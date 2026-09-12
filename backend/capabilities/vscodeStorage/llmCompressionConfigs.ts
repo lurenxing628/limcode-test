@@ -188,7 +188,9 @@ function normalizeTrigger(input: unknown): LlmCompressionConfigRecord['trigger']
     );
   }
   const thresholdUnit: LlmCompressionThresholdUnit = isKnownThresholdUnit(record.thresholdUnit) ? record.thresholdUnit : 'percent';
-  const thresholdTokens = finitePositiveNumber(record.thresholdTokens);
+  // 按百分比触发时阈值 Token 数是现算的派生量（运行时按 百分比 x 上下文窗口 取值，不读这个字段），
+  // 存下来只会和前端序列化结果对不上，让该 section 永远处于未保存状态。
+  const thresholdTokens = thresholdUnit === 'tokens' ? finitePositiveNumber(record.thresholdTokens) : undefined;
   const inputThresholdPercent = finitePercent(record.thresholdPercent);
   const mode: LlmCompressionTriggerMode = record.mode === 'manual' ? 'manual' : 'token_threshold';
   const thresholdPercent = inputThresholdPercent ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT;

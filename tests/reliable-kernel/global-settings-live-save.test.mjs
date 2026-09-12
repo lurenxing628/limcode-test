@@ -8,7 +8,14 @@ import { createSSRApp, h } from 'vue';
 import { renderToString } from 'vue/server-renderer';
 
 const require = createRequire(import.meta.url);
+const Module = require('node:module');
+const originalLoad = Module._load;
+Module._load = function load(request, parent, isMain) {
+  if (request === 'vscode') return {};
+  return originalLoad.call(this, request, parent, isMain);
+};
 const protocol = require('../../dist/extension/shared/protocol.js');
+const { normalizeLlmCompressionConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmCompressionConfigs.js');
 const { GlobalSettingsSaveBarrier } = require('../../dist/extension/backend/application/reliableKernel/GlobalSettingsSaveBarrier.js');
 const section = 'llmCompressionConfigs';
 
@@ -135,6 +142,20 @@ test('多条压缩配置载入后不算未保存修改，第二条起的阈值�
     store.llmCompressionConfigs.configs.forEach((config, index) => {
       assert.deepEqual(config.trigger, baseline.configs[index].trigger);
     });
+    await store.flushForExecution();
+    assert.equal(writes().length, 0);
+  });
+});
+
+test('按百分比触发的历史配置载入后不算未保存修改，未编辑时可以直接确认', async () => {
+  await withStore(async ({ store, writes }) => {
+    const legacy = {
+      ...protocol.createDefaultLlmCompressionConfig('历史百分比配置'),
+      trigger: { mode: 'token_threshold', thresholdUnit: 'percent', thresholdPercent: 100, thresholdTokens: 1000 }
+    };
+    const settings = { configs: [normalizeLlmCompressionConfig(legacy)] };
+    assert.equal(settings.configs[0].trigger.thresholdTokens, undefined);
+    store.applySnapshot({ section, settings, filePath: 'fixture', revision: 'initial' });
     await store.flushForExecution();
     assert.equal(writes().length, 0);
   });
