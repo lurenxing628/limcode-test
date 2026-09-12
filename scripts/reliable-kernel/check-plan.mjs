@@ -67,6 +67,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/conversation-settings-isolation.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/global-settings-live-save.test.mjs',
+  'tests/reliable-kernel/read-file-slice.test.mjs',
   'tests/reliable-kernel/request-compression-settings.test.mjs',
   'tests/reliable-kernel/context-token-estimator.test.mjs',
   'tests/reliable-kernel/conversation-fork-context.test.mjs',

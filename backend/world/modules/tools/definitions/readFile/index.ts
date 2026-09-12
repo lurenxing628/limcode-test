@@ -61,7 +61,7 @@ export function readFileToolParameters(
   const properties: Record<string, unknown> = {
     path: { type: 'string', description: 'The usual input: a local file path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
     mode: { type: 'string', enum: ['text', 'attachment'], description: 'Optional for path reads only. When omitted, recognized local PNG, JPEG, WebP, and PDF paths use "attachment"; all other paths use "text". Explicit "attachment" is supported only for those media paths.' },
-    startLine: { type: 'number', description: 'Text path reads only. Optional 1-based start line (inclusive); omit it when not needed.' },
+    startLine: { type: 'number', description: 'Text path reads only. Optional 1-based start line (inclusive); omit it when not needed. A read longer than the per-read budget returns a leading slice instead of failing; compare the returned endLine with totalLines and continue from endLine + 1.' },
     endLine: { type: 'number', description: 'Text path reads only. Optional 1-based end line (inclusive); omit it when not needed.' },
     items: {
       type: 'array',
@@ -71,7 +71,7 @@ export function readFileToolParameters(
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Local text file path.' },
-          startLine: { type: 'number', description: 'Optional 1-based inclusive start line.' },
+          startLine: { type: 'number', description: 'Optional 1-based inclusive start line. A read longer than the per-read budget returns a leading slice instead of failing; compare the returned endLine with totalLines and continue from endLine + 1.' },
           endLine: { type: 'number', description: 'Optional 1-based inclusive end line.' }
         },
         required: ['path']

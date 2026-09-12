@@ -106,3 +106,37 @@ test('本地文本和附件读取不依赖可能失联的VS Code文件系统RPC'
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test('超过单次预算的本地文件返回首段切片，行范围照常精确生效', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-vscode-fs-large-read-'));
+  try {
+    const environment = localEnvironment(root);
+    vscode.workspace.workspaceFolders = [{ uri: Uri.file(root) }];
+    // 约 440KB，远超单次返回预算；从前这样的文件会直接以 File too large 抛错，
+    // 连带 startLine/endLine 一起失效，只能绕道 shell 分段读。
+    const lineCount = 12_000;
+    const lines = Array.from({ length: lineCount }, (_, i) => `<div class="row-${i + 1}">状态栏美化的第 ${i + 1} 行</div>`);
+    await fs.writeFile(path.join(root, 'large.html'), lines.join('\n'), 'utf8');
+
+    const options = {
+      workEnvironment: environment,
+      accessibleWorkEnvironments: [environment],
+      allowOutsideProjectPaths: false
+    };
+    const head = await within(5_000, readWorkspaceTextFile('large.html', undefined, undefined, options));
+    const ranged = await within(5_000, readWorkspaceTextFile('large.html', 500, 504, options));
+
+    assert.equal(head.totalLines, lineCount);
+    assert.equal(head.startLine, 1);
+    assert.ok(head.endLine < lineCount, '整个文件不应一次返回');
+    assert.ok(head.lines.length > 0, '超限也必须返回可读内容');
+
+    assert.equal(ranged.startLine, 500);
+    assert.equal(ranged.endLine, 504);
+    assert.equal(ranged.totalLines, lineCount);
+    assert.deepEqual(workspaceFsCalls, []);
+  } finally {
+    vscode.workspace.workspaceFolders = [];
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

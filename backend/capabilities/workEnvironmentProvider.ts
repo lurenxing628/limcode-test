@@ -5,10 +5,12 @@ import type { Readable, Writable } from 'node:stream';
 import type { WorkEnvironmentRecord } from '../../shared/protocol';
 import { isRemoteServerWorkEnvironment, workEnvironmentDisplayName } from '../../shared/workEnvironmentCatalog';
 import type { CommandRunArgs, CommandRunObserver, CommandRunResult, FsDeletePathTargetType, FsReadFileResult } from './types';
+import { sliceTextFile } from './textFileSlice';
 
 const DEFAULT_REMOTE_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_CHARS = 120_000;
-const MAX_REMOTE_READ_BYTES = 256 * 1024;
+/** Remote reads travel as base64 over a shell, so the ceiling is well below the local one. */
+const MAX_REMOTE_READ_BYTES = 2 * 1024 * 1024;
 
 export interface RemotePathPolicyOptions {
   allowOutsideProjectPaths?: boolean;
@@ -75,19 +77,7 @@ export async function readRemoteServerTextFile(
   options: RemotePathPolicyOptions = {}
 ): Promise<FsReadFileResult> {
   const text = await readRemoteServerRawTextFile(environment, filePath, MAX_REMOTE_READ_BYTES, options);
-  const fileLines = text.split(/\r?\n/);
-  const from = normalizeStartLine(startLine);
-  const to = normalizeEndLine(endLine, fileLines.length);
-  const selectedLines = [] as Array<{ line: number; text: string }>;
-  for (let i = from; i <= to; i += 1) selectedLines.push({ line: i, text: fileLines[i - 1] ?? '' });
-  return {
-    path: filePath,
-    startLine: from,
-    endLine: to,
-    totalLines: fileLines.length,
-    lines: selectedLines,
-    content: selectedLines.map((line) => `${line.line} ${line.text}`).join('\n')
-  };
+  return sliceTextFile(filePath, text, startLine, endLine);
 }
 
 export async function readRemoteServerRawTextFile(
@@ -392,15 +382,7 @@ function failedRemoteResult(command: string, stderr: string): CommandRunResult {
   return { command, exitCode: 1, killed: false, stdout: '', stderr };
 }
 
-function normalizeStartLine(value: number | undefined): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 1;
-  return Math.max(1, Math.floor(value));
-}
 
-function normalizeEndLine(value: number | undefined, totalLines: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return totalLines;
-  return Math.min(totalLines, Math.max(1, Math.floor(value)));
-}
 
 class OutputAccumulator {
   private head = '';
