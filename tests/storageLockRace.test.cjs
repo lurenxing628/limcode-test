@@ -90,6 +90,164 @@ function missingPathError(target) {
   });
 }
 
+for (const scenario of ['owner-read-gap', 'delayed-stale-recovery', 'delayed-young-observation']) {
+  test(`async record-store recovery preserves a replacement owner: ${scenario}`, async () => {
+    const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-owner-replacement-'));
+    const indexPath = path.join(rootPath, 'index.json');
+    const lockPath = `${indexPath}.lock`;
+    const ownerPath = path.join(lockPath, 'owner.json');
+    const originalReadFile = fsp.readFile;
+    const originalRename = fsp.rename;
+    const originalNow = Date.now;
+    let clockOffset = 0;
+    const fencePath = scenario === 'delayed-stale-recovery'
+      ? `${lockPath}.generation-owner-original`
+      : path.join(rootPath, 'released-original');
+    let replacementPublished = false;
+    let replacementReleased = false;
+    let replacementFenced = false;
+    const publishReplacement = async () => {
+      await originalRename(lockPath, fencePath);
+      await fsp.mkdir(lockPath);
+      await fsp.writeFile(ownerPath, JSON.stringify({
+        ownerToken: 'replacement', pid: process.pid, createdAt: Date.now(), indexPath
+      }));
+      replacementPublished = true;
+    };
+    try {
+      Date.now = () => originalNow() + clockOffset;
+      await fsp.mkdir(lockPath);
+      const createdAt = Date.now() - (scenario === 'delayed-stale-recovery' ? 60_000
+        : scenario === 'delayed-young-observation' ? 29_000 : 1_000);
+      await fsp.writeFile(ownerPath, JSON.stringify({
+        ownerToken: 'original',
+        pid: scenario === 'owner-read-gap' ? process.pid : 2_147_483_647,
+        createdAt,
+        indexPath
+      }));
+      await fsp.utimes(lockPath, new Date(createdAt), new Date(createdAt));
+      fsp.readFile = async function readAcrossOwnerReplacement(target, ...options) {
+        if (String(target) === ownerPath && !replacementPublished && scenario === 'owner-read-gap') {
+          await publishReplacement();
+          throw missingPathError(target);
+        }
+        const raw = await originalReadFile.call(this, target, ...options);
+        if (String(target) === ownerPath && !replacementPublished && scenario === 'delayed-young-observation') {
+          await publishReplacement();
+          clockOffset = 2_000;
+          return raw;
+        }
+        if (String(target) === ownerPath && replacementPublished && !replacementReleased
+          && JSON.parse(String(raw)).ownerToken === 'replacement') {
+          await originalRename(lockPath, path.join(rootPath, 'released-replacement'));
+          replacementReleased = true;
+        }
+        return raw;
+      };
+      fsp.rename = async function fenceAcrossOwnerReplacement(source, destination) {
+        const fencing = String(source) === lockPath && String(destination).startsWith(`${lockPath}.generation-`);
+        if (fencing && !replacementPublished && scenario === 'delayed-stale-recovery') {
+          await publishReplacement();
+        }
+        const targetsReplacement = fencing && replacementPublished && !replacementReleased;
+        const result = await originalRename.call(this, source, destination);
+        if (targetsReplacement) replacementFenced = true;
+        return result;
+      };
+      let actionRuns = 0;
+      await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => { actionRuns += 1; });
+      assert.equal(replacementPublished, true);
+      assert.equal(replacementFenced, false, 'A recovery attempt moved a newer live writer out of its lock.');
+      assert.equal(replacementReleased, true);
+      assert.equal(actionRuns, 1);
+    } finally {
+      fsp.readFile = originalReadFile;
+      fsp.rename = originalRename;
+      Date.now = originalNow;
+      await fsp.rm(rootPath, { recursive: true, force: true });
+    }
+  });
+}
+
+test('sync storage recovery preserves a replacement owner when the previous owner file disappears', async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-sync-owner-replacement-'));
+  const resourcePath = path.join(rootPath, 'index.json');
+  const lockPath = `${resourcePath}.lock`;
+  const ownerPath = path.join(lockPath, 'owner.json');
+  const originalReadFile = fs.readFileSync;
+  const originalRename = fs.renameSync;
+  let replacementPublished = false;
+  let replacementReleased = false;
+  let replacementFenced = false;
+  try {
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      ownerToken: 'original', pid: process.pid, createdAt: Date.now(), resource: resourcePath
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    fs.readFileSync = function readAcrossOwnerReplacement(target, ...options) {
+      if (String(target) === ownerPath && !replacementPublished) {
+        originalRename(lockPath, path.join(rootPath, 'released-original'));
+        fs.mkdirSync(lockPath);
+        fs.writeFileSync(ownerPath, JSON.stringify({
+          ownerToken: 'replacement', pid: process.pid, createdAt: Date.now(), resource: resourcePath
+        }));
+        replacementPublished = true;
+        throw missingPathError(target);
+      }
+      const raw = originalReadFile.call(this, target, ...options);
+      if (String(target) === ownerPath && replacementPublished && !replacementReleased
+        && JSON.parse(String(raw)).ownerToken === 'replacement') {
+        originalRename(lockPath, path.join(rootPath, 'released-replacement'));
+        replacementReleased = true;
+      }
+      return raw;
+    };
+    fs.renameSync = function fenceAcrossOwnerReplacement(source, destination) {
+      const targetsReplacement = String(source) === lockPath && replacementPublished && !replacementReleased;
+      const result = originalRename.call(this, source, destination);
+      if (targetsReplacement) replacementFenced = true;
+      return result;
+    };
+    let actionRuns = 0;
+    syncStorageResourceLock.withSyncStorageResourceLock(resourcePath, () => { actionRuns += 1; });
+    assert.equal(replacementPublished, true);
+    assert.equal(replacementFenced, false, 'Recovery moved a newer live writer out of its lock.');
+    assert.equal(replacementReleased, true);
+    assert.equal(actionRuns, 1);
+  } finally {
+    fs.readFileSync = originalReadFile;
+    fs.renameSync = originalRename;
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
+
+test('async release retains only stale generation fences', async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-release-fence-'));
+  const indexPath = path.join(rootPath, 'index.json');
+  const lockPath = `${indexPath}.lock`;
+  const originalNow = Date.now;
+  try {
+    for (const heldMs of [0, 31_000]) {
+      let owner;
+      await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+        owner = JSON.parse(await fsp.readFile(path.join(lockPath, 'owner.json'), 'utf8'));
+        Date.now = () => originalNow() + heldMs;
+      });
+      Date.now = originalNow;
+      const artifacts = (await fsp.readdir(rootPath)).filter((name) => name.startsWith('index.json.lock'));
+      const fenceName = `index.json.lock.generation-owner-${owner.ownerToken}`;
+      assert.deepEqual(artifacts, heldMs === 0 ? [] : [fenceName]);
+      if (heldMs > 0) {
+        assert.deepEqual(JSON.parse(await fsp.readFile(path.join(rootPath, fenceName, 'owner.json'), 'utf8')), owner);
+      }
+    }
+  } finally {
+    Date.now = originalNow;
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
+
 test('sync lock publication classification is invariant when canonical state flips absent to present', windowsOnly, async () => {
   const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-sync-lock-state-flip-'));
   const resourcePath = path.join(tempRoot, 'index.json');

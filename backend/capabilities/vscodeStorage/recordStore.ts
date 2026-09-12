@@ -458,31 +458,28 @@ async function recoverExistingRecordStoreLock(
   lockPath: string,
   expectedIndexPath: string
 ): Promise<ExistingRecordStoreLockRecovery> {
+  const observedAt = Date.now();
   try {
     const stat = await fs.stat(lockPath);
     const raw = await fs.readFile(
       stat.isDirectory() ? path.join(lockPath, RECORD_STORE_LOCK_OWNER_FILE) : lockPath,
       'utf8'
-    ).catch(() => '');
+    );
     const parsed = parseRecordStoreLockMetadata(raw);
     const metadata = parsed && path.resolve(parsed.indexPath) === expectedIndexPath ? parsed : undefined;
     const legacy = metadata ? undefined : parseLegacyRecordStoreLockMetadata(raw, expectedIndexPath);
-    const ageMs = Math.max(0, Date.now() - (metadata?.createdAt ?? legacy?.createdAt ?? stat.mtimeMs));
+    const ageMs = Math.max(0, observedAt - (metadata?.createdAt ?? legacy?.createdAt ?? stat.mtimeMs));
     const staleAfterMs = metadata || legacy ? RECORD_STORE_LOCK_STALE_MS : RECORD_STORE_LOCK_INVALID_WAIT_MS;
     if (ageMs < staleAfterMs) return 'held';
     if ((metadata || legacy) && processIsAlive((metadata ?? legacy)!.pid)) return 'held';
-    const generation = metadata?.ownerToken
-      ?? (legacy ? `legacy-${legacy.pid}-${legacy.createdAt}` : `invalid-${Math.floor(stat.ctimeMs)}-${stat.size}`);
-    const quarantinePath = recordStoreLockQuarantinePath(lockPath, `${generation}-${randomUUID()}`);
+    const generation = metadata ? `owner-${metadata.ownerToken}`
+      : legacy ? `legacy-${legacy.pid}-${legacy.createdAt}`
+      : `invalid-${stat.dev}-${stat.ino}-${Math.floor(stat.birthtimeMs || stat.ctimeMs)}-${stat.size}`;
+    const quarantinePath = recordStoreLockQuarantinePath(lockPath, generation);
     await fs.rename(lockPath, quarantinePath);
-    // The rename is the fencing boundary: a new writer may acquire `lockPath` immediately, while
-    // cleanup only ever targets this detached generation. Failure to remove the quarantine must
-    // not resurrect or block the lock, but leaving every recovered generation behind would leak
-    // one directory per crashed writer forever.
-    await fs.rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
     return 'recovered';
   } catch (error) {
-    if (isFileNotFound(error)) return 'recovered';
+    if (isFileNotFound(error)) return 'missing';
     if (isAlreadyExistsError(error)) return 'held';
     return 'held';
   }
@@ -523,7 +520,9 @@ async function releaseRecordStoreLock(lockPath: string, expected: RecordStoreLoc
   }
   const quarantinePath = recordStoreLockQuarantinePath(lockPath, `owner-${expected.ownerToken}`);
   await renameRecordStoreLockGeneration(lockPath, quarantinePath);
-  await fs.rm(quarantinePath, { recursive: true, force: false });
+  if (Math.max(0, Date.now() - expected.createdAt) < RECORD_STORE_LOCK_STALE_MS) {
+    await fs.rm(quarantinePath, { recursive: true, force: false });
+  }
 }
 
 function recordStoreLockQuarantinePath(lockPath: string, generation: string): string {
