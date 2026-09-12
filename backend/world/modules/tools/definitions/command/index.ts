@@ -1,4 +1,5 @@
 import type { CommandCapability } from '../../../../../capabilities/types';
+import { powerShellCommandSyntaxGuidance, resolveWindowsPowerShell } from '../../../../../capabilities/windowsPowerShell';
 import type { ToolConfigRecord } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
 import { normalizeSchedulingHint } from '../../schedulingContract';
@@ -30,7 +31,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           command: {
             type: 'string',
             description: command.toolName === 'shell'
-              ? 'PowerShell command to execute. Separate multiple commands with semicolons. Quote paths that contain spaces. Required when mode=execute.'
+              ? `PowerShell command to execute. Syntax: ${powerShellCommandSyntaxGuidance(resolveWindowsPowerShell().edition)} Required when mode=execute.`
               : 'Bash/Shell command to execute. Prefer joining multiple commands with &&. Quote paths that contain spaces. Required when mode=execute.'
           },
           cwd: {
