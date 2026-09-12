@@ -2270,7 +2270,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         this.llmCompression = { ...emptyLlmCompression(), ...(value as LlmCompressionSettingsRecord) };
       } else if (section === 'llmCompressionConfigs') {
         const settings = value as LlmCompressionConfigsRecord;
-        this.llmCompressionConfigs = { configs: settings.configs.map(normalizeCompressionConfigForUi) };
+        this.llmCompressionConfigs = { configs: settings.configs.map((config) => normalizeCompressionConfigForUi(config)) };
       } else if (section === 'checkpointMaintenance') {
         this.checkpointMaintenance = { ...emptyCheckpointMaintenance(), ...(value as CheckpointMaintenanceSettingsRecord) };
       } else if (section === 'appearance') {

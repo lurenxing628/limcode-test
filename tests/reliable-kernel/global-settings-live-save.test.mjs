@@ -125,6 +125,21 @@ test('渠道默认字段补齐不算未保存修改，未编辑时可以直接�
   });
 });
 
+test('多条压缩配置载入后不算未保存修改，第二条起的阈值不被下标污染', async () => {
+  await withStore(async ({ store, writes }) => {
+    // 归一化函数的第二个形参是上下文窗口大小，直接把它交给 map 会收到数组下标，
+    // 于是第二条起的配置按「窗口只有 1、2 个 Token」重算阈值，和基线永远对不上。
+    const configs = ['第一个', '第二个', '第三个'].map((name) => protocol.createDefaultLlmCompressionConfig(name));
+    store.applySnapshot({ section, settings: { configs }, filePath: 'fixture', revision: 'multi' });
+    const baseline = store.baselines[section];
+    store.llmCompressionConfigs.configs.forEach((config, index) => {
+      assert.deepEqual(config.trigger, baseline.configs[index].trigger);
+    });
+    await store.flushForExecution();
+    assert.equal(writes().length, 0);
+  });
+});
+
 test('保存比较只忽略记录元数据，不忽略用户自定义参数中同名时间字段的冲突', async () => {
   await withStore(async ({ store, posted }) => {
     const section = 'llmProviderConfigs';
