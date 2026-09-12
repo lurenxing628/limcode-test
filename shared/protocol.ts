@@ -538,6 +538,10 @@ export type LlmCompressionThresholdUnit = 'percent' | 'tokens';
 export const DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 200_000;
 export const DEFAULT_LLM_RETRY_ON_ERROR = true;
 export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 4;
+/** 重试间隔秒数；0 表示沿用自动指数退避。 */
+export const DEFAULT_LLM_RETRY_DELAY_SECONDS = 0;
+/** 可配置重试间隔的上限秒数。 */
+export const MAX_LLM_RETRY_DELAY_SECONDS = 600;
 /** Reliable Runtime hard ceiling for automatic Provider retries (excluding the original attempt). */
 export const MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS = 10;
 export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
@@ -722,6 +726,8 @@ export interface LlmProviderModelConfigRecord {
   retryOnError: boolean;
   /** 最大重试次数，不包含原始请求；4 表示最多 1 + 4 次请求，-1 表示无限重试。 */
   retryMaxAttempts: number;
+  /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
+  retryDelaySeconds: number;
   enableMultimodalTools: boolean;
   contextWindowTokens?: number;
   /** 不添加标题，直接放在本次请求最终系统提示词的最前面；空字符串表示不注入。 */
@@ -751,6 +757,8 @@ export interface LlmProviderConfigRecord {
   retryOnError: boolean;
   /** 最大重试次数，不包含原始请求；4 表示最多 1 + 4 次请求，-1 表示无限重试。 */
   retryMaxAttempts: number;
+  /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
+  retryDelaySeconds: number;
   enableMultimodalTools: boolean;
   contextWindowTokens?: number;
   /** 不添加标题，直接放在本次请求最终系统提示词的最前面；空字符串表示不注入。 */
@@ -789,6 +797,7 @@ export interface LlmInvocationSettingsSnapshotRecord {
   stream?: boolean;
   retryOnError?: boolean;
   retryMaxAttempts?: number;
+  retryDelaySeconds?: number;
   enableMultimodalTools?: boolean;
   contextWindowTokens?: number;
   /** 本次调用已经冻结的渠道或模型前置系统提示词。 */

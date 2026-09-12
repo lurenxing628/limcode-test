@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import {
+  DEFAULT_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+  MAX_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_ON_ERROR,
   defaultLlmPromptCacheModeForProvider,
   defaultLlmPromptCacheTtlForProvider,
@@ -34,7 +36,7 @@ const TOKEN_STEP = 1_000;
 
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
-  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'enableMultimodalTools' | 'systemPromptPrefix'
+  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
 >>;
 
 const props = defineProps<{
@@ -128,6 +130,14 @@ function normalizeRetryMaxAttempts(value: unknown): number {
   return attempts < -1 ? -1 : attempts;
 }
 
+function normalizeRetryDelaySeconds(value: unknown): number {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return DEFAULT_LLM_RETRY_DELAY_SECONDS;
+  const seconds = Math.floor(number);
+  if (seconds <= 0) return 0;
+  return Math.min(seconds, MAX_LLM_RETRY_DELAY_SECONDS);
+}
+
 function updateContextWindowTokens(event: Event): void {
   const value = numericInputValue(event);
   emit('update-context-window-tokens', value === undefined ? undefined : alignTokenCountToK(value));
@@ -135,6 +145,10 @@ function updateContextWindowTokens(event: Event): void {
 
 function updateRetryMaxAttempts(event: Event): void {
   emit('update-field', { retryMaxAttempts: normalizeRetryMaxAttempts(numericInputValue(event)) });
+}
+
+function updateRetryDelaySeconds(event: Event): void {
+  emit('update-field', { retryDelaySeconds: normalizeRetryDelaySeconds(numericInputValue(event)) });
 }
 
 function updateSystemPromptPrefix(event: Event): void {
@@ -499,6 +513,21 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         step="1"
         placeholder="4"
         @change="updateRetryMaxAttempts"
+      />
+    </label>
+
+    <label class="global-settings-field">
+      <span>重试间隔（秒）</span>
+      <span class="global-settings-field-hint">每次重试前固定等待的秒数，用来避开 TPM 限流；填 0 表示沿用自动退避（0.5 秒起指数递增，最长 8 秒）。</span>
+      <input
+        class="token-number-input"
+        :value="config.retryDelaySeconds ?? DEFAULT_LLM_RETRY_DELAY_SECONDS"
+        type="number"
+        min="0"
+        :max="MAX_LLM_RETRY_DELAY_SECONDS"
+        step="1"
+        placeholder="0"
+        @change="updateRetryDelaySeconds"
       />
     </label>
 

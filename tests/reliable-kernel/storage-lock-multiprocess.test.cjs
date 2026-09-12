@@ -115,7 +115,9 @@ if (workerMode) {
       })));
       await assertStoreIntegrity(rootPath, successorCount, 4);
       const lockArtifacts = (await fs.readdir(rootPath)).filter((name) => name.startsWith('index.json.lock'));
-      assert.deepEqual(lockArtifacts, []);
+      const fenceName = `index.json.lock.generation-owner-${owner.ownerToken}`;
+      assert.deepEqual(lockArtifacts, [fenceName]);
+      assert.deepEqual(JSON.parse(await fs.readFile(path.join(rootPath, fenceName, 'owner.json'), 'utf8')), owner);
     } finally {
       if (holder) {
         holder.kill('SIGKILL');

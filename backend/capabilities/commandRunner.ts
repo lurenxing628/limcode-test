@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { CommandCapability, CommandOutputLimits, CommandRunArgs, CommandRunObserver, CommandRunResult, WorkEnvironmentCapabilityOptions } from './types';
@@ -13,6 +13,7 @@ import {
   workEnvironmentSupportsCapability
 } from '../../shared/workEnvironmentCatalog';
 import { isRemoteServerCommandEnvironment, runRemoteServerCommand } from './workEnvironmentProvider';
+import { powerShellCommandSyntaxGuidance, resolveWindowsPowerShell } from './windowsPowerShell';
 
 const DEFAULT_FOREGROUND_WAIT_MS = 30_000;
 /** 后台进程完整日志 buffer 的上限（远大于给模型的软上限，避免过早丢弃可能被 output 读取的历史）。 */
@@ -26,8 +27,9 @@ const PS_UTF8_PREFIX = [
   '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
   '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
   "$PSDefaultParameterValues['*:Encoding'] = 'utf8'",
-  ''
-].join('; ');
+  // PowerShell 7 colours its own formatting and error views; the 5.1 fallback never did.
+  "if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }"
+].join('; ') + '\n';
 
 type ShellKind = 'powershell' | 'bash';
 type StaticClassification = 'allow' | 'deny' | 'unknown';
@@ -35,7 +37,7 @@ type StaticClassification = 'allow' | 'deny' | 'unknown';
 interface CommandProfile {
   readonly kind: ShellKind;
   readonly toolName: 'shell' | 'bash';
-  readonly executable?: string;
+  readonly executable: string;
   readonly description: string;
   readonly commandPrefix?: string;
 }
@@ -88,16 +90,18 @@ export function createCommandCapability(capabilityOptions: {
 }
 function detectCommandProfile(): CommandProfile {
   if (process.platform === 'win32') {
+    const powerShell = resolveWindowsPowerShell();
     return {
       kind: 'powershell',
       toolName: 'shell',
+      executable: powerShell.executable,
       commandPrefix: PS_UTF8_PREFIX,
       description: `Run a non-interactive PowerShell command in the project workspace. Returns stdout, stderr, and exitCode.
 Foreground/background behavior: foregroundWaitMs is only the tool-response budget. Reaching it moves the command to the background and returns processId; it does not terminate the command. foregroundWaitMs=0 backgrounds immediately.
 Execution watchdog: executionTimeoutMs is the independent hard runtime deadline (default 120000ms, maximum 600000ms). maxOutputBytes limits combined stdout+stderr (default 256MiB). Either watchdog remains active after background handoff and reports timed_out or output_limit_exceeded.
 Completion delivery: background completion and watchdog termination are reported proactively. Do not poll mode=output merely to wait; use it only for an explicit progress check or to follow a returned output handle. Use mode=kill to terminate manually.
 Safety: built-in protection only blocks disk/filesystem formatting and direct root deletion; additional commands can be denied by the tool policy deny list.
-Command syntax: separate multiple commands with semicolons ; quote paths that contain spaces; for long output, prefer piping to Select-Object -First N.
+Command syntax: ${powerShellCommandSyntaxGuidance(powerShell.edition)}
 Encoding: the tool configures PowerShell input/output as UTF-8 by default. When reading non-UTF-8 files, specify the encoding explicitly in the command.`
     };
   }
@@ -113,18 +117,6 @@ Completion delivery: background completion and watchdog termination are reported
 Safety: built-in protection only blocks disk/filesystem formatting and direct root deletion; additional commands can be denied by the tool policy deny list.
 Command syntax: prefer joining multiple commands with &&; quote paths that contain spaces; for long output, prefer piping to head -n N.`
   };
-}
-
-let cachedPowerShell: string | undefined;
-function resolvePowerShell(): string {
-  if (cachedPowerShell) return cachedPowerShell;
-  try {
-    execFileSync('pwsh.exe', ['-NoProfile', '-Command', 'exit 0'], { stdio: 'ignore', timeout: 3000, windowsHide: true });
-    cachedPowerShell = 'pwsh.exe';
-  } catch {
-    cachedPowerShell = 'powershell.exe';
-  }
-  return cachedPowerShell;
 }
 
 async function runCommand(profile: CommandProfile, backgroundProcesses: BackgroundProcessManager, foregroundControls: Map<string, ForegroundCommandControl>, args: CommandRunArgs, observer: CommandRunObserver | undefined, options: WorkEnvironmentCapabilityOptions = {}, limits: CommandOutputLimits = DEFAULT_OUTPUT_LIMITS): Promise<CommandRunResult> {
@@ -167,7 +159,7 @@ function executeCommand(profile: CommandProfile, backgroundProcesses: Background
     let aborted = false;
     let processId: string | undefined;
 
-    const child = spawn(commandExecutable(profile), commandArgs(profile, wrappedCommand), {
+    const child = spawn(profile.executable, commandArgs(profile, wrappedCommand), {
       cwd,
       windowsHide: true,
       detached: profile.kind === 'bash' && process.platform !== 'win32',
@@ -299,10 +291,6 @@ function commandArgs(profile: CommandProfile, wrappedCommand: string): string[] 
     : ['-lc', wrappedCommand];
 }
 
-function commandExecutable(profile: CommandProfile): string {
-  return profile.executable ?? resolvePowerShell();
-}
-
 /** 追加式有界输出缓冲；后台化后由 BackgroundProcessManager 持有并持久化。 */
 
 class AppendBuffer {
@@ -416,6 +404,9 @@ function nonInteractiveEnv(kind: ShellKind): NodeJS.ProcessEnv {
     ...process.env,
     CI: process.env.CI ?? '1',
     NO_COLOR: process.env.NO_COLOR ?? '1',
+    // PowerShell only honours TERM, and unlike NO_COLOR it also covers a parse error, which aborts
+    // the script before the UTF-8 prefix can run.
+    ...(kind === 'powershell' ? { TERM: 'dumb' } : {}),
     PYTHONIOENCODING: 'utf-8',
     ...(kind === 'bash' ? { LANG: process.env.LANG || 'en_US.UTF-8' } : {})
   };

@@ -10,6 +10,8 @@ import {
   normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+  DEFAULT_LLM_RETRY_DELAY_SECONDS,
+  MAX_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_ON_ERROR,
   createDefaultLlmPromptCacheConfig,
   defaultLlmPromptCacheModeForProvider,
@@ -215,6 +217,7 @@ function createDefaultProviderConfig(name = '新渠道配置', provider: LlmProv
     stream: true,
     retryOnError: DEFAULT_LLM_RETRY_ON_ERROR,
     retryMaxAttempts: DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: true,
     contextWindowTokens: providerDefaultContextWindow(provider),
     systemPromptPrefix: '',
@@ -239,6 +242,7 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(config.provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
@@ -290,6 +294,7 @@ function normalizeProviderConfigForUi(config: LlmProviderConfigRecord): LlmProvi
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
@@ -344,6 +349,7 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
@@ -379,6 +385,14 @@ function normalizePromptCacheTtl(input: unknown, provider: LlmProviderKind): Llm
   if (provider === 'openai-responses') return '30m';
   if (provider === 'claude') return input === '5m' || input === '1h' ? input : defaultLlmPromptCacheTtlForProvider(provider);
   return defaultLlmPromptCacheTtlForProvider(provider);
+}
+
+function normalizeRetryDelaySeconds(value: unknown): number | undefined {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return undefined;
+  const seconds = Math.floor(number);
+  if (seconds <= 0) return 0;
+  return Math.min(seconds, MAX_LLM_RETRY_DELAY_SECONDS);
 }
 
 function normalizeRetryMaxAttempts(value: unknown): number | undefined {
@@ -649,6 +663,7 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) } : {}),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
@@ -674,6 +689,7 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider) } : { contextWindowTokens: providerDefaultContextWindow(provider) }),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
@@ -2254,7 +2270,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         this.llmCompression = { ...emptyLlmCompression(), ...(value as LlmCompressionSettingsRecord) };
       } else if (section === 'llmCompressionConfigs') {
         const settings = value as LlmCompressionConfigsRecord;
-        this.llmCompressionConfigs = { configs: settings.configs.map(normalizeCompressionConfigForUi) };
+        this.llmCompressionConfigs = { configs: settings.configs.map((config) => normalizeCompressionConfigForUi(config)) };
       } else if (section === 'checkpointMaintenance') {
         this.checkpointMaintenance = { ...emptyCheckpointMaintenance(), ...(value as CheckpointMaintenanceSettingsRecord) };
       } else if (section === 'appearance') {

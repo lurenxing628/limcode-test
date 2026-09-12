@@ -42,6 +42,7 @@ import type { RequestCompressionSettings } from './requestCompressionSettings';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+  MAX_LLM_RETRY_DELAY_SECONDS,
   MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS
 } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
@@ -1200,7 +1201,7 @@ function positiveSafeIntegerOrUndefined(value: unknown): number | undefined {
 function frozenProviderRetryPolicy(
   provider: LlmProviderConfigRecord,
   modelId: string
-): { enabled: boolean; maxRetries: number } {
+): { enabled: boolean; maxRetries: number; retryDelayMs: number } {
   const model = provider.modelConfigs.find((candidate) => candidate.modelId.trim() === modelId.trim());
   const enabled = model?.retryOnError ?? provider.retryOnError;
   const configured = model?.retryMaxAttempts ?? provider.retryMaxAttempts;
@@ -1209,9 +1210,14 @@ function frozenProviderRetryPolicy(
     : Number.isSafeInteger(configured) && configured >= 0
       ? Math.min(configured, MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS)
       : 0;
+  const configuredDelay = model?.retryDelaySeconds ?? provider.retryDelaySeconds;
+  const retryDelaySeconds = Number.isSafeInteger(configuredDelay) && configuredDelay > 0
+    ? Math.min(configuredDelay, MAX_LLM_RETRY_DELAY_SECONDS)
+    : 0;
   return {
     enabled: enabled === true && normalized > 0,
-    maxRetries: enabled === true ? normalized : 0
+    maxRetries: enabled === true ? normalized : 0,
+    retryDelayMs: retryDelaySeconds * 1_000
   };
 }
 

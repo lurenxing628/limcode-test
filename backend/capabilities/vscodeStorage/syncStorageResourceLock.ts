@@ -192,11 +192,12 @@ function createLockDirectory(
 type ExistingLockRecovery = 'missing' | 'recovered' | 'held';
 
 function recoverExistingLockDirectory(lockPath: string, options: NormalizedSyncStorageResourceLockOptions): ExistingLockRecovery {
+  const observedAt = Date.now();
   const snapshot = readLockDirectorySnapshot(lockPath, options);
   if (snapshot.status === 'missing') return 'missing';
   const ageMs = snapshot.status === 'ok'
-    ? Math.max(0, Date.now() - snapshot.metadata.createdAt)
-    : Math.max(0, Date.now() - lockGenerationTimestamp(snapshot.stat));
+    ? Math.max(0, observedAt - snapshot.metadata.createdAt)
+    : Math.max(0, observedAt - lockGenerationTimestamp(snapshot.stat));
   const staleAfterMs = snapshot.status === 'ok' ? options.staleMs : options.invalidMetadataWaitMs;
   if (ageMs < staleAfterMs) return 'held';
   // A synchronous critical section has no safe heartbeat opportunity. An old timestamp alone must
@@ -237,7 +238,7 @@ function readLockDirectorySnapshot(lockPath: string, options: NormalizedSyncStor
       options.retryDelayMs
     );
   } catch (error) {
-    if (isFileNotFoundError(error)) return { status: 'empty', stat };
+    if (isFileNotFoundError(error)) return { status: 'missing' };
     throw error;
   }
 

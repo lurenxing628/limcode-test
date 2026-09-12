@@ -31,11 +31,13 @@ import {
   RemoteFileNotFoundError,
   writeRemoteServerTextFile
 } from './workEnvironmentProvider';
+import { sliceTextFile } from './textFileSlice';
 import { buildFileDiffRecord, buildFileReplacementHunks } from './fileDiff';
 import { applyHunkEdit, applyInsertEdit, applyDeleteEdit } from './editStrategies';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS, LIVE_DIFF_SCHEME } from '../../shared/extensionIdentity';
 
-const MAX_BYTES = 256 * 1024;
+/** Reading a file only to return a slice of it is cheap, so the ceiling guards memory, not usefulness. */
+const MAX_SOURCE_BYTES = 20 * 1024 * 1024;
 const MAX_EDIT_READ_BYTES = 2 * 1024 * 1024;
 const LIVE_DIFF_APPLY_COMMAND = EXTENSION_COMMAND_IDS.applyLiveDiffPreview;
 const LIVE_DIFF_DOCUMENT_TTL_MS = 10 * 60 * 1000;
@@ -84,26 +86,9 @@ export async function readWorkspaceTextFile(relPath: string, startLine?: number,
       signal: options.signal
     });
   }
-  const raw = await readWorkspaceRawTextFile(relPath, MAX_BYTES, options);
+  const raw = await readWorkspaceRawTextFile(relPath, MAX_SOURCE_BYTES, options);
   if (!raw.existed) throw new Error(`File not found: ${relPath}`);
-
-  const fileLines = raw.content.split(/\r?\n/);
-  const from = normalizeStartLine(startLine);
-  const to = normalizeEndLine(endLine, fileLines.length);
-  const selectedLines: FsReadLine[] = [];
-
-  for (let i = from; i <= to; i += 1) {
-    selectedLines.push({ line: i, text: fileLines[i - 1] ?? '' });
-  }
-
-  return {
-    path: relPath,
-    startLine: from,
-    endLine: to,
-    totalLines: fileLines.length,
-    lines: selectedLines,
-    content: selectedLines.map((line) => `${line.line} ${line.text}`).join('\n')
-  };
+  return sliceTextFile(relPath, raw.content, startLine, endLine);
 }
 
 export async function readWorkspaceBinaryFile(relPath: string, mimeType: string, options: WorkEnvironmentCapabilityOptions = {}): Promise<FsReadBinaryFileResult> {
@@ -121,7 +106,7 @@ export async function readWorkspaceBinaryFile(relPath: string, mimeType: string,
   const configuredMaxBytes = Number(options.maxBytes);
   const maxBytes = Number.isSafeInteger(configuredMaxBytes) && configuredMaxBytes > 0
     ? configuredMaxBytes
-    : 20 * 1024 * 1024;
+    : MAX_SOURCE_BYTES;
   if (stat.size > maxBytes) throw new Error(`File too large: ${stat.size} bytes (limit ${maxBytes}).`);
   const data = await readWorkspaceFileBytes(uri, options.signal);
   if (data.byteLength > maxBytes) throw new Error(`File too large: ${data.byteLength} bytes (limit ${maxBytes}).`);
@@ -636,15 +621,7 @@ async function writeWorkspaceRawTextFile(relPath: string, content: string, optio
   await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
 }
 
-function normalizeStartLine(value: number | undefined): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 1;
-  return Math.max(1, Math.floor(value));
-}
 
-function normalizeEndLine(value: number | undefined, totalLines: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return totalLines;
-  return Math.min(totalLines, Math.max(1, Math.floor(value)));
-}
 
 interface WorkspacePathResolveOptions {
   rejectProjectRoot?: boolean;

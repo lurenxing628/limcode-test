@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import vm from 'node:vm';
 
 const root = process.cwd();
 const distRoot = path.join(root, 'dist/extension');
@@ -17,6 +19,7 @@ const durableDirectorySync = require(path.join(
   distRoot,
   'backend/capabilities/filesystem/durableDirectorySync.js'
 ));
+const windowsPowerShell = require(path.join(distRoot, 'backend/capabilities/windowsPowerShell.js'));
 const {
   VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY,
   VscodeReliableKernelCutoverCoordinator
@@ -1301,6 +1304,348 @@ test('macOS Bash Wrapper超时会终止进程组并发布终态收据', darwinOn
   }
 });
 
+test('PowerShell 6不能启用core语义，解析器继续选择已验证的7', () => {
+  const source = readFileSync(path.join(distRoot, 'backend/capabilities/windowsPowerShell.js'), 'utf8');
+  const resolve = (majors) => {
+    const candidates = new Map(majors.map((major, index) => [`C:\\shell-${index}\\pwsh.exe`, major]));
+    const module = { exports: {} };
+    vm.runInNewContext(source, {
+      module,
+      exports: module.exports,
+      process: { platform: 'win32', env: { PATH: [...candidates.keys()].map(path.win32.dirname).join(';') } },
+      require(name) {
+        if (name === 'node:path') return path.win32;
+        if (name === 'node:fs') return { statSync: () => ({ isFile: () => true }) };
+        if (name === 'node:child_process') {
+          return { spawnSync: (candidate) => ({ status: 0, stdout: String(candidates.get(candidate)) }) };
+        }
+        throw new Error(`Unexpected resolver dependency: ${name}`);
+      }
+    });
+    return { ...module.exports.resolveWindowsPowerShell() };
+  };
+  assert.deepEqual(resolve([6]), { executable: 'powershell.exe', edition: 'desktop' });
+  assert.deepEqual(resolve([6, 7]), { executable: 'C:\\shell-1\\pwsh.exe', edition: 'core' });
+});
+ 
+function envWithoutPowerShellDiscovery() {
+  // A PowerShell 7 parent exports its module paths; a forced 5.1 child must rebuild its own.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !['path', 'programfiles', 'programw6432', 'programfiles(x86)', 'psmodulepath'].includes(key.toLowerCase())
+  ));
+  env.PATH = (process.env.PATH ?? process.env.Path ?? '').split(path.delimiter)
+    .filter((directory) => !existsSync(path.join(directory.trim().replace(/^"(.*)"$/, '$1'), 'pwsh.exe')))
+    .join(path.delimiter);
+  return env;
+}
+
+function resolveWindowsPowerShellInChild({ cwd, env }) {
+  const modulePath = path.join(distRoot, 'backend/capabilities/windowsPowerShell.js');
+  const result = childProcess.spawnSync(process.execPath, [
+    '-e', `process.stdout.write(JSON.stringify(require(${JSON.stringify(modulePath)}).resolveWindowsPowerShell()));`
+  ], { cwd, env, encoding: 'utf8', windowsHide: true, timeout: 15_000 });
+  assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test('Windows命令壳解析拒绝无法验证为7+的相对PATH候选并回退5.1', windowsOnly, async () => {
+  // 相对 PATH 里的 pwsh.exe：候选必须先绝对化再验证；启动不了的文件被探测拒绝，
+  // 不得因为文件名就叫 pwsh.exe 而启用 core 语义，也不得随 cwd 漂移出另一个身份。
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-psrelative-'));
+  try {
+    const anchor = path.join(parent, 'anchor');
+    const fakeDirectory = path.join(anchor, 'ps7');
+    await fs.mkdir(fakeDirectory, { recursive: true });
+    await fs.writeFile(path.join(fakeDirectory, 'pwsh.exe'), 'not a powershell runtime');
+    const env = envWithoutPowerShellDiscovery();
+    env.PATH = 'ps7';
+    const runtime = resolveWindowsPowerShellInChild({ cwd: anchor, env });
+    assert.deepEqual(runtime, { executable: 'powershell.exe', edition: 'desktop' });
+  } finally {
+    await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
+test('相对PATH发现的真实PowerShell 7以稳定的绝对路径返回', {
+  skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core'
+}, async () => {
+  const real = windowsPowerShell.resolveWindowsPowerShell();
+  const realDirectory = path.dirname(real.executable);
+  const anchor = path.parse(realDirectory).root;
+  const relativeDirectory = path.relative(anchor, realDirectory);
+  assert.ok(relativeDirectory.length > 0 && !path.isAbsolute(relativeDirectory), relativeDirectory);
+  const env = envWithoutPowerShellDiscovery();
+  // 引号、尾随空项和大小写重复项都不得改变解析结果或候选身份。
+  env.PATH = [
+    `"${relativeDirectory}"`,
+    `${relativeDirectory.toUpperCase()}${path.delimiter}`,
+    'limcode-definitely-missing'
+  ].join(path.delimiter);
+  const runtime = resolveWindowsPowerShellInChild({ cwd: anchor, env });
+  assert.equal(runtime.edition, 'core');
+  assert.equal(runtime.executable, real.executable);
+  assert.ok(path.isAbsolute(runtime.executable), runtime.executable);
+});
+
+
+test('解析器跳过验证失败的候选并继续找到真正的PowerShell 7', {
+  skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core'
+}, async () => {
+  const real = windowsPowerShell.resolveWindowsPowerShell();
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-pssweep-'));
+  try {
+    const fakeDirectory = path.join(parent, 'ps-first');
+    await fs.mkdir(fakeDirectory);
+    await fs.writeFile(path.join(fakeDirectory, 'pwsh.exe'), 'not a powershell runtime');
+    const env = envWithoutPowerShellDiscovery();
+    env.PATH = [fakeDirectory, path.dirname(real.executable)].join(path.delimiter);
+    const runtime = resolveWindowsPowerShellInChild({ cwd: parent, env });
+    assert.equal(runtime.edition, 'core');
+    assert.equal(runtime.executable, real.executable);
+  } finally {
+    await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows包装器实际拉起解析到的PowerShell版本', windowsOnly, async () => {
+  const runtime = windowsPowerShell.resolveWindowsPowerShell();
+  const result = await runPlatformWrapper({
+    command: '[Console]::Out.Write($PSVersionTable.PSEdition)',
+    timeoutMs: 15_000,
+    suffix: 'edition'
+  });
+  try {
+    assert.equal(result.run.status, 0, result.run.stderr);
+    assert.equal(result.output.trim(), runtime.edition === 'core' ? 'Core' : 'Desktop');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell 7下管道链式操作符可直接透传给包装器', { skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core' }, async () => {
+  const result = await runPlatformWrapper({
+    command: "Write-Output 'chain-a' && Write-Output 'chain-b'",
+    timeoutMs: 15_000,
+    suffix: 'chain'
+  });
+  try {
+    assert.equal(result.run.status, 0, result.run.stderr);
+    assert.equal(result.receipt.exitCode, '0');
+    assert.match(result.output, /chain-a/);
+    assert.match(result.output, /chain-b/);
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell 7的错误与表格输出不再夹带自身的ANSI着色', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: "Get-ChildItem -LiteralPath '.' | Format-Table Name; Get-Content -LiteralPath 'C:\limcode-does-not-exist\a.txt'",
+    timeoutMs: 15_000,
+    suffix: 'ansi'
+  });
+  try {
+    // TERM=dumb 在启动时就关掉了 PowerShell 自身的着色，连 $PSStyle.Reset 拔不掉的尾巴一并没了。
+    assert.deepEqual(result.output.match(/\u001b\[[0-9;]*m/g) ?? [], []);
+    assert.match(result.output, /limcode-does-not-exist/);
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows语法错误不执行部分命令并保留原始输入诊断', windowsOnly, async () => {
+  for (const [suffix, env] of [['current', undefined], ['desktop', envWithoutPowerShellDiscovery()]]) {
+    const result = await runPlatformWrapper({
+      command: "Write-Output 'must-not-run'\nWrite-Output 'b'\n$x = ( 1; 2 )",
+      timeoutMs: 15_000,
+      suffix: `parseansi_${suffix}`,
+      env
+    });
+    try {
+      assert.equal(result.receipt.exitCode, '1');
+      assert.doesNotMatch(result.output, /^must-not-run\r?$/m);
+      assert.match(result.output, /\$x = \( 1; 2 \)/);
+      assert.doesNotMatch(result.output, /\u001b\[[0-9;]*m/g);
+    } finally {
+      await fs.rm(result.parent, { recursive: true, force: true });
+    }
+  }
+});
+
+test('Windows包装器在禁止脚本文件的进程策略下仍执行命令文本', windowsOnly, async () => {
+  // 只限制测试子进程，不改注册表、用户策略或组策略；同样的 Restricted 策略会拒绝加载 unsigned .ps1。
+  for (const [suffix, env] of [['current', undefined], ['desktop', envWithoutPowerShellDiscovery()]]) {
+    const result = await runPlatformWrapper({
+      command: '[Console]::Out.Write("$((Get-ExecutionPolicy)) policy-ok 中文"); exit 7',
+      timeoutMs: 15_000,
+      suffix: `restricted_${suffix}`,
+      executionPolicy: 'Restricted',
+      env
+    });
+    try {
+      assert.equal(result.bootstrap.phase, 'identity_ready');
+      assert.equal(result.receipt.exitCode, '7');
+      assert.equal(result.output, 'Restricted policy-ok 中文');
+    } finally {
+      await fs.rm(result.parent, { recursive: true, force: true });
+    }
+  }
+});
+
+test('命令末尾的行注释不会吞掉退出码判定', windowsOnly, async () => {
+  // 用分号拼成一行时，# 之后的整条退出码判定链都会变成注释，真实退出码 3 会退化成 1。
+  const result = await runPlatformWrapper({
+    command: "cmd /c exit 3 # 顺手写个注释",
+    timeoutMs: 15_000,
+    suffix: 'trailingcomment'
+  });
+  try {
+    assert.equal(result.receipt.exitCode, '3');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('单引号here-string管给解释器时内容完全字面，不需要转义', windowsOnly, async () => {
+  // 工具描述推荐用这条路径代替先落盘：双引号、反斜杠、反引号、${x} 都应原样到达 node，退出码也照常回传。
+  const result = await runPlatformWrapper({
+    command: [
+      "@'",
+      'console.log("q\\"q b\\\\b `t ${x} 中文");',
+      'process.exit(3);',
+      "'@ | node -"
+    ].join('\n'),
+    timeoutMs: 15_000,
+    suffix: 'herestring'
+  });
+  try {
+    assert.match(result.output, /q"q b\\b `t \$\{x\} 中文/);
+    assert.equal(result.receipt.exitCode, '3');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows包装器支持超过命令行上限的Unicode内联脚本并保留退出码', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: [
+      "@'",
+      `// ${'长脚本'.repeat(8192)}`,
+      'console.log("long-inline 中文 😀");',
+      'process.exit(7);',
+      "'@ | node -"
+    ].join('\n'),
+    timeoutMs: 15_000,
+    suffix: 'long_inline'
+  });
+  try {
+    assert.equal(result.bootstrap.phase, 'identity_ready');
+    assert.equal(result.output.trim(), 'long-inline 中文 😀');
+    assert.equal(result.receipt.exitCode, '7');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows PowerShell 5.1文件执行保留长脚本Unicode和括号原生退出码', windowsOnly, async () => {
+  const env = envWithoutPowerShellDiscovery();
+  const result = await runPlatformWrapper({
+    command: [
+      `# ${'长脚本'.repeat(8192)}`,
+      '[Console]::Out.Write("$($PSVersionTable.PSEdition) 中文 😀")',
+      '(cmd /c exit 7)'
+    ].join('\n'),
+    env,
+    timeoutMs: 15_000,
+    suffix: 'desktop_long_unicode'
+  });
+  try {
+    assert.equal(result.output, 'Desktop 中文 😀');
+    assert.equal(result.receipt.exitCode, '7');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows包装器为子进程统一设置Python标准流UTF8编码', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: "node -p 'process.env.PYTHONIOENCODING'",
+    env: { ...process.env, PYTHONIOENCODING: 'ascii' },
+    timeoutMs: 15_000,
+    suffix: 'python_encoding'
+  });
+  try {
+    assert.equal(result.output.trim(), 'utf-8');
+    assert.equal(result.receipt.exitCode, '0');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows包装器的Python内联脚本保留中文emoji与退出码', windowsOnly, async (context) => {
+  const python = childProcess.spawnSync('python', ['--version'], {
+    stdio: 'ignore', windowsHide: true, timeout: 5_000
+  });
+  if (python.error || python.status !== 0) {
+    context.skip('This end-to-end check requires Python on PATH.');
+    return;
+  }
+  const result = await runPlatformWrapper({
+    command: [
+      "@'",
+      'import sys',
+      'print(sys.stdout.encoding)',
+      'print("中文测试 😀")',
+      'sys.exit(7)',
+      "'@ | python -"
+    ].join('\n'),
+    env: { ...process.env, PYTHONIOENCODING: 'ascii' },
+    timeoutMs: 15_000,
+    suffix: 'python_unicode'
+  });
+  try {
+    assert.match(result.output, /^utf-8\r?\n中文测试 😀\r?\n$/);
+    assert.equal(result.receipt.exitCode, '7');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell 7括号内已恢复的链式命令不会被5.1修正误报失败', {
+  skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core'
+}, async () => {
+  const result = await runPlatformWrapper({
+    command: "(Get-Item -LiteralPath './limcode-missing-item' -ErrorAction SilentlyContinue || Write-Output 'recovered')",
+    timeoutMs: 15_000,
+    suffix: 'parenthesized_recovery'
+  });
+  try {
+    assert.equal(result.output.trim(), 'recovered');
+    assert.equal(result.receipt.exitCode, '0');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows解析错误等待身份记录完成后才退出并保留诊断', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: "Write-Output 'must-not-run'\n$broken = ( 1; 2 )",
+    timeoutMs: 15_000,
+    suffix: 'parse_after_identity',
+    fingerprintDelayMs: 1_500
+  });
+  try {
+    assert.equal(result.bootstrap.phase, 'identity_ready');
+    assert.equal(result.bootstrap.childPid, result.identity.childPid);
+    assert.equal(result.receipt.exitCode, '1');
+    assert.match(result.output, /\$broken/);
+    assert.doesNotMatch(result.output, /^must-not-run\r?$/m);
+    assert.doesNotMatch(result.output, /\u001b\[/);
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
 test('concurrent Windows cold starts all publish durable bootstrap and identity evidence', windowsOnly, async () => {
   const results = await Promise.all(Array.from({ length: 6 }, (_, index) => runPlatformWrapper({
     command: `Write-Output 'cold-${index}'`,
@@ -1418,7 +1763,7 @@ test('host consumes durable pre-identity failure instead of waiting for outcome_
   }
 });
 
-async function runPlatformWrapper({ command, timeoutMs, suffix = 'test' }) {
+async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env, fingerprintDelayMs = 0, executionPolicy }) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-wrapper-${process.platform}-`));
   const spoolLocator = `process_${process.platform}_${suffix}`;
   const spoolPath = path.join(parent, spoolLocator);
@@ -1439,7 +1784,30 @@ async function runPlatformWrapper({ command, timeoutMs, suffix = 'test' }) {
   };
   const launchPath = path.join(spoolPath, 'launch.json');
   await fs.writeFile(launchPath, `${JSON.stringify(request, null, 2)}\n`);
-  const run = await runWrapperProcess(launchPath, 15_000);
+  const preloadPath = fingerprintDelayMs || executionPolicy ? path.join(parent, 'wrapper-preload.cjs') : undefined;
+  if (preloadPath) {
+    await fs.writeFile(preloadPath, [
+      ...(fingerprintDelayMs ? [
+        `const protocol = require(${JSON.stringify(path.join(distRoot, 'backend/reliableKernel/processProtocol.js'))});`,
+        'const readFingerprint = protocol.readProcessStartFingerprint;',
+        `protocol.readProcessStartFingerprint = (pid) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${fingerprintDelayMs}); return readFingerprint(pid); };`
+      ] : []),
+      ...(executionPolicy ? [
+        "const childProcess = require('node:child_process');",
+        'const spawn = childProcess.spawn;',
+        'childProcess.spawn = (file, args, options) => {',
+        "  const index = args.indexOf('-Command');",
+        '  if (index !== -1) {',
+        '    args = [...args];',
+        `    args[index + 1] = ${JSON.stringify(`Set-ExecutionPolicy -Scope Process -ExecutionPolicy ${executionPolicy} -Force; `)} + args[index + 1];`,
+        '  }',
+        '  return spawn(file, args, options);',
+        '};'
+      ] : [])
+    ].join('\n'));
+  }
+  const run = await runWrapperProcess(launchPath, 15_000, env, preloadPath);
+  assert.equal(run.status, 0, run.stderr);
 
   const bootstrap = processProtocol.parseWrapperBootstrapReceipt(JSON.parse(
     await fs.readFile(path.join(spoolPath, processProtocol.PROCESS_WRAPPER_BOOTSTRAP_FILE), 'utf8')
@@ -1453,12 +1821,13 @@ async function runPlatformWrapper({ command, timeoutMs, suffix = 'test' }) {
   return { parent, spoolPath, run, bootstrap, identity, manifest, receipt, output };
 }
 
-function runWrapperProcess(launchPath, timeoutMs) {
+function runWrapperProcess(launchPath, timeoutMs, env, preloadPath) {
   return new Promise((resolve, reject) => {
     const child = childProcess.spawn(process.execPath, [
+      ...(preloadPath ? ['--require', preloadPath] : []),
       path.join(distRoot, 'backend/reliableKernel/processWrapper.js'),
       launchPath
-    ], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    ], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });

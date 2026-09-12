@@ -3,6 +3,7 @@ import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import { MAX_LLM_RETRY_DELAY_SECONDS } from '../../shared/protocol';
 import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
 export interface FrozenContextProfile {
@@ -26,6 +27,8 @@ export interface FrozenProviderRetryPolicy {
   enabled: boolean;
   /** Number of retries after the original Provider attempt. */
   maxRetries: number;
+  /** Fixed wait before each retry; 0 keeps the kernel automatic exponential backoff. */
+  retryDelayMs: number;
 }
 
 export interface FrozenCompressionPolicy {
@@ -133,7 +136,11 @@ export function frozenProviderRetryPolicy(document: PlainJsonValue): FrozenProvi
   if (!isRecord(document) || !isRecord(document.model)) {
     throw new Error('AuthoritySnapshot is missing frozen model retry authority.');
   }
-  return normalizeFrozenRetryPolicy(document.model.retryPolicy, 'model.retryPolicy', { enabled: true, maxRetries: 1 });
+  return normalizeFrozenRetryPolicy(
+    document.model.retryPolicy,
+    'model.retryPolicy',
+    { enabled: true, maxRetries: 1, retryDelayMs: 0 }
+  );
 }
 
 export function frozenContextProfile(document: PlainJsonValue): FrozenContextProfile {
@@ -208,7 +215,7 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
       retryPolicy: normalizeFrozenRetryPolicy(
         provider.retryPolicy,
         'compression.provider.retryPolicy',
-        { enabled: true, maxRetries: 1 }
+        { enabled: true, maxRetries: 1, retryDelayMs: 0 }
       )
     }
   };
@@ -252,7 +259,13 @@ function normalizeFrozenRetryPolicy(
   if (value.enabled !== (maxRetries > 0)) {
     throw new Error(`Frozen ${label}.enabled must exactly match whether maxRetries is non-zero.`);
   }
-  return { enabled: value.enabled, maxRetries };
+  const retryDelayMs = value.retryDelayMs === undefined
+    ? legacy.retryDelayMs
+    : nonNegativeSafeInteger(value.retryDelayMs, `${label}.retryDelayMs`);
+  if (retryDelayMs > MAX_LLM_RETRY_DELAY_SECONDS * 1_000) {
+    throw new Error(`Frozen ${label}.retryDelayMs exceeds the reliable limit.`);
+  }
+  return { enabled: value.enabled, maxRetries, retryDelayMs };
 }
 
 function requireCompressionKind(value: unknown): LlmCompressionConfigRecord['kind'] {

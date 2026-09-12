@@ -2,7 +2,7 @@
   "name": "limcode-test",
   "displayName": "Limcode Test",
   "description": "VS Code AI assistant with a TypeScript reliable runtime, SQLite/CAS persistence, and Vue webviews.",
-  "version": "0.0.20",
+  "version": "0.0.21",
   "publisher": "your-publisher",
   "private": true,
   "repository": {

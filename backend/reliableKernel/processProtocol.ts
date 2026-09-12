@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { decodeCanonicalBase64 } from '../capabilities/canonicalBase64';
+import { resolveWindowsPowerShell } from '../capabilities/windowsPowerShell';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -455,7 +456,7 @@ function readWindowsStartFingerprint(pidInput: string | number): string {
     }
   }
   const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString())`;
-  const result = spawnSync('powershell.exe', [
+  const result = spawnSync(resolveWindowsPowerShell().executable, [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
   ], { encoding: 'utf8', windowsHide: true, timeout: 3_000 });
   if (result.error) throw result.error;

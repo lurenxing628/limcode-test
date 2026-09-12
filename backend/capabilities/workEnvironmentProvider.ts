@@ -5,10 +5,12 @@ import type { Readable, Writable } from 'node:stream';
 import type { WorkEnvironmentRecord } from '../../shared/protocol';
 import { isRemoteServerWorkEnvironment, workEnvironmentDisplayName } from '../../shared/workEnvironmentCatalog';
 import type { CommandRunArgs, CommandRunObserver, CommandRunResult, FsDeletePathTargetType, FsReadFileResult } from './types';
+import { sliceTextFile } from './textFileSlice';
 
 const DEFAULT_REMOTE_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_CHARS = 120_000;
-const MAX_REMOTE_READ_BYTES = 256 * 1024;
+/** Remote reads stream raw bytes over a shell, so the ceiling is well below the local one. */
+const MAX_REMOTE_READ_BYTES = 2 * 1024 * 1024;
 
 export interface RemotePathPolicyOptions {
   allowOutsideProjectPaths?: boolean;
@@ -75,19 +77,7 @@ export async function readRemoteServerTextFile(
   options: RemotePathPolicyOptions = {}
 ): Promise<FsReadFileResult> {
   const text = await readRemoteServerRawTextFile(environment, filePath, MAX_REMOTE_READ_BYTES, options);
-  const fileLines = text.split(/\r?\n/);
-  const from = normalizeStartLine(startLine);
-  const to = normalizeEndLine(endLine, fileLines.length);
-  const selectedLines = [] as Array<{ line: number; text: string }>;
-  for (let i = from; i <= to; i += 1) selectedLines.push({ line: i, text: fileLines[i - 1] ?? '' });
-  return {
-    path: filePath,
-    startLine: from,
-    endLine: to,
-    totalLines: fileLines.length,
-    lines: selectedLines,
-    content: selectedLines.map((line) => `${line.line} ${line.text}`).join('\n')
-  };
+  return sliceTextFile(filePath, text, startLine, endLine);
 }
 
 export async function readRemoteServerRawTextFile(
@@ -105,17 +95,50 @@ if [ ! -f "$FILE" ]; then echo "not a file: $FILE" >&2; exit 46; fi
 bytes="$(wc -c < "$FILE" 2>/dev/null || printf '0')"
 case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
 if [ "$bytes" -gt ${maxBytes} ]; then echo "File too large: ${remotePath} (${maxBytes} bytes limit)" >&2; exit 45; fi
-base64 < "$FILE" | tr -d '\n\r'`;
-  const result = await executeRemoteServerScript(environment, script, {
+exec cat -- "$FILE"`;
+  // File bytes stream raw over stdout; the preview accumulator would corrupt anything past
+  // MAX_OUTPUT_CHARS. The byte budget is enforced locally too, so a file that grows past
+  // maxBytes after the remote size check fails the read instead of being truncated.
+  const controller = new AbortController();
+  const handle = spawnRemoteServerScript(environment, script, {
     timeout: DEFAULT_REMOTE_TIMEOUT_MS,
     displayCommand: `read ${remotePath}`,
-    signal: options.signal
+    captureStdout: false,
+    signal: controller.signal
   });
-  if (result.exitCode === 44) throw new RemoteFileNotFoundError(result.stderr || `远程文件不存在：${remotePath}`);
-  if (result.exitCode !== 0 || result.killed) {
-    throw new Error(result.stderr || `远程读取失败：${remotePath}`);
+  const onAbort = (): void => controller.abort();
+  options.signal?.addEventListener('abort', onAbort, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  const chunks: Buffer[] = [];
+  let received = 0;
+  let overflow = false;
+  let streamError: Error | undefined;
+  handle.stdout.on('data', (chunk: Buffer) => {
+    if (overflow) return;
+    received += chunk.length;
+    if (received > maxBytes) {
+      overflow = true;
+      chunks.length = 0;
+      controller.abort();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  handle.stdout.once('error', (error: Error) => {
+    streamError = error;
+  });
+  try {
+    const result = await handle.done;
+    if (result.exitCode === 44) throw new RemoteFileNotFoundError(result.stderr || `远程文件不存在：${remotePath}`);
+    if (overflow) throw new Error(`File too large: ${remotePath} (${maxBytes} bytes limit)`);
+    if (streamError) throw streamError;
+    if (result.exitCode !== 0 || result.killed) {
+      throw new Error(result.stderr || `远程读取失败：${remotePath}`);
+    }
+    return Buffer.concat(chunks, received).toString('utf8');
+  } finally {
+    options.signal?.removeEventListener('abort', onAbort);
   }
-  return Buffer.from(result.stdout.replace(/\s+/g, ''), 'base64').toString('utf8');
 }
 
 export async function writeRemoteServerTextFile(
@@ -392,15 +415,7 @@ function failedRemoteResult(command: string, stderr: string): CommandRunResult {
   return { command, exitCode: 1, killed: false, stdout: '', stderr };
 }
 
-function normalizeStartLine(value: number | undefined): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 1;
-  return Math.max(1, Math.floor(value));
-}
 
-function normalizeEndLine(value: number | undefined, totalLines: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return totalLines;
-  return Math.min(totalLines, Math.max(1, Math.floor(value)));
-}
 
 class OutputAccumulator {
   private head = '';
