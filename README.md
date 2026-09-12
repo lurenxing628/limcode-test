@@ -34,6 +34,9 @@ Limcode Test 不是简单改名。它仍然是在 VS Code 中使用的对话助�
 - Agent、Workflow、Policy、模型配置和 Settings 保持独立配置权威。LLM 渠道记录位于当前配置根的 `settings/llm-provider-configs/index.json` 与 `records/`，由设置页管理。
 - 数据路径统一由 `getPaths()` 和 RootAuthority 解析；Runtime 长连接持有完整、带 fencing 的 RootBinding，不能自行从 `globalStorageUri` 拼接业务路径。
 - 文件传输默认允许项目外路径；用户显式关闭 `allowOutsideProjectPaths` 时，源与目标必须真实位于各自工作环境根内，不能借符号链接绕过。
+- `read` 支持本地 20 MiB、远程 2 MiB 内文本的行范围读取，按 256 KiB 行切片预算返回；单行超出切片预算时仍返回该行。远程传输使用无损字节流，超限报错，不把截断内容当作完整文件。
+- Windows 命令优先使用已验证版本的 PowerShell 7，缺失时使用 Windows PowerShell 5.1。长脚本通过 UTF-8 暂存文件传输，在进程身份确认后作为命令文本执行，保留 Unicode、真实退出码和错误诊断。
+- 渠道和模型可分别配置重试间隔：`0` 使用自动指数退避，`1–600` 为固定等待秒数；模型专属配置可以用 `0` 覆盖渠道的固定间隔。
 
 > 当前开发阶段 LLM API Key 仍随渠道配置记录明文保存，不使用 VS Code SecretStorage；请勿分享包含密钥的配置目录。
 

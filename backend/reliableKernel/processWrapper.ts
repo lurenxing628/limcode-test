@@ -755,7 +755,14 @@ function spawnWindowsPowerShellCommand(
     `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
     `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
     `if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }`,
-    `. '${scriptPath.split("'").join("''")}'`,
+    // Group policies (AllSigned/Restricted) reject unsigned script files, and the process-scope
+    // -ExecutionPolicy Bypass cannot override them — but execution policies only govern script
+    // files. Once the gate opens, read the spooled script back and run it as in-memory command
+    // text, the same trust level as an inline -Command, instead of loading the .ps1 as a script.
+    // ReadAllText honors the BOM, so 5.1 still decodes the spooled UTF-8 correctly, and creating
+    // the ScriptBlock parses the whole text up front, preserving whole-file parse semantics.
+    `$limcodeScriptText = [System.IO.File]::ReadAllText('${scriptPath.split("'").join("''")}')`,
+    `. ([ScriptBlock]::Create($limcodeScriptText))`,
     ...checkExitStatus,
     `exit 0`
   ].join('; ');

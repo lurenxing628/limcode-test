@@ -1,8 +1,13 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 /** PowerShell 7 ships pipeline chain operators and correct `$?` for parenthesized commands. */
 const POWERSHELL_CORE_EXECUTABLE = 'pwsh.exe';
+/** Pipeline chain operators and the parenthesized-command `$?` fix require PowerShell 7 or newer. */
+const POWERSHELL_CORE_MINIMUM_MAJOR_VERSION = 7;
+/** Bound each candidate probe; the selected runtime is cached for this process. */
+const POWERSHELL_VERSION_PROBE_TIMEOUT_MS = 5_000;
 /** Windows PowerShell 5.1 is present on every supported Windows host and needs no resolution. */
 const WINDOWS_POWERSHELL_EXECUTABLE = 'powershell.exe';
 
@@ -20,11 +25,7 @@ const WINDOWS_POWERSHELL_RUNTIME: WindowsPowerShellRuntime = {
 
 let cachedRuntime: WindowsPowerShellRuntime | undefined;
 
-/**
- * Resolves the Windows shell every spawn path uses: PowerShell 7 when installed, Windows PowerShell
- * 5.1 otherwise. Resolution is a bounded stat sweep rather than a probe spawn, so the detached
- * process Wrapper can resolve per launch without paying for a child process.
- */
+/** Resolve one verified shell per process, independent of later command working directories. */
 export function resolveWindowsPowerShell(): WindowsPowerShellRuntime {
   if (cachedRuntime === undefined) cachedRuntime = locatePowerShellCore() ?? WINDOWS_POWERSHELL_RUNTIME;
   return cachedRuntime;
@@ -33,6 +34,8 @@ export function resolveWindowsPowerShell(): WindowsPowerShellRuntime {
 function locatePowerShellCore(): WindowsPowerShellRuntime | undefined {
   if (process.platform !== 'win32') return undefined;
   for (const directory of candidateDirectories()) {
+    // PATH entries may be relative; resolve against this process's cwd before stat and cache so the
+    // returned executable keeps its identity when the Wrapper spawns it with the request's cwd.
     const candidate = path.join(directory, POWERSHELL_CORE_EXECUTABLE);
     let stats: fs.Stats;
     try {
@@ -40,9 +43,34 @@ function locatePowerShellCore(): WindowsPowerShellRuntime | undefined {
     } catch {
       continue;
     }
-    if (stats.isFile()) return { executable: candidate, edition: 'core' };
+    if (stats.isFile() && isVerifiedPowerShellCore(candidate)) {
+      return { executable: candidate, edition: 'core' };
+    }
   }
   return undefined;
+}
+
+/** A file named pwsh.exe is insufficient: PowerShell 6 lacks the required command semantics. */
+function isVerifiedPowerShellCore(candidate: string): boolean {
+  try {
+    const result = spawnSync(candidate, [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      '[Console]::Out.Write($PSVersionTable.PSVersion.Major)'
+    ], {
+      encoding: 'utf8',
+      timeout: POWERSHELL_VERSION_PROBE_TIMEOUT_MS,
+      maxBuffer: 1024,
+      windowsHide: true
+    });
+    if (result.error || result.status !== 0) return false;
+    const major = Number(result.stdout.trim());
+    return Number.isInteger(major) && major >= POWERSHELL_CORE_MINIMUM_MAJOR_VERSION;
+  } catch {
+    return false;
+  }
 }
 
 function candidateDirectories(): string[] {
@@ -53,10 +81,11 @@ function candidateDirectories(): string[] {
     // PATH entries may carry surrounding quotes and trailing separators.
     const trimmed = value.trim().replace(/^"(.*)"$/, '$1');
     if (!trimmed) return;
-    const key = trimmed.toLowerCase();
+    const absolute = path.resolve(trimmed);
+    const key = absolute.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
-    directories.push(trimmed);
+    directories.push(absolute);
   };
   // Canonical installs come first: a stripped PATH must not silently downgrade the shell, and a real
   // install is preferred over a Microsoft Store execution alias that shadows it on PATH.

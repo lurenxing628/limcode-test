@@ -9,7 +9,7 @@ import { sliceTextFile } from './textFileSlice';
 
 const DEFAULT_REMOTE_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_CHARS = 120_000;
-/** Remote reads travel as base64 over a shell, so the ceiling is well below the local one. */
+/** Remote reads stream raw bytes over a shell, so the ceiling is well below the local one. */
 const MAX_REMOTE_READ_BYTES = 2 * 1024 * 1024;
 
 export interface RemotePathPolicyOptions {
@@ -95,17 +95,50 @@ if [ ! -f "$FILE" ]; then echo "not a file: $FILE" >&2; exit 46; fi
 bytes="$(wc -c < "$FILE" 2>/dev/null || printf '0')"
 case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
 if [ "$bytes" -gt ${maxBytes} ]; then echo "File too large: ${remotePath} (${maxBytes} bytes limit)" >&2; exit 45; fi
-base64 < "$FILE" | tr -d '\n\r'`;
-  const result = await executeRemoteServerScript(environment, script, {
+exec cat -- "$FILE"`;
+  // File bytes stream raw over stdout; the preview accumulator would corrupt anything past
+  // MAX_OUTPUT_CHARS. The byte budget is enforced locally too, so a file that grows past
+  // maxBytes after the remote size check fails the read instead of being truncated.
+  const controller = new AbortController();
+  const handle = spawnRemoteServerScript(environment, script, {
     timeout: DEFAULT_REMOTE_TIMEOUT_MS,
     displayCommand: `read ${remotePath}`,
-    signal: options.signal
+    captureStdout: false,
+    signal: controller.signal
   });
-  if (result.exitCode === 44) throw new RemoteFileNotFoundError(result.stderr || `远程文件不存在：${remotePath}`);
-  if (result.exitCode !== 0 || result.killed) {
-    throw new Error(result.stderr || `远程读取失败：${remotePath}`);
+  const onAbort = (): void => controller.abort();
+  options.signal?.addEventListener('abort', onAbort, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  const chunks: Buffer[] = [];
+  let received = 0;
+  let overflow = false;
+  let streamError: Error | undefined;
+  handle.stdout.on('data', (chunk: Buffer) => {
+    if (overflow) return;
+    received += chunk.length;
+    if (received > maxBytes) {
+      overflow = true;
+      chunks.length = 0;
+      controller.abort();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  handle.stdout.once('error', (error: Error) => {
+    streamError = error;
+  });
+  try {
+    const result = await handle.done;
+    if (result.exitCode === 44) throw new RemoteFileNotFoundError(result.stderr || `远程文件不存在：${remotePath}`);
+    if (overflow) throw new Error(`File too large: ${remotePath} (${maxBytes} bytes limit)`);
+    if (streamError) throw streamError;
+    if (result.exitCode !== 0 || result.killed) {
+      throw new Error(result.stderr || `远程读取失败：${remotePath}`);
+    }
+    return Buffer.concat(chunks, received).toString('utf8');
+  } finally {
+    options.signal?.removeEventListener('abort', onAbort);
   }
-  return Buffer.from(result.stdout.replace(/\s+/g, ''), 'base64').toString('utf8');
 }
 
 export async function writeRemoteServerTextFile(

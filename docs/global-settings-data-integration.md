@@ -114,6 +114,13 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - 全局默认 UA 应用于 LLM 的 HTTP 请求、WebSocket 握手及模型列表读取。后续请求重新读取默认值；WS 连接身份包含最终请求头，有效 UA 变化后使用新的握手连接，不复用旧 UA 的连接身份。
 - UA 仅改变 LLM 请求头，不模拟 TLS 指纹、浏览器能力、操作系统或网络出口，也不修改 shell、MCP 等其他客户端进程的 UA。
 
+### 4.3 重试间隔
+
+- 渠道默认配置与 LLM 专属配置使用 `retryDelaySeconds`，经现有 `llmProviderConfigs` section、纯数据转换和修订检查保存；不新增 Bridge 消息或存储根。
+- 保存值为 `0–600` 整数秒，默认 `0`。`0` 保留自动指数退避与抖动；正数表示每次瞬时失败重试前固定等待，不加抖动。该字段不改变重试开关、次数上限或取消规则。
+- 创建 LLM 专属配置时复制渠道当前值；创建后仍为完整配置替代，模型显式 `0` 不继承渠道的正数间隔。
+- 请求建立时转换并冻结为 `model.retryPolicy.retryDelayMs`；压缩使用其实际 Provider / 模型的 `compression.provider.retryPolicy.retryDelayMs`。设置修改只影响后续冻结请求，在途请求和重试不改用后来编辑的值。
+
 ## 5. 前端对接标准
 
 1. 页面组件不要直接调用 bridge，统一通过对应 Pinia store action。
@@ -148,6 +155,7 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - `LlmCompressionConfigRecord.bodyTargetTokens` 是文字压缩后保留的对话主体 Token 目标，默认 `48000`；实际预算仍受 Provider 实测校准与触发阈值以下剩余空间的一半限制。
 - 保留量复用同一配置 record 和渠道/模型绑定。前端 `toPlainCompressionConfig` 与后端 `normalizeLlmCompressionConfig` 必须保留该字段，并复用 `normalizeLlmCompressionBodyTargetTokens`；否则保存回包会把用户修改还原为默认值。
 - 保留量与压缩时限一样在请求建立时冻结：保存影响同一任务的后续请求，旧请求重放继续采用原值。
+- `trigger.thresholdUnit` 为 `percent` 时，`thresholdTokens` 是运行时按上下文窗口推导的值，不作为设置持久化；只有 `tokens` 单位保存该字段。载入多条压缩配置时，归一化回调不能把数组下标当作上下文窗口，避免未编辑的配置被误判为未保存。
 
 ## 8. Ask / Plan 无人值守审批
 

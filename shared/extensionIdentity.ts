@@ -1,5 +1,5 @@
 export const EXTENSION_PACKAGE_NAME = 'limcode-test';
-export const EXTENSION_VERSION = '0.0.20';
+export const EXTENSION_VERSION = '0.0.21';
 export const EXTENSION_USER_AGENT = `${EXTENSION_PACKAGE_NAME}/${EXTENSION_VERSION}`;
 export const EXTENSION_BRAND = 'Limcode test';
 export const EXTENSION_AGENT_NAME = `${EXTENSION_BRAND} Agent`;

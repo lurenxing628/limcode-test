@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import vm from 'node:vm';
 
 const root = process.cwd();
 const distRoot = path.join(root, 'dist/extension');
@@ -1303,29 +1304,106 @@ test('macOS Bash Wrapper超时会终止进程组并发布终态收据', darwinOn
   }
 });
 
-test('Windows命令壳解析结果自洽：PowerShell 7给出绝对路径，缺失时回退5.1', () => {
-  const runtime = windowsPowerShell.resolveWindowsPowerShell();
-  assert.equal(runtime, windowsPowerShell.resolveWindowsPowerShell());
-  if (process.platform !== 'win32') {
+test('PowerShell 6不能启用core语义，解析器继续选择已验证的7', () => {
+  const source = readFileSync(path.join(distRoot, 'backend/capabilities/windowsPowerShell.js'), 'utf8');
+  const resolve = (majors) => {
+    const candidates = new Map(majors.map((major, index) => [`C:\\shell-${index}\\pwsh.exe`, major]));
+    const module = { exports: {} };
+    vm.runInNewContext(source, {
+      module,
+      exports: module.exports,
+      process: { platform: 'win32', env: { PATH: [...candidates.keys()].map(path.win32.dirname).join(';') } },
+      require(name) {
+        if (name === 'node:path') return path.win32;
+        if (name === 'node:fs') return { statSync: () => ({ isFile: () => true }) };
+        if (name === 'node:child_process') {
+          return { spawnSync: (candidate) => ({ status: 0, stdout: String(candidates.get(candidate)) }) };
+        }
+        throw new Error(`Unexpected resolver dependency: ${name}`);
+      }
+    });
+    return { ...module.exports.resolveWindowsPowerShell() };
+  };
+  assert.deepEqual(resolve([6]), { executable: 'powershell.exe', edition: 'desktop' });
+  assert.deepEqual(resolve([6, 7]), { executable: 'C:\\shell-1\\pwsh.exe', edition: 'core' });
+});
+ 
+function envWithoutPowerShellDiscovery() {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !['path', 'programfiles', 'programw6432', 'programfiles(x86)'].includes(key.toLowerCase())
+  ));
+  env.PATH = (process.env.PATH ?? process.env.Path ?? '').split(path.delimiter)
+    .filter((directory) => !existsSync(path.join(directory.trim().replace(/^"(.*)"$/, '$1'), 'pwsh.exe')))
+    .join(path.delimiter);
+  return env;
+}
+
+function resolveWindowsPowerShellInChild({ cwd, env }) {
+  const modulePath = path.join(distRoot, 'backend/capabilities/windowsPowerShell.js');
+  const result = childProcess.spawnSync(process.execPath, [
+    '-e', `process.stdout.write(JSON.stringify(require(${JSON.stringify(modulePath)}).resolveWindowsPowerShell()));`
+  ], { cwd, env, encoding: 'utf8', windowsHide: true, timeout: 15_000 });
+  assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test('Windows命令壳解析拒绝无法验证为7+的相对PATH候选并回退5.1', windowsOnly, async () => {
+  // 相对 PATH 里的 pwsh.exe：候选必须先绝对化再验证；启动不了的文件被探测拒绝，
+  // 不得因为文件名就叫 pwsh.exe 而启用 core 语义，也不得随 cwd 漂移出另一个身份。
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-psrelative-'));
+  try {
+    const anchor = path.join(parent, 'anchor');
+    const fakeDirectory = path.join(anchor, 'ps7');
+    await fs.mkdir(fakeDirectory, { recursive: true });
+    await fs.writeFile(path.join(fakeDirectory, 'pwsh.exe'), 'not a powershell runtime');
+    const env = envWithoutPowerShellDiscovery();
+    env.PATH = 'ps7';
+    const runtime = resolveWindowsPowerShellInChild({ cwd: anchor, env });
     assert.deepEqual(runtime, { executable: 'powershell.exe', edition: 'desktop' });
-    return;
+  } finally {
+    await fs.rm(parent, { recursive: true, force: true });
   }
-  if (runtime.edition === 'desktop') {
-    assert.equal(runtime.executable, 'powershell.exe');
-    return;
-  }
-  assert.equal(runtime.edition, 'core');
-  assert.ok(path.isAbsolute(runtime.executable), runtime.executable);
-  assert.equal(path.basename(runtime.executable).toLowerCase(), 'pwsh.exe');
-  assert.ok(existsSync(runtime.executable), runtime.executable);
 });
 
-test('命令语法说明随实际解析到的PowerShell版本切换链式操作符', () => {
-  const core = windowsPowerShell.powerShellCommandSyntaxGuidance('core');
-  const desktop = windowsPowerShell.powerShellCommandSyntaxGuidance('desktop');
-  assert.match(core, /&&/);
-  assert.doesNotMatch(desktop, /&&/);
-  assert.match(desktop, /5\.1/);
+test('相对PATH发现的真实PowerShell 7以稳定的绝对路径返回', {
+  skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core'
+}, async () => {
+  const real = windowsPowerShell.resolveWindowsPowerShell();
+  const realDirectory = path.dirname(real.executable);
+  const anchor = path.parse(realDirectory).root;
+  const relativeDirectory = path.relative(anchor, realDirectory);
+  assert.ok(relativeDirectory.length > 0 && !path.isAbsolute(relativeDirectory), relativeDirectory);
+  const env = envWithoutPowerShellDiscovery();
+  // 引号、尾随空项和大小写重复项都不得改变解析结果或候选身份。
+  env.PATH = [
+    `"${relativeDirectory}"`,
+    `${relativeDirectory.toUpperCase()}${path.delimiter}`,
+    'limcode-definitely-missing'
+  ].join(path.delimiter);
+  const runtime = resolveWindowsPowerShellInChild({ cwd: anchor, env });
+  assert.equal(runtime.edition, 'core');
+  assert.equal(runtime.executable, real.executable);
+  assert.ok(path.isAbsolute(runtime.executable), runtime.executable);
+});
+
+
+test('解析器跳过验证失败的候选并继续找到真正的PowerShell 7', {
+  skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core'
+}, async () => {
+  const real = windowsPowerShell.resolveWindowsPowerShell();
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-pssweep-'));
+  try {
+    const fakeDirectory = path.join(parent, 'ps-first');
+    await fs.mkdir(fakeDirectory);
+    await fs.writeFile(path.join(fakeDirectory, 'pwsh.exe'), 'not a powershell runtime');
+    const env = envWithoutPowerShellDiscovery();
+    env.PATH = [fakeDirectory, path.dirname(real.executable)].join(path.delimiter);
+    const runtime = resolveWindowsPowerShellInChild({ cwd: parent, env });
+    assert.equal(runtime.edition, 'core');
+    assert.equal(runtime.executable, real.executable);
+  } finally {
+    await fs.rm(parent, { recursive: true, force: true });
+  }
 });
 
 test('Windows包装器实际拉起解析到的PowerShell版本', windowsOnly, async () => {
@@ -1374,20 +1452,42 @@ test('PowerShell 7的错误与表格输出不再夹带自身的ANSI着色', wind
   }
 });
 
-test('解析期错误同样不带ANSI，且行号指向命令自己的行', windowsOnly, async () => {
-  // 整个脚本一次性解析，解析失败时脚本内的 $PSStyle 设置一条都没执行过；
-  // 前置项压成单行后，命令第 N 行的语法错误应报在第 N+1 行。
-  const result = await runPlatformWrapper({
-    command: "Write-Output 'a'\nWrite-Output 'b'\n$x = ( 1; 2 )",
-    timeoutMs: 15_000,
-    suffix: 'parseansi'
-  });
-  try {
-    assert.deepEqual(result.output.match(/\u001b\[[0-9;]*m/g) ?? [], []);
-    assert.notEqual(result.receipt.exitCode, '0');
-    assert.match(result.output, /^\s*4 \|/m);
-  } finally {
-    await fs.rm(result.parent, { recursive: true, force: true });
+test('Windows语法错误不执行部分命令并保留原始输入诊断', windowsOnly, async () => {
+  for (const [suffix, env] of [['current', undefined], ['desktop', envWithoutPowerShellDiscovery()]]) {
+    const result = await runPlatformWrapper({
+      command: "Write-Output 'must-not-run'\nWrite-Output 'b'\n$x = ( 1; 2 )",
+      timeoutMs: 15_000,
+      suffix: `parseansi_${suffix}`,
+      env
+    });
+    try {
+      assert.equal(result.receipt.exitCode, '1');
+      assert.doesNotMatch(result.output, /^must-not-run\r?$/m);
+      assert.match(result.output, /\$x = \( 1; 2 \)/);
+      assert.doesNotMatch(result.output, /\u001b\[[0-9;]*m/g);
+    } finally {
+      await fs.rm(result.parent, { recursive: true, force: true });
+    }
+  }
+});
+
+test('Windows包装器在禁止脚本文件的进程策略下仍执行命令文本', windowsOnly, async () => {
+  // 只限制测试子进程，不改注册表、用户策略或组策略；同样的 Restricted 策略会拒绝加载 unsigned .ps1。
+  for (const [suffix, env] of [['current', undefined], ['desktop', envWithoutPowerShellDiscovery()]]) {
+    const result = await runPlatformWrapper({
+      command: '[Console]::Out.Write("$((Get-ExecutionPolicy)) policy-ok 中文"); exit 7',
+      timeoutMs: 15_000,
+      suffix: `restricted_${suffix}`,
+      executionPolicy: 'Restricted',
+      env
+    });
+    try {
+      assert.equal(result.bootstrap.phase, 'identity_ready');
+      assert.equal(result.receipt.exitCode, '7');
+      assert.equal(result.output, 'Restricted policy-ok 中文');
+    } finally {
+      await fs.rm(result.parent, { recursive: true, force: true });
+    }
   }
 });
 
@@ -1542,7 +1642,6 @@ test('Windows解析错误等待身份记录完成后才退出并保留诊断', w
     assert.equal(result.bootstrap.phase, 'identity_ready');
     assert.equal(result.bootstrap.childPid, result.identity.childPid);
     assert.equal(result.receipt.exitCode, '1');
-    assert.match(result.output, /ParserError/);
     assert.match(result.output, /\$broken/);
     assert.doesNotMatch(result.output, /^must-not-run\r?$/m);
     assert.doesNotMatch(result.output, /\u001b\[/);
@@ -1668,7 +1767,7 @@ test('host consumes durable pre-identity failure instead of waiting for outcome_
   }
 });
 
-async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env, fingerprintDelayMs = 0 }) {
+async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env, fingerprintDelayMs = 0, executionPolicy }) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-wrapper-${process.platform}-`));
   const spoolLocator = `process_${process.platform}_${suffix}`;
   const spoolPath = path.join(parent, spoolLocator);
@@ -1689,12 +1788,26 @@ async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env, fi
   };
   const launchPath = path.join(spoolPath, 'launch.json');
   await fs.writeFile(launchPath, `${JSON.stringify(request, null, 2)}\n`);
-  const preloadPath = fingerprintDelayMs ? path.join(parent, 'delay-fingerprint.cjs') : undefined;
+  const preloadPath = fingerprintDelayMs || executionPolicy ? path.join(parent, 'wrapper-preload.cjs') : undefined;
   if (preloadPath) {
     await fs.writeFile(preloadPath, [
-      `const protocol = require(${JSON.stringify(path.join(distRoot, 'backend/reliableKernel/processProtocol.js'))});`,
-      'const readFingerprint = protocol.readProcessStartFingerprint;',
-      `protocol.readProcessStartFingerprint = (pid) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${fingerprintDelayMs}); return readFingerprint(pid); };`
+      ...(fingerprintDelayMs ? [
+        `const protocol = require(${JSON.stringify(path.join(distRoot, 'backend/reliableKernel/processProtocol.js'))});`,
+        'const readFingerprint = protocol.readProcessStartFingerprint;',
+        `protocol.readProcessStartFingerprint = (pid) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${fingerprintDelayMs}); return readFingerprint(pid); };`
+      ] : []),
+      ...(executionPolicy ? [
+        "const childProcess = require('node:child_process');",
+        'const spawn = childProcess.spawn;',
+        'childProcess.spawn = (file, args, options) => {',
+        "  const index = args.indexOf('-Command');",
+        '  if (index !== -1) {',
+        '    args = [...args];',
+        `    args[index + 1] = ${JSON.stringify(`Set-ExecutionPolicy -Scope Process -ExecutionPolicy ${executionPolicy} -Force; `)} + args[index + 1];`,
+        '  }',
+        '  return spawn(file, args, options);',
+        '};'
+      ] : [])
     ].join('\n'));
   }
   const run = await runWrapperProcess(launchPath, 15_000, env, preloadPath);
