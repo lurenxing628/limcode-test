@@ -16,11 +16,19 @@ Module._load = function load(request, parent, isMain) {
 after(() => { Module._load = originalLoad; });
 
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
-const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
+const {
+  createDefaultLlmProviderConfig,
+  normalizeLlmProviderConfig
+} = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { loadRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { frozenCompressionPolicy, frozenInteractionAutoApproval } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
-const { createDefaultLlmCompressionConfig, normalizeLlmCompressionMaxDurationMinutes } = require('../../dist/extension/shared/protocol.js');
+const {
+  createDefaultLlmCompressionConfig,
+  normalizeLlmCompressionMaxDurationMinutes,
+  DEFAULT_LLM_RETRY_DELAY_SECONDS,
+  MAX_LLM_RETRY_DELAY_SECONDS
+} = require('../../dist/extension/shared/protocol.js');
 const { resolveToolPolicyLayers } = require('../../dist/extension/shared/toolPolicyResolution.js');
 const {
   createRemoteServerWorkEnvironmentRecord,
@@ -856,6 +864,82 @@ test('不相关的旧压缩配置不会阻塞 Agent、Workflow 与 Configuration
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test('重试间隔按模型覆盖渠道冻结成 retryDelayMs，并夹到 0..600 秒', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-retry-delay-authority-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: '重试间隔 Provider' }),
+      id: 'provider:retry-delay',
+      model: 'model:channel',
+      models: [{ id: 'model:channel', name: '渠道默认模型' }, { id: 'model:override', name: '模型覆盖' }],
+      retryOnError: true,
+      retryMaxAttempts: 4,
+      retryDelaySeconds: 30,
+      modelConfigs: [{
+        id: 'model-config:override',
+        modelId: 'model:override',
+        toolCallFormat: 'function-call',
+        openaiResponsesTransport: 'http',
+        stream: true,
+        retryOnError: true,
+        retryMaxAttempts: 2,
+        retryDelaySeconds: 60,
+        enableMultimodalTools: true,
+        systemPromptPrefix: '',
+        createdAt: 1,
+        updatedAt: 1
+      }]
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+
+    const channelFrozen = JSON.parse((await authority.compile({
+      conversationId: 'conversation:retry-channel',
+      turnId: 'turn:retry-channel',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.deepEqual(channelFrozen.model.retryPolicy, {
+      enabled: true,
+      maxRetries: 4,
+      retryDelayMs: 30_000
+    });
+
+    await authority.mutations.setModelProfile({
+      scopeKind: 'conversation',
+      scopeId: 'conversation:retry-model',
+      name: '模型覆盖',
+      providerConfigId: provider.id,
+      provider: provider.provider,
+      model: 'model:override'
+    });
+    const modelFrozen = JSON.parse((await authority.compile({
+      conversationId: 'conversation:retry-model',
+      turnId: 'turn:retry-model',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.deepEqual(modelFrozen.model.retryPolicy, {
+      enabled: true,
+      maxRetries: 2,
+      retryDelayMs: 60_000
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('重试间隔归一化：非法值与负数落回 0，超过上限夹到 600 秒', () => {
+  const config = normalizeLlmProviderConfig({ retryDelaySeconds: 999_999 });
+  assert.equal(config.retryDelaySeconds, MAX_LLM_RETRY_DELAY_SECONDS);
+  assert.equal(normalizeLlmProviderConfig({}).retryDelaySeconds, DEFAULT_LLM_RETRY_DELAY_SECONDS);
+  assert.equal(normalizeLlmProviderConfig({ retryDelaySeconds: -30 }).retryDelaySeconds, 0);
+  assert.equal(normalizeLlmProviderConfig({ retryDelaySeconds: Number.NaN }).retryDelaySeconds, 0);
+  assert.equal(normalizeLlmProviderConfig({ retryDelaySeconds: 30.9 }).retryDelaySeconds, 30);
 });
 
 test('压缩最长时间默认20分钟并限制为1到1440分钟的整数', () => {

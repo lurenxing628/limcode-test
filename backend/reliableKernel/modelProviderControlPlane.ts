@@ -1292,7 +1292,8 @@ export class ModelProviderControlPlane {
         modelRequestId,
         identity,
         error.reason,
-        maxRetries
+        maxRetries,
+        retryPolicy?.retryDelayMs ?? 0
       );
       if (retryAttempt === null) {
         return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
@@ -1762,7 +1763,8 @@ export class ModelProviderControlPlane {
     modelRequestId: string,
     failed: StreamIdentity,
     reason: ProviderTransientReason,
-    maxRetries: number
+    maxRetries: number,
+    configuredDelayMs: number
   ): Promise<{ attemptSeq: bigint; delayMs: number; retryNotBeforeAt: number } | null> {
     if (!Number.isSafeInteger(maxRetries) || maxRetries <= 0 || maxRetries > 10) {
       throw new Error('Provider retry policy must allow between 1 and 10 retries.');
@@ -1771,11 +1773,9 @@ export class ModelProviderControlPlane {
     if (retryOrdinal > maxRetries) throw new Error('Provider transient retry budget is exhausted.');
     const nextAttemptSeq = failed.attemptSeq + 1n;
     const attemptId = stableId('model_request_attempt', modelRequestId, nextAttemptSeq.toString());
-    const delayMs = retryDelayMs(
-      retryOrdinal,
-      this.retryDelaysMs,
-      `${modelRequestId}:${retryOrdinal}`
-    );
+    const delayMs = configuredDelayMs > 0
+      ? configuredDelayMs
+      : retryDelayMs(retryOrdinal, this.retryDelaysMs, `${modelRequestId}:${retryOrdinal}`);
     const retryNotBeforeAt = this.epochNow() + delayMs;
     // Same heartbeat-tolerant retry: assertion failures from benign stats metadata writes are
     // retried from a fresh bundle; a genuine concurrent retry (unique/identity race) still loses.

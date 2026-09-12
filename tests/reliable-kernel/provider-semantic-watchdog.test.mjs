@@ -1266,6 +1266,45 @@ test('已提交 retrying/not-before 在 Host handoff 后由新 ControlPlane 恢�
   });
 });
 
+test('冻结 retryDelayMs 固定重试间隔，覆盖内核自动退避且不加抖动', async () => {
+  const configuredDelayMs = 30_000;
+  await withApp('provider-fixed-retry-delay', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'fixed-retry-delay');
+    // 内核退避表配置为 0ms；固定间隔生效时应完全取代它。
+    const host = controlPlane(app, { retryDelaysMs: [0] });
+    const dispatch = host.dispatch(request.modelRequestId, {
+      providerId: 'provider-watchdog',
+      async sendFullRequest() {
+        throw new kernel.ProviderTransientError('connection_interrupted', 'fixed delay fixture');
+      }
+    });
+    const retrying = await waitForRequestStatus(app, request.modelRequestId, 'retrying');
+    assert.equal(retrying.stream_stats_json.retryDelayMs, configuredDelayMs);
+    assert.ok(retrying.stream_stats_json.retryNotBeforeAt > Date.now() + configuredDelayMs / 2);
+    await host.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture handoff'));
+    await assert.rejects(dispatch, /handoff/i);
+  }, 'openai-responses', { enabled: true, maxRetries: 2, retryDelayMs: configuredDelayMs });
+});
+
+test('冻结 retryDelayMs=0 时仍走内核自动退避表', async () => {
+  await withApp('provider-auto-retry-delay', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'auto-retry-delay');
+    const host = controlPlane(app, { retryDelaysMs: [4_000] });
+    const dispatch = host.dispatch(request.modelRequestId, {
+      providerId: 'provider-watchdog',
+      async sendFullRequest() {
+        throw new kernel.ProviderTransientError('connection_interrupted', 'auto delay fixture');
+      }
+    });
+    const retrying = await waitForRequestStatus(app, request.modelRequestId, 'retrying');
+    // 自动退避带确定性抖动，落在 [75%, 100%] 区间内。
+    assert.ok(retrying.stream_stats_json.retryDelayMs >= 3_000);
+    assert.ok(retrying.stream_stats_json.retryDelayMs <= 4_000);
+    await host.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture handoff'));
+    await assert.rejects(dispatch, /handoff/i);
+  }, 'openai-responses', { enabled: true, maxRetries: 2, retryDelayMs: 0 });
+});
+
 test('生产 deadline 固定为普通首语义300秒/idle600秒与压缩无进度270秒', () => {
   assert.deepEqual(kernel.RELIABLE_PROVIDER_SEMANTIC_DEADLINES_MS, {
     ordinaryFirst: 300_000,

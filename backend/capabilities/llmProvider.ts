@@ -102,6 +102,7 @@ import {
   DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT,
   isInlineDataPart,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+  MAX_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_ON_ERROR,
   isTextPart,
   isVisibleTextPart,
@@ -492,7 +493,7 @@ export async function startLlmProvider(
 
         sawRetry = true;
         retryCount = nextRetryCount;
-        const retryDelayMs = retryDelayForAttempt(retryCount);
+        const retryDelayMs = retryDelayForAttempt(retryCount, settings.retryDelaySeconds);
         emitLlmRetryScheduled(streamEmit, request.id, failure.message, failure.rawError, retryCount, maxRetries, retryDelayMs);
         const shouldRetry = await waitForRetryDelay(retryDelayMs, retryControl, signal);
         if (!shouldRetry) {
@@ -1388,9 +1389,19 @@ function truncateForSummary(value: string): string {
   return value.length > limit ? `${value.slice(0, limit)}…` : value;
 }
 
-function retryDelayForAttempt(retryAttempt: number): number {
+function retryDelayForAttempt(retryAttempt: number, configuredDelaySeconds?: number): number {
+  const configured = normalizeRetryDelaySeconds(configuredDelaySeconds);
+  if (configured > 0) return configured * 1_000;
   const base = Math.min(8_000, 500 * (2 ** Math.max(0, retryAttempt - 1)));
   return Math.max(0, Math.round(base * (0.75 + Math.random() * 0.25)));
+}
+
+function normalizeRetryDelaySeconds(value: unknown): number {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  const seconds = Math.floor(number);
+  if (seconds <= 0) return 0;
+  return Math.min(seconds, MAX_LLM_RETRY_DELAY_SECONDS);
 }
 
 function waitForRetryDelay(delayMs: number, control: RetryControl, signal?: AbortSignal): Promise<boolean> {
@@ -1812,7 +1823,7 @@ export async function compactLlmProvider(
 
         sawRetry = true;
         retryCount = nextRetryCount;
-        const retryDelayMs = retryDelayForAttempt(retryCount);
+        const retryDelayMs = retryDelayForAttempt(retryCount, retrySettings?.retryDelaySeconds);
         logCompressionDebug('provider.compact.retryScheduled', {
           ...compactRequestDebugInfo(request),
           message: failure.message,
@@ -4180,6 +4191,7 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
     stream: settings?.stream !== false,
     retryOnError: settings?.retryOnError !== false ? DEFAULT_LLM_RETRY_ON_ERROR : false,
     retryMaxAttempts,
+    retryDelaySeconds: normalizeRetryDelaySeconds(settings?.retryDelaySeconds),
     enableMultimodalTools: settings?.enableMultimodalTools !== false,
     ...(contextWindowTokens ? { contextWindowTokens } : {}),
     systemPromptPrefix: typeof settings?.systemPromptPrefix === 'string' ? settings.systemPromptPrefix : '',
@@ -4303,6 +4315,7 @@ function snapshotFromSettings(settings: LlmProviderConfigRecord, compressionConf
     stream: settings.stream !== false,
     retryOnError: settings.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: normalizeRetryDelaySeconds(settings.retryDelaySeconds),
     enableMultimodalTools: settings.enableMultimodalTools !== false,
     ...(settings.contextWindowTokens ? { contextWindowTokens: settings.contextWindowTokens } : {}),
     ...(settings.systemPromptPrefix.trim() ? { systemPromptPrefix: settings.systemPromptPrefix } : {}),

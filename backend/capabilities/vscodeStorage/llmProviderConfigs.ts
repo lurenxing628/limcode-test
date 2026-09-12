@@ -20,6 +20,8 @@ import type {
 import {
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+  DEFAULT_LLM_RETRY_DELAY_SECONDS,
+  MAX_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_ON_ERROR,
   createDefaultLlmPromptCacheConfig,
   createMessageId,
@@ -112,6 +114,7 @@ export function createDefaultLlmProviderConfig(input: { name?: string } = {}): L
     stream: true,
     retryOnError: DEFAULT_LLM_RETRY_ON_ERROR,
     retryMaxAttempts: DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: true,
     contextWindowTokens: DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
     systemPromptPrefix: '',
@@ -149,6 +152,7 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
     stream: typeof input?.stream === 'boolean' ? input.stream : true,
     retryOnError: typeof input?.retryOnError === 'boolean' ? input.retryOnError : DEFAULT_LLM_RETRY_ON_ERROR,
     retryMaxAttempts: finiteRetryMaxAttempts(input?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+    retryDelaySeconds: finiteRetryDelaySeconds(input?.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: typeof input?.enableMultimodalTools === 'boolean' ? input.enableMultimodalTools : true,
     contextWindowTokens,
     systemPromptPrefix: normalizeSystemPromptPrefix(input?.systemPromptPrefix),
@@ -248,6 +252,7 @@ function normalizeModelConfigs(
       stream: typeof item.stream === 'boolean' ? item.stream : true,
       retryOnError: typeof item.retryOnError === 'boolean' ? item.retryOnError : DEFAULT_LLM_RETRY_ON_ERROR,
       retryMaxAttempts: finiteRetryMaxAttempts(item.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+      retryDelaySeconds: finiteRetryDelaySeconds(item.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
       enableMultimodalTools: typeof item.enableMultimodalTools === 'boolean' ? item.enableMultimodalTools : true,
       contextWindowTokens: finitePositiveInteger(item.contextWindowTokens) ?? providerDefaultContextWindow(provider),
       systemPromptPrefix: normalizeSystemPromptPrefix(item.systemPromptPrefix),
@@ -299,6 +304,14 @@ function finiteTimestamp(value: unknown, fallback: number): number {
 function finitePositiveInteger(value: unknown): number | undefined {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : undefined;
+}
+
+function finiteRetryDelaySeconds(value: unknown): number | undefined {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return undefined;
+  const seconds = Math.floor(number);
+  if (seconds <= 0) return 0;
+  return Math.min(seconds, MAX_LLM_RETRY_DELAY_SECONDS);
 }
 
 function finiteRetryMaxAttempts(value: unknown): number | undefined {
