@@ -39,18 +39,20 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             description: 'Working directory relative to the workspace root. Defaults to the workspace root. Only used when mode=execute.'
           },
           foregroundWaitMs: {
-            type: 'number',
-            description: 'Required for mode=execute. Foreground response budget in milliseconds; this only moves a still-running command to the background and never terminates it. Use 0 to background immediately.'
+            type: 'integer',
+            minimum: 0,
+            maximum: 60000,
+            description: 'Required for mode=execute. Integer milliseconds from 0 to 60000 to wait before returning a still-running command as a background process. Use 0 to background immediately. This does not terminate the command; executionTimeoutMs controls the hard deadline.'
           },
           executionTimeoutMs: {
-            type: 'number',
+            type: 'integer',
             minimum: 1000,
             maximum: 600000,
             default: 120000,
             description: 'Optional hard execution deadline in milliseconds, independent of foregroundWaitMs. Defaults to 120000; allowed range 1000-600000. The detached runtime terminates the process group at this deadline and reports timed_out.'
           },
           maxOutputBytes: {
-            type: 'number',
+            type: 'integer',
             minimum: 1024,
             maximum: 1073741824,
             default: 268435456,

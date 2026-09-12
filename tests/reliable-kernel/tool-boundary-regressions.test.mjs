@@ -23,6 +23,62 @@ const { ReliableToolDispatcher } = require(path.join(
   root,
   'dist/extension/backend/reliableKernel/toolDispatcher.js'
 ));
+const { createCommandTool } = require(path.join(
+  root,
+  'dist/extension/backend/world/modules/tools/definitions/command/index.js'
+));
+
+for (const toolName of ['shell', 'bash']) {
+  for (const [fieldName, minimum, maximum] of [
+    ['foregroundWaitMs', 0, 60000],
+    ['executionTimeoutMs', 1000, 600000],
+    ['maxOutputBytes', 1024, 1073741824]
+  ]) {
+    test(`${toolName} 的 ${fieldName} 声明与可靠执行器整数边界一致`, async () => {
+      const stoppedBeforeProcessStart = new Error('stopped before process start');
+      const dispatcher = {
+        dependencies: {
+          host: { async resolveProcessCwd() { throw stoppedBeforeProcessStart; } }
+        }
+      };
+      const dispatch = (value) => ReliableToolDispatcher.prototype.dispatchProcess.call(
+        dispatcher,
+        {
+          toolName,
+          toolCallId: 'command-integer-contract',
+          arguments: {
+            command: 'echo contract-test',
+            explanation: 'check command parameter boundaries without starting a process',
+            foregroundWaitMs: 0,
+            [fieldName]: value
+          }
+        },
+        {},
+        new AbortController().signal
+      );
+      const validValues = [minimum, maximum];
+      const invalidValues = [minimum - 1, maximum + 1, minimum + 0.5, '1000', null];
+      if (fieldName === 'foregroundWaitMs') invalidValues.push(undefined, 90000, 120000);
+      else validValues.push(undefined);
+      for (const value of validValues) {
+        await assert.rejects(dispatch(value), (error) => error === stoppedBeforeProcessStart);
+      }
+      for (const value of invalidValues) {
+        await assert.rejects(dispatch(value), new RegExp(`${fieldName} must be an integer from ${minimum} to ${maximum}`));
+      }
+      const tool = createCommandTool({ toolName, description: toolName });
+      const field = tool.declaration.parameters.properties[fieldName];
+      assert.equal(field.type, 'integer');
+      assert.equal(field.minimum, minimum);
+      assert.equal(field.maximum, maximum);
+      if (fieldName === 'foregroundWaitMs') {
+        assert.match(field.description, /0 to 60000/);
+        assert.match(field.description, /executionTimeoutMs/);
+        assert.ok(!tool.declaration.parameters.required?.includes(fieldName));
+      }
+    });
+  }
+}
 
 function readDeps() {
   const calls = { binary: [], text: [] };
