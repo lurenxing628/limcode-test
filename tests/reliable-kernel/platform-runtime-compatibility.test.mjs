@@ -1329,8 +1329,9 @@ test('PowerShell 6不能启用core语义，解析器继续选择已验证的7', 
 });
  
 function envWithoutPowerShellDiscovery() {
+  // A PowerShell 7 parent exports its module paths; a forced 5.1 child must rebuild its own.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-    !['path', 'programfiles', 'programw6432', 'programfiles(x86)'].includes(key.toLowerCase())
+    !['path', 'programfiles', 'programw6432', 'programfiles(x86)', 'psmodulepath'].includes(key.toLowerCase())
   ));
   env.PATH = (process.env.PATH ?? process.env.Path ?? '').split(path.delimiter)
     .filter((directory) => !existsSync(path.join(directory.trim().replace(/^"(.*)"$/, '$1'), 'pwsh.exe')))
@@ -1547,12 +1548,7 @@ test('Windows包装器支持超过命令行上限的Unicode内联脚本并保留
 });
 
 test('Windows PowerShell 5.1文件执行保留长脚本Unicode和括号原生退出码', windowsOnly, async () => {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-    !['path', 'programfiles', 'programw6432', 'programfiles(x86)'].includes(key.toLowerCase())
-  ));
-  env.PATH = (process.env.PATH ?? process.env.Path ?? '').split(path.delimiter)
-    .filter((directory) => !existsSync(path.join(directory.trim().replace(/^"(.*)"$/, '$1'), 'pwsh.exe')))
-    .join(path.delimiter);
+  const env = envWithoutPowerShellDiscovery();
   const result = await runPlatformWrapper({
     command: [
       `# ${'长脚本'.repeat(8192)}`,
