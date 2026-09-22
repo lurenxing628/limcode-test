@@ -15,6 +15,7 @@ import {
   type RepositoryRead,
   type RepositoryTransactionStep
 } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface ConversationForkSnapshotPlan {
@@ -22,6 +23,26 @@ export interface ConversationForkSnapshotPlan {
   inserts: RepositoryTransactionStep[];
   copiedVisibleMessageCount: number;
 }
+
+export interface ForkContextRootShape {
+  id: string;
+  rootNodeId: string | null;
+  tailNodeId: string | null;
+  tailSegmentCount: bigint;
+  segmentCount: bigint;
+}
+
+/**
+ * The target Conversation's Context roots. Copied frozen projections are re-homed onto them: the
+ * target head when the frozen root has the same immutable shape, otherwise the copied history root.
+ */
+export interface ForkContextRoots {
+  head: ForkContextRootShape;
+  /** Source ContextSequenceRoot id -> copied target history root id. */
+  history: ReadonlyMap<string, string>;
+}
+
+const PAGE_LIMIT = 1000;
 
 interface MessageFact {
   message: DomainRow;
@@ -81,6 +102,13 @@ export async function prepareConversationForkSnapshot(
     selectedMessageIds?: ReadonlySet<string>;
     contextSegmentIds?: readonly string[];
     targetAgentId: string;
+    /**
+     * User forks own frozen copies of each copied Turn's AuthoritySnapshot. Child forks never
+     * inherit the parent's authority: their copied Turns keep no authority of their own.
+     */
+    copyTurnAuthority: boolean;
+    /** Target roots for copied request projections; omitted when the target re-sequences Context. */
+    contextRoots?: ForkContextRoots;
     now: string;
   }
 ): Promise<ConversationForkSnapshotPlan> {
@@ -194,13 +222,19 @@ export async function prepareConversationForkSnapshot(
   const messageFacts: MessageFact[] = [];
   for (const [index, candidate] of visibleCandidates.entries()) {
     const offset = index * 5;
+    const messageId = id(candidate.message.id, 'Message.id');
+    const revisionId = id(candidate.revision.id, 'MessageRevision.id');
     const fact: MessageFact = {
       ...candidate,
-      attachments: rows(relationBarrier!.snapshot[offset], 'AttachmentLink fork source lookup'),
-      contextSources: rows(relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource fork source lookup'),
-      turnLinks: rows(relationBarrier!.snapshot[offset + 2], 'MessageTurnLink fork source lookup'),
+      attachments: await completeRows(database, relationBarrier!.snapshot[offset], 'AttachmentLink', {
+        message_revision_id: revisionId
+      }),
+      contextSources: await completeRows(database, relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource', {
+        source_kind: 'message_revision', source_id: revisionId
+      }),
+      turnLinks: await completeRows(database, relationBarrier!.snapshot[offset + 2], 'MessageTurnLink', { message_id: messageId }),
       requestLinks: rows(relationBarrier!.snapshot[offset + 3], 'ModelRequestMessageLink fork source lookup'),
-      toolSources: rows(relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink fork source lookup')
+      toolSources: await completeRows(database, relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink', { message_id: messageId })
     };
     if (fact.turnLinks.some((link) => link.role === NATIVE_STEER_MESSAGE_TURN_ROLE)) {
       if (!contextLineage) throw new Error('Native steering fork requires an explicit Context prefix.');
@@ -223,8 +257,8 @@ export async function prepareConversationForkSnapshot(
   const requestRows = await getRows(database, 'ModelRequest', requestIds);
   const requestAggregates = await readRequestAggregates(database, requestRows);
   const requestIdSet = new Set(requestAggregates.map((entry) => id(entry.request.id, 'ModelRequest.id')));
-  const nativeRevisions = new Map<string, NativeMessageContextRevision[]>();
   const requestRowsById = new Map(requestRows.map((request) => [id(request.id, 'ModelRequest.id'), request]));
+  const nativeRevisions = new Map<string, NativeMessageContextRevision[]>();
   for (const fact of messageFacts) {
     if (fact.revision.role !== 'model' || !fact.requestLinks.some((link) => {
       const request = requestRowsById.get(id(link.model_request_id, 'ModelRequestMessageLink.model_request_id'));
@@ -272,6 +306,29 @@ export async function prepareConversationForkSnapshot(
   const turnRows = await getRows(database, 'Turn', turnIds);
   requireTerminatedTurns(turnRows);
   const turnRelations = await readTurnRelations(database, turnRows);
+  // A Turn whose whole transcript is copied is copied with every ModelRequest it made, including
+  // compression and failed requests that own no Message, so its original termination stays valid.
+  const copiedMessageIds = new Set([...messageFacts, ...toolResultMessages].map((fact) => id(fact.message.id, 'Message.id')));
+  const completeTurnRequests = turnRows.flatMap((turn) => {
+    const relation = turnRelations.get(id(turn.id, 'Turn.id'))!;
+    return relation.messageLinks.every((link) => copiedMessageIds.has(id(link.message_id, 'MessageTurnLink.message_id')))
+      ? relation.modelRequests.filter((request) => !requestIdSet.has(id(request.id, 'ModelRequest.id')))
+      : [];
+  });
+  for (const aggregate of await readRequestAggregates(database, completeTurnRequests)) {
+    const requestId = id(aggregate.request.id, 'ModelRequest.id');
+    requestAggregates.push(aggregate);
+    requestIdSet.add(requestId);
+    requestIds.push(requestId);
+  }
+  const authoritySnapshots = input.copyTurnAuthority
+    ? (await Promise.all(turnRows.map((turn) =>
+        listAllDomainRows(database, 'AuthoritySnapshot', { turn_id: id(turn.id, 'Turn.id') })
+      ))).flat()
+    : [];
+  const projections = input.contextRoots
+    ? await readRequestProjections(database, requestAggregates, input.contextRoots)
+    : [];
   const fileFacts = await readFileFacts(database, tools);
   const interactionFacts = await readInteractionFacts(database, tools);
 
@@ -320,6 +377,9 @@ export async function prepareConversationForkSnapshot(
   const requestIdMap = idMap(target, 'model_request', requestIds);
   const toolIdMap = idMap(target, 'tool_call', tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')));
   const modelResultIdMap = idMap(target, 'tool_model_result', tools.map((fact) => id(fact.modelResult.id, 'ToolModelResult.id')));
+  const authorityIdMap = input.copyTurnAuthority
+    ? idMap(target, 'authority_snapshot', authoritySnapshots.map((snapshot) => id(snapshot.id, 'AuthoritySnapshot.id')))
+    : undefined;
 
   const assertions: RepositoryTransactionStep[] = [];
   const inserts: RepositoryTransactionStep[] = [];
@@ -440,8 +500,30 @@ export async function prepareConversationForkSnapshot(
     }));
   }
 
+  for (const snapshot of authoritySnapshots) {
+    const sourceSnapshotId = id(snapshot.id, 'AuthoritySnapshot.id');
+    const sourceTurnId = id(snapshot.turn_id, 'AuthoritySnapshot.turn_id');
+    assertions.push(DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').assert(sourceSnapshotId, {
+      turn_id: sourceTurnId,
+      content_object_id: snapshot.content_object_id
+    }));
+    inserts.push(DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
+      ...snapshot,
+      id: mapped(authorityIdMap!, sourceSnapshotId, 'AuthoritySnapshot'),
+      turn_id: mapped(turnIdMap, sourceTurnId, 'Turn')
+    }));
+  }
   for (const aggregate of requestAggregates) {
-    addRequestAggregate(assertions, inserts, aggregate, target, turnIdMap, requestIdMap);
+    addRequestAggregate(assertions, inserts, aggregate, target, turnIdMap, requestIdMap, authorityIdMap);
+  }
+  for (const { projection, rootId } of projections) {
+    const sourceRequestId = id(projection.owner_id, 'ModelContextProjection.owner_id');
+    inserts.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
+      ...projection,
+      id: copyId(target, 'model_context_projection', id(projection.id, 'ModelContextProjection.id')),
+      owner_id: mapped(requestIdMap, sourceRequestId, 'ModelRequest'),
+      root_id: rootId
+    }));
   }
   for (const fact of messageFacts) {
     for (const link of fact.requestLinks) {
@@ -517,14 +599,57 @@ async function readRequestAggregates(database: RuntimeDatabase, requests: Domain
       where: { model_request_id: id(requests[index].id, 'ModelRequest.id') }, limit: 2
     })
   ]));
-  return requests.map((request, index) => {
-    const attempts = rows(aggregateBarrier.snapshot[index * 2], 'Attempt fork source lookup')
-      .sort((left, right) => compareInteger(left.attempt_seq, right.attempt_seq));
+  const aggregates: RequestAggregate[] = [];
+  for (const [index, request] of requests.entries()) {
+    const attempts = (await completeRows(database, aggregateBarrier.snapshot[index * 2], 'Attempt', {
+      operation_id: id(operations[index].id, 'Operation.id')
+    })).sort((left, right) => compareInteger(left.attempt_seq, right.attempt_seq));
     if (attempts.length === 0) throw new Error(`Fork source ModelRequest ${String(request.id)} has no Attempt.`);
     const fences = rows(aggregateBarrier.snapshot[index * 2 + 1], 'ModelStreamFence fork source lookup');
     if (fences.length > 1) throw new Error(`Fork source ModelRequest ${String(request.id)} has multiple fences.`);
-    return { request, operation: operations[index], attempts, fence: fences[0] ?? null };
+    aggregates.push({ request, operation: operations[index], attempts, fence: fences[0] ?? null });
+  }
+  return aggregates;
+}
+
+/** Re-homes each copied request's frozen Context projection onto the equivalent target root. */
+async function readRequestProjections(
+  database: RuntimeDatabase,
+  aggregates: readonly RequestAggregate[],
+  roots: ForkContextRoots
+): Promise<Array<{ projection: DomainRow; rootId: string }>> {
+  if (aggregates.length === 0) return [];
+  const barrier = await database.snapshot(aggregates.map((aggregate) =>
+    DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+      where: { owner_kind: 'model_request', owner_id: id(aggregate.request.id, 'ModelRequest.id') }, limit: 2
+    })
+  ));
+  const projections = barrier.snapshot.flatMap((value) => {
+    const found = rows(value, 'ModelContextProjection fork source lookup');
+    if (found.length > 1) throw new Error('Fork source ModelRequest has multiple Context projections.');
+    return found;
   });
+  const sourceRoots = await getRows(database, 'ContextSequenceRoot', unique(projections.map((projection) =>
+    id(projection.root_id, 'ModelContextProjection.root_id')
+  )));
+  const rootsById = new Map(sourceRoots.map((root) => [id(root.id, 'ContextSequenceRoot.id'), root]));
+  return projections.flatMap((projection) => {
+    const rootId = mapForkContextRoot(rootsById.get(id(projection.root_id, 'ModelContextProjection.root_id'))!, roots);
+    // A frozen root outside the retained history (for example an edited-away prefix) has no
+    // equivalent in the target; that request keeps no projection instead of a foreign root.
+    return rootId ? [{ projection, rootId }] : [];
+  });
+}
+
+export function mapForkContextRoot(sourceRoot: DomainRow, roots: ForkContextRoots): string | undefined {
+  const head = roots.head;
+  if (sourceRoot.root_node_id === head.rootNodeId
+    && sourceRoot.tail_node_id === head.tailNodeId
+    && integer(sourceRoot.tail_segment_count, 'ContextSequenceRoot.tail_segment_count') === head.tailSegmentCount
+    && integer(sourceRoot.segment_count, 'ContextSequenceRoot.segment_count') === head.segmentCount) {
+    return head.id;
+  }
+  return roots.history.get(id(sourceRoot.id, 'ContextSequenceRoot.id'));
 }
 
 async function readToolFacts(
@@ -548,26 +673,27 @@ async function readToolFacts(
     ];
   });
   const barrier = await database.snapshot(reads);
-  const partial = toolCalls.map((toolCall, index) => {
+  const partial = [];
+  for (const [index, toolCall] of toolCalls.entries()) {
     const toolCallId = id(toolCall.id, 'ToolCall.id');
     const execution = one(rows(barrier.snapshot[index * 7 + 2], 'ToolExecution fork source lookup'), 'ToolExecution');
     const outcome = one(rows(barrier.snapshot[index * 7 + 3], 'ToolOutcome fork source lookup'), 'ToolOutcome');
     const modelResult = one(rows(barrier.snapshot[index * 7 + 5], 'ToolModelResult fork source lookup'), 'ToolModelResult');
     const callSources = rows(barrier.snapshot[index * 7 + 6], 'ToolCall Context source lookup');
     if (callSources.length !== 1) throw new Error(`Fork source ToolCall ${toolCallId} has no unique Context occurrence.`);
-    return {
+    partial.push({
       toolCall,
       source: sourceByTool.get(toolCallId)!,
       policy: rows(barrier.snapshot[index * 7], 'ToolCallPolicySnapshot fork source lookup')[0] ?? null,
-      events: rows(barrier.snapshot[index * 7 + 1], 'ToolCallEvent fork source lookup')
+      events: (await completeRows(database, barrier.snapshot[index * 7 + 1], 'ToolCallEvent', { tool_call_id: toolCallId }))
         .sort((left, right) => compareInteger(left.event_seq, right.event_seq)),
       execution,
       outcome,
-      artifacts: rows(barrier.snapshot[index * 7 + 4], 'ToolResultArtifact fork source lookup'),
+      artifacts: await completeRows(database, barrier.snapshot[index * 7 + 4], 'ToolResultArtifact', { tool_call_id: toolCallId }),
       modelResult,
       callSource: callSources[0]
-    };
-  });
+    });
+  }
   const resultSourceBarrier = await database.snapshot(partial.map((fact) =>
     DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
       where: {
@@ -615,7 +741,7 @@ async function readToolResultMessages(
   });
   const barrier = await database.snapshot(reads);
   const byMessage = new Map<string, MessageFact>();
-  revisions.forEach((revision, index) => {
+  for (const [index, revision] of revisions.entries()) {
     const messageId = messageIds[index];
     const message = row(barrier.snapshot[index * 5], `Tool result Message ${messageId}`);
     const membership = one(rows(barrier.snapshot[index * 5 + 1], 'Tool result membership lookup'), 'tool result membership');
@@ -626,13 +752,15 @@ async function readToolResultMessages(
       membership,
       current,
       revision,
-      attachments: rows(barrier.snapshot[index * 5 + 3], 'Tool result AttachmentLink lookup'),
+      attachments: await completeRows(database, barrier.snapshot[index * 5 + 3], 'AttachmentLink', {
+        message_revision_id: id(revision.id, 'MessageRevision.id')
+      }),
       contextSources: [],
-      turnLinks: rows(barrier.snapshot[index * 5 + 4], 'Tool result MessageTurnLink lookup'),
+      turnLinks: await completeRows(database, barrier.snapshot[index * 5 + 4], 'MessageTurnLink', { message_id: messageId }),
       requestLinks: [],
       toolSources: []
     });
-  });
+  }
   return [...byMessage.values()].sort((left, right) => compareMessageMembership(left.membership, right.membership));
 }
 
@@ -649,7 +777,8 @@ async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[]):
       DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').list({ where: { turn_id: turnId }, limit: 2 })
     ];
   }));
-  return new Map(turns.map((turn, index) => {
+  const relations = new Map<string, TurnRelations>();
+  for (const [index, turn] of turns.entries()) {
     const turnId = id(turn.id, 'Turn.id');
     const offset = index * 6;
     const terminations = rows(barrier.snapshot[offset], 'TurnTermination fork lookup');
@@ -658,15 +787,16 @@ async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[]):
     if (terminations.length > 1 || executors.length > 1 || finalOutputFences.length > 1) {
       throw new Error(`Fork source Turn ${turnId} has duplicate relations.`);
     }
-    return [turnId, {
+    relations.set(turnId, {
       termination: terminations[0] ?? null,
       executor: executors[0] ?? null,
-      messageLinks: rows(barrier.snapshot[offset + 2], 'MessageTurnLink Turn closure lookup'),
-      modelRequests: rows(barrier.snapshot[offset + 3], 'ModelRequest Turn closure lookup'),
-      toolCalls: rows(barrier.snapshot[offset + 4], 'ToolCall Turn closure lookup'),
+      messageLinks: await completeRows(database, barrier.snapshot[offset + 2], 'MessageTurnLink', { turn_id: turnId }),
+      modelRequests: await completeRows(database, barrier.snapshot[offset + 3], 'ModelRequest', { turn_id: turnId }),
+      toolCalls: await completeRows(database, barrier.snapshot[offset + 4], 'ToolCall', { turn_id: turnId }),
       finalOutputFences
-    }];
-  }));
+    });
+  }
+  return relations;
 }
 
 function hasCompleteTurnClosure(
@@ -713,14 +843,16 @@ async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Prom
       DOMAIN_REPOSITORIES.domain('FileChangeDecision').list({ where: { change_set_id: setId }, limit: 2 })
     ];
   }));
-  const details = new Map(sets.map((set, index) => {
+  const details = new Map<string, { members: DomainRow[]; decision: DomainRow | null }>();
+  for (const [index, set] of sets.entries()) {
+    const setId = id(set.id, 'FileChangeSet.id');
     const decisions = rows(detailBarrier.snapshot[index * 2 + 1], 'FileChangeDecision fork lookup');
     if (decisions.length > 1) throw new Error(`FileChangeSet ${String(set.id)} has duplicate decisions.`);
-    return [id(set.id, 'FileChangeSet.id'), {
-      members: rows(detailBarrier.snapshot[index * 2], 'FileChangeSetMember fork lookup'),
+    details.set(setId, {
+      members: await completeRows(database, detailBarrier.snapshot[index * 2], 'FileChangeSetMember', { change_set_id: setId }),
       decision: decisions[0] ?? null
-    }];
-  }));
+    });
+  }
   return withSets.map((tool) => {
     const detail = tool.fileChangeSet ? details.get(id(tool.fileChangeSet.id, 'FileChangeSet.id')) : undefined;
     return { ...tool, fileMembers: detail?.members ?? [], fileDecision: detail?.decision ?? null };
@@ -739,7 +871,9 @@ async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[]
       where: { tool_call_id: id(tool.toolCall.id, 'ToolCall.id') }, limit: 1000
     })
   ));
-  const links = linkBarrier.snapshot.flatMap((value) => rows(value, 'InteractionToolCallLink fork lookup'));
+  const links = (await Promise.all(linkBarrier.snapshot.map((value, index) => completeRows(
+    database, value, 'InteractionToolCallLink', { tool_call_id: id(tools[index].toolCall.id, 'ToolCall.id') }
+  )))).flat();
   const requestIds = unique(links.map((link) => id(link.request_id, 'InteractionToolCallLink.request_id')));
   if (requestIds.length === 0) return { requests: [], owners: [], links, responses: [] };
   const requests = await getRows(database, 'InteractionRequest', requestIds);
@@ -842,7 +976,8 @@ function addRequestAggregate(
   aggregate: RequestAggregate,
   target: string,
   turnIds: Map<string, string>,
-  requestIds: Map<string, string>
+  requestIds: Map<string, string>,
+  authorityIds: Map<string, string> | undefined
 ): void {
   const sourceRequestId = id(aggregate.request.id, 'ModelRequest.id');
   const targetRequestId = mapped(requestIds, sourceRequestId, 'ModelRequest');
@@ -854,7 +989,14 @@ function addRequestAggregate(
   inserts.push(DOMAIN_REPOSITORIES.domain('ModelRequest').insertHistoricalCopy({
     ...aggregate.request,
     id: targetRequestId,
-    turn_id: mapped(turnIds, id(aggregate.request.turn_id, 'ModelRequest.turn_id'), 'Turn')
+    turn_id: mapped(turnIds, id(aggregate.request.turn_id, 'ModelRequest.turn_id'), 'Turn'),
+    ...(authorityIds ? {
+      authority_snapshot_id: mapped(
+        authorityIds,
+        id(aggregate.request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
+        'AuthoritySnapshot'
+      )
+    } : {})
   }));
   const sourceOperationId = id(aggregate.operation.id, 'Operation.id');
   const targetOperationId = copyId(target, 'operation', sourceOperationId);
@@ -1013,6 +1155,17 @@ function addInteractionCopies(
     id: copyId(target, 'interaction_response', id(response.id, 'InteractionResponse.id')),
     request_id: mapped(requestIds, id(response.request_id, 'InteractionResponse.request_id'), 'InteractionRequest')
   }));
+}
+
+/** A batched first page equal to the page limit may be truncated; re-read that set completely. */
+async function completeRows(
+  database: RuntimeDatabase,
+  firstPage: unknown,
+  domain: string,
+  where: DomainRow
+): Promise<DomainRow[]> {
+  const found = rows(firstPage, `${domain} fork source lookup`);
+  return found.length < PAGE_LIMIT ? found : listAllDomainRows(database, domain, where);
 }
 
 async function getRows(database: RuntimeDatabase, domain: string, ids: string[]): Promise<DomainRow[]> {

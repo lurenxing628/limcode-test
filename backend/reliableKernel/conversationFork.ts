@@ -262,6 +262,20 @@ export class ConversationForkControlPlane {
         : {}),
       ...(targetRootShape.segmentIds ? { contextSegmentIds: targetRootShape.segmentIds } : {}),
       targetAgentId: command.targetAgentId,
+      copyTurnAuthority: true,
+      contextRoots: {
+        head: {
+          id: ids.targetRootId,
+          rootNodeId: targetRootShape.rootNodeId,
+          tailNodeId: targetRootShape.tailNodeId,
+          tailSegmentCount: targetRootShape.tailSegmentCount,
+          segmentCount: targetRootShape.segmentCount
+        },
+        history: new Map(historicalSourceRoots.map((root) => {
+          const sourceRootId = requireId(root.id, 'ContextSequenceRoot.id');
+          return [sourceRootId, forkHistoryRootId(ids.targetConversationId, sourceRootId)];
+        }))
+      },
       now
     });
     if (sourceMembership) {
@@ -377,14 +391,7 @@ export class ConversationForkControlPlane {
         updated_at: now
       }),
       ...historicalSourceRoots.map((root) => DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
-        id: stableId(
-          'context_root',
-          JSON.stringify([
-            'fork-history',
-            ids.targetConversationId,
-            requireId(root.id, 'ContextSequenceRoot.id')
-          ])
-        ),
+        id: forkHistoryRootId(ids.targetConversationId, requireId(root.id, 'ContextSequenceRoot.id')),
         conversation_id: ids.targetConversationId,
         root_node_id: root.root_node_id,
         tail_node_id: root.tail_node_id,
@@ -636,6 +643,10 @@ function publicIds(ids: ForkIds): Omit<ConversationForkResult, 'sharedRootNodeId
     branchLinkId: ids.branchLinkId,
     originLinkId: ids.originLinkId
   };
+}
+
+function forkHistoryRootId(targetConversationId: string, sourceRootId: string): string {
+  return stableId('context_root', JSON.stringify(['fork-history', targetConversationId, sourceRootId]));
 }
 
 function stableId(kind: string, scope: string): string {

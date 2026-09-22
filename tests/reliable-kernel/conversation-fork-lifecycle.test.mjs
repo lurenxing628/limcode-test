@@ -23,6 +23,7 @@ const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConf
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { workEnvironmentIdFromUri } = load('shared/workEnvironmentCatalog.js');
+const protocol = load('shared/protocol.js');
 
 async function rows(app, domain, where = {}) {
   return (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({
@@ -30,7 +31,9 @@ async function rows(app, domain, where = {}) {
   }))).snapshot;
 }
 
-async function withForkRuntime(run, { withTool = false, toolCallRequests = [1], beforeDispatch } = {}) {
+async function withForkRuntime(run, {
+  withTool = false, toolCallRequests = [1], beforeDispatch, compression = false, failRequests = []
+} = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-fork-lifecycle-'));
   const authority = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
@@ -47,6 +50,19 @@ async function withForkRuntime(run, { withTool = false, toolCallRequests = [1], 
     await configuration.saveGlobalSettings(section, settings, current.revision);
   }
   if (withTool) await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read'] });
+  const compressionConfig = { ...protocol.createDefaultLlmCompressionConfig('Fork compression'), kind: 'llm_summary',
+    fallbacks: [], trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 } };
+  const saveCompression = async (patch = {}) => {
+    const current = await configuration.loadGlobalSettings('llmCompressionConfigs');
+    await configuration.saveGlobalSettings('llmCompressionConfigs', { configs: [{ ...compressionConfig, ...patch }] }, current.revision);
+  };
+  if (compression) {
+    await saveCompression();
+    const current = await configuration.loadGlobalSettings('llmCompression');
+    await configuration.saveGlobalSettings('llmCompression', {
+      defaultConfigId: compressionConfig.id, providerBindings: [], modelBindings: []
+    }, current.revision);
+  }
   const agent = await configuration.mutations.createAgent({ name: 'Fork fixture', kind: 'custom' });
   await configuration.mutations.setModelProfile({
     scopeKind: 'conversation', scopeId: 'source', providerConfigId: provider.id,
@@ -68,6 +84,7 @@ async function withForkRuntime(run, { withTool = false, toolCallRequests = [1], 
     await configuration.synchronizeWorkspaceFolders([{ uri, name: 'Fixture', rootPath: folderPath, index: 0 }]);
     app = await kernel.ReliableKernelApplication.open(authority, {
       authorityCompiler: configuration,
+      ...(compression ? { compressionSettingsAuthority: configuration } : {}),
       resolveWorkEnvironment: async () => undefined,
       mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { assert.fail('no MCP'); } },
       mcpPolicyGate: { async authorize() { assert.fail('no MCP'); } },
@@ -76,6 +93,12 @@ async function withForkRuntime(run, { withTool = false, toolCallRequests = [1], 
         assert.equal(providerId, provider.id);
         return { providerId, async sendFullRequest(request, controls) {
           requests.push(request);
+          if (request.recipe?.compressionMethodKind) {
+            await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { type: 'compression_result',
+              contents: [{ role: 'user', parts: [{ text: `offline summary ${requests.length}` }] }] } });
+            return;
+          }
+          if (failRequests.includes(requests.length)) throw new Error(`offline provider rejected request ${requests.length}`);
           await controls.onEvent({ kind: 'completed', streamSeq: '1',
             content: { role: 'model', parts: withTool && toolCallRequests.includes(requests.length)
               ? [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }]
@@ -116,7 +139,7 @@ async function withForkRuntime(run, { withTool = false, toolCallRequests = [1], 
     ]);
     const harness = {
       get app() { return app; }, get facade() { return facade; },
-      get configuration() { return configuration; }, requests, environmentId,
+      get configuration() { return configuration; }, requests, environmentId, saveCompression,
       async reopen() { await app.close(); await open(); },
       async start(conversationId, key, retry) {
         // Match claim-before-open: keep the panel's reference through the whole fake-provider turn.
@@ -269,6 +292,84 @@ test('fork copies completed turns only and the running source turn still stops n
       await gate;
     }
   });
+});
+
+async function contextSegmentIds(app, rootId) {
+  return (await app.context.materializeStructure(rootId)).records.map(record => record.segment.id);
+}
+
+/** Every copied Turn owns its frozen authority and every copied request its re-homed projection. */
+async function assertOwnedTurnHistory(h, sourceConversationId, targetConversationId) {
+  const sourceRequests = (await Promise.all((await rows(h.app, 'Turn', { conversation_id: sourceConversationId }))
+    .map(turn => rows(h.app, 'ModelRequest', { turn_id: turn.id })))).flat();
+  const copiedTurns = await rows(h.app, 'Turn', { conversation_id: targetConversationId });
+  for (const turn of copiedTurns) {
+    const authorities = await rows(h.app, 'AuthoritySnapshot', { turn_id: turn.id });
+    assert.equal(authorities.length, 1, 'each copied Turn owns exactly one frozen authority');
+    for (const request of await rows(h.app, 'ModelRequest', { turn_id: turn.id })) {
+      assert.equal(request.authority_snapshot_id, authorities[0].id);
+      const [projection] = await rows(h.app, 'ModelContextProjection', { owner_kind: 'model_request', owner_id: request.id });
+      assert.ok(projection, `copied request ${request.id} keeps its frozen Context projection`);
+      const [root] = await rows(h.app, 'ContextSequenceRoot', { id: projection.root_id });
+      assert.equal(root.conversation_id, targetConversationId, 'the projection is re-homed onto the fork history');
+      const source = sourceRequests.find(candidate => candidate.recipe_object_id === request.recipe_object_id
+        && candidate.request_seq === request.request_seq);
+      const [sourceProjection] = await rows(h.app, 'ModelContextProjection', { owner_kind: 'model_request', owner_id: source.id });
+      assert.deepEqual(await contextSegmentIds(h.app, projection.root_id), await contextSegmentIds(h.app, sourceProjection.root_id));
+    }
+  }
+  return copiedTurns;
+}
+
+test('fork after in-turn automatic compression keeps completed turns, frozen authority and projections', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', `long history ${'以前的重要历史。'.repeat(12000)}`);
+    await h.saveCompression({ trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 } });
+    const compressedTurn = await h.turn('source', 'after-automatic-compression');
+    assert.equal((await rows(h.app, 'ModelRequest', { turn_id: compressedTurn.turnId })).length, 2,
+      'the Turn made one compression and one ordinary request');
+    assert.equal((await rows(h.app, 'CompressionBlock')).length, 1);
+    const fork = await h.facade.forkConversation(await h.command('source', 'fork-after-auto-compression'));
+    const copiedTurns = await assertOwnedTurnHistory(h, 'source', fork.conversationId);
+    assert.equal(copiedTurns.length, 2);
+    for (const turn of copiedTurns) {
+      assert.deepEqual((await rows(h.app, 'TurnTermination', { turn_id: turn.id })).map(row => row.terminal_status), ['completed']);
+    }
+    const copiedAnswer = await h.command(fork.conversationId, 'retry-copied-answer');
+    const [answerTurn] = await rows(h.app, 'MessageTurnLink', { message_id: copiedAnswer.messageId, role: 'model' });
+    assert.equal((await rows(h.app, 'ModelRequest', { turn_id: answerTurn.turn_id })).length, 2,
+      'the copied Turn keeps its compression request');
+    // Retrying a copied Turn inherits that Turn's own frozen authority inside the fork.
+    await h.turn(fork.conversationId, 'retry-copied-compressed-turn', {
+      sourceTurnId: answerTurn.turn_id, target: { kind: 'message', messageId: copiedAnswer.messageId },
+      expectedMessageRevisionId: copiedAnswer.expectedRevisionId
+    });
+    await h.turn(fork.conversationId, 'continue-after-compressed-fork');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /offline summary/);
+  }, { compression: true });
+});
+
+test('a copied failed turn keeps its termination and its failed request stays retryable in the fork', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'healthy-history');
+    const failing = await h.start('source', 'provider-rejects-this-turn');
+    assert.equal((await failing.done).terminalStatus, 'failed');
+    const [failedRequest] = await rows(h.app, 'ModelRequest', { turn_id: failing.input.turnId });
+    assert.equal(failedRequest.terminal_state === 'completed', false);
+    const fork = await h.facade.forkConversation(await h.command('source', 'fork-failed-turn', 'user'));
+    const copiedTurns = await assertOwnedTurnHistory(h, 'source', fork.conversationId);
+    const terminations = (await Promise.all(copiedTurns.map(turn => rows(h.app, 'TurnTermination', { turn_id: turn.id })))).flat();
+    assert.deepEqual(terminations.map(row => row.terminal_status).sort(), ['completed', 'failed']);
+    assert.ok(terminations.every(row => row.reason !== 'forked_history_snapshot'));
+    const failedTurn = copiedTurns.find(turn => terminations.some(row => row.turn_id === turn.id && row.terminal_status === 'failed'));
+    const [copiedFailedRequest] = await rows(h.app, 'ModelRequest', { turn_id: failedTurn.id });
+    const [projection] = await rows(h.app, 'ModelContextProjection', { owner_kind: 'model_request', owner_id: copiedFailedRequest.id });
+    assert.equal(projection.root_id, await h.app.context.currentHeadRootId(fork.conversationId),
+      'the failed request froze exactly the fork head, so it can be retried there');
+    await h.turn(fork.conversationId, 'retry-copied-failed-request', {
+      sourceTurnId: failedTurn.id, target: { kind: 'model_request', modelRequestId: copiedFailedRequest.id }
+    });
+  }, { failRequests: [2] });
 });
 
 test('an early fork has no later source roots without target message provenance', async () => {

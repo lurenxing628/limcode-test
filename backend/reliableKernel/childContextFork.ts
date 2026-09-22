@@ -159,6 +159,7 @@ export async function prepareChildContextFork(
     selectedMessageIds: selectedMessages,
     boundaryMessageSeq: boundary,
     contextSegmentIds: segmentIds,
+    copyTurnAuthority: false,
     now: input.now
   });
   const copiedSources = new Map<string, string[]>();
