@@ -3134,7 +3134,8 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.Error, {
       requestType?: string;
       message: string;
-      code?: 'settings_revision_conflict';
+      /** `fork_rejected`: the fork command can never succeed and must not be replayed. */
+      code?: 'settings_revision_conflict' | 'fork_rejected';
       actualRevision?: string;
     }>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>

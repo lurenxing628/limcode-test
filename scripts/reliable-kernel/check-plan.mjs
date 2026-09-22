@@ -164,7 +164,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'webview/tests/nativeConversationProjection.test.ts',
   'webview/tests/reliableConversationProjection.test.ts',
   'tests/reliable-kernel/reliable-queue-ordering.test.mjs',
-  'webview/tests/segmentedTimeline.test.ts'
+  'webview/tests/segmentedTimeline.test.ts',
+  'webview/tests/forkRequestLifecycle.test.ts'
 ]);
 
 const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([

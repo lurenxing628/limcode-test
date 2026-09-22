@@ -8,7 +8,8 @@ const root = process.cwd();
 const WEBVIEW_TEST_FILES = Object.freeze([
   'webview/tests/reliableConversationProjection.test.ts',
   'webview/tests/segmentedTimeline.test.ts',
-  'webview/tests/nativeConversationProjection.test.ts'
+  'webview/tests/nativeConversationProjection.test.ts',
+  'webview/tests/forkRequestLifecycle.test.ts'
 ]);
 const CI_TEST_FILES = Object.freeze([
   'tests/bottomStickyScrollerScheduler.test.cjs',

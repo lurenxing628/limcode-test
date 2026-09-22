@@ -135,7 +135,7 @@ export function useBridgeBootstrap(): void {
           requestType: payload.requestType,
           section: globalSettingsSectionFromScope(message.scope),
           correlationId: message.correlationId,
-          code: payload.code,
+          ...(payload.code === 'settings_revision_conflict' ? { code: payload.code } : {}),
           actualRevision: payload.actualRevision
         });
       }

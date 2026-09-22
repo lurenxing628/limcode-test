@@ -124,6 +124,7 @@ docs/architecture/*
 !/webview/tests/segmentedTimeline.test.ts
 !/webview/tests/reliableConversationProjection.test.ts
 !/webview/tests/nativeConversationProjection.test.ts
+!/webview/tests/forkRequestLifecycle.test.ts
 /scripts/reliable-kernel/concurrency-read-*.json
 /scripts/reliable-kernel/concurrency-tuning-*.json
 /scripts/reliable-kernel/model-independent-hotpaths-after.json

@@ -42,6 +42,7 @@ import {
   type WebviewToExtensionMessage
 } from '../../../shared/protocol';
 import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
+import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
 import { isSettingsRevisionConflictError } from '../../capabilities/settingsRevisionConflict';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
@@ -129,6 +130,9 @@ export class VscodeReliableKernelCommandRouter {
             error: text
           }
         });
+      } else if (message.type === BridgeMessageType.ConversationFork && error instanceof ConversationForkRejectedError) {
+        // A permanent rejection is not an unconfirmed result: the Webview drops the command.
+        this.postRequestError(webview, message.type, text, message.id, { code: 'fork_rejected' });
       } else if (
         (message.type === BridgeMessageType.GlobalSettingsGet || message.type === BridgeMessageType.GlobalSettingsUpdate)
         && message.payload?.section
@@ -2179,7 +2183,7 @@ export class VscodeReliableKernelCommandRouter {
     correlationId?: string,
     details: {
       section?: GlobalSettingsGetPayload['section'];
-      code?: 'settings_revision_conflict' | 'stale_conversation';
+      code?: 'settings_revision_conflict' | 'stale_conversation' | 'fork_rejected';
       actualRevision?: string;
       conversationId?: string;
     } = {}

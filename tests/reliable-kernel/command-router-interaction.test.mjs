@@ -18,6 +18,10 @@ const { VscodeReliableKernelCommandRouter } = require(path.join(
   root,
   'dist/extension/backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js'
 ));
+const { ConversationForkRejectedError } = require(path.join(
+  root,
+  'dist/extension/backend/reliableKernel/conversationFork.js'
+));
 const {
   INTERACTION_ATTENTION_ACTION,
   InteractionAttentionNotifier,
@@ -195,6 +199,35 @@ test('failed global settings read preserves section scope for Webview loading st
   assert.equal(posted[0].payload.requestType, protocol.BridgeMessageType.GlobalSettingsGet);
 });
 
+
+test('fork errors mark permanent rejections so the Webview drops instead of replaying them', async () => {
+  const fork = {
+    sourceConversationId: 'fork-source', messageId: 'fork-message', expectedRevisionId: 'fork-revision',
+    command: { commandId: 'fork-command', expectedVersion: 0, issuedAt: 1 }
+  };
+  for (const [failure, code] of [
+    [new ConversationForkRejectedError('分支点所在回合仍在运行。'), 'fork_rejected'],
+    [new Error('history refresh failed after commit'), undefined]
+  ]) {
+    const posted = [];
+    const router = new VscodeReliableKernelCommandRouter({
+      debugCapture: { setListener() {} },
+      toolHost: { setStateChangeListener() {} }
+    }, { async forkConversation() { throw failure; } });
+    router.handle('fork-client', webview(posted), {
+      id: `fork-request-${code ?? 'failed'}`,
+      type: protocol.BridgeMessageType.ConversationFork,
+      channel: 'command',
+      payload: fork
+    });
+    await eventually(() => posted.length === 1);
+    assert.equal(posted[0].type, protocol.BridgeMessageType.Error);
+    assert.equal(posted[0].correlationId, `fork-request-${code ?? 'failed'}`);
+    assert.equal(posted[0].payload.requestType, protocol.BridgeMessageType.ConversationFork);
+    assert.equal(posted[0].payload.message, failure.message);
+    assert.equal(posted[0].payload.code, code);
+  }
+});
 
 test('durable Interaction result is posted before a stalled Agent resume completes', async () => {
   const posted = [];
