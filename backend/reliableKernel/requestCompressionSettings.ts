@@ -1,4 +1,5 @@
 import type { ChatModelOverrideRecord, LlmGenerationConfigRecord, LlmRequestBodyRecord } from '../../shared/protocol';
+import { DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS } from '../../shared/protocol';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import {
   frozenCompressionPolicy,
@@ -26,7 +27,7 @@ export interface RequestGenerationSettings {
 
 export interface CompressionSettingsAuthority {
   loadRequestGenerationSettings?(model: ChatModelOverrideRecord, conversationId: string): Promise<RequestGenerationSettings>;
-  loadRequestCompressionSettings(model: ChatModelOverrideRecord): Promise<RequestCompressionSettings>;
+  loadRequestCompressionSettings(model: ChatModelOverrideRecord, generationConfig?: LlmGenerationConfigRecord): Promise<RequestCompressionSettings>;
 }
 
 /** 单次请求可以独立选择压缩设置；空设置引用明确表示使用本轮原配置。 */
@@ -40,6 +41,7 @@ export function applyRequestCompressionSettings(
       || canonicalPlainJson(generation.model) !== canonicalPlainJson(frozenModelSelection(authority))) throw new Error('请求生成设置不能更换本轮模型。');
     authority = normalizePlainJson({ ...authority, model: {
       ...authority.model, generationConfig: generation.generationConfig,
+      maxOutputTokens: generation.generationConfig.maxOutputTokens ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
       requestBody: generation.requestBody, thinkingControlledByBody: generation.thinkingControlledByBody,
       thinkingConfig: generation.generationConfig.thinkingConfig ?? {}
     } }, '请求生成设置');

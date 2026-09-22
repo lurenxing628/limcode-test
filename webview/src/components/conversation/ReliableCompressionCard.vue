@@ -55,7 +55,7 @@ const title = computed(() => titleDetail.value?.status === 'ready' && titleDetai
     || (trigger.value === 'auto' ? '自动上下文压缩' : '上下文压缩'));
 const methodLabel = computed(() => {
   switch (methodKind.value) {
-    case 'openai_responses_compact': return 'OpenAI 原生压缩';
+    case 'provider_native': return 'Provider 原生压缩';
     case 'llm_summary': return 'LLM 总结';
     case 'segmented_summary': return '分段总结';
     case 'deterministic_summary': return '确定性摘要';
@@ -414,7 +414,7 @@ function nonNegativeInteger(value: unknown): number | undefined {
             <dd>{{ row.value }}</dd>
           </div>
         </dl>
-        <p v-if="providerNative" class="compression-provider-note">该块保留 OpenAI Responses 专用上下文；下一次请求会按原有结构复用，不会转换成 Markdown。</p>
+        <p v-if="providerNative" class="compression-provider-note">该块保留当前 Provider 的签名或不透明上下文；仅在渠道、模型与能力快照兼容时原样复用，不会转换成 Markdown。</p>
         <pre v-if="summaryText" data-testid="compression-detail-summary">{{ summaryText }}</pre>
         <p v-else>压缩结果没有可见文本，但可能包含渠道专用上下文。</p>
         <button v-if="summaryText" type="button" class="compression-copy" @click="copySummary">

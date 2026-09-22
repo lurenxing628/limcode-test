@@ -76,7 +76,7 @@ function compressionRequest(methodKind, context) {
     },
     provider: {
       providerConfigId: 'compression-provider',
-      provider: methodKind === 'openai_responses_compact' ? 'openai-responses' : 'openai-compatible',
+      provider: methodKind === 'provider_native' ? 'openai-responses' : 'openai-compatible',
       modelId: 'compression-model',
       contextWindowTokens: 128_000,
       maxOutputTokens: 16_000
@@ -88,7 +88,7 @@ function compressionRequest(methodKind, context) {
     sourceSegmentCount: context.length,
     blockId: 'compression-block',
     compressionMethodKind: methodKind,
-    ...(methodKind === 'openai_responses_compact' ? {} : { effectiveSummaryMaxTokens: 8_000 }),
+    ...(methodKind === 'provider_native' ? {} : { effectiveSummaryMaxTokens: 8_000 }),
     sourceHash: 'frozen-source-hash'
   };
   fullRequest.context = context;
@@ -841,7 +841,7 @@ test('LLM capability adapter 的原生 Compact 强制接收完整冻结窗口并
     segmentId: 'native-state', segmentKind: 'compression', messageRole: null,
     contentType: 'application/vnd.limcode.compression-contents+json',
     content: JSON.stringify({
-      kind: 'compression_contents', version: 1, trigger: 'auto', methodKind: 'openai_responses_compact',
+      kind: 'compression_contents', version: 1, trigger: 'auto', methodKind: 'provider_native',
       nativeBinding: {
         providerConfigId: 'compression-provider', provider: 'openai-responses', modelId: 'compression-model'
       },
@@ -900,7 +900,7 @@ test('LLM capability adapter 的原生 Compact 强制接收完整冻结窗口并
     'compression-provider',
     compressionCapability((value) => { captured = value; })
   );
-  const fullRequest = compressionRequest('openai_responses_compact', [
+  const fullRequest = compressionRequest('provider_native', [
     opaque, user, backendCommandCall, backendCommandResult, childDelivery
   ]);
   await adapter.sendFullRequest(fullRequest, {
@@ -963,7 +963,7 @@ test('LLM capability adapter 接纳 Provider 可选 undefined 字段但不持久
     });
   };
   const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
-  const fullRequest = compressionRequest('openai_responses_compact', [{
+  const fullRequest = compressionRequest('provider_native', [{
     segmentId: 'user-provider-undefined', segmentKind: 'message', messageRole: 'user',
     contentType: 'application/vnd.limcode.message+json',
     content: JSON.stringify({ role: 'user', parts: [{ text: 'compact this' }] })
@@ -1001,7 +1001,7 @@ test('LLM capability adapter 仍拒绝 Provider 内容数组中的 undefined', a
     });
   };
   const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
-  const fullRequest = compressionRequest('openai_responses_compact', [{
+  const fullRequest = compressionRequest('provider_native', [{
     segmentId: 'user-invalid-provider-array', segmentKind: 'message', messageRole: 'user',
     contentType: 'application/vnd.limcode.message+json',
     content: JSON.stringify({ role: 'user', parts: [{ text: 'compact this' }] })
@@ -1360,7 +1360,7 @@ test('native output 已含旧用户内容时只追加一次带标签的当前 Tu
     segmentId: 'native-output-with-user', segmentKind: 'compression', messageRole: null,
     contentType: 'application/vnd.limcode.compression-contents+json',
     content: JSON.stringify({
-      kind: 'compression_contents', version: 1, trigger: 'auto', methodKind: 'openai_responses_compact',
+      kind: 'compression_contents', version: 1, trigger: 'auto', methodKind: 'provider_native',
       nativeBinding: {
         providerConfigId: 'provider-config', provider: 'openai-compatible', modelId: 'model-a'
       },
@@ -1672,7 +1672,7 @@ test('LLM capability adapter 对新Provider-native压缩状态强制providerConf
     contentType: 'application/vnd.limcode.compression-contents+json',
     content: JSON.stringify({
       kind: 'compression_contents', version: 1, trigger: 'auto',
-      methodKind: 'openai_responses_compact',
+      methodKind: 'provider_native',
       nativeBinding: {
         providerConfigId: 'provider-config', provider: 'openai-compatible', modelId: 'model-a'
       },
@@ -2581,7 +2581,7 @@ test('LLM capability adapter interleaves typed attachment catalog checkpoint and
   assert.doesNotMatch(imageCatalogText, /"pages":"1-4"/);
 
   let native;
-  const nativeRequest = compressionRequest('openai_responses_compact', [compressed, tail]);
+  const nativeRequest = compressionRequest('provider_native', [compressed, tail]);
   nativeRequest.attachmentCatalogState = structuredClone(ordinaryRequest.attachmentCatalogState);
   nativeRequest.recipe.modelHandleCatalog = structuredClone(ordinaryRequest.recipe.modelHandleCatalog);
   const nativeAdapter = new kernel.LlmCapabilityFullRequestAdapter(
@@ -2670,7 +2670,7 @@ test('ordinary and native compact windows suppress repeated managed media across
     }]
   };
   let native;
-  const nativeRequest = compressionRequest('openai_responses_compact', [compactEnvelope, second]);
+  const nativeRequest = compressionRequest('provider_native', [compactEnvelope, second]);
   nativeRequest.attachmentCatalogState = nativeState;
   nativeRequest.recipe.modelHandleCatalog = handles;
   await new kernel.LlmCapabilityFullRequestAdapter(

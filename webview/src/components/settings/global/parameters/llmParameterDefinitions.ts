@@ -1,6 +1,7 @@
 import { THINKING_LEVEL_OPTIONS } from '@shared/llmThinkingLevels';
 import type { LlmProviderKind, LlmReasoningMode, LlmThinkingLevel } from '@shared/protocol';
 import { geminiThinkingCapabilityForModel } from '@shared/geminiThinking';
+import type { ModelCapabilitySnapshot } from '@shared/modelCapabilities';
 
 export type LlmParameterValueType = 'number' | 'boolean' | 'enum';
 
@@ -184,7 +185,7 @@ export function thinkingLevelDefinition(provider: LlmProviderKind, modelId?: str
   }, provider);
 }
 
-export function parameterDefinitionsForProvider(provider: LlmProviderKind, modelId?: string): LlmParameterDefinition[] {
+export function parameterDefinitionsForProvider(provider: LlmProviderKind, modelId?: string, snapshot?: ModelCapabilitySnapshot): LlmParameterDefinition[] {
   const geminiCapability = provider === 'gemini' ? geminiThinkingCapabilityForModel(modelId) : undefined;
   const definitions = LLM_PARAMETER_DEFINITIONS
     .filter((definition) => definition.providers.includes(provider))
@@ -196,9 +197,21 @@ export function parameterDefinitionsForProvider(provider: LlmProviderKind, model
   const supportsThinkingLevel = provider !== 'gemini'
     || geminiCapability?.kind === 'thinkingLevel'
     || geminiCapability?.kind === 'unknown';
-  return supportsThinkingLevel
-    ? [...definitions, thinkingLevelDefinition(provider, modelId)]
-    : definitions;
+  const result = supportsThinkingLevel ? [...definitions, thinkingLevelDefinition(provider, modelId)] : definitions;
+  if (!snapshot || snapshot.source === 'unknown' || snapshot.reasoning.family === 'none') return result;
+  const capability = snapshot.reasoning;
+  return result.filter((definition) => {
+    if (definition.key === 'thinkingBudget') return capability.supportsBudget;
+    if (definition.key === 'reasoningMode') return provider === 'openai-responses' && /^gpt-6-astra(?:-pro)?$/.test(modelId ?? '');
+    if (definition.key === 'thinkingLevel') return capability.levels.length > 0
+      || capability.canDisable && provider !== 'gemini';
+    return true;
+  }).map((definition) => {
+    if (definition.key !== 'thinkingLevel') return definition;
+    const allowed = new Set([...capability.levels, ...(capability.canDisable ? ['none'] : [])]);
+    const options = (definition.options ?? []).filter((option) => allowed.has(option.value as LlmThinkingLevel));
+    return { ...definition, options, defaultValue: capability.defaultLevel ?? options[0]?.value as LlmThinkingLevel };
+  });
 }
 
 export function labelForProvider(provider: LlmProviderKind): string {

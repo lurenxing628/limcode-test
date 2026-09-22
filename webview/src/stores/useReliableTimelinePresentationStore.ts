@@ -2,7 +2,7 @@ import { ref } from 'vue';
 import { defineStore } from 'pinia';
 import { bridge } from '@webview/transport';
 
-export type ReliableTimelineFactKind = 'turn-termination' | 'compression-block';
+export type ReliableTimelineFactKind = 'turn-termination' | 'compression-block' | 'compression-warning';
 
 interface ReliableTimelinePresentationState {
   suppressedFactKeys: string[];

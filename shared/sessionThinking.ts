@@ -91,15 +91,19 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
   if (provider === 'gemini') {
     const capability = geminiThinkingCapabilityForModel(model);
     if (capability.kind === 'thinkingLevel') {
+      if (thinking?.thinkingBudget !== undefined) return '配置不受支持（请求会拒绝）';
       if (isGeminiThinkingLevelSupported(capability, thinking?.thinkingLevel)) return thinking!.thinkingLevel!;
-      return `${thinkingValueLabel(thinking) === '服务默认' ? '服务默认' : '渠道配置已适配'}（适配器：${capability.defaultLevel}）`;
+      return thinkingValueLabel(thinking) === '服务默认' ? '服务默认' : '配置不受支持（请求会拒绝）';
     }
-    if (capability.kind === 'thinkingBudget') return thinkingValueLabel({ thinkingBudget: thinking?.thinkingBudget });
+    if (capability.kind === 'thinkingBudget') {
+      if (thinking?.thinkingLevel && !['not-set', 'non-set'].includes(thinking.thinkingLevel)) return '配置不受支持（请求会拒绝）';
+      return thinkingValueLabel({ thinkingBudget: thinking?.thinkingBudget });
+    }
     if (capability.kind === 'unsupported') return '不支持（不发送）';
+    if (capability.kind === 'unknown') return `能力未确认 · ${thinkingValueLabel(thinking)}`;
   }
   if (provider === 'openai-responses' && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
   if (provider === 'openai-compatible' || provider === 'openai-responses') return thinkingValueLabel({ thinkingLevel: thinking?.thinkingLevel });
   if (provider === 'deepseek') return thinking?.thinkingLevel && ['none', 'high', 'max'].includes(thinking.thinkingLevel) ? thinking.thinkingLevel : '服务默认';
   return thinkingValueLabel(thinking);
 }
-

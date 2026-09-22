@@ -33,6 +33,7 @@ import { classifyOpenAIResponsesPreTerminalWebSocketClose } from '../capabilitie
 import { frozenProviderRetryPolicy } from './frozenAuthority';
 import {
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
+  ProviderCapabilityError,
   ProviderTransientError
 } from './modelProviderControlPlane';
 import type {
@@ -819,7 +820,7 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
   const authority = requireRecord(request.authoritySnapshot, 'Compression authority');
   const compression = requireRecord(authority.compression, 'Compression authority policy');
   const authorityMethodConfig = requireRecord(compression.config, 'Compression authority config');
-  const methodKind = requireText(authorityMethodConfig.kind, 'Compression method kind') as LlmCompactRequest['methodKind'];
+  const methodKind = requireExecutableCompressionMethod(recipe.compressionMethodKind);
   const methodConfig = frozenEffectiveCompressionConfig(authorityMethodConfig, recipe, methodKind);
   const conversationId = requireText(request.conversationId, 'Provider request conversationId');
   const authorityConversationId = optionalText(authority.conversationId);
@@ -833,6 +834,14 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     modelId: requireText(provider.modelId, 'Compression modelId')
   };
   const context = compressionContext(request, compressionProvider, methodKind);
+  const toolPolicy = authorityToolPolicy(authority);
+  const availableTools = normalizeToolDefinitions(recipe.tools)
+    .filter((tool) => providerToolAllowed(toolPolicy, tool))
+    .map((tool) => tool.schema);
+  const tools = modelFacingToolsForHandleCatalog(
+    readToolsForAttachmentCatalog(availableTools, context.attachmentCatalogState.catalog),
+    context.modelHandleCatalog
+  );
   const attachmentObservationContract = frozenAttachmentObservationContract(
     recipe,
     methodKind,
@@ -856,11 +865,16 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     methodKind,
     methodConfigSnapshot: methodConfig as unknown as NonNullable<LlmCompactRequest['methodConfigSnapshot']>,
     settingsSnapshot,
+    ...(asRecord(provider.summaryReasoning) ? { summaryReasoning: provider.summaryReasoning as unknown as LlmCompactRequest['summaryReasoning'] } : {}),
+    ...(asRecord(asRecord(authority.model)?.generationConfig) ? { nativeGenerationConfig: asRecord(authority.model)!.generationConfig as unknown as LlmCompactRequest['nativeGenerationConfig'] } : {}),
+    ...(asRecord(asRecord(authority.model)?.requestBody) ? { nativeRequestBody: asRecord(authority.model)!.requestBody as unknown as LlmCompactRequest['nativeRequestBody'] } : {}),
+    ...(context.systemInstruction ? { systemInstruction: context.systemInstruction } : {}),
+    ...(tools.length > 0 ? { tools } : {}),
     contents: context.contents,
     ...(methodKind === 'segmented_summary' && context.segments.length > 0
       ? { segments: context.segments }
       : {}),
-    ...(methodKind !== 'openai_responses_compact' && context.priorSummaryContents.length > 0
+    ...(methodKind !== 'provider_native' && context.priorSummaryContents.length > 0
       ? { priorSummaryContents: context.priorSummaryContents }
       : {}),
     ...attachmentObservationContract,
@@ -881,7 +895,7 @@ function frozenAttachmentObservationContract(
 ): CompactAttachmentObservationContract {
   const rawProfile = recipe.attachmentObservationProfileSha256;
   const rawRequirements = recipe.attachmentObservationRequirements;
-  if (methodKind === 'openai_responses_compact') {
+  if (methodKind === 'provider_native') {
     if (rawProfile !== undefined || rawRequirements !== undefined) {
       throw new TypeError('Provider-native Compact cannot carry text-summary Attachment observations.');
     }
@@ -976,11 +990,14 @@ function frozenEffectiveCompressionConfig(
   recipe: { [key: string]: PlainJsonValue },
   methodKind: LlmCompactRequest['methodKind']
 ): { [key: string]: PlainJsonValue } {
-  if (methodKind === 'openai_responses_compact') {
+  if (methodKind === 'provider_native') {
     if (recipe.effectiveSummaryMaxTokens !== undefined) {
       throw new TypeError('Provider-native Compact recipe cannot carry a text summary target.');
     }
-    return authorityConfig;
+    return normalizePlainJson(
+      { ...authorityConfig, kind: methodKind },
+      'Effective frozen native compression config'
+    ) as { [key: string]: PlainJsonValue };
   }
   const effective = recipe.effectiveSummaryMaxTokens;
   if (!Number.isSafeInteger(effective) || (effective as number) <= 0 || (effective as number) > 8_000) {
@@ -989,14 +1006,28 @@ function frozenEffectiveCompressionConfig(
   const summary = asRecord(authorityConfig.llmSummary) ?? {};
   return normalizePlainJson({
     ...authorityConfig,
+    kind: methodKind,
     llmSummary: { ...summary, targetTokens: effective as number }
   }, 'Effective frozen compression config') as { [key: string]: PlainJsonValue };
+}
+
+function requireExecutableCompressionMethod(value: unknown): NonNullable<LlmCompactRequest['methodKind']> {
+  if (value === 'provider_native'
+    || value === 'llm_summary'
+    || value === 'segmented_summary'
+    || value === 'deterministic_summary'
+    || value === 'manual_summary') {
+    return value;
+  }
+  throw new TypeError(`Compression recipe method is not executable: ${String(value)}.`);
 }
 
 function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
   const prior = request.priorSummaryContents ?? [];
   if (request.methodKind === 'segmented_summary' && request.segments?.length) {
     const candidates = request.segments.map((segment, index) => estimateProjectedModelInput({
+      ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
+      ...(request.tools?.length ? { tools: request.tools } : {}),
       contextContents: index === 0 ? [...prior, ...segment] : segment,
       providerFramingTokens: 512
     }));
@@ -1005,8 +1036,10 @@ function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequest
     );
   }
   return estimateProjectedModelInput({
+    ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
+    ...(request.tools?.length ? { tools: request.tools } : {}),
     contextContents: [...prior, ...request.contents],
-    providerFramingTokens: request.methodKind === 'openai_responses_compact' ? 64 : 512
+    providerFramingTokens: request.methodKind === 'provider_native' ? 64 : 512
   });
 }
 
@@ -1018,10 +1051,24 @@ function compressionContext(
   contents: MessageContent[];
   segments: MessageContent[][];
   priorSummaryContents: MessageContent[];
+  systemInstruction?: MessageContent;
   attachmentCatalogState: ReturnType<typeof normalizeAttachmentCatalogState>;
   modelHandleCatalog: ModelHandleCatalog;
 } {
   const contents: MessageContent[] = [];
+  const systemParts: string[] = [];
+  const authority = requireRecord(request.authoritySnapshot, 'Compression authority snapshot');
+  const systemPrompt = asRecord(authority.systemPrompt);
+  if (typeof systemPrompt?.text === 'string' && systemPrompt.text.trim()) {
+    systemParts.push(systemPrompt.text.trim());
+  }
+  const runtimeContext = asRecord(authority.runtimeContext);
+  const runtimeContextText = typeof runtimeContext?.text === 'string' && runtimeContext.text.trim()
+    ? runtimeContext.text.trim()
+    : typeof runtimeContext?.template === 'string' && runtimeContext.template.trim()
+      ? runtimeContext.template.trim()
+      : '';
+  if (runtimeContextText) systemParts.push(runtimeContextText);
   const priorSummaryContents: MessageContent[] = [];
   const segments: MessageContent[][] = [];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
@@ -1031,10 +1078,9 @@ function compressionContext(
     current = [];
   };
   const recipe = requireRecord(request.recipe, 'Compression recipe');
-  const sourceContext = request.context.slice(
-    0,
-    typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length
-  );
+  const sourceContext = methodKind !== 'provider_native' && request.compressionSourceContext
+    ? request.compressionSourceContext
+    : request.context.slice(0, typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length);
   const attachmentCatalogState = normalizeAttachmentCatalogState(
     request.attachmentCatalogState,
     'Compression request attachmentCatalogState'
@@ -1052,7 +1098,7 @@ function compressionContext(
     || (requestedCount as number) > request.context.length) {
     throw new RangeError('Compression recipe sourceSegmentCount is outside its frozen Context projection.');
   }
-  if (methodKind === 'openai_responses_compact' && requestedCount !== request.context.length) {
+  if (methodKind === 'provider_native' && requestedCount !== request.context.length) {
     throw new Error('Provider-native compression requires the complete frozen model-visible window.');
   }
   if (request.context[requestedCount as number]?.segmentKind === 'tool_pair') {
@@ -1064,6 +1110,16 @@ function compressionContext(
     (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId)
   );
   for (const item of sourceContext) {
+    const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
+    if (item.segmentKind === 'system') {
+      const text = contextText(item.content, item.contentType).trim();
+      if (text) systemParts.push(text);
+      if (attachmentStateContent) {
+        current.push(attachmentStateContent);
+        contents.push(attachmentStateContent);
+      }
+      continue;
+    }
     let decoded: MessageContent[];
     if (item.segmentKind === 'tool_pair') decoded = toolPairContents(item.content, modelHandleCatalog);
     else if (item.segmentKind === 'runtime_context') {
@@ -1083,9 +1139,8 @@ function compressionContext(
         }];
       }
     }
-    const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
     if (item.segmentKind === 'compression' && contents.length === 0
-      && methodKind !== 'openai_responses_compact') {
+      && methodKind !== 'provider_native') {
       priorSummaryContents.push(...decoded);
       if (attachmentStateContent) priorSummaryContents.push(attachmentStateContent);
       continue;
@@ -1099,7 +1154,7 @@ function compressionContext(
       current.push(content);
       contents.push(content);
     }
-    if (item.segmentKind === 'compression' && methodKind === 'openai_responses_compact') {
+    if (item.segmentKind === 'compression' && methodKind === 'provider_native') {
       canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
     }
     if (attachmentStateContent) {
@@ -1108,7 +1163,11 @@ function compressionContext(
     }
   }
   flush();
-  if (methodKind === 'openai_responses_compact') {
+  const systemText = systemParts.filter(Boolean).join('\n\n').trim();
+  const systemInstruction = systemText
+    ? { role: 'user' as const, parts: [{ text: systemText }] }
+    : undefined;
+  if (methodKind === 'provider_native') {
     // 独立 /responses/compact 拒绝 configuration_update 输入项：只剥传输级 reasoning 选择，
     // 语义上下文保持完整；有效 effort 由 Compression 的 rebase 计划在下一个请求重锚。
     return {
@@ -1121,6 +1180,7 @@ function compressionContext(
       ).contents,
       segments: [],
       priorSummaryContents: [],
+      ...(systemInstruction ? { systemInstruction } : {}),
       attachmentCatalogState,
       modelHandleCatalog
     };
@@ -1132,6 +1192,7 @@ function compressionContext(
     segments: segments.map((segment) =>
       projectSummaryModelWindow(segment, modelHandleCatalog, segmentsMediaState).contents),
     priorSummaryContents,
+    ...(systemInstruction ? { systemInstruction } : {}),
     attachmentCatalogState,
     modelHandleCatalog
   };
@@ -2075,6 +2136,7 @@ function capabilityThrownProviderError(error: unknown): Error {
     const structured = error as Error & {
       code?: unknown;
       status?: unknown;
+      endpointKind?: unknown;
       retryable?: unknown;
       transportAttemptsExhausted?: unknown;
       receivedServerEvent?: unknown;
@@ -2085,6 +2147,7 @@ function capabilityThrownProviderError(error: unknown): Error {
     };
     if (structured.code !== undefined) raw.code ??= structured.code;
     if (structured.status !== undefined) raw.status ??= structured.status;
+    if (structured.endpointKind !== undefined) raw.endpointKind ??= structured.endpointKind;
     if (structured.retryable !== undefined) raw.retryable ??= structured.retryable;
     if (structured.transportAttemptsExhausted !== undefined) {
       raw.transportAttemptsExhausted ??= structured.transportAttemptsExhausted;
@@ -2106,10 +2169,12 @@ function capabilityThrownProviderError(error: unknown): Error {
 function classifyProviderFailure(message: string, raw: Record<string, unknown> | undefined): Error {
   const signature = collectErrorSignature(raw, message).toLowerCase();
   const structuredStatus = findNumericStatus(raw);
-  const embeddedStatus = /\b(?:streaming error|unexpected server response):\s*([45]\d{2})\b/.exec(signature);
-  const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299)) && embeddedStatus
-    ? Number(embeddedStatus[1])
+  const embeddedStatus = embeddedHttpStatus(signature);
+  const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299))
+    && embeddedStatus !== undefined
+    ? embeddedStatus
     : structuredStatus;
+  const endpointKind = findStringMetadata(raw, 'endpointKind');
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
@@ -2128,6 +2193,27 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
     return new ProviderTransientError('connection_interrupted', message, true);
   }
   if (preTerminalWebSocketClose?.retryable === false) return new Error(message);
+  const nativeCompactionEndpoint = endpointKind === 'provider_native'
+    || endpointKind === 'openai_responses_compact'
+    || endpointKind === 'anthropic_messages_compact'
+    || signature.includes('llm compact api');
+  if (nativeCompactionEndpoint && (status === 404 || status === 405 || status === 501)) {
+    return new ProviderCapabilityError(
+      'native_compaction_unsupported',
+      message,
+      status,
+      endpointKind ?? 'provider_native_compaction'
+    );
+  }
+  if ((status === 400 || status === 422)
+    && /unsupported|not supported|unknown parameter|invalid.*(?:reasoning|thinking|compaction)|thinking.*(?:disabled|adaptive|enabled)/.test(signature)) {
+    return new ProviderCapabilityError(
+      /reasoning|thinking/.test(signature) ? 'unsupported_reasoning_mode' : 'unsupported_parameter',
+      message,
+      status,
+      endpointKind
+    );
+  }
   if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
     return new Error(message);
   }
@@ -2147,6 +2233,9 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
       && /\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bservice_busy\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b|模型服务暂时不可用|服务繁忙/.test(signature));
   if (receivedSemanticOutput === true && !temporaryServiceFailure) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
+  }
+  if (status !== undefined && status >= 400 && status <= 499 && status !== 408 && status !== 425 && status !== 429) {
+    return Object.assign(new Error(message), { status, ...(endpointKind ? { endpointKind } : {}) });
   }
   if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
   if (status === 429) {
@@ -2194,11 +2283,48 @@ function compactProviderError(payload: Record<string, unknown> | undefined): Err
   return capabilityProviderError(payload);
 }
 
-function capabilityRetryError(payload: Record<string, unknown> | undefined): ProviderTransientError {
-  const mapped = capabilityProviderError(payload);
-  return mapped instanceof ProviderTransientError
-    ? mapped
-    : new ProviderTransientError('temporary_service_error', mapped.message);
+function capabilityRetryError(payload: Record<string, unknown> | undefined): Error {
+  // A dependency scheduling a retry is not authority to relabel a permanent 4xx as transient.
+  return capabilityProviderError(payload);
+}
+
+function embeddedHttpStatus(signature: string): number | undefined {
+  const patterns = [
+    /\b(?:streaming error|unexpected server response|http(?: status)?|api error|api 错误)\s*(?:\(|:)?\s*([45]\d{2})\)?\b/,
+    /\bcompact api 错误\s*\(([45]\d{2})\)/,
+    /\bstatus(?: code)?\s*(?:=|:)?\s*([45]\d{2})\b/
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(signature);
+    if (match) return Number(match[1]);
+  }
+  return undefined;
+}
+
+function findStringMetadata(
+  value: unknown,
+  key: string,
+  depth = 0,
+  seen = new Set<object>()
+): string | undefined {
+  if (depth > 6 || value === null || value === undefined || typeof value !== 'object' || seen.has(value)) {
+    return undefined;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 32)) {
+      const nested = findStringMetadata(entry, key, depth + 1, seen);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record[key] === 'string' && record[key].trim()) return record[key].trim();
+  for (const nested of Object.values(record).slice(0, 32)) {
+    const result = findStringMetadata(nested, key, depth + 1, seen);
+    if (result !== undefined) return result;
+  }
+  return undefined;
 }
 
 function findBooleanMetadata(value: unknown, key: string, depth = 0, seen = new Set<object>()): boolean | undefined {

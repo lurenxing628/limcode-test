@@ -2077,7 +2077,7 @@ function compressionPresentationTokens(summary: Record<string, unknown>): Record
 
 function requireCompressionMethodKind(value: unknown): string {
   const allowed = [
-    'openai_responses_compact',
+    'provider_native',
     'llm_summary',
     'segmented_summary',
     'deterministic_summary',

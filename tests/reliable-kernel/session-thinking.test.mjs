@@ -32,12 +32,13 @@ export async function ordinaryWire(provider, model, generationConfig, transport 
   return result.body;
 }
 
-test('默认展示区分服务默认和既有 adapter 映射，不虚构预算', async () => {
-  assert.equal(sessionThinkingDisplayLabel('gemini', 'gemini-3.1-pro'), '服务默认（适配器：high）');
-  const gemini = await ordinaryWire('gemini', 'gemini-3.1-pro', { thinkingConfig: { thinkingBudget: 4096 } });
-  assert.equal(gemini.generationConfig.thinkingConfig.thinkingLevel.toLowerCase(), 'high');
-  assert.equal(gemini.generationConfig.thinkingConfig.thinkingBudget, undefined);
-  assert.equal(sessionThinkingDisplayLabel('gemini', 'gemini-3.1-pro', { thinkingBudget: 4096 }), '渠道配置已适配（适配器：high）');
+test('默认展示区分服务默认、非法 Gemini 配置和 Astra adapter 映射', async () => {
+  assert.equal(sessionThinkingDisplayLabel('gemini', 'gemini-3.1-pro-preview'), '服务默认');
+  const gemini = await ordinaryWire('gemini', 'gemini-3.1-pro-preview', {});
+  assert.equal(gemini.generationConfig?.thinkingConfig, undefined);
+  await assert.rejects(ordinaryWire('gemini', 'gemini-3.1-pro-preview', { thinkingConfig: { thinkingBudget: 4096 } }), /Unsupported Gemini thinking/);
+  assert.equal(sessionThinkingDisplayLabel('gemini', 'gemini-3.1-pro-preview', { thinkingBudget: 4096 }), '配置不受支持（请求会拒绝）');
+  assert.equal(sessionThinkingDisplayLabel('gemini', 'gemini-2.5-flash', { thinkingLevel: 'high' }), '配置不受支持（请求会拒绝）');
   assert.equal(sessionThinkingDisplayLabel('openai-responses', 'gpt-6-astra', { thinkingLevel: 'none' }), 'low（适配器）');
   const astra = await ordinaryWire('openai-responses', 'gpt-6-astra', { thinkingConfig: { thinkingLevel: 'none' } });
   assert.equal(astra.reasoning.effort, 'low');
@@ -48,7 +49,7 @@ const matrix = [
   ['openai-responses', 'o3', { kind: 'openai-effort', value: 'high' }, body => assert.equal(body.reasoning.effort, 'high')],
   ['gemini', 'gemini-2.5-flash', { kind: 'gemini-budget', tokens: 0 }, body => assert.equal(body.generationConfig.thinkingConfig.thinkingBudget, 0)],
   ['gemini', 'gemini-2.5-pro', { kind: 'gemini-budget', tokens: -1 }, body => assert.equal(body.generationConfig.thinkingConfig.thinkingBudget, -1)],
-  ['gemini', 'gemini-3.1-pro', { kind: 'gemini-level', value: 'medium' }, body => assert.equal(body.generationConfig.thinkingConfig.thinkingLevel.toLowerCase(), 'medium')],
+  ['gemini', 'gemini-3.1-pro-preview', { kind: 'gemini-level', value: 'medium' }, body => assert.equal(body.generationConfig.thinkingConfig.thinkingLevel.toLowerCase(), 'medium')],
   ['claude', 'claude-sonnet-4-5', { kind: 'claude-budget', tokens: 2048 }, body => { assert.equal(body.thinking.budget_tokens, 2048); assert.equal(body.thinking.type, 'enabled'); assert.equal(body.output_config, undefined); }],
   ['claude', 'claude-opus-4-6', { kind: 'claude-effort', value: 'high' }, body => { assert.equal(body.thinking.type, 'adaptive'); assert.equal(body.output_config.effort, 'high'); assert.equal(body.thinking.budget_tokens, undefined); }],
   ['claude', 'claude-opus-4-6', { kind: 'claude-effort', value: 'none' }, body => assert.equal(body.thinking.type, 'disabled')],
@@ -91,7 +92,7 @@ test('能力负例与特殊值：未知不猜测、格式不等价、合法范�
   assert.throws(() => validate({ kind: 'gemini-budget', tokens: -2 }, 'gemini', 'gemini-2.5-flash'));
   assert.throws(() => validate({ kind: 'gemini-budget', tokens: 32769 }, 'gemini', 'gemini-2.5-pro'));
   assert.throws(() => validate({ kind: 'gemini-budget', tokens: 1024 }, 'gemini', 'gemini-2.5-flash', { maxOutputTokens: 1024 }));
-  assert.throws(() => validate({ kind: 'openai-effort', value: 'high' }, 'gemini', 'gemini-3.1-pro'));
+  assert.throws(() => validate({ kind: 'openai-effort', value: 'high' }, 'gemini', 'gemini-3.1-pro-preview'));
   assert.throws(() => validate({ kind: 'gemini-level', value: 'medium' }, 'gemini', 'gemini-3-pro'));
   assert.throws(() => validate({ kind: 'claude-budget', tokens: 1023 }, 'claude', 'claude-sonnet-4-5', { maxOutputTokens: 8192 }));
   assert.equal(thinkingValueLabel(), '服务默认');
@@ -133,4 +134,3 @@ test('review P2-5 Gemini只检测会覆盖思维/输出的nested字段', async (
   assert.equal(wire.generationConfig.thinkingConfig.thinkingBudget, 2048);
   assert.equal(wire.custom_field, 'keep');
 });
-

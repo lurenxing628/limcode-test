@@ -946,7 +946,9 @@ export class VscodeReliableKernelCommandRouter {
     payload: LlmProviderModelsGetPayload,
     correlationId?: string
   ): Promise<void> {
-    const models = await this.product.providerRegistry.listModels(payload.config);
+    const models = payload.probeNative === true
+      ? [await this.product.providerRegistry.verifyNativeCompaction(payload.config)]
+      : await this.product.providerRegistry.listModels(payload.config);
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.LlmProviderModelsSnapshot,
@@ -954,6 +956,7 @@ export class VscodeReliableKernelCommandRouter {
       correlationId,
       payload: {
         configId: payload.config.id,
+        ...(payload.probeNative === true ? { purpose: 'capability_probe' } : {}),
         provider: payload.config.provider,
         baseUrl: payload.config.baseUrl,
         models

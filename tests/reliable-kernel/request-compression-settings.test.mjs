@@ -36,7 +36,7 @@ const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend
 const { ReliableConversationRunner } = require('../../dist/extension/backend/application/reliableKernel/ReliableConversationRunner.js');
 const protocol = require('../../dist/extension/shared/protocol.js');
 const { readFrozenTurnAuthority } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
-const { applyRequestCompressionSettings } = require('../../dist/extension/backend/reliableKernel/requestCompressionSettings.js');
+const { applyRequestCompressionSettings, readRequestSettings } = require('../../dist/extension/backend/reliableKernel/requestCompressionSettings.js');
 
 async function fixture(run, hooks = {}) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-live-compression-'));
@@ -209,6 +209,36 @@ test('模型请求恢复只读已保存的压缩设置，不读取后来改变�
   });
 });
 
+test('集成：摘要继承同次请求的会话思维，输出预留随冻结生成设置更新', async () => {
+  await fixture(async ({ app, configuration, save, update, provider, input, frozen }) => {
+    const chat = { ...provider, provider: 'openai-responses', baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-5.2', models: [{ id: 'gpt-5.2', name: 'gpt-5.2' }],
+      generationConfig: { maxOutputTokens: 32000, thinkingConfig: { thinkingLevel: 'high' } } };
+    await save('llmProviderConfigs', { configs: [chat] });
+    await update({ llmSummary: { targetTokens: 1000, reasoning: { mode: 'inherit_chat' } } });
+    await configuration.mutations.setModelProfile({ scopeKind: 'conversation', scopeId: 'live-conversation',
+      providerConfigId: chat.id, provider: chat.provider, model: chat.model,
+      thinkingOverride: { kind: 'openai-effort', value: 'medium' } });
+    const started = await app.turns.input(input('frozen-summary-thinking'));
+    const original = await frozen(started.turnId);
+    await save('llmProviderConfigs', { configs: [{ ...chat,
+      generationConfig: { ...chat.generationConfig, maxOutputTokens: 64000 } }] });
+    const settingsId = await app.modelProvider.freezeRequestSettings(started.turnId, original.snapshot.id);
+    const settings = await readRequestSettings(app.database, app.contentStore, settingsId);
+    assert.equal(settings.requestGeneration.generationConfig.thinkingConfig.thinkingLevel, 'medium');
+    assert.equal(settings.requestCompression.compression.provider.summaryReasoning.generationConfig.thinkingConfig.thinkingLevel, 'medium');
+    const effective = applyRequestCompressionSettings(original.document, settings);
+    assert.equal(effective.model.maxOutputTokens, 64000);
+    assert.equal(original.document.model.maxOutputTokens, 32000);
+    const reset = applyRequestCompressionSettings(original.document, { requestGeneration: {
+      ...settings.requestGeneration, generationConfig: {}
+    } });
+    assert.equal(reset.model.maxOutputTokens, protocol.DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS);
+    await save('llmProviderConfigs', { configs: [chat] });
+    assert.deepEqual(await readRequestSettings(app.database, app.contentStore, settingsId), settings);
+  });
+});
+
 test('请求压缩设置不允许改变模型身份或接受不一致阈值', async () => {
   await fixture(async ({ app, configuration, input, frozen }) => {
     const started = await app.turns.input(input('invalid-settings'));
@@ -217,5 +247,120 @@ test('请求压缩设置不允许改变模型身份或接受不一致阈值', as
     assert.throws(() => applyRequestCompressionSettings(source, { requestCompression: { ...selected, model: { ...selected.model, model: 'other' } } }), /模型选择/);
     assert.throws(() => applyRequestCompressionSettings(source, { requestCompression: { ...selected, modelProfile: { ...selected.modelProfile, compressionThresholdTokens: 999 } } }), /阈值/);
     assert.throws(() => applyRequestCompressionSettings(source, { requestCompression: null }), /不完整/);
+  });
+});
+
+
+test('自动摘要失败但完整输入仍可容纳：保留原上下文、正常回答、冻结有界继续决定', async () => {
+  await fixture(async ({ app, input, terminal, update, list, requests }) => {
+    const history = await app.turns.input(input('fallback-history', 'KEEP_ORIGINAL_42 历史约束。'.repeat(5000)));
+    await terminal(history.turnId);
+    await update({ kind: 'llm_summary', fallbacks: ['continue_uncompressed_if_fits'],
+      trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 } });
+    const result = await app.agentLoop.runInput(input('fallback-input'));
+    assert.equal(result.terminalStatus, 'completed');
+    assert.equal(requests.filter((request) => request.recipe.kind === 'reliable-context-compression').length, 1);
+    const ordinary = requests.find((request) => request.recipe.kind === 'reliable-agent-turn');
+    assert.ok(ordinary.context.some((item) => item.content.includes('KEEP_ORIGINAL_42')));
+    const rows = await list('ModelRequest', { turn_id: result.turnId });
+    const failed = rows.find((row) => row.terminal_state !== 'completed');
+    assert.equal(failed.stream_stats_json.failure.category, 'capability');
+    assert.equal(failed.stream_stats_json.failure.status, 400);
+    const continued = rows.find((row) => row.id === ordinary.modelRequestId);
+    assert.equal(continued.stream_stats_json.compressionDecision.outcome, 'continued_uncompressed');
+    assert.equal(continued.stream_stats_json.compressionDecision.failures[0].modelRequestId, failed.id);
+    assert.ok(continued.stream_stats_json.compressionDecision.estimatedTokens <= continued.stream_stats_json.compressionDecision.limitTokens);
+    assert.equal((await list('CompressionBlock')).length, 0);
+    await update({ kind: 'disabled' });
+    const replay = await app.modelProvider.replay(ordinary.modelRequestId);
+    assert.deepEqual(replay.recipe.compressionDecision, continued.stream_stats_json.compressionDecision);
+  }, { async send(request, controls) {
+    if (request.recipe.kind === 'reliable-context-compression') {
+      throw new kernel.ProviderCapabilityError('unsupported_parameter', 'Summary parameter unsupported', 400, 'llm_summary');
+    }
+    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ text: '正常回答。' }] } });
+  } });
+});
+
+for (const scenario of ['authentication', 'internal']) {
+  test(`自动压缩 ${scenario} 故障不被降级掩盖或继续发送`, async () => {
+    await fixture(async ({ app, input, terminal, update, list, requests }) => {
+      const history = await app.turns.input(input(`fatal-history-${scenario}`, '以前的重要历史。'.repeat(12000)));
+      await terminal(history.turnId);
+      await update({ kind: 'llm_summary', trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 } });
+      const result = await app.agentLoop.runInput(input(`fatal-${scenario}`));
+      assert.equal(result.terminalStatus, 'failed');
+      assert.equal(requests.length, 1);
+      assert.equal((await list('CompressionBlock')).length, 0);
+      const [failed] = await list('ModelRequest', { turn_id: result.turnId });
+      assert.equal(failed.stream_stats_json.failure.category, scenario === 'internal' ? 'internal' : 'permanent');
+    }, { async send() {
+      if (scenario === 'internal') throw new TypeError('Internal context invariant failed');
+      throw Object.assign(new Error('authentication_error: invalid_api_key'), { status: 401 });
+    } });
+  });
+}
+
+test('手动压缩三段后备链只有一个维护回合；执行中改设置不改变冻结顺序', async () => {
+  await fixture(async ({ app, input, terminal, update, requests, list }) => {
+    const history = await app.turns.input(input('manual-chain-history', '必须保留的历史。'.repeat(600)));
+    await terminal(history.turnId);
+    await update({ kind: 'llm_summary', fallbacks: ['segmented_summary', 'deterministic_summary'] });
+    const runner = new ReliableConversationRunner(app, 'live-owner');
+    try {
+      const [head] = await list('ConversationContextHeadLink');
+      const result = await runner.manualCompression({ commandId: 'manual-chain', conversationId: 'live-conversation',
+        compressSegmentCount: 1, target: { kind: 'current_head', expectedRootId: head.root_id } });
+      assert.equal(result.compression.status, 'compressed');
+      assert.deepEqual(requests.map((request) => request.recipe.compressionMethodKind), ['llm_summary', 'segmented_summary', 'deterministic_summary']);
+      assert.equal(new Set(requests.map((request) => request.modelRequestId)).size, 3);
+      const rows = await list('ModelRequest', { turn_id: result.turnId });
+      assert.equal(new Set(rows.map((row) => row.settings_snapshot_object_id)).size, 1);
+      const completed = rows.find((row) => row.terminal_state === 'completed');
+      assert.equal(completed.stream_stats_json.compressionPurpose.priorFailures.length, 2);
+      assert.equal((await list('MessageTurnLink', { turn_id: result.turnId })).length, 0);
+      assert.equal((await list('CompressionBlock')).length, 1);
+      const restored = await runner.readManualCompressionDrive({ conversationId: 'live-conversation', turnId: result.turnId });
+      assert.equal(restored.compressSegmentCount, 1);
+      assert.equal(restored.settingsSnapshotContentObjectId, rows[0].settings_snapshot_object_id);
+      const replay = await runner.manualCompression({ commandId: 'manual-chain', conversationId: 'live-conversation',
+        compressSegmentCount: 1, target: { kind: 'current_head', expectedRootId: head.root_id } });
+      assert.equal(replay.deduplicated, true);
+      assert.equal(requests.length, 3);
+    } finally { runner.dispose(); }
+  }, { async send(request, controls, { update }) {
+    if (request.recipe.compressionMethodKind !== 'deterministic_summary') {
+      await update({ kind: 'disabled' });
+      throw new kernel.ProviderCapabilityError('unsupported_parameter', 'Not supported by test provider', 400, 'summary');
+    }
+    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { type: 'compression_result',
+      contents: [{ role: 'user', parts: [{ text: '保留约束的确定性摘要。' }] }] } });
+  } });
+});
+
+test('原生压缩不透明状态的文本后备从不可变来源重建，而不是总结加密占位符', async () => {
+  await fixture(async ({ app, input, terminal, update, frozen, list, requests }) => {
+    const started = await app.turns.input(input('native-source-history', 'ORIGINAL_CANONICAL_MARKER_42 '.repeat(600)));
+    await terminal(started.turnId);
+    const authority = await frozen(started.turnId);
+    const [head] = await list('ConversationContextHeadLink');
+    const { ContextCompressionControlPlane } = require('../../dist/extension/backend/reliableKernel/contextCompression.js');
+    const compression = new ContextCompressionControlPlane(app.database, app.contentStore);
+    await compression.create({ conversationId: 'live-conversation', headRootId: head.root_id,
+      authoritySnapshotId: authority.snapshot.id, compressSegmentCount: 1, title: '原生状态', idempotencyKey: 'native-canonical-test',
+      summary: [{ role: 'model', parts: [{ providerContext: { format: 'openai-responses', itemType: 'compaction',
+        rawItem: { type: 'compaction', encrypted_content: 'OPAQUE_NOT_HISTORY' } } }] }] });
+    await update({ kind: 'llm_summary', fallbacks: [] });
+    const runner = new ReliableConversationRunner(app, 'live-owner');
+    try {
+      const [nativeHead] = await list('ConversationContextHeadLink');
+      const result = await runner.manualCompression({ commandId: 'native-to-text', conversationId: 'live-conversation', compressSegmentCount: 1,
+        target: { kind: 'current_head', expectedRootId: nativeHead.root_id } });
+      assert.equal(result.compression.status, 'compressed');
+      assert.ok(requests[0].context.some((item) => item.content.includes('OPAQUE_NOT_HISTORY')));
+      assert.ok(requests[0].compressionSourceContext.some((item) => item.content.includes('ORIGINAL_CANONICAL_MARKER_42')));
+      assert.ok(!requests[0].compressionSourceContext.some((item) => item.content.includes('OPAQUE_NOT_HISTORY')));
+      assert.equal((await list('CompressionBlock')).length, 2);
+    } finally { runner.dispose(); }
   });
 });

@@ -1,4 +1,8 @@
 import { createHash } from 'crypto';
+import { discoverAnthropicModels } from './modelCapabilityDiscovery';
+import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
+import { resolveProviderModelCapabilities } from '../../shared/modelCapabilities';
+import { frozenSummaryReasoning, summaryRequestBody } from './summaryReasoning';
 import { associateDebugCapture, captureDebug, debugCaptureSources, debugSource, DebugHttpObservation, getDebugCaptureContext, type DebugCaptureRecorder } from '../reliableKernel/debugCapture/observer';
 import {
   groupAtomicMessageContents,
@@ -416,7 +420,11 @@ export async function startLlmProvider(
     const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider, {
       createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined
     });
-    const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+    const headers = headersForProviderContext(
+      settings,
+      request.contents,
+      mergeHeaders(await resolveMaybe(options.headers), settings.headers)
+    );
     const requestBody = withoutNativeServerSideCompaction(
       requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId),
       request.contents
@@ -1463,7 +1471,11 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
-  const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
+  const headers = headersForProviderContext(
+    runtimeSettings,
+    request.contents,
+    mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers)
+  );
   const requestBody = withoutNativeServerSideCompaction(
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId),
     request.contents
@@ -1526,16 +1538,16 @@ export async function dryRunCompactLlmProvider(
   );
   if (methodConfig.kind === 'disabled') throw new Error('当前压缩方法已关闭。');
   const generatedAt = Date.now();
-  if (methodConfig.kind === 'openai_responses_compact') {
+  if (methodConfig.kind === 'provider_native') {
     const observationContract = normalizeCompressionAttachmentObservationContract(request);
     if (observationContract.requirements.length > 0) {
       throw new TypeError('Provider-native Compact cannot carry text-summary Attachment observations.');
     }
-    const call = await dryRunOpenAIResponsesCompact(request, methodConfig, options, dryRunOptions);
+    const call = await dryRunProviderNativeCompact(request, methodConfig, options, dryRunOptions);
     return {
       kind: 'provider_requests',
       methodKind: methodConfig.kind,
-      calls: [{ ...call, id: `${request.id}:compact`, label: 'Responses Compact', ordinal: 0 }],
+      calls: [{ ...call, id: `${request.id}:compact`, label: 'Provider Native Compact', ordinal: 0 }],
       generatedAt
     };
   }
@@ -1616,7 +1628,7 @@ export async function dryRunCompactLlmProvider(
   };
 }
 
-async function dryRunOpenAIResponsesCompact(
+async function dryRunProviderNativeCompact(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
   options: LlmProviderOptions,
@@ -1625,7 +1637,16 @@ async function dryRunOpenAIResponsesCompact(
   const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
   const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
   const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
-  if (settings.provider !== 'openai-responses') throw new Error('OpenAI 原生压缩仅支持 openai-responses 渠道格式。');
+  if (settings.provider === 'claude') {
+    return dryRunAnthropicCompaction(request, methodConfig, normalizedContext, settings, options, dryRunOptions);
+  }
+  if (settings.provider !== 'openai-responses') {
+    throw nativeCompactionCapabilityError(
+      `当前 ${settings.provider} 渠道没有可用的 Provider 原生压缩适配器。`,
+      undefined,
+      'provider_native_compaction'
+    );
+  }
   const apiKeyAvailable = !!settings.apiKey;
   const runtimeSettings = apiKeyAvailable ? settings : { ...settings, apiKey: 'limcode-dry-run-placeholder-key' };
   const unified = await importUnifiedLlmProvider();
@@ -1695,6 +1716,10 @@ export async function listLlmProviderModels(config: LlmProviderConfigRecord, opt
 
   const unified = await importUnifiedLlmProvider();
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  if (settings.provider === 'claude') {
+    const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
+    return discoverAnthropicModels(settings, proxy ? createProxyFetch(proxy) : fetch, headers);
+  }
   const result = await unified.listAvailableModels({
     provider: settings.provider,
     apiKey: settings.apiKey,
@@ -1721,7 +1746,7 @@ export function registerLlmCompressionMethod(kind: LlmCompressionConfigRecord['k
 
 function ensureDefaultCompressionMethodsRegistered(): void {
   if (compressionMethodHandlers.size > 0) return;
-  registerLlmCompressionMethod('openai_responses_compact', compactWithOpenAIResponses);
+  registerLlmCompressionMethod('provider_native', compactWithProviderNative);
   registerLlmCompressionMethod('llm_summary', compactWithSummary);
   registerLlmCompressionMethod('segmented_summary', compactWithSegmentedSummary);
   registerLlmCompressionMethod('deterministic_summary', compactWithSummary);
@@ -1757,7 +1782,7 @@ export async function compactLlmProvider(
 
     // Freeze resolved media once for the whole native compact operation. Capability retries must
     // replay identical bytes even when the original reference was a mutable local sourcePath.
-    const handlerRequest = methodConfig.kind === 'openai_responses_compact'
+    const handlerRequest = methodConfig.kind === 'provider_native'
       ? { ...request, contents: await prepareNativeCompactContentsMultimodal(request.contents, options) }
       : request;
 
@@ -1919,13 +1944,13 @@ async function resolveCompactRetrySettings(
 }
 
 function isRetryCapableCompressionMethod(kind: LlmCompressionConfigRecord['kind']): boolean {
-  return kind === 'openai_responses_compact' || kind === 'llm_summary' || kind === 'segmented_summary';
+  return kind === 'provider_native' || kind === 'llm_summary' || kind === 'segmented_summary';
 }
 
 function compressionMethodModelOverride(methodConfig: LlmCompressionConfigRecord): LlmModelSettings | undefined {
-  if (methodConfig.kind === 'openai_responses_compact') {
-    const providerConfigId = methodConfig.openaiResponsesCompact?.providerConfigId?.trim();
-    const model = methodConfig.openaiResponsesCompact?.model?.trim();
+  if (methodConfig.kind === 'provider_native') {
+    const providerConfigId = methodConfig.providerNative?.providerConfigId?.trim();
+    const model = methodConfig.providerNative?.model?.trim();
     return providerConfigId || model ? { ...(providerConfigId ? { providerConfigId } : {}), model: model || '' } : undefined;
   }
   if (methodConfig.kind === 'llm_summary' || methodConfig.kind === 'segmented_summary') {
@@ -1937,12 +1962,20 @@ function compressionMethodModelOverride(methodConfig: LlmCompressionConfigRecord
 }
 
 function isRetryableCompactFailure(error: unknown, failure: LlmAttemptFailure): boolean {
-  const text = `${failure.message}\n${errorSearchText(error)}`.toLowerCase();
+  const text = `${failure.message}\n${errorSearchText(error)}\n${stringifyJson(failure.rawError ?? {})}`.toLowerCase();
+  const raw = isRecord(failure.rawError) ? failure.rawError : undefined;
+  const code = typeof raw?.code === 'string' ? raw.code : undefined;
+  const retryable = typeof raw?.retryable === 'boolean' ? raw.retryable : undefined;
+  const status = typeof raw?.status === 'number' ? raw.status : undefined;
+  if (code === 'PROVIDER_CAPABILITY_MISMATCH' || retryable === false) return false;
+  if ((status === 404 || status === 405 || status === 501)
+    && (text.includes('compact') || text.includes('compaction'))) return false;
   return !(
     text.includes('当前压缩方法已关闭')
     || text.includes('未注册的压缩方法')
     || text.includes('缺少 llm api key')
-    || text.includes('openai 原生压缩仅支持')
+    || text.includes('没有可用的 provider 原生压缩适配器')
+    || text.includes('native_compaction_unsupported')
     || text.includes('media_size_unknown')
     || text.includes('media_semantics_unavailable')
     || text.includes('compression_request_too_large')
@@ -1958,8 +1991,8 @@ async function resolveCompactProviderSettings(
   contents: MessageContent[],
   options: LlmProviderOptions
 ): Promise<LlmProviderConfigRecord> {
-  const modelOverride = methodConfig.openaiResponsesCompact?.model?.trim();
-  const providerConfigId = methodConfig.openaiResponsesCompact?.providerConfigId?.trim();
+  const modelOverride = methodConfig.providerNative?.model?.trim();
+  const providerConfigId = methodConfig.providerNative?.providerConfigId?.trim();
   return resolveRuntimeSettings({
     id: request.id,
     contents,
@@ -1973,7 +2006,7 @@ async function resolveCompactProviderSettings(
   }, options);
 }
 
-async function compactWithOpenAIResponses(
+async function compactWithProviderNative(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
   options: LlmProviderOptions,
@@ -1983,8 +2016,15 @@ async function compactWithOpenAIResponses(
   const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
   const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
 
+  if (settings.provider === 'claude') {
+    return compactWithAnthropic(request, methodConfig, normalizedContext, settings, options, signal);
+  }
   if (settings.provider !== 'openai-responses') {
-    throw new Error('OpenAI 原生压缩仅支持 openai-responses 渠道格式。');
+    throw nativeCompactionCapabilityError(
+      `当前 ${settings.provider} 渠道没有可用的 Provider 原生压缩适配器。`,
+      undefined,
+      'provider_native_compaction'
+    );
   }
   if (!settings.apiKey) {
     throw new Error('缺少 LLM API Key。请在全局设置的“渠道”页签里填写并保存。');
@@ -2059,8 +2099,8 @@ async function compactWithOpenAIResponses(
       error: errorDebugInfo(error),
       signalAborted: signal?.aborted === true
     });
-    // 压缩方法是用户明确选择的策略。OpenAI 原生压缩失败时必须保持该策略失败，
-    // 交给外层按同一方法重试，不能在单次尝试内偷偷切换为分段总结。
+    // 单次 Provider 原生压缩尝试只负责当前适配器；失败由冻结的外层后备链决定是否
+    // 切换为分段总结或确定性摘要，不能在 capability 内部偷偷改变执行方法。
     throw error;
   }
 
@@ -2076,6 +2116,297 @@ async function compactWithOpenAIResponses(
     settingsSnapshot: snapshotFromSettings(settings, methodConfig),
     rawResponse: compacted.rawResponse,
     methodConfig
+  };
+}
+
+async function dryRunAnthropicCompaction(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  contents: MessageContent[],
+  settings: LlmProviderConfigRecord,
+  options: LlmProviderOptions,
+  dryRunOptions: LlmDryRunOptions
+): Promise<LlmDryRunResult> {
+  const apiKeyAvailable = !!settings.apiKey;
+  const runtimeSettings = apiKeyAvailable ? settings : { ...settings, apiKey: 'limcode-dry-run-placeholder-key' };
+  const built = await buildAnthropicCompactionRequest(
+    request,
+    methodConfig,
+    contents,
+    runtimeSettings,
+    options,
+    dryRunOptions.includeApiKey === true
+  );
+  return formatUnifiedDryRunResult(
+    built.result,
+    runtimeSettings,
+    built.unified,
+    dryRunOptions,
+    apiKeyAvailable
+  );
+}
+
+async function compactWithAnthropic(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  contents: MessageContent[],
+  settings: LlmProviderConfigRecord,
+  options: LlmProviderOptions,
+  signal?: AbortSignal
+): Promise<LlmCompactResult> {
+  if (!settings.apiKey) {
+    throw new Error('缺少 LLM API Key。请在全局设置的“渠道”页签里填写并保存。');
+  }
+  const built = await buildAnthropicCompactionRequest(
+    request,
+    methodConfig,
+    contents,
+    settings,
+    options,
+    true
+  );
+  const response = await built.fetch(built.result.url, {
+    method: 'POST',
+    headers: built.result.headers,
+    body: JSON.stringify(built.result.body),
+    signal,
+    redirect: 'error'
+  });
+  const rawText = await response.text();
+  let raw: unknown;
+  try {
+    raw = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    raw = { message: rawText };
+  }
+  if (!response.ok) {
+    const message = providerHttpErrorMessage('Anthropic Compaction API', response.status, raw);
+    if (response.status === 404 || response.status === 405 || response.status === 501) {
+      throw nativeCompactionCapabilityError(message, response.status, 'anthropic_messages_compact', raw);
+    }
+    throw Object.assign(new Error(message), {
+      status: response.status,
+      endpointKind: 'anthropic_messages_compact',
+      rawResponse: raw
+    });
+  }
+  const record = isRecord(raw) ? raw : {};
+  const content = Array.isArray(record.content) ? record.content : [];
+  const block = content.find((candidate) => isRecord(candidate) && candidate.type === 'compaction');
+  const stopReason = typeof record.stop_reason === 'string' ? record.stop_reason : undefined;
+  if (content.length !== 1 || !isRecord(block) || typeof block.content !== 'string' || !block.content.trim()
+    || typeof block.signature !== 'string' || !block.signature.trim() || stopReason !== 'compaction') {
+    throw Object.assign(new Error(
+      `Anthropic 原生压缩未返回可回放的签名 compaction block（stop_reason=${stopReason ?? 'unknown'}）。`
+    ), {
+      code: 'ANTHROPIC_COMPACTION_EMPTY',
+      retryable: stopReason === 'max_tokens' || stopReason === 'model_context_window_exceeded',
+      endpointKind: 'anthropic_messages_compact',
+      stopReason,
+      rawResponse: raw
+    });
+  }
+  const providerContext: MessageContent = {
+    role: 'model',
+    parts: [{
+      providerContext: {
+        provider: 'anthropic',
+        format: 'claude',
+        endpoint: '/v1/messages',
+        itemType: 'compaction',
+        rawItem: block
+      }
+    }]
+  };
+  return {
+    id: typeof record.id === 'string' ? record.id : undefined,
+    object: typeof record.type === 'string' ? record.type : 'message',
+    contents: [providerContext],
+    usageMetadata: usageMetadataFromAnthropicCompaction(record.usage),
+    settingsSnapshot: snapshotFromSettings(settings, methodConfig),
+    rawResponse: raw,
+    methodConfig
+  };
+}
+
+async function buildAnthropicCompactionRequest(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  contents: MessageContent[],
+  settings: LlmProviderConfigRecord,
+  options: LlmProviderOptions,
+  includeApiKey: boolean
+): Promise<{
+  result: UnifiedDryRunResult;
+  unified: UnifiedModule;
+  fetch: typeof fetch;
+}> {
+  const unified = await importUnifiedLlmProvider();
+  const registry = unified.createBootstrapExtensionRegistry();
+  const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
+  const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+  const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
+  const configuredHeaders = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const provider = installProviderCompatibility(unified.createLLMFromConfig({
+    provider: settings.provider,
+    model: settings.model,
+    apiKey: settings.apiKey,
+    baseUrl: settings.baseUrl,
+    ...(settings.contextWindowTokens ? { contextWindow: settings.contextWindowTokens } : {}),
+    ...(configuredHeaders ? { headers: configuredHeaders } : {}),
+    ...((request.nativeRequestBody ?? settings.requestBody) ? { requestBody: request.nativeRequestBody ?? settings.requestBody } : {}),
+    ...(proxy ? { proxy } : {}),
+    fetch: providerFetch
+  }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model);
+  const generationConfig = request.nativeGenerationConfig ?? settings.generationConfig;
+  const systemInstruction = prependSystemInstructionPrefix(
+    request.systemInstruction,
+    settings.systemPromptPrefix
+  );
+  const result = await provider.dryRun({
+    contents,
+    ...(systemInstruction ? { systemInstruction } : {}),
+    tools: request.tools ?? [],
+    ...(generationConfig ? { generationConfig } : {})
+  }, {
+    inputFormat: 'unified',
+    outputFormat: 'unified',
+    stream: false,
+    curl: { includeApiKey, prettyBody: true }
+  });
+  const body = anthropicCompactionBody(result.body, methodConfig);
+  const headers = withAnthropicBetaHeader(result.headers, 'compact-2026-09-04');
+  return {
+    result: {
+      ...result,
+      stream: false,
+      headers,
+      body,
+      bodyText: JSON.stringify(body, null, 2),
+      curl: unified.formatRequestAsCurl(result.url, headers, body, { includeApiKey, prettyBody: true }),
+      timestamp: Date.now()
+    },
+    unified,
+    fetch: providerFetch
+  };
+}
+
+function anthropicCompactionBody(value: unknown, methodConfig: LlmCompressionConfigRecord): Record<string, unknown> {
+  if (!isRecord(value)) throw new TypeError('Anthropic compaction dry-run did not produce a JSON request body.');
+  const body: Record<string, unknown> = { ...value };
+  delete body.stream;
+  delete body.context_management;
+  delete body.stop_sequences;
+  if (isRecord(body.tool_choice) && (body.tool_choice.type === 'any' || body.tool_choice.type === 'tool')) {
+    delete body.tool_choice;
+  }
+  if (isRecord(body.output_config)) {
+    const outputConfig: Record<string, unknown> = { ...body.output_config };
+    delete outputConfig.format;
+    if (isRecord(outputConfig.task_budget)) {
+      const taskBudget: Record<string, unknown> = { ...outputConfig.task_budget };
+      delete taskBudget.remaining;
+      if (Object.keys(taskBudget).length > 0) outputConfig.task_budget = taskBudget;
+      else delete outputConfig.task_budget;
+    }
+    if (Object.keys(outputConfig).length > 0) body.output_config = outputConfig;
+    else delete body.output_config;
+  }
+  const custom = methodConfig.llmSummary?.systemPrompt?.trim();
+  const instructions = [
+    custom || 'Summarize the transcript for exact continuation in a future context window.',
+    'Preserve identifiers, file paths, numbers, decisions, constraints, tool results, open tasks, and the current state.',
+    'Do not call tools while writing this summary; return summary text only.'
+  ].join(' ').slice(0, 16_384);
+  body.compaction = { type: 'summarize', instructions };
+  return body;
+}
+
+function prependSystemInstructionPrefix(
+  systemInstruction: MessageContent | undefined,
+  prefixInput: string | undefined
+): MessageContent | undefined {
+  const prefix = prefixInput?.trim() ?? '';
+  if (!prefix) return systemInstruction;
+  if (!systemInstruction) return { role: 'user', parts: [{ text: prefix }] };
+  return {
+    ...systemInstruction,
+    parts: [{ text: prefix }, ...systemInstruction.parts]
+  };
+}
+
+function headersForProviderContext(
+  settings: Pick<LlmProviderConfigRecord, 'provider'>,
+  contents: readonly MessageContent[],
+  headers: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  return settings.provider === 'claude' && containsAnthropicCompactionBlock(contents)
+    ? withAnthropicBetaHeader(headers, 'compact-2026-09-04')
+    : headers;
+}
+
+function containsAnthropicCompactionBlock(contents: readonly MessageContent[]): boolean {
+  return contents.some((content) => content.parts.some((part) =>
+    isProviderContextPart(part)
+      && part.providerContext.format === 'claude'
+      && part.providerContext.itemType === 'compaction'
+      && isRecord(part.providerContext.rawItem)
+      && part.providerContext.rawItem.type === 'compaction'
+  ));
+}
+
+function withAnthropicBetaHeader(
+  input: Record<string, string> | undefined,
+  beta: string
+): Record<string, string> {
+  const headers = { ...(input ?? {}) };
+  const existingKey = Object.keys(headers).find((key) => key.toLowerCase() === 'anthropic-beta');
+  const existing = existingKey ? headers[existingKey] : '';
+  const values = new Set((existing ?? '').split(',').map((value) => value.trim()).filter(Boolean));
+  values.add(beta);
+  if (existingKey && existingKey !== 'anthropic-beta') delete headers[existingKey];
+  headers['anthropic-beta'] = [...values].join(',');
+  return headers;
+}
+
+function nativeCompactionCapabilityError(
+  message: string,
+  status?: number,
+  endpointKind = 'provider_native_compaction',
+  rawResponse?: unknown
+): Error {
+  return Object.assign(new Error(message), {
+    name: 'ProviderCapabilityError',
+    code: 'PROVIDER_CAPABILITY_MISMATCH',
+    reason: 'native_compaction_unsupported',
+    retryable: false,
+    ...(status === undefined ? {} : { status }),
+    endpointKind,
+    ...(rawResponse === undefined ? {} : { rawResponse })
+  });
+}
+
+function providerHttpErrorMessage(label: string, status: number, raw: unknown): string {
+  const nested = isRecord(raw) && isRecord(raw.error) && typeof raw.error.message === 'string'
+    ? raw.error.message
+    : isRecord(raw) && typeof raw.message === 'string'
+      ? raw.message
+      : stringifyJson(toPlainJsonLike(raw));
+  return `${label} 错误 (${status}): ${nested || 'Unknown provider error'}`;
+}
+
+function usageMetadataFromAnthropicCompaction(value: unknown): LlmUsageMetadataRecord | undefined {
+  if (!isRecord(value)) return undefined;
+  const iterations = Array.isArray(value.iterations) ? value.iterations.filter(isRecord) : [];
+  const inputTokens = iterations.reduce((sum, item) =>
+    sum + (typeof item.input_tokens === 'number' ? item.input_tokens : 0), 0);
+  const outputTokens = iterations.reduce((sum, item) =>
+    sum + (typeof item.output_tokens === 'number' ? item.output_tokens : 0), 0);
+  return {
+    promptTokenCount: inputTokens,
+    candidatesTokenCount: outputTokens,
+    totalTokenCount: inputTokens + outputTokens,
+    ...value
   };
 }
 
@@ -2564,9 +2895,7 @@ function buildAttachmentObservationProviderCall(
       contents: [sourceContent],
       systemInstruction: { parts: [{ text: systemPrompt }] },
       generationConfig: {
-        temperature: 0,
-        maxOutputTokens: ATTACHMENT_OBSERVATION_MAX_OUTPUT_TOKENS,
-        thinkingConfig: { thinkingLevel: 'low' }
+        maxOutputTokens: ATTACHMENT_OBSERVATION_MAX_OUTPUT_TOKENS
       }
     }
   };
@@ -2993,7 +3322,7 @@ interface ResolvedSummaryProvider {
   onCompressionProgress?: () => void;
 }
 
-/** 组装总结用 provider（复用运行时渠道解析 + 代理/头合并）；无 API Key 时 provider 为 undefined 表示回退确定性摘要。 */
+/** 组装总结 Provider；无密钥的自托管渠道仍走真实请求，认证失败不得伪装成摘要成功。 */
 async function resolveSummaryProvider(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
@@ -3012,24 +3341,24 @@ async function resolveSummaryProvider(
     ...(providerConfigId || model ? { model: { ...(providerConfigId ? { providerConfigId } : {}), model: model || '' } } : {})
   }, options);
 
+  const reasoningPlan = frozenSummaryReasoning(request, methodConfig, settings);
   const apiKeyAvailable = !!settings.apiKey;
-  if (!apiKeyAvailable && behavior.allowPlaceholderApiKey !== true) {
-    return {
-      provider: undefined,
-      settings,
-      stream: false,
-      apiKeyAvailable: false,
-      omitUnsupportedMaxOutputTokens: false
-    };
-  }
-  const runtimeSettings = apiKeyAvailable ? settings : { ...settings, apiKey: 'limcode-dry-run-placeholder-key' };
+  const runtimeSettings = !apiKeyAvailable && behavior.allowPlaceholderApiKey === true
+    ? { ...settings, apiKey: 'limcode-dry-run-placeholder-key' }
+    : settings;
   const unified = await importUnifiedLlmProvider();
   const registry = unified.createBootstrapExtensionRegistry();
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
-  const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
-  const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
+  const headers = headersForProviderContext(
+    runtimeSettings,
+    request.contents,
+    mergeHeaders(await resolveMaybe(options.headers), settings.headers)
+  );
+  const requestBody = summaryRequestBody(
+    requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId), reasoningPlan
+  );
   const provider = installProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
@@ -3522,15 +3851,14 @@ const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = 32;
 const MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS = 6;
 const SEGMENTED_SUMMARY_CONCURRENCY = 3;
 const SEGMENTED_PRIOR_CONTEXT_TOKENS = 1_024;
-const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 2_048;
+const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 8_192;
 const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 2;
 const SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS = 8_000;
 
 /**
- * `targetTokens` is the desired visible summary length, while Provider output accounting also
- * includes hidden reasoning tokens. Keep those two budgets separate: use the target in the prompt,
- * default summary reasoning to low, and reserve a bounded hard-output ceiling. An explicit method
- * `maxOutputTokens`/`thinkingConfig` remains authoritative.
+ * `targetTokens` is the desired visible summary length, while Provider output accounting can also
+ * include hidden reasoning tokens. Reasoning intent is resolved and frozen by the configuration
+ * authority; this request builder must never invent a cross-provider `low`/`medium` default.
  */
 function summaryGenerationConfig(
   methodConfig: LlmCompressionConfigRecord,
@@ -3538,41 +3866,9 @@ function summaryGenerationConfig(
   targetTokensOverride?: number
 ): LlmGenerationConfigRecord | undefined {
   const targetTokens = targetTokensOverride ?? methodConfig.llmSummary?.targetTokens;
-  const inherited = settings.generationConfig ?? {};
   const method = methodConfig.llmSummary?.generationConfig ?? {};
-  const {
-    maxOutputTokens: inheritedMaxOutputTokens,
-    thinkingConfig: inheritedThinkingConfig,
-    ...inheritedRest
-  } = inherited;
-  const {
-    maxOutputTokens: methodMaxOutputTokens,
-    thinkingConfig: methodThinkingConfig,
-    ...methodRest
-  } = method;
-  const derivedMaxOutputTokens = typeof targetTokens === 'number'
-    && Number.isFinite(targetTokens)
-    && targetTokens > 0
-    ? Math.max(
-        SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS,
-        Math.min(
-          DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
-          Math.ceil(targetTokens * SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER)
-        )
-      )
-    : inheritedMaxOutputTokens;
-  const generationConfig = {
-    ...inheritedRest,
-    ...methodRest,
-    ...((methodMaxOutputTokens ?? derivedMaxOutputTokens) !== undefined
-      ? { maxOutputTokens: methodMaxOutputTokens ?? derivedMaxOutputTokens }
-      : {}),
-    thinkingConfig: methodThinkingConfig ?? {
-      ...(inheritedThinkingConfig ?? {}),
-      thinkingLevel: 'low' as const
-    }
-  };
-  return Object.keys(generationConfig).length > 0 ? generationConfig : undefined;
+  const { thinkingConfig: _thinking, maxOutputTokens: _maximum, ...methodRest } = method;
+  return { ...methodRest, maxOutputTokens: resolveSummaryOutputBudget(targetTokens, method) };
 }
 
 async function summarizeSingleRound(
@@ -3581,27 +3877,11 @@ async function summarizeSingleRound(
   signal?: AbortSignal
 ): Promise<string> {
   const fallback = deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
-  if (!resolved.provider) return fallback;
-
-  try {
-    const trimmed = (await executeSummaryProviderCall(
-      resolved,
-      call.request,
-      signal,
-      { allowCompatibilityRetry: false }
-    )).trim();
-    return finalizeStructuredSummary(extractSummaryTag(trimmed), fallback, call.targetTokens);
-  } catch (error) {
-    if (isRequestAbort(signal)) throw error;
-    const contextLength = isContextLengthExceededError(error);
-    logCompressionDebug('provider.compact.segmentedSummary.segmentFallback', {
-      error: errorDebugInfo(error),
-      segmentContents: call.sourceContents.length,
-      contextLength
-    });
-    if (!contextLength) throw error;
-    return fallback;
-  }
+  const trimmed = (await executeSummaryProviderCall(
+    resolved, call.request, signal, { allowCompatibilityRetry: false }
+  )).trim();
+  // Method changes belong to the durable coordinator, never a hidden leaf-level fallback.
+  return finalizeStructuredSummary(extractSummaryTag(trimmed), fallback, call.targetTokens);
 }
 
 async function executeSummaryProviderCall(
@@ -3610,7 +3890,7 @@ async function executeSummaryProviderCall(
   signal?: AbortSignal,
   options: { allowCompatibilityRetry?: boolean } = {}
 ): Promise<string> {
-  if (!resolved.provider) return '';
+  if (!resolved.provider) throw new Error('Summary provider was not resolved.');
   const execute = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
     if (resolved.stream || isOpenAIResponsesWebSocketMode(resolved.settings)) {
       let text = '';
@@ -3627,6 +3907,10 @@ async function executeSummaryProviderCall(
             rawChunk: (chunk as { rawChunk?: unknown }).rawChunk ?? chunk
           }));
         }
+        if (/length|max_tokens|max_output_tokens/i.test(String((chunk as { finishReason?: unknown }).finishReason ?? ''))) {
+          throw Object.assign(new Error('Summary output limit exhausted; the stream did not produce a complete summary.'),
+            { code: 'SUMMARY_OUTPUT_LIMIT_EXHAUSTED' });
+        }
         text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
         if (chunk.textDelta?.trim() || chunk.partsDelta?.some((part) =>
           'text' in part && typeof part.text === 'string' && part.text.trim()
@@ -3634,7 +3918,7 @@ async function executeSummaryProviderCall(
           resolved.onCompressionProgress?.();
         }
       }
-      return text;
+      return requireSummaryVisibleOutput(text);
     }
 
     const response = await resolved.provider!.chat<UnifiedLLMResponse>(activeRequest, {
@@ -3647,7 +3931,10 @@ async function executeSummaryProviderCall(
         rawResponse: response.rawResponse ?? response
       }));
     }
-    return visibleTextFromParts(response.content?.parts ?? []);
+    if (/length|max_tokens|max_output_tokens/i.test(String(response.finishReason ?? ''))) {
+      throw Object.assign(new Error('Summary output limit exhausted; the configured method did not produce a complete summary.'), { code: 'SUMMARY_OUTPUT_LIMIT_EXHAUSTED' });
+    }
+    return requireSummaryVisibleOutput(visibleTextFromParts(response.content?.parts ?? []));
   };
 
   const initialRequest = resolved.omitUnsupportedMaxOutputTokens
@@ -3656,7 +3943,7 @@ async function executeSummaryProviderCall(
   try {
     return await execute(initialRequest);
   } catch (error) {
-    if (options.allowCompatibilityRetry === false) throw error;
+    if (options.allowCompatibilityRetry !== true) throw error;
     if (hasMaxOutputTokens(initialRequest) && isUnsupportedMaxOutputTokensError(error)) {
       resolved.omitUnsupportedMaxOutputTokens = true;
       logCompressionDebug('provider.compact.summary.compatibilityRetry', {
@@ -3778,7 +4065,7 @@ async function generateSummaryText(
   if (request.contents.length === 0) return { text: fallback };
 
   const resolved = resolvedProvider ?? await resolveSummaryProvider(request, methodConfig, options);
-  if (!resolved.provider) return { text: fallback, settings: resolved.settings };
+  if (!resolved.provider) throw new Error('Summary provider was not resolved.');
 
   const call = buildSummaryProviderCall(request, methodConfig, resolved.settings);
   if (!isSummaryProviderCallWithinWindow(call, resolved.settings)) {
@@ -3800,7 +4087,7 @@ function normalizeCompressionConfig(input: LlmCompressionConfigRecord | undefine
     kind,
     maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(input?.maxDurationMinutes),
     trigger: input?.trigger ?? { mode: 'manual' },
-    ...(input?.openaiResponsesCompact ? { openaiResponsesCompact: input.openaiResponsesCompact } : {}),
+    ...(input?.providerNative ? { providerNative: input.providerNative } : {}),
     ...(input?.llmSummary ? { llmSummary: input.llmSummary } : {}),
     createdAt: input?.createdAt ?? now,
     updatedAt: input?.updatedAt ?? now
@@ -3955,6 +4242,7 @@ function isStructuredSummaryText(text: string): boolean {
 function finalizeStructuredSummary(candidate: string, fallback: string, targetTokens: number): string {
   const fallbackSummary = parseStructuredSummary(fallback)
     ?? structuredSummaryFromLooseText(fallback, 'active');
+  requireSummaryVisibleOutput(candidate);
   const parsed = parseStructuredSummary(candidate);
   if (!parsed || structuredSummaryFactCount(parsed) === 0) {
     return fitStructuredSummary(fallbackSummary, targetTokens);
@@ -4818,4 +5106,63 @@ function emitLlmRetryCancelled(emit: Emit, requestId: string, message: string, r
 
 function emitLlmRetryRecovered(emit: Emit, requestId: string, message: string, retryAttempt: number, retryMaxAttempts: number): void {
   emit({ type: LlmEventType.RetryRecovered, payload: { requestId, message, retryAttempt, retryMaxAttempts, createdAt: Date.now() } });
+}
+
+/** Explicit UI action. One synthetic request may consume Provider tokens; never automatic. */
+export async function probeLlmProviderNativeCompaction(
+  config: LlmProviderConfigRecord, options: LlmProviderOptions
+): Promise<LlmProviderModelRecord> {
+  if (config.provider !== 'openai-responses' && config.provider !== 'claude') {
+    throw new Error('当前接口没有原生压缩适配器。');
+  }
+  const url = new URL(config.baseUrl);
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('能力验证端点不能包含 URL 凭据、查询串或片段；请使用渠道请求头配置认证。');
+  }
+  const settings = normalizeSettings(config);
+  const baseline = resolveProviderModelCapabilities(config, config.model);
+  const method: LlmCompressionConfigRecord = {
+    id: 'native-capability-probe', name: '原生压缩能力验证', kind: 'provider_native',
+    trigger: { mode: 'manual' }, providerNative: { providerConfigId: config.id, model: config.model },
+    llmSummary: { targetTokens: 128 }, createdAt: 0, updatedAt: 0
+  };
+  const contents: MessageContent[] = [
+    { role: 'user', parts: [{ text: 'Capability check only. Remember verification_marker=42. No tools or external actions.' }] },
+    { role: 'model', parts: [{ text: 'verification_marker=42.' }] },
+    { role: 'user', parts: [{ text: 'Preserve this marker when compacting.' }] }
+  ];
+  let nativeCompaction = baseline.nativeCompaction;
+  try {
+    const result = await compactWithProviderNative({
+      id: 'native-capability-probe', blockId: 'native-capability-probe', conversationId: 'native-capability-probe',
+      methodKind: 'provider_native', methodConfigSnapshot: method, contents,
+      nativeGenerationConfig: { maxOutputTokens: 4096 }, nativeRequestBody: {}, tools: []
+    }, method, {
+      ...options,
+      settings: async () => ({ ...settings, requestBody: {}, retryOnError: false })
+    }, AbortSignal.timeout(30_000));
+    const validNative = result.contents.some((content) => content.parts.some((part) =>
+      isProviderContextPart(part) && (part.providerContext.itemType === 'compaction'
+        || isRecord(part.providerContext.rawItem) && part.providerContext.rawItem.type === 'compaction')));
+    nativeCompaction = validNative
+      ? { kind: config.provider === 'claude' ? 'anthropic_messages' : 'openai_responses', availability: 'verified', reason: '一次独立的合成请求已返回可回放的原生压缩状态。' }
+      : { availability: 'unknown', reason: '端点响应成功，但没有返回原生 compaction 状态；未标记为验证通过。' };
+  } catch (error) {
+    const status = error && typeof error === 'object' ? (error as { status?: number }).status : undefined;
+    const embedded = error instanceof Error ? /Compact API[^\d]*(?:错误\s*)?\((404|405|501)\)/i.exec(error.message) : null;
+    const httpStatus = status ?? (embedded ? Number(embedded[1]) : undefined);
+    if (httpStatus !== 404 && httpStatus !== 405 && httpStatus !== 501) throw error;
+    nativeCompaction = { availability: 'unsupported', reason: `原生端点验证返回 HTTP ${httpStatus}，不再对这个端点和模型自动使用原生压缩。` };
+  }
+  return {
+    id: config.model, name: config.models.find((model) => model.id === config.model)?.name ?? config.model,
+    capabilitySnapshot: { ...baseline, source: 'verified_probe', verifiedAt: new Date().toISOString(), nativeCompaction }
+  };
+}
+
+function requireSummaryVisibleOutput(text: string): string {
+  if (!text.trim()) throw Object.assign(new Error(
+    'Summary provider returned no visible summary. Reasoning-only or empty output is not successful compression.'
+  ), { code: 'SUMMARY_EMPTY_OUTPUT' });
+  return text;
 }

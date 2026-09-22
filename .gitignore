@@ -21,6 +21,8 @@ docs/*
 !docs/conversation-storage-authority.md
 !docs/session-thinking-override.md
 !docs/model-context-projection.md
+!docs/provider-compression-capabilities.md
+!docs/global-settings-data-integration.md
 !docs/architecture/
 docs/architecture/*
 !docs/architecture/reliable-kernel/
@@ -53,6 +55,8 @@ docs/architecture/*
 !/tests/reliable-kernel/session-thinking.test.mjs
 !/tests/reliable-kernel/session-thinking-runtime.test.mjs
 !/tests/reliable-kernel/request-compression-settings.test.mjs
+!/tests/reliable-kernel/model-capabilities.test.mjs
+!/tests/reliable-kernel/compression-provider-contracts.test.mjs
 !/tests/reliable-kernel/context-token-estimator.test.mjs
 !/tests/reliable-kernel/conversation-fork-context.test.mjs
 !/tests/reliable-kernel/conversation-fork-lifecycle.test.mjs

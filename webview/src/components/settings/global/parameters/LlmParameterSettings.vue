@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { IconPlus } from '@tabler/icons-vue';
 import type { LlmGenerationConfigRecord, LlmProviderConfigRecord, LlmRequestBodyRecord } from '@shared/protocol';
+import { resolveProviderModelCapabilities, thinkingConfigSupported } from '@shared/modelCapabilities';
 import LlmKnownParameterRow from './LlmKnownParameterRow.vue';
 import LlmCustomRequestBodyEditor from './LlmCustomRequestBodyEditor.vue';
 import LlmParameterAddPanel, { type LlmParameterAddOption } from './LlmParameterAddPanel.vue';
@@ -29,9 +30,14 @@ const editingJson = ref(false);
 const providerLabel = computed(() => labelForProvider(props.config.provider));
 const generationConfig = computed<LlmGenerationConfigRecord>(() => props.config.generationConfig ?? {});
 const requestBody = computed<LlmRequestBodyRecord>(() => props.config.requestBody ?? {});
-const definitions = computed(() => parameterDefinitionsForProvider(props.config.provider, props.config.model));
+const capabilities = computed(() => resolveProviderModelCapabilities(props.config, props.config.model));
+const supportedDefinitions = computed(() => parameterDefinitionsForProvider(props.config.provider, props.config.model, capabilities.value));
+const definitions = computed(() => parameterDefinitionsForProvider(props.config.provider, props.config.model).map((definition) =>
+  supportedDefinitions.value.find((supported) => supported.key === definition.key) ?? {
+    ...definition, description: `${definition.description} 当前模型未确认支持；已保存值保留供检查或移除。`
+  }));
 const activeDefinitions = computed(() => definitions.value.filter((definition) => hasPath(generationConfig.value, definition.path)));
-const availableDefinitions = computed<LlmParameterAddOption[]>(() => definitions.value.filter((definition) => !hasPath(generationConfig.value, definition.path)).map(withMutualExclusionState));
+const availableDefinitions = computed<LlmParameterAddOption[]>(() => supportedDefinitions.value.filter((definition) => !hasPath(generationConfig.value, definition.path)).map(withMutualExclusionState));
 const hasRequestBody = computed(() => Object.keys(requestBody.value).length > 0);
 const hasAnyParameter = computed(() => activeDefinitions.value.length > 0 || hasRequestBody.value);
 
@@ -62,6 +68,12 @@ function updateKnownValue(definition: LlmParameterDefinition, value: unknown): v
   const next = cloneGenerationConfig(generationConfig.value);
   if (value === undefined || value === '') deletePath(next, definition.path);
   else setPath(next, definition.path, value);
+  if (next.thinkingConfig && capabilities.value.source !== 'unknown' && capabilities.value.reasoning.family !== 'none'
+    && !thinkingConfigSupported(next.thinkingConfig, capabilities.value.reasoning)) {
+    jsonError.value = '当前模型不支持该思考配置，请先移除冲突的预算或强度。';
+    return;
+  }
+  jsonError.value = '';
   emitGenerationConfig(next);
 }
 
@@ -134,6 +146,7 @@ function isThinkingMutuallyExcluded(definition: LlmParameterDefinition): boolean
 }
 
 function isThinkingParameter(definition: LlmParameterDefinition): boolean {
+  if (props.config.provider === 'claude' && capabilities.value.reasoning.family === 'anthropic_extended') return false;
   return definition.key === 'thinkingBudget' || definition.key === 'thinkingLevel';
 }
 

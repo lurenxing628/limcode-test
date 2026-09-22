@@ -5,6 +5,11 @@ import { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import { MAX_LLM_RETRY_DELAY_SECONDS } from '../../shared/protocol';
 import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind } from '../../shared/protocol';
+import type {
+  CompressionExecutionPlan,
+  ModelCapabilitySnapshot,
+  ResolvedSummaryReasoning
+} from '../../shared/modelCapabilities';
 
 export interface FrozenContextProfile {
   contextWindowTokens: number;
@@ -37,12 +42,15 @@ export interface FrozenCompressionPolicy {
   config: LlmCompressionConfigRecord;
   triggerMode: LlmCompressionConfigRecord['trigger']['mode'];
   thresholdTokens: number;
+  executionPlan: CompressionExecutionPlan;
   provider: {
     providerConfigId: string;
     provider: LlmProviderKind;
     modelId: string;
     contextWindowTokens: number;
     maxOutputTokens: number;
+    capabilities: ModelCapabilitySnapshot;
+    summaryReasoning: ResolvedSummaryReasoning;
     retryPolicy: FrozenProviderRetryPolicy;
   };
 }
@@ -194,12 +202,16 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
   const thresholdTokens = positiveSafeInteger(compression.thresholdTokens, 'compression.thresholdTokens');
   const providerKind = provider.provider;
   if (!isProviderKind(providerKind)) throw new Error('Frozen compression provider kind is invalid.');
+  const executionPlan = requireCompressionExecutionPlan(compression.executionPlan, methodKind);
+  const capabilities = requireModelCapabilities(provider.capabilities, providerKind);
+  const summaryReasoning = requireSummaryReasoning(provider.summaryReasoning);
   return {
     enabled: true,
     methodKind,
     config: normalizePlainJson(config, 'AuthoritySnapshot.compression.config') as unknown as LlmCompressionConfigRecord,
     triggerMode: trigger.mode,
     thresholdTokens,
+    executionPlan,
     provider: {
       providerConfigId: requireText(provider.providerConfigId, 'AuthoritySnapshot.compression.provider.providerConfigId'),
       provider: providerKind,
@@ -212,6 +224,8 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
         provider.maxOutputTokens,
         'compression.provider.maxOutputTokens'
       ),
+      capabilities,
+      summaryReasoning,
       retryPolicy: normalizeFrozenRetryPolicy(
         provider.retryPolicy,
         'compression.provider.retryPolicy',
@@ -269,10 +283,49 @@ function normalizeFrozenRetryPolicy(
 }
 
 function requireCompressionKind(value: unknown): LlmCompressionConfigRecord['kind'] {
-  if (!['disabled', 'openai_responses_compact', 'llm_summary', 'segmented_summary', 'deterministic_summary', 'manual_summary'].includes(String(value))) {
+  if (!['disabled', 'auto', 'provider_native', 'llm_summary', 'segmented_summary', 'deterministic_summary', 'manual_summary'].includes(String(value))) {
     throw new Error(`Unsupported frozen compression method: ${String(value)}.`);
   }
   return value as LlmCompressionConfigRecord['kind'];
+}
+
+function requireCompressionExecutionPlan(
+  value: unknown,
+  strategy: LlmCompressionConfigRecord['kind']
+): CompressionExecutionPlan {
+  if (!isRecord(value) || value.strategy !== strategy || !Array.isArray(value.attempts)
+    || typeof value.continueUncompressedIfFits !== 'boolean' || !isRecord(value.nativeCapability)) {
+    throw new Error('Frozen compression execution plan is incomplete.');
+  }
+  for (const attempt of value.attempts) {
+    if (!isRecord(attempt)
+      || !['provider_native', 'llm_summary', 'segmented_summary', 'deterministic_summary', 'manual_summary'].includes(String(attempt.methodKind))) {
+      throw new Error('Frozen compression execution plan contains an unsupported attempt.');
+    }
+    if (attempt.methodKind === 'provider_native'
+      && attempt.nativeKind !== 'openai_responses'
+      && attempt.nativeKind !== 'anthropic_messages') {
+      throw new Error('Frozen native compression attempt is missing its Provider adapter kind.');
+    }
+  }
+  return normalizePlainJson(value, 'AuthoritySnapshot.compression.executionPlan') as unknown as CompressionExecutionPlan;
+}
+
+function requireModelCapabilities(value: unknown, provider: LlmProviderKind): ModelCapabilitySnapshot {
+  if (!isRecord(value) || value.providerKind !== provider || !isRecord(value.reasoning)
+    || !isRecord(value.nativeCompaction) || typeof value.modelId !== 'string'
+    || typeof value.endpointFingerprint !== 'string' || typeof value.source !== 'string') {
+    throw new Error('Frozen compression Provider capability snapshot is incomplete.');
+  }
+  return normalizePlainJson(value, 'AuthoritySnapshot.compression.provider.capabilities') as unknown as ModelCapabilitySnapshot;
+}
+
+function requireSummaryReasoning(value: unknown): ResolvedSummaryReasoning {
+  if (!isRecord(value) || typeof value.intent !== 'string' || typeof value.status !== 'string'
+    || typeof value.description !== 'string') {
+    throw new Error('Frozen compression summary reasoning plan is incomplete.');
+  }
+  return normalizePlainJson(value, 'AuthoritySnapshot.compression.provider.summaryReasoning') as unknown as ResolvedSummaryReasoning;
 }
 
 function isProviderKind(value: unknown): value is LlmProviderKind {

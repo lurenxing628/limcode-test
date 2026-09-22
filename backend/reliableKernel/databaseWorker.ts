@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { compressionExecutionMetadata, readProviderRequestFailure } from '../../shared/compressionExecution';
 import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -1007,7 +1008,10 @@ function decodeModelStreamIdentity(value: unknown): {
     'lastStreamEventAt',
     'nativeCapabilities',
     'thinkingSelection',
-    'nativeInitialPromptTokenCount'
+    'nativeInitialPromptTokenCount',
+    'compressionPurpose',
+    'compressionDecision',
+    'failure'
   ]);
   if (
     !keys.includes('attemptSeq')
@@ -1024,6 +1028,8 @@ function decodeModelStreamIdentity(value: unknown): {
       && record.retryReason !== 'compression_timeout'
     )
   ) throw new TypeError('ModelRequest.stream_stats_json has an invalid shape.');
+  compressionExecutionMetadata(record);
+  if (record.failure !== undefined) readProviderRequestFailure(record.failure);
   assertOptionalBoundedInteger(record.retryMaxAttempts, 'retryMaxAttempts', 1, 10);
   assertOptionalBoundedInteger(record.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER);
   assertOptionalBoundedInteger(record.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER);

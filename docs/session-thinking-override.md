@@ -5,7 +5,7 @@
 - 增加 conversation-scoped `ModelProfileRecord.thinkingOverride`（类型区分预算、OpenAI effort、Gemini level、Claude adaptive effort、DeepSeek 模式）。thinking-only 记录标记 `inheritModel`，不成为模型身份选择器，不往 ModelProfile 塞入完整渠道配置。
 - 复用 `ModelProfileScopeSet/Clear`、配置 authority、现有 record/link 路径；补充仅限 ModelProfile 的 `ScopeRead/ScopeSnapshot` 确认通道（不是全 Bridge 版本重构）。外部 set/clear/thinking/reset 必须带已观察 authority/session/revision；非 conversation scope 拒绝思维覆盖，UI 只发送普通数据。
 - 底栏从 authority 获取 conversation → workflow → agent → global 的有效模型；thinking/reset 在同一 mutation lock 内校验 `expectedEffectiveModel`。继承改变时拒绝旧选择，不把 global fallback 或旧继承身份偷偷固化到会话。
-- 模型专属配置**整体替代**渠道设置；专属配置没有 generationConfig 即未设置，不继承渠道的思维数值。选择默认时显示现有有效设置，未设置显示“服务默认”。Gemini/Astra 的现有适配器补值/归一化另作标注，不把参数编辑器示例值当成服务默认。
+- 模型专属配置**整体替代**渠道设置；专属配置没有 generationConfig 即未设置，不继承渠道的思维数值。选择默认时显示现有有效设置，未设置显示“服务默认”。Gemini 默认省略思考参数，类型或等级不受支持时明确拒绝；Astra 的现有适配器归一化另作标注，不把参数编辑器示例值当成服务默认。
 - 切渠道/模型走现有 selection 入口并清掉覆盖，不进行数字与等级换算。普通 Fork 沿用已有配置复制，复制成目标独立记录；本改动不修改 Fork 实现。
 - 子 Agent 的模型选择规则不变。默认不继承父会话思维；勾选「子继承」后按现有初始化路径复制兼容的思维覆盖。请求参数解析只查**子会话自身** record；已有子会话覆盖优先。
 

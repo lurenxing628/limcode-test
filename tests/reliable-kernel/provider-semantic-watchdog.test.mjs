@@ -18,7 +18,14 @@ function modelContent(text = '') {
   return { role: 'model', parts: text ? [{ text }] : [] };
 }
 
+const capabilitiesModule = await import(pathToFileURL(path.join(compiledRoot, 'shared/modelCapabilities.js')).href);
+
 function dependencies(provider = 'openai-responses', retryPolicy = { enabled: true, maxRetries: 3 }, compression = false) {
+  const capabilities = capabilitiesModule.resolveModelCapabilities({
+    provider, baseUrl: 'https://watchdog.invalid/v1', modelId: 'model-watchdog', providerConfigId: 'provider-watchdog', transport: 'http'
+  });
+  const executionPlan = capabilitiesModule.resolveCompressionExecutionPlan({ kind: 'llm_summary', fallbacks: [] }, capabilities);
+  const summaryReasoning = capabilitiesModule.resolveSummaryReasoning({ mode: 'provider_default', capabilities });
   return {
     authorityCompiler: {
       async compile(request) {
@@ -49,6 +56,7 @@ function dependencies(provider = 'openai-responses', retryPolicy = { enabled: tr
                 compression: {
                   enabled: true,
                   methodKind: 'llm_summary',
+                  executionPlan,
                   thresholdTokens: 1,
                   config: {
                     id: 'compression-watchdog', name: 'offline summary', kind: 'llm_summary',
@@ -57,6 +65,7 @@ function dependencies(provider = 'openai-responses', retryPolicy = { enabled: tr
                   },
                   provider: {
                     providerConfigId: 'provider-watchdog', provider, modelId: 'model-watchdog',
+                    capabilities, summaryReasoning,
                     contextWindowTokens: 128000, maxOutputTokens: 16000, retryPolicy
                   }
                 }

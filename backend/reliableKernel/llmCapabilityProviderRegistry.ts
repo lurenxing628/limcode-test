@@ -5,6 +5,7 @@ import type {
 } from '../../shared/protocol';
 import {
   createLlmProviderCapability,
+  probeLlmProviderNativeCompaction,
   type LlmProviderOptions,
   type LlmProviderTransportTrace
 } from '../capabilities/llmProvider';
@@ -87,6 +88,19 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
   public listModels(config: LlmProviderConfigRecord) {
     this.requireOpen();
     return this.capability.listModels(config);
+  }
+
+  private readonly nativeProbes = new Map<string, ReturnType<typeof probeLlmProviderNativeCompaction>>();
+
+  public verifyNativeCompaction(config: LlmProviderConfigRecord) {
+    this.requireOpen();
+    const key = JSON.stringify([config.id, config.baseUrl, config.model, config.openaiResponsesTransport, config.updatedAt]);
+    const pending = this.nativeProbes.get(key);
+    if (pending) return pending;
+    const task = probeLlmProviderNativeCompaction(config, { ...this.options, settings: async () => config })
+      .finally(() => { if (this.nativeProbes.get(key) === task) this.nativeProbes.delete(key); });
+    this.nativeProbes.set(key, task);
+    return task;
   }
 
   public dispose(): void {

@@ -4,6 +4,7 @@ import { applySessionThinkingOverride, validateSessionThinkingOverride } from '.
 import type { RequestGenerationSettings } from './requestCompressionSettings';
 
 import type * as vscode from 'vscode';
+import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
 import type {
   AgentRecord,
   ChatModelOverrideRecord,
@@ -19,6 +20,7 @@ import type {
   LlmCompressionConfigsRecord,
   LlmCompressionConfigRecord,
   LlmCompressionSettingsRecord,
+  LlmGenerationConfigRecord,
   LlmProviderConfigRecord,
   LlmProviderConfigsRecord,
   LlmSettingsRecord,
@@ -52,6 +54,12 @@ import {
 } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
 import { normalizeOpenAIResponsesNativeSettings } from '../../shared/openAIResponsesCapabilities';
+import {
+  assertSummaryReasoningPlan,
+  resolveCompressionExecutionPlan,
+  resolveProviderModelCapabilities,
+  resolveSummaryReasoning
+} from '../../shared/modelCapabilities';
 import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
 import {
   createLocalFolderWorkEnvironmentRecord,
@@ -320,6 +328,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const systemPromptPrefix = selectedModelConfig?.systemPromptPrefix ?? provider.systemPromptPrefix;
     const contextWindow = resolveContextWindow(provider, modelId);
     const primaryGenerationConfig = selectedModelConfig?.generationConfig ?? provider.generationConfig;
+    const primaryCapabilities = resolveProviderModelCapabilities(provider, modelId);
     const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
       ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
@@ -396,6 +405,10 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         enableMultimodalTools,
         systemPromptPrefix,
         maxOutputTokens,
+        capabilities: clonePlain(primaryCapabilities),
+        ...(primaryGenerationConfig ? { generationConfig: clonePlain(primaryGenerationConfig) } : {}),
+        ...((selectedModelConfig?.requestBody ?? provider.requestBody)
+          ? { requestBody: clonePlain(selectedModelConfig?.requestBody ?? provider.requestBody) } : {}),
         ...(primaryGenerationConfig?.thinkingConfig
           ? { thinkingConfig: clonePlain(primaryGenerationConfig.thinkingConfig) }
           : {}),
@@ -985,7 +998,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   }
 
   public async loadRequestCompressionSettings(
-    model: ChatModelOverrideRecord
+    model: ChatModelOverrideRecord,
+    generationConfig?: LlmGenerationConfigRecord
   ): Promise<RequestCompressionSettings> {
     const paths = this.getPaths();
     const [providers, configs, selection] = await Promise.all([
@@ -1004,7 +1018,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         selection.settings as Partial<LlmCompressionSettingsRecord>, configs.settings.configs
       ),
       providerConfigs: providers.settings.configs
-    }, provider, model.model, contextWindowTokens);
+    }, provider, model.model, contextWindowTokens, generationConfig);
     return {
       model: { ...model },
       modelProfile: {
@@ -1138,7 +1152,9 @@ function resolveFrozenCompression(
   records: Pick<ConfigurationRecords, 'compressionSettings' | 'compressionConfigs' | 'providerConfigs'>,
   primaryProvider: LlmProviderConfigRecord,
   primaryModelId: string,
-  contextWindowTokens: number
+  contextWindowTokens: number,
+  primaryGenerationConfig = primaryProvider.modelConfigs.find((model) => model.modelId === primaryModelId)?.generationConfig
+    ?? primaryProvider.generationConfig
 ): FrozenCompressionResolution {
   const modelBinding = latestUpdated(records.compressionSettings.modelBindings.filter((binding) =>
     binding.providerConfigId === primaryProvider.id && binding.modelId === primaryModelId
@@ -1153,8 +1169,9 @@ function resolveFrozenCompression(
     ?? records.compressionConfigs[0];
   if (!config) throw new Error('没有可用的 LLM 压缩配置。');
 
-  const providerOverride = config.kind === 'openai_responses_compact'
-    ? config.openaiResponsesCompact
+  const providerOverride = (config.kind === 'auto' || config.kind === 'provider_native')
+    && (config.providerNative?.providerConfigId?.trim() || config.providerNative?.model?.trim())
+    ? config.providerNative
     : config.llmSummary;
   const compressionProviderId = providerOverride?.providerConfigId?.trim() || primaryProvider.id;
   const compressionProvider = records.providerConfigs.find((candidate) => candidate.id === compressionProviderId);
@@ -1179,25 +1196,53 @@ function resolveFrozenCompression(
       : Math.floor(contextWindowTokens * 0.9)
   ));
   const frozenConfig: LlmCompressionConfigRecord = clonePlain(config);
+  frozenConfig.providerNative = {
+    ...(frozenConfig.providerNative ?? {}),
+    providerConfigId: compressionProvider.id,
+    model: compressionModelId,
+    trustMode: frozenConfig.providerNative?.trustMode === 'trust_configured_endpoint'
+      ? 'trust_configured_endpoint'
+      : 'verified_only'
+  };
+  const compressionModelConfig = compressionProvider.modelConfigs.find((candidate) =>
+    candidate.modelId === compressionModelId
+  );
+  const inheritedGenerationConfig = compressionModelConfig?.generationConfig
+    ?? compressionProvider.generationConfig;
+  const capabilities = resolveProviderModelCapabilities(
+    compressionProvider,
+    compressionModelId,
+    frozenConfig.providerNative.trustMode
+  );
+  const summaryReasoning = resolveSummaryReasoning({
+    mode: frozenConfig.llmSummary?.reasoning?.mode,
+    methodGenerationConfig: frozenConfig.llmSummary?.generationConfig,
+    inheritedGenerationConfig: frozenConfig.llmSummary?.reasoning?.mode === 'inherit_chat'
+      ? primaryGenerationConfig
+      : inheritedGenerationConfig,
+    capabilities
+  });
+  assertSummaryReasoningPlan(summaryReasoning);
+  const frozenSummary = {
+    ...(frozenConfig.llmSummary ?? {}),
+    providerConfigId: compressionProvider.id,
+    model: compressionModelId,
+    reasoning: { mode: summaryReasoning.intent }
+  };
+  if (summaryReasoning.generationConfig) frozenSummary.generationConfig = summaryReasoning.generationConfig;
+  else delete frozenSummary.generationConfig;
+  frozenConfig.llmSummary = frozenSummary;
+  const nativeSameModel = compressionProvider.id === primaryProvider.id && compressionModelId === primaryModelId;
+  if (!nativeSameModel) capabilities.nativeCompaction = {
+    availability: 'unsupported', reason: '原生压缩状态必须由同一聊天渠道和模型消费；独立总结模型只使用文本摘要。'
+  };
+  const executionPlan = resolveCompressionExecutionPlan(frozenConfig, capabilities);
   const compressionContextWindowTokens = resolveContextWindow(compressionProvider, compressionModelId);
   const compressionMaxOutputTokens = resolveCompressionMaxOutputTokens(
     frozenConfig,
     compressionProvider,
     compressionModelId
   );
-  if (frozenConfig.kind === 'openai_responses_compact') {
-    frozenConfig.openaiResponsesCompact = {
-      ...(frozenConfig.openaiResponsesCompact ?? {}),
-      providerConfigId: compressionProvider.id,
-      model: compressionModelId
-    };
-  } else if (!['disabled', 'deterministic_summary', 'manual_summary'].includes(frozenConfig.kind)) {
-    frozenConfig.llmSummary = {
-      ...(frozenConfig.llmSummary ?? {}),
-      providerConfigId: compressionProvider.id,
-      model: compressionModelId
-    };
-  }
   return {
     thresholdTokens,
     snapshot: {
@@ -1209,6 +1254,7 @@ function resolveFrozenCompression(
           : { kind: 'default', id: records.compressionSettings.defaultConfigId ?? null },
       config: frozenConfig,
       methodKind: frozenConfig.kind,
+      executionPlan: clonePlain(executionPlan),
       trigger,
       thresholdTokens,
       provider: {
@@ -1217,6 +1263,8 @@ function resolveFrozenCompression(
         modelId: compressionModelId,
         contextWindowTokens: compressionContextWindowTokens,
         maxOutputTokens: compressionMaxOutputTokens,
+        capabilities: clonePlain(capabilities),
+        summaryReasoning: clonePlain(summaryReasoning),
         retryPolicy: frozenProviderRetryPolicy(compressionProvider, compressionModelId)
       }
     }
@@ -1231,19 +1279,11 @@ function resolveCompressionMaxOutputTokens(
   const providerGenerationConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId)?.generationConfig
     ?? provider.generationConfig;
   const providerMaximum = positiveSafeIntegerOrUndefined(providerGenerationConfig?.maxOutputTokens);
-  if (config.kind !== 'llm_summary' && config.kind !== 'segmented_summary') {
+  if (!['auto', 'provider_native', 'llm_summary', 'segmented_summary'].includes(config.kind)) {
     return providerMaximum ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
   }
 
-  const methodMaximum = positiveSafeIntegerOrUndefined(config.llmSummary?.generationConfig?.maxOutputTokens);
-  if (methodMaximum !== undefined) return methodMaximum;
-  const configuredTarget = positiveSafeIntegerOrUndefined(config.llmSummary?.targetTokens)
-    ?? DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS;
-  const visibleTarget = Math.min(DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS, configuredTarget);
-  return Math.max(2_048, Math.min(
-    DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
-    Math.ceil(visibleTarget * 2)
-  ));
+  return resolveSummaryOutputBudget(config.llmSummary?.targetTokens, config.llmSummary?.generationConfig);
 }
 
 function positiveSafeIntegerOrUndefined(value: unknown): number | undefined {

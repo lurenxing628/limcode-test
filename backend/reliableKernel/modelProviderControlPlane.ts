@@ -2,6 +2,9 @@ import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
 import { createHash } from 'node:crypto';
+import { compressionExecutionMetadata, readProviderRequestFailure, safeProviderFailureMessage,
+  type CompressionRequestPurpose, type CompressionRecoveryDecision, type ProviderRequestFailureFact
+} from '../../shared/compressionExecution';
 import { performance } from 'node:perf_hooks';
 import { normalizeLlmCompressionMaxDurationMinutes, type AttachmentCatalogEntry } from '../../shared/protocol';
 import {
@@ -25,6 +28,7 @@ import {
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { expandTextCompressionSources } from './compressionSourceReplay';
 import {
   estimateRequestAuthorityTokens,
   ReliableContextTokenEstimator
@@ -129,6 +133,8 @@ export interface FullProviderRequest {
   settingsSnapshot?: PlainJsonValue;
   recipe: PlainJsonValue;
   context: FullProviderContextItem[];
+  /** Read-only native-source expansion for text summaries; the canonical head is unchanged. */
+  compressionSourceContext?: FullProviderContextItem[];
   /** Frozen relation-derived model state; never persisted in Context or compression envelopes. */
   attachmentCatalogState: AttachmentCatalogState;
   /**
@@ -324,6 +330,28 @@ export class ProviderTransientError extends Error {
   }
 }
 
+export type ProviderCapabilityFailureReason =
+  | 'native_compaction_unsupported'
+  | 'unsupported_parameter'
+  | 'unsupported_reasoning_mode'
+  | 'provider_contract_violation';
+
+/** Permanent Provider capability mismatch. It must not consume transient retry budget. */
+export class ProviderCapabilityError extends Error {
+  public readonly code = 'PROVIDER_CAPABILITY_MISMATCH';
+  public readonly retryable = false;
+
+  public constructor(
+    public readonly reason: ProviderCapabilityFailureReason,
+    message: string,
+    public readonly status?: number,
+    public readonly endpointKind?: string
+  ) {
+    super(message);
+    this.name = 'ProviderCapabilityError';
+  }
+}
+
 type ModelStreamCheckpointKind =
   | 'output_delta'
   | 'output_item_done'
@@ -333,6 +361,9 @@ type ModelStreamCheckpointKind =
   | 'terminal_summary';
 
 interface StreamStats {
+  compressionPurpose?: CompressionRequestPurpose;
+  compressionDecision?: CompressionRecoveryDecision;
+  failure?: ProviderRequestFailureFact;
   thinkingSelection?: string;
   attemptSeq: string;
   socketGeneration: string;
@@ -488,9 +519,9 @@ export class ModelProviderControlPlane {
     }
     const frozen = await readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId);
     const model = frozenModelSelection(frozen.document);
-    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(model);
     const turn = await this.requireDomain('Turn', turnId);
     const generation = await this.compressionSettingsAuthority.loadRequestGenerationSettings?.(model, requireId(turn.conversation_id, 'Turn.conversation_id'));
+    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(model, generation?.generationConfig);
     const snapshot = normalizePlainJson({ requestCompression: selected, ...(generation ? { requestGeneration: generation } : {}) }, '请求设置');
     applyRequestCompressionSettings(frozen.document, snapshot);
     const content = await this.contentStore.ingest(
@@ -576,7 +607,9 @@ export class ModelProviderControlPlane {
     const recipeContent = await this.contentStore.prepare(this.database, recipeBytes, CONTENT_TYPE_RECIPE);
     const now = this.timestamp();
     const generationModel = isRecord(frozen.document) && isRecord(frozen.document.model) ? frozen.document.model : undefined;
-    const initialStats: StreamStats = { attemptSeq: '1', socketGeneration: '0', retryReason: null,
+    const initialStats: StreamStats = {
+      attemptSeq: '1', socketGeneration: '0', retryReason: null,
+      ...compressionExecutionMetadata(recipe),
       ...(!compressionRequest && generationModel?.generationConfig ? { thinkingSelection: `${frozenModelId}: ${generationModel.thinkingControlledByBody ? '由自定义请求体控制' : sessionThinkingDisplayLabel(generationModel.provider as LlmProviderKind, frozenModelId, generationModel.thinkingConfig as LlmThinkingConfigRecord)}` } : {})
     };
     const steps: RepositoryTransactionStep[] = [
@@ -730,6 +763,10 @@ export class ModelProviderControlPlane {
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
+    const compressionSourceContext = compressionPolicy && isRecord(recipe)
+      && recipe.compressionMethodKind !== 'provider_native'
+      ? await expandTextCompressionSources(this.database, this.contentStore, providerContext)
+      : undefined;
     assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,
       ...(requestAddenda.requestAddenda?.currentTurnInput
@@ -752,6 +789,7 @@ export class ModelProviderControlPlane {
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
       context: providerContext,
+      ...(compressionSourceContext ? { compressionSourceContext } : {}),
       attachmentCatalogState,
       ...(nativeAdmittedCallIds !== undefined && nativeAdmittedCallIds.length > 0
         ? { nativeAsyncAdmittedCallIds: nativeAdmittedCallIds }
@@ -1805,7 +1843,8 @@ export class ModelProviderControlPlane {
         retryReason: reason,
         retryMaxAttempts: maxRetries,
         retryDelayMs: delayMs,
-        retryNotBeforeAt
+        retryNotBeforeAt,
+        ...compressionExecutionMetadata(currentStats)
       };
       try {
         await this.database.transaction([
@@ -1981,14 +2020,15 @@ export class ModelProviderControlPlane {
     return this.terminalizeRequest(modelRequestId, identity, {
       attemptStatus: 'failed',
       operationStatus: 'failed',
-      terminalState: providerFailureTerminalState(error)
+      terminalState: providerFailureTerminalState(error),
+      failure: providerFailureFact(error)
     });
   }
 
   private async terminalizeRequest(
     modelRequestId: string,
     identity: StreamIdentity,
-    terminal: { attemptStatus: string; operationStatus: string; terminalState: string }
+    terminal: { attemptStatus: string; operationStatus: string; terminalState: string; failure?: ProviderRequestFailureFact }
   ): Promise<boolean> {
     // The full stream_stats assert doubles as the identity fence, but the activity heartbeat also
     // writes that column. A benign metadata write must not strand the request non-terminal:
@@ -2015,7 +2055,10 @@ export class ModelProviderControlPlane {
             status: terminal.operationStatus, updated_at: now
           }),
           DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-            status: 'terminal', terminal_state: terminal.terminalState, updated_at: now
+            status: 'terminal', terminal_state: terminal.terminalState, updated_at: now,
+            ...(terminal.failure ? { stream_stats_json: {
+              ...currentStats, failure: terminal.failure, completedAt: this.epochNow()
+            } } : {})
           })
         ]);
         return true;
@@ -2536,7 +2579,7 @@ function compressionRequestSegments<T>(
   if (!Number.isSafeInteger(count) || (count as number) <= 0 || (count as number) > segments.length) {
     throw new Error('Compression recipe sourceSegmentCount is outside the frozen Context projection.');
   }
-  if (recipe.compressionMethodKind === 'openai_responses_compact') {
+  if (recipe.compressionMethodKind === 'provider_native') {
     if (count !== segments.length) {
       throw new Error('Provider-native compression must freeze the complete model-visible Context projection.');
     }
@@ -2740,6 +2783,8 @@ function parseStreamStats(value: unknown): StreamStats {
     socketGeneration,
     ...(typeof value.thinkingSelection === 'string' ? { thinkingSelection: value.thinkingSelection } : {}),
     retryReason: value.retryReason as ProviderTransientReason | null,
+    ...compressionExecutionMetadata(value),
+    ...(value.failure === undefined ? {} : { failure: readProviderRequestFailure(value.failure) }),
     ...(optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) !== undefined
       ? { retryMaxAttempts: optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) }
       : {}),
@@ -3000,4 +3045,29 @@ function normalizeModelRequestRecipe(value: PlainJsonValue, label: string): Plai
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Preserve the error's classification atomically with request termination, not only its formatted string. */
+function providerFailureFact(error: unknown): ProviderRequestFailureFact {
+  const raw = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const message = safeProviderFailureMessage(error instanceof Error ? error.message : String(error));
+  const code = typeof raw.code === 'string' ? raw.code.slice(0, 128) : undefined;
+  const status = Number.isInteger(raw.status) && Number(raw.status) >= 100 && Number(raw.status) <= 599
+    ? Number(raw.status) : undefined;
+  const category: ProviderRequestFailureFact['category'] = error instanceof ProviderCapabilityError ? 'capability'
+    : error instanceof ProviderTransientError ? 'transient'
+      : error instanceof Error && (error.name === 'AbortError' || isExecutionHandoffError(error)) ? 'cancelled'
+        : error instanceof TypeError || code && /^(SQLITE|RUNTIME|MODEL_|CONTENT_)/.test(code) ? 'internal'
+          : 'permanent';
+  return {
+    category, message,
+    ...(code ? { code } : {}), ...(status === undefined ? {} : { status }),
+    ...(typeof raw.reason === 'string' && raw.reason ? { reason: raw.reason.slice(0, 128) } : {}),
+    ...(typeof raw.endpointKind === 'string' && raw.endpointKind ? { endpointKind: raw.endpointKind.slice(0, 128) } : {})
+  };
+}
+
+export function restoredProviderRequestFailure(factInput: unknown, terminalState: string): Error {
+  const fact = readProviderRequestFailure(factInput);
+  return Object.assign(new Error(fact.message), fact, { terminalState });
 }

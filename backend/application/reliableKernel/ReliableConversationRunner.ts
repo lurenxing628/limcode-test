@@ -84,6 +84,7 @@ type ManualCompressionMaintenance =
 
 interface FrozenManualCompressionDrive {
   descriptor: ManualCompressionMaintenance;
+  settingsSnapshotContentObjectId?: string;
   authoritySnapshotId: string;
   headRootId: string;
   compressSegmentCount: number;
@@ -967,38 +968,39 @@ export class ReliableConversationRunner {
     const requests = (await listAllDomainRows(this.application.database, 'ModelRequest', {
       turn_id: slot.turnId
     })).sort((left, right) => compareBigInt(left.request_seq, right.request_seq));
-    if (requests.length > 1) {
-      throw new Error(`Manual compression Turn ${slot.turnId} contains multiple ModelRequests.`);
-    }
-    if (requests.length === 1) {
-      const request = requests[0];
-      if (request.authority_snapshot_id !== authoritySnapshotId) {
-        throw new Error('Manual compression ModelRequest is bound to another AuthoritySnapshot.');
-      }
-      const recipe = await this.readJsonContentObject(
-        requireId(request.recipe_object_id, 'Manual compression ModelRequest.recipe_object_id'),
-        `Manual compression ModelRequest ${String(request.id)} recipe`
+    if (requests.length > 6) throw new Error('Manual compression exceeded its bounded method chain.');
+    if (requests.length > 0) {
+      let headRootId: string | undefined;
+      const settingsSnapshotContentObjectId = requireId(
+        requests[0].settings_snapshot_object_id, 'Manual compression frozen request settings'
       );
-      if (!recipe) throw new Error('Manual compression ModelRequest recipe has an unexpected content type.');
-      if (
-        recipe.kind !== 'reliable-context-compression'
-        || recipe.trigger !== 'manual'
-        || recipe.requestKind !== 'context_compression_manual'
-      ) {
-        throw new Error(`Maintenance Turn ${slot.turnId} contains a non-manual-compression ModelRequest.`);
-      }
-      const frozenCount = requireSafePositiveInteger(
-        recipe.sourceSegmentCount,
-        'Manual compression recipe.sourceSegmentCount'
-      );
-      if (frozenCount > descriptor.compressSegmentCount) {
-        throw new Error('Manual compression recipe widened the requested frozen prefix.');
+      for (const [index, request] of requests.entries()) {
+        if (request.authority_snapshot_id !== authoritySnapshotId
+          || request.settings_snapshot_object_id !== settingsSnapshotContentObjectId) {
+          throw new Error('Manual compression methods do not share the same frozen authority/settings.');
+        }
+        if (index < requests.length - 1 && request.status !== 'terminal') {
+          throw new Error('Manual compression started a fallback before its predecessor terminated.');
+        }
+        const recipe = await this.readJsonContentObject(
+          requireId(request.recipe_object_id, 'Manual compression ModelRequest.recipe_object_id'),
+          `Manual compression ModelRequest ${String(request.id)} recipe`
+        );
+        if (!recipe || recipe.kind !== 'reliable-context-compression'
+          || recipe.trigger !== 'manual' || recipe.requestKind !== 'context_compression_manual') {
+          throw new Error(`Maintenance Turn ${slot.turnId} contains a non-manual-compression ModelRequest.`);
+        }
+        const sourceRootId = requireId(recipe.sourceRootId, 'Manual compression source root');
+        const sourceCount = requireSafePositiveInteger(recipe.sourceSegmentCount, 'Manual compression prefix');
+        if ((headRootId && headRootId !== sourceRootId) || sourceCount > descriptor.compressSegmentCount) {
+          throw new Error('Manual compression fallback changed its frozen source or widened the selected prefix.');
+        }
+        headRootId = sourceRootId;
       }
       return {
-        descriptor,
-        authoritySnapshotId,
-        headRootId: requireId(recipe.sourceRootId, 'Manual compression recipe.sourceRootId'),
-        compressSegmentCount: frozenCount
+        descriptor, authoritySnapshotId, settingsSnapshotContentObjectId,
+        headRootId: requireId(headRootId, 'Manual compression source root'),
+        compressSegmentCount: descriptor.compressSegmentCount
       };
     }
 
@@ -1080,6 +1082,7 @@ export class ReliableConversationRunner {
       const compression = await this.application.compressionCoordinator.coordinate({
         turnId: slot.turnId,
         authoritySnapshotId: frozen.authoritySnapshotId,
+        ...(frozen.settingsSnapshotContentObjectId ? { settingsSnapshotContentObjectId: frozen.settingsSnapshotContentObjectId } : {}),
         headRootId: frozen.headRootId,
         trigger: 'manual',
         compressSegmentCount: frozen.compressSegmentCount,

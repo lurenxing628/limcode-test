@@ -459,7 +459,8 @@ export class ReliableAgentLoop {
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             trigger: 'auto',
             requestBudget: planningBudget,
-            protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe)
+            protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
+            tools: toolDefinitions
           });
           if (compression.status === 'error') {
             throw new ModelRequestPreflightError(
@@ -513,6 +514,13 @@ export class ReliableAgentLoop {
               throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
             }
             planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
+          }
+          if ((compression.status === 'compressed' || compression.status === 'continued_uncompressed')
+            && compression.recoveryDecision) {
+            frozenRecipe = normalizePlainJson({
+              ...(frozenRecipe as { [key: string]: PlainJsonValue }),
+              compressionDecision: compression.recoveryDecision
+            }, 'Request compression recovery decision');
           }
           await this.guardNativeModelSwitch(
             requireId(facts.turn.conversation_id, 'Turn.conversation_id'),

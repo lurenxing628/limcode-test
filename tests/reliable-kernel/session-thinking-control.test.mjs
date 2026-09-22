@@ -39,7 +39,7 @@ function fixture(overrides = {}) {
     else if (component) source = parse(source).descriptor.scriptSetup.content + '\nexport { options, selected, defaultLabel, inheritChildren, disabled, error, save, setInheritance, retry };';
     const module = { exports: {} };
     vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, {
-      module, exports: module.exports, defineProps: () => props,
+      module, exports: module.exports, defineProps: () => props, URL,
       require(name) {
         if (name === 'vue') return vue;
         if (name === '@webview/stores/useModelProfileStore') return { useModelProfileStore: () => store };
@@ -89,15 +89,19 @@ test('Default label shows the actual inherited value and distinguishes service d
   assert.equal(f.control.defaultLabel.value, '默认 · 服务默认', 'model config replaces channel defaults');
 });
 
-test('Budget defaults remain visible; unsupported model shortcuts remain disabled', () => {
+test('Budget defaults remain visible; unknown and unsupported model shortcuts remain disabled', () => {
   const f = fixture({ props: { model: 'gemini-2.5-flash', config: { id: 'gemini', provider: 'gemini', modelConfigs: [], generationConfig: { thinkingConfig: { thinkingBudget: 1024 } } } } });
   assert.equal(f.control.defaultLabel.value, '默认 · 1024 tokens');
   assert.ok(f.control.options.value.some(option => option.value === '2048'));
-  for (const model of ['gemini-2.0-flash', 'unknown-relay']) {
+  for (const [model, label] of [
+    ['gemini-2.0-flash', '默认 · 能力未确认 · 1024 tokens'],
+    ['gemini-9-flash', '默认 · 能力未确认 · 1024 tokens'],
+    ['unknown-relay', '默认 · 不支持（不发送）']
+  ]) {
     f.props.model = model;
-    assert.equal(f.control.defaultLabel.value, '默认 · 不支持（不发送）');
+    assert.equal(f.control.defaultLabel.value, label);
     assert.equal(f.control.disabled.value, true);
-    assert.deepEqual(plain(f.control.options.value), [{ value: 'default', label: '默认 · 不支持（不发送）' }]);
+    assert.deepEqual(plain(f.control.options.value), [{ value: 'default', label }]);
   }
 });
 
@@ -216,5 +220,3 @@ test('Stale effort from a different model never produces a missing dropdown sele
   f.control.save('minimal');
   assert.equal(f.writes.length, 0);
 });
-
-

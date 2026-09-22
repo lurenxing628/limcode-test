@@ -1,3 +1,4 @@
+import { normalizeModelCapabilitySnapshot } from '../../../shared/modelCapabilities';
 import * as vscode from 'vscode';
 import type {
   LlmGenerationConfigRecord,
@@ -214,7 +215,8 @@ function normalizeProviderModels(input: LlmProviderModelRecord[] | undefined, ac
     if (!id) continue;
     const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : id;
     const createdAt = typeof item.createdAt === 'string' && item.createdAt.trim() ? item.createdAt.trim() : undefined;
-    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}) });
+    const capabilitySnapshot = normalizeModelCapabilitySnapshot(item.capabilitySnapshot);
+    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}), ...(capabilitySnapshot ? { capabilitySnapshot } : {}) });
   }
 
   if (activeModel && !byId.has(activeModel)) {

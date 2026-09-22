@@ -117,6 +117,14 @@ export interface LlmCompactRequest {
   /** Frozen snapshots are supplied only for exact replay/dry-run. */
   methodConfigSnapshot?: LlmCompressionConfigRecord;
   settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
+  /** Resolved native fields from the exact request authority; no model-name guessing during replay. */
+  summaryReasoning?: import('../../../../shared/modelCapabilities').ResolvedSummaryReasoning;
+  nativeGenerationConfig?: import('../../../../shared/protocol').LlmGenerationConfigRecord;
+  nativeRequestBody?: import('../../../../shared/protocol').LlmRequestBodyRecord;
+  /** Frozen source-conversation system instructions used by Provider-native compaction. */
+  systemInstruction?: MessageContent;
+  /** Frozen tool definitions; required by Provider-native compaction to preserve signed thinking. */
+  tools?: ToolSchema[];
   contents: MessageContent[];
   /** 分段总结：按回合切分的消息组（仅 segmented_summary 使用）。 */
   segments?: MessageContent[][];

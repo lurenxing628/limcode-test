@@ -173,3 +173,14 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 3. 转换为普通传输数据的函数必须没有副作用，尤其不能把 updatedAt 改成当前时间。前端只在真实编辑时更新修改时间；后台保存产生的记录时间差异不参与设置内容比较或冲突判定。
 4. 新压缩请求读取当前模型对应的最新压缩设置，并通过已有单次请求设置引用固定；其重试、恢复和历史重放不读取后来改动的设置。模型身份、权限和历史基础配置不被覆盖。
 5. 聊天中的当前配置和最近请求实际采用配置分开显示。外观等即时页面设置与模型请求设置不能混为同一种生效时机。
+
+## 10. 跨 Provider 压缩策略、能力与摘要参数
+
+- 压缩策略使用现有 `llmCompressionConfigs` record 的 `kind`、`providerNative`、`fallbacks` 与 `llmSummary.reasoning`；新配置默认 auto、仅采用已验证原生能力、Provider 默认思考和显式后备链。具体执行合同见 `docs/provider-compression-capabilities.md`。
+- `provider_default` 必须清除从普通聊天 requestBody 继承的推理控制，不能只从 generationConfig 删除 thinkingLevel 后又被原生 body 覆盖。高级摘要参数仅作用于摘要目的，不改变普通聊天模型的参数。
+- 模型目录条目的 `capabilitySnapshot` 是有界、无凭据的能力证据。后端归一化、前端 sanitize/serialize、保存和快照均保留它；证据必须绑定渠道 ID、精确模型、端点指纹和 transport。修改身份后不复用旧证据。
+- 显式能力探测复用模型列表获取/快照通道的 `probeNative` / `purpose: capability_probe`。只在用户点击“验证原生端点（会调用一次）”时执行；可能产生费用，只发送合成内容，不发送当前对话或附件。普通保存不触发探测，重复进行中的同目标探测由宿主合并。
+- Models API 能力、文档登记、在线探测和用户显式信任分开显示。官方文档中的 documented 不等于 verified；界面不能仅按 provider 字符串启用原生压缩，也不能把缓存当作压缩。
+- 高级摘要 JSON 由 `LlmSummaryGenerationEditor` 校验后交给 store 保存；非法字段、非法预算以及已知模型不支持的显式思考模式不得保存。保存仍使用原有 revision、延迟合并与 flush 机制。
+- 普通模型参数编辑器按能力过滤可添加选项；已有但不支持的配置保留可见供用户检查或删除，不偷偷换成 high 或另一档。未知兼容端点的手工参数要保留未验证语义。
+- 压缩失败与后备结果由已提交 `ModelRequest.stream_stats_json` 的有界事实投影。前端不为猜测结果批量拉取请求正文，不通过请求序号推测后备成功；没有 Message 的维护 Turn 也必须显示独立失败提示。

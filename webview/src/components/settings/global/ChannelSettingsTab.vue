@@ -3,10 +3,13 @@ import { computed, ref } from 'vue';
 import { IconChevronDown, IconCloudDown, IconPencil, IconPlus, IconSearch, IconTrash } from '@tabler/icons-vue';
 import {
   type LlmCompressionConfigRecord,
+  type LlmCompressionFallbackKind,
   type LlmGenerationConfigRecord,
   type LlmProviderConfigRecord,
   type LlmProviderHeadersRecord,
   type LlmProviderKind,
+  type LlmNativeCompactionTrustMode,
+  type LlmSummaryReasoningMode,
   type LlmProviderModelConfigRecord,
   type LlmProviderModelRecord,
   type LlmPromptCacheConfigRecord,
@@ -28,7 +31,7 @@ const settings = useGlobalSettingsStore();
 const { loading: channelLoading, text: channelLoadingText } = useSettingsLoadingText('渠道配置', 'global', undefined, {
   globalSettingsSections: ['llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs'] as const
 });
-type SelectableCompressionMethodKind = 'openai_responses_compact' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
+type SelectableCompressionMethodKind = 'auto' | 'provider_native' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
 const createOpen = ref(false);
 const createProvider = ref<LlmProviderKind>('openai-compatible');
 const renameOpen = ref(false);
@@ -204,7 +207,7 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
   const base = activeConfig.value;
   const now = Date.now();
   return {
-    id: modelConfig.id,
+    id: base?.id ?? modelConfig.id,
     name: base ? `${base.name} · ${modelLabel(modelConfig.modelId)}` : modelLabel(modelConfig.modelId),
     provider: base?.provider ?? 'openai-compatible',
     baseUrl: base?.baseUrl ?? '',
@@ -297,6 +300,18 @@ function updateDefaultCompressionBodyTargetTokens(value: number): void {
   settings.setActiveCompressionBodyTargetTokens(value);
 }
 
+function updateDefaultCompressionNativeTrustMode(value: LlmNativeCompactionTrustMode): void {
+  settings.setActiveCompressionNativeTrustMode(value);
+}
+
+function updateDefaultCompressionSummaryReasoningMode(value: LlmSummaryReasoningMode): void {
+  settings.setActiveCompressionSummaryReasoningMode(value);
+}
+
+function updateDefaultCompressionFallbacks(values: LlmCompressionFallbackKind[]): void {
+  settings.setActiveCompressionFallbacks(values);
+}
+
 function updateModelCompressionProviderConfigId(modelId: string, providerConfigId: string): void {
   settings.setModelCompressionProviderConfig(modelId, providerConfigId);
 }
@@ -315,6 +330,27 @@ function updateModelCompressionMaxDurationMinutes(modelId: string, value: number
 
 function updateModelCompressionBodyTargetTokens(modelId: string, value: number): void {
   settings.setModelCompressionBodyTargetTokens(modelId, value);
+}
+
+function updateModelCompressionNativeTrustMode(
+  modelId: string,
+  value: LlmNativeCompactionTrustMode
+): void {
+  settings.setModelCompressionNativeTrustMode(modelId, value);
+}
+
+function updateModelCompressionSummaryReasoningMode(
+  modelId: string,
+  value: LlmSummaryReasoningMode
+): void {
+  settings.setModelCompressionSummaryReasoningMode(modelId, value);
+}
+
+function updateModelCompressionFallbacks(
+  modelId: string,
+  values: LlmCompressionFallbackKind[]
+): void {
+  settings.setModelCompressionFallbacks(modelId, values);
 }
 
 function openCreate(): void {
@@ -556,6 +592,7 @@ function cancelDelete(): void {
               @update-headers="updateDefaultHeaders"
             />
             <LlmCompressionSettingsEditor
+              @verify-native="(configId, modelId) => settings.verifyNativeCompressionCapability(configId, modelId)"
               class="advanced-compression-editor"
               :config="settings.activeCompressionConfig"
               :current-provider-config="activeConfig"
@@ -566,6 +603,10 @@ function cancelDelete(): void {
               @update-trigger="updateDefaultCompressionTrigger"
               @update-max-duration-minutes="updateDefaultCompressionMaxDurationMinutes"
               @update-body-target-tokens="updateDefaultCompressionBodyTargetTokens"
+              @update-native-trust-mode="updateDefaultCompressionNativeTrustMode"
+              @update-summary-reasoning-mode="updateDefaultCompressionSummaryReasoningMode"
+              @update-summary-generation-config="settings.setActiveCompressionSummaryGenerationConfig($event)"
+              @update-fallbacks="updateDefaultCompressionFallbacks"
             />
           </div>
         </article>
@@ -633,6 +674,7 @@ function cancelDelete(): void {
                   @update-headers="updateModelHeaders(modelConfig.id, $event)"
                 />
                 <LlmCompressionSettingsEditor
+                  @verify-native="(configId, modelId) => settings.verifyNativeCompressionCapability(configId, modelId)"
                   class="advanced-compression-editor"
                   :config="modelCompressionConfig(modelConfig.modelId)"
                   :current-provider-config="modelConfigAsProviderConfig(modelConfig)"
@@ -643,6 +685,10 @@ function cancelDelete(): void {
                   @update-trigger="updateModelCompressionTrigger(modelConfig.modelId, $event)"
                   @update-max-duration-minutes="updateModelCompressionMaxDurationMinutes(modelConfig.modelId, $event)"
                   @update-body-target-tokens="updateModelCompressionBodyTargetTokens(modelConfig.modelId, $event)"
+                  @update-native-trust-mode="updateModelCompressionNativeTrustMode(modelConfig.modelId, $event)"
+                  @update-summary-reasoning-mode="updateModelCompressionSummaryReasoningMode(modelConfig.modelId, $event)"
+                  @update-summary-generation-config="settings.setModelCompressionSummaryGenerationConfig(modelConfig.modelId, $event)"
+                  @update-fallbacks="updateModelCompressionFallbacks(modelConfig.modelId, $event)"
                 />
               </div>
             </article>

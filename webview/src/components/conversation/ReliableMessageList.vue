@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
+import { projectCompressionNotices, type CompressionNotice as CompressionWarningRecord } from '@shared/compressionNotices';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
@@ -23,6 +24,7 @@ import { modelRequestStreamStats } from '@webview/reliability/modelRequestStream
 import MessageItem from './MessageItem.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
+import ReliableCompressionWarningRow from './ReliableCompressionWarningRow.vue';
 import TimelineActivityRow from './TimelineActivityRow.vue';
 import {
   TIMELINE_MOUNT_LIMIT,
@@ -128,6 +130,20 @@ const terminationRowsByAnchor = computed(() => {
   }
   return result;
 });
+
+const compressionNotices = computed(() => projectCompressionNotices({
+  conversationId: conversationId.value, records: feed.records, messages: messages.value,
+  turnIdByMessageId: projection.value.turnIdByMessageId,
+  placedTerminationIds: Object.values(projection.value.terminationByMessageId).map((item) => item.id)
+}));
+const compressionWarningsByAnchor = computed(() => Object.fromEntries(
+  Object.entries(compressionNotices.value.byAnchor).map(([anchor, notices]) => [anchor,
+    notices.filter((notice) => !timelinePresentation.isSuppressed(conversationId.value, 'compression-warning', notice.id))])
+));
+const unanchoredCompressionWarnings = computed(() => compressionNotices.value.unanchored.filter((notice) =>
+  !timelinePresentation.isSuppressed(conversationId.value, 'compression-warning', notice.id)));
+const unanchoredTurnFailures = computed(() => compressionNotices.value.unanchoredFailures.filter((notice) =>
+  !timelinePresentation.isSuppressed(conversationId.value, 'turn-termination', notice.id)));
 
 watch(
   () => props.followLatest,
@@ -523,6 +539,10 @@ function dismissCompression(block: Record<string, unknown>): void {
   timelinePresentation.suppress(conversationId.value, 'compression-block', reliableText(block.id));
 }
 
+function dismissCompressionWarning(warning: CompressionWarningRecord): void {
+  timelinePresentation.suppress(conversationId.value, 'compression-warning', warning.id);
+}
+
 function messageDetailDemandSignature(message: MessageRecord): string {
   const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
   if (!revisionId) return `message:${message.id}:no-revision`;
@@ -664,6 +684,13 @@ function messageRenderKey(message: MessageRecord): string {
         :termination="termination"
         @dismiss="dismissTermination(termination)"
       />
+      <ReliableCompressionWarningRow
+        v-for="warning in compressionWarningsByAnchor[message.id] ?? []"
+        :key="warning.id"
+        :title="warning.title"
+        :detail="warning.detail"
+        @dismiss="dismissCompressionWarning(warning)"
+      />
       <ReliableCompressionCard
         v-for="block in compressionBlocksByAnchor[message.id] ?? []"
         :key="`compression:${String(block.id)}`"
@@ -687,6 +714,14 @@ function messageRenderKey(message: MessageRecord): string {
     >
       {{ retryBoundaryLabel }}
     </p>
+    <template v-if="!hasLaterSegment">
+      <ReliableCompressionWarningRow v-for="warning in unanchoredCompressionWarnings"
+        :key="warning.id" :title="warning.title" :detail="warning.detail"
+        @dismiss="dismissCompressionWarning(warning)" />
+      <ReliableCompressionWarningRow v-for="failure in unanchoredTurnFailures"
+        :key="failure.id" :title="failure.title" :detail="failure.detail" severity="error"
+        @dismiss="timelinePresentation.suppress(conversationId, 'turn-termination', failure.id)" />
+    </template>
     <ReliableCompressionCard
       v-if="activeCompressionCard && !hasLaterSegment"
       :key="`compression:${String(activeCompressionCard.id)}`"

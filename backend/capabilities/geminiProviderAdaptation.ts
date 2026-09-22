@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 /**
  * Gemini provider 适配：thinking 配置按模型能力规范化、工具 schema 清洗、
  * OpenAI 兼容 wire 上 Gemini thought signature 的请求/响应双向透传，
@@ -42,13 +43,17 @@ function installProviderSchemaEncoder<T>(
   if (!format || typeof format.encodeRequest !== 'function' || format.__limcodeProviderSchemaEncoder) return provider;
   const originalEncodeRequest = format.encodeRequest.bind(format);
   format.encodeRequest = (request, stream) => {
+    const claudeProjection = providerKind === 'claude'
+      ? projectClaudeCompactionBlocks(request)
+      : { request, blocks: new Map<string, unknown>() };
     const normalizedRequest = providerKind === 'gemini'
-      ? normalizeGeminiThinkingRequest(request, modelId)
-      : request;
+      ? normalizeGeminiThinkingRequest(claudeProjection.request, modelId)
+      : claudeProjection.request;
     const encoded = originalEncodeRequest(normalizedRequest, stream);
     if (providerKind === 'gemini' || geminiOpenAICompatible) {
       restoreGeminiToolSchemas(encoded, normalizedRequest);
     } else if (providerKind === 'claude') {
+      restoreClaudeCompactionBlocks(encoded, claudeProjection.blocks);
       restoreClaudeToolResultPairing(encoded);
     } else if (isRecord(encoded) && Array.isArray(encoded.tools)) {
       for (const tool of encoded.tools) {
@@ -65,6 +70,64 @@ interface ClaudeToolResultBatch {
   toolResults: unknown[];
   trailing: unknown[];
   endIndexExclusive: number;
+}
+
+interface ClaudeCompactionProjection {
+  request: unknown;
+  blocks: Map<string, unknown>;
+}
+
+/**
+ * unified-llm-provider does not yet know Anthropic's signed compaction block. Replace each frozen
+ * ProviderContext part with a collision-resistant text marker for ordinary message encoding, then
+ * restore the exact opaque block in the encoded Messages payload. No field of the signed block is
+ * interpreted or rewritten here.
+ */
+function projectClaudeCompactionBlocks(request: unknown): ClaudeCompactionProjection {
+  if (!isRecord(request) || !Array.isArray(request.contents)) {
+    return { request, blocks: new Map() };
+  }
+  const blocks = new Map<string, unknown>();
+  const markerScope = randomUUID();
+  let ordinal = 0;
+  let changed = false;
+  const contents = request.contents.map((content) => {
+    if (!isRecord(content) || !Array.isArray(content.parts)) return content;
+    let contentChanged = false;
+    const parts = content.parts.map((part) => {
+      if (!isClaudeCompactionProviderPart(part)) return part;
+      const marker = `\u241eLIMCODE_CLAUDE_COMPACTION_${markerScope}_${ordinal}\u241e`;
+      ordinal += 1;
+      blocks.set(marker, part.providerContext.rawItem);
+      contentChanged = true;
+      changed = true;
+      return { text: marker };
+    });
+    return contentChanged ? { ...content, parts } : content;
+  });
+  return changed ? { request: { ...request, contents }, blocks } : { request, blocks };
+}
+
+function isClaudeCompactionProviderPart(value: unknown): value is {
+  providerContext: { format: string; itemType?: string; rawItem: unknown };
+} {
+  if (!isRecord(value) || !isRecord(value.providerContext)) return false;
+  const context = value.providerContext;
+  return context.format === 'claude'
+    && context.itemType === 'compaction'
+    && isRecord(context.rawItem)
+    && context.rawItem.type === 'compaction';
+}
+
+function restoreClaudeCompactionBlocks(encodedRequest: unknown, blocks: ReadonlyMap<string, unknown>): void {
+  if (blocks.size === 0 || !isRecord(encodedRequest) || !Array.isArray(encodedRequest.messages)) return;
+  for (const message of encodedRequest.messages) {
+    if (!isRecord(message) || !Array.isArray(message.content)) continue;
+    message.content = message.content.map((block) => {
+      if (!isRecord(block) || block.type !== 'text' || typeof block.text !== 'string') return block;
+      return blocks.get(block.text) ?? block;
+    });
+  }
 }
 
 /**
@@ -323,12 +386,27 @@ function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unkn
 
   if (capability.kind === 'thinkingLevel') {
     const configuredLevel = sourceThinkingConfig.thinkingLevel;
-    thinkingConfig.thinkingLevel = isGeminiThinkingLevelSupported(capability, configuredLevel)
-      ? configuredLevel
-      : capability.defaultLevel;
+    const unset = configuredLevel === undefined || configuredLevel === 'not-set' || configuredLevel === 'non-set';
+    if (sourceThinkingConfig.thinkingBudget !== undefined
+      || !unset && !isGeminiThinkingLevelSupported(capability, configuredLevel)) {
+      throw Object.assign(new Error(`Unsupported Gemini thinking configuration for ${modelId}: use a supported thinkingLevel, not a numeric budget.`),
+        { code: 'UNSUPPORTED_REASONING_CONFIGURATION' });
+    }
+    if (isGeminiThinkingLevelSupported(capability, configuredLevel)) {
+      thinkingConfig.thinkingLevel = configuredLevel;
+      if (thinkingConfig.includeThoughts === undefined) thinkingConfig.includeThoughts = true;
+    } else {
+      // Missing/unset means Provider default. Explicit unsupported values are rejected above.
+      delete thinkingConfig.thinkingLevel;
+      if (sourceThinkingConfig.includeThoughts === undefined) delete thinkingConfig.includeThoughts;
+    }
     delete thinkingConfig.thinkingBudget;
-    if (thinkingConfig.includeThoughts === undefined) thinkingConfig.includeThoughts = true;
   } else {
+    if (capability.kind === 'thinkingBudget' && sourceThinkingConfig.thinkingLevel !== undefined
+      && sourceThinkingConfig.thinkingLevel !== 'not-set' && sourceThinkingConfig.thinkingLevel !== 'non-set') {
+      throw Object.assign(new Error(`Unsupported Gemini thinkingLevel for ${modelId}: use thinkingBudget.`),
+        { code: 'UNSUPPORTED_REASONING_CONFIGURATION' });
+    }
     delete thinkingConfig.thinkingLevel;
     if (capability.kind === 'unsupported') delete thinkingConfig.thinkingBudget;
   }

@@ -533,7 +533,28 @@ export interface LlmProviderConfigsRecord {
   configs: LlmProviderConfigRecord[];
 }
 
-export type LlmCompressionMethodKind = 'disabled' | 'openai_responses_compact' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary' | 'manual_summary';
+export type LlmCompressionMethodKind =
+  | 'disabled'
+  | 'auto'
+  | 'provider_native'
+  | 'llm_summary'
+  | 'segmented_summary'
+  | 'deterministic_summary'
+  | 'manual_summary';
+export type LlmCompressionFallbackKind =
+  | 'segmented_summary'
+  | 'deterministic_summary'
+  | 'continue_uncompressed_if_fits';
+export type LlmNativeCompactionTrustMode = 'verified_only' | 'trust_configured_endpoint';
+export type LlmSummaryReasoningMode =
+  | 'provider_default'
+  | 'inherit_chat'
+  | 'economy'
+  | 'balanced'
+  | 'quality'
+  | 'maximum'
+  | 'disabled'
+  | 'explicit';
 export type LlmCompressionTriggerMode = 'manual' | 'token_threshold';
 export type LlmCompressionThresholdUnit = 'percent' | 'tokens';
 
@@ -631,16 +652,24 @@ export interface LlmCompressionConfigRecord {
     thresholdPercent?: number;
     thresholdUnit?: LlmCompressionThresholdUnit;
   };
-  openaiResponsesCompact?: {
+  /** Provider-native compaction is enabled only by a frozen verified/declared capability. */
+  providerNative?: {
     providerConfigId?: string;
     model?: string;
+    trustMode?: LlmNativeCompactionTrustMode;
   };
+  /** Ordered fallback chain used after a permanent Provider capability/contract failure. */
+  fallbacks?: LlmCompressionFallbackKind[];
   llmSummary?: {
     providerConfigId?: string;
     model?: string;
     systemPrompt?: string;
     userPrompt?: string;
     targetTokens?: number;
+    /** Reasoning intent; provider_default sends no reasoning/thinking override. */
+    reasoning?: {
+      mode: LlmSummaryReasoningMode;
+    };
     generationConfig?: LlmGenerationConfigRecord;
   };
   createdAt: number;
@@ -666,7 +695,7 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
   return {
     id: `llm-compression-config-${createMessageId()}`,
     name,
-    kind: 'segmented_summary',
+    kind: 'auto',
     maxDurationMinutes: DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES,
     bodyTargetTokens: DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS,
     trigger: {
@@ -674,8 +703,11 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
       thresholdUnit: 'percent',
       thresholdPercent: DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT
     },
+    providerNative: { trustMode: 'verified_only' },
+    fallbacks: ['segmented_summary', 'deterministic_summary', 'continue_uncompressed_if_fits'],
     llmSummary: {
-      targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS
+      targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+      reasoning: { mode: 'provider_default' }
     },
     createdAt: now,
     updatedAt: now
@@ -685,6 +717,8 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
 export interface LlmProviderModelRecord {
   id: string;
   name: string;
+  /** Credential-free evidence obtained by explicit catalog refresh or capability probe. */
+  capabilitySnapshot?: import('./modelCapabilities').ModelCapabilitySnapshot;
   createdAt?: string;
 }
 
@@ -2784,10 +2818,13 @@ export interface ConfigurationSnapshotPayload {
 
 export interface LlmProviderModelsGetPayload {
   config: LlmProviderConfigRecord;
+  /** Explicit, possibly billable synthetic native request; never a catalog side effect. */
+  probeNative?: boolean;
 }
 
 export interface LlmProviderModelsSnapshotPayload {
   configId: string;
+  purpose?: 'capability_probe';
   provider: LlmProviderKind;
   baseUrl: string;
   models: LlmProviderModelRecord[];
