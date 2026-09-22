@@ -10,9 +10,9 @@ import type { ContentObjectMetadata } from '../../reliableKernel/contentAddresse
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
-import { readNativeSteeringInFlight } from '../../reliableKernel/nativeSteering';
 import { ForkContextCandidateProbe, isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
 import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
+import type { StructuralContextRecord } from '../../reliableKernel/contextSequence';
 import {
   createVscodeRootAuthority,
   completeVscodeRuntimeDataSetSelection,
@@ -336,22 +336,23 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         throw new ConversationForkRejectedError('分支点所在的轮次仍在运行，请等待本轮结束后再从这条消息创建分支。');
       }
     }
-    const nativeSteering = await readNativeSteeringInFlight(this.product.application.database, sourceConversationId);
-    if (nativeSteering.length > 0) {
-      throw new Error('当前对话仍有未收口的原生转向，请等待完成后再创建分支。');
-    }
-    const nativeWork = await this.product.application.runtime.effects.listNativePendingWork({
-      conversationId: sourceConversationId
-    });
-    for (const work of nativeWork) {
-      if (work.turnActive || !work.settled || !work.callContextSegmentId || work.resultContextSegmentId) continue;
-      await this.product.application.context.appendNativeToolResult({
-        conversationId: sourceConversationId,
-        toolCallId: work.toolCallId,
-        toolModelResultId: requireText(work.toolModelResultId, 'NativePendingToolCall.toolModelResultId')
+    // Settled results of ended Turns are closed into the idle source Context here (unfenced closure
+    // requires no ExecutionLease). While a later Turn runs, its executor owns the Context writes.
+    if ((await this.list('ExecutionLease', { conversation_id: sourceConversationId }, 1)).length === 0) {
+      const nativeWork = await this.product.application.runtime.effects.listNativePendingWork({
+        conversationId: sourceConversationId
       });
+      for (const work of nativeWork) {
+        if (work.turnActive || !work.settled || !work.callContextSegmentId || work.resultContextSegmentId) continue;
+        await this.product.application.context.appendNativeToolResult({
+          conversationId: sourceConversationId,
+          toolCallId: work.toolCallId,
+          toolModelResultId: requireText(work.toolModelResultId, 'NativePendingToolCall.toolModelResultId')
+        });
+      }
     }
-    await this.product.application.runtime.effects.assertNativeWorkSettledForConversation(sourceConversationId);
+    // Native closure and in-flight steering are checked by the fork writer over the fork's own
+    // retained segments and copied Turns; a still running later Turn never blocks this fork.
     const sources = await this.list('ContextSegmentSource', {
       source_kind: 'message_revision',
       source_id: revisionId
@@ -423,6 +424,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     let sourceRootId: string | undefined;
     let sourceContextEndSegmentId: string | undefined;
     let sourceContextSegmentIds: string[] | undefined;
+    let sourceRecords: StructuralContextRecord[] = [];
+    let cutIndex = -1;
     const nativeContext = nativeMessageProjection || requiredToolContext.some((tool) => tool.native);
     // Prefer the newest context containing this boundary: an edit can leave the same assistant
     // revision in an older root whose preceding user revisions no longer match the transcript.
@@ -446,8 +449,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         const callIndex = segmentIndexes.get(tool.callSegmentId) ?? -1;
         const resultIndex = segmentIndexes.get(tool.resultSegmentId) ?? -1;
         if (nativeContext) {
+          // A result settled after the selected message is moved behind the fork cut by the
+          // writer; the cut itself never extends over the later history in between.
           if (callIndex < 0 || resultIndex < callIndex) return false;
-          previousIndex = Math.max(previousIndex, resultIndex);
+          previousIndex = Math.max(previousIndex, callIndex);
           return true;
         }
         if (callIndex <= previousIndex || resultIndex !== callIndex) return false;
@@ -460,15 +465,22 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         sourceContextSegmentIds = structure.records.slice(0, previousIndex + 1).map((record) =>
           requireText(record.segment.id, 'ContextSegment.id')
         );
+        sourceRecords = structure.records;
+        cutIndex = previousIndex;
         break;
       }
     }
     if (!sourceRootId || !sourceContextEndSegmentId || !sourceContextSegmentIds) {
       throw new Error('无法定位 Fork 源 MessageRevision 对应的 Context root。');
     }
+    const lateNativeResultSegmentIds = await this.product.application.context.lateNativeResultSegmentIds(
+      sourceConversationId,
+      sourceRecords,
+      cutIndex
+    );
     const sourceAttachmentCatalogState = await this.product.application.modelProvider.projectAttachmentCatalogState(
       sourceConversationId,
-      sourceContextSegmentIds.map((segmentId) => ({ segmentId }))
+      [...sourceContextSegmentIds, ...lateNativeResultSegmentIds].map((segmentId) => ({ segmentId }))
     );
     await this.product.application.modelProvider.ensureAttachmentHandles(
       sourceConversationId,

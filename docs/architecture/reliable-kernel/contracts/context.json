@@ -257,7 +257,7 @@
     ],
     "contextRule": "fork 从选定旧 parent/root 创建目标 Conversation 的新 root/head，结构共享不可变 ContextSequence 前缀。",
     "relationRule": "Reuse、Branch、Origin、Project 分别建独立表/Repository/Codec/Client mapping；fork 在同一事务继承可选 ProjectContext；不得嵌入 Conversation。",
-    "historyRule": "fork 只复制已终止轮次：分支点或复制范围内任一 Turn 仍活动时以 ConversationForkRejectedError 拒绝且不写入；源对话的活动轮次不受已提交 fork 影响，共享的不可变 tool_pair 段按本 ToolCall 自己的来源行定位。整轮消息都被复制的 Turn 连同其全部 ModelRequest（含压缩与失败请求）一起复制并保留原终止状态，只复制部分消息的边界 Turn 记为 forked_history_snapshot 中断；用户分支为每个复制的 Turn 复制自己的 AuthoritySnapshot 并改写请求引用（子 Agent 分支不复制权限），复制请求的 ModelContextProjection 重新挂到分支中结构相同的根，无对应根时不复制；超过单页的来源集合分页读全。可达压缩块按 compression.forkOwnership 复制，块冻结权限所属的压缩 Turn（含无消息的手动压缩 Turn）一并复制，仍在运行则拒绝。",
+    "historyRule": "fork 只复制已终止轮次：分支点或复制范围内任一 Turn 仍活动时以 ConversationForkRejectedError 拒绝且不写入；源对话的活动轮次不受已提交 fork 影响，共享的不可变 tool_pair 段按本 ToolCall 自己的来源行定位。整轮消息都被复制的 Turn 连同其全部 ModelRequest（含压缩与失败请求）一起复制并保留原终止状态，只复制部分消息的边界 Turn 记为 forked_history_snapshot 中断；用户分支为每个复制的 Turn 复制自己的 AuthoritySnapshot 并改写请求引用（子 Agent 分支不复制权限），复制请求的 ModelContextProjection 重新挂到分支中结构相同的根，无对应根时不复制；超过单页的来源集合分页读全。可达压缩块按 compression.forkOwnership 复制，块冻结权限所属的压缩 Turn（含无消息的手动压缩 Turn）一并复制，仍在运行则拒绝。切点永不延长到其后的历史：保留前缀内原生调用在切点之后才进入 Context 的已结算结果，作为新的内容寻址节点追加在切点之后；原生闭合与未收口转向只检查分支自身的片段与复制的 Turn，调用方仍在运行的后续轮次不阻塞分支。",
     "legacyRunReference": "forbidden-use-source-turn-id-instead"
   }
 }

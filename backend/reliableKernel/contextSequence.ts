@@ -950,8 +950,114 @@ export class ContextSequenceControlPlane {
       }
       if (!found) throw new Error(`Context root ${rootId} does not contain end segment ${endSegmentId}.`);
     }
-    const pairRecords = prefixRecords.filter((record) => record.segment.segment_kind === 'tool_pair');
-    if (pairRecords.length === 0) return;
+    await this.assertNativeSegmentsClosed(
+      requireId(structure.root.conversation_id, 'ContextSequenceRoot.conversation_id'),
+      prefixRecords
+    );
+  }
+
+  /**
+   * The same closure guard over an explicit segment list owned by one Conversation, such as a fork
+   * prefix plus the late native results moved behind its cut. Calls outside the list (for example
+   * a caller's still running Turn after the cut) are not part of the checked history.
+   */
+  public async assertNativeSegmentsClosed(
+    conversationIdInput: string,
+    records: readonly StructuralContextRecord[]
+  ): Promise<void> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const { openCalls, resultSources } = await this.scanNativePairs(conversationId, records);
+    if (openCalls.size === 0 && resultSources.length === 0) return;
+    const resultSnapshot = await this.database.snapshot(resultSources.map((source) =>
+      DOMAIN_REPOSITORIES.domain('ToolModelResult').get(source.sourceId)
+    ));
+    for (const [index, source] of resultSources.entries()) {
+      const result = requireRow(resultSnapshot.snapshot[index], `ToolModelResult ${source.sourceId}`);
+      const ownerCallId = requireId(result.tool_call_id, 'ToolModelResult.tool_call_id');
+      if (!openCalls.delete(ownerCallId)) {
+        throw new Error(`Native ToolModelResult ${source.sourceId} has no call occurrence in this Context prefix.`);
+      }
+    }
+    if (openCalls.size === 0) return;
+    const pending: NativePendingWorkRef[] = [...openCalls.entries()].map(([toolCallId, segmentId]) => ({
+      toolCallId,
+      reason: `result occurrence missing in Context prefix (call segment ${segmentId})`
+    }));
+    throw new NativeAsyncWorkPendingError(
+      pending,
+      'Append the native result occurrences before cutting this Context prefix.'
+    );
+  }
+
+  /**
+   * Native results that settled after a fork cut: result occurrences, later in the same root, of
+   * native calls whose call occurrence lies in the retained prefix `records[0..endIndex]`. A fork
+   * moves them directly behind its cut instead of extending the cut over later history.
+   */
+  public async lateNativeResultSegmentIds(
+    conversationIdInput: string,
+    records: readonly StructuralContextRecord[],
+    endIndex: number
+  ): Promise<string[]> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const prefix = records.slice(0, endIndex + 1);
+    const { openCalls, resultSources } = await this.scanNativePairs(conversationId, prefix);
+    if (openCalls.size === 0) return [];
+    const closedInPrefix = new Set<string>();
+    if (resultSources.length > 0) {
+      const snapshot = await this.database.snapshot(resultSources.map((source) =>
+        DOMAIN_REPOSITORIES.domain('ToolModelResult').get(source.sourceId)
+      ));
+      for (const [index, source] of resultSources.entries()) {
+        closedInPrefix.add(requireId(
+          requireRow(snapshot.snapshot[index], `ToolModelResult ${source.sourceId}`).tool_call_id,
+          'ToolModelResult.tool_call_id'
+        ));
+      }
+    }
+    const later = new Map(records.slice(endIndex + 1).map((record, offset) => [
+      requireId(record.segment.id, 'ContextSegment.id'), endIndex + 1 + offset
+    ]));
+    const moved: Array<{ segmentId: string; index: number }> = [];
+    for (const toolCallId of openCalls.keys()) {
+      if (closedInPrefix.has(toolCallId)) continue;
+      const results = await listAllDomainRows(this.database, 'ToolModelResult', { tool_call_id: toolCallId });
+      if (results.length !== 1) continue;
+      const occurrences = await listAllDomainRows(this.database, 'ContextSegmentSource', {
+        source_kind: 'tool_model_result',
+        source_id: requireId(results[0].id, 'ToolModelResult.id')
+      });
+      if (occurrences.length !== 1) continue;
+      const segmentId = requireId(occurrences[0].segment_id, 'ContextSegmentSource.segment_id');
+      const index = later.get(segmentId);
+      if (index !== undefined) moved.push({ segmentId, index });
+    }
+    return moved.sort((left, right) => left.index - right.index).map((entry) => entry.segmentId);
+  }
+
+  /** Content-addressed nodes that continue an immutable chain from `parentNodeId`. */
+  public planSuffixNodes(
+    parentNodeId: string,
+    segmentIds: readonly string[],
+    savepointName: string
+  ): { nodeIds: string[]; steps: RepositoryTransactionStep[] } {
+    const now = this.timestamp();
+    const nodes: PlannedNode[] = [];
+    let parent: string = requireId(parentNodeId, 'parentNodeId');
+    for (const segmentId of segmentIds) {
+      const id = contextSequenceNodeId(parent, segmentId);
+      nodes.push({ id, parentNodeId: parent, segmentId: requireId(segmentId, 'segmentId'), now });
+      parent = id;
+    }
+    return { nodeIds: nodes.map((node) => node.id), steps: nodeInsertSteps(nodes, savepointName) };
+  }
+
+  private async scanNativePairs(
+    conversationId: string,
+    records: readonly StructuralContextRecord[]
+  ): Promise<{ openCalls: Map<string, string>; resultSources: ContextSourceOccurrence[] }> {
+    const pairRecords = records.filter((record) => record.segment.segment_kind === 'tool_pair');
+    if (pairRecords.length === 0) return { openCalls: new Map(), resultSources: [] };
     const sourceSnapshot = await this.database.snapshot(pairRecords.map((record) =>
       DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
         where: { segment_id: requireId(record.segment.id, 'ContextSegment.id') },
@@ -959,7 +1065,6 @@ export class ContextSequenceControlPlane {
         limit: 1000
       })
     ));
-    const conversationId = requireId(structure.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const sourceGroups: DomainRow[][] = [];
     for (const [index, record] of pairRecords.entries()) {
       const first = rows(sourceSnapshot.snapshot[index]);
@@ -1033,26 +1138,7 @@ export class ContextSequenceControlPlane {
         resultSources.push(shape.result);
       }
     }
-    if (openCalls.size === 0 && resultSources.length === 0) return;
-    const resultSnapshot = await this.database.snapshot(resultSources.map((source) =>
-      DOMAIN_REPOSITORIES.domain('ToolModelResult').get(source.sourceId)
-    ));
-    for (const [index, source] of resultSources.entries()) {
-      const result = requireRow(resultSnapshot.snapshot[index], `ToolModelResult ${source.sourceId}`);
-      const ownerCallId = requireId(result.tool_call_id, 'ToolModelResult.tool_call_id');
-      if (!openCalls.delete(ownerCallId)) {
-        throw new Error(`Native ToolModelResult ${source.sourceId} has no call occurrence in this Context prefix.`);
-      }
-    }
-    if (openCalls.size === 0) return;
-    const pending: NativePendingWorkRef[] = [...openCalls.entries()].map(([toolCallId, segmentId]) => ({
-      toolCallId,
-      reason: `result occurrence missing in Context prefix (call segment ${segmentId})`
-    }));
-    throw new NativeAsyncWorkPendingError(
-      pending,
-      'Append the native result occurrences before cutting this Context prefix.'
-    );
+    return { openCalls, resultSources };
   }
 
   public async materializeStructure(rootId: string): Promise<MaterializedContextStructure> {

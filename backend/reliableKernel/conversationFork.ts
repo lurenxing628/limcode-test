@@ -9,7 +9,7 @@ import { readForkContextLineage } from './conversationForkContext';
 export { ConversationForkRejectedError } from './conversationForkContext';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
 import type { ContentAddressedStore } from './contentAddressedStore';
-import { ReliableContextTokenEstimator } from './contextTokenEstimator';
+import { estimateContextSegmentTokens, ReliableContextTokenEstimator } from './contextTokenEstimator';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -62,6 +62,8 @@ interface ForkRootShape {
   segmentCount: bigint;
   estimatedTokens: bigint;
   segmentIds?: string[];
+  /** Content-addressed nodes for native results moved behind the cut. */
+  nodeSteps: RepositoryTransactionStep[];
 }
 
 /**
@@ -236,10 +238,10 @@ export class ConversationForkControlPlane {
     });
 
     const now = this.timestamp();
-    await this.context.assertNativeContextClosed(command.sourceContextRootId, command.sourceContextEndSegmentId);
     const targetRootShape = await resolveForkRootShape(
       this.database,
       this.tokenEstimator,
+      this.context,
       sourceRoot,
       command.sourceContextEndSegmentId
     );
@@ -405,6 +407,7 @@ export class ConversationForkControlPlane {
         scope: { conversation_id: ids.targetConversationId }
       })),
       ...transcript.inserts,
+      ...targetRootShape.nodeSteps,
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
         id: ids.targetRootId,
         conversation_id: ids.targetConversationId,
@@ -758,38 +761,64 @@ async function retainedForkHistoryRoots(
   return result;
 }
 
+/**
+ * The fork's own Context: the source prefix ending at the selected segment, followed by the native
+ * results that settled after that cut (appended as new content-addressed nodes), never the later
+ * history the cut excludes. Native closure is checked over exactly this segment list.
+ */
 async function resolveForkRootShape(
   database: RuntimeDatabase,
   tokenEstimator: ReliableContextTokenEstimator,
+  context: ContextSequenceControlPlane,
   sourceRoot: DomainRow,
   endSegmentId: string | undefined
 ): Promise<ForkRootShape> {
+  const rootId = requireId(sourceRoot.id, 'ContextSequenceRoot.id');
+  const conversationId = requireId(sourceRoot.conversation_id, 'ContextSequenceRoot.conversation_id');
+  const materialized = await database.materializeContext(rootId);
+  const records = materialized.snapshot.records;
   if (!endSegmentId) {
+    await context.assertNativeSegmentsClosed(conversationId, records);
     return {
       rootNodeId: nullableId(sourceRoot.root_node_id, 'ContextSequenceRoot.root_node_id'),
       tailNodeId: nullableId(sourceRoot.tail_node_id, 'ContextSequenceRoot.tail_node_id'),
       tailSegmentCount: requireBigInt(sourceRoot.tail_segment_count, 'ContextSequenceRoot.tail_segment_count'),
       segmentCount: requireBigInt(sourceRoot.segment_count, 'ContextSequenceRoot.segment_count'),
-      estimatedTokens: requireBigInt(sourceRoot.estimated_tokens, 'ContextSequenceRoot.estimated_tokens')
+      estimatedTokens: requireBigInt(sourceRoot.estimated_tokens, 'ContextSequenceRoot.estimated_tokens'),
+      nodeSteps: []
     };
   }
-  const rootId = requireId(sourceRoot.id, 'ContextSequenceRoot.id');
-  const materialized = await database.materializeContext(rootId);
-  const endIndex = materialized.snapshot.records.findIndex((record) => record.segment.id === endSegmentId);
+  const endIndex = records.findIndex((record) => record.segment.id === endSegmentId);
   if (endIndex < 0) throw new Error(`Fork Context boundary segment ${endSegmentId} is not part of source root ${rootId}.`);
-  const prefix = materialized.snapshot.records.slice(0, endIndex + 1);
+  const prefix = records.slice(0, endIndex + 1);
   const first = prefix[0];
   const last = prefix[prefix.length - 1];
   if (!first || !last) throw new Error('Fork Context boundary cannot produce an empty root.');
+  const lateSegmentIds = await context.lateNativeResultSegmentIds(conversationId, records, endIndex);
+  const late = lateSegmentIds.map((segmentId) => records.find((record) => record.segment.id === segmentId)!);
+  const retained = [...prefix, ...late];
+  await context.assertNativeSegmentsClosed(conversationId, retained);
+  const suffix = context.planSuffixNodes(
+    requireId(last.node.id, 'ContextSequenceNode.id'),
+    lateSegmentIds,
+    'fork_late_native_result_nodes'
+  );
+  const tailId = suffix.nodeIds.at(-1) ?? requireId(last.node.id, 'ContextSequenceNode.id');
+  let estimatedTokens = await tokenEstimator.estimateRootPrefix(rootId, prefix.length);
+  if (late.length > 0) {
+    const segments = (await context.materialize(rootId)).segments;
+    for (const segmentId of lateSegmentIds) {
+      estimatedTokens += estimateContextSegmentTokens(segments.find((segment) => segment.segmentId === segmentId)!);
+    }
+  }
   const compressed = first.segment.segment_kind === 'compression';
   return {
-    rootNodeId: requireId(compressed ? first.node.id : last.node.id, 'ContextSequenceNode.id'),
-    tailNodeId: compressed && prefix.length > 1
-      ? requireId(last.node.id, 'ContextSequenceNode.id')
-      : null,
-    tailSegmentCount: compressed ? BigInt(prefix.length - 1) : 0n,
-    segmentCount: BigInt(prefix.length),
-    segmentIds: prefix.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
-    estimatedTokens: BigInt(await tokenEstimator.estimateRootPrefix(rootId, prefix.length))
+    rootNodeId: requireId(compressed ? first.node.id : tailId, 'ContextSequenceNode.id'),
+    tailNodeId: compressed && retained.length > 1 ? tailId : null,
+    tailSegmentCount: compressed ? BigInt(retained.length - 1) : 0n,
+    segmentCount: BigInt(retained.length),
+    segmentIds: retained.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
+    estimatedTokens: BigInt(estimatedTokens),
+    nodeSteps: suffix.steps
   };
 }

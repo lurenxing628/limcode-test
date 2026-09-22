@@ -938,7 +938,7 @@ function validateContext(context, failures) {
   if (context?.conversationFork?.releaseDecision !== 'keep-relations-and-rebuild') failures.push('Conversation fork必须保留独立关系语义');
   if (context?.conversationFork?.legacyRunReference !== 'forbidden-use-source-turn-id-instead') failures.push('Conversation fork来源不得继续依赖Run');
   const forkHistoryRule = String(context?.conversationFork?.historyRule ?? '');
-  for (const marker of ['只复制已终止轮次', 'ConversationForkRejectedError', '本 ToolCall 自己的来源行', '全部 ModelRequest', '自己的 AuthoritySnapshot', '子 Agent 分支不复制权限', 'ModelContextProjection 重新挂到分支', 'compression.forkOwnership']) {
+  for (const marker of ['只复制已终止轮次', 'ConversationForkRejectedError', '本 ToolCall 自己的来源行', '全部 ModelRequest', '自己的 AuthoritySnapshot', '子 Agent 分支不复制权限', 'ModelContextProjection 重新挂到分支', 'compression.forkOwnership', '切点永不延长', '追加在切点之后', '只检查分支自身的片段']) {
     if (!forkHistoryRule.includes(marker)) failures.push(`Conversation fork历史规则缺少${marker}`);
   }
 

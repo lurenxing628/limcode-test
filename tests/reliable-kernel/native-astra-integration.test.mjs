@@ -404,11 +404,19 @@ test('Astra executes a durable async call before response completion and deliver
     assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId }), []);
     const [head] = await rows(app, 'ConversationContextHeadLink', { conversation_id: conversationId });
     const [callSource] = await rows(app, 'ContextSegmentSource', { source_kind: 'tool_call', source_id: admitted.id });
-    await assert.rejects(app.runtime.conversationFork.fork({
-      idempotencyKey: 'native-open-prefix-fork', reuseKey: 'native-open-prefix-fork',
+    const [resultRow] = await rows(app, 'ToolModelResult', { tool_call_id: admitted.id });
+    const [resultSource] = await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result', source_id: resultRow.id });
+    // The result settled after the call; a cut at the call moves that result behind the cut
+    // instead of extending the fork over the later suffix text.
+    const cut = await app.runtime.conversationFork.fork({
+      idempotencyKey: 'native-cut-at-call-fork', reuseKey: 'native-cut-at-call-fork',
       sourceConversationId: conversationId, sourceContextRootId: head.root_id,
-      sourceContextEndSegmentId: callSource.segment_id, targetTitle: 'Invalid partial fork', targetAgentId: 'agent-main'
-    }), { code: 'NATIVE_ASYNC_WORK_PENDING' });
+      sourceContextEndSegmentId: callSource.segment_id, targetTitle: 'Cut at native call', targetAgentId: 'agent-main'
+    });
+    const cutSegments = (await app.context.materializeStructure(cut.targetRootId)).records.map(record => record.segment.id);
+    assert.deepEqual(cutSegments.slice(-2), [callSource.segment_id, resultSource.segment_id]);
+    const cutContent = (await app.context.materialize(cut.targetRootId)).segments.map(segment => segment.content.toString('utf8')).join('\n');
+    assert.doesNotMatch(cutContent, /Continuing while the probe is still running/);
     const forked = await forkNativeMessage(app, conversationId, request.id, 'native-closed-prefix-fork');
     assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId: forked.targetConversationId }), []);
 

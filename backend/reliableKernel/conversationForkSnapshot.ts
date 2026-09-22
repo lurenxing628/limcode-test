@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { conversationAttachmentHandleLinkId } from './conversationAttachmentHandles';
 import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
-import { NATIVE_STEER_MESSAGE_TURN_ROLE } from './nativeSteering';
+import { NATIVE_STEER_MESSAGE_TURN_ROLE, readNativeSteeringInFlight } from './nativeSteering';
 import {
   ConversationForkRejectedError,
   isNativeRequest,
@@ -318,6 +318,10 @@ export async function prepareConversationForkSnapshot(
   ]);
   const turnRows = await getRows(database, 'Turn', turnIds);
   requireTerminatedTurns(turnRows);
+  const copiedTurnIds = new Set(turnIds);
+  if ((await readNativeSteeringInFlight(database, input.sourceConversationId)).some((entry) => copiedTurnIds.has(entry.turnId))) {
+    throw new Error('Fork source history still has an unsettled native steering instruction; wait for it to settle.');
+  }
   const turnRelations = await readTurnRelations(database, turnRows);
   // A Turn whose whole transcript is copied is copied with every ModelRequest it made, including
   // compression and failed requests that own no Message, so its original termination stays valid.
