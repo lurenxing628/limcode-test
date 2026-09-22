@@ -66,7 +66,6 @@ if (workerMode) {
   );
 } else {
   test('real processes serialize one global record store without loss, duplication, or workspace/session contamination', {
-    skip: process.platform !== 'win32',
     timeout: 120_000
   }, async () => {
     const rootPath = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-process-stress-'));
@@ -85,7 +84,6 @@ if (workerMode) {
   });
 
   test('a crashed owner is fenced as one stale generation while concurrent successors preserve the index', {
-    skip: process.platform !== 'win32',
     timeout: 120_000
   }, async () => {
     const rootPath = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-crash-stress-'));
