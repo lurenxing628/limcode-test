@@ -161,6 +161,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/webviewLocalResources.test.cjs',
   'tests/openAIResponsesWebSocketNative.test.cjs',
   'webview/tests/nativeConversationProjection.test.ts',
+  'webview/tests/reliableCollaborationTimeline.test.ts',
   'webview/tests/reliableConversationProjection.test.ts',
   'tests/reliable-kernel/reliable-queue-ordering.test.mjs',
   'webview/tests/segmentedTimeline.test.ts',

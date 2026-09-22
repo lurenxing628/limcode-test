@@ -370,7 +370,7 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
       return `${command} · ${processOutcomeLabel(preview.source.outcome)}`;
     }
     if (preview.source.kind === 'collaboration_message') {
-      return `协作${preview.source.mode === 'followup' ? '续派任务' : '消息'} · ${preview.source.textPreview}`;
+      return `${collaborationSourceLabel(preview.source.sourceConversationId)} · ${preview.source.mode === 'followup' ? '续派任务' : '消息'} · ${preview.source.textPreview}`;
     }
     const name = subagentName(preview.source.agentId);
     if (preview.source.title) return `${name} · ${preview.source.title}`;
@@ -380,6 +380,13 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
   if (text) return `${text}${preview.truncated ? '…' : ''}`;
   if (preview.hasAttachments) return '附件消息';
   return '(空消息)';
+}
+
+/** Title comes from the navigation list; a Conversation missing there has been deleted. */
+function collaborationSourceLabel(conversationId: string): string {
+  const conversation = reliableConversation.feed.records.Conversation?.[conversationId];
+  const title = typeof conversation?.title === 'string' ? conversation.title.trim() : '';
+  return conversation ? `来自对话 ${title || '未命名对话'}` : '来自已删除的对话';
 }
 
 function subagentName(agentId?: string): string {

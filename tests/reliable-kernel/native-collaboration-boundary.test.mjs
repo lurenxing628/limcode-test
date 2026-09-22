@@ -124,6 +124,7 @@ test('pending peer messages end a native tool loop at its first settled response
     const now = new Date().toISOString();
     const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
     // A durable follow-up request from parent to peer, already bound to the peer Turn that finished it.
+    const requestPayload = await app.contentStore.ingest(app.database, 'Please review the change.', 'text/vnd.limcode.collaboration-message');
     await app.database.transaction([
       ...['parent', 'peer'].map(id => repo('Conversation').insert({ id, title: id, status: 'active', created_at: now, updated_at: now })),
       repo('AgentConversationLink').insert({ id: 'agent-link', conversation_id: 'parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now }),
@@ -133,6 +134,7 @@ test('pending peer messages end a native tool loop at its first settled response
       repo('CollaborationMessageSourceLink').insert({ id: 'request-source', message_id: 'request-message', conversation_id: 'parent', source_kind: 'tool', source_key: 'request-call', turn_id: null, tool_call_id: null, board_post_id: null, created_at: now }),
       repo('RuntimeInboxItem').insert({ id: 'request-inbox', dedupe_key: 'request-message', source_kind: 'collaboration_message', source_id: 'request-message', state: 'routed', created_at: now, updated_at: now }),
       repo('CollaborationMessageTargetLink').insert({ id: 'request-target', message_id: 'request-message', conversation_id: 'peer', inbox_item_id: 'request-inbox', anchor_turn_id: null, created_at: now }),
+      repo('CollaborationMessagePayloadLink').insert({ id: 'request-payload', message_id: 'request-message', content_object_id: requestPayload.id, created_at: now }),
       repo('CollaborationBudget').insert({ id: 'request-budget', origin_kind: 'turn', origin_key: 'parent-origin', authority_turn_id: 'parent-origin', created_at: now }),
       repo('CollaborationRequest').insert({ id: 'request', message_id: 'request-message', budget_id: 'request-budget', automatic: 1n, state: 'pending', created_at: now, updated_at: now }),
       repo('CollaborationRequestTurnLink').insert({ id: 'request-turn', request_id: 'request', turn_id: 'peer-turn', created_at: now })

@@ -8,7 +8,10 @@
  * from the original worker implementation.
  */
 import type Database from 'better-sqlite3';
-import type { ActiveTurnWorkEnvironmentProjection } from '../../shared/reliableKernelClientFeed';
+import {
+  RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS,
+  type ActiveTurnWorkEnvironmentProjection
+} from '../../shared/reliableKernelClientFeed';
 import type { SnapshotBarrier } from './contracts';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
@@ -481,6 +484,36 @@ export function projectProcessRecord(
     background_kind: requestedBackground ? 'requested' : detached ? 'detached' : null,
     command_arguments_state: argumentsProjectionState,
     command_preview: commandPreview
+  };
+}
+
+/** Bounded envelope preview; the full body stays in CAS behind the explicit message read path. */
+export function projectCollaborationMessageRecord(
+  database: Database.Database,
+  messageId: string,
+  content: ClientProjectionContentAccess
+): DomainRow {
+  const raw = database.prepare('SELECT * FROM collaboration_message WHERE id = ?').get(messageId);
+  if (!raw) throw new Error(`CollaborationMessage ${messageId} does not exist.`);
+  const record = DOMAIN_REPOSITORIES.codec('CollaborationMessage').decode(raw as Record<string, unknown>);
+  const payloads = database.prepare(`
+    SELECT payload.*
+      FROM collaboration_message_payload_link AS link
+      JOIN content_object AS payload ON payload.id = link.content_object_id
+     WHERE link.message_id = ?
+     LIMIT 2
+  `).all(messageId) as Array<Record<string, unknown>>;
+  if (payloads.length !== 1) throw new Error(`CollaborationMessage ${messageId} requires exactly one payload.`);
+  const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(payloads[0]);
+  if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || typeof metadata.byte_length !== 'bigint' || metadata.byte_length > 64_000n) {
+    throw new Error(`CollaborationMessage ${messageId} payload violates its content contract.`);
+  }
+  const normalized = content.readVerifiedBytes(metadata).toString('utf8').replace(/\s+/g, ' ').trim();
+  const characters = Array.from(normalized);
+  const limit = RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS;
+  return {
+    ...record,
+    text_preview: characters.length <= limit ? normalized : `${characters.slice(0, limit - 1).join('')}…`
   };
 }
 
@@ -980,7 +1013,7 @@ export function executeClientProjectionSnapshot(
           OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target
           WHERE target.message_id = message.id AND target.conversation_id = @conversationId)
        ORDER BY message.message_seq DESC, message.id DESC LIMIT 32
-    `, { conversationId });
+    `, { conversationId }).map((row) => projectCollaborationMessageRecord(database, String(row.id), content));
     const collaborationIds = collaborationMessages.map(row => String(row.id));
     const collaborationMessageSourceLinks = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', collaborationIds);
     const collaborationMessageTargetLinks = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', collaborationIds);

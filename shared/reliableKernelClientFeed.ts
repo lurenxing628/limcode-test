@@ -141,6 +141,13 @@ export interface ReliableKernelCollaborationContinuationSource {
   textPreview: string;
 }
 
+/**
+ * Maximum characters of the whitespace-normalized `text_preview` carried by a CollaborationMessage
+ * client record. Source, target and reply relations stay in their own link records; the full body
+ * is never part of the feed.
+ */
+export const RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS = 320;
+
 export type ReliableKernelRuntimeContinuationSource =
   | ReliableKernelBackgroundProcessContinuationSource
   | ReliableKernelSubagentContinuationSource

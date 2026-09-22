@@ -20,6 +20,7 @@ import {
   executeConversationHistoryProjection,
   projectAnswerBridgeRecord,
   projectChildExecutionActivityRecord,
+  projectCollaborationMessageRecord,
   projectCompressionBlockRecord,
   projectConversationCommandReceiptRecord,
   projectConversationContextStatusRecord,
@@ -572,6 +573,9 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       }
       if (row.domain === 'Process') {
         record = projectProcessRecord(database, row.id, clientProjectionContent);
+      }
+      if (row.domain === 'CollaborationMessage') {
+        record = projectCollaborationMessageRecord(database, row.id, clientProjectionContent);
       }
       if (row.domain === 'RuntimeDelivery') {
         const links = database.prepare(`

@@ -1052,7 +1052,8 @@ function validateClient(client, failures) {
   const collaboration = client?.collaborationProjection;
   if (collaboration?.scope !== 'selected-conversation-source-or-target-only'
     || collaboration?.snapshotMessageLimit !== 32
-    || collaboration?.messageBodiesInFeed !== false || collaboration?.boardBodiesInFeed !== false) {
+    || collaboration?.messageBodiesInFeed !== false || collaboration?.boardBodiesInFeed !== false
+    || collaboration?.messagePreview !== 'CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read') {
     failures.push('协作前端投影必须有界、仅属于当前会话并按需读取正文');
   }
 

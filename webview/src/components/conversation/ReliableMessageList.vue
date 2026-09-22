@@ -21,7 +21,9 @@ import {
   reliableRetryStreamingActivityLabel
 } from '@webview/domain/reliableTransientActivity';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
+import { projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
 import MessageItem from './MessageItem.vue';
+import ReliableCollaborationCard from './ReliableCollaborationCard.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
 import ReliableCompressionWarningRow from './ReliableCompressionWarningRow.vue';
@@ -130,6 +132,14 @@ const terminationRowsByAnchor = computed(() => {
   }
   return result;
 });
+
+// Collaboration envelopes from or to other Conversations, placed at the Turn they belong to.
+const collaborationTimeline = computed(() => projectCollaborationTimeline({
+  conversationId: conversationId.value,
+  records: feed.records,
+  messages: messages.value,
+  turnIdByMessageId: projection.value.turnIdByMessageId
+}));
 
 const compressionNotices = computed(() => projectCompressionNotices({
   conversationId: conversationId.value, records: feed.records, messages: messages.value,
@@ -663,6 +673,12 @@ function messageRenderKey(message: MessageRecord): string {
       >
         {{ retryBoundaryLabel }}
       </p>
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.beforeMessage[message.id] ?? []"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
+      />
       <MessageItem
         :message="message"
         :run-id="projection.turnIdByMessageId[message.id]"
@@ -707,6 +723,12 @@ function messageRenderKey(message: MessageRecord): string {
         :data-timeline-row-key="`compression:${String(block.id)}`"
         @dismiss="dismissCompression(block)"
       />
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.afterMessage[message.id] ?? []"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
+      />
     </div>
     <button
       v-if="hasLaterSegment"
@@ -730,6 +752,14 @@ function messageRenderKey(message: MessageRecord): string {
       <ReliableCompressionWarningRow v-for="failure in unanchoredTurnFailures"
         :key="failure.id" :title="failure.title" :detail="failure.detail" severity="error"
         @dismiss="timelinePresentation.suppress(conversationId, 'turn-termination', failure.id)" />
+    </template>
+    <template v-if="!hasLaterSegment">
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.unbound"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
+      />
     </template>
     <ReliableCompressionCard
       v-if="activeCompressionCard && !hasLaterSegment"
