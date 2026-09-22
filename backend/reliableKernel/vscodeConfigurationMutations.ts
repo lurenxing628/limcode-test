@@ -861,7 +861,12 @@ export class VscodeConfigurationMutations {
     });
   }
 
-  /** Copies only the explicit Conversation selections that define a fork's execution identity. */
+  /**
+   * Copies every Conversation-layer selection that defines a fork's execution identity: all scoped
+   * record/link pairs, the workflow selection and the work-environment link. Only empty target
+   * slots are filled, so repeating an interrupted copy never overwrites what the target already
+   * owns. Global, Agent and Workflow layers are neither read nor written.
+   */
   public copyConversationConfiguration(
     sourceConversationIdInput: string,
     targetConversationIdInput: string
@@ -872,34 +877,32 @@ export class VscodeConfigurationMutations {
       throw new TypeError('Conversation configuration fork requires different source and target ids.');
     }
     return this.mutate(async (paths) => {
-      const sourceScope: ScopeRef = { scopeKind: 'conversation', scopeId: sourceConversationId };
-      const targetScope: ScopeRef = { scopeKind: 'conversation', scopeId: targetConversationId };
-      const modelRecordStore = modelProfileStore(paths);
-      const modelLinkStore = modelProfileLinkStore(paths);
-      const [modelRecords, modelLinks] = await Promise.all([
-        loadStore(modelRecordStore),
-        loadStore(modelLinkStore)
-      ]);
-      const sourceModelLink = latest(modelLinks.filter((link) => scopeMatches(link, sourceScope)));
-      const targetModelLink = latest(modelLinks.filter((link) => scopeMatches(link, targetScope)));
-      if (sourceModelLink && !targetModelLink) {
-        const sourceModel = modelRecords.find((record) => record.id === sourceModelLink.modelProfileId);
-        if (!sourceModel) throw new Error(`配置 Link ${sourceModelLink.id} 指向不存在的记录。`);
-        const now = Date.now();
-        const modelProfileId = scopeRecordId(modelRecordStore.idPrefix, targetScope);
-        await saveStore(modelRecordStore, upsert(modelRecords, {
-          ...plainClone(sourceModel),
-          id: modelProfileId
-        }));
-        await saveStore(modelLinkStore, upsert(modelLinks, {
-          ...plainClone(sourceModelLink),
-          id: scopeLinkId('model-profile', targetScope),
-          ...targetScope,
-          modelProfileId,
-          createdAt: now,
-          updatedAt: now
-        }));
-      }
+      const source: ScopeRef = { scopeKind: 'conversation', scopeId: sourceConversationId };
+      const target: ScopeRef = { scopeKind: 'conversation', scopeId: targetConversationId };
+      await this.copyScoped(modelProfileStore(paths), modelProfileLinkStore(paths), source, target,
+        (link) => link.modelProfileId,
+        (link, modelProfileId, now) => ({ ...link, id: scopeLinkId('model-profile', target), ...target, modelProfileId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(planReviewPolicyStore(paths), planReviewPolicyLinkStore(paths), source, target,
+        (link) => link.planReviewPolicyId,
+        (link, planReviewPolicyId, now) => ({ ...link, id: planReviewScopeLinkId(target), ...target, planReviewPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(toolPolicyStore(paths), toolPolicyLinkStore(paths), source, target,
+        (link) => link.toolPolicyId,
+        (link, toolPolicyId, now) => ({ ...link, id: scopeLinkId('tool-policy', target), ...target, toolPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(skillPolicyStore(paths), skillPolicyLinkStore(paths), source, target,
+        (link) => link.skillPolicyId,
+        (link, skillPolicyId, now) => ({ ...link, id: scopeLinkId('skill-policy', target), ...target, skillPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(systemPromptStore(paths), systemPromptLinkStore(paths), source, target,
+        (link) => link.systemPromptId,
+        (link, systemPromptId, now) => ({ ...link, id: scopeLinkId('system-prompt', target), ...target, systemPromptId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(runtimeContextStore(paths), runtimeContextLinkStore(paths), source, target,
+        (link) => link.runtimeContextId,
+        (link, runtimeContextId, now) => ({ ...link, id: scopeLinkId('runtime-context', target), ...target, runtimeContextId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(workEnvironmentPolicyStore(paths), workEnvironmentPolicyLinkStore(paths), source, target,
+        (link) => link.workEnvironmentPolicyId,
+        (link, workEnvironmentPolicyId, now) => ({ ...link, id: scopeLinkId('work-environment-policy', target), ...target, workEnvironmentPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(checkpointPolicyStore(paths), checkpointPolicyLinkStore(paths), source, target,
+        (link) => link.checkpointPolicyId,
+        (link, checkpointPolicyId, now) => ({ ...link, id: scopeLinkId('checkpoint-policy', target), ...target, checkpointPolicyId, createdAt: now, updatedAt: now }));
 
       const workflowStore = conversationWorkflowSelectionStore(paths);
       const workflowSelections = await loadStore(workflowStore);
@@ -966,6 +969,30 @@ export class VscodeConfigurationMutations {
     await this.clearScoped(runtimeContextStore(paths), runtimeContextLinkStore(paths), scope, (link) => link.runtimeContextId);
     await this.clearScoped(workEnvironmentPolicyStore(paths), workEnvironmentPolicyLinkStore(paths), scope, (link) => link.workEnvironmentPolicyId);
     await this.clearScoped(checkpointPolicyStore(paths), checkpointPolicyLinkStore(paths), scope, (link) => link.checkpointPolicyId);
+  }
+
+  /** Copies one scope's active record/link pair into an empty target scope as the target's own record. */
+  private async copyScoped<
+    TRecord extends { id: string },
+    TLink extends ScopeLinkBase,
+    TRecordKey extends string,
+    TLinkKey extends string
+  >(
+    recordStore: StoreSpec<TRecord, TRecordKey>,
+    linkStore: StoreSpec<TLink, TLinkKey>,
+    source: ScopeRef,
+    target: ScopeRef,
+    linkedRecordId: (link: TLink) => string,
+    buildLink: (source: TLink, recordId: string, now: number) => TLink
+  ): Promise<void> {
+    const [records, links] = await Promise.all([loadStore(recordStore), loadStore(linkStore)]);
+    const sourceLink = latest(links.filter((link) => scopeMatches(link, source)));
+    if (!sourceLink || links.some((link) => scopeMatches(link, target))) return;
+    const sourceRecord = records.find((record) => record.id === linkedRecordId(sourceLink));
+    if (!sourceRecord) throw new Error(`配置 Link ${sourceLink.id} 指向不存在的记录。`);
+    const recordId = scopeRecordId(recordStore.idPrefix, target);
+    await saveStore(recordStore, upsert(records, { ...plainClone(sourceRecord), id: recordId }));
+    await saveStore(linkStore, upsert(links, buildLink(plainClone(sourceLink), recordId, Date.now())));
   }
 
   private async setScoped<

@@ -301,14 +301,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (revision.message_id !== messageId) {
         throw new Error('Conversation fork command was replayed with a different source Message.');
       }
-      // The replayed branch target may be owned by a peer window; its configuration copy runs
-      // under the target ownership pin exactly like a fresh fork.
-      await this.product.application.database.conversationOwners.run(conversationId, () =>
-        this.product.configuration.mutations.copyConversationConfiguration(
-          sourceConversationId,
-          conversationId
-        )
-      );
+      // The configuration copy completed before the branch committed; the target's settings now
+      // belong to the user and a replay must not refill anything they changed or cleared.
       return { conversationId, deduplicated: true };
     }
 
@@ -499,6 +493,13 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     // retains it via claim-before-open; without a view the owner idle-releases after this run.
     const targetConversationId = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
     const result = await this.product.application.database.conversationOwners.run(targetConversationId, async () => {
+      // Conversation-layer settings are copied BEFORE the branch commits: once the branch exists
+      // it is immediately usable and replays never touch its settings again. An interrupted copy
+      // or fork is resumed by the same command, which only fills still-empty target settings.
+      await this.product.configuration.mutations.copyConversationConfiguration(
+        sourceConversationId,
+        targetConversationId
+      );
       const forkResult = await this.product.application.runtime.conversationFork.fork({
         idempotencyKey: commandId,
         reuseKey,
@@ -512,10 +513,6 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         targetTitle: `${await this.durableConversationTitle(sourceConversation)} 分支`,
         targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
       });
-      await this.product.configuration.mutations.copyConversationConfiguration(
-        sourceConversationId,
-        forkResult.targetConversationId
-      );
       await this.refreshConversationHistory();
       return forkResult;
     });

@@ -480,16 +480,25 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     assert.ok(forkModelLink);
     assert.notEqual(forkModelLink.modelProfileId, sourceModelLink.modelProfileId);
     assert.equal(snapshot.modelProfiles.find((record) => record.id === forkModelLink.modelProfileId)?.model, 'model:test');
+    const forkLinks = (links) => links.filter((link) => link.scopeKind === 'conversation' && link.scopeId === 'conversation:fork');
+    // Every Conversation-layer value the source owns becomes the fork's own copy.
+    for (const [links, field] of [
+      [snapshot.systemPromptScopeLinks, 'systemPromptId'],
+      [snapshot.runtimeContextScopeLinks, 'runtimeContextId'],
+      [snapshot.workEnvironmentPolicyScopeLinks, 'workEnvironmentPolicyId']
+    ]) {
+      const source = links.find((link) => link.scopeKind === 'conversation' && link.scopeId === 'conversation:test');
+      assert.equal(forkLinks(links).length, 1);
+      assert.notEqual(forkLinks(links)[0][field], source[field]);
+    }
+    // Layers the source only inherits from workflow/global scopes stay inherited on the fork.
     for (const links of [
       snapshot.planReviewPolicyScopeLinks,
       snapshot.toolPolicyScopeLinks,
       snapshot.skillPolicyScopeLinks,
-      snapshot.systemPromptScopeLinks,
-      snapshot.runtimeContextScopeLinks,
-      snapshot.workEnvironmentPolicyScopeLinks,
       snapshot.checkpointPolicyScopeLinks
     ]) {
-      assert.equal(links.some((link) => link.scopeKind === 'conversation' && link.scopeId === 'conversation:fork'), false);
+      assert.deepEqual(forkLinks(links), []);
     }
 
     const forkCompiled = await authority.compile({
@@ -502,6 +511,8 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     const forkPreset = JSON.parse(forkCompiled.executionPreset.content);
     assert.equal(forkFrozen.model.modelId, 'model:test');
     assert.equal(forkFrozen.planReviewPolicy.mode, 'before_mutation');
+    assert.match(forkFrozen.systemPrompt.text, /\[对话规则\]\nCONVERSATION$/);
+    assert.equal(forkFrozen.runtimeContext.template, 'ENV:\n{{$workEnvironment.current}}');
     assert.equal(forkPreset.defaultWorkEnvironmentId, workEnvironmentId);
 
     await authority.mutations.setModelProfile({

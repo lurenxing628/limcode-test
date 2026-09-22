@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import test, { after } from 'node:test';
@@ -9,8 +11,9 @@ const root = process.cwd();
 const require = createRequire(import.meta.url);
 const Module = require('node:module');
 const originalLoad = Module._load;
+const vscodeStub = createVscodeStub();
 Module._load = function load(request, parent, isMain) {
-  if (request === 'vscode') return { window: { async showWarningMessage() {} } };
+  if (request === 'vscode') return vscodeStub;
   return originalLoad.call(this, request, parent, isMain);
 };
 after(() => { Module._load = originalLoad; });
@@ -24,6 +27,13 @@ const { ReliableKernelWebviewFeedBridge } = require(path.join(
   root,
   'dist/extension/backend/reliableKernel/webviewFeedBridge.js'
 ));
+
+const { VscodeConfigurationAuthority } = require(path.join(
+  root,
+  'dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js'
+));
+const { createVscodeStoragePaths } = require(path.join(root, 'dist/extension/backend/capabilities/vscodeStorage/paths.js'));
+const { workEnvironmentIdFromUri } = require(path.join(root, 'dist/extension/shared/workEnvironmentCatalog.js'));
 
 const conversationSnapshot = (conversationId, name) => ({
   conversationId,
@@ -337,3 +347,105 @@ test('按会话投递只到达绑定该会话的面板，已断开的面板不�
     bridge.close();
   }
 });
+
+const SCOPED_CONVERSATION_LAYERS = [
+  ['modelProfiles', 'modelProfileScopeLinks', 'modelProfileId'],
+  ['planReviewPolicies', 'planReviewPolicyScopeLinks', 'planReviewPolicyId'],
+  ['toolPolicies', 'toolPolicyScopeLinks', 'toolPolicyId'],
+  ['skillPolicies', 'skillPolicyScopeLinks', 'skillPolicyId'],
+  ['systemPrompts', 'systemPromptScopeLinks', 'systemPromptId'],
+  ['runtimeContexts', 'runtimeContextScopeLinks', 'runtimeContextId'],
+  ['workEnvironmentPolicies', 'workEnvironmentPolicyScopeLinks', 'workEnvironmentPolicyId'],
+  ['checkpointPolicies', 'checkpointPolicyScopeLinks', 'checkpointPolicyId']
+];
+
+test('分支复制对话层全部设置，只填目标空位，全局与 Agent 层不变', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-fork-settings-'));
+  try {
+    const configuration = new VscodeConfigurationAuthority(() =>
+      createVscodeStoragePaths(vscodeStub.Uri.file(path.join(directory, 'configuration'))));
+    const mutations = configuration.mutations;
+    const folderPath = path.join(directory, 'workspace');
+    await fs.mkdir(folderPath);
+    const uri = vscodeStub.Uri.file(folderPath).toString();
+    const environmentId = workEnvironmentIdFromUri(uri);
+    await configuration.synchronizeWorkspaceFolders([{ uri, name: 'Fixture', rootPath: folderPath, index: 0 }]);
+    const source = { scopeKind: 'conversation', scopeId: 'source' };
+    await mutations.setModelProfile({ ...source, provider: 'openai', model: 'source-model' });
+    await mutations.setPlanReviewPolicy({ ...source, mode: 'before_mutation', requireForToolRiskLevels: ['write'] });
+    await mutations.setToolPolicy({
+      ...source, allowedTools: ['read', 'run_agent'],
+      toolConfigs: { run_agent: { config: { maxConcurrentAgents: 2 } } }
+    });
+    await mutations.setSkillPolicy({ ...source, name: 'Source skills' });
+    await mutations.setSystemPrompt({ ...source, text: 'source prompt' });
+    await mutations.setRuntimeContext({ ...source, template: 'source runtime context' });
+    await mutations.setWorkEnvironmentPolicy({
+      ...source, enabled: true, allowedWorkEnvironmentIds: [environmentId], defaultWorkEnvironmentId: environmentId
+    });
+    await mutations.setCheckpointPolicy({ ...source, enabled: false });
+    await mutations.selectConversationWorkflow({ conversationId: 'source', scopeKind: 'global' });
+    await mutations.selectConversationWorkEnvironment('source', environmentId);
+    await mutations.setSystemPrompt({ scopeKind: 'global', text: 'global prompt' });
+    await mutations.setToolPolicy({ scopeKind: 'agent', scopeId: 'agent-fixture', allowedTools: ['read'] });
+    // The target already owns one Conversation-layer value; the copy must never replace it.
+    await mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'target', text: 'target prompt' });
+    const before = await configuration.configurationClientState();
+
+    await mutations.copyConversationConfiguration('source', 'target');
+    await mutations.copyConversationConfiguration('source', 'target');
+    const after = await configuration.configurationClientState();
+
+    const conversationLinks = (state, key, scopeId) => state[key].filter(link =>
+      link.scopeKind === 'conversation' && link.scopeId === scopeId);
+    for (const [recordsKey, linksKey, recordField] of SCOPED_CONVERSATION_LAYERS) {
+      const [sourceLink] = conversationLinks(after, linksKey, 'source');
+      const targetLinks = conversationLinks(after, linksKey, 'target');
+      assert.equal(targetLinks.length, 1, `${linksKey} target owns exactly one Conversation-layer link`);
+      const sourceRecord = after[recordsKey].find(record => record.id === sourceLink[recordField]);
+      const targetRecord = after[recordsKey].find(record => record.id === targetLinks[0][recordField]);
+      assert.notEqual(targetRecord.id, sourceRecord.id, `${recordsKey} target edits must not change the source`);
+      if (recordsKey === 'systemPrompts') {
+        assert.equal(targetRecord.text, 'target prompt', 'an existing target value wins');
+        continue;
+      }
+      const { id: sourceId, ...sourceValue } = sourceRecord;
+      const { id: targetId, ...targetValue } = targetRecord;
+      assert.deepEqual(targetValue, sourceValue, `${recordsKey} is copied completely`);
+    }
+    const targetTools = after.toolPolicies.find(record =>
+      record.id === conversationLinks(after, 'toolPolicyScopeLinks', 'target')[0].toolPolicyId);
+    assert.deepEqual(targetTools.toolConfigs.run_agent, { config: { maxConcurrentAgents: 2 } });
+    assert.equal(after.conversationWorkflowSelections.filter(item => item.conversationId === 'target').length, 1);
+    assert.equal(after.conversationWorkflowSelections.find(item => item.conversationId === 'target').scopeKind, 'global');
+    assert.deepEqual(after.conversationWorkEnvironmentLinks
+      .filter(item => item.conversationId === 'target').map(item => item.workEnvironmentId), [environmentId]);
+
+    const outsideTarget = state => Object.fromEntries(SCOPED_CONVERSATION_LAYERS.flatMap(([recordsKey, linksKey, recordField]) => {
+      const links = state[linksKey].filter(link => !(link.scopeKind === 'conversation' && link.scopeId === 'target'));
+      const recordIds = new Set(links.map(link => link[recordField]));
+      return [[linksKey, links], [recordsKey, state[recordsKey].filter(record => recordIds.has(record.id))]];
+    }));
+    assert.deepEqual(outsideTarget(after), outsideTarget(before), 'source, global and Agent layers stay unchanged');
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+function createVscodeStub() {
+  class Uri {
+    constructor(fsPath) { this.scheme = 'file'; this.fsPath = path.resolve(fsPath); this.path = this.fsPath.split(path.sep).join('/'); }
+    static file(value) { return new Uri(value); }
+    static joinPath(base, ...parts) { return new Uri(path.join(base.fsPath, ...parts)); }
+    toString() { return `file://${this.path}`; }
+  }
+  const FileType = { Unknown: 0, File: 1, Directory: 2 };
+  return { Uri, FileType, window: { async showWarningMessage() {} }, workspace: { fs: {
+    async createDirectory(uri) { await fs.mkdir(uri.fsPath, { recursive: true }); },
+    async readFile(uri) { return fs.readFile(uri.fsPath); },
+    async writeFile(uri, bytes) { await fs.mkdir(path.dirname(uri.fsPath), { recursive: true }); await fs.writeFile(uri.fsPath, bytes); },
+    async readDirectory(uri) { return (await fs.readdir(uri.fsPath, { withFileTypes: true })).map(entry => [entry.name, entry.isDirectory() ? FileType.Directory : FileType.File]); },
+    async delete(uri) { await fs.rm(uri.fsPath, { recursive: true, force: true }); },
+    async stat(uri) { const stat = await fs.stat(uri.fsPath); return { type: stat.isDirectory() ? FileType.Directory : FileType.File, ctime: stat.ctimeMs, mtime: stat.mtimeMs, size: stat.size }; }
+  } } };
+}

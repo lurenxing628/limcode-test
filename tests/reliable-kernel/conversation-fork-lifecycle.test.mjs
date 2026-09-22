@@ -430,9 +430,10 @@ test('an early fork has no later source roots without target message provenance'
   });
 });
 
-test('configuration copy interrupted after model selection resumes the same target after reopen', async () => {
+test('interrupted configuration copy and fork commit resume the same fully configured target after reopen', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'copy-source-input');
+    await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'source', text: 'source prompt' });
     const command = await h.command('source', 'copy-failure');
     const store = load('backend/capabilities/vscodeStorage/recordStore.js');
     const save = store.saveRecordStore;
@@ -450,18 +451,43 @@ test('configuration copy interrupted after model selection resumes the same targ
       store.saveRecordStore = save;
     }
     assert.equal(injected, true);
-    const [branch] = await rows(h.app, 'ConversationBranchLink');
-    const target = branch.target_conversation_id;
+    assert.equal((await rows(h.app, 'Conversation')).length, 1, 'no branch commits before its settings are copied');
+    assert.deepEqual(await rows(h.app, 'ConversationBranchLink'), []);
     let config = await h.configuration.configurationClientState();
-    const modelLink = config.modelProfileScopeLinks.find(link => link.scopeId === target);
-    assert.ok(modelLink, 'model copy was durable before the environment copy failed');
+    const [modelLink] = config.modelProfileScopeLinks.filter(link => link.scopeKind === 'conversation' && link.scopeId !== 'source');
+    assert.ok(modelLink, 'settings copied before the failure stay durable');
+    const target = modelLink.scopeId;
     assert.equal(config.conversationWorkEnvironmentLinks.some(link => link.conversationId === target), false);
+
+    // Crash after the copy completed but before the fork transaction commits.
+    const database = h.app.database;
+    const transaction = database.transaction.bind(database);
+    let commitInjected = false;
+    database.transaction = async (steps, ...rest) => {
+      if (!commitInjected && steps.some(step => step.kind === 'insert' && step.domain === 'Conversation')) {
+        commitInjected = true;
+        throw new Error('injected fork commit failure');
+      }
+      return transaction(steps, ...rest);
+    };
+    try {
+      await assert.rejects(h.facade.forkConversation(command), /injected fork commit failure/);
+    } finally {
+      database.transaction = transaction;
+    }
+    assert.equal(commitInjected, true);
+    assert.equal((await rows(h.app, 'Conversation')).length, 1);
+    config = await h.configuration.configurationClientState();
+    assert.equal(config.conversationWorkEnvironmentLinks.find(link => link.conversationId === target)?.workEnvironmentId, h.environmentId);
+
     await h.reopen();
     const replay = await h.facade.forkConversation(command);
-    assert.deepEqual(replay, { conversationId: target, deduplicated: true });
+    assert.deepEqual(replay, { conversationId: target, deduplicated: false });
     config = await h.configuration.configurationClientState();
-    assert.equal(config.modelProfileScopeLinks.filter(link => link.scopeId === target).length, 1);
-    assert.equal(config.conversationWorkEnvironmentLinks.find(link => link.conversationId === target)?.workEnvironmentId, h.environmentId);
+    for (const key of ['modelProfileScopeLinks', 'systemPromptScopeLinks']) {
+      assert.equal(config[key].filter(link => link.scopeKind === 'conversation' && link.scopeId === target).length, 1, key);
+    }
+    assert.equal(config.conversationWorkEnvironmentLinks.filter(link => link.conversationId === target).length, 1);
     await h.turn(target, 'recovered-target-input');
     assert.equal((await rows(h.app, 'Conversation')).length, 2);
   });
@@ -470,11 +496,14 @@ test('configuration copy interrupted after model selection resumes the same targ
 test('lost fork result replays after a source revision change without overwriting target selections', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'revision-source-input');
+    await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'source', text: 'source prompt' });
     const command = await h.command('source', 'lost-result', 'user');
     const first = await h.facade.forkConversation(command);
     await h.configuration.mutations.selectConversationWorkflow({
       conversationId: first.conversationId, scopeKind: 'global'
     });
+    // The user resets the copied prompt on the branch; a replay must not refill the empty slot.
+    await h.configuration.mutations.clearSystemPrompt('conversation', first.conversationId);
     await h.app.turns.edit({
       source: { kind: 'command', key: 'edit-after-fork' }, conversationId: 'source',
       messageId: command.messageId, expectedRevisionId: command.expectedRevisionId,
@@ -484,6 +513,7 @@ test('lost fork result replays after a source revision change without overwritin
     assert.deepEqual(await h.facade.forkConversation(command), { ...first, deduplicated: true });
     const config = await h.configuration.configurationClientState();
     assert.equal(config.conversationWorkflowSelections.find(item => item.conversationId === first.conversationId)?.scopeKind, 'global');
+    assert.equal(config.systemPromptScopeLinks.some(link => link.scopeKind === 'conversation' && link.scopeId === first.conversationId), false);
     await assert.rejects(h.facade.forkConversation({ ...command, command: { commandId: 'new-stale-fork' } }), /Revision/);
     assert.equal((await rows(h.app, 'Conversation')).length, 2);
     await h.turn(first.conversationId, 'unchanged-fork-input');
