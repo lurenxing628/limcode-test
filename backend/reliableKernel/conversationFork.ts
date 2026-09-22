@@ -28,6 +28,7 @@ export interface ConversationForkCommand {
   sourceToolCallId?: string;
   expectedSourceHeadRootId?: string;
   targetConversationId?: string;
+  /** Initial display title only: the user may rename the target, so it is never fork identity. */
   targetTitle: string;
   targetAgentId: string;
 }
@@ -532,7 +533,6 @@ export class ConversationForkControlPlane {
       || reuse.conversation_id !== ids.targetConversationId
       || reuse.agent_id !== command.targetAgentId
       || conversation.id !== ids.targetConversationId
-      || conversation.title !== command.targetTitle
       || root.conversation_id !== ids.targetConversationId
       || head.conversation_id !== ids.targetConversationId
       || head.root_id !== ids.targetRootId
@@ -623,7 +623,6 @@ function forkIds(command: ResolvedForkCommand): ForkIds {
     command.sourceToolCallId ?? null,
     command.expectedSourceHeadRootId ?? null,
     command.targetConversationId ?? null,
-    command.targetTitle,
     command.targetAgentId
   ]);
   const targetConversationId = command.targetConversationId ?? stableId('conversation', scope);

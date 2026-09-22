@@ -312,7 +312,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       return { conversationId, deduplicated: true };
     }
 
-    await this.requireRow('Conversation', sourceConversationId);
+    const sourceConversation = await this.requireRow('Conversation', sourceConversationId);
     const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
     if (currentLinks.length !== 1) throw new Error('Fork 源 Message 缺少唯一当前 Revision。');
     const revisionId = requireText(currentLinks[0].revision_id, 'MessageCurrentRevisionLink.revision_id');
@@ -509,7 +509,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         expectedCurrentMessageRevisionId: revisionId,
         ...(sourceTurnIds.length === 1 ? { sourceTurnId: sourceTurnIds[0] } : {}),
         targetConversationId,
-        targetTitle: `${this.getConversationDisplayTitle(sourceConversationId)} 分支`,
+        targetTitle: `${await this.durableConversationTitle(sourceConversation)} 分支`,
         targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
       });
       await this.product.configuration.mutations.copyConversationConfiguration(
@@ -1165,6 +1165,41 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     if (activeFolder) return activeFolder;
     const folders = vscode.workspace.workspaceFolders ?? [];
     return folders.length === 1 ? folders[0] : undefined;
+  }
+
+  /**
+   * The title a Conversation displays, read from committed facts rather than the sidebar cache:
+   * its stored title, or for a placeholder title its first user message (as the history list does).
+   */
+  private async durableConversationTitle(conversation: DomainRow): Promise<string> {
+    const id = requireText(conversation.id, 'Conversation.id');
+    const title = typeof conversation.title === 'string' ? conversation.title : '';
+    const explicit = displayConversationTitle({ id, title });
+    if (explicit !== DEFAULT_CONVERSATION_TITLE) return explicit;
+    const memberships = requireRows((await this.product.application.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+        where: { conversation_id: id },
+        orderBy: { column: 'message_seq', direction: 'asc' },
+        limit: 16
+      })
+    ])).snapshot[0], 'MessagePartOfConversation title lookup');
+    for (const membership of memberships) {
+      const messageId = requireText(membership.message_id, 'MessagePartOfConversation.message_id');
+      const [message, current] = await Promise.all([
+        this.requireRow('Message', messageId),
+        this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2)
+      ]);
+      if (message.deleted_at !== null || current.length !== 1) continue;
+      const revision = await this.requireRow('MessageRevision', requireText(current[0].revision_id, 'MessageCurrentRevisionLink.revision_id'));
+      if (revision.role !== 'user') continue;
+      const metadata = await this.requireRow('ContentObject', requireText(revision.content_object_id, 'MessageRevision.content_object_id'));
+      const content = conversationHistoryTitleContentFromBytes(
+        await this.product.application.contentStore.read(metadata as unknown as ContentObjectMetadata),
+        String(metadata.content_type)
+      );
+      if (content) return displayConversationTitle({ id, title, messages: [{ role: 'user', content }] });
+    }
+    return explicit;
   }
 
   private async maybeRow(domain: string, id: string): Promise<DomainRow | null> {

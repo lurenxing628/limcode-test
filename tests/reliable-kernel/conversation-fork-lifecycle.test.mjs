@@ -373,6 +373,37 @@ test('a copied failed turn keeps its termination and its failed request stays re
   }, { failRequests: [2] });
 });
 
+test('fork titles come from committed facts and never take part in fork identity', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'first user words name untitled conversations');
+    const command = await h.command('source', 'titled-fork');
+    const fork = await h.facade.forkConversation(command);
+    const title = async id => (await rows(h.app, 'Conversation', { id }))[0].title;
+    assert.equal(await title(fork.conversationId), 'Source fixture 分支', 'the durable source title, not the sidebar cache');
+    assert.equal(await h.facade.renameConversationTitle(fork.conversationId, 'Renamed fork'), true);
+    assert.equal(await h.facade.renameConversationTitle('source', 'Renamed source'), true);
+    assert.deepEqual(await h.facade.forkConversation(command), { conversationId: fork.conversationId, deduplicated: true });
+    assert.equal(await title(fork.conversationId), 'Renamed fork');
+
+    const rootId = await h.app.context.currentHeadRootId('source');
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: 'source', role: 'default' });
+    const direct = { idempotencyKey: 'direct-titled-fork', reuseKey: 'direct-titled-fork', sourceConversationId: 'source',
+      sourceContextRootId: rootId, targetAgentId: agent.agent_id };
+    const first = await h.app.runtime.conversationFork.fork({ ...direct, targetTitle: 'Initial direct title' });
+    await h.facade.renameConversationTitle(first.targetConversationId, 'User renamed direct fork');
+    const replay = await h.app.runtime.conversationFork.fork({ ...direct, targetTitle: 'A different computed title' });
+    assert.equal(replay.deduplicated, true);
+    assert.equal(replay.targetConversationId, first.targetConversationId);
+
+    assert.equal(await h.facade.renameConversationTitle('source', '新对话'), true);
+    const untitled = await h.facade.forkConversation(await h.command('source', 'untitled-source-fork'));
+    const { displayConversationTitleFromText } = load('shared/conversationTitle.js');
+    assert.equal(await title(untitled.conversationId),
+      `${displayConversationTitleFromText('first user words name untitled conversations')} 分支`,
+      'a placeholder source title is displayed from its first user message');
+  });
+});
+
 test('an early fork has no later source roots without target message provenance', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'first-source-input');
