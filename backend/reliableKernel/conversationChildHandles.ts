@@ -63,6 +63,30 @@ export async function readConversationChildHandles(
   return [];
 }
 
+/** A fork target keeps exactly one ConversationBranchLink, even after its source is deleted. */
+export async function isForkConversation(database: RuntimeDatabase, conversationId: string): Promise<boolean> {
+  const snapshot = await database.snapshot([DOMAIN_REPOSITORIES.domain('ConversationBranchLink').list({
+    where: { target_conversation_id: conversationId },
+    limit: 1
+  })]);
+  const rows = snapshot.snapshot[0];
+  return Array.isArray(rows) && rows.length === 1;
+}
+
+/**
+ * A fork copies history that mentions its source's children but never their ChildExecution parent
+ * relation. In a fork, every child ref of the persistent catalog that is not one of its own child
+ * tasks was inherited: it stays addressable in the copied history and is never operable here.
+ */
+export function forkInheritedChildTargets(
+  childHandles: readonly ModelHandleEntry[],
+  ownChildTargets: ReadonlySet<string>
+): string[] {
+  return childHandles
+    .filter((entry) => entry.kind === 'child' && !ownChildTargets.has(entry.target))
+    .map((entry) => entry.target);
+}
+
 export const NATIVE_CHILD_HANDLE_PROJECTION_EVENT = 'native_child_handle_projection';
 const NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE = 'application/vnd.limcode.native-child-handle-projection+json';
 

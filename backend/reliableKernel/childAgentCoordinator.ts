@@ -58,6 +58,7 @@ import {
 import { requireChildExecutionStatus } from './childExecutionState';
 import { childThinkingInheritanceFromAuthority, childThinkingOverrideForSpawn } from './childThinkingInheritance';
 import { childAgentDepthForTurn } from './childAgentDepth';
+import { forkInheritedChildTargets, isForkConversation } from './conversationChildHandles';
 
 export interface ReliableChildAgentSelection {
   agentId: string;
@@ -1393,7 +1394,7 @@ export class ReliableChildAgentCoordinator {
         ...(cursor ? { cursor } : {}) });
       return this.settleOwnTool(input.toolCallId, { ...result, operation }, `run-agent-list:${input.toolCallId}`);
     }
-    const task = scopedChildTask(projection, requireText(args.answerBridgeId, 'run_agent.answerBridgeId'), scope);
+    const task = await this.requireScopedChildTask(projection, requireText(args.answerBridgeId, 'run_agent.answerBridgeId'), scope);
     const result = readConversationChildTask(projection, { childExecutionId: task.childExecutionId, scope, limit,
       ...(cursor ? { cursor } : {}) });
     return this.settleOwnTool(input.toolCallId, { ...result, operation }, `run-agent-read:${input.toolCallId}`);
@@ -1407,7 +1408,7 @@ export class ReliableChildAgentCoordinator {
     const bridgeIds = childTaskWaitReferences(args);
     const read = async () => {
       const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
-      return bridgeIds.map(id => scopedChildTask(projection, id, scope));
+      return Promise.all(bridgeIds.map(id => this.requireScopedChildTask(projection, id, scope)));
     };
     const initial = await read();
     const initialRevisions = initial.map(task => task.revision).join('\n');
@@ -1434,8 +1435,23 @@ export class ReliableChildAgentCoordinator {
     answerBridgeId: string, scope: 'direct' | 'tree' = 'direct'): Promise<ChildExecutionSnapshot> {
     const conversationId = await this.conversationForCaller(input);
     const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
-    const task = scopedChildTask(projection, answerBridgeId, scope);
+    const task = await this.requireScopedChildTask(projection, answerBridgeId, scope);
     return this.dependencies.children.readExecutionSnapshot(task.childExecutionId);
+  }
+
+  private async requireScopedChildTask(projection: ConversationChildTaskProjection, bridgeId: string,
+    scope: 'direct' | 'tree'): Promise<ConversationChildTaskRecord> {
+    const task = scopedChildTask(projection, bridgeId, scope);
+    if (task) return task;
+    if (await isForkConversation(this.dependencies.database, projection.conversationId)) {
+      const handles = await this.dependencies.children.readConversationChildHandles(projection.conversationId);
+      const own = new Set(projection.tasks.map(item => item.answerBridgeId));
+      if (forkInheritedChildTargets(handles, own).includes(bridgeId)) {
+        throw new Error(`子 Agent ${bridgeId} 属于分支来源对话：本分支只从复制的历史中继承了它的引用，没有继承父子关系，`
+          + '因此不能在这里读取、等待、续聊或中断它；需要时请在来源对话中操作，或在本对话新建子 Agent。');
+      }
+    }
+    throw new Error(`Child task ${bridgeId} is outside the caller's ${scope} parent lineage or does not exist.`);
   }
 
   private async spawnChild(
@@ -2425,11 +2441,11 @@ function boundedChildTaskInteger(value: PlainJsonValue | undefined, name: string
 }
 
 function scopedChildTask(projection: ConversationChildTaskProjection, bridgeId: string,
-  scope: 'direct' | 'tree'): ConversationChildTaskRecord {
+  scope: 'direct' | 'tree'): ConversationChildTaskRecord | undefined {
   const tasks = projection.tasks.filter(task => task.answerBridgeId === bridgeId);
   if (tasks.length !== 1 || tasks[0].depth < 1
     || (scope === 'direct' && (tasks[0].depth !== 1 || tasks[0].parentConversationId !== projection.conversationId))) {
-    throw new Error(`Child task ${bridgeId} is outside the caller's ${scope} parent lineage or does not exist.`);
+    return undefined;
   }
   return tasks[0];
 }

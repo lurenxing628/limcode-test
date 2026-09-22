@@ -8,6 +8,7 @@ import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { normalizeChildForkTurns, prepareChildContextFork, type ChildForkTurns } from './childContextFork';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { readConversationChildHandles } from './conversationChildHandles';
 import { prepareCollaborationCapacity, CollaborationMembershipChangedError } from './collaborationCapacity';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
@@ -337,6 +338,12 @@ export class ChildExecutionControlPlane {
   /** Model-facing task observations are reconstructed from committed lineage and source facts. */
   public readConversationTaskProjection(conversationId: string) {
     return readConversationChildTaskProjection(this.database, this.contentStore,
+      requirePhaseFId(conversationId, 'conversationId'));
+  }
+
+  /** Persistent child references frozen in the Conversation's request history, including a fork's copies. */
+  public readConversationChildHandles(conversationId: string) {
+    return readConversationChildHandles(this.database, this.contentStore,
       requirePhaseFId(conversationId, 'conversationId'));
   }
 

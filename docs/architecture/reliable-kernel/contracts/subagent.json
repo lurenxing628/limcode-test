@@ -80,7 +80,7 @@
     "freeze": "每个新 ModelRequest 将快照冻结到 recipe 与模型尾部；同 request retry 复用冻结快照，后续请求及压缩后请求重新投影。",
     "cardLimit": 32,
     "counts": "计数覆盖完整查询作用域；状态卡和列表详情的截断必须显式报告，不能用当前页长度代替成员总数。",
-    "handles": "普通与压缩请求共用持久 recipe 映射恢复；旧 childRef 永不重分配。历史引用仅供辨认，操作权由当前父链验证，Fork 不继承源会话成员权限。",
+    "handles": "普通与压缩请求共用持久 recipe 映射恢复；旧 childRef 永不重分配。历史引用仅供辨认，操作权由当前父链验证，Fork 不继承源会话成员权限；Fork 状态卡以 {inheritedChildRefs, operable:false} 列出这些继承引用，对其操作时明确报告属于分支来源对话。",
     "hostBoundary": "读取共享 Runtime 已提交事实，不从本 Host Promise 集合推导成员；操作继续遵守 Conversation ownership 和 ExecutionLease。",
     "compressionSummary": "逐条保留派发 identity；不同工具调用和不同子结果不得因通用冒号标签相同而互相覆盖。",
     "nativeHandles": "native_child_handle_projection ToolCallEvent 在发送前冻结工具输出与累计 childHandles；同请求后续调用和恢复读取该事实，普通/压缩继承映射，wire 不发送内部 metadata。",

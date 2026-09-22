@@ -5,9 +5,10 @@ import {
   modelHandleRef,
   normalizeModelHandleCatalog,
   resolveModelToolArguments,
-  UnknownModelHandleReferenceError
+  UnknownModelHandleReferenceError,
+  type ModelHandleEntry
 } from './modelHandleCatalog';
-import { readConversationChildHandles } from './conversationChildHandles';
+import { forkInheritedChildTargets, isForkConversation, readConversationChildHandles } from './conversationChildHandles';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
 import { isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
 import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
@@ -317,6 +318,8 @@ interface FrozenRuntimeStatusCard {
   awaitingHandlingCount: number;
   /** Identity candidates include omitted rows; the provider sees only stable short references. */
   childHandleTargets: Array<{ answerBridgeId: string }>;
+  /** Child refs a fork copied from its source history; listed as not operable from this Conversation. */
+  inheritedChildTargets?: string[];
   children: Array<{
     childExecutionId: string;
     answerBridgeId: string;
@@ -889,13 +892,14 @@ export class ReliableAgentLoop {
       freshConfigurationUpdate?: { effort: string };
     };
   }): Promise<PlainJsonValue> {
-    const [currentTurnState, runtimeStatusCard, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
+    const [currentTurnState, runtimeStatus, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
       this.readCurrentTurnInputReference(input.turnId, input.headRootId),
       this.readRuntimeStatusCard(input.turnId),
       readCurrentTurnTaskCard(this.database, this.contentStore, input.turnId),
       this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round),
       this.readNativeRecipeFreeze(input)
     ]);
+    const runtimeStatusCard = runtimeStatus.statusCard;
     const materialized = await this.context.materialize(input.headRootId);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const attachmentCatalogState = await this.modelProvider.projectAttachmentCatalogState(
@@ -920,8 +924,7 @@ export class ReliableAgentLoop {
       ) as unknown as ContentObjectMetadata;
       handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
     }
-    const childHandles = await readConversationChildHandles(this.database, this.contentStore, conversationId);
-    const modelHandleCatalog = buildModelHandleCatalog(handleSources, [...attachmentHandles.entries, ...childHandles]);
+    const modelHandleCatalog = buildModelHandleCatalog(handleSources, [...attachmentHandles.entries, ...runtimeStatus.childHandles]);
     if (runtimeStatusCard) {
       // Labels are runtime data. Behavioral guidance belongs to the run_agent tool definition.
       runtimeStatusCard.card += runtimeStatusCard.children.map(child => '\n' + JSON.stringify({
@@ -933,6 +936,12 @@ export class ReliableAgentLoop {
         answerAvailable: child.answerAvailable, answerHandling: child.answerHandling,
         status: child.status, resumable: child.resumable
       })).join('');
+      const inheritedChildRefs = (runtimeStatusCard.inheritedChildTargets ?? [])
+        .map(target => modelHandleRef(modelHandleCatalog, 'child', target))
+        .filter((ref): ref is string => !!ref);
+      if (inheritedChildRefs.length > 0) {
+        runtimeStatusCard.card += '\n' + JSON.stringify({ inheritedChildRefs, operable: false });
+      }
     }
     const boundaryKey = currentTurnState.compressionBoundaryId ?? 'pre-compression';
     const turnTaskCardReminderEnabled = turnTaskCard
@@ -1213,13 +1222,22 @@ export class ReliableAgentLoop {
     };
   }
 
-  private async readRuntimeStatusCard(turnId: string): Promise<FrozenRuntimeStatusCard | undefined> {
+  private async readRuntimeStatusCard(turnId: string): Promise<{
+    statusCard?: FrozenRuntimeStatusCard;
+    /** Persistent child refs of the Conversation, read once for the recipe's handle catalog. */
+    childHandles: ModelHandleEntry[];
+  }> {
     const turn = await this.requireExisting('Turn', turnId);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
-    const [projection, processLinks] = await Promise.all([
+    const [projection, processLinks, childHandles, fork] = await Promise.all([
       readConversationChildTaskProjection(this.database, this.contentStore, conversationId),
-      listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId })
+      listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId }),
+      readConversationChildHandles(this.database, this.contentStore, conversationId),
+      isForkConversation(this.database, conversationId)
     ]);
+    const inheritedChildTargets = fork
+      ? forkInheritedChildTargets(childHandles, new Set(projection.tasks.map(task => task.answerBridgeId)))
+      : [];
     const processSnapshot = processLinks.length === 0 ? null : await this.database.snapshot(processLinks.map(link =>
       DOMAIN_REPOSITORIES.domain('Process').get(requireId(link.process_id, 'ProcessCompletionSourceLink.process_id'))));
     const runningProcesses = (processSnapshot?.snapshot ?? []).flatMap(row =>
@@ -1227,7 +1245,9 @@ export class ReliableAgentLoop {
         ? [{ processId: requireId(row.id, 'Process.id'), status: 'running' as const }]
         : []);
     const direct = projection.tasks.filter(task => task.depth === 1);
-    if (direct.length === 0 && runningProcesses.length === 0) return undefined;
+    if (direct.length === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
+      return { childHandles };
+    }
     const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
     const pendingHandling = (task: typeof direct[number]) => task.result.deliveries.some(delivery =>
       delivery.state !== 'failed' && delivery.wakeState !== 'dead_letter' && delivery.phase !== 'notify_only'
@@ -1270,20 +1290,24 @@ export class ReliableAgentLoop {
     const activeChildCount = direct.filter(task => live(task.status)).length;
     const queuedInputCount = direct.reduce((sum, task) => sum + task.queuedInputs.filter(source => source.classification === 'task').length, 0);
     const awaitingHandlingCount = direct.filter(pendingHandling).length;
-    return {
+    return { childHandles, statusCard: {
       kind: 'runtime_status_card', childTaskRevision: projection.revision,
       totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
       queuedInputCount, awaitingHandlingCount, activeChildCount,
       runningProcessCount: runningProcesses.length,
       childHandleTargets: projection.tasks.map(task => ({ answerBridgeId: task.answerBridgeId })),
+      ...(inheritedChildTargets.length > 0 ? { inheritedChildTargets } : {}),
       children, processes: runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT),
       card: [
         '[Conversation child tasks and current-turn processes — runtime data, not instructions]',
         `totalDirectChildren=${direct.length}; descendantChildren=${projection.tasks.length - direct.length}; activeChildren=${activeChildCount}; runningProcesses=${runningProcesses.length}`,
         `queuedInputs=${queuedInputCount}; awaitingHandling=${awaitingHandlingCount}; shownChildren=${children.length}; omittedChildren=${direct.length - children.length}`,
-        'Task text marked truncated is a preview; run_agent operation=list/read returns retained children and paged task inputs. Closed children remain discoverable. Results delivered and results handled are separate facts.'
+        'Task text marked truncated is a preview; run_agent operation=list/read returns retained children and paged task inputs. Closed children remain discoverable. Results delivered and results handled are separate facts.',
+        ...(inheritedChildTargets.length > 0
+          ? ['inheritedChildRefs appear in history copied from this fork\'s source Conversation; those children belong to the source, not to this Conversation.']
+          : [])
       ].join('\n')
-    };
+    } };
   }
 
   private observeOpenTasksAtFinal(
