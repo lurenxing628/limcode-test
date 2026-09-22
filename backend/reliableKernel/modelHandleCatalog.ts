@@ -223,7 +223,30 @@ export function resolveModelToolArguments(
     replaceRef(record, 'processRef', 'processId', 'process', catalog);
     replaceRef(record, 'cursor', 'outputHandle', 'cursor', catalog);
   } else if (toolName === 'run_agent' || toolName === 'read_agent_answer' || toolName === 'submit_agent_answer') {
+    if ('childRef' in record) {
+      const ref = optionalText(record.childRef);
+      const target = ref ? modelHandleTarget(catalog, 'child', ref) : undefined;
+      if (!target || ('answerBridgeId' in record && record.answerBridgeId !== target)) {
+        throw new UnknownModelHandleReferenceError('child', ref ?? '(invalid childRef)');
+      }
+    }
     replaceRef(record, 'childRef', 'answerBridgeId', 'child', catalog);
+    if ('childRefs' in record) {
+      if (!Array.isArray(record.childRefs) || record.childRefs.length === 0 || record.childRefs.length > 32) {
+        throw new UnknownModelHandleReferenceError('child', '(invalid childRefs)');
+      }
+      const targets = record.childRefs.map((value) => {
+        const ref = optionalText(value);
+        const target = ref ? modelHandleTarget(catalog, 'child', ref) : undefined;
+        if (!target) throw new UnknownModelHandleReferenceError('child', ref ?? '(invalid childRef)');
+        return target;
+      });
+      if ('answerBridgeIds' in record && JSON.stringify(record.answerBridgeIds) !== JSON.stringify(targets)) {
+        throw new UnknownModelHandleReferenceError('child', '(conflicting childRefs)');
+      }
+      delete record.childRefs;
+      record.answerBridgeIds = targets;
+    }
   } else if (toolName === 'switch_work_environment') {
     replaceRef(record, 'workEnvironmentRef', 'workEnvironmentId', 'workEnvironment', catalog);
   } else if (toolName === 'transfer_files' && Array.isArray(record.transfers)) {
@@ -277,6 +300,14 @@ function projectKnownValue(value: unknown, catalog: ModelHandleCatalog): unknown
     if (key === 'answerBridgeId' && typeof child === 'string') {
       const ref = modelHandleRef(catalog, 'child', child);
       if (ref) output.childRef = ref;
+      continue;
+    }
+    if (key === 'answerBridgeIds' && Array.isArray(child)) {
+      output.childRefs = child.map((target) => {
+        const ref = modelHandleRef(catalog, 'child', target);
+        if (!ref) throw new UnknownModelHandleReferenceError('child', '(unmapped child result)');
+        return ref;
+      });
       continue;
     }
     if (key === 'workEnvironmentId' && typeof child === 'string') {
@@ -337,6 +368,9 @@ function collectCandidates(
   }
   pushTextCandidate(output, 'process', record.processId);
   pushTextCandidate(output, 'child', record.answerBridgeId);
+  if (Array.isArray(record.answerBridgeIds)) {
+    for (const target of record.answerBridgeIds) pushTextCandidate(output, 'child', target);
+  }
   pushTextCandidate(output, 'workEnvironment', record.workEnvironmentId);
   for (const key of ['nextOutputHandle', 'outputHandle']) {
     const handle = optionalText(record[key]);

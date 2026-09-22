@@ -266,6 +266,8 @@ export interface TurnRuntimeMaintenanceDescriptorV2 {
   compressSegmentCount: number;
   /** Exact UI boundary frozen before the maintenance Turn is admitted. */
   target: CompressionCommandTarget;
+  /** Explicit full-history regeneration, frozen as part of the command replay identity. */
+  sourceReplay?: 'immutable_provenance';
   /** Stable initiating source identity, used only to locate an exact command replay. */
   commandSourceKey: string;
 }
@@ -3656,6 +3658,13 @@ function normalizeRuntimeMaintenance(
     throw new TypeError('runtime maintenance compressSegmentCount must be a positive safe integer.');
   }
   const commandSourceKey = requireText(input.commandSourceKey, 'runtime maintenance commandSourceKey');
+  const sourceReplay = (input as { sourceReplay?: unknown }).sourceReplay;
+  if (sourceReplay !== undefined && sourceReplay !== 'immutable_provenance') {
+    throw new TypeError('runtime maintenance sourceReplay is invalid.');
+  }
+  if (sourceReplay && (input.version !== 2 || input.target?.kind !== 'current_head')) {
+    throw new TypeError('Immutable provenance rebuild requires the complete frozen current context.');
+  }
   if (input.version === 1) {
     return {
       kind: 'manual_context_compression',
@@ -3669,6 +3678,7 @@ function normalizeRuntimeMaintenance(
     version: 2,
     compressSegmentCount: input.compressSegmentCount,
     target: normalizeCompressionTarget(input.target),
+    ...(sourceReplay ? { sourceReplay } : {}),
     commandSourceKey
   };
 }

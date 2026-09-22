@@ -763,9 +763,20 @@ export class ModelProviderControlPlane {
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
+    if (isRecord(recipe) && recipe.sourceReplay !== undefined
+      && recipe.sourceReplay !== 'immutable_provenance') {
+      throw new TypeError('Unsupported compression source replay policy.');
+    }
+    const sourceReplay = isRecord(recipe) && recipe.sourceReplay === 'immutable_provenance'
+      ? 'immutable_provenance' as const
+      : undefined;
+    if (sourceReplay && (!compressionPolicy || !isRecord(recipe) || recipe.trigger !== 'manual')) {
+      throw new TypeError('Immutable compression source replay requires an explicit manual compression request.');
+    }
     const compressionSourceContext = compressionPolicy && isRecord(recipe)
-      && recipe.compressionMethodKind !== 'provider_native'
-      ? await expandTextCompressionSources(this.database, this.contentStore, providerContext)
+      && (recipe.compressionMethodKind !== 'provider_native' || sourceReplay)
+      ? await expandTextCompressionSources(this.database, this.contentStore, providerContext,
+          sourceReplay ? { sourceReplay } : {})
       : undefined;
     assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,

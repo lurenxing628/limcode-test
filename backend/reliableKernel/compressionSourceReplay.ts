@@ -8,15 +8,20 @@ const MAX_REPLAY_BYTES = 64 * 1024 * 1024;
 const MAX_REPLAY_DEPTH = 64;
 
 /** Text-summary fallbacks cannot summarize an encrypted or signed native state as if it were text.
- * Expand only those states through immutable CompressionBlockSource provenance. The canonical
- * transcript, current head and native window are never modified. Missing/cyclic provenance fails
- * closed rather than producing a successful but empty replacement summary. */
+ * Normally only those states are expanded through immutable CompressionBlockSource provenance.
+ * Explicit manual reconstruction expands text summaries too, discarding their possibly incorrect
+ * aliases instead of guessing replacements. This read never mutates history; missing/cyclic
+ * provenance fails closed rather than producing a successful but empty replacement summary. */
 export async function expandTextCompressionSources(
   database: RuntimeDatabase,
   store: ContentAddressedStore,
-  input: readonly FullProviderContextItem[]
+  input: readonly FullProviderContextItem[],
+  options: { sourceReplay?: 'immutable_provenance' } = {}
 ): Promise<FullProviderContextItem[]> {
-  if (!input.some(isNativeState)) return [...input];
+  const shouldExpand = (item: FullProviderContextItem) => options.sourceReplay === 'immutable_provenance'
+    ? item.segmentKind === 'compression'
+    : isNativeState(item);
+  if (!input.some(shouldExpand)) return [...input];
   const output: FullProviderContextItem[] = [];
   const cache = new Map<string, FullProviderContextItem>();
   let visits = 0;
@@ -27,7 +32,7 @@ export async function expandTextCompressionSources(
     if (++visits > MAX_REPLAY_SEGMENTS) throw invalid('原生压缩来源超过重建数量上限。');
     bytes += Buffer.byteLength(item.content, 'utf8');
     if (bytes > MAX_REPLAY_BYTES) throw invalid('原生压缩来源超过重建字节上限。');
-    if (!isNativeState(item)) { output.push(item); continue; }
+    if (!shouldExpand(item)) { output.push(item); continue; }
     if (ancestors.length >= MAX_REPLAY_DEPTH || ancestors.includes(item.segmentId)) {
       throw invalid('原生压缩来源存在循环或超过重建深度。');
     }
@@ -39,6 +44,10 @@ export async function expandTextCompressionSources(
     const sources = rows(sourceSnapshot.snapshot[0]);
     if (sources.length !== 1) throw invalid('原生压缩状态缺少唯一的历史来源。');
     const blockId = id(sources[0].source_id);
+    const block = await get(database, 'CompressionBlock', blockId);
+    if (block.summary_object_id !== (await get(database, 'ContextSegment', item.segmentId)).content_object_id) {
+      throw invalid('压缩摘要与不可变来源的内容身份不一致。');
+    }
     const originals = (await database.snapshotAll(DOMAIN_REPOSITORIES.domain('CompressionBlockSource').list({
       where: { compression_block_id: blockId }, orderBy: { column: 'id', direction: 'asc' }, limit: 1000
     }))).snapshot.sort((left, right) => {

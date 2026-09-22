@@ -1078,7 +1078,8 @@ function compressionContext(
     current = [];
   };
   const recipe = requireRecord(request.recipe, 'Compression recipe');
-  const sourceContext = methodKind !== 'provider_native' && request.compressionSourceContext
+  const sourceContext = request.compressionSourceContext
+    && (methodKind !== 'provider_native' || recipe.sourceReplay === 'immutable_provenance')
     ? request.compressionSourceContext
     : request.context.slice(0, typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length);
   const attachmentCatalogState = normalizeAttachmentCatalogState(
@@ -1093,6 +1094,15 @@ function compressionContext(
     sourceContext.map((item) => item.content),
     seededHandleCatalog.entries
   );
+  // The coordinator freezes the complete ordinary identity map. Discovering a new child here
+  // means that history/recipe provenance is missing, not permission to reuse A1 in this prefix.
+  for (const entry of modelHandleCatalog.entries) {
+    if (entry.kind === 'child' && modelHandleRef(seededHandleCatalog, 'child', entry.target) !== entry.ref) {
+      throw Object.assign(new Error(`Compression source child ${entry.target} has no frozen reference.`), {
+        code: 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT'
+      });
+    }
+  }
   const requestedCount = recipe.sourceSegmentCount;
   if (!Number.isSafeInteger(requestedCount) || (requestedCount as number) <= 0
     || (requestedCount as number) > request.context.length) {
@@ -1592,6 +1602,7 @@ function modelFacingToolsForHandleCatalog(
       renameSchemaProperty(parameters, 'processId', 'processRef');
       renameSchemaProperty(parameters, 'outputHandle', 'cursor');
     } else if (tool.name === 'run_agent' || tool.name === 'read_agent_answer' || tool.name === 'submit_agent_answer') {
+      renameSchemaProperty(parameters, 'answerBridgeIds', 'childRefs');
       renameSchemaProperty(parameters, 'answerBridgeId', 'childRef');
       if (tool.name === 'run_agent') {
         const properties = asRecord(parameters.properties);
@@ -1638,6 +1649,7 @@ function modelFacingHandleText(value: string, catalog: ModelHandleCatalog): stri
     ['attachmentId', 'attachmentRef'],
     ['processId', 'processRef'],
     ['outputHandle', 'cursor'],
+    ['answerBridgeIds', 'childRefs'],
     ['answerBridgeId', 'childRef'],
     ['workEnvironmentId', 'workEnvironmentRef']
   ] as const) text = text.split(from).join(to);

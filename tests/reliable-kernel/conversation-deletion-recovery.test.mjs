@@ -129,7 +129,7 @@ test('recovery interruption 兼容旧动态 reason，普通命令仍拒绝不同
       toolCallId: 'tool-replay',
       turnId: 'parent-turn',
       toolName: 'run_agent',
-      arguments: {}
+      arguments: { operation: 'spawn', taskName: 'Inspect interruption recovery', prompt: 'Check interruption replay behavior' }
     });
     const childExecutionId = 'child-execution-replay';
     const sourceKey = kernel.childInterruptionRecoverySourceKey(childExecutionId);

@@ -2597,6 +2597,8 @@ export interface CompressionStartPayload {
   conversationId: string;
   command: ConversationCommandMetadata;
   target: CompressionCommandTarget;
+  /** Explicitly regenerate the complete current summary from immutable original sources. */
+  sourceReplay?: 'immutable_provenance';
 }
 
 export interface CompressionCommandResultPayload {

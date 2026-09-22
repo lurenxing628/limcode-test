@@ -420,9 +420,12 @@ test('LLM capability adapter 只向模型暴露 P/O/A/W 短引用 schema', async
       parameters: {
         type: 'object',
         properties: {
+          operation: { type: 'string', enum: ['send'] },
+          prompt: { type: 'string' },
           answerBridgeId: { type: 'string' },
           agent: { type: 'object', properties: { id: { type: 'string' }, type: { type: 'string' } } }
-        }
+        },
+        required: ['operation', 'answerBridgeId', 'prompt']
       }
     },
     {
@@ -451,6 +454,8 @@ test('LLM capability adapter 只向模型暴露 P/O/A/W 短引用 schema', async
   assert.equal(tools.get('bash').parameters.properties.processId, undefined);
   assert.equal(tools.get('bash').parameters.properties.outputHandle, undefined);
   assert.ok(tools.get('run_agent').parameters.properties.childRef);
+  assert.deepEqual(tools.get('run_agent').parameters.properties.operation.enum, ['send']);
+  assert.deepEqual(tools.get('run_agent').parameters.required, ['operation', 'childRef', 'prompt']);
   assert.equal(tools.get('run_agent').parameters.properties.agent.properties.id, undefined);
   assert.ok(tools.get('switch_work_environment').parameters.properties.workEnvironmentRef);
   const encoded = JSON.stringify(captured.tools);
@@ -903,6 +908,9 @@ test('LLM capability adapter 的原生 Compact 强制接收完整冻结窗口并
   const fullRequest = compressionRequest('provider_native', [
     opaque, user, backendCommandCall, backendCommandResult, childDelivery
   ]);
+  fullRequest.recipe.modelHandleCatalog = {
+    entries: [{ kind: 'child', ref: 'A1', target: 'answer-bridge-native' }]
+  };
   await adapter.sendFullRequest(fullRequest, {
     onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
   });
@@ -918,6 +926,7 @@ test('LLM capability adapter 的原生 Compact 强制接收完整冻结窗口并
   assert.equal(nativeResponses[0].id, 'provider-backend-command');
   assert.deepEqual(nativeResponses[0].functionResponse.response, { exitCode: 0, stdout: 'passed' });
   assert.match(captured.contents.at(-1).parts[0].text, /^\[Runtime delivery:/);
+  assert.match(captured.contents.at(-1).parts[0].text, /"childRef":"A1"/);
   assert.match(captured.contents.at(-1).parts[0].text, /visible child answer/);
   assert.equal(captured.priorSummaryContents, undefined);
 
@@ -1598,72 +1607,9 @@ test('Agent loop 最终仍有未完成任务时只产生脱敏 telemetry', () =>
 });
 
 
-test('Agent loop roster 跨轮读取，活跃优先并限制 32 条，隔离其他会话', async () => {
-  const turnId = 'turn-filter-runtime-status';
-  const oldChildren = Array.from({ length: 40 }, (_, index) => ({
-    id: `child-a-completed-${String(index).padStart(3, '0')}`, status: 'idle', child_conversation_id: `old-${index}`
-  }));
-  const liveChildren = Array.from({ length: 40 }, (_, index) => ({
-    id: `child-z-active-${String(index).padStart(3, '0')}`, status: 'active', child_conversation_id: `live-${index}`
-  }));
-  const oldProcesses = Array.from({ length: 40 }, (_, index) => ({
-    id: `process-a-completed-${String(index).padStart(3, '0')}`, status: 'completed'
-  }));
-  const liveProcesses = Array.from({ length: 40 }, (_, index) => ({
-    id: `process-z-running-${String(index).padStart(3, '0')}`, status: 'running'
-  }));
-  const children = [...oldChildren, ...liveChildren];
-  const processes = [...oldProcesses, ...liveProcesses];
-  const loop = Object.create(kernel.ReliableAgentLoop.prototype);
-  loop.database = memoryReadDatabase({
-    Turn: [{ id: turnId, conversation_id: 'parent' }, { id: 'previous-turn', conversation_id: 'parent' }, { id: 'foreign-turn', conversation_id: 'foreign' }],
-    Conversation: children.map(child => ({ id: child.child_conversation_id, title: 'Investigate failure' })),
-    ChildExecutionParentLink: children.map((child) => ({
-      id: `link-${child.id}`, parent_turn_id: 'previous-turn', child_execution_id: child.id
-    })).concat([{ id: 'foreign-link', parent_turn_id: 'foreign-turn', child_execution_id: 'foreign-child' }]),
-    ChildExecution: children,
-    AnswerBridge: children.map((child) => ({
-      id: `bridge-${child.id}`, child_execution_id: child.id
-    })),
-    ProcessCompletionSourceLink: processes.map((process) => ({
-      id: `link-${process.id}`, source_turn_id: turnId, process_id: process.id
-    })),
-    Process: processes
-  });
-
-  const card = await loop.readRuntimeStatusCard(turnId);
-  assert.equal(card.activeChildCount, 40);
-  assert.equal(card.runningProcessCount, 40);
-  assert.equal(card.children.length, 32);
-  assert.equal(card.processes.length, 32);
-  assert.equal(card.children[0].childExecutionId, 'child-z-active-000');
-  assert.equal(card.children[0].answerBridgeId, 'bridge-child-z-active-000');
-  assert.equal(card.children[0].task, 'Investigate failure');
-  assert.equal(card.children[0].resumable, true);
-  assert.equal(card.processes[0].processId, 'process-z-running-000');
-  assert.match(card.card, /activeChildren=40; runningProcesses=40/);
-  assert.doesNotMatch(card.card, /child-z-active|bridge-child|process-z-running/);
-  assert.doesNotMatch(card.card, /^[-] (?:child|process) /m);
-  assert.doesNotMatch(card.card, /completed/);
-  for (const child of liveChildren) child.status = 'closed';
-  const idleCard = await loop.readRuntimeStatusCard(turnId);
-  assert.equal(idleCard.activeChildCount, 0);
-  assert.equal(idleCard.children[0].status, 'idle');
-});
-
-test('Child refs reuse frozen mapping after context loss and reserve numbers for older children', async () => {
-  const { buildModelHandleCatalog } = await import('../../dist/extension/backend/reliableKernel/modelHandleCatalog.js');
-  const loop = Object.create(kernel.ReliableAgentLoop.prototype);
-  loop.database = memoryReadDatabase({
-    Turn: [{ id: 'old', conversation_id: 'parent', created_at: '1' }, { id: 'new', conversation_id: 'parent', created_at: '2' }],
-    ModelRequest: [{ id: 'old-request', turn_id: 'old', request_seq: '1' }]
-  });
-  const previous = buildModelHandleCatalog([{ answerBridgeId: 'first-child' }, { answerBridgeId: 'second-child' }]);
-  loop.readModelRequestRecipe = async () => ({ kind: 'reliable-agent-turn', modelHandleCatalog: previous });
-  const seeds = await loop.readPreviousChildHandles('parent');
-  const next = buildModelHandleCatalog([{ answerBridgeId: 'second-child' }, { answerBridgeId: 'third-child' }], seeds);
-  assert.deepEqual(next.entries.map(e => [e.ref, e.target]), [['A1', 'first-child'], ['A2', 'second-child'], ['A3', 'third-child']]);
-});
+// Child roster and frozen-reference recovery are exercised against the current snapshot API in
+// child-task-facts-snapshot, conversation-child-task-projection, child-task-runtime and child-compression-memory.
+// The removed tests mocked the retired multi-snapshot roster and private handle reader.
 
 test('LLM capability adapter 对新Provider-native压缩状态强制providerConfig/model绑定', async () => {
   const canonicalLargeResult = 'canonical-result-'.repeat(4_000);

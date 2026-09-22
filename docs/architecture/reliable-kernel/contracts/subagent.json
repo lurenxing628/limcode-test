@@ -1,16 +1,73 @@
 {
   "contractKind": "subagent",
-  "contractRevision": "2026-07-31-r4",
+  "contractRevision": "2026-09-22-r5",
   "status": "active",
   "scope": "保留日常多Agent协作能力，用稳定子执行谱系、答案桥和运行时收件箱表达控制与交付。",
   "toolName": "run_agent",
   "operations": [
     "spawn",
     "send",
-    "wait",
     "list",
+    "read",
+    "wait",
     "interrupt_subtree"
   ],
+  "modelContract": {
+    "required": ["operation"],
+    "implicitSpawnAllowed": false,
+    "legacyModeAllowed": false,
+    "spawnRequired": ["taskName", "prompt"],
+    "sendRequired": ["childRef", "prompt"],
+    "singleTargetRequired": ["read", "interrupt_subtree"],
+    "waitTarget": "childRef 或 childRefs 二选一；childRefs 必须有 1 至 32 个已知引用",
+    "waitTimeoutMs": { "minimum": 0, "maximum": 60000 },
+    "depthLimit": "深度上限只禁止 spawn；保留 send/list/read/wait/interrupt_subtree，执行器独立重验 spawn 的冻结深度策略。",
+    "controlScope": "send 与 interrupt_subtree 只允许当前 Conversation 的直接子任务；list/read/wait 可显式读取真实后代树。",
+    "missingReference": "需要既有目标的操作缺少引用、引用未知或超出当前会话父链权限时直接拒绝，不转入 spawn。",
+    "deduplication": "同一 source ToolCall 重放使用既有稳定身份；不同 ToolCall 不因任务文字相同而自动合并。"
+  },
+  "assignmentProjection": {
+    "authority": "只投影独立 Runtime domains、Links 与不可变 CAS 正文，不创建团队 JSON、汇总任务表或第二份任务 authority。",
+    "runtimeSchemaChangeRequired": false,
+    "scope": "默认 direct 列当前 Conversation 各 Turn 的直接子任务；显式 tree 才沿 ParentLink 展开后代，不把 Fork 来源关系当成 ChildExecution 父关系。",
+    "sourceDomains": [
+      "ChildExecution", "ChildExecutionParentLink", "ChildExecutionTurnLink",
+      "ChildExecutionIntentLink", "ChildExecutionActiveTurnLink", "Turn", "TurnTermination",
+      "MessageRevision", "MessageTurnLink", "TurnIntent", "TurnIntentRevision", "ContentObject",
+      "PendingTurnInput", "AnswerBridge", "AnswerSubmission", "RuntimeInboxItem",
+      "RuntimeDelivery", "RuntimeDeliveryInputLink", "RuntimeDeliveryWake",
+      "ToolModelResult", "ToolResultArtifact", "ContextSegmentSource"
+    ],
+    "taskSources": "分别解码首轮 MessageRevision、模型 continuation 正文、UI input envelope、Plan delegation、retry/runtime continuation/maintenance 来源及 native steering 收据；不能把标题或任意 CAS JSON 当成完整当前任务。",
+    "taskStates": ["initial", "current", "queued"],
+    "answers": "按精确 submission 与 delivery/input 区分答案存在、已注入及已处理，不只查询 AnswerBridge.current_submission_id。",
+    "snapshot": "worker 在单个 SQLite 读事务内取得完整作用域事实及不可变正文 identity；事务外按 identity 读 CAS，禁止把多个时刻的查询结果拼成一个快照。",
+    "snapshotRevision": "投影来源事实内容指纹；snapshotCommitSeq 仅诊断，不能声明为跨 Host 全局提交序号。",
+    "freeze": "每个新 ModelRequest 将快照冻结到 recipe 与模型尾部；同 request retry 复用冻结快照，后续请求及压缩后请求重新投影。",
+    "cardLimit": 32,
+    "counts": "计数覆盖完整查询作用域；状态卡和列表详情的截断必须显式报告，不能用当前页长度代替成员总数。",
+    "handles": "普通与压缩请求共用持久 recipe 映射恢复；旧 childRef 永不重分配。历史引用仅供辨认，操作权由当前父链验证，Fork 不继承源会话成员权限。",
+    "hostBoundary": "读取共享 Runtime 已提交事实，不从本 Host Promise 集合推导成员；操作继续遵守 Conversation ownership 和 ExecutionLease。",
+    "compressionSummary": "逐条保留派发 identity；不同工具调用和不同子结果不得因通用冒号标签相同而互相覆盖。",
+    "nativeHandles": "native_child_handle_projection ToolCallEvent 在发送前冻结工具输出与累计 childHandles；同请求后续调用和恢复读取该事实，普通/压缩继承映射，wire 不发送内部 metadata。",
+    "continuationSources": "最新代际由 turn_seq 决定；没有新业务输入的 retry/runtime/maintenance 沿 typed sourceTurnId 继承业务任务，不退回初始标题。",
+    "deliveryFailure": "consumed 且 unhandled 的 RuntimeDeliveryWake=dead_letter 仍表示交付失败；foreground ToolModelResult 与 RuntimeDelivery 分别提供结果证据，缺证据为 unknown。"
+  },
+  "list": {
+    "readOnly": true,
+    "scopes": ["direct", "tree"],
+    "defaultScope": "direct",
+    "pagination": { "defaultLimit": 32, "maximumLimit": 100, "cursor": true, "maximumPageTokens": 2600, "rereadCursor": true },
+    "rule": "从当前 Conversation 真实父链查询；状态过滤和分页不改变完整作用域计数，被 cardLimit 省略的成员仍可查。"
+  },
+  "read": {
+    "readOnly": true,
+    "target": "childRef",
+    "pagination": { "defaultLimit": 32, "maximumLimit": 100, "cursor": true, "maximumPageTokens": 2600, "rereadCursor": true },
+    "changesDeliveryState": false,
+    "bodyChunks": "长正文按 textOffset/totalCharacters/textComplete/textSha256/textFormat 分块；游标绑定 scope/query/来源高水位与正文身份，不以可变活动快照强制失效。",
+    "rule": "按精确子任务引用读取任务来源、正文及答案；只读不能把 RuntimeDelivery 标记 consumed 或把 InputLink 标记 handled。"
+  },
   "lineage": {
     "domains": [
       "ChildExecution",

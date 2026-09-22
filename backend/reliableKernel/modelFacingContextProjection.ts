@@ -1341,7 +1341,7 @@ function toolResultSkeleton(
   originalTokens: number,
   digest: string
 ): Record<string, unknown> {
-  const facts = collectImportantFacts(input.response);
+  const facts = collectImportantFacts(input.response, input.toolName);
   return {
     kind: 'tool_result_preview',
     toolName: input.toolName,
@@ -1356,12 +1356,13 @@ function toolResultSkeleton(
   };
 }
 
-function collectImportantFacts(value: unknown): Record<string, unknown> {
+function collectImportantFacts(value: unknown, toolName = ''): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   const wanted = new Set([
     'status', 'error', 'exitCode', 'path', 'filePath', 'sourcePath',
-    'attachmentRef', 'processRef', 'cursor', 'nextCursor', 'childRef', 'workEnvironmentRef',
-    'count', 'total', 'changedFiles'
+    'attachmentRef', 'processRef', 'cursor', 'nextCursor', 'childRef', 'childRefs', 'workEnvironmentRef',
+    'count', 'total', 'changedFiles',
+    'operation', 'scope', 'rereadCursor'
   ]);
   const visit = (candidate: unknown, depth: number): void => {
     if (depth > 3 || !candidate || typeof candidate !== 'object') return;
@@ -1370,7 +1371,20 @@ function collectImportantFacts(value: unknown): Record<string, unknown> {
       return;
     }
     for (const [key, nested] of Object.entries(candidate as Record<string, unknown>)) {
-      if (wanted.has(key) && result[key] === undefined) result[key] = boundedScalar(nested);
+      if (wanted.has(key) && result[key] === undefined) {
+        // A page preview may lose body text under a shared Tool batch budget. Its restart cursor
+        // must survive byte-for-byte; nextCursor alone would skip the omitted part of this page.
+        if (toolName === 'run_agent' && (key === 'rereadCursor' || key === 'nextCursor')
+          && typeof nested === 'string') {
+          if (nested.length > 4_096) throw new Error('Child task page cursor exceeds its model projection limit.');
+          result[key] = nested;
+        } else if (toolName === 'run_agent' && key === 'childRefs' && Array.isArray(nested)) {
+          if (nested.length > 32 || nested.some(ref => typeof ref !== 'string' || !/^A[1-9]\d*$/.test(ref))) {
+            throw new Error('Child wait result contains invalid model references.');
+          }
+          result[key] = [...nested];
+        } else result[key] = boundedScalar(nested);
+      }
       if (result[key] === undefined && depth < 3) visit(nested, depth + 1);
     }
   };

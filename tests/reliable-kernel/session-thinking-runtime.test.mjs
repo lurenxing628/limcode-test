@@ -565,7 +565,7 @@ test('子 Agent 自有另一渠道和协议优先，父 OpenAI effort 不写入�
       assert.equal(child.body.generationConfig.thinkingConfig.thinkingLevel, undefined);
     }
   }, { async send(request, controls, f) {
-    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: f.requests.length === 1 ? [{ id: 'cross-child', functionCall: { name: 'run_agent', args: { prompt: 'synthetic cross-provider task' } } }] : [{ text: 'done' }] } });
+    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: f.requests.length === 1 ? [{ id: 'cross-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check cross-provider selection', prompt: 'synthetic cross-provider task' } } }] : [{ text: 'done' }] } });
   } });
 });
 
@@ -597,7 +597,7 @@ for (const childModel of [
   }, { async send(request, controls, f) {
     const first = request.conversationId === 'parent' && f.requests.filter(r => r.conversationId === 'parent').length === 1;
     await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [first
-      ? { id: 'incompatible-child', functionCall: { name: 'run_agent', args: { prompt: 'use the child model' } } }
+      ? { id: 'incompatible-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check incompatible child model', prompt: 'use the child model' } } }
       : { text: 'done' }] } });
   } });
 });
@@ -626,7 +626,7 @@ test('勾选子继承时，实际 child generation 使用父会话当前有效 t
         kind: 'completed',
         streamSeq: '1',
         content: { role: 'model', parts: [firstParentRequest
-          ? { id: 'inherit-child', functionCall: { name: 'run_agent', args: { prompt: 'inherit thinking' } } }
+          ? { id: 'inherit-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check inherited thinking', prompt: 'inherit thinking' } } }
           : { text: 'done' }] }
       });
     }
@@ -717,10 +717,10 @@ test('运行中的子 Agent 默认排队续聊，保留当前执行和同一会�
   }, { async send(request, controls, f) {
     let part = { text: 'done' };
     const count = f.requests.filter(r => r.conversationId === request.conversationId).length;
-    if (request.conversationId === 'parent' && count === 1) part = { id: 'spawn-queued', functionCall: { name: 'run_agent', args: { prompt: 'investigate', taskName: 'Investigate send failure' } } };
+    if (request.conversationId === 'parent' && count === 1) part = { id: 'spawn-queued', functionCall: { name: 'run_agent', args: { operation: 'spawn', prompt: 'investigate', taskName: 'Investigate send failure' } } };
     if (request.conversationId === 'parent' && count === 2) {
       const ref = request.recipe.modelHandleCatalog.entries.find(e => e.kind === 'child').ref;
-      part = { id: 'followup-queued', functionCall: { name: 'run_agent', args: { childRef: ref, prompt: 'also verify configuration saving' } } };
+      part = { id: 'followup-queued', functionCall: { name: 'run_agent', args: { operation: 'send', childRef: ref, prompt: 'also verify configuration saving' } } };
     }
     if (request.conversationId !== 'parent' && count === 1) await childGate;
     await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [part] } });
@@ -756,7 +756,7 @@ test('实际 coordinator 从父工具创建/嵌套/继续子会话：最终普�
     async send(request, controls, f) {
       const depth = request.conversationId === 'parent' ? 0 : new Set(f.requests.filter(r => r.conversationId !== 'parent').map(r => r.conversationId)).size;
       const first = f.requests.filter(r => r.conversationId === request.conversationId).length === 1;
-      await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: first && depth < 2 ? [{ id: `delegate-${depth}`, functionCall: { name: 'run_agent', args: { prompt: 'synthetic child', taskName: `Investigate level ${depth}`, agent: { type: 'worker' } } } }] : [{ text: 'done' }] } });
+      await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: first && depth < 2 ? [{ id: `delegate-${depth}`, functionCall: { name: 'run_agent', args: { operation: 'spawn', prompt: 'synthetic child', taskName: `Investigate level ${depth}`, agent: { type: 'worker' } } } }] : [{ text: 'done' }] } });
     }
   });
 });
@@ -776,7 +776,7 @@ for (const tokens of [0, -1]) test(`review child inheritance sends Gemini budget
   }, { async send(request, controls, f) {
     const first = request.conversationId === 'parent' && f.requests.filter(r => r.conversationId === 'parent').length === 1;
     await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [first
-      ? { id: 'gemini-child', functionCall: { name: 'run_agent', args: { prompt: 'inherit the configured budget' } } }
+      ? { id: 'gemini-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check inherited Gemini budget', prompt: 'inherit the configured budget' } } }
       : { text: 'done' }] } });
   } });
 });

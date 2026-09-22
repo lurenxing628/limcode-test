@@ -45,7 +45,15 @@ import {
 } from './executionLeaseFence';
 import { isConversationRuntimeOwnerBusyError } from './ConversationRuntimeOwnerManager';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
-import { maxChildAgentDepthFromConfig } from '../world/modules/tools/definitions/runAgent';
+import { maxChildAgentDepthFromConfig, RUN_AGENT_OPERATIONS } from '../world/modules/tools/definitions/runAgent';
+import {
+  listConversationChildTasks,
+  readConversationChildTask,
+  childTaskSummary,
+  type ConversationChildTaskProjection,
+  type ConversationChildTaskRecord
+} from './conversationChildTaskProjection';
+import { requireChildExecutionStatus } from './childExecutionState';
 import { childThinkingInheritanceFromAuthority, childThinkingOverrideForSpawn } from './childThinkingInheritance';
 import { childAgentDepthForTurn } from './childAgentDepth';
 
@@ -92,12 +100,14 @@ export interface ReliableChildAgentCoordinatorDependencies {
       conversationId: string;
       compressSegmentCount: number;
       target?: CompressionCommandTarget;
+      sourceReplay?: 'immutable_provenance';
       childExecution: { childExecutionId: string; leaseOwnerId: string };
     }): Promise<TurnCommandResult>;
     inspect(input: {
       commandId: string;
       conversationId: string;
       target?: CompressionCommandTarget;
+      sourceReplay?: 'immutable_provenance';
     }): Promise<ReliableChildManualCompressionResult | null>;
     driveIfPresent(input: {
       conversationId: string;
@@ -510,6 +520,7 @@ export class ReliableChildAgentCoordinator {
     conversationId: string;
     compressSegmentCount: number;
     target?: CompressionCommandTarget;
+    sourceReplay?: 'immutable_provenance';
   }): Promise<ReliableChildManualCompressionResult> {
     const maintenance = this.dependencies.manualCompression;
     if (!maintenance) throw new Error('Child scheduler 缺少手动压缩驱动。');
@@ -520,7 +531,8 @@ export class ReliableChildAgentCoordinator {
     const replay = await maintenance.inspect({
       commandId: input.commandId,
       conversationId: input.conversationId,
-      target: input.target
+      target: input.target,
+      sourceReplay: input.sourceReplay
     });
     if (replay) return replay;
     const started = await maintenance.admit({
@@ -528,6 +540,7 @@ export class ReliableChildAgentCoordinator {
       conversationId: input.conversationId,
       compressSegmentCount: input.compressSegmentCount,
       target: input.target,
+      sourceReplay: input.sourceReplay,
       childExecution: {
         childExecutionId,
         leaseOwnerId: this.childLeaseOwnerId
@@ -538,7 +551,8 @@ export class ReliableChildAgentCoordinator {
       const concurrentReplay = await maintenance.inspect({
         commandId: input.commandId,
         conversationId: input.conversationId,
-        target: input.target
+        target: input.target,
+        sourceReplay: input.sourceReplay
       });
       if (concurrentReplay) return concurrentReplay;
       throw new Error('Child 手动压缩维护 Turn 未取得执行租约。');
@@ -557,7 +571,8 @@ export class ReliableChildAgentCoordinator {
     const terminal = await maintenance.inspect({
       commandId: input.commandId,
       conversationId: input.conversationId,
-      target: input.target
+      target: input.target,
+      sourceReplay: input.sourceReplay
     });
     if (!terminal) throw new Error('Child 手动压缩完成后缺少可回放的终态。');
     return { ...terminal, deduplicated: started.deduplicated };
@@ -1332,16 +1347,93 @@ export class ReliableChildAgentCoordinator {
     admission?: ReliableSpecialToolAdmission
   ): Promise<ChildDispatchResult> {
     const args = requireRecord(input.arguments, 'run_agent arguments');
-    const mode = optionalText(args.mode) || 'run';
-    if (mode === 'interrupt') return this.interruptChild(input, args);
-    if (mode !== 'run') throw new Error(`Unsupported run_agent mode: ${mode}.`);
-    const prompt = requireText(args.prompt, 'run_agent.prompt');
-    const foregroundWaitMs = requireWaitMs(args.foregroundWaitMs);
-    const answerBridgeId = optionalText(args.answerBridgeId);
-    if (args.interrupt !== undefined && typeof args.interrupt !== 'boolean') throw new Error('run_agent.interrupt must be a boolean.');
-    return answerBridgeId
-      ? this.continueChild(input, answerBridgeId, prompt, foregroundWaitMs, args.interrupt === true, signal, admission)
-      : this.spawnChild(input, args, prompt, foregroundWaitMs, authority, signal, admission);
+    const operation = requireText(args.operation, 'run_agent.operation');
+    assertRunAgentArguments(operation, args);
+    switch (operation) {
+      case 'spawn':
+        requireText(args.taskName, 'run_agent.taskName');
+        return this.spawnChild(input, args, requireText(args.prompt, 'run_agent.prompt'),
+          requireWaitMs(args.foregroundWaitMs), authority, signal, admission);
+      case 'send':
+        if (args.interrupt !== undefined && typeof args.interrupt !== 'boolean') throw new Error('run_agent.interrupt must be a boolean.');
+        return this.continueChild(input, requireText(args.answerBridgeId, 'run_agent.answerBridgeId'),
+          requireText(args.prompt, 'run_agent.prompt'), requireWaitMs(args.foregroundWaitMs), args.interrupt === true, signal, admission);
+      case 'list':
+      case 'read':
+        return this.inspectChildTasks(input, args, operation);
+      case 'wait':
+        return this.waitChildTasks(input, args, signal);
+      case 'interrupt_subtree':
+        return this.interruptChild(input, args);
+      default:
+        throw new Error(`Unsupported run_agent operation: ${operation}.`);
+    }
+  }
+
+  private async conversationForCaller(input: ReliableAgentToolDispatchInput): Promise<string> {
+    const [turn, call] = await Promise.all([this.get('Turn', input.turnId), this.get('ToolCall', input.toolCallId)]);
+    if (!turn || !call || call.turn_id !== input.turnId) {
+      throw new Error('Child task access requires a ToolCall owned by the calling Turn.');
+    }
+    return requireId(turn.conversation_id, 'Calling Turn.conversation_id');
+  }
+
+  private async inspectChildTasks(input: ReliableAgentToolDispatchInput,
+    args: { [key: string]: PlainJsonValue }, operation: 'list' | 'read'): Promise<ChildDispatchResult> {
+    const conversationId = await this.conversationForCaller(input);
+    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
+    const scope = childTaskScope(args.scope);
+    const limit = boundedChildTaskInteger(args.limit, 'limit', 32, 1, 100);
+    const cursor = args.cursor === undefined ? undefined : requireText(args.cursor, 'run_agent.cursor');
+    if (operation === 'list') {
+      const result = listConversationChildTasks(projection, { scope, limit,
+        ...(args.status === undefined ? {} : { status: requireChildExecutionStatus(args.status, 'run_agent.status') }),
+        ...(cursor ? { cursor } : {}) });
+      return this.settleOwnTool(input.toolCallId, { ...result, operation }, `run-agent-list:${input.toolCallId}`);
+    }
+    const task = scopedChildTask(projection, requireText(args.answerBridgeId, 'run_agent.answerBridgeId'), scope);
+    const result = readConversationChildTask(projection, { childExecutionId: task.childExecutionId, scope, limit,
+      ...(cursor ? { cursor } : {}) });
+    return this.settleOwnTool(input.toolCallId, { ...result, operation }, `run-agent-read:${input.toolCallId}`);
+  }
+
+  private async waitChildTasks(input: ReliableAgentToolDispatchInput,
+    args: { [key: string]: PlainJsonValue }, signal?: AbortSignal): Promise<ChildDispatchResult> {
+    const conversationId = await this.conversationForCaller(input);
+    const scope = childTaskScope(args.scope);
+    const timeoutMs = boundedChildTaskInteger(args.timeoutMs, 'timeoutMs', 0, 0, 60_000);
+    const bridgeIds = childTaskWaitReferences(args);
+    const read = async () => {
+      const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
+      return bridgeIds.map(id => scopedChildTask(projection, id, scope));
+    };
+    const initial = await read();
+    const initialRevisions = initial.map(task => task.revision).join('\n');
+    let observed = initial;
+    let changed = false;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && !childTaskWaitSettled(observed)) {
+      await waitForChildTaskObservation(this.dependencies.database, Math.min(500, deadline - Date.now()), signal);
+      signal?.throwIfAborted();
+      observed = await read();
+      changed = observed.map(task => task.revision).join('\n') !== initialRevisions;
+      if (changed) break;
+    }
+    return this.settleOwnTool(input.toolCallId, {
+      operation: 'wait',
+      answerBridgeIds: bridgeIds,
+      changed,
+      timedOut: timeoutMs > 0 && !changed && !childTaskWaitSettled(observed),
+      tasks: observed.map(childTaskSummary)
+    }, `run-agent-wait:${input.toolCallId}`);
+  }
+
+  private async scopedSnapshotForBridge(input: ReliableAgentToolDispatchInput,
+    answerBridgeId: string, scope: 'direct' | 'tree' = 'direct'): Promise<ChildExecutionSnapshot> {
+    const conversationId = await this.conversationForCaller(input);
+    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
+    const task = scopedChildTask(projection, answerBridgeId, scope);
+    return this.dependencies.children.readExecutionSnapshot(task.childExecutionId);
   }
 
   private async spawnChild(
@@ -1358,7 +1450,6 @@ export class ReliableChildAgentCoordinator {
     await this.authorizeNewChildDepth(input, authority);
     const agentArgs = optionalRecord(args.agent);
     const selection = await this.dependencies.agents.resolve({
-      ...(optionalText(agentArgs?.id) ? { agentId: optionalText(agentArgs?.id) } : {}),
       ...(optionalText(agentArgs?.type) ? { agentType: optionalText(agentArgs?.type) } : {})
     });
     const answerBridgeId = stablePhaseFId('answer_bridge', input.toolCallId);
@@ -1378,7 +1469,7 @@ export class ReliableChildAgentCoordinator {
       completionPolicy,
       sourceSettlement: 'child_handle',
       ...(deadline ? { waitDeadlineAt: deadline } : {}),
-      ...(optionalText(args.taskName) || selection.title ? { title: (optionalText(args.taskName) || selection.title!).replace(/\s+/g, ' ').slice(0, 120) } : {}),
+      title: requireText(args.taskName, 'run_agent.taskName').replace(/\s+/g, ' ').slice(0, 120),
       leaseOwnerId: this.childLeaseOwnerId,
       leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
     });
@@ -1460,7 +1551,7 @@ export class ReliableChildAgentCoordinator {
   ): Promise<ChildDispatchResult> {
     const beforeSend = await this.settleUserAbort(input.toolCallId, signal, 'before-child-continuation', true);
     if (beforeSend) return beforeSend;
-    const snapshot = await this.snapshotForBridge(answerBridgeId);
+    const snapshot = await this.scopedSnapshotForBridge(input, answerBridgeId);
     const activeTurnId = snapshot.activeTurn?.status === 'active'
       ? requireId(snapshot.activeTurn.id, 'Child active Turn.id')
       : undefined;
@@ -1583,11 +1674,11 @@ export class ReliableChildAgentCoordinator {
     args: { [key: string]: PlainJsonValue }
   ): Promise<ChildDispatchResult> {
     const answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
-    const snapshot = await this.snapshotForBridge(answerBridgeId);
+    const snapshot = await this.scopedSnapshotForBridge(input, answerBridgeId);
     const cancelled = await this.interruptSubtree({
       sourceKey: `run-agent-interrupt:${input.toolCallId}`,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
-      reason: 'run_agent interrupt requested'
+      reason: 'run_agent interrupt_subtree requested'
     });
     return this.settleOwnTool(input.toolCallId, {
       ok: true,
@@ -1645,6 +1736,7 @@ export class ReliableChildAgentCoordinator {
   private async readAnswer(input: ReliableAgentToolDispatchInput): Promise<ChildDispatchResult> {
     const args = requireRecord(input.arguments, 'read_agent_answer arguments');
     const answerBridgeId = requireText(args.answerBridgeId, 'read_agent_answer.answerBridgeId');
+    await this.scopedSnapshotForBridge(input, answerBridgeId, childTaskScope(args.scope));
     const answer = await this.dependencies.answers.readCurrent(answerBridgeId);
     const detail = answer.status === 'submitted'
       ? answer.interrupted
@@ -2278,6 +2370,95 @@ function requireText(value: PlainJsonValue | undefined, label: string): string {
 
 function optionalText(value: PlainJsonValue | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function assertRunAgentArguments(operation: string, args: { [key: string]: PlainJsonValue }): void {
+  if (!(RUN_AGENT_OPERATIONS as readonly string[]).includes(operation)) {
+    throw new Error(`Unsupported run_agent operation: ${operation}.`);
+  }
+  const fields: Record<string, readonly string[]> = {
+    spawn: ['taskName', 'prompt', 'agent', 'foregroundWaitMs'],
+    send: ['answerBridgeId', 'prompt', 'interrupt', 'foregroundWaitMs'],
+    list: ['scope', 'status', 'limit', 'cursor'],
+    read: ['answerBridgeId', 'scope', 'limit', 'cursor'],
+    wait: ['answerBridgeId', 'answerBridgeIds', 'scope', 'timeoutMs'],
+    interrupt_subtree: ['answerBridgeId']
+  };
+  const allowed = new Set(['operation', 'scheduling', ...fields[operation]]);
+  for (const key of Object.keys(args)) {
+    if (!allowed.has(key)) throw new Error(`run_agent.${operation} does not accept ${key}.`);
+  }
+  if (args.scheduling !== undefined && args.scheduling !== 'serial' && args.scheduling !== 'parallel') {
+    throw new Error('run_agent.scheduling must be parallel or serial.');
+  }
+  if (args.agent !== undefined) {
+    const agent = requireRecord(args.agent, 'run_agent.agent');
+    if (Object.keys(agent).some(key => key !== 'type')) throw new Error('run_agent.agent only accepts type.');
+    if (agent.type !== undefined) requireText(agent.type, 'run_agent.agent.type');
+  }
+}
+
+function childTaskScope(value: PlainJsonValue | undefined): 'direct' | 'tree' {
+  if (value === undefined || value === 'direct') return 'direct';
+  if (value === 'tree') return 'tree';
+  throw new Error('run_agent.scope must be direct or tree.');
+}
+
+function boundedChildTaskInteger(value: PlainJsonValue | undefined, name: string,
+  fallback: number, minimum: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`run_agent.${name} must be an integer from ${minimum} to ${maximum}.`);
+  }
+  return value;
+}
+
+function scopedChildTask(projection: ConversationChildTaskProjection, bridgeId: string,
+  scope: 'direct' | 'tree'): ConversationChildTaskRecord {
+  const tasks = projection.tasks.filter(task => task.answerBridgeId === bridgeId);
+  if (tasks.length !== 1 || tasks[0].depth < 1
+    || (scope === 'direct' && (tasks[0].depth !== 1 || tasks[0].parentConversationId !== projection.conversationId))) {
+    throw new Error(`Child task ${bridgeId} is outside the caller's ${scope} parent lineage or does not exist.`);
+  }
+  return tasks[0];
+}
+
+function childTaskWaitReferences(args: { [key: string]: PlainJsonValue }): string[] {
+  if ((args.answerBridgeId !== undefined) === (args.answerBridgeIds !== undefined)) {
+    throw new Error('run_agent.wait requires exactly one of answerBridgeId or answerBridgeIds.');
+  }
+  if (args.answerBridgeId !== undefined) return [requireText(args.answerBridgeId, 'run_agent.answerBridgeId')];
+  if (!Array.isArray(args.answerBridgeIds) || args.answerBridgeIds.length < 1 || args.answerBridgeIds.length > 32) {
+    throw new Error('run_agent.answerBridgeIds must contain 1 to 32 distinct references.');
+  }
+  const ids = args.answerBridgeIds.map(id => requireText(id, 'run_agent.answerBridgeIds item'));
+  if (new Set(ids).size !== ids.length) throw new Error('run_agent.answerBridgeIds must contain distinct references.');
+  return ids;
+}
+
+function childTaskWaitSettled(tasks: ConversationChildTaskRecord[]): boolean {
+  return tasks.some(task => !['starting', 'active', 'interrupting'].includes(task.status) && task.queuedInputs.length === 0);
+}
+
+function waitForChildTaskObservation(database: RuntimeDatabase, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let unsubscribe = () => {};
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unsubscribe();
+      signal?.removeEventListener('abort', aborted);
+      if (error) reject(error); else resolve();
+    };
+    const aborted = () => finish(signal?.reason ?? new Error('Child task wait aborted.'));
+    const timer = setTimeout(() => finish(), Math.max(1, timeoutMs));
+    unsubscribe = database.onCommit(() => finish());
+    signal?.addEventListener('abort', aborted, { once: true });
+    if (signal?.aborted) aborted();
+  });
 }
 
 function abortReason(value: unknown): string {

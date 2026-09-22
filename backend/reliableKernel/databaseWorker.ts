@@ -11,6 +11,7 @@ import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, Snap
 import type { ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
+import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
 import {
   deriveCommittedParentHandling,
   executeClientKeysetPage,
@@ -230,6 +231,14 @@ async function start(): Promise<void> {
       if (request.kind === 'toolFactsSnapshot') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeToolFactsSnapshot(reader, request.toolCallId, commitSeq);
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'conversationChildTaskSnapshot') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeConversationChildTaskSnapshot(
+          reader, request.conversationId, commitSeq, executeRead, clientProjectionContent.readVerifiedBytes
+        );
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }

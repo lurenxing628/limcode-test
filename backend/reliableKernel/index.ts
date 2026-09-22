@@ -8,6 +8,8 @@ export * from './contextCompressionCoordinator';
 export * from './contextTokenEstimator';
 export * from './modelFacingContextProjection';
 export * from './modelHandleCatalog';
+export * from './conversationChildHandles';
+export * from './conversationChildTaskProjection';
 export * from './currentTurnTaskProjection';
 export * from './attachmentIngest';
 export * from './attachmentCatalog';

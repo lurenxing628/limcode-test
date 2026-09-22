@@ -7,6 +7,13 @@ export const RUN_AGENT_TOOL_NAME = 'run_agent';
 export const DEFAULT_RUN_AGENT_TYPE = 'worker';
 export const MAX_CHILD_AGENT_DEPTH_CONFIG_KEY = 'maxChildAgentDepth';
 export const DEFAULT_MAX_CHILD_AGENT_DEPTH = 1;
+export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree'] as const;
+export type RunAgentOperation = typeof RUN_AGENT_OPERATIONS[number];
+
+export function isReadonlyRunAgentOperation(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return ['list', 'read', 'wait'].includes(String((value as { operation?: unknown }).operation));
+}
 
 export function maxChildAgentDepthFromConfig(
   config: ToolConfigRecord | undefined,
@@ -39,32 +46,39 @@ export const runAgentTool: ToolDefinition = {
   execution: 'agentRun',
   declaration: {
     name: RUN_AGENT_TOOL_NAME,
-    description: `Delegate a bounded task, continue an existing child, or explicitly stop it.
-- Check the conversation child-agent roster before starting a new child. Reuse answerBridgeId for follow-up work that depends on that child's findings or context. Use agent.type only to choose the configuration for a new child; a type is not a running child identity.
-- For a new child, give taskName a short responsibility label and prompt the objective, necessary context, constraints, expected result and verification. State whether the child may edit files or should only investigate.
-- A continuation preserves the child conversation and answer channel. By default it queues after the current child turn. Set interrupt=true only when the current work needs immediate redirection; mode="interrupt" stops the child and descendants without assigning a new task.
-- Do not duplicate delegated work. Continue independent work while the child runs. When nothing useful remains until its answer arrives, end the current turn; submit_agent_answer will notify the parent. Do not repeatedly poll read_agent_answer or interrupt a child merely because it is slow.
-- foregroundWaitMs defaults to 0 (return immediately). A positive value is a bounded wait for an immediately needed result, not a child timeout; the child continues when the wait expires.
-- At most ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} child starts enter admission concurrently per parent turn. scheduling controls tool-call concurrency, not background execution.`,
+    description: `Inspect and control child tasks using an explicit operation.
+- Before spawn, inspect the conversation roster. Use list for omitted tasks and read for the original assignment, current inputs and queued work. These operations never create or resume a child.
+- spawn requires taskName and prompt. Give the complete objective, context, constraints, expected result, verification and editing permission. agent.type chooses a configuration, never an existing child identity.
+- send requires answerBridgeId and prompt, reusing that child conversation and answer channel. It queues after the current child turn unless interrupt=true explicitly redirects current work. An unknown or missing reference fails; it never creates a replacement child.
+- read/list/wait default to direct children; scope="tree" also permits verified descendants. send and interrupt_subtree only control direct children. Inherited history references are not authority to control another conversation's children.
+- wait observes one answerBridgeId or 1 to 32 answerBridgeIds until a status/task/result change or the bounded timeout. It never resumes, cancels or sends work. Do not repeatedly poll; continue independent work, then wait or finish the turn when only a child answer remains.
+- interrupt_subtree explicitly stops a direct child and its descendants without assigning a new task. Do not interrupt merely because a child is slow.
+- list/read pages are bounded by both limit and a token budget. Follow nextCursor to continue. If a tool-result preview was truncated, repeat the same operation and target with cursor=rereadCursor, preferably as a single call, so omitted text is not skipped. A read source may span pages; reassemble its text by textOffset and respect textFormat (text or message_json).
+- List cursors keep the original upper boundary; start a new list to include children created during pagination. Activity changes do not invalidate cursors.
+- foregroundWaitMs is optional for spawn/send and defaults to 0. It bounds the foreground wait, not child execution. At most ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} starts enter admission concurrently per parent turn.`,
     parameters: {
       type: 'object',
       properties: {
-        mode: {
+        operation: {
           type: 'string',
-          enum: ['run', 'interrupt'],
-          description: 'Operation mode. Defaults to "run". Use "interrupt" with answerBridgeId only when the user explicitly wants to stop/replace an existing child task; it recursively cancels descendant child AgentRuns. Do not interrupt merely because a child is slow or still running.'
+          enum: [...RUN_AGENT_OPERATIONS],
+          description: 'Required. Explicitly select spawn, send, list, read, wait or interrupt_subtree. There is no default operation.'
         },
         prompt: {
           type: 'string',
-          description: 'Required in run mode. The complete task for the target AgentRun, including all relevant background, role instructions, constraints, and supplemental information.'
+          description: 'Required for spawn and send. Complete task or follow-up, including context, constraints and expected verification.'
         },
         answerBridgeId: {
           type: 'string',
-          description: 'Reuse the existing child conversation and answer channel. Required for mode=interrupt; in run mode, follow-ups queue unless interrupt=true.'
+          description: 'Required for send, read and interrupt_subtree. For wait, supply this or answerBridgeIds, never both.'
+        },
+        answerBridgeIds: {
+          type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32,
+          description: 'For wait only: 1 to 32 distinct existing child references. Mutually exclusive with answerBridgeId.'
         },
         taskName: {
           type: 'string',
-          description: 'Short responsibility label for a new child, such as "trace send failure". Displayed in the conversation roster; not an instruction or an agent type.'
+          description: 'Required for spawn. Short responsibility label, such as "trace send failure"; the full task belongs in prompt.'
         },
         interrupt: {
           type: 'boolean',
@@ -72,12 +86,8 @@ export const runAgentTool: ToolDefinition = {
         },
         agent: {
           type: 'object',
-          description: 'Selects the child Agent. Omit this when answerBridgeId already identifies an existing child conversation.',
+          description: 'For spawn only. Selects the child Agent configuration.',
           properties: {
-            id: {
-              type: 'string',
-              description: 'Internal compatibility selector for a temporary Agent mirror previously returned by run_agent. The model normally should not use this. Prefer answerBridgeId for an existing child conversation; to create a new child, omit id and provide agent.type.'
-            },
             type: {
               type: 'string',
               description: `The Agent type/configuration id to use, such as main, worker, or explore. The backend may create a temporary runtime mirror internally, but mirror ids are not valid types and should not be supplied here. Available types are appended to the tool description at runtime. Defaults to ${DEFAULT_RUN_AGENT_TYPE}.`
@@ -88,18 +98,27 @@ export const runAgentTool: ToolDefinition = {
           type: 'integer',
           minimum: 0,
           maximum: 86_400_000,
-          description: 'Optional in run mode. Foreground wait budget in integer milliseconds from 0 to 86400000; this is not an AgentRun timeout. Omit or use 0 to background immediately (recommended for delegation). Use a small positive value only when the current reply truly needs an immediate child result. When the budget expires, the child continues in the background and the tool returns agentId, runId, conversationId, and answerBridgeId.'
+          description: 'Optional for spawn/send. Foreground wait in milliseconds, default 0; the child keeps running after it expires.'
         },
-        wait: {
-          type: 'string',
-          description: 'Legacy scheduling hint only. Prefer scheduling. Pass "true" for serial or "false" for parallel when scheduling is omitted. This field never backgrounds an AgentRun; omit foregroundWaitMs or use foregroundWaitMs=0 for background execution.'
+        scope: {
+          type: 'string', enum: ['direct', 'tree'],
+          description: 'Read-only list/read/wait scope. Defaults to direct children; tree includes verified descendants.'
+        },
+        status: { type: 'string', enum: ['starting', 'active', 'idle', 'interrupting', 'interrupted', 'closed', 'needs_human'], description: 'Optional exact ChildExecution status filter for list. Idle describes an available child; its latest Turn outcome is a separate field.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'List/read maximum page items, default 32. Token budgets may return fewer items or a partial source.' },
+        cursor: { type: 'string', description: 'For list/read: nextCursor continues, rereadCursor repeats a truncated page. Keep the same scope, filters and target; immutable source identity must match.' },
+        timeoutMs: {
+          type: 'integer', minimum: 0, maximum: 60000,
+          description: 'For wait only. Observation timeout in milliseconds, default 0; no child state is changed.'
         },
         scheduling: {
           type: 'string',
           enum: ['parallel', 'serial'],
           description: 'Tool-call scheduling mode. Defaults to parallel. Use serial when this task may interfere with other tool calls.'
         }
-      }
+      },
+      required: ['operation'],
+      additionalProperties: false
     },
     metadata: {
       category: 'agent',
@@ -114,7 +133,7 @@ export const runAgentTool: ToolDefinition = {
         key: MAX_CHILD_AGENT_DEPTH_CONFIG_KEY,
         label: '最大子 Agent 层级',
         type: 'number',
-        description: '限制子 Agent 的嵌套深度。根对话为 0；设为 1 时只允许根对话创建第一层子 Agent；设为 0 时根对话也看不到 run_agent。当前层级达到上限后，后续模型请求不再提供 run_agent；已经发出的调用仍可完成或中断。',
+        description: '限制新建子 Agent 的嵌套深度。根对话为 0；达到上限后只移除 spawn，查看、等待、续接与中断操作继续可用。',
         defaultValue: DEFAULT_MAX_CHILD_AGENT_DEPTH
       }]
     },
@@ -127,16 +146,16 @@ export const runAgentTool: ToolDefinition = {
 };
 
 interface RunAgentSchedulingArgs {
-  mode?: string;
+  operation?: string;
   foregroundWaitMs?: number;
-  wait?: string;
   scheduling?: string;
 }
 
 function summarizeRunAgentToolCall(rawArgs: unknown, context: ToolCallSummaryContext): string | undefined {
   const args = (rawArgs ?? {}) as RunAgentSchedulingArgs & { prompt?: unknown; answerBridgeId?: unknown; agent?: { type?: unknown; id?: unknown } };
   const answerBridgeId = typeof args.answerBridgeId === 'string' ? args.answerBridgeId.trim() : '';
-  if (args.mode?.trim() === 'interrupt') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
+  if (args.operation === 'interrupt_subtree') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
+  if (args.operation && ['list', 'read', 'wait'].includes(args.operation)) return `${args.operation} child tasks${answerBridgeId ? ` · ${answerBridgeId}` : ''}`;
   const prompt = typeof args.prompt === 'string' ? normalizeSummaryText(args.prompt) : '';
   const resolvedType = runAgentTypeFromValue(context.result) ?? runAgentTypeFromValue(context.progress);
   const requestedType = typeof args.agent?.type === 'string' && args.agent.type.trim()
@@ -163,13 +182,10 @@ function runAgentTypeFromValue(value: unknown): string | undefined {
 
 function resolveRunAgentScheduling(rawArgs: unknown): { mode: 'parallel' | 'serial'; reason: string } {
   const args = (rawArgs ?? {}) as RunAgentSchedulingArgs;
-  if (args.mode?.trim() === 'interrupt') return { mode: 'serial', reason: 'interrupt_mode' };
+  if (args.operation === 'interrupt_subtree') return { mode: 'serial', reason: 'interrupt_subtree' };
   if (args.scheduling === 'serial') return { mode: 'serial', reason: 'explicit_serial' };
   if (args.scheduling === 'parallel') return { mode: 'parallel', reason: 'explicit_parallel' };
 
-  const wait = typeof args.wait === 'string' ? args.wait.trim().toLowerCase() : '';
-  if (wait === 'true') return { mode: 'serial', reason: 'wait_true' };
-  if (wait === 'false') return { mode: 'parallel', reason: 'wait_false' };
   return { mode: 'parallel', reason: 'default_parallel' };
 }
 

@@ -323,6 +323,8 @@ function nativeItemCheckpoint(entry, overrides = {}) {
     responseId: 'resp-1',
     toolName: entry.toolName,
     arguments: entry.arguments,
+    resolvedArguments: entry.arguments,
+    modelHandleCatalog: { entries: [] },
     providerCallId: entry.providerCallId,
     providerOrdinal: entry.providerOrdinal,
     async: true,
@@ -952,7 +954,7 @@ test('native scheduler child admission releases the slot at the durable barrier'
         messageId,
         toolCallId: `tool-call-child-${index}`,
         toolName: 'run_agent',
-        arguments: {},
+        arguments: { operation: 'spawn', taskName: `Inspect admission slot ${index}`, prompt: `Check child admission ${index}` },
         streamSeq: index + 1,
         providerOrdinal: index
       }));
@@ -974,4 +976,3 @@ test('native scheduler child admission releases the slot at the durable barrier'
     assert.ok(results.every((result) => result.disposition === 'paused'));
   }, host, { allowedTools: ['read', 'run_agent'] });
 });
-

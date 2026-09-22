@@ -227,7 +227,7 @@ test('parent feed receives a bounded child activity change without child ToolCal
       toolCallId: 'child-activity-run-agent-call',
       turnId: parentTurn.turnId,
       toolName: 'run_agent',
-      arguments: { prompt: 'inspect the workspace' }
+      arguments: { operation: 'spawn', taskName: 'Inspect workspace activity', prompt: 'inspect the workspace' }
     });
     const child = await app.runtime.children.spawn({
       sourceToolCallId: 'child-activity-run-agent-call',

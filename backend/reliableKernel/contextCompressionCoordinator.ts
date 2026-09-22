@@ -17,6 +17,7 @@ import {
 } from './attachmentObservations';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { mergeConversationChildHandles, readConversationChildHandles } from './conversationChildHandles';
 import {
   ContextCompressionControlPlane,
   compressionBlockIdFor,
@@ -61,7 +62,7 @@ import {
   type ContextPlanningFailureCode,
   type FullRequestPlanningBudget
 } from './modelFacingContextProjection';
-import type { ModelHandleCatalog } from './modelHandleCatalog';
+import { buildModelHandleCatalog, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
@@ -98,6 +99,10 @@ export interface CoordinateCompressionCommand {
   protectedCurrentInputTokens?: number;
   /** Frozen ordinary tool definitions; Provider-native compaction must use the same tool contract. */
   tools?: readonly CompressionToolDefinition[];
+  /** The ordinary preview's exact references, including children allocated before request commit. */
+  modelHandleCatalog?: ModelHandleCatalog;
+  /** Explicit manual reconstruction of every compressed source, including old text summaries. */
+  sourceReplay?: 'immutable_provenance';
   /** Manual callers may freeze an explicit prefix. Automatic text selection uses a continuous token tail. */
   compressSegmentCount?: number;
   title?: string;
@@ -186,6 +191,10 @@ export class ReliableContextCompressionCoordinator {
   }
 
   public async coordinate(command: CoordinateCompressionCommand): Promise<CoordinateCompressionResult> {
+    if (command.sourceReplay !== undefined
+      && (command.sourceReplay !== 'immutable_provenance' || command.trigger !== 'manual')) {
+      throw new TypeError('Immutable compression source reconstruction is an explicit manual operation.');
+    }
     const turnId = requireId(command.turnId, 'turnId');
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
     const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId
@@ -210,7 +219,7 @@ export class ReliableContextCompressionCoordinator {
     const failures: CompressionAttemptFailure[] = [];
     let lastPlanningError: Extract<CoordinateCompressionResult, { status: 'error' }> | undefined;
     const groupId = `compression_group_${createHash('sha256')
-      .update(JSON.stringify([turnId, command.headRootId, settingsSnapshotContentObjectId])).digest('hex')}`;
+      .update(JSON.stringify([turnId, command.headRootId, settingsSnapshotContentObjectId, command.sourceReplay ?? null])).digest('hex')}`;
     const attemptCommand: CoordinateCompressionCommand = { ...command, settingsSnapshotContentObjectId };
     if (command.trigger === 'auto') {
       const evaluated = await this.compression.evaluate(command.headRootId, authoritySnapshotId, settingsSnapshotContentObjectId);
@@ -391,13 +400,25 @@ export class ReliableContextCompressionCoordinator {
       this.context.materialize(headRootId)
     ]);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
+    if (command.sourceReplay && command.compressSegmentCount !== undefined
+      && command.compressSegmentCount !== materialized.records.length) {
+      throw new TypeError('Immutable compression source reconstruction requires the complete current window.');
+    }
     const fullAttachmentCatalogState = await this.attachmentCatalog.projectState(
       frozen.conversationId,
       semanticMaterialized.segments.map((segment) => ({ segmentId: segment.segmentId }))
     );
-    const fullModelHandleCatalog = await this.modelProvider.ensureAttachmentHandles(
+    const fullAttachmentHandles = await this.modelProvider.ensureAttachmentHandles(
       frozen.conversationId,
       fullAttachmentCatalogState.catalog
+    );
+    const childHandles = mergeConversationChildHandles(
+      await readConversationChildHandles(this.database, this.contentStore, frozen.conversationId),
+      normalizeModelHandleCatalog(command.modelHandleCatalog).entries
+    );
+    const fullModelHandleCatalog = buildModelHandleCatalog(
+      semanticMaterialized.segments.map(segment => Buffer.from(segment.content).toString('utf8')),
+      [...fullAttachmentHandles.entries, ...childHandles]
     );
     if (
       policy.methodKind === 'provider_native' && attempt.nativeKind === 'openai_responses'
@@ -430,7 +451,7 @@ export class ReliableContextCompressionCoordinator {
           policy.config.llmSummary?.targetTokens,
           rooms.calibratedBodyTargetTokens
         );
-    const textTailPlan = policy.methodKind === 'provider_native' || command.compressSegmentCount !== undefined
+    const textTailPlan = command.sourceReplay || policy.methodKind === 'provider_native' || command.compressSegmentCount !== undefined
       ? undefined
       : selectCompressionPrefixByTokens(
             materialized.records,
@@ -448,7 +469,7 @@ export class ReliableContextCompressionCoordinator {
         hardContextRoomTokens
       );
     }
-    const requestedSourceSegmentCount = policy.methodKind === 'provider_native'
+    const requestedSourceSegmentCount = command.sourceReplay ? materialized.records.length : policy.methodKind === 'provider_native'
       ? command.compressSegmentCount ?? materialized.records.length
       : command.compressSegmentCount === undefined
         ? textTailPlan?.sourceSegmentCount ?? 0
@@ -488,6 +509,11 @@ export class ReliableContextCompressionCoordinator {
     const sourceSegmentCount = nativeGuard.status === 'protect'
       ? closeToolExchangeBoundary(materialized.records, nativeGuard.sourceSegmentCount)
       : plannedSourceSegmentCount;
+    if (command.sourceReplay && sourceSegmentCount !== materialized.records.length) {
+      throw Object.assign(new Error('Immutable source reconstruction cannot leave a protected partial window; finish pending work first.'), {
+        code: 'MODEL_CONTEXT_REBUILD_PARTIAL'
+      });
+    }
     if (sourceSegmentCount <= 0) {
       return {
         status: 'skipped',
@@ -531,6 +557,7 @@ export class ReliableContextCompressionCoordinator {
       'context-compression', trigger, headRootId, policy.config.id,
       attempt.methodKind, attempt.nativeKind ?? 'text',
       String(sourceSegmentCount), sourceHash,
+      ...(command.sourceReplay ? [command.sourceReplay] : []),
       ...(settingsSnapshotContentObjectId ? [settingsSnapshotContentObjectId] : [])
     ].join(':');
     const expectedModelRequestId = modelRequestIdFor(turnId, idempotencyKey);
@@ -562,6 +589,7 @@ export class ReliableContextCompressionCoordinator {
           sourceRootId: headRootId,
           sourceSegmentCount,
           sourceHash,
+          ...(command.sourceReplay ? { sourceReplay: command.sourceReplay } : {}),
           blockId: compressionBlockId,
           compressionConfigId: policy.config.id,
           compressionMethodKind: policy.methodKind,
@@ -572,8 +600,8 @@ export class ReliableContextCompressionCoordinator {
           ...(policy.methodKind === 'provider_native' ? { tools } : {}),
           ...(nativeRebase ? { nativeRebase } : {}),
           attachmentCatalogState: sourceAttachmentCatalogState,
-          ...(sourceAttachmentHandles.entries.length > 0
-            ? { modelHandleCatalog: sourceAttachmentHandles }
+          ...(fullModelHandleCatalog.entries.length > 0
+            ? { modelHandleCatalog: fullModelHandleCatalog }
             : {}),
           ...(attachmentObservationProfileSha256
             ? {

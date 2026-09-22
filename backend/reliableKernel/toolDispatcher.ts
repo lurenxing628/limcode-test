@@ -29,6 +29,8 @@ import {
 } from '../world/modules/tools/definitions/command';
 import {
   RUN_AGENT_TOOL_NAME,
+  RUN_AGENT_OPERATIONS,
+  isReadonlyRunAgentOperation,
   runAgentToolAvailableAtDepth
 } from '../world/modules/tools/definitions/runAgent';
 import { effectiveLocalPathReadMode } from '../world/modules/tools/definitions/readFile';
@@ -244,7 +246,7 @@ function nativeSchedulingLaneKind(
 ): NativeSchedulingLaneKind {
   if (
     input.toolName === RUN_AGENT_TOOL_NAME
-    && optionalText(plainOptionalRecord(input.arguments)?.mode) !== 'interrupt'
+    && ['spawn', 'send'].includes(optionalText(plainOptionalRecord(input.arguments)?.operation) ?? '')
   ) return 'child';
   if (
     PROCESS_TOOLS.has(input.toolName)
@@ -859,6 +861,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const executionAutomatic = yolo
       || input.toolName === 'ask_user'
       || input.toolName === 'submit_plan'
+      || (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments))
       || allowlistedCommand
       || autoApproveReadonly
       || (config?.autoApproveExecution ?? metadata?.defaultAutoApproveExecution ?? true);
@@ -1190,7 +1193,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const indexed = inputs.map((input, index): IndexedInput => ({ input, index }));
     const requiresChildAdmission = (input: ReliableAgentToolDispatchInput): boolean =>
       input.toolName === 'run_agent'
-      && optionalText(plainOptionalRecord(input.arguments)?.mode) !== 'interrupt';
+      && ['spawn', 'send'].includes(optionalText(plainOptionalRecord(input.arguments)?.operation) ?? '');
     const childInputs = indexed.filter(({ input }) => requiresChildAdmission(input));
     const processOrMcpInputs = indexed.filter(({ input }) =>
       !requiresChildAdmission(input) && (
@@ -2050,15 +2053,25 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       definition.declaration.name === RUN_AGENT_TOOL_NAME
       && definitionAllowedByAuthority(toolPolicy, definition)
     );
-    const exposeRunAgent = !runAgentDefinition || runAgentToolAvailableAtDepth(
+    const allowChildSpawn = !runAgentDefinition || runAgentToolAvailableAtDepth(
       await childAgentDepthForTurn(this.dependencies.database, turnId),
       toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
     );
     const allowed = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
-      && (definition.declaration.name !== RUN_AGENT_TOOL_NAME || exposeRunAgent)
-    );
+    ).map(definition => {
+      if (definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn) return definition;
+      const parameters = plainOptionalRecord(normalizePlainJson(definition.declaration.parameters ?? {})) ?? {};
+      const properties = plainOptionalRecord(parameters.properties) ?? {};
+      const operation = plainOptionalRecord(properties.operation) ?? {};
+      return { ...definition, declaration: { ...definition.declaration,
+        description: `${definition.declaration.description}\nNew child spawning is unavailable at the current depth. Use list/read/wait/send/interrupt_subtree for existing children.`,
+        parameters: { ...parameters, properties: { ...properties,
+          operation: { ...operation, enum: RUN_AGENT_OPERATIONS.filter(value => value !== 'spawn') }
+        } }
+      } } as ToolDefinition;
+    });
     const withSkills = this.augmentSkillsDefinition(allowed, authority.document);
     const withEnvironments = await this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
     return this.augmentRunAgentDefinition(withEnvironments);
@@ -2846,7 +2859,8 @@ function frozenSchedulingFallback(
     return { mode: args.scheduling, reason: `provider_selected_${args.scheduling}` };
   }
   const metadata = plainOptionalRecord(definition.metadata);
-  if (metadata?.readonly === true || metadata?.riskLevel === 'read') {
+  if ((definition.name === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(value))
+    || metadata?.readonly === true || metadata?.riskLevel === 'read') {
     return { mode: 'parallel', reason: 'frozen_readonly_metadata' };
   }
   return { mode: 'serial', reason: 'frozen_default_serial' };
@@ -2856,6 +2870,7 @@ function frozenPlanReviewRiskLevel(
   definition: ToolDefinition,
   input: ReliableAgentToolDispatchInput
 ): FrozenPlanReviewRiskLevel {
+  if (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments)) return 'read';
   if (FILE_TOOLS.has(input.toolName)) return 'write';
   if (PROCESS_TOOLS.has(input.toolName)) {
     return isReadonlyCommandCall(input.arguments) ? 'read' : 'command';

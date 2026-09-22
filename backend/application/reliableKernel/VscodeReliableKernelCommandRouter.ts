@@ -1664,11 +1664,18 @@ export class VscodeReliableKernelCommandRouter {
     conversationId: string
   ): Promise<void> {
     const commandId = requireText(payload.command?.commandId, 'compression commandId');
+    if (payload.sourceReplay !== undefined && payload.sourceReplay !== 'immutable_provenance') {
+      throw new TypeError('compression sourceReplay is invalid.');
+    }
+    if (payload.sourceReplay && payload.target.kind !== 'current_head') {
+      throw new Error('从原始记录重建摘要必须明确选择当前完整上下文。');
+    }
     await this.requireRow('Conversation', conversationId);
     const replay = await this.product.conversations.inspectManualCompression?.({
       commandId,
       conversationId,
-      target: payload.target
+      target: payload.target,
+      sourceReplay: payload.sourceReplay
     });
     if (replay) {
       const replayRejected = replay.terminal
@@ -1708,6 +1715,9 @@ export class VscodeReliableKernelCommandRouter {
     let compressSegmentCount: number;
     if (payload.target.kind === 'current_head') {
       const frozenRootId = requireText(payload.target.expectedRootId, 'compression target.expectedRootId');
+      if (payload.sourceReplay && frozenRootId !== rootId) {
+        throw new Error('重建摘要的当前上下文已变化，请重新确认。');
+      }
       const frozenRoot = await this.requireRow('ContextSequenceRoot', frozenRootId);
       if (frozenRoot.conversation_id !== conversationId) {
         throw new Error('压缩目标 Context root 不属于当前 Conversation。');
@@ -1769,13 +1779,15 @@ export class VscodeReliableKernelCommandRouter {
             childExecutionId,
             conversationId,
             compressSegmentCount,
-            target: payload.target
+            target: payload.target,
+            ...(payload.sourceReplay ? { sourceReplay: payload.sourceReplay } : {})
           })
         : await this.product.conversations.manualCompression({
             commandId,
             conversationId,
             compressSegmentCount,
-            target: payload.target
+            target: payload.target,
+            ...(payload.sourceReplay ? { sourceReplay: payload.sourceReplay } : {})
           });
     } catch (error) {
       if (!isConversationHistoryBusyError(error)) throw error;

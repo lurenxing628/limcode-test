@@ -3415,7 +3415,9 @@ const ROLLING_SUMMARY_STRUCTURE_INSTRUCTION = [
   '  - 受阻',
   '下一步',
   '相关文件',
-  '必须保留准确的路径、符号名、命令、报错、URL、版本号和业务 ID。'
+  '必须保留准确的路径、符号名、命令、报错、URL、版本号和业务 ID。',
+  '子 Agent 的引用、派发任务和未完成补充必须一一对应；不得合并不同子 Agent 或不同派发，不得重编引用。',
+  '摘要中的子任务信息属于历史；继续执行时以重新提供的运行状态卡和子任务查询结果为准。'
 ].join('\n');
 
 function buildSummaryProviderCall(
@@ -4282,14 +4284,10 @@ function replacementMergeFacts(prior: readonly string[], delta: readonly string[
 }
 
 function summaryReplacementKey(fact: string): string {
-  const keyValue = /^(.{1,96}?)[：:=]\s*/.exec(fact)?.[1]
-    ?.trim()
-    .replace(/^(?:必须|不得|不要|只能|需要|require|must|never|only)\s*/i, '')
-    .toLowerCase();
-  if (keyValue) return `key:${keyValue}`;
-  const file = extractFileReferences(fact)[0];
-  if (file && fact.length < 180) return `file:${file.toLowerCase()}`;
-  return `fact:${fact.toLowerCase()}`;
+  // Labels, JSON field names, paths and provider call ids do not prove that two facts are the
+  // same revision (provider ids can repeat in different requests). Without durable source/revision
+  // authority in this text boundary, remove only exact duplicates and preserve distinct records.
+  return `fact:${fact}`;
 }
 
 function appendSummaryFact(summary: StructuredSummary, field: StructuredSummaryField, fact: string): void {

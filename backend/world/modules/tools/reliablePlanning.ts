@@ -1,5 +1,5 @@
 import type { Entity, WorldReader } from '../../../ecs/types';
-import { Agent, AgentConversationLink, AgentKind, type AgentData } from '../agent/components';
+import { Agent, AgentKind, type AgentData } from '../agent/components';
 import { AgentBlueprintsKey, type BuiltinAgentDefinition, type BuiltinAgentRegistry } from '../agent/blueprints';
 import { agentSelectorSlug, isTemporaryAgentEntity } from '../agent/identity';
 import { AgentRun } from '../agentRun/components';
@@ -17,7 +17,7 @@ import {
 import type { ToolPolicyData } from '../workflow/components';
 import { isReadonlyCommandCall } from './definitions/command';
 import { allowOutsideProjectPathsFromConfig } from './definitions/filePathPolicy';
-import { DEFAULT_RUN_AGENT_TYPE, RUN_AGENT_TOOL_NAME } from './definitions/runAgent';
+import { DEFAULT_RUN_AGENT_TYPE, RUN_AGENT_TOOL_NAME, isReadonlyRunAgentOperation } from './definitions/runAgent';
 import {
   ASK_USER_TOOL_NAME,
   SUBMIT_PLAN_TOOL_NAME,
@@ -101,6 +101,7 @@ export function planReliableToolExecution(
   const settingsSnapshot = settingsSnapshotForRun(world, run);
   const runtimeDefinition = (world.tryGetResource(ToolRuntimeDefinitionsKey) ?? []).find((tool) => tool.declaration.name === call.name);
   const readonly = runtimeDefinition?.declaration.metadata?.readonly === true
+    || (call.name === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(parseToolCallArgs(call.argsJson)))
     || (isCommandToolName(call.name) && isReadonlyCommandCall(parseToolCallArgs(call.argsJson)));
 
   return {
@@ -173,6 +174,7 @@ function authorizePlanReviewForTool(world: WorldReader, call: ToolCallData, auth
 }
 
 function planReviewRiskLevelForTool(world: WorldReader, call: ToolCallData): ToolRiskLevel {
+  if (call.name === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(parseToolCallArgs(call.argsJson))) return 'read';
   if (call.name === 'edit' || call.name === 'write' || call.name === 'delete') return 'write';
   if (isCommandToolName(call.name)) return isReadonlyCommandCall(parseToolCallArgs(call.argsJson)) ? 'read' : 'command';
   if (isAgentRunTool(world, call.name)) return 'agent';
@@ -223,6 +225,7 @@ function normalizeAutoApplyDelay(value: number): number {
 }
 
 function requiresExecutionApproval(world: WorldReader, policy: ToolPolicyData, call: ToolCallData): boolean {
+  if (call.name === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(parseToolCallArgs(call.argsJson))) return false;
   if (call.name === ASK_USER_TOOL_NAME || call.name === SUBMIT_PLAN_TOOL_NAME || isRunAgentInterruptCall(call)) return false;
   if (toolGateSettings(world, policy, call.name).autoApproveExecution !== false) return false;
   const config = effectiveToolConfig(world, policy, call.name);
@@ -234,8 +237,7 @@ function isRunAgentInterruptCall(call: ToolCallData): boolean {
   if (call.name !== RUN_AGENT_TOOL_NAME) return false;
   const args = parseToolCallArgs(call.argsJson);
   if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
-  const mode = (args as { mode?: unknown }).mode;
-  return typeof mode === 'string' && mode.trim() === 'interrupt';
+  return (args as { operation?: unknown }).operation === 'interrupt_subtree';
 }
 
 function isCommandToolName(toolName: string): boolean {
@@ -252,7 +254,8 @@ function parseToolCallArgs(argsJson: string | undefined): unknown {
 }
 
 interface RunAgentArgs {
-  mode?: string;
+  operation?: string;
+  taskName?: string;
   prompt?: string;
   answerBridgeId?: string;
   agent?: { id?: string; type?: string };
@@ -330,8 +333,15 @@ export function planReliableChildAgentRun(
   } catch (error) {
     return { ok: false, reason: `run_agent 参数不是合法 JSON: ${String(error)}` };
   }
-  const mode = args.mode?.trim() || 'run';
-  if (mode !== 'run') return { ok: false, reason: `可靠 child launch 不处理 run_agent.mode=${mode}。` };
+  const operation = args.operation;
+  if (operation !== 'spawn' && operation !== 'send') return { ok: false, reason: '可靠 child launch 必须明确使用 operation=spawn 或 send。' };
+  if (operation === 'spawn' && (!args.taskName?.trim() || args.answerBridgeId !== undefined || input.continuation)) {
+    return { ok: false, reason: 'spawn 必须提供 taskName，且不能提供已有子对话引用。' };
+  }
+  if (operation === 'send' && (!args.answerBridgeId?.trim() || !input.continuation)) {
+    return { ok: false, reason: 'send 必须提供可验证的已有子对话引用。' };
+  }
+  if (args.agent?.id !== undefined) return { ok: false, reason: 'run_agent 不接受 agent.id；新建使用 agent.type，续接使用 answerBridgeId。' };
   const prompt = args.prompt?.trim();
   if (!prompt) return { ok: false, reason: 'run_agent 缺少必填 prompt。' };
   const foregroundWait = normalizeRunAgentForegroundWaitMs(args.foregroundWaitMs);
@@ -366,25 +376,6 @@ export function planReliableChildAgentRun(
     targetConversationId = input.continuation.conversationId;
     answerBridgeId = input.continuation.answerBridgeId;
     targetConversationTitle = world.get(targetConversation, Conversation)?.title;
-  } else if (args.agent?.id?.trim()) {
-    const requestedAgentId = args.agent.id.trim();
-    const targetAgent = findAgentById(world, requestedAgentId);
-    if (targetAgent === undefined) return { ok: false, reason: `指定临时 Agent 镜像不存在: ${requestedAgentId}` };
-    const agent = world.get(targetAgent, Agent);
-    const kind = world.get(targetAgent, AgentKind)?.kind;
-    if (!agent || !kind || !isTemporaryAgentEntity(world, targetAgent)) {
-      return { ok: false, reason: `agent.id 只用于复用 run_agent 创建的临时 Agent 镜像：${requestedAgentId}` };
-    }
-    const existingConversation = defaultConversationForAgent(world, targetAgent);
-    targetAgentId = agent.id;
-    targetAgentType = kind;
-    targetConversationId = existingConversation === undefined
-      ? input.ids.conversationId
-      : world.get(existingConversation, Conversation)!.id;
-    answerBridgeId = input.ids.answerBridgeId;
-    targetConversationTitle = existingConversation === undefined
-      ? `${kind}: ${prompt.slice(0, 40)}`
-      : world.get(existingConversation, Conversation)?.title;
   } else {
     const requestedKind = args.agent?.type?.trim() || DEFAULT_RUN_AGENT_TYPE;
     const blueprints = world.getResource(AgentBlueprintsKey);
@@ -397,7 +388,7 @@ export function planReliableChildAgentRun(
     targetAgentType = typeId;
     targetConversationId = input.ids.conversationId;
     answerBridgeId = input.ids.answerBridgeId;
-    targetConversationTitle = `${typeId}: ${prompt.slice(0, 40)}`;
+    targetConversationTitle = args.taskName!.trim();
     agentMirror = {
       id: targetAgentId,
       typeId,
@@ -442,19 +433,6 @@ function normalizeRunAgentForegroundWaitMs(value: unknown): { ok: true; value: n
     return { ok: false, reason: 'run_agent.foregroundWaitMs 省略时默认为 0；传入时必须是 0 到 86400000 的整数毫秒数。' };
   }
   return { ok: true, value };
-}
-
-function defaultConversationForAgent(world: WorldReader, agent: Entity): Entity | undefined {
-  return world.query(AgentConversationLink)
-    .map((entity) => world.get(entity, AgentConversationLink))
-    .filter((link): link is NonNullable<typeof link> => !!link && link.agent === agent)
-    .sort((left, right) => rolePriority(right.role) - rolePriority(left.role)
-      || right.updatedAt - left.updatedAt
-      || right.id.localeCompare(left.id))[0]?.conversation;
-}
-
-function rolePriority(role: string): number {
-  return role === 'default' ? 2 : role === 'participant' ? 1 : 0;
 }
 
 function resolveAgentType(

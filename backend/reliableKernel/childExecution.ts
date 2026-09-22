@@ -6,6 +6,7 @@ import {
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   parseInputTurnIntentEnvelopeText,
@@ -327,6 +328,12 @@ export class ChildExecutionControlPlane {
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.attachments = options.attachments;
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
+  }
+
+  /** Model-facing task observations are reconstructed from committed lineage and source facts. */
+  public readConversationTaskProjection(conversationId: string) {
+    return readConversationChildTaskProjection(this.database, this.contentStore,
+      requirePhaseFId(conversationId, 'conversationId'));
   }
 
   /**
@@ -897,6 +904,11 @@ export class ChildExecutionControlPlane {
     if (parent.turn.status !== ACTIVE_TURN || parent.termination !== null || !parent.lease) {
       throw new Error('Child continuation requires an active parent Turn and ExecutionLease.');
     }
+    const originalParentTurn = await this.requireExisting('Turn',
+      requirePhaseFId(snapshot.parentLink.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id'));
+    if (originalParentTurn.conversation_id !== parent.conversation.id) {
+      throw new Error('Child continuation is outside the calling Conversation parent lineage.');
+    }
     if (parent.toolCall.status !== 'pending' || parent.toolExecution.status !== 'pending') {
       throw new Error('Child continuation source ToolCall is no longer pending.');
     }
@@ -956,6 +968,10 @@ export class ChildExecutionControlPlane {
       DOMAIN_REPOSITORIES.domain('ToolExecution').assert(parent.toolExecution.id as string, { status: 'pending' }),
       DOMAIN_REPOSITORIES.domain('ChildExecution').assert(command.childExecutionId, {
         status: snapshot.childExecution.status
+      }),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assert(snapshot.parentLink.id as string, {
+        child_execution_id: command.childExecutionId,
+        parent_turn_id: originalParentTurn.id
       }),
       ...(currentTurn && currentActiveLink ? [
         DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(currentActiveLink.id as string, {

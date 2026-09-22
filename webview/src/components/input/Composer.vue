@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
+import { IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import {
   type AgentRecord,
@@ -28,6 +28,7 @@ import SettingsSelectableList, { type SettingsSelectableListItem } from '@webvie
 import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
+import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
@@ -142,6 +143,35 @@ function compressCurrentContext(): void {
   const conversationId = reliableConversation.conversationId.value;
   if (!conversationId || !canCompressCurrentContext.value) return;
   compressContext(conversationId, { kind: 'current_head' });
+}
+const summaryRebuildTarget = ref<{ conversationId: string; rootId: string }>();
+const currentContextRootId = computed(() => {
+  const status = Object.values(reliableConversation.feed.records.ConversationContextStatus ?? {})
+    .find((candidate) => candidate.conversation_id === reliableConversation.conversationId.value);
+  return typeof status?.root_id === 'string' ? status.root_id : '';
+});
+const summaryRebuildCanConfirm = computed(() => canCompressCurrentContext.value
+  && summaryRebuildTarget.value?.conversationId === reliableConversation.conversationId.value
+  && summaryRebuildTarget.value?.rootId === currentContextRootId.value);
+const summaryRebuildActions = computed(() => [
+  { key: 'cancel', label: '取消', variant: 'secondary' as const },
+  { key: 'confirm', label: '重建摘要', disabled: !summaryRebuildCanConfirm.value }
+]);
+
+function beginSummaryRebuild(): void {
+  if (!canCompressCurrentContext.value || !currentContextRootId.value) return;
+  summaryRebuildTarget.value = {
+    conversationId: reliableConversation.conversationId.value,
+    rootId: currentContextRootId.value
+  };
+}
+
+function confirmSummaryRebuild(): void {
+  if (!summaryRebuildCanConfirm.value || !summaryRebuildTarget.value) return;
+  compressContext(summaryRebuildTarget.value.conversationId, { kind: 'current_head' }, {
+    sourceReplay: 'immutable_provenance'
+  });
+  summaryRebuildTarget.value = undefined;
 }
 const channelOptions = computed<SettingsDropdownOption[]>(() =>
   globalSettings.llmProviderConfigs.configs.map((config) => {
@@ -1059,6 +1089,22 @@ function middleEllipsis(value: string, maxLength: number): string {
           <path d="M5 5h14l-7 6zM5 19h14l-7-6z" />
         </svg>
       </button>
+      <HoverTooltipPanel
+        panel-title="从原始记录重建摘要"
+        :rows="[{ label: '来源', value: '当前上下文对应的原始对话和工具记录' }]"
+        :delay-ms="180"
+      >
+        <button
+          type="button"
+          class="composer-compact"
+          data-testid="compression-rebuild-current"
+          :disabled="!canCompressCurrentContext || !currentContextRootId"
+          aria-label="从原始记录重建摘要"
+          @click="beginSummaryRebuild"
+        >
+          <IconHistory class="composer-send-icon" stroke="2" aria-hidden="true" />
+        </button>
+      </HoverTooltipPanel>
       <button
         type="button"
         class="composer-send"
@@ -1070,6 +1116,17 @@ function middleEllipsis(value: string, maxLength: number): string {
         <IconSend2 class="composer-send-icon" stroke="2" aria-hidden="true" />
       </button>
     </div>
+    <ConfirmPanel
+      :open="!!summaryRebuildTarget"
+      title="从原始记录重建摘要？"
+      description="将读取当前上下文对应的原始对话和工具记录，按当前压缩配置重新生成摘要。原始记录和已有摘要保留；历史较长时会消耗更多 token。"
+      :actions="summaryRebuildActions"
+      test-id="compression-rebuild-confirm"
+      @confirm="confirmSummaryRebuild"
+      @cancel="summaryRebuildTarget = undefined"
+    >
+      <p v-if="!summaryRebuildCanConfirm">当前上下文或执行状态已变化，请关闭后重新选择。</p>
+    </ConfirmPanel>
   </div>
 </template>
 

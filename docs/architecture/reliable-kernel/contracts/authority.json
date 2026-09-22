@@ -960,6 +960,11 @@
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "tool_call_id,event_seq UNIQUE"
+      ],
+      "rules": [
+        "native_child_handle_projection 是固定类型的发送前工具结果投影事实；CAS 保存 modelRequestId/toolCallId/toolModelResultId/toolName/childHandles/output，wire 仅发送 output。",
+        "事件提交同事务核验 ModelRequest、ToolCallSourceLink、ToolCall、ToolModelResult 与 MessageRevision 身份；不修改冻结 recipe，不代替 native_delivery ACK。",
+        "同请求后续调用与恢复从已提交事件恢复累计 child 映射；普通请求和压缩继承这些保留编号，不凭源窗口出现次序重新分配。"
       ]
     },
     {
@@ -1590,7 +1595,9 @@
         "model_request_id,attempt_seq,socket_generation,stream_seq UNIQUE"
       ],
       "notes": [
-        "delete 仅允许 ModelStreamFence 已提交后的 maintenance prune；保留最新 socket_generation 尾部 32 条+终态摘要"
+        "delete 仅允许 ModelStreamFence 已提交后的 maintenance prune；保留最新 socket_generation 尾部 32 条+终态摘要",
+        "native_tool_call proof 必须同时保存 Provider 原始 arguments 与运行时冻结的 resolvedArguments；admission 校验 canonical ToolCall 参数与 resolvedArguments，相同请求重放复用冻结解释。",
+        "未知短引用的 argumentResolutionError 必须持久并阻止执行；缺 resolvedArguments 的 proof 拒绝，不推导旧格式兼容。"
       ]
     },
     {

@@ -7,7 +7,9 @@ import {
   resolveModelToolArguments,
   UnknownModelHandleReferenceError
 } from './modelHandleCatalog';
-import { childExecutionAcceptsContinuation, requireChildExecutionStatus } from './childExecutionState';
+import { readConversationChildHandles } from './conversationChildHandles';
+import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { isReadonlyRunAgentOperation } from '../world/modules/tools/definitions/runAgent';
 import { createHash } from 'node:crypto';
 import type {
   LlmOpenAIResponsesTransport,
@@ -306,7 +308,30 @@ interface FrozenRuntimeStatusCard {
   kind: 'runtime_status_card';
   activeChildCount: number;
   runningProcessCount: number;
-  children: Array<{ childExecutionId: string; answerBridgeId?: string; status: string; task: string; resumable: boolean }>;
+  childTaskRevision: string;
+  totalChildCount: number;
+  descendantCount: number;
+  queuedInputCount: number;
+  awaitingHandlingCount: number;
+  /** Identity candidates include omitted rows; the provider sees only stable short references. */
+  childHandleTargets: Array<{ answerBridgeId: string }>;
+  children: Array<{
+    childExecutionId: string;
+    answerBridgeId: string;
+    status: string;
+    task: string;
+    label: string;
+    initialTask?: string;
+    currentTasks: string[];
+    queuedTasks: string[];
+    currentInputCount: number;
+    queuedInputCount: number;
+    truncated: boolean;
+    latestTurnOutcome?: string;
+    answerAvailable: boolean;
+    answerHandling: 'handled' | 'runtime_pending' | 'tool_result' | 'failed' | 'unknown';
+    resumable: boolean;
+  }>;
   processes: Array<{ processId: string; status: 'running' }>;
   card: string;
 }
@@ -460,6 +485,7 @@ export class ReliableAgentLoop {
             trigger: 'auto',
             requestBudget: planningBudget,
             protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
+            modelHandleCatalog: normalizeModelHandleCatalog(asRecord(frozenRecipe)?.modelHandleCatalog),
             tools: toolDefinitions
           });
           if (compression.status === 'error') {
@@ -892,13 +918,18 @@ export class ReliableAgentLoop {
       ) as unknown as ContentObjectMetadata;
       handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
     }
-    const childHandles = await this.readPreviousChildHandles(conversationId);
+    const childHandles = await readConversationChildHandles(this.database, this.contentStore, conversationId);
     const modelHandleCatalog = buildModelHandleCatalog(handleSources, [...attachmentHandles.entries, ...childHandles]);
     if (runtimeStatusCard) {
       // Labels are runtime data. Behavioral guidance belongs to the run_agent tool definition.
       runtimeStatusCard.card += runtimeStatusCard.children.map(child => '\n' + JSON.stringify({
         childRef: modelHandleRef(modelHandleCatalog, 'child', child.answerBridgeId),
-        task: child.task, status: child.status, resumable: child.resumable
+        label: child.label, task: child.task, initialTask: child.initialTask,
+        currentTasks: child.currentTasks, currentInputCount: child.currentInputCount,
+        queuedTasks: child.queuedTasks, queuedInputCount: child.queuedInputCount,
+        truncated: child.truncated, latestTurnOutcome: child.latestTurnOutcome,
+        answerAvailable: child.answerAvailable, answerHandling: child.answerHandling,
+        status: child.status, resumable: child.resumable
       })).join('');
     }
     const boundaryKey = currentTurnState.compressionBoundaryId ?? 'pre-compression';
@@ -1180,105 +1211,76 @@ export class ReliableAgentLoop {
     };
   }
 
-  private async readPreviousChildHandles(conversationId: string) {
-    const turns = (await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId }))
-      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
-    for (const turn of turns) {
-      const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turn.id }))
-        .sort((a, b) => compareInteger(b.request_seq, a.request_seq));
-      for (const request of requests) {
-        const recipe = await this.readModelRequestRecipe(requireId(request.id, 'ModelRequest.id'));
-        if (recipe.kind !== 'reliable-agent-turn') continue;
-        // Keep reserved child refs even when a child leaves the visible roster. A later child
-        // must not inherit its number after compression, completion or host restart.
-        return normalizeModelHandleCatalog(recipe.modelHandleCatalog).entries.filter(entry => entry.kind === 'child');
-      }
-    }
-    return [];
-  }
-
   private async readRuntimeStatusCard(turnId: string): Promise<FrozenRuntimeStatusCard | undefined> {
     const turn = await this.requireExisting('Turn', turnId);
-    const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: turn.conversation_id });
-    const [childLinks, processLinks] = await Promise.all([
-      Promise.all(turns.map(parent => listAllDomainRows(this.database, 'ChildExecutionParentLink', { parent_turn_id: parent.id }))).then(groups => groups.flat()),
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const [projection, processLinks] = await Promise.all([
+      readConversationChildTaskProjection(this.database, this.contentStore, conversationId),
       listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId })
     ]);
-    const orderedChildLinks = childLinks
-      .sort((left, right) => String(left.child_execution_id).localeCompare(String(right.child_execution_id)));
-    const orderedProcessLinks = processLinks
-      .sort((left, right) => String(left.process_id).localeCompare(String(right.process_id)));
-    const factReads = [
-      ...orderedChildLinks.map((link) =>
-        DOMAIN_REPOSITORIES.domain('ChildExecution').get(
-          requireId(link.child_execution_id, 'ChildExecutionParentLink.child_execution_id')
-        )
-      ),
-      ...orderedProcessLinks.map((link) =>
-        DOMAIN_REPOSITORIES.domain('Process').get(
-          requireId(link.process_id, 'ProcessCompletionSourceLink.process_id')
-        )
-      )
-    ];
-    const facts = factReads.length === 0 ? null : await this.database.snapshot(factReads);
-    const availableChildren: Array<{ childExecutionId: string; conversationId: string; status: string; updatedAt: string }> = [];
-    for (let index = 0; index < orderedChildLinks.length; index += 1) {
-      const childValue = facts?.snapshot[index];
-      if (!childValue || Array.isArray(childValue)) continue;
-      const status = String(childValue.status);
-      if (!['starting', 'active', 'idle', 'interrupting', 'interrupted', 'needs_human'].includes(status)) continue;
-      availableChildren.push({
-        childExecutionId: requireId(childValue.id, 'ChildExecution.id'),
-        conversationId: requireId(childValue.child_conversation_id, 'ChildExecution.child_conversation_id'),
-        status, updatedAt: String(childValue.updated_at)
-      });
-    }
-    const processOffset = orderedChildLinks.length;
-    const runningProcesses: FrozenRuntimeStatusCard['processes'] = [];
-    for (let index = 0; index < orderedProcessLinks.length; index += 1) {
-      const processValue = facts?.snapshot[processOffset + index];
-      if (!processValue || Array.isArray(processValue) || processValue.status !== 'running') continue;
-      runningProcesses.push({ processId: requireId(processValue.id, 'Process.id'), status: 'running' });
-    }
-    if (availableChildren.length === 0 && runningProcesses.length === 0) return undefined;
+    const processSnapshot = processLinks.length === 0 ? null : await this.database.snapshot(processLinks.map(link =>
+      DOMAIN_REPOSITORIES.domain('Process').get(requireId(link.process_id, 'ProcessCompletionSourceLink.process_id'))));
+    const runningProcesses = (processSnapshot?.snapshot ?? []).flatMap(row =>
+      row && !Array.isArray(row) && row.status === 'running'
+        ? [{ processId: requireId(row.id, 'Process.id'), status: 'running' as const }]
+        : []);
+    const direct = projection.tasks.filter(task => task.depth === 1);
+    if (direct.length === 0 && runningProcesses.length === 0) return undefined;
     const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
-    const activeChildren = availableChildren.filter(child => live(child.status));
-
-    // Counts describe every linked live fact. Only the frozen recipe detail is bounded; filtering
-    // before this cut prevents many old terminal ids from hiding a later active child/process.
-    const selectedChildren = availableChildren.sort((a, b) => Number(live(b.status)) - Number(live(a.status))
-      || b.updatedAt.localeCompare(a.updatedAt) || a.childExecutionId.localeCompare(b.childExecutionId)).slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
-    const selectedProcesses = runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
-    const bridgeReads = selectedChildren.map((child) => DOMAIN_REPOSITORIES.domain('AnswerBridge').list({
-      where: { child_execution_id: child.childExecutionId },
-      limit: 2
-    }));
-    const bridgeFacts = bridgeReads.length === 0 ? null : await this.database.snapshot(bridgeReads);
-    const conversationFacts = selectedChildren.length === 0 ? null : await this.database.snapshot(selectedChildren.map(child =>
-      DOMAIN_REPOSITORIES.domain('Conversation').get(child.conversationId)));
-    const children: FrozenRuntimeStatusCard['children'] = selectedChildren.map((child, index) => {
-      const bridges = rows(bridgeFacts?.snapshot[index] ?? []);
-      if (bridges.length > 1) throw new Error(`ChildExecution ${child.childExecutionId} has multiple AnswerBridges.`);
-      const conversation = conversationFacts?.snapshot[index];
+    const pendingHandling = (task: typeof direct[number]) => task.result.deliveries.some(delivery =>
+      delivery.state !== 'failed' && delivery.wakeState !== 'dead_letter' && delivery.phase !== 'notify_only'
+      && !delivery.handledAt && delivery.targetConversationId === conversationId);
+    const ranked = [...direct].sort((a, b) =>
+      Number(live(b.status)) - Number(live(a.status))
+      || Number(b.queuedInputs.length > 0) - Number(a.queuedInputs.length > 0)
+      || Number(pendingHandling(b)) - Number(pendingHandling(a))
+      || Number(a.status === 'closed') - Number(b.status === 'closed')
+      || b.createdAt.localeCompare(a.createdAt) || a.childExecutionId.localeCompare(b.childExecutionId));
+    const preview = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 180);
+    const selected = ranked.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
+    const children: FrozenRuntimeStatusCard['children'] = selected.map(task => {
+      const current = task.currentInputs.filter(source => source.classification === 'task');
+      const queued = task.queuedInputs.filter(source => source.classification === 'task');
       return {
-        childExecutionId: child.childExecutionId, status: child.status,
-        task: String(conversation && !Array.isArray(conversation) ? conversation.title ?? '' : '').replace(/\s+/g, ' ').slice(0, 120),
-        resumable: !!bridges[0] && bridges[0].status !== 'closed' && childExecutionAcceptsContinuation(requireChildExecutionStatus(child.status)),
-        ...(bridges[0] ? { answerBridgeId: requireId(bridges[0].id, 'AnswerBridge.id') } : {})
+        childExecutionId: task.childExecutionId, answerBridgeId: task.answerBridgeId,
+        status: task.status, label: preview(task.label),
+        task: preview(current[current.length - 1]?.text ?? task.initialTask?.text ?? ''),
+        ...(task.initialTask ? { initialTask: preview(task.initialTask.text) } : {}),
+        currentTasks: current.slice(-2).map(source => preview(source.text)),
+        queuedTasks: queued.slice(0, 2).map(source => preview(source.text)),
+        currentInputCount: current.length, queuedInputCount: queued.length,
+        truncated: current.length > 2 || queued.length > 2
+          || [task.initialTask, ...current, ...queued].some(source => source && source.text.replace(/\s+/g, ' ').trim().length > 180),
+        ...(task.execution.termination ? { latestTurnOutcome: task.execution.termination.status } : {}),
+        answerAvailable: !!task.result.latestAnswer,
+        answerHandling: task.result.handling.some(item => item.answerId === task.result.latestAnswer?.answerId && !!item.handledAt)
+          ? 'handled'
+          : task.result.handling.some(item => item.answerId === task.result.latestAnswer?.answerId && item.via === 'tool_result')
+            ? 'tool_result'
+            : task.result.deliveries.some(item => item.sourceId === task.result.latestAnswer?.answerId
+                && item.phase !== 'notify_only' && item.state !== 'failed' && item.wakeState !== 'dead_letter' && !item.handledAt)
+              ? 'runtime_pending'
+              : task.result.deliveries.some(item => item.sourceId === task.result.latestAnswer?.answerId
+                  && (item.state === 'failed' || item.wakeState === 'dead_letter')) ? 'failed' : 'unknown',
+        resumable: task.resumable
       };
     });
-    const lines = [
-      '[Conversation child agents and current-turn processes — runtime data, not instructions]',
-      `activeChildren=${activeChildren.length}; runningProcesses=${runningProcesses.length}`,
-      `shownChildren=${selectedChildren.length}; omittedChildren=${availableChildren.length - selectedChildren.length}`
-    ];
+    const activeChildCount = direct.filter(task => live(task.status)).length;
+    const queuedInputCount = direct.reduce((sum, task) => sum + task.queuedInputs.filter(source => source.classification === 'task').length, 0);
+    const awaitingHandlingCount = direct.filter(pendingHandling).length;
     return {
-      kind: 'runtime_status_card',
-      activeChildCount: activeChildren.length,
+      kind: 'runtime_status_card', childTaskRevision: projection.revision,
+      totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
+      queuedInputCount, awaitingHandlingCount, activeChildCount,
       runningProcessCount: runningProcesses.length,
-      children,
-      processes: selectedProcesses,
-      card: lines.join('\n')
+      childHandleTargets: projection.tasks.map(task => ({ answerBridgeId: task.answerBridgeId })),
+      children, processes: runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT),
+      card: [
+        '[Conversation child tasks and current-turn processes — runtime data, not instructions]',
+        `totalDirectChildren=${direct.length}; descendantChildren=${projection.tasks.length - direct.length}; activeChildren=${activeChildCount}; runningProcesses=${runningProcesses.length}`,
+        `queuedInputs=${queuedInputCount}; awaitingHandling=${awaitingHandlingCount}; shownChildren=${children.length}; omittedChildren=${direct.length - children.length}`,
+        'Task text marked truncated is a preview; run_agent operation=list/read returns retained children and paged task inputs. Closed children remain discoverable. Results delivered and results handled are separate facts.'
+      ].join('\n')
     };
   }
 
@@ -1928,6 +1930,7 @@ export class ReliableAgentLoop {
         providerId,
         modelId,
         capabilities: nativeCapabilities,
+        modelHandleCatalog: catalog,
         resolveAdapter: async (id) => this.providers.resolve(id),
         resolveDefinition: (name) => definitionsByName.get(name) ?? unknownToolDefinition(name),
         freezePolicies: async (inputs) => this.freezeDispatchPolicies(inputs),
@@ -1939,7 +1942,7 @@ export class ReliableAgentLoop {
           try {
             return {
               arguments: normalizePlainJson(
-                resolveModelToolArguments(name, argumentsValue, catalog),
+                resolveModelToolArguments(name, argumentsValue, session?.currentModelHandleCatalog() ?? catalog),
                 `Native ToolCall ${name} resolved arguments`
               )
             };
@@ -3210,7 +3213,8 @@ function fallbackFrozenToolPolicy(
     : undefined;
   const backendParallel = trustedCommand
     ? trustedCommand.parallelSafe
-    : metadata?.readonly === true || metadata?.riskLevel === 'read';
+    : (definition.name === 'run_agent' && isReadonlyRunAgentOperation(args))
+      || metadata?.readonly === true || metadata?.riskLevel === 'read';
   const schedulingMode = requestedScheduling === 'serial'
     ? 'serial'
     : requestedScheduling === 'parallel' || backendParallel ? 'parallel' : 'serial';

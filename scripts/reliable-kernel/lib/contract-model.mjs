@@ -16,6 +16,7 @@ export const CONTRACT_FILES = [
 ];
 
 const CONTRACT_REVISION = '2026-07-31-r4';
+const SUBAGENT_CONTRACT_REVISION = '2026-09-22-r5';
 const STAGES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 const ROOT_BINDING_FIELDS = [
   'paths',
@@ -351,7 +352,8 @@ function validateCommon(documents, failures) {
       continue;
     }
     if (document.contractKind !== kind) failures.push(`${file}.contractKind必须是${kind}`);
-    if (document.contractRevision !== CONTRACT_REVISION) failures.push(`${file}.contractRevision必须统一为${CONTRACT_REVISION}`);
+    const expectedRevision = file === 'subagent.json' ? SUBAGENT_CONTRACT_REVISION : CONTRACT_REVISION;
+    if (document.contractRevision !== expectedRevision) failures.push(`${file}.contractRevision必须为${expectedRevision}`);
     if (!['planned', 'active'].includes(document.status)) failures.push(`${file}.status必须是planned或active`);
     if ('$schema' in document) failures.push(`${file}不应通过另一份JSON Schema绕开直接校验`);
   }
@@ -970,7 +972,23 @@ function validateContext(context, failures) {
 }
 
 function validateSubagent(subagent, failures) {
-  failures.push(...exactSetProblems('子Agent操作', ['spawn', 'send', 'wait', 'list', 'interrupt_subtree'], subagent?.operations ?? []));
+  failures.push(...exactSetProblems('子Agent操作', ['spawn', 'send', 'wait', 'list', 'read', 'interrupt_subtree'], subagent?.operations ?? []));
+  failures.push(...exactSetProblems('子Agent模型必填字段', ['operation'], subagent?.modelContract?.required ?? []));
+  failures.push(...exactSetProblems('子Agent新建字段', ['taskName', 'prompt'], subagent?.modelContract?.spawnRequired ?? []));
+  failures.push(...exactSetProblems('子Agent续派字段', ['childRef', 'prompt'], subagent?.modelContract?.sendRequired ?? []));
+  if (subagent?.modelContract?.implicitSpawnAllowed !== false || subagent?.modelContract?.legacyModeAllowed !== false) {
+    failures.push('子Agent必须显式选择操作，不能缺引用隐式新建或回退旧mode');
+  }
+  if (subagent?.assignmentProjection?.runtimeSchemaChangeRequired !== false
+    || subagent?.assignmentProjection?.cardLimit !== 32) failures.push('子任务视图须复用现有Runtime事实并保持32条卡片上限');
+  for (const operation of ['list', 'read']) {
+    const contract = subagent?.[operation];
+    if (contract?.readOnly !== true || contract?.pagination?.defaultLimit !== 32
+      || contract?.pagination?.maximumLimit !== 100 || contract?.pagination?.maximumPageTokens !== 2600
+      || contract?.pagination?.cursor !== true || contract?.pagination?.rereadCursor !== true) {
+      failures.push(`子Agent ${operation}须提供只读、有界、可重读的分页合同`);
+    }
+  }
   if (subagent?.releaseDecisions?.interruptSubtree !== 'required-first-release') failures.push('interrupt_subtree必须是首发必选能力');
   failures.push(...exactSetProblems('ChildExecution lineage领域', [
     'ChildExecution',

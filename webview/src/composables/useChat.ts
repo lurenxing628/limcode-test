@@ -1489,8 +1489,11 @@ export function useChat() {
 
   function compressContext(
     conversationId: string,
-    target: { kind: 'current_head' } | { kind: 'through_message'; messageId: string }
+    target: { kind: 'current_head' } | { kind: 'through_message'; messageId: string },
+    options: { sourceReplay?: CompressionStartPayload['sourceReplay'] } = {}
   ): boolean {
+    if (options.sourceReplay !== undefined
+      && (options.sourceReplay !== 'immutable_provenance' || target.kind !== 'current_head')) return false;
     const frozenTarget = freezeCompressionTarget(conversationId, target);
     if (!conversationId || !frozenTarget) return false;
     const targetId = frozenTarget.kind === 'through_message' ? frozenTarget.messageId : frozenTarget.expectedRootId;
@@ -1500,11 +1503,14 @@ export function useChat() {
       conversationId,
       action: 'compress',
       targetId,
-      label: '正在停止后总结',
+      label: options.sourceReplay ? '正在从原始记录重建摘要' : '正在停止后总结',
       phase: 'waiting_for_idle',
       commandPayload: {
         type: BridgeMessageType.CompressionStart,
-        payload: { conversationId, target: frozenTarget, command }
+        payload: {
+          conversationId, target: frozenTarget, command,
+          ...(options.sourceReplay ? { sourceReplay: options.sourceReplay } : {})
+        }
       }
     });
   }
@@ -1672,7 +1678,9 @@ export function useChat() {
       case BridgeMessageType.MessageDeleteFrom:
         return bridge.request(command.type, command.payload);
       case BridgeMessageType.CompressionStart:
-        return bridge.request(command.type, command.payload);
+        return bridge.request(command.type, toStructuredClonePlainData(
+          command.payload, 'compression command'
+        ) as unknown as CompressionStartPayload);
     }
   }
 
