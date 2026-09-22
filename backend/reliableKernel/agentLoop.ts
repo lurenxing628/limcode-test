@@ -414,6 +414,7 @@ export class ReliableAgentLoop {
       // settlement and Context append replays that one round idempotently. Only after the replayed
       // round is complete do we advance to request_seq + 1. There is no process-local round cap:
       // safety limits belong to explicit token/cost/time policy, never an invisible failed Turn.
+      await this.openEmptyContextWithDeliveredInput(turnId);
       const resumeState = await this.readResumeState(turnId);
       let requestSequence = resumeState.requestSequence;
       let openTaskCompletionCheckConsumed = resumeState.openTaskCompletionCheckConsumed;
@@ -2674,6 +2675,21 @@ export class ReliableAgentLoop {
       .sort((left, right) => compareGuidancePositions(left.position, right.position)
         || String(left.intent.created_at).localeCompare(String(right.intent.created_at))
         || String(left.intent.id).localeCompare(String(right.intent.id)))[0] ?? null;
+  }
+
+  /**
+   * A peer followup may start a Conversation's very first Turn. Its delivered input is then the
+   * first Context occurrence, so it is absorbed before the round reads the Context head.
+   */
+  private async openEmptyContextWithDeliveredInput(turnId: string): Promise<void> {
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== 'active') return;
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    if ((await this.list('ConversationContextHeadLink', { conversation_id: conversationId }, 1)).length > 0) return;
+    if (!this.database.conversationOwners.owns(conversationId)) {
+      throw new ExecutionHandoffError(`Conversation ${conversationId} is not owned by this Runtime Host.`);
+    }
+    await this.absorbRuntimeDeliveryInputs(turnId);
   }
 
   private async absorbRuntimeDeliveryInputs(turnId: string): Promise<number> {

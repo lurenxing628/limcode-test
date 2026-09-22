@@ -35,12 +35,16 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
     if (request.childExecutionId) {
       // Only the child scheduler can establish membership and the next generation's lease.
       if (!children) return { acknowledged: false };
+      if (request.sourceTurnId === null) throw new Error('A child runtime delivery requires the child\'s latest Turn.');
       return children.runtimeDeliveryContinuation({ deliveryId: request.deliveryId,
         childExecutionId: request.childExecutionId, sourceTurnId: request.sourceTurnId });
     }
+    // A peer message never borrows the destination's previous Turn authority: the continuation
+    // runs under the destination's current settings and may be its very first Turn.
     const continuation = await runner.runtimeContinuation({
       commandId: `runtime-delivery:${request.deliveryId}`, deliveryId: request.deliveryId,
-      conversationId: request.conversationId, sourceTurnId: request.sourceTurnId
+      conversationId: request.conversationId,
+      sourceTurnId: request.sourceKind === 'collaboration_message' ? null : request.sourceTurnId
     });
     return { acknowledged: Boolean(continuation.intentId) };
   };

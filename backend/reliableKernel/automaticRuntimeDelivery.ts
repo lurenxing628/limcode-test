@@ -41,7 +41,8 @@ export type AutomaticRuntimeDeliveryReason =
 export interface AutomaticRuntimeDeliveryDecision {
   phase: RuntimeDeliveryPhase;
   targetTurnId: string | null;
-  sourceTurnId: string;
+  /** Null only for a collaboration delivery to a Conversation that has no Turn yet. */
+  sourceTurnId: string | null;
   targetConversationId: string;
   reason: AutomaticRuntimeDeliveryReason;
   childExecutionId: string | null;
@@ -219,7 +220,7 @@ export class AutomaticRuntimeDeliveryRouter {
   public async resolve(input: {
     inboxItemId: string;
     targetConversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
   }): Promise<AutomaticRuntimeDeliveryDecision> {
     const inboxItemId = requireId(input.inboxItemId, 'inboxItemId');
     const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
@@ -410,7 +411,7 @@ export class AutomaticRuntimeDeliveryRouter {
 
   /** Collaboration has destination authority, separate from the sender's Turn or user authority. */
   private async resolveCollaboration(input: {
-    inboxItemId: string; targetConversationId: string; sourceTurnId: string;
+    inboxItemId: string; targetConversationId: string; sourceTurnId: string | null;
   }, inbox: DomainRow): Promise<AutomaticRuntimeDeliveryDecision> {
     const message = await this.requireExisting('CollaborationMessage', requireId(inbox.source_id, 'Collaboration message id'));
     const links = await this.list('CollaborationMessageTargetLink', { message_id: message.id }, 2);
@@ -470,7 +471,7 @@ export class AutomaticRuntimeDeliveryRouter {
   public async reconcilePendingDelivery(input: {
     deliveryId: string;
     targetConversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
   }): Promise<{ delivery: DomainRow; decision: AutomaticRuntimeDeliveryDecision; changed: boolean }> {
     const deliveryId = requireId(input.deliveryId, 'deliveryId');
     const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
@@ -650,7 +651,7 @@ function decision(input: {
   phase?: RuntimeDeliveryPhase;
   targetTurnId?: string | null;
   targetConversationId: string;
-  sourceTurnId: string;
+  sourceTurnId: string | null;
   reason: AutomaticRuntimeDeliveryReason;
   childExecutionId?: string;
   authoritySteps?: RepositoryTransactionStep[];

@@ -504,6 +504,7 @@ class SnapshotContentReader {
       const envelope = await this.json(id);
       const continuation = parseRuntimeContinuationTurnIntentEnvelope(envelope);
       if (!continuation) throw new Error(`Child runtime continuation ${id} has an unsupported envelope kind.`);
+      if (continuation.sourceTurnId === null) throw new Error(`Child runtime continuation ${id} has no source Turn.`);
       return { ...value, contentObjectId: id, classification: 'runtime', sourceTurnId: continuation.sourceTurnId };
     }
     if (value.contentType !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
@@ -520,7 +521,9 @@ class SnapshotContentReader {
     const continuation = parseRuntimeContinuationTurnIntentEnvelope(envelope);
     if (continuation || envelope.kind === 'retry') {
       return { ...value, contentObjectId: id, classification: 'runtime', content: envelope,
-        sourceTurnId: continuation?.sourceTurnId ?? requireText(envelope.sourceTurnId, 'TurnIntent retry.sourceTurnId') };
+        ...(continuation
+          ? continuation.sourceTurnId === null ? {} : { sourceTurnId: continuation.sourceTurnId }
+          : { sourceTurnId: requireText(envelope.sourceTurnId, 'TurnIntent retry.sourceTurnId') }) };
     }
     throw new Error(`TurnIntent ${id} has an unsupported envelope kind.`);
   }

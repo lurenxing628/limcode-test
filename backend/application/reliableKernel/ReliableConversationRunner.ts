@@ -366,12 +366,15 @@ export class ReliableConversationRunner {
     });
   }
 
-  /** Durable internal continuation: no visible synthetic user message and frozen source authority. */
+  /**
+   * Durable internal continuation without a visible synthetic user message. A non-null source Turn
+   * supplies frozen authority; a collaboration delivery (null) runs under current settings.
+   */
   public async runtimeContinuation(input: {
     commandId: string;
     deliveryId: string;
     conversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
     return this.conversationOwners.run(input.conversationId, async () => {

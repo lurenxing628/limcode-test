@@ -258,7 +258,7 @@ function turnIntentPreview(intentId: string): ReliableKernelTurnIntentPreview | 
     }
     if (
       value.kind !== 'runtime_continuation'
-      || typeof value.sourceTurnId !== 'string'
+      || (typeof value.sourceTurnId !== 'string' && value.sourceTurnId !== null)
       || typeof value.deliveryId !== 'string'
       || typeof value.deliveryState !== 'string'
       || typeof value.phase !== 'string'

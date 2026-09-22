@@ -39,6 +39,8 @@
 
 生产唤醒统一使用 `createRuntimeDeliveryWakeHandler`：先验证 Conversation owner，子任务进入 Child coordinator，普通对话进入 Conversation runner。恢复根据持久事实收敛，不依赖仍存活的 Promise 或收到回调的 Host。
 
+普通对话的协作续跑不继承目标上一轮的冻结权限：续跑意图的 `sourceTurnId` 为 null，权限按目标对话当前设置编译，与用户输入开启新一轮相同。因此 followup 也可以开启一个还没有任何轮次的对话的第一轮；投递内容以协作来源信封进入上下文，不写用户消息。
+
 ## 上下文继承
 
 `run_agent.spawn.forkTurns` 接受 `none`、`all` 或正整数文字，默认 `none`。只复制当前上下文可达的已完成轮，压缩后按来源恢复；排除当前未完成轮及旧 system/runtime_context，不继承原 lease、配置 authority 或 ChildExecution 控制关系。继承历史、新任务正文、新子会话和父子关系在同一事务建立。

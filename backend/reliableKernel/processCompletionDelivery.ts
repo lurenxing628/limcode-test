@@ -38,7 +38,8 @@ export interface ProcessCompletionWakeRequest {
   processId?: string;
   processReceiptId?: string;
   conversationId: string;
-  sourceTurnId: string;
+  /** Null only for a collaboration message to a Conversation that has no Turn yet. */
+  sourceTurnId: string | null;
   targetTurnId: string | null;
   contentObjectId: string;
   action: ProcessCompletionWakeAction;
@@ -819,7 +820,7 @@ export class ProcessCompletionDeliveryControlPlane {
     sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure' | 'collaboration_message';
     sourceId: string;
     conversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
     processId?: string;
     processReceiptId?: string;
   }> {
@@ -834,9 +835,9 @@ export class ProcessCompletionDeliveryControlPlane {
       if (targets.length !== 1 || targets[0].conversation_id !== targetConversationId || targets[0].inbox_item_id !== inbox.id || payloads.length !== 1 || payloads[0].content_object_id !== contentObjectId) throw new Error('Collaboration wake has conflicting destination or payload facts.');
       const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: targetConversationId });
       turns.sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)) || String(right.id).localeCompare(String(left.id)));
+      // A followup may start a Conversation's very first Turn; it then has no anchor Turn at all.
       const anchor = turns.find((turn) => turn.status === 'active') ?? turns[0];
-      if (!anchor) throw new Error('Collaboration wake destination has no Turn.');
-      return { sourceKind: 'collaboration_message', sourceId, conversationId: targetConversationId, sourceTurnId: String(anchor.id) };
+      return { sourceKind: 'collaboration_message', sourceId, conversationId: targetConversationId, sourceTurnId: anchor ? String(anchor.id) : null };
     }
     if (inbox.source_kind === 'process_receipt') {
       const frozen = await this.readFrozenCompletionPayload(contentObjectId, sourceId);

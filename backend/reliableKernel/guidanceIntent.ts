@@ -17,7 +17,12 @@ export interface InputTurnIntentEnvelope {
 export interface RuntimeContinuationTurnIntentEnvelope {
   version: 1;
   kind: 'runtime_continuation';
-  sourceTurnId: string;
+  /**
+   * Same-Conversation Turn whose frozen authority the continuation inherits. Null only for a
+   * collaboration delivery: that continuation compiles the destination's current settings and
+   * may start the Conversation's very first Turn.
+   */
+  sourceTurnId: string | null;
 }
 
 export type TurnIntentEnvelope = InputTurnIntentEnvelope | RuntimeContinuationTurnIntentEnvelope;
@@ -64,12 +69,12 @@ export function parseInputTurnIntentEnvelopeText(source: string): InputTurnInten
 }
 
 export function runtimeContinuationTurnIntentEnvelope(input: {
-  sourceTurnId: string;
+  sourceTurnId: string | null;
 }): RuntimeContinuationTurnIntentEnvelope {
   return {
     version: 1,
     kind: 'runtime_continuation',
-    sourceTurnId: requireId(input.sourceTurnId, 'sourceTurnId')
+    sourceTurnId: input.sourceTurnId === null ? null : requireId(input.sourceTurnId, 'sourceTurnId')
   };
 }
 
@@ -80,7 +85,9 @@ export function parseRuntimeContinuationTurnIntentEnvelope(
   const record = value as Record<string, unknown>;
   if (record.kind !== 'runtime_continuation') return null;
   return runtimeContinuationTurnIntentEnvelope({
-    sourceTurnId: requireId(record.sourceTurnId, 'TurnIntent runtime_continuation.sourceTurnId')
+    sourceTurnId: record.sourceTurnId === null
+      ? null
+      : requireId(record.sourceTurnId, 'TurnIntent runtime_continuation.sourceTurnId')
   });
 }
 

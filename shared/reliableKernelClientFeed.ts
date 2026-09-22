@@ -157,7 +157,8 @@ export interface ReliableKernelRuntimeContinuationTurnIntentPreview {
   version: 3;
   kind: 'runtime_continuation';
   revisionSeq: string;
-  sourceTurnId: string;
+  /** Null for a collaboration continuation, which runs under the destination's current settings. */
+  sourceTurnId: string | null;
   deliveryId: string;
   deliveryState: string;
   phase: string;

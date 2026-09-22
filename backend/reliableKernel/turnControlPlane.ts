@@ -223,10 +223,15 @@ export interface TurnContinuationCommand extends TurnExecutionCommand {
   contentType?: string;
 }
 
-/** Internal no-visible-message continuation created for one exact RuntimeDelivery. */
+/**
+ * Internal no-visible-message continuation created for one exact RuntimeDelivery. Process and
+ * child-answer deliveries inherit the frozen authority of their same-Conversation source Turn. A
+ * collaboration delivery has no such Turn (sourceTurnId is null): the destination runs under its
+ * own current settings, exactly like a user input, and may start its very first Turn.
+ */
 export interface TurnRuntimeDeliveryContinuationCommand extends TurnExecutionCommand {
   source: TurnInitiatingSource & { kind: 'internal' };
-  sourceTurnId: string;
+  sourceTurnId: string | null;
   deliveryId: string;
   maintenance?: undefined;
 }
@@ -610,13 +615,31 @@ export class TurnControlPlane {
         runtimeMaintenance: normalizeRuntimeMaintenance(command.maintenance)
       }));
     }
-    return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
-      command,
-      operation: 'runtime_continuation',
-      sourceTurnId: command.sourceTurnId,
-      deliveryId: requireId(command.deliveryId, 'deliveryId'),
-      inheritSourceAuthority: true
-    }));
+    return this.runOwnedConversationMutation(command.conversationId, async () => {
+      const deliveryId = requireId(command.deliveryId, 'deliveryId');
+      const collaboration = await this.isCollaborationDelivery(deliveryId);
+      if (collaboration !== (command.sourceTurnId === null)) {
+        throw new TypeError(collaboration
+          ? 'A collaboration continuation compiles the destination\'s current authority and carries no source Turn.'
+          : 'A runtime continuation inherits the frozen authority of its exact source Turn.');
+      }
+      return this.startIntent({
+        command,
+        operation: 'runtime_continuation',
+        ...(command.sourceTurnId === null ? {} : { sourceTurnId: command.sourceTurnId }),
+        deliveryId,
+        inheritSourceAuthority: !collaboration
+      });
+    });
+  }
+
+  private async isCollaborationDelivery(deliveryId: string): Promise<boolean> {
+    const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
+    const inbox = await this.requireExisting(
+      'RuntimeInboxItem',
+      requireId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
+    );
+    return inbox.source_kind === 'collaboration_message';
   }
 
   public edit(command: TurnEditCommand): Promise<TurnCommandResult> {
@@ -1673,7 +1696,7 @@ export class TurnControlPlane {
         ? await this.contentStore.prepare(
             this.database,
             JSON.stringify(runtimeContinuationTurnIntentEnvelope({
-              sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId')
+              sourceTurnId: plan.inheritSourceAuthority ? requireId(plan.sourceTurnId, 'sourceTurnId') : null
             })),
             TURN_INTENT_ENVELOPE_CONTENT_TYPE
           )

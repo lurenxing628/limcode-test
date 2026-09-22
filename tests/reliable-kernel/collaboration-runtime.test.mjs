@@ -41,6 +41,7 @@ const { agentCollaborationToolModules } = load('backend/world/modules/tools/defi
 const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
 const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
 const { LlmEventType } = load('backend/world/modules/llm/events.js');
+const { preparedContentObjectSteps } = load('backend/reliableKernel/contentObjectTransaction.js');
 const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
 const definitions = [runAgentTool, ...agentCollaborationToolModules.map(module => module.create({}))];
 const call = (id, name, args = {}) => ({ id, functionCall: { name, args } });
@@ -349,5 +350,83 @@ test('a child follow-up to its idle root enters the owning runner while conversa
     assert.equal((await f.rows('CollaborationRequest'))[0].state, 'completed');
     assert.equal((await f.rows('Turn', { conversation_id: 'ordinary' })).length, 1, 'a conversation outside the team is never started');
     assert.equal((await f.rows('CollaborationMessageTargetLink', { conversation_id: 'ordinary' })).length, 0);
+  });
+});
+
+/** Commits the exact durable facts of one followup the way CollaborationControlPlane does. */
+async function queuePeerFollowup(f, { id, sourceConversationId, targetConversationId, text }) {
+  const now = new Date().toISOString();
+  const payload = await f.app.contentStore.prepare(f.app.database, text, 'text/vnd.limcode.collaboration-message');
+  const dedupeKey = `collaboration:tool:${id}`;
+  const messageId = kernel.stablePhaseFId('collaboration_message', dedupeKey);
+  const inboxItemId = kernel.stablePhaseFId('runtime_inbox_item', messageId);
+  const deliveryId = kernel.stablePhaseFId('runtime_delivery', 'collaboration', messageId);
+  await f.app.database.transaction([
+    ...preparedContentObjectSteps([payload], 'test_followup'),
+    repo('CollaborationMessage').insertWithNextSequence({ id: messageId, dedupe_key: dedupeKey, mode: 'followup', created_at: now }, { column: 'message_seq', scope: {} }),
+    repo('CollaborationMessageSourceLink').insert({ id: `${id}-source`, message_id: messageId, conversation_id: sourceConversationId, source_kind: 'tool', source_key: id, turn_id: null, tool_call_id: null, board_post_id: null, created_at: now }),
+    repo('RuntimeInboxItem').insert({ id: inboxItemId, dedupe_key: dedupeKey, source_kind: 'collaboration_message', source_id: messageId, state: 'routed', created_at: now, updated_at: now }),
+    repo('CollaborationMessageTargetLink').insert({ id: `${id}-target`, message_id: messageId, conversation_id: targetConversationId, inbox_item_id: inboxItemId, anchor_turn_id: null, created_at: now }),
+    repo('CollaborationMessagePayloadLink').insert({ id: `${id}-payload`, message_id: messageId, content_object_id: payload.metadata.id, created_at: now }),
+    repo('RuntimeInboxPayloadLink').insert({ id: `${id}-inbox-payload`, inbox_item_id: inboxItemId, content_object_id: payload.metadata.id, created_at: now }),
+    repo('RuntimeDelivery').insert({ id: deliveryId, inbox_item_id: inboxItemId, target_conversation_id: targetConversationId, target_turn_id: null, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: now, updated_at: now }),
+    repo('RuntimeDeliveryWake').insert({ id: kernel.stablePhaseFId('runtime_delivery_wake', deliveryId), delivery_id: deliveryId, state: 'pending', claim_owner_host_boot_id: null, claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n, next_attempt_at: null, last_error: null, acknowledged_at: null, created_at: now, updated_at: now })
+  ]);
+  return { deliveryId };
+}
+
+async function frozenAuthority(f, turnId) {
+  const [snapshot] = await f.rows('AuthoritySnapshot', { turn_id: turnId });
+  const [metadata] = await f.rows('ContentObject', { id: snapshot.content_object_id });
+  return JSON.parse((await f.app.contentStore.read(metadata)).toString('utf8'));
+}
+
+test('a peer followup starts the first Turn of an empty Conversation under its current settings, never as user input', { timeout: 60000 }, async () => {
+  const FIRST = 'PEER_FIRST_TASK_5521';
+  const SECOND = 'PEER_SECOND_TASK_5522';
+  const seen = [];
+  await fixture(async (request, f, start, wire) => {
+    assert.equal(request.conversationId, 'ordinary');
+    const text = JSON.stringify(start.contents);
+    const marker = text.includes(SECOND) ? SECOND : FIRST;
+    assert.ok(text.includes(marker));
+    assertPeerWireRole(wire, marker);
+    seen.push({ marker, turnId: request.turnId });
+    return answer(`handled ${marker}`);
+  }, async f => {
+    const policy = async followups => f.configuration.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: 'ordinary',
+      allowedTools: definitions.map(tool => tool.declaration.name), toolConfigs: { run_agent: { config: { maxAutomaticFollowups: followups } } } });
+    await policy(5);
+    assert.equal((await f.rows('Turn', { conversation_id: 'ordinary' })).length, 0);
+    const first = await queuePeerFollowup(f, { id: 'peer-first', sourceConversationId: 'root', targetConversationId: 'ordinary', text: FIRST });
+    await f.app.processDeliveries.scanNow();
+    const firstDelivery = await f.until(async () => (await f.rows('RuntimeDelivery', { id: first.deliveryId }))[0]?.target_turn_id ? (await f.rows('RuntimeDelivery', { id: first.deliveryId }))[0] : undefined, 'The first followup never bound a Turn.');
+    const firstEnd = await f.terminated(firstDelivery.target_turn_id);
+    assert.equal(firstEnd.terminal_status, 'completed', JSON.stringify(firstEnd));
+    const [firstTurn] = await f.rows('Turn', { conversation_id: 'ordinary' });
+    assert.equal(firstTurn.id, firstDelivery.target_turn_id, 'the followup started the Conversation\'s very first Turn');
+    assert.deepEqual((await f.rows('MessageTurnLink', { turn_id: firstTurn.id })).filter(link => link.role === 'user'), [], 'the peer task never becomes a user message');
+    const firstAuthority = await frozenAuthority(f, firstTurn.id);
+    assert.equal(firstAuthority.intentKind, 'runtime_continuation');
+    assert.equal(firstAuthority.sourceTurnId, undefined);
+    assert.equal(firstAuthority.toolPolicy.toolConfigs.run_agent.config.maxAutomaticFollowups, 5);
+    const [intent] = await f.rows('TurnIntent', { turn_id: firstTurn.id });
+    const [revision] = await f.rows('TurnIntentRevision', { intent_id: intent.id });
+    const [envelope] = await f.rows('ContentObject', { id: revision.content_object_id });
+    assert.deepEqual(JSON.parse((await f.app.contentStore.read(envelope)).toString('utf8')), { version: 1, kind: 'runtime_continuation', sourceTurnId: null });
+
+    // The next continuation compiles today's settings instead of inheriting the previous Turn.
+    await policy(7);
+    const second = await queuePeerFollowup(f, { id: 'peer-second', sourceConversationId: 'root', targetConversationId: 'ordinary', text: SECOND });
+    await f.app.processDeliveries.scanNow();
+    const secondDelivery = await f.until(async () => (await f.rows('RuntimeDelivery', { id: second.deliveryId }))[0]?.target_turn_id ? (await f.rows('RuntimeDelivery', { id: second.deliveryId }))[0] : undefined, 'The second followup never bound a Turn.');
+    assert.equal((await f.terminated(secondDelivery.target_turn_id)).terminal_status, 'completed');
+    const secondAuthority = await frozenAuthority(f, secondDelivery.target_turn_id);
+    assert.equal(secondAuthority.toolPolicy.toolConfigs.run_agent.config.maxAutomaticFollowups, 7);
+    assert.equal(secondAuthority.sourceTurnId, undefined);
+    assert.equal((await f.rows('Turn', { conversation_id: 'ordinary' })).length, 2);
+    assert.deepEqual(seen.map(entry => entry.marker), [FIRST, SECOND]);
+    assert.ok(f.wakes.every(wake => wake.sourceKind !== 'collaboration_message' || wake.action === 'start_continuation'));
+    assert.equal(f.wakes.find(wake => wake.deliveryId === first.deliveryId).sourceTurnId, null, 'an empty destination has no anchor Turn');
   });
 });

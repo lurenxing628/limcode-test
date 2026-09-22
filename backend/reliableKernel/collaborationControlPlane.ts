@@ -152,9 +152,7 @@ export class CollaborationControlPlane {
     turns.sort(compareNewest);
     const active = turns.filter((turn) => turn.status === 'active');
     if (active.length > 1) throw new Error('Collaboration target has multiple active Turns.');
-    const anchor = active[0] ?? turns[0];
     if (input.onlyIfRunning && !active[0]) throw new Error('Collaboration notification target is idle.');
-    if (input.mode === 'followup' && !anchor) throw new Error('Start the destination Conversation before sending a followup.');
     const fence = active[0] ? await this.rows('TurnFinalOutputFence', { turn_id: active[0].id }) : [];
     if (input.onlyIfRunning && fence.length) throw new Error('Collaboration notification target has completed its output.');
     // A queued send is anchored to the running Turn; routing only proceeds once that Turn has ended.
@@ -381,7 +379,8 @@ export class CollaborationControlPlane {
         const metadata = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
         if (metadata.content_type !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) continue;
         const continuation = parseRuntimeContinuationTurnIntentEnvelopeText((await this.contentStore.read(metadata)).toString('utf8'));
-        if (continuation) continuationSources.add(continuation.sourceTurnId);
+        // A collaboration continuation has no source Turn; its budget arrives through the delivery above.
+        if (continuation?.sourceTurnId) continuationSources.add(continuation.sourceTurnId);
       }
       if (continuationSources.size > 1) throw new Error('Collaboration budget has conflicting automatic continuation sources.');
       if (continuationSources.size === 1) return visit([...continuationSources][0], null, seen);
