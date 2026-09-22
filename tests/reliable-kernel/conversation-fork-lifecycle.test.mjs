@@ -33,7 +33,7 @@ async function rows(app, domain, where = {}) {
 }
 
 async function withForkRuntime(run, {
-  withTool = false, toolCallRequests = [1], beforeDispatch, compression = false, failRequests = []
+  withTool = false, toolCallRequests = [1], beforeDispatch, compression = false, failRequests = [], script
 } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-fork-lifecycle-'));
   const authority = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
@@ -64,6 +64,7 @@ async function withForkRuntime(run, {
       defaultConfigId: compressionConfig.id, providerBindings: [], modelBindings: []
     }, current.revision);
   }
+  await script?.configure(configuration);
   const agent = await configuration.mutations.createAgent({ name: 'Fork fixture', kind: 'custom' });
   await configuration.mutations.setModelProfile({
     scopeKind: 'conversation', scopeId: 'source', providerConfigId: provider.id,
@@ -101,19 +102,23 @@ async function withForkRuntime(run, {
           }
           if (failRequests.includes(requests.length)) throw new Error(`offline provider rejected request ${requests.length}`);
           await controls.onEvent({ kind: 'completed', streamSeq: '1',
-            content: { role: 'model', parts: withTool && toolCallRequests.includes(requests.length)
+            content: { role: 'model', parts: script?.reply(requests.length) ?? (withTool && toolCallRequests.includes(requests.length)
               ? [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }]
-              : [{ text: `offline reply ${requests.length}` }] } });
+              : [{ text: `offline reply ${requests.length}` }]) } });
         } };
       } },
       toolDispatcher: {
-        definitions() { return withTool ? [{ name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }] : []; },
+        definitions() {
+          return script?.definitions
+            ?? (withTool ? [{ name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }] : []);
+        },
         async dispatch(input) {
-          assert.equal(withTool, true, 'only the tool fixture may dispatch');
+          assert.equal(withTool || !!script, true, 'only the tool fixtures may dispatch');
           await beforeDispatch?.(input);
           const settled = await app.runtime.effects.settleWithoutEffect({
             source: { kind: 'internal', key: `fixture-read:${input.toolCallId}` },
-            toolCallId: input.toolCallId, status: 'succeeded', detail: { text: 'synthetic tool result' }
+            toolCallId: input.toolCallId, status: 'succeeded',
+            detail: script?.detail(input) ?? { text: 'synthetic tool result' }
           });
           return settled.terminal ?? app.runtime.effects.readTerminalResult(input.toolCallId, true);
         }
@@ -839,6 +844,62 @@ test('editing inside an inherited compressed range disables only that conversati
     await h.turn(first.conversationId, 'edited-fork-continues');
     assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /edited inside the fork/);
   });
+});
+
+test('a plan approved in the source still authorizes a retry in a fork of a fork', async () => {
+  const planPolicy = { mode: 'before_mutation', allowReadonlyBeforeApproval: false, requireForToolRiskLevels: ['write'] };
+  await withForkRuntime(async h => {
+    await h.turn('source', 'plan-source-input');
+    const [originalPlan] = await rows(h.app, 'ToolCall', { tool_name: 'submit_plan' });
+    assert.ok(originalPlan);
+    const first = await h.facade.forkConversation(await h.command('source', 'plan-first-fork'));
+    const second = await h.facade.forkConversation(await h.command(first.conversationId, 'plan-second-fork'));
+    const [copiedTurn] = await rows(h.app, 'Turn', { conversation_id: second.conversationId });
+    const [copiedPlan] = await rows(h.app, 'ToolCall', { turn_id: copiedTurn.id, tool_name: 'submit_plan' });
+    assert.notEqual(copiedPlan.id, originalPlan.id, 'the second fork owns its own copied ToolCall');
+    const boundary = await h.command(second.conversationId, 'plan-retry-boundary');
+    const retry = await h.turn(second.conversationId, 'plan-retry-in-nested-fork', {
+      sourceTurnId: copiedTurn.id, target: { kind: 'message', messageId: boundary.messageId },
+      expectedMessageRevisionId: boundary.expectedRevisionId
+    });
+    const [snapshot] = await rows(h.app, 'AuthoritySnapshot', { turn_id: retry.turnId });
+    const { readFrozenTurnAuthority } = load('backend/reliableKernel/frozenAuthority.js');
+    const authority = await readFrozenTurnAuthority(h.app.database, h.app.contentStore, snapshot.id, retry.turnId);
+    assert.equal(authority.document.retryLineage.inheritedPlanApprovalToolCallId, copiedPlan.id);
+    assert.equal(authority.document.planReviewPolicy.mode, planPolicy.mode);
+    const [mutation] = await rows(h.app, 'ToolCall', { turn_id: retry.turnId, tool_name: 'read' });
+    assert.ok(mutation, 'the retried turn issued a gated tool call');
+    const gate = new kernel.FrozenAuthorityMcpPolicyGate(h.app.database, h.app.contentStore);
+    assert.deepEqual(await gate.authorize({ toolCallId: mutation.id, serverId: 'fixture-mcp', riskLevel: 'write' }),
+      { toolPolicyAllowed: true, planReviewAllowed: true });
+    const review = input => kernel.authorizeFrozenPlanReview({
+      database: h.app.database, contentStore: h.app.contentStore, turnId: retry.turnId,
+      beforeCallSeq: mutation.call_seq, riskLevel: 'write', ...input
+    });
+    assert.deepEqual(await review({ authorityDocument: authority.document }), { allowed: true });
+    const { retryLineage, ...withoutLineage } = authority.document;
+    assert.equal((await review({ authorityDocument: withoutLineage })).allowed, false,
+      'the nested fork is authorized by the inherited approval, not by an unrelated fact');
+  }, { script: {
+    async configure(configuration) {
+      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'submit_plan'] });
+      await configuration.mutations.setPlanReviewPolicy({ scopeKind: 'global', ...planPolicy });
+    },
+    definitions: [
+      { name: 'submit_plan', description: 'Synthetic plan', parameters: { type: 'object' } },
+      { name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }
+    ],
+    reply(count) {
+      if (count === 1) return [{ functionCall: { name: 'submit_plan', args: { plan: 'fork plan' } } }];
+      if (count === 3) return [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }];
+      return undefined;
+    },
+    detail(input) {
+      return input.toolName === 'submit_plan'
+        ? { kind: 'submit_plan.result', proposalId: 'fork-plan', status: 'approved', executionTarget: 'current_conversation' }
+        : { text: 'synthetic tool result' };
+    }
+  } });
 });
 
 for (const fault of ['revision', 'duplicate']) {

@@ -261,22 +261,10 @@ test('durable artifact hard-cut：只认 canonical operation，Plan 必须明确
   };
   assert.deepEqual(taskListOperationFromSettledArtifact(settled, 'task-call'), operation);
 
-  const forkConversationId = 'conversation-fork-target';
-  const sourceToolCallId = 'rk_tool_call_source';
-  const targetToolCallId = conversationForkSnapshotCopyId(
-    forkConversationId,
-    'tool_call',
-    sourceToolCallId
-  );
-  assert.deepEqual(taskListOperationFromSettledArtifact(
-    { ...settled, toolCallId: sourceToolCallId },
-    targetToolCallId,
-    forkConversationId
-  ), operation);
+  // Fork-copied identities are resolved from durable segment facts before strict parsing.
   assert.throws(() => taskListOperationFromSettledArtifact(
-    { ...settled, toolCallId: 'unrelated-tool-call' },
-    targetToolCallId,
-    forkConversationId
+    { ...settled, toolCallId: 'rk_tool_call_source' },
+    'task-call'
   ), /identifies another ToolCall/);
 
   for (const status of ['failed', 'rejected', 'cancelled']) {
@@ -501,7 +489,8 @@ for (const depth of [0, 1, 2, 3]) {
     assert.equal(card.counts.inProgress, 1);
     assert.match(card.card, /inherited task/);
     assert.deepEqual(fixture.artifact, before, '读取投影不能改写持久化结果');
-    if (depth < 2) assert.equal(fixture.sourceReads(), 0, '原生及一层调用不增加来源查询');
+    if (depth === 0) assert.equal(fixture.sourceReads(), 0, '原生调用不增加来源查询');
+    else assert.equal(fixture.sourceReads(), 2, '任意层分支都只用一次批量来源查询');
   });
 }
 

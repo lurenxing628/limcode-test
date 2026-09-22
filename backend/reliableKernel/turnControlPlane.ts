@@ -55,6 +55,7 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import { toolArtifactIdentifiesCall } from './copiedToolIdentity';
 import { canonicalPlainJson, normalizePlainJson } from './plainJson';
 import { sqliteUniqueFailureIncludes, stablePhaseFId } from './phaseFIdentity';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -2255,14 +2256,15 @@ export class TurnControlPlane {
         );
         if (requireBigInt(request.request_seq, 'ModelRequest.request_seq') >= input.beforeModelRequestSeq) continue;
       }
-      if (!await this.isApprovedPlanToolCall(toolCallId)) continue;
+      if (!await this.isApprovedPlanToolCall(call)) continue;
       if (!await contextRootContainsCompleteToolPair(this.database, input.rootId, toolCallId)) continue;
       return toolCallId;
     }
     return undefined;
   }
 
-  private async isApprovedPlanToolCall(toolCallId: string): Promise<boolean> {
+  private async isApprovedPlanToolCall(call: DomainRow): Promise<boolean> {
+    const toolCallId = requireId(call.id, 'ToolCall.id');
     const outcomes = await this.listRows('ToolOutcome', { tool_call_id: toolCallId }, 2);
     if (outcomes.length !== 1 || outcomes[0].status !== 'succeeded') return false;
     const artifacts = await this.listRows('ToolResultArtifact', {
@@ -2278,7 +2280,10 @@ export class TurnControlPlane {
     const detail = body.detail && typeof body.detail === 'object' && !Array.isArray(body.detail)
       ? body.detail as Record<string, unknown>
       : undefined;
-    return body.toolCallId === toolCallId && body.status === 'succeeded' && detail?.status === 'approved';
+    // A fork copies the ToolCall but shares the artifact content naming the original call.
+    return body.status === 'succeeded'
+      && detail?.status === 'approved'
+      && await toolArtifactIdentifiesCall(this.database, body.toolCallId, call);
   }
 
   private async editMessage(commandInput: TurnEditCommand): Promise<TurnCommandResult> {
