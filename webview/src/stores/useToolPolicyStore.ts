@@ -11,6 +11,7 @@ import type {
   ToolPolicyScopeSetPayload,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
+import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES } from '@shared/protocol';
 import { resolveToolPolicyLayers, type ToolPolicyLayer } from '@shared/toolPolicyResolution';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
@@ -18,6 +19,7 @@ import { useClientStateStore } from './useClientStateStore';
 export const SUB_AGENT_TOOL_NAME = 'run_agent';
 export const AGENT_COLLABORATION_CONFIG_KEYS = ['maxChildAgentDepth', 'maxConcurrentAgents', 'maxAutomaticFollowups'] as const;
 export type AgentCollaborationConfigKey = typeof AGENT_COLLABORATION_CONFIG_KEYS[number];
+export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES };
 
 export interface ToolPolicyResolution {
   policy?: ToolPolicyRecord;
@@ -165,6 +167,32 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       if (Object.keys(entry.config).length === 0 && Object.keys(entry).length === 1) delete configs[SUB_AGENT_TOOL_NAME];
       else configs[SUB_AGENT_TOOL_NAME] = entry;
       this.setPolicyForScope(scopeKind, scopeId, current.allowedTools, current.name, configs, cloneSourceConfigs(local?.sourceConfigs), local?.preset);
+    },
+    /**
+     * Stores the cross-conversation switch in this scope's run_agent config. Turning it on also adds
+     * the cross-conversation tools to this scope's allowlist: a saved custom allowlist predates them
+     * and the backend never widens it on its own. Turning it off, or restoring inheritance, leaves the
+     * allowlist untouched because the switch alone already hides the tools.
+     */
+    setCrossConversationCollaborationForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, value: boolean | undefined): void {
+      if (scopeKind !== 'global' && !scopeId?.trim()) return;
+      if (value !== undefined && typeof value !== 'boolean') throw new TypeError('跨对话协作开关必须是布尔值。');
+      const definition = this.toolDefinitions.find((tool) => tool.name === SUB_AGENT_TOOL_NAME);
+      if (!definition?.configSchema?.fields.some((field) => field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY)) return;
+      const local = this.localPolicyFor(scopeKind, scopeId).policy;
+      if (value === undefined && local?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === undefined) return;
+      const current = local ?? this.effectivePolicyFor(scopeKind, scopeId).policy;
+      if (!current) return;
+      const configs = cloneToolConfigs(local?.toolConfigs) ?? {};
+      const entry = configs[SUB_AGENT_TOOL_NAME] ?? { config: {} };
+      if (value === undefined) delete entry.config[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY];
+      else entry.config[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] = value;
+      if (Object.keys(entry.config).length === 0 && Object.keys(entry).length === 1) delete configs[SUB_AGENT_TOOL_NAME];
+      else configs[SUB_AGENT_TOOL_NAME] = entry;
+      const allowedTools = value === true
+        ? [...current.allowedTools, ...CROSS_CONVERSATION_TOOL_NAMES.filter((name) => !current.allowedTools.includes(name))]
+        : current.allowedTools;
+      this.setPolicyForScope(scopeKind, scopeId, allowedTools, current.name, configs, cloneSourceConfigs(local?.sourceConfigs), local?.preset);
     },
     localPolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ToolPolicyResolution {
       const clientState = useClientStateStore();

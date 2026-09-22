@@ -991,6 +991,20 @@ function validateSubagent(subagent, failures) {
     'CollaborationBoardSubscriptionLink', 'CollaborationBoardCommandReceipt'
   ], collaboration?.board?.domains ?? []));
   failures.push(...exactSetProblems('子Agent上下文分叉模式', ['none', 'all', 'positive-integer-string'], collaboration?.forkTurns ?? []));
+  const crossConversation = collaboration?.crossConversation;
+  if (crossConversation?.switch !== 'ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; frozen-in-Turn-authority; configSchema-defaultValue-only'
+    || crossConversation?.offering !== 'top-level-conversations-only; hidden-and-rejected-when-switch-off; control-plane-rechecks-calling-Turn-frozen-authority'
+    || crossConversation?.targets !== 'other-active-top-level-conversations-of-this-Runtime; child-task-conversations-never-listed-or-addressed'
+    || crossConversation?.allowlist !== 'enabling-the-switch-in-settings-adds-the-tools-to-that-scope-allowedTools; backend-never-widens-a-saved-allowlist'
+    || crossConversation?.delivery !== 'running-target-queues-behind-its-current-Turn; followup-starts-one-Turn-after-it-ends; message-joins-the-next-Turn; completion-replies-are-not-queued'
+    || crossConversation?.authority !== 'peer-text-is-an-attributed-collaboration-envelope-never-a-user-message; list-and-read-carry-an-untrusted-data-notice') {
+    failures.push('跨对话协作必须由默认关闭的冻结开关下发，只给顶层对话，不寻址子 Agent，运行中目标排队，且对方文本不成为用户指令');
+  }
+  failures.push(...exactSetProblems('跨对话协作工具', ['list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'], crossConversation?.tools ?? []));
+  failures.push(...exactSetProblems('跨对话协作只读工具', ['list_conversations', 'read_conversation'], crossConversation?.readonlyTools ?? []));
+  if (!/null/.test(subagent?.delivery?.intentLink ?? '') || !/当前设置/.test(subagent?.delivery?.intentLink ?? '')) {
+    failures.push('协作消息续跑必须记录 sourceTurnId 为 null 并按目标对话当前设置编译权限');
+  }
 
   failures.push(...exactSetProblems('子Agent操作', ['spawn', 'send', 'wait', 'list', 'read', 'interrupt_subtree'], subagent?.operations ?? []));
   failures.push(...exactSetProblems('子Agent模型必填字段', ['operation'], subagent?.modelContract?.required ?? []));

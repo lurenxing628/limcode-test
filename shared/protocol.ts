@@ -388,6 +388,11 @@ export const ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY = 'allowOutsideProjectPaths'
 export const SUBMIT_AGENT_ANSWER_TOOL_NAME = 'submit_agent_answer';
 export const READ_AGENT_ANSWER_TOOL_NAME = 'read_agent_answer';
 export const SKILLS_TOOL_NAME = 'skills';
+/** Offered only while the user's crossConversationCollaboration switch is on (run_agent config). */
+export const CROSS_CONVERSATION_TOOL_NAMES = [
+  'list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'
+] as const;
+export const CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY = 'crossConversationCollaboration';
 
 export type EditToolMode = 'hunk' | 'insert' | 'delete';
 

@@ -1,5 +1,5 @@
 import { MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } from '../../../../../../shared/agentScheduling';
-import type { ToolConfigRecord } from '../../../../../../shared/protocol';
+import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, type ToolConfigRecord } from '../../../../../../shared/protocol';
 import type { ToolCallSummaryContext, ToolDefinition } from '../../registry';
 import { defineToolDefinitionModule } from '../types';
 
@@ -11,6 +11,8 @@ export const MAX_CONCURRENT_AGENTS_CONFIG_KEY = 'maxConcurrentAgents';
 export const DEFAULT_MAX_CONCURRENT_AGENTS = 8;
 export const MAX_AUTOMATIC_FOLLOWUPS_CONFIG_KEY = 'maxAutomaticFollowups';
 export const DEFAULT_MAX_AUTOMATIC_FOLLOWUPS = 32;
+/** Boolean user switch, frozen per Turn; it has no defaultConfig entry and is off unless set. */
+export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY };
 export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree'] as const;
 export type RunAgentOperation = typeof RUN_AGENT_OPERATIONS[number];
 
@@ -156,6 +158,12 @@ export const runAgentTool: ToolDefinition = {
         type: 'number',
         description: '限制同一轮任务中 Agent 自动续派的次数；用户开始新一轮任务时重新计数。0 表示不允许自动续派，仍可仅发送消息。',
         defaultValue: DEFAULT_MAX_AUTOMATIC_FOLLOWUPS
+      }, {
+        key: CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
+        label: '跨对话协作',
+        type: 'boolean',
+        description: '允许顶层对话的 Agent 列出、读取本工作区的其他对话，向它们发送消息或续派任务，并按用户要求新建或分支对话。默认关闭。',
+        defaultValue: false
       }]
     },
     defaultConfig: {

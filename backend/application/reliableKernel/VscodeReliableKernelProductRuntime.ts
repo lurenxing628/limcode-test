@@ -40,6 +40,7 @@ import { applyProxyEnvironment, normalizeProxySetting, proxyForShellAndMcp } fro
 import { VscodeReliableFileDiffEditor } from './VscodeReliableFileDiffEditor';
 import { getRuntimeBuildInfo } from '../runtimeBuildInfo';
 import { ReliableConversationRunner } from './ReliableConversationRunner';
+import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 
 export interface VscodeReliableKernelProductRuntimeOptions {
@@ -72,6 +73,8 @@ export class VscodeReliableKernelProductRuntime {
   public readonly childAgents: ReliableChildAgentCoordinator;
   public readonly fileDiffs: VscodeReliableFileDiffEditor;
   public readonly conversations: ReliableConversationRunner;
+  /** Fork/create writes shared with model tools; the facade adds navigation and sidebar refresh. */
+  public readonly conversationLifecycle: ReliableConversationLifecycle;
   public readonly providerRegistry: ReliableLlmProviderRegistry;
   public readonly diagnostics: ReliableDiagnosticJournal;
   public readonly debugCapture: DebugCaptureService;
@@ -94,6 +97,7 @@ export class VscodeReliableKernelProductRuntime {
     childAgents: ReliableChildAgentCoordinator;
     fileDiffs: VscodeReliableFileDiffEditor;
     conversations: ReliableConversationRunner;
+    conversationLifecycle: ReliableConversationLifecycle;
     providerRegistry: ReliableLlmProviderRegistry;
     diagnostics: ReliableDiagnosticJournal;
     debugCapture: DebugCaptureService;
@@ -106,6 +110,7 @@ export class VscodeReliableKernelProductRuntime {
     this.childAgents = input.childAgents;
     this.fileDiffs = input.fileDiffs;
     this.conversations = input.conversations;
+    this.conversationLifecycle = input.conversationLifecycle;
     this.providerRegistry = input.providerRegistry;
     this.diagnostics = input.diagnostics;
     this.debugCapture = input.debugCapture;
@@ -171,6 +176,7 @@ export class VscodeReliableKernelProductRuntime {
     let collaborationTools: CollaborationToolDispatcher | undefined;
     let fileDiffs: VscodeReliableFileDiffEditor | undefined;
     let conversations: ReliableConversationRunner | undefined;
+    let conversationLifecycle: ReliableConversationLifecycle | undefined;
     const toolHost = new VscodeReliableToolHost(context, configuration, {
       dispatchSpecial: async (definition, input, frozenAuthority, signal, admission) => {
         const collaborationResult = await collaborationTools?.dispatch(input, signal, frozenAuthority);
@@ -369,12 +375,16 @@ export class VscodeReliableKernelProductRuntime {
           }
         }
       }));
+      // The tool host's special-dispatch chain was built before the Runtime existed; these
+      // services are bound into it late through the closure variables it reads per call.
+      conversationLifecycle = new ReliableConversationLifecycle({ application, configuration });
       collaborationTools = new CollaborationToolDispatcher({
         database: application.database,
         contentStore: application.contentStore,
         effects: application.runtime.effects,
         collaboration: application.runtime.collaboration,
-        board: application.runtime.collaborationBoard
+        board: application.runtime.collaborationBoard,
+        conversations: conversationLifecycle
       });
       childAgents = new ReliableChildAgentCoordinator({
         database: application.database,
@@ -435,6 +445,7 @@ export class VscodeReliableKernelProductRuntime {
         childAgents,
         fileDiffs,
         conversations,
+        conversationLifecycle,
         providerRegistry: providers,
         diagnostics,
         debugCapture,

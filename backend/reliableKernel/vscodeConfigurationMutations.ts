@@ -862,6 +862,38 @@ export class VscodeConfigurationMutations {
   }
 
   /**
+   * Seeds a newly created Conversation's work environment. An existing selection is authoritative,
+   * so replaying the seed never overwrites a later user choice.
+   */
+  public initializeConversationWorkEnvironment(
+    conversationIdInput: string,
+    workEnvironmentIdInput: string
+  ): Promise<{ created: boolean }> {
+    return this.mutate(async (paths) => {
+      const conversationId = requireId(conversationIdInput, 'conversationId');
+      const workEnvironmentId = requireId(workEnvironmentIdInput, 'workEnvironmentId');
+      const spec = conversationWorkEnvironmentLinkStore(paths);
+      const records = await loadStore(spec);
+      if (records.some((record) => record.conversationId === conversationId && record.role === 'active')) {
+        return { created: false };
+      }
+      const environment = (await loadStore(workEnvironmentStore(paths))).find((record) => record.id === workEnvironmentId);
+      if (!environment?.available) throw new Error(`工作环境不可用：${workEnvironmentId}`);
+      const now = Date.now();
+      const record: ConversationWorkEnvironmentLinkRecord = {
+        id: `conversation-work-environment:${conversationId}`,
+        conversationId,
+        workEnvironmentId,
+        role: 'active' as const,
+        createdAt: now,
+        updatedAt: now
+      };
+      await saveStore(spec, upsert(records, record));
+      return { created: true };
+    });
+  }
+
+  /**
    * Copies every Conversation-layer selection that defines a fork's execution identity: all scoped
    * record/link pairs, the workflow selection and the work-environment link. Only empty target
    * slots are filled, so repeating an interrupted copy never overwrites what the target already

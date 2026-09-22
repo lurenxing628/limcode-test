@@ -821,6 +821,51 @@ test('a fork moves a late native result behind its cut and only checks its own r
   });
 });
 
+test('fork_conversation copies the completed history of a caller whose native Turn still runs an async call', async () => {
+  const { ReliableConversationLifecycle } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/application/reliableKernel/conversationLifecycle.js')
+  ).href);
+  await withNativeApp('native-fork-completed-history', async (app, conversationId, turnId) => {
+    const firstFence = await leaseFence(app, conversationId);
+    await kernel.runWithExecutionLeaseFence(firstFence, () => app.turns.terminal({
+      source: { kind: 'internal', key: 'native-fork-first-terminal' }, turnId, terminalStatus: 'completed', reason: 'completed fixture Turn'
+    }));
+    // The calling Turn is still running a native logical request with an unsettled async call.
+    const current = await app.turns.input({
+      source: { kind: 'command', key: 'native-fork-current-input' }, conversationId,
+      leaseOwnerId: 'native-fork-owner', hostBootId: app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(), content: 'current native turn asks to fork itself'
+    });
+    const currentFence = await leaseFence(app, conversationId);
+    const request = await createStreamingRequest(app, current.turnId, 'native-fork-current');
+    const message = await insertAssistantMessage(app, request.modelRequestId, 'native-fork-current');
+    const running = nativeEntry('tool-call-native-fork', { providerCallId: 'call-native-fork' });
+    await persistNativeCheckpoint(app, request, 1, 'native_tool_call', nativeItemCheckpoint(running));
+    await app.runtime.effects.createToolCallBatch({
+      ...batchInput(current.turnId, request.modelRequestId, message, running, 'native-fork'),
+      streamIdentity: { ...request.identity, streamSeq: '1' }
+    });
+    await kernel.runWithExecutionLeaseFence(currentFence, () => app.context.appendNativeToolCall({ conversationId, toolCallId: running.toolCallId }));
+    const copied = [];
+    const lifecycle = new ReliableConversationLifecycle({ application: app, configuration: { mutations: {
+      async copyConversationConfiguration(source, target) { copied.push([source, target]); }
+    } } });
+
+    const fork = await lifecycle.forkCompletedHistory({ sourceConversationId: conversationId, commandId: 'native-fork-tool-call' });
+    assert.equal(fork.deduplicated, false);
+    assert.deepEqual(copied, [[conversationId, fork.conversationId]]);
+    const [head] = await list(app, 'ConversationContextHeadLink', { conversation_id: fork.conversationId });
+    const content = (await app.context.materialize(head.root_id)).segments.map((segment) => segment.content.toString('utf8')).join('\n');
+    assert.match(content, /native tool admission fixture/);
+    assert.doesNotMatch(content, /current native turn asks to fork itself/, 'the running Turn is never copied');
+    assert.deepEqual(await list(app, 'Turn', { conversation_id: fork.conversationId, status: 'active' }), []);
+    assert.equal((await list(app, 'ToolCall', { id: running.toolCallId }))[0].status !== 'terminal', true, 'the caller keeps running');
+    const replay = await lifecycle.forkCompletedHistory({ sourceConversationId: conversationId, commandId: 'native-fork-tool-call' });
+    assert.deepEqual([replay.conversationId, replay.deduplicated], [fork.conversationId, true]);
+    request.close();
+  });
+});
+
 test('frozen nativeAsync policy reaches recipe metadata only for opted-in tools', async () => {
   const host = {
     definitions: () => [

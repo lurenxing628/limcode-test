@@ -1,3 +1,5 @@
+import { isCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
+
 export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment'
   | 'conversation' | 'collaborationMessage' | 'conversationMessage' | 'boardChannel' | 'boardThread' | 'boardPost';
 
@@ -370,7 +372,8 @@ function collectCandidates(
   if (!record || seen.has(record)) return;
   seen.add(record);
   const toolName = asRecord(record.toolCall)?.toolName;
-  collaborationScope ||= record.kind === 'agent_collaboration' || record.kind === 'collaboration_message'
+  collaborationScope ||= record.kind === 'agent_collaboration' || record.kind === 'cross_conversation'
+    || record.kind === 'collaboration_message'
     || (typeof toolName === 'string' && isCollaborationHandleTool(toolName));
 
   const attachmentId = optionalText(record.attachmentId);
@@ -531,7 +534,7 @@ export function isPersistentAgentHandle(kind: ModelHandleKind): boolean {
 
 export function isCollaborationHandleTool(toolName: string): boolean {
   return ['list_agents', 'send_agent_message', 'followup_agent_task', 'read_agent_messages',
-    'wait_agent_messages', 'agent_board'].includes(toolName);
+    'wait_agent_messages', 'agent_board'].includes(toolName) || isCrossConversationTool(toolName);
 }
 
 const COLLABORATION_HANDLE_FIELDS: ReadonlyArray<readonly [string, string, ModelHandleKind]> = [
@@ -583,6 +586,10 @@ function projectCollaborationValue(value: unknown, catalog: ModelHandleCatalog):
 function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
   const fields: ReadonlyArray<readonly [string, string, ModelHandleKind]> = toolName === 'agent_board'
     ? [['channelRef', 'channelId', 'boardChannel'], ['threadRef', 'threadId', 'boardThread'], ['postRef', 'postId', 'boardPost']]
+    : isCrossConversationTool(toolName)
+    // Cross-conversation tools address a whole Conversation, its transcript page or a reply.
+    ? [['conversationRef', 'targetConversationId', 'conversation'], ['beforeMessageRef', 'beforeMessageId', 'conversationMessage'],
+      ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']]
     : [['conversationRef', 'targetConversationId', 'conversation'], ['messageRef', 'messageId', 'collaborationMessage'],
       ['afterMessageRef', 'afterMessageId', 'collaborationMessage'],
       ['beforeMessageRef', 'beforeMessageId', record.view === 'conversation' ? 'conversationMessage' : 'collaborationMessage'], ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']];

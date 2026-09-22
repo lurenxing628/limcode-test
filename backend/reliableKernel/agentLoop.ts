@@ -11,6 +11,7 @@ import {
 import { forkInheritedChildTargets, isForkConversation, readConversationChildHandles } from './conversationChildHandles';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
 import { isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
+import { isReadonlyCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
 import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
 import { isReadonlyRunAgentOperation } from '../world/modules/tools/definitions/runAgent';
 import { createHash } from 'node:crypto';
@@ -3260,6 +3261,7 @@ function fallbackFrozenToolPolicy(
     ? trustedCommand.parallelSafe
     : (definition.name === 'run_agent' && isReadonlyRunAgentOperation(args))
       || isReadonlyAgentCollaborationTool(definition.name)
+      || isReadonlyCrossConversationTool(definition.name)
       || (definition.name === 'agent_board' && isReadonlyAgentBoardOperation(args))
       || metadata?.readonly === true || metadata?.riskLevel === 'read';
   const schedulingMode = requestedScheduling === 'serial'

@@ -2,8 +2,16 @@
 import { computed, reactive, watch } from 'vue';
 import type { ToolPolicyScopeKind } from '@shared/protocol';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
+import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
-import { AGENT_COLLABORATION_CONFIG_KEYS, SUB_AGENT_TOOL_NAME, useToolPolicyStore, type AgentCollaborationConfigKey } from '@webview/stores/useToolPolicyStore';
+import {
+  AGENT_COLLABORATION_CONFIG_KEYS,
+  CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
+  CROSS_CONVERSATION_TOOL_NAMES,
+  SUB_AGENT_TOOL_NAME,
+  useToolPolicyStore,
+  type AgentCollaborationConfigKey
+} from '@webview/stores/useToolPolicyStore';
 
 const props = withDefaults(defineProps<{
   scopeKind: ToolPolicyScopeKind;
@@ -36,6 +44,14 @@ const fields = computed(() => AGENT_COLLABORATION_CONFIG_KEYS.flatMap((key) => {
 const scopeLabel = computed(() => ({ global: '全局', agent: 'Agent', conversation: '对话', workflow: '工作流', run: '本次运行' })[props.scopeKind]);
 const canEdit = computed(() => !props.readonly && !!tool.value && !loading.value && (props.scopeKind === 'global' || !!props.scopeId?.trim()));
 const spawnToolEnabled = computed(() => store.effectivePolicyFor(props.scopeKind, props.scopeId).policy?.allowedTools.includes(SUB_AGENT_TOOL_NAME) === true);
+const crossConversationField = computed(() => tool.value?.configSchema?.fields.find((field) => field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY));
+const crossConversationOverridden = computed(() => typeof localConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === 'boolean');
+const crossConversationEnabled = computed(() => (localConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY]
+  ?? globalConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] ?? crossConversationField.value?.defaultValue) === true);
+const crossConversationToolsAllowed = computed(() => {
+  const allowed = store.effectivePolicyFor(props.scopeKind, props.scopeId).policy?.allowedTools ?? [];
+  return CROSS_CONVERSATION_TOOL_NAMES.every((name) => allowed.includes(name));
+});
 const drafts = reactive<Partial<Record<AgentCollaborationConfigKey, string>>>({});
 const errors = reactive<Partial<Record<AgentCollaborationConfigKey, string>>>({});
 
@@ -68,6 +84,16 @@ function restoreField(key: AgentCollaborationConfigKey): void {
   if (!canEdit.value) return;
   store.setAgentCollaborationFieldForScope(props.scopeKind, props.scopeId, key, undefined);
 }
+
+function setCrossConversation(value: boolean): void {
+  if (!canEdit.value) return;
+  store.setCrossConversationCollaborationForScope(props.scopeKind, props.scopeId, value);
+}
+
+function restoreCrossConversation(): void {
+  if (!canEdit.value) return;
+  store.setCrossConversationCollaborationForScope(props.scopeKind, props.scopeId, undefined);
+}
 </script>
 
 <template>
@@ -78,6 +104,23 @@ function restoreField(key: AgentCollaborationConfigKey): void {
     </header>
     <p v-if="scopeKind === 'global'">设置子 Agent 的默认深度和团队预算。Agent、工作流和对话可按各自范围单独配置。</p>
     <p v-else>仅调整当前{{ scopeLabel }}的协作设置；未单独设置的项执行时继承上层策略，下方显示全局参考值。</p>
+    <div v-if="crossConversationField" class="collaboration-field">
+      <div class="collaboration-field-row">
+        <LcCheckbox
+          :model-value="crossConversationEnabled"
+          :disabled="!canEdit"
+          :aria-label="crossConversationField.label"
+          @update:model-value="setCrossConversation"
+        >{{ crossConversationField.label }}</LcCheckbox>
+        <div class="collaboration-field-actions">
+          <span>{{ crossConversationOverridden ? (scopeKind === 'global' ? '全局默认' : '本层单独设置') : (scopeKind === 'global' ? '系统默认' : `继承上层 · 全局${crossConversationEnabled ? '开启' : '关闭'}`) }}</span>
+          <button type="button" :disabled="!canEdit || !crossConversationOverridden" :aria-label="`${crossConversationField.label}：${scopeKind === 'global' ? '恢复默认' : '恢复继承'}`" @click="restoreCrossConversation">{{ scopeKind === 'global' ? '恢复默认 关闭' : '恢复继承' }}</button>
+        </div>
+      </div>
+      <p>{{ crossConversationField.description }}</p>
+      <p>开启后提供列出、读取、发送、新建和分支对话五个工具，仅顶层对话可用，不能寻址子 Agent 对话。发送类工具默认自动执行，可在工具设置中逐个改为执行前确认。目标对话正在运行时，消息排队到它本轮结束后再投递。开启时会把这些工具加入当前范围的允许列表。</p>
+      <p v-if="crossConversationEnabled && !crossConversationToolsAllowed" class="collaboration-note">当前范围的工具策略仍未允许全部跨对话工具（上层工具策略可能已禁用），这些工具不会出现。</p>
+    </div>
     <div v-for="field in fields" :key="field.key" class="collaboration-field">
       <div class="collaboration-field-row">
         <label class="collaboration-number-field">

@@ -3,7 +3,8 @@ import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { readCollaborationScope } from './collaborationScope';
-import { readTurnCollaborationLimits } from './collaborationPolicy';
+import { readTurnCollaborationLimits, readTurnCrossConversationEnabled } from './collaborationPolicy';
+import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { TURN_INTENT_ENVELOPE_CONTENT_TYPE, parseRuntimeContinuationTurnIntentEnvelopeText } from './guidanceIntent';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -28,6 +29,16 @@ export interface CollaborationSendCommand {
    * next safe boundary. A followup then starts a new Turn; a message joins the target's next Turn.
    */
   queueBehindActiveTurn?: boolean;
+  /**
+   * Sent by a cross-conversation tool: the only way a tool send may leave its team. It requires the
+   * source Turn's frozen crossConversationCollaboration switch and two distinct top-level
+   * Conversations; team tools never set it.
+   */
+  crossConversation?: boolean;
+}
+export interface CrossConversationListing {
+  conversations: Array<{ conversationId: string; title: string; running: boolean; updatedAt: string }>;
+  hasMore: boolean;
 }
 export interface CollaborationMessageSummary {
   messageId: string; sourceConversationId: string; targetConversationId: string;
@@ -87,6 +98,8 @@ export class CollaborationControlPlane {
     const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
     const source = input.source;
     if (input.queueBehindActiveTurn !== undefined && typeof input.queueBehindActiveTurn !== 'boolean') throw new TypeError('queueBehindActiveTurn must be boolean.');
+    if (input.crossConversation !== undefined && typeof input.crossConversation !== 'boolean') throw new TypeError('crossConversation must be boolean.');
+    if (input.crossConversation && source.kind !== 'tool') throw new Error('Only a tool call may send across conversations.');
     // Completion replies and board notices always reach a running target; only tool sends may wait.
     if (input.queueBehindActiveTurn && (source.kind !== 'tool' || input.onlyIfRunning)) throw new Error('Only tool-sourced sends may queue behind a running target Turn.');
     const sourceKey = source.kind === 'tool' ? requirePhaseFId(source.toolCallId, 'toolCallId') : source.kind === 'completion' ? requirePhaseFId(source.requestId, 'requestId') : stablePhaseFId('board_notice', source.postId, targetConversationId);
@@ -104,9 +117,12 @@ export class CollaborationControlPlane {
       if (!message) return null;
       const [origins, targets, payloads, replies] = await Promise.all([this.rows('CollaborationMessageSourceLink', { message_id: messageId }), this.rows('CollaborationMessageTargetLink', { message_id: messageId }), this.rows('CollaborationMessagePayloadLink', { message_id: messageId }), this.rows('CollaborationMessageReplyLink', { message_id: messageId })]);
       if (message.mode !== input.mode || origins.length !== 1 || origins[0].conversation_id !== sourceConversationId || origins[0].turn_id !== sourceTurn.id || targets.length !== 1 || targets[0].conversation_id !== targetConversationId || payloads.length !== 1 || payloads[0].content_object_id !== prepared.metadata.id || (replies[0]?.request_message_id ?? null) !== replyToMessageId) throw new Error('Collaboration send replay conflicts with immutable message facts.');
-      return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, deduplicated: true };
+      // A tool send anchored to a running target Turn waits until that Turn ends.
+      const queued = source.kind === 'tool' && targets[0].anchor_turn_id !== null;
+      return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued, deduplicated: true };
     };
     const existing = await replay(); if (existing) return existing;
+    if (input.crossConversation) await this.authorizeCrossConversation({ turnId: String(sourceTurn.id), targetConversationId });
     const target = await this.existing('Conversation', targetConversationId);
     const origin = await this.existing('Conversation', sourceConversationId);
     if (target.status !== 'active' || origin.status !== 'active') throw new Error('Collaboration requires active Conversations.');
@@ -132,7 +148,7 @@ export class CollaborationControlPlane {
     if (sourceScope.rootConversationId !== targetScope.rootConversationId && source.kind !== 'completion') {
       if (source.kind === 'board') throw new Error('Board notifications cannot cross team roots.');
       if (sourceMember?.childExecutionId || targetMember.childExecutionId) throw new Error('Cross-conversation collaboration cannot address or originate from a child task of another team.');
-      throw new Error('Cross-conversation collaboration is not enabled.');
+      if (!input.crossConversation) throw new Error('Cross-conversation collaboration is not enabled.');
     }
     if (replyToMessageId) {
       const previousSource = await this.one('CollaborationMessageSourceLink', { message_id: replyToMessageId });
@@ -195,7 +211,7 @@ export class CollaborationControlPlane {
       const raced = await replay(); if (raced) return raced;
       throw error;
     }
-    return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, deduplicated: false };
+    return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued: queuedTurnId !== null, deduplicated: false };
   }
 
   public async listMessages(input: { conversationId: string; targetConversationId?: string; afterMessageId?: string; beforeMessageId?: string; limit?: number }): Promise<{ messages: CollaborationMessageSummary[]; nextCursor: string | null; olderCursor: string | null; hasMore: boolean }> {
@@ -231,11 +247,19 @@ export class CollaborationControlPlane {
     const metadata = await this.existing('ContentObject', String(payload.content_object_id)) as ContentObjectMetadata;
     return { ...summary, text: (await this.contentStore.read(metadata)).toString('utf8') };
   }
-  /** Bounded transcript read, authorized independently from send/wake and never a continuation. */
-  public async readConversation(input: { conversationId: string; targetConversationId: string; beforeMessageId?: string; limit?: number }) {
+  /**
+   * Bounded transcript read, authorized independently from send/wake and never a continuation.
+   * A team member reads its team; crossConversationTurnId instead authorizes a top-level caller
+   * through that Turn's frozen crossConversationCollaboration switch.
+   */
+  public async readConversation(input: { conversationId: string; targetConversationId: string; beforeMessageId?: string; limit?: number; crossConversationTurnId?: string }) {
     const caller = requirePhaseFId(input.conversationId, 'conversationId');
     const target = requirePhaseFId(input.targetConversationId, 'targetConversationId');
-    await this.assertReadPermission(caller, target);
+    if (input.crossConversationTurnId === undefined) await this.assertReadPermission(caller, target);
+    else {
+      const authorized = await this.authorizeCrossConversation({ turnId: input.crossConversationTurnId, targetConversationId: target });
+      if (authorized.conversationId !== caller) throw new Error('Cross-conversation read Turn belongs to another Conversation.');
+    }
     const conversation = await this.existing('Conversation', target);
     const limit = input.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError('Conversation read limit must be 1..50.');
@@ -255,6 +279,8 @@ export class CollaborationControlPlane {
       const current = await this.rows('MessageCurrentRevisionLink', { message_id: link.message_id });
       if (current.length !== 1) throw new Error('Conversation transcript message has no unique current revision.');
       const revision = await this.existing('MessageRevision', String(current[0].revision_id));
+      // The transcript carries what people and models said; tool activity stays out of it.
+      if (revision.role !== 'user' && revision.role !== 'model') continue;
       const metadata = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
       // Reading a single enormous CAS object would defeat the API response bound. Such entries
       // retain their identity and an explicit marker so callers can open the original conversation.
@@ -263,11 +289,82 @@ export class CollaborationControlPlane {
         continue;
       }
       const text = visibleMessageText(String(metadata.content_type), (await this.contentStore.read(metadata)).toString('utf8'));
+      if (!text.trim()) continue;
       const allowed = Math.min(8000, remaining);
       messages.push({ messageId: String(link.message_id), role: String(revision.role), text: text.slice(0, allowed), createdAt: String(revision.created_at), truncated: text.length > allowed });
       remaining -= Math.min(text.length, allowed);
     }
     return { conversationId: target, title: String(conversation.title), status: String(conversation.status), messages, olderMessageId: links.length > limit && selected.length ? String(selected[0].message_id) : null, hasMore: links.length > limit };
+  }
+
+  /**
+   * The Turn's own switch and top-level placement authorize every cross-conversation action; an
+   * optional target must be another active top-level Conversation. Child task conversations stay
+   * inside their team on both sides.
+   */
+  public async authorizeCrossConversation(input: { turnId: string; targetConversationId?: string }): Promise<{ conversationId: string }> {
+    const turn = await this.existing('Turn', requirePhaseFId(input.turnId, 'turnId'));
+    const conversationId = String(turn.conversation_id);
+    if (!await readTurnCrossConversationEnabled(this.database, this.contentStore, String(turn.id))) {
+      throw new Error('Cross-conversation collaboration is not enabled for this Turn.');
+    }
+    if ((await this.rows('ChildExecution', { child_conversation_id: conversationId })).length) {
+      throw new Error('Cross-conversation collaboration is only available to top-level conversations.');
+    }
+    if (input.targetConversationId === undefined) return { conversationId };
+    const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
+    if (targetConversationId === conversationId) throw new Error('A cross-conversation action must target another Conversation.');
+    const target = await this.existing('Conversation', targetConversationId);
+    if (target.status !== 'active') throw new Error('Cross-conversation target is not an active Conversation.');
+    if ((await this.rows('ChildExecution', { child_conversation_id: targetConversationId })).length) {
+      throw new Error('Cross-conversation collaboration cannot address a child task conversation.');
+    }
+    return { conversationId };
+  }
+
+  /** Other active top-level Conversations of this Runtime (one workspace), newest update first. */
+  public async listConversations(input: { turnId: string; limit?: number }): Promise<CrossConversationListing> {
+    const { conversationId } = await this.authorizeCrossConversation({ turnId: input.turnId });
+    const limit = input.limit ?? 20;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError('Conversation list limit must be 1..50.');
+    const conversations: CrossConversationListing['conversations'] = [];
+    let keyset: { column: string; value: string; id: string; direction: 'before' } | undefined;
+    for (;;) {
+      const page = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('Conversation').list({
+        orderBy: { column: 'updated_at', direction: 'desc' }, ...(keyset ? { keyset } : {}), limit: 100
+      })])).snapshot[0] as DomainRow[];
+      for (const row of page) {
+        const id = String(row.id);
+        if (id === conversationId || row.status !== 'active') continue;
+        if ((await this.rows('ChildExecution', { child_conversation_id: id })).length) continue;
+        if (conversations.length === limit) return { conversations, hasMore: true };
+        const active = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').list({ where: { conversation_id: id, status: 'active' }, limit: 1 })]);
+        conversations.push({ conversationId: id, title: await this.displayTitle(row), running: (active.snapshot[0] as DomainRow[]).length > 0, updatedAt: String(row.updated_at) });
+      }
+      if (page.length < 100) return { conversations, hasMore: false };
+      const last = page[page.length - 1];
+      keyset = { column: 'updated_at', value: String(last.updated_at), id: String(last.id), direction: 'before' };
+    }
+  }
+
+  /** The stored title, or for a placeholder its first user message, as the conversation list shows it. */
+  private async displayTitle(conversation: DomainRow): Promise<string> {
+    const id = String(conversation.id);
+    const stored = displayConversationTitle({ id, title: String(conversation.title), maxLength: 80 });
+    if (stored !== DEFAULT_CONVERSATION_TITLE) return stored;
+    const links = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({ where: { conversation_id: id }, orderBy: { column: 'message_seq', direction: 'asc' }, limit: 16 })])).snapshot[0] as DomainRow[];
+    for (const link of links) {
+      const message = await this.existing('Message', String(link.message_id));
+      const current = await this.rows('MessageCurrentRevisionLink', { message_id: link.message_id });
+      if (message.deleted_at !== null || current.length !== 1) continue;
+      const revision = await this.existing('MessageRevision', String(current[0].revision_id));
+      if (revision.role !== 'user') continue;
+      const metadata = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
+      if (metadata.byte_length > 256_000n) continue;
+      const text = visibleMessageText(String(metadata.content_type), (await this.contentStore.read(metadata)).toString('utf8'));
+      if (text.trim()) return displayConversationTitleFromText(text, 80);
+    }
+    return stored;
   }
 
   public async waitMessages(input: { conversationId: string; afterMessageId?: string; timeoutMs?: number; signal?: AbortSignal }) {
@@ -407,7 +504,7 @@ export class CollaborationControlPlane {
 function compareNewest(a: DomainRow, b: DomainRow): number { return String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)); }
 
 function visibleMessageText(contentType: string, raw: string): string {
-  if (contentType === 'text/plain') return raw;
+  if (contentType.toLowerCase().startsWith('text/plain')) return raw;
   if (contentType !== 'application/vnd.limcode.message+json') throw new Error(`Unsupported Conversation message content type ${contentType}.`);
   const value: unknown = JSON.parse(raw);
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray((value as { parts?: unknown }).parts)) throw new Error('Conversation message JSON requires a parts array.');

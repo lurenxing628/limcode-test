@@ -9,6 +9,7 @@ const { CollaborationToolDispatcher } = load('backend/reliableKernel/collaborati
 const { buildModelHandleCatalog, resolveModelToolArguments, projectToolResultForModel } = load('backend/reliableKernel/modelHandleCatalog.js');
 const { mergeConversationChildHandles, readConversationChildHandles } = load('backend/reliableKernel/conversationChildHandles.js');
 const { agentCollaborationToolModules } = load('backend/world/modules/tools/definitions/agentCollaboration/index.js');
+const { crossConversationToolModules } = load('backend/world/modules/tools/definitions/crossConversation/index.js');
 
 const detail = { kind: 'agent_collaboration', conversationId: 'peer-one', messageId: 'message-one',
   channelId: 'channel-one', threadId: 'post-one', postId: 'post-one' };
@@ -51,8 +52,9 @@ test('compressed and fork-copied recipes reserve collaboration references withou
   assert.deepEqual(await readConversationChildHandles(database, store, 'source'), []);
 });
 
-function fixture({ toolName = 'send_agent_message', args = { targetConversationId: 'peer', text: 'hello' } } = {}) {
-  const document = { toolPolicy: { allowedTools: [toolName] } };
+function fixture({ toolName = 'send_agent_message', args = { targetConversationId: 'peer', text: 'hello' }, crossConversation } = {}) {
+  const document = { toolPolicy: { allowedTools: [toolName],
+    ...(crossConversation === undefined ? {} : { toolConfigs: { run_agent: { config: { crossConversationCollaboration: crossConversation } } } }) } };
   const authority = { snapshotId: 'authority', document };
   const records = {
     AuthoritySnapshot: { id: 'authority', turn_id: 'turn', content_object_id: 'authority-content' },
@@ -73,7 +75,13 @@ function fixture({ toolName = 'send_agent_message', args = { targetConversationI
       async readConversation(input) { calls.push(input); return { conversationId: input.targetConversationId, title: 'peer', status: 'active',
         messages: [{ messageId: 'chat-message', role: 'model', text: 'retained reply' }], olderMessageId: 'chat-message', hasMore: true }; },
       async readMessage(input) { calls.push(input); return { messageId: input.messageId }; },
-      async waitMessages(input) { calls.push(input); return { messages: [], timedOut: true }; }
+      async waitMessages(input) { calls.push(input); return { messages: [], timedOut: true }; },
+      async listConversations(input) { calls.push({ list: input }); return { conversations: [{ conversationId: 'peer', title: 'peer', running: false, updatedAt: 'now' }], hasMore: false }; },
+      async authorizeCrossConversation(input) { calls.push({ authorize: input }); return { conversationId: 'conversation' }; }
+    },
+    conversations: {
+      async createForCollaboration(input) { calls.push({ create: input }); return { conversationId: 'created', title: 'created', messageId: 'message', deduplicated: false }; },
+      async forkCompletedHistory(input) { calls.push({ fork: input }); return { conversationId: 'forked', title: 'forked', deduplicated: false }; }
     },
     effects: { async settleWithoutEffect(input) { settlements.push(input); return { status: input.status, terminal: input }; } }
   });
@@ -178,4 +186,74 @@ test('authorized conversation history uses a separate reference kind from collab
     { view: 'conversation', targetConversationId: 'peer', beforeMessageId: 'chat-message' });
   assert.throws(() => resolveModelToolArguments('read_agent_messages', { beforeMessageRef: 'R1' }, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
   assert.throws(() => resolveModelToolArguments('read_agent_messages', { view: 'conversation', beforeMessageRef: 'M1' }, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+});
+
+
+test('cross-conversation dispatch requires the frozen switch and always queues sends behind a running target', async () => {
+  for (const crossConversation of [undefined, false]) {
+    const f = fixture({ toolName: 'send_conversation_message', args: { targetConversationId: 'peer', text: 'hello', mode: 'followup' }, crossConversation });
+    await assert.rejects(f.dispatcher.dispatch(f.input, undefined, f.authority), /not enabled/);
+    assert.deepEqual(f.calls, []); assert.deepEqual(f.settlements, []);
+  }
+  const send = fixture({ toolName: 'send_conversation_message', args: { targetConversationId: 'peer', text: 'hello', mode: 'message' }, crossConversation: true });
+  await send.dispatcher.dispatch(send.input, undefined, send.authority);
+  assert.deepEqual(send.calls, [{ source: { kind: 'tool', turnId: 'turn', toolCallId: 'call' }, targetConversationId: 'peer', text: 'hello',
+    mode: 'message', queueBehindActiveTurn: true, crossConversation: true }]);
+  assert.equal(send.settlements[0].detail.kind, 'cross_conversation');
+  const badMode = fixture({ toolName: 'send_conversation_message', args: { targetConversationId: 'peer', text: 'hello' }, crossConversation: true });
+  await assert.rejects(badMode.dispatcher.dispatch(badMode.input, undefined, badMode.authority), /mode/);
+  assert.deepEqual(badMode.calls, []);
+
+  const list = fixture({ toolName: 'list_conversations', args: {}, crossConversation: true });
+  const listed = await list.dispatcher.dispatch(list.input, undefined, list.authority);
+  assert.deepEqual(list.calls, [{ list: { turnId: 'turn', limit: 20 } }]);
+  assert.match(listed.detail.untrustedDataNotice, /untrusted/);
+  const read = fixture({ toolName: 'read_conversation', args: { targetConversationId: 'peer' }, crossConversation: true });
+  const transcript = await read.dispatcher.dispatch(read.input, undefined, read.authority);
+  assert.deepEqual(read.calls, [{ conversationId: 'conversation', targetConversationId: 'peer', crossConversationTurnId: 'turn', limit: 20 }]);
+  assert.equal(transcript.detail.messages[0].conversationMessageId, 'chat-message');
+  assert.match(transcript.detail.untrustedDataNotice, /untrusted/);
+
+  const create = fixture({ toolName: 'create_conversation', args: { prompt: 'do it', title: 'Task' }, crossConversation: true });
+  await create.dispatcher.dispatch(create.input, undefined, create.authority);
+  assert.deepEqual(create.calls, [{ authorize: { turnId: 'turn' } },
+    { create: { turnId: 'turn', toolCallId: 'call', sourceConversationId: 'conversation', prompt: 'do it', title: 'Task' } }]);
+  const fork = fixture({ toolName: 'fork_conversation', args: {}, crossConversation: true });
+  const forked = await fork.dispatcher.dispatch(fork.input, undefined, fork.authority);
+  assert.deepEqual(fork.calls, [{ authorize: { turnId: 'turn' } }, { fork: { sourceConversationId: 'conversation', commandId: 'call' } }]);
+  assert.equal(forked.detail.turnStarted, false);
+  assert.equal(forked.detail.sourceConversationId, 'conversation');
+});
+
+test('cross-conversation references map whole conversations, transcript pages and replies, never canonical ids', () => {
+  const raw = { kind: 'cross_conversation', conversations: [{ conversationId: 'peer-x', title: 'Peer' }], messages: [{ conversationMessageId: 'chat-x' }],
+    olderConversationMessageId: 'chat-x', sourceConversationId: 'self-x' };
+  const handles = buildModelHandleCatalog([raw]);
+  const projected = projectToolResultForModel('read_conversation', raw, handles);
+  assert.doesNotMatch(JSON.stringify(projected), /peer-x|chat-x|self-x/);
+  assert.match(projected.conversations[0].conversationRef, /^C\d+$/);
+  assert.match(projected.olderMessageRef, /^R\d+$/);
+  assert.deepEqual(resolveModelToolArguments('read_conversation', { conversationRef: projected.conversations[0].conversationRef, beforeMessageRef: projected.olderMessageRef }, handles),
+    { targetConversationId: 'peer-x', beforeMessageId: 'chat-x' });
+  assert.deepEqual(resolveModelToolArguments('fork_conversation', {}, handles), {});
+  for (const [toolName, args] of [['send_conversation_message', { targetConversationId: 'peer-x', text: 'x', mode: 'message' }],
+    ['fork_conversation', { conversationRef: 'C99' }], ['read_conversation', { conversationRef: projected.conversations[0].conversationRef, beforeMessageRef: 'M1' }]]) {
+    assert.throws(() => resolveModelToolArguments(toolName, args, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+  }
+});
+
+test('cross-conversation declarations are strict, summarize every call and classify only list and read as read-only', () => {
+  const definitions = crossConversationToolModules.map(module => module.create({}));
+  assert.deepEqual(definitions.map(tool => tool.declaration.name), ['list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation']);
+  assert.deepEqual(definitions.filter(tool => tool.declaration.metadata.readonly).map(tool => tool.declaration.name), ['list_conversations', 'read_conversation']);
+  for (const tool of [...definitions, ...agentCollaborationToolModules.map(module => module.create({}))]) {
+    assert.equal(tool.declaration.parameters.additionalProperties, false);
+    assert.equal(tool.declaration.metadata.defaultAutoApproveExecution, undefined, 'send-type tools stay auto-approved by default');
+    assert.equal(typeof tool.summary?.({ text: 'hello', prompt: 'p', mode: 'followup' }, { toolName: tool.declaration.name }), 'string');
+  }
+  const byName = Object.fromEntries(definitions.map(tool => [tool.declaration.name, tool.declaration.description]));
+  for (const name of ['list_conversations', 'read_conversation']) assert.match(byName[name], /untrusted/);
+  assert.match(byName.create_conversation, /only when the user explicitly asks/);
+  assert.match(byName.fork_conversation, /completed history/);
+  assert.match(byName.fork_conversation, /starts no turn/);
 });

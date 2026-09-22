@@ -1,4 +1,9 @@
 import { AGENT_COLLABORATION_TOOL_NAMES, isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
+import {
+  CROSS_CONVERSATION_TOOL_NAMES,
+  isCrossConversationTool,
+  isReadonlyCrossConversationTool
+} from '../world/modules/tools/definitions/crossConversation';
 import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
 import {
   MAX_CONCURRENT_ATTACHMENT_READS_PER_TURN,
@@ -62,6 +67,7 @@ import type {
 } from './agentLoop';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { childAgentDepthForTurn } from './childAgentDepth';
+import { frozenCrossConversationEnabled } from './collaborationPolicy';
 import type {
   EffectControlPlane,
   FrozenToolCallPolicyDecision,
@@ -180,6 +186,7 @@ const SPECIAL_TOOLS = new Set([
   'submit_agent_answer',
   'read_agent_answer',
   ...AGENT_COLLABORATION_TOOL_NAMES,
+  ...CROSS_CONVERSATION_TOOL_NAMES,
   'agent_board'
 ]);
 const WORK_ENVIRONMENT_TOOLS = new Set([SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME]);
@@ -867,6 +874,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       || input.toolName === 'submit_plan'
       || (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments))
       || isReadonlyAgentCollaborationTool(input.toolName)
+      || isReadonlyCrossConversationTool(input.toolName)
       || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))
       || allowlistedCommand
       || autoApproveReadonly
@@ -1430,6 +1438,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     }
     if (WORK_ENVIRONMENT_TOOLS.has(input.toolName) && !authorityWorkEnvironmentPolicy(authority.document).enabled) {
       return this.reject(input, `冻结 WorkEnvironmentPolicy 已关闭，当前 Turn 不允许工具 ${input.toolName}。`);
+    }
+    if (isCrossConversationTool(input.toolName) && !await this.crossConversationOffered(input.turnId, authority.document)) {
+      return this.reject(input, `当前 Turn 未开启跨对话协作，或当前对话是子 Agent 对话，不允许工具 ${input.toolName}。`);
     }
     const frozenDecision = options.frozenDecision
       ?? await this.readFrozenDecision(input, definition, authority);
@@ -2063,9 +2074,12 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       await childAgentDepthForTurn(this.dependencies.database, turnId),
       toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
     );
+    const crossConversation = definitions.some((definition) => isCrossConversationTool(definition.declaration.name))
+      && await this.crossConversationOffered(turnId, authority.document);
     const allowed = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
+      && (crossConversation || !isCrossConversationTool(definition.declaration.name))
     ).map(definition => {
       if (definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn) return definition;
       const parameters = plainOptionalRecord(normalizePlainJson(definition.declaration.parameters ?? {})) ?? {};
@@ -2081,6 +2095,18 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const withSkills = this.augmentSkillsDefinition(allowed, authority.document);
     const withEnvironments = await this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
     return this.augmentRunAgentDefinition(withEnvironments);
+  }
+
+  /**
+   * Cross-conversation tools require the user's frozen switch, and phase one offers them only to
+   * top-level conversations: a child task keeps collaborating inside its own team.
+   */
+  private async crossConversationOffered(turnId: string, document: PlainJsonValue): Promise<boolean> {
+    if (!frozenCrossConversationEnabled(document)) return false;
+    const turns = await this.list('Turn', { id: turnId }, 1);
+    if (turns.length !== 1) throw new Error(`Turn ${turnId} does not exist.`);
+    const conversationId = requireId(turns[0].conversation_id, 'Turn.conversation_id');
+    return (await this.list('ChildExecution', { child_conversation_id: conversationId }, 1)).length === 0;
   }
 
   /**
@@ -2867,6 +2893,7 @@ function frozenSchedulingFallback(
   const metadata = plainOptionalRecord(definition.metadata);
   if ((definition.name === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(value))
     || isReadonlyAgentCollaborationTool(definition.name)
+    || isReadonlyCrossConversationTool(definition.name)
     || (definition.name === 'agent_board' && isReadonlyAgentBoardOperation(value))
     || metadata?.readonly === true || metadata?.riskLevel === 'read') {
     return { mode: 'parallel', reason: 'frozen_readonly_metadata' };
@@ -2879,7 +2906,7 @@ function frozenPlanReviewRiskLevel(
   input: ReliableAgentToolDispatchInput
 ): FrozenPlanReviewRiskLevel {
   if (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments)) return 'read';
-  if (isReadonlyAgentCollaborationTool(input.toolName)
+  if (isReadonlyAgentCollaborationTool(input.toolName) || isReadonlyCrossConversationTool(input.toolName)
     || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))) return 'read';
   if (FILE_TOOLS.has(input.toolName)) return 'write';
   if (PROCESS_TOOLS.has(input.toolName)) {

@@ -17,7 +17,7 @@ import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingI
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { AGENT_COLLABORATION_CONFIG_KEYS, SUB_AGENT_TOOL_NAME, useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
+import { AGENT_COLLABORATION_CONFIG_KEYS, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, SUB_AGENT_TOOL_NAME, useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
 import { resolveToolHeaderIcon } from '@webview/components/content/toolDisplay/registry';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
@@ -454,7 +454,8 @@ function supportsInlineField(field: ToolConfigFieldRecord): boolean {
 
 function inlineFields(tool: ToolDefinitionRecord): ToolConfigFieldRecord[] {
   return (tool.configSchema?.fields ?? []).filter((field) => supportsInlineField(field)
-    && !(tool.name === SUB_AGENT_TOOL_NAME && AGENT_COLLABORATION_CONFIG_KEYS.some((key) => key === field.key)));
+    && !(tool.name === SUB_AGENT_TOOL_NAME && (field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY
+      || AGENT_COLLABORATION_CONFIG_KEYS.some((key) => key === field.key))));
 }
 
 function enumOptions(field: ToolConfigFieldRecord): SettingsDropdownOption[] {
@@ -652,7 +653,7 @@ function inputNumber(event: Event): number {
                       <small>由工具定义提供，展开后查看完整说明。</small>
                     </div>
                     <p class="tool-definition-description">{{ toolDescription(tool) }}</p>
-                    <p v-if="tool.name === SUB_AGENT_TOOL_NAME" class="tool-definition-mode-note">子 Agent 深度和团队预算已移至{{ scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域' }}。</p>
+                    <p v-if="tool.name === SUB_AGENT_TOOL_NAME" class="tool-definition-mode-note">子 Agent 深度、团队预算和跨对话协作开关已移至{{ scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域' }}。</p>
                     <p v-if="editModeShortLabel(tool)" class="tool-definition-mode-note">{{ editModeShortLabel(tool) }}</p>
                   </div>
 

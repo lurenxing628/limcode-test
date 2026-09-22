@@ -2,11 +2,12 @@ import type { ContentObjectMetadata } from '../../reliableKernel/contentAddresse
 import type { StructuralContextRecord } from '../../reliableKernel/contextSequence';
 import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
 import { ForkContextCandidateProbe, isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
+import { projectFolderAssignmentSteps, projectFolderForConversation } from '../../reliableKernel/conversationProject';
 import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
 import type { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
-import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle } from '../../../shared/conversationTitle';
+import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../../shared/conversationTitle';
 import { conversationHistoryTitleContentFromBytes } from './conversationHistoryProjection';
 
 /** The Runtime and settings authorities every Conversation lifecycle operation writes through. */
@@ -29,6 +30,21 @@ export interface ConversationForkOutcome {
   deduplicated: boolean;
 }
 
+export interface CompletedHistoryForkRequest {
+  sourceConversationId: string;
+  /** The fork_conversation ToolCall id: a replay resolves to the originally committed branch. */
+  commandId: string;
+}
+
+export interface CreatedConversationRequest {
+  /** Calling Turn and ToolCall: they fix the new Conversation's identity and first task source. */
+  turnId: string;
+  toolCallId: string;
+  sourceConversationId: string;
+  prompt: string;
+  title?: string;
+}
+
 /**
  * Conversation lifecycle writes shared by the user bridge (the facade) and model tools. Every
  * operation is idempotent by its command identity and never touches a webview: navigation and
@@ -47,6 +63,130 @@ export class ReliableConversationLifecycle {
     return this.application.database.conversationOwners.run(sourceConversationId, () =>
       this.forkUnderOwnership(request)
     );
+  }
+
+  /**
+   * Forks the completed history of a Conversation: the branch ends with the last visible Message
+   * of its latest ended Turn, so a Turn still in progress (including the caller's own) is never
+   * copied. The branch starts no Turn and nothing is posted to a webview.
+   */
+  public async forkCompletedHistory(request: CompletedHistoryForkRequest): Promise<ConversationForkOutcome & { title: string }> {
+    const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
+    const commandId = requireText(request.commandId, 'Conversation fork commandId');
+    return this.application.database.conversationOwners.run(sourceConversationId, async () => {
+      // A replayed command keeps its committed boundary even if more Turns have ended since.
+      const boundary = await this.committedForkBoundary(commandId) ?? await this.completedHistoryBoundary(sourceConversationId);
+      const result = await this.forkUnderOwnership({ sourceConversationId, commandId, ...boundary });
+      return { ...result, title: String((await this.requireRow('Conversation', result.conversationId)).title) };
+    });
+  }
+
+  /**
+   * Creates a top-level Conversation whose first Turn is a collaboration task from the calling
+   * Turn, never a user message. Every step is idempotent by the ToolCall id, so a replay resumes an
+   * interrupted creation; a crash before the task is sent leaves an empty Conversation behind.
+   */
+  public async createForCollaboration(request: CreatedConversationRequest): Promise<{
+    conversationId: string; title: string; messageId: string; deduplicated: boolean;
+  }> {
+    const turnId = requireText(request.turnId, 'create_conversation turnId');
+    const toolCallId = requireText(request.toolCallId, 'create_conversation toolCallId');
+    const sourceConversationId = requireText(request.sourceConversationId, 'create_conversation sourceConversationId');
+    if (typeof request.prompt !== 'string' || !request.prompt.trim()) throw new TypeError('create_conversation prompt must be non-empty text.');
+    const conversationId = stablePhaseFId('conversation', 'cross-create', toolCallId);
+    const title = request.title?.trim()
+      ? displayConversationTitleFromText(request.title, 80)
+      : displayConversationTitleFromText(request.prompt, 40);
+    // The calling Turn's frozen selection fixes the model and work environment the new
+    // Conversation starts with; everything else comes from its own settings scopes.
+    const [model, environment, agent, project] = await Promise.all([
+      this.application.runtime.children.frozenModelSelectionForTurn(turnId),
+      this.application.runtime.children.frozenWorkEnvironmentPolicyForTurn(turnId),
+      this.configuration.resolveAgent({ agentType: 'main' }),
+      projectFolderForConversation(this.application.database, sourceConversationId)
+    ]);
+    // This Host owns the new Conversation from its first write; the pending followup keeps it
+    // owned until the delivery starts its first Turn.
+    return this.application.database.conversationOwners.run(conversationId, async () => {
+      if (!await this.maybeRow('Conversation', conversationId)) {
+        const now = new Date().toISOString();
+        try {
+          await this.application.database.transaction([
+            DOMAIN_REPOSITORIES.domain('Conversation').insert({
+              id: conversationId, title, status: 'active', created_at: now, updated_at: now
+            }),
+            DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+              id: stablePhaseFId('agent_conversation_link', conversationId), conversation_id: conversationId,
+              agent_id: agent.agentId, role: 'default', created_at: now, updated_at: now
+            }),
+            ...(project ? projectFolderAssignmentSteps({ conversationId, folder: project, now }) : [])
+          ]);
+        } catch (error) {
+          if (!await this.maybeRow('Conversation', conversationId)) throw error;
+        }
+      }
+      await this.configuration.mutations.initializeConversationModelProfile({ conversationId, ...model });
+      if (environment?.defaultWorkEnvironmentId) {
+        await this.configuration.mutations.initializeConversationWorkEnvironment(conversationId, environment.defaultWorkEnvironmentId);
+      }
+      const sent = await this.application.runtime.collaboration.send({
+        source: { kind: 'tool', turnId, toolCallId }, targetConversationId: conversationId,
+        text: request.prompt, mode: 'followup', crossConversation: true
+      });
+      return {
+        conversationId,
+        title: String((await this.requireRow('Conversation', conversationId)).title),
+        messageId: sent.messageId,
+        deduplicated: sent.deduplicated
+      };
+    });
+  }
+
+  private async committedForkBoundary(commandId: string): Promise<{ messageId: string; expectedRevisionId: string } | undefined> {
+    const reuse = await this.list('ConversationReuseLink', { reuse_key: `conversation-fork-command:${commandId}` }, 2);
+    if (reuse.length !== 1) return undefined;
+    const branches = await this.list('ConversationBranchLink', {
+      target_conversation_id: requireText(reuse[0].conversation_id, 'ConversationReuseLink.conversation_id')
+    }, 2);
+    if (branches.length !== 1) return undefined;
+    const expectedRevisionId = requireText(branches[0].source_message_revision_id, 'ConversationBranchLink.source_message_revision_id');
+    const revision = await this.requireRow('MessageRevision', expectedRevisionId);
+    return { messageId: requireText(revision.message_id, 'MessageRevision.message_id'), expectedRevisionId };
+  }
+
+  /** The newest visible user or assistant Message that is in Context and whose Turns all ended. */
+  private async completedHistoryBoundary(conversationId: string): Promise<{ messageId: string; expectedRevisionId: string }> {
+    let keyset: { column: string; value: bigint; id: string; direction: 'before' } | undefined;
+    for (;;) {
+      const page = requireRows((await this.application.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+          where: { conversation_id: conversationId },
+          orderBy: { column: 'message_seq', direction: 'desc' },
+          ...(keyset ? { keyset } : {}),
+          limit: 100
+        })
+      ])).snapshot[0], 'MessagePartOfConversation fork boundary');
+      for (const membership of page) {
+        const messageId = requireText(membership.message_id, 'MessagePartOfConversation.message_id');
+        const [message, current, turnLinks] = await Promise.all([
+          this.requireRow('Message', messageId),
+          this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2),
+          this.list('MessageTurnLink', { message_id: messageId }, 16)
+        ]);
+        if (message.deleted_at !== null || current.length !== 1 || turnLinks.length === 0) continue;
+        const revisionId = requireText(current[0].revision_id, 'MessageCurrentRevisionLink.revision_id');
+        const revision = await this.requireRow('MessageRevision', revisionId);
+        if (revision.role !== 'user' && revision.role !== 'model') continue;
+        const turns = await Promise.all(turnLinks.map((link) => this.requireRow('Turn', requireText(link.turn_id, 'MessageTurnLink.turn_id'))));
+        if (turns.some((turn) => turn.status !== 'terminated')) continue;
+        const inContext = (await this.list('ContextSegmentSource', { source_kind: 'message_revision', source_id: revisionId }, 1)).length > 0
+          || (revision.role === 'model' && (await readNativeMessageContextRevisions(this.application.database, messageId)).length > 0);
+        if (inContext) return { messageId, expectedRevisionId: revisionId };
+      }
+      if (page.length < 100) throw new ConversationForkRejectedError('这个对话还没有已完成的轮次，无法创建分支。');
+      const last = page[page.length - 1];
+      keyset = { column: 'message_seq', value: last.message_seq as bigint, id: requireText(last.id, 'MessagePartOfConversation.id'), direction: 'before' };
+    }
   }
 
   private async forkUnderOwnership(request: ConversationForkRequest): Promise<ConversationForkOutcome> {

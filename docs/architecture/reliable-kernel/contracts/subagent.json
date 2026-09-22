@@ -411,7 +411,7 @@
     "sendMessage": "persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary",
     "followupTask": "explicit-request-may-wake-idle-or-join-active; never-implicitly-cancel",
     "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
-    "permissions": "same-root-peer-communication; conversations-outside-the-team-are-unreachable-except-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
+    "permissions": "same-root-peer-communication; conversations-outside-the-team-are-reachable-only-through-cross-conversation-tools-or-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
     "revocation": "check-current-team-lineage-and-target-state-again-at-admission",
     "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail",
     "limits": "frozen-policy-bounds-active-team-size-recursion-and-turn-wakeup-budget",
@@ -437,6 +437,28 @@
       "notification": "active-subscribers-only; no-idle-wake",
       "deletion": "root-channel-posts-and-source-posts-delete-with-conversation; request-receipts-and-links-cascade"
     },
-    "budget": "independent-CollaborationBudget; recursive-tool-followups-inherit-origin-budget-and-frozen-authority; zero-disables-automatic-followups"
+    "budget": "independent-CollaborationBudget; recursive-tool-followups-inherit-origin-budget-and-frozen-authority; zero-disables-automatic-followups",
+    "crossConversation": {
+      "switch": "ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; frozen-in-Turn-authority; configSchema-defaultValue-only",
+      "tools": [
+        "list_conversations",
+        "read_conversation",
+        "send_conversation_message",
+        "create_conversation",
+        "fork_conversation"
+      ],
+      "readonlyTools": [
+        "list_conversations",
+        "read_conversation"
+      ],
+      "offering": "top-level-conversations-only; hidden-and-rejected-when-switch-off; control-plane-rechecks-calling-Turn-frozen-authority",
+      "targets": "other-active-top-level-conversations-of-this-Runtime; child-task-conversations-never-listed-or-addressed",
+      "approval": "send-type-tools-auto-approved-by-default; per-tool-autoApproveExecution-false-requires-confirmation",
+      "allowlist": "enabling-the-switch-in-settings-adds-the-tools-to-that-scope-allowedTools; backend-never-widens-a-saved-allowlist",
+      "delivery": "running-target-queues-behind-its-current-Turn; followup-starts-one-Turn-after-it-ends; message-joins-the-next-Turn; completion-replies-are-not-queued",
+      "authority": "peer-text-is-an-attributed-collaboration-envelope-never-a-user-message; list-and-read-carry-an-untrusted-data-notice",
+      "create": "stable-Conversation-id-from-ToolCall; default-AgentConversationLink-project-link-model-profile-work-environment-then-followup; every-step-idempotent; no-ConversationOriginLink",
+      "fork": "commandId-is-ToolCall; completed-history-up-to-the-last-ended-Turn; starts-no-Turn; replay-keeps-the-committed-boundary; never-navigates-the-view"
+    }
   }
 }

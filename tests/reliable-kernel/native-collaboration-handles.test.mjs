@@ -20,7 +20,8 @@ const definition = name => ({ name, description: 'native collaboration handle fi
 const rows = async (app, domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain)
   .list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot;
 
-test('native collaboration references freeze before output and survive same-request send, restart and replay', { timeout: 30000 }, async () => {
+for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_message', 'agent_collaboration'],
+  ['list_conversations', 'send_conversation_message', 'cross_conversation']]) test(`native ${sendTool} references freeze before output and survive same-request send, restart and replay`, { timeout: 30000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'native-child-handles-'));
   const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(root);
@@ -38,7 +39,7 @@ test('native collaboration references freeze before output and survive same-requ
       const event = (kind, content) => controls.onEvent({ kind, streamSeq: String(++sequence), content });
       const control = content => event('native_control', content);
       const call = (id, ordinal, args, responseId) => event('output_item_done', {
-        type: 'tool_calls', calls: [{ id, ordinal, name: args.operation === 'spawn' ? 'list_agents' : 'send_agent_message', arguments: args.operation === 'spawn' ? {} : args, async: false }],
+        type: 'tool_calls', calls: [{ id, ordinal, name: args.operation === 'spawn' ? listTool : sendTool, arguments: args.operation === 'spawn' ? {} : args, async: false }],
         outputItem: { id: `item-${id}`, ordinal, providerResponseId: responseId }
       });
       let finish;
@@ -61,8 +62,9 @@ test('native collaboration references freeze before output and survive same-requ
               assert.deepEqual(decoded.map(item => item.detail.conversationRef), ['C1', 'C2']);
               await control({ type: 'response.created', responseId: 'response-followup', previousResponseId: 'response-spawn',
                 admittedToolResultCallIds: batch.map(item => item.callId) });
-              await call('send', 0, { conversationRef: 'C1', text: 'follow up original peer' }, 'response-followup');
-              await call('unknown', 1, { conversationRef: 'C999', text: 'must not run' }, 'response-followup');
+              const mode = sendTool === 'send_conversation_message' ? { mode: 'followup' } : {};
+              await call('send', 0, { conversationRef: 'C1', text: 'follow up original peer', ...mode }, 'response-followup');
+              await call('unknown', 1, { conversationRef: 'C999', text: 'must not run', ...mode }, 'response-followup');
               await control({ type: 'response.completed', responseId: 'response-followup' });
             } else {
               assert.equal(submitted.length, 4);
@@ -98,7 +100,7 @@ test('native collaboration references freeze before output and survive same-requ
           retryPolicy: { enabled: false, maxRetries: 0 } },
         modelProfile: { compressionThresholdTokens: 100000, contextWindowTokens: 128000,
           tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
-        toolPolicy: { id: 'tools', allowedTools: ['list_agents', 'send_agent_message'], preset: 'custom', toolConfigs: {}, sourceConfigs: {} },
+        toolPolicy: { id: 'tools', allowedTools: [listTool, sendTool], preset: 'custom', toolConfigs: {}, sourceConfigs: {} },
         planReviewPolicy: { mode: 'never' }, systemPrompt: { id: 'prompt', text: '' },
         runtimeContext: { id: null, name: '', template: '' },
         workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
@@ -110,15 +112,15 @@ test('native collaboration references freeze before output and survive same-requ
     attachmentSettings: { async loadGlobalSettings() { return { section: 'attachments', settings: { maxStoredInlineFileMb: 25 }, filePath: 'unused' }; } },
     providers: { resolve() { return adapter; } },
     toolDispatcher: {
-      definitions() { return [definition('list_agents'), definition('send_agent_message')]; },
+      definitions() { return [definition(listTool), definition(sendTool)]; },
       async dispatch() { throw new Error('native test must use scheduleAdmittedCall'); },
       async scheduleAdmittedCall(input) {
         executed.push(input.arguments);
-        if (input.toolName === 'send_agent_message') assert.equal(input.arguments.targetConversationId, 'conversation_one');
-        const target = input.toolName === 'list_agents' ? `conversation_${executed.length === 1 ? 'one' : 'two'}` : input.arguments.targetConversationId;
+        if (input.toolName === sendTool) assert.equal(input.arguments.targetConversationId, 'conversation_one');
+        const target = input.toolName === listTool ? `conversation_${executed.length === 1 ? 'one' : 'two'}` : input.arguments.targetConversationId;
         const result = await app.runtime.effects.settleWithoutEffect({
           source: { kind: 'internal', key: `fixture:${input.toolCallId}` }, toolCallId: input.toolCallId,
-          status: 'succeeded', detail: { kind: 'agent_collaboration', ok: true, status: 'running', conversationId: target }
+          status: 'succeeded', detail: { kind: resultKind, ok: true, status: 'running', conversationId: target }
         });
         return result.terminal;
       }
@@ -179,10 +181,10 @@ test('native collaboration references freeze before output and survive same-requ
       closeAdmittedCall: async () => {}, now: () => new Date().toISOString()
     });
     await recovered.reconcile();
-    assert.equal(resolveModelToolArguments('send_agent_message', { conversationRef: 'C2' }, recovered.currentModelHandleCatalog()).targetConversationId, 'conversation_two');
+    assert.equal(resolveModelToolArguments(sendTool, { conversationRef: 'C2' }, recovered.currentModelHandleCatalog()).targetConversationId, 'conversation_two');
     const [firstSource] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'spawn-one' });
     const [firstResult] = await rows(app, 'ToolModelResult', { tool_call_id: firstSource.tool_call_id });
-    const replay = await recovered.buildFunctionCallOutput({ name: 'list_agents', toolCallId: firstSource.tool_call_id,
+    const replay = await recovered.buildFunctionCallOutput({ name: listTool, toolCallId: firstSource.tool_call_id,
       providerCallId: 'spawn-one', toolModelResultId: firstResult.id });
     assert.equal(replay.output, outputs[0].output, 'replay bytes cannot change after later child allocations');
     assert.equal((await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT })).length, 4);

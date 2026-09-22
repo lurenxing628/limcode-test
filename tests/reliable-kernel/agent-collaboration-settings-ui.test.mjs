@@ -25,6 +25,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
     const { useToolPolicyStore } = await server.ssrLoadModule('/src/stores/useToolPolicyStore.ts');
     const { GLOBAL_SETTINGS_TABS } = await server.ssrLoadModule('/src/components/settings/global/globalSettingsTabs.ts');
     const { runAgentTool } = await server.ssrLoadModule(path.join(process.cwd(), 'backend/world/modules/tools/definitions/runAgent/index.ts'));
+    const { crossConversationToolModules } = await server.ssrLoadModule(path.join(process.cwd(), 'backend/world/modules/tools/definitions/crossConversation/index.ts'));
     const activePinia = pinia.createPinia();
     pinia.setActivePinia(activePinia);
     const client = useClientStateStore();
@@ -101,6 +102,37 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(store.localPolicyFor('agent', 'disabled').policy.toolConfigs.run_agent.autoApproveExecution, false);
       const html = await render(editor, { scopeKind: 'agent', scopeId: 'disabled' });
       assert.match(html, /调整协作设置不会自动启用工具/);
+    });
+
+    await t.test('跨对话协作开关默认关闭，开启时把跨对话工具加入该作用域允许列表，关闭与恢复继承不改动允许列表', async () => {
+      const crossTools = crossConversationToolModules.map((module) => module.create({}).declaration);
+      const crossNames = crossTools.map((tool) => tool.name);
+      client.toolDefinitions = [...client.toolDefinitions, ...crossTools];
+      const field = runAgentTool.declaration.configSchema.fields.find((candidate) => candidate.key === 'crossConversationCollaboration');
+      assert.equal(field.type, 'boolean');
+      assert.equal(field.defaultValue, false);
+      assert.equal('crossConversationCollaboration' in runAgentTool.declaration.defaultConfig, false, '只写 defaultValue，不写 defaultConfig');
+      assert.equal(runAgentTool.declaration.parameters.properties.crossConversationCollaboration, undefined);
+      const checkbox = (html) => html.match(/<button[^>]*aria-label="跨对话协作"[^>]*>/)?.[0];
+      assert.match(checkbox(await render(editor, { scopeKind: 'global' })), /aria-checked="false"/);
+      assert.doesNotMatch(await render(toolEditor, { scopeKind: 'global' }), /aria-label="跨对话协作"/);
+
+      store.setPolicyForScope('conversation', 'cross-a', ['read_file', 'run_agent'], 'Custom', { run_agent: { config: { maxConcurrentAgents: 3 } } });
+      store.setCrossConversationCollaborationForScope('conversation', 'cross-a', true);
+      const enabled = store.localPolicyFor('conversation', 'cross-a').policy;
+      assert.deepEqual(enabled.toolConfigs.run_agent.config, { maxConcurrentAgents: 3, crossConversationCollaboration: true });
+      assert.deepEqual(enabled.allowedTools, ['read_file', 'run_agent', ...crossNames]);
+      assert.equal(messages.at(-1).payload.toolConfigs.run_agent.config.crossConversationCollaboration, true);
+      assert.deepEqual(messages.at(-1).payload.allowedTools, ['read_file', 'run_agent', ...crossNames]);
+      assert.match(checkbox(await render(editor, { scopeKind: 'conversation', scopeId: 'cross-a' })), /aria-checked="true"/);
+      assert.equal(store.localPolicyFor('conversation', 'cross-b').policy, undefined, '其它对话作用域不受影响');
+
+      store.setCrossConversationCollaborationForScope('conversation', 'cross-a', false);
+      assert.equal(store.localPolicyFor('conversation', 'cross-a').policy.toolConfigs.run_agent.config.crossConversationCollaboration, false);
+      assert.deepEqual(store.localPolicyFor('conversation', 'cross-a').policy.allowedTools, ['read_file', 'run_agent', ...crossNames]);
+      store.setCrossConversationCollaborationForScope('conversation', 'cross-a', undefined);
+      assert.deepEqual(store.localPolicyFor('conversation', 'cross-a').policy.toolConfigs.run_agent.config, { maxConcurrentAgents: 3 });
+      assert.throws(() => store.setCrossConversationCollaborationForScope('global', undefined, 'yes'), TypeError);
     });
   } finally {
     pinia.setActivePinia(previousPinia);
