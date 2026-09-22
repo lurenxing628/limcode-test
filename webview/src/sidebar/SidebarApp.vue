@@ -34,6 +34,17 @@ import {
   type SidebarHistoryScopeKind,
   type SidebarConversationHistoryEntry
 } from './types';
+import {
+  expandNewlyActiveAgentAncestors,
+  expandActiveConversationAncestors,
+  toggleHistoryNode as toggleHistoryNodeIntent,
+  flattenVisibleHistoryNodes as flattenVisibleHistoryNodesWithIntent,
+  userCollapsedIdsFromState,
+  allHistoryNodes,
+  runningAgentConversationIds,
+  sortedIds,
+  type VisibleHistoryNode
+} from './collapseIntent';
 
 type SidebarView = 'history' | 'settings' | 'projectPicker';
 interface ScopeOption {
@@ -72,8 +83,10 @@ const abortRequests = ref<Record<string, {
   leaseGeneration: string;
 }>>({});
 const operationNotice = ref<{ text: string; kind: 'info' | 'error' }>();
-const expandedConversationIds = ref<Set<string>>(new Set(readSidebarHostState().expandedConversationIds));
-const favoriteConversationIds = ref<Set<string>>(new Set(readSidebarHostState().favoriteConversationIds));
+const initialHostState = readSidebarHostState();
+const expandedConversationIds = ref<Set<string>>(new Set(initialHostState.expandedConversationIds));
+const userCollapsedConversationIds = ref<Set<string>>(userCollapsedIdsFromState(initialHostState));
+const favoriteConversationIds = ref<Set<string>>(new Set(initialHostState.favoriteConversationIds));
 const favoritesViewActive = ref(false);
 const projectFolders = ref<ProjectFolderCandidateRecord[]>([]);
 const activeScopeKind = ref<SidebarHistoryScopeKind>('currentProject');
@@ -101,7 +114,11 @@ const displayEntries = computed(() => {
 });
 const historyForest = computed(() => buildConversationHistoryForest(displayEntries.value, originLinks.value));
 const originLinkByConversationId = computed(() => selectConversationOriginLinks(originLinks.value));
-const visibleHistoryNodes = computed(() => flattenVisibleHistoryNodes(historyForest.value, expandedConversationIds.value));
+const visibleHistoryNodes = computed(() => flattenVisibleHistoryNodesWithIntent({
+  forest: historyForest.value,
+  expandedIds: expandedConversationIds.value,
+  maxVisualDepth: MAX_VISUAL_TREE_DEPTH
+}));
 const historyScrollbarRefreshKey = computed(() => `${visibleEntries.value.length}:${visibleHistoryNodes.value.length}`);
 const historyCountText = computed(() => {
   if (!historyReady.value) return "正在加载对话...";
@@ -403,16 +420,19 @@ function closeAbortDialog(): void {
   abortTarget.value = undefined;
 }
 
-function toggleHistoryNode(node: VisibleHistoryTreeNode): void {
+function toggleHistoryNode(node: VisibleHistoryNode): void {
   if (!node.hasChildren) return;
-  const next = new Set(expandedConversationIds.value);
-  if (next.has(node.entry.id)) next.delete(node.entry.id);
-  else next.add(node.entry.id);
-  expandedConversationIds.value = next;
+  const result = toggleHistoryNodeIntent({
+    conversationId: node.entry.id,
+    expandedIds: expandedConversationIds.value,
+    userCollapsedIds: userCollapsedConversationIds.value
+  });
+  expandedConversationIds.value = result.expandedIds;
+  userCollapsedConversationIds.value = result.userCollapsedIds;
   persistExpandedConversationIds();
 }
 
-function onHistoryItemKeydown(event: KeyboardEvent, node: VisibleHistoryTreeNode): void {
+function onHistoryItemKeydown(event: KeyboardEvent, node: VisibleHistoryNode): void {
   if (event.key === 'Enter' || event.key === ' ') {
     event.preventDefault();
     openConversation(node.entry);
@@ -602,31 +622,7 @@ function ensureActiveScopeVisible(): void {
   scopePageIndex.value = Math.floor(index / SCOPE_PAGE_SIZE);
 }
 
-function flattenVisibleHistoryNodes(
-  roots: readonly ConversationHistoryTreeNode[],
-  expandedIds: ReadonlySet<string>
-): VisibleHistoryTreeNode[] {
-  const result: VisibleHistoryTreeNode[] = [];
-  const append = (node: ConversationHistoryTreeNode, depth: number): void => {
-    const hasChildren = node.children.length > 0;
-    const expanded = hasChildren && expandedIds.has(node.entry.id);
-    result.push({
-      entry: node.entry,
-      ...(node.originLink ? { originLink: node.originLink } : {}),
-      ...(node.parentConversationId ? { parentConversationId: node.parentConversationId } : {}),
-      depth,
-      visualDepth: Math.min(depth, MAX_VISUAL_TREE_DEPTH),
-      childCount: node.children.length,
-      hasChildren,
-      expanded,
-      descendantAgents: summarizeDescendantAgents(node)
-    });
-    if (!expanded) return;
-    for (const child of node.children) append(child, depth + 1);
-  };
-  for (const root of roots) append(root, 0);
-  return result;
-}
+
 
 function ensureActiveConversationAncestorsExpanded(): void {
   const activeConversationId = openConversations.value.find((item) => item.active)?.conversationId;
@@ -634,65 +630,45 @@ function ensureActiveConversationAncestorsExpanded(): void {
     autoExpandedActiveConversationId = undefined;
     return;
   }
-  if (activeConversationId === autoExpandedActiveConversationId) return;
 
-  const nodeById = new Map(
-    flattenConversationHistoryForest(historyForest.value).map((node) => [node.entry.id, node])
-  );
-  let node = nodeById.get(activeConversationId);
-  if (!node) return;
-  autoExpandedActiveConversationId = activeConversationId;
+  const result = expandActiveConversationAncestors({
+    nodes: allHistoryNodes(historyForest.value),
+    activeConversationId,
+    expandedIds: expandedConversationIds.value,
+    userCollapsedIds: userCollapsedConversationIds.value,
+    alreadyAutoExpandedId: autoExpandedActiveConversationId
+  });
 
-  const next = new Set(expandedConversationIds.value);
-  let changed = false;
-  while (node.parentConversationId) {
-    if (!next.has(node.parentConversationId)) {
-      next.add(node.parentConversationId);
-      changed = true;
-    }
-    const parent = nodeById.get(node.parentConversationId);
-    if (!parent) break;
-    node = parent;
-  }
-  if (changed) {
-    expandedConversationIds.value = next;
+  if (result.changed) {
+    autoExpandedActiveConversationId = result.autoExpandedId;
+    expandedConversationIds.value = result.expandedIds;
     persistExpandedConversationIds();
   }
 }
 
 function ensureNewActiveAgentAncestorsExpanded(): void {
-  const allNodes = flattenConversationHistoryForest(historyForest.value);
-  const nodeById = new Map(allNodes.map((node) => [node.entry.id, node]));
-  const nextActiveAgentIds = new Set(allNodes
-    .filter((node) => node.originLink?.originKind === 'agent')
-    .filter((node) => node.entry.runState === 'running' || node.entry.isRunning)
-    .map((node) => node.entry.id));
-  const newlyActiveIds = [...nextActiveAgentIds].filter((id) => !activeAgentConversationIds.has(id));
-  activeAgentConversationIds = nextActiveAgentIds;
-  if (newlyActiveIds.length === 0) return;
+  const nodes = allHistoryNodes(historyForest.value);
+  const result = expandNewlyActiveAgentAncestors({
+    nodes,
+    expandedIds: expandedConversationIds.value,
+    userCollapsedIds: userCollapsedConversationIds.value,
+    previouslyActiveAgentIds: activeAgentConversationIds
+  });
 
-  const nextExpanded = new Set(expandedConversationIds.value);
-  let changed = false;
-  for (const activeId of newlyActiveIds) {
-    let node = nodeById.get(activeId);
-    while (node?.parentConversationId) {
-      if (!nextExpanded.has(node.parentConversationId)) {
-        nextExpanded.add(node.parentConversationId);
-        changed = true;
-      }
-      node = nodeById.get(node.parentConversationId);
-    }
+  activeAgentConversationIds = runningAgentConversationIds(nodes);
+
+  if (result.changed) {
+    expandedConversationIds.value = result.expandedIds;
+    persistExpandedConversationIds();
   }
-  if (!changed) return;
-  expandedConversationIds.value = nextExpanded;
-  persistExpandedConversationIds();
 }
 
 function persistExpandedConversationIds(): void {
   const persisted = getPersistedSidebarHostState();
   writeSidebarHostState({
-    expandedConversationIds: [...expandedConversationIds.value].sort((left, right) => left.localeCompare(right)),
-    favoriteConversationIds: persisted.favoriteConversationIds
+    expandedConversationIds: sortedIds(expandedConversationIds.value),
+    favoriteConversationIds: persisted.favoriteConversationIds,
+    userCollapsedConversationIds: sortedIds(userCollapsedConversationIds.value)
   });
 }
 
@@ -700,7 +676,8 @@ function persistFavorites(): void {
   const persisted = getPersistedSidebarHostState();
   writeSidebarHostState({
     expandedConversationIds: persisted.expandedConversationIds,
-    favoriteConversationIds: [...favoriteConversationIds.value]
+    favoriteConversationIds: sortedIds(favoriteConversationIds.value),
+    userCollapsedConversationIds: persisted.userCollapsedConversationIds ?? []
   });
 }
 

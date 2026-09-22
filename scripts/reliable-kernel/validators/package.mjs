@@ -378,6 +378,11 @@ function checkBridgePayloadPlain() {
       postPattern: /webview\.postMessage\(\(0, [A-Za-z0-9_]+\.toStructuredClonePlainData\)\(message,/
     },
     {
+      path: 'dist/extension/backend/application/reliableKernel/GlobalSettingsSaveBarrier.js',
+      marker: 'global settings flush message',
+      postPattern: /client\.postMessage\(\(0, [A-Za-z0-9_]+\.toStructuredClonePlainData\)\(/
+    },
+    {
       path: 'dist/extension/backend/reliableKernel/webviewFeedBridge.js',
       marker: 'reliable kernel webview message',
       postPattern: /client\.webview\.postMessage\(plain\)/

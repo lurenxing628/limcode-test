@@ -287,6 +287,10 @@ test('旧窗口不能覆盖普通设置文件的新提交', async () => {
       ...initial.settings,
       streamingTextWaiting: '窗口 A 已保存'
     }, initial.revision);
+    const beforeNoop = await fsp.readFile(first.filePath, 'utf8');
+    const noop = await globalSettings.writeGlobalSettingsFile(root, 'appearance', first.settings, first.revision);
+    assert.equal(noop.revision, first.revision);
+    assert.equal(await fsp.readFile(first.filePath, 'utf8'), beforeNoop, 'unchanged settings must not republish timestamps');
 
     await assert.rejects(
       globalSettings.writeGlobalSettingsFile(root, 'appearance', {

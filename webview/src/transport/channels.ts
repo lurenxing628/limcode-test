@@ -25,6 +25,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.WorkflowUpdate:
     case BridgeMessageType.WorkflowDelete:
     case BridgeMessageType.ConversationWorkflowSelect:
+    case BridgeMessageType.ModelProfileScopeRead:
     case BridgeMessageType.ModelProfileScopeSet:
     case BridgeMessageType.ModelProfileScopeClear:
     case BridgeMessageType.WorkEnvironmentSelect:

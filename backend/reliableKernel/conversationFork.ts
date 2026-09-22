@@ -5,6 +5,7 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { conversationProjectLinkInsertStep } from './conversationProject';
+import { readForkContextLineage } from './conversationForkContext';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { ReliableContextTokenEstimator } from './contextTokenEstimator';
@@ -232,9 +233,6 @@ export class ConversationForkControlPlane {
       const rightSeq = requireBigInt(right.root_seq, 'ContextSequenceRoot.root_seq');
       return leftSeq < rightSeq ? -1 : leftSeq > rightSeq ? 1 : String(left.id).localeCompare(String(right.id));
     });
-    const historicalSourceRoots = sourceContextRoots.filter((root) =>
-      requireId(root.id, 'ContextSequenceRoot.id') !== command.sourceContextRootId
-    );
 
     const now = this.timestamp();
     await this.context.assertNativeContextClosed(command.sourceContextRootId, command.sourceContextEndSegmentId);
@@ -245,6 +243,16 @@ export class ConversationForkControlPlane {
       command.sourceContextEndSegmentId
     );
     const sharedRootNodeId = targetRootShape.rootNodeId;
+    // root_seq is insertion order, not ancestry: edits/truncation can leave earlier roots with
+    // revisions or suffixes absent from this fork. Keep only history reachable from the retained
+    // prefix, expanding compression lineage so pre-compression message boundaries remain usable.
+    const retainedSegmentIds = targetRootShape.segmentIds ?? (
+      await this.context.materializeStructure(command.sourceContextRootId)
+    ).records.map((record) => requireId(record.segment.id, 'ContextSegment.id'));
+    const retainedLineage = await readForkContextLineage(this.database, retainedSegmentIds);
+    const historicalSourceRoots = await retainedForkHistoryRoots(
+      this.database, sourceContextRoots, command.sourceContextRootId, retainedLineage.segmentIds
+    );
     const transcript = await prepareConversationForkSnapshot(this.database, {
       sourceConversationId: command.sourceConversationId,
       targetConversationId: ids.targetConversationId,
@@ -255,6 +263,22 @@ export class ConversationForkControlPlane {
       targetAgentId: command.targetAgentId,
       now
     });
+    if (sourceMembership) {
+      // A direct caller can select an obsolete root even when the boundary revision is current.
+      // Never commit a head whose retained message segments lack the copied target provenance.
+      const copiedMessageSegments = new Map<string, number>();
+      for (const step of transcript.inserts) {
+        if (step.kind !== 'insert' || step.domain !== 'ContextSegmentSource'
+          || step.row.source_kind !== 'message_revision') continue;
+        const segmentId = requireId(step.row.segment_id, 'ContextSegmentSource.segment_id');
+        copiedMessageSegments.set(segmentId, (copiedMessageSegments.get(segmentId) ?? 0) + 1);
+      }
+      for (const source of retainedLineage.messageSources) {
+        if (copiedMessageSegments.get(requireId(source.segment_id, 'ContextSegmentSource.segment_id')) !== 1) {
+          throw new Error('Fork Context prefix contains a MessageRevision outside the copied current transcript.');
+        }
+      }
+    }
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Conversation').assert(command.sourceConversationId, {
         status: sourceConversation.status
@@ -669,6 +693,56 @@ function requireBigInt(value: unknown, label: string): bigint {
   if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value);
   if (typeof value === 'string' && /^-?\d+$/.test(value)) return BigInt(value);
   throw new TypeError(`${label} must be an integer.`);
+}
+
+async function retainedForkHistoryRoots(
+  database: RuntimeDatabase,
+  roots: readonly DomainRow[],
+  selectedRootId: string,
+  retainedSegmentIds: ReadonlySet<string>
+): Promise<DomainRow[]> {
+  const candidates = roots.filter((root) => root.id !== selectedRootId);
+  const nodes = new Map<string, DomainRow>();
+  const tips = [...new Set(candidates.flatMap((root) => [root.root_node_id, root.tail_node_id])
+    .filter((id): id is string => id !== null).map((id) => requireId(id, 'ContextSequenceNode.id')))];
+  for (let offset = 0; offset < tips.length; offset += 256) {
+    const batch = tips.slice(offset, offset + 256);
+    const snapshot = await database.snapshot(batch.map((id) => DOMAIN_REPOSITORIES.domain('ContextSequenceNode').get(id)));
+    batch.forEach((id, index) => nodes.set(id, requireRow(snapshot.snapshot[index], `ContextSequenceNode ${id}`)));
+  }
+  // Memoize immutable parent chains, not materialized roots. Appending R segments creates R
+  // overlapping roots; expanding every root is quadratic. Repeated segment occurrences remain
+  // valid: no comparison between occurrence counts and a set's cardinality is used here.
+  const retained = new Map<string | null, boolean>([[null, true]]);
+  const chainRetained = async (tip: string | null): Promise<boolean> => {
+    let cursor = tip;
+    const trail = new Set<string>();
+    while (!retained.has(cursor)) {
+      const id = requireId(cursor, 'ContextSequenceNode.id');
+      if (trail.has(id)) throw new Error(`Fork history Context node cycle at ${id}.`);
+      trail.add(id);
+      let node = nodes.get(id);
+      if (!node) {
+        const snapshot = await database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSequenceNode').get(id)]);
+        node = requireRow(snapshot.snapshot[0], `ContextSequenceNode ${id}`);
+        nodes.set(id, node);
+      }
+      if (!retainedSegmentIds.has(requireId(node.segment_id, 'ContextSequenceNode.segment_id'))) {
+        retained.set(id, false);
+        break;
+      }
+      cursor = nullableId(node.parent_node_id, 'ContextSequenceNode.parent_node_id');
+    }
+    const compatible = retained.get(cursor)!;
+    for (const id of trail) retained.set(id, compatible);
+    return compatible;
+  };
+  const result: DomainRow[] = [];
+  for (const root of candidates) {
+    if (await chainRetained(nullableId(root.root_node_id, 'ContextSequenceRoot.root_node_id'))
+      && await chainRetained(nullableId(root.tail_node_id, 'ContextSequenceRoot.tail_node_id'))) result.push(root);
+  }
+  return result;
 }
 
 async function resolveForkRootShape(

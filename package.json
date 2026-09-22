@@ -2,7 +2,7 @@
   "name": "limcode-test",
   "displayName": "Limcode Test",
   "description": "VS Code AI assistant with a TypeScript reliable runtime, SQLite/CAS persistence, and Vue webviews.",
-  "version": "0.0.21",
+  "version": "0.0.24",
   "publisher": "your-publisher",
   "private": true,
   "repository": {
@@ -79,6 +79,7 @@
     }
   },
   "scripts": {
+    "test:browser": "npm run build && node --test tests/webview-session-thinking.browser.mjs",
     "clean:extension": "node -e \"require('fs').rmSync('dist/extension',{recursive:true,force:true})\"",
     "generate:cutover-manifest": "node scripts/reliable-kernel/generate-physical-cutover-manifest.mjs",
     "check:cutover-manifest": "node scripts/reliable-kernel/generate-physical-cutover-manifest.mjs --check",
@@ -128,6 +129,7 @@
     "markdown-it": "^14.2.0",
     "markdown-it-texmath": "^1.0.0",
     "pinia": "^2.3.1",
+    "playwright": "^1.63.0",
     "typescript": "^5.5.3",
     "vite": "^5.3.3",
     "vue": "^3.4.31",

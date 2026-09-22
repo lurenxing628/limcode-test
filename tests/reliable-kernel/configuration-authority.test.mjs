@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';
+﻿import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -35,10 +35,167 @@ const {
   workEnvironmentIdFromUri
 } = require('../../dist/extension/shared/workEnvironmentCatalog.js');
 
+test('渠道、压缩与 MCP 目录保存只修改选中记录，重复保存保持文件和 revision', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-catalog-delta-'));
+  try {
+    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(vscode.Uri.file(root)));
+    const cases = [
+      ['llmProviderConfigs', 'configs', i => ({ ...createDefaultLlmProviderConfig(), id: `provider-${i}`, name: `Provider ${i}`, createdAt: 1, updatedAt: 1 })],
+      ['llmCompressionConfigs', 'configs', i => ({ ...createDefaultLlmCompressionConfig(), id: `compression-${i}`, name: `Compression ${i}`, createdAt: 1, updatedAt: 1 })],
+      ['mcpServers', 'servers', i => ({ id: `mcp-${i}`, name: `MCP ${i}`, enabled: false, transport: { kind: 'stdio', command: 'fixture' }, createdAt: 1, updatedAt: 1 })]
+    ];
+    for (const [section, key, make] of cases) {
+      let result = await saveLatestGlobalSettings(authority, section, { [key]: [make(1), make(2)] });
+      const index = JSON.parse(await fs.readFile(result.filePath, 'utf8'));
+      const otherFile = path.join(path.dirname(result.filePath), index.records.find(r => r.id === make(2).id).file);
+      const otherBytes = await fs.readFile(otherFile, 'utf8');
+      const edited = structuredClone(result.settings);
+      const selected = edited[key].find(r => r.id === make(1).id);
+      selected.name = 'Edited'; selected.updatedAt = 2;
+      result = await authority.saveGlobalSettings(section, edited, result.revision);
+      assert.equal(await fs.readFile(otherFile, 'utf8'), otherBytes, section);
+      const indexBytes = await fs.readFile(result.filePath, 'utf8');
+      const unchanged = await authority.saveGlobalSettings(section, result.settings, result.revision);
+      assert.equal(unchanged.revision, result.revision, section);
+      assert.equal(await fs.readFile(result.filePath, 'utf8'), indexBytes, section);
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 async function saveLatestGlobalSettings(authority, section, settings) {
   const current = await authority.loadGlobalSettings(section);
   return authority.saveGlobalSettings(section, settings, current.revision);
 }
+
+test('effective model observation uses no Turn compile, deduplicates reads and tracks peer revision', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-model-read-cost-'));
+  const readFile = fs.readFile;
+  try {
+    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(vscode.Uri.file(directory)));
+    const provider = { ...createDefaultLlmProviderConfig({ name: 'cache fixture' }), id: 'cost-provider', provider: 'openai-compatible', model: 'o3', models: [{ id: 'o3', name: 'o3' }, { id: 'o4-mini', name: 'o4-mini' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const agent = await authority.mutations.createAgent({ name: 'read cost', kind: 'custom' });
+    let reads = 0, compiles = 0;
+    const compile = authority.compile.bind(authority);
+    authority.compile = request => { compiles++; return compile(request); };
+    fs.readFile = (...args) => { reads++; return readFile(...args); };
+    const result = await Promise.all(Array.from({ length: 5 }, () => authority.effectiveConversationModel('cost-conversation', agent.id)));
+    console.log(`MODEL_OBSERVATION_COST concurrent=5 readFile=${reads} compile=${compiles}`);
+    assert.ok(result.every(item => item.model === 'o3'));
+    assert.equal(compiles, 0, 'UI model observation must not compile prompts/policies/compression');
+    assert.ok(reads < 40, 'concurrent observation must share a minimal model-only read');
+    await authority.mutations.setModelProfile({ scopeKind: 'agent', scopeId: agent.id, providerConfigId: provider.id, provider: provider.provider, model: 'o4-mini' });
+    assert.equal((await authority.effectiveConversationModel('cost-conversation', agent.id)).model, 'o4-mini', 'fresh source revision invalidates cached model');
+  } finally { fs.readFile = readFile; await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('review scope CAS protects inheritance, absence, peer writes, reset and root fencing', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-thinking-scope-'));
+  let root = path.join(directory, 'first');
+  const getPaths = () => createVscodeStoragePaths(vscode.Uri.file(root));
+  try {
+    const a = new VscodeConfigurationAuthority(getPaths), b = new VscodeConfigurationAuthority(getPaths);
+    const one = { ...createDefaultLlmProviderConfig({ name: 'global' }), id: 'global-o3', provider: 'openai-compatible', model: 'o3', models: [{ id: 'o3', name: 'o3' }], modelConfigs: [] };
+    const two = { ...one, id: 'agent-gemini', provider: 'gemini', model: 'gemini-2.5-flash', models: [{ id: 'gemini-2.5-flash', name: 'Gemini' }], generationConfig: { maxOutputTokens: 8192 } };
+    await saveLatestGlobalSettings(a, 'llmProviderConfigs', { configs: [one, two] });
+    await saveLatestGlobalSettings(a, 'llm', { activeProviderConfigId: one.id });
+    const agent = await a.mutations.createAgent({ name: 'scope agent', kind: 'custom' });
+    const gemini = { providerConfigId: two.id, provider: two.provider, model: two.model };
+    const openai = { providerConfigId: one.id, provider: one.provider, model: one.model };
+    await a.mutations.setModelProfile({ scopeKind: 'agent', scopeId: agent.id, ...gemini });
+    const effective = () => a.effectiveConversationModel('conversation-a', agent.id);
+    const scope = { scopeKind: 'conversation', scopeId: 'conversation-a' };
+    const ca = a.mutations.captureModelProfileRoot(), cb = b.mutations.captureModelProfileRoot();
+    const first = await a.mutations.readModelProfileScope(ca, scope, effective);
+    const peer = await b.mutations.readModelProfileScope(cb, scope, effective);
+    assert.equal(first.profile, undefined); assert.deepEqual(first.effectiveModel, gemini);
+    const mutation = { ...scope, ...gemini, authorityId: ca.authorityId, expectedRevision: first.revision, operation: 'thinking', expectedEffectiveModel: gemini, thinkingOverride: { kind: 'gemini-budget', tokens: 2048 } };
+    const saved = await a.mutations.writeModelProfileScope(ca, mutation, false, effective);
+    assert.equal(saved.profile.inheritModel, true);
+    assert.deepEqual(await effective(), gemini);
+    assert.equal((await a.loadRequestGenerationSettings(gemini, scope.scopeId)).generationConfig.thinkingConfig.thinkingBudget, 2048);
+    await assert.rejects(b.mutations.writeModelProfileScope(cb, { ...mutation, authorityId: cb.authorityId, expectedRevision: peer.revision }, false, effective), /其他窗口/);
+    const other = { scopeKind: 'conversation', scopeId: 'conversation-b' };
+    const otherBefore = await b.mutations.readModelProfileScope(cb, other);
+    await b.mutations.writeModelProfileScope(cb, { ...other, ...openai, authorityId: cb.authorityId, expectedRevision: otherBefore.revision, operation: 'select' }, false);
+    assert.equal((await a.mutations.readModelProfileScope(ca, scope)).revision, saved.revision, 'other scope does not conflict');
+    await a.mutations.setModelProfile({ scopeKind: 'agent', scopeId: agent.id, ...openai });
+    await assert.rejects(a.mutations.writeModelProfileScope(ca, { ...mutation, expectedRevision: saved.revision }, false, effective), /继承模型/);
+    assert.deepEqual(await effective(), openai, 'thinking overlay does not pin the old Gemini model');
+    const reset = await a.mutations.writeModelProfileScope(ca, { ...mutation, expectedRevision: saved.revision, operation: 'reset', expectedEffectiveModel: openai }, false, effective);
+    assert.equal(reset.profile, undefined, 'reset of inherit-only overlay restores true absence');
+    const explicit = await a.mutations.writeModelProfileScope(ca, { ...scope, ...openai, authorityId: ca.authorityId, expectedRevision: reset.revision, operation: 'select' }, false, effective);
+    const resetExplicit = await a.mutations.writeModelProfileScope(ca, { ...scope, ...openai, authorityId: ca.authorityId, expectedRevision: explicit.revision, operation: 'reset', expectedEffectiveModel: openai }, false, effective);
+    assert.equal(resetExplicit.profile.model, one.model, 'reset preserves explicit model selection');
+    await assert.rejects(a.mutations.writeModelProfileScope(ca, { ...scope, ...openai, operation: 'select' }, false), /revision/);
+    root = path.join(directory, 'second');
+    const next = a.mutations.captureModelProfileRoot();
+    await assert.rejects(a.mutations.writeModelProfileScope(ca, { ...mutation, expectedRevision: resetExplicit.revision }, false, effective), /改变/);
+    assert.equal((await a.mutations.readModelProfileScope(next, scope)).profile, undefined, 'old queued write cannot enter new root');
+    a.mutations.retireModelProfileAuthority();
+    assert.throws(() => a.mutations.captureModelProfileRoot(), /已结束/);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('review completion fence waits preflight and settled failure; expiry/inflight is never cancellation', async () => {
+  const { ModelProfileMutationCompletions } = require('../../dist/extension/backend/application/reliableKernel/ModelProfileMutationCompletions.js');
+  let time = 0, release, stored = 0;
+  const registry = new ModelProfileMutationCompletions(() => time, 2, 10);
+  const gate = new Promise(resolve => { release = resolve; });
+  const original = registry.register('scope:a:first', async () => { await gate; stored = 1; throw new Error('synthetic failure after write'); }).catch(error => error.message);
+  await assert.rejects(registry.after('scope:a:first', 1), /在途/);
+  assert.equal(stored, 0);
+  const occupied = registry.register('scope:b:second', async () => { await gate; });
+  await assert.rejects(registry.register('scope:a:first', async () => { throw new Error('must not run'); }), /重复/);
+  await assert.rejects(registry.register('scope:c:overflow', async () => { throw new Error('must not run'); }), /处理中/);
+  await assert.rejects(registry.after('scope:c:overflow'), /未知/);
+  time = 100;
+  await assert.rejects(registry.after('scope:a:first', 1), /在途/, 'pending entries do not expire as settled');
+  release(); await original; await occupied; await registry.after('scope:a:first');
+  assert.equal(stored, 1, 'settled rejection may have written; only subsequent actual read can decide');
+  time = 200;
+  await assert.rejects(registry.after('scope:a:first'), /未知/);
+  await assert.rejects(registry.after('scope:a:unknown'), /未知/);
+});
+
+for (const operation of ['absent-set', 'existing-set', 'clear']) test(`review scope session fence between record/link writes is readable partial commit: ${operation}`, async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-thinking-partial-'));
+  try {
+    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(vscode.Uri.file(directory)));
+    const mutation = authority.mutations, capture = mutation.captureModelProfileRoot();
+    const scope = { scopeKind: 'conversation', scopeId: 'partial-scope' };
+    const selection = { providerConfigId: 'synthetic', provider: 'openai-compatible', model: 'o3' };
+    if (operation !== 'absent-set') await mutation.setModelProfile({ ...scope, ...selection });
+    const before = await mutation.readModelProfileScope(capture, scope);
+    let guardCalls = 0, reconnectRead, enteredSecondWrite = false;
+    const fence = () => {
+      if (++guardCalls === 4) {
+        // This is the real second store-write guard, after saveStore(index+record) completed.
+        enteredSecondWrite = true;
+        reconnectRead = mutation.readModelProfileScope(capture, scope);
+        throw new Error('synthetic session changed between stores');
+      }
+    };
+    await assert.rejects(mutation.writeModelProfileScope(capture, { ...scope, ...selection, model: 'o4-mini', operation: 'select', authorityId: capture.authorityId, expectedRevision: before.revision }, operation === 'clear', undefined, fence), /session changed/);
+    assert.equal(enteredSecondWrite, true);
+    const after = await reconnectRead;
+    const catalog = await authority.configurationClientState();
+    assert.ok(catalog.modelProfileScopeLinks.every(link => catalog.modelProfiles.some(profile => profile.id === link.modelProfileId)), 'no dangling link');
+    if (operation === 'existing-set') {
+      assert.equal(after.profile.model, 'o4-mini', 'failure has already changed the linked record');
+      assert.equal(after.link.id, before.link.id);
+      assert.notEqual(after.revision, before.revision);
+    } else {
+      assert.equal(after.profile, undefined); assert.equal(after.link, undefined);
+      assert.equal(catalog.modelProfiles.length, 1, 'unreachable record is retained, never silently compensated/deleted');
+      if (operation === 'absent-set') assert.equal(after.revision, before.revision, 'unpublished record cannot change safe absence');
+    }
+    // An explicit user operation using the actual observation can recover without removing locks.
+    const recovered = await mutation.writeModelProfileScope(capture, { ...scope, ...selection, operation: 'select', authorityId: capture.authorityId, expectedRevision: after.revision }, false);
+    assert.equal(recovered.profile.model, 'o3'); assert.equal(recovered.outcome, 'committed');
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
 
 test('调试默认设置使用独立设置文件、现有修订检查与当前数据目录，不保存开启状态', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-debug-settings-'));
@@ -68,6 +225,48 @@ test('调试默认设置使用独立设置文件、现有修订检查与当前�
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test('会话思维覆盖持久化、隔离、模型替代、Fork独立及子初始化不复制', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-session-thinking-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    let authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = { ...createDefaultLlmProviderConfig({ name: 'synthetic' }), id: 'thinking', provider: 'openai-compatible', model: 'o3', models: [{ id: 'o3', name: 'o3' }, { id: 'o4-mini', name: 'o4' }], generationConfig: { thinkingConfig: { thinkingLevel: 'low' } }, modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const selection = { providerConfigId: provider.id, provider: provider.provider, model: 'o3' };
+    const set = (scopeId, value, other = {}) => authority.mutations.setModelProfile({ scopeKind: 'conversation', scopeId, ...selection, thinkingOverride: value ? { kind: 'openai-effort', value } : null, ...other });
+    const thinking = async (id, model = selection) => (await authority.loadRequestGenerationSettings(model, id)).generationConfig.thinkingConfig?.thinkingLevel;
+    await set('parent', 'high');
+    assert.equal(await thinking('parent'), 'high');
+    assert.equal(await thinking('other'), 'low');
+    authority = new VscodeConfigurationAuthority(() => paths);
+    assert.equal(await thinking('parent'), 'high');
+    await authority.mutations.copyConversationConfiguration('parent', 'fork');
+    await set('parent', 'medium');
+    assert.equal(await thinking('fork'), 'high');
+    await authority.mutations.initializeConversationModelProfile({ conversationId: 'child', ...selection });
+    assert.equal(await thinking('child'), 'low');
+    await set('child', 'medium');
+    await authority.mutations.initializeConversationModelProfile({ conversationId: 'child', ...selection });
+    assert.equal(await thinking('child'), 'medium');
+    await authority.mutations.initializeConversationModelProfile({ conversationId: 'nested', ...selection });
+    assert.equal(await thinking('nested'), 'low');
+    await set('parent', null);
+    assert.equal(await thinking('parent'), 'low');
+    await set('parent', 'high');
+    await set('parent', null, { model: 'o4-mini' });
+    assert.equal(await thinking('parent', { ...selection, model: 'o4-mini' }), 'low');
+    await assert.rejects(authority.mutations.setModelProfile({ scopeKind: 'agent', scopeId: 'main', ...selection, thinkingOverride: { kind: 'openai-effort', value: 'high' } }), /仅限/);
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [{ ...provider, modelConfigs: [{ modelId: 'o3', toolCallFormat: 'function-call', systemPromptPrefix: '' }] }] });
+    assert.equal(await thinking('other'), undefined, 'model-specific empty config does not inherit channel low');
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [{ ...provider, requestBody: { reasoning_effort: 'low' } }] });
+    await assert.rejects(set('other', 'high'), /自定义请求体/);
+    await set('other', null);
+    assert.equal((await authority.loadRequestGenerationSettings(selection, 'other')).thinkingControlledByBody, true);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 
 test('全局 UA 随当前配置根持久化，旧窗口不能覆盖且损坏记录不回退默认值', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-network-settings-'));

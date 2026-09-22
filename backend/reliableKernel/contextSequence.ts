@@ -956,11 +956,67 @@ export class ContextSequenceControlPlane {
         limit: 1000
       })
     ));
+    const conversationId = requireId(structure.root.conversation_id, 'ContextSequenceRoot.conversation_id');
+    const sourceGroups: DomainRow[][] = [];
+    for (const [index, record] of pairRecords.entries()) {
+      const first = rows(sourceSnapshot.snapshot[index]);
+      sourceGroups.push(first.length < 1000 ? first : await listAllDomainRows(
+        this.database, 'ContextSegmentSource', { segment_id: requireId(record.segment.id, 'ContextSegment.id') }
+      ));
+    }
+    const readByIds = async (domain: string, ids: string[]): Promise<Map<string, DomainRow>> => {
+      const result = new Map<string, DomainRow>();
+      const unique = [...new Set(ids)];
+      for (let offset = 0; offset < unique.length; offset += 256) {
+        const batch = unique.slice(offset, offset + 256);
+        const snapshot = await this.database.snapshot(batch.map((id) => DOMAIN_REPOSITORIES.domain(domain).get(id)));
+        batch.forEach((id, index) => result.set(id, requireRow(snapshot.snapshot[index], `${domain} ${id}`)));
+      }
+      return result;
+    };
+    const allSources = sourceGroups.flat();
+    const results = await readByIds('ToolModelResult', allSources.filter((source) => source.source_kind === 'tool_model_result')
+      .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')));
+    const calls = await readByIds('ToolCall', [
+      ...allSources.filter((source) => source.source_kind === 'tool_call')
+        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
+      ...[...results.values()].map((result) => requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'))
+    ]);
+    const turns = await readByIds('Turn', [...calls.values()].map((call) => requireId(call.turn_id, 'ToolCall.turn_id')));
+    const callForSource = (source: DomainRow): DomainRow | undefined => {
+      if (source.source_kind === 'tool_call') return calls.get(requireId(source.source_id, 'ContextSegmentSource.source_id'));
+      if (source.source_kind === 'tool_model_result') {
+        const result = results.get(requireId(source.source_id, 'ContextSegmentSource.source_id'))!;
+        return calls.get(requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'));
+      }
+      return undefined;
+    };
     const openCalls = new Map<string, string>();
     const resultSources: ContextSourceOccurrence[] = [];
     for (const [index, record] of pairRecords.entries()) {
-      const shape = classifyToolPairSources(rows(sourceSnapshot.snapshot[index]).map(contextSourceOccurrence));
-      if (shape.kind === 'atomic') continue;
+      // Forks add independent provenance to immutable shared segments. Scope through Call→Turn,
+      // never choose an arbitrary pair or treat another Conversation's sources as duplicates.
+      const scoped = sourceGroups[index].filter((source) => {
+        const call = callForSource(source);
+        if (!call) return true; // Unknown kinds must still fail the shape check.
+        return turns.get(requireId(call.turn_id, 'ToolCall.turn_id'))!.conversation_id === conversationId;
+      });
+      for (const source of scoped) {
+        const call = callForSource(source);
+        if (call && requireBigInt(call.call_seq, 'ToolCall.call_seq')
+          !== requireBigInt(source.source_revision, 'ContextSegmentSource.source_revision')) {
+          throw new Error('Context tool source revision does not match its ToolCall call_seq.');
+        }
+      }
+      const shape = classifyToolPairSources(scoped.map(contextSourceOccurrence).sort((left, right) =>
+        left.sourceKind.localeCompare(right.sourceKind)
+      ));
+      if (shape.kind === 'atomic') {
+        if (results.get(shape.result.sourceId)!.tool_call_id !== shape.call.sourceId) {
+          throw new Error('Context tool result does not belong to its paired ToolCall.');
+        }
+        continue;
+      }
       if (shape.kind === 'native_call') {
         openCalls.set(shape.call.sourceId, requireId(record.segment.id, 'ContextSegment.id'));
       } else {

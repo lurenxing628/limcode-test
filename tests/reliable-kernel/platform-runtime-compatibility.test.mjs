@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';
+﻿import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
@@ -28,6 +28,10 @@ const {
   'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
 ));
 
+const physicalCutover = require(path.join(distRoot, 'backend/reliableKernel/physicalCutover.js'));
+const { PHYSICAL_CUTOVER_MANIFEST } = require(path.join(
+  distRoot, 'backend/reliableKernel/generatedPhysicalCutoverManifest.js'
+));
 const windowsOnly = { skip: process.platform !== 'win32' };
 const darwinOnly = { skip: process.platform !== 'darwin' };
 const windowsPathSeparator = String.fromCharCode(92);
@@ -189,6 +193,235 @@ test('身份不匹配的 pending RootBinding 继续 fail closed', async () => {
   } finally {
     if (runtime) await runtime.close().catch(() => undefined);
     await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
+test('旧版本扩展遇到更高 epoch RootBinding 时在迁移前明确拒绝且不写入运行时数据', async () => {
+  const runtimeScopeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-newer-epoch-guard-'));
+  try {
+    const paths = kernel.createRuntimeRootPaths(path.join(runtimeScopeRoot, '.limcode-runtime', 'active'));
+    const newerBinding = {
+      paths,
+      dataSetId: 'newer-data-set',
+      rootInstanceId: 'newer-root-instance',
+      rootGeneration: 1,
+      pointerRevision: 1,
+      runtimeKernelEpoch: kernel.RUNTIME_KERNEL_EPOCH + 1
+    };
+    await fs.mkdir(path.dirname(paths.rootPointerPath), { recursive: true });
+    await fs.writeFile(paths.rootPointerPath, `${JSON.stringify(newerBinding, null, 2)}\n`);
+    const pointerBefore = await fs.readFile(paths.rootPointerPath, 'utf8');
+    const authority = new kernel.RootAuthority(() => paths.dataRootPath);
+
+    assert.throws(
+      () => kernel.parseHistoricalRootBinding(newerBinding),
+      /newer than this extension/
+    );
+    await assert.rejects(
+      new VscodeReliableKernelCutoverCoordinator(authority, runtimeScopeRoot).ensureCurrentRoot(),
+      (error) => error?.code === 'runtime-epoch-newer-than-extension'
+        && !error.message.includes('Invalid historical RootBinding pointer')
+    );
+    assert.equal(await fs.readFile(paths.rootPointerPath, 'utf8'), pointerBefore);
+    await assert.rejects(fs.access(paths.rootPendingPath), { code: 'ENOENT' });
+    await assert.rejects(fs.access(paths.runtimeEpochPath), { code: 'ENOENT' });
+    await assert.rejects(fs.access(path.join(path.dirname(paths.dataRootPath), kernel.RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE)), { code: 'ENOENT' });
+  } finally {
+    await fs.rm(runtimeScopeRoot, { recursive: true, force: true });
+  }
+});
+
+test('当前 epoch RootBinding 可作为历史读取结果正常解析', async () => {
+  const runtimeScopeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-current-epoch-binding-'));
+  try {
+    const paths = kernel.createRuntimeRootPaths(path.join(runtimeScopeRoot, '.limcode-runtime', 'active'));
+    const binding = {
+      paths,
+      dataSetId: 'current-data-set',
+      rootInstanceId: 'current-root-instance',
+      rootGeneration: 2,
+      pointerRevision: 3,
+      runtimeKernelEpoch: kernel.RUNTIME_KERNEL_EPOCH
+    };
+    await fs.mkdir(path.dirname(paths.rootPointerPath), { recursive: true });
+    await fs.writeFile(paths.rootPointerPath, `${JSON.stringify(binding, null, 2)}\n`);
+
+    assert.deepEqual(await new kernel.RootAuthority(() => paths.dataRootPath).readHistoricalPointerForCutover(), binding);
+  } finally {
+    await fs.rm(runtimeScopeRoot, { recursive: true, force: true });
+  }
+});
+
+test('当前 epoch 下畸形 RootBinding 仍报告真实 historical pointer invalid', async () => {
+  const runtimeScopeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-malformed-epoch-binding-'));
+  try {
+    const paths = kernel.createRuntimeRootPaths(path.join(runtimeScopeRoot, '.limcode-runtime', 'active'));
+    const malformedBinding = {
+      paths,
+      dataSetId: 'malformed-data-set',
+      rootInstanceId: 'malformed-root-instance',
+      rootGeneration: 0,
+      pointerRevision: 1,
+      runtimeKernelEpoch: kernel.RUNTIME_KERNEL_EPOCH
+    };
+    await fs.mkdir(path.dirname(paths.rootPointerPath), { recursive: true });
+    await fs.writeFile(paths.rootPointerPath, `${JSON.stringify(malformedBinding, null, 2)}\n`);
+
+    await assert.rejects(
+      new kernel.RootAuthority(() => paths.dataRootPath).readHistoricalPointerForCutover(),
+      (error) => error?.code === 'root-binding-invalid'
+        && error.message.includes('Invalid historical RootBinding pointer')
+    );
+  } finally {
+    await fs.rm(runtimeScopeRoot, { recursive: true, force: true });
+  }
+});
+test('historical reader 完整校验优先于 future epoch 分类', async (t) => {
+  const runtimeScopeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-historical-schema-fence-'));
+  try {
+    const paths = kernel.createRuntimeRootPaths(path.join(runtimeScopeRoot, '.limcode-runtime', 'active'));
+    const binding = {
+      paths,
+      dataSetId: 'future-data-set',
+      rootInstanceId: 'future-root-instance',
+      rootGeneration: 1,
+      pointerRevision: 1,
+      runtimeKernelEpoch: kernel.RUNTIME_KERNEL_EPOCH + 1
+    };
+    const invalid = [
+      ...Object.keys(binding).map((key) => [`missing ${key}`, (value) => { delete value[key]; }]),
+      ['extra key', (value) => { value.unexpected = true; }],
+      ['empty dataSetId', (value) => { value.dataSetId = ''; }],
+      ['invalid rootInstanceId', (value) => { value.rootInstanceId = 1; }],
+      ['generation zero', (value) => { value.rootGeneration = 0; }],
+      ['unsafe generation', (value) => { value.rootGeneration = Number.MAX_SAFE_INTEGER + 1; }],
+      ['revision zero', (value) => { value.pointerRevision = 0; }],
+      ['unsafe revision', (value) => { value.pointerRevision = Number.MAX_SAFE_INTEGER + 1; }],
+      ['unsafe epoch', (value) => { value.runtimeKernelEpoch = Number.MAX_SAFE_INTEGER + 1; }],
+      ['fractional epoch', (value) => { value.runtimeKernelEpoch += 0.5; }],
+      ['string epoch', (value) => { value.runtimeKernelEpoch = String(value.runtimeKernelEpoch); }],
+      ...Object.keys(paths).flatMap((key) => [
+        [`missing path ${key}`, (value) => { delete value.paths[key]; }],
+        [`relative path ${key}`, (value) => { value.paths[key] = 'relative/path'; }],
+        [`unnormalized path ${key}`, (value) => { value.paths[key] += `${path.sep}..${path.sep}other`; }]
+      ])
+    ];
+    await fs.mkdir(path.dirname(paths.rootPointerPath), { recursive: true });
+    const authority = new kernel.RootAuthority(() => paths.dataRootPath);
+    for (const [name, mutate] of invalid) {
+      await t.test(name, async () => {
+        const malformed = structuredClone(binding);
+        mutate(malformed);
+        await fs.writeFile(paths.rootPointerPath, `${JSON.stringify(malformed)}\n`);
+        const before = await physicalCutover.treeDigest(runtimeScopeRoot);
+        await assert.rejects(authority.readHistoricalPointerForCutover(), { code: 'root-binding-invalid' });
+        assert.equal(await physicalCutover.treeDigest(runtimeScopeRoot), before);
+      });
+    }
+    await t.test('complete future pointer has the dedicated error', async () => {
+      await fs.writeFile(paths.rootPointerPath, `${JSON.stringify(binding)}\n`);
+      await assert.rejects(authority.readHistoricalPointerForCutover(), {
+        code: 'runtime-epoch-newer-than-extension'
+      });
+    });
+  } finally {
+    await fs.rm(runtimeScopeRoot, { recursive: true, force: true });
+  }
+});
+
+test('future/invalid pointer fences physical recovery and request before any mutation', async (t) => {
+  const entrypoints = {
+    startup: (authority, scope) => new VscodeReliableKernelCutoverCoordinator(authority, scope).ensureCurrentRoot(),
+    recovery: (authority, scope) => physicalCutover.recoverInterruptedPhysicalCutover(scope, authority),
+    cutover: (authority, scope) => physicalCutover.performPhysicalCutover(scope, authority, async () => {
+      assert.fail('fenced pointer must never initialize a Runtime');
+    })
+  };
+  for (const [entrypoint, invoke] of Object.entries(entrypoints)) {
+    for (const pointerKind of ['future', 'invalid']) {
+      for (const artifact of ['archiving', 'activating', 'completed', 'request-only', 'invalid-journal', 'invalid-request', 'none']) {
+        await t.test(`${entrypoint}: ${pointerKind} + ${artifact}`, async () => {
+          const scope = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-physical-future-fence-'));
+          try {
+            const paths = kernel.createRuntimeRootPaths(path.join(scope, '.limcode-runtime', 'active'));
+            const control = path.dirname(paths.rootPointerPath);
+            const binding = {
+              paths,
+              dataSetId: 'future-data-set',
+              rootInstanceId: 'future-root-instance',
+              rootGeneration: pointerKind === 'invalid' ? 0 : 2,
+              pointerRevision: 2,
+              runtimeKernelEpoch: kernel.RUNTIME_KERNEL_EPOCH + 1
+            };
+            await fs.mkdir(paths.casRootPath, { recursive: true });
+            await fs.writeFile(paths.databasePath, 'future database bytes: never open as SQLite');
+            await fs.writeFile(path.join(paths.casRootPath, 'keep.bin'), Buffer.from([0, 1, 255, 42]));
+            await fs.writeFile(paths.runtimeEpochPath, JSON.stringify({ futureEpoch: binding.runtimeKernelEpoch }));
+            await fs.writeFile(paths.rootPointerPath, `${JSON.stringify(binding)}\n`);
+            await fs.writeFile(paths.rootPendingPath, `${JSON.stringify(binding)}\n`);
+            const requestPath = path.join(control, physicalCutover.CUTOVER_REQUEST_FILE);
+            const journalPath = path.join(control, physicalCutover.CUTOVER_JOURNAL_FILE);
+            let request;
+            if (artifact !== 'none') {
+              request = await physicalCutover.persistPhysicalCutoverRequest(scope, {
+                noActiveTurn: true, noBackgroundProcess: true,
+                noPendingProviderStream: true, noPersistInflight: true
+              });
+            }
+            if (['archiving', 'activating', 'completed'].includes(artifact)) {
+              const archiveRoot = path.join(control, physicalCutover.CUTOVER_BACKUPS_DIRECTORY, 'interrupted-fixture');
+              const archivedActive = path.join(archiveRoot, 'runtime-control', 'active');
+              await fs.mkdir(archivedActive, { recursive: true });
+              await fs.writeFile(path.join(archivedActive, 'old-data.bin'), 'archived predecessor');
+              const { paths: _paths, ...identity } = binding;
+              await fs.writeFile(journalPath, JSON.stringify({
+                kind: 'limcode-runtime-cutover-journal',
+                contractRevision: PHYSICAL_CUTOVER_MANIFEST.contractRevision,
+                requestId: request.requestId,
+                attemptId: 'interrupted-attempt',
+                state: artifact,
+                archiveDirectoryName: 'interrupted-fixture',
+                createdAt: '2026-09-18T00:00:00.000Z',
+                updatedAt: '2026-09-18T00:00:00.000Z',
+                previousBinding: { ...identity, runtimeKernelEpoch: kernel.RUNTIME_KERNEL_EPOCH },
+                ...(artifact === 'completed' ? { activatedBinding: identity } : {}),
+                steps: [{
+                  entryId: 'control.previous-runtime-active',
+                  sourceRelativePath: '.limcode-runtime/active',
+                  archiveRelativePath: 'runtime-control/active',
+                  action: 'runtime-active',
+                  sourceDigest: await physicalCutover.treeDigest(archivedActive),
+                  state: 'archived',
+                  moveMode: 'rename'
+                }],
+                results: [], preservedEvidence: {}, unknownEvidence: {}
+              }));
+            } else if (artifact === 'invalid-journal') {
+              await fs.writeFile(journalPath, '{invalid journal');
+            } else if (artifact === 'invalid-request') {
+              await fs.writeFile(requestPath, '{invalid request');
+            }
+            const watched = [journalPath, requestPath, paths.rootPointerPath, paths.rootPendingPath, paths.runtimeEpochPath];
+            const readWatched = () => Promise.all(watched.map(async (file) => {
+              try { return await fs.readFile(file); }
+              catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+            }));
+            const beforeFiles = await readWatched();
+            const beforeTree = await physicalCutover.treeDigest(scope);
+            const authority = new kernel.RootAuthority(() => paths.dataRootPath);
+            let rejection;
+            try { await invoke(authority, scope); } catch (error) { rejection = error; }
+            // Check bytes AND the complete tree, even when the eventual error code looks correct.
+            assert.deepEqual(await readWatched(), beforeFiles, 'journal/request/pointer/pending/epoch changed');
+            assert.equal(await physicalCutover.treeDigest(scope), beforeTree, 'data/archive tree changed');
+            assert.equal(rejection?.code, pointerKind === 'future'
+              ? 'runtime-epoch-newer-than-extension' : 'root-binding-invalid');
+          } finally {
+            await fs.rm(scope, { recursive: true, force: true });
+          }
+        });
+      }
+    }
   }
 });
 

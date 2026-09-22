@@ -55,7 +55,44 @@ async function forkNativeMessage(app, conversationId, modelRequestId, key) {
   });
 }
 
-async function withNativeRuntime(run, { transport = 'websocket' } = {}) {
+async function createSettingsAuthority(directory, provider) {
+  const Module = require('node:module');
+  const originalLoad = Module._load;
+  class Uri {
+    constructor(value) { this.scheme = 'file'; this.fsPath = path.resolve(value); this.path = this.fsPath; }
+    static file(value) { return new Uri(value); }
+    static joinPath(base, ...parts) { return new Uri(path.join(base.fsPath, ...parts)); }
+    toString() { return `file://${this.path}`; }
+  }
+  const vscode = { Uri, FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 }, workspace: { fs: {
+    createDirectory: uri => fs.mkdir(uri.fsPath, { recursive: true }), readFile: uri => fs.readFile(uri.fsPath),
+    async writeFile(uri, bytes) { await fs.mkdir(path.dirname(uri.fsPath), { recursive: true }); await fs.writeFile(uri.fsPath, bytes); },
+    async readDirectory(uri) { return (await fs.readdir(uri.fsPath, { withFileTypes: true })).map(item => [item.name, item.isDirectory() ? 2 : 1]); },
+    delete: uri => fs.rm(uri.fsPath, { recursive: true, force: true }),
+    async stat(uri) { const s = await fs.stat(uri.fsPath); return { type: s.isDirectory() ? 2 : 1, size: s.size, ctime: s.ctimeMs, mtime: s.mtimeMs }; }
+  } } };
+  Module._load = function(request, parent, isMain) { return request === 'vscode' ? vscode : originalLoad.call(this, request, parent, isMain); };
+  let authority;
+  try {
+    const { VscodeConfigurationAuthority } = require(path.join(compiledRoot, 'backend/reliableKernel/vscodeConfigurationAuthority.js'));
+    const { createVscodeStoragePaths } = require(path.join(compiledRoot, 'backend/capabilities/vscodeStorage/paths.js'));
+    authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(directory, 'settings'))));
+  } finally { Module._load = originalLoad; }
+  const save = async (section, settings) => authority.saveGlobalSettings(section, settings, (await authority.loadGlobalSettings(section)).revision);
+  await save('llmProviderConfigs', { configs: [provider] });
+  await save('llm', { activeProviderConfigId: provider.id });
+  const agent = await authority.mutations.createAgent({ name: 'native actual authority', kind: 'custom' });
+  await authority.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['native_probe'], toolConfigs: { native_probe: { nativeAsync: true, autoApproveExecution: true, autoSubmitResult: true, config: {} } } });
+  const { createDefaultLlmCompressionConfig } = require(path.join(compiledRoot, 'shared/protocol.js'));
+  const compression = { ...createDefaultLlmCompressionConfig('synthetic native compression'), kind: 'deterministic_summary', bodyTargetTokens: 2048, llmSummary: { targetTokens: 1024 }, trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 } };
+  await save('llmCompressionConfigs', { configs: [compression] });
+  await save('llmCompression', { defaultConfigId: compression.id, providerBindings: [], modelBindings: [] });
+  return { authority, agentId: agent.id, async enableCompression() {
+    await save('llmCompressionConfigs', { configs: [{ ...compression, trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 } }] });
+  } };
+}
+
+async function withNativeRuntime(run, { transport = 'websocket', realAuthority = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-native-integration-'));
   const probePath = path.join(directory, 'probe.txt');
   await fs.writeFile(probePath, 'content from the real native probe file');
@@ -113,12 +150,13 @@ async function withNativeRuntime(run, { transport = 'websocket' } = {}) {
       return { ok: true, output: await fs.readFile(probePath, 'utf8') };
     }
   };
+  const stored = realAuthority ? await createSettingsAuthority(directory, configuration) : undefined;
   const authority = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
   let app;
   try {
     app = await kernel.ReliableKernelApplication.open(authority, {
-      authorityCompiler: {
+      authorityCompiler: stored?.authority ?? {
         async compile(request) {
           return {
             turnId: request.turnId, executorAgentId: request.executorAgentId,
@@ -154,6 +192,7 @@ async function withNativeRuntime(run, { transport = 'websocket' } = {}) {
           };
         }
       },
+      ...(stored ? { compressionSettingsAuthority: stored.authority } : {}),
       resolveWorkEnvironment: async () => undefined,
       mcpConnections: {
         async toolAnnotations() { return {}; },
@@ -186,7 +225,7 @@ async function withNativeRuntime(run, { transport = 'websocket' } = {}) {
         id: conversationId, title: 'Native integration', status: 'active', created_at: now, updated_at: now
       }),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
-        id: 'native-integration-agent-link', conversation_id: conversationId, agent_id: 'agent-main',
+        id: 'native-integration-agent-link', conversation_id: conversationId, agent_id: stored?.agentId ?? 'agent-main',
         role: 'default', created_at: now, updated_at: now
       })
     ]);
@@ -235,7 +274,7 @@ async function withNativeRuntime(run, { transport = 'websocket' } = {}) {
     function completed(socket, responseId, output) {
       send(socket, { type: 'response.completed', response: {
         id: responseId, status: 'completed', model: configuration.model, output,
-        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+        usage: { input_tokens: realAuthority ? 50000 : 10, output_tokens: 5, total_tokens: realAuthority ? 50005 : 15 }
       } });
       if (transport === 'http') socket.end('data: [DONE]\n\n');
     }
@@ -245,7 +284,13 @@ async function withNativeRuntime(run, { transport = 'websocket' } = {}) {
       configuration.generationConfig = { thinkingConfig: { thinkingLevel } };
     }
     await run({
-      app, conversationId, startTurn, frames, send, created, text, completed,
+      app, conversationId, startTurn, frames, send, created, text, completed, stored, configuration,
+      async setThinking(value) {
+        assert.ok(stored);
+        await stored.authority.mutations.setModelProfile({ scopeKind: 'conversation', scopeId: conversationId,
+          providerConfigId: configuration.id, provider: configuration.provider, model: configuration.model,
+          thinkingOverride: value ? { kind: 'openai-effort', value } : null });
+      },
       until: (read, label) => until(async () => {
         if (turnFailure) throw turnFailure;
         return read();
@@ -266,6 +311,50 @@ async function withNativeRuntime(run, { transport = 'websocket' } = {}) {
     await fs.rm(directory, { recursive: true, force: true });
   }
 }
+
+for (const transport of ['http', 'websocket']) test(`review P1-2真实authority high恢复默认与auto compression组合 ${transport}`, { timeout: 60000 }, async () => {
+  await withNativeRuntime(async h => {
+    const connection = frame => frame.socket ?? frame.response;
+    // Seed low base, then apply high via a configuration_update so the next native recipe
+    // carries high in updates, rather than using high merely as its initial base effort.
+    for (const [index, effort] of ['low', 'high'].entries()) {
+      await h.setThinking(effort);
+      const seed = await h.startTurn(`review-seed-${index}`, index === 0 ? 'synthetic historical evidence '.repeat(18000) : 'raise effort');
+      const frame = await h.until(() => h.frames[index], `seed ${effort}`);
+      h.created(connection(frame), `review-seed-response-${index}`);
+      h.completed(connection(frame), `review-seed-response-${index}`, [h.text(connection(frame), `review-seed-response-${index}`, 0, 'done')]);
+      assert.equal((await seed.completion).terminalStatus, 'completed');
+    }
+    const turn = await h.startTurn('review-native-carried-high', 'use native probe');
+    const first = await h.until(() => h.frames[2], 'carried high initial');
+    h.created(connection(first), 'review-high-1');
+    const call = { type: 'function_call', id: 'review-tool-item', call_id: 'review-tool-call', name: 'native_probe', arguments: '{}', async: true, status: 'completed' };
+    h.send(connection(first), { type: 'response.output_item.done', response_id: 'review-high-1', output_index: 0, item: call });
+    await h.until(() => h.executions() === 1, 'pending native tool');
+    await h.setThinking(null);
+    await h.stored.enableCompression();
+    h.completed(connection(first), 'review-high-1', [call]);
+    h.releaseTool.resolve();
+    const continuation = await h.until(() => h.frames[3], 'same-request native tool continuation');
+    h.created(connection(continuation), 'review-tool-finished');
+    h.completed(connection(continuation), 'review-tool-finished', [h.text(connection(continuation), 'review-tool-finished', 0, 'done')]);
+    assert.equal((await turn.completion).terminalStatus, 'completed');
+    // This transport fixture covers a new Turn; the same-Turn fresh/pending precedence red
+    // regression is driven through real kernel requests in session-thinking-runtime.test.mjs.
+    const next = await h.startTurn('review-new-request-reset', 'new request after tool completion');
+    const frame = await h.until(() => h.frames[4], 'new ordinary request after automatic compression');
+    h.created(connection(frame), 'review-restored');
+    h.completed(connection(frame), 'review-restored', [h.text(connection(frame), 'review-restored', 0, 'done')]);
+    assert.equal((await next.completion).terminalStatus, 'completed');
+    assert.ok((await rows(h.app, 'CompressionBlock')).length > 0, 'real automatic compression must have executed');
+    assert.equal(frame.body.reasoning?.effort, undefined);
+    assert.deepEqual(frame.body.input.filter(item => item.type === 'configuration_update'), []);
+    assert.equal(frame.body.previous_response_id, undefined);
+    const calls = new Set(frame.body.input.filter(item => item.type === 'function_call').map(item => item.call_id));
+    for (const output of frame.body.input.filter(item => item.type === 'function_call_output')) assert.ok(calls.has(output.call_id), 'tool pair kept together on full rebase');
+    assert.equal(h.executions(), 1, 'no duplicate side effect');
+  }, { transport, realAuthority: true });
+});
 
 test('Astra executes a durable async call before response completion and delivers its original result once', { timeout: 60_000 }, async () => {
   await withNativeRuntime(async harness => {
@@ -611,9 +700,15 @@ for (const transport of ['websocket', 'http']) {
           assert.equal(effectiveEffort(body), 'high');
         }
       });
+      harness.configureModel(MODEL, undefined);
+      await respond('restored-service-default', body => {
+        assert.equal(body.reasoning?.effort, undefined, 'old anchored effort must not be reintroduced');
+        assert.deepEqual(updates(body), [], 'old configuration updates must not restore high');
+        assert.equal(body.previous_response_id, undefined, 'restoring omission uses a full rebase');
+      });
       harness.configureModel(MODEL, 'medium');
       await respond('changed-medium', body => {
-        assert.equal(body.reasoning?.effort, baseEffort);
+        assert.equal(body.reasoning?.effort, 'medium', 'new base after restoring defaults');
         assert.equal(effectiveEffort(body), 'medium');
       });
       harness.configureModel('gpt-5.6', 'high');

@@ -1598,13 +1598,13 @@ test('Agent loop 最终仍有未完成任务时只产生脱敏 telemetry', () =>
 });
 
 
-test('Agent loop runtime status 先筛选全部 Turn facts，再限制 recipe 32 条和卡片 4 条', async () => {
+test('Agent loop roster 跨轮读取，活跃优先并限制 32 条，隔离其他会话', async () => {
   const turnId = 'turn-filter-runtime-status';
   const oldChildren = Array.from({ length: 40 }, (_, index) => ({
-    id: `child-a-completed-${String(index).padStart(3, '0')}`, status: 'completed'
+    id: `child-a-completed-${String(index).padStart(3, '0')}`, status: 'idle', child_conversation_id: `old-${index}`
   }));
   const liveChildren = Array.from({ length: 40 }, (_, index) => ({
-    id: `child-z-active-${String(index).padStart(3, '0')}`, status: 'active'
+    id: `child-z-active-${String(index).padStart(3, '0')}`, status: 'active', child_conversation_id: `live-${index}`
   }));
   const oldProcesses = Array.from({ length: 40 }, (_, index) => ({
     id: `process-a-completed-${String(index).padStart(3, '0')}`, status: 'completed'
@@ -1616,11 +1616,13 @@ test('Agent loop runtime status 先筛选全部 Turn facts，再限制 recipe 32
   const processes = [...oldProcesses, ...liveProcesses];
   const loop = Object.create(kernel.ReliableAgentLoop.prototype);
   loop.database = memoryReadDatabase({
+    Turn: [{ id: turnId, conversation_id: 'parent' }, { id: 'previous-turn', conversation_id: 'parent' }, { id: 'foreign-turn', conversation_id: 'foreign' }],
+    Conversation: children.map(child => ({ id: child.child_conversation_id, title: 'Investigate failure' })),
     ChildExecutionParentLink: children.map((child) => ({
-      id: `link-${child.id}`, parent_turn_id: turnId, child_execution_id: child.id
-    })),
+      id: `link-${child.id}`, parent_turn_id: 'previous-turn', child_execution_id: child.id
+    })).concat([{ id: 'foreign-link', parent_turn_id: 'foreign-turn', child_execution_id: 'foreign-child' }]),
     ChildExecution: children,
-    AnswerBridge: liveChildren.map((child) => ({
+    AnswerBridge: children.map((child) => ({
       id: `bridge-${child.id}`, child_execution_id: child.id
     })),
     ProcessCompletionSourceLink: processes.map((process) => ({
@@ -1636,11 +1638,31 @@ test('Agent loop runtime status 先筛选全部 Turn facts，再限制 recipe 32
   assert.equal(card.processes.length, 32);
   assert.equal(card.children[0].childExecutionId, 'child-z-active-000');
   assert.equal(card.children[0].answerBridgeId, 'bridge-child-z-active-000');
+  assert.equal(card.children[0].task, 'Investigate failure');
+  assert.equal(card.children[0].resumable, true);
   assert.equal(card.processes[0].processId, 'process-z-running-000');
   assert.match(card.card, /activeChildren=40; runningProcesses=40/);
   assert.doesNotMatch(card.card, /child-z-active|bridge-child|process-z-running/);
   assert.doesNotMatch(card.card, /^[-] (?:child|process) /m);
   assert.doesNotMatch(card.card, /completed/);
+  for (const child of liveChildren) child.status = 'closed';
+  const idleCard = await loop.readRuntimeStatusCard(turnId);
+  assert.equal(idleCard.activeChildCount, 0);
+  assert.equal(idleCard.children[0].status, 'idle');
+});
+
+test('Child refs reuse frozen mapping after context loss and reserve numbers for older children', async () => {
+  const { buildModelHandleCatalog } = await import('../../dist/extension/backend/reliableKernel/modelHandleCatalog.js');
+  const loop = Object.create(kernel.ReliableAgentLoop.prototype);
+  loop.database = memoryReadDatabase({
+    Turn: [{ id: 'old', conversation_id: 'parent', created_at: '1' }, { id: 'new', conversation_id: 'parent', created_at: '2' }],
+    ModelRequest: [{ id: 'old-request', turn_id: 'old', request_seq: '1' }]
+  });
+  const previous = buildModelHandleCatalog([{ answerBridgeId: 'first-child' }, { answerBridgeId: 'second-child' }]);
+  loop.readModelRequestRecipe = async () => ({ kind: 'reliable-agent-turn', modelHandleCatalog: previous });
+  const seeds = await loop.readPreviousChildHandles('parent');
+  const next = buildModelHandleCatalog([{ answerBridgeId: 'second-child' }, { answerBridgeId: 'third-child' }], seeds);
+  assert.deepEqual(next.entries.map(e => [e.ref, e.target]), [['A1', 'first-child'], ['A2', 'second-child'], ['A3', 'third-child']]);
 });
 
 test('LLM capability adapter 对新Provider-native压缩状态强制providerConfig/model绑定', async () => {

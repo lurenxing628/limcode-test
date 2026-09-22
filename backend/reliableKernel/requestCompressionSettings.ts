@@ -1,4 +1,4 @@
-import type { ChatModelOverrideRecord } from '../../shared/protocol';
+import type { ChatModelOverrideRecord, LlmGenerationConfigRecord, LlmRequestBodyRecord } from '../../shared/protocol';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import {
   frozenCompressionPolicy,
@@ -17,7 +17,15 @@ export interface RequestCompressionSettings {
   compression: PlainJsonValue;
 }
 
+export interface RequestGenerationSettings {
+  model: ChatModelOverrideRecord;
+  generationConfig: LlmGenerationConfigRecord;
+  requestBody: LlmRequestBodyRecord;
+  thinkingControlledByBody: boolean;
+}
+
 export interface CompressionSettingsAuthority {
+  loadRequestGenerationSettings?(model: ChatModelOverrideRecord, conversationId: string): Promise<RequestGenerationSettings>;
   loadRequestCompressionSettings(model: ChatModelOverrideRecord): Promise<RequestCompressionSettings>;
 }
 
@@ -26,6 +34,16 @@ export function applyRequestCompressionSettings(
   authority: PlainJsonValue,
   settings: PlainJsonValue | undefined
 ): PlainJsonValue {
+  if (record(settings) && Object.prototype.hasOwnProperty.call(settings, 'requestGeneration')) {
+    const generation = settings.requestGeneration;
+    if (!record(authority) || !record(authority.model) || !record(generation) || !record(generation.generationConfig)
+      || canonicalPlainJson(generation.model) !== canonicalPlainJson(frozenModelSelection(authority))) throw new Error('请求生成设置不能更换本轮模型。');
+    authority = normalizePlainJson({ ...authority, model: {
+      ...authority.model, generationConfig: generation.generationConfig,
+      requestBody: generation.requestBody, thinkingControlledByBody: generation.thinkingControlledByBody,
+      thinkingConfig: generation.generationConfig.thinkingConfig ?? {}
+    } }, '请求生成设置');
+  }
   if (!record(settings) || !Object.prototype.hasOwnProperty.call(settings, 'requestCompression')) return authority;
   const selected = settings.requestCompression;
   if (!record(authority) || !record(selected) || !record(selected.modelProfile) || !record(selected.compression)) {

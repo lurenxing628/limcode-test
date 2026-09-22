@@ -1006,6 +1006,7 @@ function decodeModelStreamIdentity(value: unknown): {
     'lastStreamSeq',
     'lastStreamEventAt',
     'nativeCapabilities',
+    'thinkingSelection',
     'nativeInitialPromptTokenCount'
   ]);
   if (
@@ -1038,6 +1039,9 @@ function decodeModelStreamIdentity(value: unknown): {
   assertOptionalStreamTiming(record.streamOutputDurationMs, 'streamOutputDurationMs', true);
   optionalDecimalInteger(record.lastStreamSeq, 'lastStreamSeq');
   optionalPositiveInteger(record.lastStreamEventAt, 'lastStreamEventAt');
+  if (record.thinkingSelection !== undefined && (typeof record.thinkingSelection !== 'string' || record.thinkingSelection.length > 1024)) {
+    throw new TypeError('ModelRequest.stream_stats_json.thinkingSelection must be a bounded string.');
+  }
   optionalNonNegativeInteger(record.nativeInitialPromptTokenCount, 'nativeInitialPromptTokenCount');
   if (record.nativeCapabilities !== undefined) {
     const capabilities = record.nativeCapabilities;

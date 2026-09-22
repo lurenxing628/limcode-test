@@ -1,3 +1,8 @@
+import { loadScopedModelProfiles } from './scopedModelProfiles';
+import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
+import { applySessionThinkingOverride, validateSessionThinkingOverride } from '../../shared/sessionThinking';
+import type { RequestGenerationSettings } from './requestCompressionSettings';
+
 import type * as vscode from 'vscode';
 import type {
   AgentRecord,
@@ -140,6 +145,7 @@ interface CurrentWorkspaceFolder {
 export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, AttachmentSettingsAuthority {
   public readonly mutations: VscodeConfigurationMutations;
   /** Host-local workspace presence; shared WorkEnvironment records must not encode another Host's view. */
+  private readonly effectiveModelReads = new Map<string, Promise<ChatModelOverrideRecord>>();
   private currentWorkspaceFolderIds = new Set<string>();
   private currentWorkspaceFolderRecords = new Map<string, WorkEnvironmentRecord>();
   private currentWorkspaceFolders: readonly CurrentWorkspaceFolder[] = [];
@@ -153,80 +159,67 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     this.setCurrentWorkspaceFolders(currentWorkspaceFolders);
   }
 
+  /** Model-only observation. Never render prompts or compile/freeze a synthetic Turn. */
+  public effectiveConversationModel(conversationId: string, executorAgentId: string): Promise<ChatModelOverrideRecord> {
+    const capture = this.mutations.captureModelProfileRoot();
+    const readKey = JSON.stringify([capture.authorityId, conversationId, executorAgentId]);
+    const existing = this.effectiveModelReads.get(readKey);
+    if (existing) return existing;
+    const pending = (async () => {
+      // Fresh source reads preserve peer-Host and inherited-scope invalidation. Only concurrent
+      // reads share IO; no timestamp/TTL can hide a provider or model authority revision.
+      const records = await this.loadModelSelectionRecords(capture.paths, conversationId, executorAgentId);
+      const { provider, modelId } = resolveModelSelection(records, {
+        conversationId, executorAgentId, turnId: `model-profile-observation:${conversationId}`, intentKind: 'input'
+      });
+      this.mutations.captureModelProfileRoot(capture.authorityId);
+      return { providerConfigId: provider.id, provider: provider.provider, model: modelId };
+    })();
+    this.effectiveModelReads.set(readKey, pending);
+    void pending.finally(() => { if (this.effectiveModelReads.get(readKey) === pending) this.effectiveModelReads.delete(readKey); }).catch(() => undefined);
+    return pending;
+  }
+
+  private async loadModelSelectionRecords(paths: StoragePaths, conversationId: string, executorAgentId: string): Promise<ModelSelectionRecords> {
+    const [agents, workflows, conversationWorkflowSelections, providers, selection] = await Promise.all([
+      loadRecordStore<AgentRecord, 'agent'>(paths.agentsRootUri, paths.agentsIndexUri, 'agent'),
+      loadRecordStore<WorkflowRecord, 'workflow'>(paths.workflowsRootUri, paths.workflowsIndexUri, 'workflow'),
+      loadRecordStore<ConversationWorkflowSelectionRecord, 'selection'>(paths.conversationWorkflowSelectionsRootUri, paths.conversationWorkflowSelectionsIndexUri, 'selection'),
+      loadLlmProviderConfigsSettings(paths),
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llm')
+    ]);
+    const selectedWorkflow = latestScopedSelection((conversationWorkflowSelections ?? []).filter(record =>
+      record.conversationId === conversationId && record.role === 'active'
+    ));
+    const scoped = await loadScopedModelProfiles(paths, [
+      { scopeKind: 'global' }, { scopeKind: 'agent', scopeId: executorAgentId },
+      ...(selectedWorkflow?.scopeKind === 'workflow' ? [{ scopeKind: 'workflow' as const, scopeId: selectedWorkflow.workflowId }] : []),
+      { scopeKind: 'conversation', scopeId: conversationId }
+    ]);
+    return { agents: mergeAgentsWithBuiltins(agents ?? []), workflows: mergeWorkflowsWithBuiltins(workflows ?? []),
+      ...scoped,
+      conversationWorkflowSelections: conversationWorkflowSelections ?? [], providerConfigs: providers.settings.configs,
+      activeProviderConfigId: (selection.settings as LlmSettingsRecord).activeProviderConfigId };
+  }
+
   public async compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
     const records = await this.loadRecords();
-    const agentId = requireId(request.executorAgentId, 'executorAgentId');
-    const agent = records.agents.find((candidate) => candidate.id === agentId);
-    if (!agent) throw new Error(`配置 authority 中不存在 executor Agent：${agentId}`);
-    const builtinAgent = BUILTIN_AGENT_DEFINITIONS[agent.kind] ?? BUILTIN_AGENT_DEFINITIONS[agent.id];
-    const workflowSelection = latestScopedSelection(
-      records.conversationWorkflowSelections.filter((selection) =>
-        selection.conversationId === request.conversationId && selection.role === 'active'
-      )
-    );
-    const workflowId = workflowSelection?.scopeKind === 'workflow' ? workflowSelection.workflowId : undefined;
-    const workflow = workflowId ? records.workflows.find((candidate) => candidate.id === workflowId) : undefined;
-    const builtinWorkflow = workflow
-      ? BUILTIN_WORKFLOW_DEFINITIONS[workflow.id]
-        ?? Object.values(BUILTIN_WORKFLOW_DEFINITIONS).find((candidate) => candidate.id === workflow.id)
-      : undefined;
-    const scopesLowToHigh: ScopeReference[] = [
-      { scopeKind: 'global' },
-      { scopeKind: 'agent', scopeId: agentId },
-      ...(workflowId ? [{ scopeKind: 'workflow' as const, scopeId: workflowId }] : []),
-      { scopeKind: 'conversation', scopeId: request.conversationId },
-      { scopeKind: 'run', scopeId: request.turnId }
-    ];
-    const scopesHighToLow = [...scopesLowToHigh].reverse();
+    const { agentId, agent, workflowId, workflow, builtinAgent, builtinWorkflow,
+      scopesLowToHigh, scopesHighToLow, modelProfile, provider, modelId } = resolveModelSelection(records, request);
 
-    const inheritedModelFallback = request.modelFallback;
-    const nonGlobalModelProfile = inheritedModelFallback
-      ? resolveScopedRecord(
-          records.modelProfileScopeLinks,
-          records.modelProfiles,
-          scopesHighToLow.filter((scope) => scope.scopeKind !== 'global'),
-          (link) => link.modelProfileId
-        )
+    const conversationModelProfile = resolveRecordAtScope(
+      records.modelProfileScopeLinks,
+      records.modelProfiles,
+      { scopeKind: 'conversation', scopeId: request.conversationId },
+      (link) => link.modelProfileId
+    );
+    const effectiveConversationThinkingOverride = conversationModelProfile
+      && conversationModelProfile.providerConfigId === provider.id
+      && conversationModelProfile.provider === provider.provider
+      && conversationModelProfile.model === modelId
+      ? conversationModelProfile.thinkingOverride
       : undefined;
-    const globalModelProfile = inheritedModelFallback
-      ? resolveRecordAtScope(
-          records.modelProfileScopeLinks,
-          records.modelProfiles,
-          { scopeKind: 'global' },
-          (link) => link.modelProfileId
-        )
-      : undefined;
-    const modelProfile = inheritedModelFallback
-      ? nonGlobalModelProfile
-      : resolveScopedRecord(
-          records.modelProfileScopeLinks,
-          records.modelProfiles,
-          scopesHighToLow,
-          (link) => link.modelProfileId
-        );
-    const builtinModel = builtinWorkflow?.model ?? builtinAgent?.model;
-    const requestedModel = request.modelOverride;
-    const selectedModel: {
-      providerConfigId?: string;
-      provider?: LlmProviderConfigRecord['provider'];
-      model: string;
-    } | undefined = requestedModel
-      ?? modelProfile
-      ?? builtinModel
-      ?? inheritedModelFallback
-      ?? globalModelProfile;
-    const providerConfigId = selectedModel?.providerConfigId?.trim() || records.activeProviderConfigId;
-    const provider = resolveRequestedProvider(records.providerConfigs, {
-      providerConfigId,
-      providerKind: selectedModel?.provider,
-      modelId: selectedModel?.model
-    });
-    if (!provider) throw new Error('没有可用的 LLM Provider 配置。');
-    const modelId = selectedModel?.model?.trim() || provider.model?.trim();
-    if (!modelId) throw new Error(`Provider ${provider.id} 没有可用模型。`);
-    if (!providerContainsModel(provider, modelId)) {
-      throw new Error(`Provider ${provider.id} 不包含 ModelProfile 冻结的模型 ${modelId}。`);
-    }
+    const inheritThinkingToChildren = conversationModelProfile?.inheritThinkingToChildren === true;
 
     const planReviewPolicy = resolveScopedRecord(
       records.planReviewPolicyScopeLinks,
@@ -415,6 +408,10 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         ...(primaryGenerationConfig?.thinkingConfig
           ? { thinkingConfig: clonePlain(primaryGenerationConfig.thinkingConfig) }
           : {}),
+        ...(effectiveConversationThinkingOverride
+          ? { thinkingOverride: clonePlain(effectiveConversationThinkingOverride) }
+          : {}),
+        ...(inheritThinkingToChildren ? { inheritThinkingToChildren: true } : {}),
         ...(nativeResponses ? { nativeResponses } : {}),
         retryPolicy: frozenProviderRetryPolicy(provider, modelId)
       },
@@ -956,6 +953,30 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     };
   }
 
+  public async loadRequestGenerationSettings(model: ChatModelOverrideRecord, conversationId: string): Promise<RequestGenerationSettings> {
+    const paths = this.getPaths();
+    const [records, providers] = await Promise.all([
+      loadScopedModelProfiles(paths, [{ scopeKind: 'conversation', scopeId: conversationId }]),
+      loadLlmProviderConfigsSettings(paths)
+    ]);
+    const provider = providers.settings.configs.find((item) => item.id === model.providerConfigId);
+    if (!provider || provider.provider !== model.provider || !providerContainsModel(provider, model.model)) throw new Error('当前请求渠道或模型已改变，请重新选择。');
+    // Resolve only this conversation. Agent/workflow/global profiles and parent Turn fallbacks
+    // select model identity, never a parent's session-only override.
+    const profile = resolveRecordAtScope(records.modelProfileScopeLinks, records.modelProfiles,
+      { scopeKind: 'conversation', scopeId: conversationId }, (link) => link.modelProfileId);
+    const modelConfig = provider.modelConfigs.find((item) => item.modelId === model.model);
+    const defaults = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
+    const requestBody = (modelConfig ? modelConfig.requestBody : provider.requestBody) ?? {};
+    const override = profile?.providerConfigId === provider.id && profile.provider === provider.provider && profile.model === model.model
+      ? profile.thinkingOverride : undefined;
+    if (override) {
+      if (hasThinkingBodyConflict(provider.provider, requestBody)) throw new Error('自定义请求体与会话思维覆盖冲突，请恢复默认或修改渠道配置。');
+      validateSessionThinkingOverride(override, provider.provider, model.model, defaults, requestBody);
+    }
+    return { model: { ...model }, generationConfig: applySessionThinkingOverride(defaults, override), requestBody: clonePlain(requestBody), thinkingControlledByBody: hasThinkingBodyConflict(provider.provider, requestBody) };
+  }
+
   public async loadRequestCompressionSettings(
     model: ChatModelOverrideRecord
   ): Promise<RequestCompressionSettings> {
@@ -1015,6 +1036,89 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     };
   }
 
+}
+
+type ModelSelectionRecords = Pick<ConfigurationRecords, 'agents' | 'workflows' | 'modelProfiles' | 'modelProfileScopeLinks'
+  | 'conversationWorkflowSelections' | 'providerConfigs' | 'activeProviderConfigId'>;
+
+/** Shared selection precedence for UI observations and immutable Turn compilation. */
+function resolveModelSelection(records: ModelSelectionRecords, request: TurnAuthorityCompilationRequest) {
+    const agentId = requireId(request.executorAgentId, 'executorAgentId');
+    const agent = records.agents.find((candidate) => candidate.id === agentId);
+    if (!agent) throw new Error(`配置 authority 中不存在 executor Agent：${agentId}`);
+    const builtinAgent = BUILTIN_AGENT_DEFINITIONS[agent.kind] ?? BUILTIN_AGENT_DEFINITIONS[agent.id];
+    const workflowSelection = latestScopedSelection(
+      records.conversationWorkflowSelections.filter((selection) =>
+        selection.conversationId === request.conversationId && selection.role === 'active'
+      )
+    );
+    const workflowId = workflowSelection?.scopeKind === 'workflow' ? workflowSelection.workflowId : undefined;
+    const workflow = workflowId ? records.workflows.find((candidate) => candidate.id === workflowId) : undefined;
+    const builtinWorkflow = workflow
+      ? BUILTIN_WORKFLOW_DEFINITIONS[workflow.id]
+        ?? Object.values(BUILTIN_WORKFLOW_DEFINITIONS).find((candidate) => candidate.id === workflow.id)
+      : undefined;
+    const scopesLowToHigh: ScopeReference[] = [
+      { scopeKind: 'global' },
+      { scopeKind: 'agent', scopeId: agentId },
+      ...(workflowId ? [{ scopeKind: 'workflow' as const, scopeId: workflowId }] : []),
+      { scopeKind: 'conversation', scopeId: request.conversationId },
+      { scopeKind: 'run', scopeId: request.turnId }
+    ];
+    const scopesHighToLow = [...scopesLowToHigh].reverse();
+
+    const inheritedModelFallback = request.modelFallback;
+    const selectableModelProfiles = records.modelProfiles.filter(profile => !profile.inheritModel);
+    const nonGlobalModelProfile = inheritedModelFallback
+      ? resolveScopedRecord(
+          records.modelProfileScopeLinks,
+          selectableModelProfiles,
+          scopesHighToLow.filter((scope) => scope.scopeKind !== 'global'),
+          (link) => link.modelProfileId
+        )
+      : undefined;
+    const globalModelProfile = inheritedModelFallback
+      ? resolveRecordAtScope(
+          records.modelProfileScopeLinks,
+          selectableModelProfiles,
+          { scopeKind: 'global' },
+          (link) => link.modelProfileId
+        )
+      : undefined;
+    const modelProfile = inheritedModelFallback
+      ? nonGlobalModelProfile
+      : resolveScopedRecord(
+          records.modelProfileScopeLinks,
+          selectableModelProfiles,
+          scopesHighToLow,
+          (link) => link.modelProfileId
+        );
+    const builtinModel = builtinWorkflow?.model ?? builtinAgent?.model;
+    const requestedModel = request.modelOverride;
+    const selectedModel: {
+      providerConfigId?: string;
+      provider?: LlmProviderConfigRecord['provider'];
+      model: string;
+    } | undefined = requestedModel
+      ?? modelProfile
+      ?? builtinModel
+      ?? inheritedModelFallback
+      ?? globalModelProfile;
+    const providerConfigId = selectedModel?.providerConfigId?.trim() || records.activeProviderConfigId;
+    const provider = resolveRequestedProvider(records.providerConfigs, {
+      providerConfigId,
+      providerKind: selectedModel?.provider,
+      modelId: selectedModel?.model
+    });
+    if (!provider) throw new Error('没有可用的 LLM Provider 配置。');
+    const modelId = selectedModel?.model?.trim() || provider.model?.trim();
+    if (!modelId) throw new Error(`Provider ${provider.id} 没有可用模型。`);
+    if (!providerContainsModel(provider, modelId)) {
+      throw new Error(`Provider ${provider.id} 不包含 ModelProfile 冻结的模型 ${modelId}。`);
+    }
+
+    return { agentId, agent, workflowId, workflow, builtinAgent, builtinWorkflow,
+      scopesLowToHigh, scopesHighToLow, modelProfile, provider, modelId };
 }
 
 /**

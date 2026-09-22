@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { RECORDS_DIR, STORAGE_VERSION } from './constants';
 import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
-import { readJson, writeJson } from './json';
+import { readJson, readJsonStrict, writeJson } from './json';
 import { sortableName } from './naming';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
 import {
@@ -53,6 +53,15 @@ export interface RecordStoreCommitResult<TRecord> extends RecordStoreSnapshot<TR
 
 export interface CommitRecordStoreSnapshotOptions extends SaveRecordStoreOptions {
   expectedRevision: string;
+  section: string;
+}
+
+export interface UpsertRecordOptions {
+  /** 记录的显示名称，用于生成可读文件名。 */
+  labelForRecord: (record: { id: string }) => string;
+  /** 保存时预期当前 revision；若不匹配则拒绝写入。 */
+  expectedRevision: string;
+  /** 冲突时报错用的 section 名称。 */
   section: string;
 }
 
@@ -198,6 +207,62 @@ export async function commitRecordStoreSnapshot<TRecord extends { id: string }, 
   });
 }
 
+/**
+ * 增量更新单条记录：只写变更的 record 文件，更新 index 中的 updatedAt，递增 revision。
+ *
+ * 使用场景：用户在设置页修改单个 model-profile，不需要全量重写 847 条记录。
+ */
+export async function upsertRecord<TRecord extends { id: string }, TKey extends string>(
+  root: vscode.Uri,
+  indexUri: vscode.Uri,
+  record: TRecord,
+  recordKey: TKey,
+  options: UpsertRecordOptions
+): Promise<RecordStoreSnapshot<TRecord>> {
+  return withRecordStoreMutationLock(indexUri, async () => {
+    const current = await loadRecordStoreSnapshotUnlocked<TRecord, TKey>(root, indexUri, recordKey);
+    const actualRevision = current?.revision ?? missingRecordStoreRevision(indexUri);
+    if (actualRevision !== options.expectedRevision) {
+      throw new SettingsRevisionConflictError(options.section, options.expectedRevision, actualRevision);
+    }
+
+    const savedAt = new Date().toISOString();
+    const previousIndex = await loadRecordsIndex(indexUri, false);
+    const previousRecords = previousIndex?.records ?? [];
+    const previousById = new Map(previousRecords.map((r) => [r.id, r]));
+
+    // 只写这一条记录的文件
+    const file = previousById.get(record.id)?.file ?? 
+      `${RECORDS_DIR}/${sortableName(record.id, options.labelForRecord(record))}.json`;
+    
+    const recordsRoot = vscode.Uri.joinPath(root, RECORDS_DIR);
+    await vscode.workspace.fs.createDirectory(recordsRoot);
+    await writeJson(vscode.Uri.joinPath(root, ...file.split('/')), {
+      schemaVersion: STORAGE_VERSION,
+      savedAt,
+      [recordKey]: record
+    } as RecordFile<TKey, TRecord>);
+
+    // 更新 index：替换或新增该记录的 updatedAt
+    const nextIndexRecords = previousRecords
+      .filter((r) => r.id !== record.id)
+      .concat([{ id: record.id, file, updatedAt: savedAt }]);
+
+    await writeJson(indexUri, {
+      schemaVersion: STORAGE_VERSION,
+      savedAt,
+      records: nextIndexRecords
+    } satisfies RecordsIndexFile);
+
+    // 返回新的 snapshot（必须重新读取才能生成正确的 revision）
+    const updated = await loadRecordStoreSnapshotUnlocked<TRecord, TKey>(root, indexUri, recordKey);
+    if (!updated) {
+      throw new Error(`Failed to reload record store after upsert: ${indexUri.fsPath}`);
+    }
+    return updated;
+  });
+}
+
 async function loadRecordStoreSnapshotUnlocked<TRecord extends { id: string }, TKey extends string>(
   root: vscode.Uri,
   indexUri: vscode.Uri,
@@ -239,14 +304,30 @@ async function saveRecordStoreUnlocked<TRecord extends { id: string }, TKey exte
   const savedAt = new Date().toISOString();
   const recordsRoot = vscode.Uri.joinPath(root, RECORDS_DIR);
   await vscode.workspace.fs.createDirectory(recordsRoot);
-  // 全量保存本身会重写所有 next records，因此不能让历史索引中的空/缺失文件永久阻断修复。
-  // 在 mutation lock 内复用旧文件名；若旧文件已丢失，下面的原子 writeJson 会直接重建。
+  // Compare stored content, not just ids or timestamps. Existing callers may submit a full
+  // catalog; unchanged files and index entries must not generate writes or watcher events.
+  // Missing/invalid files still get rebuilt by this explicit full-catalog save.
   const previousIndex = await loadRecordsIndex(indexUri, false);
   const previousRecords = previousIndex?.records ?? [];
   const previousById = new Map(previousRecords.map((record) => [record.id, record]));
+  const unchanged = new Set<string>();
+  for (let offset = 0; offset < records.length; offset += LOAD_RECORD_BATCH_SIZE) {
+    await Promise.all(records.slice(offset, offset + LOAD_RECORD_BATCH_SIZE).map(async record => {
+      const previous = previousById.get(record.id);
+      if (!previous) return;
+      const stored = await readJsonStrict<RecordFile<TKey, TRecord>>(vscode.Uri.joinPath(root, ...previous.file.split('/')));
+      if (stored.status === 'ioError') throw stored.error;
+      if (stored.status === 'ok' && stored.value?.schemaVersion === STORAGE_VERSION && stored.value?.[recordKey]
+        && createStorageRevision(stored.value[recordKey]) === createStorageRevision(record)) unchanged.add(record.id);
+    }));
+  }
 
   const nextIndexRecords: RecordIndexRecord[] = [];
   for (const record of records) {
+    if (unchanged.has(record.id)) {
+      nextIndexRecords.push(previousById.get(record.id)!);
+      continue;
+    }
     const file = previousById.get(record.id)?.file ?? `${RECORDS_DIR}/${sortableName(record.id, labelForRecord(record))}.json`;
     await writeJson(vscode.Uri.joinPath(root, ...file.split('/')), {
       schemaVersion: STORAGE_VERSION,
@@ -257,11 +338,13 @@ async function saveRecordStoreUnlocked<TRecord extends { id: string }, TKey exte
   }
 
   // 先发布新索引，再清理旧文件；并发读取者只会看到“旧索引 + 完整旧文件”或新索引。
-  await writeJson(indexUri, {
-    schemaVersion: STORAGE_VERSION,
-    savedAt,
-    records: nextIndexRecords
-  } satisfies RecordsIndexFile);
+  if (!previousIndex || createStorageRevision(previousRecords) !== createStorageRevision(nextIndexRecords)) {
+    await writeJson(indexUri, {
+      schemaVersion: STORAGE_VERSION,
+      savedAt,
+      records: nextIndexRecords
+    } satisfies RecordsIndexFile);
+  }
 
   if (options.pruneMissing) {
     const nextFiles = new Set(nextIndexRecords.map((record) => record.file));

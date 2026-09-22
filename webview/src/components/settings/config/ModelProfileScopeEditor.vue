@@ -4,6 +4,7 @@ import type { ConfigScopeKind } from '@shared/protocol';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
+import ModelProfileSaveStatus from '@webview/components/input/ModelProfileSaveStatus.vue';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
@@ -16,6 +17,7 @@ const props = withDefaults(defineProps<{ scopeKind: ConfigScopeKind; scopeId?: s
 
 const globalSettings = useGlobalSettingsStore();
 const store = useModelProfileStore();
+watch(() => [props.scopeKind, props.scopeId], (_value, _old, onCleanup) => onCleanup(store.activateScope(props.scopeKind, props.scopeId)), { immediate: true });
 const { loading: modelLoading, text: modelLoadingText } = useSettingsLoadingText('LLM 配置', () => props.scopeKind, () => props.scopeId, {
   globalSettingsSections: ['llm', 'llmProviderConfigs'] as const
 });
@@ -56,7 +58,7 @@ const selectedProviderConfigId = computed({
 
 watch(() => [props.scopeKind, props.scopeId, local.value.profile?.id, globalSettings.llmProviderConfigs.configs.length, globalSettings.llm.activeProviderConfigId], () => {
   const profile = local.value.profile;
-  if (!profile) {
+  if (!profile || profile.inheritModel) {
     providerConfigId.value = INHERIT_GLOBAL_MODEL_ID;
     model.value = '';
     return;
@@ -97,6 +99,7 @@ function save(): void {
         <input v-model="model" type="text" :disabled="isInheritSelected" :placeholder="isInheritSelected ? inheritedModelText : '例如 deepseek-v4-flash'" />
       </label>
     </div>
+    <ModelProfileSaveStatus :scope-kind="scopeKind" :scope-id="scopeId" />
     <div class="model-profile-actions">
       <button v-if="!isInheritSelected" type="button" :disabled="!model.trim()" @click="save">保存 LLM 配置</button>
       <span v-else>当前将继承全局/对话的 LLM 配置。</span>

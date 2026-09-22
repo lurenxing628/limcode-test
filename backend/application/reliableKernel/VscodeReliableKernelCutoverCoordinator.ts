@@ -91,10 +91,12 @@ export class VscodeReliableKernelCutoverCoordinator {
    * decision before acting, so a stale answer here can only surface as the exact existing error.
    */
   private async requiredMutation(): Promise<'physical-cutover' | 'runtime-root' | undefined> {
+    // A foreign or malformed pointer fences even physical-cutover preflight. Do not inspect
+    // its journal/request or enumerate Hosts before the complete historical schema is checked.
+    const historical = await this.authority.readHistoricalPointerForCutover();
     if (await physicalCutoverRecoveryRequired(this.runtimeScopeRootPath)) return 'physical-cutover';
     if (await readPhysicalCutoverRequest(this.runtimeScopeRootPath)) return 'physical-cutover';
     if (await previousRuntimeEpochMigrationRequired(this.authority)) return 'runtime-root';
-    const historical = await this.authority.readHistoricalPointerForCutover();
     if (historical && historical.runtimeKernelEpoch < RUNTIME_KERNEL_EPOCH) return 'runtime-root';
     let binding: RootBinding;
     try {
@@ -109,6 +111,7 @@ export class VscodeReliableKernelCutoverCoordinator {
   }
 
   private async ensureCurrentRootInternal(): Promise<VscodeReliableKernelCutoverResult> {
+    await this.authority.readHistoricalPointerForCutover();
     await recoverInterruptedPhysicalCutover(this.runtimeScopeRootPath, this.authority);
     const request = await readPhysicalCutoverRequest(this.runtimeScopeRootPath);
     if (request) {

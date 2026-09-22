@@ -25,9 +25,11 @@ const { readAgentAnswerTool } = fromDist('backend/world/modules/tools/definition
 const { deleteTool } = fromDist('backend/world/modules/tools/definitions/delete/index.js');
 
 test('Agent 工具声明说明异步用法，并只标记无条件必填参数', () => {
-  assert.match(runAgentTool.declaration.description, /Child Agents are asynchronous/);
-  assert.match(runAgentTool.declaration.description, /Do NOT poll read_agent_answer/);
-  assert.match(runAgentTool.declaration.description, /Never interrupt merely because/);
+  assert.match(runAgentTool.declaration.description, /Reuse answerBridgeId/);
+  assert.match(runAgentTool.declaration.description, /queues after the current child turn/);
+  assert.match(runAgentTool.declaration.description, /Do not repeatedly poll read_agent_answer/);
+  assert.equal(runAgentTool.declaration.parameters.properties.interrupt.type, 'boolean');
+  assert.equal(runAgentTool.declaration.parameters.properties.taskName.type, 'string');
   assert.match(runAgentTool.declaration.parameters.properties.foregroundWaitMs.description, /Optional in run mode/);
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.type, 'integer');
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.minimum, 0);

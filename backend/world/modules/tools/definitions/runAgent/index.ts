@@ -39,28 +39,13 @@ export const runAgentTool: ToolDefinition = {
   execution: 'agentRun',
   declaration: {
     name: RUN_AGENT_TOOL_NAME,
-    description: `Start, continue, or explicitly interrupt a child AgentRun.
-
-Usage:
-- Use agent.type to select an Agent type/configuration such as main, worker, or explore. It defaults to ${DEFAULT_RUN_AGENT_TYPE}. Runtime mirror ids are internal and must not be used as agent.type.
-- Prefer answerBridgeId when continuing or appending to an existing run_agent child conversation. It resolves the bound child Agent/conversation and preserves the same default submit_agent_answer channel.
-- In the default run mode, if the reused child conversation is still responding, this call interrupts its current Run and force-sends the new message immediately instead of placing it in the normal queue.
-- In run mode, put the complete task, background, role, and supplemental instructions in prompt. Separate context, conversation, and delivery parameters are not supported.
-- foregroundWaitMs is optional in run mode. Omit it or pass 0 to start the child Agent and return immediately. It is only a foreground wait budget, never an AgentRun timeout; when the budget expires, the child continues in the background and the tool returns agentId, runId, conversationId, and answerBridgeId.
-- Use a positive foregroundWaitMs only when the current reply truly cannot proceed without an immediate child result; keep it small.
-- Use mode="interrupt" with answerBridgeId only when the user explicitly asks to stop/replace that child task. Interrupt recursively cancels the active child Run and descendants, including backgrounded descendants. Interrupt mode does not require prompt or foregroundWaitMs. Never interrupt merely because the child Agent is slow or read_agent_answer reports status="running".
-- agent.id is an internal compatibility selector for a temporary Agent mirror previously returned by run_agent. The model normally should not use it; prefer answerBridgeId for an existing child conversation, or agent.type for a new child.
-- At most ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} child AgentRuns enter durable intent admission concurrently per parent Turn. The slot is released once the intent is durable; foreground answer waits do not retain it.
-- wait is a legacy scheduling hint only. It never enables background execution; omit foregroundWaitMs or use foregroundWaitMs=0 for that.
-
-IMPORTANT - Async child Agent behavior:
-Child Agents are asynchronous. The parent Agent should not keep its own response open just to wait for child completion.
-Recommended pattern:
-1. Delegate with run_agent using foregroundWaitMs=0 or omit foregroundWaitMs.
-2. When run_agent returns backgrounded, immediately write useful text to the user (for example: the task has been dispatched, what is being checked, and that results will arrive later) and end the current turn.
-3. Let the child submit via submit_agent_answer delivery, or check later in a new turn with read_agent_answer if needed.
-
-Do NOT poll read_agent_answer in a loop in the same response. Do NOT use tools to wait for a long-running child. If the child is slow, it is still running normally in the background.`,
+    description: `Delegate a bounded task, continue an existing child, or explicitly stop it.
+- Check the conversation child-agent roster before starting a new child. Reuse answerBridgeId for follow-up work that depends on that child's findings or context. Use agent.type only to choose the configuration for a new child; a type is not a running child identity.
+- For a new child, give taskName a short responsibility label and prompt the objective, necessary context, constraints, expected result and verification. State whether the child may edit files or should only investigate.
+- A continuation preserves the child conversation and answer channel. By default it queues after the current child turn. Set interrupt=true only when the current work needs immediate redirection; mode="interrupt" stops the child and descendants without assigning a new task.
+- Do not duplicate delegated work. Continue independent work while the child runs. When nothing useful remains until its answer arrives, end the current turn; submit_agent_answer will notify the parent. Do not repeatedly poll read_agent_answer or interrupt a child merely because it is slow.
+- foregroundWaitMs defaults to 0 (return immediately). A positive value is a bounded wait for an immediately needed result, not a child timeout; the child continues when the wait expires.
+- At most ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} child starts enter admission concurrently per parent turn. scheduling controls tool-call concurrency, not background execution.`,
     parameters: {
       type: 'object',
       properties: {
@@ -75,7 +60,15 @@ Do NOT poll read_agent_answer in a loop in the same response. Do NOT use tools t
         },
         answerBridgeId: {
           type: 'string',
-          description: 'Continue, append to, or explicitly interrupt an existing run_agent child conversation. Required in interrupt mode. In run mode, the bound child Agent and conversation are reused, the same submit_agent_answer channel is preserved, and any active response is interrupted before this message is force-sent.'
+          description: 'Reuse the existing child conversation and answer channel. Required for mode=interrupt; in run mode, follow-ups queue unless interrupt=true.'
+        },
+        taskName: {
+          type: 'string',
+          description: 'Short responsibility label for a new child, such as "trace send failure". Displayed in the conversation roster; not an instruction or an agent type.'
+        },
+        interrupt: {
+          type: 'boolean',
+          description: 'When continuing a child, true redirects its current work immediately; false or omitted queues the follow-up after its current turn.'
         },
         agent: {
           type: 'object',

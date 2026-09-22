@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
@@ -32,6 +32,7 @@ import ReliableContextStatus from '@webview/components/conversation/ReliableCont
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
 import SteeringStatusPanel from '@webview/components/input/SteeringStatusPanel.vue';
+import SessionThinkingControl from '@webview/components/input/SessionThinkingControl.vue';
 import { modelRequestNativeCapabilities } from '@webview/reliability/modelRequestStreamStats';
 
 const props = withDefaults(
@@ -52,6 +53,14 @@ const globalSettings = useGlobalSettingsStore();
 const workflowStore = useWorkflowStore();
 const agentStore = useAgentStore();
 const modelProfileStore = useModelProfileStore();
+watch(() => clientState.currentConversationId, (conversationId, _previous, onCleanup) => {
+  if (conversationId) onCleanup(modelProfileStore.activateScope('conversation', conversationId));
+}, { immediate: true });
+const confirmedEffectiveModel = computed(() => clientState.currentConversationId
+  ? modelProfileStore.effectiveFor('conversation', clientState.currentConversationId)
+  : undefined);
+const confirmedChannelConfig = computed(() => globalSettings.llmProviderConfigs.configs.find(config =>
+  config.id === confirmedEffectiveModel.value?.providerConfigId));
 const workEnvironmentStore = useWorkEnvironmentStore();
 const ui = useConversationUiStore();
 const session = useSessionStore();
@@ -94,8 +103,10 @@ const draft = computed({
   set: (next: string) => ui.setComposerDraft(next)
 });
 // Interaction 与普通输入是独立控制面：等待 AskUser/Plan 时，用户仍可创建排队 TurnIntent。
+const savingSessionSelections = ref<Record<string, boolean>>({});
+const savingSessionSelection = computed(() => !!savingSessionSelections.value[clientState.currentConversationId ?? '']);
 const conversationInputDisabled = computed(() =>
-  props.disabled || Boolean(currentSubmissionCommandId.value) || currentSteeringSubmitting.value
+  props.disabled || Boolean(currentSubmissionCommandId.value) || currentSteeringSubmitting.value || savingSessionSelection.value
 );
 const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
@@ -194,8 +205,10 @@ const activeWorkflowId = computed({
 const activeChannelId = computed({
   get: () => {
     const conversationId = clientState.currentConversationId;
-    const profileConfigId = conversationId ? modelProfileStore.localProfileFor('conversation', conversationId).profile?.providerConfigId?.trim() : '';
-    return profileConfigId || globalSettings.llm.activeProviderConfigId || globalSettings.activeLlmProviderConfig?.id || '';
+    const local = conversationId ? modelProfileStore.localProfileFor('conversation', conversationId).profile : undefined;
+    const profileConfigId = !local?.inheritModel ? local?.providerConfigId?.trim() : '';
+    const effective = confirmedEffectiveModel.value;
+    return profileConfigId || effective?.providerConfigId || globalSettings.llm.activeProviderConfigId || globalSettings.activeLlmProviderConfig?.id || '';
   },
   set: (configId: string) => selectChannel(configId)
 });
@@ -377,7 +390,7 @@ function onWindowResize(): void {
   updateExpandedEditorHeight();
 }
 
-function submit(): void {
+async function submit(): Promise<void> {
   const text = draft.value.trim();
   if ((!text && selectedAttachments.value.length === 0) || conversationInputDisabled.value) return;
   const content = buildMessageContent(text, selectedAttachments.value);
@@ -389,6 +402,19 @@ function submit(): void {
     const submission = steerCurrentTurn(text, content);
     if (submission) currentSteerCommandId.value = submission.commandId;
     return;
+  }
+  const conversationId = clientState.currentConversationId;
+  if (conversationId) {
+    savingSessionSelections.value[conversationId] = true;
+    try {
+      await modelProfileStore.awaitSavedForScope('conversation', conversationId);
+    } catch {
+      // Scope errors are shown next to the thinking control; do not send stale settings.
+      return;
+    } finally {
+      delete savingSessionSelections.value[conversationId];
+    }
+    if (clientState.currentConversationId !== conversationId || draft.value.trim() !== text || conversationInputDisabled.value) return;
   }
   const submission = sendMessage(text, content, currentTurnAuthoritySelection());
   if (!submission) return;
@@ -578,18 +604,14 @@ function providerLabel(provider: string): string {
 function selectedModelForConfig(config: LlmProviderConfigRecord): string {
   const conversationId = clientState.currentConversationId;
   const profile = conversationId ? modelProfileStore.localProfileFor('conversation', conversationId).profile : undefined;
-  const profileModel = profile?.providerConfigId?.trim() === config.id ? profile.model.trim() : '';
-  return profileModel && modelExistsInConfig(config, profileModel) ? profileModel : config.model;
+  const effective = confirmedEffectiveModel.value;
+  const profileModel = profile?.providerConfigId?.trim() === config.id && !profile.inheritModel ? profile.model.trim()
+    : effective?.providerConfigId === config.id ? effective.model : '';
+  return profileModel || config.model;
 }
 
 function currentTurnAuthoritySelection(): TurnAuthoritySelection {
   return currentAuthoritySelection();
-}
-
-function modelExistsInConfig(config: LlmProviderConfigRecord, modelId: string): boolean {
-  const id = modelId.trim();
-  if (!id) return false;
-  return config.model?.trim() === id || config.models.some((model) => model.id === id);
 }
 
 function modelDescription(model: LlmProviderModelRecord): string {
@@ -876,7 +898,7 @@ function middleEllipsis(value: string, maxLength: number): string {
     </div>
 
     <div class="composer-zone composer-zone-bottom" aria-label="输入框下方功能区">
-      <div v-if="agentOptions.length || workflowOptions.length || channelOptions.length || workEnvironmentOptions.length" class="composer-meta">
+      <div v-if="clientState.currentConversationId || agentOptions.length || workflowOptions.length || channelOptions.length || workEnvironmentOptions.length" class="composer-meta">
         <template v-if="agentOptions.length">
           <SettingsDropdown
             v-model="activeAgentId"
@@ -968,6 +990,12 @@ function middleEllipsis(value: string, maxLength: number): string {
             @open="onWorkEnvironmentDropdownOpen"
           />
         </template>
+        <SessionThinkingControl
+          v-if="clientState.currentConversationId"
+          :conversation-id="clientState.currentConversationId"
+          :config="confirmedChannelConfig"
+          :model="confirmedEffectiveModel?.model"
+        />
       </div>
       <span
         v-if="interruptPhase"

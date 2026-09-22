@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
@@ -32,6 +32,7 @@ import {
   latestTimelineSegmentStart,
   prioritizedTimelineDetailDemand
 } from './segmentedTimeline';
+import { captureScrollAnchor, restoreScrollAfterHistoryLoad, releaseStickyFromUserScroll, type ScrollAnchor } from './scrollAnchor';
 
 const props = withDefaults(defineProps<{
   emptyHint?: string;
@@ -78,6 +79,7 @@ const compressionBlocks = computed(() => Object.values(feed.records.CompressionB
 const segmentStart = ref(0);
 const followLatestSegment = ref(true);
 const pendingHistoryAnchorId = ref<string | null>(null);
+const pendingScrollAnchor = ref<ScrollAnchor | null>(null);
 const visibleTimelineRows = computed(() => messages.value.slice(
   segmentStart.value,
   segmentStart.value + TIMELINE_MOUNT_LIMIT
@@ -149,6 +151,7 @@ watch(
 
 watch(conversationId, () => {
   pendingHistoryAnchorId.value = null;
+  pendingScrollAnchor.value = null;
   followLatestSegment.value = props.followLatest;
   segmentStart.value = props.followLatest
     ? latestTimelineSegmentStart(messages.value.length)
@@ -169,6 +172,8 @@ watch(
       messages.value.length,
       Math.max(0, anchorIndex - TIMELINE_SEGMENT_STEP)
     );
+
+    void restorePendingScrollAnchor();
   }
 );
 
@@ -407,21 +412,41 @@ function runHadCompletedTools(message: MessageRecord): boolean {
   );
 }
 
+async function restorePendingScrollAnchor(): Promise<void> {
+  const anchor = pendingScrollAnchor.value;
+  const scroller = props.scroller;
+  const conversation = conversationId.value;
+  await nextTick();
+  if (pendingScrollAnchor.value !== anchor || props.scroller !== scroller || conversationId.value !== conversation) return;
+  pendingScrollAnchor.value = null;
+  restoreScrollAfterHistoryLoad({ scroller, anchor });
+}
+
 function showEarlierSegment(): void {
+  if (feed.historyLoading || !hasEarlierSegment.value) return;
+  const scroller = props.scroller;
+  pendingScrollAnchor.value = captureScrollAnchor({
+    scroller,
+    visibleRows: visibleTimelineRows.value
+  });
+  releaseStickyFromUserScroll(scroller);
+
   if (segmentStart.value > 0) {
     followLatestSegment.value = false;
     segmentStart.value = clampTimelineSegmentStart(
       messages.value.length,
       segmentStart.value - TIMELINE_SEGMENT_STEP
     );
+    void restorePendingScrollAnchor();
   } else if (canRequestEarlierHistory.value) {
     followLatestSegment.value = false;
     const anchorId = visibleTimelineRows.value[0]?.id ?? null;
     if (feed.requestEarlierHistory(conversationId.value)) {
       pendingHistoryAnchorId.value = anchorId;
+    } else {
+      pendingScrollAnchor.value = null;
     }
   }
-  props.scroller?.scrollTo({ top: 0 });
 }
 
 function showLaterSegment(): void {

@@ -221,6 +221,9 @@ export async function recoverInterruptedPhysicalCutover(
   authority: RootAuthority
 ): Promise<'none' | 'completed' | 'rolled-back'> {
   const dataRootPath = normalizedAbsolutePath(dataRootPathInput, 'cutover data root');
+  // Recovery can delete pending state, restore data trees, or finalize a completed journal.
+  // Guard here as well as in startup: direct callers must not mutate a foreign/invalid root.
+  await authority.readHistoricalPointerForCutover();
   const journal = await readJournal(dataRootPath);
   if (!journal) return 'none';
   if (journal.state === 'completed') {
@@ -249,6 +252,7 @@ export async function performPhysicalCutover(
   options: PhysicalCutoverOptions = {}
 ): Promise<PhysicalCutoverResult> {
   const dataRootPath = normalizedAbsolutePath(dataRootPathInput, 'cutover data root');
+  await authority.readHistoricalPointerForCutover();
   const request = await readPhysicalCutoverRequest(dataRootPath);
   if (!request) throw new Error('缺少显式cutover request；拒绝归档真实数据。');
   requireCompleteDrainProof(request.drain);

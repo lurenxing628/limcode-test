@@ -1,3 +1,10 @@
+﻿import { createStorageRevision } from '../capabilities/vscodeStorage/storageRevision';
+import type { ChatModelOverrideRecord, ModelProfileScopeMutationReceipt, ModelProfileScopeSnapshotPayload, ModelProfileScopeReadPayload, SessionThinkingOverride, SystemPromptScopeSetPayload } from '../../shared/protocol';
+import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
+import { loadScopedModelProfiles } from './scopedModelProfiles';
+import { validateSessionThinkingOverride } from '../../shared/sessionThinking';
+import { compatibleChildThinkingOverride } from './childThinkingInheritance';
+import { loadLlmProviderConfigsSettings } from '../capabilities/vscodeStorage/llmProviderConfigs';
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import type {
@@ -26,7 +33,6 @@ import type {
   SkillPolicyScopeSetPayload,
   SystemPromptRecord,
   SystemPromptScopeLinkRecord,
-  SystemPromptScopeSetPayload,
   ToolPolicyRecord,
   ToolPolicyScopeLinkRecord,
   ToolPolicyScopeSetPayload,
@@ -94,11 +100,164 @@ interface StoreSpec<TRecord extends { id: string }, TKey extends string> {
 
 /**
  * Settings-root mutation boundary. It never reads or writes Runtime SQLite.
- * A dedicated cross-process lock serializes multi-store record/link updates; record-first set and
- * link-first clear ordering make an interrupted operation leave at most an unreachable record.
+ * A dedicated cross-process lock serializes multi-store record/link updates. Record-first set and
+ * link-first clear never publish a dangling link. A fence between writes can leave an unreachable
+ * record (new set/clear), or an updated record reachable through the existing link (update). This
+ * is an uncertain partial commit, NOT a rollback; the next locked observation returns the actual
+ * pair/absence, including any committed change, without compensating writes.
  */
+export interface ModelProfileRootCapture { paths: StoragePaths; authorityId: string; root: string }
+
 export class VscodeConfigurationMutations {
+  private modelProfileRoot?: string;
+  private modelProfileAuthorityId = randomUUID();
+  private modelProfileSequence = 0;
+  private modelProfileRetired = false;
   public constructor(private readonly getPaths: () => StoragePaths) {}
+
+  /** Captured synchronously on message receipt; queued work can never resolve a new root later. */
+  public captureModelProfileRoot(expectedAuthorityId?: string): ModelProfileRootCapture {
+    if (this.modelProfileRetired) throw new Error('ModelProfile authority 已结束；请显式重新读取。');
+    const paths = this.getPaths();
+    const root = paths.settingsRootUri.toString();
+    if (this.modelProfileRoot !== undefined && this.modelProfileRoot !== root) {
+      this.modelProfileAuthorityId = randomUUID();
+      this.modelProfileSequence = 0;
+    }
+    this.modelProfileRoot = root;
+    if (expectedAuthorityId !== undefined && expectedAuthorityId !== this.modelProfileAuthorityId) throw new Error('ModelProfile authority/root 已改变；未自动重发，请显式重新读取。');
+    return { paths, root, authorityId: this.modelProfileAuthorityId };
+  }
+
+  public retireModelProfileAuthority(): void { this.modelProfileRetired = true; }
+
+  private assertModelProfileRoot(capture: ModelProfileRootCapture): void {
+    const current = this.captureModelProfileRoot(capture.authorityId);
+    if (current.root !== capture.root) throw new Error('ModelProfile root 已改变。');
+  }
+
+  private async modelProfilePair(paths: StoragePaths, scope: ScopeRef): Promise<{ profile?: ModelProfileRecord; link?: ModelProfileScopeLinkRecord; revision: string }> {
+    const { modelProfiles: profiles, modelProfileScopeLinks: active } = await loadScopedModelProfiles(paths, [scope]);
+    if (active.length > 1) throw new Error('ModelProfile scope 存在多个 active link。');
+    const link = active[0];
+    const profile = link ? profiles.find(item => item.id === link.modelProfileId) : undefined;
+    if (link && !profile) throw new Error('ModelProfile scope link 指向缺失记录。');
+    return { profile, link, revision: createStorageRevision({ scope, profile: profile ?? null, link: link ?? null }) };
+  }
+
+  private async modelProfileObservation(capture: ModelProfileRootCapture, scope: ScopeRef, effective?: () => Promise<ChatModelOverrideRecord | undefined>, receipt?: ModelProfileScopeMutationReceipt): Promise<ModelProfileScopeSnapshotPayload> {
+    const pair = await this.modelProfilePair(capture.paths, scope);
+    let effectiveModel: ChatModelOverrideRecord | undefined;
+    let effectiveModelError: string | undefined;
+    try {
+      effectiveModel = await effective?.();
+    } catch (error) {
+      // The stored pair/revision remains readable when its inherited provider or model was
+      // removed. Model-dependent mutations still validate effective() before writing.
+      effectiveModelError = error instanceof Error ? error.message : String(error);
+    }
+    this.assertModelProfileRoot(capture);
+    // One provider-independent shape for reads and every successful mutation, including clear.
+    return { ...scope, ...pair, ...(effectiveModel ? { effectiveModel } : {}),
+      ...(effectiveModelError ? { effectiveModelError } : {}), authorityId: capture.authorityId,
+      sequence: ++this.modelProfileSequence, profileState: !pair.profile ? 'absent' : pair.profile.thinkingOverride ? 'overridden' : 'default',
+      ...(receipt ?? {}), outcome: receipt ? 'committed' : 'observed' };
+  }
+
+  public readModelProfileScope(capture: ModelProfileRootCapture, input: ModelProfileScopeReadPayload, effective?: () => Promise<ChatModelOverrideRecord | undefined>, externalFence?: () => void): Promise<ModelProfileScopeSnapshotPayload> {
+    const scope = normalizeScope(input.scopeKind, input.scopeId);
+    return withRecordStoreTransaction(vscode.Uri.joinPath(capture.paths.settingsRootUri, CONFIGURATION_MUTATION_LOCK), async () => {
+      this.assertModelProfileRoot(capture); externalFence?.();
+      const observed = await this.modelProfileObservation(capture, scope, effective);
+      externalFence?.();
+      return observed;
+    });
+  }
+
+  /** External UI CAS only. Internal child initialization/Fork keep their existing locked methods. */
+  public writeModelProfileScope(capture: ModelProfileRootCapture, payload: ModelProfileScopeSetPayload | { scopeKind: ConfigScopeKind; scopeId?: string; authorityId?: string; expectedRevision?: string }, clear: boolean, effective?: () => Promise<ChatModelOverrideRecord | undefined>, externalFence?: () => void): Promise<ModelProfileScopeSnapshotPayload> {
+    const scope = normalizeScope(payload.scopeKind, payload.scopeId);
+    if (!payload.expectedRevision || payload.authorityId !== capture.authorityId) return Promise.reject(new Error('ModelProfile 保存缺少已确认的 scope revision/authority。请先读取。'));
+    return withRecordStoreTransaction(vscode.Uri.joinPath(capture.paths.settingsRootUri, CONFIGURATION_MUTATION_LOCK), async () => {
+      const guard = () => { this.assertModelProfileRoot(capture); externalFence?.(); };
+      guard();
+      const before = await this.modelProfilePair(capture.paths, scope);
+      if (before.revision !== payload.expectedRevision) throw new Error('ModelProfile 已被其他窗口修改；草稿已保留，请重新读取后决定。');
+      const set = payload as ModelProfileScopeSetPayload;
+      const operation = clear ? 'clear' : set.operation;
+      if (!operation || (!clear && operation !== 'select' && operation !== 'thinking' && operation !== 'reset' && operation !== 'inherit')) throw new Error('ModelProfile UI mutation 缺少有效操作。');
+      if (!clear && set.inheritThinkingToChildren !== undefined && scope.scopeKind !== 'conversation') {
+        throw new Error('子继承仅限当前对话。');
+      }
+      const inheritThinkingToChildren = scope.scopeKind === 'conversation'
+        ? set.inheritThinkingToChildren ?? before.profile?.inheritThinkingToChildren
+        : undefined;
+      let profile: ModelProfileRecord | undefined;
+      if (!clear) {
+        if (operation === 'thinking' || operation === 'reset') {
+          if (scope.scopeKind !== 'conversation') throw new Error('思维覆盖仅限当前对话。');
+          const current = await effective?.();
+          if (!current || createStorageRevision(current) !== createStorageRevision(set.expectedEffectiveModel ?? null)) throw new Error('当前继承模型已改变；没有固定旧模型，请重新读取。');
+          if (operation === 'reset') {
+            if (before.profile && (!before.profile.inheritModel || inheritThinkingToChildren)) {
+              const { thinkingOverride: _removed, ...kept } = before.profile;
+              profile = { ...kept, ...current };
+            }
+          } else {
+            if (set.thinkingOverride == null) throw new Error('思维修改缺少参数；恢复默认请用 reset。');
+            profile = {
+              ...(before.profile ?? { id: scopeRecordId('model-profile', scope), name: '会话思维覆盖', inheritModel: true }),
+              ...current,
+              ...(inheritThinkingToChildren ? { inheritThinkingToChildren: true } : {}),
+              thinkingOverride: set.thinkingOverride
+            };
+          }
+        } else if (operation === 'inherit') {
+          if (scope.scopeKind !== 'conversation') throw new Error('子继承仅限当前对话。');
+          const current = await effective?.();
+          if (!current || createStorageRevision(current) !== createStorageRevision(set.expectedEffectiveModel ?? null)) throw new Error('当前继承模型已改变；没有固定旧模型，请重新读取。');
+          profile = {
+            ...(before.profile ?? { id: scopeRecordId('model-profile', scope), name: '会话思维覆盖', inheritModel: true }),
+            ...current,
+            inheritThinkingToChildren: inheritThinkingToChildren === true
+          };
+          if (before.profile && (before.profile.providerConfigId !== current.providerConfigId
+            || before.profile.provider !== current.provider || before.profile.model !== current.model)) {
+            delete profile.thinkingOverride;
+          }
+        } else {
+          profile = {
+            id: before.profile?.id ?? scopeRecordId('model-profile', scope),
+            name: set.name?.trim() || before.profile?.name || 'LLM 配置',
+            providerConfigId: set.providerConfigId,
+            provider: set.provider,
+            model: requireId(set.model, 'model'),
+            ...(inheritThinkingToChildren ? { inheritThinkingToChildren: true } : {})
+          };
+        }
+      }
+      if (profile?.thinkingOverride) {
+        const providers = await loadLlmProviderConfigsSettings(capture.paths);
+        const provider = providers.settings.configs.find(item => item.id === profile!.providerConfigId);
+        if (!provider || provider.provider !== profile.provider || !(provider.model === profile.model || provider.models.some(item => item.id === profile!.model))) throw new Error('思维覆盖模型已改变。');
+        const modelConfig = provider.modelConfigs.find(item => item.modelId === profile!.model);
+        const body = modelConfig ? modelConfig.requestBody : provider.requestBody;
+        if (hasThinkingBodyConflict(provider.provider, body)) throw new Error('自定义请求体与本次思维修改冲突；未改变已保存配置。');
+        profile.thinkingOverride = validateSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, modelConfig ? modelConfig.generationConfig : provider.generationConfig, body);
+      }
+      guard();
+      if (profile) {
+        const next = profile;
+        await this.setScoped(modelProfileStore(capture.paths), modelProfileLinkStore(capture.paths), scope, link => link.modelProfileId,
+          () => next, (existing, recordId, now) => ({ id: existing?.id ?? scopeLinkId('model-profile', scope), ...scope, modelProfileId: recordId, role: 'active' as const, createdAt: existing?.createdAt ?? now, updatedAt: now }), guard);
+      } else {
+        await this.clearScoped(modelProfileStore(capture.paths), modelProfileLinkStore(capture.paths), scope, link => link.modelProfileId, guard);
+      }
+      const result = await this.modelProfileObservation(capture, scope, effective, { operation, expectedRevision: before.revision });
+      guard();
+      return result;
+    });
+  }
 
   public createAgent(payload: AgentCreatePayload): Promise<AgentRecord> {
     return this.mutate(async (paths) => {
@@ -274,7 +433,22 @@ export class VscodeConfigurationMutations {
   public setModelProfile(payload: ModelProfileScopeSetPayload): Promise<void> {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
     const model = requireId(payload.model, 'model');
-    return this.mutate((paths) => this.setScoped(
+    if (payload.inheritThinkingToChildren !== undefined && scope.scopeKind !== 'conversation') {
+      throw new Error('子继承仅限当前对话。');
+    }
+    return this.mutate(async (paths) => {
+      let thinkingOverride: SessionThinkingOverride | undefined;
+      if (payload.thinkingOverride != null) {
+        if (scope.scopeKind !== 'conversation') throw new Error('思维覆盖仅限当前对话。');
+        const providers = await loadLlmProviderConfigsSettings(paths);
+        const provider = providers.settings.configs.find((item) => item.id === payload.providerConfigId);
+        if (!provider || provider.provider !== payload.provider || !(provider.model === model || provider.models.some((item) => item.id === model))) throw new Error('思维覆盖的渠道或模型不存在。');
+        const modelConfig = provider.modelConfigs.find((item) => item.modelId === model);
+        if (hasThinkingBodyConflict(provider.provider, modelConfig ? modelConfig.requestBody : provider.requestBody)) throw new Error('自定义请求体控制思维或输出参数；请先在渠道设置中解除冲突。');
+        const generation = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
+        thinkingOverride = validateSessionThinkingOverride(payload.thinkingOverride, provider.provider, model, generation, modelConfig ? modelConfig.requestBody : provider.requestBody);
+      }
+      return this.setScoped(
       modelProfileStore(paths),
       modelProfileLinkStore(paths),
       scope,
@@ -286,7 +460,12 @@ export class VscodeConfigurationMutations {
           ? { providerConfigId: normalizedOptionalText(payload.providerConfigId) }
           : existing?.providerConfigId ? { providerConfigId: existing.providerConfigId } : {}),
         ...(payload.provider ? { provider: payload.provider } : existing?.provider ? { provider: existing.provider } : {}),
-        model
+        model,
+        ...(thinkingOverride ? { thinkingOverride } : {}),
+         ...(scope.scopeKind === 'conversation'
+           && (payload.inheritThinkingToChildren ?? existing?.inheritThinkingToChildren)
+           ? { inheritThinkingToChildren: true }
+           : {})
       }),
       (existing, recordId, now) => ({
         id: existing?.id ?? scopeLinkId('model-profile', scope),
@@ -296,7 +475,8 @@ export class VscodeConfigurationMutations {
         createdAt: existing?.createdAt ?? now,
         updatedAt: now
       })
-    ));
+    );
+    });
   }
 
   /**
@@ -308,6 +488,7 @@ export class VscodeConfigurationMutations {
     providerConfigId?: string;
     provider?: ModelProfileScopeSetPayload['provider'];
     model: string;
+    thinkingOverride?: SessionThinkingOverride;
   }): Promise<{ created: boolean }> {
     const scope = normalizeScope('conversation', input.conversationId);
     const model = requireId(input.model, 'model');
@@ -329,12 +510,32 @@ export class VscodeConfigurationMutations {
 
       const now = Date.now();
       const providerConfigId = normalizedOptionalText(input.providerConfigId);
+       let thinkingOverride: SessionThinkingOverride | undefined;
+       if (input.thinkingOverride) {
+         const providers = await loadLlmProviderConfigsSettings(paths);
+         const provider = providers.settings.configs.find((item) => item.id === providerConfigId);
+         if (!provider || provider.provider !== input.provider || !(provider.model === model || provider.models.some((item) => item.id === model))) {
+           throw new Error('子会话思维覆盖的渠道或模型不存在。');
+         }
+         const modelConfig = provider.modelConfigs.find((item) => item.modelId === model);
+         const body = modelConfig ? modelConfig.requestBody : provider.requestBody;
+         thinkingOverride = compatibleChildThinkingOverride(
+           input.thinkingOverride,
+           provider.provider,
+           model,
+           modelConfig ? modelConfig.generationConfig : provider.generationConfig,
+           body
+         );
+       }
+
       const record: ModelProfileRecord = {
         id: scopeRecordId(recordStore.idPrefix, scope),
         name: '子对话继承 LLM',
         ...(providerConfigId ? { providerConfigId } : {}),
         ...(input.provider ? { provider: input.provider } : {}),
-        model
+        model,
+        ...(thinkingOverride ? { thinkingOverride } : {}),
+
       };
       const link: ModelProfileScopeLinkRecord = {
         id: scopeLinkId('model-profile', scope),
@@ -793,7 +994,8 @@ export class VscodeConfigurationMutations {
     scope: ScopeRef,
     linkedRecordId: (link: TLink) => string,
     buildRecord: (existing: TRecord | undefined, id: string, now: number) => TRecord,
-    buildLink: (existing: TLink | undefined, recordId: string, now: number) => TLink
+    buildLink: (existing: TLink | undefined, recordId: string, now: number) => TLink,
+    guard: () => void = () => undefined
   ): Promise<void> {
     const [records, links] = await Promise.all([loadStore(recordStore), loadStore(linkStore)]);
     const matching = links.filter((link) => scopeMatches(link, scope));
@@ -802,8 +1004,10 @@ export class VscodeConfigurationMutations {
     const existingRecord = records.find((record) => record.id === recordId);
     const now = Date.now();
     const record = buildRecord(existingRecord, recordId, now);
+    guard();
     await saveStore(recordStore, upsert(records, record));
     const link = buildLink(existingLink, record.id, now);
+    guard();
     await saveStore(linkStore, upsert(links.filter((candidate) => !scopeMatches(candidate, scope)), link));
   }
 
@@ -816,15 +1020,18 @@ export class VscodeConfigurationMutations {
     recordStore: StoreSpec<TRecord, TRecordKey>,
     linkStore: StoreSpec<TLink, TLinkKey>,
     scope: ScopeRef,
-    linkedRecordId: (link: TLink) => string
+    linkedRecordId: (link: TLink) => string,
+    guard: () => void = () => undefined
   ): Promise<void> {
     const [records, links] = await Promise.all([loadStore(recordStore), loadStore(linkStore)]);
     const removed = links.filter((link) => scopeMatches(link, scope));
     if (removed.length === 0) return;
     const nextLinks = links.filter((link) => !scopeMatches(link, scope));
+    guard();
     await saveStore(linkStore, nextLinks);
     const stillReferenced = new Set(nextLinks.map(linkedRecordId));
     const removedRecordIds = new Set(removed.map(linkedRecordId));
+    guard();
     await saveStore(recordStore, records.filter((record) => !removedRecordIds.has(record.id) || stillReferenced.has(record.id)));
   }
 

@@ -67,6 +67,12 @@ jobs:
       - name: Run tracked critical tests
         run: npm run test:ci:linux
 
+      - name: Install browser for chat regression
+        run: npx playwright install --with-deps chromium
+
+      - name: Check built chat interaction
+        run: npm run test:browser
+
   windows-runtime-tests:
     name: Windows runtime compatibility tests
     runs-on: windows-latest

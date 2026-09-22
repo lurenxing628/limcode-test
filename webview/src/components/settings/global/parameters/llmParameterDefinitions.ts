@@ -1,3 +1,4 @@
+import { THINKING_LEVEL_OPTIONS } from '@shared/llmThinkingLevels';
 import type { LlmProviderKind, LlmReasoningMode, LlmThinkingLevel } from '@shared/protocol';
 import { geminiThinkingCapabilityForModel } from '@shared/geminiThinking';
 
@@ -34,45 +35,7 @@ const REASONING_MODE_OPTIONS = [
   { value: 'standard', label: '标准' },
   { value: 'pro', label: '专业' }
 ] as const satisfies readonly { value: LlmReasoningMode; label: string }[];
-const THINKING_LEVEL_OPTIONS: Record<LlmProviderKind, readonly { value: LlmThinkingLevel; label: string; description?: string }[]> = {
-  gemini: [
-    { value: 'minimal', label: '最低' },
-    { value: 'low', label: '低' },
-    { value: 'medium', label: '中' },
-    { value: 'high', label: '高' }
-  ],
-  claude: [
-    { value: 'none', label: '关闭', description: '关闭思考' },
-    { value: 'low', label: '低' },
-    { value: 'medium', label: '中' },
-    { value: 'high', label: '高' },
-    { value: 'xhigh', label: '极高' },
-    { value: 'max', label: '最高' }
-  ],
-  'openai-compatible': [
-    { value: 'none', label: '关闭', description: '关闭推理强度' },
-    { value: 'minimal', label: '最低' },
-    { value: 'low', label: '低' },
-    { value: 'medium', label: '中' },
-    { value: 'high', label: '高' },
-    { value: 'xhigh', label: '极高' },
-    { value: 'max', label: '最高' }
-  ],
-  'openai-responses': [
-    { value: 'none', label: '关闭', description: '关闭推理强度' },
-    { value: 'minimal', label: '最低' },
-    { value: 'low', label: '低' },
-    { value: 'medium', label: '中' },
-    { value: 'high', label: '高' },
-    { value: 'xhigh', label: '极高' },
-    { value: 'max', label: '最高' }
-  ],
-  deepseek: [
-    { value: 'none', label: '关闭', description: '关闭思考' },
-    { value: 'high', label: '高', description: '启用思考' },
-    { value: 'max', label: '最高', description: '最大思考强度' }
-  ]
-};
+
 
 const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, ProviderParameterDisplay>> = {
   gemini: {

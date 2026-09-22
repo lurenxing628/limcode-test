@@ -1,0 +1,220 @@
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const test = require('node:test');
+const vm = require('node:vm');
+const ts = require('typescript');
+const vue = require('vue');
+const { parse, compileScript } = require('@vue/compiler-sfc');
+const { baseParse } = require('@vue/compiler-dom');
+
+const composerPath = 'webview/src/components/input/Composer.vue';
+const controlPath = 'webview/src/components/input/SessionThinkingControl.vue';
+function elements(node) { return [...(node.type === 1 ? [node] : []), ...(node.children ?? []).flatMap(elements)]; }
+function templateElements(path) { return elements(baseParse(parse(fs.readFileSync(path, 'utf8')).descriptor.template.content)); }
+function attribute(node, name) { return node.props.find(prop => prop.type === 6 && prop.name === name)?.value?.content; }
+
+// Execute the actual component script and shared capability helpers without compiled dist artifacts.
+function fixture(overrides = {}) {
+  const writes = [], reads = [];
+  const state = vue.reactive({ thinking: undefined, inherit: false, pending: undefined, error: '', ...overrides.state });
+  const store = {
+    thinkingFor: () => state.thinking,
+    childThinkingInheritanceFor: () => state.inherit,
+    pendingFor: () => state.pending,
+    errorFor: () => state.error,
+    confirmedFor: () => state.observation,
+    readingFor: () => false,
+    setThinkingForScope: (...args) => writes.push(['thinking', ...args]),
+    setChildThinkingInheritance: (...args) => writes.push(['inherit', ...args]),
+    retryPending: (...args) => reads.push(['retry', ...args]),
+    refreshScope: (...args) => reads.push(['refresh', ...args])
+  };
+  const props = vue.reactive({ conversationId: 'a', model: 'o3', config: { id: 'channel', provider: 'openai-compatible', model: 'o3', modelConfigs: [] }, ...overrides.props });
+  const dropdown = { props: ['modelValue', 'options', 'disabled'], emits: ['update:modelValue'], setup: (props, { emit }) => () => vue.h('select', { value: props.modelValue, disabled: props.disabled, onChange: event => emit('update:modelValue', event.target.value) }, props.options.map(option => vue.h('option', { value: option.value }, option.label))) };
+  function load(path, component = false) {
+    let source = fs.readFileSync(path, 'utf8');
+    if (component === 'render') source = compileScript(parse(source).descriptor, { id: 'thinking-test', inlineTemplate: true }).content;
+    else if (component) source = parse(source).descriptor.scriptSetup.content + '\nexport { options, selected, defaultLabel, inheritChildren, disabled, error, save, setInheritance, retry };';
+    const module = { exports: {} };
+    vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, {
+      module, exports: module.exports, defineProps: () => props,
+      require(name) {
+        if (name === 'vue') return vue;
+        if (name === '@webview/stores/useModelProfileStore') return { useModelProfileStore: () => store };
+        if (name.endsWith('/LcCheckbox.vue')) return load('webview/src/components/ui/LcCheckbox.vue', 'render');
+        if (name.endsWith('.vue')) return { default: dropdown };
+        if (name.startsWith('@shared/')) return load('shared/' + name.slice(8) + '.ts');
+        if (name.startsWith('./')) return load('shared/' + name.slice(2) + '.ts');
+        throw new Error(`Unexpected dependency ${name}`);
+      }
+    });
+    return module.exports;
+  }
+  return { control: load(controlPath, true), component: () => load(controlPath, 'render').default, props, state, writes, reads };
+}
+const plain = value => JSON.parse(JSON.stringify(value));
+
+test('Composer renders one thinking control beside model/workspace selectors, without a save operation bar', () => {
+  const source = fs.readFileSync(composerPath, 'utf8');
+  const nodes = templateElements(composerPath);
+  const controls = nodes.filter(node => node.tag === 'SessionThinkingControl');
+  assert.equal(controls.length, 1);
+  assert.doesNotMatch(source, /ModelProfileSaveStatus/);
+  const row = nodes.find(node => attribute(node, 'class')?.split(' ').includes('composer-meta'));
+  assert.ok(elements(row).includes(controls[0]));
+  assert.match(source, /activateScope\('conversation', conversationId\)/);
+  assert.match(source, /:model="confirmedEffectiveModel\?\.model/);
+});
+
+test('Thinking UI has only one dropdown, one child-inheritance checkbox and an inline retry', () => {
+  const nodes = templateElements(controlPath);
+  assert.equal(nodes.filter(node => node.tag === 'SettingsDropdown' || node.tag === 'select').length, 1);
+  assert.equal(nodes.filter(node => node.tag === 'input').length, 0);
+  assert.equal(nodes.filter(node => node.tag === 'LcCheckbox').length, 1, 'use the shared accessible checkbox');
+  const source = fs.readFileSync(controlPath, 'utf8');
+  assert.match(source, /子继承/);
+  assert.match(source, /重试/);
+  assert.doesNotMatch(source, /ModelProfileSaveStatus|应用|放弃草稿|重新接入/);
+});
+
+test('Default label shows the actual inherited value and distinguishes service defaults', () => {
+  const f = fixture();
+  assert.equal(f.control.defaultLabel.value, '默认 · 服务默认');
+  assert.equal(f.control.selected.value, 'default');
+  f.props.config.generationConfig = { thinkingConfig: { thinkingLevel: 'high' } };
+  assert.equal(f.control.defaultLabel.value, '默认 · high');
+  f.props.config.modelConfigs = [{ modelId: 'o3', generationConfig: {} }];
+  assert.equal(f.control.defaultLabel.value, '默认 · 服务默认', 'model config replaces channel defaults');
+});
+
+test('Budget defaults remain visible; unsupported model shortcuts remain disabled', () => {
+  const f = fixture({ props: { model: 'gemini-2.5-flash', config: { id: 'gemini', provider: 'gemini', modelConfigs: [], generationConfig: { thinkingConfig: { thinkingBudget: 1024 } } } } });
+  assert.equal(f.control.defaultLabel.value, '默认 · 1024 tokens');
+  assert.ok(f.control.options.value.some(option => option.value === '2048'));
+  for (const model of ['gemini-2.0-flash', 'unknown-relay']) {
+    f.props.model = model;
+    assert.equal(f.control.defaultLabel.value, '默认 · 不支持（不发送）');
+    assert.equal(f.control.disabled.value, true);
+    assert.deepEqual(plain(f.control.options.value), [{ value: 'default', label: '默认 · 不支持（不发送）' }]);
+  }
+});
+
+test('Dropdown saves immediately, default resets, child checkbox reads and writes explicit boolean', () => {
+  const f = fixture();
+  assert.equal(f.control.inheritChildren.value, false);
+  f.control.save('high');
+  assert.deepEqual(plain(f.writes[0]), ['thinking', 'a', { providerConfigId: 'channel', provider: 'openai-compatible', model: 'o3' }, { kind: 'openai-effort', value: 'high' }]);
+  f.control.save('default');
+  assert.equal(f.writes[1][3], null);
+  f.state.inherit = true;
+  assert.equal(f.control.inheritChildren.value, true);
+  f.control.setInheritance(false);
+  assert.deepEqual(plain(f.writes[2]), ['inherit', 'a', { providerConfigId: 'channel', provider: 'openai-compatible', model: 'o3' }, false]);
+  f.props.conversationId = 'b';
+  f.control.setInheritance(true);
+  assert.equal(f.writes[3][1], 'b');
+  assert.equal(f.writes[3][3], true);
+});
+
+test('Errors retain the repair reason; explicit read retry renews the editing session', () => {
+  const f = fixture({ state: { pending: { status: 'uncertain', error: 'authority/root internals long error' } } });
+  assert.equal(f.control.error.value, 'authority/root internals long error');
+  f.control.retry();
+  assert.deepEqual(f.reads, [['retry', 'conversation', 'a']]);
+  f.state.pending = undefined;
+  f.state.error = 'internal read error';
+  assert.equal(f.control.error.value, 'internal read error');
+  f.control.retry();
+  assert.deepEqual(plain(f.reads[1]), ['refresh', 'conversation', 'a', { adoptRoot: true }]);
+});
+
+// Minimal host renderer mounts the real SFC template; no browser/VS Code visual claims.
+function mountControl(component, props) {
+  const node = (type, text = '') => ({ type, text, props: {}, children: [] });
+  const renderer = vue.createRenderer({
+    createElement: node, createText: text => node('#text', text), createComment: text => node('#comment', text),
+    setText: (item, text) => { item.text = text; }, setElementText: (item, text) => { item.text = text; item.children = []; },
+    patchProp: (item, key, _previous, next) => { item.props[key] = next; },
+    insert(item, parent, anchor) { item.parent = parent; const index = parent.children.indexOf(anchor); parent.children.splice(index < 0 ? parent.children.length : index, 0, item); },
+    remove(item) { item.parent.children.splice(item.parent.children.indexOf(item), 1); },
+    parentNode: item => item.parent, nextSibling: () => null
+  });
+  const root = node('root');
+  const app = renderer.createApp({ setup: () => () => vue.h(component, props) });
+  app.mount(root);
+  const all = item => [item, ...item.children.flatMap(all)];
+  return { find: type => all(root).filter(item => item.type === type), dispose: () => app.unmount() };
+}
+
+test('Mounted template binds dropdown change and checkbox checked/change to the current scope', async () => {
+  const f = fixture();
+  const mounted = mountControl(f.component(), f.props);
+  try {
+    assert.equal(mounted.find('select').length, 1);
+    assert.equal(mounted.find('button').find(item => item.props.role === 'checkbox').props['aria-checked'], false);
+    mounted.find('select')[0].props.onChange({ target: { value: 'high' } });
+    assert.equal(f.writes[0][3].value, 'high');
+    mounted.find('button').find(item => item.props.role === 'checkbox').props.onClick();
+    assert.equal(f.writes[1][3], true);
+    f.state.inherit = true;
+    await vue.nextTick();
+    assert.equal(mounted.find('button').find(item => item.props.role === 'checkbox').props['aria-checked'], true);
+    f.props.model = 'gpt-4o';
+    await vue.nextTick();
+    assert.equal(mounted.find('select')[0].props.disabled, true);
+    assert.equal(mounted.find('option')[0].text, '默认 · 服务默认');
+  } finally { mounted.dispose(); }
+});
+
+function composerSubmission() {
+  const source = parse(fs.readFileSync(composerPath, 'utf8')).descriptor.scriptSetup.content;
+  const ast = ts.createSourceFile('Composer.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const names = ['savingSessionSelections', 'savingSessionSelection', 'conversationInputDisabled'];
+  const parts = ast.statements.filter(statement => ts.isFunctionDeclaration(statement) ? statement.name?.text === 'submit'
+    : ts.isVariableStatement(statement) && statement.declarationList.declarations.some(item => names.includes(item.name.getText(ast))));
+  const code = parts.map(part => part.getText(ast)).join('\n') + '\nmodule.exports = { submit };';
+  const module = { exports: {} }, sent = [], clientState = vue.reactive({ currentConversationId: 'a' });
+  let release, reject;
+  const waiting = new Promise((resolve, fail) => { release = resolve; reject = fail; });
+  const draft = vue.ref('message');
+  vm.runInNewContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, {
+    module, computed: vue.computed, ref: vue.ref, clientState, props: { disabled: false }, draft,
+    modelProfileStore: { awaitSavedForScope: (_kind, id) => id === 'a' ? waiting : Promise.resolve() },
+    currentSubmissionCommandId: vue.ref(), currentSteeringSubmitting: vue.ref(false), selectedAttachments: vue.ref([]),
+    buildMessageContent: text => ({ text }), ui: { isEditing: false }, nativeSteeringAvailable: vue.ref(false),
+    currentTurnAuthoritySelection: () => ({}), sendMessage: text => { sent.push({ id: clientState.currentConversationId, text }); }
+  });
+  return { ...module.exports, sent, release, reject, clientState, draft };
+}
+
+test('Composer waits for saved settings and never sends into a newly navigated conversation', async () => {
+  const f = composerSubmission();
+  const sending = f.submit();
+  assert.equal(f.sent.length, 0);
+  f.clientState.currentConversationId = 'b';
+  await f.submit();
+  assert.deepEqual(f.sent, [{ id: 'b', text: 'message' }]);
+  f.release();
+  await sending;
+  assert.equal(f.sent.length, 1);
+});
+
+test('Composer save rejection does not send with old thinking settings', async () => {
+  const f = composerSubmission();
+  const sending = f.submit();
+  assert.equal(f.sent.length, 0);
+  f.reject(new Error('save failed'));
+  await sending;
+  assert.equal(f.sent.length, 0);
+});
+
+test('Stale effort from a different model never produces a missing dropdown selection', () => {
+  const f = fixture({ state: { thinking: { kind: 'openai-effort', value: 'minimal' } } });
+  assert.equal(f.control.selected.value, 'default', 'o3 does not expose the previous GPT-5 minimal option');
+  f.control.save('minimal');
+  assert.equal(f.writes.length, 0);
+});
+
+

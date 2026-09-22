@@ -1,8 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import { readProcessStartFingerprint } from './processProtocol';
 
 export type RecordedProcessState = 'alive' | 'dead' | 'unknown';
+
+const WINDOWS_CLAIM_RENAME_ATTEMPTS = 100;
+const WINDOWS_CLAIM_RENAME_DELAY_MS = 10;
+const RETRYABLE_WINDOWS_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 
 /**
  * Classifies a recorded peer process without any timeout-based judgement. Only ESRCH or a
@@ -80,14 +85,18 @@ export async function tryPublishClaimRecord(
       serializedRecord,
       { encoding: 'utf8', mode: 0o600, flag: 'wx' }
     );
-    await fs.rename(candidatePath, claimPath);
+    await publishClaimCandidate(candidatePath, claimPath);
     published = true;
     return true;
   } catch (error) {
     if (await isClaimContention(error, claimPath)) return false;
     throw error;
   } finally {
-    if (!published) await fs.rm(candidatePath, { recursive: true, force: true });
+    if (!published) {
+      // The candidate is uniquely named and never authoritative. Cleanup must not replace the
+      // publication error or turn ordinary contention into a Runtime-open failure.
+      await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -143,14 +152,18 @@ export async function isolateDeadClaimRecord<T extends { ownerToken: string }>(
   parse: (value: unknown) => T | undefined,
   invalid: (cause?: unknown) => Error
 ): Promise<void> {
-  const current = await readClaimRecord(claimPath, recordFileName, parse, invalid);
-  if (!current || current.ownerToken !== ownerToken) return;
   const isolatedPath = claimGenerationPath(claimPath, `dead-${ownerToken}`);
-  try {
-    await fs.rename(claimPath, isolatedPath);
-  } catch (error) {
-    if (isMissingError(error) || isAlreadyExistsError(error)) return;
-    throw error;
+  for (let attempt = 1; ; attempt += 1) {
+    const current = await readClaimRecord(claimPath, recordFileName, parse, invalid);
+    if (!current || current.ownerToken !== ownerToken) return;
+    try {
+      await fs.rename(claimPath, isolatedPath);
+      break;
+    } catch (error) {
+      if (isMissingError(error) || isAlreadyExistsError(error)) return;
+      if (!shouldRetryClaimRename(error, claimPath, isolatedPath, attempt)) throw error;
+      await delay(WINDOWS_CLAIM_RENAME_DELAY_MS);
+    }
   }
   const moved = await readClaimRecord(isolatedPath, recordFileName, parse, invalid).catch(() => undefined);
   if (!moved || moved.ownerToken !== ownerToken) {
@@ -174,12 +187,63 @@ export async function releaseClaimRecord<T extends { ownerToken: string }>(
   invalid: (cause?: unknown) => Error,
   mismatch: () => Error
 ): Promise<void> {
-  const current = await readClaimRecord(claimPath, recordFileName, parse, invalid);
-  if (!current) return;
-  if (current.ownerToken !== ownerToken) throw mismatch();
   const releasedPath = claimGenerationPath(claimPath, `released-${ownerToken}`);
-  await fs.rename(claimPath, releasedPath);
-  await fs.rm(releasedPath, { recursive: true, force: true });
+  for (let attempt = 1; ; attempt += 1) {
+    // Re-read the token before every Windows retry. A transient sharing violation must never let
+    // a stale releaser move a replacement owner that appeared between attempts.
+    const current = await readClaimRecord(claimPath, recordFileName, parse, invalid);
+    if (!current) return;
+    if (current.ownerToken !== ownerToken) throw mismatch();
+    try {
+      await fs.rename(claimPath, releasedPath);
+      break;
+    } catch (error) {
+      if (isMissingError(error)) return;
+      if (!shouldRetryClaimRename(error, claimPath, releasedPath, attempt)) throw error;
+      await delay(WINDOWS_CLAIM_RENAME_DELAY_MS);
+    }
+  }
+  // Once the owner-fenced rename succeeds, the canonical claim is free and the uniquely named
+  // released generation has no authority. Antivirus/indexer interference with its deletion may
+  // leave harmless debris, but must not fail the operation that already released the mutex.
+  await fs.rm(releasedPath, {
+    recursive: true,
+    force: true,
+    maxRetries: 3,
+    retryDelay: WINDOWS_CLAIM_RENAME_DELAY_MS
+  }).catch(() => undefined);
+}
+
+async function publishClaimCandidate(candidatePath: string, claimPath: string): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await fs.rename(candidatePath, claimPath);
+      return;
+    } catch (error) {
+      if (!shouldRetryClaimRename(error, candidatePath, claimPath, attempt)) throw error;
+      await delay(WINDOWS_CLAIM_RENAME_DELAY_MS);
+    }
+  }
+}
+
+function shouldRetryClaimRename(
+  error: unknown,
+  sourcePath: string,
+  destinationPath: string,
+  attempt: number
+): boolean {
+  if (attempt >= WINDOWS_CLAIM_RENAME_ATTEMPTS || process.platform !== 'win32') return false;
+  const candidate = error as NodeJS.ErrnoException & { dest?: unknown };
+  return RETRYABLE_WINDOWS_RENAME_CODES.has(String(candidate.code))
+    && candidate.syscall === 'rename'
+    && typeof candidate.path === 'string'
+    && typeof candidate.dest === 'string'
+    && sameWindowsPath(candidate.path, sourcePath)
+    && sameWindowsPath(candidate.dest, destinationPath);
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
 }
 
 export function delay(milliseconds: number): Promise<void> {

@@ -1,3 +1,6 @@
+﻿import { ModelProfileMutationCompletions, modelProfileCompletionKey } from './ModelProfileMutationCompletions';
+import type { ModelProfileScopeReadPayload, ModelProfileScopeSetPayload, ModelProfileScopeSnapshotPayload } from '../../../shared/protocol';
+
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -66,6 +69,8 @@ export interface VscodeReliableKernelCommandRouterOptions {
 
 /** Normal Webview command route for reliable Runtime mutations. Bounded Feed remains the only data route. */
 export class VscodeReliableKernelCommandRouter {
+  private readonly modelProfileSessions = new Map<string, { id: string; inFlight: number }>();
+  private readonly modelProfileCompletions = new ModelProfileMutationCompletions();
   private configurationMutationQueue: Promise<void> = Promise.resolve();
   private readonly clientIdByWebview = new WeakMap<vscode.Webview, string>();
   private readonly settingsSaveBarrier = new GlobalSettingsSaveBarrier();
@@ -90,6 +95,10 @@ export class VscodeReliableKernelCommandRouter {
     message: WebviewToExtensionMessage
   ): void {
     this.clientIdByWebview.set(webview, clientId);
+    if (message.type === BridgeMessageType.ModelProfileScopeSet || message.type === BridgeMessageType.ModelProfileScopeClear || message.type === BridgeMessageType.ModelProfileScopeRead) {
+      this.handleModelProfileScope(clientId, webview, message);
+      return;
+    }
     void this.dispatch(clientId, webview, message).catch((error) => {
       const text = error instanceof Error ? error.message : String(error);
       console.error('[LimCode] Reliable Webview command failed.', message.type, error);
@@ -376,17 +385,10 @@ export class VscodeReliableKernelCommandRouter {
         });
         return;
       }
-      case BridgeMessageType.ModelProfileScopeSet: {
-        const payload = requirePayload(message.payload, 'Model Profile scope set');
-        if (payload.providerConfigId) await this.product.configuration.providerConfig(payload.providerConfigId);
-        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setModelProfile(payload));
-        return;
-      }
-      case BridgeMessageType.ModelProfileScopeClear: {
-        const payload = requirePayload(message.payload, 'Model Profile scope clear');
-        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearModelProfile(payload.scopeKind, payload.scopeId));
-        return;
-      }
+      case BridgeMessageType.ModelProfileScopeSet:
+      case BridgeMessageType.ModelProfileScopeClear:
+      case BridgeMessageType.ModelProfileScopeRead:
+        throw new Error('ModelProfile scope commands must enter the registered observation boundary.');
       case BridgeMessageType.ToolPolicyScopeSet: {
         const payload = requirePayload(message.payload, 'Tool Policy scope set');
         await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setToolPolicy(payload));
@@ -625,6 +627,83 @@ export class VscodeReliableKernelCommandRouter {
         this.postRequestError(webview, message.type, `可靠 Runtime 尚不支持该命令：${message.type}`, message.id);
         return;
     }
+  }
+
+  /** ModelProfile-only observation boundary; register completion before provider preflight or claim. */
+  private handleModelProfileScope(clientId: string, webview: vscode.Webview, message: WebviewToExtensionMessage): void {
+    const input = message.payload as ModelProfileScopeReadPayload & Partial<ModelProfileScopeSetPayload>;
+    let authorityId = input?.authorityId ?? '';
+    let sessionId = input?.sessionId ?? '';
+    const reply = (payload: ModelProfileScopeSnapshotPayload): void => this.post(webview, {
+      id: randomUUID(), type: BridgeMessageType.ModelProfileScopeSnapshot, channel: 'state', correlationId: message.id, payload: { ...payload, sessionId }
+    });
+    const failed = (error: unknown): void => reply({ scopeKind: input?.scopeKind, ...(input?.scopeId ? { scopeId: input.scopeId } : {}), authorityId,
+      sequence: 0, revision: '', profileState: 'unknown', outcome: 'uncertain', error: error instanceof Error ? error.message : String(error) });
+    try {
+      const mutation = this.product.configuration.mutations;
+      const capture = mutation.captureModelProfileRoot(input.authorityId);
+      authorityId = capture.authorityId;
+      const scope = { scopeKind: input.scopeKind, ...(input.scopeId ? { scopeId: input.scopeId } : {}) };
+      const sessionKey = JSON.stringify([clientId, capture.authorityId, scope]);
+      let session = this.modelProfileSessions.get(sessionKey);
+      if (message.type === BridgeMessageType.ModelProfileScopeRead && (input.renewSession || !input.sessionId)) {
+        if (!session) {
+          // Never evict another client/scope's executing read or write. Evicted idle tokens fail
+          // closed; explicit reconnect must re-read under the settings mutation lock.
+          if (this.modelProfileSessions.size >= 256) {
+            const idle = [...this.modelProfileSessions].find(([, entry]) => entry.inFlight === 0);
+            if (idle) this.modelProfileSessions.delete(idle[0]);
+            else throw new Error('ModelProfile 编辑会话容量已满且操作仍在途；结果未确定，请稍后显式重新连接。');
+          }
+          session = { id: randomUUID(), inFlight: 0 };
+          this.modelProfileSessions.set(sessionKey, session);
+        } else if (input.renewSession) session.id = randomUUID();
+        // Ordinary mount/read without a token reuses the session; only explicit renew fences it.
+        sessionId = session.id;
+      } else if (!sessionId || session?.id !== sessionId) {
+        throw new Error('ModelProfile 编辑会话已失效；请显式连接当前配置根，旧草稿不会自动提交。');
+      }
+      const activeSession = session!;
+      const fence = () => {
+        if (this.modelProfileSessions.get(sessionKey)?.id !== sessionId) throw new Error('ModelProfile 编辑会话已更换；旧操作不得继续写入。');
+      };
+      const effective = async () => {
+        if (scope.scopeKind !== 'conversation' || !scope.scopeId) return undefined;
+        const links = await this.list('AgentConversationLink', { conversation_id: scope.scopeId, role: 'default' }, 2);
+        if (links.length !== 1) throw new Error('当前会话没有唯一的有效 Agent。');
+        return this.product.configuration.effectiveConversationModel(scope.scopeId, requireText(links[0].agent_id, 'agentId'));
+      };
+      const key = (requestId: string) => modelProfileCompletionKey(clientId, capture.authorityId, scope.scopeKind, scope.scopeId, requestId);
+      const mutationRequestKey = message.type === BridgeMessageType.ModelProfileScopeRead ? undefined : key(requireText(message.id, 'requestId'));
+      activeSession.inFlight++;
+      if (message.type === BridgeMessageType.ModelProfileScopeRead) {
+        void (async () => {
+          if (input.afterRequestId) await this.modelProfileCompletions.after(key(input.afterRequestId));
+          const result = await mutation.readModelProfileScope(capture, input, effective, fence);
+          reply({ ...result, ...(input.afterRequestId ? { afterRequestId: input.afterRequestId } : {}) });
+        })().catch(failed).finally(() => { activeSession.inFlight--; });
+        return;
+      }
+      const operation = this.modelProfileCompletions.register(mutationRequestKey!, async () => {
+        const work = async () => {
+          if (!input.expectedRevision || !input.authorityId) throw new Error('ModelProfile UI 保存必须带已确认 revision/authority；未执行写入。');
+          if (input.providerConfigId) await this.product.configuration.providerConfig(input.providerConfigId);
+          const write = () => mutation.writeModelProfileScope(capture, input as ModelProfileScopeSetPayload, message.type === BridgeMessageType.ModelProfileScopeClear, effective, fence);
+          return scope.scopeKind === 'conversation' && scope.scopeId ? this.runConversationCommand(scope.scopeId, write) : write();
+        };
+        // Registering above is synchronous. The existing configuration queue now includes preflight.
+        const queued = this.configurationMutationQueue.then(work, work);
+        this.configurationMutationQueue = queued.then(() => undefined, () => undefined);
+        return queued;
+      });
+      void operation.then(result => {
+        reply(result);
+        // The correlated reply is the only save acknowledgement. Peers receive a bounded
+        // scope invalidation, never the writer's session token or a full configuration catalog.
+        this.options.broadcast?.({ id: randomUUID(), type: BridgeMessageType.ModelProfileScopeSnapshot,
+          channel: 'state', payload: result });
+      }, failed).finally(() => { activeSession.inFlight--; });
+    } catch (error) { failed(error); }
   }
 
   private async postConfigurationSnapshot(webview: vscode.Webview, correlationId?: string): Promise<void> {

@@ -1417,9 +1417,10 @@ export function useChat() {
   function currentAuthoritySelection(): TurnAuthoritySelection {
     const conversationId = clientState.currentConversationId;
     const agentId = agentStore.activeAgentForConversation(conversationId)?.id.trim() ?? '';
-    const profile = conversationId
+    const localProfile = conversationId
       ? modelProfileStore.localProfileFor('conversation', conversationId).profile
       : undefined;
+    const profile = localProfile?.inheritModel ? undefined : localProfile;
     // Only a conversation-local selection is an explicit next-Turn override. Falling back to the
     // global dropdown here would hide Agent/Workflow profiles, especially after opening a child
     // conversation whose stable inherited selection has not reached this Webview snapshot yet.

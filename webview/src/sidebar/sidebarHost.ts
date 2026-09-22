@@ -6,6 +6,7 @@ const host = createHostApi();
 export interface SidebarHostState {
   expandedConversationIds: string[];
   favoriteConversationIds: string[];
+  userCollapsedConversationIds: string[];
 }
 
 export function postSidebarMessage(message: SidebarToExtensionMessage): void {
@@ -26,12 +27,13 @@ function readIdList(state: Record<string, unknown>, key: string): string[] {
 export function readSidebarHostState(): SidebarHostState {
   const state = host.getState<unknown>();
   if (!state || typeof state !== 'object' || Array.isArray(state)) {
-    return { expandedConversationIds: [], favoriteConversationIds: [] };
+    return { expandedConversationIds: [], favoriteConversationIds: [], userCollapsedConversationIds: [] };
   }
   const record = state as Record<string, unknown>;
   return {
     expandedConversationIds: readIdList(record, 'expandedConversationIds'),
-    favoriteConversationIds: readIdList(record, 'favoriteConversationIds')
+    favoriteConversationIds: readIdList(record, 'favoriteConversationIds'),
+    userCollapsedConversationIds: readIdList(record, 'userCollapsedConversationIds')
   };
 }
 
@@ -42,6 +44,7 @@ export function getPersistedSidebarHostState(): SidebarHostState {
 export function writeSidebarHostState(state: SidebarHostState): void {
   host.setState<SidebarHostState>({
     expandedConversationIds: [...state.expandedConversationIds],
-    favoriteConversationIds: [...state.favoriteConversationIds]
+    favoriteConversationIds: [...state.favoriteConversationIds],
+    userCollapsedConversationIds: [...state.userCollapsedConversationIds]
   });
 }

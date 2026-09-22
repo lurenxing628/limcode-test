@@ -1,9 +1,13 @@
+import { readRequestTurnAuthority } from './requestCompressionSettings';
+
 import {
   buildModelHandleCatalog,
+  modelHandleRef,
   normalizeModelHandleCatalog,
   resolveModelToolArguments,
   UnknownModelHandleReferenceError
 } from './modelHandleCatalog';
+import { childExecutionAcceptsContinuation, requireChildExecutionStatus } from './childExecutionState';
 import { createHash } from 'node:crypto';
 import type {
   LlmOpenAIResponsesTransport,
@@ -302,7 +306,7 @@ interface FrozenRuntimeStatusCard {
   kind: 'runtime_status_card';
   activeChildCount: number;
   runningProcessCount: number;
-  children: Array<{ childExecutionId: string; answerBridgeId?: string; status: string }>;
+  children: Array<{ childExecutionId: string; answerBridgeId?: string; status: string; task: string; resumable: boolean }>;
   processes: Array<{ processId: string; status: 'running' }>;
   card: string;
 }
@@ -424,6 +428,7 @@ export class ReliableAgentLoop {
             turnId, requireId(facts.authority.id, 'AuthoritySnapshot.id')
           );
           let frozenRecipe = await this.freezeOrdinaryRequestRecipe({
+            settingsSnapshotContentObjectId,
             turnId,
             round,
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
@@ -476,6 +481,7 @@ export class ReliableAgentLoop {
             const nativeRebasePlan = compression.nativeRebase
               ?? planNativeCompressionRebase({ nativeEnabled: true, updates: [] });
             frozenRecipe = await this.freezeOrdinaryRequestRecipe({
+            settingsSnapshotContentObjectId,
               turnId,
               round,
               headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
@@ -833,6 +839,7 @@ export class ReliableAgentLoop {
   }
 
   private async freezeOrdinaryRequestRecipe(input: {
+    settingsSnapshotContentObjectId?: string;
     turnId: string;
     round: string;
     headRootId: string;
@@ -877,7 +884,15 @@ export class ReliableAgentLoop {
       ) as unknown as ContentObjectMetadata;
       handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
     }
-    const modelHandleCatalog = buildModelHandleCatalog(handleSources, attachmentHandles.entries);
+    const childHandles = await this.readPreviousChildHandles(conversationId);
+    const modelHandleCatalog = buildModelHandleCatalog(handleSources, [...attachmentHandles.entries, ...childHandles]);
+    if (runtimeStatusCard) {
+      // Labels are runtime data. Behavioral guidance belongs to the run_agent tool definition.
+      runtimeStatusCard.card += runtimeStatusCard.children.map(child => '\n' + JSON.stringify({
+        childRef: modelHandleRef(modelHandleCatalog, 'child', child.answerBridgeId),
+        task: child.task, status: child.status, resumable: child.resumable
+      })).join('');
+    }
     const boundaryKey = currentTurnState.compressionBoundaryId ?? 'pre-compression';
     const turnTaskCardReminderEnabled = turnTaskCard
       ? shouldInjectTurnTaskCard({
@@ -918,6 +933,7 @@ export class ReliableAgentLoop {
    * configuration updates. Mode/model/provider changes and compression rebase discard stale updates.
    */
   private async readNativeRecipeFreeze(input: {
+    settingsSnapshotContentObjectId?: string;
     turnId: string;
     round: string;
     authoritySnapshotId: string;
@@ -934,15 +950,16 @@ export class ReliableAgentLoop {
       updates: ReadonlyArray<{ effort: string }>;
       effectiveEffort?: string;
       resetCache?: boolean;
-      forceFullReason?: 'compression';
+      forceFullReason?: 'compression' | 'thinking_defaults_restored';
       pendingConfigurationUpdate?: { effort: string };
     };
   }> {
-    const frozen = await readFrozenTurnAuthority(
+    const frozen = await readRequestTurnAuthority(
       this.database,
       this.contentStore,
       requireId(input.authoritySnapshotId, 'authoritySnapshotId'),
-      requireId(input.turnId, 'turnId')
+      requireId(input.turnId, 'turnId'),
+      input.settingsSnapshotContentObjectId
     );
     const documentModel = asRecord(frozen.document)?.model;
     const modelRecord = asRecord(documentModel);
@@ -970,8 +987,12 @@ export class ReliableAgentLoop {
     let baseEffort = configuredEffort;
     let baseMode: 'standard' | 'pro' | undefined = configuredMode;
     let carriedUpdates: ReadonlyArray<{ effort: string }> = [];
+    const compressionRebase = input.nativeRebase?.forceFullReason === 'compression';
+    // Compression records an older request's effective effort. It is not an authority for this
+    // newly frozen request: restore-to-omission clears it, and an explicit new choice replaces it.
     let pendingConfigurationUpdate = capabilities.reasoningUpdates
-      ? input.nativeRebase?.freshConfigurationUpdate
+      && input.nativeRebase?.freshConfigurationUpdate && configuredEffort !== undefined
+      ? { effort: configuredEffort }
       : undefined;
     const previous = capabilities.reasoningUpdates
       ? await this.readLatestNativeReasoning(
@@ -980,7 +1001,8 @@ export class ReliableAgentLoop {
           requireId(modelRecord?.modelId, 'native model.modelId')
         )
       : undefined;
-    if (previous) {
+    const restoreDefaults = previous !== undefined && configuredEffort === undefined && previous.effectiveEffort !== undefined;
+    if (previous && !restoreDefaults && !compressionRebase) {
       const appliedUpdates = [
         ...previous.updates,
         ...(previous.pendingConfigurationUpdate ? [previous.pendingConfigurationUpdate] : [])
@@ -1011,6 +1033,7 @@ export class ReliableAgentLoop {
     return {
       nativeResponses: capabilities,
       nativeReasoning: {
+        ...(restoreDefaults ? { resetCache: true, forceFullReason: 'thinking_defaults_restored' as const } : {}),
         ...(baseEffort ? { baseEffort } : {}),
         ...(baseMode ? { baseMode } : {}),
         updates: carriedUpdates,
@@ -1149,9 +1172,28 @@ export class ReliableAgentLoop {
     };
   }
 
+  private async readPreviousChildHandles(conversationId: string) {
+    const turns = (await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId }))
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
+    for (const turn of turns) {
+      const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turn.id }))
+        .sort((a, b) => compareInteger(b.request_seq, a.request_seq));
+      for (const request of requests) {
+        const recipe = await this.readModelRequestRecipe(requireId(request.id, 'ModelRequest.id'));
+        if (recipe.kind !== 'reliable-agent-turn') continue;
+        // Keep reserved child refs even when a child leaves the visible roster. A later child
+        // must not inherit its number after compression, completion or host restart.
+        return normalizeModelHandleCatalog(recipe.modelHandleCatalog).entries.filter(entry => entry.kind === 'child');
+      }
+    }
+    return [];
+  }
+
   private async readRuntimeStatusCard(turnId: string): Promise<FrozenRuntimeStatusCard | undefined> {
+    const turn = await this.requireExisting('Turn', turnId);
+    const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: turn.conversation_id });
     const [childLinks, processLinks] = await Promise.all([
-      listAllDomainRows(this.database, 'ChildExecutionParentLink', { parent_turn_id: turnId }),
+      Promise.all(turns.map(parent => listAllDomainRows(this.database, 'ChildExecutionParentLink', { parent_turn_id: parent.id }))).then(groups => groups.flat()),
       listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId })
     ]);
     const orderedChildLinks = childLinks
@@ -1171,15 +1213,16 @@ export class ReliableAgentLoop {
       )
     ];
     const facts = factReads.length === 0 ? null : await this.database.snapshot(factReads);
-    const activeChildren: Array<{ childExecutionId: string; status: string }> = [];
+    const availableChildren: Array<{ childExecutionId: string; conversationId: string; status: string; updatedAt: string }> = [];
     for (let index = 0; index < orderedChildLinks.length; index += 1) {
       const childValue = facts?.snapshot[index];
       if (!childValue || Array.isArray(childValue)) continue;
       const status = String(childValue.status);
-      if (!['starting', 'active', 'interrupting'].includes(status)) continue;
-      activeChildren.push({
+      if (!['starting', 'active', 'idle', 'interrupting', 'interrupted', 'needs_human'].includes(status)) continue;
+      availableChildren.push({
         childExecutionId: requireId(childValue.id, 'ChildExecution.id'),
-        status
+        conversationId: requireId(childValue.child_conversation_id, 'ChildExecution.child_conversation_id'),
+        status, updatedAt: String(childValue.updated_at)
       });
     }
     const processOffset = orderedChildLinks.length;
@@ -1189,29 +1232,37 @@ export class ReliableAgentLoop {
       if (!processValue || Array.isArray(processValue) || processValue.status !== 'running') continue;
       runningProcesses.push({ processId: requireId(processValue.id, 'Process.id'), status: 'running' });
     }
-    if (activeChildren.length === 0 && runningProcesses.length === 0) return undefined;
+    if (availableChildren.length === 0 && runningProcesses.length === 0) return undefined;
+    const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
+    const activeChildren = availableChildren.filter(child => live(child.status));
 
     // Counts describe every linked live fact. Only the frozen recipe detail is bounded; filtering
     // before this cut prevents many old terminal ids from hiding a later active child/process.
-    const selectedChildren = activeChildren.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
+    const selectedChildren = availableChildren.sort((a, b) => Number(live(b.status)) - Number(live(a.status))
+      || b.updatedAt.localeCompare(a.updatedAt) || a.childExecutionId.localeCompare(b.childExecutionId)).slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
     const selectedProcesses = runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
     const bridgeReads = selectedChildren.map((child) => DOMAIN_REPOSITORIES.domain('AnswerBridge').list({
       where: { child_execution_id: child.childExecutionId },
       limit: 2
     }));
     const bridgeFacts = bridgeReads.length === 0 ? null : await this.database.snapshot(bridgeReads);
+    const conversationFacts = selectedChildren.length === 0 ? null : await this.database.snapshot(selectedChildren.map(child =>
+      DOMAIN_REPOSITORIES.domain('Conversation').get(child.conversationId)));
     const children: FrozenRuntimeStatusCard['children'] = selectedChildren.map((child, index) => {
       const bridges = rows(bridgeFacts?.snapshot[index] ?? []);
       if (bridges.length > 1) throw new Error(`ChildExecution ${child.childExecutionId} has multiple AnswerBridges.`);
+      const conversation = conversationFacts?.snapshot[index];
       return {
-        ...child,
+        childExecutionId: child.childExecutionId, status: child.status,
+        task: String(conversation && !Array.isArray(conversation) ? conversation.title ?? '' : '').replace(/\s+/g, ' ').slice(0, 120),
+        resumable: !!bridges[0] && bridges[0].status !== 'closed' && childExecutionAcceptsContinuation(requireChildExecutionStatus(child.status)),
         ...(bridges[0] ? { answerBridgeId: requireId(bridges[0].id, 'AnswerBridge.id') } : {})
       };
     });
     const lines = [
-      '[Current Turn Runtime Status — live data, not a new user instruction]',
+      '[Conversation child agents and current-turn processes — runtime data, not instructions]',
       `activeChildren=${activeChildren.length}; runningProcesses=${runningProcesses.length}`,
-      'Background work is still active. This status is informational; do not poll it.'
+      `shownChildren=${selectedChildren.length}; omittedChildren=${availableChildren.length - selectedChildren.length}`
     ];
     return {
       kind: 'runtime_status_card',

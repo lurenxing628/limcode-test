@@ -136,6 +136,112 @@ export async function readNativeMessageContextRevisions(
   return result;
 }
 
+/**
+ * Request-local negative filter, not a replacement for materialization/suffix validation.
+ * The target set is copied once. Each immutable node has one state (depth and distance to
+ * the nearest selected segment), independent of root/window length. Thus overlapping
+ * compressed tails cost O(distinct physical nodes + candidate roots), not O(sum tail sizes).
+ */
+export class ForkContextCandidateProbe {
+  private readonly targets: ReadonlySet<string>;
+  private readonly nodes = new Map<string, DomainRow>();
+  private readonly states = new Map<string, { depth: number; nearest: number }>();
+  private readonly segmentKinds = new Map<string, string>();
+  private windows = 0;
+
+  public constructor(private readonly database: RuntimeDatabase, segmentIds: ReadonlySet<string>) {
+    this.targets = new Set(segmentIds);
+    if (this.targets.size === 0) throw new Error('Fork candidate target segments are empty.');
+  }
+
+  public get metrics(): { nodeReads: number; segmentReads: number; cacheStates: number; windowChecks: number } {
+    return { nodeReads: this.nodes.size, segmentReads: this.segmentKinds.size,
+      cacheStates: this.states.size, windowChecks: this.windows };
+  }
+
+  public async mayContain(root: DomainRow): Promise<boolean> {
+    const count = this.count(root.segment_count, 'segment_count');
+    const tailCount = this.count(root.tail_segment_count, 'tail_segment_count');
+    const rootId = this.pointer(root.root_node_id);
+    const tailId = this.pointer(root.tail_node_id);
+    if (rootId === null) {
+      if (tailId !== null || tailCount !== 0 || count !== 0) throw new Error('Invalid empty Fork candidate root.');
+      return false;
+    }
+    const node = await this.node(rootId);
+    const segmentId = requireId(node.segment_id, 'ContextSequenceNode.segment_id');
+    let kind = this.segmentKinds.get(segmentId);
+    if (kind === undefined) {
+      const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)]);
+      kind = requireId(requireRow(result.snapshot[0], 'ContextSegment').segment_kind, 'ContextSegment.segment_kind');
+      this.segmentKinds.set(segmentId, kind);
+    }
+    if (kind === 'compression') {
+      if (node.parent_node_id !== null || count !== tailCount + 1 || (tailId === null) !== (tailCount === 0)) {
+        throw new Error('Invalid compression Fork candidate window.');
+      }
+      // A tail can physically point behind the compressed boundary. Only its last tailCount
+      // occurrences are visible; matching an older physical ancestor must not admit this root.
+      const summaryHit = await this.window(rootId, 1, true);
+      const tailHit = tailId === null ? false : await this.window(tailId, tailCount, false);
+      return summaryHit || tailHit;
+    }
+    if (tailId !== null || tailCount !== 0) throw new Error('Invalid ordinary Fork candidate tail.');
+    return this.window(rootId, count, true);
+  }
+
+  private async window(tip: string, length: number, exactDepth: boolean): Promise<boolean> {
+    this.windows += 1;
+    const state = await this.state(tip);
+    if (length === 0 || state.depth < length || (exactDepth && state.depth !== length)) {
+      throw new Error('Fork candidate node chain/count mismatch.');
+    }
+    return state.nearest < length;
+  }
+
+  private async state(tip: string): Promise<{ depth: number; nearest: number }> {
+    const path: Array<{ id: string; node: DomainRow }> = [];
+    const visiting = new Set<string>();
+    let cursor: string | null = tip;
+    while (cursor !== null && !this.states.has(cursor)) {
+      if (visiting.has(cursor)) throw new Error('Fork candidate node chain cycle.');
+      visiting.add(cursor);
+      const node = await this.node(cursor);
+      path.push({ id: cursor, node });
+      cursor = this.pointer(node.parent_node_id);
+    }
+    let previous = cursor === null ? { depth: 0, nearest: Infinity } : this.states.get(cursor)!;
+    for (const { id, node } of path.reverse()) {
+      const depth = previous.depth + 1;
+      if (!Number.isSafeInteger(depth)) throw new Error('Fork candidate node chain is too deep.');
+      previous = { depth, nearest: this.targets.has(requireId(node.segment_id, 'ContextSequenceNode.segment_id'))
+        ? 0 : previous.nearest + 1 };
+      this.states.set(id, previous);
+    }
+    return this.states.get(tip)!;
+  }
+
+  private async node(id: string): Promise<DomainRow> {
+    const cached = this.nodes.get(id);
+    if (cached) return cached;
+    const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSequenceNode').get(id)]);
+    const node = requireRow(result.snapshot[0], `ContextSequenceNode ${id}`);
+    this.nodes.set(id, node);
+    return node;
+  }
+
+  private count(value: unknown, label: string): number {
+    if (typeof value !== 'bigint' || value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error(`Invalid Fork candidate ${label}.`);
+    }
+    return Number(value);
+  }
+
+  private pointer(value: unknown): string | null {
+    return value === null ? null : requireId(value, 'ContextSequenceNode pointer');
+  }
+}
+
 function requireRow(value: unknown, label: string): DomainRow {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} is missing.`);
   return value as DomainRow;

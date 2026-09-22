@@ -27,6 +27,38 @@ const {
   'dist/extension/backend/application/reliableKernel/interactionAttention.js'
 ));
 
+test('model profile commit broadcasts only its local scope, never a full configuration snapshot', async () => {
+  const posted = [], broadcasts = [];
+  let fullReads = 0;
+  const result = { scopeKind: 'conversation', scopeId: 'thinking-conversation', authorityId: 'authority', revision: 'revision-2', sequence: 2, profileState: 'overridden', outcome: 'committed' };
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} }, toolHost: { setStateChangeListener() {}, definitionRecords() { return []; }, mcp: { sourceRecords() { return []; } }, skillDefinitions() { return []; }, ruleFiles() { return []; } },
+    application: { database: { conversationOwners: passthroughConversationOwners() } },
+    configuration: {
+      async configurationClientState() { fullReads++; return {}; },
+      async providerConfig() {},
+      mutations: {
+        captureModelProfileRoot() { return { authorityId: 'authority' }; },
+        async readModelProfileScope() { return { ...result, outcome: 'observed', sequence: 1 }; },
+        async writeModelProfileScope() { return result; }
+      }
+    }
+  }, { broadcast: message => broadcasts.push(message) });
+  const view = webview(posted);
+  router.handle('scope-client', view, { id: 'read', type: protocol.BridgeMessageType.ModelProfileScopeRead,
+    payload: { scopeKind: 'conversation', scopeId: result.scopeId } });
+  await eventually(() => posted.length === 1);
+  router.handle('scope-client', view, { id: 'thinking', type: protocol.BridgeMessageType.ModelProfileScopeSet,
+    payload: { scopeKind: 'conversation', scopeId: result.scopeId, authorityId: 'authority', sessionId: posted[0].payload.sessionId,
+      expectedRevision: 'revision-1', operation: 'thinking', providerConfigId: 'p', model: 'o3', thinkingOverride: { kind: 'openai-effort', value: 'high' } } });
+  await eventually(() => posted.length === 2 && broadcasts.length === 1);
+  assert.equal(fullReads, 0);
+  assert.equal(broadcasts[0].type, protocol.BridgeMessageType.ModelProfileScopeSnapshot);
+  assert.equal(broadcasts[0].payload.scopeId, result.scopeId);
+  assert.equal(broadcasts[0].correlationId, undefined);
+  assert.equal(broadcasts[0].payload.sessionId, undefined, 'peer panels cannot reuse the writer session token');
+});
+
 test('stale Turn interrupt is idempotently reported as already_terminal', async () => {
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({

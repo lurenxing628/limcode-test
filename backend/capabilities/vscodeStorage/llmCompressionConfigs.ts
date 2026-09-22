@@ -146,7 +146,7 @@ export function normalizeLlmCompressionConfig(input: Partial<LlmCompressionConfi
 
 function normalizeConfigList(input: LlmCompressionConfigRecord[] | undefined): LlmCompressionConfigRecord[] {
   const byId = new Map<string, LlmCompressionConfigRecord>();
-  for (const item of input ?? []) byId.set(item.id, normalizeLlmCompressionConfig({ ...item, updatedAt: Date.now() }));
+  for (const item of input ?? []) byId.set(item.id, normalizeLlmCompressionConfig(item));
   return sortConfigs([...byId.values()]);
 }
 

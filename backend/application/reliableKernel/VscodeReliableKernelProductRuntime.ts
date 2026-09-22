@@ -549,6 +549,7 @@ export class VscodeReliableKernelProductRuntime {
     this.closing = true;
     const cancellation = new Error('Reliable Runtime recovery cancelled for Host handoff.');
     cancellation.name = 'AbortError';
+    this.configuration.mutations.retireModelProfileAuthority();
     this.recoveryController.abort(cancellation);
     this.externalRuntimeWatcher.cancel();
     try {

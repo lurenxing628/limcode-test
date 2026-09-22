@@ -19,6 +19,24 @@ const { normalizeLlmCompressionConfig } = require('../../dist/extension/backend/
 const { GlobalSettingsSaveBarrier } = require('../../dist/extension/backend/application/reliableKernel/GlobalSettingsSaveBarrier.js');
 const section = 'llmCompressionConfigs';
 
+test('保存确认超时不得放行依赖新设置的执行', async () => {
+  const barrier = new GlobalSettingsSaveBarrier(1000);
+  let request;
+  let executed = false;
+  barrier.attach('settings-panel', {
+    async postMessage(message) { request = message; return true; }
+  });
+  const execution = barrier.flush().then(() => { executed = true; });
+  const rejected = assert.rejects(execution, /设置尚未确认保存/);
+  await Promise.resolve();
+  barrier.receive('settings-panel', request.id, {
+    status: 'failed',
+    message: '设置尚未确认保存，已暂停本次操作，请检查设置页。'
+  });
+  await rejected;
+  assert.equal(executed, false, '未确认的配置不能作为已保存配置启动下一步');
+});
+
 async function withStore(run) {
   const previousWindow = globalThis.window;
   const posted = [];
@@ -374,10 +392,11 @@ test('跨页面确认遇到冲突、关闭、发送失败或超时均明确拒�
     let message;
     barrier.attach('settings', { async postMessage(value) { message = value; return failure !== 'undelivered'; } });
     const flushing = barrier.flush();
-    const rejected = assert.rejects(flushing, /设置|页面/);
+    const rejected = assert.rejects(flushing, /设置|页面|状态/);
     await Promise.resolve();
     if (failure === 'conflict') barrier.receive('settings', message.id, { status: 'failed', message: '设置冲突' });
     if (failure === 'closed') barrier.detach('settings');
+    // 'closed' 现在会等待超时后报 "状态未知"
     await rejected;
   }
 });

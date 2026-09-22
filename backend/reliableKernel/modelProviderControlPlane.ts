@@ -1,3 +1,6 @@
+import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
+import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
+
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { normalizeLlmCompressionMaxDurationMinutes, type AttachmentCatalogEntry } from '../../shared/protocol';
@@ -330,6 +333,7 @@ type ModelStreamCheckpointKind =
   | 'terminal_summary';
 
 interface StreamStats {
+  thinkingSelection?: string;
   attemptSeq: string;
   socketGeneration: string;
   retryReason: ProviderTransientReason | null;
@@ -483,8 +487,11 @@ export class ModelProviderControlPlane {
       }
     }
     const frozen = await readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId);
-    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(frozenModelSelection(frozen.document));
-    const snapshot = normalizePlainJson({ requestCompression: selected }, '请求压缩设置');
+    const model = frozenModelSelection(frozen.document);
+    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(model);
+    const turn = await this.requireDomain('Turn', turnId);
+    const generation = await this.compressionSettingsAuthority.loadRequestGenerationSettings?.(model, requireId(turn.conversation_id, 'Turn.conversation_id'));
+    const snapshot = normalizePlainJson({ requestCompression: selected, ...(generation ? { requestGeneration: generation } : {}) }, '请求设置');
     applyRequestCompressionSettings(frozen.document, snapshot);
     const content = await this.contentStore.ingest(
       this.database, canonicalPlainJson(snapshot), 'application/vnd.limcode.model-request-settings+json'
@@ -568,7 +575,10 @@ export class ModelProviderControlPlane {
     }
     const recipeContent = await this.contentStore.prepare(this.database, recipeBytes, CONTENT_TYPE_RECIPE);
     const now = this.timestamp();
-    const initialStats: StreamStats = { attemptSeq: '1', socketGeneration: '0', retryReason: null };
+    const generationModel = isRecord(frozen.document) && isRecord(frozen.document.model) ? frozen.document.model : undefined;
+    const initialStats: StreamStats = { attemptSeq: '1', socketGeneration: '0', retryReason: null,
+      ...(!compressionRequest && generationModel?.generationConfig ? { thinkingSelection: `${frozenModelId}: ${generationModel.thinkingControlledByBody ? '由自定义请求体控制' : sessionThinkingDisplayLabel(generationModel.provider as LlmProviderKind, frozenModelId, generationModel.thinkingConfig as LlmThinkingConfigRecord)}` } : {})
+    };
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active' }),
       ...preparedContentObjectSteps([recipeContent], 'model_request_recipe'),
@@ -2728,6 +2738,7 @@ function parseStreamStats(value: unknown): StreamStats {
   return {
     attemptSeq,
     socketGeneration,
+    ...(typeof value.thinkingSelection === 'string' ? { thinkingSelection: value.thinkingSelection } : {}),
     retryReason: value.retryReason as ProviderTransientReason | null,
     ...(optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) !== undefined
       ? { retryMaxAttempts: optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) }

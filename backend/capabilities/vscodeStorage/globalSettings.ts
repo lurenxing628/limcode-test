@@ -184,6 +184,10 @@ export async function writeGlobalSettingsFile(
     if (actualRevision !== expectedRevision) {
       throw new SettingsRevisionConflictError(section, expectedRevision, actualRevision);
     }
+    const normalized = getFileBackedSpec(section).normalize(settings as Partial<GlobalSettingsSectionValue> | undefined);
+    if (previous && createStorageRevision(normalized) === actualRevision) {
+      return { ...previous, previousSettings: previous.settings };
+    }
     const committed = await writeGlobalSettingsFileUnlocked(uri, section, settings);
     return {
       ...committed,

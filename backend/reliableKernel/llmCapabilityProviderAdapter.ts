@@ -734,11 +734,18 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       provider,
       modelId: request.modelId,
       systemPromptPrefix,
-      // 冻结的 base reasoning 随快照携带；provider 端优先于实时渠道配置使用。
+      // The complete generation config is frozen per ordinary request, not re-read on retry.
+      ...(asRecord(authorityModel.generationConfig)
+        ? { generationConfig: authorityModel.generationConfig as NonNullable<LlmStartRequest['settingsSnapshot']>['generationConfig'],
+            requestBody: authorityModel.requestBody as NonNullable<LlmStartRequest['settingsSnapshot']>['requestBody'] }
+        : {}),
+      // Native base reasoning remains stable within its continuation chain.
       ...(nativeReasoning?.baseEffort || nativeReasoning?.baseMode
         ? {
             generationConfig: {
+              ...asRecord(authorityModel.generationConfig),
               thinkingConfig: {
+                ...asRecord(asRecord(authorityModel.generationConfig)?.thinkingConfig),
                 ...(nativeReasoning.baseEffort ? { thinkingLevel: nativeReasoning.baseEffort } : {}),
                 ...(nativeReasoning.baseMode ? { reasoningMode: nativeReasoning.baseMode } : {})
               }

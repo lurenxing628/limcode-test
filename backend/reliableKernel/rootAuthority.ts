@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+﻿import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import * as fs from 'node:fs/promises';
@@ -513,6 +513,13 @@ export function parseRootBinding(value: unknown): RootBinding {
 }
 
 export function parseHistoricalRootBinding(value: unknown): HistoricalRootBinding {
+  const binding = parseHistoricalRootBindingStructure(value);
+  requireHistoricalEpoch(binding.runtimeKernelEpoch);
+  return binding;
+}
+
+/** Validates every field before the caller applies its epoch compatibility policy. */
+function parseHistoricalRootBindingStructure(value: unknown): HistoricalRootBinding {
   const record = requireRecord(value, 'RootBinding');
   requireExactKeys(record, [
     'paths',
@@ -529,7 +536,7 @@ export function parseHistoricalRootBinding(value: unknown): HistoricalRootBindin
     rootInstanceId: requireNonEmptyString(record.rootInstanceId, 'RootBinding.rootInstanceId'),
     rootGeneration: requirePositiveInteger(record.rootGeneration, 'RootBinding.rootGeneration'),
     pointerRevision: requirePositiveInteger(record.pointerRevision, 'RootBinding.pointerRevision'),
-    runtimeKernelEpoch: requireHistoricalEpoch(record.runtimeKernelEpoch)
+    runtimeKernelEpoch: requirePositiveInteger(record.runtimeKernelEpoch, 'RootBinding.runtimeKernelEpoch')
   };
   return Object.freeze({ ...binding, paths: Object.freeze({ ...binding.paths }) });
 }
@@ -623,9 +630,24 @@ async function readHistoricalBindingFile(filePath: string): Promise<HistoricalRo
     throw error;
   }
   try {
-    return parseHistoricalRootBinding(JSON.parse(text));
+    const binding = parseHistoricalRootBindingStructure(JSON.parse(text));
+    assertHistoricalEpochSupported(binding, filePath);
+    return binding;
   } catch (error) {
+    if (error instanceof RootAuthorityError && error.code === 'runtime-epoch-newer-than-extension') {
+      throw error;
+    }
     throw new RootAuthorityError('root-binding-invalid', `Invalid historical RootBinding pointer: ${filePath}`, error);
+  }
+}
+
+function assertHistoricalEpochSupported(binding: HistoricalRootBinding, filePath: string): void {
+  const epoch = binding.runtimeKernelEpoch;
+  if (epoch > RUNTIME_KERNEL_EPOCH) {
+    throw new RootAuthorityError(
+      'runtime-epoch-newer-than-extension',
+      `RootBinding pointer requires Runtime epoch ${epoch}, but this extension supports through ${RUNTIME_KERNEL_EPOCH}: ${filePath}`
+    );
   }
 }
 

@@ -170,7 +170,7 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
 function normalizeConfigList(input: LlmProviderConfigRecord[] | undefined): LlmProviderConfigRecord[] {
   const byId = new Map<string, LlmProviderConfigRecord>();
   for (const item of input ?? []) {
-    const config = normalizeLlmProviderConfig({ ...item, updatedAt: Date.now() });
+    const config = normalizeLlmProviderConfig(item);
     byId.set(config.id, config);
   }
   return sortConfigs([...byId.values()]);

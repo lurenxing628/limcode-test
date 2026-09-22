@@ -34,8 +34,6 @@ const useClientStateStoreDefinition = defineStore('clientState', {
       Object.assign(this, {
         agents: state.agents.map(cloneRecord),
         workflows: state.workflows.map(cloneRecord),
-        modelProfiles: state.modelProfiles.map(cloneRecord),
-        modelProfileScopeLinks: state.modelProfileScopeLinks.map(cloneRecord),
         planReviewPolicies: state.planReviewPolicies.map(cloneRecord),
         planReviewPolicyScopeLinks: state.planReviewPolicyScopeLinks.map(cloneRecord),
         toolDefinitions: state.toolDefinitions.map(cloneRecord),

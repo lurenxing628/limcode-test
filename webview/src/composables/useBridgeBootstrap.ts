@@ -7,7 +7,7 @@ import {
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
+import { useGlobalSettingsStore, CHANNEL_SETTINGS_SECTIONS } from '@webview/stores/useGlobalSettingsStore';
 import { useConversationSettingsStore } from '@webview/stores/useConversationSettingsStore';
 import { useSystemPromptStore } from '@webview/stores/useSystemPromptStore';
 import { useRuntimeContextStore } from '@webview/stores/useRuntimeContextStore';
@@ -47,6 +47,7 @@ export function useBridgeBootstrap(): void {
       const previousClientId = announcedClientId;
       if (message.clientId) announcedClientId = message.clientId;
       if (previousClientId && message.clientId && previousClientId !== message.clientId) {
+        modelProfiles.reconnectScopes();
         globalSettings.reconcilePendingSettings();
         bridge.ready();
       }
@@ -67,19 +68,28 @@ export function useBridgeBootstrap(): void {
     }),
     bridge.on(BridgeMessageType.ConfigurationSnapshot, (message) => {
       if (!message.payload) return;
+      modelProfiles.invalidateSnapshot(message.payload.state);
       clientState.applyConfigurationSnapshot(message.payload.state);
-      modelProfiles.reconcileSnapshot(message.correlationId);
       systemPrompts.reconcilePendingSave();
       runtimeContexts.reconcilePendingSave();
+    }),
+    bridge.on(BridgeMessageType.ModelProfileScopeSnapshot, (message) => {
+      if (message.payload) modelProfiles.applyScopeSnapshot(message.payload, message.correlationId);
     }),
     bridge.on(BridgeMessageType.InteractionResult, (message) => {
       if (message.payload) interactions.applyResult(message.payload, message.correlationId);
     }),
     bridge.on(BridgeMessageType.GlobalSettingsSnapshot, (message) => {
-      if (message.payload) globalSettings.applySnapshot(message.payload, message.correlationId);
+      if (message.payload) {
+        globalSettings.applySnapshot(message.payload, message.correlationId);
+        if (message.payload.section === 'llm' || message.payload.section === 'llmProviderConfigs') modelProfiles.invalidateActiveScopes();
+      }
     }),
     bridge.on(BridgeMessageType.GlobalSettingsFlush, (message) => {
-      void globalSettings.flushForExecution().then(
+      const sections: readonly GlobalSettingsSection[] = session.viewKind === 'globalSettings'
+        ? CHANNEL_SETTINGS_SECTIONS
+        : ['llm'];
+      void globalSettings.flushForExecution(sections).then(
         () => bridge.request(BridgeMessageType.GlobalSettingsFlushResult, { status: 'saved' }, { correlationId: message.id }),
         (error: unknown) => bridge.request(BridgeMessageType.GlobalSettingsFlushResult, {
           status: 'failed', message: error instanceof Error ? error.message : String(error)
@@ -98,8 +108,10 @@ export function useBridgeBootstrap(): void {
       if (payload.requestType === BridgeMessageType.InteractionResolve) {
         interactions.observeTransportError(message.correlationId, payload.message);
       }
-      if (payload.requestType === BridgeMessageType.ModelProfileScopeSet) {
-        modelProfiles.rejectPending(message.correlationId, payload.message);
+      if (payload.requestType === BridgeMessageType.ModelProfileScopeSet
+        || payload.requestType === BridgeMessageType.ModelProfileScopeClear
+        || payload.requestType === BridgeMessageType.ModelProfileScopeRead) {
+        modelProfiles.rejectRequest(message.correlationId, payload.message);
       }
       if (payload.requestType === BridgeMessageType.ConversationAgentSelect) {
         agents.rejectPending(message.correlationId, payload.message);
