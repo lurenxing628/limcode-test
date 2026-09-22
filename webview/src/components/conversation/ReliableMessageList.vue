@@ -498,6 +498,15 @@ function deleteFrom(message: MessageRecord): void {
   deleteMessagesFrom(message.conversationId, message.id);
 }
 
+function forkBlocked(message: MessageRecord): boolean {
+  // A fork copies completed turns only; messages of the running turn become forkable once it ends.
+  const activeTurnId = reliableText(activeTurn.value?.id);
+  return forkPendingTargetIds.value.has(message.id)
+    || !projection.value.messageRevisionIdByMessageId[message.id]
+    || message.status === 'streaming'
+    || (activeTurnId !== '' && projection.value.turnIdByMessageId[message.id] === activeTurnId);
+}
+
 function forkFrom(message: MessageRecord): void {
   const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
   if (revisionId) forkConversationFrom(message.conversationId, message.id, revisionId);
@@ -668,7 +677,7 @@ function messageRenderKey(message: MessageRecord): string {
         :mutation-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
         :retry-blocked="retryBlocked(message)"
         :compact-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
-        :fork-blocked="forkPendingTargetIds.has(message.id) || !projection.messageRevisionIdByMessageId[message.id] || message.status === 'streaming'"
+        :fork-blocked="forkBlocked(message)"
         :pending-label="conversationActionLabel ?? '正在提交操作'"
         :floor-number="timelineFloor(message, index)"
         @edit-message="emit('edit-message', message, deleteCount(message))"

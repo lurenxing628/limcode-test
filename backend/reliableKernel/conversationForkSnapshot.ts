@@ -3,6 +3,7 @@ import { conversationAttachmentHandleLinkId } from './conversationAttachmentHand
 import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
 import { NATIVE_STEER_MESSAGE_TURN_ROLE } from './nativeSteering';
 import {
+  ConversationForkRejectedError,
   isNativeRequest,
   readForkContextLineage,
   readNativeMessageContextRevisions,
@@ -209,6 +210,11 @@ export async function prepareConversationForkSnapshot(
     }
     messageFacts.push(fact);
   }
+  // A fork owns completed history only: an active Turn's messages, requests and tool calls are
+  // still being written by the source executor and must never be silently copied.
+  requireTerminatedTurns(await getRows(database, 'Turn', unique(messageFacts.flatMap((fact) =>
+    fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))
+  ))));
 
   const requestIds = unique(messageFacts.flatMap((fact) => [
     ...fact.requestLinks.map((link) => id(link.model_request_id, 'ModelRequestMessageLink.model_request_id')),
@@ -264,6 +270,7 @@ export async function prepareConversationForkSnapshot(
     ...tools.map((entry) => id(entry.toolCall.turn_id, 'ToolCall.turn_id'))
   ]);
   const turnRows = await getRows(database, 'Turn', turnIds);
+  requireTerminatedTurns(turnRows);
   const turnRelations = await readTurnRelations(database, turnRows);
   const fileFacts = await readFileFacts(database, tools);
   const interactionFacts = await readInteractionFacts(database, tools);
@@ -372,19 +379,16 @@ export async function prepareConversationForkSnapshot(
     const targetTurnId = mapped(turnIdMap, sourceTurnId, 'Turn');
     assertions.push(DOMAIN_REPOSITORIES.domain('Turn').assert(sourceTurnId, {
       conversation_id: input.sourceConversationId,
-      status: turn.status
+      status: 'terminated'
     }));
     inserts.unshift(DOMAIN_REPOSITORIES.domain('Turn').insert({
       ...turn,
       id: targetTurnId,
       conversation_id: target,
-      status: 'terminated',
-      updated_at: input.now,
-      terminal_at: turn.terminal_at ?? input.now
+      updated_at: input.now
     }));
     const relation = turnRelations.get(sourceTurnId);
-    const preservesTerminalState = turn.status === 'terminated'
-      && relation !== undefined
+    const preservesTerminalState = relation !== undefined
       && hasCompleteTurnClosure(relation, messageIdMap, requestIdMap, toolIdMap);
     if (preservesTerminalState && relation) {
       preservedTurnIds.add(sourceTurnId);
@@ -474,6 +478,16 @@ export async function prepareConversationForkSnapshot(
     inserts,
     copiedVisibleMessageCount: messageFacts.length
   };
+}
+
+function requireTerminatedTurns(turns: readonly DomainRow[]): void {
+  for (const turn of turns) {
+    if (turn.status !== 'terminated') {
+      throw new ConversationForkRejectedError(
+        `Fork source Turn ${String(turn.id)} has not finished; a fork copies completed turns only.`
+      );
+    }
+  }
 }
 
 async function readRequestAggregates(database: RuntimeDatabase, requests: DomainRow[]): Promise<RequestAggregate[]> {

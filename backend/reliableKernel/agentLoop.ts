@@ -2916,11 +2916,14 @@ export class ReliableAgentLoop {
       throw new Error(`ToolModelResult ${input.toolModelResultId} has multiple Context occurrences.`);
     }
     if (sources.length === 1) {
+      // Tool-pair segments are immutable and shared by Conversation forks; each copy registers its
+      // own call source, so only this ToolCall's occurrence in the same segment closes the pair.
       const callSources = await this.list('ContextSegmentSource', {
         segment_id: requireId(sources[0].segment_id, 'ContextSegmentSource.segment_id'),
-        source_kind: 'tool_call'
+        source_kind: 'tool_call',
+        source_id: input.toolCallId
       }, 2);
-      if (callSources.length !== 1 || callSources[0].source_id !== input.toolCallId) {
+      if (callSources.length !== 1) {
         throw new Error(`ToolModelResult ${input.toolModelResultId} is linked to a conflicting Context tool pair.`);
       }
       return;

@@ -2,6 +2,17 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
+/**
+ * The selected fork point is permanently unusable for this command: it copies a turn that has not
+ * terminated. A fork only owns completed history, so retrying the same command cannot succeed.
+ */
+export class ConversationForkRejectedError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'ConversationForkRejectedError';
+  }
+}
+
 export interface ForkContextLineage {
   segmentIds: ReadonlySet<string>;
   messageSources: readonly DomainRow[];

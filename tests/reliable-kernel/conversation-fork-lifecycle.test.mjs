@@ -29,7 +29,7 @@ async function rows(app, domain, where = {}) {
   }))).snapshot;
 }
 
-async function withForkRuntime(run, { withTool = false } = {}) {
+async function withForkRuntime(run, { withTool = false, toolCallRequests = [1], beforeDispatch } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-fork-lifecycle-'));
   const authority = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
@@ -76,7 +76,7 @@ async function withForkRuntime(run, { withTool = false } = {}) {
         return { providerId, async sendFullRequest(request, controls) {
           requests.push(request);
           await controls.onEvent({ kind: 'completed', streamSeq: '1',
-            content: { role: 'model', parts: withTool && requests.length === 1
+            content: { role: 'model', parts: withTool && toolCallRequests.includes(requests.length)
               ? [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }]
               : [{ text: `offline reply ${requests.length}` }] } });
         } };
@@ -85,6 +85,7 @@ async function withForkRuntime(run, { withTool = false } = {}) {
         definitions() { return withTool ? [{ name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }] : []; },
         async dispatch(input) {
           assert.equal(withTool, true, 'only the tool fixture may dispatch');
+          await beforeDispatch?.(input);
           const settled = await app.runtime.effects.settleWithoutEffect({
             source: { kind: 'internal', key: `fixture-read:${input.toolCallId}` },
             toolCallId: input.toolCallId, status: 'succeeded', detail: { text: 'synthetic tool result' }
@@ -116,7 +117,7 @@ async function withForkRuntime(run, { withTool = false } = {}) {
       get app() { return app; }, get facade() { return facade; },
       get configuration() { return configuration; }, requests, environmentId,
       async reopen() { await app.close(); await open(); },
-      async turn(conversationId, key, retry) {
+      async start(conversationId, key, retry) {
         // Match claim-before-open: keep the panel's reference through the whole fake-provider turn.
         await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
         const command = {
@@ -129,10 +130,15 @@ async function withForkRuntime(run, { withTool = false } = {}) {
           : await app.turns.input({ ...command, content: key });
         const [lease] = await rows(app, 'ExecutionLease', { turn_id: input.turnId });
         assert.ok(lease);
-        const result = await kernel.runWithExecutionLeaseFence({
+        const done = kernel.runWithExecutionLeaseFence({
           id: lease.id, conversationId, turnId: input.turnId, ownerId: lease.owner_id,
           hostBootId: lease.host_boot_id, generation: BigInt(lease.generation)
         }, () => app.agentLoop.drive(input.turnId));
+        return { input, done };
+      },
+      async turn(conversationId, key, retry) {
+        const { input, done } = await harness.start(conversationId, key, retry);
+        const result = await done;
         assert.equal(result.terminalStatus, 'completed', JSON.stringify(await rows(app, 'TurnTermination', { turn_id: input.turnId })));
         return input;
       },
@@ -189,6 +195,80 @@ for (const role of ['user', 'model']) {
     });
   });
 }
+
+test('fork copies completed turns only and the running source turn still stops normally', async () => {
+  let entered;
+  let release;
+  const reached = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  let dispatches = 0;
+  await withForkRuntime(async h => {
+    await h.turn('source', 'completed-tool-turn');
+    const completed = await h.command('source', 'fork-completed-turn');
+    const running = await h.start('source', 'running-tool-turn');
+    await reached;
+    const [activeTurn] = (await rows(h.app, 'Turn', { conversation_id: 'source' })).filter(turn => turn.status === 'active');
+    assert.equal(activeTurn.id, running.input.turnId);
+    const activeModel = await h.command('source', 'fork-active-model');
+    const activeUser = await h.command('source', 'fork-active-user', 'user');
+    const watched = ['Conversation', 'ConversationBranchLink', 'ConversationReuseLink', 'ConversationAttachmentHandleLink',
+      'ContextSequenceRoot', 'ContextSegmentSource', 'Message', 'Turn', 'TurnTermination'];
+    const before = await Promise.all(watched.map(domain => rows(h.app, domain)));
+    for (const command of [activeModel, activeUser]) {
+      await assert.rejects(h.facade.forkConversation(command), kernel.ConversationForkRejectedError);
+    }
+    const rootId = await h.app.context.currentHeadRootId('source');
+    const [userSource] = await rows(h.app, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: activeUser.expectedRevisionId
+    });
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: 'source', role: 'default' });
+    await assert.rejects(h.app.runtime.conversationFork.fork({
+      idempotencyKey: 'direct-active-fork', reuseKey: 'direct-active-fork',
+      sourceConversationId: 'source', sourceContextRootId: rootId,
+      sourceContextEndSegmentId: userSource.segment_id,
+      sourceMessageRevisionId: activeUser.expectedRevisionId,
+      targetTitle: 'Rejected active turn', targetAgentId: agent.agent_id
+    }), kernel.ConversationForkRejectedError);
+    assert.deepEqual(await Promise.all(watched.map(domain => rows(h.app, domain))), before,
+      'a rejected fork must not write targets, handles, native results or Context');
+
+    const fork = await h.facade.forkConversation(completed);
+    await h.app.turns.interrupt({
+      source: { kind: 'command', key: 'stop-running-after-fork' },
+      turnId: running.input.turnId, reason: 'fixture stop after forking completed history'
+    });
+    release();
+    const stopped = await running.done;
+    assert.equal(stopped.terminalStatus, 'interrupted');
+    const copiedTurns = await rows(h.app, 'Turn', { conversation_id: fork.conversationId });
+    assert.equal(copiedTurns.length, 1);
+    assert.ok(copiedTurns.every(turn => turn.status === 'terminated'));
+    assert.deepEqual((await rows(h.app, 'TurnTermination', { turn_id: copiedTurns[0].id })).map(row => row.terminal_status), ['completed']);
+    assert.doesNotMatch(JSON.stringify(await rows(h.app, 'Message')), /running-tool-turn/);
+
+    // Completed tool-pair segments are shared with the fork; closing the source pair again is a no-op.
+    const sourceCalls = (await rows(h.app, 'ToolCall')).filter(call => call.turn_id !== running.input.turnId
+      && !copiedTurns.some(turn => turn.id === call.turn_id));
+    assert.equal(sourceCalls.length, 1);
+    const [modelResult] = await rows(h.app, 'ToolModelResult', { tool_call_id: sourceCalls[0].id });
+    const [resultSource] = await rows(h.app, 'ContextSegmentSource', { source_kind: 'tool_model_result', source_id: modelResult.id });
+    assert.equal((await rows(h.app, 'ContextSegmentSource', { segment_id: resultSource.segment_id, source_kind: 'tool_call' })).length, 2);
+    await h.app.agentLoop.appendTerminalToolPairOnce({
+      conversationId: 'source', toolCallId: sourceCalls[0].id, toolModelResultId: modelResult.id
+    });
+    await h.turn('source', 'source-after-stop');
+    await h.turn(fork.conversationId, 'fork-after-source-stop');
+  }, {
+    withTool: true,
+    toolCallRequests: [1, 3],
+    async beforeDispatch() {
+      dispatches += 1;
+      if (dispatches !== 2) return;
+      entered();
+      await gate;
+    }
+  });
+});
 
 test('an early fork has no later source roots without target message provenance', async () => {
   await withForkRuntime(async h => {

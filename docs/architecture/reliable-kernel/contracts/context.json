@@ -256,6 +256,7 @@
     ],
     "contextRule": "fork 从选定旧 parent/root 创建目标 Conversation 的新 root/head，结构共享不可变 ContextSequence 前缀。",
     "relationRule": "Reuse、Branch、Origin、Project 分别建独立表/Repository/Codec/Client mapping；fork 在同一事务继承可选 ProjectContext；不得嵌入 Conversation。",
+    "historyRule": "fork 只复制已终止轮次：分支点或复制范围内任一 Turn 仍活动时以 ConversationForkRejectedError 拒绝且不写入；源对话的活动轮次不受已提交 fork 影响，共享的不可变 tool_pair 段按本 ToolCall 自己的来源行定位。",
     "legacyRunReference": "forbidden-use-source-turn-id-instead"
   }
 }

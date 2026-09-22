@@ -12,6 +12,7 @@ import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { readNativeSteeringInFlight } from '../../reliableKernel/nativeSteering';
 import { ForkContextCandidateProbe, isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
+import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
 import {
   createVscodeRootAuthority,
   completeVscodeRuntimeDataSetSelection,
@@ -321,6 +322,20 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       message_id: messageId
     }, 2);
     if (memberships.length !== 1) throw new Error('Fork 源 Message 不属于当前 Conversation。');
+    const turnLinks = (await this.product.application.database.snapshotAll(
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({
+        where: { message_id: messageId },
+        orderBy: { column: 'id', direction: 'asc' },
+        limit: 1000
+      })
+    )).snapshot;
+    const sourceTurnIds = [...new Set(turnLinks.map((row) => requireText(row.turn_id, 'MessageTurnLink.turn_id')))];
+    for (const turnId of sourceTurnIds) {
+      const turn = await this.requireRow('Turn', turnId);
+      if (turn.status !== 'terminated') {
+        throw new ConversationForkRejectedError('分支点所在的轮次仍在运行，请等待本轮结束后再从这条消息创建分支。');
+      }
+    }
     const nativeSteering = await readNativeSteeringInFlight(this.product.application.database, sourceConversationId);
     if (nativeSteering.length > 0) {
       throw new Error('当前对话仍有未收口的原生转向，请等待完成后再创建分支。');
@@ -460,14 +475,6 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       sourceAttachmentCatalogState.catalog
     );
 
-    const turnLinks = (await this.product.application.database.snapshotAll(
-      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({
-        where: { message_id: messageId },
-        orderBy: { column: 'id', direction: 'asc' },
-        limit: 1000
-      })
-    )).snapshot;
-    const sourceTurnIds = [...new Set(turnLinks.map((row) => String(row.turn_id)))];
     const agentLinks = await this.list('AgentConversationLink', {
       conversation_id: sourceConversationId,
       role: 'default'

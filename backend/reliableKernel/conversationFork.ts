@@ -6,6 +6,7 @@ import {
 } from './repositories';
 import { conversationProjectLinkInsertStep } from './conversationProject';
 import { readForkContextLineage } from './conversationForkContext';
+export { ConversationForkRejectedError } from './conversationForkContext';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { ReliableContextTokenEstimator } from './contextTokenEstimator';
