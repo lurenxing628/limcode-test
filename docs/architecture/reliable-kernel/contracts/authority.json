@@ -1415,7 +1415,7 @@
         "segment_id,source_kind"
       ],
       "notes": [
-        "source_kind ∈ {message_revision,tool_call,tool_model_result,compression_block,system,runtime_context}；新建 tool_pair 段写两行（tool_call+tool_model_result，同一 source_revision=call_seq）；一个稳定来源 tuple 只归属一个 segment；fork 可让同一不可变 segment 持有多个 Conversation 本地 Message/Tool alias，读取者必须先按 Conversation scope，再校验 message=1、tool_pair=2 的结构基数"
+        "source_kind ∈ {message_revision,tool_call,tool_model_result,compression_block,system,runtime_context}；新建 tool_pair 段写两行（tool_call+tool_model_result，同一 source_revision=call_seq）；一个稳定来源 tuple 只归属一个 segment；fork 可让同一不可变 segment 持有多个 Conversation 本地 Message/Tool alias，读取者必须先按 Conversation scope，再校验 message=1、tool_pair=2 的结构基数；已删除 Conversation 的 Tool/Turn 行随之级联删除而来源行随段保留，读取者把这类 tool 来源移出作用域，未知 source_kind 仍失败"
       ]
     },
     {

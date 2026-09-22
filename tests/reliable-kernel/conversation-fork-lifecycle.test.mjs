@@ -18,6 +18,7 @@ const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 const { ForkContextCandidateProbe } = load('backend/reliableKernel/conversationForkContext.js');
+const { prepareChildContextFork } = load('backend/reliableKernel/childContextFork.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -551,6 +552,37 @@ test('completed synchronous tool history stays forkable in both source and targe
     await h.turn(second.conversationId, 'continue-second-tool-fork');
     const sourceAgain = await h.facade.forkConversation(await h.command('source', 'tool-source-again'));
     await h.turn(sourceAgain.conversationId, 'continue-source-tool-fork');
+  }, { withTool: true });
+});
+
+test('forks keep running, re-forking and child-forking after their tool-history source is deleted', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'deleted-source-tool-turn');
+    const first = await h.facade.forkConversation(await h.command('source', 'fork-before-source-delete'));
+    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
+    assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
+    const [callSource] = await rows(h.app, 'ContextSegmentSource', { source_kind: 'tool_call' });
+    assert.equal((await rows(h.app, 'ContextSegmentSource', { segment_id: callSource.segment_id })).length, 4,
+      'the shared immutable tool segment still carries the deleted source provenance');
+    await h.turn(first.conversationId, 'fork-after-source-delete');
+    const second = await h.facade.forkConversation(await h.command(first.conversationId, 'fork-of-orphaned-fork'));
+    await h.turn(second.conversationId, 'second-generation-after-source-delete');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /deleted-source-tool-turn/);
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: first.conversationId, role: 'default' });
+    const now = new Date().toISOString();
+    const child = await prepareChildContextFork(h.app.database, h.app.contentStore, {
+      sourceConversationId: first.conversationId, targetConversationId: 'orphan-child-probe',
+      targetAgentId: agent.agent_id, forkTurns: 'all', now
+    });
+    assert.ok(child.segments.length >= 3, 'the inherited tool pair and messages remain forkable');
+    await h.app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+        id: 'orphan-child-probe', title: 'Child probe', status: 'active', created_at: now, updated_at: now
+      }),
+      ...child.steps
+    ]);
+    const copiedChildCalls = (await rows(h.app, 'ToolCall')).length;
+    assert.equal(copiedChildCalls, 3, 'first fork, second fork and child each own one copied ToolCall');
   }, { withTool: true });
 });
 

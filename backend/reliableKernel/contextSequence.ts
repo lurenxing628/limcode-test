@@ -966,30 +966,35 @@ export class ContextSequenceControlPlane {
         this.database, 'ContextSegmentSource', { segment_id: requireId(record.segment.id, 'ContextSegment.id') }
       ));
     }
-    const readByIds = async (domain: string, ids: string[]): Promise<Map<string, DomainRow>> => {
+    // Missing rows are expected: a deleted Conversation cascades its ToolCall/ToolModelResult/Turn
+    // rows while the dataset-lifetime segment keeps that Conversation's source provenance.
+    const readExistingByIds = async (domain: string, ids: string[]): Promise<Map<string, DomainRow>> => {
       const result = new Map<string, DomainRow>();
       const unique = [...new Set(ids)];
       for (let offset = 0; offset < unique.length; offset += 256) {
         const batch = unique.slice(offset, offset + 256);
         const snapshot = await this.database.snapshot(batch.map((id) => DOMAIN_REPOSITORIES.domain(domain).get(id)));
-        batch.forEach((id, index) => result.set(id, requireRow(snapshot.snapshot[index], `${domain} ${id}`)));
+        batch.forEach((id, index) => {
+          if (snapshot.snapshot[index] !== null) result.set(id, requireRow(snapshot.snapshot[index], `${domain} ${id}`));
+        });
       }
       return result;
     };
     const allSources = sourceGroups.flat();
-    const results = await readByIds('ToolModelResult', allSources.filter((source) => source.source_kind === 'tool_model_result')
+    const results = await readExistingByIds('ToolModelResult', allSources.filter((source) => source.source_kind === 'tool_model_result')
       .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')));
-    const calls = await readByIds('ToolCall', [
+    const calls = await readExistingByIds('ToolCall', [
       ...allSources.filter((source) => source.source_kind === 'tool_call')
         .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
       ...[...results.values()].map((result) => requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'))
     ]);
-    const turns = await readByIds('Turn', [...calls.values()].map((call) => requireId(call.turn_id, 'ToolCall.turn_id')));
-    const callForSource = (source: DomainRow): DomainRow | undefined => {
-      if (source.source_kind === 'tool_call') return calls.get(requireId(source.source_id, 'ContextSegmentSource.source_id'));
+    const turns = await readExistingByIds('Turn', [...calls.values()].map((call) => requireId(call.turn_id, 'ToolCall.turn_id')));
+    /** undefined: not a tool source kind; null: the owning Conversation was deleted. */
+    const callForSource = (source: DomainRow): DomainRow | null | undefined => {
+      if (source.source_kind === 'tool_call') return calls.get(requireId(source.source_id, 'ContextSegmentSource.source_id')) ?? null;
       if (source.source_kind === 'tool_model_result') {
-        const result = results.get(requireId(source.source_id, 'ContextSegmentSource.source_id'))!;
-        return calls.get(requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'));
+        const result = results.get(requireId(source.source_id, 'ContextSegmentSource.source_id'));
+        return result ? calls.get(requireId(result.tool_call_id, 'ToolModelResult.tool_call_id')) ?? null : null;
       }
       return undefined;
     };
@@ -1000,12 +1005,14 @@ export class ContextSequenceControlPlane {
       // never choose an arbitrary pair or treat another Conversation's sources as duplicates.
       const scoped = sourceGroups[index].filter((source) => {
         const call = callForSource(source);
-        if (!call) return true; // Unknown kinds must still fail the shape check.
-        return turns.get(requireId(call.turn_id, 'ToolCall.turn_id'))!.conversation_id === conversationId;
+        if (call === undefined) return true; // Unknown kinds must still fail the shape check.
+        if (call === null) return false;
+        const turn = turns.get(requireId(call.turn_id, 'ToolCall.turn_id'));
+        return turn !== undefined && turn.conversation_id === conversationId;
       });
       for (const source of scoped) {
         const call = callForSource(source);
-        if (call && requireBigInt(call.call_seq, 'ToolCall.call_seq')
+        if (call !== undefined && call !== null && requireBigInt(call.call_seq, 'ToolCall.call_seq')
           !== requireBigInt(source.source_revision, 'ContextSegmentSource.source_revision')) {
           throw new Error('Context tool source revision does not match its ToolCall call_seq.');
         }

@@ -70,16 +70,29 @@ export async function prepareChildContextFork(
     owners.add(id(item.turn.id));
     turnsByMessage.set(messageId, owners);
   }
-  const cache = new Map<string, DomainRow>();
-  async function get(domain: string, rowId: string): Promise<DomainRow> {
+  const cache = new Map<string, DomainRow | null>();
+  async function maybeGet(domain: string, rowId: string): Promise<DomainRow | null> {
     const key = `${domain}:${rowId}`;
     const cached = cache.get(key);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
     const barrier = await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(rowId)]);
     const row = barrier.snapshot[0];
-    if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error(`Child context fork missing ${key}.`);
-    cache.set(key, row as DomainRow);
-    return row as DomainRow;
+    if (row !== null && (!row || typeof row !== 'object' || Array.isArray(row))) {
+      throw new Error(`Child context fork read an invalid ${key}.`);
+    }
+    cache.set(key, row as DomainRow | null);
+    return row as DomainRow | null;
+  }
+  async function get(domain: string, rowId: string): Promise<DomainRow> {
+    const row = await maybeGet(domain, rowId);
+    if (!row) throw new Error(`Child context fork missing ${domain}:${rowId}.`);
+    return row;
+  }
+  /** Shared tool segments keep provenance of deleted Conversations whose tool rows cascaded away. */
+  async function existingToolCall(source: DomainRow): Promise<DomainRow | null> {
+    if (source.source_kind === 'tool_call') return maybeGet('ToolCall', id(source.source_id));
+    const result = await maybeGet('ToolModelResult', id(source.source_id));
+    return result ? maybeGet('ToolCall', id(result.tool_call_id)) : null;
   }
   const availableSegments: Array<{ row: DomainRow; turns: Set<string>; messages: Set<string> }> = [];
   const path = new Set<string>();
@@ -110,15 +123,15 @@ export async function prepareChildContextFork(
           for (const turnId of turnsByMessage.get(messageId) ?? []) owners.add(turnId);
           if (turnsByMessage.has(messageId)) messages.add(messageId);
         } else if (source.source_kind === 'tool_call' || source.source_kind === 'tool_model_result') {
-          const call = source.source_kind === 'tool_call'
-            ? await get('ToolCall', id(source.source_id))
-            : await get('ToolCall', id((await get('ToolModelResult', id(source.source_id))).tool_call_id));
-          if (completedTurns.has(id(call.turn_id))) {
+          const call = await existingToolCall(source);
+          if (call && completedTurns.has(id(call.turn_id))) {
             owners.add(id(call.turn_id));
             for (const sourceLink of await list('ToolCallSourceLink', { tool_call_id: id(call.id) })) {
               messages.add(id(sourceLink.message_id));
             }
           }
+        } else {
+          throw new Error(`Child context fork ${String(segment.segment_kind)} segment has an unknown ${String(source.source_kind)} source.`);
         }
       }
       if (owners.size > 0) availableSegments.push({ row: segment, turns: owners, messages });
