@@ -506,10 +506,22 @@ test('可靠 Provider 请求携带冻结 Context root 所属的 conversationId',
   });
 });
 
-test('plan→update_task_list 后只有伪 thought progress 不会续命，semantic stall 自动创建新 Attempt 并完成', async () => {
+test('plan→update_task_list 后只有伪 thought progress 不会续命，semantic stall 自动创建新 Attempt 并完成', async (context) => {
   await withApp('provider-semantic-stall', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'task-list-stall');
     const provider = controlPlane(app, { semanticTimeouts: { firstSemanticMs: 40 } });
+    // Trigger only this watchdog after observing the fixture events. A real 40ms deadline can
+    // expire before SQLite reads finish on a busy CI runner, skipping the assertion setup.
+    const schedule = globalThis.setTimeout;
+    const watchdogs = [];
+    context.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => {
+      if (milliseconds !== 40) return schedule(callback, milliseconds, ...args);
+      const handle = schedule(callback, 30_000, ...args);
+      handle.unref();
+      watchdogs.push({ handle, fire: () => callback(...args) });
+      return handle;
+    });
+    context.after(() => watchdogs.forEach(({ handle }) => clearTimeout(handle)));
     let pseudoProgressStats;
     const originalEpochNow = provider.epochNow;
     let epoch = 10_000;
@@ -536,7 +548,11 @@ test('plan→update_task_list 后只有伪 thought progress 不会续命，seman
             });
           }
           pseudoProgressStats = (await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json;
-          await new Promise((resolve) => controls.signal.addEventListener('abort', resolve, { once: true }));
+          assert.equal(watchdogs.length, 1, '伪 thought progress 不得重置首次语义超时');
+          const abortObserved = new Promise((resolve) => controls.signal.addEventListener('abort', resolve, { once: true }));
+          clearTimeout(watchdogs[0].handle);
+          watchdogs[0].fire();
+          await abortObserved;
           const aborted = new Error('watchdog aborted stalled socket');
           aborted.name = 'AbortError';
           throw aborted;
