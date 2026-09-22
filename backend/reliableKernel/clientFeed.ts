@@ -807,9 +807,6 @@ export class BoundedClientFeed {
         return materialized('CollaborationMessage', field('message_id'));
       case 'CollaborationRequestTurnLink':
         return materialized('CollaborationRequest', field('request_id'));
-      case 'ConversationCommunicationLink':
-        return field('source_conversation_id') === activeConversationId
-          || field('target_conversation_id') === activeConversationId;
       case 'RuntimeDelivery':
         return field('target_conversation_id') === activeConversationId;
       case 'RuntimeDeliveryIntentLink':
@@ -2146,8 +2143,7 @@ const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
   'ChildExecution',
   'AnswerSubmission',
   'RuntimeDelivery',
-  'CollaborationMessage',
-  'ConversationCommunicationLink'
+  'CollaborationMessage'
 ]);
 
 const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
@@ -2168,8 +2164,7 @@ const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
   'ChildExecutionActiveTurnLink',
   'AnswerBridge',
   'RuntimeDelivery',
-  'CollaborationMessage',
-  'ConversationCommunicationLink'
+  'CollaborationMessage'
 ]);
 
 /** Text links which are intentionally not SQLite foreign keys still need an explicit type. */
@@ -2264,8 +2259,7 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
     collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
     collaborationMessageReplyLinks: 'CollaborationMessageReplyLink',
     collaborationRequests: 'CollaborationRequest',
-    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink',
-    conversationCommunicationLinks: 'ConversationCommunicationLink'
+    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink'
 });
 
 function recordKey(domain: string, id: string): string {
@@ -3014,7 +3008,6 @@ function snapshotRetentionCandidates(
   add(window, 'commandReceipts', 'newest-first');
   add(window, 'compressionBlocks', 'oldest-first');
   add(subagents, 'collaborationMessages', 'newest-first');
-  add(subagents, 'conversationCommunicationLinks', 'newest-first');
   return candidates;
 }
 

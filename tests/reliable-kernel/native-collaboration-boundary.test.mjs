@@ -48,8 +48,9 @@ test('pending peer messages end a native tool loop at its first settled response
         await control({ type: 'response.created', responseId: 'response-first', capabilities });
         await event('output_item_done', { type: 'tool_calls', calls: [{ id: 'list', ordinal: 0, name: 'list_agents', arguments: {}, async: false }],
           outputItem: { id: 'list-item', ordinal: 0, providerResponseId: 'response-first' } });
-        await app.runtime.collaboration.send({ source: { kind: 'user', conversationId: 'peer', commandId: 'peer-message' },
-          targetConversationId: 'parent', mode: 'message', text: 'PEER_RUNTIME_BOUNDARY_MESSAGE' });
+        // The peer finished the follow-up this running conversation requested earlier; its result
+        // returns to the requester's live Turn instead of waiting for a later Turn.
+        await app.runtime.collaboration.completeRequestsForTurn({ turnId: 'peer-turn', text: 'PEER_RUNTIME_BOUNDARY_MESSAGE' });
         await control({ type: 'response.completed', responseId: 'response-first' });
         await ended;
         assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0, 'a local yield is never provider delivery acknowledgment');
@@ -64,6 +65,7 @@ test('pending peer messages end a native tool loop at its first settled response
         assert.equal(envelope.kind, 'collaboration_message');
         assert.equal(envelope.content, 'PEER_RUNTIME_BOUNDARY_MESSAGE');
         assert.equal(envelope.sourceConversationId, 'peer');
+        assert.equal(envelope.sourceKind, 'completion');
         assert.match(envelope.note, /not a new user instruction/i);
         const projected = load('backend/reliableKernel/runtimeDeliveryProjection.js').renderRuntimeDeliveryModelEnvelope(
           envelope, undefined, request.recipe.modelHandleCatalog);
@@ -120,11 +122,21 @@ test('pending peer messages end a native tool loop at its first settled response
   try {
     app = await kernel.ReliableKernelApplication.open(root, dependencies);
     const now = new Date().toISOString();
+    const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
+    // A durable follow-up request from parent to peer, already bound to the peer Turn that finished it.
     await app.database.transaction([
-      ...['parent', 'peer'].map(id => kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id, title: id, status: 'active', created_at: now, updated_at: now })),
-      kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'agent-link', conversation_id: 'parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
+      ...['parent', 'peer'].map(id => repo('Conversation').insert({ id, title: id, status: 'active', created_at: now, updated_at: now })),
+      repo('AgentConversationLink').insert({ id: 'agent-link', conversation_id: 'parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now }),
+      repo('Turn').insert({ id: 'peer-turn', conversation_id: 'peer', status: 'terminated', created_at: now, updated_at: now, terminal_at: now }),
+      repo('TurnTermination').insert({ id: 'peer-turn-done', turn_id: 'peer-turn', terminal_status: 'completed', reason: 'fixture', created_at: now }),
+      repo('CollaborationMessage').insertWithNextSequence({ id: 'request-message', dedupe_key: 'request-message', mode: 'followup', created_at: now }, { column: 'message_seq', scope: {} }),
+      repo('CollaborationMessageSourceLink').insert({ id: 'request-source', message_id: 'request-message', conversation_id: 'parent', source_kind: 'tool', source_key: 'request-call', turn_id: null, tool_call_id: null, board_post_id: null, created_at: now }),
+      repo('RuntimeInboxItem').insert({ id: 'request-inbox', dedupe_key: 'request-message', source_kind: 'collaboration_message', source_id: 'request-message', state: 'routed', created_at: now, updated_at: now }),
+      repo('CollaborationMessageTargetLink').insert({ id: 'request-target', message_id: 'request-message', conversation_id: 'peer', inbox_item_id: 'request-inbox', anchor_turn_id: null, created_at: now }),
+      repo('CollaborationBudget').insert({ id: 'request-budget', origin_kind: 'turn', origin_key: 'parent-origin', authority_turn_id: 'parent-origin', created_at: now }),
+      repo('CollaborationRequest').insert({ id: 'request', message_id: 'request-message', budget_id: 'request-budget', automatic: 1n, state: 'pending', created_at: now, updated_at: now }),
+      repo('CollaborationRequestTurnLink').insert({ id: 'request-turn', request_id: 'request', turn_id: 'peer-turn', created_at: now })
     ]);
-    await app.runtime.collaboration.setPermission({ sourceConversationId: 'peer', targetConversationId: 'parent', allowRead: false, allowSend: true, allowWake: false, commandId: 'authorize-peer' });
     const started = await app.turns.input({ source: { kind: 'command', key: 'start-native-peer-fixture' },
       conversationId: 'parent', leaseOwnerId: 'fixture', hostBootId: app.database.hostBootId,
       leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: 'Work while accepting team messages' });

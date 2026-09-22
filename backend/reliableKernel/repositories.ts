@@ -668,7 +668,6 @@ const RESTRICTED_UPDATE_COLUMNS: ReadonlyMap<string, ReadonlySet<string>> = new 
   ['AnswerBridge', new Set(['current_submission_id', 'status', 'updated_at'])],
   ['RuntimeInboxItem', new Set(['state', 'updated_at'])],
   ['CollaborationRequest', new Set(['state', 'updated_at'])],
-  ['ConversationCommunicationLink', new Set(['allow_read', 'allow_send', 'allow_wake', 'command_id', 'updated_at'])],
   ['CollaborationBoardSubscriptionLink', new Set(['active', 'updated_at'])],
   ['RuntimeDelivery', new Set(['target_turn_id', 'phase', 'state', 'failure_reason', 'updated_at'])],
   ['RuntimeDeliveryInputLink', new Set(['handled_at', 'updated_at'])],

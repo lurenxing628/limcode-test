@@ -1,5 +1,4 @@
-﻿import type { CollaborationConversationReadPayload, CollaborationConversationResultPayload, CollaborationGetPayload, CollaborationSnapshotPayload, CollaborationSendPayload, CollaborationPermissionSetPayload, CollaborationMessageReadPayload, CollaborationCommandResultPayload, CollaborationMessageResultPayload, CollaborationBoardCommandPayload, CollaborationBoardResultPayload } from './collaboration';
-import type { TurnExecutionPhase, TurnLifecycleStatus } from './turnLifecycle';
+﻿import type { TurnExecutionPhase, TurnLifecycleStatus } from './turnLifecycle';
 import type { NativeSteeringReceipt, OpenAIResponsesNativeSettings } from './openAIResponsesNative';
 import type { DebugCaptureSettings, DebugCaptureCommand, DebugCaptureResult, DebugCaptureUiBatch, DebugCaptureUiAck } from './debugCapture';
 import type {
@@ -69,17 +68,6 @@ export enum BridgeMessageType {
   GuidanceHold = 'guidance.hold',
   GuidanceControlResult = 'guidance.control.result',
   InteractionResolve = 'interaction.resolve',
-  CollaborationConversationRead = 'collaboration.conversation.read',
-  CollaborationConversationResult = 'collaboration.conversation.result',
-  CollaborationGet = 'collaboration.get',
-  CollaborationSnapshot = 'collaboration.snapshot',
-  CollaborationSend = 'collaboration.send',
-  CollaborationPermissionSet = 'collaboration.permission.set',
-  CollaborationMessageRead = 'collaboration.message.read',
-  CollaborationMessageResult = 'collaboration.message.result',
-  CollaborationCommandResult = 'collaboration.command.result',
-  CollaborationBoardCommand = 'collaboration.board.command',
-  CollaborationBoardResult = 'collaboration.board.result',
   ConversationOpen = 'conversation.open',
   ConversationCreate = 'conversation.create',
   ConversationFork = 'conversation.fork',
@@ -3035,12 +3023,6 @@ export interface AttachmentReloadResultPayload {
 }
 
 export type WebviewToExtensionMessage =
-  | BridgeEnvelope<BridgeMessageType.CollaborationConversationRead, CollaborationConversationReadPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationGet, CollaborationGetPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationSend, CollaborationSendPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationPermissionSet, CollaborationPermissionSetPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationMessageRead, CollaborationMessageReadPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationBoardCommand, CollaborationBoardCommandPayload>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureCommand, DebugCaptureCommand>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureObservation, DebugCaptureUiBatch>
   | BridgeEnvelope<BridgeMessageType.Ready, undefined>
@@ -3121,11 +3103,6 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.FsStatGet, FsStatGetPayload>;
 
 export type ExtensionToWebviewMessage =
-  | BridgeEnvelope<BridgeMessageType.CollaborationConversationResult, CollaborationConversationResultPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationSnapshot, CollaborationSnapshotPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationCommandResult, CollaborationCommandResultPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationMessageResult, CollaborationMessageResultPayload>
-  | BridgeEnvelope<BridgeMessageType.CollaborationBoardResult, CollaborationBoardResultPayload>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureResult, DebugCaptureResult>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureObservationAck, DebugCaptureUiAck>
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>

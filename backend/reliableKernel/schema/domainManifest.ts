@@ -152,8 +152,8 @@ export function createRuntimeDomainIndexSql(
 }
 
 function validateDomainManifest(): void {
-  if (RUNTIME_DOMAIN_SCHEMAS.length !== 108) {
-    throw new Error(`Runtime domain schema exact set must contain 108 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
+  if (RUNTIME_DOMAIN_SCHEMAS.length !== 107) {
+    throw new Error(`Runtime domain schema exact set must contain 107 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
   }
   for (const field of ['key', 'table', 'repository', 'codec'] as const) {
     const values = RUNTIME_DOMAIN_SCHEMAS.map((entry) => entry[field]);

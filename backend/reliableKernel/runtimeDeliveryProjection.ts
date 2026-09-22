@@ -286,7 +286,7 @@ export function requireRuntimeDeliveryModelEnvelope(input: unknown): RuntimeDeli
   if (value.kind === 'collaboration_message') {
     const messageId = requirePhaseFId(value.messageId, 'Collaboration envelope.messageId');
     if (value.sourceId !== messageId || value.status !== 'submitted' || !['message', 'followup'].includes(String(value.mode))) throw new Error('Collaboration envelope has conflicting identity or mode.');
-    if (!['tool', 'user', 'completion', 'board'].includes(String(value.sourceKind))) throw new Error('Collaboration envelope source kind is not supported.');
+    if (!['tool', 'completion', 'board'].includes(String(value.sourceKind))) throw new Error('Collaboration envelope source kind is not supported.');
     let board: { postId: string; channelId: string; threadId: string } | undefined;
     if (value.sourceKind === 'board') {
       const origin = requirePlainRecord(value.board, 'Collaboration board origin');

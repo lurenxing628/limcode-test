@@ -84,10 +84,10 @@ normal changes queue
 ## 同树通信与独立会话协作
 
 - 团队范围从稳定 ChildExecutionParentLink 推导，不另建成员 JSON 或团队所有权表。
-- CollaborationMessage 与 Source/Target/Payload/Reply Links 独立保存消息来源与目标；CollaborationRequest/RequestTurnLink 记录明确跟进任务及结果归属。普通会话通过独立 ConversationCommunicationLink 分别授权读取、发送和唤醒；兄弟通信权不包含终止子树权。
+- CollaborationMessage 与 Source/Target/Payload/Reply Links 独立保存消息来源与目标；CollaborationRequest/RequestTurnLink 记录明确跟进任务及结果归属。团队之外的会话不可寻址，只有跟进任务结果回送原请求方；兄弟通信权不包含终止子树权。
 - 仅发送消息不启动空闲 Turn；明确跟进任务才允许启动。两者均复用 RuntimeInboxItem、RuntimeDelivery、InputLink 和持久 Wake，新的来源类型保留工具级权限，不伪装用户授权。
 - 正式 AnswerBridge/AnswerSubmission 仍投原父任务；请求发起方的结果使用独立回复关系，不改写稳定父边。
 - 留言板的 Channel/ScopeLink、Post/ChannelLink/SourceLink/ReplyLink、SubscriptionLink 与 CommandReceipt 独立持久化；只有运行中的订阅者接收通知，不因通知拉起空闲 Agent。
 - Client Feed 只投影当前会话参与的最近 32 条消息与独立关系，正文和留言板按授权查询。运行时续接预览保留 collaboration_message 来源和有界摘要，不当作用户输入。
-- 删除目标会话时，协作 pending Delivery 同事务 failed(target-gone)，pending Request failed，未完成 Wake dead_letter；历史 Message/Inbox 和另一会话已消费内容保留。删除留言板根或作者时先清理相关 Posts/Replies/Channels，独立权限 Link 由 FK 清理。
-- epoch 5 的 108 个领域必须与 authority crosswalk 完整匹配；旧 epoch 离线归档重置，当前代缺表或 metadata 漂移拒绝打开。
+- 删除目标会话时，协作 pending Delivery 同事务 failed(target-gone)，pending Request failed，未完成 Wake dead_letter；历史 Message/Inbox 和另一会话已消费内容保留。删除留言板根或作者时先清理相关 Posts/Replies/Channels。
+- epoch 5 的 107 个领域必须与 authority crosswalk 完整匹配；旧 epoch 离线归档重置，当前代缺表或 metadata 漂移拒绝打开。

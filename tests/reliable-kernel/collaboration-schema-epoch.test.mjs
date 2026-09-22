@@ -12,9 +12,12 @@ const Database = require('better-sqlite3');
 
 test('epoch5 collaboration schema and authority crosswalk have one exact definition', async () => {
   assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 5);
-  assert.equal(RUNTIME_DOMAIN_SCHEMAS.length, 108);
+  assert.equal(RUNTIME_DOMAIN_SCHEMAS.length, 107);
   const authority = JSON.parse(await fs.readFile('docs/architecture/reliable-kernel/contracts/authority.json', 'utf8'));
-  assert.equal(authority.runtimeDomains.length, 108);
+  assert.equal(authority.runtimeDomains.length, 107);
+  // Cross-conversation reach is not a per-pair grant table; only team lineage and completion replies route.
+  assert.equal(RUNTIME_DOMAIN_SCHEMAS.some(schema => schema.key === 'ConversationCommunicationLink'), false);
+  assert.equal(authority.runtimeDomains.some(row => row.key === 'ConversationCommunicationLink'), false);
   for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
     const contract = authority.runtimeDomains.find(row => row.key === schema.key);
     assert.ok(contract, schema.key);
@@ -27,11 +30,11 @@ test('epoch5 collaboration schema and authority crosswalk have one exact definit
 });
 
 for (const [label, mutate] of [
-  ['missing collaboration table', db => { db.exec('DROP TABLE conversation_communication_link'); db.prepare('DELETE FROM schema_manifest WHERE domain_key = ?').run('ConversationCommunicationLink'); }],
+  ['missing collaboration table', db => { db.exec('DROP TABLE collaboration_request_turn_link'); db.prepare('DELETE FROM schema_manifest WHERE domain_key = ?').run('CollaborationRequestTurnLink'); }],
   ['missing formerly additive table', db => { db.exec('DROP TABLE runtime_delivery_intent_link'); db.prepare('DELETE FROM schema_manifest WHERE domain_key = ?').run('RuntimeDeliveryIntentLink'); }],
   ['manifest drift', db => db.prepare("UPDATE schema_manifest SET client_mapping = 'detail' WHERE domain_key = 'CollaborationMessage'").run()],
   ['extra physical object', db => db.exec('CREATE TABLE unknown_collaboration (id TEXT PRIMARY KEY)')],
-  ['index drift', db => { db.exec('DROP INDEX ux_conversation_communication_link_01'); db.exec('CREATE INDEX ux_conversation_communication_link_01 ON conversation_communication_link (target_conversation_id)'); }]
+  ['index drift', db => { db.exec('DROP INDEX ux_collaboration_request_01'); db.exec('CREATE INDEX ux_collaboration_request_01 ON collaboration_request (budget_id)'); }]
 ]) test(`current epoch5 ${label} fails closed without repair or archive`, async () => {
   const scope = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-collaboration-schema-'));
   try {

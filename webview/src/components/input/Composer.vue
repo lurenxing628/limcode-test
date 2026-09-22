@@ -31,7 +31,6 @@ import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
-import CollaborationPanel from '@webview/components/input/CollaborationPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
 import SteeringStatusPanel from '@webview/components/input/SteeringStatusPanel.vue';
 import SessionThinkingControl from '@webview/components/input/SessionThinkingControl.vue';
@@ -845,7 +844,6 @@ function middleEllipsis(value: string, maxLength: number): string {
         </div>
       </div>
       <div class="composer-top-actions">
-        <CollaborationPanel />
         <ReliableAgentStatusPanel />
         <BackgroundCommandPanel />
       </div>

@@ -48,9 +48,9 @@ async function fixture(run, budget = 32) {
     ]);
     await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, store, rows, get,
       async reopen() { await database.close(); database = await RuntimeDatabase.open(authority); deliveries = new RuntimeDeliveryControlPlane(database, { now: () => NOW }); collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW }); },
-      async source(id = `call-${++callSeq}`, conversationId = 'left', turnId = `${conversationId}-turn`) {
+      async source(id = `call-${++callSeq}`, conversationId = 'left', turnId = `${conversationId}-turn`, toolName = 'send_agent_message') {
         const content = await store.prepare(database, '{}', 'application/json');
-        await database.transaction([...preparedContentObjectSteps([content], 'message_tool'), repo('ToolCall').insert({ id, turn_id: turnId, call_seq: BigInt(++callSeq), tool_name: 'send_agent_message', status: 'pending', arguments_object_id: content.metadata.id, created_at: NOW, updated_at: NOW })]);
+        await database.transaction([...preparedContentObjectSteps([content], 'message_tool'), repo('ToolCall').insert({ id, turn_id: turnId, call_seq: BigInt(++callSeq), tool_name: toolName, status: 'pending', arguments_object_id: content.metadata.id, created_at: NOW, updated_at: NOW })]);
         return { kind: 'tool', turnId, toolCallId: id };
       }
     });
@@ -74,17 +74,22 @@ test('sibling send commits once, preserves source identity, and never wakes idle
   await assert.rejects(f.collaboration.readMessage({ conversationId: 'outsider', messageId: results[0].messageId }), /private messages/);
 }));
 
-test('ordinary conversation grant and revoke cannot bypass team controls', async () => fixture(async f => {
-  const source = await f.source('root-call', 'root');
-  const input = { source, targetConversationId: 'outsider', text: 'inspect this', mode: 'followup' };
-  await assert.rejects(f.collaboration.send(input), /not authorized/);
-  await f.collaboration.setPermission({ sourceConversationId: 'root', targetConversationId: 'outsider', allowRead: true, allowSend: true, allowWake: true, commandId: 'allow' });
-  const accepted = await f.collaboration.send(input);
-  assert.equal(accepted.accepted, true);
-  assert.equal((await f.rows('RuntimeDeliveryWake')).length, 1);
-  await f.collaboration.setPermission({ sourceConversationId: 'root', targetConversationId: 'outsider', allowRead: false, allowSend: false, allowWake: false, commandId: 'revoke' });
-  await assert.rejects(f.collaboration.send({ ...input, source: await f.source('root-call-two', 'root') }), /not authorized/);
-  await assert.rejects(f.collaboration.setPermission({ sourceConversationId: 'root', targetConversationId: 'right', allowRead: true, allowSend: true, allowWake: true, commandId: 'bypass' }), /child team authority/);
+test('conversations outside the team stay unreachable and another team child is never addressable', async () => fixture(async f => {
+  await f.database.transaction([
+    repo('Conversation').insert({ id: 'foreign', title: 'foreign', status: 'active', created_at: NOW, updated_at: NOW }),
+    repo('ChildExecution').insert({ id: 'foreign-child', child_conversation_id: 'foreign', status: 'idle', created_at: NOW, updated_at: NOW }),
+    repo('ChildExecutionParentLink').insert({ id: 'foreign-parent', child_execution_id: 'foreign-child', source_tool_call_id: 'foreign-spawn', parent_child_execution_id: null, parent_turn_id: 'outsider-turn', created_at: NOW })
+  ]);
+  for (const mode of ['message', 'followup']) {
+    await assert.rejects(f.collaboration.send({ source: await f.source(`root-${mode}`, 'root'), targetConversationId: 'outsider', text: 'inspect this', mode }), /Cross-conversation collaboration is not enabled/);
+    await assert.rejects(f.collaboration.send({ source: await f.source(`child-${mode}`), targetConversationId: 'outsider', text: 'inspect this', mode }), /child task of another team/);
+  }
+  await assert.rejects(f.collaboration.send({ source: await f.source('root-foreign-child', 'root'), targetConversationId: 'foreign', text: 'bypass', mode: 'followup' }), /child task of another team/);
+  await assert.rejects(f.collaboration.listMessages({ conversationId: 'root', targetConversationId: 'outsider' }), /not enabled/);
+  await assert.rejects(f.collaboration.readConversation({ conversationId: 'root', targetConversationId: 'outsider' }), /not enabled/);
+  assert.equal((await f.collaboration.listMembers('root')).members.some(member => member.conversationId === 'outsider'), false);
+  assert.equal((await f.collaboration.listMembers('root')).members.every(member => !('relation' in member)), true);
+  for (const domain of ['CollaborationMessage', 'RuntimeDelivery', 'RuntimeDeliveryWake', 'CollaborationBudget']) assert.equal((await f.rows(domain)).length, 0, domain);
 }));
 
 test('current-turn delivery preserves non-user provenance and separates injected from handled', async () => fixture(async f => {
@@ -175,43 +180,39 @@ test('same-clock concurrent messages use a stable sequence for forward and backw
   assert.throws(() => repo('CollaborationMessage').list({ orderBy: { column: 'message_seq', direction: 'asc' }, keyset: { column: 'message_seq', value: 'not-an-integer', id: 'x', direction: 'after' }, limit: 1 }), /integer|INTEGER/);
 }));
 
-test('a spawned child inherits the ordinary-conversation requester budget across roots', async () => fixture(async f => {
-  await f.collaboration.setPermission({ sourceConversationId: 'root', targetConversationId: 'outsider', allowRead: true, allowSend: true, allowWake: true, commandId: 'grant-budget' });
-  await f.collaboration.send({ source: await f.source('start-other', 'root'), targetConversationId: 'outsider', text: 'delegate', mode: 'followup' });
-  await admitPending(f, 'outsider', 'outsider-next');
+test('a nested child spawned by a followup Turn cannot reset the team followup budget', async () => fixture(async f => {
+  await f.collaboration.send({ source: await f.source('start-right', 'root'), targetConversationId: 'right', text: 'delegate', mode: 'followup' });
+  await admitPending(f, 'right', 'right-next');
   const policy = await f.get('AuthoritySnapshot', 'root-authority');
   await f.database.transaction([
+    repo('ChildExecution').update('right-child', { status: 'active', updated_at: NOW }),
     repo('Conversation').insert({ id: 'nested', title: 'nested', status: 'active', created_at: NOW, updated_at: NOW }),
     repo('Turn').insert({ id: 'nested-turn', conversation_id: 'nested', status: 'active', created_at: NOW, updated_at: NOW, terminal_at: null }),
     repo('AuthoritySnapshot').insert({ id: 'nested-policy', turn_id: 'nested-turn', content_object_id: policy.content_object_id, created_at: NOW }),
     repo('ChildExecution').insert({ id: 'nested-child', child_conversation_id: 'nested', status: 'active', created_at: NOW, updated_at: NOW }),
-    repo('ChildExecutionParentLink').insert({ id: 'nested-parent', child_execution_id: 'nested-child', source_tool_call_id: 'nested-spawn', parent_child_execution_id: null, parent_turn_id: 'outsider-next', created_at: NOW })
+    repo('ChildExecutionParentLink').insert({ id: 'nested-parent', child_execution_id: 'nested-child', source_tool_call_id: 'nested-spawn', parent_child_execution_id: 'right-child', parent_turn_id: 'right-next', created_at: NOW })
   ]);
-  await assert.rejects(f.collaboration.send({ source: await f.source('nested-followup', 'nested'), targetConversationId: 'outsider', text: 'try to reset', mode: 'followup' }), /budget exhausted/);
+  await assert.rejects(f.collaboration.send({ source: await f.source('nested-followup', 'nested'), targetConversationId: 'right', text: 'try to reset', mode: 'followup' }), /budget exhausted/);
   assert.equal((await f.rows('CollaborationBudget')).length, 1);
 }, 1));
 
-test('zero automatic budget still permits an explicit user followup without granting agent wake authority', async () => fixture(async f => {
-  const result = await f.collaboration.send({ source: { kind: 'user', conversationId: 'root', commandId: 'manual-followup' }, targetConversationId: 'right', text: 'user explicitly continues this task', mode: 'followup' });
-  assert.equal(result.accepted, true);
-  assert.equal((await f.rows('CollaborationRequest'))[0].automatic, 0n);
-  await admitPending(f, 'right', 'right-next');
-  await f.database.transaction([repo('ChildExecution').update('right-child', { status: 'active', updated_at: NOW })]);
-  await assert.rejects(f.collaboration.send({ source: await f.source('auto-after-manual', 'right', 'right-next'), targetConversationId: 'root', text: 'unauthorized automatic chain', mode: 'followup' }), /budget exhausted/);
-  assert.equal((await f.rows('CollaborationRequest')).length, 1);
+test('zero automatic budget rejects every agent followup while plain messages still queue', async () => fixture(async f => {
+  await assert.rejects(f.collaboration.send({ source: await f.source('zero-followup'), targetConversationId: 'right', text: 'continue this task', mode: 'followup' }), /budget exhausted \(0\)/);
+  assert.equal((await f.rows('CollaborationRequest')).length, 0);
+  const message = await f.collaboration.send({ source: await f.source('zero-message'), targetConversationId: 'right', text: 'plain update', mode: 'message' });
+  assert.equal(message.accepted, true);
+  assert.equal((await f.rows('RuntimeDeliveryWake')).length, 0);
 }, 0));
 
-test('read permission exposes bounded transcript content and revoke removes access', async () => fixture(async f => {
-  const content = await f.store.prepare(f.database, JSON.stringify({ role: 'model', parts: [{ text: 'private answer' }] }), 'application/vnd.limcode.message+json');
+test('team transcript reads are bounded while conversations outside the team stay unreadable', async () => fixture(async f => {
+  const content = await f.store.prepare(f.database, JSON.stringify({ role: 'model', parts: [{ text: 'private answer' }, { text: 'hidden reasoning', thought: true }] }), 'application/vnd.limcode.message+json');
   await f.database.transaction([...preparedContentObjectSteps([content], 'transcript'),
     repo('Message').insert({ id: 'history-message', created_at: NOW, updated_at: NOW, deleted_at: null }),
     repo('MessageRevision').insert({ id: 'history-revision', message_id: 'history-message', revision_seq: 1n, role: 'model', content_object_id: content.metadata.id, created_at: NOW }),
     repo('MessageCurrentRevisionLink').insert({ id: 'history-current', message_id: 'history-message', revision_id: 'history-revision', updated_at: NOW }),
-    repo('MessagePartOfConversation').insert({ id: 'history-member', conversation_id: 'outsider', message_id: 'history-message', message_seq: 1n, created_at: NOW })]);
-  const command = { conversationId: 'root', targetConversationId: 'outsider' };
-  await assert.rejects(f.collaboration.readConversation(command), /not authorized/);
-  await f.collaboration.setPermission({ sourceConversationId: 'root', targetConversationId: 'outsider', allowRead: true, allowSend: false, allowWake: false, commandId: 'read-only' });
-  assert.equal((await f.collaboration.readConversation(command)).messages[0].text, 'private answer');
+    repo('MessagePartOfConversation').insert({ id: 'history-member', conversation_id: 'left', message_id: 'history-message', message_seq: 1n, created_at: NOW })]);
+  await assert.rejects(f.collaboration.readConversation({ conversationId: 'root', targetConversationId: 'outsider' }), /not enabled/);
+  assert.equal((await f.collaboration.readConversation({ conversationId: 'root', targetConversationId: 'left' })).messages[0].text, 'private answer');
   const taskPrompt = await f.store.prepare(f.database, 'child initial task in plain text', 'text/plain');
   await f.database.transaction([...preparedContentObjectSteps([taskPrompt], 'child_prompt'),
     repo('Message').insert({ id: 'child-first-message', created_at: NOW, updated_at: NOW, deleted_at: null }),
@@ -219,9 +220,7 @@ test('read permission exposes bounded transcript content and revoke removes acce
     repo('MessageCurrentRevisionLink').insert({ id: 'child-first-current', message_id: 'child-first-message', revision_id: 'child-first-revision', updated_at: NOW }),
     repo('MessagePartOfConversation').insert({ id: 'child-first-member', conversation_id: 'right', message_id: 'child-first-message', message_seq: 1n, created_at: NOW })]);
   assert.equal((await f.collaboration.readConversation({ conversationId: 'root', targetConversationId: 'right' })).messages[0].text, 'child initial task in plain text');
-
-  await f.collaboration.setPermission({ sourceConversationId: 'root', targetConversationId: 'outsider', allowRead: false, allowSend: false, allowWake: false, commandId: 'revoke-read' });
-  await assert.rejects(f.collaboration.readConversation(command), /not authorized/);
+  assert.equal((await f.collaboration.readConversation({ conversationId: 'left', targetConversationId: 'right' })).messages[0].text, 'child initial task in plain text');
 }));
 
 test('the durable wake scanner starts exactly one followup while idle messages stay queued', async () => fixture(async f => {
@@ -263,9 +262,10 @@ test('the source execution lease generation fences an otherwise valid live ToolC
 test('board notification expires with its original running Turn instead of becoming next-turn backlog', async () => fixture(async f => {
   const { CollaborationBoard } = load('collaborationBoard.js');
   const board = new CollaborationBoard(f.database, f.store, { now: () => NOW });
-  const { channel } = await board.executeUser({ conversationId: 'root', commandId: 'board-channel' }, { operation: 'create_channel', name: 'peer-updates' });
-  const post = await board.executeUser({ conversationId: 'root', commandId: 'board-post' }, { operation: 'post', channelId: channel.id, text: 'a'.repeat(70_000) });
-  const notice = { postId: post.postId, channelId: channel.id, threadId: post.threadId ?? post.postId, sourceConversationId: 'root', targetConversationId: 'left' };
+  const boardCall = async id => { await f.source(id, 'root', 'root-turn', 'agent_board'); return { conversationId: 'root', turnId: 'root-turn', toolCallId: id }; };
+  const { channel } = await board.execute(await boardCall('board-channel'), { operation: 'create_channel', name: 'peer-updates' });
+  const post = await board.execute(await boardCall('board-post'), { operation: 'post', channelId: channel.id, text: 'a'.repeat(70_000) });
+  const notice = { postId: post.postId, channelId: channel.id, threadId: post.threadId ?? post.postId, sourceConversationId: 'root', targetConversationId: 'left', sourceTurnId: 'root-turn', sourceToolCallId: 'board-post' };
   assert.equal((await f.collaboration.notifyBoardPost(notice)).status, 'delivered');
   const delivery = (await f.rows('RuntimeDelivery'))[0];
   assert.equal(delivery.target_turn_id, 'left-turn');
@@ -277,19 +277,6 @@ test('board notification expires with its original running Turn instead of becom
   assert.equal((await f.get('RuntimeDelivery', delivery.id)).failure_reason, 'board-notification-expired');
   await admitPending(f, 'left', 'left-later');
   assert.equal((await f.rows('PendingTurnInput', { turn_id: 'left-later' })).length, 0);
-}));
-
-test('permission receipts reject changed commands and cannot replay an old grant after revocation', async () => fixture(async f => {
-  const grant = { sourceConversationId: 'root', targetConversationId: 'outsider', allowRead: true, allowSend: true, allowWake: true, commandId: 'durable-grant' };
-  const concurrent = await Promise.all([f.collaboration.setPermission(grant), f.collaboration.setPermission(grant)]);
-  assert.equal(concurrent.every(result => result.allowWake), true);
-  assert.equal((await f.rows('CommandReceipt')).length, 1);
-  await f.collaboration.setPermission({ ...grant, allowRead: false, allowSend: false, allowWake: false, commandId: 'durable-revoke' });
-  await f.reopen();
-  assert.equal((await f.collaboration.setPermission(grant)).allowSend, false);
-  assert.equal((await f.collaboration.listPermissions('root'))[0].allowWake, false);
-  await assert.rejects(f.collaboration.setPermission({ ...grant, allowRead: false }), /replay conflicts/);
-  assert.equal((await f.rows('CommandReceipt')).length, 2);
 }));
 
 test('automatic runtime continuation cannot reset the user root followup budget', async () => fixture(async f => {

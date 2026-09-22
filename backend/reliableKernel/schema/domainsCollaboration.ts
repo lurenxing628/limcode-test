@@ -50,11 +50,5 @@ export const COLLABORATION_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     key: 'CollaborationRequestTurnLink', table: 'collaboration_request_turn_link', repository: 'CollaborationRequestTurnLinkRepository', codec: 'CollaborationRequestTurnLinkRowCodec',
     mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-request', indexes: ['request_id UNIQUE', 'turn_id'],
     columns: [id(), ref('request_id', 'collaboration_request'), text('turn_id'), text('created_at')]
-  }),
-  domain({
-    key: 'ConversationCommunicationLink', table: 'conversation_communication_link', repository: 'ConversationCommunicationLinkRepository', codec: 'ConversationCommunicationLinkRowCodec',
-    mutations: ['insert', 'update', 'delete'], client: 'summary', deletePolicy: 'cascade-with-conversation',
-    indexes: ['source_conversation_id,target_conversation_id UNIQUE', 'target_conversation_id'],
-    columns: [id(), ref('source_conversation_id', 'conversation'), ref('target_conversation_id', 'conversation'), integer('allow_read'), integer('allow_send'), integer('allow_wake'), text('command_id'), text('created_at'), text('updated_at')]
   })
 ];

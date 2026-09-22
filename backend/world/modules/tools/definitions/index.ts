@@ -7,7 +7,6 @@ import { editToolModule } from './edit';
 import { readFileToolModule } from './readFile';
 import { runAgentToolModule } from './runAgent';
 import { agentCollaborationToolModules } from './agentCollaboration';
-import { agentBoardToolModule } from './agentBoard';
 import { submitPlanToolModule } from './submitPlan';
 import { switchWorkEnvironmentToolModule } from './switchWorkEnvironment';
 import { taskListToolModule } from './taskList';
@@ -48,7 +47,6 @@ const BUILTIN_TOOL_MODULES: readonly ToolDefinitionModule[] = [
   readAgentAnswerToolModule,
   runAgentToolModule,
   ...agentCollaborationToolModules,
-  agentBoardToolModule,
   commandToolModule
 ];
 

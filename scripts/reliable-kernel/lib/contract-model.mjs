@@ -164,7 +164,6 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'CollaborationBudget',
   'CollaborationRequest',
   'CollaborationRequestTurnLink',
-  'ConversationCommunicationLink',
   'CollaborationBoardChannel',
   'CollaborationBoardChannelScopeLink',
   'CollaborationBoardPost',
@@ -984,7 +983,7 @@ function validateSubagent(subagent, failures) {
   failures.push(...exactSetProblems('协作消息领域', [
     'CollaborationMessage', 'CollaborationMessageSourceLink', 'CollaborationMessageTargetLink',
     'CollaborationMessagePayloadLink', 'CollaborationMessageReplyLink', 'CollaborationBudget', 'CollaborationRequest',
-    'CollaborationRequestTurnLink', 'ConversationCommunicationLink'
+    'CollaborationRequestTurnLink'
   ], collaboration?.messageDomains ?? []));
   failures.push(...exactSetProblems('协作留言板领域', [
     'CollaborationBoardChannel', 'CollaborationBoardChannelScopeLink', 'CollaborationBoardPost',
@@ -1052,7 +1051,7 @@ function validateSubagent(subagent, failures) {
 function validateClient(client, failures) {
   const collaboration = client?.collaborationProjection;
   if (collaboration?.scope !== 'selected-conversation-source-or-target-only'
-    || collaboration?.snapshotMessageLimit !== 32 || collaboration?.snapshotPermissionLimit !== 32
+    || collaboration?.snapshotMessageLimit !== 32
     || collaboration?.messageBodiesInFeed !== false || collaboration?.boardBodiesInFeed !== false) {
     failures.push('协作前端投影必须有界、仅属于当前会话并按需读取正文');
   }

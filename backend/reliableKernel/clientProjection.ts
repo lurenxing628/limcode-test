@@ -987,11 +987,6 @@ export function executeClientProjectionSnapshot(
     const collaborationMessageReplyLinks = queryAllByIds(database, 'collaboration_message_reply_link', 'message_id', collaborationIds);
     const collaborationRequests = queryAllByIds(database, 'collaboration_request', 'message_id', collaborationIds);
     const collaborationRequestTurnLinks = queryAllByIds(database, 'collaboration_request_turn_link', 'request_id', collaborationRequests.map(row => String(row.id)));
-    const conversationCommunicationLinks = queryPlainRows(database, `
-      SELECT * FROM conversation_communication_link
-       WHERE source_conversation_id = @conversationId OR target_conversation_id = @conversationId
-       ORDER BY updated_at DESC, id DESC LIMIT 32
-    `, { conversationId });
 
     const snapshot: ClientProjectionSnapshot = {
       navigationSummary: { conversations },
@@ -1069,8 +1064,7 @@ export function executeClientProjectionSnapshot(
         collaborationMessageTargetLinks,
         collaborationMessageReplyLinks,
         collaborationRequests,
-        collaborationRequestTurnLinks,
-        conversationCommunicationLinks
+        collaborationRequestTurnLinks
       }
     };
     database.exec('COMMIT');

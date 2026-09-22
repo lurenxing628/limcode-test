@@ -277,57 +277,77 @@ for (const providerType of ['openai-compatible', 'openai-responses']) test(`${pr
   }, providerType);
 });
 
-test('ordinary conversation follow-up enters the owning runner and revoked permission rejects a previously issued reference', { timeout: 60000 }, async () => {
-  let phase = 'initialize', rootRound = 0, ordinaryTurns = 0, ordinaryRef, followedUp = false;
-  const taskText = 'ORDINARY_FOLLOWUP_9217';
-  const resultText = 'ORDINARY_RESULT_7436';
+test('a child follow-up to its idle root enters the owning runner while conversations outside the team stay unreachable', { timeout: 60000 }, async () => {
+  let rootRound = 0, childRound = 0, rootFirstTurn, followupTurn, child, childFinished = false;
+  const taskText = 'ROOT_FOLLOWUP_9217';
+  const resultText = 'ROOT_RESULT_7436';
   await fixture(async (request, f, start, wire) => {
-    if (request.conversationId === 'ordinary') {
-      ordinaryTurns += 1;
-      if (ordinaryTurns === 1) return answer('Initial ordinary conversation completed.');
-      assert.equal(ordinaryTurns, 2, 'only the authorized follow-up starts an ordinary Turn');
-      assert.ok(JSON.stringify(wire).includes(taskText));
-      assertPeerWireRole(wire, taskText);
-      assert.equal(f.app.database.conversationOwners.owns('ordinary'), true, 'only the conversation owner may execute the follow-up');
-      assert.equal((await f.rows('ChildExecutionTurnLink', { turn_id: request.turnId })).length, 0, 'ordinary peers do not acquire child lineage');
-      followedUp = true;
-      return answer(resultText);
-    }
-    rootRound += 1;
-    if (phase === 'authorized') {
-      if (rootRound === 1) return toolsAnswer(call('ordinary-members', 'list_agents'));
-      if (rootRound === 2) {
-        const peer = detail(start, 'list_agents').members.find(member => member.relation === 'permitted');
-        assert.equal(peer.relation, 'permitted');
-        assert.equal(peer.allowWake, true);
-        ordinaryRef = peer.conversationRef;
-        return toolsAnswer(call('ordinary-followup', 'followup_agent_task', { conversationRef: ordinaryRef, text: taskText }));
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === 'ordinary') return answer('Initial ordinary conversation completed.');
+    if (request.conversationId === 'root') {
+      rootRound += 1;
+      if (rootRound === 1) {
+        rootFirstTurn = request.turnId;
+        await assert.rejects(f.app.runtime.collaboration.readConversation({ conversationId: 'root', targetConversationId: 'ordinary' }), /not enabled/);
+        return toolsAnswer(call('root-members', 'list_agents'));
       }
-      await f.until(async () => (await f.app.runtime.collaboration.listMessages({ conversationId: 'root' })).messages.some(message => message.sourceKind === 'completion'), 'Ordinary peer result was not returned.');
-      return answer('Authorized ordinary follow-up completed.');
+      if (rootRound === 2) {
+        const roster = detail(start, 'list_agents');
+        assert.equal(roster.members.length, 1, 'the roster lists only the derived team, never other conversations');
+        return toolsAnswer(call('spawn-worker', 'run_agent', { operation: 'spawn', taskName: 'worker', prompt: 'WORKER_TASK_3310', foregroundWaitMs: 0 }));
+      }
+      if (request.turnId === rootFirstTurn) return answer('Root delegated and ended its Turn.');
+      if (!followupTurn && text.includes(taskText)) followupTurn = request.turnId;
+      if (request.turnId === followupTurn) {
+        assertPeerWireRole(wire, taskText);
+        assert.equal(f.app.database.conversationOwners.owns('root'), true, 'only the conversation owner may execute the follow-up');
+        assert.equal((await f.rows('ChildExecutionTurnLink', { turn_id: request.turnId })).length, 0, 'a root follow-up never acquires child lineage');
+        return answer(resultText);
+      }
+      assert.fail(`Unexpected root Turn ${request.turnId}.`);
     }
-    assert.equal(phase, 'revoked');
-    if (rootRound === 1) return toolsAnswer(call('ordinary-revoked', 'followup_agent_task', { conversationRef: ordinaryRef, text: 'THIS_MUST_NOT_BE_SENT_6408' }));
-    const result = lastResult(start, 'followup_agent_task');
-    assert.match(JSON.stringify(result), /not authorized/);
-    return answer('Revocation rejected the stale address.');
+    child ??= request.conversationId;
+    assert.equal(request.conversationId, child);
+    childRound += 1;
+    if (childRound === 1) {
+      assert.ok(text.includes('WORKER_TASK_3310'));
+      await f.until(async () => (await f.rows('TurnTermination', { turn_id: rootFirstTurn }))[0], 'Root never became idle.');
+      return toolsAnswer(call('worker-members', 'list_agents'));
+    }
+    if (childRound === 2) {
+      const roster = detail(start, 'list_agents');
+      assert.equal(roster.members.length, 2, 'root and worker only; other conversations are not team members');
+      const root = roster.members.find(member => member.parentConversationRef === null);
+      assert.ok(root, JSON.stringify(roster));
+      return toolsAnswer(call('worker-followup-root', 'followup_agent_task', { conversationRef: root.conversationRef, text: taskText }));
+    }
+    if (childRound === 3) {
+      assert.equal(detail(start, 'followup_agent_task').accepted, true);
+      await f.until(async () => (await f.app.runtime.collaboration.listMessages({ conversationId: child })).messages.some(message => message.sourceKind === 'completion'), 'Root result was not returned to the requesting worker.');
+      return answer('Worker is waiting for the root result.');
+    }
+    if (childRound === 4) {
+      assert.ok(text.includes(resultText), 'the completion reply reaches the requesting worker while its Turn is still running');
+      childFinished = true;
+      return answer('Worker finished after the root result.');
+    }
+    return answer('Worker has nothing more to do.');
   }, async f => {
     const initial = await f.input('ordinary', 'ordinary-initial');
     assert.equal((await f.terminated(initial.turnId)).terminal_status, 'completed');
-    await f.app.runtime.collaboration.setPermission({ commandId: 'grant-ordinary', sourceConversationId: 'root', targetConversationId: 'ordinary', allowRead: true, allowSend: true, allowWake: true });
-    phase = 'authorized';
-    const allowed = await f.input('root', 'ordinary-authorized');
-    assert.equal((await f.terminated(allowed.turnId)).terminal_status, 'completed');
-    assert.equal(followedUp, true);
-    assert.ok(f.wakes.some(wake => wake.conversationId === 'ordinary' && wake.action === 'start_continuation' && !wake.childExecutionId));
-    const completion = (await f.app.runtime.collaboration.listMessages({ conversationId: 'root' })).messages.find(message => message.sourceKind === 'completion');
-    assert.equal((await f.app.runtime.collaboration.readMessage({ conversationId: 'root', messageId: completion.messageId })).text, resultText);
-    const before = (await f.rows('CollaborationMessage')).length;
-    await f.app.runtime.collaboration.setPermission({ commandId: 'revoke-ordinary', sourceConversationId: 'root', targetConversationId: 'ordinary', allowRead: false, allowSend: false, allowWake: false });
-    phase = 'revoked'; rootRound = 0;
-    const rejected = await f.input('root', 'ordinary-revoked');
-    assert.equal((await f.terminated(rejected.turnId)).terminal_status, 'completed');
-    assert.equal((await f.rows('CollaborationMessage')).length, before, 'revocation fails before committing any peer message');
-    assert.equal((await f.rows('Turn', { conversation_id: 'ordinary' })).length, 2);
+    const started = await f.input('root', 'root-delegates');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    await f.until(async () => childFinished
+      && (await f.rows('Turn', { conversation_id: 'root' })).every(turn => turn.status === 'terminated')
+      && (await f.rows('Turn', { conversation_id: child })).every(turn => turn.status === 'terminated')
+      && (await f.rows('RuntimeDelivery', { state: 'pending' })).length === 0, 'Team work did not settle.');
+    assert.equal((await f.rows('Turn', { conversation_id: 'root' })).length, 2, 'the follow-up starts exactly one root Turn');
+    assert.ok(f.wakes.some(wake => wake.conversationId === 'root' && wake.sourceKind === 'collaboration_message'
+      && wake.action === 'start_continuation' && !wake.childExecutionId), 'the root follow-up is scheduled through the conversation runner');
+    const completion = (await f.app.runtime.collaboration.listMessages({ conversationId: child })).messages.find(message => message.sourceKind === 'completion');
+    assert.equal((await f.app.runtime.collaboration.readMessage({ conversationId: child, messageId: completion.messageId })).text, resultText);
+    assert.equal((await f.rows('CollaborationRequest'))[0].state, 'completed');
+    assert.equal((await f.rows('Turn', { conversation_id: 'ordinary' })).length, 1, 'a conversation outside the team is never started');
+    assert.equal((await f.rows('CollaborationMessageTargetLink', { conversation_id: 'ordinary' })).length, 0);
   });
 });

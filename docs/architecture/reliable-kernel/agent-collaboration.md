@@ -10,24 +10,24 @@
 
 配置在 Turn authority 中冻结，模型工具参数不包含以上设置。已有成员通信、读取和等待不增加深度。用户定制的工具允许列表继续生效，不为新增功能绕过已禁用的工具。
 
-输入区「协作」面板提供成员、消息、独立对话权限和留言板入口。发送消息和续派任务是两个明确动作；界面区分已提交、已注入输入和模型已处理。
+协作由模型工具发起，输入区不提供手动授权或留言板入口。发送消息和续派任务是两个明确动作；队列与消息状态区分已提交、已注入输入和模型已处理。
 
 ## 身份与授权
 
 同根团队从 `ChildExecutionParentLink` 和 Conversation/Turn 关系派生。父子树记录任务来源和生命周期；通信不改变父子树，也不把 Agent 配置作为运行地址。现有 `run_agent.send/interrupt_subtree` 仍只控制直接孩子。
 
-普通独立对话之间使用 `ConversationCommunicationLink`，由用户授予读取、发送和唤醒权限。模型工具没有授予权限的入口，普通对话接口不能借授权关系绕过子 Agent 的团队归属。
+团队之外的对话不可读取、发送或唤醒，也没有逐对话授权表；唯一例外是跟进任务完成后把结果回送给原请求方。跨对话协作将由独立设置开关统一开放，届时也不能借此寻址其他团队的子 Agent。
 
 模型侧使用冻结的短引用目录，内部 Conversation、消息、频道和帖子身份不直接暴露。普通请求、native 同一逻辑请求内的后续调用、压缩和重启共用持久映射；继承历史引用不授予原团队操作权限。
 
 ## 工具与投递
 
 - `run_agent` 继续管理创建、排队续聊、读取、等待和停止直接子树。
-- `list_agents` 返回同根成员及已授权独立对话。
+- `list_agents` 只返回同根团队成员。
 - `send_agent_message` 保存同伴消息，普通空闲目标不启动新 Turn。
 - `followup_agent_task` 提交明确任务；活动目标在安全边界接收，空闲目标通过原调度器继续执行。
 - `read_agent_messages/wait_agent_messages` 有界读取和等待，不改变处理状态，不启动目标。
-- `agent_board` 提供频道、帖子、回复、搜索和订阅。
+- 留言板代码保留，但第一期不向模型下发 `agent_board`。
 
 消息正文保存到 CAS；消息、来源、目标、回复关系、任务请求和请求对应 Turn 分别持久化。投递复用 `RuntimeInboxItem`、`RuntimeDelivery`、`RuntimeDeliveryInputLink` 和 `RuntimeDeliveryWake`。一次发送成功只证明消息提交，`handled_at` 才证明目标执行器吸收。重复源命令返回原身份，参数篡改直接拒绝。
 
@@ -49,4 +49,4 @@
 
 新增协作领域使用当前 Runtime epoch 5。旧 epoch 通过已有 archive/reset 流程归档运行数据并建立当前 Runtime，保留配置和 Workspace；不增加任意旧格式的迁移或 fallback。当前 epoch 的缺表、索引、manifest 或 RootBinding 漂移继续 fail closed。
 
-回归覆盖真实 SQLite/CAS、作用域与撤权、静默消息、唤醒与处理 ACK、重复提交、并发预算、结果回信、分页、压缩/native 短引用、fork 和生产调度链路。界面检查包括纯数据 bridge、继承/恢复设置及窄屏布局。统一入口为 `npm run check:local`。
+回归覆盖真实 SQLite/CAS、团队作用域与跨团队拒绝、静默消息、唤醒与处理 ACK、重复提交、并发预算、结果回信、分页、压缩/native 短引用、fork 和生产调度链路。界面检查包括继承/恢复设置及窄屏布局。统一入口为 `npm run check:local`。

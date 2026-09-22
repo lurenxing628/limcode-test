@@ -223,11 +223,10 @@
   "collaborationProjection": {
     "scope": "selected-conversation-source-or-target-only",
     "snapshotMessageLimit": 32,
-    "snapshotPermissionLimit": 32,
     "liveWindow": "existing-per-type-bounds-and-atomic-snapshot-refresh",
     "messageBodiesInFeed": false,
     "boardBodiesInFeed": false,
-    "relations": "independent-message-source-target-reply-request-and-communication-links",
+    "relations": "independent-message-source-target-reply-and-request-links",
     "runtimeContinuationPreview": "collaboration_message-source-kind-retains-sourceConversationId-mode-and-320-character-text-preview; never-user-authorization"
   }
 }

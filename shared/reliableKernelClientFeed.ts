@@ -432,8 +432,7 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'CollaborationMessageTargetLink',
   'CollaborationMessageReplyLink',
   'CollaborationRequest',
-  'CollaborationRequestTurnLink',
-  'ConversationCommunicationLink'
+  'CollaborationRequestTurnLink'
 ] as const);
 
 export function createEmptyReliableKernelClientState(): ReliableKernelBoundedClientState {
@@ -611,8 +610,7 @@ function seedRecordsFromSnapshot(
     collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
     collaborationMessageReplyLinks: 'CollaborationMessageReplyLink',
     collaborationRequests: 'CollaborationRequest',
-    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink',
-    conversationCommunicationLinks: 'ConversationCommunicationLink'
+    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink'
   };
   const visit = (value: PlainData): void => {
     if (Array.isArray(value)) {

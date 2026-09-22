@@ -404,16 +404,15 @@
       "CollaborationMessageReplyLink",
       "CollaborationBudget",
       "CollaborationRequest",
-      "CollaborationRequestTurnLink",
-      "ConversationCommunicationLink"
+      "CollaborationRequestTurnLink"
     ],
     "messageAuthority": "peer-tool-output-never-user-or-developer-authorization",
     "delivery": "reuse-RuntimeInboxItem-RuntimeDelivery-RuntimeDeliveryInputLink-RuntimeDeliveryWake",
     "sendMessage": "persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary",
     "followupTask": "explicit-request-may-wake-idle-or-join-active; never-implicitly-cancel",
     "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
-    "permissions": "same-root-peer-communication; ordinary-independent-conversations-require-directed-CommunicationLink; read/send/wake-independent; no-peer-interrupt-by-message-permission",
-    "revocation": "check-current-links-and-target-state-again-at-admission",
+    "permissions": "same-root-peer-communication; conversations-outside-the-team-are-unreachable-except-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
+    "revocation": "check-current-team-lineage-and-target-state-again-at-admission",
     "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail",
     "limits": "frozen-policy-bounds-active-team-size-recursion-and-turn-wakeup-budget",
     "forkTurns": [
@@ -438,6 +437,6 @@
       "notification": "active-subscribers-only; no-idle-wake",
       "deletion": "root-channel-posts-and-source-posts-delete-with-conversation; request-receipts-and-links-cascade"
     },
-    "budget": "independent-CollaborationBudget; user-followup-establishes-budget-without-spending-automatic-count; recursive-tool-followups-inherit-origin-budget-and-frozen-authority; zero-disables-automatic-only"
+    "budget": "independent-CollaborationBudget; recursive-tool-followups-inherit-origin-budget-and-frozen-authority; zero-disables-automatic-followups"
   }
 }

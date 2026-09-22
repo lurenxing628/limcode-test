@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
@@ -13,9 +12,9 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 const MAX_TEXT_BYTES = 64_000;
-export type CollaborationSource = { kind: 'tool'; turnId: string; toolCallId: string } | { kind: 'user'; conversationId: string; commandId: string };
+export type CollaborationSource = { kind: 'tool'; turnId: string; toolCallId: string };
 interface CompletionSource { kind: 'completion'; turnId: string; requestId: string }
-interface BoardSource { kind: 'board'; turnId: string | null; postId: string; conversationId: string }
+interface BoardSource { kind: 'board'; turnId: string; postId: string; conversationId: string }
 export interface CollaborationSendCommand {
   source: CollaborationSource;
   targetConversationId: string;
@@ -30,9 +29,6 @@ export interface CollaborationMessageSummary {
   mode: 'message' | 'followup'; sourceKind: string; createdAt: string;
   replyToMessageId: string | null; deliveryState: string; handled: boolean;
 }
-export interface ConversationCommunicationPermission {
-  sourceConversationId: string; targetConversationId: string; allowRead: boolean; allowSend: boolean; allowWake: boolean;
-}
 export class CollaborationControlPlane {
   private readonly now: () => string;
   private readonly router: AutomaticRuntimeDeliveryRouter;
@@ -43,72 +39,15 @@ export class CollaborationControlPlane {
     options: { now?: () => string } = {}
   ) { this.now = options.now ?? (() => new Date().toISOString()); this.router = new AutomaticRuntimeDeliveryRouter(database); }
 
+  /** Team roster only. Conversations outside the derived team are never listed here. */
   public async listMembers(conversationId: string) {
     await this.existing('Conversation', conversationId);
     const scope = await readCollaborationScope(this.database, conversationId);
-    const members = await Promise.all(scope.members.map(async (member) => ({ ...member, title: String((await this.existing('Conversation', member.conversationId)).title), allowRead: true, allowSend: member.conversationId !== conversationId && (!member.childExecutionId || ['active', 'idle'].includes(member.status)), allowWake: member.conversationId !== conversationId && (!member.childExecutionId || ['active', 'idle'].includes(member.status)), relation: 'team' as 'team' | 'permitted' })));
-    for (const permission of await this.listPermissions(conversationId)) {
-      if (!(permission.allowRead || permission.allowSend || permission.allowWake) || members.some((member) => member.conversationId === permission.targetConversationId)) continue;
-      const target = await this.maybe('Conversation', permission.targetConversationId);
-      if (target && target.status === 'active') members.push({ conversationId: permission.targetConversationId, childExecutionId: null, parentConversationId: null, status: String(target.status), title: String(target.title), allowRead: permission.allowRead, allowSend: permission.allowSend, allowWake: permission.allowWake, relation: 'permitted' });
-    }
+    const members = await Promise.all(scope.members.map(async (member) => {
+      const reachable = member.conversationId !== conversationId && (!member.childExecutionId || ['active', 'idle'].includes(member.status));
+      return { ...member, title: String((await this.existing('Conversation', member.conversationId)).title), allowRead: true, allowSend: reachable, allowWake: reachable };
+    }));
     return { rootConversationId: scope.rootConversationId, members };
-  }
-
-  /** User-facing discovery only. Model tools receive listMembers instead. */
-  public async listPermissionCandidates(conversationId: string): Promise<Array<{ conversationId: string; title: string }>> {
-    await this.existing('Conversation', conversationId);
-    const children = new Set((await this.rows('ChildExecution')).map((row) => String(row.child_conversation_id)));
-    if (children.has(conversationId)) return [];
-    return (await this.rows('Conversation', { status: 'active' })).filter((row) => row.id !== conversationId && !children.has(String(row.id)))
-      .map((row) => ({ conversationId: String(row.id), title: String(row.title) }));
-  }
-  public async listPermissions(conversationId: string): Promise<ConversationCommunicationPermission[]> {
-    return (await this.rows('ConversationCommunicationLink', { source_conversation_id: conversationId })).map(permissionView);
-  }
-  /** This command is exposed only through the authenticated user bridge, never as an agent tool. */
-  public async setPermission(input: ConversationCommunicationPermission & { commandId: string }): Promise<ConversationCommunicationPermission> {
-    const source = requirePhaseFId(input.sourceConversationId, 'sourceConversationId');
-    const target = requirePhaseFId(input.targetConversationId, 'targetConversationId');
-    const commandId = requirePhaseFId(input.commandId, 'commandId');
-    if (source === target) throw new Error('Conversation communication permission requires distinct Conversations.');
-    if (![input.allowRead, input.allowSend, input.allowWake].every((entry) => typeof entry === 'boolean')) throw new TypeError('Communication permission flags must be booleans.');
-    if (input.allowWake && !input.allowSend) throw new Error('Waking a Conversation requires send permission.');
-    const [sourceRow, targetRow, sourceChildren, targetChildren] = await Promise.all([this.existing('Conversation', source), this.existing('Conversation', target), this.rows('ChildExecution', { child_conversation_id: source }), this.rows('ChildExecution', { child_conversation_id: target })]);
-    if (sourceChildren.length || targetChildren.length) throw new Error('Explicit conversation permissions cannot bypass child team authority.');
-    const id = stablePhaseFId('conversation_communication_link', source, target);
-    const receiptId = stablePhaseFId('command_receipt', 'conversation-communication-permission', commandId);
-    const digest = createHash('sha256').update(JSON.stringify({ source, target, allowRead: input.allowRead, allowSend: input.allowSend, allowWake: input.allowWake })).digest('hex');
-    const receiptKey = `conversation-communication-permission:${commandId}:${digest}`;
-    const replay = async (): Promise<ConversationCommunicationPermission | null> => {
-      const receipt = await this.maybe('CommandReceipt', receiptId);
-      if (!receipt) return null;
-      if (receipt.source_kind !== 'command' || receipt.source_key !== receiptKey || receipt.conversation_id !== source || receipt.turn_id !== null) throw new Error('Communication permission command replay conflicts.');
-      const current = await this.maybe('ConversationCommunicationLink', id);
-      // Replaying an earlier grant after a later revoke observes the current link; it cannot grant
-      // again. The receipt and original mutation were committed in the same transaction.
-      return current ? permissionView(current) : { sourceConversationId: source, targetConversationId: target, allowRead: false, allowSend: false, allowWake: false };
-    };
-    const replayed = await replay(); if (replayed) return replayed;
-    const old = await this.maybe('ConversationCommunicationLink', id);
-    if (old?.command_id === commandId && (old.allow_read !== (input.allowRead ? 1n : 0n) || old.allow_send !== (input.allowSend ? 1n : 0n) || old.allow_wake !== (input.allowWake ? 1n : 0n))) throw new Error('Communication permission command replay conflicts.');
-    const now = this.now();
-    const patch = { allow_read: input.allowRead ? 1n : 0n, allow_send: input.allowSend ? 1n : 0n, allow_wake: input.allowWake ? 1n : 0n, command_id: commandId, updated_at: now };
-    try {
-      await this.database.transaction([
-      DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({ id: receiptId, source_kind: 'command', source_key: receiptKey, conversation_id: source, turn_id: null, created_at: now }),
-      DOMAIN_REPOSITORIES.domain('Conversation').assert(source, { status: sourceRow.status }),
-      DOMAIN_REPOSITORIES.domain('Conversation').assert(target, { status: targetRow.status }),
-      DOMAIN_REPOSITORIES.domain('ChildExecution').assertNone({ child_conversation_id: source }),
-      DOMAIN_REPOSITORIES.domain('ChildExecution').assertNone({ child_conversation_id: target }),
-      ...(old ? [DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink').assert(id, { command_id: old.command_id }), DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink').update(id, patch)] : [DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink').insert({ id, source_conversation_id: source, target_conversation_id: target, ...patch, created_at: now })])
-    ]);
-    } catch (error) {
-      if (!isTransactionAssertionFailure(error) && !sqliteUniqueFailureIncludes(error, ['command_receipt.id', 'command_receipt.source_kind, command_receipt.source_key', 'conversation_communication_link.id', 'conversation_communication_link.source_conversation_id, conversation_communication_link.target_conversation_id'])) throw error;
-      const raced = await replay(); if (raced) return raced;
-      throw error;
-    }
-    return permissionView(await this.existing('ConversationCommunicationLink', id));
   }
 
   public async send(input: CollaborationSendCommand) {
@@ -128,7 +67,7 @@ export class CollaborationControlPlane {
     const metadata = await this.existing('ContentObject', String(post.content_object_id)) as ContentObjectMetadata;
     const content = (await this.contentStore.read(metadata)).toString('utf8').slice(0, 1000);
     try {
-      await this.sendInternal({ source: { kind: 'board', postId, conversationId: notice.sourceConversationId, turnId: source.source_turn_id === null ? null : String(source.source_turn_id) }, targetConversationId: notice.targetConversationId, text: `Team board update. Use agent_board list_channels/list_threads to read the full post.\n${content}`, mode: 'message', onlyIfRunning: true });
+      await this.sendInternal({ source: { kind: 'board', postId, conversationId: notice.sourceConversationId, turnId: requirePhaseFId(source.source_turn_id, 'CollaborationBoardPostSourceLink.source_turn_id') }, targetConversationId: notice.targetConversationId, text: `Team board update. Use agent_board list_channels/list_threads to read the full post.\n${content}`, mode: 'message', onlyIfRunning: true });
       return { status: 'delivered' };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -142,21 +81,21 @@ export class CollaborationControlPlane {
     if (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > MAX_TEXT_BYTES) throw new RangeError(`Collaboration text must contain 1..${MAX_TEXT_BYTES} UTF-8 bytes.`);
     const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
     const source = input.source;
-    const sourceKey = source.kind === 'tool' ? requirePhaseFId(source.toolCallId, 'toolCallId') : source.kind === 'user' ? requirePhaseFId(source.commandId, 'commandId') : source.kind === 'completion' ? requirePhaseFId(source.requestId, 'requestId') : stablePhaseFId('board_notice', source.postId, targetConversationId);
+    const sourceKey = source.kind === 'tool' ? requirePhaseFId(source.toolCallId, 'toolCallId') : source.kind === 'completion' ? requirePhaseFId(source.requestId, 'requestId') : stablePhaseFId('board_notice', source.postId, targetConversationId);
     const dedupeKey = `collaboration:${source.kind}:${sourceKey}`;
     const messageId = stablePhaseFId('collaboration_message', dedupeKey);
     const inboxItemId = stablePhaseFId('runtime_inbox_item', messageId);
     const deliveryId = stablePhaseFId('runtime_delivery', 'collaboration', messageId);
     const replyToMessageId = input.replyToMessageId ? requirePhaseFId(input.replyToMessageId, 'replyToMessageId') : null;
-    const sourceTurn = source.kind === 'user' || (source.kind === 'board' && source.turnId === null) ? null : await this.existing('Turn', requirePhaseFId(source.turnId, 'turnId'));
-    const sourceConversationId = source.kind === 'user' || source.kind === 'board' ? requirePhaseFId(source.conversationId, 'conversationId') : String(sourceTurn!.conversation_id);
+    const sourceTurn = await this.existing('Turn', requirePhaseFId(source.turnId, 'turnId'));
+    const sourceConversationId = source.kind === 'board' ? requirePhaseFId(source.conversationId, 'conversationId') : String(sourceTurn.conversation_id);
     if (targetConversationId === sourceConversationId) throw new Error('A collaboration message must target another Conversation.');
     const prepared = await this.contentStore.prepare(this.database, input.text, COLLABORATION_MESSAGE_CONTENT_TYPE);
     const replay = async () => {
       const message = await this.maybe('CollaborationMessage', messageId);
       if (!message) return null;
       const [origins, targets, payloads, replies] = await Promise.all([this.rows('CollaborationMessageSourceLink', { message_id: messageId }), this.rows('CollaborationMessageTargetLink', { message_id: messageId }), this.rows('CollaborationMessagePayloadLink', { message_id: messageId }), this.rows('CollaborationMessageReplyLink', { message_id: messageId })]);
-      if (message.mode !== input.mode || origins.length !== 1 || origins[0].conversation_id !== sourceConversationId || origins[0].turn_id !== (sourceTurn?.id ?? null) || targets.length !== 1 || targets[0].conversation_id !== targetConversationId || payloads.length !== 1 || payloads[0].content_object_id !== prepared.metadata.id || (replies[0]?.request_message_id ?? null) !== replyToMessageId) throw new Error('Collaboration send replay conflicts with immutable message facts.');
+      if (message.mode !== input.mode || origins.length !== 1 || origins[0].conversation_id !== sourceConversationId || origins[0].turn_id !== sourceTurn.id || targets.length !== 1 || targets[0].conversation_id !== targetConversationId || payloads.length !== 1 || payloads[0].content_object_id !== prepared.metadata.id || (replies[0]?.request_message_id ?? null) !== replyToMessageId) throw new Error('Collaboration send replay conflicts with immutable message facts.');
       return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, deduplicated: true };
     };
     const existing = await replay(); if (existing) return existing;
@@ -171,7 +110,7 @@ export class CollaborationControlPlane {
     }
     if (source.kind === 'tool') {
       const tool = await this.existing('ToolCall', source.toolCallId);
-      if (tool.turn_id !== source.turnId || sourceTurn!.status !== 'active' || tool.status === 'terminal') throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
+      if (tool.turn_id !== source.turnId || sourceTurn.status !== 'active' || tool.status === 'terminal') throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
       sourceSteps = [DOMAIN_REPOSITORIES.domain('Turn').assert(source.turnId, { status: 'active', conversation_id: sourceConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: source.turnId }), DOMAIN_REPOSITORIES.domain('ToolCall').assert(source.toolCallId, { turn_id: source.turnId, status: tool.status })];
     }
     const sourceScope = await readCollaborationScope(this.database, sourceConversationId);
@@ -180,14 +119,12 @@ export class CollaborationControlPlane {
     if (source.kind === 'tool' && sourceMember?.childExecutionId && sourceMember.status !== 'active') throw new Error('A stopped child cannot initiate collaboration.');
     const targetMember = targetScope.members.find((entry) => entry.conversationId === targetConversationId)!;
     if (targetMember.childExecutionId && !['active', 'idle'].includes(targetMember.status)) throw new Error('Collaboration cannot revive a stopped, closed or starting child task.');
-    let permissionSteps: RepositoryTransactionStep[] = [];
-    if (sourceScope.rootConversationId !== targetScope.rootConversationId) {
+    // Completion replies return a result to the durable requester wherever it lives. Every other
+    // source stays inside its derived team; another team's child tasks are never addressable.
+    if (sourceScope.rootConversationId !== targetScope.rootConversationId && source.kind !== 'completion') {
       if (source.kind === 'board') throw new Error('Board notifications cannot cross team roots.');
-      const permission = await this.maybe('ConversationCommunicationLink', stablePhaseFId('conversation_communication_link', sourceConversationId, targetConversationId));
-      if (source.kind !== 'completion') {
-        if (!permission || permission.allow_send !== 1n || (input.mode === 'followup' && permission.allow_wake !== 1n)) throw new Error('Conversation communication is not authorized.');
-        permissionSteps = [DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink').assert(String(permission.id), { allow_send: 1n, ...(input.mode === 'followup' ? { allow_wake: 1n } : {}) })];
-      }
+      if (sourceMember?.childExecutionId || targetMember.childExecutionId) throw new Error('Cross-conversation collaboration cannot address or originate from a child task of another team.');
+      throw new Error('Cross-conversation collaboration is not enabled.');
     }
     if (replyToMessageId) {
       const previousSource = await this.one('CollaborationMessageSourceLink', { message_id: replyToMessageId });
@@ -218,29 +155,24 @@ export class CollaborationControlPlane {
     const requestId = stablePhaseFId('collaboration_request', messageId);
     const budgetSteps: RepositoryTransactionStep[] = [];
     if (input.mode === 'followup') {
-      const budget = source.kind === 'user'
-        ? { id: stablePhaseFId('collaboration_budget', 'user_command', source.commandId), origin_kind: 'user_command', origin_key: source.commandId, authority_turn_id: sourceScope.rootTurnId ?? String(anchor!.id), created_at: now }
-        : await this.budgetForTurn(sourceTurn ? String(sourceTurn.id) : null, sourceScope.rootTurnId);
-      if (!budget) throw new Error('Followup requires a root Turn budget scope.');
+      const budget = await this.budgetForTurn(String(sourceTurn.id), sourceScope.rootTurnId);
       const persistedBudget = await this.maybe('CollaborationBudget', String(budget.id));
       if (persistedBudget && (persistedBudget.origin_kind !== budget.origin_kind || persistedBudget.origin_key !== budget.origin_key || persistedBudget.authority_turn_id !== budget.authority_turn_id)) throw new Error('Collaboration budget identity conflicts.');
       if (!persistedBudget) budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationBudget').insert(budget));
       const requests = await this.rows('CollaborationRequest', { budget_id: budget.id, automatic: 1n });
-      if (source.kind !== 'user') {
-        const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, String(budget.authority_turn_id))).maxAutomaticFollowups;
-        if (requests.length >= limit) throw new Error(`Automatic followup budget exhausted (${limit}).`);
-        budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assertExactIds({ budget_id: budget.id, automatic: 1n }, requests.map((row) => String(row.id))));
-      }
-      budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').insert({ id: requestId, message_id: messageId, budget_id: budget.id, automatic: source.kind === 'user' ? 0n : 1n, state: 'pending', created_at: now, updated_at: now }));
+      const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, String(budget.authority_turn_id))).maxAutomaticFollowups;
+      if (requests.length >= limit) throw new Error(`Automatic followup budget exhausted (${limit}).`);
+      budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assertExactIds({ budget_id: budget.id, automatic: 1n }, requests.map((row) => String(row.id))));
+      budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').insert({ id: requestId, message_id: messageId, budget_id: budget.id, automatic: 1n, state: 'pending', created_at: now, updated_at: now }));
     }
     const wakeId = stablePhaseFId('runtime_delivery_wake', deliveryId);
     try {
       await this.database.transaction([
-        ...preparedContentObjectSteps([prepared], 'collaboration_content'), ...sourceSteps, ...permissionSteps,
+        ...preparedContentObjectSteps([prepared], 'collaboration_content'), ...sourceSteps,
         ...sourceScope.authoritySteps, ...targetScope.authoritySteps, ...routingSteps,
         DOMAIN_REPOSITORIES.domain('Conversation').assert(sourceConversationId, { status: 'active' }), DOMAIN_REPOSITORIES.domain('Conversation').assert(targetConversationId, { status: 'active' }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id: messageId, dedupe_key: dedupeKey, mode: input.mode, created_at: now }, { column: 'message_seq', scope: {} }),
-        DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').insert({ id: stablePhaseFId('collaboration_source', messageId), message_id: messageId, conversation_id: sourceConversationId, source_kind: source.kind, source_key: sourceKey, turn_id: sourceTurn?.id ?? null, tool_call_id: source.kind === 'tool' ? source.toolCallId : null, board_post_id: source.kind === 'board' ? source.postId : null, created_at: now }),
+        DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').insert({ id: stablePhaseFId('collaboration_source', messageId), message_id: messageId, conversation_id: sourceConversationId, source_kind: source.kind, source_key: sourceKey, turn_id: sourceTurn.id, tool_call_id: source.kind === 'tool' ? source.toolCallId : null, board_post_id: source.kind === 'board' ? source.postId : null, created_at: now }),
         DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').insert({ id: inboxItemId, dedupe_key: dedupeKey, source_kind: 'collaboration_message', source_id: messageId, state: 'routed', created_at: now, updated_at: now }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').insert({ id: stablePhaseFId('collaboration_target', messageId), message_id: messageId, conversation_id: targetConversationId, inbox_item_id: inboxItemId, anchor_turn_id: source.kind === 'board' ? currentTurnId : null, created_at: now }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessagePayloadLink').insert({ id: stablePhaseFId('collaboration_payload', messageId), message_id: messageId, content_object_id: prepared.metadata.id, created_at: now }),
@@ -407,31 +339,25 @@ export class CollaborationControlPlane {
     await this.existing('Conversation', caller);
     if (caller === target) return;
     const [callerScope, targetScope] = await Promise.all([readCollaborationScope(this.database, caller), readCollaborationScope(this.database, target)]);
-    if (callerScope.rootConversationId === targetScope.rootConversationId) return;
-    const link = await this.maybe('ConversationCommunicationLink', stablePhaseFId('conversation_communication_link', caller, target));
-    if (!link || link.allow_read !== 1n) throw new Error('Reading this Conversation is not authorized.');
+    if (callerScope.rootConversationId !== targetScope.rootConversationId) throw new Error('Cross-conversation collaboration is not enabled.');
   }
-  private async budgetForTurn(sourceTurnId: string | null, rootTurnId: string | null): Promise<DomainRow | null> {
+  private async budgetForTurn(sourceTurnId: string, rootTurnId: string | null): Promise<DomainRow> {
     const visit = async (turnId: string, ancestryRoot: string | null, seen: Set<string>): Promise<DomainRow> => {
       if (seen.has(turnId)) throw new Error('Collaboration budget lineage is cyclic.');
       seen.add(turnId);
       const inputs = await this.rows('RuntimeDelivery', { target_turn_id: turnId, state: 'consumed' });
-      const budgets = new Map<string, { budget: DomainRow; sequence: bigint }>();
+      const budgets = new Map<string, DomainRow>();
       for (const delivery of inputs) {
         const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
         if (inbox.source_kind !== 'collaboration_message') continue;
         const requests = await this.rows('CollaborationRequest', { message_id: inbox.source_id });
         if (!requests[0]) continue;
         const budget = await this.existing('CollaborationBudget', String(requests[0].budget_id));
-        const message = await this.existing('CollaborationMessage', String(inbox.source_id));
-        budgets.set(String(budget.id), { budget, sequence: message.message_seq as bigint });
+        budgets.set(String(budget.id), budget);
       }
-      // A newer explicit user task may reset this Turn's budget. Unrelated agent requests cannot
-      // pool budgets or select one by an arbitrary id ordering.
-      const manual = [...budgets.values()].filter((entry) => entry.budget.origin_kind === 'user_command').sort((a, b) => a.sequence < b.sequence ? 1 : -1);
-      if (manual.length) return manual[0].budget;
+      // Unrelated agent requests cannot pool budgets or select one by an arbitrary id ordering.
       if (budgets.size > 1) throw new Error('Collaboration cannot combine independent root Turn followup budgets.');
-      if (budgets.size === 1) return [...budgets.values()][0].budget;
+      if (budgets.size === 1) return [...budgets.values()][0];
       if (ancestryRoot && ancestryRoot !== turnId) return visit(ancestryRoot, null, seen);
       const turn = await this.existing('Turn', turnId);
       const scope = await readCollaborationScope(this.database, String(turn.conversation_id));
@@ -451,7 +377,7 @@ export class CollaborationControlPlane {
       if (continuationSources.size === 1) return visit([...continuationSources][0], null, seen);
       return { id: stablePhaseFId('collaboration_budget', 'turn', turnId), origin_kind: 'turn', origin_key: turnId, authority_turn_id: turnId, created_at: this.now() };
     };
-    return sourceTurnId ? visit(sourceTurnId, rootTurnId, new Set()) : rootTurnId ? visit(rootTurnId, null, new Set()) : null;
+    return visit(sourceTurnId, rootTurnId, new Set());
   }
   private async finishRequest(request: DomainRow, state: string): Promise<void> {
     try { await this.database.transaction([DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(String(request.id), { state: 'pending' }), DOMAIN_REPOSITORIES.domain('CollaborationRequest').update(String(request.id), { state, updated_at: this.now() })]); }
@@ -470,7 +396,6 @@ export class CollaborationControlPlane {
   private async existing(domain: string, id: string): Promise<DomainRow> { const row = await this.maybe(domain, id); if (!row) throw new Error(`${domain} ${id} does not exist.`); return row; }
 }
 function compareNewest(a: DomainRow, b: DomainRow): number { return String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)); }
-function permissionView(row: DomainRow): ConversationCommunicationPermission { return { sourceConversationId: String(row.source_conversation_id), targetConversationId: String(row.target_conversation_id), allowRead: row.allow_read === 1n, allowSend: row.allow_send === 1n, allowWake: row.allow_wake === 1n }; }
 
 function visibleMessageText(contentType: string, raw: string): string {
   if (contentType === 'text/plain') return raw;

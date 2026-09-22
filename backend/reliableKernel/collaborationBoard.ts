@@ -11,16 +11,16 @@ const MAX_SCAN = 100;
 const MAX_TEXT_CHARS = 100_000;
 const READ_OPERATIONS = new Set(['list_channels', 'list_threads', 'read_thread', 'read_post', 'search']);
 const OPERATIONS = new Set([...READ_OPERATIONS, 'create_channel', 'subscribe', 'unsubscribe', 'post']);
-type Source = { kind: 'tool' | 'user'; conversationId: string; key: string; turnId?: string; toolCallId?: string };
+type Source = { kind: 'tool'; conversationId: string; key: string; turnId: string; toolCallId: string };
 export interface CollaborationBoardNotice {
   postId: string;
   channelId: string;
   threadId: string;
   sourceConversationId: string;
   targetConversationId: string;
-  sourceTurnId?: string;
-  sourceToolCallId?: string;
-  sourceKind: 'tool' | 'user';
+  sourceTurnId: string;
+  sourceToolCallId: string;
+  sourceKind: 'tool';
 }
 export interface CollaborationBoardNotificationResult {
   status: 'delivered' | 'skipped_idle' | 'failed';
@@ -59,11 +59,6 @@ export class CollaborationBoard {
 
   public execute(source: { conversationId: string; turnId: string; toolCallId: string }, args: CollaborationBoardArguments): Promise<Record<string, unknown>> {
     return this.run({ kind: 'tool', conversationId: source.conversationId, turnId: source.turnId, toolCallId: source.toolCallId, key: source.toolCallId }, args);
-  }
-
-  /** Host/UI entry point: its own command identity, without inventing a model ToolCall. */
-  public executeUser(source: { conversationId: string; commandId: string }, args: CollaborationBoardArguments): Promise<Record<string, unknown>> {
-    return this.run({ kind: 'user', conversationId: source.conversationId, key: source.commandId }, args);
   }
 
   private async run(source: Source, args: CollaborationBoardArguments, contentionRetries = 0): Promise<Record<string, unknown>> {
@@ -126,7 +121,7 @@ export class CollaborationBoard {
       steps.push(...preparedContentObjectSteps([content], 'board_post'),
         repo('Post').insert({ id: postId, content_object_id: content.metadata.id, character_count: BigInt(characterCount), created_at: now }),
         repo('PostChannelLink').insert({ id: orderedIdentity('post_channel', now, postId), post_id: postId, channel_id: channelId, created_at: now }),
-        repo('PostSourceLink').insert({ id: identity('post_source', postId), post_id: postId, source_kind: source.kind, source_key: source.key, conversation_id: source.conversationId, source_turn_id: source.turnId ?? null, source_tool_call_id: source.toolCallId ?? null, created_at: now }));
+        repo('PostSourceLink').insert({ id: identity('post_source', postId), post_id: postId, source_kind: source.kind, source_key: source.key, conversation_id: source.conversationId, source_turn_id: source.turnId, source_tool_call_id: source.toolCallId, created_at: now }));
       if (target.threadId) steps.push(repo('ReplyLink').insert({ id: orderedIdentity('reply', now, postId), post_id: postId, thread_id: threadId, created_at: now }));
       await this.subscription(steps, source.conversationId, { threadId }, true, now);
       const subscribers = await this.rows('SubscriptionLink', target.threadId ? { thread_id: threadId, active: 1n } : { channel_id: channelId, active: 1n }, 257);
@@ -135,13 +130,13 @@ export class CollaborationBoard {
       targets.delete(source.conversationId);
       notify = [...targets].filter(id => members.has(id)).map(targetConversationId => ({
         postId, threadId, channelId, sourceConversationId: source.conversationId, targetConversationId,
-        sourceKind: source.kind, ...(source.turnId ? { sourceTurnId: source.turnId } : {}), ...(source.toolCallId ? { sourceToolCallId: source.toolCallId } : {})
+        sourceKind: source.kind, sourceTurnId: source.turnId, sourceToolCallId: source.toolCallId
       }));
       result = { postId, threadId, channelId };
     }
     const savedResult = await this.contentStore.prepare(this.database, JSON.stringify(result), 'application/json');
     steps.push(...preparedContentObjectSteps([savedResult], 'board_result'), repo('CommandReceipt').insert({
-      id: receiptId, source_kind: source.kind, source_key: source.key, conversation_id: source.conversationId, source_tool_call_id: source.toolCallId ?? null,
+      id: receiptId, source_kind: source.kind, source_key: source.key, conversation_id: source.conversationId, source_tool_call_id: source.toolCallId,
       operation: args.operation, request_digest: digest, result_object_id: savedResult.metadata.id, created_at: now
     }));
     try { await this.database.transaction(steps); }
@@ -168,16 +163,14 @@ export class CollaborationBoard {
     if (!conversation || conversation.status === 'deleted') throw new Error('Board conversation is unavailable.');
     const scope = await readCollaborationScope(this.database, source.conversationId);
     const steps = [...scope.authoritySteps, DOMAIN_REPOSITORIES.domain('Conversation').assert(source.conversationId, { status: conversation.status })];
-    if (source.kind === 'tool') {
-      const turnId = required(source.turnId, 'turnId');
-      const toolCallId = required(source.toolCallId, 'toolCallId');
-      const [turn, call] = await Promise.all([this.rawGet('Turn', turnId), this.rawGet('ToolCall', toolCallId)]);
-      if (!turn || turn.conversation_id !== source.conversationId || turn.status !== 'active') throw new Error('Board source Turn is not active in this conversation.');
-      if (!call || call.turn_id !== turnId || call.tool_name !== 'agent_board') throw new Error('Board source ToolCall identity does not match.');
-      steps.push(DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { conversation_id: source.conversationId, status: 'active' }),
-        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
-        DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { turn_id: turnId, tool_name: 'agent_board' }));
-    }
+    const turnId = required(source.turnId, 'turnId');
+    const toolCallId = required(source.toolCallId, 'toolCallId');
+    const [turn, call] = await Promise.all([this.rawGet('Turn', turnId), this.rawGet('ToolCall', toolCallId)]);
+    if (!turn || turn.conversation_id !== source.conversationId || turn.status !== 'active') throw new Error('Board source Turn is not active in this conversation.');
+    if (!call || call.turn_id !== turnId || call.tool_name !== 'agent_board') throw new Error('Board source ToolCall identity does not match.');
+    steps.push(DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { conversation_id: source.conversationId, status: 'active' }),
+      DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
+      DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { turn_id: turnId, tool_name: 'agent_board' }));
     return { scope, steps };
   }
 

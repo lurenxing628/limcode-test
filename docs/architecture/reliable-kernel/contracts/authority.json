@@ -2131,24 +2131,6 @@
       ]
     },
     {
-      "key": "ConversationCommunicationLink",
-      "table": "conversation_communication_link",
-      "repository": "ConversationCommunicationLinkRepository",
-      "codec": "ConversationCommunicationLinkRowCodec",
-      "mutations": [
-        "insert",
-        "update",
-        "delete"
-      ],
-      "client": "summary",
-      "deletePolicy": "cascade-with-conversation",
-      "resetPolicy": "runtime-dataset",
-      "indexes": [
-        "source_conversation_id,target_conversation_id UNIQUE",
-        "target_conversation_id"
-      ]
-    },
-    {
       "key": "CollaborationBoardChannel",
       "table": "collaboration_board_channel",
       "repository": "CollaborationBoardChannelRepository",
