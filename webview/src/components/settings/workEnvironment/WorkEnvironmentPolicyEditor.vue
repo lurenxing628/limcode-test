@@ -46,7 +46,7 @@ const hasLocalOverride = computed(() => props.scopeKind === 'global' || !!localR
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
 const environments = computed(() => store.availableEnvironments);
 const allowedSet = computed(() => new Set(effectivePolicy.value?.allowedWorkEnvironmentIds ?? environments.value.map((item) => item.id)));
-const defaultEnvironmentId = computed(() => effectivePolicy.value?.defaultWorkEnvironmentId ?? environments.value.find((item) => allowedSet.value.has(item.id))?.id ?? '');
+const defaultEnvironmentId = computed(() => effectivePolicy.value?.defaultWorkEnvironmentId ?? '');
 const activeEnvironment = computed(() => environments.value.find((item) => item.id === activeEnvironmentId.value) ?? environments.value[0]);
 const activeDetailEditor = computed(() => workEnvironmentDetailEditorForKind(activeEnvironment.value?.kind));
 const canDeleteActiveEnvironment = computed(() => !props.readonly && canRemoveWorkEnvironment(activeEnvironment.value));
@@ -75,14 +75,19 @@ function toggleAllowed(environment: WorkEnvironmentRecord, enabled: boolean): vo
   const next = new Set(allowedSet.value);
   if (enabled) next.add(environment.id);
   else next.delete(environment.id);
-  const allowed = environments.value.map((item) => item.id).filter((id) => next.has(id));
-  const defaultId = allowed.includes(defaultEnvironmentId.value) ? defaultEnvironmentId.value : allowed[0];
+  const allowed = [...next];
+  const defaultId = allowed.includes(defaultEnvironmentId.value) ? defaultEnvironmentId.value : undefined;
   store.setPolicyForScope(props.scopeKind, props.scopeId, allowed, defaultId, effectivePolicy.value?.name);
 }
 
 function setDefault(environment: WorkEnvironmentRecord): void {
   if (props.readonly || !allowedSet.value.has(environment.id)) return;
   store.setPolicyForScope(props.scopeKind, props.scopeId, [...allowedSet.value], environment.id, effectivePolicy.value?.name);
+}
+
+function clearDefault(): void {
+  if (props.readonly) return;
+  store.setPolicyForScope(props.scopeKind, props.scopeId, [...allowedSet.value], undefined, effectivePolicy.value?.name);
 }
 
 function restoreInheritance(): void {
@@ -92,8 +97,8 @@ function restoreInheritance(): void {
 
 function setPolicyEnabled(enabled: boolean): void {
   if (props.readonly) return;
-  const allowed = environments.value.map((item) => item.id).filter((id) => allowedSet.value.has(id));
-  const defaultId = allowed.includes(defaultEnvironmentId.value) ? defaultEnvironmentId.value : allowed[0];
+  const allowed = [...allowedSet.value];
+  const defaultId = defaultEnvironmentId.value || undefined;
   store.setPolicyForScope(props.scopeKind, props.scopeId, allowed, defaultId, effectivePolicy.value?.name, enabled);
 }
 
@@ -178,6 +183,7 @@ function detailNote(environment: WorkEnvironmentRecord): string {
       <div class="work-env-summary" aria-live="polite">
         <span>{{ sourceLabel }}</span>
         <span>{{ toolSwitchLabel }}</span>
+        <span v-if="!defaultEnvironmentId">未设置默认环境</span>
         <span>{{ enabledCount }} / {{ environments.length }} 已允许</span>
       </div>
     </header>
@@ -205,6 +211,7 @@ function detailNote(environment: WorkEnvironmentRecord): string {
         <IconPlus stroke="2" aria-hidden="true" />
         <span>{{ action.label }}</span>
       </button>
+      <button type="button" class="secondary" :disabled="readonly || !defaultEnvironmentId" @click="clearDefault">清除默认环境</button>
       <button type="button" class="secondary" :disabled="!canRestoreInheritance" @click="restoreInheritance">恢复继承</button>
       <span class="work-env-status">{{ store.status }}</span>
     </div>
@@ -294,7 +301,7 @@ function detailNote(environment: WorkEnvironmentRecord): string {
     <ConfirmPanel
       :open="deleteConfirmOpen"
       title="删除工作环境？"
-      :description-html="`将删除「${activeEnvironment ? environmentName(activeEnvironment) : '当前工作环境'}」，并从相关工作环境策略中移除引用。此操作<strong>无法撤销</strong>。`"
+      :description-html="`将删除「${activeEnvironment ? environmentName(activeEnvironment) : '当前工作环境'}」，使用此环境的会话和默认策略将提示重新选择环境。此操作<strong>无法撤销</strong>。`"
       confirm-label="删除"
       cancel-label="取消"
       @confirm="confirmDelete"

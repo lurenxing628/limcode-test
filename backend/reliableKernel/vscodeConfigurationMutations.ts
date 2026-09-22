@@ -765,11 +765,10 @@ export class VscodeConfigurationMutations {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
     return this.mutate(async (paths) => {
       const configured = await loadStore(workEnvironmentStore(paths));
-      const available = new Set(configured.filter((record) => record.available).map((record) => record.id));
-      const allowed = uniqueStrings(payload.allowedWorkEnvironmentIds).filter((id) => available.has(id));
-      const defaultId = payload.defaultWorkEnvironmentId && allowed.includes(payload.defaultWorkEnvironmentId)
-        ? payload.defaultWorkEnvironmentId
-        : allowed[0];
+      const existingIds = new Set(configured.map((record) => record.id));
+      const allowed = uniqueStrings(payload.allowedWorkEnvironmentIds).filter((id) => existingIds.has(id));
+      const defaultId = normalizedOptionalText(payload.defaultWorkEnvironmentId);
+      if (defaultId && !allowed.includes(defaultId)) throw new Error('默认工作环境必须包含在允许列表中。');
       await this.setScoped(
         workEnvironmentPolicyStore(paths),
         workEnvironmentPolicyLinkStore(paths),
@@ -832,22 +831,8 @@ export class VscodeConfigurationMutations {
       if (!canRemoveWorkEnvironment(record)) throw new Error('系统管理的工作环境不能删除。');
       await saveStore(spec, records.filter((candidate) => candidate.id !== workEnvironmentId));
 
-      const selections = conversationWorkEnvironmentLinkStore(paths);
-      await saveStore(selections, (await loadStore(selections)).filter((link) => link.workEnvironmentId !== workEnvironmentId));
-
-      const policies = workEnvironmentPolicyStore(paths);
-      await saveStore(policies, (await loadStore(policies)).map((policy) => {
-        const allowedWorkEnvironmentIds = policy.allowedWorkEnvironmentIds.filter((id) => id !== workEnvironmentId);
-        const defaultWorkEnvironmentId = policy.defaultWorkEnvironmentId === workEnvironmentId
-          ? allowedWorkEnvironmentIds[0]
-          : policy.defaultWorkEnvironmentId;
-        const { defaultWorkEnvironmentId: _removedDefault, ...rest } = policy;
-        return {
-          ...rest,
-          allowedWorkEnvironmentIds,
-          ...(defaultWorkEnvironmentId ? { defaultWorkEnvironmentId } : {})
-        };
-      }));
+      // Keep explicit selections and policy identities. A deleted selected/default environment
+      // must remain a visible error until the user chooses another root, never become implicit A.
     });
   }
 

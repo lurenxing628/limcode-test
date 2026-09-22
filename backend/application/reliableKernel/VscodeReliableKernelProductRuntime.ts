@@ -48,6 +48,7 @@ export interface VscodeReliableKernelProductRuntimeOptions {
   transientObserver?: ReliableAgentTransientObserver;
   lifecycleObserver?: ReliableAgentLifecycleObserver;
   dispatchSpecial?: VscodeReliableToolHostOptions['dispatchSpecial'];
+  onConfigurationChanged?: () => Promise<void> | void;
 }
 
 export type VscodeReliableKernelRecoveryState =
@@ -81,6 +82,8 @@ export class VscodeReliableKernelProductRuntime {
   private readonly externalRuntimeWatcher: ExternalDataVersionWatcher;
   private closing = false;
   private readonly initializeConfiguration: () => Promise<void>;
+  private readonly workspaceFoldersSubscription: vscode.Disposable;
+  private workspaceFoldersChangeTask: Promise<void> = Promise.resolve();
 
   private constructor(input: {
     application: ReliableKernelApplication;
@@ -93,6 +96,7 @@ export class VscodeReliableKernelProductRuntime {
     diagnostics: ReliableDiagnosticJournal;
     debugCapture: DebugCaptureService;
     initializeConfiguration: () => Promise<void>;
+    onConfigurationChanged?: () => Promise<void> | void;
   }) {
     this.application = input.application;
     this.configuration = input.configuration;
@@ -104,6 +108,18 @@ export class VscodeReliableKernelProductRuntime {
     this.diagnostics = input.diagnostics;
     this.debugCapture = input.debugCapture;
     this.initializeConfiguration = input.initializeConfiguration;
+    this.workspaceFoldersSubscription = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      if (this.closing) return;
+      // Schedule synchronously: a Turn admitted after this event must queue behind the complete
+      // folder snapshot. Existing Turns keep their frozen default identity.
+      void this.initializeConfiguration().catch(() => undefined);
+      this.workspaceFoldersChangeTask = this.configuration.synchronizeWorkspaceFolders(currentWorkspaceFolders())
+        .then(async () => { if (!this.closing) await input.onConfigurationChanged?.(); });
+      void this.workspaceFoldersChangeTask.catch(error => {
+        console.error('[LimCode] 工作目录同步失败。', error);
+        if (!this.closing) void vscode.window.showErrorMessage(`LimCode 工作目录同步失败：${error instanceof Error ? error.message : String(error)}`);
+      });
+    });
     this.externalRuntimeWatcher = new ExternalDataVersionWatcher(
       () => this.application.database.externalDataVersion(),
       () => this.application.refreshExternalRuntimeWork(),
@@ -116,12 +132,7 @@ export class VscodeReliableKernelProductRuntime {
     options: VscodeReliableKernelProductRuntimeOptions = {}
   ): Promise<VscodeReliableKernelProductRuntime> {
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
-    const workspaceFolders = (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
-      uri: folder.uri.toString(),
-      name: folder.name,
-      rootPath: folder.uri.fsPath,
-      index
-    }));
+    const workspaceFolders = currentWorkspaceFolders();
     const configuration = new VscodeConfigurationAuthority(
       getPaths,
       context,
@@ -129,7 +140,15 @@ export class VscodeReliableKernelProductRuntime {
     );
     let configurationInitialization: Promise<void> | undefined;
     const initializeConfiguration = (): Promise<void> => {
-      configurationInitialization ??= configuration.synchronizeWorkspaceFolders(workspaceFolders);
+      if (!configurationInitialization) {
+        const pending = configuration.synchronizeWorkspaceFolders(currentWorkspaceFolders());
+        configurationInitialization = pending;
+        // A later folder event or command may retry a failed initialization. Keep successful and
+        // in-flight work deduplicated, but never pin this Host to the first transient sync failure.
+        void pending.catch(() => {
+          if (configurationInitialization === pending) configurationInitialization = undefined;
+        });
+      }
       return configurationInitialization;
     };
     let authority = options.authority;
@@ -446,7 +465,8 @@ export class VscodeReliableKernelProductRuntime {
         providerRegistry: providers,
         diagnostics,
         debugCapture,
-        initializeConfiguration
+        initializeConfiguration,
+        onConfigurationChanged: options.onConfigurationChanged
       });
     } catch (error) {
       await debugCapture.close().catch(() => undefined);
@@ -547,6 +567,7 @@ export class VscodeReliableKernelProductRuntime {
 
   public async close(): Promise<void> {
     this.closing = true;
+    this.workspaceFoldersSubscription.dispose();
     const cancellation = new Error('Reliable Runtime recovery cancelled for Host handoff.');
     cancellation.name = 'AbortError';
     this.configuration.mutations.retireModelProfileAuthority();
@@ -556,6 +577,7 @@ export class VscodeReliableKernelProductRuntime {
       await this.debugCapture.close().catch(() => undefined);
       this.fileDiffs.dispose();
       this.conversations.dispose();
+      await this.workspaceFoldersChangeTask.catch(() => undefined);
       await this.application.beginHandoff();
       // MCP discovery has its own AbortSignal generation. Dispose it before awaiting recovery so
       // an unresponsive external server cannot make Extension Host reload wait forever.
@@ -571,4 +593,10 @@ export class VscodeReliableKernelProductRuntime {
       await this.diagnostics.close();
     }
   }
+}
+
+function currentWorkspaceFolders(): Array<{ uri: string; name: string; rootPath: string; index: number }> {
+  return (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
+    uri: folder.uri.toString(), name: folder.name, rootPath: folder.uri.fsPath, index
+  }));
 }

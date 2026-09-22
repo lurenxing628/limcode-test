@@ -7,6 +7,7 @@ import type {
   RepositoryTransactionStep
 } from './repositories';
 import type { DatabaseFoundationInspection } from './databaseSchema';
+import type { ActiveTurnWorkEnvironmentProjection } from '../../shared/reliableKernelClientFeed';
 
 export const MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT = 33;
 export const MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT = 1;
@@ -107,7 +108,9 @@ export interface ModelRequestCancelResult {
 
 export interface ClientProjectionSnapshot {
   navigationSummary: Record<string, unknown>;
-  activeConversationWindow: Record<string, unknown>;
+  activeConversationWindow: Record<string, unknown> & {
+    activeTurnWorkEnvironment: ActiveTurnWorkEnvironmentProjection | null;
+  };
   activeTurnSummary: Record<string, unknown>;
   activeToolAndInteractionSummary: Record<string, unknown>;
   subagentDeliverySummary: Record<string, unknown>;

@@ -68,10 +68,6 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   private readonly commandDeclaration = commandDeclarationCapability();
   private readonly builtins: ToolDefinition[];
   private readonly filePlanner: LocalFileToolPlanner;
-  private readonly environmentBoundaryCache = new Map<string, {
-    expiresAt: number;
-    promise: Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
-  }>();
   private initialization: Promise<void> | undefined;
   private mcpInitialization: Promise<void> | undefined;
   private onStateChange: (() => void) | undefined;
@@ -114,7 +110,6 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   }
 
   public async dispose(): Promise<void> {
-    this.environmentBoundaryCache.clear();
     await this.mcp.dispose();
   }
 
@@ -312,7 +307,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       .map((agent) => ({ id: agent.id, label: agent.description?.trim() || agent.name.trim() }));
   }
 
-  /** 供 toolDispatcher 构建模型可见的工作环境列表；与执行时路径边界共用同一份解析与缓存。 */
+  /** 供 toolDispatcher 构建模型可见的工作环境列表；与执行时路径边界共用本 Host 的实时目录投影。 */
   public async workEnvironmentsForAuthority(authority: ReliableToolDispatchAuthority): Promise<{
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
@@ -324,28 +319,10 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
   }> {
-    const cacheKey = authority.snapshotId;
-    const cached = this.environmentBoundaryCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return cloneEnvironmentBoundary(await cached.promise);
-    const promise = (async () => {
-      const policy = authorityWorkEnvironmentPolicy(authority.document);
-      const records = await this.configuration.workEnvironments();
-      const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
-      return { ...(boundary.active ? { active: boundary.active } : {}), allowed: boundary.allowed };
-    })();
-    this.environmentBoundaryCache.set(cacheKey, { expiresAt: Date.now() + 1_000, promise });
-    if (this.environmentBoundaryCache.size > 64) {
-      const oldest = this.environmentBoundaryCache.keys().next().value as string | undefined;
-      if (oldest && oldest !== cacheKey) this.environmentBoundaryCache.delete(oldest);
-    }
-    try {
-      return cloneEnvironmentBoundary(await promise);
-    } catch (error) {
-      if (this.environmentBoundaryCache.get(cacheKey)?.promise === promise) {
-        this.environmentBoundaryCache.delete(cacheKey);
-      }
-      throw error;
-    }
+    const policy = authorityWorkEnvironmentPolicy(authority.document);
+    const records = await this.configuration.workEnvironments();
+    const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
+    return cloneEnvironmentBoundary(boundary);
   }
 
   private async loadAttachmentMaxBytes(): Promise<number> {

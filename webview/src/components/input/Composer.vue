@@ -171,6 +171,20 @@ const workEnvironmentOptions = computed<SettingsDropdownOption[]>(() =>
       icon: IconFolder
     }))
 );
+const workEnvironmentSelection = computed(() => workEnvironmentStore.environmentSelectionForConversation(clientState.currentConversationId));
+const workEnvironmentSwitchingEnabled = computed(() => workEnvironmentStore.workEnvironmentEnabledForConversation(clientState.currentConversationId));
+const workEnvironmentLabel = computed(() => workEnvironmentSelection.value.error
+  ? '工作目录待选择'
+  : workEnvironmentSelection.value.active?.name ?? '未绑定工作目录');
+const workEnvironmentDescription = computed(() => workEnvironmentSelection.value.error
+  ?? (workEnvironmentSelection.value.active ? workEnvironmentDisplayPath(workEnvironmentSelection.value.active) : '当前没有可用的工作目录。'));
+const frozenWorkEnvironmentSelection = computed(() => workEnvironmentStore.frozenEnvironmentSelectionForConversation(clientState.currentConversationId));
+const displayedWorkEnvironmentSelection = computed(() => frozenWorkEnvironmentSelection.value ?? workEnvironmentSelection.value);
+const displayedWorkEnvironmentLabel = computed(() => displayedWorkEnvironmentSelection.value.error
+  ? '工作目录不可用'
+  : displayedWorkEnvironmentSelection.value.active?.name ?? '未绑定工作目录');
+const displayedWorkEnvironmentDescription = computed(() => displayedWorkEnvironmentSelection.value.error
+  ?? (displayedWorkEnvironmentSelection.value.active ? workEnvironmentDisplayPath(displayedWorkEnvironmentSelection.value.active) : '本回合没有可用的工作目录。'));
 const workflowOptions = computed<SettingsDropdownOption[]>(() => [
   {
     value: DEFAULT_WORKFLOW_OPTION_ID,
@@ -242,7 +256,7 @@ const runtimeDiagnosticAriaLabel = computed(() => runtimeReloadRequired.value
   : '连接正常；查看连接状态');
 
 const activeWorkEnvironmentId = computed({
-  get: () => workEnvironmentStore.activeEnvironmentForConversation(clientState.currentConversationId)?.id ?? workEnvironmentOptions.value[0]?.value ?? '',
+  get: () => workEnvironmentStore.activeEnvironmentForConversation(clientState.currentConversationId)?.id ?? '',
   set: (workEnvironmentId: string) => selectWorkEnvironment(workEnvironmentId)
 });
 const editorShellStyle = computed(() => {
@@ -976,20 +990,32 @@ function middleEllipsis(value: string, maxLength: number): string {
             </template>
           </SettingsDropdown>
         </template>
-        <template v-if="workEnvironmentOptions.length">
-          <SettingsDropdown
-            v-model="activeWorkEnvironmentId"
-            class="composer-meta-dropdown composer-work-environment-dropdown"
-            :options="workEnvironmentOptions"
-            title="切换工作环境"
-            empty-text="暂无工作环境"
-            searchable
-            search-placeholder="筛选工作环境..."
-            :close-signal="workEnvironmentDropdownCloseSignal"
-            :max-height="220"
-            @open="onWorkEnvironmentDropdownOpen"
-          />
+        <template v-if="workEnvironmentSwitchingEnabled && (workEnvironmentOptions.length || workEnvironmentSelection.error)">
+          <HoverTooltipPanel :panel-title="frozenWorkEnvironmentSelection ? '下一回合工作目录' : '工作目录'" :rows="[{ label: '目录', value: workEnvironmentDescription }]">
+            <SettingsDropdown
+              v-model="activeWorkEnvironmentId"
+              class="composer-meta-dropdown composer-work-environment-dropdown"
+              :options="workEnvironmentOptions"
+              :placeholder="workEnvironmentLabel"
+              empty-text="暂无工作环境"
+              searchable
+              search-placeholder="筛选工作环境..."
+              :close-signal="workEnvironmentDropdownCloseSignal"
+              :max-height="220"
+              @open="onWorkEnvironmentDropdownOpen"
+            />
+          </HoverTooltipPanel>
         </template>
+        <HoverTooltipPanel
+          v-if="frozenWorkEnvironmentSelection || (!workEnvironmentSwitchingEnabled && (displayedWorkEnvironmentSelection.active || displayedWorkEnvironmentSelection.error))"
+          panel-title="实际工作目录"
+          :rows="[{ label: frozenWorkEnvironmentSelection ? '本回合目录' : '目录', value: displayedWorkEnvironmentDescription }]"
+        >
+          <span class="composer-work-directory" :class="{ 'has-error': displayedWorkEnvironmentSelection.error }" tabindex="0">
+            <IconFolder :size="12" aria-hidden="true" />
+            {{ frozenWorkEnvironmentSelection ? '本回合：' : '' }}{{ displayedWorkEnvironmentLabel }}
+          </span>
+        </HoverTooltipPanel>
         <SessionThinkingControl
           v-if="clientState.currentConversationId"
           :conversation-id="clientState.currentConversationId"
@@ -1626,5 +1652,19 @@ function middleEllipsis(value: string, maxLength: number): string {
 @keyframes composer-compact-squeeze-bottom {
   0%, 100% { transform: translateY(1px); }
   50% { transform: translateY(-2px); }
+}
+.composer-work-directory {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.composer-work-directory.has-error {
+  color: var(--vscode-errorForeground);
 }
 </style>

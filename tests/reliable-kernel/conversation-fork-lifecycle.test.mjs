@@ -62,6 +62,9 @@ async function withForkRuntime(run, { withTool = false } = {}) {
   let facade;
   const open = async () => {
     configuration = new VscodeConfigurationAuthority(getPaths);
+    // Reopening a Host must re-establish its local folder presence, as ProductRuntime.open does.
+    // Persisted environment records alone do not prove that this window has the folder open.
+    await configuration.synchronizeWorkspaceFolders([{ uri, name: 'Fixture', rootPath: folderPath, index: 0 }]);
     app = await kernel.ReliableKernelApplication.open(authority, {
       authorityCompiler: configuration,
       resolveWorkEnvironment: async () => undefined,

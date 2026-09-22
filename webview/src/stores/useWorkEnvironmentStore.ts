@@ -16,6 +16,9 @@ import {
   isRemoteServerWorkEnvironmentKind,
   workEnvironmentSortKey as buildWorkEnvironmentSortKey
 } from '@shared/workEnvironmentCatalog';
+import { resolveWorkEnvironmentSelection, type WorkEnvironmentSelection } from '@shared/workEnvironmentSelection';
+import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
+import { useAgentStore } from './useAgentStore';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 import { DEFAULT_WORKFLOW_OPTION_ID, useWorkflowStore } from './useWorkflowStore';
@@ -88,7 +91,7 @@ function fallbackPolicy(): WorkEnvironmentPolicyRecord | undefined {
   const ids = availableEnvironmentIds();
   if (ids.length === 0) return undefined;
   const now = Date.now();
-  return { id: 'work-environment-policy:fallback', name: '默认工作环境策略', enabled: false, allowedWorkEnvironmentIds: ids, defaultWorkEnvironmentId: ids[0], createdAt: now, updatedAt: now };
+  return { id: 'work-environment-policy:fallback', name: '默认工作环境策略', enabled: false, allowedWorkEnvironmentIds: ids, createdAt: now, updatedAt: now };
 }
 
 function sanitizePolicyInput(allowedIds: string[], defaultId?: string): { allowed: string[]; defaultId?: string } {
@@ -96,7 +99,7 @@ function sanitizePolicyInput(allowedIds: string[], defaultId?: string): { allowe
   // entries whose `available` flag is temporarily false due to Host-scoped workspace-folder projection.
   const existing = new Set(useClientStateStore().workEnvironments.map((environment) => environment.id));
   const allowed = uniqueAllowed(allowedIds).filter((id) => existing.has(id));
-  const resolvedDefault = defaultId && allowed.includes(defaultId) ? defaultId : allowed[0];
+  const resolvedDefault = defaultId && allowed.includes(defaultId) ? defaultId : undefined;
   return { allowed, ...(resolvedDefault ? { defaultId: resolvedDefault } : {}) };
 }
 
@@ -133,39 +136,66 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
     },
     effectivePolicyForConversation(conversationId: string): WorkEnvironmentPolicyResolution {
       if (!conversationId) return this.effectivePolicyFor('global');
+      const local = this.localPolicyFor('conversation', conversationId);
+      if (local.policy) return local;
       const workflowStore = useWorkflowStore();
       const activeWorkflowId = workflowStore.activeWorkflowIdForConversation(conversationId);
       if (activeWorkflowId && activeWorkflowId !== DEFAULT_WORKFLOW_OPTION_ID) {
         const workflowPolicy = this.localPolicyFor('workflow', activeWorkflowId);
         if (workflowPolicy.policy) return { ...workflowPolicy, inheritedFrom: 'workflow' };
       }
-      const local = this.localPolicyFor('conversation', conversationId);
-      if (local.policy) return local;
-      const global = this.localPolicyFor('global');
-      if (global.policy) return { ...global, inheritedFrom: 'global' };
-      const fallback = fallbackPolicy();
-      return fallback ? { policy: fallback, inheritedFrom: 'fallback' } : {};
+      const agent = useAgentStore().activeAgentForConversation(conversationId);
+      if (agent) {
+        const agentPolicy = this.localPolicyFor('agent', agent.id);
+        if (agentPolicy.policy) return { ...agentPolicy, inheritedFrom: 'agent' };
+      }
+      return this.effectivePolicyFor('global');
     },
     workEnvironmentEnabledForConversation(conversationId: string): boolean {
       return this.effectivePolicyForConversation(conversationId).policy?.enabled === true;
     },
+    environmentSelectionForConversation(conversationId: string): WorkEnvironmentSelection {
+      const clientState = useClientStateStore();
+      const feed = useReliableKernelClientFeedStore();
+      const projectLinks = Object.values(feed.records.ConversationProjectLink ?? {}).filter(link =>
+        link.conversation_id === conversationId && link.role === 'primary');
+      const project = projectLinks.length === 1
+        ? feed.records.ProjectContext?.[String(projectLinks[0].project_context_id)] : undefined;
+      const selected = [...clientState.conversationWorkEnvironmentLinks]
+        .filter(link => link.conversationId === conversationId && link.role === 'active')
+        .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt || right.id.localeCompare(left.id))[0];
+      return resolveWorkEnvironmentSelection({
+        environments: clientState.workEnvironments,
+        policy: this.effectivePolicyForConversation(conversationId).policy,
+        explicitWorkEnvironmentId: selected?.workEnvironmentId,
+        ...(typeof project?.uri === 'string' ? { project: { uri: project.uri } } : {}),
+        projectMissing: projectLinks.length > 0 && typeof project?.uri !== 'string'
+      });
+    },
+    frozenEnvironmentSelectionForConversation(conversationId: string): WorkEnvironmentSelection | undefined {
+      const feed = useReliableKernelClientFeedStore();
+      const window = feed.projections.activeConversationWindow as Record<string, unknown> | undefined;
+      const frozen = window?.activeTurnWorkEnvironment as Record<string, unknown> | null | undefined;
+      if (!frozen || frozen.conversationId !== conversationId) {
+        const active = Object.values(feed.records.Turn ?? {}).some(turn => turn.conversation_id === conversationId && turn.status === 'active');
+        return active ? { allowed: [], error: '本回合工作目录信息不可用。' } : undefined;
+      }
+      if (!Array.isArray(frozen.allowedWorkEnvironmentIds)) return undefined;
+      const allowedWorkEnvironmentIds = frozen.allowedWorkEnvironmentIds.filter((id): id is string => typeof id === 'string');
+      const defaultWorkEnvironmentId = typeof frozen.defaultWorkEnvironmentId === 'string' ? frozen.defaultWorkEnvironmentId : undefined;
+      // A null frozen default is also authoritative: do not invent a root from today's candidates.
+      if (!defaultWorkEnvironmentId) return { allowed: [] };
+      return resolveWorkEnvironmentSelection({
+        environments: useClientStateStore().workEnvironments,
+        policy: { allowedWorkEnvironmentIds, defaultWorkEnvironmentId },
+        explicitWorkEnvironmentId: defaultWorkEnvironmentId
+      });
+    },
     allowedEnvironmentsForConversation(conversationId: string): WorkEnvironmentRecord[] {
-      const policy = this.effectivePolicyForConversation(conversationId).policy;
-      if (policy?.enabled !== true) return [];
-      const allowedIds = policy.allowedWorkEnvironmentIds;
-      if (!allowedIds || allowedIds.length === 0) return this.availableEnvironments;
-      const allowed = new Set(allowedIds);
-      return this.availableEnvironments.filter((environment) => allowed.has(environment.id));
+      return this.environmentSelectionForConversation(conversationId).allowed;
     },
     activeEnvironmentForConversation(conversationId: string): WorkEnvironmentRecord | undefined {
-      const clientState = useClientStateStore();
-      const allowed = this.allowedEnvironmentsForConversation(conversationId);
-      const allowedIds = new Set(allowed.map((environment) => environment.id));
-      const link = clientState.conversationWorkEnvironmentLinks.find((candidate) => candidate.conversationId === conversationId && candidate.role === 'active');
-      const linked = allowed.find((environment) => environment.id === link?.workEnvironmentId);
-      if (linked) return linked;
-      const policy = this.effectivePolicyForConversation(conversationId).policy;
-      return allowed.find((environment) => environment.id === policy?.defaultWorkEnvironmentId) ?? allowed[0];
+      return this.environmentSelectionForConversation(conversationId).active;
     },
     selectConversationEnvironment(conversationId: string, workEnvironmentId: string): void {
       if (!conversationId || !workEnvironmentId) return;
@@ -303,12 +333,7 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
       const environment = clientState.workEnvironments.find((candidate) => candidate.id === workEnvironmentId);
       if (!environment || !canRemoveWorkEnvironment(environment)) return;
       clientState.workEnvironments = clientState.workEnvironments.filter((candidate) => candidate.id !== workEnvironmentId);
-      clientState.conversationWorkEnvironmentLinks = clientState.conversationWorkEnvironmentLinks.filter((link) => link.workEnvironmentId !== workEnvironmentId);
-      clientState.runWorkEnvironmentLinks = clientState.runWorkEnvironmentLinks.filter((link) => link.workEnvironmentId !== workEnvironmentId);
-      for (const policy of clientState.workEnvironmentPolicies) {
-        policy.allowedWorkEnvironmentIds = policy.allowedWorkEnvironmentIds.filter((id) => id !== workEnvironmentId);
-        if (policy.defaultWorkEnvironmentId === workEnvironmentId) policy.defaultWorkEnvironmentId = policy.allowedWorkEnvironmentIds[0];
-      }
+      // Retain selected/default identities so a deleted environment produces a visible error.
       bridge.request(BridgeMessageType.WorkEnvironmentRemove, { workEnvironmentId });
     },
     importFromVscode(): void {
@@ -318,7 +343,7 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
     ensureEnvironmentAllowedInGlobal(workEnvironmentId: string): void {
       const global = this.effectivePolicyFor('global').policy;
       const allowed = uniqueAllowed([...(global?.allowedWorkEnvironmentIds ?? availableEnvironmentIds()), workEnvironmentId]);
-      const defaultId = global?.defaultWorkEnvironmentId && allowed.includes(global.defaultWorkEnvironmentId) ? global.defaultWorkEnvironmentId : allowed[0];
+      const defaultId = global?.defaultWorkEnvironmentId;
       this.applyOptimisticPolicyScopeSet('global', undefined, allowed, defaultId, global?.name, global?.enabled ?? false);
     }
   }

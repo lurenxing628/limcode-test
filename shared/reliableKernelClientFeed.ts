@@ -29,6 +29,15 @@ export interface ReliableKernelClientChange {
   removalCause?: 'window-eviction';
 }
 
+/** Read-only work-environment authority for the selected Conversation's active Turn. */
+export interface ActiveTurnWorkEnvironmentProjection {
+  conversationId: string;
+  turnId: string;
+  enabled: boolean;
+  defaultWorkEnvironmentId: string | null;
+  allowedWorkEnvironmentIds: string[];
+}
+
 export interface ReliableKernelSnapshotMessage {
   type: typeof RELIABLE_KERNEL_SNAPSHOT_MESSAGE;
   sessionId: string;

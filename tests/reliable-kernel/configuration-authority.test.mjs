@@ -1,4 +1,4 @@
-﻿import assert from 'node:assert/strict';
+import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -615,7 +615,7 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
       scopeId: 'conversation:child-disjoint',
       template: 'ENV:\n{{$workEnvironment.current}}'
     });
-    const childDisjoint = JSON.parse((await authority.compile({
+    await assert.rejects(authority.compile({
       conversationId: 'conversation:child-disjoint',
       turnId: 'turn:child-disjoint',
       executorAgentId: agent.id,
@@ -625,21 +625,15 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
         allowedWorkEnvironmentIds: [remoteEnvironment.id],
         defaultWorkEnvironmentId: remoteEnvironment.id
       }
-    })).authoritySnapshot.content);
-    assert.deepEqual(childDisjoint.workEnvironmentPolicy.allowedWorkEnvironmentIds, []);
-    assert.equal(childDisjoint.workEnvironmentPolicy.defaultWorkEnvironmentId, null);
-    assert.doesNotMatch(childDisjoint.runtimeContext.text, /Remote Test/);
-    assert.doesNotMatch(childDisjoint.runtimeContext.text, /Workspace · 本地/);
+    }), /未获当前策略允许/);
 
-    // 不携带继承边界时保持现状：无策略会话可见全部可用环境。
-    const childUnbounded = JSON.parse((await authority.compile({
+    // Multiple candidates without a project, explicit selection or default require a choice.
+    await assert.rejects(authority.compile({
       conversationId: 'conversation:child-unbounded',
       turnId: 'turn:child-unbounded',
       executorAgentId: agent.id,
       intentKind: 'input'
-    })).authoritySnapshot.content);
-    assert.deepEqual(childUnbounded.workEnvironmentPolicy.allowedWorkEnvironmentIds,
-      [remoteEnvironment.id, workEnvironmentId].sort());
+    }), /多个工作环境/);
 
     const changedProvider = {
       ...provider,
@@ -957,20 +951,17 @@ test('多个Host共享WorkEnvironment存储时只在本地投影当前Workspace�
     const secondSnapshot = await secondAuthority.configurationClientState();
     const secondPolicy = secondSnapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
     assert.equal(secondPolicy?.enabled, false);
-    // workspaceIds (secondId) always prepended to projected allowed
-    assert.deepEqual(secondPolicy?.allowedWorkEnvironmentIds, [secondId, firstId]);
-    assert.equal(secondPolicy?.defaultWorkEnvironmentId, secondId);
+    assert.deepEqual(secondPolicy?.allowedWorkEnvironmentIds, [firstId]);
+    assert.equal(secondPolicy?.defaultWorkEnvironmentId, firstId);
     assert.equal(secondSnapshot.workEnvironments.find((record) => record.id === firstId)?.available, false);
     assert.equal(secondSnapshot.workEnvironments.find((record) => record.id === secondId)?.available, true);
 
-    const secondFrozen = JSON.parse((await secondAuthority.compile({
+    await assert.rejects(secondAuthority.compile({
       conversationId: 'conversation:second-workspace',
       turnId: 'turn:second-workspace',
       executorAgentId: 'main',
       intentKind: 'input'
-    })).authoritySnapshot.content);
-    assert.deepEqual(secondFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [secondId]);
-    assert.equal(secondFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, secondId);
+    }), /当前窗口的工作环境不可用/);
 
     const manualId = 'work-environment:shared-remote';
     await firstAuthority.mutations.upsertWorkEnvironment({
@@ -991,10 +982,8 @@ test('多个Host共享WorkEnvironment存储时只在本地投影当前Workspace�
     });
     const manualSnapshot = await secondAuthority.configurationClientState();
     const manualPolicy = manualSnapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
-    // workspaceIds (secondId) always prepended to projected allowed
-    assert.deepEqual(manualPolicy?.allowedWorkEnvironmentIds, [secondId, manualId]);
-    // projected default prefers this Host's workspace folder over stored default
-    assert.equal(manualPolicy?.defaultWorkEnvironmentId, secondId);
+    assert.deepEqual(manualPolicy?.allowedWorkEnvironmentIds, [manualId]);
+    assert.equal(manualPolicy?.defaultWorkEnvironmentId, manualId);
     assert.equal(manualSnapshot.workEnvironments.find((record) => record.id === manualId)?.available, true);
 
     const manualFrozen = JSON.parse((await secondAuthority.compile({
@@ -1003,10 +992,8 @@ test('多个Host共享WorkEnvironment存储时只在本地投影当前Workspace�
       executorAgentId: 'main',
       intentKind: 'input'
     })).authoritySnapshot.content);
-    // compile inherits projected allowed with workspace folder prepended
-    assert.deepEqual(manualFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [secondId, manualId]);
-    // compile default = projected default (workspace folder)
-    assert.equal(manualFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, secondId);
+    assert.deepEqual(manualFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [manualId]);
+    assert.equal(manualFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, manualId);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -1318,7 +1305,7 @@ function createVscodeStub() {
   };
 }
 
-test('投影层始终并入当前 Host workspace folder 并优先作为 projected default', async () => {
+test('Host 投影保留用户 allow-list 与 remote default，不自动授权本地目录', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-projection-default-'));
   try {
     const paths = createVscodeStoragePaths(vscode.Uri.file(root));
@@ -1344,14 +1331,14 @@ test('投影层始终并入当前 Host workspace folder 并优先作为 projecte
       (record) => record.id === 'work-environment-policy:global:global'
     );
     assert.ok(policy, 'global policy should exist');
-    assert.deepEqual(policy.allowedWorkEnvironmentIds, [localId, remoteId]);
-    assert.equal(policy.defaultWorkEnvironmentId, localId);
+    assert.deepEqual(policy.allowedWorkEnvironmentIds, [remoteId]);
+    assert.equal(policy.defaultWorkEnvironmentId, remoteId);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 });
 
-test('多 Host 投影：不同窗口各自以自己的 folder 为 projected default 且不污染共享策略库', async () => {
+test('多 Host 投影仅改变目录可用性，不改变共享策略默认与授权', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-multi-host-default-'));
   try {
     const paths = createVscodeStoragePaths(vscode.Uri.file(root));
@@ -1382,15 +1369,15 @@ test('多 Host 投影：不同窗口各自以自己的 folder 为 projected defa
     const policyA = snapA.workEnvironmentPolicies.find(
       (record) => record.id === 'work-environment-policy:global:global'
     );
-    assert.deepEqual(policyA.allowedWorkEnvironmentIds, [idA, remoteId]);
-    assert.equal(policyA.defaultWorkEnvironmentId, idA);
+    assert.deepEqual(policyA.allowedWorkEnvironmentIds, [remoteId]);
+    assert.equal(policyA.defaultWorkEnvironmentId, remoteId);
 
     const snapB = await authB.configurationClientState();
     const policyB = snapB.workEnvironmentPolicies.find(
       (record) => record.id === 'work-environment-policy:global:global'
     );
-    assert.deepEqual(policyB.allowedWorkEnvironmentIds, [idB, remoteId]);
-    assert.equal(policyB.defaultWorkEnvironmentId, idB);
+    assert.deepEqual(policyB.allowedWorkEnvironmentIds, [remoteId]);
+    assert.equal(policyB.defaultWorkEnvironmentId, remoteId);
 
     const storedPolicies = await loadRecordStore(
       paths.workEnvironmentPoliciesRootUri,
@@ -1405,4 +1392,84 @@ test('多 Host 投影：不同窗口各自以自己的 folder 为 projected defa
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test('A+B 会话绑定 B 冻结首个相对工具根；显式 remote 和子继承优先，失效不落 A', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-workspace-selection-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const folders = ['A', 'B'].map((name, index) => {
+      const rootPath = path.join(root, name);
+      return { uri: vscode.Uri.file(rootPath).toString(), rootPath, name, index };
+    });
+    const [a, b] = folders.map(folder => workEnvironmentIdFromUri(folder.uri));
+    const provider = { ...createDefaultLlmProviderConfig(), id: 'provider:workspace-choice', model: 'fixture', models: [{ id: 'fixture', name: 'fixture' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    await authority.synchronizeWorkspaceFolders(folders);
+    const compile = (conversationId, extra = {}) => authority.compile({ conversationId, turnId: `turn:${conversationId}`, executorAgentId: 'main', intentKind: 'input', ...extra });
+    const policyOf = result => JSON.parse(result.authoritySnapshot.content).workEnvironmentPolicy;
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: false, allowedWorkEnvironmentIds: [a, b], defaultWorkEnvironmentId: a });
+    const boundB = { workspace: { uri: folders[1].uri, name: 'B' } };
+    const frozenB = policyOf(await compile('bound-b', boundB));
+    assert.equal(frozenB.defaultWorkEnvironmentId, b);
+    const { resolveFrozenWorkEnvironmentBoundary } = require('../../dist/extension/backend/reliableKernel/workEnvironmentBoundary.js');
+    const { resolvePathInsideBoundary } = require('../../dist/extension/backend/reliableKernel/localFileToolPlanner.js');
+    await fs.mkdir(folders[1].rootPath, { recursive: true });
+    await fs.writeFile(path.join(folders[1].rootPath, 'first.txt'), 'B');
+    const active = resolveFrozenWorkEnvironmentBoundary(frozenB, await authority.workEnvironments()).active;
+    assert.equal((await resolvePathInsideBoundary(active.id, active.rootPath, 'first.txt')).absolutePath, path.join(folders[1].rootPath, 'first.txt'));
+
+    const remote = await authority.mutations.upsertWorkEnvironment(createRemoteServerWorkEnvironmentRecord({ id: 'remote:explicit', name: 'Remote', host: 'example.invalid' }));
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true, allowedWorkEnvironmentIds: [a, b, remote.id], defaultWorkEnvironmentId: a });
+    await authority.mutations.selectConversationWorkEnvironment('explicit', remote.id);
+    assert.equal(policyOf(await compile('explicit', boundB)).defaultWorkEnvironmentId, remote.id);
+    assert.equal(policyOf(await compile('child', { ...boundB, inheritedWorkEnvironmentPolicy: { enabled: true, allowedWorkEnvironmentIds: [a, b, remote.id], defaultWorkEnvironmentId: remote.id } })).defaultWorkEnvironmentId, remote.id);
+
+    // A folder event and a newly admitted Turn share one queue, including reordering and removal.
+    const reordered = authority.synchronizeWorkspaceFolders([{ ...folders[1], index: 0 }, { ...folders[0], index: 1 }]);
+    const pendingTurn = compile('after-reorder', boundB);
+    await reordered;
+    assert.equal(policyOf(await pendingTurn).defaultWorkEnvironmentId, b);
+    await authority.synchronizeWorkspaceFolders([folders[0]]);
+    await assert.rejects(compile('removed-b', boundB), /不可用/);
+    assert.throws(() => resolveFrozenWorkEnvironmentBoundary(frozenB, [
+      { ...(active), available: false }, { ...(active), id: a, rootPath: folders[0].rootPath, available: true }
+    ]), /冻结的工作环境已不可用/);
+
+    await authority.synchronizeWorkspaceFolders(folders);
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: false, allowedWorkEnvironmentIds: [a], defaultWorkEnvironmentId: a });
+    await assert.rejects(compile('denied-b', boundB), /未获当前策略允许/);
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true, allowedWorkEnvironmentIds: [a, b] });
+    const saved = (await authority.configurationClientState()).workEnvironmentPolicies[0];
+    assert.equal(saved.defaultWorkEnvironmentId, undefined);
+    await assert.rejects(compile('needs-choice'), /多个工作环境/);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('Host 本地移除与同步失败隔离：其他 Host 不被禁用，后续同步恢复且失败不猜根', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-folder-sync-fence-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const one = new VscodeConfigurationAuthority(() => paths);
+    const two = new VscodeConfigurationAuthority(() => paths);
+    const folder = { uri: vscode.Uri.file(path.join(root, 'B')).toString(), name: 'B', rootPath: path.join(root, 'B'), index: 0 };
+    const id = workEnvironmentIdFromUri(folder.uri);
+    await one.synchronizeWorkspaceFolders([folder]);
+    await two.synchronizeWorkspaceFolders([folder]);
+    await one.synchronizeWorkspaceFolders([]);
+    assert.equal((await one.workEnvironments()).find(record => record.id === id).available, false);
+    assert.equal((await two.workEnvironments()).find(record => record.id === id).available, true);
+    assert.equal((await loadRecordStore(paths.workEnvironmentsRootUri, paths.workEnvironmentsIndexUri, 'workEnvironment')).find(record => record.id === id).available, true);
+
+    const synchronize = one.mutations.synchronizeWorkspaceFolders.bind(one.mutations);
+    one.mutations.synchronizeWorkspaceFolders = async () => { throw new Error('injected synchronization failure'); };
+    await assert.rejects(one.synchronizeWorkspaceFolders([folder]), /injected synchronization failure/);
+    await assert.rejects(one.compile({ conversationId: 'blocked', turnId: 'turn:blocked', executorAgentId: 'main', intentKind: 'input' }), /injected synchronization failure/);
+    await assert.rejects(one.configurationClientState(), /injected synchronization failure/);
+    one.mutations.synchronizeWorkspaceFolders = synchronize;
+    await one.synchronizeWorkspaceFolders([folder]);
+    assert.equal((await one.workEnvironments()).find(record => record.id === id).available, true);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

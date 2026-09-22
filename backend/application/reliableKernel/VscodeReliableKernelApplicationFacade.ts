@@ -159,6 +159,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   ): Promise<VscodeReliableKernelApplicationFacade> {
     await loadCommittedGlobalStatus(context);
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
+    let facade: VscodeReliableKernelApplicationFacade | undefined;
     // The data-root admission serializes placement/cutover across every workspace scope sharing
     // this configuration root. It is acquired before placement resolution and the scope
     // maintenance claim nests inside it; both lock orders (open and reset) agree.
@@ -190,9 +191,16 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           );
         }
         await completeVscodeRuntimeDataSetSelection(getPaths());
-        return VscodeReliableKernelProductRuntime.open(context, { authority, runtimePlacement });
+        return VscodeReliableKernelProductRuntime.open(context, {
+          authority, runtimePlacement,
+          onConfigurationChanged: async () => {
+            await facade?.commandRouter.refreshConfiguration();
+            await facade?.refreshConversationHistory();
+          }
+        });
       });
-      return new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
+      facade = new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
+      return facade;
     });
   }
 

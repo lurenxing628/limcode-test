@@ -58,7 +58,7 @@ import {
   isLocalFolderWorkEnvironment,
   workEnvironmentIdFromUri
 } from '../../shared/workEnvironmentCatalog';
-import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import { resolveWorkEnvironmentSelection } from '../../shared/workEnvironmentSelection';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
 import {
   loadLlmCompressionConfigsSettings,
@@ -148,7 +148,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   private readonly effectiveModelReads = new Map<string, Promise<ChatModelOverrideRecord>>();
   private currentWorkspaceFolderIds = new Set<string>();
   private currentWorkspaceFolderRecords = new Map<string, WorkEnvironmentRecord>();
-  private currentWorkspaceFolders: readonly CurrentWorkspaceFolder[] = [];
+  private workspaceOperations: Promise<unknown> = Promise.resolve();
+  private workspaceSynchronizationError: unknown;
 
   public constructor(
     private readonly getPaths: () => StoragePaths,
@@ -202,7 +203,14 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       activeProviderConfigId: (selection.settings as LlmSettingsRecord).activeProviderConfigId };
   }
 
-  public async compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
+  public compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
+    return this.enqueueWorkspaceOperation(async () => {
+      if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
+      return this.compileWithCurrentWorkspace(request);
+    });
+  }
+
+  private async compileWithCurrentWorkspace(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
     const records = await this.loadRecords();
     const { agentId, agent, workflowId, workflow, builtinAgent, builtinWorkflow,
       scopesLowToHigh, scopesHighToLow, modelProfile, provider, modelId } = resolveModelSelection(records, request);
@@ -323,29 +331,24 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
     const compressionThresholdTokens = compression.thresholdTokens;
     const allowedTools = toolPolicy.allowedTools;
-    const availableWorkEnvironmentIds = records.workEnvironments
-      .filter((environment) => environment.available)
-      .map((environment) => environment.id);
-    const allowedWorkEnvironmentIds = [...new Set(
-      workEnvironmentPolicy?.allowedWorkEnvironmentIds ?? availableWorkEnvironmentIds
-    )]
-      .filter((id) => availableWorkEnvironmentIds.includes(id))
-      .sort();
-    const { allowedWorkEnvironmentIds: effectiveAllowedWorkEnvironmentIds, inheritedDefaultWorkEnvironmentId } =
-      applyInheritedWorkEnvironmentBoundary(
-        allowedWorkEnvironmentIds,
-        request.inheritedWorkEnvironmentPolicy,
-        availableWorkEnvironmentIds
-      );
+    const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
+      link.conversationId === request.conversationId && link.role === 'active'
+    ));
+    const environmentSelection = resolveWorkEnvironmentSelection({
+      environments: records.workEnvironments,
+      policy: workEnvironmentPolicy,
+      inheritedPolicy: request.inheritedWorkEnvironmentPolicy,
+      explicitWorkEnvironmentId: selectedEnvironment?.workEnvironmentId,
+      project: request.workspace
+    });
+    if (environmentSelection.error) throw new Error(environmentSelection.error);
+    const effectiveAllowedWorkEnvironmentIds = environmentSelection.allowed.map(environment => environment.id).sort();
+    const defaultWorkEnvironmentId = environmentSelection.active?.id ?? null;
     const promptWorkEnvironments = workEnvironmentPolicy?.enabled === true
       || request.inheritedWorkEnvironmentPolicy !== undefined
-      ? effectiveAllowedWorkEnvironmentIds
-        .map((id) => records.workEnvironments.find((environment) => environment.id === id))
-        .filter((environment): environment is WorkEnvironmentRecord => !!environment)
-      // 与旧 ECS runtimeContextWorkEnvironmentsForConversation 一致：策略停用时只暴露本地 folder，
-      // 不把不可通过工具使用的 SSH/远程环境写进模型上下文。
-      : records.workEnvironments.filter((environment) =>
-          environment.available !== false && isLocalFolderWorkEnvironment(environment));
+      ? environmentSelection.allowed
+      : environmentSelection.allowed.filter(environment =>
+        isLocalFolderWorkEnvironment(environment) || environment.id === defaultWorkEnvironmentId);
     const promptRenderContext: ReliablePromptRenderContext = {
       now: new Date(),
       platform: process.platform,
@@ -368,18 +371,6 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       .filter(Boolean);
     // 与旧 ECS RuntimeContextSnapshotSystem 一致：渲染后的运行时上下文在前，规则区域原样追加在后。
     const runtimeContextText = [...renderedRuntimeContextParts, ...composeRuntimeContextRuleParts(ruleFiles)].join('\n\n');
-    const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
-      link.conversationId === request.conversationId && link.role === 'active'
-    ));
-    const preferredWorkEnvironmentId = selectedEnvironment?.workEnvironmentId
-      && effectiveAllowedWorkEnvironmentIds.includes(selectedEnvironment.workEnvironmentId)
-      ? selectedEnvironment.workEnvironmentId
-      : workEnvironmentPolicy?.defaultWorkEnvironmentId ?? inheritedDefaultWorkEnvironmentId ?? undefined;
-    const defaultWorkEnvironmentId = preferredWorkEnvironmentId
-      && effectiveAllowedWorkEnvironmentIds.includes(preferredWorkEnvironmentId)
-      ? preferredWorkEnvironmentId
-      : effectiveAllowedWorkEnvironmentIds[0] ?? null;
-
     const executionPreset = {
       kind: 'turn-execution-preset',
       turnId: request.turnId,
@@ -535,15 +526,32 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     return rules;
   }
 
-  public async synchronizeWorkspaceFolders(
-    folders: readonly CurrentWorkspaceFolder[]
-  ): Promise<void> {
-    this.setCurrentWorkspaceFolders(folders);
-    await this.mutations.synchronizeWorkspaceFolders(folders);
+  public synchronizeWorkspaceFolders(folders: readonly CurrentWorkspaceFolder[]): Promise<void> {
+    const snapshot = folders.map(folder => ({ ...folder }));
+    return this.enqueueWorkspaceOperation(async () => {
+      // Presence is Host-local even when a shared catalog write fails. New Turns fail closed until
+      // a later complete synchronization succeeds; existing Turns retain their frozen identity.
+      this.setCurrentWorkspaceFolders(snapshot);
+      try {
+        await this.mutations.synchronizeWorkspaceFolders(snapshot);
+        this.workspaceSynchronizationError = undefined;
+      } catch (error) {
+        this.workspaceSynchronizationError = error;
+        throw error;
+      }
+    });
+  }
+
+  private enqueueWorkspaceOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const task = this.workspaceOperations.catch(() => undefined).then(operation);
+    this.workspaceOperations = task.then(() => undefined, () => undefined);
+    return task;
   }
 
   /** Configuration-only projection. Runtime facts remain exclusively on the bounded reliable Feed. */
   public async configurationClientState(): Promise<ClientState> {
+    await this.workspaceOperations;
+    if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
     // The client-state tables do not contain provider or compression settings. Keep those independently
     // versioned settings stores out of bridge bootstrap so one invalid section cannot strand every tab.
     const records = await this.loadConfigurationClientRecords();
@@ -616,6 +624,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   }
 
   public async workEnvironment(workEnvironmentId: string): Promise<WorkEnvironmentRecord> {
+    await this.workspaceOperations;
+    if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
     const id = requireId(workEnvironmentId, 'workEnvironmentId');
     const environment = (await this.loadWorkEnvironments()).find((candidate) => candidate.id === id);
     if (!environment) throw new Error(`工作环境配置不存在：${id}`);
@@ -623,6 +633,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   }
 
   public async workEnvironments(): Promise<WorkEnvironmentRecord[]> {
+    await this.workspaceOperations;
+    if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
     return (await this.loadWorkEnvironments()).map((environment) => ({ ...environment }));
   }
 
@@ -805,7 +817,6 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     }, observedAt));
     this.currentWorkspaceFolderRecords = new Map(records.map((record) => [record.id, record]));
     this.currentWorkspaceFolderIds = new Set(this.currentWorkspaceFolderRecords.keys());
-    this.currentWorkspaceFolders = folders;
   }
 
   private async loadConfigurationClientRecords(): Promise<ConfigurationClientRecords> {
@@ -923,11 +934,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         'link'
       )
     ]);
-    const effectiveWorkEnvironmentPolicies = projectWorkEnvironmentPolicies(
-      workEnvironmentPolicies ?? [],
-      workEnvironments ?? [],
-      this.currentWorkspaceFolderIds
-    );
+
     return {
       agents: mergeAgentsWithBuiltins(agents ?? []),
       workflows: mergeWorkflowsWithBuiltins(workflows ?? []),
@@ -944,7 +951,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       runtimeContexts: runtimeContexts ?? [],
       runtimeContextScopeLinks: runtimeContextScopeLinks ?? [],
       workEnvironments: workEnvironments ?? [],
-      workEnvironmentPolicies: effectiveWorkEnvironmentPolicies,
+      workEnvironmentPolicies: workEnvironmentPolicies ?? [],
       workEnvironmentPolicyScopeLinks: workEnvironmentPolicyScopeLinks ?? [],
       checkpointPolicies: checkpointPolicies ?? [],
       checkpointPolicyScopeLinks: checkpointPolicyScopeLinks ?? [],
@@ -1119,65 +1126,6 @@ function resolveModelSelection(records: ModelSelectionRecords, request: TurnAuth
 
     return { agentId, agent, workflowId, workflow, builtinAgent, builtinWorkflow,
       scopesLowToHigh, scopesHighToLow, modelProfile, provider, modelId };
-}
-
-/**
- * Child executions inherit the parent Turn's frozen work-environment boundary: the child's own
- * scoped allow-list is intersected with the parent's, never widened. An empty intersection remains
- * empty so mutually exclusive policies fail closed instead of granting either side's environments.
- */
-function applyInheritedWorkEnvironmentBoundary(
-  allowed: readonly string[],
-  inherited: FrozenWorkEnvironmentBoundaryPolicy | undefined,
-  availableIds: readonly string[]
-): { allowedWorkEnvironmentIds: string[]; inheritedDefaultWorkEnvironmentId: string | null } {
-  if (!inherited) {
-    return { allowedWorkEnvironmentIds: [...allowed], inheritedDefaultWorkEnvironmentId: null };
-  }
-  const inheritedAllowed = [...new Set(inherited.allowedWorkEnvironmentIds)]
-    .filter((id) => availableIds.includes(id));
-  const intersected = allowed.filter((id) => inheritedAllowed.includes(id));
-  return {
-    allowedWorkEnvironmentIds: [...new Set(intersected)].sort(),
-    inheritedDefaultWorkEnvironmentId: inherited.defaultWorkEnvironmentId
-  };
-}
-
-function projectWorkEnvironmentPolicies(
-  policies: readonly WorkEnvironmentPolicyRecord[],
-  environments: readonly WorkEnvironmentRecord[],
-  currentWorkspaceFolderIds: ReadonlySet<string>
-): WorkEnvironmentPolicyRecord[] {
-  const availableIds = new Set(
-    environments.filter((environment) => environment.available).map((environment) => environment.id)
-  );
-  // Each Host projects its own workspace folders into the allow-list and default without
-  // publishing host-local facts into the shared policy store. Folder order follows environment index.
-  const workspaceIds = environments
-    .filter((environment) => environment.available && currentWorkspaceFolderIds.has(environment.id))
-    .sort((left, right) => (left.index ?? 0) - (right.index ?? 0) || left.id.localeCompare(right.id))
-    .map((environment) => environment.id);
-  return policies.map((policy) => {
-    // Workspace folders always join the projected allow-list so they appear checked in the editor
-    // regardless of whether the shared policy already lists them.
-    const allowedWorkEnvironmentIds = workspaceIds.length > 0
-      ? [...new Set([...workspaceIds, ...policy.allowedWorkEnvironmentIds])]
-      : [...policy.allowedWorkEnvironmentIds];
-    const eligibleDefaultIds = allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
-    // Prefer this Host's primary workspace folder as projected default when available;
-    // fall back to the stored policy default if it remains eligible.
-    const defaultWorkEnvironmentId = workspaceIds.length > 0
-      ? workspaceIds[0]
-      : policy.defaultWorkEnvironmentId && eligibleDefaultIds.includes(policy.defaultWorkEnvironmentId)
-        ? policy.defaultWorkEnvironmentId
-        : eligibleDefaultIds[0];
-    const { defaultWorkEnvironmentId: _storedDefault, ...rest } = policy;
-    return {
-      ...rest,
-      allowedWorkEnvironmentIds,
-      ...(defaultWorkEnvironmentId ? { defaultWorkEnvironmentId } : {})
-    };
-  });
 }
 
 interface FrozenCompressionResolution {

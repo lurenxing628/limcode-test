@@ -575,6 +575,14 @@ export class BoundedClientFeed {
         }
         const ownKey = recordKey(change.domain, change.id);
         const wasKnown = session.materializedRecordKeys.has(ownKey);
+        if (change.domain === 'Turn' && record.conversation_id === session.activeConversationId) {
+          const previousStatus = session.materializedRecords.get(ownKey)?.status;
+          if (previousStatus !== record.status && (previousStatus === 'active' || record.status === 'active')) {
+            // The frozen work-environment summary is a snapshot-only projection. Refresh it
+            // atomically when its active Turn appears or ends, including a child Conversation.
+            requiresSnapshot = true;
+          }
+        }
         accepted.push(acceptedChange);
         pending.splice(index, 1);
         if (wasKnown) {

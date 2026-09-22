@@ -710,6 +710,10 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, await this.configurationSnapshot(correlationId));
   }
 
+  public async refreshConfiguration(): Promise<void> {
+    this.options.broadcast?.(await this.configurationSnapshot());
+  }
+
   private async broadcastConfigurationSnapshot(webview: vscode.Webview, correlationId?: string): Promise<void> {
     this.broadcastOrPost(webview, await this.configurationSnapshot(correlationId));
   }

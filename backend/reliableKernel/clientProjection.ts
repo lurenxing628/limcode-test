@@ -8,6 +8,7 @@
  * from the original worker implementation.
  */
 import type Database from 'better-sqlite3';
+import type { ActiveTurnWorkEnvironmentProjection } from '../../shared/reliableKernelClientFeed';
 import type { SnapshotBarrier } from './contracts';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
@@ -50,6 +51,7 @@ export interface ClientProjectionContentAccess {
 const TURN_INTENT_CONTENT_TYPE = 'application/vnd.limcode.turn-intent+json';
 const CHILD_ACTIVITY_ARGUMENTS_MAX_BYTES = 64 * 1024;
 const CHILD_ACTIVITY_SUMMARY_MAX_CHARACTERS = 180;
+const TURN_AUTHORITY_PROJECTION_MAX_BYTES = 16 * 1024 * 1024;
 
 export function projectQueuedTurnIntentRecord(database: Database.Database, intentId: string): DomainRow | null {
   const rows = queryPlainRows(database, `
@@ -526,7 +528,8 @@ export function executeClientProjectionSnapshot(
       compressionBlocks: [],
       conversationContextStatuses: [],
       taskList: [],
-      currentTaskList: null
+      currentTaskList: null,
+      activeTurnWorkEnvironment: null
     };
     const emptyTurns = {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [], modelRequests: [],
@@ -712,6 +715,7 @@ export function executeClientProjectionSnapshot(
       .map((turn) => turn.status === 'active'
         ? projectTurnClientRecord(database, String(turn.id), content)
         : turn);
+    const activeTurnWorkEnvironment = projectActiveTurnWorkEnvironment(database, conversationId, turns, content);
 
     // Processes and child executions are independently visible summaries. Their active rows are
     // pinned even after their source Message leaves the normal 200-message suffix. The source
@@ -986,7 +990,8 @@ export function executeClientProjectionSnapshot(
         compressionBlocks,
         conversationContextStatuses,
         taskList,
-        currentTaskList
+        currentTaskList,
+        activeTurnWorkEnvironment
       },
       activeTurnSummary: {
         turns,
@@ -1046,6 +1051,63 @@ export function executeClientProjectionSnapshot(
     database.exec('ROLLBACK');
     throw error;
   }
+}
+
+/** Only this selected Conversation's active Turn may supply the frozen display value. */
+export function projectActiveTurnWorkEnvironment(
+  database: Database.Database,
+  conversationId: string,
+  selectedTurns: readonly DomainRow[],
+  content: ClientProjectionContentAccess
+): ActiveTurnWorkEnvironmentProjection | null {
+  // Reuse the active Conversation's existing bounded roots; do not rescan historical Turns.
+  const turns = selectedTurns.filter(turn => turn.conversation_id === conversationId && turn.status === 'active');
+  if (turns.length === 0) return null;
+  if (turns.length !== 1) throw new Error(`Conversation ${conversationId} has multiple active Turns.`);
+  const turnId = requireRuntimeId(turns[0].id);
+  const authorities = queryPlainRows(database, `
+    SELECT content.*
+      FROM authority_snapshot AS authority
+      JOIN content_object AS content ON content.id = authority.content_object_id
+     WHERE authority.turn_id = @turnId
+     ORDER BY authority.created_at DESC, authority.id DESC
+     LIMIT 2
+  `, { turnId });
+  // Absence is unknown, never a request to substitute current editable configuration. The UI
+  // distinguishes an active Turn with no projection from a Conversation with no active Turn.
+  if (authorities.length === 0) return null;
+  if (authorities.length !== 1) throw new Error(`Turn ${turnId} has multiple AuthoritySnapshots.`);
+  const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(authorities[0]);
+  if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length > BigInt(TURN_AUTHORITY_PROJECTION_MAX_BYTES)) {
+    throw new Error(`Turn ${turnId} AuthoritySnapshot exceeds the client projection read bound.`);
+  }
+  const document: unknown = JSON.parse(content.readVerifiedBytes(metadata).toString('utf8'));
+  if (!document || typeof document !== 'object' || Array.isArray(document)) {
+    throw new Error(`Turn ${turnId} AuthoritySnapshot is not an object.`);
+  }
+  const policy = (document as Record<string, unknown>).workEnvironmentPolicy;
+  if (policy === undefined || policy === null) return null;
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new Error(`Turn ${turnId} work-environment policy is invalid.`);
+  }
+  const fields = policy as Record<string, unknown>;
+  if (typeof fields.enabled !== 'boolean' || !Array.isArray(fields.allowedWorkEnvironmentIds)) {
+    throw new Error(`Turn ${turnId} work-environment policy is incomplete.`);
+  }
+  const projection: ActiveTurnWorkEnvironmentProjection = {
+    conversationId,
+    turnId,
+    enabled: fields.enabled,
+    defaultWorkEnvironmentId: fields.defaultWorkEnvironmentId === null
+      ? null
+      : requireRuntimeId(fields.defaultWorkEnvironmentId),
+    allowedWorkEnvironmentIds: fields.allowedWorkEnvironmentIds.map(requireRuntimeId)
+  };
+  // Never truncate a boundary: an oversized or malformed frozen policy is not a different policy.
+  if (wireJsonBytes(projection) > CLIENT_PAGE_MAX_BYTES) {
+    throw new Error(`Turn ${turnId} work-environment policy exceeds the client projection size bound.`);
+  }
+  return projection;
 }
 
 function taskListProjectionFromOutcome(
