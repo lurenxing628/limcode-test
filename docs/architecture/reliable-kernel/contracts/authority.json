@@ -60,6 +60,10 @@
     "maintenanceLifetime": "operation-only",
     "maintenanceExclusivity": "reject-live-or-unknown-other-hosts",
     "configurationRootAdmission": "placement-through-host-registration",
+    "runtimeSelection": "one-fixed-data-set-per-configuration-root",
+    "runtimeSelectionPointer": ".limcode-runtime-selection.json",
+    "workspaceFoldersSelectRuntime": false,
+    "unselectedHistory": "offline-snapshot-read-only-on-demand",
     "sharedConfigurationMaintenance": "all-runtime-scopes-offline",
     "rootBindingFields": [
       "paths",

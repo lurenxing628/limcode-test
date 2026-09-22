@@ -16,18 +16,17 @@ Module._load = function load(request, parent, isMain) {
 after(() => { Module._load = originalLoad; });
 
 const {
-  resolveVscodeLegacyRuntimeOwnerPath,
   resolveVscodeRuntimeDataRoot,
+  resolveVscodeRuntimeSelectionPath,
   resolveVscodeWorkspaceRuntimePlacement,
-  resolveVscodeWorkspaceRuntimeScope,
-  resolveVscodeWorkspaceRuntimeScopeRoot
+  resolveVscodeWorkspaceRuntimeScope
 } = require('../../dist/extension/backend/reliableKernel/vscodeRootAuthority.js');
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { loadRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { workEnvironmentIdFromUri } = require('../../dist/extension/shared/workEnvironmentCatalog.js');
 
-test('Workspace身份稳定分流旧Runtime与兄弟隔离根', async () => {
+test('Workspace身份保持稳定但不再参与当前Runtime选库', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-workspace-runtime-route-'));
   try {
     const first = resolveVscodeWorkspaceRuntimeScope({
@@ -54,9 +53,7 @@ test('Workspace身份稳定分流旧Runtime与兄弟隔离根', async () => {
     assert.equal(folderSetA.key, folderSetB.key);
     assert.equal(folderSetA.key, untitledFolderSet.key);
 
-    const legacyRuntimeDataRoot = resolveVscodeRuntimeDataRoot({ globalStoragePath: root });
-    await fs.mkdir(path.dirname(legacyRuntimeDataRoot), { recursive: true });
-    await fs.writeFile(path.join(path.dirname(legacyRuntimeDataRoot), 'root-binding.json'), '{}\n');
+    const fixedRuntimeDataRoot = resolveVscodeRuntimeDataRoot({ globalStoragePath: root });
 
     const firstPlacement = await resolveVscodeWorkspaceRuntimePlacement({ globalStoragePath: root }, first);
     const secondPlacement = await resolveVscodeWorkspaceRuntimePlacement({ globalStoragePath: root }, second);
@@ -64,24 +61,16 @@ test('Workspace身份稳定分流旧Runtime与兄弟隔离根', async () => {
 
     assert.equal(firstPlacement.usesLegacyRuntime, true);
     assert.equal(firstPlacement.runtimeScopeRootPath, root);
-    assert.equal(firstPlacement.runtimeDataRootPath, legacyRuntimeDataRoot);
+    assert.equal(firstPlacement.runtimeDataRootPath, fixedRuntimeDataRoot);
     assert.equal(firstPlacementAgain.usesLegacyRuntime, true);
-    assert.equal(secondPlacement.usesLegacyRuntime, false);
-    assert.equal(
-      secondPlacement.runtimeScopeRootPath,
-      resolveVscodeWorkspaceRuntimeScopeRoot({ globalStoragePath: root }, second)
-    );
-    assert.equal(
-      secondPlacement.runtimeDataRootPath,
-      resolveVscodeRuntimeDataRoot({ globalStoragePath: secondPlacement.runtimeScopeRootPath })
-    );
-    assert.equal(secondPlacement.runtimeDataRootPath.startsWith(path.join(root, '.limcode-runtime')), false);
-
-    const legacyOwner = JSON.parse(await fs.readFile(
-      resolveVscodeLegacyRuntimeOwnerPath({ globalStoragePath: root }),
+    assert.equal(secondPlacement.runtimeScopeRootPath, root);
+    assert.equal(secondPlacement.runtimeDataRootPath, fixedRuntimeDataRoot);
+    const selection = JSON.parse(await fs.readFile(
+      resolveVscodeRuntimeSelectionPath({ globalStoragePath: root }),
       'utf8'
     ));
-    assert.equal(legacyOwner.workspaceKey, first.key);
+    assert.equal(selection.id, 'default');
+    assert.equal(selection.initialized, false);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

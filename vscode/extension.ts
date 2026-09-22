@@ -40,7 +40,8 @@ async function startApplication(
       '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade'
     );
     const moduleLoadedAt = Date.now();
-    const application = await VscodeReliableKernelApplicationFacade.open(context);
+    const { openWithRuntimeDataSetSelection } = await import('./commands/runtimeDataSetManagement');
+    const application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context));
     const applicationOpenedAt = Date.now();
 
     // Deactivation may race a slow filesystem/SQLite open. Publish the result so deactivate() can
@@ -121,4 +122,3 @@ export async function deactivate(): Promise<void> {
     // Failed startup has no live application to close.
   }
 }
-

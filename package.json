@@ -25,6 +25,12 @@
   "contributes": {
     "commands": [
       {
+        "command": "limcode-test.manageRuntimeDataSets",
+        "title": "Limcode Test: 历史与存储管理",
+        "category": "Limcode Test",
+        "icon": "$(database)"
+      },
+      {
         "command": "limcode-test.openPanel",
         "title": "Limcode Test: Open LLM Chat",
         "category": "Limcode Test"
@@ -45,6 +51,11 @@
         "category": "Limcode Test"
       }
     ],
+    "menus": {
+      "view/title": [
+        { "command": "limcode-test.manageRuntimeDataSets", "when": "view == limcode-test-entry-view", "group": "navigation" }
+      ]
+    },
     "keybindings": [
       {
         "command": "limcode-test.applyLiveDiffPreview",

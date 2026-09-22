@@ -15,6 +15,7 @@ export class ApplicationStartup {
   private startRequested = false;
   private started = false;
   private settled = false;
+  private application: ApplicationFacade | undefined;
 
   public constructor() {
     this.ready = new Promise<ApplicationFacade>((resolve, reject) => {
@@ -43,9 +44,13 @@ export class ApplicationStartup {
     return this.startRequested ? this.ready : undefined;
   }
 
+  /** Maintenance commands can work even when normal Runtime startup has not completed. */
+  public current(): ApplicationFacade | undefined { return this.application; }
+
   public resolve(application: ApplicationFacade): void {
     if (this.settled) return;
     this.settled = true;
+    this.application = application;
     this.resolveReady(application);
   }
 

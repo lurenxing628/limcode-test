@@ -14,6 +14,9 @@ import { readNativeSteeringInFlight } from '../../reliableKernel/nativeSteering'
 import { ForkContextCandidateProbe, isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
 import {
   createVscodeRootAuthority,
+  completeVscodeRuntimeDataSetSelection,
+  assertConfigurationRootRuntimesOffline,
+  selectVscodeRuntimeDataSet,
   resolveVscodeWorkspaceRuntimePlacement,
   resolveVscodeWorkspaceRuntimeScope,
   type VscodeWorkspaceRuntimePlacement
@@ -186,6 +189,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
             + `${rootPreparation.epochResetBackupPath}，并创建第 ${RUNTIME_KERNEL_EPOCH} 代运行数据。`
           );
         }
+        await completeVscodeRuntimeDataSetSelection(getPaths());
         return VscodeReliableKernelProductRuntime.open(context, { authority, runtimePlacement });
       });
       return new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
@@ -643,7 +647,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public getCurrentProjectHistoryScope(): ConversationHistoryScope {
     const folder = this.currentWorkspaceFolder();
-    return folder ? { kind: 'project', folderUri: folder.uri.toString() } : { kind: 'unbound' };
+    return folder ? { kind: 'project', folderUri: folder.uri.toString() } : { kind: 'all' };
   }
 
   public getProjectFolderCandidates(): ProjectFolderCandidateRecord[] {
@@ -717,6 +721,17 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         turns: await this.list('Turn', { conversation_id: conversationId }, 200)
       } : {})
     };
+  }
+
+  /** Native command confirmation precedes this offline switch; callers reload the window after it. */
+  public async selectRuntimeDataSet(id: string): Promise<void> {
+    this.requireOpen();
+    const paths = this.getPaths();
+    await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
+      await assertConfigurationRootRuntimesOffline(paths.globalStoragePath, this.product.application.database.hostBootId);
+      await this.dispose();
+      await selectVscodeRuntimeDataSet(this.getPaths(), id);
+    });
   }
 
   public attachWebview(webview: vscode.Webview, meta: WebviewClientMeta = { kind: 'unknown' }): BridgeClientId {
