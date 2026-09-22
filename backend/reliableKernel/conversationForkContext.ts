@@ -1,3 +1,4 @@
+import { selectConversationCompressionBlock } from './compressionBlockOwnership';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -17,6 +18,17 @@ export interface ForkContextLineage {
   segmentIds: ReadonlySet<string>;
   messageSources: readonly DomainRow[];
   contentObjectIds: ReadonlyMap<string, string>;
+  /** The Conversation's own CompressionBlocks over every summary segment in the lineage. */
+  compressionBlocks: readonly ForkLineageCompressionBlock[];
+}
+
+export interface ForkLineageCompressionBlock {
+  summarySegmentId: string;
+  block: DomainRow;
+  /** The block's ContextSegmentSource row on the summary segment. */
+  summarySource: DomainRow;
+  /** Ordered CompressionBlockSource rows. */
+  blockSources: readonly DomainRow[];
 }
 
 export interface NativeMessageContextRevision {
@@ -25,15 +37,20 @@ export interface NativeMessageContextRevision {
   attachments: DomainRow[];
 }
 
-/** The selected immutable prefix includes the sources hidden behind its compression blocks. */
+/**
+ * The selected immutable prefix includes the sources hidden behind its compression blocks. Summary
+ * segments are shared by forks, so their lineage follows the blocks owned by this Conversation.
+ */
 export async function readForkContextLineage(
   database: RuntimeDatabase,
-  rootSegmentIds: readonly string[]
+  rootSegmentIds: readonly string[],
+  conversationId: string
 ): Promise<ForkContextLineage> {
   const segmentIds = new Set<string>();
   const messageSources: DomainRow[] = [];
   const contentObjectIds = new Map<string, string>();
   const childrenBySegment = new Map<string, string[]>();
+  const compressionBlocks: ForkLineageCompressionBlock[] = [];
   let frontier = [...new Set(rootSegmentIds)];
   while (frontier.length > 0) {
     const next = new Set<string>();
@@ -46,7 +63,7 @@ export async function readForkContextLineage(
           where: { segment_id: segmentId }, limit: 257
         }))
       ]);
-      const compressed: Array<{ segmentId: string; blockId: string }> = [];
+      const compressed: Array<{ segmentId: string; blockId: string; summarySource: DomainRow }> = [];
       for (const [index, segmentId] of batch.entries()) {
         const segment = requireRow(snapshot.snapshot[index], `ContextSegment ${segmentId}`);
         const first = requireRows(snapshot.snapshot[batch.length + index], 'ContextSegmentSource');
@@ -59,10 +76,13 @@ export async function readForkContextLineage(
           if (source.source_kind === 'message_revision') messageSources.push(source);
         }
         if (segment.segment_kind === 'compression') {
-          if (sources.length !== 1 || sources[0].source_kind !== 'compression_block') {
-            throw new Error(`Compression segment ${segmentId} lacks its unique block source.`);
-          }
-          compressed.push({ segmentId, blockId: requireId(sources[0].source_id, 'ContextSegmentSource.source_id') });
+          const block = await selectConversationCompressionBlock(database, segmentId, conversationId, sources);
+          const blockId = requireId(block.id, 'CompressionBlock.id');
+          compressed.push({
+            segmentId,
+            blockId,
+            summarySource: sources.find((source) => source.source_id === blockId)!
+          });
         }
       }
       if (compressed.length === 0) continue;
@@ -72,7 +92,7 @@ export async function readForkContextLineage(
           where: { compression_block_id: blockId }, limit: 257
         }))
       ]);
-      for (const [index, { segmentId, blockId }] of compressed.entries()) {
+      for (const [index, { segmentId, blockId, summarySource }] of compressed.entries()) {
         const block = requireRow(blocks.snapshot[index], `CompressionBlock ${blockId}`);
         if (block.summary_object_id !== contentObjectIds.get(segmentId)) {
           throw new Error(`Compression segment ${segmentId} does not reference its block summary.`);
@@ -88,6 +108,7 @@ export async function readForkContextLineage(
           return requireId(source.segment_id, 'CompressionBlockSource.segment_id');
         });
         childrenBySegment.set(segmentId, children);
+        compressionBlocks.push({ summarySegmentId: segmentId, block, summarySource, blockSources: sources });
         for (const child of children) if (!segmentIds.has(child)) next.add(child);
       }
     }
@@ -104,7 +125,7 @@ export async function readForkContextLineage(
     visited.add(segmentId);
   }
   for (const segmentId of rootSegmentIds) visit(segmentId);
-  return { segmentIds, messageSources, contentObjectIds };
+  return { segmentIds, messageSources, contentObjectIds, compressionBlocks };
 }
 
 /** Native UI aggregates do not own Context; their immutable item revisions do. */

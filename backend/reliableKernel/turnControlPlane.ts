@@ -3901,18 +3901,20 @@ export async function contextRootContainsCompleteToolPair(
   )) return false;
 
   const materialized = await database.materializeContext(rootId);
+  const conversationId = requireId(materialized.snapshot.root.conversation_id, 'ContextSequenceRoot.conversation_id');
   const visibleSegmentIds = materialized.snapshot.records.map((record) =>
     requireId(record.segment.id, 'ContextSegment.id')
   );
   if (visibleSegmentIds.includes(pairSegmentId)) return true;
   for (const segmentId of visibleSegmentIds) {
-    if (await compressionContainsSegment(database, segmentId, pairSegmentId, new Set())) return true;
+    if (await compressionContainsSegment(database, conversationId, segmentId, pairSegmentId, new Set())) return true;
   }
   return false;
 }
 
 async function compressionContainsSegment(
   database: RuntimeDatabase,
+  conversationId: string,
   summarySegmentId: string,
   targetSegmentId: string,
   visited: Set<string>
@@ -3924,15 +3926,23 @@ async function compressionContainsSegment(
     segment_id: summarySegmentId,
     source_kind: 'compression_block'
   });
-  if (summarySources.length !== 1) return false;
-  const blockId = requireId(summarySources[0].source_id, 'ContextSegmentSource.source_id');
+  if (summarySources.length === 0) return false;
+  // Shared summary segments carry one block per owning Conversation; follow only this one's.
+  const blocks = await database.snapshot(summarySources.map((source) =>
+    DOMAIN_REPOSITORIES.domain('CompressionBlock').get(requireId(source.source_id, 'ContextSegmentSource.source_id'))
+  ));
+  const owned = blocks.snapshot.filter((block) =>
+    !!block && !Array.isArray(block) && (block as DomainRow).conversation_id === conversationId
+  ) as DomainRow[];
+  if (owned.length !== 1) return false;
+  const blockId = requireId(owned[0].id, 'CompressionBlock.id');
   const sources = await listAllDomainRows(database, 'CompressionBlockSource', {
     compression_block_id: blockId
   });
   for (const source of sources) {
     const segmentId = requireId(source.segment_id, 'CompressionBlockSource.segment_id');
     if (segmentId === targetSegmentId) return true;
-    if (await compressionContainsSegment(database, segmentId, targetSegmentId, visited)) return true;
+    if (await compressionContainsSegment(database, conversationId, segmentId, targetSegmentId, visited)) return true;
   }
   return false;
 }

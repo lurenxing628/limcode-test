@@ -250,7 +250,7 @@ export class ConversationForkControlPlane {
     const retainedSegmentIds = targetRootShape.segmentIds ?? (
       await this.context.materializeStructure(command.sourceContextRootId)
     ).records.map((record) => requireId(record.segment.id, 'ContextSegment.id'));
-    const retainedLineage = await readForkContextLineage(this.database, retainedSegmentIds);
+    const retainedLineage = await readForkContextLineage(this.database, retainedSegmentIds, command.sourceConversationId);
     const historicalSourceRoots = await retainedForkHistoryRoots(
       this.database, sourceContextRoots, command.sourceContextRootId, retainedLineage.segmentIds
     );
@@ -260,7 +260,8 @@ export class ConversationForkControlPlane {
       ...(sourceMembership
         ? { boundaryMessageSeq: requireBigInt(sourceMembership.message_seq, 'MessagePartOfConversation.message_seq') }
         : {}),
-      ...(targetRootShape.segmentIds ? { contextSegmentIds: targetRootShape.segmentIds } : {}),
+      // Whole-root callers copy no transcript but still receive their own CompressionBlocks.
+      contextSegmentIds: targetRootShape.segmentIds ?? retainedSegmentIds,
       targetAgentId: command.targetAgentId,
       copyTurnAuthority: true,
       contextRoots: {

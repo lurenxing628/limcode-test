@@ -4,6 +4,7 @@ import {
   type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
+import { resolveConversationCompressionBlock } from './compressionBlockOwnership';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   DOMAIN_REPOSITORIES,
@@ -1681,6 +1682,7 @@ export class ContextSequenceControlPlane {
     const expanded = await this.expandCompressionSegmentForTarget(
       requireId(summary.segment.id, 'ContextSegment.id'),
       targetSegmentId,
+      requireId(state.root.conversation_id, 'ContextSequenceRoot.conversation_id'),
       new Set()
     );
     if (!expanded.containsTarget) return null;
@@ -1699,6 +1701,7 @@ export class ContextSequenceControlPlane {
   private async expandCompressionSegmentForTarget(
     segmentId: string,
     targetSegmentId: string,
+    conversationId: string,
     path: ReadonlySet<string>
   ): Promise<CompressionExpansion> {
     const current = await this.readEditableSegment(segmentId);
@@ -1709,21 +1712,10 @@ export class ContextSequenceControlPlane {
       return { containsTarget: false, segments: [current], blocks: [] };
     }
     if (path.has(segmentId)) throw new Error(`Compression lineage cycle detected at ${segmentId}.`);
-    const sourceSnapshot = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-        where: {
-          segment_id: segmentId,
-          source_kind: 'compression_block',
-          source_revision: 0n
-        },
-        limit: 1
-      })
-    ]);
-    const source = rows(sourceSnapshot.snapshot[0])[0];
-    if (!source) throw new Error(`Compression segment ${segmentId} has no CompressionBlock source.`);
-    const blockId = requireId(source.source_id, 'ContextSegmentSource.source_id');
-    const block = await this.getOptional('CompressionBlock', blockId);
-    if (!block) throw new Error(`CompressionBlock ${blockId} does not exist.`);
+    // Edits inside a compressed range disable only this Conversation's own block over the
+    // shared summary segment, never the source's or another fork's block.
+    const block = await resolveConversationCompressionBlock(this.database, segmentId, conversationId);
+    const blockId = requireId(block.id, 'CompressionBlock.id');
     const sourceRows = await this.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('CompressionBlockSource').list({
         where: { compression_block_id: blockId },
@@ -1743,6 +1735,7 @@ export class ContextSequenceControlPlane {
     const children = await Promise.all(ordered.map((row) => this.expandCompressionSegmentForTarget(
       requireId(row.segment_id, 'CompressionBlockSource.segment_id'),
       targetSegmentId,
+      conversationId,
       nextPath
     )));
     if (!children.some((child) => child.containsTarget)) {

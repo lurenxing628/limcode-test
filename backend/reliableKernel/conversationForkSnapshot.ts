@@ -7,6 +7,7 @@ import {
   isNativeRequest,
   readForkContextLineage,
   readNativeMessageContextRevisions,
+  type ForkLineageCompressionBlock,
   type NativeMessageContextRevision
 } from './conversationForkContext';
 import {
@@ -112,8 +113,17 @@ export async function prepareConversationForkSnapshot(
     now: string;
   }
 ): Promise<ConversationForkSnapshotPlan> {
-  if (input.boundaryMessageSeq === undefined) {
+  const contextLineage = input.contextSegmentIds
+    ? await readForkContextLineage(database, input.contextSegmentIds, input.sourceConversationId)
+    : undefined;
+  // Summary segments are shared, but each Conversation owns its CompressionBlocks: the target
+  // receives its own copy of every block reachable from the retained Context.
+  const compressionBlocks = contextLineage?.compressionBlocks ?? [];
+  if (input.boundaryMessageSeq === undefined && compressionBlocks.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
+  }
+  if (compressionBlocks.length > 0 && (!input.copyTurnAuthority || !input.contextRoots)) {
+    throw new Error('Copying CompressionBlocks requires a user fork with frozen authority and target roots.');
   }
 
   const membershipBarrier = await database.snapshotAll(
@@ -123,11 +133,8 @@ export async function prepareConversationForkSnapshot(
       limit: 1000
     })
   );
-  const contextLineage = input.contextSegmentIds
-    ? await readForkContextLineage(database, input.contextSegmentIds)
-    : undefined;
   let boundaryMessageSeq = input.boundaryMessageSeq;
-  if (contextLineage) {
+  if (contextLineage && boundaryMessageSeq !== undefined) {
     const membershipsByMessage = new Map(membershipBarrier.snapshot.map((membership) => [
       id(membership.message_id, 'MessagePartOfConversation.message_id'), membership
     ]));
@@ -151,14 +158,14 @@ export async function prepareConversationForkSnapshot(
         throw new Error('Fork Context MessageRevision provenance is inconsistent.');
       }
       const sequence = integer(membership.message_seq, 'MessagePartOfConversation.message_seq');
-      if (sequence > boundaryMessageSeq) boundaryMessageSeq = sequence;
+      if (sequence > boundaryMessageSeq!) boundaryMessageSeq = sequence;
     }
   }
-  const prefixMemberships = membershipBarrier.snapshot
-    .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq)
+  const prefixMemberships = boundaryMessageSeq === undefined ? [] : membershipBarrier.snapshot
+    .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq!)
     .filter((row) => !input.selectedMessageIds || input.selectedMessageIds.has(id(row.message_id, 'MessagePartOfConversation.message_id')))
     .sort(compareMessageMembership);
-  if (prefixMemberships.length === 0) {
+  if (prefixMemberships.length === 0 && compressionBlocks.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
   }
 
@@ -172,7 +179,7 @@ export async function prepareConversationForkSnapshot(
       })
     ];
   });
-  const basic = await database.snapshot(basicReads);
+  const basic = basicReads.length > 0 ? await database.snapshot(basicReads) : { snapshot: [] };
   const messageCandidates: Array<{
     message: DomainRow;
     membership: DomainRow;
@@ -187,11 +194,11 @@ export async function prepareConversationForkSnapshot(
     messageCandidates.push({ message, membership, current: currentRows[0] });
   }
 
-  const revisionBarrier = await database.snapshot(messageCandidates.map((candidate) =>
+  const revisionBarrier = messageCandidates.length > 0 ? await database.snapshot(messageCandidates.map((candidate) =>
     DOMAIN_REPOSITORIES.domain('MessageRevision').get(
       id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id')
     )
-  ));
+  )) : { snapshot: [] };
   const visibleCandidates = messageCandidates.flatMap((candidate, index) => {
     const revisionId = id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id');
     const revision = row(revisionBarrier.snapshot[index], `MessageRevision ${revisionId}`);
@@ -297,11 +304,17 @@ export async function prepareConversationForkSnapshot(
   }
   const toolResultMessages = await readToolResultMessages(database, tools, input.sourceConversationId);
 
+  // Each copied block keeps the frozen authority of the Turn that compressed (a manual compression
+  // Turn owns no Message), so that Turn is copied too; a Turn still running cannot be copied.
+  const blockAuthorities = await getRows(database, 'AuthoritySnapshot', unique(compressionBlocks.map(({ block }) =>
+    id(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id')
+  )));
   const turnIds = unique([
     ...messageFacts.flatMap((fact) => fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))),
     ...toolResultMessages.flatMap((fact) => fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))),
     ...requestAggregates.map((entry) => id(entry.request.turn_id, 'ModelRequest.turn_id')),
-    ...tools.map((entry) => id(entry.toolCall.turn_id, 'ToolCall.turn_id'))
+    ...tools.map((entry) => id(entry.toolCall.turn_id, 'ToolCall.turn_id')),
+    ...blockAuthorities.map((snapshot) => id(snapshot.turn_id, 'AuthoritySnapshot.turn_id'))
   ]);
   const turnRows = await getRows(database, 'Turn', turnIds);
   requireTerminatedTurns(turnRows);
@@ -329,6 +342,7 @@ export async function prepareConversationForkSnapshot(
   const projections = input.contextRoots
     ? await readRequestProjections(database, requestAggregates, input.contextRoots)
     : [];
+  const blockCopies = await readCompressionBlockCopies(database, compressionBlocks, input.contextRoots);
   const fileFacts = await readFileFacts(database, tools);
   const interactionFacts = await readInteractionFacts(database, tools);
 
@@ -524,6 +538,9 @@ export async function prepareConversationForkSnapshot(
       owner_id: mapped(requestIdMap, sourceRequestId, 'ModelRequest'),
       root_id: rootId
     }));
+  }
+  for (const copy of blockCopies) {
+    addCompressionBlockCopy(assertions, inserts, copy, input.sourceConversationId, target, authorityIdMap!);
   }
   for (const fact of messageFacts) {
     for (const link of fact.requestLinks) {
@@ -815,11 +832,104 @@ function hasCompleteTurnClosure(
   if (relation.termination.terminal_status !== 'completed') {
     return relation.finalOutputFences.length === 0;
   }
+  // A completed maintenance Turn (manual compression) produces no transcript and no final output.
+  if (relation.messageLinks.length === 0 && relation.finalOutputFences.length === 0) return true;
   if (relation.finalOutputFences.length !== 1) return false;
   return requestIds.has(id(
     relation.finalOutputFences[0].model_request_id,
     'TurnFinalOutputFence.model_request_id'
   ));
+}
+
+interface CompressionBlockCopy {
+  lineage: ForkLineageCompressionBlock;
+  observationLinks: DomainRow[];
+  projection: { row: DomainRow; rootId: string } | null;
+}
+
+async function readCompressionBlockCopies(
+  database: RuntimeDatabase,
+  blocks: readonly ForkLineageCompressionBlock[],
+  roots: ForkContextRoots | undefined
+): Promise<CompressionBlockCopy[]> {
+  const copies: CompressionBlockCopy[] = [];
+  for (const lineage of blocks) {
+    const blockId = id(lineage.block.id, 'CompressionBlock.id');
+    const [observationLinks, projections] = await Promise.all([
+      listAllDomainRows(database, 'CompressionBlockObservationLink', { compression_block_id: blockId }),
+      listAllDomainRows(database, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: blockId })
+    ]);
+    if (projections.length > 1) throw new Error(`CompressionBlock ${blockId} has multiple Context projections.`);
+    let projection: CompressionBlockCopy['projection'] = null;
+    if (projections[0] && roots) {
+      const [sourceRoot] = await getRows(database, 'ContextSequenceRoot', [
+        id(projections[0].root_id, 'ModelContextProjection.root_id')
+      ]);
+      const rootId = mapForkContextRoot(sourceRoot, roots);
+      if (rootId) projection = { row: projections[0], rootId };
+    }
+    copies.push({ lineage, observationLinks, projection });
+  }
+  return copies;
+}
+
+/**
+ * The copied block keeps its status, title, summary and chronology but belongs to the target, uses
+ * the target's frozen authority copy and registers its own source on the shared summary segment.
+ */
+function addCompressionBlockCopy(
+  assertions: RepositoryTransactionStep[],
+  inserts: RepositoryTransactionStep[],
+  copy: CompressionBlockCopy,
+  sourceConversationId: string,
+  target: string,
+  authorityIds: Map<string, string>
+): void {
+  const { block, summarySource, blockSources } = copy.lineage;
+  const sourceBlockId = id(block.id, 'CompressionBlock.id');
+  const targetBlockId = copyId(target, 'compression_block', sourceBlockId);
+  assertions.push(DOMAIN_REPOSITORIES.domain('CompressionBlock').assert(sourceBlockId, {
+    conversation_id: sourceConversationId,
+    status: block.status,
+    summary_object_id: block.summary_object_id
+  }));
+  inserts.push(DOMAIN_REPOSITORIES.domain('CompressionBlock').insert({
+    ...block,
+    id: targetBlockId,
+    conversation_id: target,
+    authority_snapshot_id: mapped(
+      authorityIds,
+      id(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id'),
+      'AuthoritySnapshot'
+    )
+  }));
+  for (const source of blockSources) {
+    inserts.push(DOMAIN_REPOSITORIES.domain('CompressionBlockSource').insert({
+      ...source,
+      id: copyId(target, 'compression_block_source', id(source.id, 'CompressionBlockSource.id')),
+      compression_block_id: targetBlockId
+    }));
+  }
+  for (const link of copy.observationLinks) {
+    inserts.push(DOMAIN_REPOSITORIES.domain('CompressionBlockObservationLink').insert({
+      ...link,
+      id: copyId(target, 'compression_block_observation_link', id(link.id, 'CompressionBlockObservationLink.id')),
+      compression_block_id: targetBlockId
+    }));
+  }
+  inserts.push(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
+    ...summarySource,
+    id: copyId(target, 'context_compression_block', id(summarySource.id, 'ContextSegmentSource.id')),
+    source_id: targetBlockId
+  }));
+  if (copy.projection) {
+    inserts.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
+      ...copy.projection.row,
+      id: copyId(target, 'model_context_projection', id(copy.projection.row.id, 'ModelContextProjection.id')),
+      owner_id: targetBlockId,
+      root_id: copy.projection.rootId
+    }));
+  }
 }
 
 async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Promise<ToolFact[]> {

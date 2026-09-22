@@ -775,7 +775,7 @@ export class ModelProviderControlPlane {
     }
     const compressionSourceContext = compressionPolicy && isRecord(recipe)
       && (recipe.compressionMethodKind !== 'provider_native' || sourceReplay)
-      ? await expandTextCompressionSources(this.database, this.contentStore, providerContext,
+      ? await expandTextCompressionSources(this.database, this.contentStore, frozen.conversationId, providerContext,
           sourceReplay ? { sourceReplay } : {})
       : undefined;
     assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [

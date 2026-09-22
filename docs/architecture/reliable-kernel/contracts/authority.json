@@ -1553,7 +1553,7 @@
         "status"
       ],
       "notes": [
-        "正文、来源和摘要不可变；update 仅允许 status∈{enabled,disabled,soft_deleted}，regenerate 创建新 CompressionBlock"
+        "正文、来源和摘要不可变；update 仅允许 status∈{enabled,disabled,soft_deleted}，regenerate 创建新 CompressionBlock；每个能到达摘要段的 Conversation 各自拥有一个覆盖该段的 CompressionBlock，读取者按 Conversation 选择"
       ]
     },
     {

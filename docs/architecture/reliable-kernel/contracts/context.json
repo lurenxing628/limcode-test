@@ -158,7 +158,8 @@
       "replace": "用户修改 title/summary 时创建新的 immutable CompressionBlock/replacement；同事务按明确选择将旧块 status 置 disabled 或 soft_deleted，并更新 current head；该previousStatus disposition属于持久幂等命令身份，相同key不同disposition必须冲突。",
       "enableDisableDelete": "只更新 CompressionBlock.status；delete 为 soft_deleted，不物理删除来源与历史 projection。",
       "legacyCompressionUpdate": "removed-no-in-place-title-or-summary-mutation"
-    }
+    },
+    "forkOwnership": "摘要 segment 不可变且由分支共享，CompressionBlock 归属单个 Conversation：fork 为保留历史可达的每个块复制 CompressionBlock（状态/标题/摘要/created_at 不变，authority_snapshot_id 改指分支复制的冻结权限）、CompressionBlockSource、CompressionBlockObservationLink、摘要段上新的 compression_block 来源行与重新挂根的 ModelContextProjection；读取者按 Conversation 选择恰好一个仍存在的自有块，编辑、禁用与重建只作用于本对话的块，源对话删除不影响分支。"
   },
   "replay": {
     "uses": [
@@ -256,7 +257,7 @@
     ],
     "contextRule": "fork 从选定旧 parent/root 创建目标 Conversation 的新 root/head，结构共享不可变 ContextSequence 前缀。",
     "relationRule": "Reuse、Branch、Origin、Project 分别建独立表/Repository/Codec/Client mapping；fork 在同一事务继承可选 ProjectContext；不得嵌入 Conversation。",
-    "historyRule": "fork 只复制已终止轮次：分支点或复制范围内任一 Turn 仍活动时以 ConversationForkRejectedError 拒绝且不写入；源对话的活动轮次不受已提交 fork 影响，共享的不可变 tool_pair 段按本 ToolCall 自己的来源行定位。整轮消息都被复制的 Turn 连同其全部 ModelRequest（含压缩与失败请求）一起复制并保留原终止状态，只复制部分消息的边界 Turn 记为 forked_history_snapshot 中断；用户分支为每个复制的 Turn 复制自己的 AuthoritySnapshot 并改写请求引用（子 Agent 分支不复制权限），复制请求的 ModelContextProjection 重新挂到分支中结构相同的根，无对应根时不复制；超过单页的来源集合分页读全。",
+    "historyRule": "fork 只复制已终止轮次：分支点或复制范围内任一 Turn 仍活动时以 ConversationForkRejectedError 拒绝且不写入；源对话的活动轮次不受已提交 fork 影响，共享的不可变 tool_pair 段按本 ToolCall 自己的来源行定位。整轮消息都被复制的 Turn 连同其全部 ModelRequest（含压缩与失败请求）一起复制并保留原终止状态，只复制部分消息的边界 Turn 记为 forked_history_snapshot 中断；用户分支为每个复制的 Turn 复制自己的 AuthoritySnapshot 并改写请求引用（子 Agent 分支不复制权限），复制请求的 ModelContextProjection 重新挂到分支中结构相同的根，无对应根时不复制；超过单页的来源集合分页读全。可达压缩块按 compression.forkOwnership 复制，块冻结权限所属的压缩 Turn（含无消息的手动压缩 Turn）一并复制，仍在运行则拒绝。",
     "legacyRunReference": "forbidden-use-source-turn-id-instead"
   }
 }

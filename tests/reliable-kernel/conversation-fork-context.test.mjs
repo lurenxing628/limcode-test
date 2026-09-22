@@ -44,6 +44,10 @@ async function withContext(body, observed = true) {
         ]),
         insert('ContextSequenceNode', { id: 'node-' + index, parent_node_id: index < 2 ? null : 'node-' + (index - 1), segment_id: 'segment-' + index, created_at: NOW })
       ]),
+      // The block's frozen authority belongs to the maintenance Turn that compressed the history.
+      insert('Turn', { id: 'compression-turn', conversation_id: 'source', status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+      insert('AuthoritySnapshot', { id: 'source-authority', turn_id: 'compression-turn', content_object_id: compacted.id, created_at: NOW }),
+      insert('TurnTermination', { id: 'compression-turn-termination', turn_id: 'compression-turn', terminal_status: 'completed', reason: 'compressed', created_at: NOW }),
       insert('ContextSegment', { id: 'compacted-segment', content_object_id: compacted.id, segment_kind: 'system', created_at: NOW }),
       insert('ContextSegmentSource', { id: 'compacted-source', segment_id: 'compacted-segment', source_kind: 'system', source_id: 'compacted-system', source_revision: 0n, created_at: NOW }),
       insert('CompressionBlock', { id: 'compression', conversation_id: 'source', status: 'enabled', authority_snapshot_id: 'source-authority', title_object_id: compacted.id, summary_object_id: metadata[0].id, created_at: NOW, updated_at: NOW }),
@@ -115,6 +119,11 @@ test('从较早位置分支保留 Provider 校准，图片存储字节不再膨�
     const materialized = (await database.materializeContext(result.targetRootId)).snapshot.records;
     assert.deepEqual(materialized.map(record => record.contentObject.id), metadata.slice(0, 2).map(content => content.id));
     assert.equal((await getRoot(database, 'source-full')).estimated_tokens, 6000n);
+    const targetBlocks = (await database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain('CompressionBlock').list({
+      where: { conversation_id: result.targetConversationId }, orderBy: { column: 'id', direction: 'asc' }, limit: 10
+    }))).snapshot;
+    assert.equal(targetBlocks.length, 1, 'the fork owns its own copy of the reachable compression block');
+    assert.equal(targetBlocks[0].summary_object_id, metadata[0].id);
     assert.equal((await fork('prefix', 'segment-1')).deduplicated, true);
   });
 });

@@ -19,6 +19,7 @@ const kernel = load('backend/reliableKernel/index.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 const { ForkContextCandidateProbe } = load('backend/reliableKernel/conversationForkContext.js');
 const { prepareChildContextFork } = load('backend/reliableKernel/childContextFork.js');
+const { ReliableConversationRunner } = load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -685,6 +686,128 @@ test('forks keep running, re-forking and child-forking after their tool-history 
     const copiedChildCalls = (await rows(h.app, 'ToolCall')).length;
     assert.equal(copiedChildCalls, 3, 'first fork, second fork and child each own one copied ToolCall');
   }, { withTool: true });
+});
+
+async function blockStatuses(app, conversationIds) {
+  return Object.fromEntries(await Promise.all(conversationIds.map(async conversationId =>
+    [conversationId, (await rows(app, 'CompressionBlock', { conversation_id: conversationId })).map(block => block.status)]
+  )));
+}
+
+async function firstMessageCommand(h, conversationId, commandId) {
+  const [first] = (await rows(h.app, 'MessagePartOfConversation', { conversation_id: conversationId }))
+    .sort((a, b) => Number(a.message_seq - b.message_seq));
+  const [current] = await rows(h.app, 'MessageCurrentRevisionLink', { message_id: first.message_id });
+  return { sourceConversationId: conversationId, messageId: first.message_id,
+    expectedRevisionId: current.revision_id, command: { commandId } };
+}
+
+test('a fork owns its compression blocks and keeps running, re-forking and child-forking after the source is deleted', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'manual-compressed-input-1');
+    await h.turn('source', 'manual-compressed-input-2');
+    const runner = new ReliableConversationRunner(h.app, 'fork-fixture-owner');
+    let compressionTurnId;
+    try {
+      const expectedRootId = await h.app.context.currentHeadRootId('source');
+      const structure = await h.app.context.materializeStructure(expectedRootId);
+      const compressed = await runner.manualCompression({
+        commandId: 'manual-compression-before-fork', conversationId: 'source',
+        compressSegmentCount: structure.records.length, target: { kind: 'current_head', expectedRootId }
+      });
+      assert.equal(compressed.compression.status, 'compressed');
+      compressionTurnId = compressed.turnId;
+    } finally { runner.dispose(); }
+    assert.equal((await rows(h.app, 'MessageTurnLink', { turn_id: compressionTurnId })).length, 0);
+    await h.turn('source', 'after-manual-compression');
+    const fork = await h.facade.forkConversation(await h.command('source', 'fork-compressed-source'));
+    const [sourceBlock] = await rows(h.app, 'CompressionBlock', { conversation_id: 'source' });
+    const [forkBlock] = await rows(h.app, 'CompressionBlock', { conversation_id: fork.conversationId });
+    assert.ok(forkBlock, 'the fork owns a copy of the reachable compression block');
+    assert.notEqual(forkBlock.id, sourceBlock.id);
+    assert.equal(forkBlock.summary_object_id, sourceBlock.summary_object_id);
+    assert.equal(forkBlock.created_at, sourceBlock.created_at);
+    const [forkAuthority] = await rows(h.app, 'AuthoritySnapshot', { id: forkBlock.authority_snapshot_id });
+    const [forkAuthorityTurn] = await rows(h.app, 'Turn', { id: forkAuthority.turn_id });
+    assert.equal(forkAuthorityTurn.conversation_id, fork.conversationId,
+      'the copied block freezes the authority of the copied manual compression Turn');
+    assert.deepEqual((await rows(h.app, 'TurnTermination', { turn_id: forkAuthorityTurn.id })).map(row => row.terminal_status), ['completed']);
+    assert.equal((await rows(h.app, 'ModelRequest', { turn_id: forkAuthorityTurn.id })).length,
+      (await rows(h.app, 'ModelRequest', { turn_id: compressionTurnId })).length);
+    const [summarySource] = await rows(h.app, 'ContextSegmentSource', { source_kind: 'compression_block', source_id: forkBlock.id });
+    const [sourceSummary] = await rows(h.app, 'ContextSegmentSource', { source_kind: 'compression_block', source_id: sourceBlock.id });
+    assert.equal(summarySource.segment_id, sourceSummary.segment_id, 'the immutable summary segment stays shared');
+    const feed = (await h.app.database.clientProjectionSnapshot(fork.conversationId)).snapshot.activeConversationWindow;
+    assert.deepEqual(feed.compressionBlocks.map(block => block.id), [forkBlock.id]);
+    const forkMessageIds = (await rows(h.app, 'MessagePartOfConversation', { conversation_id: fork.conversationId })).map(row => row.message_id);
+    assert.ok(forkMessageIds.includes(feed.compressionBlocks[0].anchor_message_id));
+
+    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
+    assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
+    assert.deepEqual(await rows(h.app, 'CompressionBlock', { id: sourceBlock.id }), []);
+    await h.turn(fork.conversationId, 'fork-after-compressed-source-delete');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /offline summary/);
+    const second = await h.facade.forkConversation(await h.command(fork.conversationId, 'refork-after-delete'));
+    await h.turn(second.conversationId, 'second-generation-after-compressed-delete');
+    const early = await h.facade.forkConversation(await firstMessageCommand(h, fork.conversationId, 'pre-compression-refork'));
+    await h.turn(early.conversationId, 'continue-before-inherited-compression');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /manual-compressed-input-1/);
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: fork.conversationId, role: 'default' });
+    const now = new Date().toISOString();
+    const child = await prepareChildContextFork(h.app.database, h.app.contentStore, {
+      sourceConversationId: fork.conversationId, targetConversationId: 'compressed-child-probe',
+      targetAgentId: agent.agent_id, forkTurns: 'all', now
+    });
+    assert.ok(child.segments.length >= 4, 'the inherited compressed history is expanded for the child');
+    await h.app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+        id: 'compressed-child-probe', title: 'Child probe', status: 'active', created_at: now, updated_at: now
+      }),
+      ...child.steps
+    ]);
+  }, { compression: true });
+});
+
+test('editing inside an inherited compressed range disables only that conversation\'s own block', async () => {
+  await withForkRuntime(async h => {
+    const turn = await h.turn('source', 'shared-compressed-question');
+    await h.turn('source', 'shared-compressed-follow-up');
+    const [authority] = await rows(h.app, 'AuthoritySnapshot', { turn_id: turn.turnId });
+    const rootId = await h.app.context.currentHeadRootId('source');
+    const structure = await h.app.context.materializeStructure(rootId);
+    await h.app.compression.create({
+      conversationId: 'source', headRootId: rootId, authoritySnapshotId: authority.id,
+      compressSegmentCount: structure.records.length, title: 'Shared summary',
+      summary: 'Offline shared summary', idempotencyKey: 'shared-compression'
+    });
+    await h.turn('source', 'after-shared-compression');
+    const first = await h.facade.forkConversation(await h.command('source', 'first-compressed-fork'));
+    const second = await h.facade.forkConversation(await h.command('source', 'second-compressed-fork'));
+    const conversations = ['source', first.conversationId, second.conversationId];
+    assert.deepEqual(Object.values(await blockStatuses(h.app, conversations)), [['enabled'], ['enabled'], ['enabled']]);
+
+    const edited = await firstMessageCommand(h, first.conversationId, 'unused');
+    await h.app.turns.edit({
+      source: { kind: 'command', key: 'edit-inside-fork-compression' }, conversationId: first.conversationId,
+      messageId: edited.messageId, expectedRevisionId: edited.expectedRevisionId, content: 'edited inside the fork'
+    });
+    assert.deepEqual(await blockStatuses(h.app, conversations), {
+      source: ['enabled'], [first.conversationId]: ['disabled'], [second.conversationId]: ['enabled']
+    });
+
+    const sourceFirst = await firstMessageCommand(h, 'source', 'unused');
+    await h.app.turns.edit({
+      source: { kind: 'command', key: 'edit-inside-source-compression' }, conversationId: 'source',
+      messageId: sourceFirst.messageId, expectedRevisionId: sourceFirst.expectedRevisionId, content: 'edited inside the source'
+    });
+    assert.deepEqual(await blockStatuses(h.app, conversations), {
+      source: ['disabled'], [first.conversationId]: ['disabled'], [second.conversationId]: ['enabled']
+    });
+    await h.turn(second.conversationId, 'untouched-fork-keeps-its-summary');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /Offline shared summary/);
+    await h.turn(first.conversationId, 'edited-fork-continues');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /edited inside the fork/);
+  });
 });
 
 for (const fault of ['revision', 'duplicate']) {

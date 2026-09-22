@@ -1,6 +1,7 @@
 import type { FullProviderContextItem } from './modelProviderControlPlane';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import { selectConversationCompressionBlock } from './compressionBlockOwnership';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 
 const MAX_REPLAY_SEGMENTS = 32768;
@@ -11,10 +12,12 @@ const MAX_REPLAY_DEPTH = 64;
  * Normally only those states are expanded through immutable CompressionBlockSource provenance.
  * Explicit manual reconstruction expands text summaries too, discarding their possibly incorrect
  * aliases instead of guessing replacements. This read never mutates history; missing/cyclic
- * provenance fails closed rather than producing a successful but empty replacement summary. */
+ * provenance fails closed rather than producing a successful but empty replacement summary.
+ * Shared summary segments are expanded through the block owned by the requesting Conversation. */
 export async function expandTextCompressionSources(
   database: RuntimeDatabase,
   store: ContentAddressedStore,
+  conversationId: string,
   input: readonly FullProviderContextItem[],
   options: { sourceReplay?: 'immutable_provenance' } = {}
 ): Promise<FullProviderContextItem[]> {
@@ -36,15 +39,16 @@ export async function expandTextCompressionSources(
     if (ancestors.length >= MAX_REPLAY_DEPTH || ancestors.includes(item.segmentId)) {
       throw invalid('原生压缩来源存在循环或超过重建深度。');
     }
-    const sourceSnapshot = await database.snapshot([
-      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-        where: { segment_id: item.segmentId, source_kind: 'compression_block' }, limit: 2
-      })
-    ]);
-    const sources = rows(sourceSnapshot.snapshot[0]);
-    if (sources.length !== 1) throw invalid('原生压缩状态缺少唯一的历史来源。');
-    const blockId = id(sources[0].source_id);
-    const block = await get(database, 'CompressionBlock', blockId);
+    const sources = rows((await database.snapshotAll(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+      where: { segment_id: item.segmentId }, orderBy: { column: 'id', direction: 'asc' }, limit: 1000
+    }))).snapshot);
+    let block: DomainRow;
+    try {
+      block = await selectConversationCompressionBlock(database, item.segmentId, conversationId, sources);
+    } catch {
+      throw invalid('原生压缩状态缺少本对话唯一的历史来源。');
+    }
+    const blockId = id(block.id);
     if (block.summary_object_id !== (await get(database, 'ContextSegment', item.segmentId)).content_object_id) {
       throw invalid('压缩摘要与不可变来源的内容身份不一致。');
     }

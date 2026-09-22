@@ -164,8 +164,14 @@ function provenanceFixture({ gap = false, cycle = false, missing = false } = {})
   const original = pairItem('original', 'bridge-running', 'CHECK_BETA');
   const old = textItem('old-summary', 'Incorrect historical alias A1 belongs to CHECK_BETA', 'compression');
   const domains = {
-    ContextSegmentSource: [{ id: 'source', segment_id: old.segmentId, source_kind: 'compression_block', source_id: 'old-block' }],
-    CompressionBlock: [{ id: 'old-block', summary_object_id: 'summary-object' }],
+    ContextSegmentSource: [
+      { id: 'source', segment_id: old.segmentId, source_kind: 'compression_block', source_id: 'old-block', source_revision: 0n },
+      { id: 'fork-source', segment_id: old.segmentId, source_kind: 'compression_block', source_id: 'fork-block', source_revision: 0n }
+    ],
+    CompressionBlock: [
+      { id: 'old-block', conversation_id: 'owner', summary_object_id: 'summary-object' },
+      { id: 'fork-block', conversation_id: 'fork', summary_object_id: 'summary-object' }
+    ],
     CompressionBlockSource: missing ? [] : [{ id: 'block-source', compression_block_id: 'old-block', position: gap ? 1n : 0n,
       segment_id: cycle ? old.segmentId : original.segmentId }],
     ContextSegment: [{ id: old.segmentId, content_object_id: 'summary-object', segment_kind: 'compression' },
@@ -183,8 +189,8 @@ function provenanceFixture({ gap = false, cycle = false, missing = false } = {})
 
 test('explicit immutable provenance rebuild replaces corrupt text aliases before text or native compaction', async () => {
   const fixture = provenanceFixture();
-  assert.deepEqual(await expandTextCompressionSources(fixture.database, fixture.store, [fixture.old]), [fixture.old]);
-  const source = await expandTextCompressionSources(fixture.database, fixture.store, [fixture.old], { sourceReplay: 'immutable_provenance' });
+  assert.deepEqual(await expandTextCompressionSources(fixture.database, fixture.store, 'owner', [fixture.old]), [fixture.old]);
+  const source = await expandTextCompressionSources(fixture.database, fixture.store, 'owner', [fixture.old], { sourceReplay: 'immutable_provenance' });
   assert.equal(source.length, 1);
   assert.equal(source[0].content, fixture.original.content);
   for (const method of ['llm_summary', 'provider_native']) {
@@ -201,7 +207,7 @@ test('explicit immutable provenance rebuild replaces corrupt text aliases before
 test('immutable provenance reconstruction rejects absent, cyclic and non-contiguous source graphs', async () => {
   for (const options of [{ gap: true }, { cycle: true }, { missing: true }]) {
     const fixture = provenanceFixture(options);
-    await assert.rejects(expandTextCompressionSources(fixture.database, fixture.store, [fixture.old], { sourceReplay: 'immutable_provenance' }),
+    await assert.rejects(expandTextCompressionSources(fixture.database, fixture.store, 'owner', [fixture.old], { sourceReplay: 'immutable_provenance' }),
       error => error.code === 'MODEL_CONTEXT_NATIVE_SOURCE_INVALID');
   }
 });

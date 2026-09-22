@@ -1,3 +1,4 @@
+import { selectConversationCompressionBlock } from './compressionBlockOwnership';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateContextSegmentTokens } from './contextTokenEstimator';
@@ -102,10 +103,7 @@ export async function prepareChildContextFork(
     path.add(segmentId);
     const sources = await list('ContextSegmentSource', { segment_id: segmentId });
     if (segment.segment_kind === 'compression') {
-      if (sources.length !== 1 || sources[0].source_kind !== 'compression_block') {
-        throw new Error('Child context fork compression source is ambiguous.');
-      }
-      const block = await get('CompressionBlock', id(sources[0].source_id));
+      const block = await selectConversationCompressionBlock(database, segmentId, input.sourceConversationId, sources);
       if (block.summary_object_id !== segment.content_object_id) throw new Error('Child context fork compression content is inconsistent.');
       const children = await list('CompressionBlockSource', { compression_block_id: id(block.id) });
       children.sort((a, b) => Number(BigInt(String(a.position)) - BigInt(String(b.position))));

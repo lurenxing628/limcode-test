@@ -921,6 +921,10 @@ function validateContext(context, failures) {
   if (context?.compression?.splitToolPair !== false) failures.push('压缩不能拆开工具调用和结果');
   if (context?.compression?.management?.legacyCompressionUpdate !== 'removed-no-in-place-title-or-summary-mutation') failures.push('CompressionUpdate不得原地修改摘要');
   if (!String(context?.compression?.management?.replace ?? '').includes('immutable CompressionBlock')) failures.push('压缩修改必须创建不可变replacement');
+  const compressionForkOwnership = String(context?.compression?.forkOwnership ?? '');
+  for (const marker of ['CompressionBlock 归属单个 Conversation', 'CompressionBlockSource', 'CompressionBlockObservationLink', '按 Conversation 选择恰好一个', '源对话删除不影响分支']) {
+    if (!compressionForkOwnership.includes(marker)) failures.push(`压缩块分支归属规则缺少${marker}`);
+  }
   for (const replaySource of ['ContextSequenceRoot', 'AuthoritySnapshot', 'immutable-model-request-recipe']) {
     if (!(context?.replay?.uses ?? []).includes(replaySource)) failures.push(`上下文重放缺少${replaySource}`);
   }
@@ -934,7 +938,7 @@ function validateContext(context, failures) {
   if (context?.conversationFork?.releaseDecision !== 'keep-relations-and-rebuild') failures.push('Conversation fork必须保留独立关系语义');
   if (context?.conversationFork?.legacyRunReference !== 'forbidden-use-source-turn-id-instead') failures.push('Conversation fork来源不得继续依赖Run');
   const forkHistoryRule = String(context?.conversationFork?.historyRule ?? '');
-  for (const marker of ['只复制已终止轮次', 'ConversationForkRejectedError', '本 ToolCall 自己的来源行', '全部 ModelRequest', '自己的 AuthoritySnapshot', '子 Agent 分支不复制权限', 'ModelContextProjection 重新挂到分支']) {
+  for (const marker of ['只复制已终止轮次', 'ConversationForkRejectedError', '本 ToolCall 自己的来源行', '全部 ModelRequest', '自己的 AuthoritySnapshot', '子 Agent 分支不复制权限', 'ModelContextProjection 重新挂到分支', 'compression.forkOwnership']) {
     if (!forkHistoryRule.includes(marker)) failures.push(`Conversation fork历史规则缺少${marker}`);
   }
 

@@ -375,6 +375,15 @@ export class AttachmentCatalogProjection {
       this.turnCache,
       false
     );
+    // Every Conversation reaching a shared summary segment owns its own block over it; blocks of
+    // other or deleted Conversations are absent here and scoped out below.
+    await this.primeDomainRows(
+      'CompressionBlock',
+      sources.filter((source) => source.source_kind === 'compression_block')
+        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
+      this.compressionBlockCache,
+      false
+    );
   }
 
   private async primeMessageRevisionOwners(revisionIds: readonly string[]): Promise<void> {
@@ -430,8 +439,11 @@ export class AttachmentCatalogProjection {
         conversationId
       );
     }
-    // Compression/system/runtime Context is shared immutable lineage. Unknown kinds stay visible so
-    // the structural validator fails closed instead of silently discarding malformed authority data.
+    if (sourceKind === 'compression_block') {
+      return this.compressionBlockCache.get(sourceId)?.conversation_id === conversationId;
+    }
+    // System/runtime Context is shared immutable lineage. Unknown kinds stay visible so the
+    // structural validator fails closed instead of silently discarding malformed authority data.
     return true;
   }
 
