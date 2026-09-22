@@ -1,4 +1,5 @@
-export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment';
+export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment'
+  | 'conversation' | 'collaborationMessage' | 'conversationMessage' | 'boardChannel' | 'boardThread' | 'boardPost';
 
 export class UnknownModelHandleReferenceError extends Error {
   public readonly code = 'UNKNOWN_MODEL_HANDLE_REFERENCE';
@@ -38,10 +39,16 @@ const HANDLE_PREFIX: Record<ModelHandleKind, string> = {
   process: 'P',
   cursor: 'O',
   child: 'A',
-  workEnvironment: 'W'
+  workEnvironment: 'W',
+  conversation: 'C',
+  collaborationMessage: 'M',
+  conversationMessage: 'R',
+  boardChannel: 'H',
+  boardThread: 'T',
+  boardPost: 'B'
 };
 
-const HANDLE_PATTERN = /^(?:F|P|O|A|W)[1-9]\d*$/;
+const HANDLE_PATTERN = /^(?:F|P|O|A|W|C|M|R|H|T|B)[1-9]\d*$/;
 const WORK_ENVIRONMENT_PATTERN = /\bwork-env-[a-zA-Z0-9._-]+\b/g;
 const MAX_NESTED_JSON_CHARS = 16 * 1024 * 1024;
 
@@ -64,7 +71,13 @@ export function buildModelHandleCatalog(
     process: 0,
     cursor: 0,
     child: 0,
-    workEnvironment: 0
+    workEnvironment: 0,
+    conversation: 0,
+    collaborationMessage: 0,
+    conversationMessage: 0,
+    boardChannel: 0,
+    boardThread: 0,
+    boardPost: 0
   };
   const entries: ModelHandleEntry[] = [];
   for (const seed of normalizedSeeds) {
@@ -186,7 +199,8 @@ export function projectKnownToolValue(
   catalogInput: ModelHandleCatalog | unknown
 ): unknown {
   const catalog = normalizeModelHandleCatalog(catalogInput);
-  const projected = projectKnownValue(value, catalog);
+  const projected = projectKnownValue(isCollaborationHandleTool(toolName)
+    ? projectCollaborationValue(value, catalog) : value, catalog);
   const record = asRecord(projected);
   if (!record) return projected;
 
@@ -217,7 +231,9 @@ export function resolveModelToolArguments(
   const record = asRecord(args);
   if (!record) return args;
 
-  if (toolName === 'read') {
+  if (isCollaborationHandleTool(toolName)) {
+    resolveCollaborationArguments(toolName, record, catalog);
+  } else if (toolName === 'read') {
     replaceRef(record, 'attachmentRef', 'attachmentId', 'attachment', catalog);
   } else if (toolName === 'bash' || toolName === 'shell') {
     replaceRef(record, 'processRef', 'processId', 'process', catalog);
@@ -334,10 +350,11 @@ function projectKnownText(value: string, catalog: ModelHandleCatalog): string {
 function collectCandidates(
   value: unknown,
   output: ModelHandleCandidate[],
-  seen: Set<object>
+  seen: Set<object>,
+  collaborationScope = false
 ): void {
   if (typeof value === 'string') {
-    collectNestedJson(value, output, seen);
+    collectNestedJson(value, output, seen, collaborationScope);
     for (const match of value.matchAll(WORK_ENVIRONMENT_PATTERN)) {
       pushCandidate(output, { kind: 'workEnvironment', target: match[0] });
     }
@@ -346,12 +363,15 @@ function collectCandidates(
   if (Array.isArray(value)) {
     if (seen.has(value)) return;
     seen.add(value);
-    for (const entry of value) collectCandidates(entry, output, seen);
+    for (const entry of value) collectCandidates(entry, output, seen, collaborationScope);
     return;
   }
   const record = asRecord(value);
   if (!record || seen.has(record)) return;
   seen.add(record);
+  const toolName = asRecord(record.toolCall)?.toolName;
+  collaborationScope ||= record.kind === 'agent_collaboration' || record.kind === 'collaboration_message'
+    || (typeof toolName === 'string' && isCollaborationHandleTool(toolName));
 
   const attachmentId = optionalText(record.attachmentId);
   const attachmentName = optionalText(record.name);
@@ -372,6 +392,12 @@ function collectCandidates(
     for (const target of record.answerBridgeIds) pushTextCandidate(output, 'child', target);
   }
   pushTextCandidate(output, 'workEnvironment', record.workEnvironmentId);
+  if (collaborationScope) {
+    for (const [key, , kind] of COLLABORATION_HANDLE_FIELDS) pushTextCandidate(output, kind, record[key]);
+    if (Array.isArray(record.notifyConversationIds)) {
+      for (const target of record.notifyConversationIds) pushTextCandidate(output, 'conversation', target);
+    }
+  }
   for (const key of ['nextOutputHandle', 'outputHandle']) {
     const handle = optionalText(record[key]);
     if (handle?.startsWith('rk-process-output:')) pushCandidate(output, { kind: 'cursor', target: handle });
@@ -382,15 +408,15 @@ function collectCandidates(
       pushCandidate(output, { kind: 'workEnvironment', target: environment });
     }
   }
-  for (const child of Object.values(record)) collectCandidates(child, output, seen);
+  for (const child of Object.values(record)) collectCandidates(child, output, seen, collaborationScope);
 }
 
-function collectNestedJson(value: string, output: ModelHandleCandidate[], seen: Set<object>): void {
+function collectNestedJson(value: string, output: ModelHandleCandidate[], seen: Set<object>, collaborationScope: boolean): void {
   const trimmed = value.trim();
   if (trimmed.length === 0 || trimmed.length > MAX_NESTED_JSON_CHARS) return;
   if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return;
   try {
-    collectCandidates(JSON.parse(trimmed) as unknown, output, seen);
+    collectCandidates(JSON.parse(trimmed) as unknown, output, seen, collaborationScope);
   } catch {
     // Ordinary text is not part of the handle catalog.
   }
@@ -450,6 +476,12 @@ function handleKindLabel(kind: ModelHandleKind): string {
     case 'cursor': return '输出游标';
     case 'child': return '子 Agent';
     case 'workEnvironment': return '工作环境';
+    case 'conversation': return '对话';
+    case 'collaborationMessage': return '协作消息';
+    case 'conversationMessage': return '对话历史消息';
+    case 'boardChannel': return '留言频道';
+    case 'boardThread': return '留言讨论';
+    case 'boardPost': return '留言';
   }
 }
 
@@ -459,7 +491,9 @@ function targetKey(kind: ModelHandleKind, target: string): string {
 
 function requireKind(value: unknown, label: string): ModelHandleKind {
   if (value === 'attachment' || value === 'process' || value === 'cursor'
-    || value === 'child' || value === 'workEnvironment') return value;
+    || value === 'child' || value === 'workEnvironment' || value === 'conversation'
+    || value === 'collaborationMessage' || value === 'conversationMessage' || value === 'boardChannel' || value === 'boardThread'
+    || value === 'boardPost') return value;
   throw new TypeError(`${label} is invalid.`);
 }
 
@@ -487,4 +521,92 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function cloneValue<T>(value: T): T {
   return value === undefined ? value : JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Short addresses are retained across compression; authorization always belongs to control planes. */
+export function isPersistentAgentHandle(kind: ModelHandleKind): boolean {
+  return kind === 'child' || kind === 'conversation' || kind === 'collaborationMessage' || kind === 'conversationMessage'
+    || kind === 'boardChannel' || kind === 'boardThread' || kind === 'boardPost';
+}
+
+export function isCollaborationHandleTool(toolName: string): boolean {
+  return ['list_agents', 'send_agent_message', 'followup_agent_task', 'read_agent_messages',
+    'wait_agent_messages', 'agent_board'].includes(toolName);
+}
+
+const COLLABORATION_HANDLE_FIELDS: ReadonlyArray<readonly [string, string, ModelHandleKind]> = [
+  ['conversationId', 'conversationRef', 'conversation'],
+  ['sourceConversationId', 'sourceConversationRef', 'conversation'],
+  ['authorConversationId', 'authorConversationRef', 'conversation'],
+  ['targetConversationId', 'targetConversationRef', 'conversation'],
+  ['rootConversationId', 'rootConversationRef', 'conversation'],
+  ['parentConversationId', 'parentConversationRef', 'conversation'],
+  ['messageId', 'messageRef', 'collaborationMessage'],
+  ['afterMessageId', 'afterMessageRef', 'collaborationMessage'],
+  ['beforeMessageId', 'beforeMessageRef', 'collaborationMessage'],
+  ['olderMessageId', 'olderMessageRef', 'collaborationMessage'],
+  ['conversationMessageId', 'messageRef', 'conversationMessage'],
+  ['olderConversationMessageId', 'olderMessageRef', 'conversationMessage'],
+  ['replyToMessageId', 'replyToMessageRef', 'collaborationMessage'],
+  ['nextAfterMessageId', 'nextAfterMessageRef', 'collaborationMessage'],
+  ['channelId', 'channelRef', 'boardChannel'],
+  ['threadId', 'threadRef', 'boardThread'],
+  ['postId', 'postRef', 'boardPost']
+];
+
+function projectCollaborationValue(value: unknown, catalog: ModelHandleCatalog): unknown {
+  if (Array.isArray(value)) return value.map(item => projectCollaborationValue(item, catalog));
+  const record = asRecord(value);
+  if (!record) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(record)) {
+    // Board UI records retain id alongside an explicitly typed identity; only the typed ref goes to models.
+    if (key === 'id' && (child === record.channelId || child === record.postId)) continue;
+    const field = COLLABORATION_HANDLE_FIELDS.find(([idKey]) => idKey === key);
+    if (field && (child === null || child === undefined)) {
+      output[field[1]] = child;
+    } else if (field) {
+      const ref = modelHandleRef(catalog, field[2], child);
+      if (!ref) throw new UnknownModelHandleReferenceError(field[2], '(unmapped collaboration result)');
+      output[field[1]] = ref;
+    } else if (key === 'notifyConversationIds' && Array.isArray(child)) {
+      output.notifyConversationRefs = child.map(target => {
+        const ref = modelHandleRef(catalog, 'conversation', target);
+        if (!ref) throw new UnknownModelHandleReferenceError('conversation', '(unmapped notification target)');
+        return ref;
+      });
+    } else output[key] = projectCollaborationValue(child, catalog);
+  }
+  return output;
+}
+
+function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
+  const fields: ReadonlyArray<readonly [string, string, ModelHandleKind]> = toolName === 'agent_board'
+    ? [['channelRef', 'channelId', 'boardChannel'], ['threadRef', 'threadId', 'boardThread'], ['postRef', 'postId', 'boardPost']]
+    : [['conversationRef', 'targetConversationId', 'conversation'], ['messageRef', 'messageId', 'collaborationMessage'],
+      ['afterMessageRef', 'afterMessageId', 'collaborationMessage'],
+      ['beforeMessageRef', 'beforeMessageId', record.view === 'conversation' ? 'conversationMessage' : 'collaborationMessage'], ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']];
+  for (const [refKey, targetKey, kind] of fields) {
+    // Provider contracts accept only frozen short references. Canonical IDs cannot bypass the map.
+    if (targetKey in record) throw new UnknownModelHandleReferenceError(kind, '(canonical id is not a model reference)');
+    if (!(refKey in record)) continue;
+    const ref = optionalText(record[refKey]);
+    if (!ref || !modelHandleTarget(catalog, kind, ref)) {
+      throw new UnknownModelHandleReferenceError(kind, ref ?? `(invalid ${refKey})`);
+    }
+    replaceRef(record, refKey, targetKey, kind, catalog);
+  }
+  if (toolName === 'agent_board') {
+    if ('notifyConversationIds' in record) throw new UnknownModelHandleReferenceError('conversation', '(canonical notification targets)');
+    if ('notifyConversationRefs' in record) {
+      const refs = record.notifyConversationRefs;
+      if (!Array.isArray(refs) || refs.length > 256) throw new UnknownModelHandleReferenceError('conversation', '(invalid notification targets)');
+      record.notifyConversationIds = refs.map(ref => {
+        const target = modelHandleTarget(catalog, 'conversation', ref);
+        if (!target) throw new UnknownModelHandleReferenceError('conversation', typeof ref === 'string' ? ref : '(invalid reference)');
+        return target;
+      });
+      delete record.notifyConversationRefs;
+    }
+  }
 }

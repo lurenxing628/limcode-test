@@ -1,0 +1,47 @@
+import type { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
+import type { ProcessCompletionWakeHandler, ProcessCompletionWakeRequest } from '../../reliableKernel/processCompletionDelivery';
+import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
+import type { ReliableConversationRunner } from './ReliableConversationRunner';
+
+export interface RuntimeDeliveryWakeDependencies {
+  application(): ReliableKernelApplication | undefined;
+  conversations(): ReliableConversationRunner | undefined;
+  children(): ReliableChildAgentCoordinator | undefined;
+  notify?(request: ProcessCompletionWakeRequest): void;
+}
+
+/** Shared production scheduler: durable input delivery never bypasses Conversation ownership. */
+export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWakeDependencies): ProcessCompletionWakeHandler {
+  return async request => {
+    const application = dependencies.application();
+    const runner = dependencies.conversations();
+    const children = dependencies.children();
+    if (!application || !runner) return { acknowledged: false };
+    if (!application.database.conversationOwners.owns(request.conversationId)) return { acknowledged: false };
+    await application.database.conversationOwners.assertOwned(request.conversationId);
+    if (request.action === 'notify_only') {
+      const acknowledged = await application.runtime.deliveries.acknowledgeNotification(request.deliveryId);
+      // The committed ACK fences duplicate notifications on wake replay.
+      if (acknowledged.changed) dependencies.notify?.(request);
+      return { acknowledged: true };
+    }
+    if (request.action === 'resume_current_turn') {
+      if (!request.targetTurnId) return { acknowledged: false };
+      // This is a scheduling hint. The loop absorbs committed input at a safe protocol boundary.
+      if (!await children?.resume(request.targetTurnId)) runner.resume(request.conversationId, request.targetTurnId);
+      const summary = await application.runtime.deliveries.summary(request.deliveryId);
+      return { acknowledged: summary.parentHandlingState === 'handled' };
+    }
+    if (request.childExecutionId) {
+      // Only the child scheduler can establish membership and the next generation's lease.
+      if (!children) return { acknowledged: false };
+      return children.runtimeDeliveryContinuation({ deliveryId: request.deliveryId,
+        childExecutionId: request.childExecutionId, sourceTurnId: request.sourceTurnId });
+    }
+    const continuation = await runner.runtimeContinuation({
+      commandId: `runtime-delivery:${request.deliveryId}`, deliveryId: request.deliveryId,
+      conversationId: request.conversationId, sourceTurnId: request.sourceTurnId
+    });
+    return { acknowledged: Boolean(continuation.intentId) };
+  };
+}

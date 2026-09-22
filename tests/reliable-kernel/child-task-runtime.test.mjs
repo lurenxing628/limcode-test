@@ -81,12 +81,23 @@ async function fixture(mode, hooks, run) {
     generationConfig: {}, contextWindowTokens: 200000,
     ...(native ? { nativeResponses: { enabled: true, reasoningUpdates: true, asyncTools: false, steering: false, multiplexing: false } } : {})
   };
-  const requests = [], wires = [], starts = [], dispatches = [];
+  const requests = [], wires = [], starts = [], dispatches = [], runnerErrors = [];
   const f = {
     configuration, provider, requests, wires, starts, dispatches, save,
     get app() { return app; }, get coordinator() { return coordinator; },
-    input: key => ({ source: { kind: 'command', key }, conversationId: 'parent', leaseOwnerId: 'child-memory-owner',
-      hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: 'Continue the existing assignment.' }),
+    async runInput(key, text = 'Continue the existing assignment.') {
+      // AgentLoop.runInput performs only one drive and may validly return waiting while a tool
+      // settlement races its last read. Use the production runner's wake/re-entry lifecycle.
+      const started = await runner.input({ commandId: key, conversationId: 'parent', text });
+      assert.ok(started.admitted && started.turnId, 'the preceding fixture turn must already be terminal');
+      const terminal = await eventually(async () => {
+        assert.deepEqual(runnerErrors, [], 'production runner must not hide a drive error');
+        return (await f.list('TurnTermination', { turn_id: started.turnId }))[0];
+      }, `parent Turn ${started.turnId} did not reach a committed terminal outcome`);
+      await runner.waitForIdle();
+      assert.deepEqual(runnerErrors, []);
+      return { turnId: started.turnId, terminalStatus: terminal.terminal_status };
+    },
     list: async (domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({
       where, orderBy: { column: 'id', direction: 'asc' }, limit: 100
     }))).snapshot,
@@ -152,7 +163,9 @@ async function fixture(mode, hooks, run) {
         configuration.mutations.initializeConversationModelProfile({ conversationId, ...model,
           ...(thinkingOverride ? { thinkingOverride } : {}) }) }
     });
-    runner = new ReliableConversationRunner(app, 'child-memory-owner');
+    runner = new ReliableConversationRunner(app, 'child-memory-owner', (error, context) => {
+      runnerErrors.push({ message: error instanceof Error ? error.message : String(error), ...context });
+    });
   }
   try {
     await save('llmProviderConfigs', { configs: [provider] });
@@ -341,7 +354,7 @@ for (const mode of ['llm_summary', 'provider_native']) test(`child task memory r
     }
   }, async f => {
     try {
-      const started = await f.app.agentLoop.runInput(f.input(`${mode}-dispatch`));
+      const started = await f.runInput(`${mode}-dispatch`);
       assert.equal(started.terminalStatus, 'completed', JSON.stringify(await f.list('TurnTermination', { turn_id: started.turnId })));
       assert.equal((await f.list('ChildExecution')).length, 3);
       const before = await f.projection();
@@ -351,9 +364,11 @@ for (const mode of ['llm_summary', 'provider_native']) test(`child task memory r
       const compression = await f.compress(`${mode}-compact-first`);
       assert.equal(new Set(compression.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'child').map(entry => entry.ref)).size, 3);
       phase = 'inspect';
-      const inspected = await f.app.agentLoop.runInput(f.input(`${mode}-inspect`));
+      const inspected = await f.runInput(`${mode}-inspect`);
       assert.equal(inspected.terminalStatus, 'completed', JSON.stringify(await f.list('TurnTermination', { turn_id: inspected.turnId })));
-      assert.notEqual(firstInspection.turnId, started.turnId);
+      const inspectionRequest = (await f.list('ModelRequest')).find(row => row.id === firstInspection.modelRequestId);
+      assert.equal(inspectionRequest.turn_id, inspected.turnId);
+      assert.notEqual(inspectionRequest.turn_id, started.turnId);
       assert.equal((await f.list('ChildExecution')).length, 3, 'list, read and transient retry never create a child');
       assert.equal(f.dispatches.filter(call => call.arguments.operation === 'spawn').length, 3);
       assert.equal(f.dispatches.filter(call => call.arguments.operation === 'send').length, 2);
@@ -361,7 +376,7 @@ for (const mode of ['llm_summary', 'provider_native']) test(`child task memory r
       assert.equal(f.dispatches.filter(call => call.arguments.operation === 'read').length, readPages);
       await f.compress(`${mode}-compact-second`);
       phase = 'next-turn';
-      assert.equal((await f.app.agentLoop.runInput(f.input(`${mode}-another-turn`))).terminalStatus, 'completed');
+      assert.equal((await f.runInput(`${mode}-another-turn`)).terminalStatus, 'completed');
       assert.equal((await f.list('CompressionBlock')).length, 2);
       release();
       await f.coordinator.waitForIdle();
@@ -378,8 +393,163 @@ for (const mode of ['llm_summary', 'provider_native']) test(`child task memory r
       assert.deepEqual(restored.tasks.map(task => [task.childExecutionId, task.initialTask.text]).sort(), settled.tasks.map(task => [task.childExecutionId, task.initialTask.text]).sort());
       assert.ok(restored.tasks.find(task => task.childExecutionId === alpha.childExecutionId).timeline.some(source => source.text.includes(QUEUED_FULL)), 'full follow-up body remains readable after reopening');
       assert.ok(restored.tasks.find(task => task.initialTask.text.includes(TASKS[1])).timeline.some(source => source.text.includes(RETRY_GUIDANCE)), 'guidance saved during the retry is durable');
-      assert.equal((await f.app.agentLoop.runInput(f.input(`${mode}-after-reopen`))).terminalStatus, 'completed');
+      assert.equal((await f.runInput(`${mode}-after-reopen`)).terminalStatus, 'completed');
       assert.equal((await f.list('ChildExecution')).length, 3);
     } finally { release(); }
   });
 });
+
+for (const mode of ['llm_summary', 'provider_native']) for (const forkTurns of ['none', 'all', '1']) test(`spawn forkTurns=${forkTurns} inherits completed history atomically after ${mode}`, { timeout: 120000 }, async () => {
+  let phase = 1;
+  const rounds = new Map();
+  let childStart;
+  await fixture(mode, {
+    async send(request, controls, f, wire, start) {
+      if (request.conversationId !== 'parent') {
+        childStart = { request, start };
+        return complete(controls, done());
+      }
+      const round = (rounds.get(phase) ?? 0) + 1;
+      rounds.set(phase, round);
+      if (round === 1) return complete(controls, { role: 'model', parts: [phase < 3
+        ? tool(`inspect-history-${phase}`, { operation: 'list' })
+        : tool('fork-history', { operation: 'spawn', taskName: 'Forked reviewer',
+          prompt: 'CHILD_NEW_ASSIGNMENT_7723', forkTurns })] });
+      return complete(controls, { role: 'model', parts: [{ text: `COMPLETED_REPLY_${phase}_9981` }] });
+    }
+  }, async f => {
+    for (phase = 1; phase <= 2; phase += 1) {
+      const result = await f.runInput(`fork-history-${phase}`, `HISTORY_INPUT_${phase}_9927`);
+      assert.equal(result.terminalStatus, 'completed');
+    }
+    await f.compress('fork-history-compression');
+    const result = await f.runInput('fork-current', 'CURRENT_INCOMPLETE_INPUT_6621');
+    assert.equal(result.terminalStatus, 'completed');
+    assert.equal((await f.list('ChildExecution')).length, 1,
+      JSON.stringify(f.starts.filter(item => item.conversationId === 'parent').at(-1)?.start.contents));
+    await eventually(() => childStart, 'context-inheriting child did not reach the provider');
+    const body = JSON.stringify(childStart.start.contents);
+    assert.ok(body.includes('CHILD_NEW_ASSIGNMENT_7723'));
+    assert.ok(!body.includes('CURRENT_INCOMPLETE_INPUT_6621'), 'current input is never inherited before the parent turn completes');
+    for (const historyPhase of [1, 2]) {
+      const expected = forkTurns === 'all' || (forkTurns === '1' && historyPhase === 2);
+      assert.equal(body.includes(`HISTORY_INPUT_${historyPhase}_9927`), expected);
+      assert.equal(body.includes(`COMPLETED_REPLY_${historyPhase}_9981`), expected);
+    }
+    const childConversation = childStart.request.conversationId;
+    const childTurnId = (await f.list('ModelRequest')).find(row => row.id === childStart.request.modelRequestId).turn_id;
+    const [head] = await f.list('ConversationContextHeadLink', { conversation_id: childConversation });
+    await f.app.context.assertNativeContextClosed(head.root_id);
+    const inheritedTurns = await f.list('Turn', { conversation_id: childConversation });
+    assert.equal(inheritedTurns.length, forkTurns === 'none' ? 1 : forkTurns === 'all' ? 3 : 2);
+    const childLinks = await f.list('ChildExecutionTurnLink');
+    assert.equal(childLinks.length, 1, 'forked history grants no ChildExecution control links');
+    for (const turn of inheritedTurns.filter(turn => turn.id !== childTurnId)) {
+      assert.equal((await f.list('ExecutionLease', { turn_id: turn.id })).length, 0);
+      assert.equal((await f.list('AuthoritySnapshot', { turn_id: turn.id })).length, 0);
+    }
+    await f.coordinator.waitForIdle();
+    const [intent] = await f.list('EffectIntent', { effect_kind: 'subagent_spawn' });
+    const request = await f.app.runtime.effects.readEffectRequest(intent.id);
+    const replayCommand = { ...request, leaseOwnerId: 'different-replay-host',
+      leaseExpiresAt: new Date(Date.now() + 120000).toISOString() };
+    if (replayCommand.waitDeadlineAt === null) delete replayCommand.waitDeadlineAt;
+    const beforeReplayMessages = await f.list('MessagePartOfConversation', { conversation_id: childConversation });
+    assert.equal((await f.app.runtime.children.spawn(replayCommand)).deduplicated, true);
+    assert.deepEqual(await f.list('MessagePartOfConversation', { conversation_id: childConversation }), beforeReplayMessages,
+      'replay uses the committed snapshot rather than copying the now-completed parent current turn');
+    await assert.rejects(f.app.runtime.children.spawn({ ...replayCommand,
+      forkTurns: forkTurns === 'none' ? 'all' : 'none' }), /different facts/);
+  });
+});
+
+test('forkTurns validates a single explicit format without number or whitespace fallback', () => {
+  const { normalizeChildForkTurns } = load('backend/reliableKernel/childContextFork.js');
+  for (const valid of [undefined, 'none', 'all', '1', '25']) {
+    assert.equal(normalizeChildForkTurns(valid), valid ?? 'none');
+  }
+  for (const invalid of [null, 1, 0, '0', '-1', '01', ' 1', '1 ', '1.5', '9007199254740992', 'ALL']) {
+    assert.throws(() => normalizeChildForkTurns(invalid), /forkTurns/);
+  }
+});
+
+for (const winningState of ['dispatched', 'receipt_written', 'reconciled', 'inconsistent']) {
+  test(`spawn recovery validates the exact concurrent dispatch winner: ${winningState}`, { timeout: 30000 }, async () => {
+    await fixture('llm_summary', { async send() { throw new Error('Claim recovery must not start a model request.'); } }, async f => {
+      const { database } = f.app;
+      const { effects, children } = f.app.runtime;
+      const parent = await f.app.turns.input({ source: { kind: 'command', key: `claim-race-${winningState}` },
+        conversationId: 'parent', content: 'Prepare a child without dispatching it.',
+        leaseOwnerId: 'claim-race-owner', hostBootId: database.hostBootId,
+        leaseExpiresAt: new Date(Date.now() + 120000).toISOString() });
+      const sourceToolCallId = `claim-race-tool-${winningState}`;
+      await effects.createToolCall({ source: { kind: 'internal', key: sourceToolCallId },
+        toolCallId: sourceToolCallId, turnId: parent.turnId, toolName: 'run_agent',
+        arguments: { operation: 'spawn', taskName: 'Dispatch race', prompt: 'Inspect the race.' } });
+      const [agentLink] = await f.list('AgentConversationLink', { conversation_id: 'parent' });
+      const spawned = await children.spawn({ sourceToolCallId, childAgentId: agentLink.agent_id,
+        modelFallback: { providerConfigId: f.provider.id, model: f.provider.model }, prompt: 'Inspect the race.',
+        completionPolicy: 'background', sourceSettlement: 'child_handle', leaseOwnerId: 'claim-race-child',
+        leaseExpiresAt: new Date(Date.now() + 120000).toISOString() });
+      const originalClaim = effects.claimEffectDispatch;
+      const originalSnapshot = database.snapshot;
+      let winningClaimCount = 0;
+      let losingClaimError;
+      effects.claimEffectDispatch = async intentId => {
+        assert.equal(intentId, spawned.effectIntentId);
+        database.snapshot = async reads => {
+          const snapshot = await originalSnapshot.call(database, reads);
+          if (reads.length === 1 && reads[0].domain === 'EffectIntent' && reads[0].kind === 'get'
+            && reads[0].id === intentId && snapshot.snapshot[0]?.dispatch_state === 'pending') {
+            // The losing claim has read pending. Before its next Attempt read, let the real
+            // dispatcher commit the next frontier, returning the original stale Intent read.
+            database.snapshot = originalSnapshot;
+            assert.equal(await originalClaim.call(effects, intentId), true);
+            winningClaimCount += 1;
+            if (winningState !== 'dispatched') {
+              const receipt = await children.recordSpawnReceipt({ sourceKey: `normal-winner-${winningState}`,
+                attemptId: spawned.attemptId, outcome: 'succeeded' });
+              if (winningState === 'reconciled') await children.reconcileSpawnReceipt(receipt.effectReceiptId);
+              if (winningState === 'inconsistent') await database.transaction([
+                kernel.DOMAIN_REPOSITORIES.domain('Operation').update(spawned.operationId, { status: 'invalid-frontier' })
+              ]);
+            }
+          }
+          return snapshot;
+        };
+        try {
+          return await originalClaim.call(effects, intentId);
+        } catch (error) {
+          losingClaimError = error;
+          assert.match(error.message, /parent Attempt\/Operation is no longer dispatchable/);
+          throw error;
+        } finally { database.snapshot = originalSnapshot; }
+      };
+      try {
+        if (winningState === 'inconsistent') {
+          await assert.rejects(children.recoverSpawnIntent(spawned.effectIntentId), error => error === losingClaimError);
+          assert.equal((await f.list('ChildExecution'))[0].status, 'starting', 'inconsistent evidence cannot promote the child');
+          assert.equal((await f.list('ToolModelResult', { tool_call_id: sourceToolCallId })).length, 0);
+        } else {
+          const recovered = await children.recoverSpawnIntent(spawned.effectIntentId);
+          assert.equal(recovered.childExecutionId, spawned.childExecutionId);
+          assert.equal(recovered.childTurnId, spawned.childTurnId);
+          assert.equal(recovered.dispatchState, 'receipt_written');
+          assert.equal(recovered.childStatus, 'active');
+          assert.equal(recovered.shouldDrive, true);
+          assert.equal((await f.list('ToolModelResult', { tool_call_id: sourceToolCallId })).length, 1);
+          assert.equal((await effects.readTerminalResult(sourceToolCallId)).status, 'succeeded');
+        }
+        assert.equal(winningClaimCount, 1, 'one actual dispatcher wins the persisted claim');
+        assert.ok(losingClaimError, 'the regression must exercise the real stale-claim rejection');
+        assert.equal((await f.list('ChildExecution')).length, 1);
+        assert.equal((await f.list('EffectReceipt', { attempt_id: spawned.attemptId })).length, 1,
+          'recovery reuses the winner receipt or creates exactly one for the claimed local effect');
+        assert.equal(f.requests.length, 0, 'claim recovery only reconciles facts; the child driver starts model work separately');
+      } finally {
+        effects.claimEffectDispatch = originalClaim;
+        database.snapshot = originalSnapshot;
+      }
+    });
+  });
+}

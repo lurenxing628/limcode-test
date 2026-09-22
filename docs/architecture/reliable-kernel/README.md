@@ -196,12 +196,7 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 - 旧 Runtime 归档，配置按 manifest preserve/filter，Workspace 与未知用户文件不触碰；
 - 激活后只修复新内核，不自动回退旧 writer。
 
-已经落盘的 SQLite 数据只保留两种精确、有界的升级入口：
-
-1. **epoch 3 → 4**：数据库打开前核对 table/index/trigger/manifest/RootBinding 完整指纹。仅承认已发布的 0.0.10–0.0.11 `ModelContextProjection.client_mapping=detail` 与 0.0.12–0.0.14 `summary` 两套完整前驱；其他领域与物理 DDL 必须一致。使用 SQLite Backup API 持久备份，再通过 pending pointer、单事务与 durable journal 向前恢复。新增 ConversationAttachmentHandleLink、AttachmentObservationLink、CompressionBlockObservationLink、RuntimeDeliveryIntentLink 四张关系表。
-2. **epoch 4 精确单表增量**：仅允许其他表、索引、trigger、manifest 元数据和 RootBinding 均符合当前定义、只缺 RuntimeDeliveryIntentLink 的前驱。在单事务中补表；不得修复其他领域的 `client_mapping`、digest 或任意未知漂移。
-
-两条路径都只有在旧 Child Runtime continuation 的稳定 id、CommandReceipt、RuntimeDelivery 与 CAS envelope 全部吻合时，才转换为当前 envelope 并补独立 Link；不保留运行时 fallback，不改写既有对话正文。Windows 只在 SQLite 原生 I/O 边界使用 namespaced path，持久 RootBinding 仍保存 canonical path。未知漂移拒绝打开，不根据当前 schema 临时推导新的“历史格式”。
+当前 Runtime 使用 **epoch 5**。旧 epoch 3、4 及更早 Runtime 在完整 RootBinding 校验和其他 Host 离线核验后完整归档，再初始化当前 schema；配置、Workspace 和未知用户文件保留。原 epoch 3→4 升级器和 epoch 4 单表补丁均已退休，不作为升级链保留。当前 epoch 5 的 table/index/trigger/manifest/RootBinding 必须完整匹配，任何缺表、client mapping 或 digest 漂移均拒绝打开，不做原地修补。Windows 只在 SQLite 原生 I/O 边界使用 namespaced path，持久 RootBinding 仍保存 canonical path。
 
 真实 cutover actor 是最终 VSIX 的 `cutover-only coordinator`：旧宿主先关闭 admission、drain 并持久化 request，然后退出；最终 VSIX 安装并重启后先完成 journaled archive、配置过滤和校验，再创建 SQLite/CAS/epoch 并原子激活 RootBinding。归档失败时 active pointer 不变且可按 journal 恢复。
 
@@ -227,7 +222,7 @@ Gate 的机器身份是稳定 `check.id`，handler 使用 `Map<checkId, handler>
 
 ## 9. 明确不做
 
-- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；只有上述精确 epoch 3 → 4 和 epoch 4 RuntimeDeliveryIntentLink 增量是有界例外；
+- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；旧 epoch 只允许离线完整归档重置；
 - 运行时 schema v1/v2 协商；
 - 在线 Context root/node GC 或 CAS 引用计数；
 - 持久 ClientChangeLog 或跨宿主持久 feed；

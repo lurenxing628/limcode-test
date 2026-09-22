@@ -312,7 +312,12 @@ export class ReliableKernelApplication {
         'Operation',
         'ToolResultArtifact',
         'InteractionResponse',
-        'FileChangeDecision'
+        'FileChangeDecision',
+        'CollaborationMessage',
+        'CollaborationRequest',
+        'RuntimeDelivery',
+        'RuntimeDeliveryInputLink',
+        'TurnTermination'
       ].includes(change.domain))) return;
       this.scheduleRuntimeConvergence();
     });
@@ -361,6 +366,7 @@ export class ReliableKernelApplication {
     // lineage on each Host activation only stalls live commands without repairing a new crash edge.
     signal?.throwIfAborted();
     await this.processDeliveries.start();
+    await this.runtime.collaboration.reconcile();
     await this.processes.startExitObservers();
     for (const result of phaseD) {
       this.diagnosticObserver?.observe({
@@ -513,6 +519,7 @@ export class ReliableKernelApplication {
       }
       const convergence = await this.phaseDRecovery.reconcileCommittedFacts();
       failed += convergence.failed;
+      await this.runtime.collaboration.reconcile();
     } catch (error) {
       failed += 1;
       this.diagnosticObserver?.observe({

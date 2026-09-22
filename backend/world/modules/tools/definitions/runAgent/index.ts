@@ -7,6 +7,10 @@ export const RUN_AGENT_TOOL_NAME = 'run_agent';
 export const DEFAULT_RUN_AGENT_TYPE = 'worker';
 export const MAX_CHILD_AGENT_DEPTH_CONFIG_KEY = 'maxChildAgentDepth';
 export const DEFAULT_MAX_CHILD_AGENT_DEPTH = 1;
+export const MAX_CONCURRENT_AGENTS_CONFIG_KEY = 'maxConcurrentAgents';
+export const DEFAULT_MAX_CONCURRENT_AGENTS = 8;
+export const MAX_AUTOMATIC_FOLLOWUPS_CONFIG_KEY = 'maxAutomaticFollowups';
+export const DEFAULT_MAX_AUTOMATIC_FOLLOWUPS = 32;
 export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree'] as const;
 export type RunAgentOperation = typeof RUN_AGENT_OPERATIONS[number];
 
@@ -49,6 +53,7 @@ export const runAgentTool: ToolDefinition = {
     description: `Inspect and control child tasks using an explicit operation.
 - Before spawn, inspect the conversation roster. Use list for omitted tasks and read for the original assignment, current inputs and queued work. These operations never create or resume a child.
 - spawn requires taskName and prompt. Give the complete objective, context, constraints, expected result, verification and editing permission. agent.type chooses a configuration, never an existing child identity.
+- spawn forkTurns defaults to "none". Use "all" or a positive integer string to inherit all or the most recent N completed turns. Current, failed and interrupted turns are excluded; inherited child references never grant control. The prompt always starts a new assignment.
 - send requires answerBridgeId and prompt, reusing that child conversation and answer channel. It queues after the current child turn unless interrupt=true explicitly redirects current work. An unknown or missing reference fails; it never creates a replacement child.
 - read/list/wait default to direct children; scope="tree" also permits verified descendants. send and interrupt_subtree only control direct children. Inherited history references are not authority to control another conversation's children.
 - wait observes one answerBridgeId or 1 to 32 answerBridgeIds until a status/task/result change or the bounded timeout. It never resumes, cancels or sends work. Do not repeatedly poll; continue independent work, then wait or finish the turn when only a child answer remains.
@@ -79,6 +84,10 @@ export const runAgentTool: ToolDefinition = {
         taskName: {
           type: 'string',
           description: 'Required for spawn. Short responsibility label, such as "trace send failure"; the full task belongs in prompt.'
+        },
+        forkTurns: {
+          type: 'string',
+          description: 'For spawn only: "none" (default), "all", or a positive integer string such as "3". Copies committed completed turns, excluding current, interrupted and failed turns. Does not inherit execution ownership or authority.'
         },
         interrupt: {
           type: 'boolean',
@@ -131,14 +140,28 @@ export const runAgentTool: ToolDefinition = {
     configSchema: {
       fields: [{
         key: MAX_CHILD_AGENT_DEPTH_CONFIG_KEY,
-        label: '最大子 Agent 层级',
+        label: '最大子 Agent 深度',
         type: 'number',
         description: '限制新建子 Agent 的嵌套深度。根对话为 0；达到上限后只移除 spawn，查看、等待、续接与中断操作继续可用。',
         defaultValue: DEFAULT_MAX_CHILD_AGENT_DEPTH
+      }, {
+        key: MAX_CONCURRENT_AGENTS_CONFIG_KEY,
+        label: '团队同时运行的子 Agent 上限',
+        type: 'number',
+        description: '限制同一团队实际同时运行的子 Agent 数量，至少为 1；等待中的启动任务也会核对此预算。',
+        defaultValue: DEFAULT_MAX_CONCURRENT_AGENTS
+      }, {
+        key: MAX_AUTOMATIC_FOLLOWUPS_CONFIG_KEY,
+        label: '每轮任务自动续派上限',
+        type: 'number',
+        description: '限制同一轮任务中 Agent 自动续派的次数；用户开始新一轮任务时重新计数。0 表示不允许自动续派，仍可仅发送消息。',
+        defaultValue: DEFAULT_MAX_AUTOMATIC_FOLLOWUPS
       }]
     },
     defaultConfig: {
-      [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: DEFAULT_MAX_CHILD_AGENT_DEPTH
+      [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: DEFAULT_MAX_CHILD_AGENT_DEPTH,
+      [MAX_CONCURRENT_AGENTS_CONFIG_KEY]: DEFAULT_MAX_CONCURRENT_AGENTS,
+      [MAX_AUTOMATIC_FOLLOWUPS_CONFIG_KEY]: DEFAULT_MAX_AUTOMATIC_FOLLOWUPS
     }
   },
   scheduling: resolveRunAgentScheduling,

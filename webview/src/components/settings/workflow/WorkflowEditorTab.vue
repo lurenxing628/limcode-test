@@ -18,6 +18,7 @@ import { bridge, BridgeMessageType } from '@webview/transport';
 import AdvancedScrollbar from '../../navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '../../ui/ConfirmPanel.vue';
 import InputPanel from '../../ui/InputPanel.vue';
+import AgentCollaborationSettings from '../agent/AgentCollaborationSettings.vue';
 
 const workflowStore = useWorkflowStore();
 const clientState = useClientStateStore();
@@ -410,6 +411,9 @@ function confirmDeleteWorkflow(): void {
               </button>
             </div>
           </div>
+
+          <AgentCollaborationSettings scope-kind="workflow" :scope-id="selectedWorkflow.id" title="工作流 Agent 协作" :readonly="isDirty" />
+          <p v-if="isDirty" class="workflow-help">先保存或重置下方 JSON 修改，再调整 Agent 协作设置。</p>
 
           <textarea
             v-model="rawText"

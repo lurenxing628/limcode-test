@@ -1,4 +1,6 @@
 import type { AttachmentIngestService } from './attachmentIngest';
+import { CollaborationControlPlane } from './collaborationControlPlane';
+import { CollaborationBoard } from './collaborationBoard';
 import {
   AnswerControlPlane,
   RuntimeDeliveryControlPlane,
@@ -32,6 +34,8 @@ export interface ReliableKernelRuntimeServices {
   effects: EffectControlPlane;
   conversationFork: ConversationForkControlPlane;
   deliveries: RuntimeDeliveryControlPlane;
+  collaboration: CollaborationControlPlane;
+  collaborationBoard: CollaborationBoard;
   children: ChildExecutionControlPlane;
   answers: AnswerControlPlane;
   recovery: PhaseFRecoveryScanner;
@@ -56,6 +60,11 @@ export function createReliableKernelRuntimeServices(
 ): ReliableKernelRuntimeServices {
   const effects = new EffectControlPlane(database, contentStore, options);
   const deliveries = new RuntimeDeliveryControlPlane(database, options);
+  const collaboration = new CollaborationControlPlane(database, contentStore, deliveries, options);
+  const collaborationBoard = new CollaborationBoard(database, contentStore, {
+    ...options,
+    notify: notice => collaboration.notifyBoardPost(notice)
+  });
   const children = new ChildExecutionControlPlane(database, contentStore, effects, {
     ...options,
     prepareNextTurnDeliverySteps: (conversationId, turnId, now) =>
@@ -68,6 +77,8 @@ export function createReliableKernelRuntimeServices(
   const history = new ClientHistoryReader(database);
   const details = new ClientDetailReader(database, contentStore);
   const router = new ReliableKernelRuntimeRouter({
+    collaboration,
+    collaborationBoard,
     conversationFork,
     children,
     answers,
@@ -78,6 +89,8 @@ export function createReliableKernelRuntimeServices(
     details
   });
   return {
+    collaboration,
+    collaborationBoard,
     effects,
     conversationFork,
     deliveries,

@@ -8,42 +8,6 @@
   "dualWrite": false,
   "fallbackToLegacyRuntime": false,
   "runtimeProtocolNegotiation": false,
-  "boundedEpochUpgrade": {
-    "fromEpoch": 3,
-    "toEpoch": 4,
-    "mode": "offline-startup-exact-predecessor-only",
-    "sourcePolicy": "exact-table-index-trigger-manifest-and-binding-fingerprint",
-    "publishedPredecessorManifestVariants": [
-      {
-        "id": "epoch-3-v0.0.10-v0.0.11",
-        "extensionVersions": [
-          "0.0.10",
-          "0.0.11"
-        ],
-        "domainKey": "ModelContextProjection",
-        "clientMapping": "detail",
-        "schemaDigest": "4c587475862e73a9bf2c172e29d92c047e0e60a674630ce5b54e2e921f00c760"
-      },
-      {
-        "id": "epoch-3-v0.0.12-v0.0.14",
-        "extensionVersions": [
-          "0.0.12",
-          "0.0.13",
-          "0.0.14"
-        ],
-        "domainKey": "ModelContextProjection",
-        "clientMapping": "summary",
-        "schemaDigest": "f84996edbfcb6a9b62d9c42a5140cf279cf3d646e9a75872c52cbeb909c546a9"
-      }
-    ],
-    "variantPolicy": "two-exact-published-manifest-fingerprints-only; all-other-domain-manifest-and-physical-fingerprints-identical",
-    "sqliteNativePathPolicy": "persist-canonical-root-binding-path-use-win32-namespaced-path-only-at-sqlite-io-boundary",
-    "backupPolicy": "sqlite-backup-api-plus-root-binding-and-epoch-manifest",
-    "recoveryPolicy": "durable-journal-forward-only",
-    "legacyChildContinuationPolicy": "offline-rewrite-to-current-envelope-and-link-exact-identity-only",
-    "unknownDriftPolicy": "fail-before-pending-pointer",
-    "compatibilityFallback": false
-  },
   "candidateRoot": {
     "isolated": true,
     "mayReadLegacyRuntime": false,
@@ -2169,13 +2133,25 @@
       "atomic-rename-pointer",
       "delete-pending"
     ],
-    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；精确 epoch-3 predecessor 可在数据库打开前按 boundedEpochUpgrade 离线升级并向前恢复，旧 Child Runtime continuation 仅在稳定身份、CAS 与命令收据全部吻合时一次性转换为当前 envelope + RuntimeDeliveryIntentLink；当前 epoch 4 只接受除缺少 RuntimeDeliveryIntentLink 外所有物理对象、manifest 元数据与 RootBinding 均符合当前定义的精确前驱；不得修复任意 client_mapping 或 digest 漂移。其他 pending、缺少 epoch 或未知漂移拒绝打开 Runtime。"
+    "startupRule": "cutover request 存在时进入 cutover-only coordinator；旧 epoch 在完整 RootBinding 校验和其他 Host 离线核验后 archive/reset 到 epoch 5。当前 epoch 5 只接受完整 table/index/trigger/manifest/RootBinding 指纹，不补表、不改写 client_mapping/digest、不运行已退休 epoch 3→4 升级器。未知当前漂移拒绝打开 Runtime。"
   },
   "epochPolicy": {
-    "current": "只允许一次精确 epoch 3→4 离线升级；epoch 4 内只允许其他物理结构和 manifest 元数据完全匹配的 RuntimeDeliveryIntentLink 单表增量，不推导或接受其他领域的历史 client_mapping/digest 组合；两条路径都只在旧 Child Runtime continuation 的稳定身份、CAS 与命令收据完全吻合时离线转换，不提供运行时 fallback；其他不兼容 Runtime 归档重置",
+    "current": "epoch 5 单一当前 schema；旧 epoch 3、4 及更早数据完整归档后创建新 Runtime，配置和 Workspace 保留；不运行前驱升级或单表补丁。",
     "status": "单一当前 schema，不做协议协商或长期 migration chain",
-    "roadmapNote": "新增 epoch 必须另行决策，不能自动沿用本次升级器"
+    "roadmapNote": "新增 epoch 必须明确决策，不能引入增量迁移链。"
   },
   "failureRule": "激活前失败保持旧 active pointer 且旧数据可恢复；激活后失败只修复新内核，不自动回退旧写入器。",
-  "rootChange": "配置入口继续拒绝 Runtime 运行期间切换 data root，不新增迁移或切换命令。创建、升级、归档和重置持有目标 Runtime 数据根的维护互斥；重置先核验其他宿主已退出，再关闭本宿主并重新核验。最终 VSIX 的新宿主在数据库打开前完成 cutover-only coordinator 与 RootBinding 原子激活；日常运行不持有工作区终身锁。"
+  "rootChange": "配置入口继续拒绝 Runtime 运行期间切换 data root，不新增迁移或切换命令。创建、升级、归档和重置持有目标 Runtime 数据根的维护互斥；重置先核验其他宿主已退出，再关闭本宿主并重新核验。最终 VSIX 的新宿主在数据库打开前完成 cutover-only coordinator 与 RootBinding 原子激活；日常运行不持有工作区终身锁。",
+  "currentRuntimeEpoch": 5,
+  "schemaUpgradePolicy": {
+    "olderEpoch": "offline-archive-reset",
+    "currentEpoch": "exact-manifest-and-physical-fingerprint-only",
+    "partialAdditiveUpgrade": false,
+    "unknownDrift": "fail-closed",
+    "preserve": [
+      "runtime-archive",
+      "configuration",
+      "workspace"
+    ]
+  }
 }

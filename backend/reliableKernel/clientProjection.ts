@@ -972,6 +972,27 @@ export function executeClientProjectionSnapshot(
       deliveryIds
     ).filter((link) => queuedTurnIntentIds.has(String(link.turn_intent_id)));
 
+    // Each Conversation sees only its own bounded communication envelope; message bodies stay in CAS.
+    const collaborationMessages = queryPlainRows(database, `
+      SELECT message.* FROM collaboration_message AS message
+       WHERE EXISTS (SELECT 1 FROM collaboration_message_source_link AS source
+          WHERE source.message_id = message.id AND source.conversation_id = @conversationId)
+          OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target
+          WHERE target.message_id = message.id AND target.conversation_id = @conversationId)
+       ORDER BY message.message_seq DESC, message.id DESC LIMIT 32
+    `, { conversationId });
+    const collaborationIds = collaborationMessages.map(row => String(row.id));
+    const collaborationMessageSourceLinks = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', collaborationIds);
+    const collaborationMessageTargetLinks = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', collaborationIds);
+    const collaborationMessageReplyLinks = queryAllByIds(database, 'collaboration_message_reply_link', 'message_id', collaborationIds);
+    const collaborationRequests = queryAllByIds(database, 'collaboration_request', 'message_id', collaborationIds);
+    const collaborationRequestTurnLinks = queryAllByIds(database, 'collaboration_request_turn_link', 'request_id', collaborationRequests.map(row => String(row.id)));
+    const conversationCommunicationLinks = queryPlainRows(database, `
+      SELECT * FROM conversation_communication_link
+       WHERE source_conversation_id = @conversationId OR target_conversation_id = @conversationId
+       ORDER BY updated_at DESC, id DESC LIMIT 32
+    `, { conversationId });
+
     const snapshot: ClientProjectionSnapshot = {
       navigationSummary: { conversations },
       activeConversationWindow: {
@@ -1042,7 +1063,14 @@ export function executeClientProjectionSnapshot(
         answerSubmissions,
         runtimeInboxItems: inboxItems,
         runtimeDeliveries: projectedDeliveries,
-        runtimeDeliveryIntentLinks
+        runtimeDeliveryIntentLinks,
+        collaborationMessages,
+        collaborationMessageSourceLinks,
+        collaborationMessageTargetLinks,
+        collaborationMessageReplyLinks,
+        collaborationRequests,
+        collaborationRequestTurnLinks,
+        conversationCommunicationLinks
       }
     };
     database.exec('COMMIT');

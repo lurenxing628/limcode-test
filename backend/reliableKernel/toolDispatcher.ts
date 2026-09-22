@@ -1,3 +1,5 @@
+import { AGENT_COLLABORATION_TOOL_NAMES, isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
+import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
 import {
   MAX_CONCURRENT_ATTACHMENT_READS_PER_TURN,
   MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN,
@@ -176,7 +178,9 @@ const PROCESS_TOOLS = new Set(['bash', 'shell']);
 const SPECIAL_TOOLS = new Set([
   RUN_AGENT_TOOL_NAME,
   'submit_agent_answer',
-  'read_agent_answer'
+  'read_agent_answer',
+  ...AGENT_COLLABORATION_TOOL_NAMES,
+  'agent_board'
 ]);
 const WORK_ENVIRONMENT_TOOLS = new Set([SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME]);
 const NO_EFFECT_CAPABILITY_TIMEOUT_MS = 30_000;
@@ -862,6 +866,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       || input.toolName === 'ask_user'
       || input.toolName === 'submit_plan'
       || (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments))
+      || isReadonlyAgentCollaborationTool(input.toolName)
+      || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))
       || allowlistedCommand
       || autoApproveReadonly
       || (config?.autoApproveExecution ?? metadata?.defaultAutoApproveExecution ?? true);
@@ -2860,6 +2866,8 @@ function frozenSchedulingFallback(
   }
   const metadata = plainOptionalRecord(definition.metadata);
   if ((definition.name === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(value))
+    || isReadonlyAgentCollaborationTool(definition.name)
+    || (definition.name === 'agent_board' && isReadonlyAgentBoardOperation(value))
     || metadata?.readonly === true || metadata?.riskLevel === 'read') {
     return { mode: 'parallel', reason: 'frozen_readonly_metadata' };
   }
@@ -2871,6 +2879,8 @@ function frozenPlanReviewRiskLevel(
   input: ReliableAgentToolDispatchInput
 ): FrozenPlanReviewRiskLevel {
   if (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments)) return 'read';
+  if (isReadonlyAgentCollaborationTool(input.toolName)
+    || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))) return 'read';
   if (FILE_TOOLS.has(input.toolName)) return 'write';
   if (PROCESS_TOOLS.has(input.toolName)) {
     return isReadonlyCommandCall(input.arguments) ? 'read' : 'command';

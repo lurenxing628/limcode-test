@@ -796,6 +796,20 @@ export class BoundedClientFeed {
         return materialized('ChildExecution', field('child_execution_id'));
       case 'AnswerSubmission':
         return materialized('AnswerBridge', field('answer_bridge_id'));
+      case 'CollaborationMessageSourceLink':
+      case 'CollaborationMessageTargetLink':
+        return field('conversation_id') === activeConversationId
+          || materialized('CollaborationMessage', field('message_id'));
+      case 'CollaborationMessage':
+        return referencedBy('CollaborationMessageSourceLink', 'CollaborationMessageTargetLink');
+      case 'CollaborationMessageReplyLink':
+      case 'CollaborationRequest':
+        return materialized('CollaborationMessage', field('message_id'));
+      case 'CollaborationRequestTurnLink':
+        return materialized('CollaborationRequest', field('request_id'));
+      case 'ConversationCommunicationLink':
+        return field('source_conversation_id') === activeConversationId
+          || field('target_conversation_id') === activeConversationId;
       case 'RuntimeDelivery':
         return field('target_conversation_id') === activeConversationId;
       case 'RuntimeDeliveryIntentLink':
@@ -1806,6 +1820,26 @@ export class ClientDetailReader {
         ...(exitSignal ? { exitSignal } : {})
       };
     }
+    if (inbox.source_kind === 'collaboration_message') {
+      const message = await this.requireExisting('CollaborationMessage', sourceId);
+      if (message.mode !== 'message' && message.mode !== 'followup') throw new Error('Invalid CollaborationMessage mode.');
+      const [sources, payloads, targets] = await Promise.all([
+        this.listRows('CollaborationMessageSourceLink', { message_id: sourceId }, 2),
+        this.listRows('CollaborationMessagePayloadLink', { message_id: sourceId }, 2),
+        this.listRows('CollaborationMessageTargetLink', { message_id: sourceId, inbox_item_id: inboxItemId }, 2)
+      ]);
+      if (sources.length !== 1 || payloads.length !== 1 || targets.length !== 1) {
+        throw new Error('Collaboration message preview requires exact source, payload and destination links.');
+      }
+      const metadata = await this.requireExisting('ContentObject', String(payloads[0]!.content_object_id)) as ContentObjectMetadata;
+      if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || BigInt(metadata.byte_length) > 64000n) {
+        throw new Error('Collaboration message preview payload violates its content contract.');
+      }
+      const text = (await this.contentStore.read(metadata)).toString('utf8');
+      return { kind: 'collaboration_message', inboxItemId, sourceId,
+        sourceConversationId: requirePhaseFId(sources[0]!.conversation_id, 'CollaborationMessageSourceLink.conversation_id'),
+        mode: message.mode, textPreview: boundedTurnIntentSourceText(text, 320) ?? '' };
+    }
     if (inbox.source_kind !== 'answer_submission') {
       throw new Error(`RuntimeInboxItem ${inboxItemId} has unsupported source kind ${String(inbox.source_kind)}.`);
     }
@@ -2111,7 +2145,9 @@ const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
   'Process',
   'ChildExecution',
   'AnswerSubmission',
-  'RuntimeDelivery'
+  'RuntimeDelivery',
+  'CollaborationMessage',
+  'ConversationCommunicationLink'
 ]);
 
 const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
@@ -2131,7 +2167,9 @@ const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
   'ChildExecutionTurnLink',
   'ChildExecutionActiveTurnLink',
   'AnswerBridge',
-  'RuntimeDelivery'
+  'RuntimeDelivery',
+  'CollaborationMessage',
+  'ConversationCommunicationLink'
 ]);
 
 /** Text links which are intentionally not SQLite foreign keys still need an explicit type. */
@@ -2220,7 +2258,14 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   answerSubmissions: 'AnswerSubmission',
   runtimeInboxItems: 'RuntimeInboxItem',
   runtimeDeliveries: 'RuntimeDelivery',
-  runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink'
+  runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
+    collaborationMessages: 'CollaborationMessage',
+    collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',
+    collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
+    collaborationMessageReplyLinks: 'CollaborationMessageReplyLink',
+    collaborationRequests: 'CollaborationRequest',
+    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink',
+    conversationCommunicationLinks: 'ConversationCommunicationLink'
 });
 
 function recordKey(domain: string, id: string): string {
@@ -2968,6 +3013,8 @@ function snapshotRetentionCandidates(
   add(window, 'conversationOriginLinks', 'newest-first');
   add(window, 'commandReceipts', 'newest-first');
   add(window, 'compressionBlocks', 'oldest-first');
+  add(subagents, 'collaborationMessages', 'newest-first');
+  add(subagents, 'conversationCommunicationLinks', 'newest-first');
   return candidates;
 }
 
@@ -3263,6 +3310,14 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   filterSnapshotReference(subagents, 'answerBridges', 'child_execution_id', childIds);
   const answerBridgeIds = snapshotIds(subagents, 'answerBridges');
   filterSnapshotReference(subagents, 'answerSubmissions', 'answer_bridge_id', answerBridgeIds);
+
+  const collaborationMessageIds = snapshotIds(subagents, 'collaborationMessages');
+  for (const key of ['collaborationMessageSourceLinks', 'collaborationMessageTargetLinks',
+    'collaborationMessageReplyLinks', 'collaborationRequests']) {
+    filterSnapshotReference(subagents, key, 'message_id', collaborationMessageIds);
+  }
+  filterSnapshotReference(subagents, 'collaborationRequestTurnLinks', 'request_id',
+    snapshotIds(subagents, 'collaborationRequests'));
 
   const deliveryIds = snapshotIds(subagents, 'runtimeDeliveries');
   const queuedTurnIntentIds = snapshotIds(window, 'queuedTurnIntents');

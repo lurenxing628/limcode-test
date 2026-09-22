@@ -6,6 +6,7 @@ import type {
   ReliableAgentToolSettled
 } from './agentLoop';
 import type { AnswerControlPlane, RuntimeDeliveryControlPlane } from './answerDelivery';
+import { normalizeChildForkTurns } from './childContextFork';
 import {
   childContinuationTurnId,
   childExecutionSpawnIdentity,
@@ -23,7 +24,8 @@ import type { EffectControlPlane, ToolTerminalResult } from './effectControlPlan
 import type { ModelProviderControlPlane } from './modelProviderControlPlane';
 import type { CoordinateCompressionResult } from './contextCompressionCoordinator';
 import { frozenModelSelection } from './frozenAuthority';
-import { stablePhaseFId } from './phaseFIdentity';
+import { stablePhaseFId, isTransactionAssertionFailure } from './phaseFIdentity';
+import { CollaborationCapacityError, CollaborationMembershipChangedError } from './collaborationCapacity';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
@@ -1466,6 +1468,7 @@ export class ReliableChildAgentCoordinator {
       childAgentId: selection.agentId,
       modelFallback: frozenParentModelSelection(authority),
       prompt: promptWithAnswerBridge(prompt),
+      forkTurns: normalizeChildForkTurns(args.forkTurns),
       completionPolicy,
       sourceSettlement: 'child_handle',
       ...(deadline ? { waitDeadlineAt: deadline } : {}),
@@ -1649,14 +1652,21 @@ export class ReliableChildAgentCoordinator {
       }
     }
     if (drivesChild) {
-      const admitted = await this.dependencies.children.admitQueuedIntent({
-        sourceKey: `child-continuation-admit:${sent.turnIntentId}`,
-        childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
-        turnIntentId: sent.turnIntentId,
-        leaseOwnerId: this.childLeaseOwnerId,
-        leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
-      });
-      this.launch(admitted.childExecutionId, admitted.turnId);
+      try {
+        const admitted = await this.dependencies.children.admitQueuedIntent({
+          sourceKey: `child-continuation-admit:${sent.turnIntentId}`,
+          childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
+          turnIntentId: sent.turnIntentId,
+          leaseOwnerId: this.childLeaseOwnerId,
+          leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
+        });
+        this.launch(admitted.childExecutionId, admitted.turnId);
+      } catch (error) {
+        if (!(error instanceof CollaborationCapacityError) && !(error instanceof CollaborationMembershipChangedError) && !isTransactionAssertionFailure(error)) throw error;
+        // The continuation is already durable. Capacity contention defers admission; it must
+        // never turn a successful submission into a failed or duplicate assignment.
+        this.triggerRecoveryPass();
+      }
     }
     if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
     return this.waitContinuationForeground(
@@ -2316,7 +2326,7 @@ function frozenParentModelSelection(
 }
 
 function promptWithAnswerBridge(prompt: string): string {
-  return `${prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。只有在用户明确要求提交到其它通道时，才传入当前模型上下文中提供的短 childRef。继续同一子对话、中断或重试不会改变默认通道。`;
+  return `${prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。显式 childRef 也必须属于当前子任务，不能提交到其它任务的答案通道。同伴交流使用 send_agent_message，向已有同伴续派任务使用 followup_agent_task。继续同一子对话、中断或重试不会改变默认通道。`;
 }
 
 function assertExpectedPlanDelegation(
@@ -2377,7 +2387,7 @@ function assertRunAgentArguments(operation: string, args: { [key: string]: Plain
     throw new Error(`Unsupported run_agent operation: ${operation}.`);
   }
   const fields: Record<string, readonly string[]> = {
-    spawn: ['taskName', 'prompt', 'agent', 'foregroundWaitMs'],
+    spawn: ['taskName', 'prompt', 'agent', 'foregroundWaitMs', 'forkTurns'],
     send: ['answerBridgeId', 'prompt', 'interrupt', 'foregroundWaitMs'],
     list: ['scope', 'status', 'limit', 'cursor'],
     read: ['answerBridgeId', 'scope', 'limit', 'cursor'],
@@ -2391,6 +2401,7 @@ function assertRunAgentArguments(operation: string, args: { [key: string]: Plain
   if (args.scheduling !== undefined && args.scheduling !== 'serial' && args.scheduling !== 'parallel') {
     throw new Error('run_agent.scheduling must be parallel or serial.');
   }
+  if (operation === 'spawn') normalizeChildForkTurns(args.forkTurns);
   if (args.agent !== undefined) {
     const agent = requireRecord(args.agent, 'run_agent.agent');
     if (Object.keys(agent).some(key => key !== 'type')) throw new Error('run_agent.agent only accepts type.');

@@ -1,3 +1,4 @@
+import { createRuntimeDeliveryWakeHandler } from './runtimeDeliveryWakeHandler';
 import * as vscode from 'vscode';
 import { EXTENSION_USER_AGENT } from '../../../shared/extensionIdentity';
 import type { GlobalSettingsRecord, NetworkSettingsRecord } from '../../../shared/protocol';
@@ -11,6 +12,7 @@ import type {
   ReliableAgentTransientObserver
 } from '../../reliableKernel/agentLoop';
 import { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
+import { CollaborationToolDispatcher } from '../../reliableKernel/collaborationToolDispatcher';
 import { ReliableDiagnosticJournal } from '../../reliableKernel/diagnosticJournal';
 import { DebugCaptureService } from '../../reliableKernel/debugCapture/service';
 import { debugCaptureSource } from '../../reliableKernel/debugCapture/source';
@@ -166,10 +168,13 @@ export class VscodeReliableKernelProductRuntime {
     const debugCapture = new DebugCaptureService(authority, await authority.current(), debugCaptureSource(''));
     let application: ReliableKernelApplication | undefined;
     let childAgents: ReliableChildAgentCoordinator | undefined;
+    let collaborationTools: CollaborationToolDispatcher | undefined;
     let fileDiffs: VscodeReliableFileDiffEditor | undefined;
     let conversations: ReliableConversationRunner | undefined;
     const toolHost = new VscodeReliableToolHost(context, configuration, {
       dispatchSpecial: async (definition, input, frozenAuthority, signal, admission) => {
+        const collaborationResult = await collaborationTools?.dispatch(input, signal, frozenAuthority);
+        if (collaborationResult) return collaborationResult;
         const childResult = await childAgents?.dispatch(input, signal, frozenAuthority, admission);
         if (childResult) return childResult;
         return options.dispatchSpecial?.(definition, input, frozenAuthority, signal, admission);
@@ -348,60 +353,28 @@ export class VscodeReliableKernelProductRuntime {
         undefined,
         diagnostics
       );
-      application.processDeliveries.setWakeHandler(async (request) => {
-        const app = application;
-        const runner = conversations;
-        if (!app || !runner) return { acknowledged: false };
-        if (!app.database.conversationOwners.owns(request.conversationId)) return { acknowledged: false };
-        await app.database.conversationOwners.assertOwned(request.conversationId);
-        if (request.action === 'notify_only') {
-          const acknowledged = await app.runtime.deliveries.acknowledgeNotification(request.deliveryId);
-          // The RuntimeDelivery ACK is the durable notification fence. A host crash after this point
-          // may omit a toast, but can never emit duplicate toasts on wake replay.
-          if (acknowledged.changed) {
-            if (request.sourceKind === 'child_failure') {
-              void vscode.window.showErrorMessage(
-                'LimCode 子 Agent 执行失败；失败详情已保留在可靠 Runtime 中。'
-              );
-            } else {
-              void vscode.window.showInformationMessage(
-                request.sourceKind === 'answer_submission'
-                  ? 'LimCode 子 Agent 已返回部分或最终结果；来源对话已结束，答案已保留在可靠 Runtime 中。'
-                  : `LimCode 后台进程 ${request.processId ?? request.sourceId} 已完成；来源对话已取消或关闭，结果已保留在可靠 Runtime 中。`
-              );
-            }
+      application.processDeliveries.setWakeHandler(createRuntimeDeliveryWakeHandler({
+        application: () => application,
+        conversations: () => conversations,
+        children: () => childAgents,
+        notify: request => {
+          if (request.sourceKind === 'child_failure') {
+            void vscode.window.showErrorMessage('LimCode 子 Agent 执行失败；失败详情已保留在可靠 Runtime 中。');
+          } else if (request.sourceKind === 'collaboration_message') {
+            void vscode.window.showInformationMessage('LimCode 协作消息已保留；目标任务当前无法继续执行。');
+          } else {
+            void vscode.window.showInformationMessage(request.sourceKind === 'answer_submission'
+              ? 'LimCode 子 Agent 已返回部分或最终结果；来源对话已结束，答案已保留在可靠 Runtime 中。'
+              : `LimCode 后台进程 ${request.processId ?? request.sourceId} 已完成；来源对话已取消或关闭，结果已保留在可靠 Runtime 中。`);
           }
-          return { acknowledged: true };
         }
-        if (request.action === 'resume_current_turn') {
-          if (!request.targetTurnId) return { acknowledged: false };
-          // Scheduling is only an edge hint. The AgentLoop advances and absorbs the Delivery at a
-          // protocol-safe boundary; the outbox remains pending until markInputHandled is durable.
-          if (!await childAgents?.resume(request.targetTurnId)) {
-            runner.resume(request.conversationId, request.targetTurnId);
-          }
-          const summary = await app.runtime.deliveries.summary(request.deliveryId);
-          return { acknowledged: summary.parentHandlingState === 'handled' };
-        }
-        if (request.childExecutionId) {
-          // A Child Turn requires ChildExecutionIntentLink/TurnLink/ActiveTurnLink admission. The
-          // ordinary Conversation runner deliberately cannot claim child scheduler membership.
-          // Keep the durable wake retryable until the child coordinator has created that exact
-          // internal continuation; never create an orphan ordinary Turn in the child Conversation.
-          if (!childAgents) return { acknowledged: false };
-          return childAgents.runtimeDeliveryContinuation({
-            deliveryId: request.deliveryId,
-            childExecutionId: request.childExecutionId,
-            sourceTurnId: request.sourceTurnId
-          });
-        }
-        const continuation = await runner.runtimeContinuation({
-          commandId: `runtime-delivery:${request.deliveryId}`,
-          deliveryId: request.deliveryId,
-          conversationId: request.conversationId,
-          sourceTurnId: request.sourceTurnId
-        });
-        return { acknowledged: Boolean(continuation.intentId) };
+      }));
+      collaborationTools = new CollaborationToolDispatcher({
+        database: application.database,
+        contentStore: application.contentStore,
+        effects: application.runtime.effects,
+        collaboration: application.runtime.collaboration,
+        board: application.runtime.collaborationBoard
       });
       childAgents = new ReliableChildAgentCoordinator({
         database: application.database,

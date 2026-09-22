@@ -1,4 +1,4 @@
-﻿node_modules/
+﻿node_modules
 dist/
 *.vsix
 .vscode-test/
@@ -131,3 +131,19 @@ docs/architecture/*
 /scripts/reliable-kernel/tool-scheduler-phase*-*.json
 .playwright-cli/
 /output/playwright/
+
+!/tests/reliable-kernel/collaboration-schema-epoch.test.mjs
+!/tests/reliable-kernel/collaboration-lifecycle.test.mjs
+
+!/tests/reliable-kernel/collaboration-tool-boundary.test.mjs
+!/tests/reliable-kernel/native-collaboration-handles.test.mjs
+
+!/tests/reliable-kernel/agent-collaboration-settings-ui.test.mjs
+!/tests/reliable-kernel/collaboration-board.test.mjs
+!/tests/reliable-kernel/collaboration-bridge-ui.test.mjs
+!/tests/reliable-kernel/collaboration-capacity.test.mjs
+
+!/tests/reliable-kernel/collaboration-messages.test.mjs
+!/tests/reliable-kernel/collaboration-runtime.test.mjs
+
+!/tests/reliable-kernel/native-collaboration-boundary.test.mjs

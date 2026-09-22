@@ -416,8 +416,21 @@ export async function startLlmProvider(
     const registry = unified.createBootstrapExtensionRegistry();
     const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
     const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+    const nativeHttpWireAdmission: OpenAIResponsesNativeHttpWireAdmission = { toolResultCallIds: [] };
+    const baseProviderFetch = proxyFetch ?? fetch;
+    const observeNativeHttpFetch: typeof fetch = async (input, init) => {
+      // Observe the final encoded wire body, including requestBody overrides. Unified contents
+      // and providerContext are not evidence that a result actually entered this POST.
+      const callIds = settings.provider === 'openai-responses' && nativeCapabilities.asyncTools
+        && !isOpenAIResponsesWebSocketMode(settings)
+        ? nativeHttpWireToolResultCallIds(init?.body)
+        : [];
+      const response = await baseProviderFetch(input, init);
+      nativeHttpWireAdmission.toolResultCallIds = callIds;
+      return response;
+    };
     const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
-    const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider, {
+    const providerFetch = createTerminalValidatedFetch(observeNativeHttpFetch, settings.provider, {
       createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined
     });
     const headers = headersForProviderContext(
@@ -471,6 +484,7 @@ export async function startLlmProvider(
           httpFallbackProvider,
           unified,
           options,
+          nativeHttpWireAdmission,
           signal,
           sawRetry ? { retryAttempt: retryCount, retryMaxAttempts: maxRetries } : undefined,
           proxy,
@@ -537,6 +551,7 @@ async function runLlmAttempt(
   httpFallbackProvider: UnifiedChatProvider | undefined,
   unified: UnifiedModule,
   options: LlmProviderOptions,
+  nativeHttpWireAdmission: OpenAIResponsesNativeHttpWireAdmission,
   signal?: AbortSignal,
   retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice,
   proxy?: string,
@@ -642,6 +657,7 @@ async function runLlmAttempt(
             provider,
             unifiedRequest,
             signal,
+            wireAdmission: nativeHttpWireAdmission,
             ...(wrappedNativeHooks ? { hooks: wrappedNativeHooks } : {})
           })
         : provider.chatStream<UnifiedLLMStreamChunk>(unifiedRequest, {
@@ -895,6 +911,25 @@ interface OpenAIResponsesHttpNativeStreamChunk extends UnifiedLLMStreamChunk {
   completedContents?: UnifiedContent[];
 }
 
+interface OpenAIResponsesNativeHttpWireAdmission {
+  toolResultCallIds: string[];
+}
+
+function nativeHttpWireToolResultCallIds(body: RequestInit['body']): string[] {
+  // The provider sends JSON text. Fail closed if its transport changes instead of treating
+  // an uninspectable request as evidence for results reconstructed from another source.
+  if (typeof body !== 'string') throw new Error('Native HTTP request body must be encoded JSON text.');
+  const encoded: unknown = JSON.parse(body);
+  if (!isRecord(encoded) || !Array.isArray(encoded.input)) {
+    throw new Error('Native HTTP request body must contain an encoded Responses input array.');
+  }
+  return [...new Set(encoded.input.flatMap((item: unknown) =>
+    isRecord(item) && (item.type === 'function_call_output' || item.type === 'custom_tool_call_output')
+      && typeof item.call_id === 'string' && item.call_id.trim()
+      ? [item.call_id]
+      : []))];
+}
+
 /**
  * HTTP/SSE 原生会话：与 WS 同一个 OpenAIResponsesNativeController 契约的轻量泵。
  * 逻辑请求跨多个物理 SSE response 存活；submitToolResults 排入队列，达界后以
@@ -907,6 +942,7 @@ async function* streamOpenAIResponsesNativeHttpSession(input: {
   unifiedRequest: UnifiedLLMRequest;
   signal?: AbortSignal;
   hooks?: OpenAIResponsesNativeHooks;
+  wireAdmission: OpenAIResponsesNativeHttpWireAdmission;
 }): AsyncGenerator<UnifiedLLMStreamChunk> {
   const queue: OpenAIResponsesNativeHttpQueuedSubmission[] = [];
   let logicalEnded = false;
@@ -979,16 +1015,16 @@ async function* streamOpenAIResponsesNativeHttpSession(input: {
           const nativeEvent = nativeChunk.nativeEvent;
           if (nativeEvent?.type === 'response.created' && typeof nativeEvent.responseId === 'string' && nativeEvent.responseId) {
             latestResponseId = nativeEvent.responseId;
+            // Includes full-history results on the first POST as well as later continuations.
+            // A successful fetch alone is insufficient; only response.created admits them.
+            const admittedToolResultCallIds = input.wireAdmission.toolResultCallIds;
+            if (admittedToolResultCallIds.length > 0) {
+              nativeChunk.nativeEvent = { ...nativeEvent, admittedToolResultCallIds: [...admittedToolResultCallIds] };
+            }
             if (!drainedSettled && drained.length > 0) {
               drainedSettled = true;
               const admission: OpenAIResponsesNativeResultAdmission = { responseId: nativeEvent.responseId };
               for (const submission of drained) submission.resolve(admission);
-              // 数据级观察：本 create 实际携带的结果 call_id，供内核先落投递事实再处理新输出。
-              const admittedToolResultCallIds = drained.flatMap((submission) =>
-                submission.outputs.map((output) => output.callId).filter((callId): callId is string => !!callId));
-              if (admittedToolResultCallIds.length > 0) {
-                nativeChunk.nativeEvent = { ...nativeEvent, admittedToolResultCallIds };
-              }
             }
           }
           collectNativeHttpOutstandingCallIds(chunk, pendingNativeCallIds);

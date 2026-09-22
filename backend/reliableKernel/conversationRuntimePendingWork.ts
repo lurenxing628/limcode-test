@@ -42,8 +42,13 @@ export function createConversationRuntimeWorkProbe(database: Database.Database):
       WHEN EXISTS(
         SELECT 1 FROM runtime_delivery AS delivery
           LEFT JOIN runtime_delivery_wake AS wake ON wake.delivery_id = delivery.id
+          LEFT JOIN runtime_inbox_item AS inbox ON inbox.id = delivery.inbox_item_id
+          LEFT JOIN collaboration_message AS collaboration
+            ON inbox.source_kind = 'collaboration_message' AND collaboration.id = inbox.source_id
          WHERE delivery.target_conversation_id = @conversationId
-           AND (delivery.state = 'pending' OR wake.state IN ('pending', 'claimed'))
+           AND ((delivery.state = 'pending'
+             AND NOT (COALESCE(collaboration.mode, '') = 'message' AND delivery.phase = 'next_turn' AND delivery.target_turn_id IS NULL))
+             OR wake.state IN ('pending', 'claimed'))
       ) THEN 1
       WHEN EXISTS(
         SELECT 1 FROM relevant_children AS relevant

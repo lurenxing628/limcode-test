@@ -179,12 +179,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           authority,
           runtimePlacement.runtimeScopeRootPath
         ).ensureCurrentRoot();
-        if (rootPreparation.epochMigrationBackupPath) {
-          console.warn(
-            `[LimCode] 已把第 ${rootPreparation.epochMigratedFrom} 代运行数据无损升级到 `
-            + `第 ${RUNTIME_KERNEL_EPOCH} 代，升级前数据库备份位于 ${rootPreparation.epochMigrationBackupPath}。`
-          );
-        } else if (rootPreparation.epochResetBackupPath) {
+        if (rootPreparation.epochResetBackupPath) {
           console.warn(
             `[LimCode] 已把第 ${rootPreparation.epochResetFrom} 代运行数据归档到 `
             + `${rootPreparation.epochResetBackupPath}，并创建第 ${RUNTIME_KERNEL_EPOCH} 代运行数据。`

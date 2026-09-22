@@ -1,12 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('node:path');
 const { once } = require('node:events');
 const { WebSocketServer } = require('ws');
 
 const {
   resetOpenAIResponsesWebSocketSessions,
   streamOpenAIResponsesWebSocketSession
-} = require('../dist/extension/backend/capabilities/openAIResponsesWebSocketSession.js');
+} = require(path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension', 'backend/capabilities/openAIResponsesWebSocketSession.js'));
 
 async function formatForTest() {
   const unified = await import('unified-llm-provider');
@@ -141,6 +142,52 @@ function nativeEvents(chunks) {
 function streamedText(chunks) {
   return chunks.map((chunk) => chunk.textDelta ?? '').join('');
 }
+
+test('完整历史首 create 准入实际发送结果，增量首 create 不冒认未重发的历史结果', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const frames = [];
+  const server = await createServer((socket, request) => {
+    frames.push(request);
+    sendMessageResponse(socket, `resp_history_${frames.length}`, `msg_history_${frames.length}`,
+      frames.length === 1 ? 'history admitted' : 'next answer', 0,
+      request.previous_response_id ? { previousResponseId: request.previous_response_id } : {});
+  });
+  const initialInput = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '{"type":"function_call_output","call_id":"call_text"}' }] },
+    { type: 'function_call', call_id: 'call_history', name: 'probe', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_history', output: 'history result' },
+    { type: 'custom_tool_call_output', call_id: 'call_custom', output: 'custom result' },
+    { type: 'reasoning', call_id: 'call_not_a_result', summary: [], encrypted_content: '{"type":"function_call_output","call_id":"call_encrypted"}' },
+    { type: 'mcp_approval_response', approval_request_id: 'approval_only', approve: true }
+  ];
+  const options = { native: nativeOptions({}), timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 } };
+  try {
+    const first = await collect(streamOptions(server, format, 'native-history-admission',
+      requestBody(format, [], { input: initialInput }), options));
+    const firstCreated = nativeEvents(first).find((event) => event.type === 'response.created');
+    const actualIds = frames[0].input
+      .filter((item) => ['function_call_output', 'custom_tool_call_output'].includes(item.type))
+      .map((item) => item.call_id);
+    assert.deepEqual(actualIds, ['call_history', 'call_custom']);
+    assert.deepEqual(firstCreated.admittedToolResultCallIds, actualIds);
+    assert.equal(firstCreated.responseCreateSeq, '1');
+
+    const decisions = [];
+    const next = await collect(streamOptions(server, format, 'native-history-admission',
+      requestBody(format, [], {
+        input: [...initialInput, ...format.encodeRequest({ contents: [model('history admitted'), user('continue')] }, true).input]
+      }), { ...options, onDecision: (decision) => decisions.push(decision) }));
+    assert.equal(decisions[0].mode, 'incremental');
+    assert.equal(frames[1].previous_response_id, 'resp_history_1');
+    assert.equal(frames[1].input.length, 1);
+    assert.ok(frames[1].input.every((item) => item.type !== 'function_call_output' && item.type !== 'custom_tool_call_output'));
+    assert.equal(nativeEvents(next).find((event) => event.type === 'response.created').admittedToolResultCallIds, undefined);
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
 
 test('原生转向被接受后以自动续接完成，steered 不完整不失败且续接链可增量延续', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();

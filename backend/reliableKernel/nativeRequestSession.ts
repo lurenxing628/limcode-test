@@ -14,7 +14,7 @@ import {
 import type { ModelOutputItemReference } from '../../shared/protocol';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { freezeNativeChildToolProjection, readNativeRequestChildHandles, withChildHandles } from './conversationChildHandles';
-import { normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { isCollaborationHandleTool, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import { ContextSequenceControlPlane } from './contextSequence';
 import {
   EffectControlPlane,
@@ -169,6 +169,7 @@ export class NativeRequestSession {
   private pumpDirty = false;
   private readonly inFlightDeliveries = new Set<string>();
   private disposed = false;
+  private yieldingForRuntimeInput = false;
   private childCatalog: ModelHandleCatalog;
   private readonly callResolutions = new Map<string, { arguments: PlainJsonValue; error?: string; catalog: ModelHandleCatalog }>();
 
@@ -1121,9 +1122,10 @@ export class NativeRequestSession {
   private async pumpLoop(): Promise<void> {
     for (;;) {
       this.pumpDirty = false;
-      if (this.disposed || !this.controller) return;
+      if (this.disposed || this.yieldingForRuntimeInput || !this.controller) return;
       const ready = this.collectDeliverable();
       if (ready.length === 0) return;
+      if (await this.yieldAtRuntimeInputBoundary(ready)) return;
       const adapter = await this.deps.resolveAdapter(this.deps.providerId);
       if (!adapter.materializeNativeToolOutput) {
         throw new Error(`Provider adapter ${this.deps.providerId} lacks materializeNativeToolOutput.`);
@@ -1150,6 +1152,42 @@ export class NativeRequestSession {
       }
       if (!this.pumpDirty && this.collectDeliverable().length === 0) return;
     }
+  }
+
+  /**
+   * Peer/runtime data cannot use the user-steering channel. At a completed physical response with
+   * all tools settled, close the transport chain normally and let the next ModelRequest absorb
+   * RuntimeDelivery through the existing context authority. No tool is cancelled and no provider
+   * ACK is invented: undelivered results are retained in Context for the carrier request.
+   */
+  private async yieldAtRuntimeInputBoundary(ready: readonly NativeSessionCall[]): Promise<boolean> {
+    const latestResponseId = this.responseOrder[this.responseOrder.length - 1];
+    const latest = latestResponseId ? this.responses.get(latestResponseId) : undefined;
+    if (!latest?.admissionBoundary || !latest.boundarySeq || this.inFlightDeliveries.size > 0
+      || [...this.calls.values()].some(call => !call.admitted || !call.settled)
+      || [...this.steerReceipts.values()].some(receipt =>
+        ['queued', 'sent', 'accepted', 'waiting_for_input'].includes(receipt.state))) return false;
+    const pending = await this.deps.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('RuntimeDelivery').list({
+        where: { target_turn_id: this.deps.turnId, phase: 'current_turn', state: 'pending' }, limit: 1
+      }),
+      DOMAIN_REPOSITORIES.domain('PendingTurnInput').list({
+        where: { turn_id: this.deps.turnId, input_kind: 'runtime_delivery', state: 'pending' }, limit: 1
+      })
+    ]);
+    if (!pending.snapshot.some(value => Array.isArray(value) && value.length > 0)) return false;
+    const controller = this.controller;
+    if (!controller || this.disposed) return false;
+    for (const call of ready) {
+      // Reserve refs before another request can rebuild from these newly retained results.
+      await this.buildFunctionCallOutput(call);
+      await this.appendResultOccurrence(call);
+    }
+    if (this.controller !== controller || this.disposed) return false;
+    this.yieldingForRuntimeInput = true;
+    controller.endLogicalRequest();
+    this.diagnose('Native logical request yielded at a settled tool boundary for pending runtime input.');
+    return true;
   }
 
   private collectDeliverable(): NativeSessionCall[] {
@@ -1183,7 +1221,8 @@ export class NativeRequestSession {
       requireId(revision.content_object_id, 'MessageRevision.content_object_id')
     ) as unknown as ContentObjectMetadata;
     const raw = (await this.deps.contentStore.read(metadata)).toString('utf8');
-    if (['run_agent', 'read_agent_answer', 'submit_agent_answer', 'submit_plan'].includes(call.name)) {
+    if (['run_agent', 'read_agent_answer', 'submit_agent_answer', 'submit_plan'].includes(call.name)
+      || isCollaborationHandleTool(call.name)) {
       const frozen = await freezeNativeChildToolProjection({
         database: this.deps.database, contentStore: this.deps.contentStore,
         modelRequestId: this.deps.modelRequestId, toolCallId: call.toolCallId,

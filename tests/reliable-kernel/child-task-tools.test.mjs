@@ -120,14 +120,41 @@ test('verified descendants are readable only with tree scope and remain outside 
 });
 
 test('list pagination recovers more than 32 same-label tasks and read preserves all assignments', async () => {
-  const f = fixture(Array.from({ length: 70 }, (_, index) => task(index + 1)));
-  const first = (await f.call({ operation: 'list', limit: 40 })).detail;
-  assert.equal(first.tasks.length, 40);
-  assert.equal(first.totalDirect, 70);
-  assert.equal(first.tasks[0].initialTask.preview, 'original assignment 1');
-  const next = (await f.call({ operation: 'list', limit: 40, cursor: first.nextCursor })).detail;
-  assert.equal(next.tasks.length, 30);
-  assert.equal(next.tasks[0].answerBridgeId, 'bridge-41');
+  // Match the committed projection's stable ordering; equal timestamps sort by canonical id.
+  const expected = Array.from({ length: 70 }, (_, index) => task(index + 1))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.childExecutionId.localeCompare(b.childExecutionId));
+  const f = fixture(expected);
+  const collected = [];
+  const seenCursors = new Set();
+  let cursor;
+  for (;;) {
+    const page = (await f.call({ operation: 'list', limit: 40, ...(cursor ? { cursor } : {}) })).detail;
+    assert.ok(page.tasks.length > 0 && page.tasks.length <= 40, 'limit caps a page; the token budget may shorten it');
+    assert.equal(page.totalDirect, 70);
+    assert.equal(page.shown, page.tasks.length);
+    assert.equal(typeof page.rereadCursor, 'string');
+    assert.ok(page.rereadCursor.length > 0);
+    const reread = (await f.call({ operation: 'list', limit: 40, cursor: page.rereadCursor })).detail;
+    assert.deepEqual(reread.tasks, page.tasks, 'the page supplies a valid cursor for an exact reread');
+    collected.push(...page.tasks);
+    assert.ok(collected.length <= expected.length, 'pagination cannot duplicate tasks or continue indefinitely');
+    assert.equal(page.omitted, expected.length - collected.length);
+    if (!page.nextCursor) {
+      assert.equal(collected.length, expected.length, 'the final page must include every committed task');
+      break;
+    }
+    assert.equal(typeof page.nextCursor, 'string');
+    assert.ok(page.nextCursor.length > 0);
+    assert.ok(!seenCursors.has(page.nextCursor), 'the next cursor must make progress');
+    seenCursors.add(page.nextCursor);
+    cursor = page.nextCursor;
+  }
+  assert.ok(seenCursors.size > 0, 'more than one bounded page is required');
+  assert.equal(new Set(collected.map(value => value.childExecutionId)).size, 70);
+  assert.deepEqual(collected.map(value => ({ childExecutionId: value.childExecutionId,
+    answerBridgeId: value.answerBridgeId, label: value.label, preview: value.taskPreview })),
+  expected.map(value => ({ childExecutionId: value.childExecutionId, answerBridgeId: value.answerBridgeId,
+    label: value.label, preview: value.currentInputs.at(-1).text })));
   const read = (await f.call({ operation: 'read', answerBridgeId: 'bridge-1', limit: 100 })).detail;
   assert.deepEqual(read.timelineSources.map(value => value.text),
     ['original assignment 1', 'current assignment 1', 'queued follow-up 1']);

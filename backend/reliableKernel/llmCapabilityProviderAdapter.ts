@@ -1219,10 +1219,11 @@ function runtimeContextContent(
 ): MessageContent {
   const envelope = decodeRuntimeDeliveryModelEnvelope(content, contentType);
   return {
-    // The shared Provider contract currently has only user/model roles. The explicit envelope is
-    // therefore the authority boundary: runtime data never masquerades as naked user prose, and
-    // its body cannot elevate a fake "System" heading into an instruction.
-    role: 'user',
+    // Peer messages stay below the user's authority on every provider wire. The model/assistant
+    // role carries their attributed data envelope; no synthetic user or system instruction and
+    // no invented function call is needed. Other existing runtime result kinds retain their
+    // established transport representation.
+    role: envelope.kind === 'collaboration_message' ? 'model' : 'user',
     parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope, undefined, modelHandleCatalog) }]
   };
 }

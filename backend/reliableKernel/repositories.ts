@@ -127,12 +127,17 @@ export interface RepositoryGetRead {
   id: string;
 }
 
+export interface RepositoryKeysetCursor { column: string; value: string | bigint; id: string; direction: 'before' | 'after' }
+
 export interface RepositoryListRead {
   kind: 'list';
   domain: string;
   where?: DomainRow;
   orderBy?: { column: string; direction: 'asc' | 'desc' };
   afterId?: string;
+  keyset?: RepositoryKeysetCursor;
+  /** Fixed mailbox membership predicate, valid only for CollaborationMessage. */
+  collaborationConversationId?: string;
   limit: number;
 }
 
@@ -419,12 +424,27 @@ export class DomainRepository {
         throw new TypeError(`${this.name} afterId pagination requires id ascending order.`);
       }
     }
+    if (options.keyset) {
+      if (options.afterId !== undefined) throw new TypeError('Cannot combine afterId and keyset cursors.');
+      const column = this.codec.column(options.keyset.column);
+      if (!column || column.type === 'BLOB' || column.json || column.nullable) throw new TypeError('Keyset requires a non-null scalar schema column.');
+      if (options.orderBy?.column !== options.keyset.column) throw new TypeError('Keyset column must match orderBy.');
+      if (!['before', 'after'].includes(options.keyset.direction)) throw new TypeError('Keyset direction must be before or after.');
+      requireId(options.keyset.id);
+      this.codec.encodeWhere({ [column.name]: options.keyset.value });
+    }
+    if (options.collaborationConversationId !== undefined) {
+      if (this.schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');
+      requireId(options.collaborationConversationId);
+    }
     return {
       kind: 'list',
       domain: this.schema.key,
       ...(options.where ? { where: clonePlainRecord(options.where) } : {}),
       ...(options.orderBy ? { orderBy: { ...options.orderBy } } : {}),
       ...(options.afterId ? { afterId: options.afterId } : {}),
+      ...(options.keyset ? { keyset: { ...options.keyset } } : {}),
+      ...(options.collaborationConversationId ? { collaborationConversationId: options.collaborationConversationId } : {}),
       limit: options.limit
     };
   }
@@ -647,6 +667,9 @@ const RESTRICTED_UPDATE_COLUMNS: ReadonlyMap<string, ReadonlySet<string>> = new 
   ['ChildExecutionActiveTurnLink', new Set(['turn_id', 'updated_at'])],
   ['AnswerBridge', new Set(['current_submission_id', 'status', 'updated_at'])],
   ['RuntimeInboxItem', new Set(['state', 'updated_at'])],
+  ['CollaborationRequest', new Set(['state', 'updated_at'])],
+  ['ConversationCommunicationLink', new Set(['allow_read', 'allow_send', 'allow_wake', 'command_id', 'updated_at'])],
+  ['CollaborationBoardSubscriptionLink', new Set(['active', 'updated_at'])],
   ['RuntimeDelivery', new Set(['target_turn_id', 'phase', 'state', 'failure_reason', 'updated_at'])],
   ['RuntimeDeliveryInputLink', new Set(['handled_at', 'updated_at'])],
   ['ProcessCompletionDispatch', new Set([

@@ -17,7 +17,7 @@ import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingI
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
+import { AGENT_COLLABORATION_CONFIG_KEYS, SUB_AGENT_TOOL_NAME, useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
 import { resolveToolHeaderIcon } from '@webview/components/content/toolDisplay/registry';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
@@ -452,6 +452,11 @@ function supportsInlineField(field: ToolConfigFieldRecord): boolean {
   return field.type === 'stringList' || field.type === 'globList' || field.type === 'string' || field.type === 'number' || field.type === 'boolean' || field.type === 'enum';
 }
 
+function inlineFields(tool: ToolDefinitionRecord): ToolConfigFieldRecord[] {
+  return (tool.configSchema?.fields ?? []).filter((field) => supportsInlineField(field)
+    && !(tool.name === SUB_AGENT_TOOL_NAME && AGENT_COLLABORATION_CONFIG_KEYS.some((key) => key === field.key)));
+}
+
 function enumOptions(field: ToolConfigFieldRecord): SettingsDropdownOption[] {
   return (field.options ?? []).map((option) => ({ value: String(option.value), label: option.label, description: option.description }));
 }
@@ -647,6 +652,7 @@ function inputNumber(event: Event): number {
                       <small>由工具定义提供，展开后查看完整说明。</small>
                     </div>
                     <p class="tool-definition-description">{{ toolDescription(tool) }}</p>
+                    <p v-if="tool.name === SUB_AGENT_TOOL_NAME" class="tool-definition-mode-note">子 Agent 深度和团队预算已移至{{ scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域' }}。</p>
                     <p v-if="editModeShortLabel(tool)" class="tool-definition-mode-note">{{ editModeShortLabel(tool) }}</p>
                   </div>
 
@@ -755,13 +761,13 @@ function inputNumber(event: Event): number {
                       </label>
                     </div>
 
-                  <div v-if="tool.configSchema?.fields?.length" class="tool-config-group tool-specific-config">
+                  <div v-if="inlineFields(tool).length" class="tool-config-group tool-specific-config">
                     <div class="tool-config-group-heading">
                       <span class="tool-config-group-title">工具配置</span>
                       <small>这些配置由工具定义提供，并随当前层级的策略保存。</small>
                     </div>
                     <div class="tool-config-fields">
-                      <label v-for="field in tool.configSchema.fields.filter(supportsInlineField)" :key="field.key" class="tool-config-field">
+                      <label v-for="field in inlineFields(tool)" :key="field.key" class="tool-config-field">
                         <span>{{ field.label }}</span>
                         <textarea
                           v-if="field.type === 'stringList' || field.type === 'globList'"

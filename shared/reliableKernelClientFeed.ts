@@ -132,9 +132,19 @@ export interface ReliableKernelSubagentContinuationSource {
   title?: string;
 }
 
+export interface ReliableKernelCollaborationContinuationSource {
+  kind: 'collaboration_message';
+  inboxItemId: string;
+  sourceId: string;
+  sourceConversationId: string;
+  mode: 'message' | 'followup';
+  textPreview: string;
+}
+
 export type ReliableKernelRuntimeContinuationSource =
   | ReliableKernelBackgroundProcessContinuationSource
-  | ReliableKernelSubagentContinuationSource;
+  | ReliableKernelSubagentContinuationSource
+  | ReliableKernelCollaborationContinuationSource;
 
 export interface ReliableKernelRuntimeContinuationTurnIntentPreview {
   version: 3;
@@ -416,7 +426,14 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'AnswerSubmission',
   'RuntimeInboxItem',
   'RuntimeDelivery',
-  'RuntimeDeliveryIntentLink'
+  'RuntimeDeliveryIntentLink',
+  'CollaborationMessage',
+  'CollaborationMessageSourceLink',
+  'CollaborationMessageTargetLink',
+  'CollaborationMessageReplyLink',
+  'CollaborationRequest',
+  'CollaborationRequestTurnLink',
+  'ConversationCommunicationLink'
 ] as const);
 
 export function createEmptyReliableKernelClientState(): ReliableKernelBoundedClientState {
@@ -588,7 +605,14 @@ function seedRecordsFromSnapshot(
     answerSubmissions: 'AnswerSubmission',
     runtimeInboxItems: 'RuntimeInboxItem',
     runtimeDeliveries: 'RuntimeDelivery',
-    runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink'
+    runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
+    collaborationMessages: 'CollaborationMessage',
+    collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',
+    collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
+    collaborationMessageReplyLinks: 'CollaborationMessageReplyLink',
+    collaborationRequests: 'CollaborationRequest',
+    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink',
+    conversationCommunicationLinks: 'ConversationCommunicationLink'
   };
   const visit = (value: PlainData): void => {
     if (Array.isArray(value)) {

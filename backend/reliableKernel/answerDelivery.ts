@@ -1492,6 +1492,14 @@ export class RuntimeDeliveryControlPlane {
     );
     const steps: RepositoryTransactionStep[] = [];
     for (const delivery of deliveries) {
+      const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
+      if (inbox.source_kind === 'collaboration_message') {
+        const sources = await this.listRows('CollaborationMessageSourceLink', { message_id: inbox.source_id }, 2);
+        if (sources[0]?.source_kind === 'board') {
+          steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(String(delivery.id), { state: 'pending', phase: 'next_turn', target_turn_id: null }), DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(String(delivery.id), { state: 'failed', failure_reason: 'board-notification-expired', updated_at: now }));
+          continue;
+        }
+      }
       const contentObjectId = await this.contentObjectIdForInbox(delivery.inbox_item_id as string);
       if (!contentObjectId) {
         steps.push(
@@ -1505,7 +1513,7 @@ export class RuntimeDeliveryControlPlane {
         );
         continue;
       }
-      steps.push(...injectionSteps(delivery, turnId, contentObjectId, now, true, []));
+      steps.push(...injectionSteps(delivery, turnId, contentObjectId, now, true, await this.collaborationRequestInjectionSteps(delivery, turnId, now)));
     }
     return steps;
   }
@@ -1662,6 +1670,22 @@ export class RuntimeDeliveryControlPlane {
       input.created_at,
       'PendingTurnInput.created_at'
     );
+    if (inbox.source_kind === 'collaboration_message') {
+      if (contentType !== 'text/vnd.limcode.collaboration-message') throw new Error('Collaboration Runtime Delivery has an unexpected content type.');
+      const messageId = requirePhaseFId(inbox.source_id, 'Collaboration RuntimeInboxItem.source_id');
+      const [message, sources, targets, payloads, replies] = await Promise.all([
+        this.requireExisting('CollaborationMessage', messageId), this.listRows('CollaborationMessageSourceLink', { message_id: messageId }, 2), this.listRows('CollaborationMessageTargetLink', { message_id: messageId }, 2), this.listRows('CollaborationMessagePayloadLink', { message_id: messageId }, 2), this.listRows('CollaborationMessageReplyLink', { message_id: messageId }, 2)
+      ]);
+      if (sources.length !== 1 || targets.length !== 1 || targets[0].inbox_item_id !== inboxItemId || targets[0].conversation_id !== delivery.target_conversation_id || payloads.length !== 1 || payloads[0].content_object_id !== contentObjectId) throw new Error('Collaboration Runtime Delivery has conflicting identity links.');
+      let board: { postId: string; channelId: string; threadId: string } | undefined;
+      if (sources[0].source_kind === 'board') {
+        const postId = requirePhaseFId(sources[0].board_post_id, 'Board notification post');
+        const [channels, replyLinks] = await Promise.all([this.listRows('CollaborationBoardPostChannelLink', { post_id: postId }, 2), this.listRows('CollaborationBoardReplyLink', { post_id: postId }, 2)]);
+        if (channels.length !== 1) throw new Error('Board notification post has no unique channel.');
+        board = { postId, channelId: String(channels[0].channel_id), threadId: replyLinks[0] ? String(replyLinks[0].thread_id) : postId };
+      }
+      return projectRuntimeDeliveryForModel({ ...(board ? { board } : {}), kind: 'collaboration_message', phase, deliveryId, inboxItemId, targetTurnId, deliveredAt, messageId, sourceConversationId: String(sources[0].conversation_id), targetConversationId: String(targets[0].conversation_id), sourceKind: String(sources[0].source_kind), mode: message.mode as 'message' | 'followup', replyToMessageId: replies[0] ? String(replies[0].request_message_id) : null, content: contentBytes.toString('utf8') });
+    }
     if (inbox.source_kind === 'process_receipt') {
       if (contentType !== PROCESS_COMPLETION_MODEL_SOURCE_CONTENT_TYPE) {
         throw new Error('Process completion Runtime Delivery has an unexpected content type.');
@@ -1763,6 +1787,16 @@ export class RuntimeDeliveryControlPlane {
     });
   }
 
+  private async collaborationRequestInjectionSteps(delivery: DomainRow, turnId: string, now: string): Promise<RepositoryTransactionStep[]> {
+    const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
+    if (inbox.source_kind !== 'collaboration_message') return [];
+    const requests = await this.listRows('CollaborationRequest', { message_id: inbox.source_id }, 2);
+    if (!requests.length) return [];
+    if (requests.length !== 1) throw new Error('Collaboration message has duplicate requests.');
+    const request = requests[0];
+    return [DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(String(request.id), { state: 'pending', message_id: inbox.source_id }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').insert({ id: stablePhaseFId('collaboration_request_turn', String(request.id)), request_id: request.id, turn_id: turnId, created_at: now })];
+  }
+
   private async inject(
     delivery: DomainRow,
     targetTurn: DomainRow,
@@ -1778,7 +1812,7 @@ export class RuntimeDeliveryControlPlane {
         contentObjectId,
         now,
         false,
-        authoritySteps
+        [...authoritySteps, ...await this.collaborationRequestInjectionSteps(delivery, String(targetTurn.id), now)]
       ));
       const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
       return { ...(await this.summaryFromRow(latest)), changed: true, commitSeq: commit.commitSeq };
@@ -1806,6 +1840,7 @@ export class RuntimeDeliveryControlPlane {
       DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(delivery.id as string, {
         phase: decision.phase,
         target_turn_id: decision.targetTurnId,
+        ...(decision.reason === 'collaboration_notification_expired' ? { state: 'failed', failure_reason: 'board-notification-expired' } : {}),
         updated_at: now
       })
     ]);

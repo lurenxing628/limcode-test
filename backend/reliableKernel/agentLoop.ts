@@ -9,6 +9,8 @@ import {
 } from './modelHandleCatalog';
 import { readConversationChildHandles } from './conversationChildHandles';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
+import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
 import { isReadonlyRunAgentOperation } from '../world/modules/tools/definitions/runAgent';
 import { createHash } from 'node:crypto';
 import type {
@@ -2233,11 +2235,11 @@ export class ReliableAgentLoop {
         && !entry.delivered
         && entry.resultContextSegmentId !== undefined);
     if (pending.length === 0) return;
-    const projection = await this.maybeGet(
-      'ModelContextProjection',
-      stableId('model_request_projection', carrierModelRequestId)
-    );
-    if (!projection) throw new Error(`ModelRequest ${carrierModelRequestId} lacks its Context projection.`);
+    const projections = await this.list('ModelContextProjection', {
+      owner_kind: 'model_request', owner_id: carrierModelRequestId
+    }, 2);
+    if (projections.length !== 1) throw new Error(`ModelRequest ${carrierModelRequestId} lacks its unique Context projection.`);
+    const projection = projections[0];
     const structure = await this.context.materializeStructure(
       requireId(projection.root_id, 'ModelContextProjection.root_id')
     );
@@ -3214,6 +3216,8 @@ function fallbackFrozenToolPolicy(
   const backendParallel = trustedCommand
     ? trustedCommand.parallelSafe
     : (definition.name === 'run_agent' && isReadonlyRunAgentOperation(args))
+      || isReadonlyAgentCollaborationTool(definition.name)
+      || (definition.name === 'agent_board' && isReadonlyAgentBoardOperation(args))
       || metadata?.readonly === true || metadata?.riskLevel === 'read';
   const schedulingMode = requestedScheduling === 'serial'
     ? 'serial'

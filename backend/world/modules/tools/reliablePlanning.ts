@@ -400,7 +400,7 @@ export function planReliableChildAgentRun(
     };
   }
 
-  const promptWithAnswerBridge = `${prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要把阶段性结论或最终正文提交给来源 Agent 时，请调用 submit_agent_answer({ title, content }) 并省略 childRef；Runtime 会使用当前子任务的默认通道。只有在用户明确要求提交到其它通道时，才传入当前模型上下文中提供的短 childRef。继续同一子对话、中断或重试不会改变默认通道。最终自然语言回复可以保持简短。`;
+  const promptWithAnswerBridge = `${prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要把阶段性结论或最终正文提交给来源 Agent 时，请调用 submit_agent_answer({ title, content }) 并省略 childRef；Runtime 会使用当前子任务的默认通道。显式 childRef 也必须属于当前子任务，不能提交到其它任务的答案通道。同伴交流使用 send_agent_message，向已有同伴续派任务使用 followup_agent_task。继续同一子对话、中断或重试不会改变默认通道。最终自然语言回复可以保持简短。`;
   const background = foregroundWait.value === 0;
   return {
     ok: true,

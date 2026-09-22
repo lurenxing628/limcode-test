@@ -6,6 +6,9 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.DebugCaptureCommand:
     case BridgeMessageType.DebugCaptureObservation:
       return 'diagnostics';
+    case BridgeMessageType.CollaborationSend:
+    case BridgeMessageType.CollaborationPermissionSet:
+    case BridgeMessageType.CollaborationBoardCommand:
     case BridgeMessageType.TurnStart:
     case BridgeMessageType.TurnEnqueue:
     case BridgeMessageType.TurnInterrupt:
@@ -59,6 +62,9 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.LocalFileOpen:
     case BridgeMessageType.AttachmentOpen:
       return 'command';
+    case BridgeMessageType.CollaborationConversationRead:
+    case BridgeMessageType.CollaborationGet:
+    case BridgeMessageType.CollaborationMessageRead:
     case BridgeMessageType.ClientResync:
     case BridgeMessageType.FsStatGet:
     case BridgeMessageType.ProjectFoldersGet:

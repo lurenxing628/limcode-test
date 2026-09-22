@@ -5,6 +5,7 @@ import {
   IconBolt,
   IconCheck,
   IconGripVertical,
+  IconMessages,
   IconPencil,
   IconPlayerPause,
   IconPlayerPlay,
@@ -305,6 +306,11 @@ function runtimeContinuationSource(value: unknown): ReliableKernelRuntimeContinu
       ...optionalTextField(source, 'exitSignal')
     };
   }
+  if (source.kind === 'collaboration_message') {
+    const sourceConversationId = nonEmptyText(source.sourceConversationId);
+    if (!sourceConversationId || (source.mode !== 'message' && source.mode !== 'followup') || typeof source.textPreview !== 'string') return undefined;
+    return { kind: 'collaboration_message', inboxItemId, sourceId, sourceConversationId, mode: source.mode, textPreview: source.textPreview };
+  }
   if (source.kind !== 'subagent') return undefined;
   const submissionId = nonEmptyText(source.submissionId);
   const childExecutionId = nonEmptyText(source.childExecutionId);
@@ -363,6 +369,9 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
         || `后台命令 ${shortIdentity(preview.source.processId)}`;
       return `${command} · ${processOutcomeLabel(preview.source.outcome)}`;
     }
+    if (preview.source.kind === 'collaboration_message') {
+      return `协作${preview.source.mode === 'followup' ? '续派任务' : '消息'} · ${preview.source.textPreview}`;
+    }
     const name = subagentName(preview.source.agentId);
     if (preview.source.title) return `${name} · ${preview.source.title}`;
     return `${name} 已返回${preview.source.interrupted ? '中断结果' : '回答'}`;
@@ -416,7 +425,7 @@ function stateLabel(item: QueueItem): string {
   const runtime = runtimePreview(item.preview);
   if (runtime) {
     if (runtime.deliveryState === 'failed') return '续跑失败';
-    return runtime.source.kind === 'background_process' ? '后台结果' : 'Agent 回答';
+    return runtime.source.kind === 'background_process' ? '后台结果' : runtime.source.kind === 'collaboration_message' ? '协作消息（非用户指令）' : 'Agent 回答';
   }
   if (guidancePreview(item.preview)?.hold === 'paused') return '已暂停';
   return '等待引导';
@@ -602,6 +611,13 @@ function timestamp(value: unknown): number {
           />
           <IconTerminal2
             v-else-if="runtimePreview(item.preview)?.source.kind === 'background_process'"
+            class="reliable-queue-source-icon"
+            :size="14"
+            stroke="2"
+            aria-hidden="true"
+          />
+          <IconMessages
+            v-else-if="runtimePreview(item.preview)?.source.kind === 'collaboration_message'"
             class="reliable-queue-source-icon"
             :size="14"
             stroke="2"

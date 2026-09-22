@@ -155,7 +155,24 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'RuntimeDelivery',
   'RuntimeDeliveryIntentLink',
   'RuntimeDeliveryInputLink',
-  'RuntimeDeliveryWake'
+  'RuntimeDeliveryWake',
+  'CollaborationMessage',
+  'CollaborationMessageSourceLink',
+  'CollaborationMessageTargetLink',
+  'CollaborationMessagePayloadLink',
+  'CollaborationMessageReplyLink',
+  'CollaborationBudget',
+  'CollaborationRequest',
+  'CollaborationRequestTurnLink',
+  'ConversationCommunicationLink',
+  'CollaborationBoardChannel',
+  'CollaborationBoardChannelScopeLink',
+  'CollaborationBoardPost',
+  'CollaborationBoardPostChannelLink',
+  'CollaborationBoardPostSourceLink',
+  'CollaborationBoardReplyLink',
+  'CollaborationBoardSubscriptionLink',
+  'CollaborationBoardCommandReceipt'
 ];
 
 const CONFIGURATION_DOMAINS = [
@@ -444,43 +461,16 @@ function validateMigration(root, migration, failures) {
   for (const field of ['legacyRuntimeImport', 'dualWrite', 'fallbackToLegacyRuntime', 'runtimeProtocolNegotiation']) {
     if (migration?.[field] !== false) failures.push(`migration.${field}必须为false`);
   }
-  const expectedPublishedPredecessorManifestVariants = [
-    {
-      id: 'epoch-3-v0.0.10-v0.0.11',
-      extensionVersions: ['0.0.10', '0.0.11'],
-      domainKey: 'ModelContextProjection',
-      clientMapping: 'detail',
-      schemaDigest: '4c587475862e73a9bf2c172e29d92c047e0e60a674630ce5b54e2e921f00c760'
-    },
-    {
-      id: 'epoch-3-v0.0.12-v0.0.14',
-      extensionVersions: ['0.0.12', '0.0.13', '0.0.14'],
-      domainKey: 'ModelContextProjection',
-      clientMapping: 'summary',
-      schemaDigest: 'f84996edbfcb6a9b62d9c42a5140cf279cf3d646e9a75872c52cbeb909c546a9'
-    }
-  ];
-  const boundedEpochUpgrade = migration?.boundedEpochUpgrade;
-  if (
-    boundedEpochUpgrade?.fromEpoch !== 3
-    || boundedEpochUpgrade?.toEpoch !== 4
-    || boundedEpochUpgrade?.mode !== 'offline-startup-exact-predecessor-only'
-    || boundedEpochUpgrade?.sourcePolicy !== 'exact-table-index-trigger-manifest-and-binding-fingerprint'
-    || JSON.stringify(boundedEpochUpgrade?.publishedPredecessorManifestVariants)
-      !== JSON.stringify(expectedPublishedPredecessorManifestVariants)
-    || boundedEpochUpgrade?.variantPolicy
-      !== 'two-exact-published-manifest-fingerprints-only; all-other-domain-manifest-and-physical-fingerprints-identical'
-    || boundedEpochUpgrade?.sqliteNativePathPolicy
-      !== 'persist-canonical-root-binding-path-use-win32-namespaced-path-only-at-sqlite-io-boundary'
-    || boundedEpochUpgrade?.backupPolicy !== 'sqlite-backup-api-plus-root-binding-and-epoch-manifest'
-    || boundedEpochUpgrade?.recoveryPolicy !== 'durable-journal-forward-only'
-    || boundedEpochUpgrade?.legacyChildContinuationPolicy
-      !== 'offline-rewrite-to-current-envelope-and-link-exact-identity-only'
-    || boundedEpochUpgrade?.unknownDriftPolicy !== 'fail-before-pending-pointer'
-    || boundedEpochUpgrade?.compatibilityFallback !== false
-  ) {
-    failures.push('Runtime epoch只允许精确3到4离线升级并必须具备备份、journal与未知漂移拒绝合同');
+  if (migration?.currentRuntimeEpoch !== 5
+    || migration?.boundedEpochUpgrade !== undefined
+    || migration?.schemaUpgradePolicy?.olderEpoch !== 'offline-archive-reset'
+    || migration?.schemaUpgradePolicy?.currentEpoch !== 'exact-manifest-and-physical-fingerprint-only'
+    || migration?.schemaUpgradePolicy?.partialAdditiveUpgrade !== false
+    || migration?.schemaUpgradePolicy?.unknownDrift !== 'fail-closed') {
+    failures.push('Runtime epoch 5 只允许旧代离线归档重置，当前代完整指纹严格验证，禁止复用退休升级器或补表');
   }
+  failures.push(...exactSetProblems('epoch reset保留对象',
+    ['runtime-archive', 'configuration', 'workspace'], migration?.schemaUpgradePolicy?.preserve ?? []));
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
   }
@@ -614,7 +604,8 @@ function validateAuthority(authority, migration, failures) {
     || authority?.schemaPolicy?.incrementalLegacyMigrationChain !== false
     || authority?.schemaPolicy?.incompatibleRuntimeData !== 'archive-and-reset'
     || authority?.schemaPolicy?.exactPredecessorUpgrade
-      !== 'offline-epoch-3-to-4-only-with-exact-schema-fingerprint-and-durable-backup') {
+      !== 'none-retired-predecessors-archive-reset'
+    || authority?.schemaPolicy?.currentEpoch !== 5) {
     failures.push('SQLite schema必须只有当前manifest和单一运行epoch，不维护旧迁移链');
   }
   if (authority?.rootPolicy?.mode !== 'offline-restart-only' || authority?.rootPolicy?.onlineMigration !== false) {
@@ -972,6 +963,28 @@ function validateContext(context, failures) {
 }
 
 function validateSubagent(subagent, failures) {
+  const collaboration = subagent?.collaboration;
+  if (collaboration?.teamScope !== 'derive-root-conversation-from-ChildExecutionParentLink-no-team-table'
+    || collaboration?.messageAuthority !== 'peer-tool-output-never-user-or-developer-authorization'
+    || collaboration?.delivery !== 'reuse-RuntimeInboxItem-RuntimeDelivery-RuntimeDeliveryInputLink-RuntimeDeliveryWake'
+    || collaboration?.sendMessage !== 'persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary'
+    || collaboration?.followupTask !== 'explicit-request-may-wake-idle-or-join-active; never-implicitly-cancel'
+    || collaboration?.board?.scope !== 'existing-root-conversation-no-membership-authority'
+    || collaboration?.board?.notification !== 'active-subscribers-only; no-idle-wake') {
+    failures.push('协作必须复用稳定父树与可靠投递，区分静默消息和显式唤醒，并保留工具来源权限');
+  }
+  failures.push(...exactSetProblems('协作消息领域', [
+    'CollaborationMessage', 'CollaborationMessageSourceLink', 'CollaborationMessageTargetLink',
+    'CollaborationMessagePayloadLink', 'CollaborationMessageReplyLink', 'CollaborationBudget', 'CollaborationRequest',
+    'CollaborationRequestTurnLink', 'ConversationCommunicationLink'
+  ], collaboration?.messageDomains ?? []));
+  failures.push(...exactSetProblems('协作留言板领域', [
+    'CollaborationBoardChannel', 'CollaborationBoardChannelScopeLink', 'CollaborationBoardPost',
+    'CollaborationBoardPostChannelLink', 'CollaborationBoardPostSourceLink', 'CollaborationBoardReplyLink',
+    'CollaborationBoardSubscriptionLink', 'CollaborationBoardCommandReceipt'
+  ], collaboration?.board?.domains ?? []));
+  failures.push(...exactSetProblems('子Agent上下文分叉模式', ['none', 'all', 'positive-integer-string'], collaboration?.forkTurns ?? []));
+
   failures.push(...exactSetProblems('子Agent操作', ['spawn', 'send', 'wait', 'list', 'read', 'interrupt_subtree'], subagent?.operations ?? []));
   failures.push(...exactSetProblems('子Agent模型必填字段', ['operation'], subagent?.modelContract?.required ?? []));
   failures.push(...exactSetProblems('子Agent新建字段', ['taskName', 'prompt'], subagent?.modelContract?.spawnRequired ?? []));
@@ -1029,6 +1042,13 @@ function validateSubagent(subagent, failures) {
 }
 
 function validateClient(client, failures) {
+  const collaboration = client?.collaborationProjection;
+  if (collaboration?.scope !== 'selected-conversation-source-or-target-only'
+    || collaboration?.snapshotMessageLimit !== 32 || collaboration?.snapshotPermissionLimit !== 32
+    || collaboration?.messageBodiesInFeed !== false || collaboration?.boardBodiesInFeed !== false) {
+    failures.push('协作前端投影必须有界、仅属于当前会话并按需读取正文');
+  }
+
   if (client?.persistence?.clientChangeLog !== false || client?.persistence?.clientCommitTables !== false) failures.push('第一版不得持久化前端变更日志或提交表');
   if (client?.persistence?.sessionState !== 'memory-only') failures.push('前端同步会话必须只在内存中');
   if (client?.crossHostSynchronization?.detection !== 'sqlite-externalDataVersion'
@@ -1181,6 +1201,9 @@ function validateCrossContract(documents, failures) {
   for (const domain of subagent.lineage?.domains ?? []) if (!domainSet.has(domain)) failures.push(`subagent lineage领域未进入authority runtimeDomains：${domain}`);
   for (const domain of subagent.answer?.domains ?? []) if (!domainSet.has(domain)) failures.push(`subagent answer领域未进入authority runtimeDomains：${domain}`);
   for (const domain of subagent.delivery?.domains ?? []) if (!domainSet.has(domain)) failures.push(`subagent delivery领域未进入authority runtimeDomains：${domain}`);
+  for (const domain of [...(subagent.collaboration?.messageDomains ?? []), ...(subagent.collaboration?.board?.domains ?? [])]) {
+    if (!domainSet.has(domain)) failures.push(`collaboration领域未进入authority runtimeDomains：${domain}`);
+  }
   if (context.providerContinuation?.runtimeDomainRequired === false && domainSet.has('ProviderContinuation')) failures.push('ProviderContinuation禁用时authority不得建表');
   failures.push(...exactSetProblems('tool/identity recovery ID', tool.recoveryScan?.scans?.map((entry) => entry.id) ?? [], identity.recoveryScan?.scanIds ?? []));
   const effectKinds = new Set(tool.effectIntent?.effectKinds ?? []);

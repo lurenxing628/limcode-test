@@ -219,5 +219,15 @@
     "rule": "订阅不得遗漏 snapshotCommitSeq 之后的 commit；changes.commitSeq 必须严格连续，大于 snapshotCommitSeq。",
     "implementationFreedom": "合同不固定具体 mutex/worker 消息实现，但必须证明无 gap。",
     "persistentClientChangeLog": false
+  },
+  "collaborationProjection": {
+    "scope": "selected-conversation-source-or-target-only",
+    "snapshotMessageLimit": 32,
+    "snapshotPermissionLimit": 32,
+    "liveWindow": "existing-per-type-bounds-and-atomic-snapshot-refresh",
+    "messageBodiesInFeed": false,
+    "boardBodiesInFeed": false,
+    "relations": "independent-message-source-target-reply-request-and-communication-links",
+    "runtimeContinuationPreview": "collaboration_message-source-kind-retains-sourceConversationId-mode-and-320-character-text-preview; never-user-authorization"
   }
 }

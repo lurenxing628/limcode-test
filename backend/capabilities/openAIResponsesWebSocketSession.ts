@@ -2152,7 +2152,11 @@ function startNativeResponse(
   }
 
   let admittedSeq = state.seenAnyResponse ? undefined : state.initialResponseCreateSeq;
-  let admittedToolResultCallIds: string[] | undefined;
+  // Only the prepared input was sent: incremental creates may omit results that remain in
+  // fullBody/history, while rebased initial creates can carry prior native tool results.
+  let admittedToolResultCallIds: string[] | undefined = state.seenAnyResponse
+    ? undefined
+    : nativeWireToolResultCallIds(state.prepared.payload.input);
   const inFlight = state.createInFlight;
   if (inFlight) {
     state.createInFlight = undefined;
@@ -2901,6 +2905,15 @@ function buildNativeToolOutputItems(
     coverageKeys.push(callId);
   }
   return { wireItems, callIds, coverageKeys };
+}
+
+function nativeWireToolResultCallIds(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return [...new Set(input.flatMap((item: unknown) =>
+    isRecord(item) && (item.type === 'function_call_output' || item.type === 'custom_tool_call_output')
+      && typeof item.call_id === 'string' && item.call_id.trim()
+      ? [item.call_id]
+      : []))];
 }
 
 function encodeNativeSteerInput(

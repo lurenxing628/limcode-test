@@ -11,6 +11,7 @@ import {
 } from './plainJson';
 import { estimateTextTokens } from './modelTokenEstimator';
 import {
+  projectKnownToolValue,
   modelHandleEntries,
   modelHandleRef,
   type ModelHandleCatalog
@@ -26,7 +27,8 @@ export const RUNTIME_DELIVERY_MODEL_MAX_TOKENS = 4_000;
 export type RuntimeDeliveryModelKind =
   | 'process_completion'
   | 'child_answer'
-  | 'child_failure';
+  | 'child_failure'
+  | 'collaboration_message';
 
 export type RuntimeDeliveryModelStatus =
   | 'completed'
@@ -82,7 +84,15 @@ export interface ChildFailureModelEnvelope extends RuntimeDeliveryModelEnvelopeB
   content: string;
 }
 
+export interface CollaborationMessageModelEnvelope extends RuntimeDeliveryModelEnvelopeBase {
+  kind: 'collaboration_message'; status: 'submitted'; messageId: string;
+  sourceConversationId: string; targetConversationId: string; sourceKind: string;
+  mode: 'message' | 'followup'; replyToMessageId: string | null; content: string;
+  board?: { postId: string; channelId: string; threadId: string };
+}
+
 export type RuntimeDeliveryModelEnvelope =
+  | CollaborationMessageModelEnvelope
   | ProcessCompletionModelEnvelope
   | ChildAnswerModelEnvelope
   | ChildFailureModelEnvelope;
@@ -126,7 +136,15 @@ export interface ChildFailureModelProjectionInput extends ProjectionCommonInput 
   content: string;
 }
 
+export interface CollaborationMessageModelProjectionInput extends ProjectionCommonInput {
+  kind: 'collaboration_message'; messageId: string; sourceConversationId: string;
+  targetConversationId: string; sourceKind: string; mode: 'message' | 'followup';
+  replyToMessageId: string | null; content: string;
+  board?: { postId: string; channelId: string; threadId: string };
+}
+
 export type RuntimeDeliveryModelProjectionInput =
+  | CollaborationMessageModelProjectionInput
   | ProcessCompletionModelProjectionInput
   | ChildAnswerModelProjectionInput
   | ChildFailureModelProjectionInput;
@@ -156,7 +174,9 @@ export function projectRuntimeDeliveryForModel(
   if (!runtimeDeliveryPhaseAllowsModelInput(input.phase)) return null;
   const common = normalizeCommon(input);
   let envelope: RuntimeDeliveryModelEnvelope;
-  if (input.kind === 'process_completion') {
+  if (input.kind === 'collaboration_message') {
+    envelope = requireRuntimeDeliveryModelEnvelope({ ...common, ...input, sourceId: input.messageId, status: 'submitted' });
+  } else if (input.kind === 'process_completion') {
     const content = requirePlainRecord(input.content, 'Process completion model content');
     const processId = requirePhaseFId(input.processId, 'processId');
     const processReceiptId = requirePhaseFId(input.processReceiptId, 'processReceiptId');
@@ -263,6 +283,18 @@ export function requireRuntimeDeliveryModelEnvelope(input: unknown): RuntimeDeli
     deliveredAt: requireIsoTimestamp(value.deliveredAt, 'Runtime Delivery model envelope.deliveredAt'),
     note: RUNTIME_DELIVERY_MODEL_NOTE
   };
+  if (value.kind === 'collaboration_message') {
+    const messageId = requirePhaseFId(value.messageId, 'Collaboration envelope.messageId');
+    if (value.sourceId !== messageId || value.status !== 'submitted' || !['message', 'followup'].includes(String(value.mode))) throw new Error('Collaboration envelope has conflicting identity or mode.');
+    if (!['tool', 'user', 'completion', 'board'].includes(String(value.sourceKind))) throw new Error('Collaboration envelope source kind is not supported.');
+    let board: { postId: string; channelId: string; threadId: string } | undefined;
+    if (value.sourceKind === 'board') {
+      const origin = requirePlainRecord(value.board, 'Collaboration board origin');
+      board = { postId: requirePhaseFId(origin.postId, 'postId'), channelId: requirePhaseFId(origin.channelId, 'channelId'), threadId: requirePhaseFId(origin.threadId, 'threadId') };
+    } else if (value.board !== undefined) throw new Error('Only board notifications may carry board origin.');
+    return { ...common, ...(board ? { board } : {}), kind: 'collaboration_message', status: 'submitted', sourceId: messageId, messageId,
+      sourceConversationId: requirePhaseFId(value.sourceConversationId, 'sourceConversationId'), targetConversationId: requirePhaseFId(value.targetConversationId, 'targetConversationId'), sourceKind: String(value.sourceKind), mode: value.mode as 'message' | 'followup', replyToMessageId: value.replyToMessageId === null ? null : requirePhaseFId(value.replyToMessageId, 'replyToMessageId'), content: requireString(value.content, 'Collaboration envelope.content') };
+  }
   if (value.kind === 'process_completion') {
     if (value.status !== 'completed') {
       throw new TypeError('Process completion model envelope must have completed status.');
@@ -372,6 +404,9 @@ function runtimeModelEnvelope(
   envelope: RuntimeDeliveryModelEnvelope,
   catalog: ModelHandleCatalog | unknown
 ): Record<string, unknown> {
+  if (envelope.kind === 'collaboration_message') {
+    return projectKnownToolValue('send_agent_message', { kind: envelope.kind, status: envelope.status, messageId: envelope.messageId, sourceConversationId: envelope.sourceConversationId, targetConversationId: envelope.targetConversationId, sourceKind: envelope.sourceKind, mode: envelope.mode, replyToMessageId: envelope.replyToMessageId, ...(envelope.board ? { board: envelope.board } : {}), content: envelope.content }, catalog) as Record<string, unknown>;
+  }
   if (envelope.kind === 'process_completion') {
     const processRef = modelHandleRef(catalog, 'process', envelope.processId);
     const content = compactRuntimeValue(envelope.content, catalog);

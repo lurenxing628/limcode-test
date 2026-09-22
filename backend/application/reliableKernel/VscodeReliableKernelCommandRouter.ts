@@ -249,6 +249,79 @@ export class VscodeReliableKernelCommandRouter {
       }
     }
     switch (message.type) {
+      case BridgeMessageType.CollaborationConversationRead: {
+        const payload = requirePayload(message.payload, '读取协作对话');
+        this.requireCollaborationBinding(clientId, payload.conversationId);
+        const target = await this.product.application.runtime.collaboration.readConversation({
+          conversationId: payload.conversationId, targetConversationId: requireText(payload.targetConversationId, 'targetConversationId'),
+          ...(payload.beforeMessageId ? { beforeMessageId: payload.beforeMessageId } : {}), limit: 30
+        });
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CollaborationConversationResult, channel: 'state', correlationId: message.id,
+          payload: { conversationId: payload.conversationId, target } });
+        return;
+      }
+      case BridgeMessageType.CollaborationGet: {
+        const payload = requirePayload(message.payload, '协作成员与消息');
+        this.requireCollaborationBinding(clientId, payload.conversationId);
+        const collaboration = this.product.application.runtime.collaboration;
+        const [directory, mailbox, permissions, permissionCandidates] = await Promise.all([
+          collaboration.listMembers(payload.conversationId),
+          collaboration.listMessages({ conversationId: payload.conversationId, beforeMessageId: payload.beforeMessageId, limit: 50 }),
+          collaboration.listPermissions(payload.conversationId),
+          collaboration.listPermissionCandidates(payload.conversationId)
+        ]);
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CollaborationSnapshot, channel: 'state', correlationId: message.id,
+          payload: { conversationId: payload.conversationId, ...directory, ...mailbox, permissions, permissionCandidates } });
+        return;
+      }
+      case BridgeMessageType.CollaborationMessageRead: {
+        const payload = requirePayload(message.payload, '协作消息正文');
+        this.requireCollaborationBinding(clientId, payload.conversationId);
+        const detail = await this.product.application.runtime.collaboration.readMessage(payload);
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CollaborationMessageResult, channel: 'state', correlationId: message.id,
+          payload: { conversationId: payload.conversationId, message: detail } });
+        return;
+      }
+      case BridgeMessageType.CollaborationSend: {
+        const payload = requirePayload(message.payload, '发送协作消息');
+        this.requireCollaborationBinding(clientId, payload.conversationId);
+        const result = await this.runConversationCommand(payload.conversationId, () => this.product.application.runtime.collaboration.send({
+          source: { kind: 'user', conversationId: payload.conversationId, commandId: requireText(payload.commandId, 'commandId') },
+          targetConversationId: requireText(payload.targetConversationId, 'targetConversationId'),
+          text: requireText(payload.text, '消息正文'), mode: payload.mode,
+          ...(payload.replyToMessageId ? { replyToMessageId: payload.replyToMessageId } : {})
+        }));
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CollaborationCommandResult, channel: 'command', correlationId: message.id,
+          payload: { conversationId: payload.conversationId, messageId: result.messageId } });
+        return;
+      }
+      case BridgeMessageType.CollaborationPermissionSet: {
+        const payload = requirePayload(message.payload, '对话通信授权');
+        this.requireCollaborationBinding(clientId, payload.conversationId);
+        if ([payload.allowRead, payload.allowSend, payload.allowWake].some(value => typeof value !== 'boolean')) {
+          throw new Error('对话通信权限必须明确选择。');
+        }
+        await this.runConversationCommand(payload.conversationId, () => this.product.application.runtime.collaboration.setPermission({
+          sourceConversationId: payload.conversationId,
+          targetConversationId: requireText(payload.targetConversationId, 'targetConversationId'),
+          commandId: requireText(payload.commandId, 'commandId'),
+          allowRead: payload.allowRead, allowSend: payload.allowSend, allowWake: payload.allowWake
+        }));
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CollaborationCommandResult, channel: 'command', correlationId: message.id,
+          payload: { conversationId: payload.conversationId } });
+        return;
+      }
+      case BridgeMessageType.CollaborationBoardCommand: {
+        const payload = requirePayload(message.payload, '团队留言板');
+        this.requireCollaborationBinding(clientId, payload.conversationId);
+        const { conversationId, commandId, ...args } = payload;
+        const result = await this.runConversationCommand(conversationId, () => this.product.application.runtime.collaborationBoard.executeUser({
+          conversationId, commandId: requireText(commandId, 'commandId')
+        }, args));
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CollaborationBoardResult, channel: 'state', correlationId: message.id,
+          payload: { conversationId, operation: payload.operation, result } });
+        return;
+      }
       case BridgeMessageType.Ready:
         this.settingsSaveBarrier.attach(clientId, webview);
         this.product.application.webviewFeed.reconnect(clientId);
@@ -630,6 +703,13 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   /** ModelProfile-only observation boundary; register completion before provider preflight or claim. */
+  private requireCollaborationBinding(clientId: string, conversationId: string): void {
+    const bound = this.options.conversationIdForClient?.(clientId);
+    if (!bound || conversationId !== bound) {
+      throw new Error('协作操作只能从当前面板绑定的对话发起。');
+    }
+  }
+
   private handleModelProfileScope(clientId: string, webview: vscode.Webview, message: WebviewToExtensionMessage): void {
     const input = message.payload as ModelProfileScopeReadPayload & Partial<ModelProfileScopeSetPayload>;
     let authorityId = input?.authorityId ?? '';

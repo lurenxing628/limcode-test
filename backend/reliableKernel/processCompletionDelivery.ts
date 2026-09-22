@@ -33,7 +33,7 @@ export interface ProcessCompletionWakeRequest {
   wakeId: string;
   deliveryId: string;
   inboxItemId: string;
-  sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure';
+  sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure' | 'collaboration_message';
   sourceId: string;
   processId?: string;
   processReceiptId?: string;
@@ -140,7 +140,9 @@ export class ProcessCompletionDeliveryControlPlane {
         'ProcessReceipt',
         'ProcessCompletionDispatch',
         'RuntimeDelivery',
-        'RuntimeDeliveryInputLink'
+        'RuntimeDeliveryInputLink',
+        'Turn',
+        'CollaborationMessage'
       ].includes(change.domain))) return;
       if (this.started) this.requestScan();
     });
@@ -602,7 +604,11 @@ export class ProcessCompletionDeliveryControlPlane {
         'RuntimeInboxItem',
         requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
       );
-      if (!['process_receipt', 'answer_submission'].includes(String(inbox.source_kind))) continue;
+      if (!['process_receipt', 'answer_submission', 'collaboration_message'].includes(String(inbox.source_kind))) continue;
+      if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending') {
+        const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
+        if (message.mode === 'message' && delivery.target_turn_id === null) continue;
+      }
       if ((await this.ensureWakeForDelivery(delivery)).created) created += 1;
     }
     return created;
@@ -693,6 +699,11 @@ export class ProcessCompletionDeliveryControlPlane {
       return 'dead_letter';
     }
 
+    if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending' && delivery.phase === 'next_turn' && delivery.target_turn_id === null) {
+      const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
+      // A send-only message never creates a Turn, including the final-output fence race.
+      if (message.mode === 'message') return 'retry';
+    }
     const targetTurnId = delivery.target_turn_id === null
       ? null
       : requirePhaseFId(delivery.target_turn_id, 'RuntimeDelivery.target_turn_id');
@@ -710,7 +721,7 @@ export class ProcessCompletionDeliveryControlPlane {
       ...(source.processId ? { processId: source.processId } : {}),
       ...(source.processReceiptId ? { processReceiptId: source.processReceiptId } : {}),
       conversationId: source.conversationId,
-      sourceTurnId: source.sourceTurnId,
+      sourceTurnId: reconciled.decision.sourceTurnId,
       targetTurnId,
       contentObjectId,
       action,
@@ -774,7 +785,7 @@ export class ProcessCompletionDeliveryControlPlane {
     delivery: DomainRow,
     contentObjectId: string
   ): Promise<{
-    sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure';
+    sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure' | 'collaboration_message';
     sourceId: string;
     conversationId: string;
     sourceTurnId: string;
@@ -786,6 +797,16 @@ export class ProcessCompletionDeliveryControlPlane {
       delivery.target_conversation_id,
       'RuntimeDelivery.target_conversation_id'
     );
+    if (inbox.source_kind === 'collaboration_message') {
+      const targets = await this.listRows('CollaborationMessageTargetLink', { message_id: sourceId }, 2);
+      const payloads = await this.listRows('CollaborationMessagePayloadLink', { message_id: sourceId }, 2);
+      if (targets.length !== 1 || targets[0].conversation_id !== targetConversationId || targets[0].inbox_item_id !== inbox.id || payloads.length !== 1 || payloads[0].content_object_id !== contentObjectId) throw new Error('Collaboration wake has conflicting destination or payload facts.');
+      const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: targetConversationId });
+      turns.sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)) || String(right.id).localeCompare(String(left.id)));
+      const anchor = turns.find((turn) => turn.status === 'active') ?? turns[0];
+      if (!anchor) throw new Error('Collaboration wake destination has no Turn.');
+      return { sourceKind: 'collaboration_message', sourceId, conversationId: targetConversationId, sourceTurnId: String(anchor.id) };
+    }
     if (inbox.source_kind === 'process_receipt') {
       const frozen = await this.readFrozenCompletionPayload(contentObjectId, sourceId);
       if (frozen.conversationId !== targetConversationId) {

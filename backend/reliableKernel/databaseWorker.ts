@@ -2509,8 +2509,24 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
     parameters.__after_id = requireRuntimeId(read.afterId);
     predicates.push(`${quote('id')} > @__after_id`);
   }
+  if (read.keyset) {
+    if (read.afterId !== undefined) throw new TypeError('Cannot combine afterId and keyset cursors.');
+    const column = repository.codec.column(read.keyset.column);
+    if (!column || column.type === 'BLOB' || column.json || column.nullable || read.keyset.column !== orderColumn) throw new TypeError('Keyset requires its non-null scalar order column.');
+    if (!['before', 'after'].includes(read.keyset.direction)) throw new TypeError('Keyset direction must be before or after.');
+    const encoded = repository.codec.encodeWhere({ [column.name]: read.keyset.value });
+    parameters.__keyset_value = encoded[column.name];
+    parameters.__keyset_id = requireRuntimeId(read.keyset.id);
+    const operator = read.keyset.direction === 'after' ? '>' : '<';
+    predicates.push(`(${quote(column.name)} ${operator} @__keyset_value OR (${quote(column.name)} = @__keyset_value AND ${quote('id')} ${operator} @__keyset_id))`);
+  }
+  if (read.collaborationConversationId !== undefined) {
+    if (schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');
+    parameters.__mailbox_conversation = requireRuntimeId(read.collaborationConversationId);
+    predicates.push(`(EXISTS (SELECT 1 FROM collaboration_message_source_link AS source WHERE source.message_id = collaboration_message.id AND source.conversation_id = @__mailbox_conversation) OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target WHERE target.message_id = collaboration_message.id AND target.conversation_id = @__mailbox_conversation))`);
+  }
   parameters.__limit = BigInt(read.limit);
-  const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction} LIMIT @__limit`;
+  const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction}${orderColumn === 'id' ? '' : `, id ${direction}`} LIMIT @__limit`;
   return (database.prepare(sql).all(parameters) as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));
 }
 

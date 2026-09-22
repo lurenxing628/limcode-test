@@ -6,7 +6,9 @@ import {
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { normalizeChildForkTurns, prepareChildContextFork, type ChildForkTurns } from './childContextFork';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { prepareCollaborationCapacity, CollaborationMembershipChangedError } from './collaborationCapacity';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   parseInputTurnIntentEnvelopeText,
@@ -77,6 +79,8 @@ export interface ChildExecutionSpawnCommand {
   /** Parent Turn's frozen effective model; child-local profiles still have higher precedence. */
   modelFallback: TurnModelOverride;
   prompt: string;
+  /** Inherit only committed completed turns; the new prompt remains a separate child assignment. */
+  forkTurns?: ChildForkTurns;
   completionPolicy: ChildCompletionPolicy;
   /**
    * `child_handle` owns and settles a run_agent ToolCall. `external` only anchors lineage to a
@@ -342,6 +346,15 @@ export class ChildExecutionControlPlane {
    * transaction fails.
    */
   public async spawn(commandInput: ChildExecutionSpawnCommand): Promise<ChildExecutionSpawnResult> {
+    for (let retry = 0; ; retry += 1) {
+      try { return await this.spawnWithCapacity(commandInput); }
+      catch (error) {
+        if (retry >= 15 || (!isTransactionAssertionFailure(error) && !(error instanceof CollaborationMembershipChangedError))) throw error;
+      }
+    }
+  }
+
+  private async spawnWithCapacity(commandInput: ChildExecutionSpawnCommand): Promise<ChildExecutionSpawnResult> {
     const command = normalizeSpawnCommand(commandInput);
     const ids = spawnIds(command);
     const replay = await this.findSpawnReplay(command, ids);
@@ -362,6 +375,10 @@ export class ChildExecutionControlPlane {
     if (parent.toolCall.status !== expectedSourceStatus || parent.toolExecution.status !== expectedSourceStatus) {
       throw new Error(`Source ToolCall cannot spawn from ${String(parent.toolCall.status)}/${String(parent.toolExecution.status)}.`);
     }
+
+    const capacitySteps = await prepareCollaborationCapacity(
+      this.database, this.contentStore, String(parent.conversation.id), String(parent.turn.id)
+    );
 
     const workspace = await projectFolderForConversation(
       this.database,
@@ -396,15 +413,24 @@ export class ChildExecutionControlPlane {
         compiled.authoritySnapshot.contentType
       )
     ]);
+    const now = this.timestamp();
+    const inheritedContext = await prepareChildContextFork(this.database, this.contentStore, {
+      sourceConversationId: requirePhaseFId(parent.conversation.id, 'Conversation.id'),
+      targetConversationId: ids.childConversationId,
+      targetAgentId: command.childAgentId,
+      forkTurns: command.forkTurns,
+      now
+    });
     const promptContext = this.contextSequence.prepareFreshConversationMessageMutation({
       conversationId: ids.childConversationId,
       messageRevisionId: ids.childMessageRevisionId,
       contentObjectId: promptContent.metadata.id,
       contentByteLength: promptContent.metadata.byte_length,
-      contentEstimatedTokens: estimateStoredMessageContentTokens(command.prompt, 'text/plain')
+      contentEstimatedTokens: estimateStoredMessageContentTokens(command.prompt, 'text/plain'),
+      inheritedSegments: inheritedContext.segments
     });
-    const now = this.timestamp();
     const steps: RepositoryTransactionStep[] = [
+      ...capacitySteps,
       DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
         id: ids.commandReceiptId,
         source_kind: 'internal',
@@ -452,6 +478,7 @@ export class ChildExecutionControlPlane {
         created_at: now,
         updated_at: now
       }),
+      ...inheritedContext.steps,
       ...(parent.projectLink
         ? [conversationProjectLinkInsertStep({
             conversationId: ids.childConversationId,
@@ -832,13 +859,48 @@ export class ChildExecutionControlPlane {
       try {
         await this.effects.claimEffectDispatch(effectIntentId);
       } catch (error) {
-        // Parent cancellation and dispatch race through the same exact EffectIntent row.  If the
-        // cancellation won, the refreshed durable state below is authoritative; a still-pending
-        // state means the parent is not currently dispatchable and must be retried by the level
-        // scheduler after its recovery owner is established.
-        facts = await this.readSpawnIntentFacts(effectIntentId);
-        if (facts.intent.dispatch_state === 'pending') return spawnRecoveryResult(facts, false);
-        if (facts.intent.dispatch_state !== 'cancelled_before_dispatch') throw error;
+        // The normal dispatcher can commit between claimEffectDispatch's separate Intent and
+        // Attempt reads. Reconcile an exact durable winner, including an already-written receipt;
+        // an unrelated identity or inconsistent state must never excuse the original claim error.
+        const raced = await this.database.snapshot([
+          DOMAIN_REPOSITORIES.domain('EffectIntent').get(effectIntentId),
+          DOMAIN_REPOSITORIES.domain('Attempt').get(requirePhaseFId(facts.attempt.id, 'Attempt.id')),
+          DOMAIN_REPOSITORIES.domain('Operation').get(requirePhaseFId(facts.operation.id, 'Operation.id')),
+          DOMAIN_REPOSITORIES.domain('EffectReceipt').list({ where: { attempt_id: facts.attempt.id }, limit: 2 })
+        ]);
+        const intent = requireRow(raced.snapshot[0], `EffectIntent ${effectIntentId}`);
+        const attempt = requireRow(raced.snapshot[1], `Attempt ${String(facts.attempt.id)}`);
+        const operation = requireRow(raced.snapshot[2], `Operation ${String(facts.operation.id)}`);
+        const receipts = requireRows(raced.snapshot[3], 'EffectReceipt spawn claim race lookup');
+        if (intent.id !== facts.intent.id || intent.effect_kind !== 'subagent_spawn'
+          || intent.attempt_id !== facts.attempt.id || intent.request_object_id !== facts.intent.request_object_id
+          || attempt.id !== facts.attempt.id || attempt.operation_id !== facts.operation.id
+          || attempt.attempt_seq !== facts.attempt.attempt_seq
+          || operation.id !== facts.operation.id || operation.owner_kind !== 'child_execution'
+          || operation.owner_id !== facts.childExecution.id || operation.tool_call_id !== facts.operation.tool_call_id
+          || operation.operation_seq !== facts.operation.operation_seq) throw error;
+        const pending = intent.dispatch_state === 'pending'
+          && attempt.status === 'pending' && operation.status === 'pending' && receipts.length === 0;
+        const cancelled = intent.dispatch_state === 'cancelled_before_dispatch'
+          && attempt.status === 'cancelled' && operation.status === 'cancelled' && receipts.length === 0;
+        const dispatched = intent.dispatch_state === 'dispatched'
+          && attempt.status === 'dispatched' && operation.status === 'executing' && receipts.length === 0;
+        const receipt = receipts.length === 1 ? receipts[0] : undefined;
+        const receiptWritten = intent.dispatch_state === 'receipt_written' && receipt !== undefined
+          && receipt.attempt_id === attempt.id && receipt.effect_kind === 'subagent_spawn'
+          && receipt.operation_id === operation.id && receipt.tool_call_id === operation.tool_call_id
+          && ['succeeded', 'failed', 'cancelled', 'conflict', 'outcome_unknown'].includes(String(receipt.outcome))
+          && ((attempt.status === 'dispatched' && operation.status === 'executing')
+            || (attempt.status === receipt.outcome
+              && (operation.status === receipt.outcome
+                || (receipt.outcome === 'succeeded'
+                  && (operation.status === 'waiting_answer' || TERMINAL_OPERATION_STATES.has(String(operation.status)))))));
+        if (!pending && !cancelled && !dispatched && !receiptWritten) throw error;
+        if (pending) {
+          // Parent ownership can temporarily prevent dispatch without changing the spawn facts.
+          // Leave that exact pending frontier for the level-triggered recovery scheduler.
+          return spawnRecoveryResult(await this.readSpawnIntentFacts(effectIntentId), false);
+        }
       }
       facts = await this.readSpawnIntentFacts(effectIntentId);
     }
@@ -1336,6 +1398,9 @@ export class ChildExecutionControlPlane {
     if (agentLinks.length !== 1) throw new Error('Child Conversation must have one default Agent link.');
     const executorAgentId = requirePhaseFId(agentLinks[0].agent_id, 'AgentConversationLink.agent_id');
     const childConversationId = requirePhaseFId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
+    const capacitySteps = await prepareCollaborationCapacity(
+      this.database, this.contentStore, childConversationId, String(previousTurn.id)
+    );
     const intentContentObjectId = requirePhaseFId(
       revisions[0].content_object_id,
       'TurnIntentRevision.content_object_id'
@@ -1437,6 +1502,7 @@ export class ChildExecutionControlPlane {
           updated_at: now
         });
     const steps: RepositoryTransactionStep[] = [
+      ...capacitySteps,
       DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
         id: ids.commandReceiptId,
         source_kind: 'internal',
@@ -3665,6 +3731,7 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
     childAgentId,
     modelFallback: normalizeTurnModelOverride(command.modelFallback),
     prompt: requirePhaseFText(command.prompt, 'prompt'),
+    forkTurns: normalizeChildForkTurns(command.forkTurns),
     completionPolicy,
     sourceSettlement,
     ...(waitDeadlineAt ? { waitDeadlineAt } : {}),
@@ -3826,7 +3893,8 @@ function spawnRequestPayload(
     sourceSettlement: command.sourceSettlement,
     waitDeadlineAt: command.waitDeadlineAt ?? null,
     title: command.title,
-    prompt: command.prompt
+    prompt: command.prompt,
+    forkTurns: command.forkTurns
   };
 }
 

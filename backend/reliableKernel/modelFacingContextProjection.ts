@@ -1361,8 +1361,10 @@ function collectImportantFacts(value: unknown, toolName = ''): Record<string, un
   const wanted = new Set([
     'status', 'error', 'exitCode', 'path', 'filePath', 'sourcePath',
     'attachmentRef', 'processRef', 'cursor', 'nextCursor', 'childRef', 'childRefs', 'workEnvironmentRef',
+    'conversationRef', 'sourceConversationRef', 'targetConversationRef', 'messageRef', 'afterMessageRef',
+    'nextAfterMessageRef', 'beforeMessageRef', 'olderMessageRef', 'view', 'replyToMessageRef', 'channelRef', 'threadRef', 'postRef',
     'count', 'total', 'changedFiles',
-    'operation', 'scope', 'rereadCursor'
+    'operation', 'scope', 'rereadCursor', 'offsetChars', 'nextOffsetChars'
   ]);
   const visit = (candidate: unknown, depth: number): void => {
     if (depth > 3 || !candidate || typeof candidate !== 'object') return;
@@ -1374,7 +1376,7 @@ function collectImportantFacts(value: unknown, toolName = ''): Record<string, un
       if (wanted.has(key) && result[key] === undefined) {
         // A page preview may lose body text under a shared Tool batch budget. Its restart cursor
         // must survive byte-for-byte; nextCursor alone would skip the omitted part of this page.
-        if (toolName === 'run_agent' && (key === 'rereadCursor' || key === 'nextCursor')
+        if ((toolName === 'run_agent' || toolName === 'agent_board') && (key === 'rereadCursor' || key === 'nextCursor')
           && typeof nested === 'string') {
           if (nested.length > 4_096) throw new Error('Child task page cursor exceeds its model projection limit.');
           result[key] = nested;
@@ -1544,6 +1546,8 @@ function toolResultPriority(value: unknown): ToolResultPriority {
     || facts.cursor !== undefined
     || facts.nextCursor !== undefined
     || facts.childRef !== undefined
+    || facts.conversationRef !== undefined || facts.messageRef !== undefined
+    || facts.channelRef !== undefined || facts.postRef !== undefined
     || facts.attachmentRef !== undefined
     || facts.path !== undefined
     || facts.filePath !== undefined

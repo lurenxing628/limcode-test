@@ -76,6 +76,8 @@ export async function prepareConversationForkSnapshot(
     sourceConversationId: string;
     targetConversationId: string;
     boundaryMessageSeq?: bigint;
+    /** Child forks select complete committed turns instead of a transcript prefix. */
+    selectedMessageIds?: ReadonlySet<string>;
     contextSegmentIds?: readonly string[];
     targetAgentId: string;
     now: string;
@@ -125,6 +127,7 @@ export async function prepareConversationForkSnapshot(
   }
   const prefixMemberships = membershipBarrier.snapshot
     .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq)
+    .filter((row) => !input.selectedMessageIds || input.selectedMessageIds.has(id(row.message_id, 'MessagePartOfConversation.message_id')))
     .sort(compareMessageMembership);
   if (prefixMemberships.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
@@ -1076,4 +1079,3 @@ function compareMessageMembership(left: DomainRow, right: DomainRow): number {
     || id(left.message_id, 'MessagePartOfConversation.message_id')
       .localeCompare(id(right.message_id, 'MessagePartOfConversation.message_id'));
 }
-

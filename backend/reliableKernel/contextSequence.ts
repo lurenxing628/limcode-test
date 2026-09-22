@@ -137,6 +137,8 @@ export interface FreshConversationMessageContextPlanInput {
   contentByteLength: bigint;
   /** Provider-semantic estimate for this Message; defaults to the legacy byte fallback. */
   contentEstimatedTokens?: number;
+  /** Immutable occurrences whose independent target provenance is written in the same transaction. */
+  inheritedSegments?: readonly { segmentId: string; estimatedTokens: number }[];
 }
 
 export interface MessageContextAppendPlanInput {
@@ -1097,10 +1099,20 @@ export class ContextSequenceControlPlane {
     const segmentId = stableSegmentId([{
       sourceKind: 'message_revision', sourceId: revisionId, sourceRevision: 0n
     }]);
-    const nodeId = contextSequenceNodeId(null, segmentId);
+    const now = this.timestamp();
+    const inheritedNodes: PlannedNode[] = [];
+    let parentNodeId: string | null = null;
+    let inheritedTokens = 0n;
+    for (const inherited of input.inheritedSegments ?? []) {
+      const inheritedId = requireId(inherited.segmentId, 'inheritedSegment.segmentId');
+      inheritedTokens += optionalEstimatedTokens(inherited.estimatedTokens)!;
+      const inheritedNodeId = contextSequenceNodeId(parentNodeId, inheritedId);
+      inheritedNodes.push({ id: inheritedNodeId, parentNodeId, segmentId: inheritedId, now });
+      parentNodeId = inheritedNodeId;
+    }
+    const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
     const rootId = stableId('context_root_append', conversationId, '<null>', nodeId);
     const headLinkId = stableId('conversation_context_head', conversationId);
-    const now = this.timestamp();
     return {
       rootId,
       headLinkId,
@@ -1112,15 +1124,15 @@ export class ContextSequenceControlPlane {
           contentObjectId,
           now
         }),
-        ...nodeInsertSteps([{ id: nodeId, parentNodeId: null, segmentId, now }], 'fresh_message_context_node'),
+        ...nodeInsertSteps([...inheritedNodes, { id: nodeId, parentNodeId, segmentId, now }], 'fresh_message_context_node'),
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: rootId,
           conversation_id: conversationId,
           root_node_id: nodeId,
           tail_node_id: null,
           tail_segment_count: 0n,
-          segment_count: 1n,
-          estimated_tokens: contentEstimatedTokens,
+          segment_count: BigInt(inheritedNodes.length) + 1n,
+          estimated_tokens: inheritedTokens + contentEstimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
         DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').insert({

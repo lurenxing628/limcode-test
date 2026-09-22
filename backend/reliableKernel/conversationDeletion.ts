@@ -1,6 +1,7 @@
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { collaborationConversationDeletionSteps } from './collaborationDeletion';
 
 export interface ConversationDeleteResult {
   deletedConversationIds: string[];
@@ -34,13 +35,13 @@ export class ConversationDeletionControlPlane {
     const conversationId = requireId(conversationIdInput, 'conversationId');
     const snapshot = await this.readSnapshot(conversationId);
     if (!snapshot) return null;
-    this.assertSafeToDelete(snapshot);
-
     const deletionOrder = descendantFirstConversationIds(conversationId, snapshot.childOrigins);
+    const collaboration = await collaborationConversationDeletionSteps(this.database, deletionOrder);
+    this.assertSafeToDelete(snapshot, collaboration.pendingDeliveryIds);
     const conversationById = new Map(snapshot.conversations.map((row) => [String(row.id), row]));
     const expectedOriginIdsBySource = groupIds(snapshot.sourceOrigins, 'source_conversation_id');
     const expectedChildExecutionIdsByConversation = groupIds(snapshot.childExecutions, 'child_conversation_id');
-    const steps: RepositoryTransactionStep[] = [];
+    const steps: RepositoryTransactionStep[] = [...collaboration.steps];
 
     for (const targetId of deletionOrder) {
       const conversation = conversationById.get(targetId);
@@ -178,7 +179,7 @@ export class ConversationDeletionControlPlane {
     };
   }
 
-  private assertSafeToDelete(snapshot: ConversationDeletionSnapshot): void {
+  private assertSafeToDelete(snapshot: ConversationDeletionSnapshot, settledCollaborationDeliveries: ReadonlySet<string>): void {
     if (snapshot.leases.length > 0 || snapshot.turns.some((row) => row.status === 'active')) {
       throw new Error('对话树仍有活动 Turn；请先终止全部主 Agent/Subagent 后再删除。');
     }
@@ -191,7 +192,7 @@ export class ConversationDeletionControlPlane {
     if (snapshot.childExecutions.some((row) => ['starting', 'active', 'interrupting'].includes(String(row.status)))) {
       throw new Error('对话树仍有活动 Subagent；请先终止后再删除。');
     }
-    if (snapshot.deliveries.some((row) => row.state === 'pending')) {
+    if (snapshot.deliveries.some((row) => row.state === 'pending' && !settledCollaborationDeliveries.has(String(row.id)))) {
       throw new Error('对话树仍有待接收的后台结果；结果收敛后才能删除。');
     }
     if (snapshot.processes.some((row) => row.status === 'running')) {

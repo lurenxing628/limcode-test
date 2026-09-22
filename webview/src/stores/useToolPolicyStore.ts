@@ -15,6 +15,10 @@ import { resolveToolPolicyLayers, type ToolPolicyLayer } from '@shared/toolPolic
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 
+export const SUB_AGENT_TOOL_NAME = 'run_agent';
+export const AGENT_COLLABORATION_CONFIG_KEYS = ['maxChildAgentDepth', 'maxConcurrentAgents', 'maxAutomaticFollowups'] as const;
+export type AgentCollaborationConfigKey = typeof AGENT_COLLABORATION_CONFIG_KEYS[number];
+
 export interface ToolPolicyResolution {
   policy?: ToolPolicyRecord;
   link?: ToolPolicyScopeLinkRecord;
@@ -140,6 +144,28 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     }
   },
   actions: {
+    setAgentCollaborationFieldForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, key: AgentCollaborationConfigKey, value: number | undefined): void {
+      if (scopeKind !== 'global' && !scopeId?.trim()) return;
+      if (!AGENT_COLLABORATION_CONFIG_KEYS.includes(key)) throw new TypeError('未知的 Agent 协作配置项。');
+      const minimum = key === 'maxConcurrentAgents' ? 1 : 0;
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < minimum)) {
+        throw new TypeError(`Agent 协作配置必须是大于或等于 ${minimum} 的整数。`);
+      }
+      const definition = this.toolDefinitions.find((tool) => tool.name === SUB_AGENT_TOOL_NAME);
+      if (!definition?.configSchema?.fields.some((field) => field.key === key)) return;
+      const local = this.localPolicyFor(scopeKind, scopeId).policy;
+      if (value === undefined && local?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key] === undefined) return;
+      const current = local ?? this.effectivePolicyFor(scopeKind, scopeId).policy;
+      if (!current) return;
+      // A field override must not freeze unrelated inherited tool configuration.
+      const configs = cloneToolConfigs(local?.toolConfigs) ?? {};
+      const entry = configs[SUB_AGENT_TOOL_NAME] ?? { config: {} };
+      if (value === undefined) delete entry.config[key];
+      else entry.config[key] = value;
+      if (Object.keys(entry.config).length === 0 && Object.keys(entry).length === 1) delete configs[SUB_AGENT_TOOL_NAME];
+      else configs[SUB_AGENT_TOOL_NAME] = entry;
+      this.setPolicyForScope(scopeKind, scopeId, current.allowedTools, current.name, configs, cloneSourceConfigs(local?.sourceConfigs), local?.preset);
+    },
     localPolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ToolPolicyResolution {
       const clientState = useClientStateStore();
       const link = latestLink(clientState.toolPolicyScopeLinks.filter((candidate) => scopeLinkMatches(candidate, scopeKind, scopeId)));

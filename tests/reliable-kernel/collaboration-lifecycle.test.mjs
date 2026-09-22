@@ -1,0 +1,120 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const kernel = require(path.resolve('dist/extension/backend/reliableKernel/index.js'));
+const NOW = '2026-09-22T00:00:00.000Z';
+const row = (domain, value) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(value);
+async function withRuntime(body) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-collaboration-lifecycle-'));
+  let database;
+  try {
+    const fixture = await kernel.resetCandidateRuntimeRoot(directory);
+    database = await kernel.RuntimeDatabase.open(fixture.authority, { hostBootId: 'collaboration-lifecycle-test' });
+    const store = new kernel.ContentAddressedStore(fixture.authority, fixture.binding);
+    await database.transaction(['sender','target','unrelated'].map(id => row('Conversation', { id, title: id, status: 'active', created_at: NOW, updated_at: NOW })));
+    return await body({ database, store });
+  } finally { if (database) await database.close(); await fs.rm(directory, { recursive: true, force: true }); }
+}
+async function seedMessage(database, id, mode = 'message', target = 'target') {
+  await database.transaction([
+    kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode, created_at: NOW }, { column: 'message_seq', scope: {} }),
+    row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: 'sender', source_kind: 'user', source_key: id, turn_id: null, tool_call_id: null, created_at: NOW }),
+    row('RuntimeInboxItem', { id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message', source_id: id, state: 'available', created_at: NOW, updated_at: NOW }),
+    row('CollaborationMessageTargetLink', { id: `${id}-target`, message_id: id, conversation_id: target, inbox_item_id: `${id}-inbox`, anchor_turn_id: null, created_at: NOW }),
+    row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: target, target_turn_id: null, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: NOW, updated_at: NOW })
+  ]);
+}
+async function get(database, domain, id) { return (await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0]; }
+
+test('idle message retains history without retaining owner; target deletion settles delivery and directed permission only', async () => withRuntime(async ({ database }) => {
+  await seedMessage(database, 'silent');
+  await seedMessage(database, 'other', 'message', 'unrelated');
+  await database.transaction([row('ConversationCommunicationLink', { id: 'permission', source_conversation_id: 'sender', target_conversation_id: 'target', allow_read: 1n, allow_send: 1n, allow_wake: 0n, command_id: 'allow', created_at: NOW, updated_at: NOW })]);
+  assert.equal(await database.hasConversationRuntimeWork('target'), false);
+  const snapshot = (await database.clientProjectionSnapshot('target')).snapshot.subagentDeliverySummary;
+  assert.deepEqual(snapshot.collaborationMessages.map(value => value.id), ['silent']);
+  assert.equal(snapshot.collaborationMessageSourceLinks[0].conversation_id, 'sender');
+  assert.equal(snapshot.collaborationMessages[0].content_object_id, undefined);
+  await new kernel.ConversationDeletionControlPlane(database).delete('target');
+  assert.equal(await get(database, 'Conversation', 'target'), null);
+  assert.equal(await get(database, 'ConversationCommunicationLink', 'permission'), null);
+  assert.equal((await get(database, 'RuntimeDelivery', 'silent-delivery')).failure_reason, 'target-gone');
+  assert.ok(await get(database, 'CollaborationMessage', 'silent'));
+  assert.ok(await get(database, 'RuntimeInboxItem', 'silent-inbox'));
+  assert.equal((await get(database, 'RuntimeDelivery', 'other-delivery')).state, 'pending');
+}));
+
+test('target deletion closes pending request and wake without touching sender or immutable message', async () => withRuntime(async ({ database }) => {
+  await seedMessage(database, 'followup', 'followup');
+  await database.transaction([
+    row('CollaborationBudget', { id: 'budget', origin_kind: 'user', origin_key: 'manual-command', authority_turn_id: 'historical-turn', created_at: NOW }),
+    row('CollaborationRequest', { id: 'request', message_id: 'followup', budget_id: 'budget', automatic: 0n, state: 'pending', created_at: NOW, updated_at: NOW }),
+    row('RuntimeDeliveryWake', { id: 'wake', delivery_id: 'followup-delivery', state: 'pending', claim_owner_host_boot_id: null, claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n, next_attempt_at: NOW, last_error: null, acknowledged_at: null, created_at: NOW, updated_at: NOW })
+  ]);
+  assert.equal(await database.hasConversationRuntimeWork('target'), true);
+  await new kernel.ConversationDeletionControlPlane(database).delete('target');
+  assert.equal((await get(database, 'CollaborationRequest', 'request')).state, 'failed');
+  assert.equal((await get(database, 'RuntimeDeliveryWake', 'wake')).state, 'dead_letter');
+  assert.ok(await get(database, 'Conversation', 'sender'));
+  assert.ok(await get(database, 'CollaborationMessage', 'followup'));
+}));
+
+test('board root deletion removes channel posts and replies while unrelated board stays intact', async () => withRuntime(async ({ database, store }) => {
+  const content = await store.ingest(database, 'board content', 'text/plain');
+  const steps = [];
+  for (const [id, root] of [['channel', 'target'], ['other-channel', 'unrelated']]) {
+    steps.push(row('CollaborationBoardChannel', { id, name: id, created_at: NOW }), row('CollaborationBoardChannelScopeLink', { id: `${id}-scope`, channel_id: id, root_conversation_id: root, created_at: NOW }));
+  }
+  for (const [id, channel] of [['post', 'channel'], ['reply', 'channel'], ['other-post', 'other-channel']]) {
+    steps.push(row('CollaborationBoardPost', { id, content_object_id: content.id, character_count: 13n, created_at: NOW }), row('CollaborationBoardPostChannelLink', { id: `${id}-channel`, post_id: id, channel_id: channel, created_at: NOW }), row('CollaborationBoardPostSourceLink', { id: `${id}-source`, post_id: id, source_kind: 'user', source_key: id, conversation_id: 'sender', source_turn_id: null, source_tool_call_id: null, created_at: NOW }));
+  }
+  steps.push(row('CollaborationBoardReplyLink', { id: 'reply-link', post_id: 'reply', thread_id: 'post', created_at: NOW }));
+  await database.transaction(steps);
+  await new kernel.ConversationDeletionControlPlane(database).delete('target');
+  assert.equal(await get(database, 'CollaborationBoardPost', 'post'), null);
+  assert.equal(await get(database, 'CollaborationBoardPost', 'reply'), null);
+  assert.equal(await get(database, 'CollaborationBoardChannel', 'channel'), null);
+  assert.ok(await get(database, 'CollaborationBoardPost', 'other-post'));
+  assert.ok(await get(database, 'ContentObject', content.id));
+}));
+
+
+test('live collaboration feed includes only source and destination envelopes', async () => withRuntime(async ({ database }) => {
+  const feed = new kernel.BoundedClientFeed(database);
+  const received = [];
+  try {
+    const connection = await feed.connect({ activeConversationId: 'target', send: message => received.push(message) });
+    feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: received[0].messageSeq });
+    await seedMessage(database, 'visible-live');
+    await new Promise(resolve => setImmediate(resolve));
+    const update = received.at(-1);
+    assert.equal(update.type, 'reliable-kernel.changes');
+    assert.ok(update.changes.some(change => change.type === 'CollaborationMessage' && change.id === 'visible-live'));
+    assert.ok(update.changes.some(change => change.type === 'CollaborationMessageSourceLink'));
+    assert.ok(update.changes.some(change => change.type === 'CollaborationMessageTargetLink'));
+    feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: update.messageSeq });
+    const before = received.length;
+    await seedMessage(database, 'not-visible-live', 'message', 'unrelated');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(received.length, before);
+  } finally { feed.close(); }
+}));
+
+test('collaboration request and permission identities cannot be rewritten', () => {
+  assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('CollaborationRequest').update('request', { message_id: 'other' }), /immutable|not mutable|cannot|not allowed/);
+  assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink').update('permission', { target_conversation_id: 'other' }), /immutable|not mutable|cannot|not allowed/);
+});
+
+test('collaboration snapshot bounds messages by durable sequence even at identical timestamps', async () => withRuntime(async ({ database }) => {
+  for (let index = 0; index < 35; index += 1) await seedMessage(database, `seq-${35 - index}`);
+  const summary = (await database.clientProjectionSnapshot('target')).snapshot.subagentDeliverySummary;
+  assert.equal(summary.collaborationMessages.length, 32);
+  assert.equal(summary.collaborationMessages[0].id, 'seq-1');
+  assert.equal(summary.collaborationMessages.at(-1).id, 'seq-32');
+  assert.equal(summary.collaborationMessageSourceLinks.length, 32);
+  assert.equal(summary.collaborationMessageTargetLinks.length, 32);
+}));
