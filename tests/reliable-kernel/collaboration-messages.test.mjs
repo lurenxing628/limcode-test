@@ -247,6 +247,85 @@ test('the durable wake scanner starts exactly one followup while idle messages s
   } finally { await scanner.dispose(); }
 }));
 
+async function endTurn(f, turnId) {
+  await f.database.transaction([repo('Turn').update(turnId, { status: 'terminated', terminal_at: NOW, updated_at: NOW }), repo('TurnTermination').insert({ id: `${turnId}-done`, turn_id: turnId, terminal_status: 'completed', reason: 'finished', created_at: NOW })]);
+}
+
+test('a queued followup waits for the running target Turn and then starts exactly one new Turn', async () => fixture(async f => {
+  const accepted = await f.collaboration.send({ source: await f.source('queued-followup'), targetConversationId: 'root', text: 'queued work', mode: 'followup', queueBehindActiveTurn: true });
+  const delivery = await f.get('RuntimeDelivery', accepted.deliveryId);
+  assert.equal(delivery.phase, 'next_turn');
+  assert.equal(delivery.target_turn_id, null);
+  assert.equal((await f.rows('CollaborationMessageTargetLink', { message_id: accepted.messageId }))[0].anchor_turn_id, 'root-turn');
+  const decision = await new AutomaticRuntimeDeliveryRouter(f.database).resolve({ inboxItemId: accepted.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-turn' });
+  assert.equal(decision.reason, 'collaboration_queued_behind_active_turn');
+  assert.equal(decision.phase, 'next_turn');
+  assert.equal(decision.targetTurnId, null);
+  await f.deliveries.advance(accepted.deliveryId);
+  const wakes = [];
+  const errors = [];
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, onError: detail => errors.push(detail), wakeHandler: async request => {
+    wakes.push(request);
+    if (request.action === 'start_continuation') await admitPending(f, 'root', 'root-next');
+    return { acknowledged: true };
+  } });
+  try {
+    const [before] = await f.rows('RuntimeDeliveryWake', { delivery_id: accepted.deliveryId });
+    await scanner.scanNow();
+    await scanner.scanNow();
+    assert.equal(wakes.length, 0, 'the running target is neither resumed nor continued');
+    assert.deepEqual(await f.get('RuntimeDeliveryWake', before.id), before, 'waiting leaves the wake row untouched');
+    assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).state, 'pending');
+    assert.equal((await f.rows('PendingTurnInput', { turn_id: 'root-turn' })).length, 0, 'never injected into the running Turn');
+    await endTurn(f, 'root-turn');
+    await scanner.scanNow();
+    await scanner.scanNow();
+    assert.equal(errors.length, 0, errors.map(detail => String(detail.error)).join('\n'));
+    assert.deepEqual(wakes.map(request => [request.action, request.conversationId, request.childExecutionId ?? null]), [['start_continuation', 'root', null]]);
+    assert.deepEqual((await f.rows('Turn', { conversation_id: 'root' })).map(turn => turn.id).sort(), ['root-next', 'root-turn']);
+    const consumed = await f.get('RuntimeDelivery', accepted.deliveryId);
+    assert.equal(consumed.state, 'consumed');
+    assert.equal(consumed.target_turn_id, 'root-next');
+    assert.equal((await f.rows('CollaborationRequestTurnLink'))[0].turn_id, 'root-next');
+    assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: accepted.deliveryId }))[0].state, 'acknowledged');
+  } finally { await scanner.dispose(); }
+}));
+
+test('a queued plain message waits for the target next Turn without waking it', async () => fixture(async f => {
+  const accepted = await f.collaboration.send({ source: await f.source('queued-message'), targetConversationId: 'root', text: 'queued note', mode: 'message', queueBehindActiveTurn: true });
+  assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).phase, 'next_turn');
+  assert.equal((await f.rows('RuntimeDeliveryWake')).length, 0);
+  await f.deliveries.advance(accepted.deliveryId);
+  assert.equal((await f.rows('PendingTurnInput', { turn_id: 'root-turn' })).length, 0);
+  await endTurn(f, 'root-turn');
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, wakeHandler: async () => assert.fail('A plain message never starts a Turn.') });
+  try { await scanner.scanNow(); } finally { await scanner.dispose(); }
+  assert.equal((await f.rows('Turn', { conversation_id: 'root' })).length, 1);
+  assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).state, 'pending');
+  await admitPending(f, 'root', 'root-later');
+  const consumed = await f.get('RuntimeDelivery', accepted.deliveryId);
+  assert.equal(consumed.state, 'consumed');
+  assert.equal(consumed.target_turn_id, 'root-later');
+}));
+
+test('queueing applies only to a running target and never delays a completion reply to a running requester', async () => fixture(async f => {
+  const request = await f.collaboration.send({ source: await f.source('root-asks-right', 'root'), targetConversationId: 'right', text: 'review this', mode: 'followup', queueBehindActiveTurn: true });
+  assert.equal((await f.rows('CollaborationMessageTargetLink', { message_id: request.messageId }))[0].anchor_turn_id, null, 'an idle target has no Turn to wait for');
+  await admitPending(f, 'right', 'right-next');
+  await endTurn(f, 'right-next');
+  await f.collaboration.completeRequestsForTurn({ turnId: 'right-next', text: 'review result' });
+  const reply = (await f.collaboration.listMessages({ conversationId: 'root' })).messages.find(message => message.sourceKind === 'completion');
+  const target = (await f.rows('CollaborationMessageTargetLink', { message_id: reply.messageId }))[0];
+  assert.equal(target.anchor_turn_id, null);
+  const [delivery] = await f.rows('RuntimeDelivery', { inbox_item_id: target.inbox_item_id });
+  assert.equal(delivery.phase, 'current_turn');
+  assert.equal(delivery.target_turn_id, 'root-turn');
+  assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: delivery.id })).length, 1);
+  await f.deliveries.advance(delivery.id);
+  assert.equal((await f.rows('PendingTurnInput', { turn_id: 'root-turn' })).length, 1, 'the result joins the running requester Turn');
+  await assert.rejects(f.collaboration.send({ source: await f.source('board-queue', 'root', 'root-turn'), targetConversationId: 'left', text: 'x', mode: 'message', queueBehindActiveTurn: 'yes' }), /must be boolean/);
+}));
+
 test('the source execution lease generation fences an otherwise valid live ToolCall', async () => fixture(async f => {
   const { runWithExecutionLeaseFence } = load('executionLeaseFence.js');
   const source = await f.source('fenced-message');

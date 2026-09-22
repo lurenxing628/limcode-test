@@ -304,6 +304,9 @@ export class ProcessCompletionDeliveryControlPlane {
       const wakeId = requirePhaseFId(wake.id, 'RuntimeDeliveryWake.id');
       let claim: DomainRow | null = null;
       try {
+        // Read-only: a send queued behind its target's running Turn stays untouched (no claim,
+        // backoff or failure count) until that Turn's terminal commit triggers the next scan.
+        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) continue;
         const targetConversationId = await this.wakeConversationId(wake);
         if (targetConversationId !== null && !await gate.check(targetConversationId)) continue;
         claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
@@ -320,6 +323,8 @@ export class ProcessCompletionDeliveryControlPlane {
           report.wakesAcknowledged += 1;
         } else if (dispatched.value === 'retry') {
           await this.releaseClaim('RuntimeDeliveryWake', claim);
+        } else if (dispatched.value === 'deferred') {
+          await this.releaseClaim('RuntimeDeliveryWake', claim, { immediate: true });
         }
       } catch (error) {
         report.failures += 1;
@@ -349,6 +354,30 @@ export class ProcessCompletionDeliveryControlPlane {
     } catch {
       // Resolution races surface through the normal reconcile failure path instead.
       return null;
+    }
+  }
+
+  /** True only while a collaboration delivery is still anchored to its target's running Turn. */
+  private async queuedBehindActiveTurn(wake: DomainRow): Promise<boolean> {
+    try {
+      const delivery = await this.maybeGet(
+        'RuntimeDelivery',
+        requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id')
+      );
+      if (!delivery || delivery.state !== 'pending' || delivery.phase !== 'next_turn' || delivery.target_turn_id !== null) return false;
+      const inbox = await this.maybeGet('RuntimeInboxItem', requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id'));
+      if (!inbox || inbox.source_kind !== 'collaboration_message') return false;
+      const messageId = requirePhaseFId(inbox.source_id, 'RuntimeInboxItem.source_id');
+      const [targets, sources] = await Promise.all([
+        this.listRows('CollaborationMessageTargetLink', { message_id: messageId }, 2),
+        this.listRows('CollaborationMessageSourceLink', { message_id: messageId }, 2)
+      ]);
+      if (targets.length !== 1 || sources.length !== 1 || sources[0].source_kind === 'board' || targets[0].anchor_turn_id === null) return false;
+      const anchor = await this.maybeGet('Turn', requirePhaseFId(targets[0].anchor_turn_id, 'CollaborationMessageTargetLink.anchor_turn_id'));
+      return anchor?.status === 'active' && anchor.conversation_id === delivery.target_conversation_id;
+    } catch {
+      // Malformed facts surface through the normal claimed dispatch failure path.
+      return false;
     }
   }
 
@@ -662,7 +691,7 @@ export class ProcessCompletionDeliveryControlPlane {
     }
   }
 
-  private async dispatchWake(wakeInput: DomainRow): Promise<'acknowledged' | 'retry' | 'dead_letter'> {
+  private async dispatchWake(wakeInput: DomainRow): Promise<'acknowledged' | 'retry' | 'dead_letter' | 'deferred'> {
     if (!this.wakeHandler || wakeInput.state !== 'claimed') return 'retry';
     const wakeId = requirePhaseFId(wakeInput.id, 'RuntimeDeliveryWake.id');
     let delivery = await this.requireExisting(
@@ -698,6 +727,8 @@ export class ProcessCompletionDeliveryControlPlane {
       ));
       return 'dead_letter';
     }
+    // The anchor Turn is still running: neither start a continuation nor inject into that Turn.
+    if (delivery.state === 'pending' && reconciled.decision.reason === 'collaboration_queued_behind_active_turn') return 'deferred';
 
     if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending' && delivery.phase === 'next_turn' && delivery.target_turn_id === null) {
       const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));

@@ -23,6 +23,11 @@ export interface CollaborationSendCommand {
   replyToMessageId?: string;
   /** Trusted runtime-only guard for running-member notifications. No idle message is committed. */
   onlyIfRunning?: boolean;
+  /**
+   * Hold the message until the target's currently running Turn ends instead of injecting it at the
+   * next safe boundary. A followup then starts a new Turn; a message joins the target's next Turn.
+   */
+  queueBehindActiveTurn?: boolean;
 }
 export interface CollaborationMessageSummary {
   messageId: string; sourceConversationId: string; targetConversationId: string;
@@ -81,6 +86,9 @@ export class CollaborationControlPlane {
     if (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > MAX_TEXT_BYTES) throw new RangeError(`Collaboration text must contain 1..${MAX_TEXT_BYTES} UTF-8 bytes.`);
     const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
     const source = input.source;
+    if (input.queueBehindActiveTurn !== undefined && typeof input.queueBehindActiveTurn !== 'boolean') throw new TypeError('queueBehindActiveTurn must be boolean.');
+    // Completion replies and board notices always reach a running target; only tool sends may wait.
+    if (input.queueBehindActiveTurn && (source.kind !== 'tool' || input.onlyIfRunning)) throw new Error('Only tool-sourced sends may queue behind a running target Turn.');
     const sourceKey = source.kind === 'tool' ? requirePhaseFId(source.toolCallId, 'toolCallId') : source.kind === 'completion' ? requirePhaseFId(source.requestId, 'requestId') : stablePhaseFId('board_notice', source.postId, targetConversationId);
     const dedupeKey = `collaboration:${source.kind}:${sourceKey}`;
     const messageId = stablePhaseFId('collaboration_message', dedupeKey);
@@ -149,9 +157,11 @@ export class CollaborationControlPlane {
     if (input.mode === 'followup' && !anchor) throw new Error('Start the destination Conversation before sending a followup.');
     const fence = active[0] ? await this.rows('TurnFinalOutputFence', { turn_id: active[0].id }) : [];
     if (input.onlyIfRunning && fence.length) throw new Error('Collaboration notification target has completed its output.');
-    const currentTurnId = active[0] && !fence.length ? String(active[0].id) : null;
+    // A queued send is anchored to the running Turn; routing only proceeds once that Turn has ended.
+    const queuedTurnId = input.queueBehindActiveTurn && active[0] ? String(active[0].id) : null;
+    const currentTurnId = !queuedTurnId && active[0] && !fence.length ? String(active[0].id) : null;
     const now = this.now();
-    const routingSteps: RepositoryTransactionStep[] = currentTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(currentTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: currentTurnId }), DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: currentTurnId })] : active[0] ? [DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fence[0].id), { turn_id: active[0].id })] : [DOMAIN_REPOSITORIES.domain('Turn').assertNone({ conversation_id: targetConversationId, status: 'active' })];
+    const routingSteps: RepositoryTransactionStep[] = queuedTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(queuedTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: queuedTurnId })] : currentTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(currentTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: currentTurnId }), DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: currentTurnId })] : active[0] ? [DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fence[0].id), { turn_id: active[0].id })] : [DOMAIN_REPOSITORIES.domain('Turn').assertNone({ conversation_id: targetConversationId, status: 'active' })];
     const requestId = stablePhaseFId('collaboration_request', messageId);
     const budgetSteps: RepositoryTransactionStep[] = [];
     if (input.mode === 'followup') {
@@ -174,7 +184,7 @@ export class CollaborationControlPlane {
         DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id: messageId, dedupe_key: dedupeKey, mode: input.mode, created_at: now }, { column: 'message_seq', scope: {} }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').insert({ id: stablePhaseFId('collaboration_source', messageId), message_id: messageId, conversation_id: sourceConversationId, source_kind: source.kind, source_key: sourceKey, turn_id: sourceTurn.id, tool_call_id: source.kind === 'tool' ? source.toolCallId : null, board_post_id: source.kind === 'board' ? source.postId : null, created_at: now }),
         DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').insert({ id: inboxItemId, dedupe_key: dedupeKey, source_kind: 'collaboration_message', source_id: messageId, state: 'routed', created_at: now, updated_at: now }),
-        DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').insert({ id: stablePhaseFId('collaboration_target', messageId), message_id: messageId, conversation_id: targetConversationId, inbox_item_id: inboxItemId, anchor_turn_id: source.kind === 'board' ? currentTurnId : null, created_at: now }),
+        DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').insert({ id: stablePhaseFId('collaboration_target', messageId), message_id: messageId, conversation_id: targetConversationId, inbox_item_id: inboxItemId, anchor_turn_id: source.kind === 'board' ? currentTurnId : queuedTurnId, created_at: now }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessagePayloadLink').insert({ id: stablePhaseFId('collaboration_payload', messageId), message_id: messageId, content_object_id: prepared.metadata.id, created_at: now }),
         DOMAIN_REPOSITORIES.domain('RuntimeInboxPayloadLink').insert({ id: stablePhaseFId('runtime_inbox_payload_link', inboxItemId), inbox_item_id: inboxItemId, content_object_id: prepared.metadata.id, created_at: now }),
         ...(replyToMessageId ? [DOMAIN_REPOSITORIES.domain('CollaborationMessageReplyLink').insert({ id: stablePhaseFId('collaboration_reply', messageId), message_id: messageId, request_message_id: replyToMessageId, created_at: now })] : []),

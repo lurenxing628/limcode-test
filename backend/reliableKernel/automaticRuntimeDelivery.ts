@@ -35,6 +35,7 @@ export type AutomaticRuntimeDeliveryReason =
   | 'child_generation_stale_or_terminal'
   | 'collaboration_message_waiting'
   | 'collaboration_followup_requested'
+  | 'collaboration_queued_behind_active_turn'
   | 'collaboration_notification_expired';
 
 export interface AutomaticRuntimeDeliveryDecision {
@@ -441,6 +442,14 @@ export class AutomaticRuntimeDeliveryRouter {
     const anchor = turn ?? turns[0];
     const sourceTurnId = anchor ? String(anchor.id) : input.sourceTurnId;
     if (boardNotice && (!turn || links[0].anchor_turn_id !== turn.id)) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
+    // A send queued behind the target's running Turn is never injected into that Turn. It stays a
+    // next-Turn delivery until the anchor Turn ends; the level-triggered wake then routes it.
+    if (!boardNotice && turn && links[0].anchor_turn_id === turn.id) {
+      steps.push(DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assert(String(links[0].id), { anchor_turn_id: turn.id }),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { status: 'active', conversation_id: input.targetConversationId }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turn.id }));
+      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason: 'collaboration_queued_behind_active_turn', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+    }
     if (!turn) {
       steps.push(DOMAIN_REPOSITORIES.domain('Turn').assertNone({ conversation_id: input.targetConversationId, status: 'active' }));
       if (anchor) steps.push(DOMAIN_REPOSITORIES.domain('Turn').assert(String(anchor.id), { status: anchor.status }));

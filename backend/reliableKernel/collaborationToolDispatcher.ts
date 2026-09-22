@@ -17,7 +17,7 @@ export interface CollaborationToolControlPlane {
   readMessage(input: { conversationId: string; targetConversationId?: string; messageId: string }): Promise<unknown>;
   waitMessages(input: { conversationId: string; afterMessageId?: string; timeoutMs?: number; signal?: AbortSignal }): Promise<unknown>;
   send(input: { source: { kind: 'tool'; turnId: string; toolCallId: string }; targetConversationId: string;
-    text: string; mode: 'message' | 'followup'; replyToMessageId?: string }): Promise<unknown>;
+    text: string; mode: 'message' | 'followup'; replyToMessageId?: string; queueBehindActiveTurn?: boolean }): Promise<unknown>;
 }
 
 export interface CollaborationToolDispatcherDependencies {
