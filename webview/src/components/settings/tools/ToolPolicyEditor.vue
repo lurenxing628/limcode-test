@@ -73,6 +73,12 @@ const visibleTools = computed(() => {
   return builtinTools.value.filter((tool) => toolScope(tool) === scope);
 });
 const visibleEnabledCount = computed(() => visibleTools.value.filter((tool) => isToolEnabled(tool)).length);
+/** A stored tool list on this scope's chain that the backend refuses to compile. */
+const listError = computed(() => store.toolListErrorFor(props.scopeKind, props.scopeId));
+/** This scope's own invalid list blocks every edit that would rewrite it; only a reset repairs it. */
+const editsBlocked = computed(() => props.readonly || listError.value?.own === true);
+/** Any invalid list on the chain blocks tool-list edits, which start from the effective list. */
+const listEditsBlocked = computed(() => props.readonly || !!listError.value);
 /** What the first list saved here adds beyond the tools shown now (global and workflows only). */
 const firstListExtras = computed(() => props.readonly ? [] : store.listSeedExtrasFor(props.scopeKind, props.scopeId));
 /** A built-in read-only Agent or workflow denies every MCP source it does not enable itself. */
@@ -141,8 +147,7 @@ function updateSelectedToolScope(value: string): void {
  * one, so adjusting approval or display never freezes the inherited tool list here.
  */
 function localAllowedTools(): string[] | undefined {
-  const allowed = localResolution.value.policy?.allowedTools;
-  return allowed ? [...allowed] : undefined;
+  return store.ownListFor(props.scopeKind, props.scopeId);
 }
 
 function localPolicyName(): string | undefined {
@@ -158,7 +163,7 @@ function nextAllowed(toolName: string, enabled: boolean): string[] {
 }
 
 function updatePolicyPreset(value: ToolPolicyPresetKind): void {
-  if (props.readonly || selectedPreset.value === value) return;
+  if (editsBlocked.value || selectedPreset.value === value) return;
   if (props.scopeKind === 'global' && value === 'inherit') return;
   store.setPolicyPresetForScope(props.scopeKind, props.scopeId, value);
 }
@@ -173,7 +178,7 @@ function isMcpSourceEnabled(sourceId: string): boolean {
 }
 
 function toggleMcpSource(sourceId: string, enabled: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const nextConfigs = cloneSourceConfigs();
   nextConfigs[sourceId] = {
     ...(nextConfigs[sourceId] ?? {}),
@@ -184,7 +189,7 @@ function toggleMcpSource(sourceId: string, enabled: boolean): void {
 }
 
 function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void {
-  if (props.readonly || tool.source?.kind !== 'mcp' || !tool.source.sourceId) return;
+  if (editsBlocked.value || tool.source?.kind !== 'mcp' || !tool.source.sourceId) return;
   const sourceId = tool.source.sourceId;
   const nextConfigs = cloneSourceConfigs();
   const current = nextConfigs[sourceId] ?? { enabled: true, disabledTools: [] };
@@ -199,7 +204,7 @@ function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void
 
 /** An explicit enable makes the tool the user's own: turning the cross-conversation switch off keeps it. */
 function setToolEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
-  if (props.readonly || enabled === isToolEnabled(tool)) return;
+  if (listEditsBlocked.value || enabled === isToolEnabled(tool)) return;
   if (!enabled) collapseToolConfig(tool.name);
   store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs(),
     undefined, enabled ? store.crossConversationGrantsWithout(props.scopeKind, props.scopeId, [tool.name]) : undefined);
@@ -218,14 +223,14 @@ function collapseToolConfig(toolName: string): void {
 }
 
 function enableAll(): void {
-  if (props.readonly) return;
+  if (listEditsBlocked.value) return;
   const names = builtinTools.value.map((tool) => tool.name);
   store.setPolicyForScope(props.scopeKind, props.scopeId, names, localPolicyName(), cloneToolConfigs(), cloneSourceConfigs(),
     undefined, store.crossConversationGrantsWithout(props.scopeKind, props.scopeId, names));
 }
 
 function disableAll(): void {
-  if (props.readonly) return;
+  if (listEditsBlocked.value) return;
   expandedToolNames.value = [];
   store.setPolicyForScope(props.scopeKind, props.scopeId, [], localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
@@ -349,7 +354,7 @@ function fieldListText(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord)
 }
 
 function updateStringListField(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord, value: string): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const config = sanitizeConfigForTool(tool, {
     ...localConfigForTool(tool),
     [field.key]: value.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean)
@@ -360,7 +365,7 @@ function updateStringListField(tool: ToolDefinitionRecord, field: ToolConfigFiel
 }
 
 function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord, value: ToolConfigValue): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const config = sanitizeConfigForTool(tool, { ...localConfigForTool(tool), [field.key]: value });
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
@@ -370,7 +375,7 @@ function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRec
 type ToolGateSettingKey = 'autoApproveExecution' | 'autoApplyChange' | 'autoSubmitResult';
 
 function updateGateSetting(tool: ToolDefinitionRecord, key: ToolGateSettingKey, value: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
     ...(nextConfigs[tool.name] ?? { config: {} }),
@@ -393,7 +398,7 @@ function nativeAsyncValue(tool: ToolDefinitionRecord): boolean {
 }
 
 function updateNativeAsync(tool: ToolDefinitionRecord, value: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
     ...(nextConfigs[tool.name] ?? { config: {} }),
@@ -411,7 +416,7 @@ function supportsDiffPreview(tool: ToolDefinitionRecord): boolean {
 }
 
 function updateAutoApplyChangeDelay(tool: ToolDefinitionRecord, value: number): void {
-  if (props.readonly || !supportsChangeApply(tool)) return;
+  if (editsBlocked.value || !supportsChangeApply(tool)) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
     ...(nextConfigs[tool.name] ?? { config: {} }),
@@ -430,7 +435,7 @@ function autoApplyChangeDelayValue(tool: ToolDefinitionRecord): number {
 }
 
 function updateDisplayAutoExpand(tool: ToolDefinitionRecord, value: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
     ...(nextConfigs[tool.name] ?? { config: {} }),
@@ -446,7 +451,7 @@ function displayAutoExpandValue(tool: ToolDefinitionRecord): boolean {
 }
 
 function updateDisplayAutoOpenDiffPreview(tool: ToolDefinitionRecord, value: boolean): void {
-  if (props.readonly || !supportsDiffPreview(tool)) return;
+  if (editsBlocked.value || !supportsDiffPreview(tool)) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
     ...(nextConfigs[tool.name] ?? { config: {} }),
@@ -519,6 +524,8 @@ function inputNumber(event: Event): number {
       </div>
     </header>
 
+    <p v-if="listError" class="tool-policy-error" role="alert">{{ listError.text }}</p>
+
     <section v-if="interactionApprovalTools.length > 0" class="tool-policy-preset-section interaction-auto-approval" aria-label="无人值守审批">
       <div class="tool-policy-preset-heading">
         <span>无人值守审批 · Ask / Plan</span>
@@ -529,7 +536,7 @@ function inputNumber(event: Event): number {
           v-for="{ tool, field } in interactionApprovalTools"
           :key="tool.name"
           :model-value="configForTool(tool)[field.key] === true"
-          :disabled="readonly"
+          :disabled="editsBlocked"
           :aria-label="field.label"
           @update:model-value="updateScalarField(tool, field, $event)"
         >
@@ -556,7 +563,7 @@ function inputNumber(event: Event): number {
           class="tool-policy-preset-card"
           :class="{ 'is-selected': selectedPreset === option.value }"
           :aria-checked="selectedPreset === option.value"
-          :disabled="readonly"
+          :disabled="editsBlocked"
           @click="updatePolicyPreset(option.value)"
         >
           <span class="preset-card-indicator" aria-hidden="true"></span>
@@ -578,8 +585,8 @@ function inputNumber(event: Event): number {
           @update:model-value="updateSelectedToolScope"
         />
       </div>
-      <button type="button" :disabled="readonly || tools.length === 0" @click="enableAll">启用全部</button>
-      <button type="button" class="secondary" :disabled="readonly || tools.length === 0" @click="disableAll">禁用全部</button>
+      <button type="button" :disabled="listEditsBlocked || tools.length === 0" @click="enableAll">启用全部</button>
+      <button type="button" class="secondary" :disabled="listEditsBlocked || tools.length === 0" @click="disableAll">禁用全部</button>
       <button v-if="canRestoreDefault || isUsingToolDefaults" type="button" class="secondary" :disabled="!canRestoreDefault" @click="inheritDefaults">继承默认</button>
       <button v-else type="button" class="secondary" :disabled="!canRestoreInheritance" @click="restoreInheritance">恢复继承</button>
     </div>
@@ -598,7 +605,7 @@ function inputNumber(event: Event): number {
             <LcCheckbox
               class="mcp-source-toggle"
               :model-value="isMcpSourceEnabled(group.source.id)"
-              :disabled="readonly || group.source.status !== 'connected' || group.tools.length === 0"
+              :disabled="editsBlocked || group.source.status !== 'connected' || group.tools.length === 0"
               @update:model-value="toggleMcpSource(group.source.id, $event)"
             >
               <span class="mcp-source-copy">
@@ -614,7 +621,7 @@ function inputNumber(event: Event): number {
               :key="tool.name"
               class="mcp-tool-chip"
               :model-value="isToolEnabled(tool)"
-              :disabled="readonly || !isMcpSourceEnabled(group.source.id)"
+              :disabled="editsBlocked || !isMcpSourceEnabled(group.source.id)"
               @update:model-value="toggleMcpSourceTool(tool, $event)"
             >
               <span>{{ tool.source?.originalToolName ?? tool.name }}</span>
@@ -636,7 +643,7 @@ function inputNumber(event: Event): number {
                   class="tool-enable-toggle"
                   size="sm"
                   :model-value="isToolEnabled(tool)"
-                  :disabled="readonly"
+                  :disabled="listEditsBlocked"
                   :aria-label="`${isToolEnabled(tool) ? '禁用' : '启用'}工具 ${tool.name}`"
                   @update:model-value="setToolEnabled(tool, $event)"
                 />
@@ -695,7 +702,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': toolGateValue(tool, 'autoApproveExecution') }"
                           :model-value="toolGateValue(tool, 'autoApproveExecution')"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateGateSetting(tool, 'autoApproveExecution', $event)"
                         >
                           <span class="permission-copy">
@@ -708,7 +715,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': toolGateValue(tool, 'autoApplyChange') }"
                           :model-value="toolGateValue(tool, 'autoApplyChange')"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateGateSetting(tool, 'autoApplyChange', $event)"
                         >
                           <span class="permission-copy">
@@ -721,7 +728,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': displayAutoOpenDiffPreviewValue(tool) }"
                           :model-value="displayAutoOpenDiffPreviewValue(tool)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateDisplayAutoOpenDiffPreview(tool, $event)"
                         >
                           <span class="permission-copy">
@@ -733,7 +740,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': toolGateValue(tool, 'autoSubmitResult') }"
                           :model-value="toolGateValue(tool, 'autoSubmitResult')"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateGateSetting(tool, 'autoSubmitResult', $event)"
                         >
                           <span class="permission-copy">
@@ -745,7 +752,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': nativeAsyncValue(tool) }"
                           :model-value="nativeAsyncValue(tool)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateNativeAsync(tool, $event)"
                         >
                           <span class="permission-copy">
@@ -757,7 +764,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': displayAutoExpandValue(tool) }"
                           :model-value="displayAutoExpandValue(tool)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateDisplayAutoExpand(tool, $event)"
                         >
                           <span class="permission-copy">
@@ -781,7 +788,7 @@ function inputNumber(event: Event): number {
                             max="600"
                             step="1"
                             :value="autoApplyChangeDelayValue(tool)"
-                            :readonly="readonly"
+                            :readonly="editsBlocked"
                             @change="updateAutoApplyChangeDelay(tool, inputNumber($event))"
                           />
                           <span>秒</span>
@@ -801,14 +808,14 @@ function inputNumber(event: Event): number {
                           v-if="field.type === 'stringList' || field.type === 'globList'"
                           :value="fieldListText(tool, field)"
                           :placeholder="field.placeholder"
-                          :readonly="readonly"
+                          :readonly="editsBlocked"
                           rows="3"
                           @change="updateStringListField(tool, field, inputValue($event))"
                         ></textarea>
                         <input
                           v-else-if="field.type === 'number'"
                           :value="configForTool(tool)[field.key] ?? field.defaultValue ?? 0"
-                          :readonly="readonly"
+                          :readonly="editsBlocked"
                           type="number"
                           @change="updateScalarField(tool, field, inputNumber($event))"
                         />
@@ -816,7 +823,7 @@ function inputNumber(event: Event): number {
                           v-else-if="field.type === 'boolean'"
                           class="tool-config-inline-checkbox"
                           :model-value="Boolean(configForTool(tool)[field.key] ?? field.defaultValue)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           :aria-label="field.label"
                           @update:model-value="updateScalarField(tool, field, $event)"
                         />
@@ -825,13 +832,13 @@ function inputNumber(event: Event): number {
                           :model-value="enumValue(tool, field)"
                           :options="enumOptions(field)"
                           :title="field.label"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateScalarField(tool, field, $event)"
                         />
                         <input
                           v-else
                           :value="String(configForTool(tool)[field.key] ?? field.defaultValue ?? '')"
-                          :readonly="readonly"
+                          :readonly="editsBlocked"
                           type="text"
                           @change="updateScalarField(tool, field, inputValue($event))"
                         />
@@ -937,6 +944,16 @@ function inputNumber(event: Event): number {
   display: grid;
   gap: var(--space-3);
   padding-block: var(--space-1);
+}
+
+.tool-policy-error {
+  margin: 0;
+  border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-panel-border));
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  color: var(--vscode-errorForeground);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
 }
 
 .interaction-auto-approval-hint,

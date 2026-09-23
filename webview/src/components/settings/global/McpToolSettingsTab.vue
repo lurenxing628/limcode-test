@@ -45,6 +45,8 @@ const mcpToolsBySource = computed(() => {
   return map;
 });
 const globalPolicy = computed(() => toolPolicyStore.effectivePolicyFor('global').policy);
+/** A hand-edited global list the backend refuses to compile; switches here would rewrite it. */
+const globalListInvalid = computed(() => !!toolPolicyStore.toolListErrorFor('global'));
 const renameServer = computed(() => settings.mcpServers.servers.find((server) => server.id === renameServerId.value));
 const deleteServer = computed(() => settings.mcpServers.servers.find((server) => server.id === deleteServerId.value));
 const mcpBusy = computed(() => loading.value || settings.pendingSettingsSections.mcpServers === true || clientState.mcpToolSources.some((source) => source.status === 'connecting'));
@@ -157,7 +159,7 @@ function isToolGloballyEnabled(tool: ToolDefinitionRecord): boolean {
 
 function setToolGlobalEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
   const sourceId = tool.source?.sourceId;
-  if (!sourceId) return;
+  if (!sourceId || globalListInvalid.value) return;
   const next = cloneSourceConfigs();
   const sourceConfig = next[sourceId] ?? { enabled: true, disabledTools: [] };
   const disabled = new Set(sourceConfig.disabledTools ?? []);
@@ -167,9 +169,8 @@ function setToolGlobalEnabled(tool: ToolDefinitionRecord, enabled: boolean): voi
   // Keep the saved global list state: without a saved list the source settings alone decide, and
   // writing the displayed default list here would create a global ceiling as a side effect.
   const saved = toolPolicyStore.localPolicyFor('global').policy;
-  const allowedTools = saved?.allowedTools && !enabled
-    ? saved.allowedTools.filter((name) => name !== tool.name)
-    : saved?.allowedTools;
+  const ownList = toolPolicyStore.ownListFor('global');
+  const allowedTools = ownList && !enabled ? ownList.filter((name) => name !== tool.name) : ownList;
   toolPolicyStore.setPolicyForScope('global', undefined, allowedTools, saved?.name, saved?.toolConfigs, next);
 }
 
@@ -334,12 +335,14 @@ function toolParametersText(tool: ToolDefinitionRecord): string {
                 <span>工具列表</span>
                 <small>{{ toolsForServer(server.id).length }} 个工具，开关写入全局默认工具策略。</small>
               </header>
+              <p v-if="globalListInvalid" class="mcp-error" role="alert">全局保存的工具列表无效，重置前不能在这里修改工具开关；请到「工具」页用「继承默认」重置全局工具列表。</p>
               <p v-if="toolsForServer(server.id).length === 0" class="mcp-empty">连接成功，但没有发现工具。</p>
               <article v-for="tool in toolsForServer(server.id)" :key="tool.name" class="mcp-tool-item">
                 <div class="mcp-tool-row">
                   <LcCheckbox
                     class="mcp-tool-enable"
                     :model-value="isToolGloballyEnabled(tool)"
+                    :disabled="globalListInvalid"
                     @update:model-value="setToolGlobalEnabled(tool, $event)"
                   >
                     <span>

@@ -335,6 +335,49 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.deepEqual(store.effectivePolicyFor('agent', 'main').policy.allowedTools, []);
     });
 
+    await t.test('手工写坏的工具列表在设置页显示为无效，重置前不能改工具开关，协作提示也不指向上层', async () => {
+      const { default: mcpTab } = await server.ssrLoadModule('/src/components/settings/global/McpToolSettingsTab.vue');
+      const { client, feed, store, bindings, render, messages } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      client.mcpToolSources = [{ id: 'exa', name: 'exa', transportKind: 'stdio', status: 'connected', toolCount: 1 }];
+      feed.records = { AgentConversationLink: { link: { id: 'link', conversation_id: 'below', agent_id: 'agent:custom', role: 'default' } } };
+      const tool = (name) => store.toolDefinitions.find((candidate) => candidate.name === name);
+      for (const malformed of [null, 'read_file']) {
+        client.toolPolicies = [{ id: 'tool-policy:global:global', name: 'Global', allowedTools: malformed, toolConfigs: switchOn }];
+        client.toolPolicyScopeLinks = [{ id: 'tool-policy-scope:global:global', scopeKind: 'global', toolPolicyId: 'tool-policy:global:global', role: 'active', createdAt: 1, updatedAt: 1 }];
+        messages.length = 0;
+        assert.match(await render(toolEditor, { scopeKind: 'global' }), /此范围保存的工具列表无效/, `${JSON.stringify(malformed)} is reported`);
+        const page = await bindings(toolEditor, { scopeKind: 'global' });
+        page.setToolEnabled(tool('read_file'), true);
+        page.setToolEnabled(tool('write'), true);
+        page.enableAll();
+        page.disableAll();
+        page.updateGateSetting(tool('read_file'), 'autoApproveExecution', false);
+        (await bindings(mcpTab, {})).setToolGlobalEnabled(tool('mcp_search'), true);
+        assert.throws(() => store.listSeedFor('global'), /无效/);
+        assert.throws(() => store.setCrossConversationCollaborationForScope('global', undefined, false), /无效/);
+        assert.throws(() => store.setAgentCollaborationFieldForScope('global', undefined, 'maxChildAgentDepth', 2), /无效/);
+        assert.throws(() => store.setPolicyPresetForScope('global', undefined, 'yolo'), /无效/);
+        assert.deepEqual(messages, [], 'nothing rewrites the stored value until it is reset');
+        assert.equal(store.localPolicyFor('global').policy.allowedTools, malformed);
+
+        const collaboration = await render(editor, { scopeKind: 'global' });
+        assert.match(collaboration, /此范围保存的工具列表无效/);
+        assert.doesNotMatch(collaboration, /上层工具策略/, 'the note does not blame an upper layer');
+        assert.doesNotMatch(collaboration, /不含 run_agent/);
+        assert.match(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'below' }), /全局保存的工具列表无效/, 'a scope below names the layer to fix');
+        assert.match(await render(editor, { scopeKind: 'conversation', scopeId: 'below' }), /全局保存的工具列表无效/);
+      }
+
+      // 继承默认 resets the list and keeps the rest; list edits work again from the default set.
+      (await bindings(toolEditor, { scopeKind: 'global' })).inheritDefaults();
+      assert.equal('allowedTools' in messages.at(-1).payload, false);
+      assert.equal(store.localPolicyFor('global').policy.allowedTools, undefined);
+      assert.deepEqual(store.localPolicyFor('global').policy.toolConfigs, switchOn);
+      (await bindings(toolEditor, { scopeKind: 'global' })).setToolEnabled(tool('write'), false);
+      assert.deepEqual(sorted(store.localPolicyFor('global').policy.allowedTools), sorted(['run_agent', 'read_file', 'transfer', ...crossNames]));
+    });
+
     await t.test('全局“继承默认”只去掉全局工具列表，保留开关、审批与 MCP 来源设置', async () => {
       const { client, store, bindings, render, messages } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;

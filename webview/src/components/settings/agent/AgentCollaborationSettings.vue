@@ -49,7 +49,13 @@ const fields = computed(() => AGENT_COLLABORATION_CONFIG_KEYS.flatMap((key) => {
 const scopeLabel = computed(() => SCOPE_LABELS[props.scopeKind]);
 /** A child task only collaborates inside its team; the switch has no effect there. */
 const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
-const canEdit = computed(() => !props.readonly && !!tool.value && !loading.value && (props.scopeKind === 'global' || !!props.scopeId?.trim()));
+/** A stored tool list on this scope's chain that the backend refuses to compile. */
+const listError = computed(() => store.toolListErrorFor(props.scopeKind, props.scopeId));
+/** This scope's own invalid list must not be rewritten by a budget edit; only a reset repairs it. */
+const canEdit = computed(() => !props.readonly && !!tool.value && !loading.value && (props.scopeKind === 'global' || !!props.scopeId?.trim())
+  && listError.value?.own !== true);
+/** The switch edits tool lists from the effective list, so any invalid list on the chain blocks it. */
+const canEditSwitch = computed(() => canEdit.value && !listError.value);
 const spawnToolEnabled = computed(() => store.effectivePolicyFor(props.scopeKind, props.scopeId).policy?.allowedTools.includes(SUB_AGENT_TOOL_NAME) === true);
 const crossConversationField = computed(() => tool.value?.configSchema?.fields.find((field) => field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY));
 const crossConversationOverridden = computed(() => typeof localConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === 'boolean');
@@ -95,12 +101,12 @@ function restoreField(key: AgentCollaborationConfigKey): void {
 }
 
 function setCrossConversation(value: boolean): void {
-  if (!canEdit.value) return;
+  if (!canEditSwitch.value) return;
   store.setCrossConversationCollaborationForScope(props.scopeKind, props.scopeId, value);
 }
 
 function restoreCrossConversation(): void {
-  if (!canEdit.value) return;
+  if (!canEditSwitch.value) return;
   store.setCrossConversationCollaborationForScope(props.scopeKind, props.scopeId, undefined);
 }
 </script>
@@ -113,25 +119,26 @@ function restoreCrossConversation(): void {
     </header>
     <p v-if="scopeKind === 'global'">设置子 Agent 的默认深度和团队预算。Agent、工作流和对话可按各自范围单独配置。</p>
     <p v-else>仅调整当前{{ scopeLabel }}的协作设置；未单独设置的项执行时继承上层策略，下方显示继承来源和值。</p>
+    <p v-if="listError" class="collaboration-note collaboration-error" role="alert">{{ listError.text }}</p>
     <p v-if="crossConversationField && childConversation" class="collaboration-note">子 Agent 对话只在所属团队内协作，不提供跨对话工具，因此这里不显示跨对话协作开关。</p>
     <div v-else-if="crossConversationField" class="collaboration-field">
       <div class="collaboration-field-row">
         <LcCheckbox
           :model-value="crossConversationEnabled"
-          :disabled="!canEdit"
+          :disabled="!canEditSwitch"
           :aria-label="crossConversationField.label"
           @update:model-value="setCrossConversation"
         >{{ crossConversationField.label }}</LcCheckbox>
         <div class="collaboration-field-actions">
           <span>{{ crossConversationOverridden ? (scopeKind === 'global' ? '全局默认' : '本层单独设置') : (scopeKind === 'global' ? '系统默认' : `继承上层 · ${crossConversationInheritedLabel}`) }}</span>
-          <button type="button" :disabled="!canEdit || !crossConversationOverridden" :aria-label="`${crossConversationField.label}：${scopeKind === 'global' ? '恢复默认' : '恢复继承'}`" @click="restoreCrossConversation">{{ scopeKind === 'global' ? '恢复默认 关闭' : '恢复继承' }}</button>
+          <button type="button" :disabled="!canEditSwitch || !crossConversationOverridden" :aria-label="`${crossConversationField.label}：${scopeKind === 'global' ? '恢复默认' : '恢复继承'}`" @click="restoreCrossConversation">{{ scopeKind === 'global' ? '恢复默认 关闭' : '恢复继承' }}</button>
         </div>
       </div>
       <p>{{ crossConversationField.description }}</p>
       <p>开启后提供列出、读取、发送、新建和分支对话五个工具，仅顶层对话可用，不能寻址子 Agent 对话。发送类工具默认自动执行，可在工具设置中逐个改为执行前确认。目标对话正在运行时，消息排队到它本轮结束后再投递。</p>
       <p>当前范围单独保存了工具列表时，开启会把缺少的跨对话工具加入该列表，关闭时再移除这些工具（恢复继承时上层或一起运行的 Agent / 工作流仍开启则保留，在工具设置里手动启用过的工具也不会移除）；没有单独的工具列表时只保存开关，工具列表继续沿用上层与内置设置。</p>
-      <p v-if="crossConversationEnabled && !crossConversationTools.sendTools" class="collaboration-note">当前范围的工具列表不含 run_agent，不会提供发送、新建和分支对话工具；{{ crossConversationTools.available.length > 0 ? `实际可用：${crossConversationTools.available.join('、')}。` : '没有可用的跨对话工具。' }}</p>
-      <p v-if="crossConversationEnabled && crossConversationTools.missing.length > 0" class="collaboration-note">当前范围的工具策略仍未允许 {{ crossConversationTools.missing.join('、') }}（上层工具策略可能已禁用），这些工具不会出现。</p>
+      <p v-if="!listError && crossConversationEnabled && !crossConversationTools.sendTools" class="collaboration-note">当前范围的工具列表不含 run_agent，不会提供发送、新建和分支对话工具；{{ crossConversationTools.available.length > 0 ? `实际可用：${crossConversationTools.available.join('、')}。` : '没有可用的跨对话工具。' }}</p>
+      <p v-if="!listError && crossConversationEnabled && crossConversationTools.missing.length > 0" class="collaboration-note">当前范围的工具策略仍未允许 {{ crossConversationTools.missing.join('、') }}（上层工具策略可能已禁用），这些工具不会出现。</p>
     </div>
     <div v-for="field in fields" :key="field.key" class="collaboration-field">
       <div class="collaboration-field-row">
@@ -167,7 +174,7 @@ function restoreCrossConversation(): void {
       <p v-else>{{ field.description }}</p>
     </div>
     <p class="collaboration-note">这些上限由用户设置，模型不能通过调用参数提高上限。深度调整影响后续新建子 Agent，不中断已有任务；查看、通信、等待和继续已有任务不增加深度。</p>
-    <p v-if="tool && !spawnToolEnabled" class="collaboration-note">当前范围的工具策略已禁用 run_agent；调整协作设置不会自动启用工具。</p>
+    <p v-if="tool && !listError && !spawnToolEnabled" class="collaboration-note">当前范围的工具策略已禁用 run_agent；调整协作设置不会自动启用工具。</p>
   </section>
 </template>
 

@@ -54,6 +54,18 @@ interface ScopeRef {
   scopeId?: string;
 }
 
+/** A stored tool list on a scope's chain that the backend refuses to compile. */
+export interface ToolListError {
+  scopeKind: ToolPolicyScopeKind;
+  scopeId?: string;
+  /** True when the invalid list is the scope's own record, which only a reset can repair. */
+  own: boolean;
+  /** Chinese text for the settings page: what is wrong and where to reset it. */
+  text: string;
+}
+
+const INVALID_OWN_LIST = '此范围保存的工具列表无效，请先重置此范围的工具列表。';
+
 function scopeIdFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string | undefined {
   return scopeKind === 'global' ? undefined : scopeId?.trim();
 }
@@ -189,6 +201,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       if (!definition?.configSchema?.fields.some((field) => field.key === key)) return;
       const local = this.localPolicyFor(scopeKind, scopeId).policy;
       if (value === undefined && local?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key] === undefined) return;
+      const ownList = this.ownListFor(scopeKind, scopeId);
       // A field override must not freeze unrelated inherited tool configuration or the tool list.
       const configs = cloneToolConfigs(local?.toolConfigs) ?? {};
       const entry = configs[SUB_AGENT_TOOL_NAME] ?? { config: {} };
@@ -196,7 +209,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       else entry.config[key] = value;
       if (Object.keys(entry.config).length === 0 && Object.keys(entry).length === 1) delete configs[SUB_AGENT_TOOL_NAME];
       else configs[SUB_AGENT_TOOL_NAME] = entry;
-      this.saveOrDropLocalPolicy(scopeKind, scopeId, local?.allowedTools, configs, undefined);
+      this.saveOrDropLocalPolicy(scopeKind, scopeId, ownList, configs, undefined);
     },
     /**
      * Stores the cross-conversation switch in this scope's run_agent config without changing what
@@ -215,6 +228,10 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       if (!definition?.configSchema?.fields.some((field) => field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY)) return;
       const local = this.localPolicyFor(scopeKind, scopeId).policy;
       if (value === undefined && local?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === undefined) return;
+      // The switch edits this scope's list by what the effective list allows, so an invalid list
+      // anywhere on the chain blocks it until that record is reset.
+      const listError = this.toolListErrorFor(scopeKind, scopeId);
+      if (listError) throw new TypeError(listError.text);
       const configs = cloneToolConfigs(local?.toolConfigs) ?? {};
       const entry = configs[SUB_AGENT_TOOL_NAME] ?? { config: {} };
       if (value === undefined) delete entry.config[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY];
@@ -222,7 +239,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       if (Object.keys(entry.config).length === 0 && Object.keys(entry).length === 1) delete configs[SUB_AGENT_TOOL_NAME];
       else configs[SUB_AGENT_TOOL_NAME] = entry;
 
-      let allowedTools = local?.allowedTools ? [...local.allowedTools] : undefined;
+      let allowedTools = this.ownListFor(scopeKind, scopeId);
       let granted: string[] = [];
       if (allowedTools) {
         const previous = local?.crossConversationGrantedTools ?? [];
@@ -266,6 +283,52 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       const policy = clientState.toolPolicies.find((candidate) => candidate.id === link?.toolPolicyId);
       return { ...(policy ? { policy } : {}), ...(link ? { link } : {}) };
     },
+    /**
+     * This scope's own saved list, for edits that keep it. A stored value the backend refuses to
+     * compile is never rewritten by such an edit: it throws until the record is reset.
+     */
+    ownListFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string[] | undefined {
+      const saved: unknown = this.localPolicyFor(scopeKind, scopeId).policy?.allowedTools;
+      if (saved === undefined) return undefined;
+      if (!Array.isArray(saved) || saved.some((name) => typeof name !== 'string')) throw new TypeError(INVALID_OWN_LIST);
+      return [...saved];
+    },
+    /**
+     * The first stored list on this scope's chain (upper layers, then the scope itself) that the
+     * backend refuses to compile. Every Turn on that chain fails until the record is reset, so the
+     * settings page reports it and blocks tool-list edits instead of showing an empty list.
+     */
+    toolListErrorFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ToolListError | undefined {
+      const own = { scopeKind, scopeId: scopeIdFor(scopeKind, scopeId) };
+      for (const scope of [...this.upperScopesFor(scopeKind, scopeId), own]) {
+        const layer = this.layerFor(scope);
+        if (!layer) continue;
+        try {
+          resolveToolPolicyLayers([layer], []);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          if (scope === own) {
+            const reset = scopeKind === 'global' ? '「继承默认」' : '「恢复继承」';
+            return { ...scope, own: true, text: `此范围保存的工具列表无效：${detail}使用它的对话都无法开始。重置前不能在这里修改工具设置，请在此范围的工具设置里用${reset}重置工具列表。` };
+          }
+          const label = this.scopeLabel(scope);
+          return { ...scope, own: false, text: `${label}保存的工具列表无效：${detail}此范围的对话都无法开始。重置前不能在这里修改工具开关，请到${label}的工具设置里重置。` };
+        }
+      }
+      return undefined;
+    },
+    /** How the settings page names a scope in notes. */
+    scopeLabel(scope: ScopeRef): string {
+      const clientState = useClientStateStore();
+      const id = scopeIdFor(scope.scopeKind, scope.scopeId);
+      switch (scope.scopeKind) {
+        case 'global': return '全局';
+        case 'agent': return `Agent「${clientState.agents.find((agent) => agent.id === id)?.name ?? id}」`;
+        case 'workflow': return `工作流「${clientState.workflows.find((workflow) => workflow.id === id)?.name ?? id}」`;
+        case 'conversation': return '当前对话';
+        case 'run': return '本次运行';
+      }
+    },
     /** The built-in list an Agent or workflow narrows to while its scope saves no list. */
     builtinPolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): BuiltinToolPolicyRecord | undefined {
       if (scopeKind !== 'agent' && scopeKind !== 'workflow') return undefined;
@@ -293,7 +356,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     },
     /**
      * The backend's resolution of these layers. A stored list the backend refuses to compile shows
-     * no tool enabled rather than breaking the settings view.
+     * no tool enabled rather than breaking the settings view; `toolListErrorFor` reports it.
      */
     resolveScopes(scopes: readonly ScopeRef[]): ReturnType<typeof resolveToolPolicyLayers> {
       const clientState = useClientStateStore();
@@ -342,8 +405,10 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
      * upper list would admit an MCP source no layer configures for every Agent.
      */
     listSeedFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string[] {
-      const saved: unknown = this.localPolicyFor(scopeKind, scopeId).policy?.allowedTools;
-      if (Array.isArray(saved)) return saved.filter((name): name is string => typeof name === 'string');
+      const listError = this.toolListErrorFor(scopeKind, scopeId);
+      if (listError) throw new TypeError(listError.text);
+      const saved = this.ownListFor(scopeKind, scopeId);
+      if (saved) return saved;
       const names = new Set(this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools);
       if (scopeKind === 'global' || scopeKind === 'workflow') {
         const clientState = useClientStateStore();
@@ -367,7 +432,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     },
     /** The tools the first list saved at this scope adds beyond what the scope shows today. */
     listSeedExtrasFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string[] {
-      if (this.localPolicyFor(scopeKind, scopeId).policy?.allowedTools !== undefined) return [];
+      if (this.localPolicyFor(scopeKind, scopeId).policy?.allowedTools !== undefined || this.toolListErrorFor(scopeKind, scopeId)) return [];
       const shown = new Set(this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools);
       return this.listSeedFor(scopeKind, scopeId).filter((name) => !shown.has(name)).sort();
     },
@@ -482,7 +547,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       this.setPolicyForScope(
         scopeKind,
         scopeId,
-        local?.allowedTools,
+        this.ownListFor(scopeKind, scopeId),
         local?.name,
         cloneToolConfigs(local?.toolConfigs) ?? {},
         cloneSourceConfigs(local?.sourceConfigs) ?? {},
