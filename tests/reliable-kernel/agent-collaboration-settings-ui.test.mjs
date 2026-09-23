@@ -367,6 +367,16 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
         assert.doesNotMatch(collaboration, /不含 run_agent/);
         assert.match(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'below' }), /全局保存的工具列表无效/, 'a scope below names the layer to fix');
         assert.match(await render(editor, { scopeKind: 'conversation', scopeId: 'below' }), /全局保存的工具列表无效/);
+        // A scope below the invalid list cannot change its tool switches either: a click saves nothing
+        // (a refusal may also throw the same note).
+        const below = await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'below' });
+        const refused = (action) => { try { action(); } catch (error) { assert.match(error.message, /无效/); } };
+        refused(() => below.setToolEnabled(tool('read_file'), false));
+        refused(() => below.setToolEnabled(tool('write'), true));
+        refused(() => below.enableAll());
+        refused(() => below.disableAll());
+        assert.deepEqual(messages, [], 'nothing is saved below the invalid list until it is reset');
+        assert.equal(store.localPolicyFor('conversation', 'below').policy, undefined);
       }
 
       // 继承默认 resets the list and keeps the rest; list edits work again from the default set.
