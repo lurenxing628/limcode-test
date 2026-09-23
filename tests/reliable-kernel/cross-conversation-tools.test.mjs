@@ -142,17 +142,14 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
       mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { throw new Error('External tool calls are forbidden in this fixture.'); } },
       mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
       providers: { resolve(providerId) { return { providerId, async sendFullRequest(request, controls) {
-        if (request.recipe?.compressionMethodKind) {
-          compressionRequests.push(request);
-          await complete(controls, { type: 'compression_result', contents: [{ role: 'user', parts: [{ text: `Synthetic summary ${compressionRequests.length}.` }] }] });
-          return;
-        }
         const [requestRow] = await f.rows('ModelRequest', { id: request.modelRequestId });
         const observedRequest = { ...request, turnId: requestRow.turn_id, signal: controls.signal };
         try {
+          // Every compression request, manual or automatic, is recorded and passes the test's gate.
           if (request.recipe?.kind === 'reliable-context-compression') {
+            compressionRequests.push(request);
             await compressionGate?.(observedRequest, controls.signal);
-            await complete(controls, { type: 'compression_result', contents: [{ role: 'user', parts: [{ text: 'Synthetic compression summary.' }] }] });
+            await complete(controls, { type: 'compression_result', contents: [{ role: 'user', parts: [{ text: `Synthetic summary ${compressionRequests.length}.` }] }] });
             return;
           }
           let start;
