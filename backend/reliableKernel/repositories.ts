@@ -88,6 +88,8 @@ export interface RepositoryAssertExactIdsStep {
   domain: string;
   where: DomainRow;
   expectedIds: string[];
+  /** Fixed inbound collaboration backlog predicate, valid only for RuntimeDelivery. */
+  collaborationBacklog?: true;
 }
 
 export interface RepositoryExpectedUniqueConstraint {
@@ -138,6 +140,11 @@ export interface RepositoryListRead {
   keyset?: RepositoryKeysetCursor;
   /** Fixed mailbox membership predicate, valid only for CollaborationMessage. */
   collaborationConversationId?: string;
+  /**
+   * Fixed inbound collaboration backlog predicate, valid only for RuntimeDelivery: deliveries of
+   * collaboration messages other than completion replies.
+   */
+  collaborationBacklog?: true;
   limit: number;
 }
 
@@ -381,10 +388,14 @@ export class DomainRepository {
     };
   }
 
-  /** Transaction-local assertion that a scoped relation set has exactly these stable row ids. */
-  public assertExactIds(where: DomainRow, expectedIds: readonly string[]): RepositoryAssertExactIdsStep {
+  /**
+   * Transaction-local assertion that a scoped relation set has exactly these stable row ids.
+   * `collaborationBacklog` narrows a RuntimeDelivery set to the inbound collaboration backlog.
+   */
+  public assertExactIds(where: DomainRow, expectedIds: readonly string[], options: { collaborationBacklog?: true } = {}): RepositoryAssertExactIdsStep {
     this.codec.encodeWhere(where);
     if (Object.keys(where).length === 0) throw new TypeError(`${this.name}.assertExactIds requires predicates.`);
+    this.requireCollaborationBacklogScope(options.collaborationBacklog);
     const ids = expectedIds.map((id) => {
       requireId(id);
       return id;
@@ -394,8 +405,14 @@ export class DomainRepository {
       kind: 'assertExactIds',
       domain: this.schema.key,
       where: clonePlainRecord(where),
-      expectedIds: [...ids].sort()
+      expectedIds: [...ids].sort(),
+      ...(options.collaborationBacklog ? { collaborationBacklog: true as const } : {})
     };
+  }
+
+  private requireCollaborationBacklogScope(value: unknown): void {
+    if (value === undefined) return;
+    if (value !== true || this.schema.key !== 'RuntimeDelivery') throw new TypeError('Collaboration backlog scope is only valid for RuntimeDelivery.');
   }
 
   /** Transaction-local assertion that no row matches `where`. */
@@ -437,6 +454,7 @@ export class DomainRepository {
       if (this.schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');
       requireId(options.collaborationConversationId);
     }
+    this.requireCollaborationBacklogScope(options.collaborationBacklog);
     return {
       kind: 'list',
       domain: this.schema.key,
@@ -445,6 +463,7 @@ export class DomainRepository {
       ...(options.afterId ? { afterId: options.afterId } : {}),
       ...(options.keyset ? { keyset: { ...options.keyset } } : {}),
       ...(options.collaborationConversationId ? { collaborationConversationId: options.collaborationConversationId } : {}),
+      ...(options.collaborationBacklog ? { collaborationBacklog: true as const } : {}),
       limit: options.limit
     };
   }

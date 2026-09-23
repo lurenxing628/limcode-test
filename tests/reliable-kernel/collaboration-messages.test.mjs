@@ -612,6 +612,49 @@ test('a target holds at most 16 undelivered collaboration messages from other co
   assert.equal((await crossSend(f, 'd-after-drain', 'peer-d', 'peer-d-turn', 'target-b', 'message')).accepted, true);
 }));
 
+/** Commits `interleave` right before each attempt of a send from `from`, between its reads and its transaction. */
+function interleaveBeforeSendsFrom(f, from, interleave) {
+  const original = f.database.transaction;
+  let busy = false, count = 0;
+  f.database.transaction = async function(steps, ...rest) {
+    if (!busy && steps.some(step => step.kind === 'insert' && step.domain === 'CollaborationMessageSourceLink' && step.row.conversation_id === from)) {
+      busy = true;
+      try { await interleave(count += 1); } finally { busy = false; }
+    }
+    return original.call(this, steps, ...rest);
+  };
+  return { get count() { return count; }, restore() { f.database.transaction = original; } };
+}
+
+test('unrelated delivery activity on the target never refuses a cross-conversation send', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', true]);
+  const now = NOW;
+  // A background Process of B keeps finishing while A sends: each completion is a new pending delivery.
+  const interleaved = interleaveBeforeSendsFrom(f, 'peer-a', async index => f.database.transaction([
+    repo('RuntimeInboxItem').insert({ id: `unrelated-inbox-${index}`, dedupe_key: `unrelated-${index}`, source_kind: 'process_receipt', source_id: `unrelated-receipt-${index}`, state: 'available', created_at: now, updated_at: now }),
+    repo('RuntimeDelivery').insert({ id: `unrelated-delivery-${index}`, inbox_item_id: `unrelated-inbox-${index}`, target_conversation_id: 'target-b', target_turn_id: null, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: now, updated_at: now })
+  ]));
+  try {
+    const sent = await crossSend(f, 'a-note-amid-process-work', 'peer-a', 'peer-a-turn', 'target-b', 'message');
+    assert.equal(sent.accepted, true);
+    assert.equal(interleaved.count, 1, 'the unrelated delivery did not force a retry');
+  } finally { interleaved.restore(); }
+}));
+
+test('a send that keeps losing the backlog race ends with a clear retryable error and writes nothing', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['peer-d', true], ['target-b', true]);
+  const interleaved = interleaveBeforeSendsFrom(f, 'peer-a', index => crossSend(f, `d-interloper-${index}`, 'peer-d', 'peer-d-turn', 'target-b', 'message'));
+  try {
+    await assert.rejects(crossSend(f, 'a-always-raced', 'peer-a', 'peer-a-turn', 'target-b', 'message'), error => {
+      assert.match(error.message, /Nothing was sent; try again/);
+      assert.doesNotMatch(error.message, /assert/i);
+      return true;
+    });
+    assert.equal(interleaved.count, 4, 'every attempt re-read the backlog');
+  } finally { interleaved.restore(); }
+  assert.equal(await f.collaboration.toolCallMessage('a-always-raced'), null);
+}));
+
 function repliesTo(f, conversationId, requestMessageId) {
   return f.collaboration.listMessages({ conversationId }).then(result => result.messages.filter(message => message.replyToMessageId === requestMessageId));
 }

@@ -1163,7 +1163,7 @@ function executeSteps(
       continue;
     }
     if (step.kind === 'assertExactIds') {
-      executeAssertExactIds(database, step.domain, step.where, step.expectedIds);
+      executeAssertExactIds(database, step.domain, step.where, step.expectedIds, step.collaborationBacklog === true);
       continue;
     }
     if (step.kind !== 'savepoint') {
@@ -1254,16 +1254,30 @@ function executeAssertAll(
   }
 }
 
+/**
+ * Deliveries of collaboration messages other than completion replies: the inbound backlog a
+ * cross-conversation send is capped by. Unrelated Process or answer deliveries never enter it.
+ */
+const COLLABORATION_BACKLOG_PREDICATE = 'EXISTS (SELECT 1 FROM runtime_inbox_item AS inbox'
+  + ' JOIN collaboration_message_source_link AS source ON source.message_id = inbox.source_id'
+  + ' WHERE inbox.id = runtime_delivery.inbox_item_id AND inbox.source_kind = \'collaboration_message\''
+  + ' AND source.source_kind <> \'completion\')';
+
 function executeAssertExactIds(
   database: Database.Database,
   domain: string,
   where: DomainRow,
-  expectedIds: readonly string[]
+  expectedIds: readonly string[],
+  collaborationBacklog: boolean
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(domain);
   const encoded = repository.codec.encodeWhere(where);
   const { predicates, parameters } = whereClause(encoded);
   if (predicates.length === 0) throw new Error(`${repository.name} assertExactIds requires predicates.`);
+  if (collaborationBacklog) {
+    if (repository.schema.key !== 'RuntimeDelivery') throw new TypeError('Collaboration backlog scope is only valid for RuntimeDelivery.');
+    predicates.push(COLLABORATION_BACKLOG_PREDICATE);
+  }
   const actualIds = (database.prepare(
     `SELECT id FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} ORDER BY id ASC`
   ).all(parameters) as Array<{ id: unknown }>).map((row) => requireRuntimeId(row.id));
@@ -2523,6 +2537,10 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
     parameters.__keyset_id = requireRuntimeId(read.keyset.id);
     const operator = read.keyset.direction === 'after' ? '>' : '<';
     predicates.push(`(${quote(column.name)} ${operator} @__keyset_value OR (${quote(column.name)} = @__keyset_value AND ${quote('id')} ${operator} @__keyset_id))`);
+  }
+  if (read.collaborationBacklog !== undefined) {
+    if (read.collaborationBacklog !== true || schema.key !== 'RuntimeDelivery') throw new TypeError('Collaboration backlog scope is only valid for RuntimeDelivery.');
+    predicates.push(COLLABORATION_BACKLOG_PREDICATE);
   }
   if (read.collaborationConversationId !== undefined) {
     if (schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');

@@ -76,7 +76,12 @@ export class CollaborationControlPlane {
   public async send(input: CollaborationSendCommand) {
     for (let attempt = 0; ; attempt += 1) {
       try { return await this.sendInternal(input); }
-      catch (error) { if (attempt >= 3 || (!isTransactionAssertionFailure(error) && !sqliteUniqueFailureIncludes(error, ['collaboration_budget.id', 'collaboration_budget.origin_kind, collaboration_budget.origin_key']))) throw error; }
+      catch (error) {
+        const raced = isTransactionAssertionFailure(error) || sqliteUniqueFailureIncludes(error, ['collaboration_budget.id', 'collaboration_budget.origin_kind, collaboration_budget.origin_key']);
+        if (!raced) throw error;
+        // Every attempt re-reads and re-checks: a lasting refusal surfaces as its own clear error.
+        if (attempt >= 3) throw new Error('Other collaboration activity kept changing the target or the followup budget while this was being sent. Nothing was sent; try again.');
+      }
     }
   }
 
@@ -546,20 +551,16 @@ export class CollaborationControlPlane {
   }
   /**
    * Refuses a cross-conversation send while the target already holds the maximum undelivered
-   * collaboration backlog. The exact pending set is asserted so concurrent senders cannot overshoot.
+   * collaboration backlog: pending deliveries of collaboration messages other than completion
+   * replies. Exactly that counted set is asserted, so concurrent senders cannot overshoot while
+   * unrelated Process or answer deliveries never force a retry.
    */
   private async pendingInboundCapacitySteps(targetConversationId: string): Promise<RepositoryTransactionStep[]> {
-    const pending = await this.rows('RuntimeDelivery', { target_conversation_id: targetConversationId, state: 'pending' });
-    let backlog = 0;
-    for (const delivery of pending) {
-      const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
-      if (inbox.source_kind !== 'collaboration_message') continue;
-      const sources = await this.rows('CollaborationMessageSourceLink', { message_id: inbox.source_id });
-      if (sources[0]?.source_kind !== 'completion') backlog += 1;
-    }
     const limit = CROSS_CONVERSATION_LIMITS.maxPendingInboundMessages;
-    if (backlog >= limit) throw new Error(`The target conversation already holds ${limit} undelivered collaboration messages, the most it may queue. Nothing was sent; try again after it has taken them in.`);
-    return [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds({ target_conversation_id: targetConversationId, state: 'pending' }, pending.map((row) => String(row.id)))];
+    const where = { target_conversation_id: targetConversationId, state: 'pending' };
+    const backlog = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('RuntimeDelivery').list({ where, collaborationBacklog: true, limit })])).snapshot[0] as DomainRow[];
+    if (backlog.length >= limit) throw new Error(`The target conversation already holds ${limit} undelivered collaboration messages, the most it may queue. Nothing was sent; try again after it has taken them in.`);
+    return [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds(where, backlog.map((row) => String(row.id)), { collaborationBacklog: true })];
   }
   private async assertReadPermission(caller: string, target: string): Promise<void> {
     await this.existing('Conversation', caller);
