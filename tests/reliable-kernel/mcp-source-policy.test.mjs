@@ -286,3 +286,59 @@ test('every MCP enforcement point named by the contract decides through the shar
   }
   // The behaviour behind each point is pinned above (offering, admission, estimate, gate) and in the settings view tests.
 });
+
+test('MCP tool names do not depend on which server connects first, so a per-tool disable keeps its tool', { timeout: 120000 }, async () => {
+  const { McpRuntimeManager, dedupeMcpToolNames } = load('backend/application/mcpRuntimeManager.js');
+  const { toolAllowedByPolicy } = load('shared/toolPolicyResolution.js');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-mcp-names-'));
+  try {
+    // A real stdio MCP server whose tool names come from its arguments.
+    const script = path.join(root, 'server.cjs');
+    await fs.writeFile(script, `
+const { Server } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/index.js'))});
+const { StdioServerTransport } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/stdio.js'))});
+const { ListToolsRequestSchema } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/types.js'))});
+const server = new Server({ name: 'fixture', version: '1.0.0' }, { capabilities: { tools: {} } });
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: process.argv.slice(2).map(name => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })) }));
+server.connect(new StdioServerTransport());
+`);
+    const config = (id, name, tools, enabled) => ({ id, name, enabled, transport: { kind: 'stdio', command: process.execPath, args: [script, ...tools] }, createdAt: 1, updatedAt: 1 });
+    const servers = [
+      ['mcp-server-a', '搜索服务', ['search']], ['mcp-server-b', '文件工具', ['search']],
+      ['mcp-upper', 'Search!', ['find']], ['mcp-lower', 'search?', ['find']],
+      ['mcp-exa', 'exa', ['search']]
+    ];
+    /** Connects the servers one at a time in this order, as separate refreshes would; returns sourceId/original name -> tool name. */
+    const namesConnectingIn = async (order) => {
+      let settings = { servers: [] };
+      const manager = new McpRuntimeManager({ async loadGlobalSettings() { return { settings }; } });
+      try {
+        for (let count = 1; count <= order.length; count += 1) {
+          const enabled = new Set(order.slice(0, count));
+          settings = { servers: servers.map(([id, name, tools]) => config(id, name, tools, enabled.has(id))) };
+          await manager.refreshFromSettings({ discover: true });
+        }
+        assert.deepEqual(manager.sourceRecords().map(source => source.status), servers.map(() => 'connected'));
+        return Object.fromEntries(dedupeMcpToolNames(manager.runtimeTools(), ['read', 'search', 'run_agent'])
+          .map(tool => [`${tool.declaration.source.sourceId}/${tool.declaration.source.originalToolName}`, tool.declaration.name]));
+      } finally { await manager.dispose(); }
+    };
+    const ids = servers.map(([id]) => id);
+    const forward = await namesConnectingIn(ids);
+    const backward = await namesConnectingIn([...ids].reverse());
+    assert.deepEqual(backward, forward, 'the same tool gets the same name whichever server connected first');
+    assert.equal(new Set(Object.values(forward)).size, Object.keys(forward).length, 'names stay unique');
+    assert.equal(forward['mcp-exa/search'], 'exa_search', 'an ordinary server name keeps its prefix');
+    assert.notEqual(forward['mcp-server-a/search'], forward['mcp-server-b/search']);
+
+    // A per-tool disable saved under one connection order still disables that tool, and only it, under the other.
+    const policy = { allowedTools: [], sourceConfigs: { 'mcp-server-a': { enabled: true, disabledTools: [forward['mcp-server-a/search']] }, 'mcp-server-b': { enabled: true } } };
+    const allowed = (names, key) => toolAllowedByPolicy(policy, { name: names[key], source: { kind: 'mcp', sourceId: key.split('/')[0] } });
+    for (const names of [forward, backward]) {
+      assert.equal(allowed(names, 'mcp-server-a/search'), false);
+      assert.equal(allowed(names, 'mcp-server-b/search'), true);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

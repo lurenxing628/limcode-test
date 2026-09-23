@@ -67,8 +67,11 @@ export class McpRuntimeManager implements McpMemoryConnectionRegistry {
     this.disabledSources.clear();
   }
 
+  /** Connected tools in source-id order, never in the order the servers happened to connect. */
   public runtimeTools(): ToolDefinition[] {
-    return [...this.connections.values()].flatMap((connection) => connection.tools);
+    return [...this.connections.values()]
+      .sort((left, right) => compareSourceIds(left.config.id, right.config.id))
+      .flatMap((connection) => connection.tools);
   }
 
   public async toolAnnotations(serverId: string, toolName: string): Promise<McpToolAnnotations> {
@@ -298,7 +301,7 @@ function mcpToolDeclaration(source: McpServerConfigRecord, tool: Tool): ToolDefi
   return {
     execution: 'runtime',
     declaration: {
-      name: mcpToolDisplayName(source.name, tool.name),
+      name: mcpToolDisplayName(source, tool.name),
       description: tool.description ?? `MCP 工具 ${tool.name}`,
       parameters: tool.inputSchema,
       source: {
@@ -326,19 +329,27 @@ function mcpToolDeclaration(source: McpServerConfigRecord, tool: Tool): ToolDefi
 
 /**
  * AI 可见的工具名：`服务名_原始工具名`。服务名做 slug 保证字符合法，原始工具名保持原样以便和
- * MCP 服务自身文档一致。不含随机 id —— 唯一性由 {@link dedupeMcpToolNames} 在合并时兜底。
+ * MCP 服务自身文档一致。服务名 slug 后为空（例如全是中文）时改用服务的稳定 id，不同服务不会
+ * 因此落到同一个前缀；普通 ASCII 服务名的工具名保持不变。仍然重名时由
+ * {@link dedupeMcpToolNames} 按来源 id 的固定顺序消歧。
  */
-function mcpToolDisplayName(sourceName: string, toolName: string): string {
-  return `${slug(sourceName)}_${toolName}`;
+function mcpToolDisplayName(source: McpServerConfigRecord, toolName: string): string {
+  return `${slug(source.name) || slug(source.id) || 'tool'}_${toolName}`;
 }
 
 /**
- * 就地消歧一批工具定义的名字：遇到与 `reserved`（含内置工具名）或彼此重名时追加 `_2`、`_3`…
+ * 消歧一批工具定义的名字：遇到与 `reserved`（含内置工具名）或彼此重名时追加 `_2`、`_3`…
+ * 按来源 id 排序后再分配后缀（同一来源内保持服务列出的顺序），所以名字只取决于连接着哪些服务，
+ * 与它们连上的先后无关，按名字保存的 disabledTools 和工具列表不会换到别的服务的工具上。
  * 内部的 sourceId / originalToolName 不受影响，仅调整 AI 可见的 `declaration.name`。
  */
 export function dedupeMcpToolNames(tools: ToolDefinition[], reserved: Iterable<string> = []): ToolDefinition[] {
   const used = new Set(reserved);
-  return tools.map((tool) => {
+  const ordered = tools
+    .map((tool, index) => ({ tool, index }))
+    .sort((left, right) => compareSourceIds(sourceIdOf(left.tool), sourceIdOf(right.tool)) || left.index - right.index)
+    .map(({ tool }) => tool);
+  return ordered.map((tool) => {
     const base = tool.declaration.name;
     let name = base;
     for (let suffix = 2; used.has(name); suffix += 1) name = `${base}_${suffix}`;
@@ -396,7 +407,17 @@ async function closeConnection(connection: McpConnection): Promise<void> {
 }
 
 function slug(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'tool';
+  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+}
+
+function sourceIdOf(tool: ToolDefinition): string {
+  const sourceId = tool.declaration.source?.kind === 'mcp' ? tool.declaration.source.sourceId : undefined;
+  return typeof sourceId === 'string' ? sourceId : '';
+}
+
+/** Code-unit order, so the naming order is the same on every machine and locale. */
+function compareSourceIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function messageFromError(error: unknown): string {
