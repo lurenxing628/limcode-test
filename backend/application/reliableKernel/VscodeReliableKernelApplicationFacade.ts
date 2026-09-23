@@ -37,6 +37,7 @@ import type {
   ConversationHistoryPageRecord,
   ConversationHistoryScope,
   ConversationOriginLinkRecord,
+  ExtensionToWebviewMessage,
   GlobalSettingsSection,
   ProjectFolderCandidateRecord,
   SidebarConversationHistoryEntry,
@@ -947,7 +948,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return requireRows(snapshot.snapshot[0], `${domain} list`);
   }
 
-  private broadcast(message: unknown): void {
+  /** Every broadcast is a bridge message of the shared protocol, including its channel. */
+  private broadcast(message: ExtensionToWebviewMessage): void {
     const plain = toStructuredClonePlainData(message, 'reliable configuration broadcast');
     for (const webview of this.webviews.values()) {
       void webview.postMessage(plain).then(undefined, (error) => {

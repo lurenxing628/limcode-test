@@ -63,6 +63,52 @@ test('model profile commit broadcasts only its local scope, never a full configu
   assert.equal(broadcasts[0].payload.sessionId, undefined, 'peer panels cannot reuse the writer session token');
 });
 
+test('every InteractionResult the router posts travels on the control channel', async () => {
+  const posted = [];
+  const rows = {
+    InteractionRequest: { ask: { id: 'ask', request_kind: 'ask_user', status: 'pending' } },
+    ToolCall: {
+      'plain-call': { id: 'plain-call', turn_id: 'turn', tool_name: 'read' },
+      'child-call': { id: 'child-call', turn_id: 'turn', tool_name: 'run_agent' }
+    },
+    Turn: { turn: { id: 'turn', conversation_id: 'conversation' } },
+    Process: { process: { id: 'process' } }
+  };
+  const lists = {
+    InteractionOwnerLink: [{ id: 'owner', request_id: 'ask', turn_id: 'turn' }],
+    InteractionToolCallLink: [{ id: 'link', request_id: 'ask', tool_call_id: 'ask-call' }],
+    ChildExecutionParentLink: [{ id: 'parent', source_tool_call_id: 'child-call', child_execution_id: 'child' }],
+    ProcessOriginLink: [{ id: 'origin', process_id: 'process', tool_call_id: 'plain-call' }]
+  };
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
+    toolHost: { setStateChangeListener() {} },
+    application: {
+      database: { conversationOwners: passthroughConversationOwners() },
+      interactions: { async resolveAskUser() { return { won: true }; } },
+      processes: { async stopOwnedProcess() { return { outcome: 'stopped' }; }, async reconcileProcessExit() {} }
+    },
+    childAgents: { async interruptSubtree() { return { deduplicated: false }; }, async resume() { return true; } },
+    conversations: { async interrupt() { return { ignoredBecauseTerminal: false, coalesced: false }; }, resume() {} }
+  });
+  router.maybeRow = async (domain, id) => rows[domain]?.[id];
+  router.list = async (domain, where) => (lists[domain] ?? []).filter((row) => Object.entries(where).every(([key, value]) => row[key] === value));
+  const send = (type, payload) => router.dispatch('control-client', webview(posted), { id: `${type}-${posted.length}`, type, channel: 'command', payload });
+  await send(protocol.BridgeMessageType.InteractionResolve, { conversationId: 'conversation', interactionRequestId: 'ask', interactionRevision: 1,
+    ownerTurnId: 'turn', decision: 'submit', response: { answer: 'yes' } });
+  await send(protocol.BridgeMessageType.ToolExecutionCancel, { conversationId: 'conversation', toolCallId: 'plain-call' });
+  await send(protocol.BridgeMessageType.ToolExecutionCancel, { conversationId: 'conversation', toolCallId: 'child-call' });
+  await send(protocol.BridgeMessageType.ProcessStop, { conversationId: 'conversation', processId: 'process' });
+  const results = posted.filter((message) => message.type === protocol.BridgeMessageType.InteractionResult);
+  assert.deepEqual(results.map((message) => message.payload.requestType), [
+    'ask_user',
+    protocol.BridgeMessageType.ToolExecutionCancel,
+    protocol.BridgeMessageType.ToolExecutionCancel,
+    protocol.BridgeMessageType.ProcessStop
+  ]);
+  for (const message of results) assert.equal(message.channel, 'control', `${message.payload.requestType} result must be a control message`);
+});
+
 test('stale Turn interrupt is idempotently reported as already_terminal', async () => {
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({
