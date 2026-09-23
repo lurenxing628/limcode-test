@@ -297,9 +297,9 @@ test('the client feed contract states the card placement and pinned-failure boun
   const contract = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'docs/architecture/reliable-kernel/contracts/client-feed.json'), 'utf8'));
   const rule = contract.collaborationProjection.deliveryState as string;
   assert.match(rule, new RegExp('failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent'
-    + '-or-before-the-first-message-when-older-than-every-message-and-nothing-earlier-exists'
+    + '-or-before-the-first-message-when-older-than-every-message-and-message-1-is-loaded-even-with-a-gap-after-it'
     + `-or-among-the-newest-${MAX_PINNED_FAILED_COLLABORATION_CARDS}-pinned-below-every-message`
     + '-when-newer-than-every-message-or-no-message-has-a-creation-time; '));
-  assert.match(rule, /; a-failure-older-than-a-window-with-earlier-history-appears-once-that-history-loads; /);
+  assert.match(rule, /; a-failure-older-than-a-window-that-starts-after-message-1-appears-once-that-history-loads; /);
   assert.match(rule, /a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn/);
 });

@@ -239,3 +239,179 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
     await runtime.close();
   }
 });
+
+/** The rows of one saved message of `target`, linked to its Turn when one is given. */
+function targetMessageRows({ id, seq, role = 'user', turnId, at = NOW, contentId }) {
+  return [
+    row('Message', { id, created_at: at, updated_at: at, deleted_at: null }),
+    row('MessageRevision', { id: `${id}-revision`, message_id: id, revision_seq: 1n, role, content_object_id: contentId, created_at: at }),
+    row('MessageCurrentRevisionLink', { id: `${id}-current`, message_id: id, revision_id: `${id}-revision`, updated_at: at }),
+    row('MessagePartOfConversation', { id: `${id}-member`, conversation_id: 'target', message_id: id, message_seq: BigInt(seq), created_at: at }),
+    ...(turnId ? [row('MessageTurnLink', { id: `${id}-turn`, turn_id: turnId, message_id: id, role, created_at: at })] : [])
+  ];
+}
+
+/** A collaboration message from `sender` to `target`, sent at `at`, with the newest delivery attempt `delivery`. */
+function incomingRows({ id, mode = 'message', at, payloadId, delivery }) {
+  const { state, turnId = null } = delivery;
+  return [
+    kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode, created_at: at }, { column: 'message_seq', scope: {} }),
+    row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: 'sender', source_kind: 'tool', source_key: id, turn_id: null, tool_call_id: null, created_at: at }),
+    row('RuntimeInboxItem', { id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message', source_id: id, state: 'available', created_at: at, updated_at: at }),
+    row('CollaborationMessageTargetLink', { id: `${id}-target`, message_id: id, conversation_id: 'target', inbox_item_id: `${id}-inbox`, anchor_turn_id: null, created_at: at }),
+    row('CollaborationMessagePayloadLink', { id: `${id}-payload`, message_id: id, content_object_id: payloadId, created_at: at }),
+    row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: 'target', target_turn_id: turnId, phase: 'next_turn',
+      attempt_seq: 1n, retry_of_delivery_id: null, state, failure_reason: state === 'failed' ? 'wake-dead-letter' : null, created_at: at, updated_at: at }),
+    ...(state === 'consumed' ? [row('RuntimeDeliveryInputLink', { id: `${id}-input`, delivery_id: `${id}-delivery`, pending_turn_input_id: `${id}-pending-input`, handled_at: at, created_at: at, updated_at: at })] : [])
+  ];
+}
+
+/**
+ * A Runtime of its own for one scenario with the Conversations `target` and `sender`. `seed` returns
+ * the rows of its first transaction; `snapshot()` is the first frame a bounded feed bound to
+ * `target` sends; `details` answers the Webview's detail requests as the extension host does.
+ */
+async function openScenario(name, seed) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-collaboration-${name}-`));
+  let database;
+  const close = async () => {
+    if (database) await database.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  };
+  try {
+    const fixture = await kernel.resetCandidateRuntimeRoot(directory);
+    database = await kernel.RuntimeDatabase.open(fixture.authority, { hostBootId: `collaboration-${name}` });
+    const store = new kernel.ContentAddressedStore(fixture.authority, fixture.binding);
+    const ingest = {
+      message: async (role, text) => (await store.ingest(database, JSON.stringify({ role, parts: [{ text }] }), 'application/vnd.limcode.message+json')).id,
+      payload: async (text) => (await store.ingest(database, text, 'text/vnd.limcode.collaboration-message')).id
+    };
+    await database.transaction([
+      row('Conversation', { id: 'target', title: 'target', status: 'active', created_at: EARLIER, updated_at: EARLIER }),
+      row('Conversation', { id: 'sender', title: '调研对话', status: 'active', created_at: EARLIER, updated_at: EARLIER }),
+      ...await seed(ingest)
+    ]);
+    const snapshot = async () => {
+      const feed = new kernel.BoundedClientFeed(database);
+      const received = [];
+      try {
+        await feed.connect({ activeConversationId: 'target', send: (message) => received.push(message) });
+        return received[0];
+      } finally { feed.close(); }
+    };
+    return { database, ingest, snapshot, details: new kernel.ClientDetailReader(database, store), close };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+/**
+ * Renders the real message list over feed frames. Each `render(scenario, frames)` uses a fresh store
+ * that observes the frames in order and waits until the scenario's Runtime answered every detail
+ * request, so no request timer outlives the test.
+ */
+async function withMessageList(body) {
+  const pinia = await import('pinia');
+  const { createSSRApp, nextTick } = await import('vue');
+  const { renderToString } = await import('@vue/server-renderer');
+  const previousPinia = pinia.getActivePinia();
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const host = { answerDetail: undefined, reads: [] };
+  globalThis.window = {
+    addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout, atob,
+    requestAnimationFrame(callback) { return setTimeout(() => callback(Date.now()), 0); },
+    cancelAnimationFrame(id) { clearTimeout(id); },
+    acquireVsCodeApi() {
+      return {
+        postMessage(message) {
+          const plain = structuredClone(message);
+          if (plain?.type === 'reliable-kernel.detail-request') host.answerDetail(plain);
+        },
+        getState() { return undefined; },
+        setState() {}
+      };
+    }
+  };
+  let server;
+  try {
+    server = await createWebviewSsrServer();
+    const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
+    const { default: messageList } = await server.ssrLoadModule('/src/components/conversation/ReliableMessageList.vue');
+    globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
+    const mount = async (active) => {
+      let setup;
+      const app = createSSRApp(messageList, {}).use(active);
+      app.mixin({ created() { if (this.$.type.__name === messageList.__name) setup = this.$.setupState; } });
+      return { html: await renderToString(app), setup };
+    };
+    /** A store bound to one scenario; `observe(frames)` then `mount()` renders what it holds. */
+    const open = (scenario) => {
+      const active = pinia.createPinia();
+      pinia.setActivePinia(active);
+      const feed = useReliableKernelClientFeedStore();
+      host.answerDetail = (request) => host.reads.push(scenario.details.read({ ...request, conversationId: 'target' }).then(
+        (detail) => feed.observe({ type: 'reliable-kernel.detail-result', requestId: request.requestId, sessionId: request.sessionId, detail }),
+        (error) => feed.observe({ type: 'reliable-kernel.detail-error', requestId: request.requestId, sessionId: request.sessionId, message: String(error?.message ?? error) })
+      ));
+      return {
+        feed,
+        observe: async (...frames) => {
+          for (const frame of frames) feed.observe(frame);
+          await nextTick();
+        },
+        mount: async () => {
+          const mounted = await mount(active);
+          for (let attempt = 0; attempt < 400 && Object.keys(feed.pendingDetails).length > 0; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          await Promise.allSettled(host.reads);
+          assert.deepEqual(Object.keys(feed.pendingDetails), [], 'every detail request was answered');
+          return mounted;
+        }
+      };
+    };
+    await body(open);
+  } finally {
+    await Promise.allSettled(host.reads);
+    pinia.setActivePinia(previousPinia);
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    await server?.close();
+  }
+}
+
+/** Card ids per bucket of the mounted list's collaboration timeline. */
+function placedCards(setup) {
+  const ids = (buckets) => Object.fromEntries(Object.entries(buckets).map(([anchor, cards]) => [anchor, cards.map((card) => card.messageId)]));
+  const timeline = setup.collaborationTimeline;
+  return { before: ids(timeline.beforeMessage), after: ids(timeline.afterMessage), unbound: timeline.unbound.map((card) => card.messageId) };
+}
+
+test('a failed card older than every loaded message is placed by whether message 1 is loaded', async (t) => {
+  await withMessageList(async (open) => {
+    await t.test('a gap after message 1 leaves the card above message 1', async () => {
+      const scenario = await openScenario('gap', async (ingest) => [
+        ...(await Promise.all([1, 2, 3].map(async (seq) => targetMessageRows({ id: `target-${seq}`, seq, contentId: await ingest.message('user', `第 ${seq} 条`) })))).flat(),
+        ...incomingRows({ id: 'failed-early', at: EARLIER, payloadId: await ingest.payload('比第一条消息更早的任务'), delivery: { state: 'failed' } })
+      ]);
+      try {
+        const snapshot = await scenario.snapshot();
+        // Message 2 is missing, as a byte trim that keeps a protected first message leaves the window.
+        const window = snapshot.projections.activeConversationWindow;
+        assert.deepEqual(window.messages.map((message) => message.id), ['target-1', 'target-2', 'target-3']);
+        window.messages = window.messages.filter((message) => message.id !== 'target-2');
+        const view = open(scenario);
+        await view.observe(snapshot);
+        const { html, setup } = await view.mount();
+        assert.equal(setup.hasLoadedFloorGap, true);
+        assert.deepEqual(placedCards(setup), { before: { 'target-1': ['failed-early'] }, after: {}, unbound: [] },
+          'a failure older than message 1 belongs above it whatever the gap holds');
+        assert.match(html, /比第一条消息更早的任务/);
+      } finally { await scenario.close(); }
+    });
+  });
+});

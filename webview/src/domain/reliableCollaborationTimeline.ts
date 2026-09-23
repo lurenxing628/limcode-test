@@ -26,7 +26,7 @@ export interface CollaborationTimelineCard {
 export interface CollaborationTimeline {
   /**
    * Rendered above the anchor message: a delivery that started the anchor Turn, or an incoming
-   * message that failed before every loaded message when nothing earlier exists.
+   * message that failed before every loaded message when message 1 is loaded.
    */
   beforeMessage: Record<string, CollaborationTimelineCard[]>;
   /**
@@ -49,7 +49,7 @@ export const MAX_PINNED_FAILED_COLLABORATION_CARDS = 3;
  * Places each collaboration envelope at the first visible message of the Turn it belongs to: the
  * delivery Turn for incoming messages and the sending Turn for outgoing ones. An incoming message
  * that failed before reaching a Turn sits after the last message created before it was sent, or
- * before the first message when it is older than all of them and nothing earlier exists. Messages
+ * before the first message when it is older than all of them and message 1 is loaded. Messages
  * whose position is outside the loaded window are omitted instead of being shown at a misleading
  * position.
  */
@@ -61,8 +61,8 @@ export function projectCollaborationTimeline(input: {
   /** Conversations this view saw removed; only these (or a deleted status) read as deleted. */
   removedConversationIds: readonly string[];
   /**
-   * The loaded messages begin at the Conversation's first message and have no gap, so nothing
-   * earlier exists that could hold a card older than all of them.
+   * The loaded messages begin at the Conversation's first message, so nothing earlier exists that
+   * could hold a card older than all of them, whatever a later gap holds.
    */
   loadedFromFirstMessage: boolean;
 }): CollaborationTimeline {
@@ -137,8 +137,8 @@ export function projectCollaborationTimeline(input: {
  * Where an incoming message that failed before reaching a Turn goes: after the last loaded message
  * created at or before it was sent; pinned when every loaded message is older, or when there is no
  * send time or no loaded creation time to compare with; before the first message when it is older
- * than every loaded message and nothing earlier exists. Undefined when it predates a loaded window
- * with earlier history, which holds its position.
+ * than every loaded message and message 1 is loaded. Undefined when it predates a loaded window
+ * that starts after message 1: the earlier history holds its position.
  */
 function failedIncomingPlace(
   messages: ReadonlyArray<{ id: string; createdAt?: number }>,
