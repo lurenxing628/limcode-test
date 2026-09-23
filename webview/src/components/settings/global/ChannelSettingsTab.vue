@@ -59,6 +59,7 @@ const providerOptions: SettingsDropdownOption[] = [
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
   'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
+  | 'claudeTurnScopedReminders'
 >>;
 
 const activeConfig = computed(() => settings.activeLlmProviderConfig);
@@ -225,6 +226,8 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
     systemPromptPrefix: modelConfig.systemPromptPrefix,
     promptCache: modelConfig.promptCache,
     ...(modelConfig.nativeResponses ? { nativeResponses: { ...modelConfig.nativeResponses } } : {}),
+    // 模型级配置缺省时跟随渠道，与运行时冻结的取值一致。
+    ...((modelConfig.claudeTurnScopedReminders ?? base?.claudeTurnScopedReminders) === true ? { claudeTurnScopedReminders: true } : {}),
     headers: modelConfig.headers ?? {},
     generationConfig: modelConfig.generationConfig ?? {},
     requestBody: modelConfig.requestBody ?? {},

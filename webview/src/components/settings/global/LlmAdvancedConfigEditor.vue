@@ -38,6 +38,7 @@ const TOKEN_STEP = 1_000;
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
   'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
+  | 'claudeTurnScopedReminders'
 >>;
 
 const props = defineProps<{
@@ -409,6 +410,21 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         @update:model-value="updatePromptCacheTtl"
       />
     </label>
+
+    <div v-if="config.provider === 'claude'" class="global-settings-field stream-field claude-turn-scoped-reminders-field">
+      <span>轮内系统消息提醒</span>
+      <div class="stream-checkbox-row">
+        <LcCheckbox
+          :model-value="config.claudeTurnScopedReminders === true"
+          size="sm"
+          aria-label="每轮提醒改用轮内系统消息"
+          @update:model-value="emit('update-field', { claudeTurnScopedReminders: $event })"
+        >
+          <span class="stream-checkbox-enable">启用</span>
+        </LcCheckbox>
+      </div>
+      <span class="stream-checkbox-text">把每轮提醒改为官方轮内系统消息，保持历史前缀不变，提升缓存命中并保留思考；需要模型与渠道支持轮内系统消息，扩展会自动带上所需 beta 头。渠道明确拒绝时自动退回原来的提醒方式。</span>
+    </div>
 
     <template v-if="config.provider === 'openai-responses'">
       <div class="global-settings-field global-settings-field-wide native-capabilities-field">

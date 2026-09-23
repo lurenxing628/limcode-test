@@ -257,6 +257,7 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, config.provider),
     ...(nativeResponses ? { nativeResponses } : {}),
+    ...(config.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -365,6 +366,7 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
     ...(nativeResponses ? { nativeResponses } : {}),
+    ...(typeof config.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: config.claudeTurnScopedReminders } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -752,6 +754,7 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
     ...(normalizeOpenAIResponsesNativeSettings(config.nativeResponses)
       ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
       : {}),
+    ...(config.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
@@ -778,6 +781,7 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
     ...(normalizeOpenAIResponsesNativeSettings(config.nativeResponses)
       ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
       : {}),
+    ...(typeof config.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: config.claudeTurnScopedReminders } : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
