@@ -10,7 +10,8 @@ import type {
   ContentPart,
   LlmUsageMetadataRecord,
   MessageContent,
-  ModelOutputItemReference
+  ModelOutputItemReference,
+  ProviderContextPart
 } from '../../shared/protocol';
 import type { Emit } from './types';
 
@@ -56,9 +57,57 @@ export function fromUnifiedCompletedContent(
         ...(receivedAsync ? { async: true } : {}),
         ...(outputItem ? { outputItem } : {})
       });
+      continue;
     }
+    // 不透明的 provider 项（如 Responses 普通回复里的服务端 compaction 项）原位保留，随回复存入历史并原样回放。
+    const providerContext = unifiedProviderContextOf(part);
+    if (providerContext) parts.push({ providerContext, ...(outputItem ? { outputItem } : {}) });
   }
   return { role: 'model', parts };
+}
+
+/**
+ * The opaque provider item of a unified part: today the Responses `compaction` output item of an
+ * ordinary reply made with `context_management`, which later requests append as usual
+ * (https://developers.openai.com/api/docs/guides/compaction).
+ */
+function unifiedProviderContextOf(part: unknown): ProviderContextPart['providerContext'] | undefined {
+  if (!isRecord(part) || !isRecord(part.providerContext)) return undefined;
+  const context = part.providerContext;
+  return typeof context.provider === 'string' && typeof context.format === 'string'
+    ? context as unknown as ProviderContextPart['providerContext']
+    : undefined;
+}
+
+/**
+ * Provider items travel as `OutputItemDone { part: { providerContext } }`; the reliable adapter
+ * appends them to the completed reply in event order and drops repeats of the same item.
+ */
+function emitProviderContextParts(
+  requestId: string,
+  parts: readonly unknown[],
+  emit: Emit,
+  nativeChain?: OpenAIResponsesNativeChainContext
+): void {
+  for (const part of parts) {
+    const providerContext = unifiedProviderContextOf(part);
+    if (!providerContext) continue;
+    const outputItem = stampNativeResponse(modelOutputItemFromValue(part), nativeChain);
+    emit({
+      type: LlmEventType.OutputItemDone,
+      payload: { requestId, ...(outputItem ? { outputItem } : {}), part: { providerContext } }
+    });
+  }
+}
+
+/** Splits a chunk's provider items into those before its first other part and the rest, keeping stream order. */
+function splitProviderContextParts(parts: readonly UnifiedPart[]): { leading: UnifiedPart[]; trailing: UnifiedPart[] } {
+  const firstOther = parts.findIndex((part) => !unifiedProviderContextOf(part));
+  const cut = firstOther < 0 ? parts.length : firstOther;
+  return {
+    leading: parts.slice(0, cut).filter((part) => !!unifiedProviderContextOf(part)),
+    trailing: parts.slice(cut).filter((part) => !!unifiedProviderContextOf(part))
+  };
 }
 
 export function emitUnifiedChunk(
@@ -68,6 +117,8 @@ export function emitUnifiedChunk(
   nativeChain?: OpenAIResponsesNativeChainContext
 ): void {
   const outputItem = stampNativeResponse(modelOutputItemFromValue(chunk), nativeChain);
+  const providerContextParts = splitProviderContextParts(chunk.partsDelta ?? []);
+  emitProviderContextParts(requestId, providerContextParts.leading, emit, nativeChain);
   const text = chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
   if (text) emit({
     type: LlmEventType.Delta,
@@ -140,6 +191,8 @@ export function emitUnifiedChunk(
     } });
   }
 
+  emitProviderContextParts(requestId, providerContextParts.trailing, emit, nativeChain);
+
   const outputItemDone = stampNativeResponse(modelOutputItemDoneFromChunk(chunk), nativeChain);
   if (outputItemDone) {
     emit({
@@ -151,6 +204,8 @@ export function emitUnifiedChunk(
 
 export function emitUnifiedResponse(requestId: string, response: UnifiedLLMResponse, emit: Emit): void {
   const parts = response.content?.parts ?? [];
+  // Provider items (the compaction item precedes the other output items) go first.
+  emitProviderContextParts(requestId, parts, emit);
   const visibleText = visibleTextFromParts(parts);
   if (visibleText) emit({ type: LlmEventType.Delta, payload: { requestId, text: visibleText } });
 

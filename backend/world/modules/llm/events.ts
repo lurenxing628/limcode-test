@@ -3,7 +3,8 @@ import type {
   LlmRawErrorInfoRecord,
   LlmUsageMetadataRecord,
   MessageContent,
-  ModelOutputItemReference
+  ModelOutputItemReference,
+  ProviderContextPart
 } from '../../../../shared/protocol';
 import type { OpenAIResponsesNativeEvent } from '../../../../shared/openAIResponsesNative';
 import type { LlmCompactResult } from './contracts';
@@ -88,7 +89,13 @@ export interface LlmThoughtDonePayload extends LlmStreamEpochPayload {
 }
 export interface LlmOutputItemDonePayload extends LlmStreamEpochPayload {
   requestId: string;
-  outputItem: ModelOutputItemReference;
+  /** Output item boundary; absent when the event only delivers `part`. */
+  outputItem?: ModelOutputItemReference;
+  /**
+   * An opaque provider item that belongs in the completed reply, e.g. the Responses `compaction`
+   * item of an ordinary reply; appended in event order, repeats of the same item dropped.
+   */
+  part?: ProviderContextPart;
 }
 export interface LlmToolCallDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;

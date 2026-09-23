@@ -42,7 +42,7 @@ export function toUnifiedRequest(
 ): UnifiedLLMRequest {
   const nativeAsync = nativeCapabilities?.asyncTools === true;
   const contents = providerKind === 'gemini'
-    ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(request.contents))
+    ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(projectGeminiProviderContext(request.contents)))
     : providerKind === 'claude'
       ? projectClaudeThoughtReplay(request.contents)
       : request.contents;
@@ -93,6 +93,36 @@ function isForeignThoughtPart(part: ContentPart, provider: string): boolean {
   if (!isTextPart(part) || part.thought !== true) return false;
   const signature = normalizedSignatureString(part.thoughtSignature);
   return parsePortableThoughtSignature(signature ?? '')?.provider !== provider;
+}
+
+/**
+ * 发给原生 Gemini 时摘掉别家格式的不透明 provider 项（例如 Responses 普通回复里的服务端 compaction 项、
+ * Claude 的 compaction 块）：接入库的 Gemini 编码器会把 `providerContext` 原样抄进 parts，
+ * Gemini 的 Part/Content 没有这个字段，整条请求会被拒。Gemini 自己格式的项保留（目前没有）。
+ * 摘掉后为空的内容整条去掉，不发出空 parts。
+ * Claude 与 OpenAI 兼容格式的编码器本来就不发别家的项（Claude 只还原自己的 compaction 块），不在这里处理。
+ */
+function projectGeminiProviderContext(contents: readonly MessageContent[]): readonly MessageContent[] {
+  let changed = false;
+  const projected: MessageContent[] = [];
+  for (const content of contents) {
+    const contentContext = (content as MessageContent & { providerContext?: unknown }).providerContext;
+    const foreignContentContext = contentContext !== undefined && !isGeminiProviderContext(contentContext);
+    const parts = content.parts.filter((part) => !isProviderContextPart(part) || isGeminiProviderContext(part.providerContext));
+    if (!foreignContentContext && parts.length === content.parts.length) {
+      projected.push(content);
+      continue;
+    }
+    changed = true;
+    if (parts.length === 0) continue;
+    const { providerContext: _foreign, ...rest } = content as MessageContent & { providerContext?: unknown };
+    projected.push({ ...(foreignContentContext ? rest : content), parts });
+  }
+  return changed ? projected : contents;
+}
+
+function isGeminiProviderContext(value: unknown): boolean {
+  return isRecord(value) && value.format === 'gemini';
 }
 
 /**

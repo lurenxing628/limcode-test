@@ -15,6 +15,11 @@ const {
 const {
   toUnifiedRequest
 } = require(path.join(root, 'dist/extension/backend/capabilities/unifiedMessageConversion.js'));
+const {
+  emitUnifiedChunk,
+  emitUnifiedResponse,
+  fromUnifiedCompletedContent
+} = require(path.join(root, 'dist/extension/backend/capabilities/llmStreamEventProjection.js'));
 const { LlmEventType } = require(path.join(root, 'dist/extension/backend/world/modules/llm/events.js'));
 const unified = await import('unified-llm-provider');
 
@@ -813,4 +818,77 @@ test('E5 signatures carried by thought or text parts keep their current handling
   const thoughtDone = events.filter((event) => event.type === LlmEventType.ThoughtDone)
     .map((event) => event.payload.thoughtSignature);
   assert.deepEqual(thoughtDone, ['gemini:SIG_THOUGHT', 'gemini:SIG_TEXT']);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Provider items in ordinary replies (group D, D4): the Responses `compaction` output item of a
+// reply made with `context_management` is kept and replayed as it came
+// (https://developers.openai.com/api/docs/guides/compaction, "append output items as usual").
+
+const RESPONSES_COMPACTION = {
+  provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'compaction',
+  rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'opaque' }
+};
+
+test('D4 completed content keeps provider items in place with their output item', () => {
+  const outputItem = { id: 'cmp_1', ordinal: 0 };
+  const content = fromUnifiedCompletedContent({
+    role: 'model',
+    parts: [
+      { providerContext: RESPONSES_COMPACTION, outputItem },
+      { text: 'answer', outputItem: { id: 'msg_1', ordinal: 1 } }
+    ]
+  });
+  assert.deepEqual(content.parts, [
+    { providerContext: RESPONSES_COMPACTION, outputItem },
+    { text: 'answer', outputItem: { id: 'msg_1', ordinal: 1 } }
+  ]);
+});
+
+test('D4 streamed provider items become OutputItemDone events with the part, in stream order', () => {
+  const events = [];
+  emitUnifiedChunk('request-d4', {
+    textDelta: 'answer',
+    partsDelta: [{ providerContext: RESPONSES_COMPACTION }, { text: 'answer' }, { providerContext: { ...RESPONSES_COMPACTION, rawItem: { type: 'compaction', id: 'cmp_2' } } }]
+  }, (event) => events.push(event));
+  assert.deepEqual(events.map((event) => [event.type, event.payload.part?.providerContext.rawItem.id ?? event.payload.text]), [
+    [LlmEventType.OutputItemDone, 'cmp_1'],
+    [LlmEventType.Delta, 'answer'],
+    [LlmEventType.OutputItemDone, 'cmp_2']
+  ]);
+  assert.deepEqual(events[0].payload, { requestId: 'request-d4', part: { providerContext: RESPONSES_COMPACTION } });
+
+  // A chunk without provider items emits exactly what it did before.
+  const plain = [];
+  emitUnifiedChunk('request-d4', { textDelta: 'answer', partsDelta: [{ text: 'answer' }] }, (event) => plain.push(event));
+  assert.deepEqual(plain, [{ type: LlmEventType.Delta, payload: { requestId: 'request-d4', text: 'answer' } }]);
+});
+
+test('D4 non-streamed provider items are emitted before the visible text', () => {
+  const events = [];
+  emitUnifiedResponse('request-d4', {
+    content: { role: 'model', parts: [{ text: 'answer' }, { providerContext: RESPONSES_COMPACTION }] }
+  }, (event) => events.push(event));
+  assert.deepEqual(events.map((event) => event.type), [LlmEventType.OutputItemDone, LlmEventType.Delta]);
+  assert.deepEqual(events[0].payload.part, { providerContext: RESPONSES_COMPACTION });
+});
+
+test('D4 Gemini drops provider items of other formats and contents left empty', async () => {
+  const contents = await geminiWireContents([
+    userText('q1'),
+    { role: 'model', parts: [{ providerContext: RESPONSES_COMPACTION }, { text: 'answer' }] },
+    { role: 'model', parts: [{ providerContext: { provider: 'anthropic', format: 'claude', itemType: 'compaction', rawItem: { type: 'compaction', content: 's' } } }] },
+    { role: 'model', parts: [{ text: 'kept' }], providerContext: { provider: 'openai', format: 'openai-responses', itemType: 'message', rawItem: {} } },
+    userText('q2')
+  ]);
+  assert.deepEqual(wireShape(contents), ['user:TEXT(q1)', 'model:TEXT(answer)', 'model:TEXT(kept)', 'user:TEXT(q2)']);
+  assert.doesNotMatch(JSON.stringify(contents), /providerContext/);
+});
+
+test('D4 other providers still receive provider items for their own encoders', () => {
+  const history = [userText('q1'), { role: 'model', parts: [{ providerContext: RESPONSES_COMPACTION }, { text: 'answer' }] }];
+  for (const providerKind of ['openai-responses', 'claude', 'openai-compatible']) {
+    const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, providerKind);
+    assert.deepEqual(request.contents.flatMap((content) => content.parts).filter((part) => part.providerContext).length, 1, providerKind);
+  }
 });
