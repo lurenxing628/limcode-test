@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 const root = process.cwd();
 const directory = path.join(root, 'vendor');
 const revision = '7857da99d5faec0865b8a402eb9c9d828f87b114';
-const version = '0.1.37-limcode.3';
+const version = '0.1.37-limcode.4';
 const archive = `unified-llm-provider-${version}.tgz`;
 const patch = 'unified-llm-provider.patch';
 const manifest = path.join(directory, 'provider-debug-provenance.json');

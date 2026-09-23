@@ -4,7 +4,8 @@
 
 - 上游：`https://github.com/Lianues/unified-llm-provider`，许可证 MIT。
 - 基础发布：0.1.37，源码提交 `7857da99d5faec0865b8a402eb9c9d828f87b114`（上游 main，已含 schema 属性名误删、tools 非数组两个修复）。
-- 本地构建：0.1.37-limcode.3，内容如下。
+- 本地构建：0.1.37-limcode.4，内容如下。
+- 完整源码分支已发布在 https://github.com/lurenxing628/unified-llm-provider/tree/limcode/provider-fixes （本目录的补丁即该分支相对基础提交的差异）。
 
 limcode.2 带来的内容（保持不变）：
 - 只读观察接口。
@@ -31,6 +32,11 @@ limcode.3 新增的协议修复（每项在源码注释和测试里写明了官�
   - 保留服务端返回的 assistant `phase`。
   - 服务端 compaction 项只解码一次，并可原样回放。
 - Gemini：请求 URL 对模型 id 做百分号编码。
+
+limcode.4 新增的 GPT-6 家族适配（依据 OpenAI 官方 Using GPT-6 与提示缓存指南，源码注释和测试里写明）：
+- 原生解码模式与 assistant phase 保留分支对 Astra 的判断改为认 GPT-6 家族：`gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna` 及其日期快照。Sol 和 Luna 与 Astra 走同一条原生解码路径。
+- 显式缓存时把顶层 instructions 转为带断点的 developer 消息，适用范围从 Astra 扩到 GPT-5.6 及之后的全部官方 id（`gpt-5.6`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 与 GPT-6 家族，含日期快照）。
+- 网关别名（如 `gpt-6-sol-xhigh`）不外推；其他模型的编码和解码逐字节不变。
 
 文件与命令：
 - `unified-llm-provider.patch`：相对基础提交的完整源码与测试差异，不直接作用于依赖安装目录。
