@@ -282,8 +282,8 @@ test('collaboration snapshot stays bounded by durable sequence even at identical
 
 test('the collaboration snapshot starts from the conversation links, never scans every message, and selects the same rows', async () => {
   const Database = require('better-sqlite3');
-  const { createRuntimeSchemaSql } = require(path.resolve('dist/extension/backend/reliableKernel/schema/domainManifest.js'));
-  const { queryCollaborationMessagesForTurns } = require(path.resolve('dist/extension/backend/reliableKernel/clientProjection.js'));
+  const { createRuntimeSchemaSql } = require(path.join(compiled, 'backend/reliableKernel/schema/domainManifest.js'));
+  const { queryCollaborationMessagesForTurns } = require(path.join(compiled, 'backend/reliableKernel/clientProjection.js'));
   const db = new Database(':memory:');
   try {
     db.defaultSafeIntegers(true);
