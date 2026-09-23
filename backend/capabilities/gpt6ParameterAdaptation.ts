@@ -40,15 +40,19 @@ export function adaptGpt6NoneCapableGenerationConfig(
 /**
  * 编码后请求的最终适配：请求里实际生效的推理强度只要有一个不是 none，就去掉官方要求去掉的采样参数。
  * 全部是 none 时原样返回同一引用（采样参数照常发送）。
+ *
+ * `alwaysReasoning`：Astra 不支持 none，推理始终开启，所以不看强度、一律去掉。Astra 普通请求的采样参数
+ * 已在设置层去掉；这里兜住摘要等按压缩方法自带 generationConfig 编码的请求。
  */
 export function adaptGpt6SamplingForReasoningEffort(
   request: EncodedProviderRequest,
-  provider: LlmProviderKind
+  provider: LlmProviderKind,
+  options: { alwaysReasoning?: boolean } = {}
 ): EncodedProviderRequest {
   const body = request.body;
   if (!isRecord(body)) return request;
   if (provider !== 'openai-responses' && provider !== 'openai-compatible') return request;
-  if (reasoningEffortsInPlay(body, provider).every((effort) => effort === 'none')) return request;
+  if (!options.alwaysReasoning && reasoningEffortsInPlay(body, provider).every((effort) => effort === 'none')) return request;
   const keys = provider === 'openai-compatible' ? CHAT_COMPLETIONS_SAMPLING_KEYS : RESPONSES_SAMPLING_KEYS;
   const presentKeys = keys.filter((key) => Object.prototype.hasOwnProperty.call(body, key));
   // include 只属于 Responses；Chat Completions 没有该字段，原样保留用户配置。

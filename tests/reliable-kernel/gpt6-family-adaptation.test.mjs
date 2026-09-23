@@ -371,6 +371,38 @@ test('Astra 与其他模型的参数适配不变', async () => {
   }
 });
 
+test('Astra 摘要请求：压缩方法自带的采样参数同样去掉；其他模型原样发送', async () => {
+  const { dryRunCompactLlmProvider } = require(path.join(compiledRoot, 'backend/capabilities/llmProvider.js'));
+  const summaryBody = async (provider, model) => {
+    const result = await dryRunCompactLlmProvider({
+      id: `summary-${provider}-${model}`, blockId: 'summary-block', conversationId: 'conversation-gpt6', methodKind: 'llm_summary',
+      methodConfigSnapshot: { id: 'summary-method', name: 'Summary', kind: 'llm_summary', trigger: { mode: 'manual' },
+        llmSummary: { targetTokens: 1000, reasoning: { mode: 'provider_default' }, generationConfig: { temperature: 0.3, topP: 0.9 } },
+        createdAt: 1, updatedAt: 1 },
+      contents: [{ role: 'user', parts: [{ text: 'history to summarize' }] }]
+    }, {
+      settings: async () => providerConfig({
+        provider, model, baseUrl: provider === 'openai-compatible' ? 'https://gateway.example/v1' : OFFICIAL, stream: false
+      }),
+      compressionSettings: async () => undefined
+    });
+    assert.equal(result.kind, 'provider_requests');
+    return JSON.parse(result.calls[0].bodyText);
+  };
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of ['gpt-6-astra', 'gpt-6-astra-2026-09-01']) {
+      const body = await summaryBody(provider, model);
+      assert.equal('temperature' in body, false, `${provider}:${model}`);
+      assert.equal('top_p' in body, false, `${provider}:${model}`);
+    }
+    for (const model of ['gpt-5.5', 'gpt-6-sol-xhigh']) {
+      const body = await summaryBody(provider, model);
+      assert.equal(body.temperature, 0.3, `${provider}:${model}`);
+      assert.equal(body.top_p, 0.9, `${provider}:${model}`);
+    }
+  }
+});
+
 /** 经 Reliable adapter 投影（冻结 authority 快照 + 可选冻结原生 reasoning 配方），再用不同的实时设置 dry-run。 */
 async function frozenWire(model, generationConfig, nativeReasoning, liveThinkingLevel = 'high') {
   let projected;

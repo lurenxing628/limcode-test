@@ -4626,17 +4626,18 @@ function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderReque
 
 /**
  * 编码后请求的最终适配：先按模型族做静态适配（Claude 思考类型；GPT-6 Sol / Luna 按实际推理强度去掉
- * 采样参数），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习），最后为 Claude
+ * 采样参数，Astra 一律去掉），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习），最后为 Claude
  * 轮内系统消息合并 beta 头。
  */
 function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord, claudeTurnScopedReminders = false): T {
   const target = providerRequestTarget(settings);
   const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
-  const gpt6Sampling = isGpt6NoneCapableParameterTarget(settings);
+  const astraSampling = isAstraParameterTarget(settings);
+  const gpt6Sampling = astraSampling || isGpt6NoneCapableParameterTarget(settings);
   return installEncodedRequestPostProcessor(provider, (request) => {
     const adapted = applyLearnedRequestAdaptations(
       claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
-        : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider)
+        : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider, { alwaysReasoning: astraSampling })
           : request,
       target
     );
