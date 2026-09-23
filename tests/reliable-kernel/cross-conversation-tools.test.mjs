@@ -418,6 +418,54 @@ test('a user Turn that wins the race after the anchor ends leaves the queued pee
   } });
 });
 
+test('deleting the target while a followup is queued tells the waiting sender the task could not start', { timeout: 60000 }, async () => {
+  const TASK = 'CROSS_DELETED_TASK_9901';
+  let rootRound = 0, peerFirstTurn, held, release, heardFailure = false;
+  const releaseWake = new Promise(resolve => { release = resolve; });
+  await fixture(async (request, f, start) => {
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === PEER) {
+      assert.equal(peerFirstTurn, undefined, 'the deleted target never starts the task');
+      peerFirstTurn = request.turnId;
+      await f.until(async () => (await f.rows('CollaborationMessageTargetLink', { conversation_id: PEER })).length > 0, 'Root never sent to the running peer.');
+      return answer('Peer finished its own work.');
+    }
+    rootRound += 1;
+    if (rootRound === 1) {
+      await f.until(() => peerFirstTurn, 'Peer never started.');
+      return toolsAnswer(call('list', 'list_conversations'));
+    }
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('send', 'send_conversation_message', { conversationRef: peer.conversationRef, text: TASK, mode: 'followup' }));
+    }
+    if (rootRound === 3) return answer('Waiting for the peer.');
+    heardFailure = /Task could not start: the target conversation was deleted/.test(text);
+    return answer('Noted.');
+  }, async f => {
+    const peer = await f.input(PEER, 'peer-own-work');
+    const root = await f.input(ROOT, 'delegate');
+    await f.terminated(root.turnId);
+    await f.terminated(peer.turnId);
+    await f.until(() => held, 'The queued followup was never dispatched after the anchor ended.');
+    try {
+      await f.app.conversationDeletion.delete(PEER);
+    } finally { release(); }
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'failed', 'The unstartable task was never settled.');
+    const reply = (await f.app.runtime.collaboration.listMessages({ conversationId: ROOT })).messages.find(message => message.sourceKind === 'completion');
+    assert.ok(reply, 'the sender is answered instead of waiting forever');
+    assert.equal(reply.sourceConversationId, PEER);
+    assert.match((await f.app.runtime.collaboration.readMessage({ conversationId: ROOT, messageId: reply.messageId })).text, /^Task could not start: the target conversation was deleted/);
+    const next = await f.input(ROOT, 'any news?');
+    await f.terminated(next.turnId);
+    assert.equal(heardFailure, true, 'the model sees the failure reply in its next Turn');
+  }, { wakeGate: async request => {
+    if (request.conversationId !== PEER || request.action !== 'start_continuation') return;
+    held = request;
+    await releaseWake;
+  } });
+});
+
 test('create_conversation starts a first Turn from a peer task and replaying the call creates nothing new', { timeout: 60000 }, async () => {
   const TASK = 'CROSS_CREATED_TASK_5501';
   const RESULT = 'CROSS_CREATED_RESULT_5502';

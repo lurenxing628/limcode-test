@@ -33,7 +33,10 @@
 
 发送可选择排队到目标本轮结束：目标正在运行时，消息锚定当前 Turn 且不注入该 Turn；该 Turn 结束后，followup 由持久唤醒开启恰好一轮新 Turn，message 随目标下一轮带入。跨对话 followup 还要求整轮独占，见下文「跨对话协作」。完成后自动回送的结果不排队，仍在请求方运行中的 Turn 安全边界注入。
 
-消息正文保存到 CAS；消息、来源、目标、回复关系、任务请求和请求对应 Turn 分别持久化。投递复用 `RuntimeInboxItem`、`RuntimeDelivery`、`RuntimeDeliveryInputLink` 和 `RuntimeDeliveryWake`。一次发送成功只证明消息提交，`handled_at` 才证明目标执行器吸收。重复源命令返回原身份，参数篡改直接拒绝。
+消息正文保存到 CAS；消息、来源、目标、回复关系、任务请求和请求对应 Turn 分别持久化。
+
+followup 的全部投递都失败时（例如排队期间目标对话被删除，或续跑轮次始终无法建立权限），任务从未开始。收敛时沿完成回复的同一路径给请求方发送一条「Task could not start: …」回复，再把请求标为失败，请求方不会一直等待。这条回复没有来源轮次，来源对话可能已经删除；每个请求最多回复一次。
+投递复用 `RuntimeInboxItem`、`RuntimeDelivery`、`RuntimeDeliveryInputLink` 和 `RuntimeDeliveryWake`。一次发送成功只证明消息提交，`handled_at` 才证明目标执行器吸收。重复源命令返回原身份，参数篡改直接拒绝。
 
 协作消息携带明确作者和来源类型，以 provider 的 model/assistant 角色投影，不伪装成 user/system 指令，也不产生新的用户授权。正式子任务答案继续使用自己的 AnswerBridge；跨同伴任务的结果通过独立请求/回复关系返回真正请求者。
 

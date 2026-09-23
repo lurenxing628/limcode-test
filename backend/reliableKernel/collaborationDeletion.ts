@@ -2,7 +2,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 
-/** Deletion owns destination settlement; immutable cross-Conversation message history remains. */
+/** Deletion owns destination delivery settlement; immutable cross-Conversation message history remains. */
 export async function collaborationConversationDeletionSteps(
   database: RuntimeDatabase,
   conversationIds: readonly string[]
@@ -16,17 +16,9 @@ export async function collaborationConversationDeletionSteps(
     const targets = await listAllDomainRows(database, 'CollaborationMessageTargetLink', { conversation_id: conversationId });
     steps.push(DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assertExactIds(
       { conversation_id: conversationId }, targets.map(row => String(row.id))));
+    // A pending request to a deleted target stays pending here: once its deliveries have failed, the
+    // collaboration reconcile tells the requester the task could not start and then fails it.
     for (const target of targets) {
-      const requests = await listAllDomainRows(database, 'CollaborationRequest', { message_id: target.message_id });
-      steps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assertExactIds(
-        { message_id: target.message_id }, requests.map(row => String(row.id))));
-      for (const request of requests) if (request.state === 'pending') {
-        steps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(String(request.id), {
-          state: 'pending', updated_at: request.updated_at
-        }), DOMAIN_REPOSITORIES.domain('CollaborationRequest').update(String(request.id), {
-          state: 'failed', updated_at: now
-        }));
-      }
       const inboxId = String(target.inbox_item_id);
       const deliveries = await listAllDomainRows(database, 'RuntimeDelivery', { inbox_item_id: inboxId, target_conversation_id: conversationId });
       steps.push(DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(inboxId, {

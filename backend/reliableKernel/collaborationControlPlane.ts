@@ -14,7 +14,8 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 const MAX_TEXT_BYTES = 64_000;
 export type CollaborationSource = { kind: 'tool'; turnId: string; toolCallId: string };
-interface CompletionSource { kind: 'completion'; turnId: string; requestId: string }
+/** turnId is null for the failure reply to a task that never started a Turn. */
+interface CompletionSource { kind: 'completion'; turnId: string | null; requestId: string }
 interface BoardSource { kind: 'board'; turnId: string; postId: string; conversationId: string }
 export interface CollaborationSendCommand {
   source: CollaborationSource;
@@ -108,24 +109,30 @@ export class CollaborationControlPlane {
     const inboxItemId = stablePhaseFId('runtime_inbox_item', messageId);
     const deliveryId = stablePhaseFId('runtime_delivery', 'collaboration', messageId);
     const replyToMessageId = input.replyToMessageId ? requirePhaseFId(input.replyToMessageId, 'replyToMessageId') : null;
-    const sourceTurn = await this.existing('Turn', requirePhaseFId(source.turnId, 'turnId'));
-    const sourceConversationId = source.kind === 'board' ? requirePhaseFId(source.conversationId, 'conversationId') : String(sourceTurn.conversation_id);
+    // A failure reply answers a task that never started: no Turn answers it, and the task's target
+    // (the reply's source) may have been deleted meanwhile.
+    const failureReply = source.kind === 'completion' && source.turnId === null;
+    const sourceTurn = source.turnId === null ? null : await this.existing('Turn', requirePhaseFId(source.turnId, 'turnId'));
+    const sourceTurnId = sourceTurn ? String(sourceTurn.id) : null;
+    const sourceConversationId = source.kind === 'board' ? requirePhaseFId(source.conversationId, 'conversationId')
+      : sourceTurn ? String(sourceTurn.conversation_id)
+        : await this.requestTargetConversationId(source.kind === 'completion' ? source.requestId : '');
     if (targetConversationId === sourceConversationId) throw new Error('A collaboration message must target another Conversation.');
     const prepared = await this.contentStore.prepare(this.database, input.text, COLLABORATION_MESSAGE_CONTENT_TYPE);
     const replay = async () => {
       const message = await this.maybe('CollaborationMessage', messageId);
       if (!message) return null;
       const [origins, targets, payloads, replies] = await Promise.all([this.rows('CollaborationMessageSourceLink', { message_id: messageId }), this.rows('CollaborationMessageTargetLink', { message_id: messageId }), this.rows('CollaborationMessagePayloadLink', { message_id: messageId }), this.rows('CollaborationMessageReplyLink', { message_id: messageId })]);
-      if (message.mode !== input.mode || origins.length !== 1 || origins[0].conversation_id !== sourceConversationId || origins[0].turn_id !== sourceTurn.id || targets.length !== 1 || targets[0].conversation_id !== targetConversationId || payloads.length !== 1 || payloads[0].content_object_id !== prepared.metadata.id || (replies[0]?.request_message_id ?? null) !== replyToMessageId) throw new Error('Collaboration send replay conflicts with immutable message facts.');
+      if (message.mode !== input.mode || origins.length !== 1 || origins[0].conversation_id !== sourceConversationId || origins[0].turn_id !== sourceTurnId || targets.length !== 1 || targets[0].conversation_id !== targetConversationId || payloads.length !== 1 || payloads[0].content_object_id !== prepared.metadata.id || (replies[0]?.request_message_id ?? null) !== replyToMessageId) throw new Error('Collaboration send replay conflicts with immutable message facts.');
       // A tool send anchored to a running target Turn waits until that Turn ends.
       const queued = source.kind === 'tool' && targets[0].anchor_turn_id !== null;
       return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued, deduplicated: true };
     };
     const existing = await replay(); if (existing) return existing;
-    if (input.crossConversation) await this.authorizeCrossConversation({ turnId: String(sourceTurn.id), targetConversationId });
+    if (input.crossConversation) await this.authorizeCrossConversation({ turnId: requirePhaseFId(sourceTurnId, 'turnId'), targetConversationId });
     const target = await this.existing('Conversation', targetConversationId);
-    const origin = await this.existing('Conversation', sourceConversationId);
-    if (target.status !== 'active' || origin.status !== 'active') throw new Error('Collaboration requires active Conversations.');
+    const origin = failureReply ? null : await this.existing('Conversation', sourceConversationId);
+    if (target.status !== 'active' || (origin && origin.status !== 'active')) throw new Error('Collaboration requires active Conversations.');
     let sourceSteps: RepositoryTransactionStep[] = [];
     if (source.kind === 'board') {
       const boardSource = await this.one('CollaborationBoardPostSourceLink', { post_id: source.postId });
@@ -134,18 +141,18 @@ export class CollaborationControlPlane {
     }
     if (source.kind === 'tool') {
       const tool = await this.existing('ToolCall', source.toolCallId);
-      if (tool.turn_id !== source.turnId || sourceTurn.status !== 'active' || tool.status === 'terminal') throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
+      if (tool.turn_id !== source.turnId || sourceTurn?.status !== 'active' || tool.status === 'terminal') throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
       sourceSteps = [DOMAIN_REPOSITORIES.domain('Turn').assert(source.turnId, { status: 'active', conversation_id: sourceConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: source.turnId }), DOMAIN_REPOSITORIES.domain('ToolCall').assert(source.toolCallId, { turn_id: source.turnId, status: tool.status })];
     }
-    const sourceScope = await readCollaborationScope(this.database, sourceConversationId);
+    const sourceScope = failureReply ? null : await readCollaborationScope(this.database, sourceConversationId);
     const targetScope = await readCollaborationScope(this.database, targetConversationId);
-    const sourceMember = sourceScope.members.find((entry) => entry.conversationId === sourceConversationId);
+    const sourceMember = sourceScope?.members.find((entry) => entry.conversationId === sourceConversationId);
     if (source.kind === 'tool' && sourceMember?.childExecutionId && sourceMember.status !== 'active') throw new Error('A stopped child cannot initiate collaboration.');
     const targetMember = targetScope.members.find((entry) => entry.conversationId === targetConversationId)!;
     if (targetMember.childExecutionId && !['active', 'idle'].includes(targetMember.status)) throw new Error('Collaboration cannot revive a stopped, closed or starting child task.');
     // Completion replies return a result to the durable requester wherever it lives. Every other
     // source stays inside its derived team; another team's child tasks are never addressable.
-    if (sourceScope.rootConversationId !== targetScope.rootConversationId && source.kind !== 'completion') {
+    if (source.kind !== 'completion' && sourceScope?.rootConversationId !== targetScope.rootConversationId) {
       if (source.kind === 'board') throw new Error('Board notifications cannot cross team roots.');
       if (sourceMember?.childExecutionId || targetMember.childExecutionId) throw new Error('Cross-conversation collaboration cannot address or originate from a child task of another team.');
       if (!input.crossConversation) throw new Error('Cross-conversation collaboration is not enabled.');
@@ -160,9 +167,14 @@ export class CollaborationControlPlane {
       if (!replyToMessageId) throw new Error('Completion requires a durable reply request.');
       const request = await this.existing('CollaborationRequest', source.requestId);
       if (request.message_id !== replyToMessageId) throw new Error('Completion reply request mismatch.');
-      const requestTurn = await this.one('CollaborationRequestTurnLink', { request_id: source.requestId });
-      if (requestTurn.turn_id !== source.turnId) throw new Error('Completion cannot answer a different task generation.');
-      sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: request.state, message_id: replyToMessageId }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assert(String(requestTurn.id), { turn_id: source.turnId }));
+      if (failureReply) {
+        if (request.state !== 'pending' || (await this.rows('CollaborationRequestTurnLink', { request_id: source.requestId })).length) throw new Error('Only a pending task that never started a Turn gets a failure reply.');
+        sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: 'pending', message_id: replyToMessageId }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assertNone({ request_id: source.requestId }));
+      } else {
+        const requestTurn = await this.one('CollaborationRequestTurnLink', { request_id: source.requestId });
+        if (requestTurn.turn_id !== source.turnId) throw new Error('Completion cannot answer a different task generation.');
+        sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: request.state, message_id: replyToMessageId }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assert(String(requestTurn.id), { turn_id: source.turnId }));
+      }
     }
     const turns = await this.rows('Turn', { conversation_id: targetConversationId });
     turns.sort(compareNewest);
@@ -179,7 +191,7 @@ export class CollaborationControlPlane {
     const requestId = stablePhaseFId('collaboration_request', messageId);
     const budgetSteps: RepositoryTransactionStep[] = [];
     if (input.mode === 'followup') {
-      const budget = await this.budgetForTurn(String(sourceTurn.id), sourceScope.rootTurnId);
+      const budget = await this.budgetForTurn(requirePhaseFId(sourceTurnId, 'turnId'), sourceScope?.rootTurnId ?? null);
       const persistedBudget = await this.maybe('CollaborationBudget', String(budget.id));
       if (persistedBudget && (persistedBudget.origin_kind !== budget.origin_kind || persistedBudget.origin_key !== budget.origin_key || persistedBudget.authority_turn_id !== budget.authority_turn_id)) throw new Error('Collaboration budget identity conflicts.');
       if (!persistedBudget) budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationBudget').insert(budget));
@@ -193,10 +205,10 @@ export class CollaborationControlPlane {
     try {
       await this.database.transaction([
         ...preparedContentObjectSteps([prepared], 'collaboration_content'), ...sourceSteps,
-        ...sourceScope.authoritySteps, ...targetScope.authoritySteps, ...routingSteps,
-        DOMAIN_REPOSITORIES.domain('Conversation').assert(sourceConversationId, { status: 'active' }), DOMAIN_REPOSITORIES.domain('Conversation').assert(targetConversationId, { status: 'active' }),
+        ...(sourceScope?.authoritySteps ?? []), ...targetScope.authoritySteps, ...routingSteps,
+        ...(failureReply ? [] : [DOMAIN_REPOSITORIES.domain('Conversation').assert(sourceConversationId, { status: 'active' })]), DOMAIN_REPOSITORIES.domain('Conversation').assert(targetConversationId, { status: 'active' }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id: messageId, dedupe_key: dedupeKey, mode: input.mode, created_at: now }, { column: 'message_seq', scope: {} }),
-        DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').insert({ id: stablePhaseFId('collaboration_source', messageId), message_id: messageId, conversation_id: sourceConversationId, source_kind: source.kind, source_key: sourceKey, turn_id: sourceTurn.id, tool_call_id: source.kind === 'tool' ? source.toolCallId : null, board_post_id: source.kind === 'board' ? source.postId : null, created_at: now }),
+        DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').insert({ id: stablePhaseFId('collaboration_source', messageId), message_id: messageId, conversation_id: sourceConversationId, source_kind: source.kind, source_key: sourceKey, turn_id: sourceTurnId, tool_call_id: source.kind === 'tool' ? source.toolCallId : null, board_post_id: source.kind === 'board' ? source.postId : null, created_at: now }),
         DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').insert({ id: inboxItemId, dedupe_key: dedupeKey, source_kind: 'collaboration_message', source_id: messageId, state: 'routed', created_at: now, updated_at: now }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').insert({ id: stablePhaseFId('collaboration_target', messageId), message_id: messageId, conversation_id: targetConversationId, inbox_item_id: inboxItemId, anchor_turn_id: source.kind === 'board' ? currentTurnId : queuedTurnId, created_at: now }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessagePayloadLink').insert({ id: stablePhaseFId('collaboration_payload', messageId), message_id: messageId, content_object_id: prepared.metadata.id, created_at: now }),
@@ -390,7 +402,7 @@ export class CollaborationControlPlane {
       const deliveries = await this.rows('RuntimeDelivery', { inbox_item_id: target.inbox_item_id });
       const delivery = deliveries.find((row) => row.state === 'consumed' && row.target_turn_id !== null);
       if (!delivery) {
-        if (deliveries.length && deliveries.every((row) => row.state === 'failed')) await this.finishRequest(request, 'failed');
+        if (deliveries.length && deliveries.every((row) => row.state === 'failed')) await this.failUnstartedRequest(request, deliveries);
         continue;
       }
       const links = await this.rows('CollaborationRequestTurnLink', { request_id: request.id });
@@ -422,6 +434,30 @@ export class CollaborationControlPlane {
         throw error;
       }
     }
+  }
+  /**
+   * A task whose every delivery failed never started a Turn (its target was deleted, or no
+   * continuation could be admitted). The requester is told so through the completion reply path
+   * instead of waiting for an answer that cannot come.
+   */
+  private async failUnstartedRequest(request: DomainRow, deliveries: DomainRow[]): Promise<void> {
+    const source = await this.one('CollaborationMessageSourceLink', { message_id: request.message_id });
+    const requester = await this.maybe('Conversation', String(source.conversation_id));
+    if (requester?.status === 'active') {
+      const [latest] = [...deliveries].sort(compareNewest);
+      try {
+        await this.sendInternal({ source: { kind: 'completion', turnId: null, requestId: String(request.id) }, targetConversationId: String(source.conversation_id),
+          text: `Task could not start: ${unstartedTaskReason(latest.failure_reason)}`, mode: 'message', replyToMessageId: String(request.message_id) });
+      } catch (error) {
+        const requesterChildren = await this.rows('ChildExecution', { child_conversation_id: source.conversation_id });
+        if (!requesterChildren.some((child) => !['active', 'idle'].includes(String(child.status)))) throw error;
+      }
+    }
+    await this.finishRequest(request, 'failed');
+  }
+  private async requestTargetConversationId(requestId: string): Promise<string> {
+    const request = await this.existing('CollaborationRequest', requirePhaseFId(requestId, 'requestId'));
+    return String((await this.one('CollaborationMessageTargetLink', { message_id: request.message_id })).conversation_id);
   }
   private async finalText(turnId: string): Promise<string | null> {
     const fences = await this.rows('TurnFinalOutputFence', { turn_id: turnId });
@@ -517,6 +553,12 @@ export class CollaborationControlPlane {
   private async one(domain: string, where: DomainRow): Promise<DomainRow> { const rows = await this.rows(domain, where); if (rows.length !== 1) throw new Error(`${domain} requires exactly one matching fact.`); return rows[0]; }
   private async maybe(domain: string, id: string): Promise<DomainRow | null> { return (await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | null; }
   private async existing(domain: string, id: string): Promise<DomainRow> { const row = await this.maybe(domain, id); if (!row) throw new Error(`${domain} ${id} does not exist.`); return row; }
+}
+function unstartedTaskReason(failureReason: unknown): string {
+  const reason = typeof failureReason === 'string' ? failureReason : '';
+  if (reason === 'target-gone') return 'the target conversation was deleted.';
+  if (reason.startsWith('wake-dead-letter:')) return `the target conversation could not start a turn (${reason.slice('wake-dead-letter:'.length).slice(0, 500)}).`;
+  return reason ? `${reason.slice(0, 500)}.` : 'its delivery failed.';
 }
 function compareNewest(a: DomainRow, b: DomainRow): number { return String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)); }
 

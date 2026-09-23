@@ -413,7 +413,7 @@
     "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
     "permissions": "same-root-peer-communication; conversations-outside-the-team-are-reachable-only-through-cross-conversation-tools-or-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
     "revocation": "check-current-team-lineage-and-target-state-again-at-admission",
-    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail",
+    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; a-followup-whose-deliveries-all-fail-gets-one-task-could-not-start-completion-reply-then-its-request-fails",
     "limits": "frozen-policy-bounds-active-team-size-recursion-and-turn-wakeup-budget",
     "forkTurns": [
       "none",

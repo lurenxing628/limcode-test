@@ -50,7 +50,7 @@ test('idle message retains history without retaining owner; target deletion sett
   assert.equal((await get(database, 'RuntimeDelivery', 'other-delivery')).state, 'pending');
 }));
 
-test('target deletion closes pending request and wake without touching sender or immutable message', async () => withRuntime(async (runtime) => {
+test('target deletion closes the pending wake and the sender hears the task could not start', async () => withRuntime(async (runtime) => {
   const { database } = runtime;
   await seedMessage(runtime, 'followup', 'followup');
   await database.transaction([
@@ -60,8 +60,16 @@ test('target deletion closes pending request and wake without touching sender or
   ]);
   assert.equal(await database.hasConversationRuntimeWork('target'), true);
   await new kernel.ConversationDeletionControlPlane(database).delete('target');
-  assert.equal((await get(database, 'CollaborationRequest', 'request')).state, 'failed');
+  assert.equal((await get(database, 'RuntimeDelivery', 'followup-delivery')).failure_reason, 'target-gone');
   assert.equal((await get(database, 'RuntimeDeliveryWake', 'wake')).state, 'dead_letter');
+  // The request is settled by reconcile, which first tells the sender the task could not start.
+  const { CollaborationControlPlane } = require(path.resolve('dist/extension/backend/reliableKernel/collaborationControlPlane.js'));
+  const { RuntimeDeliveryControlPlane } = require(path.resolve('dist/extension/backend/reliableKernel/answerDelivery.js'));
+  const collaboration = new CollaborationControlPlane(database, runtime.store, new RuntimeDeliveryControlPlane(database));
+  await collaboration.reconcile();
+  assert.equal((await get(database, 'CollaborationRequest', 'request')).state, 'failed');
+  const reply = (await collaboration.listMessages({ conversationId: 'sender' })).messages.find(message => message.replyToMessageId === 'followup');
+  assert.match((await collaboration.readMessage({ conversationId: 'sender', messageId: reply.messageId })).text, /could not start: the target conversation was deleted/);
   assert.ok(await get(database, 'Conversation', 'sender'));
   assert.ok(await get(database, 'CollaborationMessage', 'followup'));
 }));

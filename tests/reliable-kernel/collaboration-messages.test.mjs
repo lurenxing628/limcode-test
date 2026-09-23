@@ -548,3 +548,38 @@ test('an A to B to A followup chain spends one shared budget until it is exhaust
     assert.equal((await f.rows('CollaborationBudget')).length, 1);
   } finally { await scanner.dispose(); }
 }, 2));
+
+test('a cross-conversation followup whose target is deleted while queued tells the requester it could not start', async () => fixture(async f => {
+  const { ConversationDeletionControlPlane } = load('conversationDeletion.js');
+  await topLevel(f, ['peer-a', true], ['target-b', true]);
+  const followup = await crossSend(f, 'a-task-deleted', 'peer-a', 'peer-a-turn', 'target-b', 'followup', 'task for a deleted target');
+  await endTurn(f, 'target-b-turn');
+  await new ConversationDeletionControlPlane(f.database).delete('target-b');
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  const [request] = await f.rows('CollaborationRequest', { message_id: followup.messageId });
+  assert.equal(request.state, 'failed');
+  const replies = (await f.collaboration.listMessages({ conversationId: 'peer-a' })).messages.filter(message => message.replyToMessageId === followup.messageId);
+  assert.equal(replies.length, 1, 'exactly one reply, even when reconcile runs again');
+  assert.equal(replies[0].sourceKind, 'completion');
+  assert.equal(replies[0].sourceConversationId, 'target-b');
+  assert.match((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, /^Task could not start: the target conversation was deleted/);
+  const [source] = await f.rows('CollaborationMessageSourceLink', { message_id: replies[0].messageId });
+  assert.equal(source.turn_id, null, 'no Turn of the deleted target answers');
+  const [reply] = await f.rows('RuntimeDelivery', { target_conversation_id: 'peer-a' });
+  assert.deepEqual([reply.phase, reply.target_turn_id], ['current_turn', 'peer-a-turn'], 'the waiting requester hears back in its running Turn');
+}));
+
+test('a followup whose continuation can never be admitted is reported back to the requester', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const followup = await crossSend(f, 'a-task-unstartable', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, maxFailureCount: 1,
+    wakeHandler: async () => { throw new Error('The configured provider no longer exists.'); } });
+  try { await scanner.scanNow(); } finally { await scanner.dispose(); }
+  assert.equal((await f.get('RuntimeDelivery', followup.deliveryId)).state, 'failed');
+  await f.collaboration.reconcile();
+  assert.equal((await f.rows('CollaborationRequest', { message_id: followup.messageId }))[0].state, 'failed');
+  const reply = (await f.collaboration.listMessages({ conversationId: 'peer-a' })).messages.find(message => message.replyToMessageId === followup.messageId);
+  assert.ok(reply, 'the requester is told instead of waiting forever');
+  assert.match((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: reply.messageId })).text, /^Task could not start: .*provider no longer exists/);
+}));
