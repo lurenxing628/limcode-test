@@ -125,3 +125,40 @@ test('C5 普通 /responses 请求仍然带渠道 requestBody', async () => {
   assert.deepEqual(dry.body.context_management, CHAT_REQUEST_BODY.context_management);
   assert.equal(dry.body.truncation, 'auto');
 });
+
+// C6：https://developers.openai.com/api/docs/guides/prompt-caching#summary-of-model-differences
+// 显式断点与 prompt_cache_options 只支持 GPT-5.6 及之后；实测 gpt-5.5 返回 400。
+const hasBreakpoint = (value) => JSON.stringify(value).includes('prompt_cache_breakpoint');
+
+async function responsesDryRun(model, mode, overrides = {}) {
+  const settings = responsesSettings('https://api.openai.com/v1', { model, promptCache: { enabled: true, mode, ttl: '30m' }, ...overrides });
+  return (await dryRunLlmProvider({ id: `cache-${model}-${mode}`, conversationId: 'shaping-conversation',
+    systemInstruction: { role: 'user', parts: [{ text: 'stable instructions' }] },
+    contents: [{ role: 'user', parts: [{ text: 'hi' }] }], tools: [] }, { settings: async () => settings })).body;
+}
+
+test('C6 显式缓存：只对 GPT-5.6+ 与 GPT-6 家族的精确 id 发送，其他模型退回 key 模式', async () => {
+  for (const model of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-2026-10-01', 'GPT-6-SOL']) {
+    const body = await responsesDryRun(model, 'explicit');
+    assert.deepEqual(body.prompt_cache_options, { mode: 'explicit', ttl: '30m' }, model);
+    assert.ok(hasBreakpoint(body.input), model);
+    assert.equal(typeof body.prompt_cache_key, 'string', model);
+  }
+  for (const model of ['gpt-5.5', 'gpt-5.5-pro', 'gpt-5.4', 'gpt-5.6-preview', 'openai/gpt-5.6', 'gpt-6', 'custom-model']) {
+    const explicit = await responsesDryRun(model, 'explicit');
+    assert.equal(explicit.prompt_cache_options, undefined, model);
+    assert.equal(hasBreakpoint(explicit), false, model);
+    assert.equal(typeof explicit.prompt_cache_key, 'string', model);
+    // 退回后与 key 模式的请求逐字节相同。
+    assert.deepEqual(explicit, await responsesDryRun(model, 'key'), model);
+  }
+});
+
+test('C6 key 模式与关闭缓存的请求保持不变', async () => {
+  const key = await responsesDryRun('gpt-5.6', 'key');
+  assert.equal(key.prompt_cache_options, undefined);
+  assert.equal(hasBreakpoint(key), false);
+  const disabled = await responsesDryRun('gpt-5.6', 'explicit', { promptCache: { enabled: false, mode: 'explicit', ttl: '30m' } });
+  assert.equal(disabled.prompt_cache_options, undefined);
+  assert.equal(disabled.prompt_cache_key, undefined);
+});
