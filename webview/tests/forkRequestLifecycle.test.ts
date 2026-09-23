@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   applyForkRequestError,
   decideForkClick,
+  forkReadyNoticeLinked,
   forkRequestsToReplay,
   forkResultNavigation,
   forkResultResolves,
@@ -64,6 +65,16 @@ test('only a click in this Webview session, still on the source, opens the fork'
   assert.deepEqual(forkResultNavigation(request, result, { clickedThisSession: false, activeConversationId: 'source' }),
     { kind: 'notice', notice: { sourceConversationId: 'source', conversationId: 'branch', replayed: true } },
     'a result replayed after a reload never navigates by itself');
+});
+
+test('a fork is offered only while this view holds its branch link from the source', () => {
+  const notice = { sourceConversationId: 'source', conversationId: 'branch', replayed: true };
+  const link = (id: string, target: string, source: string) =>
+    ({ [id]: { id, target_conversation_id: target, source_conversation_id: source } });
+  assert.equal(forkReadyNoticeLinked(notice, link('l1', 'branch', 'source')), true);
+  assert.equal(forkReadyNoticeLinked(notice, undefined), false, 'the fork was deleted with its link');
+  assert.equal(forkReadyNoticeLinked(notice, link('l2', 'other-branch', 'source')), false);
+  assert.equal(forkReadyNoticeLinked(notice, link('l3', 'branch', 'elsewhere')), false, 'a link from another source does not count');
 });
 
 test('the fork button is disabled for messages of the running turn, pending forks and unfinished messages', () => {

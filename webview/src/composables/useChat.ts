@@ -17,6 +17,7 @@ import { mergeSteeringReceipts, steeringReceiptsByConversationState } from '@web
 import {
   applyForkRequestError,
   decideForkClick,
+  forkReadyNoticeLinked,
   forkRequestsToReplay,
   forkResultNavigation,
   forkResultResolves,
@@ -1176,7 +1177,7 @@ export function useChat() {
   // A fork deleted after its notice appeared must not be offered any more.
   const conversationForkReadyNotice = computed(() => {
     const notice = forkReadyNotices.value[reliableConversation.conversationId.value];
-    return notice && !reliableConversation.feed.removedConversationIds.includes(notice.conversationId) ? notice : undefined;
+    return notice && forkReadyNoticeLinked(notice, reliableConversation.feed.records.ConversationBranchLink) ? notice : undefined;
   });
   const reliableRecords = computed(() =>
     reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>

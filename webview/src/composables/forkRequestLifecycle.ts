@@ -144,6 +144,21 @@ export interface ForkReadyNotice {
 export type ForkResultNavigation = { kind: 'open' } | { kind: 'notice'; notice: ForkReadyNotice };
 
 /**
+ * A notice is offered only while this view holds the fork's ConversationBranchLink from its source.
+ * The link is deleted with the fork, so a deleted fork is never offered, whether its deletion reaches
+ * the view as a Conversation remove or as a fresh snapshot.
+ */
+export function forkReadyNoticeLinked(
+  notice: ForkReadyNotice,
+  branchLinks: Readonly<Record<string, Readonly<Record<string, unknown>>>> | undefined
+): boolean {
+  return Object.values(branchLinks ?? {}).some((link) =>
+    link.target_conversation_id === notice.conversationId
+    && link.source_conversation_id === notice.sourceConversationId
+  );
+}
+
+/**
  * Opening the fork answers a click: only a command clicked in this Webview session, while the user
  * still looks at its source, navigates. A result replayed after a reload (possibly days later) or
  * arriving after the user moved on leaves the view where it is and offers the fork on the source

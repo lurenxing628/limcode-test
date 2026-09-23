@@ -12,8 +12,9 @@ const LATER = '2026-09-23T00:00:00.000Z';
 const row = (domain, value) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(value);
 
 /**
- * The frames a real bounded feed sends to a Webview bound to `target`: its snapshot, then the live
- * changes of one committed deletion of a peer Conversation.
+ * The frames a real bounded feed sends to a Webview bound to `target`: its snapshot, then whatever
+ * one committed deletion of the peer `gone` produces. `gone` is also a fork of `target`, so like any
+ * fork it holds a copied message and the ConversationBranchLink from `target`.
  */
 async function feedFrames() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-collaboration-card-labels-'));
@@ -29,7 +30,7 @@ async function feedFrames() {
         row('Message', { id, created_at: NOW, updated_at: NOW, deleted_at: null }),
         row('MessageRevision', { id: `${id}-revision`, message_id: id, revision_seq: 1n, role: 'user', content_object_id: content.id, created_at: NOW }),
         row('MessageCurrentRevisionLink', { id: `${id}-current`, message_id: id, revision_id: `${id}-revision`, updated_at: NOW }),
-        row('MessagePartOfConversation', { id: `${id}-member`, conversation_id: id.startsWith('sender') ? 'sender' : 'target', message_id: id,
+        row('MessagePartOfConversation', { id: `${id}-member`, conversation_id: id.split('-')[0], message_id: id,
           message_seq: id.endsWith('second') ? 2n : 1n, created_at: NOW }),
         ...(turnId ? [row('MessageTurnLink', { id: `${id}-turn`, turn_id: turnId, message_id: id, role: 'user', created_at: NOW })] : [])
       ];
@@ -59,6 +60,9 @@ async function feedFrames() {
       ...await userMessage('sender-first', null, '调研登录流程'),
       ...await userMessage('target-first', 'target-turn', '第一轮'),
       ...await userMessage('target-second', 'target-running', '第二轮'),
+      ...await userMessage('gone-first', null, '第一轮'),
+      row('ConversationBranchLink', { id: 'gone-branch', target_conversation_id: 'gone', source_conversation_id: 'target',
+        source_message_revision_id: 'target-first-revision', created_at: NOW }),
       ...await incoming('from-sender', 'sender', '来自调研对话'),
       ...await incoming('from-gone', 'gone', '来自将被删除的对话')
     ]);
@@ -68,10 +72,10 @@ async function feedFrames() {
       const snapshot = feedClient.received[0];
       feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: snapshot.messageSeq });
       await new kernel.ConversationDeletionControlPlane(database).delete('gone');
-      await new Promise((resolve) => setImmediate(resolve));
-      const removal = feedClient.received.find((message) => message.type === 'reliable-kernel.changes'
-        && message.changes.some((change) => change.type === 'Conversation' && change.operation === 'remove' && change.id === 'gone'));
-      return { snapshot, removal };
+      for (let attempt = 0; attempt < 400 && feedClient.received.length === 1; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      return { snapshot, deletion: feedClient.received.slice(1) };
     } finally { feed.close(); }
   } finally {
     if (database) await database.close();
@@ -79,10 +83,11 @@ async function feedFrames() {
   }
 }
 
-test('a real snapshot and Conversation removal drive the card and queue labels, the fork button and the fork notice', async (t) => {
-  const { snapshot, removal } = await feedFrames();
+test('a real snapshot and Conversation deletion drive the card and queue labels, the fork button and the fork notice', async (t) => {
+  const { snapshot, deletion } = await feedFrames();
   assert.equal(snapshot.type, 'reliable-kernel.snapshot');
-  assert.ok(removal, 'the deletion reaches the target session as a Conversation remove');
+  assert.deepEqual(deletion.map((message) => message.type), ['reliable-kernel.snapshot'],
+    'deleting a Conversation that has messages reaches the target session as a fresh snapshot, not a Conversation remove');
   const navigation = snapshot.projections.navigationSummary.conversations.map((value) => value.id);
   assert.equal(navigation.includes('sender') || navigation.includes('gone'), false, 'both peers are outside the navigation list');
 
@@ -173,9 +178,9 @@ test('a real snapshot and Conversation removal drive the card and queue labels, 
       assert.deepEqual(forkButtons.map((button) => /\sdisabled/.test(button)), [false, true]);
     });
 
-    feed.observe(removal);
+    for (const frame of deletion) feed.observe(frame);
     await nextTick();
-    assert.ok(feed.removedConversationIds.includes('gone'), 'the store remembers the committed removal');
+    assert.equal(feed.records.ConversationBranchLink?.['gone-branch'], undefined, 'the branch link went with the fork');
     list = await mount(messageList);
     queue = await mount(queuePanel);
     assert.deepEqual(labels(list.setup), ['来自对话 调研登录流程', '来自已删除的对话'], 'the card of the deleted peer reads as deleted');
@@ -183,6 +188,10 @@ test('a real snapshot and Conversation removal drive the card and queue labels, 
     assert.equal(queue.setup.collaborationSourceLabel('gone'), '来自已删除的对话');
     assert.equal(queue.setup.collaborationSourceLabel('sender'), '来自对话 调研登录流程');
     assert.doesNotMatch(list.html, /分支已创建/, 'the notice of a deleted fork is gone');
+    host.posted = [];
+    list.setup.openForkReadyNotice();
+    assert.deepEqual(host.posted.filter((message) => message.type === BridgeMessageType.ConversationOpen), [],
+      '"打开分支" never opens the deleted fork');
   } finally {
     await new Promise((resolve) => setTimeout(resolve, 50));
     pinia.setActivePinia(previousPinia);
