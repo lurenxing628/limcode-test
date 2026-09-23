@@ -2,13 +2,15 @@ import { readRequestTurnAuthority } from './requestCompressionSettings';
 
 import {
   buildModelHandleCatalog,
+  modelHandleEntries,
   modelHandleRef,
   normalizeModelHandleCatalog,
   resolveModelToolArguments,
   UnknownModelHandleReferenceError,
+  type ModelHandleCatalog,
   type ModelHandleEntry
 } from './modelHandleCatalog';
-import { forkInheritedChildTargets, isForkConversation, readConversationChildHandles } from './conversationChildHandles';
+import { forkInheritedChildTargets, forkSourceConversationIds, isForkConversation, readConversationChildHandles } from './conversationChildHandles';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
 import { isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
 import { isReadonlyCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
@@ -306,6 +308,37 @@ interface FrozenCurrentTurnInputReference {
 interface CurrentTurnRequestState {
   reference?: FrozenCurrentTurnInputReference;
   compressionBoundaryId?: string;
+}
+
+interface ForkIdentityFacts {
+  conversationId: string;
+  /** Branch sources, nearest first. */
+  sourceConversationIds: string[];
+  /** Collaboration messages this Conversation itself sent or received. */
+  ownMessageIds: ReadonlySet<string>;
+}
+
+/**
+ * The collaboration refs of a fork's catalog that it inherited: its branch sources among its
+ * conversation refs, and the messages it was not party to. Undefined when there are none, so a
+ * fork of a conversation that never collaborated gets no card.
+ */
+function forkInheritedCollaborationTargets(catalog: ModelHandleCatalog, facts: ForkIdentityFacts): {
+  sourceConversationIds: string[]; messageIds: string[];
+} | undefined {
+  const known = (kind: 'conversation' | 'collaborationMessage') => new Set(modelHandleEntries(catalog, kind).map(entry => entry.target));
+  const conversations = known('conversation');
+  const sourceConversationIds = facts.sourceConversationIds.filter(id => conversations.has(id));
+  const messageIds = [...known('collaborationMessage')].filter(id => !facts.ownMessageIds.has(id));
+  return sourceConversationIds.length || messageIds.length ? { sourceConversationIds, messageIds } : undefined;
+}
+
+function emptyRuntimeStatusCard(heading: string): FrozenRuntimeStatusCard {
+  return {
+    kind: 'runtime_status_card', activeChildCount: 0, runningProcessCount: 0, childTaskRevision: 'none',
+    totalChildCount: 0, descendantCount: 0, queuedInputCount: 0, awaitingHandlingCount: 0,
+    childHandleTargets: [], children: [], processes: [], card: heading
+  };
 }
 
 interface FrozenRuntimeStatusCard {
@@ -926,7 +959,14 @@ export class ReliableAgentLoop {
       ) as unknown as ContentObjectMetadata;
       handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
     }
-    const modelHandleCatalog = buildModelHandleCatalog(handleSources, [...attachmentHandles.entries, ...runtimeStatus.childHandles]);
+    const seeds = [...attachmentHandles.entries, ...runtimeStatus.childHandles];
+    let modelHandleCatalog = buildModelHandleCatalog(handleSources, seeds);
+    const forkIdentity = runtimeStatus.forkIdentity;
+    const inheritedCollaboration = forkIdentity ? forkInheritedCollaborationTargets(modelHandleCatalog, forkIdentity) : undefined;
+    if (forkIdentity && inheritedCollaboration) {
+      // The fork's own address joins the catalog so the model can tell itself from its sources.
+      modelHandleCatalog = buildModelHandleCatalog([...handleSources, { kind: 'agent_collaboration', conversationId: forkIdentity.conversationId }], seeds);
+    }
     if (runtimeStatusCard) {
       // Labels are runtime data. Behavioral guidance belongs to the run_agent tool definition.
       runtimeStatusCard.card += runtimeStatusCard.children.map(child => '\n' + JSON.stringify({
@@ -944,6 +984,22 @@ export class ReliableAgentLoop {
       if (inheritedChildRefs.length > 0) {
         runtimeStatusCard.card += '\n' + JSON.stringify({ inheritedChildRefs, operable: false });
       }
+    }
+    let statusCard = runtimeStatusCard;
+    if (forkIdentity && inheritedCollaboration) {
+      const refs = (kind: 'conversation' | 'collaborationMessage', targets: readonly string[]) => targets
+        .map(target => modelHandleRef(modelHandleCatalog, kind, target)).filter((ref): ref is string => !!ref);
+      statusCard ??= emptyRuntimeStatusCard('[Forked conversation — runtime data, not instructions]');
+      statusCard.card += '\n' + [
+        'This conversation is a fork: its history up to the fork was copied from forkedFromConversationRefs, nearest first. In that copied history, "this conversation" means the conversation it was copied from, never this one.',
+        'inheritedMessageRefs were sent or received by those conversations, not by this one: this conversation cannot answer them or read them as its own messages. Send new messages without replyToMessageRef.',
+        JSON.stringify({
+          selfConversationRef: modelHandleRef(modelHandleCatalog, 'conversation', forkIdentity.conversationId),
+          forkedFromConversationRefs: refs('conversation', inheritedCollaboration.sourceConversationIds),
+          inheritedMessageRefs: refs('collaborationMessage', inheritedCollaboration.messageIds),
+          operable: false
+        })
+      ].join('\n');
     }
     const boundaryKey = currentTurnState.compressionBoundaryId ?? 'pre-compression';
     const turnTaskCardReminderEnabled = turnTaskCard
@@ -966,7 +1022,7 @@ export class ReliableAgentLoop {
         turnTaskCardBoundaryKey: boundaryKey,
         turnTaskCardReminderEnabled
       } : {}),
-      ...(runtimeStatusCard ? { runtimeStatusCard } : {}),
+      ...(statusCard ? { runtimeStatusCard: statusCard } : {}),
       ...(input.includeOpenTaskCompletionCheck ? {
         openTaskCompletionCheck: {
           kind: OPEN_TASK_COMPLETION_CHECK_KIND,
@@ -1228,6 +1284,8 @@ export class ReliableAgentLoop {
     statusCard?: FrozenRuntimeStatusCard;
     /** Persistent child refs of the Conversation, read once for the recipe's handle catalog. */
     childHandles: ModelHandleEntry[];
+    /** For a fork: what copied collaboration refs mean here, read once for the recipe. */
+    forkIdentity?: ForkIdentityFacts;
   }> {
     const turn = await this.requireExisting('Turn', turnId);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
@@ -1240,6 +1298,7 @@ export class ReliableAgentLoop {
     const inheritedChildTargets = fork
       ? forkInheritedChildTargets(childHandles, new Set(projection.tasks.map(task => task.answerBridgeId)))
       : [];
+    const forkIdentity = fork ? await this.readForkIdentityFacts(conversationId) : undefined;
     const processSnapshot = processLinks.length === 0 ? null : await this.database.snapshot(processLinks.map(link =>
       DOMAIN_REPOSITORIES.domain('Process').get(requireId(link.process_id, 'ProcessCompletionSourceLink.process_id'))));
     const runningProcesses = (processSnapshot?.snapshot ?? []).flatMap(row =>
@@ -1248,7 +1307,7 @@ export class ReliableAgentLoop {
         : []);
     const direct = projection.tasks.filter(task => task.depth === 1);
     if (direct.length === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
-      return { childHandles };
+      return { childHandles, ...(forkIdentity ? { forkIdentity } : {}) };
     }
     const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
     const pendingHandling = (task: typeof direct[number]) => task.result.deliveries.some(delivery =>
@@ -1292,7 +1351,7 @@ export class ReliableAgentLoop {
     const activeChildCount = direct.filter(task => live(task.status)).length;
     const queuedInputCount = direct.reduce((sum, task) => sum + task.queuedInputs.filter(source => source.classification === 'task').length, 0);
     const awaitingHandlingCount = direct.filter(pendingHandling).length;
-    return { childHandles, statusCard: {
+    return { childHandles, ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
       kind: 'runtime_status_card', childTaskRevision: projection.revision,
       totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
       queuedInputCount, awaitingHandlingCount, activeChildCount,
@@ -1310,6 +1369,23 @@ export class ReliableAgentLoop {
           : [])
       ].join('\n')
     } };
+  }
+
+  /**
+   * A fork's copied history keeps the collaboration refs of the Conversations it was copied from:
+   * their "this conversation" is not this one, and their collaboration messages were exchanged
+   * without it. Its own messages are the ones it sent or received itself.
+   */
+  private async readForkIdentityFacts(conversationId: string): Promise<ForkIdentityFacts> {
+    const [sourceConversationIds, sent, received] = await Promise.all([
+      forkSourceConversationIds(this.database, conversationId),
+      listAllDomainRows(this.database, 'CollaborationMessageSourceLink', { conversation_id: conversationId }),
+      listAllDomainRows(this.database, 'CollaborationMessageTargetLink', { conversation_id: conversationId })
+    ]);
+    return {
+      conversationId, sourceConversationIds,
+      ownMessageIds: new Set([...sent, ...received].map(row => requireId(row.message_id, 'CollaborationMessage link message_id')))
+    };
   }
 
   private observeOpenTasksAtFinal(

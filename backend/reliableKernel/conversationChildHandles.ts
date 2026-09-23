@@ -74,6 +74,27 @@ export async function isForkConversation(database: RuntimeDatabase, conversation
 }
 
 /**
+ * The Conversations a fork was copied from, nearest first: its branch source, that source's own
+ * branch source, and so on. Copied history that speaks of "this conversation" means one of them.
+ * A source deleted since keeps its id in the branch link and ends the chain.
+ */
+export async function forkSourceConversationIds(database: RuntimeDatabase, conversationId: string): Promise<string[]> {
+  const sources: string[] = [];
+  for (let current = conversationId; sources.length < 64;) {
+    const snapshot = await database.snapshot([DOMAIN_REPOSITORIES.domain('ConversationBranchLink').list({
+      where: { target_conversation_id: current },
+      limit: 1
+    })]);
+    const rows = snapshot.snapshot[0];
+    const source = Array.isArray(rows) && rows[0] ? String(rows[0].source_conversation_id) : '';
+    if (!source || source === conversationId || sources.includes(source)) break;
+    sources.push(source);
+    current = source;
+  }
+  return sources;
+}
+
+/**
  * A fork copies history that mentions its source's children but never their ChildExecution parent
  * relation. In a fork, every child ref of the persistent catalog that is not one of its own child
  * tasks was inherited: it stays addressable in the copied history and is never operable here.

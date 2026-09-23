@@ -12,6 +12,7 @@ import { listAllDomainRows } from './repositoryPagination';
 import { isTransactionAssertionFailure, requirePhaseFId, stablePhaseFId, sqliteUniqueFailureIncludes } from './phaseFIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { estimateJsonTokens, estimateTextTokens } from './modelTokenEstimator';
+import { forkSourceConversationIds } from './conversationChildHandles';
 
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 /** Every collaboration message body is 1..COLLABORATION_MESSAGE_MAX_TEXT_BYTES UTF-8 bytes. */
@@ -196,7 +197,9 @@ export class CollaborationControlPlane {
     if (replyToMessageId) {
       const previousSource = await this.one('CollaborationMessageSourceLink', { message_id: replyToMessageId });
       const previousTarget = await this.one('CollaborationMessageTargetLink', { message_id: replyToMessageId });
-      if (previousSource.conversation_id !== targetConversationId || previousTarget.conversation_id !== sourceConversationId) throw new Error('A collaboration reply must reverse the exact original source and target.');
+      if (previousSource.conversation_id !== targetConversationId || previousTarget.conversation_id !== sourceConversationId) {
+        throw await this.foreignMessageError(sourceConversationId, [String(previousSource.conversation_id), String(previousTarget.conversation_id)], 'answer');
+      }
       sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').assert(String(previousSource.id), { conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assert(String(previousTarget.id), { conversation_id: sourceConversationId }));
     }
     if (source.kind === 'completion') {
@@ -303,7 +306,9 @@ export class CollaborationControlPlane {
     const summary = await this.summary(message);
     const reader = input.targetConversationId ?? input.conversationId;
     await this.assertReadPermission(input.conversationId, reader);
-    if (![summary.sourceConversationId, summary.targetConversationId].includes(reader)) throw new Error('Conversation cannot read another conversation\'s private messages.');
+    if (![summary.sourceConversationId, summary.targetConversationId].includes(reader)) {
+      throw await this.foreignMessageError(reader, [summary.sourceConversationId, summary.targetConversationId], 'read');
+    }
     const payload = await this.one('CollaborationMessagePayloadLink', { message_id: input.messageId });
     const metadata = await this.existing('ContentObject', String(payload.content_object_id)) as ContentObjectMetadata;
     return { ...summary, ...collaborationTextPage((await this.contentStore.read(metadata)).toString('utf8'), input.offset ?? 0) };
@@ -716,6 +721,22 @@ export class CollaborationControlPlane {
     const [callerScope, targetScope] = await Promise.all([readCollaborationScope(this.database, caller), readCollaborationScope(this.database, target)]);
     if (callerScope.rootConversationId !== targetScope.rootConversationId) throw new Error('Cross-conversation collaboration is not enabled.');
   }
+  /**
+   * Why a collaboration message cannot be read or answered by this Conversation. A fork or forked
+   * child keeps the message refs of the history it copied, so its model is told where they come
+   * from and what to do instead of a bare refusal.
+   */
+  private async foreignMessageError(conversationId: string, parties: readonly string[], use: 'read' | 'answer'): Promise<Error> {
+    const sources = await forkSourceConversationIds(this.database, conversationId);
+    const instead = use === 'answer' ? ' Send without replyToMessageRef instead.' : '';
+    if (parties.some((party) => sources.includes(party))) {
+      return new Error(`That message reference comes from history this conversation copied when it was forked: the message was exchanged by the conversation it was forked from, not by this one, so it cannot be ${use === 'read' ? 'read' : 'answered'} from here.${instead}`);
+    }
+    return new Error(use === 'read'
+      ? 'Conversation cannot read another conversation\'s private messages.'
+      : `A collaboration reply must reverse the exact original source and target: replyToMessageRef must name a message the target sent to this conversation.${instead}`);
+  }
+
   /** The budget a followup from this Turn spends; refuses once its automatic followups are used up. */
   private async availableFollowupBudget(sourceTurnId: string, rootTurnId: string | null): Promise<{ budget: DomainRow; persisted: boolean; spendSteps: RepositoryTransactionStep[] }> {
     const budget = await this.budgetForTurn(sourceTurnId, rootTurnId);
