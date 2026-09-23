@@ -39,6 +39,7 @@ const useClientStateStoreDefinition = defineStore('clientState', {
         toolDefinitions: state.toolDefinitions.map(cloneRecord),
         toolPolicies: state.toolPolicies.map(cloneRecord),
         toolPolicyScopeLinks: state.toolPolicyScopeLinks.map(cloneRecord),
+        builtinToolPolicies: state.builtinToolPolicies.map(cloneRecord),
         mcpToolSources: state.mcpToolSources.map(cloneRecord),
         skillDefinitions: state.skillDefinitions.map(cloneRecord),
         skillPolicies: state.skillPolicies.map(cloneRecord),

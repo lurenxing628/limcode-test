@@ -7,6 +7,7 @@ import type * as vscode from 'vscode';
 import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
 import type {
   AgentRecord,
+  BuiltinToolPolicyRecord,
   ChatModelOverrideRecord,
   CheckpointPolicyRecord,
   CheckpointPolicyScopeLinkRecord,
@@ -252,15 +253,20 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         scope,
         (link) => link.toolPolicyId
       );
-      if (configured) {
-        toolPolicyLayers.push({ scopeKind: scope.scopeKind, policy: configured });
-        continue;
-      }
       const builtin = scope.scopeKind === 'agent'
         ? builtinAgent?.toolPolicy
         : scope.scopeKind === 'workflow'
           ? builtinWorkflow?.toolPolicy
           : undefined;
+      if (configured) {
+        // A saved record without a list keeps the scope's built-in list, so settings that only
+        // store per-tool config never widen a built-in read-only Agent or workflow.
+        toolPolicyLayers.push({
+          scopeKind: scope.scopeKind,
+          policy: configured.allowedTools || !builtin ? configured : { ...configured, allowedTools: builtin.allowedTools }
+        });
+        continue;
+      }
       if (builtin) {
         toolPolicyLayers.push({
           scopeKind: scope.scopeKind,
@@ -577,6 +583,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       planReviewPolicyScopeLinks: records.planReviewPolicyScopeLinks.map(clonePlain),
       toolPolicies: records.toolPolicies.map(clonePlain),
       toolPolicyScopeLinks: records.toolPolicyScopeLinks.map(clonePlain),
+      builtinToolPolicies: builtinToolPolicyRecords(records.agents, records.workflows),
       skillPolicies: records.skillPolicies.map(clonePlain),
       skillPolicyScopeLinks: records.skillPolicyScopeLinks.map(clonePlain),
       systemPrompts: records.systemPrompts.map(clonePlain),
@@ -1316,6 +1323,23 @@ function frozenProviderRetryPolicy(
 function latestUpdated<T extends { id: string; updatedAt: number; createdAt: number }>(items: readonly T[]): T | undefined {
   return [...items].sort((left, right) => right.updatedAt - left.updatedAt
     || right.createdAt - left.createdAt || right.id.localeCompare(left.id))[0];
+}
+
+/** The same built-in list each Agent and workflow falls back to in compile, keyed by its scope. */
+function builtinToolPolicyRecords(agents: readonly AgentRecord[], workflows: readonly WorkflowRecord[]): BuiltinToolPolicyRecord[] {
+  const records: BuiltinToolPolicyRecord[] = [];
+  for (const agent of agents) {
+    const builtin = BUILTIN_AGENT_DEFINITIONS[agent.kind] ?? BUILTIN_AGENT_DEFINITIONS[agent.id];
+    if (builtin) records.push({ id: `builtin-tool-policy:agent:${agent.id}`, scopeKind: 'agent', scopeId: agent.id, allowedTools: [...builtin.toolPolicy.allowedTools] });
+  }
+  for (const workflow of workflows) {
+    const builtin = BUILTIN_WORKFLOW_DEFINITIONS[workflow.id]
+      ?? Object.values(BUILTIN_WORKFLOW_DEFINITIONS).find((candidate) => candidate.id === workflow.id);
+    if (builtin?.toolPolicy) {
+      records.push({ id: `builtin-tool-policy:workflow:${workflow.id}`, scopeKind: 'workflow', scopeId: workflow.id, allowedTools: [...builtin.toolPolicy.allowedTools] });
+    }
+  }
+  return records;
 }
 
 function mergeAgentsWithBuiltins(configured: AgentRecord[]): AgentRecord[] {

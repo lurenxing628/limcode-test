@@ -1051,11 +1051,34 @@ export interface ToolPolicySourceConfigRecord {
 export interface ToolPolicyRecord {
   id: string;
   name: string;
-  allowedTools: string[];
+  /**
+   * The tool list this layer allows; each saved list can only narrow the layers above it. Absent
+   * means the record sets no list of its own: the scope keeps its built-in Agent/workflow list, if
+   * any, and otherwise narrows nothing. Settings that only store per-tool config (for example the
+   * cross-conversation switch) use this so they never freeze a tool list as a side effect.
+   */
+  allowedTools?: string[];
+  /**
+   * Cross-conversation tools this record's list gained when its cross-conversation switch was
+   * turned on. Turning the switch off or restoring inheritance removes exactly these.
+   */
+  crossConversationGrantedTools?: string[];
   /** 工具策略预设；非全局 scope 可用 inherit 只继承全局预设，同时保留本 scope 的逐工具配置。 */
   preset?: ToolPolicyPresetKind;
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
   sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;
+}
+
+/**
+ * The tool list a built-in Agent or workflow narrows to while its scope has no saved list. Read-only
+ * projection of the extension's blueprints so settings show and respect the same fallback the
+ * backend applies; never stored.
+ */
+export interface BuiltinToolPolicyRecord {
+  id: string;
+  scopeKind: 'agent' | 'workflow';
+  scopeId: string;
+  allowedTools: string[];
 }
 
 export interface ToolPolicyScopeLinkRecord {
@@ -2311,6 +2334,7 @@ export interface ClientStateRecordByTable {
   runPlanProposalLinks: RunPlanProposalLinkRecord;
   toolPolicies: ToolPolicyRecord;
   toolPolicyScopeLinks: ToolPolicyScopeLinkRecord;
+  builtinToolPolicies: BuiltinToolPolicyRecord;
   skillDefinitions: SkillDefinitionRecord;
   skillPolicies: SkillPolicyRecord;
   skillPolicyScopeLinks: SkillPolicyScopeLinkRecord;
@@ -2680,7 +2704,10 @@ export interface ToolPolicyScopeSetPayload {
   scopeKind: ToolPolicyScopeKind;
   scopeId?: string;
   name?: string;
-  allowedTools: string[];
+  /** Replaces the record's list; absent saves a record without a list of its own. */
+  allowedTools?: string[];
+  /** Replaces the record's switch-granted subset of allowedTools; absent clears it. */
+  crossConversationGrantedTools?: string[];
   preset?: ToolPolicyPresetKind;
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
   sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;

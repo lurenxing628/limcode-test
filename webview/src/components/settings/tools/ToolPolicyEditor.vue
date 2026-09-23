@@ -138,6 +138,19 @@ function updateSelectedToolScope(value: string): void {
     : 'all';
 }
 
+/**
+ * Config-only edits keep this scope's own list state: a scope without a saved list stays without
+ * one, so adjusting approval or display never freezes the inherited tool list here.
+ */
+function localAllowedTools(): string[] | undefined {
+  const allowed = localResolution.value.policy?.allowedTools;
+  return allowed ? [...allowed] : undefined;
+}
+
+function localPolicyName(): string | undefined {
+  return localResolution.value.policy?.name;
+}
+
 function nextAllowed(toolName: string, enabled: boolean): string[] {
   const names = new Set(effectivePolicy.value?.allowedTools ?? []);
   if (enabled) names.add(toolName);
@@ -173,7 +186,7 @@ function toggleMcpSource(sourceId: string, enabled: boolean): void {
     enabled,
     disabledTools: nextConfigs[sourceId]?.disabledTools ?? []
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, cloneToolConfigs(), nextConfigs);
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), cloneToolConfigs(), nextConfigs);
 }
 
 function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void {
@@ -185,14 +198,15 @@ function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void
   if (enabled) disabled.delete(tool.name);
   else disabled.add(tool.name);
   nextConfigs[sourceId] = { enabled: current.enabled !== false, ...(disabled.size > 0 ? { disabledTools: [...disabled] } : {}) };
-  const nextAllowed = enabled ? effectivePolicy.value?.allowedTools ?? [] : (effectivePolicy.value?.allowedTools ?? []).filter((name) => name !== tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed, effectivePolicy.value?.name, cloneToolConfigs(), nextConfigs);
+  const local = localAllowedTools();
+  const nextAllowed = local && !enabled ? local.filter((name) => name !== tool.name) : local;
+  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed, localPolicyName(), cloneToolConfigs(), nextConfigs);
 }
 
 function setToolEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
   if (props.readonly || enabled === isToolEnabled(tool)) return;
   if (!enabled) collapseToolConfig(tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), effectivePolicy.value?.name, cloneToolConfigs(), cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
 function isToolConfigExpanded(toolName: string): boolean { return expandedToolNames.value.includes(toolName); }
@@ -209,13 +223,13 @@ function collapseToolConfig(toolName: string): void {
 
 function enableAll(): void {
   if (props.readonly) return;
-  store.setPolicyForScope(props.scopeKind, props.scopeId, builtinTools.value.map((tool) => tool.name), effectivePolicy.value?.name, cloneToolConfigs(), cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, builtinTools.value.map((tool) => tool.name), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
 function disableAll(): void {
   if (props.readonly) return;
   expandedToolNames.value = [];
-  store.setPolicyForScope(props.scopeKind, props.scopeId, [], effectivePolicy.value?.name, cloneToolConfigs(), cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, [], localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
 function restoreInheritance(): void {
@@ -228,7 +242,7 @@ function inheritDefaults(): void {
   const defaultAllowed = tools.value
     .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
     .map((tool) => tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, defaultAllowed, effectivePolicy.value?.name, {}, {});
+  store.setPolicyForScope(props.scopeKind, props.scopeId, defaultAllowed, localPolicyName(), {}, {});
 }
 
 function riskLabel(tool: ToolDefinitionRecord): string {
@@ -341,7 +355,7 @@ function updateStringListField(tool: ToolDefinitionRecord, field: ToolConfigFiel
   });
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord, value: ToolConfigValue): void {
@@ -349,7 +363,7 @@ function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRec
   const config = sanitizeConfigForTool(tool, { ...localConfigForTool(tool), [field.key]: value });
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 type ToolGateSettingKey = 'autoApproveExecution' | 'autoApplyChange' | 'autoSubmitResult';
@@ -361,7 +375,7 @@ function updateGateSetting(tool: ToolDefinitionRecord, key: ToolGateSettingKey, 
     ...(nextConfigs[tool.name] ?? { config: {} }),
     [key]: value
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function toolGateValue(tool: ToolDefinitionRecord, key: ToolGateSettingKey): boolean {
@@ -384,7 +398,7 @@ function updateNativeAsync(tool: ToolDefinitionRecord, value: boolean): void {
     ...(nextConfigs[tool.name] ?? { config: {} }),
     nativeAsync: value
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function supportsChangeApply(tool: ToolDefinitionRecord): boolean {
@@ -402,7 +416,7 @@ function updateAutoApplyChangeDelay(tool: ToolDefinitionRecord, value: number): 
     ...(nextConfigs[tool.name] ?? { config: {} }),
     autoApplyChangeDelaySeconds: Math.min(600, Math.max(0, Math.floor(value)))
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function autoApplyChangeDelayValue(tool: ToolDefinitionRecord): number {
@@ -421,7 +435,7 @@ function updateDisplayAutoExpand(tool: ToolDefinitionRecord, value: boolean): vo
     ...(nextConfigs[tool.name] ?? { config: {} }),
     display: { ...(nextConfigs[tool.name]?.display ?? {}), autoExpand: value }
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function displayAutoExpandValue(tool: ToolDefinitionRecord): boolean {
@@ -437,7 +451,7 @@ function updateDisplayAutoOpenDiffPreview(tool: ToolDefinitionRecord, value: boo
     ...(nextConfigs[tool.name] ?? { config: {} }),
     display: { ...(nextConfigs[tool.name]?.display ?? {}), autoOpenDiffPreview: value }
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function displayAutoOpenDiffPreviewValue(tool: ToolDefinitionRecord): boolean {

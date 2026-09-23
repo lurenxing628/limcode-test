@@ -247,8 +247,9 @@ function isValidPlanReviewPolicy(policy: PlanReviewPolicyRecord): boolean {
 function isValidToolPolicy(policy: ToolPolicyRecord): boolean {
   if (typeof policy.id !== 'string' || !policy.id.trim()) return setRawError('toolPolicies[0].id 必须是非空字符串。');
   if (typeof policy.name !== 'string' || !policy.name.trim()) return setRawError('toolPolicies[0].name 必须是非空字符串。');
-  if (!Array.isArray(policy.allowedTools) || !policy.allowedTools.every((tool) => typeof tool === 'string' && tool.trim())) {
-    return setRawError('toolPolicies[0].allowedTools 必须是非空字符串数组。');
+  if (policy.allowedTools !== undefined
+    && (!Array.isArray(policy.allowedTools) || !policy.allowedTools.every((tool) => typeof tool === 'string' && tool.trim()))) {
+    return setRawError('toolPolicies[0].allowedTools 省略时不单独限制工具；填写时必须是非空字符串数组。');
   }
   if (policy.preset !== undefined && policy.preset !== 'inherit' && policy.preset !== 'custom' && policy.preset !== 'yolo') {
     return setRawError('toolPolicies[0].preset 只能是 inherit / custom / yolo。');
@@ -287,7 +288,8 @@ function saveWorkflowToolPolicy(parsed: WorkflowRawData, previous: WorkflowRawDa
       scopeKind: 'workflow',
       scopeId: parsed.workflow.id,
       name: policy.name,
-      allowedTools: [...policy.allowedTools],
+      ...(policy.allowedTools ? { allowedTools: [...policy.allowedTools] } : {}),
+      ...(policy.crossConversationGrantedTools ? { crossConversationGrantedTools: [...policy.crossConversationGrantedTools] } : {}),
       ...(policy.preset ? { preset: policy.preset } : {}),
       ...(policy.toolConfigs ? { toolConfigs: clonePlain(policy.toolConfigs) } : {}),
       ...(policy.sourceConfigs ? { sourceConfigs: clonePlain(policy.sourceConfigs) } : {})

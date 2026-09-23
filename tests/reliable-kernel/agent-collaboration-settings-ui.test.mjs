@@ -177,8 +177,21 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(effective.maxConcurrentAgents, undefined);
     });
 
-    await t.test('跨对话协作开关默认关闭，开启时把跨对话工具加入该作用域允许列表，关闭与恢复继承不改动允许列表', async () => {
-      const { store, messages, render } = fresh();
+    const writeTool = { name: 'write', execution: 'backend', parameters: { type: 'object' }, description: 'write', defaultConfig: {}, metadata: { riskLevel: 'write' } };
+    const transferTool = { name: 'transfer', execution: 'backend', parameters: { type: 'object' }, description: 'transfer', defaultConfig: {}, metadata: { defaultEnabled: false } };
+    const mcpTool = { name: 'mcp_search', execution: 'backend', parameters: { type: 'object' }, description: 'mcp', defaultConfig: {}, source: { kind: 'mcp', sourceId: 'exa' } };
+    const allDefinitions = [runAgentTool.declaration, readFileTool, writeTool, transferTool, mcpTool, ...crossTools];
+    const readonlyList = ['read_file', 'list_conversations', 'read_conversation'];
+    const builtinToolPolicies = [
+      { id: 'builtin-tool-policy:agent:main', scopeKind: 'agent', scopeId: 'main', allowedTools: ['run_agent', 'read_file', 'write', 'transfer', ...crossNames] },
+      { id: 'builtin-tool-policy:agent:explore', scopeKind: 'agent', scopeId: 'explore', allowedTools: readonlyList },
+      { id: 'builtin-tool-policy:workflow:builtin:readonly', scopeKind: 'workflow', scopeId: 'builtin:readonly', allowedTools: readonlyList }
+    ];
+    const sorted = (names) => [...names].sort();
+    const switchOn = { run_agent: { config: { crossConversationCollaboration: true } } };
+
+    await t.test('跨对话协作开关只写 defaultValue，默认关闭且不出现在工具设置里', async () => {
+      const { render } = fresh();
       const field = runAgentTool.declaration.configSchema.fields.find((candidate) => candidate.key === 'crossConversationCollaboration');
       assert.equal(field.type, 'boolean');
       assert.equal(field.defaultValue, false);
@@ -186,23 +199,131 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(runAgentTool.declaration.parameters.properties.crossConversationCollaboration, undefined);
       assert.match(checkbox(await render(editor, { scopeKind: 'global' })), /aria-checked="false"/);
       assert.doesNotMatch(await render(toolEditor, { scopeKind: 'global' }), /aria-label="跨对话协作"/);
+    });
 
-      store.setPolicyForScope('conversation', 'cross-a', ['read_file', 'run_agent'], 'Custom', { run_agent: { config: { maxConcurrentAgents: 3 } } });
-      store.setCrossConversationCollaborationForScope('conversation', 'cross-a', true);
-      const enabled = store.localPolicyFor('conversation', 'cross-a').policy;
-      assert.deepEqual(enabled.toolConfigs.run_agent.config, { maxConcurrentAgents: 3, crossConversationCollaboration: true });
-      assert.deepEqual(enabled.allowedTools, ['read_file', 'run_agent', ...crossNames]);
-      assert.equal(messages.at(-1).payload.toolConfigs.run_agent.config.crossConversationCollaboration, true);
-      assert.deepEqual(messages.at(-1).payload.allowedTools, ['read_file', 'run_agent', ...crossNames]);
-      assert.match(checkbox(await render(editor, { scopeKind: 'conversation', scopeId: 'cross-a' })), /aria-checked="true"/);
-      assert.equal(store.localPolicyFor('conversation', 'cross-b').policy, undefined, '其它对话作用域不受影响');
+    await t.test('本层没有工具策略时开启只保存开关，不新建收窄上界，关闭保留开关，恢复继承删除该记录', async () => {
+      const { store, messages, render } = fresh(allDefinitions);
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file', ...crossNames], 'Global');
+      store.setCrossConversationCollaborationForScope('conversation', 'plain', true);
+      let local = store.localPolicyFor('conversation', 'plain').policy;
+      assert.equal(local.allowedTools, undefined, 'the switch does not freeze a tool list for this conversation');
+      assert.deepEqual(local.toolConfigs, switchOn);
+      assert.equal('allowedTools' in messages.at(-1).payload, false);
+      assert.match(checkbox(await render(editor, { scopeKind: 'conversation', scopeId: 'plain' })), /aria-checked="true"/);
+      assert.equal(store.localPolicyFor('conversation', 'other').policy, undefined, '其它对话作用域不受影响');
 
-      store.setCrossConversationCollaborationForScope('conversation', 'cross-a', false);
-      assert.equal(store.localPolicyFor('conversation', 'cross-a').policy.toolConfigs.run_agent.config.crossConversationCollaboration, false);
-      assert.deepEqual(store.localPolicyFor('conversation', 'cross-a').policy.allowedTools, ['read_file', 'run_agent', ...crossNames]);
-      store.setCrossConversationCollaborationForScope('conversation', 'cross-a', undefined);
-      assert.deepEqual(store.localPolicyFor('conversation', 'cross-a').policy.toolConfigs.run_agent.config, { maxConcurrentAgents: 3 });
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file', 'write', ...crossNames], 'Global');
+      assert.ok(store.effectivePolicyFor('conversation', 'plain').policy.allowedTools.includes('write'),
+        'a tool enabled globally later still reaches the conversation');
+
+      store.setCrossConversationCollaborationForScope('conversation', 'plain', false);
+      local = store.localPolicyFor('conversation', 'plain').policy;
+      assert.equal(local.allowedTools, undefined);
+      assert.deepEqual(local.toolConfigs, { run_agent: { config: { crossConversationCollaboration: false } } });
+
+      store.setCrossConversationCollaborationForScope('conversation', 'plain', undefined);
+      assert.equal(store.localPolicyFor('conversation', 'plain').policy, undefined, 'restoring inheritance removes the record the switch created');
+      assert.deepEqual(messages.at(-1), { ...messages.at(-1), type: 'toolPolicy.scope.clear', payload: { scopeKind: 'conversation', scopeId: 'plain' } });
       assert.throws(() => store.setCrossConversationCollaborationForScope('global', undefined, 'yes'), TypeError);
+    });
+
+    await t.test('全局没有保存策略时开启不写入默认列表，MCP 与默认关闭的工具不被挡住', async () => {
+      const { store, messages } = fresh(allDefinitions);
+      store.setCrossConversationCollaborationForScope('global', undefined, true);
+      const global = store.localPolicyFor('global').policy;
+      assert.equal(global.allowedTools, undefined, 'no global ceiling is written as a side effect');
+      assert.deepEqual(global.toolConfigs, switchOn);
+      assert.equal('allowedTools' in messages.at(-1).payload, false);
+      assert.deepEqual(sorted(store.effectivePolicyFor('agent', 'main').policy.allowedTools), sorted(builtinToolPolicies[0].allowedTools).filter((name) => name !== 'transfer'),
+        'the global view keeps showing the default list');
+
+      store.setCrossConversationCollaborationForScope('global', undefined, undefined);
+      assert.equal(store.localPolicyFor('global').policy, undefined, 'restoring the default removes the switch-only global record');
+      assert.deepEqual(messages.at(-1).payload, { scopeKind: 'global' });
+      assert.equal(messages.at(-1).type, 'toolPolicy.scope.clear');
+    });
+
+    await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
+      const { client, store, render } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file', 'write', ...crossNames], 'Global');
+      assert.deepEqual(store.effectivePolicyFor('agent', 'explore').policy.allowedTools, sorted(readonlyList),
+        'the settings view shows the built-in read-only list, not the global one');
+
+      store.setCrossConversationCollaborationForScope('agent', 'explore', true);
+      assert.equal(store.localPolicyFor('agent', 'explore').policy.allowedTools, undefined, 'the built-in read-only list stays in force');
+      assert.deepEqual(store.effectivePolicyFor('agent', 'explore').policy.allowedTools, sorted(readonlyList));
+      const html = await render(editor, { scopeKind: 'agent', scopeId: 'explore' });
+      assert.match(checkbox(html), /aria-checked="true"/);
+      assert.match(html, /只提供列出和读取对话/);
+      assert.doesNotMatch(html, /上层工具策略/);
+
+      store.setCrossConversationCollaborationForScope('workflow', 'builtin:readonly', true);
+      assert.equal(store.localPolicyFor('workflow', 'builtin:readonly').policy.allowedTools, undefined);
+      assert.deepEqual(store.effectivePolicyFor('workflow', 'builtin:readonly').policy.allowedTools, sorted(readonlyList));
+
+      store.setPolicyForScope('agent', 'reader', ['read_file'], 'Reader');
+      store.setCrossConversationCollaborationForScope('agent', 'reader', true);
+      assert.deepEqual(store.localPolicyFor('agent', 'reader').policy.allowedTools, ['read_file', 'list_conversations', 'read_conversation'],
+        'a scope without run_agent gains only the read-type tools');
+      store.setCrossConversationCollaborationForScope('agent', 'reader', false);
+      assert.deepEqual(store.localPolicyFor('agent', 'reader').policy.allowedTools, ['read_file']);
+    });
+
+    await t.test('扩展已有允许列表，关闭或恢复继承只移除开关加入的工具', async () => {
+      const { store, messages } = fresh(allDefinitions);
+      store.setPolicyForScope('conversation', 'custom', ['read_file', 'run_agent', 'list_conversations'], 'Custom', { run_agent: { config: { maxConcurrentAgents: 3 } } });
+      store.setCrossConversationCollaborationForScope('conversation', 'custom', true);
+      const added = ['read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'];
+      let local = store.localPolicyFor('conversation', 'custom').policy;
+      assert.deepEqual(local.allowedTools, ['read_file', 'run_agent', 'list_conversations', ...added]);
+      assert.deepEqual(local.toolConfigs.run_agent.config, { maxConcurrentAgents: 3, crossConversationCollaboration: true });
+      assert.deepEqual(messages.at(-1).payload.allowedTools, local.allowedTools);
+
+      store.setCrossConversationCollaborationForScope('conversation', 'custom', false);
+      local = store.localPolicyFor('conversation', 'custom').policy;
+      assert.deepEqual(local.allowedTools, ['read_file', 'run_agent', 'list_conversations'], 'a tool the user had before stays');
+      assert.equal(local.toolConfigs.run_agent.config.crossConversationCollaboration, false);
+
+      store.setCrossConversationCollaborationForScope('conversation', 'custom', true);
+      // A later manual edit of the list keeps only the additions the user did not remove.
+      store.setPolicyForScope('conversation', 'custom', store.localPolicyFor('conversation', 'custom').policy.allowedTools
+        .filter((name) => name !== 'create_conversation'), undefined, store.localPolicyFor('conversation', 'custom').policy.toolConfigs);
+      store.setCrossConversationCollaborationForScope('conversation', 'custom', undefined);
+      local = store.localPolicyFor('conversation', 'custom').policy;
+      assert.deepEqual(local.allowedTools, ['read_file', 'run_agent', 'list_conversations']);
+      assert.deepEqual(local.toolConfigs.run_agent.config, { maxConcurrentAgents: 3 }, 'the record keeps the user’s own settings');
+    });
+
+    await t.test('只改审批、预设或协作上限时不给本层新建工具列表，内置只读 Agent 仍保持只读', async () => {
+      const { client, store, bindings } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file', 'write', ...crossNames], 'Global', {
+        read_file: { config: {}, autoApproveExecution: false }
+      });
+      const explore = await bindings(toolEditor, { scopeKind: 'agent', scopeId: 'explore' });
+      explore.updateGateSetting(store.toolDefinitions.find((tool) => tool.name === 'read_file'), 'autoApproveExecution', true);
+      assert.equal(store.localPolicyFor('agent', 'explore').policy.allowedTools, undefined);
+      assert.deepEqual(store.effectivePolicyFor('agent', 'explore').policy.allowedTools, sorted(readonlyList));
+
+      store.setPolicyPresetForScope('conversation', 'preset-only', 'yolo');
+      const preset = store.localPolicyFor('conversation', 'preset-only').policy;
+      assert.equal(preset.allowedTools, undefined);
+      assert.deepEqual(preset.toolConfigs, {}, 'a preset change does not copy the global per-tool settings down');
+
+      store.setAgentCollaborationFieldForScope('agent', 'worker', 'maxChildAgentDepth', 0);
+      assert.equal(store.localPolicyFor('agent', 'worker').policy.allowedTools, undefined);
+      store.setAgentCollaborationFieldForScope('agent', 'worker', 'maxChildAgentDepth', undefined);
+      assert.equal(store.localPolicyFor('agent', 'worker').policy, undefined, 'restoring the only override removes the empty record');
+    });
+
+    await t.test('上层允许列表仍挡住跨对话工具时显示提示', async () => {
+      const { store, render } = fresh(allDefinitions);
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file'], 'Global');
+      store.setCrossConversationCollaborationForScope('conversation', 'blocked', true);
+      assert.match(await render(editor, { scopeKind: 'conversation', scopeId: 'blocked' }), /上层工具策略/);
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file', ...crossNames], 'Global');
+      assert.doesNotMatch(await render(editor, { scopeKind: 'conversation', scopeId: 'blocked' }), /上层工具策略/);
     });
   } finally {
     pinia.setActivePinia(previousPinia);

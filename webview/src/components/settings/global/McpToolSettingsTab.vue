@@ -166,10 +166,13 @@ function setToolGlobalEnabled(tool: ToolDefinitionRecord, enabled: boolean): voi
   if (enabled) disabled.delete(tool.name);
   else disabled.add(tool.name);
   next[sourceId] = { enabled: sourceConfig.enabled !== false, ...(disabled.size > 0 ? { disabledTools: [...disabled] } : {}) };
-  const allowedTools = enabled
-    ? globalPolicy.value?.allowedTools ?? []
-    : (globalPolicy.value?.allowedTools ?? []).filter((name) => name !== tool.name);
-  toolPolicyStore.setPolicyForScope('global', undefined, allowedTools, globalPolicy.value?.name, globalPolicy.value?.toolConfigs, next);
+  // Keep the saved global list state: without a saved list the source settings alone decide, and
+  // writing the displayed default list here would create a global ceiling as a side effect.
+  const saved = toolPolicyStore.localPolicyFor('global').policy;
+  const allowedTools = saved?.allowedTools && !enabled
+    ? saved.allowedTools.filter((name) => name !== tool.name)
+    : saved?.allowedTools;
+  toolPolicyStore.setPolicyForScope('global', undefined, allowedTools, saved?.name, saved?.toolConfigs, next);
 }
 
 function sourceForServer(serverId: string) {

@@ -843,6 +843,64 @@ test('VscodeConfigurationAuthority 让 Agent 缺省 preset 继承全局 YOLO，�
   }
 });
 
+test('未写允许列表的工具策略层不收窄上层，内置 Agent 与工作流仍用自己的工具列表', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-listless-tool-policy-'));
+  try {
+    const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+    const blueprints = createDefaultAgentBlueprints();
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Listless Provider' }),
+      id: 'provider:listless',
+      model: 'model:listless',
+      models: [{ id: 'model:listless', name: '模型' }],
+      modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const switchOn = { run_agent: { config: { crossConversationCollaboration: true } } };
+    const compile = async (executorAgentId, conversationId) => JSON.parse((await authority.compile({
+      conversationId, turnId: `turn:${conversationId}`, executorAgentId, intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+
+    // Global switch only: no global ceiling, so the main Agent keeps its whole default list
+    // (including tools the settings page lists as off by default).
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', toolConfigs: switchOn });
+    const main = await compile('main', 'conversation:main');
+    assert.deepEqual(main.allowedTools, [...blueprints.agents.main.toolPolicy.allowedTools].sort());
+    assert.ok(main.allowedTools.includes('transfer'));
+    assert.equal(main.toolConfigs.run_agent.config.crossConversationCollaboration, true);
+
+    // A switch-only Agent record keeps the built-in read-only list instead of replacing it.
+    await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: 'explore', toolConfigs: switchOn });
+    const explore = await compile('explore', 'conversation:explore');
+    assert.deepEqual(explore.allowedTools, [...blueprints.agents.explore.toolPolicy.allowedTools].sort());
+    for (const name of ['write', 'edit', 'delete', 'run_agent', 'send_conversation_message']) {
+      assert.equal(explore.allowedTools.includes(name), false, `${name} must stay out of the read-only Agent`);
+    }
+
+    await authority.mutations.setToolPolicy({ scopeKind: 'workflow', scopeId: 'builtin:readonly', toolConfigs: switchOn });
+    await authority.mutations.selectConversationWorkflow({ conversationId: 'conversation:readonly', scopeKind: 'workflow', workflowId: 'builtin:readonly' });
+    const readonly = await compile('main', 'conversation:readonly');
+    assert.deepEqual(readonly.allowedTools, [...blueprints.workflows.readonly.toolPolicy.allowedTools].sort());
+
+    // A saved list still narrows as before.
+    await authority.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: 'conversation:main', allowedTools: ['read', 'list_conversations'] });
+    assert.deepEqual((await compile('main', 'conversation:main')).allowedTools, ['list_conversations', 'read']);
+
+    const client = await authority.configurationClientState();
+    const builtin = (scopeKind, scopeId) => client.builtinToolPolicies.find((record) => record.scopeKind === scopeKind && record.scopeId === scopeId);
+    assert.deepEqual(builtin('agent', 'explore').allowedTools, blueprints.agents.explore.toolPolicy.allowedTools);
+    assert.deepEqual(builtin('agent', 'main').allowedTools, blueprints.agents.main.toolPolicy.allowedTools);
+    assert.deepEqual(builtin('workflow', 'builtin:review').allowedTools, blueprints.workflows.review.toolPolicy.allowedTools);
+    assert.equal(builtin('workflow', 'builtin:plan'), undefined, 'a workflow without its own list narrows nothing');
+    assert.equal(client.toolPolicies.find((record) => record.id === client.toolPolicyScopeLinks.find((link) => link.scopeKind === 'global').toolPolicyId).allowedTools, undefined);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('Ask/Plan 自动审批通过原有工具策略落盘、继承并允许局部关闭', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-auto-approval-settings-'));
   try {

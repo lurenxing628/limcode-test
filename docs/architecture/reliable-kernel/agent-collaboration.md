@@ -46,7 +46,7 @@ followup 的全部投递都失败时（例如排队期间目标对话被删除�
 
 ## 跨对话协作
 
-「Agent 协作」页的「跨对话协作」开关写入同一 `run_agent.config` 的 `crossConversationCollaboration`，默认关闭，可在全局、Agent、对话和工作流作用域覆盖，并在 Turn authority 中冻结。只有布尔值 `true` 表示开启；手工写入的非布尔值（例如字符串 `"true"`）按关闭处理，不会让整轮失败。在设置界面开启时，同时把下列工具加入该作用域的 `allowedTools`；关闭或恢复继承不改动允许列表。后端从不绕过用户保存的允许列表。
+「Agent 协作」页的「跨对话协作」开关写入同一 `run_agent.config` 的 `crossConversationCollaboration`，默认关闭，可在全局、Agent、对话和工作流作用域覆盖，并在 Turn authority 中冻结。只有布尔值 `true` 表示开启；手工写入的非布尔值（例如字符串 `"true"`）按关闭处理，不会让整轮失败。在设置界面开启时，若该作用域已单独保存 `allowedTools`，把其中缺少的下列工具加入（该作用域有效工具列表不含 `run_agent` 时只加入读取类的两个），并记在 `crossConversationGrantedTools`，关闭或恢复继承时只移除这些；若该作用域没有单独的工具列表，只保存开关，不写 `allowedTools`：没有列表的 ToolPolicy 记录不收窄上层，内置 Agent/工作流仍使用自己的内置列表。恢复继承后记录为空时删除该记录。后端从不绕过用户保存的允许列表。
 
 - `list_conversations`、`read_conversation`（只读）：列出本 Runtime 其他活动的顶层对话，读取其用户与模型消息，按 `olderMessageRef` 分页，不启动、不改变、也不确认目标。结果附不可信数据提示。
 - `send_conversation_message`：`followup` 或 `message`，固定排队到目标本轮结束；followup 完成后的回复自动回到发送方。

@@ -10,7 +10,8 @@ export type ResolvedToolPolicyPreset = Exclude<ToolPolicyPresetKind, 'inherit'>;
 
 export interface ToolPolicyLayerValue {
   id?: string;
-  allowedTools: readonly string[];
+  /** Absent: this layer sets per-tool settings only and narrows nothing. */
+  allowedTools?: readonly string[];
   preset?: ToolPolicyPresetKind;
   toolConfigs?: Readonly<Record<string, ToolPolicyToolConfigRecord>>;
   sourceConfigs?: Readonly<Record<string, ToolPolicySourceConfigRecord>>;
@@ -32,8 +33,8 @@ export interface ResolvedToolPolicy {
 /**
  * Compiles raw settings layers in canonical low-to-high order.
  *
- * Capability lists are monotone: every layer is an upper bound and may only narrow the tools
- * admitted by an earlier layer. YOLO changes approval/application behavior only; it never widens
+ * Capability lists are monotone: every layer with a list is an upper bound and may only narrow the
+ * tools admitted by an earlier layer; a layer without a list narrows nothing. YOLO changes approval/application behavior only; it never widens
  * a Global/Agent/Workflow capability boundary. `inherit` (and the pre-preset shape where preset
  * is absent) inherits only the Global execution preset, while the layer's allowedTools and
  * per-tool settings remain active.
@@ -53,7 +54,7 @@ export function resolveToolPolicyLayers(
 
   const universe = uniqueNames([
     ...(availableToolNames ?? []),
-    ...layers.flatMap((layer) => layer.policy.allowedTools)
+    ...layers.flatMap((layer) => layer.policy.allowedTools ?? [])
   ]);
   let allowed = new Set(universe);
 
@@ -68,8 +69,10 @@ export function resolveToolPolicyLayers(
       preset = explicitPreset(rawPreset) ?? globalPreset;
     }
 
-    const ceiling = new Set(uniqueNames(layer.policy.allowedTools));
-    allowed = new Set([...allowed].filter((name) => ceiling.has(name)));
+    if (layer.policy.allowedTools) {
+      const ceiling = new Set(uniqueNames(layer.policy.allowedTools));
+      allowed = new Set([...allowed].filter((name) => ceiling.has(name)));
+    }
 
     mergeToolConfigs(toolConfigs, layer.policy.toolConfigs);
     mergeSourceConfigs(sourceConfigs, layer.policy.sourceConfigs);

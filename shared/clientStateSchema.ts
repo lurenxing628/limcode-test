@@ -336,6 +336,7 @@ export const CLIENT_STATE_TABLES = {
   runPlanProposalLinks: upsertRemoveTable('runPlanProposalLink', 'link', { scope: { kind: 'conversationVia', table: 'agentRuns', localField: 'runId', foreignField: 'id' } }),
   toolPolicies: upsertRemoveTable('toolPolicy', 'toolPolicy'),
   toolPolicyScopeLinks: upsertRemoveTable('toolPolicyScopeLink', 'link'),
+  builtinToolPolicies: upsertRemoveTable('builtinToolPolicy', 'toolPolicy'),
   skillDefinitions: upsertRemoveTable('skillDefinition', 'skillDefinition'),
   skillPolicies: upsertRemoveTable('skillPolicy', 'skillPolicy'),
   skillPolicyScopeLinks: upsertRemoveTable('skillPolicyScopeLink', 'link'),
