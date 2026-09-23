@@ -190,7 +190,9 @@ test('authorized conversation history uses a separate reference kind from collab
 });
 
 
-test('cross-conversation dispatch requires the frozen switch and always queues sends behind a running target', async () => {
+// Queueing behind a running target is asserted end to end in cross-conversation-tools.test.mjs; this
+// boundary test only pins what the dispatcher asks the control plane for.
+test('cross-conversation dispatch requires the frozen switch and asks the control plane to queue every send', async () => {
   for (const crossConversation of [undefined, false]) {
     const f = fixture({ toolName: 'send_conversation_message', args: { targetConversationId: 'peer', text: 'hello', mode: 'followup' }, crossConversation });
     await assert.rejects(f.dispatcher.dispatch(f.input, undefined, f.authority), /not enabled/);

@@ -359,6 +359,53 @@ test('a followup to a running conversation waits for its Turn to end, then start
   });
 });
 
+test('a message to a running conversation is never injected into its Turn and joins the next Turn without starting one', { timeout: 60000 }, async () => {
+  const NOTE = 'CROSS_QUEUED_NOTE_7801';
+  let rootRound = 0, peerFirstTurn, noteSeen;
+  await fixture(async (request, f, start, wire) => {
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === PEER) {
+      if (!peerFirstTurn) {
+        peerFirstTurn = request.turnId;
+        await f.until(async () => (await f.rows('CollaborationMessageTargetLink', { conversation_id: PEER })).length > 0, 'Root never sent to the running peer.');
+        // Give the running Turn a real safe boundary: a second model request in the same Turn.
+        return toolsAnswer(call('peer-list', 'list_conversations'));
+      }
+      if (request.turnId === peerFirstTurn) {
+        assert.ok(!text.includes(NOTE), 'the running Turn never sees the queued message');
+        return answer('Peer finished its own work.');
+      }
+      noteSeen = text.includes(NOTE);
+      assertPeerWireRole(wire, NOTE);
+      return answer('Peer read the note.');
+    }
+    rootRound += 1;
+    if (rootRound === 1) {
+      await f.until(() => peerFirstTurn, 'Peer never started.');
+      return toolsAnswer(call('list', 'list_conversations'));
+    }
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('send', 'send_conversation_message', { conversationRef: peer.conversationRef, text: NOTE, mode: 'message' }));
+    }
+    assert.equal(detail(start, 'send_conversation_message').queued, true);
+    return answer('Informed the peer.');
+  }, async f => {
+    const peer = await f.input(PEER, 'peer-own-work');
+    const root = await f.input(ROOT, 'inform');
+    await f.terminated(root.turnId);
+    assert.equal((await f.terminated(peer.turnId)).terminal_status, 'completed');
+    assert.deepEqual(await f.rows('PendingTurnInput', { turn_id: peer.turnId }), [], 'never injected into the running Turn');
+    const [delivery] = await f.rows('RuntimeDelivery', { target_conversation_id: PEER });
+    assert.deepEqual([delivery.state, delivery.phase, delivery.target_turn_id], ['pending', 'next_turn', null]);
+    assert.equal((await f.rows('Turn', { conversation_id: PEER })).length, 1, 'a message never starts a Turn');
+    const next = await f.input(PEER, 'anything new?');
+    assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+    assert.equal(noteSeen, true, 'the message joins the next Turn');
+    assert.equal((await f.rows('RuntimeDelivery', { id: delivery.id }))[0].target_turn_id, next.turnId);
+  });
+});
+
 test('a user Turn that wins the race after the anchor ends leaves the queued peer task to its own Turn', { timeout: 60000 }, async () => {
   const TASK = 'CROSS_RACE_TASK_8801';
   const RESULT = 'CROSS_RACE_RESULT_8802';
