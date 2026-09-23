@@ -686,7 +686,7 @@ test('create_conversation interrupted between its steps resumes on replay withou
     const id = kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId('create'));
     await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'The resumed conversation never answered.');
     assert.equal((await f.rows('Conversation', { id })).length, 1);
-    assert.equal((await f.settingsFor(id)).modelProfiles.length, 1, 'the settings written before the crash are reused');
+    assert.equal((await f.settingsFor(id)).modelProfiles.length, 1, 'the replay writes the settings again');
     assert.equal((await f.rows('CollaborationMessage')).filter(message => message.mode === 'followup').length, 1);
     assert.equal((await f.rows('Turn', { conversation_id: id })).length, 1);
     assert.equal(createdTurns, 1);
@@ -702,7 +702,43 @@ test('create_conversation interrupted between its steps resumes on replay withou
     } finally { mutations.initializeConversationModelProfile = original; }
     const id = kernel.stablePhaseFId('conversation', 'cross-create', input.toolCallId);
     assert.deepEqual(await f.rows('Conversation', { id }), [], 'an interrupted creation leaves no conversation');
+    assert.deepEqual(await f.settingsFor(id), { modelProfiles: [], workEnvironments: [] }, 'nor the work environment and model profile it had written');
     assert.deepEqual(await f.rows('CollaborationMessage'), []);
+  } });
+});
+
+test('create_conversation refused by the atomic send after admission leaves no settings behind', { timeout: 60000 }, async () => {
+  const TASK = 'REFUSED_AFTER_ADMISSION_3305';
+  let rootRound = 0, refused = false;
+  await fixture(async (request, f) => {
+    if (request.conversationId !== ROOT) return answer('created conversation done');
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('create', 'create_conversation', { prompt: TASK, title: 'Raced' }));
+    return answer('Created.');
+  }, async f => {
+    const started = await f.input(ROOT, 'create a separate conversation');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(refused, true);
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'The created conversation never answered.');
+  }, { dispatchHook: async (input, f) => {
+    if (input.toolName !== 'create_conversation' || refused) return;
+    refused = true;
+    // Admission passed, then another Turn of the chain spent the last followup: the atomic send refuses.
+    const collaboration = f.app.runtime.collaboration;
+    const mutations = f.configuration.mutations;
+    const original = collaboration.send, clear = mutations.clearConversationConfiguration;
+    const create = () => f.lifecycle.createForCollaboration({ turnId: input.turnId, toolCallId: input.toolCallId, sourceConversationId: ROOT, prompt: TASK, title: 'Raced' });
+    const id = kernel.stablePhaseFId('conversation', 'cross-create', input.toolCallId);
+    collaboration.send = async function() { throw new Error('Automatic followup budget exhausted (1).'); };
+    try {
+      // A failing cleanup is only logged: the model still learns why the creation was refused.
+      mutations.clearConversationConfiguration = async function() { throw new Error('settings store unavailable'); };
+      try { await assert.rejects(create(), /budget exhausted/); } finally { mutations.clearConversationConfiguration = clear; }
+      assert.equal((await f.settingsFor(id)).modelProfiles.length, 1, 'fixture: the failed cleanup left the settings');
+      await assert.rejects(create(), /budget exhausted/);
+    } finally { collaboration.send = original; }
+    assert.deepEqual(await f.rows('Conversation', { id }), []);
+    assert.deepEqual(await f.settingsFor(id), { modelProfiles: [], workEnvironments: [] }, 'the refused creation clears the settings it wrote');
   } });
 });
 

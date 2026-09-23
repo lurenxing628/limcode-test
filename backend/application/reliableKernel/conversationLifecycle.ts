@@ -95,8 +95,9 @@ export class ReliableConversationLifecycle {
    * Creates a top-level Conversation whose first Turn is a collaboration task from the calling
    * Turn, never a user message. Every check that can refuse the task runs before anything is
    * written; the Conversation, its links and the task then commit in one transaction, so a refused
-   * or interrupted creation leaves no Conversation behind. The first task is the durable creation
-   * marker: it outlives the Conversation, so a replay after the user deleted it creates nothing.
+   * or interrupted creation leaves no Conversation behind, and a failed attempt clears the settings
+   * it wrote. The first task is the durable creation marker: it outlives the Conversation, so a
+   * replay after the user deleted it creates nothing.
    */
   public async createForCollaboration(request: CreatedConversationRequest): Promise<{
     conversationId: string; title: string; messageId: string; deduplicated: boolean;
@@ -126,39 +127,62 @@ export class ReliableConversationLifecycle {
         const replayed = await collaboration.send(task);
         return { conversationId, title: String(existing.title), messageId: replayed.messageId, deduplicated: true };
       }
-      await collaboration.admitConversationCreation({ turnId, toolCallId });
-      // The calling Turn's frozen selection fixes the model and work environment the new
-      // Conversation starts with; everything else comes from its own settings scopes.
-      const [model, environment, agent, project] = await Promise.all([
-        this.application.runtime.children.frozenModelSelectionForTurn(turnId),
-        this.application.runtime.children.frozenWorkEnvironmentPolicyForTurn(turnId),
-        this.configuration.resolveAgent({ agentType: 'main' }),
-        projectFolderForConversation(this.application.database, sourceConversationId)
-      ]);
-      // Settings go first and only fill empty slots: an interruption before the commit leaves
-      // settings nothing refers to, which the replay of this call reuses.
-      if (environment?.defaultWorkEnvironmentId) {
-        await this.configuration.mutations.initializeConversationWorkEnvironment(conversationId, environment.defaultWorkEnvironmentId);
+      try {
+        await collaboration.admitConversationCreation({ turnId, toolCallId });
+        // The calling Turn's frozen selection fixes the model and work environment the new
+        // Conversation starts with; everything else comes from its own settings scopes.
+        const [model, environment, agent, project] = await Promise.all([
+          this.application.runtime.children.frozenModelSelectionForTurn(turnId),
+          this.application.runtime.children.frozenWorkEnvironmentPolicyForTurn(turnId),
+          this.configuration.resolveAgent({ agentType: 'main' }),
+          projectFolderForConversation(this.application.database, sourceConversationId)
+        ]);
+        // Settings go first and only fill empty slots. A failed attempt clears them again; only a
+        // Host that dies before the commit leaves settings nothing refers to, which the replay of
+        // this call reuses.
+        if (environment?.defaultWorkEnvironmentId) {
+          await this.configuration.mutations.initializeConversationWorkEnvironment(conversationId, environment.defaultWorkEnvironmentId);
+        }
+        await this.configuration.mutations.initializeConversationModelProfile({ conversationId, ...model });
+        const now = new Date().toISOString();
+        const sent = await collaboration.send({ ...task, newConversationSteps: [
+          DOMAIN_REPOSITORIES.domain('Conversation').insert({
+            id: conversationId, title, status: 'active', created_at: now, updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+            id: stablePhaseFId('agent_conversation_link', conversationId), conversation_id: conversationId,
+            agent_id: agent.agentId, role: 'default', created_at: now, updated_at: now
+          }),
+          ...(project ? projectFolderAssignmentSteps({ conversationId, folder: project, now }) : [])
+        ] });
+        return {
+          conversationId,
+          title: String((await this.requireRow('Conversation', conversationId)).title),
+          messageId: sent.messageId,
+          deduplicated: sent.deduplicated
+        };
+      } catch (error) {
+        await this.discardUncreatedConversationSettings(conversationId);
+        throw error;
       }
-      await this.configuration.mutations.initializeConversationModelProfile({ conversationId, ...model });
-      const now = new Date().toISOString();
-      const sent = await collaboration.send({ ...task, newConversationSteps: [
-        DOMAIN_REPOSITORIES.domain('Conversation').insert({
-          id: conversationId, title, status: 'active', created_at: now, updated_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
-          id: stablePhaseFId('agent_conversation_link', conversationId), conversation_id: conversationId,
-          agent_id: agent.agentId, role: 'default', created_at: now, updated_at: now
-        }),
-        ...(project ? projectFolderAssignmentSteps({ conversationId, folder: project, now }) : [])
-      ] });
-      return {
-        conversationId,
-        title: String((await this.requireRow('Conversation', conversationId)).title),
-        messageId: sent.messageId,
-        deduplicated: sent.deduplicated
-      };
     });
+  }
+
+  /**
+   * A creation refused after admission (a budget race, the source Turn stopped, a settings write
+   * failing midway) never commits its Conversation; the settings it wrote are removed under the
+   * same ownership pin. A cleanup failure is logged and never replaces the original error.
+   */
+  private async discardUncreatedConversationSettings(conversationId: string): Promise<void> {
+    try {
+      if (await this.maybeRow('Conversation', conversationId)) return;
+      await this.configuration.mutations.clearConversationConfiguration(conversationId);
+    } catch (cleanupError) {
+      console.warn(
+        `[reliable-kernel] failed to clear settings of the uncreated conversation ${conversationId}:`,
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      );
+    }
   }
 
   private async committedForkBoundary(commandId: string): Promise<{ messageId: string; expectedRevisionId: string } | undefined> {
