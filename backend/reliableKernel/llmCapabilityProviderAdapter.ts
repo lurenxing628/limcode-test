@@ -63,6 +63,7 @@ import {
   type ModelHandleCatalog
 } from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
@@ -1667,17 +1668,7 @@ function providerToolAllowed(
   policy: ReturnType<typeof authorityToolPolicy>,
   tool: NormalizedProviderToolDefinition
 ): boolean {
-  const explicitlyAllowed = policy.allowedTools.has(tool.schema.name);
-  if (tool.source?.kind !== 'mcp' || typeof tool.source.sourceId !== 'string' || !tool.source.sourceId.trim()) {
-    return explicitlyAllowed;
-  }
-  const config = policy.sourceConfigs[tool.source.sourceId];
-  if (!config || typeof config !== 'object' || Array.isArray(config)) return explicitlyAllowed;
-  if (config.enabled !== true) return false;
-  const disabled = Array.isArray(config.disabledTools)
-    ? config.disabledTools.filter((name): name is string => typeof name === 'string')
-    : [];
-  return !disabled.includes(tool.schema.name);
+  return toolAllowedByPolicy(policy, { name: tool.schema.name, ...(tool.source ? { source: tool.source } : {}) });
 }
 
 function shouldFreezeFailedPartialOutput(request: FullProviderRequest, error: unknown): boolean {

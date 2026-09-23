@@ -1048,6 +1048,12 @@ export interface ToolPolicySourceConfigRecord {
   disabledTools?: string[];
 }
 
+/**
+ * sourceConfigs key that denies every MCP source the same layer does not enable itself. Built-in
+ * read-only Agents and workflows carry it, so a server enabled at another layer never reaches them.
+ */
+export const TOOL_POLICY_ALL_MCP_SOURCES = '*';
+
 export interface ToolPolicyRecord {
   id: string;
   name: string;
@@ -1079,6 +1085,8 @@ export interface BuiltinToolPolicyRecord {
   scopeKind: 'agent' | 'workflow';
   scopeId: string;
   allowedTools: string[];
+  /** Built-in MCP source restrictions, for example the read-only scopes' all-sources deny. */
+  sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;
 }
 
 export interface ToolPolicyScopeLinkRecord {

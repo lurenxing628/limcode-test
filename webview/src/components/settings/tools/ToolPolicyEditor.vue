@@ -11,7 +11,8 @@ import type {
   ToolPolicyScopeKind,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
-import { ASK_USER_TOOL_NAME, EDIT_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
+import { ASK_USER_TOOL_NAME, EDIT_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
+import { mcpSourceConfigFor, toolAllowedByPolicy } from '@shared/toolPolicyResolution';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
@@ -72,6 +73,8 @@ const visibleTools = computed(() => {
   return builtinTools.value.filter((tool) => toolScope(tool) === scope);
 });
 const visibleEnabledCount = computed(() => visibleTools.value.filter((tool) => isToolEnabled(tool)).length);
+/** A built-in read-only Agent or workflow denies every MCP source it does not enable itself. */
+const mcpSourcesDeniedHere = computed(() => !!store.builtinPolicyFor(props.scopeKind, props.scopeId)?.sourceConfigs?.[TOOL_POLICY_ALL_MCP_SOURCES]);
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
 const canRestoreDefault = computed(() => {
   if (props.scopeKind !== 'global' || props.readonly) return false;
@@ -158,18 +161,13 @@ function updatePolicyPreset(value: ToolPolicyPresetKind): void {
   store.setPolicyPresetForScope(props.scopeKind, props.scopeId, value);
 }
 
+/** The backend's own admission rule over the effective policy (MCP tools follow source settings). */
 function isToolEnabled(tool: ToolDefinitionRecord): boolean {
-  if (allowedSet.value.has(tool.name)) return true;
-  if (tool.source?.kind !== 'mcp') return false;
-  const sourceId = tool.source.sourceId;
-  if (!sourceId) return false;
-  const sourceConfig = effectivePolicy.value?.sourceConfigs?.[sourceId];
-  if (!sourceConfig?.enabled) return false;
-  return !(sourceConfig.disabledTools ?? []).includes(tool.name);
+  return toolAllowedByPolicy({ allowedTools: allowedSet.value, sourceConfigs: effectivePolicy.value?.sourceConfigs }, tool);
 }
 
 function isMcpSourceEnabled(sourceId: string): boolean {
-  return effectivePolicy.value?.sourceConfigs?.[sourceId]?.enabled === true;
+  return mcpSourceConfigFor(effectivePolicy.value?.sourceConfigs, sourceId)?.enabled === true;
 }
 
 function toggleMcpSource(sourceId: string, enabled: boolean): void {
@@ -584,6 +582,7 @@ function inputNumber(event: Event): number {
       <div class="mcp-source-heading">
         <span>MCP 服务</span>
         <small>关闭某个 MCP 服务会停用它提供的全部工具；展开单个工具后仍可调整执行确认与显示。</small>
+        <small v-if="mcpSourcesDeniedHere">内置只读 Agent 和工作流默认不使用 MCP 工具，其它范围开启的服务不会带到这里；需要时在这里单独开启对应服务。</small>
       </div>
       <div class="mcp-source-list">
         <article v-for="group in mcpSourceGroups" :key="group.source.id" class="mcp-source-item">

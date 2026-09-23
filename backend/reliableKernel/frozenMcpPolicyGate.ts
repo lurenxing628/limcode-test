@@ -7,6 +7,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { contextRootContainsCompleteToolPair } from './turnControlPlane';
+import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 
 export type FrozenPlanReviewRiskLevel = 'read' | 'write' | 'command' | 'agent';
 
@@ -225,17 +226,13 @@ function mcpToolAllowed(
   policy: { [key: string]: PlainJsonValue },
   tool: { displayName: string; serverId: string }
 ): boolean {
-  const explicitlyAllowed = Array.isArray(policy.allowedTools)
-    && policy.allowedTools.some((name) => name === tool.displayName);
-  const sources = policy.sourceConfigs;
-  if (!sources || typeof sources !== 'object' || Array.isArray(sources)) return explicitlyAllowed;
-  const config = sources[tool.serverId];
-  if (!config || typeof config !== 'object' || Array.isArray(config)) return explicitlyAllowed;
-  if (config.enabled !== true) return false;
-  const disabled = Array.isArray(config.disabledTools)
-    ? config.disabledTools.filter((name): name is string => typeof name === 'string')
+  const allowedTools = Array.isArray(policy.allowedTools)
+    ? policy.allowedTools.filter((name): name is string => typeof name === 'string')
     : [];
-  return !disabled.includes(tool.displayName);
+  return toolAllowedByPolicy({ allowedTools, sourceConfigs: policy.sourceConfigs }, {
+    name: tool.displayName,
+    source: { kind: 'mcp', sourceId: tool.serverId }
+  });
 }
 
 function requireId(value: unknown, label: string): string {

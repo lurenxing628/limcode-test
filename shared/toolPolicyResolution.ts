@@ -1,9 +1,10 @@
-import type {
-  ToolConfigRecord,
-  ToolPolicyPresetKind,
-  ToolPolicyScopeKind,
-  ToolPolicySourceConfigRecord,
-  ToolPolicyToolConfigRecord
+import {
+  TOOL_POLICY_ALL_MCP_SOURCES,
+  type ToolConfigRecord,
+  type ToolPolicyPresetKind,
+  type ToolPolicyScopeKind,
+  type ToolPolicySourceConfigRecord,
+  type ToolPolicyToolConfigRecord
 } from './protocol';
 
 export type ResolvedToolPolicyPreset = Exclude<ToolPolicyPresetKind, 'inherit'>;
@@ -22,11 +23,15 @@ export interface ToolPolicyLayer {
   policy: ToolPolicyLayerValue;
 }
 
-/** The list a built-in Agent or workflow narrows to while its scope saves no list of its own. */
+/**
+ * The list a built-in Agent or workflow narrows to while its scope saves no list of its own, and the
+ * MCP source restrictions it always carries.
+ */
 export interface BuiltinToolPolicyLayerValue {
   id?: string;
   allowedTools: readonly string[];
   toolConfigs?: Readonly<Record<string, ToolPolicyToolConfigRecord>>;
+  sourceConfigs?: Readonly<Record<string, ToolPolicySourceConfigRecord>>;
 }
 
 /** The parts of a tool definition that decide whether it belongs to the default tool set. */
@@ -57,8 +62,10 @@ export function defaultToolNames(definitions: readonly ToolPolicyCatalogEntry[])
 /**
  * One settings scope as a layer: the saved record, a saved record without a list keeping the
  * scope's built-in list (so settings that only store per-tool config never widen a built-in
- * read-only Agent or workflow), or the built-in list alone. The backend compile and the settings
- * view build every layer here.
+ * read-only Agent or workflow), or the built-in list alone. A built-in scope's MCP source
+ * restrictions always stay in its layer; the scope's own saved source settings apply over them, so
+ * enabling a source at that Agent or workflow scope is the one way to opt it in. The backend
+ * compile and the settings view build every layer here.
  */
 export function toolPolicyScopeLayer(
   scopeKind: ToolPolicyScopeKind,
@@ -66,8 +73,18 @@ export function toolPolicyScopeLayer(
   builtin: BuiltinToolPolicyLayerValue | undefined
 ): ToolPolicyLayer | undefined {
   if (saved) {
-    const policy = saved.allowedTools !== undefined || !builtin ? saved : { ...saved, allowedTools: builtin.allowedTools };
-    return { scopeKind, policy };
+    if (!builtin) return { scopeKind, policy: saved };
+    const sourceConfigs = builtin.sourceConfigs || saved.sourceConfigs
+      ? { ...(builtin.sourceConfigs ?? {}), ...(saved.sourceConfigs ?? {}) }
+      : undefined;
+    return {
+      scopeKind,
+      policy: {
+        ...saved,
+        ...(saved.allowedTools === undefined ? { allowedTools: builtin.allowedTools } : {}),
+        ...(sourceConfigs ? { sourceConfigs } : {})
+      }
+    };
   }
   if (!builtin) return undefined;
   return {
@@ -75,9 +92,44 @@ export function toolPolicyScopeLayer(
     policy: {
       ...(builtin.id ? { id: builtin.id } : {}),
       allowedTools: builtin.allowedTools,
-      ...(builtin.toolConfigs ? { toolConfigs: builtin.toolConfigs } : {})
+      ...(builtin.toolConfigs ? { toolConfigs: builtin.toolConfigs } : {}),
+      ...(builtin.sourceConfigs ? { sourceConfigs: builtin.sourceConfigs } : {})
     }
   };
+}
+
+/** The source settings that decide one MCP source: its own entry, else an all-sources deny. */
+export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): ToolPolicySourceConfigRecord | undefined {
+  if (!isPlainRecord(sourceConfigs)) return undefined;
+  const config = sourceConfigs[sourceId] ?? sourceConfigs[TOOL_POLICY_ALL_MCP_SOURCES];
+  if (!isPlainRecord(config)) return undefined;
+  return {
+    enabled: config.enabled === true,
+    ...(Array.isArray(config.disabledTools)
+      ? { disabledTools: config.disabledTools.filter((name): name is string => typeof name === 'string') }
+      : {})
+  };
+}
+
+/**
+ * Whether a resolved (frozen) ToolPolicy admits one tool. A built-in tool needs its name in the
+ * list. An MCP tool follows its source settings: an enabled source admits every tool it does not
+ * disable, a disabled or denied source admits none, and a source no layer configures falls back to
+ * the list. Offering, dispatch admission, the MCP policy gate and the settings view all use this.
+ */
+export function toolAllowedByPolicy(
+  policy: { allowedTools: ReadonlySet<string> | readonly string[]; sourceConfigs?: unknown },
+  tool: { name: string; source?: { kind?: unknown; sourceId?: unknown } | null }
+): boolean {
+  const explicitlyAllowed = Array.isArray(policy.allowedTools)
+    ? policy.allowedTools.includes(tool.name)
+    : (policy.allowedTools as ReadonlySet<string>).has(tool.name);
+  const sourceId = tool.source?.kind === 'mcp' && typeof tool.source.sourceId === 'string' ? tool.source.sourceId.trim() : '';
+  if (!sourceId) return explicitlyAllowed;
+  const config = mcpSourceConfigFor(policy.sourceConfigs, sourceId);
+  if (!config) return explicitlyAllowed;
+  if (!config.enabled) return false;
+  return !(config.disabledTools ?? []).includes(tool.name);
 }
 
 /**
@@ -205,14 +257,31 @@ function mergeToolConfigs(
   }
 }
 
+/**
+ * Merges one layer's MCP source settings. An all-sources entry only denies: every source this layer
+ * does not enable itself turns off, and later layers cannot turn it back on (it stays the fallback
+ * for sources they name). The layer's own source entries then apply over what earlier layers left,
+ * so they re-enable nothing an ancestor denied.
+ */
 function mergeSourceConfigs(
   target: Record<string, ToolPolicySourceConfigRecord>,
   source: Readonly<Record<string, ToolPolicySourceConfigRecord>> | undefined
 ): void {
-  for (const [rawSourceId, incoming] of Object.entries(source ?? {})) {
+  const entries = Object.entries(source ?? {}).flatMap(([rawSourceId, incoming]) => {
     const sourceId = rawSourceId.trim();
-    if (!sourceId || !incoming || typeof incoming !== 'object' || Array.isArray(incoming)) continue;
-    const current = target[sourceId];
+    return sourceId && incoming && typeof incoming === 'object' && !Array.isArray(incoming)
+      ? [[sourceId, incoming] as const]
+      : [];
+  });
+  const ancestors = { ...target };
+  const denyAll = entries.some(([sourceId, incoming]) => sourceId === TOOL_POLICY_ALL_MCP_SOURCES && incoming.enabled !== true);
+  if (denyAll) {
+    for (const [sourceId, current] of Object.entries(target)) target[sourceId] = { ...current, enabled: false };
+    target[TOOL_POLICY_ALL_MCP_SOURCES] = { enabled: false };
+  }
+  for (const [sourceId, incoming] of entries) {
+    if (sourceId === TOOL_POLICY_ALL_MCP_SOURCES) continue;
+    const current = ancestors[sourceId] ?? ancestors[TOOL_POLICY_ALL_MCP_SOURCES];
     const disabledTools = uniqueNames([
       ...(current?.disabledTools ?? []),
       ...(incoming.disabledTools ?? [])

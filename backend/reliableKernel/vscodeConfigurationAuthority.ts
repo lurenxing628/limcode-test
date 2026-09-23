@@ -1315,13 +1315,17 @@ function builtinToolPolicyRecords(agents: readonly AgentRecord[], workflows: rea
   const records: BuiltinToolPolicyRecord[] = [];
   for (const agent of agents) {
     const builtin = BUILTIN_AGENT_DEFINITIONS[agent.kind] ?? BUILTIN_AGENT_DEFINITIONS[agent.id];
-    if (builtin) records.push({ id: `builtin-tool-policy:agent:${agent.id}`, scopeKind: 'agent', scopeId: agent.id, allowedTools: [...builtin.toolPolicy.allowedTools] });
+    if (builtin) {
+      records.push({ id: `builtin-tool-policy:agent:${agent.id}`, scopeKind: 'agent', scopeId: agent.id, allowedTools: [...builtin.toolPolicy.allowedTools],
+        ...(builtin.toolPolicy.sourceConfigs ? { sourceConfigs: clonePlain(builtin.toolPolicy.sourceConfigs) } : {}) });
+    }
   }
   for (const workflow of workflows) {
     const builtin = BUILTIN_WORKFLOW_DEFINITIONS[workflow.id]
       ?? Object.values(BUILTIN_WORKFLOW_DEFINITIONS).find((candidate) => candidate.id === workflow.id);
     if (builtin?.toolPolicy) {
-      records.push({ id: `builtin-tool-policy:workflow:${workflow.id}`, scopeKind: 'workflow', scopeId: workflow.id, allowedTools: [...builtin.toolPolicy.allowedTools] });
+      records.push({ id: `builtin-tool-policy:workflow:${workflow.id}`, scopeKind: 'workflow', scopeId: workflow.id, allowedTools: [...builtin.toolPolicy.allowedTools],
+        ...(builtin.toolPolicy.sourceConfigs ? { sourceConfigs: clonePlain(builtin.toolPolicy.sourceConfigs) } : {}) });
     }
   }
   return records;

@@ -12,6 +12,7 @@ import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading'
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
+import { mcpSourceConfigFor, toolAllowedByPolicy } from '@shared/toolPolicyResolution';
 
 const settings = useGlobalSettingsStore();
 const clientState = useClientStateStore();
@@ -147,14 +148,11 @@ function cloneSourceConfigs(): Record<string, ToolPolicySourceConfigRecord> {
 }
 
 function isSourceGloballyEnabled(sourceId: string): boolean {
-  return globalPolicy.value?.sourceConfigs?.[sourceId]?.enabled === true;
+  return mcpSourceConfigFor(globalPolicy.value?.sourceConfigs, sourceId)?.enabled === true;
 }
 
 function isToolGloballyEnabled(tool: ToolDefinitionRecord): boolean {
-  if (globalPolicy.value?.allowedTools.includes(tool.name)) return true;
-  const sourceId = tool.source?.sourceId;
-  if (!sourceId || !isSourceGloballyEnabled(sourceId)) return false;
-  return !(globalPolicy.value?.sourceConfigs?.[sourceId]?.disabledTools ?? []).includes(tool.name);
+  return !!globalPolicy.value && toolAllowedByPolicy(globalPolicy.value, tool);
 }
 
 function setToolGlobalEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {

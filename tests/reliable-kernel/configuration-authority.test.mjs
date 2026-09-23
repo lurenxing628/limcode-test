@@ -901,6 +901,44 @@ test('未写允许列表的工具策略层不收窄上层，内置 Agent 与工�
   }
 });
 
+test('MCP 全来源拒绝只由内置只读范围携带，更具体的层不能重新开启，只有该层自己的来源设置能开启', () => {
+  const { toolAllowedByPolicy, toolPolicyScopeLayer } = require('../../dist/extension/shared/toolPolicyResolution.js');
+  const { TOOL_POLICY_ALL_MCP_SOURCES } = require('../../dist/extension/shared/protocol.js');
+  const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+  const blueprints = createDefaultAgentBlueprints();
+  const denyAll = { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } };
+  for (const policy of [blueprints.agents.explore, blueprints.agents.reviewer, blueprints.workflows.review, blueprints.workflows.readonly].map((item) => item.toolPolicy)) {
+    assert.deepEqual(policy.sourceConfigs, denyAll, `${policy.name} denies every MCP source`);
+  }
+  for (const policy of [blueprints.agents.main.toolPolicy, blueprints.agents.worker.toolPolicy]) assert.equal(policy.sourceConfigs, undefined);
+  const tool = (sourceId, name = `${sourceId}_tool`) => ({ name, source: { kind: 'mcp', sourceId } });
+  const builtin = blueprints.agents.explore.toolPolicy;
+  const resolve = (...layers) => resolveToolPolicyLayers(layers.filter(Boolean), []);
+  const global = { scopeKind: 'global', policy: { sourceConfigs: { exa: { enabled: true } } } };
+
+  const readonly = resolve(global, toolPolicyScopeLayer('agent', undefined, builtin),
+    { scopeKind: 'conversation', policy: { allowedTools: ['third_tool', 'read'], sourceConfigs: { exa: { enabled: true }, other: { enabled: true } } } });
+  assert.equal(toolAllowedByPolicy(readonly, tool('exa')), false, 'a server enabled globally never reaches the read-only Agent');
+  assert.equal(toolAllowedByPolicy(readonly, tool('other')), false, 'a conversation below it cannot re-enable a source');
+  assert.equal(toolAllowedByPolicy(readonly, tool('third')), false, 'naming an MCP tool in a list below it does not opt in either');
+  assert.equal(toolAllowedByPolicy(readonly, { name: 'read' }), true);
+
+  const listless = resolve(global, toolPolicyScopeLayer('agent', { toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } } }, builtin));
+  assert.equal(toolAllowedByPolicy(listless, tool('exa')), false, 'a list-less record at the scope keeps the restriction');
+  assert.deepEqual(listless.allowedTools, [...builtin.allowedTools].sort());
+
+  const optedIn = resolve(global, toolPolicyScopeLayer('agent', { sourceConfigs: { exa: { enabled: true }, other: { enabled: true, disabledTools: ['other_hidden'] } } }, builtin));
+  assert.equal(toolAllowedByPolicy(optedIn, tool('exa')), true, 'the scope enables its own source');
+  assert.equal(toolAllowedByPolicy(optedIn, tool('other')), true);
+  assert.equal(toolAllowedByPolicy(optedIn, tool('other', 'other_hidden')), false);
+  assert.equal(toolAllowedByPolicy(optedIn, tool('unnamed')), false, 'a source the scope does not enable stays denied');
+
+  const ordinary = resolve(global, { scopeKind: 'conversation', policy: { allowedTools: ['read'] } });
+  assert.equal(toolAllowedByPolicy(ordinary, tool('exa')), true, 'an ordinary list keeps globally enabled MCP servers');
+  assert.equal(toolAllowedByPolicy(resolve({ scopeKind: 'global', policy: { sourceConfigs: { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: true } } } }), tool('exa')), false,
+    'an all-sources entry never enables anything');
+});
+
 test('整条链都没有工具列表时以默认工具集为底，自定义 Agent 不会没有工具；存储的非法列表拒绝编译', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-default-tool-set-'));
   try {

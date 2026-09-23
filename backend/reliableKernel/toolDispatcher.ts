@@ -24,6 +24,7 @@ import {
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE, PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import { BACKGROUND_ASK_USER_AUTO_ANSWER } from '../../shared/askUser';
 import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
+import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import {
   mapSettledWithBoundedAdmissionConcurrency,
   mapSettledWithBoundedConcurrency,
@@ -2800,21 +2801,12 @@ function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {
   };
 }
 
+/** The shared frozen-policy rule; MCP tools follow their source settings, including all-sources denies. */
 function definitionAllowedByAuthority(
   policy: ReturnType<typeof authorityPolicy>,
   definition: ToolDefinition
 ): boolean {
-  const explicitlyAllowed = policy.allowedTools.has(definition.declaration.name);
-  const source = definition.declaration.source;
-  if (source?.kind !== 'mcp' || !source.sourceId?.trim()) return explicitlyAllowed;
-  const config = policy.sourceConfigs[source.sourceId];
-  if (!config || typeof config !== 'object' || Array.isArray(config)) return explicitlyAllowed;
-  const configRecord = config as Record<string, unknown>;
-  if (configRecord.enabled !== true) return false;
-  const disabled = Array.isArray(configRecord.disabledTools)
-    ? configRecord.disabledTools.filter((name): name is string => typeof name === 'string')
-    : [];
-  return !disabled.includes(definition.declaration.name);
+  return toolAllowedByPolicy(policy, { name: definition.declaration.name, source: definition.declaration.source });
 }
 
 /**

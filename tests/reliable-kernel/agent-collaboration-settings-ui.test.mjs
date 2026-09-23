@@ -343,6 +343,38 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.ok(feed);
     });
 
+    await t.test('全局开启的 MCP 服务不进入内置只读 Agent 与工作流，只能在该 Agent 或工作流里单独开启', async () => {
+      const { TOOL_POLICY_ALL_MCP_SOURCES } = await server.ssrLoadModule(path.join(process.cwd(), 'shared/protocol.ts'));
+      const readonlyMcp = { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } };
+      const { client, feed, store, bindings, render } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies.map((record) => record.allowedTools === readonlyList ? { ...record, sourceConfigs: readonlyMcp } : record);
+      client.mcpToolSources = [{ id: 'exa', name: 'exa', transportKind: 'stdio', status: 'connected', toolCount: 1 }];
+      feed.records = { AgentConversationLink: { link: { id: 'link', conversation_id: 'explore-conversation', agent_id: 'explore', role: 'default' } } };
+      const mcp = store.toolDefinitions.find((tool) => tool.name === 'mcp_search');
+      store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { exa: { enabled: true } });
+      const view = async (scopeKind, scopeId) => {
+        const editor = await bindings(toolEditor, { scopeKind, scopeId });
+        return { source: editor.isMcpSourceEnabled('exa'), tool: editor.isToolEnabled(mcp), editor };
+      };
+      assert.deepEqual((({ source, tool }) => ({ source, tool }))(await view('agent', 'main')), { source: true, tool: true });
+      for (const [scopeKind, scopeId] of [['agent', 'explore'], ['workflow', 'builtin:readonly'], ['conversation', 'explore-conversation']]) {
+        const { source, tool } = await view(scopeKind, scopeId);
+        assert.deepEqual({ source, tool }, { source: false, tool: false }, `${scopeKind}:${scopeId} shows the MCP server off`);
+      }
+      store.setCrossConversationCollaborationForScope('agent', 'explore', true);
+      assert.equal((await view('agent', 'explore')).tool, false, 'a list-less record keeps the restriction');
+      assert.match(await render(toolEditor, { scopeKind: 'agent', scopeId: 'explore' }), /内置只读 Agent 和工作流默认不使用 MCP 工具/);
+
+      // A conversation below the read-only Agent cannot re-enable the source; the Agent scope can.
+      (await view('conversation', 'explore-conversation')).editor.toggleMcpSource('exa', true);
+      assert.equal((await view('conversation', 'explore-conversation')).tool, false);
+      (await view('agent', 'explore')).editor.toggleMcpSource('exa', true);
+      assert.deepEqual(store.localPolicyFor('agent', 'explore').policy.sourceConfigs, { exa: { enabled: true } });
+      assert.equal(store.localPolicyFor('agent', 'explore').policy.allowedTools, undefined, 'opting in keeps the built-in list');
+      assert.deepEqual((({ source, tool }) => ({ source, tool }))(await view('agent', 'explore')), { source: true, tool: true });
+      assert.equal(store.effectivePolicyFor('agent', 'explore').policy.allowedTools.includes('write'), false);
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
       const { client, store, render } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;

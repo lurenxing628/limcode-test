@@ -856,6 +856,9 @@ function validateTool(tool, failures) {
   if (tool?.mcpCapability?.connectionState !== 'memory-only-rebuild-on-extension-host-start') failures.push('MCP连接状态必须只在内存并于宿主启动重建');
   const mcpText = JSON.stringify(tool?.mcpCapability ?? {});
   for (const marker of ['outcome_unknown', '不自动重试', 'ToolModelResult']) if (!mcpText.includes(marker)) failures.push(`MCP Effect合同缺少${marker}`);
+  for (const marker of ["全来源拒绝'*'", '保存无列表记录时仍保留', '只有该Agent或工作流自己的sourceConfigs能开启', 'toolAllowedByPolicy']) {
+    if (!String(tool?.mcpCapability?.sourceAdmission ?? '').includes(marker)) failures.push(`MCP来源准入合同缺少${marker}`);
+  }
   const transferText = JSON.stringify(tool?.workEnvironmentTransferCapability ?? {});
   if (tool?.workEnvironmentTransferCapability?.effectKind !== 'file_transfer') failures.push('transfer必须通过file_transfer Effect执行');
   for (const marker of ['outcome_unknown', '禁止自动重试', 'enabled=false', 'rejected']) {

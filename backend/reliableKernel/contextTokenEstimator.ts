@@ -13,6 +13,7 @@ import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
 import type { ModelHandleCatalog } from './modelHandleCatalog';
+import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import {
   canonicalizeCompressionContents,
   estimateJsonTokens,
@@ -429,17 +430,11 @@ function providerToolAllowed(
   allowed: ReadonlySet<string>,
   sourceConfigs: Record<string, unknown>
 ): boolean {
-  const name = typeof tool.name === 'string' ? tool.name : '';
   const source = asRecord(tool.source);
-  if (source?.kind !== 'mcp' || typeof source.sourceId !== 'string' || !source.sourceId.trim()) {
-    return allowed.has(name);
-  }
-  const config = asRecord(sourceConfigs[source.sourceId]);
-  if (!config || config.enabled !== true) return allowed.has(name);
-  const disabled = Array.isArray(config.disabledTools)
-    ? config.disabledTools.filter((value): value is string => typeof value === 'string')
-    : [];
-  return !disabled.includes(name);
+  return toolAllowedByPolicy({ allowedTools: allowed, sourceConfigs }, {
+    name: typeof tool.name === 'string' ? tool.name : '',
+    ...(source ? { source } : {})
+  });
 }
 
 function isSegmentPrefix(
