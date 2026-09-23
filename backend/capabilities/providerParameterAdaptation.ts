@@ -32,6 +32,11 @@
  *   OpenCode Zen `Extra inputs are not permitted, field: 'reasoning_content', value: []`（https://github.com/anomalyco/opencode/issues/11446），
  *   OpenCode Go `Extra inputs are not permitted, field: 'messages[2].reasoning'`（https://github.com/can1357/oh-my-pi/issues/1157）。
  *   助手消息上的 OpenRouter 风格 `reasoning` 与 Responses 顶层的 `reasoning` 对象同名，只认明确指向 messages[N] 的错误。
+ * - 工具调用上的 Gemini 签名 `tool_calls[].extra_content`（https://ai.google.dev/gemini-api/docs/thought-signatures
+ *   “OpenAI compatibility”）：从 Gemini 换到严格服务后，历史里的签名会原样带过去。按上面同一批严格服务的报错
+ *   形状识别（extra_forbidden 的 loc、`property '…' is unsupported`、`Unknown parameter`），另认
+ *   `Additional properties are not allowed ('extra_content' was unexpected)`（JSON Schema 校验）与
+ *   serde 的 ``unknown field `extra_content` ``。这个字段只会出现在工具调用上，所以只要错误点名它就去掉全部工具调用上的它。
  */
 import type { LlmProviderKind } from '../../shared/protocol';
 import { isRecord, toPlainJsonLike } from './llmStreamEventProjection';
@@ -70,17 +75,21 @@ export type AdaptableRequestParameter =
   | 'reasoning_content'
   | 'reasoning_signature'
   | 'reasoning_details'
-  | 'reasoning';
+  | 'reasoning'
+  | 'extra_content';
 
 const TOP_LEVEL_REMOVABLE_PARAMETERS = ['reasoning_effort', 'temperature', 'top_p', 'top_k', 'stream_options'] as const;
 const ASSISTANT_MESSAGE_PARAMETERS = ['reasoning_content', 'reasoning_signature', 'reasoning_details', 'reasoning'] as const;
 /** 与顶层参数同名的助手消息字段：只接受明确落在 messages[N] 上的错误。 */
 const MESSAGE_SCOPED_ONLY_PARAMETERS = new Set<AdaptableRequestParameter>(['reasoning']);
 const SAMPLING_PARAMETERS = new Set<AdaptableRequestParameter>(['temperature', 'top_p', 'top_k']);
+/** 助手消息 `tool_calls[]` 上的字段。 */
+const TOOL_CALL_PARAMETERS = ['extra_content'] as const;
 const ADAPTABLE_PARAMETERS: readonly AdaptableRequestParameter[] = [
   ...TOP_LEVEL_REMOVABLE_PARAMETERS,
   'max_tokens',
-  ...ASSISTANT_MESSAGE_PARAMETERS
+  ...ASSISTANT_MESSAGE_PARAMETERS,
+  ...TOOL_CALL_PARAMETERS
 ];
 const CHAT_COMPLETIONS_PROVIDERS = new Set<LlmProviderKind>(['openai-compatible', 'deepseek']);
 
@@ -198,19 +207,37 @@ export function adaptRequestParameters(
     delete target.max_tokens;
   }
   const messageFields = ASSISTANT_MESSAGE_PARAMETERS.filter((parameter) => parameters.has(parameter));
-  if (messageFields.length > 0 && Array.isArray(next.messages)) {
+  const toolCallFields = TOOL_CALL_PARAMETERS.filter((parameter) => parameters.has(parameter));
+  if ((messageFields.length > 0 || toolCallFields.length > 0) && Array.isArray(next.messages)) {
     let changed = false;
     const messages = next.messages.map((message) => {
       if (!isRecord(message) || message.role !== 'assistant') return message;
-      if (!messageFields.some((field) => Object.prototype.hasOwnProperty.call(message, field))) return message;
+      const toolCalls = toolCallFields.length > 0 ? withoutToolCallFields(message.tool_calls, toolCallFields) : message.tool_calls;
+      if (toolCalls === message.tool_calls
+        && !messageFields.some((field) => Object.prototype.hasOwnProperty.call(message, field))) return message;
       changed = true;
       const copy = { ...message };
       for (const field of messageFields) delete copy[field];
+      if (toolCalls !== message.tool_calls) copy.tool_calls = toolCalls;
       return copy;
     });
     if (changed) writable().messages = messages;
   }
   return next;
+}
+
+/** 去掉工具调用上被记住的字段；没有任何调用带这些字段时返回同一引用。 */
+function withoutToolCallFields(toolCalls: unknown, fields: readonly string[]): unknown {
+  if (!Array.isArray(toolCalls)) return toolCalls;
+  let changed = false;
+  const next = toolCalls.map((toolCall) => {
+    if (!isRecord(toolCall) || !fields.some((field) => Object.prototype.hasOwnProperty.call(toolCall, field))) return toolCall;
+    changed = true;
+    const copy = { ...toolCall };
+    for (const field of fields) delete copy[field];
+    return copy;
+  });
+  return changed ? next : toolCalls;
 }
 
 /**
@@ -287,6 +314,7 @@ export function unsupportedRequestParameters(errorText: string): AdaptableReques
   return ADAPTABLE_PARAMETERS.filter((parameter) => {
     const name = escapeRegExp(parameter);
     if (MESSAGE_SCOPED_ONLY_PARAMETERS.has(parameter)) return messageFieldRejected(text, name, extraInputs);
+    if (parameter === 'extra_content') return toolCallFieldRejected(text, name, extraInputs);
     if (parameter === 'max_tokens') {
       return new RegExp(`unsupported parameter:\\s*${Q}max_tokens${Q}`, 'i').test(text)
         && /max_completion_tokens/i.test(text);
@@ -321,6 +349,19 @@ function messageFieldRejected(text: string, name: string, extraInputs: boolean):
   if (new RegExp(`${path}${Q}?\\s*:?\\s*extra inputs are not permitted`, 'i').test(text)) return true;
   if (new RegExp(`extra inputs are not permitted,\\s*field:\\s*${Q}${path}${Q}`, 'i').test(text)) return true;
   return new RegExp(`${Q}?loc${Q}?\\s*:\\s*[\\[(][^\\])]*${Q}messages${Q}\\s*,\\s*\\d+\\s*,\\s*(?:(?:${Q}assistant${Q}|\\.\\.\\.)\\s*,\\s*)?${Q}${name}${Q}\\s*[\\])]`, 'i').test(text);
+}
+
+/** 错误明确点名工具调用上的字段（该字段名只会出现在 `messages[N].tool_calls[M]` 上）。 */
+function toolCallFieldRejected(text: string, name: string, extraInputs: boolean): boolean {
+  const path = `(?:[^'"\`\\s]*[.\\]])?${name}(?![\\w])`;
+  if (new RegExp(`unknown parameter:\\s*${Q}${path}${Q}`, 'i').test(text)) return true;
+  if (new RegExp(`property\\s*${Q}${path}${Q}\\s*is unsupported`, 'i').test(text)) return true;
+  if (new RegExp(`additional properties are not allowed \\(${Q}${name}${Q} was unexpected\\)`, 'i').test(text)) return true;
+  if (new RegExp(`unknown field\\s*${Q}${name}${Q}`, 'i').test(text)) return true;
+  if (!extraInputs) return false;
+  if (new RegExp(`${path}${Q}?\\s*:?\\s*extra inputs are not permitted`, 'i').test(text)) return true;
+  if (new RegExp(`extra inputs are not permitted,\\s*field:\\s*${Q}${path}${Q}`, 'i').test(text)) return true;
+  return new RegExp(`${Q}?loc${Q}?\\s*:\\s*[\\[(][^\\])]*${Q}${name}${Q}\\s*[\\])]`, 'i').test(text);
 }
 
 function escapeRegExp(value: string): string {

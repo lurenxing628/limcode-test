@@ -314,3 +314,82 @@ test('C1 助手消息的 reasoning 字段：只认明确指向 messages[N] 的�
   const responsesBody = { model: 'gpt-5.5', reasoning: { effort: 'high' }, input: [] };
   assert.equal(adaptRequestParameters(responsesBody, new Set(['reasoning']), 'openai-responses'), responsesBody);
 });
+
+// 从 Gemini 换到严格 OpenAI 兼容服务：历史工具调用上的 Gemini 签名 `extra_content` 被拒时只去掉它。
+test('C1 工具调用上的 extra_content：严格服务的报错形状逐条识别，其他字段不误判', () => {
+  const positives = [
+    "[{'type': 'extra_forbidden', 'loc': ('body', 'messages', 1, 'assistant', 'tool_calls', 0, 'extra_content'), 'msg': 'Extra inputs are not permitted', 'input': {'google': {'thought_signature': 'SIG'}}}]",
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'messages', 1, 'assistant', 'tool_calls', 0, 'extra_content'], msg: 'Extra inputs are not permitted', input: {} }] },
+    'messages.1.tool_calls.0.extra_content: Extra inputs are not permitted',
+    { message: "messages.1.assistant.tool_calls.0.extra_content: property 'messages.1.assistant.tool_calls.0.extra_content' is unsupported", type: 'invalid_request_error' },
+    { error: { message: "'messages.1.tool_calls.0' : property 'extra_content' is unsupported" } },
+    "Unknown parameter: 'messages[1].tool_calls[0].extra_content'.",
+    { error: { message: "Additional properties are not allowed ('extra_content' was unexpected) - 'messages.1.tool_calls.0'" } },
+    'Failed to deserialize the JSON body into the target type: messages[1].tool_calls[0]: unknown field `extra_content`, expected one of `id`, `type`, `function` at line 1 column 412'
+  ];
+  for (const error of positives) assert.deepEqual(unsupportedRequestParameters(text(error)), ['extra_content'], text(error));
+  const negatives = [
+    // 不是被拒绝，只是提到了这个名字。
+    { error: { message: 'Function call is missing a thought_signature in functionCall parts. See extra_content in the docs.' } },
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'metadata'], msg: 'Extra inputs are not permitted', input: 'extra_content' }] },
+    'extra_content_extended: Extra inputs are not permitted'
+  ];
+  for (const error of negatives) assert.deepEqual(unsupportedRequestParameters(text(error)), [], text(error));
+
+  const body = {
+    model: 'm',
+    messages: [
+      { role: 'user', content: 'u', extra_content: 'keep' },
+      { role: 'assistant', content: null, tool_calls: [
+        { id: 'a', type: 'function', function: { name: 'f', arguments: '{}' }, extra_content: { google: { thought_signature: 'SIG' } } },
+        { id: 'b', type: 'function', function: { name: 'g', arguments: '{}' } }
+      ] },
+      { role: 'tool', tool_call_id: 'a', content: 'r' }
+    ]
+  };
+  const adapted = adaptRequestParameters(body, new Set(['extra_content']), 'openai-compatible');
+  assert.deepEqual(adapted.messages[1].tool_calls, [
+    { id: 'a', type: 'function', function: { name: 'f', arguments: '{}' } },
+    { id: 'b', type: 'function', function: { name: 'g', arguments: '{}' } }
+  ]);
+  assert.equal(adapted.messages[0], body.messages[0], '非助手消息不动');
+  assert.equal(adapted.messages[1].tool_calls[1], body.messages[1].tool_calls[1], '没有该字段的调用保持同一引用');
+  const noSignatures = { model: 'm', messages: [{ role: 'assistant', content: 'a', tool_calls: [{ id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } }] }] };
+  assert.equal(adaptRequestParameters(noSignatures, new Set(['extra_content']), 'openai-compatible'), noSignatures);
+});
+
+test('C1 聊天路径：从 Gemini 换到严格服务后，历史里的 extra_content 被拒时去掉重发并按目标记住', async () => {
+  resetProviderRequestAdaptations();
+  const history = [
+    { role: 'user', parts: [{ text: 'weather?' }] },
+    { role: 'model', parts: [{ functionCall: { name: 'get_weather', args: { city: 'Paris' }, callId: 'call_1' }, thoughtSignature: 'gemini:GEMINI_SIG' }] },
+    { role: 'user', parts: [{ functionResponse: { name: 'get_weather', response: { result: 'sunny' }, callId: 'call_1' } }] }
+  ];
+  const TRT_EXTRA_CONTENT = "[{'type': 'extra_forbidden', 'loc': ('body', 'messages', 1, 'assistant', 'tool_calls', 0, 'extra_content'), 'msg': 'Extra inputs are not permitted', 'input': {'google': {'thought_signature': 'GEMINI_SIG'}}}]";
+  const carriesExtraContent = (call) => call.body.messages.some((message) => Array.isArray(message.tool_calls)
+    && message.tool_calls.some((toolCall) => 'extra_content' in toolCall));
+  await withServer((call) => carriesExtraContent(call)
+    ? { status: 400, body: TRT_EXTRA_CONTENT }
+    : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    const settings = providerSettings(baseUrl, { id: 'adaptation-extra-content', model: 'llama-4-maverick', generationConfig: undefined });
+    const events = await chat(settings, 'extra-content', history);
+    assert.ok(events.some((event) => event.type === 'llm:done'), JSON.stringify(events.filter((event) => event.type === 'llm:error')));
+    assert.equal(events.some((event) => event.type.startsWith('llm:retry')), false, '自适配重发不是普通重试');
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0].body.messages[1].tool_calls[0].extra_content.google.thought_signature, 'GEMINI_SIG');
+    assert.equal(carriesExtraContent(calls[1]), false);
+    // 除工具调用上的 extra_content 外，请求体不变。
+    const stripped = structuredClone(calls[0].body);
+    delete stripped.messages[1].tool_calls[0].extra_content;
+    assert.deepEqual(calls[1].body, stripped);
+
+    await chat(settings, 'extra-content-2', history);
+    assert.equal(calls.length, 3, '同一目标之后直接去掉，不再先失败一次');
+    assert.equal(carriesExtraContent(calls[2]), false);
+    // 其他目标照常回传签名（Gemini 需要它）。
+    const other = await dryRunLlmProvider({ id: 'dry-extra-other', conversationId: 'adaptation-conversation', contents: history, tools: [] },
+      { settings: async () => ({ ...settings, model: 'gemini-3.5-flash' }) });
+    assert.equal(other.body.messages[1].tool_calls[0].extra_content.google.thought_signature, 'GEMINI_SIG');
+  });
+  resetProviderRequestAdaptations();
+});
