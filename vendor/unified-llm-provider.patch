@@ -1,12 +1,12 @@
 diff --git a/package.json b/package.json
-index 5b0475d..0f4d9d7 100644
+index 5b0475d..0bee5fd 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "unified-llm-provider",
 -  "version": "0.1.37",
-+  "version": "0.1.37-limcode.4",
++  "version": "0.1.37-limcode.5",
    "description": "统一 LLM Provider npm 包：一套统一结构接入 Gemini / Claude / OpenAI Compatible / OpenAI Responses / DeepSeek",
    "license": "MIT",
    "type": "module",
@@ -22,11 +22,66 @@ index 0c458cf..27ca125 100644
  export * from './llm/convert.js';
  export * from './llm/debug-utils.js';
  
+diff --git a/src/llm/convert.ts b/src/llm/convert.ts
+index d0cc07e..9acc940 100644
+--- a/src/llm/convert.ts
++++ b/src/llm/convert.ts
+@@ -5,7 +5,7 @@ import { normalizeLLMRequestThoughtSignatures, normalizeLLMResponseThoughtSignat
+ import { serializeLLMRequestThoughtSignatures, serializeLLMResponseThoughtSignatures, serializeLLMStreamChunkThoughtSignatures } from '../signatures/serialize.js';
+ import { createBuiltinFormatRegistry, type FormatFactoryOptions, type FormatRegistry } from '../registry/formats.js';
+ import { normalizeThinkingLevel, normalizeReasoningMode } from './formats/thinking-level.js';
+-import { isCompactFormatAdapter } from './formats/types.js';
++import { assertFormatAcceptsClaudeSystemMessages, isCompactFormatAdapter } from './formats/types.js';
+ import { isSupportedToolResponseMimeType, isToolResponseDocumentMimeType, parseBase64DataUrl } from './vision.js';
+ 
+ export type UnifiedFormatId = 'unified';
+@@ -347,6 +347,15 @@ const parseClaudeToolResultContent = (content: unknown): { response: Record<stri
+   };
+ 
+ 
++function parseClaudeSystemMessageText(content: unknown): Part[] {
++  if (typeof content === 'string') return content ? [{ text: content }] : [];
++  if (!Array.isArray(content)) return [];
++  return content
++    .filter((block): block is { type: 'text'; text: string } => !!block && typeof block === 'object'
++      && (block as any).type === 'text' && typeof (block as any).text === 'string')
++    .map(block => ({ text: block.text }));
++}
++
+ function decodeClaudeRequest(raw: unknown): LLMRequest {
+   const data = raw as any;
+   const contents: Content[] = [];
+@@ -432,6 +441,17 @@ function decodeClaudeRequest(raw: unknown): LLMRequest {
+     } else if (message.role === 'user') {
+       const parts = parseUserBlocks(message.content);
+       if (parts.length > 0) contents.push({ role: 'user', parts });
++    } else if (message.role === 'system') {
++      // 消息中段 system 消息（mid-conversation system messages）：文本内容保留为 Claude 专用内容，
++      // clear_at 原样往返；tool_addition / tool_removal 等非文本块不在统一格式里表示。
++      const parts = parseClaudeSystemMessageText(message.content);
++      if (parts.length > 0) {
++        contents.push({
++          role: 'user',
++          parts,
++          claudeSystemMessage: message.clear_at === 'next_user_message' ? { clearAt: 'next_user_message' } : {},
++        });
++      }
+     }
+   }
+ 
+@@ -863,6 +883,7 @@ export function encodeRequestToFormat(request: LLMRequest, options: EncodeReques
+ 
+   const registry = resolveFormatRegistry(options.registry);
+   const adapter = createAdapter(format, registry, options);
++  assertFormatAcceptsClaudeSystemMessages(normalizedRequest, adapter, format);
+   return adapter.encodeRequest(normalizedRequest, options.stream);
+ }
+ 
 diff --git a/src/llm/formats/claude.ts b/src/llm/formats/claude.ts
-index bad39bb..557719b 100644
+index bad39bb..be3cb42 100644
 --- a/src/llm/formats/claude.ts
 +++ b/src/llm/formats/claude.ts
-@@ -26,6 +26,67 @@ interface NormalizedClaudePromptCacheConfig {
+@@ -26,7 +26,70 @@ interface NormalizedClaudePromptCacheConfig {
    };
  }
  
@@ -92,11 +147,19 @@ index bad39bb..557719b 100644
 +}
 +
  export class ClaudeFormat implements FormatAdapter {
++  /** 能编码 `Content.claudeSystemMessage`（消息中段 system 消息）。 */
++  readonly acceptsClaudeSystemMessages = true;
    private readonly promptCache: NormalizedClaudePromptCacheConfig;
  
-@@ -56,43 +117,48 @@ export class ClaudeFormat implements FormatAdapter {
+   constructor(
+@@ -55,44 +118,53 @@ export class ClaudeFormat implements FormatAdapter {
+     let generatedToolUseIdCounter = 0;
  
      for (const content of request.contents) {
++      if (content.claudeSystemMessage !== undefined) {
++        messages.push(encodeClaudeSystemMessage(content));
++        continue;
++      }
        const textParts = content.parts.filter(isVisibleTextPart);
 -      const funcCallParts = content.parts.filter(isFunctionCallPart);
        const funcRespParts = content.parts.filter(isFunctionResponsePart);
@@ -174,7 +237,7 @@ index bad39bb..557719b 100644
          }
  
          if (contentBlocks.length > 0) {
-@@ -112,7 +178,7 @@ export class ClaudeFormat implements FormatAdapter {
+@@ -112,7 +184,7 @@ export class ClaudeFormat implements FormatAdapter {
              });
              contentBlocks.push({
                type: 'tool_result',
@@ -183,7 +246,16 @@ index bad39bb..557719b 100644
                content: encodeClaudeToolResultContent(part.functionResponse),
              });
            }
-@@ -222,6 +288,11 @@ export class ClaudeFormat implements FormatAdapter {
+@@ -146,7 +218,7 @@ export class ClaudeFormat implements FormatAdapter {
+       }
+     }
+ 
+-    body.messages = messages;
++    body.messages = settleClaudeSystemMessagePlacement(messages);
+ 
+     // tools 声明转换
+     if (request.tools && request.tools.length > 0) {
+@@ -222,6 +294,11 @@ export class ClaudeFormat implements FormatAdapter {
              thought: true,
              thoughtSignatures: { claude: block.signature },
            });
@@ -195,7 +267,7 @@ index bad39bb..557719b 100644
          }
        }
      }
-@@ -264,6 +335,14 @@ export class ClaudeFormat implements FormatAdapter {
+@@ -264,6 +341,14 @@ export class ClaudeFormat implements FormatAdapter {
          } else if (data.content_block?.type === 'thinking') {
            // 标记进入 thinking block
            st.inThinkingBlock = true;
@@ -210,6 +282,97 @@ index bad39bb..557719b 100644
          }
          break;
  
+@@ -387,6 +472,9 @@ export class ClaudeFormat implements FormatAdapter {
+ 
+     // 3. 标记最后一条用户消息的最后一个内容块。
+     //    这会缓存整个对话历史前缀。
++    //    消息中段 system 消息（role: "system"）不是 user 消息，自然被跳过：官方要求轮内系统消息的块上
++    //    不能带 cache_control，断点放在它前面那条 user 消息的最后一块上
++    //    （https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages）。
+     const messages = body.messages as any[] | undefined;
+     if (config.breakpoints.messages && messages && messages.length > 0) {
+       for (let i = messages.length - 1; i >= 0; i--) {
+@@ -408,6 +496,80 @@ export class ClaudeFormat implements FormatAdapter {
+   }
+ }
+ 
++/**
++ * `Content.claudeSystemMessage` → Messages API 消息中段 system 消息
++ * （https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages）。
++ *
++ * - 内容只取可见文本 part：官方规定轮内系统消息的 content 只能是文本块或字符串；
++ *   只有一个文本 part 时写成字符串，多个时写成文本块数组，保证同一内容每次编码逐字节相同。
++ * - `clearAt: 'next_user_message'` 写 `clear_at`；缺省 / `never` 不写（官方：省略与 never 相同）。
++ * - 不在这里加 cache_control：轮内系统消息不允许带，断点由 injectCacheBreakpoints 放在前一条 user 消息上。
++ */
++function encodeClaudeSystemMessage(content: LLMRequest['contents'][number]): Record<string, unknown> {
++  if (content.role !== 'user') {
++    throw new Error('Claude 消息中段 system 消息只能用 role: "user" 的内容表示。');
++  }
++  const texts: string[] = [];
++  for (const part of content.parts) {
++    if (!isVisibleTextPart(part)) {
++      throw new Error('Claude 消息中段 system 消息只能包含文本。');
++    }
++    if (part.text) texts.push(part.text);
++  }
++  if (texts.length === 0) throw new Error('Claude 消息中段 system 消息不能为空。');
++  const clearAt = content.claudeSystemMessage?.clearAt;
++  return {
++    role: 'system',
++    ...(clearAt === 'next_user_message' ? { clear_at: 'next_user_message' } : {}),
++    content: texts.length === 1 ? texts[0] : texts.map(text => ({ type: 'text', text })),
++  };
++}
++
++/**
++ * 按官方位置规则检查消息中段 system 消息（连续多条视为一段，整段一起判断）：
++ * - 必须紧跟一条 user 消息（含只带 tool_result 的 user 消息），或以服务端工具结果结尾的 assistant 消息；
++ *   不能是第一条，也不能夹在 tool_use 与 tool_result 之间。违反时直接报错：调用方放错了位置。
++ * - 后面只能是 assistant 消息或数组结尾。后面紧跟 user 消息时官方返回 400。轮内系统消息
++ *   （clear_at: next_user_message）在这个位置本来就永远不会显示（其后已有 user 消息），整段去掉，
++ *   结果只取决于这段历史本身，每次编码都一样；普通 system 消息则报错。
++ *   这种情况出现在它原本面对的 assistant 消息没有可编码的内容而被省略时。
++ */
++function settleClaudeSystemMessagePlacement(messages: Record<string, unknown>[]): Record<string, unknown>[] {
++  if (!messages.some(message => message.role === 'system')) return messages;
++  const settled: Record<string, unknown>[] = [];
++  for (let index = 0; index < messages.length;) {
++    if (messages[index].role !== 'system') {
++      settled.push(messages[index]);
++      index += 1;
++      continue;
++    }
++    let end = index;
++    while (end < messages.length && messages[end].role === 'system') end += 1;
++    const section = messages.slice(index, end);
++    const previous = settled[settled.length - 1];
++    if (!previous || !opensClaudeSystemSection(previous)) {
++      throw new Error(`messages[${index}]：消息中段 system 消息必须紧跟一条 user 消息（含只带 tool_result 的 user 消息）。`);
++    }
++    const next = messages[end];
++    if (next && next.role !== 'assistant') {
++      if (!section.every(message => message.clear_at === 'next_user_message')) {
++        throw new Error(`messages[${index}]：消息中段 system 消息后面只能是 assistant 消息或数组结尾。`);
++      }
++    } else {
++      settled.push(...section);
++    }
++    index = end;
++  }
++  return settled;
++}
++
++function opensClaudeSystemSection(previous: Record<string, unknown>): boolean {
++  if (previous.role === 'user') return true;
++  if (previous.role !== 'assistant' || !Array.isArray(previous.content)) return false;
++  const last = previous.content[previous.content.length - 1] as { type?: unknown } | undefined;
++  return typeof last?.type === 'string' && last.type.endsWith('_tool_result');
++}
++
+ function normalizeClaudePromptCacheConfig(
+   input: LLMPromptCacheConfig | boolean | undefined,
+   autoCaching?: boolean,
 diff --git a/src/llm/formats/openai-compatible.ts b/src/llm/formats/openai-compatible.ts
 index 08a6ccc..51b3366 100644
 --- a/src/llm/formats/openai-compatible.ts
@@ -1828,10 +1991,10 @@ index 1052c0c..dc3675e 100644
        return undefined;
    }
 diff --git a/src/llm/formats/types.ts b/src/llm/formats/types.ts
-index 0f88d4b..1f9f8f8 100644
+index 0f88d4b..2045ba0 100644
 --- a/src/llm/formats/types.ts
 +++ b/src/llm/formats/types.ts
-@@ -24,6 +24,15 @@ export interface FormatAdapter {
+@@ -24,6 +24,37 @@ export interface FormatAdapter {
  
    /** 创建流式解码状态（每次流式调用前调用） */
    createStreamState(): StreamDecodeState;
@@ -1844,6 +2007,28 @@ index 0f88d4b..1f9f8f8 100644
 +   * 此时流的输出与未实现该钩子时完全一致。读取中断（stream_read_error）时不会调用。
 +   */
 +  finalizeStream?(state: StreamDecodeState): LLMStreamChunk | undefined;
++
++  /**
++   * 可选：本格式能编码 `Content.claudeSystemMessage`（Claude 消息中段 system 消息）。
++   * 只有 Claude 格式为 true；其余格式的编码入口遇到这种内容时报错（见 assertFormatAcceptsClaudeSystemMessages）。
++   */
++  readonly acceptsClaudeSystemMessages?: boolean;
++}
++
++/**
++ * Claude 专用的消息中段 system 消息不能交给别的格式：别的编码器只认 user/model，会把它当成一条普通 user 消息发出去。
++ * 这里在编码前直接报错，调用方必须只在 Claude 格式上使用它。
++ */
++export function assertFormatAcceptsClaudeSystemMessages(
++  request: Pick<LLMRequest, 'contents'>,
++  format: Pick<FormatAdapter, 'acceptsClaudeSystemMessages'>,
++  formatLabel: string,
++): void {
++  if (format.acceptsClaudeSystemMessages === true || !Array.isArray(request.contents)) return;
++  const index = request.contents.findIndex(content => content?.claudeSystemMessage !== undefined);
++  if (index >= 0) {
++    throw new Error(`contents[${index}] 是 Claude 专用的消息中段 system 消息，不能编码为 ${formatLabel} 请求。`);
++  }
  }
  
  /** 支持独立 compact / compaction 端点的格式适配器扩展。 */
@@ -1983,10 +2168,16 @@ index 0000000..2429bdc
 +  }
 +}
 diff --git a/src/llm/providers/base.ts b/src/llm/providers/base.ts
-index 2af78f7..d45d416 100644
+index 2af78f7..91e3b1d 100644
 --- a/src/llm/providers/base.ts
 +++ b/src/llm/providers/base.ts
-@@ -10,6 +10,7 @@ import { detectLLMRequestSignatureRepresentation } from '../../signatures/normal
+@@ -5,11 +5,12 @@
+ import type { LLMRequest, LLMResponse, LLMStreamChunk } from '../../types/index.js';
+ import type { FormatId, UnifiedSignatureMode } from '../convert.js';
+ import { decodeRequestFromFormat, encodeCompactResponseToFormat, encodeResponseToFormat, encodeStreamChunkToFormat, normalizeFormatId } from '../convert.js';
+-import { isCompactFormatAdapter, type FormatAdapter } from '../formats/types.js';
++import { assertFormatAcceptsClaudeSystemMessages, isCompactFormatAdapter, type FormatAdapter } from '../formats/types.js';
+ import { detectLLMRequestSignatureRepresentation } from '../../signatures/normalize.js';
  import { buildRequestTransport, sendRequest, type EndpointConfig } from '../transport.js';
  import type { LLMProxyOption } from '../../config/types.js';
  import { processResponse, processStreamResponse } from '../response.js';
@@ -1994,7 +2185,24 @@ index 2af78f7..d45d416 100644
  import { streamOpenAIResponsesWebSocket } from '../websocket-openai-responses.js';
  import type { FormatRegistry } from '../../registry/formats.js';
  import { bodyToCurlPayload, formatRequestAsCurl, type CurlFormatOptions } from '../debug-utils.js';
-@@ -326,12 +327,12 @@ export class LLMProvider implements LLMProviderLike {
+@@ -190,6 +191,7 @@ export class LLMProvider implements LLMProviderLike {
+       format: inputFormat,
+       registry: options?.formatRegistry,
+     });
++    assertFormatAcceptsClaudeSystemMessages(canonicalRequest, this.format, this.providerName);
+ 
+     const body = normalizeRequestBodyTools(
+       mergeRequestBody(this.format.encodeRequest(canonicalRequest, stream), this.effectiveOverrides),
+@@ -219,6 +221,8 @@ export class LLMProvider implements LLMProviderLike {
+       registry: options?.formatRegistry,
+     });
+ 
++    assertFormatAcceptsClaudeSystemMessages(canonicalRequest, this.format, this.providerName);
++
+     if (options?.requestBody && 'previous_response_id' in options.requestBody) {
+       throw new Error('stateless compact 不支持 previous_response_id；请通过 input 传入完整上下文窗口');
+     }
+@@ -326,12 +330,12 @@ export class LLMProvider implements LLMProviderLike {
      const res = await sendRequest(built.endpoint, built.body, false, options?.signal, this.loggingDir);
      const canonicalResponse = await processResponse(res, this.format);
  
@@ -2009,7 +2217,7 @@ index 2af78f7..d45d416 100644
    }
  
    async *chatStream<TOutput = LLMStreamChunk>(request: unknown, options?: LLMCallOptions): AsyncGenerator<TOutput> {
-@@ -360,12 +361,12 @@ export class LLMProvider implements LLMProviderLike {
+@@ -360,12 +364,12 @@ export class LLMProvider implements LLMProviderLike {
      const res = await sendRequest(built.endpoint, built.body, true, options?.signal, this.loggingDir);
  
      for await (const chunk of processStreamResponse(res, this.format)) {
@@ -2024,7 +2232,7 @@ index 2af78f7..d45d416 100644
      }
    }
  
-@@ -430,4 +431,3 @@ export class LLMProvider implements LLMProviderLike {
+@@ -430,4 +434,3 @@ export class LLMProvider implements LLMProviderLike {
      return this.providerName;
    }
  }
@@ -2374,7 +2582,7 @@ index 53d444d..fed1b1d 100644
 +  outputItem?: LimcodeOutputItemReference;
  }
 diff --git a/src/types/message.ts b/src/types/message.ts
-index c318996..fab168d 100644
+index c318996..9c89769 100644
 --- a/src/types/message.ts
 +++ b/src/types/message.ts
 @@ -7,8 +7,17 @@
@@ -2434,6 +2642,35 @@ index c318996..fab168d 100644
    functionResponse: {
      name: string;
      response: Record<string, unknown>;
+@@ -117,10 +136,28 @@ export interface UsageMetadata {
+   cacheCreationInputTokensDetails?: CacheCreationInputTokensDetails;
+ }
+ 
++/**
++ * Claude 消息中段 system 消息的选项（https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages）。
++ *
++ * - `clearAt: 'next_user_message'`：轮内系统消息，编码为 `clear_at: "next_user_message"`；
++ *   请求必须带 beta 头 `mid-conversation-system-clear-at-2026-08-21`，否则官方返回
++ *   `messages.N.clear_at: Extra inputs are not permitted`。
++ * - 缺省或 `'never'`：普通消息中段 system 消息，不写 `clear_at`（官方：省略与 `never` 相同）。
++ */
++export interface ClaudeSystemMessageOptions {
++  clearAt?: 'next_user_message' | 'never';
++}
++
+ /** 一条消息内容（Gemini Content 格式） */
+ export interface Content {
+   role: Role;
+   parts: Part[];
++  /**
++   * Claude 专用：把这条内容编码成 Messages API 的 `role: "system"` 消息。只能配 `role: 'user'` 且只含可见文本 part
++   * （一个 part 写成字符串，多个写成文本块数组）；位置必须符合官方规则，beta 头由调用方负责。
++   * 只有 Claude 格式会编码它；其他格式的编码入口遇到时直接报错，绝不把它当成一条 user 消息发出去。
++   */
++  claudeSystemMessage?: ClaudeSystemMessageOptions;
+   /** provider 原生顶层 item 元数据；同 format 回放时可用于保留 id/status/phase 等字段 */
+   providerContext?: ProviderContextItem;
+   /** 该轮 API 调用的 Token 用量（存储用，组装请求时剥离） */
 diff --git a/src/types/tool.ts b/src/types/tool.ts
 index de7a5f8..5b8ca9f 100644
 --- a/src/types/tool.ts
@@ -3213,6 +3450,211 @@ index 0000000..7e0550d
 +      stop_reason: 'tool_use',
 +    });
 +    expect((decoded.content.parts[0] as any).functionCall.callId).toBe('toolu_01X');
++  });
++});
+diff --git a/tests/claude-mid-conversation-system-messages.test.ts b/tests/claude-mid-conversation-system-messages.test.ts
+new file mode 100644
+index 0000000..437a6bc
+--- /dev/null
++++ b/tests/claude-mid-conversation-system-messages.test.ts
+@@ -0,0 +1,199 @@
++/**
++ * Claude 消息中段 system 消息（轮内系统消息 clear_at）。
++ *
++ * 官方依据：https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages
++ * - 轮内系统消息写成 {"role":"system","clear_at":"next_user_message","content":"..."}，追加在 tool_result 之后；
++ * - 只能是文本；块上不能带 cache_control，断点放在前一条 user 消息的最后一块上；
++ * - 必须紧跟 user 轮，后面只能是 assistant 或数组结尾；紧跟另一条 user 消息是 400；不能是第一条；
++ * - 连续多条 system 消息视为一段。
++ */
++import { describe, expect, it } from 'vitest';
++
++import {
++  ClaudeFormat,
++  createClaudeProvider,
++  createDeepSeekProvider,
++  createGeminiProvider,
++  createOpenAICompatibleProvider,
++  createOpenAIResponsesProvider,
++  decodeRequestFromFormat,
++  encodeRequestToFormat,
++} from '../src/index.js';
++import type { Content, LLMRequest } from '../src/index.js';
++
++const reminder = (text: string): Content => ({
++  role: 'user',
++  parts: [{ text }],
++  claudeSystemMessage: { clearAt: 'next_user_message' },
++});
++
++/** 官方文档的工具循环例子：每个 tool_result 之后一条轮内提醒，之前的副本原样留在原位。 */
++const TOOL_LOOP: LLMRequest = {
++  systemInstruction: { parts: [{ text: 'You are a coding agent.' }] },
++  tools: [{ functionDeclarations: [{ name: 'read_file', description: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }] }],
++  contents: [
++    { role: 'user', parts: [{ text: 'Fix the failing test.' }] },
++    reminder('Request independent reads in one turn.'),
++    { role: 'model', parts: [
++      { text: '', thought: true, thoughtSignatures: { claude: 'sig-1' } },
++      { functionCall: { name: 'read_file', args: { path: 'test_auth.py' }, callId: 'toolu_01' } },
++    ] },
++    { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { content: '...' }, callId: 'toolu_01' } }] },
++    reminder('Request independent reads in one turn.'),
++    { role: 'model', parts: [
++      { text: '', thought: true, thoughtSignatures: { claude: 'sig-2' } },
++      { functionCall: { name: 'read_file', args: { path: 'auth.py' }, callId: 'toolu_02' } },
++    ] },
++    { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { content: '...' }, callId: 'toolu_02' } }] },
++    reminder('The shell exited with status 137.'),
++  ],
++};
++
++describe('Claude 轮内系统消息编码', () => {
++  it('按原位置编码为 role:"system" + clear_at，内容是字符串，不与相邻 tool_result 消息合并', () => {
++    const body = new ClaudeFormat('claude-fable-5-1').encodeRequest(TOOL_LOOP, true) as any;
++    expect(body.messages.map((message: any) => message.role)).toEqual(
++      ['user', 'system', 'assistant', 'user', 'system', 'assistant', 'user', 'system'],
++    );
++    expect(body.messages[1]).toEqual({ role: 'system', clear_at: 'next_user_message', content: 'Request independent reads in one turn.' });
++    expect(body.messages[4]).toEqual({ role: 'system', clear_at: 'next_user_message', content: 'Request independent reads in one turn.' });
++    expect(body.messages[7]).toEqual({ role: 'system', clear_at: 'next_user_message', content: 'The shell exited with status 137.' });
++    expect(body.messages[6].content).toEqual([{ type: 'tool_result', tool_use_id: 'toolu_02', content: '{"content":"..."}' }]);
++  });
++
++  it('同一历史两次编码逐字节相同；追加一轮后前面的消息原样不变', () => {
++    const format = new ClaudeFormat('claude-fable-5-1');
++    const first = JSON.stringify(format.encodeRequest(TOOL_LOOP, true));
++    expect(JSON.stringify(format.encodeRequest(structuredClone(TOOL_LOOP), true))).toBe(first);
++
++    const next: LLMRequest = {
++      ...TOOL_LOOP,
++      contents: [
++        ...TOOL_LOOP.contents,
++        { role: 'model', parts: [{ text: 'Done.' }] },
++        { role: 'user', parts: [{ text: 'thanks' }] },
++        reminder('Next turn reminder.'),
++      ],
++    };
++    const before = (format.encodeRequest(TOOL_LOOP, true) as any).messages;
++    const after = (format.encodeRequest(next, true) as any).messages;
++    expect(after.slice(0, before.length)).toEqual(before);
++  });
++
++  it('缓存断点：消息断点落在最后一条 user 消息（提醒之前）的最后一块上；system 与 tools 断点不变；提醒不带 cache_control', () => {
++    const body = new ClaudeFormat('claude-fable-5-1', { enabled: true, ttl: '1h' }).encodeRequest(TOOL_LOOP, true) as any;
++    const cacheControl = { type: 'ephemeral', ttl: '1h' };
++    expect(body.tools[0].cache_control).toEqual(cacheControl);
++    expect(body.system).toEqual([{ type: 'text', text: 'You are a coding agent.', cache_control: cacheControl }]);
++    expect(body.messages[6].content[0].cache_control).toEqual(cacheControl);
++    const marked = body.messages.flatMap((message: any, index: number) => Array.isArray(message.content)
++      ? message.content.filter((block: any) => block.cache_control).map(() => index)
++      : []);
++    expect(marked).toEqual([6]);
++    for (const message of body.messages.filter((candidate: any) => candidate.role === 'system')) {
++      expect(typeof message.content).toBe('string');
++      expect(message).not.toHaveProperty('cache_control');
++    }
++  });
++
++  it('自动缓存只写顶层 cache_control，不改动轮内系统消息（服务端选断点时跳过它）', () => {
++    const body = new ClaudeFormat('claude-fable-5-1', false, true).encodeRequest(TOOL_LOOP, true) as any;
++    expect(body.cache_control).toEqual({ type: 'ephemeral' });
++    expect(body.messages[7]).toEqual({ role: 'system', clear_at: 'next_user_message', content: 'The shell exited with status 137.' });
++  });
++
++  it('clearAt 缺省或 never 时不写 clear_at；多个文本 part 写成文本块数组', () => {
++    const body = new ClaudeFormat('claude-opus-5-5').encodeRequest({
++      contents: [
++        { role: 'user', parts: [{ text: 'hi' }] },
++        { role: 'user', parts: [{ text: 'a' }, { text: 'b' }], claudeSystemMessage: {} },
++        { role: 'user', parts: [{ text: 'c' }], claudeSystemMessage: { clearAt: 'never' } },
++      ],
++    }) as any;
++    expect(body.messages.slice(1)).toEqual([
++      { role: 'system', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] },
++      { role: 'system', content: 'c' },
++    ]);
++  });
++
++  it('面对的 assistant 消息没有可编码内容而被省略、后面紧跟 user 消息时，这段轮内系统消息整段去掉', () => {
++    const body = new ClaudeFormat('claude-opus-5-5').encodeRequest({
++      contents: [
++        { role: 'user', parts: [{ text: 'q1' }] },
++        reminder('stale'),
++        { role: 'model', parts: [{ text: '' }] },
++        { role: 'user', parts: [{ text: 'q2' }] },
++        reminder('current'),
++      ],
++    }) as any;
++    expect(body.messages).toEqual([
++      { role: 'user', content: 'q1' },
++      { role: 'user', content: 'q2' },
++      { role: 'system', clear_at: 'next_user_message', content: 'current' },
++    ]);
++  });
++
++  it('违反位置规则的调用直接报错：不能是第一条、不能跟在 assistant 后；普通 system 消息后面不能是 user', () => {
++    const format = new ClaudeFormat('claude-opus-5-5');
++    expect(() => format.encodeRequest({ contents: [reminder('first')] })).toThrow(/紧跟一条 user 消息/);
++    expect(() => format.encodeRequest({ contents: [
++      { role: 'user', parts: [{ text: 'q' }] },
++      { role: 'model', parts: [{ functionCall: { name: 'f', args: {}, callId: 'toolu_1' } }] },
++      reminder('between tool_use and tool_result'),
++      { role: 'user', parts: [{ functionResponse: { name: 'f', response: {}, callId: 'toolu_1' } }] },
++    ] })).toThrow(/紧跟一条 user 消息/);
++    expect(() => format.encodeRequest({ contents: [
++      { role: 'user', parts: [{ text: 'q' }] },
++      { role: 'user', parts: [{ text: 'policy' }], claudeSystemMessage: {} },
++      { role: 'user', parts: [{ text: 'q2' }] },
++    ] })).toThrow(/只能是 assistant/);
++    expect(() => format.encodeRequest({ contents: [
++      { role: 'user', parts: [{ text: 'q' }] },
++      { role: 'user', parts: [{ inlineData: { mimeType: 'image/png', data: 'AA==' } }], claudeSystemMessage: { clearAt: 'next_user_message' } },
++    ] })).toThrow(/只能包含文本/);
++    expect(() => format.encodeRequest({ contents: [
++      { role: 'user', parts: [{ text: 'q' }] },
++      { role: 'model', parts: [{ text: 'm' }], claudeSystemMessage: { clearAt: 'next_user_message' } },
++    ] })).toThrow(/role: "user"/);
++  });
++
++  it('Claude 请求里的 system 消息解码为 Claude 专用内容，并能原样编回', () => {
++    const wire = new ClaudeFormat('claude-fable-5-1').encodeRequest(TOOL_LOOP, false) as any;
++    const decoded = decodeRequestFromFormat(wire, { format: 'claude' });
++    expect(decoded.contents[1]).toEqual({ role: 'user', parts: [{ text: 'Request independent reads in one turn.' }], claudeSystemMessage: { clearAt: 'next_user_message' } });
++    const again = encodeRequestToFormat(decoded, { format: 'claude', sourceFormat: 'claude' }) as any;
++    expect(again.messages.filter((message: any) => message.role === 'system')).toEqual(
++      wire.messages.filter((message: any) => message.role === 'system'),
++    );
++  });
++});
++
++describe('其他格式永远收不到 Claude 专用的 system 消息', () => {
++  const config = { apiKey: 'test-key', baseUrl: 'https://example.invalid/v1' };
++  const providers = [
++    ['openai-compatible', createOpenAICompatibleProvider({ ...config, provider: 'openai-compatible', model: 'gpt-test' })],
++    ['openai-responses', createOpenAIResponsesProvider({ ...config, provider: 'openai-responses', model: 'gpt-test' })],
++    ['gemini', createGeminiProvider({ ...config, provider: 'gemini', model: 'gemini-test' })],
++    ['deepseek', createDeepSeekProvider({ ...config, provider: 'deepseek', model: 'deepseek-test' })],
++  ] as const;
++
++  for (const [name, provider] of providers) {
++    it(`${name} 编码入口直接报错，不把它当成 user 消息发出`, async () => {
++      await expect(provider.dryRun(TOOL_LOOP, { inputFormat: 'unified' })).rejects.toThrow(/Claude 专用的消息中段 system 消息/);
++      expect(() => encodeRequestToFormat(TOOL_LOOP, { format: name })).toThrow(/Claude 专用的消息中段 system 消息/);
++    });
++  }
++
++  it('Claude provider 正常编码', async () => {
++    const provider = createClaudeProvider({ ...config, provider: 'claude', model: 'claude-fable-5-1' });
++    const result = await provider.dryRun(TOOL_LOOP, { inputFormat: 'unified' });
++    expect((result.body as any).messages.filter((message: any) => message.role === 'system')).toHaveLength(3);
++  });
++
++  it('不带 claudeSystemMessage 的请求在所有格式上与原来一致（字段缺省）', () => {
++    const plain: LLMRequest = { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] };
++    for (const [name] of providers) {
++      expect(() => encodeRequestToFormat(plain, { format: name })).not.toThrow();
++    }
 +  });
 +});
 diff --git a/tests/fixtures/openai-compatible/baseline-16b50ab-requests.json b/tests/fixtures/openai-compatible/baseline-16b50ab-requests.json
