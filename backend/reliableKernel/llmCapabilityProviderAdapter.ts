@@ -256,9 +256,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           case LlmEventType.Delta: {
             const delta = optionalText(payload?.text);
             const outputItem = modelOutputItemFromPayload(payload);
+            const partSignature = optionalText(payload?.thoughtSignature);
             text += delta;
+            if (partSignature) appendSignedTextPart(outputParts, delta, partSignature, outputItem);
             if (delta) {
-              appendTextPart(outputParts, delta, false, undefined, outputItem);
+              if (!partSignature) appendTextPart(outputParts, delta, false, undefined, outputItem);
               enqueue({
                 kind: 'output_delta',
                 content: {
@@ -1854,7 +1856,7 @@ function appendTextPart(
     : last?.outputItem === undefined;
   if (last && 'text' in last && (last.thought === true) === thought
     && sameOutputItem
-    && (!thought || last.thoughtDurationMs === undefined)) {
+    && (thought ? last.thoughtDurationMs === undefined : last.thoughtSignature === undefined)) {
     last.text += delta;
     if (thought && thoughtSignature) last.thoughtSignature = thoughtSignature;
     if (outputItem) last.outputItem = outputItem;
@@ -1865,6 +1867,21 @@ function appendTextPart(
     ...(thought ? { thought: true, ...(thoughtSignature ? { thoughtSignature } : {}) } : {}),
     ...(outputItem ? { outputItem } : {})
   });
+}
+
+/**
+ * A visible text part received with a signature (Gemini's last part of a reply without function
+ * calls, often an empty text part while streaming) is stored as that part, in place: it is not merged
+ * with the text before it, and later text starts a new part, so the signature goes back "in the exact
+ * part where it was received" (https://ai.google.dev/gemini-api/docs/thought-signatures).
+ */
+function appendSignedTextPart(
+  parts: MessageContent['parts'],
+  text: string,
+  thoughtSignature: string,
+  outputItem?: ModelOutputItemReference
+): void {
+  parts.push({ text, thoughtSignature, ...(outputItem ? { outputItem } : {}) });
 }
 
 function completeLastThoughtPart(

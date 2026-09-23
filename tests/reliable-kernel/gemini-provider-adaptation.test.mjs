@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 
 const root = process.cwd();
 const require = createRequire(import.meta.url);
@@ -16,11 +17,18 @@ const {
   toUnifiedRequest
 } = require(path.join(root, 'dist/extension/backend/capabilities/unifiedMessageConversion.js'));
 const {
+  emitThoughtDeltas,
   emitUnifiedChunk,
   emitUnifiedResponse,
-  fromUnifiedCompletedContent
+  finishThoughtBlock,
+  fromUnifiedCompletedContent,
+  shouldCloseThoughtBlock
 } = require(path.join(root, 'dist/extension/backend/capabilities/llmStreamEventProjection.js'));
+const {
+  createLlmStreamEventBatcher
+} = require(path.join(root, 'dist/extension/backend/capabilities/llmStreamEventBatcher.js'));
 const { LlmEventType } = require(path.join(root, 'dist/extension/backend/world/modules/llm/events.js'));
+const kernel = await import(pathToFileURL(path.join(root, 'dist/extension/backend/reliableKernel/index.js')).href);
 const unified = await import('unified-llm-provider');
 
 // Thought signature rules: https://ai.google.dev/gemini-api/docs/thought-signatures
@@ -808,7 +816,7 @@ test('E5 a signed call without any thought does not create an empty thought part
   assert.deepEqual(calls.map((call) => call.thoughtSignature), ['gemini:SIG_FC']);
 });
 
-test('E5 signatures carried by thought or text parts keep their current handling', async (context) => {
+test('E5 a thought part keeps its own signature; a text part\'s signature is not a thought', async (context) => {
   const events = await nativeGeminiStreamEvents(context, [
     geminiChunk([{ text: 'Thinking.', thought: true, thoughtSignature: 'SIG_THOUGHT' }]),
     geminiChunk([{ functionCall: { name: 'list_items', args: {}, id: 'c1' }, thoughtSignature: 'SIG_FC' }]),
@@ -817,7 +825,330 @@ test('E5 signatures carried by thought or text parts keep their current handling
   ]);
   const thoughtDone = events.filter((event) => event.type === LlmEventType.ThoughtDone)
     .map((event) => event.payload.thoughtSignature);
-  assert.deepEqual(thoughtDone, ['gemini:SIG_THOUGHT', 'gemini:SIG_TEXT']);
+  assert.deepEqual(thoughtDone, ['gemini:SIG_THOUGHT']);
+  const deltas = events.filter((event) => event.type === LlmEventType.Delta).map((event) => event.payload);
+  assert.deepEqual(deltas.map((payload) => [payload.text, payload.thoughtSignature]), [
+    ['Done.', undefined],
+    ['', 'gemini:SIG_TEXT']
+  ]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// E6: the signature of a reply without function calls stays on the text part it arrived on.
+// "Model responses without a function call will return a thought signature inside the last part",
+// while streaming "the model may return the thought signature in a part with an empty text content
+// part", and "you must return this signature in the exact part where it was received"
+// (https://ai.google.dev/gemini-api/docs/thought-signatures); parts with signatures are neither
+// concatenated together nor merged with a part without one
+// (https://ai.google.dev/gemini-api/docs/generate-content/thinking).
+
+const GEMINI_PROVIDER_ID = 'provider-gemini-adaptation';
+
+function fullGeminiRequest(context, overrides = {}) {
+  const model = overrides.model ?? 'gemini-3.7-flash';
+  const provider = overrides.provider ?? 'gemini';
+  return {
+    kind: 'full-model-request',
+    modelRequestId: `model-request-${provider}`,
+    conversationId: 'conversation-gemini-adaptation',
+    attemptSeq: '1',
+    socketGeneration: '1',
+    providerId: GEMINI_PROVIDER_ID,
+    modelId: model,
+    authoritySnapshot: {
+      model: { providerConfigId: GEMINI_PROVIDER_ID, provider, modelId: model },
+      toolPolicy: { allowedTools: ['list_items'], preset: 'custom', sourceConfigs: {} }
+    },
+    recipe: { tools: [{ name: 'list_items', description: 'List items.', parameters: { type: 'object', properties: {} } }] },
+    context: context.map((content, index) => ({
+      segmentId: `segment-${index}`,
+      segmentKind: 'message',
+      messageRole: content.role,
+      contentType: 'application/vnd.limcode.message+json',
+      content: JSON.stringify(content)
+    })),
+    attachmentCatalogState: { catalog: [], placements: [] }
+  };
+}
+
+/** Thought durations are wall-clock timing, not part of the stored shape under test. */
+function withoutThoughtDurations(parts) {
+  return parts.map(({ thoughtDurationMs: _duration, ...part }) => part);
+}
+
+/**
+ * Production path from the wire to the stored reply: the unified Gemini decoder, the stream
+ * projection, the event batcher and the reliable full-request adapter that assembles the completed
+ * MessageContent the kernel commits. Only fetch is replaced.
+ */
+async function storedGeminiReply(context, reply, { stream = true } = {}) {
+  context.mock.method(globalThis, 'fetch', async () => stream
+    ? new Response(reply.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } })
+    : new Response(JSON.stringify(reply), { headers: { 'content-type': 'application/json' } }));
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(GEMINI_PROVIDER_ID, {
+    start(input, emit) {
+      void startLlmProvider(input, emit, { settings: async () => geminiConfig({ apiKey: 'offline-placeholder', stream }) });
+    },
+    abort() {}, cancelRetry() {}, dispose() {}
+  });
+  const events = [];
+  await adapter.sendFullRequest(fullGeminiRequest([{ role: 'user', parts: [{ text: 'go' }] }]), {
+    onEvent: async (event) => {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+    }
+  });
+  const completed = events.find((event) => event.kind === 'completed');
+  assert.ok(completed, 'the reply completes');
+  return withoutThoughtDurations(completed.content.parts);
+}
+
+/** The exact wire body of the next request, replaying a stored model reply through the production request path. */
+async function replayedWire(modelParts, overrides = {}) {
+  let start;
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(GEMINI_PROVIDER_ID, {
+    start(input, emit) {
+      start = structuredClone(input);
+      emit({ type: LlmEventType.Done, payload: { requestId: input.id } });
+    },
+    abort() {}, cancelRetry() {}, dispose() {}
+  });
+  const responses = modelParts.filter((part) => part.functionCall).map((part) => ({
+    id: part.id,
+    functionResponse: { name: part.functionCall.name, response: { ok: true } }
+  }));
+  await adapter.sendFullRequest(fullGeminiRequest([
+    { role: 'user', parts: [{ text: 'go' }] },
+    { role: 'model', parts: modelParts },
+    ...(responses.length > 0 ? [{ role: 'user', parts: responses }] : []),
+    { role: 'user', parts: [{ text: 'next' }] }
+  ], overrides), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
+  const settings = overrides.provider && overrides.provider !== 'gemini'
+    ? providerConfig({ provider: overrides.provider, model: overrides.model, apiKey: '' })
+    : geminiConfig(overrides.model ? { model: overrides.model } : {});
+  return (await dryRunLlmProvider(start, { settings: async () => settings })).body;
+}
+
+const replayedGeminiModelParts = async (modelParts, overrides) => (await replayedWire(modelParts, overrides)).contents[1].parts;
+
+test('E6 a streamed text reply keeps its trailing empty signed part in place, not as a thought', async (context) => {
+  const stored = await storedGeminiReply(context, [
+    geminiChunk([{ text: 'Thinking.', thought: true }]),
+    geminiChunk([{ text: 'Hello' }]),
+    geminiChunk([{ text: ' world' }]),
+    geminiChunk([{ text: '', thoughtSignature: 'SIG_TEXT' }], 'STOP')
+  ]);
+  assert.deepEqual(stored, [
+    { text: 'Thinking.', thought: true },
+    { text: 'Hello world' },
+    { text: '', thoughtSignature: 'gemini:SIG_TEXT' }
+  ]);
+  assert.deepEqual(await replayedGeminiModelParts(stored), [
+    { text: 'Thinking.', thought: true },
+    { text: 'Hello world' },
+    { text: '', thoughtSignature: 'SIG_TEXT' }
+  ]);
+});
+
+test('E6 a signature on a non-empty text fragment stays on that fragment; text after it starts a new part', async (context) => {
+  const lastFragment = await storedGeminiReply(context, [
+    geminiChunk([{ text: 'Hello' }]),
+    geminiChunk([{ text: ' world', thoughtSignature: 'SIG_TEXT' }], 'STOP')
+  ]);
+  assert.deepEqual(lastFragment, [{ text: 'Hello' }, { text: ' world', thoughtSignature: 'gemini:SIG_TEXT' }]);
+  assert.deepEqual(await replayedGeminiModelParts(lastFragment), [{ text: 'Hello' }, { text: ' world', thoughtSignature: 'SIG_TEXT' }]);
+
+  // Gemini 2.5 signs the first part of any type: a signed text fragment ahead of the call.
+  const firstFragment = await storedGeminiReply(context, [
+    geminiChunk([{ text: 'Let me', thoughtSignature: 'SIG_FIRST' }]),
+    geminiChunk([{ text: ' check.' }]),
+    geminiChunk([{ functionCall: { name: 'list_items', args: {}, id: 'c1' } }], 'STOP')
+  ]);
+  assert.deepEqual(firstFragment, [
+    { text: 'Let me', thoughtSignature: 'gemini:SIG_FIRST' },
+    { text: ' check.' },
+    { id: 'c1', functionCall: { name: 'list_items', args: {} } }
+  ]);
+});
+
+test('E6 streamed parallel calls: the signature stays on the first call only, with no extra thought part', async (context) => {
+  const stored = await storedGeminiReply(context, [
+    geminiChunk([{ text: 'Planning two calls.', thought: true }]),
+    geminiChunk([
+      { functionCall: { name: 'list_items', args: { page: 1 }, id: 'c1' }, thoughtSignature: 'SIG_FC' },
+      { functionCall: { name: 'list_items', args: { page: 2 }, id: 'c2' } }
+    ]),
+    geminiChunk([{ text: '' }], 'STOP')
+  ]);
+  assert.deepEqual(stored, [
+    { text: 'Planning two calls.', thought: true },
+    { id: 'c1', functionCall: { name: 'list_items', args: { page: 1 } }, thoughtSignature: 'gemini:SIG_FC' },
+    { id: 'c2', functionCall: { name: 'list_items', args: { page: 2 } } }
+  ]);
+  const wire = await replayedGeminiModelParts(stored);
+  assert.deepEqual(wire, [
+    { text: 'Planning two calls.', thought: true },
+    { functionCall: { name: 'list_items', args: { page: 1 }, id: 'c1' }, thoughtSignature: 'SIG_FC' },
+    { functionCall: { name: 'list_items', args: { page: 2 }, id: 'c2' } }
+  ]);
+});
+
+test('E6 a non-streamed text reply keeps its order and the signature on its last text part', async (context) => {
+  const stored = await storedGeminiReply(context, {
+    candidates: [{
+      content: { role: 'model', parts: [{ text: 'Thinking.', thought: true }, { text: 'Hello world', thoughtSignature: 'SIG_TEXT' }] },
+      finishReason: 'STOP'
+    }]
+  }, { stream: false });
+  assert.deepEqual(stored, [{ text: 'Thinking.', thought: true }, { text: 'Hello world', thoughtSignature: 'gemini:SIG_TEXT' }]);
+  assert.deepEqual(await replayedGeminiModelParts(stored), [
+    { text: 'Thinking.', thought: true },
+    { text: 'Hello world', thoughtSignature: 'SIG_TEXT' }
+  ]);
+
+  // Gemini 2.5 signs the first part of any type: a signed text part ahead of calls without ids.
+  const signedFirst = await storedGeminiReply(context, {
+    candidates: [{
+      content: {
+        role: 'model',
+        parts: [
+          { text: 'Let me check.', thoughtSignature: 'SIG_FIRST' },
+          { functionCall: { name: 'list_items', args: { page: 1 } } },
+          { functionCall: { name: 'list_items', args: { page: 2 } } }
+        ]
+      },
+      finishReason: 'STOP'
+    }]
+  }, { stream: false });
+  assert.deepEqual(signedFirst, [
+    { text: 'Let me check.', thoughtSignature: 'gemini:SIG_FIRST' },
+    { id: 'tool_call_0', functionCall: { name: 'list_items', args: { page: 1 } } },
+    { id: 'tool_call_1', functionCall: { name: 'list_items', args: { page: 2 } } }
+  ]);
+
+  // A non-streamed call reply has no signed text part and is stored exactly as before.
+  const calls = await storedGeminiReply(context, {
+    candidates: [{
+      content: {
+        role: 'model',
+        parts: [
+          { text: 'Planning.', thought: true },
+          { functionCall: { name: 'list_items', args: {}, id: 'c1' }, thoughtSignature: 'SIG_FC' },
+          { functionCall: { name: 'list_items', args: { page: 2 }, id: 'c2' } }
+        ]
+      },
+      finishReason: 'STOP'
+    }]
+  }, { stream: false });
+  assert.deepEqual(calls, [
+    { text: 'Planning.', thought: true },
+    { id: 'c1', functionCall: { name: 'list_items', args: {} }, thoughtSignature: 'gemini:SIG_FC' },
+    { id: 'c2', functionCall: { name: 'list_items', args: { page: 2 } } }
+  ]);
+});
+
+test('E6 non-streamed replies without a signed text part emit the same events as before', () => {
+  const events = [];
+  emitUnifiedResponse('request-e6', {
+    content: {
+      role: 'model',
+      parts: [
+        { text: 'thinking', thought: true, thoughtSignatures: { claude: 'SIG_C' } },
+        { text: 'answer' },
+        { functionCall: { name: 'list_items', args: {}, callId: 'toolu_1' } }
+      ]
+    }
+  }, (event) => events.push(event));
+  assert.deepEqual(events.map((event) => [event.type, event.payload.text ?? event.payload.thoughtSignature ?? event.payload.calls?.[0].id]), [
+    [LlmEventType.Delta, 'answer'],
+    [LlmEventType.ThoughtDelta, 'thinking'],
+    [LlmEventType.ThoughtDone, 'claude:SIG_C'],
+    [LlmEventType.ToolCall, 'toolu_1']
+  ]);
+  assert.equal(events[0].payload.thoughtSignature, undefined);
+});
+
+test('E6 other providers\' signatures still belong to their thought blocks', () => {
+  const chunks = [
+    // Claude signature_delta and redacted thinking: signature-only thought parts mirrored on the chunk.
+    { partsDelta: [{ thought: true, thoughtSignatures: { claude: 'SIG_CLAUDE' } }], thoughtSignatures: { claude: 'SIG_CLAUDE' } },
+    // OpenAI Responses encrypted reasoning.
+    { partsDelta: [{ thought: true, thoughtSignatures: { 'openai-responses': 'ENC' } }], thoughtSignatures: { 'openai-responses': 'ENC' } },
+    // OpenRouter reasoning_details envelope at the end of an OpenAI-compatible stream.
+    { partsDelta: [{ text: '', thought: true, thoughtSignature: '{"reasoning_details":[]}' }], thoughtSignature: '{"reasoning_details":[]}' }
+  ];
+  const expected = ['claude:SIG_CLAUDE', 'openai-responses:ENC', '{"reasoning_details":[]}'];
+  chunks.forEach((chunk, index) => {
+    const events = [];
+    const block = emitThoughtDeltas('request-e6', undefined, chunk, 1_000, (event) => events.push(event));
+    assert.equal(block?.thoughtSignature, expected[index]);
+    assert.equal(shouldCloseThoughtBlock(chunk), true);
+    finishThoughtBlock('request-e6', block, 1_500, (event) => events.push(event));
+    emitUnifiedChunk('request-e6', chunk, (event) => events.push(event));
+    assert.deepEqual(events.map((event) => [event.type, event.payload.thoughtSignature]), [[LlmEventType.ThoughtDone, expected[index]]]);
+  });
+  // Visible text of other providers is emitted as one unsigned Delta, as before.
+  const events = [];
+  emitUnifiedChunk('request-e6', { textDelta: 'answer', partsDelta: [{ text: 'answer' }] }, (event) => events.push(event));
+  assert.deepEqual(events, [{ type: LlmEventType.Delta, payload: { requestId: 'request-e6', text: 'answer' } }]);
+});
+
+test('E6 the event batcher never merges a signed text part with its neighbours', () => {
+  const sink = [];
+  const batcher = createLlmStreamEventBatcher((event) => sink.push(event), { intervalMs: 60_000 });
+  const delta = (text, thoughtSignature) => ({
+    type: LlmEventType.Delta,
+    payload: { requestId: 'request-e6', text, ...(thoughtSignature ? { thoughtSignature } : {}) }
+  });
+  for (const event of [delta('He'), delta('llo'), delta(' world', 'gemini:SIG'), delta('!'), delta('', 'gemini:SIG_2'), delta('', 'gemini:SIG_3')]) {
+    batcher.emit(event);
+  }
+  batcher.flush();
+  assert.deepEqual(sink.map((event) => [event.payload.text, event.payload.thoughtSignature]), [
+    ['Hello', undefined],
+    [' world', 'gemini:SIG'],
+    ['!', undefined],
+    ['', 'gemini:SIG_2'],
+    ['', 'gemini:SIG_3']
+  ]);
+});
+
+test('E6 signed Gemini text parts add nothing to other providers\' wire bodies', async () => {
+  const signed = [
+    { text: 'Thinking.', thought: true },
+    { text: 'Hello' },
+    { text: ' world', thoughtSignature: 'gemini:SIG_TEXT' },
+    { text: '', thoughtSignature: 'gemini:SIG_END' }
+  ];
+  const unsigned = [{ text: 'Thinking.', thought: true }, { text: 'Hello' }, { text: ' world' }];
+  for (const [provider, model] of [['claude', 'claude-opus-5-5'], ['openai-compatible', 'gpt-5.5'], ['openai-responses', 'gpt-5.5'], ['deepseek', 'deepseek-chat']]) {
+    assert.deepEqual(
+      await replayedWire(signed, { provider, model }),
+      await replayedWire(unsigned, { provider, model }),
+      provider
+    );
+  }
+});
+
+test('E6 replies stored before this change replay exactly as they did', async () => {
+  // Old text reply: the trailing signature was stored as an empty thought part.
+  assert.deepEqual(await replayedGeminiModelParts([
+    { text: 'Thinking.', thought: true, thoughtDurationMs: 5 },
+    { text: 'Hello world' },
+    { text: '', thought: true, thoughtSignature: 'gemini:SIG_TEXT', thoughtDurationMs: 0 }
+  ]), [
+    { text: 'Thinking.', thought: true },
+    { text: 'Hello world' },
+    { text: '', thought: true, thoughtSignature: 'SIG_TEXT' }
+  ]);
+  // Old call reply: the call's signature was also copied onto an empty thought part.
+  assert.deepEqual(await replayedGeminiModelParts([
+    { text: '', thought: true, thoughtSignature: 'gemini:SIG_FC', thoughtDurationMs: 0 },
+    { id: 'c1', functionCall: { name: 'list_items', args: {} }, thoughtSignature: 'gemini:SIG_FC' }
+  ]), [
+    { text: '', thought: true, thoughtSignature: 'SIG_FC' },
+    { functionCall: { name: 'list_items', args: {}, id: 'c1' }, thoughtSignature: 'SIG_FC' }
+  ]);
 });
 
 // ---------------------------------------------------------------------------------------------

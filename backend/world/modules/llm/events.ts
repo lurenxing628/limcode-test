@@ -61,6 +61,11 @@ export interface LlmDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
   text: string;
   outputItem?: ModelOutputItemReference;
+  /**
+   * 收到时就挂在这段可见文字 part 上的签名（Gemini 普通回复的最后一个 part，流式时常是一个空文字 part）。
+   * 带签名的 Delta 只对应那一个 part：不与其他 Delta 合并，存成独立的可见文字 part 原位回放。
+   */
+  thoughtSignature?: string;
 }
 export interface LlmThoughtDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;

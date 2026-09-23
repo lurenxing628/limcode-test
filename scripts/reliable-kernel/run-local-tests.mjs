@@ -110,6 +110,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/claude-turn-scoped-reminders.test.mjs',
   'tests/reliable-kernel/claude-turn-scoped-reminders-runtime.test.mjs',
   'tests/reliable-kernel/gemini-provider-adaptation.test.mjs',
+  'tests/reliable-kernel/gemini-thought-signature-runtime.test.mjs',
   'tests/reliable-kernel/provider-websocket-policy.test.mjs',
   'tests/reliable-kernel/reliable-control-lifecycle.test.mjs',
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',
