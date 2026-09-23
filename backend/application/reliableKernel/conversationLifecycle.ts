@@ -219,13 +219,18 @@ export class ReliableConversationLifecycle {
   /**
    * A permanently rejected command never commits its branch, but an earlier attempt that failed
    * at the commit may have copied Conversation-layer settings under the target id already. They are
-   * removed so the rejection leaves nothing behind; a target committed by this command is kept.
+   * removed so the rejection leaves nothing behind; a target committed by this command is kept. The
+   * rejection is what the caller must see, so a failed cleanup is only logged.
    */
   private async discardRejectedForkTarget(targetConversationId: string): Promise<void> {
-    await this.application.database.conversationOwners.run(targetConversationId, async () => {
-      if (await this.maybeRow('Conversation', targetConversationId)) return;
-      await this.configuration.mutations.clearConversationConfiguration(targetConversationId);
-    });
+    try {
+      await this.application.database.conversationOwners.run(targetConversationId, async () => {
+        if (await this.maybeRow('Conversation', targetConversationId)) return;
+        await this.configuration.mutations.clearConversationConfiguration(targetConversationId);
+      });
+    } catch (error) {
+      console.warn('[LimCode] Failed to remove the settings of a rejected fork target.', targetConversationId, error);
+    }
   }
 
   private async forkCommand(

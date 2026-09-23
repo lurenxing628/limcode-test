@@ -890,6 +890,28 @@ test('a fork permanently rejected after an interrupted attempt removes the setti
   });
 });
 
+test('a failed settings cleanup is logged and never replaces the permanent rejection', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'cleanup-failure-input');
+    const command = await h.command('source', 'cleanup-failure', 'user');
+    const mutations = h.configuration.mutations;
+    const clear = mutations.clearConversationConfiguration;
+    const warn = console.warn;
+    const warnings = [];
+    mutations.clearConversationConfiguration = async () => { throw new Error('injected settings cleanup failure'); };
+    console.warn = (...args) => { warnings.push(args); };
+    try {
+      await assert.rejects(h.facade.forkConversation({ ...command, sourceConversationId: 'missing-source' }),
+        error => error instanceof kernel.ConversationForkRejectedError && /不存在/.test(error.message));
+    } finally {
+      mutations.clearConversationConfiguration = clear;
+      console.warn = warn;
+    }
+    assert.ok(warnings.some(args => args.some(arg => arg instanceof Error && /injected settings cleanup failure/.test(arg.message))),
+      'the cleanup failure is logged');
+  });
+});
+
 for (const fault of ['before-commit', 'revision-race']) {
   test(`fork ${fault} does not leave a partially created runtime target`, async () => {
     await withForkRuntime(async h => {
