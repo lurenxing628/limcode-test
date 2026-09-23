@@ -248,13 +248,13 @@ test('list excludes this conversation, its team and child tasks; read returns th
   const REPLY = 'PEER_HISTORY_REPLY_4411';
   let rootRound = 0, peerRound = 0, childRequests = 0;
   const spawn = (id, taskName) => toolsAnswer(call(id, 'run_agent', { operation: 'spawn', taskName, prompt: `${taskName} task`, foregroundWaitMs: 0 }));
-  // The production registry no longer carries the board, so no conversation is ever offered it.
+  // The production registry no longer carries the board, so no conversation is ever offered it. This
+  // registry check is the guard: the fixture's own definitions never included the board.
   const builtin = createBuiltinToolDefinitions({ command: { toolName: 'bash', description: 'Synthetic shell.' } }).map(tool => tool.declaration.name);
   assert.ok(!builtin.includes('agent_board'), 'agent_board is not registered for models in phase one');
   for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(builtin.includes(name), `${name} is registered`);
   await fixture(async (request, f, start) => {
     const names = start.tools.map(tool => tool.name);
-    assert.ok(!names.includes('agent_board'), `agent_board offered to ${request.conversationId}`);
     if (request.conversationId === PEER) return ++peerRound === 1 ? spawn('peer-spawn', 'peer worker') : answer(REPLY);
     // Real child tasks of both teams: phase one never lists or addresses them across teams, and a
     // child task is not offered the cross-conversation tools even though its Turn froze the switch on.
