@@ -4,6 +4,7 @@
  * 某次请求返回 400/422 且错误文本明确点名某个参数不被支持时，记住“对这个目标去掉或替换该参数”，
  * 并让调用方立即重试一次；之后同一目标（渠道配置 id + baseUrl + 模型）的请求在编码后直接适配。
  * 其他目标完全不受影响；网络错误、5xx 与语义不明确的 400 一律不匹配。
+ * Claude 保留思考的前缀失配（claudeThinkingAdaptation.ts）用同一套按目标记忆与立即重发。
  *
  * 真实错误文本依据：
  * - 网关实测（openai-compatible → claude-sonnet-5）：
@@ -31,6 +32,11 @@
  */
 import type { LlmProviderKind } from '../../shared/protocol';
 import { isRecord, toPlainJsonLike } from './llmStreamEventProjection';
+import {
+  applyClaudeThinkingBinding,
+  claudeThinkingBindingModeForError,
+  type ClaudeThinkingBindingMode
+} from './claudeThinkingAdaptation';
 
 export interface ProviderRequestTarget {
   providerConfigId: string;
@@ -73,6 +79,8 @@ const CHAT_COMPLETIONS_PROVIDERS = new Set<LlmProviderKind>(['openai-compatible'
 
 interface TargetAdaptationState {
   parameters: Set<AdaptableRequestParameter>;
+  /** Claude 保留思考的前缀失配处理；只会 drop_block → strip_thinking 单向推进，不会放回。 */
+  claudeThinkingBinding?: ClaudeThinkingBindingMode;
 }
 
 const adaptationStates = new Map<string, TargetAdaptationState>();
@@ -86,9 +94,15 @@ export function resetProviderRequestAdaptations(): void {
   adaptationStates.clear();
 }
 
-export function learnedProviderRequestAdaptations(target: ProviderRequestTarget): { parameters: AdaptableRequestParameter[] } {
+export function learnedProviderRequestAdaptations(target: ProviderRequestTarget): {
+  parameters: AdaptableRequestParameter[];
+  claudeThinkingBinding?: ClaudeThinkingBindingMode;
+} {
   const state = adaptationStates.get(providerRequestTargetKey(target));
-  return { parameters: state ? [...state.parameters].sort() : [] };
+  return {
+    parameters: state ? [...state.parameters].sort() : [],
+    ...(state?.claudeThinkingBinding ? { claudeThinkingBinding: state.claudeThinkingBinding } : {})
+  };
 }
 
 /**
@@ -123,15 +137,22 @@ export function installEncodedRequestPostProcessor<T>(provider: T, postProcess: 
   return provider;
 }
 
-/** 把该目标已记住的参数适配应用到编码后的请求体；没有记住任何适配时原样返回同一引用。 */
-export function applyLearnedParameterAdaptations(
+/** 把该目标已记住的适配应用到编码后的请求；没有记住任何适配时原样返回同一引用。 */
+export function applyLearnedRequestAdaptations(
   request: EncodedProviderRequest,
   target: ProviderRequestTarget
 ): EncodedProviderRequest {
   const state = adaptationStates.get(providerRequestTargetKey(target));
-  if (!state || state.parameters.size === 0) return request;
-  const body = adaptRequestParameters(request.body, state.parameters, target.provider);
-  return body === request.body ? request : { ...request, body };
+  if (!state) return request;
+  let next = request;
+  if (state.parameters.size > 0) {
+    const body = adaptRequestParameters(next.body, state.parameters, target.provider);
+    if (body !== next.body) next = { ...next, body };
+  }
+  if (target.provider === 'claude' && state.claudeThinkingBinding) {
+    next = applyClaudeThinkingBinding(next, state.claudeThinkingBinding);
+  }
+  return next;
 }
 
 export function adaptRequestParameters(
@@ -180,24 +201,33 @@ export function learnProviderRequestAdaptations(target: ProviderRequestTarget, r
   if (status !== 400 && status !== 422) return [];
   const text = providerErrorSearchText(rawError);
   if (!text) return [];
-  const parameters = unsupportedRequestParameters(text)
-    .filter((parameter) => parameter !== 'max_tokens' || CHAT_COMPLETIONS_PROVIDERS.has(target.provider));
-  if (parameters.length === 0) return [];
   const key = providerRequestTargetKey(target);
   const state = adaptationStates.get(key) ?? { parameters: new Set<AdaptableRequestParameter>() };
+  const parameters = unsupportedRequestParameters(text)
+    .filter((parameter) => parameter !== 'max_tokens' || CHAT_COMPLETIONS_PROVIDERS.has(target.provider));
+  const binding = target.provider === 'claude'
+    ? claudeThinkingBindingModeForError(text, state.claudeThinkingBinding)
+    : undefined;
+  if (parameters.length === 0 && !binding) return [];
   const learned = parameters.filter((parameter) => !state.parameters.has(parameter));
   for (const parameter of parameters) state.parameters.add(parameter);
+  const learnedBinding = binding !== undefined && binding !== state.claudeThinkingBinding ? binding : undefined;
+  if (binding) state.claudeThinkingBinding = binding;
   adaptationStates.set(key, state);
-  if (learned.length > 0) {
+  if (learned.length > 0 || learnedBinding) {
     console.log('[LimCode][ProviderAdaptation]', JSON.stringify({
       providerConfigId: target.providerConfigId,
       provider: target.provider,
       model: target.model,
       status,
-      adaptedParameters: learned
+      ...(learned.length > 0 ? { adaptedParameters: learned } : {}),
+      ...(learnedBinding ? { claudeThinkingBinding: learnedBinding } : {})
     }));
   }
-  return parameters.map((parameter) => `parameter:${parameter}`);
+  return [
+    ...parameters.map((parameter) => `parameter:${parameter}`),
+    ...(binding ? [`claude-thinking-binding:${binding}`] : [])
+  ];
 }
 
 export interface ProviderRequestAdaptationRetry {

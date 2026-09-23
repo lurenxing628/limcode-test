@@ -16,7 +16,7 @@ import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
 import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 import { installProviderCompatibility } from './geminiProviderAdaptation';
 import {
-  applyLearnedParameterAdaptations,
+  applyLearnedRequestAdaptations,
   createProviderRequestAdaptationRetry,
   installEncodedRequestPostProcessor,
   type ProviderRequestTarget
@@ -4522,10 +4522,10 @@ function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderReque
   return { providerConfigId: settings.id, provider: settings.provider, baseUrl: settings.baseUrl, model: settings.model };
 }
 
-/** 编码后请求的最终适配：按目标记住的不支持参数（进程内）。 */
+/** 编码后请求的最终适配：按目标记住的不支持参数与 Claude 保留思考处理（进程内）。 */
 function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord): T {
   const target = providerRequestTarget(settings);
-  return installEncodedRequestPostProcessor(provider, (request) => applyLearnedParameterAdaptations(request, target));
+  return installEncodedRequestPostProcessor(provider, (request) => applyLearnedRequestAdaptations(request, target));
 }
 
 function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmProviderConfigRecord {
