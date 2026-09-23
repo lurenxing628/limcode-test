@@ -1818,7 +1818,7 @@ test('a plan approved in the source still authorizes a retry in a fork of a fork
     const [mutation] = await rows(h.app, 'ToolCall', { turn_id: retry.turnId, tool_name: 'read' });
     assert.ok(mutation, 'the retried turn issued a gated tool call');
     const gate = new kernel.FrozenAuthorityMcpPolicyGate(h.app.database, h.app.contentStore);
-    assert.deepEqual(await gate.authorize({ toolCallId: mutation.id, serverId: 'fixture-mcp', riskLevel: 'write' }),
+    assert.deepEqual(await gate.authorize({ toolCallId: mutation.id, serverId: 'fixture-mcp', toolName: 'read', riskLevel: 'write' }),
       { toolPolicyAllowed: true, planReviewAllowed: true });
     const review = input => kernel.authorizeFrozenPlanReview({
       database: h.app.database, contentStore: h.app.contentStore, turnId: retry.turnId,
@@ -1830,7 +1830,7 @@ test('a plan approved in the source still authorizes a retry in a fork of a fork
       'the nested fork is authorized by the inherited approval, not by an unrelated fact');
   }, { script: {
     async configure(configuration) {
-      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'submit_plan'] });
+      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'submit_plan'], sourceConfigs: { 'fixture-mcp': { enabled: true } } });
       await configuration.mutations.setPlanReviewPolicy({ scopeKind: 'global', ...planPolicy });
     },
     definitions: [
@@ -1900,12 +1900,12 @@ test('forks keep the task panel and the approved plan of copied tool calls, also
     const [mutation] = await rows(h.app, 'ToolCall', { turn_id: retry.turnId, tool_name: 'read' });
     assert.ok(mutation, 'the retried turn issued a gated tool call');
     const gate = new kernel.FrozenAuthorityMcpPolicyGate(h.app.database, h.app.contentStore);
-    assert.deepEqual(await gate.authorize({ toolCallId: mutation.id, serverId: 'fixture-mcp', riskLevel: 'write' }),
+    assert.deepEqual(await gate.authorize({ toolCallId: mutation.id, serverId: 'fixture-mcp', toolName: 'read', riskLevel: 'write' }),
       { toolPolicyAllowed: true, planReviewAllowed: true });
     assert.deepEqual((await currentTaskItems(h.app, nested.conversationId)).current, expected.current);
   }, { script: {
     async configure(configuration) {
-      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'submit_plan', 'update_task_list'] });
+      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'submit_plan', 'update_task_list'], sourceConfigs: { 'fixture-mcp': { enabled: true } } });
       await configuration.mutations.setPlanReviewPolicy({ scopeKind: 'global', ...planPolicy });
     },
     definitions: [
