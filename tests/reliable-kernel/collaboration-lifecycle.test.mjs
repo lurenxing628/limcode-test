@@ -19,15 +19,18 @@ async function withRuntime(body) {
     return await body({ database, store });
   } finally { if (database) await database.close(); await fs.rm(directory, { recursive: true, force: true }); }
 }
-async function seedMessage({ database, store }, id, mode = 'message', target = 'target', text = `body of ${id}`, source = 'sender') {
+async function seedMessage({ database, store }, id, mode = 'message', target = 'target', text = `body of ${id}`, source = 'sender', turns = {}) {
   const payload = await store.ingest(database, text, 'text/vnd.limcode.collaboration-message');
+  const delivered = turns.deliveredTurnId ?? null;
+  const deliveryState = turns.deliveryState ?? (delivered ? 'consumed' : 'pending');
   await database.transaction([
     kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode, created_at: NOW }, { column: 'message_seq', scope: {} }),
-    row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: source, source_kind: 'tool', source_key: id, turn_id: null, tool_call_id: null, created_at: NOW }),
+    row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: source, source_kind: 'tool', source_key: id, turn_id: turns.sourceTurnId ?? null, tool_call_id: null, created_at: NOW }),
     row('RuntimeInboxItem', { id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message', source_id: id, state: 'available', created_at: NOW, updated_at: NOW }),
     row('CollaborationMessageTargetLink', { id: `${id}-target`, message_id: id, conversation_id: target, inbox_item_id: `${id}-inbox`, anchor_turn_id: null, created_at: NOW }),
     row('CollaborationMessagePayloadLink', { id: `${id}-payload`, message_id: id, content_object_id: payload.id, created_at: NOW }),
-    row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: target, target_turn_id: null, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: NOW, updated_at: NOW })
+    row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: target, target_turn_id: delivered, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: deliveryState, failure_reason: deliveryState === 'failed' ? 'target-gone' : null, created_at: NOW, updated_at: NOW }),
+    ...(deliveryState === 'consumed' ? [row('RuntimeDeliveryInputLink', { id: `${id}-input`, delivery_id: `${id}-delivery`, pending_turn_input_id: `${id}-pending-input`, handled_at: NOW, created_at: NOW, updated_at: NOW })] : [])
   ]);
 }
 async function get(database, domain, id) { return (await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0]; }
@@ -162,13 +165,46 @@ test('collaboration request identity cannot be rewritten and no per-conversation
   assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink'), /ConversationCommunicationLink|unknown|Unknown|not registered/);
 });
 
-test('collaboration snapshot bounds messages by durable sequence even at identical timestamps', async () => withRuntime(async (runtime) => {
+test('collaboration snapshot keeps the cards of every loaded Turn instead of only the newest 32 messages', async () => withRuntime(async (runtime) => {
   const { database } = runtime;
-  for (let index = 0; index < 35; index += 1) await seedMessage(runtime, `seq-${35 - index}`);
+  const LATER = '2026-09-23T00:00:00.000Z';
+  await database.transaction([
+    row('Turn', { id: 'target-old-turn', conversation_id: 'target', status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+    row('Turn', { id: 'target-new-turn', conversation_id: 'target', status: 'terminated', created_at: LATER, updated_at: LATER, terminal_at: LATER })
+  ]);
+  for (let index = 0; index < 30; index += 1) {
+    await seedMessage(runtime, `delivered-${index}`, 'message', 'target', `delivered ${index}`, 'sender', { deliveredTurnId: 'target-old-turn' });
+  }
+  for (let index = 0; index < 30; index += 1) {
+    await seedMessage(runtime, `sent-${index}`, 'message', 'sender', `sent ${index}`, 'target', { sourceTurnId: 'target-new-turn' });
+  }
+  await seedMessage(runtime, 'queued', 'followup', 'target', 'waits for the next Turn');
+  await seedMessage(runtime, 'failed', 'message', 'target', 'never delivered', 'sender', { deliveryState: 'failed' });
+  await seedMessage(runtime, 'elsewhere', 'message', 'target', 'bound to a Turn this view does not load', 'sender', { deliveredTurnId: 'unloaded-turn' });
+  await seedMessage(runtime, 'foreign', 'message', 'unrelated', 'between other Conversations', 'sender', { sourceTurnId: 'target-new-turn' });
+
   const summary = (await database.clientProjectionSnapshot('target')).snapshot.subagentDeliverySummary;
-  assert.equal(summary.collaborationMessages.length, 32);
+  const ids = new Set(summary.collaborationMessages.map((value) => value.id));
+  for (let index = 0; index < 30; index += 1) {
+    assert.ok(ids.has(`delivered-${index}`), `delivered-${index} belongs to a loaded Turn`);
+    assert.ok(ids.has(`sent-${index}`), `sent-${index} belongs to a loaded Turn`);
+  }
+  assert.ok(ids.has('queued'), 'a message still waiting for a Turn stays visible');
+  assert.ok(ids.has('failed'), 'a failed delivery stays visible');
+  assert.equal(ids.has('elsewhere'), false);
+  assert.equal(ids.has('foreign'), false);
+  assert.equal(summary.collaborationMessages.length, 62);
+  const deliveries = new Set(summary.runtimeDeliveries.map((value) => value.id));
+  for (let index = 0; index < 30; index += 1) assert.ok(deliveries.has(`delivered-${index}-delivery`), 'each incoming card has its delivery');
+}));
+
+test('collaboration snapshot stays bounded by durable sequence even at identical timestamps', async () => withRuntime(async (runtime) => {
+  const { database } = runtime;
+  for (let index = 0; index < 205; index += 1) await seedMessage(runtime, `seq-${205 - index}`);
+  const summary = (await database.clientProjectionSnapshot('target')).snapshot.subagentDeliverySummary;
+  assert.equal(summary.collaborationMessages.length, 200);
   assert.equal(summary.collaborationMessages[0].id, 'seq-1');
-  assert.equal(summary.collaborationMessages.at(-1).id, 'seq-32');
-  assert.equal(summary.collaborationMessageSourceLinks.length, 32);
-  assert.equal(summary.collaborationMessageTargetLinks.length, 32);
+  assert.equal(summary.collaborationMessages.at(-1).id, 'seq-200');
+  assert.equal(summary.collaborationMessageSourceLinks.length, 200);
+  assert.equal(summary.collaborationMessageTargetLinks.length, 200);
 }));

@@ -88,6 +88,6 @@ normal changes queue
 - 仅发送消息不启动空闲 Turn；明确跟进任务才允许启动。两者均复用 RuntimeInboxItem、RuntimeDelivery、InputLink 和持久 Wake，新的来源类型保留工具级权限，不伪装用户授权。
 - 正式 AnswerBridge/AnswerSubmission 仍投原父任务；请求发起方的结果使用独立回复关系，不改写稳定父边。
 - 留言板的 Channel/ScopeLink、Post/ChannelLink/SourceLink/ReplyLink、SubscriptionLink 与 CommandReceipt 独立持久化；只有运行中的订阅者接收通知，不因通知拉起空闲 Agent。
-- Client Feed 只投影当前会话参与的最近 32 条消息与独立关系，消息信封只带 320 字符以内的正文摘要，完整正文和留言板按授权查询。运行时续接预览保留 collaboration_message 来源和有界摘要，不当作用户输入。
+- Client Feed 只投影当前会话参与、且从已加载轮次发出或投递进已加载轮次的消息（另含仍在等待或投递失败的收件，按序号最多 200 条）与独立关系，对方对话另作独立集合投影以显示侧栏标题；消息信封只带 320 字符以内的正文摘要，完整正文和留言板按授权查询。运行时续接预览保留 collaboration_message 来源和有界摘要，不当作用户输入。
 - 删除目标会话时，协作 pending Delivery 同事务 failed(target-gone)，未完成 Wake dead_letter；pending Request 由收敛先向请求方回复「Task could not start」再标为 failed。历史 Message/Inbox 和另一会话已消费内容保留。删除留言板根或作者时先清理相关 Posts/Replies/Channels。
 - epoch 5 的 107 个领域必须与 authority crosswalk 完整匹配；旧 epoch 离线归档重置，当前代缺表或 metadata 漂移拒绝打开。

@@ -1053,7 +1053,21 @@ export function executeClientProjectionSnapshot(
       'id',
       answerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : [])
     );
-    const deliveries = queryClientRuntimeDeliveries(database, conversationId);
+    // Collaboration cards sit at the Turns this snapshot loads, so the selection follows those
+    // Turns instead of a fixed count of the newest messages.
+    const collaborationMessages = queryCollaborationMessagesForTurns(database, conversationId, turnIds)
+      .map((row) => projectCollaborationMessageRecord(database, String(row.id), content));
+    const collaborationIds = collaborationMessages.map(row => String(row.id));
+    const collaborationMessageSourceLinks = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', collaborationIds);
+    const collaborationMessageTargetLinks = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', collaborationIds);
+    // Each incoming card is placed by its delivery, which may be older than the newest deliveries.
+    const deliveries = mergeRowsById([
+      ...queryClientRuntimeDeliveries(database, conversationId),
+      ...queryAllByIds(database, 'runtime_delivery', 'inbox_item_id', collaborationMessageTargetLinks
+        .filter((link) => link.conversation_id === conversationId)
+        .map((link) => String(link.inbox_item_id)))
+        .filter((delivery) => delivery.target_conversation_id === conversationId)
+    ]);
     const deliveryIds = deliveries.map((row) => String(row.id));
     const deliveryInputLinks = queryAllByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
     const projectedDeliveries = deliveries.map((delivery) => {
@@ -1077,18 +1091,6 @@ export function executeClientProjectionSnapshot(
       deliveryIds
     ).filter((link) => queuedTurnIntentIds.has(String(link.turn_intent_id)));
 
-    // Each Conversation sees only its own bounded communication envelope; message bodies stay in CAS.
-    const collaborationMessages = queryPlainRows(database, `
-      SELECT message.* FROM collaboration_message AS message
-       WHERE EXISTS (SELECT 1 FROM collaboration_message_source_link AS source
-          WHERE source.message_id = message.id AND source.conversation_id = @conversationId)
-          OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target
-          WHERE target.message_id = message.id AND target.conversation_id = @conversationId)
-       ORDER BY message.message_seq DESC, message.id DESC LIMIT 32
-    `, { conversationId }).map((row) => projectCollaborationMessageRecord(database, String(row.id), content));
-    const collaborationIds = collaborationMessages.map(row => String(row.id));
-    const collaborationMessageSourceLinks = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', collaborationIds);
-    const collaborationMessageTargetLinks = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', collaborationIds);
     const collaborationMessageReplyLinks = queryAllByIds(database, 'collaboration_message_reply_link', 'message_id', collaborationIds);
     const collaborationRequests = queryAllByIds(database, 'collaboration_request', 'message_id', collaborationIds);
     const collaborationRequestTurnLinks = queryAllByIds(database, 'collaboration_request_turn_link', 'request_id', collaborationRequests.map(row => String(row.id)));
@@ -2065,6 +2067,46 @@ function queryClientChildExecutions(
         )
      ORDER BY child.created_at DESC, child.id DESC
   `, { conversationId });
+}
+
+/**
+ * The selected Conversation's own collaboration envelopes (message bodies stay in CAS): every
+ * message it sent from, or had delivered into, one of the loaded Turns, plus incoming messages
+ * still waiting for a Turn or failed before reaching one. Bounded by durable sequence.
+ */
+function queryCollaborationMessagesForTurns(
+  database: Database.Database,
+  conversationId: string,
+  loadedTurnIds: readonly string[]
+): Array<Record<string, unknown>> {
+  const parameters: Record<string, string | bigint> = { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) };
+  const turnList = [...new Set(loadedTurnIds)].map((id, index) => {
+    parameters[`turn${index}`] = id;
+    return `@turn${index}`;
+  }).join(',');
+  const inLoadedTurns = (column: string) => turnList ? `${column} IN (${turnList})` : '0';
+  return queryPlainRows(database, `
+    SELECT message.*
+      FROM collaboration_message AS message
+     WHERE EXISTS (
+             SELECT 1 FROM collaboration_message_source_link AS source
+              WHERE source.message_id = message.id
+                AND source.conversation_id = @conversationId
+                AND ${inLoadedTurns('source.turn_id')}
+           )
+        OR EXISTS (
+             SELECT 1
+               FROM collaboration_message_target_link AS target
+               JOIN runtime_delivery AS delivery
+                 ON delivery.inbox_item_id = target.inbox_item_id
+                AND delivery.target_conversation_id = @conversationId
+              WHERE target.message_id = message.id
+                AND target.conversation_id = @conversationId
+                AND (delivery.state IN ('pending', 'failed') OR ${inLoadedTurns('delivery.target_turn_id')})
+           )
+     ORDER BY message.message_seq DESC, message.id DESC
+     LIMIT @limit
+  `, parameters);
 }
 
 function queryClientRuntimeDeliveries(

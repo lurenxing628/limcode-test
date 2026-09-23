@@ -222,7 +222,7 @@
   },
   "collaborationProjection": {
     "scope": "selected-conversation-source-or-target-only",
-    "snapshotMessageLimit": 32,
+    "snapshotSelection": "messages-sent-from-or-delivered-into-a-loaded-Turn-plus-incoming-pending-or-failed; each-incoming-card-loads-its-delivery; at-most-200-newest-by-message_seq",
     "liveWindow": "existing-per-type-bounds-and-atomic-snapshot-refresh",
     "messageBodiesInFeed": false,
     "messagePreview": "CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read",
