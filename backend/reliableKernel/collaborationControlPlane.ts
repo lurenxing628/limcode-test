@@ -14,7 +14,7 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 const MAX_TEXT_BYTES = 64_000;
 export type CollaborationSource = { kind: 'tool'; turnId: string; toolCallId: string };
-/** turnId is null for the failure reply to a task that never started a Turn. */
+/** turnId is null for the failure reply to a task that no Turn will answer. */
 interface CompletionSource { kind: 'completion'; turnId: string | null; requestId: string }
 interface BoardSource { kind: 'board'; turnId: string; postId: string; conversationId: string }
 export interface CollaborationSendCommand {
@@ -117,8 +117,8 @@ export class CollaborationControlPlane {
     const inboxItemId = stablePhaseFId('runtime_inbox_item', messageId);
     const deliveryId = stablePhaseFId('runtime_delivery', 'collaboration', messageId);
     const replyToMessageId = input.replyToMessageId ? requirePhaseFId(input.replyToMessageId, 'replyToMessageId') : null;
-    // A failure reply answers a task that never started: no Turn answers it, and the task's target
-    // (the reply's source) may have been deleted meanwhile.
+    // A failure reply answers a task no Turn will answer: none took it in, or the one that did was
+    // deleted with its Conversation. The task's target (the reply's source) may be gone as well.
     const failureReply = source.kind === 'completion' && source.turnId === null;
     const sourceTurn = source.turnId === null ? null : await this.existing('Turn', requirePhaseFId(source.turnId, 'turnId'));
     const sourceTurnId = sourceTurn ? String(sourceTurn.id) : null;
@@ -177,8 +177,11 @@ export class CollaborationControlPlane {
       const request = await this.existing('CollaborationRequest', source.requestId);
       if (request.message_id !== replyToMessageId) throw new Error('Completion reply request mismatch.');
       if (failureReply) {
-        if (request.state !== 'pending' || (await this.rows('CollaborationRequestTurnLink', { request_id: source.requestId })).length) throw new Error('Only a pending task that never started a Turn gets a failure reply.');
-        sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: 'pending', message_id: replyToMessageId }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assertNone({ request_id: source.requestId }));
+        const [requestTurn, ...extra] = await this.rows('CollaborationRequestTurnLink', { request_id: source.requestId });
+        if (request.state !== 'pending' || extra.length || (requestTurn && await this.maybe('Turn', String(requestTurn.turn_id)))) throw new Error('Only a pending task that no Turn will answer gets a failure reply.');
+        sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: 'pending', message_id: replyToMessageId }),
+          ...(requestTurn ? [DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assert(String(requestTurn.id), { request_id: source.requestId, turn_id: requestTurn.turn_id }), DOMAIN_REPOSITORIES.domain('Turn').assertNone({ id: requestTurn.turn_id })]
+            : [DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assertNone({ request_id: source.requestId })]));
       } else {
         const requestTurn = await this.one('CollaborationRequestTurnLink', { request_id: source.requestId });
         if (requestTurn.turn_id !== source.turnId) throw new Error('Completion cannot answer a different task generation.');
@@ -442,15 +445,31 @@ export class CollaborationControlPlane {
       });
     }
   }
-  /** Level-triggered recovery: input binding and completed-result replies survive every crash boundary. */
+  /**
+   * Level-triggered recovery: input binding and completed-result replies survive every crash
+   * boundary, and a task no Turn will answer is settled instead of staying pending.
+   */
   public async reconcile(): Promise<void> {
     const requests = await this.rows('CollaborationRequest', { state: 'pending' });
     for (const request of requests) {
       const target = await this.one('CollaborationMessageTargetLink', { message_id: request.message_id });
       const deliveries = await this.rows('RuntimeDelivery', { inbox_item_id: target.inbox_item_id });
-      const delivery = deliveries.find((row) => row.state === 'consumed' && row.target_turn_id !== null);
+      const delivery = deliveries.find((row) => row.state === 'consumed');
       if (!delivery) {
-        if (deliveries.length && deliveries.every((row) => row.state === 'failed')) await this.failUnstartedRequest(request, deliveries);
+        if (deliveries.length && deliveries.every((row) => row.state === 'failed')) {
+          const [latest] = [...deliveries].sort(compareNewest);
+          await this.failUnansweredRequest(request, `Task could not start: ${unstartedTaskReason(latest.failure_reason)}`);
+        }
+        continue;
+      }
+      // Acknowledged as a notification (for example to a child stopped meanwhile): no Turn took it in.
+      if (delivery.target_turn_id === null) {
+        await this.failUnansweredRequest(request, 'Task could not start: the target conversation could not take it.');
+        continue;
+      }
+      // The Turn that took it in was deleted with its Conversation before the reply went out.
+      if (!await this.maybe('Turn', String(delivery.target_turn_id))) {
+        await this.failUnansweredRequest(request, 'Task ended without a result: the target conversation was deleted before it replied.');
         continue;
       }
       const links = await this.rows('CollaborationRequestTurnLink', { request_id: request.id });
@@ -484,19 +503,19 @@ export class CollaborationControlPlane {
     }
   }
   /**
-   * A task whose every delivery failed never started a Turn (its target was deleted, or no
-   * continuation could be admitted). A peer requester in another team is told so through the
-   * completion reply path instead of waiting for an answer that cannot come. A team request keeps
-   * its original contract and just fails: the team sees its members through its own tools.
+   * A task no Turn will answer: every delivery failed (its target was deleted, or no continuation
+   * could be admitted), it was acknowledged without a Turn, or the Turn that took it in was deleted
+   * with its Conversation. A peer requester in another team is told so through the completion reply
+   * path instead of waiting for an answer that cannot come. A team request keeps its original
+   * contract and just fails: the team sees its members through its own tools.
    */
-  private async failUnstartedRequest(request: DomainRow, deliveries: DomainRow[]): Promise<void> {
+  private async failUnansweredRequest(request: DomainRow, text: string): Promise<void> {
     const source = await this.one('CollaborationMessageSourceLink', { message_id: request.message_id });
     const requester = await this.maybe('Conversation', String(source.conversation_id));
     if (requester?.status === 'active' && await isCrossConversationFollowup(this.database, String(request.message_id))) {
-      const [latest] = [...deliveries].sort(compareNewest);
       try {
         await this.sendInternal({ source: { kind: 'completion', turnId: null, requestId: String(request.id) }, targetConversationId: String(source.conversation_id),
-          text: `Task could not start: ${unstartedTaskReason(latest.failure_reason)}`, mode: 'message', replyToMessageId: String(request.message_id) });
+          text, mode: 'message', replyToMessageId: String(request.message_id) });
       } catch (error) {
         const requesterChildren = await this.rows('ChildExecution', { child_conversation_id: source.conversation_id });
         if (!requesterChildren.some((child) => !['active', 'idle'].includes(String(child.status)))) throw error;

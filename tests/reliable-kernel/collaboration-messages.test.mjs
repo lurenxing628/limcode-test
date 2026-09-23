@@ -661,3 +661,70 @@ test('a cross-conversation continuation that also absorbed a team followup spend
   const onward = await crossSend(f, 'root-onward', 'root', 'root-peer-continuation', 'peer-a', 'followup');
   assert.equal(await budgetOf(f, onward.deliveryId), 'peer-a-turn', 'the Turn a peer task started spends that request budget');
 }));
+
+test('a peer task whose target is deleted after its Turn took it in but before the reply fails with one reply', async () => fixture(async f => {
+  const { ConversationDeletionControlPlane } = load('conversationDeletion.js');
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const followup = await crossSend(f, 'a-task-then-deleted', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  await admitContinuation(f, 'target-b', 'b-took-it', followup.deliveryId);
+  assert.equal((await f.get('RuntimeDelivery', followup.deliveryId)).target_turn_id, 'b-took-it');
+  await endTurn(f, 'b-took-it');
+  // The user deletes B before convergence sends the completion reply; B's Turns go with it.
+  await new ConversationDeletionControlPlane(f.database).delete('target-b');
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  await f.reopen();
+  await f.collaboration.reconcile();
+  assert.equal((await f.rows('CollaborationRequest', { message_id: followup.messageId }))[0].state, 'failed', 'the request never stays pending');
+  const replies = await repliesTo(f, 'peer-a', followup.messageId);
+  assert.equal(replies.length, 1, 'exactly one reply, however often reconcile runs');
+  assert.equal(replies[0].sourceKind, 'completion');
+  assert.match((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, /^Task ended without a result: the target conversation was deleted/);
+  const [source] = await f.rows('CollaborationMessageSourceLink', { message_id: replies[0].messageId });
+  assert.deepEqual([source.conversation_id, source.turn_id], ['target-b', null], 'no Turn of the deleted target answers');
+}));
+
+test('a team task whose child is deleted after its Turn took it in fails without a reply', async () => fixture(async f => {
+  const { ConversationDeletionControlPlane } = load('conversationDeletion.js');
+  const followup = await f.collaboration.send({ source: await f.source('root-task-then-deleted', 'root', 'root-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'team task', mode: 'followup' });
+  await admitContinuation(f, 'right', 'right-took-it', followup.deliveryId);
+  await endTurn(f, 'right-took-it');
+  await new ConversationDeletionControlPlane(f.database).delete('right');
+  await f.collaboration.reconcile();
+  assert.equal((await f.rows('CollaborationRequest', { message_id: followup.messageId }))[0].state, 'failed');
+  assert.deepEqual(await repliesTo(f, 'root', followup.messageId), []);
+}));
+
+test('a team followup acknowledged without a Turn because its child stopped fails without a reply', async () => fixture(async f => {
+  const accepted = await f.collaboration.send({ source: await f.source('root-task-stopped-child', 'root', 'root-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'team task', mode: 'followup' });
+  await f.database.transaction([repo('ChildExecution').update('right-child', { status: 'closed', updated_at: NOW })]);
+  const actions = [];
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW,
+    wakeHandler: async request => {
+      actions.push(request.action);
+      await f.deliveries.acknowledgeNotification(request.deliveryId);
+      return { acknowledged: true };
+    } });
+  try { await scanner.scanNow(); } finally { await scanner.dispose(); }
+  assert.deepEqual(actions, ['notify_only']);
+  const delivery = await f.get('RuntimeDelivery', accepted.deliveryId);
+  assert.deepEqual([delivery.state, delivery.target_turn_id], ['consumed', null]);
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  assert.equal((await f.rows('CollaborationRequest', { message_id: accepted.messageId }))[0].state, 'failed', 'the request never stays pending');
+  assert.deepEqual(await repliesTo(f, 'root', accepted.messageId), [], 'team gating: no failure reply');
+}));
+
+test('a peer task acknowledged without a Turn fails with one reply', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const followup = await crossSend(f, 'a-task-notified', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  // Whatever routed it there, a delivery acknowledged as a notification started no Turn.
+  await f.database.transaction([repo('RuntimeDelivery').update(followup.deliveryId, { phase: 'notify_only', updated_at: NOW })]);
+  await f.deliveries.acknowledgeNotification(followup.deliveryId);
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  assert.equal((await f.rows('CollaborationRequest', { message_id: followup.messageId }))[0].state, 'failed');
+  const replies = await repliesTo(f, 'peer-a', followup.messageId);
+  assert.equal(replies.length, 1);
+  assert.match((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, /^Task could not start: /);
+}));

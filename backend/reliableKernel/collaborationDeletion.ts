@@ -16,8 +16,9 @@ export async function collaborationConversationDeletionSteps(
     const targets = await listAllDomainRows(database, 'CollaborationMessageTargetLink', { conversation_id: conversationId });
     steps.push(DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assertExactIds(
       { conversation_id: conversationId }, targets.map(row => String(row.id))));
-    // A pending request to a deleted target stays pending here: once its deliveries have failed, the
-    // collaboration reconcile tells the requester the task could not start and then fails it.
+    // A pending request to a deleted target stays pending here. Collaboration reconcile settles it
+    // once no Turn will answer it (its deliveries failed, or the Turn that took it in was deleted
+    // here): a cross-conversation requester first hears why, a team request just fails.
     for (const target of targets) {
       const inboxId = String(target.inbox_item_id);
       const deliveries = await listAllDomainRows(database, 'RuntimeDelivery', { inbox_item_id: inboxId, target_conversation_id: conversationId });
