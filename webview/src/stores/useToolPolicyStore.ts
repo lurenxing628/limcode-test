@@ -320,6 +320,34 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         ...(!local.policy ? { inheritedFrom: 'global' as const } : {})
       };
     },
+    /**
+     * What a tool-list edit at this scope starts from. A saved list is kept as it is, including
+     * entries an upper layer blocks for now. A scope without a list starts from what the backend
+     * allows there today, so creating the first list removes only what the user turns off. Global
+     * and a workflow bound every Agent, so they also keep what each Agent with its own or built-in
+     * list gets there (for example transfer on the main Agent).
+     */
+    listSeedFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string[] {
+      const saved: unknown = this.localPolicyFor(scopeKind, scopeId).policy?.allowedTools;
+      if (Array.isArray(saved)) return saved.filter((name): name is string => typeof name === 'string');
+      const names = new Set(this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools);
+      if (scopeKind === 'global' || scopeKind === 'workflow') {
+        const clientState = useClientStateStore();
+        const agentIds = uniqueNames([
+          ...clientState.builtinToolPolicies.filter((record) => record.scopeKind === 'agent').map((record) => record.scopeId),
+          ...clientState.toolPolicyScopeLinks
+            .filter((link) => link.role === 'active' && link.scopeKind === 'agent')
+            .map((link) => link.scopeId?.trim() ?? '')
+        ]);
+        const workflow: ScopeRef[] = scopeKind === 'workflow' ? [{ scopeKind, scopeId }] : [];
+        for (const agentId of agentIds) {
+          for (const name of this.resolveScopes([{ scopeKind: 'global' }, { scopeKind: 'agent', scopeId: agentId }, ...workflow]).allowedTools) {
+            names.add(name);
+          }
+        }
+      }
+      return [...names];
+    },
     /** What this scope inherits before its own record applies; global inherits only tool defaults. */
     inheritedPolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ReturnType<typeof resolveToolPolicyLayers> {
       return this.resolveScopes(this.upperScopesFor(scopeKind, scopeId));

@@ -144,8 +144,9 @@ function localPolicyName(): string | undefined {
   return localResolution.value.policy?.name;
 }
 
+/** The list saved when one tool is switched here; see `listSeedFor` for where it starts. */
 function nextAllowed(toolName: string, enabled: boolean): string[] {
-  const names = new Set(effectivePolicy.value?.allowedTools ?? []);
+  const names = new Set(store.listSeedFor(props.scopeKind, props.scopeId));
   if (enabled) names.add(toolName);
   else names.delete(toolName);
   return tools.value.map((tool) => tool.name).filter((name) => names.has(name));

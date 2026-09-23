@@ -301,6 +301,48 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.deepEqual({ type: messages.at(-1).type, payload: messages.at(-1).payload }, { type: 'toolPolicy.scope.clear', payload: { scopeKind: 'global' } });
     });
 
+    await t.test('在没有列表的范围里第一次改工具开关时，不悄悄收走该范围 Agent 现有的工具', async () => {
+      const { client, feed, store, bindings } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      const tool = (name) => store.toolDefinitions.find((candidate) => candidate.name === name);
+      store.setPolicyForScope('agent', 'porter', ['read_file', 'transfer'], 'Porter');
+      const mainBefore = store.effectivePolicyFor('agent', 'main').policy.allowedTools;
+      assert.ok(mainBefore.includes('transfer'));
+
+      (await bindings(toolEditor, { scopeKind: 'global' })).setToolEnabled(tool('write'), false);
+      const globalList = store.localPolicyFor('global').policy.allowedTools;
+      assert.equal(globalList.includes('write'), false);
+      assert.deepEqual(store.effectivePolicyFor('agent', 'main').policy.allowedTools, mainBefore.filter((name) => name !== 'write'),
+        'the main Agent loses only the tool the user turned off, not transfer from its built-in list');
+      assert.deepEqual(store.effectivePolicyFor('agent', 'porter').policy.allowedTools, ['read_file', 'transfer']);
+      assert.deepEqual(store.effectivePolicyFor('agent', 'explore').policy.allowedTools, sorted(readonlyList));
+      assert.equal(globalList.includes('mcp_search'), false, 'MCP tools stay governed by their source settings');
+
+      const agentScope = fresh(allDefinitions);
+      agentScope.client.builtinToolPolicies = builtinToolPolicies;
+      (await agentScope.bindings(toolEditor, { scopeKind: 'agent', scopeId: 'main' })).setToolEnabled(agentScope.store.toolDefinitions.find((candidate) => candidate.name === 'read_file'), false);
+      assert.deepEqual(sorted(agentScope.store.localPolicyFor('agent', 'main').policy.allowedTools),
+        sorted(builtinToolPolicies[0].allowedTools.filter((name) => name !== 'read_file')), 'an Agent scope starts from its built-in list');
+
+      const workflowScope = fresh(allDefinitions);
+      workflowScope.client.builtinToolPolicies = builtinToolPolicies;
+      (await workflowScope.bindings(toolEditor, { scopeKind: 'workflow', scopeId: 'wf' })).setToolEnabled(workflowScope.store.toolDefinitions.find((candidate) => candidate.name === 'write'), false);
+      assert.ok(workflowScope.store.localPolicyFor('workflow', 'wf').policy.allowedTools.includes('transfer'),
+        'a workflow bounds every Agent, so it keeps what the built-in Agents have');
+
+      const conversationScope = fresh(allDefinitions);
+      conversationScope.feed.records = { AgentConversationLink: { link: { id: 'link', conversation_id: 'plain', agent_id: 'agent:custom', role: 'default' } } };
+      (await conversationScope.bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'plain' })).setToolEnabled(conversationScope.store.toolDefinitions.find((candidate) => candidate.name === 'write'), false);
+      assert.deepEqual(sorted(conversationScope.store.localPolicyFor('conversation', 'plain').policy.allowedTools),
+        sorted(['run_agent', 'read_file', ...crossNames]), 'a custom-Agent conversation starts from the default tool set');
+
+      // An edit to a saved list keeps the entries an upper layer blocks for now.
+      store.setPolicyForScope('conversation', 'saved', ['read_file', 'write', 'run_agent'], 'Saved');
+      (await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'saved' })).setToolEnabled(tool('list_conversations'), true);
+      assert.deepEqual(sorted(store.localPolicyFor('conversation', 'saved').policy.allowedTools), sorted(['read_file', 'write', 'run_agent', 'list_conversations']));
+      assert.ok(feed);
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
       const { client, store, render } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;
