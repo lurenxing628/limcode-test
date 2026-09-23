@@ -80,10 +80,10 @@ test('built chat can read thinking, recover an expired save session, and send wi
     }, { T, state: createEmptyClientState() });
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     const thinking = page.locator('.session-thinking-dropdown');
-    await thinking.getByRole('button').filter({ hasText: '默认 · high' }).waitFor();
+    await thinking.getByRole('button').filter({ hasText: '思考：跟随渠道（high）' }).waitFor();
     await page.locator('textarea').fill('browser regression message');
     await thinking.getByRole('button').click();
-    await page.getByRole('option', { name: 'medium', exact: true }).click();
+    await page.getByRole('option', { name: '中（medium）', exact: true }).click();
     await page.getByText('保存连接中断', { exact: false }).waitFor();
     const send = page.locator('button.composer-send');
     await send.click();
@@ -95,7 +95,7 @@ test('built chat can read thinking, recover an expired save session, and send wi
     await page.waitForFunction(() => !document.querySelector('.session-thinking-error'));
     await page.evaluate(() => window.replaceHost());
     await page.waitForFunction(T => window.requests.some(r => r.type === T.ModelProfileScopeRead && r.clientId === 'host-b'), T);
-    await thinking.getByRole('button').filter({ hasText: '默认 · high' }).waitFor();
+    await thinking.getByRole('button').filter({ hasText: '思考：跟随渠道（high）' }).waitFor();
     await send.click();
     await page.waitForFunction(T => window.requests.some(r => r.type === T.TurnStart), T);
     const requests = await page.evaluate(() => window.requests);

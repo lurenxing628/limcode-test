@@ -241,7 +241,7 @@ for (const inheritedScope of ['agent', 'workflow']) test(`review scope actual co
       assert.equal(effective.providerConfigId, provider.id); assert.equal(effective.model, provider.model);
       // The same effective identity is passed by Composer to this production script-setup.
       const control = ui.control(provider, effective.model);
-      assert.equal(control.defaultLabel.value, '默认 · 1024 tokens');
+      assert.equal(control.defaultLabel.value, '跟随渠道设置：1024 tokens');
       control.save('2048');
       await ui.store.awaitSavedForScope('conversation', 'parent');
       const saved = ui.store.confirmedFor('conversation', 'parent');

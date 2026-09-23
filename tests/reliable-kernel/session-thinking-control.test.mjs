@@ -32,11 +32,14 @@ function fixture(overrides = {}) {
     refreshScope: (...args) => reads.push(['refresh', ...args])
   };
   const props = vue.reactive({ conversationId: 'a', model: 'o3', config: { id: 'channel', provider: 'openai-compatible', model: 'o3', modelConfigs: [] }, ...overrides.props });
-  const dropdown = { props: ['modelValue', 'options', 'disabled'], emits: ['update:modelValue'], setup: (props, { emit }) => () => vue.h('select', { value: props.modelValue, disabled: props.disabled, onChange: event => emit('update:modelValue', event.target.value) }, props.options.map(option => vue.h('option', { value: option.value }, option.label))) };
+  const dropdown = { props: ['modelValue', 'options', 'disabled'], emits: ['update:modelValue'], setup: (props, { emit, slots }) => () => vue.h('div', [
+    vue.h('select', { value: props.modelValue, disabled: props.disabled, onChange: event => emit('update:modelValue', event.target.value) }, props.options.map(option => vue.h('option', { value: option.value }, option.label))),
+    ...(slots.footer?.() ?? [])
+  ]) };
   function load(path, component = false) {
     let source = fs.readFileSync(path, 'utf8');
     if (component === 'render') source = compileScript(parse(source).descriptor, { id: 'thinking-test', inlineTemplate: true }).content;
-    else if (component) source = parse(source).descriptor.scriptSetup.content + '\nexport { options, selected, defaultLabel, inheritChildren, disabled, error, save, setInheritance, retry };';
+    else if (component) source = parse(source).descriptor.scriptSetup.content + '\nexport { options, displayOptions, selected, defaultLabel, hint, inheritChildren, disabled, error, save, setInheritance, retry };';
     const module = { exports: {} };
     vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, {
       module, exports: module.exports, defineProps: () => props, URL,
@@ -68,40 +71,62 @@ test('Composer renders one thinking control beside model/workspace selectors, wi
   assert.match(source, /:model="confirmedEffectiveModel\?\.model/);
 });
 
-test('Thinking UI has only one dropdown, one child-inheritance checkbox and an inline retry', () => {
+test('Thinking UI is one dropdown whose panel footer holds the child-inheritance checkbox, plus an inline retry', () => {
   const nodes = templateElements(controlPath);
   assert.equal(nodes.filter(node => node.tag === 'SettingsDropdown' || node.tag === 'select').length, 1);
   assert.equal(nodes.filter(node => node.tag === 'input').length, 0);
   assert.equal(nodes.filter(node => node.tag === 'LcCheckbox').length, 1, 'use the shared accessible checkbox');
+  const dropdown = nodes.find(node => node.tag === 'SettingsDropdown');
+  const footer = elements(dropdown).find(node => node.tag === 'template' && node.props?.some(prop => prop.name === 'slot' && prop.arg?.content === 'footer'));
+  assert.ok(footer, 'the checkbox lives in the dropdown footer instead of wrapping below the control');
+  assert.ok(elements(footer).some(node => node.tag === 'LcCheckbox'));
   const source = fs.readFileSync(controlPath, 'utf8');
-  assert.match(source, /子继承/);
+  assert.match(source, /派出的子 Agent 也用这个思考强度/);
+  assert.match(source, /不勾选时，子 Agent 按它自己的 Agent 设置/);
+  assert.doesNotMatch(source, /子继承|服务默认|flex-wrap: wrap/);
   assert.match(source, /重试/);
   assert.doesNotMatch(source, /ModelProfileSaveStatus|应用|放弃草稿|重新接入/);
 });
 
-test('Default label shows the actual inherited value and distinguishes service defaults', () => {
+test('Default option says it follows the channel and shows the value the channel sends', () => {
   const f = fixture();
-  assert.equal(f.control.defaultLabel.value, '默认 · 服务默认');
+  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：未设置（由服务决定）');
   assert.equal(f.control.selected.value, 'default');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：跟随渠道');
   f.props.config.generationConfig = { thinkingConfig: { thinkingLevel: 'high' } };
-  assert.equal(f.control.defaultLabel.value, '默认 · high');
+  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：high');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：跟随渠道（high）');
   f.props.config.modelConfigs = [{ modelId: 'o3', generationConfig: {} }];
-  assert.equal(f.control.defaultLabel.value, '默认 · 服务默认', 'model config replaces channel defaults');
+  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：未设置（由服务决定）', 'model config replaces channel defaults');
+});
+
+test('Level options read as plain Chinese with the wire value in brackets; the button marks child inheritance', () => {
+  const f = fixture();
+  const high = f.control.options.value.find(option => option.value === 'high');
+  assert.equal(high.label, '高（high）');
+  assert.equal(high.buttonLabel, '思考：高');
+  const none = f.control.options.value.find(option => option.value === 'none');
+  if (none) assert.equal(none.label, '关闭思考');
+  assert.equal(f.control.displayOptions.value.find(option => option.value === 'high').buttonLabel, '思考：高');
+  f.state.inherit = true;
+  assert.equal(f.control.displayOptions.value.find(option => option.value === 'high').buttonLabel, '思考：高 · 含子 Agent');
+  assert.match(f.control.hint.value, /不影响其他对话/);
+  assert.match(f.control.hint.value, /子 Agent 也使用这里的选择/);
 });
 
 test('Budget defaults remain visible; unknown and unsupported model shortcuts remain disabled', () => {
   const f = fixture({ props: { model: 'gemini-2.5-flash', config: { id: 'gemini', provider: 'gemini', modelConfigs: [], generationConfig: { thinkingConfig: { thinkingBudget: 1024 } } } } });
-  assert.equal(f.control.defaultLabel.value, '默认 · 1024 tokens');
-  assert.ok(f.control.options.value.some(option => option.value === '2048'));
+  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：1024 tokens');
+  assert.equal(f.control.options.value.find(option => option.value === '2048').label, '思考预算 2048 tokens');
   for (const [model, label] of [
-    ['gemini-2.0-flash', '默认 · 能力未确认 · 1024 tokens'],
-    ['gemini-9-flash', '默认 · 能力未确认 · 1024 tokens'],
-    ['unknown-relay', '默认 · 不支持（不发送）']
+    ['gemini-2.0-flash', '跟随渠道设置：能力未确认 · 1024 tokens'],
+    ['gemini-9-flash', '跟随渠道设置：能力未确认 · 1024 tokens'],
+    ['unknown-relay', '跟随渠道设置：不支持（不发送）']
   ]) {
     f.props.model = model;
     assert.equal(f.control.defaultLabel.value, label);
     assert.equal(f.control.disabled.value, true);
-    assert.deepEqual(plain(f.control.options.value), [{ value: 'default', label }]);
+    assert.deepEqual(plain(f.control.options.value).map(option => [option.value, option.label]), [['default', label]]);
   }
 });
 
@@ -168,7 +193,7 @@ test('Mounted template binds dropdown change and checkbox checked/change to the 
     f.props.model = 'gpt-4o';
     await vue.nextTick();
     assert.equal(mounted.find('select')[0].props.disabled, true);
-    assert.equal(mounted.find('option')[0].text, '默认 · 服务默认');
+    assert.equal(mounted.find('option')[0].text, '跟随渠道设置：未设置（由服务决定）');
   } finally { mounted.dispose(); }
 });
 

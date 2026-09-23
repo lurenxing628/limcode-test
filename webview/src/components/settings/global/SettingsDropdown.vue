@@ -199,6 +199,9 @@ function cssLength(value: number | string): string {
             </button>
             <slot name="optionAction" :option="option" :selected="option.value === modelValue" />
           </div>
+          <div v-if="$slots.footer" class="settings-dropdown-footer">
+            <slot name="footer" />
+          </div>
         </div>
         <AdvancedScrollbar :scroller="scroller" variant="minimal" />
       </section>
@@ -305,6 +308,12 @@ button.settings-dropdown-button:active {
   width: 0;
   height: 0;
   display: none;
+}
+
+.settings-dropdown-footer {
+  margin-top: var(--space-1);
+  border-top: 1px solid var(--vscode-panel-border);
+  padding-top: var(--space-2);
 }
 
 .settings-dropdown-panel .project-dropdown-title {

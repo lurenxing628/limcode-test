@@ -32,8 +32,8 @@ export async function ordinaryWire(provider, model, generationConfig, transport 
   return result.body;
 }
 
-test('默认展示区分服务默认、非法 Gemini 配置和 Astra adapter 映射', async () => {
-  assert.equal(sessionThinkingDisplayLabel('gemini', 'gemini-3.1-pro-preview'), '服务默认');
+test('默认展示区分未设置（由服务决定）、非法 Gemini 配置和 Astra adapter 映射', async () => {
+  assert.equal(sessionThinkingDisplayLabel('gemini', 'gemini-3.1-pro-preview'), '未设置（由服务决定）');
   const gemini = await ordinaryWire('gemini', 'gemini-3.1-pro-preview', {});
   assert.equal(gemini.generationConfig?.thinkingConfig, undefined);
   await assert.rejects(ordinaryWire('gemini', 'gemini-3.1-pro-preview', { thinkingConfig: { thinkingBudget: 4096 } }), /Unsupported Gemini thinking/);
@@ -95,7 +95,7 @@ test('能力负例与特殊值：未知不猜测、格式不等价、合法范�
   assert.throws(() => validate({ kind: 'openai-effort', value: 'high' }, 'gemini', 'gemini-3.1-pro-preview'));
   assert.throws(() => validate({ kind: 'gemini-level', value: 'medium' }, 'gemini', 'gemini-3-pro'));
   assert.throws(() => validate({ kind: 'claude-budget', tokens: 1023 }, 'claude', 'claude-sonnet-4-5', { maxOutputTokens: 8192 }));
-  assert.equal(thinkingValueLabel(), '服务默认');
+  assert.equal(thinkingValueLabel(), '未设置（由服务决定）');
   assert.equal(thinkingValueLabel({ thinkingBudget: 0 }), '0 tokens');
   assert.equal(thinkingValueLabel({ thinkingLevel: 'none' }), 'none');
   assert.equal(thinkingValueLabel({ thinkingBudget: -1 }), '自动（-1）');

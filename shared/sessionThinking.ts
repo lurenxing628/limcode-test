@@ -82,10 +82,13 @@ export function applySessionThinkingOverride(generation: LlmGenerationConfigReco
   return { ...result, thinkingConfig };
 }
 
+/** 渠道和模型配置都没有指定思考强度：请求不带思考参数，由服务端决定。 */
+export const UNSET_THINKING_LABEL = '未设置（由服务决定）';
+
 export function thinkingValueLabel(thinking?: LlmThinkingConfigRecord): string {
   if (thinking?.thinkingLevel && !['not-set', 'non-set'].includes(thinking.thinkingLevel)) return thinking.thinkingLevel;
   if (thinking?.thinkingBudget !== undefined) return thinking.thinkingBudget === -1 ? '自动（-1）' : `${thinking.thinkingBudget} tokens`;
-  return '服务默认';
+  return UNSET_THINKING_LABEL;
 }
 
 /** Display the existing adapter's mapping without claiming a remote service's defaults. */
@@ -95,7 +98,7 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
     if (capability.kind === 'thinkingLevel') {
       if (thinking?.thinkingBudget !== undefined) return '配置不受支持（请求会拒绝）';
       if (isGeminiThinkingLevelSupported(capability, thinking?.thinkingLevel)) return thinking!.thinkingLevel!;
-      return thinkingValueLabel(thinking) === '服务默认' ? '服务默认' : '配置不受支持（请求会拒绝）';
+      return thinkingValueLabel(thinking) === UNSET_THINKING_LABEL ? UNSET_THINKING_LABEL : '配置不受支持（请求会拒绝）';
     }
     if (capability.kind === 'thinkingBudget') {
       if (thinking?.thinkingLevel && !['not-set', 'non-set'].includes(thinking.thinkingLevel)) return '配置不受支持（请求会拒绝）';
@@ -107,6 +110,6 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
   if (provider === 'openai-responses' && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
   if ((provider === 'openai-responses' || provider === 'openai-compatible') && isGpt6NoneCapableModel(model) && thinking?.thinkingLevel === 'minimal') return 'low（适配器）';
   if (provider === 'openai-compatible' || provider === 'openai-responses') return thinkingValueLabel({ thinkingLevel: thinking?.thinkingLevel });
-  if (provider === 'deepseek') return thinking?.thinkingLevel && ['none', 'high', 'max'].includes(thinking.thinkingLevel) ? thinking.thinkingLevel : '服务默认';
+  if (provider === 'deepseek') return thinking?.thinkingLevel && ['none', 'high', 'max'].includes(thinking.thinkingLevel) ? thinking.thinkingLevel : UNSET_THINKING_LABEL;
   return thinkingValueLabel(thinking);
 }

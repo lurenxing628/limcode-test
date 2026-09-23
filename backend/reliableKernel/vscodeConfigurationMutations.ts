@@ -188,7 +188,7 @@ export class VscodeConfigurationMutations {
       const operation = clear ? 'clear' : set.operation;
       if (!operation || (!clear && operation !== 'select' && operation !== 'thinking' && operation !== 'reset' && operation !== 'inherit')) throw new Error('ModelProfile UI mutation 缺少有效操作。');
       if (!clear && set.inheritThinkingToChildren !== undefined && scope.scopeKind !== 'conversation') {
-        throw new Error('子继承仅限当前对话。');
+        throw new Error('“子 Agent 也用这个思考强度”只能在对话里设置。');
       }
       const inheritThinkingToChildren = scope.scopeKind === 'conversation'
         ? set.inheritThinkingToChildren ?? before.profile?.inheritThinkingToChildren
@@ -214,7 +214,7 @@ export class VscodeConfigurationMutations {
             };
           }
         } else if (operation === 'inherit') {
-          if (scope.scopeKind !== 'conversation') throw new Error('子继承仅限当前对话。');
+          if (scope.scopeKind !== 'conversation') throw new Error('“子 Agent 也用这个思考强度”只能在对话里设置。');
           const current = await effective?.();
           if (!current || createStorageRevision(current) !== createStorageRevision(set.expectedEffectiveModel ?? null)) throw new Error('当前继承模型已改变；没有固定旧模型，请重新读取。');
           profile = {
@@ -435,7 +435,7 @@ export class VscodeConfigurationMutations {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
     const model = requireId(payload.model, 'model');
     if (payload.inheritThinkingToChildren !== undefined && scope.scopeKind !== 'conversation') {
-      throw new Error('子继承仅限当前对话。');
+      throw new Error('“子 Agent 也用这个思考强度”只能在对话里设置。');
     }
     return this.mutate(async (paths) => {
       let thinkingOverride: SessionThinkingOverride | undefined;
