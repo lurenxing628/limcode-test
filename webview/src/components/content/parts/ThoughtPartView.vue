@@ -34,7 +34,9 @@ const { displayedText } = useSmoothStreamingText(
   () => props.text,
   () => props.streaming
 );
-const preview = computed(() => lastNonEmptyLine(displayedText.value) || '正在思考...');
+// 思考结束但没有文字：模型只返回了签名（例如 Claude adaptive 思考省略了内容），不能一直显示“正在思考”。
+const EMPTY_THOUGHT_LABEL = '模型没有返回思考内容';
+const preview = computed(() => lastNonEmptyLine(displayedText.value) || (props.streaming ? '正在思考...' : EMPTY_THOUGHT_LABEL));
 const previewHtml = computed(() => renderInlineMarkdown(preview.value));
 const liveDurationMs = computed(() => liveThoughtDurationMs({
   completedDurationMs: props.completedDurationMs,

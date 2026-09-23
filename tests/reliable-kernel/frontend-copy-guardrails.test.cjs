@@ -77,6 +77,8 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
   assert.doesNotMatch(thoughtView, /<TextPartView[\s\S]*?:text="displayedText"[\s\S]*?:show-streaming-indicator="false"/,
     'expanded thought Markdown must not smooth the already-smoothed preview stream a second time');
   assert.match(thoughtView, /preserve-soft-breaks/);
+  assert.match(thoughtView, /props\.streaming \? '正在思考\.\.\.' : EMPTY_THOUGHT_LABEL/,
+    'a finished thought without text (signature only) must not keep saying it is still thinking');
   assert.doesNotMatch(thoughtView, /<pre>\{\{ displayedText \}\}<\/pre>/);
 
   const previousWindow = globalThis.window;
