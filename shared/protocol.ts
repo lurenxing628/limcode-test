@@ -388,7 +388,10 @@ export const ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY = 'allowOutsideProjectPaths'
 export const SUBMIT_AGENT_ANSWER_TOOL_NAME = 'submit_agent_answer';
 export const READ_AGENT_ANSWER_TOOL_NAME = 'read_agent_answer';
 export const SKILLS_TOOL_NAME = 'skills';
-/** Offered only while the user's crossConversationCollaboration switch is on (run_agent config). */
+/**
+ * Granted by the user's crossConversationCollaboration switch (run_agent config) alone: no tool list
+ * controls them, and a name of theirs saved in a list is ignored.
+ */
 export const CROSS_CONVERSATION_TOOL_NAMES = [
   'list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'
 ] as const;
@@ -1066,11 +1069,6 @@ export interface ToolPolicyRecord {
    * cross-conversation switch) use this so they never freeze a tool list as a side effect.
    */
   allowedTools?: string[];
-  /**
-   * Cross-conversation tools this record's list gained when its cross-conversation switch was
-   * turned on. Turning the switch off or restoring inheritance removes exactly these.
-   */
-  crossConversationGrantedTools?: string[];
   /** 工具策略预设；非全局 scope 可用 inherit 只继承全局预设，同时保留本 scope 的逐工具配置。 */
   preset?: ToolPolicyPresetKind;
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
@@ -2716,8 +2714,6 @@ export interface ToolPolicyScopeSetPayload {
   name?: string;
   /** Replaces the record's list; absent saves a record without a list of its own. */
   allowedTools?: string[];
-  /** Replaces the record's switch-granted subset of allowedTools; absent clears it. */
-  crossConversationGrantedTools?: string[];
   preset?: ToolPolicyPresetKind;
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
   sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;

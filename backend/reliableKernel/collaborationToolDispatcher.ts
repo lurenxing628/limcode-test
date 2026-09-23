@@ -10,7 +10,7 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 import type { ReliableToolDispatchAuthority } from './toolDispatcher';
 import { isAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
 import { isCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
-import { crossConversationToolPermitted } from '../../shared/toolPolicyResolution';
+import { crossConversationToolPermitted, toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import { estimateTextTokens } from './modelTokenEstimator';
 import { RUNTIME_DELIVERY_MODEL_MAX_TOKENS } from './runtimeDeliveryProjection';
 
@@ -66,14 +66,17 @@ export class CollaborationToolDispatcher {
       throw new Error('Collaboration tool authority differs from the frozen snapshot.');
     }
     const policy = object(object(frozen.document, 'authority').toolPolicy, 'toolPolicy');
-    if (!Array.isArray(policy.allowedTools) || !policy.allowedTools.includes(input.toolName)) {
-      throw new Error(`Frozen ToolPolicy does not allow ${input.toolName}.`);
-    }
+    if (!Array.isArray(policy.allowedTools)) throw new Error('Frozen ToolPolicy.allowedTools must be an array.');
+    const allowedTools = policy.allowedTools.filter((name): name is string => typeof name === 'string');
+    // The frozen switch grants the cross-conversation tools; their names in the list are ignored.
     if (crossConversation && !frozenCrossConversationEnabled(frozen.document)) {
       throw new Error('Cross-conversation collaboration is not enabled for this Turn.');
     }
-    if (crossConversation && !crossConversationToolPermitted(policy.allowedTools.filter((name): name is string => typeof name === 'string'), input.toolName)) {
+    if (crossConversation && !crossConversationToolPermitted(allowedTools, input.toolName)) {
       throw new Error(`Frozen ToolPolicy lacks run_agent, so ${input.toolName} is not allowed; only listing and reading other conversations are.`);
+    }
+    if (!toolAllowedByPolicy({ allowedTools, toolConfigs: policy.toolConfigs }, { name: input.toolName })) {
+      throw new Error(`Frozen ToolPolicy does not allow ${input.toolName}.`);
     }
     const read = await this.dependencies.database.snapshot([
       DOMAIN_REPOSITORIES.domain('ToolCall').get(input.toolCallId),

@@ -289,7 +289,6 @@ function saveWorkflowToolPolicy(parsed: WorkflowRawData, previous: WorkflowRawDa
       scopeId: parsed.workflow.id,
       name: policy.name,
       ...(policy.allowedTools ? { allowedTools: [...policy.allowedTools] } : {}),
-      ...(policy.crossConversationGrantedTools ? { crossConversationGrantedTools: [...policy.crossConversationGrantedTools] } : {}),
       ...(policy.preset ? { preset: policy.preset } : {}),
       ...(policy.toolConfigs ? { toolConfigs: clonePlain(policy.toolConfigs) } : {}),
       ...(policy.sourceConfigs ? { sourceConfigs: clonePlain(policy.sourceConfigs) } : {})

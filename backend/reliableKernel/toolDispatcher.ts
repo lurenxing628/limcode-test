@@ -24,7 +24,7 @@ import {
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE, PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import { BACKGROUND_ASK_USER_AUTO_ANSWER } from '../../shared/askUser';
 import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
-import { crossConversationToolPermitted, toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
+import { crossConversationSwitchOn, crossConversationToolPermitted, toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import {
   mapSettledWithBoundedAdmissionConcurrency,
   mapSettledWithBoundedConcurrency,
@@ -68,7 +68,6 @@ import type {
 } from './agentLoop';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { childAgentDepthForTurn } from './childAgentDepth';
-import { frozenCrossConversationEnabled } from './collaborationPolicy';
 import type {
   EffectControlPlane,
   FrozenToolCallPolicyDecision,
@@ -1417,6 +1416,14 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (definitionMismatch) return this.reject(input, definitionMismatch);
     const authority = options.authority ?? await this.readAuthority(input.turnId, input.toolName);
     const policy = authorityPolicy(authority.document);
+    if (isCrossConversationTool(input.toolName)) {
+      if (!crossConversationSwitchOn(policy.toolConfigs) || !await this.topLevelTurn(input.turnId)) {
+        return this.reject(input, `当前 Turn 未开启跨对话协作，或当前对话是子 Agent 对话，不允许工具 ${input.toolName}。`);
+      }
+      if (!crossConversationToolPermitted(policy.allowedTools, input.toolName)) {
+        return this.reject(input, `当前 Turn 的工具策略不含 run_agent，跨对话协作只允许列出和读取对话，不允许工具 ${input.toolName}。`);
+      }
+    }
     if (!definitionAllowedByAuthority(policy, definition)) {
       return this.reject(input, `冻结 ToolPolicy 不允许工具 ${input.toolName}。`);
     }
@@ -1439,12 +1446,6 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     }
     if (WORK_ENVIRONMENT_TOOLS.has(input.toolName) && !authorityWorkEnvironmentPolicy(authority.document).enabled) {
       return this.reject(input, `冻结 WorkEnvironmentPolicy 已关闭，当前 Turn 不允许工具 ${input.toolName}。`);
-    }
-    if (isCrossConversationTool(input.toolName) && !await this.crossConversationOffered(input.turnId, authority.document)) {
-      return this.reject(input, `当前 Turn 未开启跨对话协作，或当前对话是子 Agent 对话，不允许工具 ${input.toolName}。`);
-    }
-    if (isCrossConversationTool(input.toolName) && !crossConversationToolPermitted(policy.allowedTools, input.toolName)) {
-      return this.reject(input, `当前 Turn 的工具策略不含 run_agent，跨对话协作只允许列出和读取对话，不允许工具 ${input.toolName}。`);
     }
     const frozenDecision = options.frozenDecision
       ?? await this.readFrozenDecision(input, definition, authority);
@@ -2078,13 +2079,15 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       await childAgentDepthForTurn(this.dependencies.database, turnId),
       toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
     );
-    const crossConversation = definitions.some((definition) => isCrossConversationTool(definition.declaration.name))
-      && await this.crossConversationOffered(turnId, authority.document);
+    // The frozen switch grants the cross-conversation tools (see toolAllowedByPolicy); they stay
+    // with top-level conversations, since a child task collaborates inside its own team.
+    const topLevel = definitions.some((definition) => isCrossConversationTool(definition.declaration.name))
+      && crossConversationSwitchOn(toolPolicy.toolConfigs)
+      && await this.topLevelTurn(turnId);
     const allowed = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
-      && (!isCrossConversationTool(definition.declaration.name)
-        || (crossConversation && crossConversationToolPermitted(toolPolicy.allowedTools, definition.declaration.name)))
+      && (!isCrossConversationTool(definition.declaration.name) || topLevel)
     ).map(definition => {
       if (definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn) return definition;
       const parameters = plainOptionalRecord(normalizePlainJson(definition.declaration.parameters ?? {})) ?? {};
@@ -2103,11 +2106,10 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   }
 
   /**
-   * Cross-conversation tools require the user's frozen switch, and phase one offers them only to
-   * top-level conversations: a child task keeps collaborating inside its own team.
+   * Whether the Turn runs in a top-level conversation. Phase one offers the cross-conversation
+   * tools only there: a child task keeps collaborating inside its own team.
    */
-  private async crossConversationOffered(turnId: string, document: PlainJsonValue): Promise<boolean> {
-    if (!frozenCrossConversationEnabled(document)) return false;
+  private async topLevelTurn(turnId: string): Promise<boolean> {
     const turns = await this.list('Turn', { id: turnId }, 1);
     if (turns.length !== 1) throw new Error(`Turn ${turnId} does not exist.`);
     const conversationId = requireId(turns[0].conversation_id, 'Turn.conversation_id');

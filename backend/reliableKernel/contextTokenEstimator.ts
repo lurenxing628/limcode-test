@@ -349,10 +349,11 @@ export function estimateRequestAuthorityTokens(
     ? policy.allowedTools.filter((value): value is string => typeof value === 'string')
     : []);
   const sourceConfigs = asRecord(policy?.sourceConfigs) ?? {};
+  const toolConfigs = asRecord(policy?.toolConfigs) ?? {};
   const tools = Array.isArray(recipe.tools) ? recipe.tools : [];
   for (const value of tools) {
     const tool = asRecord(value);
-    if (!tool || !providerToolAllowed(tool, allowed, sourceConfigs)) continue;
+    if (!tool || !providerToolAllowed(tool, { allowedTools: allowed, sourceConfigs, toolConfigs })) continue;
     total += 10;
     if (typeof tool.name === 'string') total += estimateTextTokens(tool.name);
     if (typeof tool.description === 'string') total += estimateTextTokens(tool.description);
@@ -427,11 +428,10 @@ function contextText(content: string, contentType: string): string {
 
 function providerToolAllowed(
   tool: Record<string, unknown>,
-  allowed: ReadonlySet<string>,
-  sourceConfigs: Record<string, unknown>
+  policy: { allowedTools: ReadonlySet<string>; sourceConfigs: Record<string, unknown>; toolConfigs: Record<string, unknown> }
 ): boolean {
   const source = asRecord(tool.source);
-  return toolAllowedByPolicy({ allowedTools: allowed, sourceConfigs }, {
+  return toolAllowedByPolicy(policy, {
     name: typeof tool.name === 'string' ? tool.name : '',
     ...(source ? { source } : {})
   });

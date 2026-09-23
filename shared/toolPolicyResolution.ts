@@ -1,4 +1,6 @@
 import {
+  CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
+  CROSS_CONVERSATION_TOOL_NAMES,
   READONLY_CROSS_CONVERSATION_TOOL_NAMES,
   TOOL_POLICY_ALL_MCP_SOURCES,
   type ToolConfigRecord,
@@ -52,12 +54,32 @@ export interface ResolvedToolPolicy {
 
 /**
  * The default tool set: what a scope gets while no layer on its chain saves a list. MCP tools never
- * belong to it; their source configs alone admit them.
+ * belong to it (their source configs alone admit them), nor do the tools the cross-conversation
+ * switch grants.
  */
 export function defaultToolNames(definitions: readonly ToolPolicyCatalogEntry[]): string[] {
   return uniqueNames(definitions
-    .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
+    .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false && !isSwitchGrantedTool(tool.name))
     .map((tool) => tool.name));
+}
+
+/**
+ * The cross-conversation tools. The user's frozen switch grants them (see `toolAllowedByPolicy`):
+ * no tool list controls them, and a name of theirs saved in a list is ignored.
+ */
+export function isSwitchGrantedTool(name: string): boolean {
+  return (CROSS_CONVERSATION_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * The cross-conversation switch in resolved per-tool settings. Only a literal `true` turns it on;
+ * any other stored value fails closed.
+ */
+export function crossConversationSwitchOn(toolConfigs: unknown): boolean {
+  if (!isPlainRecord(toolConfigs)) return false;
+  const runAgent = toolConfigs[RUN_AGENT_TOOL_NAME];
+  return isPlainRecord(runAgent) && isPlainRecord(runAgent.config)
+    && runAgent.config[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === true;
 }
 
 /**
@@ -106,9 +128,10 @@ export function toolPolicyScopeLayer(
 }
 
 /**
- * Whether an effective tool list permits one cross-conversation tool. Listing and reading need
- * nothing more; sending, creating and forking act on other conversations and need run_agent in
- * the same list. The backend offers and admits exactly these, and the settings page says so.
+ * Whether an effective tool list permits one cross-conversation tool while the switch is on.
+ * Listing and reading need nothing more; sending, creating and forking act on other conversations
+ * and need run_agent in the same list. The backend offers and admits exactly these, and the
+ * settings page says so.
  */
 export function crossConversationToolPermitted(allowedTools: ReadonlySet<string> | readonly string[], toolName: string): boolean {
   if ((READONLY_CROSS_CONVERSATION_TOOL_NAMES as readonly string[]).includes(toolName)) return true;
@@ -134,18 +157,25 @@ export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): To
 
 /**
  * Whether a resolved (frozen) ToolPolicy admits one tool. A built-in tool needs its name in the
- * list. An MCP tool follows its source settings: an enabled source admits every tool it does not
- * disable, a disabled or denied source admits none, and a source no layer configures falls back to
- * the list. Offering, dispatch admission, the MCP policy gate and the settings view all use this.
+ * list, except the cross-conversation tools: the switch in the per-tool settings grants them, with
+ * the run_agent rule of `crossConversationToolPermitted`, whatever the list names. An MCP tool
+ * follows its source settings: an enabled source admits every tool it does not disable, a disabled
+ * or denied source admits none, and a source no layer configures falls back to the list. Offering,
+ * dispatch admission, the provider adapter, the token estimate, the MCP policy gate and the
+ * settings view all use this; offering and admission also keep the cross-conversation tools to
+ * top-level conversations.
  */
 export function toolAllowedByPolicy(
-  policy: { allowedTools: ReadonlySet<string> | readonly string[]; sourceConfigs?: unknown },
+  policy: { allowedTools: ReadonlySet<string> | readonly string[]; sourceConfigs?: unknown; toolConfigs?: unknown },
   tool: { name: string; source?: { kind?: unknown; sourceId?: unknown } | null }
 ): boolean {
+  const sourceId = tool.source?.kind === 'mcp' && typeof tool.source.sourceId === 'string' ? tool.source.sourceId.trim() : '';
+  if (!sourceId && tool.source?.kind !== 'mcp' && isSwitchGrantedTool(tool.name)) {
+    return crossConversationSwitchOn(policy.toolConfigs) && crossConversationToolPermitted(policy.allowedTools, tool.name);
+  }
   const explicitlyAllowed = Array.isArray(policy.allowedTools)
     ? policy.allowedTools.includes(tool.name)
     : (policy.allowedTools as ReadonlySet<string>).has(tool.name);
-  const sourceId = tool.source?.kind === 'mcp' && typeof tool.source.sourceId === 'string' ? tool.source.sourceId.trim() : '';
   if (!sourceId) return explicitlyAllowed;
   const config = mcpSourceConfigFor(policy.sourceConfigs, sourceId);
   if (!config) return explicitlyAllowed;
@@ -158,7 +188,8 @@ export function toolAllowedByPolicy(
  *
  * Capability lists are monotone: every layer with a list is an upper bound and may only narrow the
  * tools admitted by an earlier layer; a layer without a list narrows nothing. When no layer on the
- * chain has a list, the base is `defaultTools` (see `defaultToolNames`). A stored list that is
+ * chain has a list, the base is `defaultTools` (see `defaultToolNames`). Names of the tools the
+ * cross-conversation switch grants are ignored in every list, so the result never holds them. A stored list that is
  * neither absent nor an array of names fails closed instead of narrowing nothing. YOLO changes
  * approval/application behavior only; it never widens a Global/Agent/Workflow capability boundary.
  * `inherit` (and the pre-preset shape where preset is absent) inherits only the Global execution
@@ -191,7 +222,7 @@ export function resolveToolPolicyLayers(
 
     const list = layerAllowedTools(layer);
     if (list) {
-      const ceiling = new Set(uniqueNames(list));
+      const ceiling = new Set(uniqueNames(list).filter((name) => !isSwitchGrantedTool(name)));
       allowed = allowed ? new Set([...allowed].filter((name) => ceiling.has(name))) : ceiling;
     }
 
@@ -206,7 +237,7 @@ export function resolveToolPolicyLayers(
 
   return {
     id,
-    allowedTools: [...(allowed ?? new Set(uniqueNames(defaultTools)))].sort(),
+    allowedTools: [...(allowed ?? new Set(uniqueNames(defaultTools).filter((name) => !isSwitchGrantedTool(name))))].sort(),
     preset,
     toolConfigs,
     sourceConfigs

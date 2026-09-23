@@ -885,9 +885,9 @@ test('未写允许列表的工具策略层不收窄上层，内置 Agent 与工�
     const readonly = await compile('main', 'conversation:readonly');
     assert.deepEqual(readonly.allowedTools, [...blueprints.workflows.readonly.toolPolicy.allowedTools].sort());
 
-    // A saved list still narrows as before.
+    // A saved list still narrows as before; a cross-conversation name in it is ignored, since the switch alone grants those tools.
     await authority.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: 'conversation:main', allowedTools: ['read', 'list_conversations'] });
-    assert.deepEqual((await compile('main', 'conversation:main')).allowedTools, ['list_conversations', 'read']);
+    assert.deepEqual((await compile('main', 'conversation:main')).allowedTools, ['read']);
 
     const client = await authority.configurationClientState();
     const builtin = (scopeKind, scopeId) => client.builtinToolPolicies.find((record) => record.scopeKind === scopeKind && record.scopeId === scopeId);
@@ -1016,10 +1016,12 @@ test('整条链都没有工具列表时以默认工具集为底，自定义 Agen
     const command = { toolName: process.platform === 'win32' ? 'shell' : 'bash', description: 'Synthetic shell.' };
     const builtinDefinitions = createBuiltinToolDefinitions({ command }).map((definition) => definition.declaration);
     // The one definition of the default tool set, as the settings page computes it from the same catalog.
+    const { CROSS_CONVERSATION_TOOL_NAMES } = require('../../dist/extension/shared/protocol.js');
     const defaultToolSet = builtinDefinitions
-      .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
+      .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false && !CROSS_CONVERSATION_TOOL_NAMES.includes(tool.name))
       .map((tool) => tool.name).sort();
-    assert.ok(defaultToolSet.includes('run_agent') && defaultToolSet.includes('send_conversation_message'));
+    assert.ok(defaultToolSet.includes('run_agent'));
+    assert.equal(defaultToolSet.includes('send_conversation_message'), false, 'the switch, not the default set, grants the cross-conversation tools');
     assert.equal(defaultToolSet.includes('transfer'), false, 'tools that are off by default stay out of the default set');
     const paths = createVscodeStoragePaths(vscode.Uri.file(root));
     const authority = new VscodeConfigurationAuthority(() => paths);

@@ -60,8 +60,14 @@ const lastResult = (start, name) => start.contents.flatMap(content => content.pa
   .filter(part => part.functionResponse?.name === name).at(-1)?.functionResponse.response;
 const detail = (start, name) => lastResult(start, name)?.detail;
 
+/**
+ * The saved global list names none of the cross-conversation tools: the frozen switch alone grants
+ * them, as the settings page leaves every list.
+ */
+const LISTED_TOOLS = definitions.map(tool => tool.declaration.name).filter(name => !CROSS_CONVERSATION_TOOL_NAMES.includes(name));
+
 /** The external model alone is synthetic; tools, authority, ownership, persistence and wakes are production code. */
-async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook, expectedScannerError, compressionGate, allowedTools = definitions.map(tool => tool.declaration.name), providerKind = 'openai-compatible', modelId = 'gpt-6-astra' } = {}) {
+async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook, expectedScannerError, compressionGate, allowedTools = LISTED_TOOLS, configure, providerKind = 'openai-compatible', modelId = 'gpt-6-astra' } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-cross-conversation-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -72,7 +78,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
   const errors = [], dispatches = [], wakes = [], compressionRequests = [];
   const f = {
     errors, dispatches, wakes, compressionRequests, configuration,
-    get app() { return app; }, get runner() { return runner; }, get lifecycle() { return lifecycle; },
+    get app() { return app; }, get runner() { return runner; }, get lifecycle() { return lifecycle; }, get agentId() { return agent.id; },
     /** The production wake handler, without the test's wake gate. */
     get wake() { return productionWake; },
     rows: async (domain, where = {}) => (await app.database.snapshotAll(repo(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot,
@@ -202,6 +208,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     agent = await configuration.mutations.createAgent({ name: 'Synthetic top-level', kind: 'custom' });
     await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools,
       ...(enabled ? { toolConfigs: { ...toolConfigs, run_agent: { config: { ...runAgentConfig, crossConversationCollaboration: switchValue } } } } : {}) });
+    await configure?.(configuration, agent);
     await kernel.initializeEmptyRuntimeRoot(new kernel.RootAuthority(() => path.join(root, 'runtime')));
     await open();
     const now = new Date().toISOString();
@@ -353,12 +360,45 @@ test('without run_agent in the effective list only list and read are offered or 
     // The collaboration dispatcher's own allowed-tools check refuses a send-type call from this Turn.
     const [snapshot] = await f.rows('AuthoritySnapshot', { turn_id: started.turnId });
     const frozen = await readFrozenTurnAuthority(f.app.database, f.app.contentStore, snapshot.id, started.turnId);
-    assert.ok(frozen.document.toolPolicy.allowedTools.includes('send_conversation_message'), 'the frozen list itself still names the send tool');
+    assert.equal(frozen.document.toolPolicy.allowedTools.some(name => CROSS_CONVERSATION_TOOL_NAMES.includes(name)), false, 'the frozen list never names the switch-granted tools');
     const tools = new CollaborationToolDispatcher({ database: f.app.database, contentStore: f.app.contentStore,
       effects: f.app.runtime.effects, collaboration: f.app.runtime.collaboration, conversations: f.lifecycle });
     await assert.rejects(tools.dispatch({ toolName: 'send_conversation_message', turnId: started.turnId, toolCallId: 'forged', modelRequestId: 'forged',
       arguments: { conversationRef: 'C1', text: 'x', mode: 'message' } }, undefined, { snapshotId: snapshot.id, document: frozen.document }), /run_agent/);
-  }, { allowedTools: definitions.map(tool => tool.declaration.name).filter(name => name !== 'run_agent') });
+  }, { allowedTools: LISTED_TOOLS.filter(name => name !== 'run_agent') });
+});
+
+test('the switch alone grants the tools at whichever scope turns it on, over any saved lists', { timeout: 60000 }, async () => {
+  const SEND_TYPE = CROSS_CONVERSATION_TOOL_NAMES.filter(name => !['list_conversations', 'read_conversation'].includes(name));
+  const offered = [];
+  await fixture(async (request, f, start) => {
+    assert.equal(request.conversationId, ROOT);
+    offered.push(start.tools.map(tool => tool.name).filter(name => CROSS_CONVERSATION_TOOL_NAMES.includes(name)));
+    return answer('Noted.');
+  }, async f => {
+    const turn = async (label) => {
+      const started = await f.input(ROOT, label);
+      assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+      return offered.at(-1);
+    };
+    // Global switch on; the Agent and the conversation save their own lists, neither naming the tools.
+    const agentList = LISTED_TOOLS.filter(name => name !== 'bash');
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: f.agentId, allowedTools: agentList });
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: ROOT, allowedTools: agentList.filter(name => name !== 'list_agents') });
+    assert.deepEqual(await turn('global on, own lists below'), [...CROSS_CONVERSATION_TOOL_NAMES]);
+    // run_agent missing from the effective list: only list and read.
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: ROOT, allowedTools: agentList.filter(name => name !== 'run_agent') });
+    assert.deepEqual(await turn('no run_agent'), ['list_conversations', 'read_conversation']);
+    // run_agent enabled again after the switch: the send-type tools come back with no other change.
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: ROOT, allowedTools: agentList });
+    assert.deepEqual(await turn('run_agent back'), [...CROSS_CONVERSATION_TOOL_NAMES]);
+    for (const name of SEND_TYPE) assert.ok(offered.at(-1).includes(name));
+    // Global switch off, the Agent turns it on: that Agent's conversations get the tools.
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: LISTED_TOOLS, toolConfigs: { run_agent: { config: { crossConversationCollaboration: false } } } });
+    assert.deepEqual(await turn('global off'), []);
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: f.agentId, allowedTools: agentList, toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } } });
+    assert.deepEqual(await turn('agent on'), [...CROSS_CONVERSATION_TOOL_NAMES]);
+  });
 });
 
 test('a malformed switch value fails closed instead of breaking every Turn', { timeout: 60000 }, async () => {
@@ -1234,7 +1274,7 @@ test('turning the switch off mid-Turn leaves that Turn\'s frozen switch in force
     const names = start.tools.map(tool => tool.name);
     if (rootRound === 1) {
       assert.ok(names.includes('list_conversations'));
-      await f.configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: definitions.map(tool => tool.declaration.name),
+      await f.configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: LISTED_TOOLS,
         toolConfigs: { run_agent: { config: { crossConversationCollaboration: false } } } });
       return toolsAnswer(call('list', 'list_conversations'));
     }

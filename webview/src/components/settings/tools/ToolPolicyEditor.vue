@@ -12,7 +12,7 @@ import type {
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
 import { ASK_USER_TOOL_NAME, EDIT_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
-import { mcpSourceConfigFor, toolAllowedByPolicy } from '@shared/toolPolicyResolution';
+import { isSwitchGrantedTool, mcpSourceConfigFor, toolAllowedByPolicy } from '@shared/toolPolicyResolution';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
@@ -81,6 +81,11 @@ const visibleTools = computed(() => {
 const visibleEnabledCount = computed(() => visibleTools.value.filter((tool) => isToolEnabled(tool)).length);
 /** A stored tool list on this scope's chain that the backend refuses to compile. */
 const listError = computed(() => store.toolListErrorFor(props.scopeKind, props.scopeId));
+/** A child task's conversation: the cross-conversation tools are never offered there. */
+const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
+/** Where the cross-conversation switch lives for this scope. */
+const collaborationArea = computed(() => props.scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域');
+const switchGrantedToolNames = computed(() => builtinTools.value.filter((tool) => isSwitchGranted(tool)).map((tool) => tool.name));
 /** This scope's own invalid list blocks every edit that would rewrite it; only a reset repairs it. */
 const editsBlocked = computed(() => props.readonly || listError.value?.own === true);
 /** Any invalid list on the chain blocks tool-list edits, which start from the effective list. */
@@ -176,9 +181,22 @@ function updatePolicyPreset(value: ToolPolicyPresetKind): void {
   store.setPolicyPresetForScope(props.scopeKind, props.scopeId, value);
 }
 
-/** The backend's own admission rule over the effective policy (MCP tools follow source settings). */
+/**
+ * The backend's own admission rule over the effective policy: MCP tools follow source settings,
+ * and the cross-conversation switch grants its tools to top-level conversations.
+ */
 function isToolEnabled(tool: ToolDefinitionRecord): boolean {
-  return toolAllowedByPolicy({ allowedTools: allowedSet.value, sourceConfigs: effectivePolicy.value?.sourceConfigs }, tool);
+  if (isSwitchGranted(tool) && childConversation.value) return false;
+  return toolAllowedByPolicy({
+    allowedTools: allowedSet.value,
+    sourceConfigs: effectivePolicy.value?.sourceConfigs,
+    toolConfigs: effectivePolicy.value?.toolConfigs
+  }, tool);
+}
+
+/** A cross-conversation tool: the switch in the Agent 协作 area grants it, not the tool list. */
+function isSwitchGranted(tool: ToolDefinitionRecord): boolean {
+  return tool.source?.kind !== 'mcp' && isSwitchGrantedTool(tool.name);
 }
 
 function isMcpSourceEnabled(sourceId: string): boolean {
@@ -213,16 +231,15 @@ function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void
   store.setMcpToolEnabledForScope(props.scopeKind, props.scopeId, tool, enabled);
 }
 
-/** An explicit enable makes the tool the user's own: turning the cross-conversation switch off keeps it. */
+/** One tool's box: a built-in tool edits this scope's list; the cross-conversation tools follow their switch only. */
 function setToolEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
   if (tool.source?.kind === 'mcp') {
     toggleMcpSourceTool(tool, enabled);
     return;
   }
-  if (listEditsBlocked.value || enabled === isToolEnabled(tool)) return;
+  if (isSwitchGranted(tool) || listEditsBlocked.value || enabled === isToolEnabled(tool)) return;
   if (!enabled) collapseToolConfig(tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs(),
-    undefined, enabled ? store.crossConversationGrantsWithout(props.scopeKind, props.scopeId, [tool.name]) : undefined);
+  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
 function isToolConfigExpanded(toolName: string): boolean { return expandedToolNames.value.includes(toolName); }
@@ -239,9 +256,8 @@ function collapseToolConfig(toolName: string): void {
 
 function enableAll(): void {
   if (listEditsBlocked.value) return;
-  const names = builtinTools.value.map((tool) => tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, names, localPolicyName(), cloneToolConfigs(), cloneSourceConfigs(),
-    undefined, store.crossConversationGrantsWithout(props.scopeKind, props.scopeId, names));
+  const names = builtinTools.value.filter((tool) => !isSwitchGranted(tool)).map((tool) => tool.name);
+  store.setPolicyForScope(props.scopeKind, props.scopeId, names, localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
 function disableAll(): void {
@@ -250,9 +266,10 @@ function disableAll(): void {
   store.setPolicyForScope(props.scopeKind, props.scopeId, [], localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
+/** 恢复继承 resets this scope's tool settings; the Agent 协作 switch and limits keep their own restore buttons. */
 function restoreInheritance(): void {
   if (!canRestoreInheritance.value) return;
-  store.clearPolicyScope(props.scopeKind, props.scopeId);
+  store.restoreToolInheritance(props.scopeKind, props.scopeId);
 }
 
 /**
@@ -263,7 +280,7 @@ function restoreInheritance(): void {
  */
 function inheritDefaults(): void {
   if (!canRestoreDefault.value) return;
-  store.saveOrDropLocalPolicy('global', undefined, undefined, cloneToolConfigs(), undefined);
+  store.saveOrDropLocalPolicy('global', undefined, undefined, cloneToolConfigs());
 }
 
 function riskLabel(tool: ToolDefinitionRecord): string {
@@ -599,6 +616,7 @@ function inputNumber(event: Event): number {
       <button v-else type="button" class="secondary" :disabled="!canRestoreInheritance" @click="restoreInheritance">恢复继承</button>
     </div>
 
+    <p v-if="switchGrantedToolNames.length > 0" class="tool-policy-note">{{ switchGrantedToolNames.join('、') }} 由{{ collaborationArea }}里的「跨对话协作」开关控制，不受这里的工具开关和工具列表影响。</p>
     <p v-if="firstListExtras.length > 0" class="tool-policy-note">这里还没有单独保存工具列表。第一次改下方的工具开关会保存一份列表，并带上内置 Agent 列表里的 {{ firstListExtras.join('、') }}，以免这些 Agent 失去它们；没有自己列表的自定义 Agent 也会因此得到 {{ firstListExtras.join('、') }}。工作环境相关工具仍受工作环境策略限制，默认关闭。</p>
 
     <section v-if="mcpSourceGroups.length > 0" class="mcp-source-section" aria-label="MCP 工具来源">
@@ -654,8 +672,8 @@ function inputNumber(event: Event): number {
                   class="tool-enable-toggle"
                   size="sm"
                   :model-value="isToolEnabled(tool)"
-                  :disabled="listEditsBlocked || isMcpToolBlockedAbove(tool)"
-                  :aria-label="`${isToolEnabled(tool) ? '禁用' : '启用'}工具 ${tool.name}`"
+                  :disabled="listEditsBlocked || isMcpToolBlockedAbove(tool) || isSwitchGranted(tool)"
+                  :aria-label="isSwitchGranted(tool) ? `工具 ${tool.name} 由跨对话协作开关控制` : `${isToolEnabled(tool) ? '禁用' : '启用'}工具 ${tool.name}`"
                   @update:model-value="setToolEnabled(tool, $event)"
                 />
               </div>
@@ -676,6 +694,7 @@ function inputNumber(event: Event): number {
                     <span class="tool-pill">{{ scopeLabel(toolScope(tool)) }}</span>
                     <span class="tool-pill">{{ executionLabel(tool) }}</span>
                     <span class="tool-pill">{{ riskLabel(tool) }}</span>
+                    <span v-if="isSwitchGranted(tool)" class="tool-pill">跨对话协作开关</span>
                   </span>
                 </span>
                 <span class="tool-config-toggle">
@@ -698,11 +717,12 @@ function inputNumber(event: Event): number {
                       <small>由工具定义提供，展开后查看完整说明。</small>
                     </div>
                     <p class="tool-definition-description">{{ toolDescription(tool) }}</p>
-                    <p v-if="tool.name === SUB_AGENT_TOOL_NAME" class="tool-definition-mode-note">子 Agent 深度、团队预算和跨对话协作开关已移至{{ scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域' }}。</p>
+                    <p v-if="tool.name === SUB_AGENT_TOOL_NAME" class="tool-definition-mode-note">子 Agent 深度、团队预算和跨对话协作开关已移至{{ collaborationArea }}。</p>
+                    <p v-if="isSwitchGranted(tool)" class="tool-definition-mode-note">此工具由{{ collaborationArea }}里的「跨对话协作」开关提供：开关开启时提供（工具列表不含 run_agent 时只提供列出和读取对话），这里不能单独启用或停用；可以在下方改为执行前确认。</p>
                     <p v-if="editModeShortLabel(tool)" class="tool-definition-mode-note">{{ editModeShortLabel(tool) }}</p>
                   </div>
 
-                  <template v-if="isToolEnabled(tool)">
+                  <template v-if="isToolEnabled(tool) || isSwitchGranted(tool)">
                     <div class="tool-config-group tool-config-permissions">
                       <div class="tool-config-group-heading">
                         <span class="tool-config-group-title">权限与显示</span>

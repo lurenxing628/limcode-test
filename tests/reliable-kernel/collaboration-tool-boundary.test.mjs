@@ -345,3 +345,89 @@ test('general dispatch admission refuses send, create and fork without run_agent
     assert.doesNotMatch((await admit(toolName, [toolName])).join('\n'), policyRefusal, `${toolName} needs no run_agent`);
   }
 });
+
+/**
+ * The general dispatcher over a stub frozen Turn: its own offering (`definitions(turnId)`) and
+ * dispatch admission, with no provider declaration to match.
+ */
+function frozenTurnDispatcher({ allowedTools, toolConfigs = {}, childConversation = false }) {
+  const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
+  const document = {
+    toolPolicy: { allowedTools, preset: 'custom', toolConfigs, sourceConfigs: {} },
+    planReviewPolicy: { mode: 'off' },
+    workEnvironmentPolicy: { enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
+  };
+  const records = {
+    ToolCall: [],
+    AuthoritySnapshot: [{ id: 'authority', turn_id: 'turn', content_object_id: 'authority-content' }],
+    ContentObject: [{ id: 'authority-content' }],
+    Turn: [{ id: 'turn', conversation_id: 'conversation', status: 'active' }],
+    ChildExecution: childConversation ? [{ id: 'child', child_conversation_id: 'conversation' }] : []
+  };
+  const matching = read => (records[read.domain] ?? []).filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
+  const settlements = [];
+  const declarations = [load('backend/world/modules/tools/definitions/runAgent/index.js').runAgentTool.declaration,
+    ...crossConversationToolModules.map(module => module.create({}).declaration)];
+  const dispatcher = new ReliableToolDispatcher({
+    database: {
+      async snapshot(reads) { return { snapshot: reads.map(read => read.kind === 'get' ? (records[read.domain] ?? []).find(row => row.id === read.id) : matching(read)) }; },
+      async snapshotAll(read) { return { snapshot: matching(read) }; }
+    },
+    contentStore: { async read() { return Buffer.from(JSON.stringify(document)); } },
+    effects: {
+      subscribeToolModelResults() { return () => {}; },
+      async finalizeReadyInOrder() {},
+      async readTerminalResult() { return null; },
+      async settleWithoutEffect(input) { settlements.push(input); return { status: input.status }; }
+    },
+    host: { definitions: () => declarations.map(declaration => ({ execution: 'backend', declaration, async execute() { throw new Error('not reached'); } })) }
+  });
+  return {
+    async offered() { return (await dispatcher.definitions('turn')).map(tool => tool.name).filter(name => CROSS.includes(name)); },
+    /** The refusal reasons of one directly dispatched call. */
+    async refusals(toolName) {
+      const id = `call-${records.ToolCall.length}`;
+      records.ToolCall.push({ id, turn_id: 'turn', tool_name: toolName, call_seq: BigInt(records.ToolCall.length + 1), status: 'pending' });
+      const before = settlements.length;
+      await dispatcher.dispatch({ turnId: 'turn', modelRequestId: 'request', toolCallId: id, toolName, arguments: {} }).catch(() => undefined);
+      return settlements.slice(before).filter(entry => entry.status === 'rejected').map(entry => entry.detail.reason);
+    }
+  };
+}
+
+const CROSS = ['list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'];
+const READ_TYPE = ['list_conversations', 'read_conversation'];
+const switchConfig = value => ({ run_agent: { config: { crossConversationCollaboration: value } } });
+const policyRefusal = /ToolPolicy|工具策略|跨对话协作/;
+
+test('the switch is the grant: the frozen switch offers and admits the tools whatever the tool list names', async () => {
+  // Switch on: a list that names none of the five still gets all of them with run_agent, and only list and read without it.
+  const granted = frozenTurnDispatcher({ allowedTools: ['run_agent'], toolConfigs: switchConfig(true) });
+  assert.deepEqual(await granted.offered(), CROSS);
+  for (const toolName of CROSS) assert.doesNotMatch((await granted.refusals(toolName)).join('\n'), policyRefusal, `${toolName} is admitted`);
+  const readOnly = frozenTurnDispatcher({ allowedTools: ['read'], toolConfigs: switchConfig(true) });
+  assert.deepEqual(await readOnly.offered(), READ_TYPE);
+  for (const toolName of READ_TYPE) assert.doesNotMatch((await readOnly.refusals(toolName)).join('\n'), policyRefusal);
+  for (const toolName of CROSS.filter(name => !READ_TYPE.includes(name))) assert.match((await readOnly.refusals(toolName)).join('\n'), /run_agent/);
+
+  // Switch off (or a child task): a list that names all five offers and admits none; a forged call is refused.
+  for (const off of [frozenTurnDispatcher({ allowedTools: ['run_agent', ...CROSS], toolConfigs: switchConfig(false) }),
+    frozenTurnDispatcher({ allowedTools: ['run_agent', ...CROSS] }),
+    frozenTurnDispatcher({ allowedTools: ['run_agent', ...CROSS], toolConfigs: switchConfig(true), childConversation: true })]) {
+    assert.deepEqual(await off.offered(), []);
+    for (const toolName of CROSS) assert.match((await off.refusals(toolName)).join('\n'), /未开启跨对话协作/, `${toolName} is refused`);
+  }
+});
+
+test('the collaboration dispatcher admits the tools by the frozen switch, not by list entries', async () => {
+  const send = fixture({ toolName: 'send_conversation_message', args: { targetConversationId: 'peer', text: 'hello', mode: 'message' },
+    crossConversation: true, allowedTools: ['run_agent'] });
+  await send.dispatcher.dispatch(send.input, undefined, send.authority);
+  assert.equal(send.calls.length, 1, 'a list without the tool name still sends while the switch is on');
+  const list = fixture({ toolName: 'list_conversations', args: {}, crossConversation: true, allowedTools: [] });
+  await list.dispatcher.dispatch(list.input, undefined, list.authority);
+  assert.deepEqual(list.calls, [{ list: { turnId: 'turn', limit: 20 } }]);
+  const off = fixture({ toolName: 'list_conversations', args: {}, crossConversation: false, allowedTools: ['run_agent', ...CROSS] });
+  await assert.rejects(off.dispatcher.dispatch(off.input, undefined, off.authority), /not enabled/);
+  assert.deepEqual(off.calls, []);
+});

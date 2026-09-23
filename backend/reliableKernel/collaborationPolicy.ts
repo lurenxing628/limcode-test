@@ -4,10 +4,10 @@ import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import {
-  CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
   DEFAULT_MAX_CONCURRENT_AGENTS,
   DEFAULT_MAX_AUTOMATIC_FOLLOWUPS
 } from '../world/modules/tools/definitions/runAgent';
+import { crossConversationSwitchOn } from '../../shared/toolPolicyResolution';
 
 /**
  * Fixed limits of cross-conversation collaboration. They are not settings: the automatic followup
@@ -46,7 +46,7 @@ export function frozenCollaborationLimits(document: PlainJsonValue): Collaborati
  * Turn's tool list.
  */
 export function frozenCrossConversationEnabled(document: PlainJsonValue): boolean {
-  return frozenRunAgentConfig(document)?.[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === true;
+  return crossConversationSwitchOn(record(record(document)?.toolPolicy)?.toolConfigs);
 }
 
 export async function readTurnCollaborationLimits(

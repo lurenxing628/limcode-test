@@ -1539,6 +1539,7 @@ function authorityToolPolicy(authority: { [key: string]: PlainJsonValue }): {
   allowedTools: Set<string>;
   preset: string;
   sourceConfigs: { [key: string]: PlainJsonValue };
+  toolConfigs: { [key: string]: PlainJsonValue };
 } {
   const policy = requireRecord(authority.toolPolicy, 'Provider authority toolPolicy');
   if (!Array.isArray(policy.allowedTools)) throw new TypeError('Provider authority toolPolicy.allowedTools must be an array.');
@@ -1547,7 +1548,10 @@ function authorityToolPolicy(authority: { [key: string]: PlainJsonValue }): {
     preset: typeof policy.preset === 'string' ? policy.preset : 'custom',
     sourceConfigs: policy.sourceConfigs === undefined
       ? {}
-      : requireRecord(policy.sourceConfigs, 'Provider authority toolPolicy.sourceConfigs')
+      : requireRecord(policy.sourceConfigs, 'Provider authority toolPolicy.sourceConfigs'),
+    toolConfigs: policy.toolConfigs === undefined
+      ? {}
+      : requireRecord(policy.toolConfigs, 'Provider authority toolPolicy.toolConfigs')
   };
 }
 

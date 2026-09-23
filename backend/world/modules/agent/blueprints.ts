@@ -3,7 +3,6 @@ import type { LlmProviderKind, PlanReviewPolicyRecord, ToolPolicySourceConfigRec
 import { EXTENSION_AGENT_NAME, EXTENSION_BRAND } from '../../../../shared/extensionIdentity';
 import {
   ASK_USER_TOOL_NAME,
-  CROSS_CONVERSATION_TOOL_NAMES,
   DELETE_TOOL_NAME,
   EDIT_TOOL_NAME,
   READ_TOOL_NAME,
@@ -75,8 +74,10 @@ export const DEFAULT_INTEGRATED_SYSTEM_PROMPT = [
 ].join('\n\n');
 
 const COLLABORATION_TOOLS = ['list_agents', 'send_agent_message', 'followup_agent_task', 'read_agent_messages', 'wait_agent_messages'];
-const DEFAULT_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME, READ_TOOL_NAME, EDIT_TOOL_NAME, WRITE_TOOL_NAME, DELETE_TOOL_NAME, 'shell', 'bash', 'run_agent', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME, ...COLLABORATION_TOOLS, ...CROSS_CONVERSATION_TOOL_NAMES];
-const READONLY_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, READ_TOOL_NAME, 'shell', 'bash', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME, 'list_agents', 'send_agent_message', 'read_agent_messages', 'wait_agent_messages', 'list_conversations', 'read_conversation'];
+// The cross-conversation tools belong to no list: the user's switch grants them (only listing and
+// reading where the list lacks run_agent, as in the read-only lists below).
+const DEFAULT_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME, READ_TOOL_NAME, EDIT_TOOL_NAME, WRITE_TOOL_NAME, DELETE_TOOL_NAME, 'shell', 'bash', 'run_agent', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME, ...COLLABORATION_TOOLS];
+const READONLY_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, READ_TOOL_NAME, 'shell', 'bash', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME, 'list_agents', 'send_agent_message', 'read_agent_messages', 'wait_agent_messages'];
 const DEFAULT_TOOL_CONFIGS: Record<string, ToolPolicyToolConfigRecord> = {};
 /**
  * MCP tools may have side effects and are not known to be read-only, so read-only built-ins deny

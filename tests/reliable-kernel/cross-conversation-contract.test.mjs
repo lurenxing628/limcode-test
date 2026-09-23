@@ -18,7 +18,7 @@ const { TOOL_RESULT_MAX_TOKENS } = load('backend/reliableKernel/modelFacingConte
 const { RUNTIME_DELIVERY_MODEL_NOTE, renderRuntimeDeliveryModelEnvelope } = load('backend/reliableKernel/runtimeDeliveryProjection.js');
 const { agentCollaborationToolModules, AGENT_COLLABORATION_TOOL_NAMES } = load('backend/world/modules/tools/definitions/agentCollaboration/index.js');
 const { RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS } = load('shared/reliableKernelClientFeed.js');
-const { crossConversationToolPermitted } = load('shared/toolPolicyResolution.js');
+const { crossConversationToolPermitted, resolveToolPolicyLayers, toolAllowedByPolicy } = load('shared/toolPolicyResolution.js');
 const { CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE, CLIENT_MESSAGE_WINDOW_LIMIT, CLIENT_SNAPSHOT_MAX_BYTES } = load('backend/reliableKernel/clientFeedBounds.js');
 
 const contract = async name => JSON.parse(await fs.readFile(`docs/architecture/reliable-kernel/contracts/${name}.json`, 'utf8'));
@@ -38,12 +38,22 @@ test('the cross-conversation contract names exactly the tools the code declares,
   for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(builtin.includes(name), `${name} is registered`);
 });
 
-test('without run_agent the code permits exactly the contract read-only pair, as the allowlist rule says', async () => {
+test('the switch is the grant and without run_agent the code permits exactly the contract read-only pair, as the allowlist rule says', async () => {
   const section = await crossConversation();
-  assert.match(section.allowlist, /; send-create-and-fork-are-offered-and-admitted-only-while-the-Turn-effective-allowedTools-include-run_agent\(otherwise-list-and-read-only\);/);
+  assert.match(section.allowlist, /^the-switch-is-the-grant; the-Turn-frozen-switch-alone-offers-and-admits-the-five-tools-in-top-level-conversations;/);
+  assert.match(section.allowlist, /; send-create-and-fork-only-while-the-Turn-effective-allowedTools-include-run_agent\(otherwise-list-and-read-only\);/);
+  assert.match(section.allowlist, /; no-tool-list-controls-them-and-their-names-in-saved-lists-are-ignored-/);
   const withoutRunAgent = [...CROSS_CONVERSATION_TOOL_NAMES];
   assert.deepEqual(CROSS_CONVERSATION_TOOL_NAMES.filter(name => crossConversationToolPermitted(withoutRunAgent, name)), section.readonlyTools);
   assert.deepEqual(CROSS_CONVERSATION_TOOL_NAMES.filter(name => crossConversationToolPermitted(new Set(['run_agent']), name)), section.tools);
+  const on = { run_agent: { config: { crossConversationCollaboration: true } } };
+  const off = { run_agent: { config: { crossConversationCollaboration: false } } };
+  const admitted = policy => CROSS_CONVERSATION_TOOL_NAMES.filter(name => toolAllowedByPolicy(policy, { name }));
+  assert.deepEqual(admitted({ allowedTools: ['run_agent'], toolConfigs: on }), section.tools, 'a list naming none of them');
+  assert.deepEqual(admitted({ allowedTools: [], toolConfigs: on }), section.readonlyTools);
+  assert.deepEqual(admitted({ allowedTools: ['run_agent', ...CROSS_CONVERSATION_TOOL_NAMES], toolConfigs: off }), [], 'a list naming all of them');
+  assert.deepEqual(resolveToolPolicyLayers([{ scopeKind: 'global', policy: { allowedTools: ['read', ...CROSS_CONVERSATION_TOOL_NAMES] } }], []).allowedTools, ['read'],
+    'their names in a saved list are ignored');
 });
 
 test('the switch contract matches the run_agent config schema: boolean, default off, defaultValue only, fail closed', async () => {

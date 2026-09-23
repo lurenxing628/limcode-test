@@ -562,9 +562,6 @@ export class VscodeConfigurationMutations {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
     // The payload states the record's whole list: absent saves a record that narrows nothing.
     const allowedTools = payload.allowedTools === undefined ? undefined : uniqueStrings(payload.allowedTools);
-    const grantedTools = allowedTools
-      ? uniqueStrings(payload.crossConversationGrantedTools ?? []).filter((name) => allowedTools.includes(name))
-      : [];
     return this.mutate((paths) => this.setScoped(
       toolPolicyStore(paths),
       toolPolicyLinkStore(paths),
@@ -574,7 +571,6 @@ export class VscodeConfigurationMutations {
         id,
         name: normalizedOptionalText(payload.name) ?? existing?.name ?? defaultPolicyName('工具', scope.scopeKind),
         ...(allowedTools ? { allowedTools } : {}),
-        ...(grantedTools.length > 0 ? { crossConversationGrantedTools: grantedTools } : {}),
         ...(payload.preset !== undefined ? { preset: payload.preset } : existing?.preset !== undefined ? { preset: existing.preset } : {}),
         ...(payload.toolConfigs !== undefined ? { toolConfigs: plainClone(payload.toolConfigs) } : existing?.toolConfigs ? { toolConfigs: plainClone(existing.toolConfigs) } : {}),
         ...(payload.sourceConfigs !== undefined ? { sourceConfigs: plainClone(payload.sourceConfigs) } : existing?.sourceConfigs ? { sourceConfigs: plainClone(existing.sourceConfigs) } : {})

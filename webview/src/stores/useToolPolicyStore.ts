@@ -14,8 +14,10 @@ import type {
 } from '@shared/protocol';
 import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
 import {
+  crossConversationSwitchOn,
   crossConversationToolPermitted,
   defaultToolNames,
+  isSwitchGrantedTool,
   mcpSourceConfigFor,
   resolveToolPolicyLayers,
   toolAllowedByPolicy,
@@ -47,14 +49,14 @@ export interface EffectiveToolPolicyResolution {
   inheritedFrom?: ToolPolicyScopeKind;
 }
 
-/** The cross-conversation tools a scope is meant to get, and those its effective list still blocks. */
-export interface CrossConversationToolAvailability {
+/** What the cross-conversation switch gives a scope, exactly as the backend decides it. */
+export interface CrossConversationState {
+  /** The switch as it applies here: this scope's value, else the nearest upper layer's, else off. */
+  enabled: boolean;
   /** False when the scope's effective list lacks run_agent: the backend then offers only the read-type tools. */
   sendTools: boolean;
-  /** What the backend offers here while the switch is on, from the effective list. */
-  available: string[];
-  expected: string[];
-  missing: string[];
+  /** The tools the backend offers here: all five with run_agent, list and read without it, none while off. */
+  offered: string[];
 }
 
 interface ScopeRef {
@@ -207,73 +209,41 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
   },
   actions: {
     setAgentCollaborationFieldForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, key: AgentCollaborationConfigKey, value: number | undefined): void {
-      if (scopeKind !== 'global' && !scopeId?.trim()) return;
       if (!AGENT_COLLABORATION_CONFIG_KEYS.includes(key)) throw new TypeError('未知的 Agent 协作配置项。');
       const minimum = key === 'maxConcurrentAgents' ? 1 : 0;
       if (value !== undefined && (!Number.isSafeInteger(value) || value < minimum)) {
         throw new TypeError(`Agent 协作配置必须是大于或等于 ${minimum} 的整数。`);
       }
+      this.setRunAgentConfigValueForScope(scopeKind, scopeId, key, value);
+    },
+    /**
+     * Stores the cross-conversation switch in this scope's run_agent config and nothing else. The
+     * switch is the grant: the backend offers the five tools from the frozen switch (only listing
+     * and reading while the effective list lacks run_agent), so no tool list changes.
+     */
+    setCrossConversationCollaborationForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, value: boolean | undefined): void {
+      if (value !== undefined && typeof value !== 'boolean') throw new TypeError('跨对话协作开关必须是布尔值。');
+      this.setRunAgentConfigValueForScope(scopeKind, scopeId, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, value);
+    },
+    /**
+     * Sets or removes one key of this scope's run_agent config (a collaboration limit or the
+     * cross-conversation switch). It never freezes unrelated inherited tool configuration or a tool
+     * list, and removing the last override drops a record left with nothing of its own.
+     */
+    setRunAgentConfigValueForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, key: string, value: number | boolean | undefined): void {
+      if (scopeKind !== 'global' && !scopeId?.trim()) return;
       const definition = this.toolDefinitions.find((tool) => tool.name === SUB_AGENT_TOOL_NAME);
       if (!definition?.configSchema?.fields.some((field) => field.key === key)) return;
       const local = this.localPolicyFor(scopeKind, scopeId).policy;
       if (value === undefined && local?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key] === undefined) return;
       const ownList = this.ownListFor(scopeKind, scopeId);
-      // A field override must not freeze unrelated inherited tool configuration or the tool list.
       const configs = cloneToolConfigs(local?.toolConfigs) ?? {};
       const entry = configs[SUB_AGENT_TOOL_NAME] ?? { config: {} };
       if (value === undefined) delete entry.config[key];
       else entry.config[key] = value;
       if (Object.keys(entry.config).length === 0 && Object.keys(entry).length === 1) delete configs[SUB_AGENT_TOOL_NAME];
       else configs[SUB_AGENT_TOOL_NAME] = entry;
-      this.saveOrDropLocalPolicy(scopeKind, scopeId, ownList, configs, undefined);
-    },
-    /**
-     * Stores the cross-conversation switch in this scope's run_agent config without changing what
-     * any other tool may do:
-     * - A scope with its own saved tool list gains the cross-conversation tools it lacks (only the
-     *   read-type ones when its effective list has no run_agent). The record remembers those
-     *   additions, and turning the switch off or restoring inheritance removes exactly them.
-     * - A scope without its own list gets a record with no list, which narrows nothing and keeps a
-     *   built-in Agent/workflow list in force, so the switch never freezes a new ceiling.
-     * Restoring inheritance drops a record that is left empty. Upper layers keep gating the tools.
-     */
-    setCrossConversationCollaborationForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, value: boolean | undefined): void {
-      if (scopeKind !== 'global' && !scopeId?.trim()) return;
-      if (value !== undefined && typeof value !== 'boolean') throw new TypeError('跨对话协作开关必须是布尔值。');
-      const definition = this.toolDefinitions.find((tool) => tool.name === SUB_AGENT_TOOL_NAME);
-      if (!definition?.configSchema?.fields.some((field) => field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY)) return;
-      const local = this.localPolicyFor(scopeKind, scopeId).policy;
-      if (value === undefined && local?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === undefined) return;
-      // The switch edits this scope's list by what the effective list allows, so an invalid list
-      // anywhere on the chain blocks it until that record is reset.
-      const listError = this.toolListErrorFor(scopeKind, scopeId);
-      if (listError) throw new TypeError(listError.text);
-      const configs = cloneToolConfigs(local?.toolConfigs) ?? {};
-      const entry = configs[SUB_AGENT_TOOL_NAME] ?? { config: {} };
-      if (value === undefined) delete entry.config[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY];
-      else entry.config[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] = value;
-      if (Object.keys(entry.config).length === 0 && Object.keys(entry).length === 1) delete configs[SUB_AGENT_TOOL_NAME];
-      else configs[SUB_AGENT_TOOL_NAME] = entry;
-
-      let allowedTools = this.ownListFor(scopeKind, scopeId);
-      let granted: string[] = [];
-      if (allowedTools) {
-        const previous = local?.crossConversationGrantedTools ?? [];
-        const current = allowedTools;
-        if (value === true) {
-          const added = this.crossConversationToolsFor(scopeKind, scopeId).expected.filter((name) => !current.includes(name));
-          allowedTools = [...current, ...added];
-          granted = uniqueNames([...previous.filter((name) => current.includes(name)), ...added]);
-        } else if (value === undefined && this.crossConversationOnWithoutOwnValue(scopeKind, scopeId)) {
-          // Restoring inheritance while another layer keeps the switch on for Turns this list
-          // bounds: this scope still needs the tools, and they stay marked so a later switch-off
-          // here removes them.
-          granted = previous.filter((name) => current.includes(name));
-        } else {
-          allowedTools = current.filter((name) => !previous.includes(name));
-        }
-      }
-      this.saveOrDropLocalPolicy(scopeKind, scopeId, allowedTools, configs, granted);
+      this.saveOrDropLocalPolicy(scopeKind, scopeId, ownList, configs);
     },
     /**
      * Saves this scope's record with the given list and configs, keeping its name, preset and
@@ -283,15 +253,36 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       scopeKind: ToolPolicyScopeKind,
       scopeId: string | undefined,
       allowedTools: string[] | undefined,
-      toolConfigs: Record<string, ToolPolicyToolConfigRecord>,
-      crossConversationGrantedTools: string[] | undefined
+      toolConfigs: Record<string, ToolPolicyToolConfigRecord>
     ): void {
       const local = this.localPolicyFor(scopeKind, scopeId).policy;
-      if (!allowedTools && isEmptyRecord(toolConfigs) && isEmptyRecord(local?.sourceConfigs) && local?.preset === undefined) {
+      const ownPreset = local?.preset !== undefined && !(scopeKind !== 'global' && local.preset === 'inherit');
+      if (!allowedTools && isEmptyRecord(toolConfigs) && isEmptyRecord(local?.sourceConfigs) && !ownPreset) {
         if (local) this.dropLocalPolicy(scopeKind, scopeId);
         return;
       }
-      this.setPolicyForScope(scopeKind, scopeId, allowedTools, local?.name, toolConfigs, cloneSourceConfigs(local?.sourceConfigs), local?.preset, crossConversationGrantedTools);
+      this.setPolicyForScope(scopeKind, scopeId, allowedTools, local?.name, toolConfigs, cloneSourceConfigs(local?.sourceConfigs), local?.preset);
+    },
+    /**
+     * 恢复继承 in the tool settings of a non-global scope: drops this scope's tool list, per-tool
+     * settings, MCP source settings and preset. What the Agent 协作 area sets here (the
+     * cross-conversation switch and the collaboration limits) stays, since that area restores each
+     * of them on its own. A record left with nothing else is removed.
+     */
+    restoreToolInheritance(scopeKind: ToolPolicyScopeKind, scopeId?: string): void {
+      if (scopeKind === 'global') return;
+      const local = this.localPolicyFor(scopeKind, scopeId).policy;
+      if (!local) return;
+      const collaboration: ToolConfigRecord = {};
+      const saved = cloneToolConfigRecord(local.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config);
+      for (const key of [...AGENT_COLLABORATION_CONFIG_KEYS, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY]) {
+        if (saved[key] !== undefined) collaboration[key] = saved[key];
+      }
+      if (Object.keys(collaboration).length === 0) {
+        this.dropLocalPolicy(scopeKind, scopeId);
+        return;
+      }
+      this.setPolicyForScope(scopeKind, scopeId, undefined, local.name, { [SUB_AGENT_TOOL_NAME]: { config: collaboration } }, {}, 'inherit');
     },
     localPolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ToolPolicyResolution {
       const clientState = useClientStateStore();
@@ -404,10 +395,6 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         ...(!local.policy ? { inheritedFrom: 'global' as const } : {})
       };
     },
-    /** This scope's switch-added tools minus the ones the user has now enabled explicitly. */
-    crossConversationGrantsWithout(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, enabledByUser: readonly string[]): string[] {
-      return (this.localPolicyFor(scopeKind, scopeId).policy?.crossConversationGrantedTools ?? []).filter((name) => !enabledByUser.includes(name));
-    },
     /**
      * What a tool-list edit at this scope starts from. A saved list is kept as it is, including
      * entries an upper layer blocks for now. A scope without a list starts from what the backend
@@ -463,28 +450,6 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         if (value !== undefined) return { value: value as ToolConfigValue, from: scope.scopeKind };
       }
       return undefined;
-    },
-    /**
-     * Whether the cross-conversation switch stays on for some Turn this scope's list bounds once the
-     * scope's own value is gone: an upper layer turns it on, or, since an Agent and a workflow run
-     * together, some workflow (at an Agent scope) or some Agent (at a workflow scope) turns it on
-     * over global.
-     */
-    crossConversationOnWithoutOwnValue(scopeKind: ToolPolicyScopeKind, scopeId?: string): boolean {
-      const key = CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY;
-      if (this.inheritedToolConfigValue(scopeKind, scopeId, SUB_AGENT_TOOL_NAME, key)?.value === true) return true;
-      const partner = scopeKind === 'agent' ? 'workflow' : scopeKind === 'workflow' ? 'agent' : undefined;
-      if (!partner) return false;
-      const clientState = useClientStateStore();
-      const globalValue = this.layerFor({ scopeKind: 'global' })?.policy.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key];
-      const partnerIds = uniqueNames([
-        ...clientState.builtinToolPolicies.filter((record) => record.scopeKind === partner).map((record) => record.scopeId),
-        ...clientState.toolPolicyScopeLinks
-          .filter((link) => link.role === 'active' && link.scopeKind === partner)
-          .map((link) => link.scopeId?.trim() ?? '')
-      ]);
-      return partnerIds.some((partnerId) =>
-        (this.layerFor({ scopeKind: partner, scopeId: partnerId })?.policy.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key] ?? globalValue) === true);
     },
     /**
      * The upper layer that turns one MCP source off for this scope (an all-sources deny counts),
@@ -547,21 +512,27 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       return Object.values(useReliableKernelClientFeedStore().records.ChildExecution ?? {})
         .some((child) => plainText(child.child_conversation_id) === id);
     },
-    crossConversationToolsFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): CrossConversationToolAvailability {
-      const allowed = this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools;
+    /**
+     * The backend's own rule over this scope's effective settings: the switch grants the tools to
+     * top-level conversations, and send, create and fork also need run_agent in the effective list.
+     */
+    crossConversationStateFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): CrossConversationState {
+      const policy = this.effectivePolicyFor(scopeKind, scopeId).policy;
+      const enabled = crossConversationSwitchOn(policy.toolConfigs);
       const known = new Set(useClientStateStore().toolDefinitions.map((tool) => tool.name));
-      // The backend's own rule: send, create and fork need run_agent in the same list.
-      const expected = CROSS_CONVERSATION_TOOL_NAMES.filter((name) => known.has(name) && crossConversationToolPermitted(allowed, name));
+      const child = scopeKind === 'conversation' && this.isChildConversation(scopeId);
       return {
-        sendTools: allowed.includes(SUB_AGENT_TOOL_NAME),
-        available: expected.filter((name) => allowed.includes(name)),
-        expected,
-        missing: expected.filter((name) => !allowed.includes(name))
+        enabled,
+        sendTools: policy.allowedTools.includes(SUB_AGENT_TOOL_NAME),
+        offered: enabled && !child
+          ? CROSS_CONVERSATION_TOOL_NAMES.filter((name) => known.has(name) && crossConversationToolPermitted(policy.allowedTools, name))
+          : []
       };
     },
     /**
-     * Saves one scope's record. `allowedTools` undefined saves a record without a list. The record's
-     * switch-granted tools carry over (limited to the new list) unless the caller states them.
+     * Saves one scope's record. `allowedTools` undefined saves a record without a list. A list never
+     * holds the cross-conversation tools: the switch grants them and the backend ignores their names
+     * in lists, so a save drops them.
      */
     setPolicyForScope(
       scopeKind: ToolPolicyScopeKind,
@@ -570,29 +541,23 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       name?: string,
       toolConfigs?: Record<string, ToolPolicyToolConfigRecord>,
       sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>,
-      preset?: ToolPolicyPresetKind,
-      crossConversationGrantedTools?: string[]
+      preset?: ToolPolicyPresetKind
     ): void {
       const clientState = useClientStateStore();
       const validNames = new Set(clientState.toolDefinitions.map((tool) => tool.name));
       const sanitized = allowedTools
         ?.map((tool) => tool.trim())
-        .filter((tool, index, list) => !!tool && validNames.has(tool) && list.indexOf(tool) === index);
-      const granted = sanitized
-        ? uniqueNames(crossConversationGrantedTools ?? this.localPolicyFor(scopeKind, scopeId).policy?.crossConversationGrantedTools ?? [])
-          .filter((tool) => sanitized.includes(tool))
-        : [];
+        .filter((tool, index, list) => !!tool && validNames.has(tool) && !isSwitchGrantedTool(tool) && list.indexOf(tool) === index);
 
       const plainToolConfigs = cloneToolConfigs(toolConfigs);
       const plainSourceConfigs = cloneSourceConfigs(sourceConfigs);
-      this.applyOptimisticPolicyScopeSet(scopeKind, scopeId, sanitized, name, plainToolConfigs, plainSourceConfigs, preset, granted);
+      this.applyOptimisticPolicyScopeSet(scopeKind, scopeId, sanitized, name, plainToolConfigs, plainSourceConfigs, preset);
 
       const payload: ToolPolicyScopeSetPayload = {
         scopeKind,
         ...(scopeIdFor(scopeKind, scopeId) ? { scopeId: scopeIdFor(scopeKind, scopeId) } : {}),
         ...(name?.trim() ? { name: name.trim() } : {}),
         ...(sanitized ? { allowedTools: sanitized } : {}),
-        ...(granted.length > 0 ? { crossConversationGrantedTools: granted } : {}),
         ...(preset !== undefined ? { preset } : {}),
         ...(plainToolConfigs !== undefined ? { toolConfigs: plainToolConfigs } : {}),
         ...(plainSourceConfigs !== undefined ? { sourceConfigs: plainSourceConfigs } : {})
@@ -631,8 +596,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       name?: string,
       toolConfigs?: Record<string, ToolPolicyToolConfigRecord>,
       sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>,
-      preset?: ToolPolicyPresetKind,
-      crossConversationGrantedTools: string[] = []
+      preset?: ToolPolicyPresetKind
     ): void {
       const clientState = useClientStateStore();
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
@@ -644,7 +608,6 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         id: policyId,
         name: name?.trim() || existingPolicy?.name || defaultPolicyName(scopeKind),
         ...(allowedTools ? { allowedTools: [...allowedTools] } : {}),
-        ...(crossConversationGrantedTools.length > 0 ? { crossConversationGrantedTools: [...crossConversationGrantedTools] } : {}),
         ...(preset !== undefined || existingPolicy?.preset !== undefined ? { preset: preset ?? existingPolicy?.preset } : {}),
         ...(toolConfigs !== undefined
           ? { toolConfigs: cloneToolConfigs(toolConfigs) ?? {} }
