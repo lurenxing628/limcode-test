@@ -572,10 +572,15 @@ function openAIReasoningCapability(modelId: string): ModelReasoningCapability {
   };
 }
 
+/**
+ * Claude 思考族（https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting 按模型表）：
+ * adaptive-only 拒绝 `enabled`；Fable/Mythos/Opus 5.5 始终开启、拒绝 `disabled`；4.5 及更早只有 extended、拒绝 `adaptive`。
+ * Claude Opus 5.5（https://platform.claude.com/docs/en/models/opus-5-5/overview）：adaptive 始终开启，五档 effort，默认 medium。
+ */
 function anthropicReasoningCapability(modelId: string): ModelReasoningCapability {
   const id = modelId.toLowerCase().replace(/-\d{8}$/, '');
   const adaptiveOnly = ['claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5', 'claude-mythos-5-1',
-    'claude-opus-5', 'claude-opus-4-7', 'claude-opus-4-8', 'claude-sonnet-5'];
+    'claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-7', 'claude-opus-4-8', 'claude-sonnet-5'];
   const hybrid = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-mythos-preview'];
   const extended = ['claude-opus-4-5', 'claude-sonnet-4-5', 'claude-haiku-4-5',
     'claude-opus-4', 'claude-opus-4-1', 'claude-sonnet-4', 'claude-3-7-sonnet'];
@@ -583,22 +588,29 @@ function anthropicReasoningCapability(modelId: string): ModelReasoningCapability
     : hybrid.includes(id) ? 'anthropic_hybrid'
     : extended.includes(id) ? 'anthropic_extended' : undefined;
   if (!family) return unknownReasoningCapability();
-  const alwaysOn = id.startsWith('claude-fable-') || id.startsWith('claude-mythos-');
+  const alwaysOn = id.startsWith('claude-fable-') || id.startsWith('claude-mythos-') || id === 'claude-opus-5-5';
   const levels: LlmThinkingLevel[] = family === 'anthropic_extended'
     ? id === 'claude-opus-4-5' ? ['low', 'medium', 'high'] : []
     : ['low', 'medium', 'high', ...(adaptiveOnly.includes(id) ? ['xhigh' as const] : []), 'max'];
+  const defaultLevel: LlmThinkingLevel = id === 'claude-opus-5-5' ? 'medium' : 'high';
   return {
-    family, levels, ...(levels.length ? { defaultLevel: 'high' as const } : {}),
+    family, levels, ...(levels.length ? { defaultLevel } : {}),
     supportsBudget: family !== 'anthropic_adaptive', canDisable: !alwaysOn, alwaysOn,
     outputLimitIncludesThinking: true, requiresThoughtSignatures: true,
     ...(family !== 'anthropic_adaptive' ? { minBudgetTokens: 1024 } : {})
   };
 }
 
+/** 按模型 id 查 Claude 思考族（与端点无关）；不在能力表里的模型返回 undefined。 */
+export function anthropicModelReasoningCapability(modelId: string): ModelReasoningCapability | undefined {
+  const capability = anthropicReasoningCapability(modelId.trim());
+  return capability.family === 'none' ? undefined : capability;
+}
+
 function anthropicNativeCompactionCapability(modelId: string): ModelNativeCompactionCapability {
   const id = modelId.toLowerCase().replace(/-\d{8}$/, '');
   const supported = ['claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5', 'claude-mythos-5-1',
-    'claude-mythos-preview', 'claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7',
+    'claude-mythos-preview', 'claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7',
     'claude-opus-4-6', 'claude-sonnet-5', 'claude-sonnet-4-6'].includes(id);
   return supported
     ? { kind: 'anthropic_messages', availability: 'documented', reason: '官方文档列出的按需签名压缩模型；尚未实时探测。' }

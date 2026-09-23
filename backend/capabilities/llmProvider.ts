@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import { discoverAnthropicModels } from './modelCapabilityDiscovery';
 import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
-import { resolveProviderModelCapabilities } from '../../shared/modelCapabilities';
+import { anthropicModelReasoningCapability, resolveProviderModelCapabilities } from '../../shared/modelCapabilities';
 import { frozenSummaryReasoning, summaryRequestBody } from './summaryReasoning';
 import { associateDebugCapture, captureDebug, debugCaptureSources, debugSource, DebugHttpObservation, getDebugCaptureContext, type DebugCaptureRecorder } from '../reliableKernel/debugCapture/observer';
 import {
@@ -15,6 +15,7 @@ import { createTerminalValidatedFetch } from './terminalValidatedFetch';
 import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
 import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 import { installProviderCompatibility } from './geminiProviderAdaptation';
+import { adaptClaudeThinkingForFamily, claudeThinkingFamilyProfile, type ClaudeThinkingFamilyProfile } from './claudeThinkingAdaptation';
 import {
   applyLearnedRequestAdaptations,
   createProviderRequestAdaptationRetry,
@@ -4522,10 +4523,26 @@ function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderReque
   return { providerConfigId: settings.id, provider: settings.provider, baseUrl: settings.baseUrl, model: settings.model };
 }
 
-/** 编码后请求的最终适配：按目标记住的不支持参数与 Claude 保留思考处理（进程内）。 */
+/**
+ * 编码后请求的最终适配：先按 Claude 模型族改写思考类型（静态），再应用按目标记住的
+ * 不支持参数与 Claude 保留思考处理（进程内学习）。
+ */
 function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord): T {
   const target = providerRequestTarget(settings);
-  return installEncodedRequestPostProcessor(provider, (request) => applyLearnedRequestAdaptations(request, target));
+  const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
+  return installEncodedRequestPostProcessor(provider, (request) => applyLearnedRequestAdaptations(
+    claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking) : request,
+    target
+  ));
+}
+
+/**
+ * Claude 思考族：先用该渠道/模型已确认的能力快照（官方端点的能力表或 Models API 结果），
+ * 网关端点再按模型 id 查能力表；不在能力表里的模型不改写。
+ */
+function claudeThinkingProfileForSettings(settings: LlmProviderConfigRecord): ClaudeThinkingFamilyProfile | undefined {
+  return claudeThinkingFamilyProfile(resolveProviderModelCapabilities(settings, settings.model).reasoning)
+    ?? claudeThinkingFamilyProfile(anthropicModelReasoningCapability(settings.model));
 }
 
 function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmProviderConfigRecord {

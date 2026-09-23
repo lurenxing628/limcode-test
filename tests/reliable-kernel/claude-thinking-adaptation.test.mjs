@@ -233,3 +233,86 @@ test('C2 原生压缩路径：前缀失配同样立即以 drop_block 重试', as
   });
   resetProviderRequestAdaptations();
 });
+
+// C3：https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting 按模型的思考类型表。
+test('C3 能力表：Claude Opus 5.5 按官方模型页登记为始终开启的 adaptive 模型', async () => {
+  const { anthropicModelReasoningCapability, resolveModelCapabilities } = await import('../../dist/extension/shared/modelCapabilities.js');
+  const opus55 = anthropicModelReasoningCapability('claude-opus-5-5');
+  assert.equal(opus55.family, 'anthropic_adaptive');
+  assert.equal(opus55.alwaysOn, true);
+  assert.equal(opus55.canDisable, false);
+  assert.deepEqual(opus55.levels, ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(opus55.defaultLevel, 'medium');
+  const official = resolveModelCapabilities({ provider: 'claude', baseUrl: 'https://api.anthropic.com', modelId: 'claude-opus-5-5' });
+  assert.equal(official.reasoning.family, 'anthropic_adaptive');
+  assert.equal(official.nativeCompaction.kind, 'anthropic_messages');
+  assert.equal(anthropicModelReasoningCapability('claude-opus-5').alwaysOn, false, 'Opus 5 仍可关闭思考');
+  assert.equal(anthropicModelReasoningCapability('claude-next-9'), undefined);
+});
+
+test('C3 思考类型改写：extended 不收 adaptive、4.7+ 不收 enabled、始终开启的模型不收 disabled', async () => {
+  const { anthropicModelReasoningCapability } = await import('../../dist/extension/shared/modelCapabilities.js');
+  const { adaptClaudeThinkingForFamily, claudeThinkingFamilyProfile } = await import('../../dist/extension/backend/capabilities/claudeThinkingAdaptation.js');
+  const profile = (model) => claudeThinkingFamilyProfile(anthropicModelReasoningCapability(model));
+  const adapt = (model, body, canonicalRequest) => adaptClaudeThinkingForFamily({ body, headers: {}, canonicalRequest }, profile(model)).body;
+  const adaptive = (effort) => ({ model: 'm', max_tokens: 1000, thinking: { type: 'adaptive' }, output_config: { effort }, messages: [] });
+
+  // extended-only：不编造 adaptive；没有用户预算就不发 thinking；effort 只保留该模型支持的档位。
+  assert.deepEqual(adapt('claude-sonnet-4-5', adaptive('high')), { model: 'm', max_tokens: 1000, messages: [] });
+  assert.deepEqual(adapt('claude-haiku-4-5-20251001', adaptive('low')), { model: 'm', max_tokens: 1000, messages: [] });
+  assert.deepEqual(adapt('claude-opus-4-5', adaptive('high')), { model: 'm', max_tokens: 1000, output_config: { effort: 'high' }, messages: [] });
+  assert.deepEqual(adapt('claude-opus-4-5', adaptive('max')), { model: 'm', max_tokens: 1000, messages: [] });
+  assert.deepEqual(adapt('claude-sonnet-4-5', adaptive('high'), { generationConfig: { thinkingConfig: { thinkingLevel: 'high', thinkingBudget: 4096 } } }),
+    { model: 'm', max_tokens: 1000, thinking: { type: 'enabled', budget_tokens: 4096 }, messages: [] });
+
+  // adaptive-only（4.7+）：enabled → adaptive，去掉 budget_tokens，已有 effort 不动。
+  assert.deepEqual(adapt('claude-opus-4-7', { model: 'm', thinking: { type: 'enabled', budget_tokens: 8000, display: 'summarized' } }),
+    { model: 'm', thinking: { type: 'adaptive', display: 'summarized' } });
+  assert.deepEqual(adapt('claude-sonnet-5', { model: 'm', thinking: { type: 'enabled', budget_tokens: 2048 }, output_config: { effort: 'low' } }),
+    { model: 'm', thinking: { type: 'adaptive' }, output_config: { effort: 'low' } });
+
+  // 始终开启：省略 thinking。
+  for (const model of ['claude-opus-5-5', 'claude-fable-5-1', 'claude-fable-5', 'claude-mythos-5-1', 'claude-mythos-preview']) {
+    assert.deepEqual(adapt(model, { model: 'm', thinking: { type: 'disabled' }, max_tokens: 10 }), { model: 'm', max_tokens: 10 }, model);
+  }
+
+  // 已被接受的组合保持同一引用。
+  const accepted = [
+    ['claude-opus-5', { thinking: { type: 'disabled' } }],
+    ['claude-sonnet-5', { thinking: { type: 'disabled' } }],
+    ['claude-opus-4-7', { thinking: { type: 'disabled' } }],
+    ['claude-opus-4-6', { thinking: { type: 'enabled', budget_tokens: 2048 } }],
+    ['claude-opus-4-6', adaptive('high')],
+    ['claude-sonnet-4-5', { thinking: { type: 'enabled', budget_tokens: 2048 } }],
+    ['claude-opus-5-5', adaptive('xhigh')]
+  ];
+  for (const [model, body] of accepted) {
+    const request = { body, headers: {} };
+    assert.equal(adaptClaudeThinkingForFamily(request, profile(model)), request, model);
+  }
+  assert.equal(profile('claude-next-9'), undefined, '不在能力表里的模型保持现状');
+});
+
+test('C3 聊天路径：网关上的 Claude 请求同样按模型族改写，能力表外的模型原样发送', async () => {
+  const contents = [{ role: 'user', parts: [{ text: 'hi' }] }];
+  const dry = async (model, generationConfig) => (await dryRunLlmProvider({ id: `dry-${model}`, conversationId: 'c3', contents, tools: [] },
+    { settings: async () => claudeSettings('https://gateway.example/v1', { id: `c3-${model}`, model, generationConfig }) })).body;
+
+  const sonnet45 = await dry('claude-sonnet-4-5', { thinkingConfig: { thinkingLevel: 'high' } });
+  assert.equal(sonnet45.thinking, undefined);
+  assert.equal(sonnet45.output_config, undefined);
+  const sonnet45Budget = await dry('claude-sonnet-4-5', { thinkingConfig: { thinkingLevel: 'high', thinkingBudget: 3000 } });
+  assert.deepEqual(sonnet45Budget.thinking, { type: 'enabled', budget_tokens: 3000 });
+  const opus55 = await dry('claude-opus-5-5', { thinkingConfig: { thinkingLevel: 'none' } });
+  assert.equal(opus55.thinking, undefined);
+  const opus47 = await dry('claude-opus-4-7', { thinkingConfig: { thinkingBudget: 4096 } });
+  assert.deepEqual(opus47.thinking, { type: 'adaptive' });
+
+  // 原本正确的请求逐字节不变。
+  const opus46 = await dry('claude-opus-4-6', { thinkingConfig: { thinkingLevel: 'high' } });
+  assert.deepEqual(opus46.thinking, { type: 'adaptive' });
+  assert.deepEqual(opus46.output_config, { effort: 'high' });
+  const custom = await dry('claude-custom-model', { thinkingConfig: { thinkingLevel: 'high' } });
+  assert.deepEqual(custom.thinking, { type: 'adaptive' });
+  assert.deepEqual(custom.output_config, { effort: 'high' });
+});
