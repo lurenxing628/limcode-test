@@ -647,7 +647,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   const appendAttachmentState = (segmentId: string, toolResults = false): void => {
     attachmentPlacements.leave(toolResults, renderedAttachmentState.afterSegment.get(segmentId));
   };
-  for (const item of request.context) {
+  for (const item of nativeResultsAfterTheirCalls(request.context, provider)) {
     const pairContents = item.segmentKind === 'tool_pair'
       ? toolPairContents(item.content, modelHandleCatalog)
       : undefined;
@@ -1132,6 +1132,8 @@ function compressionContext(
     current.push(content);
     contents.push(content);
   });
+  // Summary inputs render calls and results as text, and native compact is Responses-only, so the
+  // Chat reordering of late native results (nativeResultsAfterTheirCalls) does not apply here.
   for (const item of sourceContext) {
     const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
     const pairContents = item.segmentKind === 'tool_pair'
@@ -1459,6 +1461,61 @@ function decodeFrozenCurrentTurnInput(content: string, contentType: string): Mes
   if (decoded) return decoded;
   if (contentType.split(';', 1)[0].trim().toLowerCase() !== 'text/plain') return undefined;
   return { role: 'user', parts: [{ text: content }] };
+}
+
+/** Providers speaking Chat Completions, where every `tool` message must follow the assistant `tool_calls` it answers. */
+const CHAT_COMPLETIONS_PROVIDERS: ReadonlySet<LlmProviderKind> = new Set<LlmProviderKind>(['openai-compatible', 'deepseek']);
+
+/**
+ * A native (Responses) call is stored as its own call occurrence, and its result as a separate
+ * occurrence appended when the result was delivered, possibly after other items (an async call).
+ * Chat Completions rejects an assistant `tool_calls` message that is not directly followed by a
+ * `tool` message for each call, so when such a history is sent to a Chat provider, each result that
+ * came later is moved to right after its own call occurrence. Responses, Claude and Gemini keep the
+ * chronological native placement. Only this outgoing order changes; the stored Context does not, and
+ * a window without a late native result is returned as it is.
+ */
+function nativeResultsAfterTheirCalls<T extends Pick<FullProviderContextItem, 'segmentKind' | 'content'>>(
+  items: readonly T[],
+  provider: LlmProviderKind
+): readonly T[] {
+  if (!CHAT_COMPLETIONS_PROVIDERS.has(provider)) return items;
+  const nativeOccurrences = items.map((item) => nativeToolOccurrence(item));
+  const resultIndexByCall = new Map<string, number>();
+  nativeOccurrences.forEach((occurrence, index) => {
+    if (occurrence?.kind === 'result') resultIndexByCall.set(occurrence.toolCallId, index);
+  });
+  if (resultIndexByCall.size === 0) return items;
+  const moved = new Set<number>();
+  const ordered: T[] = [];
+  items.forEach((item, index) => {
+    if (moved.has(index)) return;
+    ordered.push(item);
+    const occurrence = nativeOccurrences[index];
+    const resultIndex = occurrence?.kind === 'call' ? resultIndexByCall.get(occurrence.toolCallId) : undefined;
+    if (resultIndex !== undefined && resultIndex > index + 1) {
+      ordered.push(items[resultIndex]);
+      moved.add(resultIndex);
+    }
+  });
+  return moved.size > 0 ? ordered : items;
+}
+
+/** The native call or result occurrence a tool_pair item holds, by its kernel ToolCall id. */
+function nativeToolOccurrence(
+  item: Pick<FullProviderContextItem, 'segmentKind' | 'content'>
+): { kind: 'call' | 'result'; toolCallId: string } | undefined {
+  if (item.segmentKind !== 'tool_pair') return undefined;
+  let pair: Record<string, unknown> | undefined;
+  try {
+    pair = asRecord(JSON.parse(item.content));
+  } catch {
+    return undefined;
+  }
+  if (pair?.native !== true) return undefined;
+  const toolCallId = optionalText(asRecord(pair.toolCall)?.id);
+  if (!toolCallId) return undefined;
+  return { kind: pair.toolModelResult === undefined ? 'call' : 'result', toolCallId };
 }
 
 function toolPairContents(

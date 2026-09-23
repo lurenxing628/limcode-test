@@ -236,3 +236,74 @@ test('the token estimate projects a parallel batch with the same catalog placeme
   } }, async ({ turn }) => { await turn('take a screenshot'); });
   assert.equal(checked, true);
 });
+
+/**
+ * A native (Responses) history after a switch of model: the async call `call_async` is stored as its
+ * own call occurrence and its result as a later occurrence, after the synchronous `call_list` exchange.
+ */
+function nativeHistoryRequest(providerKind, modelId, { lateResult = true } = {}) {
+  const segment = (segmentId, segmentKind, messageRole, content, contentType = 'application/vnd.limcode.message+json') =>
+    ({ segmentId, segmentKind, messageRole, contentType, content: JSON.stringify(content) });
+  const asyncCall = { id: 'tool-call-async', providerCallId: 'call_async', responseId: 'resp-1', async: true, callSeq: '1',
+    toolName: 'srv_shot', argumentsContentType: 'application/json', arguments: '{}' };
+  const pairType = 'application/vnd.limcode.context-tool-pair+json';
+  const nativeCall = segment('native-call', 'tool_pair', null, { kind: 'tool_pair', native: true, toolCall: asyncCall }, pairType);
+  const nativeResult = segment('native-result', 'tool_pair', null, { kind: 'tool_pair', native: true, toolCall: asyncCall,
+    toolModelResult: { id: 'result-async', messageRevisionId: 'revision-async', resultContentType: 'application/json', result: '{"status":"succeeded"}' } }, pairType);
+  const exchange = [
+    segment('list-call', 'message', 'model', { role: 'model', parts: [{ id: 'call_list', functionCall: { name: 'srv_list', args: {} } }] }),
+    segment('list-result', 'tool_pair', null, { kind: 'tool_pair',
+      toolCall: { id: 'tool-call-list', providerCallId: 'call_list', callSeq: '2', toolName: 'srv_list', argumentsContentType: 'application/json', arguments: '{}' },
+      toolModelResult: { id: 'result-list', messageRevisionId: 'revision-list', resultContentType: 'application/json', result: '{"status":"succeeded"}' } }, pairType),
+    segment('waiting', 'message', 'model', { role: 'model', parts: [{ text: 'Waiting for the job.' }] })
+  ];
+  return {
+    kind: 'full-model-request', modelRequestId: 'model-request-native-history', conversationId: 'conversation-native-history',
+    attemptSeq: '1', socketGeneration: '1', providerId: 'provider-config', modelId,
+    authoritySnapshot: {
+      model: { providerConfigId: 'provider-config', provider: providerKind, modelId },
+      toolPolicy: { allowedTools: ['srv_shot', 'srv_list'], preset: 'custom' }
+    },
+    recipe: { tools: ['srv_shot', 'srv_list'].map(name => ({ name, description: name, parameters: { type: 'object', properties: {} } })) },
+    context: [
+      segment('start', 'message', 'user', { role: 'user', parts: [{ text: 'start the long job and meanwhile list' }] }),
+      nativeCall,
+      ...(lateResult ? [...exchange, nativeResult] : [nativeResult, ...exchange]),
+      segment('next', 'message', 'user', { role: 'user', parts: [{ text: 'is it done?' }] })
+    ],
+    attachmentCatalogState: { catalog: [], placements: [] }
+  };
+}
+
+async function projectNativeHistory(providerKind, modelId, options) {
+  let start;
+  await new kernel.LlmCapabilityFullRequestAdapter('provider-config', {
+    start(input, emit) { start = input; emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
+  }).sendFullRequest(nativeHistoryRequest(providerKind, modelId, options), { async onEvent() { return { accepted: true, terminal: true, checkpointed: true }; } });
+  const settings = { ...createDefaultLlmProviderConfig({ name: 'native history' }), id: 'provider-config', provider: providerKind,
+    baseUrl: providerKind === 'deepseek' ? 'https://api.deepseek.com' : 'https://api.openai.com/v1', model: modelId, apiKey: '' };
+  const unified = start.contents.map(content => `${content.role === 'model' ? 'a' : 'u'}:${content.parts.map(part =>
+    part.functionCall ? `call=${part.id}` : part.functionResponse ? `result=${part.id}` : 'text').join('+')}`);
+  return { unified, wire: wireShape((await dryRunLlmProvider(start, { settings })).body) };
+}
+
+for (const [providerKind, modelId] of [['openai-compatible', 'gpt-5.5'], ['deepseek', 'deepseek-v4-flash']]) {
+  test(`${providerKind}: a native async result that arrived later is sent right after its call`, async () => {
+    // Before: `assistant tool_calls=[call_async]` was followed by another assistant message, and
+    // `tool call_async` came four messages later, which Chat Completions rejects.
+    assert.deepEqual((await projectNativeHistory(providerKind, modelId)).wire,
+      ['u:text', 'a:calls=call_async', 't:call_async', 'a:calls=call_list', 't:call_list', 'a:text', 'u:text']);
+    // A result that already follows its call is sent exactly as before.
+    assert.deepEqual((await projectNativeHistory(providerKind, modelId, { lateResult: false })).wire,
+      ['u:text', 'a:calls=call_async', 't:call_async', 'a:calls=call_list', 't:call_list', 'a:text', 'u:text']);
+  });
+}
+
+test('Responses, Claude and Gemini targets keep the chronological native placement', async () => {
+  const chronological = ['u:text', 'a:call=call_async', 'a:call=call_list', 'u:result=call_list', 'a:text', 'u:result=call_async', 'u:text'];
+  for (const [providerKind, modelId] of [['openai-responses', 'gpt-5.5'], ['claude', 'claude-sonnet-5'], ['gemini', 'gemini-3.5-flash']]) {
+    assert.deepEqual((await projectNativeHistory(providerKind, modelId)).unified, chronological, providerKind);
+  }
+  assert.deepEqual((await projectNativeHistory('openai-responses', 'gpt-5.5')).wire,
+    ['u:text', 'a:call=call_async', 'a:call=call_list', 't:call_list', 'a:text', 't:call_async', 'u:text']);
+});
