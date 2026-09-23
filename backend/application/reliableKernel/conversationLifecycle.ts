@@ -274,6 +274,9 @@ export class ReliableConversationLifecycle {
       message_id: messageId
     }, 2);
     if (memberships.length !== 1) throw new ConversationForkRejectedError('Fork 源 Message 不属于当前 Conversation。');
+    if ((await this.requireRow('Message', messageId)).deleted_at !== null) {
+      throw new ConversationForkRejectedError('分支点消息已被删除，无法从这条消息创建分支。');
+    }
     const boundaryMessageSeq = memberships[0].message_seq;
     if (typeof boundaryMessageSeq !== 'bigint') throw new TypeError('MessagePartOfConversation.message_seq 必须是整数。');
     const turnLinks = (await this.application.database.snapshotAll(

@@ -620,22 +620,6 @@ async function checkConversationForkLinks() {
     assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-stale' })).length, 0);
     faults.push('stale expected source head');
 
-    await seeded.control.delete({
-      source: { kind: 'command', key: 'fork-soft-delete-source' },
-      conversationId: seeded.conversationId,
-      messageId: seeded.messageId
-    });
-    const historical = await forks.fork({
-      ...baseCommand,
-      idempotencyKey: 'fork-historical',
-      reuseKey: 'reuse-fork-historical',
-      expectedSourceHeadRootId: undefined,
-      targetTitle: 'Historical fork'
-    });
-    assert.equal((await get(ctx.database, 'Message', seeded.messageId)).deleted_at !== null, true);
-    assert.equal((await get(ctx.database, 'ContextSequenceRoot', historical.targetRootId)).root_node_id, sourceRoot.root_node_id);
-    assertions.push('Message soft-delete后仍可按immutable历史MessageRevision/root fork，不读取当前删除状态重解释历史');
-
     const concurrent = await Promise.all(['left', 'right'].map((side) => forks.fork({
       ...baseCommand,
       idempotencyKey: `fork-${side}`,
@@ -654,6 +638,23 @@ async function checkConversationForkLinks() {
     metrics.concurrentForks = concurrent.length;
     metrics.sharedPrefixCopiedNodes = 0;
     assertions.push('同一parent并发fork创建独立target且均引用同一共享前缀，没有复制历史正文或节点');
+    await seeded.control.delete({
+      source: { kind: 'command', key: 'fork-soft-delete-source' },
+      conversationId: seeded.conversationId,
+      messageId: seeded.messageId
+    });
+    await assert.rejects(forks.fork({
+      ...baseCommand,
+      idempotencyKey: 'fork-historical',
+      reuseKey: 'reuse-fork-historical',
+      expectedSourceHeadRootId: undefined,
+      targetTitle: 'Historical fork'
+    }), /outside the copied current transcript/);
+    assert.equal((await get(ctx.database, 'Message', seeded.messageId)).deleted_at !== null, true);
+    assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-historical' })).length, 0);
+    faults.push('fork point soft-deleted after selection');
+    assertions.push('分支只复制可见转录：分支点消息软删除后按旧Revision分支被拒绝且不写复用关系（应用层另以ConversationForkRejectedError永久拒绝）');
+
     return { assertions, faults, metrics };
   });
 }

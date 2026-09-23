@@ -689,6 +689,13 @@ test('permanent fork failures are rejections that leave no target or copied sett
     assert.deepEqual(await strayConversationSettings(h.configuration, ['source', first.conversationId]), []);
     const config = await h.configuration.configurationClientState();
     assert.ok(config.systemPromptScopeLinks.some(link => link.scopeKind === 'conversation' && link.scopeId === first.conversationId));
+    // A message deleted after the user clicked fork is a permanent rejection, not a generic error.
+    await h.turn('source', 'rejection-deleted-input');
+    const deleted = await h.command('source', 'rejection-deleted', 'user');
+    await h.app.turns.delete({ source: { kind: 'command', key: 'delete-fork-point' }, conversationId: 'source', messageId: deleted.messageId });
+    await assert.rejects(h.facade.forkConversation(deleted), rejected(/已被删除/));
+    assert.equal((await rows(h.app, 'Conversation')).length, 2);
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source', first.conversationId]), []);
   });
 });
 
