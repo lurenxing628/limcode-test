@@ -232,6 +232,7 @@ export function resolveModelToolArguments(
   const args = cloneValue(argumentsInput);
   const record = asRecord(args);
   if (!record) return args;
+  dropEmptyReferenceArguments(record);
 
   if (isCollaborationHandleTool(toolName)) {
     resolveCollaborationArguments(toolName, record, catalog);
@@ -504,6 +505,23 @@ function requireText(value: unknown, label: string): string {
   const text = optionalText(value);
   if (!text) throw new TypeError(`${label} must be non-empty text.`);
   return text;
+}
+
+/**
+ * Models under provider-side strict schema normalization (Responses without `strict:false`, or relays
+ * that translate Chat Completions into Responses) must fill every optional field, so an unused
+ * reference arrives as "" or [""]. An empty reference names nothing: treat it as omitted. Tools whose
+ * reference is required still fail on the missing field, so this never selects a different target.
+ */
+function dropEmptyReferenceArguments(record: Record<string, unknown>): void {
+  const empty = (value: unknown) => value === null || (typeof value === 'string' && value.trim() === '');
+  for (const [key, value] of Object.entries(record)) {
+    if (key.endsWith('Ref') && empty(value)) {
+      delete record[key];
+    } else if (key.endsWith('Refs') && Array.isArray(value) && value.every(empty)) {
+      delete record[key];
+    }
+  }
 }
 
 function optionalText(value: unknown): string | undefined {

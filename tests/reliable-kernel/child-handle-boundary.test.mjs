@@ -25,15 +25,25 @@ test('multi-child wait resolves all frozen references without changing caller in
 
 test('invalid or conflicting child references cannot silently select a different child', () => {
   for (const args of [
-    { childRef: '' }, { childRef: 1 }, { childRef: 'A3' },
+    { childRef: 1 }, { childRef: 'A3' },
     { childRef: 'A1', answerBridgeId: 'bridge-second' },
-    { childRefs: [] }, { childRefs: ['A1', 'A3'] },
+    { childRefs: ['A1', ''] }, { childRefs: ['A1', 'A3'] },
     { childRefs: ['A1'], answerBridgeIds: ['bridge-second'] },
     { childRefs: Array(33).fill('A1') }
   ]) {
     assert.throws(() => resolveModelToolArguments('run_agent', { operation: 'send', ...args }, catalog),
       error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
   }
+});
+
+test('empty child references from strict-schema models count as omitted and never pick a child', () => {
+  // Strict schema normalization makes models fill unused optional fields with "" or [""].
+  for (const args of [{ childRef: '' }, { childRef: null }, { childRefs: [] }, { childRefs: [''] }]) {
+    assert.deepEqual(resolveModelToolArguments('run_agent', { operation: 'send', prompt: 'p', ...args }, catalog),
+      { operation: 'send', prompt: 'p' });
+  }
+  assert.deepEqual(resolveModelToolArguments('run_agent', { operation: 'wait', childRef: '', childRefs: ['A1'], timeoutMs: 0 }, catalog),
+    { operation: 'wait', answerBridgeIds: ['bridge-first'], timeoutMs: 0 });
 });
 
 test('a squeezed parallel read preserves its current-page retry cursor as well as the next cursor', () => {

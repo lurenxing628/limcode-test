@@ -25,7 +25,9 @@ test('collaboration short references retain distinct kinds, do not expose canoni
   assert.deepEqual(resolveModelToolArguments('agent_board', { operation: 'post', channelRef: 'H1', notifyConversationRefs: ['C1'] }, catalog), {
     operation: 'post', channelId: 'channel-one', notifyConversationIds: ['peer-one']
   });
-  for (const args of [{ conversationRef: 'C99' }, { conversationRef: 'M1' }, { conversationRef: '' },
+  // An empty reference counts as omitted (strict-schema models fill unused fields with "").
+  assert.deepEqual(resolveModelToolArguments('send_agent_message', { conversationRef: '', text: 'hello', replyToMessageRef: '' }, catalog), { text: 'hello' });
+  for (const args of [{ conversationRef: 'C99' }, { conversationRef: 'M1' },
     { conversationRef: 1 }, { targetConversationId: 'peer-one' }, { conversationRef: 'C1', targetConversationId: 'peer-one' }]) {
     assert.throws(() => resolveModelToolArguments('send_agent_message', args, catalog), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
   }
