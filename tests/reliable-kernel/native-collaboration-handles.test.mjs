@@ -305,7 +305,13 @@ test('native fork_conversation runs through the dispatcher and its frozen refere
   };
   try {
     app = await kernel.ReliableKernelApplication.open(root, dependencies);
-    const lifecycle = new ReliableConversationLifecycle({ application: app, configuration: { mutations: { async copyConversationConfiguration() {} } } });
+    // The Conversation-layer settings store as the fork lifecycle uses it: a copy before the
+    // branch commits and a cleanup after a permanent rejection.
+    const settings = [];
+    const lifecycle = new ReliableConversationLifecycle({ application: app, configuration: { mutations: {
+      async copyConversationConfiguration(source, target) { settings.push(['copy', source, target]); },
+      async clearConversationConfiguration(target) { settings.push(['clear', target]); }
+    } } });
     collaborationTools = new CollaborationToolDispatcher({ database: app.database, contentStore: app.contentStore,
       effects: app.runtime.effects, collaboration: app.runtime.collaboration, conversations: lifecycle });
     const now = new Date().toISOString();
@@ -322,6 +328,7 @@ test('native fork_conversation runs through the dispatcher and its frozen refere
     const forkId = kernel.stablePhaseFId('conversation', `conversation-fork:${forkSource.tool_call_id}`);
     const [branch] = await rows(app, 'ConversationBranchLink', { target_conversation_id: forkId });
     assert.equal(branch.source_conversation_id, 'native-fork-dispatch-parent');
+    assert.deepEqual(settings, [['copy', 'native-fork-dispatch-parent', forkId]], 'the native fork copies the conversation settings once');
     assert.deepEqual(await rows(app, 'Turn', { conversation_id: forkId, status: 'active' }), [], 'the fork starts no Turn');
     const transcript = (await app.runtime.collaboration.readConversation({ conversationId: forkId, targetConversationId: forkId, limit: 50 })).messages.map(message => message.text);
     assert.ok(transcript.includes('NATIVE_FIRST_QUESTION_4503'), JSON.stringify(transcript));

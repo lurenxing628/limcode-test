@@ -848,7 +848,8 @@ test('fork_conversation copies the completed history of a caller whose native Tu
     await kernel.runWithExecutionLeaseFence(currentFence, () => app.context.appendNativeToolCall({ conversationId, toolCallId: running.toolCallId }));
     const copied = [];
     const lifecycle = new ReliableConversationLifecycle({ application: app, configuration: { mutations: {
-      async copyConversationConfiguration(source, target) { copied.push([source, target]); }
+      async copyConversationConfiguration(source, target) { copied.push([source, target]); },
+      async clearConversationConfiguration(target) { assert.fail(`a committed fork never clears the settings of ${target}`); }
     } } });
 
     const fork = await lifecycle.forkCompletedHistory({ sourceConversationId: conversationId, commandId: 'native-fork-tool-call' });
