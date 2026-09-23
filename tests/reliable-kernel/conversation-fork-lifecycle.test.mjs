@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { after, test } from 'node:test';
 
 const require = createRequire(import.meta.url);
+const Database = require('better-sqlite3');
 const Module = require('node:module');
 const originalLoad = Module._load;
 const vscode = createVscodeStub();
@@ -147,7 +148,8 @@ async function withForkRuntime(run, {
     const harness = {
       get app() { return app; }, get facade() { return facade; },
       get configuration() { return configuration; }, requests, environmentId, saveCompression,
-      async reopen() { await app.close(); await open(); },
+      /** `whileClosed` runs with the Runtime database closed, for example to stage an older data shape. */
+      async reopen(whileClosed) { await app.close(); await whileClosed?.(); await open(); },
       async start(conversationId, key, retry, message = {}) {
         // Match claim-before-open: keep the panel's reference through the whole fake-provider turn.
         await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
@@ -687,7 +689,7 @@ async function assertOwnedCreationRoots(h, conversationId, count) {
     const { records } = await h.app.context.materializeStructure(root.id);
     assert.deepEqual(records.slice(0, sources.length).map(record => record.segment.id), sources,
       'the creation root starts with the compressed range');
-    creations.push({ sources, records });
+    creations.push({ blockId: block.id, sources, records });
   }
   return creations;
 }
@@ -803,6 +805,33 @@ test('an automatic compression that keeps part of a manual compression\'s tail s
       }
     };
     await assertForkableAfterRewrite(h, 'mixed', assertKeptCreationTails, /mixed-first|以前的重要历史/);
+  }, { compression: true });
+});
+
+test('a fork whose inherited block has no creation projection is refused permanently', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'unprojected-first');
+    await h.turn('source', 'unprojected-second');
+    await h.turn('source', 'unprojected-third');
+    await compressHead(h, 'source', 'unprojected-compression-1', 2);
+    await compressHead(h, 'source', 'unprojected-compression-2', 3);
+    const fork = await h.facade.forkConversation(await h.command('source', 'fork-before-projection-loss'));
+    // A fork made before copied blocks always kept their creation projection: its inner block
+    // (reached only through the outer summary) has none.
+    const [inner] = (await assertOwnedCreationRoots(h, fork.conversationId, 2))
+      .filter(({ records }) => records[0].segment.segment_kind !== 'compression');
+    const [projection] = await rows(h.app, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: inner.blockId });
+    const databasePath = h.app.database.binding.paths.databasePath;
+    await h.reopen(() => {
+      const database = new Database(databasePath);
+      try {
+        assert.equal(database.prepare('DELETE FROM model_context_projection WHERE id = ?').run(projection.id).changes, 1);
+      } finally { database.close(); }
+    });
+    const before = await rows(h.app, 'Conversation');
+    await assert.rejects(h.facade.forkConversation(await h.command(fork.conversationId, 'fork-without-inner-projection')),
+      error => error instanceof kernel.ConversationForkRejectedError && /creation projection/.test(error.message));
+    assert.deepEqual(await rows(h.app, 'Conversation'), before);
   }, { compression: true });
 });
 

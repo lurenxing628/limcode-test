@@ -10,7 +10,8 @@ import { RuntimeDatabase } from './runtimeDatabase';
  * another Conversation, a changed Revision, a deleted fork-point Message, no completed history for
  * fork_conversation); the copy would include history that is not completed (a Turn still running,
  * or a compression made after the fork point, including one whose pre-compression history was
- * rewritten); or the command is replayed with different source facts.
+ * rewritten in place); the copy would include a block without its creation projection (a fork made
+ * before copied blocks always kept it); or the command is replayed with different source facts.
  */
 export class ConversationForkRejectedError extends Error {
   public constructor(message: string) {
@@ -113,6 +114,13 @@ export async function readForkContextLineage(
         });
         if (sources.length === 0) throw new Error(`CompressionBlock ${blockId} has no registered sources.`);
         const projections = requireRows(blocks.snapshot[compressed.length * 2 + index], 'ModelContextProjection');
+        // Only a fork made before copied blocks always kept their creation projection lacks one;
+        // forking after such a block can never succeed.
+        if (projections.length === 0) {
+          throw new ConversationForkRejectedError(
+            `CompressionBlock ${blockId} has no creation projection; fork from its pre-compression history.`
+          );
+        }
         if (projections.length !== 1) throw new Error(`CompressionBlock ${blockId} must have exactly one creation projection.`);
         sources.sort((left, right) => compareIntegers(left.position, right.position));
         const children = sources.map((source, position) => {
