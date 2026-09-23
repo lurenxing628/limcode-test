@@ -463,3 +463,34 @@ test('WS dry-run：支持显式缓存的模型保留 prompt_cache_options 与断
     assert.equal(body.instructions, 'stable instructions', model);
   }
 });
+
+// 推理模式：https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode
+// “GPT-5.6 and GPT-6 models support standard and pro reasoning modes in the Responses API.”
+test('推理模式参数：openai-responses 上的 GPT-5.6 与 GPT-6 官方 id 开放，其他模型与渠道不变', () => {
+  const { parameterDefinitionsForProvider } = loadWebviewModule('webview/src/components/settings/global/parameters/llmParameterDefinitions.ts');
+  const hasMode = (model, provider = 'openai-responses') => parameterDefinitionsForProvider(provider, model, officialCapability(model, provider))
+    .some((definition) => definition.key === 'reasoningMode');
+  for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra-2026-09-01', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+    assert.equal(hasMode(model), true, model);
+  }
+  // 已登记推理能力的更早模型不开放（与修改前一致）。
+  for (const model of ['gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5.4']) assert.equal(hasMode(model), false, model);
+  // Chat Completions 没有 reasoning.mode。
+  for (const model of ['gpt-6-sol', 'gpt-6-astra']) assert.equal(hasMode(model, 'openai-compatible'), false, model);
+});
+
+test('推理模式编码：reasoning.mode 按配置发送，不再只认 Astra；Chat Completions 不发送', async () => {
+  for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-5.6', 'gpt-6-astra']) {
+    const body = (await dryRunLlmProvider(chatRequest(`mode-${model}`), {
+      settings: async () => providerConfig({ model, generationConfig: { thinkingConfig: { thinkingLevel: 'high', reasoningMode: 'pro' } } })
+    })).body;
+    assert.equal(body.reasoning.mode, 'pro', model);
+    assert.equal(body.reasoning.effort, 'high', model);
+  }
+  const chat = (await dryRunLlmProvider(chatRequest('mode-chat'), {
+    settings: async () => providerConfig({ provider: 'openai-compatible', baseUrl: 'https://gateway.example/v1',
+      generationConfig: { thinkingConfig: { thinkingLevel: 'high', reasoningMode: 'pro' } } })
+  })).body;
+  assert.equal(chat.reasoning_effort, 'high');
+  assert.equal(JSON.stringify(chat).includes('"pro"'), false);
+});

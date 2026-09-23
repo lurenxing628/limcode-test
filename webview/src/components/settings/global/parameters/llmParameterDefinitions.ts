@@ -2,6 +2,7 @@ import { THINKING_LEVEL_OPTIONS } from '@shared/llmThinkingLevels';
 import type { LlmProviderKind, LlmReasoningMode, LlmThinkingLevel } from '@shared/protocol';
 import { geminiThinkingCapabilityForModel } from '@shared/geminiThinking';
 import type { ModelCapabilitySnapshot } from '@shared/modelCapabilities';
+import { supportsOpenAIReasoningMode } from '@shared/openAIResponsesCapabilities';
 
 export type LlmParameterValueType = 'number' | 'boolean' | 'enum';
 
@@ -202,7 +203,9 @@ export function parameterDefinitionsForProvider(provider: LlmProviderKind, model
   const capability = snapshot.reasoning;
   return result.filter((definition) => {
     if (definition.key === 'thinkingBudget') return capability.supportsBudget;
-    if (definition.key === 'reasoningMode') return provider === 'openai-responses' && /^gpt-6-astra(?:-pro)?$/.test(modelId ?? '');
+    // 推理模式 standard / pro：“GPT-5.6 and GPT-6 models support standard and pro reasoning modes in the
+    // Responses API”（https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode）。只认官方 id。
+    if (definition.key === 'reasoningMode') return provider === 'openai-responses' && supportsOpenAIReasoningMode(modelId);
     if (definition.key === 'thinkingLevel') return capability.levels.length > 0
       || capability.canDisable && provider !== 'gemini';
     return true;
