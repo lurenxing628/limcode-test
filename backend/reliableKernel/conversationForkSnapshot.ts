@@ -309,6 +309,25 @@ export async function prepareConversationForkSnapshot(
   const blockAuthorities = await getRows(database, 'AuthoritySnapshot', unique(compressionBlocks.map(({ block }) =>
     id(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id')
   )));
+  if (input.boundaryMessageSeq !== undefined) {
+    // A compressing Turn with transcript outside the copied history ran after the fork point: its
+    // block is not part of this history (the caller forks from the pre-compression root instead).
+    const transcriptTurnIds = new Set([...messageFacts, ...toolResultMessages].flatMap((fact) =>
+      fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))
+    ));
+    const outsideTurnIds = unique(blockAuthorities.map((snapshot) => id(snapshot.turn_id, 'AuthoritySnapshot.turn_id')))
+      .filter((turnId) => !transcriptTurnIds.has(turnId));
+    const outsideLinks = outsideTurnIds.length > 0 ? await database.snapshot(outsideTurnIds.map((turnId) =>
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({ where: { turn_id: turnId }, limit: 1 })
+    )) : { snapshot: [] };
+    for (const [index, turnId] of outsideTurnIds.entries()) {
+      if (rows(outsideLinks.snapshot[index], 'MessageTurnLink compression Turn lookup').length > 0) {
+        throw new ConversationForkRejectedError(
+          `Fork Context keeps a CompressionBlock made by Turn ${turnId} after the fork point; fork from its pre-compression history.`
+        );
+      }
+    }
+  }
   const turnIds = unique([
     ...messageFacts.flatMap((fact) => fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))),
     ...toolResultMessages.flatMap((fact) => fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))),

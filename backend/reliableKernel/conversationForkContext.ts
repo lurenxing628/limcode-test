@@ -1,4 +1,4 @@
-import { selectConversationCompressionBlock } from './compressionBlockOwnership';
+import { resolveConversationCompressionBlock, selectConversationCompressionBlock } from './compressionBlockOwnership';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -126,6 +126,93 @@ export async function readForkContextLineage(
   }
   for (const segmentId of rootSegmentIds) visit(segmentId);
   return { segmentIds, messageSources, contentObjectIds, compressionBlocks };
+}
+
+interface CompressionPrecedenceFacts {
+  /** Node id -> position in the block's pre-compression root. */
+  creationNodes: ReadonlyMap<string, number>;
+  creationLength: number;
+}
+
+/**
+ * Whether a compressed root may supply a fork prefix. A fork owns completed history only, so the
+ * compression must precede the cut: the cut never lies strictly inside the tail that existed when
+ * the block was created (its pre-compression projection root), and the Turn that compressed has
+ * ended inside the kept history — it owns kept transcript, or none at all like a manual compression
+ * Turn. Otherwise the pre-compression root holds the same prefix uncompressed and the caller forks
+ * from it instead. Facts are memoized per summary segment across the caller's candidate roots.
+ */
+export class ForkCompressionPrecedence {
+  private readonly facts = new Map<string, Promise<CompressionPrecedenceFacts | null>>();
+
+  public constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly conversationId: string,
+    private readonly boundaryMessageSeq: bigint
+  ) {}
+
+  public async precedesCut(records: readonly { node: DomainRow; segment: DomainRow }[], cutIndex: number): Promise<boolean> {
+    const summary = records[0]?.segment;
+    if (!summary || summary.segment_kind !== 'compression') return true;
+    const cut = records[cutIndex];
+    if (!cut) throw new Error('Fork cut is outside the candidate Context root.');
+    const summarySegmentId = requireId(summary.id, 'ContextSegment.id');
+    let facts = this.facts.get(summarySegmentId);
+    if (!facts) {
+      facts = this.readFacts(summarySegmentId);
+      this.facts.set(summarySegmentId, facts);
+    }
+    const resolved = await facts;
+    if (!resolved) return false;
+    const creationIndex = resolved.creationNodes.get(requireId(cut.node.id, 'ContextSequenceNode.id'));
+    return creationIndex === undefined || creationIndex === resolved.creationLength - 1;
+  }
+
+  private async readFacts(summarySegmentId: string): Promise<CompressionPrecedenceFacts | null> {
+    const block = await resolveConversationCompressionBlock(this.database, summarySegmentId, this.conversationId);
+    if (!await this.compressingTurnIsKept(block)) return null;
+    const projections = await listAllDomainRows(this.database, 'ModelContextProjection', {
+      owner_kind: 'compression_block', owner_id: requireId(block.id, 'CompressionBlock.id')
+    });
+    if (projections.length !== 1) return null;
+    const creation = (await this.database.materializeContext(
+      requireId(projections[0].root_id, 'ModelContextProjection.root_id')
+    )).snapshot;
+    if (creation.root.conversation_id !== this.conversationId) return null;
+    return {
+      creationNodes: new Map(creation.records.map((record, index) => [requireId(record.node.id, 'ContextSequenceNode.id'), index])),
+      creationLength: creation.records.length
+    };
+  }
+
+  private async compressingTurnIsKept(block: DomainRow): Promise<boolean> {
+    const authority = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').get(
+      requireId(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id')
+    )]);
+    const snapshot = optionalRow(authority.snapshot[0], 'AuthoritySnapshot');
+    if (!snapshot) return false;
+    const turnId = requireId(snapshot.turn_id, 'AuthoritySnapshot.turn_id');
+    const [turnRead, links] = await Promise.all([
+      this.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').get(turnId)]),
+      listAllDomainRows(this.database, 'MessageTurnLink', { turn_id: turnId })
+    ]);
+    const turn = optionalRow(turnRead.snapshot[0], 'Turn');
+    if (!turn || turn.status !== 'terminated') return false;
+    if (links.length === 0) return true;
+    const messageIds = [...new Set(links.map((link) => requireId(link.message_id, 'MessageTurnLink.message_id')))];
+    const kept = await this.database.snapshot(messageIds.flatMap((messageId) => [
+      DOMAIN_REPOSITORIES.domain('Message').get(messageId),
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+        where: { conversation_id: this.conversationId, message_id: messageId }, limit: 2
+      })
+    ]));
+    return messageIds.some((_, index) => {
+      const message = optionalRow(kept.snapshot[index * 2], 'Message');
+      const [membership] = requireRows(kept.snapshot[index * 2 + 1], 'MessagePartOfConversation');
+      return !!message && message.deleted_at === null && !!membership
+        && typeof membership.message_seq === 'bigint' && membership.message_seq <= this.boundaryMessageSeq;
+    });
+  }
 }
 
 /** Native UI aggregates do not own Context; their immutable item revisions do. */
@@ -276,6 +363,12 @@ export class ForkContextCandidateProbe {
 
 function requireRow(value: unknown, label: string): DomainRow {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} is missing.`);
+  return value as DomainRow;
+}
+
+function optionalRow(value: unknown, label: string): DomainRow | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} snapshot is invalid.`);
   return value as DomainRow;
 }
 

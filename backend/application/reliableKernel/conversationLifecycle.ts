@@ -1,7 +1,12 @@
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { StructuralContextRecord } from '../../reliableKernel/contextSequence';
 import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
-import { ForkContextCandidateProbe, isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
+import {
+  ForkCompressionPrecedence,
+  ForkContextCandidateProbe,
+  isNativeRequest,
+  readNativeMessageContextRevisions
+} from '../../reliableKernel/conversationForkContext';
 import { projectFolderAssignmentSteps, projectFolderForConversation } from '../../reliableKernel/conversationProject';
 import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
@@ -228,6 +233,8 @@ export class ReliableConversationLifecycle {
       message_id: messageId
     }, 2);
     if (memberships.length !== 1) throw new Error('Fork 源 Message 不属于当前 Conversation。');
+    const boundaryMessageSeq = memberships[0].message_seq;
+    if (typeof boundaryMessageSeq !== 'bigint') throw new TypeError('MessagePartOfConversation.message_seq 必须是整数。');
     const turnLinks = (await this.application.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({
         where: { message_id: messageId },
@@ -336,6 +343,7 @@ export class ReliableConversationLifecycle {
     // Prefer the newest context containing this boundary: an edit can leave the same assistant
     // revision in an older root whose preceding user revisions no longer match the transcript.
     const candidates = new ForkContextCandidateProbe(this.application.database, sourceSegmentIds);
+    const compressionPrecedence = new ForkCompressionPrecedence(this.application.database, sourceConversationId, boundaryMessageSeq);
     for (const root of [...roots].reverse()) {
       if (!await candidates.mayContain(root)) continue;
       const rootId = requireText(root.id, 'ContextSequenceRoot.id');
@@ -366,6 +374,9 @@ export class ReliableConversationLifecycle {
         return true;
       });
       if (messageIndex >= 0 && containsClosedToolSuffix) {
+        // A compression made after this boundary (for example by a later, possibly still running
+        // Turn) is not part of the forked history: fall back to the pre-compression root.
+        if (!await compressionPrecedence.precedesCut(structure.records, previousIndex)) continue;
         sourceRootId = rootId;
         sourceContextEndSegmentId = requireText(structure.records[previousIndex].segment.id, 'ContextSegment.id');
         sourceContextSegmentIds = structure.records.slice(0, previousIndex + 1).map((record) =>
