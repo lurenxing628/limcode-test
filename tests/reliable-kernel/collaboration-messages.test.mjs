@@ -248,8 +248,8 @@ test('the durable wake scanner starts exactly one followup while idle messages s
   } finally { await scanner.dispose(); }
 }));
 
-async function endTurn(f, turnId) {
-  await f.database.transaction([repo('Turn').update(turnId, { status: 'terminated', terminal_at: NOW, updated_at: NOW }), repo('TurnTermination').insert({ id: `${turnId}-done`, turn_id: turnId, terminal_status: 'completed', reason: 'finished', created_at: NOW })]);
+async function endTurn(f, turnId, status = 'completed') {
+  await f.database.transaction([repo('Turn').update(turnId, { status: 'terminated', terminal_at: NOW, updated_at: NOW }), repo('TurnTermination').insert({ id: `${turnId}-done`, turn_id: turnId, terminal_status: status, reason: 'finished', created_at: NOW })]);
 }
 
 test('a queued followup waits for the running target Turn and then starts exactly one new Turn', async () => fixture(async f => {
@@ -894,4 +894,71 @@ test('a task answered just before its target was deleted settles as completed wi
   const replies = await repliesTo(f, 'peer-a', followup.messageId);
   assert.equal(replies.length, 1);
   assert.equal((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, 'the answer');
+}));
+
+/** Starts the level-triggered loop with a fast interval and counts the scans after its start pass. */
+async function scansAfterStart(scanner, ms) {
+  let scans = 0;
+  const scanNow = scanner.scanNow.bind(scanner);
+  scanner.scanNow = () => { scans += 1; return scanNow(); };
+  await scanner.start();
+  scans = 0;
+  await new Promise(resolve => setTimeout(resolve, ms));
+  return scans;
+}
+/** A plain message injected into a Turn the user stopped before it was taken in: its wake settles, the next Turn takes it. */
+async function assertStrandedMessageSettles(f, conversationId, deliveryId, nextTurnId) {
+  const errors = [];
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, scanIntervalMs: 20, retryBaseMs: 10,
+    onError: detail => errors.push(detail), wakeHandler: async request => {
+      if (request.deliveryId === deliveryId) assert.fail(`A plain message never starts or resumes a Turn: ${request.action}`);
+      // Inputs already bound into another Turn only ask that Turn to absorb them.
+      assert.equal(request.action, 'resume_current_turn');
+      return { acknowledged: true };
+    } });
+  try {
+    const scans = await scansAfterStart(scanner, 300);
+    assert.equal(errors.length, 0, errors.map(detail => String(detail.error)).join('\n'));
+    assert.equal(scans, 0, 'no poll keeps running for a message only the next Turn can take in');
+  } finally { await scanner.dispose(); }
+  const delivery = await f.get('RuntimeDelivery', deliveryId);
+  assert.deepEqual([delivery.state, delivery.phase, delivery.target_turn_id], ['pending', 'next_turn', null]);
+  assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: deliveryId }))[0].state, 'acknowledged');
+  assert.equal(await f.database.hasConversationRuntimeWork(conversationId), false, 'the conversation is no longer busy for other windows');
+  await admitPending(f, conversationId, nextTurnId);
+  const consumed = await f.get('RuntimeDelivery', deliveryId);
+  assert.deepEqual([consumed.state, consumed.target_turn_id], ['consumed', nextTurnId], 'the next Turn still takes the message in');
+  assert.equal((await f.rows('PendingTurnInput', { turn_id: nextTurnId })).length, 1);
+}
+
+test('a completion reply the stopped requester Turn never took in settles its wake and joins the next Turn', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const followup = await crossSend(f, 'a-task-reply-stranded', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  await admitContinuation(f, 'target-b', 'b-answers', followup.deliveryId);
+  await endTurn(f, 'b-answers');
+  await f.collaboration.completeRequestsForTurn({ turnId: 'b-answers', text: 'the answer' });
+  const [reply] = await repliesTo(f, 'peer-a', followup.messageId);
+  const [inbox] = await f.rows('RuntimeInboxItem', { source_id: reply.messageId });
+  const [delivery] = await f.rows('RuntimeDelivery', { inbox_item_id: inbox.id });
+  assert.deepEqual([delivery.phase, delivery.target_turn_id], ['current_turn', 'peer-a-turn'], 'fixture: the reply joins the running requester Turn');
+  // The user stops A before its loop took the reply in; the sending call had already returned.
+  const content = await f.store.prepare(f.database, JSON.stringify({ role: 'user', parts: [{ text: 'sent' }] }), 'application/vnd.limcode.message+json');
+  await f.database.transaction([...preparedContentObjectSteps([content], 'tool_result'),
+    repo('Message').insert({ id: 'a-send-result', created_at: NOW, updated_at: NOW, deleted_at: null }),
+    repo('MessageRevision').insert({ id: 'a-send-result-revision', message_id: 'a-send-result', revision_seq: 1n, role: 'user', content_object_id: content.metadata.id, created_at: NOW }),
+    repo('ToolCall').update('a-task-reply-stranded', { status: 'terminal', updated_at: NOW }),
+    repo('ToolModelResult').insert({ id: 'a-send-model-result', tool_call_id: 'a-task-reply-stranded', message_revision_id: 'a-send-result-revision', created_at: NOW })]);
+  await endTurn(f, 'peer-a-turn', 'interrupted');
+  await assertStrandedMessageSettles(f, 'peer-a', delivery.id, 'peer-a-next');
+}));
+
+test('a team message the stopped target Turn never took in settles its wake and joins the next Turn', async () => fixture(async f => {
+  const sent = await f.collaboration.send({ source: await f.source('note-to-running-root'), targetConversationId: 'root', text: 'note for the running root', mode: 'message' });
+  const injected = await f.get('RuntimeDelivery', sent.deliveryId);
+  assert.deepEqual([injected.phase, injected.target_turn_id], ['current_turn', 'root-turn'], 'fixture: the message joins the running Turn');
+  // The sender finishes, then the user stops root's Turn before it took the message in.
+  await endTurn(f, 'left-turn');
+  await f.database.transaction([repo('ChildExecution').update('left-child', { status: 'idle', updated_at: NOW })]);
+  await endTurn(f, 'root-turn', 'interrupted');
+  await assertStrandedMessageSettles(f, 'root', sent.deliveryId, 'root-next');
 }));

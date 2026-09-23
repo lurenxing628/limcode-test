@@ -773,8 +773,10 @@ export class ProcessCompletionDeliveryControlPlane {
 
     if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending' && delivery.phase === 'next_turn' && delivery.target_turn_id === null) {
       const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
-      // A send-only message never creates a Turn, including the final-output fence race.
-      if (message.mode === 'message') return 'retry';
+      // A send-only message never creates a Turn: after the final-output fence race, or once the
+      // user stopped the Turn it was injected into, only the target's next Turn takes it in. That
+      // admission needs no wake, so this one settles instead of polling until then.
+      if (message.mode === 'message') return this.acknowledgeWake(wakeInput);
     }
     const targetTurnId = delivery.target_turn_id === null
       ? null
@@ -802,14 +804,19 @@ export class ProcessCompletionDeliveryControlPlane {
         : {})
     });
     if (!result.acknowledged) return 'retry';
+    return this.acknowledgeWake(wakeInput);
+  }
+
+  private async acknowledgeWake(claim: DomainRow): Promise<'acknowledged'> {
+    const wakeId = requirePhaseFId(claim.id, 'RuntimeDeliveryWake.id');
     const now = this.timestamp();
     try {
       await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').assert(wakeId, {
-          delivery_id: delivery.id,
+          delivery_id: claim.delivery_id,
           state: 'claimed',
           claim_owner_host_boot_id: this.database.hostBootId,
-          claim_generation: wakeInput.claim_generation,
+          claim_generation: claim.claim_generation,
           acknowledged_at: null
         }),
         DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').update(wakeId, {
