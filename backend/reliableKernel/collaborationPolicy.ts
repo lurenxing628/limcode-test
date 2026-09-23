@@ -9,6 +9,22 @@ import {
   DEFAULT_MAX_AUTOMATIC_FOLLOWUPS
 } from '../world/modules/tools/definitions/runAgent';
 
+/**
+ * Fixed limits of cross-conversation collaboration. They are not settings: the automatic followup
+ * budget (maxAutomaticFollowups) remains the only configurable bound, and cross-conversation
+ * followups and create_conversation spend it like team followups.
+ */
+export const CROSS_CONVERSATION_LIMITS = Object.freeze({
+  /**
+   * Undelivered inbound collaboration messages (message and followup modes, from any sender) a
+   * target Conversation may hold before cross-conversation sends to it are refused. Completion
+   * replies to the target's own requests are exempt.
+   */
+  maxPendingInboundMessages: 16,
+  /** create_conversation plus fork_conversation calls one sender Turn may make. */
+  maxConversationSpawnsPerTurn: 8
+});
+
 export interface CollaborationLimits {
   maxConcurrentAgents: number;
   maxAutomaticFollowups: number;

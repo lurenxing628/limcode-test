@@ -458,7 +458,15 @@
       "delivery": "running-target-queues-behind-its-current-Turn; followup-starts-its-own-Turn-and-only-that-Turn-consumes-it; followup-waits-behind-any-running-Turn-at-dispatch-including-one-started-after-its-anchor; followups-from-different-senders-start-sequential-Turns-never-merged; that-Turn-spends-only-the-requester-budget; message-joins-the-next-Turn-whatever-starts-it; completion-replies-are-not-queued",
       "authority": "peer-text-is-an-attributed-collaboration-envelope-never-a-user-message; list-and-read-carry-an-untrusted-data-notice",
       "create": "stable-Conversation-id-from-ToolCall; default-AgentConversationLink-project-link-model-profile-work-environment-then-followup; every-step-idempotent; no-ConversationOriginLink",
-      "fork": "commandId-is-ToolCall; completed-history-up-to-the-last-ended-Turn; starts-no-Turn; replay-keeps-the-committed-boundary; never-navigates-the-view"
+      "fork": "commandId-is-ToolCall; completed-history-up-to-the-last-ended-Turn; starts-no-Turn; replay-keeps-the-committed-boundary; never-navigates-the-view",
+      "limits": {
+        "automaticFollowupBudget": "cross-conversation-followups-and-create_conversation-spend-maxAutomaticFollowups; checked-before-any-write",
+        "maxPendingInboundMessages": 16,
+        "pendingInbound": "undelivered-message-and-followup-deliveries-from-any-sender-per-target; completion-replies-exempt; enforced-on-cross-conversation-sends",
+        "maxConversationSpawnsPerTurn": 8,
+        "spawns": "create_conversation-and-fork_conversation-calls-of-one-sender-Turn-ranked-by-committed-call-order",
+        "overflow": "clear-tool-error; nothing-written; no-new-settings"
+      }
     }
   }
 }

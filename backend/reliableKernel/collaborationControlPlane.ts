@@ -3,7 +3,7 @@ import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { readCollaborationScope } from './collaborationScope';
-import { readTurnCollaborationLimits, readTurnCrossConversationEnabled } from './collaborationPolicy';
+import { CROSS_CONVERSATION_LIMITS, readTurnCollaborationLimits, readTurnCrossConversationEnabled } from './collaborationPolicy';
 import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { TURN_INTENT_ENVELOPE_CONTENT_TYPE, parseRuntimeContinuationTurnIntentEnvelopeText } from './guidanceIntent';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
@@ -188,6 +188,8 @@ export class CollaborationControlPlane {
     const currentTurnId = !queuedTurnId && active[0] && !fence.length ? String(active[0].id) : null;
     const now = this.now();
     const routingSteps: RepositoryTransactionStep[] = queuedTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(queuedTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: queuedTurnId })] : currentTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(currentTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: currentTurnId }), DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: currentTurnId })] : active[0] ? [DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fence[0].id), { turn_id: active[0].id })] : [DOMAIN_REPOSITORIES.domain('Turn').assertNone({ conversation_id: targetConversationId, status: 'active' })];
+    // Cross-conversation sends stop at a fixed backlog per target; replies owed to it never do.
+    const inboundSteps = input.crossConversation ? await this.pendingInboundCapacitySteps(targetConversationId) : [];
     const requestId = stablePhaseFId('collaboration_request', messageId);
     const budgetSteps: RepositoryTransactionStep[] = [];
     if (input.mode === 'followup') {
@@ -205,7 +207,7 @@ export class CollaborationControlPlane {
     try {
       await this.database.transaction([
         ...preparedContentObjectSteps([prepared], 'collaboration_content'), ...sourceSteps,
-        ...(sourceScope?.authoritySteps ?? []), ...targetScope.authoritySteps, ...routingSteps,
+        ...(sourceScope?.authoritySteps ?? []), ...targetScope.authoritySteps, ...routingSteps, ...inboundSteps,
         ...(failureReply ? [] : [DOMAIN_REPOSITORIES.domain('Conversation').assert(sourceConversationId, { status: 'active' })]), DOMAIN_REPOSITORIES.domain('Conversation').assert(targetConversationId, { status: 'active' }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id: messageId, dedupe_key: dedupeKey, mode: input.mode, created_at: now }, { column: 'message_seq', scope: {} }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').insert({ id: stablePhaseFId('collaboration_source', messageId), message_id: messageId, conversation_id: sourceConversationId, source_kind: source.kind, source_key: sourceKey, turn_id: sourceTurnId, tool_call_id: source.kind === 'tool' ? source.toolCallId : null, board_post_id: source.kind === 'board' ? source.postId : null, created_at: now }),
@@ -332,6 +334,23 @@ export class CollaborationControlPlane {
       throw new Error('Cross-conversation collaboration cannot address a child task conversation.');
     }
     return { conversationId };
+  }
+
+  /**
+   * One sender Turn may make at most CROSS_CONVERSATION_LIMITS.maxConversationSpawnsPerTurn
+   * create_conversation and fork_conversation calls. Calls are ranked by their committed order, so
+   * the verdict for a call never changes on replay and needs no write.
+   */
+  public async assertConversationSpawnAllowed(input: { turnId: string; toolCallId: string }): Promise<void> {
+    const turnId = requirePhaseFId(input.turnId, 'turnId');
+    const toolCallId = requirePhaseFId(input.toolCallId, 'toolCallId');
+    const calls = (await this.rows('ToolCall', { turn_id: turnId }))
+      .filter((call) => call.tool_name === 'create_conversation' || call.tool_name === 'fork_conversation')
+      .sort((left, right) => compareSequence(left.call_seq, right.call_seq) || String(left.id).localeCompare(String(right.id)));
+    const rank = calls.findIndex((call) => call.id === toolCallId);
+    if (rank < 0) throw new Error('Conversation creation requires a create_conversation or fork_conversation ToolCall of this Turn.');
+    const limit = CROSS_CONVERSATION_LIMITS.maxConversationSpawnsPerTurn;
+    if (rank >= limit) throw new Error(`This turn already made ${limit} create_conversation or fork_conversation calls, the most one turn may make. Nothing was created; continue with the conversations that exist.`);
   }
 
   /** Other active top-level Conversations of this Runtime (one workspace), newest update first. */
@@ -476,6 +495,23 @@ export class CollaborationControlPlane {
     }
     return null;
   }
+  /**
+   * Refuses a cross-conversation send while the target already holds the maximum undelivered
+   * collaboration backlog. The exact pending set is asserted so concurrent senders cannot overshoot.
+   */
+  private async pendingInboundCapacitySteps(targetConversationId: string): Promise<RepositoryTransactionStep[]> {
+    const pending = await this.rows('RuntimeDelivery', { target_conversation_id: targetConversationId, state: 'pending' });
+    let backlog = 0;
+    for (const delivery of pending) {
+      const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
+      if (inbox.source_kind !== 'collaboration_message') continue;
+      const sources = await this.rows('CollaborationMessageSourceLink', { message_id: inbox.source_id });
+      if (sources[0]?.source_kind !== 'completion') backlog += 1;
+    }
+    const limit = CROSS_CONVERSATION_LIMITS.maxPendingInboundMessages;
+    if (backlog >= limit) throw new Error(`The target conversation already holds ${limit} undelivered collaboration messages, the most it may queue. Nothing was sent; try again after it has taken them in.`);
+    return [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds({ target_conversation_id: targetConversationId, state: 'pending' }, pending.map((row) => String(row.id)))];
+  }
   private async assertReadPermission(caller: string, target: string): Promise<void> {
     await this.existing('Conversation', caller);
     if (caller === target) return;
@@ -553,6 +589,11 @@ export class CollaborationControlPlane {
   private async one(domain: string, where: DomainRow): Promise<DomainRow> { const rows = await this.rows(domain, where); if (rows.length !== 1) throw new Error(`${domain} requires exactly one matching fact.`); return rows[0]; }
   private async maybe(domain: string, id: string): Promise<DomainRow | null> { return (await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | null; }
   private async existing(domain: string, id: string): Promise<DomainRow> { const row = await this.maybe(domain, id); if (!row) throw new Error(`${domain} ${id} does not exist.`); return row; }
+}
+function compareSequence(left: unknown, right: unknown): number {
+  const a = BigInt(String(left));
+  const b = BigInt(String(right));
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 function unstartedTaskReason(failureReason: unknown): string {
   const reason = typeof failureReason === 'string' ? failureReason : '';

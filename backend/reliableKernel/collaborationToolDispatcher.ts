@@ -25,6 +25,7 @@ export interface CollaborationToolControlPlane {
     crossConversation?: boolean }): Promise<unknown>;
   listConversations(input: { turnId: string; limit?: number }): Promise<unknown>;
   authorizeCrossConversation(input: { turnId: string; targetConversationId?: string }): Promise<unknown>;
+  assertConversationSpawnAllowed(input: { turnId: string; toolCallId: string }): Promise<void>;
 }
 
 /** Conversation creation and forking, owned by the application lifecycle service. */
@@ -169,6 +170,7 @@ export class CollaborationToolDispatcher {
         fields(args, ['prompt', 'title']);
         const conversations = this.requireConversations();
         await this.dependencies.collaboration.authorizeCrossConversation({ turnId: input.turnId });
+        await this.dependencies.collaboration.assertConversationSpawnAllowed({ turnId: input.turnId, toolCallId: input.toolCallId });
         detail = await conversations.createForCollaboration({ turnId: input.turnId, toolCallId: input.toolCallId,
           sourceConversationId: conversationId, prompt: text(args.prompt, 'prompt'),
           ...(args.title === undefined ? {} : { title: text(args.title, 'title') }) });
@@ -180,6 +182,7 @@ export class CollaborationToolDispatcher {
         const target = args.targetConversationId === undefined ? undefined : text(args.targetConversationId, 'conversationRef');
         await this.dependencies.collaboration.authorizeCrossConversation({ turnId: input.turnId,
           ...(target === undefined ? {} : { targetConversationId: target }) });
+        await this.dependencies.collaboration.assertConversationSpawnAllowed({ turnId: input.turnId, toolCallId: input.toolCallId });
         const sourceConversationId = target ?? conversationId;
         detail = { ...object(await conversations.forkCompletedHistory({ sourceConversationId, commandId: input.toolCallId }), 'Conversation fork'),
           sourceConversationId, turnStarted: false,

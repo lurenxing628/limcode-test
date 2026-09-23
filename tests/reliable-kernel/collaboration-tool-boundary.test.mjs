@@ -77,7 +77,8 @@ function fixture({ toolName = 'send_agent_message', args = { targetConversationI
       async readMessage(input) { calls.push(input); return { messageId: input.messageId }; },
       async waitMessages(input) { calls.push(input); return { messages: [], timedOut: true }; },
       async listConversations(input) { calls.push({ list: input }); return { conversations: [{ conversationId: 'peer', title: 'peer', running: false, updatedAt: 'now' }], hasMore: false }; },
-      async authorizeCrossConversation(input) { calls.push({ authorize: input }); return { conversationId: 'conversation' }; }
+      async authorizeCrossConversation(input) { calls.push({ authorize: input }); return { conversationId: 'conversation' }; },
+      async assertConversationSpawnAllowed(input) { calls.push({ spawnCapacity: input }); }
     },
     conversations: {
       async createForCollaboration(input) { calls.push({ create: input }); return { conversationId: 'created', title: 'created', messageId: 'message', deduplicated: false }; },
@@ -216,11 +217,12 @@ test('cross-conversation dispatch requires the frozen switch and always queues s
 
   const create = fixture({ toolName: 'create_conversation', args: { prompt: 'do it', title: 'Task' }, crossConversation: true });
   await create.dispatcher.dispatch(create.input, undefined, create.authority);
-  assert.deepEqual(create.calls, [{ authorize: { turnId: 'turn' } },
+  assert.deepEqual(create.calls, [{ authorize: { turnId: 'turn' } }, { spawnCapacity: { turnId: 'turn', toolCallId: 'call' } },
     { create: { turnId: 'turn', toolCallId: 'call', sourceConversationId: 'conversation', prompt: 'do it', title: 'Task' } }]);
   const fork = fixture({ toolName: 'fork_conversation', args: {}, crossConversation: true });
   const forked = await fork.dispatcher.dispatch(fork.input, undefined, fork.authority);
-  assert.deepEqual(fork.calls, [{ authorize: { turnId: 'turn' } }, { fork: { sourceConversationId: 'conversation', commandId: 'call' } }]);
+  assert.deepEqual(fork.calls, [{ authorize: { turnId: 'turn' } }, { spawnCapacity: { turnId: 'turn', toolCallId: 'call' } },
+    { fork: { sourceConversationId: 'conversation', commandId: 'call' } }]);
   assert.equal(forked.detail.turnStarted, false);
   assert.equal(forked.detail.sourceConversationId, 'conversation');
 });

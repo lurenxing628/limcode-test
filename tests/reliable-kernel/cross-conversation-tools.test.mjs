@@ -524,6 +524,34 @@ test('create_conversation starts a first Turn from a peer task and replaying the
   });
 });
 
+test('one Turn may create or fork at most 8 conversations; the next call is refused without writing', { timeout: 90000 }, async () => {
+  let rootRound = 0, refused;
+  const spawnCalls = [...Array.from({ length: 7 }, (_, index) => call(`fork-${index}`, 'fork_conversation')),
+    call('create-8', 'create_conversation', { prompt: 'CAP_CREATED_TASK_1201', title: 'Eighth' }),
+    call('create-9', 'create_conversation', { prompt: 'CAP_REFUSED_TASK_1202', title: 'Ninth' })];
+  await fixture(async (request, f, start) => {
+    if (request.conversationId !== ROOT) return answer('created conversation done');
+    rootRound += 1;
+    if (rootRound === 1) return answer('first answer');
+    if (rootRound === 2) return toolsAnswer(...spawnCalls);
+    const results = start.contents.flatMap(content => content.parts).map(part => part.functionResponse).filter(Boolean);
+    refused = results.at(-1);
+    assert.deepEqual(results.slice(-9, -1).map(result => result.response?.status), Array(8).fill('succeeded'), JSON.stringify(results));
+    return answer('Spawned.');
+  }, async f => {
+    await f.terminated((await f.input(ROOT, 'first question')).turnId);
+    const conversations = (await f.rows('Conversation')).length;
+    const started = await f.input(ROOT, 'fan out');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.notEqual(refused?.response?.status, 'succeeded');
+    assert.match(JSON.stringify(refused), /8 create_conversation or fork_conversation calls/);
+    assert.equal((await f.rows('Conversation')).length, conversations + 8, 'seven forks and one created conversation, nothing for the refused call');
+    const refusedId = kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId('create-9'));
+    assert.deepEqual(await f.rows('Conversation', { id: refusedId }), []);
+    assert.equal((await f.rows('CollaborationMessage')).filter(message => message.mode === 'followup').length, 1);
+  });
+});
+
 test('fork_conversation copies completed history of the running caller and of another conversation, and replays deduplicate', { timeout: 60000 }, async () => {
   const QUESTION = 'ROOT_FIRST_QUESTION_6601';
   const ANSWER = 'ROOT_FIRST_ANSWER_6602';
