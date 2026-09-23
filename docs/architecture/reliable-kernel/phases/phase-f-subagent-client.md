@@ -84,7 +84,7 @@ normal changes queue
 ## 同树通信与独立会话协作
 
 - 团队范围从稳定 ChildExecutionParentLink 推导，不另建成员 JSON 或团队所有权表。
-- CollaborationMessage 与 Source/Target/Payload/Reply Links 独立保存消息来源与目标；CollaborationRequest/RequestTurnLink 记录明确跟进任务及结果归属。团队工具不能寻址团队之外的会话；团队之外的顶层会话只能通过用户开启「跨对话协作」后下发的跨对话工具寻址（子 Agent 会话始终不可寻址），此外只有跟进任务结果回送原请求方；兄弟通信权不包含终止子树权。
+- CollaborationMessage 与 Source/Target/Payload/Reply Links 独立保存消息来源与目标；CollaborationRequest/RequestTurnLink 记录明确跟进任务及结果归属。团队工具不能寻址团队之外的会话；团队之外的顶层会话只能通过用户开启「跨对话协作」后下发的跨对话工具寻址，且只限发起会话所在项目（子 Agent 会话始终不可寻址），此外只有跟进任务结果回送原请求方；兄弟通信权不包含终止子树权。
 - 仅发送消息不启动空闲 Turn；明确跟进任务才允许启动。两者均复用 RuntimeInboxItem、RuntimeDelivery、InputLink 和持久 Wake，新的来源类型保留工具级权限，不伪装用户授权。
 - 正式 AnswerBridge/AnswerSubmission 仍投原父任务；请求发起方的结果使用独立回复关系，不改写稳定父边。
 - 留言板的 Channel/ScopeLink、Post/ChannelLink/SourceLink/ReplyLink、SubscriptionLink 与 CommandReceipt 独立持久化；只有运行中的订阅者接收通知，不因通知拉起空闲 Agent。

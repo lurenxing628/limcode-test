@@ -944,7 +944,7 @@ function validateContext(context, failures) {
     if (!forkHistoryRule.includes(marker)) failures.push(`Conversation fork历史规则缺少${marker}`);
   }
   const forkSettingsRule = String(context?.conversationFork?.settingsRule ?? '');
-  for (const marker of ['8 组作用域记录/链接', '工作流选择与工作环境链接', '只写入目标仍为空的槽位', 'fork 事务之前', '重放不再复制', 'ConversationForkRejectedError 永久拒绝', '分支点消息已被删除', '找不到已完成的历史', '删除该命令目标 id 下尚未提交分支的对话层设置', '清理失败只记日志']) {
+  for (const marker of ['8 组作用域记录/链接', '工作流选择与工作环境链接', '只写入目标仍为空的槽位', 'fork 事务之前', '重放不再复制', 'ConversationForkRejectedError 永久拒绝', '分支点消息已被删除', '找不到已完成的历史', '删除该命令目标 id 下尚未提交分支的对话层设置', '清理失败只记日志', 'fork_conversation 工具调用只尝试一次，任何失败都在目标对话未建立时同样删除这些设置']) {
     if (!forkSettingsRule.includes(marker)) failures.push(`Conversation fork设置复制规则缺少${marker}`);
   }
 
@@ -1005,7 +1005,7 @@ function validateSubagent(subagent, failures) {
   const crossConversation = collaboration?.crossConversation;
   if (crossConversation?.switch !== 'ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; non-boolean-fails-closed; frozen-in-Turn-authority; configSchema-defaultValue-only'
     || crossConversation?.offering !== 'top-level-conversations-only; hidden-and-rejected-when-switch-off; control-plane-rechecks-calling-Turn-frozen-authority'
-    || crossConversation?.targets !== 'other-active-top-level-conversations-of-this-Runtime; child-task-conversations-never-listed-or-addressed'
+    || crossConversation?.targets !== 'other-active-top-level-conversations-of-the-caller-project-by-ConversationProjectLink; conversations-without-a-project-reach-only-each-other; child-task-conversations-never-listed-or-addressed'
     || crossConversation?.allowlist !== 'enabling-the-switch-extends-only-a-scope-own-saved-allowedTools-with-the-missing-tools(read-only-pair-without-run_agent)-and-records-them-in-crossConversationGrantedTools; a-scope-without-its-own-list-stores-only-the-switch-and-a-list-less-ToolPolicy-narrows-nothing; with-no-list-on-the-chain-the-default-tool-set-applies; send-create-and-fork-are-offered-and-admitted-only-while-the-Turn-effective-allowedTools-include-run_agent(otherwise-list-and-read-only); turning-off-removes-only-granted-tools; restoring-removes-them-unless-the-switch-stays-on-in-an-upper-layer-or-in-an-Agent-or-workflow-the-scope-runs-with; an-explicit-user-enable-clears-a-tool-grant-mark; backend-never-widens-a-saved-allowlist'
     || crossConversation?.delivery !== 'running-target-queues-behind-its-current-Turn; followup-starts-its-own-Turn-and-only-that-Turn-consumes-it; followup-waits-behind-any-running-Turn-at-dispatch-including-one-started-after-its-anchor; followups-from-different-senders-start-sequential-Turns-never-merged; queued-followups-start-in-send-order-by-the-CollaborationMessage.message_seq-their-send-transaction-assigned-never-by-timestamp; that-Turn-spends-only-the-requester-budget; message-joins-the-next-Turn-whatever-starts-it; completion-replies-join-a-running-requester-Turn-at-a-safe-boundary; a-cross-conversation-completion-or-failure-reply-to-an-idle-requester(also-after-a-user-stop)-starts-one-requester-Turn-that-spends-the-chain-automatic-followup-budget; with-the-budget-spent-the-reply-waits-for-the-next-Turn-without-error; team-replies-and-plain-messages-start-no-Turn'
     || crossConversation?.authority !== 'peer-text-is-an-attributed-collaboration-envelope-sent-as-user-role-runtime-data-never-a-user-message; its-fixed-kernel-header-says-it-is-from-another-conversation-or-team-agent-not-this-conversation-user-and-untrusted; list-and-read-carry-an-untrusted-data-notice') {
@@ -1020,19 +1020,45 @@ function validateSubagent(subagent, failures) {
   if (!String(crossConversation?.decisions ?? '').includes('a-cross-conversation-reply-starts-an-idle-requester-Turn-that-spends-and-continues-the-budget-of-the-request-it-answers')) {
     failures.push('跨对话回复须开启空闲请求方的一轮，并花费和沿用它所回复请求的预算');
   }
+  const crossScope = String(crossConversation?.scope ?? '');
+  for (const marker of ['the-project-bounds-list-read-send-and-fork', 'create_conversation-creates-in-the-caller-project', 'checked-by-the-control-plane-however-its-reference-was-obtained', 'another-project-is-refused']) {
+    if (!crossScope.includes(marker)) failures.push(`跨对话项目范围规则缺少${marker}`);
+  }
+  const crossRead = String(crossConversation?.read ?? '');
+  for (const marker of ['newest-first-page', 'stays-under-the-tool-result-cap', 'olderMessageRef-leads-to-them', 'read_conversation-with-R#-messageRef-and-offset-pages-it-whole', 'collaboration-inputs-a-Turn-took-in']) {
+    if (!crossRead.includes(marker)) failures.push(`跨对话读取规则缺少${marker}`);
+  }
+  const readBudget = crossConversation?.readBudget;
+  if (!Number.isSafeInteger(readBudget?.pageTokens) || !Number.isSafeInteger(readBudget?.messagePreviewTokens)
+    || readBudget.messagePreviewTokens > readBudget.pageTokens) {
+    failures.push('跨对话读取必须给出页预算与单条预览预算，单条不超过整页');
+  }
+  const messageText = collaboration?.messageText;
+  const paging = String(messageText?.paging ?? '');
+  const preview = String(messageText?.preview ?? '');
+  if (!Number.isSafeInteger(messageText?.pageTokens) || !Number.isSafeInteger(messageText?.pageMaxCharacters)
+    || !paging.includes('read_agent_messages-with-M#-messageRef-and-offset') || !paging.includes('following-nextOffset-until-null-returns-the-whole-text')
+    || !preview.includes('marker-names-the-exact-call-read_agent_messages') || !preview.includes('recipientSeesPreview')) {
+    failures.push('协作消息必须可按页读取全文，截断预览标出读取调用并告知发送方');
+  }
   const crossCreate = String(crossConversation?.create ?? '');
-  for (const marker of ['stable-Conversation-id-from-ToolCall', 'checked-before-any-write', 'commit-in-one-transaction', 'leaves-no-Conversation', 'replay-after-deletion-is-refused', 'no-ConversationOriginLink']) {
+  for (const marker of ['stable-Conversation-id-from-ToolCall', 'checked-before-any-write', 'commit-in-one-transaction', 'leaves-no-Conversation', 'replay-after-deletion-is-refused', 'refused-at-admission-clears-settings-a-crashed-attempt-left-only-when-a-read-finds-some', 'no-ConversationOriginLink']) {
     if (!crossCreate.includes(marker)) failures.push(`跨对话新建对话规则缺少${marker}`);
   }
   const crossFork = String(crossConversation?.fork ?? '');
-  for (const marker of ['commandId-is-ToolCall', 'completed-history-up-to-the-last-ended-Turn', 'starts-no-Turn', 'replay-keeps-the-committed-boundary', 'never-navigates-the-view']) {
+  for (const marker of ['commandId-is-ToolCall', 'completed-history-up-to-the-last-ended-Turn', 'starts-no-Turn', 'replay-keeps-the-committed-boundary', 'never-navigates-the-view', 'hosted-by-another-window-is-refused-with-a-clear-error', 'any-failed-attempt-clears-copied-settings']) {
     if (!crossFork.includes(marker)) failures.push(`跨对话分支规则缺少${marker}`);
+  }
+  const inheritedRefs = String(crossConversation?.inheritedRefs ?? '');
+  for (const marker of ['selfConversationRef', 'forkedFromConversationRefs', 'inheritedMessageRefs', 'fails-with-where-it-came-from']) {
+    if (!inheritedRefs.includes(marker)) failures.push(`分支继承引用规则缺少${marker}`);
   }
   const crossLimits = crossConversation?.limits;
   if (!Number.isSafeInteger(crossLimits?.maxPendingInboundMessages) || crossLimits.maxPendingInboundMessages < 1
     || !Number.isSafeInteger(crossLimits?.maxConversationSpawnsPerTurn) || crossLimits.maxConversationSpawnsPerTurn < 1
     || crossLimits?.automaticFollowupBudget !== 'cross-conversation-followups-and-create_conversation-spend-maxAutomaticFollowups; checked-before-any-write; so-does-each-requester-Turn-a-cross-conversation-reply-starts-checked-in-its-admission-transaction'
     || crossLimits?.pendingInbound !== 'undelivered-message-and-followup-deliveries-from-any-sender-per-target; completion-replies-exempt; enforced-on-cross-conversation-sends'
+    || crossLimits?.pendingInboundRefusal !== 'names-the-unread-count-and-that-no-message-or-followup-can-be-queued-until-the-target-takes-them-in-with-its-next-turn; suggests-no-retry'
     || crossLimits?.spawns !== 'create_conversation-and-fork_conversation-calls-of-one-sender-Turn-ranked-by-committed-call-order'
     || crossLimits?.overflow !== 'clear-tool-error; nothing-written; no-new-settings') {
     failures.push('跨对话协作必须复用自动续派预算并给出固定的积压与新建分支上限');

@@ -12,7 +12,11 @@ const { CROSS_CONVERSATION_TOOL_NAMES, crossConversationToolModules, isReadonlyC
 const { runAgentTool, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY } = load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { createBuiltinToolDefinitions } = load('backend/world/modules/tools/definitions/index.js');
 const { CROSS_CONVERSATION_LIMITS, frozenCrossConversationEnabled } = load('backend/reliableKernel/collaborationPolicy.js');
-const { COLLABORATION_MESSAGE_MAX_TEXT_BYTES } = load('backend/reliableKernel/collaborationControlPlane.js');
+const { COLLABORATION_MESSAGE_MAX_TEXT_BYTES, COLLABORATION_TEXT_PAGE_TOKENS, COLLABORATION_TEXT_PAGE_MAX_CHARACTERS,
+  TRANSCRIPT_PAGE_TOKENS, TRANSCRIPT_MESSAGE_PREVIEW_TOKENS, CROSS_PROJECT_REFUSAL } = load('backend/reliableKernel/collaborationControlPlane.js');
+const { TOOL_RESULT_MAX_TOKENS } = load('backend/reliableKernel/modelFacingContextProjection.js');
+const { RUNTIME_DELIVERY_MODEL_NOTE, renderRuntimeDeliveryModelEnvelope } = load('backend/reliableKernel/runtimeDeliveryProjection.js');
+const { agentCollaborationToolModules, AGENT_COLLABORATION_TOOL_NAMES } = load('backend/world/modules/tools/definitions/agentCollaboration/index.js');
 const { RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS } = load('shared/reliableKernelClientFeed.js');
 const { crossConversationToolPermitted } = load('shared/toolPolicyResolution.js');
 const { CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE, CLIENT_MESSAGE_WINDOW_LIMIT, CLIENT_SNAPSHOT_MAX_BYTES } = load('backend/reliableKernel/clientFeedBounds.js');
@@ -100,4 +104,51 @@ test('the board contract says it is not offered, and the registry agrees', async
   assert.match(collaboration.board.offering, /^not-offered-to-models-in-phase-one;/);
   const builtin = createBuiltinToolDefinitions({ command: { toolName: 'bash', description: 'contract fixture' } }).map(tool => tool.declaration.name);
   assert.equal(builtin.includes('agent_board'), false);
+});
+
+test('paged reads: the contract numbers are the code constants, every page fits under the tool-result cap, and the truncation marker names the paged tool', async () => {
+  const { messageText } = (await contract('subagent')).collaboration;
+  assert.equal(messageText.pageTokens, COLLABORATION_TEXT_PAGE_TOKENS);
+  assert.equal(messageText.pageMaxCharacters, COLLABORATION_TEXT_PAGE_MAX_CHARACTERS);
+  assert.ok(COLLABORATION_TEXT_PAGE_TOKENS < TOOL_RESULT_MAX_TOKENS);
+  const { readBudget } = await crossConversation();
+  assert.deepEqual(readBudget, { pageTokens: TRANSCRIPT_PAGE_TOKENS, messagePreviewTokens: TRANSCRIPT_MESSAGE_PREVIEW_TOKENS });
+  assert.ok(TRANSCRIPT_MESSAGE_PREVIEW_TOKENS <= TRANSCRIPT_PAGE_TOKENS && TRANSCRIPT_PAGE_TOKENS < TOOL_RESULT_MAX_TOKENS);
+  // The paging tool the contract and the marker name is a real team tool with the parameters they name.
+  const pagingTool = /^(read_agent_messages)-with-M#-messageRef-and-offset/.exec(messageText.paging)?.[1];
+  assert.ok(AGENT_COLLABORATION_TOOL_NAMES.includes(pagingTool));
+  const properties = name => [...agentCollaborationToolModules, ...crossConversationToolModules].map(module => module.create({}).declaration)
+    .find(declaration => declaration.name === name).parameters.properties;
+  for (const key of ['messageRef', 'offset']) {
+    assert.ok(properties(pagingTool)[key], `${pagingTool}.${key}`);
+    assert.ok(properties('read_conversation')[key], `read_conversation.${key}`);
+  }
+  const catalog = { entries: [{ kind: 'collaborationMessage', ref: 'M1', target: 'message-one' },
+    { kind: 'conversation', ref: 'C1', target: 'sender' }, { kind: 'conversation', ref: 'C2', target: 'recipient' }] };
+  const rendered = renderRuntimeDeliveryModelEnvelope({ kind: 'collaboration_message', sourceId: 'message-one', messageId: 'message-one',
+    deliveryId: 'delivery', inboxItemId: 'inbox', targetTurnId: 'turn', status: 'submitted', deliveredAt: '2026-09-23T00:00:00.000Z',
+    note: RUNTIME_DELIVERY_MODEL_NOTE, sourceConversationId: 'sender', targetConversationId: 'recipient', sourceKind: 'tool', mode: 'followup',
+    replyToMessageId: null, content: 'long task. '.repeat(4000) }, undefined, catalog);
+  assert.match(rendered, new RegExp(`${pagingTool} with messageRef=M1 and offset=0`));
+  assert.match(messageText.preview, new RegExp(`marker-names-the-exact-call-${pagingTool}-with-messageRef-and-offset=0`));
+  const document = await fs.readFile('docs/architecture/reliable-kernel/agent-collaboration.md', 'utf8');
+  assert.match(document, new RegExp(`至多 ${COLLABORATION_TEXT_PAGE_TOKENS} 个估算 token（\`COLLABORATION_TEXT_PAGE_TOKENS\`）和 ${COLLABORATION_TEXT_PAGE_MAX_CHARACTERS} 个字符`));
+  assert.match(document, new RegExp(`条目合计至多 ${TRANSCRIPT_PAGE_TOKENS} 个估算 token（\`TRANSCRIPT_PAGE_TOKENS\`），单条至多 ${TRANSCRIPT_MESSAGE_PREVIEW_TOKENS}`));
+  assert.match(document, new RegExp(`低于 ${TOOL_RESULT_MAX_TOKENS} token 的工具结果上限`));
+});
+
+test('the project scope contract matches the refusal the control plane gives and the texts models and users read', async () => {
+  const section = await crossConversation();
+  assert.match(section.targets, /^other-active-top-level-conversations-of-the-caller-project-by-ConversationProjectLink; conversations-without-a-project-reach-only-each-other;/);
+  assert.match(CROSS_PROJECT_REFUSAL, /different project/);
+  assert.match(CROSS_PROJECT_REFUSAL, /without a project only reach each other/);
+  const declarations = crossConversationToolModules.map(module => module.create({}).declaration);
+  assert.doesNotMatch(declarations.map(declaration => declaration.description).join('\n'), /workspace/);
+  assert.match(declarations.find(declaration => declaration.name === 'list_conversations').description, /this conversation's project/);
+  const field = runAgentTool.declaration.configSchema.fields.find(candidate => candidate.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY);
+  assert.match(field.description, /同一项目/);
+  assert.doesNotMatch(field.description, /工作区/);
+  const document = await fs.readFile('docs/architecture/reliable-kernel/agent-collaboration.md', 'utf8');
+  assert.match(document, /### 项目范围（已定）/);
+  assert.match(document, /未绑定项目的对话.*只与其他未绑定的对话互通/);
 });
