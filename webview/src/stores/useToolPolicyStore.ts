@@ -18,6 +18,7 @@ import {
   crossConversationToolPermitted,
   defaultToolNames,
   isSwitchGrantedTool,
+  mcpSourceAdmits,
   mcpSourceConfigFor,
   mcpToolIdentity,
   resolveToolPolicyLayers,
@@ -138,6 +139,7 @@ export function cloneSourceConfigs(sourceConfigs: Record<string, ToolPolicySourc
     }
     cloned[sourceId] = {
       enabled: record.enabled === true,
+      ...(record.enabledTools ? { enabledTools: [...record.enabledTools] } : {}),
       ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})
     };
   }
@@ -463,12 +465,17 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       }
       return undefined;
     },
-    /** Whether an upper layer keeps one MCP tool off here: its source is off above or the tool is disabled above. */
+    /**
+     * Whether an upper layer keeps one MCP tool off here: its source is off above, the tool is
+     * disabled above, or an upper allowlist (`enabledTools`) leaves it out.
+     */
     mcpToolBlockedAbove(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, tool: ToolDefinitionRecord): boolean {
       const identity = mcpToolIdentity(tool);
       if (!identity) return tool.source?.kind === 'mcp';
       if (this.mcpSourceBlockedAbove(scopeKind, scopeId, identity.sourceId)) return true;
-      return (mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, identity.sourceId)?.disabledTools ?? []).includes(identity.toolName);
+      const inherited = mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, identity.sourceId);
+      return (inherited?.disabledTools ?? []).includes(identity.toolName)
+        || (!!inherited?.enabledTools && !inherited.enabledTools.includes(identity.toolName));
     },
     /**
      * The built-in read-only Agents and workflows above this scope whose all-sources deny is in the
@@ -481,33 +488,45 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     },
     /**
      * Turns exactly one MCP tool on or off at this scope through its source settings, never through
-     * a tool list: the source's other tools keep what they show now. The scope's entry for the
-     * source is written out so that it no longer depends on the list, and tools an upper layer
-     * already disables are left to that layer. A tool an upper layer keeps off is not changed.
+     * a tool list, and changes nothing else about the source:
+     * - On, where this scope already enables the source: the tool leaves this scope's disables and,
+     *   when the scope keeps an allowlist (`enabledTools`), joins it.
+     * - On, where the source is off here: the scope enables the source for this tool only
+     *   (`enabledTools: [tool]`), so tools the server adds later stay off.
+     * - Off: the tool leaves this scope's allowlist (the source turns off here once the list is
+     *   empty), or else joins this scope's disables.
+     * Disables of tools the server does not list right now stay as they are. A tool an upper layer
+     * keeps off is not changed. Tools are named as their server names them.
      */
     setMcpToolEnabledForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, tool: ToolDefinitionRecord, enabled: boolean): void {
       if (scopeKind !== 'global' && !scopeId?.trim()) return;
       const identity = mcpToolIdentity(tool);
       if (!identity) return;
-      const { sourceId } = identity;
+      const { sourceId, toolName } = identity;
       const listError = this.toolListErrorFor(scopeKind, scopeId);
       if (listError) throw new TypeError(listError.text);
       if (enabled && this.mcpToolBlockedAbove(scopeKind, scopeId, tool)) return;
+      const effective = mcpSourceConfigFor(this.effectivePolicyFor(scopeKind, scopeId).policy.sourceConfigs, sourceId);
+      if (mcpSourceAdmits(effective, toolName) === enabled) return;
       const local = this.localPolicyFor(scopeKind, scopeId).policy;
-      const ownList = this.ownListFor(scopeKind, scopeId);
-      const effective = this.effectivePolicyFor(scopeKind, scopeId).policy;
-      const inheritedDisabled = mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, sourceId)?.disabledTools ?? [];
-      const sourceTools = this.toolDefinitions.flatMap((candidate) => {
-        const candidateIdentity = mcpToolIdentity(candidate);
-        return candidateIdentity?.sourceId === sourceId ? [{ candidate, name: candidateIdentity.toolName }] : [];
-      });
-      const on = new Set(sourceTools.filter(({ candidate }) => toolAllowedByPolicy(effective, candidate)).map(({ name }) => name));
-      if (enabled) on.add(identity.toolName);
-      else on.delete(identity.toolName);
-      const disabledTools = sourceTools.map(({ name }) => name).filter((name) => !on.has(name) && !inheritedDisabled.includes(name));
       const sourceConfigs = cloneSourceConfigs(local?.sourceConfigs) ?? {};
-      sourceConfigs[sourceId] = { enabled: true, ...(disabledTools.length > 0 ? { disabledTools } : {}) };
-      this.setPolicyForScope(scopeKind, scopeId, ownList, local?.name, cloneToolConfigs(local?.toolConfigs), sourceConfigs);
+      const own = sourceConfigs[sourceId];
+      const disabledTools = (own?.disabledTools ?? []).filter((name) => name !== toolName);
+      let next: ToolPolicySourceConfigRecord;
+      if (enabled) {
+        next = own?.enabled
+          ? { enabled: true, ...(own.enabledTools ? { enabledTools: uniqueNames([...own.enabledTools, toolName]) } : {}), ...(disabledTools.length > 0 ? { disabledTools } : {}) }
+          : { enabled: true, enabledTools: [toolName], ...(disabledTools.length > 0 ? { disabledTools } : {}) };
+      } else if (own?.enabledTools) {
+        const enabledTools = own.enabledTools.filter((name) => name !== toolName);
+        next = enabledTools.length > 0
+          ? { enabled: own.enabled, enabledTools, ...(own.disabledTools?.length ? { disabledTools: [...own.disabledTools] } : {}) }
+          : { enabled: false, ...(own.disabledTools?.length ? { disabledTools: [...own.disabledTools] } : {}) };
+      } else {
+        next = { enabled: true, disabledTools: uniqueNames([...(own?.disabledTools ?? []), toolName]) };
+      }
+      sourceConfigs[sourceId] = next;
+      this.setPolicyForScope(scopeKind, scopeId, this.ownListFor(scopeKind, scopeId), local?.name, cloneToolConfigs(local?.toolConfigs), sourceConfigs);
     },
     /** A child task's conversation: cross-conversation tools are never offered there. */
     isChildConversation(conversationId: string | undefined): boolean {

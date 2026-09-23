@@ -619,7 +619,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
         tab.setToolGlobalEnabled(search, true);
         tab = await bindings(mcpTab, {});
         assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [true, false], 'only the ticked tool is on');
-        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['delete_all'] } });
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, enabledTools: ['search'] } });
         assert.equal('allowedTools' in messages.at(-1).payload, false);
         // A list naming MCP tools admits none of them: only source settings do.
         client.toolPolicies = [{ id: 'tool-policy:global:global', name: 'Global', allowedTools: ['read_file', 'mcp_search', 'mcp_delete_all'] }];
@@ -758,6 +758,86 @@ server.connect(new StdioServerTransport());
         } finally {
           await fs.rm(root, { recursive: true, force: true });
         }
+      });
+    });
+
+    await t.test('只勾选单个 MCP 工具时只开启这些工具：服务以后新增的工具不会自动开启，也不丢掉当前没列出的工具的停用', async () => {
+      const { default: mcpTab } = await server.ssrLoadModule('/src/components/settings/global/McpToolSettingsTab.vue');
+      const { TOOL_POLICY_ALL_MCP_SOURCES } = await server.ssrLoadModule(path.join(process.cwd(), 'shared/protocol.ts'));
+      const gh = (original) => ({ ...mcpTool, name: `gh_${original}`, description: original, source: { kind: 'mcp', sourceId: 'gh', originalToolName: original } });
+      const [search, remove, merge, list, deleteRepo] = ['search_code', 'delete_file', 'merge_pull_request', 'list_issues', 'delete_repo'].map(gh);
+      const sources = [{ id: 'gh', name: 'gh', transportKind: 'stdio', status: 'connected', toolCount: 2 }];
+      const readonlyMcp = { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } };
+      const builtins = builtinToolPolicies.map((record) => record.allowedTools === readonlyList ? { ...record, sourceConfigs: readonlyMcp } : record);
+      const session = (tools) => {
+        const state = fresh([...allDefinitions, ...tools]);
+        state.client.builtinToolPolicies = builtins;
+        state.client.mcpToolSources = sources;
+        return state;
+      };
+      const on = (store, scopeKind, scopeId, tool) => toolAllowedByPolicy(store.effectivePolicyFor(scopeKind, scopeId).policy, tool);
+      const { toolAllowedByPolicy } = await server.ssrLoadModule(path.join(process.cwd(), 'shared/toolPolicyResolution.ts'));
+
+      // M1: the MCP tab, a source nobody configured. Ticking one tool enables that tool only, now and later.
+      {
+        const { client, store, bindings } = session([search, remove]);
+        (await bindings(mcpTab, {})).setToolGlobalEnabled(store.toolDefinitions.find((tool) => tool.name === search.name), true);
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { gh: { enabled: true, enabledTools: ['search_code'] } });
+        client.toolDefinitions = [...client.toolDefinitions, merge];
+        for (const agent of ['agent:custom', 'main']) {
+          assert.deepEqual([on(store, 'agent', agent, search), on(store, 'agent', agent, remove), on(store, 'agent', agent, merge)], [true, false, false],
+            `${agent}: a tool the server adds later stays off`);
+        }
+        // Ticking the source itself is the way to take every tool, including later ones.
+        (await bindings(toolEditor, { scopeKind: 'global' })).toggleMcpSource('gh', true);
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { gh: { enabled: true } });
+        assert.equal(on(store, 'agent', 'agent:custom', merge), true);
+      }
+      // M1 through the all-tools list at an Agent scope.
+      {
+        const { client, store, bindings } = session([search, remove]);
+        (await bindings(toolEditor, { scopeKind: 'agent', scopeId: 'agent:d' })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === search.name), true);
+        assert.deepEqual(store.localPolicyFor('agent', 'agent:d').policy.sourceConfigs, { gh: { enabled: true, enabledTools: ['search_code'] } });
+        client.toolDefinitions = [...client.toolDefinitions, merge];
+        assert.equal(on(store, 'agent', 'agent:d', merge), false);
+        // A second tick adds to the same allowlist; unticking the last one turns the source off here.
+        (await bindings(toolEditor, { scopeKind: 'agent', scopeId: 'agent:d' })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === remove.name), true);
+        assert.deepEqual(store.localPolicyFor('agent', 'agent:d').policy.sourceConfigs, { gh: { enabled: true, enabledTools: ['search_code', 'delete_file'] } });
+        (await bindings(toolEditor, { scopeKind: 'agent', scopeId: 'agent:d' })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === search.name), false);
+        (await bindings(toolEditor, { scopeKind: 'agent', scopeId: 'agent:d' })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === remove.name), false);
+        assert.deepEqual(store.localPolicyFor('agent', 'agent:d').policy.sourceConfigs, { gh: { enabled: false } });
+      }
+      // M1b: the source is on globally; Explore opts in one tool, and a later write tool does not reach it.
+      {
+        const { client, store, bindings } = session([search, remove]);
+        store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { gh: { enabled: true } });
+        assert.deepEqual([on(store, 'agent', 'explore', search), on(store, 'agent', 'explore', remove)], [false, false]);
+        (await bindings(toolEditor, { scopeKind: 'agent', scopeId: 'explore' })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === search.name), true);
+        assert.deepEqual(store.localPolicyFor('agent', 'explore').policy.sourceConfigs, { gh: { enabled: true, enabledTools: ['search_code'] } });
+        client.toolDefinitions = [...client.toolDefinitions, merge];
+        assert.deepEqual([on(store, 'agent', 'explore', search), on(store, 'agent', 'explore', remove), on(store, 'agent', 'explore', merge)], [true, false, false]);
+        assert.equal(on(store, 'agent', 'agent:custom', merge), true, 'the global all-tools setting still applies elsewhere');
+      }
+      // M3: a disable for a tool the server does not list right now survives an edit of another tool.
+      {
+        const { client, store, bindings } = session([search, list]);
+        store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { gh: { enabled: true, disabledTools: ['delete_repo'] } });
+        (await bindings(mcpTab, {})).setToolGlobalEnabled(store.toolDefinitions.find((tool) => tool.name === list.name), false);
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { gh: { enabled: true, disabledTools: ['delete_repo', 'list_issues'] } });
+        client.toolDefinitions = [...client.toolDefinitions, deleteRepo];
+        assert.equal(on(store, 'agent', 'agent:custom', deleteRepo), false, 'the tool comes back still off');
+        (await bindings(mcpTab, {})).setToolGlobalEnabled(store.toolDefinitions.find((tool) => tool.name === list.name), true);
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { gh: { enabled: true, disabledTools: ['delete_repo'] } });
+      }
+      // The backend compiles the allowlist the same way, and a lower layer can only narrow it.
+      await withBackendSettings(async ({ configuration, compile, toolAllowedByPolicy: backendAllowed }) => {
+        const custom = await configuration.mutations.createAgent({ name: 'Custom', kind: 'custom' });
+        await configuration.mutations.setToolPolicy({ scopeKind: 'global', sourceConfigs: { gh: { enabled: true, enabledTools: ['search_code', 'delete_file'] } } });
+        await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: custom.id, sourceConfigs: { gh: { enabled: true, enabledTools: ['search_code', 'merge_pull_request'] } } });
+        const policy = await compile(custom.id, 'conversation:custom');
+        assert.deepEqual([search, remove, merge].map((tool) => backendAllowed(policy, tool)), [true, false, false]);
+        const main = await compile('main', 'conversation:main');
+        assert.deepEqual([search, remove, merge].map((tool) => backendAllowed(main, tool)), [true, true, false]);
       });
     });
 

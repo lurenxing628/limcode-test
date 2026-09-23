@@ -213,14 +213,15 @@ function isMcpToolBlockedAbove(tool: ToolDefinitionRecord): boolean {
   return store.mcpToolBlockedAbove(props.scopeKind, props.scopeId, tool);
 }
 
+/**
+ * The server switch turns every tool of the source on or off here, including tools it adds later;
+ * the tools disabled one by one stay disabled, and a single-tool allowlist gives way to the whole source.
+ */
 function toggleMcpSource(sourceId: string, enabled: boolean): void {
   if (editsBlocked.value || (enabled && isMcpSourceBlockedAbove(sourceId))) return;
   const nextConfigs = cloneSourceConfigs();
-  nextConfigs[sourceId] = {
-    ...(nextConfigs[sourceId] ?? {}),
-    enabled,
-    disabledTools: nextConfigs[sourceId]?.disabledTools ?? []
-  };
+  const disabledTools = nextConfigs[sourceId]?.disabledTools ?? [];
+  nextConfigs[sourceId] = { enabled, ...(disabledTools.length > 0 ? { disabledTools } : {}) };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), cloneToolConfigs(), nextConfigs);
 }
 
@@ -625,7 +626,7 @@ function inputNumber(event: Event): number {
     <section v-if="mcpSourceGroups.length > 0" class="mcp-source-section" aria-label="MCP 工具来源">
       <div class="mcp-source-heading">
         <span>MCP 服务</span>
-        <small>关闭某个 MCP 服务会停用它提供的全部工具；展开单个工具后仍可调整执行确认与显示。</small>
+        <small>勾选服务会开启它的全部工具（包括以后新增的工具，单独停用的除外）；只勾选单个工具时只开启这些工具，服务以后新增的工具不会自动开启。关闭服务会停用它的全部工具；展开单个工具后仍可调整执行确认与显示。</small>
         <small v-if="mcpSourcesDeniedHere">内置只读 Agent 和工作流默认不使用 MCP 工具，其它范围开启的服务不会带到这里；需要时在这里单独开启对应服务。</small>
         <small v-if="mcpDenyingBuiltinsAbove.length > 0">此对话使用的内置只读{{ mcpDenyingBuiltinsAbove.join('和') }}不使用其它范围开启的 MCP 服务，在这里开启不会生效；需要时到该 Agent 或工作流的工具设置里开启对应服务。</small>
         <small v-else-if="mcpSourceGroups.some((group) => isMcpSourceBlockedAbove(group.source.id) || group.tools.some(isMcpToolBlockedAbove))">不可勾选的服务或工具已被上层关闭，在这里开启不会生效。</small>

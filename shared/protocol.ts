@@ -1050,6 +1050,12 @@ export interface ToolPolicyToolConfigRecord {
 
 export interface ToolPolicySourceConfigRecord {
   enabled: boolean;
+  /**
+   * When present, the only tools of this source that are on (a single-tool opt-in), so tools the
+   * server adds later stay off. Absent: every tool of the enabled source except `disabledTools`.
+   * Named as the server itself names them (source.originalToolName).
+   */
+  enabledTools?: string[];
   /** Tools of this source turned off, by the name the server itself gives them (source.originalToolName). */
   disabledTools?: string[];
 }

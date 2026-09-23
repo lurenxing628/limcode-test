@@ -184,6 +184,9 @@ export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): To
   if (!isPlainRecord(config)) return undefined;
   return {
     enabled: config.enabled === true,
+    ...(Array.isArray(config.enabledTools)
+      ? { enabledTools: config.enabledTools.filter((name): name is string => typeof name === 'string') }
+      : {}),
     ...(Array.isArray(config.disabledTools)
       ? { disabledTools: config.disabledTools.filter((name): name is string => typeof name === 'string') }
       : {})
@@ -191,12 +194,24 @@ export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): To
 }
 
 /**
+ * Whether resolved source settings admit one of the source's tools (by its original name): the
+ * source is enabled, the tool is in `enabledTools` when that allowlist is present, and it is not in
+ * `disabledTools`. The backend and the settings page decide every MCP tool here.
+ */
+export function mcpSourceAdmits(config: ToolPolicySourceConfigRecord | undefined, toolName: string): boolean {
+  if (!config?.enabled) return false;
+  if (config.enabledTools && !config.enabledTools.includes(toolName)) return false;
+  return !(config.disabledTools ?? []).includes(toolName);
+}
+
+/**
  * Whether a resolved (frozen) ToolPolicy admits one tool. A built-in tool needs its name in the
  * list, except the cross-conversation tools: the switch in the per-tool settings grants them, with
  * the run_agent rule of `crossConversationToolPermitted`, whatever the list names. An MCP tool
  * follows only its source settings, by source id and original tool name (`mcpToolIdentity`): an
- * enabled source admits every tool it does not disable, and a disabled, denied or unconfigured
- * source admits none; tool lists never admit an MCP tool. Offering, dispatch admission, the
+ * enabled source admits the tools in its `enabledTools` allowlist when it has one, else every tool,
+ * minus the ones it disables; a disabled, denied or unconfigured source admits none; tool lists
+ * never admit an MCP tool. Offering, dispatch admission, the
  * provider adapter, the token estimate, the MCP policy gate and the settings view all use this;
  * offering and admission also keep the cross-conversation tools to top-level conversations.
  */
@@ -206,9 +221,7 @@ export function toolAllowedByPolicy(
 ): boolean {
   if (tool.source?.kind === 'mcp') {
     const identity = mcpToolIdentity(tool);
-    const config = identity ? mcpSourceConfigFor(policy.sourceConfigs, identity.sourceId) : undefined;
-    if (!identity || !config?.enabled) return false;
-    return !(config.disabledTools ?? []).includes(identity.toolName);
+    return !!identity && mcpSourceAdmits(mcpSourceConfigFor(policy.sourceConfigs, identity.sourceId), identity.toolName);
   }
   if (isSwitchGrantedTool(tool.name)) {
     return crossConversationSwitchOn(policy.toolConfigs) && crossConversationToolPermitted(policy.allowedTools, tool.name);
@@ -349,7 +362,7 @@ function mergeToolConfigs(
  * does not enable itself turns off, and later layers cannot turn it back on (it stays the fallback
  * for sources they name). A stored all-sources value that is not an object fails closed as a deny.
  * The layer's own source entries then apply over what earlier layers left, so they re-enable
- * nothing an ancestor denied.
+ * nothing an ancestor denied: disables add up and `enabledTools` allowlists intersect.
  */
 function mergeSourceConfigs(
   target: Record<string, ToolPolicySourceConfigRecord>,
@@ -377,8 +390,13 @@ function mergeSourceConfigs(
       ...(current?.disabledTools ?? []),
       ...(incoming.disabledTools ?? [])
     ]).sort();
+    // Allowlists only narrow: each layer that has one keeps the tools every such layer names.
+    const enabledTools = current?.enabledTools && incoming.enabledTools
+      ? uniqueNames(incoming.enabledTools).filter((name) => current.enabledTools!.includes(name)).sort()
+      : (current?.enabledTools ?? (incoming.enabledTools ? uniqueNames(incoming.enabledTools).sort() : undefined));
     target[sourceId] = {
       enabled: current ? current.enabled && incoming.enabled === true : incoming.enabled === true,
+      ...(enabledTools ? { enabledTools } : {}),
       ...(disabledTools.length > 0 ? { disabledTools } : {})
     };
   }
