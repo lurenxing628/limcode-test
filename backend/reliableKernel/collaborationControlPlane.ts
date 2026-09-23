@@ -515,6 +515,13 @@ export class CollaborationControlPlane {
    * contract and just fails: the team sees its members through its own tools.
    */
   private async failUnansweredRequest(request: DomainRow, text: string): Promise<void> {
+    // A reply already committed before its Turn was deleted: only the settlement was lost.
+    const replyId = stablePhaseFId('collaboration_message', collaborationDedupeKey('completion', String(request.id)));
+    if (await this.maybe('CollaborationMessage', replyId)) {
+      const replySource = await this.one('CollaborationMessageSourceLink', { message_id: replyId });
+      await this.finishRequest(request, replySource.turn_id === null ? 'failed' : 'completed');
+      return;
+    }
     const source = await this.one('CollaborationMessageSourceLink', { message_id: request.message_id });
     const requester = await this.maybe('Conversation', String(source.conversation_id));
     if (requester?.status === 'active' && await isCrossConversationFollowup(this.database, String(request.message_id))) {

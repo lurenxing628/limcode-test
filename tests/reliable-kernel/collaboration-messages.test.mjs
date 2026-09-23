@@ -876,3 +876,22 @@ test('the router keeps a cross-conversation followup out of a Turn that started 
   await admitPending(f, 'root', 'root-user');
   assert.equal((await router.resolve({ inboxItemId: team.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-user' })).reason, 'source_turn_active');
 }));
+
+test('a task answered just before its target was deleted settles as completed without a second reply', async () => fixture(async f => {
+  const { ConversationDeletionControlPlane } = load('conversationDeletion.js');
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const followup = await crossSend(f, 'a-task-answered-then-deleted', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  await admitContinuation(f, 'target-b', 'b-answered', followup.deliveryId);
+  await endTurn(f, 'b-answered');
+  await f.collaboration.completeRequestsForTurn({ turnId: 'b-answered', text: 'the answer' });
+  // The Host died after committing the reply but before settling the request.
+  const [request] = await f.rows('CollaborationRequest', { message_id: followup.messageId });
+  await f.database.transaction([repo('CollaborationRequest').update(request.id, { state: 'pending', updated_at: NOW })]);
+  await new ConversationDeletionControlPlane(f.database).delete('target-b');
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  assert.equal((await f.get('CollaborationRequest', request.id)).state, 'completed');
+  const replies = await repliesTo(f, 'peer-a', followup.messageId);
+  assert.equal(replies.length, 1);
+  assert.equal((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, 'the answer');
+}));
