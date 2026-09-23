@@ -224,6 +224,7 @@
     "scope": "selected-conversation-source-or-target-only",
     "snapshotSelection": "messages-sent-from-or-delivered-into-a-loaded-Turn-plus-incoming-pending-or-failed; each-incoming-card-loads-its-delivery; at-most-200-newest-by-message_seq",
     "liveWindow": "existing-per-type-bounds-and-atomic-snapshot-refresh",
+    "byteLimitTrim": "a-collaboration-message-trimmed-under-snapshot-maxBytes-takes-its-links-requests-deliveries-to-its-peer-their-inbox-items-and-a-peer-row-no-kept-link-names; oldest-message_seq-first; deliveries-to-the-selected-conversation-stay",
     "messageBodiesInFeed": false,
     "messagePreview": "CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read",
     "deliveryState": "sender-session-also-sees-the-RuntimeDelivery-of-its-loaded-outgoing-messages; newest-attempt-per-target-decides-waiting-failed-or-settled; failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent-or-before-the-first-message-when-older-than-every-message-and-nothing-earlier-exists-or-among-the-newest-3-pinned-below-every-message-when-newer-than-every-message-or-no-message-has-a-creation-time; a-failure-older-than-a-window-with-earlier-history-appears-once-that-history-loads; a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn",

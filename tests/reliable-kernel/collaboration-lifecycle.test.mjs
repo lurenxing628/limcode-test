@@ -350,3 +350,77 @@ test('the collaboration snapshot starts from the conversation links, never scans
     console.log(`COLLABORATION_SNAPSHOT_QUERY messages=${seq} legacy=${time(() => legacy(loaded)).toFixed(2)}ms current=${time(() => queryCollaborationMessagesForTurns(db, 'x', loaded)).toFixed(2)}ms`);
   } finally { db.close(); }
 });
+
+test('the snapshot byte limit drops a collaboration message with its peer delivery, inbox item and peer row, and stops their live updates', async () => withRuntime(async ({ database }) => {
+  const { CLIENT_SNAPSHOT_MAX_BYTES } = require(path.join(compiled, 'backend/reliableKernel/clientFeedBounds.js'));
+  const wireBytes = (value) => Buffer.byteLength(JSON.stringify(value), 'utf8');
+  // Just under the per-record summary bound, so each row keeps its identity and its full weight.
+  const padded = (record) => ({ ...record, ...Object.fromEntries(Array.from({ length: 7 }, (_value, index) => [`padding_${index}`, 'x'.repeat(240)])) });
+  // The real snapshot shape of `target`, as plain wire data.
+  const projection = JSON.parse(JSON.stringify((await database.clientProjectionSnapshot('target')).snapshot,
+    (_key, value) => typeof value === 'bigint' ? value.toString() : value));
+  const subagents = projection.subagentDeliverySummary;
+  const outgoing = Array.from({ length: 200 }, (_value, index) => `out-${String(199 - index).padStart(3, '0')}`);
+  for (const id of outgoing) {
+    const peer = `peer-${id.slice(4)}`;
+    subagents.collaborationMessages.push(padded({ id, message_seq: String(Number(id.slice(4)) + 1), mode: 'message', created_at: NOW }));
+    subagents.collaborationMessageSourceLinks.push(padded({ id: `${id}-source`, message_id: id, conversation_id: 'target', source_kind: 'tool', turn_id: null }));
+    subagents.collaborationMessageTargetLinks.push(padded({ id: `${id}-target`, message_id: id, conversation_id: peer, inbox_item_id: `${id}-inbox` }));
+    subagents.runtimeDeliveries.push(padded({ id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: peer, target_turn_id: null, state: 'pending', attempt_seq: '1' }));
+    subagents.runtimeInboxItems.push(padded({ id: `${id}-inbox`, source_kind: 'collaboration_message', source_id: id, state: 'available' }));
+    subagents.collaborationPeerConversations.push(padded({ id: peer, title: peer, status: 'active', display_title: peer }));
+  }
+  // The selected Conversation's own queue is not collaboration data and is never trimmed with it.
+  const own = Array.from({ length: 850 }, (_value, index) => `own-${index}`);
+  for (const id of own) {
+    subagents.runtimeDeliveries.push(padded({ id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: 'target', target_turn_id: null, state: 'pending', attempt_seq: '1' }));
+    subagents.runtimeInboxItems.push(padded({ id: `${id}-inbox`, source_kind: 'child_execution', source_id: id, state: 'available' }));
+  }
+  assert.ok(wireBytes(projection) > CLIENT_SNAPSHOT_MAX_BYTES, 'the projection needs trimming');
+
+  let commit;
+  const received = [];
+  const feed = new kernel.BoundedClientFeed({
+    hostBootId: 'collaboration-trim',
+    async externalDataVersion() { return '1'; },
+    async clientProjectionSnapshotAndSubscribe(_conversationId, listener) {
+      commit = listener;
+      return { barrier: { snapshotCommitSeq: '1', snapshot: projection }, unsubscribe() {} };
+    }
+  });
+  try {
+    const connection = await feed.connect({ activeConversationId: 'target', send: (message) => received.push(message) });
+    const snapshot = received[0];
+    assert.ok(wireBytes(snapshot) <= CLIENT_SNAPSHOT_MAX_BYTES);
+    const summary = snapshot.projections.subagentDeliverySummary;
+    const kept = new Set(summary.collaborationMessages.map((value) => value.id));
+    assert.ok(kept.size > 0 && kept.size < outgoing.length, `some collaboration messages were trimmed (kept ${kept.size})`);
+    assert.ok(kept.has('out-199') && !kept.has('out-000'), 'the oldest go first');
+    const keptTargets = new Set(summary.collaborationMessageTargetLinks.map((link) => `${link.inbox_item_id}\0${link.conversation_id}`));
+    assert.deepEqual(summary.runtimeDeliveries.filter((delivery) => delivery.target_conversation_id !== 'target'
+      && !keptTargets.has(`${delivery.inbox_item_id}\0${delivery.target_conversation_id}`)).map((delivery) => delivery.id), [],
+      'no delivery to the peer of a trimmed message is left behind');
+    assert.equal(summary.runtimeDeliveries.filter((delivery) => delivery.target_conversation_id === 'target').length, own.length);
+    const keptInbox = new Set(summary.runtimeDeliveries.map((delivery) => delivery.inbox_item_id));
+    assert.deepEqual(summary.runtimeInboxItems.filter((item) => !keptInbox.has(item.id)).map((item) => item.id), []);
+    const namedPeers = new Set([...summary.collaborationMessageSourceLinks, ...summary.collaborationMessageTargetLinks].map((link) => link.conversation_id));
+    assert.deepEqual(summary.collaborationPeerConversations.filter((peer) => !namedPeers.has(peer.id)).map((peer) => peer.id), [],
+      'a peer no kept message names is dropped too');
+    assert.equal(summary.collaborationPeerConversations.length, kept.size);
+
+    feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: snapshot.messageSeq });
+    const update = (id) => ({ domain: 'RuntimeDelivery', kind: 'upsert', id: `${id}-delivery`,
+      record: { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: `peer-${id.slice(4)}`, target_turn_id: null, state: 'failed', attempt_seq: '1' } });
+    commit({ commitSeq: '2', changes: [update('out-000')], allocatedSequences: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(received.length, 1, 'a trimmed message no longer receives its peer delivery live');
+    commit({ commitSeq: '3', changes: [update('out-199')], allocatedSequences: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(received.at(-1)?.changes?.map((change) => change.id), ['out-199-delivery'], 'a kept message still does');
+  } finally { feed.close(); }
+
+  const contract = JSON.parse(await fs.readFile('docs/architecture/reliable-kernel/contracts/client-feed.json', 'utf8'));
+  assert.equal(contract.collaborationProjection.byteLimitTrim,
+    'a-collaboration-message-trimmed-under-snapshot-maxBytes-takes-its-links-requests-deliveries-to-its-peer-their-inbox-items-and-a-peer-row-no-kept-link-names; '
+    + 'oldest-message_seq-first; deliveries-to-the-selected-conversation-stay');
+}));

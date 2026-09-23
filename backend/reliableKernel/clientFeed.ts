@@ -3319,6 +3319,24 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   }
   filterSnapshotReference(subagents, 'collaborationRequestTurnLinks', 'request_id',
     snapshotIds(subagents, 'collaborationRequests'));
+  // A delivery to another Conversation is here only for a loaded outgoing message, and a peer row
+  // only for a loaded link; both go with the message. The selected Conversation's own deliveries stay.
+  const collaborationTargets = new Set(snapshotArray(subagents, 'collaborationMessageTargetLinks').map((link) =>
+    collaborationDeliveryKey(snapshotField(link, 'inbox_item_id'), snapshotField(link, 'conversation_id'))));
+  filterSnapshotArray(subagents, 'runtimeDeliveries', (delivery) => {
+    const targetConversationId = snapshotField(delivery, 'target_conversation_id');
+    return targetConversationId === activeConversationId
+      || collaborationTargets.has(collaborationDeliveryKey(snapshotField(delivery, 'inbox_item_id'), targetConversationId));
+  });
+  const collaborationPeerIds = new Set([
+    ...snapshotArray(subagents, 'collaborationMessageSourceLinks'),
+    ...snapshotArray(subagents, 'collaborationMessageTargetLinks')
+  ].flatMap((link) => {
+    const id = snapshotField(link, 'conversation_id');
+    return id ? [id] : [];
+  }));
+  filterSnapshotArray(subagents, 'collaborationPeerConversations', (peer) =>
+    collaborationPeerIds.has(snapshotRecordId(peer) ?? ''));
 
   const deliveryIds = snapshotIds(subagents, 'runtimeDeliveries');
   const queuedTurnIntentIds = snapshotIds(window, 'queuedTurnIntents');
@@ -3332,6 +3350,10 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   }));
   filterSnapshotArray(subagents, 'runtimeInboxItems', (item) => inboxIds.has(snapshotRecordId(item) ?? ''));
   if (deliveryIds.size === 0) subagents.runtimeInboxItems = [];
+}
+
+function collaborationDeliveryKey(inboxItemId: string | undefined, conversationId: string | undefined): string {
+  return `${inboxItemId ?? ''}\0${conversationId ?? ''}`;
 }
 
 function requireSnapshotSection(

@@ -15,7 +15,7 @@ const { CROSS_CONVERSATION_LIMITS, frozenCrossConversationEnabled } = load('back
 const { COLLABORATION_MESSAGE_MAX_TEXT_BYTES } = load('backend/reliableKernel/collaborationControlPlane.js');
 const { RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS } = load('shared/reliableKernelClientFeed.js');
 const { crossConversationToolPermitted } = load('shared/toolPolicyResolution.js');
-const { CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE, CLIENT_MESSAGE_WINDOW_LIMIT } = load('backend/reliableKernel/clientFeedBounds.js');
+const { CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE, CLIENT_MESSAGE_WINDOW_LIMIT, CLIENT_SNAPSHOT_MAX_BYTES } = load('backend/reliableKernel/clientFeedBounds.js');
 
 const contract = async name => JSON.parse(await fs.readFile(`docs/architecture/reliable-kernel/contracts/${name}.json`, 'utf8'));
 const crossConversation = async () => (await contract('subagent')).collaboration.crossConversation;
@@ -90,6 +90,9 @@ test('the client feed contract snapshot numbers are the code constants the proje
   assert.match(client.collaborationProjection.snapshotSelection, new RegExp(`; at-most-${CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE}-newest-by-message_seq$`));
   assert.equal(client.snapshot.activeRecordLimitPerType, CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE);
   assert.equal(client.snapshot.messageWindowLimit, CLIENT_MESSAGE_WINDOW_LIMIT);
+  // enforceSnapshotBounds trims to this byte limit; the collaboration trimming rule refers to it.
+  assert.equal(client.snapshot.maxBytes, CLIENT_SNAPSHOT_MAX_BYTES);
+  assert.match(client.collaborationProjection.byteLimitTrim, /-trimmed-under-snapshot-maxBytes-/);
 });
 
 test('the board contract says it is not offered, and the registry agrees', async () => {
