@@ -15,12 +15,17 @@ const row = (domain, value) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(
 /**
  * The frames a real bounded feed sends to a Webview bound to `target`: its snapshot, then whatever
  * one committed deletion of the peer `gone` produces. `gone` is also a fork of `target`, so like any
- * fork it holds a copied message and the ConversationBranchLink from `target`.
+ * fork it holds a copied message and the ConversationBranchLink from `target`. The Runtime stays open
+ * so its detail reader can answer the Webview's detail requests.
  */
-async function feedFrames() {
+async function openRuntime() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-collaboration-card-labels-'));
   let database;
   const feedClient = { received: [] };
+  const close = async () => {
+    if (database) await database.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  };
   try {
     const fixture = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(fixture.authority, { hostBootId: 'collaboration-card-labels' });
@@ -83,16 +88,17 @@ async function feedFrames() {
       for (let attempt = 0; attempt < 400 && feedClient.received.length === 1; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      return { snapshot, deletion: feedClient.received.slice(1) };
+      return { snapshot, deletion: feedClient.received.slice(1), details: new kernel.ClientDetailReader(database, store), close };
     } finally { feed.close(); }
-  } finally {
-    if (database) await database.close();
-    await fs.rm(directory, { recursive: true, force: true });
+  } catch (error) {
+    await close();
+    throw error;
   }
 }
 
 test('a real snapshot and Conversation deletion drive the card and queue labels, the fork button and the fork notice', async (t) => {
-  const { snapshot, deletion } = await feedFrames();
+  const runtime = await openRuntime();
+  const { snapshot, deletion } = runtime;
   assert.equal(snapshot.type, 'reliable-kernel.snapshot');
   assert.deepEqual(deletion.map((message) => message.type), ['reliable-kernel.snapshot'],
     'deleting a Conversation that has messages reaches the target session as a fresh snapshot, not a Conversation remove');
@@ -107,7 +113,8 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
   const command = { commandId: 'fork-command-replayed', expectedVersion: 0, issuedAt: 1 };
-  const host = { posted: [], listeners: new Set(), state: { reliableConversationControls: {
+  // Detail requests are answered by the Runtime's own reader, as the extension host does.
+  const host = { posted: [], listeners: new Set(), answerDetail: undefined, detailReads: [], state: { reliableConversationControls: {
     conversationActions: {}, pendingTurnInputs: {}, failedTurnInputs: {},
     // An unconfirmed fork from before a reload: its replayed result offers the fork as a notice.
     forkRequests: { [command.commandId]: {
@@ -119,12 +126,16 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
   globalThis.window = {
     addEventListener(type, listener) { if (type === 'message') host.listeners.add(listener); },
     removeEventListener(_type, listener) { host.listeners.delete(listener); },
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, atob,
     requestAnimationFrame(callback) { return setTimeout(() => callback(Date.now()), 0); },
     cancelAnimationFrame(id) { clearTimeout(id); },
     acquireVsCodeApi() {
       return {
-        postMessage(message) { host.posted.push(structuredClone(message)); },
+        postMessage(message) {
+          const plain = structuredClone(message);
+          host.posted.push(plain);
+          if (plain?.type === 'reliable-kernel.detail-request') host.answerDetail(plain);
+        },
         getState() { return host.state; },
         setState(value) { host.state = structuredClone(value); }
       };
@@ -149,6 +160,10 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
       return { html: await renderToString(app), setup: setupState };
     };
     const feed = useReliableKernelClientFeedStore();
+    host.answerDetail = (request) => host.detailReads.push(runtime.details.read({ ...request, conversationId: 'target' }).then(
+      (detail) => feed.observe({ type: 'reliable-kernel.detail-result', requestId: request.requestId, sessionId: request.sessionId, detail }),
+      (error) => feed.observe({ type: 'reliable-kernel.detail-error', requestId: request.requestId, sessionId: request.sessionId, message: String(error?.message ?? error) })
+    ));
     feed.observe(snapshot);
     await nextTick();
     const peers = feed.records.CollaborationPeerConversation ?? {};
@@ -203,7 +218,16 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
     list.setup.openForkReadyNotice();
     assert.deepEqual(host.posted.filter((message) => message.type === BridgeMessageType.ConversationOpen), [],
       '"打开分支" never opens the deleted fork');
+
+    // Every detail request is answered, so no request deadline or retry timer outlives the test.
+    for (let attempt = 0; attempt < 400 && Object.keys(feed.pendingDetails).length > 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(Object.keys(feed.pendingDetails), []);
+    list = await mount(messageList);
+    assert.match(list.html, /第一轮/, 'the message bodies came from the Runtime detail reader');
   } finally {
+    await Promise.allSettled(host.detailReads);
     await new Promise((resolve) => setTimeout(resolve, 50));
     pinia.setActivePinia(previousPinia);
     if (previousWindow === undefined) delete globalThis.window;
@@ -211,5 +235,6 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;
     await server.close();
+    await runtime.close();
   }
 });
