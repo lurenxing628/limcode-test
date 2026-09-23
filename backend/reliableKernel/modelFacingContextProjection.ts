@@ -774,21 +774,17 @@ export function stripNativeConfigurationUpdates(contents: readonly MessageConten
   return { contents: stripped, removedCount: updates.length, updates };
 }
 
-/** Scans durable stored Context items for configuration_update facts without altering them. */
+/**
+ * Scans durable stored Context items for configuration_update facts without altering them.
+ * A configuration_update is a provider item, so it can only sit inside stored MessageContent:
+ * message and compression segments. Tool pairs and Runtime Deliveries are rendered from kernel
+ * facts into function and text parts that never hold one; they are not projected here, since that
+ * would need the complete model handle catalog of the window.
+ */
 export function collectStoredNativeConfigurationUpdates(
   items: readonly StoredModelFacingContextItem[]
 ): NativeConfigurationUpdateFact[] {
-  const updates: NativeConfigurationUpdateFact[] = [];
-  for (const item of items) {
-    for (const content of storedContextItemContents(item, { entries: [] })) {
-      for (const part of content.parts) {
-        if (!isNativeConfigurationUpdatePart(part)) continue;
-        const effort = nativeConfigurationUpdateEffort(part);
-        updates.push(effort === undefined ? {} : { effort });
-      }
-    }
-  }
-  return updates;
+  return collectNativeConfigurationUpdates(items.flatMap((item) => storedMessageContents(item) ?? []));
 }
 
 /**
@@ -1061,6 +1057,16 @@ function storedContextItemContents(
       }];
     }
   }
+  const stored = storedMessageContents(item);
+  if (stored) return stored;
+  return [{
+    role: item.messageRole === 'model' ? 'model' : 'user',
+    parts: [{ text: contextText(item.content, item.contentType) }]
+  }];
+}
+
+/** MessageContent stored verbatim by message and compression segments; undefined for any other item. */
+function storedMessageContents(item: StoredModelFacingContextItem): MessageContent[] | undefined {
   if (item.contentType === 'application/vnd.limcode.compression-contents+json') {
     const envelope = parseRecord(item.content);
     if (envelope?.kind === 'compression_contents' && Array.isArray(envelope.contents)) {
@@ -1071,10 +1077,7 @@ function storedContextItemContents(
     const parsed = parseJson(item.content);
     if (isMessageContentValue(parsed)) return [cloneMessageContent(parsed)];
   }
-  return [{
-    role: item.messageRole === 'model' ? 'model' : 'user',
-    parts: [{ text: contextText(item.content, item.contentType) }]
-  }];
+  return undefined;
 }
 
 function splitStoredToolResponseAttachments(value: unknown): { value: unknown; parts: InlineDataPart[] } {

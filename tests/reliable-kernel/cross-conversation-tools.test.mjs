@@ -44,6 +44,7 @@ const { createBuiltinToolDefinitions } = load('backend/world/modules/tools/defin
 const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
 const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
 const { LlmEventType } = load('backend/world/modules/llm/events.js');
+const { createDefaultLlmCompressionConfig } = load('shared/protocol.js');
 const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
 // Canonical ids never occur inside titles or message text, as with production random ids.
 const ROOT = 'conv-root-7c1', PEER = 'conv-peer-7c2';
@@ -66,9 +67,9 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     provider: providerKind, baseUrl: 'https://example.invalid/v1', model: modelId,
     models: [{ id: modelId, name: 'synthetic' }], modelConfigs: [], generationConfig: {}, contextWindowTokens: 200000 };
   let app, coordinator, runner, collaborationTools, lifecycle;
-  const errors = [], dispatches = [], wakes = [];
+  const errors = [], dispatches = [], wakes = [], compressionRequests = [];
   const f = {
-    errors, dispatches, wakes, configuration,
+    errors, dispatches, wakes, compressionRequests, configuration,
     get app() { return app; }, get runner() { return runner; }, get lifecycle() { return lifecycle; },
     rows: async (domain, where = {}) => (await app.database.snapshotAll(repo(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot,
     async until(check, message, timeoutMs = 15000) {
@@ -91,6 +92,13 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     },
     async transcript(conversationId) {
       return (await app.runtime.collaboration.readConversation({ conversationId, targetConversationId: conversationId, limit: 50 })).messages;
+    },
+    /** Saves one text-summary compression method with the given trigger as the only default. */
+    async compression(trigger) {
+      const config = { ...createDefaultLlmCompressionConfig('Synthetic compression'), kind: 'llm_summary', fallbacks: [], trigger,
+        llmSummary: { targetTokens: 512, reasoning: { mode: 'provider_default' } } };
+      await save('llmCompressionConfigs', { configs: [config] });
+      await save('llmCompression', { defaultConfigId: config.id, providerBindings: [], modelBindings: [] });
     }
   };
   try {
@@ -118,6 +126,11 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
       mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { throw new Error('External tool calls are forbidden in this fixture.'); } },
       mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
       providers: { resolve(providerId) { return { providerId, async sendFullRequest(request, controls) {
+        if (request.recipe?.compressionMethodKind) {
+          compressionRequests.push(request);
+          await complete(controls, { type: 'compression_result', contents: [{ role: 'user', parts: [{ text: `Synthetic summary ${compressionRequests.length}.` }] }] });
+          return;
+        }
         const [requestRow] = await f.rows('ModelRequest', { id: request.modelRequestId });
         const observedRequest = { ...request, turnId: requestRow.turn_id };
         try {
@@ -1095,5 +1108,92 @@ for (const [providerKind, modelId] of WIRE_PROVIDERS) {
       await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'The created conversation never answered.');
       assert.equal(createdSeen, true);
     }, { providerKind, modelId });
+  });
+}
+
+/**
+ * Builds a ROOT history that holds every kind of collaboration fact a compression must carry: a
+ * list_conversations and a list_agents result, a received followup that ran in its own Turn, and a
+ * received message that joins ROOT's next Turn. The control history has the same shape without them.
+ */
+function compressionHistory(withCollaboration) {
+  const LONG = `Earlier important history. ${'以前的重要历史，需要在压缩后保留。'.repeat(700)}`;
+  let rootRound = 0, peerRound = 0;
+  const send = async (request, f, start) => {
+    if (request.conversationId === PEER) {
+      peerRound += 1;
+      if (peerRound === 1) return toolsAnswer(call('peer-list', 'list_conversations'));
+      const root = detail(start, 'list_conversations')?.conversations.find(entry => entry.title === 'Root title');
+      if (peerRound === 2) return toolsAnswer(call('peer-task', 'send_conversation_message', { conversationRef: root.conversationRef, text: 'PEER_COMPRESSION_TASK', mode: 'followup' }));
+      if (peerRound === 3) return answer('Peer asked root for a task.');
+      if (peerRound === 4) return toolsAnswer(call('peer-list-again', 'list_conversations'));
+      if (peerRound === 5) return toolsAnswer(call('peer-note', 'send_conversation_message', { conversationRef: root.conversationRef, text: 'PEER_COMPRESSION_NOTE', mode: 'message' }));
+      return answer('Peer informed root.');
+    }
+    const text = JSON.stringify(start.contents);
+    if (text.includes('PEER_COMPRESSION_TASK') && !text.includes('ROOT_TASK_DONE')) return answer('ROOT_TASK_DONE');
+    rootRound += 1;
+    if (withCollaboration && rootRound === 1) return toolsAnswer(call('root-list', 'list_conversations'));
+    if (withCollaboration && rootRound === 2) return toolsAnswer(call('root-agents', 'list_agents'));
+    return answer(`Root answer ${rootRound}. ${'模型的较长回答。'.repeat(200)}`);
+  };
+  const build = async f => {
+    await f.compression({ mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 });
+    const first = await f.input(ROOT, 'history', LONG);
+    assert.equal((await f.terminated(first.turnId)).terminal_status, 'completed');
+    if (!withCollaboration) return;
+    const task = await f.input(PEER, 'peer-task');
+    assert.equal((await f.terminated(task.turnId)).terminal_status, 'completed');
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'ROOT never answered the peer task.');
+    const note = await f.input(PEER, 'peer-note');
+    assert.equal((await f.terminated(note.turnId)).terminal_status, 'completed');
+    const [delivery] = (await f.rows('RuntimeDelivery', { target_conversation_id: ROOT })).filter(row => row.state === 'pending');
+    assert.deepEqual([delivery?.phase, delivery?.target_turn_id], ['next_turn', null], 'the note waits for ROOT\'s next Turn');
+  };
+  return { send, build };
+}
+
+async function assertRootTurnsCompleted(f) {
+  const turns = await f.rows('Turn', { conversation_id: ROOT });
+  for (const turn of turns) {
+    const [termination] = await f.rows('TurnTermination', { turn_id: turn.id });
+    assert.equal(termination?.terminal_status, 'completed', `ROOT Turn ${turn.id} ended ${termination?.terminal_status}: ${termination?.reason}`);
+  }
+}
+
+for (const withCollaboration of [false, true]) {
+  const label = withCollaboration ? 'with collaboration results and received messages' : 'without collaboration facts (control)';
+  test(`automatic compression runs on a history ${label} and every Turn completes`, { timeout: 90000 }, async () => {
+    const history = compressionHistory(withCollaboration);
+    await fixture(history.send, async f => {
+      await history.build(f);
+      await f.compression({ mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 4000 });
+      for (const commandId of ['after-threshold', 'after-compression']) {
+        const turn = await f.input(ROOT, commandId);
+        assert.equal((await f.terminated(turn.turnId)).terminal_status, 'completed');
+      }
+      assert.ok(f.compressionRequests.length > 0, 'the threshold compressed the history');
+      assert.ok((await f.rows('CompressionBlock', { conversation_id: ROOT })).length > 0);
+      await assertRootTurnsCompleted(f);
+      if (withCollaboration) assert.deepEqual((await f.rows('RuntimeDelivery', { target_conversation_id: ROOT })).map(row => row.state), ['consumed', 'consumed']);
+    });
+  });
+
+  test(`manual compression runs on a history ${label} and the next Turn completes`, { timeout: 90000 }, async () => {
+    const history = compressionHistory(withCollaboration);
+    await fixture(history.send, async f => {
+      await history.build(f);
+      const reads = await f.input(ROOT, 'take-in-note');
+      assert.equal((await f.terminated(reads.turnId)).terminal_status, 'completed');
+      const [head] = await f.rows('ConversationContextHeadLink', { conversation_id: ROOT });
+      const structure = await f.app.context.materializeStructure(head.root_id);
+      const result = await f.runner.manualCompression({ commandId: 'manual-compression', conversationId: ROOT,
+        compressSegmentCount: structure.records.length, target: { kind: 'current_head', expectedRootId: head.root_id } });
+      assert.equal(result.compression?.status, 'compressed', JSON.stringify(result));
+      assert.equal(f.compressionRequests.length, 1);
+      const next = await f.input(ROOT, 'after-manual');
+      assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+      await assertRootTurnsCompleted(f);
+    });
   });
 }
