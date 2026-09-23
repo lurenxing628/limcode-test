@@ -18,7 +18,7 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
-import { isCrossConversationFollowup } from './collaborationScope';
+import { isCrossConversationFollowup, isCrossConversationReply } from './collaborationScope';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
@@ -478,7 +478,9 @@ export class AutomaticRuntimeDeliveryRouter {
     if (fences.length) {
       steps.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fences[0].id), { turn_id: turn.id }));
       if (boardNotice) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
-      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason: 'source_turn_final_output_fenced', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+      // A reply to a cross-conversation task starts a Turn of its own once this finishing one ends.
+      const reason = await isCrossConversationReply(this.database, String(message.id)) ? 'collaboration_queued_behind_active_turn' : 'source_turn_final_output_fenced';
+      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason, childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
     }
     steps.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: turn.id }));
     return decision({ ...input, sourceTurnId, phase: 'current_turn', targetTurnId: String(turn.id), reason: 'source_turn_active', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });

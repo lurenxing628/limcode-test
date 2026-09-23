@@ -54,6 +54,22 @@ export async function isCrossConversationFollowup(database: RuntimeDatabase, mes
   return children.snapshot.every((rows) => Array.isArray(rows) && rows.length === 0);
 }
 
+/**
+ * A completion or failure reply to a cross-conversation followup. When its requester has no Turn
+ * running it starts one to handle the reply, spending the budget of the task it answers; team
+ * replies and plain messages keep waiting for the requester's next Turn.
+ */
+export async function isCrossConversationReply(database: RuntimeDatabase, messageId: string): Promise<boolean> {
+  const read = await database.snapshot([
+    DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').list({ where: { message_id: messageId }, limit: 2 }),
+    DOMAIN_REPOSITORIES.domain('CollaborationMessageReplyLink').list({ where: { message_id: messageId }, limit: 2 })
+  ]);
+  const sources = read.snapshot[0] as DomainRow[];
+  const replies = read.snapshot[1] as DomainRow[];
+  if (sources.length !== 1 || sources[0].source_kind !== 'completion' || replies.length !== 1) return false;
+  return isCrossConversationFollowup(database, String(replies[0].request_message_id));
+}
+
 /** Derives membership from committed lineage; never accepts caller-supplied team identities. */
 export async function readCollaborationScope(database: RuntimeDatabase, conversationId: string): Promise<CollaborationScope> {
   const read = async (domain: string, id: string): Promise<DomainRow> => {

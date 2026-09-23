@@ -938,7 +938,7 @@ async function assertStrandedMessageSettles(f, conversationId, deliveryId, nextT
   assert.equal((await f.rows('PendingTurnInput', { turn_id: nextTurnId })).length, 1);
 }
 
-test('a completion reply the stopped requester Turn never took in settles its wake and joins the next Turn', async () => fixture(async f => {
+test('a completion reply the stopped requester Turn never took in starts a Turn of its own', async () => fixture(async f => {
   await topLevel(f, ['peer-a', true], ['target-b', false]);
   const followup = await crossSend(f, 'a-task-reply-stranded', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
   await admitContinuation(f, 'target-b', 'b-answers', followup.deliveryId);
@@ -956,7 +956,14 @@ test('a completion reply the stopped requester Turn never took in settles its wa
     repo('ToolCall').update('a-task-reply-stranded', { status: 'terminal', updated_at: NOW }),
     repo('ToolModelResult').insert({ id: 'a-send-model-result', tool_call_id: 'a-task-reply-stranded', message_revision_id: 'a-send-result-revision', created_at: NOW })]);
   await endTurn(f, 'peer-a-turn', 'interrupted');
-  await assertStrandedMessageSettles(f, 'peer-a', delivery.id, 'peer-a-next');
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    await scan();
+    assert.deepEqual(started.map(entry => entry.deliveryId), [delivery.id], 'the reply starts one Turn of the stopped requester');
+    assert.equal((await f.get('RuntimeDelivery', delivery.id)).target_turn_id, started[0].turnId);
+  } finally { await scanner.dispose(); }
 }));
 
 test('a team message the stopped target Turn never took in settles its wake and joins the next Turn', async () => fixture(async f => {
@@ -1044,3 +1051,53 @@ test('nothing is routed into a manual compression Turn: every delivery waits for
   await admitPending(f, 'root', 'root-next');
   for (const sent of [stranded, note, task]) assert.equal((await f.get('RuntimeDelivery', sent.deliveryId)).target_turn_id, 'root-next');
 }));
+
+/** A answers B's idle task after B's Turn ended; returns the reply delivery to B. */
+async function answeredWhileIdle(f, callId, requester, requesterTurn, target, send) {
+  const task = await send(callId);
+  await endTurn(f, requesterTurn);
+  const answering = `${target}-answers-${callId}`;
+  await admitContinuation(f, target, answering, task.deliveryId);
+  await endTurn(f, answering);
+  await f.collaboration.completeRequestsForTurn({ turnId: answering, text: `answer to ${callId}` });
+  const [reply] = await repliesTo(f, requester, task.messageId);
+  const [inbox] = await f.rows('RuntimeInboxItem', { source_id: reply.messageId });
+  return { task, delivery: (await f.rows('RuntimeDelivery', { inbox_item_id: inbox.id }))[0] };
+}
+
+test('a team reply to an idle requester waits for its next Turn while a peer reply asks for a Turn of its own', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const team = await answeredWhileIdle(f, 'root-asks-right', 'root', 'root-turn', 'right',
+    async id => f.collaboration.send({ source: await f.source(id, 'root', 'root-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'team task', mode: 'followup' }));
+  const peer = await answeredWhileIdle(f, 'a-asks-b', 'peer-a', 'peer-a-turn', 'target-b', id => crossSend(f, id, 'peer-a', 'peer-a-turn', 'target-b', 'followup'));
+  for (const { delivery } of [team, peer]) assert.deepEqual([delivery.state, delivery.phase, delivery.target_turn_id], ['pending', 'next_turn', null]);
+  assert.deepEqual(await f.rows('RuntimeDeliveryWake', { delivery_id: team.delivery.id }), [], 'nothing wakes the team requester');
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    await scan();
+    assert.deepEqual(started.map(entry => entry.deliveryId), [peer.delivery.id], 'only the peer reply starts a Turn');
+    assert.equal((await f.get('RuntimeDelivery', team.delivery.id)).state, 'pending', 'the team reply waits for the next Turn');
+  } finally { await scanner.dispose(); }
+  await admitPending(f, 'root', 'root-next');
+  assert.equal((await f.get('RuntimeDelivery', team.delivery.id)).target_turn_id, 'root-next');
+}));
+
+test('the Turn a peer reply starts spends the task budget, and once it is spent the reply starts nothing', async () => fixture(async f => {
+  const { isCollaborationReplyBudgetExhaustedError } = load('collaborationControlPlane.js');
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const first = await answeredWhileIdle(f, 'a-asks-b-1', 'peer-a', 'peer-a-turn', 'target-b', id => crossSend(f, id, 'peer-a', 'peer-a-turn', 'target-b', 'followup'));
+  assert.notDeepEqual(await f.collaboration.prepareReplyContinuationSteps(first.delivery.id), [], 'the first reply may start a Turn');
+  assert.deepEqual(await f.collaboration.prepareReplyContinuationSteps(first.task.deliveryId), [], 'a followup continuation spends nothing more');
+  await admitContinuation(f, 'peer-a', 'a-reads-1', first.delivery.id);
+  // A asks B again from the Turn the reply started: that Turn spends the chain budget.
+  const second = await answeredWhileIdle(f, 'a-asks-b-2', 'peer-a', 'a-reads-1', 'target-b', async id => {
+    const sent = await crossSend(f, id, 'peer-a', 'a-reads-1', 'target-b', 'followup');
+    assert.equal(await budgetOf(f, sent.deliveryId), 'peer-a-turn');
+    // Budget 3: two followups and the reply Turn.
+    await assert.rejects(crossSend(f, 'a-asks-b-3', 'peer-a', 'a-reads-1', 'target-b', 'followup'), /budget exhausted \(3\)/);
+    return sent;
+  });
+  await assert.rejects(f.collaboration.prepareReplyContinuationSteps(second.delivery.id), isCollaborationReplyBudgetExhaustedError);
+}, 3));

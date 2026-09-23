@@ -422,6 +422,11 @@ export interface TurnControlPlaneOptions {
   ) => Promise<RepositoryTransactionStep[]>;
   /** Moves the collaboration messages a Turn never took in to next_turn inside its terminal commit. */
   prepareTerminalDeliverySteps?: (turnId: string, now: string) => Promise<RepositoryTransactionStep[]>;
+  /**
+   * Budget steps a runtime continuation commits with its TurnIntent: a Turn a cross-conversation
+   * reply starts spends the budget of the task it answers. Throws when that budget is spent.
+   */
+  prepareRuntimeContinuationSteps?: (deliveryId: string) => Promise<RepositoryTransactionStep[]>;
   now?: () => string;
 }
 
@@ -535,6 +540,7 @@ export class TurnControlPlane {
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
   private readonly prepareNextTurnDeliverySteps?: TurnControlPlaneOptions['prepareNextTurnDeliverySteps'];
   private readonly prepareTerminalDeliverySteps?: TurnControlPlaneOptions['prepareTerminalDeliverySteps'];
+  private readonly prepareRuntimeContinuationSteps?: TurnControlPlaneOptions['prepareRuntimeContinuationSteps'];
   private readonly contextSequence: ContextSequenceControlPlane;
   private readonly guidanceQueue: TurnGuidanceQueueOperations;
 
@@ -551,6 +557,7 @@ export class TurnControlPlane {
     this.unresolvedFileClosure = options.unresolvedFileClosure;
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
     this.prepareTerminalDeliverySteps = options.prepareTerminalDeliverySteps;
+    this.prepareRuntimeContinuationSteps = options.prepareRuntimeContinuationSteps;
     this.now = options.now ?? (() => new Date().toISOString());
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.guidanceQueue = new TurnGuidanceQueueOperations({
@@ -1763,6 +1770,9 @@ export class TurnControlPlane {
           contentEstimatedTokens: messageContentEstimatedTokens
         })
       : null;
+    const continuationSteps = plan.operation === 'runtime_continuation' && plan.deliveryId && this.prepareRuntimeContinuationSteps
+      ? await this.prepareRuntimeContinuationSteps(plan.deliveryId)
+      : [];
     // A manual compression or summary rebuild runs no model over new input: pending deliveries
     // stay for the next real Turn instead of blocking this Turn's terminal commit forever.
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps && !plan.runtimeMaintenance
@@ -1854,6 +1864,7 @@ export class TurnControlPlane {
             state: 'pending'
           })
         ] : []),
+        ...continuationSteps,
         DOMAIN_REPOSITORIES.domain('TurnIntent').insert({
           id: ids.intent,
           conversation_id: conversation.id,

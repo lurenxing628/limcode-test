@@ -2,7 +2,7 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
-import { isCrossConversationFollowup } from './collaborationScope';
+import { isCrossConversationFollowup, isCrossConversationReply } from './collaborationScope';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import {
@@ -120,6 +120,8 @@ export class ProcessCompletionDeliveryControlPlane {
   private loopPromise: Promise<void> | undefined;
   private readonly loopWakeups = new Set<() => void>();
   private retryPollingNeeded = false;
+  /** Deliveries whose commit left them waiting for a Turn of their own since the last scan began. */
+  private readonly deliveriesAwaitingTurn = new Set<string>();
   private externalDataVersion: string | undefined;
   private readonly unsubscribeCommit: () => void;
 
@@ -139,6 +141,13 @@ export class ProcessCompletionDeliveryControlPlane {
     this.onError = options.onError;
     this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
     this.unsubscribeCommit = database.onCommit((commit) => {
+      for (const change of commit.changes) {
+        if (change.domain !== 'RuntimeDelivery' || change.kind !== 'upsert') continue;
+        const record = change.record;
+        if (record?.state === 'pending' && record.phase === 'next_turn' && record.target_turn_id === null) {
+          this.deliveriesAwaitingTurn.add(change.id);
+        }
+      }
       if (!commit.changes.some((change) => [
         'ProcessReceipt',
         'ProcessCompletionDispatch',
@@ -266,6 +275,10 @@ export class ProcessCompletionDeliveryControlPlane {
     // Wakes left waiting behind their target's running Turn need no poll: that Turn's terminal
     // commit requests a scan here, and another Host's commit moves the external data version.
     const waitingWakeIds = new Set<string>();
+    // A delivery the Turn it was routed into ended without taking in now waits for a Turn of its
+    // own. Its wake may still back off from polling that Turn; that backoff no longer applies.
+    const awaitingTurn = new Set(this.deliveriesAwaitingTurn);
+    this.deliveriesAwaitingTurn.clear();
     try {
     const dispatches = [
       ...await listAllDomainRows(this.database, 'ProcessCompletionDispatch', { state: 'pending' }),
@@ -334,7 +347,9 @@ export class ProcessCompletionDeliveryControlPlane {
           waitingWakeIds.add(wakeId);
           continue;
         }
-        claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
+        claim = await this.claimOutbox('RuntimeDeliveryWake', wake, {
+          ignoreBackoff: awaitingTurn.has(String(wake.delivery_id))
+        });
         if (!claim) continue;
         const claimedWake = claim;
         const dispatched = targetConversationId === null
@@ -427,8 +442,9 @@ export class ProcessCompletionDeliveryControlPlane {
 
   /**
    * True only while a collaboration delivery waits for its target's running Turn: the Turn it was
-   * anchored to, a manual compression or summary rebuild (which takes nothing in), or, for a
-   * cross-conversation followup, any Turn running in the target.
+   * anchored to, a manual compression or summary rebuild (which takes nothing in), for a
+   * cross-conversation followup any Turn running in the target, and for a reply to such a task a
+   * Turn that has already produced its final output.
    */
   private async queuedBehindActiveTurn(wake: DomainRow): Promise<boolean> {
     try {
@@ -452,7 +468,9 @@ export class ProcessCompletionDeliveryControlPlane {
       const [active] = await this.listRows('Turn', { conversation_id: delivery.target_conversation_id, status: 'active' }, 1);
       if (!active) return false;
       if (await isRuntimeMaintenanceTurn(this.database, this.contentStore, String(active.id))) return true;
-      return isCrossConversationFollowup(this.database, messageId);
+      if (await isCrossConversationFollowup(this.database, messageId)) return true;
+      return await isCrossConversationReply(this.database, messageId)
+        && (await this.listRows('TurnFinalOutputFence', { turn_id: active.id }, 1)).length > 0;
     } catch {
       // Malformed facts surface through the normal claimed dispatch failure path.
       return false;
@@ -816,8 +834,10 @@ export class ProcessCompletionDeliveryControlPlane {
       const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
       // A send-only message never creates a Turn: after the final-output fence race, or once the
       // user stopped the Turn it was injected into, only the target's next Turn takes it in. That
-      // admission needs no wake, so this one settles instead of polling until then.
-      if (message.mode === 'message') return this.acknowledgeWake(wakeInput);
+      // admission needs no wake, so this one settles instead of polling until then. A reply to a
+      // cross-conversation task instead starts a Turn of its idle requester while the task's
+      // budget lasts; the continuation's admission decides that.
+      if (message.mode === 'message' && !await isCrossConversationReply(this.database, String(message.id))) return this.acknowledgeWake(wakeInput);
     }
     const targetTurnId = delivery.target_turn_id === null
       ? null
@@ -985,7 +1005,8 @@ export class ProcessCompletionDeliveryControlPlane {
 
   private async claimOutbox(
     domain: 'ProcessCompletionDispatch' | 'RuntimeDeliveryWake',
-    candidate: DomainRow
+    candidate: DomainRow,
+    options: { ignoreBackoff?: boolean } = {}
   ): Promise<DomainRow | null> {
     const id = requirePhaseFId(candidate.id, `${domain}.id`);
     let current = await this.requireExisting(domain, id);
@@ -1015,7 +1036,7 @@ export class ProcessCompletionDeliveryControlPlane {
       current = await this.requireExisting(domain, id);
     }
     if (current.state !== 'pending') return null;
-    if (current.next_attempt_at !== null) {
+    if (current.next_attempt_at !== null && options.ignoreBackoff !== true) {
       const due = requireIsoTimestamp(current.next_attempt_at, `${domain}.next_attempt_at`);
       if (Date.parse(due) > Date.parse(now)) return null;
     }

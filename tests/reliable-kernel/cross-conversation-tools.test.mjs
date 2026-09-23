@@ -66,11 +66,13 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
   const provider = { ...createDefaultLlmProviderConfig({ name: 'synthetic cross conversation' }), id: 'synthetic-cross',
     provider: providerKind, baseUrl: 'https://example.invalid/v1', model: modelId,
     models: [{ id: modelId, name: 'synthetic' }], modelConfigs: [], generationConfig: {}, contextWindowTokens: 200000 };
-  let app, coordinator, runner, collaborationTools, lifecycle;
+  let app, coordinator, runner, collaborationTools, lifecycle, productionWake;
   const errors = [], dispatches = [], wakes = [], compressionRequests = [];
   const f = {
     errors, dispatches, wakes, compressionRequests, configuration,
     get app() { return app; }, get runner() { return runner; }, get lifecycle() { return lifecycle; },
+    /** The production wake handler, without the test's wake gate. */
+    get wake() { return productionWake; },
     rows: async (domain, where = {}) => (await app.database.snapshotAll(repo(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot,
     async until(check, message, timeoutMs = 15000) {
       const deadline = Date.now() + timeoutMs;
@@ -185,7 +187,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
       deliveryWakeups: app.processDeliveries, ownedProcessCleanup: app.childOwnedProcessCleanup
     });
     runner = new ReliableConversationRunner(app, 'synthetic-cross-owner');
-    const wake = createRuntimeDeliveryWakeHandler({ application: () => app, conversations: () => runner, children: () => coordinator });
+    const wake = productionWake = createRuntimeDeliveryWakeHandler({ application: () => app, conversations: () => runner, children: () => coordinator });
     app.processDeliveries.setWakeHandler(async request => { wakes.push(structuredClone(request)); await wakeGate?.(request); return wake(request); });
   }
   try {
@@ -605,9 +607,10 @@ test('a user Turn that wins the race after the anchor ends leaves the queued pee
   } });
 });
 
-test('deleting the target while a followup is queued tells the waiting sender the task could not start', { timeout: 60000 }, async () => {
+test('deleting the target while a followup is queued tells the waiting sender, and the failure reply starts a Turn of the idle sender', { timeout: 60000 }, async () => {
   const TASK = 'CROSS_DELETED_TASK_9901';
-  let rootRound = 0, peerFirstTurn, held, release, heardFailure = false;
+  let rootRound = 0, peerFirstTurn, held, release;
+  const replyTurns = [];
   const releaseWake = new Promise(resolve => { release = resolve; });
   await fixture(async (request, f, start) => {
     const text = JSON.stringify(start.contents);
@@ -627,7 +630,7 @@ test('deleting the target while a followup is queued tells the waiting sender th
       return toolsAnswer(call('send', 'send_conversation_message', { conversationRef: peer.conversationRef, text: TASK, mode: 'followup' }));
     }
     if (rootRound === 3) return answer('Waiting for the peer.');
-    heardFailure = /Task could not start: the target conversation was deleted/.test(text);
+    replyTurns.push({ turnId: request.turnId, heard: /Task could not start: the target conversation was deleted/.test(text) });
     return answer('Noted.');
   }, async f => {
     const peer = await f.input(PEER, 'peer-own-work');
@@ -643,9 +646,10 @@ test('deleting the target while a followup is queued tells the waiting sender th
     assert.ok(reply, 'the sender is answered instead of waiting forever');
     assert.equal(reply.sourceConversationId, PEER);
     assert.match((await f.app.runtime.collaboration.readMessage({ conversationId: ROOT, messageId: reply.messageId })).text, /^Task could not start: the target conversation was deleted/);
-    const next = await f.input(ROOT, 'any news?');
-    await f.terminated(next.turnId);
-    assert.equal(heardFailure, true, 'the model sees the failure reply in its next Turn');
+    const replyTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: ROOT })).find(turn => turn.id !== root.turnId), 'The failure reply never started a Turn.');
+    assert.equal((await f.terminated(replyTurn.id)).terminal_status, 'completed');
+    assert.deepEqual(replyTurns, [{ turnId: replyTurn.id, heard: true }], 'one Turn of the idle sender starts for the failure reply and reads it');
+    assert.deepEqual(await userMessages(f, replyTurn.id), [], 'that Turn carries no user message');
   }, { wakeGate: async request => {
     if (request.conversationId !== PEER || request.action !== 'start_continuation') return;
     held = request;
@@ -1244,7 +1248,8 @@ async function assertMaintenanceLeftDelivery(f, maintenanceTurnId, deliveryId) {
   assert.deepEqual(await f.rows('PendingTurnInput', { turn_id: maintenanceTurnId }), [], 'a compression takes no delivery in');
   const delivery = (await f.rows('RuntimeDelivery', { id: deliveryId }))[0];
   assert.deepEqual([delivery.state, delivery.phase, delivery.target_turn_id], ['pending', 'next_turn', null]);
-  assert.equal(await f.app.database.hasConversationRuntimeWork(delivery.target_conversation_id), false, 'the compressed conversation is idle again');
+  // Only the reply wake may still settle; the compression leaves no work behind.
+  await f.until(async () => !await f.app.database.hasConversationRuntimeWork(delivery.target_conversation_id), 'The compressed conversation never went idle again.');
 }
 
 test('a manual compression while a message waits for the next Turn ends and leaves the message to the next real Turn', { timeout: 60000 }, async () => {
@@ -1456,4 +1461,231 @@ for (const moment of ['before its terminal commit reads its deliveries', 'betwee
     } finally { releaseScans(); }
   // With a budget of one the reply never starts a Turn of its own.
   }, { runAgentConfig: { maxAutomaticFollowups: 1 } });
+});
+
+/** The one delivery of the reply a collaboration request gets, once it exists. */
+async function replyDelivery(f) {
+  const [request] = await f.rows('CollaborationRequest');
+  const replyId = kernel.stablePhaseFId('collaboration_message', `collaboration:completion:${request.id}`);
+  return f.until(async () => (await f.rows('RuntimeDelivery', { inbox_item_id: kernel.stablePhaseFId('runtime_inbox_item', replyId) }))[0], 'The peer never replied.');
+}
+
+/** ROOT lists, sends TASK as a followup to PEER and answers; later ROOT Turns record whether they read RESULT. */
+function peerTask(TASK, RESULT, { rootLater } = {}) {
+  let rootRound = 0, firstTurn;
+  const later = [];
+  return {
+    later,
+    get firstTurn() { return firstTurn; },
+    async send(request, f, start) {
+      const text = JSON.stringify(start.contents);
+      if (request.conversationId === PEER) return answer(RESULT);
+      firstTurn ??= request.turnId;
+      if (request.turnId !== firstTurn) {
+        later.push({ turnId: request.turnId, result: text.includes(RESULT) });
+        return rootLater ? rootLater(request, f, start) : answer('Read the peer result.');
+      }
+      rootRound += 1;
+      if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+      if (rootRound === 2) {
+        const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+        return toolsAnswer(call('ask', 'send_conversation_message', { conversationRef: peer.conversationRef, text: TASK, mode: 'followup' }));
+      }
+      return answer('Delegated to the peer.');
+    }
+  };
+}
+
+test('a reply to a cross-conversation task starts exactly one Turn of the idle requester, which reads it', { timeout: 60000 }, async () => {
+  const task = peerTask('CROSS_IDLE_TASK_6601', 'CROSS_IDLE_RESULT_6602');
+  await fixture(task.send, async f => {
+    const delegated = await f.input(ROOT, 'delegate');
+    await f.terminated(delegated.turnId);
+    const reply = await replyDelivery(f);
+    const replyTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: ROOT })).find(turn => turn.id !== delegated.turnId), 'The reply never started a Turn.');
+    assert.equal((await f.terminated(replyTurn.id)).terminal_status, 'completed');
+    assert.deepEqual(task.later, [{ turnId: replyTurn.id, result: true }], 'the Turn the reply starts reads it');
+    assert.deepEqual(await userMessages(f, replyTurn.id), [], 'that Turn carries no user message');
+    const [intent] = await f.rows('TurnIntent', { turn_id: replyTurn.id });
+    assert.deepEqual((await f.rows('RuntimeDeliveryIntentLink', { turn_intent_id: intent.id })).map(link => link.delivery_id), [reply.id], 'the reply started it');
+    assert.equal((await f.rows('RuntimeDelivery', { id: reply.id }))[0].target_turn_id, replyTurn.id);
+    await f.until(async () => (await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id }))[0]?.state === 'acknowledged', 'The reply wake never settled.');
+    assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 2, 'exactly one Turn for the reply');
+  });
+});
+
+test('a reply to a running requester joins its Turn and starts no other Turn', { timeout: 60000 }, async () => {
+  const RESULT = 'CROSS_RUNNING_RESULT_6612';
+  let rootRound = 0, sawResultIn;
+  await fixture(async (request, f, start) => {
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === PEER) return answer(RESULT);
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('ask', 'send_conversation_message', { conversationRef: peer.conversationRef, text: 'CROSS_RUNNING_TASK_6611', mode: 'followup' }));
+    }
+    if (rootRound === 3) {
+      // The requester is still answering when the reply arrives.
+      const reply = await replyDelivery(f);
+      assert.deepEqual([reply.phase, reply.target_turn_id], ['current_turn', request.turnId]);
+      return answer('Delegated to the peer.');
+    }
+    sawResultIn = text.includes(RESULT) ? request.turnId : sawResultIn;
+    return answer('Read the peer result.');
+  }, async f => {
+    const delegated = await f.input(ROOT, 'delegate');
+    assert.equal((await f.terminated(delegated.turnId)).terminal_status, 'completed');
+    const reply = await replyDelivery(f);
+    assert.deepEqual([reply.state, reply.target_turn_id], ['consumed', delegated.turnId], 'the running Turn takes the reply in');
+    assert.equal(sawResultIn, delegated.turnId);
+    await f.runner.waitForIdle();
+    assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 1, 'no other Turn starts for the reply');
+  });
+});
+
+test('a reply whose task budget is spent starts no Turn and joins the next user Turn', { timeout: 60000 }, async () => {
+  const task = peerTask('CROSS_SPENT_TASK_6621', 'CROSS_SPENT_RESULT_6622');
+  await fixture(task.send, async f => {
+    const delegated = await f.input(ROOT, 'delegate');
+    await f.terminated(delegated.turnId);
+    const reply = await replyDelivery(f);
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0].state === 'completed', 'The request was never settled.');
+    await f.until(async () => ['acknowledged', undefined].includes((await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id }))[0]?.state), 'The reply wake never settled.');
+    assert.deepEqual((await f.rows('Turn', { conversation_id: ROOT })).map(turn => turn.id), [delegated.turnId], 'no Turn starts for the reply');
+    assert.deepEqual([(await f.rows('RuntimeDelivery', { id: reply.id }))[0].state, f.errors], ['pending', []], 'the reply waits without an error');
+    const next = await f.input(ROOT, 'any news?');
+    assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+    assert.deepEqual(task.later, [{ turnId: next.turnId, result: true }], 'the next user Turn reads the reply');
+  // The followup itself spends the only automatic followup.
+  }, { runAgentConfig: { maxAutomaticFollowups: 1 } });
+});
+
+// Its wake first polls the running Turn: the stop ends that Turn while the wake is dispatched, or
+// after the wake backed off; either way the reply starts the next Turn at once.
+for (const moment of ['while its wake is dispatched', 'after its wake backed off']) test(`a reply that reaches a requester Turn the user stops before taking it in starts a new Turn (${moment})`, { timeout: 60000 }, async () => {
+  const RESULT = 'CROSS_STOPPED_RESULT_6632';
+  const dispatching = moment === 'while its wake is dispatched';
+  let releasePeer, phase = 'delegate', rootRound = 0, workingTurn, resumeHeld, releaseResume;
+  const peerHeld = new Promise(resolve => { releasePeer = resolve; });
+  const resumeReleased = new Promise(resolve => { releaseResume = resolve; });
+  const later = [];
+  await fixture(async (request, f, start) => {
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === PEER) {
+      await peerHeld;
+      return answer(RESULT);
+    }
+    if (phase === 'working') {
+      workingTurn = request.turnId;
+      phase = 'after';
+      await new Promise((_, reject) => request.signal.addEventListener('abort', () => reject(new Error('stopped by the user')), { once: true }));
+    }
+    if (phase === 'after') {
+      later.push({ turnId: request.turnId, result: text.includes(RESULT) });
+      return answer('Read the peer result.');
+    }
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('ask', 'send_conversation_message', { conversationRef: peer.conversationRef, text: 'CROSS_STOPPED_TASK_6631', mode: 'followup' }));
+    }
+    return answer('Delegated to the peer.');
+  }, async f => {
+    const delegated = await f.input(ROOT, 'delegate');
+    await f.terminated(delegated.turnId);
+    await f.until(async () => (await f.rows('Turn', { conversation_id: PEER, status: 'active' }))[0], 'The peer never started the task.');
+    phase = 'working';
+    const working = await f.input(ROOT, 'keep working');
+    await f.until(() => workingTurn, 'The working Turn never asked its model.');
+    // The reply reaches the working Turn after its stop took its inputs in, before it ended.
+    const terminal = f.app.turns.terminal.bind(f.app.turns);
+    let routed = false;
+    f.app.turns.terminal = async command => {
+      if (command.turnId === working.turnId && !routed) {
+        routed = true;
+        releasePeer();
+        const reply = await replyDelivery(f);
+        assert.deepEqual([reply.phase, reply.target_turn_id], ['current_turn', working.turnId], 'fixture: the reply joins the running Turn');
+        if (dispatching) await f.until(() => resumeHeld, 'The reply wake never resumed the running Turn.');
+        else await f.until(async () => {
+          const [wake] = await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id });
+          return wake?.state === 'pending' && wake.next_attempt_at !== null;
+        }, 'The reply wake never backed off.');
+      }
+      try { return await terminal(command); } finally { releaseResume(); }
+    };
+    await f.runner.interrupt({ commandId: 'stop-working', conversationId: ROOT, turnId: working.turnId, reason: 'user stop' });
+    assert.equal((await f.terminated(working.turnId)).terminal_status, 'interrupted');
+    const replyTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: ROOT })).find(turn => ![delegated.turnId, working.turnId].includes(turn.id)), 'The stranded reply never started a Turn.');
+    assert.equal((await f.terminated(replyTurn.id)).terminal_status, 'completed');
+    assert.deepEqual(later.filter(entry => entry.turnId !== working.turnId), [{ turnId: replyTurn.id, result: true }], 'the new Turn reads the reply');
+    assert.equal((await replyDelivery(f)).target_turn_id, replyTurn.id);
+    await f.runner.waitForIdle();
+  }, { wakeGate: async request => {
+    if (!dispatching || request.conversationId !== ROOT || request.action !== 'resume_current_turn') return;
+    resumeHeld = request;
+    await resumeReleased;
+  } });
+});
+
+test('a reply wake dispatched again, or twice at once, still starts only one Turn', { timeout: 60000 }, async () => {
+  const task = peerTask('CROSS_TWICE_TASK_6641', 'CROSS_TWICE_RESULT_6642');
+  let held, release;
+  const released = new Promise(resolve => { release = resolve; });
+  await fixture(task.send, async f => {
+    const delegated = await f.input(ROOT, 'delegate');
+    await f.terminated(delegated.turnId);
+    await f.until(() => held, 'The reply never asked for a Turn.');
+    // Like the scanner, each dispatch runs under the Conversation's ownership pin.
+    const dispatch = () => f.app.database.conversationOwners.run(ROOT, () => f.wake(structuredClone(held)));
+    // Another Host taking the Conversation over and a replay of this Host's wake race the original dispatch.
+    try {
+      const results = await Promise.all([dispatch(), dispatch()]);
+      assert.deepEqual(results, [{ acknowledged: true }, { acknowledged: true }]);
+    } finally { release(); }
+    const reply = await replyDelivery(f);
+    await f.until(async () => (await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id }))[0]?.state === 'acknowledged', 'The reply wake never settled.');
+    const replyTurns = (await f.rows('Turn', { conversation_id: ROOT })).filter(turn => turn.id !== delegated.turnId);
+    assert.equal(replyTurns.length, 1, 'one Turn for the reply');
+    await f.terminated(replyTurns[0].id);
+    assert.deepEqual(task.later, [{ turnId: replyTurns[0].id, result: true }]);
+    assert.equal((await f.rows('RuntimeDeliveryIntentLink', { delivery_id: reply.id })).length, 1);
+    // A later replay of the same wake finds the committed Turn and starts nothing.
+    assert.deepEqual(await dispatch(), { acknowledged: true });
+    assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 2);
+  }, { wakeGate: async request => {
+    if (request.conversationId !== ROOT || request.action !== 'start_continuation') return;
+    held = request;
+    await released;
+  } });
+});
+
+test('two conversations trading followups and replies stop once the chain budget is spent', { timeout: 90000 }, async () => {
+  const sends = [];
+  const task = peerTask('CROSS_PINGPONG_TASK_6651', 'CROSS_PINGPONG_RESULT_6652', { rootLater: async (request, f, start) => {
+    // Every Turn a reply starts asks the peer again; once the send is refused it stops.
+    const answered = start.contents.at(-1)?.parts?.some(part => part.functionResponse?.name === 'send_conversation_message');
+    if (answered) {
+      sends.push(lastResult(start, 'send_conversation_message'));
+      return answer('Asked the peer again or stopped.');
+    }
+    const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+    return toolsAnswer(call(`again-${sends.length}`, 'send_conversation_message', { conversationRef: peer.conversationRef, text: `again ${sends.length}`, mode: 'followup' }));
+  } });
+  await fixture(task.send, async f => {
+    const delegated = await f.input(ROOT, 'delegate');
+    await f.terminated(delegated.turnId);
+    // Budget 4: the first followup, the reply Turn, the second followup, the second reply Turn.
+    await f.until(() => sends.length === 2, 'The chain never reached its budget.', 30000);
+    assert.equal(sends[0].detail?.accepted, true, JSON.stringify(sends[0]));
+    assert.match(JSON.stringify(sends[1]), /budget exhausted \(4\)/);
+    await f.until(async () => (await f.rows('Turn', { status: 'active' })).length === 0, 'The conversations never went idle.');
+    assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 3, 'the first Turn and two reply Turns');
+    assert.equal((await f.rows('Turn', { conversation_id: PEER })).length, 2, 'two peer tasks');
+    assert.equal((await f.rows('CollaborationRequest')).length, 2);
+    assert.equal((await f.rows('CollaborationBudget')).length, 1, 'one chain budget');
+  }, { runAgentConfig: { maxAutomaticFollowups: 4 } });
 });

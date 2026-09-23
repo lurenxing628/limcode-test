@@ -1,4 +1,5 @@
 import type { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
+import { isCollaborationReplyBudgetExhaustedError } from '../../reliableKernel/collaborationControlPlane';
 import type { ProcessCompletionWakeHandler, ProcessCompletionWakeRequest } from '../../reliableKernel/processCompletionDelivery';
 import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
 import type { ReliableConversationRunner } from './ReliableConversationRunner';
@@ -41,11 +42,17 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
     }
     // A peer message never borrows the destination's previous Turn authority: the continuation
     // runs under the destination's current settings and may be its very first Turn.
-    const continuation = await runner.runtimeContinuation({
-      commandId: `runtime-delivery:${request.deliveryId}`, deliveryId: request.deliveryId,
-      conversationId: request.conversationId,
-      sourceTurnId: request.sourceKind === 'collaboration_message' ? null : request.sourceTurnId
-    });
-    return { acknowledged: Boolean(continuation.intentId) };
+    try {
+      const continuation = await runner.runtimeContinuation({
+        commandId: `runtime-delivery:${request.deliveryId}`, deliveryId: request.deliveryId,
+        conversationId: request.conversationId,
+        sourceTurnId: request.sourceKind === 'collaboration_message' ? null : request.sourceTurnId
+      });
+      return { acknowledged: Boolean(continuation.intentId) };
+    } catch (error) {
+      // A reply whose task budget is spent starts no Turn: it waits for the requester's next Turn.
+      if (isCollaborationReplyBudgetExhaustedError(error)) return { acknowledged: true };
+      throw error;
+    }
   };
 }

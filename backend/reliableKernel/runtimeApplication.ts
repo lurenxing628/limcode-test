@@ -270,6 +270,7 @@ export class ReliableKernelApplication {
       prepareNextTurnDeliverySteps: (conversationId, turnId, now, startingDeliveryId) =>
         this.runtime.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now, startingDeliveryId),
       prepareTerminalDeliverySteps: (turnId, now) => this.runtime.deliveries.prepareTerminalDeliverySteps(turnId, now),
+      prepareRuntimeContinuationSteps: (deliveryId) => this.runtime.collaboration.prepareReplyContinuationSteps(deliveryId),
       ...options
     });
     this.turnOutput = new TurnOutputControlPlane(database, contentStore, options);

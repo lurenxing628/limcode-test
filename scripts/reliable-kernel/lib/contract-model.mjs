@@ -1007,7 +1007,7 @@ function validateSubagent(subagent, failures) {
     || crossConversation?.offering !== 'top-level-conversations-only; hidden-and-rejected-when-switch-off; control-plane-rechecks-calling-Turn-frozen-authority'
     || crossConversation?.targets !== 'other-active-top-level-conversations-of-this-Runtime; child-task-conversations-never-listed-or-addressed'
     || crossConversation?.allowlist !== 'enabling-the-switch-extends-only-a-scope-own-saved-allowedTools-with-the-missing-tools(read-only-pair-without-run_agent)-and-records-them-in-crossConversationGrantedTools; a-scope-without-its-own-list-stores-only-the-switch-and-a-list-less-ToolPolicy-narrows-nothing; with-no-list-on-the-chain-the-default-tool-set-applies; send-create-and-fork-are-offered-and-admitted-only-while-the-Turn-effective-allowedTools-include-run_agent(otherwise-list-and-read-only); turning-off-removes-only-granted-tools; restoring-removes-them-unless-the-switch-stays-on-in-an-upper-layer-or-in-an-Agent-or-workflow-the-scope-runs-with; an-explicit-user-enable-clears-a-tool-grant-mark; backend-never-widens-a-saved-allowlist'
-    || crossConversation?.delivery !== 'running-target-queues-behind-its-current-Turn; followup-starts-its-own-Turn-and-only-that-Turn-consumes-it; followup-waits-behind-any-running-Turn-at-dispatch-including-one-started-after-its-anchor; followups-from-different-senders-start-sequential-Turns-never-merged; queued-followups-start-in-send-order-by-the-CollaborationMessage.message_seq-their-send-transaction-assigned-never-by-timestamp; that-Turn-spends-only-the-requester-budget; message-joins-the-next-Turn-whatever-starts-it; completion-replies-are-not-queued'
+    || crossConversation?.delivery !== 'running-target-queues-behind-its-current-Turn; followup-starts-its-own-Turn-and-only-that-Turn-consumes-it; followup-waits-behind-any-running-Turn-at-dispatch-including-one-started-after-its-anchor; followups-from-different-senders-start-sequential-Turns-never-merged; queued-followups-start-in-send-order-by-the-CollaborationMessage.message_seq-their-send-transaction-assigned-never-by-timestamp; that-Turn-spends-only-the-requester-budget; message-joins-the-next-Turn-whatever-starts-it; completion-replies-join-a-running-requester-Turn-at-a-safe-boundary; a-cross-conversation-completion-or-failure-reply-to-an-idle-requester(also-after-a-user-stop)-starts-one-requester-Turn-that-spends-the-chain-automatic-followup-budget; with-the-budget-spent-the-reply-waits-for-the-next-Turn-without-error; team-replies-and-plain-messages-start-no-Turn'
     || crossConversation?.authority !== 'peer-text-is-an-attributed-collaboration-envelope-sent-as-user-role-runtime-data-never-a-user-message; its-fixed-kernel-header-says-it-is-from-another-conversation-or-team-agent-not-this-conversation-user-and-untrusted; list-and-read-carry-an-untrusted-data-notice') {
     failures.push('跨对话协作必须由默认关闭的冻结开关下发，只给顶层对话，不寻址子 Agent，运行中目标排队，且对方文本不成为用户指令');
   }
@@ -1016,6 +1016,9 @@ function validateSubagent(subagent, failures) {
   }
   if (crossConversation?.consent !== 'sender-only-authorization-as-in-Codex; the-target-has-no-switch-or-consent-check; defences-are-the-untrusted-data-envelope-and-peer-text-never-gaining-user-text-authority') {
     failures.push('跨对话协作只由发送方授权：目标方没有开关或确认检查，防线是不可信数据信封与对方文本不获得用户授权');
+  }
+  if (!String(crossConversation?.decisions ?? '').includes('a-cross-conversation-reply-starts-an-idle-requester-Turn-that-spends-and-continues-the-budget-of-the-request-it-answers')) {
+    failures.push('跨对话回复须开启空闲请求方的一轮，并花费和沿用它所回复请求的预算');
   }
   const crossCreate = String(crossConversation?.create ?? '');
   for (const marker of ['stable-Conversation-id-from-ToolCall', 'checked-before-any-write', 'commit-in-one-transaction', 'leaves-no-Conversation', 'replay-after-deletion-is-refused', 'no-ConversationOriginLink']) {
@@ -1028,7 +1031,7 @@ function validateSubagent(subagent, failures) {
   const crossLimits = crossConversation?.limits;
   if (!Number.isSafeInteger(crossLimits?.maxPendingInboundMessages) || crossLimits.maxPendingInboundMessages < 1
     || !Number.isSafeInteger(crossLimits?.maxConversationSpawnsPerTurn) || crossLimits.maxConversationSpawnsPerTurn < 1
-    || crossLimits?.automaticFollowupBudget !== 'cross-conversation-followups-and-create_conversation-spend-maxAutomaticFollowups; checked-before-any-write'
+    || crossLimits?.automaticFollowupBudget !== 'cross-conversation-followups-and-create_conversation-spend-maxAutomaticFollowups; checked-before-any-write; so-does-each-requester-Turn-a-cross-conversation-reply-starts-checked-in-its-admission-transaction'
     || crossLimits?.pendingInbound !== 'undelivered-message-and-followup-deliveries-from-any-sender-per-target; completion-replies-exempt; enforced-on-cross-conversation-sends'
     || crossLimits?.spawns !== 'create_conversation-and-fork_conversation-calls-of-one-sender-Turn-ranked-by-committed-call-order'
     || crossLimits?.overflow !== 'clear-tool-error; nothing-written; no-new-settings') {
