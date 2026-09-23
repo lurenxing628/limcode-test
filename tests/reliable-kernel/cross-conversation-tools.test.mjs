@@ -1695,6 +1695,45 @@ test('a completion reply that arrives during a compression, followed by a restar
   releaseCompression();
 });
 
+// With the task's budget left, a reply held back by a compression starts a Turn of its own once
+// that compression ends, whether it finishes or the window restarts first.
+for (const ending of ['the compression finishes', 'the window restarts']) test(`a completion reply that arrives during a compression starts exactly one Turn once ${ending}`, { timeout: 60000 }, async () => {
+  const task = delegatedTask('CROSS_HELD_TASK_4431', 'CROSS_HELD_RESULT_4432');
+  let holdCompression = false, maintenanceTurnId, releaseCompression;
+  const released = new Promise(resolve => { releaseCompression = resolve; });
+  await fixture(task.send, async f => {
+    await task.delegate(f);
+    task.setPhase('compressing');
+    holdCompression = true;
+    const compression = f.compress(ROOT, 'compress-while-replying');
+    await f.until(() => maintenanceTurnId, 'The compression never asked its model.');
+    task.releasePeer();
+    const reply = await task.reply(f);
+    assert.deepEqual([reply.phase, reply.target_turn_id], ['next_turn', null], 'the reply is never routed into the compression');
+    task.setPhase('reply');
+    if (ending === 'the window restarts') {
+      holdCompression = false;
+      void compression.catch(() => undefined);
+      await f.reopen();
+    } else {
+      releaseCompression();
+      assert.equal((await compression).compression?.status, 'compressed');
+    }
+    const replyTurnId = await f.until(async () => (await f.rows('RuntimeDelivery', { id: reply.id }))[0].target_turn_id, 'The reply never started a Turn.');
+    assert.notEqual(replyTurnId, maintenanceTurnId);
+    assert.equal((await f.terminated(maintenanceTurnId)).terminal_status, 'completed');
+    assert.equal((await f.terminated(replyTurnId)).terminal_status, 'completed');
+    assert.deepEqual(task.seen.filter(entry => entry.result).map(entry => [entry.phase, entry.turnId]), [['reply', replyTurnId]], 'the Turn the reply starts reads it');
+    await f.runner.waitForIdle();
+    assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 4, 'the delegation, its retry, the compression and one Turn for the reply');
+  }, { compressionGate: async (request, signal) => {
+    if (!holdCompression) return;
+    maintenanceTurnId = request.turnId;
+    await Promise.race([released, new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')), { once: true }))]);
+  } });
+  releaseCompression();
+});
+
 for (const moment of ['before its terminal commit reads its deliveries', 'between that read and the commit']) test(`a reply routed into a stopping Turn ${moment} joins the queued next Turn, even when the wake scan runs mid-admission`, { timeout: 60000 }, async () => {
   const TASK = 'CROSS_LATE_TASK_5501', RESULT = 'CROSS_LATE_RESULT_5502';
   let releasePeer, phase = 'delegate', rootRound = 0, workingTurn;
