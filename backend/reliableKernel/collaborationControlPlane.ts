@@ -2,7 +2,7 @@ import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { readCollaborationScope, type CollaborationScope } from './collaborationScope';
+import { isCrossConversationFollowup, readCollaborationScope, type CollaborationScope } from './collaborationScope';
 import { CROSS_CONVERSATION_LIMITS, readTurnCollaborationLimits, readTurnCrossConversationEnabled } from './collaborationPolicy';
 import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { TURN_INTENT_ENVELOPE_CONTENT_TYPE, parseRuntimeContinuationTurnIntentEnvelopeText } from './guidanceIntent';
@@ -485,13 +485,14 @@ export class CollaborationControlPlane {
   }
   /**
    * A task whose every delivery failed never started a Turn (its target was deleted, or no
-   * continuation could be admitted). The requester is told so through the completion reply path
-   * instead of waiting for an answer that cannot come.
+   * continuation could be admitted). A peer requester in another team is told so through the
+   * completion reply path instead of waiting for an answer that cannot come. A team request keeps
+   * its original contract and just fails: the team sees its members through its own tools.
    */
   private async failUnstartedRequest(request: DomainRow, deliveries: DomainRow[]): Promise<void> {
     const source = await this.one('CollaborationMessageSourceLink', { message_id: request.message_id });
     const requester = await this.maybe('Conversation', String(source.conversation_id));
-    if (requester?.status === 'active') {
+    if (requester?.status === 'active' && await isCrossConversationFollowup(this.database, String(request.message_id))) {
       const [latest] = [...deliveries].sort(compareNewest);
       try {
         await this.sendInternal({ source: { kind: 'completion', turnId: null, requestId: String(request.id) }, targetConversationId: String(source.conversation_id),
@@ -561,7 +562,7 @@ export class CollaborationControlPlane {
     const visit = async (turnId: string, ancestryRoot: string | null, seen: Set<string>): Promise<DomainRow> => {
       if (seen.has(turnId)) throw new Error('Collaboration budget lineage is cyclic.');
       seen.add(turnId);
-      // A Turn started for a followup spends that request's budget, whatever else it absorbed.
+      // A Turn started for a peer's followup spends that request's budget, whatever else it absorbed.
       const started = await this.startingFollowupBudget(turnId);
       if (started) return started;
       const inputs = await this.rows('RuntimeDelivery', { target_turn_id: turnId, state: 'consumed' });
@@ -599,7 +600,11 @@ export class CollaborationControlPlane {
     };
     return visit(sourceTurnId, rootTurnId, new Set());
   }
-  /** The budget of the followup whose runtime continuation admitted this Turn, if any. */
+  /**
+   * The budget of the cross-conversation followup whose runtime continuation admitted this Turn, if
+   * any. Team and child continuations keep pooling what they absorbed, so their independent root
+   * budgets still refuse to combine.
+   */
   private async startingFollowupBudget(turnId: string): Promise<DomainRow | null> {
     for (const intent of await this.rows('TurnIntent', { turn_id: turnId })) {
       const links = await this.rows('RuntimeDeliveryIntentLink', { turn_intent_id: intent.id });
@@ -607,7 +612,7 @@ export class CollaborationControlPlane {
       const delivery = await this.existing('RuntimeDelivery', String(links[0].delivery_id));
       if (delivery.target_turn_id !== turnId) continue;
       const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
-      if (inbox.source_kind !== 'collaboration_message') continue;
+      if (inbox.source_kind !== 'collaboration_message' || !await isCrossConversationFollowup(this.database, String(inbox.source_id))) continue;
       const requests = await this.rows('CollaborationRequest', { message_id: inbox.source_id });
       if (requests.length === 1) return this.existing('CollaborationBudget', String(requests[0].budget_id));
     }

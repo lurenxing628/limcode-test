@@ -608,3 +608,43 @@ test('a target holds at most 16 undelivered collaboration messages from other co
   await admitPending(f, 'target-b', 'target-b-next');
   assert.equal((await crossSend(f, 'd-after-drain', 'peer-d', 'peer-d-turn', 'target-b', 'message')).accepted, true);
 }));
+
+function repliesTo(f, conversationId, requestMessageId) {
+  return f.collaboration.listMessages({ conversationId }).then(result => result.messages.filter(message => message.replyToMessageId === requestMessageId));
+}
+
+test('a team followup whose child continuation dead-letters fails without a reply, as before cross-conversation work', async () => fixture(async f => {
+  const accepted = await f.collaboration.send({ source: await f.source('team-dead-letter', 'root', 'root-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'team task', mode: 'followup' });
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, maxFailureCount: 1,
+    wakeHandler: async () => { throw new Error('child scheduler unavailable'); } });
+  try { await scanner.scanNow(); } finally { await scanner.dispose(); }
+  assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).state, 'failed');
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  assert.equal((await f.rows('CollaborationRequest', { message_id: accepted.messageId }))[0].state, 'failed', 'the request never stays pending');
+  assert.deepEqual(await repliesTo(f, 'root', accepted.messageId), [], 'a team requester gets no failure reply');
+}));
+
+test('a team followup to a child deleted before it started fails without a reply', async () => fixture(async f => {
+  const { ConversationDeletionControlPlane } = load('conversationDeletion.js');
+  const accepted = await f.collaboration.send({ source: await f.source('team-target-deleted', 'root', 'root-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'team task', mode: 'followup' });
+  await new ConversationDeletionControlPlane(f.database).delete('right');
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  assert.equal((await f.rows('CollaborationRequest', { message_id: accepted.messageId }))[0].state, 'failed');
+  assert.deepEqual(await repliesTo(f, 'root', accepted.messageId), [], 'deleting a team child never turns its task into a peer task');
+}));
+
+test('a team continuation that absorbed followups of two root Turns still cannot combine their budgets', async () => fixture(async f => {
+  const first = await f.collaboration.send({ source: await f.source('root-first-task', 'root', 'root-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'first', mode: 'followup' });
+  await endTurn(f, 'root-turn');
+  await admitPending(f, 'root', 'root-second');
+  const second = await f.collaboration.send({ source: await f.source('root-second-task', 'root', 'root-second', 'followup_agent_task'), targetConversationId: 'right', text: 'second', mode: 'followup' });
+  assert.deepEqual([await budgetOf(f, first.deliveryId), await budgetOf(f, second.deliveryId)], ['root-turn', 'root-second']);
+  // The child continuation admitted for the first task also takes the second in, as team followups do.
+  await admitContinuation(f, 'right', 'right-continuation', first.deliveryId);
+  assert.equal((await f.get('RuntimeDelivery', second.deliveryId)).target_turn_id, 'right-continuation');
+  await f.database.transaction([repo('ChildExecution').update('right-child', { status: 'active', updated_at: NOW })]);
+  await assert.rejects(f.collaboration.send({ source: await f.source('right-onward', 'right', 'right-continuation', 'followup_agent_task'), targetConversationId: 'left', text: 'onward', mode: 'followup' }),
+    /cannot combine independent root Turn followup budgets/);
+}));

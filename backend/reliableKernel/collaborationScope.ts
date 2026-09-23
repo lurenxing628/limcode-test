@@ -1,6 +1,7 @@
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import { isCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
 
 export interface CollaborationMember {
   conversationId: string;
@@ -17,14 +18,17 @@ export interface CollaborationScope {
 
 /**
  * A followup that a cross-conversation tool sent to another team: a tool send between two distinct
- * top-level Conversations. A team followup always has a child task on at least one side, and the
- * cross-conversation tools never originate from or address a child task, so the committed lineage
- * alone classifies it. A sender deleted since then has no ChildExecution left and is treated as
- * top-level: its task then waits for a Turn of its own like any peer task.
+ * top-level Conversations. While the sender exists, its committed ToolCall names the tool that sent
+ * it, so deleting a team child target never turns the task into a peer task. A deleted sender takes
+ * its ToolCall along; the committed lineage then classifies it: a team followup always has a child
+ * task on at least one side, and the cross-conversation tools never originate from or address a
+ * child task. The deleted sender has no ChildExecution left and counts as top-level, so its task
+ * waits for a Turn of its own like any peer task.
  *
  * Such a followup starts exactly one Turn of its own in the target: no other Turn (a user Turn,
  * another peer's continuation, a process or child continuation) consumes it, and while any Turn
- * runs it keeps waiting.
+ * runs it keeps waiting. Only such a Turn spends the task's own budget, and only such a task that
+ * cannot be answered sends its requester a failure reply; team followups keep their original rules.
  */
 export async function isCrossConversationFollowup(database: RuntimeDatabase, messageId: string): Promise<boolean> {
   const read = await database.snapshot([
@@ -36,6 +40,10 @@ export async function isCrossConversationFollowup(database: RuntimeDatabase, mes
   const sources = read.snapshot[1] as DomainRow[];
   const targets = read.snapshot[2] as DomainRow[];
   if (!message || message.mode !== 'followup' || sources.length !== 1 || targets.length !== 1 || sources[0].source_kind !== 'tool') return false;
+  const toolCall = typeof sources[0].tool_call_id === 'string'
+    ? (await database.snapshot([DOMAIN_REPOSITORIES.domain('ToolCall').get(sources[0].tool_call_id)])).snapshot[0] as DomainRow | null
+    : null;
+  if (toolCall) return isCrossConversationTool(String(toolCall.tool_name));
   const sourceConversationId = String(sources[0].conversation_id);
   const targetConversationId = String(targets[0].conversation_id);
   if (sourceConversationId === targetConversationId) return false;
