@@ -108,6 +108,13 @@ async function checkConversationForkLinks() {
     const faults = [];
     const metrics = {};
     const seeded = await seedParent(ctx, 'fork');
+    // A fork copies completed history only: end the seeded Turn before forking its message.
+    await seeded.control.terminal({
+      source: { kind: 'callback', key: 'fork-seed-terminal' },
+      turnId: seeded.turnId,
+      terminalStatus: 'completed',
+      reason: 'fixture completed before fork'
+    });
     await ctx.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'agent-link-fork-reviewer',
@@ -182,7 +189,10 @@ async function checkConversationForkLinks() {
     const replay = await forks.fork(baseCommand);
     assert.equal(replay.deduplicated, true);
     assert.equal(replay.targetConversationId, forked.targetConversationId);
-    await assert.rejects(forks.fork({ ...baseCommand, targetTitle: 'Conflicting replay title' }), /different facts|does not exist/);
+    // The title is only the target's initial display title, never part of the fork identity.
+    const retitledReplay = await forks.fork({ ...baseCommand, targetTitle: 'Different replay title' });
+    assert.equal(retitledReplay.deduplicated, true);
+    assert.equal(retitledReplay.targetConversationId, forked.targetConversationId);
     const targetRoot = await get(ctx.database, 'ContextSequenceRoot', forked.targetRootId);
     assert.equal(targetRoot.root_node_id, sourceRoot.root_node_id);
     assert.equal(targetRoot.segment_count, sourceRoot.segment_count);
@@ -308,6 +318,12 @@ async function checkConversationForkLinks() {
       title: 'Fork recursive compression fixture',
       summary: 'COMPRESSED_PREFIX_C',
       idempotencyKey: 'fork-recursive-compression'
+    });
+    await prefixBControl.terminal({
+      source: { kind: 'callback', key: 'fork-prefix-b-terminal' },
+      turnId: prefixB.turnId,
+      terminalStatus: 'completed',
+      reason: 'fixture completed before fork'
     });
     const forkThroughB = await forks.fork({
       idempotencyKey: 'fork-prefix-through-b',
@@ -446,6 +462,9 @@ async function checkConversationForkLinks() {
     // request/operation/attempt rows through the trusted historicalCopy channel instead of
     // crashing on the creation invariant "ModelRequest insert must start prepared and non-terminal.".
     const mrSeed = await seedParent(ctx, 'fork-terminal-model-request');
+    // Every fork owns copies of its Turns' frozen authority, so the request references the real one.
+    const mrAuthority = (await list(ctx.database, 'AuthoritySnapshot', { turn_id: mrSeed.turnId }))[0];
+    assert.ok(mrAuthority);
     const mrRecipe = await ctx.store.ingest(ctx.database, 'fork-mr-recipe', 'application/json');
     const mrOutput = await ctx.store.ingest(ctx.database, 'fork-mr-output', 'text/plain');
     await ctx.database.transaction([
@@ -460,7 +479,7 @@ async function checkConversationForkLinks() {
         context_window_tokens: 128000n,
         compression_threshold_tokens: 100000n,
         estimated_context_tokens: 1000n,
-        authority_snapshot_id: 'fork-mr-authority',
+        authority_snapshot_id: mrAuthority.id,
         settings_snapshot_object_id: null,
         recipe_object_id: mrRecipe.id,
         usage_json: null,
@@ -554,6 +573,12 @@ async function checkConversationForkLinks() {
       source_id: 'fork-mr-model-revision'
     }))[0];
     assert.ok(mrModelSegment);
+    await mrSeed.control.terminal({
+      source: { kind: 'callback', key: 'fork-terminal-model-request-terminal' },
+      turnId: mrSeed.turnId,
+      terminalStatus: 'failed',
+      reason: 'provider_failed_before_output'
+    });
     const mrFork = await forks.fork({
       idempotencyKey: 'fork-terminal-model-request',
       reuseKey: 'reuse-fork-terminal-model-request',
@@ -595,12 +620,6 @@ async function checkConversationForkLinks() {
     assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-stale' })).length, 0);
     faults.push('stale expected source head');
 
-    await seeded.control.terminal({
-      source: { kind: 'callback', key: 'fork-fixture-terminal-before-history-mutation' },
-      turnId: seeded.turnId,
-      terminalStatus: 'completed',
-      reason: 'fork fixture completed before soft-delete history mutation'
-    });
     await seeded.control.delete({
       source: { kind: 'command', key: 'fork-soft-delete-source' },
       conversationId: seeded.conversationId,
