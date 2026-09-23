@@ -1047,6 +1047,8 @@ test('an active transient uses its frozen model and a Turn anchor instead of the
   ]);
   assert.equal(projection.messages[1]?.model, 'gpt-5.6-sol');
   assert.equal(projection.messages[1]?.seq, 10.5);
+  assert.equal(projection.turnIdByMessageId['transient:request-active'], 'turn-a',
+    'a streaming reply belongs to its Turn, so what is placed at that Turn keeps its place');
 });
 
 test('the latest failed terminal partial retains exact model_request retry identity', () => {

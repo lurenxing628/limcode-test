@@ -150,6 +150,10 @@ const collaborationTimeline = computed(() => projectCollaborationTimeline({
   loadedFromFirstMessage: loadedFromFirstMessage.value
 }));
 
+// With no message every card is below the messages; the empty hint never stands in for one.
+const hasCollaborationCards = computed(() =>
+  collaborationTimeline.value.turnWithoutMessage.length > 0 || collaborationTimeline.value.unbound.length > 0);
+
 const compressionNotices = computed(() => projectCompressionNotices({
   conversationId: conversationId.value, records: feed.records, messages: messages.value,
   turnIdByMessageId: projection.value.turnIdByMessageId,
@@ -756,6 +760,12 @@ function messageRenderKey(message: MessageRecord): string {
       {{ retryBoundaryLabel }}
     </p>
     <template v-if="!hasLaterSegment">
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.turnWithoutMessage"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
+      />
       <ReliableCompressionWarningRow v-for="warning in unanchoredCompressionWarnings"
         :key="warning.id" :title="warning.title" :detail="warning.detail"
         @dismiss="dismissCompressionWarning(warning)" />
@@ -791,7 +801,7 @@ function messageRenderKey(message: MessageRecord): string {
       <button type="button" @click="openForkReadyNotice">打开分支</button>
       <button type="button" aria-label="关闭分支提示" @click="dismissForkReadyNotice">关闭</button>
     </p>
-    <div v-if="messages.length === 0 && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
+    <div v-if="messages.length === 0 && !hasCollaborationCards && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
       <p class="reliable-message-empty">{{ emptyHint }}</p>
     </div>
   </div>

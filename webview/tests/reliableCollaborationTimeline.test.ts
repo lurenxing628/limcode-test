@@ -82,7 +82,7 @@ test('messages between other Conversations are never projected into this timelin
     removedConversationIds: [],
     loadedFromFirstMessage: true
   });
-  assert.deepEqual(timeline, { beforeMessage: {}, afterMessage: {}, unbound: [] });
+  assert.deepEqual(timeline, { beforeMessage: {}, afterMessage: {}, turnWithoutMessage: [], unbound: [] });
 });
 
 test('a peer outside the loaded conversations is unknown; only a removal or a deleted status reads as deleted', () => {
@@ -260,6 +260,82 @@ test('a failed incoming card with no loaded message before it still shows when n
     ['f1', 'f2', 'f3', 'f4'].slice(-MAX_PINNED_FAILED_COLLABORATION_CARDS));
 });
 
+test('a card whose loaded Turn has no loaded message sits where that Turn started and stays visible across its first request', () => {
+  const at = (ms: number) => new Date(ms).toISOString();
+  type Timeline = ReturnType<typeof projectCollaborationTimeline>;
+  type Card = Timeline['unbound'][number];
+  // Every card the timeline shows, whichever place holds it.
+  const shown = (timeline: Timeline) => Object.values(timeline)
+    .flatMap((bucket: Card[] | Record<string, Card[]>) => Array.isArray(bucket) ? bucket : Object.values(bucket).flat())
+    .map(card => card.messageId);
+  const ids = (buckets: Record<string, Card[]>) =>
+    Object.fromEntries(Object.entries(buckets).map(([anchor, cards]) => [anchor, cards.map(card => card.messageId)]));
+  const placed = (timeline: Timeline) => ({
+    before: ids(timeline.beforeMessage),
+    after: ids(timeline.afterMessage),
+    turnWithoutMessage: timeline.turnWithoutMessage.map(card => card.messageId),
+    unbound: timeline.unbound.map(card => card.messageId)
+  });
+  // A task from the peer started `task-turn` at 3000; the result it sent back when that Turn ended is optional.
+  const records = (task: { turnId: string | null; state: string }, options: { result?: boolean; turnLoaded?: boolean } = {}) => ({
+    Conversation: byId({ id: 'peer', title: '调研对话', status: 'active' }),
+    ...(options.turnLoaded === false ? {} : { Turn: byId({ id: 'task-turn', conversation_id: 'self', status: 'terminated', created_at: at(3000) }) }),
+    CollaborationMessage: byId(
+      { ...message('task', '1', 'followup', '请调研'), created_at: at(2000) },
+      ...(options.result ? [{ ...message('result', '2', 'message', 'Task ended with status failed.'), created_at: at(4000) }] : [])
+    ),
+    CollaborationMessageSourceLink: byId(
+      source('task', 'peer', 'peer-turn'),
+      ...(options.result ? [source('result', 'self', 'task-turn', 'completion')] : [])
+    ),
+    CollaborationMessageTargetLink: byId(target('task', 'self'), ...(options.result ? [target('result', 'peer')] : [])),
+    RuntimeDelivery: byId(
+      delivery('task', task.turnId, task.state),
+      ...(options.result ? [{ id: 'result-delivery-1', inbox_item_id: 'result-inbox', target_conversation_id: 'peer', target_turn_id: 'peer-turn', state: 'consumed', attempt_seq: '1' }] : [])
+    )
+  });
+  const earlier = [{ id: 'u1', role: 'user', createdAt: 1000 }, { id: 'r1', role: 'model', createdAt: 1500 }];
+  const earlierTurns = { u1: 'turn-1', r1: 'turn-1' };
+  const project = (
+    recordSet: ReturnType<typeof records>,
+    messages: Array<{ id: string; role: string; createdAt?: number }>,
+    turnIdByMessageId: Record<string, string>,
+    loadedFromFirstMessage = true
+  ) => projectCollaborationTimeline({ conversationId: 'self', records: recordSet, messages, turnIdByMessageId, removedConversationIds: [], loadedFromFirstMessage });
+  const started = { turnId: 'task-turn', state: 'consumed' };
+
+  // Across the first request: waiting, then running with nothing saved or streamed, then streaming, then saved.
+  const waiting = project(records({ turnId: null, state: 'pending' }), earlier, earlierTurns);
+  const running = project(records(started), earlier, earlierTurns);
+  const streaming = project(records(started), [...earlier, { id: 'transient:request-1', role: 'model', createdAt: 3500 }],
+    { ...earlierTurns, 'transient:request-1': 'task-turn' });
+  const replied = project(records(started), [...earlier, { id: 'r2', role: 'model', createdAt: 3500 }], { ...earlierTurns, r2: 'task-turn' });
+  for (const [stage, timeline] of Object.entries({ waiting, running, streaming, replied })) {
+    assert.deepEqual(shown(timeline), ['task'], `the card stays visible while its Turn is ${stage}`);
+  }
+  assert.deepEqual(placed(waiting).unbound, ['task']);
+  assert.deepEqual(placed(running), { before: {}, after: {}, turnWithoutMessage: ['task'], unbound: [] },
+    'below every message while the first request has nothing to show');
+  assert.deepEqual(placed(streaming).before, { 'transient:request-1': ['task'] }, 'a streaming reply holds it like the saved one');
+  assert.deepEqual(placed(replied).before, { r2: ['task'] });
+
+  // The first request ended without text (failed or stopped); the Turn sent its result back.
+  const ended = records(started, { result: true });
+  assert.deepEqual(placed(project(ended, earlier, earlierTurns)).turnWithoutMessage, ['task', 'result']);
+  assert.deepEqual(placed(project(ended, [], {})).turnWithoutMessage, ['task', 'result'], 'a created Conversation with no message shows both');
+  const later = [{ id: 'u3', role: 'user', createdAt: 6000 }, { id: 'r3', role: 'model', createdAt: 6500 }];
+  const laterTurns = { u3: 'turn-3', r3: 'turn-3' };
+  assert.deepEqual(placed(project(ended, [...earlier, ...later], { ...earlierTurns, ...laterTurns })),
+    { before: {}, after: { r1: ['task', 'result'] }, turnWithoutMessage: [], unbound: [] },
+    'after the last message created before that Turn started, not below newer ones');
+  assert.deepEqual(placed(project(ended, later, laterTurns)).before, { u3: ['task', 'result'] },
+    'above message 1 when that Turn is older than every message and message 1 is loaded');
+  assert.deepEqual(shown(project(ended, later, laterTurns, false)), [],
+    'a Turn older than a window that starts after message 1 waits for the earlier history');
+  assert.deepEqual(shown(project(records(started, { result: true, turnLoaded: false }), earlier, earlierTurns)), [],
+    'a Turn outside the loaded window is not guessed');
+});
+
 test('an outgoing message or result waiting for the recipient says it arrived and when it is read', () => {
   const outgoing = (messageId: string, turnId: string | null) =>
     ({ id: `${messageId}-delivery-1`, inbox_item_id: `${messageId}-inbox`, target_conversation_id: 'peer', target_turn_id: turnId, state: 'pending', attempt_seq: '1' });
@@ -302,4 +378,10 @@ test('the client feed contract states the card placement and pinned-failure boun
     + '-when-newer-than-every-message-or-no-message-has-a-creation-time; '));
   assert.match(rule, /; a-failure-older-than-a-window-that-starts-after-message-1-appears-once-that-history-loads; /);
   assert.match(rule, /a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn/);
+  const turnRule = contract.collaborationProjection.turnPlacement as string;
+  assert.match(turnRule, /^incoming-at-the-first-loaded-message-of-its-delivery-Turn-and-outgoing-at-that-of-its-sending-Turn-a-streaming-reply-included; /);
+  assert.match(turnRule, new RegExp('; a-loaded-Turn-without-a-loaded-message-places-its-cards-by-when-it-started-after-the-last-message-created-before-it'
+    + '-or-before-the-first-message-when-older-than-every-message-and-message-1-is-loaded'
+    + '-or-below-every-message-ahead-of-that-Turn-notices-when-newer-than-every-message; '));
+  assert.match(turnRule, /; a-Turn-not-loaded-or-older-than-a-window-that-starts-after-message-1-is-not-guessed; the-empty-conversation-hint-never-stands-in-for-a-card$/);
 });

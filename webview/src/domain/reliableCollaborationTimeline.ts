@@ -25,15 +25,24 @@ export interface CollaborationTimelineCard {
 
 export interface CollaborationTimeline {
   /**
-   * Rendered above the anchor message: a delivery that started the anchor Turn, or an incoming
-   * message that failed before every loaded message when message 1 is loaded.
+   * Rendered above the anchor message: a delivery that started the anchor Turn, or, when message 1
+   * is loaded, an incoming message that failed before every loaded message and the cards of a Turn
+   * without a loaded message that started before every loaded message.
    */
   beforeMessage: Record<string, CollaborationTimelineCard[]>;
   /**
-   * Rendered below the anchor message: received or sent while the anchor Turn ran, or an incoming
-   * message that failed before reaching a Turn, after the last message created before it was sent.
+   * Rendered below the anchor message: received or sent while the anchor Turn ran, an incoming
+   * message that failed before reaching a Turn, after the last message created before it was sent,
+   * or a card of a Turn without a loaded message, after the last message created before that Turn
+   * started.
    */
   afterMessage: Record<string, CollaborationTimelineCard[]>;
+  /**
+   * Cards of a loaded Turn that has no loaded message (its first request is still running, or it
+   * ended before saving any text) that started after every loaded message or has no time to compare
+   * with: rendered below every message, ahead of that Turn's own notices.
+   */
+  turnWithoutMessage: CollaborationTimelineCard[];
   /**
    * Incoming messages that still wait for a target Turn, and the newest few failed ones that no
    * loaded message can place: sent after every loaded message, or with no loaded message (or no
@@ -47,11 +56,11 @@ export const MAX_PINNED_FAILED_COLLABORATION_CARDS = 3;
 
 /**
  * Places each collaboration envelope at the first visible message of the Turn it belongs to: the
- * delivery Turn for incoming messages and the sending Turn for outgoing ones. An incoming message
- * that failed before reaching a Turn sits after the last message created before it was sent, or
- * before the first message when it is older than all of them and message 1 is loaded. Messages
- * whose position is outside the loaded window are omitted instead of being shown at a misleading
- * position.
+ * delivery Turn for incoming messages and the sending Turn for outgoing ones. A loaded Turn with no
+ * loaded message places its cards by when it started, and an incoming message that failed before
+ * reaching a Turn by when it was sent: after the last message created before that time, or before
+ * the first message when older than all of them and message 1 is loaded. Messages whose position is
+ * outside the loaded window are omitted instead of being shown at a misleading position.
  */
 export function projectCollaborationTimeline(input: {
   conversationId: string;
@@ -66,7 +75,7 @@ export function projectCollaborationTimeline(input: {
    */
   loadedFromFirstMessage: boolean;
 }): CollaborationTimeline {
-  const result: CollaborationTimeline = { beforeMessage: {}, afterMessage: {}, unbound: [] };
+  const result: CollaborationTimeline = { beforeMessage: {}, afterMessage: {}, turnWithoutMessage: [], unbound: [] };
   const pinnedFailures: CollaborationTimelineCard[] = [];
   if (!input.conversationId) return result;
   const firstMessageByTurn = new Map<string, { id: string; role: string }>();
@@ -112,10 +121,7 @@ export function projectCollaborationTimeline(input: {
       if (!turnId) {
         if (card.status === 'waiting') result.unbound.push(card);
         else if (card.status === 'failed') {
-          const place = failedIncomingPlace(input.messages, timestamp(message.created_at), input.loadedFromFirstMessage);
-          if (place === 'pinned') pinnedFailures.push(card);
-          else if (place?.side === 'after') (result.afterMessage[place.messageId] ??= []).push(card);
-          else if (place) (result.beforeMessage[place.messageId] ??= []).push(card);
+          placeByTime(result, card, timestamp(message.created_at), pinnedFailures, input);
         }
         continue;
       }
@@ -123,39 +129,50 @@ export function projectCollaborationTimeline(input: {
       turnId = text(source.turn_id);
     }
     const anchor = firstMessageByTurn.get(turnId);
-    if (!anchor) continue;
-    // A delivery that started a Turn precedes that Turn's first reply; everything else follows the
-    // Turn's opening user message.
-    const bucket = incoming && anchor.role !== 'user' ? result.beforeMessage : result.afterMessage;
-    (bucket[anchor.id] ??= []).push(card);
+    if (anchor) {
+      // A delivery that started a Turn precedes that Turn's first reply; everything else follows the
+      // Turn's opening user message.
+      const bucket = incoming && anchor.role !== 'user' ? result.beforeMessage : result.afterMessage;
+      (bucket[anchor.id] ??= []).push(card);
+      continue;
+    }
+    // A loaded Turn with no loaded message: its first request is still running, or it ended before
+    // saving any text. Its cards stay where it started. A Turn outside the loaded window is not guessed.
+    const turn = input.records.Turn?.[turnId];
+    if (turn && turn.conversation_id === input.conversationId) {
+      placeByTime(result, card, timestamp(turn.created_at), result.turnWithoutMessage, input);
+    }
   }
   result.unbound.push(...pinnedFailures.slice(-MAX_PINNED_FAILED_COLLABORATION_CARDS));
   return result;
 }
 
 /**
- * Where an incoming message that failed before reaching a Turn goes: after the last loaded message
- * created at or before it was sent; pinned when every loaded message is older, or when there is no
- * send time or no loaded creation time to compare with; before the first message when it is older
- * than every loaded message and message 1 is loaded. Undefined when it predates a loaded window
- * that starts after message 1: the earlier history holds its position.
+ * Places a card by a time (when it was sent, or when its Turn started): after the last loaded
+ * message created at or before it; into `pinned` when every loaded message is older, or when there
+ * is no time or no loaded creation time to compare with; before the first message when it is older
+ * than every loaded message and message 1 is loaded. Omitted when it predates a loaded window that
+ * starts after message 1: the earlier history holds its position.
  */
-function failedIncomingPlace(
-  messages: ReadonlyArray<{ id: string; createdAt?: number }>,
-  sentAt: number | undefined,
-  loadedFromFirstMessage: boolean
-): { side: 'before' | 'after'; messageId: string } | 'pinned' | undefined {
-  if (sentAt === undefined) return 'pinned';
+function placeByTime(
+  result: CollaborationTimeline,
+  card: CollaborationTimelineCard,
+  at: number | undefined,
+  pinned: CollaborationTimelineCard[],
+  input: { messages: ReadonlyArray<{ id: string; createdAt?: number }>; loadedFromFirstMessage: boolean }
+): void {
   let anchor: string | undefined;
   let newer = false;
-  for (const message of messages) {
-    if (typeof message.createdAt !== 'number' || message.createdAt <= 0) continue;
-    if (message.createdAt <= sentAt) anchor = message.id;
-    else newer = true;
+  if (at !== undefined) {
+    for (const message of input.messages) {
+      if (typeof message.createdAt !== 'number' || message.createdAt <= 0) continue;
+      if (message.createdAt <= at) anchor = message.id;
+      else newer = true;
+    }
   }
-  if (anchor) return newer ? { side: 'after', messageId: anchor } : 'pinned';
-  if (!newer) return 'pinned';
-  return loadedFromFirstMessage ? { side: 'before', messageId: messages[0].id } : undefined;
+  if (anchor && newer) (result.afterMessage[anchor] ??= []).push(card);
+  else if (!newer) pinned.push(card);
+  else if (input.loadedFromFirstMessage) (result.beforeMessage[input.messages[0].id] ??= []).push(card);
 }
 
 function timestamp(value: PlainData | undefined): number | undefined {

@@ -268,8 +268,9 @@ function incomingRows({ id, mode = 'message', at, payloadId, delivery }) {
 
 /**
  * A Runtime of its own for one scenario with the Conversations `target` and `sender`. `seed` returns
- * the rows of its first transaction; `snapshot()` is the first frame a bounded feed bound to
- * `target` sends; `details` answers the Webview's detail requests as the extension host does.
+ * the rows of its first transaction and `commit(rows)` writes a later one; `snapshot()` is the first
+ * frame a bounded feed bound to `target` sends, and `connect()` keeps such a feed open; `details`
+ * answers the Webview's detail requests as the extension host does.
  */
 async function openScenario(name, seed) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-collaboration-${name}-`));
@@ -299,7 +300,39 @@ async function openScenario(name, seed) {
         return received[0];
       } finally { feed.close(); }
     };
-    return { database, ingest, snapshot, details: new kernel.ClientDetailReader(database, store), close };
+    const feeds = [];
+    /** A live feed bound to `target`; `take()` returns the frames sent since the last call, each acknowledged. */
+    const connect = async () => {
+      const feed = new kernel.BoundedClientFeed(database);
+      feeds.push(feed);
+      const received = [];
+      let taken = 0;
+      const connection = await feed.connect({ activeConversationId: 'target', send: (message) => received.push(message) });
+      const take = async () => {
+        for (let attempt = 0; attempt < 400 && received.length === taken; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        const frames = [];
+        for (let idle = 0; idle < 10;) {
+          if (taken < received.length) {
+            const frame = received[taken++];
+            frames.push(frame);
+            feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: frame.messageSeq });
+            idle = 0;
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            idle += 1;
+          }
+        }
+        return frames;
+      };
+      return { take };
+    };
+    const commit = (rows) => database.transaction(rows);
+    return { ingest, snapshot, connect, commit, details: new kernel.ClientDetailReader(database, store), close: async () => {
+      for (const feed of feeds) feed.close();
+      await close();
+    } };
   } catch (error) {
     await close();
     throw error;
@@ -307,9 +340,9 @@ async function openScenario(name, seed) {
 }
 
 /**
- * Renders the real message list over feed frames. Each `render(scenario, frames)` uses a fresh store
- * that observes the frames in order and waits until the scenario's Runtime answered every detail
- * request, so no request timer outlives the test.
+ * Renders the real message list over feed frames. `open(scenario)` gives a fresh store whose detail
+ * requests the scenario's Runtime answers; `mount()` waits until every one is answered, so no
+ * request timer outlives the test.
  */
 async function withMessageList(body) {
   const pinia = await import('pinia');
@@ -361,14 +394,15 @@ async function withMessageList(body) {
           for (const frame of frames) feed.observe(frame);
           await nextTick();
         },
+        /** Renders twice: the first render asks for the message bodies, the second shows them. */
         mount: async () => {
-          const mounted = await mount(active);
+          await mount(active);
           for (let attempt = 0; attempt < 400 && Object.keys(feed.pendingDetails).length > 0; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 5));
           }
           await Promise.allSettled(host.reads);
           assert.deepEqual(Object.keys(feed.pendingDetails), [], 'every detail request was answered');
-          return mounted;
+          return mount(active);
         }
       };
     };
@@ -388,7 +422,12 @@ async function withMessageList(body) {
 function placedCards(setup) {
   const ids = (buckets) => Object.fromEntries(Object.entries(buckets).map(([anchor, cards]) => [anchor, cards.map((card) => card.messageId)]));
   const timeline = setup.collaborationTimeline;
-  return { before: ids(timeline.beforeMessage), after: ids(timeline.afterMessage), unbound: timeline.unbound.map((card) => card.messageId) };
+  return {
+    before: ids(timeline.beforeMessage),
+    after: ids(timeline.afterMessage),
+    turnWithoutMessage: timeline.turnWithoutMessage.map((card) => card.messageId),
+    unbound: timeline.unbound.map((card) => card.messageId)
+  };
 }
 
 test('a failed card older than every loaded message is placed by whether message 1 is loaded', async (t) => {
@@ -408,7 +447,7 @@ test('a failed card older than every loaded message is placed by whether message
         await view.observe(snapshot);
         const { html, setup } = await view.mount();
         assert.equal(setup.hasLoadedFloorGap, true);
-        assert.deepEqual(placedCards(setup), { before: { 'target-1': ['failed-early'] }, after: {}, unbound: [] },
+        assert.deepEqual(placedCards(setup), { before: { 'target-1': ['failed-early'] }, after: {}, turnWithoutMessage: [], unbound: [] },
           'a failure older than message 1 belongs above it whatever the gap holds');
         assert.match(html, /比第一条消息更早的任务/);
       } finally { await scenario.close(); }
@@ -432,9 +471,120 @@ test('a failed card older than every loaded message is placed by whether message
         const { html, setup } = await view.mount();
         assert.equal(setup.earliestLoadedFloor, 2);
         assert.equal(setup.canRequestEarlierHistory, true, 'the earlier history can be loaded');
-        assert.deepEqual(placedCards(setup), { before: {}, after: {}, unbound: [] },
+        assert.deepEqual(placedCards(setup), { before: {}, after: {}, turnWithoutMessage: [], unbound: [] },
           'the card is neither above nor below a loaded message: the earlier history holds its position');
         assert.doesNotMatch(html, /比第一条消息更早的任务/);
+      } finally { await scenario.close(); }
+    });
+  });
+});
+
+/** `NOW` plus the given seconds. */
+const after = (seconds) => new Date(Date.parse(NOW) + seconds * 1000).toISOString();
+
+/** A Turn of `target` started at `at`, ended with `ended` when given. */
+function targetTurnRows({ id, at, ended }) {
+  return [
+    row('Turn', { id, conversation_id: 'target', status: ended ? 'terminated' : 'active', created_at: at, updated_at: at, terminal_at: ended ? at : null }),
+    ...(ended ? [row('TurnTermination', { id: `${id}-termination`, turn_id: id, terminal_status: ended.status, reason: ended.reason, created_at: at })] : [])
+  ];
+}
+
+test('an incoming card stays visible while the Turn it started has no saved message', async (t) => {
+  const TASK = '请调研登录流程并汇报';
+  await withMessageList(async (open) => {
+    /** The task that created `target` started `task-turn`, which ended as `ended` before saving any text. */
+    const firstTurnEnded = async (name, ended) => {
+      const scenario = await openScenario(name, async (ingest) => [
+        ...targetTurnRows({ id: 'task-turn', at: after(1), ended }),
+        ...incomingRows({ id: 'task', mode: 'followup', at: NOW, payloadId: await ingest.payload(TASK), delivery: { state: 'consumed', turnId: 'task-turn' } })
+      ]);
+      try {
+        const view = open(scenario);
+        await view.observe(await scenario.snapshot());
+        return await view.mount();
+      } finally { await scenario.close(); }
+    };
+
+    await t.test('a created Conversation whose first request failed shows its task above the failure', async () => {
+      const { html, setup } = await firstTurnEnded('first-request-failed', { status: 'failed', reason: 'HTTP 429' });
+      assert.match(html, new RegExp(TASK), 'the task the Conversation was created for is shown');
+      assert.deepEqual(placedCards(setup), { before: {}, after: {}, turnWithoutMessage: ['task'], unbound: [] });
+      assert.ok(html.indexOf(TASK) < html.indexOf('本轮执行失败'), 'the task that started the Turn precedes its failure');
+      assert.doesNotMatch(html, /还没有消息/, 'the empty hint does not stand in for the card');
+    });
+
+    await t.test('a first Turn the user stopped still shows its task', async () => {
+      const { html, setup } = await firstTurnEnded('first-turn-stopped', { status: 'interrupted', reason: 'User requested stop.' });
+      assert.match(html, new RegExp(TASK));
+      assert.deepEqual(placedCards(setup).turnWithoutMessage, ['task']);
+      assert.doesNotMatch(html, /还没有消息/);
+    });
+
+    await t.test('the card stays visible across the first request, in the same place', async () => {
+      const scenario = await openScenario('first-request', async (ingest) => [
+        ...incomingRows({ id: 'task', mode: 'followup', at: NOW, payloadId: await ingest.payload(TASK), delivery: { state: 'pending' } })
+      ]);
+      try {
+        const live = await scenario.connect();
+        const view = open(scenario);
+        const stage = async (frames) => {
+          await view.observe(...frames);
+          const mounted = await view.mount();
+          assert.match(mounted.html, new RegExp(TASK));
+          assert.doesNotMatch(mounted.html, /还没有消息/);
+          return mounted;
+        };
+        let mounted = await stage(await live.take());
+        assert.deepEqual(placedCards(mounted.setup).unbound, ['task'], 'waiting for the next Turn');
+
+        const recipeId = await scenario.ingest.payload('{}');
+        await scenario.commit([
+          ...targetTurnRows({ id: 'task-turn', at: after(1) }),
+          kernel.DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update('task-delivery', { state: 'consumed', target_turn_id: 'task-turn', updated_at: after(1) }),
+          row('RuntimeDeliveryInputLink', { id: 'task-input', delivery_id: 'task-delivery', pending_turn_input_id: 'task-pending-input', handled_at: after(1), created_at: after(1), updated_at: after(1) }),
+          row('ModelRequest', { id: 'task-request', turn_id: 'task-turn', request_seq: 1n, status: 'prepared', terminal_state: null, provider_id: 'provider', model_id: 'model',
+            context_window_tokens: 1000n, compression_threshold_tokens: 800n, estimated_context_tokens: 10n, authority_snapshot_id: 'authority', settings_snapshot_object_id: null,
+            recipe_object_id: recipeId, usage_json: null, stream_stats_json: { attemptSeq: '1', socketGeneration: '0', retryReason: null }, created_at: after(2), updated_at: after(2) }),
+          row('Operation', { id: 'task-operation', owner_kind: 'model_request', owner_id: 'task-request', operation_seq: 1n, tool_call_id: null, status: 'pending', created_at: after(2), updated_at: after(2) }),
+          row('Attempt', { id: 'task-attempt', operation_id: 'task-operation', attempt_seq: 1n, status: 'pending', created_at: after(2), updated_at: after(2), completed_at: null })
+        ]);
+        mounted = await stage(await live.take());
+        assert.deepEqual(placedCards(mounted.setup), { before: {}, after: {}, turnWithoutMessage: ['task'], unbound: [] },
+          'the first request has nothing to show yet');
+        assert.match(mounted.html, /正在启动 LLM 请求/);
+        assert.ok(mounted.html.indexOf(TASK) < mounted.html.indexOf('正在启动 LLM 请求'), 'the task precedes the running request');
+
+        await scenario.commit([
+          ...targetMessageRows({ id: 'reply', seq: 1, role: 'model', turnId: 'task-turn', at: after(3), contentId: await scenario.ingest.message('model', '已开始调研') }),
+          row('ModelRequestMessageLink', { id: 'task-request-message', model_request_id: 'task-request', message_id: 'reply', created_at: after(3) })
+        ]);
+        mounted = await stage(await live.take());
+        assert.deepEqual(placedCards(mounted.setup), { before: { reply: ['task'] }, after: {}, turnWithoutMessage: [], unbound: [] },
+          'above the reply once it is saved');
+        const task = mounted.html.indexOf(TASK);
+        assert.ok(mounted.html.indexOf('data-timeline-row-key="reply"') < task && task < mounted.html.indexOf('data-message-id="reply"'),
+          'drawn in the reply\'s row, above the reply');
+      } finally { await scenario.close(); }
+    });
+
+    await t.test('an older card of a Turn without a message sits where that Turn started, between earlier and later messages', async () => {
+      const scenario = await openScenario('older-turn', async (ingest) => [
+        ...targetTurnRows({ id: 'user-turn', at: NOW, ended: { status: 'completed', reason: 'completed' } }),
+        ...targetMessageRows({ id: 'earlier-question', seq: 1, turnId: 'user-turn', at: NOW, contentId: await ingest.message('user', '早先的问题') }),
+        ...targetMessageRows({ id: 'earlier-answer', seq: 2, role: 'model', turnId: 'user-turn', at: after(1), contentId: await ingest.message('model', '早先的回答') }),
+        ...incomingRows({ id: 'task', mode: 'followup', at: after(2), payloadId: await ingest.payload(TASK), delivery: { state: 'consumed', turnId: 'task-turn' } }),
+        ...targetTurnRows({ id: 'task-turn', at: after(3), ended: { status: 'failed', reason: 'HTTP 429' } }),
+        ...targetTurnRows({ id: 'later-turn', at: after(10) }),
+        ...targetMessageRows({ id: 'later-question', seq: 3, turnId: 'later-turn', at: after(10), contentId: await ingest.message('user', '后来的问题') })
+      ]);
+      try {
+        const view = open(scenario);
+        await view.observe(await scenario.snapshot());
+        const { html, setup } = await view.mount();
+        assert.deepEqual(placedCards(setup), { before: {}, after: { 'earlier-answer': ['task'] }, turnWithoutMessage: [], unbound: [] },
+          'after the last message created before that Turn started');
+        assert.ok(html.indexOf('早先的回答') < html.indexOf(TASK) && html.indexOf(TASK) < html.indexOf('后来的问题'));
       } finally { await scenario.close(); }
     });
   });
