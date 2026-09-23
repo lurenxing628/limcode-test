@@ -440,3 +440,45 @@ test('E2 Gemini 2.5 (signatures optional) keeps its unsigned history as before',
   ], { model: 'gemini-2.5-flash' });
   assert.deepEqual(wireShape(contents), ['user:TEXT(go)', 'model:FC(a)', 'user:FR(a)']);
 });
+
+test('E3 Gemini drops thoughts signed by other providers and keeps its own and unsigned ones', async () => {
+  const contents = await geminiWireContents([
+    userText('go'),
+    {
+      role: 'model',
+      parts: [
+        { text: 'claude thought', thought: true, thoughtSignature: 'claude:ErUB-claude' },
+        { text: 'responses thought', thought: true, thoughtSignature: 'openai-responses:gAAAA' },
+        { text: 'gemini thought', thought: true, thoughtSignature: 'gemini:SIG_T' },
+        { text: 'summary without signature', thought: true },
+        { text: 'answer' }
+      ]
+    },
+    userText('next')
+  ]);
+  assert.deepEqual(wireShape(contents), [
+    'user:TEXT(go)',
+    'model:THOUGHT(gemini thought)+SIG_T,THOUGHT(summary without signature),TEXT(answer)',
+    'user:TEXT(next)'
+  ]);
+});
+
+test('E3 a model content left with only foreign thoughts is removed instead of sent empty', async () => {
+  const contents = await geminiWireContents([
+    userText('a'),
+    { role: 'model', parts: [{ text: 'interrupted', thought: true, thoughtSignature: 'claude:sig' }] },
+    userText('b')
+  ]);
+  assert.deepEqual(wireShape(contents), ['user:TEXT(a)', 'user:TEXT(b)']);
+});
+
+test('E3 foreign-thought projection only applies to Gemini', () => {
+  const history = [
+    userText('a'),
+    { role: 'model', parts: [{ text: 'claude thought', thought: true, thoughtSignature: 'claude:sig' }, { text: 'answer' }] }
+  ];
+  for (const providerKind of ['openai-compatible', 'openai-responses', 'deepseek']) {
+    const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, providerKind);
+    assert.equal(request.contents[1].parts[0].thought, true, providerKind);
+  }
+});

@@ -42,7 +42,7 @@ export function toUnifiedRequest(
 ): UnifiedLLMRequest {
   const nativeAsync = nativeCapabilities?.asyncTools === true;
   const contents = providerKind === 'gemini'
-    ? mergeGeminiFunctionResponseTurns(request.contents)
+    ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(request.contents))
     : providerKind === 'claude'
       ? projectClaudeThoughtReplay(request.contents)
       : request.contents;
@@ -93,6 +93,46 @@ function isForeignThoughtPart(part: ContentPart, provider: string): boolean {
   if (!isTextPart(part) || part.thought !== true) return false;
   const signature = normalizedSignatureString(part.thoughtSignature);
   return parsePortableThoughtSignature(signature ?? '')?.provider !== provider;
+}
+
+/**
+ * 发给原生 Gemini 时摘掉别家 provider 签过的思考 part，与 Claude 路径的 projectClaudeThoughtReplay 同理：
+ * 别家签名对 Gemini 无效（接入库本来就不会把它发出去），剩下的只是另一个模型的思考文字，
+ * 却会以 `thought: true` 冒充 Gemini 自己的思考回放。
+ * - Gemini 自己签过的思考原样保留：官方要求“把完整响应的所有 part 按原样回传”，签名留在收到它的 part 上
+ *   （https://ai.google.dev/gemini-api/docs/generate-content/thinking、
+ *   https://ai.google.dev/gemini-api/docs/thought-signatures）。
+ * - 无签名的思考保留：Gemini 3 的思考摘要本身不带签名（签名在函数调用或最后一个 part 上），
+ *   无法与别家无签名思考区分，按官方“完整回传”处理。
+ * 摘掉后为空的 model 内容整条去掉，不发出空 parts。
+ */
+function projectGeminiThoughtReplay(contents: readonly MessageContent[]): readonly MessageContent[] {
+  let dropped = 0;
+  const projected: MessageContent[] = [];
+  for (const content of contents) {
+    if (content.role !== 'model') {
+      projected.push(content);
+      continue;
+    }
+    const parts = content.parts.filter((part) => !isOtherProviderSignedThought(part, 'gemini'));
+    dropped += content.parts.length - parts.length;
+    if (parts.length === content.parts.length) projected.push(content);
+    else if (parts.length > 0) projected.push({ ...content, parts });
+  }
+  if (dropped === 0) return contents;
+  try {
+    console.info('[LimCode][GeminiThoughtReplay]', JSON.stringify({ droppedForeignThoughtParts: dropped }));
+  } catch {
+    // 可观测性永远不是 provider 权威。
+  }
+  return projected;
+}
+
+function isOtherProviderSignedThought(part: ContentPart, provider: string): boolean {
+  if (!isTextPart(part) || part.thought !== true) return false;
+  const signature = normalizedSignatureString(part.thoughtSignature);
+  const signedBy = signature ? parsePortableThoughtSignature(signature)?.provider : undefined;
+  return signedBy !== undefined && signedBy !== provider;
 }
 
 /**
