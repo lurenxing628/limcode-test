@@ -16,6 +16,11 @@ export interface CollaborationTimelineCard {
    * (for example queued behind its running Turn), `failed` never reached it, `settled` did.
    */
   status: 'waiting' | 'failed' | 'settled';
+  /**
+   * An outgoing message or result that is waiting has already arrived in the recipient's inbox; it
+   * starts no Turn and is read by the recipient's running Turn or by its next one.
+   */
+  readBy?: 'current-turn' | 'next-turn';
 }
 
 export interface CollaborationTimeline {
@@ -88,6 +93,9 @@ export function projectCollaborationTimeline(input: {
         : delivery?.state === 'pending' && !(incoming && text(delivery.target_turn_id)) ? 'waiting'
           : 'settled'
     };
+    if (!incoming && card.status === 'waiting' && card.kind !== 'followup') {
+      card.readBy = text(delivery?.target_turn_id) ? 'current-turn' : 'next-turn';
+    }
     let turnId: string;
     if (incoming) {
       turnId = text(delivery?.target_turn_id);
@@ -145,7 +153,10 @@ export function collaborationCardLabel(card: CollaborationTimelineCard): string 
 export function collaborationCardStatusLabel(card: CollaborationTimelineCard): string {
   if (card.status === 'failed') return '投递失败';
   if (card.status === 'settled') return '';
-  return card.direction === 'incoming' ? '等待下一轮处理' : '等待对方处理';
+  if (card.direction === 'incoming') return '等待下一轮处理';
+  if (card.readBy === 'current-turn') return '已送达，对方本轮读取';
+  if (card.readBy === 'next-turn') return '已送达，对方下一轮读取';
+  return '等待对方处理';
 }
 
 export function collaborationCardKindLabel(card: CollaborationTimelineCard): string {

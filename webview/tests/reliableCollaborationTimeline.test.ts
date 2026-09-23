@@ -209,3 +209,34 @@ test('a failed incoming card sits where it was sent; only the newest few newer t
   assert.ok(timeline.unbound.every(card => collaborationCardStatusLabel(card) === '投递失败'));
 });
 
+test('an outgoing message or result waiting for the recipient says it arrived and when it is read', () => {
+  const outgoing = (messageId: string, turnId: string | null) =>
+    ({ id: `${messageId}-delivery-1`, inbox_item_id: `${messageId}-inbox`, target_conversation_id: 'peer', target_turn_id: turnId, state: 'pending', attempt_seq: '1' });
+  const timeline = projectCollaborationTimeline({
+    conversationId: 'self',
+    records: {
+      Conversation: byId({ id: 'peer', title: '调研对话', status: 'active' }),
+      CollaborationMessage: byId(
+        message('idle-message', '1', 'message', '下一轮再看'),
+        message('running-message', '2', 'message', '本轮就能看到'),
+        message('idle-result', '3', 'message', '任务结果'),
+        message('followup', '4', 'followup', '请处理')
+      ),
+      CollaborationMessageSourceLink: byId(
+        source('idle-message', 'self', 'self-turn'), source('running-message', 'self', 'self-turn'),
+        source('idle-result', 'self', 'self-turn', 'completion'), source('followup', 'self', 'self-turn')
+      ),
+      CollaborationMessageTargetLink: byId(...['idle-message', 'running-message', 'idle-result', 'followup'].map(id => target(id, 'peer'))),
+      RuntimeDelivery: byId(outgoing('idle-message', null), outgoing('running-message', 'peer-turn'), outgoing('idle-result', null), outgoing('followup', null))
+    },
+    messages: [{ id: 'self-message', role: 'user' }],
+    turnIdByMessageId: { 'self-message': 'self-turn' },
+    removedConversationIds: []
+  });
+  assert.deepEqual(timeline.afterMessage['self-message'].map(card => [card.messageId, collaborationCardStatusLabel(card)]), [
+    ['idle-message', '已送达，对方下一轮读取'],
+    ['running-message', '已送达，对方本轮读取'],
+    ['idle-result', '已送达，对方下一轮读取'],
+    ['followup', '等待对方处理']
+  ]);
+});
