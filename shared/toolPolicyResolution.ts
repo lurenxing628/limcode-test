@@ -252,9 +252,9 @@ export function mcpSourceAdmits(config: ToolPolicySourceConfigRecord | undefined
  * follows only its source settings, by source id and original tool name (`mcpToolIdentity`): an
  * enabled source admits the tools in its `enabledTools` allowlist when it has one, else every tool,
  * minus the ones it disables; a disabled, denied or unconfigured source admits none; tool lists
- * never admit an MCP tool. Offering, dispatch admission, the
- * provider adapter, the token estimate, the MCP policy gate and the settings view all use this;
- * offering and admission also keep the cross-conversation tools to top-level conversations.
+ * never admit an MCP tool. Offering, dispatch admission, the provider adapter, the token estimate,
+ * the MCP policy gate and the settings view all use this; offering and admission also keep the
+ * cross-conversation tools to top-level conversations.
  */
 export function toolAllowedByPolicy(
   policy: { allowedTools: ReadonlySet<string> | readonly string[]; sourceConfigs?: unknown; toolConfigs?: unknown },
@@ -278,8 +278,9 @@ export function toolAllowedByPolicy(
  * Capability lists are monotone: every layer with a list is an upper bound and may only narrow the
  * tools admitted by an earlier layer; a layer without a list narrows nothing. When no layer on the
  * chain has a list, the base is `defaultTools` (see `defaultToolNames`). Names of the tools the
- * cross-conversation switch grants are ignored in every list, so the result never holds them. A stored list that is
- * neither absent nor an array of names fails closed instead of narrowing nothing. YOLO changes
+ * cross-conversation switch grants are ignored in every list, so the result never holds them. A
+ * stored list that is neither absent nor an array of names fails closed instead of narrowing
+ * nothing. YOLO changes
  * approval/application behavior only; it never widens a Global/Agent/Workflow capability boundary.
  * `inherit` (and the pre-preset shape where preset is absent) inherits only the Global execution
  * preset, while the layer's allowedTools and per-tool settings remain active.
