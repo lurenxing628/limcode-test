@@ -61,7 +61,7 @@ import {
   resolveProviderModelCapabilities,
   resolveSummaryReasoning
 } from '../../shared/modelCapabilities';
-import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
+import { resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
 import {
   createLocalFolderWorkEnvironmentRecord,
   isLocalFolderWorkEnvironment,
@@ -101,6 +101,7 @@ import {
 } from '../world/modules/agent/blueprints';
 import { composeSystemInstruction, type SystemPromptTextPart } from '../world/modules/chat/systemPromptText';
 import { VscodeConfigurationMutations } from './vscodeConfigurationMutations';
+import { builtinDefaultToolNames } from './builtinToolCatalog';
 import type { AttachmentSettingsAuthority } from './attachmentIngest';
 import type {
   CompiledTurnAuthority,
@@ -245,8 +246,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       (link) => link.planReviewPolicyId
     );
     const builtinPlanReviewPolicy = builtinWorkflow?.planReviewPolicy;
-    const toolPolicyLayers: ToolPolicyLayer[] = [];
-    for (const scope of scopesLowToHigh) {
+    const toolPolicyLayers: ToolPolicyLayer[] = scopesLowToHigh.flatMap((scope) => {
       const configured = resolveRecordAtScope(
         records.toolPolicyScopeLinks,
         records.toolPolicies,
@@ -258,26 +258,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         : scope.scopeKind === 'workflow'
           ? builtinWorkflow?.toolPolicy
           : undefined;
-      if (configured) {
-        // A saved record without a list keeps the scope's built-in list, so settings that only
-        // store per-tool config never widen a built-in read-only Agent or workflow.
-        toolPolicyLayers.push({
-          scopeKind: scope.scopeKind,
-          policy: configured.allowedTools || !builtin ? configured : { ...configured, allowedTools: builtin.allowedTools }
-        });
-        continue;
-      }
-      if (builtin) {
-        toolPolicyLayers.push({
-          scopeKind: scope.scopeKind,
-          policy: {
-            allowedTools: builtin.allowedTools,
-            toolConfigs: builtin.toolConfigs
-          }
-        });
-      }
-    }
-    const toolPolicy = resolveToolPolicyLayers(toolPolicyLayers);
+      const layer = toolPolicyScopeLayer(scope.scopeKind, configured, builtin);
+      return layer ? [layer] : [];
+    });
+    // Same rule as the settings view: with no list anywhere on the chain the default tool set applies.
+    const toolPolicy = resolveToolPolicyLayers(toolPolicyLayers, builtinDefaultToolNames());
     const skillPolicy = resolveScopedRecord(
       records.skillPolicyScopeLinks,
       records.skillPolicies,

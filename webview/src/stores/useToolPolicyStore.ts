@@ -13,7 +13,7 @@ import type {
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
 import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES } from '@shared/protocol';
-import { resolveToolPolicyLayers, type ToolPolicyLayer, type ToolPolicyLayerValue } from '@shared/toolPolicyResolution';
+import { defaultToolNames, resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '@shared/toolPolicyResolution';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
@@ -72,21 +72,6 @@ function policyIdForScope(scopeKind: ToolPolicyScopeKind, scopeId?: string): str
 
 function linkIdForScope(scopeKind: ToolPolicyScopeKind, scopeId?: string): string {
   return `tool-policy-scope:${scopeKind}:${scopeIdFor(scopeKind, scopeId) ?? 'global'}`;
-}
-
-function defaultAllowedTools(definitions: ToolDefinitionRecord[]): string[] {
-  return definitions
-    .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
-    .map((tool) => tool.name);
-}
-
-function defaultToolPolicy(definitions: ToolDefinitionRecord[], scopeKind: ToolPolicyScopeKind): ToolPolicyRecord {
-  return {
-    id: policyIdForScope(scopeKind, undefined),
-    name: defaultPolicyName(scopeKind),
-    allowedTools: defaultAllowedTools(definitions),
-    preset: 'custom'
-  };
 }
 
 function defaultPolicyName(scopeKind: ToolPolicyScopeKind): string {
@@ -282,24 +267,11 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       const id = scopeIdFor(scopeKind, scopeId);
       return useClientStateStore().builtinToolPolicies.find((record) => record.scopeKind === scopeKind && record.scopeId === id);
     },
-    /**
-     * One settings layer as the backend compiles it: the saved record, a saved record without a list
-     * keeping the built-in list, or the built-in list alone. Global without a saved list shows the
-     * default tool list.
-     */
+    /** One settings layer exactly as the backend compiles it (see `toolPolicyScopeLayer`). */
     layerFor(scope: ScopeRef): ToolPolicyLayer | undefined {
-      const clientState = useClientStateStore();
       const saved = this.localPolicyFor(scope.scopeKind, scope.scopeId).policy;
-      if (scope.scopeKind === 'global') {
-        const policy = saved ?? defaultToolPolicy(clientState.toolDefinitions, 'global');
-        return { scopeKind: 'global', policy: { ...policy, allowedTools: policy.allowedTools ?? defaultAllowedTools(clientState.toolDefinitions) } };
-      }
       const builtin = this.builtinPolicyFor(scope.scopeKind, scope.scopeId);
-      if (saved) {
-        const policy: ToolPolicyLayerValue = saved.allowedTools || !builtin ? saved : { ...saved, allowedTools: builtin.allowedTools };
-        return { scopeKind: scope.scopeKind, policy };
-      }
-      return builtin ? { scopeKind: scope.scopeKind, policy: { id: builtin.id, allowedTools: builtin.allowedTools } } : undefined;
+      return toolPolicyScopeLayer(scope.scopeKind, saved, builtin);
     },
     /** Upper layers of a scope, low to high: a Conversation also inherits its Agent and workflow. */
     upperScopesFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ScopeRef[] {
@@ -314,13 +286,21 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       }
       return upper;
     },
+    /**
+     * The backend's resolution of these layers. A stored list the backend refuses to compile shows
+     * no tool enabled rather than breaking the settings view.
+     */
     resolveScopes(scopes: readonly ScopeRef[]): ReturnType<typeof resolveToolPolicyLayers> {
       const clientState = useClientStateStore();
       const layers = scopes.flatMap((scope) => {
         const layer = this.layerFor(scope);
         return layer ? [layer] : [];
       });
-      return resolveToolPolicyLayers(layers, clientState.toolDefinitions.map((tool) => tool.name));
+      try {
+        return resolveToolPolicyLayers(layers, defaultToolNames(clientState.toolDefinitions));
+      } catch {
+        return { id: null, allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {} };
+      }
     },
     effectivePolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): EffectiveToolPolicyResolution {
       const local = this.localPolicyFor(scopeKind, scopeId);

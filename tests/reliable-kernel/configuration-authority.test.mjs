@@ -901,6 +901,69 @@ test('未写允许列表的工具策略层不收窄上层，内置 Agent 与工�
   }
 });
 
+test('整条链都没有工具列表时以默认工具集为底，自定义 Agent 不会没有工具；存储的非法列表拒绝编译', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-default-tool-set-'));
+  try {
+    const { createBuiltinToolDefinitions } = require('../../dist/extension/backend/world/modules/tools/definitions/index.js');
+    const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+    const command = { toolName: process.platform === 'win32' ? 'shell' : 'bash', description: 'Synthetic shell.' };
+    const builtinDefinitions = createBuiltinToolDefinitions({ command }).map((definition) => definition.declaration);
+    // The one definition of the default tool set, as the settings page computes it from the same catalog.
+    const defaultToolSet = builtinDefinitions
+      .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
+      .map((tool) => tool.name).sort();
+    assert.ok(defaultToolSet.includes('run_agent') && defaultToolSet.includes('send_conversation_message'));
+    assert.equal(defaultToolSet.includes('transfer'), false, 'tools that are off by default stay out of the default set');
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Default Tool Set Provider' }),
+      id: 'provider:default-tool-set',
+      model: 'model:default-tool-set',
+      models: [{ id: 'model:default-tool-set', name: '模型' }],
+      modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const custom = await authority.mutations.createAgent({ name: '自定义', kind: 'custom' });
+    let turn = 0;
+    const compile = async (executorAgentId, conversationId) => JSON.parse((await authority.compile({
+      conversationId, turnId: `turn:${conversationId}:${turn++}`, executorAgentId, intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+
+    assert.deepEqual((await compile(custom.id, 'conversation:custom')).allowedTools, defaultToolSet,
+      'a custom Agent with nothing saved gets the default tool set');
+    const switchOn = { run_agent: { config: { crossConversationCollaboration: true } } };
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', toolConfigs: switchOn });
+    const withSwitch = await compile(custom.id, 'conversation:custom');
+    assert.deepEqual(withSwitch.allowedTools, defaultToolSet, 'a list-less global record written by the switch narrows nothing');
+    assert.equal(withSwitch.toolConfigs.run_agent.config.crossConversationCollaboration, true);
+    await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: custom.id, toolConfigs: switchOn });
+    assert.deepEqual((await compile(custom.id, 'conversation:custom')).allowedTools, defaultToolSet);
+    const blueprints = createDefaultAgentBlueprints();
+    assert.deepEqual((await compile('main', 'conversation:main')).allowedTools, [...blueprints.agents.main.toolPolicy.allowedTools].sort(),
+      'the built-in main Agent keeps its own list, including tools that are off by default');
+
+    // A hand-edited record whose list is neither absent nor an array of names fails closed.
+    const recordsRoot = path.join(paths.toolPoliciesRootPath, 'records');
+    const recordFiles = await fs.readdir(recordsRoot);
+    const globalFile = [];
+    for (const file of recordFiles) {
+      const saved = JSON.parse(await fs.readFile(path.join(recordsRoot, file), 'utf8'));
+      if (saved.toolPolicy?.id === 'tool-policy:global:global') globalFile.push(path.join(recordsRoot, file));
+    }
+    assert.equal(globalFile.length, 1);
+    const original = JSON.parse(await fs.readFile(globalFile[0], 'utf8'));
+    for (const malformed of [null, '', 'read', [1], { read: true }]) {
+      await fs.writeFile(globalFile[0], JSON.stringify({ ...original, toolPolicy: { ...original.toolPolicy, allowedTools: malformed } }));
+      await assert.rejects(compile(custom.id, 'conversation:custom'), /allowedTools/, `stored allowedTools ${JSON.stringify(malformed)} must fail closed`);
+      await assert.rejects(compile('main', 'conversation:main'), /allowedTools/);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('Ask/Plan 自动审批通过原有工具策略落盘、继承并允许局部关闭', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-auto-approval-settings-'));
   try {

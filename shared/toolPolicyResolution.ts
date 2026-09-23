@@ -10,7 +10,7 @@ export type ResolvedToolPolicyPreset = Exclude<ToolPolicyPresetKind, 'inherit'>;
 
 export interface ToolPolicyLayerValue {
   id?: string;
-  /** Absent: this layer sets per-tool settings only and narrows nothing. */
+  /** Absent: this layer sets per-tool settings only and narrows nothing. Any other non-list value fails closed. */
   allowedTools?: readonly string[];
   preset?: ToolPolicyPresetKind;
   toolConfigs?: Readonly<Record<string, ToolPolicyToolConfigRecord>>;
@@ -22,6 +22,20 @@ export interface ToolPolicyLayer {
   policy: ToolPolicyLayerValue;
 }
 
+/** The list a built-in Agent or workflow narrows to while its scope saves no list of its own. */
+export interface BuiltinToolPolicyLayerValue {
+  id?: string;
+  allowedTools: readonly string[];
+  toolConfigs?: Readonly<Record<string, ToolPolicyToolConfigRecord>>;
+}
+
+/** The parts of a tool definition that decide whether it belongs to the default tool set. */
+export interface ToolPolicyCatalogEntry {
+  name: string;
+  source?: { kind?: string };
+  metadata?: { defaultEnabled?: boolean };
+}
+
 export interface ResolvedToolPolicy {
   id: string | null;
   allowedTools: string[];
@@ -31,13 +45,51 @@ export interface ResolvedToolPolicy {
 }
 
 /**
+ * The default tool set: what a scope gets while no layer on its chain saves a list. MCP tools never
+ * belong to it; their source configs alone admit them.
+ */
+export function defaultToolNames(definitions: readonly ToolPolicyCatalogEntry[]): string[] {
+  return uniqueNames(definitions
+    .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
+    .map((tool) => tool.name));
+}
+
+/**
+ * One settings scope as a layer: the saved record, a saved record without a list keeping the
+ * scope's built-in list (so settings that only store per-tool config never widen a built-in
+ * read-only Agent or workflow), or the built-in list alone. The backend compile and the settings
+ * view build every layer here.
+ */
+export function toolPolicyScopeLayer(
+  scopeKind: ToolPolicyScopeKind,
+  saved: ToolPolicyLayerValue | undefined,
+  builtin: BuiltinToolPolicyLayerValue | undefined
+): ToolPolicyLayer | undefined {
+  if (saved) {
+    const policy = saved.allowedTools !== undefined || !builtin ? saved : { ...saved, allowedTools: builtin.allowedTools };
+    return { scopeKind, policy };
+  }
+  if (!builtin) return undefined;
+  return {
+    scopeKind,
+    policy: {
+      ...(builtin.id ? { id: builtin.id } : {}),
+      allowedTools: builtin.allowedTools,
+      ...(builtin.toolConfigs ? { toolConfigs: builtin.toolConfigs } : {})
+    }
+  };
+}
+
+/**
  * Compiles raw settings layers in canonical low-to-high order.
  *
  * Capability lists are monotone: every layer with a list is an upper bound and may only narrow the
- * tools admitted by an earlier layer; a layer without a list narrows nothing. YOLO changes approval/application behavior only; it never widens
- * a Global/Agent/Workflow capability boundary. `inherit` (and the pre-preset shape where preset
- * is absent) inherits only the Global execution preset, while the layer's allowedTools and
- * per-tool settings remain active.
+ * tools admitted by an earlier layer; a layer without a list narrows nothing. When no layer on the
+ * chain has a list, the base is `defaultTools` (see `defaultToolNames`). A stored list that is
+ * neither absent nor an array of names fails closed instead of narrowing nothing. YOLO changes
+ * approval/application behavior only; it never widens a Global/Agent/Workflow capability boundary.
+ * `inherit` (and the pre-preset shape where preset is absent) inherits only the Global execution
+ * preset, while the layer's allowedTools and per-tool settings remain active.
  *
  * MCP source denies are also monotone: a disabled ancestor or disabled tool cannot be re-enabled
  * by a more specific layer. Per-tool settings are ordinary low-to-high overrides, with deep merge
@@ -45,19 +97,14 @@ export interface ResolvedToolPolicy {
  */
 export function resolveToolPolicyLayers(
   layersInput: readonly ToolPolicyLayer[],
-  availableToolNames?: readonly string[]
+  defaultTools: readonly string[]
 ): ResolvedToolPolicy {
   const layers = [...layersInput];
   const globalLayer = layers.find((layer) => layer.scopeKind === 'global');
   const globalPreset = explicitPreset(globalLayer?.policy.preset) ?? 'custom';
   let preset: ResolvedToolPolicyPreset = globalPreset;
 
-  const universe = uniqueNames([
-    ...(availableToolNames ?? []),
-    ...layers.flatMap((layer) => layer.policy.allowedTools ?? [])
-  ]);
-  let allowed = new Set(universe);
-
+  let allowed: Set<string> | undefined;
   const toolConfigs: Record<string, ToolPolicyToolConfigRecord> = {};
   const sourceConfigs: Record<string, ToolPolicySourceConfigRecord> = {};
 
@@ -69,9 +116,10 @@ export function resolveToolPolicyLayers(
       preset = explicitPreset(rawPreset) ?? globalPreset;
     }
 
-    if (layer.policy.allowedTools) {
-      const ceiling = new Set(uniqueNames(layer.policy.allowedTools));
-      allowed = new Set([...allowed].filter((name) => ceiling.has(name)));
+    const list = layerAllowedTools(layer);
+    if (list) {
+      const ceiling = new Set(uniqueNames(list));
+      allowed = allowed ? new Set([...allowed].filter((name) => ceiling.has(name))) : ceiling;
     }
 
     mergeToolConfigs(toolConfigs, layer.policy.toolConfigs);
@@ -85,11 +133,21 @@ export function resolveToolPolicyLayers(
 
   return {
     id,
-    allowedTools: [...allowed].sort(),
+    allowedTools: [...(allowed ?? new Set(uniqueNames(defaultTools)))].sort(),
     preset,
     toolConfigs,
     sourceConfigs
   };
+}
+
+/** A layer's list, or undefined when it saves none; a hand-edited non-list value fails closed. */
+function layerAllowedTools(layer: ToolPolicyLayer): readonly string[] | undefined {
+  const value: unknown = layer.policy.allowedTools;
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((name) => typeof name !== 'string')) {
+    throw new TypeError(`工具策略 ${layer.policy.id?.trim() || layer.scopeKind} 的 allowedTools 必须是工具名数组。`);
+  }
+  return value as readonly string[];
 }
 
 function explicitPreset(value: ToolPolicyPresetKind | undefined): ResolvedToolPolicyPreset | undefined {

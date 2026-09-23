@@ -1,13 +1,5 @@
 import * as path from 'node:path';
 import type * as vscode from 'vscode';
-import type {
-  CommandCapability,
-  CommandOutputLimits,
-  CommandRunArgs,
-  CommandRunObserver,
-  CommandRunResult,
-  WorkEnvironmentCapabilityOptions
-} from '../../capabilities/types';
 import { createSkillCatalogCapability } from '../../capabilities/skillCatalog';
 import { createRulesCatalogCapability } from '../../capabilities/rulesCatalog';
 import { createVsCodeFsCapability } from '../../capabilities/vscodeFs';
@@ -15,6 +7,7 @@ import { createWorkEnvironmentRuntimeCapability } from '../../capabilities/workE
 import { McpRuntimeManager, dedupeMcpToolNames } from '../mcpRuntimeManager';
 import { proxyForShellAndMcp } from './proxyEnvironment';
 import { createBuiltinToolDefinitions } from '../../world/modules/tools/definitions';
+import { commandDeclarationCapability } from '../../reliableKernel/builtinToolCatalog';
 import {
   toolDefinitionRecord,
   type ToolDefinition,
@@ -375,26 +368,6 @@ function authorityMultimodalEnabled(document: PlainJsonValue): boolean {
   const authority = requireRecord(document, 'AuthoritySnapshot');
   const model = requireRecord(authority.model, 'AuthoritySnapshot.model');
   return model.enableMultimodalTools !== false;
-}
-
-function commandDeclarationCapability(): CommandCapability {
-  const toolName: 'shell' | 'bash' = process.platform === 'win32' ? 'shell' : 'bash';
-  const unavailable = (): never => {
-    throw new Error(`${toolName} execution must use reliable ProcessControlPlane.`);
-  };
-  return {
-    toolName,
-    executable: undefined,
-    description: `${toolName === 'shell' ? 'Run a non-interactive PowerShell command' : 'Run a non-interactive Bash/Shell command'} in the project workspace. Returns stdout, stderr, and exitCode. Foreground wait moves a still-running process to the reliable detached wrapper; running results carry exitCode=null.`,
-    run(_args: CommandRunArgs, _observer?: CommandRunObserver, _options?: WorkEnvironmentCapabilityOptions, _limits?: CommandOutputLimits): Promise<CommandRunResult> {
-      return Promise.reject(unavailable());
-    },
-    backgroundForeground: unavailable,
-    readOutput: unavailable,
-    kill: unavailable,
-    quiesce() {},
-    dispose() {}
-  } as CommandCapability;
 }
 
 function assertInsideRoot(root: string, target: string, label: string): void {

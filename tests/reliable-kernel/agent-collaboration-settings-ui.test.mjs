@@ -236,13 +236,36 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(global.allowedTools, undefined, 'no global ceiling is written as a side effect');
       assert.deepEqual(global.toolConfigs, switchOn);
       assert.equal('allowedTools' in messages.at(-1).payload, false);
-      assert.deepEqual(sorted(store.effectivePolicyFor('agent', 'main').policy.allowedTools), sorted(builtinToolPolicies[0].allowedTools).filter((name) => name !== 'transfer'),
-        'the global view keeps showing the default list');
+      assert.deepEqual(sorted(store.effectivePolicyFor('global').policy.allowedTools), sorted(['run_agent', 'read_file', 'write', ...crossNames]),
+        'the global view shows the default tool set: no MCP tools and nothing that is off by default');
 
       store.setCrossConversationCollaborationForScope('global', undefined, undefined);
       assert.equal(store.localPolicyFor('global').policy, undefined, 'restoring the default removes the switch-only global record');
       assert.deepEqual(messages.at(-1).payload, { scopeKind: 'global' });
       assert.equal(messages.at(-1).type, 'toolPolicy.scope.clear');
+    });
+
+    await t.test('没有任何工具列表时按默认工具集显示，内置 Agent 按自己的列表显示，和后端编译一致', async () => {
+      const { client, feed, store } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      const defaultToolSet = sorted(['run_agent', 'read_file', 'write', ...crossNames]);
+      feed.records = { AgentConversationLink: {
+        custom: { id: 'custom', conversation_id: 'custom-conversation', agent_id: 'agent:custom', role: 'default' },
+        main: { id: 'main', conversation_id: 'main-conversation', agent_id: 'main', role: 'default' }
+      } };
+      store.setCrossConversationCollaborationForScope('global', undefined, true);
+      assert.equal(store.localPolicyFor('global').policy.allowedTools, undefined);
+      assert.deepEqual(store.effectivePolicyFor('conversation', 'custom-conversation').policy.allowedTools, defaultToolSet,
+        'a custom Agent under a list-less global record gets the default tool set');
+      assert.deepEqual(store.crossConversationToolsFor('conversation', 'custom-conversation').missing, []);
+      assert.deepEqual(store.effectivePolicyFor('agent', 'main').policy.allowedTools, sorted(builtinToolPolicies[0].allowedTools),
+        'the main Agent keeps transfer from its built-in list while global saves no list');
+      assert.deepEqual(store.effectivePolicyFor('conversation', 'main-conversation').policy.allowedTools, sorted(builtinToolPolicies[0].allowedTools));
+
+      // A hand-edited global list that is not an array of names shows nothing enabled, as the backend refuses to compile it.
+      client.toolPolicies = client.toolPolicies.map((policy) => policy.id === 'tool-policy:global:global' ? { ...policy, allowedTools: null } : policy);
+      assert.deepEqual(store.effectivePolicyFor('conversation', 'custom-conversation').policy.allowedTools, []);
+      assert.deepEqual(store.effectivePolicyFor('agent', 'main').policy.allowedTools, []);
     });
 
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
