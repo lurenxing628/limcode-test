@@ -4618,14 +4618,17 @@ const ASTRA_UNSUPPORTED_INCLUDE_VALUES: Record<string, true> = {
 };
 
 /**
- * Astra 参数适配：精确 Astra 模型 + openai-responses 时，剔除不支持的 temperature/top_p/
- * top_logprobs/logprobs，把 reasoning none/minimal 提升为 low。其他模型/渠道原样返回（同一引用）。
+ * Astra 参数适配：精确 Astra 模型走 openai-responses 或 openai-compatible 时，剔除不支持的
+ * temperature/top_p/top_logprobs/logprobs，把 reasoning none/minimal 提升为 low。其他模型/渠道原样返回（同一引用）。
+ * 依据 https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md “Update API and model parameters”：
+ * Astra 不支持 `none`（用 `low`）；effort 不是 `none` 时去掉 temperature、top_p、top_logprobs，
+ * Chat Completions 另去掉 logprobs，Responses 另从 include 去掉 message.output_text.logprobs。
  * 适配在设置解析时完成，冻结快照/恢复因此总是携带有效值。幂等。
  */
 function adaptAstraNativeParameterSettings(settings: LlmProviderConfigRecord): LlmProviderConfigRecord {
-  if (settings.provider !== 'openai-responses' || !isAstraModel(settings.model)) return settings;
+  if (!isAstraParameterTarget(settings)) return settings;
   const generationConfig = adaptAstraGenerationConfig(settings.generationConfig);
-  const requestBody = adaptAstraRequestBody(settings.requestBody);
+  const requestBody = adaptAstraRequestBody(settings.requestBody, settings.provider);
   if (generationConfig === settings.generationConfig && requestBody === settings.requestBody) return settings;
   const next = { ...settings };
   if (generationConfig !== settings.generationConfig) {
@@ -4668,15 +4671,24 @@ function effectiveRequestGenerationConfig(
 ): LlmGenerationConfigRecord | undefined {
   const frozen = request.settingsSnapshot?.generationConfig;
   if (!frozen) return settings.generationConfig;
-  return settings.provider === 'openai-responses' && isAstraModel(settings.model)
+  return isAstraParameterTarget(settings)
     ? adaptAstraGenerationConfig(frozen)
     : frozen;
 }
 
-function adaptAstraRequestBody(requestBody: LlmRequestBodyRecord | undefined): LlmRequestBodyRecord | undefined {
+/** Astra 参数适配只作用于精确 Astra 模型的 Responses 与 Chat Completions 形状请求。 */
+function isAstraParameterTarget(settings: Pick<LlmProviderConfigRecord, 'provider' | 'model'>): boolean {
+  return (settings.provider === 'openai-responses' || settings.provider === 'openai-compatible') && isAstraModel(settings.model);
+}
+
+function adaptAstraRequestBody(
+  requestBody: LlmRequestBodyRecord | undefined,
+  provider: LlmProviderKind
+): LlmRequestBodyRecord | undefined {
   if (!requestBody) return requestBody;
   const entries = Object.entries(requestBody).filter(([key]) => !ASTRA_UNSUPPORTED_REQUEST_BODY_KEYS[key]);
-  const include = requestBody.include;
+  // include 过滤只属于 Responses；Chat Completions 没有该字段，原样保留用户配置。
+  const include = provider === 'openai-responses' ? requestBody.include : undefined;
   const adaptedInclude = Array.isArray(include)
     ? include.filter((value) => !(typeof value === 'string' && ASTRA_UNSUPPORTED_INCLUDE_VALUES[value]))
     : undefined;

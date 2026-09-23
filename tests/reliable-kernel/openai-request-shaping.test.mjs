@@ -162,3 +162,59 @@ test('C6 key 模式与关闭缓存的请求保持不变', async () => {
   assert.equal(disabled.prompt_cache_options, undefined);
   assert.equal(disabled.prompt_cache_key, undefined);
 });
+
+// C7：https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md “Update API and model parameters”。
+function compatibleSettings(model, overrides = {}) {
+  return responsesSettings('https://gateway.example/v1', { id: `compat-${model}`, provider: 'openai-compatible', model,
+    promptCache: { enabled: false, mode: 'key', ttl: '30m' }, ...overrides });
+}
+
+async function compatibleDryRun(settings) {
+  return (await dryRunLlmProvider({ id: `compat-${settings.model}`, conversationId: 'shaping-conversation',
+    contents: [{ role: 'user', parts: [{ text: 'hi' }] }], tools: [] }, { settings: async () => settings })).body;
+}
+
+const SAMPLING_GENERATION = { temperature: 0.3, topP: 0.9, maxOutputTokens: 512 };
+const SAMPLING_BODY = { temperature: 0.5, top_p: 0.8, top_logprobs: 2, logprobs: true, include: ['message.output_text.logprobs'], other: 'keep' };
+
+test('C7 openai-compatible 上的 Astra：去掉 temperature/top_p/top_logprobs/logprobs，none/minimal 提升为 low', async () => {
+  for (const [level, expected] of [['none', 'low'], ['minimal', 'low'], ['high', 'high']]) {
+    const body = await compatibleDryRun(compatibleSettings('gpt-6-astra', {
+      generationConfig: { ...SAMPLING_GENERATION, thinkingConfig: { thinkingLevel: level } },
+      requestBody: SAMPLING_BODY
+    }));
+    for (const key of ['temperature', 'top_p', 'top_logprobs', 'logprobs']) assert.equal(body[key], undefined, `${level}:${key}`);
+    assert.equal(body.reasoning_effort, expected, level);
+    assert.equal(body.max_tokens, 512);
+    assert.equal(body.other, 'keep');
+    assert.deepEqual(body.include, ['message.output_text.logprobs'], 'Chat Completions 没有 include，保持用户配置不动');
+  }
+  const dated = await compatibleDryRun(compatibleSettings('gpt-6-astra-2026-09-01', { generationConfig: SAMPLING_GENERATION }));
+  assert.equal(dated.temperature, undefined);
+});
+
+test('C7 非 Astra 的 openai-compatible 请求保持不变（含支持 none 的 Sol/Luna）', async () => {
+  for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-5.5', 'gpt-6-astra-preview', 'claude-sonnet-5']) {
+    const body = await compatibleDryRun(compatibleSettings(model, {
+      generationConfig: { ...SAMPLING_GENERATION, thinkingConfig: { thinkingLevel: 'none' } },
+      requestBody: SAMPLING_BODY
+    }));
+    assert.equal(body.temperature, 0.5, model);
+    assert.equal(body.top_p, 0.8, model);
+    assert.equal(body.top_logprobs, 2, model);
+    assert.equal(body.logprobs, true, model);
+    assert.equal(body.reasoning_effort, 'none', model);
+  }
+});
+
+test('C7 Responses 上的 Astra 适配保持原样', async () => {
+  const body = (await dryRunLlmProvider({ id: 'responses-astra', conversationId: 'shaping-conversation',
+    contents: [{ role: 'user', parts: [{ text: 'hi' }] }], tools: [] }, { settings: async () => responsesSettings('https://api.openai.com/v1', {
+    model: 'gpt-6-astra', promptCache: { enabled: false, mode: 'key', ttl: '30m' },
+    generationConfig: { ...SAMPLING_GENERATION, thinkingConfig: { thinkingLevel: 'none' } },
+    requestBody: { ...SAMPLING_BODY, include: ['reasoning.encrypted_content', 'message.output_text.logprobs'] }
+  }) })).body;
+  for (const key of ['temperature', 'top_p', 'top_logprobs', 'logprobs']) assert.equal(body[key], undefined, key);
+  assert.equal(body.reasoning.effort, 'low');
+  assert.equal(body.include.includes('message.output_text.logprobs'), false);
+});
