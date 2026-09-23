@@ -591,6 +591,73 @@ test('long collaboration messages and replies arrive as previews whose marker na
   });
 });
 
+test('read_conversation spends its budget on the newest messages, pages older ones and long messages, and fits the result cap', { timeout: 90000 }, async () => {
+  const userText = index => `USER_${index}_${'历史消息分页。'.repeat(1000)}`;
+  const answerText = index => `PEER_ANSWER_${index}`;
+  let peerRound = 0, rootRound = 0, peerRef, first, long;
+  const pages = [], history = [], longPages = [];
+  const read = (id, args) => toolsAnswer(call(id, 'read_conversation', { conversationRef: peerRef, ...args }));
+  const checked = start => {
+    const raw = lastResult(start, 'read_conversation');
+    assert.equal(raw?.status, 'succeeded', JSON.stringify(raw).slice(0, 300));
+    assert.ok(raw.detail, 'the whole result fits under the tool-result cap instead of becoming a preview');
+    assert.ok(estimateTokens(JSON.stringify(raw)) < TOOL_RESULT_MAX_TOKENS);
+    assert.doesNotMatch(JSON.stringify(raw), /open the source Conversation/);
+    return raw.detail;
+  };
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === PEER) return answer(answerText(peerRound++));
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      peerRef = detail(start, 'list_conversations').conversations[0].conversationRef;
+      return read('read-newest', {});
+    }
+    if (!first) {
+      first = checked(start);
+      history.push(first);
+      long = first.messages.find(message => message.truncated);
+      assert.ok(long, JSON.stringify(first).slice(0, 400));
+      return read('read-long-0', { messageRef: long.messageRef, offset: 0 });
+    }
+    if (!long.done) {
+      const page = checked(start);
+      longPages.push(page.text);
+      if (page.nextOffset !== null) return read(`read-long-${longPages.length}`, { messageRef: long.messageRef, offset: page.nextOffset });
+      long.done = true;
+      return read('read-older-1', { beforeMessageRef: first.olderMessageRef });
+    }
+    const page = checked(start);
+    history.push(page);
+    if (page.hasMore) return read(`read-older-${history.length}`, { beforeMessageRef: page.olderMessageRef });
+    return answer('Read everything.');
+  }, async f => {
+    for (let index = 0; index < 5; index += 1) await f.terminated((await f.input(PEER, userText(index))).turnId);
+    const started = await f.input(ROOT, 'read the peer');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    // The first page holds the newest messages, the final answer whole, and continues older.
+    const newest = first.messages.map(message => message.text.slice(0, 12));
+    assert.equal(first.messages.at(-1).text, answerText(4), 'the final answer is shown whole');
+    assert.equal(first.messages.at(-1).truncated, false);
+    assert.deepEqual(newest.slice(-2), [userText(4).slice(0, 12), answerText(4).slice(0, 12)]);
+    assert.equal(first.hasMore, true);
+    assert.match(first.olderMessageRef, /^R\d+$/);
+    assert.match(first.note, /olderMessageRef as beforeMessageRef/);
+    assert.match(first.note, /read_conversation with the same conversationRef, the entry's messageRef and offset=nextOffset/);
+    // A long message: its preview is its start, and the paged read returns it whole.
+    assert.equal(long.text, userText(4).slice(0, long.nextOffset));
+    assert.equal(long.totalCharacters, userText(4).length);
+    assert.ok(longPages.length >= 2);
+    assert.equal(longPages.join(''), userText(4));
+    // Following the cursor visits every message exactly once, oldest page last.
+    const visited = history.slice().reverse().flatMap(page => page.messages.map(message => message.text.slice(0, 12)));
+    const expected = Array.from({ length: 5 }, (_, index) => [userText(index).slice(0, 12), answerText(index).slice(0, 12)]).flat();
+    assert.deepEqual(visited, expected);
+    assert.equal(history.at(-1).hasMore, false);
+    assert.equal(history.at(-1).olderMessageRef, null);
+  });
+});
+
 test('a followup to a running conversation waits for its Turn to end, then starts exactly one Turn', { timeout: 60000 }, async () => {
   const TASK = 'CROSS_QUEUED_TASK_7701';
   const RESULT = 'CROSS_QUEUED_RESULT_7702';
@@ -858,6 +925,10 @@ test('create_conversation starts a first Turn from a peer task and replaying the
       [(await model(rootAuthority)).providerConfigId, (await model(rootAuthority)).modelId], 'the calling Turn fixes the model');
     const completion = (await f.app.runtime.collaboration.listMessages({ conversationId: ROOT })).messages.find(message => message.sourceKind === 'completion');
     assert.equal((await f.app.runtime.collaboration.readMessage({ conversationId: ROOT, messageId: completion.messageId })).text, RESULT);
+    // Its transcript shows the peer task its first Turn answered, not an answer with no question.
+    const transcript = await f.app.runtime.collaboration.readConversation({ conversationId: ROOT, targetConversationId: conversationId, crossConversationTurnId: started.turnId });
+    assert.deepEqual(transcript.messages.map(message => [message.role, message.text]), [['collaboration', TASK], ['model', RESULT]]);
+    assert.deepEqual([transcript.messages[0].sourceConversationId, transcript.messages[0].mode, transcript.messages[0].sourceKind], [ROOT, 'followup', 'tool']);
 
     const frozenEnvironment = JSON.parse((await f.app.contentStore.read((await f.rows('ContentObject', { id: rootAuthority.content_object_id }))[0])).toString('utf8')).workEnvironmentPolicy?.defaultWorkEnvironmentId ?? null;
     assert.ok(frozenEnvironment, 'fixture: the calling Turn froze a work environment');

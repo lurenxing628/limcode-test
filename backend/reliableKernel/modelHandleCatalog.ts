@@ -589,8 +589,8 @@ function resolveCollaborationArguments(toolName: string, record: Record<string, 
     : isCrossConversationTool(toolName)
     // Cross-conversation tools address a whole Conversation, its transcript page or a reply.
     ? [['conversationRef', 'targetConversationId', 'conversation'], ['beforeMessageRef', 'beforeMessageId', 'conversationMessage'],
-      ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']]
-    : [['conversationRef', 'targetConversationId', 'conversation'], ['messageRef', 'messageId', 'collaborationMessage'],
+      ['messageRef', 'messageId', 'conversationMessage'], ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']]
+    : [['conversationRef', 'targetConversationId', 'conversation'], ['messageRef', 'messageId', record.view === 'conversation' ? 'conversationMessage' : 'collaborationMessage'],
       ['afterMessageRef', 'afterMessageId', 'collaborationMessage'],
       ['beforeMessageRef', 'beforeMessageId', record.view === 'conversation' ? 'conversationMessage' : 'collaborationMessage'], ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']];
   for (const [refKey, targetKey, kind] of fields) {

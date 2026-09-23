@@ -22,6 +22,7 @@ export interface CollaborationToolControlPlane {
   listMessages(input: { conversationId: string; targetConversationId?: string; afterMessageId?: string; beforeMessageId?: string; limit?: number }): Promise<unknown>;
   readConversation(input: { conversationId: string; targetConversationId: string; beforeMessageId?: string; limit?: number; crossConversationTurnId?: string }): Promise<unknown>;
   readMessage(input: { conversationId: string; targetConversationId?: string; messageId: string; offset?: number }): Promise<unknown>;
+  readConversationMessage(input: { conversationId: string; targetConversationId: string; messageId: string; offset?: number; crossConversationTurnId?: string }): Promise<unknown>;
   waitMessages(input: { conversationId: string; afterMessageId?: string; timeoutMs?: number; signal?: AbortSignal }): Promise<unknown>;
   send(input: { source: { kind: 'tool'; turnId: string; toolCallId: string }; targetConversationId: string;
     text: string; mode: 'message' | 'followup'; replyToMessageId?: string; queueBehindActiveTurn?: boolean;
@@ -120,12 +121,19 @@ export class CollaborationToolDispatcher {
         if (args.view !== undefined && args.view !== 'mailbox' && args.view !== 'conversation') throw new Error('Unknown message view.');
         if (args.offset !== undefined && args.messageId === undefined) throw new Error('offset pages the text of one message and needs messageRef.');
         if (args.view === 'conversation') {
-          if (args.messageId !== undefined || args.afterMessageId !== undefined) throw new Error('Conversation history uses beforeMessageRef pagination only.');
+          if (args.afterMessageId !== undefined) throw new Error('Conversation history uses beforeMessageRef pagination only.');
+          if (args.messageId !== undefined) {
+            if (args.beforeMessageId !== undefined || args.limit !== undefined) throw new Error('messageRef reads one message and cannot be combined with beforeMessageRef or limit.');
+            detail = { ...object(await this.dependencies.collaboration.readConversationMessage({ conversationId,
+              targetConversationId: text(args.targetConversationId, 'conversationRef'), messageId: text(args.messageId, 'messageRef'),
+              offset: integer(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER, 0) }), 'Conversation message'), view: 'conversation' };
+            break;
+          }
           const result = object(await this.dependencies.collaboration.readConversation({ conversationId,
             targetConversationId: text(args.targetConversationId, 'conversationRef'),
             ...(args.beforeMessageId === undefined ? {} : { beforeMessageId: text(args.beforeMessageId, 'beforeMessageRef') }),
             limit: integer(args.limit, 'limit', 1, 50, 20) }), 'Conversation history');
-          detail = { ...conversationHistory(result), view: 'conversation' };
+          detail = { ...conversationHistory(result, 'read_agent_messages view=conversation'), view: 'conversation' };
         } else if (args.messageId !== undefined) {
           if (args.afterMessageId !== undefined || args.beforeMessageId !== undefined || args.limit !== undefined) throw new Error('messageRef cannot be combined with page arguments.');
           detail = await this.dependencies.collaboration.readMessage({ conversationId,
@@ -157,12 +165,21 @@ export class CollaborationToolDispatcher {
           turnId: input.turnId, limit: integer(args.limit, 'limit', 1, 50, 20) }), 'Conversation list') };
         break;
       case 'read_conversation': {
-        fields(args, ['targetConversationId', 'beforeMessageId', 'limit']);
+        fields(args, ['targetConversationId', 'beforeMessageId', 'limit', 'messageId', 'offset']);
+        const targetConversationId = text(args.targetConversationId, 'conversationRef');
+        if (args.messageId !== undefined) {
+          if (args.beforeMessageId !== undefined || args.limit !== undefined) throw new Error('messageRef reads one message and cannot be combined with beforeMessageRef or limit.');
+          detail = { untrustedDataNotice: UNTRUSTED_DATA_NOTICE, ...object(await this.dependencies.collaboration.readConversationMessage({ conversationId,
+            targetConversationId, messageId: text(args.messageId, 'messageRef'), crossConversationTurnId: input.turnId,
+            offset: integer(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER, 0) }), 'Conversation message') };
+          break;
+        }
+        if (args.offset !== undefined) throw new Error('offset pages the text of one message and needs messageRef.');
         const result = object(await this.dependencies.collaboration.readConversation({ conversationId,
-          targetConversationId: text(args.targetConversationId, 'conversationRef'), crossConversationTurnId: input.turnId,
+          targetConversationId, crossConversationTurnId: input.turnId,
           ...(args.beforeMessageId === undefined ? {} : { beforeMessageId: text(args.beforeMessageId, 'beforeMessageRef') }),
           limit: integer(args.limit, 'limit', 1, 50, 20) }), 'Conversation history');
-        detail = { untrustedDataNotice: UNTRUSTED_DATA_NOTICE, ...conversationHistory(result) };
+        detail = { untrustedDataNotice: UNTRUSTED_DATA_NOTICE, ...conversationHistory(result, 'read_conversation') };
         break;
       }
       case 'send_conversation_message': {
@@ -232,15 +249,25 @@ function withRecipientPreviewNote(result: unknown, sentText: string): unknown {
     note: 'Accepted. The text is long, so the recipient first sees only its start and end; it can read the full text page by page with read_agent_messages messageRef and offset.' };
 }
 
-/** Transcript Message ids use their own reference kind, distinct from collaboration mail. */
-function conversationHistory(result: Record<string, unknown>): Record<string, unknown> {
-  const { messages, olderMessageId, ...rest } = result;
+/**
+ * Transcript Message ids use their own reference kind, distinct from collaboration mail. The notes
+ * name the exact call that continues a page that ended early or a message shown only in part.
+ */
+function conversationHistory(result: Record<string, unknown>, readCall: string): Record<string, unknown> {
+  const { messages, olderMessageId, pageFull, ...rest } = result;
   if (!Array.isArray(messages)) throw new Error('Conversation history messages are missing.');
-  return { ...rest, olderConversationMessageId: olderMessageId,
-    messages: messages.map(value => {
-      const { messageId, ...message } = object(value, 'Conversation history message');
-      return { ...message, conversationMessageId: messageId };
-    }) };
+  const entries = messages.map((value): Record<string, unknown> => {
+    const { messageId, ...message } = object(value, 'Conversation history message');
+    // Collaboration inputs a Turn took in are not transcript Messages and carry no reference.
+    return messageId === undefined ? message : { ...message, conversationMessageId: messageId };
+  });
+  const notes = [
+    ...(pageFull === true ? ['Older messages did not fit in this result; read them by passing olderMessageRef as beforeMessageRef.'] : []),
+    ...(entries.some(entry => entry.truncated === true)
+      ? [`An entry with truncated=true shows only the start of its text; read the rest with ${readCall} with the same conversationRef, the entry's messageRef and offset=nextOffset, repeating until nextOffset is null.`]
+      : [])
+  ];
+  return { ...rest, olderConversationMessageId: olderMessageId, messages: entries, ...(notes.length ? { note: notes.join(' ') } : {}) };
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {

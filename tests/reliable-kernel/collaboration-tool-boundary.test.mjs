@@ -75,6 +75,7 @@ function fixture({ toolName = 'send_agent_message', args = { targetConversationI
       async readConversation(input) { calls.push(input); return { conversationId: input.targetConversationId, title: 'peer', status: 'active',
         messages: [{ messageId: 'chat-message', role: 'model', text: 'retained reply' }], olderMessageId: 'chat-message', hasMore: true }; },
       async readMessage(input) { calls.push(input); return { messageId: input.messageId }; },
+      async readConversationMessage(input) { calls.push({ readConversationMessage: input }); return { conversationId: input.targetConversationId, conversationMessageId: input.messageId, text: 'page', offset: input.offset, nextOffset: null }; },
       async waitMessages(input) { calls.push(input); return { messages: [], timedOut: true }; },
       async listConversations(input) { calls.push({ list: input }); return { conversations: [{ conversationId: 'peer', title: 'peer', running: false, updatedAt: 'now' }], hasMore: false }; },
       async authorizeCrossConversation(input) { calls.push({ authorize: input }); return { conversationId: 'conversation' }; },
@@ -187,6 +188,19 @@ test('authorized conversation history uses a separate reference kind from collab
     { view: 'conversation', targetConversationId: 'peer', beforeMessageId: 'chat-message' });
   assert.throws(() => resolveModelToolArguments('read_agent_messages', { beforeMessageRef: 'R1' }, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
   assert.throws(() => resolveModelToolArguments('read_agent_messages', { view: 'conversation', beforeMessageRef: 'M1' }, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+  // One transcript message is read whole through its R# reference; a mailbox message through M#.
+  assert.deepEqual(resolveModelToolArguments('read_agent_messages', { view: 'conversation', conversationRef: projected.conversationRef, messageRef: 'R1', offset: 40 }, handles),
+    { view: 'conversation', targetConversationId: 'peer', messageId: 'chat-message', offset: 40 });
+  assert.throws(() => resolveModelToolArguments('read_agent_messages', { view: 'conversation', messageRef: 'M1' }, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+  assert.deepEqual(resolveModelToolArguments('read_agent_messages', { messageRef: 'M1', offset: 0 }, handles), { messageId: 'message-one', offset: 0 });
+  const page = fixture({ toolName: 'read_agent_messages', args: { view: 'conversation', targetConversationId: 'peer', messageId: 'chat-message', offset: 40 } });
+  await page.dispatcher.dispatch(page.input, undefined, page.authority);
+  assert.deepEqual(page.calls, [{ readConversationMessage: { conversationId: 'conversation', targetConversationId: 'peer', messageId: 'chat-message', offset: 40 } }]);
+  for (const args of [{ view: 'conversation', targetConversationId: 'peer', messageId: 'chat-message', limit: 5 }, { view: 'conversation', targetConversationId: 'peer', offset: 3 }]) {
+    const refused = fixture({ toolName: 'read_agent_messages', args });
+    await assert.rejects(refused.dispatcher.dispatch(refused.input, undefined, refused.authority));
+    assert.deepEqual(refused.calls, []);
+  }
 });
 
 
@@ -248,6 +262,8 @@ test('cross-conversation references map whole conversations, transcript pages an
   assert.deepEqual(resolveModelToolArguments('read_conversation', { conversationRef: projected.conversations[0].conversationRef, beforeMessageRef: projected.olderMessageRef }, handles),
     { targetConversationId: 'peer-x', beforeMessageId: 'chat-x' });
   assert.deepEqual(resolveModelToolArguments('fork_conversation', {}, handles), {});
+  assert.deepEqual(resolveModelToolArguments('read_conversation', { conversationRef: projected.conversations[0].conversationRef, messageRef: projected.olderMessageRef, offset: 7 }, handles),
+    { targetConversationId: 'peer-x', messageId: 'chat-x', offset: 7 });
   for (const [toolName, args] of [['send_conversation_message', { targetConversationId: 'peer-x', text: 'x', mode: 'message' }],
     ['fork_conversation', { conversationRef: 'C99' }], ['read_conversation', { conversationRef: projected.conversations[0].conversationRef, beforeMessageRef: 'M1' }]]) {
     assert.throws(() => resolveModelToolArguments(toolName, args, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');

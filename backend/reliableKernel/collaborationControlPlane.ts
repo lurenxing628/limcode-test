@@ -11,7 +11,7 @@ import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { isTransactionAssertionFailure, requirePhaseFId, stablePhaseFId, sqliteUniqueFailureIncludes } from './phaseFIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
-import { estimateTextTokens } from './modelTokenEstimator';
+import { estimateJsonTokens, estimateTextTokens } from './modelTokenEstimator';
 
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 /** Every collaboration message body is 1..COLLABORATION_MESSAGE_MAX_TEXT_BYTES UTF-8 bytes. */
@@ -312,15 +312,15 @@ export class CollaborationControlPlane {
    * Bounded transcript read, authorized independently from send/wake and never a continuation.
    * A team member reads its team; crossConversationTurnId instead authorizes a top-level caller
    * through that Turn's frozen crossConversationCollaboration switch.
+   *
+   * The page budget is spent newest first, so the latest messages (a final answer above all) are
+   * always shown. A message longer than one preview is shown from its start with its nextOffset for
+   * readConversationMessage. Older messages that no longer fit end the page early: they are left
+   * out, not relabelled, and olderMessageId always leads to them. The whole result stays under the
+   * model tool-result cap.
    */
   public async readConversation(input: { conversationId: string; targetConversationId: string; beforeMessageId?: string; limit?: number; crossConversationTurnId?: string }) {
-    const caller = requirePhaseFId(input.conversationId, 'conversationId');
-    const target = requirePhaseFId(input.targetConversationId, 'targetConversationId');
-    if (input.crossConversationTurnId === undefined) await this.assertReadPermission(caller, target);
-    else {
-      const authorized = await this.authorizeCrossConversation({ turnId: input.crossConversationTurnId, targetConversationId: target });
-      if (authorized.conversationId !== caller) throw new Error('Cross-conversation read Turn belongs to another Conversation.');
-    }
+    const target = await this.authorizeTranscriptRead(input);
     const conversation = await this.existing('Conversation', target);
     const limit = input.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError('Conversation read limit must be 1..50.');
@@ -331,31 +331,120 @@ export class CollaborationControlPlane {
     }
     const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({ where: { conversation_id: target }, orderBy: { column: 'message_seq', direction: 'desc' }, ...(keyset ? { keyset } : {}), limit: limit + 1 })]);
     const links = result.snapshot[0] as DomainRow[];
-    const selected = links.slice(0, limit).reverse();
-    const messages: Array<{ messageId: string; role: string; text: string; createdAt: string; truncated: boolean }> = [];
-    let remaining = 32_000;
-    for (const link of selected) {
-      const message = await this.existing('Message', String(link.message_id));
-      if (message.deleted_at !== null) continue;
-      const current = await this.rows('MessageCurrentRevisionLink', { message_id: link.message_id });
-      if (current.length !== 1) throw new Error('Conversation transcript message has no unique current revision.');
-      const revision = await this.existing('MessageRevision', String(current[0].revision_id));
-      // The transcript carries what people and models said; tool activity stays out of it.
-      if (revision.role !== 'user' && revision.role !== 'model') continue;
-      const metadata = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
-      // Reading a single enormous CAS object would defeat the API response bound. Such entries
-      // retain their identity and an explicit marker so callers can open the original conversation.
-      if (metadata.byte_length > 256_000n || remaining <= 0) {
-        messages.push({ messageId: String(link.message_id), role: String(revision.role), text: '[Large message omitted; open the source Conversation.]', createdAt: String(revision.created_at), truncated: true });
-        continue;
+    const candidates = links.slice(0, limit);
+    // Newest first. The collaboration inputs of a Turn are shown before its oldest message on the page.
+    const newestFirst: TranscriptEntry[] = [];
+    const turnInputs = new Map<string, CollaborationInputEntry[]>();
+    const oldestEntryOfTurn = new Map<string, number>();
+    let spent = 0;
+    let consumed = 0;
+    let pageFull = false;
+    for (const link of candidates) {
+      const messageId = String(link.message_id);
+      const entry = await this.transcriptEntry(messageId);
+      if (entry) {
+        const turnIds = [...new Set((await this.rows('MessageTurnLink', { message_id: messageId })).map((row) => String(row.turn_id)))];
+        const fresh: Array<[string, CollaborationInputEntry[]]> = [];
+        for (const turnId of turnIds) if (!turnInputs.has(turnId)) fresh.push([turnId, await this.collaborationInputs(target, turnId)]);
+        const cost = estimateJsonTokens(entry) + fresh.reduce((sum, [, inputs]) => sum + estimateJsonTokens(inputs), 0);
+        if (newestFirst.length > 0 && spent + cost > TRANSCRIPT_PAGE_TOKENS) { pageFull = true; break; }
+        for (const [turnId, inputs] of fresh) turnInputs.set(turnId, inputs);
+        newestFirst.push(entry);
+        for (const turnId of turnIds) oldestEntryOfTurn.set(turnId, newestFirst.length - 1);
+        spent += cost;
       }
-      const text = visibleMessageText(String(metadata.content_type), (await this.contentStore.read(metadata)).toString('utf8'));
-      if (!text.trim()) continue;
-      const allowed = Math.min(8000, remaining);
-      messages.push({ messageId: String(link.message_id), role: String(revision.role), text: text.slice(0, allowed), createdAt: String(revision.created_at), truncated: text.length > allowed });
-      remaining -= Math.min(text.length, allowed);
+      consumed += 1;
     }
-    return { conversationId: target, title: String(conversation.title), status: String(conversation.status), messages, olderMessageId: links.length > limit && selected.length ? String(selected[0].message_id) : null, hasMore: links.length > limit };
+    const messages: Array<TranscriptEntry | CollaborationInputEntry> = [];
+    for (let index = newestFirst.length - 1; index >= 0; index -= 1) {
+      for (const [turnId, oldest] of oldestEntryOfTurn) if (oldest === index) messages.push(...turnInputs.get(turnId)!);
+      messages.push(newestFirst[index]);
+    }
+    const hasMore = pageFull || links.length > limit;
+    return {
+      conversationId: target, title: await this.displayTitle(conversation), status: String(conversation.status), messages,
+      olderMessageId: hasMore && consumed > 0 ? String(candidates[consumed - 1].message_id) : null, hasMore, pageFull
+    };
+  }
+
+  /**
+   * One page of a transcript message's visible text from a character offset, under the same read
+   * authorization as readConversation. Following nextOffset until it is null returns it whole.
+   */
+  public async readConversationMessage(input: { conversationId: string; targetConversationId: string; messageId: string; offset?: number; crossConversationTurnId?: string }) {
+    const target = await this.authorizeTranscriptRead(input);
+    const messageId = requirePhaseFId(input.messageId, 'messageId');
+    if ((await this.rows('MessagePartOfConversation', { conversation_id: target, message_id: messageId })).length !== 1) {
+      throw new Error('That message reference is not a message of this conversation\'s transcript.');
+    }
+    const visible = await this.visibleTranscriptMessage(messageId, Number.POSITIVE_INFINITY);
+    if (!visible) throw new Error('That transcript message was deleted or is not a user or assistant message.');
+    return { conversationId: target, conversationMessageId: messageId, role: visible.role, createdAt: visible.createdAt,
+      ...collaborationTextPage(visible.text ?? '', input.offset ?? 0) };
+  }
+
+  private async authorizeTranscriptRead(input: { conversationId: string; targetConversationId: string; crossConversationTurnId?: string }): Promise<string> {
+    const caller = requirePhaseFId(input.conversationId, 'conversationId');
+    const target = requirePhaseFId(input.targetConversationId, 'targetConversationId');
+    if (input.crossConversationTurnId === undefined) await this.assertReadPermission(caller, target);
+    else {
+      const authorized = await this.authorizeCrossConversation({ turnId: input.crossConversationTurnId, targetConversationId: target });
+      if (authorized.conversationId !== caller) throw new Error('Cross-conversation read Turn belongs to another Conversation.');
+    }
+    return target;
+  }
+
+  /**
+   * The collaboration messages a Turn of the read Conversation took in: peer tasks, messages and
+   * replies are no transcript Messages, yet without them a peer-driven Turn shows an answer with no
+   * question. Each is a bounded preview; the full text stays private to its two Conversations.
+   */
+  private async collaborationInputs(conversationId: string, turnId: string): Promise<CollaborationInputEntry[]> {
+    const deliveries = (await this.rows('RuntimeDelivery', { target_conversation_id: conversationId, state: 'consumed', target_turn_id: turnId }))
+      .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)) || String(left.id).localeCompare(String(right.id)));
+    const entries: CollaborationInputEntry[] = [];
+    for (const delivery of deliveries) {
+      const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
+      if (inbox.source_kind !== 'collaboration_message') continue;
+      const message = await this.existing('CollaborationMessage', String(inbox.source_id));
+      const source = await this.one('CollaborationMessageSourceLink', { message_id: message.id });
+      const payload = await this.one('CollaborationMessagePayloadLink', { message_id: message.id });
+      const metadata = await this.existing('ContentObject', String(payload.content_object_id)) as ContentObjectMetadata;
+      const page = collaborationTextPage((await this.contentStore.read(metadata)).toString('utf8'), 0, COLLABORATION_INPUT_PREVIEW_TOKENS);
+      entries.push({ role: 'collaboration', mode: String(message.mode), sourceKind: String(source.source_kind),
+        sourceConversationId: String(source.conversation_id), createdAt: String(message.created_at), text: page.text,
+        ...(page.nextOffset === null ? {} : { shortened: true }) });
+    }
+    return entries;
+  }
+
+  /** A visible user or assistant message as one transcript entry: whole, or its first page when long. */
+  private async transcriptEntry(messageId: string): Promise<TranscriptEntry | null> {
+    const visible = await this.visibleTranscriptMessage(messageId, TRANSCRIPT_MESSAGE_READ_MAX_BYTES);
+    if (!visible) return null;
+    const base = { messageId, role: visible.role, createdAt: visible.createdAt };
+    // Too large to read while listing: shown empty, its whole text is one paged read away.
+    if (visible.text === null) return { ...base, text: '', truncated: true, sizeBytes: visible.sizeBytes, nextOffset: 0 };
+    if (!visible.text.trim()) return null;
+    const whole = { ...base, text: visible.text, truncated: false };
+    if (estimateJsonTokens(whole) <= TRANSCRIPT_MESSAGE_PREVIEW_TOKENS) return whole;
+    const page = collaborationTextPage(visible.text, 0, TRANSCRIPT_MESSAGE_PREVIEW_TOKENS - 100);
+    return { ...base, text: page.text, truncated: true, totalCharacters: page.totalCharacters, nextOffset: page.nextOffset };
+  }
+
+  /** Visible text of a live user or assistant message; text is null above maxBytes. */
+  private async visibleTranscriptMessage(messageId: string, maxBytes: number): Promise<{ role: string; createdAt: string; text: string | null; sizeBytes: number } | null> {
+    const message = await this.existing('Message', messageId);
+    if (message.deleted_at !== null) return null;
+    const current = await this.rows('MessageCurrentRevisionLink', { message_id: messageId });
+    if (current.length !== 1) throw new Error('Conversation transcript message has no unique current revision.');
+    const revision = await this.existing('MessageRevision', String(current[0].revision_id));
+    // The transcript carries what people and models said; tool activity stays out of it.
+    if (revision.role !== 'user' && revision.role !== 'model') return null;
+    const metadata = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
+    const sizeBytes = Number(metadata.byte_length);
+    const text = sizeBytes > maxBytes ? null : visibleMessageText(String(metadata.content_type), (await this.contentStore.read(metadata)).toString('utf8'));
+    return { role: String(revision.role), createdAt: String(revision.created_at), text, sizeBytes };
   }
 
   /**
@@ -811,6 +900,28 @@ function compareNewest(a: DomainRow, b: DomainRow): number { return String(b.cre
  */
 export const COLLABORATION_TEXT_PAGE_TOKENS = 2_400;
 export const COLLABORATION_TEXT_PAGE_MAX_CHARACTERS = 12_000;
+
+/**
+ * A read_conversation page spends at most TRANSCRIPT_PAGE_TOKENS on its entries and one entry at
+ * most TRANSCRIPT_MESSAGE_PREVIEW_TOKENS, so the whole result, with its notice, title and cursor,
+ * stays under the model tool-result cap. Listing never reads a message above
+ * TRANSCRIPT_MESSAGE_READ_MAX_BYTES; readConversationMessage pages any message.
+ */
+export const TRANSCRIPT_PAGE_TOKENS = 3_000;
+export const TRANSCRIPT_MESSAGE_PREVIEW_TOKENS = 2_000;
+const TRANSCRIPT_MESSAGE_READ_MAX_BYTES = 256_000;
+
+const COLLABORATION_INPUT_PREVIEW_TOKENS = 400;
+
+interface TranscriptEntry {
+  messageId: string; role: string; createdAt: string; text: string; truncated: boolean;
+  totalCharacters?: number; sizeBytes?: number; nextOffset?: number | null;
+}
+
+/** A collaboration message a Turn took in, shown in the transcript before that Turn's messages. */
+interface CollaborationInputEntry {
+  role: 'collaboration'; mode: string; sourceKind: string; sourceConversationId: string; createdAt: string; text: string; shortened?: true;
+}
 
 /**
  * One page of a stored text from a UTF-16 character offset: the longest slice whose JSON-escaped
