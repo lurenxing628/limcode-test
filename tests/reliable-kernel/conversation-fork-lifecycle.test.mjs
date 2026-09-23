@@ -106,7 +106,7 @@ async function withForkRuntime(run, {
           await beforeReply?.(request);
           if (failRequests.includes(requests.length)) throw new Error(`offline provider rejected request ${requests.length}`);
           await controls.onEvent({ kind: 'completed', streamSeq: '1',
-            content: { role: 'model', parts: script?.reply(requests.length) ?? (withTool && toolCallRequests.includes(requests.length)
+            content: { role: 'model', parts: script?.reply(request) ?? (withTool && toolCallRequests.includes(requests.length)
               ? [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }]
               : [{ text: `offline reply ${requests.length}` }]) } });
         } };
@@ -1783,6 +1783,11 @@ test('the attachment catalog of a compressed fork reads only its own block, also
   });
 });
 
+/** Tool names of the tool pairs already in a model request's Context, in order. */
+function contextToolNames(request) {
+  return request.context.filter(item => item.segmentKind === 'tool_pair').map(item => JSON.parse(item.content).toolCall.toolName);
+}
+
 test('a plan approved in the source still authorizes a retry in a fork of a fork', async () => {
   const planPolicy = { mode: 'before_mutation', allowReadonlyBeforeApproval: false, requireForToolRiskLevels: ['write'] };
   await withForkRuntime(async h => {
@@ -1826,10 +1831,13 @@ test('a plan approved in the source still authorizes a retry in a fork of a fork
       { name: 'submit_plan', description: 'Synthetic plan', parameters: { type: 'object' } },
       { name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }
     ],
-    reply(count) {
-      if (count === 1) return [{ functionCall: { name: 'submit_plan', args: { plan: 'fork plan' } } }];
-      if (count === 3) return [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }];
-      return undefined;
+    // Scripted by the Context each request already holds, so extra model requests cannot shift it.
+    reply(request) {
+      const called = contextToolNames(request);
+      if (request.conversationId === 'source') {
+        return called.includes('submit_plan') ? undefined : [{ functionCall: { name: 'submit_plan', args: { plan: 'fork plan' } } }];
+      }
+      return called.includes('read') ? undefined : [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }];
     },
     detail(input) {
       return input.toolName === 'submit_plan'
@@ -1899,11 +1907,15 @@ test('forks keep the task panel and the approved plan of copied tool calls, also
       { name: 'update_task_list', description: 'Synthetic task list', parameters: { type: 'object' } },
       { name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }
     ],
-    reply(count) {
-      if (count === 1) return [{ functionCall: { name: 'submit_plan', args: { plan: 'task plan', taskList } } }];
-      if (count === 2) return [{ functionCall: { name: 'update_task_list', args: update } }];
-      if (count === 4) return [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }];
-      return undefined;
+    // Scripted by the Context each request already holds, so extra model requests cannot shift it.
+    reply(request) {
+      const called = contextToolNames(request);
+      if (request.conversationId === 'source') {
+        if (!called.includes('submit_plan')) return [{ functionCall: { name: 'submit_plan', args: { plan: 'task plan', taskList } } }];
+        if (!called.includes('update_task_list')) return [{ functionCall: { name: 'update_task_list', args: update } }];
+        return undefined;
+      }
+      return called.includes('read') ? undefined : [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }];
     },
     detail(input) {
       if (input.toolName === 'submit_plan') {
