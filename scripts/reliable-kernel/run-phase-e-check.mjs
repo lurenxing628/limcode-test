@@ -35,9 +35,11 @@ if (requestedCommit && requestedCommit !== headCommit) {
 
 const require = createRequire(import.meta.url);
 let kernel;
+let modelCapabilities;
 let Database;
 try {
   kernel = require(path.join(root, 'dist/extension/backend/reliableKernel/index.js'));
+  modelCapabilities = require(path.join(root, 'dist/extension/shared/modelCapabilities.js'));
   Database = require('better-sqlite3');
 } catch (error) {
   console.error(`无法加载已编译Phase E内核；请先运行npm run compile：${error.message}`);
@@ -2917,7 +2919,7 @@ async function checkImmutableReplacement() {
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
       attachmentCatalogState: { catalog: [], placements: [] },
       recipe: {
-        kind: 'reliable-context-compression', sourceSegmentCount: 2,
+        kind: 'reliable-context-compression', sourceSegmentCount: 2, compressionMethodKind: 'segmented_summary',
         blockId: 'adapter-block', sourceHash: 'adapter-source', effectiveSummaryMaxTokens: 256
       },
       context: [
@@ -3319,8 +3321,13 @@ function createTurnControl(ctx, suffix, options = {}) {
                 ...(options.provider ? { provider: options.provider } : {}),
                 ...(options.retryPolicy ? { retryPolicy: options.retryPolicy } : {})
               },
-              ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
-              ...(options.compressionPolicy ? { compression: options.compressionPolicy } : {}),
+              // 压缩请求按冻结工具策略投影（没有工具时同样需要显式的空策略）。
+              ...(options.toolPolicy || options.compressionPolicy ? {
+                toolPolicy: options.toolPolicy ?? {
+                  id: 'tools-default', allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {}
+                }
+              } : {}),
+              ...(options.compressionPolicy ? { compression: frozenCompressionFixture(options.compressionPolicy) } : {}),
               policies: { toolPolicyId: 'tools-default', systemPromptId: 'prompt-default' }
             })
           }
@@ -3328,6 +3335,29 @@ function createTurnControl(ctx, suffix, options = {}) {
       }
     }
   });
+}
+
+/**
+ * 冻结压缩策略从按模型能力配置压缩起必须携带执行计划、能力快照与摘要推理（frozenAuthority 校验）；
+ * 夹具只写方法与阈值，这里按与设置编译相同的解析补齐，已写的字段不覆盖。
+ */
+function frozenCompressionFixture(policy) {
+  const provider = policy.provider ?? {};
+  const capabilities = provider.capabilities ?? modelCapabilities.resolveModelCapabilities({
+    provider: provider.provider, baseUrl: 'https://phase-e.invalid/v1', modelId: provider.modelId,
+    providerConfigId: provider.providerConfigId, transport: 'http'
+  });
+  return {
+    ...policy,
+    executionPlan: policy.executionPlan ?? modelCapabilities.resolveCompressionExecutionPlan(
+      { ...policy.config, kind: policy.methodKind, fallbacks: policy.config?.fallbacks ?? [] }, capabilities
+    ),
+    provider: {
+      ...provider,
+      capabilities,
+      summaryReasoning: provider.summaryReasoning ?? modelCapabilities.resolveSummaryReasoning({ mode: 'provider_default', capabilities })
+    }
+  };
 }
 
 function runtimeDeliveryFixture(suffix, targetTurnId, output) {
