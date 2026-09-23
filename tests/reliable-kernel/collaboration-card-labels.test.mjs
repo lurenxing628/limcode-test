@@ -413,5 +413,29 @@ test('a failed card older than every loaded message is placed by whether message
         assert.match(html, /比第一条消息更早的任务/);
       } finally { await scenario.close(); }
     });
+
+    await t.test('a window that starts after message 1 holds the card back until the earlier history loads', async () => {
+      const scenario = await openScenario('window', async (ingest) => {
+        const contentId = await ingest.message('user', '较早的消息');
+        return [
+          // One more message than the snapshot window holds, so message 1 stays in the earlier history.
+          ...Array.from({ length: 201 }, (_value, index) => targetMessageRows({ id: `target-${index + 1}`, seq: index + 1, contentId })).flat(),
+          ...incomingRows({ id: 'failed-early', at: EARLIER, payloadId: await ingest.payload('比第一条消息更早的任务'), delivery: { state: 'failed' } })
+        ];
+      });
+      try {
+        const snapshot = await scenario.snapshot();
+        const window = snapshot.projections.activeConversationWindow;
+        assert.equal(window.messages[0]?.id, 'target-2', 'the window starts after message 1');
+        const view = open(scenario);
+        await view.observe(snapshot);
+        const { html, setup } = await view.mount();
+        assert.equal(setup.earliestLoadedFloor, 2);
+        assert.equal(setup.canRequestEarlierHistory, true, 'the earlier history can be loaded');
+        assert.deepEqual(placedCards(setup), { before: {}, after: {}, unbound: [] },
+          'the card is neither above nor below a loaded message: the earlier history holds its position');
+        assert.doesNotMatch(html, /比第一条消息更早的任务/);
+      } finally { await scenario.close(); }
+    });
   });
 });
