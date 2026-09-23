@@ -103,6 +103,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/provider-wire-invariant.test.mjs',
   'tests/reliable-kernel/claude-cross-model-thinking-replay.test.mjs',
   'tests/reliable-kernel/provider-history-wire.test.mjs',
+  'tests/reliable-kernel/gemini-provider-adaptation.test.mjs',
   'tests/reliable-kernel/provider-websocket-policy.test.mjs',
   'tests/reliable-kernel/reliable-control-lifecycle.test.mjs',
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',

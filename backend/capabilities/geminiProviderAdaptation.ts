@@ -9,7 +9,7 @@ import {
   isGeminiThinkingLevelSupported
 } from '../../shared/geminiThinking';
 import type { LlmProviderKind } from '../../shared/protocol';
-import { isRecord, normalizedSignatureString } from './llmStreamEventProjection';
+import { isRecord, normalizedSignatureString, parsePortableThoughtSignature } from './llmStreamEventProjection';
 
 export function installProviderCompatibility<T>(
   provider: T,
@@ -28,10 +28,7 @@ function installProviderSchemaEncoder<T>(
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
-  const geminiOpenAICompatible = providerKind === 'openai-compatible'
-    && /^gemini-(?:\d|pro(?:-|$)|flash(?:-|$))/i.test(
-      modelId.slice(modelId.lastIndexOf('/') + 1).trim().replace(/^\[[^\]]+\][\s_-]*/, '')
-    );
+  const geminiOpenAICompatible = providerKind === 'openai-compatible' && isGeminiOpenAICompatibleModelName(modelId);
   if (providerKind !== 'gemini' && providerKind !== 'openai-responses' && providerKind !== 'claude' && !geminiOpenAICompatible) return provider;
   const runtimeProvider = provider as T & {
     format?: {
@@ -194,22 +191,62 @@ function claudeContentBlocks(content: unknown): unknown[] {
   return [];
 }
 
+/**
+ * Google's documented dummy signature for function calls that Gemini did not produce itself
+ * (history transferred from another model, or injected calls):
+ * https://ai.google.dev/gemini-api/docs/thought-signatures (FAQ).
+ */
 const GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR = 'skip_thought_signature_validator';
 
+/**
+ * Gemini-like models that validate function-call signatures and therefore receive the dummy for
+ * unsigned history: everything the capability table resolves to a Gemini 3 thinking level, plus
+ * Gemini names it does not know yet (`gemini-4-pro`, `gemini-flash-latest`). Gemini 1.x/2.x are
+ * left alone: signatures there are optional ("Gemini 2.5 ... optional" in the thought-signatures
+ * doc), so their existing requests stay unchanged.
+ */
+function fillsMissingGeminiSignatures(modelId: string): boolean {
+  if (geminiThinkingCapabilityForModel(modelId).kind === 'thinkingLevel') return true;
+  if (!isGeminiOpenAICompatibleModelName(modelId)) return false;
+  const major = /^gemini-(\d+)/i.exec(geminiOpenAICompatibleBaseName(modelId))?.[1];
+  return major === undefined || Number(major) >= 3;
+}
+
+/** `gemini-2.5-flash`, `models/gemini-3-pro`, `[v]gemini-3.5-flash`, `gemini-flash-latest`. */
+function isGeminiOpenAICompatibleModelName(modelId: string): boolean {
+  return /^gemini-(?:\d|pro(?:-|$)|flash(?:-|$))/i.test(geminiOpenAICompatibleBaseName(modelId));
+}
+
+function geminiOpenAICompatibleBaseName(modelId: string): string {
+  return modelId.slice(modelId.lastIndexOf('/') + 1).trim().replace(/^\[[^\]]+\][\s_-]*/, '');
+}
+
+/**
+ * Gemini thought signatures on the OpenAI-compatible wire travel in
+ * `tool_calls[].extra_content.google.thought_signature`
+ * (https://ai.google.dev/gemini-api/docs/thought-signatures, "OpenAI compatibility").
+ *
+ * - Decoding runs for every OpenAI-compatible model: a signature is kept whenever the response
+ *   carries one, whatever the model is called on the gateway.
+ * - Encoding returns the stored Gemini signature on the call it was received on. The dummy
+ *   signature for calls that never had one is only added for Gemini-like models.
+ * - Streaming matches signatures by call id, and by the call's position in the message only when
+ *   the call has no id. The per-chunk ordinal is never compared with the global `index`: that made
+ *   the second parallel call inherit the first call's signature.
+ */
 export function installGeminiOpenAICompatibleThoughtSignatures<T>(
   provider: T,
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
-  if (
-    providerKind !== 'openai-compatible'
-    || geminiThinkingCapabilityForModel(modelId).kind !== 'thinkingLevel'
-  ) return provider;
+  if (providerKind !== 'openai-compatible') return provider;
+  const fillMissingSignatures = fillsMissingGeminiSignatures(modelId);
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
       decodeResponse?: (raw: unknown) => unknown;
       decodeStreamChunk?: (raw: unknown, state: unknown) => unknown;
+      finalizeStream?: (state: unknown) => unknown;
       __limcodeGeminiOpenAIThoughtSignatures?: true;
     };
   };
@@ -220,29 +257,46 @@ export function installGeminiOpenAICompatibleThoughtSignatures<T>(
     const encodeRequest = format.encodeRequest.bind(format);
     format.encodeRequest = (request, stream) => {
       const encoded = encodeRequest(request, stream);
-      attachGeminiOpenAIThoughtSignaturesToRequest(encoded, request);
+      attachGeminiOpenAIThoughtSignaturesToRequest(encoded, request, fillMissingSignatures);
       return encoded;
     };
   }
   if (typeof format.decodeResponse === 'function') {
     const decodeResponse = format.decodeResponse.bind(format);
     format.decodeResponse = (raw) => {
-      const signatures = readGeminiOpenAIToolCallSignatures(raw, false);
+      const signatures = emptyGeminiOpenAIToolCallSignatures();
+      readGeminiOpenAIToolCallSignatures(raw, 'message', signatures);
       const decoded = decodeResponse(raw);
       attachGeminiSignaturesToUnifiedCalls(decoded, signatures);
       return decoded;
     };
   }
+  const streamSignatures = new WeakMap<object, GeminiOpenAIToolCallSignatures>();
+  const signaturesForStream = (state: unknown): GeminiOpenAIToolCallSignatures => {
+    const stateKey = isRecord(state) ? state : format;
+    let signatures = streamSignatures.get(stateKey);
+    if (!signatures) {
+      signatures = emptyGeminiOpenAIToolCallSignatures();
+      streamSignatures.set(stateKey, signatures);
+    }
+    return signatures;
+  };
   if (typeof format.decodeStreamChunk === 'function') {
     const decodeStreamChunk = format.decodeStreamChunk.bind(format);
-    const streamSignatures = new WeakMap<object, GeminiOpenAIToolCallSignatures>();
     format.decodeStreamChunk = (raw, state) => {
-      const stateKey = isRecord(state) ? state : format;
-      const signatures = streamSignatures.get(stateKey) ?? emptyGeminiOpenAIToolCallSignatures();
-      mergeGeminiOpenAIToolCallSignatures(signatures, readGeminiOpenAIToolCallSignatures(raw, true));
-      streamSignatures.set(stateKey, signatures);
+      const signatures = signaturesForStream(state);
+      readGeminiOpenAIToolCallSignatures(raw, 'delta', signatures);
       const decoded = decodeStreamChunk(raw, state);
       attachGeminiSignaturesToUnifiedCalls(decoded, signatures);
+      return decoded;
+    };
+  }
+  if (typeof format.finalizeStream === 'function') {
+    // Calls flushed by an end-of-stream hook belong to the same message and keep the same tracker.
+    const finalizeStream = format.finalizeStream.bind(format);
+    format.finalizeStream = (state) => {
+      const decoded = finalizeStream(state);
+      attachGeminiSignaturesToUnifiedCalls(decoded, signaturesForStream(state));
       return decoded;
     };
   }
@@ -250,12 +304,27 @@ export function installGeminiOpenAICompatibleThoughtSignatures<T>(
   return provider;
 }
 
+/**
+ * Signatures seen so far in one assistant message. `position` is the call's place in the message
+ * (order of first appearance on the wire), which is what decoded unified calls are emitted in.
+ */
 interface GeminiOpenAIToolCallSignatures {
   byId: Map<string, string>;
-  byIndex: Map<number, string>;
+  byPosition: Map<number, string>;
+  positionById: Map<string, number>;
+  positionByIndex: Map<number, number>;
+  lastPosition: number | undefined;
+  nextPosition: number;
+  /** Unified calls already matched; their count is the position of the next id-less call. */
+  decodedCalls: WeakSet<object>;
+  decodedCallCount: number;
 }
 
-function attachGeminiOpenAIThoughtSignaturesToRequest(encoded: unknown, source: unknown): void {
+function attachGeminiOpenAIThoughtSignaturesToRequest(
+  encoded: unknown,
+  source: unknown,
+  fillMissingSignatures: boolean
+): void {
   if (!isRecord(encoded) || !isRecord(source)) return;
   const messages = Array.isArray(encoded.messages) ? encoded.messages.filter(isRecord) : [];
   const encodedCallGroups = messages.flatMap((message) =>
@@ -273,7 +342,7 @@ function attachGeminiOpenAIThoughtSignaturesToRequest(encoded: unknown, source: 
     const encodedCalls = encodedCallGroups[groupIndex];
     const sourceCalls = sourceCallGroups[groupIndex];
     const sourceSignatures = sourceCalls.map(geminiSignatureFromUnifiedPart);
-    const transferredGroup = sourceSignatures.every((signature) => !signature);
+    const transferredGroup = fillMissingSignatures && sourceSignatures.every((signature) => !signature);
     for (let callIndex = 0; callIndex < Math.min(encodedCalls.length, sourceCalls.length); callIndex += 1) {
       const signature = sourceSignatures[callIndex]
         ?? (transferredGroup ? GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR : undefined);
@@ -284,6 +353,7 @@ function attachGeminiOpenAIThoughtSignaturesToRequest(encoded: unknown, source: 
       const attachedSignature = normalizedSignatureString(google.thought_signature)
         ?? normalizedSignatureString(google.thoughtSignature)
         ?? signature;
+      // Google documents snake_case; the tested gateway only reads camelCase. Send both.
       toolCall.extra_content = {
         ...extraContent,
         google: {
@@ -296,26 +366,62 @@ function attachGeminiOpenAIThoughtSignaturesToRequest(encoded: unknown, source: 
   }
 }
 
-function readGeminiOpenAIToolCallSignatures(raw: unknown, stream: boolean): GeminiOpenAIToolCallSignatures {
-  const signatures = emptyGeminiOpenAIToolCallSignatures();
-  if (!isRecord(raw) || !Array.isArray(raw.choices)) return signatures;
+function readGeminiOpenAIToolCallSignatures(
+  raw: unknown,
+  messageKey: 'message' | 'delta',
+  signatures: GeminiOpenAIToolCallSignatures
+): void {
+  if (!isRecord(raw) || !Array.isArray(raw.choices)) return;
   const choice = raw.choices.find(isRecord);
-  if (!choice) return signatures;
-  const rawMessage = choice[stream ? 'delta' : 'message'];
-  if (!isRecord(rawMessage) || !Array.isArray(rawMessage.tool_calls)) return signatures;
-  rawMessage.tool_calls
-    .filter((toolCall): toolCall is Record<string, unknown> => isRecord(toolCall))
-    .forEach((toolCall, ordinal) => {
-      const signature = geminiOpenAIToolCallSignature(toolCall);
-      if (!signature) return;
-      const callId = normalizedSignatureString(toolCall.id);
-      const index = typeof toolCall.index === 'number' && Number.isSafeInteger(toolCall.index)
-        ? toolCall.index
-        : ordinal;
-      if (callId) signatures.byId.set(callId, signature);
-      signatures.byIndex.set(index, signature);
-    });
-  return signatures;
+  if (!choice) return;
+  const rawMessage = choice[messageKey];
+  if (!isRecord(rawMessage) || !Array.isArray(rawMessage.tool_calls)) return;
+  const streamed = messageKey === 'delta';
+  for (const toolCall of rawMessage.tool_calls) {
+    if (!isRecord(toolCall)) continue;
+    const callId = normalizedSignatureString(toolCall.id);
+    const position = streamed
+      ? streamedToolCallPosition(signatures, toolCall, callId)
+      : claimNextPosition(signatures);
+    if (callId && !signatures.positionById.has(callId)) signatures.positionById.set(callId, position);
+    const signature = geminiOpenAIToolCallSignature(toolCall);
+    if (!signature) continue;
+    if (callId) signatures.byId.set(callId, signature);
+    signatures.byPosition.set(position, signature);
+  }
+}
+
+/**
+ * A streamed delta belongs to the call with the same `index`; without an index a new id starts a
+ * new call and an id-less fragment continues the latest call.
+ */
+function streamedToolCallPosition(
+  signatures: GeminiOpenAIToolCallSignatures,
+  toolCall: Record<string, unknown>,
+  callId: string | undefined
+): number {
+  if (typeof toolCall.index === 'number' && Number.isSafeInteger(toolCall.index)) {
+    const known = signatures.positionByIndex.get(toolCall.index);
+    if (known !== undefined) return rememberLastPosition(signatures, known);
+    const position = (callId ? signatures.positionById.get(callId) : undefined) ?? claimNextPosition(signatures);
+    signatures.positionByIndex.set(toolCall.index, position);
+    return rememberLastPosition(signatures, position);
+  }
+  if (callId) {
+    return rememberLastPosition(signatures, signatures.positionById.get(callId) ?? claimNextPosition(signatures));
+  }
+  return signatures.lastPosition ?? claimNextPosition(signatures);
+}
+
+function claimNextPosition(signatures: GeminiOpenAIToolCallSignatures): number {
+  const position = signatures.nextPosition;
+  signatures.nextPosition += 1;
+  return rememberLastPosition(signatures, position);
+}
+
+function rememberLastPosition(signatures: GeminiOpenAIToolCallSignatures, position: number): number {
+  signatures.lastPosition = position;
+  return position;
 }
 
 function geminiOpenAIToolCallSignature(toolCall: Record<string, unknown>): string | undefined {
@@ -338,14 +444,16 @@ function attachGeminiSignaturesToUnifiedCalls(
     ...(Array.isArray(decoded.partsDelta) ? decoded.partsDelta : []),
     ...(isRecord(decoded.content) && Array.isArray(decoded.content.parts) ? decoded.content.parts : [])
   ];
-  const seen = new Set<object>();
-  let ordinal = 0;
   for (const candidate of candidates) {
-    if (!isRecord(candidate) || !isRecord(candidate.functionCall) || seen.has(candidate)) continue;
-    seen.add(candidate);
+    if (!isRecord(candidate) || !isRecord(candidate.functionCall) || signatures.decodedCalls.has(candidate)) continue;
+    signatures.decodedCalls.add(candidate);
+    const position = signatures.decodedCallCount;
+    signatures.decodedCallCount += 1;
     const callId = normalizedSignatureString(candidate.functionCall.callId);
-    const signature = (callId ? signatures.byId.get(callId) : undefined) ?? signatures.byIndex.get(ordinal);
-    ordinal += 1;
+    const knownPosition = callId ? signatures.positionById.get(callId) : undefined;
+    const signature = callId
+      ? signatures.byId.get(callId) ?? (knownPosition !== undefined ? signatures.byPosition.get(knownPosition) : undefined)
+      : signatures.byPosition.get(position);
     if (!signature) continue;
     const existing = isRecord(candidate.thoughtSignatures) ? candidate.thoughtSignatures : {};
     candidate.thoughtSignatures = { ...existing, gemini: signature };
@@ -358,19 +466,23 @@ function geminiSignatureFromUnifiedPart(part: Record<string, unknown>): string |
   if (mapped) return mapped;
   const portable = normalizedSignatureString(part.thoughtSignature);
   if (!portable) return undefined;
-  return portable.startsWith('gemini:') ? portable.slice('gemini:'.length) : portable;
+  // Another provider's portable signature is not a Gemini signature; an unprefixed value is.
+  const parsed = parsePortableThoughtSignature(portable);
+  if (!parsed) return portable;
+  return parsed.provider === 'gemini' ? parsed.value : undefined;
 }
 
 function emptyGeminiOpenAIToolCallSignatures(): GeminiOpenAIToolCallSignatures {
-  return { byId: new Map(), byIndex: new Map() };
-}
-
-function mergeGeminiOpenAIToolCallSignatures(
-  target: GeminiOpenAIToolCallSignatures,
-  source: GeminiOpenAIToolCallSignatures
-): void {
-  for (const [id, signature] of source.byId) target.byId.set(id, signature);
-  for (const [index, signature] of source.byIndex) target.byIndex.set(index, signature);
+  return {
+    byId: new Map(),
+    byPosition: new Map(),
+    positionById: new Map(),
+    positionByIndex: new Map(),
+    lastPosition: undefined,
+    nextPosition: 0,
+    decodedCalls: new WeakSet(),
+    decodedCallCount: 0
+  };
 }
 
 function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unknown {
