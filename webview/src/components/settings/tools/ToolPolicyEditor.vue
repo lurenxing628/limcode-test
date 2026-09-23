@@ -18,7 +18,13 @@ import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingI
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { AGENT_COLLABORATION_CONFIG_KEYS, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, SUB_AGENT_TOOL_NAME, useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
+import {
+  AGENT_COLLABORATION_CONFIG_KEYS,
+  CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
+  SUB_AGENT_TOOL_NAME,
+  cloneSourceConfigs as cloneSourceConfigRecords,
+  useToolPolicyStore
+} from '@webview/stores/useToolPolicyStore';
 import { resolveToolHeaderIcon } from '@webview/components/content/toolDisplay/registry';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
@@ -333,14 +339,7 @@ function cloneToolConfigs(): Record<string, ToolPolicyToolConfigRecord> {
 }
 
 function cloneSourceConfigs(): Record<string, ToolPolicySourceConfigRecord> {
-  const result: Record<string, ToolPolicySourceConfigRecord> = {};
-  for (const [sourceId, record] of Object.entries(localResolution.value.policy?.sourceConfigs ?? {})) {
-    result[sourceId] = {
-      enabled: record.enabled === true,
-      ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})
-    };
-  }
-  return result;
+  return cloneSourceConfigRecords(localResolution.value.policy?.sourceConfigs) ?? {};
 }
 
 /** This scope's own config values for one tool; a field edit adds to these only. */

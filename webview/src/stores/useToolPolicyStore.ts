@@ -121,10 +121,18 @@ function cloneToolConfigs(toolConfigs: Record<string, ToolPolicyToolConfigRecord
   return cloned;
 }
 
-function cloneSourceConfigs(sourceConfigs: Record<string, ToolPolicySourceConfigRecord> | undefined): Record<string, ToolPolicySourceConfigRecord> | undefined {
+/**
+ * Plain source settings for a save. A hand-edited entry that is not an object never applied to its
+ * source and is dropped, except the all-sources key, which keeps its fail-closed deny.
+ */
+export function cloneSourceConfigs(sourceConfigs: Record<string, ToolPolicySourceConfigRecord> | undefined): Record<string, ToolPolicySourceConfigRecord> | undefined {
   if (!sourceConfigs) return undefined;
   const cloned: Record<string, ToolPolicySourceConfigRecord> = {};
   for (const [sourceId, record] of Object.entries(sourceConfigs)) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      if (sourceId.trim() === TOOL_POLICY_ALL_MCP_SOURCES) cloned[sourceId] = { enabled: false };
+      continue;
+    }
     cloned[sourceId] = {
       enabled: record.enabled === true,
       ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})

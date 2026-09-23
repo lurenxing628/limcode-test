@@ -674,6 +674,24 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       }
     });
 
+    await t.test('写坏的来源设置在设置页保存时不报错，全来源值仍按拒绝保存', async () => {
+      const { client, store, bindings, messages } = fresh(allDefinitions);
+      client.mcpToolSources = [{ id: 'exa', name: 'exa', transportKind: 'stdio', status: 'connected', toolCount: 1 }];
+      store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { exa: { enabled: true } });
+      const mcp = store.toolDefinitions.find((tool) => tool.name === 'mcp_search');
+      for (const value of [null, 'x', []]) {
+        client.toolPolicies = [...client.toolPolicies.filter((policy) => policy.id !== 'raw'), { id: 'raw', name: 'Raw', sourceConfigs: { '*': value, exa: null } }];
+        client.toolPolicyScopeLinks = [...client.toolPolicyScopeLinks.filter((link) => link.id !== 'raw-link'),
+          { id: 'raw-link', scopeKind: 'workflow', scopeId: 'wf', toolPolicyId: 'raw', role: 'active', createdAt: 1, updatedAt: 1 }];
+        assert.equal((await bindings(toolEditor, { scopeKind: 'workflow', scopeId: 'wf' })).isToolEnabled(mcp), false, `'*' ${JSON.stringify(value)} denies`);
+        (await bindings(toolEditor, { scopeKind: 'workflow', scopeId: 'wf' })).updateGateSetting(store.toolDefinitions.find((tool) => tool.name === 'read_file'), 'autoApproveExecution', false);
+        assert.deepEqual(messages.at(-1).payload.sourceConfigs, { '*': { enabled: false } }, `'*' ${JSON.stringify(value)} is saved as a deny`);
+        assert.equal((await bindings(toolEditor, { scopeKind: 'workflow', scopeId: 'wf' })).isToolEnabled(mcp), false);
+        store.setAgentCollaborationFieldForScope('workflow', 'wf', 'maxChildAgentDepth', 2);
+        assert.deepEqual(messages.at(-1).payload.sourceConfigs, { '*': { enabled: false } });
+      }
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
       const { client, store, render } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;
