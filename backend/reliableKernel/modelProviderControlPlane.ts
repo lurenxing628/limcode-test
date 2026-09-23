@@ -538,6 +538,23 @@ export class ModelProviderControlPlane {
     return this.attachmentHandles.ensure(conversationId, catalog);
   }
 
+  /**
+   * The request settings a new request of this authority would freeze now: the current generation
+   * and compression settings for its model selection. Read-only; freezeRequestSettings stores them.
+   */
+  public async resolveCurrentRequestSettings(
+    authority: PlainJsonValue,
+    conversationId: string
+  ): Promise<PlainJsonValue | undefined> {
+    if (!this.compressionSettingsAuthority) return undefined;
+    const model = frozenModelSelection(authority);
+    const generation = await this.compressionSettingsAuthority.loadRequestGenerationSettings?.(model, requireId(conversationId, 'conversationId'));
+    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(model, generation?.generationConfig);
+    const snapshot = normalizePlainJson({ requestCompression: selected, ...(generation ? { requestGeneration: generation } : {}) }, '请求设置');
+    applyRequestCompressionSettings(authority, snapshot);
+    return snapshot;
+  }
+
   public async freezeRequestSettings(turnId: string, authoritySnapshotId: string): Promise<string | undefined> {
     if (!this.compressionSettingsAuthority) return undefined;
     const lastRead = await this.database.snapshot([
@@ -555,12 +572,12 @@ export class ModelProviderControlPlane {
       }
     }
     const frozen = await readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId);
-    const model = frozenModelSelection(frozen.document);
     const turn = await this.requireDomain('Turn', turnId);
-    const generation = await this.compressionSettingsAuthority.loadRequestGenerationSettings?.(model, requireId(turn.conversation_id, 'Turn.conversation_id'));
-    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(model, generation?.generationConfig);
-    const snapshot = normalizePlainJson({ requestCompression: selected, ...(generation ? { requestGeneration: generation } : {}) }, '请求设置');
-    applyRequestCompressionSettings(frozen.document, snapshot);
+    const snapshot = await this.resolveCurrentRequestSettings(
+      frozen.document,
+      requireId(turn.conversation_id, 'Turn.conversation_id')
+    );
+    if (snapshot === undefined) return undefined;
     const content = await this.contentStore.ingest(
       this.database, canonicalPlainJson(snapshot), 'application/vnd.limcode.model-request-settings+json'
     );

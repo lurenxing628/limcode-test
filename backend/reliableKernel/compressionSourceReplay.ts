@@ -8,6 +8,23 @@ const MAX_REPLAY_SEGMENTS = 32768;
 const MAX_REPLAY_BYTES = 64 * 1024 * 1024;
 const MAX_REPLAY_DEPTH = 64;
 
+/** Hard caps of one source reconstruction; exceeding one is a size limit, not broken provenance. */
+export const COMPRESSION_SOURCE_REPLAY_LIMITS = Object.freeze({
+  segments: MAX_REPLAY_SEGMENTS,
+  bytes: MAX_REPLAY_BYTES,
+  depth: MAX_REPLAY_DEPTH
+});
+export type CompressionSourceReplayLimit = keyof typeof COMPRESSION_SOURCE_REPLAY_LIMITS;
+export const COMPRESSION_SOURCE_REPLAY_LIMIT_CODE = 'MODEL_CONTEXT_REPLAY_LIMIT';
+
+export function compressionSourceReplayLimitOf(error: unknown): CompressionSourceReplayLimit | undefined {
+  const record = error && typeof error === 'object' ? error as { code?: unknown; limit?: unknown } : undefined;
+  return record?.code === COMPRESSION_SOURCE_REPLAY_LIMIT_CODE
+    && typeof record.limit === 'string' && record.limit in COMPRESSION_SOURCE_REPLAY_LIMITS
+    ? record.limit as CompressionSourceReplayLimit
+    : undefined;
+}
+
 /** Text-summary fallbacks cannot summarize an encrypted or signed native state as if it were text.
  * Normally only those states are expanded through immutable CompressionBlockSource provenance.
  * Explicit manual reconstruction expands text summaries too, discarding their possibly incorrect
@@ -32,13 +49,12 @@ export async function expandTextCompressionSources(
   const stack = input.slice().reverse().map((item) => ({ item, ancestors: [] as string[] }));
   while (stack.length) {
     const { item, ancestors } = stack.pop()!;
-    if (++visits > MAX_REPLAY_SEGMENTS) throw invalid('原生压缩来源超过重建数量上限。');
+    if (++visits > MAX_REPLAY_SEGMENTS) throw limited('segments', '压缩来源超过重建数量上限。');
     bytes += Buffer.byteLength(item.content, 'utf8');
-    if (bytes > MAX_REPLAY_BYTES) throw invalid('原生压缩来源超过重建字节上限。');
+    if (bytes > MAX_REPLAY_BYTES) throw limited('bytes', '压缩来源超过重建字节上限。');
     if (!shouldExpand(item)) { output.push(item); continue; }
-    if (ancestors.length >= MAX_REPLAY_DEPTH || ancestors.includes(item.segmentId)) {
-      throw invalid('原生压缩来源存在循环或超过重建深度。');
-    }
+    if (ancestors.includes(item.segmentId)) throw invalid('原生压缩来源存在循环。');
+    if (ancestors.length >= MAX_REPLAY_DEPTH) throw limited('depth', '压缩来源超过重建深度上限。');
     const sources = rows((await database.snapshotAll(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
       where: { segment_id: item.segmentId }, orderBy: { column: 'id', direction: 'asc' }, limit: 1000
     }))).snapshot);
@@ -58,7 +74,8 @@ export async function expandTextCompressionSources(
       const a = BigInt(String(left.position)); const b = BigInt(String(right.position));
       return a < b ? -1 : a > b ? 1 : 0;
     });
-    if (!originals.length || originals.length > MAX_REPLAY_SEGMENTS - visits) throw invalid('原生压缩来源为空或超过数量上限。');
+    if (!originals.length) throw invalid('原生压缩来源为空。');
+    if (originals.length > MAX_REPLAY_SEGMENTS - visits) throw limited('segments', '压缩来源超过重建数量上限。');
     const expanded: FullProviderContextItem[] = [];
     for (const [position, source] of originals.entries()) {
       if (BigInt(String(source.position)) !== BigInt(position)) throw invalid('原生压缩来源顺序不连续。');
@@ -67,7 +84,7 @@ export async function expandTextCompressionSources(
       if (!original) {
         const segment = await get(database, 'ContextSegment', segmentId);
         const metadata = await get(database, 'ContentObject', id(segment.content_object_id));
-        if (Number(metadata.byte_length) > MAX_REPLAY_BYTES - bytes) throw invalid('历史内容超过重建预算。');
+        if (Number(metadata.byte_length) > MAX_REPLAY_BYTES - bytes) throw limited('bytes', '历史内容超过重建字节上限。');
         const content = (await store.read(metadata as unknown as ContentObjectMetadata)).toString('utf8');
         let role: string | null = null;
         if (metadata.content_type === 'application/vnd.limcode.message+json') {
@@ -101,3 +118,6 @@ function rows(value: unknown): DomainRow[] { if (!Array.isArray(value)) throw in
 function record(value: unknown): value is Record<string, unknown> { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); }
 function id(value: unknown): string { if (typeof value !== 'string' || !value) throw invalid('历史来源身份无效。'); return value; }
 function invalid(message: string): Error { return Object.assign(new Error(message), { code: 'MODEL_CONTEXT_NATIVE_SOURCE_INVALID' }); }
+function limited(limit: CompressionSourceReplayLimit, message: string): Error {
+  return Object.assign(new Error(message), { code: COMPRESSION_SOURCE_REPLAY_LIMIT_CODE, limit });
+}

@@ -994,6 +994,14 @@ function isCompressionRequest(recipe: PlainJsonValue): boolean {
   return asRecord(recipe)?.kind === 'reliable-context-compression';
 }
 
+/**
+ * The compact request a frozen compression request projects to, exactly as dispatch builds it.
+ * Planning only: nothing is sent and nothing is written.
+ */
+export function compactRequestForCompressionPlanning(request: FullProviderRequest): LlmCompactRequest {
+  return toLlmCompactRequest(request);
+}
+
 function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
   const recipe = requireRecord(request.recipe, 'Compression recipe');
   if (recipe.kind !== 'reliable-context-compression') throw new TypeError('ModelRequest is not a compression request.');
@@ -1215,7 +1223,7 @@ function requireExecutableCompressionMethod(value: unknown): NonNullable<LlmComp
  * the prior summary, so only that is admitted here; measuring a whole Turn instead rejected long
  * Turns the splitter handles.
  */
-function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
+export function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
   const prior = request.priorSummaryContents ?? [];
   if (request.methodKind === 'segmented_summary') {
     return estimateProjectedModelInput({

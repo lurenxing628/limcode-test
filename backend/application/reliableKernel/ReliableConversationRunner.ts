@@ -35,6 +35,11 @@ import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
 import type { CoordinateCompressionResult } from '../../reliableKernel/contextCompressionCoordinator';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnosticJournal';
+import {
+  previewCompressionSourceReplay,
+  type CompressionRebuildPreview
+} from '../../reliableKernel/compressionRebuildPreview';
+import { applyRequestCompressionSettings } from '../../reliableKernel/requestCompressionSettings';
 
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 const EXTERNAL_WAKE_POLL_MS = 500;
@@ -578,6 +583,36 @@ export class ReliableConversationRunner {
       }
     }
     return null;
+  }
+
+  /**
+   * Read-only estimate of rebuilding the current summary from original records. It resolves the same
+   * source Turn, maintenance authority and current compression settings a rebuild would freeze and
+   * previews that frozen plan; no Turn is admitted and nothing is written.
+   */
+  public async previewSourceReplayCompression(input: {
+    conversationId: string;
+    expectedRootId: string;
+    childExecutionId?: string;
+  }): Promise<CompressionRebuildPreview> {
+    this.requireOpen();
+    const conversationId = requireId(input.conversationId, 'Compression rebuild preview Conversation.id');
+    const expectedRootId = requireId(input.expectedRootId, 'Compression rebuild preview expectedRootId');
+    const heads = await listAllDomainRows(this.application.database, 'ConversationContextHeadLink', {
+      conversation_id: conversationId
+    });
+    if (heads.length !== 1) throw new Error('Conversation 缺少唯一当前 Context head。');
+    if (heads[0].root_id !== expectedRootId) return { outcome: { kind: 'stale' } };
+    const sourceTurnId = await this.manualCompressionSourceTurn(conversationId, input.childExecutionId);
+    const authority = await this.application.turns.previewMaintenanceAuthority(conversationId, sourceTurnId);
+    const settings = await this.application.modelProvider.resolveCurrentRequestSettings(authority, conversationId);
+    return previewCompressionSourceReplay({
+      database: this.application.database,
+      contentStore: this.application.contentStore,
+      conversationId,
+      rootId: expectedRootId,
+      authority: settings === undefined ? authority : applyRequestCompressionSettings(authority, settings)
+    });
   }
 
   /** Reads an already-admitted exact maintenance command without consulting the mutable Context head. */

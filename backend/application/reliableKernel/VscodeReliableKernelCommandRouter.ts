@@ -15,6 +15,8 @@ import {
   type ConversationAgentSelectPayload,
   type ConversationActionResultPayload,
   type CompressionCommandResultPayload,
+  type CompressionRebuildPreviewGetPayload,
+  type CompressionRebuildPreviewResultPayload,
   type CompressionStartPayload,
   type ConversationForkPayload,
   type ConversationForkResultPayload,
@@ -610,6 +612,13 @@ export class VscodeReliableKernelCommandRouter {
           webview,
           message.id,
           requirePayload(message.payload, 'Compression start')
+        );
+        return;
+      case BridgeMessageType.CompressionRebuildPreviewGet:
+        await this.handleCompressionRebuildPreview(
+          webview,
+          message.id,
+          requirePayload(message.payload, 'Compression rebuild preview')
         );
         return;
       case BridgeMessageType.InteractionResolve:
@@ -1819,6 +1828,47 @@ export class VscodeReliableKernelCommandRouter {
         compressionBlockId: compression.result.compressionBlockId
       } : {}),
       ...(compression?.status === 'skipped' ? { reasonCode: compression.reason } : {})
+    });
+  }
+
+  /**
+   * Read-only estimate shown before a rebuild from original records is confirmed. It resolves
+   * settings the way the rebuild will (after pending settings saves land) and never writes; every
+   * failure is answered in the dialog instead of a warning popup.
+   */
+  private async handleCompressionRebuildPreview(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    payload: CompressionRebuildPreviewGetPayload
+  ): Promise<void> {
+    const conversationId = requireText(payload.conversationId, 'conversationId');
+    const rootId = requireText(payload.expectedRootId, 'compression rebuild expectedRootId');
+    let result: CompressionRebuildPreviewResultPayload;
+    try {
+      await this.settingsSaveBarrier.flush();
+      await this.configurationMutationQueue;
+      await this.requireRow('Conversation', conversationId);
+      const childExecutionId = await this.childExecutionIdForConversation(conversationId);
+      const preview = await this.product.conversations.previewSourceReplayCompression({
+        conversationId,
+        expectedRootId: rootId,
+        ...(childExecutionId ? { childExecutionId } : {})
+      });
+      result = { conversationId, rootId, ...preview };
+    } catch (error) {
+      console.warn('[LimCode] Compression rebuild preview failed.', error);
+      result = {
+        conversationId,
+        rootId,
+        outcome: { kind: 'error', message: error instanceof Error ? error.message : String(error) }
+      };
+    }
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.CompressionRebuildPreviewResult,
+      channel: 'state',
+      correlationId,
+      payload: result
     });
   }
 

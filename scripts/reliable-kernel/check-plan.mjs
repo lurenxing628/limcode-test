@@ -155,6 +155,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',
   'tests/reliable-kernel/segmented-summary-chunking.test.mjs',
   'tests/reliable-kernel/segmented-rebuild-admission.test.mjs',
+  'tests/reliable-kernel/compression-rebuild-preview.test.mjs',
   'tests/reliable-kernel/runtime-context-rendering.test.mjs',
   'tests/reliable-kernel/streaming-output-regressions.test.mjs',
   'tests/reliable-kernel/storage-lock-multiprocess.test.cjs',

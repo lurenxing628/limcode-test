@@ -110,6 +110,7 @@ docs/architecture/*
 !/tests/reliable-kernel/child-task-tools.test.mjs
 !/tests/reliable-kernel/compression-rebuild-entry.test.mjs
 !/tests/reliable-kernel/segmented-rebuild-admission.test.mjs
+!/tests/reliable-kernel/compression-rebuild-preview.test.mjs
 !/tests/reliable-kernel/client-feed-window-rollover.test.mjs
 !/tests/reliable-kernel/conversation-deletion-recovery.test.mjs
 !/tests/reliable-kernel/frontend-copy-guardrails.test.cjs

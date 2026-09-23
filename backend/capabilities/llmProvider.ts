@@ -3650,6 +3650,78 @@ function buildSummaryProviderCall(
 /** The only Provider setting the summary splitter measures against. */
 type SummaryWindowSettings = Pick<LlmProviderConfigRecord, 'contextWindowTokens'>;
 
+export interface CompressionSummaryCallPlan {
+  /** Summary requests over the source: one for a single-call summary, one per chunk when segmented. */
+  summaryCalls: number;
+  /**
+   * Merge requests that fold segmented summaries into one. The real count depends on the summaries
+   * the Provider returns; this assumes each segment summary fills its per-call target.
+   */
+  mergeCalls: number;
+}
+
+/** Most chunks one segmented summary may send. */
+export const SEGMENTED_SUMMARY_LEAF_CALL_LIMIT = 32;
+
+/**
+ * Plans a text summary with the exact request builders and window checks the compact call runs,
+ * without calling a Provider. Throws the same `compression_source_too_large` /
+ * `compression_request_too_large` errors the real call throws before sending anything.
+ */
+export function planCompressionSummaryCalls(
+  request: LlmCompactRequest,
+  settings: SummaryWindowSettings
+): CompressionSummaryCallPlan {
+  const methodConfig = request.methodConfigSnapshot;
+  if (!methodConfig || (methodConfig.kind !== 'llm_summary' && methodConfig.kind !== 'segmented_summary')) {
+    throw new TypeError('Summary call planning requires a frozen llm_summary or segmented_summary config.');
+  }
+  const plan = (summaryCalls: number, mergeCalls = 0): CompressionSummaryCallPlan => ({ summaryCalls, mergeCalls });
+  const sourceContents = summaryDeltaContents(request);
+  if (sourceContents.length === 0) return plan(0);
+  if (methodConfig.kind === 'llm_summary') {
+    if (!isSummaryProviderCallWithinWindow(buildSummaryProviderCall(request, methodConfig, settings), settings)) {
+      throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
+    }
+    return plan(1);
+  }
+  const targetTokens = effectiveSummaryTargetTokens(methodConfig);
+  // Each chunk carries less transcript than one call may hold, so a transcript clearly beyond the
+  // whole leaf budget cannot fit and is reported without running the splitter over all of it.
+  const leafLimitTokens = summaryProviderInputLimitTokens(
+    buildSegmentDeltaCall([], 0, '', methodConfig, settings, targetTokens),
+    settings
+  );
+  const transcriptTokens = estimateTokenCount(JSON.stringify(renderContentsForSummary(sourceContents)));
+  if (leafLimitTokens > 0
+    && transcriptTokens > leafLimitTokens * MAX_SEGMENTED_SUMMARY_LEAF_CALLS * SEGMENTED_SUMMARY_PLAN_OVERFLOW_MARGIN) {
+    throw new Error(
+      `compression_source_too_large: segmented summary exceeds the ${MAX_SEGMENTED_SUMMARY_LEAF_CALLS}-leaf call budget.`
+    );
+  }
+  const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, settings);
+  const placeholder = (tokens: number): SegmentedSummaryNode => ({
+    summary: fitTextToTokenLimit('summary '.repeat(tokens), tokens),
+    sourceContents: []
+  });
+  let nodes = calls.map((call) => placeholder(call.targetTokens));
+  let mergeCalls = 0;
+  for (let level = 0; nodes.length > 1; level += 1) {
+    if (level >= MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS) {
+      throw new Error('compression_source_too_large: segmented summary exceeded the hierarchy depth limit.');
+    }
+    const groups = packSegmentedSummaryNodes(nodes, methodConfig, settings, targetTokens);
+    if (groups.length >= nodes.length) {
+      throw new Error('compression_request_too_large: summary deltas cannot be merged inside the frozen Provider window.');
+    }
+    mergeCalls += groups.filter((group) => group.length > 1).length;
+    nodes = groups.map((group) => group.length > 1 ? placeholder(targetTokens) : group[0]!);
+  }
+  const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
+  if (nodes.length > 0 && priorSummaryText) mergeCalls += 1;
+  return plan(calls.length, mergeCalls);
+}
+
 interface SegmentedSummaryChunk {
   requestContents: MessageContent[];
   sourceContents: MessageContent[];
@@ -4077,11 +4149,12 @@ function withSummaryTargetInstruction(prompt: string, targetTokens: number | und
   return `${prompt}\n\n将可见摘要正文控制在约 ${Math.floor(targetTokens)} tokens；优先保留标识符、数字、文件名、依赖关系、决定和未完成事项。`;
 }
 
-const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = 32;
+const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = SEGMENTED_SUMMARY_LEAF_CALL_LIMIT;
 const MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS = 6;
 const SEGMENTED_SUMMARY_CONCURRENCY = 3;
 const SEGMENTED_PRIOR_CONTEXT_TOKENS = 1_024;
 const SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS = 4;
+const SEGMENTED_SUMMARY_PLAN_OVERFLOW_MARGIN = 1.1;
 const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 8_192;
 const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 2;
 const SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS = 8_000;

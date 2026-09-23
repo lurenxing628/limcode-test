@@ -941,34 +941,8 @@ export class ReliableContextCompressionCoordinator {
    * compaction receives the same frozen tool contract as the history it is summarizing. Automatic
    * callers pass the current definitions directly and never enter this lookup.
    */
-  private async readLatestFrozenToolDefinitions(conversationIdInput: string): Promise<CompressionToolDefinition[]> {
-    const conversationId = requireId(conversationIdInput, 'conversationId');
-    const turns = (await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId }))
-      .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
-        || String(right.id).localeCompare(String(left.id)));
-    for (const turn of turns) {
-      const turnId = requireId(turn.id, 'Turn.id');
-      const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
-        .sort((left, right) => compareBigIntDescending(left.request_seq, right.request_seq)
-          || String(right.id).localeCompare(String(left.id)));
-      for (const request of requests) {
-        const recipeRow = await this.optionalDomain(
-          'ContentObject',
-          requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
-        );
-        if (!recipeRow) continue;
-        const recipe = requireRecord(
-          normalizePlainJson(
-            JSON.parse((await this.contentStore.read(asContentObjectMetadata(recipeRow))).toString('utf8')),
-            'ModelRequest recipe'
-          ),
-          'ModelRequest recipe'
-        );
-        if (recipe.kind !== 'reliable-agent-turn') continue;
-        return normalizeCompressionToolDefinitions(recipe.tools, 'ModelRequest recipe.tools');
-      }
-    }
-    return [];
+  private readLatestFrozenToolDefinitions(conversationId: string): Promise<CompressionToolDefinition[]> {
+    return readLatestFrozenCompressionTools(this.database, this.contentStore, conversationId);
   }
 
   /**
@@ -1187,7 +1161,47 @@ function selectCompressionPrefixByTokens(
   };
 }
 
-function manualRequestPlanningBudget(
+/**
+ * Tool definitions of the latest ordinary ModelRequest of a Conversation, which Provider-native
+ * compaction must resend unchanged. Read-only.
+ */
+export async function readLatestFrozenCompressionTools(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  conversationIdInput: string
+): Promise<CompressionToolDefinition[]> {
+  const conversationId = requireId(conversationIdInput, 'conversationId');
+  const turns = (await listAllDomainRows(database, 'Turn', { conversation_id: conversationId }))
+    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
+      || String(right.id).localeCompare(String(left.id)));
+  for (const turn of turns) {
+    const turnId = requireId(turn.id, 'Turn.id');
+    const requests = (await listAllDomainRows(database, 'ModelRequest', { turn_id: turnId }))
+      .sort((left, right) => compareBigIntDescending(left.request_seq, right.request_seq)
+        || String(right.id).localeCompare(String(left.id)));
+    for (const request of requests) {
+      const recipeRead = await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(
+        requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
+      )]);
+      const recipeRow = recipeRead.snapshot[0];
+      if (Array.isArray(recipeRow)) throw new Error('ContentObject lookup returned a list.');
+      if (!recipeRow) continue;
+      const recipe = requireRecord(
+        normalizePlainJson(
+          JSON.parse((await contentStore.read(asContentObjectMetadata(recipeRow))).toString('utf8')),
+          'ModelRequest recipe'
+        ),
+        'ModelRequest recipe'
+      );
+      if (recipe.kind !== 'reliable-agent-turn') continue;
+      return normalizeCompressionToolDefinitions(recipe.tools, 'ModelRequest recipe.tools');
+    }
+  }
+  return [];
+}
+
+/** Budget of the maintenance Turn a manual compression runs in; it has no ordinary request of its own. */
+export function manualRequestPlanningBudget(
   document: PlainJsonValue,
   thresholdTokens: number
 ): FullRequestPlanningBudget {

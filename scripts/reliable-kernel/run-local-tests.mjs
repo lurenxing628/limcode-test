@@ -118,6 +118,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',
   'tests/reliable-kernel/segmented-summary-chunking.test.mjs',
   'tests/reliable-kernel/segmented-rebuild-admission.test.mjs',
+  'tests/reliable-kernel/compression-rebuild-preview.test.mjs',
   'tests/reliable-kernel/streaming-output-regressions.test.mjs',
   'tests/reliable-kernel/storage-lock-multiprocess.test.cjs',
   'tests/reliable-kernel/stream-reset-tool-idempotency.test.mjs',

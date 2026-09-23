@@ -89,6 +89,8 @@ export enum BridgeMessageType {
   ConversationActionResult = 'conversation.action.result',
   CompressionStart = 'compression.start',
   CompressionCommandResult = 'compression.command.result',
+  CompressionRebuildPreviewGet = 'compression.rebuildPreview.get',
+  CompressionRebuildPreviewResult = 'compression.rebuildPreview.result',
   ToolPolicyScopeSet = 'toolPolicy.scope.set',
   ToolPolicyScopeClear = 'toolPolicy.scope.clear',
   SkillPolicyScopeSet = 'skillPolicy.scope.set',
@@ -2666,6 +2668,70 @@ export interface CompressionCommandResultPayload {
   compressionBlockId?: string;
   reasonCode?: string;
 }
+
+/** Read-only estimate of rebuilding the current summary from original records; nothing is written. */
+export interface CompressionRebuildPreviewGetPayload {
+  conversationId: string;
+  /** The Context root the dialog was opened for; a changed head is reported instead of estimated. */
+  expectedRootId: string;
+}
+
+/** Model-independent estimates; real Provider token counts differ. */
+export interface CompressionRebuildSourceEstimate {
+  /** Original records after every summary in the current Context is expanded, by the local estimator. */
+  sourceTokens: number;
+  /** Summaries in the current Context that are expanded back to their original records. */
+  summaryCount: number;
+  /** Context window of the compression model. */
+  contextWindowTokens: number;
+  /** Input one compression request may carry: the window minus the reserved output. */
+  inputCapacityTokens: number;
+}
+
+export type CompressionRebuildBlockReason =
+  /** Compression is turned off for this model. */
+  | 'compression_disabled'
+  /** Expanding the summaries exceeds a reconstruction cap (records, bytes or nesting). */
+  | 'replay_limit_exceeded'
+  /** A segmented summary would need more chunks than its leaf request budget. */
+  | 'leaf_budget_exceeded'
+  /** The source exceeds one request and no configured method summarizes in chunks. */
+  | 'no_chunking_method'
+  /** The compression model's window cannot hold even the fixed summary request. */
+  | 'request_too_large';
+
+export type CompressionRebuildPreviewOutcome =
+  | {
+      kind: 'ready';
+      /** First configured method expected to succeed. */
+      methodKind: Exclude<LlmCompressionMethodKind, 'disabled' | 'auto'>;
+      /** All model requests: summaries, merges and attachment analyses. Local methods send none. */
+      providerRequests: number;
+      /** Summary requests over the source: one per chunk when segmented. */
+      summaryRequests: number;
+      /** Merge requests estimated from the per-chunk summary target. */
+      mergeRequests: number;
+      /** Attachments without a reusable analysis; each costs one request. */
+      attachmentRequests: number;
+    }
+  | {
+      kind: 'blocked';
+      reason: CompressionRebuildBlockReason;
+      /** Chunk budget of one segmented summary. */
+      leafRequestLimit?: number;
+      /** The reconstruction cap that was reached, with its value. */
+      replayLimit?: { kind: 'segments' | 'bytes' | 'depth'; value: number };
+    }
+  /** The current Context changed after the dialog opened. */
+  | { kind: 'stale' }
+  | { kind: 'error'; message: string };
+
+export interface CompressionRebuildPreviewResultPayload {
+  conversationId: string;
+  rootId: string;
+  estimate?: CompressionRebuildSourceEstimate;
+  outcome: CompressionRebuildPreviewOutcome;
+}
 export type InteractionOutcomeStatus =
   | 'committed'
   | 'already_applied'
@@ -3113,6 +3179,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.MessageDeleteFrom, MessageDeleteFromPayload>
   | BridgeEnvelope<BridgeMessageType.MessageRetryFrom, MessageRetryFromPayload>
   | BridgeEnvelope<BridgeMessageType.CompressionStart, CompressionStartPayload>
+  | BridgeEnvelope<BridgeMessageType.CompressionRebuildPreviewGet, CompressionRebuildPreviewGetPayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeSet, ToolPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeClear, ToolPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.SkillPolicyScopeSet, SkillPolicyScopeSetPayload>
@@ -3189,6 +3256,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.ConversationActionResult, ConversationActionResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationForkResult, ConversationForkResultPayload>
   | BridgeEnvelope<BridgeMessageType.CompressionCommandResult, CompressionCommandResultPayload>
+  | BridgeEnvelope<BridgeMessageType.CompressionRebuildPreviewResult, CompressionRebuildPreviewResultPayload>
   | BridgeEnvelope<BridgeMessageType.ModelProfileScopeSnapshot, ModelProfileScopeSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ConfigurationSnapshot, ConfigurationSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.LlmProviderModelsSnapshot, LlmProviderModelsSnapshotPayload>

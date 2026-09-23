@@ -56,7 +56,7 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { toolArtifactIdentifiesCall } from './copiedToolIdentity';
-import { canonicalPlainJson, normalizePlainJson } from './plainJson';
+import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { sqliteUniqueFailureIncludes, stablePhaseFId } from './phaseFIdentity';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { ExecutionLeaseFence } from './executionLeaseFence';
@@ -668,6 +668,25 @@ export class TurnControlPlane {
         inheritSourceAuthority: !collaboration
       });
     });
+  }
+
+  /**
+   * The authority a manual compression maintenance Turn would freeze now, computed the way
+   * runtimeContinuation admits one: inherited from sourceTurnId when there is one, otherwise the
+   * Conversation's current settings. Read-only: no Turn is admitted and nothing is written.
+   */
+  public async previewMaintenanceAuthority(
+    conversationIdInput: string,
+    sourceTurnId: string | null
+  ): Promise<PlainJsonValue> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const previewTurnId = 'turn_maintenance_authority_preview';
+    const compiled = sourceTurnId === null
+      ? await this.compileCurrentAuthority(conversationId, previewTurnId, 'retry')
+      : await this.inheritTurnAuthority(requireId(sourceTurnId, 'sourceTurnId'), previewTurnId, conversationId, 'retry');
+    const content = compiled.authoritySnapshot.content;
+    const text = typeof content === 'string' ? content : Buffer.from(content).toString('utf8');
+    return normalizePlainJson(JSON.parse(text) as unknown, 'Maintenance authority preview');
   }
 
   private async isCollaborationDelivery(deliveryId: string): Promise<boolean> {
