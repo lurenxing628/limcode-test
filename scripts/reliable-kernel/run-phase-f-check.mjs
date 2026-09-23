@@ -649,11 +649,11 @@ async function checkConversationForkLinks() {
       reuseKey: 'reuse-fork-historical',
       expectedSourceHeadRootId: undefined,
       targetTitle: 'Historical fork'
-    }), /outside the copied current transcript/);
+    }), (error) => error instanceof kernel.ConversationForkRejectedError && /分支点消息已被删除/.test(error.message));
     assert.equal((await get(ctx.database, 'Message', seeded.messageId)).deleted_at !== null, true);
     assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-historical' })).length, 0);
     faults.push('fork point soft-deleted after selection');
-    assertions.push('分支只复制可见转录：分支点消息软删除后按旧Revision分支被拒绝且不写复用关系（应用层另以ConversationForkRejectedError永久拒绝）');
+    assertions.push('分支只复制可见转录：分支点消息软删除后，写入器按旧Revision分支以ConversationForkRejectedError永久拒绝且不写复用关系');
 
     return { assertions, faults, metrics };
   });

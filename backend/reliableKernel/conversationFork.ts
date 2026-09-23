@@ -213,18 +213,22 @@ export class ConversationForkControlPlane {
 
     let sourceMembership: DomainRow | null = null;
     if (sourceRevision) {
+      const messageId = requireId(sourceRevision.message_id, 'MessageRevision.message_id');
       const memberships = await this.database.snapshot([
         DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
-          where: {
-            conversation_id: command.sourceConversationId,
-            message_id: requireId(sourceRevision.message_id, 'MessageRevision.message_id')
-          },
+          where: { conversation_id: command.sourceConversationId, message_id: messageId },
           limit: 2
-        })
+        }),
+        DOMAIN_REPOSITORIES.domain('Message').get(messageId)
       ]);
       const rows = requireRows(memberships.snapshot[0], 'MessagePartOfConversation source lookup');
       if (rows.length !== 1) {
         throw new Error('Fork source MessageRevision is not a historical member of the source Conversation.');
+      }
+      // A deleted fork point is gone from the transcript for good; the commit asserts it is still
+      // visible, since the boundary Message is copied with its deletion state.
+      if (requireRow(memberships.snapshot[1], `Message ${messageId}`).deleted_at !== null) {
+        throw new ConversationForkRejectedError('分支点消息已被删除，无法从这条消息创建分支。');
       }
       sourceMembership = rows[0];
     }

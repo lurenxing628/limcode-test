@@ -869,8 +869,21 @@ test('permanent fork failures are rejections that leave no target or copied sett
     // A message deleted after the user clicked fork is a permanent rejection, not a generic error.
     await h.turn('source', 'rejection-deleted-input');
     const deleted = await h.command('source', 'rejection-deleted', 'user');
+    const rootBeforeDelete = await h.app.context.currentHeadRootId('source');
     await h.app.turns.delete({ source: { kind: 'command', key: 'delete-fork-point' }, conversationId: 'source', messageId: deleted.messageId });
     await assert.rejects(h.facade.forkConversation(deleted), rejected(/已被删除/));
+    // The fork writer refuses the deleted fork point itself, also for a caller holding an old root.
+    const [deletedSource] = await rows(h.app, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: deleted.expectedRevisionId
+    });
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: 'source', role: 'default' });
+    await assert.rejects(h.app.runtime.conversationFork.fork({
+      idempotencyKey: 'direct-deleted-fork-point', reuseKey: 'direct-deleted-fork-point',
+      sourceConversationId: 'source', sourceContextRootId: rootBeforeDelete,
+      sourceContextEndSegmentId: deletedSource.segment_id, sourceMessageRevisionId: deleted.expectedRevisionId,
+      targetTitle: 'Rejected deleted fork point', targetAgentId: agent.agent_id
+    }), rejected(/已被删除/));
+    assert.deepEqual(await rows(h.app, 'ConversationReuseLink', { reuse_key: 'direct-deleted-fork-point' }), []);
     assert.equal((await rows(h.app, 'Conversation')).length, 2);
     assert.deepEqual(await strayConversationSettings(h.configuration, ['source', first.conversationId]), []);
   });
