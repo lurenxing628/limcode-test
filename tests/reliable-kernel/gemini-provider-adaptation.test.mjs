@@ -215,6 +215,67 @@ test('E0 dummy signatures for unsigned history are only added for Gemini models 
   }
 });
 
+test('E0 calls flushed by an end-of-stream finalizeStream hook get their signatures from the same tracker', () => {
+  // The vendored package has no finalizeStream yet; this stands in for the one that flushes calls
+  // still pending when a gateway ends the stream without finish_reason.
+  const model = '[v]gemini-3.5-flash';
+  const format = new unified.OpenAICompatibleFormat(model);
+  format.finalizeStream = (state) => {
+    const pending = [...state.pendingToolCalls.values()].filter((entry) => !entry.emitted && entry.name);
+    for (const entry of pending) entry.emitted = true;
+    const functionCalls = pending.map((entry) => ({ functionCall: { name: entry.name, args: {}, callId: entry.callId } }));
+    return functionCalls.length > 0 ? { functionCalls, partsDelta: [...functionCalls] } : undefined;
+  };
+  const provider = installGeminiOpenAICompatibleThoughtSignatures({ format }, 'openai-compatible', model);
+  const state = provider.format.createStreamState();
+  const emitted = [
+    delta({ tool_calls: [{ index: 0, id: 'call_a', type: 'function', function: { name: 'list_items', arguments: '' }, extra_content: { google: { thoughtSignature: 'SIG_A' } } }] }),
+    delta({ tool_calls: [{ index: 1, id: 'call_b', type: 'function', function: { name: 'list_items', arguments: '' } }] })
+  ].flatMap((chunk) => provider.format.decodeStreamChunk(chunk, state).functionCalls ?? []);
+  emitted.push(...(provider.format.finalizeStream(state)?.functionCalls ?? []));
+  assert.deepEqual(emitted.map((part) => [part.functionCall.callId, part.thoughtSignatures?.gemini]), [
+    ['call_a', 'SIG_A'],
+    ['call_b', undefined]
+  ]);
+
+  const onlyAtFinalize = installGeminiOpenAICompatibleThoughtSignatures({
+    format: Object.assign(new unified.OpenAICompatibleFormat(model), { finalizeStream: format.finalizeStream })
+  }, 'openai-compatible', model);
+  const finalizeState = onlyAtFinalize.format.createStreamState();
+  onlyAtFinalize.format.decodeStreamChunk(delta({ tool_calls: [{ index: 0, id: 'call_only', type: 'function', function: { name: 'list_items', arguments: '' }, extra_content: { google: { thought_signature: 'SIG_ONLY' } } }] }), finalizeState);
+  assert.equal(onlyAtFinalize.format.finalizeStream(finalizeState).functionCalls[0].thoughtSignatures.gemini, 'SIG_ONLY');
+});
+
+test('E0 no dummy is injected next to OpenRouter reasoning_details, which carry the Gemini signature', () => {
+  const envelope = JSON.stringify({ reasoning_details: [{ type: 'reasoning.encrypted', data: 'ENCRYPTED', id: 'r1', format: 'google-gemini-v1', index: 0 }] });
+  const history = (thoughtPart) => ({
+    contents: [
+      { role: 'user', parts: [{ text: 'weather?' }] },
+      {
+        role: 'model',
+        parts: [
+          thoughtPart,
+          { functionCall: { name: 'get_weather', args: { city: 'Paris' }, callId: 'call_paris' } }
+        ]
+      }
+    ]
+  });
+  const model = 'google/gemini-3-pro-preview';
+  for (const thoughtPart of [
+    { text: '', thought: true, thoughtSignatures: { 'openai-compatible': envelope } },
+    { text: '', thought: true, thoughtSignature: `openai-compatible:${envelope}` }
+  ]) {
+    const encoded = openAICompatibleGemini(model).format.encodeRequest(history(thoughtPart), false);
+    assert.equal(encoded.messages[1].tool_calls[0].extra_content, undefined);
+  }
+  // A plain reasoning_signature string is not an OpenRouter envelope: the plain-gateway dummy stays.
+  const plain = openAICompatibleGemini(model).format.encodeRequest(
+    history({ text: 'thought', thought: true, thoughtSignatures: { 'openai-compatible': 'plain-signature' } }),
+    false
+  );
+  assert.equal(plain.messages[1].tool_calls[0].extra_content.google.thought_signature, DUMMY_SIGNATURE);
+});
+
 test('E0 responses without extra_content decode exactly as before', () => {
   const raw = {
     choices: [{
@@ -470,6 +531,24 @@ test('E3 a model content left with only foreign thoughts is removed instead of s
     userText('b')
   ]);
   assert.deepEqual(wireShape(contents), ['user:TEXT(a)', 'user:TEXT(b)']);
+});
+
+test('E3 signature-only thought parts from other providers are dropped like any other foreign thought', async () => {
+  const envelope = JSON.stringify({ reasoning_details: [{ type: 'reasoning.encrypted', data: 'ENC', format: 'google-gemini-v1', index: 0 }] });
+  const contents = await geminiWireContents([
+    userText('go'),
+    {
+      role: 'model',
+      parts: [
+        { text: '', thought: true, thoughtSignature: `openai-compatible:${envelope}` },
+        { text: '', thought: true, thoughtSignature: 'claude:sig-only' },
+        { text: 'answer' }
+      ]
+    },
+    { role: 'model', parts: [{ text: '', thought: true, thoughtSignature: `openai-compatible:${envelope}` }] },
+    userText('next')
+  ]);
+  assert.deepEqual(wireShape(contents), ['user:TEXT(go)', 'model:TEXT(answer)', 'user:TEXT(next)']);
 });
 
 test('E3 foreign-thought projection only applies to Gemini', () => {

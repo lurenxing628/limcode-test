@@ -345,15 +345,20 @@ function attachGeminiOpenAIThoughtSignaturesToRequest(
   const sourceContents = Array.isArray(source.contents) ? source.contents.filter(isRecord) : [];
   const sourceCallGroups = sourceContents.flatMap((content) => {
     if (content.role !== 'model' || !Array.isArray(content.parts)) return [];
-    const calls = content.parts.filter((part) => isRecord(part) && isRecord(part.functionCall));
-    return calls.length > 0 ? [calls] : [];
+    const parts = content.parts.filter(isRecord);
+    const calls = parts.filter((part) => isRecord(part.functionCall));
+    return calls.length > 0 ? [{ calls, carriesReasoningDetails: parts.some(carriesOpenRouterReasoningDetails) }] : [];
   });
 
   for (let groupIndex = 0; groupIndex < Math.min(encodedCallGroups.length, sourceCallGroups.length); groupIndex += 1) {
     const encodedCalls = encodedCallGroups[groupIndex];
-    const sourceCalls = sourceCallGroups[groupIndex];
+    const { calls: sourceCalls, carriesReasoningDetails } = sourceCallGroups[groupIndex];
     const sourceSignatures = sourceCalls.map(geminiSignatureFromUnifiedPart);
-    const transferredGroup = fillMissingSignatures && sourceSignatures.every((signature) => !signature);
+    // OpenRouter carries Gemini's signatures inside the replayed `reasoning_details`; a dummy in
+    // extra_content next to them is untested there, so only plain gateways get it.
+    const transferredGroup = fillMissingSignatures
+      && !carriesReasoningDetails
+      && sourceSignatures.every((signature) => !signature);
     for (let callIndex = 0; callIndex < Math.min(encodedCalls.length, sourceCalls.length); callIndex += 1) {
       const signature = sourceSignatures[callIndex]
         ?? (transferredGroup ? GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR : undefined);
@@ -374,6 +379,25 @@ function attachGeminiOpenAIThoughtSignaturesToRequest(
         }
       };
     }
+  }
+}
+
+/**
+ * A part whose OpenAI-compatible signature is the replay envelope for OpenRouter
+ * `reasoning_details` (a JSON object string, https://openrouter.ai/docs/use-cases/reasoning-tokens).
+ */
+function carriesOpenRouterReasoningDetails(part: Record<string, unknown>): boolean {
+  const signatures = isRecord(part.thoughtSignatures) ? part.thoughtSignatures : undefined;
+  const portable = normalizedSignatureString(part.thoughtSignature);
+  const parsedPortable = portable ? parsePortableThoughtSignature(portable) : undefined;
+  const envelope = normalizedSignatureString(signatures?.['openai-compatible'])
+    ?? (parsedPortable?.provider === 'openai-compatible' ? parsedPortable.value : undefined);
+  if (!envelope?.startsWith('{')) return false;
+  try {
+    const parsed: unknown = JSON.parse(envelope);
+    return isRecord(parsed) && Array.isArray(parsed.reasoning_details) && parsed.reasoning_details.length > 0;
+  } catch {
+    return false;
   }
 }
 
