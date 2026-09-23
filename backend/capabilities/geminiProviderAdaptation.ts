@@ -602,49 +602,93 @@ function restoreGeminiToolSchemas(encodedRequest: unknown, sourceRequest: unknow
   }
 }
 
-const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
-  'title',
-  'default',
-  'const',
-  '$defs',
-  'definitions',
-  '$schema',
-  'not',
-  'if',
-  'then',
-  'else',
-  'prefixItems',
-  'additionalProperties',
-  'propertyNames',
-  'multipleOf',
-  'exclusiveMinimum',
-  'exclusiveMaximum'
+/**
+ * Gemini function parameters accept only the documented Schema subset
+ * (https://ai.google.dev/api/generate-content#v1beta.Schema); any other field is rejected with
+ * 400 "Invalid JSON payload received. Unknown name ... Cannot find field" (gateway-tested for
+ * `uniqueItems`, `examples`, `$ref`, `patternProperties` and `type` arrays).
+ *
+ * Kept as-is (documented values): type, format, description, nullable, enum, maxItems, minItems,
+ * required, minProperties, maxProperties, minLength, maxLength, pattern, example, propertyOrdering,
+ * minimum, maximum. Recursed into (documented schemas): properties, items, anyOf.
+ * `title` and `default` are documented too but have always been removed here; they carry no
+ * validation and removing them keeps every built-in tool schema byte-identical.
+ */
+const GEMINI_SCHEMA_VALUE_FIELDS = new Set([
+  'type',
+  'format',
+  'description',
+  'nullable',
+  'enum',
+  'maxItems',
+  'minItems',
+  'required',
+  'minProperties',
+  'maxProperties',
+  'minLength',
+  'maxLength',
+  'pattern',
+  'example',
+  'propertyOrdering',
+  'minimum',
+  'maximum'
 ]);
 
-function sanitizeGeminiFunctionSchema(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sanitizeGeminiFunctionSchema);
+const GEMINI_SCHEMA_UNION_FIELDS = new Set(['anyOf', 'oneOf', 'allOf']);
+
+/** Local `$ref` chains deeper than this are cut like a cycle, so shared definitions cannot explode. */
+const GEMINI_SCHEMA_MAX_REF_DEPTH = 8;
+
+interface GeminiSchemaContext {
+  root: unknown;
+  refStack: readonly string[];
+}
+
+function sanitizeGeminiFunctionSchema(value: unknown, context?: GeminiSchemaContext): unknown {
+  const schemaContext = context ?? { root: value, refStack: [] };
+  if (Array.isArray(value)) return value.map((item) => sanitizeGeminiFunctionSchema(item, schemaContext));
   if (!isRecord(value)) return value;
+  if (typeof value.$ref === 'string') return sanitizeGeminiSchemaReference(value, value.$ref, schemaContext);
 
   const result: Record<string, unknown> = {};
+  const merges: Record<string, unknown>[] = [];
   let stringifiedEnum = false;
+  let nullable = false;
   for (const [key, child] of Object.entries(value)) {
-    if (GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(key)) continue;
     if (key === 'properties' && isRecord(child)) {
       result.properties = Object.fromEntries(
         Object.entries(child).map(([propertyName, propertySchema]) => [
           propertyName,
-          sanitizeGeminiFunctionSchema(propertySchema)
+          sanitizeGeminiFunctionSchema(propertySchema, schemaContext)
         ])
       );
       continue;
     }
-    if ((key === 'anyOf' || key === 'oneOf' || key === 'allOf') && Array.isArray(child)) {
-      const otherKeys = Object.keys(value).filter((candidate) =>
-        candidate !== key && !GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(candidate)
-      );
-      if (otherKeys.length === 0 && child.length > 0) {
-        const first = sanitizeGeminiFunctionSchema(child[0]);
-        if (isRecord(first)) Object.assign(result, first);
+    if (GEMINI_SCHEMA_UNION_FIELDS.has(key) && Array.isArray(child)) {
+      const union = sanitizeGeminiSchemaUnion(value, key, child, schemaContext);
+      if (union.anyOf) result.anyOf = union.anyOf;
+      merges.push(...union.merges);
+      nullable ||= union.nullable;
+      continue;
+    }
+    if (key === 'type' && Array.isArray(child)) {
+      // JSON Schema `type: [T, "null"]` is Gemini `type: T, nullable: true`.
+      const types = child.filter((type): type is string => typeof type === 'string');
+      const nonNull = types.filter((type) => type.toLowerCase() !== 'null');
+      if (nonNull.length > 0) result.type = nonNull[0];
+      else if (types.length > 0) result.type = types[0];
+      if (nonNull.length > 1 && !hasTypeSpecificGeminiFields(value)) {
+        delete result.type;
+        result.anyOf = nonNull.map((type) => ({ type }));
+      }
+      nullable ||= nonNull.length > 0 && nonNull.length < types.length;
+      continue;
+    }
+    if (key === 'const') {
+      // A string `const` is a single-value enum; other literals keep being dropped as before.
+      if (typeof child === 'string' && !Object.prototype.hasOwnProperty.call(value, 'enum')) {
+        result.enum = [child];
+        if (value.type === undefined) result.type = 'string';
       }
       continue;
     }
@@ -653,9 +697,16 @@ function sanitizeGeminiFunctionSchema(value: unknown): unknown {
       stringifiedEnum = true;
       continue;
     }
-    result[key] = sanitizeGeminiFunctionSchema(child);
+    if (key === 'items') {
+      const items = Array.isArray(child) ? child[0] : child;
+      if (items !== undefined) result.items = sanitizeGeminiFunctionSchema(items, schemaContext);
+      continue;
+    }
+    if (GEMINI_SCHEMA_VALUE_FIELDS.has(key)) result[key] = cloneGeminiSchemaValue(child);
   }
 
+  for (const merge of merges) mergeGeminiSchemaInto(result, merge);
+  if (nullable && result.nullable === undefined) result.nullable = true;
   if (stringifiedEnum && (result.type === 'integer' || result.type === 'number')) result.type = 'string';
   if (Array.isArray(result.required) && isRecord(result.properties)) {
     const required = result.required.filter((propertyName): propertyName is string =>
@@ -665,4 +716,124 @@ function sanitizeGeminiFunctionSchema(value: unknown): unknown {
     else delete result.required;
   }
   return result;
+}
+
+/**
+ * Local references (`#/$defs/...`, `#/definitions/...`, any JSON pointer into the parameters) are
+ * inlined before `$defs`/`definitions` are dropped; sibling keywords at the reference site win. A
+ * recursive or overly deep reference becomes an object without further structure; a reference that
+ * cannot be resolved locally is dropped with its siblings kept.
+ */
+function sanitizeGeminiSchemaReference(
+  value: Record<string, unknown>,
+  ref: string,
+  context: GeminiSchemaContext
+): unknown {
+  const { $ref: _ref, ...siblings } = value;
+  const target = resolveLocalGeminiSchemaReference(context.root, ref);
+  if (!isRecord(target)) return sanitizeGeminiFunctionSchema(siblings, context);
+  if (context.refStack.includes(ref) || context.refStack.length >= GEMINI_SCHEMA_MAX_REF_DEPTH) {
+    return sanitizeGeminiFunctionSchema({ type: 'object', ...siblings }, context);
+  }
+  return sanitizeGeminiFunctionSchema({ ...target, ...siblings }, {
+    root: context.root,
+    refStack: [...context.refStack, ref]
+  });
+}
+
+function resolveLocalGeminiSchemaReference(root: unknown, ref: string): unknown {
+  if (ref === '#') return root;
+  if (!ref.startsWith('#/')) return undefined;
+  let node: unknown = root;
+  for (const segment of ref.slice(2).split('/')) {
+    let key: string;
+    try {
+      key = decodeURIComponent(segment).replace(/~1/g, '/').replace(/~0/g, '~');
+    } catch {
+      return undefined;
+    }
+    if (Array.isArray(node)) node = node[Number(key)];
+    else if (isRecord(node) && Object.prototype.hasOwnProperty.call(node, key)) node = node[key];
+    else return undefined;
+  }
+  return node;
+}
+
+interface GeminiSchemaUnion {
+  anyOf?: unknown[];
+  merges: Record<string, unknown>[];
+  nullable: boolean;
+}
+
+/**
+ * `anyOf` is documented and kept when every branch is a standalone typed schema; `oneOf` is sent the
+ * same way. A `null` branch becomes `nullable: true`, and a single remaining branch is folded into
+ * the parent. `allOf` members are folded into the parent. Constraint-only branches (no type, e.g. the
+ * `required`-only branches of an exactly-one-of) keep the previous behaviour: the first branch is
+ * used when the union stands alone, otherwise the union is dropped.
+ */
+function sanitizeGeminiSchemaUnion(
+  parent: Record<string, unknown>,
+  key: string,
+  branches: readonly unknown[],
+  context: GeminiSchemaContext
+): GeminiSchemaUnion {
+  const sanitized = branches.map((branch) => sanitizeGeminiFunctionSchema(branch, context));
+  if (key === 'allOf') {
+    if (sanitized.length > 0 && sanitized.every(isRecord)) return { merges: sanitized, nullable: false };
+  } else {
+    const nonNull = sanitized.filter((branch) => !isGeminiNullSchema(branch));
+    const nullable = nonNull.length < sanitized.length;
+    if (nonNull.length > 0 && nonNull.every(isTypedGeminiSchema)) {
+      return nonNull.length === 1
+        ? { merges: [nonNull[0]], nullable }
+        : { anyOf: nonNull, merges: [], nullable };
+    }
+  }
+  const otherKeys = Object.keys(parent).filter((candidate) => candidate !== key && keepsGeminiSchemaKey(candidate));
+  if (otherKeys.length === 0 && sanitized.length > 0 && isRecord(sanitized[0])) {
+    return { merges: [sanitized[0]], nullable: false };
+  }
+  return { merges: [], nullable: false };
+}
+
+function keepsGeminiSchemaKey(key: string): boolean {
+  return GEMINI_SCHEMA_VALUE_FIELDS.has(key)
+    || GEMINI_SCHEMA_UNION_FIELDS.has(key)
+    || key === 'properties'
+    || key === 'items'
+    || key === 'const'
+    || key === '$ref';
+}
+
+function isGeminiNullSchema(value: unknown): boolean {
+  return isRecord(value) && typeof value.type === 'string' && value.type.toLowerCase() === 'null';
+}
+
+function isTypedGeminiSchema(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && (typeof value.type === 'string' || Array.isArray(value.anyOf));
+}
+
+function hasTypeSpecificGeminiFields(value: Record<string, unknown>): boolean {
+  return ['properties', 'items', 'enum', 'const', 'required'].some((key) => value[key] !== undefined);
+}
+
+/** Folds a branch into its parent: the parent's own keywords win, properties and required are unioned. */
+function mergeGeminiSchemaInto(target: Record<string, unknown>, source: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(source)) {
+    if (key === 'properties' && isRecord(value)) {
+      target.properties = { ...value, ...(isRecord(target.properties) ? target.properties : {}) };
+    } else if (key === 'required' && Array.isArray(value)) {
+      const required = Array.isArray(target.required) ? target.required : [];
+      target.required = [...required, ...value.filter((name) => !required.includes(name))];
+    } else if (!Object.prototype.hasOwnProperty.call(target, key)) {
+      target[key] = value;
+    }
+  }
+}
+
+function cloneGeminiSchemaValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneGeminiSchemaValue);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, cloneGeminiSchemaValue(child)]));
 }

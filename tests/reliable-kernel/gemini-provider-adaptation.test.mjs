@@ -482,3 +482,198 @@ test('E3 foreign-thought projection only applies to Gemini', () => {
     assert.equal(request.contents[1].parts[0].thought, true, providerKind);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// E4: Gemini tool schemas follow the documented Schema subset
+// (https://ai.google.dev/api/generate-content#v1beta.Schema).
+
+/** Frozen copy of the sanitizer before E4; built-in tool schemas must come out byte-identical. */
+const LEGACY_GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
+  'title', 'default', 'const', '$defs', 'definitions', '$schema', 'not', 'if', 'then', 'else',
+  'prefixItems', 'additionalProperties', 'propertyNames', 'multipleOf', 'exclusiveMinimum', 'exclusiveMaximum'
+]);
+function isPlainRecord(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+function legacySanitizeGeminiFunctionSchema(value) {
+  if (Array.isArray(value)) return value.map(legacySanitizeGeminiFunctionSchema);
+  if (!isPlainRecord(value)) return value;
+  const result = {};
+  let stringifiedEnum = false;
+  for (const [key, child] of Object.entries(value)) {
+    if (LEGACY_GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(key)) continue;
+    if (key === 'properties' && isPlainRecord(child)) {
+      result.properties = Object.fromEntries(Object.entries(child)
+        .map(([propertyName, propertySchema]) => [propertyName, legacySanitizeGeminiFunctionSchema(propertySchema)]));
+      continue;
+    }
+    if ((key === 'anyOf' || key === 'oneOf' || key === 'allOf') && Array.isArray(child)) {
+      const otherKeys = Object.keys(value).filter((candidate) =>
+        candidate !== key && !LEGACY_GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(candidate));
+      if (otherKeys.length === 0 && child.length > 0) {
+        const first = legacySanitizeGeminiFunctionSchema(child[0]);
+        if (isPlainRecord(first)) Object.assign(result, first);
+      }
+      continue;
+    }
+    if (key === 'enum' && Array.isArray(child)) {
+      result.enum = child.map((item) => String(item));
+      stringifiedEnum = true;
+      continue;
+    }
+    result[key] = legacySanitizeGeminiFunctionSchema(child);
+  }
+  if (stringifiedEnum && (result.type === 'integer' || result.type === 'number')) result.type = 'string';
+  if (Array.isArray(result.required) && isPlainRecord(result.properties)) {
+    const required = result.required.filter((propertyName) =>
+      typeof propertyName === 'string' && Object.prototype.hasOwnProperty.call(result.properties, propertyName));
+    if (required.length > 0) result.required = required;
+    else delete result.required;
+  }
+  return result;
+}
+
+async function loadBuiltinToolSchemas() {
+  const Module = require('node:module');
+  const originalLoad = Module._load;
+  Module._load = function patched(request, parent, isMain) {
+    if (request === 'vscode') return { Uri: { file: (value) => ({ fsPath: value }) }, workspace: {} };
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    const definitions = require(path.join(root, 'dist/extension/backend/world/modules/tools/definitions/index.js'));
+    const created = [
+      ...definitions.createBuiltinToolDefinitions({ command: { toolName: 'bash', description: 'Synthetic shell.' } }),
+      definitions.agentBoardTool
+    ];
+    const byName = new Map(created.map((definition) => [definition.declaration.name, {
+      name: definition.declaration.name,
+      description: definition.declaration.description ?? '',
+      parameters: definition.declaration.parameters
+    }]));
+    // The full edit union (the edit tool itself sends it flattened) exercises constraint-only branches.
+    const edit = byName.get('edit');
+    byName.set('edit_union_probe', { name: 'edit_union_probe', description: 'probe', parameters: edit.parameters });
+    return [...byName.values()];
+  } finally {
+    Module._load = originalLoad;
+  }
+}
+
+async function geminiWireDeclarations(tools, provider, model) {
+  const result = await dryRunLlmProvider({
+    id: `schemas-${provider}`, invocationId: `schemas-${provider}`, conversationId: 'conversation-schemas',
+    contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    tools
+  }, { settings: async () => providerConfig({ provider, model }) });
+  return provider === 'gemini'
+    ? result.body.tools[0].functionDeclarations
+    : result.body.tools.map((tool) => tool.function);
+}
+
+test('E4 every built-in tool schema is byte-identical to the pre-E4 Gemini sanitizer output', async () => {
+  const tools = await loadBuiltinToolSchemas();
+  assert.ok(tools.length >= 20, `expected the built-in tool set, got ${tools.length}`);
+  const sourceParameters = new Map(toUnifiedRequest({ id: 'r', conversationId: 'c', contents: [], tools }, undefined, 'gemini')
+    .tools[0].functionDeclarations.map((declaration) => [declaration.name, declaration.parameters]));
+  for (const [provider, model] of [['gemini', 'gemini-3.7-flash'], ['openai-compatible', '[v]gemini-3.5-flash']]) {
+    const declarations = await geminiWireDeclarations(tools, provider, model);
+    assert.equal(declarations.length, tools.length, provider);
+    for (const declaration of declarations) {
+      assert.equal(
+        JSON.stringify(declaration.parameters),
+        JSON.stringify(legacySanitizeGeminiFunctionSchema(sourceParameters.get(declaration.name))),
+        `${provider} ${declaration.name}`
+      );
+    }
+  }
+});
+
+function mcpToolParameters() {
+  return {
+    $schema: 'http://json-schema.org/draft-07/schema#',
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      path: { type: 'string', description: 'file path', format: 'uri' },
+      nullableString: { type: ['string', 'null'], description: 'pydantic Optional[str]' },
+      multiType: { type: ['string', 'number'] },
+      anyOfNullable: { anyOf: [{ type: 'string' }, { type: 'null' }], default: null, title: 'Anyofnullable' },
+      anyOfUnion: { description: 'mixed', anyOf: [{ type: 'string' }, { type: 'number', minimum: 0 }] },
+      oneOfUnion: { oneOf: [{ type: 'string' }, { $ref: '#/$defs/Item' }] },
+      mode: { const: 'fast', type: 'string' },
+      onlyConst: { const: 'fixed' },
+      numericConst: { const: 3, type: 'integer' },
+      tags: { type: 'array', items: { type: 'string' }, uniqueItems: true, examples: [['a']] },
+      ref: { $ref: '#/$defs/Item', description: 'the item' },
+      legacyRef: { allOf: [{ $ref: '#/definitions/Legacy' }], description: 'pydantic v1 style' },
+      tree: { $ref: '#/$defs/Node' },
+      dangling: { $ref: '#/$defs/Missing', description: 'unknown target' },
+      remote: { $ref: 'https://example.invalid/schema.json', type: 'string' },
+      map: { type: 'object', patternProperties: { '^x-': { type: 'string' } } },
+      count: { type: 'integer', exclusiveMinimum: 0, multipleOf: 2 },
+      title: { type: 'string', description: 'a property literally named title' },
+      const: { type: 'string', description: 'a property literally named const' }
+    },
+    required: ['path', 'title', 'const'],
+    $defs: {
+      Item: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+      Node: { type: 'object', properties: { children: { type: 'array', items: { $ref: '#/$defs/Node' } } } }
+    },
+    definitions: { Legacy: { type: 'object', properties: { name: { type: 'string' } } } }
+  };
+}
+
+const EXPECTED_MCP_PARAMETERS = {
+  type: 'object',
+  properties: {
+    path: { type: 'string', description: 'file path', format: 'uri' },
+    nullableString: { type: 'string', description: 'pydantic Optional[str]', nullable: true },
+    multiType: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+    anyOfNullable: { type: 'string', nullable: true },
+    anyOfUnion: { description: 'mixed', anyOf: [{ type: 'string' }, { type: 'number', minimum: 0 }] },
+    oneOfUnion: {
+      anyOf: [{ type: 'string' }, { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }]
+    },
+    mode: { enum: ['fast'], type: 'string' },
+    onlyConst: { enum: ['fixed'], type: 'string' },
+    numericConst: { type: 'integer' },
+    tags: { type: 'array', items: { type: 'string' } },
+    ref: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'], description: 'the item' },
+    legacyRef: { description: 'pydantic v1 style', type: 'object', properties: { name: { type: 'string' } } },
+    tree: {
+      type: 'object',
+      properties: { children: { type: 'array', items: { type: 'object' } } }
+    },
+    dangling: { description: 'unknown target' },
+    remote: { type: 'string' },
+    map: { type: 'object' },
+    count: { type: 'integer' },
+    title: { type: 'string', description: 'a property literally named title' },
+    const: { type: 'string', description: 'a property literally named const' }
+  },
+  required: ['path', 'title', 'const']
+};
+
+test('E4 MCP schemas are reduced to the documented Gemini Schema subset', async () => {
+  const parameters = mcpToolParameters();
+  const original = structuredClone(parameters);
+  for (const [provider, model] of [['gemini', 'gemini-3.7-flash'], ['openai-compatible', '[v]gemini-3.5-flash']]) {
+    const [declaration] = await geminiWireDeclarations([{ name: 'fs_read', description: 'MCP tool', parameters }], provider, model);
+    assert.deepEqual(declaration.parameters, EXPECTED_MCP_PARAMETERS, provider);
+    // Every field the gateway rejected with "Unknown name ... Cannot find field" is gone.
+    assert.doesNotMatch(JSON.stringify(declaration.parameters),
+      /"(?:\$ref|\$defs|definitions|uniqueItems|examples|patternProperties|additionalProperties|multipleOf|exclusiveMinimum)"/);
+  }
+  assert.deepEqual(parameters, original, 'the source schema must not be mutated');
+});
+
+test('E4 non-Gemini providers keep MCP schemas untouched by the Gemini sanitizer', async () => {
+  const parameters = mcpToolParameters();
+  const result = await dryRunLlmProvider({
+    id: 'schemas-claude', invocationId: 'schemas-claude', conversationId: 'conversation-schemas',
+    contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    tools: [{ name: 'fs_read', description: 'MCP tool', parameters }]
+  }, { settings: async () => providerConfig({ provider: 'openai-compatible', model: 'gpt-5.5' }) });
+  assert.match(JSON.stringify(result.body.tools[0].function.parameters), /"nullableString":\{"type":\["string","null"\]/);
+});
