@@ -1,15 +1,33 @@
 diff --git a/package.json b/package.json
-index 5b0475d..0bee5fd 100644
+index 5b0475d..a6a7de4 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "unified-llm-provider",
 -  "version": "0.1.37",
-+  "version": "0.1.37-limcode.5",
++  "version": "0.1.37-limcode.6",
    "description": "统一 LLM Provider npm 包：一套统一结构接入 Gemini / Claude / OpenAI Compatible / OpenAI Responses / DeepSeek",
    "license": "MIT",
    "type": "module",
+diff --git a/src/config/types.ts b/src/config/types.ts
+index b767128..328ded5 100644
+--- a/src/config/types.ts
++++ b/src/config/types.ts
+@@ -89,6 +89,13 @@ export interface LLMPromptCacheBreakpoints {
+   tools?: boolean;
+   /** 在本次请求聊天记录末尾写入缓存断点。 */
+   messages?: boolean;
++  /**
++   * [OpenAI Responses] 仅 explicit 模式（GPT-5.6 及之后的官方 id）：把字符串形式的 function_call_output
++   * 编码成 input_text 内容块数组，让最新的工具结果也能承载消息断点（字符串形式不能承载）。默认关闭。
++   * 适合续接链（WebSocket previous_response_id）：服务端保留此前各帧的断点，每帧把断点放在最新的工具结果上，
++   * 工具循环就能逐轮复用缓存。无状态的完整重放请求只有一个随请求移动的消息断点，不应开启。
++   */
++  toolOutputs?: boolean;
+ }
+ 
+ export interface LLMPromptCacheConfig {
 diff --git a/src/index.ts b/src/index.ts
 index 0c458cf..27ca125 100644
 --- a/src/index.ts
@@ -1144,7 +1162,7 @@ index 08a6ccc..51b3366 100644
    if (mediaBlocks.length === 0) return text;
    return [
 diff --git a/src/llm/formats/openai-responses.ts b/src/llm/formats/openai-responses.ts
-index 1be02a5..3d3f4d0 100644
+index 1be02a5..9f6a6da 100644
 --- a/src/llm/formats/openai-responses.ts
 +++ b/src/llm/formats/openai-responses.ts
 @@ -8,6 +8,7 @@
@@ -1155,7 +1173,11 @@ index 1be02a5..3d3f4d0 100644
    isVisibleTextPart, isInlineDataPart, isFunctionCallPart, isFunctionResponsePart, isTextPart, isProviderContextPart,
  } from '../../types.js';
  import type { LLMPromptCacheConfig, LLMPromptCacheMode } from '../../config/types.js';
-@@ -27,13 +28,86 @@ interface NormalizedOpenAIResponsesPromptCacheConfig {
+@@ -24,16 +25,90 @@ interface NormalizedOpenAIResponsesPromptCacheConfig {
+   ttl: '30m';
+   breakpoints: {
+     messages: boolean;
++    toolOutputs: boolean;
    };
  }
  
@@ -1243,7 +1265,7 @@ index 1be02a5..3d3f4d0 100644
    // ============ 编码请求：Gemini (Internal) → OpenAI Responses ============
  
    private encodeInstructions(request: LLMRequest): string | undefined {
-@@ -60,6 +134,9 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -60,6 +135,9 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
  
        if (content.role === 'model') {
          let currentMessageItem: any = null;
@@ -1253,7 +1275,7 @@ index 1be02a5..3d3f4d0 100644
  
          for (const part of content.parts) {
            if (isProviderContextPart(part)) {
-@@ -86,8 +163,11 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -86,8 +164,11 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
              inputItems.push(reasoningItem);
              currentMessageItem = null;
            } else if (isVisibleTextPart(part) && part.text) {
@@ -1267,7 +1289,7 @@ index 1be02a5..3d3f4d0 100644
                inputItems.push(currentMessageItem);
              }
              currentMessageItem.content.push({ type: 'output_text', text: part.text });
-@@ -98,6 +178,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -98,6 +179,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
                call_id: callId,
                name: part.functionCall.name,
                arguments: JSON.stringify(part.functionCall.args),
@@ -1276,7 +1298,7 @@ index 1be02a5..3d3f4d0 100644
              });
              pendingToolCallIds.push(callId);
              currentMessageItem = null;
-@@ -171,6 +253,15 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -171,6 +254,15 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          name: decl.name,
          description: decl.description,
          parameters: sanitizeSchemaForOpenAI(decl.parameters),
@@ -1292,7 +1314,7 @@ index 1be02a5..3d3f4d0 100644
        }));
      }
  
-@@ -209,7 +300,34 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -209,7 +301,39 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
        mode: this.promptCache.mode === 'implicit' ? 'implicit' : 'explicit',
        ttl: this.promptCache.ttl,
      };
@@ -1319,6 +1341,11 @@ index 1be02a5..3d3f4d0 100644
 +      // 依据：https://developers.openai.com/api/docs/guides/prompt-caching（Explicit mode：
 +      // “mark each desired breakpoint by adding prompt_cache_breakpoint ... to a supported content block
 +      // inside an input message”；多轮 agent 示例把断点放在 function_call_output 的 input_text 上）。
++      // 调用方开启 breakpoints.toolOutputs 时（续接链），字符串形式的工具结果先转成 input_text 数组，
++      // 让最新的工具结果成为断点承载块；整条 input 统一转换，前后请求的已发送前缀保持一致。
++      if (this.promptCache.breakpoints.toolOutputs && supportsLimcodeExplicitPromptCache(this.model)) {
++        encodeOpenAIResponsesToolOutputsAsContentBlocks(inputItems);
++      }
 +      if (!markLastOpenAIResponsesBreakpointCarrier(inputItems)) {
 +        inputItems.push(createOpenAICacheMarkerMessage(' '));
 +      }
@@ -1328,7 +1355,7 @@ index 1be02a5..3d3f4d0 100644
        inputItems.push(createOpenAICacheMarkerMessage(' '));
      }
    }
-@@ -266,19 +384,25 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -266,19 +390,25 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
      }
  
      const parts: Part[] = [];
@@ -1356,7 +1383,7 @@ index 1be02a5..3d3f4d0 100644
          parts.push(createProviderContextPart(item, 'responses'));
        }
      }
-@@ -304,7 +428,42 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -304,7 +434,42 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          chunk.textDelta = data.delta;
          chunk.partsDelta = [{ text: data.delta }];
        }
@@ -1399,7 +1426,7 @@ index 1be02a5..3d3f4d0 100644
        const item = data.item;
        if (item?.type === 'reasoning') {
          // Responses API 的 reasoning item 在 added 阶段通常只有空 summary；
-@@ -312,29 +471,37 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -312,29 +477,37 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          // encrypted_content 只在 output_item.done 阶段采信，避免保存未完成或最终全量重复签名。
          emitReasoningItemSummary(chunk, streamState, item, data);
        } else if (item?.type === 'function_call') {
@@ -1440,7 +1467,7 @@ index 1be02a5..3d3f4d0 100644
        const item = data.item;
        if (item?.type === 'reasoning') {
          // 如果前面没有 reasoning_summary_text.delta，done 里的完整 summary 是最后兜底，
-@@ -342,14 +509,49 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -342,14 +515,49 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          emitReasoningItemSummary(chunk, streamState, item, data);
          emitReasoningSignature(chunk, streamState, item, data);
        } else if (item?.type === 'function_call') {
@@ -1493,7 +1520,7 @@ index 1be02a5..3d3f4d0 100644
        for (const item of data.response?.output ?? data.output ?? []) {
          if (item?.type === 'reasoning') {
            // 部分网关不会发送 reasoning_* delta，只在 completed.response.output
-@@ -361,10 +563,12 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -361,10 +569,12 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
            // 会在历史里形成额外的 signature-only thought part。保持原逻辑：
            // 只在 output_item.done 阶段接收 reasoning.encrypted_content。
          } else if (item?.type === 'compaction') {
@@ -1508,7 +1535,7 @@ index 1be02a5..3d3f4d0 100644
      }
  
      return chunk;
-@@ -376,6 +580,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -376,6 +586,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
        pendingFunctionCalls: new Map<string, PendingOpenAIResponsesFunctionCall>(),
        reasoningTextByKey: new Map<string, string>(),
        emittedReasoningSignatures: new Set<string>(),
@@ -1517,7 +1544,7 @@ index 1be02a5..3d3f4d0 100644
      } as OpenAIResponsesStreamState;
    }
  }
-@@ -385,12 +591,59 @@ interface OpenAIResponsesStreamState extends StreamDecodeState {
+@@ -385,12 +597,59 @@ interface OpenAIResponsesStreamState extends StreamDecodeState {
    pendingFunctionCalls: Map<string, PendingOpenAIResponsesFunctionCall>;
    reasoningTextByKey: Map<string, string>;
    emittedReasoningSignatures: Set<string>;
@@ -1577,7 +1604,15 @@ index 1be02a5..3d3f4d0 100644
  }
  
  function isPlainObject(value: unknown): value is Record<string, unknown> {
-@@ -525,6 +778,35 @@ function markLastOpenAIResponsesCacheableBlockAtRequestEnd(inputItems: any[]): b
+@@ -492,6 +751,7 @@ function normalizeOpenAIResponsesPromptCacheConfig(promptCache: LLMPromptCacheCo
+     ttl: '30m',
+     breakpoints: {
+       messages: breakpoints.messages !== false,
++      toolOutputs: breakpoints.toolOutputs === true,
+     },
+   };
+ }
+@@ -525,6 +785,49 @@ function markLastOpenAIResponsesCacheableBlockAtRequestEnd(inputItems: any[]): b
    return true;
  }
  
@@ -1600,6 +1635,20 @@ index 1be02a5..3d3f4d0 100644
 +  return false;
 +}
 +
++/**
++ * 把字符串形式的 function_call_output 换成 `[{ type: 'input_text', text }]`（OpenAPI：output 可为
++ * “array of ResponseInputTextContent ...”，其 input_text 接受 prompt_cache_breakpoint）。空字符串保持原样。
++ * 替换为新对象，不改动 providerContext 里的原始 item。
++ */
++function encodeOpenAIResponsesToolOutputsAsContentBlocks(inputItems: any[]): void {
++  for (let index = 0; index < inputItems.length; index++) {
++    const item = inputItems[index];
++    if (!isPlainObject(item) || item.type !== 'function_call_output') continue;
++    if (typeof item.output !== 'string' || !item.output) continue;
++    inputItems[index] = { ...item, output: [{ type: 'input_text', text: item.output }] };
++  }
++}
++
 +function getOpenAIResponsesBreakpointCarrierBlocks(item: unknown): unknown[] | undefined {
 +  if (!isPlainObject(item)) return undefined;
 +  const blocks = item.type === 'function_call_output'
@@ -1613,7 +1662,7 @@ index 1be02a5..3d3f4d0 100644
  function isOpenAIResponsesCacheableContentBlock(block: unknown): block is Record<string, unknown> {
    if (!block || typeof block !== 'object' || Array.isArray(block)) return false;
    const type = (block as Record<string, unknown>).type;
-@@ -801,6 +1083,8 @@ function createFunctionCallPart(item: any): FunctionCallPart {
+@@ -801,6 +1104,8 @@ function createFunctionCallPart(item: any): FunctionCallPart {
        name: item.name,
        args: parseFunctionCallArguments(item.arguments),
        callId: normalizeCallId(item.call_id) ?? normalizeCallId(item.id),
@@ -1622,7 +1671,7 @@ index 1be02a5..3d3f4d0 100644
      },
    };
  }
-@@ -819,13 +1103,16 @@ function parseFunctionCallArguments(argumentsValue: unknown): Record<string, unk
+@@ -819,13 +1124,16 @@ function parseFunctionCallArguments(argumentsValue: unknown): Record<string, unk
  function rememberPendingFunctionCall(
    state: OpenAIResponsesStreamState,
    item: any,
@@ -1639,7 +1688,7 @@ index 1be02a5..3d3f4d0 100644
    if (typeof item.name === 'string' && item.name.trim()) pending.name = item.name;
    if (typeof item.arguments === 'string') {
      if (item.arguments || !pending.argumentsText) {
-@@ -836,6 +1123,7 @@ function rememberPendingFunctionCall(
+@@ -836,6 +1144,7 @@ function rememberPendingFunctionCall(
    }
  
    state.pendingFunctionCalls.set(itemKey, pending);
@@ -1647,7 +1696,7 @@ index 1be02a5..3d3f4d0 100644
    return itemKey;
  }
  
-@@ -843,13 +1131,16 @@ function appendPendingFunctionCallArguments(
+@@ -843,13 +1152,16 @@ function appendPendingFunctionCallArguments(
    state: OpenAIResponsesStreamState,
    itemId: unknown,
    delta: unknown,
@@ -1664,7 +1713,7 @@ index 1be02a5..3d3f4d0 100644
  }
  
  function getPendingFunctionCallKey(item: any): string | undefined {
-@@ -860,38 +1151,55 @@ function emitFunctionCallChunk(
+@@ -860,38 +1172,55 @@ function emitFunctionCallChunk(
    chunk: LLMStreamChunk,
    itemOrKey: any,
    state: OpenAIResponsesStreamState,
@@ -1726,7 +1775,7 @@ index 1be02a5..3d3f4d0 100644
  function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
    try {
      return createFunctionCallPart(item);
-@@ -899,3 +1207,4 @@ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
+@@ -899,3 +1228,4 @@ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
      return undefined;
    }
  }
@@ -9501,10 +9550,10 @@ index 0000000..defc1e5
 +});
 diff --git a/tests/openai-responses-format-fixes.test.ts b/tests/openai-responses-format-fixes.test.ts
 new file mode 100644
-index 0000000..ad3b058
+index 0000000..f4d9cb9
 --- /dev/null
 +++ b/tests/openai-responses-format-fixes.test.ts
-@@ -0,0 +1,1648 @@
+@@ -0,0 +1,1761 @@
 +/**
 + * OpenAI Responses 格式修复（组 B：B4 strict、B5 显式缓存断点、B6 phase、B8 服务端 compaction）。
 + *
@@ -10860,6 +10909,119 @@ index 0000000..ad3b058
 +    expect(JSON.stringify(body.input)).not.toContain('prompt_cache_breakpoint');
 +    expect(body.input).toHaveLength(3);
 +    expect(body.prompt_cache_options).toEqual({ mode: 'explicit', ttl: '30m' });
++  });
++});
++
++describe('explicit 续接链：breakpoints.toolOutputs 让工具结果以数组形式承载断点', () => {
++  // 依据：https://developers.openai.com/api/docs/guides/prompt-caching（Multi-turn agent 示例：
++  // “A breakpoint is added after each tool result”，断点放在 function_call_output 数组形式的 input_text 上）；
++  // Responses create 参考：function_call_output 的 output 为 “string or array of ResponseInputTextContent ...”，
++  // 只有数组里的 input_text / input_image / input_file 接受 prompt_cache_breakpoint。
++  const BREAKPOINT = { mode: 'explicit' };
++  const withToolOutputs = (model = 'gpt-5.6', extra: Record<string, unknown> = {}) => new OpenAIResponsesFormat(model, {
++    enabled: true, mode: 'explicit', breakpoints: { messages: true, toolOutputs: true }, ...extra,
++  });
++  const LOOP_TWO_CALLS: LLMRequest = {
++    contents: [
++      ...TOOL_LOOP_REQUEST.contents,
++      { role: 'model', parts: [
++        { functionCall: { name: 'read_file', args: { path: 'b.txt' }, callId: 'call_2' } },
++        { functionCall: { name: 'read_file', args: { path: 'c.txt' }, callId: 'call_3' } },
++      ] },
++      { role: 'user', parts: [
++        { functionResponse: { name: 'read_file', response: { content: 'bee' }, callId: 'call_2' } },
++        { functionResponse: { name: 'read_file', response: { content: 'sea' }, callId: 'call_3' } },
++      ] },
++    ],
++  };
++  const withoutBreakpoints = (value: unknown) => JSON.parse(JSON.stringify(value, (key, child) =>
++    key === 'prompt_cache_breakpoint' ? undefined : child));
++
++  it('工具循环：所有工具结果转成 input_text 数组，断点只落在最新的工具结果上', () => {
++    const body = withToolOutputs().encodeRequest(TOOL_LOOP_REQUEST, true) as any;
++    expect(body.input).toEqual([
++      { role: 'user', content: [{ type: 'input_text', text: 'read a.txt' }] },
++      { type: 'function_call', call_id: 'call_1', name: 'read_file', arguments: '{"path":"a.txt"}' },
++      { type: 'function_call_output', call_id: 'call_1', output: [
++        { type: 'input_text', text: '{"content":"hello"}', prompt_cache_breakpoint: BREAKPOINT },
++      ] },
++    ]);
++    expect(body.prompt_cache_options).toEqual({ mode: 'explicit', ttl: '30m' });
++  });
++
++  it('同一组并行工具结果：全部是数组形式，只在最后一个打断点', () => {
++    const body = withToolOutputs().encodeRequest(LOOP_TWO_CALLS, true) as any;
++    const outputs = body.input.filter((item: any) => item.type === 'function_call_output');
++    expect(outputs.map((item: any) => item.output)).toEqual([
++      [{ type: 'input_text', text: '{"content":"hello"}' }],
++      [{ type: 'input_text', text: '{"content":"bee"}' }],
++      [{ type: 'input_text', text: '{"content":"sea"}', prompt_cache_breakpoint: BREAKPOINT }],
++    ]);
++    expect(JSON.stringify(body.input).split('prompt_cache_breakpoint').length - 1).toBe(1);
++  });
++
++  it('后一请求只在断点标记上与前一请求不同：去掉断点后前一请求的 input 是后一请求的前缀', () => {
++    const format = withToolOutputs('gpt-6-astra');
++    const request = { systemInstruction: { parts: [{ text: 'stable' }] } };
++    const first = format.encodeRequest({ ...request, ...TOOL_LOOP_REQUEST }, true) as any;
++    const second = format.encodeRequest({ ...request, ...LOOP_TWO_CALLS }, true) as any;
++    expect(first.input[0]).toEqual({ role: 'developer', content: [{ type: 'input_text', text: 'stable', prompt_cache_breakpoint: BREAKPOINT }] });
++    expect(withoutBreakpoints(second.input.slice(0, first.input.length))).toEqual(withoutBreakpoints(first.input));
++    expect(first.input.at(-1).output[0].prompt_cache_breakpoint).toEqual(BREAKPOINT);
++    expect(second.input[first.input.length - 1].output[0].prompt_cache_breakpoint).toBeUndefined();
++  });
++
++  it('已是数组形式（带附件）的工具结果保持原样，断点落在最后一个内容块', () => {
++    const body = withToolOutputs().encodeRequest({
++      contents: [
++        { role: 'user', parts: [{ text: 'shot' }] },
++        { role: 'model', parts: [{ functionCall: { name: 'screenshot', args: {}, callId: 'call_s' } }] },
++        { role: 'user', parts: [{ functionResponse: {
++          name: 'screenshot', response: { ok: true }, callId: 'call_s',
++          parts: [{ inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' } }],
++        } }] },
++      ],
++    }, true) as any;
++    const output = body.input.at(-1).output;
++    expect(output[0]).toEqual({ type: 'input_text', text: '{"ok":true}' });
++    expect(output.at(-1)).toMatchObject({ type: 'input_image', prompt_cache_breakpoint: BREAKPOINT });
++  });
++
++  it('providerContext 回放的字符串工具结果换成新对象转换，不改动原始 item', () => {
++    const rawOutput = { type: 'function_call_output', call_id: 'call_raw', output: 'raw result' };
++    const body = withToolOutputs().encodeRequest({
++      contents: [
++        { role: 'user', parts: [{ text: 'go' }] },
++        { role: 'user', parts: [{ providerContext: { provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'function_call_output', rawItem: rawOutput } }] },
++      ],
++    }, true) as any;
++    expect(body.input.at(-1)).toEqual({ type: 'function_call_output', call_id: 'call_raw', output: [
++      { type: 'input_text', text: 'raw result', prompt_cache_breakpoint: BREAKPOINT },
++    ] });
++    expect(rawOutput.output).toBe('raw result');
++  });
++
++  it('只在 explicit 且模型支持显式缓存、消息断点开启时生效；其他组合与不开启时逐字节一致', () => {
++    const same = (withFlag: OpenAIResponsesFormat, without: OpenAIResponsesFormat, request: LLMRequest) =>
++      expect(JSON.stringify(withFlag.encodeRequest(request, true))).toBe(JSON.stringify(without.encodeRequest(request, true)));
++    for (const request of [TOOL_LOOP_REQUEST, LOOP_TWO_CALLS, HISTORY_REQUEST]) {
++      same(new OpenAIResponsesFormat('gpt-5.6', { enabled: true, mode: 'key', key: 'k1', breakpoints: { toolOutputs: true } }),
++        new OpenAIResponsesFormat('gpt-5.6', { enabled: true, mode: 'key', key: 'k1' }), request);
++      same(new OpenAIResponsesFormat('gpt-5.6', { enabled: true, mode: 'implicit', breakpoints: { toolOutputs: true } }),
++        new OpenAIResponsesFormat('gpt-5.6', { enabled: true, mode: 'implicit' }), request);
++      same(new OpenAIResponsesFormat('gpt-5.6', { enabled: false, mode: 'explicit', breakpoints: { toolOutputs: true } }),
++        new OpenAIResponsesFormat('gpt-5.6'), request);
++      same(new OpenAIResponsesFormat('gpt-5.5', { enabled: true, mode: 'explicit', breakpoints: { toolOutputs: true } }),
++        new OpenAIResponsesFormat('gpt-5.5', { enabled: true, mode: 'explicit' }), request);
++      same(new OpenAIResponsesFormat('gpt-5.6', { enabled: true, mode: 'explicit', breakpoints: { messages: false, toolOutputs: true } }),
++        new OpenAIResponsesFormat('gpt-5.6', { enabled: true, mode: 'explicit', breakpoints: { messages: false } }), request);
++    }
++  });
++
++  it('compact 请求不注入缓存，工具结果仍是字符串形式', () => {
++    const body = withToolOutputs().encodeCompactRequest(TOOL_LOOP_REQUEST) as any;
++    expect(body.input.at(-1)).toEqual({ type: 'function_call_output', call_id: 'call_1', output: '{"content":"hello"}' });
++    expect(JSON.stringify(body)).not.toContain('prompt_cache');
 +  });
 +});
 +

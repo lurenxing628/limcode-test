@@ -4,7 +4,7 @@
 
 - 上游：`https://github.com/Lianues/unified-llm-provider`，许可证 MIT。
 - 基础发布：0.1.37，源码提交 `7857da99d5faec0865b8a402eb9c9d828f87b114`（上游 main，已含 schema 属性名误删、tools 非数组两个修复）。
-- 本地构建：0.1.37-limcode.5，内容如下。
+- 本地构建：0.1.37-limcode.6，内容如下。
 - 完整源码分支已发布在 https://github.com/lurenxing628/unified-llm-provider/tree/limcode/provider-fixes （本目录的补丁即该分支相对基础提交的差异）。
 
 limcode.2 带来的内容（保持不变）：
@@ -41,6 +41,10 @@ limcode.4 新增的 GPT-6 家族适配（依据 OpenAI 官方 Using GPT-6 与提
 limcode.5 新增 Claude 消息中段 system 消息（依据 Anthropic 官方 mid-conversation system messages 文档）：
 - 统一请求可携带轮内 system 消息，Claude 格式编码为 `{"role":"system","clear_at":"next_user_message","content":[...]}`，只放文本块、不带 `cache_control`，消息级缓存断点落在它之前最后一条 user 消息上。
 - 仅在调用方显式提供这种消息时出现；其他格式收到时直接报错，普通请求逐字节不变。
+
+limcode.6 新增 Responses 显式缓存下工具结果承载断点（依据 OpenAI 官方提示缓存指南与 WebSocket 模式指南）：
+- 新的可选项 `breakpoints.toolOutputs`：只在显式缓存模式、且模型支持显式缓存时生效，把字符串形式的 `function_call_output` 改为 `input_text` 数组，最新的工具结果因此能带断点。
+- 只有 LimCode 的 WebSocket 续接链开启；HTTP 与未开启时编码逐字节不变。
 
 文件与命令：
 - `unified-llm-provider.patch`：相对基础提交的完整源码与测试差异，不直接作用于依赖安装目录。
