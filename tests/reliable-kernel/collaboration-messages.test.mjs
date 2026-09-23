@@ -822,8 +822,8 @@ test('a wake queued behind a running Turn keeps no poll alive; another host endi
   const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, scanIntervalMs: 20,
     wakeHandler: async request => {
       assert.equal(request.action, 'start_continuation');
-      started.push(request.deliveryId);
       await admitPending(f, 'root', 'root-after-external-end');
+      started.push(request.deliveryId);
       return { acknowledged: true };
     } });
   let scans = 0;
