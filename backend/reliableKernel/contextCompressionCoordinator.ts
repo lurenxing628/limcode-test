@@ -305,7 +305,13 @@ export class ReliableContextCompressionCoordinator {
         };
       }
     }
-    if (lastPlanningError) return lastPlanningError;
+    // The last planning error alone would hide why the earlier methods failed, for example a
+    // segmented summary beyond its leaf budget followed by a fallback that cannot admit the source.
+    if (lastPlanningError) {
+      return failures.length > 1
+        ? { ...lastPlanningError, message: compressionFallbackExhaustedMessage(attemptedMethods, failures) }
+        : lastPlanningError;
+    }
     throw new Error(compressionFallbackExhaustedMessage(attemptedMethods, failures));
   }
 
@@ -635,7 +641,11 @@ export class ReliableContextCompressionCoordinator {
         await this.modelProvider.dispatch(expectedModelRequestId, adapter, { reconnect: true });
       } catch (error) {
         if (error instanceof ModelRequestPreflightError) {
-          return compressionError(error.code, error.message, error.estimatedTokens, error.limitTokens);
+          // Callers prefix the code themselves; keep it out of the message to avoid repeating it.
+          const message = error.message.startsWith(`${error.code}: `)
+            ? error.message.slice(error.code.length + 2)
+            : error.message;
+          return compressionError(error.code, message, error.estimatedTokens, error.limitTokens);
         }
         if (isExecutionHandoffError(error)) throw error;
         throw new CompressionProviderAttemptError(attempt.methodKind, error, expectedModelRequestId);
@@ -1090,7 +1100,10 @@ function compressionFallbackExhaustedMessage(
 ): string {
   const attempted = attemptedMethods.length > 0 ? attemptedMethods.join(' → ') : '无可执行方法';
   const detail = failures.length > 0
-    ? failures.map((failure) => `${failure.methodKind}: ${failure.message}`).join('；')
+    ? failures.map((failure) => {
+      const code = failure.code && !failure.message.includes(failure.code) ? `${failure.code}: ` : '';
+      return `${failure.methodKind}: ${code}${failure.message}`;
+    }).join('；')
     : '没有可用的压缩结果。';
   return `上下文压缩后备链已耗尽（${attempted}）：${detail}`;
 }

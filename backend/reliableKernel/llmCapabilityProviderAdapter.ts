@@ -1204,23 +1204,31 @@ function requireExecutableCompressionMethod(value: unknown): NonNullable<LlmComp
   throw new TypeError(`Compression recipe method is not executable: ${String(value)}.`);
 }
 
+/**
+ * Compression admission estimate for one frozen compact request.
+ *
+ * Single-call methods send the whole source at once, so the whole source must fit. Segmented
+ * summary never sends the source at once: the Provider-side splitter packs it into at most 32
+ * rolling leaf calls, splits even one oversized message or tool exchange, and rejects every call
+ * that still cannot fit with its own `compression_request_too_large` / `compression_source_too_large`.
+ * What every leaf and the final merge must carry regardless of the source is the fixed overhead plus
+ * the prior summary, so only that is admitted here; measuring a whole Turn instead rejected long
+ * Turns the splitter handles.
+ */
 function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
   const prior = request.priorSummaryContents ?? [];
+  if (request.methodKind === 'segmented_summary') {
+    return estimateProjectedModelInput({
+      ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
+      ...(request.tools?.length ? { tools: request.tools } : {}),
+      contextContents: prior,
+      providerFramingTokens: 512
+    });
+  }
   // Claude 原生压缩带着的历史提醒已被清除，不计 token；重新注入输入的历史副本照常计入。
   const deliveries = turnReminderDeliveries(request.contents, 'claude_turn_scoped');
   const contents = request.contents.filter((content, index) =>
     !readTurnReminderMarker(content) || deliveries[index] === 'user');
-  if (request.methodKind === 'segmented_summary' && request.segments?.length) {
-    const candidates = request.segments.map((segment, index) => estimateProjectedModelInput({
-      ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
-      ...(request.tools?.length ? { tools: request.tools } : {}),
-      contextContents: index === 0 ? [...prior, ...segment] : segment,
-      providerFramingTokens: 512
-    }));
-    return candidates.reduce((largest, candidate) =>
-      candidate.fullTokens > largest.fullTokens ? candidate : largest
-    );
-  }
   return estimateProjectedModelInput({
     ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
     ...(request.tools?.length ? { tools: request.tools } : {}),
