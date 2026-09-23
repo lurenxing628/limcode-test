@@ -300,26 +300,39 @@ export class ProcessCompletionDeliveryControlPlane {
       }
     }
 
-    const wakes = await this.oldestDeliveryFirst([
+    // Only the owning Host dispatches, so ownership is settled before the send order is read.
+    const ownedWakes: Array<{ wake: DomainRow; wakeId: string; delivery: DomainRow | null; targetConversationId: string | null }> = [];
+    for (const wake of [
       ...await listAllDomainRows(this.database, 'RuntimeDeliveryWake', { state: 'pending' }),
       ...await listAllDomainRows(this.database, 'RuntimeDeliveryWake', { state: 'claimed' })
-    ]);
-    for (const wake of wakes) {
+    ]) {
       if (this.closing) break;
       const wakeId = requirePhaseFId(wake.id, 'RuntimeDeliveryWake.id');
+      try {
+        const { delivery, targetConversationId } = await this.wakeTarget(wake);
+        if (targetConversationId === null || await gate.check(targetConversationId)) {
+          ownedWakes.push({ wake, wakeId, delivery, targetConversationId });
+          continue;
+        }
+        // Read-only on a Host that does not own the target: only the owner's commit ending that
+        // Turn (a new external data version) or the Turn's recovery can move a queued send, so it
+        // keeps no poll alive here either.
+        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) waitingWakeIds.add(wakeId);
+      } catch (error) {
+        report.failures += 1;
+        this.reportError('wake', wakeId, error);
+      }
+    }
+    for (const { wake, wakeId, targetConversationId } of await this.inDispatchOrder(ownedWakes)) {
+      if (this.closing) break;
       let claim: DomainRow | null = null;
       try {
-        const targetConversationId = await this.wakeConversationId(wake);
-        const owned = targetConversationId === null || await gate.check(targetConversationId);
         // Read-only: a send queued behind its target's running Turn stays untouched (no claim,
-        // backoff or failure count) until that Turn's terminal commit triggers the next scan. On a
-        // Host that does not own the target, only the owner's commit ending that Turn (a new
-        // external data version) or the Turn's recovery can move it, so it keeps no poll alive.
+        // backoff or failure count) until that Turn's terminal commit triggers the next scan.
         if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) {
           waitingWakeIds.add(wakeId);
           continue;
         }
-        if (!owned) continue;
         claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
         if (!claim) continue;
         const claimedWake = claim;
@@ -351,24 +364,46 @@ export class ProcessCompletionDeliveryControlPlane {
   }
 
   /**
-   * Wakes ordered by their delivery's creation, oldest first. Followups queued behind one target
-   * Turn each start a Turn of their own once it ends; this order starts them in the order they were
-   * sent instead of by hash id, so a busy target never lets newer tasks overtake an older one.
+   * Owned wakes in dispatch order. Followups queued behind one target Turn each start a Turn of
+   * their own once it ends; collaboration wakes follow the message sequence their send transaction
+   * assigned, so neither equal timestamps nor a clock step back let a newer task overtake an older
+   * one. Process and answer wakes keep their delivery creation order and go first.
    */
-  private async oldestDeliveryFirst(wakes: DomainRow[]): Promise<DomainRow[]> {
-    const keyed: Array<{ wake: DomainRow; createdAt: string; deliveryId: string }> = [];
-    for (const wake of wakes) {
-      let delivery: DomainRow | null = null;
-      try {
-        delivery = await this.maybeGet('RuntimeDelivery', requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id'));
-      } catch {
-        // Malformed facts surface through the normal claimed dispatch failure path.
+  private async inDispatchOrder<T extends { wake: DomainRow; delivery: DomainRow | null }>(entries: T[]): Promise<T[]> {
+    const inboxes = await this.readEach('RuntimeInboxItem', entries.map((entry) => entry.delivery?.inbox_item_id));
+    const messages = await this.readEach('CollaborationMessage', inboxes.map((inbox) =>
+      inbox?.source_kind === 'collaboration_message' ? inbox.source_id : undefined));
+    return entries.map((entry, index) => ({
+      entry,
+      messageSeq: typeof messages[index]?.message_seq === 'bigint' ? messages[index]!.message_seq as bigint : null,
+      createdAt: String(entry.delivery?.created_at ?? ''),
+      deliveryId: String(entry.delivery?.id ?? '')
+    })).sort((left, right) => {
+      if ((left.messageSeq === null) !== (right.messageSeq === null)) return left.messageSeq === null ? -1 : 1;
+      if (left.messageSeq !== null && right.messageSeq !== null && left.messageSeq !== right.messageSeq) {
+        return left.messageSeq < right.messageSeq ? -1 : 1;
       }
-      keyed.push({ wake, createdAt: String(delivery?.created_at ?? ''), deliveryId: String(delivery?.id ?? '') });
+      return left.createdAt.localeCompare(right.createdAt)
+        || left.deliveryId.localeCompare(right.deliveryId)
+        || String(left.entry.wake.id).localeCompare(String(right.entry.wake.id));
+    }).map((keyed) => keyed.entry);
+  }
+
+  /** Point reads in one read transaction; an absent or malformed id reads as null. */
+  private async readEach(domain: string, ids: unknown[]): Promise<Array<DomainRow | null>> {
+    const wanted = ids.flatMap((id, index) => typeof id === 'string' && id.length > 0 ? [{ id, index }] : []);
+    const rows: Array<DomainRow | null> = ids.map(() => null);
+    if (wanted.length === 0) return rows;
+    try {
+      const snapshot = await this.database.snapshot(wanted.map(({ id }) => DOMAIN_REPOSITORIES.domain(domain).get(id)));
+      wanted.forEach(({ index }, position) => {
+        const row = snapshot.snapshot[position];
+        rows[index] = row && !Array.isArray(row) ? row : null;
+      });
+    } catch {
+      // Ordering is a hint: malformed facts surface through the normal claimed dispatch failure path.
     }
-    return keyed.sort((left, right) => left.createdAt.localeCompare(right.createdAt)
-      || left.deliveryId.localeCompare(right.deliveryId)
-      || String(left.wake.id).localeCompare(String(right.wake.id))).map((entry) => entry.wake);
+    return rows;
   }
 
   /** Conversation that owns this dispatch's completion chain; null defers to reconcile validation. */
@@ -420,18 +455,18 @@ export class ProcessCompletionDeliveryControlPlane {
     }
   }
 
-  /** Conversation a wake dispatches into; null defers to the dispatch-time source validation. */
-  private async wakeConversationId(wake: DomainRow): Promise<string | null> {
+  /** Delivery a wake dispatches and its Conversation; null defers to the dispatch-time source validation. */
+  private async wakeTarget(wake: DomainRow): Promise<{ delivery: DomainRow | null; targetConversationId: string | null }> {
     try {
-      const delivery = await this.maybeGet(
-        'RuntimeDelivery',
-        requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id')
-      );
-      return delivery
-        ? requirePhaseFId(delivery.target_conversation_id, 'RuntimeDelivery.target_conversation_id')
-        : null;
+      const delivery = await this.maybeGet('RuntimeDelivery', requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id'));
+      return {
+        delivery,
+        targetConversationId: delivery
+          ? requirePhaseFId(delivery.target_conversation_id, 'RuntimeDelivery.target_conversation_id')
+          : null
+      };
     } catch {
-      return null;
+      return { delivery: null, targetConversationId: null };
     }
   }
 

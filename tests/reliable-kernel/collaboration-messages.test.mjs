@@ -799,15 +799,14 @@ test('a peer continuation whose requester was deleted is refused automatic follo
 
 test('followups queued behind one Turn start their own Turns in the order they were sent', async () => fixture(async f => {
   await topLevel(f, ['peer-a', true], ['peer-d', true], ['target-b', true]);
-  // Production clocks advance between sends; the fixture's fixed clock would tie every send.
-  let tick = 0;
-  const sender = new CollaborationControlPlane(f.database, f.store, f.deliveries, { now: () => new Date(Date.parse(NOW) + (tick += 1) * 1000).toISOString() });
+  // Every send carries the same timestamp, as sends within one millisecond or after a clock step
+  // back do: only the order the sends committed in may decide.
   const sent = [];
   for (let index = 0; index < 8; index += 1) {
     const from = index % 2 ? 'peer-d' : 'peer-a';
-    const source = await f.source(`ordered-${index}`, from, `${from}-turn`, 'send_conversation_message');
-    sent.push((await sender.send({ source, targetConversationId: 'target-b', text: `task ${index}`, mode: 'followup', queueBehindActiveTurn: true, crossConversation: true })).deliveryId);
+    sent.push((await crossSend(f, `ordered-${index}`, from, `${from}-turn`, 'target-b', 'followup', `task ${index}`)).deliveryId);
   }
+  assert.deepEqual(new Set(await Promise.all(sent.map(async id => (await f.get('RuntimeDelivery', id)).created_at))), new Set([NOW]), 'fixture: one timestamp for every send');
   assert.notDeepEqual([...sent].sort(), sent, 'fixture: hash ids alone would not keep the send order');
   await endTurn(f, 'target-b-turn');
   const started = [];
