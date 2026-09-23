@@ -193,3 +193,151 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
     await fs.rm(directory, { recursive: true, force: true });
   }
 });
+
+test('native fork_conversation runs through the dispatcher and its frozen reference addresses the fork in the same request', { timeout: 30000 }, async () => {
+  const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
+  const { CollaborationToolDispatcher } = load('backend/reliableKernel/collaborationToolDispatcher.js');
+  const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
+  const { crossConversationToolModules } = load('backend/world/modules/tools/definitions/crossConversation/index.js');
+  const definitions = crossConversationToolModules.map(module => module.create({}));
+  const NOTE = 'NATIVE_FORK_NOTE_4501';
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'native-fork-dispatch-'));
+  const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
+  await kernel.initializeEmptyRuntimeRoot(root);
+  let app, collaborationTools, round = 0, forkOutput, sendOutput;
+  const dispatched = [];
+  const adapter = {
+    providerId: 'native-provider',
+    async materializeNativeToolOutput(values) { return values; },
+    async sendFullRequest(request, controls) {
+      assert.ok(controls.native, 'this must exercise nativeResponses execution');
+      round += 1;
+      let sequence = 0;
+      const event = (kind, content) => controls.onEvent({ kind, streamSeq: String(++sequence), content });
+      const control = content => event('native_control', content);
+      if (round === 1) {
+        await control({ type: 'response.created', responseId: 'response-history', capabilities });
+        await control({ type: 'response.completed', responseId: 'response-history' });
+        await event('completed', { role: 'model', parts: [{ text: 'NATIVE_FIRST_ANSWER_4502' }] });
+        return;
+      }
+      const call = (id, ordinal, name, args, responseId) => event('output_item_done', {
+        type: 'tool_calls', calls: [{ id, ordinal, name, arguments: args, async: false }],
+        outputItem: { id: `item-${id}`, ordinal, providerResponseId: responseId }
+      });
+      let finish, fail;
+      const done = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+      controls.native.onController({
+        endLogicalRequest() {}, async steer() {},
+        async submitToolResults(batch) {
+          try {
+            const [output] = batch.map(item => JSON.parse(item.output));
+            assert.doesNotMatch(JSON.stringify(output), /conversationId|native-fork-dispatch-parent/);
+            if (!forkOutput) {
+              forkOutput = output;
+              assert.equal(output.status, 'succeeded', JSON.stringify(output));
+              assert.match(output.detail.conversationRef, /^C\d+$/);
+              assert.notEqual(output.detail.conversationRef, output.detail.sourceConversationRef);
+              await control({ type: 'response.created', responseId: 'response-send', previousResponseId: 'response-fork', admittedToolResultCallIds: batch.map(item => item.callId) });
+              await call('send-to-fork', 0, 'send_conversation_message', { conversationRef: output.detail.conversationRef, text: NOTE, mode: 'message' }, 'response-send');
+              await control({ type: 'response.completed', responseId: 'response-send' });
+            } else {
+              sendOutput = output;
+              await control({ type: 'response.created', responseId: 'response-final', previousResponseId: 'response-send', admittedToolResultCallIds: batch.map(item => item.callId) });
+              await control({ type: 'response.completed', responseId: 'response-final' });
+              await event('completed', { role: 'model', parts: [{ text: 'forked and informed' }] });
+              finish();
+            }
+          } catch (error) { fail(error); throw error; }
+        }
+      });
+      await control({ type: 'response.created', responseId: 'response-fork', capabilities });
+      await call('fork-self', 0, 'fork_conversation', {}, 'response-fork');
+      await control({ type: 'response.completed', responseId: 'response-fork' });
+      await done;
+      controls.native.onController(undefined);
+    }
+  };
+  const dependencies = {
+    authorityCompiler: { async compile(request) { return {
+      turnId: request.turnId, executorAgentId: request.executorAgentId,
+      executionPreset: { content: JSON.stringify({ providerConfigId: 'native-provider', modelId: 'gpt-6-astra' }) },
+      authoritySnapshot: { content: JSON.stringify({ kind: 'effective-turn-authority',
+        turnId: request.turnId, conversationId: request.conversationId, executorAgentId: request.executorAgentId,
+        model: { providerConfigId: 'native-provider', provider: 'openai-responses', modelId: 'gpt-6-astra',
+          baseUrl: 'https://native-fixture.invalid/v1', openaiResponsesTransport: 'http',
+          nativeResponses: { enabled: true, asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false },
+          retryPolicy: { enabled: false, maxRetries: 0 } },
+        modelProfile: { compressionThresholdTokens: 100000, contextWindowTokens: 128000,
+          tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
+        toolPolicy: { id: 'tools', allowedTools: definitions.map(tool => tool.declaration.name), preset: 'custom',
+          toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } }, sourceConfigs: {} },
+        planReviewPolicy: { mode: 'never' }, systemPrompt: { id: 'prompt', text: '' },
+        runtimeContext: { id: null, name: '', template: '' },
+        workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
+      }) }
+    }; } },
+    resolveWorkEnvironment: async () => undefined,
+    mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { throw new Error('unused'); } },
+    mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
+    attachmentSettings: { async loadGlobalSettings() { return { section: 'attachments', settings: { maxStoredInlineFileMb: 25 }, filePath: 'unused' }; } },
+    providers: { resolve() { return adapter; } },
+    createToolDispatcher: ({ database, contentStore, runtime, files, fileMutations, processes, mcp, interactions }) => new ReliableToolDispatcher({
+      database, contentStore, effects: runtime.effects, files, fileMutations, processes, mcp, interactions,
+      host: {
+        definitions: () => definitions,
+        async dispatchSpecial(_definition, input, authority, signal) {
+          dispatched.push(input.toolName);
+          return collaborationTools.dispatch(input, signal, authority);
+        }
+      }
+    })
+  };
+  const drive = async (key, content) => {
+    const started = await app.turns.input({ source: { kind: 'command', key }, conversationId: 'native-fork-dispatch-parent', leaseOwnerId: 'fixture',
+      hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content });
+    const [lease] = await rows(app, 'ExecutionLease', { turn_id: started.turnId });
+    const fence = { id: lease.id, conversationId: lease.conversation_id, turnId: lease.turn_id,
+      ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) };
+    const result = await kernel.runWithExecutionLeaseFence(fence, () => app.agentLoop.drive(started.turnId));
+    if (result.terminalStatus !== 'completed') assert.fail(JSON.stringify(await rows(app, 'TurnTermination', { turn_id: started.turnId })));
+    return { ...started, result };
+  };
+  try {
+    app = await kernel.ReliableKernelApplication.open(root, dependencies);
+    const lifecycle = new ReliableConversationLifecycle({ application: app, configuration: { mutations: { async copyConversationConfiguration() {} } } });
+    collaborationTools = new CollaborationToolDispatcher({ database: app.database, contentStore: app.contentStore,
+      effects: app.runtime.effects, collaboration: app.runtime.collaboration, conversations: lifecycle });
+    const now = new Date().toISOString();
+    await app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'native-fork-dispatch-parent', title: 'parent', status: 'active', created_at: now, updated_at: now }),
+      kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'native-fork-agent-link', conversation_id: 'native-fork-dispatch-parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
+    ]);
+    await drive('native-fork-history', 'NATIVE_FIRST_QUESTION_4503');
+    const second = await drive('native-fork-current', 'NATIVE_CURRENT_QUESTION_4504');
+    assert.equal(second.result.modelRequestIds.length, 1, 'fork and send share one native logical request');
+    assert.deepEqual(dispatched, ['fork_conversation', 'send_conversation_message'], 'both calls ran through the production dispatcher');
+    assert.equal(sendOutput.status, 'succeeded', JSON.stringify(sendOutput));
+    const [forkSource] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'fork-self' });
+    const forkId = kernel.stablePhaseFId('conversation', `conversation-fork:${forkSource.tool_call_id}`);
+    const [branch] = await rows(app, 'ConversationBranchLink', { target_conversation_id: forkId });
+    assert.equal(branch.source_conversation_id, 'native-fork-dispatch-parent');
+    assert.deepEqual(await rows(app, 'Turn', { conversation_id: forkId, status: 'active' }), [], 'the fork starts no Turn');
+    const transcript = (await app.runtime.collaboration.readConversation({ conversationId: forkId, targetConversationId: forkId, limit: 50 })).messages.map(message => message.text);
+    assert.ok(transcript.includes('NATIVE_FIRST_QUESTION_4503'), JSON.stringify(transcript));
+    assert.ok(!transcript.includes('NATIVE_CURRENT_QUESTION_4504'), 'the running native Turn is never copied');
+    // The frozen reference resolved to the fork, not to the caller.
+    const [sendSource] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'send-to-fork' });
+    const [sendCall] = await rows(app, 'ToolCall', { id: sendSource.tool_call_id });
+    const [argsMetadata] = await rows(app, 'ContentObject', { id: sendCall.arguments_object_id });
+    assert.equal(JSON.parse((await app.contentStore.read(argsMetadata)).toString('utf8')).targetConversationId, forkId);
+    const [target] = await rows(app, 'CollaborationMessageTargetLink', { conversation_id: forkId });
+    assert.ok(target, 'the note was addressed to the fork');
+    const refs = await readNativeRequestChildHandles(app.database, app.contentStore, second.result.modelRequestIds[0]);
+    assert.ok(refs.some(entry => entry.ref === forkOutput.detail.conversationRef && entry.target === forkId), JSON.stringify(refs));
+    assert.ok((await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT })).length >= 2, 'references freeze before each native output');
+  } finally {
+    await app?.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
