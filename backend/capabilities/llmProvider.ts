@@ -16,6 +16,12 @@ import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
 import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 import { installProviderCompatibility } from './geminiProviderAdaptation';
 import {
+  applyLearnedParameterAdaptations,
+  createProviderRequestAdaptationRetry,
+  installEncodedRequestPostProcessor,
+  type ProviderRequestTarget
+} from './providerParameterAdaptation';
+import {
   assertCanonicalProviderToolContext,
   cloneInlineDataPart,
   createMultimodalPreparationContext,
@@ -456,21 +462,22 @@ export async function startLlmProvider(
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
     };
-    const provider = installProviderCompatibility(
+    const provider = installRequestAdaptation(installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
-    );
+    ), settings);
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
-      ? installProviderCompatibility(unified.createLLMFromConfig({
+      ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model)
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
     const maxRetries = normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
+    const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(settings));
     let retryCount = 0;
     let sawRetry = false;
 
@@ -495,6 +502,8 @@ export async function startLlmProvider(
       } catch (error) {
         if (isRequestAbort(signal)) return;
         const failure = failureFromCaughtError(error);
+        // 明确的不支持参数 400：按目标记住适配后立即重发；不占普通重试次数，也不等待。
+        if (!retryControl.cancelRequested && adaptationRetry.shouldRetryImmediately(failure.rawError)) continue;
         const nextRetryCount = retryCount + 1;
         const canRetry = retryEnabled
           && !retryControl.cancelRequested
@@ -1516,7 +1525,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId),
     request.contents
   );
-  const provider = installProviderCompatibility(unified.createLLMFromConfig({
+  const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -1528,7 +1537,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model);
+  }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings);
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
@@ -1829,6 +1838,10 @@ export async function compactLlmProvider(
       && isRetryCapableCompressionMethod(methodConfig.kind)
       && methodConfig.kind !== 'segmented_summary';
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
+    // 摘要类方法在 executeSummaryProviderCall 内逐次调用自适配；这里只覆盖单次调用的原生压缩。
+    const adaptationRetry = retrySettings && methodConfig.kind === 'provider_native'
+      ? createProviderRequestAdaptationRetry(providerRequestTarget(retrySettings))
+      : undefined;
     let retryCount = 0;
     let sawRetry = false;
     const handlerOptions: LlmProviderOptions = {
@@ -1865,6 +1878,7 @@ export async function compactLlmProvider(
         }
 
         const failure = failureFromCaughtError(error);
+        if (!retryControl.cancelRequested && adaptationRetry?.shouldRetryImmediately(failure.rawError)) continue;
         const nextRetryCount = retryCount + 1;
         const canRetry = retryEnabled
           && isRetryableCompactFailure(error, failure)
@@ -2283,7 +2297,7 @@ async function buildAnthropicCompactionRequest(
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
   const configuredHeaders = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
-  const provider = installProviderCompatibility(unified.createLLMFromConfig({
+  const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: settings.provider,
     model: settings.model,
     apiKey: settings.apiKey,
@@ -2293,7 +2307,7 @@ async function buildAnthropicCompactionRequest(
     ...((request.nativeRequestBody ?? settings.requestBody) ? { requestBody: request.nativeRequestBody ?? settings.requestBody } : {}),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model);
+  }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings);
   const generationConfig = request.nativeGenerationConfig ?? settings.generationConfig;
   const systemInstruction = prependSystemInstructionPrefix(
     request.systemInstruction,
@@ -3395,7 +3409,7 @@ async function resolveSummaryProvider(
   const requestBody = summaryRequestBody(
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId), reasoningPlan
   );
-  const provider = installProviderCompatibility(unified.createLLMFromConfig({
+  const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -3407,7 +3421,7 @@ async function resolveSummaryProvider(
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders), runtimeSettings.provider, runtimeSettings.model);
+  }, registry.llmProviders), runtimeSettings.provider, runtimeSettings.model), runtimeSettings);
   return {
     provider,
     settings,
@@ -3975,11 +3989,22 @@ async function executeSummaryProviderCall(
     return requireSummaryVisibleOutput(visibleTextFromParts(response.content?.parts ?? []));
   };
 
+  // 明确的不支持参数 400：记住目标适配后立即重发同一请求；与下面按方法配置的兼容重试相互独立。
+  const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(resolved.settings));
+  const executeAdapting = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
+    for (;;) {
+      try {
+        return await execute(activeRequest);
+      } catch (error) {
+        if (signal?.aborted || !adaptationRetry.shouldRetryImmediately(failureFromCaughtError(error).rawError)) throw error;
+      }
+    }
+  };
   const initialRequest = resolved.omitUnsupportedMaxOutputTokens
     ? withoutMaxOutputTokens(request)
     : request;
   try {
-    return await execute(initialRequest);
+    return await executeAdapting(initialRequest);
   } catch (error) {
     if (options.allowCompatibilityRetry !== true) throw error;
     if (hasMaxOutputTokens(initialRequest) && isUnsupportedMaxOutputTokensError(error)) {
@@ -3990,7 +4015,7 @@ async function executeSummaryProviderCall(
         transport: resolved.settings.openaiResponsesTransport,
         removedParameter: 'max_output_tokens'
       });
-      return execute(withoutMaxOutputTokens(initialRequest));
+      return executeAdapting(withoutMaxOutputTokens(initialRequest));
     }
     if (hasMaxOutputTokens(initialRequest) && isMaxOutputTokensIncompleteError(error)) {
       const previousMaxOutputTokens = initialRequest.generationConfig!.maxOutputTokens!;
@@ -4005,7 +4030,7 @@ async function executeSummaryProviderCall(
           previousMaxOutputTokens,
           nextMaxOutputTokens
         });
-        return execute(withMaxOutputTokens(initialRequest, nextMaxOutputTokens));
+        return executeAdapting(withMaxOutputTokens(initialRequest, nextMaxOutputTokens));
       }
     }
     throw error;
@@ -4491,6 +4516,16 @@ function modelCatalogEntryToRecord(model: UnifiedModelCatalogEntry): LlmProvider
     name: model.displayName || model.label || model.name || model.id,
     ...(model.createdAt ? { createdAt: model.createdAt } : {})
   };
+}
+
+function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderRequestTarget {
+  return { providerConfigId: settings.id, provider: settings.provider, baseUrl: settings.baseUrl, model: settings.model };
+}
+
+/** 编码后请求的最终适配：按目标记住的不支持参数（进程内）。 */
+function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord): T {
+  const target = providerRequestTarget(settings);
+  return installEncodedRequestPostProcessor(provider, (request) => applyLearnedParameterAdaptations(request, target));
 }
 
 function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmProviderConfigRecord {
