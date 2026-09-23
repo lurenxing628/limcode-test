@@ -259,9 +259,11 @@ export class ReliableChildAgentCoordinator {
       leaseOwnerId: this.childLeaseOwnerId,
       leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
     });
+    const inheritedThinkingOverride = await this.dependencies.children.frozenChildThinkingOverrideForTurn(parentTurnId);
     await this.dependencies.modelProfiles.initializeConversation({
       conversationId: spawned.childConversationId,
-      model: spawned.modelSelection
+      model: spawned.modelSelection,
+      ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
     });
     if (spawned.answerBridgeId !== preview.answerBridgeId) {
       throw new Error('Plan delegation returned an unexpected AnswerBridge identity.');
@@ -1068,10 +1070,17 @@ export class ReliableChildAgentCoordinator {
   ): Promise<'resumed' | 'deferred' | 'terminal'> {
     if (!child || child.status === 'starting') return 'deferred';
     // Repairs the crash boundary between the Runtime spawn transaction and the independent
-    // settings transaction. Existing Conversation selection remains authoritative.
+    // settings transaction. Existing Conversation selection remains authoritative; the inherited
+    // thinking strength comes from the parent Turn that spawned this child, as at spawn time.
+    const [parentLink] = await this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId }, 1);
+    const parentTurnId = typeof parentLink?.parent_turn_id === 'string' ? parentLink.parent_turn_id : undefined;
+    const inheritedThinkingOverride = parentTurnId
+      ? await this.dependencies.children.frozenChildThinkingOverrideForTurn(parentTurnId)
+      : undefined;
     await this.dependencies.modelProfiles.initializeConversation({
       conversationId: requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
-      model: await this.dependencies.children.frozenModelSelectionForTurn(turnId)
+      model: await this.dependencies.children.frozenModelSelectionForTurn(turnId),
+      ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
     });
     if (await this.dependencies.turns.ownsExecutionLease({
       turnId,

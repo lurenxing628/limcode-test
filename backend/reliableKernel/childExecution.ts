@@ -36,6 +36,8 @@ import {
   type ToolTerminalResult
 } from './effectControlPlane';
 import { frozenModelSelection, frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import { childThinkingInheritanceFromAuthority, childThinkingOverrideForSpawn } from './childThinkingInheritance';
+import type { SessionThinkingOverride } from '../../shared/protocol';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import {
   frozenSkillPolicyDocument,
@@ -700,6 +702,23 @@ export class ChildExecutionControlPlane {
       turnId
     );
     return frozenModelSelection(frozen.document);
+  }
+
+  /**
+   * The thinking override a child spawned from this (parent) Turn inherits: present only when the parent
+   * conversation had “child Agents use this thinking strength” on when the Turn was frozen.
+   */
+  public async frozenChildThinkingOverrideForTurn(turnIdInput: string): Promise<SessionThinkingOverride | undefined> {
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const snapshots = await this.listRows('AuthoritySnapshot', { turn_id: turnId }, 2);
+    if (snapshots.length !== 1) throw new Error(`Turn ${turnId} must have exactly one AuthoritySnapshot.`);
+    const frozen = await readFrozenTurnAuthority(
+      this.database,
+      this.contentStore,
+      requirePhaseFId(snapshots[0].id, 'AuthoritySnapshot.id'),
+      turnId
+    );
+    return childThinkingOverrideForSpawn(childThinkingInheritanceFromAuthority(frozen.document));
   }
 
   /** Reads the immutable work-environment boundary frozen for one Turn; absent on legacy snapshots. */

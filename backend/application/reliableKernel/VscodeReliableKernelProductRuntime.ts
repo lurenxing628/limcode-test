@@ -12,6 +12,7 @@ import type {
   ReliableAgentTransientObserver
 } from '../../reliableKernel/agentLoop';
 import { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
+import { childConversationModelProfiles } from '../../reliableKernel/childThinkingInheritance';
 import { CollaborationToolDispatcher } from '../../reliableKernel/collaborationToolDispatcher';
 import { ReliableDiagnosticJournal } from '../../reliableKernel/diagnosticJournal';
 import { DebugCaptureService } from '../../reliableKernel/debugCapture/service';
@@ -396,15 +397,7 @@ export class VscodeReliableKernelProductRuntime {
         turns: application.turns,
         agentLoop: application.agentLoop,
         agents: { resolve: (input) => configuration.resolveAgent(input) },
-        modelProfiles: {
-          initializeConversation: ({ conversationId, model }) =>
-            configuration.mutations.initializeConversationModelProfile({
-              conversationId,
-              ...(model.providerConfigId ? { providerConfigId: model.providerConfigId } : {}),
-              ...(model.provider ? { provider: model.provider } : {}),
-              model: model.model
-            })
-        },
+        modelProfiles: childConversationModelProfiles(configuration.mutations),
         deliveryWakeups: application.processDeliveries,
         ownedProcessCleanup: application.childOwnedProcessCleanup,
         cancelTurnExecution: async ({ turnId, reason }) => {

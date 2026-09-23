@@ -31,6 +31,7 @@ after(() => { Module._load = originalLoad; });
 
 const kernel = load('backend/reliableKernel/index.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
+const { childConversationModelProfiles } = load('backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { ReliableChildAgentCoordinator } = load('backend/reliableKernel/childAgentCoordinator.js');
@@ -160,9 +161,8 @@ async function fixture(mode, hooks, run) {
     coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime,
       modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
       agents: { async resolve() { return { agentId: childAgent.id, agentType: 'worker' }; } },
-      modelProfiles: { initializeConversation: ({ conversationId, model, thinkingOverride }) =>
-        configuration.mutations.initializeConversationModelProfile({ conversationId, ...model,
-          ...(thinkingOverride ? { thinkingOverride } : {}) }) }
+      // Production wiring (VscodeReliableKernelProductRuntime uses the same adapter).
+      modelProfiles: childConversationModelProfiles(configuration.mutations)
     });
     runner = new ReliableConversationRunner(app, 'child-memory-owner', (error, context) => {
       runnerErrors.push({ message: error instanceof Error ? error.message : String(error), ...context });

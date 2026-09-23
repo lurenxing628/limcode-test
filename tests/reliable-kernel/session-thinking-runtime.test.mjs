@@ -24,6 +24,7 @@ Module._load = function(request, parent, isMain) { return request === 'vscode' ?
 after(() => { Module._load = originalLoad; });
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
+const { childConversationModelProfiles } = require('../../dist/extension/backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { ReliableChildAgentCoordinator } = require('../../dist/extension/backend/reliableKernel/childAgentCoordinator.js');
@@ -184,7 +185,8 @@ async function fixture(run, hooks = {}) {
     const list = async (domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 100 }))).snapshot;
     coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime, modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
       agents: { async resolve() { return { agentId: childAgent.id, agentType: 'worker' }; } },
-      modelProfiles: { initializeConversation: ({ conversationId, model, thinkingOverride }) => configuration.mutations.initializeConversationModelProfile({ conversationId, ...model, ...(thinkingOverride ? { thinkingOverride } : {}) }) }
+      // Production wiring (VscodeReliableKernelProductRuntime uses the same adapter).
+      modelProfiles: childConversationModelProfiles(configuration.mutations)
     });
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -618,6 +620,12 @@ test('勾选子继承时，实际 child generation 使用父会话当前有效 t
     const childWires = f.wires.filter(wire => wire.conversationId !== 'parent');
     assert.ok(childWires.length, 'child must issue an actual provider request');
     assert.ok(childWires.every(wire => wire.body.reasoning_effort === 'high'));
+    // Plan delegation and crash repair read the same choice from the spawning parent Turn.
+    const [child] = await f.list('ChildExecution');
+    const [parentLink] = await f.list('ChildExecutionParentLink', { child_execution_id: child.id });
+    const [parentTurn] = await f.list('Turn', { conversation_id: 'parent' });
+    assert.equal(parentLink.parent_turn_id, parentTurn.id);
+    assert.deepEqual(await f.app.runtime.children.frozenChildThinkingOverrideForTurn(parentLink.parent_turn_id), { kind: 'openai-effort', value: 'high' });
   }, {
     async send(request, controls, f) {
       const firstParentRequest = request.conversationId === 'parent'
@@ -632,6 +640,56 @@ test('勾选子继承时，实际 child generation 使用父会话当前有效 t
     }
   });
 });
+test('产品接线把父对话冻结的思考强度写入子对话记录，关闭继承时不写', async () => {
+  const source = await fs.readFile(path.resolve('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.ts'), 'utf8');
+  assert.match(source, /modelProfiles: childConversationModelProfiles\(configuration\.mutations\)/);
+  assert.doesNotMatch(source, /initializeConversation: \(\{ conversationId, model \}\)/, 'the product must not drop thinkingOverride');
+  const calls = [];
+  const store = childConversationModelProfiles({ async initializeConversationModelProfile(input) { calls.push(input); return { created: true }; } });
+  await store.initializeConversation({ conversationId: 'child', model: { providerConfigId: 'p', provider: 'claude', model: 'claude-opus-5-5' }, thinkingOverride: { kind: 'claude-effort', value: 'high' } });
+  await store.initializeConversation({ conversationId: 'other', model: { model: 'm' } });
+  assert.deepEqual(calls, [
+    { conversationId: 'child', providerConfigId: 'p', provider: 'claude', model: 'claude-opus-5-5', thinkingOverride: { kind: 'claude-effort', value: 'high' } },
+    { conversationId: 'other', model: 'm' }
+  ]);
+});
+
+test('子对话记录写入前崩溃，启动恢复补写时仍带上父对话选择的思考强度', async () => {
+  let crashed = false;
+  await fixture(async f => {
+    await f.configuration.mutations.setModelProfile({
+      scopeKind: 'conversation', scopeId: 'parent', providerConfigId: f.provider.id, provider: f.provider.provider,
+      model: f.provider.model, thinkingOverride: { kind: 'openai-effort', value: 'high' }, inheritThinkingToChildren: true
+    });
+    const mutations = f.configuration.mutations;
+    const original = mutations.initializeConversationModelProfile;
+    mutations.initializeConversationModelProfile = async function(...args) {
+      if (!crashed) { crashed = true; throw new Error('simulated crash before the child model profile'); }
+      return original.apply(this, args);
+    };
+    await f.app.agentLoop.runInput(f.input('inherit-after-crash'));
+    await f.coordinator.waitForIdle();
+    assert.ok(crashed, 'the spawn must hit the simulated crash');
+    await f.coordinator.recoverStartup();
+    await f.coordinator.waitForIdle();
+    const childWires = f.wires.filter(wire => wire.conversationId !== 'parent');
+    assert.ok(childWires.length, 'the repaired child must issue a provider request');
+    assert.ok(childWires.every(wire => wire.body.reasoning_effort === 'high'), JSON.stringify(childWires.map(wire => wire.body.reasoning_effort)));
+  }, {
+    async send(request, controls, f) {
+      const firstParentRequest = request.conversationId === 'parent'
+        && f.requests.filter(item => item.conversationId === 'parent').length === 1;
+      await controls.onEvent({
+        kind: 'completed',
+        streamSeq: '1',
+        content: { role: 'model', parts: [firstParentRequest
+          ? { id: 'inherit-crash-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check repaired thinking', prompt: 'inherit thinking' } } }
+          : { text: 'done' }] }
+      });
+    }
+  });
+});
+
 test('首次/工具新请求/下一用户请求用新覆盖；旧请求 replay 保持原快照', async () => {
   await fixture(async f => {
     await f.set('parent', 'high');

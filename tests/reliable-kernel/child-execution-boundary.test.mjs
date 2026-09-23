@@ -25,6 +25,7 @@ Module._load = function(request, parent, isMain) { return request === 'vscode' ?
 after(() => { Module._load = originalLoad; });
 
 const dist = file => require(path.join(process.cwd(), 'dist/extension', file));
+const { childConversationModelProfiles } = dist('backend/reliableKernel/childThinkingInheritance.js');
 const kernel = dist('backend/reliableKernel/index.js');
 const { VscodeConfigurationAuthority } = dist('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = dist('backend/capabilities/vscodeStorage/paths.js');
@@ -434,7 +435,8 @@ async function runtimeFixture(run, hooks) {
     });
     coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime, modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
       agents: { async resolve() { return { agentId: childAgent.id, agentType: 'worker' }; } },
-      modelProfiles: { initializeConversation: ({ conversationId, model, thinkingOverride }) => configuration.mutations.initializeConversationModelProfile({ conversationId, ...model, ...(thinkingOverride ? { thinkingOverride } : {}) }) }
+      // Production wiring (VscodeReliableKernelProductRuntime uses the same adapter).
+      modelProfiles: childConversationModelProfiles(configuration.mutations)
     });
     const now = new Date().toISOString();
     await app.database.transaction([

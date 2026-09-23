@@ -2,6 +2,7 @@ import type { LlmGenerationConfigRecord, LlmRequestBodyRecord, LlmProviderKind, 
 import { IncompatibleSessionThinkingError, validateSessionThinkingOverride } from '../../shared/sessionThinking';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import type { PlainJsonValue } from './plainJson';
+import type { ReliableChildModelProfileStore } from './childAgentCoordinator';
 
 export interface ChildThinkingInheritance {
   inheritThinking: boolean;
@@ -70,4 +71,29 @@ function isThinkingLevel(value: PlainJsonValue | undefined): value is LlmThinkin
 
 function isRecord(value: PlainJsonValue | undefined): value is { [key: string]: PlainJsonValue } {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 子对话模型记录的唯一接线，产品与测试共用：父对话在“派出的子 Agent 也用这个思考强度”下冻结的选择，
+ * 随 thinkingOverride 一起写入子对话自己的记录（不兼容时由 initializeConversationModelProfile 丢弃）。
+ */
+export function childConversationModelProfiles(mutations: {
+  initializeConversationModelProfile(input: {
+    conversationId: string;
+    providerConfigId?: string;
+    provider?: LlmProviderKind;
+    model: string;
+    thinkingOverride?: SessionThinkingOverride;
+  }): Promise<{ created: boolean }>;
+}): ReliableChildModelProfileStore {
+  return {
+    initializeConversation: ({ conversationId, model, thinkingOverride }) =>
+      mutations.initializeConversationModelProfile({
+        conversationId,
+        ...(model.providerConfigId ? { providerConfigId: model.providerConfigId } : {}),
+        ...(model.provider ? { provider: model.provider } : {}),
+        model: model.model,
+        ...(thinkingOverride ? { thinkingOverride } : {})
+      })
+  };
 }

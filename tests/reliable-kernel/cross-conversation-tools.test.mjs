@@ -29,6 +29,7 @@ Module._load = function(request, parent, isMain) {
 after(() => { Module._load = originalLoad; });
 const kernel = load('backend/reliableKernel/index.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
+const { childConversationModelProfiles } = load('backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { ReliableChildAgentCoordinator } = load('backend/reliableKernel/childAgentCoordinator.js');
@@ -187,8 +188,8 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime,
       modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
       agents: { async resolve() { return { agentId: agent.id, agentType: 'worker' }; } },
-      modelProfiles: { initializeConversation: ({ conversationId, model }) =>
-        configuration.mutations.initializeConversationModelProfile({ conversationId, ...model }) },
+      // Production wiring (VscodeReliableKernelProductRuntime uses the same adapter).
+      modelProfiles: childConversationModelProfiles(configuration.mutations),
       deliveryWakeups: app.processDeliveries, ownedProcessCleanup: app.childOwnedProcessCleanup
     });
     runner = new ReliableConversationRunner(app, 'synthetic-cross-owner');
