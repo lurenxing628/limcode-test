@@ -896,6 +896,12 @@ test('未写允许列表的工具策略层不收窄上层，内置 Agent 与工�
     assert.deepEqual(builtin('workflow', 'builtin:review').allowedTools, blueprints.workflows.review.toolPolicy.allowedTools);
     assert.equal(builtin('workflow', 'builtin:plan'), undefined, 'a workflow without its own list narrows nothing');
     assert.equal(client.toolPolicies.find((record) => record.id === client.toolPolicyScopeLinks.find((link) => link.scopeKind === 'global').toolPolicyId).allowedTools, undefined);
+    // The settings page shows MCP servers as the backend admits them only if the built-in records carry the same deny.
+    const { TOOL_POLICY_ALL_MCP_SOURCES } = require('../../dist/extension/shared/protocol.js');
+    for (const [scopeKind, scopeId] of [['agent', 'explore'], ['agent', 'reviewer'], ['workflow', 'builtin:readonly'], ['workflow', 'builtin:review']]) {
+      assert.deepEqual(builtin(scopeKind, scopeId).sourceConfigs, { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } }, `${scopeKind}:${scopeId} carries the all-sources deny`);
+    }
+    for (const scopeId of ['main', 'worker']) assert.equal(builtin('agent', scopeId).sourceConfigs, undefined, `${scopeId} keeps MCP servers`);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -926,6 +932,18 @@ test('MCP 全来源拒绝只由内置只读范围携带，更具体的层不能�
   const listless = resolve(global, toolPolicyScopeLayer('agent', { toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } } }, builtin));
   assert.equal(toolAllowedByPolicy(listless, tool('exa')), false, 'a list-less record at the scope keeps the restriction');
   assert.deepEqual(listless.allowedTools, [...builtin.allowedTools].sort());
+
+  // A source no layer configures falls back to the all-sources deny, even when the scope's own list names its tool.
+  const listed = resolve(global, toolPolicyScopeLayer('agent', { allowedTools: ['read', 'third_tool'] }, builtin));
+  assert.ok(listed.allowedTools.includes('third_tool'));
+  assert.equal(toolAllowedByPolicy(listed, tool('third')), false, 'the deny, not the list, decides an unconfigured source');
+  assert.equal(toolAllowedByPolicy({ allowedTools: ['third_tool'], sourceConfigs: denyAll }, tool('third')), false);
+  assert.equal(toolAllowedByPolicy({ allowedTools: ['third_tool'], sourceConfigs: {} }, tool('third')), true, 'without any setting the list decides');
+
+  // Only an absent list keeps the built-in list; any other stored value fails closed at a built-in scope too.
+  for (const malformed of [null, '', 0, false, 'read']) {
+    assert.throws(() => resolve(global, toolPolicyScopeLayer('agent', { allowedTools: malformed }, builtin)), /allowedTools/, `${JSON.stringify(malformed)} at a built-in scope`);
+  }
 
   const optedIn = resolve(global, toolPolicyScopeLayer('agent', { sourceConfigs: { exa: { enabled: true }, other: { enabled: true, disabledTools: ['other_hidden'] } } }, builtin));
   assert.equal(toolAllowedByPolicy(optedIn, tool('exa')), true, 'the scope enables its own source');

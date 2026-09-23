@@ -66,7 +66,7 @@ async function fixture(run, { policy } = {}) {
     provider: 'openai-compatible', baseUrl: 'https://example.invalid/v1', model: 'gpt-6-astra',
     models: [{ id: 'gpt-6-astra', name: 'synthetic' }], modelConfigs: [], generationConfig: {}, contextWindowTokens: 200000 };
   const offered = new Map(), results = new Map(), errors = [];
-  let app, runner;
+  let app, runner, dispatcher;
   try {
     await save('llmProviderConfigs', { configs: [provider] });
     await save('llm', { activeProviderConfigId: provider.id });
@@ -112,8 +112,8 @@ async function fixture(run, { policy } = {}) {
           await controls.onEvent({ kind: 'completed', streamSeq: '1', content: forge ? forged() : answer('done') });
         } catch (error) { errors.push(error); await controls.onEvent({ kind: 'completed', streamSeq: '1', content: answer('assertion failed') }); }
       } }; } },
-      createToolDispatcher: dependencies => new ReliableToolDispatcher({ ...dependencies, effects: dependencies.runtime.effects,
-        host: { definitions: () => definitions } })
+      createToolDispatcher: dependencies => (dispatcher = new ReliableToolDispatcher({ ...dependencies, effects: dependencies.runtime.effects,
+        host: { definitions: () => definitions } }))
     });
     const now = new Date().toISOString();
     await app.database.transaction(Object.entries(conversations).flatMap(([id, { agentId }]) => [
@@ -135,7 +135,7 @@ async function fixture(run, { policy } = {}) {
       assert.equal(termination?.terminal_status, 'completed', `${id} Turn did not complete`);
       turns[id] = started.turnId;
     }
-    await run({ app, offered, results, turns, gate: new FrozenAuthorityMcpPolicyGate(app.database, app.contentStore) });
+    await run({ app, offered, results, turns, dispatcher, gate: new FrozenAuthorityMcpPolicyGate(app.database, app.contentStore) });
     assert.deepEqual(errors, []);
   } finally {
     runner?.dispose();
@@ -145,6 +145,8 @@ async function fixture(run, { policy } = {}) {
 }
 
 const offeredMcp = (offered, id) => (offered.get(id) ?? []).filter(name => MCP_NAMES.includes(name)).sort();
+/** The dispatcher's own offering for a Turn, before the provider adapter filters the request again. */
+const dispatcherMcp = async ({ dispatcher, turns }, id) => (await dispatcher.definitions(turns[id])).map(tool => tool.name).filter(name => MCP_NAMES.includes(name)).sort();
 
 async function forgedCallAllowed({ app, turns, gate }, conversationId) {
   const calls = (await rows(app, 'ToolCall', { turn_id: turns[conversationId] })).filter(call => call.tool_name === 'exa_search');
@@ -157,9 +159,11 @@ test('an MCP server enabled globally reaches ordinary Agents but never the built
     const { offered, results } = state;
     for (const id of ['explore', 'reviewer', 'readonly', 'review']) {
       assert.deepEqual(offeredMcp(offered, id), [], `${id} must not be offered MCP tools`);
+      assert.deepEqual(await dispatcherMcp(state, id), [], `the dispatcher itself must not offer ${id} MCP tools`);
     }
     for (const id of ['main', 'custom', 'saved']) {
       assert.deepEqual(offeredMcp(offered, id), MCP_NAMES, `${id} keeps the globally enabled MCP servers`);
+      assert.deepEqual(await dispatcherMcp(state, id), MCP_NAMES);
     }
     for (const id of ['explore', 'readonly']) {
       assert.notEqual(results.get(id)?.status, 'succeeded', `${id} forged MCP call must not run`);
@@ -176,6 +180,8 @@ test('a list-less record at the read-only scope keeps the MCP restriction; only 
     assert.deepEqual(offeredMcp(offered, 'review'), []);
     // The opt-in: enabling a source in the Agent's own source settings admits that source only.
     assert.deepEqual(offeredMcp(offered, 'explore'), ['exa_search']);
+    assert.deepEqual(await dispatcherMcp(state, 'explore'), ['exa_search']);
+    assert.deepEqual(await dispatcherMcp(state, 'readonly'), []);
     assert.equal(await forgedCallAllowed(state, 'explore'), true);
     // A conversation below a read-only workflow cannot re-enable what the workflow denies.
     assert.deepEqual(offeredMcp(offered, 'readonly'), []);
@@ -193,4 +199,90 @@ test('the MCP source admission contract names the key the code uses', async () =
   const { TOOL_POLICY_ALL_MCP_SOURCES } = load('shared/protocol.js');
   const contract = JSON.parse(await fs.readFile(path.resolve('docs/architecture/reliable-kernel/contracts/tool.json'), 'utf8'));
   assert.ok(contract.mcpCapability.sourceAdmission.includes(`全来源拒绝'${TOOL_POLICY_ALL_MCP_SOURCES}'`));
+});
+
+/**
+ * Admission as a directly dispatched ToolCall with no provider declaration to match, so only the
+ * dispatcher's own frozen-policy check can refuse it.
+ */
+async function directAdmission({ declaration, toolPolicy }) {
+  const document = {
+    toolPolicy: { allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {}, ...toolPolicy },
+    planReviewPolicy: { mode: 'off' },
+    workEnvironmentPolicy: { enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
+  };
+  const records = {
+    ToolCall: [{ id: 'call', turn_id: 'turn', tool_name: declaration.name, call_seq: 1n, status: 'pending' }],
+    AuthoritySnapshot: [{ id: 'authority', turn_id: 'turn', content_object_id: 'authority-content' }],
+    ContentObject: [{ id: 'authority-content' }],
+    Turn: [{ id: 'turn', conversation_id: 'conversation', status: 'active' }]
+  };
+  const matching = read => (records[read.domain] ?? []).filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
+  const settlements = [];
+  const reached = [];
+  const dispatcher = new ReliableToolDispatcher({
+    database: {
+      async snapshot(reads) { return { snapshot: reads.map(read => read.kind === 'get' ? (records[read.domain] ?? []).find(row => row.id === read.id) : matching(read)) }; },
+      async snapshotAll(read) { return { snapshot: matching(read) }; }
+    },
+    contentStore: { async read() { return Buffer.from(JSON.stringify(document)); } },
+    effects: {
+      subscribeToolModelResults() { return () => {}; },
+      async finalizeReadyInOrder() {},
+      async readTerminalResult() { return null; },
+      async settleWithoutEffect(input) { settlements.push(input); return { status: input.status }; }
+    },
+    mcp: { async prepare() { reached.push('mcp'); throw new Error('The MCP effect plane is not part of this fixture.'); } },
+    host: { definitions: () => [{ execution: 'runtime', declaration, async execute() { throw new Error('not reached'); } }] }
+  });
+  await dispatcher.dispatch({ turnId: 'turn', modelRequestId: 'request', toolCallId: 'call', toolName: declaration.name, arguments: {} }).catch(() => undefined);
+  return { rejected: settlements.filter(entry => entry.status === 'rejected').map(entry => entry.detail.reason), reached };
+}
+
+test('dispatch admission refuses an MCP call its source settings deny, even when the frozen list names it', async () => {
+  const { TOOL_POLICY_ALL_MCP_SOURCES } = load('shared/protocol.js');
+  const declaration = { ...mcpTool('exa', 'exa_search').declaration };
+  for (const sourceConfigs of [{ [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } }, { exa: { enabled: false } }, { exa: { enabled: true, disabledTools: ['exa_search'] } }]) {
+    const denied = await directAdmission({ declaration, toolPolicy: { allowedTools: ['exa_search'], sourceConfigs } });
+    assert.deepEqual(denied.rejected, ['冻结 ToolPolicy 不允许工具 exa_search。'], JSON.stringify(sourceConfigs));
+    assert.deepEqual(denied.reached, []);
+  }
+  const allowed = await directAdmission({ declaration, toolPolicy: { allowedTools: [], sourceConfigs: { exa: { enabled: true } } } });
+  assert.deepEqual(allowed.rejected, [], 'an enabled source is admitted without a list entry');
+  assert.deepEqual(allowed.reached, ['mcp']);
+});
+
+test('the request token estimate counts only the tools the frozen policy admits, MCP included', () => {
+  const { estimateRequestAuthorityTokens } = load('backend/reliableKernel/contextTokenEstimator.js');
+  const { TOOL_POLICY_ALL_MCP_SOURCES } = load('shared/protocol.js');
+  const read = { name: 'read', description: 'Read a file.', parameters: { type: 'object' } };
+  const search = { name: 'exa_search', description: 'Search the web with a long description. '.repeat(20), parameters: { type: 'object', properties: { query: { type: 'string' } } },
+    source: { kind: 'mcp', sourceId: 'exa' } };
+  const estimate = toolPolicy => estimateRequestAuthorityTokens({ toolPolicy }, { tools: [read, search] });
+  const readOnly = estimateRequestAuthorityTokens({ toolPolicy: { allowedTools: ['read'] } }, { tools: [read] });
+  const both = estimateRequestAuthorityTokens({ toolPolicy: { allowedTools: ['read', 'exa_search'] } }, { tools: [read, search] });
+  assert.ok(both > readOnly);
+  assert.equal(estimate({ allowedTools: ['read', 'exa_search'], sourceConfigs: { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } } }), readOnly, 'an all-sources deny drops the listed MCP tool');
+  assert.equal(estimate({ allowedTools: ['read', 'exa_search'], sourceConfigs: { exa: { enabled: false } } }), readOnly, 'a disabled source drops it');
+  assert.equal(estimate({ allowedTools: ['read'], sourceConfigs: { exa: { enabled: true } } }), both, 'an enabled source counts without a list entry');
+  assert.equal(estimate({ allowedTools: ['read', 'exa_search'] }), both, 'an unconfigured source falls back to the list');
+});
+
+test('every MCP enforcement point named by the contract decides through the shared rule', async () => {
+  const contract = JSON.parse(await fs.readFile(path.resolve('docs/architecture/reliable-kernel/contracts/tool.json'), 'utf8'));
+  const points = {
+    '工具提供': 'backend/reliableKernel/toolDispatcher.ts',
+    '派发准入': 'backend/reliableKernel/toolDispatcher.ts',
+    'Provider适配器': 'backend/reliableKernel/llmCapabilityProviderAdapter.ts',
+    'token估算': 'backend/reliableKernel/contextTokenEstimator.ts',
+    'MCP policy gate': 'backend/reliableKernel/frozenMcpPolicyGate.ts',
+    '设置页': 'webview/src/components/settings/tools/ToolPolicyEditor.vue'
+  };
+  for (const [point, file] of Object.entries(points)) {
+    assert.ok(contract.mcpCapability.sourceAdmission.includes(point), `the contract names ${point}`);
+    const source = await fs.readFile(path.resolve(file), 'utf8');
+    assert.match(source, /import \{[^}]*\btoolAllowedByPolicy\b[^}]*\} from '(?:(?:\.\.\/)+|@)shared\/toolPolicyResolution'/, `${file} imports the shared rule`);
+    assert.match(source.replace(/^import[^;]*;$/gm, ''), /\btoolAllowedByPolicy\(/, `${file} calls the shared rule`);
+  }
+  // The behaviour behind each point is pinned above (offering, admission, estimate, gate) and in the settings view tests.
 });

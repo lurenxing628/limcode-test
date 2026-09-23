@@ -269,3 +269,53 @@ test('cross-conversation declarations are strict, summarize every call and class
   assert.match(byName.fork_conversation, /completed history/);
   assert.match(byName.fork_conversation, /starts no turn/);
 });
+
+/**
+ * The general dispatcher's own run_agent rule, reached by a directly dispatched ToolCall with no
+ * provider declaration to match: neither offering nor the collaboration dispatcher can mask it.
+ */
+test('general dispatch admission refuses send, create and fork without run_agent in the frozen list', async () => {
+  const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
+  const admit = async (toolName, allowedTools) => {
+    const document = {
+      toolPolicy: { allowedTools, preset: 'custom', toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } }, sourceConfigs: {} },
+      planReviewPolicy: { mode: 'off' },
+      workEnvironmentPolicy: { enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
+    };
+    const records = {
+      ToolCall: [{ id: 'call', turn_id: 'turn', tool_name: toolName, call_seq: 1n, status: 'pending' }],
+      AuthoritySnapshot: [{ id: 'authority', turn_id: 'turn', content_object_id: 'authority-content' }],
+      ContentObject: [{ id: 'authority-content' }],
+      Turn: [{ id: 'turn', conversation_id: 'conversation', status: 'active' }]
+    };
+    const matching = read => (records[read.domain] ?? []).filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
+    const settlements = [];
+    const declaration = crossConversationToolModules.map(module => module.create({})).find(tool => tool.declaration.name === toolName).declaration;
+    const dispatcher = new ReliableToolDispatcher({
+      database: {
+        async snapshot(reads) { return { snapshot: reads.map(read => read.kind === 'get' ? (records[read.domain] ?? []).find(row => row.id === read.id) : matching(read)) }; },
+        async snapshotAll(read) { return { snapshot: matching(read) }; }
+      },
+      contentStore: { async read() { return Buffer.from(JSON.stringify(document)); } },
+      effects: {
+        subscribeToolModelResults() { return () => {}; },
+        async finalizeReadyInOrder() {},
+        async readTerminalResult() { return null; },
+        async settleWithoutEffect(input) { settlements.push(input); return { status: input.status }; }
+      },
+      host: { definitions: () => [{ execution: 'backend', declaration, async execute() { throw new Error('not reached'); } }] }
+    });
+    await dispatcher.dispatch({ turnId: 'turn', modelRequestId: 'request', toolCallId: 'call', toolName, arguments: {} }).catch(() => undefined);
+    return settlements.filter(entry => entry.status === 'rejected').map(entry => entry.detail.reason);
+  };
+  const policyRefusal = /工具策略不含 run_agent/;
+  for (const toolName of ['send_conversation_message', 'create_conversation', 'fork_conversation']) {
+    const refused = await admit(toolName, [toolName]);
+    assert.equal(refused.length, 1, toolName);
+    assert.match(refused[0], policyRefusal, `${toolName} without run_agent`);
+    assert.doesNotMatch((await admit(toolName, [toolName, 'run_agent'])).join('\n'), policyRefusal, `${toolName} with run_agent passes the policy check`);
+  }
+  for (const toolName of ['list_conversations', 'read_conversation']) {
+    assert.doesNotMatch((await admit(toolName, [toolName])).join('\n'), policyRefusal, `${toolName} needs no run_agent`);
+  }
+});
