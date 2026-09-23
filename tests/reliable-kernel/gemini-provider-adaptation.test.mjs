@@ -677,3 +677,61 @@ test('E4 non-Gemini providers keep MCP schemas untouched by the Gemini sanitizer
   }, { settings: async () => providerConfig({ provider: 'openai-compatible', model: 'gpt-5.5' }) });
   assert.match(JSON.stringify(result.body.tools[0].function.parameters), /"nullableString":\{"type":\["string","null"\]/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// E5: a Gemini function call's signature stays on the call part it arrived on
+// ("return this signature in the exact part where it was received", thought-signatures doc).
+
+async function nativeGeminiStreamEvents(context, chunks) {
+  context.mock.method(globalThis, 'fetch', async () => new Response(
+    chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join(''),
+    { headers: { 'content-type': 'text/event-stream' } }
+  ));
+  const events = [];
+  await startLlmProvider({
+    id: 'request-native-gemini', invocationId: 'invocation-native-gemini', conversationId: 'conversation-native-gemini',
+    contents: [{ role: 'user', parts: [{ text: 'go' }] }],
+    tools: [{ name: 'list_items', description: 'List items.', parameters: { type: 'object', properties: {} } }]
+  }, (event) => events.push(event), { settings: async () => geminiConfig({ apiKey: 'offline-placeholder' }) });
+  assert.equal(events.some((event) => event.type === LlmEventType.Error), false);
+  return events;
+}
+
+const geminiChunk = (parts, finishReason) => ({
+  candidates: [{ content: { role: 'model', parts }, ...(finishReason ? { finishReason } : {}) }]
+});
+
+test('E5 a streamed call signature is not copied onto the preceding thought summary', async (context) => {
+  const events = await nativeGeminiStreamEvents(context, [
+    geminiChunk([{ text: 'Planning the call.', thought: true }]),
+    geminiChunk([{ functionCall: { name: 'list_items', args: {}, id: 'c1' }, thoughtSignature: 'SIG_FC' }]),
+    geminiChunk([{ text: '' }], 'STOP')
+  ]);
+  const thoughtSignatures = events
+    .filter((event) => event.type === LlmEventType.ThoughtDone || event.type === LlmEventType.ThoughtDelta)
+    .map((event) => event.payload.thoughtSignature);
+  assert.deepEqual(thoughtSignatures, [undefined, undefined]);
+  const calls = events.filter((event) => event.type === LlmEventType.ToolCall).flatMap((event) => event.payload.calls);
+  assert.deepEqual(calls.map((call) => [call.id, call.thoughtSignature]), [['c1', 'gemini:SIG_FC']]);
+});
+
+test('E5 a signed call without any thought does not create an empty thought part', async (context) => {
+  const events = await nativeGeminiStreamEvents(context, [
+    geminiChunk([{ functionCall: { name: 'list_items', args: {}, id: 'c1' }, thoughtSignature: 'SIG_FC' }], 'STOP')
+  ]);
+  assert.equal(events.some((event) => event.type === LlmEventType.ThoughtDone), false);
+  const calls = events.filter((event) => event.type === LlmEventType.ToolCall).flatMap((event) => event.payload.calls);
+  assert.deepEqual(calls.map((call) => call.thoughtSignature), ['gemini:SIG_FC']);
+});
+
+test('E5 signatures carried by thought or text parts keep their current handling', async (context) => {
+  const events = await nativeGeminiStreamEvents(context, [
+    geminiChunk([{ text: 'Thinking.', thought: true, thoughtSignature: 'SIG_THOUGHT' }]),
+    geminiChunk([{ functionCall: { name: 'list_items', args: {}, id: 'c1' }, thoughtSignature: 'SIG_FC' }]),
+    geminiChunk([{ text: 'Done.' }]),
+    geminiChunk([{ text: '', thoughtSignature: 'SIG_TEXT' }], 'STOP')
+  ]);
+  const thoughtDone = events.filter((event) => event.type === LlmEventType.ThoughtDone)
+    .map((event) => event.payload.thoughtSignature);
+  assert.deepEqual(thoughtDone, ['gemini:SIG_THOUGHT', 'gemini:SIG_TEXT']);
+});

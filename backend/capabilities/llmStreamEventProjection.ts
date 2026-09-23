@@ -430,9 +430,35 @@ function thoughtSignatureFromPart(part: UnifiedPart): string | undefined {
   return normalizedSignatureString(record.thoughtSignature) ?? portableThoughtSignatureFromMap(record.thoughtSignatures);
 }
 
+/**
+ * Chunk-level signature that belongs to a thought block. Gemini puts a function call's signature on
+ * the call part itself, and the unified Gemini decoder mirrors every part signature onto the chunk;
+ * that mirrored copy is not a thought. Treating it as one stored the call's signature a second time,
+ * on the preceding thought summary or on an extra empty thought part, although the signature must be
+ * returned "in the exact part where it was received"
+ * (https://ai.google.dev/gemini-api/docs/thought-signatures). The call keeps its own signature
+ * through the ToolCall event.
+ */
 function thoughtSignatureFromChunk(chunk: UnifiedLLMStreamChunk): string | undefined {
   const record = chunk as { thoughtSignature?: unknown; thoughtSignatures?: unknown };
-  return normalizedSignatureString(record.thoughtSignature) ?? portableThoughtSignatureFromMap(record.thoughtSignatures);
+  const signature = normalizedSignatureString(record.thoughtSignature) ?? portableThoughtSignatureFromMap(record.thoughtSignatures);
+  if (!signature || !isFunctionCallSignatureMirror(chunk, signature)) return signature;
+  return undefined;
+}
+
+function isFunctionCallSignatureMirror(chunk: UnifiedLLMStreamChunk, signature: string): boolean {
+  const value = thoughtSignatureValue(signature);
+  const carriedBy = (part: UnifiedPart): boolean => {
+    const partSignature = thoughtSignatureFromPart(part);
+    return partSignature !== undefined && thoughtSignatureValue(partSignature) === value;
+  };
+  const parts = chunk.partsDelta ?? [];
+  const callParts = [...(chunk.functionCalls ?? []), ...parts.filter(isUnifiedFunctionCallPart)];
+  return callParts.some(carriedBy) && !parts.some((part) => !isUnifiedFunctionCallPart(part) && carriedBy(part));
+}
+
+function thoughtSignatureValue(signature: string): string {
+  return parsePortableThoughtSignature(signature)?.value ?? signature;
 }
 
 function hasThoughtSignatureOnlyOutput(chunk: UnifiedLLMStreamChunk): boolean {
