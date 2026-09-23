@@ -231,9 +231,10 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
           const added = this.crossConversationToolsFor(scopeKind, scopeId).expected.filter((name) => !current.includes(name));
           allowedTools = [...current, ...added];
           granted = uniqueNames([...previous.filter((name) => current.includes(name)), ...added]);
-        } else if (value === undefined && this.inheritedToolConfigValue(scopeKind, scopeId, SUB_AGENT_TOOL_NAME, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY)?.value === true) {
-          // Restoring inheritance while an upper layer keeps the switch on: this scope still needs
-          // the tools, and they stay marked so a later switch-off here removes them.
+        } else if (value === undefined && this.crossConversationOnWithoutOwnValue(scopeKind, scopeId)) {
+          // Restoring inheritance while another layer keeps the switch on for Turns this list
+          // bounds: this scope still needs the tools, and they stay marked so a later switch-off
+          // here removes them.
           granted = previous.filter((name) => current.includes(name));
         } else {
           allowedTools = current.filter((name) => !previous.includes(name));
@@ -381,6 +382,28 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         if (value !== undefined) return { value: value as ToolConfigValue, from: scope.scopeKind };
       }
       return undefined;
+    },
+    /**
+     * Whether the cross-conversation switch stays on for some Turn this scope's list bounds once the
+     * scope's own value is gone: an upper layer turns it on, or, since an Agent and a workflow run
+     * together, some workflow (at an Agent scope) or some Agent (at a workflow scope) turns it on
+     * over global.
+     */
+    crossConversationOnWithoutOwnValue(scopeKind: ToolPolicyScopeKind, scopeId?: string): boolean {
+      const key = CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY;
+      if (this.inheritedToolConfigValue(scopeKind, scopeId, SUB_AGENT_TOOL_NAME, key)?.value === true) return true;
+      const partner = scopeKind === 'agent' ? 'workflow' : scopeKind === 'workflow' ? 'agent' : undefined;
+      if (!partner) return false;
+      const clientState = useClientStateStore();
+      const globalValue = this.layerFor({ scopeKind: 'global' })?.policy.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key];
+      const partnerIds = uniqueNames([
+        ...clientState.builtinToolPolicies.filter((record) => record.scopeKind === partner).map((record) => record.scopeId),
+        ...clientState.toolPolicyScopeLinks
+          .filter((link) => link.role === 'active' && link.scopeKind === partner)
+          .map((link) => link.scopeId?.trim() ?? '')
+      ]);
+      return partnerIds.some((partnerId) =>
+        (this.layerFor({ scopeKind: partner, scopeId: partnerId })?.policy.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key] ?? globalValue) === true);
     },
     /** A child task's conversation: cross-conversation tools are never offered there. */
     isChildConversation(conversationId: string | undefined): boolean {

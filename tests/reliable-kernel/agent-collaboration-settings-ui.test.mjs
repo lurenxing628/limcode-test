@@ -632,6 +632,44 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(store.localPolicyFor('conversation', 'one').policy.allowedTools.includes('create_conversation'), false);
     });
 
+    await t.test('在工作流或 Agent 恢复继承时，与它组合运行的 Agent 或工作流仍开着开关，就保留开关加入的工具', async () => {
+      const added = ['list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'];
+      const crossTools = (chain) => store => store.resolveScopes(chain).allowedTools.filter((name) => added.includes(name)).sort();
+      {
+        const { store } = fresh(allDefinitions);
+        store.setPolicyForScope('agent', 'agent:a', undefined, 'A', switchOn);
+        store.setPolicyForScope('workflow', 'wf', ['read_file', 'run_agent'], 'W');
+        store.setCrossConversationCollaborationForScope('workflow', 'wf', true);
+        store.setCrossConversationCollaborationForScope('workflow', 'wf', undefined);
+        assert.deepEqual(store.localPolicyFor('workflow', 'wf').policy.allowedTools, ['read_file', 'run_agent', ...added],
+          'Agent A keeps the switch on and runs under this workflow, so the workflow keeps the tools');
+        const aUnderW = [{ scopeKind: 'global' }, { scopeKind: 'agent', scopeId: 'agent:a' }, { scopeKind: 'workflow', scopeId: 'wf' }];
+        assert.equal(store.resolveScopes(aUnderW).toolConfigs.run_agent.config.crossConversationCollaboration, true);
+        assert.deepEqual(crossTools(aUnderW)(store), sorted(added));
+        store.setCrossConversationCollaborationForScope('workflow', 'wf', false);
+        assert.deepEqual(store.localPolicyFor('workflow', 'wf').policy.allowedTools, ['read_file', 'run_agent'], 'a later switch-off still removes exactly them');
+      }
+      {
+        const { store } = fresh(allDefinitions);
+        store.setPolicyForScope('workflow', 'wf', undefined, 'W', switchOn);
+        store.setPolicyForScope('agent', 'agent:b', ['read_file', 'run_agent'], 'B');
+        store.setCrossConversationCollaborationForScope('agent', 'agent:b', true);
+        store.setCrossConversationCollaborationForScope('agent', 'agent:b', undefined);
+        assert.deepEqual(store.localPolicyFor('agent', 'agent:b').policy.allowedTools, ['read_file', 'run_agent', ...added],
+          'a workflow that turns the switch on still needs the tools in the Agent list');
+        assert.deepEqual(crossTools([{ scopeKind: 'global' }, { scopeKind: 'agent', scopeId: 'agent:b' }, { scopeKind: 'workflow', scopeId: 'wf' }])(store), sorted(added));
+      }
+      {
+        // With the switch off everywhere else, restoring removes what the switch added.
+        const { store } = fresh(allDefinitions);
+        store.setPolicyForScope('agent', 'agent:off', undefined, 'Off', { run_agent: { config: { crossConversationCollaboration: false } } });
+        store.setPolicyForScope('workflow', 'wf', ['read_file', 'run_agent'], 'W');
+        store.setCrossConversationCollaborationForScope('workflow', 'wf', true);
+        store.setCrossConversationCollaborationForScope('workflow', 'wf', undefined);
+        assert.deepEqual(store.localPolicyFor('workflow', 'wf').policy.allowedTools, ['read_file', 'run_agent']);
+      }
+    });
+
     await t.test('只改审批、预设或协作上限时不给本层新建工具列表，内置只读 Agent 仍保持只读', async () => {
       const { client, store, bindings } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;
