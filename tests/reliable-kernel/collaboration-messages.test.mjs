@@ -744,3 +744,28 @@ test('a peer continuation whose requester was deleted is refused automatic follo
   assert.equal((await crossSend(f, 'b-tells-c', 'target-b', 'b-working', 'third-c', 'message')).accepted, true, 'plain messages still work');
   assert.equal((await f.rows('CollaborationRequest')).length, 1, 'a refused followup spends nothing');
 }));
+
+test('followups queued behind one Turn start their own Turns in the order they were sent', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['peer-d', true], ['target-b', true]);
+  // Production clocks advance between sends; the fixture's fixed clock would tie every send.
+  let tick = 0;
+  const sender = new CollaborationControlPlane(f.database, f.store, f.deliveries, { now: () => new Date(Date.parse(NOW) + (tick += 1) * 1000).toISOString() });
+  const sent = [];
+  for (let index = 0; index < 8; index += 1) {
+    const from = index % 2 ? 'peer-d' : 'peer-a';
+    const source = await f.source(`ordered-${index}`, from, `${from}-turn`, 'send_conversation_message');
+    sent.push((await sender.send({ source, targetConversationId: 'target-b', text: `task ${index}`, mode: 'followup', queueBehindActiveTurn: true, crossConversation: true })).deliveryId);
+  }
+  assert.notDeepEqual([...sent].sort(), sent, 'fixture: hash ids alone would not keep the send order');
+  await endTurn(f, 'target-b-turn');
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    for (let index = 0; index < sent.length; index += 1) {
+      await scan();
+      assert.equal(started.length, index + 1, 'one continuation at a time');
+      await endTurn(f, started[index].turnId);
+    }
+  } finally { await scanner.dispose(); }
+  assert.deepEqual(started.map(entry => sent.indexOf(entry.deliveryId)), sent.map((_, index) => index));
+}));

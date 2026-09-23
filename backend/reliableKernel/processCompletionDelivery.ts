@@ -297,10 +297,10 @@ export class ProcessCompletionDeliveryControlPlane {
       }
     }
 
-    const wakes = [
+    const wakes = await this.oldestDeliveryFirst([
       ...await listAllDomainRows(this.database, 'RuntimeDeliveryWake', { state: 'pending' }),
       ...await listAllDomainRows(this.database, 'RuntimeDeliveryWake', { state: 'claimed' })
-    ];
+    ]);
     for (const wake of wakes) {
       if (this.closing) break;
       const wakeId = requirePhaseFId(wake.id, 'RuntimeDeliveryWake.id');
@@ -340,6 +340,27 @@ export class ProcessCompletionDeliveryControlPlane {
     }
     this.retryPollingNeeded = !this.closing && await this.hasOutstandingOutboxWork();
     return report;
+  }
+
+  /**
+   * Wakes ordered by their delivery's creation, oldest first. Followups queued behind one target
+   * Turn each start a Turn of their own once it ends; this order starts them in the order they were
+   * sent instead of by hash id, so a busy target never lets newer tasks overtake an older one.
+   */
+  private async oldestDeliveryFirst(wakes: DomainRow[]): Promise<DomainRow[]> {
+    const keyed: Array<{ wake: DomainRow; createdAt: string; deliveryId: string }> = [];
+    for (const wake of wakes) {
+      let delivery: DomainRow | null = null;
+      try {
+        delivery = await this.maybeGet('RuntimeDelivery', requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id'));
+      } catch {
+        // Malformed facts surface through the normal claimed dispatch failure path.
+      }
+      keyed.push({ wake, createdAt: String(delivery?.created_at ?? ''), deliveryId: String(delivery?.id ?? '') });
+    }
+    return keyed.sort((left, right) => left.createdAt.localeCompare(right.createdAt)
+      || left.deliveryId.localeCompare(right.deliveryId)
+      || String(left.wake.id).localeCompare(String(right.wake.id))).map((entry) => entry.wake);
   }
 
   /** Conversation that owns this dispatch's completion chain; null defers to reconcile validation. */
