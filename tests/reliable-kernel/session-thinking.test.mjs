@@ -134,3 +134,21 @@ test('review P2-5 Gemini只检测会覆盖思维/输出的nested字段', async (
   assert.equal(wire.generationConfig.thinkingConfig.thinkingBudget, 2048);
   assert.equal(wire.custom_field, 'keep');
 });
+
+test('Claude 4.7 及之后的 adaptive 模型可按会话选择 effort，始终开启的模型不提供关闭', async () => {
+  // 能力表 anthropic_adaptive（https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting）。
+  assert.deepEqual(capability('claude', 'claude-opus-5-5'), { kind: 'claude-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] });
+  assert.deepEqual(capability('claude', 'claude-fable-5-1-20260801'), { kind: 'claude-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] });
+  assert.deepEqual(capability('claude', 'claude-sonnet-5'), { kind: 'claude-effort', values: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] });
+  assert.deepEqual(capability('claude', 'claude-opus-4-6'), { kind: 'claude-effort', values: ['none', 'low', 'medium', 'high', 'max'] }, '4.6 unchanged');
+  assert.deepEqual(capability('claude', 'claude-sonnet-4-5', 32000), { kind: 'claude-budget', min: 1024, max: 31999 }, 'extended unchanged');
+  assert.equal(capability('claude', 'claude-unknown-9'), undefined, 'unknown models are not guessed');
+  assert.throws(() => validate({ kind: 'claude-effort', value: 'none' }, 'claude', 'claude-opus-5-5'));
+  const override = validate({ kind: 'claude-effort', value: 'xhigh' }, 'claude', 'claude-opus-5-5');
+  const body = await ordinaryWire('claude', 'claude-opus-5-5', apply({}, override));
+  assert.deepEqual(body.thinking, { type: 'adaptive' });
+  assert.equal(body.output_config?.effort, 'xhigh');
+  const off = await ordinaryWire('claude', 'claude-sonnet-5', apply({}, validate({ kind: 'claude-effort', value: 'none' }, 'claude', 'claude-sonnet-5')));
+  assert.equal(off.output_config?.effort, undefined);
+  assert.notEqual(off.thinking?.type, 'adaptive');
+});

@@ -2,6 +2,7 @@ import type { LlmGenerationConfigRecord, LlmRequestBodyRecord, LlmProviderKind, 
 import { isAstraModel, isGpt6NoneCapableModel } from './openAIResponsesCapabilities';
 import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from './geminiThinking';
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
+import { anthropicModelReasoningCapability } from './modelCapabilities';
 
 export type SessionThinkingCapability =
   | { kind: 'gemini-budget' | 'claude-budget'; min: number; max: number; automatic?: number; allowZero?: boolean }
@@ -23,6 +24,12 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     if (/^claude-(opus|sonnet)-4[.-]6(?:-\d{8})?$/.test(model)) {
       return configuredEffort(provider, configuredThinking)
         ?? { kind: 'claude-effort', values: model.includes('opus') ? ['none', 'low', 'medium', 'high', 'max'] : ['none', 'low', 'medium', 'high'] };
+    }
+    // Claude 4.7 及之后（能力表 anthropic_adaptive：Opus 5.5、Fable、Sonnet 5 等）只有 adaptive + output_config.effort；
+    // 始终开启的模型（Fable、Mythos、Opus 5.5）不提供关闭。编码与渠道配置同一路径（claudeThinkingAdaptation.ts）。
+    const reasoning = anthropicModelReasoningCapability(model);
+    if (reasoning?.family === 'anthropic_adaptive' && reasoning.levels.length) {
+      return { kind: 'claude-effort', values: [...(reasoning.canDisable ? ['none' as const] : []), ...reasoning.levels] };
     }
     if (/^claude-(?:3[.-]7-sonnet|(?:sonnet|opus)-4(?:[.-][015])?)(?:-|$)/.test(model) && Number.isSafeInteger(maxOutputTokens) && maxOutputTokens! > 1024) {
       return { kind: 'claude-budget', min: 1024, max: maxOutputTokens! - 1 };
