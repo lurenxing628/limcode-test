@@ -62,6 +62,7 @@ import {
   resolveSummaryReasoning
 } from '../../shared/modelCapabilities';
 import { resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
+import { boundChildToolPolicy, type BoundToolPolicy } from './childToolBoundary';
 import {
   createLocalFolderWorkEnvironmentRecord,
   isLocalFolderWorkEnvironment,
@@ -262,7 +263,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       return layer ? [layer] : [];
     });
     // Same rule as the settings view: with no list anywhere on the chain the default tool set applies.
-    const toolPolicy = resolveToolPolicyLayers(toolPolicyLayers, builtinDefaultToolNames());
+    const ownToolPolicy = resolveToolPolicyLayers(toolPolicyLayers, builtinDefaultToolNames());
+    // A child Turn keeps only what its parent Turn also allows (tools, MCP sources, permissions).
+    const toolPolicy: BoundToolPolicy = request.inheritedToolPolicy
+      ? boundChildToolPolicy(ownToolPolicy, request.inheritedToolPolicy)
+      : ownToolPolicy;
     const skillPolicy = resolveScopedRecord(
       records.skillPolicyScopeLinks,
       records.skillPolicies,
@@ -432,7 +437,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         allowedTools,
         preset: toolPolicy.preset,
         toolConfigs: toolPolicy.toolConfigs,
-        sourceConfigs: toolPolicy.sourceConfigs
+        sourceConfigs: toolPolicy.sourceConfigs,
+        ...(toolPolicy.inherited ? { inherited: toolPolicy.inherited } : {})
       },
       skillPolicy: {
         id: skillPolicy?.id ?? null,

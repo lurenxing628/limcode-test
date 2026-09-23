@@ -74,6 +74,7 @@ import {
   type ProjectFolderAssignment
 } from './conversationProject';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import { readChildExecutionToolBoundary, type FrozenToolPolicyDocument } from './childToolBoundary';
 
 export const DEFAULT_AGENT_CONVERSATION_ROLE = 'default';
 
@@ -163,6 +164,12 @@ export interface TurnAuthorityCompilationRequest {
    * intersects it with the child's own scoped policy — the boundary is never widened.
    */
   inheritedWorkEnvironmentPolicy?: FrozenWorkEnvironmentBoundaryPolicy;
+  /**
+   * The parent Turn's frozen tool policy, supplied for every Turn of a child execution. The compiler
+   * intersects the child's own tool settings with it (see `boundChildToolPolicy`) — a child never
+   * gets a tool, MCP source or permission its parent Turn lacked.
+   */
+  inheritedToolPolicy?: FrozenToolPolicyDocument;
 }
 
 export interface TurnModelOverride {
@@ -1688,7 +1695,8 @@ export class TurnControlPlane {
           plan.operation,
           plan.sourceTurnId,
           command.executorAgentId,
-          command.modelOverride
+          command.modelOverride,
+          command.membership
         );
     if (retryRewind) compiled = withRetryLineage(compiled, retryRewind.lineage);
     const now = this.timestamp();
@@ -2067,11 +2075,20 @@ export class TurnControlPlane {
     intentKind: StartIntentPlan['operation'],
     sourceTurnId?: string,
     requestedExecutorAgentId?: string,
-    modelOverride?: TurnModelOverride
+    modelOverride?: TurnModelOverride,
+    membership?: TurnExecutionMembership
   ): Promise<ReturnType<typeof normalizeCompiledTurnAuthority>> {
-    const [defaultAgent, workspace] = await Promise.all([
+    const [defaultAgent, workspace, inheritedToolPolicy] = await Promise.all([
       requestedExecutorAgentId ? Promise.resolve(undefined) : this.getDefaultAgent(conversationId),
-      projectFolderForConversation(this.database, conversationId)
+      projectFolderForConversation(this.database, conversationId),
+      // A Turn the user starts in a child conversation keeps the child's parent bound.
+      membership
+        ? readChildExecutionToolBoundary(
+          this.database,
+          this.contentStore,
+          requireId(membership.childExecutionId, 'membership.childExecutionId')
+        )
+        : Promise.resolve(undefined)
     ]);
     const executorAgentId = requestedExecutorAgentId
       ? requireId(requestedExecutorAgentId, 'TurnExecutionCommand.executorAgentId')
@@ -2083,7 +2100,8 @@ export class TurnControlPlane {
       intentKind,
       ...(sourceTurnId ? { sourceTurnId: requireId(sourceTurnId, 'sourceTurnId') } : {}),
       ...(modelOverride ? { modelOverride } : {}),
-      ...(workspace ? { workspace } : {})
+      ...(workspace ? { workspace } : {}),
+      ...(inheritedToolPolicy ? { inheritedToolPolicy } : {})
     }), turnId, executorAgentId);
   }
 
@@ -2532,7 +2550,8 @@ export class TurnControlPlane {
       'retry',
       sourceTurnId,
       command.executorAgentId,
-      command.modelOverride
+      command.modelOverride,
+      command.membership
     );
     const intentContent = await this.contentStore.prepare(this.database, JSON.stringify({
       kind: 'retry',

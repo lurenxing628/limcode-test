@@ -22,6 +22,20 @@
 
 模型侧使用冻结的短引用目录，内部 Conversation、消息、频道和帖子身份不直接暴露。普通请求、native 同一逻辑请求内的后续调用、压缩和重启共用持久映射；继承历史引用不授予原团队操作权限。
 
+## 子 Agent 的工具边界（已定）
+
+子 Agent 的每一轮只能使用它自己的设置和父对话轮次都允许的东西，和 Codex 一致：Codex 的子 Agent 从父任务的有效配置出发，角色只能收紧、不能放宽。
+
+- **边界来源**：新建子 Agent 时读取父轮次冻结的工具设置，连同父轮次自己的上级边界，一起冻结进子 Agent 首轮 authority 的 `toolPolicy.inherited`。之后父 Agent 或团队成员续派、用户在子 Agent 对话里输入、重试或编辑重跑，都沿用首轮这份边界。事后修改父 Agent 的设置只影响之后新建的子 Agent。
+- **内置工具**：两边列表都有才提供。`submit_agent_answer` 是回答父任务的通道，只要子 Agent 自己的列表有就保留。
+- **MCP**：来源两边都启用才可用；`enabledTools` 取交集，`disabledTools` 相加；父轮次没有启用的来源，在子 Agent 里关闭。
+- **能否执行的设置**直接合并进子 Agent 冻结的设置：项目外路径（`allowOutsideProjectPaths`）和 ask_user、submit_plan 的自动批准须两边都开；命令黑名单相加；`maxChildAgentDepth` 取较小值。
+- **按调用判断的设置**：执行确认、自动应用更改、自动提交结果和命令白名单，要子 Agent 自己和每一级上级都同意才自动或放行，自动应用的等待时间取最长。YOLO 只放宽它所在的那一级。
+- **子 Agent 自己决定的**：工具参数（例如输出上限）、显示设置、原生异步和预设。
+- 工作环境边界规则不变：新建和续派时与父轮次或上一轮取交集。
+
+后果：父对话没有的工具，子 Agent 也用不了。想让只负责分派的 Agent 派出能执行命令的 worker，父 Agent 自己的工具设置里也要允许该工具。本规则之前建立的子 Agent，首轮没有边界记录，按原规则运行。
+
 ## 工具与投递
 
 - `run_agent` 继续管理创建、排队续聊、读取、等待和停止直接子树。
@@ -109,7 +123,7 @@
 
 ## 上下文继承
 
-`run_agent.spawn.forkTurns` 接受 `none`、`all` 或正整数文字，默认 `none`。只复制当前上下文可达的已完成轮，压缩后按来源恢复；排除当前未完成轮及旧 system/runtime_context，不继承原 lease 或 ChildExecution 控制关系。复制的轮次各自持有其历史 AuthoritySnapshot 的副本，只作为历史记录；子 Agent 自己的轮次仍按其任务编译权限，不沿用父对话轮次的冻结 authority。继承历史、新任务正文、新子会话和父子关系在同一事务建立。
+`run_agent.spawn.forkTurns` 接受 `none`、`all` 或正整数文字，默认 `none`。只复制当前上下文可达的已完成轮，压缩后按来源恢复；排除当前未完成轮及旧 system/runtime_context，不继承原 lease 或 ChildExecution 控制关系。复制的轮次各自持有其历史 AuthoritySnapshot 的副本，只作为历史记录；子 Agent 自己的轮次仍按其任务编译权限，不沿用父对话轮次的冻结 authority，工具只受上文「子 Agent 的工具边界」约束。继承历史、新任务正文、新子会话和父子关系在同一事务建立。
 
 ## 留言板与边界
 

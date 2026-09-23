@@ -88,6 +88,7 @@ import type {
 } from './fileEffects';
 import { authorizeFrozenPlanReview, type FrozenPlanReviewRiskLevel } from './frozenMcpPolicyGate';
 import { frozenInteractionAutoApproval, readFrozenTurnAuthority } from './frozenAuthority';
+import { inheritedToolPolicyChain, type InheritedToolPolicyLayer } from './childToolBoundary';
 import type { McpEffectDispatcher } from './mcpEffects';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import type { ProcessControlPlane, ProcessWaitObservation } from './processEffects';
@@ -113,6 +114,17 @@ import {
 export interface ReliableToolDispatchAuthority {
   snapshotId: string;
   document: PlainJsonValue;
+  toolConfig?: ToolPolicyToolConfigRecord;
+  /**
+   * Child Turns only: each ancestor Turn's preset and settings for this tool, nearest first. A call
+   * runs automatically, applies changes or submits its result on its own only when every one of
+   * them agrees, and a command must pass every ancestor's command rules.
+   */
+  inheritedToolConfigs?: readonly InheritedToolConfig[];
+}
+
+export interface InheritedToolConfig {
+  preset: string;
   toolConfig?: ToolPolicyToolConfigRecord;
 }
 
@@ -844,16 +856,6 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const config = authority.toolConfig;
     const yolo = policy.preset === 'yolo';
     const supportsChangeApply = FILE_TOOLS.has(input.toolName) || metadata?.supportsChangeApply === true;
-    const automaticChangeApply = supportsChangeApply && (
-      yolo
-      || config?.autoApplyChange
-      || (config?.autoApplyChange === undefined && metadata?.defaultAutoApplyChange === true)
-    );
-    const delay = automaticChangeApply
-      ? yolo ? 0 : normalizeAutoApplyDelay(
-          config?.autoApplyChangeDelaySeconds ?? metadata?.defaultAutoApplyChangeDelaySeconds ?? 0
-        )
-      : 0;
     const commandClassification = PROCESS_TOOLS.has(input.toolName)
       ? classifyCommandCall(input.arguments)
       : undefined;
@@ -861,24 +863,17 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       ? frozenCommandScheduling(commandClassification, input.arguments)
       : live?.scheduling?.(input.arguments, { toolName: input.toolName })
         ?? frozenSchedulingFallback(input.definition, input.arguments);
-    const commandConfig = commandPolicyConfig(authority.toolConfig);
     const command = PROCESS_TOOLS.has(input.toolName)
       ? optionalText(requireRecord(input.arguments, `${input.toolName} arguments`).command)
       : '';
-    const allowlistedCommand = !!command && firstMatchedCommandRule(command, commandConfig.allowCommands) !== undefined;
-    const autoApproveReadonly = PROCESS_TOOLS.has(input.toolName)
-      && commandConfig.autoApproveReadonly
-      && isReadonlyCommandCall(input.arguments);
-    const executionAutomatic = yolo
-      || input.toolName === 'ask_user'
-      || input.toolName === 'submit_plan'
-      || (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments))
-      || isReadonlyAgentCollaborationTool(input.toolName)
-      || isReadonlyCrossConversationTool(input.toolName)
-      || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))
-      || allowlistedCommand
-      || autoApproveReadonly
-      || (config?.autoApproveExecution ?? metadata?.defaultAutoApproveExecution ?? true);
+    // A child Turn's call is automatic only where its own settings and every ancestor Turn's agree.
+    const sides = [
+      { preset: policy.preset, toolConfig: config },
+      ...(authority.inheritedToolConfigs ?? [])
+    ].map((side) => sideAutomation(input, metadata, supportsChangeApply, command, side.preset === 'yolo', side.toolConfig));
+    const automaticChangeApply = sides.every((side) => side.automaticChangeApply);
+    const delay = automaticChangeApply ? Math.max(...sides.map((side) => side.changeApplyDelaySeconds)) : 0;
+    const executionAutomatic = sides.every((side) => side.executionAutomatic);
     const summary = live?.summary?.(input.arguments, {
       toolName: input.toolName,
       argsJson: canonicalPlainJson(input.arguments, `Tool ${input.toolName} summary arguments`)
@@ -896,7 +891,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         ? automaticChangeApply ? 'automatic' : 'manual'
         : 'unsupported',
       changeApplyDelaySeconds: delay,
-      autoSubmitResult: yolo || (config?.autoSubmitResult ?? metadata?.defaultAutoSubmitResult ?? true),
+      autoSubmitResult: sides.every((side) => side.autoSubmitResult),
       schedulingMode: scheduling.mode,
       ...(scheduling.reason ? { schedulingReason: scheduling.reason } : {})
     };
@@ -1821,6 +1816,15 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (commandConfig.allowCommands.length > 0 && !firstMatchedCommandRule(command, commandConfig.allowCommands)) {
       return this.reject(input, '命令未匹配冻结 ToolPolicy 白名单；可靠执行批准门禁未启用，因此不会执行。');
     }
+    // A child Turn's command must also pass the rules of every ancestor Turn.
+    for (const inherited of authority.inheritedToolConfigs ?? []) {
+      const rules = commandPolicyConfig(inherited.toolConfig);
+      const deniedByParent = firstMatchedCommandRule(command, rules.denyCommands);
+      if (deniedByParent) return this.reject(input, `命令被上级对话冻结的 ToolPolicy 黑名单拒绝：${deniedByParent}`);
+      if (rules.allowCommands.length > 0 && !firstMatchedCommandRule(command, rules.allowCommands)) {
+        return this.reject(input, '命令未匹配上级对话冻结的 ToolPolicy 白名单；子 Agent 的命令不能超出上级对话允许的范围，因此不会执行。');
+      }
+    }
     const foregroundWaitMs = requireWaitMs(args.foregroundWaitMs);
     const executionTimeoutMs = requireOptionalBoundedInteger(
       args.executionTimeoutMs,
@@ -2737,6 +2741,8 @@ function authorityPolicy(document: PlainJsonValue): {
   preset: string;
   toolConfigs: Record<string, ToolPolicyToolConfigRecord>;
   sourceConfigs: Record<string, unknown>;
+  /** Ancestor Turns' presets and per-tool settings, nearest first; empty outside child Turns. */
+  inherited: InheritedToolPolicyLayer[];
 } {
   const authority = requireRecord(document, 'AuthoritySnapshot');
   const policy = requireRecord(authority.toolPolicy, 'AuthoritySnapshot.toolPolicy');
@@ -2755,7 +2761,8 @@ function authorityPolicy(document: PlainJsonValue): {
     allowedTools,
     preset: typeof policy.preset === 'string' ? policy.preset : 'custom',
     toolConfigs: toolConfigsRaw as unknown as Record<string, ToolPolicyToolConfigRecord>,
-    sourceConfigs
+    sourceConfigs,
+    inherited: inheritedToolPolicyChain(policy)
   };
 }
 
@@ -2803,7 +2810,16 @@ function callAuthority(
   tool: ToolPolicyTool | undefined
 ): ReliableToolDispatchAuthority {
   const toolConfig = tool ? toolConfigFor(policy.toolConfigs, tool) : undefined;
-  return { snapshotId: base.snapshotId, document: base.document, ...(toolConfig ? { toolConfig } : {}) };
+  const inheritedToolConfigs = policy.inherited.map((layer): InheritedToolConfig => {
+    const inherited = tool ? toolConfigFor(layer.toolConfigs, tool) : undefined;
+    return { preset: layer.preset, ...(inherited ? { toolConfig: inherited } : {}) };
+  });
+  return {
+    snapshotId: base.snapshotId,
+    document: base.document,
+    ...(toolConfig ? { toolConfig } : {}),
+    ...(inheritedToolConfigs.length > 0 ? { inheritedToolConfigs } : {})
+  };
 }
 
 /** The declaration a call names, which carries the identity its per-tool settings are keyed by. */
@@ -2849,6 +2865,56 @@ function nativeAsyncToolMetadata(
   const rest = { ...base };
   delete rest.nativeAsync;
   return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+interface SideAutomation {
+  executionAutomatic: boolean;
+  automaticChangeApply: boolean;
+  changeApplyDelaySeconds: number;
+  autoSubmitResult: boolean;
+}
+
+/**
+ * What one Turn's settings (a child's own, or one ancestor's) let this call do on its own. The same
+ * rules apply to every side; `freezeDecision` requires all of them.
+ */
+function sideAutomation(
+  input: ReliableAgentToolDispatchInput,
+  metadata: ToolDefinitionMetadataRecord | undefined,
+  supportsChangeApply: boolean,
+  command: string,
+  yolo: boolean,
+  config: ToolPolicyToolConfigRecord | undefined
+): SideAutomation {
+  const automaticChangeApply = supportsChangeApply && (
+    yolo
+    || config?.autoApplyChange
+    || (config?.autoApplyChange === undefined && metadata?.defaultAutoApplyChange === true)
+  ) === true;
+  const commandConfig = commandPolicyConfig(config);
+  const allowlistedCommand = !!command && firstMatchedCommandRule(command, commandConfig.allowCommands) !== undefined;
+  const autoApproveReadonly = PROCESS_TOOLS.has(input.toolName)
+    && commandConfig.autoApproveReadonly
+    && isReadonlyCommandCall(input.arguments);
+  return {
+    executionAutomatic: yolo
+      || input.toolName === 'ask_user'
+      || input.toolName === 'submit_plan'
+      || (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments))
+      || isReadonlyAgentCollaborationTool(input.toolName)
+      || isReadonlyCrossConversationTool(input.toolName)
+      || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))
+      || allowlistedCommand
+      || autoApproveReadonly
+      || (config?.autoApproveExecution ?? metadata?.defaultAutoApproveExecution ?? true),
+    automaticChangeApply,
+    changeApplyDelaySeconds: automaticChangeApply
+      ? yolo ? 0 : normalizeAutoApplyDelay(
+          config?.autoApplyChangeDelaySeconds ?? metadata?.defaultAutoApplyChangeDelaySeconds ?? 0
+        )
+      : 0,
+    autoSubmitResult: yolo || (config?.autoSubmitResult ?? metadata?.defaultAutoSubmitResult ?? true)
+  };
 }
 
 interface CommandPolicyConfig {

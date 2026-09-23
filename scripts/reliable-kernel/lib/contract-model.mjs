@@ -977,6 +977,11 @@ function validateContext(context, failures) {
 }
 
 function validateSubagent(subagent, failures) {
+  const toolBoundary = String(subagent?.spawn?.toolBoundary ?? '');
+  for (const marker of ['parent-Turn-policy-frozen-at-spawn(toolPolicy.inherited', 'reuse-the-spawn-Turn-bound', 'except-submit_agent_answer-kept-from-the-child-own-list',
+    'a-source-the-parent-never-enabled-stays-off', 'maxChildAgentDepth-takes-the-minimum', 'only-when-every-ancestor-agrees', 'yolo-loosens-only-its-own-level']) {
+    if (!toolBoundary.includes(marker)) failures.push(`子Agent工具边界规则缺少${marker}`);
+  }
   const collaboration = subagent?.collaboration;
   if (collaboration?.teamScope !== 'derive-root-conversation-from-ChildExecutionParentLink-no-team-table'
     || collaboration?.messageAuthority !== 'peer-tool-output-never-user-or-developer-authorization'

@@ -87,6 +87,12 @@ const sourceError = computed(() => store.sourceConfigErrorFor(props.scopeKind, p
 const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
 /** Where the cross-conversation switch lives for this scope. */
 const collaborationArea = computed(() => props.scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域');
+// Mirrors the backend child bound (childToolBoundary.ts): a child Turn keeps only what its parent Turn also allows.
+const childBoundNote = computed(() => {
+  const rule = '只能使用双方都允许的工具和 MCP 服务；自动执行、自动应用更改和命令白名单也要双方都同意。';
+  if (props.scopeKind === 'agent') return `这个 Agent 作为子 Agent 运行时，还受派出它的对话限制：${rule}`;
+  return childConversation.value ? `这是子 Agent 对话，工具还受派出它的对话限制：${rule}` : '';
+});
 const switchGrantedToolNames = computed(() => builtinTools.value.filter((tool) => isSwitchGranted(tool)).map((tool) => tool.name));
 /** This scope's own invalid list blocks every edit that would rewrite it; only a reset repairs it. */
 const editsBlocked = computed(() => props.readonly || listError.value?.own === true);
@@ -623,6 +629,7 @@ function inputNumber(event: Event): number {
       <button v-else type="button" class="secondary" :disabled="!canRestoreInheritance" @click="restoreInheritance">恢复继承</button>
     </div>
 
+    <p v-if="childBoundNote" class="tool-policy-note">{{ childBoundNote }}</p>
     <p v-if="switchGrantedToolNames.length > 0" class="tool-policy-note">{{ switchGrantedToolNames.join('、') }} 由{{ collaborationArea }}里的「跨对话协作」开关控制，不受这里的工具开关和工具列表影响。</p>
     <p v-if="firstListExtras.length > 0" class="tool-policy-note">这里还没有单独保存工具列表。第一次改下方的工具开关会保存一份列表，并带上内置 Agent 列表里的 {{ firstListExtras.join('、') }}，以免这些 Agent 失去它们；没有自己列表的自定义 Agent 也会因此得到 {{ firstListExtras.join('、') }}。工作环境相关工具仍受工作环境策略限制，默认关闭。</p>
 

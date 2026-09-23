@@ -63,6 +63,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/child-compression-memory.test.mjs',
   'tests/reliable-kernel/native-child-handles.test.mjs',
   'tests/reliable-kernel/child-handle-boundary.test.mjs',
+  'tests/reliable-kernel/child-tool-boundary.test.mjs',
   'tests/reliable-kernel/child-task-facts-snapshot.test.cjs',
   'tests/reliable-kernel/conversation-child-task-projection.test.mjs',
   'tests/reliable-kernel/child-task-runtime.test.mjs',
