@@ -226,7 +226,7 @@
     "liveWindow": "existing-per-type-bounds-and-atomic-snapshot-refresh",
     "messageBodiesInFeed": false,
     "messagePreview": "CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read",
-    "deliveryState": "sender-session-also-sees-the-RuntimeDelivery-of-its-loaded-outgoing-messages; newest-attempt-per-target-decides-waiting-failed-or-settled; failed-incoming-stays-visible",
+    "deliveryState": "sender-session-also-sees-the-RuntimeDelivery-of-its-loaded-outgoing-messages; newest-attempt-per-target-decides-waiting-failed-or-settled; failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent-or-among-the-newest-3-pinned-below-every-message; a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn",
     "boardBodiesInFeed": false,
     "relations": "independent-message-source-target-reply-and-request-links",
     "peerConversations": "snapshot-only-collaborationPeerConversations-for-peers-of-the-loaded-links-outside-navigation; sidebar-display_title; runtime-absent-peer-status-deleted; client-reads-only-observed-Conversation-remove-or-deleted-status-as-deleted-and-a-missing-peer-as-unknown",

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import {
+  MAX_PINNED_FAILED_COLLABORATION_CARDS,
   collaborationCardKindLabel,
   collaborationCardLabel,
   collaborationCardStatusLabel,
@@ -239,4 +242,11 @@ test('an outgoing message or result waiting for the recipient says it arrived an
     ['idle-result', '已送达，对方下一轮读取'],
     ['followup', '等待对方处理']
   ]);
+});
+
+test('the client feed contract states the card placement and pinned-failure bound the timeline uses', () => {
+  const contract = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'docs/architecture/reliable-kernel/contracts/client-feed.json'), 'utf8'));
+  const rule = contract.collaborationProjection.deliveryState as string;
+  assert.match(rule, new RegExp(`failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent-or-among-the-newest-${MAX_PINNED_FAILED_COLLABORATION_CARDS}-pinned-below-every-message`));
+  assert.match(rule, /a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn/);
 });
