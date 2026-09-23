@@ -12,6 +12,7 @@ const { CROSS_CONVERSATION_TOOL_NAMES, crossConversationToolModules, isReadonlyC
 const { runAgentTool, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY } = load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { createBuiltinToolDefinitions } = load('backend/world/modules/tools/definitions/index.js');
 const { CROSS_CONVERSATION_LIMITS, frozenCrossConversationEnabled } = load('backend/reliableKernel/collaborationPolicy.js');
+const { COLLABORATION_MESSAGE_MAX_TEXT_BYTES } = load('backend/reliableKernel/collaborationControlPlane.js');
 const { RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS } = load('shared/reliableKernelClientFeed.js');
 const { crossConversationToolPermitted } = load('shared/toolPolicyResolution.js');
 const { CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE, CLIENT_MESSAGE_WINDOW_LIMIT } = load('backend/reliableKernel/clientFeedBounds.js');
@@ -65,6 +66,14 @@ test('the limits contract carries the fixed limits the control plane enforces', 
   const document = await fs.readFile('docs/architecture/reliable-kernel/agent-collaboration.md', 'utf8');
   assert.match(document, new RegExp(`最多积压 ${CROSS_CONVERSATION_LIMITS.maxPendingInboundMessages} 条`));
   assert.match(document, new RegExp(`合计最多 ${CROSS_CONVERSATION_LIMITS.maxConversationSpawnsPerTurn} 次`));
+});
+
+test('the message size contract and document carry the byte cap the control plane enforces', async () => {
+  const { messageText } = (await contract('subagent')).collaboration;
+  assert.equal(messageText.maxBytes, COLLABORATION_MESSAGE_MAX_TEXT_BYTES);
+  assert.match(messageText.rule, /^every-collaboration-message-body-is-1-to-maxBytes-UTF-8-bytes; a-longer-send-is-refused-and-writes-nothing;/);
+  const document = await fs.readFile('docs/architecture/reliable-kernel/agent-collaboration.md', 'utf8');
+  assert.match(document, new RegExp(`正文为 1 到 ${COLLABORATION_MESSAGE_MAX_TEXT_BYTES} 个 UTF-8 字节`));
 });
 
 test('the client feed contract preview bound matches the projection constant', async () => {

@@ -12,7 +12,8 @@ import { isTransactionAssertionFailure, requirePhaseFId, stablePhaseFId, sqliteU
 import type { RuntimeDatabase } from './runtimeDatabase';
 
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
-const MAX_TEXT_BYTES = 64_000;
+/** Every collaboration message body is 1..COLLABORATION_MESSAGE_MAX_TEXT_BYTES UTF-8 bytes. */
+export const COLLABORATION_MESSAGE_MAX_TEXT_BYTES = 64_000;
 export type CollaborationSource = { kind: 'tool'; turnId: string; toolCallId: string };
 /** turnId is null for the failure reply to a task that no Turn will answer. */
 interface CompletionSource { kind: 'completion'; turnId: string | null; requestId: string }
@@ -106,7 +107,7 @@ export class CollaborationControlPlane {
 
   private async sendInternal(input: Omit<CollaborationSendCommand, 'source'> & { source: CollaborationSource | CompletionSource | BoardSource }) {
     if (input.mode !== 'message' && input.mode !== 'followup') throw new TypeError('Unsupported collaboration delivery mode.');
-    if (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > MAX_TEXT_BYTES) throw new RangeError(`Collaboration text must contain 1..${MAX_TEXT_BYTES} UTF-8 bytes.`);
+    if (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > COLLABORATION_MESSAGE_MAX_TEXT_BYTES) throw new RangeError(`Collaboration text must contain 1..${COLLABORATION_MESSAGE_MAX_TEXT_BYTES} UTF-8 bytes.`);
     const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
     const source = input.source;
     if (input.queueBehindActiveTurn !== undefined && typeof input.queueBehindActiveTurn !== 'boolean') throw new TypeError('queueBehindActiveTurn must be boolean.');
@@ -552,7 +553,7 @@ export class CollaborationControlPlane {
       if (!['assistant', 'model'].includes(String(revision.role))) continue;
       const content = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
       const text = visibleMessageText(String(content.content_type), (await this.contentStore.read(content)).toString('utf8')).trim();
-      if (text) return Buffer.byteLength(text) <= MAX_TEXT_BYTES ? text : `${text.slice(0, 12000)}\n[Result truncated; read the destination task for the full answer.]`;
+      if (text) return Buffer.byteLength(text) <= COLLABORATION_MESSAGE_MAX_TEXT_BYTES ? text : `${text.slice(0, 12000)}\n[Result truncated; read the destination task for the full answer.]`;
     }
     return null;
   }

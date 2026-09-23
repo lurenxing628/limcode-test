@@ -988,3 +988,14 @@ test('a failure reply committed before its request was settled still settles the
   assert.equal(replies.length, 1, 'no second reply');
   assert.match((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, /^Task could not start: /);
 }));
+
+test('a collaboration message carries at most the documented byte cap and a longer one writes nothing', async () => fixture(async f => {
+  const { COLLABORATION_MESSAGE_MAX_TEXT_BYTES: cap } = load('collaborationControlPlane.js');
+  // Three-byte characters: the cap counts UTF-8 bytes, not characters.
+  const atCap = '界'.repeat(Math.floor(cap / 3)) + 'x'.repeat(cap % 3);
+  assert.equal(Buffer.byteLength(atCap), cap);
+  await assert.rejects(f.collaboration.send({ source: await f.source('over-cap'), targetConversationId: 'right', text: `${atCap}x`, mode: 'message' }), new RegExp(`1\\.\\.${cap} UTF-8 bytes`));
+  assert.deepEqual(await f.rows('CollaborationMessage'), []);
+  const sent = await f.collaboration.send({ source: await f.source('at-cap'), targetConversationId: 'right', text: atCap, mode: 'message' });
+  assert.equal((await f.collaboration.readMessage({ conversationId: 'right', messageId: sent.messageId })).text, atCap);
+}));

@@ -407,6 +407,10 @@
       "CollaborationRequestTurnLink"
     ],
     "messageAuthority": "peer-tool-output-never-user-or-developer-authorization",
+    "messageText": {
+      "maxBytes": 64000,
+      "rule": "every-collaboration-message-body-is-1-to-maxBytes-UTF-8-bytes; a-longer-send-is-refused-and-writes-nothing; a-longer-final-answer-in-a-completion-reply-is-truncated-with-a-note-to-read-the-target"
+    },
     "delivery": "reuse-RuntimeInboxItem-RuntimeDelivery-RuntimeDeliveryInputLink-RuntimeDeliveryWake",
     "sendMessage": "persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary; cross-conversation-sends-instead-queue-behind-the-running-Turn-see-crossConversation.delivery",
     "followupTask": "explicit-request-may-wake-idle-or-join-active; never-implicitly-cancel",
