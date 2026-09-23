@@ -240,7 +240,7 @@ test('dry-run：configuration_update 历史剥离服务端 compaction 参数', a
   assert.ok(result.body.input.some((item) => item?.type === 'configuration_update'));
 });
 
-test('dry-run：Astra WS 保留显式缓存选项与断点，其他模型维持剥离', async () => {
+test('dry-run：Astra WS 保留显式缓存选项与断点，不支持显式缓存的模型维持剥离', async () => {
   const explicitCache = { enabled: true, mode: 'explicit', ttl: '30m' };
   const astra = await dryRunLlmProvider(
     chatRequest('dry-ws-cache', { systemInstruction: { role: 'user', parts: [{ text: 'stable instructions' }] } }),
@@ -251,8 +251,17 @@ test('dry-run：Astra WS 保留显式缓存选项与断点，其他模型维持�
   assert.ok(developer, 'Astra 显式缓存把 instructions 转为 developer 输入消息');
   assert.deepEqual(developer.content[0].prompt_cache_breakpoint, { mode: 'explicit' });
 
-  const legacy = await dryRunLlmProvider(chatRequest('dry-ws-cache-legacy'), {
+  // 显式缓存按模型判断（GPT-5.6 及之后），非原生的 gpt-5.6 在 WS 上同样保留，与运行时会话一致。
+  const gpt56 = await dryRunLlmProvider(chatRequest('dry-ws-cache-gpt56'), {
     settings: async () => providerConfig({ model: 'gpt-5.6', openaiResponsesTransport: 'websocket', promptCache: explicitCache })
+  });
+  assert.deepEqual(gpt56.body.prompt_cache_options, { mode: 'explicit', ttl: '30m' });
+
+  const legacy = await dryRunLlmProvider(chatRequest('dry-ws-cache-legacy'), {
+    settings: async () => providerConfig({
+      model: 'gpt-5.5', openaiResponsesTransport: 'websocket', promptCache: explicitCache,
+      requestBody: { prompt_cache_options: { mode: 'explicit', ttl: '30m' } }
+    })
   });
   assert.equal('prompt_cache_options' in legacy.body, false);
 });

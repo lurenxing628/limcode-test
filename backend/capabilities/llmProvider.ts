@@ -4971,7 +4971,7 @@ function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, 
 
 function openAIResponsesWebSocketDryRunResult(result: UnifiedDryRunResult, includeApiKey: boolean, model?: string): UnifiedDryRunResult & { maskedCurl: string } {
   const url = toWebSocketUrl(result.url);
-  const body = openAIResponsesWebSocketDryRunPayload(result.body, isAstraModel(model));
+  const body = openAIResponsesWebSocketDryRunPayload(result.body, supportsOpenAIExplicitPromptCache(model));
   const headers = result.headers;
   return {
     ...result,
@@ -4990,7 +4990,8 @@ function openAIResponsesWebSocketDryRunPayload(body: unknown, preserveNativeCach
   delete record.stream;
   delete record.background;
   delete record.previous_response_id;
-  // Astra WS 必须保留显式缓存选项与断点；其他模型保持原有剥离行为。
+  // 支持显式缓存的模型（GPT-5.6 及之后的官方 id）在 WS 上保留显式缓存选项与断点，与运行时会话一致；
+  // 其他模型保持原有剥离行为。
   if (!preserveNativeCache) delete record.prompt_cache_options;
   return { type: 'response.create', ...record, store: false };
 }

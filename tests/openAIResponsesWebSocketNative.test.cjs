@@ -892,9 +892,10 @@ test('努力变更在兼容续接上使用 configuration_update 且顶层推理�
   }
 });
 
-test('原生路径保留显式缓存字段而旧路径保持剥离行为', { concurrency: false }, async () => {
+test('原生路径与支持显式缓存的模型保留显式缓存字段，其他模型的旧路径保持剥离行为', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const format = await formatForTest();
+  const unified = await import('unified-llm-provider');
   const frames = [];
   const server = await createServer((socket, request, connection) => {
     frames.push({ request, connection });
@@ -903,8 +904,8 @@ test('原生路径保留显式缓存字段而旧路径保持剥离行为', { con
     sendMessageResponse(socket, `resp_cache_${seq}`, `msg_${seq}`, '好');
   });
   try {
-    const bodyWithCache = (sessionSalt) => {
-      const body = requestBody(format, [user(`缓存问题${sessionSalt}`)], {
+    const bodyWithCache = (sessionSalt, bodyFormat = format) => {
+      const body = requestBody(bodyFormat, [user(`缓存问题${sessionSalt}`)], {
         prompt_cache_options: { mode: 'explicit', ttl: '30m' }
       });
       body.input[0].content[0].prompt_cache_breakpoint = { mode: 'explicit' };
@@ -914,7 +915,15 @@ test('原生路径保留显式缓存字段而旧路径保持剥离行为', { con
       native: nativeOptions({}),
       timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
     }));
-    await collect(streamOptions(server, format, 'legacy-cache', bodyWithCache('旧式'), {
+    // 显式缓存只按模型判断（官方：GPT-5.6 and later），旧路径上的 Astra、Sol、GPT-5.6 同样保留。
+    for (const [salt, model] of [['旧式 Astra', 'gpt-6-astra'], ['旧式 Sol', 'gpt-6-sol'], ['旧式 5.6', 'gpt-5.6']]) {
+      const modelFormat = new unified.OpenAIResponsesFormat(model);
+      await collect(streamOptions(server, modelFormat, `legacy-cache-${model}`, bodyWithCache(salt, modelFormat), {
+        timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+      }));
+    }
+    const olderFormat = new unified.OpenAIResponsesFormat('gpt-5.5');
+    await collect(streamOptions(server, olderFormat, 'legacy-cache-older', bodyWithCache('旧式 5.5', olderFormat), {
       timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
     }));
 
@@ -922,7 +931,14 @@ test('原生路径保留显式缓存字段而旧路径保持剥离行为', { con
     assert.deepEqual(nativeCreate.prompt_cache_options, { mode: 'explicit', ttl: '30m' });
     assert.deepEqual(nativeCreate.input[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
 
-    const legacyCreate = frames[1].request;
+    for (const index of [1, 2, 3]) {
+      const create = frames[index].request;
+      assert.deepEqual(create.prompt_cache_options, { mode: 'explicit', ttl: '30m' }, create.model);
+      assert.deepEqual(create.input[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' }, create.model);
+    }
+
+    const legacyCreate = frames[4].request;
+    assert.equal(legacyCreate.model, 'gpt-5.5');
     assert.equal('prompt_cache_options' in legacyCreate, false);
     assert.equal('prompt_cache_breakpoint' in legacyCreate.input[0].content[0], false);
     assert.equal('stream_id' in nativeCreate, false, 'exclusive native mode uses no named lane');

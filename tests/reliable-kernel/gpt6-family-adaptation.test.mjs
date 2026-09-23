@@ -434,3 +434,32 @@ test('会话思考显示：Sol / Luna 的 minimal 显示为适配器映射，non
   assert.equal(sessionThinkingDisplayLabel('openai-responses', 'gpt-6-astra', { thinkingLevel: 'none' }), 'low（适配器）');
   assert.equal(sessionThinkingDisplayLabel('openai-compatible', 'gpt-6-astra', { thinkingLevel: 'none' }), 'none');
 });
+
+// 显式缓存：https://developers.openai.com/api/docs/guides/prompt-caching（GPT-5.6 and later；ttl 只能是 "30m"；
+// “Top-level instructions cannot contain an explicit breakpoint”）。WebSocket 模式指南对请求字段没有模型限制。
+test('WS dry-run：支持显式缓存的模型保留 prompt_cache_options 与断点（原生与否一致），其他模型剥离', async () => {
+  const explicitCache = { enabled: true, mode: 'explicit', ttl: '30m' };
+  const request = (id) => chatRequest(id, { systemInstruction: { role: 'user', parts: [{ text: 'stable instructions' }] } });
+  for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']) {
+    for (const nativeResponses of [undefined, { enabled: false }]) {
+      const body = (await dryRunLlmProvider(request(`ws-cache-${model}`), {
+        settings: async () => providerConfig({ model, openaiResponsesTransport: 'websocket', promptCache: explicitCache,
+          ...(nativeResponses ? { nativeResponses } : {}) })
+      })).body;
+      assert.equal(body.type, 'response.create', model);
+      assert.deepEqual(body.prompt_cache_options, { mode: 'explicit', ttl: '30m' }, model);
+      assert.equal(body.instructions, undefined, model);
+      const developer = body.input.find((item) => item?.role === 'developer');
+      assert.deepEqual(developer?.content?.[0], { type: 'input_text', text: 'stable instructions', prompt_cache_breakpoint: { mode: 'explicit' } }, model);
+    }
+  }
+  for (const model of ['gpt-5.5', 'gpt-6-sol-xhigh']) {
+    const body = (await dryRunLlmProvider(request(`ws-cache-${model}`), {
+      settings: async () => providerConfig({ model, openaiResponsesTransport: 'websocket', promptCache: explicitCache,
+        requestBody: { prompt_cache_options: { mode: 'explicit', ttl: '30m' } } })
+    })).body;
+    assert.equal('prompt_cache_options' in body, false, model);
+    assert.equal(JSON.stringify(body).includes('prompt_cache_breakpoint'), false, model);
+    assert.equal(body.instructions, 'stable instructions', model);
+  }
+});

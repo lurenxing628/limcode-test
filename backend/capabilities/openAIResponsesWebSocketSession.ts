@@ -9,6 +9,7 @@ import type {
   StreamDecodeState
 } from 'unified-llm-provider';
 import type { AssistantMessagePhase, ModelOutputItemReference } from '../../shared/protocol';
+import { supportsOpenAIExplicitPromptCache } from '../../shared/openAIResponsesCapabilities';
 import type {
   OpenAIResponsesNativeEvent,
   OpenAIResponsesRequiredInput,
@@ -277,7 +278,7 @@ async function* streamLocked(
     throw new Error('OpenAI Responses WebSocket connection is unavailable.');
   }
 
-  const fullBody = sanitizeResponsesCreateBody(options.body);
+  const fullBody = sanitizeResponsesCreateBody(options.body, preservesExplicitPromptCache(options.body));
   const prepared = prepareCreatePayload(
     session,
     { key: session.key, connectionGeneration: session.connectionGeneration },
@@ -674,7 +675,12 @@ function prepareCreatePayload(
 ): PreparedCreatePayload {
   const connectionReused = connection.reused;
   const fullInputItems = Array.isArray(fullBody.input) ? fullBody.input.map(cloneJson) : [];
-  const boundary = localContinuationBoundary(fullInputItems, format, continuationHint, native !== undefined);
+  const boundary = localContinuationBoundary(
+    fullInputItems,
+    format,
+    continuationHint,
+    native !== undefined || preservesExplicitPromptCache(fullBody)
+  );
   // Native dynamic reasoning keeps request-level reasoning out of the baseline signature so a pure
   // effort change can ride a configuration_update instead of rewriting the cached prefix.
   const signatureBase = requestBase(fullBody);
@@ -892,6 +898,16 @@ function localContinuationBoundary(
   };
 }
 
+/**
+ * Explicit prompt caching (`prompt_cache_options` and content `prompt_cache_breakpoint`) is documented
+ * for GPT-5.6 and later (https://developers.openai.com/api/docs/guides/prompt-caching#summary-of-model-differences),
+ * and the WebSocket mode guide places no model restriction on request fields. Those exact official ids keep
+ * the fields on every WebSocket path; any other model keeps the historical strip behavior unchanged.
+ */
+function preservesExplicitPromptCache(body: unknown): boolean {
+  return isRecord(body) && typeof body.model === 'string' && supportsOpenAIExplicitPromptCache(body.model);
+}
+
 function sanitizeResponsesCreateBody(value: unknown, native = false): Record<string, unknown> {
   if (!isRecord(value)) throw new Error('OpenAI Responses WebSocket body must be a JSON object.');
   const next = cloneJson(value);
@@ -899,8 +915,8 @@ function sanitizeResponsesCreateBody(value: unknown, native = false): Record<str
   delete next.stream;
   delete next.background;
   delete next.previous_response_id;
-  // Explicit prompt caching is retained on supported native Astra channels only; the legacy
-  // compatibility endpoint keeps the historical strip behavior unchanged.
+  // Explicit prompt caching is retained on native GPT-6 channels and for models that support it
+  // (see preservesExplicitPromptCache); other models keep the historical strip behavior unchanged.
   if (!native) delete next.prompt_cache_options;
   next.store = false;
   next.input = Array.isArray(next.input) ? next.input.map((item) => stripWebSocketOnlyInputFields(item, native)) : [];
