@@ -76,6 +76,7 @@ import {
   turnReminderContent,
   turnReminderDeliveries
 } from '../capabilities/claudeTurnScopedReminders';
+import { claudeTurnScopedCompaction } from './turnReminderProjection';
 import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
@@ -1031,6 +1032,8 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     providerConfigId: compressionProvider.providerConfigId,
     provider: compressionProvider.provider,
     modelId: compressionProvider.modelId,
+    // 与普通请求一样把冻结的开关交给 capability：决定轮内系统消息形态、beta 头与网关回退。
+    ...(claudeTurnScopedCompaction(request.authoritySnapshot, recipe) ? { claudeTurnScopedReminders: true } : {}),
     compressionConfigId: requireText(methodConfig.id, 'Compression config id'),
     compressionMethodKind: methodKind,
     compressionTrigger: methodConfig.trigger,
@@ -1203,6 +1206,10 @@ function requireExecutableCompressionMethod(value: unknown): NonNullable<LlmComp
 
 function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
   const prior = request.priorSummaryContents ?? [];
+  // Claude 原生压缩带着的历史提醒已被清除，不计 token；重新注入输入的历史副本照常计入。
+  const deliveries = turnReminderDeliveries(request.contents, 'claude_turn_scoped');
+  const contents = request.contents.filter((content, index) =>
+    !readTurnReminderMarker(content) || deliveries[index] === 'user');
   if (request.methodKind === 'segmented_summary' && request.segments?.length) {
     const candidates = request.segments.map((segment, index) => estimateProjectedModelInput({
       ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
@@ -1217,7 +1224,7 @@ function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequest
   return estimateProjectedModelInput({
     ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
     ...(request.tools?.length ? { tools: request.tools } : {}),
-    contextContents: [...prior, ...request.contents],
+    contextContents: [...prior, ...contents],
     providerFramingTokens: request.methodKind === 'provider_native' ? 64 : 512
   });
 }
@@ -1261,6 +1268,12 @@ function compressionContext(
     && (methodKind !== 'provider_native' || recipe.sourceReplay === 'immutable_provenance')
     ? request.compressionSourceContext
     : request.context.slice(0, typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length);
+  // Claude 原生压缩按对话原样发送（见 claudeTurnScopedCompaction）：普通请求放回的历史提醒与重新注入的输入，
+  // 在这里放到同样的位置，按同样的规则投影与标记；发送形态仍由 claudeTurnScopedReminders.ts 决定。
+  const reminderHistory = claudeTurnScopedCompaction(request.authoritySnapshot, recipe)
+    ? turnReminderHistoryBySegment(request)
+    : undefined;
+  const historyInsertions: HistoryInsertion[] = [];
   const attachmentCatalogState = normalizeAttachmentCatalogState(
     request.attachmentCatalogState,
     'Compression request attachmentCatalogState'
@@ -1330,6 +1343,8 @@ function compressionContext(
       }
       else {
         const message = decodeMessageContent(item.content, item.contentType);
+        const historical = message?.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
+        if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
         decoded = message ? [message] : [{
           role: item.messageRole === 'model' ? 'model' : 'user',
           parts: [{ text: contextText(item.content, item.contentType) }]
@@ -1365,13 +1380,15 @@ function compressionContext(
   if (methodKind === 'provider_native') {
     // 独立 /responses/compact 拒绝 configuration_update 输入项：只剥传输级 reasoning 选择，
     // 语义上下文保持完整；有效 effort 由 Compression 的 rebase 计划在下一个请求重锚。
+    const projection = projectOrdinaryContentsWithDetachedInputs(
+      contents,
+      canonicalCompressionRanges,
+      modelHandleCatalog,
+      historyInsertions
+    );
     return {
       contents: stripNativeConfigurationUpdates(
-        projectOrdinaryContentsPreservingRanges(
-          contents,
-          canonicalCompressionRanges,
-          modelHandleCatalog
-        )
+        withTurnReminderMarkers(projection.contents, contents.length, projection.insertions, undefined)
       ).contents,
       segments: [],
       priorSummaryContents: [],

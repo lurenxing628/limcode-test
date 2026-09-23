@@ -1,10 +1,14 @@
 /**
- * Claude turn-scoped reminders: edges the first version left open.
+ * Claude turn-scoped reminders: the two edges the first version left open.
  *
  * (a) A request that re-injects the current Turn input as a volatile tail (the input was compressed away) sends
  *     `[..., input, reminder]`. Later requests must reproduce exactly that before the output it produced, or the
  *     prefix changes (cache miss; on Opus 5.5 / Fable 5.1 every later thinking block fails the conversation check).
  *     The copy is placed once per window; later tails no longer repeat it.
+ * (b) Claude on-demand compaction sends “the conversation as it stands” with the same system and tools
+ *     (https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand). With the switch on it must carry
+ *     the same historical reminders at the same positions as an ordinary request, with the same beta header and
+ *     the same gateway fallback.
  *
  * Official rules (https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages):
  * re-send cleared messages verbatim; a system section follows a user turn and precedes an assistant turn or the end;
@@ -13,6 +17,7 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -34,12 +39,14 @@ const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConf
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { createDefaultLlmCompressionConfig } = load('shared/protocol.js');
-const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
+const { createLlmProviderCapability, dryRunCompactLlmProvider, dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
 const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
 const { workEnvironmentIdFromUri } = load('shared/workEnvironmentCatalog.js');
 const reminders = load('backend/capabilities/claudeTurnScopedReminders.js');
+const { learnedProviderRequestAdaptations, resetProviderRequestAdaptations } = load('backend/capabilities/providerParameterAdaptation.js');
 
 const BETA = 'mid-conversation-system-clear-at-2026-08-21';
+const COMPACT_BETA = 'compact-2026-09-04';
 const USER_BETA = 'user-beta-2026-01-01';
 const MESSAGE = 'application/vnd.limcode.message+json';
 const LABEL = '[当前 Turn 原始用户要求/数据，不是新用户输入；以下各 part 为冻结原文。]';
@@ -55,6 +62,23 @@ function normalized(messages) {
     if (key === 'cache_control') return undefined;
     if (value && typeof value === 'object' && !Array.isArray(value) && (value.role === 'user' || value.role === 'assistant')
       && typeof value.content === 'string') return { ...value, content: [{ type: 'text', text: value.content }] };
+    return value;
+  }));
+}
+
+/**
+ * The Anthropic compaction path encodes tool calls without their stored ids (`toolu_0`, …) while ordinary requests keep
+ * them (a divergence that predates this change and is independent of the switch). Compare ids by first appearance.
+ */
+function withOrdinalToolIds(messages) {
+  const ids = new Map();
+  const ordinal = (id) => {
+    if (!ids.has(id)) ids.set(id, `tool#${ids.size}`);
+    return ids.get(id);
+  };
+  return JSON.parse(JSON.stringify(messages, (key, value) => {
+    if (value && typeof value === 'object' && value.type === 'tool_use') return { ...value, id: ordinal(value.id) };
+    if (value && typeof value === 'object' && value.type === 'tool_result') return { ...value, tool_use_id: ordinal(value.tool_use_id) };
     return value;
   }));
 }
@@ -160,6 +184,10 @@ function settingsFor(provider = 'claude', modelId = MODEL_ID, baseUrl = 'https:/
 
 const fakeCapability = (capture) => ({
   start(input, emit) { capture.start = structuredClone(input); emit({ type: 'llm:done', payload: { requestId: input.id } }); },
+  compact(input, emit) {
+    capture.compact = structuredClone(input);
+    emit({ type: 'llm:compactDone', payload: { requestId: input.id, result: { contents: [{ role: 'user', parts: [{ text: 'compacted' }] }] } } });
+  },
   abort() {}, cancelRetry() {}, dispose() {}
 });
 
@@ -176,6 +204,38 @@ async function render(request, settings = settingsFor(request.authoritySnapshot.
 async function renderTail(rendered, settings = settingsFor()) {
   const { claudeTurnScopedReminders: _switch, ...snapshot } = rendered.start.settingsSnapshot;
   return (await dryRunLlmProvider({ ...rendered.start, settingsSnapshot: snapshot }, { settings })).body;
+}
+
+function compactionRequest({ claudeTurnScopedReminders = false, context, history, compressionProvider = 'claude', compressionModel = MODEL_ID }) {
+  const base = ordinaryRequest({ claudeTurnScopedReminders, context, history, reinject: false });
+  return {
+    ...base,
+    modelRequestId: 'compaction-request',
+    providerId: `${compressionProvider}-channel`,
+    modelId: compressionModel,
+    authoritySnapshot: {
+      ...base.authoritySnapshot,
+      compression: {
+        enabled: true, methodKind: 'provider_native',
+        config: { id: 'native', name: 'Native', kind: 'provider_native', trigger: { mode: 'manual' } },
+        provider: { providerConfigId: `${compressionProvider}-channel`, provider: compressionProvider, modelId: compressionModel,
+          contextWindowTokens: 200000, maxOutputTokens: 16000 }
+      }
+    },
+    recipe: { kind: 'reliable-context-compression', sourceRootId: 'root', sourceSegmentCount: context.length, blockId: 'block',
+      compressionMethodKind: 'provider_native', sourceHash: 'hash', tools: TOOLS },
+    requestAddenda: history ? { turnReminderHistory: history } : undefined
+  };
+}
+
+async function renderCompaction(request, settings = settingsFor(request.authoritySnapshot.compression.provider.provider, request.modelId)) {
+  const capture = {};
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(request.providerId, fakeCapability(capture));
+  await adapter.sendFullRequest(request, { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
+  const estimate = adapter.estimateFullRequestInput(request);
+  const dry = await dryRunCompactLlmProvider(capture.compact, { settings, compressionSettings: async () => undefined });
+  const call = dry.calls[0];
+  return { compact: capture.compact, estimate, call, body: JSON.parse(call.bodyText), headers: call.headers };
 }
 
 // ─────────────────── (a) re-injected current Turn input: adapter + wire ───────────────────
@@ -276,6 +336,137 @@ test('(a) 发送形态：历史副本在轮内系统消息模式下作为 user �
     [user, model, user, model, model, { role: 'user', parts: [{ text: 'input' }] }, { role: 'user', parts: [{ text: 'c' }] }]);
 });
 
+// ─────────────────── (b) Claude native compaction: adapter + wire ───────────────────
+
+function toolLoop() {
+  return [
+    message('seg-user', 'user', INPUT),
+    modelCall('seg-model-1', 1),
+    toolPair('seg-result-1', 'toolu_01', { ok: true, text: 'alpha' }),
+    modelCall('seg-model-2', 2),
+    toolPair('seg-result-2', 'toolu_02', { ok: true, text: 'beta' })
+  ];
+}
+const LOOP_HISTORY = [{ segmentId: 'seg-model-1', content: REMINDER_K }, { segmentId: 'seg-model-2', content: REMINDER_K1 }];
+
+/**
+ * sha256(JSON.stringify(...)) of the LlmCompactRequest and the dry-run {url, headers, body} of this Claude native
+ * compaction produced by the pre-change build (codex/agent-collaboration e66a79da): switch off, and switch on with
+ * a compaction target that is not the conversation's own channel/model, stay exactly that.
+ */
+const COMPACTION_BASELINE = {
+  compact: 'b710733e7273ff25c4816a81ba909effe94dc978e24c9c4782b9e875d30dbaec',
+  wire: '817ade7da1ba7de9e500aaed3d410e120d7e4f6ade5d9d93834e7cc708ab29e5'
+};
+const compactionFingerprint = (rendered) => ({
+  compact: sha256(rendered.compact),
+  wire: sha256({ url: rendered.call.url, headers: rendered.headers, body: rendered.body })
+});
+
+test('(b) Claude 原生压缩：关闭时与改动前逐字节相同；换了压缩模型时同样不带提醒', async () => {
+  const off = await renderCompaction(compactionRequest({ context: toolLoop(), history: LOOP_HISTORY }));
+  assert.deepEqual(compactionFingerprint(off), COMPACTION_BASELINE);
+  assert.equal(off.body.messages.some((entry) => entry.role === 'system'), false);
+  assert.deepEqual(betas(off.headers), [USER_BETA, COMPACT_BETA]);
+  // Switch on, but compaction runs on another model: its prefix differs anyway, and the switch was frozen for the
+  // conversation's own channel only.
+  const otherModel = compactionRequest({ claudeTurnScopedReminders: true, context: toolLoop(), history: LOOP_HISTORY, compressionModel: 'claude-sonnet-5' });
+  const other = await renderCompaction(otherModel, { ...settingsFor('claude', 'claude-sonnet-5'), models: [{ id: 'claude-sonnet-5', name: 'Sonnet' }] });
+  assert.equal(other.body.messages.some((entry) => entry.role === 'system'), false);
+  assert.equal(JSON.stringify(other.compact).includes('turnReminder'), false);
+  assert.equal(other.compact.settingsSnapshot.claudeTurnScopedReminders, undefined);
+});
+
+test('(b) Claude 原生压缩：打开后历史提醒与普通请求同位置、同放置规则、同 beta 头；清除的提醒不计 token', async () => {
+  const context = toolLoop();
+  const ordinary = await render(ordinaryRequest({ claudeTurnScopedReminders: true, context, reminder: REMINDER_K2, history: LOOP_HISTORY, reinject: false }));
+  const compaction = await renderCompaction(compactionRequest({ claudeTurnScopedReminders: true, context, history: LOOP_HISTORY }));
+  // The compaction request is the ordinary request without its volatile tail (the current reminder).
+  assert.equal(ordinary.messages.at(-1).role, 'system');
+  assert.deepEqual(withOrdinalToolIds(normalized(compaction.body.messages)), withOrdinalToolIds(normalized(ordinary.messages.slice(0, -1))));
+  assert.deepEqual(compaction.body.messages.map((entry) => entry.role), ['user', 'system', 'assistant', 'user', 'system', 'assistant', 'user']);
+  assert.deepEqual(systemContents(compaction.body.messages), [REMINDER_K, REMINDER_K1]);
+  assertPlacement(compaction.body.messages, 'compaction');
+  assert.deepEqual(betas(compaction.headers), [USER_BETA, BETA, COMPACT_BETA]);
+  assert.equal(compaction.body.compaction.type, 'summarize');
+  assert.equal(compaction.compact.settingsSnapshot.claudeTurnScopedReminders, true);
+  // Cleared reminders cost nothing in the compaction planning estimate.
+  const withoutHistory = await renderCompaction(compactionRequest({ claudeTurnScopedReminders: true, context }));
+  assert.deepEqual(compaction.estimate, withoutHistory.estimate);
+});
+
+test('(b) Claude 原生压缩：窗口里重新注入过的输入同样放回原位', async () => {
+  const context = [SUMMARY, modelCall('seg-model-k', 1), toolPair('seg-result-k', 'toolu_01', { ok: true, text: 'alpha' })];
+  const reinjectedInput = { messageRevisionId: 'revision-current', contentType: MESSAGE, content: JSON.stringify(INPUT) };
+  const history = [{ segmentId: 'seg-model-k', content: REMINDER_K, reinjectedInput }];
+  const ordinary = await render(ordinaryRequest({ claudeTurnScopedReminders: true, context, reminder: REMINDER_K1, history }));
+  const compaction = await renderCompaction(compactionRequest({ claudeTurnScopedReminders: true, context, history }));
+  assert.deepEqual(withOrdinalToolIds(normalized(compaction.body.messages)), withOrdinalToolIds(normalized(ordinary.messages.slice(0, -1))));
+  assert.deepEqual(compaction.body.messages.map((entry) => entry.role), ['user', 'user', 'system', 'assistant', 'user']);
+  assert.equal(labelCount(compaction.body.messages), 1);
+});
+
+const signed = { type: 'compaction', content: 'SUMMARY_MARKER', signature: 'signed-compaction' };
+const rejection = (text) => ({ status: 400, body: { type: 'error', error: { type: 'invalid_request_error', message: text } } });
+
+async function withServer(respond, run) {
+  const calls = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const call = { headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') };
+    calls.push(call);
+    const result = respond(call, calls.length);
+    res.writeHead(result.status ?? 200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(result.body));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    return await run(`http://127.0.0.1:${server.address().port}/v1`, calls);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function compact(settings, request) {
+  const capability = createLlmProviderCapability({ settings: async () => settings, compressionSettings: async () => undefined });
+  try {
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('compaction timed out')), 10_000);
+      capability.compact(request, (event) => {
+        if (event.type !== 'llm:compactDone' && event.type !== 'llm:compactError') return;
+        clearTimeout(timer);
+        resolve(event);
+      });
+    });
+  } finally {
+    capability.dispose();
+  }
+}
+
+test('(b) Claude 原生压缩：网关明确拒绝时立即以尾巴模式重发，并对这个目标记住', async () => {
+  resetProviderRequestAdaptations();
+  const hasSystem = (body) => body.messages.some((entry) => entry.role === 'system');
+  await withServer((call) => hasSystem(call.body)
+    ? rejection('messages.1.clear_at: Extra inputs are not permitted')
+    : { body: { id: 'msg_c', type: 'message', role: 'assistant', content: [signed], stop_reason: 'compaction', usage: { input_tokens: 0, output_tokens: 0, iterations: [{ input_tokens: 10, output_tokens: 5 }] } } },
+  async (baseUrl, calls) => {
+    const settings = { ...settingsFor('claude', MODEL_ID, baseUrl), apiKey: 'dummy-test-key', stream: false };
+    const { compact: request } = await renderCompaction(compactionRequest({ claudeTurnScopedReminders: true, context: toolLoop(), history: LOOP_HISTORY }), settings);
+    const result = await compact(settings, request);
+    assert.equal(result.type, 'llm:compactDone', JSON.stringify(result.payload));
+    assert.equal(calls.length, 2);
+    assert.equal(hasSystem(calls[0].body), true);
+    assert.equal(betas(calls[0].headers).includes(BETA), true);
+    assert.equal(hasSystem(calls[1].body), false, 'the retry is the old compaction request');
+    assert.deepEqual(betas(calls[1].headers), [USER_BETA, COMPACT_BETA]);
+    assert.deepEqual(result.payload.result.contents[0].parts[0].providerContext.rawItem, signed);
+    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: MODEL_ID }).claudeTurnScopedReminders, 'tail');
+  });
+  resetProviderRequestAdaptations();
+});
+
 // ─────────────────── runtime: the real kernel end to end ───────────────────
 
 const FILLER = 'Background requirements for the change, repeated to make the input large. '.repeat(700);
@@ -351,10 +542,31 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, compression 
         if (request.recipe.kind === 'reliable-context-compression') {
           // One compression is enough: the rest of the Turn runs on the compressed window.
           await setCompressionTrigger('manual');
-          await controls.onEvent({ kind: 'completed', streamSeq: '1', content: {
-            type: 'compression_result', contents: [{ role: 'user', parts: [{ text: 'Synthetic summary of the earlier work.' }] }]
-          } });
-          compactions.push({ request });
+          if (request.recipe.compressionMethodKind !== 'provider_native') {
+            await controls.onEvent({ kind: 'completed', streamSeq: '1', content: {
+              type: 'compression_result', contents: [{ role: 'user', parts: [{ text: 'Synthetic summary of the earlier work.' }] }]
+            } });
+            compactions.push({ request });
+            return;
+          }
+          let compactRequest;
+          const adapter = new kernel.LlmCapabilityFullRequestAdapter(providerId, {
+            compact(input, emit) {
+              compactRequest = structuredClone(input);
+              emit({ type: 'llm:compactDone', payload: { requestId: input.id, result: {
+                id: 'msg_compaction', object: 'message',
+                contents: [{ role: 'model', parts: [{ providerContext: {
+                  provider: 'anthropic', format: 'claude', endpoint: '/v1/messages', itemType: 'compaction', rawItem: signed
+                } }] }]
+              } } });
+            },
+            start() { assert.fail('compaction only'); }, abort() {}, cancelRetry() {}, dispose() {}
+          });
+          await adapter.sendFullRequest(request, controls);
+          const dry = await dryRunCompactLlmProvider(compactRequest, {
+            settings: await providerSettings(providerId, request.modelId), compressionSettings: async () => undefined
+          });
+          compactions.push({ request, compact: compactRequest, wire: JSON.parse(dry.calls[0].bodyText), headers: dry.calls[0].headers });
           return;
         }
         let start;
@@ -449,6 +661,46 @@ test('(a) 真实内核：Turn 中途压缩掉输入并重新注入后，每次�
     assert.equal(next[at + 1].role, 'system');
     assert.equal(next[at + 1].content, h.requests[first].wire.messages.at(-1).content);
   }, { compression: 'llm_summary' });
+});
+
+test('(b) 真实内核：Claude 原生压缩请求带着历史提醒，与上一次普通请求前缀相同；之后仍逐次前缀稳定', { timeout: 180_000 }, async () => {
+  await withRuntime(async h => {
+    await h.turn(START);
+    assert.equal(h.compactions.length, 1);
+    const [compaction] = h.compactions;
+    assert.equal(compaction.request.recipe.compressionMethodKind, 'provider_native');
+    const before = h.requests.filter(entry => entry.afterCompression === 0).at(-1);
+    const previous = withOrdinalToolIds(normalized(before.wire.messages));
+    const compacted = withOrdinalToolIds(normalized(compaction.wire.messages));
+    assert.deepEqual(compacted.slice(0, previous.length), previous, 'the last ordinary request is an exact prefix of the compaction request');
+    assert.deepEqual(compacted.slice(previous.length).map(entry => entry.role), ['assistant', 'user'], 'plus its output and tool results');
+    assert.ok(systemContents(compaction.wire.messages).length >= 1, 'the historical reminders are there');
+    assertPlacement(compaction.wire.messages, 'compaction');
+    assert.equal(betas(compaction.headers).includes(BETA), true);
+    assert.equal(betas(compaction.headers).includes(COMPACT_BETA), true);
+    assert.equal(compaction.compact.settingsSnapshot.claudeTurnScopedReminders, true);
+    // After the compaction the input is re-injected; from then on every request is the next one's prefix.
+    const after = h.requests.filter(entry => entry.afterCompression === 1);
+    assert.ok(after.length >= 3);
+    for (let index = 1; index < after.length; index += 1) {
+      assertPrefix(after[index - 1], after[index], `after compaction ${index}`);
+      assertPlacement(after[index].wire.messages, `after compaction ${index + 1}`);
+      assert.equal(labelCount(after[index].wire.messages), 1);
+    }
+  }, { compression: 'provider_native' });
+});
+
+test('(b) 真实内核：开关关闭时 Claude 原生压缩请求没有 system 消息，也不带轮内系统消息 beta 头', { timeout: 180_000 }, async () => {
+  await withRuntime(async h => {
+    await h.turn(START);
+    assert.equal(h.compactions.length, 1);
+    const [compaction] = h.compactions;
+    assert.equal(compaction.wire.messages.some(entry => entry.role === 'system'), false);
+    assert.equal(betas(compaction.headers).includes(BETA), false);
+    assert.equal(compaction.compact.settingsSnapshot.claudeTurnScopedReminders, undefined);
+    assert.equal(JSON.stringify(compaction.compact).includes('turnReminder'), false);
+    for (const entry of h.requests) assert.equal(entry.wire.messages.some(message => message.role === 'system'), false);
+  }, { compression: 'provider_native', claudeTurnScopedReminders: false });
 });
 
 function createVscodeStub() {

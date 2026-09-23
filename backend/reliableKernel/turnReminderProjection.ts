@@ -73,6 +73,32 @@ export function claudeTurnScopedRemindersEnabled(authority: PlainJsonValue | und
   return model?.provider === 'claude' && model.claudeTurnScopedReminders === true;
 }
 
+/**
+ * Claude 原生压缩（on-demand compaction）也按轮内系统消息模式发送历史：官方要求 “Send the conversation as it stands”，
+ * 与普通请求用同样的 system、tools 与消息；普通请求发过的历史提醒和重新注入的输入少了，前缀就与普通请求不同，
+ * 缓存命中不了，那些消息之后的思考块也不再属于同一段对话。
+ * 只在压缩目标就是本轮对话所用的同一 Claude 渠道与模型时成立（开关只对那个渠道冻结）；换渠道或换模型的压缩前缀本来就不同，
+ * 保持原样。从原始记录重建（immutable_provenance）的压缩不是任何普通请求的前缀，也保持原样。
+ */
+export function claudeTurnScopedCompaction(
+  authority: PlainJsonValue | undefined,
+  recipe: PlainJsonValue | undefined
+): boolean {
+  if (!claudeTurnScopedRemindersEnabled(authority) || !isRecord(authority)) return false;
+  if (!isRecord(recipe) || recipe.kind !== 'reliable-context-compression'
+    || recipe.compressionMethodKind !== 'provider_native' || recipe.sourceReplay !== undefined) {
+    return false;
+  }
+  const model = isRecord(authority.model) ? authority.model : undefined;
+  const compression = isRecord(authority.compression) ? authority.compression : undefined;
+  const provider = compression && isRecord(compression.provider) ? compression.provider : undefined;
+  return provider?.provider === 'claude'
+    && typeof provider.providerConfigId === 'string'
+    && provider.providerConfigId === model?.providerConfigId
+    && typeof provider.modelId === 'string'
+    && provider.modelId === model?.modelId;
+}
+
 function nonNegativeRecipeInteger(container: PlainJsonValue | undefined, key: string): number {
   const record = isRecord(container) ? container : undefined;
   const value = record?.[key];

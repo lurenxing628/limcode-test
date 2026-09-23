@@ -28,7 +28,11 @@ import {
   installEncodedRequestPostProcessor,
   type ProviderRequestTarget
 } from './providerParameterAdaptation';
-import { withClaudeTurnScopedSystemBeta, type TurnReminderLayout } from './claudeTurnScopedReminders';
+import {
+  layoutTurnReminderContents,
+  withClaudeTurnScopedSystemBeta,
+  type TurnReminderLayout
+} from './claudeTurnScopedReminders';
 import {
   assertCanonicalProviderToolContext,
   cloneInlineDataPart,
@@ -1757,8 +1761,10 @@ async function dryRunProviderNativeCompact(
   dryRunOptions: LlmDryRunOptions
 ): Promise<LlmDryRunResult> {
   const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
-  const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
-  const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
+  const canonicalContext = assertCanonicalProviderToolContext(preparedContext);
+  const settings = await resolveCompactProviderSettings(request, methodConfig, canonicalContext, options);
+  // Claude 原生压缩与普通请求一样放置历史提醒；其他目标、关闭与网关回退时没有轮内系统消息（无标记时原样返回同一个数组）。
+  const normalizedContext = layoutTurnReminderContents(canonicalContext, turnReminderLayoutFor(request, settings));
   if (settings.provider === 'claude') {
     return dryRunAnthropicCompaction(request, methodConfig, normalizedContext, settings, options, dryRunOptions);
   }
@@ -1918,7 +1924,9 @@ export async function compactLlmProvider(
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
     // 摘要类方法在 executeSummaryProviderCall 内逐次调用自适配；这里只覆盖单次调用的原生压缩。
     const adaptationRetry = retrySettings && methodConfig.kind === 'provider_native'
-      ? createProviderRequestAdaptationRetry(providerRequestTarget(retrySettings))
+      ? createProviderRequestAdaptationRetry(providerRequestTarget(retrySettings), {
+          claudeTurnScopedReminders: claudeTurnScopedRemindersRequested(request, retrySettings)
+        })
       : undefined;
     let retryCount = 0;
     let sawRetry = false;
@@ -2141,8 +2149,10 @@ async function compactWithProviderNative(
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
   const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
-  const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
-  const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
+  const canonicalContext = assertCanonicalProviderToolContext(preparedContext);
+  const settings = await resolveCompactProviderSettings(request, methodConfig, canonicalContext, options);
+  // 每次尝试按当前记忆决定形态：网关明确拒绝过轮内系统消息的目标退回尾巴模式（历史提醒不发）。
+  const normalizedContext = layoutTurnReminderContents(canonicalContext, turnReminderLayoutFor(request, settings));
 
   if (settings.provider === 'claude') {
     return compactWithAnthropic(request, methodConfig, normalizedContext, settings, options, signal);
@@ -2386,7 +2396,8 @@ async function buildAnthropicCompactionRequest(
     ...((request.nativeRequestBody ?? settings.requestBody) ? { requestBody: request.nativeRequestBody ?? settings.requestBody } : {}),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings);
+  }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings,
+  claudeTurnScopedRemindersRequested(request, settings));
   const generationConfig = request.nativeGenerationConfig ?? settings.generationConfig;
   const systemInstruction = prependSystemInstructionPrefix(
     request.systemInstruction,

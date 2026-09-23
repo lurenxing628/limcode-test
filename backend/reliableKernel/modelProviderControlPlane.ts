@@ -30,6 +30,7 @@ import {
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane, type MaterializedContextSegment } from './contextSequence';
 import {
+  claudeTurnScopedCompaction,
   claudeTurnScopedRemindersEnabled,
   projectTurnReminder,
   recipeReinjectedCurrentTurnInput,
@@ -173,7 +174,7 @@ export interface FullProviderRequest {
      * - content：那次请求的提醒；
      * - reinjectedInput：那次请求作为易失尾巴重新注入的当前 Turn 输入。同一窗口里同一条输入只在第一次出现时带上：
      *   之后的请求看到它已在窗口里，尾巴不再重发，因此也就没有要放回的副本。
-     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里。
+     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里。普通请求与同渠道同模型的 Claude 原生压缩请求才有。
      */
     turnReminderHistory?: TurnReminderHistoryEntry[];
   };
@@ -2269,9 +2270,8 @@ export class ModelProviderControlPlane {
     recipe: PlainJsonValue,
     segments: readonly MaterializedContextSegment[]
   ): Promise<TurnReminderHistoryEntry[] | undefined> {
-    if (!isRecord(recipe) || recipe.kind !== 'reliable-agent-turn' || !claudeTurnScopedRemindersEnabled(authority)) {
-      return undefined;
-    }
+    const ordinary = isRecord(recipe) && recipe.kind === 'reliable-agent-turn' && claudeTurnScopedRemindersEnabled(authority);
+    if (!ordinary && !claudeTurnScopedCompaction(authority, recipe)) return undefined;
     const sources = segments.filter((segment) => segment.segmentKind === 'message'
       && segment.messageRole === 'model'
       && typeof segment.sourceRecipeObjectId === 'string');
