@@ -1717,12 +1717,13 @@ async function dryRunProviderNativeCompact(
   if (typeof provider.compactDryRun !== 'function') {
     throw new Error('当前 unified-llm-provider 版本不支持 provider.compactDryRun。');
   }
+  const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
   const result = await provider.compactDryRun(
     { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
     {
       inputFormat: 'unified',
       outputFormat: 'unified',
-      ...(requestBody ? { requestBody } : {}),
+      ...(compactRequestBody ? { requestBody: compactRequestBody } : {}),
       curl: { includeApiKey: dryRunOptions.includeApiKey === true, prettyBody: true }
     }
   );
@@ -2125,13 +2126,14 @@ async function compactWithProviderNative(
       normalizedContentCount: normalizedContext.length,
       signalAborted: signal?.aborted === true
     });
+    const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
     compacted = await provider.compact(
       { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
       {
         inputFormat: 'unified',
         outputFormat: 'unified',
         signal,
-        ...(requestBody ? { requestBody } : {})
+        ...(compactRequestBody ? { requestBody: compactRequestBody } : {})
       }
     );
     if (hasUnifiedError(compacted)) {
@@ -2340,6 +2342,30 @@ async function buildAnthropicCompactionRequest(
     unified,
     fetch: providerFetch
   };
+}
+
+/**
+ * `/responses/compact` 只接受这些请求体字段
+ * （https://developers.openai.com/api/reference/resources/responses/methods/compact 的 Body Parameters）。
+ * 渠道 requestBody 面向 `/responses`，其中的 context_management、reasoning、store 等并入压缩请求会得到
+ * 400 Unknown parameter；只转发官方允许的字段。全部是允许字段时原样返回同一引用。
+ */
+const OPENAI_RESPONSES_COMPACT_BODY_FIELDS: ReadonlySet<string> = new Set([
+  'model',
+  'input',
+  'instructions',
+  'previous_response_id',
+  'prompt_cache_key',
+  'prompt_cache_options',
+  'prompt_cache_retention',
+  'service_tier'
+]);
+
+function openAIResponsesCompactRequestBody(requestBody: LlmRequestBodyRecord | undefined): LlmRequestBodyRecord | undefined {
+  if (!requestBody) return requestBody;
+  const entries = Object.entries(requestBody).filter(([key]) => OPENAI_RESPONSES_COMPACT_BODY_FIELDS.has(key));
+  if (entries.length === Object.keys(requestBody).length) return requestBody;
+  return entries.length > 0 ? Object.fromEntries(entries) as LlmRequestBodyRecord : undefined;
 }
 
 function anthropicCompactionBody(value: unknown, methodConfig: LlmCompressionConfigRecord): Record<string, unknown> {
