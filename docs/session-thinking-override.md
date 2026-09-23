@@ -25,7 +25,8 @@
 |---|---|---|
 | OpenAI-compatible，已知 o1/o3/o4（不含 o1-mini/preview） | effort → `reasoning_effort` | low/medium/high；第三方同名转发仍未真实联调 |
 | OpenAI-compatible / Responses，GPT-5 / 5.1 / 5.2 已列明型号 | 分模型 effort；Responses → `reasoning.effort` | 5 为 minimal/low/medium/high；5.1（含2025-11-13）为 none/low/medium/high；5.2（含2025-12-11）才开放 xhigh；未知小版本不按小数点推能力 |
-| Responses，精确 Astra（复用现有识别） | effort + 原有 native continuation | none/minimal 不作为新选项；现有渠道配置适配为 low 时明确标注 |
+| Responses，精确 Astra（复用现有识别） | effort + 原有 native continuation | low/medium/high/xhigh/max；none/minimal 不作为新选项；现有渠道配置适配为 low 时明确标注 |
+| OpenAI-compatible / Responses，精确 GPT-6 Sol / Luna（含日期快照） | effort；Responses 另有 native continuation | none/low/medium/high/xhigh/max，官方默认 medium；minimal 适配为 low 时明确标注；强度不是 none 时去掉采样参数 |
 | Gemini 2.5 文本 Pro / Flash | `thinkingBudget` | -1 自动；Pro不允许0；Flash允许0；模型范围与输出上限校验；image/audio/live不开放预算快捷入口 |
 | Gemini 3.x | `thinkingLevel` | 复用 shared/geminiThinking 按具体型号等级集合；不发送预算 |
 | Claude 3.7 Sonnet / 已识别旧4系 | `thinking.budget_tokens` | 明确 maxOutputTokens；整数≥1024且小于输出上限；temperature仅省略/1，top_k省略，top_p仅省略或0.95–1，不合法拒绝保存 |

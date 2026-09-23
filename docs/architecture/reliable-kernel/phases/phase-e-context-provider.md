@@ -40,7 +40,7 @@ Phase E 的 stable ID 验证可靠内核 control plane 本身；旧应用 LLM/co
 
 ## Astra 原生 Responses 执行边界
 
-- 能力门禁由 `shared/openAIResponsesCapabilities.ts` 统一计算：协议、精确型号、渠道信任/中继确认与传输缺一不可。HTTP/SSE 和 WebSocket 都支持原生工具链及动态推理；转向和多路复用仅用于 WebSocket。其他模型沿用原行为。
+- 能力门禁由 `shared/openAIResponsesCapabilities.ts` 统一计算：协议、精确型号（GPT-6 家族 `gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna` 及日期快照）、渠道信任/中继确认与传输缺一不可。HTTP/SSE 和 WebSocket 都支持原生工具链及动态推理（pro 推理模式下不使用动态推理更新）；转向和多路复用仅用于 WebSocket。其他模型沿用原行为。
 - 一个原生 `ModelRequest` 可以包含多个物理 response。持久化 `{attemptSeq, socketGeneration, streamSeq}` 始终存在；物理 `connectionGeneration`、`streamId`、实际发送的 `previousResponseId` 仅在真实存在时记录，HTTP 不伪造这些身份。
 - `native_control`、`native_tool_call` 是不可被普通流式容量上限丢弃的 checkpoint。`output_item.done` 的实际 `async:true` 加冻结的逐工具许可才允许早期准入；缺省/false 必须等本 response 的完成边界。原生控制器在同步结果未回传时同样保持存活，不依赖转向或另一个异步调用来解锁。
 - `NativeRequestSession` 通过 `ReliableToolDispatcher.scheduleAdmittedCall` 使用既有审批、取消、幂等和分类调度限制，不另建绕过策略的执行队列。调用准入事实与调用一起持久化；terminal checkpoint 收敛后仍由 `ToolCallEvent` 的 CAS 事实恢复。
