@@ -1043,6 +1043,34 @@ test('create_conversation that cannot run leaves no conversation behind, not eve
   }, { runAgentConfig: { maxAutomaticFollowups: 0 } });
 });
 
+test('create_conversation refused at admission clears settings a crashed earlier attempt left, and only then', { timeout: 60000 }, async () => {
+  let rootRound = 0, leftoverId;
+  await fixture(async (request, f, start) => {
+    assert.equal(request.conversationId, ROOT);
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('create-after-crash', 'create_conversation', { prompt: 'CRASHED_TASK_3310' }));
+    assert.match(JSON.stringify(lastResult(start, 'create_conversation')), /budget exhausted \(0\)/);
+    return answer('Could not delegate.');
+  }, async f => {
+    const mutations = f.configuration.mutations;
+    const clear = mutations.clearConversationConfiguration;
+    const cleared = [];
+    mutations.clearConversationConfiguration = async function(conversationId) { cleared.push(conversationId); return clear.call(this, conversationId); };
+    const started = await f.input(ROOT, 'create after a crash');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.ok(leftoverId);
+    assert.deepEqual(await f.rows('Conversation', { id: leftoverId }), []);
+    assert.deepEqual(await f.settingsFor(leftoverId), { modelProfiles: [], workEnvironments: [] }, 'the crashed attempt\'s settings are gone');
+    assert.deepEqual(cleared, [leftoverId]);
+  }, { runAgentConfig: { maxAutomaticFollowups: 0 }, async dispatchHook(input, f) {
+    if (input.toolName !== 'create_conversation') return;
+    // An earlier attempt of this call wrote its settings, then its Host died before the commit.
+    leftoverId = kernel.stablePhaseFId('conversation', 'cross-create', input.toolCallId);
+    await f.configuration.mutations.initializeConversationModelProfile({ conversationId: leftoverId, providerConfigId: 'synthetic-cross', model: 'gpt-6-astra' });
+    assert.equal((await f.settingsFor(leftoverId)).modelProfiles.length, 1);
+  } });
+});
+
 test('create_conversation with an unavailable work environment writes nothing', { timeout: 60000 }, async () => {
   let rootRound = 0;
   await fixture(async (request, f, start) => {

@@ -139,7 +139,12 @@ export class ReliableConversationLifecycle {
         const replayed = await collaboration.send(task);
         return { conversationId, title: String(existing.title), messageId: replayed.messageId, deduplicated: true };
       }
-      await collaboration.admitConversationCreation({ turnId, toolCallId });
+      try {
+        await collaboration.admitConversationCreation({ turnId, toolCallId });
+      } catch (error) {
+        await this.discardCrashedCreationSettings(conversationId);
+        throw error;
+      }
       // The calling Turn's frozen selection fixes the model and work environment the new
       // Conversation starts with; everything else comes from its own settings scopes.
       const [model, environment, agent, project] = await Promise.all([
@@ -149,9 +154,8 @@ export class ReliableConversationLifecycle {
         projectFolderForConversation(this.application.database, sourceConversationId)
       ]);
       // Settings go first and only fill empty slots. Once their writes have started, a failed
-      // attempt clears them again; a refusal before that has nothing to clear. Only a Host that
-      // dies before the commit leaves settings nothing refers to, which the replay of this call
-      // reuses.
+      // attempt clears them again. Only a Host that dies before the commit leaves settings nothing
+      // refers to: a replay of this call reuses them, and a replay refused at admission clears them.
       try {
         if (environment?.defaultWorkEnvironmentId) {
           await this.configuration.mutations.initializeConversationWorkEnvironment(conversationId, environment.defaultWorkEnvironmentId);
@@ -179,6 +183,26 @@ export class ReliableConversationLifecycle {
         throw error;
       }
     });
+  }
+
+  /**
+   * A refused call never creates its Conversation, yet a Host that died between an earlier
+   * attempt's settings writes and its commit left them under this id. They are removed only when a
+   * read finds some, so an ordinary refusal never takes the settings lock.
+   */
+  private async discardCrashedCreationSettings(conversationId: string): Promise<void> {
+    try {
+      if (await this.maybeRow('Conversation', conversationId)) return;
+      const state = await this.configuration.configurationClientState();
+      const leftover = state.modelProfileScopeLinks.some((link) => link.scopeKind === 'conversation' && link.scopeId === conversationId)
+        || state.conversationWorkEnvironmentLinks.some((link) => link.conversationId === conversationId);
+      if (leftover) await this.configuration.mutations.clearConversationConfiguration(conversationId);
+    } catch (cleanupError) {
+      console.warn(
+        `[reliable-kernel] failed to clear settings a crashed creation left for ${conversationId}:`,
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      );
+    }
   }
 
   /**
