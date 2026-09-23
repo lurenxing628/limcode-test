@@ -939,6 +939,57 @@ test('MCP 全来源拒绝只由内置只读范围携带，更具体的层不能�
     'an all-sources entry never enables anything');
 });
 
+test('内置只读范围的全来源拒绝不被该范围保存的全来源值覆盖；保存的全来源值不是对象时按拒绝处理', async () => {
+  const { toolAllowedByPolicy, toolPolicyScopeLayer } = require('../../dist/extension/shared/toolPolicyResolution.js');
+  const { TOOL_POLICY_ALL_MCP_SOURCES: ALL } = require('../../dist/extension/shared/protocol.js');
+  const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+  const blueprints = createDefaultAgentBlueprints();
+  const tool = (sourceId) => ({ name: `${sourceId}_tool`, source: { kind: 'mcp', sourceId } });
+  const resolve = (...layers) => resolveToolPolicyLayers(layers.filter(Boolean), []);
+  const global = { scopeKind: 'global', policy: { sourceConfigs: { exa: { enabled: true } } } };
+  const savedValues = [{ enabled: true }, null, 'x', [], 1];
+  for (const [scopeKind, builtin] of [['agent', blueprints.agents.explore.toolPolicy], ['workflow', blueprints.workflows.readonly.toolPolicy]]) {
+    for (const value of savedValues) {
+      const saved = { sourceConfigs: { [ALL]: value, other: { enabled: true } } };
+      const policy = resolve(global, toolPolicyScopeLayer(scopeKind, saved, builtin));
+      assert.equal(toolAllowedByPolicy(policy, tool('exa')), false, `${scopeKind} saved '*' ${JSON.stringify(value)} keeps the built-in deny`);
+      assert.equal(toolAllowedByPolicy(policy, tool('other')), true, 'the scope still opts in the source it names');
+    }
+  }
+  // At a scope without a built-in deny, a stored '*' that is not an object denies every source instead of being skipped.
+  for (const value of savedValues.slice(1)) {
+    const policy = resolve(global, { scopeKind: 'conversation', policy: { sourceConfigs: { [ALL]: value } } });
+    assert.equal(toolAllowedByPolicy(policy, tool('exa')), false, `conversation saved '*' ${JSON.stringify(value)} fails closed`);
+    assert.deepEqual(policy.sourceConfigs[ALL], { enabled: false });
+  }
+
+  // The same through saved records and the Turn compile, as the raw workflow editor or a hand edit writes them.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-readonly-mcp-'));
+  try {
+    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(vscode.Uri.file(root)));
+    const provider = { ...createDefaultLlmProviderConfig({ name: 'Readonly MCP Provider' }), id: 'provider:readonly-mcp',
+      model: 'model:readonly-mcp', models: [{ id: 'model:readonly-mcp', name: '模型' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    await authority.mutations.selectConversationWorkflow({ conversationId: 'conversation:readonly', scopeKind: 'workflow', workflowId: 'builtin:readonly' });
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', sourceConfigs: { exa: { enabled: true } } });
+    let turn = 0;
+    const compile = async (executorAgentId, conversationId) => JSON.parse((await authority.compile({
+      conversationId, turnId: `turn:${conversationId}:${turn++}`, executorAgentId, intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+    for (const value of savedValues) {
+      await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: 'explore', sourceConfigs: { [ALL]: value } });
+      await authority.mutations.setToolPolicy({ scopeKind: 'workflow', scopeId: 'builtin:readonly', sourceConfigs: { [ALL]: value } });
+      assert.equal(toolAllowedByPolicy(await compile('explore', 'conversation:explore'), tool('exa')), false, `Explore saved '*' ${JSON.stringify(value)}`);
+      assert.equal(toolAllowedByPolicy(await compile('main', 'conversation:readonly'), tool('exa')), false, `readonly workflow saved '*' ${JSON.stringify(value)}`);
+    }
+    await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: 'explore', sourceConfigs: { exa: { enabled: true } } });
+    assert.equal(toolAllowedByPolicy(await compile('explore', 'conversation:explore'), tool('exa')), true, 'naming the real source id still opts in');
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('整条链都没有工具列表时以默认工具集为底，自定义 Agent 不会没有工具；存储的非法列表拒绝编译', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-default-tool-set-'));
   try {

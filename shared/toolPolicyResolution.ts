@@ -64,7 +64,8 @@ export function defaultToolNames(definitions: readonly ToolPolicyCatalogEntry[])
  * One settings scope as a layer: the saved record, a saved record without a list keeping the
  * scope's built-in list (so settings that only store per-tool config never widen a built-in
  * read-only Agent or workflow), or the built-in list alone. A built-in scope's MCP source
- * restrictions always stay in its layer; the scope's own saved source settings apply over them, so
+ * restrictions always stay in its layer: its all-sources deny wins over whatever the scope saved
+ * under that key, and the scope's own saved entries for real source ids apply over the rest, so
  * enabling a source at that Agent or workflow scope is the one way to opt it in. The backend
  * compile and the settings view build every layer here.
  */
@@ -75,8 +76,13 @@ export function toolPolicyScopeLayer(
 ): ToolPolicyLayer | undefined {
   if (saved) {
     if (!builtin) return { scopeKind, policy: saved };
+    const builtinDenyAll = builtin.sourceConfigs?.[TOOL_POLICY_ALL_MCP_SOURCES];
     const sourceConfigs = builtin.sourceConfigs || saved.sourceConfigs
-      ? { ...(builtin.sourceConfigs ?? {}), ...(saved.sourceConfigs ?? {}) }
+      ? {
+        ...(builtin.sourceConfigs ?? {}),
+        ...(saved.sourceConfigs ?? {}),
+        ...(builtinDenyAll ? { [TOOL_POLICY_ALL_MCP_SOURCES]: builtinDenyAll } : {})
+      }
       : undefined;
     return {
       scopeKind,
@@ -275,8 +281,9 @@ function mergeToolConfigs(
 /**
  * Merges one layer's MCP source settings. An all-sources entry only denies: every source this layer
  * does not enable itself turns off, and later layers cannot turn it back on (it stays the fallback
- * for sources they name). The layer's own source entries then apply over what earlier layers left,
- * so they re-enable nothing an ancestor denied.
+ * for sources they name). A stored all-sources value that is not an object fails closed as a deny.
+ * The layer's own source entries then apply over what earlier layers left, so they re-enable
+ * nothing an ancestor denied.
  */
 function mergeSourceConfigs(
   target: Record<string, ToolPolicySourceConfigRecord>,
@@ -284,6 +291,9 @@ function mergeSourceConfigs(
 ): void {
   const entries = Object.entries(source ?? {}).flatMap(([rawSourceId, incoming]) => {
     const sourceId = rawSourceId.trim();
+    if (sourceId === TOOL_POLICY_ALL_MCP_SOURCES && !isPlainRecord(incoming)) {
+      return [[sourceId, { enabled: false } as ToolPolicySourceConfigRecord] as const];
+    }
     return sourceId && incoming && typeof incoming === 'object' && !Array.isArray(incoming)
       ? [[sourceId, incoming] as const]
       : [];
