@@ -15,6 +15,7 @@ import {
 } from '../../shared/protocol';
 import type {
   ContentPart,
+  FunctionCallPart,
   LlmGenerationConfigRecord,
   LlmProviderKind,
   MessageContent
@@ -94,7 +95,78 @@ function isForeignThoughtPart(part: ContentPart, provider: string): boolean {
   return parsePortableThoughtSignature(signature ?? '')?.provider !== provider;
 }
 
+/**
+ * Gemini 要求：model 内容里有 N 个函数调用时，紧随其后的那一条 user 内容必须恰好带这 N 个函数响应，
+ * 否则 400 "Please ensure that the number of function response parts is equal to the number of
+ * function call parts of the function call turn"（网关实测 `[v]gemini-3.5-flash`）。官方顺序是
+ * “所有调用之后跟所有响应”（FC1, FC2, FR1, FR2；https://ai.google.dev/gemini-api/docs/thought-signatures
+ * FAQ：交错会 400）。规范上下文把每个工具结果冻结成独立片段，附件目录等文字还会排在它们中间，
+ * 所以这里参照 Claude 的配对修复：把回答同一批调用、分散在多条 user 内容里的函数响应并进紧随其后的
+ * 一条 user 内容，夹在中间的其他片段按原顺序放到这些响应之后。已经在一条内容里配齐的轮次保持原样。
+ */
 function mergeGeminiFunctionResponseTurns(contents: readonly MessageContent[]): MessageContent[] {
+  return mergeAdjacentGeminiFunctionResponseTurns(pairGeminiFunctionResponses(contents));
+}
+
+function pairGeminiFunctionResponses(contents: readonly MessageContent[]): readonly MessageContent[] {
+  const paired: MessageContent[] = [];
+  let regrouped = false;
+  for (let index = 0; index < contents.length; index += 1) {
+    const content = contents[index];
+    paired.push(content);
+    const calls = content.role === 'model' ? content.parts.filter(isFunctionCallPart) : [];
+    if (calls.length === 0) continue;
+    const batch = collectGeminiFunctionResponses(contents, index + 1, calls);
+    // 只有一条 user 内容时已经满足配对（或没有可配的响应），不动它。
+    if (!batch || batch.endIndexExclusive <= index + 2) continue;
+    paired.push({ ...contents[index + 1], role: 'user', parts: [...batch.responses, ...batch.trailing] });
+    regrouped = true;
+    index = batch.endIndexExclusive - 1;
+  }
+  return regrouped ? paired : contents;
+}
+
+interface GeminiFunctionResponseBatch {
+  responses: ContentPart[];
+  trailing: ContentPart[];
+  endIndexExclusive: number;
+}
+
+/** 扫描回答一批调用的 user 内容：按调用 id 认领响应，没有 id 的调用按数量认领；遇到非 user 内容即停。 */
+function collectGeminiFunctionResponses(
+  contents: readonly MessageContent[],
+  startIndex: number,
+  calls: readonly FunctionCallPart[]
+): GeminiFunctionResponseBatch | undefined {
+  const callIds = new Set(calls.flatMap((call) => call.id ? [call.id] : []));
+  const pendingIds = new Set(callIds);
+  let pendingAnonymous = calls.length - callIds.size;
+  const responses: ContentPart[] = [];
+  const trailing: ContentPart[] = [];
+  let index = startIndex;
+  for (; index < contents.length && (pendingIds.size > 0 || pendingAnonymous > 0); index += 1) {
+    const content = contents[index];
+    if (content.role !== 'user') break;
+    for (const part of content.parts) {
+      if (isFunctionResponsePart(part)) {
+        if (part.id && pendingIds.delete(part.id)) {
+          responses.push(part);
+          continue;
+        }
+        if (pendingAnonymous > 0 && !(part.id && callIds.has(part.id))) {
+          pendingAnonymous -= 1;
+          responses.push(part);
+          continue;
+        }
+      }
+      trailing.push(part);
+    }
+  }
+  return responses.length > 0 ? { responses, trailing, endIndexExclusive: index } : undefined;
+}
+
+/** 原有行为：直接相邻、只含函数响应的 user 内容合并成一条。 */
+function mergeAdjacentGeminiFunctionResponseTurns(contents: readonly MessageContent[]): MessageContent[] {
   const merged: MessageContent[] = [];
   for (let index = 0; index < contents.length; index += 1) {
     const content = contents[index];

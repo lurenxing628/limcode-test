@@ -9,8 +9,12 @@ const {
   installGeminiOpenAICompatibleThoughtSignatures
 } = require(path.join(root, 'dist/extension/backend/capabilities/geminiProviderAdaptation.js'));
 const {
+  dryRunLlmProvider,
   startLlmProvider
 } = require(path.join(root, 'dist/extension/backend/capabilities/llmProvider.js'));
+const {
+  toUnifiedRequest
+} = require(path.join(root, 'dist/extension/backend/capabilities/unifiedMessageConversion.js'));
 const { LlmEventType } = require(path.join(root, 'dist/extension/backend/world/modules/llm/events.js'));
 const unified = await import('unified-llm-provider');
 
@@ -255,4 +259,114 @@ test('E0 another provider\'s signature on a call is never sent as a Gemini signa
     }]
   }, false);
   assert.equal(encoded.messages[0].tool_calls[0].extra_content.google.thought_signature, DUMMY_SIGNATURE);
+});
+
+function geminiConfig(overrides = {}) {
+  return providerConfig({
+    provider: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    model: 'gemini-3.7-flash',
+    apiKey: '',
+    ...overrides
+  });
+}
+
+async function geminiWireContents(contents, overrides = {}) {
+  const result = await dryRunLlmProvider({
+    id: 'request-gemini-wire',
+    invocationId: 'invocation-gemini-wire',
+    conversationId: 'conversation-gemini-wire',
+    contents,
+    tools: []
+  }, { settings: async () => geminiConfig(overrides) });
+  return result.body.contents;
+}
+
+function wireShape(contents) {
+  return contents.map((content) => `${content.role}:${content.parts.map((part) => {
+    if (part.functionCall) return `FC(${part.functionCall.id})${part.thoughtSignature ? `+${part.thoughtSignature}` : ''}`;
+    if (part.functionResponse) return `FR(${part.functionResponse.id})`;
+    if (part.thought) return `THOUGHT(${part.text})${part.thoughtSignature ? `+${part.thoughtSignature}` : ''}`;
+    return `TEXT(${part.text})`;
+  }).join(',')}`);
+}
+
+const call = (id, signature) => ({
+  id,
+  functionCall: { name: 'render', args: { id } },
+  ...(signature ? { thoughtSignature: `gemini:${signature}` } : {})
+});
+const response = (id) => ({ id, functionResponse: { name: 'render', response: { ok: id } } });
+const userText = (text) => ({ role: 'user', parts: [{ text }] });
+const CATALOG = '[LimCode 托管附件目录：仅包含不可变元数据，不包含附件正文。]';
+
+test('E1 Gemini pairs parallel responses split by an attachment catalog into the next user content', async () => {
+  const contents = await geminiWireContents([
+    userText('render three'),
+    { role: 'model', parts: [call('r1', 'SIG'), call('r2'), call('r3')] },
+    { role: 'user', parts: [response('r1')] },
+    userText(CATALOG),
+    { role: 'user', parts: [response('r2')] },
+    { role: 'user', parts: [response('r3')] }
+  ]);
+  assert.deepEqual(wireShape(contents), [
+    'user:TEXT(render three)',
+    'model:FC(r1)+SIG,FC(r2),FC(r3)',
+    `user:FR(r1),FR(r2),FR(r3),TEXT(${CATALOG})`
+  ]);
+});
+
+test('E1 Gemini moves text placed before the responses behind them and pairs consecutive batches separately', async () => {
+  const contents = await geminiWireContents([
+    userText('go'),
+    { role: 'model', parts: [call('a', 'SIG_A'), call('b')] },
+    userText(CATALOG),
+    { role: 'user', parts: [response('b'), response('a')] },
+    { role: 'model', parts: [call('c', 'SIG_C')] },
+    { role: 'user', parts: [response('c')] },
+    userText('next question')
+  ]);
+  assert.deepEqual(wireShape(contents), [
+    'user:TEXT(go)',
+    'model:FC(a)+SIG_A,FC(b)',
+    `user:FR(b),FR(a),TEXT(${CATALOG})`,
+    'model:FC(c)+SIG_C',
+    'user:FR(c)',
+    'user:TEXT(next question)'
+  ]);
+});
+
+test('E1 Gemini leaves already paired turns and adjacent response merging as before', async () => {
+  const history = [
+    userText('go'),
+    { role: 'model', parts: [call('a', 'SIG_A'), call('b')] },
+    { role: 'user', parts: [response('a')] },
+    { role: 'user', parts: [response('b')] },
+    { role: 'model', parts: [call('c', 'SIG_C')] },
+    { role: 'user', parts: [response('c'), { text: 'tool note' }] },
+    userText('continue')
+  ];
+  const contents = await geminiWireContents(history);
+  assert.deepEqual(wireShape(contents), [
+    'user:TEXT(go)',
+    'model:FC(a)+SIG_A,FC(b)',
+    'user:FR(a),FR(b)',
+    'model:FC(c)+SIG_C',
+    'user:FR(c),TEXT(tool note)',
+    'user:TEXT(continue)'
+  ]);
+});
+
+test('E1 pairing only applies to Gemini: other providers keep their own history shape', () => {
+  const history = [
+    userText('go'),
+    { role: 'model', parts: [call('a'), call('b')] },
+    { role: 'user', parts: [response('a')] },
+    userText(CATALOG),
+    { role: 'user', parts: [response('b')] }
+  ];
+  for (const providerKind of ['openai-compatible', 'openai-responses', 'deepseek']) {
+    const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, providerKind);
+    assert.deepEqual(request.contents.map((content) => content.parts.length), [1, 2, 1, 1, 1], providerKind);
+  }
 });
