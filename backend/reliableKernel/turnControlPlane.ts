@@ -236,10 +236,15 @@ export interface TurnRuntimeDeliveryContinuationCommand extends TurnExecutionCom
   maintenance?: undefined;
 }
 
-/** Internal no-visible-message product maintenance with authority inherited from one source Turn. */
+/**
+ * Internal no-visible-message product maintenance. It inherits the frozen authority of one source
+ * Turn of the Conversation; without such a Turn (sourceTurnId is null, for example a fork whose
+ * Turns are all copied history) it compiles the Conversation's current settings, like the first
+ * Turn of a new Conversation.
+ */
 export interface TurnRuntimeMaintenanceCommand extends TurnExecutionCommand {
   source: TurnInitiatingSource & { kind: 'internal' };
-  sourceTurnId: string;
+  sourceTurnId: string | null;
   deliveryId?: undefined;
   /**
    * Immutable product-maintenance identity carried by the admitted TurnIntent CAS payload.
@@ -614,8 +619,8 @@ export class TurnControlPlane {
       return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
         command,
         operation: 'retry',
-        sourceTurnId: command.sourceTurnId,
-        inheritSourceAuthority: true,
+        ...(command.sourceTurnId === null ? {} : { sourceTurnId: command.sourceTurnId }),
+        inheritSourceAuthority: command.sourceTurnId !== null,
         runtimeMaintenance: normalizeRuntimeMaintenance(command.maintenance)
       }));
     }
@@ -1713,7 +1718,9 @@ export class TurnControlPlane {
         this.database,
         JSON.stringify({
           kind: plan.operation,
-          sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId'),
+          sourceTurnId: plan.runtimeMaintenance && plan.sourceTurnId === undefined
+            ? null
+            : requireId(plan.sourceTurnId, 'sourceTurnId'),
           ...(retryRewind?.lineage.sourceMessageId
             ? { sourceMessageId: retryRewind.lineage.sourceMessageId }
             : {}),

@@ -526,10 +526,16 @@ export class ReliableConversationRunner {
     return frozen ? this.driveManualCompression(slot, frozen) : null;
   }
 
+  /**
+   * The Turn whose frozen authority a manual compression inherits: the latest ended Turn the
+   * Conversation admitted itself. Copied history Turns of a fork have no TurnIntent here and never
+   * supply the authority of new work; without an own Turn the maintenance Turn (null) compiles the
+   * Conversation's current settings.
+   */
   private async manualCompressionSourceTurn(
     conversationId: string,
     childExecutionId?: string
-  ): Promise<string> {
+  ): Promise<string | null> {
     if (childExecutionId) {
       const links = (await listAllDomainRows(this.application.database, 'ChildExecutionTurnLink', {
         child_execution_id: childExecutionId
@@ -550,11 +556,15 @@ export class ReliableConversationRunner {
       }
       return sourceTurnId;
     }
+    const ownTurnIds = new Set((await listAllDomainRows(this.application.database, 'TurnIntent', {
+      conversation_id: conversationId
+    })).flatMap((intent) => typeof intent.turn_id === 'string' ? [intent.turn_id] : []));
     const candidates = (await listAllDomainRows(this.application.database, 'Turn', {
       conversation_id: conversationId,
       status: 'terminated'
     }))
-      .filter((turn) => turn.conversation_id === conversationId && turn.status === 'terminated')
+      .filter((turn) => turn.conversation_id === conversationId && turn.status === 'terminated'
+        && ownTurnIds.has(requireId(turn.id, 'Manual compression source Turn.id')))
       .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
         || String(right.id).localeCompare(String(left.id)));
     for (const candidate of candidates) {
@@ -567,7 +577,7 @@ export class ReliableConversationRunner {
         return candidateId;
       }
     }
-    throw new Error('当前对话没有可供手动压缩继承的冻结模型配置。');
+    return null;
   }
 
   /** Reads an already-admitted exact maintenance command without consulting the mutable Context head. */

@@ -34,7 +34,8 @@ async function rows(app, domain, where = {}) {
 }
 
 async function withForkRuntime(run, {
-  withTool = false, toolCallRequests = [1], beforeDispatch, beforeReply, compression = false, failRequests = [], script
+  withTool = false, toolCallRequests = [1], beforeDispatch, beforeReply, compression = false, failRequests = [], script,
+  extraModels = []
 } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-fork-lifecycle-'));
   const authority = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
@@ -43,7 +44,7 @@ async function withForkRuntime(run, {
   let configuration = new VscodeConfigurationAuthority(getPaths);
   const provider = { ...createDefaultLlmProviderConfig({ name: 'Offline fork fixture' }),
     id: 'offline-fork-provider', model: 'offline-fork-model',
-    models: [{ id: 'offline-fork-model', name: 'Offline model' }] };
+    models: [{ id: 'offline-fork-model', name: 'Offline model' }, ...extraModels.map(id => ({ id, name: id }))] };
   for (const [section, settings] of [
     ['llmProviderConfigs', { configs: [provider] }],
     ['llm', { activeProviderConfigId: provider.id }]
@@ -147,7 +148,7 @@ async function withForkRuntime(run, {
     ]);
     const harness = {
       get app() { return app; }, get facade() { return facade; },
-      get configuration() { return configuration; }, requests, environmentId, saveCompression,
+      get configuration() { return configuration; }, requests, environmentId, saveCompression, provider,
       /** `whileClosed` runs with the Runtime database closed, for example to stage an older data shape. */
       async reopen(whileClosed) { await app.close(); await whileClosed?.(); await open(); },
       async start(conversationId, key, retry, message = {}) {
@@ -668,6 +669,7 @@ async function compressHead(h, conversationId, commandId, compressSegmentCount) 
       commandId, conversationId, compressSegmentCount, target: { kind: 'current_head', expectedRootId }
     });
     assert.equal(compressed.compression.status, 'compressed');
+    return compressed;
   } finally { runner.dispose(); }
 }
 
@@ -833,6 +835,25 @@ test('a fork whose inherited block has no creation projection is refused permane
       error => error instanceof kernel.ConversationForkRejectedError && /creation projection/.test(error.message));
     assert.deepEqual(await rows(h.app, 'Conversation'), before);
   }, { compression: true });
+});
+
+test('manual compression in a fork without Turns of its own runs under the fork\'s current settings', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'authority-first');
+    await h.turn('source', 'authority-second');
+    const fork = await h.facade.forkConversation(await h.command('source', 'fork-before-model-change'));
+    await h.configuration.mutations.setModelProfile({
+      scopeKind: 'conversation', scopeId: fork.conversationId, providerConfigId: h.provider.id,
+      provider: h.provider.provider, model: 'offline-fork-second-model'
+    });
+    // Every Turn of the fork is a copy of source history, frozen with the source's model.
+    const compressed = await compressHead(h, fork.conversationId, 'compress-fork-without-own-turns', 2);
+    const requests = await rows(h.app, 'ModelRequest', { turn_id: compressed.turnId });
+    assert.deepEqual(requests.map(request => request.model_id), ['offline-fork-second-model'],
+      'a copied Turn never supplies the authority of new work');
+    await h.turn(fork.conversationId, 'after-fork-compression');
+    assert.equal(h.requests.at(-1).modelId, 'offline-fork-second-model');
+  }, { compression: true, extraModels: ['offline-fork-second-model'] });
 });
 
 test('a copied failed turn keeps its termination and its failed request stays retryable in the fork', async () => {
