@@ -648,3 +648,16 @@ test('a team continuation that absorbed followups of two root Turns still cannot
   await assert.rejects(f.collaboration.send({ source: await f.source('right-onward', 'right', 'right-continuation', 'followup_agent_task'), targetConversationId: 'left', text: 'onward', mode: 'followup' }),
     /cannot combine independent root Turn followup budgets/);
 }));
+
+test('a cross-conversation continuation that also absorbed a team followup spends only the peer requester budget', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true]);
+  const peerTask = await crossSend(f, 'peer-task-for-root', 'peer-a', 'peer-a-turn', 'root', 'followup');
+  await endTurn(f, 'root-turn');
+  const teamTask = await f.collaboration.send({ source: await f.source('left-asks-root', 'left', 'left-turn', 'followup_agent_task'), targetConversationId: 'root', text: 'team task', mode: 'followup' });
+  assert.deepEqual([await budgetOf(f, peerTask.deliveryId), await budgetOf(f, teamTask.deliveryId)], ['peer-a-turn', 'root-turn']);
+  await admitContinuation(f, 'root', 'root-peer-continuation', peerTask.deliveryId);
+  assert.deepEqual((await f.rows('RuntimeDelivery', { target_turn_id: 'root-peer-continuation' })).map(row => row.id).sort(), [peerTask.deliveryId, teamTask.deliveryId].sort(),
+    'the team followup joins the Turn the peer task started');
+  const onward = await crossSend(f, 'root-onward', 'root', 'root-peer-continuation', 'peer-a', 'followup');
+  assert.equal(await budgetOf(f, onward.deliveryId), 'peer-a-turn', 'the Turn a peer task started spends that request budget');
+}));
