@@ -24,6 +24,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
     const { default: toolEditor } = await server.ssrLoadModule('/src/components/settings/tools/ToolPolicyEditor.vue');
     const { useClientStateStore } = await server.ssrLoadModule('/src/stores/useClientStateStore.ts');
     const { useToolPolicyStore } = await server.ssrLoadModule('/src/stores/useToolPolicyStore.ts');
+    const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
     const { GLOBAL_SETTINGS_TABS } = await server.ssrLoadModule('/src/components/settings/global/globalSettingsTabs.ts');
     const { runAgentTool } = await server.ssrLoadModule(path.join(process.cwd(), 'backend/world/modules/tools/definitions/runAgent/index.ts'));
     const { crossConversationToolModules } = await server.ssrLoadModule(path.join(process.cwd(), 'backend/world/modules/tools/definitions/crossConversation/index.ts'));
@@ -43,6 +44,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       client.toolDefinitions = definitions;
       return {
         client,
+        feed: useReliableKernelClientFeedStore(),
         store: useToolPolicyStore(),
         messages: sink.messages,
         render: (component, props) => renderToString(createSSRApp(component, props).use(isolated)),
@@ -315,6 +317,35 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(store.localPolicyFor('agent', 'worker').policy.allowedTools, undefined);
       store.setAgentCollaborationFieldForScope('agent', 'worker', 'maxChildAgentDepth', undefined);
       assert.equal(store.localPolicyFor('agent', 'worker').policy, undefined, 'restoring the only override removes the empty record');
+    });
+
+    await t.test('子 Agent 对话的设置里不显示跨对话开关', async () => {
+      const { feed, render } = fresh(allDefinitions);
+      feed.records = { ChildExecution: { child: { id: 'child', child_conversation_id: 'child-conversation', status: 'active' } } };
+      const childHtml = await render(editor, { scopeKind: 'conversation', scopeId: 'child-conversation' });
+      assert.equal(checkbox(childHtml), undefined);
+      assert.match(childHtml, /子 Agent 对话只在所属团队内协作，不提供跨对话工具/);
+      assert.match(input(childHtml, '最大子 Agent 深度'), /value="1"/, 'the team budgets stay editable');
+      assert.ok(checkbox(await render(editor, { scopeKind: 'conversation', scopeId: 'top-level' })), 'top-level conversations keep the switch');
+    });
+
+    await t.test('对话的继承值按 Agent 与工作流层计算，而不是只看全局', async () => {
+      const { client, feed, store, render } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      feed.records = { AgentConversationLink: { link: { id: 'link', conversation_id: 'layered', agent_id: 'explore', role: 'default' } } };
+      client.conversationWorkflowSelections = [{ id: 'selection', conversationId: 'layered', scopeKind: 'workflow', workflowId: 'wf', role: 'active', createdAt: 1, updatedAt: 1 }];
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file', 'write', ...crossNames], 'Global');
+      store.setAgentCollaborationFieldForScope('agent', 'explore', 'maxChildAgentDepth', 3);
+      store.setCrossConversationCollaborationForScope('workflow', 'wf', true);
+
+      const html = await render(editor, { scopeKind: 'conversation', scopeId: 'layered' });
+      assert.match(checkbox(html), /aria-checked="true"/, 'the workflow layer turned the switch on');
+      assert.match(html, /继承上层 · 工作流开启/);
+      assert.match(input(html, '最大子 Agent 深度'), /value="3"/);
+      assert.match(html, /继承上层 · Agent 3/);
+      assert.deepEqual(store.effectivePolicyFor('conversation', 'layered').policy.allowedTools, sorted(readonlyList),
+        'the conversation shows the read-only list of its Agent');
+      assert.match(html, /只提供列出和读取对话/);
     });
 
     await t.test('上层允许列表仍挡住跨对话工具时显示提示', async () => {

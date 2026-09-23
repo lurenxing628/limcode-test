@@ -344,6 +344,21 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     inheritedPolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ReturnType<typeof resolveToolPolicyLayers> {
       return this.resolveScopes(this.upperScopesFor(scopeKind, scopeId));
     },
+    /** The value one run_agent-style config key inherits here, and the nearest upper layer that set it. */
+    inheritedToolConfigValue(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, toolName: string, key: string): { value: ToolConfigValue; from: ToolPolicyScopeKind } | undefined {
+      for (const scope of [...this.upperScopesFor(scopeKind, scopeId)].reverse()) {
+        const value = this.layerFor(scope)?.policy.toolConfigs?.[toolName]?.config?.[key];
+        if (value !== undefined) return { value: value as ToolConfigValue, from: scope.scopeKind };
+      }
+      return undefined;
+    },
+    /** A child task's conversation: cross-conversation tools are never offered there. */
+    isChildConversation(conversationId: string | undefined): boolean {
+      const id = conversationId?.trim();
+      if (!id) return false;
+      return Object.values(useReliableKernelClientFeedStore().records.ChildExecution ?? {})
+        .some((child) => plainText(child.child_conversation_id) === id);
+    },
     crossConversationToolsFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): CrossConversationToolAvailability {
       const allowed = this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools;
       const sendTools = allowed.includes(SUB_AGENT_TOOL_NAME);

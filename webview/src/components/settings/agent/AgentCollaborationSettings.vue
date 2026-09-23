@@ -22,31 +22,44 @@ const props = withDefaults(defineProps<{
 const store = useToolPolicyStore();
 const { loading, text: loadingText } = useSettingsLoadingText('Agent 协作配置', () => props.scopeKind, () => props.scopeId);
 const tool = computed(() => store.toolDefinitions.find((item) => item.name === SUB_AGENT_TOOL_NAME));
+const SCOPE_LABELS: Record<ToolPolicyScopeKind, string> = { global: '全局', agent: 'Agent', conversation: '对话', workflow: '工作流', run: '本次运行' };
 const localConfig = computed(() => store.localPolicyFor(props.scopeKind, props.scopeId).policy?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config ?? {});
-const globalConfig = computed(() => store.effectivePolicyFor('global').policy?.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config ?? {});
+/** Inherited values follow every upper layer (global, the conversation's Agent and workflow). */
+function inherited(key: string): { value: unknown; source: string } | undefined {
+  const found = store.inheritedToolConfigValue(props.scopeKind, props.scopeId, SUB_AGENT_TOOL_NAME, key);
+  return found ? { value: found.value, source: SCOPE_LABELS[found.from] } : undefined;
+}
 const fields = computed(() => AGENT_COLLABORATION_CONFIG_KEYS.flatMap((key) => {
   const field = tool.value?.configSchema?.fields.find((candidate) => candidate.key === key);
   if (!field) return [];
   const defaultValue = tool.value?.defaultConfig?.[key] ?? field.defaultValue;
+  const upper = inherited(key);
   return [{
     key,
     label: key === 'maxChildAgentDepth' ? '最大子 Agent 深度' : field.label,
     description: field.description,
     defaultValue,
-    value: localConfig.value[key] ?? globalConfig.value[key] ?? defaultValue,
-    globalValue: globalConfig.value[key] ?? defaultValue,
+    value: localConfig.value[key] ?? upper?.value ?? defaultValue,
+    inheritedLabel: `${upper?.source ?? '默认'} ${String(upper?.value ?? defaultValue)}`,
     minimum: key === 'maxConcurrentAgents' ? 1 : 0,
     unit: key === 'maxChildAgentDepth' ? '层' : key === 'maxConcurrentAgents' ? '个' : '次',
     overridden: localConfig.value[key] !== undefined
   }];
 }));
-const scopeLabel = computed(() => ({ global: '全局', agent: 'Agent', conversation: '对话', workflow: '工作流', run: '本次运行' })[props.scopeKind]);
+const scopeLabel = computed(() => SCOPE_LABELS[props.scopeKind]);
+/** A child task only collaborates inside its team; the switch has no effect there. */
+const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
 const canEdit = computed(() => !props.readonly && !!tool.value && !loading.value && (props.scopeKind === 'global' || !!props.scopeId?.trim()));
 const spawnToolEnabled = computed(() => store.effectivePolicyFor(props.scopeKind, props.scopeId).policy?.allowedTools.includes(SUB_AGENT_TOOL_NAME) === true);
 const crossConversationField = computed(() => tool.value?.configSchema?.fields.find((field) => field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY));
 const crossConversationOverridden = computed(() => typeof localConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === 'boolean');
+const crossConversationInherited = computed(() => inherited(CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY));
 const crossConversationEnabled = computed(() => (localConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY]
-  ?? globalConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] ?? crossConversationField.value?.defaultValue) === true);
+  ?? crossConversationInherited.value?.value ?? crossConversationField.value?.defaultValue) === true);
+const crossConversationInheritedLabel = computed(() => {
+  const value = crossConversationInherited.value?.value ?? crossConversationField.value?.defaultValue;
+  return `${crossConversationInherited.value?.source ?? '默认'}${value === true ? '开启' : '关闭'}`;
+});
 const crossConversationTools = computed(() => store.crossConversationToolsFor(props.scopeKind, props.scopeId));
 const drafts = reactive<Partial<Record<AgentCollaborationConfigKey, string>>>({});
 const errors = reactive<Partial<Record<AgentCollaborationConfigKey, string>>>({});
@@ -99,8 +112,9 @@ function restoreCrossConversation(): void {
       <span class="collaboration-source">{{ scopeLabel }}设置</span>
     </header>
     <p v-if="scopeKind === 'global'">设置子 Agent 的默认深度和团队预算。Agent、工作流和对话可按各自范围单独配置。</p>
-    <p v-else>仅调整当前{{ scopeLabel }}的协作设置；未单独设置的项执行时继承上层策略，下方显示全局参考值。</p>
-    <div v-if="crossConversationField" class="collaboration-field">
+    <p v-else>仅调整当前{{ scopeLabel }}的协作设置；未单独设置的项执行时继承上层策略，下方显示继承来源和值。</p>
+    <p v-if="crossConversationField && childConversation" class="collaboration-note">子 Agent 对话只在所属团队内协作，不提供跨对话工具，因此这里不显示跨对话协作开关。</p>
+    <div v-else-if="crossConversationField" class="collaboration-field">
       <div class="collaboration-field-row">
         <LcCheckbox
           :model-value="crossConversationEnabled"
@@ -109,7 +123,7 @@ function restoreCrossConversation(): void {
           @update:model-value="setCrossConversation"
         >{{ crossConversationField.label }}</LcCheckbox>
         <div class="collaboration-field-actions">
-          <span>{{ crossConversationOverridden ? (scopeKind === 'global' ? '全局默认' : '本层单独设置') : (scopeKind === 'global' ? '系统默认' : `继承上层 · 全局${crossConversationEnabled ? '开启' : '关闭'}`) }}</span>
+          <span>{{ crossConversationOverridden ? (scopeKind === 'global' ? '全局默认' : '本层单独设置') : (scopeKind === 'global' ? '系统默认' : `继承上层 · ${crossConversationInheritedLabel}`) }}</span>
           <button type="button" :disabled="!canEdit || !crossConversationOverridden" :aria-label="`${crossConversationField.label}：${scopeKind === 'global' ? '恢复默认' : '恢复继承'}`" @click="restoreCrossConversation">{{ scopeKind === 'global' ? '恢复默认 关闭' : '恢复继承' }}</button>
         </div>
       </div>
@@ -140,7 +154,7 @@ function restoreCrossConversation(): void {
           </span>
         </label>
         <div class="collaboration-field-actions">
-          <span>{{ field.overridden ? (scopeKind === 'global' ? '全局默认' : '本层单独设置') : (scopeKind === 'global' ? '系统默认' : `继承上层 · 全局 ${field.globalValue}`) }}</span>
+          <span>{{ field.overridden ? (scopeKind === 'global' ? '全局默认' : '本层单独设置') : (scopeKind === 'global' ? '系统默认' : `继承上层 · ${field.inheritedLabel}`) }}</span>
           <button type="button" :disabled="!canEdit || !field.overridden" :aria-label="`${field.label}：${scopeKind === 'global' ? '恢复默认' : '恢复继承'}`" @click="restoreField(field.key)">{{ scopeKind === 'global' ? `恢复默认 ${field.defaultValue}` : '恢复继承' }}</button>
         </div>
       </div>

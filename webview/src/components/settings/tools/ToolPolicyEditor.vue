@@ -91,9 +91,10 @@ const sourceLabel = computed(() => {
   if (props.scopeKind === 'global' && runtimePreset.value === 'yolo') return '全局自动执行预设';
   if (props.scopeKind === 'global') return '全局默认策略';
   if (hasLocalOverride.value) return '当前范围的单独设置';
-  const inheritedFrom = effectiveResolution.value.inheritedFrom;
-  void inheritedFrom;
-  return '继承全局默认策略';
+  if (store.builtinPolicyFor(props.scopeKind, props.scopeId)) {
+    return props.scopeKind === 'agent' ? '沿用内置 Agent 的工具列表' : '沿用内置工作流的工具列表';
+  }
+  return props.scopeKind === 'conversation' ? '继承上层策略（全局、Agent 与工作流）' : '继承全局默认策略';
 });
 const presetOptions = computed<Array<{ value: ToolPolicyPresetKind; label: string; description: string }>>(() => [
   ...(props.scopeKind === 'global'
