@@ -607,6 +607,8 @@ function proxyDatabase(database, hooks = {}) {
   return {
     binding: database.binding,
     hostBootId: database.hostBootId,
+    // 每个变更命令都经对话运行宿主所有权边界（按对话分配运行宿主后），代理必须转发同一个所有权管理器。
+    conversationOwners: database.conversationOwners,
     async snapshot(reads) {
       const intercepted = hooks.snapshot?.(reads);
       return intercepted ?? database.snapshot(reads);
