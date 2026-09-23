@@ -3107,19 +3107,29 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentPolicyScopeClear, WorkEnvironmentPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.FsStatGet, FsStatGetPayload>;
 
+export type BridgeErrorCode =
+  | 'settings_revision_conflict'
+  /** The Conversation named by a scoped request was deleted or never existed. */
+  | 'stale_conversation'
+  /** The fork command can never succeed and must not be replayed. */
+  | 'fork_rejected';
+
+export interface BridgeErrorPayload {
+  requestType?: string;
+  message: string;
+  code?: BridgeErrorCode;
+  actualRevision?: string;
+  /** The Conversation a Conversation-scoped request failed for. */
+  conversationId?: string;
+}
+
 export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.DebugCaptureResult, DebugCaptureResult>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureObservationAck, DebugCaptureUiAck>
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>
   | BridgeEnvelope<BridgeMessageType.Pong, { text: string; receivedAt: number }>
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
-  | BridgeEnvelope<BridgeMessageType.Error, {
-      requestType?: string;
-      message: string;
-      /** `fork_rejected`: the fork command can never succeed and must not be replayed. */
-      code?: 'settings_revision_conflict' | 'fork_rejected';
-      actualRevision?: string;
-    }>
+  | BridgeEnvelope<BridgeMessageType.Error, BridgeErrorPayload>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInputResult, TurnInputResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>

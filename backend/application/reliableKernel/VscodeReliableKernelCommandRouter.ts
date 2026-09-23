@@ -11,6 +11,7 @@ import {
   BridgeMessageType,
   type AttachmentOpenPayload,
   type AttachmentReloadPayload,
+  type BridgeErrorPayload,
   type ConversationAgentSelectPayload,
   type ConversationActionResultPayload,
   type CompressionCommandResultPayload,
@@ -18,6 +19,7 @@ import {
   type ConversationForkPayload,
   type ConversationForkResultPayload,
   type ConversationSettingsGetPayload,
+  type ConversationSettingsSnapshotPayload,
   type ConversationSettingsUpdatePayload,
   type GlobalSettingsGetPayload,
   type GlobalSettingsRecord,
@@ -39,6 +41,7 @@ import {
   type TurnInputResultPayload,
   type TurnStartPayload,
   type TurnSteerPayload,
+  type ExtensionToWebviewMessage,
   type WebviewToExtensionMessage
 } from '../../../shared/protocol';
 import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
@@ -52,9 +55,9 @@ import { applyProxyEnvironment, currentProxyEnvironment, proxyForShellAndMcp } f
 import { GlobalSettingsSaveBarrier } from './GlobalSettingsSaveBarrier';
 
 export interface VscodeReliableKernelCommandRouterOptions {
-  broadcast?(message: unknown): void;
+  broadcast?(message: ExtensionToWebviewMessage): void;
   /** Delivers a Conversation-scoped message only to panels currently bound to that Conversation. */
-  postToConversation?(conversationId: string, message: unknown): void;
+  postToConversation?(conversationId: string, message: ExtensionToWebviewMessage): void;
   createConversation?(options: { projectFolderUri?: string }): Promise<string>;
   forkConversation?(request: ConversationForkPayload): Promise<{
     conversationId: string;
@@ -722,7 +725,9 @@ export class VscodeReliableKernelCommandRouter {
     this.broadcastOrPost(webview, await this.configurationSnapshot(correlationId));
   }
 
-  private async configurationSnapshot(correlationId?: string): Promise<unknown> {
+  private async configurationSnapshot(
+    correlationId?: string
+  ): Promise<Extract<ExtensionToWebviewMessage, { type: BridgeMessageType.ConfigurationSnapshot }>> {
     const state = await this.product.configuration.configurationClientState();
     state.toolDefinitions = this.product.toolHost.definitionRecords();
     state.mcpToolSources = this.product.toolHost.mcp.sourceRecords();
@@ -846,7 +851,7 @@ export class VscodeReliableKernelCommandRouter {
   private globalSettingsSnapshot(
     stored: Awaited<ReturnType<VscodeReliableKernelProductRuntime['configuration']['loadGlobalSettings']>>,
     correlationId?: string
-  ): unknown {
+  ): Extract<ExtensionToWebviewMessage, { type: BridgeMessageType.GlobalSettingsSnapshot }> {
     return {
       id: randomUUID(),
       type: BridgeMessageType.GlobalSettingsSnapshot,
@@ -910,12 +915,7 @@ export class VscodeReliableKernelCommandRouter {
     conversationId: string,
     section: ConversationSettingsGetPayload['section'],
     allowMissing = false
-  ): Promise<{
-    conversationId: string;
-    section: ConversationSettingsGetPayload['section'];
-    settings: unknown;
-    filePath: string;
-  } | undefined> {
+  ): Promise<ConversationSettingsSnapshotPayload | undefined> {
     const conversation = allowMissing
       ? await this.maybeRow('Conversation', conversationId)
       : await this.requireRow('Conversation', conversationId);
@@ -932,9 +932,9 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   private conversationSettingsSnapshot(
-    stored: { conversationId: string; section: string; settings: unknown; filePath: string },
+    stored: ConversationSettingsSnapshotPayload,
     correlationId?: string
-  ): unknown {
+  ): Extract<ExtensionToWebviewMessage, { type: BridgeMessageType.ConversationSettingsSnapshot }> {
     return {
       id: randomUUID(),
       type: BridgeMessageType.ConversationSettingsSnapshot,
@@ -1902,6 +1902,7 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
+      channel: 'control',
       correlationId,
       payload: {
         requestType: requestKind,
@@ -1966,6 +1967,7 @@ export class VscodeReliableKernelCommandRouter {
       this.post(webview, {
         id: randomUUID(),
         type: BridgeMessageType.InteractionResult,
+        channel: 'control',
         correlationId,
         payload: {
           requestType: BridgeMessageType.ToolExecutionCancel,
@@ -1986,6 +1988,7 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
+      channel: 'control',
       correlationId,
       payload: {
         requestType: BridgeMessageType.ToolExecutionCancel,
@@ -2023,6 +2026,7 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
+      channel: 'control',
       correlationId,
       payload: {
         requestType: BridgeMessageType.ProcessStop,
@@ -2091,7 +2095,7 @@ export class VscodeReliableKernelCommandRouter {
     return listAllDomainRows(this.product.application.database, domain, where);
   }
 
-  private broadcastOrPost(webview: vscode.Webview, message: unknown): void {
+  private broadcastOrPost(webview: vscode.Webview, message: ExtensionToWebviewMessage): void {
     if (this.options.broadcast) this.options.broadcast(message);
     else this.post(webview, message);
   }
@@ -2101,11 +2105,8 @@ export class VscodeReliableKernelCommandRouter {
     requestType: BridgeMessageType,
     message: string,
     correlationId?: string,
-    details: {
+    details: Pick<BridgeErrorPayload, 'code' | 'actualRevision' | 'conversationId'> & {
       section?: GlobalSettingsGetPayload['section'];
-      code?: 'settings_revision_conflict' | 'stale_conversation' | 'fork_rejected';
-      actualRevision?: string;
-      conversationId?: string;
     } = {}
   ): void {
     const { section, ...payloadDetails } = details;
@@ -2123,7 +2124,7 @@ export class VscodeReliableKernelCommandRouter {
     });
   }
 
-  private post(webview: vscode.Webview, message: unknown): void {
+  private post(webview: vscode.Webview, message: ExtensionToWebviewMessage): void {
     void webview.postMessage(toStructuredClonePlainData(message, 'reliable command result')).then(
       (delivered) => {
         if (delivered) return;
