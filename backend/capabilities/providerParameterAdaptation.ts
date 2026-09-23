@@ -28,7 +28,9 @@
  *   （https://github.com/NousResearch/hermes-agent/issues/34716），
  *   Groq `'messages.4' : for 'role:assistant' the following must be satisfied[('messages.4' : property 'reasoning_content' is unsupported)]`
  *   （https://github.com/NousResearch/hermes-agent/issues/11089），
- *   OpenCode Zen `Extra inputs are not permitted, field: 'reasoning_content', value: []`（https://github.com/anomalyco/opencode/issues/11446）。
+ *   OpenCode Zen `Extra inputs are not permitted, field: 'reasoning_content', value: []`（https://github.com/anomalyco/opencode/issues/11446），
+ *   OpenCode Go `Extra inputs are not permitted, field: 'messages[2].reasoning'`（https://github.com/can1357/oh-my-pi/issues/1157）。
+ *   助手消息上的 OpenRouter 风格 `reasoning` 与 Responses 顶层的 `reasoning` 对象同名，只认明确指向 messages[N] 的错误。
  */
 import type { LlmProviderKind } from '../../shared/protocol';
 import { isRecord, toPlainJsonLike } from './llmStreamEventProjection';
@@ -65,10 +67,13 @@ export type AdaptableRequestParameter =
   | 'stream_options'
   | 'reasoning_content'
   | 'reasoning_signature'
-  | 'reasoning_details';
+  | 'reasoning_details'
+  | 'reasoning';
 
 const TOP_LEVEL_REMOVABLE_PARAMETERS = ['reasoning_effort', 'temperature', 'top_p', 'top_k', 'stream_options'] as const;
-const ASSISTANT_MESSAGE_PARAMETERS = ['reasoning_content', 'reasoning_signature', 'reasoning_details'] as const;
+const ASSISTANT_MESSAGE_PARAMETERS = ['reasoning_content', 'reasoning_signature', 'reasoning_details', 'reasoning'] as const;
+/** 与顶层参数同名的助手消息字段：只接受明确落在 messages[N] 上的错误。 */
+const MESSAGE_SCOPED_ONLY_PARAMETERS = new Set<AdaptableRequestParameter>(['reasoning']);
 const SAMPLING_PARAMETERS = new Set<AdaptableRequestParameter>(['temperature', 'top_p', 'top_k']);
 const ADAPTABLE_PARAMETERS: readonly AdaptableRequestParameter[] = [
   ...TOP_LEVEL_REMOVABLE_PARAMETERS,
@@ -252,6 +257,7 @@ export function unsupportedRequestParameters(errorText: string): AdaptableReques
   const extraInputs = /extra inputs are not permitted|extra_forbidden/i.test(text);
   return ADAPTABLE_PARAMETERS.filter((parameter) => {
     const name = escapeRegExp(parameter);
+    if (MESSAGE_SCOPED_ONLY_PARAMETERS.has(parameter)) return messageFieldRejected(text, name, extraInputs);
     if (parameter === 'max_tokens') {
       return new RegExp(`unsupported parameter:\\s*${Q}max_tokens${Q}`, 'i').test(text)
         && /max_completion_tokens/i.test(text);
@@ -275,6 +281,18 @@ export function unsupportedRequestParameters(errorText: string): AdaptableReques
 }
 
 const Q = `['"\`]`;
+
+/** 错误明确指向 messages[N]（可带 assistant 角色层级）上的某个字段。 */
+function messageFieldRejected(text: string, name: string, extraInputs: boolean): boolean {
+  const path = `messages(?:\\.|\\[)\\d+\\]?(?:\\.assistant)?\\.${name}(?![\\w])`;
+  if (new RegExp(`unknown parameter:\\s*${Q}${path}${Q}`, 'i').test(text)) return true;
+  if (new RegExp(`property\\s*${Q}${path}${Q}\\s*is unsupported`, 'i').test(text)) return true;
+  if (new RegExp(`${Q}messages\\.\\d+${Q}\\s*:\\s*property\\s*${Q}${name}${Q}\\s*is unsupported`, 'i').test(text)) return true;
+  if (!extraInputs) return false;
+  if (new RegExp(`${path}${Q}?\\s*:?\\s*extra inputs are not permitted`, 'i').test(text)) return true;
+  if (new RegExp(`extra inputs are not permitted,\\s*field:\\s*${Q}${path}${Q}`, 'i').test(text)) return true;
+  return new RegExp(`${Q}?loc${Q}?\\s*:\\s*[\\[(][^\\])]*${Q}messages${Q}\\s*,\\s*\\d+\\s*,\\s*(?:(?:${Q}assistant${Q}|\\.\\.\\.)\\s*,\\s*)?${Q}${name}${Q}\\s*[\\])]`, 'i').test(text);
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

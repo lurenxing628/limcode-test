@@ -281,3 +281,36 @@ test('C1 摘要路径：拒绝 temperature 后立即去掉重发', async () => {
   });
   resetProviderRequestAdaptations();
 });
+
+test('C1 助手消息的 reasoning 字段：只认明确指向 messages[N] 的错误，不与 Responses 顶层 reasoning 混淆', () => {
+  const positives = [
+    // https://github.com/can1357/oh-my-pi/issues/1157
+    "Error: 400 Error from provider: Extra inputs are not permitted, field: 'messages[2].reasoning'",
+    'messages.1.reasoning: Extra inputs are not permitted',
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'messages', 2, 'assistant', 'reasoning'], msg: 'Extra inputs are not permitted', input: 'x' }] },
+    "[{'type': 'extra_forbidden', 'loc': ('body', 'messages', 2, ..., 'reasoning'), 'msg': 'Extra inputs are not permitted'}]",
+    { message: "messages.2.assistant.reasoning: property 'messages.2.assistant.reasoning' is unsupported", type: 'invalid_request_error' },
+    { error: { message: "'messages.4' : for 'role:assistant' the following must be satisfied[('messages.4' : property 'reasoning' is unsupported)]" } },
+    "Unknown parameter: 'messages[1].reasoning'."
+  ];
+  for (const error of positives) assert.deepEqual(unsupportedRequestParameters(text(error)), ['reasoning'], text(error));
+  const topLevel = [
+    "Unknown parameter: 'reasoning'.",
+    'reasoning: Extra inputs are not permitted',
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'reasoning'], msg: 'Extra inputs are not permitted' }] },
+    "Unsupported parameter: 'reasoning.effort' is not supported with this model.",
+    "Extra inputs are not permitted, field: 'reasoning'",
+    'Unrecognized request argument supplied: reasoning'
+  ];
+  for (const error of topLevel) assert.deepEqual(unsupportedRequestParameters(text(error)), [], text(error));
+  assert.deepEqual(unsupportedRequestParameters(GATEWAY_REASONING_EFFORT), ['reasoning_effort']);
+  assert.deepEqual(unsupportedRequestParameters('messages.0.reasoning_content: Extra inputs are not permitted'), ['reasoning_content']);
+
+  const body = { model: 'm', reasoning: { effort: 'high' }, messages: [{ role: 'assistant', content: 'a', reasoning: 'r', reasoning_details: [] }, { role: 'user', content: 'u', reasoning: 'keep' }] };
+  assert.deepEqual(adaptRequestParameters(body, new Set(['reasoning']), 'openai-compatible'), {
+    model: 'm', reasoning: { effort: 'high' },
+    messages: [{ role: 'assistant', content: 'a', reasoning_details: [] }, { role: 'user', content: 'u', reasoning: 'keep' }]
+  });
+  const responsesBody = { model: 'gpt-5.5', reasoning: { effort: 'high' }, input: [] };
+  assert.equal(adaptRequestParameters(responsesBody, new Set(['reasoning']), 'openai-responses'), responsesBody);
+});
