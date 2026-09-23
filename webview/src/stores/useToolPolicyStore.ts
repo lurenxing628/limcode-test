@@ -331,9 +331,14 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     /**
      * What a tool-list edit at this scope starts from. A saved list is kept as it is, including
      * entries an upper layer blocks for now. A scope without a list starts from what the backend
-     * allows there today, so creating the first list removes only what the user turns off. Global
-     * and a workflow bound every Agent, so they also keep what each Agent with its own or built-in
-     * list gets there (for example transfer on the main Agent).
+     * allows there today, so creating the first list removes only what the user turns off.
+     *
+     * Global and a workflow bound every Agent, so they also keep the tools each Agent gets there
+     * from the default tool set or a built-in Agent list: transfer and switch_work_environment on
+     * the main Agent. Agents without a list of their own gain those two as a result (both stay
+     * behind the work-environment policy, which is off by default). Nothing else comes from other
+     * Agents: their MCP tools and the tools a user ticked on them stay theirs, since a name in an
+     * upper list would admit an MCP source no layer configures for every Agent.
      */
     listSeedFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string[] {
       const saved: unknown = this.localPolicyFor(scopeKind, scopeId).policy?.allowedTools;
@@ -341,8 +346,11 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       const names = new Set(this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools);
       if (scopeKind === 'global' || scopeKind === 'workflow') {
         const clientState = useClientStateStore();
+        const builtinAgentLists = clientState.builtinToolPolicies.filter((record) => record.scopeKind === 'agent');
+        const builtinToolNames = new Set(clientState.toolDefinitions.filter((tool) => tool.source?.kind !== 'mcp').map((tool) => tool.name));
+        const carried = new Set([...defaultToolNames(clientState.toolDefinitions), ...builtinAgentLists.flatMap((record) => record.allowedTools)]);
         const agentIds = uniqueNames([
-          ...clientState.builtinToolPolicies.filter((record) => record.scopeKind === 'agent').map((record) => record.scopeId),
+          ...builtinAgentLists.map((record) => record.scopeId),
           ...clientState.toolPolicyScopeLinks
             .filter((link) => link.role === 'active' && link.scopeKind === 'agent')
             .map((link) => link.scopeId?.trim() ?? '')
@@ -350,11 +358,17 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         const workflow: ScopeRef[] = scopeKind === 'workflow' ? [{ scopeKind, scopeId }] : [];
         for (const agentId of agentIds) {
           for (const name of this.resolveScopes([{ scopeKind: 'global' }, { scopeKind: 'agent', scopeId: agentId }, ...workflow]).allowedTools) {
-            names.add(name);
+            if (builtinToolNames.has(name) && carried.has(name)) names.add(name);
           }
         }
       }
       return [...names];
+    },
+    /** The tools the first list saved at this scope adds beyond what the scope shows today. */
+    listSeedExtrasFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string[] {
+      if (this.localPolicyFor(scopeKind, scopeId).policy?.allowedTools !== undefined) return [];
+      const shown = new Set(this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools);
+      return this.listSeedFor(scopeKind, scopeId).filter((name) => !shown.has(name)).sort();
     },
     /** What this scope inherits before its own record applies; global inherits only tool defaults. */
     inheritedPolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ReturnType<typeof resolveToolPolicyLayers> {

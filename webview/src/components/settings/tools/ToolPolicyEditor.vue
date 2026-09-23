@@ -73,6 +73,8 @@ const visibleTools = computed(() => {
   return builtinTools.value.filter((tool) => toolScope(tool) === scope);
 });
 const visibleEnabledCount = computed(() => visibleTools.value.filter((tool) => isToolEnabled(tool)).length);
+/** What the first list saved here adds beyond the tools shown now (global and workflows only). */
+const firstListExtras = computed(() => props.readonly ? [] : store.listSeedExtrasFor(props.scopeKind, props.scopeId));
 /** A built-in read-only Agent or workflow denies every MCP source it does not enable itself. */
 const mcpSourcesDeniedHere = computed(() => !!store.builtinPolicyFor(props.scopeKind, props.scopeId)?.sourceConfigs?.[TOOL_POLICY_ALL_MCP_SOURCES]);
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
@@ -582,6 +584,8 @@ function inputNumber(event: Event): number {
       <button v-else type="button" class="secondary" :disabled="!canRestoreInheritance" @click="restoreInheritance">恢复继承</button>
     </div>
 
+    <p v-if="firstListExtras.length > 0" class="tool-policy-note">这里还没有单独保存工具列表。第一次改下方的工具开关会保存一份列表，并带上内置 Agent 列表里的 {{ firstListExtras.join('、') }}，以免这些 Agent 失去它们；没有自己列表的自定义 Agent 也会因此得到 {{ firstListExtras.join('、') }}。工作环境相关工具仍受工作环境策略限制，默认关闭。</p>
+
     <section v-if="mcpSourceGroups.length > 0" class="mcp-source-section" aria-label="MCP 工具来源">
       <div class="mcp-source-heading">
         <span>MCP 服务</span>
@@ -935,7 +939,8 @@ function inputNumber(event: Event): number {
   padding-block: var(--space-1);
 }
 
-.interaction-auto-approval-hint {
+.interaction-auto-approval-hint,
+.tool-policy-note {
   margin: 0;
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-xs);

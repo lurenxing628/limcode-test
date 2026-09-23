@@ -1,7 +1,77 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import test from 'node:test';
 import { createWebviewSsrServer } from './webview-ssr-server.mjs';
+
+const requireCompiled = createRequire(import.meta.url);
+const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
+class Uri {
+  constructor(value) { this.scheme = 'file'; this.fsPath = path.resolve(value); this.path = this.fsPath; }
+  static file(value) { return new Uri(value); }
+  static joinPath(base, ...parts) { return new Uri(path.join(base.fsPath, ...parts)); }
+  toString() { return `file://${this.path}`; }
+}
+const vscodeStub = { Uri, FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 }, workspace: { fs: {
+  createDirectory: uri => fs.mkdir(uri.fsPath, { recursive: true }), readFile: uri => fs.readFile(uri.fsPath),
+  async writeFile(uri, bytes) { await fs.mkdir(path.dirname(uri.fsPath), { recursive: true }); await fs.writeFile(uri.fsPath, bytes); },
+  async readDirectory(uri) { return (await fs.readdir(uri.fsPath, { withFileTypes: true })).map(item => [item.name, item.isDirectory() ? 2 : 1]); },
+  delete: uri => fs.rm(uri.fsPath, { recursive: true, force: true }),
+  async stat(uri) { const stat = await fs.stat(uri.fsPath); return { type: stat.isDirectory() ? 2 : 1, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs }; }
+} } };
+
+/**
+ * The real configuration authority behind the settings page: what the page posts is saved by the
+ * production mutations and compiled exactly as a Turn would freeze it.
+ */
+async function withBackendSettings(run) {
+  const Module = requireCompiled('node:module');
+  const originalLoad = Module._load;
+  Module._load = function(request, parent, isMain) { return request === 'vscode' ? vscodeStub : originalLoad.call(this, request, parent, isMain); };
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-settings-roundtrip-'));
+  try {
+    const load = file => requireCompiled(path.join(compiledRoot, file));
+    const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
+    const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
+    const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
+    const { createBuiltinToolDefinitions } = load('backend/world/modules/tools/definitions/index.js');
+    const { commandDeclarationCapability } = load('backend/reliableKernel/builtinToolCatalog.js');
+    const { toolDefinitionRecord } = load('backend/world/modules/tools/registry.js');
+    const { toolAllowedByPolicy } = load('shared/toolPolicyResolution.js');
+    const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(root)));
+    const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
+    const provider = { ...createDefaultLlmProviderConfig({ name: 'settings round trip' }), id: 'provider:settings-round-trip',
+      model: 'model:settings-round-trip', models: [{ id: 'model:settings-round-trip', name: 'model' }], modelConfigs: [] };
+    await save('llmProviderConfigs', { configs: [provider] });
+    await save('llm', { activeProviderConfigId: provider.id });
+    let turn = 0;
+    await run({
+      configuration,
+      toolAllowedByPolicy,
+      /** The real tool catalog, plus MCP tools as a connected server declares them. */
+      toolDefinitions: (...mcp) => [...createBuiltinToolDefinitions({ command: commandDeclarationCapability() }).map(toolDefinitionRecord), ...mcp],
+      compile: async (executorAgentId, conversationId) => JSON.parse((await configuration.compile({
+        conversationId, turnId: `turn:${conversationId}:${turn++}`, executorAgentId, intentKind: 'input'
+      })).authoritySnapshot.content).toolPolicy,
+      /** Loads the saved configuration into the page's client state, as the bridge snapshot does. */
+      async sync(client) {
+        const state = await configuration.configurationClientState();
+        for (const key of ['agents', 'workflows', 'toolPolicies', 'toolPolicyScopeLinks', 'builtinToolPolicies', 'conversationWorkflowSelections']) client[key] = state[key];
+      },
+      /** Saves what the page posted through the production mutations. */
+      async apply(message) {
+        if (message.type === 'toolPolicy.scope.set') await configuration.mutations.setToolPolicy(message.payload);
+        else if (message.type === 'toolPolicy.scope.clear') await configuration.mutations.clearToolPolicy(message.payload.scopeKind, message.payload.scopeId);
+        else assert.fail(`unexpected settings message ${message.type}`);
+      }
+    });
+  } finally {
+    Module._load = originalLoad;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
 
 test('协作设置保持用户默认深度、单项继承和作用域隔离，保存为可克隆的原工具策略', async (t) => {
   const { createSSRApp } = await import('vue');
@@ -338,6 +408,62 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       (await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'saved' })).setToolEnabled(tool('list_conversations'), true);
       assert.deepEqual(sorted(store.localPolicyFor('conversation', 'saved').policy.allowedTools), sorted(['read_file', 'write', 'run_agent', 'list_conversations']));
       assert.ok(feed);
+    });
+
+    await t.test('第一次保存全局或工作流列表时，只从其它 Agent 带入默认工具和内置 Agent 的工具，不带入 MCP 工具或手动勾选的工具', async () => {
+      const switchTool = { name: 'switch_work_environment', execution: 'backend', parameters: { type: 'object' }, description: 'switch', defaultConfig: {}, metadata: { defaultEnabled: false } };
+      const legacyTool = { name: 'legacy_tool', execution: 'backend', parameters: { type: 'object' }, description: 'legacy', defaultConfig: {}, metadata: { defaultEnabled: false } };
+      const catalog = [...allDefinitions, switchTool, legacyTool];
+      const builtins = builtinToolPolicies.map((record) => record.scopeId === 'main' ? { ...record, allowedTools: [...record.allowedTools, 'switch_work_environment'] } : record);
+      const customChain = (...upper) => [{ scopeKind: 'global' }, { scopeKind: 'agent', scopeId: 'agent:custom' }, ...upper];
+      for (const [scopeKind, scopeId] of [['global', undefined], ['workflow', 'wf']]) {
+        const { client, store, bindings, render } = fresh(catalog);
+        client.builtinToolPolicies = builtins;
+        // Another Agent's own list holds an MCP tool whose source nobody configured, and a tool that is off by default.
+        store.setPolicyForScope('agent', 'agent:other', ['read_file', 'mcp_search', 'legacy_tool'], 'Other');
+        const chain = customChain(...(scopeKind === 'workflow' ? [{ scopeKind, scopeId }] : []));
+        const before = store.resolveScopes(chain).allowedTools;
+        assert.equal(before.includes('mcp_search'), false);
+        assert.match(await render(toolEditor, { scopeKind, scopeId }), /没有自己列表的自定义 Agent 也会因此得到 switch_work_environment、transfer。/,
+          `${scopeKind} says what its first list adds`);
+        (await bindings(toolEditor, { scopeKind, scopeId })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === 'write'), false);
+        const saved = store.localPolicyFor(scopeKind, scopeId).policy.allowedTools;
+        for (const name of ['mcp_search', 'legacy_tool']) assert.equal(saved.includes(name), false, `${scopeKind} list must not take ${name} from another Agent`);
+        const after = store.resolveScopes(chain);
+        assert.deepEqual(sorted(after.allowedTools.filter((name) => !before.includes(name))), ['switch_work_environment', 'transfer'],
+          `a list-less custom Agent under the first ${scopeKind} list gains only the main Agent's built-ins (the accepted trade-off)`);
+        assert.deepEqual(before.filter((name) => !after.allowedTools.includes(name)), ['write'], 'and loses only what the user turned off');
+        assert.equal(store.effectivePolicyFor('agent', 'main').policy.allowedTools.includes('transfer'), true, 'the main Agent keeps transfer');
+        assert.doesNotMatch(await render(toolEditor, { scopeKind, scopeId }), /没有自己列表的自定义 Agent 也会因此得到/, 'the note goes once a list is saved');
+      }
+    });
+
+    await t.test('设置页第一次保存的全局或工作流列表，经后端编译后也不让没有列表的 Agent 得到其它 Agent 的 MCP 工具', async () => {
+      await withBackendSettings(async ({ configuration, compile, toolDefinitions, toolAllowedByPolicy, sync, apply }) => {
+        const exa = { name: 'exa_search', execution: 'runtime', description: 'MCP exa', parameters: { type: 'object' },
+          source: { kind: 'mcp', sourceId: 'exa', sourceName: 'exa', originalToolName: 'search' },
+          metadata: { category: 'general', scope: 'general', riskLevel: 'command', readonly: false, defaultEnabled: false } };
+        const custom = await configuration.mutations.createAgent({ name: 'Custom', kind: 'custom' });
+        const other = await configuration.mutations.createAgent({ name: 'Other', kind: 'custom' });
+        const workflow = await configuration.mutations.createWorkflow({ name: 'W' });
+        await configuration.mutations.selectConversationWorkflow({ conversationId: 'conversation:w', scopeKind: 'workflow', workflowId: workflow.id });
+        await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: other.id, allowedTools: ['read', 'exa_search'] });
+        for (const [scopeKind, scopeId, conversationId] of [['global', undefined, 'conversation:plain'], ['workflow', workflow.id, 'conversation:w']]) {
+          await configuration.mutations.clearToolPolicy('global');
+          await configuration.mutations.clearToolPolicy('workflow', workflow.id);
+          const before = await compile(custom.id, conversationId);
+          assert.equal(toolAllowedByPolicy(before, exa), false);
+          const { client, store, bindings, messages } = fresh(toolDefinitions(exa));
+          await sync(client);
+          (await bindings(toolEditor, { scopeKind, scopeId })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === 'delete'), false);
+          await apply(messages.at(-1));
+          const after = await compile(custom.id, conversationId);
+          assert.equal(toolAllowedByPolicy(after, exa), false, `the first ${scopeKind} list does not admit another Agent's MCP tool`);
+          assert.deepEqual(after.allowedTools.filter((name) => !before.allowedTools.includes(name)), ['switch_work_environment', 'transfer']);
+          assert.deepEqual(before.allowedTools.filter((name) => !after.allowedTools.includes(name)), ['delete']);
+          assert.ok((await compile('main', conversationId)).allowedTools.includes('transfer'), 'the main Agent keeps transfer');
+        }
+      });
     });
 
     await t.test('全局开启的 MCP 服务不进入内置只读 Agent 与工作流，只能在该 Agent 或工作流里单独开启', async () => {
