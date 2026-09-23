@@ -34,6 +34,7 @@ import {
   withClaudeTurnScopedSystemBeta,
   type TurnReminderLayout
 } from './claudeTurnScopedReminders';
+import { withOpenAIResponsesCacheBreakpointBeforeVolatileTail } from './openAIResponsesTailCacheBreakpoint';
 import {
   assertCanonicalProviderToolContext,
   cloneInlineDataPart,
@@ -480,18 +481,19 @@ export async function startLlmProvider(
     };
     const claudeTurnScoped = claudeTurnScopedRemindersRequested(request, settings);
     const volatileTailCount = volatileTailContentCount(request);
+    // WebSocket 模式下 provider 只用来取 WebSocket 帧（续接链）；回退用的 HTTP provider 是无状态完整重放。
     const provider = installRequestAdaptation(installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
-    ), settings, claudeTurnScoped, volatileTailCount);
+    ), settings, claudeTurnScoped, volatileTailCount, isOpenAIResponsesWebSocketMode(settings));
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
           ...unifiedPromptCacheConfigEntry(settings, requestBody, false),
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount)
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount, false)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
@@ -1619,7 +1621,8 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings,
-  claudeTurnScopedRemindersRequested(request, runtimeSettings), volatileTailContentCount(request));
+  claudeTurnScopedRemindersRequested(request, runtimeSettings), volatileTailContentCount(request),
+  isOpenAIResponsesWebSocketMode(runtimeSettings));
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
@@ -4798,12 +4801,16 @@ function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderReque
  * 编码后请求的最终适配：先按模型族做静态适配（Claude 思考类型；GPT-6 Sol / Luna 按实际推理强度去掉
  * 采样参数，Astra 一律去掉），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习），最后为 Claude
  * 轮内系统消息合并 beta 头；Claude 尾巴模式下把消息缓存断点挪到易失尾巴（本轮提醒、重新注入的输入）之前。
+ * OpenAI Responses 显式缓存在无状态完整重放（HTTP、WebSocket 回退的 HTTP、HTTP dry-run）下同样挪到尾巴之前；
+ * `webSocketChain` 表示编码结果交给 WebSocket 续接链（含 WebSocket dry-run 展示的首帧）：尾巴随 previous_response_id
+ * 留在服务端会话的原位，下一帧的会话里仍有它和它的断点，不是易失的，断点留在尾巴上。
  */
 function installRequestAdaptation<T>(
   provider: T,
   settings: LlmProviderConfigRecord,
   claudeTurnScopedReminders = false,
-  volatileTailCount = 0
+  volatileTailCount = 0,
+  webSocketChain = false
 ): T {
   const target = providerRequestTarget(settings);
   const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
@@ -4816,6 +4823,9 @@ function installRequestAdaptation<T>(
           : request,
       target
     );
+    if (settings.provider === 'openai-responses') {
+      return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount);
+    }
     if (settings.provider !== 'claude') return adapted;
     const turnScoped = claudeTurnScopedReminders && !claudeTurnScopedRemindersFallenBack(target);
     // 轮内系统消息模式下尾巴内容之后会在原位原样重发，不是易失的；只有尾巴模式才挪断点。

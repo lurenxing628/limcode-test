@@ -477,8 +477,10 @@ const WIRE_BASELINE = [
     digest: 'd08525a3fca5a7f83dcc3129427291a6589792a34c11b5335d7cd712ed361e10', decisions: INCREMENTAL_AFTER_FIRST },
   { name: 'websocket-gpt-5.5-explicit-plain', config: { model: 'gpt-5.5', transport: 'websocket', promptCache: EXPLICIT }, reminder: false,
     digest: '3cc75db9bd9edf9bcb04d855c6bed4b7898156758afc49cdf1b5edd1a031f6ab', decisions: INCREMENTAL_AFTER_FIRST },
+  // 唯一的有意差异：HTTP 完整重放下消息断点在易失尾巴（本轮提醒）之前（openai-responses-tail-cache-breakpoint 测试）；
+  // 放回尾巴上之后与改动前逐字节相同。
   { name: 'http-gpt-5.6-explicit-reminder', config: { model: 'gpt-5.6', transport: 'http', promptCache: EXPLICIT }, reminder: true,
-    digest: '52cdd32f54ed9bd522c5da709988434a5cd7c227f54a4c8edb055acb58c4a049', decisions: [] },
+    digest: '52cdd32f54ed9bd522c5da709988434a5cd7c227f54a4c8edb055acb58c4a049', decisions: [], breakpointBeforeTail: true },
   { name: 'http-gpt-5.6-explicit-plain', config: { model: 'gpt-5.6', transport: 'http', promptCache: EXPLICIT }, reminder: false,
     digest: 'fd33e28303f205e454da068fc1ccf56b5a2808c51edf68a2a4f24d843a981c81', decisions: [] },
   { name: 'http-gpt-5.6-key-plain', config: { model: 'gpt-5.6', transport: 'http', promptCache: KEY }, reminder: false,
@@ -487,9 +489,27 @@ const WIRE_BASELINE = [
     digest: '61ffc4697a2312133e210d8408b45d87d1fa10eaf2c550ce859dbd4e1daf62dc', decisions: [] }
 ];
 
+/**
+ * 把 HTTP 请求体里的消息断点放回改动前的位置（尾巴，即最后一项的最后一块），开发者指令断点不动；
+ * 同时断言断点确实在尾巴之前、尾巴上没有断点。
+ */
+function withLegacyTailBreakpoint(frame) {
+  const body = JSON.parse(frame.text);
+  const marked = breakpointPaths(body.input);
+  const tail = body.input.length - 1;
+  assert.equal(marked.length, 2, frame.text);
+  assert.equal(marked[0], '0.0', 'developer instructions');
+  const [itemIndex, blockIndex] = marked[1].split('.').map(Number);
+  assert.equal(itemIndex < tail, true, 'message breakpoint before the volatile tail');
+  delete body.input[itemIndex].content[blockIndex].prompt_cache_breakpoint;
+  body.input[tail].content.at(-1).prompt_cache_breakpoint = BREAKPOINT;
+  return { ...frame, text: JSON.stringify(body) };
+}
+
 test('非 explicit 模式、HTTP 传输与 GPT-5.6 之前的模型：线上帧与改动前构建逐字节一致', async () => {
   for (const scenario of WIRE_BASELINE) {
-    const { frames, decisions } = await runScenario(scenario.name, scenario.config, scenario.reminder);
+    const { frames: sent, decisions } = await runScenario(scenario.name, scenario.config, scenario.reminder);
+    const frames = scenario.breakpointBeforeTail ? sent.map(withLegacyTailBreakpoint) : sent;
     assert.deepEqual(decisions, scenario.decisions, scenario.name);
     assert.equal(wireDigest(frames), scenario.digest,
       `${scenario.name} 线上帧与改动前不同：\n${frames.map((frame) => `${frame.kind}: ${frame.text}`).join('\n')}`);
