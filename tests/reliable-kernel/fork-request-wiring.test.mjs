@@ -59,7 +59,14 @@ test('useChat 只在本次点击且仍在源对话时打开分支，重放或迟
         });
         await nextTick();
       };
-      return { chat, show };
+      /** A committed Conversation deletion reaching this view through the live feed. */
+      const remove = async (conversationId) => {
+        feed.observe({ type: 'reliable-kernel.changes', sessionId: feed.sessionId, hostBootId: feed.hostBootId,
+          messageSeq: String(BigInt(feed.lastMessageSeq) + 1n), commitSeq: String(BigInt(feed.lastCommitSeq) + 1n),
+          changes: [{ type: 'Conversation', operation: 'remove', id: conversationId }] });
+        await nextTick();
+      };
+      return { chat, show, remove };
     };
     const forkResult = (request, conversationId = 'branch') => ({
       id: `result-${request.id}`, type: BridgeMessageType.ConversationForkResult, channel: 'control', correlationId: request.id,
@@ -112,6 +119,23 @@ test('useChat 只在本次点击且仍在源对话时打开分支，重放或迟
       assert.deepEqual(chat.conversationForkReadyNotice.value, { sourceConversationId: 'source', conversationId: 'branch', replayed: true });
       chat.dismissForkReadyNotice();
       assert.equal(chat.conversationForkReadyNotice.value, undefined);
+    });
+
+    await t.test('分支对话被删除后提示随之消失，不会再打开已删除的对话', async () => {
+      const { chat, show, remove } = await openWebview();
+      await show('source');
+      chat.forkConversationFrom('source', 'message-a', 'revision-1');
+      const [request] = posted(BridgeMessageType.ConversationFork);
+      await show('elsewhere');
+      emit(forkResult(request));
+      await show('source');
+      assert.deepEqual(chat.conversationForkReadyNotice.value, { sourceConversationId: 'source', conversationId: 'branch', replayed: false });
+      await remove('unrelated');
+      assert.ok(chat.conversationForkReadyNotice.value, 'another deletion leaves the notice');
+      await remove('branch');
+      assert.equal(chat.conversationForkReadyNotice.value, undefined, 'the fork is gone, so is its notice');
+      chat.openForkReadyNotice();
+      assert.deepEqual(posted(BridgeMessageType.ConversationOpen), []);
     });
 
     await t.test('被拒绝的分支显示明确的中文提示，其他失败的提示不与原因矛盾', async () => {

@@ -164,7 +164,11 @@ const conversationActionStates = ref<Record<string, ConversationActionState>>(re
 const forkRequests = ref<ForkRequestRecords>(restored.forkRequests);
 /** Fork commands the user clicked in this Webview session; never persisted, so a reload clears it. */
 const forkClicksThisSession = new Set<string>();
-/** Confirmed forks the user did not open right away, keyed by their source conversation. */
+/**
+ * Confirmed forks the user did not open right away, keyed by their source conversation. Kept in
+ * memory only: the notice answers a result this session saw, and after a reload the fork is in the
+ * sidebar. Persisting it would also mean tracking deletions that happen while no Webview is open.
+ */
 const forkReadyNotices = ref<Record<string, ForkReadyNotice>>({});
 const actionNotices = ref<Record<string, string>>({});
 const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>(restored.pendingTurnInputs);
@@ -1169,7 +1173,11 @@ export function useChat() {
   const conversationActionLabel = computed(() => currentConversationAction.value?.label);
   const compressionPending = computed(() => currentConversationAction.value?.action === 'compress');
   const conversationActionNotice = computed(() => actionNotices.value[reliableConversation.conversationId.value]);
-  const conversationForkReadyNotice = computed(() => forkReadyNotices.value[reliableConversation.conversationId.value]);
+  // A fork deleted after its notice appeared must not be offered any more.
+  const conversationForkReadyNotice = computed(() => {
+    const notice = forkReadyNotices.value[reliableConversation.conversationId.value];
+    return notice && !reliableConversation.feed.removedConversationIds.includes(notice.conversationId) ? notice : undefined;
+  });
   const reliableRecords = computed(() =>
     reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
   );
