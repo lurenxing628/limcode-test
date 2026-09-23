@@ -481,6 +481,7 @@ export async function startLlmProvider(
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
+          ...unifiedPromptCacheConfigEntry(settings, requestBody, false),
           transport: undefined,
           webSocketSessionKey: undefined
         }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped)
@@ -4933,12 +4934,20 @@ function normalizePromptCacheTtl(input: unknown, provider: LlmProviderKind): Llm
   return defaultLlmPromptCacheTtlForProvider(provider);
 }
 
-function unifiedPromptCacheConfigEntry(settings: LlmProviderConfigRecord, requestBody?: LlmRequestBodyRecord): { promptCache: Record<string, unknown> } | Record<string, never> {
-  const promptCache = unifiedPromptCacheFromSettings(settings, requestBody);
+function unifiedPromptCacheConfigEntry(
+  settings: LlmProviderConfigRecord,
+  requestBody?: LlmRequestBodyRecord,
+  webSocket = isOpenAIResponsesWebSocketMode(settings)
+): { promptCache: Record<string, unknown> } | Record<string, never> {
+  const promptCache = unifiedPromptCacheFromSettings(settings, requestBody, webSocket);
   return promptCache ? { promptCache } : {};
 }
 
-function unifiedPromptCacheFromSettings(settings: LlmProviderConfigRecord, requestBody?: LlmRequestBodyRecord): Record<string, unknown> | undefined {
+function unifiedPromptCacheFromSettings(
+  settings: LlmProviderConfigRecord,
+  requestBody: LlmRequestBodyRecord | undefined,
+  webSocket: boolean
+): Record<string, unknown> | undefined {
   if (!isPromptCacheSupportedProvider(settings.provider)) return undefined;
   const promptCache = normalizePromptCache(settings.promptCache, settings.provider);
   if (!promptCache.enabled) return undefined;
@@ -4957,7 +4966,10 @@ function unifiedPromptCacheFromSettings(settings: LlmProviderConfigRecord, reque
       enabled: true,
       mode: 'explicit',
       ttl: promptCache.ttl,
-      breakpoints: { messages: true },
+      // WebSocket 续接链里服务端保留此前各帧的断点（Responses 参考：“considers up to the latest 80
+      // breakpoints in the conversation”），工具结果改用数组形式后每帧的断点能落在最新的工具结果上；
+      // 无状态 HTTP 完整重放只有一个随请求移动的断点，保持原来的字符串形式。
+      breakpoints: webSocket ? { messages: true, toolOutputs: true } : { messages: true },
       ...(key ? { key } : {})
     };
   }

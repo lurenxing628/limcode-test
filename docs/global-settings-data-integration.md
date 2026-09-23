@@ -100,7 +100,7 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - `LlmProviderConfigRecord.nativeResponses` 与模型专属配置的同名字段只保存 `enabled`、`asyncTools`、`steering`、`reasoningUpdates`、`multiplexing` 布尔选项；仍通过 `llmProviderConfigs` section 保存，不新增 Bridge CRUD 或数据目录。
 - 模型专属配置完整替代渠道默认配置，不在读取时偷偷继承原生开关。后端归一化、前端 `normalizeModelConfigForUi`、`toPlainModelConfig` 都必须保留这些字段；创建模型配置时的显式复制与运行时继承不同。
 - 能力只对 OpenAI Responses 的精确 GPT-6 家族型号（`gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna`）及日期快照开放，不从网关别名推断。官方渠道可按渠道默认启用；第三方中继必须显式确认支持。HTTP/SSE 支持原生工具续接与动态推理；推理模式为 pro 时不使用动态推理更新（官方只支持 standard 模式）；回合内转向和命名通道多路复用只在 WebSocket 模式开放。
-- 显式缓存复用 `promptCache`：`enabled`、`mode: 'explicit'`、`ttl: '30m'`。线级使用 `prompt_cache_options` 和符合条件的内容断点，不把旧 `prompt_cache_retention` 当作等价配置。只有 GPT-5.6 及之后的官方型号发送显式缓存参数，HTTP 与 WebSocket 一致。
+- 显式缓存复用 `promptCache`：`enabled`、`mode: 'explicit'`、`ttl: '30m'`。线级使用 `prompt_cache_options` 和符合条件的内容断点，不把旧 `prompt_cache_retention` 当作等价配置。只有 GPT-5.6 及之后的官方型号发送显式缓存参数，HTTP 与 WebSocket 都发送。HTTP 每次完整重放，断点放在开发者指令和最新的可承载内容块上。WebSocket 续接链只发送新增输入：比较续接前缀时只忽略内容块上的断点标记（其余内容不同仍整包重发），工具结果改用 `input_text` 数组形式，每帧只在本帧最新的可承载块上打断点，此前各帧的断点由服务端随链保留。
 - 每个工具的异步许可独立保存在 `ToolPolicy.toolConfigs[toolName].nativeAsync`。它不改变执行审批、变更应用、结果回传审批或调度策略；冻结工具定义中的 `metadata.nativeAsync` 经适配器映射为 `ToolSchema.async`，最终才成为线级声明的 `async`。
 - 配置编辑只影响后续冻结请求。普通发送与 Enter 读取当前流式 `ModelRequest.stream_stats_json.nativeCapabilities`：支持原生转向时自动介入当前回复，不支持时仍按原有规则发送或排队；不提供独立转向按钮，也不能从尚未生效的可编辑设置推断当前连接能力。提交转向期间禁止重复发送，失败保留草稿与附件，不自动改为排队；编辑消息仍走原编辑流程。
 - 保存与重载必须保留模型级原生配置；发送前继续使用专用 plain-data 转换，禁止把 Pinia/Vue Proxy 放进 bridge payload。

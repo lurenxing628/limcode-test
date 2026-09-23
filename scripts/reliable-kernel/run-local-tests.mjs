@@ -93,6 +93,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/native-tool-admission.test.mjs',
   'tests/reliable-kernel/native-provider-capability.test.mjs',
   'tests/reliable-kernel/gpt6-family-adaptation.test.mjs',
+  'tests/reliable-kernel/openai-responses-ws-explicit-cache.test.mjs',
   'tests/reliable-kernel/native-request-orchestration.test.mjs',
   'tests/reliable-kernel/native-compact-media.test.mjs',
   'tests/reliable-kernel/phase-b-foundation.test.mjs',
