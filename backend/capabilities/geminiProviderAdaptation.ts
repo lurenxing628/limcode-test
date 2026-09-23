@@ -30,6 +30,7 @@ function installProviderSchemaEncoder<T>(
 ): T {
   const geminiOpenAICompatible = providerKind === 'openai-compatible' && isGeminiOpenAICompatibleModelName(modelId);
   if (providerKind !== 'gemini' && providerKind !== 'openai-responses' && providerKind !== 'claude' && !geminiOpenAICompatible) return provider;
+  const fillsCurrentTurnSignatures = providerKind === 'gemini' && geminiModelMayValidateSignatures(modelId);
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
@@ -49,6 +50,7 @@ function installProviderSchemaEncoder<T>(
     const encoded = originalEncodeRequest(normalizedRequest, stream);
     if (providerKind === 'gemini' || geminiOpenAICompatible) {
       restoreGeminiToolSchemas(encoded, normalizedRequest);
+      if (providerKind === 'gemini' && fillsCurrentTurnSignatures) fillGeminiCurrentTurnSignatures(encoded);
     } else if (providerKind === 'claude') {
       restoreClaudeCompactionBlocks(encoded, claudeProjection.blocks);
       restoreClaudeToolResultPairing(encoded);
@@ -199,15 +201,24 @@ function claudeContentBlocks(content: unknown): unknown[] {
 const GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR = 'skip_thought_signature_validator';
 
 /**
- * Gemini-like models that validate function-call signatures and therefore receive the dummy for
- * unsigned history: everything the capability table resolves to a Gemini 3 thinking level, plus
- * Gemini names it does not know yet (`gemini-4-pro`, `gemini-flash-latest`). Gemini 1.x/2.x are
- * left alone: signatures there are optional ("Gemini 2.5 ... optional" in the thought-signatures
- * doc), so their existing requests stay unchanged.
+ * Gemini-like models on the OpenAI-compatible wire that receive the dummy for unsigned history:
+ * everything the capability table resolves to a Gemini 3 thinking level, plus Gemini names it does
+ * not know yet (`gemini-4-pro`, `gemini-flash-latest`).
  */
 function fillsMissingGeminiSignatures(modelId: string): boolean {
   if (geminiThinkingCapabilityForModel(modelId).kind === 'thinkingLevel') return true;
-  if (!isGeminiOpenAICompatibleModelName(modelId)) return false;
+  return isGeminiOpenAICompatibleModelName(modelId) && geminiModelMayValidateSignatures(modelId);
+}
+
+/**
+ * Gemini 3 validates function-call signatures; Gemini 1.x/2.x do not ("Gemini 2.5 ... optional" in
+ * https://ai.google.dev/gemini-api/docs/thought-signatures), so their existing requests stay unchanged.
+ * Unknown Gemini names are treated as validating: the dummy is accepted either way.
+ */
+function geminiModelMayValidateSignatures(modelId: string): boolean {
+  const kind = geminiThinkingCapabilityForModel(modelId).kind;
+  if (kind === 'thinkingLevel') return true;
+  if (kind === 'thinkingBudget') return false;
   const major = /^gemini-(\d+)/i.exec(geminiOpenAICompatibleBaseName(modelId))?.[1];
   return major === undefined || Number(major) >= 3;
 }
@@ -483,6 +494,41 @@ function emptyGeminiOpenAIToolCallSignatures(): GeminiOpenAIToolCallSignatures {
     decodedCalls: new WeakSet(),
     decodedCallCount: 0
   };
+}
+
+/**
+ * Native Gemini validates signatures only in the current turn: everything after the newest user
+ * content that carries ordinary content (text, media) rather than a functionResponse. In that turn
+ * "the first functionCall part in each step ... must include its thought_signature", otherwise 400
+ * (https://ai.google.dev/gemini-api/docs/thought-signatures). Calls produced by another model, or
+ * retried on Gemini after another model failed, have no Gemini signature; the documented dummy
+ * goes on the first call of each such model content. Existing signatures are never touched.
+ *
+ * A user content that mixes function responses with text is not treated as a turn boundary, so the
+ * turn can only be over-estimated; a dummy in an unvalidated earlier turn is harmless.
+ */
+function fillGeminiCurrentTurnSignatures(encodedRequest: unknown): void {
+  if (!isRecord(encodedRequest) || !Array.isArray(encodedRequest.contents)) return;
+  const contents = encodedRequest.contents;
+  let turnStart = 0;
+  for (let index = contents.length - 1; index >= 0; index -= 1) {
+    if (isGeminiTurnStartingUserContent(contents[index])) {
+      turnStart = index + 1;
+      break;
+    }
+  }
+  for (const content of contents.slice(turnStart)) {
+    if (!isRecord(content) || content.role !== 'model' || !Array.isArray(content.parts)) continue;
+    const firstCall = content.parts.find((part) => isRecord(part) && isRecord(part.functionCall));
+    if (!isRecord(firstCall) || normalizedSignatureString(firstCall.thoughtSignature)) continue;
+    firstCall.thoughtSignature = GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR;
+  }
+}
+
+function isGeminiTurnStartingUserContent(content: unknown): boolean {
+  if (!isRecord(content) || content.role !== 'user' || !Array.isArray(content.parts)) return false;
+  const parts = content.parts.filter(isRecord);
+  return parts.length > 0 && !parts.some((part) => isRecord(part.functionResponse));
 }
 
 function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unknown {

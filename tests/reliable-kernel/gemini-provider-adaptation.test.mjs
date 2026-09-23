@@ -370,3 +370,73 @@ test('E1 pairing only applies to Gemini: other providers keep their own history 
     assert.deepEqual(request.contents.map((content) => content.parts.length), [1, 2, 1, 1, 1], providerKind);
   }
 });
+
+test('E2 unsigned calls in the current Gemini turn get the dummy on the first call of each step', async () => {
+  const contents = await geminiWireContents([
+    userText('earlier question'),
+    { role: 'model', parts: [call('old')] },
+    { role: 'user', parts: [response('old')] },
+    userText('current question'),
+    { role: 'model', parts: [{ text: 'thinking', thought: true }, call('a'), call('b')] },
+    { role: 'user', parts: [response('a'), response('b')] },
+    { role: 'model', parts: [call('c')] },
+    { role: 'user', parts: [response('c')] }
+  ]);
+  assert.deepEqual(wireShape(contents), [
+    'user:TEXT(earlier question)',
+    'model:FC(old)',
+    'user:FR(old)',
+    'user:TEXT(current question)',
+    `model:THOUGHT(thinking),FC(a)+${DUMMY_SIGNATURE},FC(b)`,
+    'user:FR(a),FR(b)',
+    `model:FC(c)+${DUMMY_SIGNATURE}`,
+    'user:FR(c)'
+  ]);
+});
+
+test('E2 existing signatures stay untouched and signed turns are sent unchanged', async () => {
+  const history = [
+    userText('go'),
+    { role: 'model', parts: [call('a', 'SIG_A'), call('b')] },
+    { role: 'user', parts: [response('a'), response('b')] },
+    { role: 'model', parts: [call('c', 'SIG_C')] },
+    { role: 'user', parts: [response('c')] }
+  ];
+  assert.deepEqual(wireShape(await geminiWireContents(history)), [
+    'user:TEXT(go)',
+    'model:FC(a)+SIG_A,FC(b)',
+    'user:FR(a),FR(b)',
+    'model:FC(c)+SIG_C',
+    'user:FR(c)'
+  ]);
+});
+
+test('E2 a response content that also carries text does not end the current turn', async () => {
+  const contents = await geminiWireContents([
+    userText('go'),
+    { role: 'model', parts: [call('a')] },
+    { role: 'user', parts: [response('a')] },
+    userText(CATALOG),
+    { role: 'model', parts: [call('b')] },
+    { role: 'user', parts: [response('b'), { text: 'note' }] },
+    { role: 'model', parts: [call('c')] },
+    { role: 'user', parts: [response('c')] }
+  ]);
+  // The catalog user content starts the turn; the mixed response content does not.
+  assert.deepEqual(wireShape(contents).slice(4), [
+    `model:FC(b)+${DUMMY_SIGNATURE}`,
+    'user:FR(b),TEXT(note)',
+    `model:FC(c)+${DUMMY_SIGNATURE}`,
+    'user:FR(c)'
+  ]);
+  assert.equal(wireShape(contents)[1], 'model:FC(a)');
+});
+
+test('E2 Gemini 2.5 (signatures optional) keeps its unsigned history as before', async () => {
+  const contents = await geminiWireContents([
+    userText('go'),
+    { role: 'model', parts: [call('a')] },
+    { role: 'user', parts: [response('a')] }
+  ], { model: 'gemini-2.5-flash' });
+  assert.deepEqual(wireShape(contents), ['user:TEXT(go)', 'model:FC(a)', 'user:FR(a)']);
+});
