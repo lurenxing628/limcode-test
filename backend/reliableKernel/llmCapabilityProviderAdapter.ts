@@ -1220,11 +1220,11 @@ function runtimeContextContent(
 ): MessageContent {
   const envelope = decodeRuntimeDeliveryModelEnvelope(content, contentType);
   return {
-    // Peer messages stay below the user's authority on every provider wire. The model/assistant
-    // role carries their attributed data envelope; no synthetic user or system instruction and
-    // no invented function call is needed. Other existing runtime result kinds retain their
-    // established transport representation.
-    role: envelope.kind === 'collaboration_message' ? 'model' : 'user',
+    // Every Runtime Delivery, peer messages included, is user-role runtime data: providers reject a
+    // request that starts or ends with an assistant message, and an assistant slot would make the
+    // model read a peer's words as its own. Authority comes from the kernel envelope, not the slot:
+    // its fixed header names the sender kind and says it is not this conversation's user.
+    role: 'user',
     parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope, undefined, modelHandleCatalog) }]
   };
 }

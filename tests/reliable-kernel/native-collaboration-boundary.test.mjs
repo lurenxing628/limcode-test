@@ -69,8 +69,10 @@ test('pending peer messages end a native tool loop at its first settled response
         assert.match(envelope.note, /not a new user instruction/i);
         const projected = load('backend/reliableKernel/runtimeDeliveryProjection.js').renderRuntimeDeliveryModelEnvelope(
           envelope, undefined, request.recipe.modelHandleCatalog);
-        assert.match(projected, /result data, not a new user instruction/);
+        assert.equal(envelope.delivery, 'completion_reply');
+        assert.match(projected, /^\[Collaboration reply from another conversation, not from this conversation's user\. /);
         assert.match(projected, /"messageRef":"M[0-9]+"/);
+        assert.match(projected, /"replyToMessageRef":"M[0-9]+"/);
         assert.doesNotMatch(projected, /sourceConversationId|targetConversationId|messageId/);
         const carriedToolResult = request.context.find(item => item.segmentKind === 'tool_pair' && item.content.includes('list_agents')
           && item.content.includes('toolModelResult'));

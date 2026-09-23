@@ -14,6 +14,7 @@ import {
 } from './childExecution';
 import { requireChildExecutionStatus } from './childExecutionState';
 import { isCrossConversationFollowup } from './collaborationScope';
+import { displayConversationTitle } from '../../shared/conversationTitle';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   isTransactionAssertionFailure,
@@ -1695,7 +1696,20 @@ export class RuntimeDeliveryControlPlane {
         if (channels.length !== 1) throw new Error('Board notification post has no unique channel.');
         board = { postId, channelId: String(channels[0].channel_id), threadId: replyLinks[0] ? String(replyLinks[0].thread_id) : postId };
       }
-      return projectRuntimeDeliveryForModel({ ...(board ? { board } : {}), kind: 'collaboration_message', phase, deliveryId, inboxItemId, targetTurnId, deliveredAt, messageId, sourceConversationId: String(sources[0].conversation_id), targetConversationId: String(targets[0].conversation_id), sourceKind: String(sources[0].source_kind), mode: message.mode as 'message' | 'followup', replyToMessageId: replies[0] ? String(replies[0].request_message_id) : null, content: contentBytes.toString('utf8') });
+      const sourceConversationId = String(sources[0].conversation_id);
+      const targetConversationId = String(targets[0].conversation_id);
+      // A team always has a child task on one side; cross-conversation tools join two top-level
+      // conversations. A deleted sender keeps its ref but loses its title.
+      const [sender, sourceChildren, targetChildren] = await Promise.all([
+        this.maybeGet('Conversation', sourceConversationId),
+        this.listRows('ChildExecution', { child_conversation_id: sourceConversationId }, 1),
+        this.listRows('ChildExecution', { child_conversation_id: targetConversationId }, 1)
+      ]);
+      const senderKind = sources[0].source_kind === 'board' || sourceChildren.length > 0 || targetChildren.length > 0
+        ? 'team_agent' as const : 'other_conversation' as const;
+      const senderTitle = sender ? displayConversationTitle({ id: sourceConversationId, title: String(sender.title), maxLength: 80 }) : null;
+      return projectRuntimeDeliveryForModel({ ...(board ? { board } : {}), kind: 'collaboration_message', phase, deliveryId, inboxItemId, targetTurnId, deliveredAt, messageId, sourceConversationId, targetConversationId, sourceKind: String(sources[0].source_kind), mode: message.mode as 'message' | 'followup', replyToMessageId: replies[0] ? String(replies[0].request_message_id) : null, content: contentBytes.toString('utf8'),
+        failureReply: sources[0].source_kind === 'completion' && sources[0].turn_id === null, senderKind, senderTitle });
     }
     if (inbox.source_kind === 'process_receipt') {
       if (contentType !== PROCESS_COMPLETION_MODEL_SOURCE_CONTENT_TYPE) {
