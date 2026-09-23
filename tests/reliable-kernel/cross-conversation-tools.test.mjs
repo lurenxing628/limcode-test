@@ -312,6 +312,9 @@ test('with the switch off the tools are not offered and every entry point reject
       assert.ok(result, `${name} result missing`);
       assert.notEqual(result.status, 'succeeded', `${name} must not execute: ${JSON.stringify(result)}`);
     }
+    // The model must learn the tool is absent (so it picks an offered one), not that a declaration conflicts.
+    assert.match(JSON.stringify(lastResult(start, 'list_conversations')), /本次请求没有提供工具 list_conversations/);
+    assert.doesNotMatch(JSON.stringify(lastResult(start, 'list_conversations')), /不是唯一声明/);
     await assert.rejects(f.app.runtime.collaboration.listConversations({ turnId: request.turnId }), /not enabled/);
     await assert.rejects(f.app.runtime.collaboration.readConversation({ conversationId: ROOT, targetConversationId: PEER, crossConversationTurnId: request.turnId }), /not enabled/);
     return answer('Nothing to do.');

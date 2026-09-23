@@ -770,7 +770,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       const recipeMatches = recipeByName.get(call.toolName) ?? [];
       let definitionMismatch: string | undefined;
       if (recipeMatches.length !== 1) {
-        definitionMismatch = `ModelRequest recipe 中工具 ${call.toolName} 不是唯一声明。`;
+        definitionMismatch = recipeToolDeclarationError(call.toolName, recipeMatches.length);
       } else if (!sameReliableToolDefinition(recipeMatches[0], pending.frozenDefinition)) {
         return undefined;
       } else {
@@ -3086,10 +3086,17 @@ function providerDefinitionMismatchFromRecipe(
   const matches = recipe.tools
     .map((value, index) => requireRecord(value, `ModelRequest recipe.tools[${index}]`))
     .filter((value) => value.name === toolName);
-  if (matches.length !== 1) return `ModelRequest recipe 中工具 ${toolName} 不是唯一声明。`;
+  if (matches.length !== 1) return recipeToolDeclarationError(toolName, matches.length);
   return sameToolSource(definition.declaration.source, matches[0].source)
     ? undefined
     : `工具 ${toolName} 的当前 capability source 与 Provider 请求冻结 source 不一致；拒绝跨源执行。`;
+}
+
+/** 返回给模型的工具结果：没声明的工具要说清“不存在”，模型才会改用本次请求提供的工具，而不是当成配置冲突。 */
+function recipeToolDeclarationError(toolName: string, count: number): string {
+  return count === 0
+    ? `本次请求没有提供工具 ${toolName}，只能调用请求里声明的工具。`
+    : `ModelRequest recipe 中工具 ${toolName} 声明了 ${count} 次，不是唯一声明。`;
 }
 
 function sameToolSource(left: unknown, right: unknown): boolean {
