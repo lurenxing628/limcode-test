@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { IconChevronDown, IconPlus, IconRefresh, IconPencil, IconTrash } from '@tabler/icons-vue';
-import type { McpServerConfigRecord, McpServerTransportRecord, ToolDefinitionRecord, ToolPolicySourceConfigRecord } from '@shared/protocol';
+import type { McpServerConfigRecord, McpServerTransportRecord, ToolDefinitionRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
@@ -138,17 +138,6 @@ function deleteServerConfirm(): void {
   if (server) settings.deleteMcpServer(server.id);
 }
 
-function cloneSourceConfigs(): Record<string, ToolPolicySourceConfigRecord> {
-  const result: Record<string, ToolPolicySourceConfigRecord> = {};
-  for (const [sourceId, record] of Object.entries(globalPolicy.value?.sourceConfigs ?? {})) {
-    result[sourceId] = {
-      enabled: record.enabled === true,
-      ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})
-    };
-  }
-  return result;
-}
-
 function isSourceGloballyEnabled(sourceId: string): boolean {
   return mcpSourceConfigFor(globalPolicy.value?.sourceConfigs, sourceId)?.enabled === true;
 }
@@ -157,21 +146,13 @@ function isToolGloballyEnabled(tool: ToolDefinitionRecord): boolean {
   return !!globalPolicy.value && toolAllowedByPolicy(globalPolicy.value, tool);
 }
 
+/**
+ * Turns exactly this tool on or off in the global source settings; the server's other tools keep
+ * what they show. No global list is written as a side effect.
+ */
 function setToolGlobalEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
-  const sourceId = tool.source?.sourceId;
-  if (!sourceId || globalListInvalid.value) return;
-  const next = cloneSourceConfigs();
-  const sourceConfig = next[sourceId] ?? { enabled: true, disabledTools: [] };
-  const disabled = new Set(sourceConfig.disabledTools ?? []);
-  if (enabled) disabled.delete(tool.name);
-  else disabled.add(tool.name);
-  next[sourceId] = { enabled: sourceConfig.enabled !== false, ...(disabled.size > 0 ? { disabledTools: [...disabled] } : {}) };
-  // Keep the saved global list state: without a saved list the source settings alone decide, and
-  // writing the displayed default list here would create a global ceiling as a side effect.
-  const saved = toolPolicyStore.localPolicyFor('global').policy;
-  const ownList = toolPolicyStore.ownListFor('global');
-  const allowedTools = ownList && !enabled ? ownList.filter((name) => name !== tool.name) : ownList;
-  toolPolicyStore.setPolicyForScope('global', undefined, allowedTools, saved?.name, saved?.toolConfigs, next);
+  if (globalListInvalid.value || enabled === isToolGloballyEnabled(tool)) return;
+  toolPolicyStore.setMcpToolEnabledForScope('global', undefined, tool, enabled);
 }
 
 function sourceForServer(serverId: string) {

@@ -81,6 +81,8 @@ const editsBlocked = computed(() => props.readonly || listError.value?.own === t
 const listEditsBlocked = computed(() => props.readonly || !!listError.value);
 /** What the first list saved here adds beyond the tools shown now (global and workflows only). */
 const firstListExtras = computed(() => props.readonly ? [] : store.listSeedExtrasFor(props.scopeKind, props.scopeId));
+/** The built-in read-only Agents and workflows above this scope that deny every MCP source not enabled at their own scope. */
+const mcpDenyingBuiltinsAbove = computed(() => store.mcpDenyingBuiltinsAbove(props.scopeKind, props.scopeId).map((scope) => store.scopeLabel(scope)));
 /** A built-in read-only Agent or workflow denies every MCP source it does not enable itself. */
 const mcpSourcesDeniedHere = computed(() => !!store.builtinPolicyFor(props.scopeKind, props.scopeId)?.sourceConfigs?.[TOOL_POLICY_ALL_MCP_SOURCES]);
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
@@ -177,8 +179,18 @@ function isMcpSourceEnabled(sourceId: string): boolean {
   return mcpSourceConfigFor(effectivePolicy.value?.sourceConfigs, sourceId)?.enabled === true;
 }
 
+/** An upper layer turns this source off here, so enabling it at this scope would never apply. */
+function isMcpSourceBlockedAbove(sourceId: string): boolean {
+  return !!store.mcpSourceBlockedAbove(props.scopeKind, props.scopeId, sourceId);
+}
+
+/** An upper layer keeps this MCP tool off here, so its box cannot turn it on. */
+function isMcpToolBlockedAbove(tool: ToolDefinitionRecord): boolean {
+  return store.mcpToolBlockedAbove(props.scopeKind, props.scopeId, tool);
+}
+
 function toggleMcpSource(sourceId: string, enabled: boolean): void {
-  if (editsBlocked.value) return;
+  if (editsBlocked.value || (enabled && isMcpSourceBlockedAbove(sourceId))) return;
   const nextConfigs = cloneSourceConfigs();
   nextConfigs[sourceId] = {
     ...(nextConfigs[sourceId] ?? {}),
@@ -188,22 +200,19 @@ function toggleMcpSource(sourceId: string, enabled: boolean): void {
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), cloneToolConfigs(), nextConfigs);
 }
 
+/** One MCP tool follows its source settings: the switch changes that tool alone and never a tool list. */
 function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void {
-  if (editsBlocked.value || tool.source?.kind !== 'mcp' || !tool.source.sourceId) return;
-  const sourceId = tool.source.sourceId;
-  const nextConfigs = cloneSourceConfigs();
-  const current = nextConfigs[sourceId] ?? { enabled: true, disabledTools: [] };
-  const disabled = new Set(current.disabledTools ?? []);
-  if (enabled) disabled.delete(tool.name);
-  else disabled.add(tool.name);
-  nextConfigs[sourceId] = { enabled: current.enabled !== false, ...(disabled.size > 0 ? { disabledTools: [...disabled] } : {}) };
-  const local = localAllowedTools();
-  const nextAllowed = local && !enabled ? local.filter((name) => name !== tool.name) : local;
-  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed, localPolicyName(), cloneToolConfigs(), nextConfigs);
+  if (listEditsBlocked.value || tool.source?.kind !== 'mcp' || enabled === isToolEnabled(tool)) return;
+  if (!enabled) collapseToolConfig(tool.name);
+  store.setMcpToolEnabledForScope(props.scopeKind, props.scopeId, tool, enabled);
 }
 
 /** An explicit enable makes the tool the user's own: turning the cross-conversation switch off keeps it. */
 function setToolEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
+  if (tool.source?.kind === 'mcp') {
+    toggleMcpSourceTool(tool, enabled);
+    return;
+  }
   if (listEditsBlocked.value || enabled === isToolEnabled(tool)) return;
   if (!enabled) collapseToolConfig(tool.name);
   store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs(),
@@ -598,6 +607,8 @@ function inputNumber(event: Event): number {
         <span>MCP 服务</span>
         <small>关闭某个 MCP 服务会停用它提供的全部工具；展开单个工具后仍可调整执行确认与显示。</small>
         <small v-if="mcpSourcesDeniedHere">内置只读 Agent 和工作流默认不使用 MCP 工具，其它范围开启的服务不会带到这里；需要时在这里单独开启对应服务。</small>
+        <small v-if="mcpDenyingBuiltinsAbove.length > 0">此对话使用的内置只读{{ mcpDenyingBuiltinsAbove.join('和') }}不使用其它范围开启的 MCP 服务，在这里开启不会生效；需要时到该 Agent 或工作流的工具设置里开启对应服务。</small>
+        <small v-else-if="mcpSourceGroups.some((group) => isMcpSourceBlockedAbove(group.source.id) || group.tools.some(isMcpToolBlockedAbove))">不可勾选的服务或工具已被上层关闭，在这里开启不会生效。</small>
       </div>
       <div class="mcp-source-list">
         <article v-for="group in mcpSourceGroups" :key="group.source.id" class="mcp-source-item">
@@ -605,7 +616,8 @@ function inputNumber(event: Event): number {
             <LcCheckbox
               class="mcp-source-toggle"
               :model-value="isMcpSourceEnabled(group.source.id)"
-              :disabled="editsBlocked || group.source.status !== 'connected' || group.tools.length === 0"
+              :aria-label="`MCP 服务 ${group.source.name}`"
+              :disabled="editsBlocked || group.source.status !== 'connected' || group.tools.length === 0 || isMcpSourceBlockedAbove(group.source.id)"
               @update:model-value="toggleMcpSource(group.source.id, $event)"
             >
               <span class="mcp-source-copy">
@@ -621,7 +633,7 @@ function inputNumber(event: Event): number {
               :key="tool.name"
               class="mcp-tool-chip"
               :model-value="isToolEnabled(tool)"
-              :disabled="editsBlocked || !isMcpSourceEnabled(group.source.id)"
+              :disabled="listEditsBlocked || !isMcpSourceEnabled(group.source.id) || isMcpToolBlockedAbove(tool)"
               @update:model-value="toggleMcpSourceTool(tool, $event)"
             >
               <span>{{ tool.source?.originalToolName ?? tool.name }}</span>
@@ -643,7 +655,7 @@ function inputNumber(event: Event): number {
                   class="tool-enable-toggle"
                   size="sm"
                   :model-value="isToolEnabled(tool)"
-                  :disabled="listEditsBlocked"
+                  :disabled="listEditsBlocked || isMcpToolBlockedAbove(tool)"
                   :aria-label="`${isToolEnabled(tool) ? '禁用' : '启用'}工具 ${tool.name}`"
                   @update:model-value="setToolEnabled(tool, $event)"
                 />

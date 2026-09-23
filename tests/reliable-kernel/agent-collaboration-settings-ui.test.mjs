@@ -587,6 +587,93 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.deepEqual(store.localPolicyFor('global').policy.allowedTools, ['read_file']);
     });
 
+    await t.test('MCP 工具的每个开关只改它显示的那个工具：勾选未设置来源的一个工具不会开启整个服务，全局取消勾选不会新建列表', async () => {
+      const { default: mcpTab } = await server.ssrLoadModule('/src/components/settings/global/McpToolSettingsTab.vue');
+      const deleteAll = { ...mcpTool, name: 'mcp_delete_all', description: 'mcp delete' };
+      const catalog = [...allDefinitions, deleteAll];
+      const sources = [{ id: 'exa', name: 'exa', transportKind: 'stdio', status: 'connected', toolCount: 2 }];
+      const tools = (store) => ({ search: store.toolDefinitions.find((tool) => tool.name === 'mcp_search'), deleteAll: store.toolDefinitions.find((tool) => tool.name === 'mcp_delete_all') });
+
+      // (a) The MCP tab, a source nobody configured: ticking one tool enables that tool only.
+      {
+        const { client, store, bindings, messages } = fresh(catalog);
+        client.mcpToolSources = sources;
+        const { search, deleteAll: other } = tools(store);
+        let tab = await bindings(mcpTab, {});
+        assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [false, false]);
+        tab.setToolGlobalEnabled(search, true);
+        tab = await bindings(mcpTab, {});
+        assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [true, false], 'only the ticked tool is on');
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_delete_all'] } });
+        assert.equal('allowedTools' in messages.at(-1).payload, false);
+        // A tool on only through a saved global list (no source settings): unticking it leaves the other one on.
+        store.setPolicyForScope('global', undefined, ['read_file', 'mcp_search', 'mcp_delete_all'], 'Global', {}, {});
+        tab = await bindings(mcpTab, {});
+        assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [true, true]);
+        tab.setToolGlobalEnabled(search, false);
+        tab = await bindings(mcpTab, {});
+        assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [false, true]);
+        assert.deepEqual(store.localPolicyFor('global').policy.allowedTools, ['read_file', 'mcp_delete_all']);
+      }
+
+      // (b) The global all-tools list with the server enabled: unticking turns that tool off and saves no list.
+      {
+        const { client, store, bindings, render, messages } = fresh(catalog);
+        client.builtinToolPolicies = builtinToolPolicies;
+        client.mcpToolSources = sources;
+        const { search, deleteAll: other } = tools(store);
+        store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { exa: { enabled: true } });
+        let editor = await bindings(toolEditor, { scopeKind: 'global' });
+        editor.setToolEnabled(search, false);
+        editor = await bindings(toolEditor, { scopeKind: 'global' });
+        assert.deepEqual([editor.isToolEnabled(search), editor.isToolEnabled(other)], [false, true]);
+        assert.equal(store.localPolicyFor('global').policy.allowedTools, undefined, 'no global list is created');
+        assert.equal('allowedTools' in messages.at(-1).payload, false);
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+        editor.setToolEnabled(search, true);
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true } });
+
+        // Below global, a tool the global layer disables cannot be turned on here, so its box is disabled and a click saves nothing.
+        store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { exa: { enabled: true, disabledTools: ['mcp_delete_all'] } });
+        const before = messages.length;
+        const conversation = await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'below' });
+        conversation.setToolEnabled(other, true);
+        assert.equal(messages.length, before);
+        assert.match(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'below' }), /<button[^>]*aria-label="启用工具 mcp_delete_all"[^>]*disabled/);
+        // Unticking one tool here writes only this scope's choice, not the global layer's disabled tool.
+        conversation.setToolEnabled(search, false);
+        assert.deepEqual(store.localPolicyFor('conversation', 'below').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+        assert.equal(store.localPolicyFor('conversation', 'below').policy.allowedTools, undefined);
+        assert.equal((await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'below' })).isToolEnabled(search), false);
+      }
+    });
+
+    await t.test('内置只读 Agent 或工作流下的对话里开启 MCP 服务不会生效，开关不可用并提示到哪个 Agent 或工作流开启', async () => {
+      const { TOOL_POLICY_ALL_MCP_SOURCES } = await server.ssrLoadModule(path.join(process.cwd(), 'shared/protocol.ts'));
+      const readonlyMcp = { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } };
+      const sourceToggle = (html) => html.match(/<button[^>]*aria-label="MCP 服务 exa"[^>]*>/)?.[0];
+      for (const [conversationId, agentId, workflowId, name] of [['under-explore', 'explore', undefined, 'Agent「Explore」'], ['under-readonly', 'main', 'builtin:readonly', '工作流「只读」']]) {
+        const { client, feed, store, bindings, render, messages } = fresh(allDefinitions);
+        client.builtinToolPolicies = builtinToolPolicies.map((record) => record.allowedTools === readonlyList ? { ...record, sourceConfigs: readonlyMcp } : record);
+        client.agents = [{ id: 'explore', name: 'Explore' }, { id: 'main', name: '主 Agent' }];
+        client.workflows = [{ id: 'builtin:readonly', name: '只读' }];
+        client.mcpToolSources = [{ id: 'exa', name: 'exa', transportKind: 'stdio', status: 'connected', toolCount: 1 }];
+        feed.records = { AgentConversationLink: { link: { id: 'link', conversation_id: conversationId, agent_id: agentId, role: 'default' } } };
+        if (workflowId) client.conversationWorkflowSelections = [{ id: 'selection', conversationId, scopeKind: 'workflow', workflowId, role: 'active', createdAt: 1, updatedAt: 1 }];
+        store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { exa: { enabled: true } });
+        const before = messages.length;
+        (await bindings(toolEditor, { scopeKind: 'conversation', scopeId: conversationId })).toggleMcpSource('exa', true);
+        assert.equal(messages.length, before, 'nothing is saved that could never take effect');
+        assert.equal(store.localPolicyFor('conversation', conversationId).policy, undefined);
+        const html = await render(toolEditor, { scopeKind: 'conversation', scopeId: conversationId });
+        assert.match(sourceToggle(html), /disabled/, `${conversationId}: the server toggle is not usable`);
+        assert.match(html, new RegExp(`此对话使用的内置只读${name}不使用其它范围开启的 MCP 服务`), `${conversationId} names ${name}`);
+        // At that Agent or workflow scope itself the toggle stays usable: that is where the opt-in lives.
+        const [scopeKind, scopeId] = workflowId ? ['workflow', workflowId] : ['agent', agentId];
+        assert.doesNotMatch(sourceToggle(await render(toolEditor, { scopeKind, scopeId })), /disabled/);
+      }
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
       const { client, store, render } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;

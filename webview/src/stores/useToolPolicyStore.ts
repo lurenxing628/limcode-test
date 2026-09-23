@@ -12,8 +12,16 @@ import type {
   ToolPolicyScopeSetPayload,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
-import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES } from '@shared/protocol';
-import { crossConversationToolPermitted, defaultToolNames, resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '@shared/toolPolicyResolution';
+import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
+import {
+  crossConversationToolPermitted,
+  defaultToolNames,
+  mcpSourceConfigFor,
+  resolveToolPolicyLayers,
+  toolAllowedByPolicy,
+  toolPolicyScopeLayer,
+  type ToolPolicyLayer
+} from '@shared/toolPolicyResolution';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
@@ -469,6 +477,60 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       ]);
       return partnerIds.some((partnerId) =>
         (this.layerFor({ scopeKind: partner, scopeId: partnerId })?.policy.toolConfigs?.[SUB_AGENT_TOOL_NAME]?.config?.[key] ?? globalValue) === true);
+    },
+    /**
+     * The upper layer that turns one MCP source off for this scope (an all-sources deny counts),
+     * or undefined. Source denies are monotone, so enabling the source here would never apply.
+     */
+    mcpSourceBlockedAbove(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, sourceId: string): ScopeRef | undefined {
+      const upper = this.upperScopesFor(scopeKind, scopeId);
+      for (let count = 1; count <= upper.length; count += 1) {
+        if (mcpSourceConfigFor(this.resolveScopes(upper.slice(0, count)).sourceConfigs, sourceId)?.enabled === false) return upper[count - 1];
+      }
+      return undefined;
+    },
+    /** Whether an upper layer keeps one MCP tool off here: its source is off above or the tool is disabled above. */
+    mcpToolBlockedAbove(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, tool: ToolDefinitionRecord): boolean {
+      const sourceId = tool.source?.kind === 'mcp' ? tool.source.sourceId?.trim() : undefined;
+      if (!sourceId) return false;
+      if (this.mcpSourceBlockedAbove(scopeKind, scopeId, sourceId)) return true;
+      return (mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, sourceId)?.disabledTools ?? []).includes(tool.name);
+    },
+    /**
+     * The built-in read-only Agents and workflows above this scope whose all-sources deny is in the
+     * inherited source settings: only their own scope can opt an MCP source in for this scope.
+     */
+    mcpDenyingBuiltinsAbove(scopeKind: ToolPolicyScopeKind, scopeId?: string): ScopeRef[] {
+      if (this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs[TOOL_POLICY_ALL_MCP_SOURCES]?.enabled !== false) return [];
+      return this.upperScopesFor(scopeKind, scopeId)
+        .filter((scope) => !!this.builtinPolicyFor(scope.scopeKind, scope.scopeId)?.sourceConfigs?.[TOOL_POLICY_ALL_MCP_SOURCES]);
+    },
+    /**
+     * Turns exactly one MCP tool on or off at this scope through its source settings, never through
+     * a tool list: the source's other tools keep what they show now. The scope's entry for the
+     * source is written out so that it no longer depends on the list, and tools an upper layer
+     * already disables are left to that layer. A tool an upper layer keeps off is not changed.
+     */
+    setMcpToolEnabledForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, tool: ToolDefinitionRecord, enabled: boolean): void {
+      if (scopeKind !== 'global' && !scopeId?.trim()) return;
+      const sourceId = tool.source?.kind === 'mcp' ? tool.source.sourceId?.trim() : undefined;
+      if (!sourceId) return;
+      const listError = this.toolListErrorFor(scopeKind, scopeId);
+      if (listError) throw new TypeError(listError.text);
+      if (enabled && this.mcpToolBlockedAbove(scopeKind, scopeId, tool)) return;
+      const local = this.localPolicyFor(scopeKind, scopeId).policy;
+      const ownList = this.ownListFor(scopeKind, scopeId);
+      const effective = this.effectivePolicyFor(scopeKind, scopeId).policy;
+      const inheritedDisabled = mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, sourceId)?.disabledTools ?? [];
+      const sourceTools = this.toolDefinitions.filter((candidate) => candidate.source?.kind === 'mcp' && candidate.source.sourceId?.trim() === sourceId);
+      const on = new Set(sourceTools.filter((candidate) => toolAllowedByPolicy(effective, candidate)).map((candidate) => candidate.name));
+      if (enabled) on.add(tool.name);
+      else on.delete(tool.name);
+      const disabledTools = sourceTools.map((candidate) => candidate.name).filter((name) => !on.has(name) && !inheritedDisabled.includes(name));
+      const sourceConfigs = cloneSourceConfigs(local?.sourceConfigs) ?? {};
+      sourceConfigs[sourceId] = { enabled: true, ...(disabledTools.length > 0 ? { disabledTools } : {}) };
+      const allowedTools = ownList && !enabled ? ownList.filter((name) => name !== tool.name) : ownList;
+      this.setPolicyForScope(scopeKind, scopeId, allowedTools, local?.name, cloneToolConfigs(local?.toolConfigs), sourceConfigs);
     },
     /** A child task's conversation: cross-conversation tools are never offered there. */
     isChildConversation(conversationId: string | undefined): boolean {
