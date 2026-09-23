@@ -413,7 +413,7 @@
     "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
     "permissions": "same-root-peer-communication; conversations-outside-the-team-are-reachable-only-through-cross-conversation-tools-or-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
     "revocation": "check-current-team-lineage-and-target-state-again-at-admission",
-    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; a-followup-no-Turn-will-answer-fails(all-deliveries-failed-or-acknowledged-without-a-Turn-or-its-Turn-deleted-with-the-target); a-cross-conversation-followup-first-gets-one-failure-completion-reply; a-team-followup-fails-without-a-reply",
+    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; a-followup-no-Turn-will-answer-fails(all-deliveries-failed-or-acknowledged-without-a-Turn-or-its-Turn-deleted-with-the-target); a-cross-conversation-followup-first-gets-one-failure-completion-reply; a-team-followup-fails-without-a-reply; a-reply-committed-before-the-deletion-only-settles-its-request(completed-when-a-Turn-wrote-it-failed-for-a-failure-reply)-and-is-never-sent-twice",
     "limits": "frozen-policy-bounds-active-team-size-recursion-and-turn-wakeup-budget",
     "forkTurns": [
       "none",
