@@ -94,8 +94,11 @@ export interface ReliableKernelApplicationDependencies {
   diagnosticObserver?: ReliableDiagnosticObserver;
   runtimeBuildInfo?: () => RuntimeBuildInfoRecord;
   processCompletionWakeHandler?: ProcessCompletionWakeHandler;
-  /** Scanner pacing for the durable wake outbox; production keeps the defaults. */
-  processCompletionDelivery?: Pick<ProcessCompletionDeliveryOptions, 'scanIntervalMs' | 'retryBaseMs' | 'maxFailureCount'>;
+  /**
+   * Scanner pacing for the durable wake outbox; production keeps the defaults. `onError` observes
+   * each scan, receipt or wake failure in addition to the diagnostic event.
+   */
+  processCompletionDelivery?: Pick<ProcessCompletionDeliveryOptions, 'scanIntervalMs' | 'retryBaseMs' | 'maxFailureCount' | 'onError'>;
   now?: () => string;
 }
 
@@ -230,18 +233,21 @@ export class ReliableKernelApplication {
         ...options,
         ...dependencies.processCompletionDelivery,
         wakeHandler: dependencies.processCompletionWakeHandler,
-        onError: ({ scope, id, error }) => dependencies.diagnosticObserver?.observe({
-          eventKind: 'process.completion_delivery.failed',
-          scopeKind: 'runtime',
-          correlationId: id,
-          metadata: {
-            kind: 'process-completion-delivery',
-            scope,
-            status: 'failed',
-            hostBootId: database.hostBootId,
-            errorName: safeErrorName(error)
-          }
-        })
+        onError: (failure) => {
+          dependencies.diagnosticObserver?.observe({
+            eventKind: 'process.completion_delivery.failed',
+            scopeKind: 'runtime',
+            correlationId: failure.id,
+            metadata: {
+              kind: 'process-completion-delivery',
+              scope: failure.scope,
+              status: 'failed',
+              hostBootId: database.hostBootId,
+              errorName: safeErrorName(failure.error)
+            }
+          });
+          dependencies.processCompletionDelivery?.onError?.(failure);
+        }
       }
     );
     this.processes.setProcessReceiptObserver((processId) => {

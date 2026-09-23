@@ -58,7 +58,7 @@ const lastResult = (start, name) => start.contents.flatMap(content => content.pa
 const detail = (start, name) => lastResult(start, name)?.detail;
 
 /** The external model alone is synthetic; tools, authority, ownership, persistence and wakes are production code. */
-async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook, allowedTools = definitions.map(tool => tool.declaration.name) } = {}) {
+async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook, expectedScannerError, allowedTools = definitions.map(tool => tool.declaration.name) } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-cross-conversation-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -109,8 +109,12 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
       authorityCompiler: configuration, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
       resolveWorkEnvironment: async () => undefined,
       // No level-trigger polling within a test: queued work must start from the commit that ends the
-      // target Turn, not from a periodic rescan.
-      processCompletionDelivery: { scanIntervalMs: 60000 },
+      // target Turn, not from a periodic rescan. A scanner failure the test does not expect fails it
+      // at once instead of waiting out a retry backoff that no rescan would ever reach.
+      processCompletionDelivery: { scanIntervalMs: 60000, onError: failure => {
+        if (expectedScannerError?.(failure)) return;
+        errors.push(new Error(`Delivery scanner ${failure.scope} ${failure.id} failed: ${failure.error?.stack ?? failure.error}`));
+      } },
       mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { throw new Error('External tool calls are forbidden in this fixture.'); } },
       mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
       providers: { resolve(providerId) { return { providerId, async sendFullRequest(request, controls) {
@@ -554,7 +558,8 @@ test('deleting the target while a followup is queued tells the waiting sender th
     if (request.conversationId !== PEER || request.action !== 'start_continuation') return;
     held = request;
     await releaseWake;
-  } });
+  // The held continuation resumes after its target was deleted and fails once; the wake then dead-letters.
+  }, expectedScannerError: ({ scope, error }) => scope === 'wake' && error?.message === `Conversation ${PEER} does not exist.` });
 });
 
 test('create_conversation starts a first Turn from a peer task and replaying the call creates nothing new', { timeout: 60000 }, async () => {
