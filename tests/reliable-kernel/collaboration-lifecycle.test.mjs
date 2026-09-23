@@ -5,7 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const kernel = require(path.resolve('dist/extension/backend/reliableKernel/index.js'));
+const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
+const kernel = require(path.join(compiled, 'backend/reliableKernel/index.js'));
 const NOW = '2026-09-22T00:00:00.000Z';
 const row = (domain, value) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(value);
 async function withRuntime(body) {
@@ -66,8 +67,8 @@ test('target deletion closes the pending wake and the sender hears the task coul
   assert.equal((await get(database, 'RuntimeDelivery', 'followup-delivery')).failure_reason, 'target-gone');
   assert.equal((await get(database, 'RuntimeDeliveryWake', 'wake')).state, 'dead_letter');
   // The request is settled by reconcile, which first tells the sender the task could not start.
-  const { CollaborationControlPlane } = require(path.resolve('dist/extension/backend/reliableKernel/collaborationControlPlane.js'));
-  const { RuntimeDeliveryControlPlane } = require(path.resolve('dist/extension/backend/reliableKernel/answerDelivery.js'));
+  const { CollaborationControlPlane } = require(path.join(compiled, 'backend/reliableKernel/collaborationControlPlane.js'));
+  const { RuntimeDeliveryControlPlane } = require(path.join(compiled, 'backend/reliableKernel/answerDelivery.js'));
   const collaboration = new CollaborationControlPlane(database, runtime.store, new RuntimeDeliveryControlPlane(database));
   await collaboration.reconcile();
   assert.equal((await get(database, 'CollaborationRequest', 'request')).state, 'failed');
