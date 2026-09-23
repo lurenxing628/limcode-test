@@ -667,6 +667,11 @@ test('create_conversation that cannot run leaves no conversation behind, not eve
     if (rootRound === 2) return toolsAnswer(call('create-retry', 'create_conversation', { prompt: 'NO_BUDGET_TASK_3301' }));
     return answer('Could not delegate.');
   }, async f => {
+    // Admission refuses before any settings write, so there is nothing to clean up either.
+    const mutations = f.configuration.mutations;
+    const clear = mutations.clearConversationConfiguration;
+    const cleared = [];
+    mutations.clearConversationConfiguration = async function(conversationId) { cleared.push(conversationId); return clear.call(this, conversationId); };
     const conversations = (await f.rows('Conversation')).length;
     const started = await f.input(ROOT, 'create a separate conversation');
     assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
@@ -681,6 +686,7 @@ test('create_conversation that cannot run leaves no conversation behind, not eve
     }
     assert.equal((await f.rows('Conversation')).length, conversations);
     assert.deepEqual(await f.rows('CollaborationMessage'), []);
+    assert.deepEqual(cleared, [], 'a refused admission never takes the settings lock to clean up');
   }, { runAgentConfig: { maxAutomaticFollowups: 0 } });
 });
 

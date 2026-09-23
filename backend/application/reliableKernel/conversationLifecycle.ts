@@ -132,19 +132,20 @@ export class ReliableConversationLifecycle {
         const replayed = await collaboration.send(task);
         return { conversationId, title: String(existing.title), messageId: replayed.messageId, deduplicated: true };
       }
+      await collaboration.admitConversationCreation({ turnId, toolCallId });
+      // The calling Turn's frozen selection fixes the model and work environment the new
+      // Conversation starts with; everything else comes from its own settings scopes.
+      const [model, environment, agent, project] = await Promise.all([
+        this.application.runtime.children.frozenModelSelectionForTurn(turnId),
+        this.application.runtime.children.frozenWorkEnvironmentPolicyForTurn(turnId),
+        this.configuration.resolveAgent({ agentType: 'main' }),
+        projectFolderForConversation(this.application.database, sourceConversationId)
+      ]);
+      // Settings go first and only fill empty slots. Once their writes have started, a failed
+      // attempt clears them again; a refusal before that has nothing to clear. Only a Host that
+      // dies before the commit leaves settings nothing refers to, which the replay of this call
+      // reuses.
       try {
-        await collaboration.admitConversationCreation({ turnId, toolCallId });
-        // The calling Turn's frozen selection fixes the model and work environment the new
-        // Conversation starts with; everything else comes from its own settings scopes.
-        const [model, environment, agent, project] = await Promise.all([
-          this.application.runtime.children.frozenModelSelectionForTurn(turnId),
-          this.application.runtime.children.frozenWorkEnvironmentPolicyForTurn(turnId),
-          this.configuration.resolveAgent({ agentType: 'main' }),
-          projectFolderForConversation(this.application.database, sourceConversationId)
-        ]);
-        // Settings go first and only fill empty slots. A failed attempt clears them again; only a
-        // Host that dies before the commit leaves settings nothing refers to, which the replay of
-        // this call reuses.
         if (environment?.defaultWorkEnvironmentId) {
           await this.configuration.mutations.initializeConversationWorkEnvironment(conversationId, environment.defaultWorkEnvironmentId);
         }
