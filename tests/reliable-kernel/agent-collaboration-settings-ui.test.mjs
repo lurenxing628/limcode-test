@@ -268,6 +268,39 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.deepEqual(store.effectivePolicyFor('agent', 'main').policy.allowedTools, []);
     });
 
+    await t.test('全局“继承默认”只去掉全局工具列表，保留开关、审批与 MCP 来源设置', async () => {
+      const { client, store, bindings, render, messages } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      const inheritButton = (html) => html.match(/<button[^>]*>继承默认<\/button>/)?.[0];
+      store.setCrossConversationCollaborationForScope('global', undefined, true);
+      let global = await bindings(toolEditor, { scopeKind: 'global' });
+      assert.equal(global.canRestoreDefault, false, 'a global record without a list already uses the default tool set');
+      assert.match(inheritButton(await render(toolEditor, { scopeKind: 'global' })), /disabled/);
+
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file'], 'Global', {
+        ...switchOn, read_file: { config: {}, autoApproveExecution: false }
+      }, { exa: { enabled: true, disabledTools: ['mcp_search'] } }, 'yolo');
+      global = await bindings(toolEditor, { scopeKind: 'global' });
+      assert.equal(global.canRestoreDefault, true);
+      global.inheritDefaults();
+      const saved = store.localPolicyFor('global').policy;
+      assert.equal(saved.allowedTools, undefined, 'the global ceiling is dropped instead of writing the default list');
+      assert.deepEqual(saved.toolConfigs, { ...switchOn, read_file: { config: {}, autoApproveExecution: false } });
+      assert.deepEqual(saved.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+      assert.equal(saved.preset, 'yolo');
+      assert.equal('allowedTools' in messages.at(-1).payload, false);
+      assert.deepEqual(store.effectivePolicyFor('agent', 'main').policy.allowedTools, sorted(builtinToolPolicies[0].allowedTools),
+        'the main Agent keeps transfer after 继承默认');
+      assert.equal(store.effectivePolicyFor('global').policy.toolConfigs.run_agent.config.crossConversationCollaboration, true);
+
+      // A global record that holds nothing but a list is removed.
+      store.dropLocalPolicy('global');
+      store.setPolicyForScope('global', undefined, ['read_file'], 'Global');
+      (await bindings(toolEditor, { scopeKind: 'global' })).inheritDefaults();
+      assert.equal(store.localPolicyFor('global').policy, undefined);
+      assert.deepEqual({ type: messages.at(-1).type, payload: messages.at(-1).payload }, { type: 'toolPolicy.scope.clear', payload: { scopeKind: 'global' } });
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
       const { client, store, render } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;

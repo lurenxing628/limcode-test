@@ -77,16 +77,8 @@ const canRestoreDefault = computed(() => {
   if (props.scopeKind !== 'global' || props.readonly) return false;
   return !isUsingToolDefaults.value;
 });
-const isUsingToolDefaults = computed(() => {
-  if (props.scopeKind !== 'global') return false;
-  const policy = effectivePolicy.value;
-  if (!policy) return false;
-  const expectedAllowed = builtinTools.value.filter((tool) => tool.metadata?.defaultEnabled !== false).map((tool) => tool.name).sort();
-  const actualAllowed = [...policy.allowedTools].sort();
-  if (expectedAllowed.length !== actualAllowed.length || !expectedAllowed.every((name, i) => name === actualAllowed[i])) return false;
-  const configs = policy.toolConfigs ?? {};
-  return Object.keys(configs).length === 0;
-});
+/** Global uses the default tool set while it saves no list of its own. */
+const isUsingToolDefaults = computed(() => props.scopeKind === 'global' && localResolution.value.policy?.allowedTools === undefined);
 const sourceLabel = computed(() => {
   if (props.scopeKind === 'global' && runtimePreset.value === 'yolo') return '全局自动执行预设';
   if (props.scopeKind === 'global') return '全局默认策略';
@@ -238,12 +230,15 @@ function restoreInheritance(): void {
   store.clearPolicyScope(props.scopeKind, props.scopeId);
 }
 
+/**
+ * 继承默认 resets the global tool list only: the saved list is dropped, so the default tool set and
+ * the built-in Agent/workflow lists apply again. Per-tool settings (approval, display, the
+ * cross-conversation switch and collaboration limits), MCP source settings and the preset stay; a
+ * record left with nothing else is removed.
+ */
 function inheritDefaults(): void {
   if (!canRestoreDefault.value) return;
-  const defaultAllowed = tools.value
-    .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
-    .map((tool) => tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, defaultAllowed, localPolicyName(), {}, {});
+  store.saveOrDropLocalPolicy('global', undefined, undefined, cloneToolConfigs(), undefined);
 }
 
 function riskLabel(tool: ToolDefinitionRecord): string {
