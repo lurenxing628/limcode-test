@@ -57,7 +57,7 @@ const lastResult = (start, name) => start.contents.flatMap(content => content.pa
 const detail = (start, name) => lastResult(start, name)?.detail;
 
 /** The external model alone is synthetic; tools, authority, ownership, persistence and wakes are production code. */
-async function fixture(send, run, { enabled = true } = {}) {
+async function fixture(send, run, { enabled = true, switchValue = true } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-cross-conversation-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -96,7 +96,7 @@ async function fixture(send, run, { enabled = true } = {}) {
     await configuration.synchronizeWorkspaceFolders([{ ...project, rootPath: folderPath, index: 0 }]);
     const agent = await configuration.mutations.createAgent({ name: 'Synthetic top-level', kind: 'custom' });
     await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: definitions.map(tool => tool.declaration.name),
-      ...(enabled ? { toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } } } : {}) });
+      ...(enabled ? { toolConfigs: { run_agent: { config: { crossConversationCollaboration: switchValue } } } } : {}) });
     const rootAuthority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(rootAuthority);
     app = await kernel.ReliableKernelApplication.open(rootAuthority, {
@@ -204,6 +204,32 @@ test('with the switch off the tools are not offered and every entry point reject
     await assert.rejects(f.app.runtime.collaboration.send({ source: { kind: 'tool', turnId: started.turnId, toolCallId: forgedCall.id },
       targetConversationId: PEER, text: 'forged', mode: 'followup', crossConversation: true }), /not enabled/);
   }, { enabled: false });
+});
+
+test('a malformed switch value fails closed instead of breaking every Turn', { timeout: 60000 }, async () => {
+  const { frozenCrossConversationEnabled } = load('backend/reliableKernel/collaborationPolicy.js');
+  for (const value of ['true', 1, null, {}]) {
+    assert.equal(frozenCrossConversationEnabled({ toolPolicy: { toolConfigs: { run_agent: { config: { crossConversationCollaboration: value } } } } }), false, JSON.stringify(value));
+  }
+  let rootRound = 0;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId !== ROOT) return answer('worker done');
+    rootRound += 1;
+    const names = start.tools.map(tool => tool.name);
+    for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(!names.includes(name), `${name} must not be offered`);
+    if (rootRound === 1) return toolsAnswer(call('forged-list', 'list_conversations'),
+      call('spawn', 'run_agent', { operation: 'spawn', taskName: 'worker', prompt: 'worker task', foregroundWaitMs: 0 }));
+    assert.notEqual(lastResult(start, 'list_conversations')?.status, 'succeeded');
+    return answer('Team work still runs.');
+  }, async f => {
+    const started = await f.input(ROOT, 'malformed switch');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(rootRound, 2);
+    const [child] = await f.rows('ChildExecution');
+    assert.ok(child, 'child tasks still start under a malformed switch');
+    await f.until(async () => (await f.rows('Turn', { conversation_id: child.child_conversation_id })).some(turn => turn.status === 'terminated'), 'The child never ran.');
+    await assert.rejects(f.app.runtime.collaboration.listConversations({ turnId: started.turnId }), /not enabled/);
+  }, { switchValue: 'true' });
 });
 
 test('list excludes this conversation, its team and child tasks; read returns the peer transcript as untrusted data', { timeout: 60000 }, async () => {

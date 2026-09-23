@@ -439,7 +439,7 @@
     },
     "budget": "independent-CollaborationBudget; recursive-tool-followups-inherit-origin-budget-and-frozen-authority; zero-disables-automatic-followups",
     "crossConversation": {
-      "switch": "ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; frozen-in-Turn-authority; configSchema-defaultValue-only",
+      "switch": "ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; non-boolean-fails-closed; frozen-in-Turn-authority; configSchema-defaultValue-only",
       "tools": [
         "list_conversations",
         "read_conversation",

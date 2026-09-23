@@ -25,13 +25,12 @@ export function frozenCollaborationLimits(document: PlainJsonValue): Collaborati
 
 /**
  * The user's cross-conversation switch as frozen into one Turn. Off unless explicitly enabled at
- * some settings scope; the model can neither see nor change it.
+ * some settings scope; the model can neither see nor change it. Only a literal `true` turns it on:
+ * any other value (for example a hand-edited string "true") fails closed instead of breaking the
+ * Turn's tool list.
  */
 export function frozenCrossConversationEnabled(document: PlainJsonValue): boolean {
-  const value = frozenRunAgentConfig(document)?.[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY];
-  if (value === undefined) return false;
-  if (typeof value !== 'boolean') throw new TypeError(`Invalid frozen collaboration ${CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY}.`);
-  return value;
+  return frozenRunAgentConfig(document)?.[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === true;
 }
 
 export async function readTurnCollaborationLimits(

@@ -43,7 +43,7 @@
 
 ## 跨对话协作
 
-「Agent 协作」页的「跨对话协作」开关写入同一 `run_agent.config` 的 `crossConversationCollaboration`，默认关闭，可在全局、Agent、对话和工作流作用域覆盖，并在 Turn authority 中冻结。在设置界面开启时，同时把下列工具加入该作用域的 `allowedTools`；关闭或恢复继承不改动允许列表。后端从不绕过用户保存的允许列表。
+「Agent 协作」页的「跨对话协作」开关写入同一 `run_agent.config` 的 `crossConversationCollaboration`，默认关闭，可在全局、Agent、对话和工作流作用域覆盖，并在 Turn authority 中冻结。只有布尔值 `true` 表示开启；手工写入的非布尔值（例如字符串 `"true"`）按关闭处理，不会让整轮失败。在设置界面开启时，同时把下列工具加入该作用域的 `allowedTools`；关闭或恢复继承不改动允许列表。后端从不绕过用户保存的允许列表。
 
 - `list_conversations`、`read_conversation`（只读）：列出本 Runtime 其他活动的顶层对话，读取其用户与模型消息，按 `olderMessageRef` 分页，不启动、不改变、也不确认目标。结果附不可信数据提示。
 - `send_conversation_message`：`followup` 或 `message`，语义与团队续派/留言相同，并固定排队到目标本轮结束；followup 完成后的回复自动回到发送方。

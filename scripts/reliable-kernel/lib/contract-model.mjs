@@ -996,7 +996,7 @@ function validateSubagent(subagent, failures) {
   ], collaboration?.board?.domains ?? []));
   failures.push(...exactSetProblems('子Agent上下文分叉模式', ['none', 'all', 'positive-integer-string'], collaboration?.forkTurns ?? []));
   const crossConversation = collaboration?.crossConversation;
-  if (crossConversation?.switch !== 'ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; frozen-in-Turn-authority; configSchema-defaultValue-only'
+  if (crossConversation?.switch !== 'ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; non-boolean-fails-closed; frozen-in-Turn-authority; configSchema-defaultValue-only'
     || crossConversation?.offering !== 'top-level-conversations-only; hidden-and-rejected-when-switch-off; control-plane-rechecks-calling-Turn-frozen-authority'
     || crossConversation?.targets !== 'other-active-top-level-conversations-of-this-Runtime; child-task-conversations-never-listed-or-addressed'
     || crossConversation?.allowlist !== 'enabling-the-switch-in-settings-adds-the-tools-to-that-scope-allowedTools; backend-never-widens-a-saved-allowlist'
