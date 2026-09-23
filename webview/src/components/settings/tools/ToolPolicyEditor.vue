@@ -657,7 +657,7 @@ function inputNumber(event: Event): number {
               :key="tool.name"
               class="mcp-tool-chip"
               :model-value="isToolEnabled(tool)"
-              :disabled="listEditsBlocked || !isMcpSourceEnabled(group.source.id) || isMcpToolBlockedAbove(tool)"
+              :disabled="listEditsBlocked || isMcpToolBlockedAbove(tool)"
               @update:model-value="toggleMcpSourceTool(tool, $event)"
             >
               <span>{{ tool.source?.originalToolName ?? tool.name }}</span>

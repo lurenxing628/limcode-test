@@ -793,9 +793,12 @@ server.connect(new StdioServerTransport());
         assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { gh: { enabled: true } });
         assert.equal(on(store, 'agent', 'agent:custom', merge), true);
       }
-      // M1 through the all-tools list at an Agent scope.
+      // M1 through the all-tools list at an Agent scope; the tools under a server that is off can be ticked one by one too.
       {
-        const { client, store, bindings } = session([search, remove]);
+        const { client, store, bindings, render } = session([search, remove]);
+        const chips = (await render(toolEditor, { scopeKind: 'agent', scopeId: 'agent:d' })).match(/<button[^>]*class="[^"]*mcp-tool-chip[^"]*"[^>]*>/g);
+        assert.equal(chips.length, 2);
+        for (const chip of chips) assert.doesNotMatch(chip, / disabled/, 'a tool of a server that is off here can still be opted in');
         (await bindings(toolEditor, { scopeKind: 'agent', scopeId: 'agent:d' })).setToolEnabled(store.toolDefinitions.find((tool) => tool.name === search.name), true);
         assert.deepEqual(store.localPolicyFor('agent', 'agent:d').policy.sourceConfigs, { gh: { enabled: true, enabledTools: ['search_code'] } });
         client.toolDefinitions = [...client.toolDefinitions, merge];
