@@ -847,9 +847,11 @@ test('fork_conversation copies the completed history of a caller whose native Tu
     });
     await kernel.runWithExecutionLeaseFence(currentFence, () => app.context.appendNativeToolCall({ conversationId, toolCallId: running.toolCallId }));
     const copied = [];
+    // Recorded, not thrown: a failed cleanup is only logged, so a throwing stub could never fail this test.
+    const cleared = [];
     const lifecycle = new ReliableConversationLifecycle({ application: app, configuration: { mutations: {
       async copyConversationConfiguration(source, target) { copied.push([source, target]); },
-      async clearConversationConfiguration(target) { assert.fail(`a committed fork never clears the settings of ${target}`); }
+      async clearConversationConfiguration(target) { cleared.push(target); }
     } } });
 
     const fork = await lifecycle.forkCompletedHistory({ sourceConversationId: conversationId, commandId: 'native-fork-tool-call' });
@@ -863,6 +865,11 @@ test('fork_conversation copies the completed history of a caller whose native Tu
     assert.equal((await list(app, 'ToolCall', { id: running.toolCallId }))[0].status !== 'terminal', true, 'the caller keeps running');
     const replay = await lifecycle.forkCompletedHistory({ sourceConversationId: conversationId, commandId: 'native-fork-tool-call' });
     assert.deepEqual([replay.conversationId, replay.deduplicated], [fork.conversationId, true]);
+    // A permanent rejection of the same command (here a replay with other facts) never clears the
+    // settings of the fork that command already committed.
+    await assert.rejects(lifecycle.fork({ sourceConversationId: conversationId, messageId: message,
+      expectedRevisionId: 'another-revision', commandId: 'native-fork-tool-call' }), /different source facts/);
+    assert.deepEqual(cleared, [], 'a committed fork never clears its settings');
     request.close();
   });
 });

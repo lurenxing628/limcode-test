@@ -26,6 +26,7 @@ const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/pa
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { workEnvironmentIdFromUri } = load('shared/workEnvironmentCatalog.js');
 const protocol = load('shared/protocol.js');
+const { stablePhaseFId } = load('backend/reliableKernel/phaseFIdentity.js');
 
 async function rows(app, domain, where = {}) {
   return (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({
@@ -1047,13 +1048,24 @@ test('permanent fork failures are rejections that leave no target or copied sett
     const first = await h.facade.forkConversation(command);
     const foreign = await h.command(first.conversationId, 'unused', 'user');
     const rejected = pattern => error => error instanceof kernel.ConversationForkRejectedError && pattern.test(error.message);
+    const keep = ['source', first.conversationId];
+    // Every rejection fires before this attempt copies anything, so each command first gets the
+    // settings an interrupted earlier attempt of it copied: the rejection must remove them.
+    const stageInterruptedCopy = async commandId => {
+      const target = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
+      await h.configuration.mutations.copyConversationConfiguration('source', target);
+      assert.ok((await strayConversationSettings(h.configuration, keep)).some(([, owner]) => owner === target),
+        'fixture: an interrupted attempt of this command copied settings');
+    };
     for (const [label, attempt, pattern] of [
       ['missing source', { ...command, sourceConversationId: 'missing-source' }, /不存在/],
       ['missing current revision', { ...command, messageId: 'missing-message' }, /当前 Revision/],
       ['changed revision', { ...command, expectedRevisionId: foreign.expectedRevisionId }, /Revision 已变化/],
       ['foreign message', { ...foreign, sourceConversationId: 'source' }, /不属于当前 Conversation/]
     ]) {
+      await stageInterruptedCopy(`rejected-${label}`);
       await assert.rejects(h.facade.forkConversation({ ...attempt, command: { commandId: `rejected-${label}` } }), rejected(pattern), label);
+      assert.deepEqual(await strayConversationSettings(h.configuration, keep), [], `${label}: the copied settings are removed`);
     }
     // Replaying the committed command with other facts is a permanent rejection too, and the
     // committed branch keeps its settings.
@@ -1061,7 +1073,6 @@ test('permanent fork failures are rejections that leave no target or copied sett
       rejected(/different source facts/));
     await assert.rejects(h.facade.forkConversation({ ...command, messageId: foreign.messageId }), rejected(/different source Message/));
     assert.equal((await rows(h.app, 'Conversation')).length, 2);
-    assert.deepEqual(await strayConversationSettings(h.configuration, ['source', first.conversationId]), []);
     const config = await h.configuration.configurationClientState();
     assert.ok(config.systemPromptScopeLinks.some(link => link.scopeKind === 'conversation' && link.scopeId === first.conversationId));
     // A message deleted after the user clicked fork is a permanent rejection, not a generic error.
@@ -1069,7 +1080,9 @@ test('permanent fork failures are rejections that leave no target or copied sett
     const deleted = await h.command('source', 'rejection-deleted', 'user');
     const rootBeforeDelete = await h.app.context.currentHeadRootId('source');
     await h.app.turns.delete({ source: { kind: 'command', key: 'delete-fork-point' }, conversationId: 'source', messageId: deleted.messageId });
+    await stageInterruptedCopy(deleted.command.commandId);
     await assert.rejects(h.facade.forkConversation(deleted), rejected(/已被删除/));
+    assert.deepEqual(await strayConversationSettings(h.configuration, keep), [], 'the deleted fork point: the copied settings are removed');
     // The fork writer refuses the deleted fork point itself, also for a caller holding an old root.
     const [deletedSource] = await rows(h.app, 'ContextSegmentSource', {
       source_kind: 'message_revision', source_id: deleted.expectedRevisionId
@@ -1083,7 +1096,6 @@ test('permanent fork failures are rejections that leave no target or copied sett
     }), rejected(/已被删除/));
     assert.deepEqual(await rows(h.app, 'ConversationReuseLink', { reuse_key: 'direct-deleted-fork-point' }), []);
     assert.equal((await rows(h.app, 'Conversation')).length, 2);
-    assert.deepEqual(await strayConversationSettings(h.configuration, ['source', first.conversationId]), []);
   });
 });
 
