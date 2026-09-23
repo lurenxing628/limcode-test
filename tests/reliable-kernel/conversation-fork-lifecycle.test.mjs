@@ -1191,6 +1191,38 @@ test('fork_conversation rejected for lack of completed history removes the setti
   });
 });
 
+test('fork_conversation of a source deleted after an interrupted attempt is refused as a missing source', async () => {
+  const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
+  await withForkRuntime(async h => {
+    await h.turn('source', 'deleted-source-history');
+    await withSourceSettings(h);
+    const lifecycle = new ReliableConversationLifecycle({ application: h.app, configuration: h.configuration });
+    const request = { sourceConversationId: 'source', commandId: 'fork-tool-call-source-deleted' };
+    const database = h.app.database;
+    const transaction = database.transaction.bind(database);
+    let injected = false;
+    database.transaction = async (steps, ...rest) => {
+      if (!injected && steps.some(step => step.kind === 'insert' && step.domain === 'Conversation')) {
+        injected = true;
+        throw new Error('injected fork commit failure');
+      }
+      return transaction(steps, ...rest);
+    };
+    try {
+      await assert.rejects(lifecycle.forkCompletedHistory(request), /injected fork commit failure/);
+    } finally {
+      database.transaction = transaction;
+    }
+    assert.notDeepEqual(await strayConversationSettings(h.configuration, ['source']), [],
+      'fixture: the interrupted attempt copied settings before its commit failed');
+    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
+    assert.deepEqual((await h.app.conversationDeletion.delete('source')).deletedConversationIds, ['source']);
+    await assert.rejects(lifecycle.forkCompletedHistory(request),
+      error => error instanceof kernel.ConversationForkRejectedError && /Fork 源 Conversation source 不存在/.test(error.message));
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source']), []);
+  });
+});
+
 test('a failed settings cleanup is logged and never replaces the permanent rejection', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'cleanup-failure-input');

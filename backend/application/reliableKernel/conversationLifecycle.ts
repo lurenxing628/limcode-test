@@ -83,6 +83,11 @@ export class ReliableConversationLifecycle {
     const commandId = requireText(request.commandId, 'Conversation fork commandId');
     return this.application.database.conversationOwners.run(sourceConversationId, () =>
       this.discardingRejectedTarget(commandId, async (targetConversationId) => {
+        // A source deleted after the tool call was admitted is refused as missing, not as a
+        // Conversation without completed history.
+        if (!await this.maybeRow('Conversation', sourceConversationId)) {
+          throw new ConversationForkRejectedError(`Fork 源 Conversation ${sourceConversationId} 不存在。`);
+        }
         // A replayed command keeps its committed boundary even if more Turns have ended since.
         const boundary = await this.committedForkBoundary(commandId) ?? await this.completedHistoryBoundary(sourceConversationId);
         const result = await this.forkCommand({ sourceConversationId, commandId, ...boundary }, commandId, targetConversationId);
