@@ -23,10 +23,12 @@ import {
 } from './gpt6ParameterAdaptation';
 import {
   applyLearnedRequestAdaptations,
+  claudeTurnScopedRemindersFallenBack,
   createProviderRequestAdaptationRetry,
   installEncodedRequestPostProcessor,
   type ProviderRequestTarget
 } from './providerParameterAdaptation';
+import { withClaudeTurnScopedSystemBeta, type TurnReminderLayout } from './claudeTurnScopedReminders';
 import {
   assertCanonicalProviderToolContext,
   cloneInlineDataPart,
@@ -470,22 +472,25 @@ export async function startLlmProvider(
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
     };
+    const claudeTurnScoped = claudeTurnScopedRemindersRequested(request, settings);
     const provider = installRequestAdaptation(installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
-    ), settings);
+    ), settings, claudeTurnScoped);
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings)
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
     const maxRetries = normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
-    const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(settings));
+    const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(settings), {
+      claudeTurnScopedReminders: claudeTurnScoped
+    });
     let retryCount = 0;
     let sawRetry = false;
 
@@ -591,7 +596,8 @@ async function runLlmAttempt(
     preparedRequest,
     effectiveRequestGenerationConfig(request, settings),
     settings.provider,
-    nativeCapabilities
+    nativeCapabilities,
+    turnReminderLayoutFor(request, settings)
   );
   const forceStreaming = isOpenAIResponsesWebSocketMode(settings);
   if (settings.stream === false && !forceStreaming) {
@@ -1604,7 +1610,8 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings);
+  }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings,
+  claudeTurnScopedRemindersRequested(request, runtimeSettings));
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
@@ -1625,7 +1632,8 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     preparedRequest,
     effectiveRequestGenerationConfig(request, runtimeSettings),
     runtimeSettings.provider,
-    nativeCapabilities
+    nativeCapabilities,
+    turnReminderLayoutFor(request, runtimeSettings)
   ), {
     inputFormat: 'unified',
     outputFormat: 'unified',
@@ -4618,18 +4626,43 @@ function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderReque
 
 /**
  * 编码后请求的最终适配：先按模型族做静态适配（Claude 思考类型；GPT-6 Sol / Luna 按实际推理强度去掉
- * 采样参数），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习）。
+ * 采样参数），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习），最后为 Claude
+ * 轮内系统消息合并 beta 头。
  */
-function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord): T {
+function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord, claudeTurnScopedReminders = false): T {
   const target = providerRequestTarget(settings);
   const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
   const gpt6Sampling = isGpt6NoneCapableParameterTarget(settings);
-  return installEncodedRequestPostProcessor(provider, (request) => applyLearnedRequestAdaptations(
-    claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
-      : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider)
-        : request,
-    target
-  ));
+  return installEncodedRequestPostProcessor(provider, (request) => {
+    const adapted = applyLearnedRequestAdaptations(
+      claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
+        : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider)
+          : request,
+      target
+    );
+    return settings.provider === 'claude'
+      ? withClaudeTurnScopedSystemBeta(adapted, claudeTurnScopedReminders && !claudeTurnScopedRemindersFallenBack(target))
+      : adapted;
+  });
+}
+
+/** 冻结的调用设置要求 Claude 每轮提醒使用轮内系统消息（开关只对 Claude 生效）。 */
+function claudeTurnScopedRemindersRequested(
+  request: Pick<LlmStartRequest, 'settingsSnapshot'>,
+  settings: Pick<LlmProviderConfigRecord, 'provider'>
+): boolean {
+  return settings.provider === 'claude' && request.settingsSnapshot?.claudeTurnScopedReminders === true;
+}
+
+/** 每次发送前按当前记忆决定提醒形态：网关明确拒绝过轮内系统消息的目标退回原来的尾巴模式。 */
+function turnReminderLayoutFor(
+  request: Pick<LlmStartRequest, 'settingsSnapshot'>,
+  settings: LlmProviderConfigRecord
+): TurnReminderLayout {
+  return claudeTurnScopedRemindersRequested(request, settings)
+    && !claudeTurnScopedRemindersFallenBack(providerRequestTarget(settings))
+    ? 'claude_turn_scoped'
+    : 'tail';
 }
 
 /**

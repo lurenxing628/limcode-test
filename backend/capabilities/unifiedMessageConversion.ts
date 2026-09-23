@@ -28,6 +28,7 @@ import {
   thoughtSignaturesFromPortableSignature
 } from './llmStreamEventProjection';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
+import { layoutTurnReminderContents, type TurnReminderLayout } from './claudeTurnScopedReminders';
 
 type UnifiedContent = import('unified-llm-provider').Content;
 type UnifiedPart = import('unified-llm-provider').Part;
@@ -38,14 +39,20 @@ export function toUnifiedRequest(
   request: LlmStartRequest,
   generationConfig?: LlmGenerationConfigRecord,
   providerKind?: LlmProviderKind,
-  nativeCapabilities?: OpenAIResponsesNativeCapabilities
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities,
+  turnReminderLayout: TurnReminderLayout = 'tail'
 ): UnifiedLLMRequest {
   const nativeAsync = nativeCapabilities?.asyncTools === true;
+  // 轮内系统消息只发给 Claude；其他 provider 一律按原来的尾巴模式，历史提醒不会以任何形式发过去。
+  const requestContents = layoutTurnReminderContents(
+    request.contents,
+    providerKind === 'claude' && turnReminderLayout === 'claude_turn_scoped' ? 'claude_turn_scoped' : 'tail'
+  );
   const contents = providerKind === 'gemini'
-    ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(projectGeminiProviderContext(request.contents)))
+    ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(projectGeminiProviderContext(requestContents)))
     : providerKind === 'claude'
-      ? projectClaudeThoughtReplay(request.contents)
-      : request.contents;
+      ? projectClaudeThoughtReplay(requestContents)
+      : requestContents;
   return {
     contents: contents.flatMap((content) => toUnifiedContents(content, providerKind, nativeAsync)),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map((part) => toUnifiedPart(part, false)) } } : {}),
@@ -307,9 +314,12 @@ export function toUnifiedContents(
 
 function toUnifiedContent(content: MessageContent, nativeAsync = false): UnifiedContent {
   const providerContext = (content as MessageContent & { providerContext?: unknown }).providerContext;
+  // 只有 layoutTurnReminderContents 在 Claude 轮内系统消息模式下才会写这个字段。
+  const claudeSystemMessage = (content as MessageContent & { claudeSystemMessage?: unknown }).claudeSystemMessage;
   return {
     role: content.role === 'model' ? 'model' : 'user',
     parts: content.parts.map((part) => toUnifiedPart(part, nativeAsync)),
+    ...(claudeSystemMessage ? { claudeSystemMessage } : {}),
     ...(providerContext ? { providerContext } : {})
   } as UnifiedContent;
 }

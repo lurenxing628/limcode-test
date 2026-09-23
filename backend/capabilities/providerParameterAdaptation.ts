@@ -5,6 +5,7 @@
  * 并让调用方立即重试一次；之后同一目标（渠道配置 id + baseUrl + 模型）的请求在编码后直接适配。
  * 其他目标完全不受影响；网络错误、5xx 与语义不明确的 400 一律不匹配。
  * Claude 保留思考的前缀失配（claudeThinkingAdaptation.ts）用同一套按目标记忆与立即重发。
+ * Claude 轮内系统消息被网关明确拒绝时（claudeTurnScopedReminders.ts），同样按目标退回原来的尾巴模式并立即重发。
  *
  * 真实错误文本依据：
  * - 网关实测（openai-compatible → claude-sonnet-5）：
@@ -39,6 +40,7 @@ import {
   claudeThinkingBindingModeForError,
   type ClaudeThinkingBindingMode
 } from './claudeThinkingAdaptation';
+import { claudeTurnScopedRemindersRejected } from './claudeTurnScopedReminders';
 
 export interface ProviderRequestTarget {
   providerConfigId: string;
@@ -86,6 +88,13 @@ interface TargetAdaptationState {
   parameters: Set<AdaptableRequestParameter>;
   /** Claude 保留思考的前缀失配处理；只会 drop_block → strip_thinking 单向推进，不会放回。 */
   claudeThinkingBinding?: ClaudeThinkingBindingMode;
+  /** 网关明确拒绝了轮内系统消息：这个目标之后的请求退回原来的尾巴模式（进程内记住）。 */
+  claudeTurnScopedReminders?: 'tail';
+}
+
+/** 本次请求的上下文：只有确实用了轮内系统消息的请求，才把相关 400 当成需要回退的信号。 */
+export interface ProviderRequestAdaptationContext {
+  claudeTurnScopedReminders?: boolean;
 }
 
 const adaptationStates = new Map<string, TargetAdaptationState>();
@@ -102,12 +111,19 @@ export function resetProviderRequestAdaptations(): void {
 export function learnedProviderRequestAdaptations(target: ProviderRequestTarget): {
   parameters: AdaptableRequestParameter[];
   claudeThinkingBinding?: ClaudeThinkingBindingMode;
+  claudeTurnScopedReminders?: 'tail';
 } {
   const state = adaptationStates.get(providerRequestTargetKey(target));
   return {
     parameters: state ? [...state.parameters].sort() : [],
-    ...(state?.claudeThinkingBinding ? { claudeThinkingBinding: state.claudeThinkingBinding } : {})
+    ...(state?.claudeThinkingBinding ? { claudeThinkingBinding: state.claudeThinkingBinding } : {}),
+    ...(state?.claudeTurnScopedReminders ? { claudeTurnScopedReminders: state.claudeTurnScopedReminders } : {})
   };
+}
+
+/** 这个目标已经因网关拒绝轮内系统消息而退回尾巴模式。 */
+export function claudeTurnScopedRemindersFallenBack(target: ProviderRequestTarget): boolean {
+  return adaptationStates.get(providerRequestTargetKey(target))?.claudeTurnScopedReminders === 'tail';
 }
 
 /**
@@ -201,7 +217,11 @@ export function adaptRequestParameters(
  * 从明确的 400/422 错误中识别被点名的不支持参数，记入该目标的状态。返回本次错误对应、且当前已生效的
  * 适配标识；调用方按“每个请求每个标识只立即重试一次”去重，既覆盖并发请求，也不会死循环。
  */
-export function learnProviderRequestAdaptations(target: ProviderRequestTarget, rawError: unknown): string[] {
+export function learnProviderRequestAdaptations(
+  target: ProviderRequestTarget,
+  rawError: unknown,
+  context: ProviderRequestAdaptationContext = {}
+): string[] {
   const status = providerErrorStatus(rawError);
   if (status !== 400 && status !== 422) return [];
   const text = providerErrorSearchText(rawError);
@@ -213,25 +233,31 @@ export function learnProviderRequestAdaptations(target: ProviderRequestTarget, r
   const binding = target.provider === 'claude'
     ? claudeThinkingBindingModeForError(text, state.claudeThinkingBinding)
     : undefined;
-  if (parameters.length === 0 && !binding) return [];
+  const turnScopedFallback = target.provider === 'claude' && context.claudeTurnScopedReminders === true
+    && claudeTurnScopedRemindersRejected(text);
+  if (parameters.length === 0 && !binding && !turnScopedFallback) return [];
   const learned = parameters.filter((parameter) => !state.parameters.has(parameter));
   for (const parameter of parameters) state.parameters.add(parameter);
   const learnedBinding = binding !== undefined && binding !== state.claudeThinkingBinding ? binding : undefined;
   if (binding) state.claudeThinkingBinding = binding;
+  const learnedTurnScopedFallback = turnScopedFallback && state.claudeTurnScopedReminders !== 'tail';
+  if (turnScopedFallback) state.claudeTurnScopedReminders = 'tail';
   adaptationStates.set(key, state);
-  if (learned.length > 0 || learnedBinding) {
+  if (learned.length > 0 || learnedBinding || learnedTurnScopedFallback) {
     console.log('[LimCode][ProviderAdaptation]', JSON.stringify({
       providerConfigId: target.providerConfigId,
       provider: target.provider,
       model: target.model,
       status,
       ...(learned.length > 0 ? { adaptedParameters: learned } : {}),
-      ...(learnedBinding ? { claudeThinkingBinding: learnedBinding } : {})
+      ...(learnedBinding ? { claudeThinkingBinding: learnedBinding } : {}),
+      ...(learnedTurnScopedFallback ? { claudeTurnScopedReminders: 'tail' } : {})
     }));
   }
   return [
     ...parameters.map((parameter) => `parameter:${parameter}`),
-    ...(binding ? [`claude-thinking-binding:${binding}`] : [])
+    ...(binding ? [`claude-thinking-binding:${binding}`] : []),
+    ...(turnScopedFallback ? ['claude-turn-scoped-reminders:tail'] : [])
   ];
 }
 
@@ -240,11 +266,14 @@ export interface ProviderRequestAdaptationRetry {
   shouldRetryImmediately(rawError: unknown): boolean;
 }
 
-export function createProviderRequestAdaptationRetry(target: ProviderRequestTarget): ProviderRequestAdaptationRetry {
+export function createProviderRequestAdaptationRetry(
+  target: ProviderRequestTarget,
+  context: ProviderRequestAdaptationContext = {}
+): ProviderRequestAdaptationRetry {
   const attempted = new Set<string>();
   return {
     shouldRetryImmediately(rawError) {
-      const fresh = learnProviderRequestAdaptations(target, rawError).filter((id) => !attempted.has(id));
+      const fresh = learnProviderRequestAdaptations(target, rawError, context).filter((id) => !attempted.has(id));
       for (const id of fresh) attempted.add(id);
       return fresh.length > 0;
     }

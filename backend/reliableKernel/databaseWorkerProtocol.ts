@@ -37,6 +37,8 @@ export interface ContextMaterializationRecord {
   /** Immutable MessageRevision role resolved through ContextSegmentSource; NULL for non-message segments. */
   messageRole: string | null;
   modelSource?: ContextModelSource;
+  /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
+  sourceRecipeObjectId?: string;
 }
 
 export interface ContextMaterializationSnapshot {

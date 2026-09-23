@@ -22,6 +22,7 @@
 import type { ModelReasoningCapability } from '../../shared/modelCapabilities';
 import type { EncodedProviderRequest } from './providerParameterAdaptation';
 import { isRecord } from './llmStreamEventProjection';
+import { isTurnScopedSystemMessage } from './claudeTurnScopedReminders';
 
 export interface ClaudeThinkingFamilyProfile {
   family: 'anthropic_adaptive' | 'anthropic_hybrid' | 'anthropic_extended';
@@ -136,7 +137,11 @@ function withoutBlockBinding(body: Record<string, unknown>): Record<string, unkn
   return { ...body, thinking: rest };
 }
 
-/** 去掉所有 thinking / redacted_thinking 块；因此变空的 assistant 消息整条去掉（相邻同角色消息由 API 合并）。 */
+/**
+ * 去掉所有 thinking / redacted_thinking 块；因此变空的 assistant 消息整条去掉（相邻同角色消息由 API 合并）。
+ * 紧挨在被去掉的 assistant 消息之前的轮内系统消息一并去掉：它后面会直接跟 user 消息，官方返回 400；
+ * 它本来就已被清除、不显示，去掉只取决于历史本身，每次请求结果一致。
+ */
 function withoutHistoryThinkingBlocks(body: Record<string, unknown>): Record<string, unknown> {
   if (!Array.isArray(body.messages)) return body;
   let changed = false;
@@ -153,7 +158,10 @@ function withoutHistoryThinkingBlocks(body: Record<string, unknown>): Record<str
       continue;
     }
     changed = true;
-    if (content.length === 0 && message.role === 'assistant') continue;
+    if (content.length === 0 && message.role === 'assistant') {
+      while (messages.length > 0 && isTurnScopedSystemMessage(messages[messages.length - 1])) messages.pop();
+      continue;
+    }
     messages.push({ ...message, content });
   }
   return changed ? { ...body, messages } : body;

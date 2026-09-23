@@ -118,6 +118,8 @@ export interface MaterializedContextSegment {
   segmentKind: ContextSegmentKind;
   messageRole: string | null;
   modelSource?: ContextModelSource;
+  /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
+  sourceRecipeObjectId?: string;
   contentObject: ContentObjectMetadata;
   content: Buffer;
 }
@@ -1163,6 +1165,7 @@ export class ContextSequenceControlPlane {
         segmentKind: requireSegmentKind(record.segment.segment_kind),
         messageRole: nullableText(record.messageRole, 'Context message role'),
         ...(record.modelSource ? { modelSource: record.modelSource } : {}),
+        ...(record.sourceRecipeObjectId ? { sourceRecipeObjectId: record.sourceRecipeObjectId } : {}),
         contentObject: asContentObjectMetadata(record.contentObject),
         content: bufferView(record.content)
       })),

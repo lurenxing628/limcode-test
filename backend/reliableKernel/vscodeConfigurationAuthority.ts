@@ -328,6 +328,9 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const nativeResponses = normalizeOpenAIResponsesNativeSettings(
       selectedModelConfig?.nativeResponses ?? provider.nativeResponses
     );
+    // 每轮提醒是否改用 Claude 轮内系统消息：随 Turn 冻结，恢复与重放一致；关闭时快照里没有这个字段。
+    const claudeTurnScopedReminders = provider.provider === 'claude'
+      && (selectedModelConfig?.claudeTurnScopedReminders ?? provider.claudeTurnScopedReminders) === true;
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
     const compressionThresholdTokens = compression.thresholdTokens;
     const allowedTools = toolPolicy.allowedTools;
@@ -408,6 +411,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
           : {}),
         ...(inheritThinkingToChildren ? { inheritThinkingToChildren: true } : {}),
         ...(nativeResponses ? { nativeResponses } : {}),
+        ...(claudeTurnScopedReminders ? { claudeTurnScopedReminders: true } : {}),
         retryPolicy: frozenProviderRetryPolicy(provider, modelId)
       },
       modelProfile: {

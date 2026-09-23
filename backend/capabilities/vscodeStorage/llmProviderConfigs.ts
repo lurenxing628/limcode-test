@@ -159,6 +159,8 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
     systemPromptPrefix: normalizeSystemPromptPrefix(input?.systemPromptPrefix),
     promptCache,
     ...(nativeResponses ? { nativeResponses } : {}),
+    // 只在打开时保存；关闭与缺省完全相同，已有配置记录逐字节不变。
+    ...(input?.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
     ...(headers ? { headers } : {}),
     ...(generationConfig ? { generationConfig } : {}),
     ...(requestBody ? { requestBody } : {}),
@@ -260,6 +262,8 @@ function normalizeModelConfigs(
       systemPromptPrefix: normalizeSystemPromptPrefix(item.systemPromptPrefix),
       promptCache,
       ...(nativeResponses ? { nativeResponses } : {}),
+      // 模型级配置可以显式关闭（false）以覆盖渠道默认；缺省跟随渠道。
+      ...(typeof item.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: item.claudeTurnScopedReminders } : {}),
       ...(headers ? { headers } : {}),
       ...(generationConfig ? { generationConfig } : {}),
       ...(requestBody ? { requestBody } : {}),

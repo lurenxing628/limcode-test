@@ -2157,13 +2157,17 @@ function decodeContextRecords(
     .map((row) => requireRuntimeId(row.segment_id));
   const roles = new Map<string, string[]>();
   const modelSources = new Map<string, ContextModelSource | null>();
+  // Frozen recipe of the ModelRequest that produced a model message segment. A fork copy of the same
+  // request shares the recipe object; any disagreement or an unlinked source leaves it unset.
+  const recipeSources = new Map<string, string | null>();
   for (let offset = 0; offset < messageSegmentIds.length; offset += 500) {
     const chunk = messageSegmentIds.slice(offset, offset + 500);
     const placeholders = chunk.map(() => '?').join(',');
     const sourceRows = database.prepare(`
       SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role,
              model_request.provider_id AS source_provider_id,
-             model_request.model_id AS source_model_id
+             model_request.model_id AS source_model_id,
+             model_request.recipe_object_id AS source_recipe_object_id
         FROM context_segment_source AS source
         JOIN message_revision AS revision
           ON revision.id = source.source_id
@@ -2182,6 +2186,7 @@ function decodeContextRecords(
       role: string;
       source_provider_id: string | null;
       source_model_id: string | null;
+      source_recipe_object_id: string | null;
     }>;
     for (const source of sourceRows) {
       const segmentId = requireRuntimeId(source.segment_id);
@@ -2201,19 +2206,27 @@ function decodeContextRecords(
         || previousSource.providerId !== modelSource.providerId
         || previousSource.modelId !== modelSource.modelId
       )) modelSources.set(segmentId, null);
+      const recipeObjectId = typeof source.source_recipe_object_id === 'string' && source.source_recipe_object_id
+        ? source.source_recipe_object_id
+        : null;
+      const previousRecipe = recipeSources.get(segmentId);
+      if (previousRecipe === undefined) recipeSources.set(segmentId, recipeObjectId);
+      else if (previousRecipe !== recipeObjectId) recipeSources.set(segmentId, null);
     }
   }
   return rows.map((row) => decodeContextRecord(
     row,
     roles.get(String(row.segment_id)) ?? [],
-    modelSources.get(String(row.segment_id))
+    modelSources.get(String(row.segment_id)),
+    recipeSources.get(String(row.segment_id))
   ));
 }
 
 function decodeContextRecord(
   row: Record<string, unknown>,
   messageRoles: readonly string[],
-  modelSource?: ContextModelSource | null
+  modelSource?: ContextModelSource | null,
+  sourceRecipeObjectId?: string | null
 ): ContextMaterializationRecord {
   const segmentKind = typeof row.segment_kind === 'string' ? row.segment_kind : '';
   let messageRole: string | null = null;
@@ -2245,7 +2258,8 @@ function decodeContextRecord(
       created_at: row.content_created_at
     }),
     messageRole,
-    ...(modelSource ? { modelSource } : {})
+    ...(modelSource ? { modelSource } : {}),
+    ...(messageRole === 'model' && sourceRecipeObjectId ? { sourceRecipeObjectId } : {})
   };
 }
 

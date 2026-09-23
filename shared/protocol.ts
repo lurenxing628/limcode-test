@@ -784,6 +784,8 @@ export interface LlmProviderModelConfigRecord {
   requestBody?: LlmRequestBodyRecord;
   /** GPT-6 原生能力配置；缺省表示跟随渠道级配置。 */
   nativeResponses?: OpenAIResponsesNativeSettings;
+  /** Claude 每轮提醒改用轮内系统消息；缺省表示跟随渠道级配置。 */
+  claudeTurnScopedReminders?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -818,6 +820,12 @@ export interface LlmProviderConfigRecord {
    * 仅对 openai-responses + 精确的 GPT-6 家族模型（Astra、Sol、Luna）生效。
    */
   nativeResponses?: OpenAIResponsesNativeSettings;
+  /**
+   * Claude 每轮提醒（任务卡、未完成任务检查、运行状态卡）改用官方轮内系统消息
+   * （role: "system" + clear_at: "next_user_message"），已发过的提醒原样留在历史里；默认关闭。
+   * 打开即表示确认模型与渠道支持，扩展自动带上 `mid-conversation-system-clear-at-2026-08-21` beta 头。仅对 Claude 生效。
+   */
+  claudeTurnScopedReminders?: boolean;
   /** 针对单个模型的完整高级配置；命中模型时整体替代渠道默认高级配置。 */
   modelConfigs: LlmProviderModelConfigRecord[];
   createdAt: number;
@@ -853,6 +861,8 @@ export interface LlmInvocationSettingsSnapshotRecord {
   requestBody?: LlmRequestBodyRecord;
   /** 本次调用冻结的 Astra 原生能力配置（已按渠道/模型配置合并）。 */
   nativeResponses?: OpenAIResponsesNativeSettings;
+  /** 本次调用冻结：Claude 每轮提醒以轮内系统消息发送（只在打开时出现）。 */
+  claudeTurnScopedReminders?: boolean;
   compressionConfigId?: string;
   compressionMethodKind?: LlmCompressionMethodKind;
   compressionTrigger?: LlmCompressionConfigRecord['trigger'];

@@ -69,6 +69,11 @@ import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './p
 import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import { isGpt6NoneCapableModel } from '../../shared/openAIResponsesCapabilities';
 import {
+  readTurnReminderMarker,
+  turnReminderContent,
+  turnReminderDeliveries
+} from '../capabilities/claudeTurnScopedReminders';
+import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
@@ -129,14 +134,21 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       return estimateCompactProjection(toLlmCompactRequest(request));
     }
     const projected = toLlmStartRequest(request);
+    // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
+    // 只有按 user 消息发出的历史提醒计入上下文；本轮提醒照常计入 turnReminderTokens。
+    const deliveries = turnReminderDeliveries(projected.contents, 'claude_turn_scoped');
+    const visibleContents = projected.contents.filter((content, index) => {
+      const marker = readTurnReminderMarker(content);
+      return !marker || marker.placement === 'current' || deliveries[index] === 'user';
+    });
     const frozenCurrent = request.requestAddenda?.currentTurnInput;
     const currentInputCount = frozenCurrent?.reinject ? 1 : 0;
     const reminderCount = request.requestAddenda?.turnReminder ? 1 : 0;
-    const contextEnd = projected.contents.length - currentInputCount - reminderCount;
+    const contextEnd = visibleContents.length - currentInputCount - reminderCount;
     const currentEnd = contextEnd + currentInputCount;
-    const projectedContext = projected.contents.slice(0, contextEnd);
+    const projectedContext = visibleContents.slice(0, contextEnd);
     let currentInputContents = currentInputCount
-      ? projected.contents.slice(contextEnd, currentEnd)
+      ? visibleContents.slice(contextEnd, currentEnd)
       : [];
     if (frozenCurrent && !frozenCurrent.reinject) {
       const decodedCurrent = decodeFrozenCurrentTurnInput(frozenCurrent.content, frozenCurrent.contentType);
@@ -159,7 +171,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       tools: projected.tools,
       contextContents: projectedContext,
       ...(currentInputContents.length ? { currentInputContents } : {}),
-      ...(reminderCount ? { turnReminderContents: projected.contents.slice(currentEnd) } : {}),
+      ...(reminderCount ? { turnReminderContents: visibleContents.slice(currentEnd) } : {}),
       providerFramingTokens: 64
     });
   }
@@ -620,6 +632,13 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     .map((tool) => tool.schema);
   const authorityModel = requireRecord(authority.model, 'Provider authority model');
   const provider = requireProviderKind(authorityModel.provider);
+  // Claude 轮内系统消息模式（本轮冻结的开关）：之前发过的提醒放回它那次请求的模型输出前面，本轮提醒标为 current；
+  // 发送形态由 claudeTurnScopedReminders.ts 决定。开关关闭时这里不产生任何标记，内容与原来完全一致。
+  const turnScopedReminders = provider === 'claude' && authorityModel.claudeTurnScopedReminders === true;
+  const reminderHistory = turnScopedReminders
+    ? new Map((request.requestAddenda?.turnReminderHistory ?? []).map((entry) => [entry.segmentId, entry]))
+    : undefined;
+  const historyReminderInsertions: Array<{ beforeIndex: number; content: MessageContent }> = [];
   const systemPromptPrefix = typeof authorityModel.systemPromptPrefix === 'string'
     ? authorityModel.systemPromptPrefix
     : '';
@@ -687,6 +706,16 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     }
     const decoded = decodeMessageContent(item.content, item.contentType);
     if (decoded) {
+      const historical = decoded.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
+      if (historical) {
+        historyReminderInsertions.push({
+          beforeIndex: contents.length,
+          content: turnReminderContent(historical.content, {
+            placement: 'history',
+            ...(historical.afterReinjectedInput ? { afterReinjectedInput: true } : {})
+          })
+        });
+      }
       contents.push(isolateCrossChannelGptThoughtSignatures(decoded, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
@@ -728,10 +757,11 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...(turnReminder ? ['turn_reminder' as const] : [])
   ];
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
-  const projectedContents = projectOrdinaryContentsPreservingRanges(
-    contents,
-    canonicalCompressionRanges,
-    modelHandleCatalog
+  const projectedContents = withTurnReminderMarkers(
+    projectOrdinaryContentsPreservingRanges(contents, canonicalCompressionRanges, modelHandleCatalog),
+    contents.length,
+    historyReminderInsertions,
+    turnScopedReminders ? turnReminder?.content : undefined
   );
   return {
     id: request.modelRequestId,
@@ -748,6 +778,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       provider,
       modelId: request.modelId,
       systemPromptPrefix,
+      ...(turnScopedReminders ? { claudeTurnScopedReminders: true } : {}),
       // The complete generation config is frozen per ordinary request, not re-read on retry.
       ...(asRecord(authorityModel.generationConfig)
         ? { generationConfig: authorityModel.generationConfig as NonNullable<LlmStartRequest['settingsSnapshot']>['generationConfig'],
@@ -781,6 +812,37 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       : {}),
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
   };
+}
+
+/**
+ * 把 Claude 轮内系统消息模式的提醒标记放进已投影的内容：投影逐条一一对应（不增删、不重排），
+ * 历史提醒按投影前记下的位置插回那次请求的模型输出前面，本轮提醒（投影前按原来的形态放在最后）换成带标记的同一文本。
+ * 历史提醒不参与投影，工具结果分组与媒体去重与开关关闭时完全相同。
+ */
+function withTurnReminderMarkers(
+  projected: MessageContent[],
+  contentCount: number,
+  insertions: ReadonlyArray<{ beforeIndex: number; content: MessageContent }>,
+  currentReminder: string | undefined
+): MessageContent[] {
+  if (insertions.length === 0 && currentReminder === undefined) return projected;
+  if (projected.length !== contentCount) {
+    throw new Error('Ordinary Context projection must keep one projected content per input content.');
+  }
+  const result: MessageContent[] = [];
+  let cursor = 0;
+  projected.forEach((content, index) => {
+    while (cursor < insertions.length && insertions[cursor].beforeIndex === index) result.push(insertions[cursor++].content);
+    result.push(content);
+  });
+  if (cursor !== insertions.length) throw new Error('Historical turn reminder lost its model output position.');
+  if (currentReminder !== undefined) {
+    const last = result.pop();
+    const text = last?.role === 'user' && last.parts.length === 1 && 'text' in last.parts[0] ? last.parts[0].text : undefined;
+    if (text !== currentReminder) throw new Error('The current turn reminder must be the last projected content.');
+    result.push(turnReminderContent(currentReminder, { placement: 'current' }));
+  }
+  return result;
 }
 
 function requireAttachmentHandle(catalog: ModelHandleCatalog, attachmentId: string): string {

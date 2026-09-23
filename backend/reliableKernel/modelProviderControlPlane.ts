@@ -27,7 +27,12 @@ import {
   type ContentObjectMetadata
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { ContextSequenceControlPlane } from './contextSequence';
+import { ContextSequenceControlPlane, type MaterializedContextSegment } from './contextSequence';
+import {
+  claudeTurnScopedRemindersEnabled,
+  projectTurnReminder,
+  recipeReinjectedCurrentTurnInput
+} from './turnReminderProjection';
 import { expandTextCompressionSources } from './compressionSourceReplay';
 import {
   estimateRequestAuthorityTokens,
@@ -159,6 +164,16 @@ export interface FullProviderRequest {
       activeChildCount: number;
       runningProcessCount: number;
     };
+    /**
+     * Claude 轮内系统消息模式（本轮冻结开关打开）才有：之前每次请求发过的提醒，按那次请求冻结的 recipe
+     * 逐字节重新生成，挂在那次请求模型输出所在的 Context 片段上，发送时原样放回它的前面。
+     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里。
+     */
+    turnReminderHistory?: Array<{
+      segmentId: string;
+      content: string;
+      afterReinjectedInput?: true;
+    }>;
   };
 }
 
@@ -450,6 +465,7 @@ export class ModelProviderControlPlane {
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
+  private readonly historicalTurnReminders = new Map<string, { content: string; afterReinjectedInput: boolean } | null>();
   /** Durable Astra steering submissions/receipts; shared with the Agent loop's native session. */
   public readonly nativeSteering: NativeSteeringStore;
   private handoff: ExecutionHandoffError | undefined;
@@ -744,9 +760,9 @@ export class ModelProviderControlPlane {
       materialized.segments
     );
     const requestCreatedAt = domainTimestampMs(request.created_at);
-    const requestAddenda = await this.materializeRequestAddenda(
-      recipe,
-      requireId(request.turn_id, 'ModelRequest.turn_id')
+    const requestAddenda = withTurnReminderHistory(
+      await this.materializeRequestAddenda(recipe, requireId(request.turn_id, 'ModelRequest.turn_id')),
+      await this.materializeTurnReminderHistory(frozenAuthority, recipe, providerSegments)
     );
     const attachmentCatalogState = normalizeAttachmentCatalogState(
       isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
@@ -833,7 +849,10 @@ export class ModelProviderControlPlane {
       throw new Error('Preview Context projection belongs to another Conversation.');
     }
     const model = frozenModelIdentity(frozen.document);
-    const requestAddenda = await this.materializeRequestAddenda(recipe, turnId);
+    const requestAddenda = withTurnReminderHistory(
+      await this.materializeRequestAddenda(recipe, turnId),
+      await this.materializeTurnReminderHistory(frozen.document, recipe, materialized.segments)
+    );
     const attachmentCatalogState = normalizeAttachmentCatalogState(
       isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
       'ModelRequest preview recipe.attachmentCatalogState'
@@ -2208,37 +2227,71 @@ export class ModelProviderControlPlane {
         )
       };
     }
-    const task = recipe.turnTaskCardReminderEnabled === false
-      ? undefined
-      : isRecord(recipe.turnTaskCard) ? recipe.turnTaskCard : undefined;
-    const runtime = isRecord(recipe.runtimeStatusCard) ? recipe.runtimeStatusCard : undefined;
-    const completionCheck = isRecord(recipe.openTaskCompletionCheck)
-      ? recipe.openTaskCompletionCheck
-      : undefined;
-    const reminderParts = [
-      typeof task?.card === 'string' && task.card.trim() ? task.card.trim() : '',
-      typeof completionCheck?.card === 'string' && completionCheck.card.trim()
-        ? completionCheck.card.trim()
-        : '',
-      typeof runtime?.card === 'string' && runtime.card.trim() ? runtime.card.trim() : ''
-    ].filter(Boolean);
-    const unfinishedTaskCount = nonNegativeRecipeInteger(task?.counts, 'unfinished');
-    const activeChildCount = nonNegativeRecipeInteger(runtime, 'activeChildCount');
-    const runningProcessCount = nonNegativeRecipeInteger(runtime, 'runningProcessCount');
-    const turnReminder = reminderParts.length === 0 ? undefined : {
-      content: reminderParts.join('\n\n'),
-      ...(typeof task?.cardSha256 === 'string' && task.cardSha256.trim()
-        ? { taskCardSha256: task.cardSha256.trim() }
-        : {}),
-      unfinishedTaskCount,
-      activeChildCount,
-      runningProcessCount
-    };
+    const turnReminder = projectTurnReminder(recipe);
     if (!currentTurnInput && !turnReminder) return {};
     return { requestAddenda: {
       ...(currentTurnInput ? { currentTurnInput } : {}),
       ...(turnReminder ? { turnReminder } : {})
     } };
+  }
+
+  /**
+   * Claude 轮内系统消息模式下，之前每次请求发过的提醒（见 FullProviderRequest.requestAddenda.turnReminderHistory）。
+   * 每条模型输出片段经 ModelRequestMessageLink 找到产生它的 ModelRequest，再从它冻结的 recipe 用同一个
+   * projectTurnReminder 重新生成：重试共用一个 ModelRequest，恢复与重启只读持久事实，fork 复制的请求共用同一个
+   * recipe 对象，压缩掉的片段不在 Context 里；没有模型输出进入 Context 的请求不会被找到。
+   */
+  private async materializeTurnReminderHistory(
+    authority: PlainJsonValue,
+    recipe: PlainJsonValue,
+    segments: readonly MaterializedContextSegment[]
+  ): Promise<NonNullable<FullProviderRequest['requestAddenda']>['turnReminderHistory']> {
+    if (!isRecord(recipe) || recipe.kind !== 'reliable-agent-turn' || !claudeTurnScopedRemindersEnabled(authority)) {
+      return undefined;
+    }
+    const sources = segments.filter((segment) => segment.segmentKind === 'message'
+      && segment.messageRole === 'model'
+      && typeof segment.sourceRecipeObjectId === 'string');
+    if (sources.length === 0) return undefined;
+    const missing = [...new Set(sources.map((segment) => segment.sourceRecipeObjectId as string))]
+      .filter((id) => !this.historicalTurnReminders.has(id));
+    for (let offset = 0; offset < missing.length; offset += HISTORICAL_REMINDER_READ_BATCH) {
+      const ids = missing.slice(offset, offset + HISTORICAL_REMINDER_READ_BATCH);
+      const snapshot = await this.database.snapshot(ids.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
+      const metadata = snapshot.snapshot.map((row, index) => requireRow(row, `ModelRequest recipe ContentObject ${ids[index]}`));
+      const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
+      ids.forEach((id, index) => {
+        const historical = parsePlainJson(bytes[index], `ModelRequest recipe ${id}`);
+        const reminder = projectTurnReminder(historical);
+        this.rememberHistoricalTurnReminder(id, reminder
+          ? { content: reminder.content, afterReinjectedInput: recipeReinjectedCurrentTurnInput(historical) }
+          : null);
+      });
+    }
+    const history: NonNullable<NonNullable<FullProviderRequest['requestAddenda']>['turnReminderHistory']> = [];
+    for (const segment of sources) {
+      const reminder = this.historicalTurnReminders.get(segment.sourceRecipeObjectId as string);
+      if (!reminder) continue;
+      history.push({
+        segmentId: segment.segmentId,
+        content: reminder.content,
+        ...(reminder.afterReinjectedInput ? { afterReinjectedInput: true as const } : {})
+      });
+    }
+    return history.length > 0 ? history : undefined;
+  }
+
+  /** recipe 是不可变的内容寻址对象，按对象 id 缓存生成结果；有界，超出时淘汰最早的条目。 */
+  private rememberHistoricalTurnReminder(
+    recipeObjectId: string,
+    reminder: { content: string; afterReinjectedInput: boolean } | null
+  ): void {
+    this.historicalTurnReminders.set(recipeObjectId, reminder);
+    while (this.historicalTurnReminders.size > HISTORICAL_REMINDER_CACHE_LIMIT) {
+      const oldest = this.historicalTurnReminders.keys().next().value;
+      if (oldest === undefined) break;
+      this.historicalTurnReminders.delete(oldest);
+    }
   }
 
   private async replayCreation(
@@ -2662,10 +2715,15 @@ function estimateFullProviderContextFallback(request: FullProviderRequest): numb
   }, 0);
 }
 
-function nonNegativeRecipeInteger(container: PlainJsonValue | undefined, key: string): number {
-  const record = isRecord(container) ? container : undefined;
-  const value = record?.[key];
-  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : 0;
+const HISTORICAL_REMINDER_READ_BATCH = 200;
+const HISTORICAL_REMINDER_CACHE_LIMIT = 4096;
+
+function withTurnReminderHistory(
+  addenda: Pick<FullProviderRequest, 'requestAddenda'>,
+  history: NonNullable<FullProviderRequest['requestAddenda']>['turnReminderHistory']
+): Pick<FullProviderRequest, 'requestAddenda'> {
+  if (!history) return addenda;
+  return { requestAddenda: { ...addenda.requestAddenda, turnReminderHistory: history } };
 }
 
 function dispatchResult(
