@@ -30,8 +30,6 @@ export interface ConversationForkCommand {
   /** Optional UI CAS: the selected Message must still point at this exact revision at commit. */
   expectedCurrentMessageRevisionId?: string;
   sourceTurnId?: string;
-  sourceToolCallId?: string;
-  expectedSourceHeadRootId?: string;
   targetConversationId?: string;
   /** Initial display title only: the user may rename the target, so it is never fork identity. */
   targetTitle: string;
@@ -148,9 +146,6 @@ export class ConversationForkControlPlane {
       ...(command.sourceTurnId
         ? [DOMAIN_REPOSITORIES.domain('Turn').get(command.sourceTurnId)]
         : []),
-      ...(command.sourceToolCallId
-        ? [DOMAIN_REPOSITORIES.domain('ToolCall').get(command.sourceToolCallId)]
-        : []),
       ...(command.sourceProjectContextId
         ? [DOMAIN_REPOSITORIES.domain('ProjectContext').get(command.sourceProjectContextId)]
         : [])
@@ -165,13 +160,6 @@ export class ConversationForkControlPlane {
     if (sourceHeads.length !== 1) {
       throw new Error(`Source Conversation ${command.sourceConversationId} must have exactly one Context head.`);
     }
-    const sourceHead = sourceHeads[0];
-    if (
-      command.expectedSourceHeadRootId !== undefined
-      && sourceHead.root_id !== command.expectedSourceHeadRootId
-    ) {
-      throw new Error('Fork source expected head is stale.');
-    }
 
     const sourceRevision = command.sourceMessageRevisionId
       ? requireRow(sourceSnapshot.snapshot[cursor++], `MessageRevision ${command.sourceMessageRevisionId}`)
@@ -179,17 +167,11 @@ export class ConversationForkControlPlane {
     const sourceTurn = command.sourceTurnId
       ? requireRow(sourceSnapshot.snapshot[cursor++], `Turn ${command.sourceTurnId}`)
       : null;
-    const sourceToolCall = command.sourceToolCallId
-      ? requireRow(sourceSnapshot.snapshot[cursor++], `ToolCall ${command.sourceToolCallId}`)
-      : null;
     const sourceProjectContext = command.sourceProjectContextId
       ? requireRow(sourceSnapshot.snapshot[cursor++], `ProjectContext ${command.sourceProjectContextId}`)
       : null;
     if (sourceTurn && sourceTurn.conversation_id !== command.sourceConversationId) {
       throw new Error('Fork source Turn does not belong to the source Conversation.');
-    }
-    if (sourceToolCall && command.sourceTurnId && sourceToolCall.turn_id !== command.sourceTurnId) {
-      throw new Error('Fork source ToolCall does not belong to the selected source Turn.');
     }
 
     let currentRevisionLink: DomainRow | null = null;
@@ -346,12 +328,6 @@ export class ConversationForkControlPlane {
         tail_segment_count: sourceRoot.tail_segment_count,
         segment_count: sourceRoot.segment_count
       }),
-      ...(command.expectedSourceHeadRootId !== undefined
-        ? [DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assert(
-            requireId(sourceHead.id, 'ConversationContextHeadLink.id'),
-            { conversation_id: command.sourceConversationId, root_id: command.expectedSourceHeadRootId }
-          )]
-        : []),
       ...(sourceRevision
         ? [DOMAIN_REPOSITORIES.domain('MessageRevision').assert(command.sourceMessageRevisionId!, {
             message_id: sourceRevision.message_id,
@@ -399,11 +375,6 @@ export class ConversationForkControlPlane {
       ...(sourceTurn
         ? [DOMAIN_REPOSITORIES.domain('Turn').assert(command.sourceTurnId!, {
             conversation_id: command.sourceConversationId
-          })]
-        : []),
-      ...(sourceToolCall
-        ? [DOMAIN_REPOSITORIES.domain('ToolCall').assert(command.sourceToolCallId!, {
-            turn_id: sourceToolCall.turn_id
           })]
         : []),
       ...(sourceProjectLink && sourceProjectContext
@@ -518,7 +489,7 @@ export class ConversationForkControlPlane {
         conversation_id: ids.targetConversationId,
         source_conversation_id: command.sourceConversationId,
         source_turn_id: command.sourceTurnId ?? null,
-        source_tool_call_id: command.sourceToolCallId ?? null,
+        source_tool_call_id: null,
         source_message_revision_id: command.sourceMessageRevisionId ?? null,
         created_at: now
       })
@@ -596,7 +567,7 @@ export class ConversationForkControlPlane {
       || origin.conversation_id !== ids.targetConversationId
       || origin.source_conversation_id !== command.sourceConversationId
       || origin.source_turn_id !== (command.sourceTurnId ?? null)
-      || origin.source_tool_call_id !== (command.sourceToolCallId ?? null)
+      || origin.source_tool_call_id !== null
       || origin.source_message_revision_id !== (command.sourceMessageRevisionId ?? null)
     ) {
       throw new Error(`Conversation fork identity ${command.reuseKey} was replayed with different facts.`);
@@ -627,14 +598,9 @@ function normalizeForkCommand(command: ConversationForkCommand) {
     'expectedCurrentMessageRevisionId'
   );
   const sourceTurnId = optionalId(command.sourceTurnId, 'sourceTurnId');
-  const sourceToolCallId = optionalId(command.sourceToolCallId, 'sourceToolCallId');
-  const expectedSourceHeadRootId = optionalId(command.expectedSourceHeadRootId, 'expectedSourceHeadRootId');
   const targetConversationId = optionalId(command.targetConversationId, 'targetConversationId');
   const targetTitle = requireText(command.targetTitle, 'targetTitle');
   const targetAgentId = requireId(command.targetAgentId, 'targetAgentId');
-  if (sourceToolCallId && !sourceTurnId) {
-    throw new TypeError('sourceToolCallId requires sourceTurnId.');
-  }
   if (expectedCurrentMessageRevisionId && expectedCurrentMessageRevisionId !== sourceMessageRevisionId) {
     throw new TypeError('expectedCurrentMessageRevisionId must equal sourceMessageRevisionId.');
   }
@@ -650,8 +616,6 @@ function normalizeForkCommand(command: ConversationForkCommand) {
     ...(sourceMessageRevisionId ? { sourceMessageRevisionId } : {}),
     ...(expectedCurrentMessageRevisionId ? { expectedCurrentMessageRevisionId } : {}),
     ...(sourceTurnId ? { sourceTurnId } : {}),
-    ...(sourceToolCallId ? { sourceToolCallId } : {}),
-    ...(expectedSourceHeadRootId ? { expectedSourceHeadRootId } : {}),
     ...(targetConversationId ? { targetConversationId } : {}),
     targetTitle,
     targetAgentId
@@ -671,8 +635,6 @@ function forkIds(command: ResolvedForkCommand): ForkIds {
     command.sourceContextEndSegmentId ?? null,
     command.sourceMessageRevisionId ?? null,
     command.sourceTurnId ?? null,
-    command.sourceToolCallId ?? null,
-    command.expectedSourceHeadRootId ?? null,
     command.targetConversationId ?? null,
     command.targetAgentId
   ]);

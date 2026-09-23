@@ -152,7 +152,6 @@ async function checkConversationForkLinks() {
       sourceContextEndSegmentId: sourceMessageSegment.segment_id,
       sourceMessageRevisionId: seeded.messageRevisionId,
       sourceTurnId: seeded.turnId,
-      expectedSourceHeadRootId: sourceRootId,
       targetTitle: 'Fork target',
       targetAgentId: 'fork-target-agent'
     };
@@ -334,7 +333,6 @@ async function checkConversationForkLinks() {
       sourceMessageRevisionId: prefixB.messageRevisionId,
       expectedCurrentMessageRevisionId: prefixB.messageRevisionId,
       sourceTurnId: prefixB.turnId,
-      expectedSourceHeadRootId: prefixCompression.rootId,
       targetTitle: 'Fork through B',
       targetAgentId: prefixSeed.agentId
     });
@@ -441,7 +439,6 @@ async function checkConversationForkLinks() {
       sourceMessageRevisionId: failedSeed.messageRevisionId,
       expectedCurrentMessageRevisionId: failedSeed.messageRevisionId,
       sourceTurnId: failedSeed.turnId,
-      expectedSourceHeadRootId: failedRootId,
       targetTitle: 'Fork preserves failed Turn',
       targetAgentId: failedSeed.agentId
     });
@@ -612,19 +609,10 @@ async function checkConversationForkLinks() {
     assert.equal(copiedRequestLinks[0].model_request_id, copiedRequests[0].id);
     assertions.push('含终结ModelRequest/Operation/Attempt的历史转录经historicalCopy通道复制进fork目标，不再撞创建不变量');
 
-    await assert.rejects(forks.fork({
-      ...baseCommand,
-      idempotencyKey: 'fork-stale',
-      reuseKey: 'reuse-fork-stale'
-    }), /expected head is stale/);
-    assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-stale' })).length, 0);
-    faults.push('stale expected source head');
-
     const concurrent = await Promise.all(['left', 'right'].map((side) => forks.fork({
       ...baseCommand,
       idempotencyKey: `fork-${side}`,
       reuseKey: `reuse-fork-${side}`,
-      expectedSourceHeadRootId: undefined,
       targetTitle: `Concurrent ${side}`
     })));
     assert.equal(new Set(concurrent.map((entry) => entry.targetConversationId)).size, 2);
@@ -647,7 +635,6 @@ async function checkConversationForkLinks() {
       ...baseCommand,
       idempotencyKey: 'fork-historical',
       reuseKey: 'reuse-fork-historical',
-      expectedSourceHeadRootId: undefined,
       targetTitle: 'Historical fork'
     }), (error) => error instanceof kernel.ConversationForkRejectedError && /分支点消息已被删除/.test(error.message));
     assert.equal((await get(ctx.database, 'Message', seeded.messageId)).deleted_at !== null, true);

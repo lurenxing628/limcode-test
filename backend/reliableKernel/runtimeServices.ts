@@ -19,10 +19,7 @@ import {
   ClientDetailReader,
   ClientHistoryReader
 } from './clientFeed';
-import {
-  ConversationForkControlPlane,
-  type ConversationForkCommand
-} from './conversationFork';
+import { ConversationForkControlPlane } from './conversationFork';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { EffectControlPlane, type EffectObservedOutcome } from './effectControlPlane';
 import { PhaseFRecoveryScanner } from './phaseFRecovery';
@@ -143,10 +140,6 @@ export class ReliableKernelRuntimeRouter {
       default:
         return Promise.reject(new Error(`Unsupported run_agent operation: ${String((command as { operation?: unknown }).operation)}.`));
     }
-  }
-
-  public forkConversation(command: ConversationForkCommand) {
-    return this.services.conversationFork.fork(command);
   }
 
   public submitAnswer(command: AnswerSubmitCommand) {
