@@ -337,12 +337,23 @@ export async function prepareConversationForkSnapshot(
     throw new Error('Fork source history still has an unsettled native steering instruction; wait for it to settle.');
   }
   const turnRelations = await readTurnRelations(database, turnRows);
-  // A Turn whose whole transcript is copied is copied with every ModelRequest it made, including
-  // compression and failed requests that own no Message, so its original termination stays valid.
+  // A Turn whose whole visible transcript is copied is copied with every ModelRequest it made,
+  // including compression and failed requests that own no Message, so its original termination
+  // stays valid. Output a retry, edit or delete soft-deleted keeps its Turn links but is not part of
+  // the visible transcript, so it never makes the copied Turn look interrupted.
   const copiedMessageIds = new Set([...messageFacts, ...toolResultMessages].map((fact) => id(fact.message.id, 'Message.id')));
+  const discarded = await readDiscardedTurnOutput(
+    database,
+    [...turnRelations.values()],
+    copiedMessageIds,
+    new Set(tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')))
+  );
   const completeTurnRequests = turnRows.flatMap((turn) => {
     const relation = turnRelations.get(id(turn.id, 'Turn.id'))!;
-    return relation.messageLinks.every((link) => copiedMessageIds.has(id(link.message_id, 'MessageTurnLink.message_id')))
+    return relation.messageLinks.every((link) => {
+      const messageId = id(link.message_id, 'MessageTurnLink.message_id');
+      return copiedMessageIds.has(messageId) || discarded.messageIds.has(messageId);
+    })
       ? relation.modelRequests.filter((request) => !requestIdSet.has(id(request.id, 'ModelRequest.id')))
       : [];
   });
@@ -480,7 +491,7 @@ export async function prepareConversationForkSnapshot(
     }));
     const relation = turnRelations.get(sourceTurnId);
     const preservesTerminalState = relation !== undefined
-      && hasCompleteTurnClosure(relation, messageIdMap, requestIdMap, toolIdMap);
+      && hasCompleteTurnClosure(relation, messageIdMap, requestIdMap, toolIdMap, discarded);
     if (preservesTerminalState && relation) {
       preservedTurnIds.add(sourceTurnId);
       assertions.push(
@@ -833,18 +844,58 @@ async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[]):
   return relations;
 }
 
+/**
+ * Soft-deleted Messages linked to the copied Turns (output a retry, edit or delete discarded) and
+ * the ToolCalls those Messages issued. Neither is visible history, so neither is copied or required.
+ */
+async function readDiscardedTurnOutput(
+  database: RuntimeDatabase,
+  relations: readonly TurnRelations[],
+  copiedMessageIds: ReadonlySet<string>,
+  copiedToolIds: ReadonlySet<string>
+): Promise<{ messageIds: ReadonlySet<string>; toolCallIds: ReadonlySet<string> }> {
+  const uncopiedTools = relations.flatMap((relation) => relation.toolCalls)
+    .map((tool) => id(tool.id, 'ToolCall.id'))
+    .filter((toolCallId) => !copiedToolIds.has(toolCallId));
+  const toolSourceBarrier = uncopiedTools.length > 0 ? await database.snapshot(uncopiedTools.map((toolCallId) =>
+    DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({ where: { tool_call_id: toolCallId }, limit: 2 })
+  )) : { snapshot: [] };
+  const toolSourceMessages = new Map(uncopiedTools.flatMap((toolCallId, index) => {
+    const sources = rows(toolSourceBarrier.snapshot[index], 'ToolCallSourceLink discarded output lookup');
+    return sources.length === 1 ? [[toolCallId, id(sources[0].message_id, 'ToolCallSourceLink.message_id')] as const] : [];
+  }));
+  const candidates = unique([
+    ...relations.flatMap((relation) => relation.messageLinks.map((link) => id(link.message_id, 'MessageTurnLink.message_id'))),
+    ...toolSourceMessages.values()
+  ].filter((messageId) => !copiedMessageIds.has(messageId)));
+  const messageIds = new Set((await getRows(database, 'Message', candidates))
+    .filter((message) => message.deleted_at !== null)
+    .map((message) => id(message.id, 'Message.id')));
+  return {
+    messageIds,
+    toolCallIds: new Set([...toolSourceMessages].flatMap(([toolCallId, messageId]) =>
+      messageIds.has(messageId) ? [toolCallId] : []
+    ))
+  };
+}
+
 function hasCompleteTurnClosure(
   relation: TurnRelations,
   messageIds: Map<string, string>,
   requestIds: Map<string, string>,
-  toolIds: Map<string, string>
+  toolIds: Map<string, string>,
+  discarded: { messageIds: ReadonlySet<string>; toolCallIds: ReadonlySet<string> }
 ): boolean {
   if (!relation.termination) return false;
-  const closureMapped = relation.messageLinks.every((link) =>
-    messageIds.has(id(link.message_id, 'MessageTurnLink.message_id'))
-  )
+  const closureMapped = relation.messageLinks.every((link) => {
+    const messageId = id(link.message_id, 'MessageTurnLink.message_id');
+    return messageIds.has(messageId) || discarded.messageIds.has(messageId);
+  })
     && relation.modelRequests.every((request) => requestIds.has(id(request.id, 'ModelRequest.id')))
-    && relation.toolCalls.every((tool) => toolIds.has(id(tool.id, 'ToolCall.id')));
+    && relation.toolCalls.every((tool) => {
+      const toolCallId = id(tool.id, 'ToolCall.id');
+      return toolIds.has(toolCallId) || discarded.toolCallIds.has(toolCallId);
+    });
   if (!closureMapped) return false;
   if (relation.termination.terminal_status !== 'completed') {
     return relation.finalOutputFences.length === 0;

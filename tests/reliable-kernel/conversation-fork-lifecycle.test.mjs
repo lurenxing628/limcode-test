@@ -768,6 +768,49 @@ test('fork after retrying an old turn does not retain the discarded suffix', asy
   });
 });
 
+for (const rewrite of ['retry', 'edit']) {
+  test(`a copied turn whose output was discarded by a source ${rewrite} keeps its original termination`, async () => {
+    await withForkRuntime(async h => {
+      const rewritten = await h.turn('source', `${rewrite}-rewritten-tool-turn`);
+      const [call] = await rows(h.app, 'ToolCall', { turn_id: rewritten.turnId });
+      const [callSource] = await rows(h.app, 'ToolCallSourceLink', { tool_call_id: call.id });
+      const [callCurrent] = await rows(h.app, 'MessageCurrentRevisionLink', { message_id: callSource.message_id });
+      let command;
+      if (rewrite === 'retry') {
+        // Retrying from the tool-calling message soft-deletes it, the tool result and the reply.
+        await h.turn('source', 'retry-discarded-tool-output', {
+          sourceTurnId: rewritten.turnId, target: { kind: 'message', messageId: callSource.message_id },
+          expectedMessageRevisionId: callCurrent.revision_id
+        });
+        command = await h.command('source', 'fork-after-discarding-retry');
+      } else {
+        await h.turn('source', 'later-turn-discarded-by-edit');
+        const user = await firstMessageCommand(h, 'source', 'unused');
+        await h.app.turns.edit({
+          source: { kind: 'command', key: 'edit-discards-tool-output' }, conversationId: 'source',
+          messageId: user.messageId, expectedRevisionId: user.expectedRevisionId,
+          content: 'edited-user-input-discards-output', deleteFollowing: true
+        });
+        command = await firstMessageCommand(h, 'source', 'fork-after-discarding-edit');
+      }
+      const [sourceTermination] = await rows(h.app, 'TurnTermination', { turn_id: rewritten.turnId });
+      assert.equal(sourceTermination.terminal_status, 'completed');
+      const fork = await h.facade.forkConversation(command);
+      const copiedTurns = await rows(h.app, 'Turn', { conversation_id: fork.conversationId });
+      assert.ok(copiedTurns.length >= 1);
+      for (const turn of copiedTurns) {
+        const terminations = await rows(h.app, 'TurnTermination', { turn_id: turn.id });
+        assert.deepEqual(terminations.map(row => [row.terminal_status, row.reason]), [['completed', sourceTermination.reason]],
+          'discarded output is not part of the visible transcript, so the copied turn is not interrupted');
+      }
+      for (const turn of copiedTurns) {
+        assert.deepEqual(await rows(h.app, 'ToolCall', { turn_id: turn.id }), [], 'the discarded tool call is not copied');
+      }
+      await h.turn(fork.conversationId, `continue-after-${rewrite}-fork`);
+    }, { withTool: true });
+  });
+}
+
 test('nested compression keeps reachable pre-compression fork boundaries usable', async () => {
   await withForkRuntime(async h => {
     for (let round = 1; round <= 2; round += 1) {
