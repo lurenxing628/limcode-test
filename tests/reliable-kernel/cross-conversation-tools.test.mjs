@@ -132,7 +132,8 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
           definitions: () => definitions,
           async dispatchSpecial(_definition, input, authority, signal, admission) {
             dispatches.push(structuredClone(input));
-            await dispatchHook?.(input, f);
+            // A failed hook assertion fails the test at once instead of surfacing as a later timeout.
+            try { await dispatchHook?.(input, f); } catch (error) { errors.push(error); throw error; }
             return await collaborationTools.dispatch(input, signal, authority)
               ?? await coordinator.dispatch(input, signal, authority, admission);
           },
