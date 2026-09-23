@@ -42,7 +42,8 @@ import type {
   FullProviderRequest,
   FullRequestProviderAdapter,
   ProviderDispatchControls,
-  ProviderOutputStreamEvent
+  ProviderOutputStreamEvent,
+  TurnReminderHistoryEntry
 } from './modelProviderControlPlane';
 import {
   collectNativeConfigurationUpdates,
@@ -55,6 +56,7 @@ import {
   projectSummaryModelWindow,
   stripNativeConfigurationUpdates,
   suppressRepeatedManagedMediaBodies,
+  type ManagedMediaBodyProjectionState,
   type ProjectedRequestTokenBreakdown
 } from './modelFacingContextProjection';
 import {
@@ -69,6 +71,7 @@ import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './p
 import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import { isGpt6NoneCapableModel } from '../../shared/openAIResponsesCapabilities';
 import {
+  markedReinjectedInput,
   readTurnReminderMarker,
   turnReminderContent,
   turnReminderDeliveries
@@ -135,14 +138,19 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     }
     const projected = toLlmStartRequest(request);
     // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
-    // 只有按 user 消息发出的历史提醒计入上下文；本轮提醒照常计入 turnReminderTokens。
+    // 只有按 user 消息发出的历史提醒计入上下文；本轮提醒照常计入 turnReminderTokens。重新注入输入的历史副本是
+    // 普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，也就没有本轮输入。
     const deliveries = turnReminderDeliveries(projected.contents, 'claude_turn_scoped');
+    let tailInputSuperseded = false;
     const visibleContents = projected.contents.filter((content, index) => {
       const marker = readTurnReminderMarker(content);
-      return !marker || marker.placement === 'current' || deliveries[index] === 'user';
+      if (!marker) return true;
+      if (marker.placement === 'current' && marker.kind === 'reinjected_input') tailInputSuperseded = true;
+      else if (marker.placement === 'current') return true;
+      return deliveries[index] === 'user';
     });
     const frozenCurrent = request.requestAddenda?.currentTurnInput;
-    const currentInputCount = frozenCurrent?.reinject ? 1 : 0;
+    const currentInputCount = frozenCurrent?.reinject && !tailInputSuperseded ? 1 : 0;
     const reminderCount = request.requestAddenda?.turnReminder ? 1 : 0;
     const contextEnd = visibleContents.length - currentInputCount - reminderCount;
     const currentEnd = contextEnd + currentInputCount;
@@ -634,13 +642,11 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     .map((tool) => tool.schema);
   const authorityModel = requireRecord(authority.model, 'Provider authority model');
   const provider = requireProviderKind(authorityModel.provider);
-  // Claude 轮内系统消息模式（本轮冻结的开关）：之前发过的提醒放回它那次请求的模型输出前面，本轮提醒标为 current；
-  // 发送形态由 claudeTurnScopedReminders.ts 决定。开关关闭时这里不产生任何标记，内容与原来完全一致。
+  // Claude 轮内系统消息模式（本轮冻结的开关）：之前发过的提醒与重新注入的输入放回它那次请求的模型输出前面，本轮提醒
+  // 标为 current；发送形态由 claudeTurnScopedReminders.ts 决定。开关关闭时这里不产生任何标记，内容与原来完全一致。
   const turnScopedReminders = provider === 'claude' && authorityModel.claudeTurnScopedReminders === true;
-  const reminderHistory = turnScopedReminders
-    ? new Map((request.requestAddenda?.turnReminderHistory ?? []).map((entry) => [entry.segmentId, entry]))
-    : undefined;
-  const historyReminderInsertions: Array<{ beforeIndex: number; content: MessageContent }> = [];
+  const reminderHistory = turnScopedReminders ? turnReminderHistoryBySegment(request) : undefined;
+  const historyInsertions: HistoryInsertion[] = [];
   const systemPromptPrefix = typeof authorityModel.systemPromptPrefix === 'string'
     ? authorityModel.systemPromptPrefix
     : '';
@@ -709,15 +715,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     const decoded = decodeMessageContent(item.content, item.contentType);
     if (decoded) {
       const historical = decoded.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
-      if (historical) {
-        historyReminderInsertions.push({
-          beforeIndex: contents.length,
-          content: turnReminderContent(historical.content, {
-            placement: 'history',
-            ...(historical.afterReinjectedInput ? { afterReinjectedInput: true } : {})
-          })
-        });
-      }
+      if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
       contents.push(isolateCrossChannelGptThoughtSignatures(decoded, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
@@ -737,6 +735,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   if (nativeReasoning) {
     contents = appendNativeConfigurationUpdates(contents, nativeReasoning);
   }
+  let tailInputIndex: number | undefined;
   if (currentTurnInput?.reinject) {
     const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
     if (!current || current.role !== 'user') {
@@ -746,8 +745,14 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     if (renderedAttachmentState.currentTurn) {
       reinjected.parts.push(...renderedAttachmentState.currentTurn.parts);
     }
+    tailInputIndex = contents.length;
     contents.push(reinjected);
   }
+  // 窗口里已有这条输入的历史副本：轮内系统消息模式下尾巴副本不再发送（尾巴模式照常发送）。
+  const supersededTailInputIndex = tailInputIndex !== undefined && historyInsertions.some((insertion) =>
+    insertion.input?.messageRevisionId === currentTurnInput?.messageRevisionId)
+    ? tailInputIndex
+    : undefined;
   const turnReminder = request.requestAddenda?.turnReminder;
   if (turnReminder) {
     contents.push({ role: 'user', parts: [{ text: turnReminder.content }] });
@@ -759,11 +764,18 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...(turnReminder ? ['turn_reminder' as const] : [])
   ];
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
+  const projection = projectOrdinaryContentsWithDetachedInputs(
+    contents,
+    canonicalCompressionRanges,
+    modelHandleCatalog,
+    historyInsertions
+  );
   const projectedContents = withTurnReminderMarkers(
-    projectOrdinaryContentsPreservingRanges(contents, canonicalCompressionRanges, modelHandleCatalog),
+    projection.contents,
     contents.length,
-    historyReminderInsertions,
-    turnScopedReminders ? turnReminder?.content : undefined
+    projection.insertions,
+    turnScopedReminders ? turnReminder?.content : undefined,
+    supersededTailInputIndex
   );
   return {
     id: request.modelRequestId,
@@ -816,26 +828,116 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   };
 }
 
+/** 某次历史请求要放回它模型输出前面的内容：先是它重新注入的输入，再是它的提醒。 */
+interface HistoryInsertion {
+  /** 那次请求的模型输出在投影前内容里的位置。 */
+  beforeIndex: number;
+  reminder?: string;
+  input?: { messageRevisionId: string; content: MessageContent };
+}
+
+function turnReminderHistoryBySegment(request: FullProviderRequest): Map<string, TurnReminderHistoryEntry> {
+  return new Map((request.requestAddenda?.turnReminderHistory ?? []).map((entry) => [entry.segmentId, entry]));
+}
+
+/** 按那次请求的原样重建：与本请求的尾巴副本同一个构造（标签 part、冻结原文 parts、那次的附件目录增量）。 */
+function historyInsertion(entry: TurnReminderHistoryEntry, beforeIndex: number): HistoryInsertion {
+  let input: HistoryInsertion['input'];
+  if (entry.reinjectedInput) {
+    const current = decodeFrozenCurrentTurnInput(entry.reinjectedInput.content, entry.reinjectedInput.contentType);
+    if (!current || current.role !== 'user') {
+      throw new TypeError('Historical reinjected Turn input must be a user MessageContent.');
+    }
+    const content = reinjectedCurrentTurnInput(current);
+    if (entry.reinjectedInput.currentTurnAttachmentState) {
+      content.parts.push(...entry.reinjectedInput.currentTurnAttachmentState.parts);
+    }
+    input = { messageRevisionId: entry.reinjectedInput.messageRevisionId, content };
+  }
+  return {
+    beforeIndex,
+    ...(entry.content !== undefined ? { reminder: entry.content } : {}),
+    ...(input ? { input } : {})
+  };
+}
+
 /**
- * 把 Claude 轮内系统消息模式的提醒标记放进已投影的内容：投影逐条一一对应（不增删、不重排），
- * 历史提醒按投影前记下的位置插回那次请求的模型输出前面，本轮提醒（投影前按原来的形态放在最后）换成带标记的同一文本。
+ * 普通投影，外加重新注入输入的历史副本：每个副本用它所在位置之前的托管媒体状态单独投影，与那次请求把它放在尾巴时
+ * 看到的状态相同，所以投影结果逐字节相同；它不写回媒体状态，其余内容的投影与没有副本时（开关关闭、尾巴模式）完全相同。
+ * 副本都在模型输出之前，切分点不会落在一组工具调用与结果之间，也不会落在规范压缩范围里面。
+ */
+function projectOrdinaryContentsWithDetachedInputs(
+  contents: readonly MessageContent[],
+  canonicalRanges: readonly { start: number; end: number }[],
+  modelHandleCatalog: ModelHandleCatalog,
+  insertions: readonly HistoryInsertion[]
+): { contents: MessageContent[]; insertions: HistoryInsertion[] } {
+  const detached = insertions.filter((insertion) => insertion.input);
+  if (detached.length === 0) {
+    return {
+      contents: projectOrdinaryContentsPreservingRanges(contents, canonicalRanges, modelHandleCatalog),
+      insertions: [...insertions]
+    };
+  }
+  const projectedInputs = new Map<number, MessageContent>();
+  const projected = projectOrdinaryContentsPreservingRanges(
+    contents,
+    canonicalRanges,
+    modelHandleCatalog,
+    {
+      cuts: detached.map((insertion) => insertion.beforeIndex),
+      atCut(index, mediaState) {
+        const insertion = detached.find((candidate) => candidate.beforeIndex === index)!;
+        projectedInputs.set(index, projectOrdinaryModelWindow(
+          [insertion.input!.content],
+          modelHandleCatalog,
+          cloneManagedMediaBodyProjectionState(mediaState)
+        ).contents[0]);
+      }
+    }
+  );
+  return {
+    contents: projected,
+    insertions: insertions.map((insertion) => insertion.input
+      ? { ...insertion, input: { ...insertion.input, content: projectedInputs.get(insertion.beforeIndex)! } }
+      : insertion)
+  };
+}
+
+function cloneManagedMediaBodyProjectionState(state: ManagedMediaBodyProjectionState): ManagedMediaBodyProjectionState {
+  return {
+    seenAttachmentMetadata: new Map(state.seenAttachmentMetadata),
+    uniqueBodyCount: state.uniqueBodyCount,
+    suppressedBodyCount: state.suppressedBodyCount
+  };
+}
+
+/**
+ * 把 Claude 轮内系统消息模式的标记放进已投影的内容：投影逐条一一对应（不增删、不重排），
+ * 历史内容按投影前记下的位置插回那次请求的模型输出前面（重新注入的输入在前、提醒在后，与那次请求尾巴的顺序相同），
+ * 本轮提醒（投影前按原来的形态放在最后）换成带标记的同一文本；窗口里已有历史副本的尾巴输入标为 current。
  * 历史提醒不参与投影，工具结果分组与媒体去重与开关关闭时完全相同。
  */
 function withTurnReminderMarkers(
   projected: MessageContent[],
   contentCount: number,
-  insertions: ReadonlyArray<{ beforeIndex: number; content: MessageContent }>,
-  currentReminder: string | undefined
+  insertions: readonly HistoryInsertion[],
+  currentReminder: string | undefined,
+  supersededTailInputIndex?: number
 ): MessageContent[] {
-  if (insertions.length === 0 && currentReminder === undefined) return projected;
+  if (insertions.length === 0 && currentReminder === undefined && supersededTailInputIndex === undefined) return projected;
   if (projected.length !== contentCount) {
     throw new Error('Ordinary Context projection must keep one projected content per input content.');
   }
   const result: MessageContent[] = [];
   let cursor = 0;
   projected.forEach((content, index) => {
-    while (cursor < insertions.length && insertions[cursor].beforeIndex === index) result.push(insertions[cursor++].content);
-    result.push(content);
+    while (cursor < insertions.length && insertions[cursor].beforeIndex === index) {
+      const insertion = insertions[cursor++];
+      if (insertion.input) result.push(markedReinjectedInput(insertion.input.content, 'history'));
+      if (insertion.reminder !== undefined) result.push(turnReminderContent(insertion.reminder, { placement: 'history' }));
+    }
+    result.push(index === supersededTailInputIndex ? markedReinjectedInput(content, 'current') : content);
   });
   if (cursor !== insertions.length) throw new Error('Historical turn reminder lost its model output position.');
   if (currentReminder !== undefined) {
@@ -1314,12 +1416,33 @@ function runtimeContextContent(
 function projectOrdinaryContentsPreservingRanges(
   contents: readonly MessageContent[],
   canonicalRanges: readonly { start: number; end: number }[],
-  modelHandleCatalog: ModelHandleCatalog
+  modelHandleCatalog: ModelHandleCatalog,
+  observer?: {
+    /** Positions (never inside a canonical range) at which the running media state is observed. */
+    cuts: readonly number[];
+    atCut(index: number, mediaState: ManagedMediaBodyProjectionState): void;
+  }
 ): MessageContent[] {
-  if (canonicalRanges.length === 0) {
+  if (canonicalRanges.length === 0 && !observer) {
     return projectOrdinaryModelWindow(contents, modelHandleCatalog).contents;
   }
   const mediaState = createManagedMediaBodyProjectionState();
+  const cuts = [...new Set(observer?.cuts ?? [])].sort((left, right) => left - right);
+  let nextCut = 0;
+  /** Ordinary slices are projected piecewise at observed cuts; the cuts sit before a model content. */
+  const projectOrdinarySlice = (start: number, end: number): MessageContent[] => {
+    const sliceProjection: MessageContent[] = [];
+    let sliceStart = start;
+    while (nextCut < cuts.length && cuts[nextCut] <= end) {
+      const cut = cuts[nextCut++];
+      if (cut < start) throw new RangeError('Detached projection cut falls inside a canonical compression range.');
+      sliceProjection.push(...projectOrdinaryModelWindow(contents.slice(sliceStart, cut), modelHandleCatalog, mediaState).contents);
+      observer!.atCut(cut, mediaState);
+      sliceStart = cut;
+    }
+    sliceProjection.push(...projectOrdinaryModelWindow(contents.slice(sliceStart, end), modelHandleCatalog, mediaState).contents);
+    return sliceProjection;
+  };
   const projected: MessageContent[] = [];
   let cursor = 0;
   for (const range of canonicalRanges) {
@@ -1327,11 +1450,7 @@ function projectOrdinaryContentsPreservingRanges(
       || range.start < cursor || range.end < range.start || range.end > contents.length) {
       throw new RangeError('Canonical compression ranges are invalid or overlapping.');
     }
-    projected.push(...projectOrdinaryModelWindow(
-      contents.slice(cursor, range.start),
-      modelHandleCatalog,
-      mediaState
-    ).contents);
+    projected.push(...projectOrdinarySlice(cursor, range.start));
     // Provider-native Compact output is the canonical next window. Only repeat-media suppression is
     // applied here; tool results and provider-native items are not projected a second time.
     projected.push(...suppressRepeatedManagedMediaBodies(
@@ -1341,11 +1460,8 @@ function projectOrdinaryContentsPreservingRanges(
     ));
     cursor = range.end;
   }
-  projected.push(...projectOrdinaryModelWindow(
-    contents.slice(cursor),
-    modelHandleCatalog,
-    mediaState
-  ).contents);
+  projected.push(...projectOrdinarySlice(cursor, contents.length));
+  if (nextCut !== cuts.length) throw new RangeError('Detached projection cut is outside the projected contents.');
   return projected;
 }
 

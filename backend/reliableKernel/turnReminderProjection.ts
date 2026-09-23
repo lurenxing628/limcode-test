@@ -45,9 +45,23 @@ export function projectTurnReminder(recipe: PlainJsonValue | undefined): TurnRem
   };
 }
 
-/** 那次请求把当前 Turn 输入作为易失尾巴重新注入过：它的提醒原本跟在那条重新注入的输入后面。 */
-export function recipeReinjectedCurrentTurnInput(recipe: PlainJsonValue | undefined): boolean {
-  return isRecord(recipe) && isRecord(recipe.currentTurnInput) && recipe.currentTurnInput.reinject === true;
+/** 那次请求把当前 Turn 输入作为易失尾巴重新注入过的那条输入（冻结在 recipe 里的引用）。 */
+export interface ReinjectedCurrentTurnInputReference {
+  messageRevisionId: string;
+  contentObjectId: string;
+}
+
+/** 那次请求把当前 Turn 输入作为易失尾巴重新注入过：返回那条输入；它的提醒原本跟在那条重新注入的输入后面。 */
+export function recipeReinjectedCurrentTurnInput(
+  recipe: PlainJsonValue | undefined
+): ReinjectedCurrentTurnInputReference | undefined {
+  const current = isRecord(recipe) && isRecord(recipe.currentTurnInput) ? recipe.currentTurnInput : undefined;
+  if (current?.reinject !== true) return undefined;
+  if (typeof current.messageRevisionId !== 'string' || !current.messageRevisionId
+    || typeof current.contentObjectId !== 'string' || !current.contentObjectId) {
+    throw new Error('ModelRequest recipe.currentTurnInput is missing its frozen input reference.');
+  }
+  return { messageRevisionId: current.messageRevisionId, contentObjectId: current.contentObjectId };
 }
 
 /**

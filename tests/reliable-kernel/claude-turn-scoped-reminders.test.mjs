@@ -309,15 +309,15 @@ test('打开后：前一条不是 user（未完成任务检查续写）时提醒
   assert.deepEqual(after.slice(before.length).map((entry) => entry.role), ['assistant', 'user']);
 });
 
-test('发送形态规则：只看前一条非 system 内容；重新注入过的历史提醒在失去原位置时不发送；尾巴模式只留本轮提醒', () => {
+test('发送形态规则：只看前一条已发送的非 system 内容；前一条是模型输出时按 user 消息发出；尾巴模式只留本轮提醒', () => {
   const user = { role: 'user', parts: [{ text: 'u' }] };
   const model = { role: 'model', parts: [{ text: 'm' }] };
   const history = reminders.turnReminderContent('h', { placement: 'history' });
-  const reinjectedHistory = reminders.turnReminderContent('r', { placement: 'history', afterReinjectedInput: true });
+  const afterModel = reminders.turnReminderContent('r', { placement: 'history' });
   const current = reminders.turnReminderContent('c', { placement: 'current' });
-  const contents = [user, history, model, reinjectedHistory, model, user, current];
+  const contents = [user, history, model, afterModel, model, user, current];
   assert.deepEqual(reminders.turnReminderDeliveries(contents, 'claude_turn_scoped'),
-    [undefined, 'system', undefined, 'omitted', undefined, undefined, 'system']);
+    [undefined, 'system', undefined, 'user', undefined, undefined, 'system']);
   assert.deepEqual(reminders.turnReminderDeliveries([model, history, model, current], 'claude_turn_scoped'),
     [undefined, 'user', undefined, 'user']);
   assert.deepEqual(reminders.turnReminderDeliveries(contents, 'tail'),
@@ -331,7 +331,7 @@ test('发送形态规则：只看前一条非 system 内容；重新注入过的
   assert.equal(unified.contents.length, 5);
   const claude = toUnifiedRequest({ id: 'r', contents, tools: [] }, undefined, 'claude', undefined, 'claude_turn_scoped');
   assert.deepEqual(claude.contents.map((content) => content.claudeSystemMessage?.clearAt ?? content.role),
-    ['user', 'next_user_message', 'model', 'model', 'user', 'next_user_message']);
+    ['user', 'next_user_message', 'model', 'user', 'model', 'user', 'next_user_message']);
 });
 
 test('recipe 是提醒文本的唯一来源：同一 recipe 永远生成逐字节相同的提醒', () => {

@@ -126,6 +126,7 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - 渠道默认配置与 LLM 专属配置使用 `claudeTurnScopedReminders`，经现有 `llmProviderConfigs` section 保存；渠道级只在打开时写 `true`（关闭与缺省相同，旧记录逐字节不变），模型级可显式写 `false` 覆盖渠道默认，缺省跟随渠道，与 `nativeResponses` 相同。只对 `provider: 'claude'` 生效，不按模型表限制；打开即表示确认模型与渠道支持。
 - Turn 冻结时仅在 Claude 且打开时写入 `AuthoritySnapshot.model.claudeTurnScopedReminders: true`，并随调用快照 `LlmInvocationSettingsSnapshotRecord.claudeTurnScopedReminders` 下发；关闭或其他 provider 时两处都没有该字段，请求与改动前逐字节一致。
 - 打开后每轮提醒（任务卡、未完成任务检查、运行状态卡）以 `{"role":"system","clear_at":"next_user_message"}` 发送；已发过的提醒从各自 `ModelRequest` 冻结的 recipe 重新生成，原文原位重发（官方 “Re-send cleared messages verbatim”），不新增存储字段。请求头自动合并 `anthropic-beta: mid-conversation-system-clear-at-2026-08-21`（保留已有值，逗号合并去重）。
+- 本 Turn 输入被压缩掉、作为易失尾巴重新注入时，那次请求发出的输入（标签、冻结原文与那次的附件目录增量）同样从它的 recipe 重建，放回那次模型输出与它的提醒之前；同一窗口里同一条输入只放这一次，之后请求的尾巴不再重复它。回退的尾巴模式与关闭时一样，每次请求都在尾巴重新注入。
 - 渠道明确拒绝该格式（`clear_at` 多余字段、不支持 system 角色、位置错误的 400）时，按 `providerConfigId + baseUrl + model` 在本进程内退回原来的尾部 user 提醒并立即重发一次，不占普通重试次数。
 
 ## 5. 前端对接标准

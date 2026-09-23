@@ -16,6 +16,11 @@
  *   这条提醒按原来的尾巴形态作为 user 消息发出——之后的请求按同一规则在同一位置原样重发它，前缀仍然不变。
  * - `tail`：原来的尾巴模式，历史提醒全部不发，本轮提醒作为最后一条 user 消息。开关关闭时内核根本不产生标记，
  *   这里原样返回同一个数组，请求逐字节不变；其他 provider 和网关回退都走这条路径，历史提醒不会以任何形式泄漏过去。
+ *
+ * 重新注入的当前 Turn 输入（压缩掉了本 Turn 输入时，内核把它作为易失尾巴放在提醒前面）同样是发过的历史：
+ * - `claude_turn_scoped`：一次请求把它作为尾巴发出后，之后的请求把那份原文放回那次请求的模型输出前面（提醒之前），
+ *   逐字节重现当时的前缀；同一窗口里它只出现这一次，之后请求的尾巴副本不再发送（标成 current 的 reinjected_input）。
+ * - `tail`：历史副本不发，尾巴副本照常发送，与开关关闭时完全相同。
  */
 import type { MessageContent } from '../../shared/protocol';
 import { isRecord } from './llmStreamEventProjection';
@@ -27,8 +32,11 @@ export const CLAUDE_TURN_SCOPED_SYSTEM_BETA = 'mid-conversation-system-clear-at-
 export interface TurnReminderMarker {
   /** `current`：本请求的提醒；`history`：之前某次请求发过、紧挨在那次请求模型输出之前的提醒。 */
   placement: 'current' | 'history';
-  /** 那次请求把当前 Turn 输入作为易失尾巴重新注入过（提醒原本跟在它后面，这个位置之后不再存在）。 */
-  afterReinjectedInput?: true;
+  /**
+   * 缺省是每轮提醒。`reinjected_input` 是重新注入的当前 Turn 输入：`history` 为某次请求作为尾巴发过的原文，
+   * 放回那次请求的模型输出与它的提醒之前；`current` 为本请求的尾巴副本，只在本窗口已有它的历史副本时才带这个标记。
+   */
+  kind?: 'reinjected_input';
 }
 
 export type TurnReminderContent = MessageContent & { turnReminder: TurnReminderMarker };
@@ -43,16 +51,26 @@ export function turnReminderContent(text: string, marker: TurnReminderMarker): T
   return { role: 'user', parts: [{ text }], turnReminder: { ...marker } };
 }
 
+/** 给已投影的重新注入输入加上标记；parts 原样保留。 */
+export function markedReinjectedInput(
+  content: MessageContent,
+  placement: TurnReminderMarker['placement']
+): TurnReminderContent {
+  return { role: 'user', parts: content.parts, turnReminder: { placement, kind: 'reinjected_input' } };
+}
+
 export function readTurnReminderMarker(content: MessageContent): TurnReminderMarker | undefined {
   const marker = (content as Partial<TurnReminderContent>).turnReminder;
   if (!isRecord(marker)) return undefined;
   if (marker.placement !== 'current' && marker.placement !== 'history') return undefined;
+  if (marker.kind !== undefined && marker.kind !== 'reinjected_input') return undefined;
   return marker as unknown as TurnReminderMarker;
 }
 
 /**
- * 每条提醒的发送形态，按内容顺序计算；只看提醒前面最近一条非 system 内容的角色，
+ * 每条提醒的发送形态，按内容顺序计算；只看提醒前面最近一条已发送的非 system 内容的角色，
  * 因此只取决于那段稳定历史，同一历史每次得到同样的结果。
+ * 重新注入的输入：`claude_turn_scoped` 下历史副本作为 user 消息发送、尾巴副本不发；`tail` 下正好相反。
  */
 export function turnReminderDeliveries(
   contents: readonly MessageContent[],
@@ -69,8 +87,9 @@ export function turnReminderDeliveries(
     }
     let delivery: TurnReminderDelivery;
     if (layout === 'tail') delivery = marker.placement === 'current' ? 'user' : 'omitted';
+    else if (marker.kind === 'reinjected_input') delivery = marker.placement === 'history' ? 'user' : 'omitted';
     else if (previousRole === 'user') delivery = 'system';
-    else delivery = marker.placement === 'history' && marker.afterReinjectedInput ? 'omitted' : 'user';
+    else delivery = 'user';
     deliveries.push(delivery);
     if (delivery === 'user') previousRole = 'user';
   }

@@ -11,6 +11,7 @@ import {
   collectAttachmentCatalogFromStoredItems,
   mergeAttachmentCatalog,
   normalizeAttachmentCatalogState,
+  renderAttachmentCatalogPlacement,
   type AttachmentCatalogState
 } from './attachmentCatalog';
 import {
@@ -31,8 +32,10 @@ import { ContextSequenceControlPlane, type MaterializedContextSegment } from './
 import {
   claudeTurnScopedRemindersEnabled,
   projectTurnReminder,
-  recipeReinjectedCurrentTurnInput
+  recipeReinjectedCurrentTurnInput,
+  type ReinjectedCurrentTurnInputReference
 } from './turnReminderProjection';
+import { modelHandleRef, normalizeModelHandleCatalog } from './modelHandleCatalog';
 import { expandTextCompressionSources } from './compressionSourceReplay';
 import {
   estimateRequestAuthorityTokens,
@@ -165,16 +168,33 @@ export interface FullProviderRequest {
       runningProcessCount: number;
     };
     /**
-     * Claude 轮内系统消息模式（本轮冻结开关打开）才有：之前每次请求发过的提醒，按那次请求冻结的 recipe
-     * 逐字节重新生成，挂在那次请求模型输出所在的 Context 片段上，发送时原样放回它的前面。
+     * Claude 轮内系统消息模式（本轮冻结开关打开）才有：之前每次请求发过、之后仍要原样放回的内容，按那次请求冻结的
+     * recipe 逐字节重新生成，挂在那次请求模型输出所在的 Context 片段上，发送时放回它的前面。
+     * - content：那次请求的提醒；
+     * - reinjectedInput：那次请求作为易失尾巴重新注入的当前 Turn 输入。同一窗口里同一条输入只在第一次出现时带上：
+     *   之后的请求看到它已在窗口里，尾巴不再重发，因此也就没有要放回的副本。
      * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里。
      */
-    turnReminderHistory?: Array<{
-      segmentId: string;
-      content: string;
-      afterReinjectedInput?: true;
-    }>;
+    turnReminderHistory?: TurnReminderHistoryEntry[];
   };
+}
+
+export interface TurnReminderHistoryEntry {
+  segmentId: string;
+  content?: string;
+  reinjectedInput?: {
+    messageRevisionId: string;
+    contentType: string;
+    content: string;
+    /** 那次请求随重新注入的输入一起渲染的本 Turn 附件目录增量（current_turn_delta）。 */
+    currentTurnAttachmentState?: MessageContent;
+  };
+}
+
+/** 一次历史请求要原样放回的内容，只取决于它不可变的 recipe。 */
+interface HistoricalRequestFacts {
+  reminder?: string;
+  reinjectedInput?: ReinjectedCurrentTurnInputReference & { currentTurnAttachmentState?: MessageContent };
 }
 
 export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed' | 'native_control';
@@ -465,7 +485,7 @@ export class ModelProviderControlPlane {
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
-  private readonly historicalTurnReminders = new Map<string, { content: string; afterReinjectedInput: boolean } | null>();
+  private readonly historicalTurnReminders = new Map<string, HistoricalRequestFacts | null>();
   /** Durable Astra steering submissions/receipts; shared with the Agent loop's native session. */
   public readonly nativeSteering: NativeSteeringStore;
   private handoff: ExecutionHandoffError | undefined;
@@ -2236,16 +2256,19 @@ export class ModelProviderControlPlane {
   }
 
   /**
-   * Claude 轮内系统消息模式下，之前每次请求发过的提醒（见 FullProviderRequest.requestAddenda.turnReminderHistory）。
-   * 每条模型输出片段经 ModelRequestMessageLink 找到产生它的 ModelRequest，再从它冻结的 recipe 用同一个
-   * projectTurnReminder 重新生成：重试共用一个 ModelRequest，恢复与重启只读持久事实，fork 复制的请求共用同一个
-   * recipe 对象，压缩掉的片段不在 Context 里；没有模型输出进入 Context 的请求不会被找到。
+   * Claude 轮内系统消息模式下，之前每次请求发过、之后仍要原样放回的内容（见 FullProviderRequest.requestAddenda.turnReminderHistory）。
+   * 每条模型输出片段经 ModelRequestMessageLink 找到产生它的 ModelRequest，再从它冻结的 recipe 重新生成：提醒用同一个
+   * projectTurnReminder，重新注入的输入读 recipe 冻结的那条输入与附件目录增量。重试共用一个 ModelRequest，恢复与重启只读
+   * 持久事实，fork 复制的请求共用同一个 recipe 对象，压缩掉的片段不在 Context 里；没有模型输出进入 Context 的请求不会被找到。
+   *
+   * 重新注入的输入在一个窗口里只放回第一次：那次请求的尾巴带着它，之后的请求看到窗口里已有它（本方法同样的判断），
+   * 尾巴不再重发。这个判断只看本窗口里排在前面的片段，也就是之后那些请求各自的窗口，所以每次得到同样的结果。
    */
   private async materializeTurnReminderHistory(
     authority: PlainJsonValue,
     recipe: PlainJsonValue,
     segments: readonly MaterializedContextSegment[]
-  ): Promise<NonNullable<FullProviderRequest['requestAddenda']>['turnReminderHistory']> {
+  ): Promise<TurnReminderHistoryEntry[] | undefined> {
     if (!isRecord(recipe) || recipe.kind !== 'reliable-agent-turn' || !claudeTurnScopedRemindersEnabled(authority)) {
       return undefined;
     }
@@ -2253,40 +2276,81 @@ export class ModelProviderControlPlane {
       && segment.messageRole === 'model'
       && typeof segment.sourceRecipeObjectId === 'string');
     if (sources.length === 0) return undefined;
-    const missing = [...new Set(sources.map((segment) => segment.sourceRecipeObjectId as string))]
-      .filter((id) => !this.historicalTurnReminders.has(id));
+    // 本次用到的结果放在局部表里：缓存有界，边读边淘汰不能让某一条提醒悄悄消失。
+    const facts = new Map<string, HistoricalRequestFacts | null>();
+    const missing: string[] = [];
+    for (const id of new Set(sources.map((segment) => segment.sourceRecipeObjectId as string))) {
+      const cached = this.historicalTurnReminders.get(id);
+      if (cached === undefined) missing.push(id);
+      else facts.set(id, cached);
+    }
     for (let offset = 0; offset < missing.length; offset += HISTORICAL_REMINDER_READ_BATCH) {
       const ids = missing.slice(offset, offset + HISTORICAL_REMINDER_READ_BATCH);
       const snapshot = await this.database.snapshot(ids.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
       const metadata = snapshot.snapshot.map((row, index) => requireRow(row, `ModelRequest recipe ContentObject ${ids[index]}`));
       const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
       ids.forEach((id, index) => {
-        const historical = parsePlainJson(bytes[index], `ModelRequest recipe ${id}`);
-        const reminder = projectTurnReminder(historical);
-        this.rememberHistoricalTurnReminder(id, reminder
-          ? { content: reminder.content, afterReinjectedInput: recipeReinjectedCurrentTurnInput(historical) }
-          : null);
+        const historical = historicalRequestFacts(parsePlainJson(bytes[index], `ModelRequest recipe ${id}`), id);
+        facts.set(id, historical);
+        this.rememberHistoricalTurnReminder(id, historical);
       });
     }
-    const history: NonNullable<NonNullable<FullProviderRequest['requestAddenda']>['turnReminderHistory']> = [];
+    const placedInputs = new Set<string>();
+    const planned: Array<{ segmentId: string; reminder?: string; input?: HistoricalRequestFacts['reinjectedInput'] }> = [];
     for (const segment of sources) {
-      const reminder = this.historicalTurnReminders.get(segment.sourceRecipeObjectId as string);
-      if (!reminder) continue;
-      history.push({
+      const historical = facts.get(segment.sourceRecipeObjectId as string);
+      if (!historical) continue;
+      const input = historical.reinjectedInput && !placedInputs.has(historical.reinjectedInput.messageRevisionId)
+        ? historical.reinjectedInput
+        : undefined;
+      if (input) placedInputs.add(input.messageRevisionId);
+      if (historical.reminder === undefined && !input) continue;
+      planned.push({
         segmentId: segment.segmentId,
-        content: reminder.content,
-        ...(reminder.afterReinjectedInput ? { afterReinjectedInput: true as const } : {})
+        ...(historical.reminder !== undefined ? { reminder: historical.reminder } : {}),
+        ...(input ? { input } : {})
       });
     }
-    return history.length > 0 ? history : undefined;
+    if (planned.length === 0) return undefined;
+    const inputObjectIds = [...new Set(planned.flatMap((entry) => entry.input ? [entry.input.contentObjectId] : []))];
+    const inputs = new Map<string, { contentType: string; content: string }>();
+    if (inputObjectIds.length > 0) {
+      const snapshot = await this.database.snapshot(inputObjectIds.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
+      const metadata = snapshot.snapshot.map((row, index) =>
+        requireRow(row, `Reinjected current Turn input ContentObject ${inputObjectIds[index]}`));
+      const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
+      inputObjectIds.forEach((id, index) => inputs.set(id, {
+        contentType: requireText(metadata[index].content_type, 'Reinjected current Turn input ContentObject.content_type'),
+        content: decodeUtf8Exact(bytes[index], `Reinjected current Turn input ${id}`)
+      }));
+    }
+    return planned.map((entry) => {
+      const input = entry.input ? inputs.get(entry.input.contentObjectId) : undefined;
+      return {
+        segmentId: entry.segmentId,
+        ...(entry.reminder !== undefined ? { content: entry.reminder } : {}),
+        ...(entry.input && input
+          ? {
+              reinjectedInput: {
+                messageRevisionId: entry.input.messageRevisionId,
+                contentType: input.contentType,
+                content: input.content,
+                ...(entry.input.currentTurnAttachmentState
+                  ? { currentTurnAttachmentState: entry.input.currentTurnAttachmentState }
+                  : {})
+              }
+            }
+          : {})
+      };
+    });
   }
 
   /** recipe 是不可变的内容寻址对象，按对象 id 缓存生成结果；有界，超出时淘汰最早的条目。 */
   private rememberHistoricalTurnReminder(
     recipeObjectId: string,
-    reminder: { content: string; afterReinjectedInput: boolean } | null
+    facts: HistoricalRequestFacts | null
   ): void {
-    this.historicalTurnReminders.set(recipeObjectId, reminder);
+    this.historicalTurnReminders.set(recipeObjectId, facts);
     while (this.historicalTurnReminders.size > HISTORICAL_REMINDER_CACHE_LIMIT) {
       const oldest = this.historicalTurnReminders.keys().next().value;
       if (oldest === undefined) break;
@@ -2718,9 +2782,39 @@ function estimateFullProviderContextFallback(request: FullProviderRequest): numb
 const HISTORICAL_REMINDER_READ_BATCH = 200;
 const HISTORICAL_REMINDER_CACHE_LIMIT = 4096;
 
+/**
+ * 一次历史请求要原样放回的内容：它的提醒，以及它作为易失尾巴重新注入的当前 Turn 输入（连同那次一起渲染的
+ * current_turn_delta 附件目录，用那次 recipe 冻结的附件目录与模型句柄，与当时 llmCapabilityProviderAdapter 渲染的逐字节相同）。
+ */
+function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string): HistoricalRequestFacts | null {
+  const reminder = projectTurnReminder(recipe)?.content;
+  const input = recipeReinjectedCurrentTurnInput(recipe);
+  if (reminder === undefined && !input) return null;
+  let currentTurnAttachmentState: MessageContent | undefined;
+  if (input && isRecord(recipe)) {
+    const state = normalizeAttachmentCatalogState(
+      recipe.attachmentCatalogState,
+      `ModelRequest recipe ${recipeObjectId}.attachmentCatalogState`
+    );
+    const delta = state.placements.find((placement) => placement.kind === 'current_turn_delta');
+    if (delta) {
+      const handles = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+      currentTurnAttachmentState = renderAttachmentCatalogPlacement(delta, (entry) => {
+        const ref = modelHandleRef(handles, 'attachment', entry.attachmentId);
+        if (!ref) throw new Error(`Attachment ${entry.attachmentId} has no frozen model handle.`);
+        return ref;
+      });
+    }
+  }
+  return {
+    ...(reminder !== undefined ? { reminder } : {}),
+    ...(input ? { reinjectedInput: { ...input, ...(currentTurnAttachmentState ? { currentTurnAttachmentState } : {}) } } : {})
+  };
+}
+
 function withTurnReminderHistory(
   addenda: Pick<FullProviderRequest, 'requestAddenda'>,
-  history: NonNullable<FullProviderRequest['requestAddenda']>['turnReminderHistory']
+  history: TurnReminderHistoryEntry[] | undefined
 ): Pick<FullProviderRequest, 'requestAddenda'> {
   if (!history) return addenda;
   return { requestAddenda: { ...addenda.requestAddenda, turnReminderHistory: history } };
