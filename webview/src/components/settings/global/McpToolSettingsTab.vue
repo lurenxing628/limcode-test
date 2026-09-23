@@ -47,6 +47,8 @@ const mcpToolsBySource = computed(() => {
 const globalPolicy = computed(() => toolPolicyStore.effectivePolicyFor('global').policy);
 /** A hand-edited global list the backend refuses to compile; switches here would rewrite it. */
 const globalListInvalid = computed(() => !!toolPolicyStore.toolListErrorFor('global'));
+/** A hand-edited global source entry that turns its server off; a tool switch here rewrites it. */
+const globalSourceError = computed(() => toolPolicyStore.sourceConfigErrorFor('global'));
 const renameServer = computed(() => settings.mcpServers.servers.find((server) => server.id === renameServerId.value));
 const deleteServer = computed(() => settings.mcpServers.servers.find((server) => server.id === deleteServerId.value));
 const mcpBusy = computed(() => loading.value || settings.pendingSettingsSections.mcpServers === true || clientState.mcpToolSources.some((source) => source.status === 'connecting'));
@@ -317,6 +319,7 @@ function toolParametersText(tool: ToolDefinitionRecord): string {
                 <small>{{ toolsForServer(server.id).length }} 个工具，开关写入全局默认工具策略。</small>
               </header>
               <p v-if="globalListInvalid" class="mcp-error" role="alert">全局保存的工具列表无效，重置前不能在这里修改工具开关；请到「工具」页用「继承默认」重置全局工具列表。</p>
+              <p v-if="globalSourceError?.sourceId === server.id" class="mcp-error" role="alert">全局保存的这个服务的来源设置无效，服务按关闭处理；在下方勾选工具，或到「工具」页重新勾选这个服务，即可改写为有效设置。</p>
               <p v-if="toolsForServer(server.id).length === 0" class="mcp-empty">连接成功，但没有发现工具。</p>
               <article v-for="tool in toolsForServer(server.id)" :key="tool.name" class="mcp-tool-item">
                 <div class="mcp-tool-row">

@@ -885,6 +885,64 @@ server.connect(new StdioServerTransport());
       }
     });
 
+    await t.test('写坏的 disabledTools 或 enabledTools 让该服务按关闭处理：不拆成单个字符放行，不报成工具列表无效，设置页指出字段并能修复', async () => {
+      const { default: workflowTab } = await server.ssrLoadModule('/src/components/settings/workflow/WorkflowEditorTab.vue');
+      const gh = (original) => ({ ...mcpTool, name: `gh_${original}`, description: original, source: { kind: 'mcp', sourceId: 'gh', originalToolName: original } });
+      const [search, remove] = ['search_code', 'delete_file'].map(gh);
+      const alert = (html) => html.match(/<p class="tool-policy-error"[^>]*role="alert"[^>]*>([^<]*)<\/p>/)?.[1];
+      for (const [scopeKind, scopeId, label] of [['workflow', 'wf', '此范围'], ['global', undefined, '此范围']]) {
+        for (const [field, malformed] of [['disabledTools', 'gh_delete_file'], ['disabledTools', 5], ['disabledTools', {}], ['disabledTools', [1]], ['enabledTools', 'search_code'], ['disabledTools', null]]) {
+          const { client, feed, store, bindings, render, messages } = fresh([...allDefinitions, search, remove]);
+          client.mcpToolSources = [{ id: 'gh', name: 'GitHub', transportKind: 'stdio', status: 'connected', toolCount: 2 }];
+          const policyId = scopeKind === 'global' ? 'tool-policy:global:global' : 'raw';
+          client.toolPolicies = [{ id: policyId, name: 'Raw', sourceConfigs: { gh: { enabled: true, [field]: malformed } } }];
+          client.toolPolicyScopeLinks = [{ id: `${policyId}-link`, scopeKind, ...(scopeId ? { scopeId } : {}), toolPolicyId: policyId, role: 'active', createdAt: 1, updatedAt: 1 }];
+          const what = `${scopeKind} ${field}=${JSON.stringify(malformed)}`;
+          let page = await bindings(toolEditor, { scopeKind, scopeId });
+          assert.deepEqual([page.isToolEnabled(store.toolDefinitions.find((tool) => tool.name === search.name)), page.isToolEnabled(store.toolDefinitions.find((tool) => tool.name === remove.name))],
+            [false, false], `${what}: the whole source is off`);
+          assert.equal(store.toolListErrorFor(scopeKind, scopeId), undefined, `${what}: not reported as an invalid tool list`);
+          const text = alert(await render(toolEditor, { scopeKind, scopeId }));
+          assert.match(text ?? '', new RegExp(`${label}保存的 MCP 服务「GitHub」的来源设置无效：${field} 必须是工具名数组`), what);
+          assert.match(text, /重新勾选这个服务/, `${what}: the note offers a repair`);
+          // Saving another setting keeps the fail-closed meaning instead of rewriting the value into characters.
+          page.updateGateSetting(store.toolDefinitions.find((tool) => tool.name === 'read_file'), 'autoApproveExecution', false);
+          assert.deepEqual(messages.at(-1).payload.sourceConfigs, { gh: { enabled: false } }, what);
+          // The source switch at that scope repairs it.
+          page = await bindings(toolEditor, { scopeKind, scopeId });
+          page.toggleMcpSource('gh', true);
+          assert.deepEqual(messages.at(-1).payload.sourceConfigs, { gh: { enabled: true } });
+          assert.equal(alert(await render(toolEditor, { scopeKind, scopeId })), undefined, `${what}: repaired`);
+          // A scope below names the layer to repair.
+          if (scopeKind === 'global') {
+            client.toolPolicies = [{ id: policyId, name: 'Raw', sourceConfigs: { gh: { enabled: true, [field]: malformed } } }];
+            feed.records = { AgentConversationLink: { link: { id: 'link', conversation_id: 'below', agent_id: 'agent:custom', role: 'default' } } };
+            assert.match(alert(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'below' })) ?? '', new RegExp(`全局保存的 MCP 服务「GitHub」的来源设置无效：${field}`));
+          }
+        }
+      }
+
+      // The raw workflow editor refuses such a value and names the field; nothing is sent.
+      const { client, messages, bindings } = fresh([...allDefinitions, search, remove]);
+      client.workflows = [{ id: 'wf', name: 'W', source: 'user', createdAt: 1, updatedAt: 1 }];
+      for (const [sourceConfigs, message] of [
+        [{ gh: { enabled: true, disabledTools: 'gh_delete_file' } }, /toolPolicies\[0\]\.sourceConfigs\.gh\.disabledTools 必须是工具名数组/],
+        [{ gh: { enabled: true, enabledTools: [1] } }, /toolPolicies\[0\]\.sourceConfigs\.gh\.enabledTools 必须是工具名数组/],
+        [{ gh: { enabled: 'yes' } }, /toolPolicies\[0\]\.sourceConfigs\.gh\.enabled 必须是 true 或 false/],
+        [{ gh: null }, /toolPolicies\[0\]\.sourceConfigs\.gh 必须是对象/],
+        [[], /toolPolicies\[0\]\.sourceConfigs 省略时不设置 MCP 服务；填写时必须是以服务 id 为键的对象/]
+      ]) {
+        const tab = await bindings(workflowTab, {});
+        const raw = JSON.parse(tab.rawText);
+        raw.toolPolicies = [{ id: 'raw', name: 'Raw', sourceConfigs }];
+        tab.rawText = JSON.stringify(raw);
+        const before = messages.length;
+        tab.saveRawWorkflow();
+        assert.match(tab.rawError, message);
+        assert.equal(messages.length, before, 'nothing is saved');
+      }
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只提供读取类对话工具，也不写工具列表', async () => {
       const { client, store, render, messages } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;

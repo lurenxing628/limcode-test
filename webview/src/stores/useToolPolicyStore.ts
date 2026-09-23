@@ -21,7 +21,9 @@ import {
   mcpSourceAdmits,
   mcpSourceConfigFor,
   mcpToolIdentity,
+  readSourceConfig,
   resolveToolPolicyLayers,
+  sourceConfigEntryProblem,
   toolAllowedByPolicy,
   toolPolicyScopeLayer,
   type ToolPolicyLayer
@@ -64,6 +66,17 @@ export interface CrossConversationState {
 interface ScopeRef {
   scopeKind: ToolPolicyScopeKind;
   scopeId?: string;
+}
+
+/** A stored MCP source entry on a scope's chain whose value turns that source off. */
+export interface SourceConfigError {
+  scopeKind: ToolPolicyScopeKind;
+  scopeId?: string;
+  sourceId: string;
+  /** True when the entry is the scope's own, which its source switch rewrites. */
+  own: boolean;
+  /** Chinese text for the settings page: the field, the effect and where to repair it. */
+  text: string;
 }
 
 /** A stored tool list on a scope's chain that the backend refuses to compile. */
@@ -126,8 +139,9 @@ function cloneToolConfigs(toolConfigs: Record<string, ToolPolicyToolConfigRecord
 }
 
 /**
- * Plain source settings for a save. A hand-edited entry that is not an object never applied to its
- * source and is dropped, except the all-sources key, which keeps its fail-closed deny.
+ * Plain source settings for a save, as the policy reads them. A hand-edited entry that is not an
+ * object never applied to its source and is dropped, except the all-sources key, which keeps its
+ * fail-closed deny; an entry with malformed tool lists is saved as the disabled source it reads as.
  */
 export function cloneSourceConfigs(sourceConfigs: Record<string, ToolPolicySourceConfigRecord> | undefined): Record<string, ToolPolicySourceConfigRecord> | undefined {
   if (!sourceConfigs) return undefined;
@@ -137,10 +151,11 @@ export function cloneSourceConfigs(sourceConfigs: Record<string, ToolPolicySourc
       if (sourceId.trim() === TOOL_POLICY_ALL_MCP_SOURCES) cloned[sourceId] = { enabled: false };
       continue;
     }
+    const read = readSourceConfig(record as unknown as Record<string, unknown>);
     cloned[sourceId] = {
-      enabled: record.enabled === true,
-      ...(record.enabledTools ? { enabledTools: [...record.enabledTools] } : {}),
-      ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})
+      enabled: read.enabled,
+      ...(read.enabledTools ? { enabledTools: [...read.enabledTools] } : {}),
+      ...(read.disabledTools?.length ? { disabledTools: [...read.disabledTools] } : {})
     };
   }
   return cloned;
@@ -323,6 +338,29 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
           }
           const label = this.scopeLabel(scope);
           return { ...scope, own: false, text: `${label}保存的工具列表无效：${detail}此范围的对话都无法开始。重置前不能在这里修改工具开关，请到${label}的工具设置里重置。` };
+        }
+      }
+      return undefined;
+    },
+    /**
+     * The first MCP source entry on this scope's chain (upper layers, then the scope itself) that a
+     * hand edit left malformed, for example a `disabledTools` that is not a list. The policy reads it
+     * as a disabled source; the source switch at the scope that saved it rewrites it.
+     */
+    sourceConfigErrorFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): SourceConfigError | undefined {
+      const own = { scopeKind, scopeId: scopeIdFor(scopeKind, scopeId) };
+      for (const scope of [...this.upperScopesFor(scopeKind, scopeId), own]) {
+        const saved: unknown = this.localPolicyFor(scope.scopeKind, scope.scopeId).policy?.sourceConfigs;
+        if (!saved || typeof saved !== 'object' || Array.isArray(saved)) continue;
+        for (const [sourceId, entry] of Object.entries(saved as Record<string, unknown>)) {
+          if (sourceId.trim() === TOOL_POLICY_ALL_MCP_SOURCES || !entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+          const problem = sourceConfigEntryProblem(entry as Record<string, unknown>);
+          if (!problem) continue;
+          const name = useClientStateStore().mcpToolSources.find((source) => source.id === sourceId)?.name ?? sourceId;
+          const detail = `MCP 服务「${name}」的来源设置无效：${problem}`;
+          return scope === own
+            ? { ...scope, sourceId, own: true, text: `此范围保存的 ${detail}该服务按关闭处理。在下方「MCP 服务」里重新勾选这个服务即可改写为有效设置。` }
+            : { ...scope, sourceId, own: false, text: `${this.scopeLabel(scope)}保存的 ${detail}该服务在此范围按关闭处理；请到${this.scopeLabel(scope)}的工具设置里重新勾选这个服务。` };
         }
       }
       return undefined;

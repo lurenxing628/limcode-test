@@ -984,10 +984,25 @@ test('内置只读范围的全来源拒绝不被该范围保存的全来源值�
     assert.deepEqual(policy.sourceConfigs[ALL], { enabled: false });
   }
 
-  // The same through saved records and the Turn compile, as the raw workflow editor or a hand edit writes them.
+  // The same through saved records and the Turn compile, as a hand edit writes them (saves refuse such values).
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-readonly-mcp-'));
   try {
-    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(vscode.Uri.file(root)));
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    /** Saves a record for the scope, then hand-edits its source settings in the record file. */
+    const handEditSourceConfigs = async (scopeKind, scopeId, sourceConfigs) => {
+      await authority.mutations.setToolPolicy({ scopeKind, scopeId, sourceConfigs: {} });
+      const state = await authority.configurationClientState();
+      const policyId = state.toolPolicyScopeLinks.find((link) => link.scopeKind === scopeKind && link.scopeId === scopeId).toolPolicyId;
+      const recordsRoot = path.join(paths.toolPoliciesRootPath, 'records');
+      for (const file of await fs.readdir(recordsRoot)) {
+        const saved = JSON.parse(await fs.readFile(path.join(recordsRoot, file), 'utf8'));
+        if (saved.toolPolicy?.id !== policyId) continue;
+        await fs.writeFile(path.join(recordsRoot, file), JSON.stringify({ ...saved, toolPolicy: { ...saved.toolPolicy, sourceConfigs } }));
+        return;
+      }
+      assert.fail(`no record file for ${policyId}`);
+    };
     const provider = { ...createDefaultLlmProviderConfig({ name: 'Readonly MCP Provider' }), id: 'provider:readonly-mcp',
       model: 'model:readonly-mcp', models: [{ id: 'model:readonly-mcp', name: '模型' }], modelConfigs: [] };
     await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
@@ -999,8 +1014,8 @@ test('内置只读范围的全来源拒绝不被该范围保存的全来源值�
       conversationId, turnId: `turn:${conversationId}:${turn++}`, executorAgentId, intentKind: 'input'
     })).authoritySnapshot.content).toolPolicy;
     for (const value of savedValues) {
-      await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: 'explore', sourceConfigs: { [ALL]: value } });
-      await authority.mutations.setToolPolicy({ scopeKind: 'workflow', scopeId: 'builtin:readonly', sourceConfigs: { [ALL]: value } });
+      await handEditSourceConfigs('agent', 'explore', { [ALL]: value });
+      await handEditSourceConfigs('workflow', 'builtin:readonly', { [ALL]: value });
       assert.equal(toolAllowedByPolicy(await compile('explore', 'conversation:explore'), tool('exa')), false, `Explore saved '*' ${JSON.stringify(value)}`);
       assert.equal(toolAllowedByPolicy(await compile('main', 'conversation:readonly'), tool('exa')), false, `readonly workflow saved '*' ${JSON.stringify(value)}`);
     }
@@ -1070,6 +1085,56 @@ test('整条链都没有工具列表时以默认工具集为底，自定义 Agen
       await fs.writeFile(globalFile[0], JSON.stringify({ ...original, toolPolicy: { ...original.toolPolicy, allowedTools: malformed } }));
       await assert.rejects(compile(custom.id, 'conversation:custom'), /allowedTools/, `stored allowedTools ${JSON.stringify(malformed)} must fail closed`);
       await assert.rejects(compile('main', 'conversation:main'), /allowedTools/);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('写坏的来源设置让该 MCP 服务按关闭处理而不让编译失败；保存时拒绝并指出字段', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-malformed-source-'));
+  try {
+    const { toolAllowedByPolicy } = require('../../dist/extension/shared/toolPolicyResolution.js');
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Malformed Source Provider' }),
+      id: 'provider:malformed-source', model: 'model:malformed-source',
+      models: [{ id: 'model:malformed-source', name: '模型' }], modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    let turn = 0;
+    const compile = async () => JSON.parse((await authority.compile({
+      conversationId: 'conversation:main', turnId: `turn:malformed:${turn++}`, executorAgentId: 'main', intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+    const tool = (sourceId, original) => ({ name: `${sourceId}_${original}`, source: { kind: 'mcp', sourceId, originalToolName: original } });
+
+    // A save never stores such a value, and the error names the field.
+    for (const [sourceConfigs, message] of [
+      [{ gh: { enabled: true, disabledTools: 'gh_delete_file' } }, /sourceConfigs\.gh\.disabledTools 必须是工具名数组/],
+      [{ gh: { enabled: true, enabledTools: [1] } }, /sourceConfigs\.gh\.enabledTools 必须是工具名数组/],
+      [{ gh: { enabled: 'yes' } }, /sourceConfigs\.gh\.enabled 必须是 true 或 false/],
+      [{ gh: 5 }, /sourceConfigs\.gh 必须是对象/],
+      [{ '*': 'x' }, /sourceConfigs\.\* 必须是对象/]
+    ]) {
+      await assert.rejects(authority.mutations.setToolPolicy({ scopeKind: 'workflow', scopeId: 'wf', sourceConfigs }), message, JSON.stringify(sourceConfigs));
+    }
+    assert.equal((await authority.configurationClientState()).toolPolicyScopeLinks.some((link) => link.scopeKind === 'workflow'), false);
+
+    // A hand-edited record: the source turns off, the Turn still compiles, and other sources keep working.
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', sourceConfigs: { gh: { enabled: true }, exa: { enabled: true } } });
+    const recordsRoot = path.join(paths.toolPoliciesRootPath, 'records');
+    const [file] = (await fs.readdir(recordsRoot)).map((name) => path.join(recordsRoot, name));
+    const original = JSON.parse(await fs.readFile(file, 'utf8'));
+    for (const [field, malformed] of [['disabledTools', 'gh_delete_file'], ['disabledTools', 5], ['disabledTools', {}], ['disabledTools', [1]], ['disabledTools', null], ['enabledTools', 'search']]) {
+      await fs.writeFile(file, JSON.stringify({ ...original, toolPolicy: { ...original.toolPolicy,
+        sourceConfigs: { ...original.toolPolicy.sourceConfigs, gh: { enabled: true, [field]: malformed } } } }));
+      const policy = await compile();
+      const what = `${field}=${JSON.stringify(malformed)}`;
+      assert.equal(toolAllowedByPolicy(policy, tool('gh', 'delete_file')), false, what);
+      assert.equal(toolAllowedByPolicy(policy, tool('gh', 'search')), false, `${what}: the whole source is off`);
+      assert.equal(toolAllowedByPolicy(policy, tool('exa', 'search')), true);
     }
   } finally {
     await fs.rm(root, { recursive: true, force: true });

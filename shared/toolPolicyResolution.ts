@@ -181,16 +181,57 @@ export function toolConfigFor<T>(toolConfigs: Readonly<Record<string, T>> | unde
 export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): ToolPolicySourceConfigRecord | undefined {
   if (!isPlainRecord(sourceConfigs)) return undefined;
   const config = sourceConfigs[sourceId] ?? sourceConfigs[TOOL_POLICY_ALL_MCP_SOURCES];
-  if (!isPlainRecord(config)) return undefined;
+  return isPlainRecord(config) ? readSourceConfig(config) : undefined;
+}
+
+/**
+ * One stored source entry as the policy reads it. An `enabledTools` or `disabledTools` that is
+ * present but not a list of tool names turns the whole source off, as a malformed all-sources
+ * value denies: it never splits a string into characters and never breaks the compile.
+ */
+export function readSourceConfig(entry: Readonly<Record<string, unknown>>): ToolPolicySourceConfigRecord {
+  const { enabledTools, disabledTools } = entry;
+  if ((enabledTools !== undefined && !isNameList(enabledTools)) || (disabledTools !== undefined && !isNameList(disabledTools))) {
+    return { enabled: false };
+  }
   return {
-    enabled: config.enabled === true,
-    ...(Array.isArray(config.enabledTools)
-      ? { enabledTools: config.enabledTools.filter((name): name is string => typeof name === 'string') }
-      : {}),
-    ...(Array.isArray(config.disabledTools)
-      ? { disabledTools: config.disabledTools.filter((name): name is string => typeof name === 'string') }
-      : {})
+    enabled: entry.enabled === true,
+    ...(enabledTools !== undefined ? { enabledTools: uniqueNames(enabledTools) } : {}),
+    ...(disabledTools !== undefined ? { disabledTools: uniqueNames(disabledTools) } : {})
   };
+}
+
+/**
+ * The first problem in the source settings a save would store, as `sourceConfigs.<source id>.<field>`
+ * followed by Chinese text, or undefined. The settings mutation and the raw workflow editor refuse
+ * such values; one already stored reads as a disabled source (`readSourceConfig`).
+ */
+export function sourceConfigsProblem(sourceConfigs: unknown): string | undefined {
+  if (sourceConfigs === undefined) return undefined;
+  if (!isPlainRecord(sourceConfigs)) return 'sourceConfigs 省略时不设置 MCP 服务；填写时必须是以服务 id 为键的对象。';
+  for (const [sourceId, entry] of Object.entries(sourceConfigs)) {
+    const field = `sourceConfigs.${sourceId}`;
+    if (!isPlainRecord(entry)) return `${field} 必须是对象。`;
+    const problem = sourceConfigEntryProblem(entry);
+    if (problem) return `${field}.${problem}`;
+  }
+  return undefined;
+}
+
+/** What is wrong with one stored source entry, as `<field> ...`, or undefined. */
+export function sourceConfigEntryProblem(entry: Readonly<Record<string, unknown>>): string | undefined {
+  if (typeof entry.enabled !== 'boolean') return 'enabled 必须是 true 或 false。';
+  for (const key of ['enabledTools', 'disabledTools'] as const) {
+    const value = entry[key];
+    if (value !== undefined && !(isNameList(value) && value.every((name) => name.trim()))) {
+      return `${key} 必须是工具名数组（服务自己给工具起的名字）。`;
+    }
+  }
+  return undefined;
+}
+
+function isNameList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((name) => typeof name === 'string');
 }
 
 /**
@@ -360,7 +401,8 @@ function mergeToolConfigs(
 /**
  * Merges one layer's MCP source settings. An all-sources entry only denies: every source this layer
  * does not enable itself turns off, and later layers cannot turn it back on (it stays the fallback
- * for sources they name). A stored all-sources value that is not an object fails closed as a deny.
+ * for sources they name). A stored all-sources value that is not an object fails closed as a deny,
+ * and so does a source entry whose tool lists are malformed (`readSourceConfig`).
  * The layer's own source entries then apply over what earlier layers left, so they re-enable
  * nothing an ancestor denied: disables add up and `enabledTools` allowlists intersect.
  */
@@ -373,8 +415,8 @@ function mergeSourceConfigs(
     if (sourceId === TOOL_POLICY_ALL_MCP_SOURCES && !isPlainRecord(incoming)) {
       return [[sourceId, { enabled: false } as ToolPolicySourceConfigRecord] as const];
     }
-    return sourceId && incoming && typeof incoming === 'object' && !Array.isArray(incoming)
-      ? [[sourceId, incoming] as const]
+    return sourceId && isPlainRecord(incoming)
+      ? [[sourceId, readSourceConfig(incoming)] as const]
       : [];
   });
   const ancestors = { ...target };

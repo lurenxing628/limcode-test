@@ -12,6 +12,7 @@ import type {
   WorkflowIconKey,
   WorkflowRecord
 } from '@shared/protocol';
+import { sourceConfigsProblem } from '@shared/toolPolicyResolution';
 import { useWorkflowStore, workflowRecordToPlain } from '@webview/stores/useWorkflowStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -254,6 +255,8 @@ function isValidToolPolicy(policy: ToolPolicyRecord): boolean {
   if (policy.preset !== undefined && policy.preset !== 'inherit' && policy.preset !== 'custom' && policy.preset !== 'yolo') {
     return setRawError('toolPolicies[0].preset 只能是 inherit / custom / yolo。');
   }
+  const sourceProblem = sourceConfigsProblem(policy.sourceConfigs);
+  if (sourceProblem) return setRawError(`toolPolicies[0].${sourceProblem}`);
   return true;
 }
 

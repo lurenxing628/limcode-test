@@ -81,6 +81,8 @@ const visibleTools = computed(() => {
 const visibleEnabledCount = computed(() => visibleTools.value.filter((tool) => isToolEnabled(tool)).length);
 /** A stored tool list on this scope's chain that the backend refuses to compile. */
 const listError = computed(() => store.toolListErrorFor(props.scopeKind, props.scopeId));
+/** A hand-edited MCP source entry on this scope's chain that turns its source off. */
+const sourceError = computed(() => store.sourceConfigErrorFor(props.scopeKind, props.scopeId));
 /** A child task's conversation: the cross-conversation tools are never offered there. */
 const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
 /** Where the cross-conversation switch lives for this scope. */
@@ -554,6 +556,7 @@ function inputNumber(event: Event): number {
     </header>
 
     <p v-if="listError" class="tool-policy-error" role="alert">{{ listError.text }}</p>
+    <p v-if="sourceError" class="tool-policy-error" role="alert">{{ sourceError.text }}</p>
 
     <section v-if="interactionApprovalTools.length > 0" class="tool-policy-preset-section interaction-auto-approval" aria-label="无人值守审批">
       <div class="tool-policy-preset-heading">

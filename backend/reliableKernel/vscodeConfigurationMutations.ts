@@ -1,6 +1,7 @@
 ﻿import { createStorageRevision } from '../capabilities/vscodeStorage/storageRevision';
 import type { ChatModelOverrideRecord, ModelProfileScopeMutationReceipt, ModelProfileScopeSnapshotPayload, ModelProfileScopeReadPayload, SessionThinkingOverride, SystemPromptScopeSetPayload } from '../../shared/protocol';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
+import { sourceConfigsProblem } from '../../shared/toolPolicyResolution';
 import { loadScopedModelProfiles } from './scopedModelProfiles';
 import { validateSessionThinkingOverride } from '../../shared/sessionThinking';
 import { compatibleChildThinkingOverride } from './childThinkingInheritance';
@@ -560,6 +561,9 @@ export class VscodeConfigurationMutations {
 
   public setToolPolicy(payload: ToolPolicyScopeSetPayload): Promise<void> {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
+    // Refuse source settings the policy would only read as a disabled source, naming the field.
+    const sourceProblem = sourceConfigsProblem(payload.sourceConfigs);
+    if (sourceProblem) return Promise.reject(new TypeError(`工具策略的 ${sourceProblem}`));
     // The payload states the record's whole list: absent saves a record that narrows nothing.
     const allowedTools = payload.allowedTools === undefined ? undefined : uniqueStrings(payload.allowedTools);
     return this.mutate((paths) => this.setScoped(
