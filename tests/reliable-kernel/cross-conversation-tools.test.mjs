@@ -1467,6 +1467,8 @@ for (const [providerKind, modelId] of WIRE_PROVIDERS) {
  * Builds a ROOT history that holds every kind of collaboration fact a compression must carry: a
  * list_conversations and a list_agents result, a received followup that ran in its own Turn, and a
  * received message that joins ROOT's next Turn. The control history has the same shape without them.
+ * The followup spends the only automatic followup, so ROOT's reply starts no Turn of the idle PEER:
+ * PEER stays idle for its next user Turn, which takes the reply in.
  */
 function compressionHistory(withCollaboration) {
   const LONG = `Earlier important history. ${'以前的重要历史，需要在压缩后保留。'.repeat(700)}`;
@@ -1502,7 +1504,7 @@ function compressionHistory(withCollaboration) {
     const [delivery] = (await f.rows('RuntimeDelivery', { target_conversation_id: ROOT })).filter(row => row.state === 'pending');
     assert.deepEqual([delivery?.phase, delivery?.target_turn_id], ['next_turn', null], 'the note waits for ROOT\'s next Turn');
   };
-  return { send, build };
+  return { send, build, options: { runAgentConfig: { maxAutomaticFollowups: 1 } } };
 }
 
 async function assertRootTurnsCompleted(f) {
@@ -1528,7 +1530,7 @@ for (const withCollaboration of [false, true]) {
       assert.ok((await f.rows('CompressionBlock', { conversation_id: ROOT })).length > 0);
       await assertRootTurnsCompleted(f);
       if (withCollaboration) assert.deepEqual((await f.rows('RuntimeDelivery', { target_conversation_id: ROOT })).map(row => row.state), ['consumed', 'consumed']);
-    });
+    }, history.options);
   });
 
   test(`manual compression runs on a history ${label} and the next Turn completes`, { timeout: 90000 }, async () => {
@@ -1546,7 +1548,7 @@ for (const withCollaboration of [false, true]) {
       const next = await f.input(ROOT, 'after-manual');
       assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
       await assertRootTurnsCompleted(f);
-    });
+    }, history.options);
   });
 }
 
