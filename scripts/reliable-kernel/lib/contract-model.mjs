@@ -978,8 +978,9 @@ function validateSubagent(subagent, failures) {
   if (collaboration?.teamScope !== 'derive-root-conversation-from-ChildExecutionParentLink-no-team-table'
     || collaboration?.messageAuthority !== 'peer-tool-output-never-user-or-developer-authorization'
     || collaboration?.delivery !== 'reuse-RuntimeInboxItem-RuntimeDelivery-RuntimeDeliveryInputLink-RuntimeDeliveryWake'
-    || collaboration?.sendMessage !== 'persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary'
+    || collaboration?.sendMessage !== 'persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary; cross-conversation-sends-instead-queue-behind-the-running-Turn-see-crossConversation.delivery'
     || collaboration?.followupTask !== 'explicit-request-may-wake-idle-or-join-active; never-implicitly-cancel'
+    || collaboration?.board?.offering !== 'not-offered-to-models-in-phase-one; agent_board-is-not-in-the-builtin-tool-registry; domain-and-control-plane-code-retained'
     || collaboration?.board?.scope !== 'existing-root-conversation-no-membership-authority'
     || collaboration?.board?.notification !== 'active-subscribers-only; no-idle-wake') {
     failures.push('协作必须复用稳定父树与可靠投递，区分静默消息和显式唤醒，并保留工具来源权限');
@@ -1004,8 +1005,28 @@ function validateSubagent(subagent, failures) {
     || crossConversation?.authority !== 'peer-text-is-an-attributed-collaboration-envelope-never-a-user-message; list-and-read-carry-an-untrusted-data-notice') {
     failures.push('跨对话协作必须由默认关闭的冻结开关下发，只给顶层对话，不寻址子 Agent，运行中目标排队，且对方文本不成为用户指令');
   }
+  if (crossConversation?.approval !== 'send-type-tools-auto-approved-by-default; per-tool-autoApproveExecution-false-requires-confirmation') {
+    failures.push('跨对话协作的发送类工具默认自动批准，可逐个要求确认');
+  }
   if (crossConversation?.consent !== 'sender-only-authorization-as-in-Codex; the-target-has-no-switch-or-consent-check; defences-are-the-untrusted-data-envelope-and-peer-text-never-gaining-user-text-authority') {
     failures.push('跨对话协作只由发送方授权：目标方没有开关或确认检查，防线是不可信数据信封与对方文本不获得用户授权');
+  }
+  const crossCreate = String(crossConversation?.create ?? '');
+  for (const marker of ['stable-Conversation-id-from-ToolCall', 'checked-before-any-write', 'commit-in-one-transaction', 'leaves-no-Conversation', 'replay-after-deletion-is-refused', 'no-ConversationOriginLink']) {
+    if (!crossCreate.includes(marker)) failures.push(`跨对话新建对话规则缺少${marker}`);
+  }
+  const crossFork = String(crossConversation?.fork ?? '');
+  for (const marker of ['commandId-is-ToolCall', 'completed-history-up-to-the-last-ended-Turn', 'starts-no-Turn', 'replay-keeps-the-committed-boundary', 'never-navigates-the-view']) {
+    if (!crossFork.includes(marker)) failures.push(`跨对话分支规则缺少${marker}`);
+  }
+  const crossLimits = crossConversation?.limits;
+  if (!Number.isSafeInteger(crossLimits?.maxPendingInboundMessages) || crossLimits.maxPendingInboundMessages < 1
+    || !Number.isSafeInteger(crossLimits?.maxConversationSpawnsPerTurn) || crossLimits.maxConversationSpawnsPerTurn < 1
+    || crossLimits?.automaticFollowupBudget !== 'cross-conversation-followups-and-create_conversation-spend-maxAutomaticFollowups; checked-before-any-write'
+    || crossLimits?.pendingInbound !== 'undelivered-message-and-followup-deliveries-from-any-sender-per-target; completion-replies-exempt; enforced-on-cross-conversation-sends'
+    || crossLimits?.spawns !== 'create_conversation-and-fork_conversation-calls-of-one-sender-Turn-ranked-by-committed-call-order'
+    || crossLimits?.overflow !== 'clear-tool-error; nothing-written; no-new-settings') {
+    failures.push('跨对话协作必须复用自动续派预算并给出固定的积压与新建分支上限');
   }
   failures.push(...exactSetProblems('跨对话协作工具', ['list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'], crossConversation?.tools ?? []));
   failures.push(...exactSetProblems('跨对话协作只读工具', ['list_conversations', 'read_conversation'], crossConversation?.readonlyTools ?? []));

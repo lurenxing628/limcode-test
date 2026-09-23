@@ -44,6 +44,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/collaboration-board.test.mjs',
   'tests/reliable-kernel/collaboration-capacity.test.mjs',
   'tests/reliable-kernel/collaboration-tool-boundary.test.mjs',
+  'tests/reliable-kernel/cross-conversation-contract.test.mjs',
   'tests/reliable-kernel/cross-conversation-tools.test.mjs',
   'tests/reliable-kernel/native-collaboration-handles.test.mjs',
   'tests/reliable-kernel/collaboration-schema-epoch.test.mjs',

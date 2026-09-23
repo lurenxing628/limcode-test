@@ -138,6 +138,7 @@ docs/architecture/*
 !/tests/reliable-kernel/collaboration-lifecycle.test.mjs
 
 !/tests/reliable-kernel/collaboration-tool-boundary.test.mjs
+!/tests/reliable-kernel/cross-conversation-contract.test.mjs
 !/tests/reliable-kernel/cross-conversation-tools.test.mjs
 !/tests/reliable-kernel/native-collaboration-handles.test.mjs
 

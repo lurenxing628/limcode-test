@@ -408,7 +408,7 @@
     ],
     "messageAuthority": "peer-tool-output-never-user-or-developer-authorization",
     "delivery": "reuse-RuntimeInboxItem-RuntimeDelivery-RuntimeDeliveryInputLink-RuntimeDeliveryWake",
-    "sendMessage": "persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary",
+    "sendMessage": "persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary; cross-conversation-sends-instead-queue-behind-the-running-Turn-see-crossConversation.delivery",
     "followupTask": "explicit-request-may-wake-idle-or-join-active; never-implicitly-cancel",
     "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
     "permissions": "same-root-peer-communication; conversations-outside-the-team-are-reachable-only-through-cross-conversation-tools-or-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
@@ -432,6 +432,7 @@
         "CollaborationBoardSubscriptionLink",
         "CollaborationBoardCommandReceipt"
       ],
+      "offering": "not-offered-to-models-in-phase-one; agent_board-is-not-in-the-builtin-tool-registry; domain-and-control-plane-code-retained",
       "scope": "existing-root-conversation-no-membership-authority",
       "access": "bounded-authorized-query; no-board-body-in-client-feed",
       "notification": "active-subscribers-only; no-idle-wake",
