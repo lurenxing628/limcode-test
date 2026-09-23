@@ -88,8 +88,10 @@ export class ReliableConversationLifecycle {
 
   /**
    * Creates a top-level Conversation whose first Turn is a collaboration task from the calling
-   * Turn, never a user message. Every step is idempotent by the ToolCall id, so a replay resumes an
-   * interrupted creation; a crash before the task is sent leaves an empty Conversation behind.
+   * Turn, never a user message. Every check that can refuse the task runs before anything is
+   * written; the Conversation, its links and the task then commit in one transaction, so a refused
+   * or interrupted creation leaves no Conversation behind. The first task is the durable creation
+   * marker: it outlives the Conversation, so a replay after the user deleted it creates nothing.
    */
   public async createForCollaboration(request: CreatedConversationRequest): Promise<{
     conversationId: string; title: string; messageId: string; deduplicated: boolean;
@@ -102,42 +104,49 @@ export class ReliableConversationLifecycle {
     const title = request.title?.trim()
       ? displayConversationTitleFromText(request.title, 80)
       : displayConversationTitleFromText(request.prompt, 40);
-    // The calling Turn's frozen selection fixes the model and work environment the new
-    // Conversation starts with; everything else comes from its own settings scopes.
-    const [model, environment, agent, project] = await Promise.all([
-      this.application.runtime.children.frozenModelSelectionForTurn(turnId),
-      this.application.runtime.children.frozenWorkEnvironmentPolicyForTurn(turnId),
-      this.configuration.resolveAgent({ agentType: 'main' }),
-      projectFolderForConversation(this.application.database, sourceConversationId)
-    ]);
+    const collaboration = this.application.runtime.collaboration;
+    // A running target never exists at creation, yet the task queues like every peer task.
+    const task = {
+      source: { kind: 'tool' as const, turnId, toolCallId }, targetConversationId: conversationId,
+      text: request.prompt, mode: 'followup' as const, queueBehindActiveTurn: true, crossConversation: true
+    };
     // This Host owns the new Conversation from its first write; the pending followup keeps it
     // owned until the delivery starts its first Turn.
     return this.application.database.conversationOwners.run(conversationId, async () => {
-      if (!await this.maybeRow('Conversation', conversationId)) {
-        const now = new Date().toISOString();
-        try {
-          await this.application.database.transaction([
-            DOMAIN_REPOSITORIES.domain('Conversation').insert({
-              id: conversationId, title, status: 'active', created_at: now, updated_at: now
-            }),
-            DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
-              id: stablePhaseFId('agent_conversation_link', conversationId), conversation_id: conversationId,
-              agent_id: agent.agentId, role: 'default', created_at: now, updated_at: now
-            }),
-            ...(project ? projectFolderAssignmentSteps({ conversationId, folder: project, now }) : [])
-          ]);
-        } catch (error) {
-          if (!await this.maybeRow('Conversation', conversationId)) throw error;
-        }
+      const committed = await collaboration.toolCallMessage(toolCallId);
+      if (committed) {
+        if (committed.targetConversationId !== conversationId) throw new Error('create_conversation replay conflicts with its committed task.');
+        const existing = await this.maybeRow('Conversation', conversationId);
+        if (!existing) throw new Error('The conversation this call created has been deleted; it is not created again.');
+        const replayed = await collaboration.send(task);
+        return { conversationId, title: String(existing.title), messageId: replayed.messageId, deduplicated: true };
       }
-      await this.configuration.mutations.initializeConversationModelProfile({ conversationId, ...model });
+      await collaboration.admitConversationCreation({ turnId, toolCallId });
+      // The calling Turn's frozen selection fixes the model and work environment the new
+      // Conversation starts with; everything else comes from its own settings scopes.
+      const [model, environment, agent, project] = await Promise.all([
+        this.application.runtime.children.frozenModelSelectionForTurn(turnId),
+        this.application.runtime.children.frozenWorkEnvironmentPolicyForTurn(turnId),
+        this.configuration.resolveAgent({ agentType: 'main' }),
+        projectFolderForConversation(this.application.database, sourceConversationId)
+      ]);
+      // Settings go first and only fill empty slots: an interruption before the commit leaves
+      // settings nothing refers to, which the replay of this call reuses.
       if (environment?.defaultWorkEnvironmentId) {
         await this.configuration.mutations.initializeConversationWorkEnvironment(conversationId, environment.defaultWorkEnvironmentId);
       }
-      const sent = await this.application.runtime.collaboration.send({
-        source: { kind: 'tool', turnId, toolCallId }, targetConversationId: conversationId,
-        text: request.prompt, mode: 'followup', crossConversation: true
-      });
+      await this.configuration.mutations.initializeConversationModelProfile({ conversationId, ...model });
+      const now = new Date().toISOString();
+      const sent = await collaboration.send({ ...task, newConversationSteps: [
+        DOMAIN_REPOSITORIES.domain('Conversation').insert({
+          id: conversationId, title, status: 'active', created_at: now, updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+          id: stablePhaseFId('agent_conversation_link', conversationId), conversation_id: conversationId,
+          agent_id: agent.agentId, role: 'default', created_at: now, updated_at: now
+        }),
+        ...(project ? projectFolderAssignmentSteps({ conversationId, folder: project, now }) : [])
+      ] });
       return {
         conversationId,
         title: String((await this.requireRow('Conversation', conversationId)).title),

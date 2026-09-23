@@ -2,7 +2,7 @@ import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { readCollaborationScope } from './collaborationScope';
+import { readCollaborationScope, type CollaborationScope } from './collaborationScope';
 import { CROSS_CONVERSATION_LIMITS, readTurnCollaborationLimits, readTurnCrossConversationEnabled } from './collaborationPolicy';
 import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { TURN_INTENT_ENVELOPE_CONTENT_TYPE, parseRuntimeContinuationTurnIntentEnvelopeText } from './guidanceIntent';
@@ -36,6 +36,12 @@ export interface CollaborationSendCommand {
    * Conversations; team tools never set it.
    */
   crossConversation?: boolean;
+  /**
+   * create_conversation only: these steps insert the target Conversation and its links in the same
+   * transaction as its first task. The target must not exist yet, so a refused or interrupted
+   * creation leaves nothing behind.
+   */
+  newConversationSteps?: RepositoryTransactionStep[];
 }
 export interface CrossConversationListing {
   conversations: Array<{ conversationId: string; title: string; running: boolean; updatedAt: string }>;
@@ -103,8 +109,10 @@ export class CollaborationControlPlane {
     if (input.crossConversation && source.kind !== 'tool') throw new Error('Only a tool call may send across conversations.');
     // Completion replies and board notices always reach a running target; only tool sends may wait.
     if (input.queueBehindActiveTurn && (source.kind !== 'tool' || input.onlyIfRunning)) throw new Error('Only tool-sourced sends may queue behind a running target Turn.');
+    const creating = input.newConversationSteps !== undefined;
+    if (creating && (source.kind !== 'tool' || !input.crossConversation || input.mode !== 'followup')) throw new Error('Only a cross-conversation followup tool call may create its target Conversation.');
     const sourceKey = source.kind === 'tool' ? requirePhaseFId(source.toolCallId, 'toolCallId') : source.kind === 'completion' ? requirePhaseFId(source.requestId, 'requestId') : stablePhaseFId('board_notice', source.postId, targetConversationId);
-    const dedupeKey = `collaboration:${source.kind}:${sourceKey}`;
+    const dedupeKey = collaborationDedupeKey(source.kind, sourceKey);
     const messageId = stablePhaseFId('collaboration_message', dedupeKey);
     const inboxItemId = stablePhaseFId('runtime_inbox_item', messageId);
     const deliveryId = stablePhaseFId('runtime_delivery', 'collaboration', messageId);
@@ -129,8 +137,9 @@ export class CollaborationControlPlane {
       return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued, deduplicated: true };
     };
     const existing = await replay(); if (existing) return existing;
-    if (input.crossConversation) await this.authorizeCrossConversation({ turnId: requirePhaseFId(sourceTurnId, 'turnId'), targetConversationId });
-    const target = await this.existing('Conversation', targetConversationId);
+    if (input.crossConversation) await this.authorizeCrossConversation({ turnId: requirePhaseFId(sourceTurnId, 'turnId'), ...(creating ? {} : { targetConversationId }) });
+    if (creating && await this.maybe('Conversation', targetConversationId)) throw new Error('The Conversation to create already exists without its first task.');
+    const target = creating ? { id: targetConversationId, status: 'active' } : await this.existing('Conversation', targetConversationId);
     const origin = failureReply ? null : await this.existing('Conversation', sourceConversationId);
     if (target.status !== 'active' || (origin && origin.status !== 'active')) throw new Error('Collaboration requires active Conversations.');
     let sourceSteps: RepositoryTransactionStep[] = [];
@@ -145,7 +154,7 @@ export class CollaborationControlPlane {
       sourceSteps = [DOMAIN_REPOSITORIES.domain('Turn').assert(source.turnId, { status: 'active', conversation_id: sourceConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: source.turnId }), DOMAIN_REPOSITORIES.domain('ToolCall').assert(source.toolCallId, { turn_id: source.turnId, status: tool.status })];
     }
     const sourceScope = failureReply ? null : await readCollaborationScope(this.database, sourceConversationId);
-    const targetScope = await readCollaborationScope(this.database, targetConversationId);
+    const targetScope = creating ? newTopLevelScope(targetConversationId) : await readCollaborationScope(this.database, targetConversationId);
     const sourceMember = sourceScope?.members.find((entry) => entry.conversationId === sourceConversationId);
     if (source.kind === 'tool' && sourceMember?.childExecutionId && sourceMember.status !== 'active') throw new Error('A stopped child cannot initiate collaboration.');
     const targetMember = targetScope.members.find((entry) => entry.conversationId === targetConversationId)!;
@@ -176,7 +185,7 @@ export class CollaborationControlPlane {
         sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: request.state, message_id: replyToMessageId }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assert(String(requestTurn.id), { turn_id: source.turnId }));
       }
     }
-    const turns = await this.rows('Turn', { conversation_id: targetConversationId });
+    const turns = creating ? [] : await this.rows('Turn', { conversation_id: targetConversationId });
     turns.sort(compareNewest);
     const active = turns.filter((turn) => turn.status === 'active');
     if (active.length > 1) throw new Error('Collaboration target has multiple active Turns.');
@@ -193,19 +202,15 @@ export class CollaborationControlPlane {
     const requestId = stablePhaseFId('collaboration_request', messageId);
     const budgetSteps: RepositoryTransactionStep[] = [];
     if (input.mode === 'followup') {
-      const budget = await this.budgetForTurn(requirePhaseFId(sourceTurnId, 'turnId'), sourceScope?.rootTurnId ?? null);
-      const persistedBudget = await this.maybe('CollaborationBudget', String(budget.id));
-      if (persistedBudget && (persistedBudget.origin_kind !== budget.origin_kind || persistedBudget.origin_key !== budget.origin_key || persistedBudget.authority_turn_id !== budget.authority_turn_id)) throw new Error('Collaboration budget identity conflicts.');
-      if (!persistedBudget) budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationBudget').insert(budget));
-      const requests = await this.rows('CollaborationRequest', { budget_id: budget.id, automatic: 1n });
-      const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, String(budget.authority_turn_id))).maxAutomaticFollowups;
-      if (requests.length >= limit) throw new Error(`Automatic followup budget exhausted (${limit}).`);
+      const { budget, persisted, requests } = await this.availableFollowupBudget(requirePhaseFId(sourceTurnId, 'turnId'), sourceScope?.rootTurnId ?? null);
+      if (!persisted) budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationBudget').insert(budget));
       budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assertExactIds({ budget_id: budget.id, automatic: 1n }, requests.map((row) => String(row.id))));
       budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').insert({ id: requestId, message_id: messageId, budget_id: budget.id, automatic: 1n, state: 'pending', created_at: now, updated_at: now }));
     }
     const wakeId = stablePhaseFId('runtime_delivery_wake', deliveryId);
     try {
       await this.database.transaction([
+        ...(input.newConversationSteps ?? []),
         ...preparedContentObjectSteps([prepared], 'collaboration_content'), ...sourceSteps,
         ...(sourceScope?.authoritySteps ?? []), ...targetScope.authoritySteps, ...routingSteps, ...inboundSteps,
         ...(failureReply ? [] : [DOMAIN_REPOSITORIES.domain('Conversation').assert(sourceConversationId, { status: 'active' })]), DOMAIN_REPOSITORIES.domain('Conversation').assert(targetConversationId, { status: 'active' }),
@@ -221,7 +226,7 @@ export class CollaborationControlPlane {
         ...(input.mode === 'followup' || currentTurnId ? [DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').insert({ id: wakeId, delivery_id: deliveryId, state: 'pending', claim_owner_host_boot_id: null, claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n, next_attempt_at: null, last_error: null, acknowledged_at: null, created_at: now, updated_at: now })] : [])
       ]);
     } catch (error) {
-      if (!isTransactionAssertionFailure(error) && !sqliteUniqueFailureIncludes(error, ['collaboration_message.id', 'collaboration_message.dedupe_key', 'collaboration_message_source_link.source_kind, collaboration_message_source_link.source_key'])) throw error;
+      if (!isTransactionAssertionFailure(error) && !sqliteUniqueFailureIncludes(error, ['collaboration_message.id', 'collaboration_message.dedupe_key', 'collaboration_message_source_link.source_kind, collaboration_message_source_link.source_key', ...(creating ? ['conversation.id'] : [])])) throw error;
       const raced = await replay(); if (raced) return raced;
       throw error;
     }
@@ -334,6 +339,30 @@ export class CollaborationControlPlane {
       throw new Error('Cross-conversation collaboration cannot address a child task conversation.');
     }
     return { conversationId };
+  }
+
+  /**
+   * Runs every check that can refuse create_conversation's first task before the lifecycle writes
+   * anything, settings included: the switch, a top-level live ToolCall in its active Turn, the
+   * per-Turn creation limit and the automatic followup budget. The atomic send checks them again.
+   */
+  public async admitConversationCreation(input: { turnId: string; toolCallId: string }): Promise<void> {
+    const turnId = requirePhaseFId(input.turnId, 'turnId');
+    const toolCallId = requirePhaseFId(input.toolCallId, 'toolCallId');
+    const { conversationId } = await this.authorizeCrossConversation({ turnId });
+    const [turn, tool, terminations] = await Promise.all([this.existing('Turn', turnId), this.existing('ToolCall', toolCallId), this.rows('TurnTermination', { turn_id: turnId })]);
+    if (tool.turn_id !== turnId || tool.tool_name !== 'create_conversation' || turn.status !== 'active' || terminations.length || tool.status === 'terminal') {
+      throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
+    }
+    await this.assertConversationSpawnAllowed({ turnId, toolCallId });
+    await this.availableFollowupBudget(turnId, (await readCollaborationScope(this.database, conversationId)).rootTurnId);
+  }
+
+  /** The collaboration message a tool call committed, if any; it outlives both Conversations. */
+  public async toolCallMessage(toolCallIdInput: string): Promise<{ messageId: string; targetConversationId: string } | null> {
+    const messageId = stablePhaseFId('collaboration_message', collaborationDedupeKey('tool', requirePhaseFId(toolCallIdInput, 'toolCallId')));
+    if (!await this.maybe('CollaborationMessage', messageId)) return null;
+    return { messageId, targetConversationId: String((await this.one('CollaborationMessageTargetLink', { message_id: messageId })).conversation_id) };
   }
 
   /**
@@ -518,6 +547,16 @@ export class CollaborationControlPlane {
     const [callerScope, targetScope] = await Promise.all([readCollaborationScope(this.database, caller), readCollaborationScope(this.database, target)]);
     if (callerScope.rootConversationId !== targetScope.rootConversationId) throw new Error('Cross-conversation collaboration is not enabled.');
   }
+  /** The budget a followup from this Turn spends; refuses once its automatic followups are used up. */
+  private async availableFollowupBudget(sourceTurnId: string, rootTurnId: string | null): Promise<{ budget: DomainRow; persisted: boolean; requests: DomainRow[] }> {
+    const budget = await this.budgetForTurn(sourceTurnId, rootTurnId);
+    const persisted = await this.maybe('CollaborationBudget', String(budget.id));
+    if (persisted && (persisted.origin_kind !== budget.origin_kind || persisted.origin_key !== budget.origin_key || persisted.authority_turn_id !== budget.authority_turn_id)) throw new Error('Collaboration budget identity conflicts.');
+    const requests = await this.rows('CollaborationRequest', { budget_id: budget.id, automatic: 1n });
+    const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, String(budget.authority_turn_id))).maxAutomaticFollowups;
+    if (requests.length >= limit) throw new Error(`Automatic followup budget exhausted (${limit}).`);
+    return { budget, persisted: persisted !== null, requests };
+  }
   private async budgetForTurn(sourceTurnId: string, rootTurnId: string | null): Promise<DomainRow> {
     const visit = async (turnId: string, ancestryRoot: string | null, seen: Set<string>): Promise<DomainRow> => {
       if (seen.has(turnId)) throw new Error('Collaboration budget lineage is cyclic.');
@@ -589,6 +628,17 @@ export class CollaborationControlPlane {
   private async one(domain: string, where: DomainRow): Promise<DomainRow> { const rows = await this.rows(domain, where); if (rows.length !== 1) throw new Error(`${domain} requires exactly one matching fact.`); return rows[0]; }
   private async maybe(domain: string, id: string): Promise<DomainRow | null> { return (await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | null; }
   private async existing(domain: string, id: string): Promise<DomainRow> { const row = await this.maybe(domain, id); if (!row) throw new Error(`${domain} ${id} does not exist.`); return row; }
+}
+function collaborationDedupeKey(sourceKind: string, sourceKey: string): string {
+  return `collaboration:${sourceKind}:${sourceKey}`;
+}
+/** A Conversation inserted by the same transaction: top-level, alone in its team, without Turns. */
+function newTopLevelScope(conversationId: string): CollaborationScope {
+  return {
+    rootConversationId: conversationId, rootTurnId: null,
+    members: [{ conversationId, childExecutionId: null, parentConversationId: null, status: 'active' }],
+    authoritySteps: [DOMAIN_REPOSITORIES.domain('ChildExecution').assertNone({ child_conversation_id: conversationId })]
+  };
 }
 function compareSequence(left: unknown, right: unknown): number {
   const a = BigInt(String(left));

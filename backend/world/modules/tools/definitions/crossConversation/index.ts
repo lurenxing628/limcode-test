@@ -41,7 +41,7 @@ const definitions: ToolDefinition[] = [
     const text = compact(record?.text, 80);
     return text ? `${label} · ${text}` : label;
   }),
-  tool('create_conversation', 'Create a new top-level conversation in this workspace and start its first turn with prompt as a task from this conversation. Use only when the user explicitly asks for a new, separate conversation or task. The new conversation does not inherit this conversation\'s history; it uses the current model, project folder and work environment under its own settings. Its final reply is returned to you automatically. The user\'s view does not switch. If creation is interrupted, an empty conversation may remain for the user to delete.', {
+  tool('create_conversation', 'Create a new top-level conversation in this workspace and start its first turn with prompt as a task from this conversation. Use only when the user explicitly asks for a new, separate conversation or task. The new conversation does not inherit this conversation\'s history; it uses the current model, project folder and work environment under its own settings. Its final reply is returned to you automatically. The user\'s view does not switch. Nothing is created when the call fails.', {
     prompt: { type: 'string', description: 'Complete task for the new conversation, including context, constraints and the expected result.' },
     title: { type: 'string', description: 'Optional short title shown in the conversation list; defaults to the start of prompt.' }
   }, ['prompt'], (args) => {

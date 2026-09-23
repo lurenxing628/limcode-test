@@ -58,7 +58,7 @@ const lastResult = (start, name) => start.contents.flatMap(content => content.pa
 const detail = (start, name) => lastResult(start, name)?.detail;
 
 /** The external model alone is synthetic; tools, authority, ownership, persistence and wakes are production code. */
-async function fixture(send, run, { enabled = true, switchValue = true, wakeGate } = {}) {
+async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-cross-conversation-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -84,6 +84,11 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     async input(conversationId, commandId, text = commandId) { return runner.input({ conversationId, commandId, text }); },
     async terminated(turnId) { return f.until(async () => (await f.rows('TurnTermination', { turn_id: turnId }))[0], `Turn did not terminate: ${turnId}`); },
     toolCallId(providerCallId) { return f.dispatches.find(input => input.providerCallId === providerCallId)?.toolCallId; },
+    async settingsFor(conversationId) {
+      const state = await configuration.configurationClientState();
+      return { modelProfiles: state.modelProfileScopeLinks.filter(link => link.scopeKind === 'conversation' && link.scopeId === conversationId),
+        workEnvironments: state.conversationWorkEnvironmentLinks.filter(link => link.conversationId === conversationId) };
+    },
     async transcript(conversationId) {
       return (await app.runtime.collaboration.readConversation({ conversationId, targetConversationId: conversationId, limit: 50 })).messages;
     }
@@ -97,7 +102,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     await configuration.synchronizeWorkspaceFolders([{ ...project, rootPath: folderPath, index: 0 }]);
     const agent = await configuration.mutations.createAgent({ name: 'Synthetic top-level', kind: 'custom' });
     await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: definitions.map(tool => tool.declaration.name),
-      ...(enabled ? { toolConfigs: { run_agent: { config: { crossConversationCollaboration: switchValue } } } } : {}) });
+      ...(enabled ? { toolConfigs: { ...toolConfigs, run_agent: { config: { ...runAgentConfig, crossConversationCollaboration: switchValue } } } } : {}) });
     const rootAuthority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(rootAuthority);
     app = await kernel.ReliableKernelApplication.open(rootAuthority, {
@@ -127,6 +132,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
           definitions: () => definitions,
           async dispatchSpecial(_definition, input, authority, signal, admission) {
             dispatches.push(structuredClone(input));
+            await dispatchHook?.(input, f);
             return await collaborationTools.dispatch(input, signal, authority)
               ?? await coordinator.dispatch(input, signal, authority, admission);
           },
@@ -514,6 +520,11 @@ test('create_conversation starts a first Turn from a peer task and replaying the
     const completion = (await f.app.runtime.collaboration.listMessages({ conversationId: ROOT })).messages.find(message => message.sourceKind === 'completion');
     assert.equal((await f.app.runtime.collaboration.readMessage({ conversationId: ROOT, messageId: completion.messageId })).text, RESULT);
 
+    const frozenEnvironment = JSON.parse((await f.app.contentStore.read((await f.rows('ContentObject', { id: rootAuthority.content_object_id }))[0])).toString('utf8')).workEnvironmentPolicy?.defaultWorkEnvironmentId ?? null;
+    assert.ok(frozenEnvironment, 'fixture: the calling Turn froze a work environment');
+    assert.deepEqual((await f.settingsFor(conversationId)).workEnvironments.map(link => link.workEnvironmentId), [frozenEnvironment],
+      'the new conversation starts in the caller\'s work environment');
+
     const conversations = (await f.rows('Conversation')).length;
     const replay = await f.lifecycle.createForCollaboration({ turnId: rootTurn, toolCallId, sourceConversationId: ROOT, prompt: TASK, title: 'Spawned audit' });
     assert.equal(replay.conversationId, conversationId);
@@ -521,6 +532,12 @@ test('create_conversation starts a first Turn from a peer task and replaying the
     assert.equal((await f.rows('Conversation')).length, conversations);
     assert.equal((await f.rows('Turn', { conversation_id: conversationId })).length, 1);
     assert.equal((await f.rows('CollaborationMessage')).filter(message => message.mode === 'followup').length, 1);
+
+    // The user deletes the created conversation; a late replay of the same call never brings it back.
+    await f.app.conversationDeletion.delete(conversationId);
+    await assert.rejects(f.lifecycle.createForCollaboration({ turnId: rootTurn, toolCallId, sourceConversationId: ROOT, prompt: TASK, title: 'Spawned audit' }), /deleted/);
+    assert.deepEqual(await f.rows('Conversation', { id: conversationId }), []);
+    assert.equal((await f.rows('Conversation')).length, conversations - 1);
   });
 });
 
@@ -549,6 +566,154 @@ test('one Turn may create or fork at most 8 conversations; the next call is refu
     const refusedId = kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId('create-9'));
     assert.deepEqual(await f.rows('Conversation', { id: refusedId }), []);
     assert.equal((await f.rows('CollaborationMessage')).filter(message => message.mode === 'followup').length, 1);
+  });
+});
+
+test('create_conversation that cannot run leaves no conversation behind, not even on retry', { timeout: 60000 }, async () => {
+  let rootRound = 0;
+  const created = [];
+  await fixture(async (request, f, start) => {
+    assert.equal(request.conversationId, ROOT, 'no created conversation ever runs');
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('create-first', 'create_conversation', { prompt: 'NO_BUDGET_TASK_3301' }));
+    const result = lastResult(start, 'create_conversation');
+    assert.notEqual(result?.status, 'succeeded', JSON.stringify(result));
+    assert.match(JSON.stringify(result), /budget exhausted \(0\)/);
+    if (rootRound === 2) return toolsAnswer(call('create-retry', 'create_conversation', { prompt: 'NO_BUDGET_TASK_3301' }));
+    return answer('Could not delegate.');
+  }, async f => {
+    const conversations = (await f.rows('Conversation')).length;
+    const started = await f.input(ROOT, 'create a separate conversation');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(rootRound, 3);
+    for (const id of ['create-first', 'create-retry']) created.push(kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId(id)));
+    assert.equal((await f.rows('Conversation')).length, conversations, 'a refused create writes no Conversation');
+    for (const id of created) {
+      assert.deepEqual(await f.settingsFor(id), { modelProfiles: [], workEnvironments: [] }, 'nor any settings for it');
+      // A replay after the Turn ended is refused as well.
+      await assert.rejects(f.lifecycle.createForCollaboration({ turnId: started.turnId, toolCallId: f.toolCallId(id === created[0] ? 'create-first' : 'create-retry'),
+        sourceConversationId: ROOT, prompt: 'NO_BUDGET_TASK_3301' }));
+    }
+    assert.equal((await f.rows('Conversation')).length, conversations);
+    assert.deepEqual(await f.rows('CollaborationMessage'), []);
+  }, { runAgentConfig: { maxAutomaticFollowups: 0 } });
+});
+
+test('create_conversation with an unavailable work environment writes nothing', { timeout: 60000 }, async () => {
+  let rootRound = 0;
+  await fixture(async (request, f, start) => {
+    assert.equal(request.conversationId, ROOT);
+    rootRound += 1;
+    if (rootRound === 1) {
+      // The environment the Turn froze disappears before the call runs.
+      const state = await f.configuration.configurationClientState();
+      for (const environment of state.workEnvironments) await f.configuration.mutations.upsertWorkEnvironment({ ...environment, available: false });
+      return toolsAnswer(call('create', 'create_conversation', { prompt: 'NO_ENVIRONMENT_TASK_3302' }));
+    }
+    assert.notEqual(lastResult(start, 'create_conversation')?.status, 'succeeded');
+    return answer('Could not create.');
+  }, async f => {
+    const conversations = (await f.rows('Conversation')).length;
+    const started = await f.input(ROOT, 'create a separate conversation');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    const id = kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId('create'));
+    assert.equal((await f.rows('Conversation')).length, conversations);
+    assert.deepEqual(await f.settingsFor(id), { modelProfiles: [], workEnvironments: [] });
+    assert.deepEqual(await f.rows('CollaborationMessage'), []);
+  });
+});
+
+test('create_conversation interrupted between its steps resumes on replay without duplicating anything', { timeout: 60000 }, async () => {
+  const TASK = 'RESUMED_CREATE_TASK_3303';
+  let rootRound = 0, crashed = false, createdTurns = 0;
+  await fixture(async (request, f) => {
+    if (request.conversationId !== ROOT) { createdTurns += 1; return answer('resumed conversation done'); }
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('create', 'create_conversation', { prompt: TASK, title: 'Resumed' }));
+    return answer('Created.');
+  }, async f => {
+    const started = await f.input(ROOT, 'create a separate conversation');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(crashed, true);
+    const id = kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId('create'));
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'The resumed conversation never answered.');
+    assert.equal((await f.rows('Conversation', { id })).length, 1);
+    assert.equal((await f.settingsFor(id)).modelProfiles.length, 1, 'the settings written before the crash are reused');
+    assert.equal((await f.rows('CollaborationMessage')).filter(message => message.mode === 'followup').length, 1);
+    assert.equal((await f.rows('Turn', { conversation_id: id })).length, 1);
+    assert.equal(createdTurns, 1);
+  }, { dispatchHook: async (input, f) => {
+    if (input.toolName !== 'create_conversation' || crashed) return;
+    crashed = true;
+    // The Host dies after the first settings write: nothing is visible yet, and the replay resumes.
+    const mutations = f.configuration.mutations;
+    const original = mutations.initializeConversationModelProfile;
+    mutations.initializeConversationModelProfile = async function(...args) { await original.apply(this, args); throw new Error('simulated crash after the model profile'); };
+    try {
+      await assert.rejects(f.lifecycle.createForCollaboration({ turnId: input.turnId, toolCallId: input.toolCallId, sourceConversationId: ROOT, prompt: TASK, title: 'Resumed' }), /simulated crash/);
+    } finally { mutations.initializeConversationModelProfile = original; }
+    const id = kernel.stablePhaseFId('conversation', 'cross-create', input.toolCallId);
+    assert.deepEqual(await f.rows('Conversation', { id }), [], 'an interrupted creation leaves no conversation');
+    assert.deepEqual(await f.rows('CollaborationMessage'), []);
+  } });
+});
+
+test('create_conversation with confirmation required waits for approval and creates only after it', { timeout: 60000 }, async () => {
+  const TASK = 'APPROVED_CREATE_TASK_3304';
+  let rootRound = 0, createdObserved = false;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId !== ROOT) { createdObserved = JSON.stringify(start.contents).includes(TASK); return answer('approved conversation done'); }
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('create', 'create_conversation', { prompt: TASK }));
+    assert.equal(lastResult(start, 'create_conversation')?.status, 'succeeded');
+    return answer('Created after approval.');
+  }, async f => {
+    const started = await f.input(ROOT, 'create a separate conversation');
+    const [approval] = await f.until(async () => {
+      const requests = (await f.rows('InteractionRequest')).filter(row => row.request_kind === 'exec_approval');
+      return requests.length ? requests : undefined;
+    }, 'create_conversation never asked for approval.');
+    const [call] = (await f.rows('ToolCall', { turn_id: started.turnId })).filter(row => row.tool_name === 'create_conversation');
+    const toolCallId = call.id;
+    const [policy] = await f.rows('ToolCallPolicySnapshot', { tool_call_id: toolCallId });
+    assert.notEqual(policy.execution_gate, 'automatic');
+    assert.equal(f.dispatches.some(input => input.toolCallId === toolCallId), false, 'the call does not run before approval');
+    const id = kernel.stablePhaseFId('conversation', 'cross-create', toolCallId);
+    assert.deepEqual(await f.rows('Conversation', { id }), [], 'nothing is created before the user approves');
+    await f.app.interactions.resolveExecutionApproval({ source: { kind: 'command', key: 'approve-create' }, requestId: approval.id, decision: 'accept', response: {} });
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'The approved conversation never answered.');
+    assert.equal((await f.rows('Conversation', { id })).length, 1);
+    assert.equal(createdObserved, true);
+  }, { toolConfigs: { create_conversation: { autoApproveExecution: false } } });
+});
+
+test('turning the switch off mid-Turn leaves that Turn\'s frozen switch in force until it ends', { timeout: 60000 }, async () => {
+  let rootRound = 0;
+  await fixture(async (request, f, start) => {
+    assert.equal(request.conversationId, ROOT);
+    rootRound += 1;
+    const names = start.tools.map(tool => tool.name);
+    if (rootRound === 1) {
+      assert.ok(names.includes('list_conversations'));
+      await f.configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: definitions.map(tool => tool.declaration.name),
+        toolConfigs: { run_agent: { config: { crossConversationCollaboration: false } } } });
+      return toolsAnswer(call('list', 'list_conversations'));
+    }
+    if (rootRound === 2) {
+      assert.equal(lastResult(start, 'list_conversations')?.status, 'succeeded', 'the running Turn keeps its frozen switch');
+      assert.ok(names.includes('list_conversations'), 'the same Turn still offers the tools');
+      return answer('Listed.');
+    }
+    for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(!names.includes(name), `${name} is gone in the next Turn`);
+    return answer('Switch is off now.');
+  }, async f => {
+    const first = await f.input(ROOT, 'list other conversations');
+    assert.equal((await f.terminated(first.turnId)).terminal_status, 'completed');
+    const next = await f.input(ROOT, 'and now?');
+    assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+    assert.equal(rootRound, 3);
+    await assert.rejects(f.app.runtime.collaboration.listConversations({ turnId: next.turnId }), /not enabled/);
   });
 });
 
