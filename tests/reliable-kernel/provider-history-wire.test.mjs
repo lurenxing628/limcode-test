@@ -307,3 +307,31 @@ test('Responses, Claude and Gemini targets keep the chronological native placeme
   assert.deepEqual((await projectNativeHistory('openai-responses', 'gpt-5.5')).wire,
     ['u:text', 'a:call=call_async', 'a:call=call_list', 't:call_list', 'a:text', 't:call_async', 'u:text']);
 });
+
+test('a server-side compaction item from an ordinary Responses reply is stored with the reply and replayed verbatim on the next request', { timeout: 120000 }, async () => {
+  // https://developers.openai.com/api/docs/guides/compaction: with `context_management` the response
+  // output carries an encrypted compaction item; stateless chaining appends output items as usual.
+  const compaction = { provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'compaction',
+    rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'opaque-compaction-state' } };
+  const wires = [];
+  await fixture({ providerKind: 'openai-responses', modelId: 'gpt-5.5', async send(round, { wire }) {
+    wires.push(wire);
+    return round === 1
+      ? { role: 'model', parts: [{ providerContext: compaction }, { text: 'First answer.' }] }
+      : answer('Second answer.');
+  } }, async ({ turn }) => {
+    await turn('first question');
+    await turn('second question');
+  });
+  assert.equal(wires.length, 2);
+  const input = wires[1].input.filter(item => item.role !== 'system' && item.role !== 'developer');
+  const compactionIndex = input.findIndex(item => item.type === 'compaction');
+  assert.deepEqual(input[compactionIndex], compaction.rawItem, 'the item is replayed byte for byte');
+  assert.equal(input.filter(item => item.type === 'compaction').length, 1);
+  const texts = input.map(item => JSON.stringify(item));
+  const firstQuestion = texts.findIndex(text => text.includes('first question'));
+  const firstAnswer = texts.findIndex(text => text.includes('First answer.'));
+  const secondQuestion = texts.findIndex(text => text.includes('second question'));
+  assert.ok(firstQuestion < compactionIndex && compactionIndex < firstAnswer && firstAnswer < secondQuestion,
+    `output order is kept: ${texts.map(text => text.slice(0, 60)).join(' | ')}`);
+});

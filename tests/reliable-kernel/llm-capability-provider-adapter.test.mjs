@@ -2836,3 +2836,62 @@ test('LLM capability adapter holds catalog placements anchored inside a parallel
   assert.ok(Math.min(...catalogs) > Math.max(...results), summaryKinds.join(' | '));
   assert.deepEqual(catalogs.map((index) => summaryKinds[index]), ['catalog:first', 'catalog:second']);
 });
+
+test('LLM capability adapter keeps a provider item delivered with an output item in the completed reply, once and in stream order', async () => {
+  // https://developers.openai.com/api/docs/guides/compaction: an ordinary reply made with
+  // `context_management` carries an encrypted compaction item that later requests append as usual.
+  const compaction = { provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'compaction',
+    id: undefined, encryptedContent: 'opaque', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'opaque' } };
+  const run = async (events) => {
+    const emitted = [];
+    const fullRequest = request();
+    fullRequest.authoritySnapshot.model.provider = 'openai-responses';
+    await new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      for (const event of events) emit({ ...event, payload: { requestId: llmRequest.id, ...event.payload } });
+      emit({ type: 'llm:done', payload: { requestId: llmRequest.id } });
+    })).sendFullRequest(fullRequest, { onEvent: async (event) => {
+      emitted.push(event);
+      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+    } });
+    return emitted;
+  };
+  const events = await run([
+    { type: 'llm:outputItemDone', payload: { part: { providerContext: compaction } } },
+    { type: 'llm:delta', payload: { text: 'First ' } },
+    { type: 'llm:delta', payload: { text: 'answer.' } },
+    // The same item reported again with the final response output.
+    { type: 'llm:outputItemDone', payload: { part: { providerContext: compaction } } }
+  ]);
+  const { id: _absent, ...stored } = compaction;
+  assert.deepEqual(events.at(-1).content.parts, [{ providerContext: stored }, { text: 'First answer.' }]);
+  assert.deepEqual(events.map((event) => event.kind), ['output_delta', 'output_delta', 'completed'],
+    'the provider item is not a visible stream event');
+
+  // Without a provider item the reply is exactly as before.
+  const plain = await run([{ type: 'llm:delta', payload: { text: 'First answer.' } }]);
+  assert.deepEqual(plain.at(-1).content, { role: 'model', parts: [{ text: 'First answer.' }] });
+
+  // An output item part that is not a provider item fails the request instead of being stored.
+  await assert.rejects(run([{ type: 'llm:outputItemDone', payload: { part: { text: 'not a provider item' } } }]),
+    /providerContext part/);
+});
+
+test('LLM capability adapter stores provider items of an authoritative reply with absent optional fields omitted', async () => {
+  const fullRequest = request();
+  fullRequest.authoritySnapshot.model.provider = 'openai-responses';
+  const events = [];
+  await new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+    emit({ type: 'llm:done', payload: { requestId: llmRequest.id, content: { role: 'model', parts: [
+      { providerContext: { provider: 'openai', format: 'openai-responses', itemType: 'compaction', endpoint: undefined,
+        rawItem: { type: 'compaction', encrypted_content: 'opaque' } } },
+      { text: 'answer' }
+    ] } } });
+  })).sendFullRequest(fullRequest, { onEvent: async (event) => {
+    events.push(event);
+    return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+  } });
+  assert.deepEqual(events.at(-1).content.parts, [
+    { providerContext: { provider: 'openai', format: 'openai-responses', itemType: 'compaction', rawItem: { type: 'compaction', encrypted_content: 'opaque' } } },
+    { text: 'answer' }
+  ]);
+});

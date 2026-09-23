@@ -12,7 +12,8 @@ import {
   type LlmProviderKind,
   type LlmThinkingLevel,
   type MessageContent,
-  type ModelOutputItemReference
+  type ModelOutputItemReference,
+  type ProviderContextPart
 } from '../../shared/protocol';
 import {
   normalizeAttachmentCatalogState,
@@ -345,6 +346,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           }
           case LlmEventType.OutputItemDone: {
             const outputItem = modelOutputItemFromPayload(payload);
+            const providerContextPart = providerContextPartFromPayload(payload?.part, outputItem);
+            if (providerContextPart) appendProviderContextPart(outputParts, providerContextPart);
             if (outputItem) {
               applyOutputItemMetadata(outputParts, outputItem);
               enqueue({
@@ -1878,12 +1881,50 @@ function plainModelOutputItem(outputItem: ModelOutputItemReference): PlainJsonVa
 
 function messageContentFromDonePayload(value: unknown): MessageContent | undefined {
   if (value === undefined) return undefined;
-  const normalized = normalizePlainJson(value, 'LLM completed MessageContent');
+  // Provider items copied from the SDK (providerContext parts) may carry absent optional fields as
+  // `undefined`; they are omitted, while arrays and every other value keep the strict JSON boundary.
+  const normalized = normalizeProviderPlainJson(value, 'LLM completed MessageContent');
   const record = requireRecord(normalized, 'LLM completed MessageContent');
   if (record.role !== 'model' || !Array.isArray(record.parts)) {
     throw new TypeError('LLM completed MessageContent must contain model parts.');
   }
   return normalized as unknown as MessageContent;
+}
+
+/**
+ * An opaque provider item delivered with an output item: the capability emits it as
+ * `OutputItemDone { part: { providerContext } }`. The one produced today is the Responses
+ * `compaction` item of an ordinary reply made with `context_management`, which later requests must
+ * send back as it came (https://developers.openai.com/api/docs/guides/compaction: "append output
+ * items as usual"); it joins the completed reply in stream order and is stored and replayed with it.
+ */
+function providerContextPartFromPayload(
+  value: unknown,
+  outputItem: ModelOutputItemReference | undefined
+): ProviderContextPart | undefined {
+  if (value === undefined) return undefined;
+  const part = asRecord(normalizeProviderPlainJson(value, 'LLM output item part'));
+  const context = asRecord(part?.providerContext);
+  if (!context || !optionalText(context.provider) || !optionalText(context.format)) {
+    throw new TypeError('LLM output item part must be a providerContext part with provider and format.');
+  }
+  const partOutputItem = outputItem ?? modelOutputItemFromPayload(part);
+  return {
+    providerContext: context as unknown as ProviderContextPart['providerContext'],
+    ...(partOutputItem ? { outputItem: partOutputItem } : {})
+  };
+}
+
+/**
+ * Appends a provider item once: a stream may report the same item again at its end (the Responses
+ * stream decoder reads compaction items both from `response.output_item.done` and from the final
+ * `response.completed` output), and sending it twice would replay the same state twice.
+ */
+function appendProviderContextPart(parts: MessageContent['parts'], part: ProviderContextPart): void {
+  const identity = canonicalPlainJson(part.providerContext as unknown as PlainJsonValue, 'LLM provider context item');
+  if (parts.some((existing) => 'providerContext' in existing
+    && canonicalPlainJson(existing.providerContext as unknown as PlainJsonValue, 'LLM provider context item') === identity)) return;
+  parts.push(part);
 }
 
 function compactReadToolCallsInContent(content: MessageContent): MessageContent {
