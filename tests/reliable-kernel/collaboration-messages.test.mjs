@@ -46,7 +46,7 @@ async function fixture(run, budget = 32) {
         repo('ChildExecutionTurnLink').insert({ id: `${id}-child-turn`, child_execution_id: `${id}-child`, turn_id: `${id}-turn`, turn_seq: 1n, created_at: NOW })
       ])
     ]);
-    await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, store, rows, get,
+    await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, store, rows, get, authority,
       async reopen() { await database.close(); database = await RuntimeDatabase.open(authority); deliveries = new RuntimeDeliveryControlPlane(database, { now: () => NOW }); collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW }); },
       async source(id = `call-${++callSeq}`, conversationId = 'left', turnId = `${conversationId}-turn`, toolName = 'send_agent_message') {
         const content = await store.prepare(database, '{}', 'application/json');
@@ -374,3 +374,35 @@ test('automatic runtime continuation cannot reset the user root followup budget'
   await assert.rejects(f.collaboration.send({ source: await f.source('auto-again', 'root', 'root-auto'), targetConversationId: 'right', text: 'cannot reset', mode: 'followup' }), /budget exhausted/);
   assert.equal((await f.rows('CollaborationBudget')).length, 1);
 }, 1));
+
+test('a host that does not own the target skips a queued wake without reading its collaboration facts', async () => fixture(async f => {
+  const { ConversationRuntimeOwnerManager } = load('ConversationRuntimeOwnerManager.js');
+  const accepted = await f.collaboration.send({ source: await f.source('foreign-queued'), targetConversationId: 'root', text: 'queued work', mode: 'followup', queueBehindActiveTurn: true });
+  // A live peer Host runs the target Turn and owns the Conversation.
+  const peerOwner = new ConversationRuntimeOwnerManager(f.database.binding, 'collaboration-peer-host');
+  peerOwner.setPendingWorkProbe(async () => true);
+  assert.equal(await peerOwner.tryClaim('root'), true);
+  const read = [];
+  const restore = [];
+  for (const method of ['snapshot', 'snapshotAll']) {
+    const original = f.database[method];
+    restore.push(() => { f.database[method] = original; });
+    f.database[method] = function(operations, ...rest) {
+      for (const operation of [operations].flat()) if (operation?.domain) read.push(operation.domain);
+      return original.call(this, operations, ...rest);
+    };
+  }
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW,
+    wakeHandler: async () => assert.fail('A foreign host never dispatches the wake.') });
+  try {
+    const [before] = await f.rows('RuntimeDeliveryWake', { delivery_id: accepted.deliveryId });
+    read.length = 0;
+    await scanner.scanNow();
+    assert.ok(read.includes('RuntimeDeliveryWake'), 'the scan did run');
+    for (const domain of ['CollaborationMessageTargetLink', 'CollaborationMessageSourceLink']) {
+      assert.equal(read.includes(domain), false, `a non-owner host must not read ${domain} for a queued wake`);
+    }
+    for (const undo of restore) undo();
+    assert.deepEqual(await f.get('RuntimeDeliveryWake', before.id), before, 'the foreign wake stays untouched');
+  } finally { for (const undo of restore) undo(); await scanner.dispose(); await peerOwner.close(); }
+}));

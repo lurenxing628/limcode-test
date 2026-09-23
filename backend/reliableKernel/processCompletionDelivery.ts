@@ -305,11 +305,12 @@ export class ProcessCompletionDeliveryControlPlane {
       const wakeId = requirePhaseFId(wake.id, 'RuntimeDeliveryWake.id');
       let claim: DomainRow | null = null;
       try {
-        // Read-only: a send queued behind its target's running Turn stays untouched (no claim,
-        // backoff or failure count) until that Turn's terminal commit triggers the next scan.
-        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) continue;
         const targetConversationId = await this.wakeConversationId(wake);
         if (targetConversationId !== null && !await gate.check(targetConversationId)) continue;
+        // Read-only and only on the owning Host: a send queued behind its target's running Turn
+        // stays untouched (no claim, backoff or failure count) until that Turn's terminal commit
+        // triggers the next scan.
+        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) continue;
         claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
         if (!claim) continue;
         const claimedWake = claim;
