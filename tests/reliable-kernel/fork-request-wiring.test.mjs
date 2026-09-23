@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 const require = createRequire(import.meta.url);
 const kernel = require(path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension', 'backend/reliableKernel/index.js'));
@@ -66,7 +67,6 @@ async function until(condition, label) {
 // frames a real bounded feed sends, acknowledged by the Webview store.
 test('useChat 只在本次点击且仍在源对话时打开分支，重放或迟到的结果改为可打开的提示', async (t) => {
   const runtime = await openRuntime();
-  const { createServer } = await import('vite');
   const pinia = await import('pinia');
   const { effectScope, nextTick } = await import('vue');
   const previousPinia = pinia.getActivePinia();
@@ -92,12 +92,10 @@ test('useChat 只在本次点击且仍在源对话时打开分支，重放或迟
       };
     }
   };
-  const server = await createServer({
-    configFile: path.join(process.cwd(), 'vite.config.ts'),
-    server: { middlewareMode: true }, appType: 'custom', logLevel: 'error'
-  });
+  let server;
   const scopes = [];
   try {
+    server = await createWebviewSsrServer();
     const { BridgeMessageType } = await server.ssrLoadModule(path.join(process.cwd(), 'shared/protocol.ts'));
     const emit = (message) => { for (const listener of [...host.listeners]) listener({ data: message }); };
     const posted = (type) => host.posted.filter((message) => message.type === type);
@@ -248,7 +246,7 @@ test('useChat 只在本次点击且仍在源对话时打开分支，重放或迟
     pinia.setActivePinia(previousPinia);
     if (previousWindow === undefined) delete globalThis.window;
     else globalThis.window = previousWindow;
-    await server.close();
+    await server?.close();
     await runtime.close();
   }
 });

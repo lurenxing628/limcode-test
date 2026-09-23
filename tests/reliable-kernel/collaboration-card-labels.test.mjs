@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 const require = createRequire(import.meta.url);
 const kernel = require(path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension', 'backend/reliableKernel/index.js'));
@@ -105,7 +106,6 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
   const navigation = snapshot.projections.navigationSummary.conversations.map((value) => value.id);
   assert.equal(navigation.includes('sender') || navigation.includes('gone'), false, 'both peers are outside the navigation list');
 
-  const { createServer } = await import('vite');
   const pinia = await import('pinia');
   const { createSSRApp, nextTick } = await import('vue');
   const { renderToString } = await import('@vue/server-renderer');
@@ -141,10 +141,11 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
       };
     }
   };
-  const server = await createServer({ configFile: path.join(process.cwd(), 'vite.config.ts'), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
+  let server;
   const isolated = pinia.createPinia();
   pinia.setActivePinia(isolated);
   try {
+    server = await createWebviewSsrServer();
     const { BridgeMessageType } = await server.ssrLoadModule(path.join(process.cwd(), 'shared/protocol.ts'));
     const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
     const { collaborationCardLabel } = await server.ssrLoadModule('/src/domain/reliableCollaborationTimeline.ts');
@@ -234,7 +235,7 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
     else globalThis.window = previousWindow;
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;
-    await server.close();
+    await server?.close();
     await runtime.close();
   }
 });

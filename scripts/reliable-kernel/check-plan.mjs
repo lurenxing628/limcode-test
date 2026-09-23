@@ -72,6 +72,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/collaboration-messages.test.mjs',
   'tests/reliable-kernel/agent-collaboration-settings-ui.test.mjs',
   'tests/reliable-kernel/fork-request-wiring.test.mjs',
+  'tests/reliable-kernel/webview-ssr-server.mjs',
   'tests/reliable-kernel/collaboration-board.test.mjs',
   'tests/reliable-kernel/collaboration-capacity.test.mjs',
   'tests/reliable-kernel/collaboration-tool-boundary.test.mjs',
