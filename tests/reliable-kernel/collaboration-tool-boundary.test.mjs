@@ -284,6 +284,16 @@ test('cross-conversation declarations are strict, summarize every call and class
   assert.match(byName.create_conversation, /only when the user explicitly asks/);
   assert.match(byName.fork_conversation, /completed history/);
   assert.match(byName.fork_conversation, /starts no turn/);
+  // How a task's reply comes back: into the running turn, else a new turn within the automatic
+  // followup budget, else the next turn; wait_agent_messages returns it within this turn.
+  for (const name of ['send_conversation_message', 'create_conversation']) {
+    assert.doesNotMatch(byName[name], /returned to you automatically/, name);
+    assert.match(byName[name], /still running, the reply is added to it/, name);
+    assert.match(byName[name], /a new turn starts to handle it while the automatic followup budget allows; otherwise it arrives with your next turn/, name);
+    assert.match(byName[name], /wait_agent_messages with afterMessageRef set to the messageRef this call returns/, name);
+  }
+  assert.match(byName.list_conversations, /this conversation's project/);
+  assert.doesNotMatch(Object.values(byName).join('\n'), /workspace/);
 });
 
 /**

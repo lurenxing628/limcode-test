@@ -951,6 +951,34 @@ test('create_conversation starts a first Turn from a peer task and replaying the
   });
 });
 
+test('wait_agent_messages returns the reply of a created conversation within the same Turn, as the description says', { timeout: 60000 }, async () => {
+  const TASK = 'WAIT_CREATED_TASK_5601', RESULT = 'WAIT_CREATED_RESULT_5602';
+  let rootRound = 0, created, reply, read;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId !== ROOT) return answer(RESULT);
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('create', 'create_conversation', { prompt: TASK }));
+    if (rootRound === 2) {
+      created = detail(start, 'create_conversation');
+      return toolsAnswer(call('wait', 'wait_agent_messages', { afterMessageRef: created.messageRef, timeoutMs: 60000 }));
+    }
+    if (rootRound === 3) {
+      reply = detail(start, 'wait_agent_messages').messages.find(message => message.replyToMessageRef === created.messageRef);
+      assert.ok(reply, JSON.stringify(detail(start, 'wait_agent_messages')));
+      return toolsAnswer(call('read', 'read_agent_messages', { messageRef: reply.messageRef }));
+    }
+    read = detail(start, 'read_agent_messages');
+    return answer('Reported the result.');
+  }, async f => {
+    const started = await f.input(ROOT, 'create and wait');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(reply.sourceKind, 'completion');
+    assert.equal(read.text, RESULT);
+    assert.equal(read.nextOffset, null);
+    assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 1, 'the reply was taken within the same Turn');
+  });
+});
+
 test('one Turn may create or fork at most 8 conversations; the next call is refused without writing', { timeout: 90000 }, async () => {
   let rootRound = 0, refused;
   const spawnCalls = [...Array.from({ length: 7 }, (_, index) => call(`fork-${index}`, 'fork_conversation')),
