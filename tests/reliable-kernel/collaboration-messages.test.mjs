@@ -376,36 +376,40 @@ test('automatic runtime continuation cannot reset the user root followup budget'
   assert.equal((await f.rows('CollaborationBudget')).length, 1);
 }, 1));
 
-test('a host that does not own the target skips a queued wake without reading its collaboration facts', async () => fixture(async f => {
+test('a host that does not own the target leaves a queued wake untouched and keeps no poll alive for it', async () => fixture(async f => {
   const { ConversationRuntimeOwnerManager } = load('ConversationRuntimeOwnerManager.js');
   const accepted = await f.collaboration.send({ source: await f.source('foreign-queued'), targetConversationId: 'root', text: 'queued work', mode: 'followup', queueBehindActiveTurn: true });
   // A live peer Host runs the target Turn and owns the Conversation.
   const peerOwner = new ConversationRuntimeOwnerManager(f.database.binding, 'collaboration-peer-host');
   peerOwner.setPendingWorkProbe(async () => true);
   assert.equal(await peerOwner.tryClaim('root'), true);
-  const read = [];
-  const restore = [];
-  for (const method of ['snapshot', 'snapshotAll']) {
-    const original = f.database[method];
-    restore.push(() => { f.database[method] = original; });
-    f.database[method] = function(operations, ...rest) {
-      for (const operation of [operations].flat()) if (operation?.domain) read.push(operation.domain);
-      return original.call(this, operations, ...rest);
-    };
-  }
-  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW,
-    wakeHandler: async () => assert.fail('A foreign host never dispatches the wake.') });
+  const errors = [], started = [];
+  let ownerGone = false;
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, scanIntervalMs: 20,
+    onError: detail => errors.push(detail), wakeHandler: async request => {
+      if (!ownerGone) assert.fail('A foreign host never dispatches the wake.');
+      assert.equal(request.action, 'start_continuation');
+      await admitPending(f, 'root', 'root-after-recovery');
+      started.push(request.deliveryId);
+      return { acknowledged: true };
+    } });
   try {
     const [before] = await f.rows('RuntimeDeliveryWake', { delivery_id: accepted.deliveryId });
-    read.length = 0;
-    await scanner.scanNow();
-    assert.ok(read.includes('RuntimeDeliveryWake'), 'the scan did run');
-    for (const domain of ['CollaborationMessageTargetLink', 'CollaborationMessageSourceLink']) {
-      assert.equal(read.includes(domain), false, `a non-owner host must not read ${domain} for a queued wake`);
-    }
-    for (const undo of restore) undo();
+    // Only the owner's commit ending that Turn, or the Turn's recovery, can move the wake.
+    assert.equal(await scansAfterStart(scanner, 300), 0, 'no poll while the wake waits behind the other host Turn');
+    assert.equal(errors.length, 0, errors.map(detail => String(detail.error)).join('\n'));
     assert.deepEqual(await f.get('RuntimeDeliveryWake', before.id), before, 'the foreign wake stays untouched');
-  } finally { for (const undo of restore) undo(); await scanner.dispose(); await peerOwner.close(); }
+    assert.equal(f.database.conversationOwners.owns('root'), false);
+    // The owner Host goes away and another Host recovers its Turn: the new external data version
+    // wakes this Host, which takes the target over and starts the queued followup.
+    ownerGone = true;
+    await peerOwner.close();
+    await endTurnOnAnotherHost(f, 'root-turn', 'interrupted');
+    const deadline = Date.now() + 10_000;
+    while (!started.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(errors.length, 0, errors.map(detail => String(detail.error)).join('\n'));
+    assert.deepEqual(started, [accepted.deliveryId]);
+  } finally { await scanner.dispose(); await peerOwner.close(); }
 }));
 
 /** Top-level Conversations outside the fixture team, each with one frozen Turn. */
@@ -838,22 +842,7 @@ test('a wake queued behind a running Turn keeps no poll alive; another host endi
     assert.equal(scans, 0, 'nothing changed, so the waiting wake is not rescanned every interval');
     assert.deepEqual(started, []);
     // Another Host ends the running Turn: no local commit hook fires here.
-    const script = `
-      const path = require('node:path');
-      const load = name => require(path.join(${JSON.stringify(compiled)}, 'backend/reliableKernel', name));
-      const { RootAuthority } = load('rootAuthority.js');
-      const { RuntimeDatabase } = load('runtimeDatabase.js');
-      const { DOMAIN_REPOSITORIES } = load('repositories.js');
-      (async () => {
-        const database = await RuntimeDatabase.open(new RootAuthority(() => ${JSON.stringify(f.runtimeDirectory)}), { hostBootId: 'collaboration-external-host' });
-        try {
-          await database.transaction([
-            DOMAIN_REPOSITORIES.domain('Turn').update('root-turn', { status: 'terminated', terminal_at: ${JSON.stringify(NOW)}, updated_at: ${JSON.stringify(NOW)} }),
-            DOMAIN_REPOSITORIES.domain('TurnTermination').insert({ id: 'root-turn-external-done', turn_id: 'root-turn', terminal_status: 'completed', reason: 'finished elsewhere', created_at: ${JSON.stringify(NOW)} })
-          ]);
-        } finally { await database.close(); }
-      })().catch(error => { console.error(error); process.exitCode = 1; });`;
-    await new Promise((resolve, reject) => execFile(process.execPath, ['-e', script], (error, stdout, stderr) => error ? reject(new Error(`${error.message}\n${stderr}`)) : resolve()));
+    await endTurnOnAnotherHost(f, 'root-turn', 'completed');
     const deadline = Date.now() + 10_000;
     while (!started.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
     assert.deepEqual(started, [accepted.deliveryId], 'the external data version change starts the queued followup');
@@ -896,6 +885,25 @@ test('a task answered just before its target was deleted settles as completed wi
   assert.equal((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, 'the answer');
 }));
 
+/** Ends a Turn from a separate process, as another Host would: only the external data version changes here. */
+async function endTurnOnAnotherHost(f, turnId, status) {
+  const script = `
+    const path = require('node:path');
+    const load = name => require(path.join(${JSON.stringify(compiled)}, 'backend/reliableKernel', name));
+    const { RootAuthority } = load('rootAuthority.js');
+    const { RuntimeDatabase } = load('runtimeDatabase.js');
+    const { DOMAIN_REPOSITORIES } = load('repositories.js');
+    (async () => {
+      const database = await RuntimeDatabase.open(new RootAuthority(() => ${JSON.stringify(f.runtimeDirectory)}), { hostBootId: 'collaboration-external-host' });
+      try {
+        await database.transaction([
+          DOMAIN_REPOSITORIES.domain('Turn').update(${JSON.stringify(turnId)}, { status: 'terminated', terminal_at: ${JSON.stringify(NOW)}, updated_at: ${JSON.stringify(NOW)} }),
+          DOMAIN_REPOSITORIES.domain('TurnTermination').insert({ id: ${JSON.stringify(`${turnId}-external-done`)}, turn_id: ${JSON.stringify(turnId)}, terminal_status: ${JSON.stringify(status)}, reason: 'finished elsewhere', created_at: ${JSON.stringify(NOW)} })
+        ]);
+      } finally { await database.close(); }
+    })().catch(error => { console.error(error); process.exitCode = 1; });`;
+  await new Promise((resolve, reject) => execFile(process.execPath, ['-e', script], (error, stdout, stderr) => error ? reject(new Error(`${error.message}\n${stderr}`)) : resolve()));
+}
 /** Starts the level-triggered loop with a fast interval and counts the scans after its start pass. */
 async function scansAfterStart(scanner, ms) {
   let scans = 0;

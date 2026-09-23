@@ -310,14 +310,16 @@ export class ProcessCompletionDeliveryControlPlane {
       let claim: DomainRow | null = null;
       try {
         const targetConversationId = await this.wakeConversationId(wake);
-        if (targetConversationId !== null && !await gate.check(targetConversationId)) continue;
-        // Read-only and only on the owning Host: a send queued behind its target's running Turn
-        // stays untouched (no claim, backoff or failure count) until that Turn's terminal commit
-        // triggers the next scan.
+        const owned = targetConversationId === null || await gate.check(targetConversationId);
+        // Read-only: a send queued behind its target's running Turn stays untouched (no claim,
+        // backoff or failure count) until that Turn's terminal commit triggers the next scan. On a
+        // Host that does not own the target, only the owner's commit ending that Turn (a new
+        // external data version) or the Turn's recovery can move it, so it keeps no poll alive.
         if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) {
           waitingWakeIds.add(wakeId);
           continue;
         }
+        if (!owned) continue;
         claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
         if (!claim) continue;
         const claimedWake = claim;
