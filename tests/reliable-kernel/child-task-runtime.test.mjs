@@ -103,11 +103,11 @@ async function fixture(mode, hooks, run) {
       where, orderBy: { column: 'id', direction: 'asc' }, limit: 100
     }))).snapshot,
     projection: () => readConversationChildTaskProjection(app.database, app.contentStore, 'parent'),
-    async compress(key) {
-      const [head] = await f.list('ConversationContextHeadLink', { conversation_id: 'parent' });
+    async compress(key, conversationId = 'parent', segmentCount) {
+      const [head] = await f.list('ConversationContextHeadLink', { conversation_id: conversationId });
       const structure = await app.context.materializeStructure(head.root_id);
-      const result = await runner.manualCompression({ commandId: key, conversationId: 'parent',
-        compressSegmentCount: structure.records.length, target: { kind: 'current_head', expectedRootId: head.root_id } });
+      const result = await runner.manualCompression({ commandId: key, conversationId,
+        compressSegmentCount: segmentCount ?? structure.records.length, target: { kind: 'current_head', expectedRootId: head.root_id } });
       assert.equal(result.compression.status, 'compressed', JSON.stringify(result));
       const request = requests.filter(request => request.recipe.kind === 'reliable-context-compression').at(-1);
       assert.equal(request.recipe.compressionMethodKind, mode, 'the requested compression mode actually ran');
@@ -533,6 +533,71 @@ test('a user fork of a forkTurns child owns its inherited history and outlives t
     const again = await lifecycle.fork({ sourceConversationId: fork.conversationId, messageId: forkModel.message_id,
       expectedRevisionId: current.revision_id, commandId: 'fork-of-child-fork-after-parent-delete' });
     await assertSelfContainedAuthority(again.conversationId);
+  });
+});
+
+test('a user fork of a forkTurns child stays forkable after a compression and a delete inside the inherited history', { timeout: 120000 }, async () => {
+  let phase = 1;
+  const rounds = new Map();
+  await fixture('llm_summary', {
+    async send(request, controls) {
+      if (request.conversationId !== 'parent') return complete(controls, done());
+      const round = (rounds.get(phase) ?? 0) + 1;
+      rounds.set(phase, round);
+      if (round === 1 && phase === 3) return complete(controls, { role: 'model', parts: [tool('truncated-history-child', {
+        operation: 'spawn', taskName: 'Truncated reviewer', prompt: 'CHILD_TRUNCATED_ASSIGNMENT_6120', forkTurns: 'all' })] });
+      return complete(controls, { role: 'model', parts: [{ text: `PARENT_REPLY_${phase}_6120` }] });
+    }
+  }, async f => {
+    for (phase = 1; phase <= 3; phase += 1) {
+      assert.equal((await f.runInput(`truncated-child-history-${phase}`, `PARENT_HISTORY_${phase}_6120`)).terminalStatus, 'completed');
+    }
+    await f.coordinator.waitForIdle();
+    const [execution] = await f.list('ChildExecution');
+    const child = execution.child_conversation_id;
+    await eventually(async () => (await f.list('Turn', { conversation_id: child })).every(turn => turn.status === 'terminated')
+      && (await f.list('Turn', { conversation_id: child })).length === 3, 'the child did not finish its assignment');
+    // The child's first Context root holds both inherited exchanges and its assignment in one step:
+    // no root of the child ever held only part of the inherited history.
+    const [firstRoot] = (await f.list('ContextSequenceRoot', { conversation_id: child }))
+      .sort((left, right) => Number(left.root_seq - right.root_seq));
+    assert.equal(firstRoot.segment_count, 5n, 'fixture: the child started from two inherited exchanges and its assignment');
+    const lifecycle = new ReliableConversationLifecycle({ application: f.app, configuration: f.configuration });
+    const messages = async conversationId => {
+      const result = [];
+      for (const member of (await f.list('MessagePartOfConversation', { conversation_id: conversationId }))
+        .sort((left, right) => Number(left.message_seq - right.message_seq))) {
+        const [current] = await f.list('MessageCurrentRevisionLink', { message_id: member.message_id });
+        const [revision] = await f.list('MessageRevision', { id: current.revision_id });
+        const [message] = await f.list('Message', { id: member.message_id });
+        if (message.deleted_at === null) result.push({ messageId: member.message_id, expectedRevisionId: revision.id, role: revision.role });
+      }
+      return result;
+    };
+    const latestModel = async conversationId => (await messages(conversationId)).filter(message => message.role === 'model').at(-1);
+    const fork = await lifecycle.fork({ sourceConversationId: child, ...await latestModel(child), commandId: 'fork-truncated-child' });
+    const branch = fork.conversationId;
+    // Compress the first inherited exchange, then delete from the second one: the compression's
+    // creation root keeps only the first exchange, which no root of the branch holds.
+    await f.compress('truncated-child-compression', branch, 2);
+    const secondInherited = (await messages(branch))[2];
+    assert.equal(secondInherited.role, 'user');
+    await f.app.turns.delete({ source: { kind: 'command', key: 'delete-inside-inherited-history' }, conversationId: branch,
+      messageId: secondInherited.messageId });
+    assert.equal((await f.app.context.materializeStructure(await f.app.context.currentHeadRootId(branch))).records.length, 1);
+    assert.equal((await f.runInput('continue-truncated-child-fork', 'CONTINUE_TRUNCATED_FORK_6120', branch)).terminalStatus, 'completed');
+
+    const again = await lifecycle.fork({ sourceConversationId: branch, ...await latestModel(branch), commandId: 'refork-truncated-child' });
+    const [block] = await f.list('CompressionBlock', { conversation_id: again.conversationId });
+    const [projection] = await f.list('ModelContextProjection', { owner_kind: 'compression_block', owner_id: block.id });
+    const [creationRoot] = await f.list('ContextSequenceRoot', { id: projection.root_id });
+    assert.equal(creationRoot.conversation_id, again.conversationId, 'the creation projection is re-homed onto the new fork');
+    assert.equal(creationRoot.segment_count, 2n, 'the creation root holds exactly the kept first exchange');
+    assert.equal((await f.runInput('continue-truncated-child-refork', 'CONTINUE_TRUNCATED_REFORK_6120', again.conversationId))
+      .terminalStatus, 'completed');
+    const body = JSON.stringify(f.requests.at(-1).context);
+    assert.ok(body.includes(SUMMARY) && body.includes('CONTINUE_TRUNCATED_FORK_6120'));
+    assert.ok(!body.includes('PARENT_HISTORY_2_6120'), 'the deleted inherited exchange stays deleted');
   });
 });
 

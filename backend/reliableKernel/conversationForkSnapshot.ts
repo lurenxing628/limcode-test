@@ -43,10 +43,10 @@ export interface ForkContextRoots {
   /** Source ContextSequenceRoot id -> copied target history root id. */
   history: ReadonlyMap<string, string>;
   /**
-   * Source pre-compression root of a kept block -> the source root holding exactly its retained
-   * part, for creation roots whose end the retained history no longer contains.
+   * Source pre-compression root of a kept block -> the target root holding exactly its kept part,
+   * for creation roots that are not themselves copied history.
    */
-  creation: ReadonlyMap<string, DomainRow>;
+  creation: ReadonlyMap<string, string>;
 }
 
 const PAGE_LIMIT = 1000;
@@ -921,8 +921,9 @@ interface CompressionBlockCopy {
 
 /**
  * A copied block always keeps its creation projection, re-homed onto the fork's own history: its
- * readers (fork precedence, replacement) need it. A block whose pre-compression root has no
- * equivalent in the fork is refused rather than copied without one.
+ * readers (fork precedence, replacement) need it. Only a block whose pre-compression root was
+ * rewritten before its end (an in-place edit) has no kept part in the fork; it is refused rather
+ * than copied without a projection.
  */
 async function readCompressionBlockCopies(
   database: RuntimeDatabase,
@@ -934,8 +935,9 @@ async function readCompressionBlockCopies(
     const blockId = id(lineage.block.id, 'CompressionBlock.id');
     const observationLinks = await listAllDomainRows(database, 'CompressionBlockObservationLink', { compression_block_id: blockId });
     const sourceRootId = id(lineage.creationProjection.root_id, 'ModelContextProjection.root_id');
-    const [sourceRoot] = await getRows(database, 'ContextSequenceRoot', [sourceRootId]);
-    const rootId = roots ? mapForkContextRoot(roots.creation.get(sourceRootId) ?? sourceRoot, roots) : undefined;
+    const rootId = roots
+      ? roots.creation.get(sourceRootId) ?? mapForkContextRoot((await getRows(database, 'ContextSequenceRoot', [sourceRootId]))[0], roots)
+      : undefined;
     if (!rootId) {
       throw new ConversationForkRejectedError(
         `Fork Context keeps CompressionBlock ${blockId} whose history was rewritten after it; fork from its pre-compression history.`

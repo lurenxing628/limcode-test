@@ -658,6 +658,154 @@ test('a kept compression whose creation history was rewritten mid-way is refused
   }, { compression: true });
 });
 
+async function compressHead(h, conversationId, commandId, compressSegmentCount) {
+  const runner = new ReliableConversationRunner(h.app, 'fork-fixture-owner');
+  try {
+    const expectedRootId = await h.app.context.currentHeadRootId(conversationId);
+    const compressed = await runner.manualCompression({
+      commandId, conversationId, compressSegmentCount, target: { kind: 'current_head', expectedRootId }
+    });
+    assert.equal(compressed.compression.status, 'compressed');
+  } finally { runner.dispose(); }
+}
+
+/**
+ * Every block of the Conversation keeps one creation projection on a root the Conversation owns,
+ * starting with the block's compressed range. Returns the creation segments of each block.
+ */
+async function assertOwnedCreationRoots(h, conversationId, count) {
+  const blocks = await rows(h.app, 'CompressionBlock', { conversation_id: conversationId });
+  assert.equal(blocks.length, count, 'the fork owns every compression that precedes its boundary');
+  const creations = [];
+  for (const block of blocks) {
+    const projections = await rows(h.app, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: block.id });
+    assert.equal(projections.length, 1, 'the copied block keeps its creation projection');
+    const [root] = await rows(h.app, 'ContextSequenceRoot', { id: projections[0].root_id });
+    assert.equal(root.conversation_id, conversationId, 'the creation projection is re-homed onto the fork');
+    const sources = (await rows(h.app, 'CompressionBlockSource', { compression_block_id: block.id }))
+      .sort((left, right) => Number(left.position - right.position)).map(source => source.segment_id);
+    const { records } = await h.app.context.materializeStructure(root.id);
+    assert.deepEqual(records.slice(0, sources.length).map(record => record.segment.id), sources,
+      'the creation root starts with the compressed range');
+    creations.push({ sources, records });
+  }
+  return creations;
+}
+
+for (const rewrite of ['retry', 'delete', 'edit']) {
+  test(`stacked compressions followed by a ${rewrite} in the second one's creation tail keep later messages forkable`, async () => {
+    await withForkRuntime(async h => {
+      await h.turn('source', 'stacked-first');
+      await h.turn('source', 'stacked-second');
+      const third = await h.turn('source', 'stacked-third');
+      await compressHead(h, 'source', 'stacked-compression-1', 2);
+      await compressHead(h, 'source', 'stacked-compression-2', 3);
+      // The second compression summarized [first summary, second exchange] of the first one's
+      // output root, which was written in one step: no root ever held just part of its tail.
+      const head = await h.app.context.materializeStructure(await h.app.context.currentHeadRootId('source'));
+      assert.deepEqual(head.records.map(record => record.segment.segment_kind), ['compression', 'message', 'message'],
+        'fixture: the second compression kept the third exchange as its tail');
+      const [thirdInput, thirdReply] = head.records.slice(1).map(record => record.segment.id);
+      if (rewrite === 'retry') {
+        const reply = await h.command('source', 'unused');
+        await h.turn('source', 'stacked-retry', {
+          sourceTurnId: third.turnId, target: { kind: 'message', messageId: reply.messageId },
+          expectedMessageRevisionId: reply.expectedRevisionId
+        });
+      } else {
+        const [input] = (await rows(h.app, 'MessageTurnLink', { turn_id: third.turnId })).filter(link => link.role === 'input');
+        if (rewrite === 'delete') {
+          await h.app.turns.delete({ source: { kind: 'command', key: 'stacked-delete' }, conversationId: 'source', messageId: input.message_id });
+        } else {
+          const [current] = await rows(h.app, 'MessageCurrentRevisionLink', { message_id: input.message_id });
+          await h.app.turns.edit({
+            source: { kind: 'command', key: 'stacked-edit' }, conversationId: 'source', messageId: input.message_id,
+            expectedRevisionId: current.revision_id, content: 'stacked-third-edited', deleteFollowing: true
+          });
+        }
+        await h.turn('source', 'stacked-after-rewrite');
+      }
+      assert.deepEqual((await rows(h.app, 'CompressionBlock', { conversation_id: 'source' })).map(block => block.status),
+        ['enabled', 'enabled']);
+      const discarded = rewrite === 'retry' ? [thirdReply] : [thirdInput, thirdReply];
+      const assertKeptCreationTails = async conversationId => {
+        const creations = await assertOwnedCreationRoots(h, conversationId, 2);
+        for (const { records } of creations) {
+          assert.deepEqual(records.filter(record => discarded.includes(record.segment.id)), [],
+            'a creation root holds only the part of its history the fork keeps');
+        }
+        // The second block's creation root is exactly its kept part: its range, then what is left of its tail.
+        const [second] = creations.filter(({ records }) => records[0].segment.segment_kind === 'compression');
+        assert.deepEqual(second.records.map(record => record.segment.id),
+          [...second.sources, ...(rewrite === 'retry' ? [thirdInput] : [])]);
+      };
+
+      await assertForkableAfterRewrite(h, `stacked-${rewrite}`, assertKeptCreationTails, /stacked-first|stacked-second/);
+    }, { compression: true });
+  });
+}
+
+/**
+ * The latest user message and the latest reply of the source fork; the fork continues, re-forks,
+ * and still forks after its source is deleted. Every fork passes `assertFork`.
+ */
+async function assertForkableAfterRewrite(h, label, assertFork, compressedAway) {
+  const atUser = await h.facade.forkConversation(await h.command('source', `${label}-fork-user`, 'user'));
+  await assertFork(atUser.conversationId);
+  const fork = await h.facade.forkConversation(await h.command('source', `${label}-fork`));
+  await assertFork(fork.conversationId);
+  await h.turn(fork.conversationId, `${label}-continue-fork`);
+  let context = h.requests.at(-1).context.map(item => item.content).join('\n');
+  assert.match(context, /offline summary/);
+  assert.doesNotMatch(context, compressedAway);
+  const refork = await h.facade.forkConversation(await h.command(fork.conversationId, `${label}-refork`));
+  await assertFork(refork.conversationId);
+
+  await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
+  assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
+  const orphan = await h.facade.forkConversation(await h.command(fork.conversationId, `${label}-fork-after-delete`));
+  await assertFork(orphan.conversationId);
+  await h.turn(orphan.conversationId, `${label}-continue-after-delete`);
+  context = h.requests.at(-1).context.map(item => item.content).join('\n');
+  assert.match(context, /offline summary/);
+  assert.match(context, new RegExp(`${label}-continue-fork`));
+}
+
+test('an automatic compression that keeps part of a manual compression\'s tail stays forkable after a delete', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'mixed-first');
+    await h.turn('source', `mixed-second ${'以前的重要历史。'.repeat(12000)}`);
+    const third = await h.turn('source', 'mixed-third');
+    await compressHead(h, 'source', 'mixed-manual-compression', 2);
+    await h.saveCompression({ trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 },
+      llmSummary: { targetTokens: 512 } });
+    const automatic = await h.turn('source', 'mixed-fourth');
+    await h.saveCompression({ trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 } });
+    const [thirdInput] = (await rows(h.app, 'MessageTurnLink', { turn_id: third.turnId })).filter(link => link.role === 'input');
+    const [thirdRevision] = await rows(h.app, 'MessageCurrentRevisionLink', { message_id: thirdInput.message_id });
+    const [thirdSource] = await rows(h.app, 'ContextSegmentSource', { source_kind: 'message_revision', source_id: thirdRevision.revision_id });
+    const blocks = await rows(h.app, 'CompressionBlock', { conversation_id: 'source' });
+    const authorityTurns = await Promise.all(blocks.map(async block =>
+      (await rows(h.app, 'AuthoritySnapshot', { id: block.authority_snapshot_id }))[0].turn_id));
+    assert.equal(blocks.length, 2);
+    assert.ok(authorityTurns.includes(automatic.turnId), 'fixture: the fourth Turn compressed automatically');
+    const head = await h.app.context.materializeStructure(await h.app.context.currentHeadRootId('source'));
+    assert.ok(head.records.slice(1).some(record => record.segment.id === thirdSource.segment_id),
+      'fixture: the automatic compression kept the third exchange of the manual compression\'s tail');
+    // Deleting the third exchange leaves the automatic compression only a part of the manual
+    // compression's one-step output root as its kept creation history.
+    await h.app.turns.delete({ source: { kind: 'command', key: 'mixed-delete' }, conversationId: 'source', messageId: thirdInput.message_id });
+    await h.turn('source', 'mixed-after-delete');
+    const assertKeptCreationTails = async conversationId => {
+      for (const { records } of await assertOwnedCreationRoots(h, conversationId, 2)) {
+        assert.equal(records.some(record => record.segment.id === thirdSource.segment_id), false,
+          'a creation root holds only the part of its history the fork keeps');
+      }
+    };
+    await assertForkableAfterRewrite(h, 'mixed', assertKeptCreationTails, /mixed-first|以前的重要历史/);
+  }, { compression: true });
+});
+
 test('a copied failed turn keeps its termination and its failed request stays retryable in the fork', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'healthy-history');

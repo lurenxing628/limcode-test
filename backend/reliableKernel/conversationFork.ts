@@ -12,7 +12,7 @@ import {
   type ForkContextLineage
 } from './conversationForkContext';
 export { ConversationForkRejectedError } from './conversationForkContext';
-import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
+import { prepareConversationForkSnapshot, type ForkContextRootShape } from './conversationForkSnapshot';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { estimateContextSegmentTokens, ReliableContextTokenEstimator } from './contextTokenEstimator';
 import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
@@ -290,8 +290,15 @@ export class ConversationForkControlPlane {
     const historicalSourceRoots = await retainedForkHistoryRoots(
       this.database, sourceContextRoots, command.sourceContextRootId, retainedLineage.segmentIds
     );
+    const targetHead: ForkContextRootShape = {
+      id: ids.targetRootId,
+      rootNodeId: targetRootShape.rootNodeId,
+      tailNodeId: targetRootShape.tailNodeId,
+      tailSegmentCount: targetRootShape.tailSegmentCount,
+      segmentCount: targetRootShape.segmentCount
+    };
     const creationRoots = await retainedCreationRoots(
-      this.database, sourceContextRoots, historicalSourceRoots, retainedLineage
+      this.database, this.tokenEstimator, ids.targetConversationId, targetHead, historicalSourceRoots, retainedLineage
     );
     const transcript = await prepareConversationForkSnapshot(this.database, {
       sourceConversationId: command.sourceConversationId,
@@ -303,18 +310,12 @@ export class ConversationForkControlPlane {
       contextSegmentIds: targetRootShape.segmentIds ?? retainedSegmentIds,
       targetAgentId: command.targetAgentId,
       contextRoots: {
-        head: {
-          id: ids.targetRootId,
-          rootNodeId: targetRootShape.rootNodeId,
-          tailNodeId: targetRootShape.tailNodeId,
-          tailSegmentCount: targetRootShape.tailSegmentCount,
-          segmentCount: targetRootShape.segmentCount
-        },
+        head: targetHead,
         history: new Map(historicalSourceRoots.map((root) => {
           const sourceRootId = requireId(root.id, 'ContextSequenceRoot.id');
           return [sourceRootId, forkHistoryRootId(ids.targetConversationId, sourceRootId)];
         })),
-        creation: creationRoots
+        creation: creationRoots.targets
       },
       now
     });
@@ -438,6 +439,19 @@ export class ConversationForkControlPlane {
         tail_segment_count: requireBigInt(root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count'),
         segment_count: requireBigInt(root.segment_count, 'ContextSequenceRoot.segment_count'),
         estimated_tokens: requireBigInt(root.estimated_tokens, 'ContextSequenceRoot.estimated_tokens'),
+        created_at: now
+      }, {
+        column: 'root_seq',
+        scope: { conversation_id: ids.targetConversationId }
+      })),
+      ...creationRoots.owned.map((root) => DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
+        id: root.id,
+        conversation_id: ids.targetConversationId,
+        root_node_id: root.rootNodeId,
+        tail_node_id: root.tailNodeId,
+        tail_segment_count: root.tailSegmentCount,
+        segment_count: root.segmentCount,
+        estimated_tokens: root.estimatedTokens,
         created_at: now
       }, {
         column: 'root_seq',
@@ -689,6 +703,17 @@ function forkHistoryRootId(targetConversationId: string, sourceRootId: string): 
   return stableId('context_root', JSON.stringify(['fork-history', targetConversationId, sourceRootId]));
 }
 
+function forkKeptCreationRootId(targetConversationId: string, shape: Omit<ForkContextRootShape, 'id'>): string {
+  return stableId('context_root', JSON.stringify([
+    'fork-kept-creation',
+    targetConversationId,
+    shape.rootNodeId,
+    shape.tailNodeId,
+    shape.tailSegmentCount.toString(),
+    shape.segmentCount.toString()
+  ]));
+}
+
 function stableId(kind: string, scope: string): string {
   const digest = createHash('sha256')
     .update('limcode-phase-f-conversation-fork\0')
@@ -797,38 +822,78 @@ async function retainedForkHistoryRoots(
   return result;
 }
 
+interface ForkCreationRoots {
+  /** Source pre-compression root of a kept block -> the target root holding exactly its kept part. */
+  targets: Map<string, string>;
+  /** Kept parts that no copied root holds; the fork inserts its own history root for each. */
+  owned: Array<ForkContextRootShape & { estimatedTokens: bigint }>;
+}
+
 /**
- * A kept block's pre-compression root can run past the retained history when a delete or retry
- * later discarded its end (for example the transcript of the Turn that compressed). The fork then
- * stands that root for the source root holding exactly its retained part, so the copied block keeps
- * a creation projection made of its own history. A root rewritten before its end while later parts
- * stay history (an edit) has no such part and is left unmapped.
+ * A kept block's pre-compression root can run past the retained history when a delete, retry or
+ * truncating edit later discarded its end (for example the transcript of the Turn that compressed).
+ * The copied block's creation projection then points at the fork root holding exactly its kept
+ * part: the head or a copied history root of that shape, otherwise a history root the fork inserts
+ * over the existing immutable nodes. A compression writes its output root in one step, so a later
+ * compression over that root finds no source root for part of its tail. A root rewritten before
+ * its end while later parts stay history (an in-place edit) has no kept part and is left unmapped.
  */
 async function retainedCreationRoots(
   database: RuntimeDatabase,
-  roots: readonly DomainRow[],
+  tokenEstimator: ReliableContextTokenEstimator,
+  targetConversationId: string,
+  head: ForkContextRootShape,
   historicalRoots: readonly DomainRow[],
   lineage: ForkContextLineage
-): Promise<Map<string, DomainRow>> {
+): Promise<ForkCreationRoots> {
   const historical = new Set(historicalRoots.map((root) => requireId(root.id, 'ContextSequenceRoot.id')));
-  const result = new Map<string, DomainRow>();
+  const targets = new Map<string, string>();
+  const owned = new Map<string, ForkCreationRoots['owned'][number]>();
   for (const { creationProjection } of lineage.compressionBlocks) {
     const creationRootId = requireId(creationProjection.root_id, 'ModelContextProjection.root_id');
-    if (historical.has(creationRootId) || result.has(creationRootId)) continue;
+    if (historical.has(creationRootId) || targets.has(creationRootId)) continue;
     const records = (await database.materializeContext(creationRootId)).snapshot.records;
-    const end = records.findIndex((record) => !lineage.segmentIds.has(requireId(record.segment.id, 'ContextSegment.id')));
-    if (end <= 0 || records.slice(end).some((record) => lineage.segmentIds.has(requireId(record.segment.id, 'ContextSegment.id')))) {
+    const retained = (record: StructuralContextRecord) => lineage.segmentIds.has(requireId(record.segment.id, 'ContextSegment.id'));
+    const firstDiscarded = records.findIndex((record) => !retained(record));
+    const end = firstDiscarded < 0 ? records.length : firstDiscarded;
+    if (end === 0 || records.slice(end).some(retained)) continue;
+    const compressed = records[0].segment.segment_kind === 'compression';
+    const last = requireId(records[end - 1].node.id, 'ContextSequenceNode.id');
+    const shape = {
+      rootNodeId: compressed ? requireId(records[0].node.id, 'ContextSequenceNode.id') : last,
+      tailNodeId: compressed && end > 1 ? last : null,
+      tailSegmentCount: compressed ? BigInt(end - 1) : 0n,
+      segmentCount: BigInt(end)
+    };
+    const sameShape = (root: Omit<ForkContextRootShape, 'id'>) => root.rootNodeId === shape.rootNodeId
+      && root.tailNodeId === shape.tailNodeId
+      && root.tailSegmentCount === shape.tailSegmentCount
+      && root.segmentCount === shape.segmentCount;
+    if (sameShape(head)) {
+      targets.set(creationRootId, head.id);
       continue;
     }
-    const first = requireId(records[0].node.id, 'ContextSequenceNode.id');
-    const last = requireId(records[end - 1].node.id, 'ContextSequenceNode.id');
-    const compressed = records[0].segment.segment_kind === 'compression';
-    const retained = roots.find((root) => root.segment_count === BigInt(end) && (compressed
-      ? root.root_node_id === first && root.tail_node_id === (end > 1 ? last : null)
-      : root.root_node_id === last && root.tail_node_id === null));
-    if (retained) result.set(creationRootId, retained);
+    const copied = historicalRoots.find((root) => sameShape({
+      rootNodeId: nullableId(root.root_node_id, 'ContextSequenceRoot.root_node_id'),
+      tailNodeId: nullableId(root.tail_node_id, 'ContextSequenceRoot.tail_node_id'),
+      tailSegmentCount: requireBigInt(root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count'),
+      segmentCount: requireBigInt(root.segment_count, 'ContextSequenceRoot.segment_count')
+    }));
+    if (copied) {
+      targets.set(creationRootId, forkHistoryRootId(targetConversationId, requireId(copied.id, 'ContextSequenceRoot.id')));
+      continue;
+    }
+    const id = forkKeptCreationRootId(targetConversationId, shape);
+    if (!owned.has(id)) {
+      owned.set(id, {
+        id,
+        ...shape,
+        estimatedTokens: BigInt(await tokenEstimator.estimateRootPrefix(creationRootId, end))
+      });
+    }
+    targets.set(creationRootId, id);
   }
-  return result;
+  return { targets, owned: [...owned.values()] };
 }
 
 /**
