@@ -59,6 +59,12 @@ test('C8 OpenAI 兼容：只有思考就以 length / content_filter / error 结�
       const result = await run(settings('openai-compatible', `${base}/v1`, 'reasoner'));
       assert.equal(result.done, false, finish);
       assert.ok(result.error, finish);
+      if (finish === 'error') {
+        // The provider package already reports finish_reason "error" as an upstream stream error
+        // (OpenRouter documents it as the mid-stream error terminator), before the empty-output rule.
+        assert.match(result.error.message, /finish_reason: "error"|结束原因：error/);
+        return;
+      }
       assert.match(result.error.message, new RegExp(`结束原因：${finish}`));
       assert.equal(result.error.rawError.finishReason, finish);
     });
