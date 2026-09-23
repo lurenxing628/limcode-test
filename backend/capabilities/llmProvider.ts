@@ -3614,7 +3614,7 @@ const ROLLING_SUMMARY_STRUCTURE_INSTRUCTION = [
 function buildSummaryProviderCall(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord
+  settings: SummaryWindowSettings
 ): SummaryProviderCall {
   const summarySettings = methodConfig.llmSummary;
   const targetTokens = effectiveSummaryTargetTokens(methodConfig);
@@ -3647,6 +3647,9 @@ function buildSummaryProviderCall(
   };
 }
 
+/** The only Provider setting the summary splitter measures against. */
+type SummaryWindowSettings = Pick<LlmProviderConfigRecord, 'contextWindowTokens'>;
+
 interface SegmentedSummaryChunk {
   requestContents: MessageContent[];
   sourceContents: MessageContent[];
@@ -3662,7 +3665,7 @@ interface SegmentedSummaryUnit extends SegmentedSummaryChunk {
 function buildSegmentedSummaryProviderCalls(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord
+  settings: SummaryWindowSettings
 ): SummaryProviderCall[] {
   const totalTargetTokens = effectiveSummaryTargetTokens(methodConfig);
   const sourceSegments = (request.segments && request.segments.length > 0
@@ -3687,10 +3690,16 @@ function buildSegmentedSummaryProviderCalls(
   const priorFor = (index: number): string => index === 0
     ? priorSummaryText
     : finalAnswerTextOf(groups[index - 1]?.requestContents ?? []);
+  const callFor = (contents: MessageContent[], index: number): SummaryProviderCall =>
+    buildSegmentDeltaCall(contents, index, priorFor(index), methodConfig, settings, totalTargetTokens);
   const fits = (contents: MessageContent[], index: number): boolean => isSummaryProviderCallWithinWindow(
-    buildSegmentDeltaCall(contents, index, priorFor(index), methodConfig, settings, totalTargetTokens),
+    callFor(contents, index),
     settings
   );
+  // Every packing call carries the same generation config, so they share one input limit.
+  const packingLimitTokens = summaryProviderInputLimitTokens(callFor([], 0), settings);
+  // Upper bound on the current chunk's call tokens; undefined until the next exact measurement.
+  let currentCallTokensBound: number | undefined;
   const pushCurrent = (): void => {
     if (current.requestContents.length === 0) return;
     if (groups.length >= MAX_SEGMENTED_SUMMARY_LEAF_CALLS) {
@@ -3700,13 +3709,32 @@ function buildSegmentedSummaryProviderCalls(
     }
     groups.push(current);
     current = { requestContents: [], sourceContents: [] };
+    currentCallTokensBound = undefined;
   };
 
   for (const unit of units) {
+    // Re-measuring the whole growing chunk for every unit made packing quadratic. The token
+    // estimator is additive across the escaped transcript, so a unit whose rendered cost still fits
+    // under the last exact measurement is accepted without re-rendering the chunk; anything closer
+    // to the limit takes the exact measurement below.
+    if (currentCallTokensBound !== undefined && current.requestContents.length > 0) {
+      const bound = currentCallTokensBound + appendedSummaryTranscriptTokensBound(
+        unit.requestContents,
+        current.requestContents.length
+      );
+      if (bound <= packingLimitTokens) {
+        current.requestContents = [...current.requestContents, ...unit.requestContents];
+        current.sourceContents.push(...unit.sourceContents);
+        currentCallTokensBound = bound;
+        continue;
+      }
+    }
     const candidate = [...current.requestContents, ...unit.requestContents];
-    if (fits(candidate, groups.length)) {
+    const candidateTokens = summaryProviderCallInputTokens(callFor(candidate, groups.length));
+    if (packingLimitTokens > 0 && candidateTokens <= packingLimitTokens) {
       current.requestContents = candidate;
       current.sourceContents.push(...unit.sourceContents);
+      currentCallTokensBound = candidateTokens;
       continue;
     }
     pushCurrent();
@@ -3730,6 +3758,7 @@ function buildSegmentedSummaryProviderCalls(
       current.requestContents.push(...safeUnit.requestContents);
       current.sourceContents.push(...safeUnit.sourceContents);
     }
+    currentCallTokensBound = undefined;
   }
   pushCurrent();
   if (groups.length > MAX_SEGMENTED_SUMMARY_LEAF_CALLS) {
@@ -3762,7 +3791,7 @@ function splitOversizedSummaryUnit(
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number,
   maxChunks: number
 ): SegmentedSummaryChunk[] {
@@ -3852,15 +3881,23 @@ function largestFittingSummaryTextPrefix(
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number
 ): string {
+  // A fitting prefix never carries more tokens than the whole call may, so the search only needs
+  // one window's worth of text; slicing the complete remainder on every probe was the slow part.
+  const limitTokens = summaryProviderInputLimitTokens(
+    buildSegmentDeltaCall([], index, priorContext, methodConfig, settings, targetTokens),
+    settings
+  );
+  if (limitTokens <= 0) return '';
+  const searchText = sliceByTokens(text, 0, limitTokens + 1);
   let low = 1;
-  let high = Math.max(1, estimateTokenCount(text));
+  let high = Math.max(1, estimateTokenCount(searchText));
   let best = '';
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
-    const candidateText = sliceByTokens(text, 0, middle);
+    const candidateText = sliceByTokens(searchText, 0, middle);
     if (!candidateText) {
       low = middle + 1;
       continue;
@@ -3888,7 +3925,7 @@ function buildSegmentDeltaCall(
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number,
   sourceContents: MessageContent[] = segment
 ): SummaryProviderCall {
@@ -3920,7 +3957,7 @@ function buildSummaryReplacementMergeCall(
   deltaSummaries: readonly string[],
   sourceContents: MessageContent[],
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number
 ): SummaryProviderCall {
   return {
@@ -4006,7 +4043,7 @@ async function mergeSegmentedSummaryHierarchy(
 function packSegmentedSummaryNodes(
   nodes: readonly SegmentedSummaryNode[],
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number
 ): SegmentedSummaryNode[][] {
   const groups: SegmentedSummaryNode[][] = [];
@@ -4044,6 +4081,7 @@ const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = 32;
 const MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS = 6;
 const SEGMENTED_SUMMARY_CONCURRENCY = 3;
 const SEGMENTED_PRIOR_CONTEXT_TOKENS = 1_024;
+const SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS = 4;
 const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 8_192;
 const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 2;
 const SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS = 8_000;
@@ -4055,7 +4093,7 @@ const SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS = 8_000;
  */
 function summaryGenerationConfig(
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokensOverride?: number
 ): LlmGenerationConfigRecord | undefined {
   const targetTokens = targetTokensOverride ?? methodConfig.llmSummary?.targetTokens;
@@ -4303,8 +4341,8 @@ function usageMetadataFromCompact(value: unknown): LlmUsageMetadataRecord | unde
   return isRecord(cleaned) && Object.keys(cleaned).length > 0 ? cleaned as LlmUsageMetadataRecord : undefined;
 }
 
-function renderContentsForSummary(contents: MessageContent[]): string {
-  return contents.map((content, index) => `${index + 1}. ${content.role}: ${content.parts.map(renderSummaryPart).filter(Boolean).join('\n') || '[empty]'}`).join('\n\n');
+function renderContentsForSummary(contents: MessageContent[], startIndex = 0): string {
+  return contents.map((content, index) => `${startIndex + index + 1}. ${content.role}: ${content.parts.map(renderSummaryPart).filter(Boolean).join('\n') || '[empty]'}`).join('\n\n');
 }
 
 function renderSummaryPart(part: ContentPart): string {
@@ -4636,19 +4674,38 @@ function fitTextToTokenLimit(text: string, limit: number): string {
 
 function isSummaryProviderCallWithinWindow(
   call: SummaryProviderCall,
-  settings: LlmProviderConfigRecord
+  settings: SummaryWindowSettings
 ): boolean {
+  const inputLimit = summaryProviderInputLimitTokens(call, settings);
+  if (inputLimit <= 0) return false;
+  return summaryProviderCallInputTokens(call) <= inputLimit;
+}
+
+function summaryProviderInputLimitTokens(call: SummaryProviderCall, settings: SummaryWindowSettings): number {
   const contextWindowTokens = settings.contextWindowTokens ?? DEFAULT_LLM_CONTEXT_WINDOW_TOKENS;
   const outputTokens = call.request.generationConfig?.maxOutputTokens
     ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
-  const inputLimit = contextWindowTokens
+  return contextWindowTokens
     - Math.max(DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, outputTokens)
     - SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS;
-  if (inputLimit <= 0) return false;
+}
+
+function summaryProviderCallInputTokens(call: SummaryProviderCall): number {
   return estimateTokenCount(JSON.stringify({
     contents: call.request.contents,
     systemInstruction: call.request.systemInstruction
-  })) <= inputLimit;
+  }));
+}
+
+/**
+ * Upper bound on what appending messages adds to a summary call already holding `startIndex`
+ * messages. JSON escapes character by character and the estimator sums independent segments, so
+ * the appended escaped text costs what it costs alone; the quotes JSON adds around it and a small
+ * allowance cover the one segment that may merge across either edge.
+ */
+function appendedSummaryTranscriptTokensBound(contents: MessageContent[], startIndex: number): number {
+  return estimateTokenCount(JSON.stringify(`\n\n${renderContentsForSummary(contents, startIndex)}`))
+    + SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS;
 }
 
 function modelCatalogEntryToRecord(model: UnifiedModelCatalogEntry): LlmProviderModelRecord {
