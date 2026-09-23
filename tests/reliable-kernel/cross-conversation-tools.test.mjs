@@ -1941,3 +1941,38 @@ test('two conversations trading followups and replies stop once the chain budget
     assert.equal((await f.rows('CollaborationBudget')).length, 1, 'one chain budget');
   }, { runAgentConfig: { maxAutomaticFollowups: 4 } });
 });
+
+test('fork_conversation that fails after copying settings removes them and reports a clear error', { timeout: 60000 }, async () => {
+  let rootRound = 0, forkResult;
+  await fixture(async (request, f, start) => {
+    assert.equal(request.conversationId, ROOT);
+    rootRound += 1;
+    if (rootRound === 1) return answer('FIRST_ANSWER_6701');
+    if (rootRound === 2) return toolsAnswer(call('fork-self', 'fork_conversation'));
+    forkResult = lastResult(start, 'fork_conversation');
+    return answer('Fork failed.');
+  }, async f => {
+    await f.terminated((await f.input(ROOT, 'FIRST_QUESTION_6700')).turnId);
+    await f.configuration.mutations.initializeConversationModelProfile({ conversationId: ROOT, providerConfigId: 'synthetic-cross', model: 'gpt-6-astra' });
+    assert.equal((await f.settingsFor(ROOT)).modelProfiles.length, 1);
+    const mutations = f.configuration.mutations;
+    const copy = mutations.copyConversationConfiguration;
+    mutations.copyConversationConfiguration = async function(source, target) {
+      await copy.call(this, source, target);
+      // A concurrent change to a fact the fork transaction asserts makes its commit fail.
+      const at = new Date().toISOString();
+      const [agentLink] = await f.rows('AgentConversationLink', { conversation_id: ROOT, role: 'default' });
+      await f.app.database.transaction([repo('AgentConversationLink').insert({ id: 'concurrent-participant', conversation_id: ROOT,
+        agent_id: agentLink.agent_id, role: 'participant', created_at: at, updated_at: at })]);
+    };
+    const started = await f.input(ROOT, 'fork please');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    const targetId = kernel.stablePhaseFId('conversation', `conversation-fork:${f.toolCallId('fork-self')}`);
+    assert.notEqual(forkResult?.status, 'succeeded');
+    assert.match(JSON.stringify(forkResult), /changed while it was being forked/);
+    assert.match(JSON.stringify(forkResult), /Nothing was created/);
+    assert.doesNotMatch(JSON.stringify(forkResult), /assertExactIds|assertion failed/i);
+    assert.deepEqual(await f.rows('Conversation', { id: targetId }), []);
+    assert.deepEqual(await f.settingsFor(targetId), { modelProfiles: [], workEnvironments: [] }, 'no settings stay behind for the uncreated fork');
+  });
+});

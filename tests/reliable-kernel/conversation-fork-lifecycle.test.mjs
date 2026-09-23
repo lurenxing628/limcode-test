@@ -1192,13 +1192,21 @@ test('a fork that fails before its commit point writes no settings', async () =>
   });
 });
 
-test('fork_conversation rejected for lack of completed history removes the settings an interrupted attempt copied', async () => {
+/**
+ * Settings an attempt of this fork command copied before its Host died at the commit: a failure the
+ * process survives already removes them, so only a crash leaves them for a later rejection.
+ */
+async function copiedByCrashedAttempt(h, commandId) {
+  await h.configuration.mutations.copyConversationConfiguration('source', stablePhaseFId('conversation', `conversation-fork:${commandId}`));
+  assert.notDeepEqual(await strayConversationSettings(h.configuration, ['source']), [], 'fixture: the crashed attempt copied settings');
+}
+
+test('fork_conversation that fails at its commit removes the settings it copied', async () => {
   const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
   await withForkRuntime(async h => {
-    await h.turn('source', 'completed-history-input');
+    await h.turn('source', 'commit-failure-input');
     await withSourceSettings(h);
     const lifecycle = new ReliableConversationLifecycle({ application: h.app, configuration: h.configuration });
-    const request = { sourceConversationId: 'source', commandId: 'fork-tool-call-interrupted' };
     const database = h.app.database;
     const transaction = database.transaction.bind(database);
     let injected = false;
@@ -1210,12 +1218,24 @@ test('fork_conversation rejected for lack of completed history removes the setti
       return transaction(steps, ...rest);
     };
     try {
-      await assert.rejects(lifecycle.forkCompletedHistory(request), /injected fork commit failure/);
+      await assert.rejects(lifecycle.forkCompletedHistory({ sourceConversationId: 'source', commandId: 'fork-tool-call-commit-failure' }),
+        /^Error: Forking failed\. Nothing was created: injected fork commit failure$/);
     } finally {
       database.transaction = transaction;
     }
-    assert.notDeepEqual(await strayConversationSettings(h.configuration, ['source']), [],
-      'fixture: the interrupted attempt copied settings before its commit failed');
+    assert.ok(injected);
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source']), [], 'no settings stay behind for the uncreated fork');
+  });
+});
+
+test('fork_conversation rejected for lack of completed history removes the settings a crashed attempt copied', async () => {
+  const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
+  await withForkRuntime(async h => {
+    await h.turn('source', 'completed-history-input');
+    await withSourceSettings(h);
+    const lifecycle = new ReliableConversationLifecycle({ application: h.app, configuration: h.configuration });
+    const request = { sourceConversationId: 'source', commandId: 'fork-tool-call-interrupted' };
+    await copiedByCrashedAttempt(h, request.commandId);
     const first = await h.command('source', 'unused', 'user');
     await h.app.turns.delete({ source: { kind: 'command', key: 'delete-all-history' }, conversationId: 'source', messageId: first.messageId });
     await assert.rejects(lifecycle.forkCompletedHistory(request),
@@ -1224,30 +1244,14 @@ test('fork_conversation rejected for lack of completed history removes the setti
   });
 });
 
-test('fork_conversation of a source deleted after an interrupted attempt is refused as a missing source', async () => {
+test('fork_conversation of a source deleted after a crashed attempt is refused as a missing source', async () => {
   const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
   await withForkRuntime(async h => {
     await h.turn('source', 'deleted-source-history');
     await withSourceSettings(h);
     const lifecycle = new ReliableConversationLifecycle({ application: h.app, configuration: h.configuration });
     const request = { sourceConversationId: 'source', commandId: 'fork-tool-call-source-deleted' };
-    const database = h.app.database;
-    const transaction = database.transaction.bind(database);
-    let injected = false;
-    database.transaction = async (steps, ...rest) => {
-      if (!injected && steps.some(step => step.kind === 'insert' && step.domain === 'Conversation')) {
-        injected = true;
-        throw new Error('injected fork commit failure');
-      }
-      return transaction(steps, ...rest);
-    };
-    try {
-      await assert.rejects(lifecycle.forkCompletedHistory(request), /injected fork commit failure/);
-    } finally {
-      database.transaction = transaction;
-    }
-    assert.notDeepEqual(await strayConversationSettings(h.configuration, ['source']), [],
-      'fixture: the interrupted attempt copied settings before its commit failed');
+    await copiedByCrashedAttempt(h, request.commandId);
     await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
     assert.deepEqual((await h.app.conversationDeletion.delete('source')).deletedConversationIds, ['source']);
     await assert.rejects(lifecycle.forkCompletedHistory(request),

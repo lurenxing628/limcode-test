@@ -8,7 +8,7 @@ import {
   readNativeMessageContextRevisions
 } from '../../reliableKernel/conversationForkContext';
 import { projectFolderAssignmentSteps, projectFolderForConversation } from '../../reliableKernel/conversationProject';
-import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
+import { isTransactionAssertionFailure, stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
 import type { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
@@ -81,8 +81,9 @@ export class ReliableConversationLifecycle {
   public async forkCompletedHistory(request: CompletedHistoryForkRequest): Promise<ConversationForkOutcome & { title: string }> {
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
     const commandId = requireText(request.commandId, 'Conversation fork commandId');
-    return this.application.database.conversationOwners.run(sourceConversationId, () =>
-      this.discardingRejectedTarget(commandId, async (targetConversationId) => {
+    const targetConversationId = forkTargetConversationId(commandId);
+    try {
+      return await this.application.database.conversationOwners.run(sourceConversationId, async () => {
         // A source deleted after the tool call was admitted is refused as missing, not as a
         // Conversation without completed history.
         if (!await this.maybeRow('Conversation', sourceConversationId)) {
@@ -92,8 +93,13 @@ export class ReliableConversationLifecycle {
         const boundary = await this.committedForkBoundary(commandId) ?? await this.completedHistoryBoundary(sourceConversationId);
         const result = await this.forkCommand({ sourceConversationId, commandId, ...boundary }, commandId, targetConversationId);
         return { ...result, title: String((await this.requireRow('Conversation', result.conversationId)).title) };
-      })
-    );
+      });
+    } catch (error) {
+      // The model's call is its only attempt: whatever failed, settings copied under a branch that
+      // was never committed are removed, and the model gets a reason it can act on.
+      await this.discardRejectedForkTarget(targetConversationId);
+      throw forkToolError(error);
+    }
   }
 
   /**
@@ -244,7 +250,7 @@ export class ReliableConversationLifecycle {
    * history, can find settings an earlier attempt of the same command copied under it.
    */
   private async discardingRejectedTarget<T>(commandId: string, run: (targetConversationId: string) => Promise<T>): Promise<T> {
-    const targetConversationId = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
+    const targetConversationId = forkTargetConversationId(commandId);
     try {
       return await run(targetConversationId);
     } catch (error) {
@@ -586,6 +592,24 @@ export class ReliableConversationLifecycle {
     ]);
     return requireRows(snapshot.snapshot[0], `${domain} list`);
   }
+}
+
+/** A fork command's branch target: derived from the command identity alone. */
+function forkTargetConversationId(commandId: string): string {
+  return stablePhaseFId('conversation', `conversation-fork:${commandId}`);
+}
+
+/**
+ * The reason a fork_conversation call reports. Nothing was created in every case. A permanent
+ * rejection already says why; a concurrent change to the source gets its own actionable message;
+ * anything else keeps its text behind that fact.
+ */
+function forkToolError(error: unknown): Error {
+  if (error instanceof ConversationForkRejectedError) return error;
+  if (isTransactionAssertionFailure(error)) {
+    return new Error('The conversation changed while it was being forked. Nothing was created; try again.');
+  }
+  return new Error(`Forking failed. Nothing was created: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 function requireRows(value: DomainRow | DomainRow[] | null, label: string): DomainRow[] {
