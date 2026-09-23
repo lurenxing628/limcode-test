@@ -229,3 +229,51 @@ test('a summary that does not shrink the Context is still skipped as non_reducin
     assert.equal((await list(app, 'CompressionBlock', { conversation_id: seeded.conversationId })).length, 0);
   });
 });
+
+async function compressionMetadata(app, conversationId) {
+  const [block] = await list(app, 'CompressionBlock', { conversation_id: conversationId });
+  const [object] = await list(app, 'ContentObject', { id: block.summary_object_id });
+  return JSON.parse((await app.contentStore.read(object)).toString('utf8'));
+}
+
+test('the card saving compares Context with Context; manual compression records no full-request size', async () => {
+  const thresholdTokens = 1_000;
+  await withTurn('reduction-gate-metadata', thresholdTokens, async (app, seeded) => {
+    await appendMessage(app, seeded, 'source', 'assistant', `source ${'alpha beta gamma delta '.repeat(110)}`);
+    await appendMessage(app, seeded, 'tail', 'user', `tail ${'epsilon zeta eta theta '.repeat(110)}`);
+    const head = await app.context.currentHeadRootId(seeded.conversationId);
+    const result = await summaryCoordinator(app, 'MANUAL-SUMMARY', () => {}).coordinate({
+      turnId: seeded.turnId,
+      authoritySnapshotId: seeded.authoritySnapshotId,
+      headRootId: head,
+      trigger: 'manual'
+    });
+    assert.equal(result.status, 'compressed', JSON.stringify(result));
+    const metadata = await compressionMetadata(app, seeded.conversationId);
+    assert.equal(metadata.trigger, 'manual');
+    // Previously 0 with an all-zero breakdown, which the card showed as “节省约 0 Token”.
+    assert.equal(metadata.estimatedTokensBefore, undefined);
+    assert.equal(metadata.requestBreakdown, undefined);
+    assert.equal(metadata.calibratedTokensBefore, undefined);
+    assert.ok(Number.isSafeInteger(metadata.contextTokensBefore) && Number.isSafeInteger(metadata.estimatedTokensAfter));
+    assert.ok(metadata.contextTokensBefore > metadata.estimatedTokensAfter, JSON.stringify(metadata));
+  });
+  await withTurn('reduction-gate-metadata-auto', thresholdTokens, async (app, seeded) => {
+    await appendMessage(app, seeded, 'source', 'assistant', `source ${'alpha beta gamma delta '.repeat(110)}`);
+    await appendMessage(app, seeded, 'tail', 'user', `tail ${'epsilon zeta eta theta '.repeat(110)}`);
+    const head = await app.context.currentHeadRootId(seeded.conversationId);
+    const level = await app.compression.evaluate(head, seeded.authoritySnapshotId);
+    const fixedTokens = 500;
+    const result = await summaryCoordinator(app, 'AUTO-SUMMARY', () => {}).coordinate({
+      turnId: seeded.turnId, authoritySnapshotId: seeded.authoritySnapshotId, headRootId: head, trigger: 'auto',
+      requestBudget: requestBudget(thresholdTokens, fixedTokens, level.estimatedTokens)
+    });
+    assert.equal(result.status, 'compressed', JSON.stringify(result));
+    const metadata = await compressionMetadata(app, seeded.conversationId);
+    assert.equal(metadata.estimatedTokensBefore, fixedTokens + level.estimatedTokens, 'automatic keeps the full-request figure');
+    assert.ok(metadata.requestBreakdown);
+    // The saving excludes the fixed system/tool overhead that compression never removes.
+    assert.ok(metadata.contextTokensBefore < metadata.estimatedTokensBefore);
+    assert.ok(metadata.contextTokensBefore > metadata.estimatedTokensAfter);
+  });
+});

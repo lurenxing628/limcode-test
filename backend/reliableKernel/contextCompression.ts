@@ -75,7 +75,10 @@ export interface CreateCompressionCommand {
       bodyTokens: number;
       fullTokens: number;
     };
+    /** Full request (system, tools and context) before; absent for manual compression, which has no request. */
     estimatedTokensBefore?: number;
+    /** Context before, in the same estimator unit as estimatedTokensAfter; their difference is the saving. */
+    contextTokensBefore?: number;
     estimatedTokensAfter?: number;
     /** Provider/estimator ratio used to size the retained tail, within [1, 4]. */
     providerCalibrationRatio?: number;
@@ -975,6 +978,9 @@ function normalizeCompressionSummary(
         ...(metadata.requestBreakdown ? { requestBreakdown: requireRequestBreakdown(metadata.requestBreakdown) } : {}),
         ...(metadata.estimatedTokensBefore === undefined ? {} : {
           estimatedTokensBefore: requireEstimatedTokens(metadata.estimatedTokensBefore, 'summaryMetadata.estimatedTokensBefore')
+        }),
+        ...(metadata.contextTokensBefore === undefined ? {} : {
+          contextTokensBefore: requireEstimatedTokens(metadata.contextTokensBefore, 'summaryMetadata.contextTokensBefore')
         }),
         ...(metadata.estimatedTokensAfter === undefined ? {} : {
           estimatedTokensAfter: requireEstimatedTokens(metadata.estimatedTokensAfter, 'summaryMetadata.estimatedTokensAfter')

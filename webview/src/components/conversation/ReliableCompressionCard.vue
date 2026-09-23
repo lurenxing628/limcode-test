@@ -81,11 +81,16 @@ const summaryText = computed(() => renderContents(envelope.value.contents));
 const providerNative = computed(() => envelope.value.contents.some((content) =>
   content.parts.some((part) => isProviderContextPart(part))
 ));
-const beforeTokens = computed(() => firstToken(
+// A 0 full-request estimate only comes from manual compression recorded before it stopped writing one.
+const beforeTokens = computed(() => positiveToken(firstToken(
   props.block.estimated_tokens_before,
   props.block.estimatedTokensBefore,
   presentation.value.estimatedTokensBefore,
   envelope.value.estimatedTokensBefore
+)));
+const contextBeforeTokens = computed(() => firstToken(
+  presentation.value.contextTokensBefore,
+  envelope.value.contextTokensBefore
 ));
 const afterTokens = computed(() => firstToken(
   props.block.estimated_tokens_after,
@@ -93,9 +98,12 @@ const afterTokens = computed(() => firstToken(
   presentation.value.estimatedTokensAfter,
   envelope.value.estimatedTokensAfter
 ));
-const savedTokens = computed(() => beforeTokens.value !== undefined && afterTokens.value !== undefined
-  ? Math.max(0, beforeTokens.value - afterTokens.value)
-  : undefined);
+// Saving compares context with context (same estimator); the full-request estimate also counts the
+// system prompt and tool definitions, which compression never removes. Older blocks have no context figure.
+const savedTokens = computed(() => {
+  const before = contextBeforeTokens.value ?? beforeTokens.value;
+  return before !== undefined && afterTokens.value !== undefined ? Math.max(0, before - afterTokens.value) : undefined;
+});
 const triggerReason = computed(() =>
   stringValue(props.block.trigger_reason ?? props.block.triggerReason)
   || presentation.value.triggerReason
@@ -145,7 +153,8 @@ const diagnosticRows = computed(() => [
   { label: '触发值来源', value: triggerTokenSourceLabel.value },
   { label: '配置压缩阈值', value: tokenLabel(configuredThresholdTokens.value) },
   { label: '触发时完整请求估算', value: tokenLabel(beforeTokens.value) },
-  { label: '触发时请求构成', value: envelope.value.requestBreakdownLabel ?? '' },
+  { label: '触发时请求构成', value: beforeTokens.value === undefined ? '' : envelope.value.requestBreakdownLabel ?? '' },
+  { label: '压缩前上下文估算', value: tokenLabel(contextBeforeTokens.value) },
   { label: '压缩后上下文估算', value: tokenLabel(afterTokens.value) },
   { label: '压缩 Provider 实际输入', value: tokenLabel(providerInputTokens.value) },
   { label: '压缩 Provider 实际输出', value: tokenLabel(providerOutputTokens.value) },
@@ -210,6 +219,7 @@ interface CompressionDiagnosticData {
   triggerTokenSource?: string;
   configuredThresholdTokens?: number;
   estimatedTokensBefore?: number;
+  contextTokensBefore?: number;
   estimatedTokensAfter?: number;
   providerInputTokens?: number;
   providerOutputTokens?: number;
@@ -280,6 +290,7 @@ function parseDiagnosticFields(record: Record<string, unknown>): CompressionDiag
     triggerTokens: ['triggerTokens', 'trigger_tokens'],
     configuredThresholdTokens: ['configuredThresholdTokens', 'configured_threshold_tokens'],
     estimatedTokensBefore: ['estimatedTokensBefore', 'estimated_tokens_before'],
+    contextTokensBefore: ['contextTokensBefore', 'context_tokens_before'],
     estimatedTokensAfter: ['estimatedTokensAfter', 'estimated_tokens_after'],
     providerInputTokens: ['providerInputTokens', 'provider_input_tokens'],
     providerOutputTokens: ['providerOutputTokens', 'provider_output_tokens']
@@ -314,6 +325,10 @@ function firstToken(...values: unknown[]): number | undefined {
     if (normalized !== undefined) return normalized;
   }
   return undefined;
+}
+
+function positiveToken(value: number | undefined): number | undefined {
+  return value === undefined || value === 0 ? undefined : value;
 }
 
 function tokenLabel(value: number | undefined): string {

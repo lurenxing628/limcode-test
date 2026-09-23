@@ -795,14 +795,18 @@ export class ReliableContextCompressionCoordinator {
         triggerTokens: decision.estimatedTokens,
         triggerTokenSource: decision.source,
         configuredThresholdTokens: requestBudget.compressionThresholdTokens,
-        requestBreakdown: requestBudget.breakdown,
-        estimatedTokensBefore: requestBudget.estimatedFullInputTokens,
+        // Manual compression runs outside any request: there is no full-request size to report.
+        ...(command.requestBudget ? {
+          requestBreakdown: requestBudget.breakdown,
+          estimatedTokensBefore: requestBudget.estimatedFullInputTokens,
+          calibratedTokensBefore: calibrateEstimatorToProvider(
+            requestBudget.estimatedFullInputTokens,
+            calibration
+          )
+        } : {}),
+        contextTokensBefore: currentContextTokens,
         estimatedTokensAfter: projectedTokens,
         providerCalibrationRatio: calibration.ratio,
-        calibratedTokensBefore: calibrateEstimatorToProvider(
-          requestBudget.estimatedFullInputTokens,
-          calibration
-        ),
         calibratedTokensAfter: projectedProviderTokens,
         ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
         ...(providerOutputTokens === undefined ? {} : { providerOutputTokens }),

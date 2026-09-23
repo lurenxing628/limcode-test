@@ -2098,6 +2098,7 @@ function compressionPresentationTokens(summary: Record<string, unknown>): Record
     'triggerTokens',
     'configuredThresholdTokens',
     'estimatedTokensBefore',
+    'contextTokensBefore',
     'estimatedTokensAfter',
     'calibratedTokensBefore',
     'calibratedTokensAfter',

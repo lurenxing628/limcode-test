@@ -77,6 +77,11 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
   assert.doesNotMatch(thoughtView, /<TextPartView[\s\S]*?:text="displayedText"[\s\S]*?:show-streaming-indicator="false"/,
     'expanded thought Markdown must not smooth the already-smoothed preview stream a second time');
   assert.match(thoughtView, /preserve-soft-breaks/);
+  const compressionCard = source('webview/src/components/conversation/ReliableCompressionCard.vue');
+  assert.match(compressionCard, /const before = contextBeforeTokens\.value \?\? beforeTokens\.value;/,
+    'the saving compares Context with Context, never the full request (system + tools) with the Context');
+  assert.match(compressionCard, /const beforeTokens = computed\(\(\) => positiveToken\(/,
+    'a legacy 0 full-request figure from manual compression must not be shown or subtracted');
   assert.match(thoughtView, /props\.streaming \? '正在思考\.\.\.' : EMPTY_THOUGHT_LABEL/,
     'a finished thought without text (signature only) must not keep saying it is still thinking');
   assert.doesNotMatch(thoughtView, /<pre>\{\{ displayedText \}\}<\/pre>/);
