@@ -393,6 +393,34 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.match(html, /仍未允许 read_conversation/);
     });
 
+    await t.test('MCP 页里开关单个工具只改来源设置，不给全局写入工具列表，也不丢掉全局的其它设置', async () => {
+      const { default: mcpTab } = await server.ssrLoadModule('/src/components/settings/global/McpToolSettingsTab.vue');
+      const { client, store, bindings, messages } = fresh(allDefinitions);
+      client.builtinToolPolicies = builtinToolPolicies;
+      client.mcpToolSources = [{ id: 'exa', name: 'exa', transportKind: 'stdio', status: 'connected', toolCount: 1 }];
+      const mcp = store.toolDefinitions.find((tool) => tool.name === 'mcp_search');
+      store.setPolicyForScope('global', undefined, undefined, 'Global', switchOn, { exa: { enabled: true } });
+      const tab = await bindings(mcpTab, {});
+      assert.equal(tab.isToolGloballyEnabled(mcp), true);
+      tab.setToolGlobalEnabled(mcp, false);
+      let global = store.localPolicyFor('global').policy;
+      assert.equal(global.allowedTools, undefined, 'no global list is written as a side effect');
+      assert.equal('allowedTools' in messages.at(-1).payload, false);
+      assert.deepEqual(global.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+      assert.deepEqual(global.toolConfigs, switchOn, 'the cross-conversation switch stays');
+      assert.equal(tab.isToolGloballyEnabled(mcp), false);
+      assert.ok(store.effectivePolicyFor('agent', 'main').policy.allowedTools.includes('transfer'), 'built-in Agents keep their own lists');
+      tab.setToolGlobalEnabled(mcp, true);
+      global = store.localPolicyFor('global').policy;
+      assert.equal(global.allowedTools, undefined);
+      assert.deepEqual(global.sourceConfigs, { exa: { enabled: true } });
+
+      // A saved global list keeps its state; turning an MCP tool off also drops it from that list.
+      store.setPolicyForScope('global', undefined, ['read_file', 'mcp_search'], 'Global', switchOn, { exa: { enabled: true } });
+      tab.setToolGlobalEnabled(mcp, false);
+      assert.deepEqual(store.localPolicyFor('global').policy.allowedTools, ['read_file']);
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
       const { client, store, render } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;
