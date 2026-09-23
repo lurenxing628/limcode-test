@@ -194,12 +194,43 @@ const withoutCacheControl = (value) => JSON.parse(JSON.stringify(value, (key, ne
 }));
 const hasMarker = (value) => /"(?:turnReminder|claudeSystemMessage|claudeTurnScopedReminders)"/.test(JSON.stringify(value));
 
+/**
+ * 尾巴模式把消息缓存断点挪到易失尾巴之前（claudeTurnScopedReminders.ts withClaudeCacheBreakpointBeforeVolatileTail）。
+ * 这里把断点放回改动前的位置（最后一条 user 消息的最后一块；移走断点的纯文本消息还原成字符串简写），
+ * 用来证明除断点位置以外，线上请求与改动前的构建逐字节相同。
+ */
+function withLegacyBreakpoint(wire) {
+  const copy = structuredClone(wire);
+  const messages = copy.body.messages;
+  let control;
+  messages.forEach((message, index) => {
+    if (!Array.isArray(message.content)) return;
+    const last = message.content.at(-1);
+    if (!last?.cache_control) return;
+    control = last.cache_control;
+    delete last.cache_control;
+    if (message.content.length === 1 && last.type === 'text' && Object.keys(last).length === 2) messages[index] = { ...message, content: last.text };
+  });
+  const lastUser = messages.findLast((message) => message.role === 'user');
+  if (control && lastUser) {
+    if (typeof lastUser.content === 'string') lastUser.content = [{ type: 'text', text: lastUser.content }];
+    lastUser.content.at(-1).cache_control = control;
+  }
+  return copy;
+}
+
 test('关闭时 Claude 请求与改动前的构建逐字节一致（LlmStartRequest、线上 URL/头/体、投影估算）', async () => {
   for (const scenario of SCENARIOS) {
     const rendered = await render(fullRequest({ provider: 'claude', modelId: 'claude-opus-5-5', scenario }));
     const key = `claude/${scenario}`;
     assert.equal(sha256(rendered.start), CLAUDE_BASELINE[key].start, `${key} LlmStartRequest`);
-    assert.equal(sha256(rendered.wire), CLAUDE_BASELINE[key].wire, `${key} wire`);
+    // 唯一的有意差异：有易失尾巴（本轮提醒）时消息断点在尾巴之前；放回原位后与改动前逐字节相同。
+    assert.equal(sha256(withLegacyBreakpoint(rendered.wire)), CLAUDE_BASELINE[key].wire, `${key} wire`);
+    const marked = rendered.wire.body.messages.flatMap((entry, index) =>
+      Array.isArray(entry.content) && entry.content.some((block) => block.cache_control) ? [index] : []);
+    const lastUser = rendered.wire.body.messages.findLastIndex((entry) => entry.role === 'user');
+    if (scenario === 'no-reminder') assert.deepEqual(marked, [lastUser], `${key}: no tail, breakpoint unchanged`);
+    else assert.equal(marked.length === 1 && marked[0] < lastUser, true, `${key}: breakpoint before the volatile tail`);
     assert.equal(sha256(rendered.estimate), CLAUDE_BASELINE[key].estimate, `${key} estimate`);
     assert.equal(hasMarker(rendered.start), false);
     assert.equal(rendered.wire.body.messages.some((entry) => entry.role === 'system'), false);

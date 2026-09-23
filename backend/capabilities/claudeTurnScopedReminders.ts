@@ -16,6 +16,7 @@
  *   这条提醒按原来的尾巴形态作为 user 消息发出——之后的请求按同一规则在同一位置原样重发它，前缀仍然不变。
  * - `tail`：原来的尾巴模式，历史提醒全部不发，本轮提醒作为最后一条 user 消息。开关关闭时内核根本不产生标记，
  *   这里原样返回同一个数组，请求逐字节不变；其他 provider 和网关回退都走这条路径，历史提醒不会以任何形式泄漏过去。
+ *   尾巴上的内容下一次请求就不在原位了，所以 Claude 的消息缓存断点放在尾巴之前（见 withClaudeCacheBreakpointBeforeVolatileTail）。
  *
  * 重新注入的当前 Turn 输入（压缩掉了本 Turn 输入时，内核把它作为易失尾巴放在提醒前面）同样是发过的历史：
  * - `claude_turn_scoped`：一次请求把它作为尾巴发出后，之后的请求把那份原文放回那次请求的模型输出前面（提醒之前），
@@ -138,6 +139,67 @@ export function withClaudeTurnScopedSystemBeta(
   if (!active && !bodyHasTurnScopedSystemMessages(request.body)) return request;
   const headers = withAnthropicBetaValue(request.headers, CLAUDE_TURN_SCOPED_SYSTEM_BETA);
   return headers === request.headers ? request : { ...request, headers };
+}
+
+/**
+ * 尾巴模式（开关关闭，或网关拒绝后退回）下，本轮提醒与重新注入的输入是易失尾巴：下一次请求不会在同一位置再发它们。
+ * 接入库把消息断点放在最后一条 user 消息上，正好落在易失尾巴上；这个位置的缓存只写不读，
+ * 每一轮都按 1.25 倍价格重写整段历史，历史部分永远命中不了。
+ * 官方（https://platform.claude.com/docs/en/build-with-claude/prompt-caching）：缓存按前缀匹配，易变内容要放在最后一个
+ * 断点之后；断点前面的前缀在下一次请求里原样出现，才能从之前写入的位置读到。
+ * 这里把消息断点挪到易失尾巴之前最后一条 user 消息的最后一块上（同一个 cache_control，断点数不变）；
+ * 挪动、增删 cache_control 不改变前缀，也不影响已有思考块的有效性。
+ * `volatileTailCount` 是内容末尾的易失条数（每条内容编码为一条 user 消息）；形状对不上、尾巴上没有断点、
+ * 尾巴前面没有 user 消息时原样返回同一引用。
+ */
+export function withClaudeCacheBreakpointBeforeVolatileTail(
+  request: EncodedProviderRequest,
+  volatileTailCount: number
+): EncodedProviderRequest {
+  const body = request.body;
+  if (!Number.isSafeInteger(volatileTailCount) || volatileTailCount <= 0) return request;
+  if (!isRecord(body) || !Array.isArray(body.messages)) return request;
+  const messages = body.messages as unknown[];
+  const tailStart = messages.length - volatileTailCount;
+  if (tailStart <= 0) return request;
+  const tail = messages.slice(tailStart);
+  if (!tail.every((message) => isRecord(message) && message.role === 'user')) return request;
+  let cacheControl: unknown;
+  const strippedTail = tail.map((message) => {
+    const record = message as Record<string, unknown>;
+    if (!Array.isArray(record.content) || !record.content.some((block) => isRecord(block) && 'cache_control' in block)) {
+      return message;
+    }
+    return {
+      ...record,
+      content: record.content.map((block) => {
+        if (!isRecord(block) || !('cache_control' in block)) return block;
+        cacheControl ??= block.cache_control;
+        const { cache_control: _moved, ...rest } = block;
+        return rest;
+      })
+    };
+  });
+  if (cacheControl === undefined) return request;
+  let target = -1;
+  for (let index = tailStart - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!isRecord(message) || message.role !== 'user') continue;
+    if ((typeof message.content === 'string' && message.content)
+      || (Array.isArray(message.content) && message.content.length > 0 && isRecord(message.content[message.content.length - 1]))) {
+      target = index;
+      break;
+    }
+  }
+  if (target < 0) return request;
+  const targetMessage = messages[target] as Record<string, unknown>;
+  const blocks = typeof targetMessage.content === 'string'
+    ? [{ type: 'text', text: targetMessage.content }]
+    : targetMessage.content as Record<string, unknown>[];
+  const marked = { ...targetMessage, content: [...blocks.slice(0, -1), { ...blocks[blocks.length - 1], cache_control: cacheControl }] };
+  const next = [...messages.slice(0, tailStart), ...strippedTail];
+  next[target] = marked;
+  return { ...request, body: { ...body, messages: next } };
 }
 
 export function withAnthropicBetaValue(headers: Record<string, string>, beta: string): Record<string, string> {

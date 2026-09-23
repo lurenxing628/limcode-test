@@ -138,6 +138,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/claude-turn-scoped-reminders-runtime.test.mjs',
   'tests/reliable-kernel/claude-turn-scoped-reminder-edges.test.mjs',
   'tests/reliable-kernel/claude-native-compaction-shaping.test.mjs',
+  'tests/reliable-kernel/claude-tail-cache-breakpoint.test.mjs',
   'tests/reliable-kernel/gemini-provider-adaptation.test.mjs',
   'tests/reliable-kernel/gemini-thought-signature-runtime.test.mjs',
   'tests/reliable-kernel/provider-websocket-policy.test.mjs',

@@ -30,6 +30,7 @@ import {
 } from './providerParameterAdaptation';
 import {
   layoutTurnReminderContents,
+  withClaudeCacheBreakpointBeforeVolatileTail,
   withClaudeTurnScopedSystemBeta,
   type TurnReminderLayout
 } from './claudeTurnScopedReminders';
@@ -478,18 +479,19 @@ export async function startLlmProvider(
       fetch: providerFetch
     };
     const claudeTurnScoped = claudeTurnScopedRemindersRequested(request, settings);
+    const volatileTailCount = volatileTailContentCount(request);
     const provider = installRequestAdaptation(installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
-    ), settings, claudeTurnScoped);
+    ), settings, claudeTurnScoped, volatileTailCount);
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
           ...unifiedPromptCacheConfigEntry(settings, requestBody, false),
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped)
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
@@ -1617,7 +1619,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings,
-  claudeTurnScopedRemindersRequested(request, runtimeSettings));
+  claudeTurnScopedRemindersRequested(request, runtimeSettings), volatileTailContentCount(request));
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
@@ -4795,9 +4797,14 @@ function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderReque
 /**
  * 编码后请求的最终适配：先按模型族做静态适配（Claude 思考类型；GPT-6 Sol / Luna 按实际推理强度去掉
  * 采样参数，Astra 一律去掉），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习），最后为 Claude
- * 轮内系统消息合并 beta 头。
+ * 轮内系统消息合并 beta 头；Claude 尾巴模式下把消息缓存断点挪到易失尾巴（本轮提醒、重新注入的输入）之前。
  */
-function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord, claudeTurnScopedReminders = false): T {
+function installRequestAdaptation<T>(
+  provider: T,
+  settings: LlmProviderConfigRecord,
+  claudeTurnScopedReminders = false,
+  volatileTailCount = 0
+): T {
   const target = providerRequestTarget(settings);
   const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
   const astraSampling = isAstraParameterTarget(settings);
@@ -4809,10 +4816,20 @@ function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRec
           : request,
       target
     );
-    return settings.provider === 'claude'
-      ? withClaudeTurnScopedSystemBeta(adapted, claudeTurnScopedReminders && !claudeTurnScopedRemindersFallenBack(target))
-      : adapted;
+    if (settings.provider !== 'claude') return adapted;
+    const turnScoped = claudeTurnScopedReminders && !claudeTurnScopedRemindersFallenBack(target);
+    // 轮内系统消息模式下尾巴内容之后会在原位原样重发，不是易失的；只有尾巴模式才挪断点。
+    return withClaudeTurnScopedSystemBeta(
+      turnScoped ? adapted : withClaudeCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount),
+      turnScoped
+    );
   });
+}
+
+/** 内核放在内容末尾、下一次请求不再原位出现的条数（重新注入的输入、本轮提醒）。 */
+function volatileTailContentCount(request: Pick<LlmStartRequest, 'openAIResponsesContinuation'>): number {
+  const kinds = request.openAIResponsesContinuation?.volatileTailContentKinds;
+  return Array.isArray(kinds) ? kinds.length : 0;
 }
 
 /** 冻结的调用设置要求 Claude 每轮提醒使用轮内系统消息（开关只对 Claude 生效）。 */
