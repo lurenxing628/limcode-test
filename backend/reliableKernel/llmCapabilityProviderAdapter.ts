@@ -67,6 +67,7 @@ import {
 } from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
+import { isGpt6NoneCapableModel } from '../../shared/openAIResponsesCapabilities';
 import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
@@ -701,7 +702,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   );
   // 冻结原生 reasoning：configuration_update 历史/待决更新按序置于持久化上下文之后、
   // 当前 Turn 易失尾之前（最新 update 支配后续 response；cache 前缀不被尾部易失内容干扰）。
-  const nativeReasoning = frozenNativeReasoning(recipe);
+  const nativeReasoning = frozenNativeReasoning(recipe, request.modelId);
   if (nativeReasoning) {
     contents = appendNativeConfigurationUpdates(contents, nativeReasoning);
   }
@@ -1313,10 +1314,15 @@ const LLM_THINKING_LEVELS: Record<string, true> = {
   max: true
 };
 
-/** Astra 不接受 none/minimal；与 llmProvider 的 Astra→low 适配一致，在冻结解析层归一。 */
-function normalizeNativeEffort(value: unknown): string | undefined {
+/**
+ * 冻结解析层按模型归一原生 effort，与 llmProvider 的参数适配一致：Astra 不接受 none/minimal，
+ * 两者都转成 low；GPT-6 Sol / Luna 支持 none，只把 minimal 转成 low（Using GPT-6 “Update API and
+ * model parameters”）。
+ */
+function normalizeNativeEffort(value: unknown, modelId: string): string | undefined {
   const effort = optionalText(value);
   if (!effort) return undefined;
+  if (isGpt6NoneCapableModel(modelId)) return effort === 'minimal' ? 'low' : effort;
   return effort === 'none' || effort === 'minimal' ? 'low' : effort;
 }
 
@@ -1324,21 +1330,24 @@ function asLlmThinkingLevel(value: string | undefined): LlmThinkingLevel | undef
   return value !== undefined && LLM_THINKING_LEVELS[value] ? (value as LlmThinkingLevel) : undefined;
 }
 
-function frozenNativeReasoning(recipe: { [key: string]: PlainJsonValue }): FrozenNativeReasoning | undefined {
+function frozenNativeReasoning(
+  recipe: { [key: string]: PlainJsonValue },
+  modelId: string
+): FrozenNativeReasoning | undefined {
   const value = asRecord(recipe.nativeReasoning);
   if (!value) return undefined;
   const updates = Array.isArray(value.updates)
     ? value.updates.map((entry, index) => {
         const record = requireRecord(entry, `Provider recipe.nativeReasoning.updates[${index}]`);
-        const effort = normalizeNativeEffort(record.effort);
+        const effort = normalizeNativeEffort(record.effort, modelId);
         return effort ? { effort } : {};
       })
     : [];
   const pending = asRecord(value.pendingConfigurationUpdate);
-  const pendingEffort = pending ? normalizeNativeEffort(pending.effort) : undefined;
-  const baseEffort = asLlmThinkingLevel(normalizeNativeEffort(value.baseEffort));
+  const pendingEffort = pending ? normalizeNativeEffort(pending.effort, modelId) : undefined;
+  const baseEffort = asLlmThinkingLevel(normalizeNativeEffort(value.baseEffort, modelId));
   const baseModeRaw = optionalText(value.baseMode);
-  const effectiveEffort = normalizeNativeEffort(value.effectiveEffort);
+  const effectiveEffort = normalizeNativeEffort(value.effectiveEffort, modelId);
   const forceFullReason = optionalText(value.forceFullReason);
   return {
     ...(baseEffort ? { baseEffort } : {}),

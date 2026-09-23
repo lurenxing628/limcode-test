@@ -17,6 +17,11 @@ import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWeb
 import { installProviderCompatibility } from './geminiProviderAdaptation';
 import { adaptClaudeThinkingForFamily, claudeThinkingFamilyProfile, type ClaudeThinkingFamilyProfile } from './claudeThinkingAdaptation';
 import {
+  adaptGpt6NoneCapableGenerationConfig,
+  adaptGpt6SamplingForReasoningEffort,
+  isGpt6NoneCapableParameterTarget
+} from './gpt6ParameterAdaptation';
+import {
   applyLearnedRequestAdaptations,
   createProviderRequestAdaptationRetry,
   installEncodedRequestPostProcessor,
@@ -4612,14 +4617,17 @@ function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderReque
 }
 
 /**
- * 编码后请求的最终适配：先按 Claude 模型族改写思考类型（静态），再应用按目标记住的
- * 不支持参数与 Claude 保留思考处理（进程内学习）。
+ * 编码后请求的最终适配：先按模型族做静态适配（Claude 思考类型；GPT-6 Sol / Luna 按实际推理强度去掉
+ * 采样参数），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习）。
  */
 function installRequestAdaptation<T>(provider: T, settings: LlmProviderConfigRecord): T {
   const target = providerRequestTarget(settings);
   const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
+  const gpt6Sampling = isGpt6NoneCapableParameterTarget(settings);
   return installEncodedRequestPostProcessor(provider, (request) => applyLearnedRequestAdaptations(
-    claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking) : request,
+    claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
+      : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider)
+        : request,
     target
   ));
 }
@@ -4640,7 +4648,7 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
   const nativeResponses = normalizeOpenAIResponsesNativeSettings(settings?.nativeResponses);
   const contextWindowTokens = normalizeContextWindowTokens(settings?.contextWindowTokens);
   const retryMaxAttempts = normalizeRetryMaxAttempts(settings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
-  return adaptAstraNativeParameterSettings({
+  return adaptGpt6NoneCapableParameterSettings(adaptAstraNativeParameterSettings({
     id: settings?.id?.trim() || 'llm-provider-config-default',
     name: settings?.name?.trim() || '默认渠道',
     provider: normalizeProvider(settings?.provider),
@@ -4665,7 +4673,17 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
     modelConfigs: settings?.modelConfigs ?? [],
     createdAt: settings?.createdAt ?? 0,
     updatedAt: settings?.updatedAt ?? 0
-  });
+  }));
+}
+
+/**
+ * GPT-6 Sol / Luna：设置解析时只把 minimal 提升为 low（none 保留），冻结快照因此携带有效值；
+ * 采样参数按最终请求里实际生效的推理强度在编码后去掉（见 gpt6ParameterAdaptation）。其他模型原样返回。
+ */
+function adaptGpt6NoneCapableParameterSettings(settings: LlmProviderConfigRecord): LlmProviderConfigRecord {
+  if (!isGpt6NoneCapableParameterTarget(settings)) return settings;
+  const generationConfig = adaptGpt6NoneCapableGenerationConfig(settings.generationConfig);
+  return generationConfig === settings.generationConfig || !generationConfig ? settings : { ...settings, generationConfig };
 }
 
 /** Astra 模型不支持的请求参数；reasoning none/minimal 也不受支持。 */
@@ -4725,7 +4743,8 @@ function adaptAstraGenerationConfig(
 
 /**
  * 单次请求实际使用的 generationConfig：冻结调用快照携带时以快照为准（冻结 recipe 的
- * base reasoning 等），否则用解析出的渠道/模型配置。Astra 目标上快照值同样过一遍参数适配。
+ * base reasoning 等），否则用解析出的渠道/模型配置。GPT-6 目标上快照值同样过一遍参数适配
+ * （Astra 按原规则；Sol / Luna 只把 minimal 提升为 low）。
  */
 function effectiveRequestGenerationConfig(
   request: LlmStartRequest,
@@ -4733,9 +4752,9 @@ function effectiveRequestGenerationConfig(
 ): LlmGenerationConfigRecord | undefined {
   const frozen = request.settingsSnapshot?.generationConfig;
   if (!frozen) return settings.generationConfig;
-  return isAstraParameterTarget(settings)
-    ? adaptAstraGenerationConfig(frozen)
-    : frozen;
+  if (isAstraParameterTarget(settings)) return adaptAstraGenerationConfig(frozen);
+  if (isGpt6NoneCapableParameterTarget(settings)) return adaptGpt6NoneCapableGenerationConfig(frozen);
+  return frozen;
 }
 
 /** 原生能力门禁需要本次请求实际使用的推理模式：pro 模式不支持 configuration_update。 */

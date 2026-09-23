@@ -105,6 +105,7 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
     if (capability.kind === 'unknown') return `能力未确认 · ${thinkingValueLabel(thinking)}`;
   }
   if (provider === 'openai-responses' && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
+  if ((provider === 'openai-responses' || provider === 'openai-compatible') && isGpt6NoneCapableModel(model) && thinking?.thinkingLevel === 'minimal') return 'low（适配器）';
   if (provider === 'openai-compatible' || provider === 'openai-responses') return thinkingValueLabel({ thinkingLevel: thinking?.thinkingLevel });
   if (provider === 'deepseek') return thinking?.thinkingLevel && ['none', 'high', 'max'].includes(thinking.thinkingLevel) ? thinking.thinkingLevel : '服务默认';
   return thinkingValueLabel(thinking);

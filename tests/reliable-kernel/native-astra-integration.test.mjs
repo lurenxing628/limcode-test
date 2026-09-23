@@ -740,14 +740,16 @@ for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
     test(`${model} native ${transport} admits an async call before completion and delivers its original result once`, { timeout: 60_000 }, async () => {
       await withNativeRuntime(async harness => {
         const { app, conversationId, frames, created, text, completed, send, until } = harness;
-        harness.configureModel(model, 'high');
+        // Sol、Luna 支持 none：冻结与恢复路径不把它改成 low（Astra 仍转 low）。
+        const effort = model === 'gpt-6-sol' ? 'none' : 'high';
+        harness.configureModel(model, effort);
         const turn = await harness.startTurn(`family-${model}-${transport}`, 'Read the probe asynchronously.');
         const first = await until(() => frames.find(frame => frame.response || frame.body.type === 'response.create'),
           `${model} native request`);
         const channel = first.response ?? first.socket;
         assert.equal(first.body.model, model);
         assert.equal(first.body.tools.find(tool => tool.name === 'native_probe')?.async, true);
-        assert.equal(first.body.reasoning?.effort, 'high');
+        assert.equal(first.body.reasoning?.effort, effort);
         created(channel, `${model}-response-1`);
         const call = {
           type: 'function_call', id: `${model}-function-item`, call_id: `original-${model}-call`,

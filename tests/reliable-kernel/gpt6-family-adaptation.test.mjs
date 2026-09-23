@@ -17,6 +17,8 @@ const capabilities = require(path.join(compiledRoot, 'shared/openAIResponsesCapa
 const modelCapabilities = require(path.join(compiledRoot, 'shared/modelCapabilities.js'));
 const sessionThinking = require(path.join(compiledRoot, 'shared/sessionThinking.js'));
 const { dryRunLlmProvider } = require(path.join(compiledRoot, 'backend/capabilities/llmProvider.js'));
+const { LlmCapabilityFullRequestAdapter } = require(path.join(compiledRoot, 'backend/reliableKernel/llmCapabilityProviderAdapter.js'));
+const { LlmEventType } = require(path.join(compiledRoot, 'backend/world/modules/llm/events.js'));
 
 /** 用 esbuild 把 webview 源码模块打成 CJS 在 Node 里加载（与 tests/openAIResponsesWebSocket.test.cjs 相同做法）。 */
 function loadWebviewModule(relativeEntry) {
@@ -258,4 +260,177 @@ test('设置界面思考强度选项按新表过滤，Sol / Luna 默认 medium',
   }
   assert.deepEqual(thinking('gpt-5.2').options.map((option) => option.value), ['none', 'low', 'medium', 'high', 'xhigh']);
   assert.equal(thinking('gpt-5.2').defaultValue, 'none');
+});
+
+// ---- 参数适配：Using GPT-6 “Update API and model parameters” ----
+const SAMPLING_GENERATION = { temperature: 0.3, topP: 0.9, maxOutputTokens: 512 };
+const SAMPLING_BODY = { top_logprobs: 2, logprobs: true, include: ['reasoning.encrypted_content', 'message.output_text.logprobs'], other: 'keep' };
+
+async function parameterDryRun(provider, model, thinkingLevel, overrides = {}) {
+  const generationConfig = { ...SAMPLING_GENERATION, ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}) };
+  return (await dryRunLlmProvider(chatRequest(`params-${provider}-${model}-${thinkingLevel}`, overrides.request), {
+    settings: async () => providerConfig({
+      provider, model, baseUrl: provider === 'openai-compatible' ? 'https://gateway.example/v1' : OFFICIAL,
+      generationConfig, requestBody: SAMPLING_BODY, ...overrides.settings
+    })
+  })).body;
+}
+
+const effortOf = (provider, body) => provider === 'openai-compatible' ? body.reasoning_effort : body.reasoning?.effort;
+
+test('Sol / Luna：推理强度为 none 时保留采样参数，none 不改写', async () => {
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-luna-2026-06-01']) {
+      const body = await parameterDryRun(provider, model, 'none');
+      assert.equal(effortOf(provider, body), 'none', `${provider}:${model}`);
+      assert.equal(body.temperature, 0.3);
+      assert.equal(body.top_p, 0.9);
+      assert.equal(body.top_logprobs, 2);
+      assert.equal(body.logprobs, true);
+      assert.ok(body.include.includes('message.output_text.logprobs'));
+      assert.equal(body.other, 'keep');
+    }
+  }
+});
+
+test('Sol / Luna：强度不是 none（含未设置 = 默认 medium）时去掉采样参数；minimal 提升为 low', async () => {
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+      for (const [level, expected] of [[undefined, undefined], ['not-set', undefined], ['minimal', 'low'], ['low', 'low'],
+        ['medium', 'medium'], ['high', 'high'], ['xhigh', 'xhigh'], ['max', 'max']]) {
+        const label = `${provider}:${model}:${level}`;
+        const body = await parameterDryRun(provider, model, level);
+        assert.equal(effortOf(provider, body), expected, label);
+        for (const key of ['temperature', 'top_p', 'top_logprobs']) assert.equal(key in body, false, `${label}:${key}`);
+        if (provider === 'openai-compatible') {
+          // Chat Completions 另去掉 logprobs；Chat 没有 include，保留用户配置。
+          assert.equal('logprobs' in body, false, label);
+          assert.deepEqual(body.include, SAMPLING_BODY.include, label);
+        } else {
+          // Responses 从 include 去掉 message.output_text.logprobs，其余 include 保留。
+          assert.equal(body.include.includes('message.output_text.logprobs'), false, label);
+          assert.ok(body.include.includes('reasoning.encrypted_content'), label);
+        }
+        assert.equal(body.other, 'keep', label);
+        assert.equal(provider === 'openai-compatible' ? body.max_tokens : body.max_output_tokens, 512, label);
+      }
+    }
+  }
+});
+
+test('Sol / Luna：按最终请求里生效的强度判断（requestBody 覆盖与 configuration_update）', async () => {
+  // requestBody 把强度覆盖为 none：保留采样参数。
+  const responsesNone = await parameterDryRun('openai-responses', 'gpt-6-sol', 'high', {
+    settings: { requestBody: { ...SAMPLING_BODY, reasoning: { effort: 'none' } } }
+  });
+  assert.equal(responsesNone.reasoning.effort, 'none');
+  assert.equal(responsesNone.temperature, 0.3);
+  const chatNone = await parameterDryRun('openai-compatible', 'gpt-6-luna', 'high', {
+    settings: { requestBody: { ...SAMPLING_BODY, reasoning_effort: 'none' } }
+  });
+  assert.equal(chatNone.reasoning_effort, 'none');
+  assert.equal(chatNone.logprobs, true);
+  // requestBody 把强度覆盖为 high：去掉。
+  const chatHigh = await parameterDryRun('openai-compatible', 'gpt-6-luna', 'none', {
+    settings: { requestBody: { ...SAMPLING_BODY, reasoning_effort: 'high' } }
+  });
+  assert.equal('temperature' in chatHigh, false);
+  // 请求级 none，但 configuration_update 把后续响应改为 high：同样去掉。
+  const updated = await parameterDryRun('openai-responses', 'gpt-6-sol', 'none', {
+    request: { contents: [
+      { role: 'user', parts: [{ text: 'earlier' }] },
+      { role: 'user', parts: [{ providerContext: {
+        provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'configuration_update',
+        rawItem: { type: 'configuration_update', reasoning: { effort: 'high' } }
+      } }] }
+    ] }
+  });
+  assert.equal(updated.reasoning.effort, 'none');
+  assert.equal('temperature' in updated, false);
+  assert.equal('top_p' in updated, false);
+});
+
+test('Astra 与其他模型的参数适配不变', async () => {
+  // Astra：none/minimal → low，始终去掉采样参数（原行为）。
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    const astra = await parameterDryRun(provider, 'gpt-6-astra', 'none');
+    assert.equal(effortOf(provider, astra), 'low', provider);
+    for (const key of ['temperature', 'top_p', 'top_logprobs', 'logprobs']) assert.equal(key in astra, false, `${provider}:${key}`);
+  }
+  // 其他模型（含网关别名）：采样参数、minimal、include 原样发送。
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of ['gpt-5.5', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-6-sol-xhigh', '[az]gpt-6-luna', 'claude-sonnet-5']) {
+      const body = await parameterDryRun(provider, model, 'minimal');
+      assert.equal(effortOf(provider, body), 'minimal', `${provider}:${model}`);
+      assert.equal(body.temperature, 0.3, `${provider}:${model}`);
+      assert.equal(body.top_p, 0.9, `${provider}:${model}`);
+      assert.equal(body.top_logprobs, 2, `${provider}:${model}`);
+      assert.equal(body.logprobs, true, `${provider}:${model}`);
+      assert.ok(body.include.includes('message.output_text.logprobs'), `${provider}:${model}`);
+    }
+  }
+});
+
+/** 经 Reliable adapter 投影（冻结 authority 快照 + 可选冻结原生 reasoning 配方），再用不同的实时设置 dry-run。 */
+async function frozenWire(model, generationConfig, nativeReasoning, liveThinkingLevel = 'high') {
+  let projected;
+  const adapter = new LlmCapabilityFullRequestAdapter('fixture-provider', {
+    start(request, emit) { projected = request; emit({ type: LlmEventType.Done, payload: { requestId: request.id } }); },
+    abort() {}, dispose() {}
+  });
+  await adapter.sendFullRequest({
+    kind: 'full-model-request', modelRequestId: `frozen-${model}`, conversationId: 'fixture-session', attemptSeq: '1', socketGeneration: '1',
+    providerId: 'fixture-provider', modelId: model,
+    authoritySnapshot: { model: { providerConfigId: 'fixture-provider', provider: 'openai-responses', modelId: model, generationConfig, requestBody: {} },
+      toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} } },
+    recipe: { tools: [], ...(nativeReasoning ? { nativeReasoning } : {}) },
+    context: [{ segmentId: 'input', segmentKind: 'message', messageRole: 'user', contentType: 'application/vnd.limcode.message+json',
+      content: JSON.stringify({ role: 'user', parts: [{ text: 'synthetic fixture' }] }) }],
+    attachmentCatalogState: { catalog: [], placements: [] }
+  }, { async onEvent() { return { accepted: true, checkpointed: true, terminal: true }; } });
+  return (await dryRunLlmProvider(projected, { settings: providerConfig({
+    id: 'fixture-provider', model, baseUrl: 'https://relay.example/v1',
+    generationConfig: { thinkingConfig: { thinkingLevel: liveThinkingLevel } }
+  }) })).body;
+}
+
+test('冻结快照：Sol 冻结的 none 优先于实时设置并保留采样参数；冻结的 minimal 提升为 low', async () => {
+  const none = await frozenWire('gpt-6-sol', { temperature: 0.4, thinkingConfig: { thinkingLevel: 'none' } });
+  assert.equal(none.reasoning.effort, 'none');
+  assert.equal(none.temperature, 0.4);
+  const minimal = await frozenWire('gpt-6-luna', { temperature: 0.4, thinkingConfig: { thinkingLevel: 'minimal' } }, undefined, 'none');
+  assert.equal(minimal.reasoning.effort, 'low');
+  assert.equal('temperature' in minimal, false);
+  // Astra 冻结的 none 仍按原规则变为 low。
+  const astra = await frozenWire('gpt-6-astra', { temperature: 0.4, thinkingConfig: { thinkingLevel: 'none' } });
+  assert.equal(astra.reasoning.effort, 'low');
+  assert.equal('temperature' in astra, false);
+});
+
+test('冻结原生 reasoning 配方按模型归一：Sol / Luna 保留 none、minimal → low；Astra 的 none 仍转 low', async () => {
+  const recipe = { baseEffort: 'none', baseMode: 'standard', updates: [{ effort: 'minimal' }], effectiveEffort: 'minimal' };
+  const updates = (body) => body.input.filter((item) => item.type === 'configuration_update').map((item) => item.reasoning.effort);
+  for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+    const body = await frozenWire(model, { thinkingConfig: { thinkingLevel: 'none' } }, recipe);
+    assert.equal(body.reasoning.effort, 'none', model);
+    assert.deepEqual(updates(body), ['low'], model);
+  }
+  const noneOnly = await frozenWire('gpt-6-sol', { temperature: 0.4 }, { baseEffort: 'none', updates: [{ effort: 'none' }] });
+  assert.equal(noneOnly.reasoning.effort, 'none');
+  assert.deepEqual(updates(noneOnly), ['none']);
+  assert.equal(noneOnly.temperature, 0.4, 'every effort in play is none');
+  const astra = await frozenWire('gpt-6-astra', { thinkingConfig: { thinkingLevel: 'none' } }, recipe);
+  assert.equal(astra.reasoning.effort, 'low');
+  assert.deepEqual(updates(astra), ['low']);
+});
+
+test('会话思考显示：Sol / Luna 的 minimal 显示为适配器映射，none 原样显示', () => {
+  const { sessionThinkingDisplayLabel } = sessionThinking;
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    assert.equal(sessionThinkingDisplayLabel(provider, 'gpt-6-sol', { thinkingLevel: 'minimal' }), 'low（适配器）');
+    assert.equal(sessionThinkingDisplayLabel(provider, 'gpt-6-luna', { thinkingLevel: 'none' }), 'none');
+    assert.equal(sessionThinkingDisplayLabel(provider, 'gpt-5.6', { thinkingLevel: 'minimal' }), 'minimal');
+  }
+  assert.equal(sessionThinkingDisplayLabel('openai-responses', 'gpt-6-astra', { thinkingLevel: 'none' }), 'low（适配器）');
+  assert.equal(sessionThinkingDisplayLabel('openai-compatible', 'gpt-6-astra', { thinkingLevel: 'none' }), 'none');
 });
