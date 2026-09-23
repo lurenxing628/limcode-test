@@ -77,6 +77,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/collaboration-tool-boundary.test.mjs',
   'tests/reliable-kernel/cross-conversation-contract.test.mjs',
   'tests/reliable-kernel/mcp-source-policy.test.mjs',
+  'tests/reliable-kernel/collaboration-card-labels.test.mjs',
   'tests/reliable-kernel/cross-conversation-tools.test.mjs',
   'tests/reliable-kernel/native-collaboration-handles.test.mjs',
   'tests/reliable-kernel/collaboration-schema-epoch.test.mjs',
