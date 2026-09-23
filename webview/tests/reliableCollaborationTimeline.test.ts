@@ -50,7 +50,8 @@ test('collaboration cards anchor to the first message of their delivery or sendi
     records,
     messages: [{ id: 'user-message', role: 'user' }, { id: 'user-reply', role: 'model' }, { id: 'continuation-reply', role: 'model' }],
     turnIdByMessageId: { 'user-message': 'user-turn', 'user-reply': 'user-turn', 'continuation-reply': 'started-turn' },
-    removedConversationIds: []
+    removedConversationIds: [],
+    loadedFromFirstMessage: true
   });
   const labels = (cards: ReturnType<typeof projectCollaborationTimeline>['unbound'] = []) => cards.map(card =>
     `${collaborationCardLabel(card)} · ${collaborationCardKindLabel(card)} · ${card.textPreview}`);
@@ -78,7 +79,8 @@ test('messages between other Conversations are never projected into this timelin
     },
     messages: [{ id: 'user-message', role: 'user' }],
     turnIdByMessageId: { 'user-message': 'peer-turn' },
-    removedConversationIds: []
+    removedConversationIds: [],
+    loadedFromFirstMessage: true
   });
   assert.deepEqual(timeline, { beforeMessage: {}, afterMessage: {}, unbound: [] });
 });
@@ -117,7 +119,8 @@ test('a peer outside the loaded conversations is unknown; only a removal or a de
     },
     messages: [{ id: 'self-message', role: 'user' }],
     turnIdByMessageId: { 'self-message': 'self-turn' },
-    removedConversationIds: []
+    removedConversationIds: [],
+    loadedFromFirstMessage: true
   });
   assert.deepEqual(timeline.afterMessage['self-message'].map(collaborationCardLabel), ['来自对话 调研登录流程']);
 });
@@ -133,7 +136,8 @@ test('only committed Conversation removals are remembered as deleted, newest las
   assert.deepEqual(rememberRemovedConversations(['x'], undefined), ['x']);
 });
 
-test('failed deliveries are shown: an incoming one waits in the unbound list, an outgoing card is marked failed', () => {
+test('failed deliveries are shown: an incoming one newer than every message is pinned below them, an outgoing card is marked failed', () => {
+  const at = (ms: number) => new Date(ms).toISOString();
   const outgoingDelivery = (messageId: string, peer: string, state: string, attempt = '1') =>
     ({ id: `${messageId}-delivery-${attempt}`, inbox_item_id: `${messageId}-inbox`, target_conversation_id: peer, target_turn_id: null, state, attempt_seq: attempt });
   const timeline = projectCollaborationTimeline({
@@ -141,7 +145,7 @@ test('failed deliveries are shown: an incoming one waits in the unbound list, an
     records: {
       Conversation: byId({ id: 'peer', title: '调研对话', status: 'active' }),
       CollaborationMessage: byId(
-        message('incoming-failed', '1', 'followup', '没送到'),
+        { ...message('incoming-failed', '1', 'followup', '没送到'), created_at: at(2000) },
         message('outgoing-failed', '2', 'message', '发出但失败'),
         message('outgoing-retried', '3', 'message', '重试后送达'),
         message('outgoing-pending', '4', 'followup', '排队中')
@@ -166,9 +170,10 @@ test('failed deliveries are shown: an incoming one waits in the unbound list, an
         outgoingDelivery('outgoing-pending', 'peer', 'pending')
       )
     },
-    messages: [{ id: 'self-message', role: 'user' }],
+    messages: [{ id: 'self-message', role: 'user', createdAt: 1000 }],
     turnIdByMessageId: { 'self-message': 'self-turn' },
-    removedConversationIds: []
+    removedConversationIds: [],
+    loadedFromFirstMessage: true
   });
   assert.deepEqual(timeline.unbound.map((card) => [card.messageId, card.status]), [['incoming-failed', 'failed']]);
   assert.deepEqual(timeline.afterMessage['self-message'].map((card) => [card.messageId, card.status]), [
@@ -200,16 +205,59 @@ test('a failed incoming card sits where it was sent; only the newest few newer t
       { id: 'second-user', role: 'user', createdAt: 5000 }
     ],
     turnIdByMessageId: { 'first-user': 'turn-a', 'first-reply': 'turn-a', 'second-user': 'turn-b' },
-    removedConversationIds: []
+    removedConversationIds: [],
+    // Earlier history exists but is not loaded.
+    loadedFromFirstMessage: false
   });
   const placed = (anchor: string) => (timeline.afterMessage[anchor] ?? []).map(card => card.messageId);
   assert.deepEqual(placed('first-user'), ['mid-turn']);
   assert.deepEqual(placed('first-reply'), ['between'], 'a later Turn no longer leaves the failure pinned at the bottom');
   assert.deepEqual(placed('second-user'), []);
-  assert.equal(Object.values(timeline.afterMessage).flat().some(card => card.messageId === 'early'), false,
-    'a failure older than the loaded window is not guessed into it');
+  assert.equal([...Object.values(timeline.afterMessage), ...Object.values(timeline.beforeMessage)].flat().some(card => card.messageId === 'early'), false,
+    'a failure older than a loaded window with earlier history is not guessed into it');
   assert.deepEqual(timeline.unbound.map(card => card.messageId), ['n2', 'n3', 'n4'], 'newer than every message: the newest three only');
   assert.ok(timeline.unbound.every(card => collaborationCardStatusLabel(card) === '投递失败'));
+});
+
+test('a failed incoming card with no loaded message before it still shows when nothing earlier exists', () => {
+  const at = (ms: number) => new Date(ms).toISOString();
+  const failed = (...cards: Array<[string, number | undefined]>) => ({
+    Conversation: byId({ id: 'peer', title: '调研对话', status: 'active' }),
+    CollaborationMessage: byId(...cards.map(([id, sentAt], index) => ({
+      ...message(id, String(index + 1), 'followup', id),
+      ...(sentAt === undefined ? {} : { created_at: at(sentAt) })
+    }))),
+    CollaborationMessageSourceLink: byId(...cards.map(([id]) => source(id, 'peer', 'peer-turn'))),
+    CollaborationMessageTargetLink: byId(...cards.map(([id]) => target(id, 'self'))),
+    RuntimeDelivery: byId(...cards.map(([id]) => delivery(id, null, 'failed')))
+  });
+  const project = (
+    records: ReturnType<typeof failed>,
+    messages: Array<{ id: string; role: string; createdAt?: number }>,
+    loadedFromFirstMessage: boolean
+  ) => {
+    const timeline = projectCollaborationTimeline({
+      conversationId: 'self', records, messages, turnIdByMessageId: {}, removedConversationIds: [], loadedFromFirstMessage
+    });
+    const ids = (buckets: Record<string, Array<{ messageId: string }>>) =>
+      Object.fromEntries(Object.entries(buckets).map(([anchor, cards]) => [anchor, cards.map(card => card.messageId)]));
+    return { before: ids(timeline.beforeMessage), after: ids(timeline.afterMessage), unbound: timeline.unbound.map(card => card.messageId) };
+  };
+
+  // A Conversation created for a task whose wake dead-lettered has no messages at all.
+  assert.deepEqual(project(failed(['task', 1000]), [], true), { before: {}, after: {}, unbound: ['task'] });
+  // The user typed into it later: the whole history is loaded and the failure precedes it.
+  assert.deepEqual(project(failed(['task', 1000]), [{ id: 'u1', role: 'user', createdAt: 5000 }], true),
+    { before: { u1: ['task'] }, after: {}, unbound: [] });
+  // Loaded messages without creation times give nothing to compare with.
+  assert.deepEqual(project(failed(['untimed', 1000]), [{ id: 'm1', role: 'user' }, { id: 'm2', role: 'model' }], false),
+    { before: {}, after: {}, unbound: ['untimed'] });
+  // Earlier history that is not loaded may hold the right position: the card waits for it.
+  assert.deepEqual(project(failed(['early', 1000]), [{ id: 'm9', role: 'user', createdAt: 5000 }], false),
+    { before: {}, after: {}, unbound: [] });
+  // The pin keeps only the newest few, in an empty Conversation as well.
+  assert.deepEqual(project(failed(['f1', 1], ['f2', 2], ['f3', 3], ['f4', 4]), [], true).unbound,
+    ['f1', 'f2', 'f3', 'f4'].slice(-MAX_PINNED_FAILED_COLLABORATION_CARDS));
 });
 
 test('an outgoing message or result waiting for the recipient says it arrived and when it is read', () => {
@@ -234,7 +282,8 @@ test('an outgoing message or result waiting for the recipient says it arrived an
     },
     messages: [{ id: 'self-message', role: 'user' }],
     turnIdByMessageId: { 'self-message': 'self-turn' },
-    removedConversationIds: []
+    removedConversationIds: [],
+    loadedFromFirstMessage: true
   });
   assert.deepEqual(timeline.afterMessage['self-message'].map(card => [card.messageId, collaborationCardStatusLabel(card)]), [
     ['idle-message', '已送达，对方下一轮读取'],
@@ -247,6 +296,10 @@ test('an outgoing message or result waiting for the recipient says it arrived an
 test('the client feed contract states the card placement and pinned-failure bound the timeline uses', () => {
   const contract = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'docs/architecture/reliable-kernel/contracts/client-feed.json'), 'utf8'));
   const rule = contract.collaborationProjection.deliveryState as string;
-  assert.match(rule, new RegExp(`failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent-or-among-the-newest-${MAX_PINNED_FAILED_COLLABORATION_CARDS}-pinned-below-every-message`));
+  assert.match(rule, new RegExp('failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent'
+    + '-or-before-the-first-message-when-older-than-every-message-and-nothing-earlier-exists'
+    + `-or-among-the-newest-${MAX_PINNED_FAILED_COLLABORATION_CARDS}-pinned-below-every-message`
+    + '-when-newer-than-every-message-or-no-message-has-a-creation-time; '));
+  assert.match(rule, /; a-failure-older-than-a-window-with-earlier-history-appears-once-that-history-loads; /);
   assert.match(rule, /a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn/);
 });

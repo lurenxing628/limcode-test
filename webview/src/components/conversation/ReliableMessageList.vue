@@ -113,6 +113,8 @@ const canRequestEarlierHistory = computed(() =>
   && (earliestLoadedFloor.value > 1 || hasLoadedFloorGap.value)
 );
 const hasEarlierSegment = computed(() => segmentStart.value > 0 || canRequestEarlierHistory.value);
+// The loaded rows begin at the Conversation's first message without a gap: nothing earlier exists.
+const loadedFromFirstMessage = computed(() => earliestLoadedFloor.value <= 1 && !hasLoadedFloorGap.value);
 const hasLaterSegment = computed(() => segmentStart.value + TIMELINE_MOUNT_LIMIT < messages.value.length);
 const earlierSegmentLabel = computed(() => feed.historyLoading
   ? '正在加载更早内容'
@@ -143,7 +145,8 @@ const collaborationTimeline = computed(() => projectCollaborationTimeline({
   records: feed.records,
   messages: messages.value,
   turnIdByMessageId: projection.value.turnIdByMessageId,
-  removedConversationIds: feed.removedConversationIds
+  removedConversationIds: feed.removedConversationIds,
+  loadedFromFirstMessage: loadedFromFirstMessage.value
 }));
 
 const compressionNotices = computed(() => projectCompressionNotices({

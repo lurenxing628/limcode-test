@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const kernel = require(path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension', 'backend/reliableKernel/index.js'));
+const EARLIER = '2026-09-21T00:00:00.000Z';
 const NOW = '2026-09-22T00:00:00.000Z';
 const LATER = '2026-09-23T00:00:00.000Z';
 const row = (domain, value) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(value);
@@ -35,17 +36,22 @@ async function feedFrames() {
         ...(turnId ? [row('MessageTurnLink', { id: `${id}-turn`, turn_id: turnId, message_id: id, role: 'user', created_at: NOW })] : [])
       ];
     };
-    const incoming = async (id, from, text) => {
+    /** Delivered into the finished Turn unless `failedAt` says it failed, sent at that time, before reaching a Turn. */
+    const incoming = async (id, from, text, failedAt) => {
       const payload = await store.ingest(database, text, 'text/vnd.limcode.collaboration-message');
+      const sentAt = failedAt ?? NOW;
       return [
-        kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode: 'message', created_at: NOW }, { column: 'message_seq', scope: {} }),
+        kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode: 'message', created_at: sentAt }, { column: 'message_seq', scope: {} }),
         row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: from, source_kind: 'tool', source_key: id, turn_id: null, tool_call_id: null, created_at: NOW }),
         row('RuntimeInboxItem', { id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message', source_id: id, state: 'available', created_at: NOW, updated_at: NOW }),
         row('CollaborationMessageTargetLink', { id: `${id}-target`, message_id: id, conversation_id: 'target', inbox_item_id: `${id}-inbox`, anchor_turn_id: null, created_at: NOW }),
         row('CollaborationMessagePayloadLink', { id: `${id}-payload`, message_id: id, content_object_id: payload.id, created_at: NOW }),
-        row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: 'target', target_turn_id: 'target-turn', phase: 'current_turn',
-          attempt_seq: 1n, retry_of_delivery_id: null, state: 'consumed', failure_reason: null, created_at: NOW, updated_at: NOW }),
-        row('RuntimeDeliveryInputLink', { id: `${id}-input`, delivery_id: `${id}-delivery`, pending_turn_input_id: `${id}-pending-input`, handled_at: NOW, created_at: NOW, updated_at: NOW })
+        failedAt
+          ? row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: 'target', target_turn_id: null, phase: 'next_turn',
+            attempt_seq: 1n, retry_of_delivery_id: null, state: 'failed', failure_reason: 'wake-dead-letter', created_at: sentAt, updated_at: sentAt })
+          : row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: 'target', target_turn_id: 'target-turn', phase: 'current_turn',
+            attempt_seq: 1n, retry_of_delivery_id: null, state: 'consumed', failure_reason: null, created_at: NOW, updated_at: NOW }),
+        ...(failedAt ? [] : [row('RuntimeDeliveryInputLink', { id: `${id}-input`, delivery_id: `${id}-delivery`, pending_turn_input_id: `${id}-pending-input`, handled_at: NOW, created_at: NOW, updated_at: NOW })])
       ];
     };
     await database.transaction([
@@ -64,7 +70,9 @@ async function feedFrames() {
       row('ConversationBranchLink', { id: 'gone-branch', target_conversation_id: 'gone', source_conversation_id: 'target',
         source_message_revision_id: 'target-first-revision', created_at: NOW }),
       ...await incoming('from-sender', 'sender', '来自调研对话'),
-      ...await incoming('from-gone', 'gone', '来自将被删除的对话')
+      ...await incoming('from-gone', 'gone', '来自将被删除的对话'),
+      // Failed before the first message of `target`, whose whole history the snapshot loads.
+      ...await incoming('failed-early', 'sender', '比第一条消息更早的任务', EARLIER)
     ]);
     const feed = new kernel.BoundedClientFeed(database);
     try {
@@ -152,6 +160,9 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
     let queue = await mount(queuePanel);
     assert.deepEqual(labels(list.setup), ['来自对话 会被删除的对话', '来自对话 调研登录流程']);
     assert.match(list.html, /来自对话 调研登录流程/);
+    assert.deepEqual(list.setup.collaborationTimeline.beforeMessage['target-first']?.map((card) => [card.messageId, card.status]),
+      [['failed-early', 'failed']], 'a failure older than every message sits above the first one when the whole history is loaded');
+    assert.match(list.html, /比第一条消息更早的任务/);
     assert.equal(queue.setup.collaborationSourceLabel('gone'), '来自对话 会被删除的对话');
 
     await t.test('a replayed fork result shows the notice until the fork is deleted', async () => {
