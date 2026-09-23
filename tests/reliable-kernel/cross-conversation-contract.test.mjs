@@ -14,6 +14,7 @@ const { createBuiltinToolDefinitions } = load('backend/world/modules/tools/defin
 const { CROSS_CONVERSATION_LIMITS, frozenCrossConversationEnabled } = load('backend/reliableKernel/collaborationPolicy.js');
 const { RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS } = load('shared/reliableKernelClientFeed.js');
 const { crossConversationToolPermitted } = load('shared/toolPolicyResolution.js');
+const { CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE, CLIENT_MESSAGE_WINDOW_LIMIT } = load('backend/reliableKernel/clientFeedBounds.js');
 
 const contract = async name => JSON.parse(await fs.readFile(`docs/architecture/reliable-kernel/contracts/${name}.json`, 'utf8'));
 const crossConversation = async () => (await contract('subagent')).collaboration.crossConversation;
@@ -72,6 +73,14 @@ test('the client feed contract preview bound matches the projection constant', a
   assert.match(projection.messagePreview, new RegExp(`text_preview-of-at-most-${bound}-characters`));
   assert.match(projection.runtimeContinuationPreview, new RegExp(`${bound}-character-text-preview`));
   assert.equal(projection.messageBodiesInFeed, false);
+});
+
+test('the client feed contract snapshot numbers are the code constants the projection uses', async () => {
+  const client = await contract('client-feed');
+  // queryCollaborationMessagesForTurns limits the collaboration selection by the per-type bound.
+  assert.match(client.collaborationProjection.snapshotSelection, new RegExp(`; at-most-${CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE}-newest-by-message_seq$`));
+  assert.equal(client.snapshot.activeRecordLimitPerType, CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE);
+  assert.equal(client.snapshot.messageWindowLimit, CLIENT_MESSAGE_WINDOW_LIMIT);
 });
 
 test('the board contract says it is not offered, and the registry agrees', async () => {
