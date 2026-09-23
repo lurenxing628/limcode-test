@@ -176,7 +176,9 @@ console.log(
     ? `按稳定顺序运行${files.length}个已纳入版本库的CI关键测试文件。`
     : `按稳定顺序运行${files.length}个当前可靠内核本机测试文件。`
 );
-const TEST_TIMEOUT_MS = 10 * 60 * 1000;
+// Guard against a hung run, not a budget for the suite: the serial suite alone now takes about
+// 13-14 minutes on a developer machine, so a 10-minute cap failed every complete run.
+const TEST_TIMEOUT_MS = 30 * 60 * 1000;
 // Several gate tests intentionally read/write shared evidence files. Node's default per-file
 // parallelism makes those durable fixtures race each other, so the advertised stable order must be
 // real rather than merely sorting the argv list.
