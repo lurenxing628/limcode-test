@@ -4,7 +4,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import { MAX_LLM_RETRY_DELAY_SECONDS } from '../../shared/protocol';
-import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind } from '../../shared/protocol';
+import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind, SkillPolicyRecord } from '../../shared/protocol';
 import type {
   CompressionExecutionPlan,
   ModelCapabilitySnapshot,
@@ -107,6 +107,20 @@ export function frozenInteractionAutoApproval(
   }
   const tool = policy.toolConfigs[toolName];
   return isRecord(tool) && isRecord(tool.config) && tool.config.autoApprove === true;
+}
+
+/**
+ * The skill settings frozen in one AuthoritySnapshot. Absent means every skill is on (skills are
+ * opt-out); a malformed value throws. Listing skills to the model and loading one both use this.
+ */
+export function frozenSkillPolicy(document: PlainJsonValue): Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined {
+  if (!isRecord(document)) throw new TypeError('AuthoritySnapshot must be an object.');
+  if (document.skillPolicy === undefined || document.skillPolicy === null) return undefined;
+  if (!isRecord(document.skillPolicy)) throw new TypeError('AuthoritySnapshot.skillPolicy must be an object.');
+  const sourceConfigs = document.skillPolicy.sourceConfigs;
+  if (sourceConfigs === undefined || sourceConfigs === null) return {};
+  if (!isRecord(sourceConfigs)) throw new TypeError('AuthoritySnapshot.skillPolicy.sourceConfigs must be an object.');
+  return { sourceConfigs: sourceConfigs as SkillPolicyRecord['sourceConfigs'] };
 }
 
 export function frozenModelIdentity(document: PlainJsonValue): { providerId: string; modelId: string } {

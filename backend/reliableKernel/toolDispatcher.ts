@@ -16,7 +16,6 @@ import {
   SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
   TRANSFER_TOOL_NAME,
   type SkillDefinitionRecord,
-  type SkillPolicyRecord,
   type ToolDefinitionMetadataRecord,
   type ToolPolicyToolConfigRecord,
   type WorkEnvironmentRecord
@@ -87,8 +86,8 @@ import type {
   FileMutationDispatcher
 } from './fileEffects';
 import { authorizeFrozenPlanReview, type FrozenPlanReviewRiskLevel } from './frozenMcpPolicyGate';
-import { frozenInteractionAutoApproval, readFrozenTurnAuthority } from './frozenAuthority';
-import { inheritedToolPolicyChain, type InheritedToolPolicyLayer } from './childToolBoundary';
+import { frozenInteractionAutoApproval, frozenSkillPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import { inheritedToolPolicyChain, type InheritedToolPolicyLayer } from './childExecutionBoundary';
 import type { McpEffectDispatcher } from './mcpEffects';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import type { ProcessControlPlane, ProcessWaitObservation } from './processEffects';
@@ -2204,7 +2203,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (index === -1) return definitions;
     let enabled: SkillDefinitionRecord[];
     try {
-      const policy = authoritySkillPolicy(document);
+      const policy = frozenSkillPolicy(document);
       enabled = host.skillDefinitions().filter((skill) => isSkillEnabledByPolicy(policy, skill));
     } catch {
       // 与其他动态注入点一致：目录/冻结策略异常时降级为静态描述，不拖垮整个 Turn。
@@ -2763,20 +2762,6 @@ function authorityPolicy(document: PlainJsonValue): {
     toolConfigs: toolConfigsRaw as unknown as Record<string, ToolPolicyToolConfigRecord>,
     sourceConfigs,
     inherited: inheritedToolPolicyChain(policy)
-  };
-}
-
-/**
- * 读取冻结 Authority 中的 skillPolicy。缺失/为空时返回 undefined（默认全部启用，opt-out）。
- * sourceConfigs 由 configuration authority 冻结时 plain-clone，结构与 SkillPolicyRecord 一致。
- */
-function authoritySkillPolicy(document: PlainJsonValue): Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined {
-  const authority = requireRecord(document, 'AuthoritySnapshot');
-  if (authority.skillPolicy === undefined || authority.skillPolicy === null) return undefined;
-  const raw = plainRecord(authority.skillPolicy, 'AuthoritySnapshot.skillPolicy');
-  if (raw.sourceConfigs === undefined || raw.sourceConfigs === null) return {};
-  return {
-    sourceConfigs: plainRecord(raw.sourceConfigs as PlainJsonValue | undefined, 'AuthoritySnapshot.skillPolicy.sourceConfigs') as unknown as SkillPolicyRecord['sourceConfigs']
   };
 }
 

@@ -35,6 +35,8 @@ import type {
 import { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
 import type { PlainJsonValue } from '../../reliableKernel/plainJson';
 import { resolveFrozenWorkEnvironmentBoundary } from '../../reliableKernel/workEnvironmentBoundary';
+import { frozenSkillPolicy } from '../../reliableKernel/frozenAuthority';
+import { skillCatalogWithinPolicy } from '../../world/modules/skill/policy';
 import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 
 export interface VscodeReliableToolHostOptions {
@@ -173,7 +175,8 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       fs: this.fs,
       command: this.commandDeclaration,
       workEnvironment: this.workEnvironment,
-      skills: this.skills,
+      // A skill the Turn's frozen policy turns off (for a child, also off in its parent) cannot be loaded.
+      skills: skillCatalogWithinPolicy(this.skills, frozenSkillPolicy(authority.document)),
       ...(this.options.resolveAttachmentReference ? {
         attachments: {
           reference: this.options.resolveAttachmentReference,

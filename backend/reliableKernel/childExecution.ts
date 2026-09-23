@@ -38,10 +38,11 @@ import {
 import { frozenModelSelection, frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from './frozenAuthority';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import {
+  frozenSkillPolicyDocument,
   frozenToolPolicyDocument,
-  readChildExecutionToolBoundary,
-  type FrozenToolPolicyDocument
-} from './childToolBoundary';
+  readChildExecutionBoundary,
+  type ChildExecutionBoundary
+} from './childExecutionBoundary';
 import { canonicalPlainJson } from './plainJson';
 import {
   isTransactionAssertionFailure,
@@ -399,8 +400,8 @@ export class ChildExecutionControlPlane {
     const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
       requirePhaseFId(parent.turn.id, 'parent Turn.id')
     );
-    // The child's tools never exceed the parent Turn's; later Turns keep this same bound.
-    const inheritedToolPolicy = await this.frozenToolPolicyForTurn(
+    // The child's tools and skills never exceed the parent Turn's; later Turns keep this same bound.
+    const inherited = await this.frozenChildBoundaryForTurn(
       requirePhaseFId(parent.turn.id, 'parent Turn.id')
     );
     const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
@@ -411,7 +412,8 @@ export class ChildExecutionControlPlane {
       modelFallback: command.modelFallback,
       ...(workspace ? { workspace } : {}),
       ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {}),
-      inheritedToolPolicy
+      inheritedToolPolicy: inherited.toolPolicy,
+      inheritedSkillPolicy: inherited.skillPolicy
     }), ids.childTurnId, command.childAgentId);
     const modelSelection = frozenModelSelection(JSON.parse(asUtf8Text(
       compiled.authoritySnapshot.content,
@@ -716,8 +718,8 @@ export class ChildExecutionControlPlane {
     return frozenWorkEnvironmentPolicy(frozen.document);
   }
 
-  /** Reads the tool policy frozen for one Turn, with its own parent bound, as a child inherits it. */
-  public async frozenToolPolicyForTurn(turnIdInput: string): Promise<FrozenToolPolicyDocument> {
+  /** Reads the tool and skill settings frozen for one Turn, as a child spawned by it inherits them. */
+  public async frozenChildBoundaryForTurn(turnIdInput: string): Promise<Required<ChildExecutionBoundary>> {
     const turnId = requirePhaseFId(turnIdInput, 'turnId');
     const snapshots = await this.listRows('AuthoritySnapshot', { turn_id: turnId }, 2);
     if (snapshots.length !== 1) throw new Error(`Turn ${turnId} must have exactly one AuthoritySnapshot.`);
@@ -727,7 +729,10 @@ export class ChildExecutionControlPlane {
       requirePhaseFId(snapshots[0].id, 'AuthoritySnapshot.id'),
       turnId
     );
-    return frozenToolPolicyDocument(frozen.document);
+    return {
+      toolPolicy: frozenToolPolicyDocument(frozen.document),
+      skillPolicy: frozenSkillPolicyDocument(frozen.document)
+    };
   }
 
   public recordSpawnReceipt(input: {
@@ -1464,7 +1469,7 @@ export class ChildExecutionControlPlane {
     const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
       requirePhaseFId(previousTurn.id, 'previous Turn.id')
     );
-    const inheritedToolPolicy = await readChildExecutionToolBoundary(
+    const inherited = await readChildExecutionBoundary(
       this.database,
       this.contentStore,
       requirePhaseFId(command.childExecutionId, 'childExecutionId')
@@ -1477,7 +1482,8 @@ export class ChildExecutionControlPlane {
       sourceTurnId: requirePhaseFId(previousTurn.id, 'previous Turn.id'),
       ...(workspace ? { workspace } : {}),
       ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {}),
-      ...(inheritedToolPolicy ? { inheritedToolPolicy } : {})
+      ...(inherited.toolPolicy ? { inheritedToolPolicy: inherited.toolPolicy } : {}),
+      ...(inherited.skillPolicy ? { inheritedSkillPolicy: inherited.skillPolicy } : {})
     }), ids.turnId, executorAgentId);
     const authorityContent = await this.contentStore.prepare(
       this.database,

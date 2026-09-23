@@ -10,6 +10,7 @@ import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useSkillPolicyStore } from '@webview/stores/useSkillPolicyStore';
+import { useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
 const props = withDefaults(defineProps<{
@@ -59,6 +60,14 @@ const groups = computed<SkillSourceGroup[]>(() => SKILL_SOURCES.map((source) => 
 
 const enabledCount = computed(() => skills.value.filter((skill) => isSkillEnabled(skill)).length);
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
+// Mirrors the backend child bound (childExecutionBoundary.ts): a skill the parent Turn turned off stays off.
+const childBoundNote = computed(() => {
+  const rule = '派出它的对话关掉的技能，这里也用不了。';
+  if (props.scopeKind === 'agent') return `这个 Agent 作为子 Agent 运行时，${rule}`;
+  return props.scopeKind === 'conversation' && useToolPolicyStore().isChildConversation(props.scopeId)
+    ? `这是子 Agent 对话，${rule}`
+    : '';
+});
 const sourceLabel = computed(() => {
   if (props.scopeKind === 'global') return '全局默认策略';
   if (hasLocalOverride.value) return '当前范围的单独设置';
@@ -175,6 +184,8 @@ function toggleSkillExpanded(id: string): void {
       </div>
     </header>
 
+    <p v-if="childBoundNote" class="skill-policy-note">{{ childBoundNote }}</p>
+
     <div class="skill-policy-actions">
       <button type="button" class="secondary" :disabled="refreshing" @click="refreshCatalog">{{ refreshing ? '刷新中…' : '刷新技能' }}</button>
       <button type="button" :disabled="readonly || skills.length === 0" @click="enableAll">启用全部</button>
@@ -265,6 +276,13 @@ function toggleSkillExpanded(id: string): void {
   margin: var(--space-1) 0 0;
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
+.skill-policy-note {
+  margin: 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--font-size-xs);
   line-height: 1.5;
 }
 

@@ -1,12 +1,15 @@
 import type { ContentAddressedStore } from './contentAddressedStore';
-import { readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from './frozenAuthority';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import {
   ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY,
   SUBMIT_AGENT_ANSWER_TOOL_NAME,
   TOOL_POLICY_ALL_MCP_SOURCES,
+  type SkillPolicySourceConfigRecord,
+  type SkillSource,
   type ToolConfigRecord,
   type ToolPolicySourceConfigRecord,
   type ToolPolicyToolConfigRecord
@@ -38,6 +41,24 @@ export interface BoundToolPolicy extends ResolvedToolPolicy {
 export interface InheritedToolPolicyLayer {
   preset: string;
   toolConfigs: Record<string, ToolPolicyToolConfigRecord>;
+}
+
+export type SkillSourceConfigs = Partial<Record<SkillSource, SkillPolicySourceConfigRecord>>;
+
+/** The skill settings one Turn froze, as a child Turn inherits them (already bounded by its own parent). */
+export interface FrozenSkillPolicyDocument {
+  id: string | null;
+  sourceConfigs: SkillSourceConfigs;
+}
+
+export interface BoundSkillPolicy extends FrozenSkillPolicyDocument {
+  inherited?: FrozenSkillPolicyDocument;
+}
+
+/** What a child execution inherited from the parent Turn that spawned it. */
+export interface ChildExecutionBoundary {
+  toolPolicy?: FrozenToolPolicyDocument;
+  skillPolicy?: FrozenSkillPolicyDocument;
 }
 
 /**
@@ -98,6 +119,47 @@ export function frozenInheritedToolPolicy(document: PlainJsonValue): FrozenToolP
     : parseToolPolicy(policy.inherited, 'AuthoritySnapshot.toolPolicy.inherited', 1);
 }
 
+/**
+ * A child Turn's skills: a skill is off when either side turns it off — its source disabled or the
+ * skill listed in `disabledSkills` — the same opt-out rule as `isSkillEnabledByPolicy`. The parent's
+ * frozen settings already include its own parent's, so one level of `inherited` is enough.
+ */
+export function boundChildSkillPolicy(own: FrozenSkillPolicyDocument, parent: FrozenSkillPolicyDocument): BoundSkillPolicy {
+  const sourceConfigs: SkillSourceConfigs = {};
+  const sources = new Set([...Object.keys(own.sourceConfigs), ...Object.keys(parent.sourceConfigs)] as SkillSource[]);
+  for (const source of [...sources].sort()) {
+    const mine = own.sourceConfigs[source];
+    const theirs = parent.sourceConfigs[source];
+    if (!mine && !theirs) continue;
+    const disabledSkills = [...new Set([...(mine?.disabledSkills ?? []), ...(theirs?.disabledSkills ?? [])])].sort();
+    sourceConfigs[source] = {
+      enabled: mine?.enabled !== false && theirs?.enabled !== false,
+      ...(disabledSkills.length > 0 ? { disabledSkills } : {})
+    };
+  }
+  return { id: own.id, sourceConfigs, inherited: clonePlain(parent) };
+}
+
+/**
+ * The skill settings frozen in one AuthoritySnapshot document, as a bound for its child. A Turn
+ * that froze none had every skill on (skills are opt-out).
+ */
+export function frozenSkillPolicyDocument(document: PlainJsonValue): FrozenSkillPolicyDocument {
+  const authority = requireRecord(document, 'AuthoritySnapshot');
+  if (authority.skillPolicy === undefined || authority.skillPolicy === null) return { id: null, sourceConfigs: {} };
+  return parseSkillPolicy(authority.skillPolicy, 'AuthoritySnapshot.skillPolicy');
+}
+
+/** The parent skill bound a child Turn froze; undefined for a top-level Turn or a legacy snapshot. */
+export function frozenInheritedSkillPolicy(document: PlainJsonValue): FrozenSkillPolicyDocument | undefined {
+  const authority = requireRecord(document, 'AuthoritySnapshot');
+  if (authority.skillPolicy === undefined || authority.skillPolicy === null) return undefined;
+  const policy = requireRecord(authority.skillPolicy, 'AuthoritySnapshot.skillPolicy');
+  return policy.inherited === undefined
+    ? undefined
+    : parseSkillPolicy(policy.inherited, 'AuthoritySnapshot.skillPolicy.inherited');
+}
+
 /** Every ancestor's preset and per-tool settings, nearest first; empty for a top-level Turn. */
 export function inheritedToolPolicyChain(toolPolicy: unknown): InheritedToolPolicyLayer[] {
   const chain: InheritedToolPolicyLayer[] = [];
@@ -119,32 +181,67 @@ export function inheritedToolPolicyChain(toolPolicy: unknown): InheritedToolPoli
 }
 
 /**
- * The parent bound of one ChildExecution: what its first Turn inherited when it was spawned. Every
- * later Turn of the child, whoever starts it, uses the same bound, so a Turn started by the user in
- * the child conversation cannot widen what later continuations get.
+ * What one ChildExecution inherited when it was spawned: the tool and skill settings its first Turn
+ * froze from the parent Turn. Every later Turn of the child, whoever starts it, uses the same bound,
+ * so a Turn started by the user in the child conversation cannot widen what later ones get.
  */
-export async function readChildExecutionToolBoundary(
+export async function readChildExecutionBoundary(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   childExecutionId: string
-): Promise<FrozenToolPolicyDocument | undefined> {
+): Promise<ChildExecutionBoundary> {
+  const document = await readChildTurnDocument(database, contentStore, childExecutionId, 'asc');
+  const toolPolicy = frozenInheritedToolPolicy(document);
+  const skillPolicy = frozenInheritedSkillPolicy(document);
+  return { ...(toolPolicy ? { toolPolicy } : {}), ...(skillPolicy ? { skillPolicy } : {}) };
+}
+
+/**
+ * The work-environment boundary of a child's latest Turn, which the next one inherits: the rule a
+ * continuation from the parent or a teammate already follows, now also used for Turns the user
+ * starts in the child conversation.
+ */
+export async function readChildExecutionWorkEnvironmentBoundary(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  childExecutionId: string
+): Promise<FrozenWorkEnvironmentBoundaryPolicy | undefined> {
+  return frozenWorkEnvironmentPolicy(await readChildTurnDocument(database, contentStore, childExecutionId, 'desc'));
+}
+
+/** The frozen authority of a child's first ('asc') or latest ('desc') Turn. */
+async function readChildTurnDocument(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  childExecutionId: string,
+  direction: 'asc' | 'desc'
+): Promise<PlainJsonValue> {
   const links = await database.snapshot([
     DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').list({
       where: { child_execution_id: childExecutionId },
-      orderBy: { column: 'turn_seq', direction: 'asc' },
+      orderBy: { column: 'turn_seq', direction },
       limit: 1
     })
   ]);
-  const first = (links.snapshot[0] as Array<Record<string, unknown>> | undefined)?.[0];
-  if (!first) throw new Error(`ChildExecution ${childExecutionId} has no spawn Turn.`);
-  const spawnTurnId = String(first.turn_id);
+  const link = (links.snapshot[0] as Array<Record<string, unknown>> | undefined)?.[0];
+  if (!link) throw new Error(`ChildExecution ${childExecutionId} has no Turn lineage.`);
+  const turnId = String(link.turn_id);
   const snapshots = await database.snapshot([
-    DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').list({ where: { turn_id: spawnTurnId }, limit: 2 })
+    DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').list({ where: { turn_id: turnId }, limit: 2 })
   ]);
   const rows = snapshots.snapshot[0] as Array<Record<string, unknown>> | undefined;
-  if (!rows || rows.length !== 1) throw new Error(`Spawn Turn ${spawnTurnId} must have exactly one AuthoritySnapshot.`);
-  const frozen = await readFrozenTurnAuthority(database, contentStore, String(rows[0].id), spawnTurnId);
-  return frozenInheritedToolPolicy(frozen.document);
+  if (!rows || rows.length !== 1) throw new Error(`Child Turn ${turnId} must have exactly one AuthoritySnapshot.`);
+  return (await readFrozenTurnAuthority(database, contentStore, String(rows[0].id), turnId)).document;
+}
+
+function parseSkillPolicy(value: unknown, label: string): FrozenSkillPolicyDocument {
+  const policy = requireRecord(value, label);
+  return {
+    id: typeof policy.id === 'string' ? policy.id : null,
+    sourceConfigs: policy.sourceConfigs === undefined || policy.sourceConfigs === null
+      ? {}
+      : clonePlain(requireRecord(policy.sourceConfigs, `${label}.sourceConfigs`)) as SkillSourceConfigs
+  };
 }
 
 function parseToolPolicy(value: unknown, label: string, depth: number): FrozenToolPolicyDocument {

@@ -90,6 +90,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
   try {
     const { default: editor } = await server.ssrLoadModule('/src/components/settings/agent/AgentCollaborationSettings.vue');
     const { default: toolEditor } = await server.ssrLoadModule('/src/components/settings/tools/ToolPolicyEditor.vue');
+    const { default: skillEditor } = await server.ssrLoadModule('/src/components/settings/skills/SkillPolicyEditor.vue');
     const { useClientStateStore } = await server.ssrLoadModule('/src/stores/useClientStateStore.ts');
     const { useToolPolicyStore } = await server.ssrLoadModule('/src/stores/useToolPolicyStore.ts');
     const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
@@ -146,6 +147,8 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.doesNotMatch(oldHtml, /受派出它的对话限制/, 'the global scope never runs as a child');
       assert.match(await render(toolEditor, { scopeKind: 'agent', scopeId: 'worker' }),
         /这个 Agent 作为子 Agent 运行时，还受派出它的对话限制：只能使用双方都允许的工具和 MCP 服务/);
+      assert.match(await render(skillEditor, { scopeKind: 'agent', scopeId: 'worker' }), /这个 Agent 作为子 Agent 运行时，派出它的对话关掉的技能，这里也用不了/);
+      assert.doesNotMatch(await render(skillEditor, { scopeKind: 'global' }), /派出它的对话关掉的技能/);
       const readonlyHtml = await render(editor, { scopeKind: 'global', readonly: true });
       assert.match(input(readonlyHtml, '最大子 Agent 深度'), /disabled/);
     });
@@ -1077,6 +1080,8 @@ server.connect(new StdioServerTransport());
       // Its tool settings say the conversation that started it bounds them too; a top-level conversation's do not.
       assert.match(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'child-conversation' }), /这是子 Agent 对话，工具还受派出它的对话限制/);
       assert.doesNotMatch(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'plain' }), /受派出它的对话限制/);
+      assert.match(await render(skillEditor, { scopeKind: 'conversation', scopeId: 'child-conversation' }), /这是子 Agent 对话，派出它的对话关掉的技能/);
+      assert.doesNotMatch(await render(skillEditor, { scopeKind: 'conversation', scopeId: 'plain' }), /派出它的对话关掉的技能/);
     });
 
     await t.test('工具设置的恢复继承只重置工具设置，保留 Agent 协作里的开关和上限', async () => {

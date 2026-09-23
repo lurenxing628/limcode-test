@@ -33,11 +33,14 @@ const { ReliableChildAgentCoordinator } = dist('backend/reliableKernel/childAgen
 const { readFrozenTurnAuthority } = dist('backend/reliableKernel/frozenAuthority.js');
 const { ReliableToolDispatcher } = dist('backend/reliableKernel/toolDispatcher.js');
 const {
+  boundChildSkillPolicy,
   boundChildToolPolicy,
+  frozenSkillPolicyDocument,
   frozenToolPolicyDocument,
   inheritedToolPolicyChain
-} = dist('backend/reliableKernel/childToolBoundary.js');
+} = dist('backend/reliableKernel/childExecutionBoundary.js');
 const { toolAllowedByPolicy } = dist('shared/toolPolicyResolution.js');
+const { isSkillEnabledByPolicy, skillCatalogWithinPolicy } = dist('backend/world/modules/skill/policy.js');
 
 const resolved = (overrides = {}) => ({
   id: 'policy:child', allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {}, ...overrides
@@ -140,6 +143,42 @@ test('the inherited chain reaches the top-level Turn, nearest first', () => {
     ['submit_agent_answer']);
 });
 
+test('a skill either side turns off stays off in the child; untouched sources stay on', () => {
+  const bound = boundChildSkillPolicy(
+    { id: 'skills:child', sourceConfigs: { agents: { enabled: true, disabledSkills: ['lint'] }, claude: { enabled: false } } },
+    { id: 'skills:parent', sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] }, global: { enabled: false } } }
+  );
+  assert.deepEqual(bound.sourceConfigs, {
+    agents: { enabled: true, disabledSkills: ['deploy', 'lint'] },
+    claude: { enabled: false },
+    global: { enabled: false }
+  });
+  assert.equal(bound.id, 'skills:child');
+  assert.deepEqual(bound.inherited, { id: 'skills:parent', sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] }, global: { enabled: false } } });
+  const on = (id, source) => isSkillEnabledByPolicy(bound, { id, source });
+  assert.deepEqual([on('review', 'agents'), on('deploy', 'agents'), on('lint', 'agents'), on('x', 'claude'), on('y', 'global')], [true, false, false, false, false]);
+  // A parent that froze no skill settings had every skill on.
+  assert.deepEqual(frozenSkillPolicyDocument({}), { id: null, sourceConfigs: {} });
+  assert.deepEqual(boundChildSkillPolicy({ id: null, sourceConfigs: {} }, frozenSkillPolicyDocument({})).sourceConfigs, {});
+});
+
+test('a skill the frozen policy turns off can be neither listed nor loaded', async () => {
+  const skills = [{ id: 'deploy', slug: 'deploy', name: 'deploy', source: 'agents' }, { id: 'review', slug: 'review', name: 'review', source: 'agents' }];
+  const catalog = {
+    list: () => skills,
+    get: (name, source) => skills.find(skill => skill.name === name && (!source || skill.source === source)),
+    async readBody(name) { return `body of ${name}`; },
+    async refresh() {}
+  };
+  const visible = skillCatalogWithinPolicy(catalog, { sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] } } });
+  assert.deepEqual(visible.list().map(skill => skill.id), ['review']);
+  assert.equal(visible.get('deploy'), undefined);
+  assert.equal(visible.get('review').id, 'review');
+  assert.equal(await visible.readBody('review', 'agents'), 'body of review');
+  await assert.rejects(visible.readBody('deploy', 'agents'), /未找到技能：deploy/);
+  assert.equal(skillCatalogWithinPolicy(catalog, undefined).get('deploy').id, 'deploy', 'no frozen skill settings: every skill is on');
+});
+
 test('VscodeConfigurationAuthority compiles a child Turn within its parent Turn and leaves top-level Turns unchanged', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-child-tool-boundary-compile-'));
   try {
@@ -151,14 +190,21 @@ test('VscodeConfigurationAuthority compiles a child Turn within its parent Turn 
       allowedTools: ['read', 'run_agent'], sourceConfigs: { exa: { enabled: true, enabledTools: ['search'] } } });
     await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: childAgent.id,
       allowedTools: ['bash', 'read', 'submit_agent_answer', 'write'], sourceConfigs: { exa: { enabled: true }, github: { enabled: true } } });
+    await configuration.mutations.setSkillPolicy({ scopeKind: 'agent', scopeId: parentAgent.id, sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] } } });
+    await configuration.mutations.setSkillPolicy({ scopeKind: 'agent', scopeId: childAgent.id, sourceConfigs: { claude: { enabled: false } } });
     const compile = async (turnId, agentId, extra = {}) => JSON.parse((await configuration.compile({
       conversationId: `conversation:${turnId}`, turnId, executorAgentId: agentId, intentKind: 'input', ...extra
     })).authoritySnapshot.content);
     const parent = await compile('parent-turn', parentAgent.id);
     assert.equal(parent.toolPolicy.inherited, undefined, 'a top-level Turn carries no inherited bound');
+    assert.deepEqual(Object.keys(parent.skillPolicy), ['id', 'sourceConfigs'], 'nor inherited skill settings');
     const unbound = await compile('child-unbound', childAgent.id);
     assert.deepEqual(unbound.toolPolicy.allowedTools, ['bash', 'read', 'submit_agent_answer', 'write']);
-    const child = await compile('child-turn', childAgent.id, { inheritedToolPolicy: frozenToolPolicyDocument(parent) });
+    const child = await compile('child-turn', childAgent.id, {
+      inheritedToolPolicy: frozenToolPolicyDocument(parent), inheritedSkillPolicy: frozenSkillPolicyDocument(parent)
+    });
+    assert.deepEqual(child.skillPolicy.sourceConfigs, { agents: { enabled: true, disabledSkills: ['deploy'] }, claude: { enabled: false } });
+    assert.deepEqual(child.skillPolicy.inherited, frozenSkillPolicyDocument(parent));
     assert.deepEqual(child.toolPolicy.allowedTools, ['read', 'submit_agent_answer']);
     assert.deepEqual(child.toolPolicy.sourceConfigs, { exa: { enabled: true, enabledTools: ['search'] }, github: { enabled: false } });
     assert.deepEqual(child.toolPolicy.inherited, frozenToolPolicyDocument(parent));
@@ -262,7 +308,7 @@ test('MCP per-tool settings of every ancestor are found by source identity', asy
   assert.equal(decide(authority, 'exa_search', {}).executionGate, 'approval_required');
 });
 
-test('spawned, continued and user-started child Turns all stay within the parent Turn frozen at spawn', { timeout: 120000 }, async () => {
+test('spawned, continued and user-started child Turns all stay within the parent Turn frozen at spawn and the latest work-environment bound', { timeout: 120000 }, async () => {
   await runtimeFixture(async f => {
     assert.equal((await f.app.agentLoop.runInput(f.input('spawn'))).terminalStatus, 'completed');
     await f.coordinator.waitForIdle();
@@ -288,10 +334,18 @@ test('spawned, continued and user-started child Turns all stay within the parent
     const all = await turns();
     assert.equal(all.length, 3, 'spawn, parent follow-up and user input each ran one child Turn');
     for (const link of all) {
-      const policy = (await f.frozen(link.turn_id)).document.toolPolicy;
-      assert.deepEqual(policy.allowedTools, ['read', 'submit_agent_answer'], `child Turn ${link.turn_seq} stays bounded`);
-      assert.deepEqual(policy.inherited, spawned.inherited);
+      const { toolPolicy, skillPolicy } = (await f.frozen(link.turn_id)).document;
+      assert.deepEqual(toolPolicy.allowedTools, ['read', 'submit_agent_answer'], `child Turn ${link.turn_seq} stays bounded`);
+      assert.deepEqual(toolPolicy.inherited, spawned.inherited);
+      assert.deepEqual(skillPolicy.sourceConfigs, { agents: { enabled: true, disabledSkills: ['deploy'] } }, 'the parent skill setting reaches every child Turn');
     }
+    // The Turn the user started takes the work environments of the child's previous Turn, as a continuation does.
+    const [, previous, userTurn] = all;
+    const request = f.compileRequests.find(candidate => candidate.turnId === userTurn.turn_id);
+    const { enabled, allowedWorkEnvironmentIds, defaultWorkEnvironmentId } = (await f.frozen(previous.turn_id)).document.workEnvironmentPolicy;
+    assert.deepEqual(request.inheritedWorkEnvironmentPolicy, { enabled, allowedWorkEnvironmentIds, defaultWorkEnvironmentId });
+    assert.deepEqual(request.inheritedToolPolicy, spawned.inherited);
+    assert.ok(request.inheritedSkillPolicy, 'the user-started Turn also carries the skill bound');
   }, {
     async send(request, controls, f) {
       let part = { text: 'done' };
@@ -337,6 +391,7 @@ async function runtimeFixture(run, hooks) {
       allowedTools: ['read', 'run_agent'], toolConfigs: { run_agent: { config: { maxChildAgentDepth: 3 } } } });
     await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: childAgent.id,
       allowedTools: ['bash', 'read', 'submit_agent_answer', 'write'] });
+    await configuration.mutations.setSkillPolicy({ scopeKind: 'agent', scopeId: parentAgent.id, sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] } } });
     const authority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(authority);
     const requests = [], wires = [];
@@ -346,8 +401,10 @@ async function runtimeFixture(run, hooks) {
       const [row] = await list('AuthoritySnapshot', { turn_id: turnId });
       return readFrozenTurnAuthority(app.database, app.contentStore, row.id, turnId);
     };
+    const compileRequests = [];
+    const compiler = { async compile(request) { compileRequests.push(structuredClone(request)); return configuration.compile(request); } };
     app = await kernel.ReliableKernelApplication.open(authority, {
-      authorityCompiler: configuration, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
+      authorityCompiler: compiler, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
       resolveWorkEnvironment: async () => undefined,
       mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { return null; } },
       mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
@@ -385,7 +442,7 @@ async function runtimeFixture(run, hooks) {
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: parentAgent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     const input = key => ({ source: { kind: 'command', key }, conversationId: 'parent', leaseOwnerId: 'boundary-owner', hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: `synthetic input ${key}` });
-    f = { app, configuration, coordinator, parentAgent, childAgent, input, requests, wires, list, frozen, sent: new Set() };
+    f = { app, configuration, coordinator, parentAgent, childAgent, input, requests, wires, list, frozen, compileRequests, sent: new Set() };
     await run(f);
   } finally {
     if (coordinator) await coordinator.dispose();

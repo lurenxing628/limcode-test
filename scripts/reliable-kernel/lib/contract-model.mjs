@@ -979,7 +979,8 @@ function validateContext(context, failures) {
 function validateSubagent(subagent, failures) {
   const toolBoundary = String(subagent?.spawn?.toolBoundary ?? '');
   for (const marker of ['parent-Turn-policy-frozen-at-spawn(toolPolicy.inherited', 'reuse-the-spawn-Turn-bound', 'except-submit_agent_answer-kept-from-the-child-own-list',
-    'a-source-the-parent-never-enabled-stays-off', 'maxChildAgentDepth-takes-the-minimum', 'only-when-every-ancestor-agrees', 'yolo-loosens-only-its-own-level']) {
+    'a-source-the-parent-never-enabled-stays-off', 'maxChildAgentDepth-takes-the-minimum', 'only-when-every-ancestor-agrees', 'yolo-loosens-only-its-own-level',
+    'a-disabled-skill-can-be-neither-listed-nor-loaded', 'including-Turns-the-user-starts-in-the-child-conversation']) {
     if (!toolBoundary.includes(marker)) failures.push(`子Agent工具边界规则缺少${marker}`);
   }
   const collaboration = subagent?.collaboration;

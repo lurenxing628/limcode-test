@@ -87,7 +87,7 @@ const sourceError = computed(() => store.sourceConfigErrorFor(props.scopeKind, p
 const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
 /** Where the cross-conversation switch lives for this scope. */
 const collaborationArea = computed(() => props.scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域');
-// Mirrors the backend child bound (childToolBoundary.ts): a child Turn keeps only what its parent Turn also allows.
+// Mirrors the backend child bound (childExecutionBoundary.ts): a child Turn keeps only what its parent Turn also allows.
 const childBoundNote = computed(() => {
   const rule = '只能使用双方都允许的工具和 MCP 服务；自动执行、自动应用更改和命令白名单也要双方都同意。';
   if (props.scopeKind === 'agent') return `这个 Agent 作为子 Agent 运行时，还受派出它的对话限制：${rule}`;

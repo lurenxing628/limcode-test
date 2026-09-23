@@ -62,7 +62,7 @@ import {
   resolveSummaryReasoning
 } from '../../shared/modelCapabilities';
 import { resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
-import { boundChildToolPolicy, type BoundToolPolicy } from './childToolBoundary';
+import { boundChildSkillPolicy, boundChildToolPolicy, type BoundSkillPolicy, type BoundToolPolicy } from './childExecutionBoundary';
 import {
   createLocalFolderWorkEnvironmentRecord,
   isLocalFolderWorkEnvironment,
@@ -338,6 +338,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       && (selectedModelConfig?.claudeTurnScopedReminders ?? provider.claudeTurnScopedReminders) === true;
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
     const compressionThresholdTokens = compression.thresholdTokens;
+    const ownSkillPolicy = { id: skillPolicy?.id ?? null, sourceConfigs: clonePlainRecord(skillPolicy?.sourceConfigs) };
+    // A skill the parent Turn turned off stays off in its child.
+    const frozenSkillPolicy: BoundSkillPolicy = request.inheritedSkillPolicy
+      ? boundChildSkillPolicy(ownSkillPolicy, request.inheritedSkillPolicy)
+      : ownSkillPolicy;
     const allowedTools = toolPolicy.allowedTools;
     const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
       link.conversationId === request.conversationId && link.role === 'active'
@@ -440,10 +445,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         sourceConfigs: toolPolicy.sourceConfigs,
         ...(toolPolicy.inherited ? { inherited: toolPolicy.inherited } : {})
       },
-      skillPolicy: {
-        id: skillPolicy?.id ?? null,
-        sourceConfigs: clonePlainRecord(skillPolicy?.sourceConfigs)
-      },
+      skillPolicy: frozenSkillPolicy,
       systemPrompt: {
         id: systemPrompt?.id ?? (builtinWorkflow ? `builtin-system-prompt:${workflow?.id}` : builtinAgent ? `builtin-system-prompt:${agentId}` : null),
         text: renderReliableSystemPromptTemplate(composeSystemInstruction(orderedPromptParts), promptRenderContext)
