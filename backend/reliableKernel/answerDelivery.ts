@@ -13,6 +13,7 @@ import {
   type PreparedForegroundSettlement
 } from './childExecution';
 import { requireChildExecutionStatus } from './childExecutionState';
+import { isCrossConversationFollowup } from './collaborationScope';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   isTransactionAssertionFailure,
@@ -1472,15 +1473,23 @@ export class RuntimeDeliveryControlPlane {
     return this.retargetWithDecision(delivery, decision);
   }
 
-  /** Called before a new Turn transaction; returned steps write back target + inject atomically. */
+  /**
+   * Called before a new Turn transaction; returned steps write back target + inject atomically.
+   * `startingDeliveryId` names the delivery a runtime continuation was admitted for: only that
+   * Turn consumes a cross-conversation followup, every other Turn leaves it waiting.
+   */
   public async prepareNextTurnDeliverySteps(
     conversationIdInput: string,
     turnIdInput: string,
-    nowInput: string
+    nowInput: string,
+    startingDeliveryIdInput?: string | null
   ): Promise<RepositoryTransactionStep[]> {
     const conversationId = requirePhaseFId(conversationIdInput, 'conversationId');
     const turnId = requirePhaseFId(turnIdInput, 'turnId');
     const now = requireIsoTimestamp(nowInput, 'now');
+    const startingDeliveryId = startingDeliveryIdInput == null
+      ? null
+      : requirePhaseFId(startingDeliveryIdInput, 'startingDeliveryId');
     const deliveries = (await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_conversation_id: conversationId,
       target_turn_id: null,
@@ -1499,6 +1508,8 @@ export class RuntimeDeliveryControlPlane {
           steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(String(delivery.id), { state: 'pending', phase: 'next_turn', target_turn_id: null }), DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(String(delivery.id), { state: 'failed', failure_reason: 'board-notification-expired', updated_at: now }));
           continue;
         }
+        // A peer's task starts its own Turn; a plain message joins whichever Turn comes next.
+        if (delivery.id !== startingDeliveryId && await isCrossConversationFollowup(this.database, String(inbox.source_id))) continue;
       }
       const contentObjectId = await this.contentObjectIdForInbox(delivery.inbox_item_id as string);
       if (!contentObjectId) {

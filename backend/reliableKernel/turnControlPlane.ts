@@ -405,11 +405,15 @@ export interface TurnControlPlaneOptions {
   authorityCompiler: TurnAuthorityCompiler;
   attachments?: AttachmentIngestService;
   unresolvedFileClosure?: TurnUnresolvedFileClosure;
-  /** Injects pending next_turn RuntimeDelivery facts into an admitted ordinary Turn atomically. */
+  /**
+   * Injects pending next_turn RuntimeDelivery facts into an admitted ordinary Turn atomically.
+   * `startingDeliveryId` is the delivery a runtime continuation was admitted for.
+   */
   prepareNextTurnDeliverySteps?: (
     conversationId: string,
     turnId: string,
-    now: string
+    now: string,
+    startingDeliveryId?: string | null
   ) => Promise<RepositoryTransactionStep[]>;
   now?: () => string;
 }
@@ -1414,7 +1418,12 @@ export class TurnControlPlane {
         })
       : null;
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps
-      ? await this.prepareNextTurnDeliverySteps(conversationId, ids.turn, now)
+      ? await this.prepareNextTurnDeliverySteps(
+          conversationId,
+          ids.turn,
+          now,
+          deliveryIntentLink ? requireId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id') : null
+        )
       : [];
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
@@ -1740,7 +1749,7 @@ export class TurnControlPlane {
         })
       : null;
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps
-      ? await this.prepareNextTurnDeliverySteps(conversation.id as string, ids.turn, now)
+      ? await this.prepareNextTurnDeliverySteps(conversation.id as string, ids.turn, now, plan.deliveryId ?? null)
       : [];
     const childAdmission = command.membership
       ? await this.prepareChildAdmission({

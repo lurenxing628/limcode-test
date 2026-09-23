@@ -58,7 +58,7 @@ const lastResult = (start, name) => start.contents.flatMap(content => content.pa
 const detail = (start, name) => lastResult(start, name)?.detail;
 
 /** The external model alone is synthetic; tools, authority, ownership, persistence and wakes are production code. */
-async function fixture(send, run, { enabled = true, switchValue = true } = {}) {
+async function fixture(send, run, { enabled = true, switchValue = true, wakeGate } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-cross-conversation-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -147,7 +147,7 @@ async function fixture(send, run, { enabled = true, switchValue = true } = {}) {
     });
     runner = new ReliableConversationRunner(app, 'synthetic-cross-owner');
     const wake = createRuntimeDeliveryWakeHandler({ application: () => app, conversations: () => runner, children: () => coordinator });
-    app.processDeliveries.setWakeHandler(async request => { wakes.push(structuredClone(request)); return wake(request); });
+    app.processDeliveries.setWakeHandler(async request => { wakes.push(structuredClone(request)); await wakeGate?.(request); return wake(request); });
     const now = new Date().toISOString();
     await app.database.transaction([
       ...[[ROOT, 'Root title'], [PEER, 'Peer title']].flatMap(([id, title]) => [
@@ -351,6 +351,71 @@ test('a followup to a running conversation waits for its Turn to end, then start
     const completion = (await f.app.runtime.collaboration.listMessages({ conversationId: ROOT })).messages.find(message => message.sourceKind === 'completion');
     assert.equal((await f.app.runtime.collaboration.readMessage({ conversationId: ROOT, messageId: completion.messageId })).text, RESULT);
   });
+});
+
+test('a user Turn that wins the race after the anchor ends leaves the queued peer task to its own Turn', { timeout: 60000 }, async () => {
+  const TASK = 'CROSS_RACE_TASK_8801';
+  const RESULT = 'CROSS_RACE_RESULT_8802';
+  const USER = 'PEER_USER_RACE_8803';
+  const USER_ANSWER = 'PEER_USER_ANSWER_8804';
+  let rootRound = 0, peerFirstTurn, userTurn, continuationTurn, held, release;
+  const releaseWake = new Promise(resolve => { release = resolve; });
+  await fixture(async (request, f, start, wire) => {
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === PEER) {
+      if (!peerFirstTurn) {
+        peerFirstTurn = request.turnId;
+        await f.until(async () => (await f.rows('CollaborationMessageTargetLink', { conversation_id: PEER })).length > 0, 'Root never sent to the running peer.');
+        return answer('Peer finished its own work.');
+      }
+      if (request.turnId === userTurn) {
+        assert.ok(!text.includes(TASK), 'the user Turn never receives the peer task');
+        return answer(USER_ANSWER);
+      }
+      continuationTurn = request.turnId;
+      assert.ok(text.includes(TASK));
+      assertPeerWireRole(wire, TASK);
+      assert.deepEqual(await userMessages(f, request.turnId), [], 'the continuation carries no user message');
+      return answer(RESULT);
+    }
+    rootRound += 1;
+    if (rootRound === 1) {
+      await f.until(() => peerFirstTurn, 'Peer never started.');
+      return toolsAnswer(call('list', 'list_conversations'));
+    }
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('send', 'send_conversation_message', { conversationRef: peer.conversationRef, text: TASK, mode: 'followup' }));
+    }
+    return answer('Delegated to the peer.');
+  }, async f => {
+    const peer = await f.input(PEER, 'peer-own-work');
+    const root = await f.input(ROOT, 'delegate');
+    await f.terminated(root.turnId);
+    await f.terminated(peer.turnId);
+    await f.until(() => held, 'The queued followup was never dispatched after the anchor ended.');
+    const [delivery] = (await f.rows('RuntimeDelivery', { target_conversation_id: PEER })).filter(row => row.id === held.deliveryId);
+    // The user speaks first; the durable wake is still in flight.
+    let user;
+    try {
+      user = await f.input(PEER, USER);
+      userTurn = user.turnId;
+      assert.equal((await f.rows('RuntimeDelivery', { id: delivery.id }))[0].state, 'pending', 'the user Turn does not consume the peer task');
+    } finally { release(); }
+    assert.equal((await f.terminated(user.turnId)).terminal_status, 'completed');
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'The peer task never ran in its own Turn.');
+    const turns = await f.rows('Turn', { conversation_id: PEER });
+    assert.equal(turns.length, 3, 'own work, the user Turn, then exactly one continuation');
+    assert.ok(continuationTurn && continuationTurn !== user.turnId);
+    assert.equal((await f.rows('RuntimeDelivery', { id: delivery.id }))[0].target_turn_id, continuationTurn);
+    assert.deepEqual((await f.rows('CollaborationRequestTurnLink')).map(link => link.turn_id), [continuationTurn]);
+    const completion = (await f.app.runtime.collaboration.listMessages({ conversationId: ROOT })).messages.find(message => message.sourceKind === 'completion');
+    assert.equal((await f.app.runtime.collaboration.readMessage({ conversationId: ROOT, messageId: completion.messageId })).text, RESULT, 'the requester gets the peer task result, not the user answer');
+  }, { wakeGate: async request => {
+    if (request.conversationId !== PEER || request.action !== 'start_continuation') return;
+    held = request;
+    await releaseWake;
+  } });
 });
 
 test('create_conversation starts a first Turn from a peer task and replaying the call creates nothing new', { timeout: 60000 }, async () => {

@@ -15,6 +15,37 @@ export interface CollaborationScope {
   authoritySteps: RepositoryTransactionStep[];
 }
 
+/**
+ * A followup that a cross-conversation tool sent to another team: a tool send between two distinct
+ * top-level Conversations. A team followup always has a child task on at least one side, and the
+ * cross-conversation tools never originate from or address a child task, so the committed lineage
+ * alone classifies it. A sender deleted since then has no ChildExecution left and is treated as
+ * top-level: its task then waits for a Turn of its own like any peer task.
+ *
+ * Such a followup starts exactly one Turn of its own in the target: no other Turn (a user Turn,
+ * another peer's continuation, a process or child continuation) consumes it, and while any Turn
+ * runs it keeps waiting.
+ */
+export async function isCrossConversationFollowup(database: RuntimeDatabase, messageId: string): Promise<boolean> {
+  const read = await database.snapshot([
+    DOMAIN_REPOSITORIES.domain('CollaborationMessage').get(messageId),
+    DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').list({ where: { message_id: messageId }, limit: 2 }),
+    DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').list({ where: { message_id: messageId }, limit: 2 })
+  ]);
+  const message = read.snapshot[0] as DomainRow | null;
+  const sources = read.snapshot[1] as DomainRow[];
+  const targets = read.snapshot[2] as DomainRow[];
+  if (!message || message.mode !== 'followup' || sources.length !== 1 || targets.length !== 1 || sources[0].source_kind !== 'tool') return false;
+  const sourceConversationId = String(sources[0].conversation_id);
+  const targetConversationId = String(targets[0].conversation_id);
+  if (sourceConversationId === targetConversationId) return false;
+  const children = await database.snapshot([
+    DOMAIN_REPOSITORIES.domain('ChildExecution').list({ where: { child_conversation_id: sourceConversationId }, limit: 1 }),
+    DOMAIN_REPOSITORIES.domain('ChildExecution').list({ where: { child_conversation_id: targetConversationId }, limit: 1 })
+  ]);
+  return children.snapshot.every((rows) => Array.isArray(rows) && rows.length === 0);
+}
+
 /** Derives membership from committed lineage; never accepts caller-supplied team identities. */
 export async function readCollaborationScope(database: RuntimeDatabase, conversationId: string): Promise<CollaborationScope> {
   const read = async (domain: string, id: string): Promise<DomainRow> => {

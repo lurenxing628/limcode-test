@@ -450,6 +450,9 @@ export class CollaborationControlPlane {
     const visit = async (turnId: string, ancestryRoot: string | null, seen: Set<string>): Promise<DomainRow> => {
       if (seen.has(turnId)) throw new Error('Collaboration budget lineage is cyclic.');
       seen.add(turnId);
+      // A Turn started for a followup spends that request's budget, whatever else it absorbed.
+      const started = await this.startingFollowupBudget(turnId);
+      if (started) return started;
       const inputs = await this.rows('RuntimeDelivery', { target_turn_id: turnId, state: 'consumed' });
       const budgets = new Map<string, DomainRow>();
       for (const delivery of inputs) {
@@ -484,6 +487,20 @@ export class CollaborationControlPlane {
       return { id: stablePhaseFId('collaboration_budget', 'turn', turnId), origin_kind: 'turn', origin_key: turnId, authority_turn_id: turnId, created_at: this.now() };
     };
     return visit(sourceTurnId, rootTurnId, new Set());
+  }
+  /** The budget of the followup whose runtime continuation admitted this Turn, if any. */
+  private async startingFollowupBudget(turnId: string): Promise<DomainRow | null> {
+    for (const intent of await this.rows('TurnIntent', { turn_id: turnId })) {
+      const links = await this.rows('RuntimeDeliveryIntentLink', { turn_intent_id: intent.id });
+      if (links.length !== 1) continue;
+      const delivery = await this.existing('RuntimeDelivery', String(links[0].delivery_id));
+      if (delivery.target_turn_id !== turnId) continue;
+      const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
+      if (inbox.source_kind !== 'collaboration_message') continue;
+      const requests = await this.rows('CollaborationRequest', { message_id: inbox.source_id });
+      if (requests.length === 1) return this.existing('CollaborationBudget', String(requests[0].budget_id));
+    }
+    return null;
   }
   private async finishRequest(request: DomainRow, state: string): Promise<void> {
     try { await this.database.transaction([DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(String(request.id), { state: 'pending' }), DOMAIN_REPOSITORIES.domain('CollaborationRequest').update(String(request.id), { state, updated_at: this.now() })]); }

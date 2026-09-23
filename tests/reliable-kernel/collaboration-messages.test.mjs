@@ -29,7 +29,7 @@ async function fixture(run, budget = 32) {
   let collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW });
   const rows = async (domain, where = {}) => (await database.snapshot([repo(domain).list({ where, limit: 1000 })])).snapshot[0];
   const get = async (domain, id) => (await database.snapshot([repo(domain).get(id)])).snapshot[0];
-  const prepared = await store.prepare(database, JSON.stringify({ toolPolicy: { toolConfigs: { run_agent: { config: { maxAutomaticFollowups: budget } } } } }), 'application/json');
+  const prepared = await store.prepare(database, JSON.stringify({ toolPolicy: { toolConfigs: { run_agent: { config: { maxAutomaticFollowups: budget, crossConversationCollaboration: true } } } } }), 'application/json');
   let callSeq = 0;
   try {
     await database.transaction([
@@ -154,9 +154,9 @@ test('stopped child cannot be revived through a sibling followup', async () => f
   assert.equal((await f.rows('CollaborationMessage')).length, 0);
 }));
 
-async function admitPending(f, conversationId, turnId) {
+async function admitPending(f, conversationId, turnId, startingDeliveryId) {
   const policy = await f.get('AuthoritySnapshot', 'root-authority');
-  const steps = await f.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, NOW);
+  const steps = await f.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, NOW, startingDeliveryId);
   await f.database.transaction([
     repo('Turn').insert({ id: turnId, conversation_id: conversationId, status: 'active', created_at: NOW, updated_at: NOW, terminal_at: null }),
     repo('AuthoritySnapshot').insert({ id: `${turnId}-policy`, turn_id: turnId, content_object_id: policy.content_object_id, created_at: NOW }),
@@ -406,3 +406,145 @@ test('a host that does not own the target skips a queued wake without reading it
     assert.deepEqual(await f.get('RuntimeDeliveryWake', before.id), before, 'the foreign wake stays untouched');
   } finally { for (const undo of restore) undo(); await scanner.dispose(); await peerOwner.close(); }
 }));
+
+/** Top-level Conversations outside the fixture team, each with one frozen Turn. */
+async function topLevel(f, ...conversations) {
+  const policy = await f.get('AuthoritySnapshot', 'root-authority');
+  await f.database.transaction(conversations.flatMap(([id, active]) => [
+    repo('Conversation').insert({ id, title: id, status: 'active', created_at: NOW, updated_at: NOW }),
+    repo('Turn').insert({ id: `${id}-turn`, conversation_id: id, status: active ? 'active' : 'terminated', created_at: NOW, updated_at: NOW, terminal_at: active ? null : NOW }),
+    repo('AuthoritySnapshot').insert({ id: `${id}-authority`, turn_id: `${id}-turn`, content_object_id: policy.content_object_id, created_at: NOW }),
+    ...(active ? [] : [repo('TurnTermination').insert({ id: `${id}-termination`, turn_id: `${id}-turn`, terminal_status: 'completed', reason: 'fixture', created_at: NOW })])
+  ]));
+}
+async function crossSend(f, callId, from, turnId, target, mode, text = callId) {
+  const source = await f.source(callId, from, turnId, 'send_conversation_message');
+  return f.collaboration.send({ source, targetConversationId: target, text, mode, queueBehindActiveTurn: true, crossConversation: true });
+}
+/** Mirrors a runtime continuation admission: the Turn is linked to the exact delivery that started it. */
+async function admitContinuation(f, conversationId, turnId, deliveryId) {
+  const envelope = await f.store.prepare(f.database, JSON.stringify({ version: 1, kind: 'runtime_continuation', sourceTurnId: null }), 'application/vnd.limcode.turn-intent+json');
+  await f.database.transaction([...preparedContentObjectSteps([envelope], "continuation_intent"),
+    repo('TurnIntent').insert({ id: `${turnId}-intent`, conversation_id: conversationId, turn_id: null, state: 'queued', created_at: NOW, updated_at: NOW }),
+    repo('TurnIntentRevision').insert({ id: `${turnId}-intent-revision`, intent_id: `${turnId}-intent`, revision_seq: 1n, content_object_id: envelope.metadata.id, created_at: NOW }),
+    repo('RuntimeDeliveryIntentLink').insert({ id: `${turnId}-delivery-link`, delivery_id: deliveryId, turn_intent_id: `${turnId}-intent`, created_at: NOW })]);
+  await admitPending(f, conversationId, turnId, deliveryId);
+  await f.database.transaction([repo('TurnIntent').update(`${turnId}-intent`, { turn_id: turnId, state: 'admitted', updated_at: NOW })]);
+}
+function continuationScanner(f, started) {
+  const errors = [];
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, onError: detail => errors.push(detail), wakeHandler: async request => {
+    // Inputs already bound into a Turn only ask that Turn to absorb them.
+    if (request.action === 'resume_current_turn') return { acknowledged: true };
+    assert.equal(request.action, 'start_continuation', JSON.stringify(request));
+    const turnId = `${request.conversationId}-continuation-${started.length + 1}`;
+    started.push({ turnId, deliveryId: request.deliveryId });
+    await admitContinuation(f, request.conversationId, turnId, request.deliveryId);
+    return { acknowledged: true };
+  } });
+  return { scanner, errors, async scan() { await scanner.scanNow(); assert.equal(errors.length, 0, errors.map(detail => String(detail.error?.stack ?? detail.error)).join('\n')); } };
+}
+async function budgetOf(f, deliveryId) {
+  const delivery = await f.get('RuntimeDelivery', deliveryId);
+  const inbox = await f.get('RuntimeInboxItem', delivery.inbox_item_id);
+  const [request] = await f.rows('CollaborationRequest', { message_id: inbox.source_id });
+  return (await f.get('CollaborationBudget', request.budget_id)).origin_key;
+}
+
+test('a user Turn that starts after the anchor ends never absorbs a queued cross-conversation followup', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', true]);
+  const followup = await crossSend(f, 'a-followup', 'peer-a', 'peer-a-turn', 'target-b', 'followup', 'task from A');
+  const note = await crossSend(f, 'a-note', 'peer-a', 'peer-a-turn', 'target-b', 'message', 'note from A');
+  await endTurn(f, 'target-b-turn');
+  // The user's own Turn wins the race against the durable wake.
+  await admitPending(f, 'target-b', 'target-b-user');
+  assert.equal((await f.get('RuntimeDelivery', followup.deliveryId)).state, 'pending', 'the user Turn does not consume the peer task');
+  assert.deepEqual(await f.rows('CollaborationRequestTurnLink'), [], 'the peer request is not attached to the user Turn');
+  assert.equal((await f.get('RuntimeDelivery', note.deliveryId)).target_turn_id, 'target-b-user', 'a plain message still joins the next Turn');
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    assert.deepEqual(started, [], 'the followup waits behind the user Turn instead of being injected');
+    assert.equal((await f.get('RuntimeDelivery', followup.deliveryId)).state, 'pending');
+    assert.deepEqual((await f.rows('PendingTurnInput', { turn_id: 'target-b-user' })).map(row => row.id).length, 1, 'only the plain message entered the user Turn');
+    // The user Turn spends its own budget, never the peer's.
+    const own = await crossSend(f, 'b-user-followup', 'target-b', 'target-b-user', 'peer-a', 'followup');
+    assert.equal(await budgetOf(f, own.deliveryId), 'target-b-user');
+    await endTurn(f, 'target-b-user');
+    await scan();
+    assert.deepEqual(started.map(entry => entry.deliveryId).filter(id => id === followup.deliveryId), [followup.deliveryId]);
+    const continuation = started.find(entry => entry.deliveryId === followup.deliveryId).turnId;
+    assert.equal((await f.get('RuntimeDelivery', followup.deliveryId)).target_turn_id, continuation);
+    const [link] = await f.rows('CollaborationRequestTurnLink', { turn_id: continuation });
+    assert.ok(link, 'the peer request belongs to the continuation it started');
+    const chained = await crossSend(f, 'b-continuation-followup', 'target-b', continuation, 'peer-a', 'followup');
+    assert.equal(await budgetOf(f, chained.deliveryId), 'peer-a-turn', 'the continuation spends the requester budget');
+  } finally { await scanner.dispose(); }
+}));
+
+test('followups from two peers queued behind one Turn start two sequential Turns with their own budgets', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['peer-d', true], ['target-b', true]);
+  const fromA = await crossSend(f, 'a-task', 'peer-a', 'peer-a-turn', 'target-b', 'followup', 'task from A');
+  const fromD = await crossSend(f, 'd-task', 'peer-d', 'peer-d-turn', 'target-b', 'followup', 'task from D');
+  await endTurn(f, 'target-b-turn');
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    await scan();
+    assert.equal(started.length, 1, 'one continuation at a time');
+    const [first] = started;
+    const firstInputs = await f.rows('RuntimeDelivery', { target_turn_id: first.turnId });
+    assert.deepEqual(firstInputs.map(row => row.id), [first.deliveryId], 'two peer tasks are never merged into one Turn');
+    const other = first.deliveryId === fromA.deliveryId ? fromD : fromA;
+    assert.equal((await f.get('RuntimeDelivery', other.deliveryId)).state, 'pending');
+    const firstOrigin = first.deliveryId === fromA.deliveryId ? 'peer-a-turn' : 'peer-d-turn';
+    const onward = await crossSend(f, 'b-first-onward', 'target-b', first.turnId, 'peer-a', 'message');
+    assert.equal(onward.accepted, true);
+    const firstFollowup = await crossSend(f, 'b-first-followup', 'target-b', first.turnId, first.deliveryId === fromA.deliveryId ? 'peer-d' : 'peer-a', 'followup');
+    assert.equal(await budgetOf(f, firstFollowup.deliveryId), firstOrigin);
+    await endTurn(f, first.turnId);
+    await scan();
+    assert.equal(started.length, 2);
+    assert.equal(started[1].deliveryId, other.deliveryId);
+    assert.deepEqual((await f.rows('RuntimeDelivery', { target_turn_id: started[1].turnId })).filter(row => row.id === first.deliveryId), []);
+    const secondFollowup = await crossSend(f, 'b-second-followup', 'target-b', started[1].turnId, 'peer-a', 'followup');
+    assert.equal(await budgetOf(f, secondFollowup.deliveryId), firstOrigin === 'peer-a-turn' ? 'peer-d-turn' : 'peer-a-turn');
+  } finally { await scanner.dispose(); }
+}));
+
+test('a queued cross-conversation followup still starts its Turn when the anchor ends failed or interrupted', async () => {
+  for (const terminalStatus of ['failed', 'interrupted', 'cancelled']) await fixture(async f => {
+    await topLevel(f, ['peer-a', true], ['target-b', true]);
+    const followup = await crossSend(f, `a-task-${terminalStatus}`, 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+    await f.database.transaction([repo('Turn').update('target-b-turn', { status: 'terminated', terminal_at: NOW, updated_at: NOW }), repo('TurnTermination').insert({ id: 'target-b-stopped', turn_id: 'target-b-turn', terminal_status: terminalStatus, reason: 'user stop', created_at: NOW })]);
+    const started = [];
+    const { scanner, scan } = continuationScanner(f, started);
+    try {
+      await scan();
+      assert.deepEqual(started.map(entry => entry.deliveryId), [followup.deliveryId], terminalStatus);
+      assert.equal((await f.get('RuntimeDelivery', followup.deliveryId)).state, 'consumed');
+    } finally { await scanner.dispose(); }
+  });
+});
+
+test('an A to B to A followup chain spends one shared budget until it is exhausted', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', false]);
+  const first = await crossSend(f, 'a-asks-b', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  await endTurn(f, 'peer-a-turn');
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    assert.deepEqual(started.map(entry => entry.deliveryId), [first.deliveryId]);
+    const back = await crossSend(f, 'b-asks-a', 'target-b', started[0].turnId, 'peer-a', 'followup');
+    assert.equal(await budgetOf(f, back.deliveryId), 'peer-a-turn');
+    await endTurn(f, started[0].turnId);
+    await scan();
+    assert.deepEqual(started.map(entry => entry.deliveryId), [first.deliveryId, back.deliveryId]);
+    await assert.rejects(crossSend(f, 'a-asks-b-again', 'peer-a', started[1].turnId, 'target-b', 'followup'), /budget exhausted \(2\)/);
+    assert.equal((await f.rows('CollaborationRequest')).length, 2);
+    assert.equal((await f.rows('CollaborationBudget')).length, 1);
+  } finally { await scanner.dispose(); }
+}, 2));

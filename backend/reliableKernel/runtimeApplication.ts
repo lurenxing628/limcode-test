@@ -261,8 +261,8 @@ export class ReliableKernelApplication {
       authorityCompiler: dependencies.authorityCompiler,
       attachments: this.attachments,
       unresolvedFileClosure: this.files,
-      prepareNextTurnDeliverySteps: (conversationId, turnId, now) =>
-        this.runtime.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now),
+      prepareNextTurnDeliverySteps: (conversationId, turnId, now, startingDeliveryId) =>
+        this.runtime.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now, startingDeliveryId),
       ...options
     });
     this.turnOutput = new TurnOutputControlPlane(database, contentStore, options);

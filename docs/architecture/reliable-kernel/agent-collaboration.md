@@ -31,7 +31,7 @@
 - `read_agent_messages/wait_agent_messages` 有界读取和等待，不改变处理状态，不启动目标。
 - 留言板代码保留，但第一期不向模型下发 `agent_board`。
 
-发送可选择排队到目标本轮结束：目标正在运行时，消息锚定当前 Turn 且不注入该 Turn；该 Turn 结束后，followup 由持久唤醒开启恰好一轮新 Turn，message 随目标下一轮带入。完成后自动回送的结果不排队，仍在请求方运行中的 Turn 安全边界注入。
+发送可选择排队到目标本轮结束：目标正在运行时，消息锚定当前 Turn 且不注入该 Turn；该 Turn 结束后，followup 由持久唤醒开启恰好一轮新 Turn，message 随目标下一轮带入。跨对话 followup 还要求整轮独占，见下文「跨对话协作」。完成后自动回送的结果不排队，仍在请求方运行中的 Turn 安全边界注入。
 
 消息正文保存到 CAS；消息、来源、目标、回复关系、任务请求和请求对应 Turn 分别持久化。投递复用 `RuntimeInboxItem`、`RuntimeDelivery`、`RuntimeDeliveryInputLink` 和 `RuntimeDeliveryWake`。一次发送成功只证明消息提交，`handled_at` 才证明目标执行器吸收。重复源命令返回原身份，参数篡改直接拒绝。
 
@@ -46,7 +46,12 @@
 「Agent 协作」页的「跨对话协作」开关写入同一 `run_agent.config` 的 `crossConversationCollaboration`，默认关闭，可在全局、Agent、对话和工作流作用域覆盖，并在 Turn authority 中冻结。只有布尔值 `true` 表示开启；手工写入的非布尔值（例如字符串 `"true"`）按关闭处理，不会让整轮失败。在设置界面开启时，同时把下列工具加入该作用域的 `allowedTools`；关闭或恢复继承不改动允许列表。后端从不绕过用户保存的允许列表。
 
 - `list_conversations`、`read_conversation`（只读）：列出本 Runtime 其他活动的顶层对话，读取其用户与模型消息，按 `olderMessageRef` 分页，不启动、不改变、也不确认目标。结果附不可信数据提示。
-- `send_conversation_message`：`followup` 或 `message`，语义与团队续派/留言相同，并固定排队到目标本轮结束；followup 完成后的回复自动回到发送方。
+- `send_conversation_message`：`followup` 或 `message`，固定排队到目标本轮结束；followup 完成后的回复自动回到发送方。
+  - 跨对话 followup 只由它自己开启的那一轮消费，这一轮也只使用这条请求的预算。用户新开的轮次、其他对话的续派轮次、进程或子任务结果触发的续跑都不会吸收它。
+  - 派发时目标只要有轮次在运行（包括锚定轮结束后才开始的用户轮次），followup 就继续等待，不注入该轮；该轮结束后再开启自己的一轮。
+  - 多个对话排在同一轮之后的 followup 依次各开一轮，从不合并。用户停止目标的运行轮次时，排队的 followup 仍会立即开启新一轮。
+  - `message` 仍随目标下一轮带入，不论这一轮由谁开启。
+  - 团队内（同根）的续派语义不变。
 - `create_conversation`：以工具调用派生稳定对话身份，依次建立对话、主 Agent 关联和项目关联，用发送方冻结的模型和工作环境初始化对话配置，领取运行归属，再发送 followup 任务。每一步都可幂等重放，不写 `ConversationOriginLink`；中途中断可能留下一个空对话，由用户删除。
 - `fork_conversation`：以工具调用作为分支命令身份，复制到最后一个已结束轮次的最后可见消息为止的历史，包括正在运行的调用方自身（native 与非 native 均适用）。分支不启动轮次，不切换用户视图；重放沿用已提交的分支边界。
 

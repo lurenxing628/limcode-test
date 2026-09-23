@@ -2,6 +2,7 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
+import { isCrossConversationFollowup } from './collaborationScope';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import {
   requireIsoTimestamp,
@@ -359,7 +360,10 @@ export class ProcessCompletionDeliveryControlPlane {
     }
   }
 
-  /** True only while a collaboration delivery is still anchored to its target's running Turn. */
+  /**
+   * True only while a collaboration delivery waits for its target's running Turn: the Turn it was
+   * anchored to, or, for a cross-conversation followup, any Turn running in the target.
+   */
   private async queuedBehindActiveTurn(wake: DomainRow): Promise<boolean> {
     try {
       const delivery = await this.maybeGet(
@@ -374,9 +378,13 @@ export class ProcessCompletionDeliveryControlPlane {
         this.listRows('CollaborationMessageTargetLink', { message_id: messageId }, 2),
         this.listRows('CollaborationMessageSourceLink', { message_id: messageId }, 2)
       ]);
-      if (targets.length !== 1 || sources.length !== 1 || sources[0].source_kind === 'board' || targets[0].anchor_turn_id === null) return false;
-      const anchor = await this.maybeGet('Turn', requirePhaseFId(targets[0].anchor_turn_id, 'CollaborationMessageTargetLink.anchor_turn_id'));
-      return anchor?.status === 'active' && anchor.conversation_id === delivery.target_conversation_id;
+      if (targets.length !== 1 || sources.length !== 1 || sources[0].source_kind === 'board') return false;
+      if (targets[0].anchor_turn_id !== null) {
+        const anchor = await this.maybeGet('Turn', requirePhaseFId(targets[0].anchor_turn_id, 'CollaborationMessageTargetLink.anchor_turn_id'));
+        if (anchor?.status === 'active' && anchor.conversation_id === delivery.target_conversation_id) return true;
+      }
+      if (!await isCrossConversationFollowup(this.database, messageId)) return false;
+      return (await this.listRows('Turn', { conversation_id: delivery.target_conversation_id, status: 'active' }, 1)).length > 0;
     } catch {
       // Malformed facts surface through the normal claimed dispatch failure path.
       return false;

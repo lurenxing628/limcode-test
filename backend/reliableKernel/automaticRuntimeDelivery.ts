@@ -18,6 +18,7 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
+import { isCrossConversationFollowup } from './collaborationScope';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -444,9 +445,12 @@ export class AutomaticRuntimeDeliveryRouter {
     const sourceTurnId = anchor ? String(anchor.id) : input.sourceTurnId;
     if (boardNotice && (!turn || links[0].anchor_turn_id !== turn.id)) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
     // A send queued behind the target's running Turn is never injected into that Turn. It stays a
-    // next-Turn delivery until the anchor Turn ends; the level-triggered wake then routes it.
-    if (!boardNotice && turn && links[0].anchor_turn_id === turn.id) {
-      steps.push(DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assert(String(links[0].id), { anchor_turn_id: turn.id }),
+    // next-Turn delivery until the anchor Turn ends; the level-triggered wake then routes it. A
+    // cross-conversation followup starts a Turn of its own, so it keeps waiting behind whichever
+    // Turn is running when it is dispatched, even one that started after its anchor ended.
+    if (!boardNotice && turn && (links[0].anchor_turn_id === turn.id
+      || await isCrossConversationFollowup(this.database, String(message.id)))) {
+      steps.push(DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assert(String(links[0].id), { anchor_turn_id: links[0].anchor_turn_id }),
         DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { status: 'active', conversation_id: input.targetConversationId }),
         DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turn.id }));
       return decision({ ...input, sourceTurnId, phase: 'next_turn', reason: 'collaboration_queued_behind_active_turn', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
