@@ -587,23 +587,25 @@ test('a followup whose continuation can never be admitted is reported back to th
 
 test('a target holds at most 16 undelivered collaboration messages from other conversations; completion replies are exempt', async () => fixture(async f => {
   await topLevel(f, ['peer-a', true], ['peer-d', true], ['target-b', true]);
-  // B is waiting on A, so a completion reply is owed to B later.
+  // B asked A, and A has already answered: that completion reply now waits in B's inbox.
   const asked = await crossSend(f, 'b-asks-a', 'target-b', 'target-b-turn', 'peer-a', 'followup');
-  for (let index = 0; index < 10; index += 1) await crossSend(f, `a-note-${index}`, 'peer-a', 'peer-a-turn', 'target-b', 'message');
-  for (let index = 0; index < 6; index += 1) await crossSend(f, `d-task-${index}`, 'peer-d', 'peer-d-turn', 'target-b', 'followup');
-  const before = (await f.rows('CollaborationMessage')).length;
-  for (const mode of ['message', 'followup']) {
-    await assert.rejects(crossSend(f, `a-overflow-${mode}`, 'peer-a', 'peer-a-turn', 'target-b', mode), /16 undelivered collaboration messages/);
-  }
-  assert.equal((await f.rows('CollaborationMessage')).length, before, 'a rejected send writes nothing');
-  assert.equal((await f.rows('CollaborationRequest')).length, 7, 'a rejected followup spends no budget');
-  // The owed answer still reaches B.
   await endTurn(f, 'peer-a-turn');
   await admitContinuation(f, 'peer-a', 'peer-a-answering', asked.deliveryId);
   await endTurn(f, 'peer-a-answering');
   await f.collaboration.completeRequestsForTurn({ turnId: 'peer-a-answering', text: 'answer for B' });
-  const reply = (await f.collaboration.listMessages({ conversationId: 'target-b' })).messages.find(message => message.replyToMessageId === asked.messageId);
+  const reply = (await repliesTo(f, 'target-b', asked.messageId))[0];
   assert.equal(reply?.sourceKind, 'completion');
+  assert.equal(reply.deliveryState, 'pending', 'the owed answer is still undelivered');
+  // Sixteen messages from other conversations still fit next to it.
+  for (let index = 0; index < 10; index += 1) await crossSend(f, `d-note-${index}`, 'peer-d', 'peer-d-turn', 'target-b', 'message');
+  for (let index = 0; index < 6; index += 1) await crossSend(f, `d-task-${index}`, 'peer-d', 'peer-d-turn', 'target-b', 'followup');
+  assert.equal((await f.rows('RuntimeDelivery', { target_conversation_id: 'target-b', state: 'pending' })).length, 17);
+  const before = (await f.rows('CollaborationMessage')).length;
+  for (const mode of ['message', 'followup']) {
+    await assert.rejects(crossSend(f, `d-overflow-${mode}`, 'peer-d', 'peer-d-turn', 'target-b', mode), /16 undelivered collaboration messages/);
+  }
+  assert.equal((await f.rows('CollaborationMessage')).length, before, 'a rejected send writes nothing');
+  assert.equal((await f.rows('CollaborationRequest')).length, 7, 'a rejected followup spends no budget');
   // Once B takes its messages in, peers may send again.
   await endTurn(f, 'target-b-turn');
   await admitPending(f, 'target-b', 'target-b-next');
