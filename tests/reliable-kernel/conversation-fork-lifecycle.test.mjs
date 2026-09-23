@@ -194,6 +194,22 @@ async function withForkRuntime(run, {
   }
 }
 
+/** Waits for a fixture step, failing with the step's name instead of hanging the runner. */
+function bounded(promise, step, ms = 30_000) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out after ${ms} ms waiting for ${step}.`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+/** A held Turn reaches its gate, unless it ends first. */
+function reachedGate(reached, running, step) {
+  return bounded(Promise.race([reached, running.done.then(result => {
+    throw new Error(`The running Turn ended (${result.terminalStatus}) before ${step}.`);
+  })]), step);
+}
+
 for (const role of ['user', 'model']) {
   test(`fork at ${role} boundary continues, reopens, continues again and forks its copied history`, async () => {
     await withForkRuntime(async h => {
@@ -238,7 +254,7 @@ test('fork copies completed turns only and the running source turn still stops n
     await h.turn('source', 'completed-tool-turn');
     const completed = await h.command('source', 'fork-completed-turn');
     const running = await h.start('source', 'running-tool-turn');
-    await reached;
+    await reachedGate(reached, running, 'its second tool dispatch');
     const [activeTurn] = (await rows(h.app, 'Turn', { conversation_id: 'source' })).filter(turn => turn.status === 'active');
     assert.equal(activeTurn.id, running.input.turnId);
     const activeModel = await h.command('source', 'fork-active-model');
@@ -270,7 +286,7 @@ test('fork copies completed turns only and the running source turn still stops n
       turnId: running.input.turnId, reason: 'fixture stop after forking completed history'
     });
     release();
-    const stopped = await running.done;
+    const stopped = await bounded(running.done, 'the stopped Turn to end');
     assert.equal(stopped.terminalStatus, 'interrupted');
     const copiedTurns = await rows(h.app, 'Turn', { conversation_id: fork.conversationId });
     assert.equal(copiedTurns.length, 1);
@@ -382,8 +398,9 @@ test('forking a completed message never copies a later turn that compressed its 
     };
     holdReplies = true;
     const running = await h.start('source', 'running-turn-compresses-first');
+    let ended;
     try {
-      await reached;
+      await reachedGate(reached, running, 'its model request after compressing');
       const [block] = await rows(h.app, 'CompressionBlock', { conversation_id: 'source' });
       assert.ok(block, 'the running Turn compressed before its model request');
       const [authority] = await rows(h.app, 'AuthoritySnapshot', { id: block.authority_snapshot_id });
@@ -401,8 +418,11 @@ test('forking a completed message never copies a later turn that compressed its 
     } finally {
       holdReplies = false;
       release();
-      assert.equal((await running.done).terminalStatus, 'completed');
+      // Never replace a failure of the block above with the running Turn's outcome.
+      ended = await bounded(running.done, 'the released Turn to end').catch(error => error);
     }
+    if (ended instanceof Error) throw ended;
+    assert.equal(ended.terminalStatus, 'completed');
     const afterFinished = await h.facade.forkConversation({ ...completed, command: { commandId: 'fork-after-later-compression-ended' } });
     await assertCompletedHistoryOnly(afterFinished.conversationId);
     // A direct writer caller that selects the later compressed head is refused before any write.
