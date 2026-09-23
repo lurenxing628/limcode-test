@@ -148,7 +148,7 @@ async function withForkRuntime(run, {
       get app() { return app; }, get facade() { return facade; },
       get configuration() { return configuration; }, requests, environmentId, saveCompression,
       async reopen() { await app.close(); await open(); },
-      async start(conversationId, key, retry) {
+      async start(conversationId, key, retry, message = {}) {
         // Match claim-before-open: keep the panel's reference through the whole fake-provider turn.
         await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
         const command = {
@@ -158,7 +158,8 @@ async function withForkRuntime(run, {
         };
         const input = retry
           ? await app.turns.retry({ ...command, ...retry })
-          : await app.turns.input({ ...command, content: key });
+          : await app.turns.input({ ...command, content: message.content ?? key,
+            ...(message.contentType ? { contentType: message.contentType } : {}) });
         const [lease] = await rows(app, 'ExecutionLease', { turn_id: input.turnId });
         assert.ok(lease);
         const done = kernel.runWithExecutionLeaseFence({
@@ -167,8 +168,8 @@ async function withForkRuntime(run, {
         }, () => app.agentLoop.drive(input.turnId));
         return { input, done };
       },
-      async turn(conversationId, key, retry) {
-        const { input, done } = await harness.start(conversationId, key, retry);
+      async turn(conversationId, key, retry, message) {
+        const { input, done } = await harness.start(conversationId, key, retry, message);
         const result = await done;
         assert.equal(result.terminalStatus, 'completed', JSON.stringify(await rows(app, 'TurnTermination', { turn_id: input.turnId })));
         return input;
@@ -1120,6 +1121,113 @@ test('editing inside an inherited compressed range disables only that conversati
     assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /Offline shared summary/);
     await h.turn(first.conversationId, 'edited-fork-continues');
     assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /edited inside the fork/);
+  });
+});
+
+async function compressWholeHead(h, conversationId, authorityTurnId, title, summary, idempotencyKey) {
+  const [authority] = await rows(h.app, 'AuthoritySnapshot', { turn_id: authorityTurnId });
+  const headRootId = await h.app.context.currentHeadRootId(conversationId);
+  const structure = await h.app.context.materializeStructure(headRootId);
+  return h.app.compression.create({
+    conversationId, headRootId, authoritySnapshotId: authority.id,
+    compressSegmentCount: structure.records.length, title, summary, idempotencyKey
+  });
+}
+
+test('compression management acts only on the fork\'s own block, before and after its source is deleted', async () => {
+  await withForkRuntime(async h => {
+    const turn = await h.turn('source', 'managed-compressed-question');
+    await h.turn('source', 'managed-compressed-follow-up');
+    await compressWholeHead(h, 'source', turn.turnId, 'Managed summary', 'Offline managed summary', 'managed-compression');
+    await h.turn('source', 'after-managed-compression');
+    const first = (await h.facade.forkConversation(await h.command('source', 'managed-first-fork'))).conversationId;
+    const second = (await h.facade.forkConversation(await h.command('source', 'managed-second-fork'))).conversationId;
+    const ownBlock = async conversationId => {
+      const blocks = (await rows(h.app, 'CompressionBlock', { conversation_id: conversationId })).filter(block => block.status === 'enabled');
+      assert.equal(blocks.length, 1);
+      return blocks[0];
+    };
+    const statuses = async () => Object.fromEntries(Object.entries(await blockStatuses(h.app, ['source', first, second]))
+      .map(([conversationId, values]) => [conversationId, [...values].sort()]));
+    const replaceOwnBlock = async (conversationId, summary) => h.app.compression.replace({
+      conversationId, previousBlockId: (await ownBlock(conversationId)).id,
+      expectedHeadRootId: await h.app.context.currentHeadRootId(conversationId), previousStatus: 'disabled',
+      idempotencyKey: `replace-${summary}`, title: summary, summary
+    });
+
+    const firstBlock = await ownBlock(first);
+    await h.app.compression.updateStatus(firstBlock.id, 'disabled');
+    assert.deepEqual(await statuses(), { source: ['enabled'], [first]: ['disabled'], [second]: ['enabled'] });
+    await h.app.compression.updateStatus(firstBlock.id, 'enabled');
+    await replaceOwnBlock(first, 'Replaced first fork summary');
+    assert.deepEqual(await statuses(), { source: ['enabled'], [first]: ['disabled', 'enabled'], [second]: ['enabled'] });
+    await h.turn(first, 'after-first-fork-replacement');
+    let context = h.requests.at(-1).context.map(item => item.content).join('\n');
+    assert.match(context, /Replaced first fork summary/);
+    assert.doesNotMatch(context, /Offline managed summary/);
+    await h.turn('source', 'source-keeps-its-summary');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /Offline managed summary/);
+
+    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
+    assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
+    const afterDelete = async () => Object.fromEntries(Object.entries(await statuses()).filter(([id]) => id !== 'source'));
+    const secondBlock = await ownBlock(second);
+    await h.app.compression.updateStatus(secondBlock.id, 'disabled');
+    assert.deepEqual(await afterDelete(), { [first]: ['disabled', 'enabled'], [second]: ['disabled'] });
+    await h.app.compression.updateStatus(secondBlock.id, 'enabled');
+    await replaceOwnBlock(second, 'Replaced orphaned fork summary');
+    await h.turn(second, 'after-orphaned-fork-replacement');
+    context = h.requests.at(-1).context.map(item => item.content).join('\n');
+    assert.match(context, /Replaced orphaned fork summary/);
+    assert.doesNotMatch(context, /Replaced first fork summary|Offline managed summary/);
+
+    // Editing inside the inherited compressed range of the orphaned fork disables only its blocks.
+    const edited = await firstMessageCommand(h, second, 'unused');
+    await h.app.turns.edit({
+      source: { kind: 'command', key: 'edit-inside-orphaned-fork-compression' }, conversationId: second,
+      messageId: edited.messageId, expectedRevisionId: edited.expectedRevisionId, content: 'edited inside the orphaned fork'
+    });
+    assert.deepEqual(await afterDelete(), { [first]: ['disabled', 'enabled'], [second]: ['disabled', 'disabled'] });
+    await h.turn(second, 'edited-orphaned-fork-continues');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /edited inside the orphaned fork/);
+    await h.turn(first, 'first-fork-unaffected');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /Replaced first fork summary/);
+  });
+});
+
+test('the attachment catalog of a compressed fork reads only its own block, also after the source is deleted', async () => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+  await withForkRuntime(async h => {
+    const turn = await h.turn('source', 'attachment-history', undefined, {
+      content: JSON.stringify({ role: 'user', parts: [{ text: 'attachment-history' }, {
+        inlineData: { mimeType: 'image/png', name: 'fork-attachment.png', data: png, storage: 'embedded', status: 'available' }
+      }] }),
+      contentType: 'application/vnd.limcode.message+json'
+    });
+    await h.turn('source', 'attachment-follow-up');
+    const compressed = await compressWholeHead(h, 'source', turn.turnId, 'Attachment summary', 'Offline attachment summary', 'attachment-compression');
+    await h.turn('source', 'after-attachment-compression');
+    const first = (await h.facade.forkConversation(await h.command('source', 'attachment-first-fork'))).conversationId;
+    const second = (await h.facade.forkConversation(await h.command(first, 'attachment-second-fork'))).conversationId;
+    assert.equal((await rows(h.app, 'ContextSegmentSource', { segment_id: compressed.summarySegmentId })).length, 3,
+      'the shared summary segment carries one block source per Conversation');
+    const catalog = async conversationId => {
+      const structure = await h.app.context.materializeStructure(await h.app.context.currentHeadRootId(conversationId));
+      assert.equal(structure.records[0].segment.id, compressed.summarySegmentId);
+      const state = await h.app.modelProvider.projectAttachmentCatalogState(
+        conversationId, structure.records.map(record => ({ segmentId: record.segment.id }))
+      );
+      return state.catalog.map(entry => entry.name);
+    };
+    for (const conversationId of ['source', first, second]) {
+      assert.deepEqual(await catalog(conversationId), ['fork-attachment.png'], conversationId);
+    }
+    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
+    assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
+    for (const conversationId of [first, second]) {
+      assert.deepEqual(await catalog(conversationId), ['fork-attachment.png'], `${conversationId} after the source is deleted`);
+    }
+    await h.turn(second, 'attachment-fork-continues');
   });
 });
 
