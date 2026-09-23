@@ -40,6 +40,7 @@ const { CollaborationToolDispatcher } = load('backend/reliableKernel/collaborati
 const { runAgentTool } = load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { agentCollaborationToolModules } = load('backend/world/modules/tools/definitions/agentCollaboration/index.js');
 const { crossConversationToolModules, CROSS_CONVERSATION_TOOL_NAMES } = load('backend/world/modules/tools/definitions/crossConversation/index.js');
+const { createBuiltinToolDefinitions } = load('backend/world/modules/tools/definitions/index.js');
 const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
 const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
 const { LlmEventType } = load('backend/world/modules/llm/events.js');
@@ -238,12 +239,24 @@ test('a malformed switch value fails closed instead of breaking every Turn', { t
 test('list excludes this conversation, its team and child tasks; read returns the peer transcript as untrusted data', { timeout: 60000 }, async () => {
   const HISTORY = 'PEER_HISTORY_QUESTION_4410';
   const REPLY = 'PEER_HISTORY_REPLY_4411';
-  let rootRound = 0, peerRound = 0;
+  let rootRound = 0, peerRound = 0, childRequests = 0;
   const spawn = (id, taskName) => toolsAnswer(call(id, 'run_agent', { operation: 'spawn', taskName, prompt: `${taskName} task`, foregroundWaitMs: 0 }));
+  // The production registry no longer carries the board, so no conversation is ever offered it.
+  const builtin = createBuiltinToolDefinitions({ command: { toolName: 'bash', description: 'Synthetic shell.' } }).map(tool => tool.declaration.name);
+  assert.ok(!builtin.includes('agent_board'), 'agent_board is not registered for models in phase one');
+  for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(builtin.includes(name), `${name} is registered`);
   await fixture(async (request, f, start) => {
+    const names = start.tools.map(tool => tool.name);
+    assert.ok(!names.includes('agent_board'), `agent_board offered to ${request.conversationId}`);
     if (request.conversationId === PEER) return ++peerRound === 1 ? spawn('peer-spawn', 'peer worker') : answer(REPLY);
-    // Real child tasks of both teams: phase one never lists or addresses them across teams.
-    if (request.conversationId !== ROOT) return answer('worker done');
+    // Real child tasks of both teams: phase one never lists or addresses them across teams, and a
+    // child task is not offered the cross-conversation tools even though its Turn froze the switch on.
+    if (request.conversationId !== ROOT) {
+      childRequests += 1;
+      for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(!names.includes(name), `${name} offered to a child task`);
+      assert.ok(names.includes('list_agents'), 'a child task keeps its team tools');
+      return answer('worker done');
+    }
     rootRound += 1;
     if (rootRound === 1) {
       const names = start.tools.map(tool => tool.name);
@@ -275,6 +288,7 @@ test('list excludes this conversation, its team and child tasks; read returns th
     assert.equal(rootRound, 4);
     const children = await f.rows('ChildExecution');
     assert.equal(children.length, 2);
+    await f.until(async () => childRequests >= 2, 'Both child tasks must reach the provider.');
     assert.equal((await f.rows('Turn', { conversation_id: PEER })).length, 1, 'reading never starts the other conversation');
     for (const child of children) {
       await assert.rejects(f.app.runtime.collaboration.readConversation({ conversationId: ROOT, targetConversationId: child.child_conversation_id,
