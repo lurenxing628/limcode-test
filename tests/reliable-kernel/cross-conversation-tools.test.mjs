@@ -138,7 +138,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
           return;
         }
         const [requestRow] = await f.rows('ModelRequest', { id: request.modelRequestId });
-        const observedRequest = { ...request, turnId: requestRow.turn_id };
+        const observedRequest = { ...request, turnId: requestRow.turn_id, signal: controls.signal };
         try {
           if (request.recipe?.kind === 'reliable-context-compression') {
             await compressionGate?.(observedRequest, controls.signal);
@@ -1369,4 +1369,91 @@ test('a completion reply that arrives during a compression, followed by a restar
     await Promise.race([released, new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')), { once: true }))]);
   } });
   releaseCompression();
+});
+
+for (const moment of ['before its terminal commit reads its deliveries', 'between that read and the commit']) test(`a reply routed into a stopping Turn ${moment} joins the queued next Turn, even when the wake scan runs mid-admission`, { timeout: 60000 }, async () => {
+  const TASK = 'CROSS_LATE_TASK_5501', RESULT = 'CROSS_LATE_RESULT_5502';
+  let releasePeer, phase = 'delegate', rootRound = 0, workingTurn;
+  const peerHeld = new Promise(resolve => { releasePeer = resolve; });
+  const seen = [];
+  await fixture(async (request, f, start) => {
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === PEER) {
+      await peerHeld;
+      return answer(RESULT);
+    }
+    seen.push({ phase, turnId: request.turnId, result: text.includes(RESULT) });
+    if (phase === 'working') {
+      workingTurn = request.turnId;
+      // The model is still answering when the user stops the Turn.
+      await new Promise((_, reject) => request.signal.addEventListener('abort', () => reject(new Error('stopped by the user')), { once: true }));
+    }
+    if (phase !== 'delegate') return answer(`Root ${phase}.`);
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('ask', 'send_conversation_message', { conversationRef: peer.conversationRef, text: TASK, mode: 'followup' }));
+    }
+    return answer('Delegated to the peer.');
+  }, async f => {
+    const delegated = await f.input(ROOT, 'delegate');
+    await f.terminated(delegated.turnId);
+    await f.until(async () => (await f.rows('Turn', { conversation_id: PEER, status: 'active' }))[0], 'The peer never started the task.');
+    phase = 'working';
+    const working = await f.input(ROOT, 'keep working');
+    await f.until(() => workingTurn, 'The working Turn never asked its model.');
+    phase = 'next';
+    const queued = await f.input(ROOT, 'what did the peer say?');
+    assert.equal(queued.turnId ?? null, null, 'fixture: the next message waits behind the working Turn');
+    // Hold the level-triggered wake scans: the one forced below decides the interleaving.
+    const scanner = f.app.processDeliveries;
+    const scanNow = scanner.scanNow.bind(scanner);
+    let releaseScans, forced = false, replyRouted = false, terminalReads = 0;
+    const scansHeld = new Promise(resolve => { releaseScans = resolve; });
+    scanner.scanNow = async () => { await scansHeld; return scanNow(); };
+    try {
+      // The reply reaches the working Turn after its stop took its inputs in, before its terminal commit.
+      const routeReply = async () => {
+        releasePeer();
+        const reply = await f.until(async () => (await f.rows('RuntimeDelivery', { target_conversation_id: ROOT }))[0], 'The peer never replied.');
+        assert.deepEqual([reply.phase, reply.target_turn_id], ['current_turn', working.turnId], 'fixture: the reply joins the running Turn');
+        replyRouted = true;
+      };
+      const deliveries = f.app.runtime.deliveries;
+      if (moment.startsWith('before')) {
+        const terminal = f.app.turns.terminal.bind(f.app.turns);
+        f.app.turns.terminal = async command => {
+          if (command.turnId === working.turnId && !replyRouted) await routeReply();
+          return terminal(command);
+        };
+      } else {
+        // The commit then finds a delivery its read missed and reads again.
+        const prepareTerminal = deliveries.prepareTerminalDeliverySteps.bind(deliveries);
+        deliveries.prepareTerminalDeliverySteps = async (turnId, now) => {
+          const steps = await prepareTerminal(turnId, now);
+          if (turnId === working.turnId) terminalReads += 1;
+          if (turnId === working.turnId && !replyRouted) await routeReply();
+          return steps;
+        };
+      }
+      // The wake scan runs after the next Turn read its next-turn deliveries and before it commits.
+      const prepare = deliveries.prepareNextTurnDeliverySteps.bind(deliveries);
+      deliveries.prepareNextTurnDeliverySteps = async (conversationId, turnId, now, startingDeliveryId) => {
+        const steps = await prepare(conversationId, turnId, now, startingDeliveryId);
+        if (conversationId === ROOT && replyRouted && !forced) { forced = true; await scanNow(); }
+        return steps;
+      };
+      await f.runner.interrupt({ commandId: 'stop-working', conversationId: ROOT, turnId: working.turnId, reason: 'user stop' });
+      assert.equal((await f.terminated(working.turnId)).terminal_status, 'interrupted');
+      const next = await f.until(async () => (await f.rows('TurnIntent', { id: queued.intentId }))[0]?.turn_id, 'The queued message never started its Turn.');
+      assert.equal((await f.terminated(next)).terminal_status, 'completed');
+      assert.equal(forced, true, 'fixture: the wake scan ran inside the next Turn admission');
+      if (!moment.startsWith('before')) assert.equal(terminalReads, 2, 'the terminal commit read the Turn deliveries again');
+      const [reply] = await f.rows('RuntimeDelivery', { target_conversation_id: ROOT });
+      assert.deepEqual([reply.state, reply.target_turn_id], ['consumed', next], 'the queued next Turn takes the reply in');
+      assert.deepEqual(seen.filter(entry => entry.result).map(entry => [entry.phase, entry.turnId]), [['next', next]]);
+    } finally { releaseScans(); }
+  // With a budget of one the reply never starts a Turn of its own.
+  }, { runAgentConfig: { maxAutomaticFollowups: 1 } });
 });

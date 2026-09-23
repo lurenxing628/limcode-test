@@ -1531,6 +1531,37 @@ export class RuntimeDeliveryControlPlane {
     return steps;
   }
 
+  /**
+   * Called inside a Turn's terminal commit. Collaboration messages routed into that Turn but never
+   * taken in move to next_turn in the same transaction, so the admission of the next Turn always
+   * sees them instead of racing the wake that would otherwise move them later. Board notices
+   * expire with their Turn through the router; Process and child answers keep their source-Turn
+   * routing.
+   */
+  public async prepareTerminalDeliverySteps(turnIdInput: string, nowInput: string): Promise<RepositoryTransactionStep[]> {
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const now = requireIsoTimestamp(nowInput, 'now');
+    const where = { target_turn_id: turnId, phase: 'current_turn', state: 'pending' };
+    const deliveries = await listAllDomainRows(this.database, 'RuntimeDelivery', where);
+    // A send routed into the Turn after this read fails the terminal commit, which then retries.
+    const steps: RepositoryTransactionStep[] = [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds(
+      where,
+      deliveries.map((delivery) => requirePhaseFId(delivery.id, 'RuntimeDelivery.id'))
+    )];
+    for (const delivery of deliveries) {
+      const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
+      if (inbox.source_kind !== 'collaboration_message') continue;
+      const sources = await this.listRows('CollaborationMessageSourceLink', { message_id: inbox.source_id }, 2);
+      if (sources[0]?.source_kind === 'board') continue;
+      steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(String(delivery.id), {
+        phase: 'next_turn',
+        target_turn_id: null,
+        updated_at: now
+      }));
+    }
+    return steps;
+  }
+
   public async acknowledgeNotification(deliveryIdInput: string): Promise<RuntimeDeliveryAdvanceResult> {
     const delivery = await this.requireExisting(
       'RuntimeDelivery',

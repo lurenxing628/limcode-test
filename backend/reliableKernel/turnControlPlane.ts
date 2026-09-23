@@ -420,6 +420,8 @@ export interface TurnControlPlaneOptions {
     now: string,
     startingDeliveryId?: string | null
   ) => Promise<RepositoryTransactionStep[]>;
+  /** Moves the collaboration messages a Turn never took in to next_turn inside its terminal commit. */
+  prepareTerminalDeliverySteps?: (turnId: string, now: string) => Promise<RepositoryTransactionStep[]>;
   now?: () => string;
 }
 
@@ -532,6 +534,7 @@ export class TurnControlPlane {
   private readonly attachments?: AttachmentIngestService;
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
   private readonly prepareNextTurnDeliverySteps?: TurnControlPlaneOptions['prepareNextTurnDeliverySteps'];
+  private readonly prepareTerminalDeliverySteps?: TurnControlPlaneOptions['prepareTerminalDeliverySteps'];
   private readonly contextSequence: ContextSequenceControlPlane;
   private readonly guidanceQueue: TurnGuidanceQueueOperations;
 
@@ -547,6 +550,7 @@ export class TurnControlPlane {
     this.attachments = options.attachments;
     this.unresolvedFileClosure = options.unresolvedFileClosure;
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
+    this.prepareTerminalDeliverySteps = options.prepareTerminalDeliverySteps;
     this.now = options.now ?? (() => new Date().toISOString());
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.guidanceQueue = new TurnGuidanceQueueOperations({
@@ -776,6 +780,9 @@ export class TurnControlPlane {
       ? await this.unresolvedFileClosure.prepareUnresolvedTurnClosure(turnId, { requireLease: false })
       : [];
     const now = this.timestamp();
+    const terminalDeliverySteps = this.prepareTerminalDeliverySteps
+      ? await this.prepareTerminalDeliverySteps(turnId, now)
+      : [];
     const committed = await this.commitWithReceipt({
       source,
       receiptId,
@@ -786,6 +793,7 @@ export class TurnControlPlane {
         DOMAIN_REPOSITORIES.domain('ExecutionLease').assertNone({ turn_id: turnId }),
         DOMAIN_REPOSITORIES.domain('PendingTurnInput').assertNone({ turn_id: turnId }),
         DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
+        ...terminalDeliverySteps,
         ...unresolvedFileSteps,
         DOMAIN_REPOSITORIES.domain('ToolCall').assertAll({ turn_id: turnId }, { status: 'terminal' }),
         DOMAIN_REPOSITORIES.domain('ModelRequest').assertAll({ turn_id: turnId }, { status: 'terminal' }),
@@ -2907,7 +2915,7 @@ export class TurnControlPlane {
     };
   }
 
-  private async recordTerminal(commandInput: TurnTerminalCommand): Promise<TurnCommandResult> {
+  private async recordTerminal(commandInput: TurnTerminalCommand, attempt = 0): Promise<TurnCommandResult> {
     const source = normalizeTerminalSource(commandInput.source);
     const turnId = requireId(commandInput.turnId, 'turnId');
     const reason = requireText(commandInput.reason, 'reason');
@@ -2972,6 +2980,9 @@ export class TurnControlPlane {
       terminalInputSnapshot,
       now
     );
+    const terminalDeliverySteps = this.prepareTerminalDeliverySteps
+      ? await this.prepareTerminalDeliverySteps(turnId, now)
+      : [];
     try {
       const committed = await this.commitWithReceipt({
         source,
@@ -2997,6 +3008,8 @@ export class TurnControlPlane {
             ] : [])
           ] : []),
           ...terminalInputSteps,
+          // After the input fence, so a delivery injected meanwhile still reports that conflict.
+          ...terminalDeliverySteps,
           ...unresolvedFileSteps,
           // A terminal Turn may not strand a pending or in-flight ToolCall. This assertion runs
           // after the pending-file closure steps in the same writer transaction.
@@ -3032,6 +3045,8 @@ export class TurnControlPlane {
       if (!isTransactionAssertionError(error)) throw error;
       const latest = await this.getTurn(turnId);
       if (latest.status !== TURN_STATUS_TERMINATED) {
+        // A collaboration message was routed into the Turn after the terminal read: read again.
+        if (isTerminalDeliveryFenceAssertion(error) && attempt < 3) return this.recordTerminal(commandInput, attempt + 1);
         if (handoffQueuedIntentId) {
           const [handoffIntent, childLinks, handoffRevisions] = await Promise.all([
             this.maybeGet('TurnIntent', handoffQueuedIntentId),
@@ -3876,6 +3891,11 @@ function requireTerminalStatus(value: string): asserts value is TurnTerminalStat
 function isTerminalInputFenceAssertion(error: unknown): boolean {
   return error instanceof Error
     && error.message === 'PendingTurnInputRepository transaction assertExactIds failed.';
+}
+
+function isTerminalDeliveryFenceAssertion(error: unknown): boolean {
+  return error instanceof Error
+    && error.message === 'RuntimeDeliveryRepository transaction assertExactIds failed.';
 }
 
 function prepareTerminalInputFence(
