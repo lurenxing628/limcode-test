@@ -1,0 +1,238 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+import { after, test } from 'node:test';
+
+const require = createRequire(import.meta.url);
+const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
+const load = file => require(path.join(compiled, file));
+const Module = require('node:module');
+const originalLoad = Module._load;
+class Uri {
+  constructor(value) { this.scheme = 'file'; this.fsPath = path.resolve(value); this.path = this.fsPath; }
+  static file(value) { return new Uri(value); }
+  static joinPath(base, ...parts) { return new Uri(path.join(base.fsPath, ...parts)); }
+  toString() { return `file://${this.path}`; }
+}
+const vscode = { Uri, FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 }, workspace: { fs: {
+  createDirectory: uri => fs.mkdir(uri.fsPath, { recursive: true }), readFile: uri => fs.readFile(uri.fsPath),
+  async writeFile(uri, bytes) { await fs.mkdir(path.dirname(uri.fsPath), { recursive: true }); await fs.writeFile(uri.fsPath, bytes); },
+  async readDirectory(uri) { return (await fs.readdir(uri.fsPath, { withFileTypes: true })).map(item => [item.name, item.isDirectory() ? 2 : 1]); },
+  delete: uri => fs.rm(uri.fsPath, { recursive: true, force: true }),
+  async stat(uri) { const stat = await fs.stat(uri.fsPath); return { type: stat.isDirectory() ? 2 : 1, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs }; }
+} } };
+Module._load = function(request, parent, isMain) {
+  return request === 'vscode' ? vscode : originalLoad.call(this, request, parent, isMain);
+};
+after(() => { Module._load = originalLoad; });
+const kernel = load('backend/reliableKernel/index.js');
+const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
+const { ReliableConversationRunner } = load('backend/application/reliableKernel/ReliableConversationRunner.js');
+const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
+const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
+const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
+const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
+const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
+const { projectStoredModelFacingWindow } = load('backend/reliableKernel/modelFacingContextProjection.js');
+const { LlmEventType } = load('backend/world/modules/llm/events.js');
+const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
+const rows = async (app, domain, where) => (await app.database.snapshotAll(repo(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 100 }))).snapshot;
+
+// 1x1 transparent PNG.
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+const CATALOG_MARKER = 'LimCode 托管附件目录';
+const CONVERSATION = 'conversation-tool-batch';
+
+/** Two MCP tools as McpRuntimeManager declares them: `srv_shot` answers with an image, `srv_list` with text. */
+const mcpTool = (name, originalToolName) => ({
+  execution: 'runtime',
+  declaration: {
+    name, description: `MCP ${name}`, parameters: { type: 'object', properties: {} },
+    source: { kind: 'mcp', sourceId: 'srv', sourceName: 'srv', originalToolName },
+    metadata: { category: 'general', scope: 'general', riskLevel: 'read', readonly: true, defaultEnabled: false,
+      defaultAutoApproveExecution: true, defaultAutoSubmitResult: true }
+  },
+  async execute() { throw new Error('MCP execution must use the reliable McpEffect control plane.'); }
+});
+const definitions = [mcpTool('srv_shot', 'shot'), mcpTool('srv_list', 'list')];
+const call = (id, name) => ({ id, functionCall: { name, args: {} } });
+const answer = text => ({ role: 'model', parts: [{ text }] });
+
+/**
+ * One conversation on one provider kind. Only the external model and the MCP server are synthetic:
+ * tool dispatch, MCP results, managed attachments, the attachment catalog projection, the provider
+ * adapter and the provider request encoder are production code. `send` answers each request and
+ * sees the frozen request, the adapter's LlmStartRequest and the encoded wire body.
+ */
+async function fixture({ providerKind, modelId, send }, run) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-tool-batch-wire-'));
+  const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
+  const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
+  const provider = { ...createDefaultLlmProviderConfig({ name: 'synthetic tool batch' }), id: 'synthetic-batch',
+    provider: providerKind, baseUrl: 'https://example.invalid/v1', model: modelId,
+    models: [{ id: modelId, name: 'synthetic' }], modelConfigs: [], generationConfig: {}, contextWindowTokens: 200000 };
+  const errors = [], requests = [];
+  let app, runner;
+  try {
+    await save('llmProviderConfigs', { configs: [provider] });
+    await save('llm', { activeProviderConfigId: provider.id });
+    await configuration.mutations.setToolPolicy({ scopeKind: 'global', sourceConfigs: { srv: { enabled: true } } });
+    const rootAuthority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
+    await kernel.initializeEmptyRuntimeRoot(rootAuthority);
+    app = await kernel.ReliableKernelApplication.open(rootAuthority, {
+      authorityCompiler: configuration, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
+      resolveWorkEnvironment: async () => undefined,
+      processCompletionDelivery: { scanIntervalMs: 60000 },
+      mcpConnections: {
+        async toolAnnotations() { return { readOnlyHint: true }; },
+        async callTool(_serverId, toolName) {
+          return toolName === 'shot'
+            ? { content: [{ type: 'text', text: 'screenshot taken' }, { type: 'image', data: PNG, mimeType: 'image/png' }] }
+            : { content: [{ type: 'text', text: 'two items' }] };
+        }
+      },
+      mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
+      providers: { resolve(providerId) { return { providerId, async sendFullRequest(request, controls) {
+        try {
+          let start;
+          const adapter = new kernel.LlmCapabilityFullRequestAdapter(providerId, {
+            start(input, emit) { start = input; emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
+          });
+          await adapter.sendFullRequest(request, { async onEvent() { return { accepted: true, terminal: true, checkpointed: true }; } });
+          const effective = applyFrozenModelProviderConfig(await configuration.providerConfig(providerId), request.modelId);
+          const wire = (await dryRunLlmProvider(start, { settings: { ...effective, apiKey: '' } })).body;
+          requests.push({ request, start, wire });
+          await controls.onEvent({ kind: 'completed', streamSeq: '1', content: await send(requests.length, { request, start, wire }) });
+        } catch (error) {
+          errors.push(error);
+          await controls.onEvent({ kind: 'completed', streamSeq: '1', content: answer('Synthetic provider assertion failed.') });
+        }
+      } }; } },
+      createToolDispatcher: dependencies => new ReliableToolDispatcher({ ...dependencies, effects: dependencies.runtime.effects,
+        host: { definitions: () => definitions } })
+    });
+    const now = new Date().toISOString();
+    await app.database.transaction([
+      repo('Conversation').insert({ id: CONVERSATION, title: 'tool batch', status: 'active', created_at: now, updated_at: now }),
+      repo('AgentConversationLink').insert({ id: `${CONVERSATION}-agent`, conversation_id: CONVERSATION, agent_id: 'main', role: 'default', created_at: now, updated_at: now })
+    ]);
+    await app.recover();
+    runner = new ReliableConversationRunner(app, 'synthetic-tool-batch-owner');
+    const turn = async (text) => {
+      const started = await runner.input({ conversationId: CONVERSATION, commandId: `input-${requests.length}-${text}`, text });
+      const deadline = Date.now() + 20000;
+      let termination;
+      while (!termination && Date.now() < deadline) {
+        if (errors.length) throw errors[0];
+        [termination] = await rows(app, 'TurnTermination', { turn_id: started.turnId });
+        if (!termination) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal(termination?.terminal_status, 'completed', termination?.reason ?? 'the Turn did not terminate');
+      return started.turnId;
+    };
+    await run({ app, requests, turn });
+    assert.deepEqual(errors, []);
+  } finally {
+    runner?.dispose();
+    if (app) await app.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+/** The request's conversation as one line per entry: `R:kind` with R = u(ser)/a(ssistant)/t(ool). */
+function wireShape(wire) {
+  const isCatalog = value => JSON.stringify(value).includes(CATALOG_MARKER);
+  if (Array.isArray(wire.messages)) {
+    return wire.messages.filter(message => message.role !== 'system' && message.role !== 'developer').map(message => {
+      if (message.role === 'tool') return `t:${message.tool_call_id}`;
+      if (message.role === 'assistant') {
+        const ids = message.tool_calls?.map(entry => entry.id)
+          ?? (Array.isArray(message.content) ? message.content.filter(block => block.type === 'tool_use').map(block => block.id) : []);
+        return ids.length ? `a:calls=${ids.join(',')}` : 'a:text';
+      }
+      if (Array.isArray(message.content) && message.content.some(block => block.type === 'tool_result')) {
+        return `u:${message.content.map(block => block.type === 'tool_result' ? `result=${block.tool_use_id}` : isCatalog(block) ? 'catalog' : block.type).join('+')}`;
+      }
+      return isCatalog(message) ? 'u:catalog' : 'u:text';
+    });
+  }
+  if (Array.isArray(wire.contents)) {
+    return wire.contents.map(content => `${content.role === 'model' ? 'a' : 'u'}:${content.parts.map(part =>
+      part.functionCall ? `call=${part.functionCall.id ?? part.functionCall.name}`
+        : part.functionResponse ? `result=${part.functionResponse.id ?? part.functionResponse.name}`
+          : isCatalog(part) ? 'catalog' : part.inlineData ? 'media' : 'text').join('+')}`);
+  }
+  return wire.input.filter(item => item.role !== 'system' && item.role !== 'developer').map(item => {
+    if (item.type === 'function_call') return `a:call=${item.call_id}`;
+    if (item.type === 'function_call_output') return `t:${item.call_id}`;
+    return `${item.role === 'assistant' ? 'a' : 'u'}:${isCatalog(item) ? 'catalog' : 'text'}`;
+  });
+}
+
+const PROVIDERS = [
+  ['openai-compatible', 'gpt-5.5'],
+  ['deepseek', 'deepseek-v4-flash'],
+  ['gemini', 'gemini-3.5-flash'],
+  ['claude', 'claude-sonnet-5'],
+  ['openai-responses', 'gpt-5.5']
+];
+
+/** Where the catalog of the screenshot lands in the request after one Turn of tool calls. */
+async function catalogAfterToolTurn(providerKind, modelId, calls) {
+  let shape, start;
+  await fixture({ providerKind, modelId, async send(round, observed) {
+    if (round === 1) return { role: 'model', parts: calls };
+    if (round === 2) {
+      shape = wireShape(observed.wire);
+      start = observed.start;
+    }
+    return answer('Saw the screenshot.');
+  } }, async ({ turn }) => { await turn('take a screenshot'); });
+  return { shape, start };
+}
+
+for (const [providerKind, modelId] of PROVIDERS) {
+  test(`${providerKind}: an attachment catalog after the first result of a parallel batch waits until the batch ends`, { timeout: 120000 }, async () => {
+    const { shape } = await catalogAfterToolTurn(providerKind, modelId, [call('shot1', 'srv_shot'), call('list2', 'srv_list')]);
+    const expected = {
+      // Chat Completions: every `tool` message directly after the assistant tool_calls (the dry-run
+      // before this fix had the catalog user message between `tool shot1` and `tool list2`).
+      'openai-compatible': ['u:text', 'a:calls=shot1,list2', 't:shot1', 't:list2', 'u:catalog'],
+      deepseek: ['u:text', 'a:calls=shot1,list2', 't:shot1', 't:list2', 'u:catalog'],
+      // Gemini: both function responses in one turn right after the model's two calls (a split batch is a live 400).
+      gemini: ['u:text', 'a:call=shot1+call=list2', 'u:result=shot1+result=list2', 'u:catalog'],
+      // Claude: both tool_result blocks in the user message right after the tool_use blocks.
+      claude: ['u:text', 'a:calls=shot1,list2', 'u:result=shot1+result=list2', 'u:catalog'],
+      'openai-responses': ['u:text', 'a:call=shot1', 'a:call=list2', 't:shot1', 't:list2', 'u:catalog']
+    }[providerKind];
+    assert.deepEqual(shape, expected);
+  });
+}
+
+test('an attachment catalog after a lone tool result stays directly after it', { timeout: 120000 }, async () => {
+  for (const [providerKind, modelId] of [['openai-compatible', 'gpt-5.5'], ['gemini', 'gemini-3.5-flash']]) {
+    const { shape } = await catalogAfterToolTurn(providerKind, modelId, [call('shot1', 'srv_shot')]);
+    assert.deepEqual(shape, providerKind === 'gemini'
+      ? ['u:text', 'a:call=shot1', 'u:result=shot1', 'u:catalog']
+      : ['u:text', 'a:calls=shot1', 't:shot1', 'u:catalog']);
+  }
+});
+
+test('the token estimate projects a parallel batch with the same catalog placement as the request', { timeout: 120000 }, async () => {
+  let checked = false;
+  await fixture({ providerKind: 'openai-compatible', modelId: 'gpt-5.5', async send(round, { request, start }) {
+    if (round === 1) return { role: 'model', parts: [call('shot1', 'srv_shot'), call('list2', 'srv_list')] };
+    if (round === 2) {
+      const stored = projectStoredModelFacingWindow(request.context, request.attachmentCatalogState, request.recipe.modelHandleCatalog);
+      const kinds = contents => contents.map(content => content.parts.map(part =>
+        part.functionResponse ? 'result' : part.functionCall ? 'call' : JSON.stringify(part).includes(CATALOG_MARKER) ? 'catalog' : 'other').join('+'));
+      assert.deepEqual(kinds(stored.contents), ['other', 'call+call', 'result', 'result', 'catalog']);
+      assert.deepEqual(kinds(start.contents), kinds(stored.contents));
+      checked = true;
+    }
+    return answer('done');
+  } }, async ({ turn }) => { await turn('take a screenshot'); });
+  assert.equal(checked, true);
+});

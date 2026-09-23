@@ -2769,3 +2769,70 @@ function assertCatalogStates(contents, expected) {
     assert.match(checkpointText, /nextPages/);
   }
 }
+
+test('LLM capability adapter holds catalog placements anchored inside a parallel tool batch until the batch ends, in order', async () => {
+  const first = { attachmentId: 'attachment-batch-first', name: 'first.png', mimeType: 'image/png', sizeBytes: 11 };
+  const second = { attachmentId: 'attachment-batch-second', name: 'second.png', mimeType: 'image/png', sizeBytes: 22 };
+  const toolPair = (segmentId, callId, name) => ({
+    segmentId, segmentKind: 'tool_pair', messageRole: null,
+    contentType: 'application/vnd.limcode.context-tool-pair+json',
+    content: JSON.stringify({
+      kind: 'tool_pair',
+      toolCall: { id: `internal-${callId}`, providerCallId: callId, callSeq: '1', toolName: name, argumentsContentType: 'application/json', arguments: '{}' },
+      toolModelResult: { id: `result-${callId}`, messageRevisionId: `revision-${callId}`, resultContentType: 'application/json', result: `{"ok":"${callId}"}` }
+    })
+  });
+  const message = (segmentId, role, parts) => ({
+    segmentId, segmentKind: 'message', messageRole: role,
+    contentType: 'application/vnd.limcode.message+json', content: JSON.stringify({ role, parts })
+  });
+  const context = [
+    message('batch-user', 'user', [{ text: 'render both' }]),
+    message('batch-calls', 'model', [
+      { id: 'call-a', functionCall: { name: 'echo', args: {} } },
+      { id: 'call-b', functionCall: { name: 'echo', args: {} } }
+    ]),
+    toolPair('batch-result-a', 'call-a', 'echo'),
+    toolPair('batch-result-b', 'call-b', 'echo'),
+    message('batch-answer', 'model', [{ text: 'rendered' }])
+  ];
+  const attachmentCatalogState = {
+    catalog: [first, second],
+    placements: [
+      { kind: 'attachment_catalog_delta', afterSegmentId: 'batch-result-a', entries: [first] },
+      { kind: 'attachment_catalog_delta', afterSegmentId: 'batch-result-b', entries: [second] }
+    ]
+  };
+  const modelHandleCatalog = { entries: [attachmentHandle('F1', first), attachmentHandle('F2', second)] };
+  const kinds = (contents) => contents.map((content) => content.parts.map((part) => part.functionCall ? `call:${part.id}`
+    : part.functionResponse ? `result:${part.id}`
+      : part.text?.includes('LimCode 托管附件目录') ? `catalog:${part.text.includes('first.png') ? 'first' : 'second'}`
+        : part.text?.includes('historical_tool_result') ? `result:${JSON.parse(part.text).callId}` : 'text').join('+'));
+
+  const ordinaryRequest = request();
+  ordinaryRequest.context = context;
+  ordinaryRequest.attachmentCatalogState = attachmentCatalogState;
+  ordinaryRequest.recipe.modelHandleCatalog = modelHandleCatalog;
+  let ordinary;
+  await new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+    ordinary = llmRequest;
+    emit({ type: 'llm:done', payload: { requestId: llmRequest.id } });
+  })).sendFullRequest(ordinaryRequest, { onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' }) });
+  assert.deepEqual(kinds(ordinary.contents),
+    ['text', 'call:call-a+call:call-b', 'result:call-a', 'result:call-b', 'catalog:first', 'catalog:second', 'text']);
+
+  // A compression request sends the same history, so it holds the placements the same way.
+  let summary;
+  const summaryRequest = compressionRequest('provider_native', context);
+  summaryRequest.attachmentCatalogState = attachmentCatalogState;
+  summaryRequest.recipe.modelHandleCatalog = modelHandleCatalog;
+  await new kernel.LlmCapabilityFullRequestAdapter('compression-provider', compressionCapability((compactRequest) => { summary = compactRequest; }))
+    .sendFullRequest(summaryRequest, { onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' }) });
+  const summaryKinds = kinds(summary.contents);
+  const catalogs = summaryKinds.flatMap((kind, index) => kind.startsWith('catalog:') ? [index] : []);
+  const results = summaryKinds.flatMap((kind, index) => kind.includes('result:') ? [index] : []);
+  assert.equal(catalogs.length, 2, summaryKinds.join(' | '));
+  assert.equal(results.length, 2, summaryKinds.join(' | '));
+  assert.ok(Math.min(...catalogs) > Math.max(...results), summaryKinds.join(' | '));
+  assert.deepEqual(catalogs.map((index) => summaryKinds[index]), ['catalog:first', 'catalog:second']);
+});

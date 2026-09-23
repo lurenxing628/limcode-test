@@ -115,6 +115,7 @@ docs/architecture/*
 !/tests/reliable-kernel/runtime-dataset-commands.test.cjs
 !/tests/reliable-kernel/vscode-fs-local-read.test.cjs
 !/tests/reliable-kernel/claude-cross-model-thinking-replay.test.mjs
+!/tests/reliable-kernel/provider-history-wire.test.mjs
 !/tests/reliable-kernel/settings-flush-convergence.test.mjs
 !/tests/reliable-kernel/settings-save-barrier-detach.test.mjs
 !/tests/vscodeStorageJsonDurability.test.cjs

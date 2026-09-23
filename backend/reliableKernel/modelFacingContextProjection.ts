@@ -813,12 +813,66 @@ export function projectStoredModelFacingWindow(
     }
   );
   const contents: MessageContent[] = [];
+  const placements = createAttachmentPlacementQueue((content) => contents.push(content));
   items.forEach((item, index) => {
-    contents.push(...storedContextItemContents(item, modelHandleCatalog));
-    const placement = renderedState.afterSegment.get(segmentIds[index]);
-    if (placement) contents.push(placement);
+    const itemContents = storedContextItemContents(item, modelHandleCatalog);
+    const toolResults = item.segmentKind === 'tool_pair' && isToolResultContents(itemContents);
+    placements.enter(toolResults);
+    contents.push(...itemContents);
+    placements.leave(toolResults, renderedState.afterSegment.get(segmentIds[index]));
   });
+  placements.release();
   return projectOrdinaryModelWindow(contents, modelHandleCatalog);
+}
+
+/**
+ * Whether one Context item rendered as tool results only: a completed tool_pair renders one user
+ * content holding its function response. A native call occurrence renders a model content instead.
+ */
+export function isToolResultContents(contents: readonly MessageContent[]): boolean {
+  return contents.length > 0 && contents.every((content) =>
+    content.role === 'user'
+    && content.parts.length > 0
+    && content.parts.every((part) => 'functionResponse' in part));
+}
+
+/** See {@link createAttachmentPlacementQueue}. */
+export interface AttachmentPlacementQueue {
+  /** Before an item's contents: any item but a completed tool_pair ends the run of tool results. */
+  enter(toolResults: boolean): void;
+  /** After an item's contents: its frozen placement, held back while the item is part of a run of tool results. */
+  leave(toolResults: boolean, placement: MessageContent | undefined): void;
+  /** Emits every held placement; also called once after the last Context item. */
+  release(): void;
+}
+
+/**
+ * Emits the attachment catalog placement frozen after each Context item. A placement anchored on a
+ * completed tool_pair waits for the end of that run of consecutive tool results, so it never splits
+ * the results of one parallel call batch: Chat Completions rejects an assistant `tool_calls` message
+ * that is not followed by a `tool` message for each call, Gemini rejects a model turn whose function
+ * calls are not answered by as many function response parts (both live 400s for a catalog between
+ * two results), and Claude needs the tool_result blocks first in the next user message
+ * (https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls). Held placements
+ * keep their order and their rendered bytes; a placement after a lone tool result, or after any
+ * other item, lands exactly where it did before.
+ */
+export function createAttachmentPlacementQueue(emit: (content: MessageContent) => void): AttachmentPlacementQueue {
+  const held: MessageContent[] = [];
+  const release = (): void => {
+    for (const placement of held.splice(0)) emit(placement);
+  };
+  return {
+    enter(toolResults) {
+      if (!toolResults) release();
+    },
+    leave(toolResults, placement) {
+      if (!placement) return;
+      if (toolResults) held.push(placement);
+      else emit(placement);
+    },
+    release
+  };
 }
 
 /** Common ordinary/native model-visible representation: same items, same result previews. */

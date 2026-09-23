@@ -46,8 +46,10 @@ import type {
 import {
   collectNativeConfigurationUpdates,
   isNativeConfigurationUpdatePart,
+  createAttachmentPlacementQueue,
   createManagedMediaBodyProjectionState,
   estimateProjectedModelInput,
+  isToolResultContents,
   projectOrdinaryModelWindow,
   projectSummaryModelWindow,
   stripNativeConfigurationUpdates,
@@ -641,19 +643,24 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId),
     { allowCurrentTurnDelta: currentTurnInput?.reinject === true }
   );
-  const appendAttachmentState = (segmentId: string): void => {
-    const placement = renderedAttachmentState.afterSegment.get(segmentId);
-    if (placement) contents.push(placement);
+  const attachmentPlacements = createAttachmentPlacementQueue((content) => contents.push(content));
+  const appendAttachmentState = (segmentId: string, toolResults = false): void => {
+    attachmentPlacements.leave(toolResults, renderedAttachmentState.afterSegment.get(segmentId));
   };
   for (const item of request.context) {
+    const pairContents = item.segmentKind === 'tool_pair'
+      ? toolPairContents(item.content, modelHandleCatalog)
+      : undefined;
+    const toolResults = pairContents !== undefined && isToolResultContents(pairContents);
+    attachmentPlacements.enter(toolResults);
     if (item.segmentKind === 'system') {
       systemParts.push(contextText(item.content, item.contentType));
       appendAttachmentState(item.segmentId);
       continue;
     }
-    if (item.segmentKind === 'tool_pair') {
-      contents.push(...toolPairContents(item.content, modelHandleCatalog));
-      appendAttachmentState(item.segmentId);
+    if (pairContents) {
+      contents.push(...pairContents);
+      appendAttachmentState(item.segmentId, toolResults);
       continue;
     }
     const compressed = decodeCompressionContents(item.content, item.contentType);
@@ -684,6 +691,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     contents.push({ role, parts: [{ text: item.content }] });
     appendAttachmentState(item.segmentId);
   }
+  attachmentPlacements.release();
   const tools = modelFacingToolsForHandleCatalog(
     readToolsForAttachmentCatalog(availableTools, attachmentCatalogState.catalog),
     modelHandleCatalog
@@ -1120,19 +1128,25 @@ function compressionContext(
     sourceContext.map((item) => item.segmentId),
     (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId)
   );
+  const attachmentPlacements = createAttachmentPlacementQueue((content) => {
+    current.push(content);
+    contents.push(content);
+  });
   for (const item of sourceContext) {
     const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
+    const pairContents = item.segmentKind === 'tool_pair'
+      ? toolPairContents(item.content, modelHandleCatalog)
+      : undefined;
+    const toolResults = pairContents !== undefined && isToolResultContents(pairContents);
+    attachmentPlacements.enter(toolResults);
     if (item.segmentKind === 'system') {
       const text = contextText(item.content, item.contentType).trim();
       if (text) systemParts.push(text);
-      if (attachmentStateContent) {
-        current.push(attachmentStateContent);
-        contents.push(attachmentStateContent);
-      }
+      attachmentPlacements.leave(false, attachmentStateContent);
       continue;
     }
     let decoded: MessageContent[];
-    if (item.segmentKind === 'tool_pair') decoded = toolPairContents(item.content, modelHandleCatalog);
+    if (pairContents) decoded = pairContents;
     else if (item.segmentKind === 'runtime_context') {
       decoded = [runtimeContextContent(item.content, item.contentType, modelHandleCatalog)];
     }
@@ -1168,11 +1182,9 @@ function compressionContext(
     if (item.segmentKind === 'compression' && methodKind === 'provider_native') {
       canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
     }
-    if (attachmentStateContent) {
-      current.push(attachmentStateContent);
-      contents.push(attachmentStateContent);
-    }
+    attachmentPlacements.leave(toolResults, attachmentStateContent);
   }
+  attachmentPlacements.release();
   flush();
   const systemText = systemParts.filter(Boolean).join('\n\n').trim();
   const systemInstruction = systemText
