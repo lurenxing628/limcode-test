@@ -4,6 +4,7 @@ import { IconArrowDownLeft, IconArrowUpRight } from '@tabler/icons-vue';
 import {
   collaborationCardKindLabel,
   collaborationCardLabel,
+  collaborationCardStatusLabel,
   type CollaborationTimelineCard
 } from '@webview/domain/reliableCollaborationTimeline';
 
@@ -11,20 +12,21 @@ const props = defineProps<{ card: CollaborationTimelineCard }>();
 
 const label = computed(() => collaborationCardLabel(props.card));
 const kindLabel = computed(() => collaborationCardKindLabel(props.card));
+const statusLabel = computed(() => collaborationCardStatusLabel(props.card));
 </script>
 
 <template>
   <article
     class="collaboration-card"
-    :class="{ 'is-outgoing': card.direction === 'outgoing', 'is-waiting': card.waiting }"
-    :aria-label="`${label} · ${kindLabel}`"
+    :class="{ 'is-outgoing': card.direction === 'outgoing', 'is-waiting': card.status === 'waiting', 'is-failed': card.status === 'failed' }"
+    :aria-label="[label, kindLabel, statusLabel].filter(Boolean).join(' · ')"
   >
     <header class="collaboration-card-header">
       <IconArrowDownLeft v-if="card.direction === 'incoming'" :size="14" stroke="1.9" aria-hidden="true" />
       <IconArrowUpRight v-else :size="14" stroke="1.9" aria-hidden="true" />
       <strong class="collaboration-card-peer" :class="{ 'is-deleted': card.peer.state === 'deleted', 'is-unknown': card.peer.state === 'unknown' }">{{ label }}</strong>
       <span class="collaboration-card-kind">{{ kindLabel }}</span>
-      <span v-if="card.waiting" class="collaboration-card-state">等待下一轮处理</span>
+      <span v-if="statusLabel" class="collaboration-card-state">{{ statusLabel }}</span>
     </header>
     <p v-if="card.textPreview" class="collaboration-card-preview">{{ card.textPreview }}</p>
   </article>
@@ -51,6 +53,14 @@ const kindLabel = computed(() => collaborationCardKindLabel(props.card));
 
 .collaboration-card.is-waiting {
   border-style: dashed;
+}
+
+.collaboration-card.is-failed {
+  border-left-color: var(--vscode-errorForeground);
+}
+
+.collaboration-card.is-failed .collaboration-card-state {
+  color: var(--vscode-errorForeground);
 }
 
 .collaboration-card-header {

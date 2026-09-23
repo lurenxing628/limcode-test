@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   collaborationCardKindLabel,
   collaborationCardLabel,
+  collaborationCardStatusLabel,
   projectCollaborationTimeline
 } from '../src/domain/reliableCollaborationTimeline.ts';
 import { collaborationPeerLabel, rememberRemovedConversations, resolveCollaborationPeer } from '../src/domain/collaborationPeer.ts';
@@ -58,7 +59,7 @@ test('collaboration cards anchor to the first message of their delivery or sendi
   ], 'mid-Turn deliveries follow the opening user message in sequence order');
   assert.deepEqual(labels(timeline.afterMessage['continuation-reply']), ['发往对话 调研对话 · 任务结果 · 调研结果']);
   assert.deepEqual(labels(timeline.unbound), ['来自对话 调研对话 · 续派任务 · 等你这轮结束']);
-  assert.equal(timeline.unbound[0].waiting, true);
+  assert.equal(timeline.unbound[0].status, 'waiting');
   assert.equal(Object.values(timeline.afterMessage).flat().some(card => card.messageId === 'retried'), false,
     'the newest attempt decides placement and a Turn outside the loaded window is not guessed');
 });
@@ -127,4 +128,51 @@ test('only committed Conversation removals are remembered as deleted, newest las
   ], 3);
   assert.deepEqual(remembered, ['b', 'c', 'a']);
   assert.deepEqual(rememberRemovedConversations(['x'], undefined), ['x']);
+});
+
+test('failed deliveries are shown: an incoming one waits in the unbound list, an outgoing card is marked failed', () => {
+  const outgoingDelivery = (messageId: string, peer: string, state: string, attempt = '1') =>
+    ({ id: `${messageId}-delivery-${attempt}`, inbox_item_id: `${messageId}-inbox`, target_conversation_id: peer, target_turn_id: null, state, attempt_seq: attempt });
+  const timeline = projectCollaborationTimeline({
+    conversationId: 'self',
+    records: {
+      Conversation: byId({ id: 'peer', title: '调研对话', status: 'active' }),
+      CollaborationMessage: byId(
+        message('incoming-failed', '1', 'followup', '没送到'),
+        message('outgoing-failed', '2', 'message', '发出但失败'),
+        message('outgoing-retried', '3', 'message', '重试后送达'),
+        message('outgoing-pending', '4', 'followup', '排队中')
+      ),
+      CollaborationMessageSourceLink: byId(
+        source('incoming-failed', 'peer', 'peer-turn'),
+        source('outgoing-failed', 'self', 'self-turn'),
+        source('outgoing-retried', 'self', 'self-turn'),
+        source('outgoing-pending', 'self', 'self-turn')
+      ),
+      CollaborationMessageTargetLink: byId(
+        target('incoming-failed', 'self'),
+        target('outgoing-failed', 'peer'),
+        target('outgoing-retried', 'peer'),
+        target('outgoing-pending', 'peer')
+      ),
+      RuntimeDelivery: byId(
+        delivery('incoming-failed', null, 'failed'),
+        outgoingDelivery('outgoing-failed', 'peer', 'failed'),
+        outgoingDelivery('outgoing-retried', 'peer', 'failed', '1'),
+        { ...outgoingDelivery('outgoing-retried', 'peer', 'consumed', '2'), target_turn_id: 'peer-turn' },
+        outgoingDelivery('outgoing-pending', 'peer', 'pending')
+      )
+    },
+    messages: [{ id: 'self-message', role: 'user' }],
+    turnIdByMessageId: { 'self-message': 'self-turn' },
+    removedConversationIds: []
+  });
+  assert.deepEqual(timeline.unbound.map((card) => [card.messageId, card.status]), [['incoming-failed', 'failed']]);
+  assert.deepEqual(timeline.afterMessage['self-message'].map((card) => [card.messageId, card.status]), [
+    ['outgoing-failed', 'failed'],
+    ['outgoing-retried', 'settled'],
+    ['outgoing-pending', 'waiting']
+  ], 'the newest delivery attempt decides the outgoing state');
+  assert.equal(collaborationCardStatusLabel(timeline.unbound[0]), '投递失败');
+  assert.equal(collaborationCardStatusLabel(timeline.afterMessage['self-message'][2]), '等待对方处理');
 });

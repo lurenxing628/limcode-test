@@ -807,8 +807,16 @@ export class BoundedClientFeed {
         return materialized('CollaborationMessage', field('message_id'));
       case 'CollaborationRequestTurnLink':
         return materialized('CollaborationRequest', field('request_id'));
-      case 'RuntimeDelivery':
-        return field('target_conversation_id') === activeConversationId;
+      case 'RuntimeDelivery': {
+        // The sender also sees the delivery of its own loaded outgoing collaboration messages.
+        const inboxItemId = field('inbox_item_id');
+        return field('target_conversation_id') === activeConversationId
+          || Boolean(inboxItemId && hasMaterializedReferenceFrom(
+            session,
+            recordKey('RuntimeInboxItem', inboxItemId),
+            ['CollaborationMessageTargetLink']
+          ));
+      }
       case 'RuntimeDeliveryIntentLink':
         return materialized('RuntimeDelivery', field('delivery_id'))
           && materialized('TurnIntent', field('turn_intent_id'));

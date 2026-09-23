@@ -1102,6 +1102,10 @@ function validateClient(client, failures) {
   for (const marker of ['collaborationPeerConversations', 'display_title', 'status-deleted', 'missing-peer-as-unknown']) {
     if (!peerRule.includes(marker)) failures.push(`协作对方对话投影缺少${marker}`);
   }
+  const deliveryRule = String(collaboration?.deliveryState ?? '');
+  for (const marker of ['RuntimeDelivery-of-its-loaded-outgoing-messages', 'newest-attempt', 'failed-incoming-stays-visible']) {
+    if (!deliveryRule.includes(marker)) failures.push(`协作卡片投递状态缺少${marker}`);
+  }
 
   if (client?.persistence?.clientChangeLog !== false || client?.persistence?.clientCommitTables !== false) failures.push('第一版不得持久化前端变更日志或提交表');
   if (client?.persistence?.sessionState !== 'memory-only') failures.push('前端同步会话必须只在内存中');

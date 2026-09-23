@@ -160,6 +160,34 @@ test('collaboration snapshot ships its peers as their own set with the sidebar t
   assert.deepEqual(peers.gone, { id: 'gone', title: null, status: 'deleted', display_title: null }, 'a peer removed from the Runtime is known to be deleted');
 }));
 
+test('the sender sees the target delivery of its own outgoing message, including a later failure', async () => withRuntime(async (runtime) => {
+  const { database } = runtime;
+  await database.transaction([row('Turn', { id: 'sender-turn', conversation_id: 'sender', status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW })]);
+  await seedMessage(runtime, 'outgoing', 'message', 'target', 'hello', 'sender', { sourceTurnId: 'sender-turn' });
+  await seedMessage(runtime, 'not-ours', 'message', 'unrelated', 'between others', 'target');
+  const summary = (await database.clientProjectionSnapshot('sender')).snapshot.subagentDeliverySummary;
+  assert.ok(summary.collaborationMessages.some((value) => value.id === 'outgoing'));
+  assert.deepEqual(summary.runtimeDeliveries.map((value) => [value.id, value.state]), [['outgoing-delivery', 'pending']],
+    'only the deliveries of this Conversation’s own outgoing messages');
+  const feed = new kernel.BoundedClientFeed(database);
+  const received = [];
+  try {
+    const connection = await feed.connect({ activeConversationId: 'sender', send: (message) => received.push(message) });
+    feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: received[0].messageSeq });
+    await database.transaction([kernel.DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update('outgoing-delivery', { state: 'failed', failure_reason: 'target-gone', updated_at: NOW })]);
+    await new Promise((resolve) => setImmediate(resolve));
+    const update = received.at(-1);
+    assert.equal(update.type, 'reliable-kernel.changes');
+    const change = update.changes.find((value) => value.type === 'RuntimeDelivery' && value.id === 'outgoing-delivery');
+    assert.equal(change?.record?.state, 'failed', 'the failure reaches the sender live');
+    feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: update.messageSeq });
+    const before = received.length;
+    await database.transaction([kernel.DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update('not-ours-delivery', { state: 'failed', failure_reason: 'target-gone', updated_at: NOW })]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(received.length, before, 'deliveries of other Conversations’ messages stay out');
+  } finally { feed.close(); }
+}));
+
 test('collaboration request identity cannot be rewritten and no per-conversation grant domain exists', () => {
   assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('CollaborationRequest').update('request', { message_id: 'other' }), /immutable|not mutable|cannot|not allowed/);
   assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink'), /ConversationCommunicationLink|unknown|Unknown|not registered/);

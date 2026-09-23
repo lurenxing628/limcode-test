@@ -1060,13 +1060,14 @@ export function executeClientProjectionSnapshot(
     const collaborationIds = collaborationMessages.map(row => String(row.id));
     const collaborationMessageSourceLinks = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', collaborationIds);
     const collaborationMessageTargetLinks = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', collaborationIds);
-    // Each incoming card is placed by its delivery, which may be older than the newest deliveries.
+    // Each card carries its own delivery: an incoming one is placed by it (it may be older than the
+    // newest deliveries) and an outgoing one shows whether the peer received it.
     const deliveries = mergeRowsById([
       ...queryClientRuntimeDeliveries(database, conversationId),
       ...queryAllByIds(database, 'runtime_delivery', 'inbox_item_id', collaborationMessageTargetLinks
-        .filter((link) => link.conversation_id === conversationId)
         .map((link) => String(link.inbox_item_id)))
-        .filter((delivery) => delivery.target_conversation_id === conversationId)
+        .filter((delivery) => collaborationMessageTargetLinks.some((link) =>
+          link.inbox_item_id === delivery.inbox_item_id && link.conversation_id === delivery.target_conversation_id))
     ]);
     const deliveryIds = deliveries.map((row) => String(row.id));
     const deliveryInputLinks = queryAllByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);

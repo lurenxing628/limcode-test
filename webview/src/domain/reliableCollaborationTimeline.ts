@@ -11,8 +11,11 @@ export interface CollaborationTimelineCard {
   peer: CollaborationPeer;
   kind: 'message' | 'followup' | 'result';
   textPreview: string;
-  /** Committed but not yet bound to a target Turn (for example queued behind a running Turn). */
-  waiting: boolean;
+  /**
+   * From the newest delivery attempt: `waiting` is committed but not yet taken up by the target
+   * (for example queued behind its running Turn), `failed` never reached it, `settled` did.
+   */
+  status: 'waiting' | 'failed' | 'settled';
 }
 
 export interface CollaborationTimeline {
@@ -20,7 +23,7 @@ export interface CollaborationTimeline {
   beforeMessage: Record<string, CollaborationTimelineCard[]>;
   /** Rendered below the anchor message: received or sent while the anchor Turn ran. */
   afterMessage: Record<string, CollaborationTimelineCard[]>;
-  /** Incoming messages that still wait for a target Turn. */
+  /** Incoming messages that still wait for a target Turn or failed before reaching one. */
   unbound: CollaborationTimelineCard[];
 }
 
@@ -46,7 +49,7 @@ export function projectCollaborationTimeline(input: {
   }
   const sources = linksByMessage(input.records.CollaborationMessageSourceLink);
   const targets = linksByMessage(input.records.CollaborationMessageTargetLink);
-  const deliveries = Object.values(input.records.RuntimeDelivery ?? {});
+  const latestDeliveries = latestDeliveryByTarget(input.records.RuntimeDelivery);
   const messages = Object.values(input.records.CollaborationMessage ?? {})
     .filter((message) => typeof message.id === 'string')
     .sort((left, right) => compareSequence(left.message_seq, right.message_seq) || text(left.id).localeCompare(text(right.id)));
@@ -59,23 +62,25 @@ export function projectCollaborationTimeline(input: {
     if (!incoming && source.conversation_id !== input.conversationId) continue;
     const peerConversationId = text(incoming ? source.conversation_id : target.conversation_id);
     if (!peerConversationId) continue;
+    // The newest attempt to the message's own target decides its state on both sides.
+    const delivery = latestDeliveries.get(deliveryKey(target.inbox_item_id, target.conversation_id));
+    if (incoming && !delivery) continue;
     const card: CollaborationTimelineCard = {
       messageId,
       direction: incoming ? 'incoming' : 'outgoing',
       peer: resolveCollaborationPeer(input.records, peerConversationId, input.removedConversationIds),
       kind: source.source_kind === 'completion' ? 'result' : message.mode === 'followup' ? 'followup' : 'message',
       textPreview: text(message.text_preview),
-      waiting: false
+      // An incoming delivery already bound to a Turn is taken up there; only an unbound one waits.
+      status: delivery?.state === 'failed' ? 'failed'
+        : delivery?.state === 'pending' && !(incoming && text(delivery.target_turn_id)) ? 'waiting'
+          : 'settled'
     };
     let turnId: string;
     if (incoming) {
-      const delivery = deliveries
-        .filter((row) => row.inbox_item_id === target.inbox_item_id && row.target_conversation_id === input.conversationId)
-        .sort((left, right) => compareSequence(right.attempt_seq, left.attempt_seq))[0];
-      if (!delivery) continue;
-      turnId = text(delivery.target_turn_id);
+      turnId = text(delivery?.target_turn_id);
       if (!turnId) {
-        if (delivery.state === 'pending') result.unbound.push({ ...card, waiting: true });
+        if (card.status !== 'settled') result.unbound.push(card);
         continue;
       }
     } else {
@@ -96,9 +101,31 @@ export function collaborationCardLabel(card: CollaborationTimelineCard): string 
   return card.direction === 'incoming' ? `来自${peer}` : `发往${peer}`;
 }
 
+/** The state badge, or an empty string when the message simply arrived. */
+export function collaborationCardStatusLabel(card: CollaborationTimelineCard): string {
+  if (card.status === 'failed') return '投递失败';
+  if (card.status === 'settled') return '';
+  return card.direction === 'incoming' ? '等待下一轮处理' : '等待对方处理';
+}
+
 export function collaborationCardKindLabel(card: CollaborationTimelineCard): string {
   if (card.kind === 'result') return '任务结果';
   return card.kind === 'followup' ? '续派任务' : '消息';
+}
+
+function deliveryKey(inboxItemId: PlainData | undefined, conversationId: PlainData | undefined): string {
+  return `${text(inboxItemId)}\0${text(conversationId)}`;
+}
+
+/** One pass over the deliveries: the newest attempt per inbox item and target Conversation. */
+function latestDeliveryByTarget(records: Record<string, FeedRecord> | undefined): Map<string, FeedRecord> {
+  const latest = new Map<string, FeedRecord>();
+  for (const delivery of Object.values(records ?? {})) {
+    const key = deliveryKey(delivery.inbox_item_id, delivery.target_conversation_id);
+    const current = latest.get(key);
+    if (!current || compareSequence(delivery.attempt_seq, current.attempt_seq) > 0) latest.set(key, delivery);
+  }
+  return latest;
 }
 
 function linksByMessage(records: Record<string, FeedRecord> | undefined): Map<string, FeedRecord> {
