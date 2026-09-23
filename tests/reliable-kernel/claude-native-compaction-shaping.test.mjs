@@ -206,14 +206,16 @@ test('Claude 原生压缩：多轮工具循环的 tools、system 与消息前缀
   const ordinary = await renderOrdinary(ordinaryRequest({ context: WINDOW_N, reminder: REMINDER_3 }));
   const compaction = await renderCompaction(compactionRequest({ context: WINDOW_FULL }));
 
-  // The ordinary request's volatile tail is its reminder, the last user message (it also carries that request's breakpoint).
+  // The ordinary request's volatile tail is its reminder, the last user message. In tail mode its breakpoint sits on
+  // the last user message before the tail (6860ccf4), so the tail itself carries none.
   assert.deepEqual(ordinary.start.openAIResponsesContinuation.volatileTailContentKinds, ['turn_reminder']);
   const tail = ordinary.body.messages.at(-1);
-  assert.deepEqual(tail, { role: 'user', content: [{ type: 'text', text: REMINDER_3, cache_control: CACHE }] });
+  assert.deepEqual(tail, { role: 'user', content: [{ type: 'text', text: REMINDER_3 }] });
   const stable = ordinary.body.messages.slice(0, -1);
 
-  // Messages: the stable part of the ordinary request is a byte-identical prefix of the compaction request.
-  assert.deepEqual(compaction.body.messages.slice(0, stable.length), stable);
+  // Messages: the stable part of the ordinary request is a byte-identical prefix of the compaction request. Only
+  // where the breakpoint sits differs; Anthropic matches cached prefixes by content and looks back over earlier blocks.
+  assert.deepEqual(withoutCacheControl(compaction.body.messages.slice(0, stable.length)), withoutCacheControl(stable));
   assert.deepEqual(compaction.body.messages.map((entry) => entry.role), ['user', 'assistant', 'user', 'assistant', 'user', 'assistant', 'user']);
   // Tool ids are the stored ones (a non-conforming id is rewritten the same way as in ordinary requests).
   const ids = toolUseIds(compaction.body.messages);
@@ -240,8 +242,8 @@ test('Claude 原生压缩：多轮工具循环的 tools、system 与消息前缀
   assert.deepEqual(compaction.body.tools, ordinary.body.tools);
   assert.equal(compaction.body.tools.length, 1);
   assert.equal(compaction.body.tools[0].name, 'read');
-  // One breakpoint each on tools, system and the last user message, like every ordinary request.
-  assert.deepEqual(cacheMarkers(ordinary.body), ['tools[0]', 'system[0]', lastUserBlock(ordinary.body.messages)]);
+  // One breakpoint each on tools, system and the last stable user message (before the ordinary request's volatile tail).
+  assert.deepEqual(cacheMarkers(ordinary.body), ['tools[0]', 'system[0]', lastUserBlock(stable)]);
   assert.deepEqual(cacheMarkers(compaction.body), ['tools[0]', 'system[0]', lastUserBlock(compaction.body.messages)]);
   assert.equal(lastUserBlock(compaction.body.messages), 'messages[6].content[0]');
 
