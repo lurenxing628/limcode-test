@@ -969,3 +969,22 @@ test('a team message the stopped target Turn never took in settles its wake and 
   await endTurn(f, 'root-turn', 'interrupted');
   await assertStrandedMessageSettles(f, 'root', sent.deliveryId, 'root-next');
 }));
+
+test('a failure reply committed before its request was settled still settles the request as failed', async () => fixture(async f => {
+  const { ConversationDeletionControlPlane } = load('conversationDeletion.js');
+  await topLevel(f, ['peer-a', true], ['target-b', true]);
+  const followup = await crossSend(f, 'a-task-failed-then-lost', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  await endTurn(f, 'target-b-turn');
+  await new ConversationDeletionControlPlane(f.database).delete('target-b');
+  await f.collaboration.reconcile();
+  const [request] = await f.rows('CollaborationRequest', { message_id: followup.messageId });
+  assert.equal(request.state, 'failed', 'fixture: the requester was told the task could not start');
+  // The Host died after committing the failure reply but before settling the request.
+  await f.database.transaction([repo('CollaborationRequest').update(request.id, { state: 'pending', updated_at: NOW })]);
+  await f.collaboration.reconcile();
+  await f.collaboration.reconcile();
+  assert.equal((await f.get('CollaborationRequest', request.id)).state, 'failed', 'a reply no Turn wrote never marks the task completed');
+  const replies = await repliesTo(f, 'peer-a', followup.messageId);
+  assert.equal(replies.length, 1, 'no second reply');
+  assert.match((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, /^Task could not start: /);
+}));
