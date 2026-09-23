@@ -179,6 +179,14 @@ export class ForkCompressionPrecedence {
     return !tail.slice(cutIndex).some((segmentId) => later.has(segmentId));
   }
 
+  /**
+   * False when no cut can follow this summary's compression (its Turn is not kept, or its creation
+   * projection is unusable), so a caller can skip a candidate root without reading it.
+   */
+  public async mayPrecede(summarySegmentId: string): Promise<boolean> {
+    return (await this.factsFor(summarySegmentId)) !== null;
+  }
+
   private factsFor(summarySegmentId: string): Promise<CompressionPrecedenceFacts | null> {
     let facts = this.facts.get(summarySegmentId);
     if (!facts) {
@@ -330,13 +338,7 @@ export class ForkContextCandidateProbe {
       return false;
     }
     const node = await this.node(rootId);
-    const segmentId = requireId(node.segment_id, 'ContextSequenceNode.segment_id');
-    let kind = this.segmentKinds.get(segmentId);
-    if (kind === undefined) {
-      const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)]);
-      kind = requireId(requireRow(result.snapshot[0], 'ContextSegment').segment_kind, 'ContextSegment.segment_kind');
-      this.segmentKinds.set(segmentId, kind);
-    }
+    const kind = await this.segmentKind(requireId(node.segment_id, 'ContextSequenceNode.segment_id'));
     if (kind === 'compression') {
       if (node.parent_node_id !== null || count !== tailCount + 1 || (tailId === null) !== (tailCount === 0)) {
         throw new Error('Invalid compression Fork candidate window.');
@@ -349,6 +351,24 @@ export class ForkContextCandidateProbe {
     }
     if (tailId !== null || tailCount !== 0) throw new Error('Invalid ordinary Fork candidate tail.');
     return this.window(rootId, count, true);
+  }
+
+  /** The summary segment a compressed candidate root starts with; null for an ordinary root. */
+  public async compressionSummary(root: DomainRow): Promise<string | null> {
+    const rootId = this.pointer(root.root_node_id);
+    if (rootId === null) return null;
+    const segmentId = requireId((await this.node(rootId)).segment_id, 'ContextSequenceNode.segment_id');
+    return await this.segmentKind(segmentId) === 'compression' ? segmentId : null;
+  }
+
+  private async segmentKind(segmentId: string): Promise<string> {
+    let kind = this.segmentKinds.get(segmentId);
+    if (kind === undefined) {
+      const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)]);
+      kind = requireId(requireRow(result.snapshot[0], 'ContextSegment').segment_kind, 'ContextSegment.segment_kind');
+      this.segmentKinds.set(segmentId, kind);
+    }
+    return kind;
   }
 
   private async window(tip: string, length: number, exactDepth: boolean): Promise<boolean> {

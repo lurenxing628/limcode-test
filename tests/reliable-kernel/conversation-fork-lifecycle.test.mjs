@@ -1621,6 +1621,37 @@ for (const suffixCount of [32, 128]) {
 }
 }
 
+test('an early fork never reads the compressed roots of a later compression', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', `long history ${'以前的重要历史。'.repeat(12000)}`);
+    await h.turn('source', 'early-boundary-before-compression');
+    const early = await h.command('source', 'early-fork-before-later-compression');
+    await h.saveCompression({ trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 },
+      llmSummary: { targetTokens: 512 } });
+    await h.turn('source', 'later-compressing-turn');
+    await h.saveCompression({ trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 } });
+    for (let index = 0; index < 4; index += 1) await h.turn('source', `later-turn-${index}`);
+    const compressedRoots = new Set();
+    for (const root of await rows(h.app, 'ContextSequenceRoot', { conversation_id: 'source' })) {
+      if ((await h.app.context.materializeStructure(root.id)).records[0].segment.segment_kind === 'compression') compressedRoots.add(root.id);
+    }
+    assert.ok(compressedRoots.size >= 8, 'fixture: every later root keeps the boundary in its compressed tail');
+    const database = h.app.database;
+    const materialize = database.materializeContext.bind(database);
+    const read = [];
+    database.materializeContext = async (rootId, ...rest) => { read.push(rootId); return materialize(rootId, ...rest); };
+    let fork;
+    try {
+      fork = await h.facade.forkConversation(early);
+    } finally {
+      database.materializeContext = materialize;
+    }
+    assert.deepEqual(read.filter(rootId => compressedRoots.has(rootId)), [],
+      'a compression whose Turn follows the cut is rejected from its summary alone');
+    assert.deepEqual(await rows(h.app, 'CompressionBlock', { conversation_id: fork.conversationId }), []);
+  }, { compression: true });
+});
+
 test('candidate probe excludes an actual compressed tail ancestor outside its visible window', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'hidden-boundary');

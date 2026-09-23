@@ -390,6 +390,9 @@ export class ReliableConversationLifecycle {
     const compressionPrecedence = new ForkCompressionPrecedence(this.application.database, sourceConversationId, boundaryMessageSeq);
     for (const root of [...roots].reverse()) {
       if (!await candidates.mayContain(root)) continue;
+      // A root whose compression can never precede this cut is skipped without reading it.
+      const summarySegmentId = await candidates.compressionSummary(root);
+      if (summarySegmentId && !await compressionPrecedence.mayPrecede(summarySegmentId)) continue;
       const rootId = requireText(root.id, 'ContextSequenceRoot.id');
       const structure = await this.application.context.materializeStructure(rootId);
       const segmentIndexes = new Map(structure.records.map((record, index) => [String(record.segment.id), index]));
