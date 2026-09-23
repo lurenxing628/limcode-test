@@ -554,6 +554,9 @@ function cloneGenerationConfig(input: LlmGenerationConfigRecord | undefined): Ll
 function openAIReasoningCapability(modelId: string): ModelReasoningCapability {
   // Only documented model ids, plus their dated snapshots. A gateway alias/future family is unknown.
   const id = modelId.toLowerCase().replace(/-\d{4}-\d{2}-\d{2}$/, '');
+  // GPT-6（https://developers.openai.com/api/docs/models/gpt-6-astra、gpt-6-sol、gpt-6-luna）：
+  // Astra 的 reasoning.effort 支持 low、medium、high、xhigh、max，不支持 none，官方没有写默认值；
+  // Sol 和 Luna 支持 none、low、medium（默认）、high、xhigh、max。`pro` 是 reasoning.mode，不是模型 id。
   const levels: Record<string, LlmThinkingLevel[]> = {
     'gpt-5': ['minimal', 'low', 'medium', 'high'],
     'gpt-5-mini': ['minimal', 'low', 'medium', 'high'],
@@ -561,12 +564,19 @@ function openAIReasoningCapability(modelId: string): ModelReasoningCapability {
     'gpt-5.1': ['none', 'low', 'medium', 'high'],
     'gpt-5.2': ['none', 'low', 'medium', 'high', 'xhigh'],
     'gpt-5.4': ['none', 'low', 'medium', 'high', 'xhigh'],
-    'gpt-6-astra': ['low', 'medium', 'high'],
-    'gpt-6-astra-pro': ['low', 'medium', 'high']
+    'gpt-6-astra': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gpt-6-sol': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+    'gpt-6-luna': ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+  };
+  const defaultLevels: Record<string, LlmThinkingLevel> = {
+    'gpt-6-sol': 'medium',
+    'gpt-6-luna': 'medium'
   };
   if (!levels[id]) return unknownReasoningCapability();
   return {
-    family: 'openai_effort', levels: levels[id], supportsBudget: false,
+    family: 'openai_effort', levels: levels[id],
+    ...(defaultLevels[id] ? { defaultLevel: defaultLevels[id] } : {}),
+    supportsBudget: false,
     canDisable: levels[id].includes('none'), alwaysOn: !levels[id].includes('none'),
     outputLimitIncludesThinking: true, requiresThoughtSignatures: true
   };

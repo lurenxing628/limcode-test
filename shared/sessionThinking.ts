@@ -1,5 +1,5 @@
 import type { LlmGenerationConfigRecord, LlmRequestBodyRecord, LlmProviderKind, LlmThinkingConfigRecord, LlmThinkingLevel, SessionThinkingOverride } from './protocol';
-import { isAstraModel } from './openAIResponsesCapabilities';
+import { isAstraModel, isGpt6NoneCapableModel } from './openAIResponsesCapabilities';
 import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from './geminiThinking';
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
 
@@ -35,6 +35,8 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     if (/^gpt-5\.1(?:-2025-11-13)?$/.test(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high'] };
     if (/^gpt-5\.2(?:-2025-12-11)?$/.test(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh'] };
     if (isAstraModel(model) && provider === 'openai-responses') return { kind: 'openai-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] };
+    // GPT-6 Sol / Luna（models/gpt-6-sol.md、models/gpt-6-luna.md）：none、low、medium（默认）、high、xhigh、max。
+    if (isGpt6NoneCapableModel(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] };
   }
   if (provider === 'deepseek' && /^deepseek-(?:reasoner|v4)(?:-|$)/.test(model)) return { kind: 'deepseek-effort', values: ['none', 'high', 'max'] };
   return configuredEffort(provider, configuredThinking);

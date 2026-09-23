@@ -14,7 +14,26 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const capabilities = require(path.join(compiledRoot, 'shared/openAIResponsesCapabilities.js'));
+const modelCapabilities = require(path.join(compiledRoot, 'shared/modelCapabilities.js'));
+const sessionThinking = require(path.join(compiledRoot, 'shared/sessionThinking.js'));
 const { dryRunLlmProvider } = require(path.join(compiledRoot, 'backend/capabilities/llmProvider.js'));
+
+/** 用 esbuild 把 webview 源码模块打成 CJS 在 Node 里加载（与 tests/openAIResponsesWebSocket.test.cjs 相同做法）。 */
+function loadWebviewModule(relativeEntry) {
+  const Module = require('node:module');
+  const esbuild = require('esbuild');
+  const root = path.resolve('.');
+  const result = esbuild.buildSync({
+    entryPoints: [path.join(root, relativeEntry)], absWorkingDir: root, bundle: true, write: false,
+    platform: 'node', format: 'cjs', target: 'node18', tsconfig: path.join(root, 'tsconfig.webview.json'), logLevel: 'silent'
+  });
+  const filename = path.join(root, `.test-gpt6-${path.basename(relativeEntry)}.cjs`);
+  const compiled = new Module(filename);
+  compiled.filename = filename;
+  compiled.paths = Module._nodeModulePaths(root);
+  compiled._compile(result.outputFiles[0].text, filename);
+  return compiled.exports;
+}
 
 const FAMILY = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
 const DATED_FAMILY = ['gpt-6-astra-2026-09-01', 'gpt-6-sol-2026-05-01', 'gpt-6-luna-2026-06-01'];
@@ -140,4 +159,103 @@ test('dry-run：Sol / Luna 在官方渠道按 per-tool 声明编码 async:true�
     settings: async () => providerConfig({ baseUrl: 'https://relay.example/v1' })
   })).body;
   assert.equal('async' in relay.tools.find((tool) => tool.name === 'probe'), false);
+});
+
+const officialCapability = (modelId, provider = 'openai-responses') => modelCapabilities.resolveModelCapabilities({
+  provider, modelId, baseUrl: OFFICIAL, providerConfigId: 'channel', transport: 'http'
+});
+
+test('推理强度表：Astra 为 low…max 且不支持 none、官方未写默认值；Sol / Luna 为 none…max、默认 medium', () => {
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of ['gpt-6-astra', 'gpt-6-astra-2026-09-01']) {
+      assert.deepEqual(officialCapability(model, provider).reasoning, {
+        family: 'openai_effort', levels: ['low', 'medium', 'high', 'xhigh', 'max'], supportsBudget: false,
+        canDisable: false, alwaysOn: true, outputLimitIncludesThinking: true, requiresThoughtSignatures: true
+      }, `${provider}:${model}`);
+    }
+    for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-sol-2026-05-01']) {
+      assert.deepEqual(officialCapability(model, provider).reasoning, {
+        family: 'openai_effort', levels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultLevel: 'medium',
+        supportsBudget: false, canDisable: true, alwaysOn: false, outputLimitIncludesThinking: true, requiresThoughtSignatures: true
+      }, `${provider}:${model}`);
+    }
+  }
+  // gpt-6-astra-pro 不是官方模型 id（pro 是 reasoning.mode），与网关别名一样按未知处理。
+  for (const model of ['gpt-6-astra-pro', 'gpt-6-sol-xhigh', 'gpt-6']) {
+    assert.equal(officialCapability(model).reasoning.family, 'none', model);
+  }
+});
+
+test('推理强度表：其他 OpenAI 模型的能力快照逐字节不变', () => {
+  const expected = {
+    'gpt-5': ['minimal', 'low', 'medium', 'high'],
+    'gpt-5-mini': ['minimal', 'low', 'medium', 'high'],
+    'gpt-5.1': ['none', 'low', 'medium', 'high'],
+    'gpt-5.2': ['none', 'low', 'medium', 'high', 'xhigh'],
+    'gpt-5.4-2026-03-05': ['none', 'low', 'medium', 'high', 'xhigh']
+  };
+  for (const [model, levels] of Object.entries(expected)) {
+    const none = levels.includes('none');
+    assert.equal(JSON.stringify(officialCapability(model).reasoning), JSON.stringify({
+      family: 'openai_effort', levels, supportsBudget: false, canDisable: none, alwaysOn: !none,
+      outputLimitIncludesThinking: true, requiresThoughtSignatures: true
+    }), model);
+  }
+  for (const model of ['gpt-5.5', 'gpt-5.6', 'gpt-5.6-sol']) assert.equal(officialCapability(model).reasoning.family, 'none', model);
+});
+
+test('摘要推理预设按新表映射：Astra maximum → max、不能关闭；Sol / Luna 可以关闭', () => {
+  const reason = (model, mode, thinkingConfig) => modelCapabilities.resolveSummaryReasoning({
+    capabilities: officialCapability(model), mode,
+    methodGenerationConfig: thinkingConfig ? { thinkingConfig } : undefined,
+    inheritedGenerationConfig: { thinkingConfig: { thinkingLevel: 'high' } }
+  });
+  assert.deepEqual(reason('gpt-6-astra', 'maximum').requestBody, { reasoning: { effort: 'max' } });
+  assert.deepEqual(reason('gpt-6-astra', 'economy').requestBody, { reasoning: { effort: 'low' } });
+  assert.equal(reason('gpt-6-astra', 'disabled').status, 'unsupported');
+  assert.equal(reason('gpt-6-astra', 'explicit', { thinkingLevel: 'none' }).status, 'unsupported');
+  assert.equal(reason('gpt-6-astra', 'explicit', { thinkingLevel: 'xhigh' }).status, 'applied');
+  for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+    assert.deepEqual(reason(model, 'disabled').requestBody, { reasoning: { effort: 'none' } }, model);
+    assert.deepEqual(reason(model, 'maximum').requestBody, { reasoning: { effort: 'max' } }, model);
+    assert.equal(reason(model, 'explicit', { thinkingLevel: 'minimal' }).status, 'unsupported', model);
+  }
+});
+
+test('会话思考选项：Sol / Luna 在 openai-responses 与 openai-compatible 下都可选 none…max', () => {
+  const { sessionThinkingCapability } = sessionThinking;
+  const range = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-luna-2026-06-01', 'GPT-6-Sol']) {
+      assert.deepEqual(sessionThinkingCapability(provider, model), { kind: 'openai-effort', values: range }, `${provider}:${model}`);
+    }
+  }
+  // Astra 保持原样：openai-responses 为 low…max，openai-compatible 跟随渠道配置。
+  assert.deepEqual(sessionThinkingCapability('openai-responses', 'gpt-6-astra'),
+    { kind: 'openai-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] });
+  assert.equal(sessionThinkingCapability('openai-compatible', 'gpt-6-astra'), undefined);
+  // 网关别名与其他模型不变。
+  for (const model of ['gpt-6-sol-xhigh', '[az]gpt-6-luna', 'gpt-5.6-sol']) {
+    assert.equal(sessionThinkingCapability('openai-responses', model), undefined, model);
+  }
+  assert.deepEqual(sessionThinkingCapability('openai-responses', 'gpt-5.2'),
+    { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh'] });
+});
+
+test('设置界面思考强度选项按新表过滤，Sol / Luna 默认 medium', () => {
+  const { parameterDefinitionsForProvider } = loadWebviewModule('webview/src/components/settings/global/parameters/llmParameterDefinitions.ts');
+  const thinking = (model, provider = 'openai-responses') => parameterDefinitionsForProvider(provider, model, officialCapability(model, provider))
+    .find((definition) => definition.key === 'thinkingLevel');
+  const astra = thinking('gpt-6-astra');
+  assert.deepEqual(astra.options.map((option) => option.value), ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(astra.defaultValue, 'low');
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+      const definition = thinking(model, provider);
+      assert.deepEqual(definition.options.map((option) => option.value), ['none', 'low', 'medium', 'high', 'xhigh', 'max'], model);
+      assert.equal(definition.defaultValue, 'medium', model);
+    }
+  }
+  assert.deepEqual(thinking('gpt-5.2').options.map((option) => option.value), ['none', 'low', 'medium', 'high', 'xhigh']);
+  assert.equal(thinking('gpt-5.2').defaultValue, 'none');
 });
