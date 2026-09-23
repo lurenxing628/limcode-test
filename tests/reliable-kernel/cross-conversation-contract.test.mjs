@@ -138,6 +138,7 @@ test('paged reads: the contract numbers are the code constants, every page fits 
   const rendered = renderRuntimeDeliveryModelEnvelope({ kind: 'collaboration_message', sourceId: 'message-one', messageId: 'message-one',
     deliveryId: 'delivery', inboxItemId: 'inbox', targetTurnId: 'turn', status: 'submitted', deliveredAt: '2026-09-23T00:00:00.000Z',
     note: RUNTIME_DELIVERY_MODEL_NOTE, sourceConversationId: 'sender', targetConversationId: 'recipient', sourceKind: 'tool', mode: 'followup',
+    delivery: 'followup_task', senderKind: 'other_conversation', senderTitle: 'Sender',
     replyToMessageId: null, content: 'long task. '.repeat(4000) }, undefined, catalog);
   assert.match(rendered, new RegExp(`${pagingTool} with messageRef=M1 and offset=0`));
   assert.match(messageText.preview, new RegExp(`marker-names-the-exact-call-${pagingTool}-with-messageRef-and-offset=0`));
