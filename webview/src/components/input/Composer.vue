@@ -1053,68 +1053,70 @@ function middleEllipsis(value: string, maxLength: number): string {
           :model="confirmedEffectiveModel?.model"
         />
       </div>
-      <span
-        v-if="interruptPhase"
-        class="composer-interrupt-status"
-        data-testid="turn-interrupt-status"
-        role="status"
-      >{{ interruptPhase === 'stopping' ? '正在停止' : '正在请求停止' }}</span>
-      <HoverTooltipPanel
-        v-if="session.status === 'ready'"
-        class="composer-runtime-tooltip"
-        panel-title="连接状态"
-        :rows="runtimeDiagnosticRows"
-        :delay-ms="180"
-      >
-        <button
-          type="button"
-          class="composer-runtime-badge"
-          :class="{ 'is-websocket': activeTransport === 'websocket', 'is-reload-required': runtimeReloadRequired }"
-          :aria-label="runtimeDiagnosticAriaLabel"
+      <div class="composer-actions">
+        <span
+          v-if="interruptPhase"
+          class="composer-interrupt-status"
+          data-testid="turn-interrupt-status"
+          role="status"
+        >{{ interruptPhase === 'stopping' ? '正在停止' : '正在请求停止' }}</span>
+        <HoverTooltipPanel
+          v-if="session.status === 'ready'"
+          class="composer-runtime-tooltip"
+          panel-title="连接状态"
+          :rows="runtimeDiagnosticRows"
+          :delay-ms="180"
         >
-          {{ runtimeBadgeLabel }}
-        </button>
-      </HoverTooltipPanel>
-      <ReliableContextStatus class="composer-token-usage" />
-      <button
-        type="button"
-        class="composer-compact"
-        data-testid="compression-start-current"
-        :disabled="!canCompressCurrentContext"
-        aria-label="压缩当前上下文"
-        title="压缩当前上下文"
-        @click="compressCurrentContext"
-      >
-        <svg class="composer-compact-icon" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-          <path d="M5 5h14l-7 6zM5 19h14l-7-6z" />
-        </svg>
-      </button>
-      <HoverTooltipPanel
-        panel-title="从原始记录重建摘要"
-        :rows="[{ label: '来源', value: '当前上下文对应的原始对话和工具记录' }]"
-        :delay-ms="180"
-      >
+          <button
+            type="button"
+            class="composer-runtime-badge"
+            :class="{ 'is-websocket': activeTransport === 'websocket', 'is-reload-required': runtimeReloadRequired }"
+            :aria-label="runtimeDiagnosticAriaLabel"
+          >
+            {{ runtimeBadgeLabel }}
+          </button>
+        </HoverTooltipPanel>
+        <ReliableContextStatus class="composer-token-usage" />
         <button
           type="button"
           class="composer-compact"
-          data-testid="compression-rebuild-current"
-          :disabled="!canCompressCurrentContext || !currentContextRootId"
-          aria-label="从原始记录重建摘要"
-          @click="beginSummaryRebuild"
+          data-testid="compression-start-current"
+          :disabled="!canCompressCurrentContext"
+          aria-label="压缩当前上下文"
+          title="压缩当前上下文"
+          @click="compressCurrentContext"
         >
-          <IconHistory class="composer-send-icon" stroke="2" aria-hidden="true" />
+          <svg class="composer-compact-icon" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+            <path d="M5 5h14l-7 6zM5 19h14l-7-6z" />
+          </svg>
         </button>
-      </HoverTooltipPanel>
-      <button
-        type="button"
-        class="composer-send"
-        :disabled="conversationInputDisabled || !hasDraftContent"
-        :aria-label="sendTitle"
-        :title="sendTitle"
-        @click="submit"
-      >
-        <IconSend2 class="composer-send-icon" stroke="2" aria-hidden="true" />
-      </button>
+        <HoverTooltipPanel
+          panel-title="从原始记录重建摘要"
+          :rows="[{ label: '来源', value: '当前上下文对应的原始对话和工具记录' }]"
+          :delay-ms="180"
+        >
+          <button
+            type="button"
+            class="composer-compact"
+            data-testid="compression-rebuild-current"
+            :disabled="!canCompressCurrentContext || !currentContextRootId"
+            aria-label="从原始记录重建摘要"
+            @click="beginSummaryRebuild"
+          >
+            <IconHistory class="composer-send-icon" stroke="2" aria-hidden="true" />
+          </button>
+        </HoverTooltipPanel>
+        <button
+          type="button"
+          class="composer-send"
+          :disabled="conversationInputDisabled || !hasDraftContent"
+          :aria-label="sendTitle"
+          :title="sendTitle"
+          @click="submit"
+        >
+          <IconSend2 class="composer-send-icon" stroke="2" aria-hidden="true" />
+        </button>
+      </div>
     </div>
     <ConfirmPanel
       :open="!!summaryRebuildTarget"
@@ -1195,6 +1197,17 @@ function middleEllipsis(value: string, maxLength: number): string {
 .composer-zone-bottom {
   justify-content: flex-end;
   align-items: center;
+  /* Narrow panels: the selectors keep the first line and the status/send group moves below as a unit, never overlapping. */
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+.composer-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 .composer-edit-indicator {
@@ -1393,13 +1406,14 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-meta {
-  flex: 1 1 auto;
+  flex: 1 1 220px;
   min-width: 0;
   margin-right: auto;
   overflow: visible;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-1);
+  gap: 2px var(--space-1);
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-sm);
   line-height: 1.4;

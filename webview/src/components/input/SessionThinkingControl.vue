@@ -40,7 +40,7 @@ const options = computed<SettingsDropdownOption[]>(() => {
     value: 'default',
     label: defaultLabel.value,
     buttonLabel: channelValue.value && channelValue.value !== UNSET_THINKING_LABEL ? `思考：跟随渠道（${channelValue.value}）` : '思考：跟随渠道',
-    description: '不单独设置，使用渠道或模型高级配置里的思考强度'
+    description: '使用渠道或模型高级配置里的设置'
   }];
   const supported = capability.value;
   if (!supported) return result;
@@ -145,8 +145,9 @@ function retry(): void {
 </template>
 
 <style scoped>
-.session-thinking-control { display: inline-flex; align-items: center; flex-wrap: nowrap; gap: 6px; min-width: 0; }
-.session-thinking-dropdown { width: min(190px, 28vw); min-width: 112px; --lc-dropdown-transform-origin: bottom left; }
+.session-thinking-control { display: inline-flex; align-items: center; flex-wrap: nowrap; gap: 6px; min-width: 0; max-width: 100%; }
+/* Sized by its label (up to 260px) so the chosen strength stays readable; longer labels end with an ellipsis. */
+.session-thinking-dropdown { width: max-content; max-width: min(260px, 100%); min-width: 96px; --lc-dropdown-transform-origin: bottom left; --lc-dropdown-offset-y: 4px; }
 /* Same quiet look as the neighbouring Agent / channel / directory selectors in the composer. */
 .session-thinking-dropdown :deep(button.settings-dropdown-button) {
   min-height: 24px; padding: 2px 6px; border-color: transparent; background: transparent;

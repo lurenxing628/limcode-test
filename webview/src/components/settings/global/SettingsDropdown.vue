@@ -310,10 +310,15 @@ button.settings-dropdown-button:active {
   display: none;
 }
 
+/* Stays visible at the bottom of the panel while the options scroll. */
 .settings-dropdown-footer {
-  margin-top: var(--space-1);
+  position: sticky;
+  bottom: calc(-1 * var(--space-2));
+  z-index: 1;
+  margin: var(--space-1) 0 calc(-1 * var(--space-2));
   border-top: 1px solid var(--vscode-panel-border);
-  padding-top: var(--space-2);
+  padding: var(--space-2) 0;
+  background: var(--vscode-editor-background);
 }
 
 .settings-dropdown-panel .project-dropdown-title {
