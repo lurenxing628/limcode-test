@@ -38,6 +38,7 @@ import { ProcessControlPlane } from './processEffects';
 import { ChildOwnedProcessCleanupControlPlane } from './childOwnedProcessCleanup';
 import {
   ProcessCompletionDeliveryControlPlane,
+  type ProcessCompletionDeliveryOptions,
   type ProcessCompletionWakeHandler
 } from './processCompletionDelivery';
 import { RootAuthority } from './rootAuthority';
@@ -93,6 +94,8 @@ export interface ReliableKernelApplicationDependencies {
   diagnosticObserver?: ReliableDiagnosticObserver;
   runtimeBuildInfo?: () => RuntimeBuildInfoRecord;
   processCompletionWakeHandler?: ProcessCompletionWakeHandler;
+  /** Scanner pacing for the durable wake outbox; production keeps the defaults. */
+  processCompletionDelivery?: Pick<ProcessCompletionDeliveryOptions, 'scanIntervalMs' | 'retryBaseMs' | 'maxFailureCount'>;
   now?: () => string;
 }
 
@@ -225,6 +228,7 @@ export class ReliableKernelApplication {
       this.runtime.deliveries,
       {
         ...options,
+        ...dependencies.processCompletionDelivery,
         wakeHandler: dependencies.processCompletionWakeHandler,
         onError: ({ scope, id, error }) => dependencies.diagnosticObserver?.observe({
           eventKind: 'process.completion_delivery.failed',

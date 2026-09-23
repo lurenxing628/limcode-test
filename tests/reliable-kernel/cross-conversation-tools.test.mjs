@@ -102,6 +102,9 @@ async function fixture(send, run, { enabled = true, switchValue = true } = {}) {
     app = await kernel.ReliableKernelApplication.open(rootAuthority, {
       authorityCompiler: configuration, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
       resolveWorkEnvironment: async () => undefined,
+      // No level-trigger polling within a test: queued work must start from the commit that ends the
+      // target Turn, not from a periodic rescan.
+      processCompletionDelivery: { scanIntervalMs: 60000 },
       mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { throw new Error('External tool calls are forbidden in this fixture.'); } },
       mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
       providers: { resolve(providerId) { return { providerId, async sendFullRequest(request, controls) {
