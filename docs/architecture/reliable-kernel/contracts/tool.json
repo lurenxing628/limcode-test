@@ -364,7 +364,7 @@
       "otherwise": "command"
     },
     "approval": "复用 ToolPolicy 与 PlanReviewPolicy，不建 MCP 专用审批权威；明确拒绝持久化rejected Tool facts且不创建Attempt/EffectIntent。",
-    "sourceAdmission": "MCP工具按冻结ToolPolicy.sourceConfigs准入：已启用来源准入其未禁用的工具，禁用来源一律拒绝，没有任何层配置的来源回落到allowedTools；内置只读Agent与工作流携带全来源拒绝'*'，该范围保存无列表记录时仍保留，该范围自己保存的'*'值不覆盖它，保存的'*'不是对象时按拒绝处理，更具体的层和列表都不能重新开启，只有该Agent或工作流自己的sourceConfigs能开启某个来源；工具提供、派发准入、Provider适配器、token估算、MCP policy gate与设置页共用toolAllowedByPolicy。",
+    "sourceAdmission": "MCP工具只按冻结ToolPolicy.sourceConfigs准入，按来源id加原始工具名识别，不用给模型看的显示名：已启用来源准入其未禁用的工具，禁用来源和没有任何层配置的来源一律拒绝，allowedTools从不准入MCP工具；disabledTools保存原始工具名，逐工具配置保存在toolConfigs的'mcp:<来源id>/<原始工具名>'键下；内置只读Agent与工作流携带全来源拒绝'*'，该范围保存无列表记录时仍保留，该范围自己保存的'*'值不覆盖它，保存的'*'不是对象时按拒绝处理，更具体的层和列表都不能重新开启，只有该Agent或工作流自己的sourceConfigs能开启某个来源；工具提供、派发准入、Provider适配器、token估算、MCP policy gate与设置页共用toolAllowedByPolicy。",
     "errorMapping": "adapter明确not_dispatched/explicit_failure或协议isError写failed；只有dispatch后无法证明结果的transport断裂写outcome_unknown。",
     "crashRule": "派发后无法向 MCP server 查询同一调用结果时写 outcome_unknown，不自动重试。",
     "resultRule": "终态经 EffectReceipt -> ToolOutcome -> 唯一 ToolModelResult；连接重建不等于调用恢复。"

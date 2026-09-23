@@ -24,7 +24,14 @@ import {
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE, PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import { BACKGROUND_ASK_USER_AUTO_ANSWER } from '../../shared/askUser';
 import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
-import { crossConversationSwitchOn, crossConversationToolPermitted, toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
+import {
+  crossConversationSwitchOn,
+  crossConversationToolPermitted,
+  toolAllowedByPolicy,
+  toolConfigFor,
+  toolConfigKey,
+  type ToolPolicyTool
+} from '../../shared/toolPolicyResolution';
 import {
   mapSettledWithBoundedAdmissionConcurrency,
   mapSettledWithBoundedConcurrency,
@@ -595,11 +602,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
           skipProviderDefinitionCheck: true,
           deferNoEffectSettlement: false,
           definitions: preflight.definitions,
-          authority: {
-            snapshotId: preflight.baseAuthority.snapshotId,
-            document: preflight.baseAuthority.document,
-            ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
-          },
+          authority: callAuthority(preflight.baseAuthority, policy, callTool(preflight.definitions, input.toolName)),
           ...(specialAdmission ? { specialAdmission } : {})
         });
       } catch (error) {
@@ -650,11 +653,11 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       : available;
     const nativeAsyncTools = turnId === undefined
       ? undefined
-      : nativeAsyncEnabledTools(await this.readAuthority(turnId, 'tool-definitions'));
+      : nativeAsyncEnabledTools(await this.readAuthority(turnId));
     return definitions.map((definition) => {
       const name = requireText(definition.declaration.name, 'Tool declaration.name');
       const metadata = nativeAsyncToolMetadata(
-        name,
+        toolConfigKey(definition.declaration),
         definition.declaration.metadata
           ? normalizePlainJson(definition.declaration.metadata, `Tool ${name} metadata`)
           : undefined,
@@ -693,7 +696,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       throw new Error('freezeCalls requires every Provider call to belong to the same Turn.');
     }
     const [authority, liveDefinitions] = await Promise.all([
-      this.readAuthority(turnId, 'tool-definitions'),
+      this.readAuthority(turnId),
       this.dependencies.host.definitions()
     ]);
     const policy = authorityPolicy(authority.document);
@@ -706,11 +709,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       const live = liveCandidate && sameToolSource(liveCandidate.declaration.source, input.definition.source)
         ? liveCandidate
         : undefined;
-      return this.freezeDecision(input, live, {
-        snapshotId: authority.snapshotId,
-        document: authority.document,
-        ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
-      });
+      return this.freezeDecision(input, live, callAuthority(authority, policy,
+        { name: input.definition.name, source: plainOptionalRecord(input.definition.source) }));
     });
     this.rememberPreparedProviderBatch(inputs, decisions, liveDefinitions, authority);
     return decisions;
@@ -1046,7 +1046,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
 
     const [definitions, baseAuthority, preflight] = await Promise.all([
       this.dependencies.host.definitions(),
-      this.readAuthority(turnId, 'tool-definitions'),
+      this.readAuthority(turnId),
       this.dependencies.database.snapshot(inputs.flatMap((input) => [
         DOMAIN_REPOSITORIES.domain('ToolCall').get(input.toolCallId),
         DOMAIN_REPOSITORIES.domain('Operation').list({ where: { tool_call_id: input.toolCallId }, limit: 1 }),
@@ -1098,13 +1098,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         internalCallIds.add(inputs[index].toolCallId);
         const definition = definitionsByName.get(inputs[index].toolName);
         if (definition) {
-          const authority: ReliableToolDispatchAuthority = {
-            snapshotId: baseAuthority.snapshotId,
-            document: baseAuthority.document,
-            ...(policy.toolConfigs[inputs[index].toolName]
-              ? { toolConfig: policy.toolConfigs[inputs[index].toolName] }
-              : {})
-          };
+          const authority = callAuthority(baseAuthority, policy, definition.declaration);
           frozenDecisionsById.set(inputs[index].toolCallId, this.freezeDecision({
             ...inputs[index],
             definition: reliableDefinitionFromTool(definition)
@@ -1241,11 +1235,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
           skipProviderDefinitionCheck: true,
           deferNoEffectSettlement: !isAttachmentReadInput(input),
           definitions,
-          authority: {
-            snapshotId: baseAuthority.snapshotId,
-            document: baseAuthority.document,
-            ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
-          },
+          authority: callAuthority(baseAuthority, policy, callTool(definitions, input.toolName)),
           ...(admission ? { specialAdmission: admission } : {})
         });
       } catch (error) {
@@ -1414,7 +1404,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       ? undefined
       : await this.providerDefinitionMismatch(input, definition);
     if (definitionMismatch) return this.reject(input, definitionMismatch);
-    const authority = options.authority ?? await this.readAuthority(input.turnId, input.toolName);
+    const authority = options.authority ?? await this.readAuthority(input.turnId, definition.declaration);
     const policy = authorityPolicy(authority.document);
     if (isCrossConversationTool(input.toolName)) {
       if (!crossConversationSwitchOn(policy.toolConfigs) || !await this.topLevelTurn(input.turnId)) {
@@ -2068,7 +2058,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     definitions: ToolDefinition[],
     turnId: string
   ): Promise<ToolDefinition[]> {
-    const authority = await this.readAuthority(turnId, 'tool-definitions');
+    const authority = await this.readAuthority(turnId);
     const toolPolicy = authorityPolicy(authority.document);
     const workEnvironmentPolicy = authorityWorkEnvironmentPolicy(authority.document);
     const runAgentDefinition = definitions.find((definition) =>
@@ -2229,7 +2219,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     return next;
   }
 
-  private async readAuthority(turnId: string, toolName: string): Promise<ReliableToolDispatchAuthority> {
+  /** The Turn's frozen authority, with one tool's per-tool settings when a tool is named. */
+  private async readAuthority(turnId: string, tool?: ToolPolicyTool): Promise<ReliableToolDispatchAuthority> {
     let cached = this.authorityCache.get(turnId);
     if (!cached) {
       cached = (async () => {
@@ -2257,12 +2248,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       if (this.authorityCache.get(turnId) === cached) this.authorityCache.delete(turnId);
       throw error;
     }
-    const policy = authorityPolicy(base.document);
-    return {
-      snapshotId: base.snapshotId,
-      document: base.document,
-      ...(policy.toolConfigs[toolName] ? { toolConfig: policy.toolConfigs[toolName] } : {})
-    };
+    return callAuthority(base, authorityPolicy(base.document), tool);
   }
 
   private async reject(
@@ -2678,7 +2664,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     }
     const childPlan = memberships.length === 1;
     if (!childPlan) {
-      const frozen = authority ?? await this.readAuthority(input.turnId, toolName);
+      const frozen = authority ?? await this.readAuthority(input.turnId);
       if (!frozenInteractionAutoApproval(frozen.document, toolName)) return undefined;
     }
     if (await this.turnTerminationRequested(input.turnId)) return undefined;
@@ -2807,6 +2793,24 @@ function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {
   };
 }
 
+/**
+ * The authority one call runs under: the frozen document plus the tool's own per-tool settings,
+ * found by `toolConfigKey` (an MCP tool by source id and original name, never its display name).
+ */
+function callAuthority(
+  base: { snapshotId: string; document: PlainJsonValue },
+  policy: ReturnType<typeof authorityPolicy>,
+  tool: ToolPolicyTool | undefined
+): ReliableToolDispatchAuthority {
+  const toolConfig = tool ? toolConfigFor(policy.toolConfigs, tool) : undefined;
+  return { snapshotId: base.snapshotId, document: base.document, ...(toolConfig ? { toolConfig } : {}) };
+}
+
+/** The declaration a call names, which carries the identity its per-tool settings are keyed by. */
+function callTool(definitions: readonly ToolDefinition[], toolName: string): ToolPolicyTool {
+  return definitions.find((definition) => definition.declaration.name === toolName)?.declaration ?? { name: toolName };
+}
+
 /** The shared frozen-policy rule; MCP tools follow their source settings, including all-sources denies. */
 function definitionAllowedByAuthority(
   policy: ReturnType<typeof authorityPolicy>,
@@ -2816,9 +2820,9 @@ function definitionAllowedByAuthority(
 }
 
 /**
- * Frozen-policy native async opt-in set. Only tools explicitly configured with nativeAsync:true
- * may ever be declared async on a native channel; false/missing policy means synchronous, and a
- * declaration-carried flag is never enough on its own.
+ * Frozen-policy native async opt-in set, by `toolConfigKey`. Only tools explicitly configured with
+ * nativeAsync:true may ever be declared async on a native channel; false/missing policy means
+ * synchronous, and a declaration-carried flag is never enough on its own.
  */
 function nativeAsyncEnabledTools(authority: ReliableToolDispatchAuthority): ReadonlySet<string> {
   const enabled = new Set<string>();

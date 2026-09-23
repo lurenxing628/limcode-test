@@ -142,6 +142,41 @@ export function crossConversationToolPermitted(allowedTools: ReadonlySet<string>
 
 const RUN_AGENT_TOOL_NAME = 'run_agent';
 
+/** The parts of a tool that identify it to the tool policy. */
+export interface ToolPolicyTool {
+  name: string;
+  source?: { kind?: unknown; sourceId?: unknown; originalToolName?: unknown } | null;
+}
+
+/**
+ * An MCP tool's stable identity: its source id and the name the server itself gives the tool. The
+ * display name the model sees can move to another server's tool when servers connect, disconnect or
+ * are removed, so no saved setting uses it.
+ */
+export function mcpToolIdentity(tool: ToolPolicyTool): { sourceId: string; toolName: string } | undefined {
+  if (tool.source?.kind !== 'mcp') return undefined;
+  const sourceId = typeof tool.source.sourceId === 'string' ? tool.source.sourceId.trim() : '';
+  const toolName = typeof tool.source.originalToolName === 'string' ? tool.source.originalToolName : '';
+  return sourceId && toolName ? { sourceId, toolName } : undefined;
+}
+
+/**
+ * The key a tool's per-tool settings are saved under in `toolConfigs`: a built-in tool's name, and
+ * for an MCP tool `mcp:<source id>/<original tool name>` (the source id URI-encoded so the key
+ * splits one way only). An MCP tool without an identity gets no key that any saved entry uses.
+ */
+export function toolConfigKey(tool: ToolPolicyTool): string {
+  if (tool.source?.kind !== 'mcp') return tool.name;
+  const identity = mcpToolIdentity(tool);
+  return identity ? `mcp:${encodeURIComponent(identity.sourceId)}/${identity.toolName}` : '';
+}
+
+/** One tool's resolved per-tool settings, found by `toolConfigKey`. */
+export function toolConfigFor<T>(toolConfigs: Readonly<Record<string, T>> | undefined, tool: ToolPolicyTool): T | undefined {
+  const key = toolConfigKey(tool);
+  return key && toolConfigs && Object.prototype.hasOwnProperty.call(toolConfigs, key) ? toolConfigs[key] : undefined;
+}
+
 /** The source settings that decide one MCP source: its own entry, else an all-sources deny. */
 export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): ToolPolicySourceConfigRecord | undefined {
   if (!isPlainRecord(sourceConfigs)) return undefined;
@@ -159,28 +194,28 @@ export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): To
  * Whether a resolved (frozen) ToolPolicy admits one tool. A built-in tool needs its name in the
  * list, except the cross-conversation tools: the switch in the per-tool settings grants them, with
  * the run_agent rule of `crossConversationToolPermitted`, whatever the list names. An MCP tool
- * follows its source settings: an enabled source admits every tool it does not disable, a disabled
- * or denied source admits none, and a source no layer configures falls back to the list. Offering,
- * dispatch admission, the provider adapter, the token estimate, the MCP policy gate and the
- * settings view all use this; offering and admission also keep the cross-conversation tools to
- * top-level conversations.
+ * follows only its source settings, by source id and original tool name (`mcpToolIdentity`): an
+ * enabled source admits every tool it does not disable, and a disabled, denied or unconfigured
+ * source admits none; tool lists never admit an MCP tool. Offering, dispatch admission, the
+ * provider adapter, the token estimate, the MCP policy gate and the settings view all use this;
+ * offering and admission also keep the cross-conversation tools to top-level conversations.
  */
 export function toolAllowedByPolicy(
   policy: { allowedTools: ReadonlySet<string> | readonly string[]; sourceConfigs?: unknown; toolConfigs?: unknown },
-  tool: { name: string; source?: { kind?: unknown; sourceId?: unknown } | null }
+  tool: ToolPolicyTool
 ): boolean {
-  const sourceId = tool.source?.kind === 'mcp' && typeof tool.source.sourceId === 'string' ? tool.source.sourceId.trim() : '';
-  if (!sourceId && tool.source?.kind !== 'mcp' && isSwitchGrantedTool(tool.name)) {
+  if (tool.source?.kind === 'mcp') {
+    const identity = mcpToolIdentity(tool);
+    const config = identity ? mcpSourceConfigFor(policy.sourceConfigs, identity.sourceId) : undefined;
+    if (!identity || !config?.enabled) return false;
+    return !(config.disabledTools ?? []).includes(identity.toolName);
+  }
+  if (isSwitchGrantedTool(tool.name)) {
     return crossConversationSwitchOn(policy.toolConfigs) && crossConversationToolPermitted(policy.allowedTools, tool.name);
   }
-  const explicitlyAllowed = Array.isArray(policy.allowedTools)
+  return Array.isArray(policy.allowedTools)
     ? policy.allowedTools.includes(tool.name)
     : (policy.allowedTools as ReadonlySet<string>).has(tool.name);
-  if (!sourceId) return explicitlyAllowed;
-  const config = mcpSourceConfigFor(policy.sourceConfigs, sourceId);
-  if (!config) return explicitlyAllowed;
-  if (!config.enabled) return false;
-  return !(config.disabledTools ?? []).includes(tool.name);
 }
 
 /**

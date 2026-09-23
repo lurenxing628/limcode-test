@@ -12,7 +12,7 @@ import type {
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
 import { ASK_USER_TOOL_NAME, EDIT_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
-import { isSwitchGrantedTool, mcpSourceConfigFor, toolAllowedByPolicy } from '@shared/toolPolicyResolution';
+import { isSwitchGrantedTool, mcpSourceConfigFor, toolAllowedByPolicy, toolConfigKey } from '@shared/toolPolicyResolution';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
@@ -359,15 +359,18 @@ function cloneSourceConfigs(): Record<string, ToolPolicySourceConfigRecord> {
   return cloneSourceConfigRecords(localResolution.value.policy?.sourceConfigs) ?? {};
 }
 
-/** This scope's own config values for one tool; a field edit adds to these only. */
+/**
+ * This scope's own config values for one tool; a field edit adds to these only. Per-tool settings
+ * are keyed by `toolConfigKey`: an MCP tool by server id and original name, never its display name.
+ */
 function localConfigForTool(tool: ToolDefinitionRecord): ToolConfigRecord {
-  return { ...(localResolution.value.policy?.toolConfigs?.[tool.name]?.config ?? {}) };
+  return { ...(localResolution.value.policy?.toolConfigs?.[toolConfigKey(tool)]?.config ?? {}) };
 }
 
 function configForTool(tool: ToolDefinitionRecord): ToolConfigRecord {
   return {
     ...(tool.defaultConfig ?? {}),
-    ...(effectivePolicy.value?.toolConfigs?.[tool.name]?.config ?? {})
+    ...(effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.config ?? {})
   };
 }
 
@@ -385,7 +388,7 @@ function updateStringListField(tool: ToolDefinitionRecord, field: ToolConfigFiel
     [field.key]: value.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean)
   });
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
+  nextConfigs[toolConfigKey(tool)] = { ...(nextConfigs[toolConfigKey(tool)] ?? {}), config };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
@@ -393,7 +396,7 @@ function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRec
   if (editsBlocked.value) return;
   const config = sanitizeConfigForTool(tool, { ...localConfigForTool(tool), [field.key]: value });
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
+  nextConfigs[toolConfigKey(tool)] = { ...(nextConfigs[toolConfigKey(tool)] ?? {}), config };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
@@ -402,15 +405,15 @@ type ToolGateSettingKey = 'autoApproveExecution' | 'autoApplyChange' | 'autoSubm
 function updateGateSetting(tool: ToolDefinitionRecord, key: ToolGateSettingKey, value: boolean): void {
   if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: {} }),
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
     [key]: value
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function toolGateValue(tool: ToolDefinitionRecord, key: ToolGateSettingKey): boolean {
-  const configValue = effectivePolicy.value?.toolConfigs?.[tool.name]?.[key];
+  const configValue = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.[key];
   if (configValue !== undefined) return configValue;
   if (key === 'autoApproveExecution') return tool.metadata?.defaultAutoApproveExecution ?? true;
   if (key === 'autoApplyChange') return tool.metadata?.defaultAutoApplyChange ?? true;
@@ -419,14 +422,14 @@ function toolGateValue(tool: ToolDefinitionRecord, key: ToolGateSettingKey): boo
 
 /** 原生异步与执行审批、结果回传、调度预设相互独立；只有显式开启才生效。 */
 function nativeAsyncValue(tool: ToolDefinitionRecord): boolean {
-  return effectivePolicy.value?.toolConfigs?.[tool.name]?.nativeAsync === true;
+  return effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.nativeAsync === true;
 }
 
 function updateNativeAsync(tool: ToolDefinitionRecord, value: boolean): void {
   if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: {} }),
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
     nativeAsync: value
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
@@ -443,15 +446,15 @@ function supportsDiffPreview(tool: ToolDefinitionRecord): boolean {
 function updateAutoApplyChangeDelay(tool: ToolDefinitionRecord, value: number): void {
   if (editsBlocked.value || !supportsChangeApply(tool)) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: {} }),
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
     autoApplyChangeDelaySeconds: Math.min(600, Math.max(0, Math.floor(value)))
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function autoApplyChangeDelayValue(tool: ToolDefinitionRecord): number {
-  const value = effectivePolicy.value?.toolConfigs?.[tool.name]?.autoApplyChangeDelaySeconds;
+  const value = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.autoApplyChangeDelaySeconds;
   if (typeof value === 'number' && Number.isFinite(value)) return Math.min(600, Math.max(0, Math.floor(value)));
   const defaultValue = tool.metadata?.defaultAutoApplyChangeDelaySeconds;
   return typeof defaultValue === 'number' && Number.isFinite(defaultValue)
@@ -462,15 +465,15 @@ function autoApplyChangeDelayValue(tool: ToolDefinitionRecord): number {
 function updateDisplayAutoExpand(tool: ToolDefinitionRecord, value: boolean): void {
   if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: {} }),
-    display: { ...(nextConfigs[tool.name]?.display ?? {}), autoExpand: value }
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
+    display: { ...(nextConfigs[toolConfigKey(tool)]?.display ?? {}), autoExpand: value }
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function displayAutoExpandValue(tool: ToolDefinitionRecord): boolean {
-  const display = effectivePolicy.value?.toolConfigs?.[tool.name]?.display;
+  const display = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.display;
   if (display?.autoExpand !== undefined) return display.autoExpand;
   return tool.metadata?.defaultAutoExpand === true;
 }
@@ -478,16 +481,16 @@ function displayAutoExpandValue(tool: ToolDefinitionRecord): boolean {
 function updateDisplayAutoOpenDiffPreview(tool: ToolDefinitionRecord, value: boolean): void {
   if (editsBlocked.value || !supportsDiffPreview(tool)) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: {} }),
-    display: { ...(nextConfigs[tool.name]?.display ?? {}), autoOpenDiffPreview: value }
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
+    display: { ...(nextConfigs[toolConfigKey(tool)]?.display ?? {}), autoOpenDiffPreview: value }
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function displayAutoOpenDiffPreviewValue(tool: ToolDefinitionRecord): boolean {
   if (!supportsDiffPreview(tool)) return false;
-  const display = effectivePolicy.value?.toolConfigs?.[tool.name]?.display;
+  const display = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.display;
   if (display?.autoOpenDiffPreview !== undefined) return display.autoOpenDiffPreview;
   return tool.metadata?.defaultAutoOpenDiffPreview === true;
 }

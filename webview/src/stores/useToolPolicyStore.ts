@@ -19,6 +19,7 @@ import {
   defaultToolNames,
   isSwitchGrantedTool,
   mcpSourceConfigFor,
+  mcpToolIdentity,
   resolveToolPolicyLayers,
   toolAllowedByPolicy,
   toolPolicyScopeLayer,
@@ -404,8 +405,8 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
      * from the default tool set or a built-in Agent list: transfer and switch_work_environment on
      * the main Agent. Agents without a list of their own gain those two as a result (both stay
      * behind the work-environment policy, which is off by default). Nothing else comes from other
-     * Agents: their MCP tools and the tools a user ticked on them stay theirs, since a name in an
-     * upper list would admit an MCP source no layer configures for every Agent.
+     * Agents: the tools a user ticked on them stay theirs. MCP tools never join a list; their source
+     * settings alone admit them.
      */
     listSeedFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): string[] {
       const listError = this.toolListErrorFor(scopeKind, scopeId);
@@ -464,10 +465,10 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     },
     /** Whether an upper layer keeps one MCP tool off here: its source is off above or the tool is disabled above. */
     mcpToolBlockedAbove(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, tool: ToolDefinitionRecord): boolean {
-      const sourceId = tool.source?.kind === 'mcp' ? tool.source.sourceId?.trim() : undefined;
-      if (!sourceId) return false;
-      if (this.mcpSourceBlockedAbove(scopeKind, scopeId, sourceId)) return true;
-      return (mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, sourceId)?.disabledTools ?? []).includes(tool.name);
+      const identity = mcpToolIdentity(tool);
+      if (!identity) return tool.source?.kind === 'mcp';
+      if (this.mcpSourceBlockedAbove(scopeKind, scopeId, identity.sourceId)) return true;
+      return (mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, identity.sourceId)?.disabledTools ?? []).includes(identity.toolName);
     },
     /**
      * The built-in read-only Agents and workflows above this scope whose all-sources deny is in the
@@ -486,8 +487,9 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
      */
     setMcpToolEnabledForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, tool: ToolDefinitionRecord, enabled: boolean): void {
       if (scopeKind !== 'global' && !scopeId?.trim()) return;
-      const sourceId = tool.source?.kind === 'mcp' ? tool.source.sourceId?.trim() : undefined;
-      if (!sourceId) return;
+      const identity = mcpToolIdentity(tool);
+      if (!identity) return;
+      const { sourceId } = identity;
       const listError = this.toolListErrorFor(scopeKind, scopeId);
       if (listError) throw new TypeError(listError.text);
       if (enabled && this.mcpToolBlockedAbove(scopeKind, scopeId, tool)) return;
@@ -495,15 +497,17 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       const ownList = this.ownListFor(scopeKind, scopeId);
       const effective = this.effectivePolicyFor(scopeKind, scopeId).policy;
       const inheritedDisabled = mcpSourceConfigFor(this.inheritedPolicyFor(scopeKind, scopeId).sourceConfigs, sourceId)?.disabledTools ?? [];
-      const sourceTools = this.toolDefinitions.filter((candidate) => candidate.source?.kind === 'mcp' && candidate.source.sourceId?.trim() === sourceId);
-      const on = new Set(sourceTools.filter((candidate) => toolAllowedByPolicy(effective, candidate)).map((candidate) => candidate.name));
-      if (enabled) on.add(tool.name);
-      else on.delete(tool.name);
-      const disabledTools = sourceTools.map((candidate) => candidate.name).filter((name) => !on.has(name) && !inheritedDisabled.includes(name));
+      const sourceTools = this.toolDefinitions.flatMap((candidate) => {
+        const candidateIdentity = mcpToolIdentity(candidate);
+        return candidateIdentity?.sourceId === sourceId ? [{ candidate, name: candidateIdentity.toolName }] : [];
+      });
+      const on = new Set(sourceTools.filter(({ candidate }) => toolAllowedByPolicy(effective, candidate)).map(({ name }) => name));
+      if (enabled) on.add(identity.toolName);
+      else on.delete(identity.toolName);
+      const disabledTools = sourceTools.map(({ name }) => name).filter((name) => !on.has(name) && !inheritedDisabled.includes(name));
       const sourceConfigs = cloneSourceConfigs(local?.sourceConfigs) ?? {};
       sourceConfigs[sourceId] = { enabled: true, ...(disabledTools.length > 0 ? { disabledTools } : {}) };
-      const allowedTools = ownList && !enabled ? ownList.filter((name) => name !== tool.name) : ownList;
-      this.setPolicyForScope(scopeKind, scopeId, allowedTools, local?.name, cloneToolConfigs(local?.toolConfigs), sourceConfigs);
+      this.setPolicyForScope(scopeKind, scopeId, ownList, local?.name, cloneToolConfigs(local?.toolConfigs), sourceConfigs);
     },
     /** A child task's conversation: cross-conversation tools are never offered there. */
     isChildConversation(conversationId: string | undefined): boolean {
@@ -531,8 +535,8 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     },
     /**
      * Saves one scope's record. `allowedTools` undefined saves a record without a list. A list never
-     * holds the cross-conversation tools: the switch grants them and the backend ignores their names
-     * in lists, so a save drops them.
+     * holds the cross-conversation tools (the switch grants them) or MCP tools (their source
+     * settings alone admit them); the backend ignores those names in lists, so a save drops them.
      */
     setPolicyForScope(
       scopeKind: ToolPolicyScopeKind,
@@ -544,7 +548,7 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       preset?: ToolPolicyPresetKind
     ): void {
       const clientState = useClientStateStore();
-      const validNames = new Set(clientState.toolDefinitions.map((tool) => tool.name));
+      const validNames = new Set(clientState.toolDefinitions.filter((tool) => tool.source?.kind !== 'mcp').map((tool) => tool.name));
       const sanitized = allowedTools
         ?.map((tool) => tool.trim())
         .filter((tool, index, list) => !!tool && validNames.has(tool) && !isSwitchGrantedTool(tool) && list.indexOf(tool) === index);

@@ -917,7 +917,7 @@ test('MCP 全来源拒绝只由内置只读范围携带，更具体的层不能�
     assert.deepEqual(policy.sourceConfigs, denyAll, `${policy.name} denies every MCP source`);
   }
   for (const policy of [blueprints.agents.main.toolPolicy, blueprints.agents.worker.toolPolicy]) assert.equal(policy.sourceConfigs, undefined);
-  const tool = (sourceId, name = `${sourceId}_tool`) => ({ name, source: { kind: 'mcp', sourceId } });
+  const tool = (sourceId, name = `${sourceId}_tool`) => ({ name, source: { kind: 'mcp', sourceId, originalToolName: name.slice(sourceId.length + 1) } });
   const builtin = blueprints.agents.explore.toolPolicy;
   const resolve = (...layers) => resolveToolPolicyLayers(layers.filter(Boolean), []);
   const global = { scopeKind: 'global', policy: { sourceConfigs: { exa: { enabled: true } } } };
@@ -938,14 +938,17 @@ test('MCP 全来源拒绝只由内置只读范围携带，更具体的层不能�
   assert.ok(listed.allowedTools.includes('third_tool'));
   assert.equal(toolAllowedByPolicy(listed, tool('third')), false, 'the deny, not the list, decides an unconfigured source');
   assert.equal(toolAllowedByPolicy({ allowedTools: ['third_tool'], sourceConfigs: denyAll }, tool('third')), false);
-  assert.equal(toolAllowedByPolicy({ allowedTools: ['third_tool'], sourceConfigs: {} }, tool('third')), true, 'without any setting the list decides');
+  assert.equal(toolAllowedByPolicy({ allowedTools: ['third_tool'], sourceConfigs: {} }, tool('third')), false, 'without a source setting the list admits no MCP tool either');
+  assert.equal(toolAllowedByPolicy({ allowedTools: [], sourceConfigs: { third: { enabled: true } } }, tool('third')), true);
+  assert.equal(toolAllowedByPolicy({ allowedTools: [], sourceConfigs: { third: { enabled: true } } }, { name: 'third_tool', source: { kind: 'mcp', sourceId: 'third' } }), false,
+    'an MCP tool without its original name has no identity and fails closed');
 
   // Only an absent list keeps the built-in list; any other stored value fails closed at a built-in scope too.
   for (const malformed of [null, '', 0, false, 'read']) {
     assert.throws(() => resolve(global, toolPolicyScopeLayer('agent', { allowedTools: malformed }, builtin)), /allowedTools/, `${JSON.stringify(malformed)} at a built-in scope`);
   }
 
-  const optedIn = resolve(global, toolPolicyScopeLayer('agent', { sourceConfigs: { exa: { enabled: true }, other: { enabled: true, disabledTools: ['other_hidden'] } } }, builtin));
+  const optedIn = resolve(global, toolPolicyScopeLayer('agent', { sourceConfigs: { exa: { enabled: true }, other: { enabled: true, disabledTools: ['hidden'] } } }, builtin));
   assert.equal(toolAllowedByPolicy(optedIn, tool('exa')), true, 'the scope enables its own source');
   assert.equal(toolAllowedByPolicy(optedIn, tool('other')), true);
   assert.equal(toolAllowedByPolicy(optedIn, tool('other', 'other_hidden')), false);
@@ -962,7 +965,7 @@ test('内置只读范围的全来源拒绝不被该范围保存的全来源值�
   const { TOOL_POLICY_ALL_MCP_SOURCES: ALL } = require('../../dist/extension/shared/protocol.js');
   const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
   const blueprints = createDefaultAgentBlueprints();
-  const tool = (sourceId) => ({ name: `${sourceId}_tool`, source: { kind: 'mcp', sourceId } });
+  const tool = (sourceId) => ({ name: `${sourceId}_tool`, source: { kind: 'mcp', sourceId, originalToolName: 'tool' } });
   const resolve = (...layers) => resolveToolPolicyLayers(layers.filter(Boolean), []);
   const global = { scopeKind: 'global', policy: { sourceConfigs: { exa: { enabled: true } } } };
   const savedValues = [{ enabled: true }, null, 'x', [], 1];

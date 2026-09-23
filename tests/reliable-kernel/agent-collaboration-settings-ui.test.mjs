@@ -49,6 +49,7 @@ async function withBackendSettings(run) {
     let turn = 0;
     await run({
       configuration,
+      load,
       toolAllowedByPolicy,
       /** The real tool catalog, plus MCP tools as a connected server declares them. */
       toolDefinitions: (...mcp) => [...createBuiltinToolDefinitions({ command: commandDeclarationCapability() }).map(toolDefinitionRecord), ...mcp],
@@ -248,7 +249,8 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
 
     const writeTool = { name: 'write', execution: 'backend', parameters: { type: 'object' }, description: 'write', defaultConfig: {}, metadata: { riskLevel: 'write' } };
     const transferTool = { name: 'transfer', execution: 'backend', parameters: { type: 'object' }, description: 'transfer', defaultConfig: {}, metadata: { defaultEnabled: false } };
-    const mcpTool = { name: 'mcp_search', execution: 'backend', parameters: { type: 'object' }, description: 'mcp', defaultConfig: {}, source: { kind: 'mcp', sourceId: 'exa' } };
+    // An MCP tool is identified by its server id and the name the server gives it; `mcp_search` is only its display name.
+    const mcpTool = { name: 'mcp_search', execution: 'backend', parameters: { type: 'object' }, description: 'mcp', defaultConfig: {}, source: { kind: 'mcp', sourceId: 'exa', originalToolName: 'search' } };
     const allDefinitions = [runAgentTool.declaration, readFileTool, writeTool, transferTool, mcpTool, ...crossTools];
     // As the blueprints: no list names the cross-conversation tools, which the switch alone grants.
     const readonlyList = ['read_file'];
@@ -402,14 +404,14 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
 
       store.setPolicyForScope('global', undefined, ['run_agent', 'read_file'], 'Global', {
         ...switchOn, read_file: { config: {}, autoApproveExecution: false }
-      }, { exa: { enabled: true, disabledTools: ['mcp_search'] } }, 'yolo');
+      }, { exa: { enabled: true, disabledTools: ['search'] } }, 'yolo');
       global = await bindings(toolEditor, { scopeKind: 'global' });
       assert.equal(global.canRestoreDefault, true);
       global.inheritDefaults();
       const saved = store.localPolicyFor('global').policy;
       assert.equal(saved.allowedTools, undefined, 'the global ceiling is dropped instead of writing the default list');
       assert.deepEqual(saved.toolConfigs, { ...switchOn, read_file: { config: {}, autoApproveExecution: false } });
-      assert.deepEqual(saved.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+      assert.deepEqual(saved.sourceConfigs, { exa: { enabled: true, disabledTools: ['search'] } });
       assert.equal(saved.preset, 'yolo');
       assert.equal('allowedTools' in messages.at(-1).payload, false);
       assert.deepEqual(store.effectivePolicyFor('agent', 'main').policy.allowedTools, sorted(builtinToolPolicies[0].allowedTools),
@@ -584,7 +586,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       let global = store.localPolicyFor('global').policy;
       assert.equal(global.allowedTools, undefined, 'no global list is written as a side effect');
       assert.equal('allowedTools' in messages.at(-1).payload, false);
-      assert.deepEqual(global.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+      assert.deepEqual(global.sourceConfigs, { exa: { enabled: true, disabledTools: ['search'] } }, 'the disable names the tool as its server does');
       assert.deepEqual(global.toolConfigs, switchOn, 'the cross-conversation switch stays');
       assert.equal(tab.isToolGloballyEnabled(mcp), false);
       assert.ok(store.effectivePolicyFor('agent', 'main').policy.allowedTools.includes('transfer'), 'built-in Agents keep their own lists');
@@ -593,15 +595,16 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(global.allowedTools, undefined);
       assert.deepEqual(global.sourceConfigs, { exa: { enabled: true } });
 
-      // A saved global list keeps its state; turning an MCP tool off also drops it from that list.
+      // A saved global list keeps its state and never holds MCP tools.
       store.setPolicyForScope('global', undefined, ['read_file', 'mcp_search'], 'Global', switchOn, { exa: { enabled: true } });
+      assert.deepEqual(store.localPolicyFor('global').policy.allowedTools, ['read_file']);
       tab.setToolGlobalEnabled(mcp, false);
       assert.deepEqual(store.localPolicyFor('global').policy.allowedTools, ['read_file']);
     });
 
     await t.test('MCP 工具的每个开关只改它显示的那个工具：勾选未设置来源的一个工具不会开启整个服务，全局取消勾选不会新建列表', async () => {
       const { default: mcpTab } = await server.ssrLoadModule('/src/components/settings/global/McpToolSettingsTab.vue');
-      const deleteAll = { ...mcpTool, name: 'mcp_delete_all', description: 'mcp delete' };
+      const deleteAll = { ...mcpTool, name: 'mcp_delete_all', description: 'mcp delete', source: { ...mcpTool.source, originalToolName: 'delete_all' } };
       const catalog = [...allDefinitions, deleteAll];
       const sources = [{ id: 'exa', name: 'exa', transportKind: 'stdio', status: 'connected', toolCount: 2 }];
       const tools = (store) => ({ search: store.toolDefinitions.find((tool) => tool.name === 'mcp_search'), deleteAll: store.toolDefinitions.find((tool) => tool.name === 'mcp_delete_all') });
@@ -616,16 +619,12 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
         tab.setToolGlobalEnabled(search, true);
         tab = await bindings(mcpTab, {});
         assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [true, false], 'only the ticked tool is on');
-        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_delete_all'] } });
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['delete_all'] } });
         assert.equal('allowedTools' in messages.at(-1).payload, false);
-        // A tool on only through a saved global list (no source settings): unticking it leaves the other one on.
-        store.setPolicyForScope('global', undefined, ['read_file', 'mcp_search', 'mcp_delete_all'], 'Global', {}, {});
+        // A list naming MCP tools admits none of them: only source settings do.
+        client.toolPolicies = [{ id: 'tool-policy:global:global', name: 'Global', allowedTools: ['read_file', 'mcp_search', 'mcp_delete_all'] }];
         tab = await bindings(mcpTab, {});
-        assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [true, true]);
-        tab.setToolGlobalEnabled(search, false);
-        tab = await bindings(mcpTab, {});
-        assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [false, true]);
-        assert.deepEqual(store.localPolicyFor('global').policy.allowedTools, ['read_file', 'mcp_delete_all']);
+        assert.deepEqual([tab.isToolGloballyEnabled(search), tab.isToolGloballyEnabled(other)], [false, false]);
       }
 
       // (b) The global all-tools list with the server enabled: unticking turns that tool off and saves no list.
@@ -641,12 +640,12 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
         assert.deepEqual([editor.isToolEnabled(search), editor.isToolEnabled(other)], [false, true]);
         assert.equal(store.localPolicyFor('global').policy.allowedTools, undefined, 'no global list is created');
         assert.equal('allowedTools' in messages.at(-1).payload, false);
-        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+        assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['search'] } });
         editor.setToolEnabled(search, true);
         assert.deepEqual(store.localPolicyFor('global').policy.sourceConfigs, { exa: { enabled: true } });
 
         // Below global, a tool the global layer disables cannot be turned on here, so its box is disabled and a click saves nothing.
-        store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { exa: { enabled: true, disabledTools: ['mcp_delete_all'] } });
+        store.setPolicyForScope('global', undefined, undefined, 'Global', {}, { exa: { enabled: true, disabledTools: ['delete_all'] } });
         const before = messages.length;
         const conversation = await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'below' });
         conversation.setToolEnabled(other, true);
@@ -654,10 +653,112 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
         assert.match(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'below' }), /<button[^>]*aria-label="启用工具 mcp_delete_all"[^>]*disabled/);
         // Unticking one tool here writes only this scope's choice, not the global layer's disabled tool.
         conversation.setToolEnabled(search, false);
-        assert.deepEqual(store.localPolicyFor('conversation', 'below').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['mcp_search'] } });
+        assert.deepEqual(store.localPolicyFor('conversation', 'below').policy.sourceConfigs, { exa: { enabled: true, disabledTools: ['search'] } });
         assert.equal(store.localPolicyFor('conversation', 'below').policy.allowedTools, undefined);
         assert.equal((await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'below' })).isToolEnabled(search), false);
       }
+    });
+
+    await t.test('MCP 工具的停用和自动批准跟着服务 id 与原始工具名走：前一个服务停用、连不上、删除或还在连接时都不会换到另一个服务的工具上', async () => {
+      await withBackendSettings(async ({ configuration, compile, toolDefinitions, toolAllowedByPolicy, sync, apply, load }) => {
+        const { McpRuntimeManager, dedupeMcpToolNames } = load('backend/application/mcpRuntimeManager.js');
+        const { toolDefinitionRecord } = load('backend/world/modules/tools/registry.js');
+        const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
+        const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-mcp-identity-'));
+        try {
+          // A real stdio MCP server listing `query` and `execute` after an optional delay.
+          const script = path.join(root, 'server.cjs');
+          await fs.writeFile(script, `
+const { Server } = require(${JSON.stringify(requireCompiled.resolve('@modelcontextprotocol/sdk/server/index.js'))});
+const { StdioServerTransport } = require(${JSON.stringify(requireCompiled.resolve('@modelcontextprotocol/sdk/server/stdio.js'))});
+const { ListToolsRequestSchema } = require(${JSON.stringify(requireCompiled.resolve('@modelcontextprotocol/sdk/types.js'))});
+const delay = Number(process.argv[2]);
+const server = new Server({ name: 'fixture', version: '1.0.0' }, { capabilities: { tools: {} } });
+server.setRequestHandler(ListToolsRequestSchema, async () => { await new Promise(resolve => setTimeout(resolve, delay)); return { tools: ['query', 'execute'].map(name => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })) }; });
+server.connect(new StdioServerTransport());
+`);
+          // Both names reduce to the same prefix; A has the lower id.
+          const A = 'mcp-postgres-a', B = 'mcp-postgres-b';
+          const server = (id, name, { enabled = true, delay = 0, command = process.execPath } = {}) =>
+            ({ id, name, enabled, transport: { kind: 'stdio', command, args: [script, String(delay)] }, createdAt: 1, updatedAt: 1 });
+          const reserved = toolDefinitions().map((tool) => tool.name);
+          /** The tools as the host names them while these servers are configured; also every intermediate state. */
+          const connect = async (servers) => {
+            const manager = new McpRuntimeManager({ async loadGlobalSettings() { return { settings: { servers } }; } });
+            const seen = [];
+            const named = () => dedupeMcpToolNames(manager.runtimeTools(), reserved);
+            manager.setStateChangeListener(() => seen.push(named()));
+            try {
+              await manager.refreshFromSettings({ discover: true });
+              return { tools: named(), seen };
+            } finally { await manager.dispose(); }
+          };
+          const find = (tools, sourceId, original) => tools.find((tool) => tool.declaration.source?.sourceId === sourceId && tool.declaration.source?.originalToolName === original);
+          const both = (await connect([server(A, 'Postgres 测试'), server(B, 'Postgres 生产')])).tools;
+          assert.equal(find(both, A, 'execute').declaration.name.endsWith('_execute'), true);
+          assert.equal(find(both, B, 'execute').declaration.name, `${find(both, A, 'execute').declaration.name}_2`, 'B gets the suffix while A is connected');
+
+          // The settings page with both servers connected: enable both, turn B's execute off, auto-approve A's query.
+          const custom = await configuration.mutations.createAgent({ name: 'Custom', kind: 'custom' });
+          const { client, store, bindings, messages } = fresh(toolDefinitions(...both.map(toolDefinitionRecord)));
+          await sync(client);
+          client.mcpToolSources = [A, B].map((id) => ({ id, name: id, transportKind: 'stdio', status: 'connected', toolCount: 2 }));
+          const record = (sourceId, original) => store.toolDefinitions.find((tool) => tool.source?.sourceId === sourceId && tool.source?.originalToolName === original);
+          (await bindings(toolEditor, { scopeKind: 'global' })).toggleMcpSource(A, true);
+          (await bindings(toolEditor, { scopeKind: 'global' })).toggleMcpSource(B, true);
+          (await bindings(toolEditor, { scopeKind: 'global' })).setToolEnabled(record(B, 'execute'), false);
+          (await bindings(toolEditor, { scopeKind: 'global' })).updateGateSetting(record(A, 'query'), 'autoApproveExecution', true);
+          for (const message of messages.splice(0)) await apply(message);
+          const policy = await compile(custom.id, 'conversation:custom');
+
+          /** The dispatcher's frozen approval gate for one call of this tool under the compiled policy. */
+          const approvalGate = async (tools, tool) => {
+            const records = {
+              AuthoritySnapshot: [{ id: 'authority', turn_id: 'turn', content_object_id: 'authority-content' }],
+              ContentObject: [{ id: 'authority-content' }],
+              Turn: [{ id: 'turn', conversation_id: 'conversation', status: 'active' }]
+            };
+            const matching = (read) => (records[read.domain] ?? []).filter((row) => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
+            const dispatcher = new ReliableToolDispatcher({
+              database: {
+                async snapshot(reads) { return { snapshot: reads.map((read) => read.kind === 'get' ? (records[read.domain] ?? []).find((row) => row.id === read.id) : matching(read)) }; },
+                async snapshotAll(read) { return { snapshot: matching(read) }; }
+              },
+              contentStore: { async read() { return Buffer.from(JSON.stringify({ toolPolicy: policy })); } },
+              effects: { subscribeToolModelResults() { return () => {}; } },
+              host: { definitions: () => tools }
+            });
+            const { name, description, parameters, source, metadata } = tool.declaration;
+            return (await dispatcher.freezeCall({ turnId: 'turn', modelRequestId: 'request', toolCallId: `call-${name}`, toolName: name, arguments: {},
+              definition: { name, description, parameters, source, metadata } })).executionGate;
+          };
+          const allowed = (tool) => toolAllowedByPolicy(policy, toolDefinitionRecord(tool));
+          assert.deepEqual([allowed(find(both, A, 'execute')), allowed(find(both, B, 'execute'))], [true, false]);
+          assert.equal(await approvalGate(both, find(both, A, 'query')), 'automatic');
+          assert.equal(await approvalGate(both, find(both, B, 'query')), 'approval_required');
+
+          const withoutA = [
+            ['A switched off', (await connect([server(A, 'Postgres 测试', { enabled: false }), server(B, 'Postgres 生产')])).tools],
+            ['A fails to connect', (await connect([server(A, 'Postgres 测试', { command: path.join(root, 'missing-command') }), server(B, 'Postgres 生产')])).tools],
+            ['A removed', (await connect([server(B, 'Postgres 生产')])).tools],
+            ['A still connecting', (await connect([server(A, 'Postgres 测试', { delay: 1500 }), server(B, 'Postgres 生产')])).seen
+              .find((tools) => find(tools, B, 'execute') && !find(tools, A, 'execute'))]
+          ];
+          for (const [label, tools] of withoutA) {
+            assert.ok(tools, `${label}: B was connected alone`);
+            assert.equal(find(tools, B, 'execute').declaration.name, find(both, A, 'execute').declaration.name, `${label}: B's tool takes the name A's had`);
+            assert.equal(allowed(find(tools, B, 'execute')), false, `${label}: B's execute stays off`);
+            assert.equal(allowed(find(tools, B, 'query')), true);
+            assert.equal(await approvalGate(tools, find(tools, B, 'query')), 'approval_required', `${label}: B's query does not take A's auto-approve`);
+          }
+          // B gone instead: A keeps its own settings.
+          const withoutB = (await connect([server(A, 'Postgres 测试')])).tools;
+          assert.equal(await approvalGate(withoutB, find(withoutB, A, 'query')), 'automatic');
+          assert.equal(allowed(find(withoutB, A, 'execute')), true);
+        } finally {
+          await fs.rm(root, { recursive: true, force: true });
+        }
+      });
     });
 
     await t.test('内置只读 Agent 或工作流下的对话里开启 MCP 服务不会生效，开关不可用并提示到哪个 Agent 或工作流开启', async () => {

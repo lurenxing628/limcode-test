@@ -1050,6 +1050,7 @@ export interface ToolPolicyToolConfigRecord {
 
 export interface ToolPolicySourceConfigRecord {
   enabled: boolean;
+  /** Tools of this source turned off, by the name the server itself gives them (source.originalToolName). */
   disabledTools?: string[];
 }
 
@@ -1071,6 +1072,7 @@ export interface ToolPolicyRecord {
   allowedTools?: string[];
   /** 工具策略预设；非全局 scope 可用 inherit 只继承全局预设，同时保留本 scope 的逐工具配置。 */
   preset?: ToolPolicyPresetKind;
+  /** Per-tool settings keyed by `toolConfigKey`: a built-in tool's name, an MCP tool's `mcp:<source id>/<original name>`. */
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
   sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;
 }

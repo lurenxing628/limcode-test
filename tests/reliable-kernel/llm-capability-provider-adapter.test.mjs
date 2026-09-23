@@ -20,7 +20,7 @@ function request() {
       toolPolicy: {
         allowedTools: ['echo'],
         preset: 'custom',
-        sourceConfigs: { 'mcp-exa': { enabled: true, disabledTools: ['exa_hidden'] } }
+        sourceConfigs: { 'mcp-exa': { enabled: true, disabledTools: ['hidden'] } }
       },
       systemPrompt: { text: 'system instruction' }
     },

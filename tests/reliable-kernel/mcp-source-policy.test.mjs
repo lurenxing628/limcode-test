@@ -151,7 +151,7 @@ const dispatcherMcp = async ({ dispatcher, turns }, id) => (await dispatcher.def
 async function forgedCallAllowed({ app, turns, gate }, conversationId) {
   const calls = (await rows(app, 'ToolCall', { turn_id: turns[conversationId] })).filter(call => call.tool_name === 'exa_search');
   assert.equal(calls.length, 1, `${conversationId} forged exactly one MCP call`);
-  return (await gate.authorize({ toolCallId: calls[0].id, serverId: 'exa' })).toolPolicyAllowed;
+  return (await gate.authorize({ toolCallId: calls[0].id, serverId: 'exa', toolName: 'search' })).toolPolicyAllowed;
 }
 
 test('an MCP server enabled globally reaches ordinary Agents but never the built-in read-only Agents or workflows', { timeout: 120000 }, async () => {
@@ -195,10 +195,15 @@ test('a list-less record at the read-only scope keeps the MCP restriction; only 
   } });
 });
 
-test('the MCP source admission contract names the key the code uses', async () => {
+test('the MCP source admission contract names the keys the code uses', async () => {
   const { TOOL_POLICY_ALL_MCP_SOURCES } = load('shared/protocol.js');
+  const { toolConfigKey } = load('shared/toolPolicyResolution.js');
   const contract = JSON.parse(await fs.readFile(path.resolve('docs/architecture/reliable-kernel/contracts/tool.json'), 'utf8'));
   assert.ok(contract.mcpCapability.sourceAdmission.includes(`全来源拒绝'${TOOL_POLICY_ALL_MCP_SOURCES}'`));
+  assert.ok(contract.mcpCapability.sourceAdmission.includes("'mcp:<来源id>/<原始工具名>'"));
+  assert.equal(toolConfigKey({ name: 'exa_search_2', source: { kind: 'mcp', sourceId: 'exa', originalToolName: 'search' } }), 'mcp:exa/search');
+  assert.equal(toolConfigKey({ name: 'x', source: { kind: 'mcp', sourceId: 'id/with:odd', originalToolName: 'a/b' } }), 'mcp:id%2Fwith%3Aodd/a/b', 'the source id splits one way only');
+  assert.equal(toolConfigKey({ name: 'read' }), 'read');
 });
 
 /**
@@ -242,7 +247,7 @@ async function directAdmission({ declaration, toolPolicy }) {
 test('dispatch admission refuses an MCP call its source settings deny, even when the frozen list names it', async () => {
   const { TOOL_POLICY_ALL_MCP_SOURCES } = load('shared/protocol.js');
   const declaration = { ...mcpTool('exa', 'exa_search').declaration };
-  for (const sourceConfigs of [{ [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } }, { exa: { enabled: false } }, { exa: { enabled: true, disabledTools: ['exa_search'] } }]) {
+  for (const sourceConfigs of [{ [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } }, { exa: { enabled: false } }, { exa: { enabled: true, disabledTools: ['search'] } }, {}]) {
     const denied = await directAdmission({ declaration, toolPolicy: { allowedTools: ['exa_search'], sourceConfigs } });
     assert.deepEqual(denied.rejected, ['冻结 ToolPolicy 不允许工具 exa_search。'], JSON.stringify(sourceConfigs));
     assert.deepEqual(denied.reached, []);
@@ -257,15 +262,15 @@ test('the request token estimate counts only the tools the frozen policy admits,
   const { TOOL_POLICY_ALL_MCP_SOURCES } = load('shared/protocol.js');
   const read = { name: 'read', description: 'Read a file.', parameters: { type: 'object' } };
   const search = { name: 'exa_search', description: 'Search the web with a long description. '.repeat(20), parameters: { type: 'object', properties: { query: { type: 'string' } } },
-    source: { kind: 'mcp', sourceId: 'exa' } };
+    source: { kind: 'mcp', sourceId: 'exa', originalToolName: 'search' } };
   const estimate = toolPolicy => estimateRequestAuthorityTokens({ toolPolicy }, { tools: [read, search] });
   const readOnly = estimateRequestAuthorityTokens({ toolPolicy: { allowedTools: ['read'] } }, { tools: [read] });
-  const both = estimateRequestAuthorityTokens({ toolPolicy: { allowedTools: ['read', 'exa_search'] } }, { tools: [read, search] });
+  const both = estimateRequestAuthorityTokens({ toolPolicy: { allowedTools: ['read'], sourceConfigs: { exa: { enabled: true } } } }, { tools: [read, search] });
   assert.ok(both > readOnly);
   assert.equal(estimate({ allowedTools: ['read', 'exa_search'], sourceConfigs: { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } } }), readOnly, 'an all-sources deny drops the listed MCP tool');
   assert.equal(estimate({ allowedTools: ['read', 'exa_search'], sourceConfigs: { exa: { enabled: false } } }), readOnly, 'a disabled source drops it');
   assert.equal(estimate({ allowedTools: ['read'], sourceConfigs: { exa: { enabled: true } } }), both, 'an enabled source counts without a list entry');
-  assert.equal(estimate({ allowedTools: ['read', 'exa_search'] }), both, 'an unconfigured source falls back to the list');
+  assert.equal(estimate({ allowedTools: ['read', 'exa_search'] }), readOnly, 'a list naming the tool of an unconfigured source counts nothing');
 });
 
 test('every MCP enforcement point named by the contract decides through the shared rule', async () => {
@@ -331,9 +336,9 @@ server.connect(new StdioServerTransport());
     assert.equal(forward['mcp-exa/search'], 'exa_search', 'an ordinary server name keeps its prefix');
     assert.notEqual(forward['mcp-server-a/search'], forward['mcp-server-b/search']);
 
-    // A per-tool disable saved under one connection order still disables that tool, and only it, under the other.
-    const policy = { allowedTools: [], sourceConfigs: { 'mcp-server-a': { enabled: true, disabledTools: [forward['mcp-server-a/search']] }, 'mcp-server-b': { enabled: true } } };
-    const allowed = (names, key) => toolAllowedByPolicy(policy, { name: names[key], source: { kind: 'mcp', sourceId: key.split('/')[0] } });
+    // A per-tool disable names the tool as its server does, so it disables that tool, and only it, whatever the display names.
+    const policy = { allowedTools: [], sourceConfigs: { 'mcp-server-a': { enabled: true, disabledTools: ['search'] }, 'mcp-server-b': { enabled: true } } };
+    const allowed = (names, key) => toolAllowedByPolicy(policy, { name: names[key], source: { kind: 'mcp', sourceId: key.split('/')[0], originalToolName: key.split('/')[1] } });
     for (const names of [forward, backward]) {
       assert.equal(allowed(names, 'mcp-server-a/search'), false);
       assert.equal(allowed(names, 'mcp-server-b/search'), true);

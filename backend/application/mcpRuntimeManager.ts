@@ -339,9 +339,10 @@ function mcpToolDisplayName(source: McpServerConfigRecord, toolName: string): st
 
 /**
  * 消歧一批工具定义的名字：遇到与 `reserved`（含内置工具名）或彼此重名时追加 `_2`、`_3`…
- * 按来源 id 排序后再分配后缀（同一来源内保持服务列出的顺序），所以名字只取决于连接着哪些服务，
- * 与它们连上的先后无关，按名字保存的 disabledTools 和工具列表不会换到别的服务的工具上。
- * 内部的 sourceId / originalToolName 不受影响，仅调整 AI 可见的 `declaration.name`。
+ * 按来源 id 排序后再分配后缀（同一来源内保持服务列出的顺序），所以名字与服务连上的先后无关；
+ * 但另一个服务断开、停用或被删除时，显示名仍可能换到别的服务的工具上。因此保存的设置都按
+ * sourceId + originalToolName 识别工具（见 shared/toolPolicyResolution 的 mcpToolIdentity 与
+ * toolConfigKey），这里只调整 AI 可见的 `declaration.name`。
  */
 export function dedupeMcpToolNames(tools: ToolDefinition[], reserved: Iterable<string> = []): ToolDefinition[] {
   const used = new Set(reserved);

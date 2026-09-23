@@ -70,7 +70,8 @@ export class FrozenAuthorityMcpPolicyGate implements McpExistingPolicyGate {
     const toolPolicy = requireRecord(authority.toolPolicy, 'AuthoritySnapshot.toolPolicy');
     const allowed = mcpToolAllowed(toolPolicy, {
       displayName: String(toolCall.tool_name),
-      serverId: request.serverId
+      serverId: request.serverId,
+      originalToolName: request.toolName
     });
     if (!allowed) {
       return {
@@ -222,16 +223,17 @@ function optionalId(value: PlainJsonValue | undefined): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/** The frozen source settings decide, by server id and the tool name the server itself uses. */
 function mcpToolAllowed(
   policy: { [key: string]: PlainJsonValue },
-  tool: { displayName: string; serverId: string }
+  tool: { displayName: string; serverId: string; originalToolName: string }
 ): boolean {
   const allowedTools = Array.isArray(policy.allowedTools)
     ? policy.allowedTools.filter((name): name is string => typeof name === 'string')
     : [];
   return toolAllowedByPolicy({ allowedTools, sourceConfigs: policy.sourceConfigs }, {
     name: tool.displayName,
-    source: { kind: 'mcp', sourceId: tool.serverId }
+    source: { kind: 'mcp', sourceId: tool.serverId, originalToolName: tool.originalToolName }
   });
 }
 
