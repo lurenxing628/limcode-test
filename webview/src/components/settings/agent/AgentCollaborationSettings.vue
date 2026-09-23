@@ -129,7 +129,7 @@ function restoreCrossConversation(): void {
       </div>
       <p>{{ crossConversationField.description }}</p>
       <p>开启后提供列出、读取、发送、新建和分支对话五个工具，仅顶层对话可用，不能寻址子 Agent 对话。发送类工具默认自动执行，可在工具设置中逐个改为执行前确认。目标对话正在运行时，消息排队到它本轮结束后再投递。</p>
-      <p>当前范围单独保存了工具列表时，开启会把缺少的跨对话工具加入该列表，关闭或恢复继承时再移除这些工具；没有单独的工具列表时只保存开关，工具列表继续沿用上层与内置设置。</p>
+      <p>当前范围单独保存了工具列表时，开启会把缺少的跨对话工具加入该列表，关闭时再移除这些工具（恢复继承时上层仍开启则保留，在工具设置里手动启用过的工具也不会移除）；没有单独的工具列表时只保存开关，工具列表继续沿用上层与内置设置。</p>
       <p v-if="crossConversationEnabled && !crossConversationTools.sendTools" class="collaboration-note">当前范围的工具列表不含 run_agent，不会提供发送、新建和分支对话工具；{{ crossConversationTools.available.length > 0 ? `实际可用：${crossConversationTools.available.join('、')}。` : '没有可用的跨对话工具。' }}</p>
       <p v-if="crossConversationEnabled && crossConversationTools.missing.length > 0" class="collaboration-note">当前范围的工具策略仍未允许 {{ crossConversationTools.missing.join('、') }}（上层工具策略可能已禁用），这些工具不会出现。</p>
     </div>

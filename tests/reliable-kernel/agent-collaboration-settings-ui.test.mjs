@@ -445,6 +445,42 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.deepEqual(local.toolConfigs.run_agent.config, { maxConcurrentAgents: 3 }, 'the record keeps the user’s own settings');
     });
 
+    await t.test('恢复继承时上层开关仍开启就保留开关加入的工具；用户明确启用的工具不再算开关加入的', async () => {
+      const { store, bindings } = fresh(allDefinitions);
+      const added = ['list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'];
+      store.setCrossConversationCollaborationForScope('global', undefined, true);
+      store.setPolicyForScope('conversation', 'kept', ['read_file', 'run_agent'], 'Kept');
+      store.setCrossConversationCollaborationForScope('conversation', 'kept', true);
+      assert.deepEqual(store.localPolicyFor('conversation', 'kept').policy.crossConversationGrantedTools, added);
+      store.setCrossConversationCollaborationForScope('conversation', 'kept', undefined);
+      let local = store.localPolicyFor('conversation', 'kept').policy;
+      assert.deepEqual(local.allowedTools, ['read_file', 'run_agent', ...added], 'the inherited switch is still on, so its tools stay');
+      assert.equal(local.toolConfigs?.run_agent, undefined, 'the local switch value itself is removed');
+      assert.deepEqual(store.crossConversationToolsFor('conversation', 'kept').missing, []);
+      store.setCrossConversationCollaborationForScope('conversation', 'kept', false);
+      assert.deepEqual(store.localPolicyFor('conversation', 'kept').policy.allowedTools, ['read_file', 'run_agent'],
+        'turning the switch off here later still removes exactly the tools it added');
+
+      // 启用全部 is an explicit enable of every tool: a later switch-off keeps them.
+      store.setPolicyForScope('conversation', 'all', ['read_file', 'run_agent'], 'All');
+      store.setCrossConversationCollaborationForScope('conversation', 'all', true);
+      (await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'all' })).enableAll();
+      assert.equal(store.localPolicyFor('conversation', 'all').policy.crossConversationGrantedTools, undefined);
+      store.setCrossConversationCollaborationForScope('conversation', 'all', false);
+      for (const name of added) assert.ok(store.localPolicyFor('conversation', 'all').policy.allowedTools.includes(name), `${name} stays after 启用全部`);
+
+      // Enabling one switch-added tool the global list still blocks marks it as the user's own.
+      store.setPolicyForScope('global', undefined, ['read_file', 'run_agent', 'list_conversations', 'read_conversation'], 'Global', switchOn);
+      store.setPolicyForScope('conversation', 'one', ['read_file', 'run_agent'], 'One');
+      store.setCrossConversationCollaborationForScope('conversation', 'one', true);
+      const editor = await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'one' });
+      editor.setToolEnabled(store.toolDefinitions.find((tool) => tool.name === 'send_conversation_message'), true);
+      assert.equal(store.localPolicyFor('conversation', 'one').policy.crossConversationGrantedTools.includes('send_conversation_message'), false);
+      store.setCrossConversationCollaborationForScope('conversation', 'one', false);
+      assert.ok(store.localPolicyFor('conversation', 'one').policy.allowedTools.includes('send_conversation_message'));
+      assert.equal(store.localPolicyFor('conversation', 'one').policy.allowedTools.includes('create_conversation'), false);
+    });
+
     await t.test('只改审批、预设或协作上限时不给本层新建工具列表，内置只读 Agent 仍保持只读', async () => {
       const { client, store, bindings } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;

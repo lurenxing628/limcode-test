@@ -226,13 +226,17 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
       let granted: string[] = [];
       if (allowedTools) {
         const previous = local?.crossConversationGrantedTools ?? [];
+        const current = allowedTools;
         if (value === true) {
-          const current = allowedTools;
           const added = this.crossConversationToolsFor(scopeKind, scopeId).expected.filter((name) => !current.includes(name));
           allowedTools = [...current, ...added];
           granted = uniqueNames([...previous.filter((name) => current.includes(name)), ...added]);
+        } else if (value === undefined && this.inheritedToolConfigValue(scopeKind, scopeId, SUB_AGENT_TOOL_NAME, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY)?.value === true) {
+          // Restoring inheritance while an upper layer keeps the switch on: this scope still needs
+          // the tools, and they stay marked so a later switch-off here removes them.
+          granted = previous.filter((name) => current.includes(name));
         } else {
-          allowedTools = allowedTools.filter((name) => !previous.includes(name));
+          allowedTools = current.filter((name) => !previous.includes(name));
         }
       }
       this.saveOrDropLocalPolicy(scopeKind, scopeId, allowedTools, configs, granted);
@@ -319,6 +323,10 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         ...(local.link ? { link: local.link } : {}),
         ...(!local.policy ? { inheritedFrom: 'global' as const } : {})
       };
+    },
+    /** This scope's switch-added tools minus the ones the user has now enabled explicitly. */
+    crossConversationGrantsWithout(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, enabledByUser: readonly string[]): string[] {
+      return (this.localPolicyFor(scopeKind, scopeId).policy?.crossConversationGrantedTools ?? []).filter((name) => !enabledByUser.includes(name));
     },
     /**
      * What a tool-list edit at this scope starts from. A saved list is kept as it is, including

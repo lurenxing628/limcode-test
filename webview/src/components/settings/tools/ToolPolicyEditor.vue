@@ -195,10 +195,12 @@ function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void
   store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed, localPolicyName(), cloneToolConfigs(), nextConfigs);
 }
 
+/** An explicit enable makes the tool the user's own: turning the cross-conversation switch off keeps it. */
 function setToolEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
   if (props.readonly || enabled === isToolEnabled(tool)) return;
   if (!enabled) collapseToolConfig(tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs(),
+    undefined, enabled ? store.crossConversationGrantsWithout(props.scopeKind, props.scopeId, [tool.name]) : undefined);
 }
 
 function isToolConfigExpanded(toolName: string): boolean { return expandedToolNames.value.includes(toolName); }
@@ -215,7 +217,9 @@ function collapseToolConfig(toolName: string): void {
 
 function enableAll(): void {
   if (props.readonly) return;
-  store.setPolicyForScope(props.scopeKind, props.scopeId, builtinTools.value.map((tool) => tool.name), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
+  const names = builtinTools.value.map((tool) => tool.name);
+  store.setPolicyForScope(props.scopeKind, props.scopeId, names, localPolicyName(), cloneToolConfigs(), cloneSourceConfigs(),
+    undefined, store.crossConversationGrantsWithout(props.scopeKind, props.scopeId, names));
 }
 
 function disableAll(): void {
