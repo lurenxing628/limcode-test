@@ -266,7 +266,6 @@ export class ConversationForkControlPlane {
       // Whole-root callers copy no transcript but still receive their own CompressionBlocks.
       contextSegmentIds: targetRootShape.segmentIds ?? retainedSegmentIds,
       targetAgentId: command.targetAgentId,
-      copyTurnAuthority: true,
       contextRoots: {
         head: {
           id: ids.targetRootId,

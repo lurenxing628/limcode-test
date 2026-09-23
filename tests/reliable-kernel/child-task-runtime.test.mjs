@@ -37,6 +37,7 @@ const { ReliableChildAgentCoordinator } = load('backend/reliableKernel/childAgen
 const { ReliableConversationRunner } = load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const { readFrozenTurnAuthority } = load('backend/reliableKernel/frozenAuthority.js');
 const { readConversationChildTaskProjection } = load('backend/reliableKernel/conversationChildTaskProjection.js');
+const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
 const { runAgentTool } = load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
 const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
@@ -85,10 +86,10 @@ async function fixture(mode, hooks, run) {
   const f = {
     configuration, provider, requests, wires, starts, dispatches, save,
     get app() { return app; }, get coordinator() { return coordinator; },
-    async runInput(key, text = 'Continue the existing assignment.') {
+    async runInput(key, text = 'Continue the existing assignment.', conversationId = 'parent') {
       // AgentLoop.runInput performs only one drive and may validly return waiting while a tool
       // settlement races its last read. Use the production runner's wake/re-entry lifecycle.
-      const started = await runner.input({ commandId: key, conversationId: 'parent', text });
+      const started = await runner.input({ commandId: key, conversationId, text });
       assert.ok(started.admitted && started.turnId, 'the preceding fixture turn must already be terminal');
       const terminal = await eventually(async () => {
         assert.deepEqual(runnerErrors, [], 'production runner must not hide a drive error');
@@ -444,9 +445,16 @@ for (const mode of ['llm_summary', 'provider_native']) for (const forkTurns of [
     assert.equal(inheritedTurns.length, forkTurns === 'none' ? 1 : forkTurns === 'all' ? 3 : 2);
     const childLinks = await f.list('ChildExecutionTurnLink');
     assert.equal(childLinks.length, 1, 'forked history grants no ChildExecution control links');
+    const [childAuthority] = await f.list('AuthoritySnapshot', { turn_id: childTurnId });
     for (const turn of inheritedTurns.filter(turn => turn.id !== childTurnId)) {
       assert.equal((await f.list('ExecutionLease', { turn_id: turn.id })).length, 0);
-      assert.equal((await f.list('AuthoritySnapshot', { turn_id: turn.id })).length, 0);
+      // Inherited history owns frozen copies of its historical authority, never the child's own.
+      const snapshots = await f.list('AuthoritySnapshot', { turn_id: turn.id });
+      assert.equal(snapshots.length, 1);
+      assert.notEqual(snapshots[0].content_object_id, childAuthority.content_object_id);
+      for (const request of await f.list('ModelRequest', { turn_id: turn.id })) {
+        assert.equal(request.authority_snapshot_id, snapshots[0].id);
+      }
     }
     await f.coordinator.waitForIdle();
     const [intent] = await f.list('EffectIntent', { effect_kind: 'subagent_spawn' });
@@ -460,6 +468,71 @@ for (const mode of ['llm_summary', 'provider_native']) for (const forkTurns of [
       'replay uses the committed snapshot rather than copying the now-completed parent current turn');
     await assert.rejects(f.app.runtime.children.spawn({ ...replayCommand,
       forkTurns: forkTurns === 'none' ? 'all' : 'none' }), /different facts/);
+  });
+});
+
+test('a user fork of a forkTurns child owns its inherited history and outlives the deleted parent', { timeout: 120000 }, async () => {
+  let phase = 1;
+  const rounds = new Map();
+  await fixture('llm_summary', {
+    async send(request, controls) {
+      if (request.conversationId !== 'parent') return complete(controls, done());
+      const round = (rounds.get(phase) ?? 0) + 1;
+      rounds.set(phase, round);
+      if (round === 1 && phase === 2) return complete(controls, { role: 'model', parts: [tool('fork-history-child', {
+        operation: 'spawn', taskName: 'Forked reviewer', prompt: 'CHILD_FORK_ASSIGNMENT_4471', forkTurns: 'all' })] });
+      return complete(controls, { role: 'model', parts: [{ text: `PARENT_REPLY_${phase}_5530` }] });
+    }
+  }, async f => {
+    for (phase = 1; phase <= 2; phase += 1) {
+      assert.equal((await f.runInput(`child-fork-history-${phase}`, `PARENT_HISTORY_${phase}_5530`)).terminalStatus, 'completed');
+    }
+    await f.coordinator.waitForIdle();
+    const [execution] = await f.list('ChildExecution');
+    const child = execution.child_conversation_id;
+    await eventually(async () => (await f.list('Turn', { conversation_id: child })).every(turn => turn.status === 'terminated')
+      && (await f.list('Turn', { conversation_id: child })).length === 2, 'the child did not finish its assignment');
+    const childModels = [];
+    for (const member of (await f.list('MessagePartOfConversation', { conversation_id: child }))
+      .sort((left, right) => Number(right.message_seq - left.message_seq))) {
+      const [current] = await f.list('MessageCurrentRevisionLink', { message_id: member.message_id });
+      const [revision] = await f.list('MessageRevision', { id: current.revision_id });
+      if (revision.role === 'model') childModels.push({ messageId: member.message_id, revisionId: revision.id });
+    }
+    assert.ok(childModels.length > 0);
+    /** Every request of a Conversation references an AuthoritySnapshot owned by its own Turn. */
+    const assertSelfContainedAuthority = async conversationId => {
+      for (const turn of await f.list('Turn', { conversation_id: conversationId })) {
+        const snapshots = await f.list('AuthoritySnapshot', { turn_id: turn.id });
+        assert.equal(snapshots.length, 1, `Turn ${turn.id} owns its frozen authority`);
+        for (const request of await f.list('ModelRequest', { turn_id: turn.id })) {
+          assert.equal(request.authority_snapshot_id, snapshots[0].id);
+        }
+      }
+    };
+    await assertSelfContainedAuthority(child);
+    const lifecycle = new ReliableConversationLifecycle({ application: f.app, configuration: f.configuration });
+    const fork = await lifecycle.fork({ sourceConversationId: child, messageId: childModels[0].messageId,
+      expectedRevisionId: childModels[0].revisionId, commandId: 'user-fork-of-forked-child' });
+    assert.equal(fork.deduplicated, false);
+    assert.equal((await f.list('Turn', { conversation_id: fork.conversationId })).length, 2);
+    await assertSelfContainedAuthority(fork.conversationId);
+
+    await f.coordinator.waitForIdle();
+    const deleted = await f.app.database.conversationOwners.run('parent', () => f.app.conversationDeletion.delete('parent'));
+    assert.ok(deleted.deletedConversationIds.includes('parent'));
+    assert.equal(deleted.deletedConversationIds.includes(fork.conversationId), false);
+    await assertSelfContainedAuthority(fork.conversationId);
+    assert.equal((await f.runInput('continue-child-fork-after-parent-delete', 'CONTINUE_CHILD_FORK_7718', fork.conversationId))
+      .terminalStatus, 'completed');
+    const body = JSON.stringify(f.requests.at(-1).context);
+    assert.ok(body.includes('PARENT_HISTORY_1_5530'), 'the fork keeps the history the child inherited');
+    const [forkModel] = (await f.list('MessagePartOfConversation', { conversation_id: fork.conversationId }))
+      .sort((left, right) => Number(left.message_seq - right.message_seq));
+    const [current] = await f.list('MessageCurrentRevisionLink', { message_id: forkModel.message_id });
+    const again = await lifecycle.fork({ sourceConversationId: fork.conversationId, messageId: forkModel.message_id,
+      expectedRevisionId: current.revision_id, commandId: 'fork-of-child-fork-after-parent-delete' });
+    await assertSelfContainedAuthority(again.conversationId);
   });
 });
 

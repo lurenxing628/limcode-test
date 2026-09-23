@@ -103,11 +103,6 @@ export async function prepareConversationForkSnapshot(
     selectedMessageIds?: ReadonlySet<string>;
     contextSegmentIds?: readonly string[];
     targetAgentId: string;
-    /**
-     * User forks own frozen copies of each copied Turn's AuthoritySnapshot. Child forks never
-     * inherit the parent's authority: their copied Turns keep no authority of their own.
-     */
-    copyTurnAuthority: boolean;
     /** Target roots for copied request projections; omitted when the target re-sequences Context. */
     contextRoots?: ForkContextRoots;
     now: string;
@@ -122,8 +117,8 @@ export async function prepareConversationForkSnapshot(
   if (input.boundaryMessageSeq === undefined && compressionBlocks.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
   }
-  if (compressionBlocks.length > 0 && (!input.copyTurnAuthority || !input.contextRoots)) {
-    throw new Error('Copying CompressionBlocks requires a user fork with frozen authority and target roots.');
+  if (compressionBlocks.length > 0 && !input.contextRoots) {
+    throw new Error('Copying CompressionBlocks requires the target Context roots.');
   }
 
   const membershipBarrier = await database.snapshotAll(
@@ -357,11 +352,12 @@ export async function prepareConversationForkSnapshot(
     requestIdSet.add(requestId);
     requestIds.push(requestId);
   }
-  const authoritySnapshots = input.copyTurnAuthority
-    ? (await Promise.all(turnRows.map((turn) =>
-        listAllDomainRows(database, 'AuthoritySnapshot', { turn_id: id(turn.id, 'Turn.id') })
-      ))).flat()
-    : [];
+  // Every fork owns its history: each copied Turn owns a copy of its frozen AuthoritySnapshot and
+  // copied requests reference that copy, never a row of the source (or a deleted parent). The copy
+  // is a historical record: a child's own Turns still compile their authority from its assignment.
+  const authoritySnapshots = (await Promise.all(turnRows.map((turn) =>
+    listAllDomainRows(database, 'AuthoritySnapshot', { turn_id: id(turn.id, 'Turn.id') })
+  ))).flat();
   const projections = input.contextRoots
     ? await readRequestProjections(database, requestAggregates, input.contextRoots)
     : [];
@@ -414,9 +410,7 @@ export async function prepareConversationForkSnapshot(
   const requestIdMap = idMap(target, 'model_request', requestIds);
   const toolIdMap = idMap(target, 'tool_call', tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')));
   const modelResultIdMap = idMap(target, 'tool_model_result', tools.map((fact) => id(fact.modelResult.id, 'ToolModelResult.id')));
-  const authorityIdMap = input.copyTurnAuthority
-    ? idMap(target, 'authority_snapshot', authoritySnapshots.map((snapshot) => id(snapshot.id, 'AuthoritySnapshot.id')))
-    : undefined;
+  const authorityIdMap = idMap(target, 'authority_snapshot', authoritySnapshots.map((snapshot) => id(snapshot.id, 'AuthoritySnapshot.id')));
 
   const assertions: RepositoryTransactionStep[] = [];
   const inserts: RepositoryTransactionStep[] = [];
@@ -546,7 +540,7 @@ export async function prepareConversationForkSnapshot(
     }));
     inserts.push(DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
       ...snapshot,
-      id: mapped(authorityIdMap!, sourceSnapshotId, 'AuthoritySnapshot'),
+      id: mapped(authorityIdMap, sourceSnapshotId, 'AuthoritySnapshot'),
       turn_id: mapped(turnIdMap, sourceTurnId, 'Turn')
     }));
   }
@@ -563,7 +557,7 @@ export async function prepareConversationForkSnapshot(
     }));
   }
   for (const copy of blockCopies) {
-    addCompressionBlockCopy(assertions, inserts, copy, input.sourceConversationId, target, authorityIdMap!);
+    addCompressionBlockCopy(assertions, inserts, copy, input.sourceConversationId, target, authorityIdMap);
   }
   for (const fact of messageFacts) {
     for (const link of fact.requestLinks) {
@@ -1110,7 +1104,7 @@ function addRequestAggregate(
   target: string,
   turnIds: Map<string, string>,
   requestIds: Map<string, string>,
-  authorityIds: Map<string, string> | undefined
+  authorityIds: Map<string, string>
 ): void {
   const sourceRequestId = id(aggregate.request.id, 'ModelRequest.id');
   const targetRequestId = mapped(requestIds, sourceRequestId, 'ModelRequest');
@@ -1123,13 +1117,11 @@ function addRequestAggregate(
     ...aggregate.request,
     id: targetRequestId,
     turn_id: mapped(turnIds, id(aggregate.request.turn_id, 'ModelRequest.turn_id'), 'Turn'),
-    ...(authorityIds ? {
-      authority_snapshot_id: mapped(
-        authorityIds,
-        id(aggregate.request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
-        'AuthoritySnapshot'
-      )
-    } : {})
+    authority_snapshot_id: mapped(
+      authorityIds,
+      id(aggregate.request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
+      'AuthoritySnapshot'
+    )
   }));
   const sourceOperationId = id(aggregate.operation.id, 'Operation.id');
   const targetOperationId = copyId(target, 'operation', sourceOperationId);

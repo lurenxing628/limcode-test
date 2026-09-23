@@ -25,8 +25,10 @@ export interface ChildContextForkPlan {
 }
 
 /**
- * Prepares history only: no Conversation, execution ownership, authority or child-control links.
- * The caller commits this plan with the new child and its new assignment in one transaction.
+ * Prepares history only: no Conversation, execution ownership or child-control links. Inherited
+ * Turns own frozen copies of their historical AuthoritySnapshots (like any fork), while the child's
+ * own authority is compiled from its assignment by the caller, which commits this plan with the new
+ * child and that assignment in one transaction.
  */
 export async function prepareChildContextFork(
   database: RuntimeDatabase,
@@ -157,7 +159,6 @@ export async function prepareChildContextFork(
     selectedMessageIds: selectedMessages,
     boundaryMessageSeq: boundary,
     contextSegmentIds: segmentIds,
-    copyTurnAuthority: false,
     now: input.now
   });
   const copiedSources = new Map<string, string[]>();

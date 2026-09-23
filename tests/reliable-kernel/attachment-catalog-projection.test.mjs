@@ -961,7 +961,6 @@ test('fork snapshot preserves source attachment handle sequence for the copied p
       targetConversationId: 'conversation-handle-target',
       boundaryMessageSeq: 1n,
       targetAgentId: 'agent-target',
-      copyTurnAuthority: true,
       now: NOW
     });
     const handleInsert = plan.inserts.find((step) =>
