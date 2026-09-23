@@ -226,6 +226,7 @@ async function directAdmission({ declaration, toolPolicy }) {
   const matching = read => (records[read.domain] ?? []).filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
   const settlements = [];
   const reached = [];
+  const prepared = [];
   const dispatcher = new ReliableToolDispatcher({
     database: {
       async snapshot(reads) { return { snapshot: reads.map(read => read.kind === 'get' ? (records[read.domain] ?? []).find(row => row.id === read.id) : matching(read)) }; },
@@ -238,11 +239,11 @@ async function directAdmission({ declaration, toolPolicy }) {
       async readTerminalResult() { return null; },
       async settleWithoutEffect(input) { settlements.push(input); return { status: input.status }; }
     },
-    mcp: { async prepare() { reached.push('mcp'); throw new Error('The MCP effect plane is not part of this fixture.'); } },
+    mcp: { async prepare(input) { reached.push('mcp'); prepared.push(input); throw new Error('The MCP effect plane is not part of this fixture.'); } },
     host: { definitions: () => [{ execution: 'runtime', declaration, async execute() { throw new Error('not reached'); } }] }
   });
   await dispatcher.dispatch({ turnId: 'turn', modelRequestId: 'request', toolCallId: 'call', toolName: declaration.name, arguments: {} }).catch(() => undefined);
-  return { rejected: settlements.filter(entry => entry.status === 'rejected').map(entry => entry.detail.reason), reached };
+  return { rejected: settlements.filter(entry => entry.status === 'rejected').map(entry => entry.detail.reason), reached, prepared };
 }
 
 test('dispatch admission refuses an MCP call its source settings deny, even when the frozen list names it', async () => {
@@ -367,6 +368,79 @@ server.connect(new StdioServerTransport());
       assert.equal(allowed(names, 'mcp-server-a/search'), false);
       assert.equal(allowed(names, 'mcp-server-b/search'), true);
     }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP tool names every model API rejects get a stable provider-safe name; valid names and the original-name identity stay as they were', { timeout: 120000 }, async () => {
+  // Live Chat, Responses, Claude and Gemini requests all answer one such name with a 400 for the whole
+  // request (`.`, `/`, a space, non-ASCII; Gemini also a first character that is not a letter or `_`).
+  const { McpRuntimeManager, dedupeMcpToolNames } = load('backend/application/mcpRuntimeManager.js');
+  const { toolAllowedByPolicy, toolConfigKey } = load('shared/toolPolicyResolution.js');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-mcp-safe-names-'));
+  try {
+    const script = path.join(root, 'server.cjs');
+    await fs.writeFile(script, `
+const { Server } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/index.js'))});
+const { StdioServerTransport } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/stdio.js'))});
+const { ListToolsRequestSchema } = require(${JSON.stringify(require.resolve('@modelcontextprotocol/sdk/types.js'))});
+const server = new Server({ name: 'fixture', version: '1.0.0' }, { capabilities: { tools: {} } });
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: process.argv.slice(2).map(name => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })) }));
+server.connect(new StdioServerTransport());
+`);
+    const LONG_DOTTED = `x.${'y'.repeat(80)}`;
+    const servers = [
+      ['mcp-github', 'GitHub', ['repos.list', 'repos/list', 'repos_list', 'search']],
+      ['mcp-fs', 'fs', ['files/read']],
+      ['mcp-weather', 'my-server', ['get weather']],
+      ['mcp-notes', 'notes', ['创建笔记', 'create']],
+      ['mcp-7zip', '7zip', ['extract']],
+      ['mcp-long', 'long', [LONG_DOTTED]]
+    ];
+    const names = async () => {
+      const settings = { servers: servers.map(([id, name, tools]) => ({ id, name, enabled: true, transport: { kind: 'stdio', command: process.execPath, args: [script, ...tools] }, createdAt: 1, updatedAt: 1 })) };
+      const manager = new McpRuntimeManager({ async loadGlobalSettings() { return { settings }; } });
+      try {
+        await manager.refreshFromSettings({ discover: true });
+        assert.deepEqual(manager.sourceRecords().map(source => source.status), servers.map(() => 'connected'));
+        return dedupeMcpToolNames(manager.runtimeTools(), ['read', 'search', 'run_agent']);
+      } finally { await manager.dispose(); }
+    };
+    const tools = await names();
+    const byKey = Object.fromEntries(tools.map(tool => [`${tool.declaration.source.sourceId}/${tool.declaration.source.originalToolName}`, tool.declaration.name]));
+    const hash8 = (value) => createHash('sha256').update(value).digest('hex').slice(0, 8);
+    assert.deepEqual(byKey, {
+      'mcp-github/repos.list': `github_repos_list_${hash8('github_repos.list')}`,
+      'mcp-github/repos/list': `github_repos_list_${hash8('github_repos/list')}`,
+      'mcp-github/repos_list': 'github_repos_list',
+      'mcp-github/search': 'github_search',
+      'mcp-fs/files/read': `fs_files_read_${hash8('fs_files/read')}`,
+      'mcp-weather/get weather': `my-server_get_weather_${hash8('my-server_get weather')}`,
+      'mcp-notes/创建笔记': `notes_${hash8('notes_创建笔记')}`,
+      'mcp-notes/create': 'notes_create',
+      'mcp-7zip/extract': `_7zip_extract_${hash8('7zip_extract')}`,
+      [`mcp-long/${LONG_DOTTED}`]: `${`long_x_${'y'.repeat(80)}`.slice(0, 55)}_${hash8(`long_${LONG_DOTTED}`)}`
+    }, 'valid names are byte-identical; others are rewritten and always carry the hash of the name they replace');
+    for (const name of Object.values(byKey)) {
+      assert.match(name, /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/, `${name} is accepted by OpenAI, Claude and Gemini`);
+    }
+    assert.equal(new Set(Object.values(byKey)).size, tools.length, 'names that differ only in rewritten characters stay apart');
+    assert.deepEqual(Object.fromEntries((await names()).map(tool => [`${tool.declaration.source.sourceId}/${tool.declaration.source.originalToolName}`, tool.declaration.name])), byKey,
+      'the names are the same after a restart');
+
+    // Settings and dispatch keep naming the tool as its server does.
+    const dotted = tools.find(tool => tool.declaration.source.originalToolName === 'repos.list');
+    assert.equal(toolConfigKey(dotted.declaration), 'mcp:mcp-github/repos.list');
+    const policy = { allowedTools: [], sourceConfigs: { 'mcp-github': { enabled: true, disabledTools: ['repos.list'] } } };
+    assert.deepEqual(tools.filter(tool => tool.declaration.source.sourceId === 'mcp-github').map(tool => [tool.declaration.source.originalToolName, toolAllowedByPolicy(policy, tool.declaration)]),
+      [['repos.list', false], ['repos/list', true], ['repos_list', true], ['search', true]]);
+    // The per-tool auto-approve saved under the original-name key reaches the call made by the rewritten name.
+    const chinese = tools.find(tool => tool.declaration.source.originalToolName === '创建笔记').declaration;
+    const dispatched = await directAdmission({ declaration: chinese, toolPolicy: { allowedTools: [],
+      sourceConfigs: { 'mcp-notes': { enabled: true } }, toolConfigs: { 'mcp:mcp-notes/创建笔记': { autoApproveExecution: true } } } });
+    assert.deepEqual(dispatched.rejected, []);
+    assert.deepEqual(dispatched.prepared.map(input => [input.serverId, input.toolName]), [['mcp-notes', '创建笔记']], 'the server is called with its own tool name');
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

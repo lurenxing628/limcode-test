@@ -332,14 +332,41 @@ function mcpToolDeclaration(source: McpServerConfigRecord, tool: Tool): ToolDefi
 export const MCP_TOOL_NAME_MAX_LENGTH = 64;
 
 /**
- * AI 可见的工具名：`服务名_原始工具名`。服务名做 slug 保证字符合法，原始工具名保持原样以便和
- * MCP 服务自身文档一致。服务名 slug 后为空（例如全是中文）时改用 `mcp-<服务 id 的 8 位哈希>`，
+ * A function name every provider accepts, length aside. OpenAI takes `a-z, A-Z, 0-9, _ and -`, at most
+ * 64 (https://platform.openai.com/docs/api-reference/chat/create), Claude `^[a-zA-Z0-9_-]{1,128}$`
+ * (https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools). Gemini documents a
+ * looser set (https://ai.google.dev/api/caching#FunctionDeclaration), but live Chat, Responses, Claude
+ * and Gemini requests all answer a name with `.`, `/`, a space or non-ASCII with a 400, and Gemini also
+ * a name that does not start with a letter or `_`. One such MCP name fails every request, not one tool.
+ */
+const PROVIDER_TOOL_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+
+/**
+ * AI 可见的工具名：`服务名_原始工具名`。服务名做 slug 保证字符合法；原始工具名本身合法时保持原样，
+ * 以便和 MCP 服务自身文档一致。服务名 slug 后为空（例如全是中文）时改用 `mcp-<服务 id 的 8 位哈希>`，
  * 前缀短而稳定，不同服务也不会落到同一个前缀；普通 ASCII 服务名的工具名保持不变。超过 64 个字符
- * 的名字截短并接上整名的哈希（{@link capMcpToolName}）。仍然重名时由 {@link dedupeMcpToolNames}
- * 按来源 id 的固定顺序消歧。
+ * 的名字截短并接上整名的哈希（{@link capMcpToolName}）。整名含有接口不接受的字符或不以字母、下划线
+ * 开头时（例如 `repos.list`、`get weather`、中文工具名、`7zip` 服务），改用
+ * {@link providerSafeMcpToolName}。仍然重名时由 {@link dedupeMcpToolNames} 按来源 id 的固定顺序消歧。
+ * 名字只改给模型看的 `declaration.name`；派发与保存的设置仍按来源 id 加原始工具名识别。
  */
 function mcpToolDisplayName(source: McpServerConfigRecord, toolName: string): string {
-  return capMcpToolName(`${slug(source.name) || `mcp-${shortHash(source.id)}`}_${toolName}`);
+  const name = `${slug(source.name) || `mcp-${shortHash(source.id)}`}_${toolName}`;
+  return PROVIDER_TOOL_NAME_PATTERN.test(name) ? capMcpToolName(name) : providerSafeMcpToolName(name);
+}
+
+/**
+ * Rewrites a name no provider accepts: every run of other characters becomes `_`, a name not starting
+ * with a letter or `_` gets a leading `_`, and `_<8-character hash of the unchanged name>` is always
+ * appended, so names that only differed in the rewritten characters stay apart and each keeps the
+ * same name on every run. The result stays within {@link MCP_TOOL_NAME_MAX_LENGTH}.
+ */
+function providerSafeMcpToolName(name: string): string {
+  const hash = shortHash(name);
+  let head = name.replace(/[^A-Za-z0-9_-]+/g, '_');
+  if (!/^[A-Za-z_]/.test(head)) head = `_${head}`;
+  head = head.slice(0, MCP_TOOL_NAME_MAX_LENGTH - hash.length - 1).replace(/[_-]+$/, '') || '_';
+  return `${head}_${hash}`;
 }
 
 /** A name within {@link MCP_TOOL_NAME_MAX_LENGTH}: longer ones keep their start and end with `_<8-character hash of the whole name>`. */
