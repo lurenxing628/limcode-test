@@ -10,7 +10,8 @@ const WEBVIEW_TEST_FILES = Object.freeze([
   'webview/tests/segmentedTimeline.test.ts',
   'webview/tests/nativeConversationProjection.test.ts',
   'webview/tests/forkRequestLifecycle.test.ts',
-  'webview/tests/reliableCollaborationTimeline.test.ts'
+  'webview/tests/reliableCollaborationTimeline.test.ts',
+  'webview/tests/summaryRebuildPreview.test.ts'
 ]);
 const CI_TEST_FILES = Object.freeze([
   'tests/bottomStickyScrollerScheduler.test.cjs',
@@ -119,6 +120,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/segmented-summary-chunking.test.mjs',
   'tests/reliable-kernel/segmented-rebuild-admission.test.mjs',
   'tests/reliable-kernel/compression-rebuild-preview.test.mjs',
+  'tests/reliable-kernel/compression-rebuild-dialog.test.mjs',
   'tests/reliable-kernel/streaming-output-regressions.test.mjs',
   'tests/reliable-kernel/storage-lock-multiprocess.test.cjs',
   'tests/reliable-kernel/stream-reset-tool-idempotency.test.mjs',

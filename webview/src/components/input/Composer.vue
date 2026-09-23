@@ -28,7 +28,9 @@ import SettingsSelectableList, { type SettingsSelectableListItem } from '@webvie
 import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
-import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
+import SummaryRebuildConfirm from '@webview/components/input/SummaryRebuildConfirm.vue';
+import { summaryRebuildTooltipRows } from '@webview/components/input/summaryRebuildPreview';
+import { useSummaryRebuildPreview } from '@webview/composables/useSummaryRebuildPreview';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
@@ -153,10 +155,8 @@ const currentContextRootId = computed(() => {
 const summaryRebuildCanConfirm = computed(() => canCompressCurrentContext.value
   && summaryRebuildTarget.value?.conversationId === reliableConversation.conversationId.value
   && summaryRebuildTarget.value?.rootId === currentContextRootId.value);
-const summaryRebuildActions = computed(() => [
-  { key: 'cancel', label: '取消', variant: 'secondary' as const },
-  { key: 'confirm', label: '重建摘要', disabled: !summaryRebuildCanConfirm.value }
-]);
+const summaryRebuildPreview = useSummaryRebuildPreview();
+const summaryRebuildTooltip = summaryRebuildTooltipRows();
 
 function beginSummaryRebuild(): void {
   if (!canCompressCurrentContext.value || !currentContextRootId.value) return;
@@ -164,6 +164,12 @@ function beginSummaryRebuild(): void {
     conversationId: reliableConversation.conversationId.value,
     rootId: currentContextRootId.value
   };
+  summaryRebuildPreview.request(summaryRebuildTarget.value.conversationId, summaryRebuildTarget.value.rootId);
+}
+
+function closeSummaryRebuild(): void {
+  summaryRebuildTarget.value = undefined;
+  summaryRebuildPreview.reset();
 }
 
 function confirmSummaryRebuild(): void {
@@ -171,7 +177,7 @@ function confirmSummaryRebuild(): void {
   compressContext(summaryRebuildTarget.value.conversationId, { kind: 'current_head' }, {
     sourceReplay: 'immutable_provenance'
   });
-  summaryRebuildTarget.value = undefined;
+  closeSummaryRebuild();
 }
 const channelOptions = computed<SettingsDropdownOption[]>(() =>
   globalSettings.llmProviderConfigs.configs.map((config) => {
@@ -1092,7 +1098,7 @@ function middleEllipsis(value: string, maxLength: number): string {
         </button>
         <HoverTooltipPanel
           panel-title="从原始记录重建摘要"
-          :rows="[{ label: '来源', value: '当前上下文对应的原始对话和工具记录' }]"
+          :rows="summaryRebuildTooltip"
           :delay-ms="180"
         >
           <button
@@ -1118,17 +1124,13 @@ function middleEllipsis(value: string, maxLength: number): string {
         </button>
       </div>
     </div>
-    <ConfirmPanel
+    <SummaryRebuildConfirm
       :open="!!summaryRebuildTarget"
-      title="从原始记录重建摘要？"
-      description="将读取当前上下文对应的原始对话和工具记录，按当前压缩配置重新生成摘要。原始记录和已有摘要保留；历史较长时会消耗更多 token。"
-      :actions="summaryRebuildActions"
-      test-id="compression-rebuild-confirm"
+      :preview="summaryRebuildPreview.state.value"
+      :target-current="summaryRebuildCanConfirm"
       @confirm="confirmSummaryRebuild"
-      @cancel="summaryRebuildTarget = undefined"
-    >
-      <p v-if="!summaryRebuildCanConfirm">当前上下文或执行状态已变化，请关闭后重新选择。</p>
-    </ConfirmPanel>
+      @cancel="closeSummaryRebuild"
+    />
   </div>
 </template>
 

@@ -111,6 +111,7 @@ docs/architecture/*
 !/tests/reliable-kernel/compression-rebuild-entry.test.mjs
 !/tests/reliable-kernel/segmented-rebuild-admission.test.mjs
 !/tests/reliable-kernel/compression-rebuild-preview.test.mjs
+!/tests/reliable-kernel/compression-rebuild-dialog.test.mjs
 !/tests/reliable-kernel/client-feed-window-rollover.test.mjs
 !/tests/reliable-kernel/conversation-deletion-recovery.test.mjs
 !/tests/reliable-kernel/frontend-copy-guardrails.test.cjs
@@ -143,6 +144,7 @@ docs/architecture/*
 !/webview/tests/nativeConversationProjection.test.ts
 !/webview/tests/forkRequestLifecycle.test.ts
 !/webview/tests/reliableCollaborationTimeline.test.ts
+!/webview/tests/summaryRebuildPreview.test.ts
 /scripts/reliable-kernel/concurrency-read-*.json
 /scripts/reliable-kernel/concurrency-tuning-*.json
 /scripts/reliable-kernel/model-independent-hotpaths-after.json
