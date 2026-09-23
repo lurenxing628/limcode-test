@@ -19,11 +19,11 @@ async function withRuntime(body) {
     return await body({ database, store });
   } finally { if (database) await database.close(); await fs.rm(directory, { recursive: true, force: true }); }
 }
-async function seedMessage({ database, store }, id, mode = 'message', target = 'target', text = `body of ${id}`) {
+async function seedMessage({ database, store }, id, mode = 'message', target = 'target', text = `body of ${id}`, source = 'sender') {
   const payload = await store.ingest(database, text, 'text/vnd.limcode.collaboration-message');
   await database.transaction([
     kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode, created_at: NOW }, { column: 'message_seq', scope: {} }),
-    row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: 'sender', source_kind: 'tool', source_key: id, turn_id: null, tool_call_id: null, created_at: NOW }),
+    row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: source, source_kind: 'tool', source_key: id, turn_id: null, tool_call_id: null, created_at: NOW }),
     row('RuntimeInboxItem', { id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message', source_id: id, state: 'available', created_at: NOW, updated_at: NOW }),
     row('CollaborationMessageTargetLink', { id: `${id}-target`, message_id: id, conversation_id: target, inbox_item_id: `${id}-inbox`, anchor_turn_id: null, created_at: NOW }),
     row('CollaborationMessagePayloadLink', { id: `${id}-payload`, message_id: id, content_object_id: payload.id, created_at: NOW }),
@@ -124,6 +124,37 @@ test('live collaboration feed includes only source and destination envelopes wit
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(received.length, before);
   } finally { feed.close(); }
+}));
+
+test('collaboration snapshot ships its peers as their own set with the sidebar title, beyond the navigation window', async () => withRuntime(async (runtime) => {
+  const { database, store } = runtime;
+  const LATER = '2026-09-23T00:00:00.000Z';
+  // The placeholder-titled sender shows its first user message in the sidebar.
+  const firstUser = await store.ingest(database, JSON.stringify({ role: 'user', parts: [{ text: '调研登录流程' }] }), 'application/vnd.limcode.message+json');
+  await database.transaction([
+    kernel.DOMAIN_REPOSITORIES.domain('Conversation').update('sender', { title: '新对话', updated_at: NOW }),
+    row('Message', { id: 'sender-first', created_at: NOW, updated_at: NOW, deleted_at: null }),
+    row('MessageRevision', { id: 'sender-first-revision', message_id: 'sender-first', revision_seq: 1n, role: 'user', content_object_id: firstUser.id, created_at: NOW }),
+    row('MessageCurrentRevisionLink', { id: 'sender-first-current', message_id: 'sender-first', revision_id: 'sender-first-revision', updated_at: NOW }),
+    row('MessagePartOfConversation', { id: 'sender-first-member', conversation_id: 'sender', message_id: 'sender-first', message_seq: 1n, created_at: NOW }),
+    row('Conversation', { id: 'gone', title: '已删的对话', status: 'active', created_at: NOW, updated_at: NOW }),
+    // Newer conversations (for example child tasks) push the idle peers out of the navigation list.
+    ...Array.from({ length: 205 }, (_value, index) => row('Conversation', { id: `busy-${index}`, title: `busy ${index}`, status: 'active', created_at: LATER, updated_at: LATER }))
+  ]);
+  await seedMessage(runtime, 'from-sender');
+  await seedMessage(runtime, 'from-gone', 'message', 'target', 'from a peer that is deleted later', 'gone');
+  await seedMessage(runtime, 'to-unrelated', 'message', 'unrelated', 'not ours', 'sender');
+  await new kernel.ConversationDeletionControlPlane(database).delete('gone');
+
+  const snapshot = (await database.clientProjectionSnapshot('target')).snapshot;
+  const navigation = snapshot.navigationSummary.conversations.map((value) => value.id);
+  assert.equal(navigation.includes('sender'), false, 'the peer is outside the bounded navigation list');
+  const peers = Object.fromEntries(snapshot.subagentDeliverySummary.collaborationPeerConversations.map((value) => [value.id, value]));
+  assert.deepEqual(Object.keys(peers).sort(), ['gone', 'sender'], 'exactly the peers of the loaded links');
+  assert.equal(peers.sender.status, 'active');
+  assert.equal(peers.sender.title, '新对话');
+  assert.equal(peers.sender.display_title, '调研登录流程', 'the same title the sidebar shows for a placeholder title');
+  assert.deepEqual(peers.gone, { id: 'gone', title: null, status: 'deleted', display_title: null }, 'a peer removed from the Runtime is known to be deleted');
 }));
 
 test('collaboration request identity cannot be rewritten and no per-conversation grant domain exists', () => {

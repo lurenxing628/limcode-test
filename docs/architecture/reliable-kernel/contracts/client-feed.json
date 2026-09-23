@@ -228,6 +228,7 @@
     "messagePreview": "CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read",
     "boardBodiesInFeed": false,
     "relations": "independent-message-source-target-reply-and-request-links",
+    "peerConversations": "snapshot-only-collaborationPeerConversations-for-peers-of-the-loaded-links-outside-navigation; sidebar-display_title; runtime-absent-peer-status-deleted; client-reads-only-observed-Conversation-remove-or-deleted-status-as-deleted-and-a-missing-peer-as-unknown",
     "runtimeContinuationPreview": "collaboration_message-source-kind-retains-sourceConversationId-mode-and-320-character-text-preview; never-user-authorization"
   }
 }

@@ -138,7 +138,8 @@ const collaborationTimeline = computed(() => projectCollaborationTimeline({
   conversationId: conversationId.value,
   records: feed.records,
   messages: messages.value,
-  turnIdByMessageId: projection.value.turnIdByMessageId
+  turnIdByMessageId: projection.value.turnIdByMessageId,
+  removedConversationIds: feed.removedConversationIds
 }));
 
 const compressionNotices = computed(() => projectCompressionNotices({

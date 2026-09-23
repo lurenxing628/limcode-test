@@ -1098,6 +1098,10 @@ function validateClient(client, failures) {
     || collaboration?.messagePreview !== 'CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read') {
     failures.push('协作前端投影必须有界、仅属于当前会话并按需读取正文');
   }
+  const peerRule = String(collaboration?.peerConversations ?? '');
+  for (const marker of ['collaborationPeerConversations', 'display_title', 'status-deleted', 'missing-peer-as-unknown']) {
+    if (!peerRule.includes(marker)) failures.push(`协作对方对话投影缺少${marker}`);
+  }
 
   if (client?.persistence?.clientChangeLog !== false || client?.persistence?.clientCommitTables !== false) failures.push('第一版不得持久化前端变更日志或提交表');
   if (client?.persistence?.sessionState !== 'memory-only') failures.push('前端同步会话必须只在内存中');

@@ -1,4 +1,5 @@
 import type { PlainData } from '@shared/plainData';
+import { collaborationPeerLabel, resolveCollaborationPeer, type CollaborationPeer } from './collaborationPeer';
 
 type FeedRecord = { [key: string]: PlainData };
 type FeedRecords = Record<string, Record<string, FeedRecord>>;
@@ -7,9 +8,7 @@ type FeedRecords = Record<string, Record<string, FeedRecord>>;
 export interface CollaborationTimelineCard {
   messageId: string;
   direction: 'incoming' | 'outgoing';
-  peerConversationId: string;
-  /** Title from the navigation list; null when the other Conversation no longer exists there. */
-  peerTitle: string | null;
+  peer: CollaborationPeer;
   kind: 'message' | 'followup' | 'result';
   textPreview: string;
   /** Committed but not yet bound to a target Turn (for example queued behind a running Turn). */
@@ -35,6 +34,8 @@ export function projectCollaborationTimeline(input: {
   records: FeedRecords;
   messages: ReadonlyArray<{ id: string; role: string }>;
   turnIdByMessageId: Readonly<Record<string, string>>;
+  /** Conversations this view saw removed; only these (or a deleted status) read as deleted. */
+  removedConversationIds: readonly string[];
 }): CollaborationTimeline {
   const result: CollaborationTimeline = { beforeMessage: {}, afterMessage: {}, unbound: [] };
   if (!input.conversationId) return result;
@@ -58,12 +59,10 @@ export function projectCollaborationTimeline(input: {
     if (!incoming && source.conversation_id !== input.conversationId) continue;
     const peerConversationId = text(incoming ? source.conversation_id : target.conversation_id);
     if (!peerConversationId) continue;
-    const peer = input.records.Conversation?.[peerConversationId];
     const card: CollaborationTimelineCard = {
       messageId,
       direction: incoming ? 'incoming' : 'outgoing',
-      peerConversationId,
-      peerTitle: peer && peer.status !== 'deleted' ? text(peer.title) || '未命名对话' : null,
+      peer: resolveCollaborationPeer(input.records, peerConversationId, input.removedConversationIds),
       kind: source.source_kind === 'completion' ? 'result' : message.mode === 'followup' ? 'followup' : 'message',
       textPreview: text(message.text_preview),
       waiting: false
@@ -93,7 +92,7 @@ export function projectCollaborationTimeline(input: {
 }
 
 export function collaborationCardLabel(card: CollaborationTimelineCard): string {
-  const peer = card.peerTitle ? `对话 ${card.peerTitle}` : '已删除的对话';
+  const peer = collaborationPeerLabel(card.peer);
   return card.direction === 'incoming' ? `来自${peer}` : `发往${peer}`;
 }
 

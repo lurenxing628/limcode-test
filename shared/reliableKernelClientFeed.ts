@@ -618,7 +618,9 @@ function seedRecordsFromSnapshot(
     collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
     collaborationMessageReplyLinks: 'CollaborationMessageReplyLink',
     collaborationRequests: 'CollaborationRequest',
-    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink'
+    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink',
+    /** Snapshot-only: the peers of the loaded collaboration links, outside the navigation list. */
+    collaborationPeerConversations: 'CollaborationPeerConversation'
   };
   const visit = (value: PlainData): void => {
     if (Array.isArray(value)) {

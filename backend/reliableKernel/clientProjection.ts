@@ -12,6 +12,12 @@ import {
   RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS,
   type ActiveTurnWorkEnvironmentProjection
 } from '../../shared/reliableKernelClientFeed';
+import {
+  DEFAULT_CONVERSATION_TITLE,
+  GENERATED_CONVERSATION_TITLE_PREFIX,
+  displayConversationTitle
+} from '../../shared/conversationTitle';
+import type { MessageContent } from '../../shared/protocol';
 import type { SnapshotBarrier } from './contracts';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
@@ -488,6 +494,8 @@ export function projectProcessRecord(
   };
 }
 
+const PEER_TITLE_CONTENT_MAX_BYTES = 256_000n;
+
 /** Bounded envelope preview; the full body stays in CAS behind the explicit message read path. */
 export function projectCollaborationMessageRecord(
   database: Database.Database,
@@ -516,6 +524,69 @@ export function projectCollaborationMessageRecord(
     ...record,
     text_preview: characters.length <= limit ? normalized : `${characters.slice(0, limit - 1).join('')}…`
   };
+}
+
+/**
+ * The other Conversations named by the selected Conversation's collaboration links. A peer that is
+ * gone from the Runtime is marked deleted; a live one carries the title the sidebar shows (its
+ * first user message when the stored title is a placeholder). Title lookups never fail the
+ * snapshot: an unreadable first message just keeps the stored title.
+ */
+function projectCollaborationPeerConversations(
+  database: Database.Database,
+  activeConversationId: string,
+  peerIds: readonly string[],
+  content: ClientProjectionContentAccess
+): Array<Record<string, unknown>> {
+  const ids = [...new Set(peerIds)].filter((id) => id && id !== activeConversationId).sort();
+  if (ids.length === 0) return [];
+  const rows = new Map(queryAllByIds(database, 'conversation', 'id', ids).map((row) => [String(row.id), row]));
+  const firstUserText = new Map<string, MessageContent>();
+  const placeholderIds = [...rows.values()]
+    .filter((row) => displayConversationTitle({ id: String(row.id), title: String(row.title) }) === DEFAULT_CONVERSATION_TITLE
+      || String(row.title).startsWith(GENERATED_CONVERSATION_TITLE_PREFIX))
+    .map((row) => String(row.id));
+  for (const first of queryFirstUserRevisions(database, placeholderIds)) {
+    const title = readFirstUserTitleContent(database, String(first.revision_id), content);
+    if (title) firstUserText.set(String(first.conversation_id), title);
+  }
+  return ids.map((id) => {
+    const row = rows.get(id);
+    if (!row) return { id, title: null, status: 'deleted', display_title: null };
+    const first = firstUserText.get(id);
+    return {
+      id,
+      title: row.title,
+      status: row.status,
+      display_title: displayConversationTitle({
+        id,
+        title: String(row.title),
+        ...(first ? { messages: [{ role: 'user' as const, content: first }] } : {})
+      })
+    };
+  });
+}
+
+function readFirstUserTitleContent(
+  database: Database.Database,
+  revisionId: string,
+  content: ClientProjectionContentAccess
+): MessageContent | undefined {
+  try {
+    const revision = database.prepare('SELECT content_object_id FROM message_revision WHERE id = ?').get(revisionId) as { content_object_id?: unknown } | undefined;
+    const raw = revision ? database.prepare('SELECT * FROM content_object WHERE id = ?').get(String(revision.content_object_id)) : undefined;
+    if (!raw) return undefined;
+    const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
+    if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length > PEER_TITLE_CONTENT_MAX_BYTES) return undefined;
+    const text = content.readVerifiedBytes(metadata).toString('utf8');
+    const contentType = String(metadata.content_type).toLowerCase();
+    if (contentType.startsWith('text/plain')) return { role: 'user', parts: [{ text }] };
+    const value: unknown = JSON.parse(text);
+    const parts = value && typeof value === 'object' && !Array.isArray(value) ? (value as { parts?: unknown }).parts : undefined;
+    return Array.isArray(parts) ? { role: 'user', parts: parts as MessageContent['parts'] } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function deriveCommittedParentHandling(
@@ -1021,6 +1092,12 @@ export function executeClientProjectionSnapshot(
     const collaborationMessageReplyLinks = queryAllByIds(database, 'collaboration_message_reply_link', 'message_id', collaborationIds);
     const collaborationRequests = queryAllByIds(database, 'collaboration_request', 'message_id', collaborationIds);
     const collaborationRequestTurnLinks = queryAllByIds(database, 'collaboration_request_turn_link', 'request_id', collaborationRequests.map(row => String(row.id)));
+    // Peers are named by their own set: the bounded navigation list holds only the newest
+    // Conversations (child tasks included), so an idle peer is usually not in it.
+    const collaborationPeerConversations = projectCollaborationPeerConversations(database, conversationId, [
+      ...collaborationMessageSourceLinks.map(row => String(row.conversation_id)),
+      ...collaborationMessageTargetLinks.map(row => String(row.conversation_id))
+    ], content);
 
     const snapshot: ClientProjectionSnapshot = {
       navigationSummary: { conversations },
@@ -1098,7 +1175,8 @@ export function executeClientProjectionSnapshot(
         collaborationMessageTargetLinks,
         collaborationMessageReplyLinks,
         collaborationRequests,
-        collaborationRequestTurnLinks
+        collaborationRequestTurnLinks,
+        collaborationPeerConversations
       }
     };
     database.exec('COMMIT');

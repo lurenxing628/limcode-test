@@ -22,7 +22,7 @@ const kindLabel = computed(() => collaborationCardKindLabel(props.card));
     <header class="collaboration-card-header">
       <IconArrowDownLeft v-if="card.direction === 'incoming'" :size="14" stroke="1.9" aria-hidden="true" />
       <IconArrowUpRight v-else :size="14" stroke="1.9" aria-hidden="true" />
-      <strong class="collaboration-card-peer" :class="{ 'is-deleted': !card.peerTitle }">{{ label }}</strong>
+      <strong class="collaboration-card-peer" :class="{ 'is-deleted': card.peer.state === 'deleted', 'is-unknown': card.peer.state === 'unknown' }">{{ label }}</strong>
       <span class="collaboration-card-kind">{{ kindLabel }}</span>
       <span v-if="card.waiting" class="collaboration-card-state">等待下一轮处理</span>
     </header>
@@ -73,8 +73,12 @@ const kindLabel = computed(() => collaborationCardKindLabel(props.card));
   white-space: nowrap;
 }
 
-.collaboration-card-peer.is-deleted {
+.collaboration-card-peer.is-deleted,
+.collaboration-card-peer.is-unknown {
   color: var(--vscode-descriptionForeground);
+}
+
+.collaboration-card-peer.is-deleted {
   font-style: italic;
 }
 

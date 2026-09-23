@@ -24,6 +24,7 @@ import type {
 } from '@shared/reliableKernelClientFeed';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { collaborationPeerLabel, resolveCollaborationPeer } from '@webview/domain/collaborationPeer';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
@@ -382,11 +383,10 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
   return '(空消息)';
 }
 
-/** Title comes from the navigation list; a Conversation missing there has been deleted. */
+/** Same peer label as the collaboration cards: the sidebar title, deleted only when removed. */
 function collaborationSourceLabel(conversationId: string): string {
-  const conversation = reliableConversation.feed.records.Conversation?.[conversationId];
-  const title = typeof conversation?.title === 'string' ? conversation.title.trim() : '';
-  return conversation ? `来自对话 ${title || '未命名对话'}` : '来自已删除的对话';
+  const feed = reliableConversation.feed;
+  return `来自${collaborationPeerLabel(resolveCollaborationPeer(feed.records, conversationId, feed.removedConversationIds))}`;
 }
 
 function subagentName(agentId?: string): string {
