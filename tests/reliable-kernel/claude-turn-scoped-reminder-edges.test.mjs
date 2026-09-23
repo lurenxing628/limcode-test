@@ -35,6 +35,7 @@ after(() => { Module._load = originalLoad; });
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = await import(pathToFileURL(path.join(compiled, 'backend/reliableKernel/index.js')).href);
+const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -532,77 +533,87 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, compression 
   let app;
   const providerSettings = async (providerId, modelId) =>
     ({ ...applyFrozenModelProviderConfig(await configuration.providerConfig(providerId), modelId), apiKey: '' });
-  app = await kernel.ReliableKernelApplication.open(authority, {
-    authorityCompiler: configuration, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
-    resolveWorkEnvironment: async () => undefined,
-    mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { assert.fail('no MCP'); } },
-    mcpPolicyGate: { async authorize() { assert.fail('no MCP'); } },
-    providers: { resolve(providerId) {
-      return { providerId, async sendFullRequest(request, controls) {
-        if (request.recipe.kind === 'reliable-context-compression') {
-          // One compression is enough: the rest of the Turn runs on the compressed window.
-          await setCompressionTrigger('manual');
-          if (request.recipe.compressionMethodKind !== 'provider_native') {
-            await controls.onEvent({ kind: 'completed', streamSeq: '1', content: {
-              type: 'compression_result', contents: [{ role: 'user', parts: [{ text: 'Synthetic summary of the earlier work.' }] }]
-            } });
-            compactions.push({ request });
+  let facade;
+  const open = async () => {
+    configuration = new VscodeConfigurationAuthority(getPaths);
+    await configuration.synchronizeWorkspaceFolders([{ uri, name: 'Fixture', rootPath: folderPath, index: 0 }]);
+    app = await kernel.ReliableKernelApplication.open(authority, {
+      authorityCompiler: configuration, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
+      resolveWorkEnvironment: async () => undefined,
+      mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { assert.fail('no MCP'); } },
+      mcpPolicyGate: { async authorize() { assert.fail('no MCP'); } },
+      providers: { resolve(providerId) {
+        return { providerId, async sendFullRequest(request, controls) {
+          if (request.recipe.kind === 'reliable-context-compression') {
+            // One compression is enough: the rest of the Turn runs on the compressed window.
+            await setCompressionTrigger('manual');
+            if (request.recipe.compressionMethodKind !== 'provider_native') {
+              await controls.onEvent({ kind: 'completed', streamSeq: '1', content: {
+                type: 'compression_result', contents: [{ role: 'user', parts: [{ text: 'Synthetic summary of the earlier work.' }] }]
+              } });
+              compactions.push({ request });
+              return;
+            }
+            let compactRequest;
+            const adapter = new kernel.LlmCapabilityFullRequestAdapter(providerId, {
+              compact(input, emit) {
+                compactRequest = structuredClone(input);
+                emit({ type: 'llm:compactDone', payload: { requestId: input.id, result: {
+                  id: 'msg_compaction', object: 'message',
+                  contents: [{ role: 'model', parts: [{ providerContext: {
+                    provider: 'anthropic', format: 'claude', endpoint: '/v1/messages', itemType: 'compaction', rawItem: signed
+                  } }] }]
+                } } });
+              },
+              start() { assert.fail('compaction only'); }, abort() {}, cancelRetry() {}, dispose() {}
+            });
+            await adapter.sendFullRequest(request, controls);
+            const dry = await dryRunCompactLlmProvider(compactRequest, {
+              settings: await providerSettings(providerId, request.modelId), compressionSettings: async () => undefined
+            });
+            compactions.push({ request, compact: compactRequest, wire: JSON.parse(dry.calls[0].bodyText), headers: dry.calls[0].headers });
             return;
           }
-          let compactRequest;
+          let start;
           const adapter = new kernel.LlmCapabilityFullRequestAdapter(providerId, {
-            compact(input, emit) {
-              compactRequest = structuredClone(input);
-              emit({ type: 'llm:compactDone', payload: { requestId: input.id, result: {
-                id: 'msg_compaction', object: 'message',
-                contents: [{ role: 'model', parts: [{ providerContext: {
-                  provider: 'anthropic', format: 'claude', endpoint: '/v1/messages', itemType: 'compaction', rawItem: signed
-                } }] }]
-              } } });
-            },
-            start() { assert.fail('compaction only'); }, abort() {}, cancelRetry() {}, dispose() {}
+            start(input, emit) { start = structuredClone(input); emit({ type: 'llm:done', payload: { requestId: input.id } }); },
+            abort() {}, cancelRetry() {}, dispose() {}
           });
-          await adapter.sendFullRequest(request, controls);
-          const dry = await dryRunCompactLlmProvider(compactRequest, {
-            settings: await providerSettings(providerId, request.modelId), compressionSettings: async () => undefined
+          await adapter.sendFullRequest(request, { async onEvent() { return { accepted: true, checkpointed: true, terminal: false }; } });
+          const dryRun = await dryRunLlmProvider(start, { settings: await providerSettings(providerId, request.modelId) });
+          const entry = { request, start, wire: dryRun.body, headers: dryRun.headers, afterCompression: compactions.length };
+          requests.push(entry);
+          await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: scriptedReply(request, requests.length) } });
+        } };
+      } },
+      toolDispatcher: {
+        definitions() {
+          return [
+            { name: 'update_task_list', description: 'Synthetic task list', parameters: { type: 'object' } },
+            { name: 'read', description: 'Synthetic read', parameters: { type: 'object' } }
+          ];
+        },
+        async dispatch(input) {
+          // After the second tool call the window is over the threshold: the next round compresses it, Turn input included.
+          if (++toolCount === 2) await setCompressionTrigger('token_threshold');
+          const settled = await app.runtime.effects.settleWithoutEffect({
+            source: { kind: 'internal', key: `fixture:${input.toolCallId}` },
+            toolCallId: input.toolCallId, status: 'succeeded',
+            detail: input.toolName === 'update_task_list'
+              ? { kind: 'task-list', operation: { kind: 'task_list.operation', ...TASKS } }
+              : { text: 'alpha' }
           });
-          compactions.push({ request, compact: compactRequest, wire: JSON.parse(dry.calls[0].bodyText), headers: dry.calls[0].headers });
-          return;
+          return settled.terminal ?? app.runtime.effects.readTerminalResult(input.toolCallId, true);
         }
-        let start;
-        const adapter = new kernel.LlmCapabilityFullRequestAdapter(providerId, {
-          start(input, emit) { start = structuredClone(input); emit({ type: 'llm:done', payload: { requestId: input.id } }); },
-          abort() {}, cancelRetry() {}, dispose() {}
-        });
-        await adapter.sendFullRequest(request, { async onEvent() { return { accepted: true, checkpointed: true, terminal: false }; } });
-        const dryRun = await dryRunLlmProvider(start, { settings: await providerSettings(providerId, request.modelId) });
-        const entry = { request, start, wire: dryRun.body, headers: dryRun.headers, afterCompression: compactions.length };
-        requests.push(entry);
-        await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: scriptedReply(request, requests.length) } });
-      } };
-    } },
-    toolDispatcher: {
-      definitions() {
-        return [
-          { name: 'update_task_list', description: 'Synthetic task list', parameters: { type: 'object' } },
-          { name: 'read', description: 'Synthetic read', parameters: { type: 'object' } }
-        ];
-      },
-      async dispatch(input) {
-        // After the second tool call the window is over the threshold: the next round compresses it, Turn input included.
-        if (++toolCount === 2) await setCompressionTrigger('token_threshold');
-        const settled = await app.runtime.effects.settleWithoutEffect({
-          source: { kind: 'internal', key: `fixture:${input.toolCallId}` },
-          toolCallId: input.toolCallId, status: 'succeeded',
-          detail: input.toolName === 'update_task_list'
-            ? { kind: 'task-list', operation: { kind: 'task_list.operation', ...TASKS } }
-            : { text: 'alpha' }
-        });
-        return settled.terminal ?? app.runtime.effects.readTerminalResult(input.toolCallId, true);
       }
-    }
-  });
+    });
+    facade = Object.create(Facade.prototype);
+    facade.product = { application: app, configuration };
+    facade.historyEntries = [];
+    facade.refreshConversationHistory = async () => {};
+  };
   try {
+    await open();
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'source', title: 'Source', status: 'active', created_at: now, updated_at: now }),
@@ -615,16 +626,27 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, compression 
     }))).snapshot;
     await run({
       requests, compactions,
-      async turn(text) {
-        await app.database.conversationOwners.retain('source', 'fixture-panel:source');
+      get facade() { return facade; },
+      async reopen() { await app.close(); await open(); },
+      async lastMessage(conversationId, role) {
+        const memberships = await rows('MessagePartOfConversation', { conversation_id: conversationId });
+        for (const member of memberships.sort((left, right) => Number(right.message_seq - left.message_seq))) {
+          const [current] = await rows('MessageCurrentRevisionLink', { message_id: member.message_id });
+          const [revision] = await rows('MessageRevision', { id: current.revision_id });
+          if (revision.role === role) return { sourceConversationId: conversationId, messageId: member.message_id, expectedRevisionId: revision.id };
+        }
+        assert.fail('no such message');
+      },
+      async turn(text, conversationId = 'source') {
+        await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
         const input = await app.turns.input({
-          source: { kind: 'command', key: `source:${requests.length}:${text.slice(0, 16)}` }, conversationId: 'source',
+          source: { kind: 'command', key: `${conversationId}:${requests.length}:${text.slice(0, 16)}` }, conversationId,
           leaseOwnerId: 'reminder-edges-owner', hostBootId: app.database.hostBootId,
           leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(), content: text
         });
         const [lease] = await rows('ExecutionLease', { turn_id: input.turnId });
         const result = await kernel.runWithExecutionLeaseFence({
-          id: lease.id, conversationId: 'source', turnId: input.turnId, ownerId: lease.owner_id,
+          id: lease.id, conversationId, turnId: input.turnId, ownerId: lease.owner_id,
           hostBootId: lease.host_boot_id, generation: BigInt(lease.generation)
         }, () => app.agentLoop.drive(input.turnId)).catch(error => ({ terminalStatus: 'failed', error }));
         assert.equal(result.terminalStatus, 'completed',
@@ -660,6 +682,24 @@ test('(a) 真实内核：Turn 中途压缩掉输入并重新注入后，每次�
     const at = next.findIndex(entry => JSON.stringify(entry).includes(LABEL));
     assert.equal(next[at + 1].role, 'system');
     assert.equal(next[at + 1].content, h.requests[first].wire.messages.at(-1).content);
+
+    // Restart: only durable facts remain (fresh caches, fresh process-local adaptation state).
+    const beforeRestart = h.requests.at(-1);
+    await h.reopen();
+    await h.turn('after-restart');
+    const afterRestart = h.requests.at(-1);
+    assertPrefix(beforeRestart, afterRestart, 'after restart');
+    assertPlacement(afterRestart.wire.messages, 'after restart');
+    assert.equal(labelCount(afterRestart.wire.messages), 1);
+
+    // Fork: the copied rounds share their ModelRequest recipes, so the same input is placed at the same position.
+    const fork = await h.facade.forkConversation({ ...(await h.lastMessage('source', 'model')), command: { commandId: 'fork-reminder-edges' } });
+    await h.turn('in-fork', fork.conversationId);
+    const inFork = h.requests.at(-1);
+    assert.equal(inFork.request.conversationId, fork.conversationId);
+    assertPrefix(afterRestart, inFork, 'fork');
+    assertPlacement(inFork.wire.messages, 'fork');
+    assert.equal(labelCount(inFork.wire.messages), 1);
   }, { compression: 'llm_summary' });
 });
 
