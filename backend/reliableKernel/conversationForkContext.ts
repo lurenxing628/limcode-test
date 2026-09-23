@@ -4,8 +4,13 @@ import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 /**
- * The selected fork point is permanently unusable for this command: it copies a turn that has not
- * terminated. A fork only owns completed history, so retrying the same command cannot succeed.
+ * The fork command can never succeed, so retrying the same command is pointless and it leaves
+ * nothing behind (the application removes settings an earlier attempt copied). Causes: the fork
+ * point is gone or changed (missing source Conversation, a Message without a current Revision or of
+ * another Conversation, a changed Revision, a deleted fork-point Message, no completed history for
+ * fork_conversation); the copy would include history that is not completed (a Turn still running,
+ * or a compression made after the fork point, including one whose pre-compression history was
+ * rewritten); or the command is replayed with different source facts.
  */
 export class ConversationForkRejectedError extends Error {
   public constructor(message: string) {

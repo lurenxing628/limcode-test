@@ -420,7 +420,7 @@
       "all",
       "positive-integer-string"
     ],
-    "forkAuthority": "completed-committed-context-only; no-active-turn-no-child-control-links-no-ownership-or-authority-copy",
+    "forkAuthority": "completed-committed-context-only; no-active-turn-no-child-control-links-no-lease-or-ownership-copy; copied-Turns-own-copies-of-their-historical-AuthoritySnapshot; the-child-own-Turns-compile-authority-from-its-assignment",
     "board": {
       "domains": [
         "CollaborationBoardChannel",
