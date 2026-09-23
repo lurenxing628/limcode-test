@@ -608,7 +608,10 @@ test('a target holds at most 16 undelivered collaboration messages from other co
   assert.equal((await f.rows('RuntimeDelivery', { target_conversation_id: 'target-b', state: 'pending' })).length, 17);
   const before = (await f.rows('CollaborationMessage')).length;
   for (const mode of ['message', 'followup']) {
-    await assert.rejects(crossSend(f, `d-overflow-${mode}`, 'peer-d', 'peer-d-turn', 'target-b', mode), /16 undelivered collaboration messages/);
+    // The refusal names the count and what must happen first; it suggests nothing the model cannot do.
+    await assert.rejects(crossSend(f, `d-overflow-${mode}`, 'peer-d', 'peer-d-turn', 'target-b', mode),
+      error => /already has 16 unread collaboration messages/.test(error.message) && /no message or followup can be queued to it until it takes those in/.test(error.message)
+        && !/try again/.test(error.message));
   }
   assert.equal((await f.rows('CollaborationMessage')).length, before, 'a rejected send writes nothing');
   assert.equal((await f.rows('CollaborationRequest')).length, 7, 'a rejected followup spends no budget');

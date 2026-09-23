@@ -712,7 +712,9 @@ export class CollaborationControlPlane {
     const limit = CROSS_CONVERSATION_LIMITS.maxPendingInboundMessages;
     const where = { target_conversation_id: targetConversationId, state: 'pending' };
     const backlog = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('RuntimeDelivery').list({ where, collaborationBacklog: true, limit })])).snapshot[0] as DomainRow[];
-    if (backlog.length >= limit) throw new Error(`The target conversation already holds ${limit} undelivered collaboration messages, the most it may queue. Nothing was sent; try again after it has taken them in.`);
+    if (backlog.length >= limit) {
+      throw new Error(`The target conversation already has ${backlog.length} unread collaboration messages, the most it may hold. Nothing was sent, and no message or followup can be queued to it until it takes those in when its next turn starts.`);
+    }
     return [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds(where, backlog.map((row) => String(row.id)), { collaborationBacklog: true })];
   }
   private async assertReadPermission(caller: string, target: string): Promise<void> {
