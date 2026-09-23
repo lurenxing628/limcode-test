@@ -63,10 +63,13 @@ export class ReliableConversationLifecycle {
 
   public async fork(request: ConversationForkRequest): Promise<ConversationForkOutcome> {
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
+    const commandId = requireText(request.commandId, 'Conversation fork commandId');
     // The source Conversation DAG/configuration is read and copied under its ownership pin so a
     // peer Host cannot mutate or delete it mid-fork.
     return this.application.database.conversationOwners.run(sourceConversationId, () =>
-      this.forkUnderOwnership(request)
+      this.discardingRejectedTarget(commandId, (targetConversationId) =>
+        this.forkCommand(request, commandId, targetConversationId)
+      )
     );
   }
 
@@ -78,12 +81,14 @@ export class ReliableConversationLifecycle {
   public async forkCompletedHistory(request: CompletedHistoryForkRequest): Promise<ConversationForkOutcome & { title: string }> {
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
     const commandId = requireText(request.commandId, 'Conversation fork commandId');
-    return this.application.database.conversationOwners.run(sourceConversationId, async () => {
-      // A replayed command keeps its committed boundary even if more Turns have ended since.
-      const boundary = await this.committedForkBoundary(commandId) ?? await this.completedHistoryBoundary(sourceConversationId);
-      const result = await this.forkUnderOwnership({ sourceConversationId, commandId, ...boundary });
-      return { ...result, title: String((await this.requireRow('Conversation', result.conversationId)).title) };
-    });
+    return this.application.database.conversationOwners.run(sourceConversationId, () =>
+      this.discardingRejectedTarget(commandId, async (targetConversationId) => {
+        // A replayed command keeps its committed boundary even if more Turns have ended since.
+        const boundary = await this.committedForkBoundary(commandId) ?? await this.completedHistoryBoundary(sourceConversationId);
+        const result = await this.forkCommand({ sourceConversationId, commandId, ...boundary }, commandId, targetConversationId);
+        return { ...result, title: String((await this.requireRow('Conversation', result.conversationId)).title) };
+      })
+    );
   }
 
   /**
@@ -203,13 +208,15 @@ export class ReliableConversationLifecycle {
     }
   }
 
-  private async forkUnderOwnership(request: ConversationForkRequest): Promise<ConversationForkOutcome> {
-    const commandId = requireText(request.commandId, 'Conversation fork commandId');
-    // The branch target id is derived from the command identity alone, so a rejection can find
-    // settings an earlier attempt of the same command copied under it.
+  /**
+   * Runs one fork command against its branch target. The target id is derived from the command
+   * identity alone, so any permanent rejection of the command, including finding no completed
+   * history, can find settings an earlier attempt of the same command copied under it.
+   */
+  private async discardingRejectedTarget<T>(commandId: string, run: (targetConversationId: string) => Promise<T>): Promise<T> {
     const targetConversationId = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
     try {
-      return await this.forkCommand(request, commandId, targetConversationId);
+      return await run(targetConversationId);
     } catch (error) {
       if (error instanceof ConversationForkRejectedError) await this.discardRejectedForkTarget(targetConversationId);
       throw error;

@@ -890,6 +890,97 @@ test('a fork permanently rejected after an interrupted attempt removes the setti
   });
 });
 
+async function withSourceSettings(h) {
+  await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'source', text: 'source prompt' });
+  await h.configuration.mutations.selectConversationWorkflow({ conversationId: 'source', scopeKind: 'global' });
+}
+
+test('a rejection raised after the settings copy removes every copied setting, the workflow selection included', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'late-rejection-input');
+    await withSourceSettings(h);
+    const command = await h.command('source', 'late-rejection', 'user');
+    const database = h.app.database;
+    const transaction = database.transaction.bind(database);
+    let copied;
+    database.transaction = async (steps, ...rest) => {
+      if (copied === undefined && steps.some(step => step.kind === 'insert' && step.domain === 'Conversation')) {
+        copied = await strayConversationSettings(h.configuration, ['source']);
+        throw new kernel.ConversationForkRejectedError('injected rejection at the fork commit');
+      }
+      return transaction(steps, ...rest);
+    };
+    try {
+      await assert.rejects(h.facade.forkConversation(command), /injected rejection at the fork commit/);
+    } finally {
+      database.transaction = transaction;
+    }
+    assert.ok(copied.some(([key]) => key === 'conversationWorkflowSelections') && copied.some(([key]) => key === 'systemPromptScopeLinks'),
+      'fixture: the settings, the workflow selection included, were copied before the commit');
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source']), []);
+    assert.equal((await rows(h.app, 'Conversation')).length, 1);
+  });
+});
+
+test('a fork that fails before its commit point writes no settings', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'early-failure-input');
+    await withSourceSettings(h);
+    const command = await h.command('source', 'early-failure', 'user');
+    const writer = h.app.runtime.conversationFork;
+    const database = h.app.database;
+    const fork = writer.fork;
+    writer.fork = async function (...args) {
+      const materialize = database.materializeContext;
+      database.materializeContext = async () => { throw new Error('injected fork read failure'); };
+      try { return await fork.apply(this, args); } finally { database.materializeContext = materialize; }
+    };
+    try {
+      await assert.rejects(h.facade.forkConversation(command),
+        error => !(error instanceof kernel.ConversationForkRejectedError) && /injected fork read failure/.test(error.message));
+    } finally {
+      writer.fork = fork;
+    }
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source']), [],
+      'settings are copied only for a fork that passed every check');
+    const retried = await h.facade.forkConversation(command);
+    const config = await h.configuration.configurationClientState();
+    assert.equal(config.conversationWorkflowSelections.find(item => item.conversationId === retried.conversationId)?.scopeKind, 'global');
+  });
+});
+
+test('fork_conversation rejected for lack of completed history removes the settings an interrupted attempt copied', async () => {
+  const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
+  await withForkRuntime(async h => {
+    await h.turn('source', 'completed-history-input');
+    await withSourceSettings(h);
+    const lifecycle = new ReliableConversationLifecycle({ application: h.app, configuration: h.configuration });
+    const request = { sourceConversationId: 'source', commandId: 'fork-tool-call-interrupted' };
+    const database = h.app.database;
+    const transaction = database.transaction.bind(database);
+    let injected = false;
+    database.transaction = async (steps, ...rest) => {
+      if (!injected && steps.some(step => step.kind === 'insert' && step.domain === 'Conversation')) {
+        injected = true;
+        throw new Error('injected fork commit failure');
+      }
+      return transaction(steps, ...rest);
+    };
+    try {
+      await assert.rejects(lifecycle.forkCompletedHistory(request), /injected fork commit failure/);
+    } finally {
+      database.transaction = transaction;
+    }
+    assert.notDeepEqual(await strayConversationSettings(h.configuration, ['source']), [],
+      'fixture: the interrupted attempt copied settings before its commit failed');
+    const first = await h.command('source', 'unused', 'user');
+    await h.app.turns.delete({ source: { kind: 'command', key: 'delete-all-history' }, conversationId: 'source', messageId: first.messageId });
+    await assert.rejects(lifecycle.forkCompletedHistory(request),
+      error => error instanceof kernel.ConversationForkRejectedError && /还没有已完成的轮次/.test(error.message));
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source']), []);
+  });
+});
+
 test('a failed settings cleanup is logged and never replaces the permanent rejection', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'cleanup-failure-input');
