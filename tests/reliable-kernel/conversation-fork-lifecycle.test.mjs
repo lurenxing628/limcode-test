@@ -1100,6 +1100,82 @@ test('a plan approved in the source still authorizes a retry in a fork of a fork
   } });
 });
 
+async function currentTaskItems(app, conversationId) {
+  const window = (await app.database.clientProjectionSnapshot(conversationId)).snapshot.activeConversationWindow;
+  return {
+    current: window.currentTaskList?.items.map(item => [item.title, item.status]) ?? null,
+    cards: window.taskList.map(card => [card.outcome, card.detail_on_demand, card.items?.map(item => [item.title, item.status]) ?? null])
+  };
+}
+
+test('forks keep the task panel and the approved plan of copied tool calls, also after the source is deleted', async () => {
+  const planPolicy = { mode: 'before_mutation', allowReadonlyBeforeApproval: false, requireForToolRiskLevels: ['write'] };
+  const taskList = { mode: 'rewrite', items: [{ title: 'Fork task A', status: 'pending' }, { title: 'Fork task B', status: 'pending' }] };
+  // Completing every task lets the turn end instead of being reminded of unfinished work.
+  const update = { kind: 'task_list.operation', mode: 'update',
+    items: [{ title: 'Fork task A', status: 'completed' }, { title: 'Fork task B', status: 'completed' }] };
+  await withForkRuntime(async h => {
+    await h.turn('source', 'task-source-input');
+    const expected = {
+      current: [['Fork task A', 'completed'], ['Fork task B', 'completed']],
+      cards: [['succeeded', false, [['Fork task A', 'completed'], ['Fork task B', 'completed']]]]
+    };
+    assert.deepEqual(await currentTaskItems(h.app, 'source'), expected);
+    const fork = await h.facade.forkConversation(await h.command('source', 'task-first-fork'));
+    const nested = await h.facade.forkConversation(await h.command(fork.conversationId, 'task-nested-fork'));
+    for (const conversationId of [fork.conversationId, nested.conversationId]) {
+      assert.deepEqual(await currentTaskItems(h.app, conversationId), expected, 'copied task calls keep the task panel');
+    }
+
+    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
+    assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
+    for (const conversationId of [fork.conversationId, nested.conversationId]) {
+      assert.deepEqual(await currentTaskItems(h.app, conversationId), expected, 'copied identity survives deleting the source');
+    }
+
+    const [copiedTurn] = await rows(h.app, 'Turn', { conversation_id: nested.conversationId });
+    const [copiedPlan] = await rows(h.app, 'ToolCall', { turn_id: copiedTurn.id, tool_name: 'submit_plan' });
+    const boundary = await h.command(nested.conversationId, 'task-retry-boundary');
+    const retry = await h.turn(nested.conversationId, 'plan-retry-after-source-delete', {
+      sourceTurnId: copiedTurn.id, target: { kind: 'message', messageId: boundary.messageId },
+      expectedMessageRevisionId: boundary.expectedRevisionId
+    });
+    const [snapshot] = await rows(h.app, 'AuthoritySnapshot', { turn_id: retry.turnId });
+    const { readFrozenTurnAuthority } = load('backend/reliableKernel/frozenAuthority.js');
+    const authority = await readFrozenTurnAuthority(h.app.database, h.app.contentStore, snapshot.id, retry.turnId);
+    assert.equal(authority.document.retryLineage.inheritedPlanApprovalToolCallId, copiedPlan.id);
+    const [mutation] = await rows(h.app, 'ToolCall', { turn_id: retry.turnId, tool_name: 'read' });
+    assert.ok(mutation, 'the retried turn issued a gated tool call');
+    const gate = new kernel.FrozenAuthorityMcpPolicyGate(h.app.database, h.app.contentStore);
+    assert.deepEqual(await gate.authorize({ toolCallId: mutation.id, serverId: 'fixture-mcp', riskLevel: 'write' }),
+      { toolPolicyAllowed: true, planReviewAllowed: true });
+    assert.deepEqual((await currentTaskItems(h.app, nested.conversationId)).current, expected.current);
+  }, { script: {
+    async configure(configuration) {
+      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'submit_plan', 'update_task_list'] });
+      await configuration.mutations.setPlanReviewPolicy({ scopeKind: 'global', ...planPolicy });
+    },
+    definitions: [
+      { name: 'submit_plan', description: 'Synthetic plan', parameters: { type: 'object' } },
+      { name: 'update_task_list', description: 'Synthetic task list', parameters: { type: 'object' } },
+      { name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }
+    ],
+    reply(count) {
+      if (count === 1) return [{ functionCall: { name: 'submit_plan', args: { plan: 'task plan', taskList } } }];
+      if (count === 2) return [{ functionCall: { name: 'update_task_list', args: update } }];
+      if (count === 4) return [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }];
+      return undefined;
+    },
+    detail(input) {
+      if (input.toolName === 'submit_plan') {
+        return { kind: 'submit_plan.result', proposalId: 'task-plan', status: 'approved', executionTarget: 'current_conversation' };
+      }
+      if (input.toolName === 'update_task_list') return { kind: 'task-list', operation: update };
+      return { text: 'synthetic tool result' };
+    }
+  } });
+});
+
 for (const fault of ['revision', 'duplicate']) {
   test(`tool prefix validation still rejects ${fault} provenance inside the same conversation`, async () => {
     await withForkRuntime(async h => {

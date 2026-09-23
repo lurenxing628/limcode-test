@@ -25,6 +25,7 @@ import {
   boundClientRecordSummary,
   settleClientWireResponseBytes
 } from './clientWireData';
+import { toolArtifactIdentifiesCallInWorker } from './copiedToolIdentity';
 import {
   approvedSubmitPlanTaskOperation,
   buildCurrentTurnTaskProjection,
@@ -925,7 +926,7 @@ export function executeClientProjectionSnapshot(
           call_seq: row.call_seq,
           state: row.status,
           outcome: outcome?.status ?? null,
-          ...taskListProjectionFromOutcome(database, outcome, String(row.id), content)
+          ...taskListProjectionFromOutcome(database, outcome, row, content)
         };
       });
     const selectedInteractionToolCallLinks = mergeRowsById([
@@ -1168,9 +1169,10 @@ export function projectActiveTurnWorkEnvironment(
 function taskListProjectionFromOutcome(
   database: Database.Database,
   outcome: Record<string, unknown> | null,
-  toolCallId: string,
+  call: Record<string, unknown>,
   content: ClientProjectionContentAccess
 ): { mode?: string; items: unknown[] | null; detail_on_demand: boolean } {
+  const toolCallId = String(call.id);
   if (!outcome || outcome.content_object_id === null) return { items: null, detail_on_demand: false };
   if (outcome.status !== 'succeeded') return { items: null, detail_on_demand: false };
   const contentObjectId = requireRuntimeId(outcome.content_object_id);
@@ -1195,7 +1197,7 @@ function taskListProjectionFromOutcome(
   }
   let operation;
   try {
-    operation = taskListOperationFromSettledArtifact(value, toolCallId);
+    operation = taskListOperationFromSettledArtifact(taskArtifactForCall(database, value, call), toolCallId);
   } catch {
     return { items: null, detail_on_demand: true };
   }
@@ -1205,6 +1207,23 @@ function taskListProjectionFromOutcome(
     items: operation.items,
     detail_on_demand: false
   };
+}
+
+/**
+ * A fork copies a ToolCall under a new id while its result content still names the original call;
+ * the copied identity rule (same immutable tool segment, same call_seq) resolves it to this call.
+ */
+function taskArtifactForCall(
+  database: Database.Database,
+  value: unknown,
+  call: Record<string, unknown>
+): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const artifact = value as Record<string, unknown>;
+  const toolCallId = String(call.id);
+  return artifact.toolCallId !== toolCallId && toolArtifactIdentifiesCallInWorker(database, artifact.toolCallId, call)
+    ? { ...artifact, toolCallId }
+    : value;
 }
 
 function projectCurrentTaskList(
@@ -1227,9 +1246,6 @@ function projectCurrentTaskList(
       JOIN tool_result_artifact AS artifact
         ON artifact.tool_call_id = call.id
        AND artifact.role = 'no_effect_result'
-      JOIN operation AS task_operation
-        ON task_operation.tool_call_id = call.id
-       AND task_operation.status = 'succeeded'
       JOIN tool_call_source_link AS source ON source.tool_call_id = call.id
       JOIN message_part_of_conversation AS membership
         ON membership.message_id = source.message_id
@@ -1238,6 +1254,18 @@ function projectCurrentTaskList(
      WHERE turn.conversation_id = @conversationId
        AND message.deleted_at IS NULL
        AND call.tool_name IN ('update_task_list', 'submit_plan')
+       -- Settled by this call's own Operation, or, for a fork's copied ToolCall (which carries its
+       -- ToolOutcome but not the source's execution Operations), by that copied outcome.
+       AND (
+         EXISTS (
+           SELECT 1 FROM operation AS task_operation
+            WHERE task_operation.tool_call_id = call.id AND task_operation.status = 'succeeded'
+         )
+         OR EXISTS (
+           SELECT 1 FROM tool_outcome AS task_outcome
+            WHERE task_outcome.tool_call_id = call.id AND task_outcome.status = 'succeeded'
+         )
+       )
      ORDER BY membership.message_seq ASC,
               source.provider_ordinal ASC,
               call.call_seq ASC,
@@ -1252,12 +1280,12 @@ function projectCurrentTaskList(
     const operations: CurrentTurnTaskOperationFact[] = [];
     for (const call of calls) {
       const toolCallId = String(call.id);
-      const artifact = readTaskProjectionJson(
+      const artifact = taskArtifactForCall(database, readTaskProjectionJson(
         database,
         call.artifact_content_object_id,
         `Task-list ToolResultArtifact ${toolCallId}`,
         content
-      );
+      ), call);
       if (call.tool_name === 'update_task_list') {
         const operation = taskListOperationFromSettledArtifact(artifact, toolCallId);
         if (!operation) continue;

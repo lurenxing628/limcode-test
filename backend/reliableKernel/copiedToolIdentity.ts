@@ -1,3 +1,4 @@
+import type Database from 'better-sqlite3';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryRead } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
 
@@ -45,6 +46,31 @@ export async function toolArtifactsIdentifyCalls(
     });
   });
   return { identified, snapshotCommitSeq: barrier.snapshotCommitSeq };
+}
+
+/**
+ * The same rule over the database worker's connection, for the client projection that runs inside
+ * a read transaction there. Rows keep SQLite integers as bigint (defaultSafeIntegers).
+ */
+export function toolArtifactIdentifiesCallInWorker(
+  database: Database.Database,
+  claimedId: unknown,
+  call: DomainRow
+): boolean {
+  const toolCallId = requireId(call.id, 'ToolCall.id');
+  if (claimedId === toolCallId) return true;
+  if (typeof claimedId !== 'string' || claimedId.length === 0) return false;
+  const sources = database.prepare(`
+    SELECT source_kind, segment_id, source_revision
+      FROM context_segment_source
+     WHERE source_kind = 'tool_call' AND source_id = ?
+     LIMIT 2
+  `);
+  return copiedToolSourcesIdentifyCall({
+    claimedSources: sources.all(claimedId) as DomainRow[],
+    callSources: sources.all(toolCallId) as DomainRow[],
+    callSeq: requireBigInt(call.call_seq, 'ToolCall.call_seq')
+  });
 }
 
 function copiedToolIdentityReads(claimedId: string, toolCallId: string): RepositoryRead[] {
