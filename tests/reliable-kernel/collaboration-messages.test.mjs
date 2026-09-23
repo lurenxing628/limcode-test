@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { execFile } from 'node:child_process';
 import test from 'node:test';
 const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
@@ -46,7 +47,7 @@ async function fixture(run, budget = 32) {
         repo('ChildExecutionTurnLink').insert({ id: `${id}-child-turn`, child_execution_id: `${id}-child`, turn_id: `${id}-turn`, turn_seq: 1n, created_at: NOW })
       ])
     ]);
-    await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, store, rows, get, authority,
+    await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, store, rows, get, authority, runtimeDirectory: path.join(directory, 'runtime'),
       async reopen() { await database.close(); database = await RuntimeDatabase.open(authority); deliveries = new RuntimeDeliveryControlPlane(database, { now: () => NOW }); collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW }); },
       async source(id = `call-${++callSeq}`, conversationId = 'left', turnId = `${conversationId}-turn`, toolName = 'send_agent_message') {
         const content = await store.prepare(database, '{}', 'application/json');
@@ -768,4 +769,47 @@ test('followups queued behind one Turn start their own Turns in the order they w
     }
   } finally { await scanner.dispose(); }
   assert.deepEqual(started.map(entry => sent.indexOf(entry.deliveryId)), sent.map((_, index) => index));
+}));
+
+test('a wake queued behind a running Turn keeps no poll alive; another host ending that Turn still wakes it', async () => fixture(async f => {
+  const accepted = await f.collaboration.send({ source: await f.source('queued-without-poll'), targetConversationId: 'root', text: 'queued work', mode: 'followup', queueBehindActiveTurn: true });
+  const started = [];
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, scanIntervalMs: 20,
+    wakeHandler: async request => {
+      assert.equal(request.action, 'start_continuation');
+      started.push(request.deliveryId);
+      await admitPending(f, 'root', 'root-after-external-end');
+      return { acknowledged: true };
+    } });
+  let scans = 0;
+  const scanNow = scanner.scanNow.bind(scanner);
+  scanner.scanNow = () => { scans += 1; return scanNow(); };
+  try {
+    await scanner.start();
+    scans = 0;
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert.equal(scans, 0, 'nothing changed, so the waiting wake is not rescanned every interval');
+    assert.deepEqual(started, []);
+    // Another Host ends the running Turn: no local commit hook fires here.
+    const script = `
+      const path = require('node:path');
+      const load = name => require(path.join(${JSON.stringify(compiled)}, 'backend/reliableKernel', name));
+      const { RootAuthority } = load('rootAuthority.js');
+      const { RuntimeDatabase } = load('runtimeDatabase.js');
+      const { DOMAIN_REPOSITORIES } = load('repositories.js');
+      (async () => {
+        const database = await RuntimeDatabase.open(new RootAuthority(() => ${JSON.stringify(f.runtimeDirectory)}), { hostBootId: 'collaboration-external-host' });
+        try {
+          await database.transaction([
+            DOMAIN_REPOSITORIES.domain('Turn').update('root-turn', { status: 'terminated', terminal_at: ${JSON.stringify(NOW)}, updated_at: ${JSON.stringify(NOW)} }),
+            DOMAIN_REPOSITORIES.domain('TurnTermination').insert({ id: 'root-turn-external-done', turn_id: 'root-turn', terminal_status: 'completed', reason: 'finished elsewhere', created_at: ${JSON.stringify(NOW)} })
+          ]);
+        } finally { await database.close(); }
+      })().catch(error => { console.error(error); process.exitCode = 1; });`;
+    await new Promise((resolve, reject) => execFile(process.execPath, ['-e', script], (error, stdout, stderr) => error ? reject(new Error(`${error.message}\n${stderr}`)) : resolve()));
+    const deadline = Date.now() + 10_000;
+    while (!started.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(started, [accepted.deliveryId], 'the external data version change starts the queued followup');
+    assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).target_turn_id, 'root-after-external-end');
+  } finally { await scanner.dispose(); }
 }));

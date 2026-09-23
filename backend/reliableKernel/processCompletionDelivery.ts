@@ -262,6 +262,9 @@ export class ProcessCompletionDeliveryControlPlane {
     // or dispatch its mutable execution. Foreign rows are left pending untouched — never claimed,
     // never failed, never dead-lettered — so the owning Host's own level scan converges them.
     const gate = new ConversationOwnershipGate(this.database, 'claim');
+    // Wakes left waiting behind their target's running Turn need no poll: that Turn's terminal
+    // commit requests a scan here, and another Host's commit moves the external data version.
+    const waitingWakeIds = new Set<string>();
     try {
     const dispatches = [
       ...await listAllDomainRows(this.database, 'ProcessCompletionDispatch', { state: 'pending' }),
@@ -311,7 +314,10 @@ export class ProcessCompletionDeliveryControlPlane {
         // Read-only and only on the owning Host: a send queued behind its target's running Turn
         // stays untouched (no claim, backoff or failure count) until that Turn's terminal commit
         // triggers the next scan.
-        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) continue;
+        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) {
+          waitingWakeIds.add(wakeId);
+          continue;
+        }
         claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
         if (!claim) continue;
         const claimedWake = claim;
@@ -338,7 +344,7 @@ export class ProcessCompletionDeliveryControlPlane {
     } finally {
       await gate.releaseClaimed();
     }
-    this.retryPollingNeeded = !this.closing && await this.hasOutstandingOutboxWork();
+    this.retryPollingNeeded = !this.closing && await this.hasOutstandingOutboxWork(waitingWakeIds);
     return report;
   }
 
@@ -427,7 +433,8 @@ export class ProcessCompletionDeliveryControlPlane {
     }
   }
 
-  private async hasOutstandingOutboxWork(): Promise<boolean> {
+  /** Outbox work a periodic poll must retry; wakes known to wait behind a running Turn do not count. */
+  private async hasOutstandingOutboxWork(waitingWakeIds: ReadonlySet<string>): Promise<boolean> {
     const snapshot = await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('ProcessCompletionDispatch').list({
         where: { state: 'pending' },
@@ -438,15 +445,18 @@ export class ProcessCompletionDeliveryControlPlane {
         limit: 1
       }),
       DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({
-        where: { state: 'pending' },
-        limit: 1
-      }),
-      DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({
         where: { state: 'claimed' },
         limit: 1
+      }),
+      // One more row than the waiting set: any pending wake outside it is returned.
+      DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({
+        where: { state: 'pending' },
+        limit: waitingWakeIds.size + 1
       })
     ]);
-    return snapshot.snapshot.some((value) => Array.isArray(value) && value.length > 0);
+    const [pendingDispatches, claimedDispatches, claimedWakes, pendingWakes] = snapshot.snapshot as DomainRow[][];
+    return pendingDispatches.length > 0 || claimedDispatches.length > 0 || claimedWakes.length > 0
+      || pendingWakes.some((wake) => !waitingWakeIds.has(String(wake.id)));
   }
 
   private async reconcileDispatch(dispatch: DomainRow): Promise<{
