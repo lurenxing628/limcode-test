@@ -481,6 +481,121 @@ test('a fork keeps a compression only when it precedes the fork point, together 
   }, { compression: true });
 });
 
+/** The fork's copy of a source Message, found by its immutable content. */
+async function copiedMessageCommand(h, conversationId, sourceRevisionId, commandId) {
+  const [source] = await rows(h.app, 'MessageRevision', { id: sourceRevisionId });
+  for (const member of await rows(h.app, 'MessagePartOfConversation', { conversation_id: conversationId })) {
+    const [current] = await rows(h.app, 'MessageCurrentRevisionLink', { message_id: member.message_id });
+    const [revision] = await rows(h.app, 'MessageRevision', { id: current.revision_id });
+    if (revision.role === source.role && revision.content_object_id === source.content_object_id) {
+      return { sourceConversationId: conversationId, messageId: member.message_id,
+        expectedRevisionId: revision.id, command: { commandId } };
+    }
+  }
+  assert.fail('the fork has no copy of the source message');
+}
+
+/** The fork owns exactly one block, re-homed with its creation projection, and the Turn that compressed. */
+async function assertOwnedCompression(h, conversationId) {
+  const blocks = await rows(h.app, 'CompressionBlock', { conversation_id: conversationId });
+  assert.equal(blocks.length, 1, 'the fork owns the compression that precedes its boundary');
+  const projections = await rows(h.app, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: blocks[0].id });
+  assert.equal(projections.length, 1, 'the copied block keeps its creation projection');
+  const [projectionRoot] = await rows(h.app, 'ContextSequenceRoot', { id: projections[0].root_id });
+  assert.equal(projectionRoot.conversation_id, conversationId);
+  const [authority] = await rows(h.app, 'AuthoritySnapshot', { id: blocks[0].authority_snapshot_id });
+  const [turn] = await rows(h.app, 'Turn', { id: authority.turn_id });
+  assert.equal(turn.conversation_id, conversationId);
+  assert.deepEqual((await rows(h.app, 'TurnTermination', { turn_id: turn.id })).map(row => row.terminal_status), ['completed'],
+    'the compressing Turn keeps its own termination');
+  const creation = (await h.app.context.materialize(projections[0].root_id)).segments.map(segment => segment.content).join('\n');
+  return { turn, creation };
+}
+
+test('deleting the transcript of a turn that auto-compressed keeps every later message forkable', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', `long history ${'以前的重要历史。'.repeat(12000)}`);
+    await h.turn('source', 'kept-before-deleted-compression');
+    const insideTail = await h.command('source', 'fork-inside-deleted-compression-tail', 'user');
+    const tailEnd = await h.command('source', 'fork-at-end-of-deleted-compression-tail');
+    await h.saveCompression({ trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 },
+      llmSummary: { targetTokens: 512 } });
+    const compressing = await h.turn('source', 'deleted-compressing-turn');
+    await h.saveCompression({ trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 } });
+    const [block] = await rows(h.app, 'CompressionBlock', { conversation_id: 'source' });
+    assert.equal((await rows(h.app, 'AuthoritySnapshot', { id: block.authority_snapshot_id }))[0].turn_id, compressing.turnId,
+      'fixture: the Turn compressed before its own model request');
+    const [input] = (await rows(h.app, 'MessageTurnLink', { turn_id: compressing.turnId })).filter(link => link.role === 'input');
+    // Deleting from its user message keeps the summary: the tail before it stays in the Context head.
+    await h.app.turns.delete({ source: { kind: 'command', key: 'delete-compressing-turn' }, conversationId: 'source', messageId: input.message_id });
+    const head = await h.app.context.materializeStructure(await h.app.context.currentHeadRootId('source'));
+    assert.equal(head.records[0].segment.segment_kind, 'compression');
+    await h.turn('source', 'after-deleted-compression');
+
+    const fork = await h.facade.forkConversation(await h.command('source', 'fork-after-deleted-compression'));
+    const owned = await assertOwnedCompression(h, fork.conversationId);
+    assert.deepEqual(await rows(h.app, 'MessageTurnLink', { turn_id: owned.turn.id }), [],
+      'the deleted transcript is not copied; the Turn stays as the owner of the compression');
+    assert.match(owned.creation, /kept-before-deleted-compression/);
+    assert.doesNotMatch(owned.creation, /deleted-compressing-turn/, 'the creation projection holds only the retained history');
+    // Its deleted transcript no longer follows the tail, so the compression precedes a cut at the tail's end.
+    const atEnd = await h.facade.forkConversation(tailEnd);
+    await assertOwnedCompression(h, atEnd.conversationId);
+    await h.turn(fork.conversationId, 'continue-after-deleted-compression-fork');
+    let context = h.requests.at(-1).context.map(item => item.content).join('\n');
+    assert.match(context, /offline summary/);
+    assert.doesNotMatch(context, /deleted-compressing-turn/);
+    // The fork itself stays forkable after the compression, and inside its creation tail.
+    const refork = await h.facade.forkConversation(await h.command(fork.conversationId, 'refork-after-deleted-compression'));
+    await assertOwnedCompression(h, refork.conversationId);
+    const reforkInside = await h.facade.forkConversation(await copiedMessageCommand(h, fork.conversationId,
+      insideTail.expectedRevisionId, 'refork-inside-deleted-compression-tail'));
+    assert.deepEqual(await rows(h.app, 'CompressionBlock', { conversation_id: reforkInside.conversationId }), []);
+
+    // A cut inside the tail that existed when the Turn compressed still keeps the uncompressed history.
+    const inside = await h.facade.forkConversation(insideTail);
+    assert.deepEqual(await rows(h.app, 'CompressionBlock', { conversation_id: inside.conversationId }), []);
+    await h.turn(inside.conversationId, 'continue-inside-deleted-compression-tail');
+    context = h.requests.at(-1).context.map(item => item.content).join('\n');
+    assert.match(context, /以前的重要历史/);
+    assert.doesNotMatch(context, /offline summary/);
+  }, { compression: true });
+});
+
+test('retrying away the only reply of a turn that auto-compressed keeps later messages forkable', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', `long history ${'以前的重要历史。'.repeat(12000)}`);
+    const second = await h.turn('source', 'retried-question');
+    await h.saveCompression({ trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 10000 },
+      llmSummary: { targetTokens: 512 } });
+    // A retry Turn owns no user message; this one compresses before its model request.
+    const reply = await h.command('source', 'unused');
+    const compressing = await h.turn('source', 'retry-compresses', {
+      sourceTurnId: second.turnId, target: { kind: 'message', messageId: reply.messageId },
+      expectedMessageRevisionId: reply.expectedRevisionId
+    });
+    await h.saveCompression({ trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 } });
+    const [block] = await rows(h.app, 'CompressionBlock', { conversation_id: 'source' });
+    assert.equal((await rows(h.app, 'AuthoritySnapshot', { id: block.authority_snapshot_id }))[0].turn_id, compressing.turnId,
+      'fixture: the retry Turn compressed');
+    assert.deepEqual((await rows(h.app, 'MessageTurnLink', { turn_id: compressing.turnId })).map(link => link.role), ['model']);
+    // Retrying its reply again soft-deletes the whole transcript of the Turn that compressed.
+    const compressedReply = await h.command('source', 'unused');
+    await h.turn('source', 'retry-discards-compressing-reply', {
+      sourceTurnId: compressing.turnId, target: { kind: 'message', messageId: compressedReply.messageId },
+      expectedMessageRevisionId: compressedReply.expectedRevisionId
+    });
+    await h.turn('source', 'after-retried-compression');
+
+    const fork = await h.facade.forkConversation(await h.command('source', 'fork-after-retried-compression'));
+    await assertOwnedCompression(h, fork.conversationId);
+    await h.turn(fork.conversationId, 'continue-after-retried-compression-fork');
+    assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /offline summary/);
+    const refork = await h.facade.forkConversation(await h.command(fork.conversationId, 'refork-after-retried-compression'));
+    await assertOwnedCompression(h, refork.conversationId);
+  }, { compression: true });
+});
+
 test('a copied failed turn keeps its termination and its failed request stays retryable in the fork', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'healthy-history');

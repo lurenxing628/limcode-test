@@ -5,7 +5,7 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { conversationProjectLinkInsertStep } from './conversationProject';
-import { readForkContextLineage } from './conversationForkContext';
+import { readForkContextLineage, type ForkContextLineage } from './conversationForkContext';
 export { ConversationForkRejectedError } from './conversationForkContext';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
 import type { ContentAddressedStore } from './contentAddressedStore';
@@ -265,6 +265,9 @@ export class ConversationForkControlPlane {
     const historicalSourceRoots = await retainedForkHistoryRoots(
       this.database, sourceContextRoots, command.sourceContextRootId, retainedLineage.segmentIds
     );
+    const creationRoots = await retainedCreationRoots(
+      this.database, sourceContextRoots, historicalSourceRoots, retainedLineage
+    );
     const transcript = await prepareConversationForkSnapshot(this.database, {
       sourceConversationId: command.sourceConversationId,
       targetConversationId: ids.targetConversationId,
@@ -285,7 +288,8 @@ export class ConversationForkControlPlane {
         history: new Map(historicalSourceRoots.map((root) => {
           const sourceRootId = requireId(root.id, 'ContextSequenceRoot.id');
           return [sourceRootId, forkHistoryRootId(ids.targetConversationId, sourceRootId)];
-        }))
+        })),
+        creation: creationRoots
       },
       now
     });
@@ -764,6 +768,40 @@ async function retainedForkHistoryRoots(
   for (const root of candidates) {
     if (await chainRetained(nullableId(root.root_node_id, 'ContextSequenceRoot.root_node_id'))
       && await chainRetained(nullableId(root.tail_node_id, 'ContextSequenceRoot.tail_node_id'))) result.push(root);
+  }
+  return result;
+}
+
+/**
+ * A kept block's pre-compression root can run past the retained history when a delete or retry
+ * later discarded its end (for example the transcript of the Turn that compressed). The fork then
+ * stands that root for the source root holding exactly its retained part, so the copied block keeps
+ * a creation projection made of its own history. A root rewritten before its end while later parts
+ * stay history (an edit) has no such part and is left unmapped.
+ */
+async function retainedCreationRoots(
+  database: RuntimeDatabase,
+  roots: readonly DomainRow[],
+  historicalRoots: readonly DomainRow[],
+  lineage: ForkContextLineage
+): Promise<Map<string, DomainRow>> {
+  const historical = new Set(historicalRoots.map((root) => requireId(root.id, 'ContextSequenceRoot.id')));
+  const result = new Map<string, DomainRow>();
+  for (const { creationProjection } of lineage.compressionBlocks) {
+    const creationRootId = requireId(creationProjection.root_id, 'ModelContextProjection.root_id');
+    if (historical.has(creationRootId) || result.has(creationRootId)) continue;
+    const records = (await database.materializeContext(creationRootId)).snapshot.records;
+    const end = records.findIndex((record) => !lineage.segmentIds.has(requireId(record.segment.id, 'ContextSegment.id')));
+    if (end <= 0 || records.slice(end).some((record) => lineage.segmentIds.has(requireId(record.segment.id, 'ContextSegment.id')))) {
+      continue;
+    }
+    const first = requireId(records[0].node.id, 'ContextSequenceNode.id');
+    const last = requireId(records[end - 1].node.id, 'ContextSequenceNode.id');
+    const compressed = records[0].segment.segment_kind === 'compression';
+    const retained = roots.find((root) => root.segment_count === BigInt(end) && (compressed
+      ? root.root_node_id === first && root.tail_node_id === (end > 1 ? last : null)
+      : root.root_node_id === last && root.tail_node_id === null));
+    if (retained) result.set(creationRootId, retained);
   }
   return result;
 }

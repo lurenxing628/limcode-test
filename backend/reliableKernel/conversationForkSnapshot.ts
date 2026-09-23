@@ -7,6 +7,7 @@ import {
   isNativeRequest,
   readForkContextLineage,
   readNativeMessageContextRevisions,
+  readVisibleTurnMessages,
   type ForkLineageCompressionBlock,
   type NativeMessageContextRevision
 } from './conversationForkContext';
@@ -41,6 +42,11 @@ export interface ForkContextRoots {
   head: ForkContextRootShape;
   /** Source ContextSequenceRoot id -> copied target history root id. */
   history: ReadonlyMap<string, string>;
+  /**
+   * Source pre-compression root of a kept block -> the source root holding exactly its retained
+   * part, for creation roots whose end the retained history no longer contains.
+   */
+  creation: ReadonlyMap<string, DomainRow>;
 }
 
 const PAGE_LIMIT = 1000;
@@ -305,18 +311,16 @@ export async function prepareConversationForkSnapshot(
     id(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id')
   )));
   if (input.boundaryMessageSeq !== undefined) {
-    // A compressing Turn with transcript outside the copied history ran after the fork point: its
-    // block is not part of this history (the caller forks from the pre-compression root instead).
+    // A compressing Turn with visible transcript outside the copied history ran after the fork
+    // point: its block is not part of this history (the caller forks from the pre-compression root
+    // instead). A Turn whose transcript was deleted owns no history, like a manual compression Turn.
     const transcriptTurnIds = new Set([...messageFacts, ...toolResultMessages].flatMap((fact) =>
       fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))
     ));
     const outsideTurnIds = unique(blockAuthorities.map((snapshot) => id(snapshot.turn_id, 'AuthoritySnapshot.turn_id')))
       .filter((turnId) => !transcriptTurnIds.has(turnId));
-    const outsideLinks = outsideTurnIds.length > 0 ? await database.snapshot(outsideTurnIds.map((turnId) =>
-      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({ where: { turn_id: turnId }, limit: 1 })
-    )) : { snapshot: [] };
-    for (const [index, turnId] of outsideTurnIds.entries()) {
-      if (rows(outsideLinks.snapshot[index], 'MessageTurnLink compression Turn lookup').length > 0) {
+    for (const turnId of outsideTurnIds) {
+      if ((await readVisibleTurnMessages(database, input.sourceConversationId, turnId)).length > 0) {
         throw new ConversationForkRejectedError(
           `Fork Context keeps a CompressionBlock made by Turn ${turnId} after the fork point; fork from its pre-compression history.`
         );
@@ -923,18 +927,13 @@ async function readCompressionBlockCopies(
   const copies: CompressionBlockCopy[] = [];
   for (const lineage of blocks) {
     const blockId = id(lineage.block.id, 'CompressionBlock.id');
-    const [observationLinks, projections] = await Promise.all([
-      listAllDomainRows(database, 'CompressionBlockObservationLink', { compression_block_id: blockId }),
-      listAllDomainRows(database, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: blockId })
-    ]);
-    if (projections.length > 1) throw new Error(`CompressionBlock ${blockId} has multiple Context projections.`);
+    const observationLinks = await listAllDomainRows(database, 'CompressionBlockObservationLink', { compression_block_id: blockId });
     let projection: CompressionBlockCopy['projection'] = null;
-    if (projections[0] && roots) {
-      const [sourceRoot] = await getRows(database, 'ContextSequenceRoot', [
-        id(projections[0].root_id, 'ModelContextProjection.root_id')
-      ]);
-      const rootId = mapForkContextRoot(sourceRoot, roots);
-      if (rootId) projection = { row: projections[0], rootId };
+    if (roots) {
+      const sourceRootId = id(lineage.creationProjection.root_id, 'ModelContextProjection.root_id');
+      const [sourceRoot] = await getRows(database, 'ContextSequenceRoot', [sourceRootId]);
+      const rootId = mapForkContextRoot(roots.creation.get(sourceRootId) ?? sourceRoot, roots);
+      if (rootId) projection = { row: lineage.creationProjection, rootId };
     }
     copies.push({ lineage, observationLinks, projection });
   }
