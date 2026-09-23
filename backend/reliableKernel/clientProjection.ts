@@ -1973,7 +1973,7 @@ function buildClientVisibleMessageHistoryRecords(
 }
 
 function queryPlainRows(
-  database: Database.Database,
+  database: Pick<Database.Database, 'prepare'>,
   sql: string,
   parameters: Record<string, string | bigint> = {}
 ): Array<Record<string, unknown>> {
@@ -2073,10 +2073,12 @@ function queryClientChildExecutions(
 /**
  * The selected Conversation's own collaboration envelopes (message bodies stay in CAS): every
  * message it sent from, or had delivered into, one of the loaded Turns, plus incoming messages
- * still waiting for a Turn or failed before reaching one. Bounded by durable sequence.
+ * still waiting for a Turn or failed before reaching one. Bounded by durable sequence. The
+ * candidates come from this Conversation's source/target link indexes, so the cost follows its own
+ * traffic rather than every message in the Runtime.
  */
-function queryCollaborationMessagesForTurns(
-  database: Database.Database,
+export function queryCollaborationMessagesForTurns(
+  database: Pick<Database.Database, 'prepare'>,
   conversationId: string,
   loadedTurnIds: readonly string[]
 ): Array<Record<string, unknown>> {
@@ -2089,20 +2091,18 @@ function queryCollaborationMessagesForTurns(
   return queryPlainRows(database, `
     SELECT message.*
       FROM collaboration_message AS message
-     WHERE EXISTS (
-             SELECT 1 FROM collaboration_message_source_link AS source
-              WHERE source.message_id = message.id
-                AND source.conversation_id = @conversationId
+     WHERE message.id IN (
+             SELECT source.message_id
+               FROM collaboration_message_source_link AS source
+              WHERE source.conversation_id = @conversationId
                 AND ${inLoadedTurns('source.turn_id')}
-           )
-        OR EXISTS (
-             SELECT 1
+             UNION
+             SELECT target.message_id
                FROM collaboration_message_target_link AS target
                JOIN runtime_delivery AS delivery
                  ON delivery.inbox_item_id = target.inbox_item_id
                 AND delivery.target_conversation_id = @conversationId
-              WHERE target.message_id = message.id
-                AND target.conversation_id = @conversationId
+              WHERE target.conversation_id = @conversationId
                 AND (delivery.state IN ('pending', 'failed') OR ${inLoadedTurns('delivery.target_turn_id')})
            )
      ORDER BY message.message_seq DESC, message.id DESC

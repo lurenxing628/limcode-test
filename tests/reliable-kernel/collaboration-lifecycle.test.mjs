@@ -237,3 +237,74 @@ test('collaboration snapshot stays bounded by durable sequence even at identical
   assert.equal(summary.collaborationMessageSourceLinks.length, 200);
   assert.equal(summary.collaborationMessageTargetLinks.length, 200);
 }));
+
+test('the collaboration snapshot starts from the conversation links, never scans every message, and selects the same rows', async () => {
+  const Database = require('better-sqlite3');
+  const { createRuntimeSchemaSql } = require(path.resolve('dist/extension/backend/reliableKernel/schema/domainManifest.js'));
+  const { queryCollaborationMessagesForTurns } = require(path.resolve('dist/extension/backend/reliableKernel/clientProjection.js'));
+  const db = new Database(':memory:');
+  try {
+    db.defaultSafeIntegers(true);
+    db.pragma('foreign_keys = OFF');
+    for (const statement of createRuntimeSchemaSql()) db.exec(statement);
+    const insert = {
+      message: db.prepare('INSERT INTO collaboration_message (id, dedupe_key, message_seq, mode, created_at) VALUES (?, ?, ?, ?, ?)'),
+      source: db.prepare('INSERT INTO collaboration_message_source_link (id, message_id, conversation_id, source_kind, source_key, turn_id, tool_call_id, board_post_id, created_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)'),
+      target: db.prepare('INSERT INTO collaboration_message_target_link (id, message_id, conversation_id, inbox_item_id, anchor_turn_id, created_at) VALUES (?, ?, ?, ?, NULL, ?)'),
+      delivery: db.prepare('INSERT INTO runtime_delivery (id, inbox_item_id, target_conversation_id, target_turn_id, phase, attempt_seq, retry_of_delivery_id, state, failure_reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)')
+    };
+    let seq = 0;
+    const add = (from, to, sourceTurn, deliveries) => {
+      const id = `m${seq}`;
+      insert.message.run(id, `k${seq}`, BigInt(seq), 'message', NOW);
+      insert.source.run(`s${seq}`, id, from, 'tool', `sk${seq}`, sourceTurn, NOW);
+      insert.target.run(`t${seq}`, id, to, `i${seq}`, NOW);
+      deliveries.forEach(([target, turn, state], attempt) => insert.delivery.run(`d${seq}-${attempt}`, `i${seq}`, target, turn, 'next_turn', BigInt(attempt + 1), state, NOW, NOW));
+      seq += 1;
+      return id;
+    };
+    db.transaction(() => {
+      // Traffic between other conversations fills the table.
+      for (let i = 0; i < 20000; i += 1) {
+        const from = `c${i % 400}`, to = `c${(i + 1) % 400}`;
+        add(from, to, `turn-${from}`, [[to, `turn-${to}`, 'consumed']]);
+      }
+      // Every case of the selected conversation X, loaded Turns turn-x-1 and turn-x-2.
+      add('x', 'c1', 'turn-x-1', [['c1', 'turn-c1', 'consumed']]);
+      add('x', 'c1', 'turn-x-old', [['c1', null, 'pending']]);
+      add('c2', 'x', 'turn-c2', [['x', 'turn-x-2', 'consumed']]);
+      add('c2', 'x', 'turn-c2', [['x', 'turn-x-old', 'consumed']]);
+      add('c3', 'x', 'turn-c3', [['x', null, 'pending']]);
+      add('c3', 'x', 'turn-c3', [['x', null, 'failed']]);
+      add('c3', 'x', 'turn-c3', [['x', null, 'failed'], ['x', 'turn-x-old', 'consumed']]);
+      add('c4', 'c5', 'turn-x-1', [['x', 'turn-x-1', 'consumed']]);
+    })();
+    const legacy = (turnIds) => {
+      const parameters = { conversationId: 'x', limit: 200n };
+      const list = turnIds.map((id, index) => { parameters[`turn${index}`] = id; return `@turn${index}`; }).join(',');
+      const inLoaded = (column) => list ? `${column} IN (${list})` : '0';
+      return db.prepare(`SELECT message.* FROM collaboration_message AS message
+         WHERE EXISTS (SELECT 1 FROM collaboration_message_source_link AS source
+                 WHERE source.message_id = message.id AND source.conversation_id = @conversationId AND ${inLoaded('source.turn_id')})
+            OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target
+                  JOIN runtime_delivery AS delivery ON delivery.inbox_item_id = target.inbox_item_id AND delivery.target_conversation_id = @conversationId
+                 WHERE target.message_id = message.id AND target.conversation_id = @conversationId
+                   AND (delivery.state IN ('pending', 'failed') OR ${inLoaded('delivery.target_turn_id')}))
+         ORDER BY message.message_seq DESC, message.id DESC LIMIT @limit`).all(parameters);
+    };
+    for (const turnIds of [['turn-x-1', 'turn-x-2'], [], ['turn-x-old']]) {
+      assert.deepEqual(queryCollaborationMessagesForTurns(db, 'x', turnIds), legacy(turnIds), `same rows for loaded Turns ${turnIds.join(',')}`);
+    }
+    assert.deepEqual(queryCollaborationMessagesForTurns(db, 'x', ['turn-x-1', 'turn-x-2']).map((row) => row.id), ['m20006', 'm20005', 'm20004', 'm20002', 'm20000']);
+
+    const captured = [];
+    const recording = { prepare(sql) { captured.push(sql); return db.prepare(sql); } };
+    const loaded = Array.from({ length: 200 }, (_value, index) => `turn-x-${index}`);
+    queryCollaborationMessagesForTurns(recording, 'x', loaded);
+    const parameters = { conversationId: 'x', limit: 200n, ...Object.fromEntries(loaded.map((id, index) => [`turn${index}`, id])) };
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${captured[0]}`).all(parameters).map((row) => row.detail);
+    assert.equal(plan.some((detail) => /^SCAN (message|collaboration_message)\b/.test(detail)), false, `no full scan of the message table:\n${plan.join('\n')}`);
+    const time = (run) => { const start = process.hrtime.bigint(); for (let round = 0; round < 20; round += 1) run(); return Number(process.hrtime.bigint() - start) / 20e6; };
+    console.log(`COLLABORATION_SNAPSHOT_QUERY messages=${seq} legacy=${time(() => legacy(loaded)).toFixed(2)}ms current=${time(() => queryCollaborationMessagesForTurns(db, 'x', loaded)).toFixed(2)}ms`);
+  } finally { db.close(); }
+});
