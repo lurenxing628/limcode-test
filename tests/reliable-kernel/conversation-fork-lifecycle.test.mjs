@@ -811,32 +811,34 @@ test('an automatic compression that keeps part of a manual compression\'s tail s
   }, { compression: true });
 });
 
-test('a fork whose inherited block has no creation projection is refused permanently', async () => {
-  await withForkRuntime(async h => {
-    await h.turn('source', 'unprojected-first');
-    await h.turn('source', 'unprojected-second');
-    await h.turn('source', 'unprojected-third');
-    await compressHead(h, 'source', 'unprojected-compression-1', 2);
-    await compressHead(h, 'source', 'unprojected-compression-2', 3);
-    const fork = await h.facade.forkConversation(await h.command('source', 'fork-before-projection-loss'));
-    // A fork made before copied blocks always kept their creation projection: its inner block
-    // (reached only through the outer summary) has none.
-    const [inner] = (await assertOwnedCreationRoots(h, fork.conversationId, 2))
-      .filter(({ records }) => records[0].segment.segment_kind !== 'compression');
-    const [projection] = await rows(h.app, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: inner.blockId });
-    const databasePath = h.app.database.binding.paths.databasePath;
-    await h.reopen(() => {
-      const database = new Database(databasePath);
-      try {
-        assert.equal(database.prepare('DELETE FROM model_context_projection WHERE id = ?').run(projection.id).changes, 1);
-      } finally { database.close(); }
-    });
-    const before = await rows(h.app, 'Conversation');
-    await assert.rejects(h.facade.forkConversation(await h.command(fork.conversationId, 'fork-without-inner-projection')),
-      error => error instanceof kernel.ConversationForkRejectedError && /creation projection/.test(error.message));
-    assert.deepEqual(await rows(h.app, 'Conversation'), before);
-  }, { compression: true });
-});
+for (const which of ['inner', 'outer']) {
+  test(`a fork over a block that lost its creation projection (${which}) fails its invariant without writing`, async () => {
+    await withForkRuntime(async h => {
+      await h.turn('source', 'unprojected-first');
+      await h.turn('source', 'unprojected-second');
+      await h.turn('source', 'unprojected-third');
+      await compressHead(h, 'source', 'unprojected-compression-1', 2);
+      await compressHead(h, 'source', 'unprojected-compression-2', 3);
+      const fork = await h.facade.forkConversation(await h.command('source', 'fork-before-projection-loss'));
+      // Every block keeps exactly one creation projection; a missing one is corruption, not an
+      // older data shape, so forking over it fails the invariant instead of being classified.
+      const [block] = (await assertOwnedCreationRoots(h, fork.conversationId, 2))
+        .filter(({ records }) => (records[0].segment.segment_kind === 'compression') === (which === 'outer'));
+      const [projection] = await rows(h.app, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: block.blockId });
+      const databasePath = h.app.database.binding.paths.databasePath;
+      await h.reopen(() => {
+        const database = new Database(databasePath);
+        try {
+          assert.equal(database.prepare('DELETE FROM model_context_projection WHERE id = ?').run(projection.id).changes, 1);
+        } finally { database.close(); }
+      });
+      const before = await rows(h.app, 'Conversation');
+      await assert.rejects(h.facade.forkConversation(await h.command(fork.conversationId, 'fork-without-projection')),
+        error => !(error instanceof kernel.ConversationForkRejectedError) && /must have exactly one creation projection/.test(error.message));
+      assert.deepEqual(await rows(h.app, 'Conversation'), before);
+    }, { compression: true });
+  });
+}
 
 test('manual compression in a fork without Turns of its own runs under the fork\'s current settings', async () => {
   await withForkRuntime(async h => {

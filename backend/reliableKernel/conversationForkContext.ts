@@ -10,8 +10,8 @@ import { RuntimeDatabase } from './runtimeDatabase';
  * another Conversation, a changed Revision, a deleted fork-point Message, no completed history for
  * fork_conversation); the copy would include history that is not completed (a Turn still running,
  * or a compression made after the fork point, including one whose pre-compression history was
- * rewritten in place); the copy would include a block without its creation projection (a fork made
- * before copied blocks always kept it); or the command is replayed with different source facts.
+ * rewritten in place); or the command is replayed with different source facts. Broken invariants,
+ * such as a block without exactly one creation projection, are plain errors, never rejections.
  */
 export class ConversationForkRejectedError extends Error {
   public constructor(message: string) {
@@ -114,13 +114,6 @@ export async function readForkContextLineage(
         });
         if (sources.length === 0) throw new Error(`CompressionBlock ${blockId} has no registered sources.`);
         const projections = requireRows(blocks.snapshot[compressed.length * 2 + index], 'ModelContextProjection');
-        // Only a fork made before copied blocks always kept their creation projection lacks one;
-        // forking after such a block can never succeed.
-        if (projections.length === 0) {
-          throw new ConversationForkRejectedError(
-            `CompressionBlock ${blockId} has no creation projection; fork from its pre-compression history.`
-          );
-        }
         if (projections.length !== 1) throw new Error(`CompressionBlock ${blockId} must have exactly one creation projection.`);
         sources.sort((left, right) => compareIntegers(left.position, right.position));
         const children = sources.map((source, position) => {
@@ -193,8 +186,8 @@ export class ForkCompressionPrecedence {
   }
 
   /**
-   * False when no cut can follow this summary's compression (its Turn is not kept, or its creation
-   * projection is unusable), so a caller can skip a candidate root without reading it.
+   * False when no cut can follow this summary's compression (its Turn is not kept), so a caller can
+   * skip a candidate root without reading it.
    */
   public async mayPrecede(summarySegmentId: string): Promise<boolean> {
     return (await this.factsFor(summarySegmentId)) !== null;
@@ -217,11 +210,15 @@ export class ForkCompressionPrecedence {
       listAllDomainRows(this.database, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: blockId }),
       listAllDomainRows(this.database, 'CompressionBlockSource', { compression_block_id: blockId })
     ]);
-    if (projections.length !== 1) return null;
+    // Every block, a fork's copied blocks included, has exactly one creation projection on a root of
+    // its own Conversation.
+    if (projections.length !== 1) throw new Error(`CompressionBlock ${blockId} must have exactly one creation projection.`);
     const creation = (await this.database.materializeContext(
       requireId(projections[0].root_id, 'ModelContextProjection.root_id')
     )).snapshot;
-    if (creation.root.conversation_id !== this.conversationId) return null;
+    if (creation.root.conversation_id !== this.conversationId) {
+      throw new Error(`CompressionBlock ${blockId} creation projection belongs to another Conversation.`);
+    }
     sources.sort((left, right) => compareIntegers(left.position, right.position));
     if (sources.length > creation.records.length
       || sources.some((source, index) => source.segment_id !== creation.records[index].segment.id)) {
