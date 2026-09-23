@@ -5,12 +5,17 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { conversationProjectLinkInsertStep } from './conversationProject';
-import { readForkContextLineage, type ForkContextLineage } from './conversationForkContext';
+import {
+  ConversationForkRejectedError,
+  ForkCompressionPrecedence,
+  readForkContextLineage,
+  type ForkContextLineage
+} from './conversationForkContext';
 export { ConversationForkRejectedError } from './conversationForkContext';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { estimateContextSegmentTokens, ReliableContextTokenEstimator } from './contextTokenEstimator';
-import { ContextSequenceControlPlane } from './contextSequence';
+import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface ConversationForkCommand {
@@ -65,6 +70,8 @@ interface ForkRootShape {
   segmentIds?: string[];
   /** Content-addressed nodes for native results moved behind the cut. */
   nodeSteps: RepositoryTransactionStep[];
+  /** The selected source root and the position of its cut, for a fork at a segment boundary. */
+  cut?: { records: readonly StructuralContextRecord[]; index: number };
 }
 
 /**
@@ -254,6 +261,20 @@ export class ConversationForkControlPlane {
       sourceRoot,
       command.sourceContextEndSegmentId
     );
+    if (sourceMembership && targetRootShape.cut) {
+      // Only a compression that precedes the cut belongs to the forked history, whatever root the
+      // caller selected (the application forks from the pre-compression root instead).
+      const precedence = new ForkCompressionPrecedence(
+        this.database,
+        command.sourceConversationId,
+        requireBigInt(sourceMembership.message_seq, 'MessagePartOfConversation.message_seq')
+      );
+      if (!await precedence.precedesCut(targetRootShape.cut.records, targetRootShape.cut.index)) {
+        throw new ConversationForkRejectedError(
+          'Fork Context keeps a CompressionBlock made after the fork point; fork from its pre-compression history.'
+        );
+      }
+    }
     const sharedRootNodeId = targetRootShape.rootNodeId;
     // root_seq is insertion order, not ancestry: edits/truncation can leave earlier roots with
     // revisions or suffixes absent from this fork. Keep only history reachable from the retained
@@ -864,6 +885,7 @@ async function resolveForkRootShape(
     segmentCount: BigInt(retained.length),
     segmentIds: retained.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
     estimatedTokens: BigInt(estimatedTokens),
-    nodeSteps: suffix.steps
+    nodeSteps: suffix.steps,
+    cut: { records, index: endIndex }
   };
 }

@@ -916,9 +916,14 @@ function hasCompleteTurnClosure(
 interface CompressionBlockCopy {
   lineage: ForkLineageCompressionBlock;
   observationLinks: DomainRow[];
-  projection: { row: DomainRow; rootId: string } | null;
+  projection: { row: DomainRow; rootId: string };
 }
 
+/**
+ * A copied block always keeps its creation projection, re-homed onto the fork's own history: its
+ * readers (fork precedence, replacement) need it. A block whose pre-compression root has no
+ * equivalent in the fork is refused rather than copied without one.
+ */
 async function readCompressionBlockCopies(
   database: RuntimeDatabase,
   blocks: readonly ForkLineageCompressionBlock[],
@@ -928,14 +933,15 @@ async function readCompressionBlockCopies(
   for (const lineage of blocks) {
     const blockId = id(lineage.block.id, 'CompressionBlock.id');
     const observationLinks = await listAllDomainRows(database, 'CompressionBlockObservationLink', { compression_block_id: blockId });
-    let projection: CompressionBlockCopy['projection'] = null;
-    if (roots) {
-      const sourceRootId = id(lineage.creationProjection.root_id, 'ModelContextProjection.root_id');
-      const [sourceRoot] = await getRows(database, 'ContextSequenceRoot', [sourceRootId]);
-      const rootId = mapForkContextRoot(roots.creation.get(sourceRootId) ?? sourceRoot, roots);
-      if (rootId) projection = { row: lineage.creationProjection, rootId };
+    const sourceRootId = id(lineage.creationProjection.root_id, 'ModelContextProjection.root_id');
+    const [sourceRoot] = await getRows(database, 'ContextSequenceRoot', [sourceRootId]);
+    const rootId = roots ? mapForkContextRoot(roots.creation.get(sourceRootId) ?? sourceRoot, roots) : undefined;
+    if (!rootId) {
+      throw new ConversationForkRejectedError(
+        `Fork Context keeps CompressionBlock ${blockId} whose history was rewritten after it; fork from its pre-compression history.`
+      );
     }
-    copies.push({ lineage, observationLinks, projection });
+    copies.push({ lineage, observationLinks, projection: { row: lineage.creationProjection, rootId } });
   }
   return copies;
 }
@@ -989,14 +995,12 @@ function addCompressionBlockCopy(
     id: copyId(target, 'context_compression_block', id(summarySource.id, 'ContextSegmentSource.id')),
     source_id: targetBlockId
   }));
-  if (copy.projection) {
-    inserts.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
-      ...copy.projection.row,
-      id: copyId(target, 'model_context_projection', id(copy.projection.row.id, 'ModelContextProjection.id')),
-      owner_id: targetBlockId,
-      root_id: copy.projection.rootId
-    }));
-  }
+  inserts.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
+    ...copy.projection.row,
+    id: copyId(target, 'model_context_projection', id(copy.projection.row.id, 'ModelContextProjection.id')),
+    owner_id: targetBlockId,
+    root_id: copy.projection.rootId
+  }));
 }
 
 async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Promise<ToolFact[]> {

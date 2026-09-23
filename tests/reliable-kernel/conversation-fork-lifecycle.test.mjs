@@ -451,9 +451,24 @@ test('a fork keeps a compression only when it precedes the fork point, together 
     const head = await h.app.context.materializeStructure(await h.app.context.currentHeadRootId('source'));
     assert.equal(head.records.length, 3, 'fixture: the manual compression kept the second exchange as its tail');
 
+    // A direct writer caller that cuts the compressed head inside that tail is refused before any write.
+    const insideCommand = await h.command('source', 'fork-inside-compression-tail', 'user');
+    const [insideSource] = await rows(h.app, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: insideCommand.expectedRevisionId
+    });
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: 'source', role: 'default' });
+    const conversationsBefore = await rows(h.app, 'Conversation');
+    await assert.rejects(h.app.runtime.conversationFork.fork({
+      idempotencyKey: 'direct-inside-compression-tail', reuseKey: 'direct-inside-compression-tail',
+      sourceConversationId: 'source', sourceContextRootId: await h.app.context.currentHeadRootId('source'),
+      sourceContextEndSegmentId: insideSource.segment_id, sourceMessageRevisionId: insideCommand.expectedRevisionId,
+      targetTitle: 'Rejected inside compression tail', targetAgentId: agent.agent_id
+    }), error => error instanceof kernel.ConversationForkRejectedError && /after the fork point/.test(error.message));
+    assert.deepEqual(await rows(h.app, 'Conversation'), conversationsBefore);
+
     // The user message sits inside the tail that existed when the compression ran: the compression
     // came after it, so the fork keeps the uncompressed prefix and not the maintenance Turn.
-    const insideTail = await h.facade.forkConversation(await h.command('source', 'fork-inside-compression-tail', 'user'));
+    const insideTail = await h.facade.forkConversation(insideCommand);
     assert.deepEqual(await rows(h.app, 'CompressionBlock', { conversation_id: insideTail.conversationId }), []);
     const insideTurns = await rows(h.app, 'Turn', { conversation_id: insideTail.conversationId });
     assert.equal(insideTurns.length, 2, 'the manual compression Turn after the boundary is not copied');
@@ -593,6 +608,33 @@ test('retrying away the only reply of a turn that auto-compressed keeps later me
     assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /offline summary/);
     const refork = await h.facade.forkConversation(await h.command(fork.conversationId, 'refork-after-retried-compression'));
     await assertOwnedCompression(h, refork.conversationId);
+  }, { compression: true });
+});
+
+test('a kept compression whose creation history was rewritten mid-way is refused instead of copied without its projection', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'rewritten-compressed-input');
+    await h.turn('source', 'rewritten-tail-input');
+    const edited = await h.command('source', 'unused', 'user');
+    const runner = new ReliableConversationRunner(h.app, 'fork-fixture-owner');
+    try {
+      const expectedRootId = await h.app.context.currentHeadRootId('source');
+      const compressed = await runner.manualCompression({
+        commandId: 'manual-compression-before-rewrite', conversationId: 'source',
+        compressSegmentCount: 2, target: { kind: 'current_head', expectedRootId }
+      });
+      assert.equal(compressed.compression.status, 'compressed');
+    } finally { runner.dispose(); }
+    // Editing in place rewrites the creation tail while its reply stays history after the edit.
+    await h.app.turns.edit({
+      source: { kind: 'command', key: 'edit-inside-creation-tail' }, conversationId: 'source',
+      messageId: edited.messageId, expectedRevisionId: edited.expectedRevisionId,
+      content: 'rewritten-tail-edited', deleteFollowing: false
+    });
+    const before = await rows(h.app, 'Conversation');
+    await assert.rejects(h.facade.forkConversation(await h.command('source', 'fork-after-rewritten-creation-tail')),
+      error => error instanceof kernel.ConversationForkRejectedError && /history was rewritten/.test(error.message));
+    assert.deepEqual(await rows(h.app, 'Conversation'), before);
   }, { compression: true });
 });
 
