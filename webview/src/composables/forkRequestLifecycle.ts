@@ -91,15 +91,22 @@ export type ForkErrorOutcome =
  * A permanent rejection (`fork_rejected`) can never succeed and drops the command. Any other
  * failure may have committed before the error was reported: keep the exact command, mark it
  * failed and wait for the user to replay it explicitly.
+ *
+ * The hint for other failures only says a click retries: clicking the message's fork button
+ * replays the same command for an unchanged message (reusing a fork that did commit) and starts
+ * a new one for edited content, so it never contradicts the reason the Host gave. A request the
+ * user did not click in this Webview session (replayed after a reload) says so.
  */
 export function applyForkRequestError(
   requests: Readonly<ForkRequestRecords>,
   error: { correlationId?: string; code?: string; message?: string },
-  now: number
+  now: number,
+  clickedThisSession: ReadonlySet<string>
 ): ForkErrorOutcome | undefined {
   if (!error.correlationId) return undefined;
   const request = Object.values(requests).find((candidate) => candidate.requestId === error.correlationId);
   if (!request) return undefined;
+  const earlier = clickedThisSession.has(request.actionId) ? '' : '之前的分支请求';
   const next: ForkRequestRecords = { ...requests };
   if (error.code === 'fork_rejected') {
     delete next[request.actionId];
@@ -107,7 +114,7 @@ export function applyForkRequestError(
       kind: 'rejected',
       requests: next,
       request,
-      notice: error.message ? `${error.message}（未创建分支。）` : '分支请求被拒绝，未创建分支。'
+      notice: `${earlier}未创建分支${error.message ? `：${error.message}` : '。'}`
     };
   }
   const { requestId: _requestId, ...rest } = request;
@@ -121,9 +128,61 @@ export function applyForkRequestError(
     requests: next,
     request: failed,
     notice: error.message
-      ? `${error.message}（再次点击将重放同一分支命令。）`
-      : '分支提交结果未确认；再次点击将重放同一命令。'
+      ? `${earlier ? `${earlier}：` : ''}${error.message}（分支结果尚未确认，可再次点击分支按钮重试。）`
+      : `${earlier ? `${earlier}的` : ''}分支结果尚未确认，可再次点击分支按钮重试。`
   };
+}
+
+/** A confirmed fork the user did not open right away, offered on its source conversation. */
+export interface ForkReadyNotice {
+  sourceConversationId: string;
+  conversationId: string;
+  /** The result belongs to a command replayed after the Webview reloaded, not to a click now. */
+  replayed: boolean;
+}
+
+export type ForkResultNavigation = { kind: 'open' } | { kind: 'notice'; notice: ForkReadyNotice };
+
+/**
+ * Opening the fork answers a click: only a command clicked in this Webview session, while the user
+ * still looks at its source, navigates. A result replayed after a reload (possibly days later) or
+ * arriving after the user moved on leaves the view where it is and offers the fork on the source
+ * conversation instead. The command is still replayed and resolved, so a committed fork is never
+ * duplicated by a later click.
+ */
+export function forkResultNavigation(
+  request: ForkRequestState,
+  payload: ConversationForkResultPayload,
+  view: { clickedThisSession: boolean; activeConversationId: string }
+): ForkResultNavigation {
+  if (view.clickedThisSession && view.activeConversationId === request.sourceConversationId) return { kind: 'open' };
+  return {
+    kind: 'notice',
+    notice: {
+      sourceConversationId: request.sourceConversationId,
+      conversationId: payload.conversationId,
+      replayed: !view.clickedThisSession
+    }
+  };
+}
+
+/**
+ * Forks copy completed turns only: a message of the running turn, one still streaming, one without
+ * a committed revision or one whose fork is already in flight cannot start another fork.
+ */
+export function messageForkBlocked(
+  message: { id: string; status?: string },
+  state: {
+    activeTurnId: string;
+    pendingMessageIds: ReadonlySet<string>;
+    revisionIdByMessageId: Readonly<Record<string, string>>;
+    turnIdByMessageId: Readonly<Record<string, string>>;
+  }
+): boolean {
+  return state.pendingMessageIds.has(message.id)
+    || !state.revisionIdByMessageId[message.id]
+    || message.status === 'streaming'
+    || (state.activeTurnId !== '' && state.turnIdByMessageId[message.id] === state.activeTurnId);
 }
 
 /** A new Feed session re-sends unconfirmed commands of the active Conversation, never failed ones. */

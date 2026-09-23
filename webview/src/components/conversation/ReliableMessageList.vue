@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
 import { projectCompressionNotices, type CompressionNotice as CompressionWarningRecord } from '@shared/compressionNotices';
 import { useChat } from '@webview/composables/useChat';
+import { messageForkBlocked } from '@webview/composables/forkRequestLifecycle';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
@@ -60,6 +61,9 @@ const {
   conversationActionPending,
   conversationActionLabel,
   conversationActionNotice,
+  conversationForkReadyNotice,
+  openForkReadyNotice,
+  dismissForkReadyNotice,
   forkPendingTargetIds,
   currentAuthoritySelection
 } = useChat();
@@ -511,11 +515,12 @@ function deleteFrom(message: MessageRecord): void {
 
 function forkBlocked(message: MessageRecord): boolean {
   // A fork copies completed turns only; messages of the running turn become forkable once it ends.
-  const activeTurnId = reliableText(activeTurn.value?.id);
-  return forkPendingTargetIds.value.has(message.id)
-    || !projection.value.messageRevisionIdByMessageId[message.id]
-    || message.status === 'streaming'
-    || (activeTurnId !== '' && projection.value.turnIdByMessageId[message.id] === activeTurnId);
+  return messageForkBlocked(message, {
+    activeTurnId: reliableText(activeTurn.value?.id),
+    pendingMessageIds: forkPendingTargetIds.value,
+    revisionIdByMessageId: projection.value.messageRevisionIdByMessageId,
+    turnIdByMessageId: projection.value.turnIdByMessageId
+  });
 }
 
 function forkFrom(message: MessageRecord): void {
@@ -777,6 +782,11 @@ function messageRenderKey(message: MessageRecord): string {
     <p v-if="conversationActionNotice" class="reliable-action-notice" role="status">
       {{ conversationActionNotice }}
     </p>
+    <p v-if="conversationForkReadyNotice" class="reliable-action-notice reliable-fork-ready" role="status">
+      <span>{{ conversationForkReadyNotice.replayed ? '之前的分支请求已完成，分支已创建。' : '分支已创建。' }}</span>
+      <button type="button" @click="openForkReadyNotice">打开分支</button>
+      <button type="button" aria-label="关闭分支提示" @click="dismissForkReadyNotice">关闭</button>
+    </p>
     <div v-if="messages.length === 0 && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
       <p class="reliable-message-empty">{{ emptyHint }}</p>
     </div>
@@ -841,6 +851,31 @@ function messageRenderKey(message: MessageRecord): string {
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-sm);
   text-align: center;
+}
+
+.reliable-fork-ready {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.reliable-fork-ready button {
+  padding: 1px var(--space-2);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  cursor: pointer;
+}
+
+.reliable-fork-ready button:hover,
+.reliable-fork-ready button:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--vscode-foreground) 45%, transparent);
+  outline-offset: 1px;
+  background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
 }
 
 .reliable-message-empty-container {

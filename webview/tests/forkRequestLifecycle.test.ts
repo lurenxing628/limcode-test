@@ -4,8 +4,10 @@ import {
   applyForkRequestError,
   decideForkClick,
   forkRequestsToReplay,
+  forkResultNavigation,
   forkResultResolves,
   markForkRequestSent,
+  messageForkBlocked,
   pendingForkMessageIds,
   restoreForkRequests,
   type ForkRequestRecords
@@ -30,16 +32,58 @@ test('a permanent rejection drops the fork command', () => {
   const { requests, request } = sent({});
   const outcome = applyForkRequestError(requests, {
     correlationId: 'request-1', code: 'fork_rejected', message: '回合仍在运行'
-  }, 10);
+  }, 10, new Set([request.actionId]));
   assert.equal(outcome?.kind, 'rejected');
   assert.deepEqual(outcome?.requests, {});
   assert.equal(outcome?.request.actionId, request.actionId);
-  assert.match(outcome?.notice ?? '', /回合仍在运行/);
+  assert.equal(outcome?.notice, '未创建分支：回合仍在运行');
+});
+
+test('failure hints never contradict the reason, and a replayed request says it is an earlier one', () => {
+  const { requests, request } = sent({});
+  const failed = applyForkRequestError(requests, {
+    correlationId: 'request-1', message: 'Fork 源 Message Revision 已变化，请基于当前内容重新创建分支。'
+  }, 10, new Set([request.actionId]));
+  assert.equal(failed?.kind, 'failed');
+  assert.doesNotMatch(failed?.notice ?? '', /重放同一分支命令/, 'a hint must not promise to replay what the reason says to redo');
+  assert.match(failed?.notice ?? '', /可再次点击分支按钮/);
+  const generic = applyForkRequestError(requests, { correlationId: 'request-1' }, 10, new Set([request.actionId]));
+  assert.equal(generic?.notice, '分支结果尚未确认，可再次点击分支按钮重试。');
+
+  const replayed = applyForkRequestError(requests, { correlationId: 'request-1', code: 'fork_rejected', message: '源消息已变化' }, 10, new Set());
+  assert.equal(replayed?.notice, '之前的分支请求未创建分支：源消息已变化');
+});
+
+test('only a click in this Webview session, still on the source, opens the fork', () => {
+  const { request } = sent({});
+  const result = { sourceConversationId: 'source', messageId: 'message-a', expectedRevisionId: 'revision-1', commandId: request.actionId, conversationId: 'branch', status: 'accepted' as const };
+  assert.deepEqual(forkResultNavigation(request, result, { clickedThisSession: true, activeConversationId: 'source' }), { kind: 'open' });
+  assert.deepEqual(forkResultNavigation(request, result, { clickedThisSession: true, activeConversationId: 'elsewhere' }),
+    { kind: 'notice', notice: { sourceConversationId: 'source', conversationId: 'branch', replayed: false } },
+    'a user who moved on is not pulled back; the source offers the fork instead');
+  assert.deepEqual(forkResultNavigation(request, result, { clickedThisSession: false, activeConversationId: 'source' }),
+    { kind: 'notice', notice: { sourceConversationId: 'source', conversationId: 'branch', replayed: true } },
+    'a result replayed after a reload never navigates by itself');
+});
+
+test('the fork button is disabled for messages of the running turn, pending forks and unfinished messages', () => {
+  const state = {
+    activeTurnId: 'turn-2',
+    pendingMessageIds: new Set(['pending']),
+    revisionIdByMessageId: { done: 'r1', running: 'r2', pending: 'r3', streaming: 'r4' } as Record<string, string>,
+    turnIdByMessageId: { done: 'turn-1', running: 'turn-2', pending: 'turn-1', streaming: 'turn-1' } as Record<string, string>
+  };
+  assert.equal(messageForkBlocked({ id: 'done', status: 'final' }, state), false, 'an earlier turn stays forkable while a later one runs');
+  assert.equal(messageForkBlocked({ id: 'running', status: 'final' }, state), true);
+  assert.equal(messageForkBlocked({ id: 'pending', status: 'final' }, state), true);
+  assert.equal(messageForkBlocked({ id: 'streaming', status: 'streaming' }, state), true);
+  assert.equal(messageForkBlocked({ id: 'no-revision', status: 'final' }, state), true);
+  assert.equal(messageForkBlocked({ id: 'running', status: 'final' }, { ...state, activeTurnId: '' }), false, 'once the turn ends it can be forked');
 });
 
 test('an unconfirmed failure is kept for an explicit replay and never replayed by a new session', () => {
   const { requests, request } = sent({});
-  const outcome = applyForkRequestError(requests, { correlationId: 'request-1', message: '历史刷新失败' }, 42);
+  const outcome = applyForkRequestError(requests, { correlationId: 'request-1', message: '历史刷新失败' }, 42, new Set());
   assert.equal(outcome?.kind, 'failed');
   const failed = outcome!.requests[request.actionId];
   assert.deepEqual(failed.failure, { message: '历史刷新失败', failedAt: 42 });
@@ -68,7 +112,7 @@ test('a different message revision replaces a failed request but not an in-fligh
   const blocked = decideForkClick(requests, edited, nextCommand);
   assert.equal(blocked.kind, 'blocked');
 
-  const failed = applyForkRequestError(requests, { correlationId: 'request-1' }, 5)!.requests;
+  const failed = applyForkRequestError(requests, { correlationId: 'request-1' }, 5, new Set())!.requests;
   const replaced = decideForkClick(failed, edited, nextCommand);
   assert.equal(replaced.kind, 'send');
   if (replaced.kind !== 'send') return;
@@ -81,7 +125,7 @@ test('a new Feed session re-sends only unconfirmed commands of the active conver
   let { requests } = sent({});
   ({ requests } = sent(requests, { ...target, messageId: 'message-b' }, 'request-2'));
   ({ requests } = sent(requests, { ...target, sourceConversationId: 'other' }, 'request-3'));
-  const failed = applyForkRequestError(requests, { correlationId: 'request-2' }, 1)!.requests;
+  const failed = applyForkRequestError(requests, { correlationId: 'request-2' }, 1, new Set())!.requests;
   assert.deepEqual(forkRequestsToReplay(failed, 'source', 'session-1'), [], 'same session is not replayed');
   assert.deepEqual(forkRequestsToReplay(failed, 'source', 'session-2').map((request) => request.messageId), ['message-a']);
   assert.deepEqual([...pendingForkMessageIds(failed, 'source')], ['message-a']);
@@ -89,8 +133,8 @@ test('a new Feed session re-sends only unconfirmed commands of the active conver
 
 test('errors and results resolve only their exact command', () => {
   const { requests, request } = sent({});
-  assert.equal(applyForkRequestError(requests, { correlationId: 'another-request' }, 1), undefined);
-  assert.equal(applyForkRequestError(requests, {}, 1), undefined);
+  assert.equal(applyForkRequestError(requests, { correlationId: 'another-request' }, 1, new Set()), undefined);
+  assert.equal(applyForkRequestError(requests, {}, 1, new Set()), undefined);
   const result = {
     sourceConversationId: 'source',
     messageId: 'message-a',
