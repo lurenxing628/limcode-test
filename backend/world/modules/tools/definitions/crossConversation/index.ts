@@ -53,7 +53,7 @@ const definitions: ToolDefinition[] = [
     const title = compact(record?.title, 60) || compact(record?.prompt, 60);
     return title ? `新建对话 · ${title}` : '新建对话';
   }),
-  tool('fork_conversation', 'Fork a conversation into a new top-level conversation that contains only its completed history, up to the end of its last finished turn. A turn still in progress, including the current one when forking this conversation, is excluded. The fork starts no turn; to continue work there, send it a task with send_conversation_message. Omit conversationRef to fork this conversation. The user\'s view does not switch.', {
+  tool('fork_conversation', 'Fork a conversation into a new top-level conversation that contains only its completed history, up to the end of its last finished turn. A turn still in progress, including the current one when forking this conversation, is excluded. The fork starts no turn; to continue work there, send it a task with send_conversation_message. Omit conversationRef to fork this conversation. A conversation open in another VS Code window can only be forked from that window. The user\'s view does not switch.', {
     conversationRef: { type: 'string', description: 'Optional conversation reference C# returned by list_conversations; omit to fork this conversation.' }
   }, [], (args) => asRecord(args)?.targetConversationId === undefined ? '分支当前对话' : '分支其他对话')
 ];

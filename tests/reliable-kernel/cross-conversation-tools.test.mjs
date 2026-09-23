@@ -2024,3 +2024,46 @@ test('a fork is told which copied collaboration refs are inherited and which ref
     assert.equal(fresh?.status, 'succeeded', 'the way forward the error names works');
   });
 });
+
+test('fork_conversation of a conversation another window hosts says so and creates nothing, while reading it still works', { timeout: 60000 }, async () => {
+  const { ConversationRuntimeOwnerManager } = load('backend/reliableKernel/ConversationRuntimeOwnerManager.js');
+  let rootRound = 0, forked, read;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === PEER) return answer('PEER_ANSWER_7701');
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations[0].conversationRef;
+      return toolsAnswer(call('read-peer', 'read_conversation', { conversationRef: peer }), call('fork-peer', 'fork_conversation', { conversationRef: peer }));
+    }
+    forked = lastResult(start, 'fork_conversation');
+    read = lastResult(start, 'read_conversation');
+    return answer('done');
+  }, async f => {
+    await f.terminated((await f.input(PEER, 'PEER_QUESTION_7700')).turnId);
+    const otherWindow = new ConversationRuntimeOwnerManager(f.app.database.binding, 'other-window');
+    otherWindow.setPendingWorkProbe(async () => false);
+    try {
+      // This window lets go of the idle peer before the other window can open it.
+      await f.until(async () => {
+        try { await otherWindow.retain(PEER, 'other-window-panel'); return true; }
+        catch (error) {
+          if (error?.code !== 'conversation-runtime-owner-busy') throw error;
+          await f.app.database.conversationOwners.releaseIfIdle(PEER);
+          return false;
+        }
+      }, 'The other window never took the peer over.');
+      const conversations = (await f.rows('Conversation')).length;
+      assert.equal((await f.terminated((await f.input(ROOT, 'fork the peer')).turnId)).terminal_status, 'completed');
+      assert.equal(read?.status, 'succeeded');
+      assert.notEqual(forked?.status, 'succeeded');
+      assert.match(JSON.stringify(forked), /open in another VS Code window/);
+      assert.match(JSON.stringify(forked), /Nothing was created/);
+      assert.equal((await f.rows('Conversation')).length, conversations);
+      const targetId = kernel.stablePhaseFId('conversation', `conversation-fork:${f.toolCallId('fork-peer')}`);
+      assert.deepEqual(await f.settingsFor(targetId), { modelProfiles: [], workEnvironments: [] });
+    } finally {
+      await otherWindow.close();
+    }
+  });
+});

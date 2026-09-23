@@ -9,6 +9,7 @@ import {
 } from '../../reliableKernel/conversationForkContext';
 import { projectFolderAssignmentSteps, projectFolderForConversation } from '../../reliableKernel/conversationProject';
 import { isTransactionAssertionFailure, stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
+import { ConversationRuntimeOwnerBusyError } from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
 import type { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
@@ -601,11 +602,16 @@ function forkTargetConversationId(commandId: string): string {
 
 /**
  * The reason a fork_conversation call reports. Nothing was created in every case. A permanent
- * rejection already says why; a concurrent change to the source gets its own actionable message;
- * anything else keeps its text behind that fact.
+ * rejection already says why; a source hosted by another window and a concurrent change to the
+ * source get their own actionable message; anything else keeps its text behind that fact.
  */
 function forkToolError(error: unknown): Error {
   if (error instanceof ConversationForkRejectedError) return error;
+  // Forking reads and settles the source under its ownership, which listing, reading and sending
+  // never need: only this call cares which window hosts the source.
+  if (error instanceof ConversationRuntimeOwnerBusyError) {
+    return new Error('That conversation is open in another VS Code window, and only the window hosting a conversation can fork it. Nothing was created; ask the user to fork it from that window, or try again once it is closed there.');
+  }
   if (isTransactionAssertionFailure(error)) {
     return new Error('The conversation changed while it was being forked. Nothing was created; try again.');
   }
