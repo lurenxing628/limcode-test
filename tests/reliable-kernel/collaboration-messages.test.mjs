@@ -465,8 +465,10 @@ test('a user Turn that starts after the anchor ends never absorbs a queued cross
   const started = [];
   const { scanner, scan } = continuationScanner(f, started);
   try {
+    const [wakeBefore] = await f.rows('RuntimeDeliveryWake', { delivery_id: followup.deliveryId });
     await scan();
     assert.deepEqual(started, [], 'the followup waits behind the user Turn instead of being injected');
+    assert.deepEqual(await f.get('RuntimeDeliveryWake', wakeBefore.id), wakeBefore, 'the scanner leaves the waiting wake unclaimed, not claimed and deferred');
     assert.equal((await f.get('RuntimeDelivery', followup.deliveryId)).state, 'pending');
     assert.deepEqual((await f.rows('PendingTurnInput', { turn_id: 'target-b-user' })).map(row => row.id).length, 1, 'only the plain message entered the user Turn');
     // The user Turn spends its own budget, never the peer's.
@@ -857,4 +859,20 @@ test('a wake queued behind a running Turn keeps no poll alive; another host endi
     assert.deepEqual(started, [accepted.deliveryId], 'the external data version change starts the queued followup');
     assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).target_turn_id, 'root-after-external-end');
   } finally { await scanner.dispose(); }
+}));
+
+test('the router keeps a cross-conversation followup out of a Turn that started after its anchor ended', async () => fixture(async f => {
+  await topLevel(f, ['peer-a', true], ['target-b', true]);
+  const followup = await crossSend(f, 'a-task-router', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  const team = await f.collaboration.send({ source: await f.source('team-note-router', 'left', 'left-turn'), targetConversationId: 'root', text: 'team note', mode: 'message', queueBehindActiveTurn: true });
+  await endTurn(f, 'target-b-turn');
+  await admitPending(f, 'target-b', 'target-b-user');
+  // Dispatch can race the user's Turn past the scanner's own check; the router decides alone.
+  const router = new AutomaticRuntimeDeliveryRouter(f.database);
+  const decision = await router.resolve({ inboxItemId: followup.inboxItemId, targetConversationId: 'target-b', sourceTurnId: 'target-b-user' });
+  assert.deepEqual([decision.reason, decision.phase, decision.targetTurnId], ['collaboration_queued_behind_active_turn', 'next_turn', null]);
+  // Team messages keep their anchor-only rule.
+  await endTurn(f, 'root-turn');
+  await admitPending(f, 'root', 'root-user');
+  assert.equal((await router.resolve({ inboxItemId: team.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-user' })).reason, 'source_turn_active');
 }));
