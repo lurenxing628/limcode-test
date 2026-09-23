@@ -29,6 +29,11 @@ export class CollaborationReplyBudgetExhaustedError extends Error {
 export function isCollaborationReplyBudgetExhaustedError(error: unknown): error is CollaborationReplyBudgetExhaustedError {
   return error instanceof CollaborationReplyBudgetExhaustedError;
 }
+/**
+ * Cross-conversation tools reach only Conversations of the caller's project. Conversations without
+ * a project reach only each other, as the sidebar groups them under one 未绑定 scope.
+ */
+export const CROSS_PROJECT_REFUSAL = 'That conversation belongs to a different project. Cross-conversation tools only reach conversations of this conversation\'s project (conversations without a project only reach each other). Nothing was read, sent or created.';
 export type CollaborationSource = { kind: 'tool'; turnId: string; toolCallId: string };
 /** turnId is null for the failure reply to a task that no Turn will answer. */
 interface CompletionSource { kind: 'completion'; turnId: string | null; requestId: string }
@@ -349,10 +354,11 @@ export class CollaborationControlPlane {
 
   /**
    * The Turn's own switch and top-level placement authorize every cross-conversation action; an
-   * optional target must be another active top-level Conversation. Child task conversations stay
-   * inside their team on both sides.
+   * optional target must be another active top-level Conversation of the caller's project. Child
+   * task conversations stay inside their team on both sides. Every read, send and fork of another
+   * Conversation passes here, so a reference obtained any other way never reaches another project.
    */
-  public async authorizeCrossConversation(input: { turnId: string; targetConversationId?: string }): Promise<{ conversationId: string }> {
+  public async authorizeCrossConversation(input: { turnId: string; targetConversationId?: string }): Promise<{ conversationId: string; projectContextId: string | null }> {
     const turn = await this.existing('Turn', requirePhaseFId(input.turnId, 'turnId'));
     const conversationId = String(turn.conversation_id);
     if (!await readTurnCrossConversationEnabled(this.database, this.contentStore, String(turn.id))) {
@@ -361,7 +367,8 @@ export class CollaborationControlPlane {
     if ((await this.rows('ChildExecution', { child_conversation_id: conversationId })).length) {
       throw new Error('Cross-conversation collaboration is only available to top-level conversations.');
     }
-    if (input.targetConversationId === undefined) return { conversationId };
+    const projectContextId = await this.projectOf(conversationId);
+    if (input.targetConversationId === undefined) return { conversationId, projectContextId };
     const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
     if (targetConversationId === conversationId) throw new Error('A cross-conversation action must target another Conversation.');
     const target = await this.existing('Conversation', targetConversationId);
@@ -369,7 +376,19 @@ export class CollaborationControlPlane {
     if ((await this.rows('ChildExecution', { child_conversation_id: targetConversationId })).length) {
       throw new Error('Cross-conversation collaboration cannot address a child task conversation.');
     }
-    return { conversationId };
+    if (await this.projectOf(targetConversationId) !== projectContextId) throw new Error(CROSS_PROJECT_REFUSAL);
+    return { conversationId, projectContextId };
+  }
+
+  /**
+   * The project a Conversation was created in, or null when it has none. A ConversationProjectLink
+   * is written only with its Conversation and deleted only with it, so the answer never changes
+   * while the Conversation exists and the checks that use it need no transaction assertion.
+   */
+  private async projectOf(conversationId: string): Promise<string | null> {
+    const links = await this.rows('ConversationProjectLink', { conversation_id: conversationId });
+    if (links.length > 1) throw new Error(`Conversation ${conversationId} has more than one project link.`);
+    return links[0] ? String(links[0].project_context_id) : null;
   }
 
   /**
@@ -413,9 +432,12 @@ export class CollaborationControlPlane {
     if (rank >= limit) throw new Error(`This turn already made ${limit} create_conversation or fork_conversation calls, the most one turn may make. Nothing was created; continue with the conversations that exist.`);
   }
 
-  /** Other active top-level Conversations of this Runtime (one workspace), newest update first. */
+  /**
+   * Other active top-level Conversations of the caller's project, newest update first. The Runtime
+   * is shared by every VS Code window, so the project, never the Runtime, bounds what is listed.
+   */
   public async listConversations(input: { turnId: string; limit?: number }): Promise<CrossConversationListing> {
-    const { conversationId } = await this.authorizeCrossConversation({ turnId: input.turnId });
+    const { conversationId, projectContextId } = await this.authorizeCrossConversation({ turnId: input.turnId });
     const limit = input.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError('Conversation list limit must be 1..50.');
     const conversations: CrossConversationListing['conversations'] = [];
@@ -428,6 +450,7 @@ export class CollaborationControlPlane {
         const id = String(row.id);
         if (id === conversationId || row.status !== 'active') continue;
         if ((await this.rows('ChildExecution', { child_conversation_id: id })).length) continue;
+        if (await this.projectOf(id) !== projectContextId) continue;
         if (conversations.length === limit) return { conversations, hasMore: true };
         const active = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').list({ where: { conversation_id: id, status: 'active' }, limit: 1 })]);
         conversations.push({ conversationId: id, title: await this.displayTitle(row), running: (active.snapshot[0] as DomainRow[]).length > 0, updatedAt: String(row.updated_at) });

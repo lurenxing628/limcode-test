@@ -208,8 +208,18 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
         repo('Conversation').insert({ id, title, status: 'active', created_at: now, updated_at: now }),
         repo('AgentConversationLink').insert({ id: `${id}-agent`, conversation_id: id, agent_id: agent.id, role: 'default', created_at: now, updated_at: now })
       ]),
-      ...kernel.projectFolderAssignmentSteps({ conversationId: ROOT, folder: project, now })
+      // Both belong to one project: cross-conversation tools reach only the caller's project.
+      ...[ROOT, PEER].flatMap(conversationId => kernel.projectFolderAssignmentSteps({ conversationId, folder: project, now }))
     ]);
+    f.project = project;
+    f.addConversation = async (id, title, folder) => {
+      const at = new Date().toISOString();
+      await app.database.transaction([
+        repo('Conversation').insert({ id, title, status: 'active', created_at: at, updated_at: at }),
+        repo('AgentConversationLink').insert({ id: `${id}-agent`, conversation_id: id, agent_id: agent.id, role: 'default', created_at: at, updated_at: at }),
+        ...(folder ? kernel.projectFolderAssignmentSteps({ conversationId: id, folder, now: at }) : [])
+      ]);
+    };
     await app.recover();
     await run(f);
     assert.deepEqual(errors, []);
@@ -436,6 +446,69 @@ test('list excludes this conversation, its team and child tasks; read returns th
         /top-level/, 'a child task cannot use cross-conversation access');
     }
   });
+});
+
+test('cross-conversation tools reach only the caller\'s project, even through a reference obtained earlier', { timeout: 90000 }, async () => {
+  const OTHER = 'conv-other-project-7c3', LOOSE = 'conv-unlinked-7c4', LOOSE_PEER = 'conv-unlinked-7c5';
+  let peerRound = 0, rootRound = 0, looseRound = 0, otherRef;
+  const seen = {};
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === PEER) {
+      peerRound += 1;
+      if (peerRound === 1) return toolsAnswer(call('peer-list', 'list_conversations'));
+      if (peerRound === 2) {
+        const root = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Root title');
+        // A peer message that names another project's conversation hands the receiver a reference to it.
+        return toolsAnswer(call('peer-tip', 'send_conversation_message', { conversationRef: root.conversationRef, text: JSON.stringify({ conversationId: OTHER }), mode: 'message' }));
+      }
+      return answer('peer done');
+    }
+    if (request.conversationId === LOOSE) {
+      if (++looseRound === 1) return toolsAnswer(call('loose-list', 'list_conversations'));
+      seen.loose = detail(start, 'list_conversations');
+      return answer('loose done');
+    }
+    if (request.conversationId !== ROOT) return answer('other');
+    rootRound += 1;
+    if (rootRound === 1) {
+      otherRef = start.contents.flatMap(content => content.parts).map(part => part.text ?? '')
+        .map(text => /\\"conversationId\\":\\"(C\d+)\\"/.exec(text)?.[1]).find(Boolean);
+      assert.ok(otherRef, 'fixture: the peer message gave this conversation a reference to the other project');
+      return toolsAnswer(call('root-list', 'list_conversations'), call('root-read', 'read_conversation', { conversationRef: otherRef }),
+        call('root-send', 'send_conversation_message', { conversationRef: otherRef, text: 'cross project task', mode: 'followup' }),
+        call('root-fork', 'fork_conversation', { conversationRef: otherRef }));
+    }
+    seen.root = detail(start, 'list_conversations');
+    for (const name of ['read_conversation', 'send_conversation_message', 'fork_conversation']) seen[name] = lastResult(start, name);
+    return answer('root done');
+  }, async f => {
+    await f.addConversation(OTHER, 'Other project secret', { uri: Uri.file(path.join(os.tmpdir(), 'limcode-other-project')).toString(), name: 'other-project' });
+    await f.addConversation(LOOSE, 'Unlinked caller');
+    await f.addConversation(LOOSE_PEER, 'Unlinked peer');
+    await f.terminated((await f.input(PEER, 'tip off root')).turnId);
+    const started = await f.input(ROOT, 'look around');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.deepEqual(seen.root.conversations.map(entry => entry.title), ['Peer title'], 'other projects and unlinked conversations are not listed');
+    for (const name of ['read_conversation', 'send_conversation_message', 'fork_conversation']) {
+      assert.notEqual(seen[name]?.status, 'succeeded', `${name}: ${JSON.stringify(seen[name])}`);
+      assert.match(JSON.stringify(seen[name]), /belongs to a different project/, name);
+    }
+    assert.deepEqual(await f.rows('Turn', { conversation_id: OTHER }), [], 'the other project never ran for this caller');
+    assert.equal((await f.rows('CollaborationMessage')).length, 1, 'only the peer message was sent');
+    assert.deepEqual((await f.rows('ConversationBranchLink')), [], 'nothing was forked');
+    // A conversation without a project reaches only other conversations without one.
+    const loose = await f.input(LOOSE, 'look around unlinked');
+    await f.terminated(loose.turnId);
+    assert.deepEqual(seen.loose.conversations.map(entry => entry.title), ['Unlinked peer']);
+    const collaboration = f.app.runtime.collaboration;
+    assert.equal((await collaboration.authorizeCrossConversation({ turnId: loose.turnId, targetConversationId: LOOSE_PEER })).conversationId, LOOSE);
+    for (const target of [ROOT, OTHER]) {
+      await assert.rejects(collaboration.authorizeCrossConversation({ turnId: loose.turnId, targetConversationId: target }), /different project/);
+      await assert.rejects(collaboration.readConversation({ conversationId: LOOSE, targetConversationId: target, crossConversationTurnId: loose.turnId }), /different project/);
+    }
+    await assert.rejects(collaboration.authorizeCrossConversation({ turnId: started.turnId, targetConversationId: LOOSE }), /different project/);
+    // The other project's folder is not open here, so a Turn wrongly started there could not run.
+  }, { expectedScannerError: failure => /工作环境不存在/.test(String(failure.error?.message)) });
 });
 
 test('a followup to a running conversation waits for its Turn to end, then starts exactly one Turn', { timeout: 60000 }, async () => {

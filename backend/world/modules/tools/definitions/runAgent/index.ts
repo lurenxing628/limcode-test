@@ -162,7 +162,7 @@ export const runAgentTool: ToolDefinition = {
         key: CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
         label: '跨对话协作',
         type: 'boolean',
-        description: '允许顶层对话的 Agent 列出、读取本工作区的其他对话，向它们发送消息或续派任务，并按用户要求新建或分支对话。默认关闭。',
+        description: '允许顶层对话的 Agent 列出、读取同一项目的其他对话（未绑定项目的对话只能访问其他未绑定的对话），向它们发送消息或续派任务，并按用户要求在本项目新建或分支对话。默认关闭。',
         defaultValue: false
       }]
     },
