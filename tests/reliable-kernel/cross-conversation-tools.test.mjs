@@ -2046,7 +2046,7 @@ test('fork_conversation that fails after copying settings removes them and repor
 
 test('a fork is told which copied collaboration refs are inherited and which ref is itself, and inherited refs fail with a way forward', { timeout: 90000 }, async () => {
   const TASK = 'FORK_REF_TASK_9901';
-  let rootRound = 0, forkRound = 0, forkId, card, envelope, reply, read, fresh;
+  let rootRound = 0, forkRound = 0, createdId, forkId, card, envelope, refs, reply, read, fresh;
   await fixture(async (request, f, start) => {
     if (request.conversationId === ROOT) return ++rootRound === 1 ? toolsAnswer(call('create', 'create_conversation', { prompt: TASK, title: 'Spawned' })) : answer('root');
     if (request.conversationId !== forkId) return answer('created result');
@@ -2055,33 +2055,35 @@ test('a fork is told which copied collaboration refs are inherited and which ref
     if (forkRound === 1) {
       const line = texts.flatMap(text => text.split('\n')).find(text => text.startsWith('{"selfConversationRef"'));
       card = line && JSON.parse(line);
-      const copied = texts.find(text => text.includes(TASK));
-      envelope = {
-        messageRef: /"messageRef":"(M\d+)"/.exec(copied)?.[1],
-        sourceConversationRef: /"sourceConversationRef":"(C\d+)"/.exec(copied)?.[1],
-        targetConversationRef: /"targetConversationRef":"(C\d+)"/.exec(copied)?.[1]
-      };
-      return toolsAnswer(call('reply-copied', 'send_conversation_message', { conversationRef: envelope.sourceConversationRef, text: 'answer to the copied task', mode: 'message', replyToMessageRef: envelope.messageRef }),
+      // The copied task names only its sender; which ref is the fork itself and which is its source
+      // is read from the catalog this request was built with.
+      const copied = JSON.parse(texts.find(text => text.includes(TASK)).split('\n')[1]);
+      envelope = { messageRef: copied.messageRef, senderConversationRef: copied.sender.conversationRef };
+      const conversationRef = id => request.recipe.modelHandleCatalog.entries.find(entry => entry.kind === 'conversation' && entry.target === id)?.ref;
+      refs = { root: conversationRef(ROOT), created: conversationRef(createdId), fork: conversationRef(forkId) };
+      return toolsAnswer(call('reply-copied', 'send_conversation_message', { conversationRef: envelope.senderConversationRef, text: 'answer to the copied task', mode: 'message', replyToMessageRef: envelope.messageRef }),
         call('read-copied', 'read_agent_messages', { messageRef: envelope.messageRef }));
     }
     if (forkRound === 2) {
       reply = lastResult(start, 'send_conversation_message');
       read = lastResult(start, 'read_agent_messages');
-      return toolsAnswer(call('send-fresh', 'send_conversation_message', { conversationRef: envelope.sourceConversationRef, text: 'fresh message from the fork', mode: 'message' }));
+      return toolsAnswer(call('send-fresh', 'send_conversation_message', { conversationRef: envelope.senderConversationRef, text: 'fresh message from the fork', mode: 'message' }));
     }
     fresh = lastResult(start, 'send_conversation_message');
     return answer('fork done');
   }, async f => {
     await f.terminated((await f.input(ROOT, 'create one')).turnId);
-    const createdId = kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId('create'));
+    createdId = kernel.stablePhaseFId('conversation', 'cross-create', f.toolCallId('create'));
     await f.until(async () => (await f.rows('CollaborationRequest')).some(request => request.state === 'completed'), 'The created conversation never answered.');
     forkId = (await f.lifecycle.forkCompletedHistory({ sourceConversationId: createdId, commandId: 'fork-with-copied-refs' })).conversationId;
     const turn = await f.input(forkId, 'please answer the original task');
     assert.equal((await f.terminated(turn.turnId)).terminal_status, 'completed');
     assert.ok(card, 'the fork gets a fork identity card');
     assert.match(card.selfConversationRef, /^C\d+$/);
-    assert.deepEqual(card.forkedFromConversationRefs, [envelope.targetConversationRef], 'the copied "this conversation" is the source');
-    assert.notEqual(card.selfConversationRef, envelope.targetConversationRef);
+    assert.equal(envelope.senderConversationRef, refs.root, 'the copied task names ROOT as its sender');
+    assert.equal(card.selfConversationRef, refs.fork);
+    assert.deepEqual(card.forkedFromConversationRefs, [refs.created], 'the copied "this conversation" is the source');
+    assert.notEqual(card.selfConversationRef, refs.created);
     assert.deepEqual(card.inheritedMessageRefs, [envelope.messageRef]);
     for (const result of [reply, read]) {
       assert.notEqual(result?.status, 'succeeded', JSON.stringify(result));
