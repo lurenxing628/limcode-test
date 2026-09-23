@@ -494,3 +494,67 @@ test('推理模式编码：reasoning.mode 按配置发送，不再只认 Astra�
   assert.equal(chat.reasoning_effort, 'high');
   assert.equal(JSON.stringify(chat).includes('"pro"'), false);
 });
+
+// Chat Completions 工具限制：Using GPT-6 “Update API and model parameters”：“GPT-6 Astra supports Chat Completions,
+// but its tool calling requires Responses. GPT-6 Sol and Luna support function calling in Chat Completions only with
+// reasoning_effort: "none".” LimCode 不改写推理强度，只在设置界面提示。
+test('Chat Completions 工具限制：只对 openai-compatible 上的 GPT-6 官方 id 给出提示', () => {
+  const { gpt6ChatCompletionsToolRestriction: restriction } = capabilities;
+  assert.equal(restriction('openai-compatible', 'gpt-6-astra'), 'unsupported');
+  assert.equal(restriction('openai-compatible', 'gpt-6-astra-2026-09-01'), 'unsupported');
+  for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-luna-2026-06-01']) {
+    assert.equal(restriction('openai-compatible', model), 'requires_none_effort', model);
+  }
+  for (const model of FAMILY) assert.equal(restriction('openai-responses', model), undefined, model);
+  for (const model of ['gpt-6-sol-xhigh', '[az]gpt-6-astra-xhigh', 'gpt-5.6', 'gpt-5.5', 'claude-sonnet-5']) {
+    assert.equal(restriction('openai-compatible', model), undefined, model);
+  }
+});
+
+test('Chat Completions 带工具时不擅自改写推理强度', async () => {
+  const tools = [{ name: 'probe', description: 'd', parameters: { type: 'object', properties: {} } }];
+  for (const [model, level] of [['gpt-6-sol', 'high'], ['gpt-6-luna', 'none'], ['gpt-6-astra', 'high']]) {
+    const body = (await dryRunLlmProvider(chatRequest(`chat-tools-${model}`, { tools }), {
+      settings: async () => providerConfig({ provider: 'openai-compatible', model, baseUrl: 'https://gateway.example/v1',
+        generationConfig: { thinkingConfig: { thinkingLevel: level } } })
+    })).body;
+    assert.equal(body.reasoning_effort, level, model);
+    assert.equal(body.tools.length, 1, model);
+  }
+});
+
+test('设置界面：openai-compatible 上的 GPT-6 模型显示工具调用限制提示，其他情况不显示', async () => {
+  const { createWebviewSsrServer } = await import('./webview-ssr-server.mjs');
+  const server = await createWebviewSsrServer();
+  // 原生能力状态的悬浮面板在 setup 里读取视口尺寸；SSR 下给一个最小的 document 桩。
+  const previousDocument = globalThis.document;
+  globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
+  try {
+    const { default: editor } = await server.ssrLoadModule('/src/components/settings/global/LlmAdvancedConfigEditor.vue');
+    const { createSSRApp } = await import('vue');
+    const { renderToString } = await import('@vue/server-renderer');
+    const render = (provider, model, generationConfig) => renderToString(createSSRApp(editor, {
+      config: providerConfig({ provider, model, ...(generationConfig ? { generationConfig } : {}) })
+    }));
+    const astra = await render('openai-compatible', 'gpt-6-astra');
+    assert.match(astra, /GPT-6 Astra 走 Chat Completions 时不支持工具调用/);
+    for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+      assert.match(await render('openai-compatible', model), /工具调用需要推理强度为 none/, model);
+    }
+    for (const [provider, model] of [['openai-responses', 'gpt-6-sol'], ['openai-compatible', 'gpt-5.5'], ['openai-compatible', 'gpt-6-sol-xhigh']]) {
+      assert.doesNotMatch(await render(provider, model), /chat-completions-tool-hint/, `${provider}:${model}`);
+    }
+    // Responses 渠道：原生能力区块改为 GPT-6 家族；pro 模式下提示动态推理更新不可用。
+    const sol = await render('openai-responses', 'gpt-6-sol');
+    assert.match(sol, /GPT-6 原生能力/);
+    assert.match(sol, /已启用/);
+    assert.doesNotMatch(sol, /推理模式为 pro 时不可用/);
+    const pro = await render('openai-responses', 'gpt-6-luna', { thinkingConfig: { reasoningMode: 'pro' } });
+    assert.match(pro, /推理模式为 pro 时不可用/);
+    assert.match(await render('openai-responses', 'gpt-6-sol-xhigh'), /当前 LLM 不支持/);
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    await server.close();
+  }
+});

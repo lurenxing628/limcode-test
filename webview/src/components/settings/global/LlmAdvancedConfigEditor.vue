@@ -19,6 +19,7 @@ import {
   type LlmToolCallFormat
 } from '@shared/protocol';
 import {
+  gpt6ChatCompletionsToolRestriction,
   isGpt6FamilyModel,
   isOfficialOpenAIChannel,
   normalizeOpenAIResponsesNativeSettings,
@@ -58,6 +59,21 @@ const emit = defineEmits<{
 const toolCallFormatOptions: SettingsDropdownOption[] = [
   { value: 'function-call', label: 'Function Call' }
 ];
+
+/**
+ * GPT-6 在 Chat Completions 上的工具调用限制（Using GPT-6 “Update API and model parameters”、Sol / Luna 模型页）：
+ * Astra 的工具调用需要 Responses；Sol、Luna 只有 reasoning_effort 为 none 时才能调用工具。只提示，不改写推理强度。
+ */
+const chatCompletionsToolHint = computed(() => {
+  switch (gpt6ChatCompletionsToolRestriction(props.config.provider, props.config.model)) {
+    case 'unsupported':
+      return 'GPT-6 Astra 走 Chat Completions 时不支持工具调用（官方要求工具调用使用 Responses），带工具的请求会被拒绝，建议改用 OpenAI Responses 渠道。';
+    case 'requires_none_effort':
+      return '该模型走 Chat Completions 时工具调用需要推理强度为 none，推理强度不是 none（含未设置时的默认 medium）时带工具的请求会被拒绝。LimCode 不会自动改写推理强度，建议改用 OpenAI Responses 渠道。';
+    default:
+      return '';
+  }
+});
 const openaiResponsesTransportOptions: SettingsDropdownOption[] = [
   {
     value: 'http',
@@ -299,6 +315,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         title="选择工具调用格式"
         @update:model-value="updateToolCallFormat"
       />
+      <span v-if="chatCompletionsToolHint" class="stream-checkbox-text chat-completions-tool-hint">{{ chatCompletionsToolHint }}</span>
     </label>
 
     <label v-if="config.provider === 'openai-responses'" class="global-settings-field openai-responses-transport-field">
