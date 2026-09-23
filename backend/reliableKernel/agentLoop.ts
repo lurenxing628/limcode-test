@@ -1035,7 +1035,7 @@ export class ReliableAgentLoop {
   }
 
   /**
-   * Freezes the Astra native decision and reasoning facts into the ordinary recipe so recovery
+   * Freezes the GPT-6 native decision and reasoning facts into the ordinary recipe so recovery
    * replays byte-identical behavior. Capability inputs come from the frozen Turn authority (never
    * live settings). The base stays stable on a compatible lineage; effort changes become pending
    * configuration updates. Mode/model/provider changes and compression rebase discard stale updates.
@@ -1071,17 +1071,18 @@ export class ReliableAgentLoop {
     );
     const documentModel = asRecord(frozen.document)?.model;
     const modelRecord = asRecord(documentModel);
+    const thinking = asRecord(modelRecord?.thinkingConfig);
     const capabilities = openAIResponsesNativeCapabilities({
       provider: modelRecord?.provider as LlmProviderKind | undefined,
       model: typeof modelRecord?.modelId === 'string' ? modelRecord.modelId : undefined,
       baseUrl: typeof modelRecord?.baseUrl === 'string' ? modelRecord.baseUrl : undefined,
       transport: modelRecord?.openaiResponsesTransport as LlmOpenAIResponsesTransport | undefined,
-      nativeResponses: normalizeOpenAIResponsesNativeSettings(modelRecord?.nativeResponses)
+      nativeResponses: normalizeOpenAIResponsesNativeSettings(modelRecord?.nativeResponses),
+      ...(typeof thinking?.reasoningMode === 'string' ? { reasoningMode: thinking.reasoningMode } : {})
     });
     if (!capabilities.asyncTools && !capabilities.steering && !capabilities.reasoningUpdates) {
       return {};
     }
-    const thinking = asRecord(modelRecord?.thinkingConfig);
     const configuredEffort = typeof thinking?.thinkingLevel === 'string' && thinking.thinkingLevel !== 'not-set' && thinking.thinkingLevel !== 'non-set'
       ? thinking.thinkingLevel
       : undefined;

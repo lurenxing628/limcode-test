@@ -73,7 +73,8 @@ import { LlmEventType } from '../world/modules/llm/events';
 import {
   isAstraModel,
   normalizeOpenAIResponsesNativeSettings,
-  openAIResponsesNativeCapabilities
+  openAIResponsesNativeCapabilities,
+  supportsOpenAIExplicitPromptCache
 } from '../../shared/openAIResponsesCapabilities';
 import type {
   OpenAIResponsesNativeCapabilities,
@@ -416,7 +417,8 @@ export async function startLlmProvider(
       model: settings.model,
       baseUrl: settings.baseUrl,
       transport: settings.openaiResponsesTransport,
-      nativeResponses: settings.nativeResponses
+      nativeResponses: settings.nativeResponses,
+      ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, settings))
     });
 
     const unified = await importUnifiedLlmProvider();
@@ -1609,7 +1611,8 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     model: runtimeSettings.model,
     baseUrl: runtimeSettings.baseUrl,
     transport: runtimeSettings.openaiResponsesTransport,
-    nativeResponses: runtimeSettings.nativeResponses
+    nativeResponses: runtimeSettings.nativeResponses,
+    ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, runtimeSettings))
   });
   const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities);
   const webSocketMode = isOpenAIResponsesWebSocketMode(runtimeSettings);
@@ -4735,6 +4738,12 @@ function effectiveRequestGenerationConfig(
     : frozen;
 }
 
+/** 原生能力门禁需要本次请求实际使用的推理模式：pro 模式不支持 configuration_update。 */
+function nativeReasoningModeInput(generationConfig: LlmGenerationConfigRecord | undefined): { reasoningMode?: string } {
+  const reasoningMode = generationConfig?.thinkingConfig?.reasoningMode;
+  return typeof reasoningMode === 'string' ? { reasoningMode } : {};
+}
+
 /** Astra 参数适配只作用于精确 Astra 模型的 Responses 与 Chat Completions 形状请求。 */
 function isAstraParameterTarget(settings: Pick<LlmProviderConfigRecord, 'provider' | 'model'>): boolean {
   return (settings.provider === 'openai-responses' || settings.provider === 'openai-compatible') && isAstraModel(settings.model);
@@ -4885,7 +4894,9 @@ function unifiedPromptCacheFromSettings(settings: LlmProviderConfigRecord, reque
     const key = typeof effectiveRequestBody?.prompt_cache_key === 'string' && effectiveRequestBody.prompt_cache_key.trim()
       ? effectiveRequestBody.prompt_cache_key.trim()
       : undefined;
-    // 显式断点与 prompt_cache_options 只在 GPT-5.6 及之后的模型上可用；其他模型（实测 gpt-5.5 返回 400）退回 key 模式。
+    // 显式断点与 prompt_cache_options 只在 GPT-5.6 及之后的模型上可用（官方 id 清单见 shared 的
+    // supportsOpenAIExplicitPromptCache；/responses/compact 参考同样写明 “Supported for gpt-5.6 and later
+    // models”）；其他模型（实测 gpt-5.5 返回 400）退回 key 模式。
     if (promptCache.mode === 'key' || !supportsOpenAIExplicitPromptCache(settings.model)) {
       return key ? { enabled: true, mode: 'key', key } : undefined;
     }
@@ -4903,22 +4914,6 @@ function unifiedPromptCacheFromSettings(settings: LlmProviderConfigRecord, reque
     mode: 'explicit',
     breakpoints: { system: true, tools: true, messages: true }
   };
-}
-
-/**
- * 显式提示缓存（`prompt_cache_options` / `prompt_cache_breakpoint`）只支持 “GPT-5.6 and later”
- * （https://developers.openai.com/api/docs/guides/prompt-caching#summary-of-model-differences；
- * /responses/compact 参考同样写明 “Supported for gpt-5.6 and later models”）。只认官方文档列出的精确 id
- * 及其日期快照，不按网关别名或前缀猜测。
- */
-const OPENAI_EXPLICIT_PROMPT_CACHE_MODELS: ReadonlySet<string> = new Set([
-  'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
-  'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'
-]);
-
-function supportsOpenAIExplicitPromptCache(model: string): boolean {
-  const normalized = model.trim().toLowerCase().replace(/-\d{4}-\d{2}-\d{2}$/, '');
-  return OPENAI_EXPLICIT_PROMPT_CACHE_MODELS.has(normalized);
 }
 
 function requestBodyWithOpenAIPromptCacheKey(settings: LlmProviderConfigRecord, conversationId?: string): LlmRequestBodyRecord | undefined {

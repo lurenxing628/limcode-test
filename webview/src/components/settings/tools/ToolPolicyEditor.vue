@@ -795,7 +795,7 @@ function inputNumber(event: Event): number {
                         >
                           <span class="permission-copy">
                             <span class="permission-title">原生异步执行</span>
-                            <span class="permission-desc">仅在 Astra 原生渠道开启「原生异步工具」后生效：该工具可异步执行，结果稍后按原始调用回传；不改变上方的执行审批与调度设置。</span>
+                            <span class="permission-desc">仅在 GPT-6（Astra、Sol、Luna）原生渠道开启「原生异步工具」后生效：该工具可异步执行，结果稍后按原始调用回传；不改变上方的执行审批与调度设置。</span>
                           </span>
                         </LcCheckbox>
                         <LcCheckbox

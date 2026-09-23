@@ -782,7 +782,7 @@ export interface LlmProviderModelConfigRecord {
   headers?: LlmProviderHeadersRecord;
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
-  /** Astra 原生能力配置；缺省表示跟随渠道级配置。 */
+  /** GPT-6 原生能力配置；缺省表示跟随渠道级配置。 */
   nativeResponses?: OpenAIResponsesNativeSettings;
   createdAt: number;
   updatedAt: number;
@@ -814,8 +814,8 @@ export interface LlmProviderConfigRecord {
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
   /**
-   * Astra 原生能力配置（provider-scoped）。显式 enabled 同时表示确认该兼容渠道支持原生能力；
-   * 仅对 openai-responses + 精确 Astra 模型生效。
+   * GPT-6 原生能力配置（provider-scoped）。显式 enabled 同时表示确认该兼容渠道支持原生能力；
+   * 仅对 openai-responses + 精确的 GPT-6 家族模型（Astra、Sol、Luna）生效。
    */
   nativeResponses?: OpenAIResponsesNativeSettings;
   /** 针对单个模型的完整高级配置；命中模型时整体替代渠道默认高级配置。 */
@@ -1042,7 +1042,7 @@ export interface ToolPolicyToolConfigRecord {
    * 用户拒绝时仍会向 AI 回传“用户拒绝使用该结果”的工具响应，避免 AgentRun 永久等待。
    */
   autoSubmitResult?: boolean;
-  /** 是否在 Astra 原生通道允许该工具异步准入（output_item.done 即持久化准入、结果延迟投递）；缺省/false = 同步。 */
+  /** 是否在 GPT-6 原生通道允许该工具异步准入（output_item.done 即持久化准入、结果延迟投递）；缺省/false = 同步。 */
   nativeAsync?: boolean;
   display?: ToolDisplayPolicyRecord;
   config: ToolConfigRecord;
