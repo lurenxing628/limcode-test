@@ -9,10 +9,11 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
   const pinia = await import('pinia');
   const previousPinia = pinia.getActivePinia();
   const previousWindow = globalThis.window;
-  const messages = [];
+  // The bridge is a window singleton; each isolated session swaps in its own message list.
+  const sink = { messages: [] };
   globalThis.window = {
     addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout,
-    acquireVsCodeApi() { return { postMessage(message) { messages.push(structuredClone(message)); }, getState() {}, setState() {} }; }
+    acquireVsCodeApi() { return { postMessage(message) { sink.messages.push(structuredClone(message)); }, getState() {}, setState() {} }; }
   };
   const server = await createServer({
     configFile: path.join(process.cwd(), 'vite.config.ts'),
@@ -26,16 +27,38 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
     const { GLOBAL_SETTINGS_TABS } = await server.ssrLoadModule('/src/components/settings/global/globalSettingsTabs.ts');
     const { runAgentTool } = await server.ssrLoadModule(path.join(process.cwd(), 'backend/world/modules/tools/definitions/runAgent/index.ts'));
     const { crossConversationToolModules } = await server.ssrLoadModule(path.join(process.cwd(), 'backend/world/modules/tools/definitions/crossConversation/index.ts'));
-    const activePinia = pinia.createPinia();
-    pinia.setActivePinia(activePinia);
-    const client = useClientStateStore();
-    client.configurationReady = true;
-    client.toolDefinitions = [runAgentTool.declaration, { name: 'read_file', execution: 'backend', parameters: { type: 'object' }, description: 'read', defaultConfig: {} }];
-    const store = useToolPolicyStore();
-    const render = async (component, props) => renderToString(createSSRApp(component, props).use(activePinia));
+    const crossTools = crossConversationToolModules.map((module) => module.create({}).declaration);
+    const crossNames = crossTools.map((tool) => tool.name);
+    const readFileTool = { name: 'read_file', execution: 'backend', parameters: { type: 'object' }, description: 'read', defaultConfig: {} };
     const input = (html, label) => html.match(new RegExp('<input[^>]*aria-label="' + label + '"[^>]*>'))?.[0];
+    const checkbox = (html) => html.match(/<button[^>]*aria-label="跨对话协作"[^>]*>/)?.[0];
+
+    /** An isolated settings session: its own Pinia, configuration snapshot and posted messages. */
+    const fresh = (definitions = [runAgentTool.declaration, readFileTool, ...crossTools]) => {
+      const isolated = pinia.createPinia();
+      pinia.setActivePinia(isolated);
+      sink.messages = [];
+      const client = useClientStateStore();
+      client.configurationReady = true;
+      client.toolDefinitions = definitions;
+      return {
+        client,
+        store: useToolPolicyStore(),
+        messages: sink.messages,
+        render: (component, props) => renderToString(createSSRApp(component, props).use(isolated)),
+        /** The component's own handlers, reached after a server render instead of through the DOM. */
+        bindings: async (component, props) => {
+          let setupState;
+          const app = createSSRApp(component, props).use(isolated);
+          app.mixin({ created() { if (this.$.type.__name === component.__name) setupState = this.$.setupState; } });
+          await renderToString(app);
+          return setupState;
+        }
+      };
+    };
 
     await t.test('主入口位于全局一级页签，默认 1，预算和深度均不是模型参数', async () => {
+      const { render } = fresh();
       assert.ok(GLOBAL_SETTINGS_TABS.findIndex((tab) => tab.key === 'agent-collaboration') < GLOBAL_SETTINGS_TABS.findIndex((tab) => tab.key === 'tools'));
       for (const [key, value] of Object.entries({ maxChildAgentDepth: 1, maxConcurrentAgents: 8, maxAutomaticFollowups: 32 })) {
         assert.equal(runAgentTool.declaration.defaultConfig[key], value);
@@ -55,6 +78,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
     });
 
     await t.test('局部调整不复制无关的全局设置，0 覆盖与恢复继承都保留其它策略', async () => {
+      const { store, messages, render } = fresh();
       store.setPolicyForScope('global', undefined, ['run_agent', 'read_file'], 'Global', {
         run_agent: { config: { maxChildAgentDepth: 1, maxConcurrentAgents: 9 }, nativeAsync: true },
         read_file: { config: { nested: { enabled: true } }, autoApproveExecution: false }
@@ -89,13 +113,13 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
     });
 
     await t.test('非法数字和缺少作用域不会发送请求，不自动启用已禁用的工具', async () => {
-      const count = messages.length;
+      const { store, messages, render } = fresh();
       for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
         assert.throws(() => store.setAgentCollaborationFieldForScope('global', undefined, 'maxChildAgentDepth', value), TypeError);
       }
       assert.throws(() => store.setAgentCollaborationFieldForScope('global', undefined, 'maxConcurrentAgents', 0), TypeError);
       store.setAgentCollaborationFieldForScope('conversation', undefined, 'maxChildAgentDepth', 2);
-      assert.equal(messages.length, count);
+      assert.equal(messages.length, 0);
       store.setPolicyForScope('agent', 'disabled', ['read_file'], 'Disabled', { run_agent: { config: {}, autoApproveExecution: false } });
       store.setAgentCollaborationFieldForScope('agent', 'disabled', 'maxChildAgentDepth', 2);
       assert.deepEqual(store.localPolicyFor('agent', 'disabled').policy.allowedTools, ['read_file']);
@@ -104,16 +128,62 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.match(html, /调整协作设置不会自动启用工具/);
     });
 
+    await t.test('工具设置里的单项修改只写本层自己的配置，不把全局配置复制到下层', async () => {
+      const shellTool = { name: 'shell', execution: 'backend', parameters: { type: 'object' }, description: 'shell', defaultConfig: {},
+        configSchema: { fields: [
+          { key: 'timeoutSeconds', label: '超时', type: 'number', defaultValue: 30 },
+          { key: 'allowedCommands', label: '允许命令', type: 'stringList', defaultValue: [] }
+        ] } };
+      const { store, bindings } = fresh([runAgentTool.declaration, readFileTool, shellTool, ...crossTools]);
+      store.setPolicyForScope('global', undefined, ['run_agent', 'read_file', ...crossNames], 'Global', {
+        run_agent: { config: { crossConversationCollaboration: true, maxConcurrentAgents: 9 } },
+        read_file: { config: {}, autoApproveExecution: false }
+      }, { server: { enabled: true } });
+      store.setPolicyForScope('conversation', 'edits', ['run_agent', 'read_file', 'send_conversation_message'], 'Local', {
+        read_file: { config: {}, display: { autoExpand: true } }
+      });
+      const toolEditorState = await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'edits' });
+      const tool = (name) => store.toolDefinitions.find((candidate) => candidate.name === name);
+
+      toolEditorState.updateGateSetting(tool('send_conversation_message'), 'autoApproveExecution', false);
+      let local = store.localPolicyFor('conversation', 'edits').policy;
+      assert.deepEqual(local.toolConfigs, {
+        read_file: { config: {}, display: { autoExpand: true } },
+        send_conversation_message: { config: {}, autoApproveExecution: false }
+      }, 'the global switch and the global read_file gate stay in the global layer');
+      assert.deepEqual(local.sourceConfigs ?? {}, {}, 'global MCP source settings are not copied down');
+
+      toolEditorState.updateGateSetting(tool('run_agent'), 'autoApproveExecution', false);
+      local = store.localPolicyFor('conversation', 'edits').policy;
+      assert.deepEqual(local.toolConfigs.run_agent, { config: {}, autoApproveExecution: false },
+        'a gate change on run_agent does not freeze the inherited switch or budgets');
+
+      store.setPolicyForScope('global', undefined, store.localPolicyFor('global').policy.allowedTools, 'Global', {
+        ...store.localPolicyFor('global').policy.toolConfigs,
+        shell: { config: { timeoutSeconds: 60, allowedCommands: ['git'] } }
+      }, { server: { enabled: true } });
+      const shellField = (key) => shellTool.configSchema.fields.find((field) => field.key === key);
+      toolEditorState.updateScalarField(shellTool, shellField('timeoutSeconds'), 90);
+      assert.deepEqual(store.localPolicyFor('conversation', 'edits').policy.toolConfigs.shell, { config: { timeoutSeconds: 90 } },
+        'a field edit writes only that field; the global command list stays inherited');
+      toolEditorState.updateStringListField(shellTool, shellField('allowedCommands'), 'npm\nnode');
+      assert.deepEqual(store.localPolicyFor('conversation', 'edits').policy.toolConfigs.shell,
+        { config: { timeoutSeconds: 90, allowedCommands: ['npm', 'node'] } });
+
+      store.setAgentCollaborationFieldForScope('global', undefined, 'maxConcurrentAgents', undefined);
+      store.setCrossConversationCollaborationForScope('global', undefined, false);
+      const effective = store.effectivePolicyFor('conversation', 'edits').policy.toolConfigs.run_agent.config;
+      assert.equal(effective.crossConversationCollaboration, false, 'turning the switch off globally reaches this scope');
+      assert.equal(effective.maxConcurrentAgents, undefined);
+    });
+
     await t.test('跨对话协作开关默认关闭，开启时把跨对话工具加入该作用域允许列表，关闭与恢复继承不改动允许列表', async () => {
-      const crossTools = crossConversationToolModules.map((module) => module.create({}).declaration);
-      const crossNames = crossTools.map((tool) => tool.name);
-      client.toolDefinitions = [...client.toolDefinitions, ...crossTools];
+      const { store, messages, render } = fresh();
       const field = runAgentTool.declaration.configSchema.fields.find((candidate) => candidate.key === 'crossConversationCollaboration');
       assert.equal(field.type, 'boolean');
       assert.equal(field.defaultValue, false);
       assert.equal('crossConversationCollaboration' in runAgentTool.declaration.defaultConfig, false, '只写 defaultValue，不写 defaultConfig');
       assert.equal(runAgentTool.declaration.parameters.properties.crossConversationCollaboration, undefined);
-      const checkbox = (html) => html.match(/<button[^>]*aria-label="跨对话协作"[^>]*>/)?.[0];
       assert.match(checkbox(await render(editor, { scopeKind: 'global' })), /aria-checked="false"/);
       assert.doesNotMatch(await render(toolEditor, { scopeKind: 'global' }), /aria-label="跨对话协作"/);
 

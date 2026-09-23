@@ -282,9 +282,14 @@ function toolIcon(tool: ToolDefinitionRecord) {
   return resolveToolHeaderIcon(tool.name);
 }
 
+/**
+ * Edits start from this scope's own saved configs. The effective view merges upper layers in, and
+ * saving it here would freeze those inherited values (for example the global cross-conversation
+ * switch) into this scope.
+ */
 function cloneToolConfigs(): Record<string, ToolPolicyToolConfigRecord> {
   const result: Record<string, ToolPolicyToolConfigRecord> = {};
-  for (const [toolName, record] of Object.entries(effectivePolicy.value?.toolConfigs ?? {})) {
+  for (const [toolName, record] of Object.entries(localResolution.value.policy?.toolConfigs ?? {})) {
     result[toolName] = {
       config: { ...(record.config ?? {}) },
       ...(typeof record.autoApproveExecution === 'boolean' ? { autoApproveExecution: record.autoApproveExecution } : {}),
@@ -300,13 +305,18 @@ function cloneToolConfigs(): Record<string, ToolPolicyToolConfigRecord> {
 
 function cloneSourceConfigs(): Record<string, ToolPolicySourceConfigRecord> {
   const result: Record<string, ToolPolicySourceConfigRecord> = {};
-  for (const [sourceId, record] of Object.entries(effectivePolicy.value?.sourceConfigs ?? {})) {
+  for (const [sourceId, record] of Object.entries(localResolution.value.policy?.sourceConfigs ?? {})) {
     result[sourceId] = {
       enabled: record.enabled === true,
       ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})
     };
   }
   return result;
+}
+
+/** This scope's own config values for one tool; a field edit adds to these only. */
+function localConfigForTool(tool: ToolDefinitionRecord): ToolConfigRecord {
+  return { ...(localResolution.value.policy?.toolConfigs?.[tool.name]?.config ?? {}) };
 }
 
 function configForTool(tool: ToolDefinitionRecord): ToolConfigRecord {
@@ -325,9 +335,8 @@ function fieldListText(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord)
 
 function updateStringListField(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord, value: string): void {
   if (props.readonly) return;
-  const current = configForTool(tool);
   const config = sanitizeConfigForTool(tool, {
-    ...current,
+    ...localConfigForTool(tool),
     [field.key]: value.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean)
   });
   const nextConfigs = cloneToolConfigs();
@@ -337,7 +346,7 @@ function updateStringListField(tool: ToolDefinitionRecord, field: ToolConfigFiel
 
 function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord, value: ToolConfigValue): void {
   if (props.readonly) return;
-  const config = sanitizeConfigForTool(tool, { ...configForTool(tool), [field.key]: value });
+  const config = sanitizeConfigForTool(tool, { ...localConfigForTool(tool), [field.key]: value });
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
   store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
@@ -349,7 +358,7 @@ function updateGateSetting(tool: ToolDefinitionRecord, key: ToolGateSettingKey, 
   if (props.readonly) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+    ...(nextConfigs[tool.name] ?? { config: {} }),
     [key]: value
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
@@ -372,7 +381,7 @@ function updateNativeAsync(tool: ToolDefinitionRecord, value: boolean): void {
   if (props.readonly) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+    ...(nextConfigs[tool.name] ?? { config: {} }),
     nativeAsync: value
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
@@ -390,7 +399,7 @@ function updateAutoApplyChangeDelay(tool: ToolDefinitionRecord, value: number): 
   if (props.readonly || !supportsChangeApply(tool)) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+    ...(nextConfigs[tool.name] ?? { config: {} }),
     autoApplyChangeDelaySeconds: Math.min(600, Math.max(0, Math.floor(value)))
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
@@ -409,7 +418,7 @@ function updateDisplayAutoExpand(tool: ToolDefinitionRecord, value: boolean): vo
   if (props.readonly) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+    ...(nextConfigs[tool.name] ?? { config: {} }),
     display: { ...(nextConfigs[tool.name]?.display ?? {}), autoExpand: value }
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
@@ -425,7 +434,7 @@ function updateDisplayAutoOpenDiffPreview(tool: ToolDefinitionRecord, value: boo
   if (props.readonly || !supportsDiffPreview(tool)) return;
   const nextConfigs = cloneToolConfigs();
   nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+    ...(nextConfigs[tool.name] ?? { config: {} }),
     display: { ...(nextConfigs[tool.name]?.display ?? {}), autoOpenDiffPreview: value }
   };
   store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
