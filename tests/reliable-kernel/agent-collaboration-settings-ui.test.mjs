@@ -375,6 +375,24 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.equal(store.effectivePolicyFor('agent', 'explore').policy.allowedTools.includes('write'), false);
     });
 
+    await t.test('工具列表不含 run_agent 时，提示按实际列表列出可用的跨对话工具，与后端只提供列出和读取一致', async () => {
+      const { store, render } = fresh(allDefinitions);
+      const note = (html) => html.match(/<p class="collaboration-note"[^>]*>当前范围的工具列表不含 run_agent[^<]*<\/p>/)?.[0];
+      store.setPolicyForScope('global', undefined, ['read_file', 'write', ...crossNames], 'Global');
+      store.setCrossConversationCollaborationForScope('global', undefined, true);
+      const availability = store.crossConversationToolsFor('global');
+      assert.equal(availability.sendTools, false);
+      assert.deepEqual(availability.available, ['list_conversations', 'read_conversation'],
+        'the send-type tools stay in the saved list but the backend does not offer them');
+      assert.match(note(await render(editor, { scopeKind: 'global' })), /不会提供发送、新建和分支对话工具；实际可用：list_conversations、read_conversation/);
+
+      store.setPolicyForScope('global', undefined, ['read_file', 'list_conversations', 'send_conversation_message'], 'Global', switchOn);
+      assert.deepEqual(store.crossConversationToolsFor('global').available, ['list_conversations']);
+      const html = await render(editor, { scopeKind: 'global' });
+      assert.match(note(html), /实际可用：list_conversations。/);
+      assert.match(html, /仍未允许 read_conversation/);
+    });
+
     await t.test('内置只读 Agent 和工作流开启后不获得写工具，只增加读取类对话工具', async () => {
       const { client, store, render } = fresh(allDefinitions);
       client.builtinToolPolicies = builtinToolPolicies;
@@ -387,7 +405,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.deepEqual(store.effectivePolicyFor('agent', 'explore').policy.allowedTools, sorted(readonlyList));
       const html = await render(editor, { scopeKind: 'agent', scopeId: 'explore' });
       assert.match(checkbox(html), /aria-checked="true"/);
-      assert.match(html, /只提供列出和读取对话/);
+      assert.match(html, /不会提供发送、新建和分支对话工具；实际可用：list_conversations、read_conversation。/);
       assert.doesNotMatch(html, /上层工具策略/);
 
       store.setCrossConversationCollaborationForScope('workflow', 'builtin:readonly', true);
@@ -475,7 +493,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.match(html, /继承上层 · Agent 3/);
       assert.deepEqual(store.effectivePolicyFor('conversation', 'layered').policy.allowedTools, sorted(readonlyList),
         'the conversation shows the read-only list of its Agent');
-      assert.match(html, /只提供列出和读取对话/);
+      assert.match(html, /不会提供发送、新建和分支对话工具；实际可用：list_conversations、read_conversation。/);
     });
 
     await t.test('上层允许列表仍挡住跨对话工具时显示提示', async () => {

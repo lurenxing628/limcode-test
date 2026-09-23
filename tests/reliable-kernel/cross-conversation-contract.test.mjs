@@ -13,6 +13,7 @@ const { runAgentTool, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY } = load('back
 const { createBuiltinToolDefinitions } = load('backend/world/modules/tools/definitions/index.js');
 const { CROSS_CONVERSATION_LIMITS, frozenCrossConversationEnabled } = load('backend/reliableKernel/collaborationPolicy.js');
 const { RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS } = load('shared/reliableKernelClientFeed.js');
+const { crossConversationToolPermitted } = load('shared/toolPolicyResolution.js');
 
 const contract = async name => JSON.parse(await fs.readFile(`docs/architecture/reliable-kernel/contracts/${name}.json`, 'utf8'));
 const crossConversation = async () => (await contract('subagent')).collaboration.crossConversation;
@@ -29,6 +30,14 @@ test('the cross-conversation contract names exactly the tools the code declares,
   for (const declaration of declarations) assert.equal(declaration.metadata.defaultAutoApproveExecution, undefined, declaration.name);
   const builtin = createBuiltinToolDefinitions({ command: { toolName: 'bash', description: 'contract fixture' } }).map(tool => tool.declaration.name);
   for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(builtin.includes(name), `${name} is registered`);
+});
+
+test('without run_agent the code permits exactly the contract read-only pair, as the allowlist rule says', async () => {
+  const section = await crossConversation();
+  assert.match(section.allowlist, /; send-create-and-fork-are-offered-and-admitted-only-while-the-Turn-effective-allowedTools-include-run_agent\(otherwise-list-and-read-only\);/);
+  const withoutRunAgent = [...CROSS_CONVERSATION_TOOL_NAMES];
+  assert.deepEqual(CROSS_CONVERSATION_TOOL_NAMES.filter(name => crossConversationToolPermitted(withoutRunAgent, name)), section.readonlyTools);
+  assert.deepEqual(CROSS_CONVERSATION_TOOL_NAMES.filter(name => crossConversationToolPermitted(new Set(['run_agent']), name)), section.tools);
 });
 
 test('the switch contract matches the run_agent config schema: boolean, default off, defaultValue only, fail closed', async () => {

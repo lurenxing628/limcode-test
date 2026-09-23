@@ -52,8 +52,8 @@ test('compressed and fork-copied recipes reserve collaboration references withou
   assert.deepEqual(await readConversationChildHandles(database, store, 'source'), []);
 });
 
-function fixture({ toolName = 'send_agent_message', args = { targetConversationId: 'peer', text: 'hello' }, crossConversation } = {}) {
-  const document = { toolPolicy: { allowedTools: [toolName],
+function fixture({ toolName = 'send_agent_message', args = { targetConversationId: 'peer', text: 'hello' }, crossConversation, allowedTools = [toolName, 'run_agent'] } = {}) {
+  const document = { toolPolicy: { allowedTools,
     ...(crossConversation === undefined ? {} : { toolConfigs: { run_agent: { config: { crossConversationCollaboration: crossConversation } } } }) } };
   const authority = { snapshotId: 'authority', document };
   const records = {
@@ -203,6 +203,14 @@ test('cross-conversation dispatch requires the frozen switch and asks the contro
   assert.deepEqual(send.calls, [{ source: { kind: 'tool', turnId: 'turn', toolCallId: 'call' }, targetConversationId: 'peer', text: 'hello',
     mode: 'message', queueBehindActiveTurn: true, crossConversation: true }]);
   assert.equal(send.settlements[0].detail.kind, 'cross_conversation');
+  // Sending acts on another conversation and needs run_agent in the same frozen list; reading does not.
+  const noRunAgent = fixture({ toolName: 'send_conversation_message', args: { targetConversationId: 'peer', text: 'hello', mode: 'message' },
+    crossConversation: true, allowedTools: ['send_conversation_message'] });
+  await assert.rejects(noRunAgent.dispatcher.dispatch(noRunAgent.input, undefined, noRunAgent.authority), /lacks run_agent/);
+  assert.deepEqual(noRunAgent.calls, []);
+  const listWithoutRunAgent = fixture({ toolName: 'list_conversations', args: {}, crossConversation: true, allowedTools: ['list_conversations'] });
+  await listWithoutRunAgent.dispatcher.dispatch(listWithoutRunAgent.input, undefined, listWithoutRunAgent.authority);
+  assert.deepEqual(listWithoutRunAgent.calls, [{ list: { turnId: 'turn', limit: 20 } }]);
   const badMode = fixture({ toolName: 'send_conversation_message', args: { targetConversationId: 'peer', text: 'hello' }, crossConversation: true });
   await assert.rejects(badMode.dispatcher.dispatch(badMode.input, undefined, badMode.authority), /mode/);
   assert.deepEqual(badMode.calls, []);

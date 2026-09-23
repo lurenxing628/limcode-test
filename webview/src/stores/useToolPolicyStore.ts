@@ -12,8 +12,8 @@ import type {
   ToolPolicyScopeSetPayload,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
-import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES } from '@shared/protocol';
-import { defaultToolNames, resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '@shared/toolPolicyResolution';
+import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES } from '@shared/protocol';
+import { crossConversationToolPermitted, defaultToolNames, resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '@shared/toolPolicyResolution';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
@@ -22,9 +22,7 @@ import { DEFAULT_WORKFLOW_OPTION_ID, useWorkflowStore } from './useWorkflowStore
 export const SUB_AGENT_TOOL_NAME = 'run_agent';
 export const AGENT_COLLABORATION_CONFIG_KEYS = ['maxChildAgentDepth', 'maxConcurrentAgents', 'maxAutomaticFollowups'] as const;
 export type AgentCollaborationConfigKey = typeof AGENT_COLLABORATION_CONFIG_KEYS[number];
-export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES };
-
-export const READONLY_CROSS_CONVERSATION_TOOL_NAMES: readonly string[] = ['list_conversations', 'read_conversation'];
+export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES };
 
 export interface ToolPolicyResolution {
   policy?: ToolPolicyRecord;
@@ -43,8 +41,10 @@ export interface EffectiveToolPolicyResolution {
 
 /** The cross-conversation tools a scope is meant to get, and those its effective list still blocks. */
 export interface CrossConversationToolAvailability {
-  /** False when the scope's effective list lacks run_agent: only the read-type tools apply. */
+  /** False when the scope's effective list lacks run_agent: the backend then offers only the read-type tools. */
   sendTools: boolean;
+  /** What the backend offers here while the switch is on, from the effective list. */
+  available: string[];
   expected: string[];
   missing: string[];
 }
@@ -369,11 +369,15 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     },
     crossConversationToolsFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): CrossConversationToolAvailability {
       const allowed = this.effectivePolicyFor(scopeKind, scopeId).policy.allowedTools;
-      const sendTools = allowed.includes(SUB_AGENT_TOOL_NAME);
       const known = new Set(useClientStateStore().toolDefinitions.map((tool) => tool.name));
-      const expected = (sendTools ? [...CROSS_CONVERSATION_TOOL_NAMES] : [...READONLY_CROSS_CONVERSATION_TOOL_NAMES])
-        .filter((name) => known.has(name));
-      return { sendTools, expected, missing: expected.filter((name) => !allowed.includes(name)) };
+      // The backend's own rule: send, create and fork need run_agent in the same list.
+      const expected = CROSS_CONVERSATION_TOOL_NAMES.filter((name) => known.has(name) && crossConversationToolPermitted(allowed, name));
+      return {
+        sendTools: allowed.includes(SUB_AGENT_TOOL_NAME),
+        available: expected.filter((name) => allowed.includes(name)),
+        expected,
+        missing: expected.filter((name) => !allowed.includes(name))
+      };
     },
     /**
      * Saves one scope's record. `allowedTools` undefined saves a record without a list. The record's

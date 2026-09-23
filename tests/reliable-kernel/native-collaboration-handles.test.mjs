@@ -270,7 +270,8 @@ test('native fork_conversation runs through the dispatcher and its frozen refere
           retryPolicy: { enabled: false, maxRetries: 0 } },
         modelProfile: { compressionThresholdTokens: 100000, contextWindowTokens: 128000,
           tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
-        toolPolicy: { id: 'tools', allowedTools: definitions.map(tool => tool.declaration.name), preset: 'custom',
+        // run_agent is frozen too: send, create and fork need it in the same list.
+        toolPolicy: { id: 'tools', allowedTools: [...definitions.map(tool => tool.declaration.name), 'run_agent'], preset: 'custom',
           toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } }, sourceConfigs: {} },
         planReviewPolicy: { mode: 'never' }, systemPrompt: { id: 'prompt', text: '' },
         runtimeContext: { id: null, name: '', template: '' },

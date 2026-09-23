@@ -24,7 +24,7 @@ import {
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE, PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import { BACKGROUND_ASK_USER_AUTO_ANSWER } from '../../shared/askUser';
 import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
-import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
+import { crossConversationToolPermitted, toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import {
   mapSettledWithBoundedAdmissionConcurrency,
   mapSettledWithBoundedConcurrency,
@@ -1443,6 +1443,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (isCrossConversationTool(input.toolName) && !await this.crossConversationOffered(input.turnId, authority.document)) {
       return this.reject(input, `当前 Turn 未开启跨对话协作，或当前对话是子 Agent 对话，不允许工具 ${input.toolName}。`);
     }
+    if (isCrossConversationTool(input.toolName) && !crossConversationToolPermitted(policy.allowedTools, input.toolName)) {
+      return this.reject(input, `当前 Turn 的工具策略不含 run_agent，跨对话协作只允许列出和读取对话，不允许工具 ${input.toolName}。`);
+    }
     const frozenDecision = options.frozenDecision
       ?? await this.readFrozenDecision(input, definition, authority);
     if (!frozenDecision.autoSubmitResult) {
@@ -2080,7 +2083,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const allowed = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
-      && (crossConversation || !isCrossConversationTool(definition.declaration.name))
+      && (!isCrossConversationTool(definition.declaration.name)
+        || (crossConversation && crossConversationToolPermitted(toolPolicy.allowedTools, definition.declaration.name)))
     ).map(definition => {
       if (definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn) return definition;
       const parameters = plainOptionalRecord(normalizePlainJson(definition.declaration.parameters ?? {})) ?? {};

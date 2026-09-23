@@ -58,7 +58,7 @@ const lastResult = (start, name) => start.contents.flatMap(content => content.pa
 const detail = (start, name) => lastResult(start, name)?.detail;
 
 /** The external model alone is synthetic; tools, authority, ownership, persistence and wakes are production code. */
-async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook } = {}) {
+async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook, allowedTools = definitions.map(tool => tool.declaration.name) } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-cross-conversation-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -101,7 +101,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     const project = { uri: Uri.file(folderPath).toString(), name: 'cross-project' };
     await configuration.synchronizeWorkspaceFolders([{ ...project, rootPath: folderPath, index: 0 }]);
     const agent = await configuration.mutations.createAgent({ name: 'Synthetic top-level', kind: 'custom' });
-    await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: definitions.map(tool => tool.declaration.name),
+    await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools,
       ...(enabled ? { toolConfigs: { ...toolConfigs, run_agent: { config: { ...runAgentConfig, crossConversationCollaboration: switchValue } } } } : {}) });
     const rootAuthority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(rootAuthority);
@@ -215,6 +215,43 @@ test('with the switch off the tools are not offered and every entry point reject
     await assert.rejects(f.app.runtime.collaboration.send({ source: { kind: 'tool', turnId: started.turnId, toolCallId: forgedCall.id },
       targetConversationId: PEER, text: 'forged', mode: 'followup', crossConversation: true }), /not enabled/);
   }, { enabled: false });
+});
+
+test('without run_agent in the effective list only list and read are offered or admitted, even with the switch on', { timeout: 60000 }, async () => {
+  const { readFrozenTurnAuthority } = load('backend/reliableKernel/frozenAuthority.js');
+  const SEND_TYPE = ['send_conversation_message', 'create_conversation', 'fork_conversation'];
+  let round = 0;
+  await fixture(async (request, f, start) => {
+    assert.equal(request.conversationId, ROOT);
+    round += 1;
+    if (round === 1) {
+      const names = start.tools.map(tool => tool.name);
+      assert.ok(!names.includes('run_agent'));
+      for (const name of ['list_conversations', 'read_conversation']) assert.ok(names.includes(name), `${name} stays offered`);
+      for (const name of SEND_TYPE) assert.ok(!names.includes(name), `${name} must not be offered without run_agent`);
+      return toolsAnswer(call('forged-send', 'send_conversation_message', { conversationRef: 'C1', text: 'x', mode: 'followup' }),
+        call('forged-create', 'create_conversation', { prompt: 'new task' }));
+    }
+    for (const name of ['send_conversation_message', 'create_conversation']) {
+      assert.notEqual(lastResult(start, name)?.status, 'succeeded', `${name} must not run`);
+    }
+    return answer('Only reading is possible.');
+  }, async f => {
+    const started = await f.input(ROOT, 'no run_agent');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(round, 2);
+    assert.equal((await f.rows('CollaborationMessage')).length, 0);
+    assert.equal((await f.rows('Conversation')).length, 2, 'nothing was created');
+    assert.equal(f.dispatches.filter(input => SEND_TYPE.includes(input.toolName)).length, 0, 'the special dispatcher is never reached');
+    // The collaboration dispatcher's own allowed-tools check refuses a send-type call from this Turn.
+    const [snapshot] = await f.rows('AuthoritySnapshot', { turn_id: started.turnId });
+    const frozen = await readFrozenTurnAuthority(f.app.database, f.app.contentStore, snapshot.id, started.turnId);
+    assert.ok(frozen.document.toolPolicy.allowedTools.includes('send_conversation_message'), 'the frozen list itself still names the send tool');
+    const tools = new CollaborationToolDispatcher({ database: f.app.database, contentStore: f.app.contentStore,
+      effects: f.app.runtime.effects, collaboration: f.app.runtime.collaboration, conversations: f.lifecycle });
+    await assert.rejects(tools.dispatch({ toolName: 'send_conversation_message', turnId: started.turnId, toolCallId: 'forged', modelRequestId: 'forged',
+      arguments: { conversationRef: 'C1', text: 'x', mode: 'message' } }, undefined, { snapshotId: snapshot.id, document: frozen.document }), /run_agent/);
+  }, { allowedTools: definitions.map(tool => tool.declaration.name).filter(name => name !== 'run_agent') });
 });
 
 test('a malformed switch value fails closed instead of breaking every Turn', { timeout: 60000 }, async () => {

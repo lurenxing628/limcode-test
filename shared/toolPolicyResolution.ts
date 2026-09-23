@@ -1,4 +1,5 @@
 import {
+  READONLY_CROSS_CONVERSATION_TOOL_NAMES,
   TOOL_POLICY_ALL_MCP_SOURCES,
   type ToolConfigRecord,
   type ToolPolicyPresetKind,
@@ -97,6 +98,20 @@ export function toolPolicyScopeLayer(
     }
   };
 }
+
+/**
+ * Whether an effective tool list permits one cross-conversation tool. Listing and reading need
+ * nothing more; sending, creating and forking act on other conversations and need run_agent in
+ * the same list. The backend offers and admits exactly these, and the settings page says so.
+ */
+export function crossConversationToolPermitted(allowedTools: ReadonlySet<string> | readonly string[], toolName: string): boolean {
+  if ((READONLY_CROSS_CONVERSATION_TOOL_NAMES as readonly string[]).includes(toolName)) return true;
+  return Array.isArray(allowedTools)
+    ? allowedTools.includes(RUN_AGENT_TOOL_NAME)
+    : (allowedTools as ReadonlySet<string>).has(RUN_AGENT_TOOL_NAME);
+}
+
+const RUN_AGENT_TOOL_NAME = 'run_agent';
 
 /** The source settings that decide one MCP source: its own entry, else an all-sources deny. */
 export function mcpSourceConfigFor(sourceConfigs: unknown, sourceId: string): ToolPolicySourceConfigRecord | undefined {
