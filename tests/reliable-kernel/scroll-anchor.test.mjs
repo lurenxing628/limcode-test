@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createServer } from 'vite';
-import path from 'node:path';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 async function functions(context) {
-  const server = await createServer({ configFile: path.join(process.cwd(), 'vite.config.ts'), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
+  const server = await createWebviewSsrServer();
   context.after(() => server.close());
   return server.ssrLoadModule('@webview/components/conversation/scrollAnchor');
 }

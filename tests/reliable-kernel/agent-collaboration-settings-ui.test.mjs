@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 test('协作设置保持用户默认深度、单项继承和作用域隔离，保存为可克隆的原工具策略', async (t) => {
-  const { createServer } = await import('vite');
   const { createSSRApp } = await import('vue');
   const { renderToString } = await import('@vue/server-renderer');
   const pinia = await import('pinia');
@@ -15,10 +15,7 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
     addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout,
     acquireVsCodeApi() { return { postMessage(message) { sink.messages.push(structuredClone(message)); }, getState() {}, setState() {} }; }
   };
-  const server = await createServer({
-    configFile: path.join(process.cwd(), 'vite.config.ts'),
-    server: { middlewareMode: true }, appType: 'custom', logLevel: 'error'
-  });
+  const server = await createWebviewSsrServer();
   try {
     const { default: editor } = await server.ssrLoadModule('/src/components/settings/agent/AgentCollaborationSettings.vue');
     const { default: toolEditor } = await server.ssrLoadModule('/src/components/settings/tools/ToolPolicyEditor.vue');

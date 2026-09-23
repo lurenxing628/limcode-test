@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 const require = createRequire(import.meta.url);
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
@@ -233,7 +234,6 @@ test('Ask/Plan 自动审批不启用被禁用工具，也不绕过其它执行�
 });
 
 test('工具页顶部显示两个独立开关，保存复用现有策略且保留其它工具设置', async () => {
-  const { createServer } = await import('vite');
   const { createSSRApp } = await import('vue');
   const { renderToString } = await import('@vue/server-renderer');
   const pinia = await import('pinia');
@@ -244,10 +244,7 @@ test('工具页顶部显示两个独立开关，保存复用现有策略且保�
     addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout,
     acquireVsCodeApi() { return { postMessage(message) { messages.push(structuredClone(message)); }, getState() {}, setState() {} }; }
   };
-  const server = await createServer({
-    configFile: path.join(process.cwd(), 'vite.config.ts'),
-    server: { middlewareMode: true }, appType: 'custom', logLevel: 'error'
-  });
+  const server = await createWebviewSsrServer();
   try {
     const { default: editor } = await server.ssrLoadModule('/src/components/settings/tools/ToolPolicyEditor.vue');
     const { useClientStateStore } = await server.ssrLoadModule('/src/stores/useClientStateStore.ts');

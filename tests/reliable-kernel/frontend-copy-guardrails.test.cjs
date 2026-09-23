@@ -37,13 +37,8 @@ test('guidance queue uses a passive bolt and waits for the current response and 
 
 
 test('thought cards render Markdown and merge adjacent reasoning output items', async (context) => {
-  const { createServer } = await import('vite');
-  const server = await createServer({
-    configFile: path.join(ROOT, 'vite.config.ts'),
-    server: { middlewareMode: true },
-    appType: 'custom',
-    logLevel: 'error'
-  });
+  const { createWebviewSsrServer } = await import('./webview-ssr-server.mjs');
+  const server = await createWebviewSsrServer();
   context.after(async () => server.close());
 
   const markdown = await server.ssrLoadModule('/src/components/content/markdown/markdownRenderer.ts');
@@ -134,13 +129,8 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
 });
 
 async function createViteServer(context) {
-  const { createServer } = await import('vite');
-  const server = await createServer({
-    configFile: path.join(ROOT, 'vite.config.ts'),
-    server: { middlewareMode: true },
-    appType: 'custom',
-    logLevel: 'error'
-  });
+  const { createWebviewSsrServer } = await import('./webview-ssr-server.mjs');
+  const server = await createWebviewSsrServer();
   context.after(async () => server.close());
   return server;
 }

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import test, { after } from 'node:test';
-import { createServer } from 'vite';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 import { createPinia } from 'pinia';
 
 const root = process.cwd();
@@ -101,12 +101,7 @@ async function withConversationStores(run) {
       };
     }
   };
-  const server = await createServer({
-    configFile: path.join(root, 'vite.config.ts'),
-    server: { middlewareMode: true },
-    appType: 'custom',
-    logLevel: 'error'
-  });
+  const server = await createWebviewSsrServer();
   try {
     const { useConversationSettingsStore } = await server.ssrLoadModule('/src/stores/useConversationSettingsStore.ts');
     const piniaA = createPinia();
