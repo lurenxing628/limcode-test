@@ -1004,7 +1004,18 @@ test('a collaboration message carries at most the documented byte cap and a long
   await assert.rejects(f.collaboration.send({ source: await f.source('over-cap'), targetConversationId: 'right', text: `${atCap}x`, mode: 'message' }), new RegExp(`1\\.\\.${cap} UTF-8 bytes`));
   assert.deepEqual(await f.rows('CollaborationMessage'), []);
   const sent = await f.collaboration.send({ source: await f.source('at-cap'), targetConversationId: 'right', text: atCap, mode: 'message' });
-  assert.equal((await f.collaboration.readMessage({ conversationId: 'right', messageId: sent.messageId })).text, atCap);
+  // A message at the cap is read back whole, page by page.
+  const pages = [];
+  for (let offset = 0; offset !== null;) {
+    const page = await f.collaboration.readMessage({ conversationId: 'right', messageId: sent.messageId, offset });
+    assert.equal(page.offset, offset);
+    assert.equal(page.totalCharacters, atCap.length);
+    pages.push(page.text);
+    offset = page.nextOffset;
+  }
+  assert.ok(pages.length > 1);
+  assert.equal(pages.join(''), atCap);
+  await assert.rejects(f.collaboration.readMessage({ conversationId: 'right', messageId: sent.messageId, offset: atCap.length + 1 }), /offset must be an integer from 0/);
 }));
 
 /** Admits a manual compression Turn: its TurnIntent payload carries the runtimeMaintenance descriptor. */
@@ -1101,3 +1112,18 @@ test('the Turn a peer reply starts spends the task budget, and once it is spent 
   });
   await assert.rejects(f.collaboration.prepareReplyContinuationSteps(second.delivery.id), isCollaborationReplyBudgetExhaustedError);
 }, 3));
+test('message pages never split a surrogate pair and stay under the page token budget', () => {
+  const { collaborationTextPage, COLLABORATION_TEXT_PAGE_TOKENS } = load('collaborationControlPlane.js');
+  const { estimateTextTokens } = load('modelTokenEstimator.js');
+  for (const text of ['😀'.repeat(5000), `a${'😀'.repeat(4000)}`, '中'.repeat(9000), 'x'.repeat(40_000), '\n'.repeat(9000), '']) {
+    const pages = [];
+    for (let offset = 0; offset !== null;) {
+      const page = collaborationTextPage(text, offset);
+      assert.ok(estimateTextTokens(JSON.stringify(page.text)) <= COLLABORATION_TEXT_PAGE_TOKENS);
+      assert.ok(!/^[\udc00-\udfff]/.test(page.text) && !/[\ud800-\udbff]$/.test(page.text), 'no page starts or ends inside a pair');
+      pages.push(page.text);
+      offset = page.nextOffset;
+    }
+    assert.equal(pages.join(''), text);
+  }
+});

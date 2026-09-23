@@ -26,11 +26,12 @@ const definitions: ToolDefinition[] = [
     text: { type: 'string', description: 'Concrete follow-up task.' },
     replyToMessageRef: { type: 'string', description: 'Optional M# message reference for the originating request.' }
   }, ['conversationRef', 'text'], args => withText('团队续派任务', args)),
-  tool('read_agent_messages', 'Read collaboration messages (view=mailbox, default) or a team member\'s conversation history (view=conversation, requires conversationRef). Mailbox: supply M# messageRef for one message, afterMessageRef for new messages, or beforeMessageRef to read older pages. Conversation history: use R# beforeMessageRef returned as olderMessageRef. Cursors from these two views are distinct. Reading does not acknowledge delivery or start any conversation.', {
+  tool('read_agent_messages', 'Read collaboration messages (view=mailbox, default) or a team member\'s conversation history (view=conversation, requires conversationRef). Mailbox: supply M# messageRef for the full text of one message, returned in pages: repeat with offset=nextOffset until nextOffset is null; afterMessageRef lists new messages and beforeMessageRef older pages. Conversation history: use R# beforeMessageRef returned as olderMessageRef. Cursors from these two views are distinct. Reading does not acknowledge delivery or start any conversation.', {
     view: { type: 'string', enum: ['mailbox', 'conversation'], description: 'mailbox reads peer messages; conversation reads the actual chat transcript of a team member.' },
     conversationRef: { type: 'string', description: 'C# team member conversation; required for conversation view, optional for mailbox.' },
     beforeMessageRef: { type: 'string', description: 'Older-page cursor: M# for mailbox, R# for conversation history. Use the returned olderMessageRef.' },
-    messageRef: { type: 'string', description: 'Optional M# reference of a single message.' },
+    messageRef: { type: 'string', description: 'Optional M# reference of a single message to read in full.' },
+    offset: { type: 'integer', minimum: 0, description: 'With messageRef: character offset of the page to read; use the returned nextOffset. Defaults to 0.' },
     afterMessageRef: { type: 'string', description: 'Optional M# cursor from the previous page.' },
     limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum messages in a page; defaults to 20.' }
   }, [], args => {

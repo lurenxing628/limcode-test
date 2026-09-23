@@ -45,6 +45,8 @@ const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
 const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
 const { LlmEventType } = load('backend/world/modules/llm/events.js');
 const { createDefaultLlmCompressionConfig } = load('shared/protocol.js');
+const { TOOL_RESULT_MAX_TOKENS } = load('backend/reliableKernel/modelFacingContextProjection.js');
+const { estimateTextTokens: estimateTokens } = load('backend/reliableKernel/modelTokenEstimator.js');
 const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
 // Canonical ids never occur inside titles or message text, as with production random ids.
 const ROOT = 'conv-root-7c1', PEER = 'conv-peer-7c2';
@@ -509,6 +511,84 @@ test('cross-conversation tools reach only the caller\'s project, even through a 
     await assert.rejects(collaboration.authorizeCrossConversation({ turnId: started.turnId, targetConversationId: LOOSE }), /different project/);
     // The other project's folder is not open here, so a Turn wrongly started there could not run.
   }, { expectedScannerError: failure => /工作环境不存在/.test(String(failure.error?.message)) });
+});
+
+/** The paged read a truncated collaboration envelope names, with the envelope's own messageRef. */
+function truncatedEnvelopeRead(start) {
+  for (const part of start.contents.flatMap(content => content.parts)) {
+    const read = /read_agent_messages with messageRef=(M\d+) and offset=0/.exec(part.text ?? '');
+    if (read) return { markerRef: read[1], envelopeRef: /"messageRef":"(M\d+)"/.exec(part.text)?.[1] };
+  }
+  return null;
+}
+
+/** Drives read_agent_messages page by page; returns the next model response, or null when done. */
+function pagedRead(start, state, prefix) {
+  const page = state.pages.length ? detail(start, 'read_agent_messages') : null;
+  if (page) {
+    const raw = lastResult(start, 'read_agent_messages');
+    assert.equal(raw.status, 'succeeded', JSON.stringify(raw).slice(0, 400));
+    assert.equal(page.offset, state.offset, 'each page starts where the last one ended');
+    assert.ok(estimateTokens(JSON.stringify(raw)) < TOOL_RESULT_MAX_TOKENS, 'every page fits under the tool-result cap');
+    state.texts.push(page.text);
+    if (page.nextOffset === null) return null;
+    state.offset = page.nextOffset;
+  }
+  state.pages.push(state.offset);
+  return toolsAnswer(call(`${prefix}-page-${state.pages.length}`, 'read_agent_messages', { messageRef: state.ref, offset: state.offset }));
+}
+
+test('long collaboration messages and replies arrive as previews whose marker names the paged read that returns them whole', { timeout: 90000 }, async () => {
+  let ascii = '';
+  for (let line = 0; ascii.length < 30_000; line += 1) ascii += `Line ${line}: the quick brown fox jumps over the lazy dog; ASCII round trip.\n`;
+  const ASCII_TASK = `${ascii}ASCII_TASK_END`;
+  const CJK_REPLY = `${'协作消息分页读取，中文往返无损。'.repeat(560)}CJK_REPLY_END`;
+  assert.ok(Buffer.byteLength(CJK_REPLY) < 64_000);
+  let rootRound = 0, sendResult, waited;
+  const peer = { pages: [], texts: [], offset: 0 }, root = { pages: [], texts: [], offset: 0 };
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === PEER) {
+      if (!peer.ref) {
+        const marker = truncatedEnvelopeRead(start);
+        assert.ok(marker, 'the long task arrives with an actionable truncation marker');
+        assert.equal(marker.markerRef, marker.envelopeRef, 'the marker names this message');
+        peer.ref = marker.markerRef;
+      }
+      return pagedRead(start, peer, 'peer') ?? answer(CJK_REPLY);
+    }
+    assert.equal(request.conversationId, ROOT);
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      const target = detail(start, 'list_conversations').conversations[0];
+      return toolsAnswer(call('send-long', 'send_conversation_message', { conversationRef: target.conversationRef, text: ASCII_TASK, mode: 'followup' }));
+    }
+    if (rootRound === 3) {
+      sendResult = detail(start, 'send_conversation_message');
+      // Waiting in this Turn returns the reply to a cross-conversation task.
+      return toolsAnswer(call('wait-reply', 'wait_agent_messages', { afterMessageRef: sendResult.messageRef, timeoutMs: 60000 }));
+    }
+    if (!root.ref) {
+      waited = detail(start, 'wait_agent_messages');
+      const reply = waited.messages.find(message => message.replyToMessageRef === sendResult.messageRef);
+      assert.ok(reply, JSON.stringify(waited));
+      root.ref = reply.messageRef;
+    }
+    const next = pagedRead(start, root, 'root');
+    if (next) return next;
+    root.marker = truncatedEnvelopeRead(start);
+    return answer('Read the whole reply.');
+  }, async f => {
+    const started = await f.input(ROOT, 'delegate a long task');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(sendResult.accepted, true);
+    assert.equal(sendResult.recipientSeesPreview, true);
+    assert.match(sendResult.note, /read_agent_messages messageRef and offset/);
+    assert.ok(peer.pages.length >= 2 && root.pages.length >= 2, `paged: ${peer.pages.length} / ${root.pages.length}`);
+    assert.equal(peer.texts.join(''), ASCII_TASK, 'the recipient reads the ASCII task back byte for byte');
+    assert.equal(root.texts.join(''), CJK_REPLY, 'the sender reads the CJK reply back byte for byte');
+    assert.equal(root.marker?.markerRef, root.ref, 'the reply injected into the running Turn names its own paged read');
+  });
 });
 
 test('a followup to a running conversation waits for its Turn to end, then starts exactly one Turn', { timeout: 60000 }, async () => {

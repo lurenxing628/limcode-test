@@ -271,7 +271,10 @@ export function renderRuntimeDeliveryModelEnvelope(
     ? canonicalPlainJson(modelEnvelope, 'Process completion model projection')
     : typeof modelEnvelope.content === 'string' ? modelEnvelope.content : envelope.content;
   const digest = createHash('sha256').update(originalContent).digest('hex');
-  const marker = `[truncated runtime result; originalBytes=${Buffer.byteLength(originalContent, 'utf8')}; sha256=${digest}]`;
+  const marker = envelope.kind === 'collaboration_message' && typeof modelEnvelope.messageRef === 'string'
+    // The whole message stays readable: the marker names the exact paged read that returns it.
+    ? `[Message truncated: only its start and end are shown below. Read the full text with read_agent_messages with messageRef=${modelEnvelope.messageRef} and offset=0, then repeat with offset=nextOffset until nextOffset is null.]`
+    : `[truncated runtime result; originalBytes=${Buffer.byteLength(originalContent, 'utf8')}; sha256=${digest}]`;
   let low = 0;
   let high = originalContent.length;
   let best = render(runtimeRenderEnvelope(modelEnvelope, envelope.kind, marker, digest, originalContent.length));

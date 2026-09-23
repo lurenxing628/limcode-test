@@ -11,6 +11,7 @@ import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { isTransactionAssertionFailure, requirePhaseFId, stablePhaseFId, sqliteUniqueFailureIncludes } from './phaseFIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import { estimateTextTokens } from './modelTokenEstimator';
 
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 /** Every collaboration message body is 1..COLLABORATION_MESSAGE_MAX_TEXT_BYTES UTF-8 bytes. */
@@ -292,7 +293,12 @@ export class CollaborationControlPlane {
     if (!input.afterMessageId) selected.reverse();
     return { messages: await Promise.all(selected.map((row) => this.summary(row))), nextCursor: selected.length ? String(selected[selected.length - 1].id) : input.afterMessageId ?? null, olderCursor: !input.afterMessageId && hasMore && selected.length ? String(selected[0].id) : null, hasMore };
   }
-  public async readMessage(input: { conversationId: string; targetConversationId?: string; messageId: string }) {
+  /**
+   * One page of a collaboration message's full text, starting at a character offset. A page always
+   * fits well under the model tool-result cap, so any accepted message, up to its byte limit, can be
+   * read in full by following nextOffset until it is null.
+   */
+  public async readMessage(input: { conversationId: string; targetConversationId?: string; messageId: string; offset?: number }) {
     const message = await this.existing('CollaborationMessage', requirePhaseFId(input.messageId, 'messageId'));
     const summary = await this.summary(message);
     const reader = input.targetConversationId ?? input.conversationId;
@@ -300,7 +306,7 @@ export class CollaborationControlPlane {
     if (![summary.sourceConversationId, summary.targetConversationId].includes(reader)) throw new Error('Conversation cannot read another conversation\'s private messages.');
     const payload = await this.one('CollaborationMessagePayloadLink', { message_id: input.messageId });
     const metadata = await this.existing('ContentObject', String(payload.content_object_id)) as ContentObjectMetadata;
-    return { ...summary, text: (await this.contentStore.read(metadata)).toString('utf8') };
+    return { ...summary, ...collaborationTextPage((await this.contentStore.read(metadata)).toString('utf8'), input.offset ?? 0) };
   }
   /**
    * Bounded transcript read, authorized independently from send/wake and never a continuation.
@@ -797,6 +803,42 @@ function unstartedTaskReason(failureReason: unknown): string {
   return reason ? `${reason.slice(0, 500)}.` : 'its delivery failed.';
 }
 function compareNewest(a: DomainRow, b: DomainRow): number { return String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)); }
+
+/**
+ * Each page of a paged message read stays well under the model tool-result cap
+ * (TOOL_RESULT_MAX_TOKENS), leaving room for the result's own fields, and is also bounded in
+ * characters because whitespace barely counts in the estimate.
+ */
+export const COLLABORATION_TEXT_PAGE_TOKENS = 2_400;
+export const COLLABORATION_TEXT_PAGE_MAX_CHARACTERS = 12_000;
+
+/**
+ * One page of a stored text from a UTF-16 character offset: the longest slice whose JSON-escaped
+ * estimate fits maxTokens, never splitting a surrogate pair. nextOffset is null once the text ends.
+ */
+export function collaborationTextPage(text: string, offset: number, maxTokens = COLLABORATION_TEXT_PAGE_TOKENS): {
+  text: string; offset: number; nextOffset: number | null; totalCharacters: number;
+} {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > text.length) {
+    throw new RangeError(`offset must be an integer from 0 to ${text.length}, the message length in characters.`);
+  }
+  const fits = (end: number) => estimateTextTokens(JSON.stringify(text.slice(offset, end))) <= maxTokens;
+  let end = Math.min(text.length, offset + COLLABORATION_TEXT_PAGE_MAX_CHARACTERS);
+  if (!fits(end)) {
+    let low = offset + 1;
+    let high = end - 1;
+    end = low;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      if (fits(middle)) { end = middle; low = middle + 1; } else high = middle - 1;
+    }
+  }
+  if (end < text.length && end > offset + 1 && isHighSurrogate(text.charCodeAt(end - 1))) end -= 1;
+  if (end < text.length && end === offset + 1 && isHighSurrogate(text.charCodeAt(offset))) end += 1;
+  return { text: text.slice(offset, end), offset, nextOffset: end < text.length ? end : null, totalCharacters: text.length };
+}
+
+function isHighSurrogate(code: number): boolean { return code >= 0xd800 && code <= 0xdbff; }
 
 function visibleMessageText(contentType: string, raw: string): string {
   if (contentType.toLowerCase().startsWith('text/plain')) return raw;
