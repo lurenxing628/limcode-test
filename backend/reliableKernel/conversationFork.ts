@@ -87,7 +87,15 @@ export class ConversationForkControlPlane {
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
   }
 
-  public async fork(commandInput: ConversationForkCommand): Promise<ConversationForkResult> {
+  /**
+   * `beforeCommit` runs once every read and check has passed, just before the fork transaction and
+   * never for a replay: the caller's own pre-commit writes (Conversation-layer settings) therefore
+   * happen only for a fork that is about to commit.
+   */
+  public async fork(
+    commandInput: ConversationForkCommand,
+    options: { beforeCommit?: () => Promise<void> } = {}
+  ): Promise<ConversationForkResult> {
     let command: ResolvedForkCommand = normalizeForkCommand(commandInput);
     const ids = forkIds(command);
     const replay = await this.findReplay(command, ids);
@@ -473,6 +481,7 @@ export class ConversationForkControlPlane {
       })
     ];
 
+    await options.beforeCommit?.();
     try {
       const commit = await this.database.transaction(steps);
       return {

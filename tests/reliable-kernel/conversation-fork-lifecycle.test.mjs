@@ -639,10 +639,89 @@ test('lost fork result replays after a source revision change without overwritin
     const config = await h.configuration.configurationClientState();
     assert.equal(config.conversationWorkflowSelections.find(item => item.conversationId === first.conversationId)?.scopeKind, 'global');
     assert.equal(config.systemPromptScopeLinks.some(link => link.scopeKind === 'conversation' && link.scopeId === first.conversationId), false);
-    await assert.rejects(h.facade.forkConversation({ ...command, command: { commandId: 'new-stale-fork' } }), /Revision/);
+    await assert.rejects(h.facade.forkConversation({ ...command, command: { commandId: 'new-stale-fork' } }),
+      error => error instanceof kernel.ConversationForkRejectedError && /Revision/.test(error.message));
     assert.equal((await rows(h.app, 'Conversation')).length, 2);
     await h.turn(first.conversationId, 'unchanged-fork-input');
     assert.doesNotMatch(h.requests.at(-1).context.map(item => item.content).join('\n'), /changed source after/);
+  });
+});
+
+/** Conversation-scoped settings of every Conversation other than the given ones. */
+async function strayConversationSettings(configuration, keep) {
+  const config = await configuration.configurationClientState();
+  const stray = [];
+  for (const [key, value] of Object.entries(config)) {
+    if (!Array.isArray(value)) continue;
+    for (const record of value) {
+      const scoped = record?.scopeKind === 'conversation' ? record.scopeId : undefined;
+      const owner = scoped ?? (key === 'conversationWorkflowSelections' || key === 'conversationWorkEnvironmentLinks'
+        ? record.conversationId : undefined);
+      if (owner !== undefined && !keep.includes(owner)) stray.push([key, owner]);
+    }
+  }
+  return stray;
+}
+
+test('permanent fork failures are rejections that leave no target or copied settings', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'rejection-source-input');
+    await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'source', text: 'source prompt' });
+    const command = await h.command('source', 'rejection-committed', 'user');
+    const first = await h.facade.forkConversation(command);
+    const foreign = await h.command(first.conversationId, 'unused', 'user');
+    const rejected = pattern => error => error instanceof kernel.ConversationForkRejectedError && pattern.test(error.message);
+    for (const [label, attempt, pattern] of [
+      ['missing source', { ...command, sourceConversationId: 'missing-source' }, /不存在/],
+      ['missing current revision', { ...command, messageId: 'missing-message' }, /当前 Revision/],
+      ['changed revision', { ...command, expectedRevisionId: foreign.expectedRevisionId }, /Revision 已变化/],
+      ['foreign message', { ...foreign, sourceConversationId: 'source' }, /不属于当前 Conversation/]
+    ]) {
+      await assert.rejects(h.facade.forkConversation({ ...attempt, command: { commandId: `rejected-${label}` } }), rejected(pattern), label);
+    }
+    // Replaying the committed command with other facts is a permanent rejection too, and the
+    // committed branch keeps its settings.
+    await assert.rejects(h.facade.forkConversation({ ...command, expectedRevisionId: foreign.expectedRevisionId }),
+      rejected(/different source facts/));
+    await assert.rejects(h.facade.forkConversation({ ...command, messageId: foreign.messageId }), rejected(/different source Message/));
+    assert.equal((await rows(h.app, 'Conversation')).length, 2);
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source', first.conversationId]), []);
+    const config = await h.configuration.configurationClientState();
+    assert.ok(config.systemPromptScopeLinks.some(link => link.scopeKind === 'conversation' && link.scopeId === first.conversationId));
+  });
+});
+
+test('a fork permanently rejected after an interrupted attempt removes the settings that attempt copied', async () => {
+  await withForkRuntime(async h => {
+    await h.turn('source', 'orphan-source-input');
+    await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'source', text: 'source prompt' });
+    const command = await h.command('source', 'orphaned-settings', 'user');
+    const database = h.app.database;
+    const transaction = database.transaction.bind(database);
+    let raced = false;
+    database.transaction = async (steps, ...rest) => {
+      if (!raced && steps.some(step => step.kind === 'insert' && step.domain === 'Conversation')) {
+        raced = true;
+        await h.app.turns.edit({
+          source: { kind: 'command', key: 'edit-races-fork-commit' }, conversationId: 'source',
+          messageId: command.messageId, expectedRevisionId: command.expectedRevisionId,
+          content: 'source edited between the fork checks and its commit'
+        });
+      }
+      return transaction(steps, ...rest);
+    };
+    try {
+      await assert.rejects(h.facade.forkConversation(command), error => !(error instanceof kernel.ConversationForkRejectedError));
+    } finally {
+      database.transaction = transaction;
+    }
+    assert.equal(raced, true);
+    assert.notDeepEqual(await strayConversationSettings(h.configuration, ['source']), [],
+      'the interrupted attempt copied settings before its commit failed');
+    await assert.rejects(h.facade.forkConversation(command), kernel.ConversationForkRejectedError);
+    assert.deepEqual(await strayConversationSettings(h.configuration, ['source']), [],
+      'a permanently rejected fork leaves no Conversation-layer settings behind');
+    assert.equal((await rows(h.app, 'Conversation')).length, 1);
   });
 });
 

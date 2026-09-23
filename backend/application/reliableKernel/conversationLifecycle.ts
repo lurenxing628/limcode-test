@@ -195,15 +195,44 @@ export class ReliableConversationLifecycle {
   }
 
   private async forkUnderOwnership(request: ConversationForkRequest): Promise<ConversationForkOutcome> {
+    const commandId = requireText(request.commandId, 'Conversation fork commandId');
+    // The branch target id is derived from the command identity alone, so a rejection can find
+    // settings an earlier attempt of the same command copied under it.
+    const targetConversationId = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
+    try {
+      return await this.forkCommand(request, commandId, targetConversationId);
+    } catch (error) {
+      if (error instanceof ConversationForkRejectedError) await this.discardRejectedForkTarget(targetConversationId);
+      throw error;
+    }
+  }
+
+  /**
+   * A permanently rejected command never commits its branch, but an earlier attempt that failed
+   * at the commit may have copied Conversation-layer settings under the target id already. They are
+   * removed so the rejection leaves nothing behind; a target committed by this command is kept.
+   */
+  private async discardRejectedForkTarget(targetConversationId: string): Promise<void> {
+    await this.application.database.conversationOwners.run(targetConversationId, async () => {
+      if (await this.maybeRow('Conversation', targetConversationId)) return;
+      await this.configuration.mutations.clearConversationConfiguration(targetConversationId);
+    });
+  }
+
+  private async forkCommand(
+    request: ConversationForkRequest,
+    commandId: string,
+    targetConversationId: string
+  ): Promise<ConversationForkOutcome> {
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
     const messageId = requireText(request.messageId, 'Conversation fork messageId');
     const expectedRevisionId = requireText(request.expectedRevisionId, 'Conversation fork expectedRevisionId');
-    const commandId = requireText(request.commandId, 'Conversation fork commandId');
     const reuseKey = `conversation-fork-command:${commandId}`;
 
     // Replay is resolved from the immutable branch/reuse facts before consulting today's mutable
     // MessageCurrentRevisionLink. A lost result therefore remains replayable even if the source is
-    // edited after the original fork committed.
+    // edited after the original fork committed, and every rejection below follows this lookup, so
+    // none of them can hide a committed branch: they are permanent for this command.
     const existingReuse = await this.list('ConversationReuseLink', { reuse_key: reuseKey }, 2);
     if (existingReuse.length > 1) throw new Error('Conversation fork command identity is not unique.');
     if (existingReuse.length === 1) {
@@ -213,26 +242,29 @@ export class ReliableConversationLifecycle {
         branches.length !== 1
         || branches[0].source_conversation_id !== sourceConversationId
         || branches[0].source_message_revision_id !== expectedRevisionId
-      ) throw new Error('Conversation fork command was replayed with different source facts.');
+      ) throw new ConversationForkRejectedError('Conversation fork command was replayed with different source facts.');
       const revision = await this.requireRow('MessageRevision', expectedRevisionId);
       if (revision.message_id !== messageId) {
-        throw new Error('Conversation fork command was replayed with a different source Message.');
+        throw new ConversationForkRejectedError('Conversation fork command was replayed with a different source Message.');
       }
       // The configuration copy completed before the branch committed; the target's settings now
       // belong to the user and a replay must not refill anything they changed or cleared.
       return { conversationId, deduplicated: true };
     }
 
-    const sourceConversation = await this.requireRow('Conversation', sourceConversationId);
+    const sourceConversation = await this.maybeRow('Conversation', sourceConversationId);
+    if (!sourceConversation) throw new ConversationForkRejectedError(`Fork 源 Conversation ${sourceConversationId} 不存在。`);
     const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
-    if (currentLinks.length !== 1) throw new Error('Fork 源 Message 缺少唯一当前 Revision。');
+    if (currentLinks.length !== 1) throw new ConversationForkRejectedError('Fork 源 Message 缺少唯一当前 Revision。');
     const revisionId = requireText(currentLinks[0].revision_id, 'MessageCurrentRevisionLink.revision_id');
-    if (revisionId !== expectedRevisionId) throw new Error('Fork 源 Message Revision 已变化，请基于当前内容重新创建分支。');
+    if (revisionId !== expectedRevisionId) {
+      throw new ConversationForkRejectedError('Fork 源 Message Revision 已变化，请基于当前内容重新创建分支。');
+    }
     const memberships = await this.list('MessagePartOfConversation', {
       conversation_id: sourceConversationId,
       message_id: messageId
     }, 2);
-    if (memberships.length !== 1) throw new Error('Fork 源 Message 不属于当前 Conversation。');
+    if (memberships.length !== 1) throw new ConversationForkRejectedError('Fork 源 Message 不属于当前 Conversation。');
     const boundaryMessageSeq = memberships[0].message_seq;
     if (typeof boundaryMessageSeq !== 'bigint') throw new TypeError('MessagePartOfConversation.message_seq 必须是整数。');
     const turnLinks = (await this.application.database.snapshotAll(
@@ -410,20 +442,13 @@ export class ReliableConversationLifecycle {
     }, 2);
     if (agentLinks.length !== 1) throw new Error('Fork 源 Conversation 缺少唯一默认 Agent 关系。');
     // The branch target is claimed BEFORE its first write: this Host owns the new Conversation
-    // through the fork transaction and the configuration copy. The id is derived from the fork
+    // through the configuration copy and the fork transaction. The id is derived from the fork
     // command identity so concurrent same-command calls deterministically claim the same target
     // (and a peer's claim refuses busy) instead of forking divergent targets. The opening view
     // retains it via claim-before-open; without a view the owner idle-releases after this run.
-    const targetConversationId = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
-    const result = await this.application.database.conversationOwners.run(targetConversationId, async () => {
-      // Conversation-layer settings are copied BEFORE the branch commits: once the branch exists
-      // it is immediately usable and replays never touch its settings again. An interrupted copy
-      // or fork is resumed by the same command, which only fills still-empty target settings.
-      await this.configuration.mutations.copyConversationConfiguration(
-        sourceConversationId,
-        targetConversationId
-      );
-      return this.application.runtime.conversationFork.fork({
+    const targetTitle = `${await this.durableConversationTitle(sourceConversation)} 分支`;
+    const result = await this.application.database.conversationOwners.run(targetConversationId, () =>
+      this.application.runtime.conversationFork.fork({
         idempotencyKey: commandId,
         reuseKey,
         sourceConversationId,
@@ -433,10 +458,19 @@ export class ReliableConversationLifecycle {
         expectedCurrentMessageRevisionId: revisionId,
         ...(sourceTurnIds.length === 1 ? { sourceTurnId: sourceTurnIds[0] } : {}),
         targetConversationId,
-        targetTitle: `${await this.durableConversationTitle(sourceConversation)} 分支`,
+        targetTitle,
         targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
-      });
-    });
+      }, {
+        // Conversation-layer settings are copied after every snapshot check and BEFORE the branch
+        // commits: once the branch exists it is immediately usable and replays never touch its
+        // settings again. An interrupted copy or commit is resumed by the same command, which only
+        // fills still-empty target settings; a permanent rejection removes them again.
+        beforeCommit: () => this.configuration.mutations.copyConversationConfiguration(
+          sourceConversationId,
+          targetConversationId
+        )
+      })
+    );
     return { conversationId: result.targetConversationId, deduplicated: result.deduplicated };
   }
 

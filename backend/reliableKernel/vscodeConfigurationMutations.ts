@@ -980,6 +980,29 @@ export class VscodeConfigurationMutations {
     });
   }
 
+  /**
+   * Removes every Conversation-layer selection of a Conversation id that will never exist, such as
+   * a permanently rejected fork target: exactly what copyConversationConfiguration can write (the
+   * scoped record/link pairs, the workflow selection and the work-environment link). Global, Agent
+   * and Workflow layers are neither read nor written.
+   */
+  public clearConversationConfiguration(conversationIdInput: string): Promise<void> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    return this.mutate(async (paths) => {
+      await this.clearOwnerScopes(paths, 'conversation', conversationId);
+      const workflowStore = conversationWorkflowSelectionStore(paths);
+      const workflowSelections = await loadStore(workflowStore);
+      if (workflowSelections.some((record) => record.conversationId === conversationId)) {
+        await saveStore(workflowStore, workflowSelections.filter((record) => record.conversationId !== conversationId));
+      }
+      const environmentStore = conversationWorkEnvironmentLinkStore(paths);
+      const environmentLinks = await loadStore(environmentStore);
+      if (environmentLinks.some((record) => record.conversationId === conversationId)) {
+        await saveStore(environmentStore, environmentLinks.filter((record) => record.conversationId !== conversationId));
+      }
+    });
+  }
+
   private mutate<T>(action: (paths: StoragePaths) => Promise<T>): Promise<T> {
     const paths = this.getPaths();
     const lockUri = vscode.Uri.joinPath(paths.settingsRootUri, CONFIGURATION_MUTATION_LOCK);
