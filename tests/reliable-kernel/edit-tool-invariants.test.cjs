@@ -128,7 +128,9 @@ test('provider dry-runs flatten only the edit union and retain complete branch s
     const declarations = provider === 'gemini' ? result.body.tools[0].functionDeclarations : result.body.tools;
     if (provider === 'openai-responses') {
       assert.equal(declarations[0].strict, false, 'Responses must not make all edit branches required through implicit strict mode');
-      assert.equal(declarations[1].strict, undefined, 'Unrelated tools must keep their original strictness');
+      // Omitting strict makes Responses normalize every schema into strict mode (optional fields become
+      // required): https://developers.openai.com/api/docs/guides/function-calling#strict-mode
+      assert.equal(declarations[1].strict, false, 'Unrelated tools must not be normalized into implicit strict mode either');
     }
     const [schema, unrelatedSchema] = declarations.map((declaration) => provider === 'claude'
       ? declaration.input_schema
