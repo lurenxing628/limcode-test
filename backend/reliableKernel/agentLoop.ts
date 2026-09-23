@@ -392,7 +392,7 @@ export class ReliableAgentLoop {
     this.now = options.now ?? (() => new Date().toISOString());
     this.reconcileCommittedToolCall = options.reconcileCommittedToolCall;
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
-    this.automaticDeliveries = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveries = new AutomaticRuntimeDeliveryRouter(database, contentStore);
   }
 
   public async runInput(command: TurnInputCommand): Promise<ReliableAgentLoopResult> {

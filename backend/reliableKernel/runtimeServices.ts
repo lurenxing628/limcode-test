@@ -59,7 +59,7 @@ export function createReliableKernelRuntimeServices(
   }
 ): ReliableKernelRuntimeServices {
   const effects = new EffectControlPlane(database, contentStore, options);
-  const deliveries = new RuntimeDeliveryControlPlane(database, options);
+  const deliveries = new RuntimeDeliveryControlPlane(database, contentStore, options);
   const collaboration = new CollaborationControlPlane(database, contentStore, deliveries, options);
   const collaborationBoard = new CollaborationBoard(database, contentStore, {
     ...options,

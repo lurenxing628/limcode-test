@@ -4,6 +4,7 @@ import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { isCrossConversationFollowup } from './collaborationScope';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
+import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import {
   requireIsoTimestamp,
   requirePhaseFId,
@@ -136,7 +137,7 @@ export class ProcessCompletionDeliveryControlPlane {
     this.maxFailureCount = requirePositiveInteger(options.maxFailureCount ?? DEFAULT_MAX_FAILURE_COUNT, 'maxFailureCount', 100);
     this.wakeHandler = options.wakeHandler;
     this.onError = options.onError;
-    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
     this.unsubscribeCommit = database.onCommit((commit) => {
       if (!commit.changes.some((change) => [
         'ProcessReceipt',
@@ -426,7 +427,8 @@ export class ProcessCompletionDeliveryControlPlane {
 
   /**
    * True only while a collaboration delivery waits for its target's running Turn: the Turn it was
-   * anchored to, or, for a cross-conversation followup, any Turn running in the target.
+   * anchored to, a manual compression or summary rebuild (which takes nothing in), or, for a
+   * cross-conversation followup, any Turn running in the target.
    */
   private async queuedBehindActiveTurn(wake: DomainRow): Promise<boolean> {
     try {
@@ -447,8 +449,10 @@ export class ProcessCompletionDeliveryControlPlane {
         const anchor = await this.maybeGet('Turn', requirePhaseFId(targets[0].anchor_turn_id, 'CollaborationMessageTargetLink.anchor_turn_id'));
         if (anchor?.status === 'active' && anchor.conversation_id === delivery.target_conversation_id) return true;
       }
-      if (!await isCrossConversationFollowup(this.database, messageId)) return false;
-      return (await this.listRows('Turn', { conversation_id: delivery.target_conversation_id, status: 'active' }, 1)).length > 0;
+      const [active] = await this.listRows('Turn', { conversation_id: delivery.target_conversation_id, status: 'active' }, 1);
+      if (!active) return false;
+      if (await isRuntimeMaintenanceTurn(this.database, this.contentStore, String(active.id))) return true;
+      return isCrossConversationFollowup(this.database, messageId);
     } catch {
       // Malformed facts surface through the normal claimed dispatch failure path.
       return false;

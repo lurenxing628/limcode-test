@@ -2284,7 +2284,7 @@ async function checkProcessWrapperRecovery() {
       })
     ]);
     const idleWakeRequests = [];
-    const idleDeliveries = new kernel.RuntimeDeliveryControlPlane(ctx.database);
+    const idleDeliveries = new kernel.RuntimeDeliveryControlPlane(ctx.database, ctx.store);
     const idleDispatcher = new kernel.ProcessCompletionDeliveryControlPlane(
       ctx.database,
       ctx.store,
@@ -2475,7 +2475,7 @@ async function checkProcessWrapperRecovery() {
       ctx.database,
       ctx.store,
       processes,
-      new kernel.RuntimeDeliveryControlPlane(ctx.database),
+      new kernel.RuntimeDeliveryControlPlane(ctx.database, ctx.store),
       {
         scanIntervalMs: 10,
         claimTtlMs: 100,
@@ -2737,7 +2737,7 @@ async function checkProcessWrapperRecovery() {
       ctx.database,
       ctx.store,
       processes,
-      new kernel.RuntimeDeliveryControlPlane(ctx.database),
+      new kernel.RuntimeDeliveryControlPlane(ctx.database, ctx.store),
       {
         scanIntervalMs: 25,
         wakeHandler: async (request) => {

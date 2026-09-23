@@ -1755,7 +1755,9 @@ export class TurnControlPlane {
           contentEstimatedTokens: messageContentEstimatedTokens
         })
       : null;
-    const nextDeliverySteps = this.prepareNextTurnDeliverySteps
+    // A manual compression or summary rebuild runs no model over new input: pending deliveries
+    // stay for the next real Turn instead of blocking this Turn's terminal commit forever.
+    const nextDeliverySteps = this.prepareNextTurnDeliverySteps && !plan.runtimeMaintenance
       ? await this.prepareNextTurnDeliverySteps(conversation.id as string, ids.turn, now, plan.deliveryId ?? null)
       : [];
     const childAdmission = command.membership

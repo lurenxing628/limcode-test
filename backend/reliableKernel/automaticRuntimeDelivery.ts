@@ -19,6 +19,8 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { isCrossConversationFollowup } from './collaborationScope';
+import type { ContentAddressedStore } from './contentAddressedStore';
+import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -73,7 +75,10 @@ const TERMINAL_FAILURES = new Set(['interrupted', 'cancelled', 'failed', 'outcom
  * only a scheduling hint.
  */
 export class AutomaticRuntimeDeliveryRouter {
-  public constructor(private readonly database: RuntimeDatabase) {}
+  public constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly contentStore: ContentAddressedStore
+  ) {}
 
   /**
    * Fences a no-tool-call Provider result before it becomes visible. A delivery that won first
@@ -444,6 +449,14 @@ export class AutomaticRuntimeDeliveryRouter {
     const anchor = turn ?? turns[0];
     const sourceTurnId = anchor ? String(anchor.id) : input.sourceTurnId;
     if (boardNotice && (!turn || links[0].anchor_turn_id !== turn.id)) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
+    // A manual compression or summary rebuild never takes a delivery in. The delivery waits; the
+    // commit that ends the maintenance Turn triggers the scan that routes it to the next real Turn.
+    if (turn && await isRuntimeMaintenanceTurn(this.database, this.contentStore, String(turn.id))) {
+      steps.push(DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { status: 'active', conversation_id: input.targetConversationId }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turn.id }));
+      if (boardNotice) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
+      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason: 'collaboration_queued_behind_active_turn', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+    }
     // A send queued behind the target's running Turn is never injected into that Turn. It stays a
     // next-Turn delivery until the anchor Turn ends; the level-triggered wake then routes it. A
     // cross-conversation followup starts a Turn of its own, so it keeps waiting behind whichever

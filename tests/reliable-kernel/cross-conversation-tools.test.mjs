@@ -59,7 +59,7 @@ const lastResult = (start, name) => start.contents.flatMap(content => content.pa
 const detail = (start, name) => lastResult(start, name)?.detail;
 
 /** The external model alone is synthetic; tools, authority, ownership, persistence and wakes are production code. */
-async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook, expectedScannerError, allowedTools = definitions.map(tool => tool.declaration.name), providerKind = 'openai-compatible', modelId = 'gpt-6-astra' } = {}) {
+async function fixture(send, run, { enabled = true, switchValue = true, wakeGate, runAgentConfig = {}, toolConfigs = {}, dispatchHook, expectedScannerError, compressionGate, allowedTools = definitions.map(tool => tool.declaration.name), providerKind = 'openai-compatible', modelId = 'gpt-6-astra' } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-cross-conversation-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -99,20 +99,26 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
         llmSummary: { targetTokens: 512, reasoning: { mode: 'provider_default' } } };
       await save('llmCompressionConfigs', { configs: [config] });
       await save('llmCompression', { defaultConfigId: config.id, providerBindings: [], modelBindings: [] });
+    },
+    /** Manual compression of the whole current head, as the compress button does. */
+    async compress(conversationId, commandId) {
+      const expectedRootId = await app.context.currentHeadRootId(conversationId);
+      const structure = await app.context.materializeStructure(expectedRootId);
+      return runner.manualCompression({ commandId, conversationId, compressSegmentCount: structure.records.length, target: { kind: 'current_head', expectedRootId } });
+    },
+    /** Restarts the window: a new Host opens the same Runtime and recovers it. */
+    async reopen() {
+      runner.dispose();
+      await coordinator.dispose();
+      await app.close();
+      await open();
+      await app.recover();
+      await runner.recoverStartup();
     }
   };
-  try {
-    await save('llmProviderConfigs', { configs: [provider] });
-    await save('llm', { activeProviderConfigId: provider.id });
-    const folderPath = path.join(root, 'workspace');
-    await fs.mkdir(folderPath);
-    const project = { uri: Uri.file(folderPath).toString(), name: 'cross-project' };
-    await configuration.synchronizeWorkspaceFolders([{ ...project, rootPath: folderPath, index: 0 }]);
-    const agent = await configuration.mutations.createAgent({ name: 'Synthetic top-level', kind: 'custom' });
-    await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools,
-      ...(enabled ? { toolConfigs: { ...toolConfigs, run_agent: { config: { ...runAgentConfig, crossConversationCollaboration: switchValue } } } } : {}) });
+  let agent;
+  async function open() {
     const rootAuthority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
-    await kernel.initializeEmptyRuntimeRoot(rootAuthority);
     app = await kernel.ReliableKernelApplication.open(rootAuthority, {
       authorityCompiler: configuration, compressionSettingsAuthority: configuration, attachmentSettings: configuration,
       resolveWorkEnvironment: async () => undefined,
@@ -134,6 +140,11 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
         const [requestRow] = await f.rows('ModelRequest', { id: request.modelRequestId });
         const observedRequest = { ...request, turnId: requestRow.turn_id };
         try {
+          if (request.recipe?.kind === 'reliable-context-compression') {
+            await compressionGate?.(observedRequest, controls.signal);
+            await complete(controls, { type: 'compression_result', contents: [{ role: 'user', parts: [{ text: 'Synthetic compression summary.' }] }] });
+            return;
+          }
           let start;
           const adapter = new kernel.LlmCapabilityFullRequestAdapter(providerId, {
             start(input, emit) { start = input; emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
@@ -142,7 +153,11 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
           const effective = applyFrozenModelProviderConfig(await configuration.providerConfig(providerId), request.modelId);
           const wire = await dryRunLlmProvider(start, { settings: { ...effective, apiKey: '' } });
           await complete(controls, await send(observedRequest, f, start, wire.body));
-        } catch (error) { errors.push(error); await complete(controls, answer('Synthetic provider assertion failed.')); }
+        } catch (error) {
+          // A window closing mid-request aborts it; the restarted Host replays the request.
+          if (controls.signal?.aborted) throw error;
+          errors.push(error); await complete(controls, answer('Synthetic provider assertion failed.'));
+        }
       } }; } },
       createToolDispatcher: dependencies => new ReliableToolDispatcher({ ...dependencies, effects: dependencies.runtime.effects,
         host: {
@@ -172,6 +187,19 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     runner = new ReliableConversationRunner(app, 'synthetic-cross-owner');
     const wake = createRuntimeDeliveryWakeHandler({ application: () => app, conversations: () => runner, children: () => coordinator });
     app.processDeliveries.setWakeHandler(async request => { wakes.push(structuredClone(request)); await wakeGate?.(request); return wake(request); });
+  }
+  try {
+    await save('llmProviderConfigs', { configs: [provider] });
+    await save('llm', { activeProviderConfigId: provider.id });
+    const folderPath = path.join(root, 'workspace');
+    await fs.mkdir(folderPath);
+    const project = { uri: Uri.file(folderPath).toString(), name: 'cross-project' };
+    await configuration.synchronizeWorkspaceFolders([{ ...project, rootPath: folderPath, index: 0 }]);
+    agent = await configuration.mutations.createAgent({ name: 'Synthetic top-level', kind: 'custom' });
+    await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools,
+      ...(enabled ? { toolConfigs: { ...toolConfigs, run_agent: { config: { ...runAgentConfig, crossConversationCollaboration: switchValue } } } } : {}) });
+    await kernel.initializeEmptyRuntimeRoot(new kernel.RootAuthority(() => path.join(root, 'runtime')));
+    await open();
     const now = new Date().toISOString();
     await app.database.transaction([
       ...[[ROOT, 'Root title'], [PEER, 'Peer title']].flatMap(([id, title]) => [
@@ -1197,3 +1225,148 @@ for (const withCollaboration of [false, true]) {
     });
   });
 }
+
+/** The user retries a Turn's first answer; the retried Turn leaves no collaboration tool result in the history. */
+async function retryFirstAnswer(f, conversationId, turnId, commandId) {
+  const answers = await Promise.all((await f.rows('MessageTurnLink', { turn_id: turnId, role: 'model' })).map(async link =>
+    (await f.rows('MessagePartOfConversation', { message_id: link.message_id }))[0]));
+  const first = answers.sort((left, right) => (left.message_seq < right.message_seq ? -1 : 1))[0];
+  const [current] = await f.rows('MessageCurrentRevisionLink', { message_id: first.message_id });
+  const retried = await f.runner.retry({ commandId, conversationId, sourceTurnId: turnId,
+    target: { kind: 'message', messageId: first.message_id }, expectedMessageRevisionId: current.revision_id });
+  assert.equal((await f.terminated(retried.turnId)).terminal_status, 'completed');
+  return retried.turnId;
+}
+
+/** A maintenance Turn that ended without taking anything in, and the delivery still waiting for the next real Turn. */
+async function assertMaintenanceLeftDelivery(f, maintenanceTurnId, deliveryId) {
+  assert.equal((await f.terminated(maintenanceTurnId)).terminal_status, 'completed');
+  assert.deepEqual(await f.rows('PendingTurnInput', { turn_id: maintenanceTurnId }), [], 'a compression takes no delivery in');
+  const delivery = (await f.rows('RuntimeDelivery', { id: deliveryId }))[0];
+  assert.deepEqual([delivery.state, delivery.phase, delivery.target_turn_id], ['pending', 'next_turn', null]);
+  assert.equal(await f.app.database.hasConversationRuntimeWork(delivery.target_conversation_id), false, 'the compressed conversation is idle again');
+}
+
+test('a manual compression while a message waits for the next Turn ends and leaves the message to the next real Turn', { timeout: 60000 }, async () => {
+  const NOTE = 'CROSS_WAITING_NOTE_4401';
+  let rootRound = 0, peerSawNote;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === PEER) {
+      peerSawNote = JSON.stringify(start.contents).includes(NOTE);
+      return answer('Peer answered.');
+    }
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('send', 'send_conversation_message', { conversationRef: peer.conversationRef, text: NOTE, mode: 'message' }));
+    }
+    return answer('Informed the peer.');
+  }, async f => {
+    const own = await f.input(PEER, 'peer-own-work');
+    await f.terminated(own.turnId);
+    const root = await f.input(ROOT, 'inform');
+    await f.terminated(root.turnId);
+    const [delivery] = await f.rows('RuntimeDelivery', { target_conversation_id: PEER });
+    assert.deepEqual([delivery.state, delivery.phase, delivery.target_turn_id], ['pending', 'next_turn', null], 'fixture: the note waits for the idle peer');
+    peerSawNote = undefined;
+    const compressed = await f.compress(PEER, 'compress-with-waiting-note');
+    assert.equal(compressed.compression.status, 'compressed');
+    await assertMaintenanceLeftDelivery(f, compressed.turnId, delivery.id);
+    assert.equal(peerSawNote, undefined, 'no model ran over the note');
+    const next = await f.input(PEER, 'anything new?');
+    assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+    assert.equal(peerSawNote, true, 'the next real Turn takes the note in');
+    assert.equal((await f.rows('RuntimeDelivery', { id: delivery.id }))[0].target_turn_id, next.turnId);
+  });
+});
+
+/** ROOT asks PEER with a followup, then the user retries ROOT's answer; PEER works only once released. */
+function delegatedTask(TASK, RESULT) {
+  let releasePeer, phase = 'delegate', rootRound = 0;
+  const peerHeld = new Promise(resolve => { releasePeer = resolve; });
+  const seen = [];
+  const send = async (request, f, start) => {
+    const text = JSON.stringify(start.contents);
+    if (request.conversationId === PEER) {
+      assert.ok(text.includes(TASK));
+      await peerHeld;
+      return answer(RESULT);
+    }
+    seen.push({ phase, turnId: request.turnId, result: text.includes(RESULT) });
+    if (phase !== 'delegate') return answer(`Root ${phase}.`);
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('list', 'list_conversations'));
+    if (rootRound === 2) {
+      const peer = detail(start, 'list_conversations').conversations.find(entry => entry.title === 'Peer title');
+      return toolsAnswer(call('ask', 'send_conversation_message', { conversationRef: peer.conversationRef, text: TASK, mode: 'followup' }));
+    }
+    return answer('Delegated to the peer.');
+  };
+  return {
+    send, seen, releasePeer,
+    setPhase(value) { phase = value; },
+    async delegate(f) {
+      const delegated = await f.input(ROOT, 'delegate');
+      assert.equal((await f.terminated(delegated.turnId)).terminal_status, 'completed');
+      phase = 'retried';
+      await retryFirstAnswer(f, ROOT, delegated.turnId, 'retry-delegation');
+      phase = 'idle';
+    },
+    async reply(f) {
+      const [request] = await f.rows('CollaborationRequest');
+      const replyId = kernel.stablePhaseFId('collaboration_message', `collaboration:completion:${request.id}`);
+      return f.until(async () => (await f.rows('RuntimeDelivery', { inbox_item_id: kernel.stablePhaseFId('runtime_inbox_item', replyId) }))[0], 'The peer never replied.');
+    }
+  };
+}
+
+test('a manual compression while a completion reply waits for the next Turn ends and leaves the reply to the next real Turn', { timeout: 60000 }, async () => {
+  const task = delegatedTask('CROSS_WAITING_TASK_4411', 'CROSS_WAITING_RESULT_4412');
+  await fixture(task.send, async f => {
+    await task.delegate(f);
+    task.releasePeer();
+    const reply = await task.reply(f);
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0].state === 'completed', 'The request was never settled.');
+    assert.deepEqual([reply.state, reply.phase, reply.target_turn_id], ['pending', 'next_turn', null], 'fixture: the reply waits for the idle requester');
+    task.setPhase('compressing');
+    const compressed = await f.compress(ROOT, 'compress-with-waiting-reply');
+    assert.equal(compressed.compression.status, 'compressed');
+    await assertMaintenanceLeftDelivery(f, compressed.turnId, reply.id);
+    task.setPhase('next');
+    const next = await f.input(ROOT, 'any news?');
+    assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+    assert.deepEqual(task.seen.filter(entry => entry.result).map(entry => [entry.phase, entry.turnId]), [['next', next.turnId]], 'only the next real Turn reads the reply');
+  // With a budget of one the reply cannot start a Turn of its own: only the next user Turn takes it in.
+  }, { runAgentConfig: { maxAutomaticFollowups: 1 } });
+});
+
+test('a completion reply that arrives during a compression, followed by a restart, waits for the next real Turn', { timeout: 90000 }, async () => {
+  const task = delegatedTask('CROSS_RESTART_TASK_4421', 'CROSS_RESTART_RESULT_4422');
+  let holdCompression = false, compressionStarted, releaseCompression;
+  const started = new Promise(resolve => { compressionStarted = resolve; });
+  const released = new Promise(resolve => { releaseCompression = resolve; });
+  await fixture(task.send, async f => {
+    await task.delegate(f);
+    task.setPhase('compressing');
+    holdCompression = true;
+    // The window closes while this compression is still running; its promise is abandoned with it.
+    void f.compress(ROOT, 'compress-then-restart').catch(() => undefined);
+    const maintenanceTurnId = await started;
+    task.releasePeer();
+    const reply = await task.reply(f);
+    assert.notEqual(reply.target_turn_id, maintenanceTurnId, 'the reply is never routed into the compression');
+    holdCompression = false;
+    await f.reopen();
+    await assertMaintenanceLeftDelivery(f, maintenanceTurnId, reply.id);
+    task.setPhase('next');
+    const next = await f.input(ROOT, 'any news?');
+    assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+    assert.deepEqual(task.seen.filter(entry => entry.result).map(entry => [entry.phase, entry.turnId]), [['next', next.turnId]], 'only the next real Turn reads the reply');
+  }, { runAgentConfig: { maxAutomaticFollowups: 1 }, compressionGate: async (request, signal) => {
+    if (!holdCompression) return;
+    compressionStarted(request.turnId);
+    await Promise.race([released, new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')), { once: true }))]);
+  } });
+  releaseCompression();
+});

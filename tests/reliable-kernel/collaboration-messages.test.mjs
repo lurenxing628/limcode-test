@@ -26,7 +26,7 @@ async function fixture(run, budget = 32) {
   await initializeEmptyRuntimeRoot(authority);
   let database = await RuntimeDatabase.open(authority);
   const store = new ContentAddressedStore(authority, database.binding);
-  let deliveries = new RuntimeDeliveryControlPlane(database, { now: () => NOW });
+  let deliveries = new RuntimeDeliveryControlPlane(database, store, { now: () => NOW });
   let collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW });
   const rows = async (domain, where = {}) => (await database.snapshot([repo(domain).list({ where, limit: 1000 })])).snapshot[0];
   const get = async (domain, id) => (await database.snapshot([repo(domain).get(id)])).snapshot[0];
@@ -48,7 +48,7 @@ async function fixture(run, budget = 32) {
       ])
     ]);
     await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, store, rows, get, authority, runtimeDirectory: path.join(directory, 'runtime'),
-      async reopen() { await database.close(); database = await RuntimeDatabase.open(authority); deliveries = new RuntimeDeliveryControlPlane(database, { now: () => NOW }); collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW }); },
+      async reopen() { await database.close(); database = await RuntimeDatabase.open(authority); deliveries = new RuntimeDeliveryControlPlane(database, store, { now: () => NOW }); collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW }); },
       async source(id = `call-${++callSeq}`, conversationId = 'left', turnId = `${conversationId}-turn`, toolName = 'send_agent_message') {
         const content = await store.prepare(database, '{}', 'application/json');
         await database.transaction([...preparedContentObjectSteps([content], 'message_tool'), repo('ToolCall').insert({ id, turn_id: turnId, call_seq: BigInt(++callSeq), tool_name: toolName, status: 'pending', arguments_object_id: content.metadata.id, created_at: NOW, updated_at: NOW })]);
@@ -117,7 +117,7 @@ test('send-only message on a final-output fence queues without an idle wake or a
   const accepted = await f.collaboration.send({ source: await f.source(), targetConversationId: 'root', text: 'late peer update', mode: 'message' });
   assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).phase, 'next_turn');
   assert.equal((await f.rows('RuntimeDeliveryWake')).length, 0);
-  const decision = await new AutomaticRuntimeDeliveryRouter(f.database).resolve({ inboxItemId: accepted.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-turn' });
+  const decision = await new AutomaticRuntimeDeliveryRouter(f.database, f.store).resolve({ inboxItemId: accepted.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-turn' });
   assert.equal(decision.phase, 'next_turn');
   assert.equal(decision.targetTurnId, null);
 }));
@@ -258,7 +258,7 @@ test('a queued followup waits for the running target Turn and then starts exactl
   assert.equal(delivery.phase, 'next_turn');
   assert.equal(delivery.target_turn_id, null);
   assert.equal((await f.rows('CollaborationMessageTargetLink', { message_id: accepted.messageId }))[0].anchor_turn_id, 'root-turn');
-  const decision = await new AutomaticRuntimeDeliveryRouter(f.database).resolve({ inboxItemId: accepted.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-turn' });
+  const decision = await new AutomaticRuntimeDeliveryRouter(f.database, f.store).resolve({ inboxItemId: accepted.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-turn' });
   assert.equal(decision.reason, 'collaboration_queued_behind_active_turn');
   assert.equal(decision.phase, 'next_turn');
   assert.equal(decision.targetTurnId, null);
@@ -856,7 +856,7 @@ test('the router keeps a cross-conversation followup out of a Turn that started 
   await endTurn(f, 'target-b-turn');
   await admitPending(f, 'target-b', 'target-b-user');
   // Dispatch can race the user's Turn past the scanner's own check; the router decides alone.
-  const router = new AutomaticRuntimeDeliveryRouter(f.database);
+  const router = new AutomaticRuntimeDeliveryRouter(f.database, f.store);
   const decision = await router.resolve({ inboxItemId: followup.inboxItemId, targetConversationId: 'target-b', sourceTurnId: 'target-b-user' });
   assert.deepEqual([decision.reason, decision.phase, decision.targetTurnId], ['collaboration_queued_behind_active_turn', 'next_turn', null]);
   // Team messages keep their anchor-only rule.
@@ -998,4 +998,49 @@ test('a collaboration message carries at most the documented byte cap and a long
   assert.deepEqual(await f.rows('CollaborationMessage'), []);
   const sent = await f.collaboration.send({ source: await f.source('at-cap'), targetConversationId: 'right', text: atCap, mode: 'message' });
   assert.equal((await f.collaboration.readMessage({ conversationId: 'right', messageId: sent.messageId })).text, atCap);
+}));
+
+/** Admits a manual compression Turn: its TurnIntent payload carries the runtimeMaintenance descriptor. */
+async function startMaintenance(f, conversationId, turnId) {
+  const policy = await f.get('AuthoritySnapshot', 'root-authority');
+  const envelope = await f.store.prepare(f.database, JSON.stringify({ kind: 'retry', sourceTurnId: null,
+    runtimeMaintenance: { kind: 'manual_context_compression', version: 1, compressSegmentCount: 1, commandSourceKey: `manual-compression:${turnId}:turn` } }), 'application/vnd.limcode.turn-intent+json');
+  await f.database.transaction([...preparedContentObjectSteps([envelope], 'maintenance_intent'),
+    repo('Turn').insert({ id: turnId, conversation_id: conversationId, status: 'active', created_at: NOW, updated_at: NOW, terminal_at: null }),
+    repo('AuthoritySnapshot').insert({ id: `${turnId}-policy`, turn_id: turnId, content_object_id: policy.content_object_id, created_at: NOW }),
+    repo('TurnIntent').insert({ id: `${turnId}-intent`, conversation_id: conversationId, turn_id: turnId, state: 'admitted', created_at: NOW, updated_at: NOW }),
+    repo('TurnIntentRevision').insert({ id: `${turnId}-intent-revision`, intent_id: `${turnId}-intent`, revision_seq: 1n, content_object_id: envelope.metadata.id, created_at: NOW })]);
+}
+
+test('nothing is routed into a manual compression Turn: every delivery waits for the next real Turn', async () => fixture(async f => {
+  // A message for root's running Turn that the user stopped before it was taken in.
+  const stranded = await f.collaboration.send({ source: await f.source('note-before-compression'), targetConversationId: 'root', text: 'stranded note', mode: 'message' });
+  assert.equal((await f.get('RuntimeDelivery', stranded.deliveryId)).target_turn_id, 'root-turn', 'fixture: the note joins the running Turn');
+  await endTurn(f, 'root-turn', 'interrupted');
+  await startMaintenance(f, 'root', 'root-compress');
+  // Recovery advances every pending delivery; the router never picks the compression Turn.
+  await f.deliveries.advance(stranded.deliveryId);
+  const moved = await f.get('RuntimeDelivery', stranded.deliveryId);
+  assert.deepEqual([moved.state, moved.phase, moved.target_turn_id], ['pending', 'next_turn', null]);
+  const decision = await new AutomaticRuntimeDeliveryRouter(f.database, f.store).resolve({ inboxItemId: stranded.inboxItemId, targetConversationId: 'root', sourceTurnId: 'root-compress' });
+  assert.deepEqual([decision.reason, decision.phase, decision.targetTurnId], ['collaboration_queued_behind_active_turn', 'next_turn', null]);
+  // Sends during the compression wait as well, and a running-member notice finds root idle.
+  const note = await f.collaboration.send({ source: await f.source('note-during-compression'), targetConversationId: 'root', text: 'note during compression', mode: 'message' });
+  const task = await f.collaboration.send({ source: await f.source('task-during-compression', 'left', 'left-turn', 'followup_agent_task'), targetConversationId: 'root', text: 'task during compression', mode: 'followup' });
+  for (const sent of [note, task]) {
+    const delivery = await f.get('RuntimeDelivery', sent.deliveryId);
+    assert.deepEqual([delivery.phase, delivery.target_turn_id], ['next_turn', null]);
+  }
+  await assert.rejects(f.collaboration.send({ source: await f.source('notice-during-compression'), targetConversationId: 'root', text: 'notice', mode: 'message', onlyIfRunning: true }), /target is idle/);
+  const scanner = new ProcessCompletionDeliveryControlPlane(f.database, f.store, {}, f.deliveries, { now: () => NOW, scanIntervalMs: 20,
+    wakeHandler: async request => assert.fail(`Nothing wakes a conversation during its compression: ${request.action}`) });
+  try {
+    const [wakeBefore] = await f.rows('RuntimeDeliveryWake', { delivery_id: task.deliveryId });
+    assert.equal(await scansAfterStart(scanner, 300), 0, 'the task waits for the compression without a poll');
+    assert.deepEqual(await f.get('RuntimeDeliveryWake', wakeBefore.id), wakeBefore, 'the waiting wake stays untouched');
+  } finally { await scanner.dispose(); }
+  assert.deepEqual(await f.rows('PendingTurnInput', { turn_id: 'root-compress' }), [], 'the compression takes nothing in');
+  await endTurn(f, 'root-compress');
+  await admitPending(f, 'root', 'root-next');
+  for (const sent of [stranded, note, task]) assert.equal((await f.get('RuntimeDelivery', sent.deliveryId)).target_turn_id, 'root-next');
 }));

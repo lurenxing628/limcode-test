@@ -7,6 +7,7 @@ import { CROSS_CONVERSATION_LIMITS, readTurnCollaborationLimits, readTurnCrossCo
 import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { TURN_INTENT_ENVELOPE_CONTENT_TYPE, parseRuntimeContinuationTurnIntentEnvelopeText } from './guidanceIntent';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
+import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { isTransactionAssertionFailure, requirePhaseFId, stablePhaseFId, sqliteUniqueFailureIncludes } from './phaseFIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
@@ -61,7 +62,7 @@ export class CollaborationControlPlane {
     private readonly contentStore: ContentAddressedStore,
     private readonly deliveries: RuntimeDeliveryControlPlane,
     options: { now?: () => string } = {}
-  ) { this.now = options.now ?? (() => new Date().toISOString()); this.router = new AutomaticRuntimeDeliveryRouter(database); }
+  ) { this.now = options.now ?? (() => new Date().toISOString()); this.router = new AutomaticRuntimeDeliveryRouter(database, contentStore); }
 
   /** Team roster only. Conversations outside the derived team are never listed here. */
   public async listMembers(conversationId: string) {
@@ -198,14 +199,18 @@ export class CollaborationControlPlane {
     turns.sort(compareNewest);
     const active = turns.filter((turn) => turn.status === 'active');
     if (active.length > 1) throw new Error('Collaboration target has multiple active Turns.');
-    if (input.onlyIfRunning && !active[0]) throw new Error('Collaboration notification target is idle.');
+    // A manual compression or summary rebuild takes nothing in: a running-member notice finds the
+    // target idle, and every other send waits for the next real Turn.
+    const maintenance = active[0] ? await isRuntimeMaintenanceTurn(this.database, this.contentStore, String(active[0].id)) : false;
+    if (input.onlyIfRunning && (!active[0] || maintenance)) throw new Error('Collaboration notification target is idle.');
     const fence = active[0] ? await this.rows('TurnFinalOutputFence', { turn_id: active[0].id }) : [];
     if (input.onlyIfRunning && fence.length) throw new Error('Collaboration notification target has completed its output.');
     // A queued send is anchored to the running Turn; routing only proceeds once that Turn has ended.
     const queuedTurnId = input.queueBehindActiveTurn && active[0] ? String(active[0].id) : null;
-    const currentTurnId = !queuedTurnId && active[0] && !fence.length ? String(active[0].id) : null;
+    const currentTurnId = !queuedTurnId && active[0] && !maintenance && !fence.length ? String(active[0].id) : null;
+    const waitingTurnId = queuedTurnId ?? (maintenance ? String(active[0].id) : null);
     const now = this.now();
-    const routingSteps: RepositoryTransactionStep[] = queuedTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(queuedTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: queuedTurnId })] : currentTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(currentTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: currentTurnId }), DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: currentTurnId })] : active[0] ? [DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fence[0].id), { turn_id: active[0].id })] : [DOMAIN_REPOSITORIES.domain('Turn').assertNone({ conversation_id: targetConversationId, status: 'active' })];
+    const routingSteps: RepositoryTransactionStep[] = waitingTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(waitingTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: waitingTurnId })] : currentTurnId ? [DOMAIN_REPOSITORIES.domain('Turn').assert(currentTurnId, { status: 'active', conversation_id: targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: currentTurnId }), DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: currentTurnId })] : active[0] ? [DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fence[0].id), { turn_id: active[0].id })] : [DOMAIN_REPOSITORIES.domain('Turn').assertNone({ conversation_id: targetConversationId, status: 'active' })];
     // Cross-conversation sends stop at a fixed backlog per target; replies owed to it never do.
     const inboundSteps = input.crossConversation ? await this.pendingInboundCapacitySteps(targetConversationId) : [];
     const requestId = stablePhaseFId('collaboration_request', messageId);

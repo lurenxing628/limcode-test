@@ -181,7 +181,7 @@ export class AnswerControlPlane {
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
-    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
   }
 
   public async submit(commandInput: AnswerSubmitCommand): Promise<AnswerSubmitResult> {
@@ -1268,10 +1268,11 @@ export class RuntimeDeliveryControlPlane {
 
   public constructor(
     private readonly database: RuntimeDatabase,
+    contentStore: ContentAddressedStore,
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
-    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
   }
 
   public async create(commandInput: RuntimeDeliveryCreateCommand): Promise<RuntimeDeliveryResult & {

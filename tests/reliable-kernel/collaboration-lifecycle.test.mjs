@@ -69,7 +69,7 @@ test('target deletion closes the pending wake and the sender hears the task coul
   // The request is settled by reconcile, which first tells the sender the task could not start.
   const { CollaborationControlPlane } = require(path.join(compiled, 'backend/reliableKernel/collaborationControlPlane.js'));
   const { RuntimeDeliveryControlPlane } = require(path.join(compiled, 'backend/reliableKernel/answerDelivery.js'));
-  const collaboration = new CollaborationControlPlane(database, runtime.store, new RuntimeDeliveryControlPlane(database));
+  const collaboration = new CollaborationControlPlane(database, runtime.store, new RuntimeDeliveryControlPlane(database, runtime.store));
   await collaboration.reconcile();
   assert.equal((await get(database, 'CollaborationRequest', 'request')).state, 'failed');
   const reply = (await collaboration.listMessages({ conversationId: 'sender' })).messages.find(message => message.replyToMessageId === 'followup');
