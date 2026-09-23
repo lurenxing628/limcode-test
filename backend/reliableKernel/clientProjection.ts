@@ -655,7 +655,10 @@ export function executeClientProjectionSnapshot(
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [], childTurnTerminations: [], childTurnExecutorLinks: [],
       childExecutionActivities: [],
       answerBridges: [], answerSubmissions: [],
-      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: []
+      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [],
+      collaborationMessages: [], collaborationMessageSourceLinks: [], collaborationMessageTargetLinks: [],
+      collaborationMessageReplyLinks: [], collaborationRequests: [], collaborationRequestTurnLinks: [],
+      collaborationPeerConversations: []
     };
     if (conversationId === null) {
       database.exec('COMMIT');

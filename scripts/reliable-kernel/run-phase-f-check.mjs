@@ -3928,7 +3928,10 @@ function emptyClientProjection(conversationId) {
       childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
       childExecutionActiveTurnLinks: [], childExecutionActivities: [], childTurns: [], childExecutionLeases: [],
       childTurnTerminations: [], childTurnExecutorLinks: [], answerBridges: [],
-      answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: []
+      answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [],
+      collaborationMessages: [], collaborationMessageSourceLinks: [], collaborationMessageTargetLinks: [],
+      collaborationMessageReplyLinks: [], collaborationRequests: [], collaborationRequestTurnLinks: [],
+      collaborationPeerConversations: []
     }
   };
 }

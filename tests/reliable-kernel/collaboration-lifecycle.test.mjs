@@ -223,6 +223,14 @@ test('a new outgoing message and a retry of its delivery reach the connected sen
   } finally { feed.close(); }
 }));
 
+test('a snapshot without an active conversation carries the same subagent sections as one with it', async () => withRuntime(async (runtime) => {
+  const { database } = runtime;
+  const withConversation = (await database.clientProjectionSnapshot('target')).snapshot.subagentDeliverySummary;
+  const withoutConversation = (await database.clientProjectionSnapshot(null)).snapshot.subagentDeliverySummary;
+  assert.deepEqual(Object.keys(withoutConversation).sort(), Object.keys(withConversation).sort());
+  assert.ok(Object.values(withoutConversation).every((value) => Array.isArray(value) && value.length === 0));
+}));
+
 test('collaboration request identity cannot be rewritten and no per-conversation grant domain exists', () => {
   assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('CollaborationRequest').update('request', { message_id: 'other' }), /immutable|not mutable|cannot|not allowed/);
   assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink'), /ConversationCommunicationLink|unknown|Unknown|not registered/);
