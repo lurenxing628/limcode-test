@@ -785,6 +785,36 @@ test('create_conversation refused by the atomic send after admission leaves no s
   } });
 });
 
+test('create_conversation whose committed send still reports a failure keeps the settings of the conversation it created', { timeout: 60000 }, async () => {
+  const TASK = 'COMMITTED_THEN_FAILED_3306';
+  let rootRound = 0, failed = false;
+  await fixture(async (request, f) => {
+    if (request.conversationId !== ROOT) return answer('created conversation done');
+    rootRound += 1;
+    if (rootRound === 1) return toolsAnswer(call('create', 'create_conversation', { prompt: TASK, title: 'Committed' }));
+    return answer('Created.');
+  }, async f => {
+    const started = await f.input(ROOT, 'create a separate conversation');
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'completed');
+    assert.equal(failed, true);
+    await f.until(async () => (await f.rows('CollaborationRequest'))[0]?.state === 'completed', 'The created conversation never answered.');
+  }, { dispatchHook: async (input, f) => {
+    if (input.toolName !== 'create_conversation' || failed) return;
+    failed = true;
+    // The task and its Conversation commit, then the send still fails, as when its answer is lost.
+    const collaboration = f.app.runtime.collaboration;
+    const original = collaboration.send;
+    collaboration.send = async function(...args) { await original.apply(this, args); throw new Error('answer lost after the commit'); };
+    try {
+      await assert.rejects(f.lifecycle.createForCollaboration({ turnId: input.turnId, toolCallId: input.toolCallId, sourceConversationId: ROOT, prompt: TASK, title: 'Committed' }), /answer lost/);
+    } finally { collaboration.send = original; }
+    const id = kernel.stablePhaseFId('conversation', 'cross-create', input.toolCallId);
+    assert.equal((await f.rows('Conversation', { id })).length, 1, 'fixture: the creation committed');
+    const settings = await f.settingsFor(id);
+    assert.deepEqual([settings.modelProfiles.length, settings.workEnvironments.length], [1, 1], 'the settings of a conversation that exists are never cleared');
+  } });
+});
+
 test('create_conversation with confirmation required waits for approval and creates only after it', { timeout: 60000 }, async () => {
   const TASK = 'APPROVED_CREATE_TASK_3304';
   let rootRound = 0, createdObserved = false;
