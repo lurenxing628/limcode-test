@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { after, test } from 'node:test';
 
@@ -292,7 +293,7 @@ test('every MCP enforcement point named by the contract decides through the shar
   // The behaviour behind each point is pinned above (offering, admission, estimate, gate) and in the settings view tests.
 });
 
-test('MCP tool names do not depend on which server connects first, so a per-tool disable keeps its tool', { timeout: 120000 }, async () => {
+test('MCP tool names do not depend on which server connects first, stay within 64 characters, and a per-tool disable keeps its tool', { timeout: 120000 }, async () => {
   const { McpRuntimeManager, dedupeMcpToolNames } = load('backend/application/mcpRuntimeManager.js');
   const { toolAllowedByPolicy } = load('shared/toolPolicyResolution.js');
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-mcp-names-'));
@@ -308,10 +309,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: process.a
 server.connect(new StdioServerTransport());
 `);
     const config = (id, name, tools, enabled) => ({ id, name, enabled, transport: { kind: 'stdio', command: process.execPath, args: [script, ...tools] }, createdAt: 1, updatedAt: 1 });
+    // A 49-character tool name: with a long server prefix the full name would pass the 64-character
+    // function-name limit of OpenAI and Gemini.
+    const LONG = 'list_all_repository_collaborators_with_permission';
+    const LONG_SERVER = 'A very long server name that keeps going for quite a while';
     const servers = [
-      ['mcp-server-a', '搜索服务', ['search']], ['mcp-server-b', '文件工具', ['search']],
+      ['mcp-server-a', '搜索服务', ['search']], ['mcp-server-b', '文件工具', ['search', LONG]],
       ['mcp-upper', 'Search!', ['find']], ['mcp-lower', 'search?', ['find']],
-      ['mcp-exa', 'exa', ['search']]
+      ['mcp-exa', 'exa', ['search']],
+      ['mcp-long-1', LONG_SERVER, [LONG]], ['mcp-long-2', `${LONG_SERVER}!`, [LONG]]
     ];
     /** Connects the servers one at a time in this order, as separate refreshes would; returns sourceId/original name -> tool name. */
     const namesConnectingIn = async (order) => {
@@ -323,7 +329,7 @@ server.connect(new StdioServerTransport());
           settings = { servers: servers.map(([id, name, tools]) => config(id, name, tools, enabled.has(id))) };
           await manager.refreshFromSettings({ discover: true });
         }
-        assert.deepEqual(manager.sourceRecords().map(source => source.status), servers.map(() => 'connected'));
+        assert.deepEqual(manager.sourceRecords().map(source => source.status), servers.map(([id]) => order.includes(id) ? 'connected' : 'disabled'));
         return Object.fromEntries(dedupeMcpToolNames(manager.runtimeTools(), ['read', 'search', 'run_agent'])
           .map(tool => [`${tool.declaration.source.sourceId}/${tool.declaration.source.originalToolName}`, tool.declaration.name]));
       } finally { await manager.dispose(); }
@@ -334,7 +340,25 @@ server.connect(new StdioServerTransport());
     assert.deepEqual(backward, forward, 'the same tool gets the same name whichever server connected first');
     assert.equal(new Set(Object.values(forward)).size, Object.keys(forward).length, 'names stay unique');
     assert.equal(forward['mcp-exa/search'], 'exa_search', 'an ordinary server name keeps its prefix');
-    assert.notEqual(forward['mcp-server-a/search'], forward['mcp-server-b/search']);
+    // A server name with no ASCII letters falls back to a short stable hash of the server id, never the whole id.
+    const hash8 = (value) => createHash('sha256').update(value).digest('hex').slice(0, 8);
+    assert.equal(forward['mcp-server-a/search'], `mcp-${hash8('mcp-server-a')}_search`);
+    assert.equal(forward['mcp-server-b/search'], `mcp-${hash8('mcp-server-b')}_search`);
+    assert.equal(forward[`mcp-server-b/${LONG}`], `mcp-${hash8('mcp-server-b')}_${LONG}`, '14 + 49 characters fit');
+    for (const [key, name] of Object.entries(forward)) {
+      assert.ok(name.length <= 64, `${key} -> ${name} (${name.length})`);
+      assert.match(name, /^[a-zA-Z0-9_-]+$/);
+    }
+    // Too long a name is cut to 64 with a hash of the whole name; the same cut name from another server is told apart.
+    const longOne = forward[`mcp-long-1/${LONG}`], longTwo = forward[`mcp-long-2/${LONG}`];
+    const full = `a-very-long-server-name-that-keeps-going-for-quite-a-while_${LONG}`;
+    assert.equal(longOne, `${full.slice(0, 55)}_${hash8(full)}`);
+    assert.equal(longTwo.length, 64);
+    assert.notEqual(longTwo, longOne);
+    // The names of one fallback-named server do not change when the other one is not connected.
+    const aloneA = await namesConnectingIn(['mcp-server-a']);
+    assert.equal(aloneA['mcp-server-a/search'], forward['mcp-server-a/search']);
+    assert.deepEqual(await namesConnectingIn(ids), forward, 'the names are the same on every run');
 
     // A per-tool disable names the tool as its server does, so it disables that tool, and only it, whatever the display names.
     const policy = { allowedTools: [], sourceConfigs: { 'mcp-server-a': { enabled: true, disabledTools: ['search'] }, 'mcp-server-b': { enabled: true } } };

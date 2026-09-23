@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServerConfigRecord, McpServersSettingsRecord, McpToolSourceRecord } from '../../shared/protocol';
@@ -327,18 +328,33 @@ function mcpToolDeclaration(source: McpServerConfigRecord, tool: Tool): ToolDefi
   };
 }
 
+/** OpenAI and Gemini refuse function names longer than this. */
+export const MCP_TOOL_NAME_MAX_LENGTH = 64;
+
 /**
  * AI 可见的工具名：`服务名_原始工具名`。服务名做 slug 保证字符合法，原始工具名保持原样以便和
- * MCP 服务自身文档一致。服务名 slug 后为空（例如全是中文）时改用服务的稳定 id，不同服务不会
- * 因此落到同一个前缀；普通 ASCII 服务名的工具名保持不变。仍然重名时由
- * {@link dedupeMcpToolNames} 按来源 id 的固定顺序消歧。
+ * MCP 服务自身文档一致。服务名 slug 后为空（例如全是中文）时改用 `mcp-<服务 id 的 8 位哈希>`，
+ * 前缀短而稳定，不同服务也不会落到同一个前缀；普通 ASCII 服务名的工具名保持不变。超过 64 个字符
+ * 的名字截短并接上整名的哈希（{@link capMcpToolName}）。仍然重名时由 {@link dedupeMcpToolNames}
+ * 按来源 id 的固定顺序消歧。
  */
 function mcpToolDisplayName(source: McpServerConfigRecord, toolName: string): string {
-  return `${slug(source.name) || slug(source.id) || 'tool'}_${toolName}`;
+  return capMcpToolName(`${slug(source.name) || `mcp-${shortHash(source.id)}`}_${toolName}`);
+}
+
+/** A name within {@link MCP_TOOL_NAME_MAX_LENGTH}: longer ones keep their start and end with `_<8-character hash of the whole name>`. */
+function capMcpToolName(name: string): string {
+  if (name.length <= MCP_TOOL_NAME_MAX_LENGTH) return name;
+  const hash = shortHash(name);
+  return `${name.slice(0, MCP_TOOL_NAME_MAX_LENGTH - hash.length - 1)}_${hash}`;
+}
+
+function shortHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 8);
 }
 
 /**
- * 消歧一批工具定义的名字：遇到与 `reserved`（含内置工具名）或彼此重名时追加 `_2`、`_3`…
+ * 消歧一批工具定义的名字：遇到与 `reserved`（含内置工具名）或彼此重名时追加 `_2`、`_3`…（仍不超过 64 个字符）
  * 按来源 id 排序后再分配后缀（同一来源内保持服务列出的顺序），所以名字与服务连上的先后无关；
  * 但另一个服务断开、停用或被删除时，显示名仍可能换到别的服务的工具上。因此保存的设置都按
  * sourceId + originalToolName 识别工具（见 shared/toolPolicyResolution 的 mcpToolIdentity 与
@@ -353,7 +369,7 @@ export function dedupeMcpToolNames(tools: ToolDefinition[], reserved: Iterable<s
   return ordered.map((tool) => {
     const base = tool.declaration.name;
     let name = base;
-    for (let suffix = 2; used.has(name); suffix += 1) name = `${base}_${suffix}`;
+    for (let suffix = 2; used.has(name); suffix += 1) name = capMcpToolName(`${base}_${suffix}`);
     used.add(name);
     return name === base ? tool : { ...tool, declaration: { ...tool.declaration, name } };
   });
