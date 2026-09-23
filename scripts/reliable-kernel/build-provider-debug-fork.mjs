@@ -6,8 +6,9 @@ import { execFileSync } from 'node:child_process';
 
 const root = process.cwd();
 const directory = path.join(root, 'vendor');
-const revision = '3cb58dad30bda99d7c414ba5dd230745e6298bdb';
-const archive = 'unified-llm-provider-0.1.35-limcode.2.tgz';
+const revision = '7857da99d5faec0865b8a402eb9c9d828f87b114';
+const version = '0.1.37-limcode.3';
+const archive = `unified-llm-provider-${version}.tgz`;
 const patch = 'unified-llm-provider.patch';
 const manifest = path.join(directory, 'provider-debug-provenance.json');
 const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -33,9 +34,9 @@ if (process.argv.includes('--check')) {
     run('npm', ['run', 'build']);
     run('npm', ['pack', '--ignore-scripts', '--pack-destination', directory]);
     fs.writeFileSync(manifest, JSON.stringify({
-      upstreamPackage: 'unified-llm-provider@0.1.35',
+      upstreamPackage: 'unified-llm-provider@0.1.37',
       upstreamCommit: revision,
-      version: '0.1.35-limcode.2',
+      version,
       archive,
       archiveSha256: sha256(path.join(directory, archive)),
       patchSha256: sha256(path.join(directory, patch))
