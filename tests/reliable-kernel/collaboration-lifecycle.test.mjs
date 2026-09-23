@@ -189,6 +189,40 @@ test('the sender sees the target delivery of its own outgoing message, including
   } finally { feed.close(); }
 }));
 
+test('a new outgoing message and a retry of its delivery reach the connected sender live', async () => withRuntime(async (runtime) => {
+  const { database } = runtime;
+  await database.transaction([row('Turn', { id: 'sender-turn', conversation_id: 'sender', status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW })]);
+  const feed = new kernel.BoundedClientFeed(database);
+  const received = [];
+  const settle = async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    const update = received.at(-1);
+    assert.equal(update.type, 'reliable-kernel.changes');
+    feed.acknowledge({ sessionId: update.sessionId, hostBootId: update.hostBootId, messageSeq: update.messageSeq });
+    return update;
+  };
+  try {
+    const connection = await feed.connect({ activeConversationId: 'sender', send: (message) => received.push(message) });
+    feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: received[0].messageSeq });
+    await seedMessage(runtime, 'fresh', 'message', 'target', 'sent while connected', 'sender', { sourceTurnId: 'sender-turn' });
+    let update = await settle();
+    assert.equal(update.changes.find((value) => value.type === 'RuntimeDelivery' && value.id === 'fresh-delivery')?.record?.state, 'pending',
+      'the delivery of a message sent after the snapshot reaches the sender');
+    await database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update('fresh-delivery', { state: 'failed', failure_reason: 'wake-dead-letter:retry', updated_at: NOW }),
+      row('RuntimeDelivery', { id: 'fresh-delivery-2', inbox_item_id: 'fresh-inbox', target_conversation_id: 'target', target_turn_id: null, phase: 'next_turn', attempt_seq: 2n,
+        retry_of_delivery_id: 'fresh-delivery', state: 'pending', failure_reason: null, created_at: NOW, updated_at: NOW })
+    ]);
+    update = await settle();
+    assert.equal(update.changes.find((value) => value.type === 'RuntimeDelivery' && value.id === 'fresh-delivery-2')?.record?.attempt_seq, '2',
+      'a retry attempt reaches the sender too, so the newest attempt decides the card');
+    const before = received.length;
+    await seedMessage(runtime, 'others', 'message', 'unrelated', 'between others', 'target');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(received.length, before, 'deliveries of other Conversations’ new messages stay out');
+  } finally { feed.close(); }
+}));
+
 test('collaboration request identity cannot be rewritten and no per-conversation grant domain exists', () => {
   assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('CollaborationRequest').update('request', { message_id: 'other' }), /immutable|not mutable|cannot|not allowed/);
   assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('ConversationCommunicationLink'), /ConversationCommunicationLink|unknown|Unknown|not registered/);
