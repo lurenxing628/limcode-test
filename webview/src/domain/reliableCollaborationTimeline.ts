@@ -21,26 +21,38 @@ export interface CollaborationTimelineCard {
 export interface CollaborationTimeline {
   /** Rendered above the anchor message: a delivery that started the anchor Turn. */
   beforeMessage: Record<string, CollaborationTimelineCard[]>;
-  /** Rendered below the anchor message: received or sent while the anchor Turn ran. */
+  /**
+   * Rendered below the anchor message: received or sent while the anchor Turn ran, or an incoming
+   * message that failed before reaching a Turn, after the last message created before it was sent.
+   */
   afterMessage: Record<string, CollaborationTimelineCard[]>;
-  /** Incoming messages that still wait for a target Turn or failed before reaching one. */
+  /**
+   * Incoming messages that still wait for a target Turn, and the newest few failed ones sent after
+   * every loaded message.
+   */
   unbound: CollaborationTimelineCard[];
 }
 
+/** Failed incoming cards newer than every loaded message that stay pinned below the timeline. */
+export const MAX_PINNED_FAILED_COLLABORATION_CARDS = 3;
+
 /**
  * Places each collaboration envelope at the first visible message of the Turn it belongs to: the
- * delivery Turn for incoming messages and the sending Turn for outgoing ones. Messages whose Turn is
- * outside the loaded window are omitted instead of being shown at a misleading position.
+ * delivery Turn for incoming messages and the sending Turn for outgoing ones. An incoming message
+ * that failed before reaching a Turn sits after the last message created before it was sent. Messages
+ * whose position is outside the loaded window are omitted instead of being shown at a misleading
+ * position.
  */
 export function projectCollaborationTimeline(input: {
   conversationId: string;
   records: FeedRecords;
-  messages: ReadonlyArray<{ id: string; role: string }>;
+  messages: ReadonlyArray<{ id: string; role: string; createdAt?: number }>;
   turnIdByMessageId: Readonly<Record<string, string>>;
   /** Conversations this view saw removed; only these (or a deleted status) read as deleted. */
   removedConversationIds: readonly string[];
 }): CollaborationTimeline {
   const result: CollaborationTimeline = { beforeMessage: {}, afterMessage: {}, unbound: [] };
+  const pinnedFailures: CollaborationTimelineCard[] = [];
   if (!input.conversationId) return result;
   const firstMessageByTurn = new Map<string, { id: string; role: string }>();
   for (const message of input.messages) {
@@ -80,7 +92,13 @@ export function projectCollaborationTimeline(input: {
     if (incoming) {
       turnId = text(delivery?.target_turn_id);
       if (!turnId) {
-        if (card.status !== 'settled') result.unbound.push(card);
+        if (card.status === 'waiting') result.unbound.push(card);
+        else if (card.status === 'failed') {
+          const sentAt = timestamp(message.created_at);
+          const anchor = sentAt === undefined ? undefined : lastMessageCreatedBy(input.messages, sentAt);
+          if (anchor === 'after-all' || sentAt === undefined) pinnedFailures.push(card);
+          else if (anchor) (result.afterMessage[anchor] ??= []).push(card);
+        }
         continue;
       }
     } else {
@@ -93,7 +111,29 @@ export function projectCollaborationTimeline(input: {
     const bucket = incoming && anchor.role !== 'user' ? result.beforeMessage : result.afterMessage;
     (bucket[anchor.id] ??= []).push(card);
   }
+  result.unbound.push(...pinnedFailures.slice(-MAX_PINNED_FAILED_COLLABORATION_CARDS));
   return result;
+}
+
+/**
+ * The last loaded message created at or before `at`; `after-all` when every loaded message is older
+ * (the card belongs below the newest), undefined when it predates the loaded window.
+ */
+function lastMessageCreatedBy(messages: ReadonlyArray<{ id: string; createdAt?: number }>, at: number): string | 'after-all' | undefined {
+  let anchor: string | undefined;
+  let newer = false;
+  for (const message of messages) {
+    if (typeof message.createdAt !== 'number' || message.createdAt <= 0) continue;
+    if (message.createdAt <= at) anchor = message.id;
+    else newer = true;
+  }
+  if (anchor && !newer) return 'after-all';
+  return anchor;
+}
+
+function timestamp(value: PlainData | undefined): number | undefined {
+  const parsed = typeof value === 'string' ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 export function collaborationCardLabel(card: CollaborationTimelineCard): string {

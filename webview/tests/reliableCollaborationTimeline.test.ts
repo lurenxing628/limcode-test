@@ -176,3 +176,36 @@ test('failed deliveries are shown: an incoming one waits in the unbound list, an
   assert.equal(collaborationCardStatusLabel(timeline.unbound[0]), '投递失败');
   assert.equal(collaborationCardStatusLabel(timeline.afterMessage['self-message'][2]), '等待对方处理');
 });
+
+test('a failed incoming card sits where it was sent; only the newest few newer than every message stay pinned', () => {
+  const at = (ms: number) => new Date(ms).toISOString();
+  const timed = (id: string, seq: string, ms: number) => ({ ...message(id, seq, 'followup', id), created_at: at(ms) });
+  const ids = ['early', 'mid-turn', 'between', 'n1', 'n2', 'n3', 'n4'];
+  const times = [500, 1500, 3000, 6000, 7000, 8000, 9000];
+  const timeline = projectCollaborationTimeline({
+    conversationId: 'self',
+    records: {
+      Conversation: byId({ id: 'peer', title: '调研对话', status: 'active' }),
+      CollaborationMessage: byId(...ids.map((id, index) => timed(id, String(index + 1), times[index]))),
+      CollaborationMessageSourceLink: byId(...ids.map(id => source(id, 'peer', 'peer-turn'))),
+      CollaborationMessageTargetLink: byId(...ids.map(id => target(id, 'self'))),
+      RuntimeDelivery: byId(...ids.map(id => delivery(id, null, 'failed')))
+    },
+    messages: [
+      { id: 'first-user', role: 'user', createdAt: 1000 },
+      { id: 'first-reply', role: 'model', createdAt: 2000 },
+      { id: 'second-user', role: 'user', createdAt: 5000 }
+    ],
+    turnIdByMessageId: { 'first-user': 'turn-a', 'first-reply': 'turn-a', 'second-user': 'turn-b' },
+    removedConversationIds: []
+  });
+  const placed = (anchor: string) => (timeline.afterMessage[anchor] ?? []).map(card => card.messageId);
+  assert.deepEqual(placed('first-user'), ['mid-turn']);
+  assert.deepEqual(placed('first-reply'), ['between'], 'a later Turn no longer leaves the failure pinned at the bottom');
+  assert.deepEqual(placed('second-user'), []);
+  assert.equal(Object.values(timeline.afterMessage).flat().some(card => card.messageId === 'early'), false,
+    'a failure older than the loaded window is not guessed into it');
+  assert.deepEqual(timeline.unbound.map(card => card.messageId), ['n2', 'n3', 'n4'], 'newer than every message: the newest three only');
+  assert.ok(timeline.unbound.every(card => collaborationCardStatusLabel(card) === '投递失败'));
+});
+
