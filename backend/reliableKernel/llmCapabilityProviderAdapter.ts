@@ -2287,7 +2287,7 @@ function capabilityThrownProviderError(error: unknown): Error {
 function classifyProviderFailure(message: string, raw: Record<string, unknown> | undefined): Error {
   const signature = collectErrorSignature(raw, message).toLowerCase();
   const structuredStatus = findNumericStatus(raw);
-  const embeddedStatus = embeddedHttpStatus(signature);
+  const embeddedStatus = embeddedHttpStatus(signature) ?? findPayloadStatusCode(raw);
   const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299))
     && embeddedStatus !== undefined
     ? embeddedStatus
@@ -2404,6 +2404,32 @@ function compactProviderError(payload: Record<string, unknown> | undefined): Err
 function capabilityRetryError(payload: Record<string, unknown> | undefined): Error {
   // A dependency scheduling a retry is not authority to relabel a permanent 4xx as transient.
   return capabilityProviderError(payload);
+}
+
+/**
+ * Relays report upstream failures inside an HTTP 200 SSE payload, for example
+ * `{"error":{"message":"ConnectError","type":"upstream_stream_error"},"status_code":502}`. The error
+ * signature keeps values but not keys, so read the payload's own status code field structurally.
+ */
+function findPayloadStatusCode(value: unknown, depth = 0): number | undefined {
+  if (depth > 5 || value === null || value === undefined || typeof value !== 'object') return undefined;
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 32)) {
+      const nested = findPayloadStatusCode(entry, depth + 1);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ['status_code', 'statusCode', 'http_status']) {
+    const candidate = record[key];
+    if (typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 400 && candidate <= 599) return candidate;
+  }
+  for (const nested of Object.values(record)) {
+    const found = findPayloadStatusCode(nested, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
 }
 
 function embeddedHttpStatus(signature: string): number | undefined {

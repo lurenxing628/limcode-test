@@ -1898,7 +1898,12 @@ test('LLM capability adapter 将 429、流截断、网络错误和所有可恢�
       code: 'LLM_TRANSPORT_TIMEOUT', phase: 'first_event'
     }, 'connection_interrupted'],
     ['temporary failure', { status: 503 }, 'temporary_service_error'],
-    ['Upstream request failed', undefined, 'temporary_service_error']
+    ['Upstream request failed', undefined, 'temporary_service_error'],
+    // A relay reports the upstream failure inside an HTTP 200 SSE payload (live gateway capture).
+    ['stream_error', {
+      kind: 'stream_error', status: 200,
+      rawChunk: { error: { message: 'ConnectError', type: 'upstream_stream_error' }, status_code: 502 }
+    }, 'temporary_service_error']
   ]) {
     const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
       emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
