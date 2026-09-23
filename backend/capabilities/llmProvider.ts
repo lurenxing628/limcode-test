@@ -3686,19 +3686,6 @@ export function planCompressionSummaryCalls(
     return plan(1);
   }
   const targetTokens = effectiveSummaryTargetTokens(methodConfig);
-  // Each chunk carries less transcript than one call may hold, so a transcript clearly beyond the
-  // whole leaf budget cannot fit and is reported without running the splitter over all of it.
-  const leafLimitTokens = summaryProviderInputLimitTokens(
-    buildSegmentDeltaCall([], 0, '', methodConfig, settings, targetTokens),
-    settings
-  );
-  const transcriptTokens = estimateTokenCount(JSON.stringify(renderContentsForSummary(sourceContents)));
-  if (leafLimitTokens > 0
-    && transcriptTokens > leafLimitTokens * MAX_SEGMENTED_SUMMARY_LEAF_CALLS * SEGMENTED_SUMMARY_PLAN_OVERFLOW_MARGIN) {
-    throw new Error(
-      `compression_source_too_large: segmented summary exceeds the ${MAX_SEGMENTED_SUMMARY_LEAF_CALLS}-leaf call budget.`
-    );
-  }
   const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, settings);
   const placeholder = (tokens: number): SegmentedSummaryNode => ({
     summary: fitTextToTokenLimit('summary '.repeat(tokens), tokens),
@@ -3745,6 +3732,20 @@ function buildSegmentedSummaryProviderCalls(
     : request.contents.length > 0 ? [request.contents] : [])
     .filter((segment) => segment.length > 0);
   if (sourceSegments.length === 0) return [];
+  // Every packing call carries the same generation config, so they share one input limit.
+  const packingLimitTokens = summaryProviderInputLimitTokens(
+    buildSegmentDeltaCall([], 0, '', methodConfig, settings, totalTargetTokens),
+    settings
+  );
+  // Every chunk carries less transcript than one call may hold, so a transcript clearly beyond the
+  // whole leaf budget cannot fit; report it before splitting the whole source chunk by chunk.
+  const transcriptTokens = estimateTokenCount(JSON.stringify(renderContentsForSummary(sourceSegments.flat())));
+  if (packingLimitTokens > 0 && transcriptTokens
+    > packingLimitTokens * MAX_SEGMENTED_SUMMARY_LEAF_CALLS * SEGMENTED_SUMMARY_BUDGET_OVERFLOW_MARGIN) {
+    throw new Error(
+      `compression_source_too_large: segmented summary exceeds the ${MAX_SEGMENTED_SUMMARY_LEAF_CALLS}-leaf call budget.`
+    );
+  }
   const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
   const units: SegmentedSummaryUnit[] = sourceSegments.flatMap((segment) =>
     groupAtomicMessageContents(segment).map((group) => ({
@@ -3768,8 +3769,6 @@ function buildSegmentedSummaryProviderCalls(
     callFor(contents, index),
     settings
   );
-  // Every packing call carries the same generation config, so they share one input limit.
-  const packingLimitTokens = summaryProviderInputLimitTokens(callFor([], 0), settings);
   // Upper bound on the current chunk's call tokens; undefined until the next exact measurement.
   let currentCallTokensBound: number | undefined;
   const pushCurrent = (): void => {
@@ -4154,7 +4153,7 @@ const MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS = 6;
 const SEGMENTED_SUMMARY_CONCURRENCY = 3;
 const SEGMENTED_PRIOR_CONTEXT_TOKENS = 1_024;
 const SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS = 4;
-const SEGMENTED_SUMMARY_PLAN_OVERFLOW_MARGIN = 1.1;
+const SEGMENTED_SUMMARY_BUDGET_OVERFLOW_MARGIN = 1.1;
 const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 8_192;
 const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 2;
 const SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS = 8_000;
