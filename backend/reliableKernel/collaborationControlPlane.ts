@@ -573,9 +573,21 @@ export class CollaborationControlPlane {
     const persisted = await this.maybe('CollaborationBudget', String(budget.id));
     if (persisted && (persisted.origin_kind !== budget.origin_kind || persisted.origin_key !== budget.origin_key || persisted.authority_turn_id !== budget.authority_turn_id)) throw new Error('Collaboration budget identity conflicts.');
     const requests = await this.rows('CollaborationRequest', { budget_id: budget.id, automatic: 1n });
-    const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, String(budget.authority_turn_id))).maxAutomaticFollowups;
+    const limit = await this.followupBudgetLimit(String(budget.authority_turn_id));
     if (requests.length >= limit) throw new Error(`Automatic followup budget exhausted (${limit}).`);
     return { budget, persisted: persisted !== null, requests };
+  }
+  /**
+   * The budget's limit is frozen in the Turn that started the chain. Deleting that Turn's
+   * Conversation ends the chain it funded: the tasks it started may finish their own work and send
+   * plain messages, but they no longer spend its budget on followups or new conversations.
+   */
+  private async followupBudgetLimit(authorityTurnId: string): Promise<number> {
+    try { return (await readTurnCollaborationLimits(this.database, this.contentStore, authorityTurnId)).maxAutomaticFollowups; }
+    catch (error) {
+      if (await this.maybe('Turn', authorityTurnId)) throw error;
+      throw new Error('The conversation that started this task was deleted, so this turn can no longer send followups or create conversations. Nothing was sent; plain messages still work.');
+    }
   }
   private async budgetForTurn(sourceTurnId: string, rootTurnId: string | null): Promise<DomainRow> {
     const visit = async (turnId: string, ancestryRoot: string | null, seen: Set<string>): Promise<DomainRow> => {

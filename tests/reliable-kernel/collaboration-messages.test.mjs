@@ -728,3 +728,19 @@ test('a peer task acknowledged without a Turn fails with one reply', async () =>
   assert.equal(replies.length, 1);
   assert.match((await f.collaboration.readMessage({ conversationId: 'peer-a', messageId: replies[0].messageId })).text, /^Task could not start: /);
 }));
+
+test('a peer continuation whose requester was deleted is refused automatic followups with a clear message', async () => fixture(async f => {
+  const { ConversationDeletionControlPlane } = load('conversationDeletion.js');
+  await topLevel(f, ['peer-a', true], ['target-b', false], ['third-c', false]);
+  const task = await crossSend(f, 'a-asks-b', 'peer-a', 'peer-a-turn', 'target-b', 'followup');
+  await admitContinuation(f, 'target-b', 'b-working', task.deliveryId);
+  // The user deletes A while B's continuation is still running; A's Turn authority goes with it.
+  await endTurn(f, 'peer-a-turn');
+  await new ConversationDeletionControlPlane(f.database).delete('peer-a');
+  const deleted = /conversation that started this task was deleted/;
+  await assert.rejects(crossSend(f, 'b-asks-c', 'target-b', 'b-working', 'third-c', 'followup'), deleted);
+  await f.source('b-creates', 'target-b', 'b-working', 'create_conversation');
+  await assert.rejects(f.collaboration.admitConversationCreation({ turnId: 'b-working', toolCallId: 'b-creates' }), deleted);
+  assert.equal((await crossSend(f, 'b-tells-c', 'target-b', 'b-working', 'third-c', 'message')).accepted, true, 'plain messages still work');
+  assert.equal((await f.rows('CollaborationRequest')).length, 1, 'a refused followup spends nothing');
+}));

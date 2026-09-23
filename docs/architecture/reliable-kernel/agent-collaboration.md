@@ -64,6 +64,7 @@
 跨对话协作不新增设置，只复用已有预算并加几条固定上限（常量 `CROSS_CONVERSATION_LIMITS`，位于 `collaborationPolicy.ts`）：
 
 - 跨对话 followup 和 `create_conversation`（首个任务就是 followup）都计入同一个 `maxAutomaticFollowups` 自动续派预算，写入任何事实之前先检查。
+- 预算上限冻结在开启这条任务链的轮次里。该对话被删除后，它派出的任务仍能完成本轮工作、发送普通消息和读取对话，但不能再续派或新建对话：工具返回明确错误「The conversation that started this task was deleted…」，不写入任何东西。预算记录没有单独保存上限，这样不需要改动 schema；删除发起方也就结束了它资助的自动续派。
 - 每个目标对话最多积压 16 条尚未投递或消费的入站协作消息（`message` 与 `followup` 都计入，来自任何发送方）；超过时拒绝跨对话发送。回送给目标自身请求的完成回复不受限制。
 - 同一个发送轮次的 `create_conversation` 与 `fork_conversation` 调用合计最多 8 次，按已提交的调用顺序计数，重放结果不变。
 - 超过上限时工具返回明确错误，不写入任何东西。

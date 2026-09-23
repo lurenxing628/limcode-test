@@ -463,6 +463,7 @@
       "fork": "commandId-is-ToolCall; completed-history-up-to-the-last-ended-Turn; starts-no-Turn; replay-keeps-the-committed-boundary; never-navigates-the-view",
       "limits": {
         "automaticFollowupBudget": "cross-conversation-followups-and-create_conversation-spend-maxAutomaticFollowups; checked-before-any-write",
+        "deletedChainOrigin": "the-limit-is-frozen-in-the-Turn-that-started-the-chain; once-its-Conversation-is-deleted-tasks-it-started-may-finish-and-send-plain-messages-but-followups-and-create_conversation-get-a-clear-refusal",
         "maxPendingInboundMessages": 16,
         "pendingInbound": "undelivered-message-and-followup-deliveries-from-any-sender-per-target; completion-replies-exempt; enforced-on-cross-conversation-sends",
         "maxConversationSpawnsPerTurn": 8,
