@@ -44,6 +44,7 @@ import {
 import { readNativeSteeringInFlight } from './nativeSteering';
 import {
   compressionOutputTokens,
+  estimateMaterializedContextTokens,
   estimateMessageContentsTokens,
   providerPromptTokens
 } from './contextTokenEstimator';
@@ -748,7 +749,17 @@ export class ReliableContextCompressionCoordinator {
     }
     const projectedProviderTokens = calibrateEstimatorToProvider(projectedTokens, calibration)
       + rooms.calibratedFixedTokens;
-    if (trigger === 'auto' && policy.methodKind !== 'provider_native' && projectedProviderTokens >= decision.estimatedTokens) {
+    // Only the Context changes, so compare the Context before and after in the same local estimator
+    // unit. The level-trigger estimate is not a like-for-like "before": without a Provider anchor it
+    // measures the Context alone, and with one it is Provider-counted, while fixed tokens here are
+    // estimated. Under a small threshold the fixed overhead dominates both sides, so mixing units
+    // skipped compressions that did shrink the Context.
+    const currentContextTokens = estimateMaterializedContextTokens(
+      semanticMaterialized.segments,
+      fullAttachmentCatalogState,
+      fullModelHandleCatalog
+    );
+    if (trigger === 'auto' && policy.methodKind !== 'provider_native' && projectedTokens >= currentContextTokens) {
       // A large protected tail can cross the threshold while the currently eligible prefix is
       // already compact.  The durable ModelRequest makes this decision exact-replayable for this
       // frozen head; treating it as a level-triggered skip keeps the primary Agent Turn alive and
