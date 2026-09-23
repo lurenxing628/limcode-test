@@ -98,6 +98,7 @@ import type {
   OpenAIResponsesNativeResultAdmission
 } from './openAIResponsesNativeControl';
 import { ATTACHMENT_OBSERVATION_PROMPT_REVISION } from '../world/modules/llm/contracts';
+import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import type {
   LlmCompactDryRunResult,
   LlmCompactRequest,
@@ -2386,6 +2387,7 @@ async function buildAnthropicCompactionRequest(
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
   const configuredHeaders = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const requestBody = request.nativeRequestBody ?? settings.requestBody;
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: settings.provider,
     model: settings.model,
@@ -2393,7 +2395,10 @@ async function buildAnthropicCompactionRequest(
     baseUrl: settings.baseUrl,
     ...(settings.contextWindowTokens ? { contextWindow: settings.contextWindowTokens } : {}),
     ...(configuredHeaders ? { headers: configuredHeaders } : {}),
-    ...((request.nativeRequestBody ?? settings.requestBody) ? { requestBody: request.nativeRequestBody ?? settings.requestBody } : {}),
+    ...(requestBody ? { requestBody } : {}),
+    // 与普通请求同一份渠道缓存配置：tools、system 与最后一条 user 消息上的断点位置和写法都相同，
+    // 压缩请求才能读到对话此前写入的缓存（没有任何 cache_control 的请求既不读也不写缓存）。
+    ...unifiedPromptCacheConfigEntry(settings, requestBody),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings,
@@ -2403,12 +2408,23 @@ async function buildAnthropicCompactionRequest(
     request.systemInstruction,
     settings.systemPromptPrefix
   );
-  const result = await provider.dryRun({
-    contents,
-    ...(systemInstruction ? { systemInstruction } : {}),
-    tools: request.tools ?? [],
-    ...(generationConfig ? { generationConfig } : {})
-  }, {
+  // 官方要求压缩请求发送“对话当前的样子”，并使用与对话其余请求相同的 system 与 tools
+  // （https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand）。所以与普通请求走同一个转换：
+  // 存储的工具调用 id 写成 callId（否则接入库按顺序生成 toolu_0、toolu_1…），便携思考签名展开、别家签过的思考摘掉，
+  // ToolSchema 转成函数声明（否则 tools 被编码成空数组），轮内系统消息按同一布局放置（contents 已布局过，再布局一次不变）。
+  const unifiedRequest = toUnifiedRequest(
+    {
+      id: request.id,
+      contents,
+      tools: request.tools ?? [],
+      ...(systemInstruction ? { systemInstruction } : {})
+    },
+    generationConfig,
+    settings.provider,
+    undefined,
+    turnReminderLayoutFor(request, settings)
+  );
+  const result = await provider.dryRun(unifiedRequest, {
     inputFormat: 'unified',
     outputFormat: 'unified',
     stream: false,
@@ -2486,6 +2502,10 @@ function anthropicCompactionBody(value: unknown, methodConfig: LlmCompressionCon
   return body;
 }
 
+/**
+ * 前置提示词与普通请求同样合进系统提示词的同一段文本（prependSystemPromptPrefix：空一行）。
+ * 单独作为一个 part 时 Claude 编码器用单个换行连接各 part，system 文本就与普通请求差一个换行，缓存前缀对不上。
+ */
 function prependSystemInstructionPrefix(
   systemInstruction: MessageContent | undefined,
   prefixInput: string | undefined
@@ -2493,6 +2513,13 @@ function prependSystemInstructionPrefix(
   const prefix = prefixInput?.trim() ?? '';
   if (!prefix) return systemInstruction;
   if (!systemInstruction) return { role: 'user', parts: [{ text: prefix }] };
+  const [first, ...rest] = systemInstruction.parts;
+  if (first && isVisibleTextPart(first)) {
+    return {
+      ...systemInstruction,
+      parts: [{ ...first, text: prependSystemPromptPrefix(first.text, prefix) }, ...rest]
+    };
+  }
   return {
     ...systemInstruction,
     parts: [{ text: prefix }, ...systemInstruction.parts]

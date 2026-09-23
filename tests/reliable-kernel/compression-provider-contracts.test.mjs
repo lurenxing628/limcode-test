@@ -125,7 +125,8 @@ test('Claude on-demand compaction carries frozen system/tools/thinking and prese
     const settings = provider('claude', `${base}/v1`, 'claude-opus-4-6');
     const req = request('provider_native');
     req.systemInstruction = { role: 'user', parts: [{ text: 'FROZEN_SYSTEM' }] };
-    req.tools = [{ functionDeclarations: [{ name: 'read', description: 'Read', parameters: { type: 'object', properties: {} } }] }];
+    // LlmCompactRequest.tools are ToolSchema[] (what the adapter freezes), converted like ordinary request tools.
+    req.tools = [{ name: 'read', description: 'Read', parameters: { type: 'object', properties: {} } }];
     req.nativeGenerationConfig = { maxOutputTokens: 8192, thinkingConfig: { thinkingLevel: 'medium' } };
     req.nativeRequestBody = {};
     const result = await compact(settings, req);

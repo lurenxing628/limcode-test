@@ -67,23 +67,6 @@ function normalized(messages) {
   }));
 }
 
-/**
- * The Anthropic compaction path encodes tool calls without their stored ids (`toolu_0`, …) while ordinary requests keep
- * them (a divergence that predates this change and is independent of the switch). Compare ids by first appearance.
- */
-function withOrdinalToolIds(messages) {
-  const ids = new Map();
-  const ordinal = (id) => {
-    if (!ids.has(id)) ids.set(id, `tool#${ids.size}`);
-    return ids.get(id);
-  };
-  return JSON.parse(JSON.stringify(messages, (key, value) => {
-    if (value && typeof value === 'object' && value.type === 'tool_use') return { ...value, id: ordinal(value.id) };
-    if (value && typeof value === 'object' && value.type === 'tool_result') return { ...value, tool_use_id: ordinal(value.tool_use_id) };
-    return value;
-  }));
-}
-
 function assertPrefix(previous, next, label) {
   const before = normalized(previous.wire.messages);
   const later = normalized(next.wire.messages);
@@ -352,12 +335,15 @@ const LOOP_HISTORY = [{ segmentId: 'seg-model-1', content: REMINDER_K }, { segme
 
 /**
  * sha256(JSON.stringify(...)) of the LlmCompactRequest and the dry-run {url, headers, body} of this Claude native
- * compaction produced by the pre-change build (codex/agent-collaboration e66a79da): switch off, and switch on with
- * a compaction target that is not the conversation's own channel/model, stay exactly that.
+ * compaction with the switch off (and switch on with a compaction target that is not the conversation's own
+ * channel/model). `compact` is what the pre-change build (codex/agent-collaboration e66a79da) produced. `wire` was
+ * re-pinned when the Claude compaction request started to be encoded like ordinary requests
+ * (claude-native-compaction-shaping.test.mjs): stored tool ids instead of `toolu_0`/`toolu_1`, the real tool
+ * definitions instead of `tools: []`, and the channel's cache breakpoints (system in block form); nothing else changed.
  */
 const COMPACTION_BASELINE = {
   compact: 'b710733e7273ff25c4816a81ba909effe94dc978e24c9c4782b9e875d30dbaec',
-  wire: '817ade7da1ba7de9e500aaed3d410e120d7e4f6ade5d9d93834e7cc708ab29e5'
+  wire: 'bccd0de636d8ae778f64c6b42e5dc0c4175b8e60450d398f86d8296ca9f476a8'
 };
 const compactionFingerprint = (rendered) => ({
   compact: sha256(rendered.compact),
@@ -384,7 +370,7 @@ test('(b) Claude 原生压缩：打开后历史提醒与普通请求同位置、
   const compaction = await renderCompaction(compactionRequest({ claudeTurnScopedReminders: true, context, history: LOOP_HISTORY }));
   // The compaction request is the ordinary request without its volatile tail (the current reminder).
   assert.equal(ordinary.messages.at(-1).role, 'system');
-  assert.deepEqual(withOrdinalToolIds(normalized(compaction.body.messages)), withOrdinalToolIds(normalized(ordinary.messages.slice(0, -1))));
+  assert.deepEqual(normalized(compaction.body.messages), normalized(ordinary.messages.slice(0, -1)));
   assert.deepEqual(compaction.body.messages.map((entry) => entry.role), ['user', 'system', 'assistant', 'user', 'system', 'assistant', 'user']);
   assert.deepEqual(systemContents(compaction.body.messages), [REMINDER_K, REMINDER_K1]);
   assertPlacement(compaction.body.messages, 'compaction');
@@ -402,7 +388,7 @@ test('(b) Claude 原生压缩：窗口里重新注入过的输入同样放回原
   const history = [{ segmentId: 'seg-model-k', content: REMINDER_K, reinjectedInput }];
   const ordinary = await render(ordinaryRequest({ claudeTurnScopedReminders: true, context, reminder: REMINDER_K1, history }));
   const compaction = await renderCompaction(compactionRequest({ claudeTurnScopedReminders: true, context, history }));
-  assert.deepEqual(withOrdinalToolIds(normalized(compaction.body.messages)), withOrdinalToolIds(normalized(ordinary.messages.slice(0, -1))));
+  assert.deepEqual(normalized(compaction.body.messages), normalized(ordinary.messages.slice(0, -1)));
   assert.deepEqual(compaction.body.messages.map((entry) => entry.role), ['user', 'user', 'system', 'assistant', 'user']);
   assert.equal(labelCount(compaction.body.messages), 1);
 });
@@ -710,10 +696,12 @@ test('(b) 真实内核：Claude 原生压缩请求带着历史提醒，与上一
     const [compaction] = h.compactions;
     assert.equal(compaction.request.recipe.compressionMethodKind, 'provider_native');
     const before = h.requests.filter(entry => entry.afterCompression === 0).at(-1);
-    const previous = withOrdinalToolIds(normalized(before.wire.messages));
-    const compacted = withOrdinalToolIds(normalized(compaction.wire.messages));
+    const previous = normalized(before.wire.messages);
+    const compacted = normalized(compaction.wire.messages);
     assert.deepEqual(compacted.slice(0, previous.length), previous, 'the last ordinary request is an exact prefix of the compaction request');
     assert.deepEqual(compacted.slice(previous.length).map(entry => entry.role), ['assistant', 'user'], 'plus its output and tool results');
+    assert.deepEqual(compaction.wire.system, before.wire.system, 'the same system blocks and breakpoint');
+    assert.deepEqual(compaction.wire.tools, before.wire.tools, 'the same tools and breakpoint');
     assert.ok(systemContents(compaction.wire.messages).length >= 1, 'the historical reminders are there');
     assertPlacement(compaction.wire.messages, 'compaction');
     assert.equal(betas(compaction.headers).includes(BETA), true);
