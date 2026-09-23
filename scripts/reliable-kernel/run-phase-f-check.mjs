@@ -1189,10 +1189,12 @@ async function checkCancelSubtree() {
       leaseExpiresAt: '2026-08-02T00:00:00.000Z'
     };
     const originalTransaction = ctx.database.transaction.bind(ctx.database);
-    let spawnFaultInjected = false;
+    // spawn retries a transaction assertion failure (a concurrent capacity or membership change),
+    // so the fault stays armed for the whole call: every attempt must roll back its lineage facts.
+    let spawnFaultAttempts = 0;
     ctx.database.transaction = async (steps) => {
-      if (!spawnFaultInjected && steps.some((step) => step.kind === 'insert' && step.domain === 'ChildExecution')) {
-        spawnFaultInjected = true;
+      if (steps.some((step) => step.kind === 'insert' && step.domain === 'ChildExecution')) {
+        spawnFaultAttempts += 1;
         return originalTransaction([
           ...steps,
           kernel.DOMAIN_REPOSITORIES.domain('Conversation').assert('missing-spawn-fault', { status: 'active' })
@@ -1200,8 +1202,12 @@ async function checkCancelSubtree() {
       }
       return originalTransaction(steps);
     };
-    await assert.rejects(ctx.services.children.spawn(atomicSpawnCommand), /assertion failed/);
-    ctx.database.transaction = originalTransaction;
+    try {
+      await assert.rejects(ctx.services.children.spawn(atomicSpawnCommand), /assertion failed/);
+    } finally {
+      ctx.database.transaction = originalTransaction;
+    }
+    assert.ok(spawnFaultAttempts > 1, 'spawn retries an assertion failure before giving up');
     assert.equal((await list(ctx.database, 'ChildExecutionParentLink', {
       source_tool_call_id: atomicTool.toolCallId
     })).length, 0);
@@ -1313,7 +1319,8 @@ async function checkCancelSubtree() {
       leaseOwnerId: 'continued-a-owner',
       leaseExpiresAt: '2026-08-02T00:00:00.000Z'
     });
-    const pendingBTool = await createRunAgentTool(ctx, parent.turnId, 'queue-b-pending');
+    // Only B's own parent Conversation (A) may queue a continuation for it.
+    const pendingBTool = await createRunAgentTool(ctx, continuedA.turnId, 'queue-b-pending');
     const pendingB = await ctx.services.children.send({
       sourceKey: 'queue-b-pending',
       sourceToolCallId: pendingBTool.toolCallId,
@@ -1465,7 +1472,7 @@ async function checkCancelSubtree() {
           childAgentId: 'agent-plan-external',
           modelFallback: CHILD_MODEL_FALLBACK,
           sourceSettlement: 'external',
-          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。只有在用户明确要求提交到其它通道时，才传入当前模型上下文中提供的短 childRef。继续同一子对话、中断或重试不会改变默认通道。`,
+          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。显式 childRef 也必须属于当前子任务，不能提交到其它任务的答案通道。同伴交流使用 send_agent_message，向已有同伴续派任务使用 followup_agent_task。继续同一子对话、中断或重试不会改变默认通道。`,
           completionPolicy: 'background',
           leaseOwnerId: `child-owner-plan-external-${externalEnsureAttempts}`,
           leaseExpiresAt: `2026-08-0${externalEnsureAttempts + 1}T00:00:00.000Z`
