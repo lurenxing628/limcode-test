@@ -96,6 +96,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/plan-interrupt-recovery.test.mjs',
   'tests/reliable-kernel/product-composition.test.mjs',
   'tests/reliable-kernel/provider-semantic-watchdog.test.mjs',
+  'tests/reliable-kernel/llm-finish-reason.test.mjs',
   'tests/reliable-kernel/openai-request-shaping.test.mjs',
   'tests/reliable-kernel/claude-thinking-adaptation.test.mjs',
   'tests/reliable-kernel/provider-parameter-adaptation.test.mjs',

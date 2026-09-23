@@ -597,6 +597,10 @@ async function runLlmAttempt(
     if (hasUnifiedError(response)) {
       throw new LlmAttemptFailureError(failureFromProviderError(response.error, { rawResponse: response.rawResponse }));
     }
+    const abnormalFinish = unifiedPartsHaveVisibleOutputOrToolCall(response.content?.parts)
+      ? undefined
+      : abnormalFinishReason(response.finishReason);
+    if (abnormalFinish) throw new LlmAttemptFailureError(emptyAbnormalFinishFailure(abnormalFinish));
     emitRetryRecovered(request.id, emit, retryRecoveryNotice);
     emitUnifiedResponse(request.id, response, observingEmit(response));
     const completedAt = Date.now();
@@ -620,6 +624,8 @@ async function runLlmAttempt(
   const timing: LlmAttemptTimingState = { streamTimingChunkCount: 0 };
   let activeThoughtBlock: ActiveThoughtBlock | undefined;
   let retryRecoveryPending = retryRecoveryNotice !== undefined;
+  let sawVisibleOutputOrToolCall = false;
+  let lastFinishReason: string | undefined;
   const nativeHooks = controls?.native;
   // 只包装 onController（媒体解析）；onLaneQueueState 等其他本地 hook 原样透传。
   const wrappedNativeHooks: OpenAIResponsesNativeHooks | undefined = nativeHooks
@@ -685,6 +691,8 @@ async function runLlmAttempt(
         });
         throw new LlmAttemptFailureError(failure);
       }
+      if (!sawVisibleOutputOrToolCall && chunkHasVisibleOutputOrToolCall(chunk)) sawVisibleOutputOrToolCall = true;
+      if (typeof chunk.finishReason === 'string' && chunk.finishReason.trim()) lastFinishReason = chunk.finishReason.trim();
       const chunkAt = Date.now();
       const chunkMark = nowMonotonicMs();
       const nativeEvent = (chunk as LimCodeOpenAIResponsesStreamChunk).nativeEvent;
@@ -733,6 +741,9 @@ async function runLlmAttempt(
       }
       emitUnifiedChunk(request.id, chunk, chunkEmit, nativeChain);
     }
+    // 流正常结束但没有任何可见输出和工具调用，且结束原因表示出错、被过滤或被截断：按失败上报，不当成成功的空回复。
+    const abnormalFinish = sawVisibleOutputOrToolCall ? undefined : abnormalFinishReason(lastFinishReason);
+    if (abnormalFinish) throw new LlmAttemptFailureError(emptyAbnormalFinishFailure(abnormalFinish));
   } catch (error) {
     const aborted = isRequestAbort(signal);
     if (activeThoughtBlock) activeThoughtBlock = aborted
@@ -781,6 +792,54 @@ async function runLlmAttempt(
       ...(aggregatedUsageMetadata ? { usageMetadata: aggregatedUsageMetadata } : {})
     }
   });
+}
+
+/**
+ * 表示出错、被过滤或被截断的结束原因（统一格式透传各家原值；Claude 的 max_tokens 映射为 MAX_TOKENS）：
+ * - OpenAI Chat Completions `length`、`content_filter`（https://platform.openai.com/docs/api-reference/chat/object），
+ *   OpenRouter 流中途出错的 `error`（https://openrouter.ai/docs/api-reference/errors）；
+ * - Claude `max_tokens`、`refusal`、`model_context_window_exceeded`
+ *   （https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons）；
+ * - Gemini `MAX_TOKENS`、`SAFETY`、`RECITATION`、`MALFORMED_FUNCTION_CALL`、`PROHIBITED_CONTENT`、`BLOCKLIST`、
+ *   `SPII`、`IMAGE_SAFETY`、`UNEXPECTED_TOOL_CALL`（https://ai.google.dev/api/generate-content#FinishReason）。
+ */
+const ABNORMAL_FINISH_REASONS: ReadonlySet<string> = new Set([
+  'length', 'content_filter', 'error',
+  'max_tokens', 'refusal', 'model_context_window_exceeded',
+  'safety', 'recitation', 'malformed_function_call', 'prohibited_content', 'blocklist', 'spii', 'image_safety',
+  'unexpected_tool_call'
+]);
+
+function abnormalFinishReason(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return ABNORMAL_FINISH_REASONS.has(trimmed.toLowerCase()) ? trimmed : undefined;
+}
+
+/** 可见输出：非思考的非空文字、媒体；以及任何工具调用。思考与 providerContext 不算。 */
+function unifiedPartsHaveVisibleOutputOrToolCall(parts: readonly unknown[] | undefined): boolean {
+  return (parts ?? []).some((part) => isRecord(part) && (
+    (typeof part.text === 'string' && part.thought !== true && part.text.trim().length > 0)
+    || isRecord(part.functionCall)
+    || isRecord(part.inlineData)
+    || isRecord(part.fileData)
+  ));
+}
+
+function chunkHasVisibleOutputOrToolCall(chunk: UnifiedLLMStreamChunk): boolean {
+  if (typeof chunk.textDelta === 'string' && chunk.textDelta.trim()) return true;
+  if ((chunk.functionCalls?.length ?? 0) > 0) return true;
+  if (unifiedPartsHaveVisibleOutputOrToolCall(chunk.partsDelta)) return true;
+  const native = chunk as LimCodeOpenAIResponsesStreamChunk & OpenAIResponsesHttpNativeStreamChunk;
+  if ((native.toolCallArgumentDeltas?.length ?? 0) > 0) return true;
+  if (native.completedContent && unifiedPartsHaveVisibleOutputOrToolCall(native.completedContent.parts)) return true;
+  return Array.isArray(native.completedContents)
+    && native.completedContents.some((content) => unifiedPartsHaveVisibleOutputOrToolCall(content.parts));
+}
+
+function emptyAbnormalFinishFailure(finishReason: string): LlmAttemptFailure {
+  const message = `模型没有返回任何可见内容或工具调用就结束了（结束原因：${finishReason}）。`;
+  return { message, rawError: { kind: 'empty_response', finishReason, message }, createdAt: Date.now() };
 }
 
 async function* streamOpenAIResponsesWithLimCodeSession(input: {

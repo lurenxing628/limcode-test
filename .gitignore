@@ -92,6 +92,7 @@ docs/architecture/*
 !/tests/reliable-kernel/panel-owner-lifecycle.test.mjs
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs
 !/tests/reliable-kernel/provider-semantic-watchdog.test.mjs
+!/tests/reliable-kernel/llm-finish-reason.test.mjs
 !/tests/reliable-kernel/openai-request-shaping.test.mjs
 !/tests/reliable-kernel/claude-thinking-adaptation.test.mjs
 !/tests/reliable-kernel/provider-parameter-adaptation.test.mjs
