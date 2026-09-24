@@ -9,6 +9,7 @@ const artifact = option('artifact');
 const listing = artifact ? listArtifactFiles(artifact) : listWorkspaceCandidateFiles();
 const files = listing.files;
 const manifest = listing.manifest;
+const sqliteBinding = listing.sqliteBinding;
 
 const failures = [];
 const forbidden = [
@@ -58,6 +59,10 @@ const required = [
   'node_modules/better-sqlite3/prebuilds/darwin-arm64.node'
 ];
 for (const file of required) if (!files.includes(file)) failures.push(`安装包缺少必需文件：${file}`);
+if (!sqliteBinding?.includes("process.report?.getReport?.()?.header")
+  || !sqliteBinding.includes("fs.existsSync('/lib/ld-musl-' + loader + '.so.1')")) {
+  failures.push('better-sqlite3 缺少 VS Code Extension Host 的 process.report 兼容修补');
+}
 if (!files.some((file) => file.toLowerCase() === 'readme.md')) failures.push('安装包缺少README');
 if (!files.some((file) => /^license(?:\.[^/]+)?$/i.test(file))) failures.push('安装包缺少LICENSE');
 if (!files.some((file) => file.startsWith('dist/webview/') && file.endsWith('.html'))) failures.push('安装包缺少编译后的网页视图HTML');
@@ -86,7 +91,8 @@ function listWorkspaceCandidateFiles() {
   }
   return {
     files: lines(result.stdout),
-    manifest: JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    manifest: JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')),
+    sqliteBinding: fs.readFileSync(path.join(root, 'node_modules/better-sqlite3/lib/binding.js'), 'utf8')
   };
 }
 
@@ -104,7 +110,8 @@ function listArtifactFiles(relativeArtifactPath) {
       files: archive.names
         .map((file) => file.replace(/^extension\//, ''))
         .filter((file) => file && file !== '[Content_Types].xml' && file !== 'extension.vsixmanifest'),
-      manifest: JSON.parse(manifestBytes.toString('utf8'))
+      manifest: JSON.parse(manifestBytes.toString('utf8')),
+      sqliteBinding: archive.read('extension/node_modules/better-sqlite3/lib/binding.js')?.toString('utf8')
     };
   } catch (error) {
     console.error(`VSIX内容检查失败：无法读取artifact ZIP清单或package.json：${error.message}`);
