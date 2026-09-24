@@ -4558,15 +4558,19 @@ function isStructuredSummaryText(text: string): boolean {
     .every((heading) => source.includes(heading));
 }
 
+/**
+ * 模型给出按标题组织、且有内容的摘要时，它就是最终摘要：模型已拿到旧摘要和新增记录，按提示输出替代它们的最新摘要。
+ * 不再把逐条抽取的原始记录（整段工具调用 / 结果 JSON、原样复制的回复）并进来——实测它们会挤满目标长度，
+ * 把模型自己的总结挤到被截掉的位置。原始记录始终保存在库里，可随时“从原始记录重建摘要”，不会因此永久丢失。
+ * 模型没按标题输出（例如拒答）或各节全是“无”时，才退回逐条抽取的确定性摘要。
+ */
 function finalizeStructuredSummary(candidate: string, fallback: string, targetTokens: number): string {
-  const fallbackSummary = parseStructuredSummary(fallback)
-    ?? structuredSummaryFromLooseText(fallback, 'active');
   requireSummaryVisibleOutput(candidate);
   const parsed = parseStructuredSummary(candidate);
-  if (!parsed || structuredSummaryFactCount(parsed) === 0) {
-    return fitStructuredSummary(fallbackSummary, targetTokens);
-  }
-  return fitStructuredSummary(mergeStructuredSummaries(fallbackSummary, parsed), targetTokens);
+  if (parsed && structuredSummaryFactCount(parsed) > 0) return fitStructuredSummary(parsed, targetTokens);
+  const fallbackSummary = parseStructuredSummary(fallback)
+    ?? structuredSummaryFromLooseText(fallback, 'active');
+  return fitStructuredSummary(fallbackSummary, targetTokens);
 }
 
 function structuredSummaryFactCount(summary: StructuredSummary): number {

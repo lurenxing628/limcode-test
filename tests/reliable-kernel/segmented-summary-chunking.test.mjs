@@ -720,3 +720,67 @@ for (const [provider, baseUrl] of PROVIDERS) {
     assert.ok(result.calls.every((call) => call.bodyText.length < fixture.oversizedToolResult.length));
   });
 }
+
+async function compactWithReply(request, reply) {
+  const server = http.createServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-authoritative', object: 'chat.completion', created: 1, model: 'gpt-test',
+      choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }]
+    }));
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  const capability = createLlmProviderCapability({
+    settings: async () => ({ ...providerConfig('openai-compatible', `http://127.0.0.1:${address.port}/v1`), stream: false }),
+    compressionSettings: async () => undefined
+  });
+  try {
+    const terminal = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('authoritative summary test timed out')), 10_000);
+      capability.compact(request, (event) => {
+        if (event.type === 'llm:compactError') { clearTimeout(timeout); reject(new Error(event.payload.message)); }
+        if (event.type === 'llm:compactDone') { clearTimeout(timeout); resolve(event); }
+      });
+    });
+    return terminal.payload.result.contents[0].parts[0].text;
+  } finally {
+    capability.dispose();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function toolHistoryRequest() {
+  const fixture = compactRequest('openai-compatible');
+  fixture.request.methodConfigSnapshot.llmSummary.targetTokens = 4_000;
+  fixture.request.segments = [[
+    { role: 'user', parts: [{ text: 'SOURCE-USER-ASK: read the config and report its port' }] },
+    { role: 'model', parts: [{ id: 'call-config', functionCall: { name: 'read', args: { path: 'SOURCE-PATH/config.json' } } }] },
+    { role: 'user', parts: [{ id: 'call-config', functionResponse: { name: 'read', response: { content: 'SOURCE-TOOL-RESULT {"port": 8080}' } } }] },
+    { role: 'model', parts: [{ text: 'SOURCE-MODEL-REPLY: the port is 8080.' }] }
+  ]];
+  return fixture.request;
+}
+
+test('a structured model summary is the summary; raw source records are not merged into it', async () => {
+  const reply = [
+    '目标', '- 读取配置并报告端口', '',
+    '重要约束、决定和准确标识', '- 配置文件是 SOURCE-PATH/config.json，端口 8080', '',
+    '工作状态', '  - 已完成', '    - 已读取配置，端口为 8080',
+    '  - 正在做', '    - 无', '  - 受阻', '    - 无', '',
+    '下一步', '- 无', '', '相关文件', '- SOURCE-PATH/config.json'
+  ].join('\n');
+  const text = await compactWithReply(toolHistoryRequest(), reply);
+  assert.match(text, /已读取配置，端口为 8080/);
+  assert.match(text, /配置文件是 SOURCE-PATH\/config\.json/);
+  // Before: every tool call/result was appended as raw JSON and every reply copied verbatim.
+  assert.doesNotMatch(text, /historical_tool_(?:call|result)/);
+  assert.doesNotMatch(text, /SOURCE-TOOL-RESULT|SOURCE-MODEL-REPLY|SOURCE-USER-ASK/);
+});
+
+test('a reply without the required headings (e.g. a refusal) still falls back to the deterministic summary', async () => {
+  const text = await compactWithReply(toolHistoryRequest(), 'I cannot help with that request.');
+  assert.doesNotMatch(text, /I cannot help/);
+  assert.match(text, /SOURCE-USER-ASK/);
+});
