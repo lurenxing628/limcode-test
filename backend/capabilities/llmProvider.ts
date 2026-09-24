@@ -4269,10 +4269,11 @@ async function shortenOversizedSummary(
       ...(call.request.generationConfig ? { generationConfig: call.request.generationConfig } : {})
     }, signal, { allowCompatibilityRetry: false })).trim());
     const reparsed = parseStructuredSummary(shortened);
-    const accepted = !!reparsed && structuredSummaryFactCount(reparsed) > 0;
-    logCompressionDebug('summary.shorten.done', {
-      label: call.label, accepted, shortenedTokens: estimateTokenCount(modelSummaryText(shortened))
-    });
+    const shortenedTokens = estimateTokenCount(modelSummaryText(shortened));
+    // A rewrite that is not actually shorter would only replace the model's first answer with a
+    // second one that the mechanical cut then trims harder.
+    const accepted = !!reparsed && structuredSummaryFactCount(reparsed) > 0 && shortenedTokens < currentTokens;
+    logCompressionDebug('summary.shorten.done', { label: call.label, accepted, shortenedTokens });
     return accepted ? shortened : candidate;
   } catch (error) {
     if (signal?.aborted) throw error;

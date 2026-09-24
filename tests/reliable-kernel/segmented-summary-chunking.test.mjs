@@ -876,3 +876,16 @@ test('a limit too small for the seven empty headings sends no shorten request', 
     assert.ok(text.length > 0);
   }
 });
+
+test('a shorten reply that is not shorter than the original is ignored', async () => {
+  const longer = OVERSIZED_REPLY.replace('- 保留的目标', '- LONGER-SHORTEN-GOAL')
+    + '\n' + Array.from({ length: 20 }, (_, index) => `- src/extra/added-by-shorten-${index}.ts`).join('\n');
+  const sameLength = OVERSIZED_REPLY.replace('- 保留的目标', '- SAMELEN-SHORTEN-GOAL');
+  for (const reply of [longer, sameLength]) {
+    const sent = [];
+    const text = await compactWithReply(oversizedSummaryRequest(), [OVERSIZED_REPLY, reply], sent);
+    assert.equal(sent.length, 2);
+    assert.match(text, /保留的目标/);
+    assert.doesNotMatch(text, /LONGER-SHORTEN-GOAL|SAMELEN-SHORTEN-GOAL|added-by-shorten/);
+  }
+});
