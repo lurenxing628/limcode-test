@@ -72,7 +72,7 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     thinkingLevel: {
       path: 'reasoning_effort / thinking.type / enable_thinking',
       label: '思考强度',
-      description: '按“思考参数写法”发送：OpenAI 写法为 reasoning_effort；DeepSeek、Kimi、智谱等为 thinking.type + reasoning_effort；百炼、硅基流动为 enable_thinking。模型不接受的强度会换成最接近的值。'
+      description: '按“思考参数写法”发送：OpenAI 写法原样发 reasoning_effort；DeepSeek 写法（DeepSeek、Kimi、智谱等）用 thinking.type 开关思考，enable_thinking 写法（百炼、硅基流动等）用 enable_thinking 开关，模型接受强度时再带 reasoning_effort。模型不接受的强度按模型规则换成相近的档位；只开关思考的模型只发开关；关不掉思考的模型选“关闭”时不发送任何思考参数。'
     }
   },
   'openai-responses': {

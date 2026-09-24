@@ -321,7 +321,7 @@ test('测试证据作为 probed 传入：写法与规则取自测试结果，手
   assert.equal(dialect.rule.canDisable, false);
   assert.deepEqual(dialect.rule.efforts, ['high', 'max']);
   assert.deepEqual(openAICompatibleEffortValues(dialect), ['high', 'max']);
-  assert.equal(describeOpenAICompatibleDialect(dialect), 'enable_thinking 写法（百炼、硅基流动等） · 按测试结果');
+  assert.equal(describeOpenAICompatibleDialect(dialect), 'enable_thinking 写法（enable_thinking + reasoning_effort，关不掉思考） · 按测试结果');
   // 平台相关的回传行为仍按平台和写法计算。
   assert.equal(resolveOpenAICompatibleDialect(DEEPSEEK, 'renamed', undefined, { format: 'deepseek', canDisable: true, efforts: [] }).toolContentArrays, true);
   const manual = resolveOpenAICompatibleDialect(RELAY, 'renamed-model', 'deepseek', probed);
@@ -598,4 +598,22 @@ test('“跟随渠道”显示实际发出的值：换算后的强度、只开�
   assert.equal(label(OPENROUTER, 'deepseek/deepseek-v4-pro', 'medium'), 'medium');
   assert.equal(label(DEEPSEEK, 'deepseek-v4-pro', 'high', { openaiCompatibleThinkingFormat: 'omit' }), 'high，不发送思考参数');
   assert.equal(sessionThinkingDisplayLabel('openai-compatible', 'deepseek-v4-pro', undefined, settings(DEEPSEEK, 'deepseek-v4-pro')), '未设置（由服务决定）');
+});
+
+test('写法说明按模型写准：Kimi K3 只发强度、MiMo 与 GLM-4.x 只发开关，百炼按模型区分', () => {
+  const describe = (baseUrl, model) => describeOpenAICompatibleDialect(resolveOpenAICompatibleDialect(baseUrl, model));
+  assert.equal(describe(DEEPSEEK, 'deepseek-v4-pro'), 'DeepSeek 写法（thinking.type + reasoning_effort） · 按接口地址识别：DeepSeek 官方');
+  assert.equal(describe(MOONSHOT, 'kimi-k3'), 'DeepSeek 写法（这个模型只发 reasoning_effort，关不掉思考） · 按接口地址识别：Kimi（月之暗面）');
+  assert.equal(describe('https://api.xiaomimimo.com/v1', 'mimo-v2-pro'), 'DeepSeek 写法（这个模型只发 thinking.type 开关） · 按接口地址识别：小米 MiMo');
+  assert.equal(describe(ZHIPU, 'glm-4.6'), 'DeepSeek 写法（这个模型只发 thinking.type 开关） · 按接口地址识别：智谱');
+  assert.equal(describe(ZHIPU, 'glm-5.3'), 'DeepSeek 写法（thinking.type + reasoning_effort，关不掉思考） · 按接口地址识别：智谱');
+  assert.equal(describe(DASHSCOPE, 'qwen3-max'), 'enable_thinking 写法（这个模型只发 enable_thinking 开关） · 按接口地址识别：阿里百炼');
+  assert.equal(describe(DASHSCOPE, 'deepseek-v4-pro'), 'enable_thinking 写法（enable_thinking + reasoning_effort） · 按接口地址识别：阿里百炼');
+  const fs = require('node:fs');
+  const definitions = fs.readFileSync('webview/src/components/settings/global/parameters/llmParameterDefinitions.ts', 'utf8');
+  assert.doesNotMatch(definitions, /换成最接近的值/);
+  assert.match(definitions, /关不掉思考的模型选“关闭”时不发送/);
+  const editor = fs.readFileSync('webview/src/components/settings/global/LlmAdvancedConfigEditor.vue', 'utf8');
+  assert.match(editor, /当前发送（\{\{ config\.model \}\}）/);
+  assert.match(editor, /依次看手动指定、测试结果、接口地址和模型 ID/);
 });

@@ -463,7 +463,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         title="选择思考参数的发送写法"
         @update:model-value="updateThinkingFormat"
       />
-      <span class="stream-checkbox-text">当前发送：{{ thinkingFormatSummary }}。先按接口地址识别服务商，认不出的中转站再看模型 ID；只有识别不对（例如中转站改了模型名）时才需要手动指定。</span>
+      <span class="stream-checkbox-text">当前发送（{{ config.model }}）：{{ thinkingFormatSummary }}。依次看手动指定、测试结果、接口地址和模型 ID；只有识别不对（例如中转站改了模型名）时才需要手动指定。</span>
     </div>
 
     <template v-if="config.provider === 'openai-responses'">

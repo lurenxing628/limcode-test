@@ -381,9 +381,28 @@ export const OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS: Record<OpenAICompatibleTh
   omit: '不发送思考参数'
 };
 
-/** 设置界面上说明自动识别的结果，例如“DeepSeek 写法 · 按接口地址识别：DeepSeek 官方”。 */
+/**
+ * 按模型写准的写法说明：Kimi K3 只发 reasoning_effort，MiMo、GLM-4.x 只发开关，关不掉思考的模型注明。
+ * 认不出模型（例如手动指定）时用写法本身的说明。
+ */
+function dialectFormatLabel(dialect: OpenAICompatibleDialect): string {
+  const rule = dialect.rule;
+  if (!rule || (dialect.format !== 'deepseek' && dialect.format !== 'enable_thinking')) {
+    return OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS[dialect.format];
+  }
+  const name = dialect.format === 'deepseek' ? 'DeepSeek 写法' : 'enable_thinking 写法';
+  const toggle = dialect.format === 'deepseek' ? 'thinking.type' : 'enable_thinking';
+  const values = openAICompatibleEffortValues(dialect);
+  const sendsEffort = values === 'any' || values.length > 0;
+  const sent = rule.toggle === false
+    ? sendsEffort ? '这个模型只发 reasoning_effort' : '这个模型不发思考参数'
+    : sendsEffort ? `${toggle} + reasoning_effort` : `这个模型只发 ${toggle} 开关`;
+  return `${name}（${sent}${rule.canDisable ? '' : '，关不掉思考'}）`;
+}
+
+/** 设置界面上说明自动识别的结果，例如“DeepSeek 写法（thinking.type + reasoning_effort） · 按接口地址识别：DeepSeek 官方”。 */
 export function describeOpenAICompatibleDialect(dialect: OpenAICompatibleDialect): string {
-  const format = OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS[dialect.format];
+  const format = dialectFormatLabel(dialect);
   switch (dialect.source) {
     case 'manual': return `${format} · 手动指定`;
     case 'probe': return `${format} · 按测试结果`;
