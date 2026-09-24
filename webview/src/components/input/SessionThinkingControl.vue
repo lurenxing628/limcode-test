@@ -13,7 +13,7 @@ const localError = ref('');
 // A model's advanced configuration replaces (rather than merges with) channel defaults.
 const settings = computed(() => props.config?.modelConfigs.find(item => item.modelId === props.model) ?? props.config);
 const capability = computed(() => props.config && props.model
-  ? sessionThinkingCapability(props.config.provider, props.model, settings.value?.generationConfig?.maxOutputTokens, settings.value?.generationConfig?.thinkingConfig)
+  ? sessionThinkingCapability(props.config.provider, props.model, settings.value?.generationConfig?.maxOutputTokens, settings.value?.generationConfig?.thinkingConfig, props.config)
   : undefined);
 const pending = computed(() => store.pendingFor('conversation', props.conversationId));
 const override = computed(() => store.thinkingFor('conversation', props.conversationId));
@@ -99,7 +99,7 @@ function save(value: string): void {
       }
       const supported = capability.value!;
       next = 'min' in supported ? { kind: supported.kind, tokens: Number(value) } : { kind: supported.kind, value: value as LlmThinkingLevel };
-      next = validateSessionThinkingOverride(next, props.config!.provider, props.model!, settings.value?.generationConfig, settings.value?.requestBody);
+      next = validateSessionThinkingOverride(next, props.config!.provider, props.model!, settings.value?.generationConfig, settings.value?.requestBody, props.config);
     }
     store.setThinkingForScope(props.conversationId!, modelIdentity(), next);
   } catch (error) {

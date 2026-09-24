@@ -1,5 +1,5 @@
 import type { LlmGenerationConfigRecord, LlmRequestBodyRecord, LlmProviderKind, LlmThinkingLevel, SessionThinkingOverride } from '../../shared/protocol';
-import { IncompatibleSessionThinkingError, validateSessionThinkingOverride } from '../../shared/sessionThinking';
+import { IncompatibleSessionThinkingError, validateSessionThinkingOverride, type SessionThinkingProviderConfig } from '../../shared/sessionThinking';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import type { PlainJsonValue } from './plainJson';
 import type { ReliableChildModelProfileStore } from './childAgentCoordinator';
@@ -25,11 +25,12 @@ export function compatibleChildThinkingOverride(
   provider: LlmProviderKind,
   model: string,
   generation?: LlmGenerationConfigRecord,
-  body?: LlmRequestBodyRecord
+  body?: LlmRequestBodyRecord,
+  providerConfig?: SessionThinkingProviderConfig
 ): SessionThinkingOverride | undefined {
   if (hasThinkingBodyConflict(provider, body)) return undefined;
   try {
-    return validateSessionThinkingOverride(value, provider, model, generation, body);
+    return validateSessionThinkingOverride(value, provider, model, generation, body, providerConfig);
   } catch (error) {
     if (error instanceof IncompatibleSessionThinkingError) return undefined;
     throw error;

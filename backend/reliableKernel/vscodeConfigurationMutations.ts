@@ -247,7 +247,7 @@ export class VscodeConfigurationMutations {
         const modelConfig = provider.modelConfigs.find(item => item.modelId === profile!.model);
         const body = modelConfig ? modelConfig.requestBody : provider.requestBody;
         if (hasThinkingBodyConflict(provider.provider, body)) throw new Error('自定义请求体与本次思维修改冲突；未改变已保存配置。');
-        profile.thinkingOverride = validateSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, modelConfig ? modelConfig.generationConfig : provider.generationConfig, body);
+        profile.thinkingOverride = validateSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, modelConfig ? modelConfig.generationConfig : provider.generationConfig, body, provider);
       }
       guard();
       if (profile) {
@@ -450,7 +450,7 @@ export class VscodeConfigurationMutations {
         const modelConfig = provider.modelConfigs.find((item) => item.modelId === model);
         if (hasThinkingBodyConflict(provider.provider, modelConfig ? modelConfig.requestBody : provider.requestBody)) throw new Error('自定义请求体控制思维或输出参数；请先在渠道设置中解除冲突。');
         const generation = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
-        thinkingOverride = validateSessionThinkingOverride(payload.thinkingOverride, provider.provider, model, generation, modelConfig ? modelConfig.requestBody : provider.requestBody);
+        thinkingOverride = validateSessionThinkingOverride(payload.thinkingOverride, provider.provider, model, generation, modelConfig ? modelConfig.requestBody : provider.requestBody, provider);
       }
       return this.setScoped(
       modelProfileStore(paths),
@@ -528,7 +528,8 @@ export class VscodeConfigurationMutations {
            provider.provider,
            model,
            modelConfig ? modelConfig.generationConfig : provider.generationConfig,
-           body
+           body,
+           provider
          );
        }
 

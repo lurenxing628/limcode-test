@@ -2,15 +2,21 @@ import type { LlmGenerationConfigRecord, LlmRequestBodyRecord, LlmProviderKind, 
 import { isAstraModel, isGpt6NoneCapableModel } from './openAIResponsesCapabilities';
 import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from './geminiThinking';
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
-import { anthropicModelReasoningCapability } from './modelCapabilities';
+import { anthropicModelReasoningCapability, resolveProviderOpenAICompatibleDialect } from './modelCapabilities';
 import { openAICompatibleModelThinkingRule, openAICompatibleThinkingLevels, resolveOpenAICompatibleDialect } from './openAICompatibleDialect';
+
+/** 渠道配置（接口地址、测试结果、手动写法）：OpenAI 兼容渠道按它算出有效规则。 */
+export type SessionThinkingProviderConfig = Parameters<typeof resolveProviderOpenAICompatibleDialect>[0];
 
 export type SessionThinkingCapability =
   | { kind: 'gemini-budget' | 'claude-budget'; min: number; max: number; automatic?: number; allowZero?: boolean }
   | { kind: 'openai-effort' | 'gemini-level' | 'claude-effort' | 'deepseek-effort'; values: readonly LlmThinkingLevel[] };
 
-/** Known model constraints take priority. Configured relay aliases reuse the channel editor's values. */
-export function sessionThinkingCapability(provider: LlmProviderKind, modelId: string, maxOutputTokens?: number, configuredThinking?: LlmThinkingConfigRecord): SessionThinkingCapability | undefined {
+/**
+ * Known model constraints take priority. Configured relay aliases reuse the channel editor's values.
+ * `providerConfig`：OpenAI 兼容渠道按渠道配置（接口地址、测试结果、手动写法）算选项；没有时只按模型规则。
+ */
+export function sessionThinkingCapability(provider: LlmProviderKind, modelId: string, maxOutputTokens?: number, configuredThinking?: LlmThinkingConfigRecord, providerConfig?: SessionThinkingProviderConfig): SessionThinkingCapability | undefined {
   const model = modelId.toLowerCase().replace(/^models\//, '');
   if (provider === 'gemini') {
     const capability = geminiThinkingCapabilityForModel(model);
@@ -47,12 +53,13 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     if (isGpt6NoneCapableModel(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] };
   }
   if (provider === 'openai-compatible') {
-    // DeepSeek 风格的模型（DeepSeek、MiMo、Kimi、智谱、混元、Qwen、ERNIE）：按模型能力给档位，
-    // 发送时再按平台换成对方的参数写法（backend/capabilities/openAICompatibleDialectAdaptation.ts）。
-    // kind 沿用 'deepseek-effort'，已保存的会话覆盖（原 DeepSeek 渠道）继续有效。
-    const thinking = openAICompatibleModelThinkingRule(model)
-      ? openAICompatibleThinkingLevels(resolveOpenAICompatibleDialect('', model, 'deepseek'))
-      : undefined;
+    // DeepSeek 写法或 enable_thinking 写法的模型：按有效规则（手动写法 → 测试结果 → 平台 / 模型 ID）给档位，
+    // 与请求改写（backend/capabilities/openAICompatibleDialectAdaptation.ts）和能力表共用同一份规则。
+    // 没有渠道配置时只能按模型规则。kind 沿用 'deepseek-effort'（原 DeepSeek 渠道）。
+    const dialect = providerConfig
+      ? resolveProviderOpenAICompatibleDialect(providerConfig, modelId)
+      : openAICompatibleModelThinkingRule(model) ? resolveOpenAICompatibleDialect('', model, 'deepseek') : undefined;
+    const thinking = dialect ? openAICompatibleThinkingLevels(dialect) : undefined;
     if (thinking) return { kind: 'deepseek-effort', values: thinking.canDisable ? ['none', ...thinking.levels] : thinking.levels };
   }
   return configuredEffort(provider, configuredThinking);
@@ -67,8 +74,8 @@ function configuredEffort(provider: LlmProviderKind, thinking?: LlmThinkingConfi
 
 export class IncompatibleSessionThinkingError extends Error {}
 
-export function validateSessionThinkingOverride(value: SessionThinkingOverride, provider: LlmProviderKind, model: string, generation?: LlmGenerationConfigRecord, requestBody?: LlmRequestBodyRecord): SessionThinkingOverride {
-  const capability = sessionThinkingCapability(provider, model, generation?.maxOutputTokens, generation?.thinkingConfig);
+export function validateSessionThinkingOverride(value: SessionThinkingOverride, provider: LlmProviderKind, model: string, generation?: LlmGenerationConfigRecord, requestBody?: LlmRequestBodyRecord, providerConfig?: SessionThinkingProviderConfig): SessionThinkingOverride {
+  const capability = sessionThinkingCapability(provider, model, generation?.maxOutputTokens, generation?.thinkingConfig, providerConfig);
   if (!value || !capability || value.kind !== capability.kind) throw new IncompatibleSessionThinkingError('当前模型不支持此思维参数，请恢复默认或重新选择。');
   if (provider === 'claude' && ('tokens' in value || value.value !== 'none')) {
     const temperature = requestBody && Object.prototype.hasOwnProperty.call(requestBody, 'temperature') ? requestBody.temperature : generation?.temperature;

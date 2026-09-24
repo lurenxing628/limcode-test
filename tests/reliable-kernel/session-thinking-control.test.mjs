@@ -245,3 +245,11 @@ test('Stale effort from a different model never produces a missing dropdown sele
   f.control.save('minimal');
   assert.equal(f.writes.length, 0);
 });
+
+test('OpenAI 兼容渠道的选项按渠道配置计算：硅基流动的 DeepSeek V4 只有 high / max', () => {
+  const model = 'deepseek-ai/DeepSeek-V4-Pro';
+  const f = fixture({ props: { model, config: { id: 'channel', provider: 'openai-compatible', baseUrl: 'https://api.siliconflow.cn/v1', model, models: [{ id: model, name: model }], modelConfigs: [] } } });
+  assert.deepEqual(plain(f.control.options.value).map(option => option.value), ['default', 'none', 'high', 'max']);
+  f.control.save('high');
+  assert.deepEqual(plain(f.writes[0][3]), { kind: 'deepseek-effort', value: 'high' });
+});

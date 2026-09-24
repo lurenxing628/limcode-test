@@ -20,7 +20,7 @@ const {
   OPENAI_COMPATIBLE_SERVICE_PRESETS
 } = require('../../dist/extension/shared/openAICompatibleDialect.js');
 const { canonicalLlmProviderKind } = require('../../dist/extension/shared/protocol.js');
-const { sessionThinkingCapability } = require('../../dist/extension/shared/sessionThinking.js');
+const { sessionThinkingCapability, validateSessionThinkingOverride } = require('../../dist/extension/shared/sessionThinking.js');
 const { normalizeModelCapabilitySnapshot, resolveProviderOpenAICompatibleDialect } = require('../../dist/extension/shared/modelCapabilities.js');
 const { libraryProviderKind } = require('../../dist/extension/backend/capabilities/openAICompatibleDialectAdaptation.js');
 const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
@@ -371,4 +371,19 @@ test('请求改写与接入库格式都采用测试结果', async () => {
   assert.deepEqual(thinkingParams(manual), { reasoning_effort: 'low' });
   // DeepSeek 官方地址上测出 DeepSeek 写法时仍交给接入库的 DeepSeek 格式。
   assert.equal(libraryProviderKind(probedSettings(DEEPSEEK, 'renamed', { wireFormat: 'deepseek', canDisable: true, levels: [] })), 'deepseek');
+});
+
+test('会话思考强度按渠道配置给选项：平台差异、测试结果与手动写法都算进去', () => {
+  const values = (baseUrl, model, extra = {}) => sessionThinkingCapability('openai-compatible', model, undefined, undefined, settings(baseUrl, model, extra))?.values;
+  assert.deepEqual(values(DEEPSEEK, 'deepseek-v4-pro'), ['none', 'low', 'high', 'max']);
+  assert.deepEqual(values(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro'), ['none', 'high', 'max']);
+  assert.deepEqual(values(MOONSHOT, 'kimi-k3'), ['low', 'high', 'max']);
+  const probe = { wireFormat: 'deepseek', canDisable: false, levels: ['high', 'max'] };
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'renamed-model', undefined, undefined, probedSettings(RELAY, 'renamed-model', probe)),
+    { kind: 'deepseek-effort', values: ['high', 'max'] });
+  assert.equal(values(DEEPSEEK, 'deepseek-v4-pro', { openaiCompatibleThinkingFormat: 'omit' }), undefined);
+  assert.throws(() => validateSessionThinkingOverride({ kind: 'deepseek-effort', value: 'low' }, 'openai-compatible', 'deepseek-ai/DeepSeek-V4-Pro',
+    undefined, undefined, settings(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro')), /不支持/);
+  assert.deepEqual(validateSessionThinkingOverride({ kind: 'deepseek-effort', value: 'max' }, 'openai-compatible', 'renamed-model',
+    undefined, undefined, probedSettings(RELAY, 'renamed-model', probe)), { kind: 'deepseek-effort', value: 'max' });
 });

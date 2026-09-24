@@ -998,7 +998,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       ? profile.thinkingOverride : undefined;
     if (override) {
       if (hasThinkingBodyConflict(provider.provider, requestBody)) throw new Error('自定义请求体与会话思维覆盖冲突，请恢复默认或修改渠道配置。');
-      validateSessionThinkingOverride(override, provider.provider, model.model, defaults, requestBody);
+      validateSessionThinkingOverride(override, provider.provider, model.model, defaults, requestBody, provider);
     }
     return { model: { ...model }, generationConfig: applySessionThinkingOverride(defaults, override), requestBody: clonePlain(requestBody), thinkingControlledByBody: hasThinkingBodyConflict(provider.provider, requestBody) };
   }
