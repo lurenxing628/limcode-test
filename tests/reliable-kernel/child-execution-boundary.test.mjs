@@ -368,6 +368,45 @@ test('spawned, continued and user-started child Turns all stay within the parent
   });
 });
 
+test('editing a message in a child conversation reruns within the bound frozen at spawn', { timeout: 120000 }, async () => {
+  await runtimeFixture(async f => {
+    assert.equal((await f.app.agentLoop.runInput(f.input('spawn'))).terminalStatus, 'completed');
+    await f.coordinator.waitForIdle();
+    const [child] = await f.list('ChildExecution');
+    const [spawnLink] = await f.list('ChildExecutionTurnLink', { child_execution_id: child.id });
+    const spawned = (await f.frozen(spawnLink.turn_id)).document;
+    const [prompt] = await f.list('MessageTurnLink', { turn_id: spawnLink.turn_id, role: 'input' });
+    // Widening the parent later must not reach the rerun either.
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: f.parentAgent.id,
+      allowedTools: ['bash', 'read', 'run_agent', 'write'], toolConfigs: { run_agent: { config: { maxChildAgentDepth: 3 } } } });
+    await f.app.database.conversationOwners.claim(child.child_conversation_id);
+    await f.coordinator.editAndRunFromConversation({ commandId: 'edit-in-child', childExecutionId: child.id,
+      conversationId: child.child_conversation_id, messageId: prompt.message_id, content: 'implement the fix and run the tests' });
+    await f.coordinator.waitForIdle();
+    const links = (await f.list('ChildExecutionTurnLink', { child_execution_id: child.id }))
+      .sort((left, right) => Number(left.turn_seq) - Number(right.turn_seq));
+    assert.equal(links.length, 2, 'the edit reran one Turn as the same child generation');
+    const rerun = f.compileRequests.find(candidate => candidate.turnId === links[1].turn_id);
+    assert.equal(rerun.intentKind, 'retry');
+    assert.deepEqual(rerun.inheritedToolPolicy, spawned.toolPolicy.inherited);
+    assert.ok(rerun.inheritedSkillPolicy, 'the rerun carries the skill bound');
+    const { enabled, allowedWorkEnvironmentIds, defaultWorkEnvironmentId } = spawned.workEnvironmentPolicy;
+    assert.deepEqual(rerun.inheritedWorkEnvironmentPolicy, { enabled, allowedWorkEnvironmentIds, defaultWorkEnvironmentId },
+      'and the work environments of the child latest Turn');
+    const { toolPolicy } = (await f.frozen(links[1].turn_id)).document;
+    assert.deepEqual(toolPolicy.allowedTools, ['read', 'submit_agent_answer'], 'bash and write stay off after the edit');
+  }, {
+    async send(request, controls, f) {
+      let part = { text: 'done' };
+      if (request.conversationId === 'parent' && !f.sent.has('spawn')) {
+        f.sent.add('spawn');
+        part = { id: 'spawn-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Implement fix', prompt: 'implement the fix' } } };
+      }
+      await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [part] } });
+    }
+  });
+});
+
 test('a Plan the user approves to run in a new conversation runs with the executor Agent own settings, not the planning Turn', { timeout: 120000 }, async () => {
   await runtimeFixture(async f => {
     const { workEnvironmentIdFromUri } = dist('shared/workEnvironmentCatalog.js');
