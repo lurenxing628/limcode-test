@@ -3728,6 +3728,8 @@ export function planCompressionSummaryCalls(
 interface SegmentedSummaryChunk {
   requestContents: MessageContent[];
   sourceContents: MessageContent[];
+  /** Least the chunk's escaped transcript adds to any call, when a split already measured it. */
+  transcriptTokensFloor?: number;
 }
 
 interface SegmentedSummaryUnit extends SegmentedSummaryChunk {
@@ -3800,29 +3802,37 @@ function buildSegmentedSummaryProviderCalls(
   };
 
   for (const unit of units) {
-    // Re-measuring the whole growing chunk for every unit made packing quadratic. The token
-    // estimator is additive across the escaped transcript, so a unit whose rendered cost still fits
-    // under the last exact measurement is accepted without re-rendering the chunk; anything closer
-    // to the limit takes the exact measurement below.
-    if (currentCallTokensBound !== undefined && current.requestContents.length > 0) {
-      const bound = currentCallTokensBound + appendedSummaryTranscriptTokensBound(
-        unit.requestContents,
-        current.requestContents.length
-      );
-      if (bound <= packingLimitTokens) {
-        current.requestContents = [...current.requestContents, ...unit.requestContents];
+    // A unit whose own text is already beyond one call is split straight away: measuring a
+    // multi-megabyte record whole (appended, then alone) only to learn that took seconds.
+    const transcriptFloor = summaryUnitTranscriptTokensFloor(unit);
+    const beyondOneCall = packingLimitTokens > 0 && transcriptFloor !== undefined && transcriptFloor > packingLimitTokens;
+    let measuredAlone = beyondOneCall;
+    if (!beyondOneCall) {
+      // Re-measuring the whole growing chunk for every unit made packing quadratic. The token
+      // estimator is additive across the escaped transcript, so a unit whose rendered cost still fits
+      // under the last exact measurement is accepted without re-rendering the chunk; anything closer
+      // to the limit takes the exact measurement below.
+      if (currentCallTokensBound !== undefined && current.requestContents.length > 0) {
+        const bound = currentCallTokensBound + appendedSummaryTranscriptTokensBound(
+          unit.requestContents,
+          current.requestContents.length
+        );
+        if (bound <= packingLimitTokens) {
+          current.requestContents = [...current.requestContents, ...unit.requestContents];
+          current.sourceContents.push(...unit.sourceContents);
+          currentCallTokensBound = bound;
+          continue;
+        }
+      }
+      measuredAlone = current.requestContents.length === 0;
+      const candidate = [...current.requestContents, ...unit.requestContents];
+      const candidateTokens = summaryProviderCallInputTokens(callFor(candidate, groups.length));
+      if (packingLimitTokens > 0 && candidateTokens <= packingLimitTokens) {
+        current.requestContents = candidate;
         current.sourceContents.push(...unit.sourceContents);
-        currentCallTokensBound = bound;
+        currentCallTokensBound = candidateTokens;
         continue;
       }
-    }
-    const candidate = [...current.requestContents, ...unit.requestContents];
-    const candidateTokens = summaryProviderCallInputTokens(callFor(candidate, groups.length));
-    if (packingLimitTokens > 0 && candidateTokens <= packingLimitTokens) {
-      current.requestContents = candidate;
-      current.sourceContents.push(...unit.sourceContents);
-      currentCallTokensBound = candidateTokens;
-      continue;
     }
     pushCurrent();
     const safeUnits = splitOversizedSummaryUnit(
@@ -3832,12 +3842,29 @@ function buildSegmentedSummaryProviderCalls(
       methodConfig,
       settings,
       totalTargetTokens,
-      MAX_SEGMENTED_SUMMARY_LEAF_CALLS - groups.length
+      MAX_SEGMENTED_SUMMARY_LEAF_CALLS - groups.length,
+      measuredAlone
     );
+    // Exact tokens of the current call while it holds only what was measured alone.
+    let currentTokens: number | undefined;
     for (const safeUnit of safeUnits) {
-      const next = [...current.requestContents, ...safeUnit.requestContents];
-      if (!fits(next, groups.length)) pushCurrent();
-      if (!fits(safeUnit.requestContents, groups.length)) {
+      if (current.requestContents.length > 0) {
+        // A split piece fills most of a call by itself, so joining it to the previous piece is
+        // measured only when the room left could possibly hold it.
+        const joinedFloor = currentTokens !== undefined && safeUnit.transcriptTokensFloor !== undefined
+          ? currentTokens + safeUnit.transcriptTokensFloor - SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS
+          : undefined;
+        if ((joinedFloor === undefined || joinedFloor <= packingLimitTokens)
+          && fits([...current.requestContents, ...safeUnit.requestContents], groups.length)) {
+          current.requestContents.push(...safeUnit.requestContents);
+          current.sourceContents.push(...safeUnit.sourceContents);
+          currentTokens = undefined;
+          continue;
+        }
+        pushCurrent();
+      }
+      currentTokens = summaryProviderCallInputTokens(callFor(safeUnit.requestContents, groups.length));
+      if (packingLimitTokens <= 0 || currentTokens > packingLimitTokens) {
         throw new Error(
           `compression_request_too_large: fixed summary prompt cannot fit chunk ${groups.length + 1} in the frozen Provider window.`
         );
@@ -3845,7 +3872,7 @@ function buildSegmentedSummaryProviderCalls(
       current.requestContents.push(...safeUnit.requestContents);
       current.sourceContents.push(...safeUnit.sourceContents);
     }
-    currentCallTokensBound = undefined;
+    currentCallTokensBound = currentTokens;
   }
   pushCurrent();
   if (groups.length > MAX_SEGMENTED_SUMMARY_LEAF_CALLS) {
@@ -3880,20 +3907,24 @@ function splitOversizedSummaryUnit(
   methodConfig: LlmCompressionConfigRecord,
   settings: SummaryWindowSettings,
   targetTokens: number,
-  maxChunks: number
+  maxChunks: number,
+  /** The caller already measured this unit alone, with this prior, beyond the window. */
+  knownOversized = false
 ): SegmentedSummaryChunk[] {
   if (maxChunks <= 0) {
     throw new Error('compression_source_too_large: segmented summary exhausted the leaf call budget.');
   }
-  const direct = buildSegmentDeltaCall(
-    unit.requestContents,
-    index,
-    priorContext,
-    methodConfig,
-    settings,
-    targetTokens
-  );
-  if (isSummaryProviderCallWithinWindow(direct, settings)) return [unit];
+  if (!knownOversized) {
+    const direct = buildSegmentDeltaCall(
+      unit.requestContents,
+      index,
+      priorContext,
+      methodConfig,
+      settings,
+      targetTokens
+    );
+    if (isSummaryProviderCallWithinWindow(direct, settings)) return [unit];
+  }
 
   const message = unit.kind === 'message' && unit.requestContents.length === 1
     ? unit.requestContents[0]
@@ -3923,9 +3954,9 @@ function splitOversizedSummaryUnit(
         targetTokens
       );
       if (!fitting) break;
-      const chunk: MessageContent = { role: message.role, parts: [{ ...textPart, text: fitting }] };
-      chunks.push({ requestContents: [chunk], sourceContents: [chunk] });
-      remaining = remaining.slice(fitting.length);
+      const chunk: MessageContent = { role: message.role, parts: [{ ...textPart, text: fitting.text }] };
+      chunks.push({ requestContents: [chunk], sourceContents: [chunk], transcriptTokensFloor: fitting.transcriptTokensFloor });
+      remaining = remaining.slice(fitting.text.length);
     }
     if (remaining.length === 0 && chunks.length > 0) return chunks;
   }
@@ -3952,9 +3983,9 @@ function splitOversizedSummaryUnit(
       targetTokens
     );
     if (!fitting) break;
-    const chunk: MessageContent = { role: 'user', parts: [{ text: fitting }] };
-    chunks.push({ requestContents: [chunk], sourceContents: [chunk] });
-    remaining = remaining.slice(fitting.length);
+    const chunk: MessageContent = { role: 'user', parts: [{ text: fitting.text }] };
+    chunks.push({ requestContents: [chunk], sourceContents: [chunk], transcriptTokensFloor: fitting.transcriptTokensFloor });
+    remaining = remaining.slice(fitting.text.length);
   }
   if (remaining.length === 0 && chunks.length > 0) return chunks;
   throw new Error(
@@ -3962,6 +3993,16 @@ function splitOversizedSummaryUnit(
   );
 }
 
+/**
+ * Largest prefix of `text` whose summary call still fits the frozen window.
+ *
+ * The call is measured as JSON, where the text is escaped, and the estimator sums independent
+ * segments: the call costs its fixed framing plus what the escaped text costs alone, give or take
+ * the one segment that may merge across either edge. So the prefix is cut once at the budget the
+ * framing leaves and then confirmed with one exact measurement. Bisecting with a full measurement per
+ * probe (and slicing the whole remainder first) took seconds on a multi-megabyte message, all of it
+ * on the extension host while the rebuild dialog waited for its estimate.
+ */
 function largestFittingSummaryTextPrefix(
   text: string,
   role: MessageContent['role'],
@@ -3970,41 +4011,87 @@ function largestFittingSummaryTextPrefix(
   methodConfig: LlmCompressionConfigRecord,
   settings: SummaryWindowSettings,
   targetTokens: number
-): string {
-  // A fitting prefix never carries more tokens than the whole call may, so the search only needs
-  // one window's worth of text; slicing the complete remainder on every probe was the slow part.
-  const limitTokens = summaryProviderInputLimitTokens(
-    buildSegmentDeltaCall([], index, priorContext, methodConfig, settings, targetTokens),
-    settings
+): { text: string; transcriptTokensFloor: number } | undefined {
+  const callWith = (candidateText: string): SummaryProviderCall => buildSegmentDeltaCall(
+    [{ role, parts: [{ text: candidateText }] }],
+    index,
+    priorContext,
+    methodConfig,
+    settings,
+    targetTokens
   );
-  if (limitTokens <= 0) return '';
-  const searchText = sliceByTokens(text, 0, limitTokens + 1);
-  let low = 1;
-  let high = Math.max(1, estimateTokenCount(searchText));
-  let best = '';
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    const candidateText = sliceByTokens(searchText, 0, middle);
-    if (!candidateText) {
-      low = middle + 1;
-      continue;
+  const empty = callWith('');
+  const limitTokens = summaryProviderInputLimitTokens(empty, settings);
+  if (limitTokens <= 0) return undefined;
+  const framingTokens = summaryProviderCallInputTokens(empty);
+  let budget = limitTokens - framingTokens - SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS;
+  for (let attempt = 0; budget > 0 && attempt < LARGEST_FITTING_PREFIX_ATTEMPTS; attempt += 1) {
+    const prefix = escapedTextPrefixByTokens(text, budget);
+    if (!prefix) return undefined;
+    const callTokens = summaryProviderCallInputTokens(callWith(prefix));
+    if (callTokens <= limitTokens) {
+      return {
+        text: prefix,
+        transcriptTokensFloor: Math.max(0, callTokens - framingTokens - SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS)
+      };
     }
-    const call = buildSegmentDeltaCall(
-      [{ role, parts: [{ text: candidateText }] }],
-      index,
-      priorContext,
-      methodConfig,
-      settings,
-      targetTokens
-    );
-    if (isSummaryProviderCallWithinWindow(call, settings)) {
-      best = candidateText;
-      low = middle + 1;
-    } else {
-      high = middle - 1;
-    }
+    budget -= Math.max(SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS, callTokens - limitTokens);
   }
-  return best;
+  return undefined;
+}
+
+const LARGEST_FITTING_PREFIX_ATTEMPTS = 8;
+/** Characters one estimator token usually spans; only whitespace and digit runs span more. */
+const ESTIMATOR_TYPICAL_CHARS_PER_TOKEN = 4;
+
+/**
+ * Longest prefix of `text` whose JSON-escaped form the estimator counts at no more than `tokens`.
+ * Only a window slightly larger than the answer is escaped and measured: it starts at a typical
+ * character count for `tokens` and doubles while it still holds fewer tokens than asked for.
+ */
+function escapedTextPrefixByTokens(text: string, tokens: number): string {
+  let windowChars = Math.max(1_024, (tokens + 1) * ESTIMATOR_TYPICAL_CHARS_PER_TOKEN);
+  for (;;) {
+    const window = text.length <= windowChars ? text : text.slice(0, windowChars);
+    const escaped = JSON.stringify(window).slice(1, -1);
+    const escapedPrefix = sliceByTokens(escaped, 0, tokens);
+    if (escapedPrefix.length < escaped.length || window.length === text.length) {
+      return rawPrefixForEscapedLength(window, escapedPrefix.length);
+    }
+    windowChars *= 2;
+  }
+}
+
+/** Longest prefix of `text` whose JSON.stringify escaping is at most `escapedLength` characters; never splits a surrogate pair. */
+function rawPrefixForEscapedLength(text: string, escapedLength: number): string {
+  let used = 0;
+  let end = 0;
+  while (end < text.length) {
+    const code = text.charCodeAt(end);
+    let units = 1;
+    let cost: number;
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x0c || code === 0x0a || code === 0x0d || code === 0x09) {
+      cost = 2;
+    } else if (code < 0x20) {
+      cost = 6;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = end + 1 < text.length ? text.charCodeAt(end + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        units = 2;
+        cost = 2;
+      } else {
+        cost = 6;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      cost = 6;
+    } else {
+      cost = 1;
+    }
+    if (used + cost > escapedLength) break;
+    used += cost;
+    end += units;
+  }
+  return text.slice(0, end);
 }
 
 function buildSegmentDeltaCall(
@@ -4946,6 +5033,34 @@ function appendedSummaryTranscriptTokensBound(contents: MessageContent[], startI
   return estimateTokenCount(JSON.stringify(`\n\n${renderContentsForSummary(contents, startIndex)}`))
     + SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS;
 }
+
+/**
+ * Least a unit's transcript adds to a summary call, from the estimate made when it was grouped, or
+ * undefined when the transcript renders it differently (hidden thoughts, media, provider items).
+ * The call escapes the rendered text as JSON, which never lowers the estimator's count, and renders
+ * every part the estimate counted; only the per-message and per-call overheads are not rendered.
+ */
+function summaryUnitTranscriptTokensFloor(unit: SegmentedSummaryUnit): number | undefined {
+  let overhead = 0;
+  for (const content of unit.requestContents) {
+    if (isRecord((content as unknown as Record<string, unknown>).providerContext)) return undefined;
+    overhead += SUMMARY_UNIT_MESSAGE_OVERHEAD_TOKENS;
+    for (const part of content.parts) {
+      if (isTextPart(part)) {
+        if (part.thought === true) return undefined;
+      } else if (isFunctionCallPart(part) || (isFunctionResponsePart(part) && !part.functionResponse.parts?.length)) {
+        overhead += SUMMARY_UNIT_FUNCTION_OVERHEAD_TOKENS;
+      } else {
+        return undefined;
+      }
+    }
+  }
+  return unit.estimatedTokens - overhead;
+}
+
+/** The fixed overheads groupAtomicMessageContents counts per message and per function part. */
+const SUMMARY_UNIT_MESSAGE_OVERHEAD_TOKENS = 4;
+const SUMMARY_UNIT_FUNCTION_OVERHEAD_TOKENS = 4;
 
 function modelCatalogEntryToRecord(model: UnifiedModelCatalogEntry): LlmProviderModelRecord {
   return {

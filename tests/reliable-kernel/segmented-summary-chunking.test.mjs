@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
+import { estimateTokenCount } from 'tokenx';
 import {
   createLlmProviderCapability,
-  dryRunCompactLlmProvider
+  dryRunCompactLlmProvider,
+  planCompressionSummaryCalls
 } from '../../dist/extension/backend/capabilities/llmProvider.js';
 
 const PROVIDERS = [
@@ -990,4 +992,69 @@ test('cancelling while the shorten request is in flight ends the compaction with
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+function oneMessageRequest(text, targetTokens = 8_000) {
+  const { request } = compactRequest('openai-compatible');
+  request.methodConfigSnapshot.llmSummary = { targetTokens };
+  request.segments = [[{ role: 'user', parts: [{ text }] }]];
+  return request;
+}
+
+test('an oversized message is split losslessly, including escapes, emoji and control characters', async () => {
+  const piece = (index) => `He said "hi" at C:\\tmp\\${index}\n\t中文说明😀\u0001 ${'word '.repeat(index % 7)}{"k":[${index}]}\r\n`;
+  const text = Array.from({ length: 3_000 }, (_, index) => piece(index)).join('');
+  const result = await dryRunCompactLlmProvider(oneMessageRequest(text), {
+    settings: async () => ({ ...providerConfig('openai-compatible', 'https://example.test/v1'), contextWindowTokens: 30_000 }),
+    compressionSettings: async () => undefined
+  });
+  assert.equal(result.kind, 'provider_requests');
+  assert.ok(result.calls.length >= 3, `expected several chunks, got ${result.calls.length}`);
+  const marker = '【本回合记录】\n1. user: ';
+  const chunks = result.calls.map((call) => {
+    const user = JSON.parse(call.bodyText).messages.find((message) => message.role === 'user').content;
+    const start = user.indexOf(marker);
+    assert.ok(start >= 0);
+    return user.slice(start + marker.length);
+  });
+  assert.equal(chunks.join(''), text);
+
+  // A tool exchange is split through its rendered transcript, with the result JSON escaped twice.
+  const toolRequest = oneMessageRequest('');
+  const args = { path: 'C:\\tmp\\"quoted".txt' };
+  const response = { text };
+  toolRequest.segments = [[
+    { role: 'model', parts: [{ id: 'call-escape', functionCall: { name: 'read', args } }] },
+    { role: 'user', parts: [{ id: 'call-escape', functionResponse: { name: 'read', response } }] }
+  ]];
+  const toolResult = await dryRunCompactLlmProvider(toolRequest, {
+    settings: async () => ({ ...providerConfig('openai-compatible', 'https://example.test/v1'), contextWindowTokens: 30_000 }),
+    compressionSettings: async () => undefined
+  });
+  const toolChunks = toolResult.calls.map((call) => {
+    const user = JSON.parse(call.bodyText).messages.find((message) => message.role === 'user').content;
+    return user.slice(user.indexOf(marker) + marker.length);
+  });
+  assert.ok(toolChunks.length >= 3);
+  assert.equal(
+    toolChunks.join(''),
+    `1. model: [tool call] read: ${JSON.stringify(args)}\n\n2. user: [tool result] read: ${JSON.stringify(response)}`
+  );
+});
+
+test('splitting a multi-megabyte message costs a few passes over it, not a full measurement per bisection step', () => {
+  const text = `PERF-START ${'ordinary-history '.repeat(Math.ceil(4e6 / 17))} PERF-END`;
+  const tokenizeOnce = () => {
+    const started = performance.now();
+    estimateTokenCount(JSON.stringify(text));
+    return performance.now() - started;
+  };
+  const onePass = Math.min(tokenizeOnce(), tokenizeOnce());
+  const started = performance.now();
+  const plan = planCompressionSummaryCalls(oneMessageRequest(text), { contextWindowTokens: 400_000 });
+  const elapsed = performance.now() - started;
+  assert.deepEqual(plan, { summaryCalls: 4, mergeCalls: 1 });
+  // Bisecting each chunk with a full measurement per probe, after slicing the whole remainder, took
+  // about 28 passes' worth (7 s for 4 MB); the planner runs on the extension host.
+  assert.ok(elapsed < onePass * 15, `planning took ${Math.round(elapsed)} ms, ${(elapsed / onePass).toFixed(1)}x one tokenizer pass`);
 });
