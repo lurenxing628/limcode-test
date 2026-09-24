@@ -306,6 +306,31 @@ test('provider usage上下文口径优先prompt/input，而不是input+output to
   assert.equal(kernel.compressionOutputTokens(usage), 900);
 });
 
+test('压缩输出token不含推理：OpenAI把推理算进输出时减掉，Gemini另计推理时不减', () => {
+  // unified 把 Responses 的 output_tokens（含 reasoning_tokens）映射成 candidatesTokenCount。
+  assert.equal(kernel.compressionOutputTokens({
+    promptTokenCount: 1_000, candidatesTokenCount: 900, thoughtsTokenCount: 600, totalTokenCount: 1_900
+  }), 300);
+  assert.equal(kernel.compressionOutputTokens({
+    input_tokens: 1_000, output_tokens: 900, output_tokens_details: { reasoning_tokens: 600 }, total_tokens: 1_900
+  }), 300);
+  assert.equal(kernel.compressionOutputTokens({
+    prompt_tokens: 1_000, completion_tokens: 900, completion_tokens_details: { reasoning_tokens: 600 }, total_tokens: 1_900
+  }), 300);
+  // Gemini 的 candidatesTokenCount 本来就不含思考，总数另加 thoughtsTokenCount。
+  assert.equal(kernel.compressionOutputTokens({
+    promptTokenCount: 1_000, candidatesTokenCount: 300, thoughtsTokenCount: 600, totalTokenCount: 1_900
+  }), 300);
+  // 密文压缩块按输出计入上下文，推理不回到上下文。
+  const compaction = [{ role: 'model', parts: [{ providerContext: { format: 'openai-responses', itemType: 'compaction',
+    rawItem: { type: 'compaction', encrypted_content: 'ciphertext' } } }] }];
+  const openAIUsage = { promptTokenCount: 1_000, candidatesTokenCount: 900, thoughtsTokenCount: 600, totalTokenCount: 1_900 };
+  assert.equal(
+    kernel.estimateCompressionResultTokens(compaction, kernel.compressionOutputTokens(openAIUsage)),
+    kernel.estimateMessageContentsTokens(compaction) + 300
+  );
+});
+
 test('实用版压缩规划使用48K主体、8K摘要和16K输出且没有全局估算硬门槛', () => {
   assert.equal(kernel.MODEL_BODY_TARGET_TOKENS, 48_000);
   assert.equal(kernel.SUMMARY_TARGET_TOKENS, 8_000);

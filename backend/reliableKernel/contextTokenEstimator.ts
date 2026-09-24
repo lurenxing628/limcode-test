@@ -503,9 +503,30 @@ export function providerTotalTokens(value: unknown): number | undefined {
   return input !== undefined && output !== undefined ? input + output : undefined;
 }
 
+/**
+ * Output tokens of a compaction that come back into the Context, without the Provider's reasoning.
+ * OpenAI counts reasoning inside its output tokens, and the unified usage keeps that sum as
+ * `candidatesTokenCount` beside `thoughtsTokenCount`; Gemini reports thoughts on top of candidates,
+ * which its total then shows. Counting OpenAI's reasoning made a ciphertext compaction look as large
+ * as everything the model thought while writing it.
+ */
 export function compressionOutputTokens(value: unknown): number | undefined {
   const usage = usageRecord(value);
-  return firstTokenCount(usage, ['candidatesTokenCount', 'completion_tokens', 'output_tokens', 'outputTokens']);
+  const output = firstTokenCount(usage, ['candidatesTokenCount', 'completion_tokens', 'output_tokens', 'outputTokens']);
+  if (output === undefined) return undefined;
+  return Math.max(0, output - Math.min(output, reasoningInsideOutputTokens(usage, output)));
+}
+
+function reasoningInsideOutputTokens(usage: Record<string, unknown> | undefined, output: number): number {
+  const detailed = optionalTokenCount(asRecord(usage?.output_tokens_details)?.reasoning_tokens)
+    ?? optionalTokenCount(asRecord(usage?.completion_tokens_details)?.reasoning_tokens);
+  if (detailed !== undefined) return detailed;
+  const thoughts = optionalTokenCount(usage?.thoughtsTokenCount);
+  if (!thoughts) return 0;
+  const prompt = firstTokenCount(usage, ['promptTokenCount', 'prompt_tokens', 'input_tokens', 'inputTokens']);
+  const total = firstTokenCount(usage, ['totalTokenCount', 'total_tokens', 'totalTokens']);
+  // A total that holds thoughts on top of the output means the output never included them.
+  return prompt !== undefined && total !== undefined && total >= prompt + output + thoughts ? 0 : thoughts;
 }
 
 /**
