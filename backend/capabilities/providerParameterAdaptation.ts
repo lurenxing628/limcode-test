@@ -321,7 +321,7 @@ export function createProviderRequestAdaptationRetry(
 
 /** 只认明确点名参数的错误文本；导出供单测覆盖正反例。 */
 export function unsupportedRequestParameters(errorText: string): AdaptableRequestParameter[] {
-  const text = normalizeErrorText(errorText);
+  const text = withoutEchoedInputs(normalizeErrorText(errorText));
   const extraInputs = /extra inputs are not permitted|extra_forbidden/i.test(text);
   return ADAPTABLE_PARAMETERS.filter((parameter) => {
     const name = escapeRegExp(parameter);
@@ -408,21 +408,26 @@ export function providerErrorStatus(rawError: unknown): number | undefined {
   return undefined;
 }
 
-/** 错误中全部可读文本：结构化部分序列化（保留 loc 数组结构），字符串叶子原样保留；不含响应头与调用栈。 */
+/**
+ * 错误中全部可读文本：结构化部分序列化（保留 loc 数组结构），字符串叶子原样保留；不含响应头与调用栈。
+ * pydantic 风格的错误把被拒字段的值原样回显在 `input` 里（常常就是用户消息），这里一律去掉：结构化的 `input` 键不看，
+ * 字符串里（原始响应体、`HTTP 400: {...}` 这类消息、Python repr）的 `'input': …` 也跳过，只按 msg / message / loc 判断。
+ */
 export function providerErrorSearchText(rawError: unknown): string {
   const plain = toPlainJsonLike(rawError);
   const strings: string[] = [];
   const visit = (value: unknown, depth: number): unknown => {
     if (depth > 8) return undefined;
     if (typeof value === 'string') {
-      strings.push(value);
-      return value;
+      const cleaned = withoutEchoedInputs(normalizeErrorText(value));
+      strings.push(cleaned);
+      return cleaned;
     }
     if (Array.isArray(value)) return value.map((item) => visit(item, depth + 1));
     if (!isRecord(value)) return value;
     const result: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value)) {
-      if (key === 'headers' || key === 'stack') continue;
+      if (key === 'headers' || key === 'stack' || key === 'input') continue;
       result[key] = visit(child, depth + 1);
     }
     return result;
@@ -435,6 +440,46 @@ export function providerErrorSearchText(rawError: unknown): string {
     serialized = '';
   }
   return normalizeErrorText([serialized, ...strings].join('\n'));
+}
+
+/** 去掉文本里 `"input": …` / `'input': …` 形式的回显值（JSON 或 Python repr，值可以嵌套）。 */
+function withoutEchoedInputs(text: string): string {
+  const pattern = /,?\s*(['"])input\1\s*:\s*/g;
+  let result = '';
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    const valueEnd = echoedValueEnd(text, match.index + match[0].length);
+    result += text.slice(cursor, match.index);
+    cursor = valueEnd;
+    pattern.lastIndex = Math.max(valueEnd, match.index + 1);
+  }
+  return cursor === 0 ? text : result + text.slice(cursor);
+}
+
+/** 从值的开头扫到它结束的位置：成对的括号与引号内部整体跳过，遇到同层的逗号或外层的右括号为止。 */
+function echoedValueEnd(text: string, start: number): number {
+  let depth = 0;
+  let quote: string | undefined;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) {
+      if (char === '\\') index += 1;
+      else if (char === quote) {
+        quote = undefined;
+        if (depth === 0) return index + 1;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === '{' || char === '[' || char === '(') depth += 1;
+    else if (char === '}' || char === ']' || char === ')') {
+      if (depth === 0) return index;
+      depth -= 1;
+      if (depth === 0) return index + 1;
+    } else if ((char === ',' || char === '\n') && depth === 0) return index;
+  }
+  return text.length;
 }
 
 function stringRecord(value: unknown): Record<string, string> {

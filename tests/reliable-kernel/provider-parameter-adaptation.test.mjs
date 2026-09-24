@@ -10,6 +10,7 @@ import {
   adaptRequestParameters,
   learnProviderRequestAdaptations,
   learnedProviderRequestAdaptations,
+  providerErrorSearchText,
   resetProviderRequestAdaptations,
   unsupportedRequestParameters
 } from '../../dist/extension/backend/capabilities/providerParameterAdaptation.js';
@@ -455,5 +456,30 @@ test('C1 聊天路径：网关拒绝 DeepSeek 写法的 thinking 后去掉重发
     assert.equal(calls.length, 3, '同一目标之后直接去掉');
     assert.equal(calls[2].body.thinking, undefined);
   });
+  resetProviderRequestAdaptations();
+});
+
+// pydantic 风格的 422 会把被拒字段的值原样回显在 `input` 里；回显的是用户内容，不能拿来学习。
+test('C1 学习：跳过服务端回显的 input 字段，只按 msg / message / loc 判断', () => {
+  resetProviderRequestAdaptations();
+  const echoed = 'reasoning_effort: Extra inputs are not permitted';
+  const structured = { detail: [{ type: 'extra_forbidden', loc: ['body', 'metadata'], msg: 'Extra inputs are not permitted', input: { note: echoed } }] };
+  const pythonRepr = `[{'type': 'extra_forbidden', 'loc': ('body', 'metadata'), 'msg': 'Extra inputs are not permitted', 'input': {'note': '${echoed}', 'more': ['x', ('y', 1)]}}]`;
+  const errors = [
+    { status: 422, rawBody: structured },
+    { status: 422, bodyText: JSON.stringify(structured) },
+    { status: 400, message: `HTTP 400: ${JSON.stringify(structured)}` },
+    { status: 400, message: pythonRepr },
+    { status: 400, error: { message: `Error: ${pythonRepr}` } },
+    { status: 422, rawBody: { detail: [{ type: 'extra_forbidden', loc: ['body', 'metadata'], msg: 'Extra inputs are not permitted', input: "it's reasoning_effort: Extra inputs are not permitted" }] } }
+  ];
+  for (const error of errors) {
+    assert.equal(providerErrorSearchText(error).includes(echoed), false, JSON.stringify(error));
+    assert.deepEqual(learnProviderRequestAdaptations(target({ providerConfigId: 'echo-input' }), error), [], JSON.stringify(error));
+  }
+  assert.deepEqual(learnedProviderRequestAdaptations(target({ providerConfigId: 'echo-input' })).parameters, []);
+  // 真正点名字段的 msg / loc 照常识别，回显内容被去掉不影响它们。
+  assert.deepEqual(learnProviderRequestAdaptations(target({ providerConfigId: 'echo-real' }), { status: 422, rawBody: MISTRAL_REASONING_CONTENT }), ['parameter:reasoning_content']);
+  assert.deepEqual(learnProviderRequestAdaptations(target({ providerConfigId: 'echo-real-repr' }), { status: 400, message: TRT_REASONING_CONTENT }), ['parameter:reasoning_content']);
   resetProviderRequestAdaptations();
 });
