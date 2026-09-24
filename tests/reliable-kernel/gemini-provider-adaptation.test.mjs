@@ -1237,3 +1237,62 @@ test('D4 other providers still receive provider items for their own encoders', (
     assert.deepEqual(request.contents.flatMap((content) => content.parts).filter((part) => part.providerContext).length, 1, providerKind);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// Gemini signatures on the OpenAI-compatible wire go only where they can be read. OpenAI documents
+// `tool_calls[]` as `id`/`type`/`function` only; strict servers reject unknown fields
+// (https://platform.openai.com/docs/api-reference/chat/create). A stored Gemini signature is sent
+// back as `extra_content` only when the target looks like Gemini, or when the call was produced by
+// the same channel and model it is sent to (a Gemini model behind a gateway alias).
+
+const SIGNED_HISTORY_CHANNEL = 'provider-gemini-adaptation';
+
+async function replayedCrossSourceWire({ target, source, baseUrl }) {
+  let start;
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(SIGNED_HISTORY_CHANNEL, {
+    start(input, emit) {
+      start = structuredClone(input);
+      emit({ type: LlmEventType.Done, payload: { requestId: input.id } });
+    },
+    abort() {}, cancelRetry() {}, dispose() {}
+  });
+  const request = fullGeminiRequest([
+    { role: 'user', parts: [{ text: 'list twice' }] },
+    { role: 'model', parts: [
+      { id: 'call_a', functionCall: { name: 'list_items', args: {} }, thoughtSignature: 'gemini:REAL_SIG',
+        thoughtSignatures: { gemini: 'REAL_SIG' } },
+      { id: 'call_b', functionCall: { name: 'list_items', args: {} } }
+    ] },
+    { role: 'user', parts: [
+      { id: 'call_a', functionResponse: { name: 'list_items', response: { ok: true } } },
+      { id: 'call_b', functionResponse: { name: 'list_items', response: { ok: true } } }
+    ] },
+    { role: 'user', parts: [{ text: 'next' }] }
+  ], { provider: 'openai-compatible', model: target });
+  request.context[1].modelSource = source;
+  await adapter.sendFullRequest(request, { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
+  const settings = providerConfig({ provider: 'openai-compatible', model: target, apiKey: '', ...(baseUrl ? { baseUrl } : {}) });
+  const body = (await dryRunLlmProvider(start, { settings: async () => settings })).body;
+  return body.messages.filter((message) => Array.isArray(message.tool_calls))
+    .flatMap((message) => message.tool_calls.map((call) => [call.id, call.extra_content?.google?.thought_signature ?? null]));
+}
+
+test('E7 a real Gemini signature in history is not sent as extra_content to GPT, DeepSeek or Kimi', async () => {
+  const fromGemini = { providerId: 'gemini-gateway', modelId: '[v]gemini-3.5-flash' };
+  for (const [target, baseUrl] of [['gpt-5.5'], ['deepseek-v4-flash', 'https://api.deepseek.com/v1'], ['moonshot-kimi-k3']]) {
+    assert.deepEqual(await replayedCrossSourceWire({ target, source: fromGemini, baseUrl }),
+      [['call_a', null], ['call_b', null]], target);
+    // The same gateway channel serving both models: the call was still made by another model.
+    assert.deepEqual(await replayedCrossSourceWire({ target, source: { providerId: SIGNED_HISTORY_CHANNEL, modelId: '[v]gemini-3.5-flash' }, baseUrl }),
+      [['call_a', null], ['call_b', null]], `${target} on the same channel`);
+  }
+});
+
+test('E7 a Gemini behind a gateway alias gets its own signature back; Gemini-like targets keep any Gemini signature', async () => {
+  // e3e7b556: a signature is decoded whatever the gateway calls the model, and returned on the call it came with.
+  assert.deepEqual(await replayedCrossSourceWire({ target: 'relay/flash-latest',
+    source: { providerId: SIGNED_HISTORY_CHANNEL, modelId: 'relay/flash-latest' } }), [['call_a', 'REAL_SIG'], ['call_b', null]]);
+  // A Gemini-like target reads Gemini signatures from any channel.
+  assert.deepEqual(await replayedCrossSourceWire({ target: '[v]gemini-3.5-flash',
+    source: { providerId: 'another-gemini-channel', modelId: 'gemini-3.5-flash' } }), [['call_a', 'REAL_SIG'], ['call_b', null]]);
+});

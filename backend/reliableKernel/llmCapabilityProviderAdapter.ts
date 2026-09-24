@@ -79,6 +79,10 @@ import {
 } from '../capabilities/claudeTurnScopedReminders';
 import { claudeTurnScopedCompaction } from './turnReminderProjection';
 import {
+  openAICompatibleModelReadsGeminiSignatures,
+  withoutGeminiFunctionCallSignatures
+} from '../capabilities/geminiProviderAdaptation';
+import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
@@ -605,6 +609,47 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
   }
 }
 
+/**
+ * Provider state stored in a model reply that only its source can read is not replayed elsewhere:
+ * GPT reasoning signatures across Responses channels, and Gemini call signatures to an OpenAI-
+ * compatible model that is not Gemini.
+ */
+function isolateCrossSourceProviderState(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  return isolateCrossSourceGeminiCallSignatures(
+    isolateCrossChannelGptThoughtSignatures(content, source, request, provider),
+    source,
+    request,
+    provider
+  );
+}
+
+/**
+ * The OpenAI-compatible encoder returns a stored Gemini call signature as
+ * `tool_calls[].extra_content.google.thought_signature`. Chat Completions documents only
+ * `id`/`type`/`function` there and strict servers reject the field, so the signature goes back
+ * only to a Gemini-like model, or to the same channel and model that produced the call (a Gemini
+ * behind a gateway alias). A reply of unknown source keeps it only for Gemini-like models.
+ */
+function isolateCrossSourceGeminiCallSignatures(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  if (
+    provider !== 'openai-compatible'
+    || content.role !== 'model'
+    || openAICompatibleModelReadsGeminiSignatures(request.modelId)
+    || (source?.providerId === request.providerId && source.modelId === request.modelId)
+  ) return content;
+  return withoutGeminiFunctionCallSignatures(content);
+}
+
 function isolateCrossChannelGptThoughtSignatures(
   content: MessageContent,
   source: FullProviderContextItem['modelSource'],
@@ -718,7 +763,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     if (decoded) {
       const historical = decoded.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
       if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
-      contents.push(isolateCrossChannelGptThoughtSignatures(decoded, item.modelSource, request, provider));
+      contents.push(isolateCrossSourceProviderState(decoded, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
     }

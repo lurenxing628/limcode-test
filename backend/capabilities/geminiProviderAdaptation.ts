@@ -233,6 +233,46 @@ function geminiOpenAICompatibleBaseName(modelId: string): string {
 }
 
 /**
+ * An OpenAI-compatible model that reads Gemini signatures in `tool_calls[].extra_content`: a Gemini
+ * name or a model the capability table knows as Gemini. Other models only see the Chat Completions
+ * `tool_calls` fields `id`/`type`/`function`, and strict servers reject anything else.
+ */
+export function openAICompatibleModelReadsGeminiSignatures(modelId: string): boolean {
+  const kind = geminiThinkingCapabilityForModel(modelId).kind;
+  return kind === 'thinkingLevel' || kind === 'thinkingBudget' || isGeminiOpenAICompatibleModelName(modelId);
+}
+
+/**
+ * The content with the Gemini signatures of its function calls removed (the values the OpenAI-
+ * compatible encoder would send as `extra_content.google.thought_signature`); every other part and
+ * other providers' signatures stay as they are. Returns the same object when nothing is removed.
+ */
+export function withoutGeminiFunctionCallSignatures<T extends { parts: readonly unknown[] }>(content: T): T {
+  let changed = false;
+  const parts = content.parts.map((part) => {
+    if (!isRecord(part) || !isRecord(part.functionCall)) return part;
+    const projected: Record<string, unknown> = { ...part };
+    let partChanged = false;
+    const portable = normalizedSignatureString(part.thoughtSignature);
+    // An unprefixed signature is sent as a Gemini one (geminiSignatureFromUnifiedPart).
+    if (portable && (parsePortableThoughtSignature(portable)?.provider ?? 'gemini') === 'gemini') {
+      delete projected.thoughtSignature;
+      partChanged = true;
+    }
+    if (isRecord(part.thoughtSignatures) && 'gemini' in part.thoughtSignatures) {
+      const { gemini: _gemini, ...others } = part.thoughtSignatures;
+      if (Object.keys(others).length > 0) projected.thoughtSignatures = others;
+      else delete projected.thoughtSignatures;
+      partChanged = true;
+    }
+    if (!partChanged) return part;
+    changed = true;
+    return projected;
+  });
+  return changed ? { ...content, parts } : content;
+}
+
+/**
  * Gemini thought signatures on the OpenAI-compatible wire travel in
  * `tool_calls[].extra_content.google.thought_signature`
  * (https://ai.google.dev/gemini-api/docs/thought-signatures, "OpenAI compatibility").
