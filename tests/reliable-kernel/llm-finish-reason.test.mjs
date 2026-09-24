@@ -161,3 +161,66 @@ test('C8 Gemini：没有内容的 SAFETY / MAX_TOKENS / MALFORMED_FUNCTION_CALL 
     assert.equal(result.done, true, 'STOP 保持原样');
   });
 });
+
+// Responses HTTP：接入库不给 Responses 产出 finishReason。只靠线上看到的终态判断：状态为 incomplete（或推理用尽了
+// max_output_tokens）而且没有任何可见输出时按失败上报并写明原因；这不依赖接入库对 response.incomplete 的处理方式。
+const responsesEvent = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+const reasoningOnlyStream = (terminal) => [
+  responsesEvent('response.created', { response: { id: 'resp_1', object: 'response', status: 'in_progress', output: [] } }),
+  responsesEvent('response.output_item.added', { output_index: 0, item: { id: 'rs_1', type: 'reasoning', summary: [] } }),
+  responsesEvent('response.output_item.done', { output_index: 0, item: { id: 'rs_1', type: 'reasoning', summary: [], encrypted_content: 'ENC' } }),
+  terminal
+].join('');
+const exhaustedUsage = { input_tokens: 12, output_tokens: 256, output_tokens_details: { reasoning_tokens: 256 }, total_tokens: 268 };
+
+test('C8 Responses HTTP：只有推理就以 incomplete 结束时按失败上报，写明 max_output_tokens 被推理用尽', async () => {
+  const terminals = [
+    // 官方形状：接入库当前把它当错误块，失败原因只剩 “max_output_tokens”。
+    responsesEvent('response.incomplete', { response: { id: 'resp_1', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, usage: exhaustedUsage } }),
+    // 接入库不认、不报错的写法（例如中转改名的终态事件）：以前会被当成被截断的流去重试。
+    `data: ${JSON.stringify({ type: 'response.done', response: { id: 'resp_1', status: 'incomplete', usage: exhaustedUsage } })}\n\n`
+  ];
+  for (const terminal of terminals) {
+    await withServer(() => ({ sse: reasoningOnlyStream(terminal) }), async (base) => {
+      const result = await run(settings('openai-responses', `${base}/v1`, 'gpt-5.5', { generationConfig: { maxOutputTokens: 256 } }));
+      assert.equal(result.done, false, terminal);
+      assert.ok(result.error, terminal);
+      assert.match(result.error.message, /没有返回任何可见内容/);
+      assert.match(result.error.message, /incomplete/);
+      assert.equal(result.error.rawError.kind, 'empty_response');
+      assert.equal(result.error.rawError.responseStatus, 'incomplete');
+      if (terminal.includes('incomplete_details')) {
+        assert.match(result.error.message, /max_output_tokens/);
+        assert.match(result.error.message, /推理/);
+      }
+    });
+  }
+});
+
+test('C8 Responses HTTP 非流式：只有推理且 incomplete，或推理用尽输出上限时按失败上报；有正文时照常成功', async () => {
+  const response = (status, output, extra = {}) => ({ id: 'resp_1', object: 'response', status, output, usage: exhaustedUsage, ...extra });
+  const reasoning = { id: 'rs_1', type: 'reasoning', summary: [], encrypted_content: 'ENC' };
+  const message = { id: 'msg_1', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'answer', annotations: [] }] };
+  const failing = [
+    response('incomplete', [reasoning], { incomplete_details: { reason: 'max_output_tokens' } }),
+    // 网关报 completed，但推理用掉了全部 max_output_tokens，一个可见 token 都没有。
+    response('completed', [reasoning])
+  ];
+  for (const body of failing) {
+    await withServer(() => ({ body }), async (base) => {
+      const result = await run(settings('openai-responses', `${base}/v1`, 'gpt-5.5', { stream: false, generationConfig: { maxOutputTokens: 256 } }));
+      assert.equal(result.done, false, body.status);
+      assert.match(result.error.message, /没有返回任何可见内容/, body.status);
+      assert.match(result.error.message, /max_output_tokens/, body.status);
+    });
+  }
+  await withServer(() => ({ body: response('completed', [reasoning, message]) }), async (base) => {
+    const result = await run(settings('openai-responses', `${base}/v1`, 'gpt-5.5', { stream: false, generationConfig: { maxOutputTokens: 256 } }));
+    assert.equal(result.done, true);
+    assert.equal(result.error, undefined);
+  });
+  await withServer(() => ({ body: response('completed', [reasoning], { usage: { input_tokens: 12, output_tokens: 40, output_tokens_details: { reasoning_tokens: 40 }, total_tokens: 52 } }) }), async (base) => {
+    const result = await run(settings('openai-responses', `${base}/v1`, 'gpt-5.5', { stream: false, generationConfig: { maxOutputTokens: 256 } }));
+    assert.equal(result.done, true, '没用尽上限的空回复行为不变');
+  });
+});

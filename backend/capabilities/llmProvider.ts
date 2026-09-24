@@ -11,7 +11,7 @@ import {
 import { estimateTokenCount, sliceByTokens } from 'tokenx';
 import { mapWithBoundedConcurrency } from './boundedConcurrency';
 import { createProxyFetch } from './proxyFetch';
-import { createTerminalValidatedFetch } from './terminalValidatedFetch';
+import { createTerminalValidatedFetch, type ResponsesTerminalEvidence } from './terminalValidatedFetch';
 import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
 import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 import { installProviderCompatibility } from './geminiProviderAdaptation';
@@ -461,8 +461,11 @@ export async function startLlmProvider(
       return response;
     };
     const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
+    // Responses HTTP：本次尝试线上看到的终态（每次尝试开始时清空），用来判断空回复是不是 incomplete。
+    const responsesTerminal: ResponsesTerminalObservation = {};
     const providerFetch = createTerminalValidatedFetch(observeNativeHttpFetch, settings.provider, {
-      createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined
+      createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined,
+      onResponsesTerminal: (terminal) => { responsesTerminal.current = terminal; }
     });
     const headers = headersForProviderContext(
       settings,
@@ -521,6 +524,7 @@ export async function startLlmProvider(
         attemptEmitted = true;
         streamEmit(event);
       };
+      responsesTerminal.current = undefined;
       try {
         await runLlmAttempt(
           request,
@@ -535,7 +539,8 @@ export async function startLlmProvider(
           sawRetry ? { retryAttempt: retryCount, retryMaxAttempts: maxRetries } : undefined,
           proxy,
           nativeCapabilities,
-          controls
+          controls,
+          responsesTerminal
         );
         return;
       } catch (error) {
@@ -607,9 +612,13 @@ async function runLlmAttempt(
   retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice,
   proxy?: string,
   nativeCapabilities?: OpenAIResponsesNativeCapabilities,
-  controls?: LlmStartRuntimeControls
+  controls?: LlmStartRuntimeControls,
+  responsesTerminal: ResponsesTerminalObservation = {}
 ): Promise<void> {
   const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
+  const maxOutputTokens = effectiveRequestGenerationConfig(request, settings)?.maxOutputTokens;
+  const emptyResponsesTerminal = (): LlmAttemptFailure | undefined =>
+    responsesEmptyTerminalFailure(responsesTerminal.current, maxOutputTokens);
   const observingEmit = (value: unknown): Emit => {
     if (!options.debugCapture?.active(debugContext)) return emit;
     const sdkSource = debugSource(unified.getLlmObservation(value));
@@ -636,12 +645,13 @@ async function runLlmAttempt(
       signal
     });
     if (signal?.aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
+    const visible = !hasUnifiedError(response) && unifiedPartsHaveVisibleOutputOrToolCall(response.content?.parts);
+    const emptyTerminal = visible ? undefined : emptyResponsesTerminal();
+    if (emptyTerminal) throw new LlmAttemptFailureError(emptyTerminal);
     if (hasUnifiedError(response)) {
       throw new LlmAttemptFailureError(failureFromProviderError(response.error, { rawResponse: response.rawResponse }));
     }
-    const abnormalFinish = unifiedPartsHaveVisibleOutputOrToolCall(response.content?.parts)
-      ? undefined
-      : abnormalFinishReason(response.finishReason);
+    const abnormalFinish = visible ? undefined : abnormalFinishReason(response.finishReason);
     if (abnormalFinish) throw new LlmAttemptFailureError(emptyAbnormalFinishFailure(abnormalFinish));
     emitRetryRecovered(request.id, emit, retryRecoveryNotice);
     emitUnifiedResponse(request.id, response, observingEmit(response));
@@ -725,6 +735,9 @@ async function runLlmAttempt(
       const chunkEmit = observingEmit(chunk);
       if (signal?.aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
       if (hasUnifiedError(chunk)) {
+        // 接入库把 response.incomplete 报成错误块时，没有任何可见输出的按空回复写明原因。
+        const emptyTerminal = sawVisibleOutputOrToolCall ? undefined : emptyResponsesTerminal();
+        if (emptyTerminal) throw new LlmAttemptFailureError(emptyTerminal);
         const failure = failureFromProviderError(chunk.error, {
           rawChunk: (chunk as { rawChunk?: unknown }).rawChunk ?? chunk,
           ...createDoneTiming(timing.firstStreamChunkAt, Date.now(), timing.firstStreamChunkMark, nowMonotonicMs(), timing.streamTimingChunkCount)
@@ -782,8 +795,11 @@ async function runLlmAttempt(
       emitUnifiedChunk(request.id, chunk, chunkEmit, nativeChain);
     }
     // 流正常结束但没有任何可见输出和工具调用，且结束原因表示出错、被过滤或被截断：按失败上报，不当成成功的空回复。
+    // Responses 没有 finishReason，按线上终态（incomplete，或推理用尽 max_output_tokens）判断。
     const abnormalFinish = sawVisibleOutputOrToolCall ? undefined : abnormalFinishReason(lastFinishReason);
     if (abnormalFinish) throw new LlmAttemptFailureError(emptyAbnormalFinishFailure(abnormalFinish));
+    const emptyTerminal = sawVisibleOutputOrToolCall ? undefined : emptyResponsesTerminal();
+    if (emptyTerminal) throw new LlmAttemptFailureError(emptyTerminal);
   } catch (error) {
     const aborted = isRequestAbort(signal);
     if (activeThoughtBlock) activeThoughtBlock = aborted
@@ -880,6 +896,48 @@ function chunkHasVisibleOutputOrToolCall(chunk: UnifiedLLMStreamChunk): boolean 
 function emptyAbnormalFinishFailure(finishReason: string): LlmAttemptFailure {
   const message = `模型没有返回任何可见内容或工具调用就结束了（结束原因：${finishReason}）。`;
   return { message, rawError: { kind: 'empty_response', finishReason, message }, createdAt: Date.now() };
+}
+
+interface ResponsesTerminalObservation {
+  current?: ResponsesTerminalEvidence;
+}
+
+/**
+ * OpenAI Responses 的空回复（https://platform.openai.com/docs/api-reference/responses/object）：接入库不产出 finishReason，
+ * 按线上终态判断。`status: "incomplete"`（`incomplete_details.reason` 为 max_output_tokens 或 content_filter），
+ * 或网关报 completed 但推理用掉了全部 max_output_tokens，都说明这次回复没有完成，不能当成成功的空回复。
+ */
+function responsesEmptyTerminalFailure(
+  terminal: ResponsesTerminalEvidence | undefined,
+  maxOutputTokens: number | undefined
+): LlmAttemptFailure | undefined {
+  if (!terminal) return undefined;
+  const usage = isRecord(terminal.usage) ? terminal.usage : undefined;
+  const outputTokens = typeof usage?.output_tokens === 'number' ? usage.output_tokens : undefined;
+  const details = isRecord(usage?.output_tokens_details) ? usage.output_tokens_details : undefined;
+  const reasoningTokens = typeof details?.reasoning_tokens === 'number' ? details.reasoning_tokens : undefined;
+  const reasoningUsedAll = outputTokens !== undefined && outputTokens > 0
+    && reasoningTokens !== undefined && reasoningTokens >= outputTokens;
+  let reason: string | undefined;
+  if (terminal.status === 'incomplete') reason = terminal.reason;
+  else if (terminal.status === 'completed' && reasoningUsedAll && maxOutputTokens !== undefined && outputTokens! >= maxOutputTokens) {
+    reason = 'max_output_tokens';
+  } else return undefined;
+  const explanation = reason === 'max_output_tokens' && reasoningUsedAll
+    ? `；${outputTokens} 个输出 token 全部用在了推理上，可以调高输出上限或降低思考强度`
+    : reason === 'content_filter' ? '；回复被内容过滤拦下' : '';
+  const message = `模型没有返回任何可见内容或工具调用就结束了（Responses 状态：${terminal.status}${reason ? `，原因：${reason}` : ''}${explanation}）。`;
+  return {
+    message,
+    rawError: {
+      kind: 'empty_response',
+      responseStatus: terminal.status,
+      ...(reason ? { finishReason: reason, incompleteReason: reason } : {}),
+      ...(terminal.usage !== undefined ? { usage: toPlainJsonLike(terminal.usage) } : {}),
+      message
+    },
+    createdAt: Date.now()
+  };
 }
 
 async function* streamOpenAIResponsesWithLimCodeSession(input: {
