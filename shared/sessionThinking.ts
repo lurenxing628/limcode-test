@@ -4,10 +4,22 @@ import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
 import { hasThinkingBodyConflict } from './sessionThinkingBody';
 import { anthropicModelReasoningCapability, resolveProviderOpenAICompatibleDialect } from './modelCapabilities';
-import { openAICompatibleModelThinkingRule, openAICompatibleThinkingLevels, resolveOpenAICompatibleDialect } from './openAICompatibleDialect';
+import {
+  mapOpenAICompatibleEffort,
+  openAICompatibleEffortValues,
+  openAICompatibleModelThinkingRule,
+  openAICompatibleThinkingLevels,
+  resolveOpenAICompatibleDialect
+} from './openAICompatibleDialect';
 
 /** 渠道配置（接口地址、测试结果、手动写法）：OpenAI 兼容渠道按它算出有效规则。 */
 export type SessionThinkingProviderConfig = Parameters<typeof resolveProviderOpenAICompatibleDialect>[0];
+
+/**
+ * OpenRouter 按原值转发顶层 `reasoning_effort`（openrouter.ai/docs Parameters）：取值没有 max；
+ * 必须思考的模型拒绝 none（Reasoning Tokens 页）。
+ */
+const OPENROUTER_EFFORTS: readonly LlmThinkingLevel[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 
 export type SessionThinkingCapability =
   | { kind: 'gemini-budget' | 'claude-budget'; min: number; max: number; automatic?: number; allowZero?: boolean }
@@ -65,6 +77,11 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
       ?? (openAICompatibleModelThinkingRule(model) ? resolveOpenAICompatibleDialect('', model, 'deepseek') : undefined);
     const thinking = dialect ? openAICompatibleThinkingLevels(dialect) : undefined;
     if (thinking) return { kind: 'deepseek-effort', values: thinking.canDisable ? ['none', ...thinking.levels] : thinking.levels };
+    // OpenRouter 按原值发送，不套 DeepSeek 档位；认得出的思考模型直接给选项，其余沿用渠道已配置强度的判断。
+    if (compatibleDialect?.platform === 'openrouter' && compatibleDialect.format === 'reasoning_effort'
+      && (compatibleDialect.rule || configuredEffort(provider, configuredThinking))) {
+      return { kind: 'openai-effort', values: compatibleDialect.rule?.canDisable === false ? OPENROUTER_EFFORTS.filter((value) => value !== 'none') : OPENROUTER_EFFORTS };
+    }
   }
   return configuredEffort(provider, configuredThinking);
 }
@@ -149,8 +166,24 @@ export function thinkingValueLabel(thinking?: LlmThinkingConfigRecord): string {
   return UNSET_THINKING_LABEL;
 }
 
+/**
+ * OpenAI 兼容渠道按有效规则实际发出的值：换算后的强度、只开关的模型、关不掉思考的模型、不发送。
+ * 与发出的值相同时返回 undefined（直接显示渠道设置的值）。
+ */
+function openAICompatibleSentLabel(providerConfig: SessionThinkingProviderConfig, model: string, thinking?: LlmThinkingConfigRecord): string | undefined {
+  const level = thinking?.thinkingLevel;
+  if (!level || level === 'not-set' || level === 'non-set') return undefined;
+  const dialect = resolveProviderOpenAICompatibleDialect(providerConfig, model);
+  if (dialect.format === 'omit') return `${level}，不发送思考参数`;
+  if (dialect.format === 'reasoning_effort' || !dialect.rule) return undefined;
+  if (level === 'none') return dialect.rule.canDisable ? undefined : 'none，模型关不掉思考，实际仍会思考';
+  const sent = mapOpenAICompatibleEffort(level, openAICompatibleEffortValues(dialect));
+  if (!sent) return `${level}，只开启思考，不发强度`;
+  return sent === level ? undefined : `${level}，实际发 ${sent}`;
+}
+
 /** Display the existing adapter's mapping without claiming a remote service's defaults. */
-export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: string, thinking?: LlmThinkingConfigRecord): string {
+export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: string, thinking?: LlmThinkingConfigRecord, providerConfig?: SessionThinkingProviderConfig): string {
   if (provider === 'gemini') {
     const capability = geminiThinkingCapabilityForModel(model);
     if (capability.kind === 'thinkingLevel') {
@@ -167,6 +200,8 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
   }
   if (provider === 'openai-responses' && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
   if ((provider === 'openai-responses' || provider === 'openai-compatible') && isGpt6NoneCapableModel(model) && thinking?.thinkingLevel === 'minimal') return 'low（适配器）';
+  const compatibleLabel = provider === 'openai-compatible' && providerConfig ? openAICompatibleSentLabel(providerConfig, model, thinking) : undefined;
+  if (compatibleLabel) return compatibleLabel;
   if (provider === 'openai-compatible' || provider === 'openai-responses') return thinkingValueLabel({ thinkingLevel: thinking?.thinkingLevel });
   return thinkingValueLabel(thinking);
 }

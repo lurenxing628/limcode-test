@@ -21,7 +21,7 @@ const {
   OPENAI_COMPATIBLE_SERVICE_PRESETS
 } = require('../../dist/extension/shared/openAICompatibleDialect.js');
 const { canonicalLlmProviderKind } = require('../../dist/extension/shared/protocol.js');
-const { sessionThinkingCapability, validateSessionThinkingOverride } = require('../../dist/extension/shared/sessionThinking.js');
+const { sessionThinkingCapability, validateSessionThinkingOverride, sessionThinkingDisplayLabel } = require('../../dist/extension/shared/sessionThinking.js');
 const { normalizeModelCapabilitySnapshot, resolveProviderOpenAICompatibleDialect } = require('../../dist/extension/shared/modelCapabilities.js');
 const { libraryProviderKind, adaptOpenAICompatibleDialect } = require('../../dist/extension/backend/capabilities/openAICompatibleDialectAdaptation.js');
 const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
@@ -576,4 +576,26 @@ test('MiMo 的 tool 消息不支持 file：工具结果里的文件移到这批 
   // DeepSeek 官方 tool 消息接受 file，保持原样。
   const deepseek = await wire(DEEPSEEK, 'deepseek-v4-pro', { contents, tools: [{ ...TOOL, name: 'read' }] });
   assert.equal(deepseek.messages.find((message) => message.role === 'tool').content.some((block) => block.type === 'file'), true);
+});
+
+test('会话思考选项按平台区分：OpenRouter 按原值发送、没有 max，必须思考的模型没有 none；本机服务不套 DeepSeek 档位', () => {
+  // OpenRouter Parameters：顶层 reasoning_effort 为 xhigh / high / medium / low / minimal / none；必须思考的模型拒绝 none。
+  const capability = (baseUrl, model, thinking) => sessionThinkingCapability('openai-compatible', model, undefined, thinking, settings(baseUrl, model));
+  assert.deepEqual(capability(OPENROUTER, 'deepseek/deepseek-v4-pro'), { kind: 'openai-effort', values: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] });
+  assert.deepEqual(capability(OPENROUTER, 'moonshotai/kimi-k3').values, ['minimal', 'low', 'medium', 'high', 'xhigh']);
+  assert.equal(capability(OPENROUTER, 'openai/gpt-4o'), undefined);
+  assert.deepEqual(capability(OPENROUTER, 'some/relay-model', { thinkingLevel: 'high' }).values, ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+  assert.equal(capability('http://127.0.0.1:8000/v1', 'deepseek-v4-pro'), undefined);
+  assert.ok(capability('http://127.0.0.1:8000/v1', 'deepseek-v4-pro', { thinkingLevel: 'high' }).values.includes('medium'));
+});
+
+test('“跟随渠道”显示实际发出的值：换算后的强度、只开关的模型、关不掉思考的模型', () => {
+  const label = (baseUrl, model, level, extra) => sessionThinkingDisplayLabel('openai-compatible', model, { thinkingLevel: level }, settings(baseUrl, model, extra));
+  assert.equal(label(DEEPSEEK, 'deepseek-v4-pro', 'high'), 'high');
+  assert.equal(label(DEEPSEEK, 'deepseek-v4-pro', 'medium'), 'medium，实际发 high');
+  assert.equal(label('https://api.xiaomimimo.com/v1', 'mimo-v2-pro', 'high'), 'high，只开启思考，不发强度');
+  assert.equal(label(MOONSHOT, 'kimi-k3', 'none'), 'none，模型关不掉思考，实际仍会思考');
+  assert.equal(label(OPENROUTER, 'deepseek/deepseek-v4-pro', 'medium'), 'medium');
+  assert.equal(label(DEEPSEEK, 'deepseek-v4-pro', 'high', { openaiCompatibleThinkingFormat: 'omit' }), 'high，不发送思考参数');
+  assert.equal(sessionThinkingDisplayLabel('openai-compatible', 'deepseek-v4-pro', undefined, settings(DEEPSEEK, 'deepseek-v4-pro')), '未设置（由服务决定）');
 });

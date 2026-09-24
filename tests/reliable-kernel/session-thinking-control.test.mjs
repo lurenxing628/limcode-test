@@ -305,3 +305,10 @@ test('OpenAI 兼容渠道的选项按渠道配置计算：硅基流动的 DeepSe
   f.control.save('high');
   assert.deepEqual(plain(f.writes[0][3]), { kind: 'deepseek-effort', value: 'high' });
 });
+
+test('The channel default label shows the value actually sent on OpenAI-compatible channels', () => {
+  const model = 'deepseek-v4-pro';
+  const f = fixture({ props: { model, config: { id: 'channel', provider: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', model, models: [{ id: model, name: model }], modelConfigs: [], generationConfig: { thinkingConfig: { thinkingLevel: 'medium' } } } } });
+  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：medium，实际发 high');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：跟随渠道（medium，实际发 high）');
+});

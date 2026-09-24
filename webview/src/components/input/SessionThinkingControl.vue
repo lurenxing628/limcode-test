@@ -29,7 +29,7 @@ const busy = computed(() => pending.value?.status === 'saving');
 const disabled = computed(() => !ready.value || busy.value || (!capability.value && !inactiveOverride.value && !inheritChildren.value));
 /** What the channel/model configuration itself sends when this conversation does not override it. */
 const channelValue = computed(() => props.config && props.model
-  ? sessionThinkingDisplayLabel(props.config.provider, props.model, settings.value?.generationConfig?.thinkingConfig)
+  ? sessionThinkingDisplayLabel(props.config.provider, props.model, settings.value?.generationConfig?.thinkingConfig, props.config)
   : '');
 const defaultLabel = computed(() => props.config && props.model ? `跟随渠道设置：${channelValue.value}` : '正在读取渠道设置');
 const LEVEL_NAMES: Record<string, string> = {
