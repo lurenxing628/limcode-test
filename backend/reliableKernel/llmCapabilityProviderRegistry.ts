@@ -10,6 +10,7 @@ import {
   type LlmProviderOptions,
   type LlmProviderTransportTrace
 } from '../capabilities/llmProvider';
+import { probeOpenAICompatibleThinking } from '../capabilities/openAICompatibleThinkingProbe';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { LlmCapabilityFullRequestAdapter } from './llmCapabilityProviderAdapter';
 import type { FullRequestProviderAdapter } from './modelProviderControlPlane';
@@ -101,6 +102,27 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
     const task = probeLlmProviderNativeCompaction(config, { ...this.options, settings: async () => config })
       .finally(() => { if (this.nativeProbes.get(key) === task) this.nativeProbes.delete(key); });
     this.nativeProbes.set(key, task);
+    return task;
+  }
+
+  private readonly thinkingProbes = new Map<string, ReturnType<typeof probeOpenAICompatibleThinking>>();
+
+  /**
+   * “测试这个模型”（OpenAI 兼容思考参数）：按模型专属配置叠加请求头后测试 `config.model`；
+   * 渠道、接口地址、模型与修改时间都相同的并发测试合并成一次。
+   */
+  public probeOpenAICompatibleThinking(config: LlmProviderConfigRecord) {
+    this.requireOpen();
+    const key = JSON.stringify([config.id, config.baseUrl, config.model, config.updatedAt]);
+    const pending = this.thinkingProbes.get(key);
+    if (pending) return pending;
+    const task = Promise.resolve()
+      .then(() => probeOpenAICompatibleThinking(applyFrozenModelProviderConfig(config, config.model), {
+        ...(this.options.proxy ? { proxy: this.options.proxy } : {}),
+        ...(this.options.headers ? { headers: this.options.headers } : {})
+      }))
+      .finally(() => { if (this.thinkingProbes.get(key) === task) this.thinkingProbes.delete(key); });
+    this.thinkingProbes.set(key, task);
     return task;
   }
 

@@ -108,6 +108,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/claude-thinking-binding-persistence.test.mjs',
   'tests/reliable-kernel/provider-parameter-adaptation.test.mjs',
   'tests/reliable-kernel/openai-compatible-dialect.test.mjs',
+  'tests/reliable-kernel/openai-compatible-thinking-probe.test.mjs',
   'tests/reliable-kernel/provider-wire-invariant.test.mjs',
   'tests/reliable-kernel/claude-cross-model-thinking-replay.test.mjs',
   'tests/reliable-kernel/provider-history-wire.test.mjs',
