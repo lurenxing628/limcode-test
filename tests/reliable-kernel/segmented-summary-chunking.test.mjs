@@ -947,3 +947,47 @@ test('bold headings over the limit are still cut by section, keeping the model f
   assert.match(text, /BOLD-ACTIVE-KEEP/);
   assert.doesNotMatch(text, /SOURCE-USER-ASK|SOURCE-TOOL-RESULT/);
 });
+
+test('cancelling while the shorten request is in flight ends the compaction without a summary', async () => {
+  let requests = 0;
+  let shortenClosed;
+  const shortenClosedPromise = new Promise((resolve) => { shortenClosed = resolve; });
+  let shortenStarted;
+  const shortenStartedPromise = new Promise((resolve) => { shortenStarted = resolve; });
+  const server = http.createServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    requests += 1;
+    if (requests === 1) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-oversized', object: 'chat.completion', created: 1, model: 'gpt-test',
+        choices: [{ index: 0, message: { role: 'assistant', content: OVERSIZED_REPLY }, finish_reason: 'stop' }]
+      }));
+      return;
+    }
+    // The shorten request never answers; only the client's cancellation ends it.
+    res.on('close', () => shortenClosed());
+    shortenStarted();
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const capability = createLlmProviderCapability({
+    settings: async () => ({ ...providerConfig('openai-compatible', `http://127.0.0.1:${server.address().port}/v1`), stream: false }),
+    compressionSettings: async () => undefined
+  });
+  const request = oversizedSummaryRequest();
+  const events = [];
+  try {
+    capability.compact(request, (event) => events.push(event));
+    await shortenStartedPromise;
+    capability.abort(request.id);
+    await shortenClosedPromise;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(requests, 2);
+    assert.equal(events.some((event) => event.type === 'llm:compactDone'), false, 'a cancelled shorten must not fall back to a summary');
+    assert.equal(events.some((event) => event.type === 'llm:compactError'), false);
+  } finally {
+    capability.dispose();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
