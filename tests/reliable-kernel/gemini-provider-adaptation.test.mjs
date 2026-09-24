@@ -1232,9 +1232,41 @@ test('D4 Gemini drops provider items of other formats and contents left empty', 
 
 test('D4 other providers still receive provider items for their own encoders', () => {
   const history = [userText('q1'), { role: 'model', parts: [{ providerContext: RESPONSES_COMPACTION }, { text: 'answer' }] }];
-  for (const providerKind of ['openai-responses', 'claude', 'openai-compatible']) {
+  for (const providerKind of ['openai-responses', 'claude']) {
     const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, providerKind);
     assert.deepEqual(request.contents.flatMap((content) => content.parts).filter((part) => part.providerContext).length, 1, providerKind);
+  }
+});
+
+test('D4 OpenAI-compatible drops provider items of other formats and contents left empty', async () => {
+  // Before: a model content holding only a Responses reasoning item and a compaction item (its thought
+  // summary signed by Responses is already dropped) was encoded as {"role":"assistant","content":""}.
+  const reasoningItem = { provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'reasoning',
+    rawItem: { type: 'reasoning', id: 'rs_1', summary: [], encrypted_content: 'enc' } };
+  const history = [
+    userText('q1'),
+    { role: 'model', parts: [
+      { text: 'responses thought', thought: true, thoughtSignature: 'openai-responses:gAAAA' },
+      { providerContext: reasoningItem },
+      { providerContext: RESPONSES_COMPACTION }
+    ] },
+    { role: 'model', parts: [{ providerContext: RESPONSES_COMPACTION }, { text: 'answer' }] },
+    { role: 'model', parts: [{ providerContext: { provider: 'anthropic', format: 'claude', itemType: 'compaction', rawItem: { type: 'compaction', content: 's' } } }] },
+    { role: 'model', parts: [{ text: 'kept' }], providerContext: { provider: 'openai', format: 'openai-responses', itemType: 'message', rawItem: {} } },
+    { role: 'user', parts: [{ providerContext: { provider: 'openai', format: 'openai-responses', itemType: 'configuration_update',
+      rawItem: { type: 'configuration_update', reasoning: { effort: 'high' } } } }] },
+    userText('q2')
+  ];
+  const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, 'openai-compatible');
+  assert.deepEqual(request.contents.map((content) => `${content.role}:${content.parts.map((part) => part.text).join('+')}`),
+    ['user:q1', 'model:answer', 'model:kept', 'user:q2']);
+  assert.doesNotMatch(JSON.stringify(request.contents), /providerContext/);
+  for (const [model, baseUrl] of [['gpt-5.5'], ['deepseek-v4-flash', 'https://api.deepseek.com/v1']]) {
+    const body = (await dryRunLlmProvider({ id: 'r', conversationId: 'c', contents: history, tools: [] }, {
+      settings: async () => providerConfig({ model, apiKey: '', ...(baseUrl ? { baseUrl } : {}) })
+    })).body;
+    assert.deepEqual(body.messages.filter((message) => message.role !== 'system').map((message) => [message.role, message.content]),
+      [['user', 'q1'], ['assistant', 'answer'], ['assistant', 'kept'], ['user', 'q2']], model);
   }
 });
 

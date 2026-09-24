@@ -53,7 +53,7 @@ export function toUnifiedRequest(
     : providerKind === 'claude'
       ? projectClaudeThoughtReplay(requestContents)
       : providerKind === 'openai-compatible'
-        ? projectOpenAICompatibleThoughtReplay(requestContents)
+        ? projectOpenAICompatibleThoughtReplay(projectForeignProviderContext(requestContents, 'openai-compatible'))
         : requestContents;
   return {
     contents: contents.flatMap((content) => toUnifiedContents(content, providerKind, nativeAsync)),
@@ -109,15 +109,25 @@ function isForeignThoughtPart(part: ContentPart, provider: string): boolean {
  * Claude 的 compaction 块）：接入库的 Gemini 编码器会把 `providerContext` 原样抄进 parts，
  * Gemini 的 Part/Content 没有这个字段，整条请求会被拒。Gemini 自己格式的项保留（目前没有）。
  * 摘掉后为空的内容整条去掉，不发出空 parts。
- * Claude 与 OpenAI 兼容格式的编码器本来就不发别家的项（Claude 只还原自己的 compaction 块），不在这里处理。
+ * Claude 的编码器本来就不发别家的项（只还原自己的 compaction 块），不在这里处理。
  */
 function projectGeminiProviderContext(contents: readonly MessageContent[]): readonly MessageContent[] {
+  return projectForeignProviderContext(contents, 'gemini');
+}
+
+/**
+ * 摘掉不是 `format` 格式的 provider 项（part 与内容级的 `providerContext`），摘空的内容整条去掉。
+ * - Gemini：见 projectGeminiProviderContext。
+ * - OpenAI 兼容：编码器不发 provider 项，但一条只剩 provider 项的内容（例如 Responses 回复里只有推理项与
+ *   服务端 compaction 项、思考摘要已被摘掉）会编码成 `{"role":"assistant","content":""}` 这样的空消息。
+ */
+function projectForeignProviderContext(contents: readonly MessageContent[], format: string): readonly MessageContent[] {
   let changed = false;
   const projected: MessageContent[] = [];
   for (const content of contents) {
     const contentContext = (content as MessageContent & { providerContext?: unknown }).providerContext;
-    const foreignContentContext = contentContext !== undefined && !isGeminiProviderContext(contentContext);
-    const parts = content.parts.filter((part) => !isProviderContextPart(part) || isGeminiProviderContext(part.providerContext));
+    const foreignContentContext = contentContext !== undefined && !isProviderContextOfFormat(contentContext, format);
+    const parts = content.parts.filter((part) => !isProviderContextPart(part) || isProviderContextOfFormat(part.providerContext, format));
     if (!foreignContentContext && parts.length === content.parts.length) {
       projected.push(content);
       continue;
@@ -130,8 +140,8 @@ function projectGeminiProviderContext(contents: readonly MessageContent[]): read
   return changed ? projected : contents;
 }
 
-function isGeminiProviderContext(value: unknown): boolean {
-  return isRecord(value) && value.format === 'gemini';
+function isProviderContextOfFormat(value: unknown, format: string): boolean {
+  return isRecord(value) && value.format === format;
 }
 
 /**
