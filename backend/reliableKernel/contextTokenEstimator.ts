@@ -294,8 +294,11 @@ export function estimateMaterializedContextTokens(
     contentType: segments[0].contentObject.content_type,
     content: segments[0].content.toString('utf8')
   }]).tokenCount;
+  // A stored estimate may count rendered state the projection does not, but it never undercuts what
+  // the block's contents measure: blocks written before Claude compaction text was counted stored
+  // only the envelope overhead.
   return safeTokenCount(
-    projected.tokenCount - projectedCompression + compressed,
+    projected.tokenCount - projectedCompression + Math.max(compressed, projectedCompression),
     'projected Context estimate'
   );
 }
@@ -386,10 +389,10 @@ function estimateCompressionEnvelopeTokens(content: string): number {
   if (!envelope || envelope.kind !== 'compression_contents' || !Array.isArray(envelope.contents)) {
     return estimateTextTokens(content);
   }
+  const measured = estimateMessageContentsTokens(envelope.contents.filter(isMessageContent));
   const stored = optionalTokenCount(envelope.estimatedTokens);
-  if (stored !== undefined) return stored;
-  const contents = envelope.contents.filter(isMessageContent);
-  return estimateMessageContentsTokens(contents);
+  // Same rule as estimateMaterializedContextTokens: the stored estimate never undercuts the contents.
+  return stored === undefined ? measured : Math.max(stored, measured);
 }
 
 function compressionEstimate(segments: readonly MaterializedContextSegment[]): number | undefined {

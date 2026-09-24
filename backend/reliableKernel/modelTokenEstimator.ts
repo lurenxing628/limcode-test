@@ -153,9 +153,10 @@ function estimateProviderContextTokens(value: unknown): number {
       + estimateTextTokens(typeof reasoning?.effort === 'string' ? reasoning.effort : '');
   }
   case 'compaction':
-    // Ciphertext is an opaque provider handle, not a text prompt. The compression envelope carries
-    // the provider-observed output token estimate for this state when one is available.
-    return 0;
+    // Claude's compaction block carries its summary as readable `content` that the model reads on
+    // every later request, so it is counted like text. OpenAI's carries only `encrypted_content`, an
+    // opaque provider handle that is not a text prompt and has no local size.
+    return typeof raw.content === 'string' ? estimateTextTokens(raw.content) : 0;
   default:
     return 0;
   }

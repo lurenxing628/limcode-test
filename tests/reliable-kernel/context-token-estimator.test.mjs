@@ -131,6 +131,36 @@ test('provider compaction ciphertext只保留rawItem权威副本且不按密文�
   assert.ok(kernel.estimateMessageContentsTokens(contents) < 20);
 });
 
+test('Claude 原生压缩块的可读摘要按文本计入上下文；旧库里只记了外壳大小的压缩块也按内容计', () => {
+  const summaryText = '已读取 README.md，第 1 行 hello，派过 A1 和 A2 两个子 Agent。'.repeat(60);
+  const contents = [{
+    role: 'model',
+    parts: [{
+      providerContext: {
+        provider: 'anthropic',
+        format: 'claude',
+        itemType: 'compaction',
+        rawItem: { type: 'compaction', content: summaryText, signature: 'signed-compaction' }
+      }
+    }]
+  }];
+  const measured = kernel.estimateMessageContentsTokens(contents);
+  assert.ok(measured >= kernel.estimateTextTokens(summaryText), `compaction text must be counted, got ${measured}`);
+  // Blocks written before this fix stored estimatedTokens of the envelope overhead only (4 in a real run).
+  const envelope = JSON.stringify({ kind: 'compression_contents', version: 1, contents, methodKind: 'provider_native', estimatedTokens: 4 });
+  const compression = segment('compression', COMPRESSION_TYPE, envelope, 'model');
+  assert.equal(kernel.estimateContextSegmentTokens(compression), measured);
+  const question = segment('message', MESSAGE_TYPE, JSON.stringify({ role: 'user', parts: [{ text: '还记得吗？' }] }), 'user');
+  const total = kernel.estimateMaterializedContextTokens([compression, question]);
+  assert.ok(total >= measured, `Context estimate ${total} must include the ${measured}-token compaction summary`);
+  // A larger stored estimate (e.g. rendered attachment state) is still honoured.
+  const richer = segment('compression', COMPRESSION_TYPE, JSON.stringify({
+    kind: 'compression_contents', version: 1, contents, methodKind: 'provider_native', estimatedTokens: measured + 500
+  }), 'model');
+  assert.equal(kernel.estimateContextSegmentTokens(richer), measured + 500);
+  assert.equal(kernel.estimateMaterializedContextTokens([richer, question]) - total, 500);
+});
+
 test('tool_pair只估算实际重传的functionResponse，不重复计算历史工具参数', () => {
   const hugeArguments = JSON.stringify({ content: 'x'.repeat(500_000) });
   const pair = JSON.stringify({
