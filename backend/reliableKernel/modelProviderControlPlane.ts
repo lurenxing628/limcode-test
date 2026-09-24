@@ -152,6 +152,12 @@ export interface FullProviderRequest {
    * async-marked call items; populated only for native-frozen requests.
    */
   nativeAsyncAdmittedCallIds?: readonly string[];
+  /**
+   * 这个对话已经选定的 Claude 保留思考处理（官方要求随会话保存、重启后也带上、去掉的思考块不再放回）：
+   * 取发送窗口里各条模型输出所属请求终态里记下的处理中最强的一种。fork 复制请求时一并复制；压缩掉的输出不在窗口里，
+   * 它们的思考块也不会再发送。
+   */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
   requestAddenda?: {
     currentTurnInput?: {
       messageId: string;
@@ -209,6 +215,8 @@ export interface ProviderStreamEvent {
   content: PlainJsonValue;
   usage?: PlainJsonValue;
   timing?: ProviderStreamTiming;
+  /** completed 才有：这次请求实际使用的 Claude 保留思考处理，写进请求终态，之后的请求按对话沿用。 */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
   /** Process-local signal: false for synthetic clocks such as thought_progress. Never persisted. */
   semanticProgress?: boolean;
 }
@@ -421,6 +429,8 @@ interface StreamStats {
    * the original ModelContextProjection root; never substituted by later/cumulative usage.
    */
   nativeInitialPromptTokenCount?: number;
+  /** 终态才写：这次请求实际使用的 Claude 保留思考处理（按对话沿用，见 FullProviderRequest.claudeThinkingBinding）。 */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 
 interface StreamIdentity {
@@ -859,6 +869,7 @@ export class ModelProviderControlPlane {
       ...(nativeAdmittedCallIds !== undefined && nativeAdmittedCallIds.length > 0
         ? { nativeAsyncAdmittedCallIds: nativeAdmittedCallIds }
         : {}),
+      ...conversationClaudeThinkingBinding(providerSegments),
       ...requestAddenda
     };
   }
@@ -924,6 +935,7 @@ export class ModelProviderControlPlane {
       recipe,
       context: providerContext,
       attachmentCatalogState,
+      ...conversationClaudeThinkingBinding(materialized.segments),
       ...requestAddenda
     };
   }
@@ -1564,7 +1576,8 @@ export class ModelProviderControlPlane {
       streamSeq: event.streamSeq,
       content: event.content,
       ...(event.usage !== undefined ? { usage: event.usage } : {}),
-      ...(event.timing !== undefined ? { timing: event.timing } : {})
+      ...(event.timing !== undefined ? { timing: event.timing } : {}),
+      ...(completed && event.claudeThinkingBinding ? { claudeThinkingBinding: event.claudeThinkingBinding } : {})
     });
   }
 
@@ -1683,6 +1696,7 @@ export class ModelProviderControlPlane {
       content: PlainJsonValue;
       usage?: PlainJsonValue;
       timing?: ProviderStreamTiming;
+      claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
     }
   ): Promise<StreamEventResult> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
@@ -1799,7 +1813,7 @@ export class ModelProviderControlPlane {
       contentObject: content.metadata,
       ...(content.insert ? { contentInsert: content.insert } : {}),
       usage: completed ? (event.usage ?? null) : null,
-      terminalStats: completed ? terminalStreamStats(stats, event.timing) : null,
+      terminalStats: completed ? terminalStreamStats(stats, event.timing, event.claudeThinkingBinding) : null,
       now: this.timestamp()
     });
     transactionCount = result.commit ? 1 : 0;
@@ -2936,6 +2950,7 @@ function normalizeStreamEvent(event: ProviderStreamEvent): {
   content: PlainJsonValue;
   usage?: PlainJsonValue;
   timing?: ProviderStreamTiming;
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 } {
   if (!event || !['output_delta', 'output_item_done', 'completed', 'native_control'].includes(event.kind)) {
     throw new TypeError(`Unsupported Provider stream event: ${String(event?.kind)}`);
@@ -2947,8 +2962,23 @@ function normalizeStreamEvent(event: ProviderStreamEvent): {
     streamSeq,
     content: normalizePlainJson(event.content, 'Provider stream event content'),
     ...(event.usage !== undefined ? { usage: normalizePlainJson(event.usage, 'Provider stream usage') } : {}),
-    ...(event.timing !== undefined ? { timing: normalizeProviderTiming(event.timing) } : {})
+    ...(event.timing !== undefined ? { timing: normalizeProviderTiming(event.timing) } : {}),
+    ...(event.claudeThinkingBinding === 'drop_block' || event.claudeThinkingBinding === 'strip_thinking'
+      ? { claudeThinkingBinding: event.claudeThinkingBinding }
+      : {})
   };
+}
+
+/** 发送窗口里各条模型输出所属请求终态里记下的 Claude 保留思考处理中最强的一种。 */
+function conversationClaudeThinkingBinding(
+  segments: readonly Pick<MaterializedContextSegment, 'sourceClaudeThinkingBinding'>[]
+): Pick<FullProviderRequest, 'claudeThinkingBinding'> {
+  let binding: FullProviderRequest['claudeThinkingBinding'];
+  for (const segment of segments) {
+    if (segment.sourceClaudeThinkingBinding === 'strip_thinking') return { claudeThinkingBinding: 'strip_thinking' };
+    if (segment.sourceClaudeThinkingBinding === 'drop_block') binding = 'drop_block';
+  }
+  return binding ? { claudeThinkingBinding: binding } : {};
 }
 
 function parseStreamStats(value: unknown): StreamStats {
@@ -2962,6 +2992,9 @@ function parseStreamStats(value: unknown): StreamStats {
     attemptSeq,
     socketGeneration,
     ...(typeof value.thinkingSelection === 'string' ? { thinkingSelection: value.thinkingSelection } : {}),
+    ...(value.claudeThinkingBinding === 'drop_block' || value.claudeThinkingBinding === 'strip_thinking'
+      ? { claudeThinkingBinding: value.claudeThinkingBinding }
+      : {}),
     retryReason: value.retryReason as ProviderTransientReason | null,
     ...compressionExecutionMetadata(value),
     ...(value.failure === undefined ? {} : { failure: readProviderRequestFailure(value.failure) }),
@@ -3005,8 +3038,12 @@ function normalizeNativeCapabilitiesSummary(value: unknown): OpenAIResponsesNati
   };
 }
 
-function terminalStreamStats(stats: StreamStats, timing?: ProviderStreamTiming): DomainRow {
-  const terminal: DomainRow = { ...stats, ...(timing ?? {}) };
+function terminalStreamStats(
+  stats: StreamStats,
+  timing?: ProviderStreamTiming,
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking'
+): DomainRow {
+  const terminal: DomainRow = { ...stats, ...(timing ?? {}), ...(claudeThinkingBinding ? { claudeThinkingBinding } : {}) };
   delete terminal.lastStreamSeq;
   delete terminal.lastStreamEventAt;
   return terminal;

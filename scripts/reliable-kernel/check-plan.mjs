@@ -130,6 +130,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/llm-finish-reason.test.mjs',
   'tests/reliable-kernel/openai-request-shaping.test.mjs',
   'tests/reliable-kernel/claude-thinking-adaptation.test.mjs',
+  'tests/reliable-kernel/claude-thinking-binding-persistence.test.mjs',
   'tests/reliable-kernel/provider-parameter-adaptation.test.mjs',
   'tests/reliable-kernel/openai-compatible-dialect.test.mjs',
   'tests/reliable-kernel/provider-wire-invariant.test.mjs',

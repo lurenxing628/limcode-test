@@ -7,7 +7,9 @@
  * - 配置版本是渠道的 updatedAt：用户改过渠道配置后，之前学到的不再沿用；保存配置时按渠道清空（forgetProviderRequestAdaptations）。
  * - 学到的适配 {@link LEARNED_ADAPTATION_TTL_MS} 后过期，重新按原样试探一次（网关可能已经修好）。
  * - 用户自己写在自定义请求参数（requestBody）里的键被拒时不替用户去掉，调用方改为报错写明是哪个参数、去哪里改。
- * Claude 保留思考的前缀失配（claudeThinkingAdaptation.ts）用同一套按目标记忆与立即重发。
+ * Claude 保留思考的前缀失配（claudeThinkingAdaptation.ts）用同一套立即重发，但选择按对话记住（官方要求随会话保存、
+ * 重启后也带上）：本请求的起点来自内核持久化的对话选择（LlmStartRequest.claudeThinkingBinding）与进程内按对话记住的选择，
+ * 学到的选择随 Done 事件交回内核持久化；不会套到同一渠道的其他对话上。
  * Claude 轮内系统消息被网关明确拒绝时（claudeTurnScopedReminders.ts），同样按目标退回原来的尾巴模式并立即重发。
  *
  * 真实错误文本依据：
@@ -120,8 +122,6 @@ interface TargetAdaptationState {
   model: string;
   /** 学到的参数与学到它的时间。 */
   parameters: Map<AdaptableRequestParameter, number>;
-  /** Claude 保留思考的前缀失配处理；只会 drop_block → strip_thinking 单向推进，不会放回。 */
-  claudeThinkingBinding?: ClaudeThinkingBindingMode;
   /** 网关明确拒绝了轮内系统消息的时间：这个目标之后的请求退回原来的尾巴模式（进程内记住，过期后重新试探）。 */
   claudeTurnScopedRemindersFallbackAt?: number;
 }
@@ -131,12 +131,48 @@ interface TargetAdaptationState {
  * 同一请求重发后又收到同一条报错时据此升级；不看其他并发请求学到的状态。
  */
 export interface ProviderRequestAdaptationSession {
+  readonly conversationId?: string;
+  /** 这个对话的 Claude 保留思考处理（本请求编码时使用）；只会 drop_block → strip_thinking 单向推进，不会放回。 */
+  claudeThinkingBinding?: ClaudeThinkingBindingMode;
   /** 最近一次编码发出的请求带的 Claude 保留思考处理（没带为 undefined）。 */
   sentClaudeThinkingBinding?: ClaudeThinkingBindingMode;
 }
 
-export function createProviderRequestAdaptationSession(): ProviderRequestAdaptationSession {
-  return {};
+/** 按对话记住的 Claude 保留思考处理（进程内，补内核持久化之前的空档，例如同一请求的内核重试）。 */
+const conversationClaudeThinkingBindings = new Map<string, ClaudeThinkingBindingMode>();
+const CONVERSATION_BINDING_LIMIT = 1024;
+
+export function createProviderRequestAdaptationSession(input: {
+  conversationId?: string;
+  /** 内核按对话持久化的选择。 */
+  claudeThinkingBinding?: ClaudeThinkingBindingMode;
+} = {}): ProviderRequestAdaptationSession {
+  const conversationId = input.conversationId?.trim() || undefined;
+  const remembered = conversationId ? conversationClaudeThinkingBindings.get(conversationId) : undefined;
+  const binding = strongerClaudeThinkingBinding(normalizeClaudeThinkingBinding(input.claudeThinkingBinding), remembered);
+  return {
+    ...(conversationId ? { conversationId } : {}),
+    ...(binding ? { claudeThinkingBinding: binding } : {})
+  };
+}
+
+/** 这个对话在本进程里记住的 Claude 保留思考处理（测试与诊断用）。 */
+export function learnedConversationClaudeThinkingBinding(conversationId: string): ClaudeThinkingBindingMode | undefined {
+  return conversationClaudeThinkingBindings.get(conversationId);
+}
+
+function rememberConversationClaudeThinkingBinding(conversationId: string, binding: ClaudeThinkingBindingMode): void {
+  conversationClaudeThinkingBindings.delete(conversationId);
+  conversationClaudeThinkingBindings.set(conversationId, binding);
+  while (conversationClaudeThinkingBindings.size > CONVERSATION_BINDING_LIMIT) {
+    const oldest = conversationClaudeThinkingBindings.keys().next().value;
+    if (oldest === undefined) break;
+    conversationClaudeThinkingBindings.delete(oldest);
+  }
+}
+
+export function normalizeClaudeThinkingBinding(value: unknown): ClaudeThinkingBindingMode | undefined {
+  return value === 'drop_block' || value === 'strip_thinking' ? value : undefined;
 }
 
 /** 本次请求的上下文：只有确实用了轮内系统消息的请求，才把相关 400 当成需要回退的信号。 */
@@ -156,6 +192,7 @@ export function providerRequestTargetKey(target: ProviderRequestTarget): string 
 /** 测试与开发诊断用：清空进程内记住的适配。 */
 export function resetProviderRequestAdaptations(): void {
   adaptationStates.clear();
+  conversationClaudeThinkingBindings.clear();
 }
 
 /** 测试用：替换判断过期所用的时钟；不传时恢复为当前时间。 */
@@ -182,7 +219,7 @@ function liveAdaptationState(key: string): TargetAdaptationState | undefined {
     && now - state.claudeTurnScopedRemindersFallbackAt > LEARNED_ADAPTATION_TTL_MS) {
     delete state.claudeTurnScopedRemindersFallbackAt;
   }
-  if (state.parameters.size === 0 && !state.claudeThinkingBinding && state.claudeTurnScopedRemindersFallbackAt === undefined) {
+  if (state.parameters.size === 0 && state.claudeTurnScopedRemindersFallbackAt === undefined) {
     adaptationStates.delete(key);
     return undefined;
   }
@@ -191,13 +228,11 @@ function liveAdaptationState(key: string): TargetAdaptationState | undefined {
 
 export function learnedProviderRequestAdaptations(target: ProviderRequestTarget): {
   parameters: AdaptableRequestParameter[];
-  claudeThinkingBinding?: ClaudeThinkingBindingMode;
   claudeTurnScopedReminders?: 'tail';
 } {
   const state = liveAdaptationState(providerRequestTargetKey(target));
   return {
     parameters: state ? [...state.parameters.keys()].sort() : [],
-    ...(state?.claudeThinkingBinding ? { claudeThinkingBinding: state.claudeThinkingBinding } : {}),
     ...(state?.claudeTurnScopedRemindersFallbackAt !== undefined ? { claudeTurnScopedReminders: 'tail' as const } : {})
   };
 }
@@ -252,7 +287,7 @@ export function installEncodedRequestPostProcessor<T>(provider: T, postProcess: 
 }
 
 /**
- * 把该目标已记住的适配应用到编码后的请求；没有记住任何适配时原样返回同一引用。
+ * 把该目标已记住的适配与这个对话的保留思考处理应用到编码后的请求；没有任何适配时原样返回同一引用。
  * 传入 session 时顺带记下这次实际发出的保留思考处理。
  */
 export function applyLearnedRequestAdaptations(
@@ -266,7 +301,7 @@ export function applyLearnedRequestAdaptations(
     const body = adaptRequestParameters(next.body, new Set(state.parameters.keys()), target.provider);
     if (body !== next.body) next = { ...next, body };
   }
-  const binding = target.provider === 'claude' ? state?.claudeThinkingBinding : undefined;
+  const binding = target.provider === 'claude' ? session?.claudeThinkingBinding : undefined;
   if (binding) next = applyClaudeThinkingBinding(next, binding);
   if (session) session.sentClaudeThinkingBinding = target.provider === 'claude' ? sentClaudeThinkingBinding(next, binding) : undefined;
   return next;
@@ -365,9 +400,9 @@ function learnProviderRequestAdaptationsDetailed(
   const userKeys = new Set(context.userRequestBodyKeys ?? []);
   const userRequestBodyRejected = rejected.filter((parameter) => userKeys.has(parameter));
   const parameters = rejected.filter((parameter) => !userKeys.has(parameter));
-  // 本请求实际发出的处理；没有 session 的调用方（单测、摘要）按目标记住的处理近似。
-  const binding = target.provider === 'claude'
-    ? claudeThinkingBindingModeForError(text, session ? session.sentClaudeThinkingBinding : state.claudeThinkingBinding)
+  // 只按本请求实际发出的处理判断；没有 session 的调用方（摘要）不处理保留思考。
+  const binding = target.provider === 'claude' && session
+    ? claudeThinkingBindingModeForError(text, session.sentClaudeThinkingBinding)
     : undefined;
   const turnScopedFallback = target.provider === 'claude' && context.claudeTurnScopedReminders === true
     && claudeTurnScopedRemindersRejected(text);
@@ -375,12 +410,16 @@ function learnProviderRequestAdaptationsDetailed(
   const now = adaptationClock();
   const learned = parameters.filter((parameter) => !state.parameters.has(parameter));
   for (const parameter of parameters) state.parameters.set(parameter, now);
-  const nextBinding = strongerClaudeThinkingBinding(state.claudeThinkingBinding, binding);
-  const learnedBinding = nextBinding !== state.claudeThinkingBinding ? nextBinding : undefined;
-  state.claudeThinkingBinding = nextBinding;
+  const previousBinding = session?.claudeThinkingBinding;
+  const nextBinding = strongerClaudeThinkingBinding(previousBinding, binding);
+  const learnedBinding = nextBinding !== previousBinding ? nextBinding : undefined;
+  if (session && nextBinding) {
+    session.claudeThinkingBinding = nextBinding;
+    if (session.conversationId) rememberConversationClaudeThinkingBinding(session.conversationId, nextBinding);
+  }
   const learnedTurnScopedFallback = turnScopedFallback && state.claudeTurnScopedRemindersFallbackAt === undefined;
   if (turnScopedFallback) state.claudeTurnScopedRemindersFallbackAt = now;
-  adaptationStates.set(key, state);
+  if (state.parameters.size > 0 || state.claudeTurnScopedRemindersFallbackAt !== undefined) adaptationStates.set(key, state);
   if (learned.length > 0 || learnedBinding || learnedTurnScopedFallback) {
     console.log('[LimCode][ProviderAdaptation]', JSON.stringify({
       providerConfigId: target.providerConfigId,

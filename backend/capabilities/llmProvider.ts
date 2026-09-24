@@ -498,7 +498,11 @@ export async function startLlmProvider(
     };
     const claudeTurnScoped = claudeTurnScopedRemindersRequested(request, settings);
     const volatileTailCount = volatileTailContentCount(request);
-    const adaptationSession = createProviderRequestAdaptationSession();
+    // 本请求的自适配状态：保留思考处理从这个对话已持久化的选择开始。
+    const adaptationSession = createProviderRequestAdaptationSession({
+      conversationId: request.conversationId,
+      claudeThinkingBinding: request.claudeThinkingBinding
+    });
     // WebSocket 模式下 provider 只用来取 WebSocket 帧（续接链）；回退用的 HTTP provider 是无状态完整重放。
     // HTTP 原生会话里同一个 provider 发首请求与续接请求（续接在原内容后追加），断点按会话方式放。
     const provider = installRequestAdaptation(installProviderCompatibility(
@@ -549,7 +553,8 @@ export async function startLlmProvider(
           proxy,
           nativeCapabilities,
           controls,
-          responsesTerminal
+          responsesTerminal,
+          adaptationSession
         );
         return;
       } catch (error) {
@@ -623,8 +628,13 @@ async function runLlmAttempt(
   proxy?: string,
   nativeCapabilities?: OpenAIResponsesNativeCapabilities,
   controls?: LlmStartRuntimeControls,
-  responsesTerminal: ResponsesTerminalObservation = {}
+  responsesTerminal: ResponsesTerminalObservation = {},
+  adaptationSession?: ProviderRequestAdaptationSession
 ): Promise<void> {
+  // 这个对话的 Claude 保留思考处理随 Done 交回内核持久化（官方要求随会话保存、重启后也带上）。
+  const conversationAdaptation = adaptationSession?.claudeThinkingBinding
+    ? { claudeThinkingBinding: adaptationSession.claudeThinkingBinding }
+    : {};
   const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
   const maxOutputTokens = effectiveRequestGenerationConfig(request, settings)?.maxOutputTokens;
   const emptyResponsesTerminal = (): LlmAttemptFailure | undefined =>
@@ -673,7 +683,8 @@ async function runLlmAttempt(
         createdAt: completedAt,
         completedAt,
         streamOutputDurationMs: 0,
-        ...(usageMetadataFromCompact(response.usageMetadata) ? { usageMetadata: usageMetadataFromCompact(response.usageMetadata) } : {})
+        ...(usageMetadataFromCompact(response.usageMetadata) ? { usageMetadata: usageMetadataFromCompact(response.usageMetadata) } : {}),
+        ...conversationAdaptation
       }
     });
     return;
@@ -855,7 +866,8 @@ async function runLlmAttempt(
       ...(authoritativeCompletedContent ? { content: authoritativeCompletedContent } : {}),
       ...createDoneTiming(timing.firstStreamChunkAt, finishedAt, timing.firstStreamChunkMark, finishedMark, timing.streamTimingChunkCount),
       completedAt: finishedAt,
-      ...(aggregatedUsageMetadata ? { usageMetadata: aggregatedUsageMetadata } : {})
+      ...(aggregatedUsageMetadata ? { usageMetadata: aggregatedUsageMetadata } : {}),
+      ...conversationAdaptation
     }
   });
 }
@@ -1715,7 +1727,11 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings,
   claudeTurnScopedRemindersRequested(request, runtimeSettings), volatileTailContentCount(request),
-  isOpenAIResponsesWebSocketMode(runtimeSettings), openAIResponsesHttpReplay(runtimeSettings, nativeCapabilities));
+  isOpenAIResponsesWebSocketMode(runtimeSettings), openAIResponsesHttpReplay(runtimeSettings, nativeCapabilities),
+  createProviderRequestAdaptationSession({
+    conversationId: request.conversationId,
+    claudeThinkingBinding: request.claudeThinkingBinding
+  }));
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
@@ -2014,7 +2030,10 @@ export async function compactLlmProvider(
       && methodConfig.kind !== 'segmented_summary';
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
     // 摘要类方法在 executeSummaryProviderCall 内逐次调用自适配；这里只覆盖单次调用的原生压缩。
-    const adaptationSession = createProviderRequestAdaptationSession();
+    const adaptationSession = createProviderRequestAdaptationSession({
+      conversationId: request.conversationId,
+      claudeThinkingBinding: request.claudeThinkingBinding
+    });
     const adaptationRetry = retrySettings && methodConfig.kind === 'provider_native'
       ? createProviderRequestAdaptationRetry(providerRequestTarget(retrySettings), {
           claudeTurnScopedReminders: claudeTurnScopedRemindersRequested(request, retrySettings),
@@ -2496,7 +2515,11 @@ async function buildAnthropicCompactionRequest(
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings,
-  claudeTurnScopedRemindersRequested(request, settings), 0, false, 'stateless', options.requestAdaptationSession);
+  claudeTurnScopedRemindersRequested(request, settings), 0, false, 'stateless',
+  options.requestAdaptationSession ?? createProviderRequestAdaptationSession({
+    conversationId: request.conversationId,
+    claudeThinkingBinding: request.claudeThinkingBinding
+  }));
   const generationConfig = request.nativeGenerationConfig ?? settings.generationConfig;
   const systemInstruction = prependSystemInstructionPrefix(
     request.systemInstruction,

@@ -1024,7 +1024,8 @@ function decodeModelStreamIdentity(value: unknown): {
     'nativeInitialPromptTokenCount',
     'compressionPurpose',
     'compressionDecision',
-    'failure'
+    'failure',
+    'claudeThinkingBinding'
   ]);
   if (
     !keys.includes('attemptSeq')
@@ -1060,6 +1061,10 @@ function decodeModelStreamIdentity(value: unknown): {
   optionalPositiveInteger(record.lastStreamEventAt, 'lastStreamEventAt');
   if (record.thinkingSelection !== undefined && (typeof record.thinkingSelection !== 'string' || record.thinkingSelection.length > 1024)) {
     throw new TypeError('ModelRequest.stream_stats_json.thinkingSelection must be a bounded string.');
+  }
+  if (record.claudeThinkingBinding !== undefined
+    && record.claudeThinkingBinding !== 'drop_block' && record.claudeThinkingBinding !== 'strip_thinking') {
+    throw new TypeError('ModelRequest.stream_stats_json.claudeThinkingBinding is invalid.');
   }
   optionalNonNegativeInteger(record.nativeInitialPromptTokenCount, 'nativeInitialPromptTokenCount');
   if (record.nativeCapabilities !== undefined) {
@@ -2160,6 +2165,8 @@ function decodeContextRecords(
   // Frozen recipe of the ModelRequest that produced a model message segment. A fork copy of the same
   // request shares the recipe object; any disagreement or an unlinked source leaves it unset.
   const recipeSources = new Map<string, string | null>();
+  // Claude 保留思考处理：产生这条模型输出的请求终态里记下的对话选择；多个来源取更强的一种（只会单向推进）。
+  const thinkingBindings = new Map<string, 'drop_block' | 'strip_thinking'>();
   for (let offset = 0; offset < messageSegmentIds.length; offset += 500) {
     const chunk = messageSegmentIds.slice(offset, offset + 500);
     const placeholders = chunk.map(() => '?').join(',');
@@ -2167,7 +2174,8 @@ function decodeContextRecords(
       SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role,
              model_request.provider_id AS source_provider_id,
              model_request.model_id AS source_model_id,
-             model_request.recipe_object_id AS source_recipe_object_id
+             model_request.recipe_object_id AS source_recipe_object_id,
+             model_request.stream_stats_json AS source_stream_stats_json
         FROM context_segment_source AS source
         JOIN message_revision AS revision
           ON revision.id = source.source_id
@@ -2187,6 +2195,7 @@ function decodeContextRecords(
       source_provider_id: string | null;
       source_model_id: string | null;
       source_recipe_object_id: string | null;
+      source_stream_stats_json: string | null;
     }>;
     for (const source of sourceRows) {
       const segmentId = requireRuntimeId(source.segment_id);
@@ -2212,21 +2221,41 @@ function decodeContextRecords(
       const previousRecipe = recipeSources.get(segmentId);
       if (previousRecipe === undefined) recipeSources.set(segmentId, recipeObjectId);
       else if (previousRecipe !== recipeObjectId) recipeSources.set(segmentId, null);
+      const binding = sourceClaudeThinkingBinding(source.source_stream_stats_json);
+      if (binding && thinkingBindings.get(segmentId) !== 'strip_thinking') thinkingBindings.set(segmentId, binding);
     }
   }
   return rows.map((row) => decodeContextRecord(
     row,
     roles.get(String(row.segment_id)) ?? [],
     modelSources.get(String(row.segment_id)),
-    recipeSources.get(String(row.segment_id))
+    recipeSources.get(String(row.segment_id)),
+    thinkingBindings.get(String(row.segment_id))
   ));
+}
+
+/** ModelRequest.stream_stats_json 里持久化的 Claude 保留思考处理；没有或形状不对时为空。 */
+function sourceClaudeThinkingBinding(value: unknown): 'drop_block' | 'strip_thinking' | undefined {
+  let stats: unknown = value;
+  if (typeof value === 'string') {
+    try {
+      stats = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  const binding = stats && typeof stats === 'object' && !Array.isArray(stats)
+    ? (stats as Record<string, unknown>).claudeThinkingBinding
+    : undefined;
+  return binding === 'drop_block' || binding === 'strip_thinking' ? binding : undefined;
 }
 
 function decodeContextRecord(
   row: Record<string, unknown>,
   messageRoles: readonly string[],
   modelSource?: ContextModelSource | null,
-  sourceRecipeObjectId?: string | null
+  sourceRecipeObjectId?: string | null,
+  sourceThinkingBinding?: 'drop_block' | 'strip_thinking'
 ): ContextMaterializationRecord {
   const segmentKind = typeof row.segment_kind === 'string' ? row.segment_kind : '';
   let messageRole: string | null = null;
@@ -2259,7 +2288,8 @@ function decodeContextRecord(
     }),
     messageRole,
     ...(modelSource ? { modelSource } : {}),
-    ...(messageRole === 'model' && sourceRecipeObjectId ? { sourceRecipeObjectId } : {})
+    ...(messageRole === 'model' && sourceRecipeObjectId ? { sourceRecipeObjectId } : {}),
+    ...(messageRole === 'model' && sourceThinkingBinding ? { sourceClaudeThinkingBinding: sourceThinkingBinding } : {})
   };
 }
 

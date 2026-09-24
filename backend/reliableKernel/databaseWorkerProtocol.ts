@@ -42,6 +42,8 @@ export interface ContextMaterializationRecord {
   modelSource?: ContextModelSource;
   /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
   sourceRecipeObjectId?: string;
+  /** Claude 保留思考处理：产生这条模型输出的 ModelRequest 实际发出时这个对话已选定的处理（stream_stats 里的持久记录）。 */
+  sourceClaudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 
 export interface ContextMaterializationSnapshot {

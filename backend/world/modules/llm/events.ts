@@ -158,6 +158,8 @@ export interface LlmDonePayload extends LlmStreamEpochPayload {
   streamOutputDurationMs?: number;
   usageMetadata?: LlmUsageMetadataRecord;
   streamAggregation?: LlmStreamAggregationMetrics;
+  /** 这次请求实际使用的 Claude 保留思考处理（含本次新学到的）；内核按对话持久化。 */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 export interface LlmErrorPayload extends LlmStreamEpochPayload {
   requestId: string;

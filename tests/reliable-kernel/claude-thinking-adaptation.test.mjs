@@ -7,7 +7,9 @@ import {
   claudeThinkingBindingModeForError
 } from '../../dist/extension/backend/capabilities/claudeThinkingAdaptation.js';
 import {
-  learnedProviderRequestAdaptations,
+  createProviderRequestAdaptationRetry,
+  createProviderRequestAdaptationSession,
+  learnedConversationClaudeThinkingBinding,
   resetProviderRequestAdaptations
 } from '../../dist/extension/backend/capabilities/providerParameterAdaptation.js';
 
@@ -129,11 +131,12 @@ const HISTORY = [
 const hasThinkingBlock = (body) => body.messages.some((message) => Array.isArray(message.content)
   && message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'));
 
-async function chat(settings, id) {
+async function chat(settings, id, request = {}) {
   const events = [];
-  await startLlmProvider({ id, conversationId: 'claude-binding-conversation', contents: HISTORY, tools: [] }, (event) => events.push(event), { settings: async () => settings });
+  await startLlmProvider({ id, conversationId: 'claude-binding-conversation', contents: HISTORY, tools: [], ...request }, (event) => events.push(event), { settings: async () => settings });
   return events;
 }
+const doneBinding = (events) => events.find((event) => event.type === 'llm:done')?.payload.claudeThinkingBinding;
 
 test('C2 官方端点：前缀失配 400 后带 beta 头与 drop_block 重试一次，并记住这个选择', async () => {
   resetProviderRequestAdaptations();
@@ -154,10 +157,12 @@ test('C2 官方端点：前缀失配 400 后带 beta 头与 drop_block 重试一
     const { thinking: secondThinking, ...secondRest } = calls[1].body;
     assert.deepEqual(secondRest, firstRest);
     assert.deepEqual(secondThinking, { ...firstThinking, block_binding: { prefix_mismatch_behavior: 'drop_block' } });
-    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model, configRevision: settings.updatedAt }).claudeThinkingBinding, 'drop_block');
+    // 这个选择按对话记住，并随 Done 交回内核持久化（官方：随会话保存，重启后也带上）。
+    assert.equal(learnedConversationClaudeThinkingBinding('claude-binding-conversation'), 'drop_block');
+    assert.equal(doneBinding(events), 'drop_block');
 
     await chat(settings, 'binding-2');
-    assert.equal(calls.length, 3, '之后的请求一开始就带上 drop_block');
+    assert.equal(calls.length, 3, '同一对话之后的请求一开始就带上 drop_block');
     assert.equal(calls[2].body.thinking.block_binding.prefix_mismatch_behavior, 'drop_block');
   });
   resetProviderRequestAdaptations();
@@ -213,23 +218,50 @@ test('C2 中转静默丢掉 block_binding：带 drop_block 重发仍失配时升
   resetProviderRequestAdaptations();
 });
 
-test('C2 升级只看本请求实际发出的内容：并发请求没带 drop_block 时收到失配只升到 drop_block', async () => {
+test('C2 升级只看本请求实际发出的内容：并发请求没带 drop_block 时收到失配只升到 drop_block', () => {
   resetProviderRequestAdaptations();
-  const { createProviderRequestAdaptationRetry, createProviderRequestAdaptationSession } = await import('../../dist/extension/backend/capabilities/providerParameterAdaptation.js');
   const target = { providerConfigId: 'claude-concurrent', provider: 'claude', baseUrl: 'https://gateway.example/v1', model: 'claude-opus-5-5', configRevision: 1 };
   const error = { status: 400, rawBody: PREFIX_MISMATCH_400 };
   // 请求一先失败并学到 drop_block，请求二在那之前已经不带 drop_block 发出、之后才收到同样的失配。
-  const first = createProviderRequestAdaptationSession();
-  const second = createProviderRequestAdaptationSession();
+  const first = createProviderRequestAdaptationSession({ conversationId: 'concurrent' });
+  const second = createProviderRequestAdaptationSession({ conversationId: 'concurrent' });
   assert.equal(createProviderRequestAdaptationRetry(target, {}, first).shouldRetryImmediately(error), true);
-  assert.equal(learnedProviderRequestAdaptations(target).claudeThinkingBinding, 'drop_block');
+  assert.equal(learnedConversationClaudeThinkingBinding('concurrent'), 'drop_block');
   assert.equal(createProviderRequestAdaptationRetry(target, {}, second).shouldRetryImmediately(error), true);
-  assert.equal(learnedProviderRequestAdaptations(target).claudeThinkingBinding, 'drop_block', '没带 drop_block 发出的请求不能把目标升级成去掉思考块');
+  assert.equal(second.claudeThinkingBinding, 'drop_block');
+  assert.equal(learnedConversationClaudeThinkingBinding('concurrent'), 'drop_block', '没带 drop_block 发出的请求不能升级成去掉思考块');
   // 真正带着 drop_block 发出后仍失配，才升级。
   second.sentClaudeThinkingBinding = 'drop_block';
-  const retry = createProviderRequestAdaptationRetry(target, {}, second);
-  assert.equal(retry.shouldRetryImmediately(error), true);
-  assert.equal(learnedProviderRequestAdaptations(target).claudeThinkingBinding, 'strip_thinking');
+  assert.equal(createProviderRequestAdaptationRetry(target, {}, second).shouldRetryImmediately(error), true);
+  assert.equal(learnedConversationClaudeThinkingBinding('concurrent'), 'strip_thinking');
+  resetProviderRequestAdaptations();
+});
+
+// 官方（preserved-thinking “Handle the error in code”）：这个选择随会话保存、重启后也带上；去掉的思考块不再放回。
+test('C2 保留思考处理按对话记住：同渠道的其他对话不受影响；内核持久化的选择在新进程里从第一次发送就生效', async () => {
+  resetProviderRequestAdaptations();
+  await withServer((call) => hasThinkingBlock(call.body)
+    ? { status: 400, body: PREFIX_MISMATCH_400 }
+    : { sse: CLAUDE_OK_STREAM }, async (baseUrl, calls) => {
+    const settings = claudeSettings(baseUrl, { id: 'claude-binding-per-conversation' });
+    const learned = await chat(settings, 'per-conversation-1');
+    assert.equal(calls.length, 3);
+    assert.equal(doneBinding(learned), 'strip_thinking');
+    // 同一渠道、同一模型的另一个对话：照常带思考块发送。
+    await chat(settings, 'other-conversation', { conversationId: 'another-conversation' });
+    assert.equal(hasThinkingBlock(calls[3].body), true, '其他对话不被套上去掉思考块');
+    // 重启后进程内记忆没了；内核按对话持久化的选择随请求交进来，从第一次发送就去掉思考块。
+    resetProviderRequestAdaptations();
+    const before = calls.length;
+    const restored = await chat(settings, 'after-restart', { claudeThinkingBinding: 'strip_thinking' });
+    assert.equal(calls.length, before + 1);
+    assert.equal(hasThinkingBlock(calls.at(-1).body), false);
+    assert.equal(doneBinding(restored), 'strip_thinking', '沿用的选择也交回内核');
+    const dry = await dryRunLlmProvider({ id: 'dry-restored', conversationId: 'fresh-conversation', contents: HISTORY, tools: [], claudeThinkingBinding: 'strip_thinking' }, { settings: async () => settings });
+    assert.equal(hasThinkingBlock(dry.body), false, 'dry-run 展示同样按持久化的选择');
+    const plain = await chat(settings, 'plain', { conversationId: 'plain-conversation', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] });
+    assert.equal(doneBinding(plain), undefined, '没有选择的对话不写');
+  });
   resetProviderRequestAdaptations();
 });
 

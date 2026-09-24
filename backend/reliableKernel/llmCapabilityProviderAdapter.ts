@@ -457,10 +457,15 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               completedThoughtBlockDurations,
               thoughtTimingObserved ? completedThoughtDurationMs : undefined
             ));
+            // 这次请求实际使用的 Claude 保留思考处理（含本次新学到的）写进请求终态；没带时沿用窗口里已有的选择。
+            const claudeThinkingBinding = payload?.claudeThinkingBinding === 'drop_block' || payload?.claudeThinkingBinding === 'strip_thinking'
+              ? payload.claudeThinkingBinding
+              : request.claudeThinkingBinding;
             enqueue({
               kind: 'completed',
               content: normalizePlainJson(completedContent, 'LLM completed MessageContent'),
               ...(usage !== undefined ? { usage } : {}),
+              ...(claudeThinkingBinding ? { claudeThinkingBinding } : {}),
               timing: {
                 ...(providerStartedAt !== undefined ? { providerStartedAt } : {}),
                 ...(optionalPositiveNumber(payload?.createdAt) !== undefined
@@ -906,6 +911,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...(request.nativeAsyncAdmittedCallIds?.length
       ? { nativeAsyncAdmittedCallIds: [...request.nativeAsyncAdmittedCallIds] }
       : {}),
+    ...(request.claudeThinkingBinding ? { claudeThinkingBinding: request.claudeThinkingBinding } : {}),
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
   };
 }
@@ -1158,7 +1164,10 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
       ? { priorSummaryContents: context.priorSummaryContents }
       : {}),
     ...attachmentObservationContract,
-    ...(optionalText(recipe.sourceHash) ? { sourceHash: optionalText(recipe.sourceHash) } : {})
+    ...(optionalText(recipe.sourceHash) ? { sourceHash: optionalText(recipe.sourceHash) } : {}),
+    ...(methodKind === 'provider_native' && request.claudeThinkingBinding
+      ? { claudeThinkingBinding: request.claudeThinkingBinding }
+      : {})
   };
 }
 

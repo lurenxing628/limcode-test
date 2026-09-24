@@ -120,6 +120,8 @@ export interface MaterializedContextSegment {
   modelSource?: ContextModelSource;
   /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
   sourceRecipeObjectId?: string;
+  /** Claude 保留思考处理：产生这条模型输出的请求发出时这个对话已选定的处理。 */
+  sourceClaudeThinkingBinding?: 'drop_block' | 'strip_thinking';
   contentObject: ContentObjectMetadata;
   content: Buffer;
 }
@@ -1166,6 +1168,7 @@ export class ContextSequenceControlPlane {
         messageRole: nullableText(record.messageRole, 'Context message role'),
         ...(record.modelSource ? { modelSource: record.modelSource } : {}),
         ...(record.sourceRecipeObjectId ? { sourceRecipeObjectId: record.sourceRecipeObjectId } : {}),
+        ...(record.sourceClaudeThinkingBinding ? { sourceClaudeThinkingBinding: record.sourceClaudeThinkingBinding } : {}),
         contentObject: asContentObjectMetadata(record.contentObject),
         content: bufferView(record.content)
       })),
