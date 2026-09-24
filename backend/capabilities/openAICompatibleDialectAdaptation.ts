@@ -50,7 +50,55 @@ export function adaptOpenAICompatibleDialect(
   if (!openAICompatibleBodyControlsThinking(settings.requestBody)) body = withDialectThinking(body, dialect);
   if (dialect.format === 'deepseek' || dialect.format === 'enable_thinking') body = withReasoningContentField(body);
   if (dialect.fillReasoningReplay) body = withReasoningReplay(body);
+  if (dialect.platform === 'mimo' && dialect.toolContentArrays) body = withToolFilesAfterToolMessages(body);
   return body === request.body ? request : { ...request, body };
+}
+
+/**
+ * 小米 MiMo 的 tool 消息只支持文字、图片、音频、视频（mimo.mi.com openai-api 文档），不支持 file：
+ * 接入库的 DeepSeek 格式把文件留在 tool 消息里，这里移到这批 tool 消息之后的 user 消息，并注明来自哪个调用
+ * （与接入库通用格式的说明文字一致）。
+ */
+function withToolFilesAfterToolMessages(body: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(body.messages)) return body;
+  const toolNames = new Map<string, string>();
+  const messages: unknown[] = [];
+  let moved: unknown[] = [];
+  let changed = false;
+  const flush = () => {
+    if (!moved.length) return;
+    messages.push({ role: 'user', content: moved });
+    moved = [];
+  };
+  for (const message of body.messages) {
+    if (isRecord(message) && message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        if (isRecord(call) && typeof call.id === 'string' && isRecord(call.function) && typeof call.function.name === 'string') {
+          toolNames.set(call.id, call.function.name);
+        }
+      }
+    }
+    if (!isRecord(message) || message.role !== 'tool') {
+      flush();
+      messages.push(message);
+      continue;
+    }
+    const content = Array.isArray(message.content) ? message.content : [];
+    const files = content.filter((block) => isRecord(block) && block.type === 'file');
+    if (!files.length) {
+      messages.push(message);
+      continue;
+    }
+    changed = true;
+    const rest = content.filter((block) => !(isRecord(block) && block.type === 'file'));
+    const onlyText = rest.length === 1 && isRecord(rest[0]) && rest[0].type === 'text' && typeof rest[0].text === 'string';
+    messages.push({ ...message, content: onlyText ? (rest[0] as { text: string }).text : rest });
+    const callId = typeof message.tool_call_id === 'string' ? message.tool_call_id : '';
+    const subject = files.length === 1 ? 'The following attachment belongs' : `The following ${files.length} attachments belong`;
+    moved.push({ type: 'text', text: `[${subject} to the result of tool call "${toolNames.get(callId) ?? 'tool'}" (tool_call_id: ${callId}).]` }, ...files);
+  }
+  flush();
+  return changed ? { ...body, messages } : body;
 }
 
 /**

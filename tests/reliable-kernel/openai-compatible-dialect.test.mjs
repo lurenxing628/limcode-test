@@ -551,3 +551,29 @@ test('DeepSeek 写法下把历史里 OpenRouter 的 reasoning 文本挪到 reaso
   const kept = adaptOpenAICompatibleDialect(request([{ role: 'assistant', content: '', reasoning: 'x', reasoning_details: [] }]), settings(OPENROUTER, 'deepseek/deepseek-v4-pro'));
   assert.equal(kept.body.messages[0].reasoning, 'x');
 });
+
+test('MiMo 的 tool 消息不支持 file：工具结果里的文件移到这批 tool 消息之后的 user 消息，图片留在原处', async () => {
+  // MiMo 官方：“For tool messages, text, image, audio and video are supported.”（https://mimo.mi.com/static/docs/api/chat/openai-api.md）
+  const PDF = Buffer.from('%PDF-1.4 fixture').toString('base64');
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  const contents = [
+    { role: 'user', parts: [{ text: 'read it' }] },
+    { role: 'model', parts: [{ id: 'call_1', functionCall: { name: 'read', args: {} } }] },
+    { role: 'user', parts: [{ id: 'call_1', functionResponse: { name: 'read', response: { ok: true }, parts: [
+      { inlineData: { mimeType: 'application/pdf', data: PDF } }, { inlineData: { mimeType: 'image/png', data: PNG } }] } }] },
+    { role: 'user', parts: [{ text: 'next' }] }
+  ];
+  const mimo = await wire('https://api.xiaomimimo.com/v1', 'mimo-v2-pro', { contents, tools: [{ ...TOOL, name: 'read' }] });
+  const toolIndex = mimo.messages.findIndex((message) => message.role === 'tool');
+  const tool = mimo.messages[toolIndex];
+  assert.ok(Array.isArray(tool.content));
+  assert.equal(tool.content.some((block) => block.type === 'file'), false);
+  assert.equal(tool.content.some((block) => block.type === 'image_url'), true);
+  const moved = mimo.messages[toolIndex + 1];
+  assert.equal(moved.role, 'user');
+  assert.match(moved.content[0].text, /tool_call_id: call_1/);
+  assert.equal(moved.content[1].type, 'file');
+  // DeepSeek 官方 tool 消息接受 file，保持原样。
+  const deepseek = await wire(DEEPSEEK, 'deepseek-v4-pro', { contents, tools: [{ ...TOOL, name: 'read' }] });
+  assert.equal(deepseek.messages.find((message) => message.role === 'tool').content.some((block) => block.type === 'file'), true);
+});
