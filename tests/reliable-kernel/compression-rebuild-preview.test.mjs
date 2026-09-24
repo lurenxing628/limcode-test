@@ -50,7 +50,7 @@ const SUMMARY = [
   '下一步', '- 无', '', '相关文件', '- 无'
 ].join('\n');
 
-async function startSummaryServer() {
+async function startSummaryServer(reply = SUMMARY) {
   const bodies = [];
   const server = http.createServer(async (req, res) => {
     const chunks = [];
@@ -59,7 +59,7 @@ async function startSummaryServer() {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       id: `chatcmpl-${bodies.length}`, object: 'chat.completion', created: 1, model: 'preview-model',
-      choices: [{ index: 0, message: { role: 'assistant', content: SUMMARY }, finish_reason: 'stop' }],
+      choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
     }));
   });
@@ -86,9 +86,9 @@ async function listFiles(root) {
 }
 
 /** One Conversation whose history was already replaced by a short text summary. */
-async function fixture({ contextWindowTokens = 40_000, compression = {}, turns }, run) {
+async function fixture({ contextWindowTokens = 40_000, compression = {}, turns, reply }, run) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-rebuild-preview-'));
-  const server = await startSummaryServer();
+  const server = await startSummaryServer(reply);
   let app;
   let registry;
   let runner;
@@ -211,6 +211,29 @@ test('大来源：预估的分段请求数与随后真实重建发出的分段�
     assert.equal(rebuilt.compression.status, 'compressed');
     const leafCalls = server.bodies.filter((body) => body.includes('本回合记录')).length;
     assert.equal(leafCalls, result.outcome.summaryRequests);
+  });
+});
+
+/** A structured summary well over the 1,000-token target: every leaf, merge and shorten reply is this long. */
+const OVERSIZED_SUMMARY = [
+  SUMMARY,
+  ...Array.from({ length: 60 }, (_, index) => `- src/generated/module-${index}/implementation-file-${index}.ts`)
+].join('\n');
+
+test('分段重建：模型每次都写超长时，实际请求数最多比预估多一次删短', async () => {
+  await fixture({ turns: [`HISTORY-START ${words(40_000, 'fact')} HISTORY-END`], reply: OVERSIZED_SUMMARY }, async ({ preview, rebuild, server }) => {
+    const result = await preview();
+    assert.equal(result.outcome.kind, 'ready', JSON.stringify(result));
+    assert.ok(result.outcome.summaryRequests >= 2, JSON.stringify(result.outcome));
+    const rebuilt = await rebuild();
+    assert.equal(rebuilt.compression.status, 'compressed');
+    const shortenCalls = server.bodies.filter((body) => body.includes('删短到约')).length;
+    // Before: every leaf and every merge asked for its own shorten, doubling the requests.
+    assert.equal(shortenCalls, 1, 'only the final summary may be shortened, once');
+    assert.ok(
+      server.bodies.length <= result.outcome.providerRequests + 1,
+      `sent ${server.bodies.length} requests for an estimate of ${result.outcome.providerRequests}`
+    );
   });
 });
 

@@ -859,3 +859,20 @@ test('a summary inside the target sends no shorten request', async () => {
   await compactWithReply(toolHistoryRequest(), OVERSIZED_REPLY.split('\n').slice(0, 20).join('\n'), sent);
   assert.equal(sent.length, 1);
 });
+
+test('a limit too small for the seven empty headings sends no shorten request', async () => {
+  for (const kind of ['segmented_summary', 'llm_summary']) {
+    const request = toolHistoryRequest();
+    request.methodKind = kind;
+    request.methodConfigSnapshot.kind = kind;
+    request.methodConfigSnapshot.llmSummary.targetTokens = 40;
+    if (kind === 'llm_summary') {
+      request.contents = request.segments.flat();
+      delete request.segments;
+    }
+    const sent = [];
+    const text = await compactWithReply(request, OVERSIZED_REPLY, sent);
+    assert.equal(sent.length, 1, `${kind}: a shorten request cannot fit the headings under a 40-token limit`);
+    assert.ok(text.length > 0);
+  }
+});

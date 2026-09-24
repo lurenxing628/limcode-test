@@ -3442,7 +3442,7 @@ async function compactWithSegmentedSummary(
 
   if (sourceContents.length > 0 && provider.provider) {
     const calls = buildSegmentedSummaryProviderCalls(semanticRequest, methodConfig, provider.settings);
-    const deltaSummaries = await mapWithBoundedConcurrency(
+    const leaves = await mapWithBoundedConcurrency(
       calls,
       isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
       (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
@@ -3450,16 +3450,23 @@ async function compactWithSegmentedSummary(
     );
     const merged = await mergeSegmentedSummaryHierarchy(
       provider,
-      calls.map((call, index) => ({
-        summary: deltaSummaries[index] ?? '',
-        sourceContents: call.sourceContents
-      })),
+      leaves,
       priorSummaryText,
       methodConfig,
       targetTokens,
       signal
     );
-    if (merged) finalSummary = finalizeStructuredSummary(merged, deterministic, targetTokens);
+    // Only the final summary is shortened, once: leaf and intermediate results are merge inputs that
+    // the next merge rewrites anyway, so shortening each of them doubled the requests.
+    if (merged) {
+      const shortened = await shortenOversizedSummary(
+        provider,
+        merged.candidate,
+        { ...merged.call, targetTokens },
+        signal
+      );
+      finalSummary = finalizeStructuredSummary(shortened, deterministic, targetTokens);
+    }
   }
 
   const contents = compressionSummaryContents(
@@ -4062,18 +4069,31 @@ function buildSummaryReplacementMergeCall(
 }
 
 interface SegmentedSummaryNode {
+  /** Bounded to the call's target; what a later merge reads. */
   summary: string;
   sourceContents: MessageContent[];
 }
 
+/** A summary produced by one Provider call: the bounded node plus the model's unbounded text. */
+interface SummarizedSegmentNode extends SegmentedSummaryNode {
+  candidate: string;
+  call: SummaryProviderCall;
+}
+
+interface FinalSegmentedSummary {
+  /** The model's own text for the final summary, before any shortening or mechanical cut. */
+  candidate: string;
+  call: SummaryProviderCall;
+}
+
 async function mergeSegmentedSummaryHierarchy(
   provider: ResolvedSummaryProvider,
-  initialNodes: readonly SegmentedSummaryNode[],
+  initialNodes: readonly SummarizedSegmentNode[],
   priorSummaryText: string,
   methodConfig: LlmCompressionConfigRecord,
   targetTokens: number,
   signal?: AbortSignal
-): Promise<string> {
+): Promise<FinalSegmentedSummary | undefined> {
   let nodes = [...initialNodes];
   for (let level = 0; nodes.length > 1; level += 1) {
     if (level >= MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS) {
@@ -4096,20 +4116,18 @@ async function mergeSegmentedSummaryHierarchy(
           provider.settings,
           targetTokens
         );
-        return {
-          summary: await summarizeSingleRound(provider, call, siblingSignal),
-          sourceContents: call.sourceContents
-        };
+        return summarizeSingleRound(provider, call, siblingSignal);
       },
       signal
     );
   }
-  if (nodes.length === 0) return '';
-  if (!priorSummaryText) return nodes[0]!.summary;
+  const top = nodes[0];
+  if (!top) return undefined;
+  if (!priorSummaryText) return { candidate: top.candidate, call: top.call };
   const call = buildSummaryReplacementMergeCall(
     priorSummaryText,
-    [nodes[0]!.summary],
-    nodes[0]!.sourceContents,
+    [top.summary],
+    top.sourceContents,
     methodConfig,
     provider.settings,
     targetTokens
@@ -4117,17 +4135,17 @@ async function mergeSegmentedSummaryHierarchy(
   if (!isSummaryProviderCallWithinWindow(call, provider.settings)) {
     throw new Error('compression_request_too_large: prior summary and segmented delta cannot fit a merge request.');
   }
-  return summarizeSingleRound(provider, call, signal);
+  return { candidate: await requestSummaryCandidate(provider, call, signal), call };
 }
 
-function packSegmentedSummaryNodes(
-  nodes: readonly SegmentedSummaryNode[],
+function packSegmentedSummaryNodes<Node extends SegmentedSummaryNode>(
+  nodes: readonly Node[],
   methodConfig: LlmCompressionConfigRecord,
   settings: SummaryWindowSettings,
   targetTokens: number
-): SegmentedSummaryNode[][] {
-  const groups: SegmentedSummaryNode[][] = [];
-  let current: SegmentedSummaryNode[] = [];
+): Node[][] {
+  const groups: Node[][] = [];
+  let current: Node[] = [];
   for (const node of nodes) {
     const candidate = [...current, node];
     const fits = current.length === 0 || isSummaryProviderCallWithinWindow(
@@ -4189,23 +4207,45 @@ function summaryGenerationConfig(
   return { ...methodRest, maxOutputTokens: resolveSummaryOutputBudget(targetTokens, method) };
 }
 
-async function summarizeSingleRound(
+/** One summary request; the model's text (inside `<summary>` when present), not yet bounded. */
+async function requestSummaryCandidate(
   resolved: ResolvedSummaryProvider,
   call: SummaryProviderCall,
   signal?: AbortSignal
 ): Promise<string> {
-  const fallback = deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
-  const trimmed = (await executeSummaryProviderCall(
+  return extractSummaryTag((await executeSummaryProviderCall(
     resolved, call.request, signal, { allowCompatibilityRetry: false }
-  )).trim();
-  const summary = await shortenOversizedSummary(resolved, extractSummaryTag(trimmed), call, signal);
-  // Method changes belong to the durable coordinator, never a hidden leaf-level fallback.
-  return finalizeStructuredSummary(summary, fallback, call.targetTokens);
+  )).trim());
 }
 
 /**
+ * A leaf or intermediate merge summary. It only feeds a later merge, so an oversized one is cut to
+ * its target mechanically instead of costing another request; the final summary alone is shortened
+ * by the model (compactWithSegmentedSummary).
+ */
+async function summarizeSingleRound(
+  resolved: ResolvedSummaryProvider,
+  call: SummaryProviderCall,
+  signal?: AbortSignal
+): Promise<SummarizedSegmentNode> {
+  const fallback = deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
+  const candidate = await requestSummaryCandidate(resolved, call, signal);
+  // Method changes belong to the durable coordinator, never a hidden leaf-level fallback.
+  return {
+    summary: finalizeStructuredSummary(candidate, fallback, call.targetTokens),
+    sourceContents: call.sourceContents,
+    candidate,
+    call
+  };
+}
+
+/** Tokens of the seven headings with every section empty; no shorter structured summary exists. */
+const EMPTY_STRUCTURED_SUMMARY_TOKENS = estimateTokenCount(formatStructuredSummary(emptyStructuredSummary()));
+
+/**
  * 模型数不准 token，常写得比上限长。超出上限时请它把自己的摘要删短一次，删什么由模型决定；
- * 仍超出才由 finalizeStructuredSummary 按条目机械删减。拒答、没按标题输出或删短请求失败时原样交回。
+ * 仍超出才由 finalizeStructuredSummary 按条目机械删减。只对最终摘要调用一次。
+ * 拒答、没按标题输出、删短请求失败，或上限连七个空标题都放不下时原样交回。
  */
 async function shortenOversizedSummary(
   resolved: ResolvedSummaryProvider,
@@ -4219,6 +4259,8 @@ async function shortenOversizedSummary(
   const currentTokens = estimateTokenCount(text);
   const limitTokens = summaryBodyBudget(call.targetTokens);
   if (currentTokens <= limitTokens) return candidate;
+  // No rewrite can keep the headings under such a limit; the mechanical cut handles it without a request.
+  if (limitTokens < EMPTY_STRUCTURED_SUMMARY_TOKENS) return candidate;
   logCompressionDebug('summary.shorten.begin', { label: call.label, currentTokens, limitTokens });
   try {
     const shortened = extractSummaryTag((await executeSummaryProviderCall(resolved, {
