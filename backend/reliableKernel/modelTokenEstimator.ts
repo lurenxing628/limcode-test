@@ -24,6 +24,20 @@ export function estimateMessageContentTokens(content: MessageContent): number {
     total + estimateContentPartTokens(part), 0);
 }
 
+/**
+ * True when the contents hold a provider compaction item without readable text (OpenAI's
+ * `encrypted_content`). Its size is invisible to this estimator; the Provider's output count for the
+ * compaction is the only measure of what the model reads back.
+ */
+export function hasOpaqueProviderCompaction(contents: readonly MessageContent[]): boolean {
+  const opaque = (context: unknown): boolean => {
+    const raw = asRecord(asRecord(context)?.rawItem);
+    return raw?.type === 'compaction' && typeof raw.content !== 'string';
+  };
+  return contents.some((content) => opaque(asRecord(content as unknown)?.providerContext)
+    || (Array.isArray(content.parts) && content.parts.some((part) => 'providerContext' in part && opaque(part.providerContext))));
+}
+
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
   const estimated = estimateTokenCount(text);

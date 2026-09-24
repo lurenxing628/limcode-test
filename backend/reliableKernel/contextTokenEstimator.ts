@@ -20,7 +20,8 @@ import {
   estimateMessageContentTokens,
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
-  estimateTextTokens
+  estimateTextTokens,
+  hasOpaqueProviderCompaction
 } from './modelTokenEstimator';
 
 export {
@@ -29,8 +30,26 @@ export {
   estimateMessageContentTokens,
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
-  estimateTextTokens
+  estimateTextTokens,
+  hasOpaqueProviderCompaction
 } from './modelTokenEstimator';
+
+/**
+ * Model-visible size of a compression result, in local estimator tokens. Contents the estimator can
+ * read (summary text, Claude compaction text, rendered Attachment observation state) are measured;
+ * an OpenAI compaction item is ciphertext, so its share comes from the Provider's output count for
+ * the compaction, converted by the Conversation's calibration ratio.
+ */
+export function estimateCompressionResultTokens(
+  contents: readonly MessageContent[],
+  providerOutputTokens: number | undefined,
+  calibrationRatio = 1
+): number {
+  const measured = estimateMessageContentsTokens(contents);
+  if (providerOutputTokens === undefined || !hasOpaqueProviderCompaction(contents)) return measured;
+  const ratio = Number.isFinite(calibrationRatio) && calibrationRatio >= 1 ? calibrationRatio : 1;
+  return safeTokenCount(measured + Math.floor(providerOutputTokens / ratio), 'compression result estimate');
+}
 
 const CONTENT_TYPE_MESSAGE = 'application/vnd.limcode.message+json';
 const CONTENT_TYPE_TOOL_PAIR = 'application/vnd.limcode.context-tool-pair+json';
@@ -389,17 +408,29 @@ function estimateCompressionEnvelopeTokens(content: string): number {
   if (!envelope || envelope.kind !== 'compression_contents' || !Array.isArray(envelope.contents)) {
     return estimateTextTokens(content);
   }
-  const measured = estimateMessageContentsTokens(envelope.contents.filter(isMessageContent));
+  const measured = compressionEnvelopeResultTokens(envelope);
   const stored = optionalTokenCount(envelope.estimatedTokens);
   // Same rule as estimateMaterializedContextTokens: the stored estimate never undercuts the contents.
   return stored === undefined ? measured : Math.max(stored, measured);
+}
+
+/**
+ * Re-measures a stored compression result. Blocks written before the result estimate counted Claude
+ * compaction text or OpenAI compaction output stored 4 and 0 tokens for summaries of thousands.
+ */
+function compressionEnvelopeResultTokens(envelope: Record<string, unknown>): number {
+  const contents = Array.isArray(envelope.contents) ? envelope.contents.filter(isMessageContent) : [];
+  const ratio = typeof envelope.providerCalibrationRatio === 'number' ? envelope.providerCalibrationRatio : 1;
+  return estimateCompressionResultTokens(contents, optionalTokenCount(envelope.providerOutputTokens), ratio);
 }
 
 function compressionEstimate(segments: readonly MaterializedContextSegment[]): number | undefined {
   const first = segments[0];
   if (!first || first.segmentKind !== 'compression') return undefined;
   const envelope = parseRecord(first.content.toString('utf8'));
-  return optionalTokenCount(envelope?.estimatedTokens);
+  const stored = optionalTokenCount(envelope?.estimatedTokens);
+  if (!envelope || stored === undefined) return stored;
+  return envelope.kind === 'compression_contents' ? Math.max(stored, compressionEnvelopeResultTokens(envelope)) : stored;
 }
 
 function parseMessageContent(content: string): MessageContent | undefined {

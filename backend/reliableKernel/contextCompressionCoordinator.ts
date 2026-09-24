@@ -44,8 +44,8 @@ import {
 import { readNativeSteeringInFlight } from './nativeSteering';
 import {
   compressionOutputTokens,
+  estimateCompressionResultTokens,
   estimateMaterializedContextTokens,
-  estimateMessageContentsTokens,
   providerPromptTokens
 } from './contextTokenEstimator';
 import {
@@ -728,9 +728,10 @@ export class ReliableContextCompressionCoordinator {
     const providerInputTokens = providerPromptTokens(completed.usage);
     const providerOutputTokens = compressionOutputTokens(completed.usage);
     // The durable replacement may include locally rendered Attachment observation state that is not
-    // part of Provider output accounting. Project the complete structured result instead of silently
-    // undercounting that model-visible state.
-    const summaryEstimatedTokens = estimateMessageContentsTokens(summary);
+    // part of Provider output accounting, so the readable result is measured; an OpenAI compaction
+    // item is ciphertext and is sized by the Provider's output count instead (measuring it alone
+    // recorded 0 and made every later estimate of this Context too small).
+    const summaryEstimatedTokens = estimateCompressionResultTokens(summary, providerOutputTokens, calibration.ratio);
     const projectedTokens = summaryEstimatedTokens
       + Math.max(0, candidateProjection.tokenCount - summaryProjectionTokens);
     const projectedBodyTokens = calibrateEstimatorToProvider(

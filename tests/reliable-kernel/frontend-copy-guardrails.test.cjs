@@ -82,6 +82,10 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
     'the saving compares Context with Context, never the full request (system + tools) with the Context');
   assert.match(compressionCard, /const beforeTokens = computed\(\(\) => positiveToken\(/,
     'a legacy 0 full-request figure from manual compression must not be shown or subtracted');
+  assert.doesNotMatch(compressionCard, /Math\.max\(0, before - afterTokens\.value\)/,
+    'a Context that grew must not be clamped to “节省约 0 Token”');
+  assert.match(compressionCard, /`上下文增加约 \$\{formatTokenNumber\(-change\)\} Token`/,
+    'a Context that grew is reported as an increase');
   assert.match(thoughtView, /props\.streaming \? '正在思考\.\.\.' : EMPTY_THOUGHT_LABEL/,
     'a finished thought without text (signature only) must not keep saying it is still thinking');
   assert.doesNotMatch(thoughtView, /<pre>\{\{ displayedText \}\}<\/pre>/);

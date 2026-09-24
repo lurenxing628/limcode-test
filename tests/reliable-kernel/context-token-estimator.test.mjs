@@ -161,6 +161,39 @@ test('Claude 原生压缩块的可读摘要按文本计入上下文；旧库里�
   assert.equal(kernel.estimateMaterializedContextTokens([richer, question]) - total, 500);
 });
 
+test('OpenAI 原生压缩的密文按服务商输出计入上下文；旧库里记成 0 的压缩块也按输出纠正', () => {
+  const opaque = [{
+    role: 'model',
+    parts: [{
+      providerContext: {
+        provider: 'openai',
+        format: 'openai-responses',
+        itemType: 'compaction',
+        rawItem: { type: 'compaction', encrypted_content: 'cipher'.repeat(2_000) }
+      }
+    }]
+  }];
+  const observation = { role: 'user', parts: [{ text: '附件观察：截图里是登录页，按钮文字为“继续”。' }] };
+  assert.ok(kernel.estimateMessageContentsTokens(opaque) < 20, 'ciphertext itself is never charged by characters');
+  // New results: the readable part (e.g. Attachment observation state) plus the compaction output.
+  const measured = kernel.estimateMessageContentsTokens([...opaque, observation]);
+  assert.equal(kernel.estimateCompressionResultTokens([...opaque, observation], 2_845, 1.25), measured + Math.floor(2_845 / 1.25));
+  assert.equal(kernel.estimateCompressionResultTokens([...opaque, observation], undefined, 1.25), measured);
+  // Readable Claude compaction text is measured, never topped up with the output count.
+  const claude = [{ role: 'model', parts: [{ providerContext: { provider: 'anthropic', format: 'claude', itemType: 'compaction',
+    rawItem: { type: 'compaction', content: '摘要正文', signature: 'sig' } } }] }];
+  assert.equal(kernel.estimateCompressionResultTokens(claude, 1_817, 1), kernel.estimateMessageContentsTokens(claude));
+  // A block written between 2026-08-21 and this fix stored estimatedTokens 0 (real run: output 2,845).
+  const stored = segment('compression', COMPRESSION_TYPE, JSON.stringify({
+    kind: 'compression_contents', version: 1, contents: opaque, methodKind: 'provider_native',
+    estimatedTokens: 0, providerOutputTokens: 2_845, providerCalibrationRatio: 1.25
+  }), 'model');
+  const expected = kernel.estimateMessageContentsTokens(opaque) + Math.floor(2_845 / 1.25);
+  assert.equal(kernel.estimateContextSegmentTokens(stored), expected);
+  const question = segment('message', MESSAGE_TYPE, JSON.stringify({ role: 'user', parts: [{ text: '继续' }] }), 'user');
+  assert.ok(kernel.estimateMaterializedContextTokens([stored, question]) >= expected);
+});
+
 test('tool_pair只估算实际重传的functionResponse，不重复计算历史工具参数', () => {
   const hugeArguments = JSON.stringify({ content: 'x'.repeat(500_000) });
   const pair = JSON.stringify({

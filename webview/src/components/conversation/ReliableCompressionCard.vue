@@ -100,9 +100,11 @@ const afterTokens = computed(() => firstToken(
 ));
 // Saving compares context with context (same estimator); the full-request estimate also counts the
 // system prompt and tool definitions, which compression never removes. Older blocks have no context figure.
-const savedTokens = computed(() => {
+// Negative when the Context grew — e.g. a summary rebuilt from raw records came out longer than the one it
+// replaced; that is reported as an increase instead of being clamped to “节省约 0 Token”.
+const tokenChange = computed(() => {
   const before = contextBeforeTokens.value ?? beforeTokens.value;
-  return before !== undefined && afterTokens.value !== undefined ? Math.max(0, before - afterTokens.value) : undefined;
+  return before !== undefined && afterTokens.value !== undefined ? before - afterTokens.value : undefined;
 });
 const triggerReason = computed(() =>
   stringValue(props.block.trigger_reason ?? props.block.triggerReason)
@@ -182,7 +184,10 @@ const subtitle = computed(() => {
   }
   const facts = [methodLabel.value, triggerLabel.value];
   if (sourceCount.value !== undefined) facts.push(`${sourceCount.value} 个上下文段`);
-  if (savedTokens.value !== undefined) facts.push(`节省约 ${formatTokenNumber(savedTokens.value)} Token`);
+  const change = tokenChange.value;
+  if (change !== undefined) {
+    facts.push(change >= 0 ? `节省约 ${formatTokenNumber(change)} Token` : `上下文增加约 ${formatTokenNumber(-change)} Token`);
+  }
   return facts.join(' · ');
 });
 
