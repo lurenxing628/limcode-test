@@ -232,7 +232,7 @@ export function resolveModelToolArguments(
   const args = cloneValue(argumentsInput);
   const record = asRecord(args);
   if (!record) return args;
-  dropEmptyReferenceArguments(record);
+  dropEmptyReferenceArguments(record, modelReferenceKeys(toolName, record));
 
   if (isCollaborationHandleTool(toolName)) {
     resolveCollaborationArguments(toolName, record, catalog);
@@ -512,15 +512,33 @@ function requireText(value: unknown, label: string): string {
  * that translate Chat Completions into Responses) must fill every optional field, so an unused
  * reference arrives as "" or [""]. An empty reference names nothing: treat it as omitted. Tools whose
  * reference is required still fail on the missing field, so this never selects a different target.
+ * Only the handle keys a builtin tool's model contract defines are cleaned: an MCP tool's own `baseRef`
+ * or `labelRefs` (and any other *Ref argument) are real values and reach the tool exactly as sent.
  */
-function dropEmptyReferenceArguments(record: Record<string, unknown>): void {
+function dropEmptyReferenceArguments(record: Record<string, unknown>, keys: readonly string[]): void {
   const empty = (value: unknown) => value === null || (typeof value === 'string' && value.trim() === '');
-  for (const [key, value] of Object.entries(record)) {
-    if (key.endsWith('Ref') && empty(value)) {
-      delete record[key];
-    } else if (key.endsWith('Refs') && Array.isArray(value) && value.every(empty)) {
-      delete record[key];
-    }
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+    const value = record[key];
+    if (empty(value) || (Array.isArray(value) && value.every(empty))) delete record[key];
+  }
+}
+
+/** Handle-reference argument keys of the builtin tools that resolveModelToolArguments maps; none for other tools. */
+function modelReferenceKeys(toolName: string, record: Record<string, unknown>): readonly string[] {
+  if (isCollaborationHandleTool(toolName)) {
+    const keys = collaborationArgumentFields(toolName, record).map(([refKey]) => refKey);
+    return toolName === 'agent_board' ? [...keys, 'notifyConversationRefs'] : keys;
+  }
+  switch (toolName) {
+    case 'read': return ['attachmentRef'];
+    case 'bash':
+    case 'shell': return ['processRef'];
+    case 'run_agent':
+    case 'read_agent_answer':
+    case 'submit_agent_answer': return ['childRef', 'childRefs'];
+    case 'switch_work_environment': return ['workEnvironmentRef'];
+    default: return [];
   }
 }
 
@@ -601,8 +619,11 @@ function projectCollaborationValue(value: unknown, catalog: ModelHandleCatalog):
   return output;
 }
 
-function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
-  const fields: ReadonlyArray<readonly [string, string, ModelHandleKind]> = toolName === 'agent_board'
+function collaborationArgumentFields(
+  toolName: string,
+  record: Record<string, unknown>
+): ReadonlyArray<readonly [string, string, ModelHandleKind]> {
+  return toolName === 'agent_board'
     ? [['channelRef', 'channelId', 'boardChannel'], ['threadRef', 'threadId', 'boardThread'], ['postRef', 'postId', 'boardPost']]
     : isCrossConversationTool(toolName)
     // Cross-conversation tools address a whole Conversation, its transcript page or a reply.
@@ -611,6 +632,10 @@ function resolveCollaborationArguments(toolName: string, record: Record<string, 
     : [['conversationRef', 'targetConversationId', 'conversation'], ['messageRef', 'messageId', record.view === 'conversation' ? 'conversationMessage' : 'collaborationMessage'],
       ['afterMessageRef', 'afterMessageId', 'collaborationMessage'],
       ['beforeMessageRef', 'beforeMessageId', record.view === 'conversation' ? 'conversationMessage' : 'collaborationMessage'], ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']];
+}
+
+function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
+  const fields = collaborationArgumentFields(toolName, record);
   for (const [refKey, targetKey, kind] of fields) {
     // Provider contracts accept only frozen short references. Canonical IDs cannot bypass the map.
     if (targetKey in record) throw new UnknownModelHandleReferenceError(kind, '(canonical id is not a model reference)');

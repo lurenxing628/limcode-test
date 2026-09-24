@@ -39,6 +39,19 @@ test('collaboration short references retain distinct kinds, do not expose canoni
   assert.deepEqual(buildModelHandleCatalog([{ conversationId: 'hidden-child', messageId: 'historical-chat' }]).entries, [], 'unrelated internal IDs are not collaboration references');
 });
 
+test('empty-reference cleanup only touches handle keys of builtin tools; MCP and other arguments stay exactly as sent', () => {
+  // An MCP tool's own *Ref parameters (git refs, ...) are not model handles: empty strings, null and [] are real values.
+  const mcpArgs = { baseRef: '', headRef: 'feature', parentRef: null, labelRefs: [] };
+  assert.deepEqual(resolveModelToolArguments('github_compare_commits', mcpArgs, catalog), mcpArgs);
+  // Builtin tools: only their own handle keys; unrelated *Ref keys the tool does not define are left alone.
+  assert.deepEqual(resolveModelToolArguments('read', { path: 'a.txt', attachmentRef: '', gitRef: '' }, catalog), { path: 'a.txt', gitRef: '' });
+  assert.deepEqual(resolveModelToolArguments('bash', { command: 'ls', processRef: '', baseRef: '' }, catalog), { command: 'ls', baseRef: '' });
+  assert.deepEqual(resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: '', otherRef: null }, catalog), { otherRef: null });
+  assert.deepEqual(resolveModelToolArguments('agent_board', { operation: 'post', channelRef: 'H1', threadRef: '', notifyConversationRefs: [''], labelRefs: [''] }, catalog), {
+    operation: 'post', channelId: 'channel-one', labelRefs: ['']
+  });
+});
+
 test('compressed and fork-copied recipes reserve collaboration references without scanning source conversations', async () => {
   const domains = {
     Turn: [{ id: 'fork-turn', conversation_id: 'fork', created_at: 'same' }],
