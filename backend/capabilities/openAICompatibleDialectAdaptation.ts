@@ -5,8 +5,9 @@
  * - DeepSeek 写法：`thinking.type` + 收敛到对方接受值的 `reasoning_effort`；不能关闭思考的模型不发 disabled。
  * - enable_thinking 写法：`enable_thinking` 开关，只在对方接受时带 `reasoning_effort`。
  * - 不发送：去掉所有思考参数。
- * 带 tools 的请求里给每条 assistant 消息补上 `reasoning_content`（缺失时为空串）：DeepSeek、MiMo
- * 官方在思考模式下缺了就返回 400；其他 DeepSeek 写法的服务商多传不会报错。
+ * 带 tools 的请求里给每条 assistant 消息补上 `reasoning_content`（缺失时为空串）：只在官方文档写明要求回传的
+ * 平台和模型上补（见 shared/openAICompatibleDialect.ts 的 fillReasoningReplay）；空串是否被接受官方没有写明。
+ * DeepSeek 写法和 enable_thinking 写法下，历史里 OpenRouter 的 `reasoning` 文本挪到 `reasoning_content`。
  * 用户在自定义请求体里自己写了思考参数时不改写，只补回传。
  */
 import type { LlmProviderConfigRecord, LlmThinkingLevel } from '../../shared/protocol';
@@ -47,8 +48,27 @@ export function adaptOpenAICompatibleDialect(
   let body = request.body;
   // 用户在自定义请求体里自己写了思考参数（与会话思考覆盖的冲突检查同一口径）：不改写、也不删除。
   if (!openAICompatibleBodyControlsThinking(settings.requestBody)) body = withDialectThinking(body, dialect);
+  if (dialect.format === 'deepseek' || dialect.format === 'enable_thinking') body = withReasoningContentField(body);
   if (dialect.fillReasoningReplay) body = withReasoningReplay(body);
   return body === request.body ? request : { ...request, body };
+}
+
+/**
+ * 从 OpenRouter 切过来时，历史 assistant 消息的思考在 `reasoning`（加 `reasoning_details`）里；
+ * DeepSeek 等只认 `reasoning_content`（DeepSeek 带 tools 时缺了返回 400），把文本挪过去，去掉 OpenRouter 专有字段。
+ */
+function withReasoningContentField(body: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(body.messages)) return body;
+  let changed = false;
+  const messages = body.messages.map((message) => {
+    if (!isRecord(message) || message.role !== 'assistant' || !('reasoning' in message || 'reasoning_details' in message)) return message;
+    changed = true;
+    const { reasoning, reasoning_details: _details, ...rest } = message;
+    return typeof rest.reasoning_content !== 'string' && typeof reasoning === 'string' && reasoning
+      ? { ...rest, reasoning_content: reasoning }
+      : rest;
+  });
+  return changed ? { ...body, messages } : body;
 }
 
 /** 渠道或会话选的档位：接入库把它编码成 `reasoning_effort`（官方 DeepSeek 走接入库的 DeepSeek 格式时是 thinking.type）。 */
@@ -100,7 +120,7 @@ function withReasoningReplay(body: Record<string, unknown>): Record<string, unkn
   let changed = false;
   const messages = body.messages.map((message) => {
     if (!isRecord(message) || message.role !== 'assistant') return message;
-    if (typeof message.reasoning_content === 'string' || typeof message.reasoning === 'string') return message;
+    if (typeof message.reasoning_content === 'string') return message;
     changed = true;
     return { ...message, reasoning_content: '' };
   });

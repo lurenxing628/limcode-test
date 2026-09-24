@@ -41,7 +41,7 @@ export interface OpenAICompatibleModelThinkingRule {
   canDisable: boolean;
   /** 模型接受的 `reasoning_effort`；空数组表示从不发送强度。 */
   efforts: readonly LlmThinkingLevel[];
-  /** 官方接口在带 tools 的请求里要求每条 assistant 消息都回传 `reasoning_content`，否则返回 400。 */
+  /** 官方文档写明带 tools 的请求要回传 `reasoning_content`（DeepSeek、MiMo 缺了返回 400；Kimi K3 要求回传完整 assistant 消息）。 */
   requiresReasoningReplay: boolean;
 }
 
@@ -60,7 +60,10 @@ export interface OpenAICompatibleDialect {
   source: 'manual' | 'probe' | 'platform' | 'model' | 'default';
   /** tool 消息的 content 可以放图片/文件数组（DeepSeek、MiMo 官方接口）。 */
   toolContentArrays: boolean;
-  /** 带 tools 的请求里，给每条 assistant 消息补上 `reasoning_content`（缺失时为空串）。 */
+  /**
+   * 带 tools 的请求里，给每条 assistant 消息补上 `reasoning_content`（缺失时为空串）。
+   * 只在官方文档写明要求回传的平台和模型上补；空串是否被各家接受官方没有写明，待真实请求验证。
+   */
   fillReasoningReplay: boolean;
 }
 
@@ -85,7 +88,8 @@ const QWEN_THINKING_ONLY: OpenAICompatibleModelThinkingRule = { ...QWEN_HYBRID, 
 const MODEL_RULES: ReadonlyArray<{ pattern: RegExp; rule: OpenAICompatibleModelThinkingRule | null }> = [
   { pattern: /^deepseek/, rule: { family: 'deepseek', toggle: true, canDisable: true, efforts: DEEPSEEK_STYLE_EFFORTS, requiresReasoningReplay: true } },
   { pattern: /^mimo/, rule: { family: 'mimo', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: true } },
-  { pattern: /^kimi-k3/, rule: { family: 'kimi', toggle: false, canDisable: false, efforts: DEEPSEEK_STYLE_EFFORTS, requiresReasoningReplay: false } },
+  // Kimi K3（platform.kimi.ai kimi-k3-quickstart）：始终思考，只收顶层 reasoning_effort，要求把完整 assistant 消息原样带回。
+  { pattern: /^kimi-k3/, rule: { family: 'kimi', toggle: false, canDisable: false, efforts: DEEPSEEK_STYLE_EFFORTS, requiresReasoningReplay: true } },
   { pattern: /^kimi-k2-7-code/, rule: { family: 'kimi', toggle: true, canDisable: false, efforts: [], requiresReasoningReplay: false } },
   { pattern: /^kimi-/, rule: { family: 'kimi', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: false } },
   // 智谱（docs.bigmodel.cn 对话补全）：GLM-5.3 只接受 low / high / max 且关不掉；GLM-5.2 的 low、medium 映射为 high
@@ -197,9 +201,26 @@ export function resolveOpenAICompatibleDialect(
     format,
     source,
     toolContentArrays: format === 'deepseek' && (platform === 'deepseek' || platform === 'mimo'),
-    fillReasoningReplay: format === 'deepseek' || platform === 'kimi-code'
-      || (rule?.requiresReasoningReplay === true && platform !== 'openrouter' && platform !== 'local')
+    fillReasoningReplay: format !== 'omit' && requiresReasoningReplay(platform, model, rule)
   };
+}
+
+/**
+ * 官方文档写明要回传思考内容的平台和模型：模型规则（DeepSeek、MiMo、Kimi K3）；Kimi Code 缺了返回 400
+ * （kimi.com/code/docs error-reference）；百炼的第三方 `kimi/` 模型必须在每轮 assistant 消息里保留 reasoning_content
+ * （help.aliyun.com/zh/model-studio/kimi-api-by-moonshot-ai）；硅基流动的 GLM-4.7 要求原样回传
+ * （docs.siliconflow.com interleaved-thinking）。OpenRouter 和本机服务按它们自己的写法，不补。
+ */
+function requiresReasoningReplay(
+  platform: OpenAICompatiblePlatform,
+  model: string,
+  rule: OpenAICompatibleModelThinkingRule | undefined
+): boolean {
+  if (platform === 'openrouter' || platform === 'local') return false;
+  if (rule?.requiresReasoningReplay || platform === 'kimi-code') return true;
+  if (platform === 'dashscope') return model.trim().toLowerCase().startsWith('kimi/');
+  if (platform === 'siliconflow') return /^glm-4-7(?:$|-)/.test(normalizedOpenAICompatibleModelName(model));
+  return false;
 }
 
 function probedRule(

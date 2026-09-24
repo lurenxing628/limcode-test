@@ -23,7 +23,7 @@ const {
 const { canonicalLlmProviderKind } = require('../../dist/extension/shared/protocol.js');
 const { sessionThinkingCapability, validateSessionThinkingOverride } = require('../../dist/extension/shared/sessionThinking.js');
 const { normalizeModelCapabilitySnapshot, resolveProviderOpenAICompatibleDialect } = require('../../dist/extension/shared/modelCapabilities.js');
-const { libraryProviderKind } = require('../../dist/extension/backend/capabilities/openAICompatibleDialectAdaptation.js');
+const { libraryProviderKind, adaptOpenAICompatibleDialect } = require('../../dist/extension/backend/capabilities/openAICompatibleDialectAdaptation.js');
 const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
 const { normalizeLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { canonicalModelProfile } = require('../../dist/extension/backend/reliableKernel/scopedModelProfiles.js');
@@ -101,7 +101,8 @@ test('自动识别写法：先看平台，认不出的中转站再看模型 ID�
     [DEEPSEEK, 'deepseek-v4-pro', 'deepseek', 'platform', true, true],
     ['https://api.xiaomimimo.com/v1', 'mimo-v2-pro', 'deepseek', 'platform', true, true],
     [MOONSHOT, 'kimi-k3', 'deepseek', 'platform', false, true],
-    [ZHIPU, 'glm-5.2', 'deepseek', 'platform', false, true],
+    // 智谱官方没有写明缺 reasoning_content 会报错，不补空串。
+    [ZHIPU, 'glm-5.2', 'deepseek', 'platform', false, false],
     [DASHSCOPE, 'deepseek-v4-pro', 'enable_thinking', 'platform', false, true],
     [DASHSCOPE, 'qwen3-max', 'enable_thinking', 'platform', false, false],
     [SILICONFLOW, 'Qwen/Qwen3-32B', 'enable_thinking', 'platform', false, false],
@@ -113,7 +114,7 @@ test('自动识别写法：先看平台，认不出的中转站再看模型 ID�
     [OPENROUTER, 'deepseek/deepseek-v4-pro', 'reasoning_effort', 'platform', false, false],
     ['http://127.0.0.1:8000/v1', 'deepseek-v4-pro', 'reasoning_effort', 'platform', false, false],
     [RELAY, 'deepseek-v4-flash', 'deepseek', 'model', false, true],
-    [RELAY, 'glm-5.3', 'deepseek', 'model', false, true],
+    [RELAY, 'glm-5.3', 'deepseek', 'model', false, false],
     [RELAY, 'qwen3-max', 'reasoning_effort', 'default', false, false],
     [RELAY, 'gpt-5.5', 'reasoning_effort', 'default', false, false]
   ];
@@ -516,4 +517,37 @@ test('百炼按官方文档发送顶层 reasoning_effort：DeepSeek-V4、GLM-5.x
   assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3.8-max', { level: 'none' })), { enable_thinking: false });
   assert.deepEqual(sessionThinkingCapability('openai-compatible', 'deepseek-v4-pro', undefined, undefined, settings(DASHSCOPE, 'deepseek-v4-pro')).values, ['none', 'high', 'max']);
   assert.deepEqual(sessionThinkingCapability('openai-compatible', 'qwen3.8-max', undefined, undefined, settings(DASHSCOPE, 'qwen3.8-max')).values, ['none', 'low', 'medium', 'xhigh']);
+});
+
+test('回传思考内容只在官方写明要求的平台和模型上补：Kimi K3、Kimi Code、百炼 kimi/、硅基流动 GLM-4.7', async () => {
+  const filled = async (baseUrl, model, extra = {}) => {
+    const body = await wire(baseUrl, model, { level: 'high', contents: TOOL_HISTORY, tools: [TOOL], ...extra });
+    return body.messages.filter((message) => message.role === 'assistant').every((message) => message.reasoning_content === '');
+  };
+  assert.equal(resolveOpenAICompatibleDialect(MOONSHOT, 'kimi-k3').rule.requiresReasoningReplay, true);
+  assert.equal(await filled('https://api.kimi.com/coding/v1', 'kimi-for-coding'), true);
+  assert.equal(await filled(DASHSCOPE, 'kimi/kimi-k2.5'), true);
+  assert.equal(await filled(SILICONFLOW, 'zai-org/GLM-4.7'), true);
+  // 官方没有写明要求回传的：不补空串。
+  assert.equal(await filled(ZHIPU, 'glm-5.2'), false);
+  assert.equal(await filled(MOONSHOT, 'kimi-k2-0905-preview'), false);
+  assert.equal(await filled(RELAY, 'renamed-model', { openaiCompatibleThinkingFormat: 'deepseek' }), false);
+  assert.equal(await filled(DASHSCOPE, 'qwen3-max'), false);
+});
+
+test('DeepSeek 写法下把历史里 OpenRouter 的 reasoning 文本挪到 reasoning_content', () => {
+  const request = (messages) => ({ headers: {}, body: { model: 'deepseek-v4-pro', messages, tools: [{ type: 'function', function: { name: 'probe', parameters: {} } }] } });
+  const adapted = adaptOpenAICompatibleDialect(request([
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: '', reasoning: 'earlier thoughts', reasoning_details: [{ type: 'reasoning.text', text: 'earlier thoughts' }], tool_calls: [] },
+    { role: 'assistant', content: 'plain' }
+  ]), settings(DEEPSEEK, 'deepseek-v4-pro'));
+  const [first, second] = adapted.body.messages.filter((message) => message.role === 'assistant');
+  assert.equal(first.reasoning_content, 'earlier thoughts');
+  assert.equal('reasoning' in first, false);
+  assert.equal('reasoning_details' in first, false);
+  assert.equal(second.reasoning_content, '');
+  // OpenRouter 自己保留 reasoning / reasoning_details。
+  const kept = adaptOpenAICompatibleDialect(request([{ role: 'assistant', content: '', reasoning: 'x', reasoning_details: [] }]), settings(OPENROUTER, 'deepseek/deepseek-v4-pro'));
+  assert.equal(kept.body.messages[0].reasoning, 'x');
 });
