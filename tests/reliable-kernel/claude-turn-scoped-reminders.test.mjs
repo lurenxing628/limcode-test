@@ -510,7 +510,7 @@ for (const reason of [
       assert.equal(String(calls[0].headers['anthropic-beta']).split(',').includes(BETA), true);
       assert.deepEqual(calls[1].body, tailBody, 'the retry is exactly the old tail-mode request');
       assert.equal(String(calls[1].headers['anthropic-beta']), USER_BETA, 'no clear_at beta in tail mode');
-      assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model }).claudeTurnScopedReminders, 'tail');
+      assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model, configRevision: settings.updatedAt }).claudeTurnScopedReminders, 'tail');
 
       // Later requests to this target go straight to tail mode.
       const next = await turnScopedStart(baseUrl, 'fallback-2');
@@ -547,7 +547,7 @@ for (const scenario of ['no-reminder', 'tool-loop']) {
       assert.equal(String(calls[0].headers['anthropic-beta']).split(',').includes(BETA), true);
       assert.deepEqual(calls[1].body, off.body, 'the retry equals the switch-off request');
       assert.equal(calls[1].headers['anthropic-beta'], off.headers['anthropic-beta']);
-      assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model }).claudeTurnScopedReminders, 'tail');
+      assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model, configRevision: settings.updatedAt }).claudeTurnScopedReminders, 'tail');
     });
     resetProviderRequestAdaptations();
   });
@@ -560,7 +560,7 @@ test('网关回退：无关的 400 不回退、原样报错；没用轮内系统
     const events = await send(start, settings);
     assert.equal(calls.length, 1);
     assert.equal(events.some((event) => event.type === 'llm:error'), true);
-    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model }).claudeTurnScopedReminders, undefined);
+    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model, configRevision: settings.updatedAt }).claudeTurnScopedReminders, undefined);
   });
   await withServer(() => rejection('messages.7.clear_at: Extra inputs are not permitted'), async (baseUrl, calls) => {
     const request = fullRequest({ provider: 'claude', modelId: 'claude-opus-5-5', scenario: 'tool-loop' });
@@ -568,7 +568,7 @@ test('网关回退：无关的 400 不回退、原样报错；没用轮内系统
     const { start } = await render(request, settings);
     await send({ ...start, id: 'off-request' }, settings);
     assert.equal(calls.length, 1, 'switch off: no fallback retry');
-    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model }).claudeTurnScopedReminders, undefined);
+    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model, configRevision: settings.updatedAt }).claudeTurnScopedReminders, undefined);
   });
 });
 

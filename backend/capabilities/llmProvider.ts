@@ -28,6 +28,8 @@ import {
   applyLearnedRequestAdaptations,
   claudeTurnScopedRemindersFallenBack,
   createProviderRequestAdaptationRetry,
+  userRequestBodyRejectionMessage,
+  type ProviderRequestAdaptationRetry,
   installEncodedRequestPostProcessor,
   type ProviderRequestTarget
 } from './providerParameterAdaptation';
@@ -512,7 +514,8 @@ export async function startLlmProvider(
     const retryEnabled = settings.retryOnError !== false;
     const maxRetries = normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
     const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(settings), {
-      claudeTurnScopedReminders: claudeTurnScoped
+      claudeTurnScopedReminders: claudeTurnScoped,
+      userRequestBodyKeys: Object.keys(settings.requestBody ?? {})
     });
     let retryCount = 0;
     let sawRetry = false;
@@ -545,10 +548,11 @@ export async function startLlmProvider(
         return;
       } catch (error) {
         if (isRequestAbort(signal)) return;
-        const failure = failureFromCaughtError(error);
+        let failure = failureFromCaughtError(error);
         // 明确的不支持参数 400：按目标记住适配后立即重发；不占普通重试次数，也不等待。
         // 只有本次尝试还没发出任何事件时才立即重发；已经发出输出的，只记住给之后的请求，本次照常报错。
         if (!retryControl.cancelRequested && adaptationRetry.shouldRetryImmediately(failure.rawError) && !attemptEmitted) continue;
+        failure = withUserRequestBodyRejection(failure, adaptationRetry, settings);
         const nextRetryCount = retryCount + 1;
         // 接入库标明不可重试的错误（如 finish_reason=length 截断的工具参数）原样重发只会再失败一次。
         const canRetry = retryEnabled
@@ -2006,7 +2010,8 @@ export async function compactLlmProvider(
     // 摘要类方法在 executeSummaryProviderCall 内逐次调用自适配；这里只覆盖单次调用的原生压缩。
     const adaptationRetry = retrySettings && methodConfig.kind === 'provider_native'
       ? createProviderRequestAdaptationRetry(providerRequestTarget(retrySettings), {
-          claudeTurnScopedReminders: claudeTurnScopedRemindersRequested(request, retrySettings)
+          claudeTurnScopedReminders: claudeTurnScopedRemindersRequested(request, retrySettings),
+          userRequestBodyKeys: Object.keys(request.nativeRequestBody ?? retrySettings.requestBody ?? {})
         })
       : undefined;
     let retryCount = 0;
@@ -2044,8 +2049,9 @@ export async function compactLlmProvider(
           return;
         }
 
-        const failure = failureFromCaughtError(error);
+        let failure = failureFromCaughtError(error);
         if (!retryControl.cancelRequested && adaptationRetry?.shouldRetryImmediately(failure.rawError)) continue;
+        if (adaptationRetry && retrySettings) failure = withUserRequestBodyRejection(failure, adaptationRetry, retrySettings);
         const nextRetryCount = retryCount + 1;
         const canRetry = retryEnabled
           && isRetryableCompactFailure(error, failure)
@@ -4527,13 +4533,19 @@ async function executeSummaryProviderCall(
   };
 
   // 明确的不支持参数 400：记住目标适配后立即重发同一请求；与下面按方法配置的兼容重试相互独立。
-  const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(resolved.settings));
+  const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(resolved.settings), {
+    userRequestBodyKeys: Object.keys(resolved.settings.requestBody ?? {})
+  });
   const executeAdapting = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
     for (;;) {
       try {
         return await execute(activeRequest);
       } catch (error) {
-        if (signal?.aborted || !adaptationRetry.shouldRetryImmediately(failureFromCaughtError(error).rawError)) throw error;
+        if (signal?.aborted) throw error;
+        const failure = failureFromCaughtError(error);
+        if (adaptationRetry.shouldRetryImmediately(failure.rawError)) continue;
+        const explained = withUserRequestBodyRejection(failure, adaptationRetry, resolved.settings);
+        throw explained === failure ? error : new LlmAttemptFailureError(explained);
       }
     }
   };
@@ -5161,7 +5173,24 @@ function modelCatalogEntryToRecord(model: UnifiedModelCatalogEntry): LlmProvider
 }
 
 function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderRequestTarget {
-  return { providerConfigId: settings.id, provider: settings.provider, baseUrl: settings.baseUrl, model: settings.model };
+  return {
+    providerConfigId: settings.id,
+    provider: settings.provider,
+    baseUrl: settings.baseUrl,
+    model: settings.model,
+    configRevision: settings.updatedAt
+  };
+}
+
+/** 用户自己写在自定义请求参数里的键被服务明确拒绝：不替用户删，报错改成写明哪个参数、去哪里改（保留原始错误）。 */
+function withUserRequestBodyRejection(
+  failure: LlmAttemptFailure,
+  retry: ProviderRequestAdaptationRetry,
+  settings: Pick<LlmProviderConfigRecord, 'name'>
+): LlmAttemptFailure {
+  const rejected = retry.userRequestBodyRejection();
+  if (rejected.length === 0) return failure;
+  return { ...failure, message: userRequestBodyRejectionMessage(rejected, settings.name, failure.message) };
 }
 
 /**

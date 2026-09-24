@@ -8,10 +8,12 @@ import {
 } from '../../dist/extension/backend/capabilities/llmProvider.js';
 import {
   adaptRequestParameters,
+  forgetProviderRequestAdaptations,
   learnProviderRequestAdaptations,
   learnedProviderRequestAdaptations,
   providerErrorSearchText,
   resetProviderRequestAdaptations,
+  setProviderAdaptationClockForTests,
   unsupportedRequestParameters
 } from '../../dist/extension/backend/capabilities/providerParameterAdaptation.js';
 
@@ -579,4 +581,125 @@ test('C1 内核适配层：输出之后才报的参数错误让本次尝试失�
     assert.equal(events.filter((event) => event.kind === 'output_delta').map((event) => event.content.text).join(''), 'PARTIAL');
   });
   resetProviderRequestAdaptations();
+});
+
+// 学到的“去掉参数”绑定渠道配置的版本、有过期时间，用户自己写进自定义请求参数的键不替用户删。
+test('C1 学到的适配绑定渠道配置版本：改过配置（updatedAt 变）后重新试探', async () => {
+  resetProviderRequestAdaptations();
+  await withServer((call) => call.body.reasoning_effort !== undefined
+    ? { status: 400, body: GATEWAY_REASONING_EFFORT }
+    : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    const settings = providerSettings(baseUrl, { id: 'adaptation-revision', updatedAt: 100 });
+    await chat(settings, 'revision-1');
+    assert.equal(calls.length, 2);
+    await chat(settings, 'revision-2');
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2].body.reasoning_effort, undefined);
+    // 用户改了渠道配置：之前学到的不再沿用，先按新配置原样发送。
+    const events = await chat({ ...settings, updatedAt: 200 }, 'revision-3');
+    assert.ok(events.some((event) => event.type === 'llm:done'));
+    assert.equal(calls.length, 5);
+    assert.equal(calls[3].body.reasoning_effort, 'high');
+    assert.equal(calls[4].body.reasoning_effort, undefined);
+  });
+  resetProviderRequestAdaptations();
+});
+
+test('C1 学到的适配：配置保存时按渠道清空；过了有效期重新试探', async () => {
+  resetProviderRequestAdaptations();
+  const now = { value: 1_000_000 };
+  setProviderAdaptationClockForTests(() => now.value);
+  try {
+    const learned = target({ providerConfigId: 'adaptation-ttl', configRevision: 7 });
+    const body = JSON.parse(GATEWAY_REASONING_EFFORT);
+    assert.deepEqual(learnProviderRequestAdaptations(learned, { status: 400, rawBody: body }), ['parameter:reasoning_effort']);
+    assert.deepEqual(learnedProviderRequestAdaptations(learned).parameters, ['reasoning_effort']);
+    now.value += 23 * 60 * 60 * 1000;
+    assert.deepEqual(learnedProviderRequestAdaptations(learned).parameters, ['reasoning_effort'], '有效期内仍然沿用');
+    now.value += 2 * 60 * 60 * 1000;
+    assert.deepEqual(learnedProviderRequestAdaptations(learned).parameters, [], '过期后重新试探');
+    assert.deepEqual(learnProviderRequestAdaptations(learned, { status: 400, rawBody: body }), ['parameter:reasoning_effort'], '再次被拒时重新记住');
+    const other = target({ providerConfigId: 'adaptation-other-channel', configRevision: 7 });
+    learnProviderRequestAdaptations(other, { status: 400, rawBody: body });
+    forgetProviderRequestAdaptations('adaptation-ttl');
+    assert.deepEqual(learnedProviderRequestAdaptations(learned).parameters, []);
+    assert.deepEqual(learnedProviderRequestAdaptations(other).parameters, ['reasoning_effort'], '只清空保存的那个渠道');
+  } finally {
+    setProviderAdaptationClockForTests(undefined);
+    resetProviderRequestAdaptations();
+  }
+});
+
+test('C1 自定义请求参数里用户自己写的键被拒时不去掉，报错写明哪个参数、去哪里改', async () => {
+  resetProviderRequestAdaptations();
+  await withServer((call) => call.body.reasoning_effort !== undefined
+    ? { status: 400, body: GATEWAY_REASONING_EFFORT }
+    : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    const settings = providerSettings(baseUrl, {
+      id: 'adaptation-user-body', name: '我的中转', generationConfig: undefined, requestBody: { reasoning_effort: 'high' }
+    });
+    const events = await chat(settings, 'user-body-1');
+    assert.equal(calls.length, 1, '不替用户删掉自己写的参数');
+    const error = events.find((event) => event.type === 'llm:error');
+    assert.ok(error);
+    assert.match(error.payload.message, /reasoning_effort/);
+    assert.match(error.payload.message, /自定义请求参数/);
+    assert.match(error.payload.message, /我的中转/);
+    assert.match(error.payload.message, /Extra inputs are not permitted/, '保留服务返回的原文');
+    await chat(settings, 'user-body-2');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].body.reasoning_effort, 'high', '也不记住去掉它');
+  });
+  resetProviderRequestAdaptations();
+});
+
+test('C1 学到的适配：保存渠道配置时只清空改过或删掉的渠道', async () => {
+  const { createRequire } = await import('node:module');
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const require = createRequire(import.meta.url);
+  const Module = require('node:module');
+  const originalLoad = Module._load;
+  class Uri {
+    constructor(value) { this.scheme = 'file'; this.fsPath = path.resolve(value); this.path = this.fsPath; }
+    static file(value) { return new Uri(value); }
+    static joinPath(base, ...parts) { return new Uri(path.join(base.fsPath, ...parts)); }
+    toString() { return `file://${this.path}`; }
+  }
+  const vscode = { Uri, FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 }, workspace: { fs: {
+    createDirectory: (uri) => fs.mkdir(uri.fsPath, { recursive: true }), readFile: (uri) => fs.readFile(uri.fsPath),
+    async writeFile(uri, bytes) { await fs.mkdir(path.dirname(uri.fsPath), { recursive: true }); await fs.writeFile(uri.fsPath, bytes); },
+    async readDirectory(uri) { return (await fs.readdir(uri.fsPath, { withFileTypes: true })).map((item) => [item.name, item.isDirectory() ? 2 : 1]); },
+    delete: (uri) => fs.rm(uri.fsPath, { recursive: true, force: true }),
+    async stat(uri) { const stat = await fs.stat(uri.fsPath); return { type: stat.isDirectory() ? 2 : 1, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs }; },
+    async rename(from, to) { await fs.rename(from.fsPath, to.fsPath); }
+  } } };
+  Module._load = function load(request, parent, isMain) { return request === 'vscode' ? vscode : originalLoad.call(this, request, parent, isMain); };
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-adaptation-save-'));
+  resetProviderRequestAdaptations();
+  try {
+    const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
+    const { createDefaultLlmProviderConfig, loadLlmProviderConfigsSettings, saveLlmProviderConfigsSettings } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
+    const paths = createVscodeStoragePaths(Uri.file(root));
+    const first = { ...createDefaultLlmProviderConfig({ name: '甲' }), id: 'save-channel-a' };
+    const second = { ...createDefaultLlmProviderConfig({ name: '乙' }), id: 'save-channel-b' };
+    const loaded = await loadLlmProviderConfigsSettings(paths);
+    let saved = await saveLlmProviderConfigsSettings(paths, { configs: [first, second] }, loaded.revision);
+    const body = JSON.parse(GATEWAY_REASONING_EFFORT);
+    const targetOf = (config) => target({ providerConfigId: config.id, configRevision: config.updatedAt });
+    learnProviderRequestAdaptations(targetOf(first), { status: 400, rawBody: body });
+    learnProviderRequestAdaptations(targetOf(second), { status: 400, rawBody: body });
+    // 只改了甲：甲清空，乙保留。
+    saved = await saveLlmProviderConfigsSettings(paths, { configs: [{ ...first, baseUrl: 'https://changed.example/v1' }, second] }, saved.revision);
+    assert.deepEqual(learnedProviderRequestAdaptations(targetOf(first)).parameters, []);
+    assert.deepEqual(learnedProviderRequestAdaptations(targetOf(second)).parameters, ['reasoning_effort']);
+    // 删掉乙：乙也清空。
+    await saveLlmProviderConfigsSettings(paths, { configs: [{ ...first, baseUrl: 'https://changed.example/v1' }] }, saved.revision);
+    assert.deepEqual(learnedProviderRequestAdaptations(targetOf(second)).parameters, []);
+  } finally {
+    Module._load = originalLoad;
+    resetProviderRequestAdaptations();
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

@@ -33,6 +33,7 @@ import {
 } from '../../../shared/protocol';
 import { normalizeOpenAIResponsesNativeSettings } from '../../../shared/openAIResponsesCapabilities';
 import { DEFAULT_LLM_BASE_URL } from '../llmProvider';
+import { forgetProviderRequestAdaptations } from '../providerParameterAdaptation';
 import { isSettingsRevisionConflictError } from '../settingsRevisionConflict';
 import type { StoragePaths } from './paths';
 import { INDEX_FILE } from './constants';
@@ -96,6 +97,11 @@ export async function saveLlmProviderConfigsSettings(
     (record) => record.name,
     { expectedRevision, section: REVISION_SECTION, pruneMissing: true }
   );
+  // 改过或删掉的渠道：之前按这个渠道学到的请求适配（去掉的参数、退回的提醒方式）全部作废，按新配置重新试探。
+  const saved = new Map(committed.records.map((record) => [record.id, JSON.stringify(record)]));
+  for (const previous of committed.previousRecords) {
+    if (saved.get(previous.id) !== JSON.stringify(previous)) forgetProviderRequestAdaptations(previous.id);
+  }
   return {
     ...providerSettingsFromSnapshot(indexUri, committed),
     previousSettings: providerSettingsFromRecords(committed.previousRecords)

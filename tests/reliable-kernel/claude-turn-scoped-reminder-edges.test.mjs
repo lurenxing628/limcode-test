@@ -451,7 +451,7 @@ test('(b) Claude 原生压缩：网关明确拒绝时立即以尾巴模式重发
     assert.equal(hasSystem(calls[1].body), false, 'the retry is the old compaction request');
     assert.deepEqual(betas(calls[1].headers), [USER_BETA, COMPACT_BETA]);
     assert.deepEqual(result.payload.result.contents[0].parts[0].providerContext.rawItem, signed);
-    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: MODEL_ID }).claudeTurnScopedReminders, 'tail');
+    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: MODEL_ID, configRevision: settings.updatedAt }).claudeTurnScopedReminders, 'tail');
   });
   resetProviderRequestAdaptations();
 });

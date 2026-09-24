@@ -153,7 +153,7 @@ test('C2 官方端点：前缀失配 400 后带 beta 头与 drop_block 重试一
     const { thinking: secondThinking, ...secondRest } = calls[1].body;
     assert.deepEqual(secondRest, firstRest);
     assert.deepEqual(secondThinking, { ...firstThinking, block_binding: { prefix_mismatch_behavior: 'drop_block' } });
-    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model }).claudeThinkingBinding, 'drop_block');
+    assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model, configRevision: settings.updatedAt }).claudeThinkingBinding, 'drop_block');
 
     await chat(settings, 'binding-2');
     assert.equal(calls.length, 3, '之后的请求一开始就带上 drop_block');

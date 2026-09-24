@@ -2,8 +2,11 @@
  * 不支持参数的自适配（进程内、按目标记忆）。
  *
  * 某次请求返回 400/422 且错误文本明确点名某个参数不被支持时，记住“对这个目标去掉或替换该参数”，
- * 并让调用方立即重试一次；之后同一目标（渠道配置 id + baseUrl + 模型）的请求在编码后直接适配。
+ * 并让调用方立即重试一次；之后同一目标（渠道配置 id + baseUrl + 模型 + 配置版本）的请求在编码后直接适配。
  * 其他目标完全不受影响；网络错误、5xx 与语义不明确的 400 一律不匹配。
+ * - 配置版本是渠道的 updatedAt：用户改过渠道配置后，之前学到的不再沿用；保存配置时按渠道清空（forgetProviderRequestAdaptations）。
+ * - 学到的适配 {@link LEARNED_ADAPTATION_TTL_MS} 后过期，重新按原样试探一次（网关可能已经修好）。
+ * - 用户自己写在自定义请求参数（requestBody）里的键被拒时不替用户去掉，调用方改为报错写明是哪个参数、去哪里改。
  * Claude 保留思考的前缀失配（claudeThinkingAdaptation.ts）用同一套按目标记忆与立即重发。
  * Claude 轮内系统消息被网关明确拒绝时（claudeTurnScopedReminders.ts），同样按目标退回原来的尾巴模式并立即重发。
  *
@@ -55,7 +58,12 @@ export interface ProviderRequestTarget {
   provider: LlmProviderKind;
   baseUrl: string;
   model: string;
+  /** 渠道配置的版本（updatedAt）：改过配置后，之前学到的适配不再沿用。 */
+  configRevision?: number;
 }
+
+/** 学到的适配多久之后重新试探一次。 */
+export const LEARNED_ADAPTATION_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** 编码并合并 requestBody 覆盖之后、真正发往线上的请求（dry-run 与 WebSocket 帧同样取自这里）。 */
 export interface EncodedProviderRequest {
@@ -106,27 +114,64 @@ const ADAPTABLE_PARAMETERS: readonly AdaptableRequestParameter[] = [
 const CHAT_COMPLETIONS_PROVIDERS = new Set<LlmProviderKind>(['openai-compatible']);
 
 interface TargetAdaptationState {
-  parameters: Set<AdaptableRequestParameter>;
+  providerConfigId: string;
+  model: string;
+  /** 学到的参数与学到它的时间。 */
+  parameters: Map<AdaptableRequestParameter, number>;
   /** Claude 保留思考的前缀失配处理；只会 drop_block → strip_thinking 单向推进，不会放回。 */
   claudeThinkingBinding?: ClaudeThinkingBindingMode;
-  /** 网关明确拒绝了轮内系统消息：这个目标之后的请求退回原来的尾巴模式（进程内记住）。 */
-  claudeTurnScopedReminders?: 'tail';
+  /** 网关明确拒绝了轮内系统消息的时间：这个目标之后的请求退回原来的尾巴模式（进程内记住，过期后重新试探）。 */
+  claudeTurnScopedRemindersFallbackAt?: number;
 }
 
 /** 本次请求的上下文：只有确实用了轮内系统消息的请求，才把相关 400 当成需要回退的信号。 */
 export interface ProviderRequestAdaptationContext {
   claudeTurnScopedReminders?: boolean;
+  /** 用户在自定义请求参数（requestBody）里自己写的顶层键：被拒时不替用户去掉。 */
+  userRequestBodyKeys?: readonly string[];
 }
 
 const adaptationStates = new Map<string, TargetAdaptationState>();
+let adaptationClock: () => number = () => Date.now();
 
 export function providerRequestTargetKey(target: ProviderRequestTarget): string {
-  return [target.providerConfigId, target.baseUrl, target.model].join('\n');
+  return [target.providerConfigId, target.baseUrl, target.model, String(target.configRevision ?? '')].join('\n');
 }
 
-/** 测试与开发诊断用：清空进程内记住的适配。生产路径不调用。 */
+/** 测试与开发诊断用：清空进程内记住的适配。 */
 export function resetProviderRequestAdaptations(): void {
   adaptationStates.clear();
+}
+
+/** 测试用：替换判断过期所用的时钟；不传时恢复为当前时间。 */
+export function setProviderAdaptationClockForTests(clock?: () => number): void {
+  adaptationClock = clock ?? (() => Date.now());
+}
+
+/** 渠道配置保存时调用：这个渠道之前学到的适配全部作废，按新配置重新试探。 */
+export function forgetProviderRequestAdaptations(providerConfigId: string): void {
+  for (const [key, state] of adaptationStates) {
+    if (state.providerConfigId === providerConfigId) adaptationStates.delete(key);
+  }
+}
+
+/** 读取目标的记忆，顺带去掉已经过期的条目；什么都不剩时删掉整条。 */
+function liveAdaptationState(key: string): TargetAdaptationState | undefined {
+  const state = adaptationStates.get(key);
+  if (!state) return undefined;
+  const now = adaptationClock();
+  for (const [parameter, learnedAt] of state.parameters) {
+    if (now - learnedAt > LEARNED_ADAPTATION_TTL_MS) state.parameters.delete(parameter);
+  }
+  if (state.claudeTurnScopedRemindersFallbackAt !== undefined
+    && now - state.claudeTurnScopedRemindersFallbackAt > LEARNED_ADAPTATION_TTL_MS) {
+    delete state.claudeTurnScopedRemindersFallbackAt;
+  }
+  if (state.parameters.size === 0 && !state.claudeThinkingBinding && state.claudeTurnScopedRemindersFallbackAt === undefined) {
+    adaptationStates.delete(key);
+    return undefined;
+  }
+  return state;
 }
 
 export function learnedProviderRequestAdaptations(target: ProviderRequestTarget): {
@@ -134,17 +179,17 @@ export function learnedProviderRequestAdaptations(target: ProviderRequestTarget)
   claudeThinkingBinding?: ClaudeThinkingBindingMode;
   claudeTurnScopedReminders?: 'tail';
 } {
-  const state = adaptationStates.get(providerRequestTargetKey(target));
+  const state = liveAdaptationState(providerRequestTargetKey(target));
   return {
-    parameters: state ? [...state.parameters].sort() : [],
+    parameters: state ? [...state.parameters.keys()].sort() : [],
     ...(state?.claudeThinkingBinding ? { claudeThinkingBinding: state.claudeThinkingBinding } : {}),
-    ...(state?.claudeTurnScopedReminders ? { claudeTurnScopedReminders: state.claudeTurnScopedReminders } : {})
+    ...(state?.claudeTurnScopedRemindersFallbackAt !== undefined ? { claudeTurnScopedReminders: 'tail' as const } : {})
   };
 }
 
 /** 这个目标已经因网关拒绝轮内系统消息而退回尾巴模式。 */
 export function claudeTurnScopedRemindersFallenBack(target: ProviderRequestTarget): boolean {
-  return adaptationStates.get(providerRequestTargetKey(target))?.claudeTurnScopedReminders === 'tail';
+  return liveAdaptationState(providerRequestTargetKey(target))?.claudeTurnScopedRemindersFallbackAt !== undefined;
 }
 
 /**
@@ -184,11 +229,11 @@ export function applyLearnedRequestAdaptations(
   request: EncodedProviderRequest,
   target: ProviderRequestTarget
 ): EncodedProviderRequest {
-  const state = adaptationStates.get(providerRequestTargetKey(target));
+  const state = liveAdaptationState(providerRequestTargetKey(target));
   if (!state) return request;
   let next = request;
   if (state.parameters.size > 0) {
-    const body = adaptRequestParameters(next.body, state.parameters, target.provider);
+    const body = adaptRequestParameters(next.body, new Set(state.parameters.keys()), target.provider);
     if (body !== next.body) next = { ...next, body };
   }
   if (target.provider === 'claude' && state.claudeThinkingBinding) {
@@ -261,26 +306,47 @@ export function learnProviderRequestAdaptations(
   rawError: unknown,
   context: ProviderRequestAdaptationContext = {}
 ): string[] {
+  return learnProviderRequestAdaptationsDetailed(target, rawError, context).ids;
+}
+
+interface LearnedAdaptationOutcome {
+  /** 本次错误对应、且当前已生效的适配标识。 */
+  ids: string[];
+  /** 被明确点名拒绝、但是用户自己写在自定义请求参数里的键：不去掉，由调用方报错说明。 */
+  userRequestBodyRejected: AdaptableRequestParameter[];
+}
+
+function learnProviderRequestAdaptationsDetailed(
+  target: ProviderRequestTarget,
+  rawError: unknown,
+  context: ProviderRequestAdaptationContext
+): LearnedAdaptationOutcome {
+  const none: LearnedAdaptationOutcome = { ids: [], userRequestBodyRejected: [] };
   const status = providerErrorStatus(rawError);
-  if (status !== 400 && status !== 422) return [];
+  if (status !== 400 && status !== 422) return none;
   const text = providerErrorSearchText(rawError);
-  if (!text) return [];
+  if (!text) return none;
   const key = providerRequestTargetKey(target);
-  const state = adaptationStates.get(key) ?? { parameters: new Set<AdaptableRequestParameter>() };
-  const parameters = unsupportedRequestParameters(text)
+  const state = liveAdaptationState(key)
+    ?? { providerConfigId: target.providerConfigId, model: target.model, parameters: new Map<AdaptableRequestParameter, number>() };
+  const rejected = unsupportedRequestParameters(text)
     .filter((parameter) => parameter !== 'max_tokens' || CHAT_COMPLETIONS_PROVIDERS.has(target.provider));
+  const userKeys = new Set(context.userRequestBodyKeys ?? []);
+  const userRequestBodyRejected = rejected.filter((parameter) => userKeys.has(parameter));
+  const parameters = rejected.filter((parameter) => !userKeys.has(parameter));
   const binding = target.provider === 'claude'
     ? claudeThinkingBindingModeForError(text, state.claudeThinkingBinding)
     : undefined;
   const turnScopedFallback = target.provider === 'claude' && context.claudeTurnScopedReminders === true
     && claudeTurnScopedRemindersRejected(text);
-  if (parameters.length === 0 && !binding && !turnScopedFallback) return [];
+  if (parameters.length === 0 && !binding && !turnScopedFallback) return { ids: [], userRequestBodyRejected };
+  const now = adaptationClock();
   const learned = parameters.filter((parameter) => !state.parameters.has(parameter));
-  for (const parameter of parameters) state.parameters.add(parameter);
+  for (const parameter of parameters) state.parameters.set(parameter, now);
   const learnedBinding = binding !== undefined && binding !== state.claudeThinkingBinding ? binding : undefined;
   if (binding) state.claudeThinkingBinding = binding;
-  const learnedTurnScopedFallback = turnScopedFallback && state.claudeTurnScopedReminders !== 'tail';
-  if (turnScopedFallback) state.claudeTurnScopedReminders = 'tail';
+  const learnedTurnScopedFallback = turnScopedFallback && state.claudeTurnScopedRemindersFallbackAt === undefined;
+  if (turnScopedFallback) state.claudeTurnScopedRemindersFallbackAt = now;
   adaptationStates.set(key, state);
   if (learned.length > 0 || learnedBinding || learnedTurnScopedFallback) {
     console.log('[LimCode][ProviderAdaptation]', JSON.stringify({
@@ -293,16 +359,21 @@ export function learnProviderRequestAdaptations(
       ...(learnedTurnScopedFallback ? { claudeTurnScopedReminders: 'tail' } : {})
     }));
   }
-  return [
-    ...parameters.map((parameter) => `parameter:${parameter}`),
-    ...(binding ? [`claude-thinking-binding:${binding}`] : []),
-    ...(turnScopedFallback ? ['claude-turn-scoped-reminders:tail'] : [])
-  ];
+  return {
+    ids: [
+      ...parameters.map((parameter) => `parameter:${parameter}`),
+      ...(binding ? [`claude-thinking-binding:${binding}`] : []),
+      ...(turnScopedFallback ? ['claude-turn-scoped-reminders:tail'] : [])
+    ],
+    userRequestBodyRejected
+  };
 }
 
 export interface ProviderRequestAdaptationRetry {
   /** 本次失败可以通过（新的或并发请求刚学到的）适配修复时返回 true；每个适配每个请求最多触发一次。 */
   shouldRetryImmediately(rawError: unknown): boolean;
+  /** 最近一次失败里被明确拒绝、但是用户自己写在自定义请求参数里的键（没有去掉）。 */
+  userRequestBodyRejection(): AdaptableRequestParameter[];
 }
 
 export function createProviderRequestAdaptationRetry(
@@ -310,13 +381,38 @@ export function createProviderRequestAdaptationRetry(
   context: ProviderRequestAdaptationContext = {}
 ): ProviderRequestAdaptationRetry {
   const attempted = new Set<string>();
+  let lastUserRequestBodyRejected: AdaptableRequestParameter[] = [];
   return {
     shouldRetryImmediately(rawError) {
-      const fresh = learnProviderRequestAdaptations(target, rawError, context).filter((id) => !attempted.has(id));
+      const outcome = learnProviderRequestAdaptationsDetailed(target, rawError, context);
+      lastUserRequestBodyRejected = outcome.userRequestBodyRejected;
+      const fresh = outcome.ids.filter((id) => !attempted.has(id));
       for (const id of fresh) attempted.add(id);
       return fresh.length > 0;
+    },
+    userRequestBodyRejection() {
+      return [...lastUserRequestBodyRejected];
     }
   };
+}
+
+/**
+ * 用户自己写在自定义请求参数里的键被服务明确拒绝时的报错：写明哪个参数、服务原话、去哪里改。
+ * 设置页的位置：设置 → 渠道 → 这个渠道（或它下面这个 LLM 的专属配置）→ “自定义请求参数”。
+ */
+export function userRequestBodyRejectionMessage(
+  parameters: readonly string[],
+  channelName: string,
+  serviceMessage: string
+): string {
+  const names = parameters.map((parameter) => `\`${parameter}\``).join('、');
+  const original = serviceMessage.trim().replace(/\s+/g, ' ');
+  const quoted = original.length > 400 ? `${original.slice(0, 400)}…` : original;
+  const channel = channelName.trim() || '当前渠道';
+  return `渠道「${channel}」的服务不接受你在“自定义请求参数”里写的 ${names}`
+    + `${quoted ? `（服务返回：${quoted}）` : ''}。`
+    + `LimCode 不会替你删掉自己写的参数，请到“设置 → 渠道 → ${channel}”的“自定义请求参数”里删掉或改掉它；`
+    + '这个 LLM 有专属配置时，改专属配置里的那一份。';
 }
 
 /** 只认明确点名参数的错误文本；导出供单测覆盖正反例。 */
