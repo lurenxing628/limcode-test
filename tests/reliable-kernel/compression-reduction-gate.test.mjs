@@ -277,3 +277,47 @@ test('the card saving compares Context with Context; manual compression records 
     assert.ok(metadata.contextTokensBefore > metadata.estimatedTokensAfter);
   });
 });
+
+test('with a Provider calibration above 1 the frozen summary limit is converted into estimator tokens', async () => {
+  const thresholdTokens = 20_000;
+  await withTurn('reduction-gate-calibrated-summary', thresholdTokens, async (app, seeded) => {
+    await appendMessage(app, seeded, 'source', 'assistant', `source ${'alpha beta gamma delta '.repeat(400)}`);
+    await appendMessage(app, seeded, 'tail', 'user', `tail ${'epsilon zeta eta theta '.repeat(20)}`);
+    const head = await app.context.currentHeadRootId(seeded.conversationId);
+    const level = await app.compression.evaluate(head, seeded.authoritySnapshotId);
+    const fixedTokens = 1_000;
+    const budget = requestBudget(thresholdTokens, fixedTokens, level.estimatedTokens);
+    const recipes = [];
+    const coordinator = new kernel.ReliableContextCompressionCoordinator(app.database, app.contentStore, app.modelProvider, {
+      resolve(providerId) {
+        return {
+          providerId,
+          async sendFullRequest(request, controls) {
+            recipes.push(request.recipe);
+            await controls.onEvent({
+              kind: 'completed', streamSeq: '1',
+              content: { type: 'compression_result', contents: [{ role: 'model', parts: [{ text: 'CALIBRATED-SUMMARY' }] }] }
+            });
+          }
+        };
+      }
+    });
+    // The Provider counted twice what the local estimator measures for this request.
+    const evaluate = coordinator.compression.evaluate.bind(coordinator.compression);
+    coordinator.compression.evaluate = async (...args) => ({
+      ...(await evaluate(...args)),
+      shouldCompress: true,
+      source: 'provider-observed-delta',
+      estimatedTokens: budget.estimatedFullInputTokens * 2
+    });
+    const result = await coordinator.coordinate({
+      turnId: seeded.turnId, authoritySnapshotId: seeded.authoritySnapshotId, headRootId: head, trigger: 'auto',
+      requestBudget: budget
+    });
+    assert.equal(result.status, 'compressed', JSON.stringify(result));
+    assert.equal(recipes.length, 1);
+    // 8,000 Provider tokens are reserved for the summary; the summary is written and cut with the
+    // local estimator, where the same room is 4,000 tokens at a ratio of 2.
+    assert.equal(recipes[0].effectiveSummaryMaxTokens, 4_000);
+  });
+});

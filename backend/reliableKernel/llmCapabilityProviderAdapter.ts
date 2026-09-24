@@ -1190,6 +1190,8 @@ function frozenEffectiveCompressionConfig(
       'Effective frozen native compression config'
     ) as { [key: string]: PlainJsonValue };
   }
+  // Frozen in the local estimator unit the summary writer measures and cuts with; the coordinator
+  // has already converted the Provider-unit reservation by the Conversation's calibration ratio.
   const effective = recipe.effectiveSummaryMaxTokens;
   if (!Number.isSafeInteger(effective) || (effective as number) <= 0 || (effective as number) > 8_000) {
     throw new RangeError('Text compression recipe requires effectiveSummaryMaxTokens in [1, 8000].');

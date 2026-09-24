@@ -54,6 +54,7 @@ import {
   calculateFullRequestPlanningBudget,
   calibrateEstimatorToProvider,
   calibratedTailBudgetTokens,
+  summaryTargetEstimatorTokens,
   collectStoredNativeConfigurationUpdates,
   projectStoredModelFacingWindow,
   providerTokenCalibration,
@@ -616,7 +617,9 @@ export class ReliableContextCompressionCoordinator {
                 attachmentObservationRequirements
               }
             : {}),
-          ...(effectiveSummaryMaxTokens === undefined ? {} : { effectiveSummaryMaxTokens })
+          ...(effectiveSummaryMaxTokens === undefined ? {} : {
+            effectiveSummaryMaxTokens: summaryTargetEstimatorTokens(effectiveSummaryMaxTokens, calibration)
+          })
         }, 'Reliable compression recipe'),
         idempotencyKey
       });

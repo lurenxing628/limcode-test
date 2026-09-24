@@ -373,6 +373,19 @@ export function calculateCalibratedCompressionRooms(
   };
 }
 
+/**
+ * The text-summary limit handed to the summary writer. The retained tail reserves `summaryMaxTokens`
+ * of the body target in Provider units, but the summary is written, shortened and cut with the local
+ * estimator; handing it the same number let a summary take `ratio` times the room reserved for it.
+ */
+export function summaryTargetEstimatorTokens(
+  summaryMaxTokens: number,
+  calibration: ProviderTokenCalibration
+): number {
+  const reserved = nonNegativeTokenCount(summaryMaxTokens, 'summaryMaxTokens');
+  return reserved === 0 ? 0 : Math.max(1, calibrateProviderToEstimator(reserved, calibration));
+}
+
 /** Retained-tail allowance in local estimator tokens, after reserving the Provider summary budget. */
 export function calibratedTailBudgetTokens(
   rooms: CalibratedCompressionRooms,
