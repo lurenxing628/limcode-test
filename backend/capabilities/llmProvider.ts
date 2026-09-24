@@ -530,7 +530,9 @@ export async function startLlmProvider(
         // 明确的不支持参数 400：按目标记住适配后立即重发；不占普通重试次数，也不等待。
         if (!retryControl.cancelRequested && adaptationRetry.shouldRetryImmediately(failure.rawError)) continue;
         const nextRetryCount = retryCount + 1;
+        // 接入库标明不可重试的错误（如 finish_reason=length 截断的工具参数）原样重发只会再失败一次。
         const canRetry = retryEnabled
+          && failure.rawError?.retryable !== false
           && !retryControl.cancelRequested
           && (maxRetries === -1 || nextRetryCount <= maxRetries);
 

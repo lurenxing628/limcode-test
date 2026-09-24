@@ -191,3 +191,57 @@ test('没有 id 的调用分在不同块里到达时各自存下，不会因为�
     assert.deepEqual(functionCallsOf(result.completed).map((part) => part.functionCall.args), [{ page: 1 }, { page: 2 }]);
   });
 });
+
+// ---- finish_reason=length 截断的工具参数错误不整包重试 ----
+
+/** 直接走 capability 层（渠道自己的“出错重试”设置），返回全部事件。 */
+async function runCapability(providerSettings, contents = [user('go')]) {
+  const events = [];
+  await startLlmProvider({ id: 'capability-request', conversationId: 'capability-conversation', contents, tools: TOOLS },
+    (event) => events.push(event), { settings: async () => providerSettings });
+  return events;
+}
+
+test('finish_reason=length 截断工具参数时不整包重试（接入库标 retryable:false，重试判断尊重它）', async () => {
+  // Chat Completions：finish_reason “length” 表示达到请求里的最大 token 数，原样重发会在同一上限处
+  // 再次截断；以前按“出错重试”整包重发（默认 4 次），每次都耗满输出上限。
+  const chunk = (delta, finish = null) => ({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason: finish }] });
+  const truncatedStream = [
+    chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'write_file', arguments: '{"path":"a.txt","content":"hel' } }] }),
+    chunk({}, 'length')
+  ].map((value) => `data: ${JSON.stringify(value)}\n\n`).join('') + 'data: [DONE]\n\n';
+  const truncatedBody = {
+    id: 'c', object: 'chat.completion',
+    choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'write_file', arguments: '{"path":"a.txt","content":"hel' } }] }, finish_reason: 'length' }]
+  };
+  for (const [label, response, overrides] of [
+    ['stream', { sse: truncatedStream }, {}],
+    ['non-stream', { body: truncatedBody }, { stream: false }]
+  ]) {
+    await withServer(() => response, async (base, calls) => {
+      const events = await runCapability(settings('openai-compatible', `${base}/v1`, 'relay-model', {
+        retryOnError: true, retryMaxAttempts: 2, ...overrides
+      }));
+      assert.equal(calls.length, 1, label);
+      assert.equal(events.some((event) => event.type === 'llm:retryScheduled'), false, label);
+      const error = events.find((event) => event.type === 'llm:error')?.payload;
+      assert.match(error?.message ?? '', /参数可能被截断/, label);
+      assert.equal(error.rawError.retryable, false, label);
+      // 可靠内核自己的尝试预算也不把它当作可重放的临时故障。
+      const kernelResult = await sendThroughKernel(settings('openai-compatible', `${base}/v1`, 'relay-model', overrides), [user('go')]);
+      assert.ok(kernelResult.error, label);
+      assert.equal(kernelResult.error instanceof kernel.ProviderTransientError, false, label);
+    });
+  }
+});
+
+test('没有 retryable:false 的普通错误仍按渠道设置重试', async () => {
+  await withServer(({ index }) => (index === 0
+    ? { status: 503, body: { error: { message: 'temporarily unavailable', type: 'server_error' } } }
+    : { sse: `data: ${JSON.stringify({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n` }),
+  async (base, calls) => {
+    const events = await runCapability(settings('openai-compatible', `${base}/v1`, 'relay-model', { retryOnError: true, retryMaxAttempts: 2, retryDelaySeconds: 0 }));
+    assert.equal(calls.length, 2);
+    assert.ok(events.some((event) => event.type === 'llm:done'));
+  });
+});
