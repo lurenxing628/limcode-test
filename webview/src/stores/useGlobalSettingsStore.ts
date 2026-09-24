@@ -82,6 +82,8 @@ export interface OpenAICompatibleThinkingProbeState {
   /** 这次测试的 bridge 请求 id：后端报错按它认出是哪次测试。 */
   requestId: string;
   message?: string;
+  /** 测试时的接口地址：地址改了，这次失败就不再显示。 */
+  baseUrl?: string;
 }
 
 interface GlobalSettingsState {
@@ -1244,7 +1246,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
   }),
   getters: {
     thinkingProbeState(state): (configId: string, modelId: string) => OpenAICompatibleThinkingProbeState | undefined {
-      return (configId: string, modelId: string) => state.thinkingProbes[thinkingProbeKey(configId, modelId)];
+      return (configId: string, modelId: string) => {
+        const probe = state.thinkingProbes[thinkingProbeKey(configId, modelId)];
+        if (probe?.status !== 'failed' || probe.baseUrl === undefined) return probe;
+        const config = state.llmProviderConfigs.configs.find((candidate) => candidate.id === configId);
+        return config?.baseUrl.trim() === probe.baseUrl ? probe : undefined;
+      };
     },
     hasExternalSettingsChange(state): boolean {
       return Object.keys(state.externalChangedSections).length > 0;
@@ -2180,6 +2187,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       if (!config || config.provider !== 'openai-compatible' || !modelId) return;
       const key = thinkingProbeKey(config.id, modelId);
       if (this.thinkingProbes[key]?.status === 'running') return;
+      const baseUrl = config.baseUrl.trim();
       let requestId: string;
       try {
         requestId = bridge.request(BridgeMessageType.LlmProviderModelsGet, {
@@ -2187,11 +2195,11 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
           probeThinking: true
         });
       } catch (error) {
-        this.setThinkingProbe({ configId: config.id, modelId, status: 'failed', requestId: '',
+        this.setThinkingProbe({ configId: config.id, modelId, status: 'failed', requestId: '', baseUrl,
           message: `测试思考参数失败：请求没有发出去（${messageFromError(error)}）` });
         return;
       }
-      this.setThinkingProbe({ configId: config.id, modelId, status: 'running', requestId });
+      this.setThinkingProbe({ configId: config.id, modelId, status: 'running', requestId, baseUrl });
       this.status = `正在测试「${modelId}」的思考参数（最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求）…`;
       clearThinkingProbeTimer(key);
       thinkingProbeTimers.set(key, window.setTimeout(() => {

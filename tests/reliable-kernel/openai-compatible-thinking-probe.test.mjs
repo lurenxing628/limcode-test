@@ -526,7 +526,7 @@ test('设置 store：发起测试带上模型与 probeThinking，测试中不重
 });
 
 test('设置 store：失败显示“测试思考参数失败”，不关获取 LLM 弹窗，也不当成获取 LLM 列表失败', async () => {
-  await withSettingsStore(async ({ store, posted, probeRequests }) => {
+  await withSettingsStore(async ({ store, posted, probeRequests, baseUrl }) => {
     store.requestModelsForActiveConfig();
     const listRequest = posted.find((message) => message.type === protocol.BridgeMessageType.LlmProviderModelsGet && !message.payload.probeThinking);
     store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
@@ -534,7 +534,7 @@ test('设置 store：失败显示“测试思考参数失败”，不关获取 L
       requestType: protocol.BridgeMessageType.LlmProviderModelsGet, correlationId: probeRequests()[0].id
     });
     assert.deepEqual(probeState(store), {
-      configId: 'probe-channel', modelId: 'deepseek-like', status: 'failed', requestId: probeRequests()[0].id,
+      configId: 'probe-channel', modelId: 'deepseek-like', status: 'failed', requestId: probeRequests()[0].id, baseUrl,
       message: '测试思考参数失败：第 1 次请求失败（HTTP 401）：Incorrect API key provided'
     });
     assert.equal(store.status, '测试思考参数失败：第 1 次请求失败（HTTP 401）：Incorrect API key provided');
@@ -603,6 +603,20 @@ test('设置 store：测试期间改了接口地址，结果作废；重新获�
     const kept = config().models.find((model) => model.id === 'deepseek-like');
     assert.equal(kept.name, '类 DeepSeek（新名字）');
     assert.deepEqual(kept.capabilitySnapshot, snapshot);
+  });
+});
+
+test('设置 store：测试失败只对当时的接口地址显示，改了地址就不再显示', async () => {
+  await withSettingsStore(async ({ store, probeRequests, baseUrl, config }) => {
+    store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
+    store.setError('第 1 次请求没有发出去或连接断开：fetch failed', {
+      requestType: protocol.BridgeMessageType.LlmProviderModelsGet, correlationId: probeRequests()[0].id
+    });
+    assert.equal(probeState(store).status, 'failed');
+    config().baseUrl = 'https://fixed.example.invalid/v1';
+    assert.equal(probeState(store), undefined, '换了地址，旧地址上的失败不再挂在这一行');
+    config().baseUrl = ` ${baseUrl} `;
+    assert.equal(probeState(store).status, 'failed');
   });
 });
 
