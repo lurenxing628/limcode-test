@@ -47,6 +47,8 @@ export interface OpenAICompatibleModelThinkingRule {
 
 export interface OpenAICompatibleDialect {
   platform: OpenAICompatiblePlatform;
+  /** 原样的模型 ID（小写）：百炼的 `kimi/` 等前缀决定参数取值。 */
+  modelId: string;
   /** 统一后的模型名（见 normalizedOpenAICompatibleModelName）。 */
   modelName: string;
   rule?: OpenAICompatibleModelThinkingRule;
@@ -189,6 +191,7 @@ export function resolveOpenAICompatibleDialect(
   const source = manual ? 'manual' : useProbe ? 'probe' : automatic.source;
   return {
     platform,
+    modelId: model.trim().toLowerCase(),
     modelName: normalizedOpenAICompatibleModelName(model),
     ...(rule ? { rule } : {}),
     format,
@@ -255,7 +258,8 @@ function automaticFormat(
 
 /**
  * 本平台、本模型接受的 `reasoning_effort` 取值；空数组表示不发送强度（只开关思考）。
- * 方舟接受七档，按原值发送；硅基流动、千帆只对 DeepSeek V4（硅基流动还有 GLM-5.2）接受 high / max。
+ * 方舟接受七档，按原值发送；硅基流动、千帆只对 DeepSeek V4（硅基流动还有 GLM-5.2）接受 high / max；
+ * 百炼按模型区分（见 dashscopeEffortValues）。
  */
 export function openAICompatibleEffortValues(dialect: OpenAICompatibleDialect): readonly LlmThinkingLevel[] | 'any' {
   // 测试结果就是在这个平台上实测到的取值。
@@ -266,10 +270,27 @@ export function openAICompatibleEffortValues(dialect: OpenAICompatibleDialect): 
     const glm52 = dialect.platform === 'siliconflow' && /^glm-5-2/.test(dialect.modelName);
     return v4 || glm52 ? ['high', 'max'] : [];
   }
-  if (dialect.platform === 'dashscope') return [];
+  if (dialect.platform === 'dashscope') return dashscopeEffortValues(dialect);
   if (dialect.rule) return dialect.rule.efforts;
   // 手动指定 DeepSeek 写法、模型认不出时按 DeepSeek 的取值。
   return dialect.format === 'deepseek' ? DEEPSEEK_STYLE_EFFORTS : 'any';
+}
+
+/**
+ * 百炼的顶层 `reasoning_effort`（help.aliyun.com/zh/model-studio 的 deepseek-api、glm、kimi-api-by-moonshot-ai、
+ * qwen-api-via-openai-chat-completions）：DeepSeek-V4 为 high / max（v4.1-flash、v4-flash-0731、v4-pro-0813 另有 low）；
+ * GLM-5.3 为 low / high / max，GLM-5.2 的 low、medium 按 high 处理；百炼直供的 kimi-k3 为 low / high / max，
+ * 第三方 `kimi/kimi-k3` 只支持 max；Qwen3.8 为 low / medium / xhigh（high、max 按 xhigh）。其余模型只开关思考。
+ */
+function dashscopeEffortValues(dialect: OpenAICompatibleDialect): readonly LlmThinkingLevel[] {
+  const name = dialect.modelName;
+  if (/^deepseek-v4-(?:1-flash|flash-0731|pro-0813)(?:$|-)/.test(name)) return DEEPSEEK_STYLE_EFFORTS;
+  if (/^deepseek-v4/.test(name)) return ['high', 'max'];
+  if (/^glm-5-3(?:$|-)/.test(name)) return DEEPSEEK_STYLE_EFFORTS;
+  if (/^glm-5-2(?:$|-)/.test(name)) return ['high', 'max'];
+  if (/^kimi-k3/.test(name)) return dialect.modelId.startsWith('kimi/') ? ['max'] : DEEPSEEK_STYLE_EFFORTS;
+  if (/^qwen3-8(?:$|-)/.test(name)) return ['low', 'medium', 'xhigh'];
+  return [];
 }
 
 const LEVEL_ORDER: readonly LlmThinkingLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];

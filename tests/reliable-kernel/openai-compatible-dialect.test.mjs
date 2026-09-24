@@ -156,7 +156,7 @@ test('思考强度换成对方接受的值：先按 DeepSeek 官方换算，再�
   assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro')), ['high', 'max']);
   assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(SILICONFLOW, 'zai-org/GLM-5.2')), ['high', 'max']);
   assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(QIANFAN, 'glm-5.2')), []);
-  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(DASHSCOPE, 'deepseek-v4-pro')), []);
+  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(DASHSCOPE, 'deepseek-v4-pro')), ['high', 'max']);
   assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(RELAY, 'hunyuan-t2')), ['low', 'high']);
   assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(RELAY, 'unknown-model', 'deepseek')), deepseek);
   assert.equal(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(RELAY, 'gpt-5.5')), 'any');
@@ -494,4 +494,26 @@ test('官方域名补齐：百炼各接入点、千帆北京、BytePlus、TokenH
     'https://ark.ap-southeast.bytepluses.com/api/v3', 'https://tokenhub-intl.tencentcloudmaas.com/v1', 'https://api.siliconflow.com/v1']) {
     assert.ok(OPENAI_COMPATIBLE_SERVICE_PRESETS.some((preset) => preset.baseUrl === baseUrl), baseUrl);
   }
+});
+
+test('百炼按官方文档发送顶层 reasoning_effort：DeepSeek-V4、GLM-5.x、Kimi K3、Qwen3.8', async () => {
+  // https://help.aliyun.com/zh/model-studio/deepseek-api、/glm、/kimi-api-by-moonshot-ai、/qwen-api-via-openai-chat-completions
+  const values = (model) => openAICompatibleEffortValues(resolveOpenAICompatibleDialect(DASHSCOPE, model));
+  assert.deepEqual(values('deepseek-v4-pro'), ['high', 'max']);
+  assert.deepEqual(values('deepseek-v4.1-flash'), ['low', 'high', 'max']);
+  assert.deepEqual(values('glm-5.3'), ['low', 'high', 'max']);
+  assert.deepEqual(values('glm-5.2'), ['high', 'max']);
+  assert.deepEqual(values('glm-5.1'), []);
+  assert.deepEqual(values('kimi-k3'), ['low', 'high', 'max']);
+  assert.deepEqual(values('kimi/kimi-k3'), ['max']);
+  assert.deepEqual(values('qwen3.8-max'), ['low', 'medium', 'xhigh']);
+  assert.deepEqual(values('qwen3.7-plus'), []);
+  assert.deepEqual(values('qwen3-8b'), []);
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'deepseek-v4-pro', { level: 'low' })), { enable_thinking: true, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'glm-5.3', { level: 'medium' })), { enable_thinking: true, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'kimi/kimi-k3', { level: 'low' })), { reasoning_effort: 'max' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3.8-max', { level: 'high' })), { enable_thinking: true, reasoning_effort: 'xhigh' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3.8-max', { level: 'none' })), { enable_thinking: false });
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'deepseek-v4-pro', undefined, undefined, settings(DASHSCOPE, 'deepseek-v4-pro')).values, ['none', 'high', 'max']);
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'qwen3.8-max', undefined, undefined, settings(DASHSCOPE, 'qwen3.8-max')).values, ['none', 'low', 'medium', 'xhigh']);
 });
