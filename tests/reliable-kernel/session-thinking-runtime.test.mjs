@@ -838,3 +838,55 @@ for (const tokens of [0, -1]) test(`review child inheritance sends Gemini budget
       : { text: 'done' }] } });
   } });
 });
+
+/** 模拟升级前保存、按现在的规则已不合法的会话思考覆盖：直接写记录，不经过保存校验。 */
+async function injectSavedThinkingOverride(f, provider, override) {
+  const { loadRecordStore, saveRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
+  await f.save('llmProviderConfigs', { configs: [provider] });
+  await f.configuration.mutations.setModelProfile({ scopeKind: 'conversation', scopeId: 'parent', providerConfigId: provider.id, provider: provider.provider, model: provider.model });
+  const paths = f.configuration.getPaths();
+  const records = await loadRecordStore(paths.modelProfilesRootUri, paths.modelProfilesIndexUri, 'modelProfile');
+  const target = records.find(record => record.providerConfigId === provider.id && record.model === provider.model);
+  assert.ok(target);
+  await saveRecordStore(paths.modelProfilesRootUri, paths.modelProfilesIndexUri, records.map(record => record === target ? { ...record, thinkingOverride: override } : record), 'modelProfile');
+}
+
+test('升级前保存的会话思考覆盖：kind 不同但值可用时照常生效，已不合法的按渠道设置发送，对话不再每轮失败', async () => {
+  await fixture(async f => {
+    const deepseek = { ...f.provider, baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', models: [{ id: 'deepseek-v4-pro', name: 'DeepSeek' }], generationConfig: {} };
+    await injectSavedThinkingOverride(f, deepseek, { kind: 'openai-effort', value: 'high' });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-kind'))).terminalStatus, 'completed');
+    assert.deepEqual(f.wires.at(-1).body.thinking, { type: 'enabled' });
+    assert.equal(f.wires.at(-1).body.reasoning_effort, 'high');
+    await injectSavedThinkingOverride(f, deepseek, { kind: 'openai-effort', value: 'medium' });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-value'))).terminalStatus, 'completed');
+    assert.equal(f.wires.at(-1).body.thinking, undefined);
+    assert.equal(f.wires.at(-1).body.reasoning_effort, undefined);
+    // 自定义请求体后来加了思考参数：已保存的覆盖不生效，不报错。
+    await f.save('llmProviderConfigs', { configs: [{ ...deepseek, requestBody: { thinking: { type: 'disabled' } } }] });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-body'))).terminalStatus, 'completed');
+    assert.deepEqual(f.wires.at(-1).body.thinking, { type: 'disabled' });
+    const opus = { ...f.provider, provider: 'claude', baseUrl: 'https://api.anthropic.com', model: 'claude-opus-5-5', models: [{ id: 'claude-opus-5-5', name: 'Opus' }], generationConfig: {} };
+    await injectSavedThinkingOverride(f, opus, { kind: 'claude-effort', value: 'none' });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-opus-none'))).terminalStatus, 'completed');
+    assert.notEqual(f.wires.at(-1).body.thinking?.type, 'disabled');
+    // 修改“子 Agent 也用”开关不因旧覆盖报错，旧覆盖原样保留，界面仍可重置。
+    const { send, receive, T } = scopeRouter(f);
+    const scope = { scopeKind: 'conversation', scopeId: 'parent' };
+    send('legacy-read', T.ModelProfileScopeRead, scope);
+    const observed = await receive('legacy-read');
+    send('legacy-inherit', T.ModelProfileScopeSet, { ...scope, ...observed.effectiveModel, authorityId: observed.authorityId,
+      sessionId: observed.sessionId, expectedRevision: observed.revision, expectedEffectiveModel: observed.effectiveModel,
+      operation: 'inherit', inheritThinkingToChildren: true });
+    const inherited = await receive('legacy-inherit');
+    assert.equal(inherited.outcome, 'committed', inherited.message);
+    assert.equal(inherited.profile.inheritThinkingToChildren, true);
+    assert.deepEqual(inherited.profile.thinkingOverride, { kind: 'claude-effort', value: 'none' });
+    send('legacy-reset', T.ModelProfileScopeSet, { ...scope, ...inherited.effectiveModel, authorityId: inherited.authorityId,
+      sessionId: inherited.sessionId, expectedRevision: inherited.revision, expectedEffectiveModel: inherited.effectiveModel,
+      operation: 'reset', thinkingOverride: null });
+    const reset = await receive('legacy-reset');
+    assert.equal(reset.outcome, 'committed', reset.message);
+    assert.equal(reset.profile?.thinkingOverride, undefined);
+  });
+});

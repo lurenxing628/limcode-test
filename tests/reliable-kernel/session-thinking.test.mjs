@@ -154,3 +154,39 @@ test('Claude 4.7 及之后的 adaptive 模型可按会话选择 effort，始终�
   assert.equal(off.output_config?.effort, undefined);
   assert.notEqual(off.thinking?.type, 'adaptive');
 });
+
+const { resolveSavedSessionThinkingOverride } = require('../../dist/extension/shared/sessionThinking.js');
+const deepseekChannel = (model = 'deepseek-v4-pro', extra = {}) => ({ id: 'legacy', provider: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', model, models: [{ id: model, name: model }], modelConfigs: [], ...extra });
+
+test('已保存的会话思考覆盖容错解析：强度类 kind 不同但值可用时改写 kind，否则不生效', () => {
+  const saved = (value, provider, model, generation, body, config) => resolveSavedSessionThinkingOverride(value, provider, model, generation, body, config);
+  assert.deepEqual(saved({ kind: 'openai-effort', value: 'high' }, 'openai-compatible', 'deepseek-v4-pro', undefined, undefined, deepseekChannel()),
+    { status: 'applied', override: { kind: 'deepseek-effort', value: 'high' } });
+  for (const model of ['glm-4.6', 'qwen3-max', 'kimi-k2-0905-preview']) {
+    assert.equal(saved({ kind: 'openai-effort', value: 'high' }, 'openai-compatible', model).status, 'applied', model);
+  }
+  assert.equal(saved({ kind: 'openai-effort', value: 'medium' }, 'openai-compatible', 'deepseek-v4-pro', undefined, undefined, deepseekChannel()).status, 'inactive');
+  // 原 DeepSeek 渠道上的中转别名：现在按渠道配置给 openai-effort。
+  assert.deepEqual(saved({ kind: 'deepseek-effort', value: 'high' }, 'openai-compatible', 'relay-alias', { thinkingConfig: { thinkingLevel: 'high' } }),
+    { status: 'applied', override: { kind: 'openai-effort', value: 'high' } });
+  // Opus 5.5 / Fable / Mythos 以前保存的 none 现在不合法。
+  for (const model of ['claude-opus-5-5', 'claude-fable-5', 'claude-mythos-5']) {
+    const result = saved({ kind: 'claude-effort', value: 'none' }, 'claude', model);
+    assert.equal(result.status, 'inactive', model);
+    assert.match(result.reason, /不适用于当前模型/);
+  }
+  // 预算类不跨 kind 改写。
+  assert.equal(saved({ kind: 'gemini-budget', tokens: 2048 }, 'claude', 'claude-sonnet-4-5', { maxOutputTokens: 8192 }).status, 'inactive');
+  // 自定义请求体控制思考：不生效，不报错。
+  assert.equal(saved({ kind: 'deepseek-effort', value: 'high' }, 'openai-compatible', 'deepseek-v4-pro', undefined, { enable_thinking: false }, deepseekChannel()).status, 'inactive');
+  assert.throws(() => validate({ kind: 'openai-effort', value: 'high' }, 'openai-compatible', 'deepseek-v4-pro', undefined, undefined, deepseekChannel()), '保存时仍然严格校验');
+});
+
+test('chat_template_kwargs 只在含思考相关子键时才算与会话思考冲突', () => {
+  assert.equal(hasThinkingBodyConflict('openai-compatible', { chat_template_kwargs: { add_generation_prompt: true } }), false);
+  for (const key of ['enable_thinking', 'thinking', 'reasoning_effort', 'thinking_budget']) {
+    assert.equal(hasThinkingBodyConflict('openai-compatible', { chat_template_kwargs: { [key]: true } }), true, key);
+  }
+  assert.equal(resolveSavedSessionThinkingOverride({ kind: 'deepseek-effort', value: 'high' }, 'openai-compatible', 'deepseek-v4-pro', undefined,
+    { chat_template_kwargs: { add_generation_prompt: true } }, deepseekChannel()).status, 'applied');
+});

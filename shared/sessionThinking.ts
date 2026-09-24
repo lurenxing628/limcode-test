@@ -2,6 +2,7 @@ import type { LlmGenerationConfigRecord, LlmRequestBodyRecord, LlmProviderKind, 
 import { isAstraModel, isGpt6NoneCapableModel } from './openAIResponsesCapabilities';
 import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from './geminiThinking';
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
+import { hasThinkingBodyConflict } from './sessionThinkingBody';
 import { anthropicModelReasoningCapability, resolveProviderOpenAICompatibleDialect } from './modelCapabilities';
 import { openAICompatibleModelThinkingRule, openAICompatibleThinkingLevels, resolveOpenAICompatibleDialect } from './openAICompatibleDialect';
 
@@ -92,6 +93,37 @@ export function validateSessionThinkingOverride(value: SessionThinkingOverride, 
   }
   if ('value' in value && 'values' in capability && capability.values.includes(value.value)) return { kind: value.kind, value: value.value };
   throw new IncompatibleSessionThinkingError('当前模型不支持此思维等级。');
+}
+
+/** 已保存的会话思考覆盖在当前模型上不生效时，界面和说明里用的话。 */
+export const INACTIVE_SESSION_THINKING_NOTICE = '已保存的思考强度不适用于当前模型，已按渠道设置发送。';
+
+export type SavedSessionThinking =
+  | { status: 'applied'; override: SessionThinkingOverride }
+  | { status: 'inactive'; reason: string };
+
+const EFFORT_OVERRIDE_KINDS: ReadonlySet<string> = new Set(['openai-effort', 'deepseek-effort']);
+
+/**
+ * 请求冻结、子 Agent 继承与“子 Agent 也用”开关对已保存覆盖的容错解析（保存时仍用上面的严格校验）：
+ * 升级后同一模型可能换了强度类 kind（openai-effort ↔ deepseek-effort），值仍在可选集合里就改写 kind 后生效；
+ * 已不合法的值（例如 Opus 5.5 以前保存的 none）或自定义请求体已控制思考时视为没有覆盖，按渠道设置发送。
+ */
+export function resolveSavedSessionThinkingOverride(value: SessionThinkingOverride, provider: LlmProviderKind, model: string, generation?: LlmGenerationConfigRecord, requestBody?: LlmRequestBodyRecord, providerConfig?: SessionThinkingProviderConfig): SavedSessionThinking {
+  if (hasThinkingBodyConflict(provider, requestBody)) {
+    return { status: 'inactive', reason: '自定义请求体已控制思考参数，已保存的思考强度不生效，按渠道设置发送。' };
+  }
+  const capability = sessionThinkingCapability(provider, model, generation?.maxOutputTokens, generation?.thinkingConfig, providerConfig);
+  const candidate: SessionThinkingOverride = capability && 'values' in capability && 'value' in value
+    && EFFORT_OVERRIDE_KINDS.has(value.kind) && EFFORT_OVERRIDE_KINDS.has(capability.kind) && value.kind !== capability.kind
+    ? { kind: capability.kind as 'openai-effort' | 'deepseek-effort', value: value.value }
+    : value;
+  try {
+    return { status: 'applied', override: validateSessionThinkingOverride(candidate, provider, model, generation, requestBody, providerConfig) };
+  } catch (error) {
+    if (error instanceof IncompatibleSessionThinkingError) return { status: 'inactive', reason: INACTIVE_SESSION_THINKING_NOTICE };
+    throw error;
+  }
 }
 
 export function applySessionThinkingOverride(generation: LlmGenerationConfigRecord | undefined, override: SessionThinkingOverride | undefined): LlmGenerationConfigRecord {

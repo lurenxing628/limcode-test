@@ -4,7 +4,7 @@ import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import { sourceConfigsProblem } from '../../shared/toolPolicyResolution';
 import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
 import { canonicalLlmProviderKind } from '../../shared/protocol';
-import { validateSessionThinkingOverride } from '../../shared/sessionThinking';
+import { resolveSavedSessionThinkingOverride, validateSessionThinkingOverride } from '../../shared/sessionThinking';
 import { compatibleChildThinkingOverride } from './childThinkingInheritance';
 import { loadLlmProviderConfigsSettings } from '../capabilities/vscodeStorage/llmProviderConfigs';
 import { randomUUID } from 'node:crypto';
@@ -246,8 +246,16 @@ export class VscodeConfigurationMutations {
         if (!provider || provider.provider !== profile.provider || !(provider.model === profile.model || provider.models.some(item => item.id === profile!.model))) throw new Error('思维覆盖模型已改变。');
         const modelConfig = provider.modelConfigs.find(item => item.modelId === profile!.model);
         const body = modelConfig ? modelConfig.requestBody : provider.requestBody;
-        if (hasThinkingBodyConflict(provider.provider, body)) throw new Error('自定义请求体与本次思维修改冲突；未改变已保存配置。');
-        profile.thinkingOverride = validateSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, modelConfig ? modelConfig.generationConfig : provider.generationConfig, body, provider);
+        const generation = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
+        if (operation === 'thinking') {
+          // 用户这次选择的强度：严格校验。
+          if (hasThinkingBodyConflict(provider.provider, body)) throw new Error('自定义请求体与本次思维修改冲突；未改变已保存配置。');
+          profile.thinkingOverride = validateSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, generation, body, provider);
+        } else {
+          // 只改“子 Agent 也用”时带着的旧覆盖：容错解析，适用就规范化，不适用就原样保留（界面显示“当前不生效”，可重置）。
+          const saved = resolveSavedSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, generation, body, provider);
+          if (saved.status === 'applied') profile.thinkingOverride = saved.override;
+        }
       }
       guard();
       if (profile) {

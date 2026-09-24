@@ -1,6 +1,6 @@
 import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
-import { applySessionThinkingOverride, validateSessionThinkingOverride } from '../../shared/sessionThinking';
+import { applySessionThinkingOverride, resolveSavedSessionThinkingOverride } from '../../shared/sessionThinking';
 import type { RequestGenerationSettings } from './requestCompressionSettings';
 
 import type * as vscode from 'vscode';
@@ -233,7 +233,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       { scopeKind: 'conversation', scopeId: request.conversationId },
       (link) => link.modelProfileId
     );
-    const effectiveConversationThinkingOverride = conversationModelProfile
+    const savedConversationThinkingOverride = conversationModelProfile
       && conversationModelProfile.providerConfigId === provider.id
       && conversationModelProfile.provider === provider.provider
       && conversationModelProfile.model === modelId
@@ -326,6 +326,12 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const contextWindow = resolveContextWindow(provider, modelId);
     const primaryGenerationConfig = selectedModelConfig?.generationConfig ?? provider.generationConfig;
     const primaryCapabilities = resolveProviderModelCapabilities(provider, modelId);
+    // 只冻结实际生效的覆盖（子 Agent 按它继承）；不适用的旧覆盖按渠道设置发送。
+    const savedThinking = savedConversationThinkingOverride
+      ? resolveSavedSessionThinkingOverride(savedConversationThinkingOverride, provider.provider, modelId, primaryGenerationConfig,
+        selectedModelConfig ? selectedModelConfig.requestBody : provider.requestBody, provider)
+      : undefined;
+    const effectiveConversationThinkingOverride = savedThinking?.status === 'applied' ? savedThinking.override : undefined;
     const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
       ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
@@ -994,12 +1000,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const modelConfig = provider.modelConfigs.find((item) => item.modelId === model.model);
     const defaults = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
     const requestBody = (modelConfig ? modelConfig.requestBody : provider.requestBody) ?? {};
-    const override = profile?.providerConfigId === provider.id && profile.provider === provider.provider && profile.model === model.model
+    const saved = profile?.providerConfigId === provider.id && profile.provider === provider.provider && profile.model === model.model
       ? profile.thinkingOverride : undefined;
-    if (override) {
-      if (hasThinkingBodyConflict(provider.provider, requestBody)) throw new Error('自定义请求体与会话思维覆盖冲突，请恢复默认或修改渠道配置。');
-      validateSessionThinkingOverride(override, provider.provider, model.model, defaults, requestBody, provider);
-    }
+    // 升级前保存的覆盖可能已不适用：容错解析，不适用时按渠道设置发送（界面显示“当前不生效”），不让每轮请求失败。
+    const resolved = saved ? resolveSavedSessionThinkingOverride(saved, provider.provider, model.model, defaults, requestBody, provider) : undefined;
+    const override = resolved?.status === 'applied' ? resolved.override : undefined;
     return { model: { ...model }, generationConfig: applySessionThinkingOverride(defaults, override), requestBody: clonePlain(requestBody), thinkingControlledByBody: hasThinkingBodyConflict(provider.provider, requestBody) };
   }
 

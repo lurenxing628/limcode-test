@@ -1,6 +1,5 @@
 import type { LlmGenerationConfigRecord, LlmRequestBodyRecord, LlmProviderKind, LlmThinkingLevel, SessionThinkingOverride } from '../../shared/protocol';
-import { IncompatibleSessionThinkingError, validateSessionThinkingOverride, type SessionThinkingProviderConfig } from '../../shared/sessionThinking';
-import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
+import { resolveSavedSessionThinkingOverride, type SessionThinkingProviderConfig } from '../../shared/sessionThinking';
 import type { PlainJsonValue } from './plainJson';
 import type { ReliableChildModelProfileStore } from './childAgentCoordinator';
 
@@ -19,7 +18,10 @@ export function childThinkingOverrideForSpawn(input: {
     : { kind: input.thinkingOverride.kind, value: input.thinkingOverride.value };
 }
 
-/** Incompatible inheritance leaves the child's own settings intact; storage errors are not caught. */
+/**
+ * Incompatible inheritance leaves the child's own settings intact; storage errors are not caught.
+ * 与请求冻结同一套容错解析：强度类 kind 不同但值可用时改写 kind。
+ */
 export function compatibleChildThinkingOverride(
   value: SessionThinkingOverride,
   provider: LlmProviderKind,
@@ -28,13 +30,8 @@ export function compatibleChildThinkingOverride(
   body?: LlmRequestBodyRecord,
   providerConfig?: SessionThinkingProviderConfig
 ): SessionThinkingOverride | undefined {
-  if (hasThinkingBodyConflict(provider, body)) return undefined;
-  try {
-    return validateSessionThinkingOverride(value, provider, model, generation, body, providerConfig);
-  } catch (error) {
-    if (error instanceof IncompatibleSessionThinkingError) return undefined;
-    throw error;
-  }
+  const saved = resolveSavedSessionThinkingOverride(value, provider, model, generation, body, providerConfig);
+  return saved.status === 'applied' ? saved.override : undefined;
 }
 
 /** Reads only the parent conversation's explicit child-propagation facts from frozen authority. */
