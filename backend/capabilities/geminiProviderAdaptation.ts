@@ -284,6 +284,9 @@ export function withoutGeminiFunctionCallSignatures<T extends { parts: readonly 
  * - Streaming matches signatures by call id, and by the call's position in the message only when
  *   the call has no id. The per-chunk ordinal is never compared with the global `index`: that made
  *   the second parallel call inherit the first call's signature.
+ * - A signature that arrives after its call was already emitted (complete arguments first, the
+ *   signature in a later delta) is delivered by emitting the same call again with the signature;
+ *   consumers merge calls by id.
  */
 export function installGeminiOpenAICompatibleThoughtSignatures<T>(
   provider: T,
@@ -369,6 +372,11 @@ interface GeminiOpenAIToolCallSignatures {
   /** Unified calls already matched; their count is the position of the next id-less call. */
   decodedCalls: WeakSet<object>;
   decodedCallCount: number;
+  /**
+   * Calls with an id that were emitted before their signature arrived (the library emits a streamed
+   * call as soon as its arguments are complete JSON), keyed by position.
+   */
+  unsignedEmittedCalls: Map<number, { callId: string; part: Record<string, unknown> }>;
 }
 
 function attachGeminiOpenAIThoughtSignaturesToRequest(
@@ -529,9 +537,26 @@ function attachGeminiSignaturesToUnifiedCalls(
     const signature = callId
       ? signatures.byId.get(callId) ?? (knownPosition !== undefined ? signatures.byPosition.get(knownPosition) : undefined)
       : signatures.byPosition.get(position);
-    if (!signature) continue;
+    if (!signature) {
+      if (callId) signatures.unsignedEmittedCalls.set(knownPosition ?? position, { callId, part: candidate });
+      continue;
+    }
     const existing = isRecord(candidate.thoughtSignatures) ? candidate.thoughtSignatures : {};
     candidate.thoughtSignatures = { ...existing, gemini: signature };
+  }
+  reemitLateSignedCalls(decoded, signatures);
+}
+
+/** Emits again, with its signature, each already emitted call whose signature arrived since. */
+function reemitLateSignedCalls(decoded: Record<string, unknown>, signatures: GeminiOpenAIToolCallSignatures): void {
+  for (const [position, { callId, part }] of signatures.unsignedEmittedCalls) {
+    const signature = signatures.byId.get(callId) ?? signatures.byPosition.get(position);
+    if (!signature) continue;
+    signatures.unsignedEmittedCalls.delete(position);
+    const existing = isRecord(part.thoughtSignatures) ? part.thoughtSignatures : {};
+    const signed = { ...part, thoughtSignatures: { ...existing, gemini: signature } };
+    signatures.decodedCalls.add(signed);
+    decoded.functionCalls = [...(Array.isArray(decoded.functionCalls) ? decoded.functionCalls : []), signed];
   }
 }
 
@@ -556,7 +581,8 @@ function emptyGeminiOpenAIToolCallSignatures(): GeminiOpenAIToolCallSignatures {
     lastPosition: undefined,
     nextPosition: 0,
     decodedCalls: new WeakSet(),
-    decodedCallCount: 0
+    decodedCallCount: 0,
+    unsignedEmittedCalls: new Map()
   };
 }
 

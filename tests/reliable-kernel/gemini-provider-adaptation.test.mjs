@@ -1380,3 +1380,46 @@ test('E7 a Gemini behind a gateway alias gets its own signature back; Gemini-lik
   assert.deepEqual(await replayedCrossSourceWire({ target: '[v]gemini-3.5-flash',
     source: { providerId: 'another-gemini-channel', modelId: 'gemini-3.5-flash' } }), [['call_a', 'REAL_SIG'], ['call_b', null]]);
 });
+
+// ---------------------------------------------------------------------------------------------
+// E8: on the OpenAI-compatible wire the library emits a streamed call as soon as its arguments are
+// complete JSON; a Gemini signature that comes in a later delta still belongs to that call.
+
+const lateSignatureStream = (name) => [
+  delta({ tool_calls: [{ index: 0, id: 'call_a', type: 'function', function: { name, arguments: '{"city":"Paris"}' } }] }),
+  delta({ tool_calls: [{ index: 0, extra_content: { google: { thought_signature: 'SIG_LATE' } } }] }),
+  delta({ tool_calls: [{ index: 1, id: 'call_b', type: 'function', function: { name, arguments: '{"city":"Tokyo"}' } }] }),
+  delta({}, 'tool_calls')
+];
+
+test('E8 a signature that arrives after the call was emitted with complete arguments is still attached to it', async (context) => {
+  // Before: [['call_a', null], ['call_b', null]] — the call was already emitted, the signature had nowhere to go.
+  const calls = await streamedToolCalls(context, lateSignatureStream('get_weather'));
+  assert.deepEqual(calls.map((call) => [call.id, JSON.parse(call.argsJson).city, call.thoughtSignature ?? null]), [
+    ['call_a', 'Paris', 'gemini:SIG_LATE'],
+    ['call_b', 'Tokyo', null]
+  ]);
+});
+
+test('E8 the reply stored by the reliable adapter carries the late signature on its call, once', async (context) => {
+  context.mock.method(globalThis, 'fetch', async () => sse(lateSignatureStream('list_items')));
+  const settings = providerConfig({ model: '[v]gemini-3.5-flash' });
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(GEMINI_PROVIDER_ID, {
+    start(input, emit) { void startLlmProvider(input, emit, { settings: async () => settings }); },
+    abort() {}, cancelRetry() {}, dispose() {}
+  });
+  const events = [];
+  await adapter.sendFullRequest(fullGeminiRequest([{ role: 'user', parts: [{ text: 'go' }] }],
+    { provider: 'openai-compatible', model: '[v]gemini-3.5-flash' }), {
+    onEvent: async (event) => {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+    }
+  });
+  const completed = events.find((event) => event.kind === 'completed');
+  assert.ok(completed, JSON.stringify(events.filter((event) => event.kind !== 'output_delta')));
+  assert.deepEqual(completed.content.parts.filter((part) => part.functionCall).map((part) => [part.id, part.thoughtSignature ?? null]), [
+    ['call_a', 'gemini:SIG_LATE'],
+    ['call_b', null]
+  ]);
+});
