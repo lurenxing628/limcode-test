@@ -35,7 +35,8 @@ const TAMPERED_SIGNATURE_400 = {
 test('C2 匹配：只有前缀失配原文触发 drop_block；网关拒绝 block_binding 才退回去掉思考块', () => {
   const mismatch = JSON.stringify(PREFIX_MISMATCH_400);
   assert.equal(claudeThinkingBindingModeForError(mismatch, undefined), 'drop_block');
-  assert.equal(claudeThinkingBindingModeForError(mismatch, 'drop_block'), 'drop_block');
+  // 第二个参数是本请求实际发出的处理：已经带着 drop_block 发出还收到失配，说明中转丢了 block_binding 或 beta 头。
+  assert.equal(claudeThinkingBindingModeForError(mismatch, 'drop_block'), 'strip_thinking');
   assert.equal(claudeThinkingBindingModeForError(mismatch, 'strip_thinking'), 'strip_thinking', '去掉后不能再放回');
   assert.equal(claudeThinkingBindingModeForError(JSON.stringify(TAMPERED_SIGNATURE_400), undefined), undefined,
     '签名本身无效时 prefix_mismatch_behavior 不适用');
@@ -187,6 +188,48 @@ test('C2 网关不转发 beta 头：退回去掉全部思考块并一直保持�
     const dry = await dryRunLlmProvider({ id: 'dry', conversationId: 'claude-binding-conversation', contents: HISTORY, tools: [] }, { settings: async () => settings });
     assert.equal(hasThinkingBlock(dry.body), false);
   });
+  resetProviderRequestAdaptations();
+});
+
+// 中转悄悄删掉 thinking.block_binding、也不转发 beta 头：带 drop_block 重发仍收到同一条失配报错。
+// 官方（preserved-thinking “Handle the error in code”）：发不了 beta 头时去掉历史里全部 thinking / redacted_thinking 块。
+test('C2 中转静默丢掉 block_binding：带 drop_block 重发仍失配时升级为去掉思考块，之后的请求不再卡住', async () => {
+  resetProviderRequestAdaptations();
+  await withServer((call) => hasThinkingBlock(call.body)
+    ? { status: 400, body: PREFIX_MISMATCH_400 }
+    : { sse: CLAUDE_OK_STREAM }, async (baseUrl, calls) => {
+    const settings = claudeSettings(baseUrl, { id: 'claude-binding-silent-relay' });
+    const events = await chat(settings, 'silent-1');
+    assert.ok(events.some((event) => event.type === 'llm:done'), JSON.stringify(events.filter((event) => event.type === 'llm:error')));
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].body.thinking.block_binding, undefined);
+    assert.equal(calls[1].body.thinking.block_binding.prefix_mismatch_behavior, 'drop_block', '先按官方做法带 drop_block 重试一次');
+    assert.equal(hasThinkingBlock(calls[2].body), false, '同一请求已带 drop_block 仍失配：去掉全部思考块');
+    assert.equal(calls[2].body.thinking.block_binding, undefined);
+    await chat(settings, 'silent-2');
+    assert.equal(calls.length, 4, '之后的请求一开始就去掉思考块，不再先失败');
+    assert.equal(hasThinkingBlock(calls[3].body), false);
+  });
+  resetProviderRequestAdaptations();
+});
+
+test('C2 升级只看本请求实际发出的内容：并发请求没带 drop_block 时收到失配只升到 drop_block', async () => {
+  resetProviderRequestAdaptations();
+  const { createProviderRequestAdaptationRetry, createProviderRequestAdaptationSession } = await import('../../dist/extension/backend/capabilities/providerParameterAdaptation.js');
+  const target = { providerConfigId: 'claude-concurrent', provider: 'claude', baseUrl: 'https://gateway.example/v1', model: 'claude-opus-5-5', configRevision: 1 };
+  const error = { status: 400, rawBody: PREFIX_MISMATCH_400 };
+  // 请求一先失败并学到 drop_block，请求二在那之前已经不带 drop_block 发出、之后才收到同样的失配。
+  const first = createProviderRequestAdaptationSession();
+  const second = createProviderRequestAdaptationSession();
+  assert.equal(createProviderRequestAdaptationRetry(target, {}, first).shouldRetryImmediately(error), true);
+  assert.equal(learnedProviderRequestAdaptations(target).claudeThinkingBinding, 'drop_block');
+  assert.equal(createProviderRequestAdaptationRetry(target, {}, second).shouldRetryImmediately(error), true);
+  assert.equal(learnedProviderRequestAdaptations(target).claudeThinkingBinding, 'drop_block', '没带 drop_block 发出的请求不能把目标升级成去掉思考块');
+  // 真正带着 drop_block 发出后仍失配，才升级。
+  second.sentClaudeThinkingBinding = 'drop_block';
+  const retry = createProviderRequestAdaptationRetry(target, {}, second);
+  assert.equal(retry.shouldRetryImmediately(error), true);
+  assert.equal(learnedProviderRequestAdaptations(target).claudeThinkingBinding, 'strip_thinking');
   resetProviderRequestAdaptations();
 });
 

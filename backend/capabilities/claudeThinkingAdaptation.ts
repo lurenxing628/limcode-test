@@ -18,6 +18,8 @@
  * `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` 重试一次，并在之后的每个请求都带上；
  * 如果无法发送 beta 头（没带头时发 block_binding 会得到 `block_binding: Extra inputs are not permitted`），
  * 就把历史里所有 thinking 与 redacted_thinking 块去掉并一直保持去掉——“Once you remove a block, leave it out”。
+ * 中转也可能悄悄删掉 block_binding、不转发 beta 头：这时带 drop_block 重发仍收到同一条失配报错，同样按
+ * “发不了 beta 头”处理，升级为去掉思考块。是否升级只看本请求实际发出的内容，不看别的请求学到的状态。
  */
 import type { ModelReasoningCapability } from '../../shared/modelCapabilities';
 import type { EncodedProviderRequest } from './providerParameterAdaptation';
@@ -90,20 +92,43 @@ export type ClaudeThinkingBindingMode = 'drop_block' | 'strip_thinking';
 
 /**
  * 只认文档原文：前缀失配的 400 必含 “bound to a different conversation”；签名本身被篡改的 400 不含这句话，
- * prefix_mismatch_behavior 对它无效，不能匹配。回退只在我们已经发过 block_binding 之后才发生。
+ * prefix_mismatch_behavior 对它无效，不能匹配。`sent` 是本请求实际发出的处理：
+ * - 没带任何处理时收到失配 → drop_block；
+ * - 已经带着 drop_block 发出仍收到失配（中转丢了 block_binding 或 beta 头）→ strip_thinking；
+ * - 带着 block_binding 发出收到 `block_binding: Extra inputs are not permitted`（网关不转发 beta 头）→ strip_thinking。
  */
 export function claudeThinkingBindingModeForError(
   errorText: string,
-  current: ClaudeThinkingBindingMode | undefined
+  sent: ClaudeThinkingBindingMode | undefined
 ): ClaudeThinkingBindingMode | undefined {
   if (/the block is bound to a different conversation/i.test(errorText)) {
-    return current === 'strip_thinking' ? 'strip_thinking' : 'drop_block';
+    return sent === undefined ? 'drop_block' : 'strip_thinking';
   }
-  if (current !== undefined
+  if (sent === 'drop_block'
     && /(?<![\w])block_binding['"`]?\s*:?\s*extra inputs are not permitted/i.test(errorText)) {
     return 'strip_thinking';
   }
   return undefined;
+}
+
+/** 两种处理里更强的一种：只会 drop_block → strip_thinking 单向推进。 */
+export function strongerClaudeThinkingBinding(
+  left: ClaudeThinkingBindingMode | undefined,
+  right: ClaudeThinkingBindingMode | undefined
+): ClaudeThinkingBindingMode | undefined {
+  if (left === 'strip_thinking' || right === 'strip_thinking') return 'strip_thinking';
+  return left ?? right;
+}
+
+/** 编码后的请求实际带的处理：thinking 上有 drop_block 才算 drop_block；去掉思考块的请求记为 strip_thinking。 */
+export function sentClaudeThinkingBinding(
+  request: EncodedProviderRequest,
+  mode: ClaudeThinkingBindingMode | undefined
+): ClaudeThinkingBindingMode | undefined {
+  if (mode === 'strip_thinking') return 'strip_thinking';
+  const thinking = isRecord(request.body) ? request.body.thinking : undefined;
+  const binding = isRecord(thinking) ? thinking.block_binding : undefined;
+  return isRecord(binding) && binding.prefix_mismatch_behavior === 'drop_block' ? 'drop_block' : undefined;
 }
 
 export function applyClaudeThinkingBinding(

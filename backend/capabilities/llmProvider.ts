@@ -28,8 +28,10 @@ import {
   applyLearnedRequestAdaptations,
   claudeTurnScopedRemindersFallenBack,
   createProviderRequestAdaptationRetry,
+  createProviderRequestAdaptationSession,
   userRequestBodyRejectionMessage,
   type ProviderRequestAdaptationRetry,
+  type ProviderRequestAdaptationSession,
   installEncodedRequestPostProcessor,
   type ProviderRequestTarget
 } from './providerParameterAdaptation';
@@ -262,6 +264,8 @@ export interface LlmProviderOptions {
   resolveAttachment?: (input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }) => Promise<InlineDataPart | undefined>;
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
   onCompressionProgress?: () => void;
+  /** 内部：本次压缩请求的自适配状态（原生压缩的立即重发据此判断上一次实际发出了什么）。 */
+  requestAdaptationSession?: ProviderRequestAdaptationSession;
 }
 interface RetryControl {
   cancelRequested: boolean;
@@ -494,6 +498,7 @@ export async function startLlmProvider(
     };
     const claudeTurnScoped = claudeTurnScopedRemindersRequested(request, settings);
     const volatileTailCount = volatileTailContentCount(request);
+    const adaptationSession = createProviderRequestAdaptationSession();
     // WebSocket 模式下 provider 只用来取 WebSocket 帧（续接链）；回退用的 HTTP provider 是无状态完整重放。
     // HTTP 原生会话里同一个 provider 发首请求与续接请求（续接在原内容后追加），断点按会话方式放。
     const provider = installRequestAdaptation(installProviderCompatibility(
@@ -501,14 +506,15 @@ export async function startLlmProvider(
       settings.provider,
       settings.model
     ), settings, claudeTurnScoped, volatileTailCount, isOpenAIResponsesWebSocketMode(settings),
-    openAIResponsesHttpReplay(settings, nativeCapabilities));
+    openAIResponsesHttpReplay(settings, nativeCapabilities), adaptationSession);
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
           ...unifiedPromptCacheConfigEntry(settings, requestBody, false),
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount, false)
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount, false,
+        'stateless', adaptationSession)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
@@ -516,7 +522,7 @@ export async function startLlmProvider(
     const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(settings), {
       claudeTurnScopedReminders: claudeTurnScoped,
       userRequestBodyKeys: Object.keys(settings.requestBody ?? {})
-    });
+    }, adaptationSession);
     let retryCount = 0;
     let sawRetry = false;
 
@@ -2008,16 +2014,18 @@ export async function compactLlmProvider(
       && methodConfig.kind !== 'segmented_summary';
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
     // 摘要类方法在 executeSummaryProviderCall 内逐次调用自适配；这里只覆盖单次调用的原生压缩。
+    const adaptationSession = createProviderRequestAdaptationSession();
     const adaptationRetry = retrySettings && methodConfig.kind === 'provider_native'
       ? createProviderRequestAdaptationRetry(providerRequestTarget(retrySettings), {
           claudeTurnScopedReminders: claudeTurnScopedRemindersRequested(request, retrySettings),
           userRequestBodyKeys: Object.keys(request.nativeRequestBody ?? retrySettings.requestBody ?? {})
-        })
+        }, adaptationSession)
       : undefined;
     let retryCount = 0;
     let sawRetry = false;
     const handlerOptions: LlmProviderOptions = {
       ...options,
+      requestAdaptationSession: adaptationSession,
       onCompressionProgress: () => {
         if (signal?.aborted) return;
         emit({ type: LlmEventType.CompactProgress, payload: { requestId: request.id } });
@@ -2488,7 +2496,7 @@ async function buildAnthropicCompactionRequest(
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings,
-  claudeTurnScopedRemindersRequested(request, settings));
+  claudeTurnScopedRemindersRequested(request, settings), 0, false, 'stateless', options.requestAdaptationSession);
   const generationConfig = request.nativeGenerationConfig ?? settings.generationConfig;
   const systemInstruction = prependSystemInstructionPrefix(
     request.systemInstruction,
@@ -5207,7 +5215,8 @@ function installRequestAdaptation<T>(
   claudeTurnScopedReminders = false,
   volatileTailCount = 0,
   webSocketChain = false,
-  httpReplay: OpenAIResponsesHttpReplay = 'stateless'
+  httpReplay: OpenAIResponsesHttpReplay = 'stateless',
+  session?: ProviderRequestAdaptationSession
 ): T {
   const target = providerRequestTarget(settings);
   const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
@@ -5218,7 +5227,7 @@ function installRequestAdaptation<T>(
       : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider, { alwaysReasoning: astraSampling })
         : request;
     // 方言改写在记住的参数适配之前：方言写上的顶层 `thinking` / `enable_thinking` 若被网关明确拒绝过，这里仍会去掉。
-    const adapted = applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target);
+    const adapted = applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target, session);
     if (settings.provider === 'openai-responses') {
       return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount, httpReplay);
     }
