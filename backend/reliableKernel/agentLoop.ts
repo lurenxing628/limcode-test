@@ -68,6 +68,7 @@ import {
   type TurnTaskCardReminderState
 } from './currentTurnTaskProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { CLAUDE_TURN_SCOPED_REMINDER_DELIVERY, claudeTurnScopedRemindersEnabled } from './turnReminderProjection';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -1029,6 +1030,7 @@ export class ReliableAgentLoop {
           card: OPEN_TASK_COMPLETION_CHECK_CARD
         }
       } : {}),
+      ...(nativeFreeze.turnReminderDelivery ? { turnReminderDelivery: nativeFreeze.turnReminderDelivery } : {}),
       ...(nativeFreeze.nativeResponses ? { nativeResponses: nativeFreeze.nativeResponses } : {}),
       ...(nativeFreeze.nativeReasoning ? { nativeReasoning: nativeFreeze.nativeReasoning } : {})
     }, 'Reliable Agent recipe');
@@ -1039,6 +1041,8 @@ export class ReliableAgentLoop {
    * replays byte-identical behavior. Capability inputs come from the frozen Turn authority (never
    * live settings). The base stays stable on a compatible lineage; effort changes become pending
    * configuration updates. Mode/model/provider changes and compression rebase discard stale updates.
+   * The same frozen authority also records how this request sends its reminders: only requests sent
+   * as Claude turn-scoped system messages are later re-sent verbatim in the history.
    */
   private async readNativeRecipeFreeze(input: {
     settingsSnapshotContentObjectId?: string;
@@ -1051,6 +1055,7 @@ export class ReliableAgentLoop {
       freshConfigurationUpdate?: { effort: string };
     };
   }): Promise<{
+    turnReminderDelivery?: typeof CLAUDE_TURN_SCOPED_REMINDER_DELIVERY;
     nativeResponses?: OpenAIResponsesNativeCapabilities;
     nativeReasoning?: {
       baseEffort?: string;
@@ -1069,6 +1074,9 @@ export class ReliableAgentLoop {
       requireId(input.turnId, 'turnId'),
       input.settingsSnapshotContentObjectId
     );
+    const delivery = claudeTurnScopedRemindersEnabled(frozen.document)
+      ? { turnReminderDelivery: CLAUDE_TURN_SCOPED_REMINDER_DELIVERY }
+      : {};
     const documentModel = asRecord(frozen.document)?.model;
     const modelRecord = asRecord(documentModel);
     const thinking = asRecord(modelRecord?.thinkingConfig);
@@ -1081,7 +1089,7 @@ export class ReliableAgentLoop {
       ...(typeof thinking?.reasoningMode === 'string' ? { reasoningMode: thinking.reasoningMode } : {})
     });
     if (!capabilities.asyncTools && !capabilities.steering && !capabilities.reasoningUpdates) {
-      return {};
+      return delivery;
     }
     const configuredEffort = typeof thinking?.thinkingLevel === 'string' && thinking.thinkingLevel !== 'not-set' && thinking.thinkingLevel !== 'non-set'
       ? thinking.thinkingLevel
@@ -1140,6 +1148,7 @@ export class ReliableAgentLoop {
       ?? carriedUpdates[carriedUpdates.length - 1]?.effort
       ?? baseEffort;
     return {
+      ...delivery,
       nativeResponses: capabilities,
       nativeReasoning: {
         ...(restoreDefaults ? { resetCache: true, forceFullReason: 'thinking_defaults_restored' as const } : {}),

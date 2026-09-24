@@ -451,7 +451,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
           <span class="stream-checkbox-enable">启用</span>
         </LcCheckbox>
       </div>
-      <span class="stream-checkbox-text">把每轮提醒改为官方轮内系统消息，保持历史前缀不变，提升缓存命中并保留思考；需要模型与渠道支持轮内系统消息，扩展会自动带上所需 beta 头。渠道明确拒绝时自动退回原来的提醒方式。</span>
+      <span class="stream-checkbox-text">把每轮提醒改为官方轮内系统消息，保持历史前缀不变，提升缓存命中并保留思考；需要模型与渠道支持轮内系统消息，扩展会自动带上所需 beta 头。渠道明确拒绝时自动退回原来的提醒方式。对话进行到一半时打开或关闭，下一次请求的缓存会失效一次，之前的提醒不会被补进历史。</span>
     </div>
 
     <div v-if="config.provider === 'openai-compatible'" class="global-settings-field global-settings-field-wide openai-compatible-thinking-format-field">

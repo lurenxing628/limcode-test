@@ -34,6 +34,7 @@ import {
   claudeTurnScopedRemindersEnabled,
   projectTurnReminder,
   recipeReinjectedCurrentTurnInput,
+  recipeSentClaudeTurnScopedReminders,
   type ReinjectedCurrentTurnInputReference
 } from './turnReminderProjection';
 import { modelHandleRef, normalizeModelHandleCatalog } from './modelHandleCatalog';
@@ -180,7 +181,8 @@ export interface FullProviderRequest {
      * - content：那次请求的提醒；
      * - reinjectedInput：那次请求作为易失尾巴重新注入的当前 Turn 输入。同一窗口里同一条输入只在第一次出现时带上：
      *   之后的请求看到它已在窗口里，尾巴不再重发，因此也就没有要放回的副本。
-     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里。普通请求与同渠道同模型的 Claude 原生压缩请求才有。
+     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里；recipe 没记着按轮内方式发出的请求（开关打开之前以尾巴
+     * 方式发出的）也不会：那份提醒当时只是尾巴。普通请求与同渠道同模型的 Claude 原生压缩请求才有。
      */
     turnReminderHistory?: TurnReminderHistoryEntry[];
   };
@@ -2816,8 +2818,10 @@ const HISTORICAL_REMINDER_CACHE_LIMIT = 4096;
 /**
  * 一次历史请求要原样放回的内容：它的提醒，以及它作为易失尾巴重新注入的当前 Turn 输入（连同那次一起渲染的
  * current_turn_delta 附件目录，用那次 recipe 冻结的附件目录与模型句柄，与当时 llmCapabilityProviderAdapter 渲染的逐字节相同）。
+ * 只有 recipe 记着当时就按轮内系统消息发出的请求才有：以尾巴方式发出的提醒与输入副本只在那次请求里出现过，不补回历史。
  */
 function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string): HistoricalRequestFacts | null {
+  if (!recipeSentClaudeTurnScopedReminders(recipe)) return null;
   const reminder = projectTurnReminder(recipe)?.content;
   const input = recipeReinjectedCurrentTurnInput(recipe);
   if (reminder === undefined && !input) return null;

@@ -410,6 +410,50 @@ test('中途切到别的 provider 时历史提醒不以任何形式泄漏过去�
   });
 });
 
+test('开关中途打开：之前以尾巴方式发出的请求不补回提醒，只有打开后发出的请求之后原位重发', { timeout: 180_000 }, async () => {
+  await withRuntime(async h => {
+    await h.turn('source', 'start-work');
+    const tailRequests = [...h.requests];
+    assert.ok(tailRequests.some(entry => /Open Task Completion Check/.test(JSON.stringify(entry.wire.messages.at(-1)))),
+      'the tail loop ended with the completion check as the tail user message');
+    for (const entry of tailRequests) assert.equal('turnReminderDelivery' in entry.request.recipe, false, 'recorded as the tail mode');
+    const current = await h.configuration.loadGlobalSettings('llmProviderConfigs');
+    await h.configuration.saveGlobalSettings('llmProviderConfigs', {
+      ...current.settings,
+      configs: current.settings.configs.map(config => config.id === h.claude.id ? { ...config, claudeTurnScopedReminders: true } : config)
+    }, current.revision);
+
+    const firstAfter = h.requests.length;
+    await h.turn('source', 'after-switch');
+    const afterSwitch = h.requests.slice(firstAfter);
+    for (const entry of afterSwitch) {
+      assert.equal(entry.request.recipe.turnReminderDelivery, 'claude_turn_scoped', 'recorded as sent turn-scoped');
+      assertPlacement(entry, 'after the switch');
+    }
+    const first = afterSwitch[0];
+    assert.equal(first.request.requestAddenda?.turnReminderHistory, undefined,
+      'reminders the tail requests sent are not rebuilt into the history');
+    assert.equal(JSON.stringify(first.wire.messages).includes('Open Task Completion Check'), false,
+      'the old tail completion check does not become a permanently visible user message');
+    const lastUser = first.wire.messages.findLastIndex(message => message.role === 'user');
+    assert.equal(first.wire.messages.slice(0, lastUser).some(message => message.role === 'system'), false,
+      'no history rewritten into system messages');
+
+    const firstLater = h.requests.length;
+    await h.turn('source', 'later');
+    const later = h.requests[firstLater];
+    assertPrefix(afterSwitch.at(-1), later, 'from the switch on, every request is the next one’s prefix');
+    const rebuilt = later.request.requestAddenda?.turnReminderHistory ?? [];
+    const afterSwitchOutputs = new Set(later.request.context
+      .filter(item => item.segmentKind === 'message' && item.messageRole === 'model')
+      .slice(-afterSwitch.length)
+      .map(item => item.segmentId));
+    for (const entry of rebuilt) {
+      assert.ok(afterSwitchOutputs.has(entry.segmentId), 'only requests sent turn-scoped are rebuilt');
+    }
+  }, { claudeTurnScopedReminders: false });
+});
+
 test('开关关闭时同样的对话：没有 system 消息、不带 beta 头、提醒仍是原来的尾巴 user 消息', { timeout: 180_000 }, async () => {
   await withRuntime(async h => {
     await h.turn('source', 'start-work');

@@ -65,6 +65,17 @@ export function recipeReinjectedCurrentTurnInput(
 }
 
 /**
+ * 普通请求 recipe 记下的每轮提醒发送方式（`recipe.turnReminderDelivery`）：冻结这次请求时开关打开，提醒按 Claude
+ * 轮内系统消息发出。之后的请求只为这样的请求原样重建提醒与重新注入的输入；没有这个字段的请求当时以尾巴方式发出，
+ * 那份提醒只在它自己那次请求里出现过，中途打开开关也不会把它补回历史（前缀从打开那一刻起重新开始，缓存失效一次）。
+ */
+export const CLAUDE_TURN_SCOPED_REMINDER_DELIVERY = 'claude_turn_scoped' as const;
+
+export function recipeSentClaudeTurnScopedReminders(recipe: PlainJsonValue | undefined): boolean {
+  return isRecord(recipe) && recipe.turnReminderDelivery === CLAUDE_TURN_SCOPED_REMINDER_DELIVERY;
+}
+
+/**
  * 本轮冻结的设置要求把每轮提醒作为 Claude 轮内系统消息发送。开关只在 Claude 渠道打开时写进
  * AuthoritySnapshot.model，其他 provider 与关闭时都没有这个字段。
  */
