@@ -393,3 +393,67 @@ test('C1 聊天路径：从 Gemini 换到严格服务后，历史里的 extra_co
   });
   resetProviderRequestAdaptations();
 });
+
+// 网关不认 DeepSeek / 百炼写法的思考开关：顶层 `thinking`、`enable_thinking` 被明确点名拒绝时学会去掉。
+test('C1 顶层 thinking / enable_thinking：网关明确拒绝时识别，消息里的同名字段与嵌套键不误判', () => {
+  const thinkingPositives = [
+    { error: { message: 'Unrecognized request argument supplied: thinking', type: 'invalid_request_error', param: null, code: null } },
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'thinking'], msg: 'Extra inputs are not permitted', input: { type: 'enabled' } }] },
+    "[{'type': 'extra_forbidden', 'loc': ('body', 'thinking'), 'msg': 'Extra inputs are not permitted', 'input': {'type': 'enabled'}}]",
+    { message: "property 'thinking' is unsupported", type: 'invalid_request_error' },
+    'Error: Current provider response failed: thinking: Extra inputs are not permitted',
+    "Unknown parameter: 'thinking'.",
+    "Unsupported parameter: 'thinking' is not supported with this model."
+  ];
+  for (const error of thinkingPositives) assert.deepEqual(unsupportedRequestParameters(text(error)), ['thinking'], text(error));
+  const enablePositives = [
+    { error: { message: 'Unrecognized request argument supplied: enable_thinking', type: 'invalid_request_error' } },
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'enable_thinking'], msg: 'Extra inputs are not permitted', input: true }] },
+    { message: "property 'enable_thinking' is unsupported" },
+    'enable_thinking: Extra inputs are not permitted'
+  ];
+  for (const error of enablePositives) assert.deepEqual(unsupportedRequestParameters(text(error)), ['enable_thinking'], text(error));
+  const negatives = [
+    // Claude 思考块、消息上的同名字段、嵌套在 chat_template_kwargs 里的开关：去掉顶层键修不好。
+    'messages.1.content.0.thinking: Extra inputs are not permitted',
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'messages', 1, 'assistant', 'thinking'], msg: 'Extra inputs are not permitted' }] },
+    "Unknown parameter: 'messages[1].thinking'.",
+    { error: { message: "'messages.4' : for 'role:assistant' the following must be satisfied[('messages.4' : property 'thinking' is unsupported)]" } },
+    "Unknown parameter: 'chat_template_kwargs.enable_thinking'.",
+    { detail: [{ type: 'extra_forbidden', loc: ['body', 'chat_template_kwargs', 'enable_thinking'], msg: 'Extra inputs are not permitted' }] },
+    // Claude 保留思考与 block_binding 相关的 400 不是“不支持 thinking”。
+    'thinking.adaptive.block_binding: Extra inputs are not permitted',
+    "Unknown parameter: 'thinking.block_binding'.",
+    '`thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified',
+    '"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort"',
+    'adaptive thinking is not supported on this model'
+  ];
+  for (const error of negatives) assert.deepEqual(unsupportedRequestParameters(text(error)), [], text(error));
+  assert.deepEqual(
+    adaptRequestParameters({ model: 'm', thinking: { type: 'enabled' }, enable_thinking: true, reasoning_effort: 'high', messages: [] },
+      new Set(['thinking', 'enable_thinking']), 'openai-compatible'),
+    { model: 'm', reasoning_effort: 'high', messages: [] }
+  );
+});
+
+test('C1 聊天路径：网关拒绝 DeepSeek 写法的 thinking 后去掉重发，并按目标记住', async () => {
+  resetProviderRequestAdaptations();
+  const REJECTED = { error: { message: 'Unrecognized request argument supplied: thinking', type: 'invalid_request_error', param: null, code: null } };
+  await withServer((call) => call.body.thinking !== undefined
+    ? { status: 400, body: REJECTED }
+    : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    // 本机地址不按模型 ID 猜写法；手动选 DeepSeek 写法，模拟中转站。
+    const settings = providerSettings(baseUrl, { id: 'adaptation-thinking', model: 'deepseek-v4-flash', openaiCompatibleThinkingFormat: 'deepseek' });
+    const events = await chat(settings, 'thinking-1');
+    assert.ok(events.some((event) => event.type === 'llm:done'), JSON.stringify(events.filter((event) => event.type === 'llm:error')));
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0].body.thinking, { type: 'enabled' });
+    assert.equal(calls[1].body.thinking, undefined);
+    const { thinking: _removed, ...firstWithoutThinking } = calls[0].body;
+    assert.deepEqual(calls[1].body, firstWithoutThinking, '只去掉被拒的参数');
+    await chat(settings, 'thinking-2');
+    assert.equal(calls.length, 3, '同一目标之后直接去掉');
+    assert.equal(calls[2].body.thinking, undefined);
+  });
+  resetProviderRequestAdaptations();
+});

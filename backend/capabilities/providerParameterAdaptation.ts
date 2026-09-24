@@ -32,6 +32,9 @@
  *   OpenCode Zen `Extra inputs are not permitted, field: 'reasoning_content', value: []`（https://github.com/anomalyco/opencode/issues/11446），
  *   OpenCode Go `Extra inputs are not permitted, field: 'messages[2].reasoning'`（https://github.com/can1357/oh-my-pi/issues/1157）。
  *   助手消息上的 OpenRouter 风格 `reasoning` 与 Responses 顶层的 `reasoning` 对象同名，只认明确指向 messages[N] 的错误。
+ * - 方言写上的思考开关（顶层 `thinking`、`enable_thinking`）：不认它们的网关按上面同样的形状报错
+ *   （`Unrecognized request argument supplied: thinking`、`loc: ['body', 'thinking']`、`property 'thinking' is unsupported`）。
+ *   只认顶层：Claude 思考块、消息上的同名字段与 `chat_template_kwargs.enable_thinking` 被拒时去掉顶层键修不好。
  * - 工具调用上的 Gemini 签名 `tool_calls[].extra_content`（https://ai.google.dev/gemini-api/docs/thought-signatures
  *   “OpenAI compatibility”）：从 Gemini 换到严格服务后，历史里的签名会原样带过去。按上面同一批严格服务的报错
  *   形状识别（extra_forbidden 的 loc、`property '…' is unsupported`、`Unknown parameter`），另认
@@ -67,6 +70,8 @@ export type EncodedProviderRequestPostProcessor = (request: EncodedProviderReque
 
 export type AdaptableRequestParameter =
   | 'reasoning_effort'
+  | 'thinking'
+  | 'enable_thinking'
   | 'max_tokens'
   | 'temperature'
   | 'top_p'
@@ -78,7 +83,14 @@ export type AdaptableRequestParameter =
   | 'reasoning'
   | 'extra_content';
 
-const TOP_LEVEL_REMOVABLE_PARAMETERS = ['reasoning_effort', 'temperature', 'top_p', 'top_k', 'stream_options'] as const;
+const TOP_LEVEL_REMOVABLE_PARAMETERS = [
+  'reasoning_effort', 'thinking', 'enable_thinking', 'temperature', 'top_p', 'top_k', 'stream_options'
+] as const;
+/**
+ * 只认顶层的参数：Claude 思考块、助手消息上的同名字段、`chat_template_kwargs.enable_thinking` 等嵌套键被拒时，
+ * 去掉顶层键修不好，不能匹配。
+ */
+const TOP_LEVEL_ONLY_PARAMETERS = new Set<AdaptableRequestParameter>(['thinking', 'enable_thinking']);
 const ASSISTANT_MESSAGE_PARAMETERS = ['reasoning_content', 'reasoning_signature', 'reasoning_details', 'reasoning'] as const;
 /** 与顶层参数同名的助手消息字段：只接受明确落在 messages[N] 上的错误。 */
 const MESSAGE_SCOPED_ONLY_PARAMETERS = new Set<AdaptableRequestParameter>(['reasoning']);
@@ -314,6 +326,7 @@ export function unsupportedRequestParameters(errorText: string): AdaptableReques
   return ADAPTABLE_PARAMETERS.filter((parameter) => {
     const name = escapeRegExp(parameter);
     if (MESSAGE_SCOPED_ONLY_PARAMETERS.has(parameter)) return messageFieldRejected(text, name, extraInputs);
+    if (TOP_LEVEL_ONLY_PARAMETERS.has(parameter)) return topLevelFieldRejected(text, name, extraInputs);
     if (parameter === 'extra_content') return toolCallFieldRejected(text, name, extraInputs);
     if (parameter === 'max_tokens') {
       return new RegExp(`unsupported parameter:\\s*${Q}max_tokens${Q}`, 'i').test(text)
@@ -338,6 +351,19 @@ export function unsupportedRequestParameters(errorText: string): AdaptableReques
 }
 
 const Q = `['"\`]`;
+
+/** 错误明确点名顶层字段：不带任何路径前缀，loc 只有 body 一层。 */
+function topLevelFieldRejected(text: string, name: string, extraInputs: boolean): boolean {
+  if (new RegExp(`unsupported parameter:\\s*${Q}${name}${Q}`, 'i').test(text)) return true;
+  if (new RegExp(`unknown parameter:\\s*${Q}${name}${Q}`, 'i').test(text)) return true;
+  if (new RegExp(`unrecognized request argument supplied:\\s*${name}(?![\\w])`, 'i').test(text)) return true;
+  // Groq 的消息级写法 `'messages.4' : property 'x' is unsupported` 指向消息上的字段。
+  if (new RegExp(`(?<!messages[.\\[]\\d+\\]?${Q}\\s*:\\s*)property\\s*${Q}${name}${Q}\\s*is unsupported`, 'i').test(text)) return true;
+  if (!extraInputs) return false;
+  if (new RegExp(`(?<![\\w.\\[\\]])${name}${Q}?\\s*:?\\s*extra inputs are not permitted`, 'i').test(text)) return true;
+  if (new RegExp(`extra inputs are not permitted,\\s*field:\\s*${Q}${name}${Q}`, 'i').test(text)) return true;
+  return new RegExp(`${Q}?loc${Q}?\\s*:\\s*[\\[(]\\s*(?:${Q}body${Q}\\s*,\\s*)?${Q}${name}${Q}\\s*[\\])]`, 'i').test(text);
+}
 
 /** 错误明确指向 messages[N]（可带 assistant 角色层级）上的某个字段。 */
 function messageFieldRejected(text: string, name: string, extraInputs: boolean): boolean {

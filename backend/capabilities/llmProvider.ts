@@ -5123,7 +5123,7 @@ function installRequestAdaptation<T>(
     const shaped = claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
       : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider, { alwaysReasoning: astraSampling })
         : request;
-    // 方言改写在记住的参数适配之前：网关明确拒绝过的参数（例如某中转不认 thinking）仍会被去掉。
+    // 方言改写在记住的参数适配之前：方言写上的顶层 `thinking` / `enable_thinking` 若被网关明确拒绝过，这里仍会去掉。
     const adapted = applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target);
     if (settings.provider === 'openai-responses') {
       return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount, httpReplay);
