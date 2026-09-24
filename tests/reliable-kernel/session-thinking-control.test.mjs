@@ -39,7 +39,7 @@ function fixture(overrides = {}) {
   function load(path, component = false) {
     let source = fs.readFileSync(path, 'utf8');
     if (component === 'render') source = compileScript(parse(source).descriptor, { id: 'thinking-test', inlineTemplate: true }).content;
-    else if (component) source = parse(source).descriptor.scriptSetup.content + '\nexport { options, displayOptions, selected, defaultLabel, hint, inheritChildren, disabled, error, save, setInheritance, retry };';
+    else if (component) source = parse(source).descriptor.scriptSetup.content + '\nexport { options, displayOptions, selected, defaultLabel, hint, inheritChildren, disabled, error, save, setInheritance, retry, panelOffset };';
     const module = { exports: {} };
     vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, {
       module, exports: module.exports, defineProps: () => props, URL,
@@ -192,6 +192,9 @@ test('Mounted template binds dropdown change and checkbox checked/change to the 
     assert.equal(mounted.find('button').find(item => item.props.role === 'checkbox').props['aria-checked'], true);
     f.props.model = 'gpt-4o';
     await vue.nextTick();
+    assert.equal(mounted.find('select')[0].props.disabled, false, 'still openable so child inheritance can be turned off');
+    f.state.inherit = false;
+    await vue.nextTick();
     assert.equal(mounted.find('select')[0].props.disabled, true);
     assert.equal(mounted.find('option')[0].text, '跟随渠道设置：未设置（由服务决定）');
   } finally { mounted.dispose(); }
@@ -239,11 +242,60 @@ test('Composer save rejection does not send with old thinking settings', async (
   assert.equal(f.sent.length, 0);
 });
 
-test('Stale effort from a different model never produces a missing dropdown selection', () => {
+test('A saved effort the current model does not accept shows as inactive, and choosing the channel default really resets it', () => {
   const f = fixture({ state: { thinking: { kind: 'openai-effort', value: 'minimal' } } });
-  assert.equal(f.control.selected.value, 'default', 'o3 does not expose the previous GPT-5 minimal option');
+  assert.equal(f.control.selected.value, 'saved-inactive', 'o3 does not expose the previous GPT-5 minimal option');
+  const inactive = f.control.options.value.find(option => option.value === 'saved-inactive');
+  assert.equal(inactive.label, '已保存：最低（当前不生效）');
+  assert.equal(inactive.disabled, true);
+  assert.match(inactive.description, /已保存的思考强度不适用于当前模型，已按渠道设置发送/);
+  assert.match(f.control.hint.value, /已保存的思考强度不适用于当前模型/);
   f.control.save('minimal');
+  f.control.save('saved-inactive');
   assert.equal(f.writes.length, 0);
+  f.control.save('default');
+  assert.deepEqual(plain(f.writes[0]), ['thinking', 'a', { providerConfigId: 'channel', provider: 'openai-compatible', model: 'o3' }, null]);
+});
+
+test('Legacy overrides: an effort kind renamed by the upgrade stays selected; Opus 5.5 none can be cleared even though the model has options', () => {
+  const deepseek = { id: 'channel', provider: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', models: [{ id: 'deepseek-v4-pro', name: 'DeepSeek' }], modelConfigs: [] };
+  const renamed = fixture({ props: { model: 'deepseek-v4-pro', config: deepseek }, state: { thinking: { kind: 'openai-effort', value: 'high' } } });
+  assert.equal(renamed.control.selected.value, 'high');
+  const opus = fixture({ props: { model: 'claude-opus-5-5', config: { id: 'claude', provider: 'claude', model: 'claude-opus-5-5', models: [], modelConfigs: [] } }, state: { thinking: { kind: 'claude-effort', value: 'none' } } });
+  assert.equal(opus.control.selected.value, 'saved-inactive');
+  assert.equal(opus.control.options.value.find(option => option.value === 'saved-inactive').label, '已保存：关闭思考（当前不生效）');
+  assert.equal(opus.control.disabled.value, false);
+  opus.control.save('default');
+  assert.equal(opus.writes[0][3], null);
+});
+
+test('A stale override on a model without options can still be reset; the child checkbox stays reachable while it is on', () => {
+  const f = fixture({ props: { model: 'gpt-4o' }, state: { thinking: { kind: 'openai-effort', value: 'high' } } });
+  assert.equal(f.control.selected.value, 'saved-inactive');
+  assert.equal(f.control.disabled.value, false);
+  f.control.save('default');
+  assert.equal(f.writes[0][3], null);
+  const plainModel = fixture({ props: { model: 'gpt-4o' } });
+  assert.equal(plainModel.control.disabled.value, true);
+  plainModel.state.inherit = true;
+  assert.equal(plainModel.control.disabled.value, false, 'the checkbox lives in the panel; keep it openable so inheritance can be turned off');
+});
+
+test('Following the channel does not claim child Agents use a session choice', () => {
+  const f = fixture({ state: { inherit: true } });
+  assert.equal(f.control.displayOptions.value.find(option => option.value === 'default').buttonLabel, '思考：跟随渠道');
+  assert.equal(f.control.displayOptions.value.find(option => option.value === 'high').buttonLabel, '思考：高 · 含子 Agent');
+});
+
+test('The dropdown panel is shifted left so it never runs past the right edge of the window', () => {
+  const f = fixture();
+  assert.equal(f.control.panelOffset(10, 120, 1000), 0);
+  assert.equal(f.control.panelOffset(900, 120, 1000), 1000 - 8 - (900 + 280));
+  assert.equal(f.control.panelOffset(150, 120, 250), 8 - 150, 'narrow window: pinned to the left margin');
+  const source = fs.readFileSync(controlPath, 'utf8');
+  assert.match(source, /left: var\(--session-thinking-panel-left, 0px\)/);
+  assert.match(source, /max-width: calc\(100vw - 16px\)/);
+  assert.match(source, /@open="alignPanel"/);
 });
 
 test('OpenAI 兼容渠道的选项按渠道配置计算：硅基流动的 DeepSeek V4 只有 high / max', () => {
