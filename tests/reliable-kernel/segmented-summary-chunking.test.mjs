@@ -1058,3 +1058,60 @@ test('splitting a multi-megabyte message costs a few passes over it, not a full 
   // about 28 passes' worth (7 s for 4 MB); the planner runs on the extension host.
   assert.ok(elapsed < onePass * 15, `planning took ${Math.round(elapsed)} ms, ${(elapsed / onePass).toFixed(1)}x one tokenizer pass`);
 });
+
+test('the Attachment observation state appended after the summary is counted inside the frozen limit', async () => {
+  for (const kind of ['llm_summary', 'segmented_summary']) {
+    const fixture = observationCompactRequest(kind);
+    fixture.request.methodConfigSnapshot.llmSummary.targetTokens = 300;
+    const bodies = [];
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = Buffer.concat(chunks).toString('utf8');
+      bodies.push(body);
+      const content = body.includes('Attachment observation contract revision')
+        ? JSON.stringify({
+            attachmentRef: 'F1',
+            summary: 'A dashboard screenshot whose status column shows a red failure marker next to the deploy job.',
+            salientFacts: ['The deploy job row is red.', 'The timestamp column reads 14:02.', 'Two other jobs are green.'],
+            uncertainties: ['The job name is partly cut off.']
+          })
+        : OVERSIZED_REPLY;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: `chatcmpl-state-${bodies.length}`, object: 'chat.completion', created: 1, model: 'gpt-test',
+        choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }]
+      }));
+    });
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+    const capability = createLlmProviderCapability({
+      settings: async () => ({ ...providerConfig('openai-compatible', `http://127.0.0.1:${server.address().port}/v1`), stream: false }),
+      compressionSettings: async () => undefined,
+      async resolveAttachment(input) {
+        return { inlineData: {
+          mimeType: 'image/png', name: 'visual-evidence.png', data: fixture.bytes.toString('base64'),
+          attachmentId: input.attachmentId, sizeBytes: fixture.bytes.byteLength
+        } };
+      }
+    });
+    try {
+      const terminal = await waitForCompactTerminal(capability, fixture.request);
+      assert.equal(terminal.type, 'llm:compactDone', terminal.payload.message);
+      const [summary, state] = terminal.payload.result.contents.map((content) => content.parts[0].text);
+      assert.match(state, /attachment_observation_state/);
+      const stateTokens = estimateTokenCount(state);
+      assert.ok(stateTokens > 50, `fixture state is ${stateTokens} tokens`);
+      assert.ok(
+        estimateTokenCount(summary) + stateTokens <= 300,
+        `${kind}: summary ${estimateTokenCount(summary)} + state ${stateTokens} tokens exceed the 300-token limit`
+      );
+      // The model is told the room the state leaves, not the whole limit.
+      const summaryBody = bodies.find((body) => body.includes('最多不超过'));
+      const told = Number(/最多不超过 (\d+) tokens/.exec(summaryBody)?.[1]);
+      assert.ok(told < 300 && told >= 300 - stateTokens - 1, `${kind}: prompt limit ${told}`);
+    } finally {
+      capability.dispose();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+});

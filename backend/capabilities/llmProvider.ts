@@ -3339,16 +3339,37 @@ function attachmentObservationModelRecord(
   };
 }
 
+/** The Attachment observation state a text compression appends after its summary, if any. */
+function compressionAttachmentState(prepared: PreparedCompressionMediaSemantics): MessageContent | undefined {
+  if (prepared.requirements.length === 0) return undefined;
+  const byRef = new Map(prepared.observations.map((observation) => [observation.attachmentRef, observation]));
+  return attachmentObservationStateContent(prepared.requirements, byRef);
+}
+
+/**
+ * The frozen limit covers everything the compression puts back into the Context: the summary and
+ * the Attachment observation state appended after it. The summary is written to the room the state
+ * leaves, but keeps at least a quarter of the limit; many large observations then overrun the limit
+ * instead of leaving no room for the task itself.
+ */
+function summaryConfigBesideAttachmentState(
+  methodConfig: LlmCompressionConfigRecord,
+  state: MessageContent | undefined
+): LlmCompressionConfigRecord {
+  if (!state) return methodConfig;
+  const limitTokens = effectiveSummaryTargetTokens(methodConfig);
+  const stateTokens = state.parts.reduce((total, part) => total + (isTextPart(part) ? estimateTokenCount(part.text) : 0), 0);
+  const targetTokens = Math.max(Math.ceil(limitTokens / 4), limitTokens - stateTokens);
+  return { ...methodConfig, llmSummary: { ...(methodConfig.llmSummary ?? {}), targetTokens } };
+}
+
 function compressionSummaryContents(
   summary: string,
   targetTokens: number,
-  requirements: readonly LlmAttachmentObservationRequirement[],
-  observations: readonly LlmAttachmentObservation[]
+  state: MessageContent | undefined
 ): MessageContent[] {
   const contents = summaryContents(summary, targetTokens);
-  if (requirements.length === 0) return contents;
-  const byRef = new Map(observations.map((observation) => [observation.attachmentRef, observation]));
-  return [...contents, attachmentObservationStateContent(requirements, byRef)];
+  return state ? [...contents, state] : contents;
 }
 
 function attachmentObservationResultFields(
@@ -3391,18 +3412,19 @@ async function compactWithSummary(
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
   const mediaSemantics = await prepareCompressionMediaSemantics(request, methodConfig, options, signal);
+  const attachmentState = compressionAttachmentState(mediaSemantics);
+  const summaryConfig = summaryConfigBesideAttachmentState(methodConfig, attachmentState);
   const summary = await generateSummaryText(
     mediaSemantics.request,
-    methodConfig,
+    summaryConfig,
     options,
     signal,
     mediaSemantics.provider
   );
   const contents = compressionSummaryContents(
     summary.text,
-    effectiveSummaryTargetTokens(methodConfig),
-    mediaSemantics.requirements,
-    mediaSemantics.observations
+    effectiveSummaryTargetTokens(summaryConfig),
+    attachmentState
   );
   return {
     id: `summary-${request.blockId}`,
@@ -3432,7 +3454,9 @@ async function compactWithSegmentedSummary(
   );
   const provider = mediaSemantics.provider ?? initialProvider;
   const semanticRequest = mediaSemantics.request;
-  const targetTokens = effectiveSummaryTargetTokens(methodConfig);
+  const attachmentState = compressionAttachmentState(mediaSemantics);
+  const summaryConfig = summaryConfigBesideAttachmentState(methodConfig, attachmentState);
+  const targetTokens = effectiveSummaryTargetTokens(summaryConfig);
   const priorSummaryText = semanticRequest.priorSummaryContents?.length
     ? plainTextOfContents(semanticRequest.priorSummaryContents)
     : '';
@@ -3441,7 +3465,7 @@ async function compactWithSegmentedSummary(
   let finalSummary = deterministic;
 
   if (sourceContents.length > 0 && provider.provider) {
-    const calls = buildSegmentedSummaryProviderCalls(semanticRequest, methodConfig, provider.settings);
+    const calls = buildSegmentedSummaryProviderCalls(semanticRequest, summaryConfig, provider.settings);
     const leaves = await mapWithBoundedConcurrency(
       calls,
       isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
@@ -3452,7 +3476,7 @@ async function compactWithSegmentedSummary(
       provider,
       leaves,
       priorSummaryText,
-      methodConfig,
+      summaryConfig,
       targetTokens,
       signal
     );
@@ -3469,12 +3493,7 @@ async function compactWithSegmentedSummary(
     }
   }
 
-  const contents = compressionSummaryContents(
-    finalSummary,
-    targetTokens,
-    mediaSemantics.requirements,
-    mediaSemantics.observations
-  );
+  const contents = compressionSummaryContents(finalSummary, targetTokens, attachmentState);
   return {
     id: `summary-${request.blockId}`,
     object: 'limcode.context_summary',
