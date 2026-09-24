@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import type {
   CompressionCommandTarget,
   LlmProviderKind,
-  MessageRetryTarget
+  MessageRetryTarget,
+  SessionThinkingOverride
 } from '../../shared/protocol';
 import type {
   AttachmentIngestService,
@@ -186,6 +187,11 @@ export interface TurnAuthorityCompilationRequest {
    * turns off stays off in the child (see `boundChildSkillPolicy`).
    */
   inheritedSkillPolicy?: FrozenSkillPolicyDocument;
+  /**
+   * 父回合在“派出的子 Agent 也用这个思考强度”下冻结的思考强度。子对话的第一个回合在写入它自己的
+   * 模型记录之前编译，对话还没有模型记录时按这里冻结，这个子 Agent 再派出的孙 Agent 才能接着继承。
+   */
+  inheritedThinkingOverride?: SessionThinkingOverride;
 }
 
 export interface TurnModelOverride {

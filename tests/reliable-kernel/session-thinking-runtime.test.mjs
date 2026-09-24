@@ -890,3 +890,37 @@ test('升级前保存的会话思考覆盖：kind 不同但值可用时照常生
     assert.equal(reset.profile?.thinkingOverride, undefined);
   });
 });
+
+test('孙 Agent 也继承思考强度：继承标记随思考强度写进子对话的模型记录', async () => {
+  await fixture(async f => {
+    await f.configuration.mutations.setModelProfile({
+      scopeKind: 'conversation', scopeId: 'parent', providerConfigId: f.provider.id, provider: f.provider.provider,
+      model: f.provider.model, thinkingOverride: { kind: 'openai-effort', value: 'high' }, inheritThinkingToChildren: true
+    });
+    await f.app.agentLoop.runInput(f.input('inherit-grandchild'));
+    await f.coordinator.waitForIdle();
+    const descendants = [...new Set(f.wires.map(wire => wire.conversationId).filter(id => id !== 'parent'))];
+    // 子对话的第一个回合就冻结了继承（它在写入子对话记录之前编译），子对话记录也带着继承标记。
+    for (const turn of await f.list('Turn')) {
+      const model = (await f.frozen(turn.id)).document.model;
+      assert.deepEqual(model.thinkingOverride, { kind: 'openai-effort', value: 'high' }, turn.conversation_id);
+      assert.equal(model.inheritThinkingToChildren, true, turn.conversation_id);
+    }
+    assert.equal(descendants.length, 2, 'child and grandchild both issue provider requests');
+    assert.ok(f.wires.filter(wire => wire.conversationId !== 'parent').every(wire => wire.body.reasoning_effort === 'high'),
+      JSON.stringify(f.wires.map(wire => [wire.conversationId, wire.body.reasoning_effort])));
+  }, {
+    async send(request, controls, f) {
+      const own = f.requests.filter(item => item.conversationId === request.conversationId);
+      const conversations = [...new Set(f.requests.map(item => item.conversationId))];
+      const depth = conversations.indexOf(request.conversationId);
+      const spawn = own.length === 1 && depth < 2;
+      await controls.onEvent({
+        kind: 'completed', streamSeq: '1',
+        content: { role: 'model', parts: [spawn
+          ? { id: `spawn-${depth}`, functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: `Level ${depth + 1}`, prompt: 'inherit thinking' } } }
+          : { text: 'done' }] }
+      });
+    }
+  });
+});

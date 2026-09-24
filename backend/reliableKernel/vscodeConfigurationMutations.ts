@@ -547,8 +547,9 @@ export class VscodeConfigurationMutations {
         ...(providerConfigId ? { providerConfigId } : {}),
         ...(input.provider ? { provider: input.provider } : {}),
         model,
-        ...(thinkingOverride ? { thinkingOverride } : {}),
-
+        // 只有父对话开着“派出的子 Agent 也用这个思考强度”时才会带来思考强度；继承标记一起写进子对话，
+        // 这个子 Agent 再派出的孙 Agent 也按同一强度。
+        ...(thinkingOverride ? { thinkingOverride, inheritThinkingToChildren: true } : {})
       };
       const link: ModelProfileScopeLinkRecord = {
         id: scopeLinkId('model-profile', scope),

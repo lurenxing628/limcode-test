@@ -414,6 +414,7 @@ export class ChildExecutionControlPlane {
     );
     const parentTurnId = requirePhaseFId(parent.turn.id, 'parent Turn.id');
     const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(parentTurnId);
+    const inheritedThinkingOverride = await this.frozenChildThinkingOverrideForTurn(parentTurnId);
     const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
       conversationId: ids.childConversationId,
       turnId: ids.childTurnId,
@@ -427,7 +428,8 @@ export class ChildExecutionControlPlane {
             ? { preferredWorkEnvironmentId: inheritedBoundary.defaultWorkEnvironmentId }
             : {})
         // The child's tools and skills never exceed the parent Turn's; later Turns keep this same bound.
-        : await this.parentTurnBound(parentTurnId, inheritedBoundary))
+        : await this.parentTurnBound(parentTurnId, inheritedBoundary)),
+      ...(inheritedThinkingOverride ? { inheritedThinkingOverride } : {})
     }), ids.childTurnId, command.childAgentId);
     const modelSelection = frozenModelSelection(JSON.parse(asUtf8Text(
       compiled.authoritySnapshot.content,

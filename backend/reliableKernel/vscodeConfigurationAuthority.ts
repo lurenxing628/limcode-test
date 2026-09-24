@@ -233,13 +233,14 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       { scopeKind: 'conversation', scopeId: request.conversationId },
       (link) => link.modelProfileId
     );
+    // 子对话的第一个回合在写入它自己的模型记录之前编译：还没有对话级记录时，按父回合冻结的继承选择。
     const savedConversationThinkingOverride = conversationModelProfile
-      && conversationModelProfile.providerConfigId === provider.id
-      && conversationModelProfile.provider === provider.provider
-      && conversationModelProfile.model === modelId
-      ? conversationModelProfile.thinkingOverride
-      : undefined;
-    const inheritThinkingToChildren = conversationModelProfile?.inheritThinkingToChildren === true;
+      ? conversationModelProfile.providerConfigId === provider.id
+        && conversationModelProfile.provider === provider.provider
+        && conversationModelProfile.model === modelId
+        ? conversationModelProfile.thinkingOverride
+        : undefined
+      : request.inheritedThinkingOverride;
 
     const planReviewPolicy = resolveScopedRecord(
       records.planReviewPolicyScopeLinks,
@@ -332,6 +333,10 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         selectedModelConfig ? selectedModelConfig.requestBody : provider.requestBody, provider)
       : undefined;
     const effectiveConversationThinkingOverride = savedThinking?.status === 'applied' ? savedThinking.override : undefined;
+    // 与 initializeConversationModelProfile 写入子对话记录的继承标记一致：继承来的强度适用时才继续往下传。
+    const inheritThinkingToChildren = conversationModelProfile
+      ? conversationModelProfile.inheritThinkingToChildren === true
+      : effectiveConversationThinkingOverride !== undefined;
     const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
       ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
