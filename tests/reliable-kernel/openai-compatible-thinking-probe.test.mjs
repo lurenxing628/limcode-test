@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { createPinia, setActivePinia } from 'pinia';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 const require = createRequire(import.meta.url);
 // 渠道配置与路由模块在加载时引用 vscode；这里只用到它们的纯函数，给一个桩，并记下弹出的警告。
@@ -23,6 +25,11 @@ const {
 const { sessionThinkingCapability } = require('../../dist/extension/shared/sessionThinking.js');
 const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
 const protocol = require('../../dist/extension/shared/protocol.js');
+const {
+  describeOpenAICompatibleThinkingProbe,
+  openAICompatibleThinkingProbeSummary
+} = require('../../dist/extension/shared/openAICompatibleThinkingProbe.js');
+const { openAICompatibleThinkingProbeEvidence } = require('../../dist/extension/shared/modelCapabilities.js');
 const { VscodeReliableKernelCommandRouter } = require('../../dist/extension/backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js');
 
 const API_KEY = 'sk-probe-secret-7f3a9c';
@@ -423,4 +430,178 @@ test('路由：测试失败按请求 id 回报错，不弹 VS Code 警告', asyn
   assert.equal(posted[0].payload.message, '第 1 次请求失败（HTTP 401）：Incorrect API key provided');
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(warnings, []);
+});
+
+function snapshotFixture(baseUrl, modelId, reasoning, providerConfigId = 'probe-channel') {
+  return {
+    providerKind: 'openai-compatible', modelId, providerConfigId, transport: 'http', registryRevision: '2026-09-24',
+    endpointFingerprint: normalizedEndpointFingerprint(baseUrl), source: 'verified_probe', verifiedAt: '2026-09-24T02:30:00.000Z',
+    reasoning: { supportsBudget: false, outputLimitIncludesThinking: true, requiresThoughtSignatures: false, ...reasoning },
+    nativeCompaction: { availability: 'unknown', reason: '当前渠道和模型没有经过能力确认。' }
+  };
+}
+
+const TESTED = { family: 'deepseek_toggle', levels: ['low', 'high', 'max'], canDisable: true, alwaysOn: false, wireFormat: 'deepseek' };
+
+test('测试结果说明：写法、能否关闭、接受的强度；没测到思考时说明仍按自动识别', () => {
+  const base = 'https://relay.example.invalid/v1';
+  assert.equal(describeOpenAICompatibleThinkingProbe(snapshotFixture(base, 'm', TESTED)), 'DeepSeek 写法（thinking.type）；可以关闭思考；接受 low / high / max');
+  assert.equal(describeOpenAICompatibleThinkingProbe(snapshotFixture(base, 'm', { family: 'deepseek_toggle', levels: [], canDisable: false, alwaysOn: true, wireFormat: 'enable_thinking' })),
+    'enable_thinking 写法；关不掉思考；不接受 reasoning_effort，只开关思考');
+  assert.equal(describeOpenAICompatibleThinkingProbe(snapshotFixture(base, 'm', { family: 'openai_effort', levels: ['low', 'medium', 'high'], canDisable: true, alwaysOn: false, wireFormat: 'reasoning_effort' })),
+    'OpenAI 写法（只发 reasoning_effort）；可以关闭思考；接受 low / medium / high');
+  assert.equal(describeOpenAICompatibleThinkingProbe(snapshotFixture(base, 'm', { family: 'none', levels: [], canDisable: false, alwaysOn: false })),
+    '没有看到思考输出，发送时仍按自动识别');
+  assert.match(openAICompatibleThinkingProbeSummary(snapshotFixture(base, 'm', TESTED)), /^测试结果（\d\d-\d\d \d\d:\d\d）：DeepSeek 写法/);
+  // 设置界面只显示身份匹配的结果：换了接口地址或渠道就不再显示。
+  const config = withEvidence(channel(base, 'm'), snapshotFixture(base, 'm', TESTED));
+  assert.equal(openAICompatibleThinkingProbeEvidence(config, 'm')?.reasoning.wireFormat, 'deepseek');
+  assert.equal(openAICompatibleThinkingProbeEvidence({ ...config, baseUrl: 'https://other.example.invalid/v1' }, 'm'), undefined);
+  assert.equal(openAICompatibleThinkingProbeEvidence({ ...config, id: 'other' }, 'm'), undefined);
+  assert.equal(openAICompatibleThinkingProbeEvidence({ ...config, provider: 'claude' }, 'm'), undefined);
+});
+
+/** 用 Vite SSR 加载真实的设置 store；bridge 发出的消息记在 posted 里，定时器由测试推进。 */
+async function withSettingsStore(run) {
+  const previousWindow = globalThis.window;
+  const posted = [];
+  const timers = new Map();
+  let nextId = 0;
+  let now = 0;
+  globalThis.window = {
+    addEventListener() {}, removeEventListener() {},
+    setTimeout(callback, delay) { const id = ++nextId; timers.set(id, { callback, at: now + delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    acquireVsCodeApi() { return { postMessage(message) { posted.push(message); }, getState() { return undefined; }, setState() {} }; }
+  };
+  const server = await createWebviewSsrServer();
+  try {
+    const { useGlobalSettingsStore } = await server.ssrLoadModule('/src/stores/useGlobalSettingsStore.ts');
+    setActivePinia(createPinia());
+    const store = useGlobalSettingsStore();
+    const baseUrl = 'https://relay.example.invalid/v1';
+    const models = [{ id: 'deepseek-like', name: '类 DeepSeek' }, { id: 'plain-chat', name: 'plain-chat' }];
+    store.applySnapshot({ section: 'llmProviderConfigs', settings: { configs: [channel(baseUrl, 'deepseek-like', { models, requestBody: undefined, generationConfig: undefined })] }, filePath: 'fixture', revision: 'initial' });
+    store.applySnapshot({ section: 'llm', settings: { activeProviderConfigId: 'probe-channel' }, filePath: 'fixture', revision: 'initial' });
+    const advance = (ms) => {
+      const target = now + ms;
+      for (;;) {
+        const next = [...timers].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next) break;
+        now = next[1].at;
+        timers.delete(next[0]);
+        next[1].callback();
+      }
+      now = target;
+    };
+    const probeRequests = () => posted.filter((message) => message.type === protocol.BridgeMessageType.LlmProviderModelsGet && message.payload.probeThinking === true);
+    const saves = () => posted.filter((message) => message.type === protocol.BridgeMessageType.GlobalSettingsUpdate && message.payload.section === 'llmProviderConfigs');
+    await run({ store, posted, advance, baseUrl, probeRequests, saves, config: () => store.llmProviderConfigs.configs[0] });
+  } finally {
+    await server.close();
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+}
+
+const probeState = (store, modelId = 'deepseek-like') => store.thinkingProbeState('probe-channel', modelId);
+
+test('设置 store：发起测试带上模型与 probeThinking，测试中不重复发送', async () => {
+  await withSettingsStore(async ({ store, probeRequests }) => {
+    store.testOpenAICompatibleThinking('probe-channel', 'plain-chat');
+    assert.equal(probeRequests().length, 1);
+    const request = probeRequests()[0];
+    assert.equal(request.payload.config.id, 'probe-channel');
+    assert.equal(request.payload.config.model, 'plain-chat');
+    assert.equal(probeState(store, 'plain-chat').status, 'running');
+    assert.equal(probeState(store, 'plain-chat').requestId, request.id);
+    assert.equal(probeState(store), undefined);
+    store.testOpenAICompatibleThinking('probe-channel', 'plain-chat');
+    assert.equal(probeRequests().length, 1);
+    // 只有 OpenAI 兼容渠道能测试。
+    store.llmProviderConfigs.configs[0].provider = 'claude';
+    store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
+    assert.equal(probeRequests().length, 1);
+  });
+});
+
+test('设置 store：失败显示“测试思考参数失败”，不关获取 LLM 弹窗，也不当成获取 LLM 列表失败', async () => {
+  await withSettingsStore(async ({ store, posted, probeRequests }) => {
+    store.requestModelsForActiveConfig();
+    const listRequest = posted.find((message) => message.type === protocol.BridgeMessageType.LlmProviderModelsGet && !message.payload.probeThinking);
+    store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
+    store.setError('第 1 次请求失败（HTTP 401）：Incorrect API key provided', {
+      requestType: protocol.BridgeMessageType.LlmProviderModelsGet, correlationId: probeRequests()[0].id
+    });
+    assert.deepEqual(probeState(store), {
+      configId: 'probe-channel', modelId: 'deepseek-like', status: 'failed', requestId: probeRequests()[0].id,
+      message: '测试思考参数失败：第 1 次请求失败（HTTP 401）：Incorrect API key provided'
+    });
+    assert.equal(store.status, '测试思考参数失败：第 1 次请求失败（HTTP 401）：Incorrect API key provided');
+    assert.equal(store.fetchedModelsDialog.open, true);
+    assert.equal(store.fetchedModelsDialog.loading, true);
+    // 获取 LLM 列表自己的失败仍按原来的提示。
+    store.setError('网络错误', { requestType: protocol.BridgeMessageType.LlmProviderModelsGet, correlationId: listRequest.id });
+    assert.equal(store.status, '获取 LLM 列表失败：网络错误');
+    assert.equal(probeState(store).status, 'failed');
+    // 失败后可以重新测试。
+    store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
+    assert.equal(probeRequests().length, 2);
+    assert.equal(probeState(store).status, 'running');
+  });
+});
+
+test('设置 store：3 分钟没有结果按超时失败', async () => {
+  await withSettingsStore(async ({ store, advance }) => {
+    store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
+    advance(179_999);
+    assert.equal(probeState(store).status, 'running');
+    advance(1);
+    assert.equal(probeState(store).status, 'failed');
+    assert.match(probeState(store).message, /^测试思考参数失败：3 分钟内没有结果/);
+    assert.equal(store.status, probeState(store).message);
+  });
+});
+
+test('设置 store：测试结果写进对应模型并保存，不影响正在获取的 LLM 列表', async () => {
+  await withSettingsStore(async ({ store, probeRequests, saves, baseUrl, config }) => {
+    store.requestModelsForActiveConfig();
+    store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
+    const snapshot = snapshotFixture(baseUrl, 'deepseek-like', TESTED);
+    store.applyLlmProviderModelsSnapshot({
+      configId: 'probe-channel', purpose: 'thinking_probe', provider: 'openai-compatible', baseUrl,
+      models: [{ id: 'deepseek-like', name: 'deepseek-like', capabilitySnapshot: snapshot }]
+    });
+    assert.deepEqual(config().models.find((model) => model.id === 'deepseek-like').capabilitySnapshot, snapshot);
+    assert.equal(probeState(store), undefined);
+    assert.equal(store.fetchedModelsDialog.loading, true, '测试结果不能关掉正在获取的 LLM 列表');
+    assert.equal(saves().length, 1);
+    const saved = saves()[0].payload.settings.configs[0].models.find((model) => model.id === 'deepseek-like');
+    assert.equal(saved.capabilitySnapshot.reasoning.wireFormat, 'deepseek');
+    assert.doesNotMatch(JSON.stringify(saved), new RegExp(API_KEY));
+    assert.equal(store.status, '「类 DeepSeek」测试完成：DeepSeek 写法（thinking.type）；可以关闭思考；接受 low / high / max');
+  });
+});
+
+test('设置 store：测试期间改了接口地址，结果作废；重新获取同名 LLM 时保留测试结果', async () => {
+  await withSettingsStore(async ({ store, probeRequests, baseUrl, config }) => {
+    store.testOpenAICompatibleThinking('probe-channel', 'deepseek-like');
+    config().baseUrl = 'https://changed.example.invalid/v1';
+    store.applyLlmProviderModelsSnapshot({
+      configId: 'probe-channel', purpose: 'thinking_probe', provider: 'openai-compatible', baseUrl,
+      models: [{ id: 'deepseek-like', name: 'deepseek-like', capabilitySnapshot: snapshotFixture(baseUrl, 'deepseek-like', TESTED) }]
+    });
+    assert.equal(config().models.find((model) => model.id === 'deepseek-like').capabilitySnapshot, undefined);
+    assert.equal(probeState(store).status, 'failed');
+    assert.match(probeState(store).message, /接口地址改了/);
+
+    config().baseUrl = baseUrl;
+    const snapshot = snapshotFixture(baseUrl, 'deepseek-like', TESTED);
+    config().models.find((model) => model.id === 'deepseek-like').capabilitySnapshot = snapshot;
+    store.requestModelsForActiveConfig();
+    store.addFetchedModelsToConfig([{ id: 'deepseek-like', name: '类 DeepSeek（新名字）' }, { id: 'new-model', name: 'new-model' }]);
+    const kept = config().models.find((model) => model.id === 'deepseek-like');
+    assert.equal(kept.name, '类 DeepSeek（新名字）');
+    assert.deepEqual(kept.capabilitySnapshot, snapshot);
+  });
 });

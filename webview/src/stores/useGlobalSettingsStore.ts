@@ -1,4 +1,5 @@
 import { normalizeModelCapabilitySnapshot } from '@shared/modelCapabilities';
+import { describeOpenAICompatibleThinkingProbe, OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS } from '@shared/openAICompatibleThinkingProbe';
 import { defineStore } from 'pinia';
 import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '@shared/debugCapture';
 import {
@@ -73,6 +74,16 @@ interface FetchedModelsDialogState {
   models: LlmProviderModelRecord[];
 }
 
+/** “测试这个模型”进行中或失败的状态；测试成功后删除，结果看模型的 capabilitySnapshot。 */
+export interface OpenAICompatibleThinkingProbeState {
+  configId: string;
+  modelId: string;
+  status: 'running' | 'failed';
+  /** 这次测试的 bridge 请求 id：后端报错按它认出是哪次测试。 */
+  requestId: string;
+  message?: string;
+}
+
 interface GlobalSettingsState {
   common: GlobalSettingsRecord;
   network: NetworkSettingsRecord;
@@ -109,6 +120,8 @@ interface GlobalSettingsState {
   loadingSettingsSections: Partial<Record<GlobalSettingsSection, boolean>>;
   /** 获取模型后等待用户选择导入的临时列表。 */
   fetchedModelsDialog: FetchedModelsDialogState;
+  /** “测试这个模型”的状态，键见 thinkingProbeKey（渠道 ID + 模型 ID）。 */
+  thinkingProbes: Record<string, OpenAICompatibleThinkingProbeState>;
   /** 已发起更新，正在等待后端 snapshot 确认的全局设置 section。 */
   pendingSettingsSections: Partial<Record<GlobalSettingsSection, boolean>>;
   failedSettingsSections: GlobalSettingsSectionMessages;
@@ -1095,6 +1108,19 @@ function cloneMergeValue(value: MergeNodeValue): MergeNodeValue {
 }
 
 let modelFetchTimeout: number | undefined;
+/** 后端每次请求最多 30 秒、最多 9 次，另留余量。 */
+const THINKING_PROBE_TIMEOUT_MS = 180_000;
+const thinkingProbeTimers = new Map<string, number>();
+
+export function thinkingProbeKey(configId: string, modelId: string): string {
+  return JSON.stringify([configId, modelId.trim()]);
+}
+
+function clearThinkingProbeTimer(key: string): void {
+  const timer = thinkingProbeTimers.get(key);
+  if (timer !== undefined) window.clearTimeout(timer);
+  thinkingProbeTimers.delete(key);
+}
 const LLM_PROVIDER_CONFIGS_AUTOSAVE_DELAY_MS = 400;
 const LLM_COMPRESSION_CONFIGS_AUTOSAVE_DELAY_MS = 400;
 const SETTINGS_SAVE_ACK_TIMEOUT_MS = 5_000;
@@ -1211,11 +1237,15 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     loadedSections: {},
     loadingSettingsSections: {},
     fetchedModelsDialog: emptyFetchedModelsDialog(),
+    thinkingProbes: {},
     pendingSettingsSections: {},
     failedSettingsSections: {},
     status: ''
   }),
   getters: {
+    thinkingProbeState(state): (configId: string, modelId: string) => OpenAICompatibleThinkingProbeState | undefined {
+      return (configId: string, modelId: string) => state.thinkingProbes[thinkingProbeKey(configId, modelId)];
+    },
     hasExternalSettingsChange(state): boolean {
       return Object.keys(state.externalChangedSections).length > 0;
     },
@@ -2140,6 +2170,84 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.status = '正在验证原生压缩端点（仅发送合成内容，可能消耗少量 Token）…';
       bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig, probeNative: true });
     },
+    /**
+     * “测试这个模型”：让后端向这个模型发最多 9 次很短的请求，测出思考参数写法。只在用户确认后调用。
+     * 同一渠道、同一模型测试中时不重复发送；3 分钟没有结果按超时失败。
+     */
+    testOpenAICompatibleThinking(configId: string, modelIdInput: string): void {
+      const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === configId);
+      const modelId = modelIdInput.trim();
+      if (!config || config.provider !== 'openai-compatible' || !modelId) return;
+      const key = thinkingProbeKey(config.id, modelId);
+      if (this.thinkingProbes[key]?.status === 'running') return;
+      let requestId: string;
+      try {
+        requestId = bridge.request(BridgeMessageType.LlmProviderModelsGet, {
+          config: { ...toPlainProviderConfig(config), model: modelId },
+          probeThinking: true
+        });
+      } catch (error) {
+        this.setThinkingProbe({ configId: config.id, modelId, status: 'failed', requestId: '',
+          message: `测试思考参数失败：请求没有发出去（${messageFromError(error)}）` });
+        return;
+      }
+      this.setThinkingProbe({ configId: config.id, modelId, status: 'running', requestId });
+      this.status = `正在测试「${modelId}」的思考参数（最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求）…`;
+      clearThinkingProbeTimer(key);
+      thinkingProbeTimers.set(key, window.setTimeout(() => {
+        thinkingProbeTimers.delete(key);
+        const current = this.thinkingProbes[key];
+        if (current?.status !== 'running' || current.requestId !== requestId) return;
+        this.setThinkingProbe({ ...current, status: 'failed',
+          message: '测试思考参数失败：3 分钟内没有结果，请检查接口地址、API 密钥或网络代理设置。' });
+      }, THINKING_PROBE_TIMEOUT_MS));
+    },
+    /** 写入测试状态；失败时同时显示在状态栏。 */
+    setThinkingProbe(next: OpenAICompatibleThinkingProbeState | { configId: string; modelId: string; clear: true }): void {
+      const key = thinkingProbeKey(next.configId, next.modelId);
+      const probes = { ...this.thinkingProbes };
+      if ('clear' in next) delete probes[key];
+      else probes[key] = next;
+      this.thinkingProbes = probes;
+      if (!('clear' in next) && next.status === 'failed' && next.message) {
+        clearThinkingProbeTimer(key);
+        this.status = next.message;
+      }
+    },
+    /** 后端对某次测试的报错：按请求 id 认出，认出时返回 true（不再当成获取 LLM 列表失败）。 */
+    rejectThinkingProbe(correlationId: string | undefined, message: string): boolean {
+      if (!correlationId) return false;
+      const current = Object.values(this.thinkingProbes).find((probe) => probe.requestId === correlationId);
+      if (!current) return false;
+      this.setThinkingProbe({ ...current, status: 'failed', message: `测试思考参数失败：${message}` });
+      return true;
+    },
+    /** 测试结果：核对渠道和接口地址没变、模型还在，写进这个模型的 capabilitySnapshot 并保存。 */
+    applyThinkingProbeResult(payload: LlmProviderModelsSnapshotPayload): void {
+      const record = payload.models[0];
+      const evidence = normalizeModelCapabilitySnapshot(record?.capabilitySnapshot);
+      const modelId = evidence?.modelId ?? record?.id?.trim() ?? '';
+      const key = thinkingProbeKey(payload.configId, modelId);
+      clearThinkingProbeTimer(key);
+      const current = this.thinkingProbes[key];
+      const fail = (message: string) => this.setThinkingProbe({
+        configId: payload.configId, modelId, status: 'failed', requestId: current?.requestId ?? '', message: `测试思考参数失败：${message}`
+      });
+      const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === payload.configId);
+      if (!config) { this.setThinkingProbe({ configId: payload.configId, modelId, clear: true }); return; }
+      if (!evidence) { fail('没有返回测试结果。'); return; }
+      if (config.provider !== payload.provider || config.baseUrl.trim() !== payload.baseUrl.trim()) {
+        fail('测试期间接口地址改了，这次结果作废，请重新测试。');
+        return;
+      }
+      const model = config.models.find((candidate) => candidate.id === evidence.modelId);
+      if (!model) { fail('这个模型已从 LLM 列表移除，结果没有保存。'); return; }
+      model.capabilitySnapshot = evidence;
+      config.updatedAt = Date.now();
+      this.setThinkingProbe({ configId: payload.configId, modelId, clear: true });
+      this.saveLlmProviderConfigs();
+      this.status = `「${model.name || model.id}」测试完成：${describeOpenAICompatibleThinkingProbe(evidence)}`;
+    },
     closeFetchedModelsDialog(): void {
       this.fetchedModelsDialog = emptyFetchedModelsDialog();
     },
@@ -2152,9 +2260,14 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         return;
       }
       const selectedIds = new Set(selected.map((model) => model.id));
+      const previous = new Map(config.models.map((model) => [model.id, model.capabilitySnapshot]));
       config.models = sanitizeModels([
         ...config.models.filter((model) => !selectedIds.has(model.id)),
-        ...selected
+        // 重新添加同名模型时保留原来的能力证据（例如“测试这个模型”的结果）；测试证据优先于列表自带的信息。
+        ...selected.map((model) => {
+          const kept = previous.get(model.id);
+          return kept && (kept.source === 'verified_probe' || !model.capabilitySnapshot) ? { ...model, capabilitySnapshot: kept } : model;
+        })
       ]);
       if (!config.model) config.model = selected[0]?.id ?? '';
       config.updatedAt = Date.now();
@@ -2485,6 +2598,11 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       else this.clearPendingSettingSection(section);
     },
     applyLlmProviderModelsSnapshot(payload: LlmProviderModelsSnapshotPayload): void {
+      // 测试结果与获取 LLM 列表互不影响：不清获取超时，也不动获取弹窗。
+      if (payload.purpose === 'thinking_probe') {
+        this.applyThinkingProbeResult(payload);
+        return;
+      }
       clearModelFetchTimeout();
       const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === payload.configId);
       if (!config) return;
@@ -2508,6 +2626,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.status = models.length ? `已获取 ${models.length} 个 LLM，请选择要添加的 LLM` : '没有获取到 LLM';
     },
     setError(message: string, options: GlobalSettingsErrorOptions = {}): void {
+      if (options.requestType === BridgeMessageType.LlmProviderModelsGet && this.rejectThinkingProbe(options.correlationId, message)) return;
       clearModelFetchTimeout();
       if (options.requestType === BridgeMessageType.LlmProviderModelsGet) {
         this.closeFetchedModelsDialog();

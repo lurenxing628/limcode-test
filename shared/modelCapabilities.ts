@@ -262,6 +262,19 @@ function probedOpenAICompatibleThinking(
 }
 
 /**
+ * 设置界面显示的“测试这个模型”结果：身份匹配（渠道 ID、模型、接口地址）的 verified_probe 证据；
+ * 换了任何一项都返回 undefined（结果失效，需要重新测试）。有手动写法时证据仍在，只是发送时不采用。
+ */
+export function openAICompatibleThinkingProbeEvidence(
+  provider: ProviderCapabilityConfig,
+  modelId: string
+): ModelCapabilitySnapshot | undefined {
+  if (provider.provider !== 'openai-compatible') return undefined;
+  const evidence = boundCapabilityEvidence(provider, modelId.trim());
+  return evidence?.source === 'verified_probe' ? evidence : undefined;
+}
+
+/**
  * 按渠道配置解析 OpenAI 兼容方言，请求改写、会话思考强度、能力表与设置界面共用：
  * 手动写法（模型级优先）→ 身份匹配的测试结果 → 按接口地址 / 模型 ID 自动识别。
  * `options.manual`：不传时读配置里的手动写法；`null` 表示忽略手动写法（设置界面“自动识别”一项的说明）。
