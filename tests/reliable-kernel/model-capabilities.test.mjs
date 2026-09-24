@@ -351,3 +351,19 @@ test('渠道参数编辑器：deepseek_toggle 不按能力过滤思考强度，�
   const source = readFileSync(new URL('../../webview/src/components/settings/global/parameters/LlmParameterSettings.vue', import.meta.url), 'utf8');
   assert.match(source, /reasoning\.family !== 'deepseek_toggle'/);
 });
+
+test('渠道请求体自己写了思考参数时，摘要请求仍按方言改写，并去掉会改变思考的键', async () => {
+  const deepseek = await summaryWire(COMPAT.deepseek, 'deepseek-v4-pro', 'balanced', { requestBody: { thinking: { type: 'disabled' }, thinking_budget: 64 } });
+  assert.deepEqual(deepseek.thinking, { type: 'enabled' });
+  assert.equal(deepseek.reasoning_effort, 'high');
+  assert.equal('thinking_budget' in deepseek, false);
+  const qwen = await summaryWire(COMPAT.dashscope, 'qwen3-max', 'disabled', {
+    requestBody: { enable_thinking: true, chat_template_kwargs: { enable_thinking: true } } });
+  assert.equal(qwen.enable_thinking, false);
+  assert.equal('reasoning_effort' in qwen, false);
+  assert.equal('chat_template_kwargs' in qwen, false);
+  const plan = { intent: 'provider_default', status: 'provider_default', description: '' };
+  assert.deepEqual(summaryRequestBody({ chat_template_kwargs: { thinking: true } }, plan), {});
+  assert.deepEqual(summaryRequestBody({ chat_template_kwargs: { enable_thinking: false, custom_template_flag: 1 } }, plan),
+    { chat_template_kwargs: { custom_template_flag: 1 } }, '与思考无关的模板参数保留');
+});

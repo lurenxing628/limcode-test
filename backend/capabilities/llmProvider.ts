@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import { discoverAnthropicModels } from './modelCapabilityDiscovery';
 import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
 import { anthropicModelReasoningCapability, resolveProviderModelCapabilities } from '../../shared/modelCapabilities';
-import { frozenSummaryReasoning, summaryRequestBody } from './summaryReasoning';
+import { frozenSummaryReasoning, summaryConfiguredRequestBody, summaryRequestBody } from './summaryReasoning';
 import { associateDebugCapture, captureDebug, debugCaptureSources, debugSource, DebugHttpObservation, getDebugCaptureContext, type DebugCaptureRecorder } from '../reliableKernel/debugCapture/observer';
 import {
   groupAtomicMessageContents,
@@ -3690,9 +3690,11 @@ async function resolveSummaryProvider(
     request.contents,
     mergeHeaders(await resolveMaybe(options.headers), settings.headers)
   );
-  const requestBody = summaryRequestBody(
-    requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId), reasoningPlan
-  );
+  const configuredRequestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
+  const requestBody = summaryRequestBody(configuredRequestBody, reasoningPlan);
+  // 请求改写按摘要实际带上的渠道请求体判断用户是否自己写了思考参数（那些键已被去掉），
+  // 不能看渠道原始请求体，否则摘要推理计划的 reasoning_effort 会不经改写直接发出。
+  const adaptationSettings = { ...runtimeSettings, requestBody: summaryConfiguredRequestBody(configuredRequestBody) };
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: libraryProviderKind(runtimeSettings),
     model: runtimeSettings.model,
@@ -3705,7 +3707,7 @@ async function resolveSummaryProvider(
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders), runtimeSettings.provider, runtimeSettings.model), runtimeSettings);
+  }, registry.llmProviders), runtimeSettings.provider, runtimeSettings.model), adaptationSettings);
   return {
     provider,
     settings,
