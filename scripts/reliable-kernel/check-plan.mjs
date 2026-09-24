@@ -195,7 +195,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/reliable-queue-ordering.test.mjs',
   'webview/tests/segmentedTimeline.test.ts',
   'webview/tests/forkRequestLifecycle.test.ts',
-  'webview/tests/summaryRebuildPreview.test.ts'
+  'webview/tests/summaryRebuildPreview.test.ts',
+  'webview/tests/compressionTokenChange.test.ts'
 ]);
 
 const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([

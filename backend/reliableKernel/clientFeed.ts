@@ -53,6 +53,7 @@ import {
   type ContentObjectMetadata
 } from './contentAddressedStore';
 import type { RuntimeChange, RuntimeCommitResult } from './contracts';
+import { compressionResultSizeCounted } from './contextTokenEstimator';
 import { requirePhaseFId, requirePhaseFText } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -1649,7 +1650,8 @@ export class ClientDetailReader {
       methodKind: requireCompressionMethodKind(summary.methodKind),
       ...(triggerReason ? { triggerReason } : {}),
       ...(triggerTokenSource ? { triggerTokenSource } : {}),
-      ...compressionPresentationTokens(summary)
+      ...compressionPresentationTokens(summary),
+      ...(compressionResultSizeCounted(summary) ? {} : { resultSizeUncounted: true })
     })), 'utf8');
   }
 

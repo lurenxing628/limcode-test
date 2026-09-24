@@ -150,6 +150,7 @@ docs/architecture/*
 !/webview/tests/forkRequestLifecycle.test.ts
 !/webview/tests/reliableCollaborationTimeline.test.ts
 !/webview/tests/summaryRebuildPreview.test.ts
+!/webview/tests/compressionTokenChange.test.ts
 /scripts/reliable-kernel/concurrency-read-*.json
 /scripts/reliable-kernel/concurrency-tuning-*.json
 /scripts/reliable-kernel/model-independent-hotpaths-after.json

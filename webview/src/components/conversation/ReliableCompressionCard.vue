@@ -14,6 +14,7 @@ import {
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import { formatTokenNumber } from './tokenUsageModel';
+import { compressionTokenChange } from './compressionTokenChange';
 
 const props = defineProps<{
   block: Record<string, unknown>;
@@ -98,14 +99,17 @@ const afterTokens = computed(() => firstToken(
   presentation.value.estimatedTokensAfter,
   envelope.value.estimatedTokensAfter
 ));
+const resultSizeUncounted = computed(() => presentation.value.resultSizeUncounted === true);
 // Saving compares context with context (same estimator); the full-request estimate also counts the
-// system prompt and tool definitions, which compression never removes. Older blocks have no context figure.
-// Negative when the Context grew — e.g. a summary rebuilt from raw records came out longer than the one it
-// replaced; that is reported as an increase instead of being clamped to “节省约 0 Token”.
-const tokenChange = computed(() => {
-  const before = contextBeforeTokens.value ?? beforeTokens.value;
-  return before !== undefined && afterTokens.value !== undefined ? before - afterTokens.value : undefined;
-});
+// system prompt and tool definitions, which compression never removes, so older blocks without a
+// context figure show no saving. Negative when the Context grew — e.g. a summary rebuilt from raw
+// records came out longer than the one it replaced; that is reported as an increase instead of being
+// clamped to “节省约 0 Token”.
+const tokenChange = computed(() => compressionTokenChange({
+  ...(contextBeforeTokens.value === undefined ? {} : { contextTokensBefore: contextBeforeTokens.value }),
+  ...(afterTokens.value === undefined ? {} : { estimatedTokensAfter: afterTokens.value }),
+  resultSizeUncounted: resultSizeUncounted.value
+}));
 const triggerReason = computed(() =>
   stringValue(props.block.trigger_reason ?? props.block.triggerReason)
   || presentation.value.triggerReason
@@ -157,7 +161,12 @@ const diagnosticRows = computed(() => [
   { label: '触发时完整请求估算', value: tokenLabel(beforeTokens.value) },
   { label: '触发时请求构成', value: beforeTokens.value === undefined ? '' : envelope.value.requestBreakdownLabel ?? '' },
   { label: '压缩前上下文估算', value: tokenLabel(contextBeforeTokens.value) },
-  { label: '压缩后上下文估算', value: tokenLabel(afterTokens.value) },
+  {
+    label: '压缩后上下文估算',
+    value: afterTokens.value !== undefined && resultSizeUncounted.value
+      ? `${tokenLabel(afterTokens.value)}（没有算入服务商加密的压缩结果，实际更大）`
+      : tokenLabel(afterTokens.value)
+  },
   { label: '压缩 Provider 实际输入', value: tokenLabel(providerInputTokens.value) },
   { label: '压缩 Provider 实际输出', value: tokenLabel(providerOutputTokens.value) },
   { label: '保留附件目录', value: envelope.value.attachmentCount === undefined ? '' : `${envelope.value.attachmentCount} 项（无正文）` }
@@ -269,6 +278,7 @@ function parsePresentation(text: string): CompressionDiagnosticData & {
   title?: string;
   trigger?: string;
   methodKind?: string;
+  resultSizeUncounted?: boolean;
 } {
   if (!text.trim()) return {};
   try {
@@ -278,6 +288,7 @@ function parsePresentation(text: string): CompressionDiagnosticData & {
       ...(stringValue(record.title) ? { title: stringValue(record.title) } : {}),
       ...(stringValue(record.trigger) ? { trigger: stringValue(record.trigger) } : {}),
       ...(stringValue(record.methodKind) ? { methodKind: stringValue(record.methodKind) } : {}),
+      ...(record.resultSizeUncounted === true ? { resultSizeUncounted: true } : {}),
       ...parseDiagnosticFields(record)
     };
   } catch {

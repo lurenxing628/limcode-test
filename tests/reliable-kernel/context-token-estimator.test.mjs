@@ -762,3 +762,22 @@ test('当前扩展替换命令等待process真实终态，其他命令保持请�
     1_000
   );
 });
+
+test('压缩块的压缩后估算是否计入了密文：旧OpenAI原生记录与缺少输出token的记录判为未计入', () => {
+  const compaction = [{ role: 'model', parts: [{ providerContext: { format: 'openai-responses', itemType: 'compaction',
+    rawItem: { type: 'compaction', encrypted_content: 'ciphertext' } } }] }];
+  const measured = kernel.estimateMessageContentsTokens(compaction);
+  const envelope = (fields) => ({ kind: 'compression_contents', version: 1, contents: compaction, ...fields });
+  // 9448944e 之前：密文按 0 计，压缩后估算只含可读部分。
+  assert.equal(kernel.compressionResultSizeCounted(envelope({ estimatedTokens: measured, providerOutputTokens: 900 })), false);
+  // 网关没有返回 usage：密文大小无从得知。
+  assert.equal(kernel.compressionResultSizeCounted(envelope({ estimatedTokens: measured })), false);
+  // 现在的记录：密文按服务商输出计入。
+  assert.equal(kernel.compressionResultSizeCounted(envelope({
+    estimatedTokens: measured + 450, providerOutputTokens: 900, providerCalibrationRatio: 2
+  })), true);
+  // 可读的文本摘要总是计入。
+  assert.equal(kernel.compressionResultSizeCounted({
+    kind: 'compression_contents', version: 1, contents: [{ role: 'user', parts: [{ text: '[Context Summary]\n目标' }] }]
+  }), true);
+});

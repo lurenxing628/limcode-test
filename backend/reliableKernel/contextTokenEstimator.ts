@@ -425,6 +425,19 @@ function compressionEnvelopeResultTokens(envelope: Record<string, unknown>): num
 }
 
 /**
+ * Whether a stored compression's after-figure counts its whole result. An OpenAI compaction item is
+ * ciphertext sized by the Provider's output count; blocks stored before that was counted, or without
+ * any usage from the gateway, recorded it as 0 and would show an inflated saving.
+ */
+export function compressionResultSizeCounted(envelope: Record<string, unknown>): boolean {
+  const contents = Array.isArray(envelope.contents) ? envelope.contents.filter(isMessageContent) : [];
+  if (!hasOpaqueProviderCompaction(contents)) return true;
+  const stored = optionalTokenCount(envelope.estimatedTokens);
+  if (stored === undefined || optionalTokenCount(envelope.providerOutputTokens) === undefined) return false;
+  return stored >= compressionEnvelopeResultTokens(envelope);
+}
+
+/**
  * True when the Context opens with an OpenAI compaction item whose size nobody reported: its
  * ciphertext is invisible to the estimator and the gateway returned no output count, so any Context
  * total that includes it is only a lower bound.

@@ -78,8 +78,12 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
     'expanded thought Markdown must not smooth the already-smoothed preview stream a second time');
   assert.match(thoughtView, /preserve-soft-breaks/);
   const compressionCard = source('webview/src/components/conversation/ReliableCompressionCard.vue');
-  assert.match(compressionCard, /const before = contextBeforeTokens\.value \?\? beforeTokens\.value;/,
-    'the saving compares Context with Context, never the full request (system + tools) with the Context');
+  assert.match(compressionCard, /const tokenChange = computed\(\(\) => compressionTokenChange\(\{/,
+    'the saving comes from the shared Context-against-Context rule');
+  assert.doesNotMatch(compressionCard, /contextBeforeTokens\.value \?\? beforeTokens\.value/,
+    'an older record without a Context figure shows no saving instead of the full request (system + tools) minus the Context');
+  assert.match(compressionCard, /resultSizeUncounted: resultSizeUncounted\.value/,
+    'a record whose after-figure left the ciphertext summary out shows no saving');
   assert.match(compressionCard, /const beforeTokens = computed\(\(\) => positiveToken\(/,
     'a legacy 0 full-request figure from manual compression must not be shown or subtracted');
   assert.doesNotMatch(compressionCard, /Math\.max\(0, before - afterTokens\.value\)/,

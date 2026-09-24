@@ -338,7 +338,11 @@ test('a ciphertext compaction without an output count has an unknown size, so a 
       summary: [{ role: 'model', parts: [{ providerContext: {
         format: 'openai-responses', itemType: 'compaction',
         rawItem: { type: 'compaction', id: 'cmp_unsized', encrypted_content: 'gAAAA-ciphertext' }
-      } }] }]
+      } }] }],
+      summaryMetadata: {
+        trigger: 'auto', methodKind: 'provider_native',
+        contextTokensBefore: 900, estimatedTokensAfter: 30, estimatedTokens: 0
+      }
     });
     await appendMessage(app, seeded, 'source', 'assistant', 'small-source');
     await appendMessage(app, seeded, 'tail', 'user', 'protected-tail');
@@ -355,7 +359,19 @@ test('a ciphertext compaction without an output count has an unknown size, so a 
     // Before: the ciphertext measured 0 tokens, every text summary looked larger, and the paid summary
     // was thrown away as non_reducing on every attempt.
     assert.equal(result.status, 'compressed', JSON.stringify(result));
-    const metadata = await compressionMetadata(app, seeded.conversationId);
-    assert.equal(metadata.contextTokensBefore, undefined, 'an unknown Context size is not recorded as a before figure');
+    const blocks = await list(app, 'CompressionBlock', { conversation_id: seeded.conversationId });
+    const presentations = new Map();
+    const reader = new kernel.ClientDetailReader(app.database, app.contentStore);
+    for (const block of blocks) {
+      const [object] = await list(app, 'ContentObject', { id: block.summary_object_id });
+      const stored = JSON.parse((await app.contentStore.read(object)).toString('utf8'));
+      const detail = await reader.read({ kind: 'compression-presentation', recordId: block.id, offset: 0, maxBytes: 64 * 1024 });
+      presentations.set(stored.methodKind, { stored, presentation: JSON.parse(Buffer.from(detail.chunk, 'base64').toString('utf8')) });
+    }
+    const text = presentations.get('llm_summary');
+    assert.equal(text.stored.contextTokensBefore, undefined, 'an unknown Context size is not recorded as a before figure');
+    assert.equal(text.presentation.resultSizeUncounted, undefined);
+    // The card shows no saving for the ciphertext block: its after-figure counted the ciphertext as 0.
+    assert.equal(presentations.get('provider_native').presentation.resultSizeUncounted, true);
   });
 });
