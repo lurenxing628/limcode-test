@@ -36,7 +36,7 @@ import { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigu
 import type { PlainJsonValue } from '../../reliableKernel/plainJson';
 import { resolveFrozenWorkEnvironmentBoundary } from '../../reliableKernel/workEnvironmentBoundary';
 import { frozenSkillPolicy } from '../../reliableKernel/frozenAuthority';
-import { skillCatalogWithinPolicy } from '../../world/modules/skill/policy';
+import { lazySkillCatalogWithinPolicy } from '../../world/modules/skill/policy';
 import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 
 export interface VscodeReliableToolHostOptions {
@@ -176,7 +176,8 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       command: this.commandDeclaration,
       workEnvironment: this.workEnvironment,
       // A skill the Turn's frozen policy turns off (for a child, also off in its parent) cannot be loaded.
-      skills: skillCatalogWithinPolicy(this.skills, frozenSkillPolicy(authority.document)),
+      // The settings are parsed only when a skill is looked up, so `read` of an ordinary file never depends on them.
+      skills: lazySkillCatalogWithinPolicy(this.skills, () => frozenSkillPolicy(authority.document)),
       ...(this.options.resolveAttachmentReference ? {
         attachments: {
           reference: this.options.resolveAttachmentReference,

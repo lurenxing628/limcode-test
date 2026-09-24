@@ -203,6 +203,25 @@ test('a skill name without a source loads the highest-priority candidate the fro
   await assert.rejects(allOff.readBody('foo'), /未找到技能：foo/);
 });
 
+test('read does not parse the frozen skill settings; loading a skill still does', async () => {
+  const { VscodeReliableToolHost } = dist('backend/application/reliableKernel/VscodeReliableToolHost.js');
+  const skill = { id: 'skill:agents:review', slug: 'review', name: 'review', source: 'agents', path: '/skills/review/SKILL.md' };
+  const host = {
+    async resolveEnvironments() { return { allowed: [] }; },
+    async loadAttachmentMaxBytes() { return 1024; },
+    fs: {}, commandDeclaration: {}, workEnvironment: {}, options: {},
+    skills: { list: () => [skill], get: () => skill, async readBody() { return 'body'; }, async refresh() {} }
+  };
+  // A hand-edited, malformed skill setting in the Turn's frozen authority.
+  const authority = { snapshotId: 'snapshot', document: { conversationId: 'conversation', model: {}, skillPolicy: { sourceConfigs: 'broken' } } };
+  const run = (name, execute) => VscodeReliableToolHost.prototype.executeNoEffect.call(host,
+    { execution: 'runtime', declaration: { name }, execute },
+    { turnId: 'turn', modelRequestId: 'request', toolCallId: `${name}-call`, toolName: name, arguments: { path: 'a.txt' } },
+    authority, () => {}, new AbortController().signal);
+  assert.equal(await run('read', async () => 'file contents'), 'file contents', 'reading an ordinary file never touches skills');
+  await assert.rejects(run('skills', async (_args, deps) => deps.skills.get('review')), /skillPolicy\.sourceConfigs must be an object/);
+});
+
 test('VscodeConfigurationAuthority compiles a child Turn within its parent Turn and leaves top-level Turns unchanged', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-child-tool-boundary-compile-'));
   try {

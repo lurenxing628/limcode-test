@@ -46,3 +46,21 @@ export function skillCatalogWithinPolicy(
   };
 }
 
+/**
+ * The same bounded catalog, reading the Turn's frozen skill settings only when a skill is actually
+ * looked up. A tool that never touches skills (`read` of an ordinary file) is then unaffected by a
+ * malformed skill setting.
+ */
+export function lazySkillCatalogWithinPolicy(
+  catalog: SkillCatalogCapability,
+  readPolicy: () => Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined
+): SkillCatalogCapability {
+  let bounded: SkillCatalogCapability | undefined;
+  const resolve = () => bounded ??= skillCatalogWithinPolicy(catalog, readPolicy());
+  return {
+    list: () => resolve().list(),
+    get: (name, source) => resolve().get(name, source),
+    readBody: (name, source) => resolve().readBody(name, source),
+    refresh: () => catalog.refresh()
+  };
+}
