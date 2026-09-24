@@ -74,17 +74,32 @@ export interface OpenAICompatibleProbedThinking {
 
 const DEEPSEEK_STYLE_EFFORTS: readonly LlmThinkingLevel[] = ['low', 'high', 'max'];
 
-const MODEL_RULES: ReadonlyArray<{ pattern: RegExp; rule: OpenAICompatibleModelThinkingRule }> = [
+const GLM_TOGGLE: OpenAICompatibleModelThinkingRule = { family: 'glm', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: false };
+const QWEN_HYBRID: OpenAICompatibleModelThinkingRule = { family: 'qwen', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: false };
+const QWEN_THINKING_ONLY: OpenAICompatibleModelThinkingRule = { ...QWEN_HYBRID, canDisable: false };
+
+/** 按顺序匹配；`rule: null` 表示认得出、但不思考（不发思考参数、不给档位）的模型。 */
+const MODEL_RULES: ReadonlyArray<{ pattern: RegExp; rule: OpenAICompatibleModelThinkingRule | null }> = [
   { pattern: /^deepseek/, rule: { family: 'deepseek', toggle: true, canDisable: true, efforts: DEEPSEEK_STYLE_EFFORTS, requiresReasoningReplay: true } },
   { pattern: /^mimo/, rule: { family: 'mimo', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: true } },
   { pattern: /^kimi-k3/, rule: { family: 'kimi', toggle: false, canDisable: false, efforts: DEEPSEEK_STYLE_EFFORTS, requiresReasoningReplay: false } },
   { pattern: /^kimi-k2-7-code/, rule: { family: 'kimi', toggle: true, canDisable: false, efforts: [], requiresReasoningReplay: false } },
   { pattern: /^kimi-/, rule: { family: 'kimi', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: false } },
-  { pattern: /^glm-5-3/, rule: { family: 'glm', toggle: true, canDisable: false, efforts: DEEPSEEK_STYLE_EFFORTS, requiresReasoningReplay: false } },
-  { pattern: /^glm-5-2/, rule: { family: 'glm', toggle: true, canDisable: true, efforts: DEEPSEEK_STYLE_EFFORTS, requiresReasoningReplay: false } },
-  { pattern: /^glm-/, rule: { family: 'glm', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: false } },
+  // 智谱（docs.bigmodel.cn 对话补全）：GLM-5.3 只接受 low / high / max 且关不掉；GLM-5.2 的 low、medium 映射为 high
+  // （火山方舟同样）；thinking 参数只有 GLM-4.5 及以上支持。方舟的模型 ID 带日期（glm-5-2-260617、glm-5-260117），
+  // 所以版本号后面必须是连字符或结尾，glm-5-2601xx 这种带日期的 GLM-5 不能认成 5.2。
+  { pattern: /^glm-5-3(?:$|-)/, rule: { ...GLM_TOGGLE, canDisable: false, efforts: DEEPSEEK_STYLE_EFFORTS } },
+  { pattern: /^glm-5-2(?:$|-)/, rule: { ...GLM_TOGGLE, efforts: ['high', 'max'] } },
+  { pattern: /^glm-(?:4-[5-9](?:$|[-v])|[5-9](?:$|-))/, rule: GLM_TOGGLE },
+  { pattern: /^glm-/, rule: null },
   { pattern: /^(?:hunyuan|hy\d)/, rule: { family: 'hunyuan', toggle: true, canDisable: true, efforts: ['low', 'high'], requiresReasoningReplay: false } },
-  { pattern: /^qwen/, rule: { family: 'qwen', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: false } },
+  // Qwen：Qwen3 起是混合思考（qwen-plus / turbo / flash 已是 Qwen3）；instruct、coder 型号不思考，thinking 型号与 QwQ 只能思考；
+  // qwen-max、Qwen2.5 等更早的型号不思考。
+  { pattern: /^qwen3-(?:.+-)?(?:instruct|coder)(?:$|-)/, rule: null },
+  { pattern: /^qwen3-(?:.+-)?thinking(?:$|-)/, rule: QWEN_THINKING_ONLY },
+  { pattern: /^(?:qwen3|qwen-(?:plus|turbo|flash))(?:$|-)/, rule: QWEN_HYBRID },
+  { pattern: /^qwq/, rule: QWEN_THINKING_ONLY },
+  { pattern: /^qwen/, rule: null },
   { pattern: /^ernie/, rule: { family: 'ernie', toggle: true, canDisable: true, efforts: [], requiresReasoningReplay: false } }
 ];
 
@@ -100,9 +115,13 @@ export function normalizedOpenAICompatibleModelName(model: string): string {
   return last.replace(/\./g, '-');
 }
 
-export function openAICompatibleModelThinkingRule(model: string): OpenAICompatibleModelThinkingRule | undefined {
+function modelRuleEntry(model: string): { rule: OpenAICompatibleModelThinkingRule | null } | undefined {
   const name = normalizedOpenAICompatibleModelName(model);
-  return MODEL_RULES.find((entry) => entry.pattern.test(name))?.rule;
+  return MODEL_RULES.find((entry) => entry.pattern.test(name));
+}
+
+export function openAICompatibleModelThinkingRule(model: string): OpenAICompatibleModelThinkingRule | undefined {
+  return modelRuleEntry(model)?.rule ?? undefined;
 }
 
 export function openAICompatiblePlatform(baseUrl: string): OpenAICompatiblePlatform {
@@ -149,10 +168,11 @@ export function resolveOpenAICompatibleDialect(
   probed?: OpenAICompatibleProbedThinking
 ): OpenAICompatibleDialect {
   const platform = openAICompatiblePlatform(baseUrl);
-  const modelRule = openAICompatibleModelThinkingRule(model);
+  const entry = modelRuleEntry(model);
+  const modelRule = entry?.rule ?? undefined;
   const useProbe = !manual && probed !== undefined;
   const rule = useProbe ? probedRule(probed, modelRule) : modelRule;
-  const automatic = automaticFormat(platform, modelRule);
+  const automatic = automaticFormat(platform, modelRule, entry?.rule === null);
   const format = manual ?? (useProbe ? probed.format : automatic.format);
   const source = manual ? 'manual' : useProbe ? 'probe' : automatic.source;
   return {
@@ -182,8 +202,11 @@ function probedRule(
 
 function automaticFormat(
   platform: OpenAICompatiblePlatform,
-  rule: OpenAICompatibleModelThinkingRule | undefined
+  rule: OpenAICompatibleModelThinkingRule | undefined,
+  nonThinking: boolean
 ): { format: OpenAICompatibleThinkingFormat; source: OpenAICompatibleDialect['source'] } {
+  // 认得出、但不思考的模型（GLM-4.5 以下、qwen-max 等）：不发思考参数。OpenRouter 和本机服务仍按它们自己的写法。
+  if (nonThinking && platform !== 'openrouter' && platform !== 'local') return { format: 'omit', source: 'model' };
   switch (platform) {
     // 平台写法只用于登记了规则的模型：平台上认不出的模型（例如腾讯 TokenHub 的 minimax-m3 传
     // thinking.type enabled 会返回 400）按 OpenAI 写法，只在设置了强度时发 reasoning_effort。

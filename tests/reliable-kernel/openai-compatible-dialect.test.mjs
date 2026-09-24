@@ -13,6 +13,7 @@ const {
   mapOpenAICompatibleEffort,
   normalizedOpenAICompatibleModelName,
   openAICompatibleEffortValues,
+  openAICompatibleModelThinkingRule,
   openAICompatiblePlatform,
   openAICompatibleThinkingLevels,
   resolveOpenAICompatibleDialect,
@@ -426,4 +427,35 @@ test('平台写法只用于有规则的模型；旧混元平台不归入腾讯 T
   assert.deepEqual([legacy.format, legacy.source], ['omit', 'platform']);
   assert.deepEqual(thinkingParams(await wire(HUNYUAN_LEGACY, 'hunyuan-t1', { level: 'high' })), {});
   assert.match(describeOpenAICompatibleDialect(minimax), /腾讯 TokenHub.*没有登记思考参数规则/);
+});
+
+const ARK = 'https://ark.cn-beijing.volces.com/api/v3';
+
+test('模型规则：GLM-5.2 不给 low，方舟带日期的 GLM-5 不误认成 5.2，GLM-4.5 以下与不思考的 qwen 不发思考参数', async () => {
+  // 智谱、方舟官方：GLM-5.2 的 low / medium 映射为 high。
+  assert.deepEqual(openAICompatibleModelThinkingRule('glm-5.2').efforts, ['high', 'max']);
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'glm-5.2', undefined, undefined, settings(ZHIPU, 'glm-5.2')).values, ['none', 'high', 'max']);
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-5.2', { level: 'low' })), { thinking: { type: 'enabled' }, reasoning_effort: 'high' });
+  assert.deepEqual(openAICompatibleModelThinkingRule('glm-5-2-260617').efforts, ['high', 'max']);
+  assert.deepEqual(openAICompatibleModelThinkingRule('glm-5-260117').efforts, [], '方舟带日期的 GLM-5');
+  assert.equal(openAICompatibleModelThinkingRule('glm-5-3-flash-260828').canDisable, false);
+  // 智谱：thinking 参数只有 GLM-4.5 及以上支持。
+  for (const model of ['glm-4-plus', 'glm-4-flash-250414', 'glm-4v-plus', 'glm-4-9b-chat', 'glm-4-0520', 'glm-4-airx']) {
+    assert.equal(openAICompatibleModelThinkingRule(model), undefined, model);
+  }
+  for (const model of ['glm-4.5', 'glm-4.5-air', 'glm-4.5v', 'glm-4.6', 'glm-4.7-flash', 'glm-5', 'glm-5.1']) {
+    assert.ok(openAICompatibleModelThinkingRule(model), model);
+  }
+  for (const model of ['qwen-max', 'qwen2.5-72b-instruct', 'qwen3-coder-plus', 'qwen3-235b-a22b-instruct-2507', 'qwen-vl-max', 'qwen-long']) {
+    assert.equal(openAICompatibleModelThinkingRule(model), undefined, model);
+  }
+  for (const model of ['qwen3-max', 'qwen-plus', 'qwen3-235b-a22b', 'qwen3.5-plus']) assert.equal(openAICompatibleModelThinkingRule(model)?.canDisable, true, model);
+  for (const model of ['qwq-plus', 'qwen3-235b-a22b-thinking-2507']) assert.equal(openAICompatibleModelThinkingRule(model)?.canDisable, false, model);
+  // 认得出的不思考模型：不发思考参数、不给会话档位（OpenRouter 仍按它自己的写法）。
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-4-plus', { level: 'high' })), {});
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'glm-4-flash', { level: 'high' })), {});
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen-max', { level: 'high' })), {});
+  assert.equal(sessionThinkingCapability('openai-compatible', 'qwen-max', undefined, { thinkingLevel: 'high' }, settings(DASHSCOPE, 'qwen-max')), undefined);
+  assert.deepEqual(thinkingParams(await wire(OPENROUTER, 'z-ai/glm-4-plus', { level: 'high' })), { reasoning_effort: 'high' });
+  assert.equal(resolveOpenAICompatibleDialect(ARK, 'glm-5-260117').format, 'deepseek');
 });

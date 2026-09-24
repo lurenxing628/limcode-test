@@ -44,6 +44,10 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     }
     return configuredEffort(provider, configuredThinking);
   }
+  // OpenAI 兼容渠道按有效规则不发送思考参数时（手动“不发送”、认得出的不思考模型、旧混元接口），没有可选强度。
+  const compatibleDialect = provider === 'openai-compatible' && providerConfig
+    ? resolveProviderOpenAICompatibleDialect(providerConfig, modelId) : undefined;
+  if (compatibleDialect?.format === 'omit') return undefined;
   if (provider === 'openai-compatible' || provider === 'openai-responses') {
     if (/^o[134](?:-|$)/.test(model) && !/^o1-(?:mini|preview)/.test(model)) return { kind: 'openai-effort', values: ['low', 'medium', 'high'] };
     if (/^gpt-5(?:-mini|-nano)?(?:-\d{4}-\d{2}-\d{2})?$/.test(model)) return { kind: 'openai-effort', values: ['minimal', 'low', 'medium', 'high'] };
@@ -57,9 +61,8 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     // DeepSeek 写法或 enable_thinking 写法的模型：按有效规则（手动写法 → 测试结果 → 平台 / 模型 ID）给档位，
     // 与请求改写（backend/capabilities/openAICompatibleDialectAdaptation.ts）和能力表共用同一份规则。
     // 没有渠道配置时只能按模型规则。kind 沿用 'deepseek-effort'（原 DeepSeek 渠道）。
-    const dialect = providerConfig
-      ? resolveProviderOpenAICompatibleDialect(providerConfig, modelId)
-      : openAICompatibleModelThinkingRule(model) ? resolveOpenAICompatibleDialect('', model, 'deepseek') : undefined;
+    const dialect = compatibleDialect
+      ?? (openAICompatibleModelThinkingRule(model) ? resolveOpenAICompatibleDialect('', model, 'deepseek') : undefined);
     const thinking = dialect ? openAICompatibleThinkingLevels(dialect) : undefined;
     if (thinking) return { kind: 'deepseek-effort', values: thinking.canDisable ? ['none', ...thinking.levels] : thinking.levels };
   }
