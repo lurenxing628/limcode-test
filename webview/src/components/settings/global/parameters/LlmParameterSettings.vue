@@ -69,6 +69,7 @@ function updateKnownValue(definition: LlmParameterDefinition, value: unknown): v
   if (value === undefined || value === '') deletePath(next, definition.path);
   else setPath(next, definition.path, value);
   if (next.thinkingConfig && capabilities.value.source !== 'unknown' && capabilities.value.reasoning.family !== 'none'
+    && capabilities.value.reasoning.family !== 'deepseek_toggle'
     && !thinkingConfigSupported(next.thinkingConfig, capabilities.value.reasoning)) {
     jsonError.value = '当前模型不支持该思考配置，请先移除冲突的预算或强度。';
     return;

@@ -46,7 +46,7 @@ test('documented native capability is not mislabeled as a live verification', ()
   assert.equal(value.source, 'official_registry');
   assert.equal(value.nativeCompaction.availability, 'documented');
   assert.match(caps.capabilityDisplayLabel(value), /未实测/);
-  assert.equal(value.registryRevision, '2026-09-22');
+  assert.equal(value.registryRevision, caps.MODEL_CAPABILITY_REGISTRY_REVISION);
   assert.equal(caps.resolveCompressionExecutionPlan(method(), value).attempts[0].methodKind, 'segmented_summary');
   const declared = caps.resolveProviderModelCapabilities(config(), undefined, 'trust_configured_endpoint');
   assert.equal(caps.resolveCompressionExecutionPlan(method(), declared).attempts[0].methodKind, 'provider_native');
@@ -224,4 +224,130 @@ test('successful provider response alone cannot claim a committed fallback summa
 test('frozen reasoning is not recalculated from a later target configuration', () => {
   const plan = reason(capability('openai-responses', 'gpt-5.4'), 'balanced');
   assert.deepEqual(frozenSummaryReasoning({ summaryReasoning: plan }, { llmSummary: { reasoning: { mode: 'maximum' } } }, config()), plan);
+});
+
+// ---- OpenAI 兼容：能力表复用方言规则（摘要推理） ----
+const { dryRunCompactLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
+const COMPAT = {
+  deepseek: 'https://api.deepseek.com/v1', moonshot: 'https://api.moonshot.cn/v1',
+  dashscope: 'https://dashscope.aliyuncs.com/compatible-mode/v1', siliconflow: 'https://api.siliconflow.cn/v1',
+  openrouter: 'https://openrouter.ai/api/v1', relay: 'https://relay.example.invalid/v1'
+};
+const compat = (baseUrl, modelId, extra = {}) => caps.resolveModelCapabilities({ provider: 'openai-compatible', baseUrl, modelId, providerConfigId: 'channel', transport: 'http', ...extra });
+const compatConfig = (baseUrl, model, extra = {}) => ({ id: 'channel', provider: 'openai-compatible', baseUrl, model,
+  models: [{ id: model, name: model }], modelConfigs: [], apiKey: 'test-key', ...extra });
+
+test('OpenAI 兼容能力表：按方言规则给出 deepseek_toggle，平台认出的记为官方文档，中转站仍未确认', () => {
+  const deepseek = compat(COMPAT.deepseek, 'deepseek-v4-pro');
+  assert.equal(deepseek.source, 'official_registry');
+  assert.deepEqual({ family: deepseek.reasoning.family, levels: deepseek.reasoning.levels, canDisable: deepseek.reasoning.canDisable, alwaysOn: deepseek.reasoning.alwaysOn, wireFormat: deepseek.reasoning.wireFormat },
+    { family: 'deepseek_toggle', levels: ['low', 'high', 'max'], canDisable: true, alwaysOn: false, wireFormat: 'deepseek' });
+  assert.equal(deepseek.nativeCompaction.availability, 'unsupported', '原生压缩能力不变');
+  const kimi = compat(COMPAT.moonshot, 'kimi-k3');
+  assert.equal(kimi.reasoning.canDisable, false);
+  assert.equal(kimi.reasoning.alwaysOn, true);
+  const qwen = compat(COMPAT.dashscope, 'qwen3-max');
+  assert.deepEqual([qwen.reasoning.family, qwen.reasoning.levels, qwen.reasoning.canDisable, qwen.reasoning.wireFormat], ['deepseek_toggle', ['high'], true, 'enable_thinking']);
+  assert.deepEqual(compat(COMPAT.siliconflow, 'deepseek-ai/DeepSeek-V4-Pro').reasoning.levels, ['high', 'max']);
+  const relay = compat(COMPAT.relay, 'deepseek-v4-flash');
+  assert.equal(relay.source, 'unknown');
+  assert.deepEqual(relay.reasoning.levels, ['low', 'high', 'max']);
+  assert.equal(relay.nativeCompaction.availability, 'unknown');
+  assert.equal(compat(COMPAT.openrouter, 'deepseek/deepseek-v4-pro').reasoning.family, 'none');
+  assert.equal(compat(COMPAT.deepseek, 'deepseek-v4-pro', { thinkingFormat: 'omit' }).reasoning.family, 'none');
+  assert.equal(compat(COMPAT.deepseek, 'deepseek-v4-pro', { thinkingFormat: 'omit' }).source, 'unknown');
+  // 信任模式保持现状。
+  const trusted = compat(COMPAT.deepseek, 'deepseek-v4-pro', { trustMode: 'trust_configured_endpoint' });
+  assert.equal(trusted.source, 'explicit_trust');
+  assert.equal(trusted.nativeCompaction.availability, 'unsupported');
+  assert.equal(compat(COMPAT.relay, 'custom', { trustMode: 'trust_configured_endpoint' }).nativeCompaction.availability, 'unsupported');
+  assert.equal(caps.MODEL_CAPABILITY_REGISTRY_REVISION, '2026-09-24');
+});
+
+test('渠道能力：手动写法先取模型级、不采用测试证据；测试证据按有效规则给档位', () => {
+  const omitted = caps.resolveProviderModelCapabilities(compatConfig(COMPAT.deepseek, 'deepseek-v4-pro', {
+    openaiCompatibleThinkingFormat: 'deepseek',
+    modelConfigs: [{ id: 'mc', modelId: 'deepseek-v4-pro', openaiCompatibleThinkingFormat: 'omit' }]
+  }));
+  assert.equal(omitted.reasoning.family, 'none');
+  const probe = { providerKind: 'openai-compatible', modelId: 'renamed', providerConfigId: 'channel', transport: 'http',
+    endpointFingerprint: COMPAT.relay, source: 'verified_probe', verifiedAt: '2026-09-24T00:00:00Z',
+    reasoning: { family: 'deepseek_toggle', levels: [], supportsBudget: false, canDisable: true, alwaysOn: false,
+      outputLimitIncludesThinking: true, requiresThoughtSignatures: false, wireFormat: 'enable_thinking' },
+    nativeCompaction: { availability: 'unknown', reason: 'baseline' } };
+  const probed = caps.resolveProviderModelCapabilities(compatConfig(COMPAT.relay, 'renamed', { models: [{ id: 'renamed', name: 'renamed', capabilitySnapshot: probe }] }));
+  assert.equal(probed.source, 'verified_probe');
+  assert.deepEqual([probed.reasoning.levels, probed.reasoning.canDisable, probed.reasoning.wireFormat], [['high'], true, 'enable_thinking']);
+  const manual = caps.resolveProviderModelCapabilities(compatConfig(COMPAT.relay, 'renamed', {
+    openaiCompatibleThinkingFormat: 'reasoning_effort', models: [{ id: 'renamed', name: 'renamed', capabilitySnapshot: probe }] }));
+  assert.notEqual(manual.source, 'verified_probe');
+  assert.equal(manual.reasoning.family, 'none');
+});
+
+test('摘要推理：DeepSeek 与百炼的预设就近换算，显式 medium 换算不报错，Kimi K3 显式关闭仍报错', () => {
+  const deepseek = compat(COMPAT.deepseek, 'deepseek-v4-pro');
+  assert.deepEqual(reason(deepseek, 'economy').requestBody, { reasoning_effort: 'low' });
+  assert.deepEqual(reason(deepseek, 'balanced').requestBody, { reasoning_effort: 'high' });
+  assert.deepEqual(reason(deepseek, 'quality').requestBody, { reasoning_effort: 'high' });
+  assert.deepEqual(reason(deepseek, 'maximum').requestBody, { reasoning_effort: 'max' });
+  assert.deepEqual(reason(deepseek, 'disabled').requestBody, { reasoning_effort: 'none' });
+  const qwen = compat(COMPAT.dashscope, 'qwen3-max');
+  for (const mode of ['economy', 'balanced', 'quality', 'maximum']) assert.deepEqual(reason(qwen, mode).requestBody, { reasoning_effort: 'high' }, mode);
+  const explicit = reason(deepseek, 'explicit', { thinkingLevel: 'medium' });
+  assert.equal(explicit.status, 'applied');
+  assert.match(explicit.description, /medium 实际发送为 high/);
+  caps.assertSummaryReasoningPlan(explicit);
+  assert.equal(caps.thinkingConfigSupported({ thinkingLevel: 'xhigh' }, deepseek.reasoning), true);
+  assert.equal(caps.thinkingConfigSupported({ thinkingBudget: 1024 }, deepseek.reasoning), false);
+  const kimi = compat(COMPAT.moonshot, 'kimi-k3');
+  assert.throws(() => caps.assertSummaryReasoningPlan(reason(kimi, 'explicit', { thinkingLevel: 'none' })));
+  assert.throws(() => caps.assertSummaryReasoningPlan(reason(kimi, 'disabled')), /关闭/);
+});
+
+async function summaryWire(baseUrl, model, mode, extra = {}) {
+  const settings = { id: 'channel', name: 'summary', provider: 'openai-compatible', baseUrl, model, models: [{ id: model, name: model }],
+    apiKey: 'offline-placeholder', toolCallFormat: 'function-call', openaiResponsesTransport: 'http', stream: false,
+    retryOnError: false, retryMaxAttempts: 0, retryDelaySeconds: 0, enableMultimodalTools: true, contextWindowTokens: 65536,
+    systemPromptPrefix: '', promptCache: { enabled: false, mode: 'key', ttl: '30m' }, modelConfigs: [], createdAt: 1, updatedAt: 1, ...extra };
+  const result = await dryRunCompactLlmProvider({ id: 'summary-request', blockId: 'summary-block', conversationId: 'summary-conversation', methodKind: 'llm_summary',
+    methodConfigSnapshot: { id: 'summary-method', name: 'summary', kind: 'llm_summary', trigger: { mode: 'manual' },
+      llmSummary: { targetTokens: 1000, reasoning: { mode } }, createdAt: 1, updatedAt: 1 },
+    contents: [{ role: 'user', parts: [{ text: 'history' }] }] }, { settings: async () => settings, compressionSettings: async () => undefined });
+  return JSON.parse(result.calls[0].bodyText);
+}
+
+test('摘要请求最终按方言发出 thinking.type 或 enable_thinking', async () => {
+  const deepseek = await summaryWire(COMPAT.deepseek, 'deepseek-v4-pro', 'balanced');
+  assert.deepEqual(deepseek.thinking, { type: 'enabled' });
+  assert.equal(deepseek.reasoning_effort, 'high');
+  const qwen = await summaryWire(COMPAT.dashscope, 'qwen3-max', 'disabled');
+  assert.equal(qwen.enable_thinking, false);
+  assert.equal('reasoning_effort' in qwen, false);
+});
+
+function loadWebviewModule(relativeEntry) {
+  const Module = require('node:module');
+  const esbuild = require('esbuild');
+  const path = require('node:path');
+  const root = path.resolve('.');
+  const result = esbuild.buildSync({
+    entryPoints: [path.join(root, relativeEntry)], absWorkingDir: root, bundle: true, write: false,
+    platform: 'node', format: 'cjs', target: 'node18', tsconfig: path.join(root, 'tsconfig.webview.json'), logLevel: 'silent'
+  });
+  const filename = path.join(root, `.test-capabilities-${path.basename(relativeEntry)}.cjs`);
+  const compiled = new Module(filename);
+  compiled.filename = filename;
+  compiled.paths = Module._nodeModulePaths(root);
+  compiled._compile(result.outputFiles[0].text, filename);
+  return compiled.exports;
+}
+
+test('渠道参数编辑器：deepseek_toggle 不按能力过滤思考强度，发送时就近换算', () => {
+  const { parameterDefinitionsForProvider } = loadWebviewModule('webview/src/components/settings/global/parameters/llmParameterDefinitions.ts');
+  for (const [baseUrl, model] of [[COMPAT.deepseek, 'deepseek-v4-pro'], [COMPAT.moonshot, 'kimi-k3'], [COMPAT.dashscope, 'qwen3-max']]) {
+    const definition = parameterDefinitionsForProvider('openai-compatible', model, compat(baseUrl, model)).find((entry) => entry.key === 'thinkingLevel');
+    assert.deepEqual(definition.options.map((option) => option.value), ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], model);
+  }
+  const source = readFileSync(new URL('../../webview/src/components/settings/global/parameters/LlmParameterSettings.vue', import.meta.url), 'utf8');
+  assert.match(source, /reasoning\.family !== 'deepseek_toggle'/);
 });

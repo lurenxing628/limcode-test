@@ -13,13 +13,15 @@ import type {
 } from './protocol';
 import { canonicalLlmProviderKind } from './protocol';
 import {
+  mapOpenAICompatibleEffort,
+  openAICompatibleThinkingLevels,
   resolveOpenAICompatibleDialect,
   type OpenAICompatibleDialect,
   type OpenAICompatibleProbedThinking
 } from './openAICompatibleDialect';
 
 /** Registry entries are documentation evidence, never a claim of a successful live request. */
-export const MODEL_CAPABILITY_REGISTRY_REVISION = '2026-09-22';
+export const MODEL_CAPABILITY_REGISTRY_REVISION = '2026-09-24';
 export type ModelCapabilitySource = 'official_registry' | 'provider_api' | 'verified_probe' | 'explicit_trust' | 'unknown';
 export type NativeCompactionKind = 'openai_responses' | 'anthropic_messages';
 export type NativeCompactionAvailability = 'documented' | 'verified' | 'declared' | 'unsupported' | 'unknown';
@@ -107,6 +109,8 @@ export function resolveModelCapabilities(input: {
   trustMode?: LlmNativeCompactionTrustMode;
   providerConfigId?: string;
   transport?: string;
+  /** OpenAI 兼容渠道手动指定的思考参数写法（模型级优先）。 */
+  thinkingFormat?: OpenAICompatibleThinkingFormat;
 }): ModelCapabilitySnapshot {
   const providerKind = input.provider;
   const modelId = input.modelId.trim();
@@ -146,14 +150,21 @@ export function resolveModelCapabilities(input: {
       availability: 'unsupported',
       reason: 'Gemini 当前使用本地分段摘要；上下文缓存不等同于可回放的原生压缩状态。'
     };
-  } else if (providerKind === 'openai-compatible' && isOfficialEndpoint(input.baseUrl, 'api.deepseek.com', ['', '/v1'])) {
-    // Compatible transport is not model capability proof. Keep explicit controls available, but
-    // do not invent supported levels for an unversioned or newly released DeepSeek model.
-    reasoning = unknownReasoningCapability();
-    nativeCompaction = {
-      availability: 'unsupported',
-      reason: 'DeepSeek 官方接口没有可回放的 Provider 原生压缩契约。'
-    };
+  } else if (providerKind === 'openai-compatible'
+    && (compatibleReasoning(input) || isOfficialEndpoint(input.baseUrl, 'api.deepseek.com', ['', '/v1']))) {
+    // 与请求改写、会话思考强度共用同一份方言规则（shared/openAICompatibleDialect.ts）：
+    // 按接口地址认出服务商时按其官方文档记为 official_registry；只按模型 ID 认出（中转站）时仍未确认。
+    const dialect = resolveOpenAICompatibleDialect(input.baseUrl, modelId, input.thinkingFormat);
+    const compatible = openAICompatibleReasoningCapability(dialect);
+    if (compatible) {
+      reasoning = compatible;
+      if (source === 'unknown' && dialect.source === 'platform') source = 'official_registry';
+    }
+    nativeCompaction = isOfficialEndpoint(input.baseUrl, 'api.deepseek.com', ['', '/v1'])
+      ? { availability: 'unsupported', reason: 'DeepSeek 官方接口没有可回放的 Provider 原生压缩契约。' }
+      : input.trustMode === 'trust_configured_endpoint'
+        ? { availability: 'unsupported', reason: '该 Provider 格式没有 LimCode 可验证的原生压缩适配器。' }
+        : nativeCompaction;
   } else if (input.trustMode === 'trust_configured_endpoint') {
     source = 'explicit_trust';
     if (providerKind === 'openai-responses') {
@@ -269,22 +280,65 @@ export function resolveProviderOpenAICompatibleDialect(
 
 export function resolveProviderModelCapabilities(
   provider: Pick<LlmProviderConfigRecord, 'provider' | 'baseUrl' | 'model' | 'modelConfigs'>
-    & Partial<Pick<LlmProviderConfigRecord, 'id' | 'models' | 'openaiResponsesTransport'>>,
+    & Partial<Pick<LlmProviderConfigRecord, 'id' | 'models' | 'openaiResponsesTransport' | 'openaiCompatibleThinkingFormat'>>,
   modelIdInput?: string,
   trustMode?: LlmNativeCompactionTrustMode
 ): ModelCapabilitySnapshot {
   const modelId = modelIdInput?.trim() || provider.model.trim();
   const transport = providerTransport(provider, modelId);
+  const thinkingFormat = provider.provider === 'openai-compatible'
+    ? configuredOpenAICompatibleThinkingFormat(provider, modelId) : undefined;
   const fallback = resolveModelCapabilities({
     provider: provider.provider, baseUrl: provider.baseUrl, modelId, trustMode,
-    providerConfigId: provider.id, transport
+    providerConfigId: provider.id, transport, ...(thinkingFormat ? { thinkingFormat } : {})
   });
-  const discovered = boundCapabilityEvidence(provider, modelId);
-  if (!discovered) return fallback;
+  const bound = boundCapabilityEvidence(provider, modelId);
+  // 手动指定写法时不采用测试证据（手动 > 测试结果 > 自动识别）。
+  if (!bound || (thinkingFormat && bound.source === 'verified_probe')) return fallback;
+  const discovered = withProbedOpenAICompatibleReasoning(provider, modelId, bound);
   if (trustMode === 'trust_configured_endpoint' && fallback.nativeCompaction.availability === 'declared') {
     return { ...discovered, source: 'explicit_trust', nativeCompaction: fallback.nativeCompaction };
   }
   return discovered;
+}
+
+/**
+ * OpenAI 兼容的有效规则给出的推理能力：DeepSeek 写法或 enable_thinking 写法、且有规则时为
+ * `deepseek_toggle`（档位就近换算后发送）；OpenAI 写法、不发送或认不出模型时为 undefined（能力未知）。
+ */
+export function openAICompatibleReasoningCapability(dialect: OpenAICompatibleDialect): ModelReasoningCapability | undefined {
+  const thinking = openAICompatibleThinkingLevels(dialect);
+  if (!thinking) return undefined;
+  return {
+    family: 'deepseek_toggle',
+    levels: thinking.levels,
+    supportsBudget: false,
+    canDisable: thinking.canDisable,
+    alwaysOn: !thinking.canDisable,
+    outputLimitIncludesThinking: true,
+    requiresThoughtSignatures: false,
+    wireFormat: dialect.format
+  };
+}
+
+function compatibleReasoning(input: { baseUrl: string; modelId: string; thinkingFormat?: OpenAICompatibleThinkingFormat }): boolean {
+  return openAICompatibleReasoningCapability(
+    resolveOpenAICompatibleDialect(input.baseUrl, input.modelId.trim(), input.thinkingFormat)
+  ) !== undefined;
+}
+
+/** 测试证据里的 DeepSeek / enable_thinking 写法按有效规则给档位（只开关的记作 high），与请求改写一致。 */
+function withProbedOpenAICompatibleReasoning(
+  provider: ProviderCapabilityConfig,
+  modelId: string,
+  evidence: ModelCapabilitySnapshot
+): ModelCapabilitySnapshot {
+  const probed = probedOpenAICompatibleThinking(provider, modelId);
+  if (!probed) return evidence;
+  const reasoning = openAICompatibleReasoningCapability(
+    resolveOpenAICompatibleDialect(provider.baseUrl, modelId, undefined, probed)
+  );
+  return reasoning ? { ...evidence, reasoning } : evidence;
 }
 
 /** A bounded, credential-free codec shared by settings save/load, UI and capability discovery. */
@@ -437,10 +491,13 @@ function resolveSummaryReasoningIntent(input: {
     if (!thinkingConfigSupported(explicit, input.capabilities.reasoning)) {
       return resolvedProviderDefault(intent, withoutThinking, '高级思考参数不在当前模型能力集合内，未发送。', 'unsupported');
     }
+    const converted = convertedOpenAICompatibleLevel(explicit, input.capabilities.reasoning);
     return {
       intent,
       status: 'applied',
-      description: '高级原生思考参数已通过当前模型能力校验。',
+      description: converted
+        ? `高级思考参数已通过当前模型能力校验；按该模型规则，${converted.from} 实际发送为 ${converted.to}。`
+        : '高级原生思考参数已通过当前模型能力校验。',
       generationConfig: method
     };
   }
@@ -459,14 +516,16 @@ function resolveSummaryReasoningIntent(input: {
     };
   }
 
-  const target = presetLevel(intent, input.capabilities.reasoning.levels);
+  const target = presetLevel(intent, input.capabilities.reasoning);
   if (!target) {
     return resolvedProviderDefault(intent, withoutThinking, '当前模型没有与该预设完全对应的已确认档位，改用 Provider 默认。', 'unsupported');
   }
   return {
     intent,
     status: 'applied',
-    description: `已映射为 ${target} 思考档位。`,
+    description: input.capabilities.reasoning.family === 'deepseek_toggle'
+      ? `已按该模型规则映射为 ${target} 思考档位，发送时换成该渠道的思考参数写法。`
+      : `已映射为 ${target} 思考档位。`,
     generationConfig: withThinking(withoutThinking, {
       thinkingLevel: target,
       ...(input.capabilities.reasoning.family === 'gemini_level' ? { includeThoughts: false } : {})
@@ -511,7 +570,9 @@ export function thinkingConfigSupported(
   const level = config.thinkingLevel;
   if (level === 'none') {
     if (!capability.canDisable || config.thinkingBudget !== undefined) return false;
-  } else if (level && level !== 'not-set' && level !== 'non-set' && !capability.levels.includes(level)) return false;
+  } else if (level && level !== 'not-set' && level !== 'non-set' && !capability.levels.includes(level)
+    // OpenAI 兼容的 DeepSeek / enable_thinking 写法在发送时就近换算，档位以外的强度也能发送。
+    && capability.family !== 'deepseek_toggle') return false;
   if (config.thinkingBudget !== undefined) {
     const budget = config.thinkingBudget;
     if (!capability.supportsBudget || !Number.isSafeInteger(budget)) return false;
@@ -588,10 +649,27 @@ export function reasoningNativeFields(
   return level ? { reasoning_effort: level } : {};
 }
 
+/** OpenAI 兼容的强度在发送时被换成另一档（例如 DeepSeek 把 medium 发成 high）时返回换算前后的值。 */
+function convertedOpenAICompatibleLevel(
+  thinking: LlmThinkingConfigRecord,
+  capability: ModelReasoningCapability
+): { from: LlmThinkingLevel; to: LlmThinkingLevel } | undefined {
+  const level = thinking.thinkingLevel;
+  if (capability.family !== 'deepseek_toggle' || !level || level === 'none' || level === 'not-set' || level === 'non-set') return undefined;
+  const mapped = mapOpenAICompatibleEffort(level, capability.levels.filter((value) => value !== 'none'));
+  return mapped && mapped !== level ? { from: level, to: mapped } : undefined;
+}
+
 function presetLevel(
   intent: Exclude<LlmSummaryReasoningMode, 'provider_default' | 'inherit_chat' | 'disabled' | 'explicit'>,
-  levels: readonly LlmThinkingLevel[]
+  reasoning: ModelReasoningCapability
 ): LlmThinkingLevel | undefined {
+  const levels = reasoning.levels;
+  if (reasoning.family === 'deepseek_toggle') {
+    // 就近换算：经济 → low，均衡 → medium（按官方换成 high），高质量 → high，最高 → 最高档。
+    const wanted: LlmThinkingLevel = intent === 'economy' ? 'low' : intent === 'balanced' ? 'medium' : intent === 'quality' ? 'high' : 'max';
+    return mapOpenAICompatibleEffort(wanted, levels.filter((level) => level !== 'none'));
+  }
   if (intent === 'economy') {
     return ['minimal', 'low'].find((level) => levels.includes(level as LlmThinkingLevel)) as LlmThinkingLevel | undefined;
   }

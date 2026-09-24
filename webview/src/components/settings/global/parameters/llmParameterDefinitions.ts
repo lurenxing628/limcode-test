@@ -189,7 +189,9 @@ export function parameterDefinitionsForProvider(provider: LlmProviderKind, model
     || geminiCapability?.kind === 'thinkingLevel'
     || geminiCapability?.kind === 'unknown';
   const result = supportsThinkingLevel ? [...definitions, thinkingLevelDefinition(provider, modelId)] : definitions;
-  if (!snapshot || snapshot.source === 'unknown' || snapshot.reasoning.family === 'none') return result;
+  // OpenAI 兼容的 DeepSeek / enable_thinking 写法（deepseek_toggle）：所有档位都能选，发送时按模型规则就近换算。
+  if (!snapshot || snapshot.source === 'unknown' || snapshot.reasoning.family === 'none'
+    || snapshot.reasoning.family === 'deepseek_toggle') return result;
   const capability = snapshot.reasoning;
   return result.filter((definition) => {
     if (definition.key === 'thinkingBudget') return capability.supportsBudget;

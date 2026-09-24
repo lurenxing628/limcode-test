@@ -72,17 +72,17 @@ const SUMMARY_REASONING_OPTIONS: SettingsDropdownOption[] = [
   {
     value: 'economy',
     label: '经济',
-    description: '仅在当前总结模型明确支持最低非关闭档时发送。'
+    description: '仅在当前总结模型明确支持最低非关闭档时发送；DeepSeek、Kimi、智谱等按模型规则换成最接近的档位。'
   },
   {
     value: 'balanced',
     label: '平衡',
-    description: '仅在当前总结模型明确支持 medium 时发送。'
+    description: '仅在当前总结模型明确支持 medium 时发送；DeepSeek、Kimi、智谱等按模型规则换成最接近的档位（例如 medium 发成 high）。'
   },
   {
     value: 'quality',
     label: '高质量',
-    description: '仅在当前总结模型明确支持 high 时发送。'
+    description: '仅在当前总结模型明确支持 high 时发送；DeepSeek、Kimi、智谱等按模型规则换成最接近的档位。'
   },
   {
     value: 'maximum',
@@ -338,9 +338,9 @@ const configuredFallbacks = computed<LlmCompressionFallbackKind[]>(() =>
 
 const capabilitySourceLabel = computed(() => {
   const source = capabilities.value?.source;
-  if (source === 'official_registry') return '官方文档注册表（不是在线探测）';
+  if (source === 'official_registry') return '按官方文档登记（不是在线测试）';
   if (source === 'provider_api') return 'Provider Models API';
-  if (source === 'verified_probe') return '独立端点探测';
+  if (source === 'verified_probe') return '在线测试结果';
   if (source === 'explicit_trust') return '用户显式声明';
   return '未验证兼容端点';
 });
