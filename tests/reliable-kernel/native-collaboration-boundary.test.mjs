@@ -13,7 +13,7 @@ const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSessi
 const { readConversationChildHandles, readNativeRequestChildHandles, NATIVE_CHILD_HANDLE_PROJECTION_EVENT } =
   load('backend/reliableKernel/conversationChildHandles.js');
 const { resolveModelToolArguments } = load('backend/reliableKernel/modelHandleCatalog.js');
-const { parseNativeToolCallCheckpoint } = load('backend/reliableKernel/nativeToolFacts.js');
+const { parseNativeToolCallCheckpoint, parseNativeDeliveryContent } = load('backend/reliableKernel/nativeToolFacts.js');
 
 const capabilities = { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false, explicitCaching: true };
 const definition = name => ({ name, description: 'native collaboration handle fixture', parameters: { type: 'object' } });
@@ -27,6 +27,7 @@ test('pending peer messages end a native tool loop at its first settled response
   let app;
   const executed = [];
   const requests = [];
+  const transients = [];
   let chainEnds = 0;
   let wireSubmissions = 0;
   const adapter = {
@@ -46,16 +47,21 @@ test('pending peer messages end a native tool loop at its first settled response
           async submitToolResults() { wireSubmissions += 1; assert.fail('Peer input must cross the first settled tool boundary before another native response'); }
         });
         await control({ type: 'response.created', responseId: 'response-first', capabilities });
-        await event('output_item_done', { type: 'tool_calls', calls: [{ id: 'list', ordinal: 0, name: 'list_agents', arguments: {}, async: false }],
-          outputItem: { id: 'list-item', ordinal: 0, providerResponseId: 'response-first' } });
+        await event('output_item_done', { type: 'tool_calls', calls: [{ id: 'list-a', ordinal: 0, name: 'list_agents', arguments: {}, async: false }],
+          outputItem: { id: 'list-item-a', ordinal: 0, providerResponseId: 'response-first' } });
+        await event('output_item_done', { type: 'tool_calls', calls: [{ id: 'list-b', ordinal: 1, name: 'list_agents', arguments: {}, async: false }],
+          outputItem: { id: 'list-item-b', ordinal: 1, providerResponseId: 'response-first' } });
         // The peer finished the follow-up this running conversation requested earlier; its result
         // returns to the requester's live Turn instead of waiting for a later Turn.
         await app.runtime.collaboration.completeRequestsForTurn({ turnId: 'peer-turn', text: 'PEER_RUNTIME_BOUNDARY_MESSAGE' });
         await control({ type: 'response.completed', responseId: 'response-first' });
         await ended;
         assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0, 'a local yield is never provider delivery acknowledgment');
-        assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1, 'the settled tool result is retained before ending the chain');
-        await event('completed', { role: 'model', parts: [{ id: 'list', functionCall: { name: 'list_agents', args: {} } }] });
+        assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 2, 'both settled tool results are retained before ending the chain');
+        await event('completed', { role: 'model', parts: [
+          { id: 'list-a', functionCall: { name: 'list_agents', args: {} } },
+          { id: 'list-b', functionCall: { name: 'list_agents', args: {} } }
+        ] });
         controls.native.onController(undefined);
       } else {
         assert.equal(requests.length, 2);
@@ -77,13 +83,30 @@ test('pending peer messages end a native tool loop at its first settled response
         const carriedToolResult = request.context.find(item => item.segmentKind === 'tool_pair' && item.content.includes('list_agents')
           && item.content.includes('toolModelResult'));
         assert.ok(carriedToolResult, 'admission names are derived from the body actually sent by this carrier');
-        await control({ type: 'response.created', responseId: 'response-after-peer', capabilities, admittedToolResultCallIds: ['list'] });
-        await control({ type: 'response.completed', responseId: 'response-after-peer' });
+        await control({ type: 'response.created', responseId: 'response-unadmitted', capabilities });
+        assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
+          'a response.created without explicit call IDs cannot prove either historical result');
+        await control({ type: 'response.completed', responseId: 'response-unadmitted' });
+        await control({ type: 'response.created', responseId: 'response-admit-a', admittedToolResultCallIds: ['list-a'] });
+        assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 1,
+          'only the first named historical result is marked at its durable response.created');
+        await control({ type: 'response.completed', responseId: 'response-admit-a' });
+        await control({ type: 'response.created', responseId: 'response-admit-b', admittedToolResultCallIds: ['list-b'] });
+        assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 2,
+          'the second historical result requires its own response.created admission');
+        // Terminal checkpoint pruning keeps only the last 32 stream rows. Both admissions must
+        // already be durable delivery facts before this long response removes their checkpoints.
+        for (let ordinal = 0; ordinal < 40; ordinal += 1) {
+          await event('output_item_done', { type: 'output_item_done',
+            outputItem: { id: `empty-item-${ordinal}`, ordinal, providerResponseId: 'response-admit-b' } });
+        }
+        await control({ type: 'response.completed', responseId: 'response-admit-b' });
         await event('completed', { role: 'model', parts: [{ text: 'Processed the peer message.' }] });
       }
     }
   };
   const dependencies = {
+    transientObserver: { observe(event) { transients.push(event); } },
     authorityCompiler: { async compile(request) { return {
       turnId: request.turnId, executorAgentId: request.executorAgentId,
       executionPreset: { content: JSON.stringify({ providerConfigId: 'native-provider', modelId: 'gpt-6-astra' }) },
@@ -152,7 +175,38 @@ test('pending peer messages end a native tool loop at its first settled response
     assert.equal(result.modelRequestIds.length, 2);
     assert.equal(chainEnds, 1);
     assert.equal(wireSubmissions, 0);
-    assert.equal(executed.length, 1, 'a carrier request must not rerun the settled tool');
+    assert.equal(executed.length, 2, 'a carrier request must not rerun either settled tool');
+    for (const request of requests) {
+      const visible = transients.filter(event => event.modelRequestId === request.modelRequestId);
+      assert.ok(visible.length > 0);
+      let nextSequence = 1n;
+      for (const event of visible) {
+        assert.equal(BigInt(event.fromStreamSeq), nextSequence,
+          'only observed native controls are covered between visible events');
+        nextSequence = BigInt(event.event.streamSeq) + 1n;
+      }
+    }
+    const carrierVisible = transients.filter(event => event.modelRequestId === requests[1].modelRequestId);
+    assert.deepEqual([carrierVisible[0].fromStreamSeq, carrierVisible[0].event.streamSeq], ['1', '6'],
+      'the first visible item covers the five preceding native controls');
+    assert.deepEqual([carrierVisible.at(-1).fromStreamSeq, carrierVisible.at(-1).event.streamSeq], ['46', '47'],
+      'the final visible event covers only its observed response boundary');
+    const delivered = await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' });
+    assert.equal(delivered.length, 2);
+    for (const [providerCallId, expectedResponseId] of [
+      ['list-a', 'response-admit-a'], ['list-b', 'response-admit-b']
+    ]) {
+      const [source] = await rows(app, 'ToolCallSourceLink', { provider_call_id: providerCallId });
+      const [delivery] = delivered.filter(row => row.tool_call_id === source.tool_call_id);
+      assert.ok(delivery, `${providerCallId} retains its own delivery fact after pruning`);
+      const [metadata] = await rows(app, 'ContentObject', { id: delivery.content_object_id });
+      const content = JSON.parse((await app.contentStore.read(metadata)).toString('utf8'));
+      assert.equal(parseNativeDeliveryContent(content).providerResponseId, expectedResponseId);
+    }
+    const carrierCheckpoints = await rows(app, 'ModelStreamCheckpoint', { model_request_id: requests[1].modelRequestId });
+    assert.equal(carrierCheckpoints.length, 33, 'terminal pruning keeps only the bounded checkpoint tail');
+    assert.ok(carrierCheckpoints.every(row => Number(row.stream_seq) > 5),
+      'both response.created admission checkpoints were pruned after their delivery facts committed');
     const inputs = await rows(app, 'PendingTurnInput', { turn_id: started.turnId, input_kind: 'runtime_delivery' });
     assert.equal(inputs.length, 1);
     assert.equal(inputs[0].state, 'consumed');

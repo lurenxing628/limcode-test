@@ -59,7 +59,7 @@ import {
 } from '../../shared/openAIResponsesCapabilities';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
 import { NativeRequestSession } from './nativeRequestSession';
-import { NativeAsyncWorkPendingError, TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY } from './nativeToolFacts';
+import { NativeAsyncWorkPendingError, TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY, parseNativeControlCheckpoint } from './nativeToolFacts';
 import { readNativeSteeringInFlight } from './nativeSteering';
 import { planNativeCompressionRebase } from './nativeCompressionGuard';
 import {
@@ -207,6 +207,8 @@ export interface ReliableAgentTransientEvent {
   socketGeneration: string;
   /** Durable commit frontier visible before this Provider socket was dispatched. */
   afterCommitSeq: string;
+  /** First stream sequence covered by this visible event and contiguous observed native controls. */
+  fromStreamSeq?: string;
   event: ProviderTransientStreamEvent;
   observedAt: string;
 }
@@ -685,15 +687,6 @@ export class ReliableAgentLoop {
             });
         assistantMessageIds.push(message.messageId);
         this.observeLifecycle({ turnId, stage: 'assistant_commit_completed', round, modelRequestId });
-        // A completed full-history request is the stateless server-admission proof for earlier
-        // native results actually projected onto its sent body.
-        if (nativeCapabilities) {
-          await this.markNativeCarrierDeliveries(
-            requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-            modelRequestId
-          );
-        }
-
         if (shouldContinueOpenTasks) {
           // This visible output remains an in-progress assistant message. The next frozen recipe owns
           // the one durable completion-check marker, so crash recovery cannot create an endless loop.
@@ -2073,6 +2066,46 @@ export class ReliableAgentLoop {
       await session.reconcile();
     }
     const activeSession = session;
+    // Native controls consume provider stream sequence numbers but never enter the Webview
+    // transient overlay. Cover only controls observed contiguously next to a visible event;
+    // an unknown provider/observer gap must still make the Webview request a snapshot.
+    const transientSpans = new Map<string, {
+      lastObservedStreamSeq: bigint;
+      controlRunStart?: bigint;
+      unknownGap: boolean;
+    }>();
+    const transientSpan = (attemptSeq: string, socketGeneration: string) => {
+      const key = `${attemptSeq}\0${socketGeneration}`;
+      let span = transientSpans.get(key);
+      if (!span) {
+        span = { lastObservedStreamSeq: 0n, unknownGap: false };
+        transientSpans.set(key, span);
+      }
+      return span;
+    };
+    const noteNativeControl = (attemptSeq: string, socketGeneration: string, streamSeq: string | bigint): void => {
+      const span = transientSpan(attemptSeq, socketGeneration);
+      const sequence = requirePositiveInteger(streamSeq, 'native control streamSeq');
+      if (sequence <= span.lastObservedStreamSeq) return;
+      if (sequence === span.lastObservedStreamSeq + 1n && !span.unknownGap) {
+        span.controlRunStart ??= sequence;
+      } else {
+        span.unknownGap = true;
+        span.controlRunStart = undefined;
+      }
+      span.lastObservedStreamSeq = sequence;
+    };
+    const visibleFromStreamSeq = (attemptSeq: string, socketGeneration: string, streamSeq: string | bigint): string => {
+      const span = transientSpan(attemptSeq, socketGeneration);
+      const sequence = requirePositiveInteger(streamSeq, 'visible streamSeq');
+      if (sequence <= span.lastObservedStreamSeq) return sequence.toString();
+      const contiguous = !span.unknownGap && sequence === span.lastObservedStreamSeq + 1n;
+      const from = contiguous ? span.controlRunStart ?? sequence : sequence;
+      span.lastObservedStreamSeq = sequence;
+      span.controlRunStart = undefined;
+      span.unknownGap = false;
+      return from.toString();
+    };
     const wrapped: FullRequestProviderAdapter = {
       providerId,
       ...(adapter.estimateFullRequestInput
@@ -2099,6 +2132,21 @@ export class ReliableAgentLoop {
             if (event.kind === 'native_control') {
               const result = await controls.onEvent(event);
               if (activeSession) await activeSession.afterNativeControl(event, result);
+              if (activeSession && (result.checkpointed || result.ignoredReason === 'duplicate')) {
+                const admission = parseNativeControlCheckpoint(event.content);
+                if (admission.type === 'response.created' && admission.admittedToolResultCallIds?.length) {
+                  await this.markNativeCarrierDeliveries(
+                    conversationId,
+                    turnId,
+                    modelRequestId,
+                    admission.responseId,
+                    admission.admittedToolResultCallIds
+                  );
+                }
+              }
+              if (result.checkpointed || result.ignoredReason === 'duplicate') {
+                noteNativeControl(fullRequest.attemptSeq, fullRequest.socketGeneration, event.streamSeq);
+              }
               return result;
             }
             const transientKind = event.kind;
@@ -2112,6 +2160,7 @@ export class ReliableAgentLoop {
               attemptSeq: fullRequest.attemptSeq,
               socketGeneration: fullRequest.socketGeneration,
               afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
+              fromStreamSeq: visibleFromStreamSeq(fullRequest.attemptSeq, fullRequest.socketGeneration, event.streamSeq),
               event: {
                 kind: transientKind,
                 streamSeq: event.streamSeq,
@@ -2175,6 +2224,7 @@ export class ReliableAgentLoop {
           attemptSeq: terminal.attemptSeq,
           socketGeneration: terminal.socketGeneration,
           afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
+          fromStreamSeq: visibleFromStreamSeq(terminal.attemptSeq, terminal.socketGeneration, terminal.event.streamSeq),
           event: terminal.event,
           observedAt: this.timestamp()
         })
@@ -2332,20 +2382,27 @@ export class ReliableAgentLoop {
   }
 
   /**
-   * Stateless carrier delivery: a completed full-history request proves server admission of every
-   * earlier settled native result actually projected onto its sent body (its frozen Context root).
-   * Calls dropped by compression or delivered by a live chain stay untouched.
+   * A checkpointed response.created proves only the result call IDs that its actual wire create
+   * admitted. Mark earlier settled results while that proof is still durable: terminal stream
+   * pruning retains only a bounded tail and may remove this first response.created later.
    */
   private async markNativeCarrierDeliveries(
     conversationId: string,
-    carrierModelRequestId: string
+    turnId: string,
+    carrierModelRequestId: string,
+    providerResponseId: string,
+    admittedToolResultCallIds: readonly string[]
   ): Promise<void> {
+    const admittedCallIds = new Set(admittedToolResultCallIds);
     const pending = (await this.effects.listNativePendingWork({ conversationId }))
       .filter((entry) =>
-        entry.modelRequestId !== carrierModelRequestId
+        entry.turnId === turnId
+        && entry.modelRequestId !== carrierModelRequestId
         && entry.settled
         && !entry.delivered
-        && entry.resultContextSegmentId !== undefined);
+        && entry.resultContextSegmentId !== undefined
+        && entry.providerCallId !== undefined
+        && admittedCallIds.has(entry.providerCallId));
     if (pending.length === 0) return;
     const projections = await this.list('ModelContextProjection', {
       owner_kind: 'model_request', owner_id: carrierModelRequestId
@@ -2361,27 +2418,6 @@ export class ReliableAgentLoop {
     const eligible = pending.filter((entry) =>
       projectedSegmentIds.has(requireText(entry.resultContextSegmentId, 'NativePendingToolCall.resultContextSegmentId')));
     if (eligible.length === 0) return;
-    // The carrier's first response.created is the actual server-admission proof of its sent body.
-    const checkpoints = await this.list('ModelStreamCheckpoint', { model_request_id: carrierModelRequestId }, 512);
-    let providerResponseId: string | undefined;
-    for (const checkpoint of checkpoints
-      .filter((row) => row.checkpoint_kind === 'native_control')
-      .sort((left, right) => compareInteger(left.stream_seq, right.stream_seq))) {
-      const metadata = await this.requireExisting(
-        'ContentObject',
-        requireId(checkpoint.content_object_id, 'ModelStreamCheckpoint.content_object_id')
-      ) as unknown as ContentObjectMetadata;
-      const envelope = asRecord(normalizePlainJson(
-        JSON.parse((await this.contentStore.read(metadata)).toString('utf8')),
-        'Native control checkpoint'
-      ));
-      const content = asRecord(envelope?.content);
-      if (content?.type === 'response.created' && typeof content.responseId === 'string') {
-        providerResponseId = content.responseId;
-        break;
-      }
-    }
-    if (!providerResponseId) return;
     await this.effects.markNativeResultsDelivered({
       source: {
         kind: 'callback',

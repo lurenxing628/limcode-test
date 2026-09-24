@@ -109,6 +109,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/debug-capture-ui.test.mjs',
   'tests/reliable-kernel/edit-tool-invariants.test.cjs',
   'tests/reliable-kernel/frontend-copy-guardrails.test.cjs',
+  'tests/reliable-kernel/reliable-message-activity-row.test.mjs',
+  'tests/reliable-kernel/function-call-preview-handoff.test.mjs',
   'tests/reliable-kernel/guidance-queue.test.mjs',
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',
   'tests/reliable-kernel/model-system-prompt-prefix.test.mjs',

@@ -28,7 +28,10 @@ import {
   interactionViewFromReliableRuntime,
   type InteractionView
 } from '@webview/domain/interactionProjection';
-import { transientToolCallPreviewForMessage } from '@webview/domain/reliableTransientModel';
+import {
+  shouldKeepTransientToolCallPreview,
+  transientToolCallPreviewForMessage
+} from '@webview/domain/reliableTransientModel';
 import type { ReliableToolOutcomeProjectionStatus } from '@webview/domain/reliableConversationProjection';
 import {
   reliableKernelDetailDemandSignature,
@@ -41,6 +44,7 @@ import AskUserContent from '@webview/components/askUser/AskUserContent.vue';
 import PlanProposalContent from '@webview/components/plan/PlanProposalContent.vue';
 import TaskListDisplay from '@webview/components/taskList/TaskListDisplay.vue';
 import { resolveToolDisplay } from '../toolDisplay/registry';
+import { isRunAgentSpawnArguments } from '../toolDisplay/runAgentToolDisplay';
 import { parseShellArgs, parseShellResultOutput } from '../toolDisplay/shellToolModel';
 import ContentBlockSection from '../ContentBlockSection.vue';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
@@ -141,6 +145,11 @@ const transientPreview = computed(() => {
   const sourceMessageId = projection.splitSourceMessageIdByMessageId[props.messageId] ?? props.messageId;
   if (durableCallId) {
     if (projection.interactionByToolCallId[durableCallId]?.status === 'pending') return undefined;
+    const exactCall = toolCall.value?.id === partId || toolCall.value?.functionCallId === partId;
+    if (exactCall && !shouldKeepTransientToolCallPreview(
+      toolCall.value,
+      projection.toolOutcomeStatusByCallId[durableCallId]
+    )) return undefined;
     const revisionId = projection.messageRevisionIdByMessageId[sourceMessageId];
     const messageDetail = revisionId
       ? reliableConversation.feed.details[reliableKernelDetailKey('message-content', revisionId)]
@@ -579,12 +588,18 @@ function fallbackToolSummary(toolName: string, args: unknown): string | undefine
     return childRef ? `读取 Agent 回答 · ${childRef}` : '读取 Agent 回答';
   }
   if (toolName === 'run_agent') {
-    const childRef = boundedInlineValue(source.childRef);
-    if (source.mode === 'interrupt') return childRef ? `Interrupt Agent · ${childRef}` : 'Interrupt Agent';
+    const operation = source.operation;
+    const answerBridgeId = boundedInlineValue(source.answerBridgeId);
+    if (operation === 'list') return '列出已有子 Agent';
+    if (operation === 'read') return answerBridgeId ? `读取子 Agent · ${answerBridgeId}` : '读取子 Agent';
+    if (operation === 'wait') return '等待子 Agent 回答';
+    if (operation === 'send') return answerBridgeId ? `继续子 Agent · ${answerBridgeId}` : '继续子 Agent';
+    if (operation === 'interrupt_subtree') return '终止子 Agent 子树';
+    if (operation !== 'spawn') return '子 Agent 操作';
     const agent = isRecord(source.agent) ? source.agent : undefined;
     const agentType = boundedInlineValue(agent?.type) ?? 'worker';
-    const prompt = boundedInlineValue(source.prompt);
-    return prompt ? `Run ${agentType} · ${prompt}` : `Run ${agentType}`;
+    const taskName = boundedInlineValue(source.taskName);
+    return taskName ? `启动 ${agentType} · ${taskName}` : `启动 ${agentType}`;
   }
   if (toolName === TRANSFER_TOOL_NAME) {
     const transfers = Array.isArray(source.transfers) ? source.transfers.filter(isRecord) : [];
@@ -905,13 +920,7 @@ function labelForStatus(status: ToolCallStatus): string {
 }
 
 function isRunAgentStartupCall(call: ToolCallRecord): boolean {
-  if (call.name !== 'run_agent') return false;
-  try {
-    const args = JSON.parse(call.args) as unknown;
-    return !isRecord(args) || args.mode !== 'interrupt';
-  } catch {
-    return true;
-  }
+  return call.name === 'run_agent' && isRunAgentSpawnArguments(call.args);
 }
 
 function isDeniedResult(result: unknown): boolean {

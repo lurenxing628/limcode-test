@@ -461,6 +461,65 @@ test('completed transient tool preview remains authoritative until message body 
   assert.match(component, /if \(!partId \|\| !props\.messageId\) return undefined;/);
   assert.doesNotMatch(component, /!props\.messageId \|\| toolCall\.value/,
     'a newly visible durable ToolCall must not prematurely hide the retained preview');
+  assert.match(component, /shouldKeepTransientToolCallPreview\(/,
+    'the visible tool part must hand off to its matching durable execution state');
+});
+
+test('tool preview yields to a matching durable execution or outcome before the model request ends', async (context) => {
+  const server = await createWebviewTestServer();
+  context.after(async () => server.close());
+  const { shouldKeepTransientToolCallPreview } = await server.ssrLoadModule(
+    '/src/domain/reliableTransientModel.ts'
+  );
+
+  assert.equal(shouldKeepTransientToolCallPreview(undefined, undefined), true);
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'queued' }, undefined), true,
+    'a newly admitted call has not yet proved that execution started');
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'queued' }, 'missing'), true);
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'executing' }, undefined), false,
+    'an executing tool must show its durable progress while the model request remains active');
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'awaiting_child' }, undefined), false);
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'queued' }, 'succeeded'), false,
+    'a visible outcome wins even if the call status arrives a feed update later');
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'success' }, 'succeeded'), false);
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'error' }, 'failed'), false);
+  assert.equal(shouldKeepTransientToolCallPreview({ status: 'warning' }, 'missing'), false,
+    'a terminal call keeps its durable card visible while its outcome detail loads');
+});
+
+test('run_agent list reports an empty query without implying a child was started', async (context) => {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  globalThis.window = { addEventListener() {}, removeEventListener() {} };
+  context.after(async () => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    await server.close();
+  });
+  const { runAgentToolDisplay, isRunAgentSpawnArguments } = await server.ssrLoadModule(
+    '/src/components/content/toolDisplay/runAgentToolDisplay.ts'
+  );
+  const display = runAgentToolDisplay({
+    result: { operation: 'list', scope: 'direct', totalDirect: 0, totalDescendants: 0, tasks: [] }
+  });
+  assert.equal(display.headerActions.length, 0);
+  assert.equal(display.outputSections.length, 1);
+  assert.equal(display.outputSections[0].title, '子 Agent 查询结果');
+  assert.deepEqual(display.outputSections[0].rows, [
+    { label: '操作', value: '列出已有子 Agent（不会启动新任务）' },
+    { label: '范围', value: '直接子任务' },
+    { label: '已有子任务', value: '0 个' },
+    { label: '结果', value: '当前没有子任务；本次查询未启动子 Agent' }
+  ]);
+  for (const operation of ['list', 'read', 'wait', 'send', 'interrupt_subtree']) {
+    assert.equal(isRunAgentSpawnArguments(JSON.stringify({ operation })), false, operation);
+  }
+  assert.equal(isRunAgentSpawnArguments('{invalid'), false);
+  assert.equal(isRunAgentSpawnArguments(JSON.stringify({ operation: 'spawn' })), true);
+  const component = fs.readFileSync(path.join(root,
+    'webview/src/components/content/parts/FunctionCallPartView.vue'), 'utf8');
+  assert.match(component, /isRunAgentSpawnArguments\(call\.args\)/,
+    'the queued status must use the exact spawn operation');
 });
 
 test('process stream detail pages every CAS chunk beyond the projection window', async () => {

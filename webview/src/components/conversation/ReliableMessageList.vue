@@ -229,6 +229,17 @@ const activeTurnRequests = computed(() => {
     .sort((left, right) => reliableInteger(right.request_seq) - reliableInteger(left.request_seq));
 });
 const latestActiveTurnRequest = computed(() => activeTurnRequests.value[0]);
+const latestRequestHasVisibleModelRow = computed(() => {
+  const requestId = reliableText(latestActiveTurnRequest.value?.id);
+  if (!requestId) return false;
+  return visibleTimelineRows.value.some((message) =>
+    message.role === 'model'
+    && message.status === 'streaming'
+    && message.content.parts.length > 0
+    && (message.id === `transient:${requestId}`
+      || projection.value.modelRequestIdByMessageId[message.id] === requestId)
+  );
+});
 const latestRequestPurposeDetail = computed(() => {
   const requestId = reliableText(latestActiveTurnRequest.value?.id);
   return requestId
@@ -324,15 +335,6 @@ const activityModelLabel = computed(() => {
     : '';
   return override || provider?.model?.trim() || 'LLM';
 });
-const activityHeartbeat = computed(() => {
-  const request = latestActiveTurnRequest.value;
-  if (!request || reliableText(request.status) !== 'streaming') return undefined;
-  const stats = modelRequestStreamStats(request);
-  const observedAt = reliableInteger(stats?.lastStreamEventAt);
-  const streamSeq = reliableText(stats?.lastStreamSeq);
-  if (observedAt <= 0 || !streamSeq) return undefined;
-  return { observedAt, streamSeq };
-});
 const activityLabel = computed(() => {
   const action = conversationAction.value;
   if (action?.action === 'retry' && action.phase !== 'running') {
@@ -372,7 +374,9 @@ const activityLabel = computed(() => {
       )
     });
   }
-  if (hasVisibleStreamingTransientForTurn(
+  // Native Responses may commit an output item into a durable Message before the request ends.
+  // Its live transient is then merged into that Message, so no `transient:` row is mounted.
+  if (latestRequestHasVisibleModelRow.value || hasVisibleStreamingTransientForTurn(
     feed.transientModelRequests,
     turn.id,
     mountedTransientRequestIds.value
@@ -385,10 +389,7 @@ const activityLabel = computed(() => {
     return '正在启动 LLM 请求';
   }
   if (latest.status === 'streaming') {
-    const heartbeat = activityHeartbeat.value;
-    return heartbeat
-      ? `正在等待 LLM 终态 · 最近流活动 ${formatActivityTime(heartbeat.observedAt)} · #${heartbeat.streamSeq}`
-      : '正在等待 LLM 输出';
+    return '正在等待模型回复';
   }
   return 'LLM 结果已提交，正在准备工具或下一轮';
 });
@@ -604,13 +605,6 @@ function messageDetailLoading(message: MessageRecord): boolean {
 function timelineFloor(message: MessageRecord, visibleIndex: number): number {
   const projected = projection.value.absoluteFloorByMessageId[message.id] ?? message.seq;
   return absoluteTimelineFloor(projected, segmentStart.value + visibleIndex + 1);
-}
-
-function formatActivityTime(value: number): string {
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    : '未知';
 }
 
 function modelRequestRetryState(request: Record<string, unknown>): {

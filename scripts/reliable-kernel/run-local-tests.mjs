@@ -62,6 +62,8 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/conversation-fork-lifecycle.test.mjs',
   'tests/reliable-kernel/current-turn-task-projection.test.mjs',
   'tests/reliable-kernel/frontend-copy-guardrails.test.cjs',
+  'tests/reliable-kernel/reliable-message-activity-row.test.mjs',
+  'tests/reliable-kernel/function-call-preview-handoff.test.mjs',
   'tests/reliable-kernel/guidance-queue.test.mjs',
   'tests/reliable-kernel/compression-progress-ui.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',

@@ -159,6 +159,11 @@ function coalescePendingToolCallDelta(
   if (!isToolCallDeltaTransient(incoming)) return false;
   const previous = pending[pending.length - 1];
   if (!previous || !isToolCallDeltaTransient(previous.event) || !sameTransientStream(previous.event, incoming)) return false;
+  const previousSeq = String(previous.event.event.streamSeq);
+  const incomingFrom = incoming.fromStreamSeq ?? String(incoming.event.streamSeq);
+  if (!/^(?:0|[1-9]\d*)$/.test(previousSeq)
+    || !/^(?:0|[1-9]\d*)$/.test(incomingFrom)
+    || BigInt(incomingFrom) !== BigInt(previousSeq) + 1n) return false;
   const content = mergeToolCallDeltaContent(previous.event.event.content, incoming.event.content);
   if (!content) return false;
   pending[pending.length - 1] = {
@@ -680,7 +685,7 @@ export class ReliableKernelWebviewFeedBridge {
       if (!coalescePendingToolCallDelta(client.pendingTransientEvents, event)) {
         client.pendingTransientEvents.push({
           event,
-          fromStreamSeq: String(event.event.streamSeq)
+          fromStreamSeq: event.fromStreamSeq ?? String(event.event.streamSeq)
         });
       }
       const terminal = ['completed', 'failed', 'cancelled'].includes(event.event.kind);

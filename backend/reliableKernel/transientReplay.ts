@@ -13,6 +13,7 @@ type ReplaySlot = ReplayEventSlot | ReplayTextSlot | ReplayToolDeltaSlot;
 interface ReplaySlotBase {
   order: number;
   firstStreamSeq: string;
+  firstFromStreamSeq: string;
   item: ReliableKernelTransientBatchItem;
 }
 
@@ -48,6 +49,7 @@ interface ReplayEntry {
   observedAt: string;
   updatedAt: number;
   terminal: boolean;
+  contiguous: boolean;
   nextOrder: number;
   slots: ReplaySlot[];
   textSlots: Map<string, ReplayTextSlot>;
@@ -97,14 +99,14 @@ export class ReliableTransientReplayStore {
       input.attemptSeq,
       input.socketGeneration
     ));
-    if (!entry || entry.conversationId !== input.conversationId) return undefined;
+    if (!entry || !entry.contiguous || entry.conversationId !== input.conversationId) return undefined;
     return materializeReplayEntry(entry);
   }
 
   public snapshotsForConversation(conversationId: string): ReliableTransientReplaySnapshot[] {
     this.prune(Date.now());
     return [...this.entries.values()]
-      .filter((entry) => entry.conversationId === conversationId)
+      .filter((entry) => entry.contiguous && entry.conversationId === conversationId)
       .sort((left, right) => left.updatedAt - right.updatedAt || left.key.localeCompare(right.key))
       .map(materializeReplayEntry);
   }
@@ -146,6 +148,7 @@ function createReplayEntry(key: string, event: ReliableAgentTransientEvent): Rep
     observedAt: event.observedAt,
     updatedAt: timestamp(event.observedAt),
     terminal: false,
+    contiguous: true,
     nextOrder: 0,
     slots: [],
     textSlots: new Map(),
@@ -157,6 +160,8 @@ function createReplayEntry(key: string, event: ReliableAgentTransientEvent): Rep
 function ingestReplayEvent(entry: ReplayEntry, event: ReliableAgentTransientEvent): void {
   const streamSeq = decimal(event.event.streamSeq);
   if (BigInt(streamSeq) <= BigInt(entry.headStreamSeq) && entry.slots.length > 0) return;
+  const previousHead = entry.slots.length > 0 ? BigInt(entry.headStreamSeq) : 0n;
+  if (BigInt(coveredFromStreamSeq(event)) !== previousHead + 1n) entry.contiguous = false;
   entry.headStreamSeq = streamSeq;
   entry.observedAt = event.observedAt;
   entry.updatedAt = timestamp(event.observedAt);
@@ -165,6 +170,8 @@ function ingestReplayEvent(entry: ReplayEntry, event: ReliableAgentTransientEven
   if (event.event.kind === 'completed') {
     clearReplaySlots(entry);
     appendEventSlot(entry, event);
+    // The completed item carries the full final Provider output and replaces partial fragments.
+    entry.contiguous = true;
     entry.terminal = true;
     return;
   }
@@ -209,6 +216,7 @@ function ingestTextDelta(
       kind: 'text',
       order: entry.nextOrder++,
       firstStreamSeq: decimal(event.event.streamSeq),
+      firstFromStreamSeq: coveredFromStreamSeq(event),
       item: toBatchItem(event),
       content: { ...content, text: '' },
       chunks: []
@@ -218,7 +226,7 @@ function ingestTextDelta(
   }
   slot.chunks.push(String(content.text));
   slot.content = { ...slot.content, ...content, text: '' };
-  slot.item = { ...toBatchItem(event), fromStreamSeq: slot.firstStreamSeq };
+  slot.item = { ...toBatchItem(event), fromStreamSeq: slot.firstFromStreamSeq };
 }
 
 function ingestThoughtProgress(
@@ -229,13 +237,14 @@ function ingestThoughtProgress(
   const key = outputItemIdentity(content.outputItem) ?? 'legacy';
   const prior = entry.progressSlots.get(key);
   if (prior) {
-    prior.item = { ...toBatchItem(event), fromStreamSeq: prior.firstStreamSeq };
+    prior.item = { ...toBatchItem(event), fromStreamSeq: prior.firstFromStreamSeq };
     return;
   }
   const slot: ReplayEventSlot = {
     kind: 'event',
     order: entry.nextOrder++,
     firstStreamSeq: decimal(event.event.streamSeq),
+    firstFromStreamSeq: coveredFromStreamSeq(event),
     item: toBatchItem(event)
   };
   entry.progressSlots.set(key, slot);
@@ -263,6 +272,7 @@ function ingestToolCallDeltas(
         kind: 'tool-delta',
         order: entry.nextOrder++,
         firstStreamSeq: decimal(event.event.streamSeq),
+        firstFromStreamSeq: coveredFromStreamSeq(event),
         item: toBatchItem(event),
         content: { ...content, calls: [] },
         call: { ...call, argumentsDelta: '' },
@@ -275,7 +285,7 @@ function ingestToolCallDeltas(
     else slot.chunks.push(call.argumentsDelta);
     slot.content = { ...slot.content, ...content, calls: [] };
     slot.call = { ...slot.call, ...call, argumentsDelta: '' };
-    slot.item = { ...toBatchItem(event), fromStreamSeq: slot.firstStreamSeq };
+    slot.item = { ...toBatchItem(event), fromStreamSeq: slot.firstFromStreamSeq };
   });
 }
 
@@ -284,6 +294,7 @@ function appendEventSlot(entry: ReplayEntry, event: ReliableAgentTransientEvent)
     kind: 'event',
     order: entry.nextOrder++,
     firstStreamSeq: decimal(event.event.streamSeq),
+    firstFromStreamSeq: coveredFromStreamSeq(event),
     item: toBatchItem(event)
   });
 }
@@ -316,7 +327,7 @@ function materializeReplayEntry(entry: ReplayEntry): ReliableTransientReplaySnap
 }
 
 function materializeSlot(slot: ReplaySlot): ReliableKernelTransientBatchItem {
-  if (slot.kind === 'event') return cloneBatchItem(slot.item, slot.firstStreamSeq);
+  if (slot.kind === 'event') return cloneBatchItem(slot.item, slot.firstFromStreamSeq);
   if (slot.kind === 'text') {
     return cloneBatchItem({
       ...slot.item,
@@ -325,7 +336,7 @@ function materializeSlot(slot: ReplaySlot): ReliableKernelTransientBatchItem {
         streamSeq: slot.firstStreamSeq,
         content: { ...slot.content, text: slot.chunks.join('') }
       }
-    }, slot.firstStreamSeq);
+    }, slot.firstFromStreamSeq);
   }
   return cloneBatchItem({
     ...slot.item,
@@ -337,7 +348,7 @@ function materializeSlot(slot: ReplaySlot): ReliableKernelTransientBatchItem {
         calls: [{ ...slot.call, argumentsDelta: slot.chunks.join('') }]
       }
     }
-  }, slot.firstStreamSeq);
+  }, slot.firstFromStreamSeq);
 }
 
 function toBatchItem(event: ReliableAgentTransientEvent): ReliableKernelTransientBatchItem {
@@ -350,7 +361,7 @@ function toBatchItem(event: ReliableAgentTransientEvent): ReliableKernelTransien
     attemptSeq: event.attemptSeq,
     socketGeneration: event.socketGeneration,
     afterCommitSeq: event.afterCommitSeq,
-    fromStreamSeq: decimal(event.event.streamSeq),
+    fromStreamSeq: coveredFromStreamSeq(event),
     observedAt: event.observedAt,
     event: {
       kind: event.event.kind,
@@ -361,7 +372,11 @@ function toBatchItem(event: ReliableAgentTransientEvent): ReliableKernelTransien
         : { usage: toStructuredClonePlainData(event.event.usage, 'transient replay usage') }),
       ...(event.event.timing ? { timing: { ...event.event.timing } } : {})
     }
-  }, decimal(event.event.streamSeq));
+  }, coveredFromStreamSeq(event));
+}
+
+function coveredFromStreamSeq(event: ReliableAgentTransientEvent): string {
+  return decimal(event.fromStreamSeq ?? event.event.streamSeq);
 }
 
 function cloneBatchItem(

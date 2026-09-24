@@ -1,8 +1,10 @@
 import type {
   FunctionCallPart,
   ModelOutputItemReference,
+  ToolCallRecord,
   ToolCallPreviewRecord
 } from '@shared/protocol';
+import type { ReliableToolOutcomeProjectionStatus } from './reliableConversationProjection';
 import {
   advanceToolCallPreviewFields,
   appendToolCallPreviewArguments,
@@ -176,6 +178,16 @@ export function transientFunctionCallParts(
 export interface ToolCallPreviewLookupOptions {
   /** Keep the completed transient snapshot visible until its durable ToolCall is available. */
   includeFinal?: boolean;
+}
+
+/** Keep argument generation visible until the linked durable tool begins executing or settles. */
+export function shouldKeepTransientToolCallPreview(
+  call: Pick<ToolCallRecord, 'status'> | undefined,
+  outcomeStatus: ReliableToolOutcomeProjectionStatus | undefined
+): boolean {
+  if (!call) return true;
+  if (outcomeStatus !== undefined && outcomeStatus !== 'missing') return false;
+  return call.status === 'streaming' || call.status === 'queued';
 }
 
 export function toolCallPreviewByCallId(

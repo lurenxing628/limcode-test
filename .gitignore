@@ -69,6 +69,8 @@ docs/architecture/*
 !/tests/reliable-kernel/debug-capture-ui.test.mjs
 !/tests/reliable-kernel/llm-capability-provider-adapter.test.mjs
 !/tests/reliable-kernel/model-system-prompt-prefix.test.mjs
+!/tests/reliable-kernel/reliable-message-activity-row.test.mjs
+!/tests/reliable-kernel/function-call-preview-handoff.test.mjs
 !/tests/reliable-kernel/native-compact-media.test.mjs
 !/tests/reliable-kernel/native-astra-integration.test.mjs
 !/tests/reliable-kernel/native-tool-admission.test.mjs

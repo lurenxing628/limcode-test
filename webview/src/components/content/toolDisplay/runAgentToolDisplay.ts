@@ -6,7 +6,10 @@ import { answerFromValue, answerMarkdownSection } from './agentAnswerToolDisplay
 export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
   const conversationId = context.childConversationId?.trim() || undefined;
   const answer = answerFromValue(context.result);
-  const metadataSections = runAgentMetadataSections(context);
+  const metadataSections = [
+    ...runAgentListSections(context.result),
+    ...runAgentMetadataSections(context)
+  ];
   const outputSections = metadataSections.length > 0 || answer?.content
     ? [
         ...metadataSections,
@@ -29,6 +32,32 @@ export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
       : []
   };
 };
+
+export function isRunAgentSpawnArguments(value: unknown): boolean {
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed) as unknown; }
+    catch { return false; }
+  }
+  return asRecord(parsed)?.operation === 'spawn';
+}
+
+function runAgentListSections(value: unknown): ToolDisplaySection[] {
+  const record = asRecord(value);
+  if (record?.operation !== 'list') return [];
+  const scope = record.scope === 'tree' ? 'tree' : 'direct';
+  const count = scope === 'tree' ? record.totalDescendants : record.totalDirect;
+  const total = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0
+    ? count
+    : undefined;
+  const rows = [
+    { label: '操作', value: '列出已有子 Agent（不会启动新任务）' },
+    { label: '范围', value: scope === 'tree' ? '整个子任务树' : '直接子任务' },
+    ...(total !== undefined ? [{ label: '已有子任务', value: `${total} 个` }] : []),
+    ...(total === 0 ? [{ label: '结果', value: '当前没有子任务；本次查询未启动子 Agent' }] : [])
+  ];
+  return [{ kind: 'output', title: '子 Agent 查询结果', rows, rowStyle: 'keyValue' }];
+}
 
 function runAgentMetadataSections(context: ToolDisplayContext): ToolDisplaySection[] {
   const record = asRecord(context.result) ?? asRecord(context.progress);

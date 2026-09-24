@@ -9,6 +9,40 @@ const { ReliableKernelWebviewFeedBridge } = require(path.join(
   root,
   'dist/extension/backend/reliableKernel/webviewFeedBridge.js'
 ));
+const { ReliableTransientReplayStore } = require(path.join(
+  root,
+  'dist/extension/backend/reliableKernel/transientReplay.js'
+));
+
+test('transient replay covers observed native controls and refuses an unknown visible gap', () => {
+  const replay = new ReliableTransientReplayStore();
+  const observedAt = new Date().toISOString();
+  const event = (streamSeq, fromStreamSeq, kind, content) => ({
+    conversationId: 'conversation-control-spans', turnId: 'turn-control-spans',
+    modelRequestId: 'request-control-spans', requestSeq: '1',
+    providerId: 'provider-control-spans', modelId: 'model-control-spans',
+    attemptSeq: '1', socketGeneration: '1', afterCommitSeq: '0',
+    observedAt, fromStreamSeq,
+    event: { kind, streamSeq, content }
+  });
+  const identity = {
+    conversationId: 'conversation-control-spans', modelRequestId: 'request-control-spans',
+    attemptSeq: '1', socketGeneration: '1'
+  };
+  replay.observe(event('2', '1', 'output_delta', { type: 'text_delta', text: 'A' }));
+  replay.observe(event('4', '3', 'output_delta', { type: 'text_delta', text: 'B' }));
+  const covered = replay.snapshot(identity);
+  assert.equal(covered.headStreamSeq, '4');
+  assert.equal(covered.events[0].fromStreamSeq, '1');
+  assert.equal(covered.events[0].event.content.text, 'AB');
+
+  replay.observe(event('6', '6', 'output_delta', { type: 'text_delta', text: 'C' }));
+  assert.equal(replay.snapshot(identity), undefined,
+    'a missing visible seq 5 cannot be healed from an incomplete cumulative replay');
+  replay.observe(event('7', '7', 'completed', { role: 'model', parts: [{ text: 'ABC final' }] }));
+  assert.equal(replay.snapshot(identity)?.events[0]?.event.kind, 'completed',
+    'the authoritative completed output restores a safe snapshot');
+});
 
 test('Feed waits for Ready, stays disconnected while hidden, and creates one fresh session on reveal', async () => {
   const feed = fakeFeed();
@@ -117,7 +151,7 @@ test('tool_call_delta flushes a new call immediately and coalesces later fragmen
   bridge.reconnect(clientId);
   await eventually(() => snapshots(posted).length === 1);
 
-  const transient = (streamSeq, content, kind = 'output_delta') => ({
+  const transient = (streamSeq, content, kind = 'output_delta', fromStreamSeq = streamSeq) => ({
     conversationId: 'conversation-tool-preview',
     turnId: 'turn-tool-preview',
     modelRequestId: 'request-tool-preview',
@@ -127,35 +161,41 @@ test('tool_call_delta flushes a new call immediately and coalesces later fragmen
     attemptSeq: '1',
     socketGeneration: '1',
     afterCommitSeq: '0',
+    fromStreamSeq,
     observedAt: '2026-08-19T00:00:00.000Z',
     event: { kind, streamSeq, content }
   });
 
-  bridge.broadcastTransient(transient('1', { type: 'thought_delta', text: '先分析' }));
+  bridge.broadcastTransient(transient('2', { type: 'thought_delta', text: '先分析' }, 'output_delta', '1'));
   await Promise.resolve();
   assert.equal(transientPosts(posted).length, 0, 'ordinary output still waits for the existing batch window');
 
-  bridge.broadcastTransient(transient('2', {
+  bridge.broadcastTransient(transient('4', {
     type: 'tool_call_delta',
     calls: [{ id: 'call-tool-preview', name: 'write', argumentsDelta: '{"path":' }]
-  }));
+  }, 'output_delta', '3'));
   await Promise.resolve();
 
   const [firstBatch] = transientPosts(posted);
   assert.equal(firstBatch?.type, 'reliable-kernel.transient-batch');
-  assert.deepEqual(firstBatch.events.map((entry) => entry.event.streamSeq), ['1', '2']);
-  assert.deepEqual(firstBatch.events.map((entry) => entry.fromStreamSeq), ['1', '2']);
+  assert.deepEqual(firstBatch.events.map((entry) => entry.event.streamSeq), ['2', '4']);
+  assert.deepEqual(firstBatch.events.map((entry) => entry.fromStreamSeq), ['1', '3'],
+    'each visible event covers only its contiguous observed native-control boundary');
   assert.deepEqual(firstBatch.events.map((entry) => entry.event.content.type), [
     'thought_delta',
     'tool_call_delta'
   ]);
 
-  for (let index = 3; index <= 12; index += 1) {
+  for (let index = 5; index <= 14; index += 1) {
     bridge.broadcastTransient(transient(String(index), {
       type: 'tool_call_delta',
       calls: [{ id: 'call-tool-preview', argumentsDelta: 'x' }]
     }));
   }
+  bridge.broadcastTransient(transient('16', {
+    type: 'tool_call_delta',
+    calls: [{ id: 'call-tool-preview', argumentsDelta: 'z' }]
+  }));
   await Promise.resolve();
   assert.equal(transientPosts(posted).length, 1, 'later fragments wait for one presentation window');
   await eventually(() => transientPosts(posted).length === 2);
@@ -163,12 +203,14 @@ test('tool_call_delta flushes a new call immediately and coalesces later fragmen
   const compactedEvents = compacted.type === 'reliable-kernel.transient-batch'
     ? compacted.events
     : [compacted];
-  assert.equal(compactedEvents.length, 1);
-  assert.equal(compactedEvents[0].fromStreamSeq, '3');
-  assert.equal(compactedEvents[0].event.streamSeq, '12');
+  assert.equal(compactedEvents.length, 2, 'a missing visible sequence must not be coalesced away');
+  assert.equal(compactedEvents[0].fromStreamSeq, '5');
+  assert.equal(compactedEvents[0].event.streamSeq, '14');
   assert.equal(compactedEvents[0].event.content.calls[0].argumentsDelta, 'x'.repeat(10));
+  assert.equal(compactedEvents[1].fromStreamSeq, '16');
+  assert.equal(compactedEvents[1].event.streamSeq, '16');
 
-  bridge.broadcastTransient(transient('13', {
+  bridge.broadcastTransient(transient('17', {
     type: 'tool_call_delta',
     calls: [{ id: 'call-second', name: 'read', argumentsDelta: '{"path":"a"}' }]
   }));
