@@ -169,7 +169,7 @@ async function fixture({ contextWindowTokens = 40_000, compression = {}, turns, 
       commandId: 'preview-then-rebuild', conversationId: 'preview-conversation', compressSegmentCount: 1,
       target: { kind: 'current_head', expectedRootId: head.root_id }, sourceReplay: 'immutable_provenance'
     });
-    await run({ preview, rebuild, server, list, headRootId: head.root_id, save, config });
+    await run({ preview, rebuild, server, list, headRootId: head.root_id, save, config, runner });
   } finally {
     runner?.dispose();
     if (app) await app.close();
@@ -234,6 +234,23 @@ test('分段重建：模型每次都写超长时，实际请求数最多比预�
       server.bodies.length <= result.outcome.providerRequests + 1,
       `sent ${server.bodies.length} requests for an estimate of ${result.outcome.providerRequests}`
     );
+  });
+});
+
+test('同一上下文同时请求两次预估只算一次，再打开对话框直接复用；设置变了重新估算', async () => {
+  await fixture({ turns: [`HISTORY-START ${words(20_000, 'fact')} HISTORY-END`] }, async ({ runner, headRootId, save, config }) => {
+    const input = { conversationId: 'preview-conversation', expectedRootId: headRootId };
+    const [first, second] = await Promise.all([
+      runner.previewSourceReplayCompression(input),
+      runner.previewSourceReplayCompression(input)
+    ]);
+    assert.equal(first.outcome.kind, 'ready', JSON.stringify(first));
+    assert.equal(second, first, 'a concurrent request joins the running estimate instead of computing it again');
+    assert.equal(await runner.previewSourceReplayCompression(input), first, 'reopening the dialog reuses the answer');
+    await save('llmCompressionConfigs', { configs: [{ ...config, llmSummary: { ...config.llmSummary, targetTokens: 2_000 } }] });
+    const changed = await runner.previewSourceReplayCompression(input);
+    assert.notEqual(changed, first, 'other settings are another estimate');
+    assert.equal(changed.outcome.kind, 'ready');
   });
 });
 

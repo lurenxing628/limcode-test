@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type {
   CompressionRebuildPreviewOutcome,
   CompressionRebuildSourceEstimate,
@@ -59,6 +60,48 @@ export interface CompressionRebuildPreview {
 }
 
 const PREVIEW_REQUEST_ID = 'compression_rebuild_preview';
+const PREVIEW_CACHE_LIMIT = 8;
+
+/**
+ * One estimate per Context root and frozen settings. The estimate runs on the extension host and a
+ * long history takes a noticeable moment; reopening the dialog, or a second panel asking, joins the
+ * running computation or reuses its answer instead of starting another one alongside it. A root
+ * never changes, so an answer stays right for the same root and authority; a failure is not kept.
+ * Closing the dialog needs no cancellation: the Webview ignores an answer it no longer waits for.
+ */
+export class CompressionRebuildPreviewCache {
+  private readonly entries = new Map<string, Promise<CompressionRebuildPreview>>();
+
+  public preview(input: CompressionRebuildPreviewInput): Promise<CompressionRebuildPreview> {
+    const key = previewCacheKey(input);
+    const existing = this.entries.get(key);
+    if (existing) {
+      this.entries.delete(key);
+      this.entries.set(key, existing);
+      return existing;
+    }
+    const running = previewCompressionSourceReplay(input);
+    this.entries.set(key, running);
+    running.catch(() => {
+      if (this.entries.get(key) === running) this.entries.delete(key);
+    });
+    for (const oldest of this.entries.keys()) {
+      if (this.entries.size <= PREVIEW_CACHE_LIMIT) break;
+      this.entries.delete(oldest);
+    }
+    return running;
+  }
+
+  public clear(): void {
+    this.entries.clear();
+  }
+}
+
+function previewCacheKey(input: CompressionRebuildPreviewInput): string {
+  return createHash('sha256')
+    .update(JSON.stringify([input.conversationId, input.rootId, input.authority]))
+    .digest('hex');
+}
 
 /**
  * Estimates a rebuild from original records before the user confirms it. It walks the same frozen
@@ -147,7 +190,7 @@ export async function previewCompressionSourceReplay(
     rooms.calibratedBodyTargetTokens
   );
 
-  const compactFor = (methodKind: ExecutedMethodKind, tools?: readonly CompressionToolDefinition[]): LlmCompactRequest => {
+  const buildCompact = (methodKind: ExecutedMethodKind, tools?: readonly CompressionToolDefinition[]): LlmCompactRequest => {
     const text = methodKind !== 'provider_native';
     const recipe = normalizePlainJson({
       kind: 'reliable-context-compression',
@@ -185,16 +228,31 @@ export async function previewCompressionSourceReplay(
     };
     return compactRequestForCompressionPlanning(request);
   };
+  // Text methods read the same Context the same way; only the method differs. Building the compact
+  // request walks the whole history, so it is built once and the other text methods reuse it.
+  let textCompact: LlmCompactRequest | undefined;
+  const compactFor = (methodKind: Exclude<ExecutedMethodKind, 'provider_native'>): LlmCompactRequest => {
+    textCompact ??= buildCompact('segmented_summary');
+    if (methodKind === 'segmented_summary') return textCompact;
+    const { segments: _segments, ...single } = textCompact;
+    return {
+      ...single,
+      methodKind,
+      methodConfigSnapshot: { ...textCompact.methodConfigSnapshot!, kind: methodKind }
+    };
+  };
   // The kernel preflight every compression ModelRequest passes before dispatch.
   const admitted = (compact: LlmCompactRequest): boolean => preflightCompressionRequest({
     contextWindowTokens: policy.provider.contextWindowTokens,
     maxOutputTokens: policy.provider.maxOutputTokens,
     compressionThresholdTokens: policy.provider.contextWindowTokens,
-    breakdown: estimateCompactProjection(compact)
+    breakdown: compact.methodKind === 'segmented_summary' ? estimateCompactProjection(compact) : textSourceProjection
   }).status === 'ready';
   const summaryWindow = { contextWindowTokens: policy.provider.contextWindowTokens };
 
   const textSource = compactFor('llm_summary');
+  // Single-call methods send the whole source; its projection is measured once for all of them.
+  const textSourceProjection = estimateCompactProjection(textSource);
   const estimate: CompressionRebuildSourceEstimate = {
     sourceTokens: estimateMessageContentsTokens([...(textSource.priorSummaryContents ?? []), ...textSource.contents]),
     summaryCount,
@@ -203,7 +261,7 @@ export async function previewCompressionSourceReplay(
       contextWindowTokens: policy.provider.contextWindowTokens,
       maxOutputTokens: policy.provider.maxOutputTokens,
       compressionThresholdTokens: policy.provider.contextWindowTokens,
-      breakdown: estimateCompactProjection(textSource)
+      breakdown: textSourceProjection
     }).planningInputCapacityTokens
   };
   const ready = (
@@ -230,7 +288,14 @@ export async function previewCompressionSourceReplay(
     const methodKind = attempt.methodKind;
     if (methodKind === 'provider_native') {
       const tools = await readLatestFrozenCompressionTools(database, contentStore, conversationId);
-      if (admitted(compactFor(methodKind, tools))) return ready(methodKind, 1, 0, 0);
+      const native = buildCompact(methodKind, tools);
+      const nativeAdmitted = preflightCompressionRequest({
+        contextWindowTokens: policy.provider.contextWindowTokens,
+        maxOutputTokens: policy.provider.maxOutputTokens,
+        compressionThresholdTokens: policy.provider.contextWindowTokens,
+        breakdown: estimateCompactProjection(native)
+      }).status === 'ready';
+      if (nativeAdmitted) return ready(methodKind, 1, 0, 0);
       singleCallTooLarge = true;
       continue;
     }

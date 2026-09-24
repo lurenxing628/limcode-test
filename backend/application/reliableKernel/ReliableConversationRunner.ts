@@ -36,7 +36,7 @@ import type { CoordinateCompressionResult } from '../../reliableKernel/contextCo
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnosticJournal';
 import {
-  previewCompressionSourceReplay,
+  CompressionRebuildPreviewCache,
   type CompressionRebuildPreview
 } from '../../reliableKernel/compressionRebuildPreview';
 import { applyRequestCompressionSettings } from '../../reliableKernel/requestCompressionSettings';
@@ -166,6 +166,7 @@ export class ReliableConversationRunner {
   private externalWakeTask: Promise<void> | undefined;
   private localWakeRequested = false;
   private readonly unsubscribeCommit: () => void;
+  private readonly rebuildPreviews = new CompressionRebuildPreviewCache();
   private disposed = false;
 
   public constructor(
@@ -606,7 +607,7 @@ export class ReliableConversationRunner {
     const sourceTurnId = await this.manualCompressionSourceTurn(conversationId, input.childExecutionId);
     const authority = await this.application.turns.previewMaintenanceAuthority(conversationId, sourceTurnId);
     const settings = await this.application.modelProvider.resolveCurrentRequestSettings(authority, conversationId);
-    return previewCompressionSourceReplay({
+    return this.rebuildPreviews.preview({
       database: this.application.database,
       contentStore: this.application.contentStore,
       conversationId,
@@ -844,6 +845,7 @@ export class ReliableConversationRunner {
     this.deferredRecovery.clear();
     this.terminationRecoveryFailures.clear();
     this.interruptCancellationSignaled.clear();
+    this.rebuildPreviews.clear();
   }
 
   private wake(result: TurnCommandResult): void {
