@@ -61,12 +61,17 @@ const groups = computed<SkillSourceGroup[]>(() => SKILL_SOURCES.map((source) => 
 const enabledCount = computed(() => skills.value.filter((skill) => isSkillEnabled(skill)).length);
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
 // Mirrors the backend child bound (childExecutionBoundary.ts): a skill the parent Turn turned off stays off.
+// A Plan the user approved to run in a new conversation is the exception: it keeps the executor's own settings.
 const childBoundNote = computed(() => {
   const rule = '派出它的对话关掉的技能，这里也用不了。';
-  if (props.scopeKind === 'agent') return `这个 Agent 作为子 Agent 运行时，${rule}`;
-  return props.scopeKind === 'conversation' && useToolPolicyStore().isChildConversation(props.scopeId)
+  if (props.scopeKind === 'agent') {
+    return `这个 Agent 被模型派出作为子 Agent 运行时，${rule}用户在 Plan 卡片上选「新开对话执行」交给它时，按它自己的技能设置运行。`;
+  }
+  const tools = useToolPolicyStore();
+  if (props.scopeKind !== 'conversation' || !tools.isChildConversation(props.scopeId)) return '';
+  return tools.childConversationBoundedByParent(props.scopeId)
     ? `这是子 Agent 对话，${rule}`
-    : '';
+    : '这是用户批准 Plan 后新开的子 Agent 对话，按执行 Agent 自己的技能设置运行，不受派出它的对话限制。';
 });
 const sourceLabel = computed(() => {
   if (props.scopeKind === 'global') return '全局默认策略';

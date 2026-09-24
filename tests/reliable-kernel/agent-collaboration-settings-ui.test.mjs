@@ -145,9 +145,12 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
       assert.doesNotMatch(oldHtml, /<input[^>]*aria-label="最大子 Agent 深度"/);
       assert.match(oldHtml, /全局设置的「Agent 协作」页/);
       assert.doesNotMatch(oldHtml, /受派出它的对话限制/, 'the global scope never runs as a child');
-      assert.match(await render(toolEditor, { scopeKind: 'agent', scopeId: 'worker' }),
-        /这个 Agent 作为子 Agent 运行时，还受派出它的对话限制：只能使用双方都允许的工具和 MCP 服务/);
-      assert.match(await render(skillEditor, { scopeKind: 'agent', scopeId: 'worker' }), /这个 Agent 作为子 Agent 运行时，派出它的对话关掉的技能，这里也用不了/);
+      const agentToolHtml = await render(toolEditor, { scopeKind: 'agent', scopeId: 'worker' });
+      assert.match(agentToolHtml, /这个 Agent 被模型派出作为子 Agent 运行时，还受派出它的对话限制：只能使用双方都允许的工具和 MCP 服务/);
+      assert.match(agentToolHtml, /用户在 Plan 卡片上选「新开对话执行」交给它时，按它自己的工具设置运行/);
+      const agentSkillHtml = await render(skillEditor, { scopeKind: 'agent', scopeId: 'worker' });
+      assert.match(agentSkillHtml, /这个 Agent 被模型派出作为子 Agent 运行时，派出它的对话关掉的技能，这里也用不了/);
+      assert.match(agentSkillHtml, /用户在 Plan 卡片上选「新开对话执行」交给它时，按它自己的技能设置运行/);
       assert.doesNotMatch(await render(skillEditor, { scopeKind: 'global' }), /派出它的对话关掉的技能/);
       const readonlyHtml = await render(editor, { scopeKind: 'global', readonly: true });
       assert.match(input(readonlyHtml, '最大子 Agent 深度'), /disabled/);
@@ -1082,6 +1085,17 @@ server.connect(new StdioServerTransport());
       assert.doesNotMatch(await render(toolEditor, { scopeKind: 'conversation', scopeId: 'plain' }), /受派出它的对话限制/);
       assert.match(await render(skillEditor, { scopeKind: 'conversation', scopeId: 'child-conversation' }), /这是子 Agent 对话，派出它的对话关掉的技能/);
       assert.doesNotMatch(await render(skillEditor, { scopeKind: 'conversation', scopeId: 'plain' }), /派出它的对话关掉的技能/);
+      // A Plan the user approved to run in a new conversation is not bounded by the planning conversation.
+      feed.projections = { activeConversationWindow: { conversationId: 'child-conversation', childConversationBoundary: {
+        conversationId: 'child-conversation', childExecutionId: 'child', boundedByParent: false, workEnvironment: null } } };
+      const delegatedTools = await render(toolEditor, { scopeKind: 'conversation', scopeId: 'child-conversation' });
+      assert.doesNotMatch(delegatedTools, /工具还受派出它的对话限制/);
+      assert.match(delegatedTools, /这是用户批准 Plan 后新开的子 Agent 对话，按执行 Agent 自己的工具设置运行，不受派出它的对话限制/);
+      const delegatedSkills = await render(skillEditor, { scopeKind: 'conversation', scopeId: 'child-conversation' });
+      assert.doesNotMatch(delegatedSkills, /派出它的对话关掉的技能/);
+      assert.match(delegatedSkills, /这是用户批准 Plan 后新开的子 Agent 对话，按执行 Agent 自己的技能设置运行/);
+      assert.equal((await bindings(toolEditor, { scopeKind: 'conversation', scopeId: 'child-conversation' })).isToolEnabled(send), false,
+        'it is still a child task conversation without cross-conversation tools');
     });
 
     await t.test('工具设置的恢复继承只重置工具设置，保留 Agent 协作里的开关和上限', async () => {

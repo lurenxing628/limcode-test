@@ -88,10 +88,17 @@ const childConversation = computed(() => props.scopeKind === 'conversation' && s
 /** Where the cross-conversation switch lives for this scope. */
 const collaborationArea = computed(() => props.scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域');
 // Mirrors the backend child bound (childExecutionBoundary.ts): a child Turn keeps only what its parent Turn also allows.
+// A Plan the user approved to run in a new conversation is the exception: it keeps the executor's own settings.
 const childBoundNote = computed(() => {
   const rule = '只能使用双方都允许的工具和 MCP 服务；自动执行、自动应用更改和命令白名单也要双方都同意。';
-  if (props.scopeKind === 'agent') return `这个 Agent 作为子 Agent 运行时，还受派出它的对话限制：${rule}`;
-  return childConversation.value ? `这是子 Agent 对话，工具还受派出它的对话限制：${rule}` : '';
+  if (props.scopeKind === 'agent') {
+    return `这个 Agent 被模型派出作为子 Agent 运行时，还受派出它的对话限制：${rule}`
+      + '用户在 Plan 卡片上选「新开对话执行」交给它时，按它自己的工具设置运行。';
+  }
+  if (!childConversation.value) return '';
+  return store.childConversationBoundedByParent(props.scopeId)
+    ? `这是子 Agent 对话，工具还受派出它的对话限制：${rule}`
+    : '这是用户批准 Plan 后新开的子 Agent 对话，按执行 Agent 自己的工具设置运行，不受派出它的对话限制。';
 });
 const switchGrantedToolNames = computed(() => builtinTools.value.filter((tool) => isSwitchGranted(tool)).map((tool) => tool.name));
 /** This scope's own invalid list blocks every edit that would rewrite it; only a reset repairs it. */

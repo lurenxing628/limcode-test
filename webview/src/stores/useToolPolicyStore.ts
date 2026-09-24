@@ -574,6 +574,18 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
         .some((child) => plainText(child.child_conversation_id) === id);
     },
     /**
+     * Whether a child conversation's tools and skills are also bounded by the conversation that
+     * started it. False only for a Plan the user approved to run in a new conversation, read from the
+     * selected conversation's frozen first Turn (`childConversationBoundary`).
+     */
+    childConversationBoundedByParent(conversationId: string | undefined): boolean {
+      const id = conversationId?.trim();
+      if (!id || !this.isChildConversation(id)) return false;
+      const window = useReliableKernelClientFeedStore().projections.activeConversationWindow as Record<string, unknown> | undefined;
+      const boundary = window?.childConversationBoundary as Record<string, unknown> | null | undefined;
+      return !(boundary && plainText(boundary.conversationId) === id && boundary.boundedByParent === false);
+    },
+    /**
      * The backend's own rule over this scope's effective settings: the switch grants the tools to
      * top-level conversations, and send, create and fork also need run_agent in the effective list.
      */
