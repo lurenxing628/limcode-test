@@ -167,7 +167,7 @@ export function emitUnifiedChunk(
     const thoughtSignature = thoughtSignatureFromPart(part);
     const receivedAsync = 'async' in part.functionCall && part.functionCall.async === true;
     const candidate = {
-      id: stableCallId ?? `tool_call_${index}`,
+      id: stableCallId ?? anonymousStreamCallId(part, index, nativeChain),
       name: part.functionCall.name,
       argsJson: stringifyJson(part.functionCall.args ?? {}),
       ...(thoughtSignature ? { thoughtSignature } : {}),
@@ -213,6 +213,30 @@ export function emitUnifiedChunk(
       payload: { requestId, outputItem: outputItemDone }
     });
   }
+}
+
+/**
+ * Fallback ids of stream calls without a provider id, numbered across the whole attempt. runLlmAttempt
+ * creates one chain context per attempt and passes it with every chunk, so it identifies the attempt
+ * here. Numbering per chunk gave two id-less calls in different chunks the same `tool_call_0`, and the
+ * reliable adapter, which merges calls by id, then failed the request on their conflicting content.
+ */
+const anonymousStreamCallIds = new WeakMap<object, { next: number; ids: WeakMap<object, string> }>();
+
+function anonymousStreamCallId(part: UnifiedPart, chunkIndex: number, attempt: object | undefined): string {
+  if (!attempt) return `tool_call_${chunkIndex}`;
+  let allocator = anonymousStreamCallIds.get(attempt);
+  if (!allocator) {
+    allocator = { next: 0, ids: new WeakMap() };
+    anonymousStreamCallIds.set(attempt, allocator);
+  }
+  let id = allocator.ids.get(part);
+  if (!id) {
+    id = `tool_call_${allocator.next}`;
+    allocator.next += 1;
+    allocator.ids.set(part, id);
+  }
+  return id;
 }
 
 export function emitUnifiedResponse(requestId: string, response: UnifiedLLMResponse, emit: Emit): void {

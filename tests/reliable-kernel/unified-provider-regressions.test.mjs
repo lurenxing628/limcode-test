@@ -164,3 +164,30 @@ test('OpenAI 兼容流里不带 id 的工具调用同样只存一条', async () 
     ]);
   });
 });
+
+test('没有 id 的调用分在不同块里到达时各自存下，不会因为占位 id 相同而整轮失败', async () => {
+  // 占位 id 以前按“本块内的序号”生成，两块各一个无 id 调用都叫 tool_call_0，可靠内核按 id 合并时
+  // 报 “reused tool call id tool_call_0 with conflicting content”，整次请求失败。
+  await withServer(() => ({ sse: geminiSse([
+    geminiChunk([{ functionCall: { name: 'list_items', args: { page: 1 } } }]),
+    geminiChunk([{ functionCall: { name: 'list_items', args: { page: 2 } } }], 'STOP')
+  ]) }), async (base) => {
+    const result = await sendThroughKernel(settings('gemini', `${base}/v1beta`, 'gemini-2.5-flash'), [user('go')]);
+    assert.equal(result.error, undefined, result.error?.message);
+    const calls = functionCallsOf(result.completed);
+    assert.deepEqual(calls.map((part) => part.functionCall.args), [{ page: 1 }, { page: 2 }]);
+    assert.notEqual(calls[0].id, calls[1].id);
+  });
+
+  const chunk = (delta, finish = null) => ({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason: finish }] });
+  const sse = [
+    chunk({ role: 'assistant', tool_calls: [{ index: 0, type: 'function', function: { name: 'list_items', arguments: '{"page":1}' } }] }),
+    chunk({ tool_calls: [{ index: 1, type: 'function', function: { name: 'list_items', arguments: '{"page":2}' } }] }),
+    chunk({}, 'tool_calls')
+  ].map((value) => `data: ${JSON.stringify(value)}\n\n`).join('') + 'data: [DONE]\n\n';
+  await withServer(() => ({ sse }), async (base) => {
+    const result = await sendThroughKernel(settings('openai-compatible', `${base}/v1`, 'relay-model'), [user('go')]);
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.deepEqual(functionCallsOf(result.completed).map((part) => part.functionCall.args), [{ page: 1 }, { page: 2 }]);
+  });
+});
