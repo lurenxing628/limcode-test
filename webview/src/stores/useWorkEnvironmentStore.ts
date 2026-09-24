@@ -16,7 +16,11 @@ import {
   isRemoteServerWorkEnvironmentKind,
   workEnvironmentSortKey as buildWorkEnvironmentSortKey
 } from '@shared/workEnvironmentCatalog';
-import { resolveWorkEnvironmentSelection, type WorkEnvironmentSelection } from '@shared/workEnvironmentSelection';
+import {
+  resolveWorkEnvironmentSelection,
+  type WorkEnvironmentSelection,
+  type WorkEnvironmentSelectionPolicy
+} from '@shared/workEnvironmentSelection';
 import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
 import { useAgentStore } from './useAgentStore';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -154,9 +158,30 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
     workEnvironmentEnabledForConversation(conversationId: string): boolean {
       return this.effectivePolicyForConversation(conversationId).policy?.enabled === true;
     },
+    /**
+     * The work environments a child Agent conversation's next Turn inherits (its latest Turn's frozen
+     * list and directory), as the kernel applies them; undefined for any other conversation.
+     */
+    childInheritedWorkEnvironmentPolicy(conversationId: string): WorkEnvironmentSelectionPolicy | 'unknown' | undefined {
+      const feed = useReliableKernelClientFeedStore();
+      const child = Object.values(feed.records.ChildExecution ?? {}).some(record => record.child_conversation_id === conversationId);
+      if (!child) return undefined;
+      const window = feed.projections.activeConversationWindow as Record<string, unknown> | undefined;
+      const boundary = window?.childConversationBoundary as Record<string, unknown> | null | undefined;
+      if (!boundary || boundary.conversationId !== conversationId) return 'unknown';
+      const frozen = boundary.workEnvironment as Record<string, unknown> | null | undefined;
+      // A latest Turn that froze no work environments bounds nothing, as in the kernel.
+      if (!frozen || !Array.isArray(frozen.allowedWorkEnvironmentIds)) return undefined;
+      return {
+        allowedWorkEnvironmentIds: frozen.allowedWorkEnvironmentIds.filter((id): id is string => typeof id === 'string'),
+        defaultWorkEnvironmentId: typeof frozen.defaultWorkEnvironmentId === 'string' ? frozen.defaultWorkEnvironmentId : null
+      };
+    },
     environmentSelectionForConversation(conversationId: string): WorkEnvironmentSelection {
       const clientState = useClientStateStore();
       const feed = useReliableKernelClientFeedStore();
+      const inheritedPolicy = this.childInheritedWorkEnvironmentPolicy(conversationId);
+      if (inheritedPolicy === 'unknown') return { allowed: [], error: '子 Agent 对话的工作目录范围暂不可用，请稍后再试。' };
       const projectLinks = Object.values(feed.records.ConversationProjectLink ?? {}).filter(link =>
         link.conversation_id === conversationId && link.role === 'primary');
       const project = projectLinks.length === 1
@@ -167,6 +192,7 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
       return resolveWorkEnvironmentSelection({
         environments: clientState.workEnvironments,
         policy: this.effectivePolicyForConversation(conversationId).policy,
+        ...(inheritedPolicy ? { inheritedPolicy } : {}),
         explicitWorkEnvironmentId: selected?.workEnvironmentId,
         ...(typeof project?.uri === 'string' ? { project: { uri: project.uri } } : {}),
         projectMissing: projectLinks.length > 0 && typeof project?.uri !== 'string'

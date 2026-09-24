@@ -10,7 +10,8 @@
 import type Database from 'better-sqlite3';
 import {
   RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS,
-  type ActiveTurnWorkEnvironmentProjection
+  type ActiveTurnWorkEnvironmentProjection,
+  type ChildConversationBoundaryProjection
 } from '../../shared/reliableKernelClientFeed';
 import {
   DEFAULT_CONVERSATION_TITLE,
@@ -634,7 +635,8 @@ export function executeClientProjectionSnapshot(
       conversationContextStatuses: [],
       taskList: [],
       currentTaskList: null,
-      activeTurnWorkEnvironment: null
+      activeTurnWorkEnvironment: null,
+      childConversationBoundary: null
     };
     const emptyTurns = {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [], modelRequests: [],
@@ -823,7 +825,10 @@ export function executeClientProjectionSnapshot(
       .map((turn) => turn.status === 'active'
         ? projectTurnClientRecord(database, String(turn.id), content)
         : turn);
-    const activeTurnWorkEnvironment = projectActiveTurnWorkEnvironment(database, conversationId, turns, content);
+    // One read per frozen AuthoritySnapshot: a child's active Turn is also its latest Turn.
+    const authorityDocuments: TurnAuthorityDocuments = new Map();
+    const activeTurnWorkEnvironment = projectActiveTurnWorkEnvironment(database, conversationId, turns, content, authorityDocuments);
+    const childConversationBoundary = projectChildConversationBoundary(database, conversationId, content, authorityDocuments);
 
     // Processes and child executions are independently visible summaries. Their active rows are
     // pinned even after their source Message leaves the normal 200-message suffix. The source
@@ -1124,7 +1129,8 @@ export function executeClientProjectionSnapshot(
         conversationContextStatuses,
         taskList,
         currentTaskList,
-        activeTurnWorkEnvironment
+        activeTurnWorkEnvironment,
+        childConversationBoundary
       },
       activeTurnSummary: {
         turns,
@@ -1198,13 +1204,91 @@ export function projectActiveTurnWorkEnvironment(
   database: Database.Database,
   conversationId: string,
   selectedTurns: readonly DomainRow[],
-  content: ClientProjectionContentAccess
+  content: ClientProjectionContentAccess,
+  documents?: TurnAuthorityDocuments
 ): ActiveTurnWorkEnvironmentProjection | null {
   // Reuse the active Conversation's existing bounded roots; do not rescan historical Turns.
   const turns = selectedTurns.filter(turn => turn.conversation_id === conversationId && turn.status === 'active');
   if (turns.length === 0) return null;
   if (turns.length !== 1) throw new Error(`Conversation ${conversationId} has multiple active Turns.`);
   const turnId = requireRuntimeId(turns[0].id);
+  // Absence is unknown, never a request to substitute current editable configuration. The UI
+  // distinguishes an active Turn with no projection from a Conversation with no active Turn.
+  const document = readTurnAuthorityDocument(database, turnId, content, documents);
+  const policy = document && frozenWorkEnvironmentProjection(turnId, document);
+  if (!policy) return null;
+  const projection: ActiveTurnWorkEnvironmentProjection = { conversationId, ...policy };
+  // Never truncate a boundary: an oversized or malformed frozen policy is not a different policy.
+  if (wireJsonBytes(projection) > CLIENT_PAGE_MAX_BYTES) {
+    throw new Error(`Turn ${turnId} work-environment policy exceeds the client projection size bound.`);
+  }
+  return projection;
+}
+
+/**
+ * The bound a Turn the user starts in this child conversation will inherit: the tool and skill
+ * bound frozen by the child's first Turn and the work environments of its latest Turn. Null for a
+ * conversation that is not a child execution.
+ */
+export function projectChildConversationBoundary(
+  database: Database.Database,
+  conversationId: string,
+  content: ClientProjectionContentAccess,
+  documents?: TurnAuthorityDocuments
+): ChildConversationBoundaryProjection | null {
+  const children = queryPlainRows(database, `
+    SELECT id FROM child_execution WHERE child_conversation_id = @conversationId LIMIT 2
+  `, { conversationId });
+  if (children.length === 0) return null;
+  if (children.length !== 1) throw new Error(`Conversation ${conversationId} has multiple ChildExecutions.`);
+  const childExecutionId = requireRuntimeId(children[0].id);
+  const turnAt = (direction: 'ASC' | 'DESC') => queryPlainRows(database, `
+    SELECT turn_id FROM child_execution_turn_link
+     WHERE child_execution_id = @childExecutionId
+     ORDER BY turn_seq ${direction}
+     LIMIT 1
+  `, { childExecutionId })[0];
+  const first = turnAt('ASC');
+  const latest = turnAt('DESC');
+  if (!first || !latest) throw new Error(`ChildExecution ${childExecutionId} has no Turn lineage.`);
+  const firstTurnId = requireRuntimeId(first.turn_id);
+  const latestTurnId = requireRuntimeId(latest.turn_id);
+  const firstDocument = readTurnAuthorityDocument(database, firstTurnId, content, documents);
+  const latestDocument = readTurnAuthorityDocument(database, latestTurnId, content, documents);
+  const toolPolicy = firstDocument?.toolPolicy;
+  const projection: ChildConversationBoundaryProjection = {
+    conversationId,
+    childExecutionId,
+    boundedByParent: !!toolPolicy && typeof toolPolicy === 'object' && !Array.isArray(toolPolicy)
+      && (toolPolicy as Record<string, unknown>).inherited !== undefined,
+    workEnvironment: latestDocument ? frozenWorkEnvironmentProjection(latestTurnId, latestDocument) : null
+  };
+  if (wireJsonBytes(projection) > CLIENT_PAGE_MAX_BYTES) {
+    throw new Error(`ChildExecution ${childExecutionId} boundary exceeds the client projection size bound.`);
+  }
+  return projection;
+}
+
+type TurnAuthorityDocuments = Map<string, Record<string, unknown> | null>;
+
+/** One Turn's frozen AuthoritySnapshot document, read within the projection bound; null when none. */
+function readTurnAuthorityDocument(
+  database: Database.Database,
+  turnId: string,
+  content: ClientProjectionContentAccess,
+  documents?: TurnAuthorityDocuments
+): Record<string, unknown> | null {
+  if (documents?.has(turnId)) return documents.get(turnId)!;
+  const document = readTurnAuthorityDocumentUncached(database, turnId, content);
+  documents?.set(turnId, document);
+  return document;
+}
+
+function readTurnAuthorityDocumentUncached(
+  database: Database.Database,
+  turnId: string,
+  content: ClientProjectionContentAccess
+): Record<string, unknown> | null {
   const authorities = queryPlainRows(database, `
     SELECT content.*
       FROM authority_snapshot AS authority
@@ -1213,8 +1297,6 @@ export function projectActiveTurnWorkEnvironment(
      ORDER BY authority.created_at DESC, authority.id DESC
      LIMIT 2
   `, { turnId });
-  // Absence is unknown, never a request to substitute current editable configuration. The UI
-  // distinguishes an active Turn with no projection from a Conversation with no active Turn.
   if (authorities.length === 0) return null;
   if (authorities.length !== 1) throw new Error(`Turn ${turnId} has multiple AuthoritySnapshots.`);
   const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(authorities[0]);
@@ -1225,7 +1307,14 @@ export function projectActiveTurnWorkEnvironment(
   if (!document || typeof document !== 'object' || Array.isArray(document)) {
     throw new Error(`Turn ${turnId} AuthoritySnapshot is not an object.`);
   }
-  const policy = (document as Record<string, unknown>).workEnvironmentPolicy;
+  return document as Record<string, unknown>;
+}
+
+function frozenWorkEnvironmentProjection(
+  turnId: string,
+  document: Record<string, unknown>
+): Omit<ActiveTurnWorkEnvironmentProjection, 'conversationId'> | null {
+  const policy = document.workEnvironmentPolicy;
   if (policy === undefined || policy === null) return null;
   if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
     throw new Error(`Turn ${turnId} work-environment policy is invalid.`);
@@ -1234,8 +1323,7 @@ export function projectActiveTurnWorkEnvironment(
   if (typeof fields.enabled !== 'boolean' || !Array.isArray(fields.allowedWorkEnvironmentIds)) {
     throw new Error(`Turn ${turnId} work-environment policy is incomplete.`);
   }
-  const projection: ActiveTurnWorkEnvironmentProjection = {
-    conversationId,
+  return {
     turnId,
     enabled: fields.enabled,
     defaultWorkEnvironmentId: fields.defaultWorkEnvironmentId === null
@@ -1243,11 +1331,6 @@ export function projectActiveTurnWorkEnvironment(
       : requireRuntimeId(fields.defaultWorkEnvironmentId),
     allowedWorkEnvironmentIds: fields.allowedWorkEnvironmentIds.map(requireRuntimeId)
   };
-  // Never truncate a boundary: an oversized or malformed frozen policy is not a different policy.
-  if (wireJsonBytes(projection) > CLIENT_PAGE_MAX_BYTES) {
-    throw new Error(`Turn ${turnId} work-environment policy exceeds the client projection size bound.`);
-  }
-  return projection;
 }
 
 function taskListProjectionFromOutcome(

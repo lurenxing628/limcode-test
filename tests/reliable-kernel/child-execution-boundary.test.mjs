@@ -347,6 +347,15 @@ test('spawned, continued and user-started child Turns all stay within the parent
     assert.deepEqual(request.inheritedWorkEnvironmentPolicy, { enabled, allowedWorkEnvironmentIds, defaultWorkEnvironmentId });
     assert.deepEqual(request.inheritedToolPolicy, spawned.inherited);
     assert.ok(request.inheritedSkillPolicy, 'the user-started Turn also carries the skill bound');
+    // The composer reads the same bound: the child's latest Turn, and whether the parent bounds its tools.
+    const window = (await f.app.database.clientProjectionSnapshot(child.child_conversation_id)).snapshot.activeConversationWindow;
+    const latest = (await f.frozen(userTurn.turn_id)).document.workEnvironmentPolicy;
+    assert.deepEqual(window.childConversationBoundary, {
+      conversationId: child.child_conversation_id, childExecutionId: child.id, boundedByParent: true,
+      workEnvironment: { turnId: userTurn.turn_id, enabled: latest.enabled, defaultWorkEnvironmentId: latest.defaultWorkEnvironmentId,
+        allowedWorkEnvironmentIds: latest.allowedWorkEnvironmentIds }
+    });
+    assert.equal((await f.app.database.clientProjectionSnapshot('parent')).snapshot.activeConversationWindow.childConversationBoundary, null);
   }, {
     async send(request, controls, f) {
       let part = { text: 'done' };
@@ -474,6 +483,9 @@ test('a Plan the user approves to run in a new conversation runs with the execut
     assert.deepEqual(later.toolPolicy.allowedTools, ['read', 'run_agent', 'submit_agent_answer', 'write']);
     assert.equal(later.toolPolicy.inherited, undefined);
     assert.equal(later.workEnvironmentPolicy.defaultWorkEnvironmentId, beta);
+    const boundary = (await f.app.database.clientProjectionSnapshot(child.child_conversation_id)).snapshot.activeConversationWindow.childConversationBoundary;
+    assert.equal(boundary.boundedByParent, false, 'the composer and settings know the parent does not bound it');
+    assert.equal(boundary.workEnvironment.defaultWorkEnvironmentId, beta);
     // Only a user-approved Plan (externally settled) may ask for the executor's own settings.
     await assert.rejects(f.app.runtime.children.spawn({ sourceToolCallId: 'model-call', childAgentId: f.childAgent.id,
       modelFallback: { providerConfigId: f.provider.id, model: f.provider.model }, prompt: 'widen', completionPolicy: 'background',

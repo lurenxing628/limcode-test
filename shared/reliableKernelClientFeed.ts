@@ -38,6 +38,28 @@ export interface ActiveTurnWorkEnvironmentProjection {
   allowedWorkEnvironmentIds: string[];
 }
 
+/**
+ * What the next Turn the user starts in the selected child Agent conversation inherits, read from
+ * frozen authority exactly as the kernel does (readChildExecutionBoundary /
+ * readChildExecutionWorkEnvironmentBoundary).
+ */
+export interface ChildConversationBoundaryProjection {
+  conversationId: string;
+  childExecutionId: string;
+  /**
+   * Whether the child's tools and skills are bounded by the conversation that started it. False for
+   * a Plan the user approved to run in a new conversation: it runs with its executor Agent's own settings.
+   */
+  boundedByParent: boolean;
+  /** The work environments of the child's latest Turn, which bound its next Turn; null when none were frozen. */
+  workEnvironment: {
+    turnId: string;
+    enabled: boolean;
+    defaultWorkEnvironmentId: string | null;
+    allowedWorkEnvironmentIds: string[];
+  } | null;
+}
+
 export interface ReliableKernelSnapshotMessage {
   type: typeof RELIABLE_KERNEL_SNAPSHOT_MESSAGE;
   sessionId: string;

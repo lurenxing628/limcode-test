@@ -132,6 +132,38 @@ test('composer store resolves B with switching disabled and separately reads chi
   assert.match(store.frozenEnvironmentSelectionForConversation('conversation').error, /信息不可用/);
 });
 
+test('a child Agent conversation shows and offers only the directories its next Turn inherits', () => {
+  const { store, state, feed } = makeStore();
+  feed.records.ChildExecution = { child: { id: 'child', child_conversation_id: 'conversation', status: 'active' } };
+  feed.projections.activeConversationWindow = { conversationId: 'conversation', childConversationBoundary: {
+    conversationId: 'conversation', childExecutionId: 'child', boundedByParent: true,
+    workEnvironment: { turnId: 'child-turn', enabled: false, allowedWorkEnvironmentIds: [A.id], defaultWorkEnvironmentId: A.id }
+  } };
+  // The kernel runs the next Turn in the inherited A, not the project folder B.
+  assert.equal(store.activeEnvironmentForConversation('conversation').id, A.id);
+  assert.deepEqual(plain(store.allowedEnvironmentsForConversation('conversation').map(record => record.id)), [A.id]);
+  store.selectConversationEnvironment('conversation', B.id);
+  assert.equal(state.conversationWorkEnvironmentLinks.length, 0, 'a directory outside the inherited list cannot be chosen');
+  // A choice already stored outside the list says where the limit comes from.
+  state.conversationWorkEnvironmentLinks = [{ id: 'link', conversationId: 'conversation', workEnvironmentId: B.id, role: 'active', createdAt: 1, updatedAt: 1 }];
+  const outside = store.environmentSelectionForConversation('conversation');
+  assert.match(outside.error, /不在派出这个子 Agent 的对话允许的范围内/);
+  assert.match(outside.error, /限制来自派出它的对话/);
+  assert.doesNotMatch(outside.error, /调整策略/);
+  // A top-level conversation keeps the ordinary wording.
+  assert.match(selection.resolveWorkEnvironmentSelection({ environments: [A, B], policy: { allowedWorkEnvironmentIds: [A.id] },
+    explicitWorkEnvironmentId: B.id }).error, /未获当前策略允许/);
+  // Without the child's boundary the composer does not guess.
+  feed.projections.activeConversationWindow = { conversationId: 'conversation', childConversationBoundary: null };
+  assert.match(store.environmentSelectionForConversation('conversation').error, /子 Agent 对话的工作目录范围暂不可用/);
+  // A child whose latest Turn froze no work environments is bounded by nothing, as in the kernel.
+  state.conversationWorkEnvironmentLinks = [];
+  feed.projections.activeConversationWindow = { conversationId: 'conversation', childConversationBoundary: {
+    conversationId: 'conversation', childExecutionId: 'child', boundedByParent: true, workEnvironment: null
+  } };
+  assert.equal(store.activeEnvironmentForConversation('conversation').id, B.id);
+});
+
 test('ProductRuntime subscribes once, captures complete add/remove/reorder snapshots and broadcasts after sync', async () => {
   let listener, subscriptions = 0, disposed = 0;
   const workspace = { workspaceFolders: [], onDidChangeWorkspaceFolders(callback) { listener = callback; subscriptions += 1; return { dispose() { disposed += 1; } }; } };

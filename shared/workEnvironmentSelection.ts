@@ -38,7 +38,11 @@ export function resolveWorkEnvironmentSelection(input: {
     const environment = byId.get(id);
     const label = environment?.name || id;
     if (!environment) return { allowed, source, error: `工作环境不存在：${label}，请重新选择工作环境。` };
-    if (!allowedIds.has(id)) return { allowed, source, error: `工作环境未获当前策略允许：${label}，请调整策略或重新选择。` };
+    // A child Agent conversation's list is also bounded by the conversation that started it; say so,
+    // since adjusting this conversation's own settings cannot lift that limit.
+    if (!allowedIds.has(id)) return { allowed, source, error: inheritedIds && !inheritedIds.has(id)
+      ? `工作目录「${label}」不在派出这个子 Agent 的对话允许的范围内。这个限制来自派出它的对话，请从允许的目录中重新选择。`
+      : `工作环境未获当前策略允许：${label}，请调整策略或重新选择。` };
     if (!environment.available) return { allowed, source, error: `当前窗口的工作环境不可用：${label}，请打开对应目录或重新选择。` };
     return { allowed, active: environment, source };
   };

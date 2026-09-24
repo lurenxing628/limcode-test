@@ -7,7 +7,10 @@ import type {
   RepositoryTransactionStep
 } from './repositories';
 import type { DatabaseFoundationInspection } from './databaseSchema';
-import type { ActiveTurnWorkEnvironmentProjection } from '../../shared/reliableKernelClientFeed';
+import type {
+  ActiveTurnWorkEnvironmentProjection,
+  ChildConversationBoundaryProjection
+} from '../../shared/reliableKernelClientFeed';
 import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
 export type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
 
@@ -114,6 +117,7 @@ export interface ClientProjectionSnapshot {
   navigationSummary: Record<string, unknown>;
   activeConversationWindow: Record<string, unknown> & {
     activeTurnWorkEnvironment: ActiveTurnWorkEnvironmentProjection | null;
+    childConversationBoundary: ChildConversationBoundaryProjection | null;
   };
   activeTurnSummary: Record<string, unknown>;
   activeToolAndInteractionSummary: Record<string, unknown>;
