@@ -456,15 +456,39 @@ function readWindowsStartFingerprint(pidInput: string | number): string {
     }
   }
   const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString())`;
-  const result = spawnSync(resolveWindowsPowerShell().executable, [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
-  ], { encoding: 'utf8', windowsHide: true, timeout: 3_000 });
-  if (result.error) throw result.error;
-  const ticks = result.stdout?.trim();
-  if (result.status !== 0 || !ticks || !/^\d+$/.test(ticks)) {
-    throw Object.assign(new Error(`Cannot read start time for process ${pid}.`), { code: 'ENOENT' });
+  const executable = resolveWindowsPowerShell().executable;
+  // PowerShell cold start can exceed a single budget while the machine is busy (window reload,
+  // antivirus scan); only a timeout is retried, every other outcome is final.
+  for (let attempt = 0; ; attempt += 1) {
+    const timeout = WINDOWS_START_PROBE_TIMEOUTS_MS[attempt]!;
+    const result = spawnSync(executable, [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
+    ], { encoding: 'utf8', windowsHide: true, timeout });
+    if (result.error) {
+      const code = (result.error as NodeJS.ErrnoException).code;
+      if (code === 'ETIMEDOUT' && attempt + 1 < WINDOWS_START_PROBE_TIMEOUTS_MS.length) continue;
+      throw Object.assign(new Error(
+        code === 'ETIMEDOUT'
+          ? `Cannot read start time for process ${pid}: PowerShell probe timed out ${attempt + 1} times (last budget ${timeout}ms).`
+          : `Cannot read start time for process ${pid}: PowerShell probe failed to run (${code ?? result.error.message}).`
+      ), { code: code ?? 'ENOENT', cause: result.error });
+    }
+    const ticks = result.stdout?.trim();
+    if (result.status === 0 && ticks && /^\d+$/.test(ticks)) {
+      return `win32-process:${pid}:${BigInt(ticks).toString()}`;
+    }
+    const detail = firstLine(result.stderr) ?? (ticks ? `unexpected output ${JSON.stringify(ticks.slice(0, 80))}` : 'no output');
+    throw Object.assign(new Error(
+      `Cannot read start time for process ${pid}: PowerShell exited with status ${result.status ?? 'null'}; ${detail.replace(/\.$/, '')}.`
+    ), { code: 'ENOENT' });
   }
-  return `win32-process:${pid}:${BigInt(ticks).toString()}`;
+}
+
+const WINDOWS_START_PROBE_TIMEOUTS_MS = [3_000, 6_000, 10_000] as const;
+
+function firstLine(text: string | null | undefined): string | undefined {
+  const line = text?.replace(/\x1B\[[0-9;]*m/g, '').split(/\r?\n/).map((value) => value.trim()).find((value) => value.length > 0);
+  return line === undefined ? undefined : line.slice(0, 200);
 }
 
 export function readLinuxStartFingerprint(pidInput: string | number): string {

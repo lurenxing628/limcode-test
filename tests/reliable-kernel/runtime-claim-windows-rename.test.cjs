@@ -259,3 +259,31 @@ test('Windows Runtime claim publication and dead-owner isolation share bounded r
     await fsp.rm(root, { recursive: true, force: true });
   }
 });
+
+test('Runtime holder inspection explains why an owner is unknown', () => {
+  const invalidPid = claims.inspectRecordedProcess(-1, undefined);
+  assert.equal(invalidPid.state, 'unknown');
+  assert.match(invalidPid.reason, /not a valid pid/);
+
+  const self = claims.inspectRecordedProcess(process.pid, claims.ownProcessStartIdentity());
+  assert.equal(self.state, 'alive');
+  assert.equal(self.reason, undefined);
+});
+
+test('Windows holder inspection of a protected pid fails closed with a recorded reason', windowsOnly, () => {
+  // PID 4 is the Windows System process: a reused-pid holder of this kind is what left a stale
+  // maintenance claim unverifiable in the field.
+  const system = claims.inspectRecordedProcess(4, 'win32-process:4:0');
+  assert.notEqual(system.state, 'alive');
+  if (system.state === 'unknown') assert.ok(system.reason && system.reason.length > 0);
+});
+
+test('Runtime maintenance busy error carries the probe failure reason', () => {
+  const hostControl = require(path.join(process.cwd(), 'dist/extension/backend/reliableKernel/runtimeHostControl.js'));
+  const error = new hostControl.RuntimeMaintenanceBusyError('claim-path', {
+    claimToken: 'token', processId: 5000, startedAt: new Date(0).toISOString(), rootPointerPath: 'root'
+  }, 'PowerShell probe timed out 3 times');
+  assert.equal(error.reason, 'PowerShell probe timed out 3 times');
+  assert.match(error.message, /holder process 5000 for claim-path \(PowerShell probe timed out 3 times\)/);
+  assert.ok(hostControl.isRuntimeMaintenanceBusyError(error));
+});

@@ -18,20 +18,41 @@ export function classifyRecordedProcess(
   processId: number,
   processStartIdentity: string | undefined
 ): RecordedProcessState {
-  if (!Number.isSafeInteger(processId) || processId <= 0) return 'unknown';
+  return inspectRecordedProcess(processId, processStartIdentity).state;
+}
+
+export interface RecordedProcessInspection {
+  state: RecordedProcessState;
+  /** Why the owner could not be proven alive or dead; present only for 'unknown'. */
+  reason?: string;
+}
+
+export function inspectRecordedProcess(
+  processId: number,
+  processStartIdentity: string | undefined
+): RecordedProcessInspection {
+  if (!Number.isSafeInteger(processId) || processId <= 0) {
+    return { state: 'unknown', reason: `recorded process id ${String(processId)} is not a valid pid` };
+  }
   try {
     process.kill(processId, 0);
   } catch (error) {
-    return (error as NodeJS.ErrnoException)?.code === 'ESRCH' ? 'dead' : 'unknown';
+    const code = (error as NodeJS.ErrnoException)?.code;
+    return code === 'ESRCH'
+      ? { state: 'dead' }
+      : { state: 'unknown', reason: `liveness signal failed with ${code ?? String(error)}` };
   }
-  if (processStartIdentity === undefined) return 'alive';
+  if (processStartIdentity === undefined) return { state: 'alive' };
   let currentIdentity: string;
   try {
     currentIdentity = readProcessStartFingerprint(processId);
-  } catch {
-    return 'unknown';
+  } catch (error) {
+    return {
+      state: 'unknown',
+      reason: `process ${processId} exists but its start time could not be read: ${error instanceof Error ? error.message : String(error)}`
+    };
   }
-  return currentIdentity === processStartIdentity ? 'alive' : 'dead';
+  return { state: currentIdentity === processStartIdentity ? 'alive' : 'dead' };
 }
 
 let ownStartIdentity: string | undefined;
