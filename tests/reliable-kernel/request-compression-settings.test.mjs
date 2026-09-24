@@ -251,6 +251,22 @@ test('请求压缩设置不允许改变模型身份或接受不一致阈值', as
 });
 
 
+test('升级前冻结的请求设置快照（原 DeepSeek 渠道类型）重放时仍认作同一个模型', async () => {
+  await fixture(async ({ app, configuration, input, frozen }) => {
+    const started = await app.turns.input(input('legacy-deepseek-settings'));
+    const source = (await frozen(started.turnId)).document;
+    assert.equal(source.model.provider, 'openai-compatible');
+    const selected = await configuration.loadRequestCompressionSettings({ providerConfigId: 'live-provider', provider: source.model.provider, model: 'live-model' });
+    const legacyModel = { ...selected.model, provider: 'deepseek' };
+    const generation = { model: legacyModel, generationConfig: {}, requestBody: {}, thinkingControlledByBody: false };
+    for (const authority of [source, { ...source, model: { ...source.model, provider: 'deepseek' } }]) {
+      applyRequestCompressionSettings(authority, { requestGeneration: generation });
+      applyRequestCompressionSettings(authority, { requestCompression: { ...selected, model: legacyModel } });
+    }
+    assert.throws(() => applyRequestCompressionSettings(source, { requestGeneration: { ...generation, model: { ...legacyModel, provider: 'claude' } } }), /不能更换本轮模型/);
+  });
+});
+
 test('自动摘要失败但完整输入仍可容纳：保留原上下文、正常回答、冻结有界继续决定', async () => {
   await fixture(async ({ app, input, terminal, update, list, requests }) => {
     const history = await app.turns.input(input('fallback-history', 'KEEP_ORIGINAL_42 历史约束。'.repeat(5000)));
