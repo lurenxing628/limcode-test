@@ -180,6 +180,29 @@ test('a skill the frozen policy turns off can be neither listed nor loaded', asy
   assert.equal(skillCatalogWithinPolicy(catalog, undefined).get('deploy').id, 'deploy', 'no frozen skill settings: every skill is on');
 });
 
+test('a skill name without a source loads the highest-priority candidate the frozen policy leaves on', async () => {
+  const skills = ['agents', 'claude', 'global'].map(source => ({ id: `skill:${source}:foo`, slug: 'foo', name: 'foo', source }));
+  const catalog = {
+    list: () => skills,
+    // Like the real catalog: without a source, the first of .agents > .claude > global.
+    get: (name, source) => skills.find(skill => skill.name === name && (!source || skill.source === source)),
+    async readBody(name, source) { return `body of ${catalog.get(name, source).id}`; },
+    async refresh() {}
+  };
+  const agentsOff = skillCatalogWithinPolicy(catalog, { sourceConfigs: { agents: { enabled: false } } });
+  assert.deepEqual(agentsOff.list().map(skill => skill.id), ['skill:claude:foo', 'skill:global:foo']);
+  assert.equal(agentsOff.get('foo').id, 'skill:claude:foo', 'the listed claude:foo is what loading foo finds');
+  assert.equal(await agentsOff.readBody('foo'), 'body of skill:claude:foo', 'and its body, not the disabled .agents one');
+  assert.equal(agentsOff.get('foo', 'agents'), undefined);
+  await assert.rejects(agentsOff.readBody('foo', 'agents'), /未找到技能：foo/);
+  const skillOff = skillCatalogWithinPolicy(catalog, { sourceConfigs: {
+    agents: { enabled: true, disabledSkills: ['skill:agents:foo'] }, claude: { enabled: false } } });
+  assert.equal(skillOff.get('foo').id, 'skill:global:foo');
+  const allOff = skillCatalogWithinPolicy(catalog, { sourceConfigs: { agents: { enabled: false }, claude: { enabled: false }, global: { enabled: false } } });
+  assert.equal(allOff.get('foo'), undefined);
+  await assert.rejects(allOff.readBody('foo'), /未找到技能：foo/);
+});
+
 test('VscodeConfigurationAuthority compiles a child Turn within its parent Turn and leaves top-level Turns unchanged', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-child-tool-boundary-compile-'));
   try {
