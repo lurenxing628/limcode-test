@@ -178,6 +178,7 @@ function restoreCrossConversation(): void {
       <p v-else>{{ field.description }}</p>
     </div>
     <p class="collaboration-note">这些上限由用户设置，模型不能通过调用参数提高上限。深度调整影响后续新建子 Agent，不中断已有任务；查看、通信、等待和继续已有任务不增加深度。</p>
+    <p class="collaboration-note">子 Agent 从派出方继承的权限上限（工具、技能和工作目录）在派出时确定：之后再收紧派出方 Agent、对话或工作流的设置，只影响之后新派出的子 Agent，已经派出的子 Agent（包括在它的对话里继续输入）仍按派出时的上限运行。子 Agent 自己的设置和全局设置的改动，从它的下一轮开始生效。</p>
     <p v-if="tool && !listError && !spawnToolEnabled" class="collaboration-note">当前范围的工具策略已禁用 run_agent；调整协作设置不会自动启用工具。</p>
   </section>
 </template>

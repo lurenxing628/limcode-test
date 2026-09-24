@@ -136,6 +136,10 @@ test('协作设置保持用户默认深度、单项继承和作用域隔离，�
         assert.equal(runAgentTool.declaration.parameters.properties[key], undefined);
       }
       const html = await render(editor, { scopeKind: 'global' });
+      // Permissions are frozen when a child starts: tightening settings later reaches only new children.
+      const frozenNote = /子 Agent 从派出方继承的权限上限（工具、技能和工作目录）在派出时确定：之后再收紧派出方 Agent、对话或工作流的设置，只影响之后新派出的子 Agent，已经派出的子 Agent（包括在它的对话里继续输入）仍按派出时的上限运行。子 Agent 自己的设置和全局设置的改动，从它的下一轮开始生效。/;
+      assert.match(html, frozenNote);
+      assert.match(await render(editor, { scopeKind: 'agent', scopeId: 'worker' }), frozenNote);
       assert.match(input(html, '最大子 Agent 深度'), /value="1"/);
       assert.doesNotMatch(input(html, '最大子 Agent 深度'), /disabled/);
       assert.match(html, /1（默认）/);
