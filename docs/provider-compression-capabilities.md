@@ -30,7 +30,7 @@
 
 `official_registry` 表示有文档依据；`provider_api` 表示读取了机器能力目录；`verified_probe` 表示执行了独立探测；`explicit_trust` 是用户声明；`unknown` 表示未知。原生状态另行区分 `documented / verified / declared / unsupported / unknown`。默认 `verified_only` 不把 `documented` 当作在线验证，只有 `verified` 或显式 `declared` 可进入原生尝试。
 
-OpenAI Compatible 只代表编码格式。自定义网关、未识别模型和未来模型不自动获得 OpenAI 思考档位或压缩能力。Google 官方兼容入口与 Gemini 原生入口使用不同参数编译路径。DeepSeek 不再是独立渠道类型：它和 Kimi、智谱、百炼等都走 OpenAI Compatible，思考参数写法按接口地址和模型 ID 识别（`shared/openAICompatibleDialect.ts`），也可在高级配置里手动指定；旧配置与历史快照里的 `deepseek` 读作 `openai-compatible`。未确认精确能力的模型使用 Provider 默认或明确标记的高级未验证设置，不猜测所有模型都接受同一组等级。
+OpenAI Compatible 只代表编码格式。自定义网关、未识别模型和未来模型不自动获得 OpenAI 思考档位或压缩能力。Google 官方兼容入口与 Gemini 原生入口使用不同参数编译路径。DeepSeek 不再是独立渠道类型：它和 Kimi、智谱、百炼等都走 OpenAI Compatible，思考参数写法按接口地址和模型 ID 识别（`shared/openAICompatibleDialect.ts`），也可在高级配置里手动指定；旧配置与历史快照里的 `deepseek` 读作 `openai-compatible`。能力表复用同一份方言规则：DeepSeek 写法或 enable_thinking 写法、且有模型规则时记为 `deepseek_toggle`，摘要推理的预设按模型规则就近换算（例如均衡的 medium 在 DeepSeek 上发成 high）；按接口地址认出服务商时记为官方文档登记，只按模型 ID 认出（中转站）时仍为未确认。规则来源依次为手动写法、“测试这个模型”的结果（`models[].capabilitySnapshot`，`source: verified_probe` 且带 `reasoning.wireFormat`）、自动识别。未确认精确能力的模型使用 Provider 默认或明确标记的高级未验证设置，不猜测所有模型都接受同一组等级。
 
 在设置页点“验证原生端点（会调用一次）”才发送探测。探测只含合成的 `verification_marker=42`，没有当前对话、附件或工具；可能产生少量 Provider 费用。只返回 HTTP 200 而没有原生 compaction 状态，不算验证通过。404/405/501 生成绑定到当前身份的负面能力证据。并发相同探测在宿主内合并。正常渲染、保存配置和回合执行不会偷偷探测。
 

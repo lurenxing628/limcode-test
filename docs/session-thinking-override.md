@@ -24,17 +24,18 @@
 | 协议 / 模型族 | 控件和原生字段 | 限制 |
 |---|---|---|
 | OpenAI-compatible，已知 o1/o3/o4（不含 o1-mini/preview） | effort → `reasoning_effort` | low/medium/high；第三方同名转发仍未真实联调 |
-| OpenAI-compatible / Responses，GPT-5 / 5.1 / 5.2 已列明型号 | 分模型 effort；Responses → `reasoning.effort` | 5 为 minimal/low/medium/high；5.1（含2025-11-13）为 none/low/medium/high；5.2（含2025-12-11）才开放 xhigh；未知小版本不按小数点推能力 |
-| Responses，精确 Astra（复用现有识别） | effort + 原有 native continuation | low/medium/high/xhigh/max；none/minimal 不作为新选项；现有渠道配置适配为 low 时明确标注 |
+| OpenAI-compatible / Responses，GPT-5 / 5.1 / 5.2 / 5.6 已列明型号 | 分模型 effort；Responses → `reasoning.effort` | 5 为 minimal/low/medium/high；5.1（含2025-11-13）为 none/low/medium/high；5.2（含2025-12-11）才开放 xhigh；5.6（gpt-5.6、sol、terra、luna）为 none/low/medium/high/xhigh/max、没有 minimal；未知小版本不按小数点推能力 |
+| OpenAI-compatible / Responses，精确 Astra（复用现有识别） | effort + 原有 native continuation | low/medium/high/xhigh/max；none/minimal 不作为新选项；现有渠道配置适配为 low 时明确标注（两种渠道一致） |
 | OpenAI-compatible / Responses，精确 GPT-6 Sol / Luna（含日期快照） | effort；Responses 另有 native continuation | none/low/medium/high/xhigh/max，官方默认 medium；minimal 适配为 low 时明确标注；强度不是 none 时去掉采样参数 |
 | Gemini 2.5 文本 Pro / Flash | `thinkingBudget` | -1 自动；Pro不允许0；Flash允许0；模型范围与输出上限校验；image/audio/live不开放预算快捷入口 |
 | Gemini 3.x | `thinkingLevel` | 复用 shared/geminiThinking 按具体型号等级集合；不发送预算 |
 | Claude 3.7 Sonnet / 已识别旧4系 | `thinking.budget_tokens` | 明确 maxOutputTokens；整数≥1024且小于输出上限；temperature仅省略/1，top_k省略，top_p仅省略或0.95–1，不合法拒绝保存 |
-| Claude 精确4.6 Opus/Sonnet（及日期标识） | adaptive + `output_config.effort` | 与预算互斥；none为关闭；不猜测未来4.x，不静默降档 |
-| Claude 4.7 及之后（能力表 `anthropic_adaptive`：Opus 4.7/4.8/5/5.5、Sonnet 5、Fable、Mythos） | adaptive + `output_config.effort`（low–xhigh、max） | 只按能力表精确 id（及日期标识）开放；始终开启的 Fable、Mythos、Opus 5.5 不提供 none；编码与渠道配置同一路径 |
-| OpenAI-compatible，DeepSeek 风格模型（DeepSeek、MiMo、Kimi、GLM、混元、Qwen、ERNIE，按模型 ID 识别） | 档位按模型能力给出；发送时按“思考参数写法”换成对方参数：`thinking.type` + `reasoning_effort`、`enable_thinking`，或只发 `reasoning_effort`（`shared/openAICompatibleDialect.ts`） | DeepSeek none/low/high/max；关不掉思考的模型（Kimi K3、GLM-5.3、Kimi K2.7 Code）不提供 none；只能开关的模型为 none/high；对方不接受的强度换成最接近的值 |
+| Claude 精确4.6 Opus/Sonnet、Mythos Preview（及日期标识） | adaptive + `output_config.effort` | 与预算互斥；4.6 为 none/low/medium/high/max；Mythos Preview 始终思考、没有 xhigh；渠道配置不放宽已知模型 |
+| Claude 4.7 及之后（能力表 `anthropic_adaptive`：Opus 4.7/4.8/5/5.5、Sonnet 5、Fable、Mythos） | adaptive + `output_config.effort`（low–xhigh、max） | 只按能力表精确 id（及日期标识）开放；始终开启的 Fable、Mythos、Opus 5.5 不提供 none（渠道设了 none 时注明实际仍会思考）；非默认的 temperature / top_p / top_k 无论是否思考都报冲突；编码与渠道配置同一路径 |
+| OpenAI-compatible，DeepSeek 写法或 enable_thinking 写法的模型（DeepSeek、MiMo、Kimi、GLM-4.5 及以上、混元、Qwen3、ERNIE） | 档位按渠道的有效规则给出（手动写法 → 测试结果 → 接口地址 / 模型 ID），与请求改写、能力表共用（`shared/openAICompatibleDialect.ts`、`resolveProviderOpenAICompatibleDialect`） | DeepSeek none/low/high/max；关不掉思考的模型（Kimi K3、GLM-5.3、Kimi K2.7 Code）不提供 none；只能开关的模型为 none/high；平台差异计入（硅基流动 V4 为 high/max，百炼按模型）；发送时就近换算，“跟随渠道”显示实际发出的值；OpenRouter 按原值发送（没有 max），本机服务不套这些档位 |
 | 未知别名 / 自定义渠道模型 | 显示现有渠道或模型配置；已配置 effort 时复用渠道编辑器的参数集合 | 未配置时不猜测能力；Gemini 保留具体型号约束。参数集合来自 `shared/llmThinkingLevels.ts`，不代表远端服务已通过联调 |
-| 与思维/输出相关 custom body | 保留已有 body，快捷覆盖报冲突 | 失败草稿保留，可确认重试/放弃草稿/恢复默认；不全局阻塞其他会话 |
+| 与思维/输出相关 custom body | 保留已有 body，保存覆盖时报冲突；`chat_template_kwargs` 只在含思考相关子键时算冲突 | 失败草稿保留，可确认重试/放弃草稿/恢复默认；不全局阻塞其他会话 |
+| 升级前保存、现在已不适用的覆盖 | 请求冻结、子 Agent 继承与“子 Agent 也用”开关用容错解析：`openai-effort` 与 `deepseek-effort` 的值仍可用时改写 kind 后生效，否则按渠道设置发送 | 保存时仍严格校验；思考下拉单独显示“已保存：X（当前不生效）”，选“跟随渠道”即可清除 |
 
 不声明适用于所有第三方兼容端点。已知名称也可能被中继限制；实际能力报错仍来自原 provider 请求路径。能力白名单需随仓库 adapter 与模型证据更新，不是旧协议 fallback。
 
