@@ -63,7 +63,7 @@ const providerOptions: SettingsDropdownOption[] = [
 /** 新建 OpenAI 兼容渠道时按服务商填好接口地址；空值表示 OpenAI 或其他服务，自己填地址。 */
 const createServiceOptions: SettingsDropdownOption[] = [
   { value: '', label: 'OpenAI 或其他服务', description: '先用 OpenAI 的地址，建好后可以改成任意兼容地址' },
-  ...OPENAI_COMPATIBLE_SERVICE_PRESETS.map((preset) => ({ value: preset.id, label: preset.label, description: preset.baseUrl }))
+  ...OPENAI_COMPATIBLE_SERVICE_PRESETS.map((preset) => ({ value: preset.key, label: preset.label, description: preset.baseUrl }))
 ];
 const createService = ref('');
 
@@ -378,7 +378,7 @@ function openCreate(): void {
 function confirmCreate(name: string): void {
   createOpen.value = false;
   const preset = createProvider.value === 'openai-compatible'
-    ? OPENAI_COMPATIBLE_SERVICE_PRESETS.find((candidate) => candidate.id === createService.value)
+    ? OPENAI_COMPATIBLE_SERVICE_PRESETS.find((candidate) => candidate.key === createService.value)
     : undefined;
   settings.createLlmProviderConfig(name, createProvider.value, preset?.baseUrl);
 }

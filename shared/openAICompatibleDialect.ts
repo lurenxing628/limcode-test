@@ -18,6 +18,7 @@ export type OpenAICompatiblePlatform =
   | 'deepseek'
   | 'mimo'
   | 'moonshot'
+  | 'kimi-code'
   | 'zhipu'
   | 'tencent'
   | 'hunyuan'
@@ -135,25 +136,36 @@ export function openAICompatiblePlatform(baseUrl: string): OpenAICompatiblePlatf
   if (within('deepseek.com')) return 'deepseek';
   if (within('xiaomimimo.com')) return 'mimo';
   if (within('moonshot.cn') || within('moonshot.ai')) return 'moonshot';
+  // Kimi Code：api.kimi.com/coding/v1（中国）、api.kimi.ai/coding/v1（海外）。
+  if (within('kimi.com') || within('kimi.ai')) return 'kimi-code';
   if (within('bigmodel.cn') || within('z.ai')) return 'zhipu';
-  if (within('tencentmaas.com')) return 'tencent';
+  // 腾讯 TokenHub：中国站 tokenhub(-intl).tencentmaas.com / .cn，国际站 tokenhub(-intl / -us).tencentcloudmaas.com / .tech；
+  // 知识引擎的 DeepSeek 接口 api.lkeap.cloud.tencent.com 已并入 TokenHub。
+  if (within('tencentmaas.com') || within('tencentmaas.cn') || within('tencentcloudmaas.com') || within('tencentcloudmaas.tech')
+    || host === 'api.lkeap.cloud.tencent.com') return 'tencent';
   // 旧混元平台的 OpenAI 兼容接口没有 thinking / reasoning_effort 参数，不归入 TokenHub。
   if (host === 'api.hunyuan.cloud.tencent.com') return 'hunyuan';
-  if (within('volces.com')) return 'ark';
-  if (within('aliyuncs.com') && (host.startsWith('dashscope') || host.includes('.maas.'))) return 'dashscope';
+  if (within('volces.com') || within('bytepluses.com')) return 'ark';
+  // 百炼：dashscope(-intl / -us).aliyuncs.com、cn-hongkong.dashscope.aliyuncs.com、Coding Plan 的
+  // coding(-intl).dashscope.aliyuncs.com，以及业务空间 / 试用的 *.maas.aliyuncs.com。
+  if (within('aliyuncs.com') && (host.startsWith('dashscope') || within('dashscope.aliyuncs.com') || host.includes('.maas.'))) return 'dashscope';
   if (within('siliconflow.cn') || within('siliconflow.com')) return 'siliconflow';
-  if (within('qianfan.baidubce.com')) return 'qianfan';
+  if (within('qianfan.baidubce.com') || host === 'qianfan.bj.baidubce.com') return 'qianfan';
   if (within('openrouter.ai')) return 'openrouter';
   if (isLocalHost(host)) return 'local';
   return 'unknown';
 }
 
 function isLocalHost(host: string): boolean {
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host === '::1' || host === '0.0.0.0') return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host === '::1' || host === '0.0.0.0'
+    || host === 'host.docker.internal') return true;
+  // IPv6 唯一本地地址 fd00::/8。
+  if (host.includes(':')) return /^fd[0-9a-f]{0,2}:/.test(host);
   const octets = host.split('.').map(Number);
   if (octets.length !== 4 || octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return false;
   const [a, b] = octets as [number, number, number, number];
-  return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+  // 私有网段，以及 Tailscale 等使用的 100.64.0.0/10。
+  return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 100 && b >= 64 && b <= 127);
 }
 
 /**
@@ -182,7 +194,7 @@ export function resolveOpenAICompatibleDialect(
     format,
     source,
     toolContentArrays: format === 'deepseek' && (platform === 'deepseek' || platform === 'mimo'),
-    fillReasoningReplay: format === 'deepseek'
+    fillReasoningReplay: format === 'deepseek' || platform === 'kimi-code'
       || (rule?.requiresReasoningReplay === true && platform !== 'openrouter' && platform !== 'local')
   };
 }
@@ -213,6 +225,7 @@ function automaticFormat(
     case 'deepseek':
     case 'mimo':
     case 'moonshot':
+    case 'kimi-code':
     case 'zhipu':
     case 'tencent':
     case 'ark':
@@ -306,6 +319,7 @@ const PLATFORM_LABELS: Record<OpenAICompatiblePlatform, string> = {
   deepseek: 'DeepSeek 官方',
   mimo: '小米 MiMo',
   moonshot: 'Kimi（月之暗面）',
+  'kimi-code': 'Kimi Code',
   zhipu: '智谱',
   tencent: '腾讯 TokenHub',
   hunyuan: '腾讯混元（旧接口）',
@@ -340,15 +354,21 @@ export function describeOpenAICompatibleDialect(dialect: OpenAICompatibleDialect
 }
 
 /** 新建 OpenAI 兼容渠道时可选的服务商：只填接口地址，思考参数写法由上面的自动识别决定。 */
-export const OPENAI_COMPATIBLE_SERVICE_PRESETS: ReadonlyArray<{ id: OpenAICompatiblePlatform; label: string; baseUrl: string }> = [
-  { id: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1' },
-  { id: 'moonshot', label: 'Kimi（月之暗面）', baseUrl: 'https://api.moonshot.cn/v1' },
-  { id: 'zhipu', label: '智谱', baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
-  { id: 'mimo', label: '小米 MiMo', baseUrl: 'https://api.xiaomimimo.com/v1' },
-  { id: 'tencent', label: '腾讯 TokenHub', baseUrl: 'https://tokenhub.tencentmaas.com/v1' },
-  { id: 'ark', label: '火山方舟', baseUrl: 'https://ark.cn-beijing.volces.com/api/v3' },
-  { id: 'dashscope', label: '阿里百炼', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-  { id: 'siliconflow', label: '硅基流动', baseUrl: 'https://api.siliconflow.cn/v1' },
-  { id: 'qianfan', label: '百度千帆', baseUrl: 'https://qianfan.baidubce.com/v2' },
-  { id: 'openrouter', label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' }
+export const OPENAI_COMPATIBLE_SERVICE_PRESETS: ReadonlyArray<{ key: string; platform: OpenAICompatiblePlatform; label: string; baseUrl: string }> = [
+  { key: 'deepseek', platform: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1' },
+  { key: 'moonshot', platform: 'moonshot', label: 'Kimi（月之暗面）', baseUrl: 'https://api.moonshot.cn/v1' },
+  { key: 'moonshot-intl', platform: 'moonshot', label: 'Kimi（国际站）', baseUrl: 'https://api.moonshot.ai/v1' },
+  { key: 'zhipu', platform: 'zhipu', label: '智谱', baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+  { key: 'zhipu-intl', platform: 'zhipu', label: '智谱 Z.ai（国际站）', baseUrl: 'https://api.z.ai/api/paas/v4' },
+  { key: 'mimo', platform: 'mimo', label: '小米 MiMo', baseUrl: 'https://api.xiaomimimo.com/v1' },
+  { key: 'tencent', platform: 'tencent', label: '腾讯 TokenHub', baseUrl: 'https://tokenhub.tencentmaas.com/v1' },
+  { key: 'tencent-intl', platform: 'tencent', label: '腾讯 TokenHub（国际站）', baseUrl: 'https://tokenhub-intl.tencentcloudmaas.com/v1' },
+  { key: 'ark', platform: 'ark', label: '火山方舟', baseUrl: 'https://ark.cn-beijing.volces.com/api/v3' },
+  { key: 'ark-intl', platform: 'ark', label: '火山方舟 BytePlus（国际站）', baseUrl: 'https://ark.ap-southeast.bytepluses.com/api/v3' },
+  { key: 'dashscope', platform: 'dashscope', label: '阿里百炼', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  { key: 'dashscope-intl', platform: 'dashscope', label: '阿里百炼（国际站）', baseUrl: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' },
+  { key: 'siliconflow', platform: 'siliconflow', label: '硅基流动', baseUrl: 'https://api.siliconflow.cn/v1' },
+  { key: 'siliconflow-intl', platform: 'siliconflow', label: '硅基流动（国际站）', baseUrl: 'https://api.siliconflow.com/v1' },
+  { key: 'qianfan', platform: 'qianfan', label: '百度千帆', baseUrl: 'https://qianfan.baidubce.com/v2' },
+  { key: 'openrouter', platform: 'openrouter', label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' }
 ];

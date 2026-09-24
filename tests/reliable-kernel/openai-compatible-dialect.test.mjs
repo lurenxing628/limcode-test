@@ -71,8 +71,9 @@ function thinkingParams(body) {
 
 test('按接口地址识别平台：各服务商官方地址、本机与局域网、认不出的中转站', () => {
   for (const preset of OPENAI_COMPATIBLE_SERVICE_PRESETS) {
-    assert.equal(openAICompatiblePlatform(preset.baseUrl), preset.id, preset.baseUrl);
+    assert.equal(openAICompatiblePlatform(preset.baseUrl), preset.platform, preset.baseUrl);
   }
+  assert.equal(new Set(OPENAI_COMPATIBLE_SERVICE_PRESETS.map((preset) => preset.key)).size, OPENAI_COMPATIBLE_SERVICE_PRESETS.length);
   assert.equal(openAICompatiblePlatform('https://api.z.ai/api/paas/v4'), 'zhipu');
   assert.equal(openAICompatiblePlatform('https://api.moonshot.ai/v1'), 'moonshot');
   assert.equal(openAICompatiblePlatform('https://dashscope-intl.aliyuncs.com/compatible-mode/v1'), 'dashscope');
@@ -458,4 +459,39 @@ test('模型规则：GLM-5.2 不给 low，方舟带日期的 GLM-5 不误认成 
   assert.equal(sessionThinkingCapability('openai-compatible', 'qwen-max', undefined, { thinkingLevel: 'high' }, settings(DASHSCOPE, 'qwen-max')), undefined);
   assert.deepEqual(thinkingParams(await wire(OPENROUTER, 'z-ai/glm-4-plus', { level: 'high' })), { reasoning_effort: 'high' });
   assert.equal(resolveOpenAICompatibleDialect(ARK, 'glm-5-260117').format, 'deepseek');
+});
+
+test('官方域名补齐：百炼各接入点、千帆北京、BytePlus、TokenHub 各站点、Kimi Code、本机与局域网', () => {
+  const cases = [
+    ['https://coding.dashscope.aliyuncs.com/v1', 'dashscope'],
+    ['https://coding-intl.dashscope.aliyuncs.com/v1', 'dashscope'],
+    ['https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1', 'dashscope'],
+    ['https://dashscope-us.aliyuncs.com/compatible-mode/v1', 'dashscope'],
+    ['https://ws-demo.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'dashscope'],
+    ['https://oss-cn-hangzhou.aliyuncs.com/v1', 'unknown'],
+    ['https://qianfan.bj.baidubce.com/v2', 'qianfan'],
+    ['https://ark.ap-southeast.bytepluses.com/api/v3', 'ark'],
+    ['https://tokenhub.tencentmaas.cn/v1', 'tencent'],
+    ['https://tokenhub-intl.tencentmaas.cn/v1', 'tencent'],
+    ['https://tokenhub-intl.tencentcloudmaas.com/v1', 'tencent'],
+    ['https://tokenhub-us.tencentcloudmaas.com/v1', 'tencent'],
+    ['https://api.lkeap.cloud.tencent.com/v1', 'tencent'],
+    ['https://api.kimi.com/coding/v1', 'kimi-code'],
+    ['https://api.kimi.ai/coding/v1', 'kimi-code'],
+    ['http://host.docker.internal:11434/v1', 'local'],
+    ['http://100.64.0.1:8000/v1', 'local'],
+    ['http://100.127.255.254/v1', 'local'],
+    ['http://100.128.0.1/v1', 'unknown'],
+    ['http://[fd12:3456::1]:8000/v1', 'local'],
+    ['http://[2001:db8::1]/v1', 'unknown']
+  ];
+  for (const [baseUrl, platform] of cases) assert.equal(openAICompatiblePlatform(baseUrl), platform, baseUrl);
+  // Kimi Code：缺 reasoning_content 返回 400（https://www.kimi.com/code/docs/en/kimi-code/error-reference）。
+  const kimiCode = resolveOpenAICompatibleDialect('https://api.kimi.com/coding/v1', 'kimi-for-coding');
+  assert.deepEqual([kimiCode.format, kimiCode.fillReasoningReplay], ['deepseek', true]);
+  // 预设里有国际站。
+  for (const baseUrl of ['https://api.moonshot.ai/v1', 'https://api.z.ai/api/paas/v4', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+    'https://ark.ap-southeast.bytepluses.com/api/v3', 'https://tokenhub-intl.tencentcloudmaas.com/v1', 'https://api.siliconflow.com/v1']) {
+    assert.ok(OPENAI_COMPATIBLE_SERVICE_PRESETS.some((preset) => preset.baseUrl === baseUrl), baseUrl);
+  }
 });
