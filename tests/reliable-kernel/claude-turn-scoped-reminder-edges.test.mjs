@@ -340,9 +340,11 @@ const LOOP_HISTORY = [{ segmentId: 'seg-model-1', content: REMINDER_K }, { segme
  * re-pinned when the Claude compaction request started to be encoded like ordinary requests
  * (claude-native-compaction-shaping.test.mjs): stored tool ids instead of `toolu_0`/`toolu_1`, the real tool
  * definitions instead of `tools: []`, and the channel's cache breakpoints (system in block form); nothing else changed.
+ * `compact` re-pinned once more when the compaction settings snapshot started to carry the turn's frozen
+ * systemPromptPrefix (same channel and model); the wire is unchanged.
  */
 const COMPACTION_BASELINE = {
-  compact: 'b710733e7273ff25c4816a81ba909effe94dc978e24c9c4782b9e875d30dbaec',
+  compact: '7d527234ab5402ab3cc3596187ae4ee3fb390531e1bb3e5f7d1f0ad5b114789c',
   wire: 'bccd0de636d8ae778f64c6b42e5dc0c4175b8e60450d398f86d8296ca9f476a8'
 };
 const compactionFingerprint = (rendered) => ({

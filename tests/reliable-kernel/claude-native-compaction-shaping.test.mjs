@@ -268,6 +268,26 @@ test('Claude 原生压缩：多轮工具循环的 tools、system 与消息前缀
   assert.deepEqual(withoutCacheControl(compaction.body.messages), withoutCacheControl(next.body.messages.slice(0, -1)));
 });
 
+test('Claude 原生压缩：用本轮冻结的前置提示词，渠道之后改了前置提示词也和普通请求的 system 一致', async () => {
+  // 渠道配置里的前置提示词已经改了；本轮请求冻结的仍是 PREFIX。设置按注册表的规则解析：快照里冻结的值优先。
+  const live = { ...settingsFor(), systemPromptPrefix: 'Changed after the turn was frozen.' };
+  const resolve = async (request) => kernel.applyFrozenModelProviderConfig(
+    live, request.settingsSnapshot.modelId, request.settingsSnapshot.provider, request.settingsSnapshot.systemPromptPrefix);
+  const captureOrdinary = {};
+  await new kernel.LlmCapabilityFullRequestAdapter(PROVIDER_ID, fakeCapability(captureOrdinary))
+    .sendFullRequest(ordinaryRequest({ context: WINDOW_FULL }), accepted);
+  const ordinary = await dryRunLlmProvider(captureOrdinary.start, { settings: resolve });
+  const captureCompaction = {};
+  await new kernel.LlmCapabilityFullRequestAdapter(PROVIDER_ID, fakeCapability(captureCompaction))
+    .sendFullRequest(compactionRequest({ context: WINDOW_FULL }), accepted);
+  assert.equal(captureCompaction.compact.settingsSnapshot.systemPromptPrefix, PREFIX);
+  const dry = await dryRunCompactLlmProvider(captureCompaction.compact, { settings: resolve, compressionSettings: async () => undefined });
+  const compaction = JSON.parse(dry.calls[0].bodyText);
+  assert.deepEqual(withoutCacheControl(compaction.system), withoutCacheControl(ordinary.body.system));
+  assert.match(JSON.stringify(compaction.system), /Always answer in English\./);
+  assert.doesNotMatch(JSON.stringify(compaction.system), /Changed after the turn was frozen/);
+});
+
 test('Claude 原生压缩：渠道关闭提示缓存时不带任何 cache_control，system 与普通请求一样是字符串', async () => {
   const settings = settingsFor({ promptCache: false });
   const ordinary = await renderOrdinary(ordinaryRequest({ context: WINDOW_N, reminder: REMINDER_3 }), settings);

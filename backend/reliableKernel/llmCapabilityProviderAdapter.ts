@@ -1111,10 +1111,19 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     context.attachmentCatalogState.catalog,
     context.modelHandleCatalog
   );
+  // 压缩渠道就是本轮对话的渠道与模型时（原生压缩必然如此），用本轮冻结的前置提示词，与普通请求的 system 逐字节相同；
+  // 不带它时 capability 会回落到渠道当前的配置，渠道改过前置提示词后 system 就与普通请求不同。
+  const authorityModel = asRecord(authority.model);
+  const frozenSystemPromptPrefix = authorityModel
+    && authorityModel.providerConfigId === compressionProvider.providerConfigId
+    && authorityModel.modelId === compressionProvider.modelId
+    ? typeof authorityModel.systemPromptPrefix === 'string' ? authorityModel.systemPromptPrefix : ''
+    : undefined;
   const settingsSnapshot = normalizePlainJson({
     providerConfigId: compressionProvider.providerConfigId,
     provider: compressionProvider.provider,
     modelId: compressionProvider.modelId,
+    ...(frozenSystemPromptPrefix !== undefined ? { systemPromptPrefix: frozenSystemPromptPrefix } : {}),
     // 与普通请求一样把冻结的开关交给 capability：决定轮内系统消息形态、beta 头与网关回退。
     ...(claudeTurnScopedCompaction(request.authoritySnapshot, recipe) ? { claudeTurnScopedReminders: true } : {}),
     compressionConfigId: requireText(methodConfig.id, 'Compression config id'),
