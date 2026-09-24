@@ -302,6 +302,18 @@ test('(a) 网关回退后估算按实际发出的尾巴布局：与开关关闭�
   }
 });
 
+test('(a) 轮内系统消息模式不挪断点：尾巴输入已有历史副本、本轮没有提醒时，断点仍在最后一条 user 消息', async () => {
+  const [, k1] = reinjectionRounds();
+  const request = { ...k1, requestAddenda: { ...k1.requestAddenda, turnReminder: undefined } };
+  const rendered = await render(request);
+  const messages = rendered.messages;
+  assert.equal(labelCount(messages.at(-1)), 0, 'the tail copy of the input is not sent');
+  const marked = messages.flatMap((entry, index) =>
+    Array.isArray(entry.content) && entry.content.some((block) => block.cache_control) ? [index] : []);
+  assert.deepEqual(marked, [messages.findLastIndex((entry) => entry.role === 'user')],
+    'nothing volatile is at the end, so the breakpoint stays on the last user message');
+});
+
 test('(a) 托管媒体：历史副本按那次请求的位置投影，其余内容与开关关闭时完全相同', async () => {
   const image = { inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=', attachmentId: 'attachment-1', name: 'a.png', sizeBytes: 8 } };
   const input = { role: 'user', parts: [{ text: 'Implement what the screenshot shows.' }, image] };
