@@ -387,3 +387,13 @@ test('会话思考强度按渠道配置给选项：平台差异、测试结果�
   assert.deepEqual(validateSessionThinkingOverride({ kind: 'deepseek-effort', value: 'max' }, 'openai-compatible', 'renamed-model',
     undefined, undefined, probedSettings(RELAY, 'renamed-model', probe)), { kind: 'deepseek-effort', value: 'max' });
 });
+
+test('enable_thinking 写法：关不掉思考的模型不发 false，不接受开关的模型不带这个字段', async () => {
+  // 百炼官方：glm-5.3、kimi-k3 的 enable_thinking 只支持 true（https://help.aliyun.com/zh/model-studio/deep-thinking）。
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'glm-5.3', { level: 'none' })), {});
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'kimi-k3', { level: 'none' })), {});
+  assert.equal('enable_thinking' in await wire(DASHSCOPE, 'kimi-k3', { level: 'high' }), false);
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'renamed-model', { level: 'none', models: [{ id: 'renamed-model', name: 'renamed-model',
+    capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', { wireFormat: 'enable_thinking', canDisable: false, levels: [] }) }] })), {});
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3-max', { level: 'none' })), { enable_thinking: false });
+});

@@ -89,9 +89,15 @@ function withDialectThinking(body: Record<string, unknown>, dialect: OpenAICompa
       ...(effort ? { reasoning_effort: effort } : {})
     };
   }
-  if (level === 'none') return { ...next, enable_thinking: false };
+  // 与 DeepSeek 写法一致：关不掉思考的模型（百炼的 GLM-5.3、Kimi K3 只接受 true）不发 false，
+  // 不接受开关参数的模型不带 enable_thinking。
+  if (level === 'none') return rule?.toggle === false || rule?.canDisable === false ? next : { ...next, enable_thinking: false };
   const effort = mapOpenAICompatibleEffort(level, openAICompatibleEffortValues(dialect));
-  return { ...next, enable_thinking: true, ...(effort ? { reasoning_effort: effort } : {}) };
+  return {
+    ...next,
+    ...(rule?.toggle === false ? {} : { enable_thinking: true }),
+    ...(effort ? { reasoning_effort: effort } : {})
+  };
 }
 
 function withReasoningReplay(body: Record<string, unknown>): Record<string, unknown> {
