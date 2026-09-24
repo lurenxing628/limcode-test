@@ -411,3 +411,55 @@ test('a server-side compaction item from an ordinary Responses reply is stored w
   assert.ok(firstQuestion < compactionIndex && compactionIndex < firstAnswer && firstAnswer < secondQuestion,
     `output order is kept: ${texts.map(text => text.slice(0, 60)).join(' | ')}`);
 });
+
+
+/**
+ * The next Responses request after an ordinary reply that carried a server-side compaction item, from
+ * the reply's `source` channel/model to the request's `target` channel/model.
+ */
+async function replayedCompactionInput({ source, target, onlyCompaction = false }) {
+  const compaction = { provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'compaction',
+    rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'opaque-compaction-state' } };
+  const segment = (segmentId, messageRole, content, modelSource) => ({ segmentId, segmentKind: 'message', messageRole,
+    contentType: 'application/vnd.limcode.message+json', content: JSON.stringify(content), ...(modelSource ? { modelSource } : {}) });
+  const request = {
+    kind: 'full-model-request', modelRequestId: 'model-request-compaction-source', conversationId: 'conversation-compaction-source',
+    attemptSeq: '1', socketGeneration: '1', providerId: target.providerId, modelId: target.modelId,
+    authoritySnapshot: {
+      model: { providerConfigId: target.providerId, provider: 'openai-responses', modelId: target.modelId },
+      toolPolicy: { allowedTools: [], preset: 'custom' }
+    },
+    recipe: { tools: [] },
+    context: [
+      segment('first-question', 'user', { role: 'user', parts: [{ text: 'first question' }] }),
+      segment('first-answer', 'model', { role: 'model', parts: [{ providerContext: compaction },
+        ...(onlyCompaction ? [] : [{ text: 'First answer.' }])] }, source),
+      segment('second-question', 'user', { role: 'user', parts: [{ text: 'second question' }] })
+    ],
+    attachmentCatalogState: { catalog: [], placements: [] }
+  };
+  let start;
+  await new kernel.LlmCapabilityFullRequestAdapter(target.providerId, {
+    start(input, emit) { start = input; emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
+  }).sendFullRequest(request, { async onEvent() { return { accepted: true, terminal: true, checkpointed: true }; } });
+  const settings = { ...createDefaultLlmProviderConfig({ name: 'compaction source' }), id: target.providerId, provider: 'openai-responses',
+    baseUrl: 'https://api.openai.com/v1', model: target.modelId, apiKey: '' };
+  const body = (await dryRunLlmProvider(start, { settings })).body;
+  return body.input.filter((item) => item.role !== 'system' && item.role !== 'developer');
+}
+
+test('a compaction item from an ordinary reply is replayed only to the channel and model that produced it', async () => {
+  const origin = { providerId: 'responses-a', modelId: 'gpt-5.5' };
+  const kinds = input => input.map(item => item.type === 'compaction' ? 'compaction'
+    : `${item.role}:${JSON.stringify(item.content).includes('First answer') ? 'answer' : 'text'}`);
+  // Same channel and model: replayed as it came.
+  assert.deepEqual(kinds(await replayedCompactionInput({ source: origin, target: origin })), ['user:text', 'compaction', 'assistant:answer', 'user:text']);
+  // Another Responses channel, another model, or a reply of unknown source: the encrypted state is not sent.
+  for (const target of [{ providerId: 'responses-b', modelId: 'gpt-5.5' }, { providerId: 'responses-a', modelId: 'gpt-5.6' }]) {
+    assert.deepEqual(kinds(await replayedCompactionInput({ source: origin, target })), ['user:text', 'assistant:answer', 'user:text'], JSON.stringify(target));
+  }
+  assert.deepEqual(kinds(await replayedCompactionInput({ source: undefined, target: origin })), ['user:text', 'assistant:answer', 'user:text']);
+  // A reply that held only the compaction item leaves nothing behind.
+  assert.deepEqual(kinds(await replayedCompactionInput({ source: origin, target: { providerId: 'responses-b', modelId: 'gpt-5.5' }, onlyCompaction: true })),
+    ['user:text', 'user:text']);
+});

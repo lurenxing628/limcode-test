@@ -611,8 +611,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
 
 /**
  * Provider state stored in a model reply that only its source can read is not replayed elsewhere:
- * GPT reasoning signatures across Responses channels, and Gemini call signatures to an OpenAI-
- * compatible model that is not Gemini.
+ * GPT reasoning signatures across Responses channels, Responses compaction items to another channel
+ * or model, and Gemini call signatures to an OpenAI-compatible model that is not Gemini.
  */
 function isolateCrossSourceProviderState(
   content: MessageContent,
@@ -621,11 +621,40 @@ function isolateCrossSourceProviderState(
   provider: LlmProviderKind
 ): MessageContent {
   return isolateCrossSourceGeminiCallSignatures(
-    isolateCrossChannelGptThoughtSignatures(content, source, request, provider),
+    isolateCrossSourceResponsesCompaction(
+      isolateCrossChannelGptThoughtSignatures(content, source, request, provider),
+      source,
+      request,
+      provider
+    ),
     source,
     request,
     provider
   );
+}
+
+/**
+ * The encrypted Responses `compaction` item of an ordinary reply made with `context_management` is
+ * replayed as it came (https://developers.openai.com/api/docs/guides/compaction), but only to the
+ * channel and model that produced it, like provider-native compression state (assertCompressionBinding).
+ * After a switch of channel or model, or for a reply of unknown source, the item is not sent: the
+ * history it condenses is still in the window. Other providers already drop Responses items.
+ */
+function isolateCrossSourceResponsesCompaction(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  if (
+    provider !== 'openai-responses'
+    || content.role !== 'model'
+    || (source?.providerId === request.providerId && source.modelId === request.modelId)
+  ) return content;
+  const parts = content.parts.filter((part) => !('providerContext' in part)
+    || part.providerContext.format !== 'openai-responses'
+    || part.providerContext.itemType !== 'compaction');
+  return parts.length === content.parts.length ? content : { ...content, parts };
 }
 
 /**

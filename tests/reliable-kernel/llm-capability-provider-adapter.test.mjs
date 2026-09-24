@@ -242,6 +242,11 @@ test('GPT 推理签名只隔离明确跨渠道的来源，同名跨渠道也隔�
         delete expected.parts[0].thoughtSignature;
         delete expected.parts[2].thoughtSignature;
       }
+      // 普通回复里的 Responses compaction 密文只回放给产生它的同一渠道与模型（来源不明也不回放）；
+      // 非 Responses 目标由各自的协议投影处理。
+      const compactionReplayed = scenario.provider === 'openai-compatible'
+        || (scenario.sourceProvider === fullRequest.providerId && scenario.sourceModel === scenario.targetModel);
+      if (!compactionReplayed) expected.parts.splice(4, 1);
       assert.deepEqual(captured.contents.at(-1), expected);
       assert.equal(JSON.stringify(fullRequest), frozen, '出站隔离不得修改冻结历史或来源记录');
     });
