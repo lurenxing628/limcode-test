@@ -8,14 +8,11 @@ import {
 } from '../../reliableKernel/runtimeDatabase';
 import {
   RootAuthority,
-  RootAuthorityError,
-  StaleRootBindingError,
-  type HistoricalRootBinding
+  RootAuthorityError
 } from '../../reliableKernel/rootAuthority';
 import {
   RUNTIME_KERNEL_EPOCH,
-  type RootBinding,
-  type RuntimeRootPaths
+  type RootBinding
 } from '../../reliableKernel/contracts';
 import {
   legacyRuntimeRequiresCutover,
@@ -26,6 +23,10 @@ import {
 } from '../../reliableKernel/physicalCutover';
 import { assertRuntimeHostsOffline, withRuntimeMaintenance } from '../../reliableKernel/runtimeHostControl';
 import { validateCurrentRuntimeSchema } from '../../reliableKernel/currentRuntimeSchemaValidation';
+import {
+  migratePreviousRuntimeEpochIfRequired,
+  previousRuntimeEpochMigrationRequired
+} from '../../reliableKernel/runtimeEpochMigration';
 import { assertConfigurationRootRuntimesOffline } from '../../reliableKernel/vscodeRootAuthority';
 
 export const VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY = '.limcode-runtime-backups';
@@ -35,14 +36,16 @@ export interface VscodeReliableKernelCutoverResult {
   initialized: boolean;
   cutoverPerformed: boolean;
   archiveDirectoryName?: string;
-  epochResetFrom?: number;
-  epochResetBackupPath?: string;
+  epochMigratedFrom?: number;
+  epochMigrationBackupPath?: string;
 }
 
 /**
  * Final-VSIX startup gate. A legacy file Runtime is never opened or imported: an explicit drained
  * request archives it with a durable journal, filters independent configuration, and only then
- * atomically activates the current SQLite/CAS RootBinding. Every older Runtime epoch is archived/reset before RuntimeDatabase opens;
+ * atomically activates the current SQLite/CAS RootBinding. Exact published epoch-3/4 roots are
+ * backed up and upgraded in place before RuntimeDatabase opens. Unsupported epochs remain intact
+ * and require an explicit recovery decision; startup never silently replaces them with an empty root.
  * current-epoch schema drift is rejected without rewriting data.
  *
  * The whole gate runs inside the configuration-root admission and the scope maintenance claim
@@ -85,6 +88,7 @@ export class VscodeReliableKernelCutoverCoordinator {
     const historical = await this.authority.readHistoricalPointerForCutover();
     if (await physicalCutoverRecoveryRequired(this.runtimeScopeRootPath)) return 'physical-cutover';
     if (await readPhysicalCutoverRequest(this.runtimeScopeRootPath)) return 'physical-cutover';
+    if (await previousRuntimeEpochMigrationRequired(this.authority)) return 'runtime-root';
     if (historical && historical.runtimeKernelEpoch < RUNTIME_KERNEL_EPOCH) return 'runtime-root';
     let binding: RootBinding;
     try {
@@ -117,21 +121,25 @@ export class VscodeReliableKernelCutoverCoordinator {
       };
     }
 
+    const migration = await migratePreviousRuntimeEpochIfRequired(this.authority);
+    if (migration) {
+      return {
+        binding: migration.binding,
+        initialized: false,
+        cutoverPerformed: false,
+        ...(migration.migrated ? {
+          epochMigratedFrom: migration.previousEpoch,
+          epochMigrationBackupPath: migration.backupPath
+        } : {})
+      };
+    }
+
     const historical = await this.authority.readHistoricalPointerForCutover();
     if (historical && historical.runtimeKernelEpoch < RUNTIME_KERNEL_EPOCH) {
-      const reset = await archiveAndResetIncompatibleRuntime(
-        this.authority,
-        this.runtimeScopeRootPath,
-        historical
+      throw new RootAuthorityError(
+        'runtime-epoch-upgrade-unsupported',
+        `第 ${historical.runtimeKernelEpoch} 代运行数据没有已验证的无损升级路径；原数据保持不变，拒绝自动重置。`
       );
-      return {
-        binding: reset.binding,
-        initialized: true,
-        cutoverPerformed: false,
-        archiveDirectoryName: reset.archiveDirectoryName,
-        epochResetFrom: historical.runtimeKernelEpoch,
-        epochResetBackupPath: reset.backupPath
-      };
     }
 
     try {
@@ -171,12 +179,6 @@ export class VscodeReliableKernelCutoverCoordinator {
       throw error;
     }
   }
-}
-
-interface IncompatibleRuntimeResetResult {
-  binding: RootBinding;
-  archiveDirectoryName: string;
-  backupPath: string;
 }
 
 /**
@@ -223,136 +225,11 @@ export async function archiveCurrentRuntimeRootForReset(
   );
 }
 
-async function archiveAndResetIncompatibleRuntime(
-  authority: RootAuthority,
-  runtimeScopeRootPathInput: string,
-  historical: HistoricalRootBinding
-): Promise<IncompatibleRuntimeResetResult> {
-  const runtimeScopeRootPath = normalizedAbsolutePath(runtimeScopeRootPathInput, 'Workspace Runtime scope root');
-  const expected = authority.expectedPaths();
-  assertHistoricalBindingMatchesExpected(historical, expected);
-
-  const controlRootPath = path.dirname(expected.rootPointerPath);
-  if (
-    path.dirname(controlRootPath) !== runtimeScopeRootPath
-    || path.dirname(expected.dataRootPath) !== controlRootPath
-  ) {
-    throw new RootAuthorityError(
-      'runtime-epoch-reset-path-invalid',
-      `Runtime epoch reset path is outside the selected Workspace scope: ${controlRootPath}`
-    );
-  }
-
-  const backupRootPath = path.join(
-    runtimeScopeRootPath,
-    VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY
-  );
-  const archiveDirectoryName = [
-    timestampSlug(),
-    `epoch-${historical.runtimeKernelEpoch}-to-${RUNTIME_KERNEL_EPOCH}`,
-    randomUUID().slice(0, 8)
-  ].join('-');
-  const backupPath = path.join(backupRootPath, archiveDirectoryName);
-  await fs.mkdir(backupRootPath, { recursive: true, mode: 0o700 });
-  await fs.rename(controlRootPath, backupPath);
-  await syncDirectoryDurably(backupRootPath);
-  await syncDirectoryDurably(runtimeScopeRootPath);
-
-  try {
-    const binding = await initializeEmptyRuntimeRoot(authority);
-    await syncDirectoryDurably(runtimeScopeRootPath);
-    return { binding, archiveDirectoryName, backupPath };
-  } catch (error) {
-    const restored = await restoreArchivedRuntimeAfterFailedActivation({
-      authority,
-      runtimeScopeRootPath,
-      controlRootPath,
-      backupRootPath,
-      backupPath,
-      archiveDirectoryName
-    }).catch((rollbackError: unknown) => {
-      throw new RootAuthorityError(
-        'runtime-epoch-reset-rollback-failed',
-        `Runtime epoch reset failed and the archived root could not be restored: ${backupPath}`,
-        combinedFailure(error, rollbackError)
-      );
-    });
-    throw new RootAuthorityError(
-      'runtime-epoch-reset-failed',
-      restored
-        ? `Runtime epoch reset failed; the previous Runtime root was restored: ${controlRootPath}`
-        : `Runtime epoch reset did not finish cleanly; the previous Runtime root remains archived at: ${backupPath}`,
-      error
-    );
-  }
-}
-
-async function restoreArchivedRuntimeAfterFailedActivation(input: {
-  authority: RootAuthority;
-  runtimeScopeRootPath: string;
-  controlRootPath: string;
-  backupRootPath: string;
-  backupPath: string;
-  archiveDirectoryName: string;
-}): Promise<boolean> {
-  const published = await input.authority.readHistoricalPointerForCutover();
-  if (published?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) return false;
-
-  if (await exists(input.controlRootPath)) {
-    const failedPath = path.join(
-      input.backupRootPath,
-      `${input.archiveDirectoryName}-failed-current-${randomUUID().slice(0, 8)}`
-    );
-    await fs.rename(input.controlRootPath, failedPath);
-    await syncDirectoryDurably(input.backupRootPath);
-  }
-  await fs.rename(input.backupPath, input.controlRootPath);
-  await syncDirectoryDurably(input.backupRootPath);
-  await syncDirectoryDurably(input.runtimeScopeRootPath);
-  return true;
-}
-
-function assertHistoricalBindingMatchesExpected(
-  historical: HistoricalRootBinding,
-  expected: RuntimeRootPaths
-): void {
-  if (!samePaths(historical.paths, expected)) {
-    throw new StaleRootBindingError(
-      'Historical RootBinding paths do not match the selected Workspace Runtime root.'
-    );
-  }
-}
-
-function samePaths(left: RuntimeRootPaths, right: RuntimeRootPaths): boolean {
-  return left.dataRootPath === right.dataRootPath
-    && left.databasePath === right.databasePath
-    && left.casRootPath === right.casRootPath
-    && left.rootPointerPath === right.rootPointerPath
-    && left.rootPendingPath === right.rootPendingPath
-    && left.runtimeEpochPath === right.runtimeEpochPath;
-}
-
 function normalizedAbsolutePath(value: string, label: string): string {
   if (typeof value !== 'string' || !path.isAbsolute(value) || path.resolve(value) !== value) {
     throw new TypeError(`${label} must be a normalized absolute path.`);
   }
   return value;
-}
-
-async function exists(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
-    throw error;
-  }
-}
-
-function combinedFailure(activationError: unknown, rollbackError: unknown): Error {
-  const error = new Error('Runtime epoch activation and rollback both failed.');
-  (error as Error & { causes?: readonly unknown[] }).causes = [activationError, rollbackError];
-  return error;
 }
 
 function timestampSlug(): string {

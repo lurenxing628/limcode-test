@@ -174,6 +174,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/waiting-interaction-cancellation.test.mjs',
   'tests/reliable-kernel/interaction-auto-approval.test.mjs',
   'tests/reliable-kernel/platform-runtime-compatibility.test.mjs',
+  'tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs',
   'tests/reliable-kernel/runtime-claim-windows-rename.test.cjs',
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
   'tests/reliable-kernel/runtime-datasets.test.mjs',

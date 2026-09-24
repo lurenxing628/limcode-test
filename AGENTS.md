@@ -12,7 +12,7 @@
 
 当前项目仍然处于开发模式，因此不要对旧格式有任何兜底，也不需要保留旧功能代码的兼容和体验，也不需要写什么协议v1，v2等之类的运行时内部版本号，全面使用新格式新功能更优秀的代码。
 
-允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。当前 Runtime epoch 为 5。旧 epoch 3→4 的离线升级和 epoch 4 内补 RuntimeDeliveryIntentLink 的有界入口已经退休，不得将其继续套用到当前 schema。旧 epoch 通过现有维护互斥、完整 RootBinding 校验与离线 archive/reset 保留原 Runtime 归档，再创建 epoch 5；配置和 Workspace 独立保留。当前 epoch 内任何 table/index/trigger/manifest/RootBinding 漂移均 fail closed，不补表、不修 metadata、不维护通用迁移链。
+允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的通用 migration 链。当前 Runtime epoch 为 5。为保留已发布用户的对话，精确支持版本 0.0.10–0.0.14 的 epoch 3 和 0.0.15–0.0.21 的 epoch 4 离线升级到 epoch 5：数据库打开前核对完整 table/index/trigger/manifest/RootBinding 指纹，要求其它 Host 离线，使用 SQLite Backup API 持久备份，通过 pending pointer、单事务和 durable journal 向前恢复；旧版中断的 3→4 pending/journal 经精确核验后先收敛；原 Conversation、Message、附件与 CAS 保留。epoch 3 的旧 Child Runtime continuation、epoch 4 精确缺少 RuntimeDeliveryIntentLink 的前驱，仅在身份与内容全部严格匹配时转换。不允许由其它缺表、字段或 digest 推导前驱。未知结构漂移和不受支持的旧 epoch 保持原根不变并 fail closed，绝不自动换成空库；用户显式归档重置另走独立入口。当前 epoch 内任何 table/index/trigger/manifest/RootBinding 漂移也 fail closed，不补表、不修 metadata。
 
 ### 1.1 独立领域对象必须独立建模
 

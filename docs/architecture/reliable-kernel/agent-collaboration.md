@@ -141,6 +141,6 @@
 
 ## 存储与验证
 
-新增协作领域使用当前 Runtime epoch 5。旧 epoch 通过已有 archive/reset 流程归档运行数据并建立当前 Runtime，保留配置和 Workspace；不增加任意旧格式的迁移或 fallback。当前 epoch 的缺表、索引、manifest 或 RootBinding 漂移继续 fail closed。
+新增协作领域使用当前 Runtime epoch 5。已发布的 epoch 3、4 在数据库打开前经过完整指纹核验、SQLite 持久备份、单事务增表和 durable journal 向前恢复，旧版中断的 3→4 升级先精确收敛，原对话、消息、附件与 CAS 保留；epoch 3 及精确缺少 RuntimeDeliveryIntentLink 的 epoch 4 前驱仅在身份完全匹配时转换旧 Child continuation。未知前驱或结构漂移保持原根并拒绝自动重置；当前 epoch 的缺表、索引、manifest 或 RootBinding 漂移继续 fail closed。
 
 回归覆盖真实 SQLite/CAS、团队作用域与跨团队拒绝、跨对话开关与子 Agent 拒绝、跨项目拒绝、跨对话新建与分支、长消息与对话记录的分页读取、分支继承引用、静默消息、唤醒与处理 ACK、重复提交、并发预算、结果回信、分页、压缩/native 短引用、fork 和生产调度链路。界面检查包括继承/恢复设置及窄屏布局。统一入口为 `npm run check:local`。

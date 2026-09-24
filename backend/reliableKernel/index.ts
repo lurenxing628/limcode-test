@@ -50,6 +50,7 @@ export * from './processProtocol';
 export * from './repositories';
 export * from './repositoryPagination';
 export * from './rootAuthority';
+export * from './runtimeEpochMigration';
 export * from './runtimeDeliveryContinuationIdentity';
 export * from './currentRuntimeSchemaValidation';
 export * from './sqliteFilePath';
