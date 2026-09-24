@@ -48,6 +48,16 @@ test('shared selection honors explicit, inherited, project, default and singleto
   assert.match(resolve({ project: undefined, policy: { allowedWorkEnvironmentIds: [B.id, A.id] } }).error, /多个工作环境/);
   assert.equal(resolve({ environments: [B], project: undefined, policy: undefined }).active.id, B.id);
   assert.match(resolve({ explicitWorkEnvironmentId: 'deleted' }).error, /不存在/);
+  // A starting directory (a user-approved Plan's planning directory) narrows nothing and is used only
+  // while this choice's own list admits it; otherwise the usual order applies without an error.
+  const preferred = resolve({ preferredWorkEnvironmentId: remote.id });
+  assert.equal(preferred.active.id, remote.id);
+  assert.deepEqual(plain(preferred.allowed.map(record => record.id)), policy.allowedWorkEnvironmentIds);
+  assert.equal(resolve({ explicitWorkEnvironmentId: A.id, preferredWorkEnvironmentId: remote.id }).active.id, A.id);
+  const outside = resolve({ policy: { allowedWorkEnvironmentIds: [A.id, B.id] }, preferredWorkEnvironmentId: remote.id });
+  assert.equal(outside.active.id, B.id);
+  assert.equal(outside.error, undefined);
+  assert.equal(resolve({ preferredWorkEnvironmentId: 'deleted' }).active.id, B.id);
 });
 
 test('frozen default cannot fall into another allowed environment after removal', () => {

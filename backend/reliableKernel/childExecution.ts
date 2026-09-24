@@ -70,6 +70,7 @@ import { RuntimeDatabase } from './runtimeDatabase';
 import {
   normalizeTurnModelOverride,
   normalizeCompiledTurnAuthority,
+  type TurnAuthorityCompilationRequest,
   type TurnAuthorityCompiler,
   type TurnModelOverride
 } from './turnControlPlane';
@@ -80,6 +81,13 @@ export const CHILD_INTERRUPTION_RECOVERY_REASON =
 
 export type ChildCompletionPolicy = 'wait_for_answer' | 'background';
 export type ChildSpawnSourceSettlement = 'child_handle' | 'external';
+/**
+ * `parent_turn`: a child the model starts only narrows — every Turn stays within the tools, skills
+ * and work environments the parent Turn froze. `executor_agent`: the user approved a Plan to run in
+ * a new conversation, so the child runs with its executor Agent's own settings (global and its own
+ * scopes still apply) and only starts in the planning Turn's working directory.
+ */
+export type ChildSpawnAuthorityBound = 'parent_turn' | 'executor_agent';
 export type ChildSendMode = 'queue_next_turn' | 'interrupt_current_turn';
 
 export interface ChildExecutionSpawnCommand {
@@ -96,6 +104,8 @@ export interface ChildExecutionSpawnCommand {
    * ToolCall whose interaction control plane remains its sole settlement owner.
    */
   sourceSettlement: ChildSpawnSourceSettlement;
+  /** Defaults to `parent_turn`; `executor_agent` is only for a user-approved Plan (external settlement). */
+  authorityBound?: ChildSpawnAuthorityBound;
   waitDeadlineAt?: string;
   childConversationId?: string;
   title?: string;
@@ -395,17 +405,15 @@ export class ChildExecutionControlPlane {
       this.database, this.contentStore, String(parent.conversation.id), String(parent.turn.id)
     );
 
+    if (command.authorityBound === 'executor_agent' && parent.toolCall.tool_name !== 'submit_plan') {
+      throw new Error('Only a Plan the user approved may start a child with its executor Agent own settings.');
+    }
     const workspace = await projectFolderForConversation(
       this.database,
       requirePhaseFId(parent.conversation.id, 'Conversation.id')
     );
-    const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
-      requirePhaseFId(parent.turn.id, 'parent Turn.id')
-    );
-    // The child's tools and skills never exceed the parent Turn's; later Turns keep this same bound.
-    const inherited = await this.frozenChildBoundaryForTurn(
-      requirePhaseFId(parent.turn.id, 'parent Turn.id')
-    );
+    const parentTurnId = requirePhaseFId(parent.turn.id, 'parent Turn.id');
+    const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(parentTurnId);
     const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
       conversationId: ids.childConversationId,
       turnId: ids.childTurnId,
@@ -413,9 +421,13 @@ export class ChildExecutionControlPlane {
       intentKind: 'input',
       modelFallback: command.modelFallback,
       ...(workspace ? { workspace } : {}),
-      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {}),
-      inheritedToolPolicy: inherited.toolPolicy,
-      inheritedSkillPolicy: inherited.skillPolicy
+      ...(command.authorityBound === 'executor_agent'
+        // The user approved this delegation: no planning-Turn bound, only its working directory.
+        ? (inheritedBoundary?.defaultWorkEnvironmentId
+            ? { preferredWorkEnvironmentId: inheritedBoundary.defaultWorkEnvironmentId }
+            : {})
+        // The child's tools and skills never exceed the parent Turn's; later Turns keep this same bound.
+        : await this.parentTurnBound(parentTurnId, inheritedBoundary))
     }), ids.childTurnId, command.childAgentId);
     const modelSelection = frozenModelSelection(JSON.parse(asUtf8Text(
       compiled.authoritySnapshot.content,
@@ -735,6 +747,19 @@ export class ChildExecutionControlPlane {
       turnId
     );
     return frozenWorkEnvironmentPolicy(frozen.document);
+  }
+
+  private async parentTurnBound(
+    parentTurnId: string,
+    inheritedBoundary: FrozenWorkEnvironmentBoundaryPolicy | undefined
+  ): Promise<Pick<TurnAuthorityCompilationRequest,
+    'inheritedWorkEnvironmentPolicy' | 'inheritedToolPolicy' | 'inheritedSkillPolicy'>> {
+    const inherited = await this.frozenChildBoundaryForTurn(parentTurnId);
+    return {
+      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {}),
+      inheritedToolPolicy: inherited.toolPolicy,
+      inheritedSkillPolicy: inherited.skillPolicy
+    };
   }
 
   /** Reads the tool and skill settings frozen for one Turn, as a child spawned by it inherits them. */
@@ -3776,6 +3801,7 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   const childAgentId = requirePhaseFId(command.childAgentId, 'childAgentId');
   const completionPolicy = requireCompletionPolicy(command.completionPolicy);
   const sourceSettlement = requireSpawnSourceSettlement(command.sourceSettlement);
+  const authorityBound = requireSpawnAuthorityBound(command.authorityBound ?? 'parent_turn');
   const waitDeadlineAt = command.waitDeadlineAt === undefined
     ? undefined
     : requireIsoTimestamp(command.waitDeadlineAt, 'waitDeadlineAt');
@@ -3788,6 +3814,9 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   if (sourceSettlement === 'external' && completionPolicy !== 'background') {
     throw new TypeError('external source settlement requires background completion.');
   }
+  if (authorityBound === 'executor_agent' && sourceSettlement !== 'external') {
+    throw new TypeError('executor_agent authority requires an externally settled source (a user-approved Plan).');
+  }
   return {
     sourceToolCallId,
     childAgentId,
@@ -3796,6 +3825,7 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
     forkTurns: normalizeChildForkTurns(command.forkTurns),
     completionPolicy,
     sourceSettlement,
+    authorityBound,
     ...(waitDeadlineAt ? { waitDeadlineAt } : {}),
     ...(optionalPhaseFId(command.childConversationId, 'childConversationId')
       ? { childConversationId: optionalPhaseFId(command.childConversationId, 'childConversationId')! }
@@ -3953,6 +3983,7 @@ function spawnRequestPayload(
     inputMessageRevisionId: ids.childMessageRevisionId,
     completionPolicy: command.completionPolicy,
     sourceSettlement: command.sourceSettlement,
+    ...(command.authorityBound === 'executor_agent' ? { authorityBound: command.authorityBound } : {}),
     waitDeadlineAt: command.waitDeadlineAt ?? null,
     title: command.title,
     prompt: command.prompt,
@@ -4145,6 +4176,13 @@ function requireCompletionPolicy(value: unknown): ChildCompletionPolicy {
 function requireSpawnSourceSettlement(value: unknown): ChildSpawnSourceSettlement {
   if (value !== 'child_handle' && value !== 'external') {
     throw new TypeError('sourceSettlement must be child_handle or external.');
+  }
+  return value;
+}
+
+function requireSpawnAuthorityBound(value: unknown): ChildSpawnAuthorityBound {
+  if (value !== 'parent_turn' && value !== 'executor_agent') {
+    throw new TypeError('authorityBound must be parent_turn or executor_agent.');
   }
   return value;
 }

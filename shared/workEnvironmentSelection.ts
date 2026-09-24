@@ -19,6 +19,12 @@ export function resolveWorkEnvironmentSelection(input: {
   policy?: WorkEnvironmentSelectionPolicy;
   inheritedPolicy?: WorkEnvironmentSelectionPolicy;
   explicitWorkEnvironmentId?: string;
+  /**
+   * Where to start when nothing is chosen explicitly or inherited, used only while this choice's
+   * own allowed list admits it (a Plan the user approved to run in a new conversation starts in
+   * the planning directory). Unlike `inheritedPolicy` it narrows nothing.
+   */
+  preferredWorkEnvironmentId?: string;
   project?: { uri: string };
   projectMissing?: boolean;
 }): WorkEnvironmentSelection {
@@ -38,6 +44,8 @@ export function resolveWorkEnvironmentSelection(input: {
   };
   if (input.explicitWorkEnvironmentId) return select(input.explicitWorkEnvironmentId, 'explicit');
   if (input.inheritedPolicy?.defaultWorkEnvironmentId) return select(input.inheritedPolicy.defaultWorkEnvironmentId, 'inherited');
+  const preferred = input.preferredWorkEnvironmentId ? byId.get(input.preferredWorkEnvironmentId) : undefined;
+  if (preferred?.available && allowedIds.has(preferred.id)) return { allowed, active: preferred, source: 'inherited' };
   if (input.projectMissing) return { allowed, error: '会话绑定的项目不存在，请重新绑定项目或显式选择工作环境。' };
   if (input.project) return select(workEnvironmentIdFromUri(input.project.uri), 'project');
   if (input.policy?.defaultWorkEnvironmentId) return select(input.policy.defaultWorkEnvironmentId, 'default');

@@ -170,7 +170,13 @@ export interface TurnAuthorityCompilationRequest {
    */
   inheritedWorkEnvironmentPolicy?: FrozenWorkEnvironmentBoundaryPolicy;
   /**
-   * The parent Turn's frozen tool policy, supplied for every Turn of a child execution. The compiler
+   * The planning Turn's working directory, supplied when a Plan the user approved runs in a new
+   * conversation: the child starts there if its own settings allow it. It narrows nothing.
+   */
+  preferredWorkEnvironmentId?: string;
+  /**
+   * The parent Turn's frozen tool policy, supplied for every Turn of a child execution the model
+   * started (a Plan the user approved to run in a new conversation has none). The compiler
    * intersects the child's own tool settings with it (see `boundChildToolPolicy`) — a child never
    * gets a tool, MCP source or permission its parent Turn lacked.
    */

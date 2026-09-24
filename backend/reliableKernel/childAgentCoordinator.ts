@@ -256,6 +256,9 @@ export class ReliableChildAgentCoordinator {
       prompt: promptWithAnswerBridge(requireText(input.prompt, 'prompt')),
       completionPolicy: 'background',
       sourceSettlement: 'external',
+      // The user approved this delegation on the Plan card: the executor Agent runs with its own
+      // settings instead of the planning Turn's (see ChildSpawnAuthorityBound).
+      authorityBound: 'executor_agent',
       leaseOwnerId: this.childLeaseOwnerId,
       leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
     });

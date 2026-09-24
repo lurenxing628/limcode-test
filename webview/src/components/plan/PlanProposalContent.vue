@@ -2,7 +2,7 @@
 import { computed, nextTick, ref, useAttrs, watch } from 'vue';
 import { IconArrowsMaximize, IconArrowsMinimize, IconClipboardList, IconCircleCheck, IconCircleX, IconDownload, IconMessage2, IconMessagePlus, IconPencilMinus, IconRobot } from '@tabler/icons-vue';
 import { renderPlanMarkdown } from '@shared/planMarkdown';
-import { DELEGATED_PLAN_APPROVAL_MESSAGE, submitPlanOutputFromResult } from '@shared/planReview';
+import { DELEGATED_PLAN_APPROVAL_MESSAGE, delegatedPlanDispatchDescription, submitPlanOutputFromResult } from '@shared/planReview';
 import type { AgentRecord, PlanProposalRecord, PlanProposalStatus, SubmitPlanToolRequestRecord, ToolCallRecord } from '@shared/protocol';
 import { interactionForTool, type InteractionView } from '@webview/domain/interactionProjection';
 import { useAgentStore } from '@webview/stores/useAgentStore';
@@ -154,6 +154,7 @@ const dispatchAgentOptions = computed<SettingsDropdownOption[]>(() => agentStore
   icon: IconRobot
 })));
 const selectedDispatchAgent = computed<AgentRecord | undefined>(() => agentStore.configurableAgents.find((agent) => agent.id === selectedDispatchAgentType.value));
+const dispatchPanelDescription = computed(() => delegatedPlanDispatchDescription(selectedDispatchAgent.value?.name));
 const dispatchPanelActions = computed<ConfirmPanelAction[]>(() => [
   { key: 'cancel', label: '取消', variant: 'secondary' },
   { key: 'confirm', label: '分派执行', disabled: !selectedDispatchAgent.value }
@@ -457,7 +458,7 @@ function agentTypeDescription(agent: AgentRecord): string {
   <ConfirmPanel
     :open="dispatchPanelOpen"
     title="选择执行 Agent"
-    description="将创建一个独立的子 Agent 对话，并在后台执行已批准的 Plan。"
+    :description="dispatchPanelDescription"
     :actions="dispatchPanelActions"
     @cancel="closeDispatchPanel"
     @confirm="confirmDispatch"

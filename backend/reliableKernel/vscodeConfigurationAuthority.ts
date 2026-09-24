@@ -353,6 +353,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       policy: workEnvironmentPolicy,
       inheritedPolicy: request.inheritedWorkEnvironmentPolicy,
       explicitWorkEnvironmentId: selectedEnvironment?.workEnvironmentId,
+      preferredWorkEnvironmentId: request.preferredWorkEnvironmentId,
       project: request.workspace
     });
     if (environmentSelection.error) throw new Error(environmentSelection.error);

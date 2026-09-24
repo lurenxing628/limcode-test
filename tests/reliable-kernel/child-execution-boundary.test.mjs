@@ -368,16 +368,111 @@ test('spawned, continued and user-started child Turns all stay within the parent
   });
 });
 
-async function saveProvider(configuration) {
+test('a Plan the user approves to run in a new conversation runs with the executor Agent own settings, not the planning Turn', { timeout: 120000 }, async () => {
+  await runtimeFixture(async f => {
+    const { workEnvironmentIdFromUri } = dist('shared/workEnvironmentCatalog.js');
+    const folders = ['alpha', 'beta'].map((name, index) => {
+      const rootPath = path.join(f.root, name);
+      return { uri: Uri.file(rootPath).toString(), name, rootPath, index };
+    });
+    for (const folder of folders) await fs.mkdir(folder.rootPath, { recursive: true });
+    await f.configuration.synchronizeWorkspaceFolders(folders);
+    const [alpha, beta] = folders.map(folder => workEnvironmentIdFromUri(folder.uri));
+    // A read-only planner working in beta; the planning conversation's own settings allow only beta.
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: f.parentAgent.id, allowedTools: ['read', 'submit_plan'] });
+    await f.configuration.mutations.setWorkEnvironmentPolicy({ scopeKind: 'conversation', scopeId: 'parent', enabled: false,
+      allowedWorkEnvironmentIds: [beta], defaultWorkEnvironmentId: beta });
+    await f.configuration.mutations.selectConversationWorkEnvironment('parent', beta);
+    await f.configuration.mutations.setModelProfile({ scopeKind: 'conversation', scopeId: 'parent', providerConfigId: f.provider.id,
+      provider: f.provider.provider, model: f.provider.model, thinkingOverride: { kind: 'openai-effort', value: 'high' }, inheritThinkingToChildren: true });
+    // The worker may edit and use an MCP source; the global settings still leave bash out for everyone.
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'run_agent', 'submit_agent_answer', 'submit_plan', 'write'] });
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: f.childAgent.id,
+      allowedTools: ['bash', 'read', 'run_agent', 'submit_agent_answer', 'write'], sourceConfigs: { github: { enabled: true } } });
+
+    await f.app.agentLoop.runInput(f.input('plan'));
+    const [request] = await f.list('InteractionRequest');
+    assert.equal(request.request_kind, 'plan_review');
+    const [planTurn] = await f.list('Turn', { conversation_id: 'parent' });
+    const planning = (await f.frozen(planTurn.id)).document;
+    assert.deepEqual(planning.toolPolicy.allowedTools, ['read', 'submit_plan']);
+    assert.deepEqual(planning.workEnvironmentPolicy.allowedWorkEnvironmentIds, [beta]);
+
+    await f.app.interactions.resolvePlanReview({ source: { kind: 'command', key: 'approve-in-new-conversation' }, requestId: request.id,
+      decision: 'accept', response: { executionTarget: 'new_conversation', agentType: f.childAgent.id } });
+    await f.coordinator.waitForIdle();
+    const [child] = await f.list('ChildExecution');
+    assert.ok(child, 'the approved Plan starts a child conversation');
+    const [firstLink] = await f.list('ChildExecutionTurnLink', { child_execution_id: child.id });
+    const { toolPolicy, skillPolicy, workEnvironmentPolicy } = (await f.frozen(firstLink.turn_id)).document;
+    assert.deepEqual(toolPolicy.allowedTools, ['read', 'run_agent', 'submit_agent_answer', 'write'],
+      'the worker keeps its own tools (bash stays off globally), not the planner read-only list');
+    assert.equal(toolPolicy.inherited, undefined, 'no planning-Turn bound is frozen');
+    assert.deepEqual(toolPolicy.sourceConfigs, { github: { enabled: true } });
+    assert.equal(skillPolicy.inherited, undefined);
+    assert.deepEqual([...workEnvironmentPolicy.allowedWorkEnvironmentIds].sort(), [alpha, beta].sort(),
+      'the worker own work environments, not the planning conversation list');
+    assert.equal(workEnvironmentPolicy.defaultWorkEnvironmentId, beta, 'it starts in the directory the Plan was made in');
+    const compiled = f.compileRequests.find(candidate => candidate.turnId === firstLink.turn_id);
+    assert.equal(compiled.inheritedToolPolicy, undefined);
+    assert.equal(compiled.inheritedSkillPolicy, undefined);
+    assert.equal(compiled.inheritedWorkEnvironmentPolicy, undefined);
+    const childWire = f.wires.find(wire => wire.conversationId === child.child_conversation_id);
+    assert.deepEqual(childWire.body.tools.map(tool => tool.function.name).sort(), ['read', 'run_agent', 'write']);
+    // The planning conversation's "child Agents use this thinking strength" still reaches the worker.
+    const init = f.profileInits.find(entry => entry.conversationId === child.child_conversation_id);
+    assert.deepEqual(init.thinkingOverride, { kind: 'openai-effort', value: 'high' });
+
+    // Later Turns in that conversation keep the worker own settings too.
+    await f.app.database.conversationOwners.claim(child.child_conversation_id);
+    await f.coordinator.inputFromConversation({ commandId: 'user-in-delegated-child', childExecutionId: child.id,
+      conversationId: child.child_conversation_id, content: 'also run the checks' });
+    await f.coordinator.waitForIdle();
+    const links = (await f.list('ChildExecutionTurnLink', { child_execution_id: child.id }))
+      .sort((left, right) => Number(left.turn_seq) - Number(right.turn_seq));
+    assert.equal(links.length, 2);
+    const later = (await f.frozen(links[1].turn_id)).document;
+    assert.deepEqual(later.toolPolicy.allowedTools, ['read', 'run_agent', 'submit_agent_answer', 'write']);
+    assert.equal(later.toolPolicy.inherited, undefined);
+    assert.equal(later.workEnvironmentPolicy.defaultWorkEnvironmentId, beta);
+    // Only a user-approved Plan (externally settled) may ask for the executor's own settings.
+    await assert.rejects(f.app.runtime.children.spawn({ sourceToolCallId: 'model-call', childAgentId: f.childAgent.id,
+      modelFallback: { providerConfigId: f.provider.id, model: f.provider.model }, prompt: 'widen', completionPolicy: 'background',
+      sourceSettlement: 'child_handle', authorityBound: 'executor_agent', leaseOwnerId: 'owner', leaseExpiresAt: new Date().toISOString() }),
+    /executor_agent authority requires an externally settled source/);
+  }, {
+    async send(request, controls, f) {
+      let part = { text: 'done' };
+      if (request.conversationId === 'parent' && !f.sent.has('plan')) {
+        f.sent.add('plan');
+        part = { id: 'submit-plan', functionCall: { name: 'submit_plan', args: { plan: 'Edit the parser and add a regression test.',
+          taskList: { mode: 'rewrite', items: [{ title: 'Fix the parser', description: 'Edit and test.', status: 'pending', delete: false }] } } } };
+      }
+      await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [part] } });
+    }
+  }, { model: 'o3' });
+});
+
+test('the Plan card says the chosen Agent runs with its own tool permissions', async () => {
+  const { delegatedPlanDispatchDescription } = dist('shared/planReview.js');
+  assert.match(delegatedPlanDispatchDescription('Worker'), /将按「Worker」自己的工具权限执行/);
+  assert.match(delegatedPlanDispatchDescription('Worker'), /不受当前对话规划时的限制/);
+  assert.match(delegatedPlanDispatchDescription(), /将按所选 Agent 自己的工具权限执行/);
+  const card = await fs.readFile(path.resolve('webview/src/components/plan/PlanProposalContent.vue'), 'utf8');
+  assert.match(card, /delegatedPlanDispatchDescription\(selectedDispatchAgent\.value\?\.name\)/);
+  assert.match(card, /:description="dispatchPanelDescription"/);
+});
+
+async function saveProvider(configuration, model = 'synthetic-model') {
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
   const provider = { ...createDefaultLlmProviderConfig({ name: 'synthetic' }), id: 'child-boundary', provider: 'openai-compatible',
-    model: 'synthetic-model', models: [{ id: 'synthetic-model', name: 'synthetic' }], modelConfigs: [], generationConfig: {} };
+    model, models: [{ id: model, name: 'synthetic' }], modelConfigs: [], generationConfig: {} };
   await save('llmProviderConfigs', { configs: [provider] });
   await save('llm', { activeProviderConfigId: provider.id });
   return provider;
 }
 
-async function runtimeFixture(run, hooks) {
+async function runtimeFixture(run, hooks, options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-child-tool-boundary-runtime-'));
   let app, coordinator;
   try {
@@ -385,7 +480,7 @@ async function runtimeFixture(run, hooks) {
     const { applyFrozenModelProviderConfig } = dist('backend/reliableKernel/llmCapabilityProviderRegistry.js');
     const { LlmEventType } = dist('backend/world/modules/llm/events.js');
     const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
-    await saveProvider(configuration);
+    const provider = await saveProvider(configuration, options.model);
     const parentAgent = await configuration.mutations.createAgent({ name: 'orchestrator', kind: 'custom' });
     const childAgent = await configuration.mutations.createAgent({ name: 'implementer', kind: 'custom' });
     await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: parentAgent.id,
@@ -423,9 +518,14 @@ async function runtimeFixture(run, hooks) {
       } }; } },
       toolDispatcher: {
         definitions() {
-          return ['bash', 'read', 'run_agent', 'write'].map(name => ({ name, description: 'synthetic', parameters: { type: 'object', properties: {} }, metadata: { readonly: name === 'read' } }));
+          return ['bash', 'read', 'run_agent', 'submit_plan', 'write'].map(name => ({ name, description: 'synthetic', parameters: { type: 'object', properties: {} }, metadata: { readonly: name === 'read' } }));
         },
         async dispatch(input) {
+          if (input.toolName === 'submit_plan') {
+            const pause = await app.interactions.pauseForPlanReview({ source: { kind: 'internal', key: `plan:${input.toolCallId}` },
+              toolCallId: input.toolCallId, request: input.arguments });
+            return { disposition: 'paused', toolCallId: input.toolCallId, reason: 'awaiting_plan_review', resumeKey: pause.requestId };
+          }
           assert.equal(input.toolName, 'run_agent');
           const frozenAuthority = await frozen(input.turnId);
           return coordinator.dispatch(input, undefined, { snapshotId: frozenAuthority.snapshot.id, document: frozenAuthority.document,
@@ -433,18 +533,22 @@ async function runtimeFixture(run, hooks) {
         }
       }
     });
+    const profileInits = [];
+    const productProfiles = childConversationModelProfiles(configuration.mutations);
     coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime, modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
       agents: { async resolve() { return { agentId: childAgent.id, agentType: 'worker' }; } },
       // Production wiring (VscodeReliableKernelProductRuntime uses the same adapter).
-      modelProfiles: childConversationModelProfiles(configuration.mutations)
+      modelProfiles: { async initializeConversation(input) { profileInits.push(structuredClone(input)); return productProfiles.initializeConversation(input); } }
     });
+    // Production wiring: a Plan approved to run in a new conversation goes through the same coordinator.
+    app.interactions.setPlanDelegator({ preview: input => coordinator.previewApprovedPlan(input), ensure: input => coordinator.ensureApprovedPlan(input) });
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent', title: 'Synthetic', status: 'active', created_at: now, updated_at: now }),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: parentAgent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     const input = key => ({ source: { kind: 'command', key }, conversationId: 'parent', leaseOwnerId: 'boundary-owner', hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: `synthetic input ${key}` });
-    f = { app, configuration, coordinator, parentAgent, childAgent, input, requests, wires, list, frozen, compileRequests, sent: new Set() };
+    f = { app, configuration, coordinator, provider, root, parentAgent, childAgent, input, requests, wires, list, frozen, compileRequests, profileInits, sent: new Set() };
     await run(f);
   } finally {
     if (coordinator) await coordinator.dispose();
