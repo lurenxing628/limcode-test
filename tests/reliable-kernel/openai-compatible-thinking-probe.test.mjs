@@ -4,11 +4,13 @@ import test from 'node:test';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-// 渠道配置与路由模块在加载时引用 vscode；这里只用到它们的纯函数，给一个空桩。
+// 渠道配置与路由模块在加载时引用 vscode；这里只用到它们的纯函数，给一个桩，并记下弹出的警告。
+const warnings = [];
+const vscodeStub = { window: { showWarningMessage(text) { warnings.push(text); return Promise.resolve(undefined); } } };
 const Module = require('node:module');
 const originalLoad = Module._load;
 Module._load = function load(request, ...rest) {
-  return request === 'vscode' ? {} : originalLoad.call(this, request, ...rest);
+  return request === 'vscode' ? vscodeStub : originalLoad.call(this, request, ...rest);
 };
 const { probeOpenAICompatibleThinking } = require('../../dist/extension/backend/capabilities/openAICompatibleThinkingProbe.js');
 const { ReliableLlmProviderRegistry } = require('../../dist/extension/backend/reliableKernel/llmCapabilityProviderRegistry.js');
@@ -20,6 +22,8 @@ const {
 } = require('../../dist/extension/shared/modelCapabilities.js');
 const { sessionThinkingCapability } = require('../../dist/extension/shared/sessionThinking.js');
 const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
+const protocol = require('../../dist/extension/shared/protocol.js');
+const { VscodeReliableKernelCommandRouter } = require('../../dist/extension/backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js');
 
 const API_KEY = 'sk-probe-secret-7f3a9c';
 const PROBE_KEYS = new Set(['model', 'messages', 'stream', 'max_tokens', 'thinking', 'enable_thinking', 'reasoning_effort']);
@@ -364,4 +368,59 @@ test('请求改写与会话思考选项采用测试结果', async () => {
   const plain = (await dryRunLlmProvider({ id: 'plain', invocationId: 'plain', conversationId: 'plain', contents: [{ role: 'user', parts: [{ text: 'hello' }] }], tools: [] },
     { settings: async () => untested })).body;
   assert.deepEqual(thinkingParams(plain), { reasoning_effort: 'medium' });
+});
+
+async function waitFor(predicate, label) {
+  const deadline = Date.now() + 3000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`等待超时：${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function routerFixture(probeThinking) {
+  const posted = [];
+  const calls = [];
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} }, toolHost: { setStateChangeListener() {} },
+    async ensureCapabilitiesReady() {},
+    providerRegistry: {
+      async probeOpenAICompatibleThinking(config) { calls.push(config); return probeThinking(config); },
+      async listModels() { throw new Error('不应获取 LLM 列表'); },
+      async verifyNativeCompaction() { throw new Error('不应验证原生压缩'); }
+    }
+  });
+  const webview = { async postMessage(message) { posted.push(message); return true; } };
+  const send = (config) => router.handle('settings-panel', webview, {
+    id: 'thinking-test-request', type: protocol.BridgeMessageType.LlmProviderModelsGet, payload: { config, probeThinking: true }
+  });
+  return { posted, calls, send };
+}
+
+test('路由：测试请求走 probeThinking 分支，结果按请求 id 回给设置页，用途标为 thinking_probe', async () => {
+  const config = channel('https://relay.example.invalid/v1', 'deepseek-like');
+  const record = { id: 'deepseek-like', name: 'deepseek-like', capabilitySnapshot: { source: 'verified_probe' } };
+  const { posted, calls, send } = routerFixture(async () => record);
+  send(config);
+  await waitFor(() => posted.length > 0, '路由回复');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, 'deepseek-like');
+  assert.equal(posted[0].type, protocol.BridgeMessageType.LlmProviderModelsSnapshot);
+  assert.equal(posted[0].correlationId, 'thinking-test-request');
+  assert.deepEqual(posted[0].payload, {
+    configId: config.id, purpose: 'thinking_probe', provider: 'openai-compatible', baseUrl: config.baseUrl, models: [record]
+  });
+});
+
+test('路由：测试失败按请求 id 回报错，不弹 VS Code 警告', async () => {
+  warnings.length = 0;
+  const { posted, send } = routerFixture(async () => { throw new Error('第 1 次请求失败（HTTP 401）：Incorrect API key provided'); });
+  send(channel('https://relay.example.invalid/v1', 'deepseek-like'));
+  await waitFor(() => posted.length > 0, '路由报错');
+  assert.equal(posted[0].type, protocol.BridgeMessageType.Error);
+  assert.equal(posted[0].correlationId, 'thinking-test-request');
+  assert.equal(posted[0].payload.requestType, protocol.BridgeMessageType.LlmProviderModelsGet);
+  assert.equal(posted[0].payload.message, '第 1 次请求失败（HTTP 401）：Incorrect API key provided');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(warnings, []);
 });

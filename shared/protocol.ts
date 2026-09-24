@@ -2972,11 +2972,17 @@ export interface LlmProviderModelsGetPayload {
   config: LlmProviderConfigRecord;
   /** Explicit, possibly billable synthetic native request; never a catalog side effect. */
   probeNative?: boolean;
+  /**
+   * “测试这个模型”：向 `config.model` 发最多 9 次很短的合成请求，测出 OpenAI 兼容思考参数写法、
+   * 能否关闭思考与接受的强度。只在用户点按钮时发送，可能产生少量费用。
+   */
+  probeThinking?: boolean;
 }
 
 export interface LlmProviderModelsSnapshotPayload {
   configId: string;
-  purpose?: 'capability_probe';
+  /** capability_probe：原生压缩端点验证；thinking_probe：“测试这个模型”的思考参数测试。 */
+  purpose?: 'capability_probe' | 'thinking_probe';
   provider: LlmProviderKind;
   baseUrl: string;
   models: LlmProviderModelRecord[];

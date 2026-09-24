@@ -959,6 +959,10 @@ export class VscodeReliableKernelCommandRouter {
     payload: LlmProviderModelsGetPayload,
     correlationId?: string
   ): Promise<void> {
+    if (payload.probeThinking === true) {
+      await this.postThinkingProbe(webview, payload, correlationId);
+      return;
+    }
     const models = payload.probeNative === true
       ? [await this.product.providerRegistry.verifyNativeCompaction(payload.config)]
       : await this.product.providerRegistry.listModels(payload.config);
@@ -973,6 +977,37 @@ export class VscodeReliableKernelCommandRouter {
         provider: payload.config.provider,
         baseUrl: payload.config.baseUrl,
         models
+      }
+    });
+  }
+
+  /**
+   * “测试这个模型”：结果与失败都按请求 id 回给设置页，由设置页显示在对应模型旁边；
+   * 失败不弹 VS Code 警告，也不当成“获取 LLM 列表失败”。
+   */
+  private async postThinkingProbe(
+    webview: vscode.Webview,
+    payload: LlmProviderModelsGetPayload,
+    correlationId?: string
+  ): Promise<void> {
+    let model;
+    try {
+      model = await this.product.providerRegistry.probeOpenAICompatibleThinking(payload.config);
+    } catch (error) {
+      this.postRequestError(webview, BridgeMessageType.LlmProviderModelsGet, error instanceof Error ? error.message : String(error), correlationId);
+      return;
+    }
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.LlmProviderModelsSnapshot,
+      channel: 'state',
+      correlationId,
+      payload: {
+        configId: payload.config.id,
+        purpose: 'thinking_probe',
+        provider: payload.config.provider,
+        baseUrl: payload.config.baseUrl,
+        models: [model]
       }
     });
   }
