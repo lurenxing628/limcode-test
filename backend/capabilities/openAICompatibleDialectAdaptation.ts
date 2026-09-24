@@ -9,21 +9,19 @@
  * 官方在思考模式下缺了就返回 400；其他 DeepSeek 写法的服务商多传不会报错。
  * 用户在自定义请求体里自己写了思考参数时不改写，只补回传。
  */
-import type { LlmProviderConfigRecord, LlmRequestBodyRecord, LlmThinkingLevel } from '../../shared/protocol';
+import type { LlmProviderConfigRecord, LlmThinkingLevel } from '../../shared/protocol';
 import {
   mapOpenAICompatibleEffort,
   openAICompatibleEffortValues,
   type OpenAICompatibleDialect
 } from '../../shared/openAICompatibleDialect';
 import { resolveProviderOpenAICompatibleDialect } from '../../shared/modelCapabilities';
+import { openAICompatibleBodyControlsThinking } from '../../shared/sessionThinkingBody';
 import type { EncodedProviderRequest } from './providerParameterAdaptation';
 
 /** 运行时的 settings 来自 applyFrozenModelProviderConfig，带着 models（测试结果）与 modelConfigs。 */
 type DialectSettings = Pick<LlmProviderConfigRecord, 'provider' | 'baseUrl' | 'model' | 'openaiCompatibleThinkingFormat'>
   & Partial<Pick<LlmProviderConfigRecord, 'id' | 'models' | 'modelConfigs'>>;
-
-/** 自定义请求体里出现这些键，表示用户已经自己决定了思考参数的写法。 */
-const USER_THINKING_KEYS = ['thinking', 'enable_thinking', 'thinking_budget', 'chat_template_kwargs'] as const;
 
 const THINKING_LEVELS: ReadonlySet<string> = new Set<LlmThinkingLevel>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 
@@ -47,13 +45,10 @@ export function adaptOpenAICompatibleDialect(
   if (settings.provider !== 'openai-compatible' || !isRecord(request.body)) return request;
   const dialect = openAICompatibleDialectForSettings(settings);
   let body = request.body;
-  if (!userControlsThinking(settings.requestBody)) body = withDialectThinking(body, dialect);
+  // 用户在自定义请求体里自己写了思考参数（与会话思考覆盖的冲突检查同一口径）：不改写、也不删除。
+  if (!openAICompatibleBodyControlsThinking(settings.requestBody)) body = withDialectThinking(body, dialect);
   if (dialect.fillReasoningReplay) body = withReasoningReplay(body);
   return body === request.body ? request : { ...request, body };
-}
-
-function userControlsThinking(requestBody: LlmRequestBodyRecord | undefined): boolean {
-  return !!requestBody && USER_THINKING_KEYS.some((key) => Object.prototype.hasOwnProperty.call(requestBody, key));
 }
 
 /** 渠道或会话选的档位：接入库把它编码成 `reasoning_effort`（官方 DeepSeek 走接入库的 DeepSeek 格式时是 thinking.type）。 */

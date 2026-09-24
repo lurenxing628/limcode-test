@@ -358,10 +358,10 @@ test('渠道请求体自己写了思考参数时，摘要请求仍按方言改�
   assert.equal(deepseek.reasoning_effort, 'high');
   assert.equal('thinking_budget' in deepseek, false);
   const qwen = await summaryWire(COMPAT.dashscope, 'qwen3-max', 'disabled', {
-    requestBody: { enable_thinking: true, chat_template_kwargs: { enable_thinking: true } } });
+    requestBody: { enable_thinking: true, chat_template_kwargs: { enable_thinking: true, custom_template_flag: 1 } } });
   assert.equal(qwen.enable_thinking, false);
   assert.equal('reasoning_effort' in qwen, false);
-  assert.equal('chat_template_kwargs' in qwen, false);
+  assert.deepEqual(qwen.chat_template_kwargs, { custom_template_flag: 1 }, '与思考无关的模板参数保留');
   const plan = { intent: 'provider_default', status: 'provider_default', description: '' };
   assert.deepEqual(summaryRequestBody({ chat_template_kwargs: { thinking: true } }, plan), {});
   assert.deepEqual(summaryRequestBody({ chat_template_kwargs: { enable_thinking: false, custom_template_flag: 1 } }, plan),

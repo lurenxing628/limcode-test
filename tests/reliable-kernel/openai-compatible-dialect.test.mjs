@@ -397,3 +397,14 @@ test('enable_thinking 写法：关不掉思考的模型不发 false，不接受�
     capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', { wireFormat: 'enable_thinking', canDisable: false, levels: [] }) }] })), {});
   assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3-max', { level: 'none' })), { enable_thinking: false });
 });
+
+test('自定义请求体里的 reasoning_effort 原样发送；“不发送”也不删用户写的键；与思考无关的模板参数不影响改写', async () => {
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'glm-4.6', { requestBody: { reasoning_effort: 'high' } })), { reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3-max', { requestBody: { reasoning_effort: 'low' } })), { reasoning_effort: 'low' });
+  assert.deepEqual(thinkingParams(await wire(DEEPSEEK, 'deepseek-v4-pro', { openaiCompatibleThinkingFormat: 'omit', requestBody: { reasoning_effort: 'high' } })), { reasoning_effort: 'high' });
+  const kwargs = await wire(DASHSCOPE, 'qwen3-max', { level: 'high', requestBody: { chat_template_kwargs: { add_generation_prompt: true } } });
+  assert.deepEqual(thinkingParams(kwargs), { enable_thinking: true });
+  assert.deepEqual(kwargs.chat_template_kwargs, { add_generation_prompt: true });
+  const controlled = await wire(DASHSCOPE, 'qwen3-max', { level: 'high', requestBody: { chat_template_kwargs: { enable_thinking: false } } });
+  assert.equal('enable_thinking' in controlled, false);
+});
