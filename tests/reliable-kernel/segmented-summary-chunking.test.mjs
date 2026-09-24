@@ -909,3 +909,41 @@ test('sections the model writes before 目标 are kept; only the preamble before
   assert.match(shortenInput, /DONE-KEEP/);
   assert.doesNotMatch(shortenInput, /以下是摘要/);
 });
+
+test('bold, numbered and list-marked headings are recognized instead of falling back to raw records', async () => {
+  const variants = [
+    [
+      '## 1. **目标**', '- BOLD-GOAL 读取配置并报告端口', '',
+      '**二、重要约束、决定和准确标识**', '- 端口 8080', '',
+      '3) 工作状态', '- **已完成**：BOLD-DONE 已读取配置', '- __正在做__：无', '- **受阻**：无', '',
+      '**下一步**：无', '', '__相关文件__', '- SOURCE-PATH/config.json'
+    ],
+    [
+      '一、目标', '- BOLD-GOAL 读取配置并报告端口', '',
+      '（二）重要约束、决定和准确标识', '- 端口 8080', '',
+      '三、工作状态：', '1. 已完成：BOLD-DONE 已读取配置', '2. 正在做：无', '3. 受阻：无', '',
+      '* 下一步', '- 无', '', '#### 5. 相关文件：', '- SOURCE-PATH/config.json'
+    ]
+  ];
+  for (const lines of variants) {
+    const body = lines.join('\n');
+    const text = await compactWithReply(toolHistoryRequest(), `以下是摘要：\n${body}`);
+    assert.equal(text, `[Context Summary]\n\n${body}`);
+    assert.doesNotMatch(text, /SOURCE-USER-ASK|SOURCE-TOOL-RESULT/);
+  }
+});
+
+test('bold headings over the limit are still cut by section, keeping the model facts', async () => {
+  const reply = [
+    '**目标**', '- BOLD-GOAL-KEEP', '', '**重要约束、决定和准确标识**', '- 无', '',
+    '**工作状态**', '- **已完成**：无', '- **正在做**：BOLD-ACTIVE-KEEP', '- **受阻**：无', '',
+    '**下一步**', '- 无', '', '**相关文件**',
+    ...Array.from({ length: 200 }, (_, index) => `- src/generated/module-${index}/implementation-file-${index}.ts`)
+  ].join('\n');
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), reply, sent);
+  assert.equal(sent.length, 2, 'bold headings are a structured summary, so the model is asked to shorten it');
+  assert.match(text, /BOLD-GOAL-KEEP/);
+  assert.match(text, /BOLD-ACTIVE-KEEP/);
+  assert.doesNotMatch(text, /SOURCE-USER-ASK|SOURCE-TOOL-RESULT/);
+});

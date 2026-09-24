@@ -4636,15 +4636,12 @@ function parseStructuredSummary(text: string): StructuredSummary | undefined {
 }
 
 function summaryHeading(line: string): { field: StructuredSummaryField; rest: string } | undefined {
-  const normalized = line.replace(/[：:]\s*/, ':');
+  const normalized = summaryHeadingText(line).replace(/[：:]\s*/, ':');
   const headings: Array<[string, StructuredSummaryField]> = [
     ['重要约束、决定和准确标识', 'constraints'],
     ['重要约束、决定和标识', 'constraints'],
-    ['- 已完成', 'completed'],
     ['已完成', 'completed'],
-    ['- 正在做', 'active'],
     ['正在做', 'active'],
-    ['- 受阻', 'blocked'],
     ['受阻', 'blocked'],
     ['下一步', 'next'],
     ['相关文件', 'files'],
@@ -4657,9 +4654,36 @@ function summaryHeading(line: string): { field: StructuredSummaryField; rest: st
   return undefined;
 }
 
+const SUMMARY_HEADING_DECORATION = [
+  /^#{1,6}\s*/,
+  /^[-*•+]\s*/,
+  /^(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*[.．、)）]\s*/,
+  /^[（(](?:\d{1,2}|[一二三四五六七八九十]{1,3})[)）]\s*/
+];
+
+/**
+ * A line reduced to the words a heading is matched on. Models dress headings up as `**目标**`,
+ * `- **已完成**：`, `1. 目标`, `一、目标` or `### 3. 工作状态`; the decoration carries no meaning,
+ * and not recognizing it made a well-formed summary look unstructured.
+ */
+function summaryHeadingText(line: string): string {
+  let text = line.trim().replace(/\*\*|__/g, '').trim();
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const pattern of SUMMARY_HEADING_DECORATION) {
+      const next = text.replace(pattern, '');
+      if (next !== text) {
+        text = next.trim();
+        changed = true;
+      }
+    }
+  }
+  return text;
+}
+
 /** 工作状态 only groups 已完成 / 正在做 / 受阻 and holds no facts of its own. */
 function isWorkStatusHeading(line: string): boolean {
-  return line === '工作状态' || line === '工作状态：' || line === '工作状态:';
+  return /^工作状态[：:]?$/.test(summaryHeadingText(line));
 }
 
 function isStructuredSummaryText(text: string): boolean {
@@ -4694,10 +4718,7 @@ function finalizeStructuredSummary(candidate: string, fallback: string, targetTo
  */
 function modelSummaryText(candidate: string): string {
   const lines = stripSummaryEnvelope(candidate).split(/\r?\n/);
-  const start = lines.findIndex((rawLine) => {
-    const line = rawLine.trim().replace(/^#{1,6}\s*/, '');
-    return summaryHeading(line) !== undefined || isWorkStatusHeading(line);
-  });
+  const start = lines.findIndex((line) => summaryHeading(line) !== undefined || isWorkStatusHeading(line));
   return (start > 0 ? lines.slice(start) : lines).join('\n').trim();
 }
 
