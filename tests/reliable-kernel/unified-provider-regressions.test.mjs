@@ -119,3 +119,48 @@ test('非流式 Responses：带 phase 的 assistant message 按 outputItem 存�
     });
   }
 });
+
+// ---- 没有 id 的流式工具调用只存一条 ----
+
+const geminiSse = (chunks) => chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('');
+const geminiChunk = (parts, finishReason) => ({ candidates: [{ content: { role: 'model', parts }, ...(finishReason ? { finishReason } : {}) }] });
+
+test('流式工具调用没有 id 时只存一条（接入库把同一个调用对象同时放进 functionCalls 和 partsDelta）', async () => {
+  // Gemini 2.x 等模型的 functionCall 不带 id；接入库对同一个调用对象同时给出 functionCalls 与 partsDelta，
+  // 投影以前只按 callId 去重，没有 id 的调用被编成 tool_call_0、tool_call_1 两条，可能执行两次。
+  await withServer(() => ({ sse: geminiSse([geminiChunk([{ functionCall: { name: 'list_items', args: { page: 1 } } }], 'STOP')]) }), async (base) => {
+    const result = await sendThroughKernel(settings('gemini', `${base}/v1beta`, 'gemini-2.5-flash'), [user('go')]);
+    assert.equal(result.error, undefined);
+    assert.deepEqual(functionCallsOf(result.completed).map((part) => [part.functionCall.name, part.functionCall.args]), [
+      ['list_items', { page: 1 }]
+    ]);
+  });
+});
+
+test('同一块里两个参数相同、都没有 id 的并行调用仍是两条（按对象身份去重，不按内容去重）', async () => {
+  await withServer(() => ({ sse: geminiSse([geminiChunk([
+    { functionCall: { name: 'list_items', args: { page: 1 } } },
+    { functionCall: { name: 'list_items', args: { page: 1 } } }
+  ], 'STOP')]) }), async (base) => {
+    const result = await sendThroughKernel(settings('gemini', `${base}/v1beta`, 'gemini-2.5-flash'), [user('go')]);
+    assert.equal(result.error, undefined);
+    const calls = functionCallsOf(result.completed);
+    assert.equal(calls.length, 2);
+    assert.notEqual(calls[0].id, calls[1].id);
+  });
+});
+
+test('OpenAI 兼容流里不带 id 的工具调用同样只存一条', async () => {
+  const chunk = (delta, finish = null) => ({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason: finish }] });
+  const sse = [
+    chunk({ role: 'assistant', tool_calls: [{ index: 0, type: 'function', function: { name: 'list_items', arguments: '{"page":2}' } }] }),
+    chunk({}, 'tool_calls')
+  ].map((value) => `data: ${JSON.stringify(value)}\n\n`).join('') + 'data: [DONE]\n\n';
+  await withServer(() => ({ sse }), async (base) => {
+    const result = await sendThroughKernel(settings('openai-compatible', `${base}/v1`, 'relay-model'), [user('go')]);
+    assert.equal(result.error, undefined);
+    assert.deepEqual(functionCallsOf(result.completed).map((part) => [part.functionCall.name, part.functionCall.args]), [
+      ['list_items', { page: 2 }]
+    ]);
+  });
+});

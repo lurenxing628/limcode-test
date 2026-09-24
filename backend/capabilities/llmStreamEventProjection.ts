@@ -147,10 +147,19 @@ export function emitUnifiedChunk(
     });
   }
 
+  // The unified decoders put the same call object in both functionCalls and partsDelta. A call with a
+  // provider id is merged by that id below; one without an id (Gemini 2.x, some compatible relays) is
+  // matched by identity here, otherwise it would get two fallback ids and be stored, and run, twice.
+  // Two distinct objects stay two calls even when their name and arguments are equal (parallel calls).
+  const seenCallParts = new Set<UnifiedPart>();
   const callParts = [
     ...(chunk.functionCalls ?? []),
     ...(chunk.partsDelta ?? []).filter(isUnifiedFunctionCallPart)
-  ];
+  ].filter((part) => {
+    if (seenCallParts.has(part)) return false;
+    seenCallParts.add(part);
+    return true;
+  });
   const stableCallIndexes = new Map<string, number>();
   const calls: Array<{ id: string; name: string; argsJson: string; thoughtSignature?: string; async?: boolean }> = [];
   callParts.forEach((part, index) => {
