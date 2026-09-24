@@ -11,7 +11,7 @@ import { pathToFileURL } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const root = process.cwd();
-const { startLlmProvider } = require(path.join(root, 'dist/extension/backend/capabilities/llmProvider.js'));
+const { startLlmProvider, dryRunLlmProvider } = require(path.join(root, 'dist/extension/backend/capabilities/llmProvider.js'));
 const kernel = await import(pathToFileURL(path.join(root, 'dist/extension/backend/reliableKernel/index.js')).href);
 
 async function withServer(respond, run) {
@@ -243,5 +243,114 @@ test('没有 retryable:false 的普通错误仍按渠道设置重试', async () 
     const events = await runCapability(settings('openai-compatible', `${base}/v1`, 'relay-model', { retryOnError: true, retryMaxAttempts: 2, retryDelaySeconds: 0 }));
     assert.equal(calls.length, 2);
     assert.ok(events.some((event) => event.type === 'llm:done'));
+  });
+});
+
+// ---- 接入库协议修复的端到端回归：修复被回退时这些测试会失败 ----
+
+/** 真实编码链路（接入库编码 + LimCode 请求改写）产出的请求（url 与 body）。 */
+function dryRun(providerSettings, contents, tools = TOOLS) {
+  return dryRunLlmProvider({ id: 'dry-run', invocationId: 'dry-run', conversationId: 'dry-run', contents, tools },
+    { settings: async () => providerSettings });
+}
+
+const openAIChunk = (delta, finish = null, extra = {}) => ({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason: finish, ...extra }] });
+const openAISse = (chunks, { done = true } = {}) => chunks.map((value) => `data: ${JSON.stringify(value)}\n\n`).join('') + (done ? 'data: [DONE]\n\n' : '');
+
+test('finish_reason:"error" 按错误上报，即使前面已经有可见文字（流式与非流式）', async () => {
+  // OpenRouter errors-and-debugging：200 之后的错误以 finish_reason "error" 的块终止流；非流式把错误放在
+  // choice 里。以前有文字时当作正常结束，半截回复被存成成功。
+  const stream = openAISse([
+    openAIChunk({ role: 'assistant', content: 'partial answer' }),
+    openAIChunk({ content: '' }, 'error', { native_finish_reason: 'MALFORMED_FUNCTION_CALL' })
+  ]);
+  const body = { id: 'c', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'partial answer' }, finish_reason: 'error', error: { code: 502, message: 'Provider disconnected' } }] };
+  for (const [label, response, overrides] of [['stream', { sse: stream }, {}], ['non-stream', { body }, { stream: false }]]) {
+    await withServer(() => response, async (base) => {
+      const events = await runCapability(settings('openai-compatible', `${base}/v1`, 'relay-model', overrides));
+      assert.equal(events.some((event) => event.type === 'llm:done'), false, label);
+      assert.match(events.find((event) => event.type === 'llm:error')?.payload.message ?? '', /finish_reason: "error"/, label);
+    });
+  }
+});
+
+test('Responses 函数工具默认发送 strict:false', async () => {
+  // https://developers.openai.com/api/docs/guides/function-calling#strict-mode：“To opt out of strict mode in
+  // Responses and keep non-strict, best-effort function calling, explicitly set strict: false.”
+  const result = await dryRun(settings('openai-responses', 'https://api.openai.com/v1', 'gpt-5.5'), [user('hi')]);
+  assert.deepEqual(result.body.tools.map((tool) => [tool.name, tool.strict]), [['list_items', false], ['write_file', false]]);
+});
+
+test('Claude：其他渠道产生的不合规工具调用 id 改写成 Claude 接受的 id，tool_use 与 tool_result 一致', async () => {
+  // Messages API：tool_use.id 与 tool_result.tool_use_id 须匹配 ^[a-zA-Z0-9_-]+$。Kimi 风格的
+  // functions.list_items:0 原样发出会被拒绝。
+  const history = [
+    user('hi'),
+    { role: 'model', parts: [{ id: 'functions.list_items:0', functionCall: { name: 'list_items', args: {} } }, { id: 'toolu_01ABC', functionCall: { name: 'list_items', args: { page: 2 } } }] },
+    { role: 'user', parts: [
+      { id: 'functions.list_items:0', functionResponse: { name: 'list_items', response: { ok: 1 } } },
+      { id: 'toolu_01ABC', functionResponse: { name: 'list_items', response: { ok: 2 } } }
+    ] }
+  ];
+  const result = await dryRun(settings('claude', 'https://api.anthropic.com/v1', 'claude-opus-5-5'), history);
+  const toolUses = result.body.messages.flatMap((message) => Array.isArray(message.content) ? message.content : []).filter((block) => block.type === 'tool_use');
+  const toolResults = result.body.messages.flatMap((message) => Array.isArray(message.content) ? message.content : []).filter((block) => block.type === 'tool_result');
+  for (const block of toolUses) assert.match(block.id, /^[a-zA-Z0-9_-]+$/);
+  assert.equal(toolUses[1].id, 'toolu_01ABC', '已合规的 id 原样发出');
+  assert.notEqual(toolUses[0].id, 'functions.list_items:0');
+  assert.deepEqual(toolResults.map((block) => block.tool_use_id), toolUses.map((block) => block.id));
+});
+
+test('Gemini 请求 URL 对模型 id 做百分号编码', async () => {
+  // 网关常用带方括号、空格或 # 的模型别名；不编码时 # 之后的部分会被当成 URL 片段丢掉，请求打到错误的路径。
+  const base = 'https://generativelanguage.googleapis.com/v1beta';
+  const bracketed = await dryRun(settings('gemini', base, '[v]gemini-3.5-flash'), [user('hi')]);
+  assert.equal(new URL(bracketed.url).pathname, '/v1beta/models/%5Bv%5Dgemini-3.5-flash:streamGenerateContent');
+  const hashed = await dryRun(settings('gemini', base, 'tuned/gemini flash#2'), [user('hi')]);
+  const url = new URL(hashed.url);
+  assert.equal(url.pathname, '/v1beta/models/tuned/gemini%20flash%232:streamGenerateContent');
+  assert.equal(url.hash, '');
+  const official = await dryRun(settings('gemini', base, 'gemini-2.5-flash'), [user('hi')]);
+  assert.equal(new URL(official.url).pathname, '/v1beta/models/gemini-2.5-flash:streamGenerateContent', '官方 id 不变');
+});
+
+test('DeepSeek 思考等级按官方取值映射（minimal→low、medium/xhigh→high），不再被当成未设置', async () => {
+  // https://api-docs.deepseek.com/guides/thinking_mode：reasoning_effort 只接受 low / high / max，其他等级按对照表映射。
+  const expected = {
+    minimal: { thinking: { type: 'enabled' }, reasoning_effort: 'low' },
+    low: { thinking: { type: 'enabled' }, reasoning_effort: 'low' },
+    medium: { thinking: { type: 'enabled' }, reasoning_effort: 'high' },
+    xhigh: { thinking: { type: 'enabled' }, reasoning_effort: 'high' },
+    max: { thinking: { type: 'enabled' }, reasoning_effort: 'max' },
+    none: { thinking: { type: 'disabled' } }
+  };
+  for (const [level, params] of Object.entries(expected)) {
+    const result = await dryRun(settings('openai-compatible', 'https://api.deepseek.com/v1', 'deepseek-v4-pro', {
+      generationConfig: { thinkingConfig: { thinkingLevel: level } }
+    }), [user('hi')], []);
+    const actual = Object.fromEntries(['thinking', 'reasoning_effort', 'enable_thinking'].filter((key) => key in result.body).map((key) => [key, result.body[key]]));
+    assert.deepEqual(actual, params, level);
+  }
+});
+
+test('流结束补发：收到 [DONE] 时没有 finish_reason 的无参数调用按 {} 存下；连接干净断开时按参数截断报错', async () => {
+  // 部分中转在工具调用流里不发 finish_reason，最后一个（无参数）调用只能在流结束时补发。只有收到
+  // data: [DONE] 才能确定流已结束；没有 [DONE] 的 EOF 可能是连接在参数发完之前断开，按 {} 补发会让
+  // 参数全可选的 write_file 真的以空参数执行。
+  const nameOnly = (name) => openAIChunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name, arguments: '' } }] });
+  await withServer(() => ({ sse: openAISse([nameOnly('list_items')]) }), async (base) => {
+    const result = await sendThroughKernel(settings('openai-compatible', `${base}/v1`, 'relay-model'), [user('go')]);
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.deepEqual(functionCallsOf(result.completed).map((part) => [part.id, part.functionCall.name, part.functionCall.args]), [
+      ['call_1', 'list_items', {}]
+    ]);
+  });
+  // 没有 [DONE] 也没有 finish_reason：LimCode 的 terminalValidatedFetch 先把它判为 LLM_STREAM_TRUNCATED，
+  // 接入库（limcode.7）自己也不再按 {} 补发。两层任一层都保证 write_file 不会以空参数存下或执行。
+  await withServer(() => ({ sse: openAISse([nameOnly('write_file')], { done: false }) }), async (base) => {
+    const result = await sendThroughKernel(settings('openai-compatible', `${base}/v1`, 'relay-model'), [user('go')]);
+    assert.equal(result.completed, undefined);
+    assert.ok(result.error);
+    assert.equal(result.events.some((event) => JSON.stringify(event).includes('write_file')), false);
   });
 });
