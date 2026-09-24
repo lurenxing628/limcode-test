@@ -889,3 +889,23 @@ test('a shorten reply that is not shorter than the original is ignored', async (
     assert.doesNotMatch(text, /LONGER-SHORTEN-GOAL|SAMELEN-SHORTEN-GOAL|added-by-shorten/);
   }
 });
+
+test('sections the model writes before 目标 are kept; only the preamble before the first heading is dropped', async () => {
+  const body = [
+    '重要约束、决定和准确标识', '- CONSTRAINT-KEEP 端口保持 8080', '',
+    '工作状态', '- 已完成：', '  - DONE-KEEP 已读取配置', '- 正在做：无', '- 受阻：无', '',
+    '目标', '- 读取配置并报告端口', '',
+    '下一步', '- 无', '', '相关文件', '- SOURCE-PATH/config.json'
+  ].join('\n');
+  const text = await compactWithReply(toolHistoryRequest(), `好的，以下是摘要：\n\n${body}`);
+  assert.equal(text, `[Context Summary]\n\n${body}`);
+  // Over the limit, the shorten request must get those sections too.
+  const oversized = `${body}\n${Array.from({ length: 200 }, (_, index) => `- src/generated/file-${index}.ts`).join('\n')}`;
+  const sent = [];
+  await compactWithReply(oversizedSummaryRequest(), `以下是摘要：\n${oversized}`, sent);
+  assert.equal(sent.length, 2);
+  const shortenInput = JSON.stringify(sent[1].messages.find((message) => message.role === 'user'));
+  assert.match(shortenInput, /CONSTRAINT-KEEP/);
+  assert.match(shortenInput, /DONE-KEEP/);
+  assert.doesNotMatch(shortenInput, /以下是摘要/);
+});

@@ -4624,7 +4624,7 @@ function parseStructuredSummary(text: string): StructuredSummary | undefined {
       if (heading.rest && heading.rest !== '无') appendSummaryFact(summary, field, heading.rest);
       continue;
     }
-    if (line === '工作状态' || line === '工作状态：') {
+    if (isWorkStatusHeading(line)) {
       field = undefined;
       continue;
     }
@@ -4657,6 +4657,11 @@ function summaryHeading(line: string): { field: StructuredSummaryField; rest: st
   return undefined;
 }
 
+/** 工作状态 only groups 已完成 / 正在做 / 受阻 and holds no facts of its own. */
+function isWorkStatusHeading(line: string): boolean {
+  return line === '工作状态' || line === '工作状态：' || line === '工作状态:';
+}
+
 function isStructuredSummaryText(text: string): boolean {
   const source = stripSummaryEnvelope(text);
   return ['目标', '重要约束、决定', '工作状态', '已完成', '正在做', '受阻', '下一步', '相关文件']
@@ -4683,10 +4688,16 @@ function finalizeStructuredSummary(candidate: string, fallback: string, targetTo
   return fitStructuredSummary(fallbackSummary, targetTokens);
 }
 
-/** The model's summary from its 目标 heading on, so any preamble such as “以下是摘要：” is dropped. */
+/**
+ * The model's summary from its first recognizable heading on, whichever section it wrote first, so
+ * only a preamble such as “以下是摘要：” is dropped.
+ */
 function modelSummaryText(candidate: string): string {
   const lines = stripSummaryEnvelope(candidate).split(/\r?\n/);
-  const start = lines.findIndex((line) => summaryHeading(line.trim().replace(/^#{1,6}\s*/, ''))?.field === 'goals');
+  const start = lines.findIndex((rawLine) => {
+    const line = rawLine.trim().replace(/^#{1,6}\s*/, '');
+    return summaryHeading(line) !== undefined || isWorkStatusHeading(line);
+  });
   return (start > 0 ? lines.slice(start) : lines).join('\n').trim();
 }
 
