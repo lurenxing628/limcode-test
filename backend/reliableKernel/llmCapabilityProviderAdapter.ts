@@ -1691,23 +1691,29 @@ function decodeFrozenCurrentTurnInput(content: string, contentType: string): Mes
   return { role: 'user', parts: [{ text: content }] };
 }
 
-/** Providers speaking Chat Completions, where every `tool` message must follow the assistant `tool_calls` it answers. */
-const CHAT_COMPLETIONS_PROVIDERS: ReadonlySet<LlmProviderKind> = new Set<LlmProviderKind>(['openai-compatible']);
+/**
+ * Providers whose wire pairs each tool call with a result that directly follows it: Chat Completions
+ * (a `tool` message right after the assistant `tool_calls`), Claude Messages (the `tool_result` in the
+ * very next user message after its `tool_use`) and Gemini (a model turn's function calls answered by
+ * the next user turn). Only Responses accepts a `function_call_output` anywhere after its call.
+ */
+const PROVIDERS_KEEPING_CHRONOLOGICAL_NATIVE_RESULTS: ReadonlySet<LlmProviderKind> = new Set<LlmProviderKind>(['openai-responses']);
 
 /**
  * A native (Responses) call is stored as its own call occurrence, and its result as a separate
  * occurrence appended when the result was delivered, possibly after other items (an async call).
- * Chat Completions rejects an assistant `tool_calls` message that is not directly followed by a
- * `tool` message for each call, so when such a history is sent to a Chat provider, each result that
- * came later is moved to right after its own call occurrence. Responses, Claude and Gemini keep the
- * chronological native placement. Only this outgoing order changes; the stored Context does not, and
- * a window without a late native result is returned as it is.
+ * Chat Completions, Claude and Gemini reject a call whose result does not directly follow it (the
+ * outgoing pairing repairs only look at the adjacent user messages and cannot reach a result sent
+ * after an assistant reply), so for every provider except Responses each result that came later is
+ * moved to right after its own call occurrence. Responses keeps the chronological native placement.
+ * Only this outgoing order changes; the stored Context does not, and a window without a late native
+ * result is returned as it is.
  */
 function nativeResultsAfterTheirCalls<T extends Pick<FullProviderContextItem, 'segmentKind' | 'content'>>(
   items: readonly T[],
   provider: LlmProviderKind
 ): readonly T[] {
-  if (!CHAT_COMPLETIONS_PROVIDERS.has(provider)) return items;
+  if (PROVIDERS_KEEPING_CHRONOLOGICAL_NATIVE_RESULTS.has(provider)) return items;
   const nativeOccurrences = items.map((item) => nativeToolOccurrence(item));
   const resultIndexByCall = new Map<string, number>();
   nativeOccurrences.forEach((occurrence, index) => {

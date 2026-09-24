@@ -280,32 +280,108 @@ async function projectNativeHistory(providerKind, modelId, options) {
   await new kernel.LlmCapabilityFullRequestAdapter('provider-config', {
     start(input, emit) { start = input; emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
   }).sendFullRequest(nativeHistoryRequest(providerKind, modelId, options), { async onEvent() { return { accepted: true, terminal: true, checkpointed: true }; } });
+  const baseUrl = modelId.startsWith('deepseek') ? 'https://api.deepseek.com'
+    : providerKind === 'claude' ? 'https://api.anthropic.com'
+      : providerKind === 'gemini' ? 'https://generativelanguage.googleapis.com' : 'https://api.openai.com/v1';
   const settings = { ...createDefaultLlmProviderConfig({ name: 'native history' }), id: 'provider-config', provider: providerKind,
-    baseUrl: modelId.startsWith('deepseek') ? 'https://api.deepseek.com' : 'https://api.openai.com/v1', model: modelId, apiKey: '' };
+    baseUrl, model: modelId, apiKey: '' };
   const unified = start.contents.map(content => `${content.role === 'model' ? 'a' : 'u'}:${content.parts.map(part =>
     part.functionCall ? `call=${part.id}` : part.functionResponse ? `result=${part.id}` : 'text').join('+')}`);
-  return { unified, wire: wireShape((await dryRunLlmProvider(start, { settings })).body) };
+  const body = (await dryRunLlmProvider(start, { settings })).body;
+  return { unified, wire: wireShape(body), violations: toolPairingViolations(body) };
+}
+
+/**
+ * Tool call/result pairing the provider itself enforces, checked on the encoded request body:
+ * - Chat Completions: an assistant `tool_calls` message is followed by one `tool` message per call id.
+ * - Claude Messages: every `tool_use` of an assistant message has its `tool_result` in the very next
+ *   user message (https://docs.claude.com/en/docs/agents-and-tools/tool-use/implement-tool-use).
+ * - Gemini: a model turn with N function calls is followed by a user turn with the N function
+ *   responses (https://ai.google.dev/gemini-api/docs/function-calling).
+ * - Responses: every `function_call` has a `function_call_output` later in the input.
+ */
+function toolPairingViolations(wire) {
+  const violations = [];
+  const sameIds = (expected, actual) => JSON.stringify([...expected].sort()) === JSON.stringify([...actual].sort());
+  if (Array.isArray(wire.contents)) {
+    wire.contents.forEach((content, index) => {
+      const calls = content.parts.filter(part => part.functionCall).map(part => part.functionCall.id ?? part.functionCall.name);
+      if (content.role !== 'model' || calls.length === 0) return;
+      const next = wire.contents[index + 1];
+      const results = next?.role === 'user' ? next.parts.filter(part => part.functionResponse)
+        .map(part => part.functionResponse.id ?? part.functionResponse.name) : [];
+      if (!sameIds(calls, results)) violations.push(`contents[${index}] calls ${calls} answered by ${results}`);
+    });
+    return violations;
+  }
+  if (Array.isArray(wire.messages)) {
+    const messages = wire.messages;
+    messages.forEach((message, index) => {
+      if (message.role !== 'assistant') return;
+      if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
+        const calls = message.tool_calls.map(entry => entry.id);
+        const results = [];
+        for (let next = index + 1; messages[next]?.role === 'tool'; next += 1) results.push(messages[next].tool_call_id);
+        if (!sameIds(calls, results)) violations.push(`messages[${index}] tool_calls ${calls} answered by ${results}`);
+        return;
+      }
+      const calls = Array.isArray(message.content) ? message.content.filter(block => block.type === 'tool_use').map(block => block.id) : [];
+      if (calls.length === 0) return;
+      const next = messages[index + 1];
+      const results = next?.role === 'user' && Array.isArray(next.content)
+        ? next.content.filter(block => block.type === 'tool_result').map(block => block.tool_use_id) : [];
+      if (!sameIds(calls, results)) violations.push(`messages[${index}] tool_use ${calls} answered by ${results}`);
+    });
+    return violations;
+  }
+  wire.input.forEach((item, index) => {
+    if (item.type !== 'function_call') return;
+    if (!wire.input.slice(index + 1).some(later => later.type === 'function_call_output' && later.call_id === item.call_id)) {
+      violations.push(`input[${index}] function_call ${item.call_id} has no later output`);
+    }
+  });
+  return violations;
 }
 
 for (const [providerKind, modelId] of [['openai-compatible', 'gpt-5.5'], ['openai-compatible', 'deepseek-v4-flash']]) {
   test(`${providerKind}/${modelId}: a native async result that arrived later is sent right after its call`, async () => {
     // Before: `assistant tool_calls=[call_async]` was followed by another assistant message, and
     // `tool call_async` came four messages later, which Chat Completions rejects.
-    assert.deepEqual((await projectNativeHistory(providerKind, modelId)).wire,
+    const late = await projectNativeHistory(providerKind, modelId);
+    assert.deepEqual(late.wire,
       ['u:text', 'a:calls=call_async', 't:call_async', 'a:calls=call_list', 't:call_list', 'a:text', 'u:text']);
+    assert.deepEqual(late.violations, []);
     // A result that already follows its call is sent exactly as before.
     assert.deepEqual((await projectNativeHistory(providerKind, modelId, { lateResult: false })).wire,
       ['u:text', 'a:calls=call_async', 't:call_async', 'a:calls=call_list', 't:call_list', 'a:text', 'u:text']);
   });
 }
 
-test('Responses, Claude and Gemini targets keep the chronological native placement', async () => {
-  const chronological = ['u:text', 'a:call=call_async', 'a:call=call_list', 'u:result=call_list', 'a:text', 'u:result=call_async', 'u:text'];
-  for (const [providerKind, modelId] of [['openai-responses', 'gpt-5.5'], ['claude', 'claude-sonnet-5'], ['gemini', 'gemini-3.5-flash']]) {
-    assert.deepEqual((await projectNativeHistory(providerKind, modelId)).unified, chronological, providerKind);
+test('Claude and Gemini targets also receive a late native async result right after its call', async () => {
+  // Before: Claude got `assistant tool_use(call_async), assistant tool_use(call_list), user tool_result(call_list), ...,
+  // user tool_result(call_async)`; the two adjacent assistant messages merge and call_async has no tool_result in the
+  // next user message (a 400). Gemini got the same order: a model turn with two calls answered by one response.
+  const expected = {
+    claude: ['u:text', 'a:calls=call_async', 'u:result=call_async', 'a:calls=call_list', 'u:result=call_list', 'a:text', 'u:text'],
+    gemini: ['u:text', 'a:call=call_async', 'u:result=call_async', 'a:call=call_list', 'u:result=call_list', 'a:text', 'u:text']
+  };
+  for (const [providerKind, modelId] of [['claude', 'claude-sonnet-5'], ['gemini', 'gemini-3.5-flash']]) {
+    const late = await projectNativeHistory(providerKind, modelId);
+    assert.deepEqual(late.violations, [], providerKind);
+    assert.deepEqual(late.wire, expected[providerKind], providerKind);
+    const inPlace = await projectNativeHistory(providerKind, modelId, { lateResult: false });
+    assert.deepEqual(inPlace.violations, [], providerKind);
+    assert.deepEqual(inPlace.wire, expected[providerKind], providerKind);
   }
-  assert.deepEqual((await projectNativeHistory('openai-responses', 'gpt-5.5')).wire,
+});
+
+test('Responses keeps the chronological native placement', async () => {
+  const chronological = ['u:text', 'a:call=call_async', 'a:call=call_list', 'u:result=call_list', 'a:text', 'u:result=call_async', 'u:text'];
+  const responses = await projectNativeHistory('openai-responses', 'gpt-5.5');
+  assert.deepEqual(responses.unified, chronological);
+  assert.deepEqual(responses.wire,
     ['u:text', 'a:call=call_async', 'a:call=call_list', 't:call_list', 'a:text', 't:call_async', 'u:text']);
+  assert.deepEqual(responses.violations, []);
 });
 
 test('a server-side compaction item from an ordinary Responses reply is stored with the reply and replayed verbatim on the next request', { timeout: 120000 }, async () => {
