@@ -8,9 +8,15 @@ import type {
   LlmProviderKind,
   LlmSummaryReasoningMode,
   LlmThinkingConfigRecord,
-  LlmThinkingLevel
+  LlmThinkingLevel,
+  OpenAICompatibleThinkingFormat
 } from './protocol';
 import { canonicalLlmProviderKind } from './protocol';
+import {
+  resolveOpenAICompatibleDialect,
+  type OpenAICompatibleDialect,
+  type OpenAICompatibleProbedThinking
+} from './openAICompatibleDialect';
 
 /** Registry entries are documentation evidence, never a claim of a successful live request. */
 export const MODEL_CAPABILITY_REGISTRY_REVISION = '2026-09-22';
@@ -38,7 +44,11 @@ export interface ModelReasoningCapability {
   requiresThoughtSignatures: boolean;
   minBudgetTokens?: number;
   maxBudgetTokens?: number;
+  /** 只用于 OpenAI 兼容：思考参数的写法（测试结果或方言规则）。 */
+  wireFormat?: OpenAICompatibleThinkingFormat;
 }
+
+const OPENAI_COMPATIBLE_THINKING_FORMATS: readonly OpenAICompatibleThinkingFormat[] = ['deepseek', 'enable_thinking', 'reasoning_effort', 'omit'];
 
 export interface ModelNativeCompactionCapability {
   kind?: NativeCompactionKind;
@@ -189,6 +199,74 @@ export function resolveModelCapabilities(input: {
   };
 }
 
+type ProviderCapabilityConfig = Pick<LlmProviderConfigRecord, 'provider' | 'baseUrl' | 'model'>
+  & Partial<Pick<LlmProviderConfigRecord, 'id' | 'models' | 'modelConfigs' | 'openaiResponsesTransport'>>;
+
+function providerTransport(provider: ProviderCapabilityConfig, modelId: string): string {
+  return provider.provider === 'openai-responses'
+    ? provider.modelConfigs?.find((model) => model.modelId === modelId)?.openaiResponsesTransport
+      ?? provider.openaiResponsesTransport ?? 'http'
+    : 'http';
+}
+
+/**
+ * A catalog belongs to the exact channel/model/endpoint/transport. Editing any of them invalidates
+ * it for new requests, while existing frozen request snapshots remain unaffected.
+ */
+function boundCapabilityEvidence(provider: ProviderCapabilityConfig, modelId: string): ModelCapabilitySnapshot | undefined {
+  const discovered = normalizeModelCapabilitySnapshot(
+    provider.models?.find((model) => model.id === modelId)?.capabilitySnapshot
+  );
+  if (!discovered || discovered.modelId !== modelId
+    || discovered.providerKind !== provider.provider
+    || discovered.endpointFingerprint !== normalizedEndpointFingerprint(provider.baseUrl)
+    || discovered.providerConfigId !== provider.id
+    || discovered.transport !== providerTransport(provider, modelId)) return undefined;
+  return discovered;
+}
+
+/** 渠道或模型高级配置里手动指定的思考参数写法：先取模型级，没有再取渠道级。 */
+function configuredOpenAICompatibleThinkingFormat(
+  provider: Partial<Pick<LlmProviderConfigRecord, 'modelConfigs' | 'openaiCompatibleThinkingFormat'>>,
+  modelId: string
+): OpenAICompatibleThinkingFormat | undefined {
+  return provider.modelConfigs?.find((model) => model.modelId === modelId)?.openaiCompatibleThinkingFormat
+    ?? provider.openaiCompatibleThinkingFormat;
+}
+
+/** 身份匹配的“测试这个模型”证据：`verified_probe` 且带写法。 */
+function probedOpenAICompatibleThinking(
+  provider: ProviderCapabilityConfig,
+  modelId: string
+): OpenAICompatibleProbedThinking | undefined {
+  if (provider.provider !== 'openai-compatible') return undefined;
+  const evidence = boundCapabilityEvidence(provider, modelId);
+  const format = evidence?.source === 'verified_probe' ? evidence.reasoning.wireFormat : undefined;
+  if (!evidence || !format) return undefined;
+  return {
+    format,
+    canDisable: evidence.reasoning.canDisable,
+    efforts: evidence.reasoning.levels.filter((level) => level !== 'none')
+  };
+}
+
+/**
+ * 按渠道配置解析 OpenAI 兼容方言，请求改写、会话思考强度、能力表与设置界面共用：
+ * 手动写法（模型级优先）→ 身份匹配的测试结果 → 按接口地址 / 模型 ID 自动识别。
+ * `options.manual`：不传时读配置里的手动写法；`null` 表示忽略手动写法（设置界面“自动识别”一项的说明）。
+ */
+export function resolveProviderOpenAICompatibleDialect(
+  config: ProviderCapabilityConfig & Partial<Pick<LlmProviderConfigRecord, 'openaiCompatibleThinkingFormat'>>,
+  modelIdInput?: string,
+  options: { manual?: OpenAICompatibleThinkingFormat | null } = {}
+): OpenAICompatibleDialect {
+  const modelId = modelIdInput?.trim() || config.model.trim();
+  const manual = options.manual === null ? undefined : options.manual ?? configuredOpenAICompatibleThinkingFormat(config, modelId);
+  return manual
+    ? resolveOpenAICompatibleDialect(config.baseUrl, modelId, manual)
+    : resolveOpenAICompatibleDialect(config.baseUrl, modelId, undefined, probedOpenAICompatibleThinking(config, modelId));
+}
+
 export function resolveProviderModelCapabilities(
   provider: Pick<LlmProviderConfigRecord, 'provider' | 'baseUrl' | 'model' | 'modelConfigs'>
     & Partial<Pick<LlmProviderConfigRecord, 'id' | 'models' | 'openaiResponsesTransport'>>,
@@ -196,24 +274,13 @@ export function resolveProviderModelCapabilities(
   trustMode?: LlmNativeCompactionTrustMode
 ): ModelCapabilitySnapshot {
   const modelId = modelIdInput?.trim() || provider.model.trim();
-  const transport = provider.provider === 'openai-responses'
-    ? provider.modelConfigs.find((model) => model.modelId === modelId)?.openaiResponsesTransport
-      ?? provider.openaiResponsesTransport ?? 'http'
-    : 'http';
+  const transport = providerTransport(provider, modelId);
   const fallback = resolveModelCapabilities({
     provider: provider.provider, baseUrl: provider.baseUrl, modelId, trustMode,
     providerConfigId: provider.id, transport
   });
-  const discovered = normalizeModelCapabilitySnapshot(
-    provider.models?.find((model) => model.id === modelId)?.capabilitySnapshot
-  );
-  // A catalog belongs to the exact channel/model/endpoint/transport. Editing any of them invalidates
-  // it for new requests, while existing frozen request snapshots remain unaffected.
-  if (!discovered || discovered.modelId !== modelId
-    || discovered.providerKind !== provider.provider
-    || discovered.endpointFingerprint !== fallback.endpointFingerprint
-    || discovered.providerConfigId !== provider.id
-    || discovered.transport !== transport) return fallback;
+  const discovered = boundCapabilityEvidence(provider, modelId);
+  if (!discovered) return fallback;
   if (trustMode === 'trust_configured_endpoint' && fallback.nativeCompaction.availability === 'declared') {
     return { ...discovered, source: 'explicit_trust', nativeCompaction: fallback.nativeCompaction };
   }
@@ -257,7 +324,10 @@ export function normalizeModelCapabilitySnapshot(value: unknown): ModelCapabilit
       ...(Number.isSafeInteger(reasoning.minBudgetTokens) && Number(reasoning.minBudgetTokens) >= 0
         ? { minBudgetTokens: Number(reasoning.minBudgetTokens) } : {}),
       ...(Number.isSafeInteger(reasoning.maxBudgetTokens) && Number(reasoning.maxBudgetTokens) > 0
-        ? { maxBudgetTokens: Number(reasoning.maxBudgetTokens) } : {})
+        ? { maxBudgetTokens: Number(reasoning.maxBudgetTokens) } : {}),
+      ...(canonicalLlmProviderKind(value.providerKind) === 'openai-compatible'
+        && OPENAI_COMPATIBLE_THINKING_FORMATS.includes(reasoning.wireFormat as OpenAICompatibleThinkingFormat)
+        ? { wireFormat: reasoning.wireFormat as OpenAICompatibleThinkingFormat } : {})
     },
     nativeCompaction: {
       availability: native.availability as NativeCompactionAvailability,

@@ -31,7 +31,8 @@ export type OpenAICompatiblePlatform =
 export type OpenAICompatibleModelFamily = 'deepseek' | 'mimo' | 'kimi' | 'glm' | 'hunyuan' | 'qwen' | 'ernie';
 
 export interface OpenAICompatibleModelThinkingRule {
-  family: OpenAICompatibleModelFamily;
+  /** 按模型 ID 认出的系列；只有测试结果、认不出模型时没有。 */
+  family?: OpenAICompatibleModelFamily;
   /** 用 `thinking.type` 开关思考；Kimi K3 不接受 `thinking` 参数。 */
   toggle: boolean;
   /** 接受 `thinking.type: disabled`；GLM-5.3、Kimi K2.7 Code 传 disabled 会报错。 */
@@ -48,12 +49,26 @@ export interface OpenAICompatibleDialect {
   modelName: string;
   rule?: OpenAICompatibleModelThinkingRule;
   format: OpenAICompatibleThinkingFormat;
-  /** manual：用户手动指定；platform：按接口地址；model：按模型 ID；default：都认不出，保持 OpenAI 写法。 */
-  source: 'manual' | 'platform' | 'model' | 'default';
+  /**
+   * manual：用户手动指定；probe：按“测试这个模型”的结果；platform：按接口地址；model：按模型 ID；
+   * default：都认不出，保持 OpenAI 写法。
+   */
+  source: 'manual' | 'probe' | 'platform' | 'model' | 'default';
   /** tool 消息的 content 可以放图片/文件数组（DeepSeek、MiMo 官方接口）。 */
   toolContentArrays: boolean;
   /** 带 tools 的请求里，给每条 assistant 消息补上 `reasoning_content`（缺失时为空串）。 */
   fillReasoningReplay: boolean;
+}
+
+/**
+ * “测试这个模型”测出的规则（存在 `models[].capabilitySnapshot` 里，`source: 'verified_probe'`，
+ * `reasoning.wireFormat` 为写法，见 shared/modelCapabilities.ts 的 resolveProviderOpenAICompatibleDialect）。
+ */
+export interface OpenAICompatibleProbedThinking {
+  format: OpenAICompatibleThinkingFormat;
+  canDisable: boolean;
+  /** 该写法下对方接受的 `reasoning_effort`（不含 none）；空数组表示只开关思考、不发强度。 */
+  efforts: readonly LlmThinkingLevel[];
 }
 
 const DEEPSEEK_STYLE_EFFORTS: readonly LlmThinkingLevel[] = ['low', 'high', 'max'];
@@ -119,16 +134,24 @@ function isLocalHost(host: string): boolean {
   return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
 }
 
+/**
+ * 有效规则的来源依次为：手动写法 → 测试结果（`probed`）→ 按接口地址 / 模型 ID 自动识别。
+ * 有测试结果且没有手动写法时，写法与规则（能否关闭、接受的强度）取自测试结果；
+ * 回传行为（`fillReasoningReplay`、`toolContentArrays`）仍按平台和写法计算。
+ */
 export function resolveOpenAICompatibleDialect(
   baseUrl: string,
   model: string,
-  manual?: OpenAICompatibleThinkingFormat
+  manual?: OpenAICompatibleThinkingFormat,
+  probed?: OpenAICompatibleProbedThinking
 ): OpenAICompatibleDialect {
   const platform = openAICompatiblePlatform(baseUrl);
-  const rule = openAICompatibleModelThinkingRule(model);
-  const automatic = automaticFormat(platform, rule);
-  const format = manual ?? automatic.format;
-  const source = manual ? 'manual' : automatic.source;
+  const modelRule = openAICompatibleModelThinkingRule(model);
+  const useProbe = !manual && probed !== undefined;
+  const rule = useProbe ? probedRule(probed, modelRule) : modelRule;
+  const automatic = automaticFormat(platform, modelRule);
+  const format = manual ?? (useProbe ? probed.format : automatic.format);
+  const source = manual ? 'manual' : useProbe ? 'probe' : automatic.source;
   return {
     platform,
     modelName: normalizedOpenAICompatibleModelName(model),
@@ -138,6 +161,19 @@ export function resolveOpenAICompatibleDialect(
     toolContentArrays: format === 'deepseek' && (platform === 'deepseek' || platform === 'mimo'),
     fillReasoningReplay: format === 'deepseek'
       || (rule?.requiresReasoningReplay === true && platform !== 'openrouter' && platform !== 'local')
+  };
+}
+
+function probedRule(
+  probed: OpenAICompatibleProbedThinking,
+  modelRule: OpenAICompatibleModelThinkingRule | undefined
+): OpenAICompatibleModelThinkingRule {
+  return {
+    ...(modelRule?.family ? { family: modelRule.family } : {}),
+    toggle: modelRule?.toggle ?? true,
+    canDisable: probed.canDisable,
+    efforts: sortedLevels(probed.efforts.filter((level) => level !== 'none')),
+    requiresReasoningReplay: modelRule?.requiresReasoningReplay ?? false
   };
 }
 
@@ -159,7 +195,7 @@ function automaticFormat(
     case 'qianfan':
       // 千帆按模型分：DeepSeek、Kimi、GLM 用 thinking.type（默认关闭），Qwen、ERNIE 用 enable_thinking。
       if (rule?.family === 'qwen' || rule?.family === 'ernie') return { format: 'enable_thinking', source: 'platform' };
-      if (rule && DEEPSEEK_STYLE_FAMILIES.has(rule.family)) return { format: 'deepseek', source: 'platform' };
+      if (rule?.family && DEEPSEEK_STYLE_FAMILIES.has(rule.family)) return { format: 'deepseek', source: 'platform' };
       return { format: 'reasoning_effort', source: 'default' };
     case 'openrouter':
       // OpenRouter 的顶层 reasoning_effort 是 reasoning.effort 的简写，none 也可用；不能套 DeepSeek 写法。
@@ -168,7 +204,7 @@ function automaticFormat(
       // vLLM / SGLang / Ollama 的开关走 chat_template_kwargs，键名随模型模板变，第一期保持原样。
       return { format: 'reasoning_effort', source: 'platform' };
     case 'unknown':
-      return rule && DEEPSEEK_STYLE_FAMILIES.has(rule.family)
+      return rule?.family && DEEPSEEK_STYLE_FAMILIES.has(rule.family)
         ? { format: 'deepseek', source: 'model' }
         : { format: 'reasoning_effort', source: 'default' };
   }
@@ -179,6 +215,8 @@ function automaticFormat(
  * 方舟接受七档，按原值发送；硅基流动、千帆只对 DeepSeek V4（硅基流动还有 GLM-5.2）接受 high / max。
  */
 export function openAICompatibleEffortValues(dialect: OpenAICompatibleDialect): readonly LlmThinkingLevel[] | 'any' {
+  // 测试结果就是在这个平台上实测到的取值。
+  if (dialect.source === 'probe' && dialect.rule) return dialect.rule.efforts;
   if (dialect.platform === 'ark') return 'any';
   if (dialect.platform === 'siliconflow' || dialect.platform === 'qianfan') {
     const v4 = /^deepseek-v4/.test(dialect.modelName);
@@ -192,6 +230,12 @@ export function openAICompatibleEffortValues(dialect: OpenAICompatibleDialect): 
 }
 
 const LEVEL_ORDER: readonly LlmThinkingLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+function sortedLevels(levels: readonly LlmThinkingLevel[]): LlmThinkingLevel[] {
+  return [...new Set(levels)]
+    .filter((level) => LEVEL_ORDER.includes(level))
+    .sort((left, right) => LEVEL_ORDER.indexOf(left) - LEVEL_ORDER.indexOf(right));
+}
 
 /**
  * 把渠道上的思考档位换成对方接受的值。先按 DeepSeek 官方的换算（minimal→low，medium、xhigh→high），
@@ -213,10 +257,19 @@ export function mapOpenAICompatibleEffort(
   return higher[0] ?? [...allowed].sort((left, right) => LEVEL_ORDER.indexOf(right) - LEVEL_ORDER.indexOf(left))[0];
 }
 
-/** 会话思考强度下拉可选的值：能关闭时有“关闭”，只能开关的模型只给“开启（high）”。 */
-export function openAICompatibleSessionThinkingValues(rule: OpenAICompatibleModelThinkingRule): LlmThinkingLevel[] {
-  const levels: LlmThinkingLevel[] = rule.efforts.length ? [...rule.efforts] : ['high'];
-  return rule.canDisable ? ['none', ...levels] : levels;
+/**
+ * 有效规则给出的思考档位：会话思考强度下拉与能力表（摘要推理）共用。
+ * 只在 DeepSeek 写法或 enable_thinking 写法、且有规则（模型规则或测试结果）时有值；
+ * 平台差异已算进去（方舟按模型规则，硅基流动的 DeepSeek V4 为 high / max，百炼只有开关）；
+ * 只有开关、不发强度的记作 `['high']`。OpenAI 写法、不发送、认不出模型时返回 undefined。
+ */
+export function openAICompatibleThinkingLevels(
+  dialect: OpenAICompatibleDialect
+): { levels: LlmThinkingLevel[]; canDisable: boolean } | undefined {
+  if ((dialect.format !== 'deepseek' && dialect.format !== 'enable_thinking') || !dialect.rule) return undefined;
+  const values = openAICompatibleEffortValues(dialect);
+  const efforts = sortedLevels(values === 'any' ? dialect.rule.efforts : values);
+  return { levels: efforts.length ? efforts : ['high'], canDisable: dialect.rule.canDisable };
 }
 
 const PLATFORM_LABELS: Record<OpenAICompatiblePlatform, string> = {
@@ -246,6 +299,7 @@ export function describeOpenAICompatibleDialect(dialect: OpenAICompatibleDialect
   const format = OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS[dialect.format];
   switch (dialect.source) {
     case 'manual': return `${format} · 手动指定`;
+    case 'probe': return `${format} · 按测试结果`;
     case 'platform': return `${format} · 按接口地址识别：${PLATFORM_LABELS[dialect.platform]}`;
     case 'model': return `${format} · 按模型 ID 识别`;
     case 'default': return `${format} · 未识别出服务商或模型，按 OpenAI 写法`;

@@ -3,7 +3,7 @@ import { isAstraModel, isGpt6NoneCapableModel } from './openAIResponsesCapabilit
 import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from './geminiThinking';
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
 import { anthropicModelReasoningCapability } from './modelCapabilities';
-import { openAICompatibleModelThinkingRule, openAICompatibleSessionThinkingValues } from './openAICompatibleDialect';
+import { openAICompatibleModelThinkingRule, openAICompatibleThinkingLevels, resolveOpenAICompatibleDialect } from './openAICompatibleDialect';
 
 export type SessionThinkingCapability =
   | { kind: 'gemini-budget' | 'claude-budget'; min: number; max: number; automatic?: number; allowZero?: boolean }
@@ -50,8 +50,10 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     // DeepSeek 风格的模型（DeepSeek、MiMo、Kimi、智谱、混元、Qwen、ERNIE）：按模型能力给档位，
     // 发送时再按平台换成对方的参数写法（backend/capabilities/openAICompatibleDialectAdaptation.ts）。
     // kind 沿用 'deepseek-effort'，已保存的会话覆盖（原 DeepSeek 渠道）继续有效。
-    const rule = openAICompatibleModelThinkingRule(model);
-    if (rule) return { kind: 'deepseek-effort', values: openAICompatibleSessionThinkingValues(rule) };
+    const thinking = openAICompatibleModelThinkingRule(model)
+      ? openAICompatibleThinkingLevels(resolveOpenAICompatibleDialect('', model, 'deepseek'))
+      : undefined;
+    if (thinking) return { kind: 'deepseek-effort', values: thinking.canDisable ? ['none', ...thinking.levels] : thinking.levels };
   }
   return configuredEffort(provider, configuredThinking);
 }

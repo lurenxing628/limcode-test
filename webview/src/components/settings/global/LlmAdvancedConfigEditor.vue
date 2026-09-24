@@ -21,9 +21,9 @@ import {
 } from '@shared/protocol';
 import {
   OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS,
-  describeOpenAICompatibleDialect,
-  resolveOpenAICompatibleDialect
+  describeOpenAICompatibleDialect
 } from '@shared/openAICompatibleDialect';
+import { resolveProviderOpenAICompatibleDialect } from '@shared/modelCapabilities';
 import {
   gpt6ChatCompletionsToolRestriction,
   isGpt6FamilyModel,
@@ -68,17 +68,18 @@ const toolCallFormatOptions: SettingsDropdownOption[] = [
 ];
 
 const THINKING_FORMATS: readonly OpenAICompatibleThinkingFormat[] = ['deepseek', 'enable_thinking', 'reasoning_effort', 'omit'];
-/** 自动识别只看接口地址和模型 ID，这里直接把它会得出的结果写在选项说明里。 */
+/** 自动识别按测试结果、接口地址和模型 ID 得出，这里直接把正在编辑的模型会得出的结果写在选项说明里。 */
 const thinkingFormatOptions = computed<SettingsDropdownOption[]>(() => [
   {
     value: 'auto',
     label: '自动识别（推荐）',
-    description: describeOpenAICompatibleDialect(resolveOpenAICompatibleDialect(props.config.baseUrl, props.config.model))
+    description: describeOpenAICompatibleDialect(resolveProviderOpenAICompatibleDialect(props.config, props.config.model, { manual: null }))
   },
   ...THINKING_FORMATS.map((value) => ({ value, label: OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS[value] }))
 ]);
+// 这个编辑器编辑的就是 config 上的写法（模型专属配置已按“模型级优先”合并好）。
 const thinkingFormatSummary = computed(() => describeOpenAICompatibleDialect(
-  resolveOpenAICompatibleDialect(props.config.baseUrl, props.config.model, props.config.openaiCompatibleThinkingFormat)
+  resolveProviderOpenAICompatibleDialect(props.config, props.config.model, { manual: props.config.openaiCompatibleThinkingFormat ?? null })
 ));
 
 function updateThinkingFormat(value: string): void {

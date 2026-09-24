@@ -14,13 +14,14 @@ const {
   normalizedOpenAICompatibleModelName,
   openAICompatibleEffortValues,
   openAICompatiblePlatform,
+  openAICompatibleThinkingLevels,
   resolveOpenAICompatibleDialect,
   describeOpenAICompatibleDialect,
   OPENAI_COMPATIBLE_SERVICE_PRESETS
 } = require('../../dist/extension/shared/openAICompatibleDialect.js');
 const { canonicalLlmProviderKind } = require('../../dist/extension/shared/protocol.js');
 const { sessionThinkingCapability } = require('../../dist/extension/shared/sessionThinking.js');
-const { normalizeModelCapabilitySnapshot } = require('../../dist/extension/shared/modelCapabilities.js');
+const { normalizeModelCapabilitySnapshot, resolveProviderOpenAICompatibleDialect } = require('../../dist/extension/shared/modelCapabilities.js');
 const { libraryProviderKind } = require('../../dist/extension/backend/capabilities/openAICompatibleDialectAdaptation.js');
 const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
 const { normalizeLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -283,4 +284,91 @@ test('已保存的模型选择、历史回合快照和能力快照里的 deepsee
     nativeCompaction: { availability: 'unsupported', reason: 'none' }
   });
   assert.equal(snapshot.providerKind, 'openai-compatible');
+});
+
+/** “测试这个模型”写进 models[].capabilitySnapshot 的证据（由 1b 的探测产生，这里直接构造）。 */
+function probeSnapshot(baseUrl, model, { wireFormat, canDisable, levels, providerConfigId = 'dialect-channel' }) {
+  return {
+    providerKind: 'openai-compatible', modelId: model, providerConfigId, transport: 'http',
+    endpointFingerprint: baseUrl.replace(/\/+$/, ''), source: 'verified_probe', verifiedAt: '2026-09-24T02:30:00.000Z',
+    reasoning: {
+      family: wireFormat === 'reasoning_effort' ? 'openai_effort' : 'deepseek_toggle', levels, supportsBudget: false,
+      canDisable, alwaysOn: !canDisable, outputLimitIncludesThinking: true, requiresThoughtSignatures: false, wireFormat
+    },
+    nativeCompaction: { availability: 'unknown', reason: '当前渠道和模型没有经过能力确认。' }
+  };
+}
+
+function probedSettings(baseUrl, model, probe, overrides = {}) {
+  return settings(baseUrl, model, { models: [{ id: model, name: model, capabilitySnapshot: probeSnapshot(baseUrl, model, probe) }], ...overrides });
+}
+
+test('测试证据：wireFormat 随能力快照保存，只对 OpenAI 兼容保留合法值', () => {
+  const snapshot = probeSnapshot(RELAY, 'renamed-model', { wireFormat: 'enable_thinking', canDisable: true, levels: ['high', 'max'] });
+  assert.equal(normalizeModelCapabilitySnapshot(snapshot).reasoning.wireFormat, 'enable_thinking');
+  assert.equal('wireFormat' in normalizeModelCapabilitySnapshot({ ...snapshot, reasoning: { ...snapshot.reasoning, wireFormat: 'bogus' } }).reasoning, false);
+  assert.equal('wireFormat' in normalizeModelCapabilitySnapshot({ ...snapshot, providerKind: 'claude' }).reasoning, false);
+});
+
+test('测试证据作为 probed 传入：写法与规则取自测试结果，手动写法优先', () => {
+  const probed = { format: 'enable_thinking', canDisable: false, efforts: ['high', 'max'] };
+  const dialect = resolveOpenAICompatibleDialect(RELAY, 'renamed-model', undefined, probed);
+  assert.equal(dialect.format, 'enable_thinking');
+  assert.equal(dialect.source, 'probe');
+  assert.equal(dialect.rule.canDisable, false);
+  assert.deepEqual(dialect.rule.efforts, ['high', 'max']);
+  assert.deepEqual(openAICompatibleEffortValues(dialect), ['high', 'max']);
+  assert.equal(describeOpenAICompatibleDialect(dialect), 'enable_thinking 写法（百炼、硅基流动等） · 按测试结果');
+  // 平台相关的回传行为仍按平台和写法计算。
+  assert.equal(resolveOpenAICompatibleDialect(DEEPSEEK, 'renamed', undefined, { format: 'deepseek', canDisable: true, efforts: [] }).toolContentArrays, true);
+  const manual = resolveOpenAICompatibleDialect(RELAY, 'renamed-model', 'deepseek', probed);
+  assert.equal(manual.source, 'manual');
+  assert.equal(manual.rule, undefined);
+});
+
+test('有效档位：平台差异算进去，只有开关的记作 high，OpenAI 写法与不发送没有档位', () => {
+  const levels = (baseUrl, model, manual, probed) => openAICompatibleThinkingLevels(resolveOpenAICompatibleDialect(baseUrl, model, manual, probed));
+  assert.deepEqual(levels(DEEPSEEK, 'deepseek-v4-pro'), { levels: ['low', 'high', 'max'], canDisable: true });
+  assert.deepEqual(levels(MOONSHOT, 'kimi-k3'), { levels: ['low', 'high', 'max'], canDisable: false });
+  assert.deepEqual(levels('https://ark.cn-beijing.volces.com/api/v3', 'deepseek-v4-pro'), { levels: ['low', 'high', 'max'], canDisable: true });
+  assert.deepEqual(levels(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro'), { levels: ['high', 'max'], canDisable: true });
+  assert.deepEqual(levels('https://api.xiaomimimo.com/v1', 'mimo-v2-pro'), { levels: ['high'], canDisable: true });
+  assert.deepEqual(levels(RELAY, 'renamed-model', undefined, { format: 'deepseek', canDisable: true, efforts: [] }), { levels: ['high'], canDisable: true });
+  assert.equal(levels(OPENROUTER, 'deepseek/deepseek-v4-pro'), undefined);
+  assert.equal(levels(DEEPSEEK, 'deepseek-v4-pro', 'omit'), undefined);
+  assert.equal(levels(RELAY, 'renamed-model', 'deepseek'), undefined);
+});
+
+test('按渠道配置解析方言：模型级手动 > 渠道级手动 > 测试证据 > 自动识别，证据换地址或渠道即失效', () => {
+  const probe = { wireFormat: 'enable_thinking', canDisable: true, levels: ['low', 'high'] };
+  const config = probedSettings(RELAY, 'renamed-model', probe);
+  const probed = resolveProviderOpenAICompatibleDialect(config, 'renamed-model');
+  assert.equal(probed.source, 'probe');
+  assert.equal(probed.format, 'enable_thinking');
+  assert.deepEqual(probed.rule.efforts, ['low', 'high']);
+  assert.equal(resolveProviderOpenAICompatibleDialect({ ...config, baseUrl: 'https://other.example.invalid/v1' }, 'renamed-model').source, 'default');
+  assert.equal(resolveProviderOpenAICompatibleDialect({ ...config, id: 'another-channel' }, 'renamed-model').source, 'default');
+  const channelManual = resolveProviderOpenAICompatibleDialect({ ...config, openaiCompatibleThinkingFormat: 'deepseek' }, 'renamed-model');
+  assert.equal(channelManual.source, 'manual');
+  assert.equal(channelManual.format, 'deepseek');
+  const modelManual = resolveProviderOpenAICompatibleDialect({
+    ...config, openaiCompatibleThinkingFormat: 'deepseek',
+    modelConfigs: [{ id: 'mc', modelId: 'renamed-model', openaiCompatibleThinkingFormat: 'omit' }]
+  }, 'renamed-model');
+  assert.equal(modelManual.format, 'omit');
+  // 编辑器里“自动识别”一项的说明：忽略手动写法。
+  assert.equal(resolveProviderOpenAICompatibleDialect({ ...config, openaiCompatibleThinkingFormat: 'deepseek' }, 'renamed-model', { manual: null }).source, 'probe');
+});
+
+test('请求改写与接入库格式都采用测试结果', async () => {
+  const probe = { wireFormat: 'enable_thinking', canDisable: true, levels: ['high', 'max'] };
+  const body = await wire(RELAY, 'renamed-model', { level: 'low', models: [{ id: 'renamed-model', name: 'renamed-model', capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', probe) }] });
+  assert.deepEqual(thinkingParams(body), { enable_thinking: true, reasoning_effort: 'high' });
+  const off = await wire(RELAY, 'renamed-model', { level: 'none', models: [{ id: 'renamed-model', name: 'renamed-model', capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', probe) }] });
+  assert.deepEqual(thinkingParams(off), { enable_thinking: false });
+  // 手动写法优先于测试结果。
+  const manual = await wire(RELAY, 'renamed-model', { level: 'low', openaiCompatibleThinkingFormat: 'reasoning_effort', models: [{ id: 'renamed-model', name: 'renamed-model', capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', probe) }] });
+  assert.deepEqual(thinkingParams(manual), { reasoning_effort: 'low' });
+  // DeepSeek 官方地址上测出 DeepSeek 写法时仍交给接入库的 DeepSeek 格式。
+  assert.equal(libraryProviderKind(probedSettings(DEEPSEEK, 'renamed', { wireFormat: 'deepseek', canDisable: true, levels: [] })), 'deepseek');
 });

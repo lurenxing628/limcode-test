@@ -13,12 +13,14 @@ import type { LlmProviderConfigRecord, LlmRequestBodyRecord, LlmThinkingLevel } 
 import {
   mapOpenAICompatibleEffort,
   openAICompatibleEffortValues,
-  resolveOpenAICompatibleDialect,
   type OpenAICompatibleDialect
 } from '../../shared/openAICompatibleDialect';
+import { resolveProviderOpenAICompatibleDialect } from '../../shared/modelCapabilities';
 import type { EncodedProviderRequest } from './providerParameterAdaptation';
 
-type DialectSettings = Pick<LlmProviderConfigRecord, 'provider' | 'baseUrl' | 'model' | 'openaiCompatibleThinkingFormat'>;
+/** 运行时的 settings 来自 applyFrozenModelProviderConfig，带着 models（测试结果）与 modelConfigs。 */
+type DialectSettings = Pick<LlmProviderConfigRecord, 'provider' | 'baseUrl' | 'model' | 'openaiCompatibleThinkingFormat'>
+  & Partial<Pick<LlmProviderConfigRecord, 'id' | 'models' | 'modelConfigs'>>;
 
 /** 自定义请求体里出现这些键，表示用户已经自己决定了思考参数的写法。 */
 const USER_THINKING_KEYS = ['thinking', 'enable_thinking', 'thinking_budget', 'chat_template_kwargs'] as const;
@@ -26,7 +28,7 @@ const USER_THINKING_KEYS = ['thinking', 'enable_thinking', 'thinking_budget', 'c
 const THINKING_LEVELS: ReadonlySet<string> = new Set<LlmThinkingLevel>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 
 export function openAICompatibleDialectForSettings(settings: DialectSettings): OpenAICompatibleDialect {
-  return resolveOpenAICompatibleDialect(settings.baseUrl, settings.model, settings.openaiCompatibleThinkingFormat);
+  return resolveProviderOpenAICompatibleDialect(settings, settings.model);
 }
 
 /**
