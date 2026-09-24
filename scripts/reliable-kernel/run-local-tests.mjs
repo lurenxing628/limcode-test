@@ -117,6 +117,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/openai-responses-tail-cache-breakpoint.test.mjs',
   'tests/reliable-kernel/gemini-provider-adaptation.test.mjs',
   'tests/reliable-kernel/gemini-thought-signature-runtime.test.mjs',
+  'tests/reliable-kernel/provider-vendor-check.test.mjs',
   'tests/reliable-kernel/provider-websocket-policy.test.mjs',
   'tests/reliable-kernel/reliable-control-lifecycle.test.mjs',
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',

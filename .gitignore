@@ -136,6 +136,7 @@ docs/architecture/*
 !/tests/reliable-kernel/openai-responses-tail-cache-breakpoint.test.mjs
 !/tests/reliable-kernel/gemini-provider-adaptation.test.mjs
 !/tests/reliable-kernel/gemini-thought-signature-runtime.test.mjs
+!/tests/reliable-kernel/provider-vendor-check.test.mjs
 !/tests/reliable-kernel/settings-flush-convergence.test.mjs
 !/tests/reliable-kernel/settings-save-barrier-detach.test.mjs
 !/tests/vscodeStorageJsonDurability.test.cjs
