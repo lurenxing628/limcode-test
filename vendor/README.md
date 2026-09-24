@@ -57,6 +57,6 @@ limcode.7 新增的修复（每项在源码注释和测试里写明了官方依�
 - `unified-llm-provider.patch`：相对基础提交的完整源码与测试差异，不直接作用于依赖安装目录。
 - `provider-debug-provenance.json`：记录基础提交、补丁与安装包的摘要。
 - 重建：在项目根目录运行 `node scripts/reliable-kernel/build-provider-debug-fork.mjs`。
-- 验证：运行 `node scripts/reliable-kernel/build-provider-debug-fork.mjs --check`，核对已固定的补丁和安装包。
+- 验证：运行 `node scripts/reliable-kernel/build-provider-debug-fork.mjs --check`（`npm run compile` 会先跑它），核对已固定的补丁和安装包摘要、`package.json` 与 `package-lock.json` 指向这个安装包（lock 的版本和 integrity 与它一致），以及 `node_modules/unified-llm-provider` 实际装的就是它（版本一致，`dist` 每个文件的内容与安装包相同）。换了 vendor 却没重装依赖时直接失败。
 
 观察接口不开启原库的累计全文调试功能。升级此依赖时必须重新检查补丁并跑补丁自带的测试（在打过补丁的源码目录运行 `npx vitest run`），不允许静默退回没有观察接口或协议修复的版本。
