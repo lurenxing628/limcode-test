@@ -458,6 +458,73 @@ test('editing a message in a child conversation reruns within the bound frozen a
   });
 });
 
+test('startup recovery isolates one child whose model record cannot be written and reads each parent Turn once', { timeout: 120000 }, async () => {
+  const reported = [];
+  const originalError = console.error;
+  console.error = (...args) => { reported.push(args); };
+  try {
+    await runtimeFixture(async f => {
+      // Crash window: both children are spawned, but neither model record is written and neither is launched.
+      f.failProfile = () => new Error('simulated crash before the child model record');
+      const now = new Date().toISOString();
+      await f.app.database.transaction([
+        kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent-2', title: 'Second', status: 'active', created_at: now, updated_at: now }),
+        kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-2-agent', conversation_id: 'parent-2', agent_id: f.parentAgent.id, role: 'default', created_at: now, updated_at: now })
+      ]);
+      await f.app.agentLoop.runInput(f.input('spawn-first'));
+      await f.app.agentLoop.runInput({ ...f.input('spawn-second'), conversationId: 'parent-2' });
+      const children = await f.list('ChildExecution');
+      assert.equal(children.length, 2);
+      const [broken, healthy] = children;
+      // Meanwhile the user deleted the channel the first child uses: writing its model record now fails.
+      f.failProfile = input => input.conversationId === broken.child_conversation_id
+        ? new Error('渠道或模型不存在：child-boundary') : undefined;
+      const thinkingReads = [];
+      const children$ = f.app.runtime.children;
+      const readThinking = children$.frozenChildThinkingOverrideForTurn;
+      children$.frozenChildThinkingOverrideForTurn = function(turnId) { thinkingReads.push(turnId); return readThinking.call(this, turnId); };
+      // Another live Host drives both children for now, so every pass scans them again without launching them.
+      const turns = f.app.turns;
+      const { ownsExecutionLease, claimRecoveryExecution } = turns;
+      turns.ownsExecutionLease = async () => false;
+      turns.claimRecoveryExecution = async () => null;
+      const first = await f.coordinator.recoverStartup();
+      const second = await f.coordinator.recoverStartup();
+      assert.equal(first.activeTurnsScanned, 2, 'the failing child does not stop the pass');
+      assert.equal(first.deferredTurnIds.length, 2, JSON.stringify(first));
+      assert.equal(second.deferredTurnIds.length, 2, JSON.stringify(second));
+      const parentTurns = [...await f.list('Turn', { conversation_id: 'parent' }), ...await f.list('Turn', { conversation_id: 'parent-2' })];
+      assert.deepEqual([...thinkingReads].sort(), parentTurns.map(turn => turn.id).sort(), 'each parent Turn snapshot is read once, not on every pass');
+      const healthyInits = f.profileInits.filter(entry => entry.conversationId === healthy.child_conversation_id);
+      assert.equal(healthyInits.length, 2, 'spawn crash and one repair; a written record is not rewritten on the next pass');
+      assert.ok(reported.some(args => String(args[2]?.message ?? args[2]).includes('渠道或模型不存在')), 'the failure is reported');
+      assert.equal(reported.filter(args => String(args[2]?.message ?? args[2]).includes('渠道或模型不存在')).length, 1,
+        'a repeated failure is reported once');
+
+      // Once that Host is gone, both children resume; the broken one runs from its frozen Turn.
+      turns.ownsExecutionLease = ownsExecutionLease;
+      turns.claimRecoveryExecution = claimRecoveryExecution;
+      await f.coordinator.recoverStartup();
+      await f.coordinator.waitForIdle();
+      for (const child of children) {
+        assert.ok(f.wires.some(wire => wire.conversationId === child.child_conversation_id), 'each child reaches its model');
+      }
+    }, {
+      async send(request, controls, f) {
+        let part = { text: 'done' };
+        if (request.conversationId.startsWith('parent') && !f.sent.has(request.conversationId)) {
+          f.sent.add(request.conversationId);
+          part = { id: `spawn-${request.conversationId}`, functionCall: { name: 'run_agent', args: { operation: 'spawn',
+            taskName: `Task of ${request.conversationId}`, prompt: `do the part of ${request.conversationId}` } } };
+        }
+        await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [part] } });
+      }
+    });
+  } finally {
+    console.error = originalError;
+  }
+});
+
 test('a Plan the user approves to run in a new conversation runs with the executor Agent own settings, not the planning Turn', { timeout: 120000 }, async () => {
   await runtimeFixture(async f => {
     const { workEnvironmentIdFromUri } = dist('shared/workEnvironmentCatalog.js');
@@ -631,7 +698,12 @@ async function runtimeFixture(run, hooks, options = {}) {
     coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime, modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
       agents: { async resolve() { return { agentId: childAgent.id, agentType: 'worker' }; } },
       // Production wiring (VscodeReliableKernelProductRuntime uses the same adapter).
-      modelProfiles: { async initializeConversation(input) { profileInits.push(structuredClone(input)); return productProfiles.initializeConversation(input); } }
+      modelProfiles: { async initializeConversation(input) {
+        profileInits.push(structuredClone(input));
+        const failure = f.failProfile?.(input);
+        if (failure) throw failure;
+        return productProfiles.initializeConversation(input);
+      } }
     });
     // Production wiring: a Plan approved to run in a new conversation goes through the same coordinator.
     app.interactions.setPlanDelegator({ preview: input => coordinator.previewApprovedPlan(input), ensure: input => coordinator.ensureApprovedPlan(input) });

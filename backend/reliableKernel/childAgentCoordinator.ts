@@ -182,6 +182,12 @@ export class ReliableChildAgentCoordinator {
   private readonly waitingOwned = new Map<string, { childExecutionId: string; externalDataVersion: string }>();
   private recoveryPollInFlight = false;
   private recoveryPollTask: Promise<void> | undefined;
+  /** Frozen parent Turns never change, so each one's child thinking choice is read once per Host. */
+  private readonly parentTurnThinking = new Map<string, Promise<SessionThinkingOverride | undefined>>();
+  /** Child Conversations whose model record recovery already wrote or found; later passes skip them. */
+  private readonly repairedChildModelProfiles = new Set<string>();
+  /** Recovery failures already logged, so a failure that repeats on every pass is logged once. */
+  private readonly reportedRecoveryFailures = new Set<string>();
 
   public constructor(private readonly dependencies: ReliableChildAgentCoordinatorDependencies) {
     this.now = dependencies.now ?? (() => new Date().toISOString());
@@ -1072,19 +1078,7 @@ export class ReliableChildAgentCoordinator {
     child: DomainRow | null
   ): Promise<'resumed' | 'deferred' | 'terminal'> {
     if (!child || child.status === 'starting') return 'deferred';
-    // Repairs the crash boundary between the Runtime spawn transaction and the independent
-    // settings transaction. Existing Conversation selection remains authoritative; the inherited
-    // thinking strength comes from the parent Turn that spawned this child, as at spawn time.
-    const [parentLink] = await this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId }, 1);
-    const parentTurnId = typeof parentLink?.parent_turn_id === 'string' ? parentLink.parent_turn_id : undefined;
-    const inheritedThinkingOverride = parentTurnId
-      ? await this.dependencies.children.frozenChildThinkingOverrideForTurn(parentTurnId)
-      : undefined;
-    await this.dependencies.modelProfiles.initializeConversation({
-      conversationId: requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
-      model: await this.dependencies.children.frozenModelSelectionForTurn(turnId),
-      ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
-    });
+    await this.repairChildModelProfile(childExecutionId, turnId, child);
     if (await this.dependencies.turns.ownsExecutionLease({
       turnId,
       leaseOwnerId: this.childLeaseOwnerId,
@@ -1115,6 +1109,49 @@ export class ReliableChildAgentCoordinator {
     if (!claimed) return 'deferred';
     this.launch(childExecutionId, turnId);
     return 'resumed';
+  }
+
+  /**
+   * Repairs the crash boundary between the Runtime spawn transaction and the independent settings
+   * transaction. Existing Conversation selection remains authoritative; the inherited thinking
+   * strength comes from the parent Turn that spawned this child, as at spawn time. The Turn itself
+   * is already frozen, so a record that cannot be written (for example, the user deleted the
+   * child's channel meanwhile) is reported and skipped: the child still recovers, and so does
+   * every other child in the pass.
+   */
+  private async repairChildModelProfile(childExecutionId: string, turnId: string, child: DomainRow): Promise<void> {
+    const conversationId = requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
+    if (this.repairedChildModelProfiles.has(conversationId)) return;
+    try {
+      const [parentLink] = await this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId }, 1);
+      const parentTurnId = typeof parentLink?.parent_turn_id === 'string' ? parentLink.parent_turn_id : undefined;
+      const inheritedThinkingOverride = parentTurnId ? await this.parentTurnThinkingOverride(parentTurnId) : undefined;
+      await this.dependencies.modelProfiles.initializeConversation({
+        conversationId,
+        model: await this.dependencies.children.frozenModelSelectionForTurn(turnId),
+        ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
+      });
+      this.repairedChildModelProfiles.add(conversationId);
+    } catch (error) {
+      this.reportRecoveryFailureOnce(error, 'recovery-child-model-profile', turnId);
+    }
+  }
+
+  private parentTurnThinkingOverride(parentTurnId: string): Promise<SessionThinkingOverride | undefined> {
+    let read = this.parentTurnThinking.get(parentTurnId);
+    if (!read) {
+      read = this.dependencies.children.frozenChildThinkingOverrideForTurn(parentTurnId);
+      this.parentTurnThinking.set(parentTurnId, read);
+      read.catch(() => this.parentTurnThinking.delete(parentTurnId));
+    }
+    return read;
+  }
+
+  private reportRecoveryFailureOnce(error: unknown, operation: string, turnId: string): void {
+    const key = `${operation}:${turnId}:${error instanceof Error ? error.message : String(error)}`;
+    if (this.reportedRecoveryFailures.has(key)) return;
+    this.reportedRecoveryFailures.add(key);
+    this.reportError(error, operation, turnId);
   }
 
   /** Resolves the ChildExecution owning a spawn EffectIntent through its Attempt and Operation. */
