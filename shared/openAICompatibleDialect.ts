@@ -20,6 +20,7 @@ export type OpenAICompatiblePlatform =
   | 'moonshot'
   | 'zhipu'
   | 'tencent'
+  | 'hunyuan'
   | 'ark'
   | 'dashscope'
   | 'siliconflow'
@@ -116,7 +117,9 @@ export function openAICompatiblePlatform(baseUrl: string): OpenAICompatiblePlatf
   if (within('xiaomimimo.com')) return 'mimo';
   if (within('moonshot.cn') || within('moonshot.ai')) return 'moonshot';
   if (within('bigmodel.cn') || within('z.ai')) return 'zhipu';
-  if (within('tencentmaas.com') || host === 'api.hunyuan.cloud.tencent.com') return 'tencent';
+  if (within('tencentmaas.com')) return 'tencent';
+  // 旧混元平台的 OpenAI 兼容接口没有 thinking / reasoning_effort 参数，不归入 TokenHub。
+  if (host === 'api.hunyuan.cloud.tencent.com') return 'hunyuan';
   if (within('volces.com')) return 'ark';
   if (within('aliyuncs.com') && (host.startsWith('dashscope') || host.includes('.maas.'))) return 'dashscope';
   if (within('siliconflow.cn') || within('siliconflow.com')) return 'siliconflow';
@@ -182,16 +185,20 @@ function automaticFormat(
   rule: OpenAICompatibleModelThinkingRule | undefined
 ): { format: OpenAICompatibleThinkingFormat; source: OpenAICompatibleDialect['source'] } {
   switch (platform) {
+    // 平台写法只用于登记了规则的模型：平台上认不出的模型（例如腾讯 TokenHub 的 minimax-m3 传
+    // thinking.type enabled 会返回 400）按 OpenAI 写法，只在设置了强度时发 reasoning_effort。
     case 'deepseek':
     case 'mimo':
     case 'moonshot':
     case 'zhipu':
     case 'tencent':
     case 'ark':
-      return { format: 'deepseek', source: 'platform' };
+      return rule ? { format: 'deepseek', source: 'platform' } : { format: 'reasoning_effort', source: 'default' };
     case 'dashscope':
     case 'siliconflow':
-      return { format: 'enable_thinking', source: 'platform' };
+      return rule ? { format: 'enable_thinking', source: 'platform' } : { format: 'reasoning_effort', source: 'default' };
+    case 'hunyuan':
+      return { format: 'omit', source: 'platform' };
     case 'qianfan':
       // 千帆按模型分：DeepSeek、Kimi、GLM 用 thinking.type（默认关闭），Qwen、ERNIE 用 enable_thinking。
       if (rule?.family === 'qwen' || rule?.family === 'ernie') return { format: 'enable_thinking', source: 'platform' };
@@ -278,6 +285,7 @@ const PLATFORM_LABELS: Record<OpenAICompatiblePlatform, string> = {
   moonshot: 'Kimi（月之暗面）',
   zhipu: '智谱',
   tencent: '腾讯 TokenHub',
+  hunyuan: '腾讯混元（旧接口）',
   ark: '火山方舟',
   dashscope: '阿里百炼',
   siliconflow: '硅基流动',
@@ -302,7 +310,9 @@ export function describeOpenAICompatibleDialect(dialect: OpenAICompatibleDialect
     case 'probe': return `${format} · 按测试结果`;
     case 'platform': return `${format} · 按接口地址识别：${PLATFORM_LABELS[dialect.platform]}`;
     case 'model': return `${format} · 按模型 ID 识别`;
-    case 'default': return `${format} · 未识别出服务商或模型，按 OpenAI 写法`;
+    case 'default': return dialect.platform === 'unknown'
+      ? `${format} · 未识别出服务商或模型，按 OpenAI 写法`
+      : `${format} · 按接口地址识别：${PLATFORM_LABELS[dialect.platform]}，这个模型没有登记思考参数规则，按 OpenAI 写法`;
   }
 }
 

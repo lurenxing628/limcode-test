@@ -408,3 +408,22 @@ test('自定义请求体里的 reasoning_effort 原样发送；“不发送”�
   const controlled = await wire(DASHSCOPE, 'qwen3-max', { level: 'high', requestBody: { chat_template_kwargs: { enable_thinking: false } } });
   assert.equal('enable_thinking' in controlled, false);
 });
+
+const TOKENHUB = 'https://tokenhub.tencentmaas.com/v1';
+const HUNYUAN_LEGACY = 'https://api.hunyuan.cloud.tencent.com/v1';
+
+test('平台写法只用于有规则的模型；旧混元平台不归入腾讯 TokenHub，不发思考参数', async () => {
+  // 腾讯 TokenHub：minimax-m3 传 thinking.type enabled 返回 400（https://cloud.tencent.com/document/product/1823/135872）。
+  const minimax = resolveOpenAICompatibleDialect(TOKENHUB, 'minimax-m3');
+  assert.deepEqual([minimax.format, minimax.source], ['reasoning_effort', 'default']);
+  assert.equal('thinking' in await wire(TOKENHUB, 'minimax-m3', { level: 'high' }), false);
+  assert.deepEqual([resolveOpenAICompatibleDialect(MOONSHOT, 'moonshot-v1-8k').format, resolveOpenAICompatibleDialect(MOONSHOT, 'moonshot-v1-8k').source], ['reasoning_effort', 'default']);
+  assert.equal(resolveOpenAICompatibleDialect(TOKENHUB, 'deepseek-v4-pro').format, 'deepseek');
+  assert.equal(resolveOpenAICompatibleDialect(DASHSCOPE, 'MiniMax/MiniMax-M3').source, 'default');
+  // 旧混元平台的参数表没有 thinking / reasoning_effort（https://cloud.tencent.com/document/product/1729/111007）。
+  assert.equal(openAICompatiblePlatform(HUNYUAN_LEGACY), 'hunyuan');
+  const legacy = resolveOpenAICompatibleDialect(HUNYUAN_LEGACY, 'hunyuan-t1');
+  assert.deepEqual([legacy.format, legacy.source], ['omit', 'platform']);
+  assert.deepEqual(thinkingParams(await wire(HUNYUAN_LEGACY, 'hunyuan-t1', { level: 'high' })), {});
+  assert.match(describeOpenAICompatibleDialect(minimax), /腾讯 TokenHub.*没有登记思考参数规则/);
+});
