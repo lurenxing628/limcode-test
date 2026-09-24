@@ -774,6 +774,58 @@ test('E4 MCP schemas are reduced to the documented Gemini Schema subset', async 
   assert.deepEqual(parameters, original, 'the source schema must not be mutated');
 });
 
+test('E4 type arrays with items/properties, parent required with branch-only properties, and numeric enums stay valid Gemini schemas', async () => {
+  const parameters = {
+    type: 'object',
+    properties: {
+      // Before: {type: 'string', items} — items on a string.
+      paths: { type: ['string', 'array'], items: { type: 'string' }, description: 'one path or many' },
+      options: { type: ['string', 'object', 'null'], properties: { depth: { type: 'integer' } }, required: ['depth'] },
+      // Before: a string enum without a type.
+      level: { enum: [1, 2, 3] },
+      mixed: { enum: ['a', 2] },
+      named: { enum: ['x', 'y'] },
+      // Before: the parent kept required: ['kind'] although kind is defined only in the branches.
+      shape: {
+        type: 'object',
+        required: ['kind'],
+        oneOf: [
+          { type: 'object', properties: { kind: { const: 'circle' }, radius: { type: 'number' } }, required: ['kind', 'radius'] },
+          { type: 'object', properties: { kind: { const: 'square' }, side: { type: 'number' } }, required: ['kind', 'side'] }
+        ]
+      },
+      bare: { type: 'object', required: ['ghost'] },
+      // A required list split from its properties by allOf still meets them in the parent.
+      split: { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }, { required: ['a'] }] }
+    },
+    required: ['paths', 'missing']
+  };
+  const expected = {
+    type: 'object',
+    properties: {
+      paths: { type: 'array', items: { type: 'string' }, description: 'one path or many' },
+      options: { type: 'object', properties: { depth: { type: 'integer' } }, required: ['depth'], nullable: true },
+      level: { enum: ['1', '2', '3'], type: 'string' },
+      mixed: { enum: ['a', '2'], type: 'string' },
+      named: { enum: ['x', 'y'] },
+      shape: {
+        type: 'object',
+        anyOf: [
+          { type: 'object', properties: { kind: { enum: ['circle'], type: 'string' }, radius: { type: 'number' } }, required: ['kind', 'radius'] },
+          { type: 'object', properties: { kind: { enum: ['square'], type: 'string' }, side: { type: 'number' } }, required: ['kind', 'side'] }
+        ]
+      },
+      bare: { type: 'object' },
+      split: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }
+    },
+    required: ['paths']
+  };
+  for (const [provider, model] of [['gemini', 'gemini-3.7-flash'], ['openai-compatible', '[v]gemini-3.5-flash']]) {
+    const [declaration] = await geminiWireDeclarations([{ name: 'mcp_shapes', description: 'MCP tool', parameters }], provider, model);
+    assert.deepEqual(declaration.parameters, expected, provider);
+  }
+});
+
 test('E4 non-Gemini providers keep MCP schemas untouched by the Gemini sanitizer', async () => {
   const parameters = mcpToolParameters();
   const result = await dryRunLlmProvider({

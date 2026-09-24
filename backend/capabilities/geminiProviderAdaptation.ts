@@ -662,7 +662,7 @@ function restoreGeminiToolSchemas(encodedRequest: unknown, sourceRequest: unknow
     if (typeof declaration.name !== 'string') continue;
     const source = sourceByName.get(declaration.name);
     if (!source?.parameters) continue;
-    declaration.parameters = sanitizeGeminiFunctionSchema(source.parameters);
+    declaration.parameters = withOnlyDefinedGeminiRequired(sanitizeGeminiFunctionSchema(source.parameters));
   }
 }
 
@@ -717,6 +717,7 @@ function sanitizeGeminiFunctionSchema(value: unknown, context?: GeminiSchemaCont
   const result: Record<string, unknown> = {};
   const merges: Record<string, unknown>[] = [];
   let stringifiedEnum = false;
+  let nonStringEnum = false;
   let nullable = false;
   for (const [key, child] of Object.entries(value)) {
     if (key === 'properties' && isRecord(child)) {
@@ -739,7 +740,9 @@ function sanitizeGeminiFunctionSchema(value: unknown, context?: GeminiSchemaCont
       // JSON Schema `type: [T, "null"]` is Gemini `type: T, nullable: true`.
       const types = child.filter((type): type is string => typeof type === 'string');
       const nonNull = types.filter((type) => type.toLowerCase() !== 'null');
-      if (nonNull.length > 0) result.type = nonNull[0];
+      // `items` belong to the array type and `properties`/`required` to the object type: the first
+      // listed type would put them on a string (`{type: "string", items}`).
+      if (nonNull.length > 0) result.type = geminiTypeForTypeSpecificFields(value, nonNull) ?? nonNull[0];
       else if (types.length > 0) result.type = types[0];
       if (nonNull.length > 1 && !hasTypeSpecificGeminiFields(value)) {
         delete result.type;
@@ -759,6 +762,7 @@ function sanitizeGeminiFunctionSchema(value: unknown, context?: GeminiSchemaCont
     if (key === 'enum' && Array.isArray(child)) {
       result.enum = child.map((item) => String(item));
       stringifiedEnum = true;
+      nonStringEnum ||= child.some((item) => typeof item !== 'string');
       continue;
     }
     if (key === 'items') {
@@ -772,6 +776,9 @@ function sanitizeGeminiFunctionSchema(value: unknown, context?: GeminiSchemaCont
   for (const merge of merges) mergeGeminiSchemaInto(result, merge);
   if (nullable && result.nullable === undefined) result.nullable = true;
   if (stringifiedEnum && (result.type === 'integer' || result.type === 'number')) result.type = 'string';
+  // Gemini enums are strings: numbers stringified above need the matching type (a typeless string
+  // enum is sent as before).
+  if (nonStringEnum && result.type === undefined) result.type = 'string';
   if (Array.isArray(result.required) && isRecord(result.properties)) {
     const required = result.required.filter((propertyName): propertyName is string =>
       typeof propertyName === 'string' && Object.prototype.hasOwnProperty.call(result.properties, propertyName)
@@ -780,6 +787,35 @@ function sanitizeGeminiFunctionSchema(value: unknown, context?: GeminiSchemaCont
     else delete result.required;
   }
   return result;
+}
+
+/**
+ * Final pass over the sanitized parameters: Gemini checks every `required` name against the same
+ * schema's own `properties`. A schema without properties (for example a parent whose properties are
+ * defined only in its `anyOf` branches, which keep their own required lists) drops its `required`.
+ * Runs after unions and `allOf` members are folded, so a required list that met its properties in the
+ * parent is kept.
+ */
+function withOnlyDefinedGeminiRequired(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(withOnlyDefinedGeminiRequired);
+  if (!isRecord(schema)) return schema;
+  if (isRecord(schema.properties)) {
+    for (const [name, property] of Object.entries(schema.properties)) {
+      schema.properties[name] = withOnlyDefinedGeminiRequired(property);
+    }
+  }
+  if (schema.items !== undefined) schema.items = withOnlyDefinedGeminiRequired(schema.items);
+  if (Array.isArray(schema.anyOf)) schema.anyOf = schema.anyOf.map(withOnlyDefinedGeminiRequired);
+  if (Array.isArray(schema.required) && !isRecord(schema.properties)) delete schema.required;
+  return schema;
+}
+
+/** The listed type that the schema's type-specific fields belong to, if any. */
+function geminiTypeForTypeSpecificFields(value: Record<string, unknown>, types: readonly string[]): string | undefined {
+  const wanted = value.items !== undefined ? 'array'
+    : value.properties !== undefined || value.required !== undefined ? 'object'
+      : undefined;
+  return wanted ? types.find((type) => type.toLowerCase() === wanted) : undefined;
 }
 
 /**
