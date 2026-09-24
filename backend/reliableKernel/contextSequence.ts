@@ -4,6 +4,7 @@ import {
   type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
+import { resolveConversationCompressionBlock } from './compressionBlockOwnership';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   DOMAIN_REPOSITORIES,
@@ -117,6 +118,10 @@ export interface MaterializedContextSegment {
   segmentKind: ContextSegmentKind;
   messageRole: string | null;
   modelSource?: ContextModelSource;
+  /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
+  sourceRecipeObjectId?: string;
+  /** Claude 保留思考处理：产生这条模型输出的请求发出时这个对话已选定的处理。 */
+  sourceClaudeThinkingBinding?: 'drop_block' | 'strip_thinking';
   contentObject: ContentObjectMetadata;
   content: Buffer;
 }
@@ -137,6 +142,8 @@ export interface FreshConversationMessageContextPlanInput {
   contentByteLength: bigint;
   /** Provider-semantic estimate for this Message; defaults to the legacy byte fallback. */
   contentEstimatedTokens?: number;
+  /** Immutable occurrences whose independent target provenance is written in the same transaction. */
+  inheritedSegments?: readonly { segmentId: string; estimatedTokens: number }[];
 }
 
 export interface MessageContextAppendPlanInput {
@@ -947,82 +954,23 @@ export class ContextSequenceControlPlane {
       }
       if (!found) throw new Error(`Context root ${rootId} does not contain end segment ${endSegmentId}.`);
     }
-    const pairRecords = prefixRecords.filter((record) => record.segment.segment_kind === 'tool_pair');
-    if (pairRecords.length === 0) return;
-    const sourceSnapshot = await this.database.snapshot(pairRecords.map((record) =>
-      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-        where: { segment_id: requireId(record.segment.id, 'ContextSegment.id') },
-        orderBy: { column: 'id', direction: 'asc' },
-        limit: 1000
-      })
-    ));
-    const conversationId = requireId(structure.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const sourceGroups: DomainRow[][] = [];
-    for (const [index, record] of pairRecords.entries()) {
-      const first = rows(sourceSnapshot.snapshot[index]);
-      sourceGroups.push(first.length < 1000 ? first : await listAllDomainRows(
-        this.database, 'ContextSegmentSource', { segment_id: requireId(record.segment.id, 'ContextSegment.id') }
-      ));
-    }
-    const readByIds = async (domain: string, ids: string[]): Promise<Map<string, DomainRow>> => {
-      const result = new Map<string, DomainRow>();
-      const unique = [...new Set(ids)];
-      for (let offset = 0; offset < unique.length; offset += 256) {
-        const batch = unique.slice(offset, offset + 256);
-        const snapshot = await this.database.snapshot(batch.map((id) => DOMAIN_REPOSITORIES.domain(domain).get(id)));
-        batch.forEach((id, index) => result.set(id, requireRow(snapshot.snapshot[index], `${domain} ${id}`)));
-      }
-      return result;
-    };
-    const allSources = sourceGroups.flat();
-    const results = await readByIds('ToolModelResult', allSources.filter((source) => source.source_kind === 'tool_model_result')
-      .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')));
-    const calls = await readByIds('ToolCall', [
-      ...allSources.filter((source) => source.source_kind === 'tool_call')
-        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
-      ...[...results.values()].map((result) => requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'))
-    ]);
-    const turns = await readByIds('Turn', [...calls.values()].map((call) => requireId(call.turn_id, 'ToolCall.turn_id')));
-    const callForSource = (source: DomainRow): DomainRow | undefined => {
-      if (source.source_kind === 'tool_call') return calls.get(requireId(source.source_id, 'ContextSegmentSource.source_id'));
-      if (source.source_kind === 'tool_model_result') {
-        const result = results.get(requireId(source.source_id, 'ContextSegmentSource.source_id'))!;
-        return calls.get(requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'));
-      }
-      return undefined;
-    };
-    const openCalls = new Map<string, string>();
-    const resultSources: ContextSourceOccurrence[] = [];
-    for (const [index, record] of pairRecords.entries()) {
-      // Forks add independent provenance to immutable shared segments. Scope through Call→Turn,
-      // never choose an arbitrary pair or treat another Conversation's sources as duplicates.
-      const scoped = sourceGroups[index].filter((source) => {
-        const call = callForSource(source);
-        if (!call) return true; // Unknown kinds must still fail the shape check.
-        return turns.get(requireId(call.turn_id, 'ToolCall.turn_id'))!.conversation_id === conversationId;
-      });
-      for (const source of scoped) {
-        const call = callForSource(source);
-        if (call && requireBigInt(call.call_seq, 'ToolCall.call_seq')
-          !== requireBigInt(source.source_revision, 'ContextSegmentSource.source_revision')) {
-          throw new Error('Context tool source revision does not match its ToolCall call_seq.');
-        }
-      }
-      const shape = classifyToolPairSources(scoped.map(contextSourceOccurrence).sort((left, right) =>
-        left.sourceKind.localeCompare(right.sourceKind)
-      ));
-      if (shape.kind === 'atomic') {
-        if (results.get(shape.result.sourceId)!.tool_call_id !== shape.call.sourceId) {
-          throw new Error('Context tool result does not belong to its paired ToolCall.');
-        }
-        continue;
-      }
-      if (shape.kind === 'native_call') {
-        openCalls.set(shape.call.sourceId, requireId(record.segment.id, 'ContextSegment.id'));
-      } else {
-        resultSources.push(shape.result);
-      }
-    }
+    await this.assertNativeSegmentsClosed(
+      requireId(structure.root.conversation_id, 'ContextSequenceRoot.conversation_id'),
+      prefixRecords
+    );
+  }
+
+  /**
+   * The same closure guard over an explicit segment list owned by one Conversation, such as a fork
+   * prefix plus the late native results moved behind its cut. Calls outside the list (for example
+   * a caller's still running Turn after the cut) are not part of the checked history.
+   */
+  public async assertNativeSegmentsClosed(
+    conversationIdInput: string,
+    records: readonly StructuralContextRecord[]
+  ): Promise<void> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const { openCalls, resultSources } = await this.scanNativePairs(conversationId, records);
     if (openCalls.size === 0 && resultSources.length === 0) return;
     const resultSnapshot = await this.database.snapshot(resultSources.map((source) =>
       DOMAIN_REPOSITORIES.domain('ToolModelResult').get(source.sourceId)
@@ -1043,6 +991,158 @@ export class ContextSequenceControlPlane {
       pending,
       'Append the native result occurrences before cutting this Context prefix.'
     );
+  }
+
+  /**
+   * Native results that settled after a fork cut: result occurrences, later in the same root, of
+   * native calls whose call occurrence lies in the retained prefix `records[0..endIndex]`. A fork
+   * moves them directly behind its cut instead of extending the cut over later history.
+   */
+  public async lateNativeResultSegmentIds(
+    conversationIdInput: string,
+    records: readonly StructuralContextRecord[],
+    endIndex: number
+  ): Promise<string[]> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const prefix = records.slice(0, endIndex + 1);
+    const { openCalls, resultSources } = await this.scanNativePairs(conversationId, prefix);
+    if (openCalls.size === 0) return [];
+    const closedInPrefix = new Set<string>();
+    if (resultSources.length > 0) {
+      const snapshot = await this.database.snapshot(resultSources.map((source) =>
+        DOMAIN_REPOSITORIES.domain('ToolModelResult').get(source.sourceId)
+      ));
+      for (const [index, source] of resultSources.entries()) {
+        closedInPrefix.add(requireId(
+          requireRow(snapshot.snapshot[index], `ToolModelResult ${source.sourceId}`).tool_call_id,
+          'ToolModelResult.tool_call_id'
+        ));
+      }
+    }
+    const later = new Map(records.slice(endIndex + 1).map((record, offset) => [
+      requireId(record.segment.id, 'ContextSegment.id'), endIndex + 1 + offset
+    ]));
+    const moved: Array<{ segmentId: string; index: number }> = [];
+    for (const toolCallId of openCalls.keys()) {
+      if (closedInPrefix.has(toolCallId)) continue;
+      const results = await listAllDomainRows(this.database, 'ToolModelResult', { tool_call_id: toolCallId });
+      if (results.length !== 1) continue;
+      const occurrences = await listAllDomainRows(this.database, 'ContextSegmentSource', {
+        source_kind: 'tool_model_result',
+        source_id: requireId(results[0].id, 'ToolModelResult.id')
+      });
+      if (occurrences.length !== 1) continue;
+      const segmentId = requireId(occurrences[0].segment_id, 'ContextSegmentSource.segment_id');
+      const index = later.get(segmentId);
+      if (index !== undefined) moved.push({ segmentId, index });
+    }
+    return moved.sort((left, right) => left.index - right.index).map((entry) => entry.segmentId);
+  }
+
+  /** Content-addressed nodes that continue an immutable chain from `parentNodeId`. */
+  public planSuffixNodes(
+    parentNodeId: string,
+    segmentIds: readonly string[],
+    savepointName: string
+  ): { nodeIds: string[]; steps: RepositoryTransactionStep[] } {
+    const now = this.timestamp();
+    const nodes: PlannedNode[] = [];
+    let parent: string = requireId(parentNodeId, 'parentNodeId');
+    for (const segmentId of segmentIds) {
+      const id = contextSequenceNodeId(parent, segmentId);
+      nodes.push({ id, parentNodeId: parent, segmentId: requireId(segmentId, 'segmentId'), now });
+      parent = id;
+    }
+    return { nodeIds: nodes.map((node) => node.id), steps: nodeInsertSteps(nodes, savepointName) };
+  }
+
+  private async scanNativePairs(
+    conversationId: string,
+    records: readonly StructuralContextRecord[]
+  ): Promise<{ openCalls: Map<string, string>; resultSources: ContextSourceOccurrence[] }> {
+    const pairRecords = records.filter((record) => record.segment.segment_kind === 'tool_pair');
+    if (pairRecords.length === 0) return { openCalls: new Map(), resultSources: [] };
+    const sourceSnapshot = await this.database.snapshot(pairRecords.map((record) =>
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { segment_id: requireId(record.segment.id, 'ContextSegment.id') },
+        orderBy: { column: 'id', direction: 'asc' },
+        limit: 1000
+      })
+    ));
+    const sourceGroups: DomainRow[][] = [];
+    for (const [index, record] of pairRecords.entries()) {
+      const first = rows(sourceSnapshot.snapshot[index]);
+      sourceGroups.push(first.length < 1000 ? first : await listAllDomainRows(
+        this.database, 'ContextSegmentSource', { segment_id: requireId(record.segment.id, 'ContextSegment.id') }
+      ));
+    }
+    // Missing rows are expected: a deleted Conversation cascades its ToolCall/ToolModelResult/Turn
+    // rows while the dataset-lifetime segment keeps that Conversation's source provenance.
+    const readExistingByIds = async (domain: string, ids: string[]): Promise<Map<string, DomainRow>> => {
+      const result = new Map<string, DomainRow>();
+      const unique = [...new Set(ids)];
+      for (let offset = 0; offset < unique.length; offset += 256) {
+        const batch = unique.slice(offset, offset + 256);
+        const snapshot = await this.database.snapshot(batch.map((id) => DOMAIN_REPOSITORIES.domain(domain).get(id)));
+        batch.forEach((id, index) => {
+          if (snapshot.snapshot[index] !== null) result.set(id, requireRow(snapshot.snapshot[index], `${domain} ${id}`));
+        });
+      }
+      return result;
+    };
+    const allSources = sourceGroups.flat();
+    const results = await readExistingByIds('ToolModelResult', allSources.filter((source) => source.source_kind === 'tool_model_result')
+      .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')));
+    const calls = await readExistingByIds('ToolCall', [
+      ...allSources.filter((source) => source.source_kind === 'tool_call')
+        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
+      ...[...results.values()].map((result) => requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'))
+    ]);
+    const turns = await readExistingByIds('Turn', [...calls.values()].map((call) => requireId(call.turn_id, 'ToolCall.turn_id')));
+    /** undefined: not a tool source kind; null: the owning Conversation was deleted. */
+    const callForSource = (source: DomainRow): DomainRow | null | undefined => {
+      if (source.source_kind === 'tool_call') return calls.get(requireId(source.source_id, 'ContextSegmentSource.source_id')) ?? null;
+      if (source.source_kind === 'tool_model_result') {
+        const result = results.get(requireId(source.source_id, 'ContextSegmentSource.source_id'));
+        return result ? calls.get(requireId(result.tool_call_id, 'ToolModelResult.tool_call_id')) ?? null : null;
+      }
+      return undefined;
+    };
+    const openCalls = new Map<string, string>();
+    const resultSources: ContextSourceOccurrence[] = [];
+    for (const [index, record] of pairRecords.entries()) {
+      // Forks add independent provenance to immutable shared segments. Scope through Call→Turn,
+      // never choose an arbitrary pair or treat another Conversation's sources as duplicates.
+      const scoped = sourceGroups[index].filter((source) => {
+        const call = callForSource(source);
+        if (call === undefined) return true; // Unknown kinds must still fail the shape check.
+        if (call === null) return false;
+        const turn = turns.get(requireId(call.turn_id, 'ToolCall.turn_id'));
+        return turn !== undefined && turn.conversation_id === conversationId;
+      });
+      for (const source of scoped) {
+        const call = callForSource(source);
+        if (call !== undefined && call !== null && requireBigInt(call.call_seq, 'ToolCall.call_seq')
+          !== requireBigInt(source.source_revision, 'ContextSegmentSource.source_revision')) {
+          throw new Error('Context tool source revision does not match its ToolCall call_seq.');
+        }
+      }
+      const shape = classifyToolPairSources(scoped.map(contextSourceOccurrence).sort((left, right) =>
+        left.sourceKind.localeCompare(right.sourceKind)
+      ));
+      if (shape.kind === 'atomic') {
+        if (results.get(shape.result.sourceId)!.tool_call_id !== shape.call.sourceId) {
+          throw new Error('Context tool result does not belong to its paired ToolCall.');
+        }
+        continue;
+      }
+      if (shape.kind === 'native_call') {
+        openCalls.set(shape.call.sourceId, requireId(record.segment.id, 'ContextSegment.id'));
+      } else {
+        resultSources.push(shape.result);
+      }
+    }
+    return { openCalls, resultSources };
   }
 
   public async materializeStructure(rootId: string): Promise<MaterializedContextStructure> {
@@ -1067,6 +1167,8 @@ export class ContextSequenceControlPlane {
         segmentKind: requireSegmentKind(record.segment.segment_kind),
         messageRole: nullableText(record.messageRole, 'Context message role'),
         ...(record.modelSource ? { modelSource: record.modelSource } : {}),
+        ...(record.sourceRecipeObjectId ? { sourceRecipeObjectId: record.sourceRecipeObjectId } : {}),
+        ...(record.sourceClaudeThinkingBinding ? { sourceClaudeThinkingBinding: record.sourceClaudeThinkingBinding } : {}),
         contentObject: asContentObjectMetadata(record.contentObject),
         content: bufferView(record.content)
       })),
@@ -1097,10 +1199,20 @@ export class ContextSequenceControlPlane {
     const segmentId = stableSegmentId([{
       sourceKind: 'message_revision', sourceId: revisionId, sourceRevision: 0n
     }]);
-    const nodeId = contextSequenceNodeId(null, segmentId);
+    const now = this.timestamp();
+    const inheritedNodes: PlannedNode[] = [];
+    let parentNodeId: string | null = null;
+    let inheritedTokens = 0n;
+    for (const inherited of input.inheritedSegments ?? []) {
+      const inheritedId = requireId(inherited.segmentId, 'inheritedSegment.segmentId');
+      inheritedTokens += optionalEstimatedTokens(inherited.estimatedTokens)!;
+      const inheritedNodeId = contextSequenceNodeId(parentNodeId, inheritedId);
+      inheritedNodes.push({ id: inheritedNodeId, parentNodeId, segmentId: inheritedId, now });
+      parentNodeId = inheritedNodeId;
+    }
+    const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
     const rootId = stableId('context_root_append', conversationId, '<null>', nodeId);
     const headLinkId = stableId('conversation_context_head', conversationId);
-    const now = this.timestamp();
     return {
       rootId,
       headLinkId,
@@ -1112,15 +1224,15 @@ export class ContextSequenceControlPlane {
           contentObjectId,
           now
         }),
-        ...nodeInsertSteps([{ id: nodeId, parentNodeId: null, segmentId, now }], 'fresh_message_context_node'),
+        ...nodeInsertSteps([...inheritedNodes, { id: nodeId, parentNodeId, segmentId, now }], 'fresh_message_context_node'),
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: rootId,
           conversation_id: conversationId,
           root_node_id: nodeId,
           tail_node_id: null,
           tail_segment_count: 0n,
-          segment_count: 1n,
-          estimated_tokens: contentEstimatedTokens,
+          segment_count: BigInt(inheritedNodes.length) + 1n,
+          estimated_tokens: inheritedTokens + contentEstimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
         DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').insert({
@@ -1662,6 +1774,7 @@ export class ContextSequenceControlPlane {
     const expanded = await this.expandCompressionSegmentForTarget(
       requireId(summary.segment.id, 'ContextSegment.id'),
       targetSegmentId,
+      requireId(state.root.conversation_id, 'ContextSequenceRoot.conversation_id'),
       new Set()
     );
     if (!expanded.containsTarget) return null;
@@ -1680,6 +1793,7 @@ export class ContextSequenceControlPlane {
   private async expandCompressionSegmentForTarget(
     segmentId: string,
     targetSegmentId: string,
+    conversationId: string,
     path: ReadonlySet<string>
   ): Promise<CompressionExpansion> {
     const current = await this.readEditableSegment(segmentId);
@@ -1690,21 +1804,10 @@ export class ContextSequenceControlPlane {
       return { containsTarget: false, segments: [current], blocks: [] };
     }
     if (path.has(segmentId)) throw new Error(`Compression lineage cycle detected at ${segmentId}.`);
-    const sourceSnapshot = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-        where: {
-          segment_id: segmentId,
-          source_kind: 'compression_block',
-          source_revision: 0n
-        },
-        limit: 1
-      })
-    ]);
-    const source = rows(sourceSnapshot.snapshot[0])[0];
-    if (!source) throw new Error(`Compression segment ${segmentId} has no CompressionBlock source.`);
-    const blockId = requireId(source.source_id, 'ContextSegmentSource.source_id');
-    const block = await this.getOptional('CompressionBlock', blockId);
-    if (!block) throw new Error(`CompressionBlock ${blockId} does not exist.`);
+    // Edits inside a compressed range disable only this Conversation's own block over the
+    // shared summary segment, never the source's or another fork's block.
+    const block = await resolveConversationCompressionBlock(this.database, segmentId, conversationId);
+    const blockId = requireId(block.id, 'CompressionBlock.id');
     const sourceRows = await this.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('CompressionBlockSource').list({
         where: { compression_block_id: blockId },
@@ -1724,6 +1827,7 @@ export class ContextSequenceControlPlane {
     const children = await Promise.all(ordered.map((row) => this.expandCompressionSegmentForTarget(
       requireId(row.segment_id, 'CompressionBlockSource.segment_id'),
       targetSegmentId,
+      conversationId,
       nextPath
     )));
     if (!children.some((child) => child.containsTarget)) {

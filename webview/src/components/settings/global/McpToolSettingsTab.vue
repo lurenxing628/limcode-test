@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { IconChevronDown, IconPlus, IconRefresh, IconPencil, IconTrash } from '@tabler/icons-vue';
-import type { McpServerConfigRecord, McpServerTransportRecord, ToolDefinitionRecord, ToolPolicySourceConfigRecord } from '@shared/protocol';
+import type { McpServerConfigRecord, McpServerTransportRecord, ToolDefinitionRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
@@ -12,6 +12,7 @@ import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading'
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
+import { mcpSourceConfigFor, toolAllowedByPolicy } from '@shared/toolPolicyResolution';
 
 const settings = useGlobalSettingsStore();
 const clientState = useClientStateStore();
@@ -44,6 +45,10 @@ const mcpToolsBySource = computed(() => {
   return map;
 });
 const globalPolicy = computed(() => toolPolicyStore.effectivePolicyFor('global').policy);
+/** A hand-edited global list the backend refuses to compile; switches here would rewrite it. */
+const globalListInvalid = computed(() => !!toolPolicyStore.toolListErrorFor('global'));
+/** A hand-edited global source entry that turns its server off; a tool switch here rewrites it. */
+const globalSourceError = computed(() => toolPolicyStore.sourceConfigErrorFor('global'));
 const renameServer = computed(() => settings.mcpServers.servers.find((server) => server.id === renameServerId.value));
 const deleteServer = computed(() => settings.mcpServers.servers.find((server) => server.id === deleteServerId.value));
 const mcpBusy = computed(() => loading.value || settings.pendingSettingsSections.mcpServers === true || clientState.mcpToolSources.some((source) => source.status === 'connecting'));
@@ -135,41 +140,21 @@ function deleteServerConfirm(): void {
   if (server) settings.deleteMcpServer(server.id);
 }
 
-function cloneSourceConfigs(): Record<string, ToolPolicySourceConfigRecord> {
-  const result: Record<string, ToolPolicySourceConfigRecord> = {};
-  for (const [sourceId, record] of Object.entries(globalPolicy.value?.sourceConfigs ?? {})) {
-    result[sourceId] = {
-      enabled: record.enabled === true,
-      ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})
-    };
-  }
-  return result;
-}
-
 function isSourceGloballyEnabled(sourceId: string): boolean {
-  return globalPolicy.value?.sourceConfigs?.[sourceId]?.enabled === true;
+  return mcpSourceConfigFor(globalPolicy.value?.sourceConfigs, sourceId)?.enabled === true;
 }
 
 function isToolGloballyEnabled(tool: ToolDefinitionRecord): boolean {
-  if (globalPolicy.value?.allowedTools.includes(tool.name)) return true;
-  const sourceId = tool.source?.sourceId;
-  if (!sourceId || !isSourceGloballyEnabled(sourceId)) return false;
-  return !(globalPolicy.value?.sourceConfigs?.[sourceId]?.disabledTools ?? []).includes(tool.name);
+  return !!globalPolicy.value && toolAllowedByPolicy(globalPolicy.value, tool);
 }
 
+/**
+ * Turns exactly this tool on or off in the global source settings; the server's other tools keep
+ * what they show. No global list is written as a side effect.
+ */
 function setToolGlobalEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
-  const sourceId = tool.source?.sourceId;
-  if (!sourceId) return;
-  const next = cloneSourceConfigs();
-  const sourceConfig = next[sourceId] ?? { enabled: true, disabledTools: [] };
-  const disabled = new Set(sourceConfig.disabledTools ?? []);
-  if (enabled) disabled.delete(tool.name);
-  else disabled.add(tool.name);
-  next[sourceId] = { enabled: sourceConfig.enabled !== false, ...(disabled.size > 0 ? { disabledTools: [...disabled] } : {}) };
-  const allowedTools = enabled
-    ? globalPolicy.value?.allowedTools ?? []
-    : (globalPolicy.value?.allowedTools ?? []).filter((name) => name !== tool.name);
-  toolPolicyStore.setPolicyForScope('global', undefined, allowedTools, globalPolicy.value?.name, globalPolicy.value?.toolConfigs, next);
+  if (globalListInvalid.value || enabled === isToolGloballyEnabled(tool)) return;
+  toolPolicyStore.setMcpToolEnabledForScope('global', undefined, tool, enabled);
 }
 
 function sourceForServer(serverId: string) {
@@ -333,12 +318,15 @@ function toolParametersText(tool: ToolDefinitionRecord): string {
                 <span>工具列表</span>
                 <small>{{ toolsForServer(server.id).length }} 个工具，开关写入全局默认工具策略。</small>
               </header>
+              <p v-if="globalListInvalid" class="mcp-error" role="alert">全局保存的工具列表无效，重置前不能在这里修改工具开关；请到「工具」页用「继承默认」重置全局工具列表。</p>
+              <p v-if="globalSourceError?.sourceId === server.id" class="mcp-error" role="alert">全局保存的这个服务的来源设置无效，服务按关闭处理；在下方勾选工具，或到「工具」页重新勾选这个服务，即可改写为有效设置。</p>
               <p v-if="toolsForServer(server.id).length === 0" class="mcp-empty">连接成功，但没有发现工具。</p>
               <article v-for="tool in toolsForServer(server.id)" :key="tool.name" class="mcp-tool-item">
                 <div class="mcp-tool-row">
                   <LcCheckbox
                     class="mcp-tool-enable"
                     :model-value="isToolGloballyEnabled(tool)"
+                    :disabled="globalListInvalid"
                     @update:model-value="setToolGlobalEnabled(tool, $event)"
                   >
                     <span>

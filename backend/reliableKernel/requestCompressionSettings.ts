@@ -1,4 +1,5 @@
 import type { ChatModelOverrideRecord, LlmGenerationConfigRecord, LlmRequestBodyRecord } from '../../shared/protocol';
+import { DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, canonicalLlmProviderKind } from '../../shared/protocol';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import {
   frozenCompressionPolicy,
@@ -26,7 +27,7 @@ export interface RequestGenerationSettings {
 
 export interface CompressionSettingsAuthority {
   loadRequestGenerationSettings?(model: ChatModelOverrideRecord, conversationId: string): Promise<RequestGenerationSettings>;
-  loadRequestCompressionSettings(model: ChatModelOverrideRecord): Promise<RequestCompressionSettings>;
+  loadRequestCompressionSettings(model: ChatModelOverrideRecord, generationConfig?: LlmGenerationConfigRecord): Promise<RequestCompressionSettings>;
 }
 
 /** 单次请求可以独立选择压缩设置；空设置引用明确表示使用本轮原配置。 */
@@ -37,9 +38,10 @@ export function applyRequestCompressionSettings(
   if (record(settings) && Object.prototype.hasOwnProperty.call(settings, 'requestGeneration')) {
     const generation = settings.requestGeneration;
     if (!record(authority) || !record(authority.model) || !record(generation) || !record(generation.generationConfig)
-      || canonicalPlainJson(generation.model) !== canonicalPlainJson(frozenModelSelection(authority))) throw new Error('请求生成设置不能更换本轮模型。');
+      || !sameModelSelection(generation.model, authority)) throw new Error('请求生成设置不能更换本轮模型。');
     authority = normalizePlainJson({ ...authority, model: {
       ...authority.model, generationConfig: generation.generationConfig,
+      maxOutputTokens: generation.generationConfig.maxOutputTokens ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
       requestBody: generation.requestBody, thinkingControlledByBody: generation.thinkingControlledByBody,
       thinkingConfig: generation.generationConfig.thinkingConfig ?? {}
     } }, '请求生成设置');
@@ -49,7 +51,7 @@ export function applyRequestCompressionSettings(
   if (!record(authority) || !record(selected) || !record(selected.modelProfile) || !record(selected.compression)) {
     throw new TypeError('请求压缩设置不完整。');
   }
-  if (canonicalPlainJson(selected.model) !== canonicalPlainJson(frozenModelSelection(authority))) {
+  if (!sameModelSelection(selected.model, authority)) {
     throw new Error('请求压缩设置不能更换本轮的模型选择。');
   }
   const effective = normalizePlainJson({
@@ -91,6 +93,17 @@ export async function readRequestTurnAuthority(
   if (!settingsSnapshotContentObjectId) return frozen;
   const settings = await readRequestSettings(database, contentStore, settingsSnapshotContentObjectId);
   return { ...frozen, document: applyRequestCompressionSettings(frozen.document, settings) };
+}
+
+/**
+ * 两边都先规范化再比较：升级前冻结的请求设置快照里仍是原 DeepSeek 渠道类型（'deepseek'），
+ * 而 frozenModelSelection 已把它读作 OpenAI 兼容。
+ */
+function sameModelSelection(value: PlainJsonValue | undefined, authority: PlainJsonValue): boolean {
+  if (!record(value)) return false;
+  const provider = canonicalLlmProviderKind(value.provider);
+  const selection = provider ? { ...value, provider } : value;
+  return canonicalPlainJson(selection) === canonicalPlainJson(frozenModelSelection(authority));
 }
 
 function record(value: unknown): value is { [key: string]: PlainJsonValue } {

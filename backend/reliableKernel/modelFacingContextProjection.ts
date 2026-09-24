@@ -373,6 +373,19 @@ export function calculateCalibratedCompressionRooms(
   };
 }
 
+/**
+ * The text-summary limit handed to the summary writer. The retained tail reserves `summaryMaxTokens`
+ * of the body target in Provider units, but the summary is written, shortened and cut with the local
+ * estimator; handing it the same number let a summary take `ratio` times the room reserved for it.
+ */
+export function summaryTargetEstimatorTokens(
+  summaryMaxTokens: number,
+  calibration: ProviderTokenCalibration
+): number {
+  const reserved = nonNegativeTokenCount(summaryMaxTokens, 'summaryMaxTokens');
+  return reserved === 0 ? 0 : Math.max(1, calibrateProviderToEstimator(reserved, calibration));
+}
+
 /** Retained-tail allowance in local estimator tokens, after reserving the Provider summary budget. */
 export function calibratedTailBudgetTokens(
   rooms: CalibratedCompressionRooms,
@@ -774,21 +787,17 @@ export function stripNativeConfigurationUpdates(contents: readonly MessageConten
   return { contents: stripped, removedCount: updates.length, updates };
 }
 
-/** Scans durable stored Context items for configuration_update facts without altering them. */
+/**
+ * Scans durable stored Context items for configuration_update facts without altering them.
+ * A configuration_update is a provider item, so it can only sit inside stored MessageContent:
+ * message and compression segments. Tool pairs and Runtime Deliveries are rendered from kernel
+ * facts into function and text parts that never hold one; they are not projected here, since that
+ * would need the complete model handle catalog of the window.
+ */
 export function collectStoredNativeConfigurationUpdates(
   items: readonly StoredModelFacingContextItem[]
 ): NativeConfigurationUpdateFact[] {
-  const updates: NativeConfigurationUpdateFact[] = [];
-  for (const item of items) {
-    for (const content of storedContextItemContents(item, { entries: [] })) {
-      for (const part of content.parts) {
-        if (!isNativeConfigurationUpdatePart(part)) continue;
-        const effort = nativeConfigurationUpdateEffort(part);
-        updates.push(effort === undefined ? {} : { effort });
-      }
-    }
-  }
-  return updates;
+  return collectNativeConfigurationUpdates(items.flatMap((item) => storedMessageContents(item) ?? []));
 }
 
 /**
@@ -817,12 +826,66 @@ export function projectStoredModelFacingWindow(
     }
   );
   const contents: MessageContent[] = [];
+  const placements = createAttachmentPlacementQueue((content) => contents.push(content));
   items.forEach((item, index) => {
-    contents.push(...storedContextItemContents(item, modelHandleCatalog));
-    const placement = renderedState.afterSegment.get(segmentIds[index]);
-    if (placement) contents.push(placement);
+    const itemContents = storedContextItemContents(item, modelHandleCatalog);
+    const toolResults = item.segmentKind === 'tool_pair' && isToolResultContents(itemContents);
+    placements.enter(toolResults);
+    contents.push(...itemContents);
+    placements.leave(toolResults, renderedState.afterSegment.get(segmentIds[index]));
   });
+  placements.release();
   return projectOrdinaryModelWindow(contents, modelHandleCatalog);
+}
+
+/**
+ * Whether one Context item rendered as tool results only: a completed tool_pair renders one user
+ * content holding its function response. A native call occurrence renders a model content instead.
+ */
+export function isToolResultContents(contents: readonly MessageContent[]): boolean {
+  return contents.length > 0 && contents.every((content) =>
+    content.role === 'user'
+    && content.parts.length > 0
+    && content.parts.every((part) => 'functionResponse' in part));
+}
+
+/** See {@link createAttachmentPlacementQueue}. */
+export interface AttachmentPlacementQueue {
+  /** Before an item's contents: any item but a completed tool_pair ends the run of tool results. */
+  enter(toolResults: boolean): void;
+  /** After an item's contents: its frozen placement, held back while the item is part of a run of tool results. */
+  leave(toolResults: boolean, placement: MessageContent | undefined): void;
+  /** Emits every held placement; also called once after the last Context item. */
+  release(): void;
+}
+
+/**
+ * Emits the attachment catalog placement frozen after each Context item. A placement anchored on a
+ * completed tool_pair waits for the end of that run of consecutive tool results, so it never splits
+ * the results of one parallel call batch: Chat Completions rejects an assistant `tool_calls` message
+ * that is not followed by a `tool` message for each call, Gemini rejects a model turn whose function
+ * calls are not answered by as many function response parts (both live 400s for a catalog between
+ * two results), and Claude needs the tool_result blocks first in the next user message
+ * (https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls). Held placements
+ * keep their order and their rendered bytes; a placement after a lone tool result, or after any
+ * other item, lands exactly where it did before.
+ */
+export function createAttachmentPlacementQueue(emit: (content: MessageContent) => void): AttachmentPlacementQueue {
+  const held: MessageContent[] = [];
+  const release = (): void => {
+    for (const placement of held.splice(0)) emit(placement);
+  };
+  return {
+    enter(toolResults) {
+      if (!toolResults) release();
+    },
+    leave(toolResults, placement) {
+      if (!placement) return;
+      if (toolResults) held.push(placement);
+      else emit(placement);
+    },
+    release
+  };
 }
 
 /** Common ordinary/native model-visible representation: same items, same result previews. */
@@ -1061,6 +1124,16 @@ function storedContextItemContents(
       }];
     }
   }
+  const stored = storedMessageContents(item);
+  if (stored) return stored;
+  return [{
+    role: item.messageRole === 'model' ? 'model' : 'user',
+    parts: [{ text: contextText(item.content, item.contentType) }]
+  }];
+}
+
+/** MessageContent stored verbatim by message and compression segments; undefined for any other item. */
+function storedMessageContents(item: StoredModelFacingContextItem): MessageContent[] | undefined {
   if (item.contentType === 'application/vnd.limcode.compression-contents+json') {
     const envelope = parseRecord(item.content);
     if (envelope?.kind === 'compression_contents' && Array.isArray(envelope.contents)) {
@@ -1071,10 +1144,7 @@ function storedContextItemContents(
     const parsed = parseJson(item.content);
     if (isMessageContentValue(parsed)) return [cloneMessageContent(parsed)];
   }
-  return [{
-    role: item.messageRole === 'model' ? 'model' : 'user',
-    parts: [{ text: contextText(item.content, item.contentType) }]
-  }];
+  return undefined;
 }
 
 function splitStoredToolResponseAttachments(value: unknown): { value: unknown; parts: InlineDataPart[] } {
@@ -1341,7 +1411,7 @@ function toolResultSkeleton(
   originalTokens: number,
   digest: string
 ): Record<string, unknown> {
-  const facts = collectImportantFacts(input.response);
+  const facts = collectImportantFacts(input.response, input.toolName);
   return {
     kind: 'tool_result_preview',
     toolName: input.toolName,
@@ -1356,12 +1426,15 @@ function toolResultSkeleton(
   };
 }
 
-function collectImportantFacts(value: unknown): Record<string, unknown> {
+function collectImportantFacts(value: unknown, toolName = ''): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   const wanted = new Set([
     'status', 'error', 'exitCode', 'path', 'filePath', 'sourcePath',
-    'attachmentRef', 'processRef', 'cursor', 'nextCursor', 'childRef', 'workEnvironmentRef',
-    'count', 'total', 'changedFiles'
+    'attachmentRef', 'processRef', 'cursor', 'nextCursor', 'childRef', 'childRefs', 'workEnvironmentRef',
+    'conversationRef', 'sourceConversationRef', 'targetConversationRef', 'messageRef', 'afterMessageRef',
+    'nextAfterMessageRef', 'beforeMessageRef', 'olderMessageRef', 'view', 'replyToMessageRef', 'channelRef', 'threadRef', 'postRef',
+    'count', 'total', 'changedFiles',
+    'operation', 'scope', 'rereadCursor', 'offsetChars', 'nextOffsetChars'
   ]);
   const visit = (candidate: unknown, depth: number): void => {
     if (depth > 3 || !candidate || typeof candidate !== 'object') return;
@@ -1370,7 +1443,20 @@ function collectImportantFacts(value: unknown): Record<string, unknown> {
       return;
     }
     for (const [key, nested] of Object.entries(candidate as Record<string, unknown>)) {
-      if (wanted.has(key) && result[key] === undefined) result[key] = boundedScalar(nested);
+      if (wanted.has(key) && result[key] === undefined) {
+        // A page preview may lose body text under a shared Tool batch budget. Its restart cursor
+        // must survive byte-for-byte; nextCursor alone would skip the omitted part of this page.
+        if ((toolName === 'run_agent' || toolName === 'agent_board') && (key === 'rereadCursor' || key === 'nextCursor')
+          && typeof nested === 'string') {
+          if (nested.length > 4_096) throw new Error('Child task page cursor exceeds its model projection limit.');
+          result[key] = nested;
+        } else if (toolName === 'run_agent' && key === 'childRefs' && Array.isArray(nested)) {
+          if (nested.length > 32 || nested.some(ref => typeof ref !== 'string' || !/^A[1-9]\d*$/.test(ref))) {
+            throw new Error('Child wait result contains invalid model references.');
+          }
+          result[key] = [...nested];
+        } else result[key] = boundedScalar(nested);
+      }
       if (result[key] === undefined && depth < 3) visit(nested, depth + 1);
     }
   };
@@ -1530,6 +1616,8 @@ function toolResultPriority(value: unknown): ToolResultPriority {
     || facts.cursor !== undefined
     || facts.nextCursor !== undefined
     || facts.childRef !== undefined
+    || facts.conversationRef !== undefined || facts.messageRef !== undefined
+    || facts.channelRef !== undefined || facts.postRef !== undefined
     || facts.attachmentRef !== undefined
     || facts.path !== undefined
     || facts.filePath !== undefined

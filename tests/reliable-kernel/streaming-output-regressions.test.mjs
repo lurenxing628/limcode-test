@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { createServer } from 'vite';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 const root = process.cwd();
 const kernel = await import(pathToFileURL(path.join(
@@ -48,12 +48,7 @@ function emptyClientProjection() {
 }
 
 async function createWebviewTestServer() {
-  return createServer({
-    configFile: path.join(root, 'vite.config.ts'),
-    server: { middlewareMode: true },
-    appType: 'custom',
-    logLevel: 'error'
-  });
+  return createWebviewSsrServer();
 }
 
 test('detail load errors use bounded backoff, manual reset, and durable invalidation', async (context) => {

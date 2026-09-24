@@ -52,6 +52,11 @@ export interface LlmStartRequest {
    * 保持 pending-without-result；普通未决/孤儿/错配调用仍然失败。缺省 = 无例外。
    */
   nativeAsyncAdmittedCallIds?: readonly string[];
+  /**
+   * 这个对话已经选定的 Claude 保留思考处理（内核从窗口里模型输出所属请求的持久记录得出）：
+   * drop_block 每个请求都带 beta 头与 block_binding；strip_thinking 一直去掉历史思考块、不再放回。
+   */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 
 export interface LlmResolveInvocationRequest {
@@ -117,6 +122,14 @@ export interface LlmCompactRequest {
   /** Frozen snapshots are supplied only for exact replay/dry-run. */
   methodConfigSnapshot?: LlmCompressionConfigRecord;
   settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
+  /** Resolved native fields from the exact request authority; no model-name guessing during replay. */
+  summaryReasoning?: import('../../../../shared/modelCapabilities').ResolvedSummaryReasoning;
+  nativeGenerationConfig?: import('../../../../shared/protocol').LlmGenerationConfigRecord;
+  nativeRequestBody?: import('../../../../shared/protocol').LlmRequestBodyRecord;
+  /** Frozen source-conversation system instructions used by Provider-native compaction. */
+  systemInstruction?: MessageContent;
+  /** Frozen tool definitions; required by Provider-native compaction to preserve signed thinking. */
+  tools?: ToolSchema[];
   contents: MessageContent[];
   /** 分段总结：按回合切分的消息组（仅 segmented_summary 使用）。 */
   segments?: MessageContent[][];
@@ -125,6 +138,8 @@ export interface LlmCompactRequest {
   sourceHash?: string;
   attachmentObservationProfileSha256?: string;
   attachmentObservationRequirements?: LlmAttachmentObservationRequirement[];
+  /** 这个对话已经选定的 Claude 保留思考处理；Claude 原生压缩按它发送历史里的思考块。 */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 
 export interface LlmCompactDryRunCall extends LlmDryRunResult {

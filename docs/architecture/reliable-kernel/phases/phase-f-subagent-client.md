@@ -79,3 +79,15 @@ normal changes queue
 - snapshot→changes 不丢 commit，gap/unknown type/apply failure 转 snapshot-required；
 - history older/newer keyset pagination 无重复漏项；
 - candidate 对应 stable check ID 有真实 handler 与 evidence。
+
+
+## 同树通信与独立会话协作
+
+- 团队范围从稳定 ChildExecutionParentLink 推导，不另建成员 JSON 或团队所有权表。
+- CollaborationMessage 与 Source/Target/Payload/Reply Links 独立保存消息来源与目标；CollaborationRequest/RequestTurnLink 记录明确跟进任务及结果归属。团队工具不能寻址团队之外的会话；团队之外的顶层会话只能通过用户开启「跨对话协作」后下发的跨对话工具寻址，且只限发起会话所在项目（子 Agent 会话始终不可寻址），此外只有跟进任务结果回送原请求方；兄弟通信权不包含终止子树权。
+- 仅发送消息不启动空闲 Turn；明确跟进任务才允许启动。两者均复用 RuntimeInboxItem、RuntimeDelivery、InputLink 和持久 Wake，新的来源类型保留工具级权限，不伪装用户授权。
+- 正式 AnswerBridge/AnswerSubmission 仍投原父任务；请求发起方的结果使用独立回复关系，不改写稳定父边。
+- 留言板的 Channel/ScopeLink、Post/ChannelLink/SourceLink/ReplyLink、SubscriptionLink 与 CommandReceipt 独立持久化；只有运行中的订阅者接收通知，不因通知拉起空闲 Agent。
+- Client Feed 只投影当前会话参与、且从已加载轮次发出或投递进已加载轮次的消息（另含仍在等待或投递失败的收件，按序号最多 200 条）与独立关系，对方对话另作独立集合投影以显示侧栏标题；消息信封只带 320 字符以内的正文摘要，完整正文和留言板按授权查询。运行时续接预览保留 collaboration_message 来源和有界摘要，不当作用户输入。
+- 删除目标会话时，协作 pending Delivery 同事务 failed(target-gone)，未完成 Wake dead_letter；没有轮次会回答的 pending Request（投递全部失败、被确认为通知而没有开启轮次，或接收它的轮次随目标一起删除）由收敛标为 failed；跨对话 followup 先向请求方回复一次「Task could not start」或「Task ended without a result」，团队续派不回复。回复在删除前已经提交、只差结算时，收敛只补记结算：轮次写出的完成回复记为 completed，失败回复记为 failed，不再发第二条回复。历史 Message/Inbox 和另一会话已消费内容保留。删除留言板根或作者时先清理相关 Posts/Replies/Channels。
+- epoch 5 的 107 个领域必须与 authority crosswalk 完整匹配；旧 epoch 离线归档重置，当前代缺表或 metadata 漂移拒绝打开。

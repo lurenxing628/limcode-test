@@ -1,4 +1,4 @@
-﻿import assert from 'node:assert/strict';
+import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -480,16 +480,25 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     assert.ok(forkModelLink);
     assert.notEqual(forkModelLink.modelProfileId, sourceModelLink.modelProfileId);
     assert.equal(snapshot.modelProfiles.find((record) => record.id === forkModelLink.modelProfileId)?.model, 'model:test');
+    const forkLinks = (links) => links.filter((link) => link.scopeKind === 'conversation' && link.scopeId === 'conversation:fork');
+    // Every Conversation-layer value the source owns becomes the fork's own copy.
+    for (const [links, field] of [
+      [snapshot.systemPromptScopeLinks, 'systemPromptId'],
+      [snapshot.runtimeContextScopeLinks, 'runtimeContextId'],
+      [snapshot.workEnvironmentPolicyScopeLinks, 'workEnvironmentPolicyId']
+    ]) {
+      const source = links.find((link) => link.scopeKind === 'conversation' && link.scopeId === 'conversation:test');
+      assert.equal(forkLinks(links).length, 1);
+      assert.notEqual(forkLinks(links)[0][field], source[field]);
+    }
+    // Layers the source only inherits from workflow/global scopes stay inherited on the fork.
     for (const links of [
       snapshot.planReviewPolicyScopeLinks,
       snapshot.toolPolicyScopeLinks,
       snapshot.skillPolicyScopeLinks,
-      snapshot.systemPromptScopeLinks,
-      snapshot.runtimeContextScopeLinks,
-      snapshot.workEnvironmentPolicyScopeLinks,
       snapshot.checkpointPolicyScopeLinks
     ]) {
-      assert.equal(links.some((link) => link.scopeKind === 'conversation' && link.scopeId === 'conversation:fork'), false);
+      assert.deepEqual(forkLinks(links), []);
     }
 
     const forkCompiled = await authority.compile({
@@ -502,6 +511,8 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     const forkPreset = JSON.parse(forkCompiled.executionPreset.content);
     assert.equal(forkFrozen.model.modelId, 'model:test');
     assert.equal(forkFrozen.planReviewPolicy.mode, 'before_mutation');
+    assert.match(forkFrozen.systemPrompt.text, /\[对话规则\]\nCONVERSATION$/);
+    assert.equal(forkFrozen.runtimeContext.template, 'ENV:\n{{$workEnvironment.current}}');
     assert.equal(forkPreset.defaultWorkEnvironmentId, workEnvironmentId);
 
     await authority.mutations.setModelProfile({
@@ -615,7 +626,7 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
       scopeId: 'conversation:child-disjoint',
       template: 'ENV:\n{{$workEnvironment.current}}'
     });
-    const childDisjoint = JSON.parse((await authority.compile({
+    await assert.rejects(authority.compile({
       conversationId: 'conversation:child-disjoint',
       turnId: 'turn:child-disjoint',
       executorAgentId: agent.id,
@@ -625,21 +636,15 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
         allowedWorkEnvironmentIds: [remoteEnvironment.id],
         defaultWorkEnvironmentId: remoteEnvironment.id
       }
-    })).authoritySnapshot.content);
-    assert.deepEqual(childDisjoint.workEnvironmentPolicy.allowedWorkEnvironmentIds, []);
-    assert.equal(childDisjoint.workEnvironmentPolicy.defaultWorkEnvironmentId, null);
-    assert.doesNotMatch(childDisjoint.runtimeContext.text, /Remote Test/);
-    assert.doesNotMatch(childDisjoint.runtimeContext.text, /Workspace · 本地/);
+    }), /未获当前策略允许/);
 
-    // 不携带继承边界时保持现状：无策略会话可见全部可用环境。
-    const childUnbounded = JSON.parse((await authority.compile({
+    // Multiple candidates without a project, explicit selection or default require a choice.
+    await assert.rejects(authority.compile({
       conversationId: 'conversation:child-unbounded',
       turnId: 'turn:child-unbounded',
       executorAgentId: agent.id,
       intentKind: 'input'
-    })).authoritySnapshot.content);
-    assert.deepEqual(childUnbounded.workEnvironmentPolicy.allowedWorkEnvironmentIds,
-      [remoteEnvironment.id, workEnvironmentId].sort());
+    }), /多个工作环境/);
 
     const changedProvider = {
       ...provider,
@@ -838,6 +843,304 @@ test('VscodeConfigurationAuthority 让 Agent 缺省 preset 继承全局 YOLO，�
   }
 });
 
+test('未写允许列表的工具策略层不收窄上层，内置 Agent 与工作流仍用自己的工具列表', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-listless-tool-policy-'));
+  try {
+    const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+    const blueprints = createDefaultAgentBlueprints();
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Listless Provider' }),
+      id: 'provider:listless',
+      model: 'model:listless',
+      models: [{ id: 'model:listless', name: '模型' }],
+      modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const switchOn = { run_agent: { config: { crossConversationCollaboration: true } } };
+    const compile = async (executorAgentId, conversationId) => JSON.parse((await authority.compile({
+      conversationId, turnId: `turn:${conversationId}`, executorAgentId, intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+
+    // Global switch only: no global ceiling, so the main Agent keeps its whole default list
+    // (including tools the settings page lists as off by default).
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', toolConfigs: switchOn });
+    const main = await compile('main', 'conversation:main');
+    assert.deepEqual(main.allowedTools, [...blueprints.agents.main.toolPolicy.allowedTools].sort());
+    assert.ok(main.allowedTools.includes('transfer'));
+    assert.equal(main.toolConfigs.run_agent.config.crossConversationCollaboration, true);
+
+    // A switch-only Agent record keeps the built-in read-only list instead of replacing it.
+    await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: 'explore', toolConfigs: switchOn });
+    const explore = await compile('explore', 'conversation:explore');
+    assert.deepEqual(explore.allowedTools, [...blueprints.agents.explore.toolPolicy.allowedTools].sort());
+    for (const name of ['write', 'edit', 'delete', 'run_agent', 'send_conversation_message']) {
+      assert.equal(explore.allowedTools.includes(name), false, `${name} must stay out of the read-only Agent`);
+    }
+
+    await authority.mutations.setToolPolicy({ scopeKind: 'workflow', scopeId: 'builtin:readonly', toolConfigs: switchOn });
+    await authority.mutations.selectConversationWorkflow({ conversationId: 'conversation:readonly', scopeKind: 'workflow', workflowId: 'builtin:readonly' });
+    const readonly = await compile('main', 'conversation:readonly');
+    assert.deepEqual(readonly.allowedTools, [...blueprints.workflows.readonly.toolPolicy.allowedTools].sort());
+
+    // A saved list still narrows as before; a cross-conversation name in it is ignored, since the switch alone grants those tools.
+    await authority.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: 'conversation:main', allowedTools: ['read', 'list_conversations'] });
+    assert.deepEqual((await compile('main', 'conversation:main')).allowedTools, ['read']);
+
+    const client = await authority.configurationClientState();
+    const builtin = (scopeKind, scopeId) => client.builtinToolPolicies.find((record) => record.scopeKind === scopeKind && record.scopeId === scopeId);
+    assert.deepEqual(builtin('agent', 'explore').allowedTools, blueprints.agents.explore.toolPolicy.allowedTools);
+    assert.deepEqual(builtin('agent', 'main').allowedTools, blueprints.agents.main.toolPolicy.allowedTools);
+    assert.deepEqual(builtin('workflow', 'builtin:review').allowedTools, blueprints.workflows.review.toolPolicy.allowedTools);
+    assert.equal(builtin('workflow', 'builtin:plan'), undefined, 'a workflow without its own list narrows nothing');
+    assert.equal(client.toolPolicies.find((record) => record.id === client.toolPolicyScopeLinks.find((link) => link.scopeKind === 'global').toolPolicyId).allowedTools, undefined);
+    // The settings page shows MCP servers as the backend admits them only if the built-in records carry the same deny.
+    const { TOOL_POLICY_ALL_MCP_SOURCES } = require('../../dist/extension/shared/protocol.js');
+    for (const [scopeKind, scopeId] of [['agent', 'explore'], ['agent', 'reviewer'], ['workflow', 'builtin:readonly'], ['workflow', 'builtin:review']]) {
+      assert.deepEqual(builtin(scopeKind, scopeId).sourceConfigs, { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } }, `${scopeKind}:${scopeId} carries the all-sources deny`);
+    }
+    for (const scopeId of ['main', 'worker']) assert.equal(builtin('agent', scopeId).sourceConfigs, undefined, `${scopeId} keeps MCP servers`);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP 全来源拒绝只由内置只读范围携带，更具体的层不能重新开启，只有该层自己的来源设置能开启', () => {
+  const { toolAllowedByPolicy, toolPolicyScopeLayer } = require('../../dist/extension/shared/toolPolicyResolution.js');
+  const { TOOL_POLICY_ALL_MCP_SOURCES } = require('../../dist/extension/shared/protocol.js');
+  const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+  const blueprints = createDefaultAgentBlueprints();
+  const denyAll = { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } };
+  for (const policy of [blueprints.agents.explore, blueprints.agents.reviewer, blueprints.workflows.review, blueprints.workflows.readonly].map((item) => item.toolPolicy)) {
+    assert.deepEqual(policy.sourceConfigs, denyAll, `${policy.name} denies every MCP source`);
+  }
+  for (const policy of [blueprints.agents.main.toolPolicy, blueprints.agents.worker.toolPolicy]) assert.equal(policy.sourceConfigs, undefined);
+  const tool = (sourceId, name = `${sourceId}_tool`) => ({ name, source: { kind: 'mcp', sourceId, originalToolName: name.slice(sourceId.length + 1) } });
+  const builtin = blueprints.agents.explore.toolPolicy;
+  const resolve = (...layers) => resolveToolPolicyLayers(layers.filter(Boolean), []);
+  const global = { scopeKind: 'global', policy: { sourceConfigs: { exa: { enabled: true } } } };
+
+  const readonly = resolve(global, toolPolicyScopeLayer('agent', undefined, builtin),
+    { scopeKind: 'conversation', policy: { allowedTools: ['third_tool', 'read'], sourceConfigs: { exa: { enabled: true }, other: { enabled: true } } } });
+  assert.equal(toolAllowedByPolicy(readonly, tool('exa')), false, 'a server enabled globally never reaches the read-only Agent');
+  assert.equal(toolAllowedByPolicy(readonly, tool('other')), false, 'a conversation below it cannot re-enable a source');
+  assert.equal(toolAllowedByPolicy(readonly, tool('third')), false, 'naming an MCP tool in a list below it does not opt in either');
+  assert.equal(toolAllowedByPolicy(readonly, { name: 'read' }), true);
+
+  const listless = resolve(global, toolPolicyScopeLayer('agent', { toolConfigs: { run_agent: { config: { crossConversationCollaboration: true } } } }, builtin));
+  assert.equal(toolAllowedByPolicy(listless, tool('exa')), false, 'a list-less record at the scope keeps the restriction');
+  assert.deepEqual(listless.allowedTools, [...builtin.allowedTools].sort());
+
+  // A source no layer configures falls back to the all-sources deny, even when the scope's own list names its tool.
+  const listed = resolve(global, toolPolicyScopeLayer('agent', { allowedTools: ['read', 'third_tool'] }, builtin));
+  assert.ok(listed.allowedTools.includes('third_tool'));
+  assert.equal(toolAllowedByPolicy(listed, tool('third')), false, 'the deny, not the list, decides an unconfigured source');
+  assert.equal(toolAllowedByPolicy({ allowedTools: ['third_tool'], sourceConfigs: denyAll }, tool('third')), false);
+  assert.equal(toolAllowedByPolicy({ allowedTools: ['third_tool'], sourceConfigs: {} }, tool('third')), false, 'without a source setting the list admits no MCP tool either');
+  assert.equal(toolAllowedByPolicy({ allowedTools: [], sourceConfigs: { third: { enabled: true } } }, tool('third')), true);
+  assert.equal(toolAllowedByPolicy({ allowedTools: [], sourceConfigs: { third: { enabled: true } } }, { name: 'third_tool', source: { kind: 'mcp', sourceId: 'third' } }), false,
+    'an MCP tool without its original name has no identity and fails closed');
+
+  // Only an absent list keeps the built-in list; any other stored value fails closed at a built-in scope too.
+  for (const malformed of [null, '', 0, false, 'read']) {
+    assert.throws(() => resolve(global, toolPolicyScopeLayer('agent', { allowedTools: malformed }, builtin)), /allowedTools/, `${JSON.stringify(malformed)} at a built-in scope`);
+  }
+
+  const optedIn = resolve(global, toolPolicyScopeLayer('agent', { sourceConfigs: { exa: { enabled: true }, other: { enabled: true, disabledTools: ['hidden'] } } }, builtin));
+  assert.equal(toolAllowedByPolicy(optedIn, tool('exa')), true, 'the scope enables its own source');
+  assert.equal(toolAllowedByPolicy(optedIn, tool('other')), true);
+  assert.equal(toolAllowedByPolicy(optedIn, tool('other', 'other_hidden')), false);
+  assert.equal(toolAllowedByPolicy(optedIn, tool('unnamed')), false, 'a source the scope does not enable stays denied');
+
+  const ordinary = resolve(global, { scopeKind: 'conversation', policy: { allowedTools: ['read'] } });
+  assert.equal(toolAllowedByPolicy(ordinary, tool('exa')), true, 'an ordinary list keeps globally enabled MCP servers');
+  assert.equal(toolAllowedByPolicy(resolve({ scopeKind: 'global', policy: { sourceConfigs: { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: true } } } }), tool('exa')), false,
+    'an all-sources entry never enables anything');
+});
+
+test('内置只读范围的全来源拒绝不被该范围保存的全来源值覆盖；保存的全来源值不是对象时按拒绝处理', async () => {
+  const { toolAllowedByPolicy, toolPolicyScopeLayer } = require('../../dist/extension/shared/toolPolicyResolution.js');
+  const { TOOL_POLICY_ALL_MCP_SOURCES: ALL } = require('../../dist/extension/shared/protocol.js');
+  const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+  const blueprints = createDefaultAgentBlueprints();
+  const tool = (sourceId) => ({ name: `${sourceId}_tool`, source: { kind: 'mcp', sourceId, originalToolName: 'tool' } });
+  const resolve = (...layers) => resolveToolPolicyLayers(layers.filter(Boolean), []);
+  const global = { scopeKind: 'global', policy: { sourceConfigs: { exa: { enabled: true } } } };
+  const savedValues = [{ enabled: true }, null, 'x', [], 1];
+  for (const [scopeKind, builtin] of [['agent', blueprints.agents.explore.toolPolicy], ['workflow', blueprints.workflows.readonly.toolPolicy]]) {
+    for (const value of savedValues) {
+      const saved = { sourceConfigs: { [ALL]: value, other: { enabled: true } } };
+      const policy = resolve(global, toolPolicyScopeLayer(scopeKind, saved, builtin));
+      assert.equal(toolAllowedByPolicy(policy, tool('exa')), false, `${scopeKind} saved '*' ${JSON.stringify(value)} keeps the built-in deny`);
+      assert.equal(toolAllowedByPolicy(policy, tool('other')), true, 'the scope still opts in the source it names');
+    }
+  }
+  // At a scope without a built-in deny, a stored '*' that is not an object denies every source instead of being skipped.
+  for (const value of savedValues.slice(1)) {
+    const policy = resolve(global, { scopeKind: 'conversation', policy: { sourceConfigs: { [ALL]: value } } });
+    assert.equal(toolAllowedByPolicy(policy, tool('exa')), false, `conversation saved '*' ${JSON.stringify(value)} fails closed`);
+    assert.deepEqual(policy.sourceConfigs[ALL], { enabled: false });
+  }
+
+  // The same through saved records and the Turn compile, as a hand edit writes them (saves refuse such values).
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-readonly-mcp-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    /** Saves a record for the scope, then hand-edits its source settings in the record file. */
+    const handEditSourceConfigs = async (scopeKind, scopeId, sourceConfigs) => {
+      await authority.mutations.setToolPolicy({ scopeKind, scopeId, sourceConfigs: {} });
+      const state = await authority.configurationClientState();
+      const policyId = state.toolPolicyScopeLinks.find((link) => link.scopeKind === scopeKind && link.scopeId === scopeId).toolPolicyId;
+      const recordsRoot = path.join(paths.toolPoliciesRootPath, 'records');
+      for (const file of await fs.readdir(recordsRoot)) {
+        const saved = JSON.parse(await fs.readFile(path.join(recordsRoot, file), 'utf8'));
+        if (saved.toolPolicy?.id !== policyId) continue;
+        await fs.writeFile(path.join(recordsRoot, file), JSON.stringify({ ...saved, toolPolicy: { ...saved.toolPolicy, sourceConfigs } }));
+        return;
+      }
+      assert.fail(`no record file for ${policyId}`);
+    };
+    const provider = { ...createDefaultLlmProviderConfig({ name: 'Readonly MCP Provider' }), id: 'provider:readonly-mcp',
+      model: 'model:readonly-mcp', models: [{ id: 'model:readonly-mcp', name: '模型' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    await authority.mutations.selectConversationWorkflow({ conversationId: 'conversation:readonly', scopeKind: 'workflow', workflowId: 'builtin:readonly' });
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', sourceConfigs: { exa: { enabled: true } } });
+    let turn = 0;
+    const compile = async (executorAgentId, conversationId) => JSON.parse((await authority.compile({
+      conversationId, turnId: `turn:${conversationId}:${turn++}`, executorAgentId, intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+    for (const value of savedValues) {
+      await handEditSourceConfigs('agent', 'explore', { [ALL]: value });
+      await handEditSourceConfigs('workflow', 'builtin:readonly', { [ALL]: value });
+      assert.equal(toolAllowedByPolicy(await compile('explore', 'conversation:explore'), tool('exa')), false, `Explore saved '*' ${JSON.stringify(value)}`);
+      assert.equal(toolAllowedByPolicy(await compile('main', 'conversation:readonly'), tool('exa')), false, `readonly workflow saved '*' ${JSON.stringify(value)}`);
+    }
+    await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: 'explore', sourceConfigs: { exa: { enabled: true } } });
+    assert.equal(toolAllowedByPolicy(await compile('explore', 'conversation:explore'), tool('exa')), true, 'naming the real source id still opts in');
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('整条链都没有工具列表时以默认工具集为底，自定义 Agent 不会没有工具；存储的非法列表拒绝编译', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-default-tool-set-'));
+  try {
+    const { createBuiltinToolDefinitions } = require('../../dist/extension/backend/world/modules/tools/definitions/index.js');
+    const { createDefaultAgentBlueprints } = require('../../dist/extension/backend/world/modules/agent/blueprints.js');
+    const command = { toolName: process.platform === 'win32' ? 'shell' : 'bash', description: 'Synthetic shell.' };
+    const builtinDefinitions = createBuiltinToolDefinitions({ command }).map((definition) => definition.declaration);
+    // The one definition of the default tool set, as the settings page computes it from the same catalog.
+    const { CROSS_CONVERSATION_TOOL_NAMES } = require('../../dist/extension/shared/protocol.js');
+    const defaultToolSet = builtinDefinitions
+      .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false && !CROSS_CONVERSATION_TOOL_NAMES.includes(tool.name))
+      .map((tool) => tool.name).sort();
+    assert.ok(defaultToolSet.includes('run_agent'));
+    assert.equal(defaultToolSet.includes('send_conversation_message'), false, 'the switch, not the default set, grants the cross-conversation tools');
+    assert.equal(defaultToolSet.includes('transfer'), false, 'tools that are off by default stay out of the default set');
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Default Tool Set Provider' }),
+      id: 'provider:default-tool-set',
+      model: 'model:default-tool-set',
+      models: [{ id: 'model:default-tool-set', name: '模型' }],
+      modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const custom = await authority.mutations.createAgent({ name: '自定义', kind: 'custom' });
+    let turn = 0;
+    const compile = async (executorAgentId, conversationId) => JSON.parse((await authority.compile({
+      conversationId, turnId: `turn:${conversationId}:${turn++}`, executorAgentId, intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+
+    assert.deepEqual((await compile(custom.id, 'conversation:custom')).allowedTools, defaultToolSet,
+      'a custom Agent with nothing saved gets the default tool set');
+    const switchOn = { run_agent: { config: { crossConversationCollaboration: true } } };
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', toolConfigs: switchOn });
+    const withSwitch = await compile(custom.id, 'conversation:custom');
+    assert.deepEqual(withSwitch.allowedTools, defaultToolSet, 'a list-less global record written by the switch narrows nothing');
+    assert.equal(withSwitch.toolConfigs.run_agent.config.crossConversationCollaboration, true);
+    await authority.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: custom.id, toolConfigs: switchOn });
+    assert.deepEqual((await compile(custom.id, 'conversation:custom')).allowedTools, defaultToolSet);
+    const blueprints = createDefaultAgentBlueprints();
+    assert.deepEqual((await compile('main', 'conversation:main')).allowedTools, [...blueprints.agents.main.toolPolicy.allowedTools].sort(),
+      'the built-in main Agent keeps its own list, including tools that are off by default');
+
+    // A hand-edited record whose list is neither absent nor an array of names fails closed.
+    const recordsRoot = path.join(paths.toolPoliciesRootPath, 'records');
+    const recordFiles = await fs.readdir(recordsRoot);
+    const globalFile = [];
+    for (const file of recordFiles) {
+      const saved = JSON.parse(await fs.readFile(path.join(recordsRoot, file), 'utf8'));
+      if (saved.toolPolicy?.id === 'tool-policy:global:global') globalFile.push(path.join(recordsRoot, file));
+    }
+    assert.equal(globalFile.length, 1);
+    const original = JSON.parse(await fs.readFile(globalFile[0], 'utf8'));
+    for (const malformed of [null, '', 'read', [1], { read: true }]) {
+      await fs.writeFile(globalFile[0], JSON.stringify({ ...original, toolPolicy: { ...original.toolPolicy, allowedTools: malformed } }));
+      await assert.rejects(compile(custom.id, 'conversation:custom'), /allowedTools/, `stored allowedTools ${JSON.stringify(malformed)} must fail closed`);
+      await assert.rejects(compile('main', 'conversation:main'), /allowedTools/);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('写坏的来源设置让该 MCP 服务按关闭处理而不让编译失败；保存时拒绝并指出字段', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-configuration-malformed-source-'));
+  try {
+    const { toolAllowedByPolicy } = require('../../dist/extension/shared/toolPolicyResolution.js');
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Malformed Source Provider' }),
+      id: 'provider:malformed-source', model: 'model:malformed-source',
+      models: [{ id: 'model:malformed-source', name: '模型' }], modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    let turn = 0;
+    const compile = async () => JSON.parse((await authority.compile({
+      conversationId: 'conversation:main', turnId: `turn:malformed:${turn++}`, executorAgentId: 'main', intentKind: 'input'
+    })).authoritySnapshot.content).toolPolicy;
+    const tool = (sourceId, original) => ({ name: `${sourceId}_${original}`, source: { kind: 'mcp', sourceId, originalToolName: original } });
+
+    // A save never stores such a value, and the error names the field.
+    for (const [sourceConfigs, message] of [
+      [{ gh: { enabled: true, disabledTools: 'gh_delete_file' } }, /sourceConfigs\.gh\.disabledTools 必须是工具名数组/],
+      [{ gh: { enabled: true, enabledTools: [1] } }, /sourceConfigs\.gh\.enabledTools 必须是工具名数组/],
+      [{ gh: { enabled: 'yes' } }, /sourceConfigs\.gh\.enabled 必须是 true 或 false/],
+      [{ gh: 5 }, /sourceConfigs\.gh 必须是对象/],
+      [{ '*': 'x' }, /sourceConfigs\.\* 必须是对象/]
+    ]) {
+      await assert.rejects(authority.mutations.setToolPolicy({ scopeKind: 'workflow', scopeId: 'wf', sourceConfigs }), message, JSON.stringify(sourceConfigs));
+    }
+    assert.equal((await authority.configurationClientState()).toolPolicyScopeLinks.some((link) => link.scopeKind === 'workflow'), false);
+
+    // A hand-edited record: the source turns off, the Turn still compiles, and other sources keep working.
+    await authority.mutations.setToolPolicy({ scopeKind: 'global', sourceConfigs: { gh: { enabled: true }, exa: { enabled: true } } });
+    const recordsRoot = path.join(paths.toolPoliciesRootPath, 'records');
+    const [file] = (await fs.readdir(recordsRoot)).map((name) => path.join(recordsRoot, name));
+    const original = JSON.parse(await fs.readFile(file, 'utf8'));
+    for (const [field, malformed] of [['disabledTools', 'gh_delete_file'], ['disabledTools', 5], ['disabledTools', {}], ['disabledTools', [1]], ['disabledTools', null], ['enabledTools', 'search']]) {
+      await fs.writeFile(file, JSON.stringify({ ...original, toolPolicy: { ...original.toolPolicy,
+        sourceConfigs: { ...original.toolPolicy.sourceConfigs, gh: { enabled: true, [field]: malformed } } } }));
+      const policy = await compile();
+      const what = `${field}=${JSON.stringify(malformed)}`;
+      assert.equal(toolAllowedByPolicy(policy, tool('gh', 'delete_file')), false, what);
+      assert.equal(toolAllowedByPolicy(policy, tool('gh', 'search')), false, `${what}: the whole source is off`);
+      assert.equal(toolAllowedByPolicy(policy, tool('exa', 'search')), true);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('Ask/Plan 自动审批通过原有工具策略落盘、继承并允许局部关闭', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-auto-approval-settings-'));
   try {
@@ -957,20 +1260,17 @@ test('多个Host共享WorkEnvironment存储时只在本地投影当前Workspace�
     const secondSnapshot = await secondAuthority.configurationClientState();
     const secondPolicy = secondSnapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
     assert.equal(secondPolicy?.enabled, false);
-    // workspaceIds (secondId) always prepended to projected allowed
-    assert.deepEqual(secondPolicy?.allowedWorkEnvironmentIds, [secondId, firstId]);
-    assert.equal(secondPolicy?.defaultWorkEnvironmentId, secondId);
+    assert.deepEqual(secondPolicy?.allowedWorkEnvironmentIds, [firstId]);
+    assert.equal(secondPolicy?.defaultWorkEnvironmentId, firstId);
     assert.equal(secondSnapshot.workEnvironments.find((record) => record.id === firstId)?.available, false);
     assert.equal(secondSnapshot.workEnvironments.find((record) => record.id === secondId)?.available, true);
 
-    const secondFrozen = JSON.parse((await secondAuthority.compile({
+    await assert.rejects(secondAuthority.compile({
       conversationId: 'conversation:second-workspace',
       turnId: 'turn:second-workspace',
       executorAgentId: 'main',
       intentKind: 'input'
-    })).authoritySnapshot.content);
-    assert.deepEqual(secondFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [secondId]);
-    assert.equal(secondFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, secondId);
+    }), /当前窗口的工作环境不可用/);
 
     const manualId = 'work-environment:shared-remote';
     await firstAuthority.mutations.upsertWorkEnvironment({
@@ -991,10 +1291,8 @@ test('多个Host共享WorkEnvironment存储时只在本地投影当前Workspace�
     });
     const manualSnapshot = await secondAuthority.configurationClientState();
     const manualPolicy = manualSnapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
-    // workspaceIds (secondId) always prepended to projected allowed
-    assert.deepEqual(manualPolicy?.allowedWorkEnvironmentIds, [secondId, manualId]);
-    // projected default prefers this Host's workspace folder over stored default
-    assert.equal(manualPolicy?.defaultWorkEnvironmentId, secondId);
+    assert.deepEqual(manualPolicy?.allowedWorkEnvironmentIds, [manualId]);
+    assert.equal(manualPolicy?.defaultWorkEnvironmentId, manualId);
     assert.equal(manualSnapshot.workEnvironments.find((record) => record.id === manualId)?.available, true);
 
     const manualFrozen = JSON.parse((await secondAuthority.compile({
@@ -1003,10 +1301,8 @@ test('多个Host共享WorkEnvironment存储时只在本地投影当前Workspace�
       executorAgentId: 'main',
       intentKind: 'input'
     })).authoritySnapshot.content);
-    // compile inherits projected allowed with workspace folder prepended
-    assert.deepEqual(manualFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [secondId, manualId]);
-    // compile default = projected default (workspace folder)
-    assert.equal(manualFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, secondId);
+    assert.deepEqual(manualFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [manualId]);
+    assert.equal(manualFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, manualId);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -1318,7 +1614,7 @@ function createVscodeStub() {
   };
 }
 
-test('投影层始终并入当前 Host workspace folder 并优先作为 projected default', async () => {
+test('Host 投影保留用户 allow-list 与 remote default，不自动授权本地目录', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-projection-default-'));
   try {
     const paths = createVscodeStoragePaths(vscode.Uri.file(root));
@@ -1344,14 +1640,14 @@ test('投影层始终并入当前 Host workspace folder 并优先作为 projecte
       (record) => record.id === 'work-environment-policy:global:global'
     );
     assert.ok(policy, 'global policy should exist');
-    assert.deepEqual(policy.allowedWorkEnvironmentIds, [localId, remoteId]);
-    assert.equal(policy.defaultWorkEnvironmentId, localId);
+    assert.deepEqual(policy.allowedWorkEnvironmentIds, [remoteId]);
+    assert.equal(policy.defaultWorkEnvironmentId, remoteId);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 });
 
-test('多 Host 投影：不同窗口各自以自己的 folder 为 projected default 且不污染共享策略库', async () => {
+test('多 Host 投影仅改变目录可用性，不改变共享策略默认与授权', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-multi-host-default-'));
   try {
     const paths = createVscodeStoragePaths(vscode.Uri.file(root));
@@ -1382,15 +1678,15 @@ test('多 Host 投影：不同窗口各自以自己的 folder 为 projected defa
     const policyA = snapA.workEnvironmentPolicies.find(
       (record) => record.id === 'work-environment-policy:global:global'
     );
-    assert.deepEqual(policyA.allowedWorkEnvironmentIds, [idA, remoteId]);
-    assert.equal(policyA.defaultWorkEnvironmentId, idA);
+    assert.deepEqual(policyA.allowedWorkEnvironmentIds, [remoteId]);
+    assert.equal(policyA.defaultWorkEnvironmentId, remoteId);
 
     const snapB = await authB.configurationClientState();
     const policyB = snapB.workEnvironmentPolicies.find(
       (record) => record.id === 'work-environment-policy:global:global'
     );
-    assert.deepEqual(policyB.allowedWorkEnvironmentIds, [idB, remoteId]);
-    assert.equal(policyB.defaultWorkEnvironmentId, idB);
+    assert.deepEqual(policyB.allowedWorkEnvironmentIds, [remoteId]);
+    assert.equal(policyB.defaultWorkEnvironmentId, remoteId);
 
     const storedPolicies = await loadRecordStore(
       paths.workEnvironmentPoliciesRootUri,
@@ -1405,4 +1701,84 @@ test('多 Host 投影：不同窗口各自以自己的 folder 为 projected defa
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test('A+B 会话绑定 B 冻结首个相对工具根；显式 remote 和子继承优先，失效不落 A', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-workspace-selection-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const folders = ['A', 'B'].map((name, index) => {
+      const rootPath = path.join(root, name);
+      return { uri: vscode.Uri.file(rootPath).toString(), rootPath, name, index };
+    });
+    const [a, b] = folders.map(folder => workEnvironmentIdFromUri(folder.uri));
+    const provider = { ...createDefaultLlmProviderConfig(), id: 'provider:workspace-choice', model: 'fixture', models: [{ id: 'fixture', name: 'fixture' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    await authority.synchronizeWorkspaceFolders(folders);
+    const compile = (conversationId, extra = {}) => authority.compile({ conversationId, turnId: `turn:${conversationId}`, executorAgentId: 'main', intentKind: 'input', ...extra });
+    const policyOf = result => JSON.parse(result.authoritySnapshot.content).workEnvironmentPolicy;
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: false, allowedWorkEnvironmentIds: [a, b], defaultWorkEnvironmentId: a });
+    const boundB = { workspace: { uri: folders[1].uri, name: 'B' } };
+    const frozenB = policyOf(await compile('bound-b', boundB));
+    assert.equal(frozenB.defaultWorkEnvironmentId, b);
+    const { resolveFrozenWorkEnvironmentBoundary } = require('../../dist/extension/backend/reliableKernel/workEnvironmentBoundary.js');
+    const { resolvePathInsideBoundary } = require('../../dist/extension/backend/reliableKernel/localFileToolPlanner.js');
+    await fs.mkdir(folders[1].rootPath, { recursive: true });
+    await fs.writeFile(path.join(folders[1].rootPath, 'first.txt'), 'B');
+    const active = resolveFrozenWorkEnvironmentBoundary(frozenB, await authority.workEnvironments()).active;
+    assert.equal((await resolvePathInsideBoundary(active.id, active.rootPath, 'first.txt')).absolutePath, path.join(folders[1].rootPath, 'first.txt'));
+
+    const remote = await authority.mutations.upsertWorkEnvironment(createRemoteServerWorkEnvironmentRecord({ id: 'remote:explicit', name: 'Remote', host: 'example.invalid' }));
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true, allowedWorkEnvironmentIds: [a, b, remote.id], defaultWorkEnvironmentId: a });
+    await authority.mutations.selectConversationWorkEnvironment('explicit', remote.id);
+    assert.equal(policyOf(await compile('explicit', boundB)).defaultWorkEnvironmentId, remote.id);
+    assert.equal(policyOf(await compile('child', { ...boundB, inheritedWorkEnvironmentPolicy: { enabled: true, allowedWorkEnvironmentIds: [a, b, remote.id], defaultWorkEnvironmentId: remote.id } })).defaultWorkEnvironmentId, remote.id);
+
+    // A folder event and a newly admitted Turn share one queue, including reordering and removal.
+    const reordered = authority.synchronizeWorkspaceFolders([{ ...folders[1], index: 0 }, { ...folders[0], index: 1 }]);
+    const pendingTurn = compile('after-reorder', boundB);
+    await reordered;
+    assert.equal(policyOf(await pendingTurn).defaultWorkEnvironmentId, b);
+    await authority.synchronizeWorkspaceFolders([folders[0]]);
+    await assert.rejects(compile('removed-b', boundB), /不可用/);
+    assert.throws(() => resolveFrozenWorkEnvironmentBoundary(frozenB, [
+      { ...(active), available: false }, { ...(active), id: a, rootPath: folders[0].rootPath, available: true }
+    ]), /冻结的工作环境已不可用/);
+
+    await authority.synchronizeWorkspaceFolders(folders);
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: false, allowedWorkEnvironmentIds: [a], defaultWorkEnvironmentId: a });
+    await assert.rejects(compile('denied-b', boundB), /未获当前策略允许/);
+    await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true, allowedWorkEnvironmentIds: [a, b] });
+    const saved = (await authority.configurationClientState()).workEnvironmentPolicies[0];
+    assert.equal(saved.defaultWorkEnvironmentId, undefined);
+    await assert.rejects(compile('needs-choice'), /多个工作环境/);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('Host 本地移除与同步失败隔离：其他 Host 不被禁用，后续同步恢复且失败不猜根', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-folder-sync-fence-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const one = new VscodeConfigurationAuthority(() => paths);
+    const two = new VscodeConfigurationAuthority(() => paths);
+    const folder = { uri: vscode.Uri.file(path.join(root, 'B')).toString(), name: 'B', rootPath: path.join(root, 'B'), index: 0 };
+    const id = workEnvironmentIdFromUri(folder.uri);
+    await one.synchronizeWorkspaceFolders([folder]);
+    await two.synchronizeWorkspaceFolders([folder]);
+    await one.synchronizeWorkspaceFolders([]);
+    assert.equal((await one.workEnvironments()).find(record => record.id === id).available, false);
+    assert.equal((await two.workEnvironments()).find(record => record.id === id).available, true);
+    assert.equal((await loadRecordStore(paths.workEnvironmentsRootUri, paths.workEnvironmentsIndexUri, 'workEnvironment')).find(record => record.id === id).available, true);
+
+    const synchronize = one.mutations.synchronizeWorkspaceFolders.bind(one.mutations);
+    one.mutations.synchronizeWorkspaceFolders = async () => { throw new Error('injected synchronization failure'); };
+    await assert.rejects(one.synchronizeWorkspaceFolders([folder]), /injected synchronization failure/);
+    await assert.rejects(one.compile({ conversationId: 'blocked', turnId: 'turn:blocked', executorAgentId: 'main', intentKind: 'input' }), /injected synchronization failure/);
+    await assert.rejects(one.configurationClientState(), /injected synchronization failure/);
+    one.mutations.synchronizeWorkspaceFolders = synchronize;
+    await one.synchronizeWorkspaceFolders([folder]);
+    assert.equal((await one.workEnvironments()).find(record => record.id === id).available, true);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

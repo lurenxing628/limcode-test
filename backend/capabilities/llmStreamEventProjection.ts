@@ -10,7 +10,8 @@ import type {
   ContentPart,
   LlmUsageMetadataRecord,
   MessageContent,
-  ModelOutputItemReference
+  ModelOutputItemReference,
+  ProviderContextPart
 } from '../../shared/protocol';
 import type { Emit } from './types';
 
@@ -56,9 +57,57 @@ export function fromUnifiedCompletedContent(
         ...(receivedAsync ? { async: true } : {}),
         ...(outputItem ? { outputItem } : {})
       });
+      continue;
     }
+    // 不透明的 provider 项（如 Responses 普通回复里的服务端 compaction 项）原位保留，随回复存入历史并原样回放。
+    const providerContext = unifiedProviderContextOf(part);
+    if (providerContext) parts.push({ providerContext, ...(outputItem ? { outputItem } : {}) });
   }
   return { role: 'model', parts };
+}
+
+/**
+ * The opaque provider item of a unified part: today the Responses `compaction` output item of an
+ * ordinary reply made with `context_management`, which later requests append as usual
+ * (https://developers.openai.com/api/docs/guides/compaction).
+ */
+function unifiedProviderContextOf(part: unknown): ProviderContextPart['providerContext'] | undefined {
+  if (!isRecord(part) || !isRecord(part.providerContext)) return undefined;
+  const context = part.providerContext;
+  return typeof context.provider === 'string' && typeof context.format === 'string'
+    ? context as unknown as ProviderContextPart['providerContext']
+    : undefined;
+}
+
+/**
+ * Provider items travel as `OutputItemDone { part: { providerContext } }`; the reliable adapter
+ * appends them to the completed reply in event order and drops repeats of the same item.
+ */
+function emitProviderContextParts(
+  requestId: string,
+  parts: readonly unknown[],
+  emit: Emit,
+  nativeChain?: OpenAIResponsesNativeChainContext
+): void {
+  for (const part of parts) {
+    const providerContext = unifiedProviderContextOf(part);
+    if (!providerContext) continue;
+    const outputItem = stampNativeResponse(modelOutputItemFromValue(part), nativeChain);
+    emit({
+      type: LlmEventType.OutputItemDone,
+      payload: { requestId, ...(outputItem ? { outputItem } : {}), part: { providerContext } }
+    });
+  }
+}
+
+/** Splits a chunk's provider items into those before its first other part and the rest, keeping stream order. */
+function splitProviderContextParts(parts: readonly UnifiedPart[]): { leading: UnifiedPart[]; trailing: UnifiedPart[] } {
+  const firstOther = parts.findIndex((part) => !unifiedProviderContextOf(part));
+  const cut = firstOther < 0 ? parts.length : firstOther;
+  return {
+    leading: parts.slice(0, cut).filter((part) => !!unifiedProviderContextOf(part)),
+    trailing: parts.slice(cut).filter((part) => !!unifiedProviderContextOf(part))
+  };
 }
 
 export function emitUnifiedChunk(
@@ -68,11 +117,17 @@ export function emitUnifiedChunk(
   nativeChain?: OpenAIResponsesNativeChainContext
 ): void {
   const outputItem = stampNativeResponse(modelOutputItemFromValue(chunk), nativeChain);
-  const text = chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
-  if (text) emit({
-    type: LlmEventType.Delta,
-    payload: { requestId, text, ...(outputItem ? { outputItem } : {}) }
-  });
+  const providerContextParts = splitProviderContextParts(chunk.partsDelta ?? []);
+  emitProviderContextParts(requestId, providerContextParts.leading, emit, nativeChain);
+  if ((chunk.partsDelta ?? []).some(isSignedVisibleTextPart)) {
+    emitVisibleTextParts(requestId, chunk.partsDelta ?? [], emit, outputItem);
+  } else {
+    const text = chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
+    if (text) emit({
+      type: LlmEventType.Delta,
+      payload: { requestId, text, ...(outputItem ? { outputItem } : {}) }
+    });
+  }
 
   const argumentDeltas = (chunk as LimCodeOpenAIResponsesStreamChunk).toolCallArgumentDeltas ?? [];
   if (argumentDeltas.length > 0) {
@@ -92,10 +147,19 @@ export function emitUnifiedChunk(
     });
   }
 
+  // The unified decoders put the same call object in both functionCalls and partsDelta. A call with a
+  // provider id is merged by that id below; one without an id (Gemini 2.x, some compatible relays) is
+  // matched by identity here, otherwise it would get two fallback ids and be stored, and run, twice.
+  // Two distinct objects stay two calls even when their name and arguments are equal (parallel calls).
+  const seenCallParts = new Set<UnifiedPart>();
   const callParts = [
     ...(chunk.functionCalls ?? []),
     ...(chunk.partsDelta ?? []).filter(isUnifiedFunctionCallPart)
-  ];
+  ].filter((part) => {
+    if (seenCallParts.has(part)) return false;
+    seenCallParts.add(part);
+    return true;
+  });
   const stableCallIndexes = new Map<string, number>();
   const calls: Array<{ id: string; name: string; argsJson: string; thoughtSignature?: string; async?: boolean }> = [];
   callParts.forEach((part, index) => {
@@ -103,7 +167,7 @@ export function emitUnifiedChunk(
     const thoughtSignature = thoughtSignatureFromPart(part);
     const receivedAsync = 'async' in part.functionCall && part.functionCall.async === true;
     const candidate = {
-      id: stableCallId ?? `tool_call_${index}`,
+      id: stableCallId ?? anonymousStreamCallId(part, index, nativeChain),
       name: part.functionCall.name,
       argsJson: stringifyJson(part.functionCall.args ?? {}),
       ...(thoughtSignature ? { thoughtSignature } : {}),
@@ -140,6 +204,8 @@ export function emitUnifiedChunk(
     } });
   }
 
+  emitProviderContextParts(requestId, providerContextParts.trailing, emit, nativeChain);
+
   const outputItemDone = stampNativeResponse(modelOutputItemDoneFromChunk(chunk), nativeChain);
   if (outputItemDone) {
     emit({
@@ -149,30 +215,143 @@ export function emitUnifiedChunk(
   }
 }
 
+/**
+ * Fallback ids of stream calls without a provider id, numbered across the whole attempt. runLlmAttempt
+ * creates one chain context per attempt and passes it with every chunk, so it identifies the attempt
+ * here. Numbering per chunk gave two id-less calls in different chunks the same `tool_call_0`, and the
+ * reliable adapter, which merges calls by id, then failed the request on their conflicting content.
+ */
+const anonymousStreamCallIds = new WeakMap<object, { next: number; ids: WeakMap<object, string> }>();
+
+function anonymousStreamCallId(part: UnifiedPart, chunkIndex: number, attempt: object | undefined): string {
+  if (!attempt) return `tool_call_${chunkIndex}`;
+  let allocator = anonymousStreamCallIds.get(attempt);
+  if (!allocator) {
+    allocator = { next: 0, ids: new WeakMap() };
+    anonymousStreamCallIds.set(attempt, allocator);
+  }
+  let id = allocator.ids.get(part);
+  if (!id) {
+    id = `tool_call_${allocator.next}`;
+    allocator.next += 1;
+    allocator.ids.set(part, id);
+  }
+  return id;
+}
+
 export function emitUnifiedResponse(requestId: string, response: UnifiedLLMResponse, emit: Emit): void {
   const parts = response.content?.parts ?? [];
+  // Provider items (the compaction item precedes the other output items) go first.
+  emitProviderContextParts(requestId, parts, emit);
+  if (parts.some(isSignedVisibleTextPart) || parts.some(isOutputItemVisibleTextPart)) {
+    emitUnifiedResponsePartsInOrder(requestId, parts, emit);
+    return;
+  }
   const visibleText = visibleTextFromParts(parts);
   if (visibleText) emit({ type: LlmEventType.Delta, payload: { requestId, text: visibleText } });
 
   const thoughtParts = parts.filter(isUnifiedThoughtTextPart);
-  for (const part of thoughtParts) {
-    const text = typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : '';
-    const signature = thoughtSignatureFromPart(part);
-    const thoughtStartedAt = Date.now();
-    if (text) emit({ type: LlmEventType.ThoughtDelta, payload: { requestId, text, thoughtStartedAt, thoughtElapsedMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
-    if (text || signature) emit({ type: LlmEventType.ThoughtDone, payload: { requestId, thoughtStartedAt, thoughtDurationMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
-  }
+  for (const part of thoughtParts) emitCompletedThoughtPart(requestId, part, emit);
 
-  const calls = parts.filter(isUnifiedFunctionCallPart).map((part, index) => {
-    const thoughtSignature = thoughtSignatureFromPart(part);
-    return {
-      id: part.functionCall.callId ?? `tool_call_${index}`,
-      name: part.functionCall.name,
-      argsJson: stringifyJson(part.functionCall.args ?? {}),
-      ...(thoughtSignature ? { thoughtSignature } : {})
-    };
-  });
+  const calls = parts.filter(isUnifiedFunctionCallPart).map((part, index) => completedToolCall(part, index));
   if (calls.length > 0) emit({ type: LlmEventType.ToolCall, payload: { requestId, calls } });
+}
+
+/**
+ * A reply with a signature on a visible text part (Gemini: "The final content part (`text`,
+ * `inlineData`…) returned by the model may contain a `thought_signature`", which "you must return
+ * ... in the exact part where it was received"; https://ai.google.dev/gemini-api/docs/thought-signatures).
+ * Its parts are emitted in response order, so the signed text part keeps both its signature and its
+ * place after the thoughts. Replies without such a part keep the emission above unchanged.
+ *
+ * The same in-order emission serves a reply whose visible text carries an output item (a Responses
+ * assistant message with `phase`, which must be preserved and resent on every assistant message:
+ * https://developers.openai.com/api/reference/resources/responses). Consecutive text of one output
+ * item becomes one group whose Deltas carry that item, so each message is stored, and replayed, as its
+ * own item with its own phase instead of being merged into one untagged text.
+ */
+function emitUnifiedResponsePartsInOrder(requestId: string, parts: readonly UnifiedPart[], emit: Emit): void {
+  let callIndex = 0;
+  let textGroup: UnifiedPart[] = [];
+  let textGroupItem: ModelOutputItemReference | undefined;
+  const flushTextGroup = (): void => {
+    if (textGroup.length > 0) emitVisibleTextParts(requestId, textGroup, emit, textGroupItem);
+    textGroup = [];
+    textGroupItem = undefined;
+  };
+  for (const part of parts) {
+    if (isUnifiedVisibleTextPart(part)) {
+      const outputItem = modelOutputItemFromValue(part);
+      if (textGroup.length > 0 && outputItem?.id !== textGroupItem?.id) flushTextGroup();
+      textGroup.push(part);
+      textGroupItem = outputItem;
+      continue;
+    }
+    flushTextGroup();
+    if (isUnifiedThoughtTextPart(part)) {
+      emitCompletedThoughtPart(requestId, part, emit);
+    } else if (isUnifiedFunctionCallPart(part)) {
+      emit({ type: LlmEventType.ToolCall, payload: { requestId, calls: [completedToolCall(part, callIndex)] } });
+      callIndex += 1;
+    }
+  }
+  flushTextGroup();
+}
+
+function emitCompletedThoughtPart(requestId: string, part: UnifiedPart, emit: Emit): void {
+  const text = typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : '';
+  const signature = thoughtSignatureFromPart(part);
+  const thoughtStartedAt = Date.now();
+  if (text) emit({ type: LlmEventType.ThoughtDelta, payload: { requestId, text, thoughtStartedAt, thoughtElapsedMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
+  if (text || signature) emit({ type: LlmEventType.ThoughtDone, payload: { requestId, thoughtStartedAt, thoughtDurationMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
+}
+
+function completedToolCall(
+  part: Extract<UnifiedPart, { functionCall: unknown }>,
+  index: number
+): { id: string; name: string; argsJson: string; thoughtSignature?: string } {
+  const thoughtSignature = thoughtSignatureFromPart(part);
+  return {
+    id: part.functionCall.callId ?? `tool_call_${index}`,
+    name: part.functionCall.name,
+    argsJson: stringifyJson(part.functionCall.args ?? {}),
+    ...(thoughtSignature ? { thoughtSignature } : {})
+  };
+}
+
+/**
+ * Visible text of parts that include a signed text part. Gemini puts the signature of a reply
+ * without function calls on its last part, and while streaming "may return the thought signature in
+ * a part with an empty text content part"; it must go back "in the exact part where it was received"
+ * (https://ai.google.dev/gemini-api/docs/thought-signatures), and parts with signatures are neither
+ * concatenated together nor merged with a part without one
+ * (https://ai.google.dev/gemini-api/docs/generate-content/thinking). So each signed text part,
+ * empty or not, is its own Delta carrying its signature; the unsigned text between them is emitted
+ * as before. Such a signature is not a thought and never opens a thought block.
+ */
+function emitVisibleTextParts(
+  requestId: string,
+  parts: readonly UnifiedPart[],
+  emit: Emit,
+  outputItem?: ModelOutputItemReference
+): void {
+  let unsignedText = '';
+  const flushUnsignedText = (): void => {
+    if (unsignedText) emit({ type: LlmEventType.Delta, payload: { requestId, text: unsignedText, ...(outputItem ? { outputItem } : {}) } });
+    unsignedText = '';
+  };
+  for (const part of parts) {
+    if (!isUnifiedVisibleTextPart(part)) continue;
+    const text = (part as { text: string }).text;
+    const thoughtSignature = thoughtSignatureFromPart(part);
+    if (!thoughtSignature) {
+      unsignedText += text;
+      continue;
+    }
+    flushUnsignedText();
+    emit({ type: LlmEventType.Delta, payload: { requestId, text, thoughtSignature, ...(outputItem ? { outputItem } : {}) } });
+  }
+  flushUnsignedText();
 }
 
 export interface LlmDoneTiming {
@@ -311,6 +490,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 export function hasStreamTimingChunk(chunk: UnifiedLLMStreamChunk): boolean {
   return hasStreamOutput(chunk)
     || hasThoughtOutput(chunk)
+    || hasSignedVisibleTextPart(chunk)
     || ((chunk as LimCodeOpenAIResponsesStreamChunk).toolCallArgumentDeltas?.length ?? 0) > 0
     || (chunk as LimCodeOpenAIResponsesStreamChunk).nativeEvent !== undefined;
 }
@@ -399,7 +579,8 @@ export function shouldCloseThoughtBlock(chunk: UnifiedLLMStreamChunk): boolean {
   return (chunk as LimCodeOpenAIResponsesStreamChunk).reasoningItemDone === true
     || !!chunk.finishReason
     || hasStreamOutput(chunk)
-    || hasThoughtSignatureOnlyOutput(chunk);
+    || hasThoughtSignatureOnlyOutput(chunk)
+    || hasSignedVisibleTextPart(chunk);
 }
 
 export function finishThoughtBlock(requestId: string, block: ActiveThoughtBlock, finishedAt: number, emit: Emit): undefined {
@@ -425,14 +606,65 @@ function isUnifiedFunctionCallPart(part: UnifiedPart): part is Extract<UnifiedPa
   return 'functionCall' in part;
 }
 
+/** A text part that is not a thought, including an empty one. */
+function isUnifiedVisibleTextPart(part: UnifiedPart): boolean {
+  return !isUnifiedThoughtTextPart(part)
+    && !isUnifiedFunctionCallPart(part)
+    && typeof (part as { text?: unknown }).text === 'string';
+}
+
+/** A visible text part that arrived with a signature: only Gemini returns these today. */
+function isSignedVisibleTextPart(part: UnifiedPart): boolean {
+  return isUnifiedVisibleTextPart(part) && !!thoughtSignatureFromPart(part);
+}
+
+/** A visible text part tagged with its output item (a Responses assistant message with `phase`). */
+function isOutputItemVisibleTextPart(part: UnifiedPart): boolean {
+  return isUnifiedVisibleTextPart(part) && modelOutputItemFromValue(part) !== undefined;
+}
+
+function hasSignedVisibleTextPart(chunk: UnifiedLLMStreamChunk): boolean {
+  return (chunk.partsDelta ?? []).some(isSignedVisibleTextPart);
+}
+
 function thoughtSignatureFromPart(part: UnifiedPart): string | undefined {
   const record = part as { thoughtSignature?: unknown; thoughtSignatures?: unknown };
   return normalizedSignatureString(record.thoughtSignature) ?? portableThoughtSignatureFromMap(record.thoughtSignatures);
 }
 
+/**
+ * Chunk-level signature that belongs to a thought block. Gemini puts a signature on the part it
+ * belongs to (a function call, or the last, possibly empty, text part of a reply without calls), and
+ * the unified Gemini decoder mirrors every part signature onto the chunk; that mirrored copy is not a
+ * thought. Treating it as one stored the signature a second time, on the preceding thought summary
+ * or on an extra empty thought part, although the signature must be returned "in the exact part where
+ * it was received" (https://ai.google.dev/gemini-api/docs/thought-signatures). The call keeps its own
+ * signature through the ToolCall event, a text part through its Delta event.
+ */
 function thoughtSignatureFromChunk(chunk: UnifiedLLMStreamChunk): string | undefined {
   const record = chunk as { thoughtSignature?: unknown; thoughtSignatures?: unknown };
-  return normalizedSignatureString(record.thoughtSignature) ?? portableThoughtSignatureFromMap(record.thoughtSignatures);
+  const signature = normalizedSignatureString(record.thoughtSignature) ?? portableThoughtSignatureFromMap(record.thoughtSignatures);
+  if (!signature || !isNonThoughtPartSignatureMirror(chunk, signature)) return signature;
+  return undefined;
+}
+
+function isNonThoughtPartSignatureMirror(chunk: UnifiedLLMStreamChunk, signature: string): boolean {
+  const value = thoughtSignatureValue(signature);
+  const carriedBy = (part: UnifiedPart): boolean => {
+    const partSignature = thoughtSignatureFromPart(part);
+    return partSignature !== undefined && thoughtSignatureValue(partSignature) === value;
+  };
+  const parts = chunk.partsDelta ?? [];
+  const carriers = [
+    ...(chunk.functionCalls ?? []),
+    ...parts.filter((part) => isUnifiedFunctionCallPart(part) || isUnifiedVisibleTextPart(part))
+  ];
+  return carriers.some(carriedBy)
+    && !parts.some((part) => !isUnifiedFunctionCallPart(part) && !isUnifiedVisibleTextPart(part) && carriedBy(part));
+}
+
+function thoughtSignatureValue(signature: string): string {
+  return parsePortableThoughtSignature(signature)?.value ?? signature;
 }
 
 function hasThoughtSignatureOnlyOutput(chunk: UnifiedLLMStreamChunk): boolean {

@@ -1,16 +1,62 @@
 # 固定模型接入库构建
 
-本目录维护 `unified-llm-provider` 的观察接口与 Astra 原生适配补丁及固定安装包。
+本目录维护 `unified-llm-provider` 的本地补丁及固定安装包。补丁包括观察接口、Astra 原生适配，以及按各家官方接口文档做的协议修复。
 
 - 上游：`https://github.com/Lianues/unified-llm-provider`，许可证 MIT。
-- 基础发布：0.1.35，源码提交 `3cb58dad30bda99d7c414ba5dd230745e6298bdb`。
-- 本地构建：0.1.35-limcode.2。在 limcode.1 的只读观察接口之上增加：
-  - function 工具声明与 function_call 输入/解码 item 的 `async` 标记无损透传（Astra 异步工具）；
-  - 可选原生解码模式（provider 内部构造开启；LimCode WebSocket 会话不开启），精确 Astra 模型在 SSE 解码时附加 `nativeEvent`（response.created/completed/incomplete）与终端 `completedContents`；
-  - Astra 显式缓存断点：顶层 instructions 转为带 `prompt_cache_breakpoint` 的 developer 输入消息（GPT-5.6+ 语义），其余模型行为不变。
-- `unified-llm-provider.patch` 是源码差异，不直接作用于依赖安装目录。
-- `provider-debug-provenance.json` 记录基础提交、补丁与安装包摘要。
-- 重建：在项目根目录运行 `node scripts/reliable-kernel/build-provider-debug-fork.mjs`。
-- 验证：运行 `node scripts/reliable-kernel/build-provider-debug-fork.mjs --check` 核对已固定的补丁和安装包。
+- 基础发布：0.1.37，源码提交 `7857da99d5faec0865b8a402eb9c9d828f87b114`（上游 main，已含 schema 属性名误删、tools 非数组两个修复）。
+- 本地构建：0.1.37-limcode.7，内容如下。
+- 完整源码分支已发布在 https://github.com/lurenxing628/unified-llm-provider/tree/limcode/provider-fixes （本目录的补丁即该分支相对基础提交的差异）。
 
-观察接口不开启原库的累计全文调试功能；除上述 Astra 适配外不改变请求编码、解析规则和工具执行。升级此依赖时必须重新检查补丁和测试，不允许静默退回没有观察接口的版本。
+limcode.2 带来的内容（保持不变）：
+- 只读观察接口。
+- function 工具声明、function_call 输入与解码 item 上的 `async` 标记原样透传（Astra 异步工具）。
+- 可选的原生解码模式：由 provider 内部构造时开启，LimCode WebSocket 会话不开启。开启时，精确匹配的 Astra 模型在 SSE 解码时附加 `nativeEvent`（response.created/completed）和终端 `completedContents`；SSE 上的 `response.incomplete` 按错误上报，不产出原生事件（limcode.7 更正，见下）。
+- Astra 显式缓存断点：把顶层 instructions 转为带 `prompt_cache_breakpoint` 的 developer 输入消息。
+
+limcode.3 新增的协议修复（每项在源码注释和测试里写明了官方依据）：
+- OpenAI 兼容格式：
+  - 流结束时补发尚未发出的工具调用，参数不完整时报解码错误，不再静默丢弃。
+  - 容忍空参数和缺 `index` 的流式增量。
+  - `finish_reason:"error"` 按错误上报。
+  - 解码并原样回放 OpenRouter 的 `reasoning` 和 `reasoning_details`。
+  - `tool` 消息只放文字，图片、文件和旁带文字放到该批 `tool` 消息之后（DeepSeek 除外）。
+  - DeepSeek 思考等级按官方取值映射。
+  - schema 清洗先展开本地 `$ref`，数字 enum 保留原值。
+- Claude：
+  - 思考块按原顺序回放。
+  - 保留并回放 `redacted_thinking`。
+  - 规范化不合规的工具调用 id。
+- Responses：
+  - 函数工具默认发送 `strict:false`。
+  - 显式缓存断点放到最后一个能承载的块上。
+  - 保留服务端返回的 assistant `phase`。
+  - 服务端 compaction 项只解码一次，并可原样回放。
+- Gemini：请求 URL 对模型 id 做百分号编码。
+
+limcode.4 新增的 GPT-6 家族适配（依据 OpenAI 官方 Using GPT-6 与提示缓存指南，源码注释和测试里写明）：
+- 原生解码模式与 assistant phase 保留分支对 Astra 的判断改为认 GPT-6 家族：`gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna` 及其日期快照。Sol 和 Luna 与 Astra 走同一条原生解码路径。
+- 显式缓存时把顶层 instructions 转为带断点的 developer 消息，适用范围从 Astra 扩到 GPT-5.6 及之后的全部官方 id（`gpt-5.6`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 与 GPT-6 家族，含日期快照）。
+- 网关别名（如 `gpt-6-sol-xhigh`）不外推；其他模型的编码和解码逐字节不变。
+
+limcode.5 新增 Claude 消息中段 system 消息（依据 Anthropic 官方 mid-conversation system messages 文档）：
+- 统一请求可携带轮内 system 消息，Claude 格式编码为 `{"role":"system","clear_at":"next_user_message","content":[...]}`，只放文本块、不带 `cache_control`，消息级缓存断点落在它之前最后一条 user 消息上。
+- 仅在调用方显式提供这种消息时出现；其他格式收到时直接报错，普通请求逐字节不变。
+
+limcode.6 新增 Responses 显式缓存下工具结果承载断点（依据 OpenAI 官方提示缓存指南与 WebSocket 模式指南）：
+- 新的可选项 `breakpoints.toolOutputs`：只在显式缓存模式、且模型支持显式缓存时生效，把字符串形式的 `function_call_output` 改为 `input_text` 数组，最新的工具结果因此能带断点。
+- 只有 LimCode 的 WebSocket 续接链开启；HTTP 与未开启时编码逐字节不变。
+
+limcode.7 新增的修复（每项在源码注释和测试里写明了官方依据）：
+- Responses：GPT-6 家族的非流式回复也保留 assistant `phase`。非流式没有原生事件和 `completedContents`，以前对 GPT-6 家族跳过了 phase，回放时丢失。依据 OpenAI Responses API 参考 `phase` 字段：“preserve and resend phase on all assistant messages — dropping it can degrade performance”。
+- OpenAI 兼容格式：只有收到 `data: [DONE]` 时，才把只收到工具名（`arguments:""`）的调用按 `{}` 补发。连接在没有 finish_reason 和 [DONE] 的情况下结束时，这种调用按参数截断报解码错误，不再以空参数发出（参数全可选的工具会真的执行）。依据 OpenAI OpenAPI 对 Chat Completions 流的说明：`stream_options.include_usage` “an additional chunk will be streamed before the `data: [DONE]` message”，即流以 `data: [DONE]` 结束。
+- 流里已经发出过错误块（上游错误事件、非 JSON 数据、解码失败、格式适配器自己的错误块）时，不再调用 `finalizeStream`，不会在错误之后补发待定的工具调用、截断错误或签名信封。依据 OpenRouter errors-and-debugging：中途错误块同时带顶层 `error` 和 `finish_reason: "error"`，“The stream is terminated after this event”。
+- Responses：删除走不到的 `response.incomplete` 原生解码分支。response 层把事件名或 type 含 incomplete 的 SSE 事件当作上游错误，在格式适配器之前就返回 `stream_error`；保留这一行为，与 LimCode WebSocket 原生会话一致（只有 WebSocket 上的 steered 边界不算失败，其余 incomplete 按失败处理）。OpenAI 对该事件的定义是 “emitted when a response finishes as incomplete”。
+- OpenAI 兼容格式：`finish_reason:"length"` 截断造成的工具参数错误（流式和非流式）带 `retryable:false`。依据 Chat Completions `finish_reason`：“`length` if the maximum number of tokens specified in the request was reached”，原样重发会在同一上限处再次截断。
+
+文件与命令：
+- `unified-llm-provider.patch`：相对基础提交的完整源码与测试差异，不直接作用于依赖安装目录。
+- `provider-debug-provenance.json`：记录基础提交、补丁与安装包的摘要。
+- 重建：在项目根目录运行 `node scripts/reliable-kernel/build-provider-debug-fork.mjs`。
+- 验证：运行 `node scripts/reliable-kernel/build-provider-debug-fork.mjs --check`（`npm run compile` 会先跑它），核对已固定的补丁和安装包摘要、`package.json` 与 `package-lock.json` 指向这个安装包（lock 的版本和 integrity 与它一致），以及 `node_modules/unified-llm-provider` 实际装的就是它（版本一致，`dist` 每个文件的内容与安装包相同）。换了 vendor 却没重装依赖时直接失败。
+
+观察接口不开启原库的累计全文调试功能。升级此依赖时必须重新检查补丁并跑补丁自带的测试（在打过补丁的源码目录运行 `npx vitest run`），不允许静默退回没有观察接口或协议修复的版本。

@@ -278,10 +278,10 @@ async function withNativeRuntime(run, { transport = 'websocket', realAuthority =
       } });
       if (transport === 'http') socket.end('data: [DONE]\n\n');
     }
-    function configureModel(model, thinkingLevel) {
+    function configureModel(model, thinkingLevel, reasoningMode) {
       configuration.model = model;
       configuration.models = [{ id: model, name: model }];
-      configuration.generationConfig = { thinkingConfig: { thinkingLevel } };
+      configuration.generationConfig = { thinkingConfig: { thinkingLevel, ...(reasoningMode ? { reasoningMode } : {}) } };
     }
     await run({
       app, conversationId, startTurn, frames, send, created, text, completed, stored, configuration,
@@ -404,11 +404,19 @@ test('Astra executes a durable async call before response completion and deliver
     assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId }), []);
     const [head] = await rows(app, 'ConversationContextHeadLink', { conversation_id: conversationId });
     const [callSource] = await rows(app, 'ContextSegmentSource', { source_kind: 'tool_call', source_id: admitted.id });
-    await assert.rejects(app.runtime.conversationFork.fork({
-      idempotencyKey: 'native-open-prefix-fork', reuseKey: 'native-open-prefix-fork',
+    const [resultRow] = await rows(app, 'ToolModelResult', { tool_call_id: admitted.id });
+    const [resultSource] = await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result', source_id: resultRow.id });
+    // The result settled after the call; a cut at the call moves that result behind the cut
+    // instead of extending the fork over the later suffix text.
+    const cut = await app.runtime.conversationFork.fork({
+      idempotencyKey: 'native-cut-at-call-fork', reuseKey: 'native-cut-at-call-fork',
       sourceConversationId: conversationId, sourceContextRootId: head.root_id,
-      sourceContextEndSegmentId: callSource.segment_id, targetTitle: 'Invalid partial fork', targetAgentId: 'agent-main'
-    }), { code: 'NATIVE_ASYNC_WORK_PENDING' });
+      sourceContextEndSegmentId: callSource.segment_id, targetTitle: 'Cut at native call', targetAgentId: 'agent-main'
+    });
+    const cutSegments = (await app.context.materializeStructure(cut.targetRootId)).records.map(record => record.segment.id);
+    assert.deepEqual(cutSegments.slice(-2), [callSource.segment_id, resultSource.segment_id]);
+    const cutContent = (await app.context.materialize(cut.targetRootId)).segments.map(segment => segment.content.toString('utf8')).join('\n');
+    assert.doesNotMatch(cutContent, /Continuing while the probe is still running/);
     const forked = await forkNativeMessage(app, conversationId, request.id, 'native-closed-prefix-fork');
     assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId: forked.targetConversationId }), []);
 
@@ -724,6 +732,91 @@ for (const transport of ['websocket', 'http']) {
       });
     }, { transport });
   });
+}
+
+// GPT-6 Sol / Luna 与 Astra 共享原生路径（Using GPT-6 “What's new”；guides/async-tool-calling 与 guides/steering）。
+for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+  for (const transport of ['http', 'websocket']) {
+    test(`${model} native ${transport} admits an async call before completion and delivers its original result once`, { timeout: 60_000 }, async () => {
+      await withNativeRuntime(async harness => {
+        const { app, conversationId, frames, created, text, completed, send, until } = harness;
+        // Sol、Luna 支持 none：冻结与恢复路径不把它改成 low（Astra 仍转 low）。
+        const effort = model === 'gpt-6-sol' ? 'none' : 'high';
+        harness.configureModel(model, effort);
+        const turn = await harness.startTurn(`family-${model}-${transport}`, 'Read the probe asynchronously.');
+        const first = await until(() => frames.find(frame => frame.response || frame.body.type === 'response.create'),
+          `${model} native request`);
+        const channel = first.response ?? first.socket;
+        assert.equal(first.body.model, model);
+        assert.equal(first.body.tools.find(tool => tool.name === 'native_probe')?.async, true);
+        assert.equal(first.body.reasoning?.effort, effort);
+        created(channel, `${model}-response-1`);
+        const call = {
+          type: 'function_call', id: `${model}-function-item`, call_id: `original-${model}-call`,
+          name: 'native_probe', arguments: '{}', async: true, status: 'completed'
+        };
+        send(channel, { type: 'response.output_item.done', response_id: `${model}-response-1`, output_index: 0, item: call });
+        await until(() => harness.executions() === 1, `${model} execution before response.completed`);
+        const [request] = await rows(app, 'ModelRequest', { turn_id: turn.turnId });
+        assert.equal(request.stream_stats_json.nativeCapabilities.asyncTools, true);
+        assert.equal(request.stream_stats_json.nativeCapabilities.steering, transport === 'websocket');
+        completed(channel, `${model}-response-1`, [call]);
+        harness.releaseTool.resolve();
+        const delivery = await until(() => frames.find(frame => frame !== first
+          && frame.body.input?.some(item => item.type === 'function_call_output')), `${model} result carrier`);
+        const results = delivery.body.input.filter(item => item.type === 'function_call_output');
+        assert.equal(results.length, 1);
+        assert.equal(results[0].call_id, `original-${model}-call`);
+        const carrier = delivery.response ?? delivery.socket;
+        created(carrier, `${model}-response-2`, delivery.body.previous_response_id);
+        completed(carrier, `${model}-response-2`, [text(carrier, `${model}-response-2`, 0, 'Result received.')]);
+        assert.equal((await turn.completion).terminalStatus, 'completed');
+        assert.equal(harness.executions(), 1);
+        assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId }), []);
+      }, { transport });
+    });
+  }
+}
+
+// 官方：configuration_update “supported by the GPT-6 model family in standard, single-agent mode”
+// （guides/reasoning “Change reasoning mid-conversation”）。pro 模式下改推理强度只能换请求级 effort。
+for (const model of ['gpt-6-astra', 'gpt-6-sol']) {
+  for (const transport of ['websocket', 'http']) {
+    test(`${model} pro reasoning mode never sends configuration_update over ${transport}`, { timeout: 60_000 }, async () => {
+      await withNativeRuntime(async harness => {
+        const { frames, created, text, completed, until } = harness;
+        async function respond(key) {
+          const before = frames.length;
+          const turn = await harness.startTurn(`pro-${model}-${key}`, `Pro scenario ${key}.`);
+          const frame = await until(() => frames.slice(before).find(value =>
+            value.response || (value.body.type === 'response.create' && value.body.generate !== false)
+          ), `pro ${key} request`);
+          const responseId = `pro-${model}-${key}`;
+          const channel = frame.response ?? frame.socket;
+          created(channel, responseId, frame.body.previous_response_id);
+          completed(channel, responseId, [text(channel, responseId, 0, `Finished ${key}.`)]);
+          assert.equal((await turn.completion).terminalStatus, 'completed');
+          return frame.body;
+        }
+        const updates = body => body.input.filter(item => item.type === 'configuration_update');
+        harness.configureModel(model, 'low', 'pro');
+        const low = await respond('low');
+        assert.deepEqual(low.reasoning && { mode: low.reasoning.mode, effort: low.reasoning.effort }, { mode: 'pro', effort: 'low' });
+        harness.configureModel(model, 'high', 'pro');
+        const high = await respond('high');
+        assert.deepEqual(updates(high), []);
+        assert.equal(high.reasoning?.mode, 'pro');
+        assert.equal(high.reasoning?.effort, 'high', 'pro mode changes the request-level effort directly');
+        // 回到 standard 后动态推理更新恢复。
+        harness.configureModel(model, 'medium', 'standard');
+        await respond('standard-medium');
+        harness.configureModel(model, 'xhigh', 'standard');
+        const standard = await respond('standard-xhigh');
+        assert.equal(standard.reasoning?.effort, 'medium');
+        assert.equal(updates(standard).at(-1)?.reasoning?.effort, 'xhigh');
+      }, { transport });
+    });
+  }
 }
 
 test('ready async results wait behind an automatic steer successor and retain actual context order', { timeout: 60_000 }, async () => {

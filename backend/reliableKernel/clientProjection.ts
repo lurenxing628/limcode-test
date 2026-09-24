@@ -8,6 +8,17 @@
  * from the original worker implementation.
  */
 import type Database from 'better-sqlite3';
+import {
+  RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS,
+  type ActiveTurnWorkEnvironmentProjection,
+  type ChildConversationBoundaryProjection
+} from '../../shared/reliableKernelClientFeed';
+import {
+  DEFAULT_CONVERSATION_TITLE,
+  GENERATED_CONVERSATION_TITLE_PREFIX,
+  displayConversationTitle
+} from '../../shared/conversationTitle';
+import type { MessageContent } from '../../shared/protocol';
 import type { SnapshotBarrier } from './contracts';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
@@ -21,6 +32,7 @@ import {
   boundClientRecordSummary,
   settleClientWireResponseBytes
 } from './clientWireData';
+import { toolArtifactIdentifiesCallInWorker } from './copiedToolIdentity';
 import {
   approvedSubmitPlanTaskOperation,
   buildCurrentTurnTaskProjection,
@@ -50,6 +62,7 @@ export interface ClientProjectionContentAccess {
 const TURN_INTENT_CONTENT_TYPE = 'application/vnd.limcode.turn-intent+json';
 const CHILD_ACTIVITY_ARGUMENTS_MAX_BYTES = 64 * 1024;
 const CHILD_ACTIVITY_SUMMARY_MAX_CHARACTERS = 180;
+const TURN_AUTHORITY_PROJECTION_MAX_BYTES = 16 * 1024 * 1024;
 
 export function projectQueuedTurnIntentRecord(database: Database.Database, intentId: string): DomainRow | null {
   const rows = queryPlainRows(database, `
@@ -482,6 +495,101 @@ export function projectProcessRecord(
   };
 }
 
+const PEER_TITLE_CONTENT_MAX_BYTES = 256_000n;
+
+/** Bounded envelope preview; the full body stays in CAS behind the explicit message read path. */
+export function projectCollaborationMessageRecord(
+  database: Database.Database,
+  messageId: string,
+  content: ClientProjectionContentAccess
+): DomainRow {
+  const raw = database.prepare('SELECT * FROM collaboration_message WHERE id = ?').get(messageId);
+  if (!raw) throw new Error(`CollaborationMessage ${messageId} does not exist.`);
+  const record = DOMAIN_REPOSITORIES.codec('CollaborationMessage').decode(raw as Record<string, unknown>);
+  const payloads = database.prepare(`
+    SELECT payload.*
+      FROM collaboration_message_payload_link AS link
+      JOIN content_object AS payload ON payload.id = link.content_object_id
+     WHERE link.message_id = ?
+     LIMIT 2
+  `).all(messageId) as Array<Record<string, unknown>>;
+  if (payloads.length !== 1) throw new Error(`CollaborationMessage ${messageId} requires exactly one payload.`);
+  const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(payloads[0]);
+  if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || typeof metadata.byte_length !== 'bigint' || metadata.byte_length > 64_000n) {
+    throw new Error(`CollaborationMessage ${messageId} payload violates its content contract.`);
+  }
+  const normalized = content.readVerifiedBytes(metadata).toString('utf8').replace(/\s+/g, ' ').trim();
+  const characters = Array.from(normalized);
+  const limit = RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS;
+  return {
+    ...record,
+    text_preview: characters.length <= limit ? normalized : `${characters.slice(0, limit - 1).join('')}…`
+  };
+}
+
+/**
+ * The other Conversations named by the selected Conversation's collaboration links. A peer that is
+ * gone from the Runtime is marked deleted; a live one carries the title the sidebar shows (its
+ * first user message when the stored title is a placeholder). Title lookups never fail the
+ * snapshot: an unreadable first message just keeps the stored title.
+ */
+function projectCollaborationPeerConversations(
+  database: Database.Database,
+  activeConversationId: string,
+  peerIds: readonly string[],
+  content: ClientProjectionContentAccess
+): Array<Record<string, unknown>> {
+  const ids = [...new Set(peerIds)].filter((id) => id && id !== activeConversationId).sort();
+  if (ids.length === 0) return [];
+  const rows = new Map(queryAllByIds(database, 'conversation', 'id', ids).map((row) => [String(row.id), row]));
+  const firstUserText = new Map<string, MessageContent>();
+  const placeholderIds = [...rows.values()]
+    .filter((row) => displayConversationTitle({ id: String(row.id), title: String(row.title) }) === DEFAULT_CONVERSATION_TITLE
+      || String(row.title).startsWith(GENERATED_CONVERSATION_TITLE_PREFIX))
+    .map((row) => String(row.id));
+  for (const first of queryFirstUserRevisions(database, placeholderIds)) {
+    const title = readFirstUserTitleContent(database, String(first.revision_id), content);
+    if (title) firstUserText.set(String(first.conversation_id), title);
+  }
+  return ids.map((id) => {
+    const row = rows.get(id);
+    if (!row) return { id, title: null, status: 'deleted', display_title: null };
+    const first = firstUserText.get(id);
+    return {
+      id,
+      title: row.title,
+      status: row.status,
+      display_title: displayConversationTitle({
+        id,
+        title: String(row.title),
+        ...(first ? { messages: [{ role: 'user' as const, content: first }] } : {})
+      })
+    };
+  });
+}
+
+function readFirstUserTitleContent(
+  database: Database.Database,
+  revisionId: string,
+  content: ClientProjectionContentAccess
+): MessageContent | undefined {
+  try {
+    const revision = database.prepare('SELECT content_object_id FROM message_revision WHERE id = ?').get(revisionId) as { content_object_id?: unknown } | undefined;
+    const raw = revision ? database.prepare('SELECT * FROM content_object WHERE id = ?').get(String(revision.content_object_id)) : undefined;
+    if (!raw) return undefined;
+    const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
+    if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length > PEER_TITLE_CONTENT_MAX_BYTES) return undefined;
+    const text = content.readVerifiedBytes(metadata).toString('utf8');
+    const contentType = String(metadata.content_type).toLowerCase();
+    if (contentType.startsWith('text/plain')) return { role: 'user', parts: [{ text }] };
+    const value: unknown = JSON.parse(text);
+    const parts = value && typeof value === 'object' && !Array.isArray(value) ? (value as { parts?: unknown }).parts : undefined;
+    return Array.isArray(parts) ? { role: 'user', parts: parts as MessageContent['parts'] } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function deriveCommittedParentHandling(
   delivery: DomainRow,
   inputLink: { handled_at: string | null } | null
@@ -526,7 +634,9 @@ export function executeClientProjectionSnapshot(
       compressionBlocks: [],
       conversationContextStatuses: [],
       taskList: [],
-      currentTaskList: null
+      currentTaskList: null,
+      activeTurnWorkEnvironment: null,
+      childConversationBoundary: null
     };
     const emptyTurns = {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [], modelRequests: [],
@@ -547,7 +657,10 @@ export function executeClientProjectionSnapshot(
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [], childTurnTerminations: [], childTurnExecutorLinks: [],
       childExecutionActivities: [],
       answerBridges: [], answerSubmissions: [],
-      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: []
+      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [],
+      collaborationMessages: [], collaborationMessageSourceLinks: [], collaborationMessageTargetLinks: [],
+      collaborationMessageReplyLinks: [], collaborationRequests: [], collaborationRequestTurnLinks: [],
+      collaborationPeerConversations: []
     };
     if (conversationId === null) {
       database.exec('COMMIT');
@@ -712,6 +825,10 @@ export function executeClientProjectionSnapshot(
       .map((turn) => turn.status === 'active'
         ? projectTurnClientRecord(database, String(turn.id), content)
         : turn);
+    // One read per frozen AuthoritySnapshot: a child's active Turn is also its latest Turn.
+    const authorityDocuments: TurnAuthorityDocuments = new Map();
+    const activeTurnWorkEnvironment = projectActiveTurnWorkEnvironment(database, conversationId, turns, content, authorityDocuments);
+    const childConversationBoundary = projectChildConversationBoundary(database, conversationId, content, authorityDocuments);
 
     // Processes and child executions are independently visible summaries. Their active rows are
     // pinned even after their source Message leaves the normal 200-message suffix. The source
@@ -888,7 +1005,7 @@ export function executeClientProjectionSnapshot(
           call_seq: row.call_seq,
           state: row.status,
           outcome: outcome?.status ?? null,
-          ...taskListProjectionFromOutcome(database, outcome, String(row.id), content)
+          ...taskListProjectionFromOutcome(database, outcome, row, content)
         };
       });
     const selectedInteractionToolCallLinks = mergeRowsById([
@@ -944,7 +1061,22 @@ export function executeClientProjectionSnapshot(
       'id',
       answerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : [])
     );
-    const deliveries = queryClientRuntimeDeliveries(database, conversationId);
+    // Collaboration cards sit at the Turns this snapshot loads, so the selection follows those
+    // Turns instead of a fixed count of the newest messages.
+    const collaborationMessages = queryCollaborationMessagesForTurns(database, conversationId, turnIds)
+      .map((row) => projectCollaborationMessageRecord(database, String(row.id), content));
+    const collaborationIds = collaborationMessages.map(row => String(row.id));
+    const collaborationMessageSourceLinks = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', collaborationIds);
+    const collaborationMessageTargetLinks = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', collaborationIds);
+    // Each card carries its own delivery: an incoming one is placed by it (it may be older than the
+    // newest deliveries) and an outgoing one shows whether the peer received it.
+    const deliveries = mergeRowsById([
+      ...queryClientRuntimeDeliveries(database, conversationId),
+      ...queryAllByIds(database, 'runtime_delivery', 'inbox_item_id', collaborationMessageTargetLinks
+        .map((link) => String(link.inbox_item_id)))
+        .filter((delivery) => collaborationMessageTargetLinks.some((link) =>
+          link.inbox_item_id === delivery.inbox_item_id && link.conversation_id === delivery.target_conversation_id))
+    ]);
     const deliveryIds = deliveries.map((row) => String(row.id));
     const deliveryInputLinks = queryAllByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
     const projectedDeliveries = deliveries.map((delivery) => {
@@ -968,6 +1100,16 @@ export function executeClientProjectionSnapshot(
       deliveryIds
     ).filter((link) => queuedTurnIntentIds.has(String(link.turn_intent_id)));
 
+    const collaborationMessageReplyLinks = queryAllByIds(database, 'collaboration_message_reply_link', 'message_id', collaborationIds);
+    const collaborationRequests = queryAllByIds(database, 'collaboration_request', 'message_id', collaborationIds);
+    const collaborationRequestTurnLinks = queryAllByIds(database, 'collaboration_request_turn_link', 'request_id', collaborationRequests.map(row => String(row.id)));
+    // Peers are named by their own set: the bounded navigation list holds only the newest
+    // Conversations (child tasks included), so an idle peer is usually not in it.
+    const collaborationPeerConversations = projectCollaborationPeerConversations(database, conversationId, [
+      ...collaborationMessageSourceLinks.map(row => String(row.conversation_id)),
+      ...collaborationMessageTargetLinks.map(row => String(row.conversation_id))
+    ], content);
+
     const snapshot: ClientProjectionSnapshot = {
       navigationSummary: { conversations },
       activeConversationWindow: {
@@ -986,7 +1128,9 @@ export function executeClientProjectionSnapshot(
         compressionBlocks,
         conversationContextStatuses,
         taskList,
-        currentTaskList
+        currentTaskList,
+        activeTurnWorkEnvironment,
+        childConversationBoundary
       },
       activeTurnSummary: {
         turns,
@@ -1037,7 +1181,14 @@ export function executeClientProjectionSnapshot(
         answerSubmissions,
         runtimeInboxItems: inboxItems,
         runtimeDeliveries: projectedDeliveries,
-        runtimeDeliveryIntentLinks
+        runtimeDeliveryIntentLinks,
+        collaborationMessages,
+        collaborationMessageSourceLinks,
+        collaborationMessageTargetLinks,
+        collaborationMessageReplyLinks,
+        collaborationRequests,
+        collaborationRequestTurnLinks,
+        collaborationPeerConversations
       }
     };
     database.exec('COMMIT');
@@ -1048,12 +1199,147 @@ export function executeClientProjectionSnapshot(
   }
 }
 
+/** Only this selected Conversation's active Turn may supply the frozen display value. */
+export function projectActiveTurnWorkEnvironment(
+  database: Database.Database,
+  conversationId: string,
+  selectedTurns: readonly DomainRow[],
+  content: ClientProjectionContentAccess,
+  documents?: TurnAuthorityDocuments
+): ActiveTurnWorkEnvironmentProjection | null {
+  // Reuse the active Conversation's existing bounded roots; do not rescan historical Turns.
+  const turns = selectedTurns.filter(turn => turn.conversation_id === conversationId && turn.status === 'active');
+  if (turns.length === 0) return null;
+  if (turns.length !== 1) throw new Error(`Conversation ${conversationId} has multiple active Turns.`);
+  const turnId = requireRuntimeId(turns[0].id);
+  // Absence is unknown, never a request to substitute current editable configuration. The UI
+  // distinguishes an active Turn with no projection from a Conversation with no active Turn.
+  const document = readTurnAuthorityDocument(database, turnId, content, documents);
+  const policy = document && frozenWorkEnvironmentProjection(turnId, document);
+  if (!policy) return null;
+  const projection: ActiveTurnWorkEnvironmentProjection = { conversationId, ...policy };
+  // Never truncate a boundary: an oversized or malformed frozen policy is not a different policy.
+  if (wireJsonBytes(projection) > CLIENT_PAGE_MAX_BYTES) {
+    throw new Error(`Turn ${turnId} work-environment policy exceeds the client projection size bound.`);
+  }
+  return projection;
+}
+
+/**
+ * The bound a Turn the user starts in this child conversation will inherit: the tool and skill
+ * bound frozen by the child's first Turn and the work environments of its latest Turn. Null for a
+ * conversation that is not a child execution.
+ */
+export function projectChildConversationBoundary(
+  database: Database.Database,
+  conversationId: string,
+  content: ClientProjectionContentAccess,
+  documents?: TurnAuthorityDocuments
+): ChildConversationBoundaryProjection | null {
+  const children = queryPlainRows(database, `
+    SELECT id FROM child_execution WHERE child_conversation_id = @conversationId LIMIT 2
+  `, { conversationId });
+  if (children.length === 0) return null;
+  if (children.length !== 1) throw new Error(`Conversation ${conversationId} has multiple ChildExecutions.`);
+  const childExecutionId = requireRuntimeId(children[0].id);
+  const turnAt = (direction: 'ASC' | 'DESC') => queryPlainRows(database, `
+    SELECT turn_id FROM child_execution_turn_link
+     WHERE child_execution_id = @childExecutionId
+     ORDER BY turn_seq ${direction}
+     LIMIT 1
+  `, { childExecutionId })[0];
+  const first = turnAt('ASC');
+  const latest = turnAt('DESC');
+  if (!first || !latest) throw new Error(`ChildExecution ${childExecutionId} has no Turn lineage.`);
+  const firstTurnId = requireRuntimeId(first.turn_id);
+  const latestTurnId = requireRuntimeId(latest.turn_id);
+  const firstDocument = readTurnAuthorityDocument(database, firstTurnId, content, documents);
+  const latestDocument = readTurnAuthorityDocument(database, latestTurnId, content, documents);
+  const toolPolicy = firstDocument?.toolPolicy;
+  const projection: ChildConversationBoundaryProjection = {
+    conversationId,
+    childExecutionId,
+    boundedByParent: !!toolPolicy && typeof toolPolicy === 'object' && !Array.isArray(toolPolicy)
+      && (toolPolicy as Record<string, unknown>).inherited !== undefined,
+    workEnvironment: latestDocument ? frozenWorkEnvironmentProjection(latestTurnId, latestDocument) : null
+  };
+  if (wireJsonBytes(projection) > CLIENT_PAGE_MAX_BYTES) {
+    throw new Error(`ChildExecution ${childExecutionId} boundary exceeds the client projection size bound.`);
+  }
+  return projection;
+}
+
+type TurnAuthorityDocuments = Map<string, Record<string, unknown> | null>;
+
+/** One Turn's frozen AuthoritySnapshot document, read within the projection bound; null when none. */
+function readTurnAuthorityDocument(
+  database: Database.Database,
+  turnId: string,
+  content: ClientProjectionContentAccess,
+  documents?: TurnAuthorityDocuments
+): Record<string, unknown> | null {
+  if (documents?.has(turnId)) return documents.get(turnId)!;
+  const document = readTurnAuthorityDocumentUncached(database, turnId, content);
+  documents?.set(turnId, document);
+  return document;
+}
+
+function readTurnAuthorityDocumentUncached(
+  database: Database.Database,
+  turnId: string,
+  content: ClientProjectionContentAccess
+): Record<string, unknown> | null {
+  const authorities = queryPlainRows(database, `
+    SELECT content.*
+      FROM authority_snapshot AS authority
+      JOIN content_object AS content ON content.id = authority.content_object_id
+     WHERE authority.turn_id = @turnId
+     ORDER BY authority.created_at DESC, authority.id DESC
+     LIMIT 2
+  `, { turnId });
+  if (authorities.length === 0) return null;
+  if (authorities.length !== 1) throw new Error(`Turn ${turnId} has multiple AuthoritySnapshots.`);
+  const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(authorities[0]);
+  if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length > BigInt(TURN_AUTHORITY_PROJECTION_MAX_BYTES)) {
+    throw new Error(`Turn ${turnId} AuthoritySnapshot exceeds the client projection read bound.`);
+  }
+  const document: unknown = JSON.parse(content.readVerifiedBytes(metadata).toString('utf8'));
+  if (!document || typeof document !== 'object' || Array.isArray(document)) {
+    throw new Error(`Turn ${turnId} AuthoritySnapshot is not an object.`);
+  }
+  return document as Record<string, unknown>;
+}
+
+function frozenWorkEnvironmentProjection(
+  turnId: string,
+  document: Record<string, unknown>
+): Omit<ActiveTurnWorkEnvironmentProjection, 'conversationId'> | null {
+  const policy = document.workEnvironmentPolicy;
+  if (policy === undefined || policy === null) return null;
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new Error(`Turn ${turnId} work-environment policy is invalid.`);
+  }
+  const fields = policy as Record<string, unknown>;
+  if (typeof fields.enabled !== 'boolean' || !Array.isArray(fields.allowedWorkEnvironmentIds)) {
+    throw new Error(`Turn ${turnId} work-environment policy is incomplete.`);
+  }
+  return {
+    turnId,
+    enabled: fields.enabled,
+    defaultWorkEnvironmentId: fields.defaultWorkEnvironmentId === null
+      ? null
+      : requireRuntimeId(fields.defaultWorkEnvironmentId),
+    allowedWorkEnvironmentIds: fields.allowedWorkEnvironmentIds.map(requireRuntimeId)
+  };
+}
+
 function taskListProjectionFromOutcome(
   database: Database.Database,
   outcome: Record<string, unknown> | null,
-  toolCallId: string,
+  call: Record<string, unknown>,
   content: ClientProjectionContentAccess
 ): { mode?: string; items: unknown[] | null; detail_on_demand: boolean } {
+  const toolCallId = String(call.id);
   if (!outcome || outcome.content_object_id === null) return { items: null, detail_on_demand: false };
   if (outcome.status !== 'succeeded') return { items: null, detail_on_demand: false };
   const contentObjectId = requireRuntimeId(outcome.content_object_id);
@@ -1078,7 +1364,7 @@ function taskListProjectionFromOutcome(
   }
   let operation;
   try {
-    operation = taskListOperationFromSettledArtifact(value, toolCallId);
+    operation = taskListOperationFromSettledArtifact(taskArtifactForCall(database, value, call), toolCallId);
   } catch {
     return { items: null, detail_on_demand: true };
   }
@@ -1088,6 +1374,23 @@ function taskListProjectionFromOutcome(
     items: operation.items,
     detail_on_demand: false
   };
+}
+
+/**
+ * A fork copies a ToolCall under a new id while its result content still names the original call;
+ * the copied identity rule (same immutable tool segment, same call_seq) resolves it to this call.
+ */
+function taskArtifactForCall(
+  database: Database.Database,
+  value: unknown,
+  call: Record<string, unknown>
+): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const artifact = value as Record<string, unknown>;
+  const toolCallId = String(call.id);
+  return artifact.toolCallId !== toolCallId && toolArtifactIdentifiesCallInWorker(database, artifact.toolCallId, call)
+    ? { ...artifact, toolCallId }
+    : value;
 }
 
 function projectCurrentTaskList(
@@ -1110,9 +1413,6 @@ function projectCurrentTaskList(
       JOIN tool_result_artifact AS artifact
         ON artifact.tool_call_id = call.id
        AND artifact.role = 'no_effect_result'
-      JOIN operation AS task_operation
-        ON task_operation.tool_call_id = call.id
-       AND task_operation.status = 'succeeded'
       JOIN tool_call_source_link AS source ON source.tool_call_id = call.id
       JOIN message_part_of_conversation AS membership
         ON membership.message_id = source.message_id
@@ -1121,6 +1421,18 @@ function projectCurrentTaskList(
      WHERE turn.conversation_id = @conversationId
        AND message.deleted_at IS NULL
        AND call.tool_name IN ('update_task_list', 'submit_plan')
+       -- Settled by this call's own Operation, or, for a fork's copied ToolCall (which carries its
+       -- ToolOutcome but not the source's execution Operations), by that copied outcome.
+       AND (
+         EXISTS (
+           SELECT 1 FROM operation AS task_operation
+            WHERE task_operation.tool_call_id = call.id AND task_operation.status = 'succeeded'
+         )
+         OR EXISTS (
+           SELECT 1 FROM tool_outcome AS task_outcome
+            WHERE task_outcome.tool_call_id = call.id AND task_outcome.status = 'succeeded'
+         )
+       )
      ORDER BY membership.message_seq ASC,
               source.provider_ordinal ASC,
               call.call_seq ASC,
@@ -1135,12 +1447,12 @@ function projectCurrentTaskList(
     const operations: CurrentTurnTaskOperationFact[] = [];
     for (const call of calls) {
       const toolCallId = String(call.id);
-      const artifact = readTaskProjectionJson(
+      const artifact = taskArtifactForCall(database, readTaskProjectionJson(
         database,
         call.artifact_content_object_id,
         `Task-list ToolResultArtifact ${toolCallId}`,
         content
-      );
+      ), call);
       if (call.tool_name === 'update_task_list') {
         const operation = taskListOperationFromSettledArtifact(artifact, toolCallId);
         if (!operation) continue;
@@ -1747,7 +2059,7 @@ function buildClientVisibleMessageHistoryRecords(
 }
 
 function queryPlainRows(
-  database: Database.Database,
+  database: Pick<Database.Database, 'prepare'>,
   sql: string,
   parameters: Record<string, string | bigint> = {}
 ): Array<Record<string, unknown>> {
@@ -1842,6 +2154,46 @@ function queryClientChildExecutions(
         )
      ORDER BY child.created_at DESC, child.id DESC
   `, { conversationId });
+}
+
+/**
+ * The selected Conversation's own collaboration envelopes (message bodies stay in CAS): every
+ * message it sent from, or had delivered into, one of the loaded Turns, plus incoming messages
+ * still waiting for a Turn or failed before reaching one. Bounded by durable sequence. The
+ * candidates come from this Conversation's source/target link indexes, so the cost follows its own
+ * traffic rather than every message in the Runtime.
+ */
+export function queryCollaborationMessagesForTurns(
+  database: Pick<Database.Database, 'prepare'>,
+  conversationId: string,
+  loadedTurnIds: readonly string[]
+): Array<Record<string, unknown>> {
+  const parameters: Record<string, string | bigint> = { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) };
+  const turnList = [...new Set(loadedTurnIds)].map((id, index) => {
+    parameters[`turn${index}`] = id;
+    return `@turn${index}`;
+  }).join(',');
+  const inLoadedTurns = (column: string) => turnList ? `${column} IN (${turnList})` : '0';
+  return queryPlainRows(database, `
+    SELECT message.*
+      FROM collaboration_message AS message
+     WHERE message.id IN (
+             SELECT source.message_id
+               FROM collaboration_message_source_link AS source
+              WHERE source.conversation_id = @conversationId
+                AND ${inLoadedTurns('source.turn_id')}
+             UNION
+             SELECT target.message_id
+               FROM collaboration_message_target_link AS target
+               JOIN runtime_delivery AS delivery
+                 ON delivery.inbox_item_id = target.inbox_item_id
+                AND delivery.target_conversation_id = @conversationId
+              WHERE target.conversation_id = @conversationId
+                AND (delivery.state IN ('pending', 'failed') OR ${inLoadedTurns('delivery.target_turn_id')})
+           )
+     ORDER BY message.message_seq DESC, message.id DESC
+     LIMIT @limit
+  `, parameters);
 }
 
 function queryClientRuntimeDeliveries(

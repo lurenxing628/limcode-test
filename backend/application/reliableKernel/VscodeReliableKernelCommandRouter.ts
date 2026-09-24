@@ -11,13 +11,17 @@ import {
   BridgeMessageType,
   type AttachmentOpenPayload,
   type AttachmentReloadPayload,
+  type BridgeErrorPayload,
   type ConversationAgentSelectPayload,
   type ConversationActionResultPayload,
   type CompressionCommandResultPayload,
+  type CompressionRebuildPreviewGetPayload,
+  type CompressionRebuildPreviewResultPayload,
   type CompressionStartPayload,
   type ConversationForkPayload,
   type ConversationForkResultPayload,
   type ConversationSettingsGetPayload,
+  type ConversationSettingsSnapshotPayload,
   type ConversationSettingsUpdatePayload,
   type GlobalSettingsGetPayload,
   type GlobalSettingsRecord,
@@ -39,9 +43,11 @@ import {
   type TurnInputResultPayload,
   type TurnStartPayload,
   type TurnSteerPayload,
+  type ExtensionToWebviewMessage,
   type WebviewToExtensionMessage
 } from '../../../shared/protocol';
 import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
+import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
 import { isSettingsRevisionConflictError } from '../../capabilities/settingsRevisionConflict';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
@@ -51,9 +57,9 @@ import { applyProxyEnvironment, currentProxyEnvironment, proxyForShellAndMcp } f
 import { GlobalSettingsSaveBarrier } from './GlobalSettingsSaveBarrier';
 
 export interface VscodeReliableKernelCommandRouterOptions {
-  broadcast?(message: unknown): void;
+  broadcast?(message: ExtensionToWebviewMessage): void;
   /** Delivers a Conversation-scoped message only to panels currently bound to that Conversation. */
-  postToConversation?(conversationId: string, message: unknown): void;
+  postToConversation?(conversationId: string, message: ExtensionToWebviewMessage): void;
   createConversation?(options: { projectFolderUri?: string }): Promise<string>;
   forkConversation?(request: ConversationForkPayload): Promise<{
     conversationId: string;
@@ -129,6 +135,9 @@ export class VscodeReliableKernelCommandRouter {
             error: text
           }
         });
+      } else if (message.type === BridgeMessageType.ConversationFork && error instanceof ConversationForkRejectedError) {
+        // A permanent rejection is not an unconfirmed result: the Webview drops the command.
+        this.postRequestError(webview, message.type, text, message.id, { code: 'fork_rejected' });
       } else if (
         (message.type === BridgeMessageType.GlobalSettingsGet || message.type === BridgeMessageType.GlobalSettingsUpdate)
         && message.payload?.section
@@ -605,6 +614,13 @@ export class VscodeReliableKernelCommandRouter {
           requirePayload(message.payload, 'Compression start')
         );
         return;
+      case BridgeMessageType.CompressionRebuildPreviewGet:
+        await this.handleCompressionRebuildPreview(
+          webview,
+          message.id,
+          requirePayload(message.payload, 'Compression rebuild preview')
+        );
+        return;
       case BridgeMessageType.InteractionResolve:
         await this.handleInteractionResolve(webview, message.id, requirePayload(message.payload, 'Interaction resolve'));
         return;
@@ -710,11 +726,17 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, await this.configurationSnapshot(correlationId));
   }
 
+  public async refreshConfiguration(): Promise<void> {
+    this.options.broadcast?.(await this.configurationSnapshot());
+  }
+
   private async broadcastConfigurationSnapshot(webview: vscode.Webview, correlationId?: string): Promise<void> {
     this.broadcastOrPost(webview, await this.configurationSnapshot(correlationId));
   }
 
-  private async configurationSnapshot(correlationId?: string): Promise<unknown> {
+  private async configurationSnapshot(
+    correlationId?: string
+  ): Promise<Extract<ExtensionToWebviewMessage, { type: BridgeMessageType.ConfigurationSnapshot }>> {
     const state = await this.product.configuration.configurationClientState();
     state.toolDefinitions = this.product.toolHost.definitionRecords();
     state.mcpToolSources = this.product.toolHost.mcp.sourceRecords();
@@ -838,7 +860,7 @@ export class VscodeReliableKernelCommandRouter {
   private globalSettingsSnapshot(
     stored: Awaited<ReturnType<VscodeReliableKernelProductRuntime['configuration']['loadGlobalSettings']>>,
     correlationId?: string
-  ): unknown {
+  ): Extract<ExtensionToWebviewMessage, { type: BridgeMessageType.GlobalSettingsSnapshot }> {
     return {
       id: randomUUID(),
       type: BridgeMessageType.GlobalSettingsSnapshot,
@@ -902,12 +924,7 @@ export class VscodeReliableKernelCommandRouter {
     conversationId: string,
     section: ConversationSettingsGetPayload['section'],
     allowMissing = false
-  ): Promise<{
-    conversationId: string;
-    section: ConversationSettingsGetPayload['section'];
-    settings: unknown;
-    filePath: string;
-  } | undefined> {
+  ): Promise<ConversationSettingsSnapshotPayload | undefined> {
     const conversation = allowMissing
       ? await this.maybeRow('Conversation', conversationId)
       : await this.requireRow('Conversation', conversationId);
@@ -924,9 +941,9 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   private conversationSettingsSnapshot(
-    stored: { conversationId: string; section: string; settings: unknown; filePath: string },
+    stored: ConversationSettingsSnapshotPayload,
     correlationId?: string
-  ): unknown {
+  ): Extract<ExtensionToWebviewMessage, { type: BridgeMessageType.ConversationSettingsSnapshot }> {
     return {
       id: randomUUID(),
       type: BridgeMessageType.ConversationSettingsSnapshot,
@@ -942,7 +959,13 @@ export class VscodeReliableKernelCommandRouter {
     payload: LlmProviderModelsGetPayload,
     correlationId?: string
   ): Promise<void> {
-    const models = await this.product.providerRegistry.listModels(payload.config);
+    if (payload.probeThinking === true) {
+      await this.postThinkingProbe(webview, payload, correlationId);
+      return;
+    }
+    const models = payload.probeNative === true
+      ? [await this.product.providerRegistry.verifyNativeCompaction(payload.config)]
+      : await this.product.providerRegistry.listModels(payload.config);
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.LlmProviderModelsSnapshot,
@@ -950,9 +973,41 @@ export class VscodeReliableKernelCommandRouter {
       correlationId,
       payload: {
         configId: payload.config.id,
+        ...(payload.probeNative === true ? { purpose: 'capability_probe' } : {}),
         provider: payload.config.provider,
         baseUrl: payload.config.baseUrl,
         models
+      }
+    });
+  }
+
+  /**
+   * “测试这个模型”：结果与失败都按请求 id 回给设置页，由设置页显示在对应模型旁边；
+   * 失败不弹 VS Code 警告，也不当成“获取 LLM 列表失败”。
+   */
+  private async postThinkingProbe(
+    webview: vscode.Webview,
+    payload: LlmProviderModelsGetPayload,
+    correlationId?: string
+  ): Promise<void> {
+    let model;
+    try {
+      model = await this.product.providerRegistry.probeOpenAICompatibleThinking(payload.config);
+    } catch (error) {
+      this.postRequestError(webview, BridgeMessageType.LlmProviderModelsGet, error instanceof Error ? error.message : String(error), correlationId);
+      return;
+    }
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.LlmProviderModelsSnapshot,
+      channel: 'state',
+      correlationId,
+      payload: {
+        configId: payload.config.id,
+        purpose: 'thinking_probe',
+        provider: payload.config.provider,
+        baseUrl: payload.config.baseUrl,
+        models: [model]
       }
     });
   }
@@ -1657,11 +1712,18 @@ export class VscodeReliableKernelCommandRouter {
     conversationId: string
   ): Promise<void> {
     const commandId = requireText(payload.command?.commandId, 'compression commandId');
+    if (payload.sourceReplay !== undefined && payload.sourceReplay !== 'immutable_provenance') {
+      throw new TypeError('compression sourceReplay is invalid.');
+    }
+    if (payload.sourceReplay && payload.target.kind !== 'current_head') {
+      throw new Error('从原始记录重建摘要必须明确选择当前完整上下文。');
+    }
     await this.requireRow('Conversation', conversationId);
     const replay = await this.product.conversations.inspectManualCompression?.({
       commandId,
       conversationId,
-      target: payload.target
+      target: payload.target,
+      sourceReplay: payload.sourceReplay
     });
     if (replay) {
       const replayRejected = replay.terminal
@@ -1701,6 +1763,9 @@ export class VscodeReliableKernelCommandRouter {
     let compressSegmentCount: number;
     if (payload.target.kind === 'current_head') {
       const frozenRootId = requireText(payload.target.expectedRootId, 'compression target.expectedRootId');
+      if (payload.sourceReplay && frozenRootId !== rootId) {
+        throw new Error('重建摘要的当前上下文已变化，请重新确认。');
+      }
       const frozenRoot = await this.requireRow('ContextSequenceRoot', frozenRootId);
       if (frozenRoot.conversation_id !== conversationId) {
         throw new Error('压缩目标 Context root 不属于当前 Conversation。');
@@ -1762,13 +1827,15 @@ export class VscodeReliableKernelCommandRouter {
             childExecutionId,
             conversationId,
             compressSegmentCount,
-            target: payload.target
+            target: payload.target,
+            ...(payload.sourceReplay ? { sourceReplay: payload.sourceReplay } : {})
           })
         : await this.product.conversations.manualCompression({
             commandId,
             conversationId,
             compressSegmentCount,
-            target: payload.target
+            target: payload.target,
+            ...(payload.sourceReplay ? { sourceReplay: payload.sourceReplay } : {})
           });
     } catch (error) {
       if (!isConversationHistoryBusyError(error)) throw error;
@@ -1796,6 +1863,47 @@ export class VscodeReliableKernelCommandRouter {
         compressionBlockId: compression.result.compressionBlockId
       } : {}),
       ...(compression?.status === 'skipped' ? { reasonCode: compression.reason } : {})
+    });
+  }
+
+  /**
+   * Read-only estimate shown before a rebuild from original records is confirmed. It resolves
+   * settings the way the rebuild will (after pending settings saves land) and never writes; every
+   * failure is answered in the dialog instead of a warning popup.
+   */
+  private async handleCompressionRebuildPreview(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    payload: CompressionRebuildPreviewGetPayload
+  ): Promise<void> {
+    const conversationId = requireText(payload.conversationId, 'conversationId');
+    const rootId = requireText(payload.expectedRootId, 'compression rebuild expectedRootId');
+    let result: CompressionRebuildPreviewResultPayload;
+    try {
+      await this.settingsSaveBarrier.flush();
+      await this.configurationMutationQueue;
+      await this.requireRow('Conversation', conversationId);
+      const childExecutionId = await this.childExecutionIdForConversation(conversationId);
+      const preview = await this.product.conversations.previewSourceReplayCompression({
+        conversationId,
+        expectedRootId: rootId,
+        ...(childExecutionId ? { childExecutionId } : {})
+      });
+      result = { conversationId, rootId, ...preview };
+    } catch (error) {
+      console.warn('[LimCode] Compression rebuild preview failed.', error);
+      result = {
+        conversationId,
+        rootId,
+        outcome: { kind: 'error', message: error instanceof Error ? error.message : String(error) }
+      };
+    }
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.CompressionRebuildPreviewResult,
+      channel: 'state',
+      correlationId,
+      payload: result
     });
   }
 
@@ -1879,6 +1987,7 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
+      channel: 'control',
       correlationId,
       payload: {
         requestType: requestKind,
@@ -1943,6 +2052,7 @@ export class VscodeReliableKernelCommandRouter {
       this.post(webview, {
         id: randomUUID(),
         type: BridgeMessageType.InteractionResult,
+        channel: 'control',
         correlationId,
         payload: {
           requestType: BridgeMessageType.ToolExecutionCancel,
@@ -1963,6 +2073,7 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
+      channel: 'control',
       correlationId,
       payload: {
         requestType: BridgeMessageType.ToolExecutionCancel,
@@ -2000,6 +2111,7 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
+      channel: 'control',
       correlationId,
       payload: {
         requestType: BridgeMessageType.ProcessStop,
@@ -2068,7 +2180,7 @@ export class VscodeReliableKernelCommandRouter {
     return listAllDomainRows(this.product.application.database, domain, where);
   }
 
-  private broadcastOrPost(webview: vscode.Webview, message: unknown): void {
+  private broadcastOrPost(webview: vscode.Webview, message: ExtensionToWebviewMessage): void {
     if (this.options.broadcast) this.options.broadcast(message);
     else this.post(webview, message);
   }
@@ -2078,11 +2190,8 @@ export class VscodeReliableKernelCommandRouter {
     requestType: BridgeMessageType,
     message: string,
     correlationId?: string,
-    details: {
+    details: Pick<BridgeErrorPayload, 'code' | 'actualRevision' | 'conversationId'> & {
       section?: GlobalSettingsGetPayload['section'];
-      code?: 'settings_revision_conflict' | 'stale_conversation';
-      actualRevision?: string;
-      conversationId?: string;
     } = {}
   ): void {
     const { section, ...payloadDetails } = details;
@@ -2100,7 +2209,7 @@ export class VscodeReliableKernelCommandRouter {
     });
   }
 
-  private post(webview: vscode.Webview, message: unknown): void {
+  private post(webview: vscode.Webview, message: ExtensionToWebviewMessage): void {
     void webview.postMessage(toStructuredClonePlainData(message, 'reliable command result')).then(
       (delivered) => {
         if (delivered) return;

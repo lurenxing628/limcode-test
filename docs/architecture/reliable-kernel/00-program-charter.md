@@ -118,7 +118,7 @@ Stage F 拥有：
 
 激活前失败：active pointer 不变，按 journal 逆序恢复；激活后失败：只修复新内核，不回退旧 writer。
 
-`runtimeKernelEpoch` bump 默认等于 Runtime 数据归档重置，不建立旧格式 migration chain。当前为保留已经实际落盘的对话历史，只允许一次精确 `epoch 3 → 4` 离线升级；升级器完整核对 predecessor DDL/manifest/RootBinding 指纹、先做一致性备份并通过 durable journal 向前恢复，一次创建包括 `RuntimeDeliveryIntentLink` 在内的四张新关系表，并仅把身份与旧 CAS 完全吻合的 Child Runtime continuation 离线转换为当前 envelope + Link，不提供运行时 fallback。
+`runtimeKernelEpoch` bump 等于 Runtime 数据归档重置，不建立旧格式 migration chain。当前 epoch 5 新增协作消息与留言板的独立领域；旧 epoch 3、4 等根目录在维护互斥和 Host 离线核验后完整归档，独立配置与 Workspace 保留。当前 epoch schema 只读核对完整物理对象与 manifest，缺表和未知漂移均拒绝，已退休升级器不再参与启动。
 
 ## 8. 范围与阶段
 

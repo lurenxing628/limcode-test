@@ -12,12 +12,7 @@
 
 当前项目仍然处于开发模式，因此不要对旧格式有任何兜底，也不需要保留旧功能代码的兼容和体验，也不需要写什么协议v1，v2等之类的运行时内部版本号，全面使用新格式新功能更优秀的代码。
 
-允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。为保留已落盘对话，当前仅有以下两个已列入机器合同的有界例外：
-
-- 精确`Runtime epoch 3 → 4`离线升级：数据库打开前核对table/index/trigger/manifest/RootBinding完整指纹，只接受合同列出的两套已发布前驱；使用SQLite Backup API持久备份，通过pending pointer、单事务和durable journal向前恢复。
-- epoch 4内精确补`RuntimeDeliveryIntentLink`：其他物理对象、manifest元数据和RootBinding必须完全符合当前定义，只允许缺少这一张关系表；单事务补表及身份严格核验的旧Child Runtime continuation转换，不允许顺带修复`client_mapping`、digest或其他metadata漂移。
-
-任何未知漂移仍fail closed，不得根据任意旧字段值推导“可兼容”schema，也不得把这些例外扩展成通用迁移链。
+允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。当前 Runtime epoch 为 5。旧 epoch 3→4 的离线升级和 epoch 4 内补 RuntimeDeliveryIntentLink 的有界入口已经退休，不得将其继续套用到当前 schema。旧 epoch 通过现有维护互斥、完整 RootBinding 校验与离线 archive/reset 保留原 Runtime 归档，再创建 epoch 5；配置和 Workspace 独立保留。当前 epoch 内任何 table/index/trigger/manifest/RootBinding 漂移均 fail closed，不补表、不修 metadata、不维护通用迁移链。
 
 ### 1.1 独立领域对象必须独立建模
 

@@ -24,20 +24,24 @@ const {
 const { readAgentAnswerTool } = fromDist('backend/world/modules/tools/definitions/agentAnswer/index.js');
 const { deleteTool } = fromDist('backend/world/modules/tools/definitions/delete/index.js');
 
-test('Agent 工具声明说明异步用法，并只标记无条件必填参数', () => {
-  assert.match(runAgentTool.declaration.description, /Reuse answerBridgeId/);
+test('Agent 工具声明要求显式操作，异步派发与既有任务操作分开', () => {
+  assert.match(runAgentTool.declaration.description, /spawn/);
+  assert.match(runAgentTool.declaration.description, /send/);
+  assert.match(runAgentTool.declaration.description, /answerBridgeId/);
   assert.match(runAgentTool.declaration.description, /queues after the current child turn/);
-  assert.match(runAgentTool.declaration.description, /Do not repeatedly poll read_agent_answer/);
   assert.equal(runAgentTool.declaration.parameters.properties.interrupt.type, 'boolean');
   assert.equal(runAgentTool.declaration.parameters.properties.taskName.type, 'string');
-  assert.match(runAgentTool.declaration.parameters.properties.foregroundWaitMs.description, /Optional in run mode/);
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.type, 'integer');
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.minimum, 0);
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.maximum, 86_400_000);
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.multipleOf, undefined);
 
-  assert.equal(runAgentTool.declaration.parameters.required, undefined,
-    'prompt 只在 run 模式必填，不能让 interrupt 模式也被 JSON schema 拒绝');
+  assert.deepEqual(runAgentTool.declaration.parameters.required, ['operation'],
+    '所有调用必须说明操作，spawn/send 的条件参数由执行器校验，list 不要求 prompt');
+  assert.deepEqual(runAgentTool.declaration.parameters.properties.operation.enum,
+    ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree']);
+  assert.equal(runAgentTool.declaration.parameters.properties.mode, undefined,
+    '旧 mode 不再进入模型工具合同');
   assert.deepEqual(readAgentAnswerTool.declaration.parameters.required, ['answerBridgeId']);
   assert.deepEqual(deleteTool.declaration.parameters.required, ['paths']);
 
@@ -62,7 +66,7 @@ test('Agent 工具声明说明异步用法，并只标记无条件必填参数',
   assert.equal(runAgentToolAvailableAtDepth(0, { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 0 }), false);
 });
 
-test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 interrupt 的 prompt 校验保持分开', async () => {
+test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，spawn 与 interrupt_subtree 的 prompt 校验保持分开', async () => {
   const toolCallId = 'optional-wait-tool-call';
   const answerBridgeId = stablePhaseFId('answer_bridge', toolCallId);
   let spawnCommand;
@@ -74,9 +78,14 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
       conversationOwners: createRetainedConversationOwners(),
       async snapshot(reads) {
         return {
-          snapshot: reads.map((read) => read.kind === 'list'
-            ? []
-            : { id: read.id, child_execution_id: 'interrupt-child' })
+          snapshot: reads.map((read) => {
+            if (read.kind === 'list') return [];
+            if (read.domain === 'Turn' && read.id === 'parent-turn') {
+              return { id: read.id, conversation_id: 'parent-conversation', status: 'active' };
+            }
+            if (read.domain === 'ToolCall') return { id: read.id, turn_id: 'parent-turn' };
+            return null;
+          })
         };
       }
     },
@@ -108,20 +117,35 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
       async finalizeWaitSettlement(requestedToolCallId) {
         return { toolCallId: requestedToolCallId, status: 'succeeded' };
       },
+      async readConversationTaskProjection(conversationId) {
+        assert.equal(conversationId, 'parent-conversation');
+        return {
+          conversationId,
+          revision: 'fixture-child-task-revision',
+          snapshotCommitSeq: '1',
+          tasks: ['continuation', 'interrupt'].map((kind) => ({
+            childExecutionId: `${kind}-child`,
+            answerBridgeId: `${kind}-bridge`,
+            parentConversationId: conversationId,
+            conversationId: `${kind}-conversation`,
+            depth: 1
+          }))
+        };
+      },
       async readExecutionSnapshot(childExecutionId) {
         return {
           childExecution: {
             id: childExecutionId,
-            status: 'active',
-            child_conversation_id: 'interrupt-conversation'
+            status: 'idle',
+            child_conversation_id: childExecutionId.replace('-child', '-conversation')
           }
         };
       },
       async send() {
         return { turnIntentId: 'continuation-intent' };
       },
-      async admitQueuedIntent() {
-        return { childExecutionId: 'interrupt-child', turnId: 'continuation-turn' };
+      async admitQueuedIntent(command) {
+        return { childExecutionId: command.childExecutionId, turnId: 'continuation-turn' };
       },
       async interruptSubtree() {
         return {
@@ -156,7 +180,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     modelRequestId: 'parent-request',
     toolCallId,
     toolName: 'run_agent',
-    arguments: { prompt: 'inspect in the background', agent: { type: 'worker' } }
+    arguments: { operation: 'spawn', taskName: 'Inspect background behavior', prompt: 'inspect in the background', agent: { type: 'worker' } }
   }, undefined, frozenRunAgentAuthority(1));
   assert.deepEqual(resolvedSelection, { agentType: 'worker' });
   assert.equal(spawnCommand.completionPolicy, 'background');
@@ -180,7 +204,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     modelRequestId: 'missing-prompt-request',
     toolCallId: 'missing-prompt-tool-call',
     toolName: 'run_agent',
-    arguments: { mode: 'run' }
+    arguments: { operation: 'spawn', taskName: 'Validate missing prompt' }
   }), /run_agent\.prompt must be non-empty/);
 
   const maxZeroAuthority = frozenRunAgentAuthority(0);
@@ -190,7 +214,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     toolCallId: 'continuation-tool-call',
     toolName: 'run_agent',
     arguments: {
-      mode: 'run',
+      operation: 'send',
       prompt: 'continue the same child',
       answerBridgeId: 'continuation-bridge'
     }
@@ -203,7 +227,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     modelRequestId: 'interrupt-request',
     toolCallId: 'interrupt-tool-call',
     toolName: 'run_agent',
-    arguments: { mode: 'interrupt', answerBridgeId: 'interrupt-bridge' }
+    arguments: { operation: 'interrupt_subtree', answerBridgeId: 'interrupt-bridge' }
   }, undefined, maxZeroAuthority);
   assert.equal(interrupted.disposition, 'settled');
 });
@@ -234,13 +258,22 @@ test('可靠 run_agent 按冻结策略和持久父链限制新建子 Agent 的�
   assert.equal(firstLevelAllowed.spawnCount(), 1);
 });
 
-test('run_agent 按设置上限和当前持久层级动态出现在模型工具列表中', async () => {
-  assert.deepEqual(await visibleToolNames(3, []), ['read', 'run_agent']);
-  assert.deepEqual(await visibleToolNames(3, ['child-1']), ['read', 'run_agent']);
-  assert.deepEqual(await visibleToolNames(3, ['child-2', 'child-1']), ['read', 'run_agent']);
-  assert.deepEqual(await visibleToolNames(3, ['child-3', 'child-2', 'child-1']), ['read']);
-  assert.deepEqual(await visibleToolNames(3, ['child-4', 'child-3', 'child-2', 'child-1']), ['read']);
-  assert.deepEqual(await visibleToolNames(0, []), ['read']);
+test('达到深度上限只移除 spawn，模型仍能查询和操作已有子 Agent', async () => {
+  for (const [maxDepth, lineage, spawnAllowed] of [
+    [3, [], true],
+    [3, ['child-1'], true],
+    [3, ['child-2', 'child-1'], true],
+    [3, ['child-3', 'child-2', 'child-1'], false],
+    [3, ['child-4', 'child-3', 'child-2', 'child-1'], false],
+    [0, [], false]
+  ]) {
+    const definitions = await visibleToolDefinitions(maxDepth, lineage);
+    assert.deepEqual(definitions.map((definition) => definition.name).sort(), ['read', 'run_agent']);
+    const childTool = definitions.find((definition) => definition.name === 'run_agent');
+    assert.deepEqual(childTool.parameters.properties.operation.enum,
+      spawnAllowed ? ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree']
+        : ['send', 'list', 'read', 'wait', 'interrupt_subtree']);
+  }
 });
 
 test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后的重驱动', { timeout: 10_000 }, async () => {
@@ -405,7 +438,7 @@ function runAgentInput(suffix) {
     modelRequestId: `parent-request-${suffix}`,
     toolCallId: `tool-call-${suffix}`,
     toolName: 'run_agent',
-    arguments: { mode: 'run', prompt: `task-${suffix}`, agent: { type: 'worker' } }
+    arguments: { operation: 'spawn', taskName: `Inspect ${suffix}`, prompt: `task-${suffix}`, agent: { type: 'worker' } }
   };
 }
 
@@ -492,7 +525,7 @@ function createDepthCoordinator(lineageFromCurrentToRoot) {
   };
 }
 
-async function visibleToolNames(maxDepth, lineageFromCurrentToRoot) {
+async function visibleToolDefinitions(maxDepth, lineageFromCurrentToRoot) {
   const database = {
     async snapshot(reads) {
       return {
@@ -563,5 +596,5 @@ async function visibleToolNames(maxDepth, lineageFromCurrentToRoot) {
       }
     }
   });
-  return (await dispatcher.definitions('visibility-turn')).map((definition) => definition.name).sort();
+  return dispatcher.definitions('visibility-turn');
 }

@@ -1,3 +1,4 @@
+import { normalizeModelCapabilitySnapshot } from '../../../shared/modelCapabilities';
 import * as vscode from 'vscode';
 import type {
   LlmGenerationConfigRecord,
@@ -15,9 +16,11 @@ import type {
   LlmRequestBodyRecord,
   LlmThinkingConfigRecord,
   LlmThinkingLevel,
-  LlmToolCallFormat
+  LlmToolCallFormat,
+  OpenAICompatibleThinkingFormat
 } from '../../../shared/protocol';
 import {
+  canonicalLlmProviderKind,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
   DEFAULT_LLM_RETRY_DELAY_SECONDS,
@@ -30,6 +33,7 @@ import {
 } from '../../../shared/protocol';
 import { normalizeOpenAIResponsesNativeSettings } from '../../../shared/openAIResponsesCapabilities';
 import { DEFAULT_LLM_BASE_URL } from '../llmProvider';
+import { forgetProviderRequestAdaptations } from '../providerParameterAdaptation';
 import { isSettingsRevisionConflictError } from '../settingsRevisionConflict';
 import type { StoragePaths } from './paths';
 import { INDEX_FILE } from './constants';
@@ -93,6 +97,11 @@ export async function saveLlmProviderConfigsSettings(
     (record) => record.name,
     { expectedRevision, section: REVISION_SECTION, pruneMissing: true }
   );
+  // 改过或删掉的渠道：之前按这个渠道学到的请求适配（去掉的参数、退回的提醒方式）全部作废，按新配置重新试探。
+  const saved = new Map(committed.records.map((record) => [record.id, JSON.stringify(record)]));
+  for (const previous of committed.previousRecords) {
+    if (saved.get(previous.id) !== JSON.stringify(previous)) forgetProviderRequestAdaptations(previous.id);
+  }
   return {
     ...providerSettingsFromSnapshot(indexUri, committed),
     previousSettings: providerSettingsFromRecords(committed.previousRecords)
@@ -131,7 +140,10 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
   const updatedAt = finiteTimestamp(input?.updatedAt, createdAt);
   const model = typeof input?.model === 'string' && input.model.trim() ? input.model.trim() : fallback.model;
   const models = normalizeProviderModels(input?.models, model);
-  const provider = isKnownProvider(input?.provider) ? input.provider : fallback.provider;
+  // DeepSeek 渠道并入 OpenAI 兼容（方言按接口地址和模型识别）；没填地址的沿用原 DeepSeek 渠道的默认地址。
+  const legacyDeepSeek = (input?.provider as unknown) === 'deepseek';
+  const provider = canonicalLlmProviderKind(input?.provider) ?? fallback.provider;
+  const openaiCompatibleThinkingFormat = normalizeThinkingFormat(input?.openaiCompatibleThinkingFormat);
   const headers = normalizeHeaders(input?.headers);
   const generationConfig = normalizeGenerationConfig(input?.generationConfig);
   const requestBody = normalizeRequestBody(input?.requestBody);
@@ -143,7 +155,7 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
     id: stringOrDefault(input?.id, fallback.id),
     name: stringOrDefault(input?.name, fallback.name),
     provider,
-    baseUrl: stringOrDefault(input?.baseUrl, fallback.baseUrl),
+    baseUrl: stringOrDefault(input?.baseUrl, legacyDeepSeek ? LEGACY_DEEPSEEK_BASE_URL : fallback.baseUrl),
     model,
     models,
     apiKey: typeof input?.apiKey === 'string' ? input.apiKey.trim() : fallback.apiKey,
@@ -158,6 +170,10 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
     systemPromptPrefix: normalizeSystemPromptPrefix(input?.systemPromptPrefix),
     promptCache,
     ...(nativeResponses ? { nativeResponses } : {}),
+    // 只在打开时保存；关闭与缺省完全相同，已有配置记录逐字节不变。
+    ...(input?.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
+    // 只在手动指定时保存；缺省为自动识别，已有配置记录逐字节不变。
+    ...(openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat } : {}),
     ...(headers ? { headers } : {}),
     ...(generationConfig ? { generationConfig } : {}),
     ...(requestBody ? { requestBody } : {}),
@@ -214,7 +230,8 @@ function normalizeProviderModels(input: LlmProviderModelRecord[] | undefined, ac
     if (!id) continue;
     const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : id;
     const createdAt = typeof item.createdAt === 'string' && item.createdAt.trim() ? item.createdAt.trim() : undefined;
-    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}) });
+    const capabilitySnapshot = normalizeModelCapabilitySnapshot(item.capabilitySnapshot);
+    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}), ...(capabilitySnapshot ? { capabilitySnapshot } : {}) });
   }
 
   if (activeModel && !byId.has(activeModel)) {
@@ -258,6 +275,11 @@ function normalizeModelConfigs(
       systemPromptPrefix: normalizeSystemPromptPrefix(item.systemPromptPrefix),
       promptCache,
       ...(nativeResponses ? { nativeResponses } : {}),
+      // 模型级配置可以显式关闭（false）以覆盖渠道默认；缺省跟随渠道。
+      ...(typeof item.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: item.claudeTurnScopedReminders } : {}),
+      // 模型级缺省跟随渠道。
+      ...(normalizeThinkingFormat(item.openaiCompatibleThinkingFormat)
+        ? { openaiCompatibleThinkingFormat: normalizeThinkingFormat(item.openaiCompatibleThinkingFormat) } : {}),
       ...(headers ? { headers } : {}),
       ...(generationConfig ? { generationConfig } : {}),
       ...(requestBody ? { requestBody } : {}),
@@ -272,8 +294,13 @@ function normalizeModelConfigs(
   });
 }
 
-function isKnownProvider(provider: unknown): provider is LlmProviderKind {
-  return provider === 'openai-compatible' || provider === 'openai-responses' || provider === 'claude' || provider === 'gemini' || provider === 'deepseek';
+/** 原 DeepSeek 渠道类型的默认地址；迁移时只给没填地址的记录使用。 */
+const LEGACY_DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
+
+function normalizeThinkingFormat(value: unknown): OpenAICompatibleThinkingFormat | undefined {
+  return value === 'deepseek' || value === 'enable_thinking' || value === 'reasoning_effort' || value === 'omit'
+    ? value
+    : undefined;
 }
 
 function providerDefaultContextWindow(_provider: LlmProviderKind): number {

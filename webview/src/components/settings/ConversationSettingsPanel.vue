@@ -4,6 +4,7 @@ import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingI
 import { useConversationSettingsStore } from '@webview/stores/useConversationSettingsStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 import ToolPolicyEditor from '@webview/components/settings/tools/ToolPolicyEditor.vue';
+import AgentCollaborationSettings from '@webview/components/settings/agent/AgentCollaborationSettings.vue';
 import SkillPolicyEditor from '@webview/components/settings/skills/SkillPolicyEditor.vue';
 import WorkEnvironmentPolicyEditor from '@webview/components/settings/workEnvironment/WorkEnvironmentPolicyEditor.vue';
 import CheckpointPolicyEditor from '@webview/components/settings/checkpoints/CheckpointPolicyEditor.vue';
@@ -41,6 +42,13 @@ function reload(): void {
     <p class="settings-note">
       对话名称会直接保存；LLM 设置由单独的配置管理。
     </p>
+
+    <AgentCollaborationSettings
+      v-if="hasConversation"
+      scope-kind="conversation"
+      :scope-id="settings.common.conversationId"
+      title="对话 Agent 协作"
+    />
 
     <SystemPromptScopeEditor
       v-if="hasConversation"

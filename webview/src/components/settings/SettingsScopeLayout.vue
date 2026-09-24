@@ -104,6 +104,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="settings-panel" :aria-label="settingsLabel">
+    <div class="settings-tabs-shell">
     <aside ref="tabsContainer" class="settings-tabs" :aria-label="`${settingsLabel}页签`">
       <span class="settings-tab-active-marker" :style="activeTabMarkerStyle" aria-hidden="true"></span>
       <button
@@ -129,6 +130,8 @@ onBeforeUnmount(() => {
         </span>
       </button>
     </aside>
+    <AdvancedScrollbar class="settings-tabs-scrollbar" :scroller="tabsContainer" variant="minimal" orientation="horizontal" />
+    </div>
 
     <div class="settings-content-shell">
       <div ref="contentScroller" class="settings-content">
@@ -159,9 +162,21 @@ onBeforeUnmount(() => {
   background: var(--vscode-editor-background);
 }
 
+.settings-tabs-shell {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.settings-tabs-scrollbar {
+  display: none;
+}
+
 .settings-tabs {
   position: relative;
   min-width: 0;
+  height: 100%;
   padding: var(--space-2);
   border-right: 1px solid var(--vscode-panel-border);
   display: flex;
@@ -331,6 +346,16 @@ onBeforeUnmount(() => {
     border-right: 0;
     border-bottom: 1px solid var(--vscode-panel-border);
     flex-direction: row;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .settings-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .settings-tabs-scrollbar {
+    display: flex;
   }
 
   .settings-tab-active-marker {
@@ -338,7 +363,18 @@ onBeforeUnmount(() => {
   }
 
   .settings-tab {
-    min-height: 52px;
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 44px;
+    grid-template-columns: 18px max-content;
+  }
+
+  .tab-label {
+    white-space: nowrap;
+  }
+
+  .tab-description {
+    display: none;
   }
 }
 

@@ -20,7 +20,7 @@ export const readAgentAnswerToolModule = defineToolDefinitionModule({
 export const submitAgentAnswerTool: ToolDefinition = {
   declaration: {
     name: SUBMIT_AGENT_ANSWER_TOOL_NAME,
-    description: "Submit this AgentRun's interim conclusion or final answer to a given answerBridgeId. When answerBridgeId is omitted, the default answerBridgeId assigned to the current run_agent task is used; pass answerBridgeId explicitly to submit to a different answer channel. If a background submission is delivered while the parent conversation is still responding, it interrupts that response and force-sends the answer notification instead of waiting in the normal queue.",
+    description: "Submit an interim conclusion or final answer through the current child task's own answer bridge. Omit answerBridgeId to use its default bridge; an explicit bridge must belong to this exact child execution. The parent absorbs delivery at a safe input boundary. Use send_agent_message for peer communication and followup_agent_task for a new assignment to an existing peer; neither changes the original parent answer channel.",
     parameters: {
       type: 'object',
       properties: {
@@ -50,11 +50,12 @@ export const submitAgentAnswerTool: ToolDefinition = {
 export const readAgentAnswerTool: ToolDefinition = {
   declaration: {
     name: READ_AGENT_ANSWER_TOOL_NAME,
-    description: 'Read a saved AgentAnswer body by the answerBridgeId returned in a run_agent or submit_agent_answer response. Does not read the regular conversation transcript. When no submitted answer is available yet, the response distinguishes these cases via a "status" field: "running" — the child conversation is still active (including after a manual retry) and has not submitted yet. This is NOT a failure: do not poll repeatedly in the same response and do not interrupt just because it is slow; continue independent work, then end the current turn when waiting for submit_agent_answer notification is all that remains. "failed" — the child Run ended with the returned error. "interrupted" — the child conversation exists but has no active Run or submitted answer; call run_agent({ answerBridgeId, prompt }) to continue/append that same child conversation and keep the same default submit_agent_answer bridge. "not_found" — the answerBridgeId does not match any answer or child conversation.',
+    description: 'Read a saved AgentAnswer body by the answerBridgeId returned in a run_agent or submit_agent_answer response. Does not read the regular conversation transcript. When no submitted answer is available yet, the response distinguishes these cases via a "status" field: "running" — the child conversation is still active (including after a manual retry) and has not submitted yet. This is NOT a failure: do not poll repeatedly in the same response and do not interrupt just because it is slow; continue independent work, then end the current turn when waiting for submit_agent_answer notification is all that remains. "failed" — the child Run ended with the returned error. "interrupted" — the child conversation exists but has no active Run or submitted answer; call run_agent({ operation: "send", answerBridgeId, prompt }) to continue/append that same child conversation and keep the same default submit_agent_answer bridge. "not_found" — the answerBridgeId does not match any answer or child conversation.',
     parameters: {
       type: 'object',
       properties: {
-        answerBridgeId: { type: 'string', description: 'The answerBridgeId returned by run_agent or submit_agent_answer.' }
+        answerBridgeId: { type: 'string', description: 'A child reference within the current conversation parent lineage.' },
+        scope: { type: 'string', enum: ['direct', 'tree'], description: 'Defaults to direct children. tree permits verified descendants.' }
       },
       required: ['answerBridgeId']
     },

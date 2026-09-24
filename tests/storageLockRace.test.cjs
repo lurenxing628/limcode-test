@@ -90,6 +90,321 @@ function missingPathError(target) {
   });
 }
 
+function injectedFsError(code, syscall, target) {
+  return Object.assign(new Error(`${code}: injected ${syscall} failure at '${target}'`), {
+    code, syscall, path: String(target)
+  });
+}
+
+for (const operation of ['read', 'rename']) {
+  test(`async release retries a temporary ${operation} failure without repeating the action`, async () => {
+    const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-release-retry-'));
+    const indexPath = path.join(rootPath, 'index.json');
+    const lockPath = `${indexPath}.lock`;
+    const ownerPath = path.join(lockPath, 'owner.json');
+    const originalReadFile = fsp.readFile;
+    const originalRename = fsp.rename;
+    const fault = injectedFsError(operation === 'read' ? 'EACCES' : 'EBUSY', operation, ownerPath);
+    let actionRuns = 0;
+    let failures = 0;
+    try {
+      fsp.readFile = async (target, ...options) => {
+        if (operation === 'read' && actionRuns === 1 && String(target) === ownerPath && failures++ < 2) throw fault;
+        return originalReadFile(target, ...options);
+      };
+      fsp.rename = async (source, destination) => {
+        if (operation === 'rename' && String(source) === lockPath && failures++ < 2) throw fault;
+        return originalRename(source, destination);
+      };
+      const result = await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+        actionRuns += 1;
+        return 'saved';
+      });
+      assert.equal(result, 'saved');
+      assert.equal(actionRuns, 1);
+      assert.ok(failures >= 3);
+      assert.deepEqual(await fsp.readdir(rootPath), []);
+      await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => { actionRuns += 1; });
+      assert.equal(actionRuns, 2);
+    } finally {
+      fsp.readFile = originalReadFile;
+      fsp.rename = originalRename;
+      await fsp.rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  test(`a completed owner survives repeated ${operation} release failures and is released before the next action`, { timeout: 10_000 }, async () => {
+    const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-pending-release-'));
+    const indexPath = path.join(rootPath, 'index.json');
+    const lockPath = `${indexPath}.lock`;
+    const ownerPath = path.join(lockPath, 'owner.json');
+    const originalReadFile = fsp.readFile;
+    const originalRename = fsp.rename;
+    const fault = injectedFsError('EACCES', operation, ownerPath);
+    let actionRuns = 0;
+    let denyRelease = true;
+    let failures = 0;
+    let firstOwner;
+    let recoveredOwner;
+    try {
+      fsp.readFile = async (target, ...options) => {
+        if (operation === 'read' && actionRuns > 0 && String(target) === ownerPath && denyRelease) {
+          failures += 1;
+          throw fault;
+        }
+        return originalReadFile(target, ...options);
+      };
+      fsp.rename = async (source, destination) => {
+        if (String(source) === lockPath) {
+          if (operation === 'rename' && denyRelease) {
+            failures += 1;
+            throw fault;
+          }
+          recoveredOwner ??= JSON.parse(await originalReadFile(ownerPath, 'utf8'));
+        }
+        return originalRename(source, destination);
+      };
+      await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+        firstOwner = JSON.parse(await originalReadFile(ownerPath, 'utf8'));
+        actionRuns += 1;
+      }), (error) => error.cause === fault && /release/.test(error.message));
+      assert.ok(failures > 1 && failures <= 100, 'release retries must be bounded');
+      await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+        actionRuns += 1;
+      }), (error) => error.cause === fault);
+      assert.equal(actionRuns, 1, 'a new action cannot enter while the completed owner remains locked');
+      assert.deepEqual(JSON.parse(await originalReadFile(ownerPath, 'utf8')), firstOwner);
+      denyRelease = false;
+      await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+        const nextOwner = JSON.parse(await originalReadFile(ownerPath, 'utf8'));
+        assert.notEqual(nextOwner.ownerToken, firstOwner.ownerToken);
+        assert.deepEqual(recoveredOwner, firstOwner, 'only the completed owner may be released during recovery');
+        actionRuns += 1;
+      });
+      assert.equal(actionRuns, 2);
+      assert.deepEqual(await fsp.readdir(rootPath), []);
+    } finally {
+      fsp.readFile = originalReadFile;
+      fsp.rename = originalRename;
+      await fsp.rm(rootPath, { recursive: true, force: true });
+    }
+  });
+}
+
+test('an old live owner with the same PID is not treated as a completed local action', async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-live-owner-'));
+  const indexPath = path.join(rootPath, 'index.json');
+  const lockPath = `${indexPath}.lock`;
+  const ownerPath = path.join(lockPath, 'owner.json');
+  const originalReadFile = fsp.readFile;
+  const originalNow = Date.now;
+  let clockOffset = 0;
+  const owner = { ownerToken: 'live-owner', pid: process.pid, createdAt: Date.now() - 60_000, indexPath };
+  try {
+    await fsp.mkdir(lockPath);
+    await fsp.writeFile(ownerPath, JSON.stringify(owner));
+    Date.now = () => originalNow() + clockOffset;
+    fsp.readFile = async (target, ...options) => {
+      const raw = await originalReadFile(target, ...options);
+      if (String(target) === ownerPath) clockOffset = 31_000;
+      return raw;
+    };
+    let actionRuns = 0;
+    await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+      actionRuns += 1;
+    }), /Timed out waiting for record store lock/);
+    assert.equal(actionRuns, 0);
+    assert.deepEqual(JSON.parse(await originalReadFile(ownerPath, 'utf8')), owner);
+    assert.deepEqual(await fsp.readdir(rootPath), ['index.json.lock']);
+  } finally {
+    fsp.readFile = originalReadFile;
+    Date.now = originalNow;
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
+
+test('a failed action retains both errors and still permits its completed owner to be released later', async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-action-and-release-'));
+  const indexPath = path.join(rootPath, 'index.json');
+  const ownerPath = path.join(`${indexPath}.lock`, 'owner.json');
+  const originalReadFile = fsp.readFile;
+  const actionError = new Error('configuration write failed');
+  const releaseError = injectedFsError('EIO', 'read', ownerPath);
+  let actionRuns = 0;
+  try {
+    fsp.readFile = async (target, ...options) => {
+      if (String(target) === ownerPath) throw releaseError;
+      return originalReadFile(target, ...options);
+    };
+    await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+      actionRuns += 1;
+      throw actionError;
+    }), (error) => error.cause === actionError && error.actionError === actionError
+      && error.releaseError.cause === releaseError);
+    fsp.readFile = originalReadFile;
+    await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => { actionRuns += 1; });
+    assert.equal(actionRuns, 2);
+    assert.deepEqual(await fsp.readdir(rootPath), []);
+  } finally {
+    fsp.readFile = originalReadFile;
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
+
+test('release retries recheck the owner and a later queued recovery preserves its replacement', async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-release-replacement-'));
+  const indexPath = path.join(rootPath, 'index.json');
+  const lockPath = `${indexPath}.lock`;
+  const ownerPath = path.join(lockPath, 'owner.json');
+  const originalReadFile = fsp.readFile;
+  const originalRename = fsp.rename;
+  const originalNow = Date.now;
+  let clockOffset = 0;
+  let replacement;
+  let replacementReads = 0;
+  let movedReplacement = false;
+  try {
+    fsp.rename = async (source, destination) => {
+      if (String(source) === lockPath) {
+        if (!replacement) {
+          await originalRename(source, path.join(rootPath, 'released-original'));
+          replacement = { ownerToken: 'replacement', pid: process.pid, createdAt: Date.now(), indexPath };
+          await fsp.mkdir(lockPath);
+          await fsp.writeFile(ownerPath, JSON.stringify(replacement));
+          throw injectedFsError('EBUSY', 'rename', source);
+        }
+        movedReplacement = true;
+      }
+      return originalRename(source, destination);
+    };
+    await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => undefined),
+      (error) => /owner changed/.test(error.cause?.message));
+    Date.now = () => originalNow() + clockOffset;
+    fsp.readFile = async (target, ...options) => {
+      const raw = await originalReadFile(target, ...options);
+      if (String(target) === ownerPath && ++replacementReads >= 2) clockOffset = 31_000;
+      return raw;
+    };
+    await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+      assert.fail('replacement owner must remain locked');
+    }), /Timed out waiting for record store lock/);
+    assert.equal(movedReplacement, false);
+    assert.deepEqual(JSON.parse(await originalReadFile(ownerPath, 'utf8')), replacement);
+  } finally {
+    fsp.readFile = originalReadFile;
+    fsp.rename = originalRename;
+    Date.now = originalNow;
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
+
+test('Windows publication denied without an owner reports the filesystem cause within bounded retries', { timeout: 5_000 }, async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-publication-denied-'));
+  const indexPath = path.join(rootPath, 'index.json');
+  const lockPath = `${indexPath}.lock`;
+  const originalRename = fsp.rename;
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  let publicationAttempts = 0;
+  let lastFault;
+  try {
+    Object.defineProperty(process, 'platform', { ...platformDescriptor, value: 'win32' });
+    fsp.rename = async (source, destination) => {
+      if (String(destination) === lockPath) {
+        publicationAttempts += 1;
+        lastFault = injectedPublicationError(source, destination);
+        throw lastFault;
+      }
+      return originalRename(source, destination);
+    };
+    await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+      assert.fail('no action may run without publication');
+    }), (error) => error.cause === lastFault && /publish without an existing owner/.test(error.message));
+    assert.ok(publicationAttempts > 1 && publicationAttempts <= 100);
+    assert.deepEqual(await fsp.readdir(rootPath), []);
+  } finally {
+    fsp.rename = originalRename;
+    Object.defineProperty(process, 'platform', platformDescriptor);
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
+
+for (const operation of ['create', 'read', 'recover']) {
+  test(`acquisition ${operation} filesystem failure is not reported as contention`, async () => {
+    const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-io-error-'));
+    const indexPath = path.join(rootPath, 'index.json');
+    const lockPath = `${indexPath}.lock`;
+    const ownerPath = path.join(lockPath, 'owner.json');
+    const originalMkdir = fsp.mkdir;
+    const originalReadFile = fsp.readFile;
+    const originalRename = fsp.rename;
+    const fault = injectedFsError(operation === 'create' ? 'EEXIST' : 'EIO', operation, lockPath);
+    try {
+      if (operation !== 'create') {
+        await fsp.mkdir(lockPath);
+        await fsp.writeFile(ownerPath, JSON.stringify({
+          ownerToken: 'dead-owner', pid: 2_147_483_647, createdAt: Date.now() - 60_000, indexPath
+        }));
+      }
+      fsp.mkdir = async (target, ...options) => {
+        if (operation === 'create' && String(target).startsWith(`${lockPath}.candidate-`)) throw fault;
+        return originalMkdir(target, ...options);
+      };
+      fsp.readFile = async (target, ...options) => {
+        if (operation === 'read' && String(target) === ownerPath) throw fault;
+        return originalReadFile(target, ...options);
+      };
+      fsp.rename = async (source, destination) => {
+        if (operation === 'recover' && String(source) === lockPath) throw fault;
+        return originalRename(source, destination);
+      };
+      await assert.rejects(recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+        assert.fail('acquisition failed');
+      }), (error) => error.cause === fault && !/Timed out/.test(error.message));
+    } finally {
+      fsp.mkdir = originalMkdir;
+      fsp.readFile = originalReadFile;
+      fsp.rename = originalRename;
+      await fsp.rm(rootPath, { recursive: true, force: true });
+    }
+  });
+}
+
+test('cleanup failure after owner-fenced release preserves the committed result and the next operation', async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-release-residue-'));
+  const indexPath = path.join(rootPath, 'index.json');
+  const lockPath = `${indexPath}.lock`;
+  const originalRm = fsp.rm;
+  const originalWarn = console.warn;
+  const fault = injectedFsError('EACCES', 'rm', lockPath);
+  const warnings = [];
+  let residuePath;
+  try {
+    console.warn = (...args) => { warnings.push(args); };
+    fsp.rm = async (target, ...options) => {
+      if (String(target) === residuePath) throw fault;
+      return originalRm(target, ...options);
+    };
+    const result = await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => {
+      const owner = JSON.parse(await fsp.readFile(path.join(lockPath, 'owner.json'), 'utf8'));
+      residuePath = `${lockPath}.generation-owner-${owner.ownerToken}`;
+      await fsp.writeFile(indexPath, 'committed\n');
+      return 'committed';
+    });
+    assert.equal(result, 'committed');
+    assert.equal(await fsp.readFile(indexPath, 'utf8'), 'committed\n');
+    await assert.rejects(fsp.stat(lockPath), { code: 'ENOENT' });
+    assert.equal((await fsp.stat(residuePath)).isDirectory(), true);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0][1], fault);
+    await recordStore.withRecordStoreTransaction(MockUri.file(indexPath), async () => undefined);
+    assert.equal(warnings.length, 1, 'released residue must not be registered as a pending lock');
+  } finally {
+    fsp.rm = originalRm;
+    console.warn = originalWarn;
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
+
 for (const scenario of ['owner-read-gap', 'delayed-stale-recovery', 'delayed-young-observation']) {
   test(`async record-store recovery preserves a replacement owner: ${scenario}`, async () => {
     const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-lock-owner-replacement-'));

@@ -1,0 +1,619 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+// 渠道配置存储模块在加载时引用 vscode；这里只用到它的纯函数（配置规范化），给一个空桩。
+const Module = require('node:module');
+const originalLoad = Module._load;
+Module._load = function load(request, ...rest) {
+  return request === 'vscode' ? {} : originalLoad.call(this, request, ...rest);
+};
+const {
+  mapOpenAICompatibleEffort,
+  normalizedOpenAICompatibleModelName,
+  openAICompatibleEffortValues,
+  openAICompatibleModelThinkingRule,
+  openAICompatiblePlatform,
+  openAICompatibleThinkingLevels,
+  resolveOpenAICompatibleDialect,
+  describeOpenAICompatibleDialect,
+  OPENAI_COMPATIBLE_SERVICE_PRESETS
+} = require('../../dist/extension/shared/openAICompatibleDialect.js');
+const { canonicalLlmProviderKind } = require('../../dist/extension/shared/protocol.js');
+const { sessionThinkingCapability, validateSessionThinkingOverride, sessionThinkingDisplayLabel } = require('../../dist/extension/shared/sessionThinking.js');
+const { normalizeModelCapabilitySnapshot, resolveProviderOpenAICompatibleDialect } = require('../../dist/extension/shared/modelCapabilities.js');
+const { libraryProviderKind, adaptOpenAICompatibleDialect } = require('../../dist/extension/backend/capabilities/openAICompatibleDialectAdaptation.js');
+const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
+const { normalizeLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
+const { canonicalModelProfile } = require('../../dist/extension/backend/reliableKernel/scopedModelProfiles.js');
+const { frozenModelSelection } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
+
+const DEEPSEEK = 'https://api.deepseek.com/v1';
+const MOONSHOT = 'https://api.moonshot.cn/v1';
+const ZHIPU = 'https://open.bigmodel.cn/api/paas/v4';
+const DASHSCOPE = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+const SILICONFLOW = 'https://api.siliconflow.cn/v1';
+const QIANFAN = 'https://qianfan.baidubce.com/v2';
+const OPENROUTER = 'https://openrouter.ai/api/v1';
+const RELAY = 'https://relay.example.invalid/v1';
+
+const THINKING_KEYS = ['thinking', 'enable_thinking', 'reasoning_effort'];
+
+function settings(baseUrl, model, overrides = {}) {
+  return {
+    id: 'dialect-channel', name: 'dialect', provider: 'openai-compatible', baseUrl, model,
+    models: [{ id: model, name: model }], apiKey: 'offline-placeholder', toolCallFormat: 'function-call',
+    stream: false, retryOnError: false, retryMaxAttempts: 0, enableMultimodalTools: true,
+    promptCache: { enabled: false, mode: 'key', ttl: '30m' }, modelConfigs: [], createdAt: 1, updatedAt: 1,
+    ...overrides
+  };
+}
+
+/** 真实编码链路（接入库编码 + requestBody 合并 + 方言改写）产出的请求体。 */
+async function wire(baseUrl, model, { level, contents, tools = [], ...overrides } = {}) {
+  const result = await dryRunLlmProvider({
+    id: 'dialect', invocationId: 'dialect', conversationId: 'dialect',
+    contents: contents ?? [{ role: 'user', parts: [{ text: 'hello' }] }],
+    tools
+  }, {
+    settings: async () => settings(baseUrl, model, {
+      ...(level ? { generationConfig: { thinkingConfig: { thinkingLevel: level } } } : {}),
+      ...overrides
+    })
+  });
+  return result.body;
+}
+
+function thinkingParams(body) {
+  return Object.fromEntries(THINKING_KEYS.filter((key) => key in body).map((key) => [key, body[key]]));
+}
+
+test('按接口地址识别平台：各服务商官方地址、本机与局域网、认不出的中转站', () => {
+  for (const preset of OPENAI_COMPATIBLE_SERVICE_PRESETS) {
+    assert.equal(openAICompatiblePlatform(preset.baseUrl), preset.platform, preset.baseUrl);
+  }
+  assert.equal(new Set(OPENAI_COMPATIBLE_SERVICE_PRESETS.map((preset) => preset.key)).size, OPENAI_COMPATIBLE_SERVICE_PRESETS.length);
+  assert.equal(openAICompatiblePlatform('https://api.z.ai/api/paas/v4'), 'zhipu');
+  assert.equal(openAICompatiblePlatform('https://api.moonshot.ai/v1'), 'moonshot');
+  assert.equal(openAICompatiblePlatform('https://dashscope-intl.aliyuncs.com/compatible-mode/v1'), 'dashscope');
+  for (const local of ['http://localhost:11434/v1', 'http://127.0.0.1:8000/v1', 'http://192.168.1.20:8000/v1', 'http://10.0.0.5/v1', 'http://172.20.0.2/v1', 'http://[::1]:8000/v1']) {
+    assert.equal(openAICompatiblePlatform(local), 'local', local);
+  }
+  assert.equal(openAICompatiblePlatform('http://172.40.0.2/v1'), 'unknown');
+  // 只认主机名：路径里出现服务商名字的中转站不算。
+  assert.equal(openAICompatiblePlatform('https://relay.example.invalid/deepseek.com/v1'), 'unknown');
+  assert.equal(openAICompatiblePlatform('https://notdeepseek.com/v1'), 'unknown');
+  assert.equal(openAICompatiblePlatform('not a url'), 'unknown');
+});
+
+test('模型 ID 去掉平台前缀、小写并把点号换成连字符后再匹配能力', () => {
+  assert.equal(normalizedOpenAICompatibleModelName('deepseek-ai/DeepSeek-V4-Pro'), 'deepseek-v4-pro');
+  assert.equal(normalizedOpenAICompatibleModelName('Pro/zai-org/GLM-5.2'), 'glm-5-2');
+  const glm53 = resolveOpenAICompatibleDialect('https://ark.cn-beijing.volces.com/api/v3', 'glm-5-3-flash-260828');
+  assert.equal(glm53.rule.family, 'glm');
+  assert.equal(glm53.rule.canDisable, false);
+  assert.equal(resolveOpenAICompatibleDialect(SILICONFLOW, 'moonshotai/Kimi-K3').rule.toggle, false);
+});
+
+test('自动识别写法：先看平台，认不出的中转站再看模型 ID，手动指定优先', () => {
+  const cases = [
+    [DEEPSEEK, 'deepseek-v4-pro', 'deepseek', 'platform', true, true],
+    ['https://api.xiaomimimo.com/v1', 'mimo-v2-pro', 'deepseek', 'platform', true, true],
+    [MOONSHOT, 'kimi-k3', 'deepseek', 'platform', false, true],
+    // 智谱官方没有写明缺 reasoning_content 会报错，不补空串。
+    [ZHIPU, 'glm-5.2', 'deepseek', 'platform', false, false],
+    [DASHSCOPE, 'deepseek-v4-pro', 'enable_thinking', 'platform', false, true],
+    [DASHSCOPE, 'qwen3-max', 'enable_thinking', 'platform', false, false],
+    [SILICONFLOW, 'Qwen/Qwen3-32B', 'enable_thinking', 'platform', false, false],
+    [QIANFAN, 'qwen3-235b-a22b', 'enable_thinking', 'platform', false, false],
+    [QIANFAN, 'ernie-5.0', 'enable_thinking', 'platform', false, false],
+    [QIANFAN, 'deepseek-v4-pro', 'deepseek', 'platform', false, true],
+    [QIANFAN, 'some-other-model', 'reasoning_effort', 'default', false, false],
+    // OpenRouter 不能套 DeepSeek 写法，也不补回传。
+    [OPENROUTER, 'deepseek/deepseek-v4-pro', 'reasoning_effort', 'platform', false, false],
+    ['http://127.0.0.1:8000/v1', 'deepseek-v4-pro', 'reasoning_effort', 'platform', false, false],
+    [RELAY, 'deepseek-v4-flash', 'deepseek', 'model', false, true],
+    [RELAY, 'glm-5.3', 'deepseek', 'model', false, false],
+    [RELAY, 'qwen3-max', 'reasoning_effort', 'default', false, false],
+    [RELAY, 'gpt-5.5', 'reasoning_effort', 'default', false, false]
+  ];
+  for (const [baseUrl, model, format, source, toolContentArrays, fillReasoningReplay] of cases) {
+    const dialect = resolveOpenAICompatibleDialect(baseUrl, model);
+    assert.deepEqual(
+      { format: dialect.format, source: dialect.source, toolContentArrays: dialect.toolContentArrays, fillReasoningReplay: dialect.fillReasoningReplay },
+      { format, source, toolContentArrays, fillReasoningReplay },
+      `${baseUrl} ${model}`
+    );
+  }
+  const manual = resolveOpenAICompatibleDialect(DEEPSEEK, 'deepseek-v4-pro', 'reasoning_effort');
+  assert.equal(manual.format, 'reasoning_effort');
+  assert.equal(manual.source, 'manual');
+  assert.equal(manual.toolContentArrays, false);
+  assert.equal(describeOpenAICompatibleDialect(resolveOpenAICompatibleDialect(DEEPSEEK, 'deepseek-v4-pro')), 'DeepSeek 写法（thinking.type + reasoning_effort） · 按接口地址识别：DeepSeek 官方');
+  assert.equal(describeOpenAICompatibleDialect(manual), 'OpenAI 写法（只发 reasoning_effort） · 手动指定');
+});
+
+test('只有官方 DeepSeek、MiMo 接口交给接入库的 DeepSeek 格式编码', () => {
+  assert.equal(libraryProviderKind(settings(DEEPSEEK, 'deepseek-v4-pro')), 'deepseek');
+  assert.equal(libraryProviderKind(settings('https://api.xiaomimimo.com/v1', 'mimo-v2-pro')), 'deepseek');
+  assert.equal(libraryProviderKind(settings(MOONSHOT, 'kimi-k3')), 'openai-compatible');
+  assert.equal(libraryProviderKind(settings(RELAY, 'deepseek-v4-pro')), 'openai-compatible');
+  assert.equal(libraryProviderKind(settings(DEEPSEEK, 'deepseek-v4-pro', { openaiCompatibleThinkingFormat: 'reasoning_effort' })), 'openai-compatible');
+  assert.equal(libraryProviderKind({ ...settings(DEEPSEEK, 'claude-opus-5-5'), provider: 'claude' }), 'claude');
+});
+
+test('思考强度换成对方接受的值：先按 DeepSeek 官方换算，再取不低于它的最小值', () => {
+  const deepseek = ['low', 'high', 'max'];
+  assert.equal(mapOpenAICompatibleEffort('minimal', deepseek), 'low');
+  assert.equal(mapOpenAICompatibleEffort('medium', deepseek), 'high');
+  assert.equal(mapOpenAICompatibleEffort('xhigh', deepseek), 'high');
+  assert.equal(mapOpenAICompatibleEffort('max', deepseek), 'max');
+  assert.equal(mapOpenAICompatibleEffort('max', ['low', 'high']), 'high');
+  assert.equal(mapOpenAICompatibleEffort('low', ['high', 'max']), 'high');
+  assert.equal(mapOpenAICompatibleEffort('medium', []), undefined);
+  assert.equal(mapOpenAICompatibleEffort('medium', 'any'), 'medium');
+  assert.equal(openAICompatibleEffortValues(resolveOpenAICompatibleDialect('https://ark.cn-beijing.volces.com/api/v3', 'deepseek-v4-pro')), 'any');
+  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro')), ['high', 'max']);
+  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(SILICONFLOW, 'zai-org/GLM-5.2')), ['high', 'max']);
+  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(QIANFAN, 'glm-5.2')), []);
+  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(DASHSCOPE, 'deepseek-v4-pro')), ['high', 'max']);
+  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(RELAY, 'hunyuan-t2')), ['low', 'high']);
+  assert.deepEqual(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(RELAY, 'unknown-model', 'deepseek')), deepseek);
+  assert.equal(openAICompatibleEffortValues(resolveOpenAICompatibleDialect(RELAY, 'gpt-5.5')), 'any');
+});
+
+test('会话思考强度按模型能力给选项：关不掉的模型没有“关闭”，只能开关的给 none / high', () => {
+  const values = (model) => sessionThinkingCapability('openai-compatible', model)?.values;
+  assert.deepEqual(values('deepseek-v4-pro'), ['none', 'low', 'high', 'max']);
+  assert.deepEqual(values('deepseek-ai/DeepSeek-V4-Flash'), ['none', 'low', 'high', 'max']);
+  assert.deepEqual(values('kimi-k3'), ['low', 'high', 'max']);
+  assert.deepEqual(values('kimi-k2.7-code'), ['high']);
+  assert.deepEqual(values('glm-5.3'), ['low', 'high', 'max']);
+  assert.deepEqual(values('qwen3-max'), ['none', 'high']);
+  assert.deepEqual(values('hunyuan-t2'), ['none', 'low', 'high']);
+  assert.equal(sessionThinkingCapability('openai-compatible', 'deepseek-v4-pro').kind, 'deepseek-effort');
+  assert.equal(values('gpt-4o'), undefined);
+});
+
+test('DeepSeek 写法：官方接口按档位发 thinking.type + 收敛后的 reasoning_effort', async () => {
+  assert.deepEqual(thinkingParams(await wire(DEEPSEEK, 'deepseek-v4-pro', { level: 'medium' })), { thinking: { type: 'enabled' }, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DEEPSEEK, 'deepseek-v4-pro', { level: 'max' })), { thinking: { type: 'enabled' }, reasoning_effort: 'max' });
+  assert.deepEqual(thinkingParams(await wire(DEEPSEEK, 'deepseek-v4-pro', { level: 'none' })), { thinking: { type: 'disabled' } });
+  // 没有设置档位：不发任何思考参数，由服务决定。
+  assert.deepEqual(thinkingParams(await wire(DEEPSEEK, 'deepseek-v4-pro')), {});
+  // 认不出的中转站按模型 ID 走同一写法。
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'deepseek-v4-flash', { level: 'low' })), { thinking: { type: 'enabled' }, reasoning_effort: 'low' });
+  // MiMo 只开关，不发强度。
+  assert.deepEqual(thinkingParams(await wire('https://api.xiaomimimo.com/v1', 'mimo-v2-pro', { level: 'high' })), { thinking: { type: 'enabled' } });
+});
+
+test('DeepSeek 写法：关不掉思考的模型不发 disabled，Kimi K3 不发 thinking 参数', async () => {
+  assert.deepEqual(thinkingParams(await wire(MOONSHOT, 'kimi-k3', { level: 'none' })), {});
+  assert.deepEqual(thinkingParams(await wire(MOONSHOT, 'kimi-k3', { level: 'medium' })), { reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-5.3', { level: 'none' })), {});
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-5.3', { level: 'xhigh' })), { thinking: { type: 'enabled' }, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-4.6', { level: 'high' })), { thinking: { type: 'enabled' } });
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-4.6', { level: 'none' })), { thinking: { type: 'disabled' } });
+});
+
+test('enable_thinking 写法：百炼、硅基流动、千帆 Qwen 用开关，只在对方接受时带强度', async () => {
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3-max', { level: 'high' })), { enable_thinking: true });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'deepseek-v4-pro', { level: 'none' })), { enable_thinking: false });
+  assert.deepEqual(thinkingParams(await wire(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro', { level: 'low' })), { enable_thinking: true, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(QIANFAN, 'qwen3-235b-a22b', { level: 'medium' })), { enable_thinking: true });
+});
+
+test('OpenAI 写法与不发送：OpenRouter、本机服务原样发 reasoning_effort，手动“不发送”去掉全部思考参数', async () => {
+  assert.deepEqual(thinkingParams(await wire(OPENROUTER, 'deepseek/deepseek-v4-pro', { level: 'medium' })), { reasoning_effort: 'medium' });
+  assert.deepEqual(thinkingParams(await wire('http://127.0.0.1:8000/v1', 'qwen3-32b', { level: 'none' })), { reasoning_effort: 'none' });
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'gpt-5.5', { level: 'high' })), { reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DEEPSEEK, 'deepseek-v4-pro', { level: 'high', openaiCompatibleThinkingFormat: 'omit' })), {});
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'renamed-model', { level: 'medium', openaiCompatibleThinkingFormat: 'deepseek' })), { thinking: { type: 'enabled' }, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'renamed-model', { level: 'none', openaiCompatibleThinkingFormat: 'enable_thinking' })), { enable_thinking: false });
+});
+
+test('用户在自定义请求体里写了思考参数时不改写', async () => {
+  const body = await wire(DASHSCOPE, 'qwen3-max', { level: 'high', requestBody: { enable_thinking: false, thinking_budget: 256 } });
+  assert.equal(body.enable_thinking, false);
+  assert.equal(body.thinking_budget, 256);
+  assert.equal('thinking' in body, false);
+  const custom = await wire(DEEPSEEK, 'deepseek-v4-pro', { level: 'high', requestBody: { thinking: { type: 'disabled' } } });
+  assert.deepEqual(custom.thinking, { type: 'disabled' });
+});
+
+const TOOL = { name: 'probe', description: 'probe', parameters: { type: 'object', properties: {} } };
+const TOOL_HISTORY = [
+  { role: 'user', parts: [{ text: 'go' }] },
+  { role: 'model', parts: [{ id: 'call_1', functionCall: { name: 'probe', args: {} } }] },
+  { role: 'user', parts: [{ id: 'call_1', functionResponse: { name: 'probe', response: { ok: true } } }] },
+  { role: 'model', parts: [{ text: 'done' }] },
+  { role: 'user', parts: [{ text: 'next' }] }
+];
+
+test('带 tools 的请求给每条 assistant 消息补上 reasoning_content；OpenRouter、OpenAI 写法不补', async () => {
+  for (const [baseUrl, model] of [[DEEPSEEK, 'deepseek-v4-pro'], [MOONSHOT, 'kimi-k3'], [DASHSCOPE, 'deepseek-v4-pro'], [RELAY, 'deepseek-v4-flash']]) {
+    const body = await wire(baseUrl, model, { level: 'high', contents: TOOL_HISTORY, tools: [TOOL] });
+    const assistants = body.messages.filter((message) => message.role === 'assistant');
+    assert.equal(assistants.length, 2, baseUrl);
+    for (const message of assistants) assert.equal(message.reasoning_content, '', `${baseUrl} ${model}`);
+  }
+  for (const [baseUrl, model] of [[OPENROUTER, 'deepseek/deepseek-v4-pro'], [RELAY, 'gpt-5.5']]) {
+    const body = await wire(baseUrl, model, { level: 'high', contents: TOOL_HISTORY, tools: [TOOL] });
+    for (const message of body.messages.filter((entry) => entry.role === 'assistant')) {
+      assert.equal('reasoning_content' in message, false, baseUrl);
+    }
+  }
+  // 没有 tools 时不补。
+  const plain = await wire(DEEPSEEK, 'deepseek-v4-pro', { level: 'high', contents: [TOOL_HISTORY[0], TOOL_HISTORY[3], TOOL_HISTORY[4]] });
+  assert.equal('reasoning_content' in plain.messages.find((message) => message.role === 'assistant'), false);
+});
+
+test('原 DeepSeek 渠道迁移为 OpenAI 兼容：没填地址的补上官方地址，思考写法只保存合法值', () => {
+  const legacy = normalizeLlmProviderConfig({ id: 'legacy', name: 'DeepSeek', provider: 'deepseek', baseUrl: '', model: 'deepseek-v4-pro' });
+  assert.equal(legacy.provider, 'openai-compatible');
+  assert.equal(legacy.baseUrl, 'https://api.deepseek.com/v1');
+  assert.equal(resolveOpenAICompatibleDialect(legacy.baseUrl, legacy.model).format, 'deepseek');
+  const relay = normalizeLlmProviderConfig({ id: 'relay', provider: 'deepseek', baseUrl: 'https://relay.example.invalid/v1', model: 'deepseek-v4-pro' });
+  assert.equal(relay.baseUrl, 'https://relay.example.invalid/v1');
+  assert.equal('openaiCompatibleThinkingFormat' in relay, false);
+  const manual = normalizeLlmProviderConfig({
+    id: 'manual', provider: 'openai-compatible', baseUrl: RELAY, model: 'a', openaiCompatibleThinkingFormat: 'enable_thinking',
+    models: [{ id: 'a', name: 'a' }, { id: 'b', name: 'b' }],
+    modelConfigs: [
+      { id: 'mc-a', modelId: 'a', toolCallFormat: 'function-call', openaiResponsesTransport: 'http', stream: true, retryOnError: true, retryMaxAttempts: 3, enableMultimodalTools: true, openaiCompatibleThinkingFormat: 'omit', createdAt: 1, updatedAt: 1 },
+      { id: 'mc-b', modelId: 'b', toolCallFormat: 'function-call', openaiResponsesTransport: 'http', stream: true, retryOnError: true, retryMaxAttempts: 3, enableMultimodalTools: true, openaiCompatibleThinkingFormat: 'bogus', createdAt: 1, updatedAt: 1 }
+    ]
+  });
+  assert.equal(manual.openaiCompatibleThinkingFormat, 'enable_thinking');
+  assert.equal(manual.modelConfigs.find((entry) => entry.modelId === 'a').openaiCompatibleThinkingFormat, 'omit');
+  assert.equal('openaiCompatibleThinkingFormat' in manual.modelConfigs.find((entry) => entry.modelId === 'b'), false);
+  assert.equal('openaiCompatibleThinkingFormat' in normalizeLlmProviderConfig({ provider: 'openai-compatible', openaiCompatibleThinkingFormat: 'bogus' }), false);
+});
+
+test('已保存的模型选择、历史回合快照和能力快照里的 deepseek 读作 OpenAI 兼容', () => {
+  assert.equal(canonicalLlmProviderKind('deepseek'), 'openai-compatible');
+  assert.equal(canonicalLlmProviderKind('claude'), 'claude');
+  assert.equal(canonicalLlmProviderKind('bogus'), undefined);
+  const profile = { providerConfigId: 'legacy', provider: 'deepseek', model: 'deepseek-v4-pro' };
+  assert.equal(canonicalModelProfile(profile).provider, 'openai-compatible');
+  const current = { providerConfigId: 'c', provider: 'claude', model: 'claude-opus-5-5' };
+  assert.equal(canonicalModelProfile(current), current);
+  assert.equal(frozenModelSelection({ model: { providerConfigId: 'legacy', provider: 'deepseek', modelId: 'deepseek-v4-pro' } }).provider, 'openai-compatible');
+  assert.throws(() => frozenModelSelection({ model: { providerConfigId: 'legacy', provider: 'bogus', modelId: 'x' } }), /provider is invalid/);
+  const snapshot = normalizeModelCapabilitySnapshot({
+    providerKind: 'deepseek', modelId: 'deepseek-v4-pro', endpointFingerprint: 'https://api.deepseek.com/v1', source: 'official_registry',
+    reasoning: { family: 'deepseek_toggle', levels: ['high', 'max'], supportsBudget: false, canDisable: true, alwaysOn: false, outputLimitIncludesThinking: true, requiresThoughtSignatures: false },
+    nativeCompaction: { availability: 'unsupported', reason: 'none' }
+  });
+  assert.equal(snapshot.providerKind, 'openai-compatible');
+});
+
+/** “测试这个模型”写进 models[].capabilitySnapshot 的证据（由 1b 的探测产生，这里直接构造）。 */
+function probeSnapshot(baseUrl, model, { wireFormat, canDisable, levels, providerConfigId = 'dialect-channel' }) {
+  return {
+    providerKind: 'openai-compatible', modelId: model, providerConfigId, transport: 'http',
+    endpointFingerprint: baseUrl.replace(/\/+$/, ''), source: 'verified_probe', verifiedAt: '2026-09-24T02:30:00.000Z',
+    reasoning: {
+      family: wireFormat === 'reasoning_effort' ? 'openai_effort' : 'deepseek_toggle', levels, supportsBudget: false,
+      canDisable, alwaysOn: !canDisable, outputLimitIncludesThinking: true, requiresThoughtSignatures: false, wireFormat
+    },
+    nativeCompaction: { availability: 'unknown', reason: '当前渠道和模型没有经过能力确认。' }
+  };
+}
+
+function probedSettings(baseUrl, model, probe, overrides = {}) {
+  return settings(baseUrl, model, { models: [{ id: model, name: model, capabilitySnapshot: probeSnapshot(baseUrl, model, probe) }], ...overrides });
+}
+
+test('测试证据：wireFormat 随能力快照保存，只对 OpenAI 兼容保留合法值', () => {
+  const snapshot = probeSnapshot(RELAY, 'renamed-model', { wireFormat: 'enable_thinking', canDisable: true, levels: ['high', 'max'] });
+  assert.equal(normalizeModelCapabilitySnapshot(snapshot).reasoning.wireFormat, 'enable_thinking');
+  assert.equal('wireFormat' in normalizeModelCapabilitySnapshot({ ...snapshot, reasoning: { ...snapshot.reasoning, wireFormat: 'bogus' } }).reasoning, false);
+  assert.equal('wireFormat' in normalizeModelCapabilitySnapshot({ ...snapshot, providerKind: 'claude' }).reasoning, false);
+});
+
+test('测试证据作为 probed 传入：写法与规则取自测试结果，手动写法优先', () => {
+  const probed = { format: 'enable_thinking', canDisable: false, efforts: ['high', 'max'] };
+  const dialect = resolveOpenAICompatibleDialect(RELAY, 'renamed-model', undefined, probed);
+  assert.equal(dialect.format, 'enable_thinking');
+  assert.equal(dialect.source, 'probe');
+  assert.equal(dialect.rule.canDisable, false);
+  assert.deepEqual(dialect.rule.efforts, ['high', 'max']);
+  assert.deepEqual(openAICompatibleEffortValues(dialect), ['high', 'max']);
+  assert.equal(describeOpenAICompatibleDialect(dialect), 'enable_thinking 写法（enable_thinking + reasoning_effort，关不掉思考） · 按测试结果');
+  // 平台相关的回传行为仍按平台和写法计算。
+  assert.equal(resolveOpenAICompatibleDialect(DEEPSEEK, 'renamed', undefined, { format: 'deepseek', canDisable: true, efforts: [] }).toolContentArrays, true);
+  const manual = resolveOpenAICompatibleDialect(RELAY, 'renamed-model', 'deepseek', probed);
+  assert.equal(manual.source, 'manual');
+  assert.equal(manual.rule, undefined);
+});
+
+test('有效档位：平台差异算进去，只有开关的记作 high，OpenAI 写法与不发送没有档位', () => {
+  const levels = (baseUrl, model, manual, probed) => openAICompatibleThinkingLevels(resolveOpenAICompatibleDialect(baseUrl, model, manual, probed));
+  assert.deepEqual(levels(DEEPSEEK, 'deepseek-v4-pro'), { levels: ['low', 'high', 'max'], canDisable: true });
+  assert.deepEqual(levels(MOONSHOT, 'kimi-k3'), { levels: ['low', 'high', 'max'], canDisable: false });
+  assert.deepEqual(levels('https://ark.cn-beijing.volces.com/api/v3', 'deepseek-v4-pro'), { levels: ['low', 'high', 'max'], canDisable: true });
+  assert.deepEqual(levels(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro'), { levels: ['high', 'max'], canDisable: true });
+  assert.deepEqual(levels('https://api.xiaomimimo.com/v1', 'mimo-v2-pro'), { levels: ['high'], canDisable: true });
+  assert.deepEqual(levels(RELAY, 'renamed-model', undefined, { format: 'deepseek', canDisable: true, efforts: [] }), { levels: ['high'], canDisable: true });
+  assert.equal(levels(OPENROUTER, 'deepseek/deepseek-v4-pro'), undefined);
+  assert.equal(levels(DEEPSEEK, 'deepseek-v4-pro', 'omit'), undefined);
+  assert.equal(levels(RELAY, 'renamed-model', 'deepseek'), undefined);
+});
+
+test('按渠道配置解析方言：模型级手动 > 渠道级手动 > 测试证据 > 自动识别，证据换地址或渠道即失效', () => {
+  const probe = { wireFormat: 'enable_thinking', canDisable: true, levels: ['low', 'high'] };
+  const config = probedSettings(RELAY, 'renamed-model', probe);
+  const probed = resolveProviderOpenAICompatibleDialect(config, 'renamed-model');
+  assert.equal(probed.source, 'probe');
+  assert.equal(probed.format, 'enable_thinking');
+  assert.deepEqual(probed.rule.efforts, ['low', 'high']);
+  assert.equal(resolveProviderOpenAICompatibleDialect({ ...config, baseUrl: 'https://other.example.invalid/v1' }, 'renamed-model').source, 'default');
+  assert.equal(resolveProviderOpenAICompatibleDialect({ ...config, id: 'another-channel' }, 'renamed-model').source, 'default');
+  const channelManual = resolveProviderOpenAICompatibleDialect({ ...config, openaiCompatibleThinkingFormat: 'deepseek' }, 'renamed-model');
+  assert.equal(channelManual.source, 'manual');
+  assert.equal(channelManual.format, 'deepseek');
+  const modelManual = resolveProviderOpenAICompatibleDialect({
+    ...config, openaiCompatibleThinkingFormat: 'deepseek',
+    modelConfigs: [{ id: 'mc', modelId: 'renamed-model', openaiCompatibleThinkingFormat: 'omit' }]
+  }, 'renamed-model');
+  assert.equal(modelManual.format, 'omit');
+  // 编辑器里“自动识别”一项的说明：忽略手动写法。
+  assert.equal(resolveProviderOpenAICompatibleDialect({ ...config, openaiCompatibleThinkingFormat: 'deepseek' }, 'renamed-model', { manual: null }).source, 'probe');
+});
+
+test('请求改写与接入库格式都采用测试结果', async () => {
+  const probe = { wireFormat: 'enable_thinking', canDisable: true, levels: ['high', 'max'] };
+  const body = await wire(RELAY, 'renamed-model', { level: 'low', models: [{ id: 'renamed-model', name: 'renamed-model', capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', probe) }] });
+  assert.deepEqual(thinkingParams(body), { enable_thinking: true, reasoning_effort: 'high' });
+  const off = await wire(RELAY, 'renamed-model', { level: 'none', models: [{ id: 'renamed-model', name: 'renamed-model', capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', probe) }] });
+  assert.deepEqual(thinkingParams(off), { enable_thinking: false });
+  // 手动写法优先于测试结果。
+  const manual = await wire(RELAY, 'renamed-model', { level: 'low', openaiCompatibleThinkingFormat: 'reasoning_effort', models: [{ id: 'renamed-model', name: 'renamed-model', capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', probe) }] });
+  assert.deepEqual(thinkingParams(manual), { reasoning_effort: 'low' });
+  // DeepSeek 官方地址上测出 DeepSeek 写法时仍交给接入库的 DeepSeek 格式。
+  assert.equal(libraryProviderKind(probedSettings(DEEPSEEK, 'renamed', { wireFormat: 'deepseek', canDisable: true, levels: [] })), 'deepseek');
+});
+
+test('会话思考强度按渠道配置给选项：平台差异、测试结果与手动写法都算进去', () => {
+  const values = (baseUrl, model, extra = {}) => sessionThinkingCapability('openai-compatible', model, undefined, undefined, settings(baseUrl, model, extra))?.values;
+  assert.deepEqual(values(DEEPSEEK, 'deepseek-v4-pro'), ['none', 'low', 'high', 'max']);
+  assert.deepEqual(values(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro'), ['none', 'high', 'max']);
+  assert.deepEqual(values(MOONSHOT, 'kimi-k3'), ['low', 'high', 'max']);
+  const probe = { wireFormat: 'deepseek', canDisable: false, levels: ['high', 'max'] };
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'renamed-model', undefined, undefined, probedSettings(RELAY, 'renamed-model', probe)),
+    { kind: 'deepseek-effort', values: ['high', 'max'] });
+  assert.equal(values(DEEPSEEK, 'deepseek-v4-pro', { openaiCompatibleThinkingFormat: 'omit' }), undefined);
+  assert.throws(() => validateSessionThinkingOverride({ kind: 'deepseek-effort', value: 'low' }, 'openai-compatible', 'deepseek-ai/DeepSeek-V4-Pro',
+    undefined, undefined, settings(SILICONFLOW, 'deepseek-ai/DeepSeek-V4-Pro')), /不支持/);
+  assert.deepEqual(validateSessionThinkingOverride({ kind: 'deepseek-effort', value: 'max' }, 'openai-compatible', 'renamed-model',
+    undefined, undefined, probedSettings(RELAY, 'renamed-model', probe)), { kind: 'deepseek-effort', value: 'max' });
+});
+
+test('enable_thinking 写法：关不掉思考的模型不发 false，不接受开关的模型不带这个字段', async () => {
+  // 百炼官方：glm-5.3、kimi-k3 的 enable_thinking 只支持 true（https://help.aliyun.com/zh/model-studio/deep-thinking）。
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'glm-5.3', { level: 'none' })), {});
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'kimi-k3', { level: 'none' })), {});
+  assert.equal('enable_thinking' in await wire(DASHSCOPE, 'kimi-k3', { level: 'high' }), false);
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'renamed-model', { level: 'none', models: [{ id: 'renamed-model', name: 'renamed-model',
+    capabilitySnapshot: probeSnapshot(RELAY, 'renamed-model', { wireFormat: 'enable_thinking', canDisable: false, levels: [] }) }] })), {});
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3-max', { level: 'none' })), { enable_thinking: false });
+});
+
+test('自定义请求体里的 reasoning_effort 原样发送；“不发送”也不删用户写的键；与思考无关的模板参数不影响改写', async () => {
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'glm-4.6', { requestBody: { reasoning_effort: 'high' } })), { reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3-max', { requestBody: { reasoning_effort: 'low' } })), { reasoning_effort: 'low' });
+  assert.deepEqual(thinkingParams(await wire(DEEPSEEK, 'deepseek-v4-pro', { openaiCompatibleThinkingFormat: 'omit', requestBody: { reasoning_effort: 'high' } })), { reasoning_effort: 'high' });
+  const kwargs = await wire(DASHSCOPE, 'qwen3-max', { level: 'high', requestBody: { chat_template_kwargs: { add_generation_prompt: true } } });
+  assert.deepEqual(thinkingParams(kwargs), { enable_thinking: true });
+  assert.deepEqual(kwargs.chat_template_kwargs, { add_generation_prompt: true });
+  const controlled = await wire(DASHSCOPE, 'qwen3-max', { level: 'high', requestBody: { chat_template_kwargs: { enable_thinking: false } } });
+  assert.equal('enable_thinking' in controlled, false);
+});
+
+const TOKENHUB = 'https://tokenhub.tencentmaas.com/v1';
+const HUNYUAN_LEGACY = 'https://api.hunyuan.cloud.tencent.com/v1';
+
+test('平台写法只用于有规则的模型；旧混元平台不归入腾讯 TokenHub，不发思考参数', async () => {
+  // 腾讯 TokenHub：minimax-m3 传 thinking.type enabled 返回 400（https://cloud.tencent.com/document/product/1823/135872）。
+  const minimax = resolveOpenAICompatibleDialect(TOKENHUB, 'minimax-m3');
+  assert.deepEqual([minimax.format, minimax.source], ['reasoning_effort', 'default']);
+  assert.equal('thinking' in await wire(TOKENHUB, 'minimax-m3', { level: 'high' }), false);
+  assert.deepEqual([resolveOpenAICompatibleDialect(MOONSHOT, 'moonshot-v1-8k').format, resolveOpenAICompatibleDialect(MOONSHOT, 'moonshot-v1-8k').source], ['reasoning_effort', 'default']);
+  assert.equal(resolveOpenAICompatibleDialect(TOKENHUB, 'deepseek-v4-pro').format, 'deepseek');
+  assert.equal(resolveOpenAICompatibleDialect(DASHSCOPE, 'MiniMax/MiniMax-M3').source, 'default');
+  // 旧混元平台的参数表没有 thinking / reasoning_effort（https://cloud.tencent.com/document/product/1729/111007）。
+  assert.equal(openAICompatiblePlatform(HUNYUAN_LEGACY), 'hunyuan');
+  const legacy = resolveOpenAICompatibleDialect(HUNYUAN_LEGACY, 'hunyuan-t1');
+  assert.deepEqual([legacy.format, legacy.source], ['omit', 'platform']);
+  assert.deepEqual(thinkingParams(await wire(HUNYUAN_LEGACY, 'hunyuan-t1', { level: 'high' })), {});
+  assert.match(describeOpenAICompatibleDialect(minimax), /腾讯 TokenHub.*没有登记思考参数规则/);
+});
+
+const ARK = 'https://ark.cn-beijing.volces.com/api/v3';
+
+test('模型规则：GLM-5.2 不给 low，方舟带日期的 GLM-5 不误认成 5.2，GLM-4.5 以下与不思考的 qwen 不发思考参数', async () => {
+  // 智谱、方舟官方：GLM-5.2 的 low / medium 映射为 high。
+  assert.deepEqual(openAICompatibleModelThinkingRule('glm-5.2').efforts, ['high', 'max']);
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'glm-5.2', undefined, undefined, settings(ZHIPU, 'glm-5.2')).values, ['none', 'high', 'max']);
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-5.2', { level: 'low' })), { thinking: { type: 'enabled' }, reasoning_effort: 'high' });
+  assert.deepEqual(openAICompatibleModelThinkingRule('glm-5-2-260617').efforts, ['high', 'max']);
+  assert.deepEqual(openAICompatibleModelThinkingRule('glm-5-260117').efforts, [], '方舟带日期的 GLM-5');
+  assert.equal(openAICompatibleModelThinkingRule('glm-5-3-flash-260828').canDisable, false);
+  // 智谱：thinking 参数只有 GLM-4.5 及以上支持。
+  for (const model of ['glm-4-plus', 'glm-4-flash-250414', 'glm-4v-plus', 'glm-4-9b-chat', 'glm-4-0520', 'glm-4-airx']) {
+    assert.equal(openAICompatibleModelThinkingRule(model), undefined, model);
+  }
+  for (const model of ['glm-4.5', 'glm-4.5-air', 'glm-4.5v', 'glm-4.6', 'glm-4.7-flash', 'glm-5', 'glm-5.1']) {
+    assert.ok(openAICompatibleModelThinkingRule(model), model);
+  }
+  for (const model of ['qwen-max', 'qwen2.5-72b-instruct', 'qwen3-coder-plus', 'qwen3-235b-a22b-instruct-2507', 'qwen-vl-max', 'qwen-long']) {
+    assert.equal(openAICompatibleModelThinkingRule(model), undefined, model);
+  }
+  for (const model of ['qwen3-max', 'qwen-plus', 'qwen3-235b-a22b', 'qwen3.5-plus']) assert.equal(openAICompatibleModelThinkingRule(model)?.canDisable, true, model);
+  for (const model of ['qwq-plus', 'qwen3-235b-a22b-thinking-2507']) assert.equal(openAICompatibleModelThinkingRule(model)?.canDisable, false, model);
+  // 认得出的不思考模型：不发思考参数、不给会话档位（OpenRouter 仍按它自己的写法）。
+  assert.deepEqual(thinkingParams(await wire(ZHIPU, 'glm-4-plus', { level: 'high' })), {});
+  assert.deepEqual(thinkingParams(await wire(RELAY, 'glm-4-flash', { level: 'high' })), {});
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen-max', { level: 'high' })), {});
+  assert.equal(sessionThinkingCapability('openai-compatible', 'qwen-max', undefined, { thinkingLevel: 'high' }, settings(DASHSCOPE, 'qwen-max')), undefined);
+  assert.deepEqual(thinkingParams(await wire(OPENROUTER, 'z-ai/glm-4-plus', { level: 'high' })), { reasoning_effort: 'high' });
+  assert.equal(resolveOpenAICompatibleDialect(ARK, 'glm-5-260117').format, 'deepseek');
+});
+
+test('官方域名补齐：百炼各接入点、千帆北京、BytePlus、TokenHub 各站点、Kimi Code、本机与局域网', () => {
+  const cases = [
+    ['https://coding.dashscope.aliyuncs.com/v1', 'dashscope'],
+    ['https://coding-intl.dashscope.aliyuncs.com/v1', 'dashscope'],
+    ['https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1', 'dashscope'],
+    ['https://dashscope-us.aliyuncs.com/compatible-mode/v1', 'dashscope'],
+    ['https://ws-demo.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'dashscope'],
+    ['https://oss-cn-hangzhou.aliyuncs.com/v1', 'unknown'],
+    ['https://qianfan.bj.baidubce.com/v2', 'qianfan'],
+    ['https://ark.ap-southeast.bytepluses.com/api/v3', 'ark'],
+    ['https://tokenhub.tencentmaas.cn/v1', 'tencent'],
+    ['https://tokenhub-intl.tencentmaas.cn/v1', 'tencent'],
+    ['https://tokenhub-intl.tencentcloudmaas.com/v1', 'tencent'],
+    ['https://tokenhub-us.tencentcloudmaas.com/v1', 'tencent'],
+    ['https://api.lkeap.cloud.tencent.com/v1', 'tencent'],
+    ['https://api.kimi.com/coding/v1', 'kimi-code'],
+    ['https://api.kimi.ai/coding/v1', 'kimi-code'],
+    ['http://host.docker.internal:11434/v1', 'local'],
+    ['http://100.64.0.1:8000/v1', 'local'],
+    ['http://100.127.255.254/v1', 'local'],
+    ['http://100.128.0.1/v1', 'unknown'],
+    ['http://[fd12:3456::1]:8000/v1', 'local'],
+    ['http://[2001:db8::1]/v1', 'unknown']
+  ];
+  for (const [baseUrl, platform] of cases) assert.equal(openAICompatiblePlatform(baseUrl), platform, baseUrl);
+  // Kimi Code：缺 reasoning_content 返回 400（https://www.kimi.com/code/docs/en/kimi-code/error-reference）。
+  const kimiCode = resolveOpenAICompatibleDialect('https://api.kimi.com/coding/v1', 'kimi-for-coding');
+  assert.deepEqual([kimiCode.format, kimiCode.fillReasoningReplay], ['deepseek', true]);
+  // 预设里有国际站。
+  for (const baseUrl of ['https://api.moonshot.ai/v1', 'https://api.z.ai/api/paas/v4', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+    'https://ark.ap-southeast.bytepluses.com/api/v3', 'https://tokenhub-intl.tencentcloudmaas.com/v1', 'https://api.siliconflow.com/v1']) {
+    assert.ok(OPENAI_COMPATIBLE_SERVICE_PRESETS.some((preset) => preset.baseUrl === baseUrl), baseUrl);
+  }
+});
+
+test('百炼按官方文档发送顶层 reasoning_effort：DeepSeek-V4、GLM-5.x、Kimi K3、Qwen3.8', async () => {
+  // https://help.aliyun.com/zh/model-studio/deepseek-api、/glm、/kimi-api-by-moonshot-ai、/qwen-api-via-openai-chat-completions
+  const values = (model) => openAICompatibleEffortValues(resolveOpenAICompatibleDialect(DASHSCOPE, model));
+  assert.deepEqual(values('deepseek-v4-pro'), ['high', 'max']);
+  assert.deepEqual(values('deepseek-v4.1-flash'), ['low', 'high', 'max']);
+  assert.deepEqual(values('glm-5.3'), ['low', 'high', 'max']);
+  assert.deepEqual(values('glm-5.2'), ['high', 'max']);
+  assert.deepEqual(values('glm-5.1'), []);
+  assert.deepEqual(values('kimi-k3'), ['low', 'high', 'max']);
+  assert.deepEqual(values('kimi/kimi-k3'), ['max']);
+  assert.deepEqual(values('qwen3.8-max'), ['low', 'medium', 'xhigh']);
+  assert.deepEqual(values('qwen3.7-plus'), []);
+  assert.deepEqual(values('qwen3-8b'), []);
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'deepseek-v4-pro', { level: 'low' })), { enable_thinking: true, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'glm-5.3', { level: 'medium' })), { enable_thinking: true, reasoning_effort: 'high' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'kimi/kimi-k3', { level: 'low' })), { reasoning_effort: 'max' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3.8-max', { level: 'high' })), { enable_thinking: true, reasoning_effort: 'xhigh' });
+  assert.deepEqual(thinkingParams(await wire(DASHSCOPE, 'qwen3.8-max', { level: 'none' })), { enable_thinking: false });
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'deepseek-v4-pro', undefined, undefined, settings(DASHSCOPE, 'deepseek-v4-pro')).values, ['none', 'high', 'max']);
+  assert.deepEqual(sessionThinkingCapability('openai-compatible', 'qwen3.8-max', undefined, undefined, settings(DASHSCOPE, 'qwen3.8-max')).values, ['none', 'low', 'medium', 'xhigh']);
+});
+
+test('回传思考内容只在官方写明要求的平台和模型上补：Kimi K3、Kimi Code、百炼 kimi/、硅基流动 GLM-4.7', async () => {
+  const filled = async (baseUrl, model, extra = {}) => {
+    const body = await wire(baseUrl, model, { level: 'high', contents: TOOL_HISTORY, tools: [TOOL], ...extra });
+    return body.messages.filter((message) => message.role === 'assistant').every((message) => message.reasoning_content === '');
+  };
+  assert.equal(resolveOpenAICompatibleDialect(MOONSHOT, 'kimi-k3').rule.requiresReasoningReplay, true);
+  assert.equal(await filled('https://api.kimi.com/coding/v1', 'kimi-for-coding'), true);
+  assert.equal(await filled(DASHSCOPE, 'kimi/kimi-k2.5'), true);
+  assert.equal(await filled(SILICONFLOW, 'zai-org/GLM-4.7'), true);
+  // 官方没有写明要求回传的：不补空串。
+  assert.equal(await filled(ZHIPU, 'glm-5.2'), false);
+  assert.equal(await filled(MOONSHOT, 'kimi-k2-0905-preview'), false);
+  assert.equal(await filled(RELAY, 'renamed-model', { openaiCompatibleThinkingFormat: 'deepseek' }), false);
+  assert.equal(await filled(DASHSCOPE, 'qwen3-max'), false);
+});
+
+test('DeepSeek 写法下把历史里 OpenRouter 的 reasoning 文本挪到 reasoning_content', () => {
+  const request = (messages) => ({ headers: {}, body: { model: 'deepseek-v4-pro', messages, tools: [{ type: 'function', function: { name: 'probe', parameters: {} } }] } });
+  const adapted = adaptOpenAICompatibleDialect(request([
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: '', reasoning: 'earlier thoughts', reasoning_details: [{ type: 'reasoning.text', text: 'earlier thoughts' }], tool_calls: [] },
+    { role: 'assistant', content: 'plain' }
+  ]), settings(DEEPSEEK, 'deepseek-v4-pro'));
+  const [first, second] = adapted.body.messages.filter((message) => message.role === 'assistant');
+  assert.equal(first.reasoning_content, 'earlier thoughts');
+  assert.equal('reasoning' in first, false);
+  assert.equal('reasoning_details' in first, false);
+  assert.equal(second.reasoning_content, '');
+  // OpenRouter 自己保留 reasoning / reasoning_details。
+  const kept = adaptOpenAICompatibleDialect(request([{ role: 'assistant', content: '', reasoning: 'x', reasoning_details: [] }]), settings(OPENROUTER, 'deepseek/deepseek-v4-pro'));
+  assert.equal(kept.body.messages[0].reasoning, 'x');
+});
+
+test('MiMo 的 tool 消息不支持 file：工具结果里的文件移到这批 tool 消息之后的 user 消息，图片留在原处', async () => {
+  // MiMo 官方：“For tool messages, text, image, audio and video are supported.”（https://mimo.mi.com/static/docs/api/chat/openai-api.md）
+  const PDF = Buffer.from('%PDF-1.4 fixture').toString('base64');
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  const contents = [
+    { role: 'user', parts: [{ text: 'read it' }] },
+    { role: 'model', parts: [{ id: 'call_1', functionCall: { name: 'read', args: {} } }] },
+    { role: 'user', parts: [{ id: 'call_1', functionResponse: { name: 'read', response: { ok: true }, parts: [
+      { inlineData: { mimeType: 'application/pdf', data: PDF } }, { inlineData: { mimeType: 'image/png', data: PNG } }] } }] },
+    { role: 'user', parts: [{ text: 'next' }] }
+  ];
+  const mimo = await wire('https://api.xiaomimimo.com/v1', 'mimo-v2-pro', { contents, tools: [{ ...TOOL, name: 'read' }] });
+  const toolIndex = mimo.messages.findIndex((message) => message.role === 'tool');
+  const tool = mimo.messages[toolIndex];
+  assert.ok(Array.isArray(tool.content));
+  assert.equal(tool.content.some((block) => block.type === 'file'), false);
+  assert.equal(tool.content.some((block) => block.type === 'image_url'), true);
+  const moved = mimo.messages[toolIndex + 1];
+  assert.equal(moved.role, 'user');
+  assert.match(moved.content[0].text, /tool_call_id: call_1/);
+  assert.equal(moved.content[1].type, 'file');
+  // DeepSeek 官方 tool 消息接受 file，保持原样。
+  const deepseek = await wire(DEEPSEEK, 'deepseek-v4-pro', { contents, tools: [{ ...TOOL, name: 'read' }] });
+  assert.equal(deepseek.messages.find((message) => message.role === 'tool').content.some((block) => block.type === 'file'), true);
+});
+
+test('会话思考选项按平台区分：OpenRouter 按原值发送、没有 max，必须思考的模型没有 none；本机服务不套 DeepSeek 档位', () => {
+  // OpenRouter Parameters：顶层 reasoning_effort 为 xhigh / high / medium / low / minimal / none；必须思考的模型拒绝 none。
+  const capability = (baseUrl, model, thinking) => sessionThinkingCapability('openai-compatible', model, undefined, thinking, settings(baseUrl, model));
+  assert.deepEqual(capability(OPENROUTER, 'deepseek/deepseek-v4-pro'), { kind: 'openai-effort', values: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] });
+  assert.deepEqual(capability(OPENROUTER, 'moonshotai/kimi-k3').values, ['minimal', 'low', 'medium', 'high', 'xhigh']);
+  assert.equal(capability(OPENROUTER, 'openai/gpt-4o'), undefined);
+  assert.deepEqual(capability(OPENROUTER, 'some/relay-model', { thinkingLevel: 'high' }).values, ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+  assert.equal(capability('http://127.0.0.1:8000/v1', 'deepseek-v4-pro'), undefined);
+  assert.ok(capability('http://127.0.0.1:8000/v1', 'deepseek-v4-pro', { thinkingLevel: 'high' }).values.includes('medium'));
+});
+
+test('“跟随渠道”显示实际发出的值：换算后的强度、只开关的模型、关不掉思考的模型', () => {
+  const label = (baseUrl, model, level, extra) => sessionThinkingDisplayLabel('openai-compatible', model, { thinkingLevel: level }, settings(baseUrl, model, extra));
+  assert.equal(label(DEEPSEEK, 'deepseek-v4-pro', 'high'), 'high');
+  assert.equal(label(DEEPSEEK, 'deepseek-v4-pro', 'medium'), 'medium，实际发 high');
+  assert.equal(label('https://api.xiaomimimo.com/v1', 'mimo-v2-pro', 'high'), 'high，只开启思考，不发强度');
+  assert.equal(label(MOONSHOT, 'kimi-k3', 'none'), 'none，模型关不掉思考，实际仍会思考');
+  assert.equal(label(OPENROUTER, 'deepseek/deepseek-v4-pro', 'medium'), 'medium');
+  assert.equal(label(DEEPSEEK, 'deepseek-v4-pro', 'high', { openaiCompatibleThinkingFormat: 'omit' }), 'high，不发送思考参数');
+  assert.equal(sessionThinkingDisplayLabel('openai-compatible', 'deepseek-v4-pro', undefined, settings(DEEPSEEK, 'deepseek-v4-pro')), '未设置（由服务决定）');
+});
+
+test('写法说明按模型写准：Kimi K3 只发强度、MiMo 与 GLM-4.x 只发开关，百炼按模型区分', () => {
+  const describe = (baseUrl, model) => describeOpenAICompatibleDialect(resolveOpenAICompatibleDialect(baseUrl, model));
+  assert.equal(describe(DEEPSEEK, 'deepseek-v4-pro'), 'DeepSeek 写法（thinking.type + reasoning_effort） · 按接口地址识别：DeepSeek 官方');
+  assert.equal(describe(MOONSHOT, 'kimi-k3'), 'DeepSeek 写法（这个模型只发 reasoning_effort，关不掉思考） · 按接口地址识别：Kimi（月之暗面）');
+  assert.equal(describe('https://api.xiaomimimo.com/v1', 'mimo-v2-pro'), 'DeepSeek 写法（这个模型只发 thinking.type 开关） · 按接口地址识别：小米 MiMo');
+  assert.equal(describe(ZHIPU, 'glm-4.6'), 'DeepSeek 写法（这个模型只发 thinking.type 开关） · 按接口地址识别：智谱');
+  assert.equal(describe(ZHIPU, 'glm-5.3'), 'DeepSeek 写法（thinking.type + reasoning_effort，关不掉思考） · 按接口地址识别：智谱');
+  assert.equal(describe(DASHSCOPE, 'qwen3-max'), 'enable_thinking 写法（这个模型只发 enable_thinking 开关） · 按接口地址识别：阿里百炼');
+  assert.equal(describe(DASHSCOPE, 'deepseek-v4-pro'), 'enable_thinking 写法（enable_thinking + reasoning_effort） · 按接口地址识别：阿里百炼');
+  const fs = require('node:fs');
+  const definitions = fs.readFileSync('webview/src/components/settings/global/parameters/llmParameterDefinitions.ts', 'utf8');
+  assert.doesNotMatch(definitions, /换成最接近的值/);
+  assert.match(definitions, /关不掉思考的模型选“关闭”时不发送/);
+  const editor = fs.readFileSync('webview/src/components/settings/global/LlmAdvancedConfigEditor.vue', 'utf8');
+  assert.match(editor, /当前发送（\{\{ config\.model \}\}）/);
+  assert.match(editor, /依次看手动指定、测试结果、接口地址和模型 ID/);
+});

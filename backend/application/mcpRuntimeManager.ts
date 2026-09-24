@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServerConfigRecord, McpServersSettingsRecord, McpToolSourceRecord } from '../../shared/protocol';
@@ -67,8 +68,11 @@ export class McpRuntimeManager implements McpMemoryConnectionRegistry {
     this.disabledSources.clear();
   }
 
+  /** Connected tools in source-id order, never in the order the servers happened to connect. */
   public runtimeTools(): ToolDefinition[] {
-    return [...this.connections.values()].flatMap((connection) => connection.tools);
+    return [...this.connections.values()]
+      .sort((left, right) => compareSourceIds(left.config.id, right.config.id))
+      .flatMap((connection) => connection.tools);
   }
 
   public async toolAnnotations(serverId: string, toolName: string): Promise<McpToolAnnotations> {
@@ -298,7 +302,7 @@ function mcpToolDeclaration(source: McpServerConfigRecord, tool: Tool): ToolDefi
   return {
     execution: 'runtime',
     declaration: {
-      name: mcpToolDisplayName(source.name, tool.name),
+      name: mcpToolDisplayName(source, tool.name),
       description: tool.description ?? `MCP 工具 ${tool.name}`,
       parameters: tool.inputSchema,
       source: {
@@ -324,24 +328,75 @@ function mcpToolDeclaration(source: McpServerConfigRecord, tool: Tool): ToolDefi
   };
 }
 
+/** OpenAI and Gemini refuse function names longer than this. */
+export const MCP_TOOL_NAME_MAX_LENGTH = 64;
+
 /**
- * AI 可见的工具名：`服务名_原始工具名`。服务名做 slug 保证字符合法，原始工具名保持原样以便和
- * MCP 服务自身文档一致。不含随机 id —— 唯一性由 {@link dedupeMcpToolNames} 在合并时兜底。
+ * A function name every provider accepts, length aside. OpenAI takes `a-z, A-Z, 0-9, _ and -`, at most
+ * 64 (https://platform.openai.com/docs/api-reference/chat/create), Claude `^[a-zA-Z0-9_-]{1,128}$`
+ * (https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools). Gemini documents a
+ * looser set (https://ai.google.dev/api/caching#FunctionDeclaration), but live Chat, Responses, Claude
+ * and Gemini requests all answer a name with `.`, `/`, a space or non-ASCII with a 400, and Gemini also
+ * a name that does not start with a letter or `_`. One such MCP name fails every request, not one tool.
  */
-function mcpToolDisplayName(sourceName: string, toolName: string): string {
-  return `${slug(sourceName)}_${toolName}`;
+const PROVIDER_TOOL_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+
+/**
+ * AI 可见的工具名：`服务名_原始工具名`。服务名做 slug 保证字符合法；原始工具名本身合法时保持原样，
+ * 以便和 MCP 服务自身文档一致。服务名 slug 后为空（例如全是中文）时改用 `mcp-<服务 id 的 8 位哈希>`，
+ * 前缀短而稳定，不同服务也不会落到同一个前缀；普通 ASCII 服务名的工具名保持不变。超过 64 个字符
+ * 的名字截短并接上整名的哈希（{@link capMcpToolName}）。整名含有接口不接受的字符或不以字母、下划线
+ * 开头时（例如 `repos.list`、`get weather`、中文工具名、`7zip` 服务），改用
+ * {@link providerSafeMcpToolName}。仍然重名时由 {@link dedupeMcpToolNames} 按来源 id 的固定顺序消歧。
+ * 名字只改给模型看的 `declaration.name`；派发与保存的设置仍按来源 id 加原始工具名识别。
+ */
+function mcpToolDisplayName(source: McpServerConfigRecord, toolName: string): string {
+  const name = `${slug(source.name) || `mcp-${shortHash(source.id)}`}_${toolName}`;
+  return PROVIDER_TOOL_NAME_PATTERN.test(name) ? capMcpToolName(name) : providerSafeMcpToolName(name);
 }
 
 /**
- * 就地消歧一批工具定义的名字：遇到与 `reserved`（含内置工具名）或彼此重名时追加 `_2`、`_3`…
- * 内部的 sourceId / originalToolName 不受影响，仅调整 AI 可见的 `declaration.name`。
+ * Rewrites a name no provider accepts: every run of other characters becomes `_`, a name not starting
+ * with a letter or `_` gets a leading `_`, and `_<8-character hash of the unchanged name>` is always
+ * appended, so names that only differed in the rewritten characters stay apart and each keeps the
+ * same name on every run. The result stays within {@link MCP_TOOL_NAME_MAX_LENGTH}.
+ */
+function providerSafeMcpToolName(name: string): string {
+  const hash = shortHash(name);
+  let head = name.replace(/[^A-Za-z0-9_-]+/g, '_');
+  if (!/^[A-Za-z_]/.test(head)) head = `_${head}`;
+  head = head.slice(0, MCP_TOOL_NAME_MAX_LENGTH - hash.length - 1).replace(/[_-]+$/, '') || '_';
+  return `${head}_${hash}`;
+}
+
+/** A name within {@link MCP_TOOL_NAME_MAX_LENGTH}: longer ones keep their start and end with `_<8-character hash of the whole name>`. */
+function capMcpToolName(name: string): string {
+  if (name.length <= MCP_TOOL_NAME_MAX_LENGTH) return name;
+  const hash = shortHash(name);
+  return `${name.slice(0, MCP_TOOL_NAME_MAX_LENGTH - hash.length - 1)}_${hash}`;
+}
+
+function shortHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 8);
+}
+
+/**
+ * 消歧一批工具定义的名字：遇到与 `reserved`（含内置工具名）或彼此重名时追加 `_2`、`_3`…（仍不超过 64 个字符）
+ * 按来源 id 排序后再分配后缀（同一来源内保持服务列出的顺序），所以名字与服务连上的先后无关；
+ * 但另一个服务断开、停用或被删除时，显示名仍可能换到别的服务的工具上。因此保存的设置都按
+ * sourceId + originalToolName 识别工具（见 shared/toolPolicyResolution 的 mcpToolIdentity 与
+ * toolConfigKey），这里只调整 AI 可见的 `declaration.name`。
  */
 export function dedupeMcpToolNames(tools: ToolDefinition[], reserved: Iterable<string> = []): ToolDefinition[] {
   const used = new Set(reserved);
-  return tools.map((tool) => {
+  const ordered = tools
+    .map((tool, index) => ({ tool, index }))
+    .sort((left, right) => compareSourceIds(sourceIdOf(left.tool), sourceIdOf(right.tool)) || left.index - right.index)
+    .map(({ tool }) => tool);
+  return ordered.map((tool) => {
     const base = tool.declaration.name;
     let name = base;
-    for (let suffix = 2; used.has(name); suffix += 1) name = `${base}_${suffix}`;
+    for (let suffix = 2; used.has(name); suffix += 1) name = capMcpToolName(`${base}_${suffix}`);
     used.add(name);
     return name === base ? tool : { ...tool, declaration: { ...tool.declaration, name } };
   });
@@ -396,7 +451,17 @@ async function closeConnection(connection: McpConnection): Promise<void> {
 }
 
 function slug(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'tool';
+  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+}
+
+function sourceIdOf(tool: ToolDefinition): string {
+  const sourceId = tool.declaration.source?.kind === 'mcp' ? tool.declaration.source.sourceId : undefined;
+  return typeof sourceId === 'string' ? sourceId : '';
+}
+
+/** Code-unit order, so the naming order is the same on every machine and locale. */
+function compareSourceIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function messageFromError(error: unknown): string {

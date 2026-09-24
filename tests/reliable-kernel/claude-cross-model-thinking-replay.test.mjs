@@ -90,15 +90,20 @@ test('只剩别家思考的助手轮次整条消失而不是发出空消息', ()
   assert.equal(messages.some((message) => Array.isArray(message.content) && message.content.length === 0), false);
 });
 
-test('其它渠道不受影响：思考照常按各自格式回放', () => {
+test('其它渠道：Gemini、OpenAI 兼容同样摘掉别家签名的思考，Responses 照常回放', () => {
   const contents = [
     { role: 'user', parts: [{ text: 'a' }] },
     { role: 'model', parts: [claudeThought('Claude 的思考'), { text: '答案' }] }
   ];
 
+  // 原生 Gemini 按同样的道理摘掉别家签名的思考（见 gemini-provider-adaptation.test.mjs 的 E3），只留回答。
   const geminiRequest = toUnifiedRequest(startRequest(contents), undefined, 'gemini');
-  assert.equal(geminiRequest.contents[1].parts[0].thought, true);
+  assert.deepEqual(geminiRequest.contents[1].parts, [{ text: '答案' }]);
 
-  const openAIRequest = toUnifiedRequest(startRequest(contents), undefined, 'openai-compatible');
-  assert.equal(openAIRequest.contents[1].parts[0].thought, true);
+  // OpenAI 兼容渠道（含 DeepSeek 等）把思考当 reasoning_content 回传，别家的思考不是这个模型的推理，同样摘掉。
+  const compatibleRequest = toUnifiedRequest(startRequest(contents), undefined, 'openai-compatible');
+  assert.deepEqual(compatibleRequest.contents[1].parts, [{ text: '答案' }]);
+
+  const responsesRequest = toUnifiedRequest(startRequest(contents), undefined, 'openai-responses');
+  assert.equal(responsesRequest.contents[1].parts[0].thought, true);
 });

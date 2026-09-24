@@ -44,17 +44,29 @@ async function withContext(body, observed = true) {
         ]),
         insert('ContextSequenceNode', { id: 'node-' + index, parent_node_id: index < 2 ? null : 'node-' + (index - 1), segment_id: 'segment-' + index, created_at: NOW })
       ]),
+      // The block's frozen authority belongs to the maintenance Turn that compressed the history.
+      insert('Turn', { id: 'compression-turn', conversation_id: 'source', status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+      insert('AuthoritySnapshot', { id: 'source-authority', turn_id: 'compression-turn', content_object_id: compacted.id, created_at: NOW }),
+      insert('TurnTermination', { id: 'compression-turn-termination', turn_id: 'compression-turn', terminal_status: 'completed', reason: 'compressed', created_at: NOW }),
       insert('ContextSegment', { id: 'compacted-segment', content_object_id: compacted.id, segment_kind: 'system', created_at: NOW }),
       insert('ContextSegmentSource', { id: 'compacted-source', segment_id: 'compacted-segment', source_kind: 'system', source_id: 'compacted-system', source_revision: 0n, created_at: NOW }),
       insert('CompressionBlock', { id: 'compression', conversation_id: 'source', status: 'enabled', authority_snapshot_id: 'source-authority', title_object_id: compacted.id, summary_object_id: metadata[0].id, created_at: NOW, updated_at: NOW }),
       insert('CompressionBlockSource', { id: 'compression-source', compression_block_id: 'compression', segment_id: 'compacted-segment', position: 0n, created_at: NOW }),
       insert('ContextSegmentSource', { id: 'summary-source', segment_id: 'segment-0', source_kind: 'compression_block', source_id: 'compression', source_revision: 0n, created_at: NOW }),
+      // The root the block compressed: its compressed range followed by the tail it kept.
+      insert('ContextSequenceNode', { id: 'creation-node-0', parent_node_id: null, segment_id: 'compacted-segment', created_at: NOW }),
+      insert('ContextSequenceNode', { id: 'creation-node-1', parent_node_id: 'creation-node-0', segment_id: 'segment-1', created_at: NOW }),
       insert('ContextSequenceRoot', {
-        id: 'source-prefix', conversation_id: 'source', root_seq: 1n, root_node_id: 'node-0', tail_node_id: 'node-1',
+        id: 'source-creation', conversation_id: 'source', root_seq: 1n, root_node_id: 'creation-node-1', tail_node_id: null,
+        tail_segment_count: 0n, segment_count: 2n, estimated_tokens: 5000n, created_at: NOW
+      }),
+      insert('ModelContextProjection', { id: 'compression-projection', owner_kind: 'compression_block', owner_id: 'compression', root_id: 'source-creation', purpose: 'compression-source', created_at: NOW }),
+      insert('ContextSequenceRoot', {
+        id: 'source-prefix', conversation_id: 'source', root_seq: 2n, root_node_id: 'node-0', tail_node_id: 'node-1',
         tail_segment_count: 1n, segment_count: 2n, estimated_tokens: 5000n, created_at: NOW
       }),
       insert('ContextSequenceRoot', {
-        id: 'source-full', conversation_id: 'source', root_seq: 2n, root_node_id: 'node-0', tail_node_id: 'node-2',
+        id: 'source-full', conversation_id: 'source', root_seq: 3n, root_node_id: 'node-0', tail_node_id: 'node-2',
         tail_segment_count: 2n, segment_count: 3n, estimated_tokens: 6000n, created_at: NOW
       }),
       insert('ConversationContextHeadLink', { id: 'source-head', conversation_id: 'source', root_id: 'source-full', updated_at: NOW })
@@ -115,6 +127,16 @@ test('从较早位置分支保留 Provider 校准，图片存储字节不再膨�
     const materialized = (await database.materializeContext(result.targetRootId)).snapshot.records;
     assert.deepEqual(materialized.map(record => record.contentObject.id), metadata.slice(0, 2).map(content => content.id));
     assert.equal((await getRoot(database, 'source-full')).estimated_tokens, 6000n);
+    const targetBlocks = (await database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain('CompressionBlock').list({
+      where: { conversation_id: result.targetConversationId }, orderBy: { column: 'id', direction: 'asc' }, limit: 10
+    }))).snapshot;
+    assert.equal(targetBlocks.length, 1, 'the fork owns its own copy of the reachable compression block');
+    assert.equal(targetBlocks[0].summary_object_id, metadata[0].id);
+    const [projection] = (await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+      where: { owner_kind: 'compression_block', owner_id: targetBlocks[0].id }, limit: 2
+    })])).snapshot[0];
+    assert.equal((await getRoot(database, projection.root_id)).conversation_id, result.targetConversationId,
+      'the copied block keeps its creation projection on the fork history');
     assert.equal((await fork('prefix', 'segment-1')).deduplicated, true);
   });
 });

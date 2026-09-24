@@ -24,16 +24,8 @@ import {
   readPhysicalCutoverRequest,
   recoverInterruptedPhysicalCutover
 } from '../../reliableKernel/physicalCutover';
-import {
-  PREVIOUS_RUNTIME_KERNEL_EPOCH,
-  migratePreviousRuntimeEpochIfRequired,
-  previousRuntimeEpochMigrationRequired
-} from '../../reliableKernel/runtimeEpochMigration';
 import { assertRuntimeHostsOffline, withRuntimeMaintenance } from '../../reliableKernel/runtimeHostControl';
-import {
-  currentRuntimeManifestMigrationRequired,
-  migrateCurrentRuntimeManifestIfRequired
-} from '../../reliableKernel/runtimeManifestMigration';
+import { validateCurrentRuntimeSchema } from '../../reliableKernel/currentRuntimeSchemaValidation';
 import { assertConfigurationRootRuntimesOffline } from '../../reliableKernel/vscodeRootAuthority';
 
 export const VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY = '.limcode-runtime-backups';
@@ -42,10 +34,7 @@ export interface VscodeReliableKernelCutoverResult {
   binding: RootBinding;
   initialized: boolean;
   cutoverPerformed: boolean;
-  manifestMigrated?: boolean;
   archiveDirectoryName?: string;
-  epochMigratedFrom?: number;
-  epochMigrationBackupPath?: string;
   epochResetFrom?: number;
   epochResetBackupPath?: string;
 }
@@ -53,8 +42,8 @@ export interface VscodeReliableKernelCutoverResult {
 /**
  * Final-VSIX startup gate. A legacy file Runtime is never opened or imported: an explicit drained
  * request archives it with a durable journal, filters independent configuration, and only then
- * atomically activates the current SQLite/CAS RootBinding. The exact epoch-3 predecessor is
- * upgraded offline before RuntimeDatabase opens; other incompatible epochs are archived/reset.
+ * atomically activates the current SQLite/CAS RootBinding. Every older Runtime epoch is archived/reset before RuntimeDatabase opens;
+ * current-epoch schema drift is rejected without rewriting data.
  *
  * The whole gate runs inside the configuration-root admission and the scope maintenance claim
  * (canonical order), so Host registration can never interleave with a root mutation. The offline
@@ -96,7 +85,6 @@ export class VscodeReliableKernelCutoverCoordinator {
     const historical = await this.authority.readHistoricalPointerForCutover();
     if (await physicalCutoverRecoveryRequired(this.runtimeScopeRootPath)) return 'physical-cutover';
     if (await readPhysicalCutoverRequest(this.runtimeScopeRootPath)) return 'physical-cutover';
-    if (await previousRuntimeEpochMigrationRequired(this.authority)) return 'runtime-root';
     if (historical && historical.runtimeKernelEpoch < RUNTIME_KERNEL_EPOCH) return 'runtime-root';
     let binding: RootBinding;
     try {
@@ -107,7 +95,8 @@ export class VscodeReliableKernelCutoverCoordinator {
       // is the one mutation in this branch.
       return (await legacyRuntimeRequiresCutover(this.runtimeScopeRootPath)) ? undefined : 'runtime-root';
     }
-    return (await currentRuntimeManifestMigrationRequired(binding)) ? 'runtime-root' : undefined;
+    await validateCurrentRuntimeSchema(binding);
+    return undefined;
   }
 
   private async ensureCurrentRootInternal(): Promise<VscodeReliableKernelCutoverResult> {
@@ -125,19 +114,6 @@ export class VscodeReliableKernelCutoverCoordinator {
         initialized: true,
         cutoverPerformed: true,
         ...(result.archiveDirectoryName ? { archiveDirectoryName: result.archiveDirectoryName } : {})
-      };
-    }
-
-    const epochMigration = await migratePreviousRuntimeEpochIfRequired(this.authority);
-    if (epochMigration) {
-      return {
-        binding: epochMigration.binding,
-        initialized: epochMigration.migrated,
-        cutoverPerformed: false,
-        epochMigratedFrom: PREVIOUS_RUNTIME_KERNEL_EPOCH,
-        ...(epochMigration.backupPath
-          ? { epochMigrationBackupPath: epochMigration.backupPath }
-          : {})
       };
     }
 
@@ -160,12 +136,11 @@ export class VscodeReliableKernelCutoverCoordinator {
 
     try {
       const binding = await this.authority.current();
-      const manifestMigration = await migrateCurrentRuntimeManifestIfRequired(binding);
+      await validateCurrentRuntimeSchema(binding);
       return {
         binding,
         initialized: false,
-        cutoverPerformed: false,
-        ...(manifestMigration.upgraded ? { manifestMigrated: true } : {})
+        cutoverPerformed: false
       };
     } catch (error) {
       if (!(error instanceof RootAuthorityError) || error.code !== 'root-binding-missing') throw error;

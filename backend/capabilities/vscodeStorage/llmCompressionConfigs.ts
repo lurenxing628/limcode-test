@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type {
   LlmCompressionConfigRecord,
   LlmCompressionConfigsRecord,
+  LlmCompressionFallbackKind,
   LlmCompressionMethodKind,
   LlmCompressionSettingsRecord,
   LlmCompressionThresholdUnit,
@@ -129,7 +130,10 @@ export function normalizeLlmCompressionConfig(input: Partial<LlmCompressionConfi
   const kind = isKnownKind(input?.kind) ? input.kind : fallback.kind;
   const trigger = normalizeTrigger(input?.trigger);
   const llmSummary = normalizeLlmSummary(input?.llmSummary)
-    ?? (isTextSummaryKind(kind) ? { targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS } : undefined);
+    ?? (isTextSummaryKind(kind) ? {
+      targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+      reasoning: { mode: 'provider_default' as const }
+    } : undefined);
   return {
     id: stringOrDefault(input?.id, fallback.id),
     name: stringOrDefault(input?.name, fallback.name),
@@ -137,7 +141,8 @@ export function normalizeLlmCompressionConfig(input: Partial<LlmCompressionConfi
     trigger,
     maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(input?.maxDurationMinutes),
     bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(input?.bodyTargetTokens),
-    ...(normalizeOpenAICompact(input?.openaiResponsesCompact) ? { openaiResponsesCompact: normalizeOpenAICompact(input?.openaiResponsesCompact) } : {}),
+    providerNative: normalizeProviderNative(input?.providerNative),
+    fallbacks: normalizeFallbacks(input?.fallbacks),
     ...(llmSummary ? { llmSummary } : {}),
     createdAt,
     updatedAt: finiteTimestamp(input?.updatedAt, createdAt)
@@ -202,12 +207,27 @@ function normalizeTrigger(input: unknown): LlmCompressionConfigRecord['trigger']
   };
 }
 
-function normalizeOpenAICompact(input: unknown): LlmCompressionConfigRecord['openaiResponsesCompact'] | undefined {
-  if (!isPlainObject(input)) return undefined;
+function normalizeProviderNative(input: unknown): NonNullable<LlmCompressionConfigRecord['providerNative']> {
+  const record = isPlainObject(input) ? input : {};
   return {
-    ...(optionalString(input.providerConfigId) ? { providerConfigId: optionalString(input.providerConfigId) } : {}),
-    ...(optionalString(input.model) ? { model: optionalString(input.model) } : {})
+    ...(optionalString(record.providerConfigId) ? { providerConfigId: optionalString(record.providerConfigId) } : {}),
+    ...(optionalString(record.model) ? { model: optionalString(record.model) } : {}),
+    trustMode: record.trustMode === 'trust_configured_endpoint'
+      ? 'trust_configured_endpoint'
+      : 'verified_only'
   };
+}
+
+function normalizeFallbacks(input: unknown): LlmCompressionFallbackKind[] {
+  const values = Array.isArray(input) ? input : [
+    'segmented_summary',
+    'deterministic_summary',
+    'continue_uncompressed_if_fits'
+  ];
+  return [...new Set(values.filter((value): value is LlmCompressionFallbackKind =>
+    value === 'segmented_summary'
+      || value === 'deterministic_summary'
+      || value === 'continue_uncompressed_if_fits'))];
 }
 
 function normalizeLlmSummary(input: unknown): LlmCompressionConfigRecord['llmSummary'] | undefined {
@@ -218,19 +238,40 @@ function normalizeLlmSummary(input: unknown): LlmCompressionConfigRecord['llmSum
     ...(optionalString(input.systemPrompt) ? { systemPrompt: optionalString(input.systemPrompt) } : {}),
     ...(optionalString(input.userPrompt) ? { userPrompt: optionalString(input.userPrompt) } : {}),
     targetTokens: finitePositiveNumber(input.targetTokens) ?? DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+    reasoning: { mode: normalizeSummaryReasoningMode(isPlainObject(input.reasoning) ? input.reasoning.mode : undefined) },
     ...(isPlainObject(input.generationConfig) ? { generationConfig: input.generationConfig } : {})
   };
 }
 
 function isTextSummaryKind(kind: LlmCompressionMethodKind): boolean {
-  return kind === 'llm_summary'
+  return kind === 'auto'
+    || kind === 'provider_native'
+    || kind === 'llm_summary'
     || kind === 'segmented_summary'
     || kind === 'deterministic_summary'
     || kind === 'manual_summary';
 }
 
 function isKnownKind(value: unknown): value is LlmCompressionMethodKind {
-  return value === 'disabled' || value === 'openai_responses_compact' || value === 'llm_summary' || value === 'segmented_summary' || value === 'deterministic_summary' || value === 'manual_summary';
+  return value === 'disabled'
+    || value === 'auto'
+    || value === 'provider_native'
+    || value === 'llm_summary'
+    || value === 'segmented_summary'
+    || value === 'deterministic_summary'
+    || value === 'manual_summary';
+}
+
+function normalizeSummaryReasoningMode(value: unknown): NonNullable<NonNullable<LlmCompressionConfigRecord['llmSummary']>['reasoning']>['mode'] {
+  return value === 'inherit_chat'
+    || value === 'economy'
+    || value === 'balanced'
+    || value === 'quality'
+    || value === 'maximum'
+    || value === 'disabled'
+    || value === 'explicit'
+    ? value
+    : 'provider_default';
 }
 
 function isKnownThresholdUnit(value: unknown): value is LlmCompressionThresholdUnit {

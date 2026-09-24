@@ -68,6 +68,7 @@ export interface ApplicationFacade {
   getStorageRootUri(): vscode.Uri;
   refreshGlobalSettings(section: GlobalSettingsSection): Promise<void>;
   resetDevelopmentData(): Promise<StorageDataResetResult>;
+  selectRuntimeDataSet(id: string): Promise<void>;
   inspectReliability(conversationId?: string): Promise<unknown>;
 
   attachWebview(webview: vscode.Webview, meta?: WebviewClientMeta): BridgeClientId;

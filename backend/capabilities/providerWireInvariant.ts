@@ -27,7 +27,7 @@ export async function inspectFinalProviderWireBody(
     throw wireInvariantError(provider, bodySha256, 'final request body is not valid UTF-8 JSON', cause);
   }
   const root = requireWireRecord(body, provider, bodySha256, 'request body');
-  if (provider === 'openai-compatible' || provider === 'deepseek') {
+  if (provider === 'openai-compatible') {
     return inspectOpenAICompatible(root, provider, bodySha256);
   }
   if (provider === 'openai-responses') return inspectOpenAIResponses(root, provider, bodySha256);

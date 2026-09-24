@@ -222,6 +222,11 @@ export function projectReliableConversation(
     lastCommitSeq: input.lastCommitSeq ?? undefined
   });
   parsedMessages.sort(compareParsedMessages);
+  // A streaming reply belongs to its Turn like the saved one that replaces it, so what is placed at
+  // that Turn keeps its place while the reply streams.
+  for (const entry of parsedMessages) {
+    if (entry.turnId && entry.message.id.startsWith('transient:')) turnIdByMessageId[entry.message.id] = entry.turnId;
+  }
   const splitSourceMessageIdByMessageId = splitAggregateMessagesAtSteeringBoundaries(
     parsedMessages,
     input.steeringReceipts ?? [],

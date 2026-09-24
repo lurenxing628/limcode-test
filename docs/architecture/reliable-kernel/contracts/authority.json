@@ -44,7 +44,8 @@
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
     "incompatibleRuntimeData": "archive-and-reset",
-    "exactPredecessorUpgrade": "offline-epoch-3-to-4-only-with-exact-schema-fingerprint-and-durable-backup"
+    "exactPredecessorUpgrade": "none-retired-predecessors-archive-reset",
+    "currentEpoch": 5
   },
   "sequenceAllocation": {
     "columnType": "INTEGER",
@@ -60,6 +61,10 @@
     "maintenanceLifetime": "operation-only",
     "maintenanceExclusivity": "reject-live-or-unknown-other-hosts",
     "configurationRootAdmission": "placement-through-host-registration",
+    "runtimeSelection": "one-fixed-data-set-per-configuration-root",
+    "runtimeSelectionPointer": ".limcode-runtime-selection.json",
+    "workspaceFoldersSelectRuntime": false,
+    "unselectedHistory": "offline-snapshot-read-only-on-demand",
     "sharedConfigurationMaintenance": "all-runtime-scopes-offline",
     "rootBindingFields": [
       "paths",
@@ -72,7 +77,10 @@
   },
   "conversationHostOwnership": {
     "manager": "ConversationRuntimeOwnerManager",
-    "scope": ["dataSetId", "conversationId"],
+    "scope": [
+      "dataSetId",
+      "conversationId"
+    ],
     "storage": "runtime-control-directory",
     "publication": "atomic-nonempty-directory-rename",
     "singleHostPerConversation": true,
@@ -81,7 +89,15 @@
     "takeover": "verified-dead-or-reused-process-only",
     "liveHostPreemption": false,
     "release": "no-view-references-no-active-commands-no-pending-runtime-work",
-    "gates": ["open", "restore", "admission", "recovery", "child-execution", "delivery-wake", "conversation-mutation"],
+    "gates": [
+      "open",
+      "restore",
+      "admission",
+      "recovery",
+      "child-execution",
+      "delivery-wake",
+      "conversation-mutation"
+    ],
     "externalReceipts": "durable-idempotent-independent-of-panel-lifetime"
   },
   "configurationDomains": [
@@ -956,6 +972,11 @@
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "tool_call_id,event_seq UNIQUE"
+      ],
+      "rules": [
+        "native_child_handle_projection 是固定类型的发送前工具结果投影事实；CAS 保存 modelRequestId/toolCallId/toolModelResultId/toolName/childHandles/output，wire 仅发送 output。",
+        "事件提交同事务核验 ModelRequest、ToolCallSourceLink、ToolCall、ToolModelResult 与 MessageRevision 身份；不修改冻结 recipe，不代替 native_delivery ACK。",
+        "同请求后续调用与恢复从已提交事件恢复累计 child 映射；普通请求和压缩继承这些保留编号，不凭源窗口出现次序重新分配。"
       ]
     },
     {
@@ -1394,7 +1415,7 @@
         "segment_id,source_kind"
       ],
       "notes": [
-        "source_kind ∈ {message_revision,tool_call,tool_model_result,compression_block,system,runtime_context}；新建 tool_pair 段写两行（tool_call+tool_model_result，同一 source_revision=call_seq）；一个稳定来源 tuple 只归属一个 segment；fork 可让同一不可变 segment 持有多个 Conversation 本地 Message/Tool alias，读取者必须先按 Conversation scope，再校验 message=1、tool_pair=2 的结构基数"
+        "source_kind ∈ {message_revision,tool_call,tool_model_result,compression_block,system,runtime_context}；新建 tool_pair 段写两行（tool_call+tool_model_result，同一 source_revision=call_seq）；一个稳定来源 tuple 只归属一个 segment；fork 可让同一不可变 segment 持有多个 Conversation 本地 Message/Tool alias，读取者必须先按 Conversation scope，再校验 message=1、tool_pair=2 的结构基数；已删除 Conversation 的 Tool/Turn 行随之级联删除而来源行随段保留，读取者把这类 tool 来源移出作用域，未知 source_kind 仍失败"
       ]
     },
     {
@@ -1532,7 +1553,7 @@
         "status"
       ],
       "notes": [
-        "正文、来源和摘要不可变；update 仅允许 status∈{enabled,disabled,soft_deleted}，regenerate 创建新 CompressionBlock"
+        "正文、来源和摘要不可变；update 仅允许 status∈{enabled,disabled,soft_deleted}，regenerate 创建新 CompressionBlock；每个能到达摘要段的 Conversation 各自拥有一个覆盖该段的 CompressionBlock，读取者按 Conversation 选择"
       ]
     },
     {
@@ -1586,7 +1607,9 @@
         "model_request_id,attempt_seq,socket_generation,stream_seq UNIQUE"
       ],
       "notes": [
-        "delete 仅允许 ModelStreamFence 已提交后的 maintenance prune；保留最新 socket_generation 尾部 32 条+终态摘要"
+        "delete 仅允许 ModelStreamFence 已提交后的 maintenance prune；保留最新 socket_generation 尾部 32 条+终态摘要",
+        "native_tool_call proof 必须同时保存 Provider 原始 arguments 与运行时冻结的 resolvedArguments；admission 校验 canonical ToolCall 参数与 resolvedArguments，相同请求重放复用冻结解释。",
+        "未知短引用的 argumentResolutionError 必须持久并阻止执行；缺 resolvedArguments 的 proof 拒绝，不推导旧格式兼容。"
       ]
     },
     {
@@ -1972,6 +1995,273 @@
       ],
       "notes": [
         "level-triggered 持久唤醒 outbox；claim owner/generation 跨 host fence；产品调度器只有在已持久安排幂等 resume/continuation/notification 后才写 acknowledged，毒消息有界退避后进入 dead_letter"
+      ]
+    },
+    {
+      "key": "CollaborationMessage",
+      "table": "collaboration_message",
+      "repository": "CollaborationMessageRepository",
+      "codec": "CollaborationMessageRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "dedupe_key UNIQUE",
+        "message_seq UNIQUE",
+        "created_at,id"
+      ]
+    },
+    {
+      "key": "CollaborationMessageSourceLink",
+      "table": "collaboration_message_source_link",
+      "repository": "CollaborationMessageSourceLinkRepository",
+      "codec": "CollaborationMessageSourceLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id UNIQUE",
+        "conversation_id,created_at",
+        "source_kind,source_key UNIQUE"
+      ]
+    },
+    {
+      "key": "CollaborationMessageTargetLink",
+      "table": "collaboration_message_target_link",
+      "repository": "CollaborationMessageTargetLinkRepository",
+      "codec": "CollaborationMessageTargetLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id UNIQUE",
+        "conversation_id,created_at",
+        "inbox_item_id UNIQUE"
+      ]
+    },
+    {
+      "key": "CollaborationMessagePayloadLink",
+      "table": "collaboration_message_payload_link",
+      "repository": "CollaborationMessagePayloadLinkRepository",
+      "codec": "CollaborationMessagePayloadLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id UNIQUE",
+        "content_object_id"
+      ]
+    },
+    {
+      "key": "CollaborationMessageReplyLink",
+      "table": "collaboration_message_reply_link",
+      "repository": "CollaborationMessageReplyLinkRepository",
+      "codec": "CollaborationMessageReplyLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id UNIQUE",
+        "request_message_id"
+      ]
+    },
+    {
+      "key": "CollaborationBudget",
+      "table": "collaboration_budget",
+      "repository": "CollaborationBudgetRepository",
+      "codec": "CollaborationBudgetRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "origin_kind,origin_key UNIQUE",
+        "authority_turn_id"
+      ]
+    },
+    {
+      "key": "CollaborationRequest",
+      "table": "collaboration_request",
+      "repository": "CollaborationRequestRepository",
+      "codec": "CollaborationRequestRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id UNIQUE",
+        "budget_id,automatic",
+        "state,created_at"
+      ]
+    },
+    {
+      "key": "CollaborationRequestTurnLink",
+      "table": "collaboration_request_turn_link",
+      "repository": "CollaborationRequestTurnLinkRepository",
+      "codec": "CollaborationRequestTurnLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-request",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "request_id UNIQUE",
+        "turn_id"
+      ]
+    },
+    {
+      "key": "CollaborationBoardChannel",
+      "table": "collaboration_board_channel",
+      "repository": "CollaborationBoardChannelRepository",
+      "codec": "CollaborationBoardChannelRowCodec",
+      "mutations": [
+        "insert",
+        "delete"
+      ],
+      "client": "none",
+      "deletePolicy": "delete-with-board-root-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "name"
+      ]
+    },
+    {
+      "key": "CollaborationBoardChannelScopeLink",
+      "table": "collaboration_board_channel_scope_link",
+      "repository": "CollaborationBoardChannelScopeLinkRepository",
+      "codec": "CollaborationBoardChannelScopeLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-channel-or-root-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "channel_id UNIQUE",
+        "root_conversation_id,channel_id UNIQUE"
+      ]
+    },
+    {
+      "key": "CollaborationBoardPost",
+      "table": "collaboration_board_post",
+      "repository": "CollaborationBoardPostRepository",
+      "codec": "CollaborationBoardPostRowCodec",
+      "mutations": [
+        "insert",
+        "delete"
+      ],
+      "client": "none",
+      "deletePolicy": "delete-with-channel",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "created_at"
+      ]
+    },
+    {
+      "key": "CollaborationBoardPostChannelLink",
+      "table": "collaboration_board_post_channel_link",
+      "repository": "CollaborationBoardPostChannelLinkRepository",
+      "codec": "CollaborationBoardPostChannelLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-post-or-channel",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "post_id UNIQUE",
+        "channel_id,post_id UNIQUE"
+      ]
+    },
+    {
+      "key": "CollaborationBoardPostSourceLink",
+      "table": "collaboration_board_post_source_link",
+      "repository": "CollaborationBoardPostSourceLinkRepository",
+      "codec": "CollaborationBoardPostSourceLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-post-or-source-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "post_id UNIQUE",
+        "source_kind,source_key UNIQUE",
+        "source_tool_call_id UNIQUE",
+        "conversation_id"
+      ]
+    },
+    {
+      "key": "CollaborationBoardReplyLink",
+      "table": "collaboration_board_reply_link",
+      "repository": "CollaborationBoardReplyLinkRepository",
+      "codec": "CollaborationBoardReplyLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-post-or-thread",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "post_id UNIQUE",
+        "thread_id,post_id UNIQUE"
+      ]
+    },
+    {
+      "key": "CollaborationBoardSubscriptionLink",
+      "table": "collaboration_board_subscription_link",
+      "repository": "CollaborationBoardSubscriptionLinkRepository",
+      "codec": "CollaborationBoardSubscriptionLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-subscriber-or-channel-or-thread",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,channel_id UNIQUE WHERE channel_id IS NOT NULL",
+        "conversation_id,thread_id UNIQUE WHERE thread_id IS NOT NULL",
+        "channel_id,active",
+        "thread_id,active"
+      ]
+    },
+    {
+      "key": "CollaborationBoardCommandReceipt",
+      "table": "collaboration_board_command_receipt",
+      "repository": "CollaborationBoardCommandReceiptRepository",
+      "codec": "CollaborationBoardCommandReceiptRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-source-tool-call-or-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "source_kind,source_key UNIQUE",
+        "source_tool_call_id UNIQUE",
+        "conversation_id"
       ]
     }
   ],

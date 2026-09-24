@@ -38,6 +38,7 @@ import { ProcessControlPlane } from './processEffects';
 import { ChildOwnedProcessCleanupControlPlane } from './childOwnedProcessCleanup';
 import {
   ProcessCompletionDeliveryControlPlane,
+  type ProcessCompletionDeliveryOptions,
   type ProcessCompletionWakeHandler
 } from './processCompletionDelivery';
 import { RootAuthority } from './rootAuthority';
@@ -93,6 +94,11 @@ export interface ReliableKernelApplicationDependencies {
   diagnosticObserver?: ReliableDiagnosticObserver;
   runtimeBuildInfo?: () => RuntimeBuildInfoRecord;
   processCompletionWakeHandler?: ProcessCompletionWakeHandler;
+  /**
+   * Scanner pacing for the durable wake outbox; production keeps the defaults. `onError` observes
+   * each scan, receipt or wake failure in addition to the diagnostic event.
+   */
+  processCompletionDelivery?: Pick<ProcessCompletionDeliveryOptions, 'scanIntervalMs' | 'retryBaseMs' | 'maxFailureCount' | 'onError'>;
   now?: () => string;
 }
 
@@ -225,19 +231,23 @@ export class ReliableKernelApplication {
       this.runtime.deliveries,
       {
         ...options,
+        ...dependencies.processCompletionDelivery,
         wakeHandler: dependencies.processCompletionWakeHandler,
-        onError: ({ scope, id, error }) => dependencies.diagnosticObserver?.observe({
-          eventKind: 'process.completion_delivery.failed',
-          scopeKind: 'runtime',
-          correlationId: id,
-          metadata: {
-            kind: 'process-completion-delivery',
-            scope,
-            status: 'failed',
-            hostBootId: database.hostBootId,
-            errorName: safeErrorName(error)
-          }
-        })
+        onError: (failure) => {
+          dependencies.diagnosticObserver?.observe({
+            eventKind: 'process.completion_delivery.failed',
+            scopeKind: 'runtime',
+            correlationId: failure.id,
+            metadata: {
+              kind: 'process-completion-delivery',
+              scope: failure.scope,
+              status: 'failed',
+              hostBootId: database.hostBootId,
+              errorName: safeErrorName(failure.error)
+            }
+          });
+          dependencies.processCompletionDelivery?.onError?.(failure);
+        }
       }
     );
     this.processes.setProcessReceiptObserver((processId) => {
@@ -257,8 +267,10 @@ export class ReliableKernelApplication {
       authorityCompiler: dependencies.authorityCompiler,
       attachments: this.attachments,
       unresolvedFileClosure: this.files,
-      prepareNextTurnDeliverySteps: (conversationId, turnId, now) =>
-        this.runtime.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now),
+      prepareNextTurnDeliverySteps: (conversationId, turnId, now, startingDeliveryId) =>
+        this.runtime.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now, startingDeliveryId),
+      prepareTerminalDeliverySteps: (turnId, now) => this.runtime.deliveries.prepareTerminalDeliverySteps(turnId, now),
+      prepareRuntimeContinuationSteps: (deliveryId) => this.runtime.collaboration.prepareReplyContinuationSteps(deliveryId),
       ...options
     });
     this.turnOutput = new TurnOutputControlPlane(database, contentStore, options);
@@ -312,7 +324,12 @@ export class ReliableKernelApplication {
         'Operation',
         'ToolResultArtifact',
         'InteractionResponse',
-        'FileChangeDecision'
+        'FileChangeDecision',
+        'CollaborationMessage',
+        'CollaborationRequest',
+        'RuntimeDelivery',
+        'RuntimeDeliveryInputLink',
+        'TurnTermination'
       ].includes(change.domain))) return;
       this.scheduleRuntimeConvergence();
     });
@@ -361,6 +378,7 @@ export class ReliableKernelApplication {
     // lineage on each Host activation only stalls live commands without repairing a new crash edge.
     signal?.throwIfAborted();
     await this.processDeliveries.start();
+    await this.runtime.collaboration.reconcile();
     await this.processes.startExitObservers();
     for (const result of phaseD) {
       this.diagnosticObserver?.observe({
@@ -513,6 +531,7 @@ export class ReliableKernelApplication {
       }
       const convergence = await this.phaseDRecovery.reconcileCommittedFacts();
       failed += convergence.failed;
+      await this.runtime.collaboration.reconcile();
     } catch (error) {
       failed += 1;
       this.diagnosticObserver?.observe({

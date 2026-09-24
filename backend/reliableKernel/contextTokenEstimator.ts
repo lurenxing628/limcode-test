@@ -13,13 +13,15 @@ import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
 import type { ModelHandleCatalog } from './modelHandleCatalog';
+import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 import {
   canonicalizeCompressionContents,
   estimateJsonTokens,
   estimateMessageContentTokens,
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
-  estimateTextTokens
+  estimateTextTokens,
+  hasOpaqueProviderCompaction
 } from './modelTokenEstimator';
 
 export {
@@ -28,8 +30,26 @@ export {
   estimateMessageContentTokens,
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
-  estimateTextTokens
+  estimateTextTokens,
+  hasOpaqueProviderCompaction
 } from './modelTokenEstimator';
+
+/**
+ * Model-visible size of a compression result, in local estimator tokens. Contents the estimator can
+ * read (summary text, Claude compaction text, rendered Attachment observation state) are measured;
+ * an OpenAI compaction item is ciphertext, so its share comes from the Provider's output count for
+ * the compaction, converted by the Conversation's calibration ratio.
+ */
+export function estimateCompressionResultTokens(
+  contents: readonly MessageContent[],
+  providerOutputTokens: number | undefined,
+  calibrationRatio = 1
+): number {
+  const measured = estimateMessageContentsTokens(contents);
+  if (providerOutputTokens === undefined || !hasOpaqueProviderCompaction(contents)) return measured;
+  const ratio = Number.isFinite(calibrationRatio) && calibrationRatio >= 1 ? calibrationRatio : 1;
+  return safeTokenCount(measured + Math.floor(providerOutputTokens / ratio), 'compression result estimate');
+}
 
 const CONTENT_TYPE_MESSAGE = 'application/vnd.limcode.message+json';
 const CONTENT_TYPE_TOOL_PAIR = 'application/vnd.limcode.context-tool-pair+json';
@@ -293,8 +313,11 @@ export function estimateMaterializedContextTokens(
     contentType: segments[0].contentObject.content_type,
     content: segments[0].content.toString('utf8')
   }]).tokenCount;
+  // A stored estimate may count rendered state the projection does not, but it never undercuts what
+  // the block's contents measure: blocks written before Claude compaction text was counted stored
+  // only the envelope overhead.
   return safeTokenCount(
-    projected.tokenCount - projectedCompression + compressed,
+    projected.tokenCount - projectedCompression + Math.max(compressed, projectedCompression),
     'projected Context estimate'
   );
 }
@@ -348,10 +371,11 @@ export function estimateRequestAuthorityTokens(
     ? policy.allowedTools.filter((value): value is string => typeof value === 'string')
     : []);
   const sourceConfigs = asRecord(policy?.sourceConfigs) ?? {};
+  const toolConfigs = asRecord(policy?.toolConfigs) ?? {};
   const tools = Array.isArray(recipe.tools) ? recipe.tools : [];
   for (const value of tools) {
     const tool = asRecord(value);
-    if (!tool || !providerToolAllowed(tool, allowed, sourceConfigs)) continue;
+    if (!tool || !providerToolAllowed(tool, { allowedTools: allowed, sourceConfigs, toolConfigs })) continue;
     total += 10;
     if (typeof tool.name === 'string') total += estimateTextTokens(tool.name);
     if (typeof tool.description === 'string') total += estimateTextTokens(tool.description);
@@ -384,17 +408,56 @@ function estimateCompressionEnvelopeTokens(content: string): number {
   if (!envelope || envelope.kind !== 'compression_contents' || !Array.isArray(envelope.contents)) {
     return estimateTextTokens(content);
   }
+  const measured = compressionEnvelopeResultTokens(envelope);
   const stored = optionalTokenCount(envelope.estimatedTokens);
-  if (stored !== undefined) return stored;
-  const contents = envelope.contents.filter(isMessageContent);
-  return estimateMessageContentsTokens(contents);
+  // Same rule as estimateMaterializedContextTokens: the stored estimate never undercuts the contents.
+  return stored === undefined ? measured : Math.max(stored, measured);
+}
+
+/**
+ * Re-measures a stored compression result. Blocks written before the result estimate counted Claude
+ * compaction text or OpenAI compaction output stored 4 and 0 tokens for summaries of thousands.
+ */
+function compressionEnvelopeResultTokens(envelope: Record<string, unknown>): number {
+  const contents = Array.isArray(envelope.contents) ? envelope.contents.filter(isMessageContent) : [];
+  const ratio = typeof envelope.providerCalibrationRatio === 'number' ? envelope.providerCalibrationRatio : 1;
+  return estimateCompressionResultTokens(contents, optionalTokenCount(envelope.providerOutputTokens), ratio);
+}
+
+/**
+ * Whether a stored compression's after-figure counts its whole result. An OpenAI compaction item is
+ * ciphertext sized by the Provider's output count; blocks stored before that was counted, or without
+ * any usage from the gateway, recorded it as 0 and would show an inflated saving.
+ */
+export function compressionResultSizeCounted(envelope: Record<string, unknown>): boolean {
+  const contents = Array.isArray(envelope.contents) ? envelope.contents.filter(isMessageContent) : [];
+  if (!hasOpaqueProviderCompaction(contents)) return true;
+  const stored = optionalTokenCount(envelope.estimatedTokens);
+  if (stored === undefined || optionalTokenCount(envelope.providerOutputTokens) === undefined) return false;
+  return stored >= compressionEnvelopeResultTokens(envelope);
+}
+
+/**
+ * True when the Context opens with an OpenAI compaction item whose size nobody reported: its
+ * ciphertext is invisible to the estimator and the gateway returned no output count, so any Context
+ * total that includes it is only a lower bound.
+ */
+export function hasUnsizedOpaqueCompaction(segments: readonly MaterializedContextSegment[]): boolean {
+  const first = segments[0];
+  if (!first || first.segmentKind !== 'compression') return false;
+  const envelope = parseRecord(first.content.toString('utf8'));
+  if (!envelope || envelope.kind !== 'compression_contents' || !Array.isArray(envelope.contents)) return false;
+  return hasOpaqueProviderCompaction(envelope.contents.filter(isMessageContent))
+    && optionalTokenCount(envelope.providerOutputTokens) === undefined;
 }
 
 function compressionEstimate(segments: readonly MaterializedContextSegment[]): number | undefined {
   const first = segments[0];
   if (!first || first.segmentKind !== 'compression') return undefined;
   const envelope = parseRecord(first.content.toString('utf8'));
-  return optionalTokenCount(envelope?.estimatedTokens);
+  const stored = optionalTokenCount(envelope?.estimatedTokens);
+  if (!envelope || stored === undefined) return stored;
+  return envelope.kind === 'compression_contents' ? Math.max(stored, compressionEnvelopeResultTokens(envelope)) : stored;
 }
 
 function parseMessageContent(content: string): MessageContent | undefined {
@@ -426,20 +489,13 @@ function contextText(content: string, contentType: string): string {
 
 function providerToolAllowed(
   tool: Record<string, unknown>,
-  allowed: ReadonlySet<string>,
-  sourceConfigs: Record<string, unknown>
+  policy: { allowedTools: ReadonlySet<string>; sourceConfigs: Record<string, unknown>; toolConfigs: Record<string, unknown> }
 ): boolean {
-  const name = typeof tool.name === 'string' ? tool.name : '';
   const source = asRecord(tool.source);
-  if (source?.kind !== 'mcp' || typeof source.sourceId !== 'string' || !source.sourceId.trim()) {
-    return allowed.has(name);
-  }
-  const config = asRecord(sourceConfigs[source.sourceId]);
-  if (!config || config.enabled !== true) return allowed.has(name);
-  const disabled = Array.isArray(config.disabledTools)
-    ? config.disabledTools.filter((value): value is string => typeof value === 'string')
-    : [];
-  return !disabled.includes(name);
+  return toolAllowedByPolicy(policy, {
+    name: typeof tool.name === 'string' ? tool.name : '',
+    ...(source ? { source } : {})
+  });
 }
 
 function isSegmentPrefix(
@@ -474,9 +530,30 @@ export function providerTotalTokens(value: unknown): number | undefined {
   return input !== undefined && output !== undefined ? input + output : undefined;
 }
 
+/**
+ * Output tokens of a compaction that come back into the Context, without the Provider's reasoning.
+ * OpenAI counts reasoning inside its output tokens, and the unified usage keeps that sum as
+ * `candidatesTokenCount` beside `thoughtsTokenCount`; Gemini reports thoughts on top of candidates,
+ * which its total then shows. Counting OpenAI's reasoning made a ciphertext compaction look as large
+ * as everything the model thought while writing it.
+ */
 export function compressionOutputTokens(value: unknown): number | undefined {
   const usage = usageRecord(value);
-  return firstTokenCount(usage, ['candidatesTokenCount', 'completion_tokens', 'output_tokens', 'outputTokens']);
+  const output = firstTokenCount(usage, ['candidatesTokenCount', 'completion_tokens', 'output_tokens', 'outputTokens']);
+  if (output === undefined) return undefined;
+  return Math.max(0, output - Math.min(output, reasoningInsideOutputTokens(usage, output)));
+}
+
+function reasoningInsideOutputTokens(usage: Record<string, unknown> | undefined, output: number): number {
+  const detailed = optionalTokenCount(asRecord(usage?.output_tokens_details)?.reasoning_tokens)
+    ?? optionalTokenCount(asRecord(usage?.completion_tokens_details)?.reasoning_tokens);
+  if (detailed !== undefined) return detailed;
+  const thoughts = optionalTokenCount(usage?.thoughtsTokenCount);
+  if (!thoughts) return 0;
+  const prompt = firstTokenCount(usage, ['promptTokenCount', 'prompt_tokens', 'input_tokens', 'inputTokens']);
+  const total = firstTokenCount(usage, ['totalTokenCount', 'total_tokens', 'totalTokens']);
+  // A total that holds thoughts on top of the output means the output never included them.
+  return prompt !== undefined && total !== undefined && total >= prompt + output + thoughts ? 0 : thoughts;
 }
 
 /**

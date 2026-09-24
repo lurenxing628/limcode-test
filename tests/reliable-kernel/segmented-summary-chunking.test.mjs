@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
+import { estimateTokenCount } from 'tokenx';
 import {
   createLlmProviderCapability,
-  dryRunCompactLlmProvider
+  dryRunCompactLlmProvider,
+  planCompressionSummaryCalls
 } from '../../dist/extension/backend/capabilities/llmProvider.js';
 
 const PROVIDERS = [
@@ -720,3 +722,396 @@ for (const [provider, baseUrl] of PROVIDERS) {
     assert.ok(result.calls.every((call) => call.bodyText.length < fixture.oversizedToolResult.length));
   });
 }
+
+/** `replies` answers the requests in order (the last one repeats); `{ status }` answers with an HTTP error. */
+async function compactWithReply(request, replies, sentBodies = []) {
+  const queue = Array.isArray(replies) ? replies : [replies];
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    sentBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    const reply = queue[Math.min(sentBodies.length, queue.length) - 1];
+    if (typeof reply === 'object') {
+      res.writeHead(reply.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'shorten failed' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-authoritative', object: 'chat.completion', created: 1, model: 'gpt-test',
+      choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }]
+    }));
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  const capability = createLlmProviderCapability({
+    settings: async () => ({ ...providerConfig('openai-compatible', `http://127.0.0.1:${address.port}/v1`), stream: false }),
+    compressionSettings: async () => undefined
+  });
+  try {
+    const terminal = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('authoritative summary test timed out')), 10_000);
+      capability.compact(request, (event) => {
+        if (event.type === 'llm:compactError') { clearTimeout(timeout); reject(new Error(event.payload.message)); }
+        if (event.type === 'llm:compactDone') { clearTimeout(timeout); resolve(event); }
+      });
+    });
+    return terminal.payload.result.contents[0].parts[0].text;
+  } finally {
+    capability.dispose();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function toolHistoryRequest() {
+  const fixture = compactRequest('openai-compatible');
+  fixture.request.methodConfigSnapshot.llmSummary.targetTokens = 4_000;
+  fixture.request.segments = [[
+    { role: 'user', parts: [{ text: 'SOURCE-USER-ASK: read the config and report its port' }] },
+    { role: 'model', parts: [{ id: 'call-config', functionCall: { name: 'read', args: { path: 'SOURCE-PATH/config.json' } } }] },
+    { role: 'user', parts: [{ id: 'call-config', functionResponse: { name: 'read', response: { content: 'SOURCE-TOOL-RESULT {"port": 8080}' } } }] },
+    { role: 'model', parts: [{ text: 'SOURCE-MODEL-REPLY: the port is 8080.' }] }
+  ]];
+  return fixture.request;
+}
+
+test('a structured model summary is the summary; raw source records are not merged into it', async () => {
+  const reply = [
+    '目标', '- 读取配置并报告端口', '',
+    '重要约束、决定和准确标识', '- 配置文件是 SOURCE-PATH/config.json，端口 8080', '',
+    '工作状态', '  - 已完成', '    - 已读取配置，端口为 8080',
+    '  - 正在做', '    - 无', '  - 受阻', '    - 无', '',
+    '下一步', '- 无', '', '相关文件', '- SOURCE-PATH/config.json'
+  ].join('\n');
+  const text = await compactWithReply(toolHistoryRequest(), reply);
+  assert.match(text, /已读取配置，端口为 8080/);
+  assert.match(text, /配置文件是 SOURCE-PATH\/config\.json/);
+  // Before: every tool call/result was appended as raw JSON and every reply copied verbatim.
+  assert.doesNotMatch(text, /historical_tool_(?:call|result)/);
+  assert.doesNotMatch(text, /SOURCE-TOOL-RESULT|SOURCE-MODEL-REPLY|SOURCE-USER-ASK/);
+});
+
+test('a reply without the required headings (e.g. a refusal) still falls back to the deterministic summary', async () => {
+  const text = await compactWithReply(toolHistoryRequest(), 'I cannot help with that request.');
+  assert.doesNotMatch(text, /I cannot help/);
+  assert.match(text, /SOURCE-USER-ASK/);
+});
+
+test('a model summary inside the target is kept verbatim: code blocks, numbering and nesting survive, a preamble is dropped', async () => {
+  const body = [
+    '目标', '- 给 /health 增加数据库检查，端口保持 8080', '',
+    '重要约束、决定和准确标识', '- 超时 2 秒：', '  ```js', '  await withTimeout(pool.query(\'SELECT 1\'), 2000);', '  ```', '',
+    '工作状态', '- 已完成：', '  1. 读取 package.json', '  2. 替换 /health 路由', '- 正在做：', '  - 补 withTimeout', '- 受阻：', '  - 无', '',
+    '下一步', '1. 定义 withTimeout', '2. 重跑 npm test', '', '相关文件', '- src/server.js'
+  ].join('\n');
+  const sent = [];
+  const text = await compactWithReply(toolHistoryRequest(), `好的，以下是摘要：\n\n${body}`, sent);
+  assert.equal(text, `[Context Summary]\n\n${body}`);
+  const system = JSON.stringify(sent[0].messages?.find((message) => message.role === 'system') ?? sent[0]);
+  assert.match(system, /最多不超过 4000 tokens/);
+  assert.match(system, /控制在约 3200 tokens/);
+});
+
+function oversizedSummaryRequest() {
+  const request = toolHistoryRequest();
+  request.methodConfigSnapshot.llmSummary.targetTokens = 300;
+  return request;
+}
+
+const OVERSIZED_REPLY = [
+  '目标', '- 保留的目标', '', '重要约束、决定和准确标识', '- 无', '',
+  '工作状态', '  - 已完成', '    - 无', '  - 正在做', '    - 无', '  - 受阻', '    - 无', '',
+  '下一步', '- 无', '', '相关文件',
+  ...Array.from({ length: 200 }, (_, index) => `- src/generated/module-${index}/implementation-file-${index}.ts`)
+].join('\n');
+
+const systemTextOf = (body) => JSON.stringify(body.messages?.find((message) => message.role === 'system') ?? body);
+
+test('a model summary over the target is shortened by the model itself and kept verbatim', async () => {
+  const shortened = [
+    '目标', '- 保留的目标', '', '重要约束、决定和准确标识', '- 生成文件共 200 个：', '  ```', '  src/generated/module-*/implementation-file-*.ts', '  ```', '',
+    '工作状态', '- 已完成：', '  1. 生成模块', '- 正在做：无', '- 受阻：无', '', '下一步', '- 无', '', '相关文件', '- src/generated/'
+  ].join('\n');
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), [OVERSIZED_REPLY, shortened], sent);
+  assert.equal(sent.length, 2);
+  assert.match(systemTextOf(sent[1]), /删短到约 \d+ tokens/);
+  assert.equal(JSON.stringify(sent[1].messages.find((message) => message.role === 'user')).includes('implementation-file-199'), true);
+  assert.equal(text, `[Context Summary]\n\n${shortened}`);
+});
+
+test('a summary still over the target after the model shortened it is cut down mechanically', async () => {
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), OVERSIZED_REPLY, sent);
+  assert.equal(sent.length, 2, 'one summary request plus exactly one shorten request');
+  assert.match(text, /保留的目标/);
+  assert.ok(text.length < OVERSIZED_REPLY.length / 4, `expected the oversized summary to be cut, got ${text.length} chars`);
+});
+
+test('a failed shorten request falls back to the mechanical cut instead of failing the compression', async () => {
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), [OVERSIZED_REPLY, { status: 500 }], sent);
+  assert.equal(sent.length, 2);
+  assert.match(text, /保留的目标/);
+  assert.ok(text.length < OVERSIZED_REPLY.length / 4);
+});
+
+test('a summary inside the target sends no shorten request', async () => {
+  const sent = [];
+  await compactWithReply(toolHistoryRequest(), OVERSIZED_REPLY.split('\n').slice(0, 20).join('\n'), sent);
+  assert.equal(sent.length, 1);
+});
+
+test('a limit too small for the seven empty headings sends no shorten request', async () => {
+  for (const kind of ['segmented_summary', 'llm_summary']) {
+    const request = toolHistoryRequest();
+    request.methodKind = kind;
+    request.methodConfigSnapshot.kind = kind;
+    request.methodConfigSnapshot.llmSummary.targetTokens = 40;
+    if (kind === 'llm_summary') {
+      request.contents = request.segments.flat();
+      delete request.segments;
+    }
+    const sent = [];
+    const text = await compactWithReply(request, OVERSIZED_REPLY, sent);
+    assert.equal(sent.length, 1, `${kind}: a shorten request cannot fit the headings under a 40-token limit`);
+    assert.ok(text.length > 0);
+  }
+});
+
+test('a shorten reply that is not shorter than the original is ignored', async () => {
+  const longer = OVERSIZED_REPLY.replace('- 保留的目标', '- LONGER-SHORTEN-GOAL')
+    + '\n' + Array.from({ length: 20 }, (_, index) => `- src/extra/added-by-shorten-${index}.ts`).join('\n');
+  const sameLength = OVERSIZED_REPLY.replace('- 保留的目标', '- SAMELEN-SHORTEN-GOAL');
+  for (const reply of [longer, sameLength]) {
+    const sent = [];
+    const text = await compactWithReply(oversizedSummaryRequest(), [OVERSIZED_REPLY, reply], sent);
+    assert.equal(sent.length, 2);
+    assert.match(text, /保留的目标/);
+    assert.doesNotMatch(text, /LONGER-SHORTEN-GOAL|SAMELEN-SHORTEN-GOAL|added-by-shorten/);
+  }
+});
+
+test('sections the model writes before 目标 are kept; only the preamble before the first heading is dropped', async () => {
+  const body = [
+    '重要约束、决定和准确标识', '- CONSTRAINT-KEEP 端口保持 8080', '',
+    '工作状态', '- 已完成：', '  - DONE-KEEP 已读取配置', '- 正在做：无', '- 受阻：无', '',
+    '目标', '- 读取配置并报告端口', '',
+    '下一步', '- 无', '', '相关文件', '- SOURCE-PATH/config.json'
+  ].join('\n');
+  const text = await compactWithReply(toolHistoryRequest(), `好的，以下是摘要：\n\n${body}`);
+  assert.equal(text, `[Context Summary]\n\n${body}`);
+  // Over the limit, the shorten request must get those sections too.
+  const oversized = `${body}\n${Array.from({ length: 200 }, (_, index) => `- src/generated/file-${index}.ts`).join('\n')}`;
+  const sent = [];
+  await compactWithReply(oversizedSummaryRequest(), `以下是摘要：\n${oversized}`, sent);
+  assert.equal(sent.length, 2);
+  const shortenInput = JSON.stringify(sent[1].messages.find((message) => message.role === 'user'));
+  assert.match(shortenInput, /CONSTRAINT-KEEP/);
+  assert.match(shortenInput, /DONE-KEEP/);
+  assert.doesNotMatch(shortenInput, /以下是摘要/);
+});
+
+test('bold, numbered and list-marked headings are recognized instead of falling back to raw records', async () => {
+  const variants = [
+    [
+      '## 1. **目标**', '- BOLD-GOAL 读取配置并报告端口', '',
+      '**二、重要约束、决定和准确标识**', '- 端口 8080', '',
+      '3) 工作状态', '- **已完成**：BOLD-DONE 已读取配置', '- __正在做__：无', '- **受阻**：无', '',
+      '**下一步**：无', '', '__相关文件__', '- SOURCE-PATH/config.json'
+    ],
+    [
+      '一、目标', '- BOLD-GOAL 读取配置并报告端口', '',
+      '（二）重要约束、决定和准确标识', '- 端口 8080', '',
+      '三、工作状态：', '1. 已完成：BOLD-DONE 已读取配置', '2. 正在做：无', '3. 受阻：无', '',
+      '* 下一步', '- 无', '', '#### 5. 相关文件：', '- SOURCE-PATH/config.json'
+    ]
+  ];
+  for (const lines of variants) {
+    const body = lines.join('\n');
+    const text = await compactWithReply(toolHistoryRequest(), `以下是摘要：\n${body}`);
+    assert.equal(text, `[Context Summary]\n\n${body}`);
+    assert.doesNotMatch(text, /SOURCE-USER-ASK|SOURCE-TOOL-RESULT/);
+  }
+});
+
+test('bold headings over the limit are still cut by section, keeping the model facts', async () => {
+  const reply = [
+    '**目标**', '- BOLD-GOAL-KEEP', '', '**重要约束、决定和准确标识**', '- 无', '',
+    '**工作状态**', '- **已完成**：无', '- **正在做**：BOLD-ACTIVE-KEEP', '- **受阻**：无', '',
+    '**下一步**', '- 无', '', '**相关文件**',
+    ...Array.from({ length: 200 }, (_, index) => `- src/generated/module-${index}/implementation-file-${index}.ts`)
+  ].join('\n');
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), reply, sent);
+  assert.equal(sent.length, 2, 'bold headings are a structured summary, so the model is asked to shorten it');
+  assert.match(text, /BOLD-GOAL-KEEP/);
+  assert.match(text, /BOLD-ACTIVE-KEEP/);
+  assert.doesNotMatch(text, /SOURCE-USER-ASK|SOURCE-TOOL-RESULT/);
+});
+
+test('cancelling while the shorten request is in flight ends the compaction without a summary', async () => {
+  let requests = 0;
+  let shortenClosed;
+  const shortenClosedPromise = new Promise((resolve) => { shortenClosed = resolve; });
+  let shortenStarted;
+  const shortenStartedPromise = new Promise((resolve) => { shortenStarted = resolve; });
+  const server = http.createServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    requests += 1;
+    if (requests === 1) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-oversized', object: 'chat.completion', created: 1, model: 'gpt-test',
+        choices: [{ index: 0, message: { role: 'assistant', content: OVERSIZED_REPLY }, finish_reason: 'stop' }]
+      }));
+      return;
+    }
+    // The shorten request never answers; only the client's cancellation ends it.
+    res.on('close', () => shortenClosed());
+    shortenStarted();
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const capability = createLlmProviderCapability({
+    settings: async () => ({ ...providerConfig('openai-compatible', `http://127.0.0.1:${server.address().port}/v1`), stream: false }),
+    compressionSettings: async () => undefined
+  });
+  const request = oversizedSummaryRequest();
+  const events = [];
+  try {
+    capability.compact(request, (event) => events.push(event));
+    await shortenStartedPromise;
+    capability.abort(request.id);
+    await shortenClosedPromise;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(requests, 2);
+    assert.equal(events.some((event) => event.type === 'llm:compactDone'), false, 'a cancelled shorten must not fall back to a summary');
+    assert.equal(events.some((event) => event.type === 'llm:compactError'), false);
+  } finally {
+    capability.dispose();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+function oneMessageRequest(text, targetTokens = 8_000) {
+  const { request } = compactRequest('openai-compatible');
+  request.methodConfigSnapshot.llmSummary = { targetTokens };
+  request.segments = [[{ role: 'user', parts: [{ text }] }]];
+  return request;
+}
+
+test('an oversized message is split losslessly, including escapes, emoji and control characters', async () => {
+  const piece = (index) => `He said "hi" at C:\\tmp\\${index}\n\t中文说明😀\u0001 ${'word '.repeat(index % 7)}{"k":[${index}]}\r\n`;
+  const text = Array.from({ length: 3_000 }, (_, index) => piece(index)).join('');
+  const result = await dryRunCompactLlmProvider(oneMessageRequest(text), {
+    settings: async () => ({ ...providerConfig('openai-compatible', 'https://example.test/v1'), contextWindowTokens: 30_000 }),
+    compressionSettings: async () => undefined
+  });
+  assert.equal(result.kind, 'provider_requests');
+  assert.ok(result.calls.length >= 3, `expected several chunks, got ${result.calls.length}`);
+  const marker = '【本回合记录】\n1. user: ';
+  const chunks = result.calls.map((call) => {
+    const user = JSON.parse(call.bodyText).messages.find((message) => message.role === 'user').content;
+    const start = user.indexOf(marker);
+    assert.ok(start >= 0);
+    return user.slice(start + marker.length);
+  });
+  assert.equal(chunks.join(''), text);
+
+  // A tool exchange is split through its rendered transcript, with the result JSON escaped twice.
+  const toolRequest = oneMessageRequest('');
+  const args = { path: 'C:\\tmp\\"quoted".txt' };
+  const response = { text };
+  toolRequest.segments = [[
+    { role: 'model', parts: [{ id: 'call-escape', functionCall: { name: 'read', args } }] },
+    { role: 'user', parts: [{ id: 'call-escape', functionResponse: { name: 'read', response } }] }
+  ]];
+  const toolResult = await dryRunCompactLlmProvider(toolRequest, {
+    settings: async () => ({ ...providerConfig('openai-compatible', 'https://example.test/v1'), contextWindowTokens: 30_000 }),
+    compressionSettings: async () => undefined
+  });
+  const toolChunks = toolResult.calls.map((call) => {
+    const user = JSON.parse(call.bodyText).messages.find((message) => message.role === 'user').content;
+    return user.slice(user.indexOf(marker) + marker.length);
+  });
+  assert.ok(toolChunks.length >= 3);
+  assert.equal(
+    toolChunks.join(''),
+    `1. model: [tool call] read: ${JSON.stringify(args)}\n\n2. user: [tool result] read: ${JSON.stringify(response)}`
+  );
+});
+
+test('splitting a multi-megabyte message costs a few passes over it, not a full measurement per bisection step', () => {
+  const text = `PERF-START ${'ordinary-history '.repeat(Math.ceil(4e6 / 17))} PERF-END`;
+  const tokenizeOnce = () => {
+    const started = performance.now();
+    estimateTokenCount(JSON.stringify(text));
+    return performance.now() - started;
+  };
+  const onePass = Math.min(tokenizeOnce(), tokenizeOnce());
+  const started = performance.now();
+  const plan = planCompressionSummaryCalls(oneMessageRequest(text), { contextWindowTokens: 400_000 });
+  const elapsed = performance.now() - started;
+  assert.deepEqual(plan, { summaryCalls: 4, mergeCalls: 1 });
+  // Bisecting each chunk with a full measurement per probe, after slicing the whole remainder, took
+  // about 28 passes' worth (7 s for 4 MB); the planner runs on the extension host.
+  assert.ok(elapsed < onePass * 15, `planning took ${Math.round(elapsed)} ms, ${(elapsed / onePass).toFixed(1)}x one tokenizer pass`);
+});
+
+test('the Attachment observation state appended after the summary is counted inside the frozen limit', async () => {
+  for (const kind of ['llm_summary', 'segmented_summary']) {
+    const fixture = observationCompactRequest(kind);
+    fixture.request.methodConfigSnapshot.llmSummary.targetTokens = 300;
+    const bodies = [];
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = Buffer.concat(chunks).toString('utf8');
+      bodies.push(body);
+      const content = body.includes('Attachment observation contract revision')
+        ? JSON.stringify({
+            attachmentRef: 'F1',
+            summary: 'A dashboard screenshot whose status column shows a red failure marker next to the deploy job.',
+            salientFacts: ['The deploy job row is red.', 'The timestamp column reads 14:02.', 'Two other jobs are green.'],
+            uncertainties: ['The job name is partly cut off.']
+          })
+        : OVERSIZED_REPLY;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: `chatcmpl-state-${bodies.length}`, object: 'chat.completion', created: 1, model: 'gpt-test',
+        choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }]
+      }));
+    });
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+    const capability = createLlmProviderCapability({
+      settings: async () => ({ ...providerConfig('openai-compatible', `http://127.0.0.1:${server.address().port}/v1`), stream: false }),
+      compressionSettings: async () => undefined,
+      async resolveAttachment(input) {
+        return { inlineData: {
+          mimeType: 'image/png', name: 'visual-evidence.png', data: fixture.bytes.toString('base64'),
+          attachmentId: input.attachmentId, sizeBytes: fixture.bytes.byteLength
+        } };
+      }
+    });
+    try {
+      const terminal = await waitForCompactTerminal(capability, fixture.request);
+      assert.equal(terminal.type, 'llm:compactDone', terminal.payload.message);
+      const [summary, state] = terminal.payload.result.contents.map((content) => content.parts[0].text);
+      assert.match(state, /attachment_observation_state/);
+      const stateTokens = estimateTokenCount(state);
+      assert.ok(stateTokens > 50, `fixture state is ${stateTokens} tokens`);
+      assert.ok(
+        estimateTokenCount(summary) + stateTokens <= 300,
+        `${kind}: summary ${estimateTokenCount(summary)} + state ${stateTokens} tokens exceed the 300-token limit`
+      );
+      // The model is told the room the state leaves, not the whole limit.
+      const summaryBody = bodies.find((body) => body.includes('最多不超过'));
+      const told = Number(/最多不超过 (\d+) tokens/.exec(summaryBody)?.[1]);
+      assert.ok(told < 300 && told >= 300 - stateTokens - 1, `${kind}: prompt limit ${told}`);
+    } finally {
+      capability.dispose();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+});

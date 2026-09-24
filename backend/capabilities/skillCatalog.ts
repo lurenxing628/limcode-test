@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { SkillDefinitionRecord, SkillSource } from '../../shared/protocol';
 import type { SkillCatalogCapability } from './types';
 import { resolveDataRootUri } from './vscodeStorage/globalStatus';
+import { SKILL_SOURCE_PRIORITY } from '../world/modules/skill/policy';
 
 const SKILL_ENTRY_FILE = 'SKILL.md';
 /** 项目级技能来源与其目录段。三者相互独立，同名 slug 各自保留。 */
@@ -11,7 +12,7 @@ const PROJECT_SKILL_ROOTS: readonly { source: SkillSource; segments: readonly st
 ];
 const GLOBAL_SKILLS_SEGMENT = 'skills';
 /** 来源优先级（也用于列表展示排序）：.agents > .claude > 全局。未指定 source 时按此顺序取最优先者。 */
-const SOURCE_ORDER: readonly SkillSource[] = ['agents', 'claude', 'global'];
+const SOURCE_ORDER: readonly SkillSource[] = SKILL_SOURCE_PRIORITY;
 
 function sourceRank(source: SkillSource): number {
   const index = SOURCE_ORDER.indexOf(source);

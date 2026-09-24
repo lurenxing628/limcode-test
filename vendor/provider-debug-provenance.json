@@ -1,8 +1,8 @@
 {
-  "upstreamPackage": "unified-llm-provider@0.1.35",
-  "upstreamCommit": "3cb58dad30bda99d7c414ba5dd230745e6298bdb",
-  "version": "0.1.35-limcode.2",
-  "archive": "unified-llm-provider-0.1.35-limcode.2.tgz",
-  "archiveSha256": "1afead51b6d4a141284434b2538f5cf3f6f47dfef3d57319470a86a2ed6e8185",
-  "patchSha256": "6140b186a57539ef8f68cd402605ad927c156fd03696711fb76f1b469c0caa11"
+  "upstreamPackage": "unified-llm-provider@0.1.37",
+  "upstreamCommit": "7857da99d5faec0865b8a402eb9c9d828f87b114",
+  "version": "0.1.37-limcode.7",
+  "archive": "unified-llm-provider-0.1.37-limcode.7.tgz",
+  "archiveSha256": "b6d98867c1c50243f2ceb14e40235c1d0044fe88120245afed8ae44a678ad777",
+  "patchSha256": "e317e8bc311d78dbcfbf896219dc95405110281aa897e97cc7764421a7ef1870"
 }

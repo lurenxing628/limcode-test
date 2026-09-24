@@ -2,7 +2,9 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
+import { isCrossConversationFollowup, isCrossConversationReply } from './collaborationScope';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
+import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import {
   requireIsoTimestamp,
   requirePhaseFId,
@@ -33,12 +35,13 @@ export interface ProcessCompletionWakeRequest {
   wakeId: string;
   deliveryId: string;
   inboxItemId: string;
-  sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure';
+  sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure' | 'collaboration_message';
   sourceId: string;
   processId?: string;
   processReceiptId?: string;
   conversationId: string;
-  sourceTurnId: string;
+  /** Null only for a collaboration message to a Conversation that has no Turn yet. */
+  sourceTurnId: string | null;
   targetTurnId: string | null;
   contentObjectId: string;
   action: ProcessCompletionWakeAction;
@@ -117,6 +120,8 @@ export class ProcessCompletionDeliveryControlPlane {
   private loopPromise: Promise<void> | undefined;
   private readonly loopWakeups = new Set<() => void>();
   private retryPollingNeeded = false;
+  /** Deliveries whose commit left them waiting for a Turn of their own since the last scan began. */
+  private readonly deliveriesAwaitingTurn = new Set<string>();
   private externalDataVersion: string | undefined;
   private readonly unsubscribeCommit: () => void;
 
@@ -134,13 +139,22 @@ export class ProcessCompletionDeliveryControlPlane {
     this.maxFailureCount = requirePositiveInteger(options.maxFailureCount ?? DEFAULT_MAX_FAILURE_COUNT, 'maxFailureCount', 100);
     this.wakeHandler = options.wakeHandler;
     this.onError = options.onError;
-    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
     this.unsubscribeCommit = database.onCommit((commit) => {
+      for (const change of commit.changes) {
+        if (change.domain !== 'RuntimeDelivery' || change.kind !== 'upsert') continue;
+        const record = change.record;
+        if (record?.state === 'pending' && record.phase === 'next_turn' && record.target_turn_id === null) {
+          this.deliveriesAwaitingTurn.add(change.id);
+        }
+      }
       if (!commit.changes.some((change) => [
         'ProcessReceipt',
         'ProcessCompletionDispatch',
         'RuntimeDelivery',
-        'RuntimeDeliveryInputLink'
+        'RuntimeDeliveryInputLink',
+        'Turn',
+        'CollaborationMessage'
       ].includes(change.domain))) return;
       if (this.started) this.requestScan();
     });
@@ -258,6 +272,13 @@ export class ProcessCompletionDeliveryControlPlane {
     // or dispatch its mutable execution. Foreign rows are left pending untouched — never claimed,
     // never failed, never dead-lettered — so the owning Host's own level scan converges them.
     const gate = new ConversationOwnershipGate(this.database, 'claim');
+    // Wakes left waiting behind their target's running Turn need no poll: that Turn's terminal
+    // commit requests a scan here, and another Host's commit moves the external data version.
+    const waitingWakeIds = new Set<string>();
+    // A delivery the Turn it was routed into ended without taking in now waits for a Turn of its
+    // own. Its wake may still back off from polling that Turn; that backoff no longer applies.
+    const awaitingTurn = new Set(this.deliveriesAwaitingTurn);
+    this.deliveriesAwaitingTurn.clear();
     try {
     const dispatches = [
       ...await listAllDomainRows(this.database, 'ProcessCompletionDispatch', { state: 'pending' }),
@@ -293,18 +314,42 @@ export class ProcessCompletionDeliveryControlPlane {
       }
     }
 
-    const wakes = [
+    // Only the owning Host dispatches, so ownership is settled before the send order is read.
+    const ownedWakes: Array<{ wake: DomainRow; wakeId: string; delivery: DomainRow | null; targetConversationId: string | null }> = [];
+    for (const wake of [
       ...await listAllDomainRows(this.database, 'RuntimeDeliveryWake', { state: 'pending' }),
       ...await listAllDomainRows(this.database, 'RuntimeDeliveryWake', { state: 'claimed' })
-    ];
-    for (const wake of wakes) {
+    ]) {
       if (this.closing) break;
       const wakeId = requirePhaseFId(wake.id, 'RuntimeDeliveryWake.id');
+      try {
+        const { delivery, targetConversationId } = await this.wakeTarget(wake);
+        if (targetConversationId === null || await gate.check(targetConversationId)) {
+          ownedWakes.push({ wake, wakeId, delivery, targetConversationId });
+          continue;
+        }
+        // Read-only on a Host that does not own the target: only the owner's commit ending that
+        // Turn (a new external data version) or the Turn's recovery can move a queued send, so it
+        // keeps no poll alive here either.
+        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) waitingWakeIds.add(wakeId);
+      } catch (error) {
+        report.failures += 1;
+        this.reportError('wake', wakeId, error);
+      }
+    }
+    for (const { wake, wakeId, targetConversationId } of await this.inDispatchOrder(ownedWakes)) {
+      if (this.closing) break;
       let claim: DomainRow | null = null;
       try {
-        const targetConversationId = await this.wakeConversationId(wake);
-        if (targetConversationId !== null && !await gate.check(targetConversationId)) continue;
-        claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
+        // Read-only: a send queued behind its target's running Turn stays untouched (no claim,
+        // backoff or failure count) until that Turn's terminal commit triggers the next scan.
+        if (wake.state === 'pending' && await this.queuedBehindActiveTurn(wake)) {
+          waitingWakeIds.add(wakeId);
+          continue;
+        }
+        claim = await this.claimOutbox('RuntimeDeliveryWake', wake, {
+          ignoreBackoff: awaitingTurn.has(String(wake.delivery_id))
+        });
         if (!claim) continue;
         const claimedWake = claim;
         const dispatched = targetConversationId === null
@@ -318,6 +363,8 @@ export class ProcessCompletionDeliveryControlPlane {
           report.wakesAcknowledged += 1;
         } else if (dispatched.value === 'retry') {
           await this.releaseClaim('RuntimeDeliveryWake', claim);
+        } else if (dispatched.value === 'deferred') {
+          await this.releaseClaim('RuntimeDeliveryWake', claim, { immediate: true });
         }
       } catch (error) {
         report.failures += 1;
@@ -328,8 +375,51 @@ export class ProcessCompletionDeliveryControlPlane {
     } finally {
       await gate.releaseClaimed();
     }
-    this.retryPollingNeeded = !this.closing && await this.hasOutstandingOutboxWork();
+    this.retryPollingNeeded = !this.closing && await this.hasOutstandingOutboxWork(waitingWakeIds);
     return report;
+  }
+
+  /**
+   * Owned wakes in dispatch order. Followups queued behind one target Turn each start a Turn of
+   * their own once it ends; collaboration wakes follow the message sequence their send transaction
+   * assigned, so neither equal timestamps nor a clock step back let a newer task overtake an older
+   * one. Process and answer wakes keep their delivery creation order and go first.
+   */
+  private async inDispatchOrder<T extends { wake: DomainRow; delivery: DomainRow | null }>(entries: T[]): Promise<T[]> {
+    const inboxes = await this.readEach('RuntimeInboxItem', entries.map((entry) => entry.delivery?.inbox_item_id));
+    const messages = await this.readEach('CollaborationMessage', inboxes.map((inbox) =>
+      inbox?.source_kind === 'collaboration_message' ? inbox.source_id : undefined));
+    return entries.map((entry, index) => ({
+      entry,
+      messageSeq: typeof messages[index]?.message_seq === 'bigint' ? messages[index]!.message_seq as bigint : null,
+      createdAt: String(entry.delivery?.created_at ?? ''),
+      deliveryId: String(entry.delivery?.id ?? '')
+    })).sort((left, right) => {
+      if ((left.messageSeq === null) !== (right.messageSeq === null)) return left.messageSeq === null ? -1 : 1;
+      if (left.messageSeq !== null && right.messageSeq !== null && left.messageSeq !== right.messageSeq) {
+        return left.messageSeq < right.messageSeq ? -1 : 1;
+      }
+      return left.createdAt.localeCompare(right.createdAt)
+        || left.deliveryId.localeCompare(right.deliveryId)
+        || String(left.entry.wake.id).localeCompare(String(right.entry.wake.id));
+    }).map((keyed) => keyed.entry);
+  }
+
+  /** Point reads in one read transaction; an absent or malformed id reads as null. */
+  private async readEach(domain: string, ids: unknown[]): Promise<Array<DomainRow | null>> {
+    const wanted = ids.flatMap((id, index) => typeof id === 'string' && id.length > 0 ? [{ id, index }] : []);
+    const rows: Array<DomainRow | null> = ids.map(() => null);
+    if (wanted.length === 0) return rows;
+    try {
+      const snapshot = await this.database.snapshot(wanted.map(({ id }) => DOMAIN_REPOSITORIES.domain(domain).get(id)));
+      wanted.forEach(({ index }, position) => {
+        const row = snapshot.snapshot[position];
+        rows[index] = row && !Array.isArray(row) ? row : null;
+      });
+    } catch {
+      // Ordering is a hint: malformed facts surface through the normal claimed dispatch failure path.
+    }
+    return rows;
   }
 
   /** Conversation that owns this dispatch's completion chain; null defers to reconcile validation. */
@@ -350,22 +440,60 @@ export class ProcessCompletionDeliveryControlPlane {
     }
   }
 
-  /** Conversation a wake dispatches into; null defers to the dispatch-time source validation. */
-  private async wakeConversationId(wake: DomainRow): Promise<string | null> {
+  /**
+   * True only while a collaboration delivery waits for its target's running Turn: the Turn it was
+   * anchored to, a manual compression or summary rebuild (which takes nothing in), for a
+   * cross-conversation followup any Turn running in the target, and for a reply to such a task a
+   * Turn that has already produced its final output.
+   */
+  private async queuedBehindActiveTurn(wake: DomainRow): Promise<boolean> {
     try {
       const delivery = await this.maybeGet(
         'RuntimeDelivery',
         requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id')
       );
-      return delivery
-        ? requirePhaseFId(delivery.target_conversation_id, 'RuntimeDelivery.target_conversation_id')
-        : null;
+      if (!delivery || delivery.state !== 'pending' || delivery.phase !== 'next_turn' || delivery.target_turn_id !== null) return false;
+      const inbox = await this.maybeGet('RuntimeInboxItem', requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id'));
+      if (!inbox || inbox.source_kind !== 'collaboration_message') return false;
+      const messageId = requirePhaseFId(inbox.source_id, 'RuntimeInboxItem.source_id');
+      const [targets, sources] = await Promise.all([
+        this.listRows('CollaborationMessageTargetLink', { message_id: messageId }, 2),
+        this.listRows('CollaborationMessageSourceLink', { message_id: messageId }, 2)
+      ]);
+      if (targets.length !== 1 || sources.length !== 1 || sources[0].source_kind === 'board') return false;
+      if (targets[0].anchor_turn_id !== null) {
+        const anchor = await this.maybeGet('Turn', requirePhaseFId(targets[0].anchor_turn_id, 'CollaborationMessageTargetLink.anchor_turn_id'));
+        if (anchor?.status === 'active' && anchor.conversation_id === delivery.target_conversation_id) return true;
+      }
+      const [active] = await this.listRows('Turn', { conversation_id: delivery.target_conversation_id, status: 'active' }, 1);
+      if (!active) return false;
+      if (await isRuntimeMaintenanceTurn(this.database, this.contentStore, String(active.id))) return true;
+      if (await isCrossConversationFollowup(this.database, messageId)) return true;
+      return await isCrossConversationReply(this.database, messageId)
+        && (await this.listRows('TurnFinalOutputFence', { turn_id: active.id }, 1)).length > 0;
     } catch {
-      return null;
+      // Malformed facts surface through the normal claimed dispatch failure path.
+      return false;
     }
   }
 
-  private async hasOutstandingOutboxWork(): Promise<boolean> {
+  /** Delivery a wake dispatches and its Conversation; null defers to the dispatch-time source validation. */
+  private async wakeTarget(wake: DomainRow): Promise<{ delivery: DomainRow | null; targetConversationId: string | null }> {
+    try {
+      const delivery = await this.maybeGet('RuntimeDelivery', requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id'));
+      return {
+        delivery,
+        targetConversationId: delivery
+          ? requirePhaseFId(delivery.target_conversation_id, 'RuntimeDelivery.target_conversation_id')
+          : null
+      };
+    } catch {
+      return { delivery: null, targetConversationId: null };
+    }
+  }
+
+  /** Outbox work a periodic poll must retry; wakes known to wait behind a running Turn do not count. */
+  private async hasOutstandingOutboxWork(waitingWakeIds: ReadonlySet<string>): Promise<boolean> {
     const snapshot = await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('ProcessCompletionDispatch').list({
         where: { state: 'pending' },
@@ -376,15 +504,18 @@ export class ProcessCompletionDeliveryControlPlane {
         limit: 1
       }),
       DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({
-        where: { state: 'pending' },
-        limit: 1
-      }),
-      DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({
         where: { state: 'claimed' },
         limit: 1
+      }),
+      // One more row than the waiting set: any pending wake outside it is returned.
+      DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({
+        where: { state: 'pending' },
+        limit: waitingWakeIds.size + 1
       })
     ]);
-    return snapshot.snapshot.some((value) => Array.isArray(value) && value.length > 0);
+    const [pendingDispatches, claimedDispatches, claimedWakes, pendingWakes] = snapshot.snapshot as DomainRow[][];
+    return pendingDispatches.length > 0 || claimedDispatches.length > 0 || claimedWakes.length > 0
+      || pendingWakes.some((wake) => !waitingWakeIds.has(String(wake.id)));
   }
 
   private async reconcileDispatch(dispatch: DomainRow): Promise<{
@@ -602,7 +733,11 @@ export class ProcessCompletionDeliveryControlPlane {
         'RuntimeInboxItem',
         requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
       );
-      if (!['process_receipt', 'answer_submission'].includes(String(inbox.source_kind))) continue;
+      if (!['process_receipt', 'answer_submission', 'collaboration_message'].includes(String(inbox.source_kind))) continue;
+      if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending') {
+        const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
+        if (message.mode === 'message' && delivery.target_turn_id === null) continue;
+      }
       if ((await this.ensureWakeForDelivery(delivery)).created) created += 1;
     }
     return created;
@@ -656,7 +791,7 @@ export class ProcessCompletionDeliveryControlPlane {
     }
   }
 
-  private async dispatchWake(wakeInput: DomainRow): Promise<'acknowledged' | 'retry' | 'dead_letter'> {
+  private async dispatchWake(wakeInput: DomainRow): Promise<'acknowledged' | 'retry' | 'dead_letter' | 'deferred'> {
     if (!this.wakeHandler || wakeInput.state !== 'claimed') return 'retry';
     const wakeId = requirePhaseFId(wakeInput.id, 'RuntimeDeliveryWake.id');
     let delivery = await this.requireExisting(
@@ -692,7 +827,18 @@ export class ProcessCompletionDeliveryControlPlane {
       ));
       return 'dead_letter';
     }
+    // The anchor Turn is still running: neither start a continuation nor inject into that Turn.
+    if (delivery.state === 'pending' && reconciled.decision.reason === 'collaboration_queued_behind_active_turn') return 'deferred';
 
+    if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending' && delivery.phase === 'next_turn' && delivery.target_turn_id === null) {
+      const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
+      // A send-only message never creates a Turn: after the final-output fence race, or once the
+      // user stopped the Turn it was injected into, only the target's next Turn takes it in. That
+      // admission needs no wake, so this one settles instead of polling until then. A reply to a
+      // cross-conversation task instead starts a Turn of its idle requester while the task's
+      // budget lasts; the continuation's admission decides that.
+      if (message.mode === 'message' && !await isCrossConversationReply(this.database, String(message.id))) return this.acknowledgeWake(wakeInput);
+    }
     const targetTurnId = delivery.target_turn_id === null
       ? null
       : requirePhaseFId(delivery.target_turn_id, 'RuntimeDelivery.target_turn_id');
@@ -710,7 +856,7 @@ export class ProcessCompletionDeliveryControlPlane {
       ...(source.processId ? { processId: source.processId } : {}),
       ...(source.processReceiptId ? { processReceiptId: source.processReceiptId } : {}),
       conversationId: source.conversationId,
-      sourceTurnId: source.sourceTurnId,
+      sourceTurnId: reconciled.decision.sourceTurnId,
       targetTurnId,
       contentObjectId,
       action,
@@ -719,14 +865,19 @@ export class ProcessCompletionDeliveryControlPlane {
         : {})
     });
     if (!result.acknowledged) return 'retry';
+    return this.acknowledgeWake(wakeInput);
+  }
+
+  private async acknowledgeWake(claim: DomainRow): Promise<'acknowledged'> {
+    const wakeId = requirePhaseFId(claim.id, 'RuntimeDeliveryWake.id');
     const now = this.timestamp();
     try {
       await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').assert(wakeId, {
-          delivery_id: delivery.id,
+          delivery_id: claim.delivery_id,
           state: 'claimed',
           claim_owner_host_boot_id: this.database.hostBootId,
-          claim_generation: wakeInput.claim_generation,
+          claim_generation: claim.claim_generation,
           acknowledged_at: null
         }),
         DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').update(wakeId, {
@@ -774,10 +925,10 @@ export class ProcessCompletionDeliveryControlPlane {
     delivery: DomainRow,
     contentObjectId: string
   ): Promise<{
-    sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure';
+    sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure' | 'collaboration_message';
     sourceId: string;
     conversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
     processId?: string;
     processReceiptId?: string;
   }> {
@@ -786,6 +937,16 @@ export class ProcessCompletionDeliveryControlPlane {
       delivery.target_conversation_id,
       'RuntimeDelivery.target_conversation_id'
     );
+    if (inbox.source_kind === 'collaboration_message') {
+      const targets = await this.listRows('CollaborationMessageTargetLink', { message_id: sourceId }, 2);
+      const payloads = await this.listRows('CollaborationMessagePayloadLink', { message_id: sourceId }, 2);
+      if (targets.length !== 1 || targets[0].conversation_id !== targetConversationId || targets[0].inbox_item_id !== inbox.id || payloads.length !== 1 || payloads[0].content_object_id !== contentObjectId) throw new Error('Collaboration wake has conflicting destination or payload facts.');
+      const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: targetConversationId });
+      turns.sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)) || String(right.id).localeCompare(String(left.id)));
+      // A followup may start a Conversation's very first Turn; it then has no anchor Turn at all.
+      const anchor = turns.find((turn) => turn.status === 'active') ?? turns[0];
+      return { sourceKind: 'collaboration_message', sourceId, conversationId: targetConversationId, sourceTurnId: anchor ? String(anchor.id) : null };
+    }
     if (inbox.source_kind === 'process_receipt') {
       const frozen = await this.readFrozenCompletionPayload(contentObjectId, sourceId);
       if (frozen.conversationId !== targetConversationId) {
@@ -844,7 +1005,8 @@ export class ProcessCompletionDeliveryControlPlane {
 
   private async claimOutbox(
     domain: 'ProcessCompletionDispatch' | 'RuntimeDeliveryWake',
-    candidate: DomainRow
+    candidate: DomainRow,
+    options: { ignoreBackoff?: boolean } = {}
   ): Promise<DomainRow | null> {
     const id = requirePhaseFId(candidate.id, `${domain}.id`);
     let current = await this.requireExisting(domain, id);
@@ -874,7 +1036,7 @@ export class ProcessCompletionDeliveryControlPlane {
       current = await this.requireExisting(domain, id);
     }
     if (current.state !== 'pending') return null;
-    if (current.next_attempt_at !== null) {
+    if (current.next_attempt_at !== null && options.ignoreBackoff !== true) {
       const due = requireIsoTimestamp(current.next_attempt_at, `${domain}.next_attempt_at`);
       if (Date.parse(due) > Date.parse(now)) return null;
     }

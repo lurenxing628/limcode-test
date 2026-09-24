@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
+import { IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import {
   type AgentRecord,
@@ -28,6 +28,9 @@ import SettingsSelectableList, { type SettingsSelectableListItem } from '@webvie
 import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
+import SummaryRebuildConfirm from '@webview/components/input/SummaryRebuildConfirm.vue';
+import { summaryRebuildTooltipRows } from '@webview/components/input/summaryRebuildPreview';
+import { useSummaryRebuildPreview } from '@webview/composables/useSummaryRebuildPreview';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
@@ -143,6 +146,39 @@ function compressCurrentContext(): void {
   if (!conversationId || !canCompressCurrentContext.value) return;
   compressContext(conversationId, { kind: 'current_head' });
 }
+const summaryRebuildTarget = ref<{ conversationId: string; rootId: string }>();
+const currentContextRootId = computed(() => {
+  const status = Object.values(reliableConversation.feed.records.ConversationContextStatus ?? {})
+    .find((candidate) => candidate.conversation_id === reliableConversation.conversationId.value);
+  return typeof status?.root_id === 'string' ? status.root_id : '';
+});
+const summaryRebuildCanConfirm = computed(() => canCompressCurrentContext.value
+  && summaryRebuildTarget.value?.conversationId === reliableConversation.conversationId.value
+  && summaryRebuildTarget.value?.rootId === currentContextRootId.value);
+const summaryRebuildPreview = useSummaryRebuildPreview();
+const summaryRebuildTooltip = summaryRebuildTooltipRows();
+
+function beginSummaryRebuild(): void {
+  if (!canCompressCurrentContext.value || !currentContextRootId.value) return;
+  summaryRebuildTarget.value = {
+    conversationId: reliableConversation.conversationId.value,
+    rootId: currentContextRootId.value
+  };
+  summaryRebuildPreview.request(summaryRebuildTarget.value.conversationId, summaryRebuildTarget.value.rootId);
+}
+
+function closeSummaryRebuild(): void {
+  summaryRebuildTarget.value = undefined;
+  summaryRebuildPreview.reset();
+}
+
+function confirmSummaryRebuild(): void {
+  if (!summaryRebuildCanConfirm.value || !summaryRebuildTarget.value) return;
+  compressContext(summaryRebuildTarget.value.conversationId, { kind: 'current_head' }, {
+    sourceReplay: 'immutable_provenance'
+  });
+  closeSummaryRebuild();
+}
 const channelOptions = computed<SettingsDropdownOption[]>(() =>
   globalSettings.llmProviderConfigs.configs.map((config) => {
     const model = selectedModelForConfig(config);
@@ -171,6 +207,20 @@ const workEnvironmentOptions = computed<SettingsDropdownOption[]>(() =>
       icon: IconFolder
     }))
 );
+const workEnvironmentSelection = computed(() => workEnvironmentStore.environmentSelectionForConversation(clientState.currentConversationId));
+const workEnvironmentSwitchingEnabled = computed(() => workEnvironmentStore.workEnvironmentEnabledForConversation(clientState.currentConversationId));
+const workEnvironmentLabel = computed(() => workEnvironmentSelection.value.error
+  ? '工作目录待选择'
+  : workEnvironmentSelection.value.active?.name ?? '未绑定工作目录');
+const workEnvironmentDescription = computed(() => workEnvironmentSelection.value.error
+  ?? (workEnvironmentSelection.value.active ? workEnvironmentDisplayPath(workEnvironmentSelection.value.active) : '当前没有可用的工作目录。'));
+const frozenWorkEnvironmentSelection = computed(() => workEnvironmentStore.frozenEnvironmentSelectionForConversation(clientState.currentConversationId));
+const displayedWorkEnvironmentSelection = computed(() => frozenWorkEnvironmentSelection.value ?? workEnvironmentSelection.value);
+const displayedWorkEnvironmentLabel = computed(() => displayedWorkEnvironmentSelection.value.error
+  ? '工作目录不可用'
+  : displayedWorkEnvironmentSelection.value.active?.name ?? '未绑定工作目录');
+const displayedWorkEnvironmentDescription = computed(() => displayedWorkEnvironmentSelection.value.error
+  ?? (displayedWorkEnvironmentSelection.value.active ? workEnvironmentDisplayPath(displayedWorkEnvironmentSelection.value.active) : '本回合没有可用的工作目录。'));
 const workflowOptions = computed<SettingsDropdownOption[]>(() => [
   {
     value: DEFAULT_WORKFLOW_OPTION_ID,
@@ -242,7 +292,7 @@ const runtimeDiagnosticAriaLabel = computed(() => runtimeReloadRequired.value
   : '连接正常；查看连接状态');
 
 const activeWorkEnvironmentId = computed({
-  get: () => workEnvironmentStore.activeEnvironmentForConversation(clientState.currentConversationId)?.id ?? workEnvironmentOptions.value[0]?.value ?? '',
+  get: () => workEnvironmentStore.activeEnvironmentForConversation(clientState.currentConversationId)?.id ?? '',
   set: (workEnvironmentId: string) => selectWorkEnvironment(workEnvironmentId)
 });
 const editorShellStyle = computed(() => {
@@ -594,8 +644,6 @@ function providerLabel(provider: string): string {
       return 'Claude';
     case 'gemini':
       return 'Gemini';
-    case 'deepseek':
-      return 'DeepSeek';
     default:
       return provider;
   }
@@ -976,20 +1024,32 @@ function middleEllipsis(value: string, maxLength: number): string {
             </template>
           </SettingsDropdown>
         </template>
-        <template v-if="workEnvironmentOptions.length">
-          <SettingsDropdown
-            v-model="activeWorkEnvironmentId"
-            class="composer-meta-dropdown composer-work-environment-dropdown"
-            :options="workEnvironmentOptions"
-            title="切换工作环境"
-            empty-text="暂无工作环境"
-            searchable
-            search-placeholder="筛选工作环境..."
-            :close-signal="workEnvironmentDropdownCloseSignal"
-            :max-height="220"
-            @open="onWorkEnvironmentDropdownOpen"
-          />
+        <template v-if="workEnvironmentSwitchingEnabled && (workEnvironmentOptions.length || workEnvironmentSelection.error)">
+          <HoverTooltipPanel :panel-title="frozenWorkEnvironmentSelection ? '下一回合工作目录' : '工作目录'" :rows="[{ label: '目录', value: workEnvironmentDescription }]">
+            <SettingsDropdown
+              v-model="activeWorkEnvironmentId"
+              class="composer-meta-dropdown composer-work-environment-dropdown"
+              :options="workEnvironmentOptions"
+              :placeholder="workEnvironmentLabel"
+              empty-text="暂无工作环境"
+              searchable
+              search-placeholder="筛选工作环境..."
+              :close-signal="workEnvironmentDropdownCloseSignal"
+              :max-height="220"
+              @open="onWorkEnvironmentDropdownOpen"
+            />
+          </HoverTooltipPanel>
         </template>
+        <HoverTooltipPanel
+          v-if="frozenWorkEnvironmentSelection || (!workEnvironmentSwitchingEnabled && (displayedWorkEnvironmentSelection.active || displayedWorkEnvironmentSelection.error))"
+          panel-title="实际工作目录"
+          :rows="[{ label: frozenWorkEnvironmentSelection ? '本回合目录' : '目录', value: displayedWorkEnvironmentDescription }]"
+        >
+          <span class="composer-work-directory" :class="{ 'has-error': displayedWorkEnvironmentSelection.error }" tabindex="0">
+            <IconFolder :size="12" aria-hidden="true" />
+            {{ frozenWorkEnvironmentSelection ? '本回合：' : '' }}{{ displayedWorkEnvironmentLabel }}
+          </span>
+        </HoverTooltipPanel>
         <SessionThinkingControl
           v-if="clientState.currentConversationId"
           :conversation-id="clientState.currentConversationId"
@@ -997,53 +1057,78 @@ function middleEllipsis(value: string, maxLength: number): string {
           :model="confirmedEffectiveModel?.model"
         />
       </div>
-      <span
-        v-if="interruptPhase"
-        class="composer-interrupt-status"
-        data-testid="turn-interrupt-status"
-        role="status"
-      >{{ interruptPhase === 'stopping' ? '正在停止' : '正在请求停止' }}</span>
-      <HoverTooltipPanel
-        v-if="session.status === 'ready'"
-        class="composer-runtime-tooltip"
-        panel-title="连接状态"
-        :rows="runtimeDiagnosticRows"
-        :delay-ms="180"
-      >
+      <div class="composer-actions">
+        <span
+          v-if="interruptPhase"
+          class="composer-interrupt-status"
+          data-testid="turn-interrupt-status"
+          role="status"
+        >{{ interruptPhase === 'stopping' ? '正在停止' : '正在请求停止' }}</span>
+        <HoverTooltipPanel
+          v-if="session.status === 'ready'"
+          class="composer-runtime-tooltip"
+          panel-title="连接状态"
+          :rows="runtimeDiagnosticRows"
+          :delay-ms="180"
+        >
+          <button
+            type="button"
+            class="composer-runtime-badge"
+            :class="{ 'is-websocket': activeTransport === 'websocket', 'is-reload-required': runtimeReloadRequired }"
+            :aria-label="runtimeDiagnosticAriaLabel"
+          >
+            {{ runtimeBadgeLabel }}
+          </button>
+        </HoverTooltipPanel>
+        <ReliableContextStatus class="composer-token-usage" />
         <button
           type="button"
-          class="composer-runtime-badge"
-          :class="{ 'is-websocket': activeTransport === 'websocket', 'is-reload-required': runtimeReloadRequired }"
-          :aria-label="runtimeDiagnosticAriaLabel"
+          class="composer-compact"
+          data-testid="compression-start-current"
+          :disabled="!canCompressCurrentContext"
+          aria-label="压缩当前上下文"
+          title="压缩当前上下文"
+          @click="compressCurrentContext"
         >
-          {{ runtimeBadgeLabel }}
+          <svg class="composer-compact-icon" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+            <path d="M5 5h14l-7 6zM5 19h14l-7-6z" />
+          </svg>
         </button>
-      </HoverTooltipPanel>
-      <ReliableContextStatus class="composer-token-usage" />
-      <button
-        type="button"
-        class="composer-compact"
-        data-testid="compression-start-current"
-        :disabled="!canCompressCurrentContext"
-        aria-label="压缩当前上下文"
-        title="压缩当前上下文"
-        @click="compressCurrentContext"
-      >
-        <svg class="composer-compact-icon" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-          <path d="M5 5h14l-7 6zM5 19h14l-7-6z" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="composer-send"
-        :disabled="conversationInputDisabled || !hasDraftContent"
-        :aria-label="sendTitle"
-        :title="sendTitle"
-        @click="submit"
-      >
-        <IconSend2 class="composer-send-icon" stroke="2" aria-hidden="true" />
-      </button>
+        <HoverTooltipPanel
+          panel-title="从原始记录重建摘要"
+          :rows="summaryRebuildTooltip"
+          :delay-ms="180"
+        >
+          <button
+            type="button"
+            class="composer-compact"
+            data-testid="compression-rebuild-current"
+            :disabled="!canCompressCurrentContext || !currentContextRootId"
+            aria-label="从原始记录重建摘要"
+            @click="beginSummaryRebuild"
+          >
+            <IconHistory class="composer-send-icon" stroke="2" aria-hidden="true" />
+          </button>
+        </HoverTooltipPanel>
+        <button
+          type="button"
+          class="composer-send"
+          :disabled="conversationInputDisabled || !hasDraftContent"
+          :aria-label="sendTitle"
+          :title="sendTitle"
+          @click="submit"
+        >
+          <IconSend2 class="composer-send-icon" stroke="2" aria-hidden="true" />
+        </button>
+      </div>
     </div>
+    <SummaryRebuildConfirm
+      :open="!!summaryRebuildTarget"
+      :preview="summaryRebuildPreview.state.value"
+      :target-current="summaryRebuildCanConfirm"
+      @confirm="confirmSummaryRebuild"
+      @cancel="closeSummaryRebuild"
+    />
   </div>
 </template>
 
@@ -1112,6 +1197,17 @@ function middleEllipsis(value: string, maxLength: number): string {
 .composer-zone-bottom {
   justify-content: flex-end;
   align-items: center;
+  /* Narrow panels: the selectors keep the first line and the status/send group moves below as a unit, never overlapping. */
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+.composer-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 .composer-edit-indicator {
@@ -1310,13 +1406,14 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-meta {
-  flex: 1 1 auto;
+  flex: 1 1 220px;
   min-width: 0;
   margin-right: auto;
   overflow: visible;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-1);
+  gap: 2px var(--space-1);
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-sm);
   line-height: 1.4;
@@ -1626,5 +1723,19 @@ function middleEllipsis(value: string, maxLength: number): string {
 @keyframes composer-compact-squeeze-bottom {
   0%, 100% { transform: translateY(1px); }
   50% { transform: translateY(-2px); }
+}
+.composer-work-directory {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.composer-work-directory.has-error {
+  color: var(--vscode-errorForeground);
 }
 </style>

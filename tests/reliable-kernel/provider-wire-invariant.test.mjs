@@ -88,7 +88,14 @@ test('真实 SDK 的 SSE JSON 解析错误不因响应体封装变成截断', as
 
 const callId = 'super-secret-call-id';
 const privateOutput = 'private-output-do-not-log';
-const providers = ['openai-compatible', 'deepseek', 'openai-responses', 'claude', 'gemini'];
+// 官方 DeepSeek / MiMo 接口在 OpenAI 兼容渠道里交给接入库的 DeepSeek 格式编码，校验仍按 OpenAI 兼容的 wire 形状。
+const providers = [
+  ['openai-compatible', 'openai-compatible'],
+  ['openai-compatible', 'deepseek'],
+  ['openai-responses', 'openai-responses'],
+  ['claude', 'claude'],
+  ['gemini', 'gemini']
+];
 
 function unifiedToolExchange() {
   return {
@@ -105,11 +112,11 @@ function unifiedToolExchange() {
   };
 }
 
-async function captureProviderWire(providerKind) {
+async function captureProviderWire(providerKind, libraryKind) {
   let bodyText;
   let returnedResponse;
   const traces = [];
-  const remoteField = providerKind === 'openai-compatible' || providerKind === 'deepseek'
+  const remoteField = providerKind === 'openai-compatible'
     ? 'tool_call_id'
     : providerKind === 'openai-responses'
       ? 'call_id'
@@ -131,7 +138,7 @@ async function captureProviderWire(providerKind) {
   });
   const registry = unified.createBootstrapExtensionRegistry();
   const provider = unified.createLLMFromConfig({
-    provider: providerKind,
+    provider: libraryKind,
     model: providerKind === 'gemini' ? 'gemini-2.5-flash' : 'test-model',
     apiKey: 'super-secret-api-key',
     baseUrl: 'https://provider.invalid/v1',
@@ -145,7 +152,7 @@ async function captureProviderWire(providerKind) {
 }
 
 function assertWireToolResult(providerKind, body) {
-  if (providerKind === 'openai-compatible' || providerKind === 'deepseek') {
+  if (providerKind === 'openai-compatible') {
     const item = body.messages.find((message) => message.role === 'tool');
     assert.equal(item.tool_call_id, callId);
     return;
@@ -167,9 +174,9 @@ function assertWireToolResult(providerKind, body) {
   assert.equal(item.name, 'edit');
 }
 
-for (const providerKind of providers) {
-  test(`${providerKind} final fetch validates its actual wire tool-result shape and emits only safe evidence`, async () => {
-    const captured = await captureProviderWire(providerKind);
+for (const [providerKind, libraryKind] of providers) {
+  test(`${providerKind}（接入库 ${libraryKind} 格式）final fetch validates its actual wire tool-result shape and emits only safe evidence`, async () => {
+    const captured = await captureProviderWire(providerKind, libraryKind);
     assertWireToolResult(providerKind, captured.body);
     assert.equal(captured.traces.length, 1);
     const trace = captured.traces[0];
@@ -199,7 +206,7 @@ for (const providerKind of providers) {
 test('required provider-specific IDs fail closed before fetch', async () => {
   const invalidBodies = [
     ['openai-compatible', { messages: [{ role: 'tool', content: 'x' }] }],
-    ['deepseek', { messages: [{ role: 'tool', content: 'x' }] }],
+    ['openai-compatible', { messages: [{ role: 'tool', content: [{ type: 'text', text: 'x' }] }] }],
     ['openai-responses', { input: [{ type: 'function_call_output', output: 'x' }] }],
     ['claude', { messages: [{ role: 'user', content: [{ type: 'tool_result', content: 'x' }] }] }]
   ];

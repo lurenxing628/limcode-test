@@ -53,6 +53,7 @@ import {
   type ContentObjectMetadata
 } from './contentAddressedStore';
 import type { RuntimeChange, RuntimeCommitResult } from './contracts';
+import { compressionResultSizeCounted } from './contextTokenEstimator';
 import { requirePhaseFId, requirePhaseFText } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -575,6 +576,14 @@ export class BoundedClientFeed {
         }
         const ownKey = recordKey(change.domain, change.id);
         const wasKnown = session.materializedRecordKeys.has(ownKey);
+        if (change.domain === 'Turn' && record.conversation_id === session.activeConversationId) {
+          const previousStatus = session.materializedRecords.get(ownKey)?.status;
+          if (previousStatus !== record.status && (previousStatus === 'active' || record.status === 'active')) {
+            // The frozen work-environment summary is a snapshot-only projection. Refresh it
+            // atomically when its active Turn appears or ends, including a child Conversation.
+            requiresSnapshot = true;
+          }
+        }
         accepted.push(acceptedChange);
         pending.splice(index, 1);
         if (wasKnown) {
@@ -788,8 +797,27 @@ export class BoundedClientFeed {
         return materialized('ChildExecution', field('child_execution_id'));
       case 'AnswerSubmission':
         return materialized('AnswerBridge', field('answer_bridge_id'));
-      case 'RuntimeDelivery':
-        return field('target_conversation_id') === activeConversationId;
+      case 'CollaborationMessageSourceLink':
+      case 'CollaborationMessageTargetLink':
+        return field('conversation_id') === activeConversationId
+          || materialized('CollaborationMessage', field('message_id'));
+      case 'CollaborationMessage':
+        return referencedBy('CollaborationMessageSourceLink', 'CollaborationMessageTargetLink');
+      case 'CollaborationMessageReplyLink':
+      case 'CollaborationRequest':
+        return materialized('CollaborationMessage', field('message_id'));
+      case 'CollaborationRequestTurnLink':
+        return materialized('CollaborationRequest', field('request_id'));
+      case 'RuntimeDelivery': {
+        // The sender also sees the delivery of its own loaded outgoing collaboration messages.
+        const inboxItemId = field('inbox_item_id');
+        return field('target_conversation_id') === activeConversationId
+          || Boolean(inboxItemId && hasMaterializedReferenceFrom(
+            session,
+            recordKey('RuntimeInboxItem', inboxItemId),
+            ['CollaborationMessageTargetLink']
+          ));
+      }
       case 'RuntimeDeliveryIntentLink':
         return materialized('RuntimeDelivery', field('delivery_id'))
           && materialized('TurnIntent', field('turn_intent_id'));
@@ -1622,7 +1650,8 @@ export class ClientDetailReader {
       methodKind: requireCompressionMethodKind(summary.methodKind),
       ...(triggerReason ? { triggerReason } : {}),
       ...(triggerTokenSource ? { triggerTokenSource } : {}),
-      ...compressionPresentationTokens(summary)
+      ...compressionPresentationTokens(summary),
+      ...(compressionResultSizeCounted(summary) ? {} : { resultSizeUncounted: true })
     })), 'utf8');
   }
 
@@ -1797,6 +1826,26 @@ export class ClientDetailReader {
         ...(exitCode ? { exitCode } : {}),
         ...(exitSignal ? { exitSignal } : {})
       };
+    }
+    if (inbox.source_kind === 'collaboration_message') {
+      const message = await this.requireExisting('CollaborationMessage', sourceId);
+      if (message.mode !== 'message' && message.mode !== 'followup') throw new Error('Invalid CollaborationMessage mode.');
+      const [sources, payloads, targets] = await Promise.all([
+        this.listRows('CollaborationMessageSourceLink', { message_id: sourceId }, 2),
+        this.listRows('CollaborationMessagePayloadLink', { message_id: sourceId }, 2),
+        this.listRows('CollaborationMessageTargetLink', { message_id: sourceId, inbox_item_id: inboxItemId }, 2)
+      ]);
+      if (sources.length !== 1 || payloads.length !== 1 || targets.length !== 1) {
+        throw new Error('Collaboration message preview requires exact source, payload and destination links.');
+      }
+      const metadata = await this.requireExisting('ContentObject', String(payloads[0]!.content_object_id)) as ContentObjectMetadata;
+      if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || BigInt(metadata.byte_length) > 64000n) {
+        throw new Error('Collaboration message preview payload violates its content contract.');
+      }
+      const text = (await this.contentStore.read(metadata)).toString('utf8');
+      return { kind: 'collaboration_message', inboxItemId, sourceId,
+        sourceConversationId: requirePhaseFId(sources[0]!.conversation_id, 'CollaborationMessageSourceLink.conversation_id'),
+        mode: message.mode, textPreview: boundedTurnIntentSourceText(text, 320) ?? '' };
     }
     if (inbox.source_kind !== 'answer_submission') {
       throw new Error(`RuntimeInboxItem ${inboxItemId} has unsupported source kind ${String(inbox.source_kind)}.`);
@@ -2051,6 +2100,7 @@ function compressionPresentationTokens(summary: Record<string, unknown>): Record
     'triggerTokens',
     'configuredThresholdTokens',
     'estimatedTokensBefore',
+    'contextTokensBefore',
     'estimatedTokensAfter',
     'calibratedTokensBefore',
     'calibratedTokensAfter',
@@ -2069,7 +2119,7 @@ function compressionPresentationTokens(summary: Record<string, unknown>): Record
 
 function requireCompressionMethodKind(value: unknown): string {
   const allowed = [
-    'openai_responses_compact',
+    'provider_native',
     'llm_summary',
     'segmented_summary',
     'deterministic_summary',
@@ -2103,7 +2153,8 @@ const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
   'Process',
   'ChildExecution',
   'AnswerSubmission',
-  'RuntimeDelivery'
+  'RuntimeDelivery',
+  'CollaborationMessage'
 ]);
 
 const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
@@ -2123,7 +2174,8 @@ const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
   'ChildExecutionTurnLink',
   'ChildExecutionActiveTurnLink',
   'AnswerBridge',
-  'RuntimeDelivery'
+  'RuntimeDelivery',
+  'CollaborationMessage'
 ]);
 
 /** Text links which are intentionally not SQLite foreign keys still need an explicit type. */
@@ -2212,7 +2264,13 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   answerSubmissions: 'AnswerSubmission',
   runtimeInboxItems: 'RuntimeInboxItem',
   runtimeDeliveries: 'RuntimeDelivery',
-  runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink'
+  runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
+    collaborationMessages: 'CollaborationMessage',
+    collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',
+    collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
+    collaborationMessageReplyLinks: 'CollaborationMessageReplyLink',
+    collaborationRequests: 'CollaborationRequest',
+    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink'
 });
 
 function recordKey(domain: string, id: string): string {
@@ -2960,6 +3018,7 @@ function snapshotRetentionCandidates(
   add(window, 'conversationOriginLinks', 'newest-first');
   add(window, 'commandReceipts', 'newest-first');
   add(window, 'compressionBlocks', 'oldest-first');
+  add(subagents, 'collaborationMessages', 'newest-first');
   return candidates;
 }
 
@@ -3256,6 +3315,32 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   const answerBridgeIds = snapshotIds(subagents, 'answerBridges');
   filterSnapshotReference(subagents, 'answerSubmissions', 'answer_bridge_id', answerBridgeIds);
 
+  const collaborationMessageIds = snapshotIds(subagents, 'collaborationMessages');
+  for (const key of ['collaborationMessageSourceLinks', 'collaborationMessageTargetLinks',
+    'collaborationMessageReplyLinks', 'collaborationRequests']) {
+    filterSnapshotReference(subagents, key, 'message_id', collaborationMessageIds);
+  }
+  filterSnapshotReference(subagents, 'collaborationRequestTurnLinks', 'request_id',
+    snapshotIds(subagents, 'collaborationRequests'));
+  // A delivery to another Conversation is here only for a loaded outgoing message, and a peer row
+  // only for a loaded link; both go with the message. The selected Conversation's own deliveries stay.
+  const collaborationTargets = new Set(snapshotArray(subagents, 'collaborationMessageTargetLinks').map((link) =>
+    collaborationDeliveryKey(snapshotField(link, 'inbox_item_id'), snapshotField(link, 'conversation_id'))));
+  filterSnapshotArray(subagents, 'runtimeDeliveries', (delivery) => {
+    const targetConversationId = snapshotField(delivery, 'target_conversation_id');
+    return targetConversationId === activeConversationId
+      || collaborationTargets.has(collaborationDeliveryKey(snapshotField(delivery, 'inbox_item_id'), targetConversationId));
+  });
+  const collaborationPeerIds = new Set([
+    ...snapshotArray(subagents, 'collaborationMessageSourceLinks'),
+    ...snapshotArray(subagents, 'collaborationMessageTargetLinks')
+  ].flatMap((link) => {
+    const id = snapshotField(link, 'conversation_id');
+    return id ? [id] : [];
+  }));
+  filterSnapshotArray(subagents, 'collaborationPeerConversations', (peer) =>
+    collaborationPeerIds.has(snapshotRecordId(peer) ?? ''));
+
   const deliveryIds = snapshotIds(subagents, 'runtimeDeliveries');
   const queuedTurnIntentIds = snapshotIds(window, 'queuedTurnIntents');
   filterSnapshotArray(subagents, 'runtimeDeliveryIntentLinks', (link) =>
@@ -3268,6 +3353,10 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   }));
   filterSnapshotArray(subagents, 'runtimeInboxItems', (item) => inboxIds.has(snapshotRecordId(item) ?? ''));
   if (deliveryIds.size === 0) subagents.runtimeInboxItems = [];
+}
+
+function collaborationDeliveryKey(inboxItemId: string | undefined, conversationId: string | undefined): string {
+  return `${inboxItemId ?? ''}\0${conversationId ?? ''}`;
 }
 
 function requireSnapshotSection(

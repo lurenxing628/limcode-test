@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import type {
   CompressionCommandTarget,
   LlmProviderKind,
-  MessageRetryTarget
+  MessageRetryTarget,
+  SessionThinkingOverride
 } from '../../shared/protocol';
 import type {
   AttachmentIngestService,
@@ -55,7 +56,8 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
-import { canonicalPlainJson, normalizePlainJson } from './plainJson';
+import { toolArtifactIdentifiesCall } from './copiedToolIdentity';
+import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { sqliteUniqueFailureIncludes, stablePhaseFId } from './phaseFIdentity';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { ExecutionLeaseFence } from './executionLeaseFence';
@@ -73,6 +75,12 @@ import {
   type ProjectFolderAssignment
 } from './conversationProject';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import {
+  readChildExecutionBoundary,
+  readChildExecutionWorkEnvironmentBoundary,
+  type FrozenSkillPolicyDocument,
+  type FrozenToolPolicyDocument
+} from './childExecutionBoundary';
 
 export const DEFAULT_AGENT_CONVERSATION_ROLE = 'default';
 
@@ -162,6 +170,28 @@ export interface TurnAuthorityCompilationRequest {
    * intersects it with the child's own scoped policy — the boundary is never widened.
    */
   inheritedWorkEnvironmentPolicy?: FrozenWorkEnvironmentBoundaryPolicy;
+  /**
+   * The planning Turn's working directory, supplied when a Plan the user approved runs in a new
+   * conversation: the child starts there if its own settings allow it. It narrows nothing.
+   */
+  preferredWorkEnvironmentId?: string;
+  /**
+   * The parent Turn's frozen tool policy, supplied for every Turn of a child execution the model
+   * started (a Plan the user approved to run in a new conversation has none). The compiler
+   * intersects the child's own tool settings with it (see `boundChildToolPolicy`) — a child never
+   * gets a tool, MCP source or permission its parent Turn lacked.
+   */
+  inheritedToolPolicy?: FrozenToolPolicyDocument;
+  /**
+   * The parent Turn's frozen skill settings, supplied with `inheritedToolPolicy`. A skill either side
+   * turns off stays off in the child (see `boundChildSkillPolicy`).
+   */
+  inheritedSkillPolicy?: FrozenSkillPolicyDocument;
+  /**
+   * 父回合在“派出的子 Agent 也用这个思考强度”下冻结的思考强度。子对话的第一个回合在写入它自己的
+   * 模型记录之前编译，对话还没有模型记录时按这里冻结，这个子 Agent 再派出的孙 Agent 才能接着继承。
+   */
+  inheritedThinkingOverride?: SessionThinkingOverride;
 }
 
 export interface TurnModelOverride {
@@ -222,18 +252,28 @@ export interface TurnContinuationCommand extends TurnExecutionCommand {
   contentType?: string;
 }
 
-/** Internal no-visible-message continuation created for one exact RuntimeDelivery. */
+/**
+ * Internal no-visible-message continuation created for one exact RuntimeDelivery. Process and
+ * child-answer deliveries inherit the frozen authority of their same-Conversation source Turn. A
+ * collaboration delivery has no such Turn (sourceTurnId is null): the destination runs under its
+ * own current settings, exactly like a user input, and may start its very first Turn.
+ */
 export interface TurnRuntimeDeliveryContinuationCommand extends TurnExecutionCommand {
   source: TurnInitiatingSource & { kind: 'internal' };
-  sourceTurnId: string;
+  sourceTurnId: string | null;
   deliveryId: string;
   maintenance?: undefined;
 }
 
-/** Internal no-visible-message product maintenance with authority inherited from one source Turn. */
+/**
+ * Internal no-visible-message product maintenance. It inherits the frozen authority of one source
+ * Turn of the Conversation; without such a Turn (sourceTurnId is null, for example a fork whose
+ * Turns are all copied history) it compiles the Conversation's current settings, like the first
+ * Turn of a new Conversation.
+ */
 export interface TurnRuntimeMaintenanceCommand extends TurnExecutionCommand {
   source: TurnInitiatingSource & { kind: 'internal' };
-  sourceTurnId: string;
+  sourceTurnId: string | null;
   deliveryId?: undefined;
   /**
    * Immutable product-maintenance identity carried by the admitted TurnIntent CAS payload.
@@ -266,6 +306,8 @@ export interface TurnRuntimeMaintenanceDescriptorV2 {
   compressSegmentCount: number;
   /** Exact UI boundary frozen before the maintenance Turn is admitted. */
   target: CompressionCommandTarget;
+  /** Explicit full-history regeneration, frozen as part of the command replay identity. */
+  sourceReplay?: 'immutable_provenance';
   /** Stable initiating source identity, used only to locate an exact command replay. */
   commandSourceKey: string;
 }
@@ -397,12 +439,23 @@ export interface TurnControlPlaneOptions {
   authorityCompiler: TurnAuthorityCompiler;
   attachments?: AttachmentIngestService;
   unresolvedFileClosure?: TurnUnresolvedFileClosure;
-  /** Injects pending next_turn RuntimeDelivery facts into an admitted ordinary Turn atomically. */
+  /**
+   * Injects pending next_turn RuntimeDelivery facts into an admitted ordinary Turn atomically.
+   * `startingDeliveryId` is the delivery a runtime continuation was admitted for.
+   */
   prepareNextTurnDeliverySteps?: (
     conversationId: string,
     turnId: string,
-    now: string
+    now: string,
+    startingDeliveryId?: string | null
   ) => Promise<RepositoryTransactionStep[]>;
+  /** Moves the collaboration messages a Turn never took in to next_turn inside its terminal commit. */
+  prepareTerminalDeliverySteps?: (turnId: string, now: string) => Promise<RepositoryTransactionStep[]>;
+  /**
+   * Budget steps a runtime continuation commits with its TurnIntent: a Turn a cross-conversation
+   * reply starts spends the budget of the task it answers. Throws when that budget is spent.
+   */
+  prepareRuntimeContinuationSteps?: (deliveryId: string) => Promise<RepositoryTransactionStep[]>;
   now?: () => string;
 }
 
@@ -515,6 +568,8 @@ export class TurnControlPlane {
   private readonly attachments?: AttachmentIngestService;
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
   private readonly prepareNextTurnDeliverySteps?: TurnControlPlaneOptions['prepareNextTurnDeliverySteps'];
+  private readonly prepareTerminalDeliverySteps?: TurnControlPlaneOptions['prepareTerminalDeliverySteps'];
+  private readonly prepareRuntimeContinuationSteps?: TurnControlPlaneOptions['prepareRuntimeContinuationSteps'];
   private readonly contextSequence: ContextSequenceControlPlane;
   private readonly guidanceQueue: TurnGuidanceQueueOperations;
 
@@ -530,6 +585,8 @@ export class TurnControlPlane {
     this.attachments = options.attachments;
     this.unresolvedFileClosure = options.unresolvedFileClosure;
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
+    this.prepareTerminalDeliverySteps = options.prepareTerminalDeliverySteps;
+    this.prepareRuntimeContinuationSteps = options.prepareRuntimeContinuationSteps;
     this.now = options.now ?? (() => new Date().toISOString());
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.guidanceQueue = new TurnGuidanceQueueOperations({
@@ -602,18 +659,55 @@ export class TurnControlPlane {
       return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
         command,
         operation: 'retry',
-        sourceTurnId: command.sourceTurnId,
-        inheritSourceAuthority: true,
+        ...(command.sourceTurnId === null ? {} : { sourceTurnId: command.sourceTurnId }),
+        inheritSourceAuthority: command.sourceTurnId !== null,
         runtimeMaintenance: normalizeRuntimeMaintenance(command.maintenance)
       }));
     }
-    return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
-      command,
-      operation: 'runtime_continuation',
-      sourceTurnId: command.sourceTurnId,
-      deliveryId: requireId(command.deliveryId, 'deliveryId'),
-      inheritSourceAuthority: true
-    }));
+    return this.runOwnedConversationMutation(command.conversationId, async () => {
+      const deliveryId = requireId(command.deliveryId, 'deliveryId');
+      const collaboration = await this.isCollaborationDelivery(deliveryId);
+      if (collaboration !== (command.sourceTurnId === null)) {
+        throw new TypeError(collaboration
+          ? 'A collaboration continuation compiles the destination\'s current authority and carries no source Turn.'
+          : 'A runtime continuation inherits the frozen authority of its exact source Turn.');
+      }
+      return this.startIntent({
+        command,
+        operation: 'runtime_continuation',
+        ...(command.sourceTurnId === null ? {} : { sourceTurnId: command.sourceTurnId }),
+        deliveryId,
+        inheritSourceAuthority: !collaboration
+      });
+    });
+  }
+
+  /**
+   * The authority a manual compression maintenance Turn would freeze now, computed the way
+   * runtimeContinuation admits one: inherited from sourceTurnId when there is one, otherwise the
+   * Conversation's current settings. Read-only: no Turn is admitted and nothing is written.
+   */
+  public async previewMaintenanceAuthority(
+    conversationIdInput: string,
+    sourceTurnId: string | null
+  ): Promise<PlainJsonValue> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const previewTurnId = 'turn_maintenance_authority_preview';
+    const compiled = sourceTurnId === null
+      ? await this.compileCurrentAuthority(conversationId, previewTurnId, 'retry')
+      : await this.inheritTurnAuthority(requireId(sourceTurnId, 'sourceTurnId'), previewTurnId, conversationId, 'retry');
+    const content = compiled.authoritySnapshot.content;
+    const text = typeof content === 'string' ? content : Buffer.from(content).toString('utf8');
+    return normalizePlainJson(JSON.parse(text) as unknown, 'Maintenance authority preview');
+  }
+
+  private async isCollaborationDelivery(deliveryId: string): Promise<boolean> {
+    const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
+    const inbox = await this.requireExisting(
+      'RuntimeInboxItem',
+      requireId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
+    );
+    return inbox.source_kind === 'collaboration_message';
   }
 
   public edit(command: TurnEditCommand): Promise<TurnCommandResult> {
@@ -741,6 +835,9 @@ export class TurnControlPlane {
       ? await this.unresolvedFileClosure.prepareUnresolvedTurnClosure(turnId, { requireLease: false })
       : [];
     const now = this.timestamp();
+    const terminalDeliverySteps = this.prepareTerminalDeliverySteps
+      ? await this.prepareTerminalDeliverySteps(turnId, now)
+      : [];
     const committed = await this.commitWithReceipt({
       source,
       receiptId,
@@ -751,6 +848,7 @@ export class TurnControlPlane {
         DOMAIN_REPOSITORIES.domain('ExecutionLease').assertNone({ turn_id: turnId }),
         DOMAIN_REPOSITORIES.domain('PendingTurnInput').assertNone({ turn_id: turnId }),
         DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
+        ...terminalDeliverySteps,
         ...unresolvedFileSteps,
         DOMAIN_REPOSITORIES.domain('ToolCall').assertAll({ turn_id: turnId }, { status: 'terminal' }),
         DOMAIN_REPOSITORIES.domain('ModelRequest').assertAll({ turn_id: turnId }, { status: 'terminal' }),
@@ -1388,7 +1486,12 @@ export class TurnControlPlane {
         })
       : null;
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps
-      ? await this.prepareNextTurnDeliverySteps(conversationId, ids.turn, now)
+      ? await this.prepareNextTurnDeliverySteps(
+          conversationId,
+          ids.turn,
+          now,
+          deliveryIntentLink ? requireId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id') : null
+        )
       : [];
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
@@ -1633,7 +1736,8 @@ export class TurnControlPlane {
           plan.operation,
           plan.sourceTurnId,
           command.executorAgentId,
-          command.modelOverride
+          command.modelOverride,
+          command.membership
         );
     if (retryRewind) compiled = withRetryLineage(compiled, retryRewind.lineage);
     const now = this.timestamp();
@@ -1670,7 +1774,7 @@ export class TurnControlPlane {
         ? await this.contentStore.prepare(
             this.database,
             JSON.stringify(runtimeContinuationTurnIntentEnvelope({
-              sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId')
+              sourceTurnId: plan.inheritSourceAuthority ? requireId(plan.sourceTurnId, 'sourceTurnId') : null
             })),
             TURN_INTENT_ENVELOPE_CONTENT_TYPE
           )
@@ -1678,7 +1782,9 @@ export class TurnControlPlane {
         this.database,
         JSON.stringify({
           kind: plan.operation,
-          sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId'),
+          sourceTurnId: plan.runtimeMaintenance && plan.sourceTurnId === undefined
+            ? null
+            : requireId(plan.sourceTurnId, 'sourceTurnId'),
           ...(retryRewind?.lineage.sourceMessageId
             ? { sourceMessageId: retryRewind.lineage.sourceMessageId }
             : {}),
@@ -1713,8 +1819,13 @@ export class TurnControlPlane {
           contentEstimatedTokens: messageContentEstimatedTokens
         })
       : null;
-    const nextDeliverySteps = this.prepareNextTurnDeliverySteps
-      ? await this.prepareNextTurnDeliverySteps(conversation.id as string, ids.turn, now)
+    const continuationSteps = plan.operation === 'runtime_continuation' && plan.deliveryId && this.prepareRuntimeContinuationSteps
+      ? await this.prepareRuntimeContinuationSteps(plan.deliveryId)
+      : [];
+    // A manual compression or summary rebuild runs no model over new input: pending deliveries
+    // stay for the next real Turn instead of blocking this Turn's terminal commit forever.
+    const nextDeliverySteps = this.prepareNextTurnDeliverySteps && !plan.runtimeMaintenance
+      ? await this.prepareNextTurnDeliverySteps(conversation.id as string, ids.turn, now, plan.deliveryId ?? null)
       : [];
     const childAdmission = command.membership
       ? await this.prepareChildAdmission({
@@ -1802,6 +1913,7 @@ export class TurnControlPlane {
             state: 'pending'
           })
         ] : []),
+        ...continuationSteps,
         DOMAIN_REPOSITORIES.domain('TurnIntent').insert({
           id: ids.intent,
           conversation_id: conversation.id,
@@ -2004,11 +2116,23 @@ export class TurnControlPlane {
     intentKind: StartIntentPlan['operation'],
     sourceTurnId?: string,
     requestedExecutorAgentId?: string,
-    modelOverride?: TurnModelOverride
+    modelOverride?: TurnModelOverride,
+    membership?: TurnExecutionMembership
   ): Promise<ReturnType<typeof normalizeCompiledTurnAuthority>> {
-    const [defaultAgent, workspace] = await Promise.all([
+    const childExecutionId = membership
+      ? requireId(membership.childExecutionId, 'membership.childExecutionId')
+      : undefined;
+    // A Turn the user starts in a child conversation keeps the child's bounds: the tools and skills
+    // inherited at spawn, and the work environments of its latest Turn, as a continuation would.
+    const [defaultAgent, workspace, boundary, inheritedWorkEnvironmentPolicy] = await Promise.all([
       requestedExecutorAgentId ? Promise.resolve(undefined) : this.getDefaultAgent(conversationId),
-      projectFolderForConversation(this.database, conversationId)
+      projectFolderForConversation(this.database, conversationId),
+      childExecutionId
+        ? readChildExecutionBoundary(this.database, this.contentStore, childExecutionId)
+        : Promise.resolve(undefined),
+      childExecutionId
+        ? readChildExecutionWorkEnvironmentBoundary(this.database, this.contentStore, childExecutionId)
+        : Promise.resolve(undefined)
     ]);
     const executorAgentId = requestedExecutorAgentId
       ? requireId(requestedExecutorAgentId, 'TurnExecutionCommand.executorAgentId')
@@ -2020,7 +2144,10 @@ export class TurnControlPlane {
       intentKind,
       ...(sourceTurnId ? { sourceTurnId: requireId(sourceTurnId, 'sourceTurnId') } : {}),
       ...(modelOverride ? { modelOverride } : {}),
-      ...(workspace ? { workspace } : {})
+      ...(workspace ? { workspace } : {}),
+      ...(inheritedWorkEnvironmentPolicy ? { inheritedWorkEnvironmentPolicy } : {}),
+      ...(boundary?.toolPolicy ? { inheritedToolPolicy: boundary.toolPolicy } : {}),
+      ...(boundary?.skillPolicy ? { inheritedSkillPolicy: boundary.skillPolicy } : {})
     }), turnId, executorAgentId);
   }
 
@@ -2253,14 +2380,15 @@ export class TurnControlPlane {
         );
         if (requireBigInt(request.request_seq, 'ModelRequest.request_seq') >= input.beforeModelRequestSeq) continue;
       }
-      if (!await this.isApprovedPlanToolCall(toolCallId)) continue;
+      if (!await this.isApprovedPlanToolCall(call)) continue;
       if (!await contextRootContainsCompleteToolPair(this.database, input.rootId, toolCallId)) continue;
       return toolCallId;
     }
     return undefined;
   }
 
-  private async isApprovedPlanToolCall(toolCallId: string): Promise<boolean> {
+  private async isApprovedPlanToolCall(call: DomainRow): Promise<boolean> {
+    const toolCallId = requireId(call.id, 'ToolCall.id');
     const outcomes = await this.listRows('ToolOutcome', { tool_call_id: toolCallId }, 2);
     if (outcomes.length !== 1 || outcomes[0].status !== 'succeeded') return false;
     const artifacts = await this.listRows('ToolResultArtifact', {
@@ -2276,7 +2404,10 @@ export class TurnControlPlane {
     const detail = body.detail && typeof body.detail === 'object' && !Array.isArray(body.detail)
       ? body.detail as Record<string, unknown>
       : undefined;
-    return body.toolCallId === toolCallId && body.status === 'succeeded' && detail?.status === 'approved';
+    // A fork copies the ToolCall but shares the artifact content naming the original call.
+    return body.status === 'succeeded'
+      && detail?.status === 'approved'
+      && await toolArtifactIdentifiesCall(this.database, body.toolCallId, call);
   }
 
   private async editMessage(commandInput: TurnEditCommand): Promise<TurnCommandResult> {
@@ -2465,7 +2596,8 @@ export class TurnControlPlane {
       'retry',
       sourceTurnId,
       command.executorAgentId,
-      command.modelOverride
+      command.modelOverride,
+      command.membership
     );
     const intentContent = await this.contentStore.prepare(this.database, JSON.stringify({
       kind: 'retry',
@@ -2859,7 +2991,7 @@ export class TurnControlPlane {
     };
   }
 
-  private async recordTerminal(commandInput: TurnTerminalCommand): Promise<TurnCommandResult> {
+  private async recordTerminal(commandInput: TurnTerminalCommand, attempt = 0): Promise<TurnCommandResult> {
     const source = normalizeTerminalSource(commandInput.source);
     const turnId = requireId(commandInput.turnId, 'turnId');
     const reason = requireText(commandInput.reason, 'reason');
@@ -2924,6 +3056,9 @@ export class TurnControlPlane {
       terminalInputSnapshot,
       now
     );
+    const terminalDeliverySteps = this.prepareTerminalDeliverySteps
+      ? await this.prepareTerminalDeliverySteps(turnId, now)
+      : [];
     try {
       const committed = await this.commitWithReceipt({
         source,
@@ -2949,6 +3084,8 @@ export class TurnControlPlane {
             ] : [])
           ] : []),
           ...terminalInputSteps,
+          // After the input fence, so a delivery injected meanwhile still reports that conflict.
+          ...terminalDeliverySteps,
           ...unresolvedFileSteps,
           // A terminal Turn may not strand a pending or in-flight ToolCall. This assertion runs
           // after the pending-file closure steps in the same writer transaction.
@@ -2984,6 +3121,8 @@ export class TurnControlPlane {
       if (!isTransactionAssertionError(error)) throw error;
       const latest = await this.getTurn(turnId);
       if (latest.status !== TURN_STATUS_TERMINATED) {
+        // A collaboration message was routed into the Turn after the terminal read: read again.
+        if (isTerminalDeliveryFenceAssertion(error) && attempt < 3) return this.recordTerminal(commandInput, attempt + 1);
         if (handoffQueuedIntentId) {
           const [handoffIntent, childLinks, handoffRevisions] = await Promise.all([
             this.maybeGet('TurnIntent', handoffQueuedIntentId),
@@ -3656,6 +3795,13 @@ function normalizeRuntimeMaintenance(
     throw new TypeError('runtime maintenance compressSegmentCount must be a positive safe integer.');
   }
   const commandSourceKey = requireText(input.commandSourceKey, 'runtime maintenance commandSourceKey');
+  const sourceReplay = (input as { sourceReplay?: unknown }).sourceReplay;
+  if (sourceReplay !== undefined && sourceReplay !== 'immutable_provenance') {
+    throw new TypeError('runtime maintenance sourceReplay is invalid.');
+  }
+  if (sourceReplay && (input.version !== 2 || input.target?.kind !== 'current_head')) {
+    throw new TypeError('Immutable provenance rebuild requires the complete frozen current context.');
+  }
   if (input.version === 1) {
     return {
       kind: 'manual_context_compression',
@@ -3669,6 +3815,7 @@ function normalizeRuntimeMaintenance(
     version: 2,
     compressSegmentCount: input.compressSegmentCount,
     target: normalizeCompressionTarget(input.target),
+    ...(sourceReplay ? { sourceReplay } : {}),
     commandSourceKey
   };
 }
@@ -3822,6 +3969,11 @@ function isTerminalInputFenceAssertion(error: unknown): boolean {
     && error.message === 'PendingTurnInputRepository transaction assertExactIds failed.';
 }
 
+function isTerminalDeliveryFenceAssertion(error: unknown): boolean {
+  return error instanceof Error
+    && error.message === 'RuntimeDeliveryRepository transaction assertExactIds failed.';
+}
+
 function prepareTerminalInputFence(
   turnId: string,
   terminalStatus: TurnTerminalStatus,
@@ -3891,18 +4043,20 @@ export async function contextRootContainsCompleteToolPair(
   )) return false;
 
   const materialized = await database.materializeContext(rootId);
+  const conversationId = requireId(materialized.snapshot.root.conversation_id, 'ContextSequenceRoot.conversation_id');
   const visibleSegmentIds = materialized.snapshot.records.map((record) =>
     requireId(record.segment.id, 'ContextSegment.id')
   );
   if (visibleSegmentIds.includes(pairSegmentId)) return true;
   for (const segmentId of visibleSegmentIds) {
-    if (await compressionContainsSegment(database, segmentId, pairSegmentId, new Set())) return true;
+    if (await compressionContainsSegment(database, conversationId, segmentId, pairSegmentId, new Set())) return true;
   }
   return false;
 }
 
 async function compressionContainsSegment(
   database: RuntimeDatabase,
+  conversationId: string,
   summarySegmentId: string,
   targetSegmentId: string,
   visited: Set<string>
@@ -3914,15 +4068,23 @@ async function compressionContainsSegment(
     segment_id: summarySegmentId,
     source_kind: 'compression_block'
   });
-  if (summarySources.length !== 1) return false;
-  const blockId = requireId(summarySources[0].source_id, 'ContextSegmentSource.source_id');
+  if (summarySources.length === 0) return false;
+  // Shared summary segments carry one block per owning Conversation; follow only this one's.
+  const blocks = await database.snapshot(summarySources.map((source) =>
+    DOMAIN_REPOSITORIES.domain('CompressionBlock').get(requireId(source.source_id, 'ContextSegmentSource.source_id'))
+  ));
+  const owned = blocks.snapshot.filter((block) =>
+    !!block && !Array.isArray(block) && (block as DomainRow).conversation_id === conversationId
+  ) as DomainRow[];
+  if (owned.length !== 1) return false;
+  const blockId = requireId(owned[0].id, 'CompressionBlock.id');
   const sources = await listAllDomainRows(database, 'CompressionBlockSource', {
     compression_block_id: blockId
   });
   for (const source of sources) {
     const segmentId = requireId(source.segment_id, 'CompressionBlockSource.segment_id');
     if (segmentId === targetSegmentId) return true;
-    if (await compressionContainsSegment(database, segmentId, targetSegmentId, visited)) return true;
+    if (await compressionContainsSegment(database, conversationId, segmentId, targetSegmentId, visited)) return true;
   }
   return false;
 }

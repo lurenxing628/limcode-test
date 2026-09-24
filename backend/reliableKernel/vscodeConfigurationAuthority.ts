@@ -1,11 +1,13 @@
-import { loadScopedModelProfiles } from './scopedModelProfiles';
+import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
-import { applySessionThinkingOverride, validateSessionThinkingOverride } from '../../shared/sessionThinking';
+import { applySessionThinkingOverride, resolveSavedSessionThinkingOverride } from '../../shared/sessionThinking';
 import type { RequestGenerationSettings } from './requestCompressionSettings';
 
 import type * as vscode from 'vscode';
+import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
 import type {
   AgentRecord,
+  BuiltinToolPolicyRecord,
   ChatModelOverrideRecord,
   CheckpointPolicyRecord,
   CheckpointPolicyScopeLinkRecord,
@@ -19,6 +21,7 @@ import type {
   LlmCompressionConfigsRecord,
   LlmCompressionConfigRecord,
   LlmCompressionSettingsRecord,
+  LlmGenerationConfigRecord,
   LlmProviderConfigRecord,
   LlmProviderConfigsRecord,
   LlmSettingsRecord,
@@ -48,17 +51,25 @@ import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   MAX_LLM_RETRY_DELAY_SECONDS,
-  MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS
+  MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS,
+  canonicalLlmProviderKind
 } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
 import { normalizeOpenAIResponsesNativeSettings } from '../../shared/openAIResponsesCapabilities';
-import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
+import {
+  assertSummaryReasoningPlan,
+  resolveCompressionExecutionPlan,
+  resolveProviderModelCapabilities,
+  resolveSummaryReasoning
+} from '../../shared/modelCapabilities';
+import { resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
+import { boundChildSkillPolicy, boundChildToolPolicy, type BoundSkillPolicy, type BoundToolPolicy } from './childExecutionBoundary';
 import {
   createLocalFolderWorkEnvironmentRecord,
   isLocalFolderWorkEnvironment,
   workEnvironmentIdFromUri
 } from '../../shared/workEnvironmentCatalog';
-import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import { resolveWorkEnvironmentSelection } from '../../shared/workEnvironmentSelection';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
 import {
   loadLlmCompressionConfigsSettings,
@@ -92,6 +103,7 @@ import {
 } from '../world/modules/agent/blueprints';
 import { composeSystemInstruction, type SystemPromptTextPart } from '../world/modules/chat/systemPromptText';
 import { VscodeConfigurationMutations } from './vscodeConfigurationMutations';
+import { builtinDefaultToolNames } from './builtinToolCatalog';
 import type { AttachmentSettingsAuthority } from './attachmentIngest';
 import type {
   CompiledTurnAuthority,
@@ -148,7 +160,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   private readonly effectiveModelReads = new Map<string, Promise<ChatModelOverrideRecord>>();
   private currentWorkspaceFolderIds = new Set<string>();
   private currentWorkspaceFolderRecords = new Map<string, WorkEnvironmentRecord>();
-  private currentWorkspaceFolders: readonly CurrentWorkspaceFolder[] = [];
+  private workspaceOperations: Promise<unknown> = Promise.resolve();
+  private workspaceSynchronizationError: unknown;
 
   public constructor(
     private readonly getPaths: () => StoragePaths,
@@ -202,7 +215,14 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       activeProviderConfigId: (selection.settings as LlmSettingsRecord).activeProviderConfigId };
   }
 
-  public async compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
+  public compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
+    return this.enqueueWorkspaceOperation(async () => {
+      if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
+      return this.compileWithCurrentWorkspace(request);
+    });
+  }
+
+  private async compileWithCurrentWorkspace(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
     const records = await this.loadRecords();
     const { agentId, agent, workflowId, workflow, builtinAgent, builtinWorkflow,
       scopesLowToHigh, scopesHighToLow, modelProfile, provider, modelId } = resolveModelSelection(records, request);
@@ -213,13 +233,14 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       { scopeKind: 'conversation', scopeId: request.conversationId },
       (link) => link.modelProfileId
     );
-    const effectiveConversationThinkingOverride = conversationModelProfile
-      && conversationModelProfile.providerConfigId === provider.id
-      && conversationModelProfile.provider === provider.provider
-      && conversationModelProfile.model === modelId
-      ? conversationModelProfile.thinkingOverride
-      : undefined;
-    const inheritThinkingToChildren = conversationModelProfile?.inheritThinkingToChildren === true;
+    // 子对话的第一个回合在写入它自己的模型记录之前编译：还没有对话级记录时，按父回合冻结的继承选择。
+    const savedConversationThinkingOverride = conversationModelProfile
+      ? conversationModelProfile.providerConfigId === provider.id
+        && conversationModelProfile.provider === provider.provider
+        && conversationModelProfile.model === modelId
+        ? conversationModelProfile.thinkingOverride
+        : undefined
+      : request.inheritedThinkingOverride;
 
     const planReviewPolicy = resolveScopedRecord(
       records.planReviewPolicyScopeLinks,
@@ -228,34 +249,27 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       (link) => link.planReviewPolicyId
     );
     const builtinPlanReviewPolicy = builtinWorkflow?.planReviewPolicy;
-    const toolPolicyLayers: ToolPolicyLayer[] = [];
-    for (const scope of scopesLowToHigh) {
+    const toolPolicyLayers: ToolPolicyLayer[] = scopesLowToHigh.flatMap((scope) => {
       const configured = resolveRecordAtScope(
         records.toolPolicyScopeLinks,
         records.toolPolicies,
         scope,
         (link) => link.toolPolicyId
       );
-      if (configured) {
-        toolPolicyLayers.push({ scopeKind: scope.scopeKind, policy: configured });
-        continue;
-      }
       const builtin = scope.scopeKind === 'agent'
         ? builtinAgent?.toolPolicy
         : scope.scopeKind === 'workflow'
           ? builtinWorkflow?.toolPolicy
           : undefined;
-      if (builtin) {
-        toolPolicyLayers.push({
-          scopeKind: scope.scopeKind,
-          policy: {
-            allowedTools: builtin.allowedTools,
-            toolConfigs: builtin.toolConfigs
-          }
-        });
-      }
-    }
-    const toolPolicy = resolveToolPolicyLayers(toolPolicyLayers);
+      const layer = toolPolicyScopeLayer(scope.scopeKind, configured, builtin);
+      return layer ? [layer] : [];
+    });
+    // Same rule as the settings view: with no list anywhere on the chain the default tool set applies.
+    const ownToolPolicy = resolveToolPolicyLayers(toolPolicyLayers, builtinDefaultToolNames());
+    // A child Turn keeps only what its parent Turn also allows (tools, MCP sources, permissions).
+    const toolPolicy: BoundToolPolicy = request.inheritedToolPolicy
+      ? boundChildToolPolicy(ownToolPolicy, request.inheritedToolPolicy)
+      : ownToolPolicy;
     const skillPolicy = resolveScopedRecord(
       records.skillPolicyScopeLinks,
       records.skillPolicies,
@@ -312,6 +326,17 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const systemPromptPrefix = selectedModelConfig?.systemPromptPrefix ?? provider.systemPromptPrefix;
     const contextWindow = resolveContextWindow(provider, modelId);
     const primaryGenerationConfig = selectedModelConfig?.generationConfig ?? provider.generationConfig;
+    const primaryCapabilities = resolveProviderModelCapabilities(provider, modelId);
+    // 只冻结实际生效的覆盖（子 Agent 按它继承）；不适用的旧覆盖按渠道设置发送。
+    const savedThinking = savedConversationThinkingOverride
+      ? resolveSavedSessionThinkingOverride(savedConversationThinkingOverride, provider.provider, modelId, primaryGenerationConfig,
+        selectedModelConfig ? selectedModelConfig.requestBody : provider.requestBody, provider)
+      : undefined;
+    const effectiveConversationThinkingOverride = savedThinking?.status === 'applied' ? savedThinking.override : undefined;
+    // 与 initializeConversationModelProfile 写入子对话记录的继承标记一致：继承来的强度适用时才继续往下传。
+    const inheritThinkingToChildren = conversationModelProfile
+      ? conversationModelProfile.inheritThinkingToChildren === true
+      : effectiveConversationThinkingOverride !== undefined;
     const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
       ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
@@ -320,32 +345,36 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const nativeResponses = normalizeOpenAIResponsesNativeSettings(
       selectedModelConfig?.nativeResponses ?? provider.nativeResponses
     );
+    // 每轮提醒是否改用 Claude 轮内系统消息：随 Turn 冻结，恢复与重放一致；关闭时快照里没有这个字段。
+    const claudeTurnScopedReminders = provider.provider === 'claude'
+      && (selectedModelConfig?.claudeTurnScopedReminders ?? provider.claudeTurnScopedReminders) === true;
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
     const compressionThresholdTokens = compression.thresholdTokens;
+    const ownSkillPolicy = { id: skillPolicy?.id ?? null, sourceConfigs: clonePlainRecord(skillPolicy?.sourceConfigs) };
+    // A skill the parent Turn turned off stays off in its child.
+    const frozenSkillPolicy: BoundSkillPolicy = request.inheritedSkillPolicy
+      ? boundChildSkillPolicy(ownSkillPolicy, request.inheritedSkillPolicy)
+      : ownSkillPolicy;
     const allowedTools = toolPolicy.allowedTools;
-    const availableWorkEnvironmentIds = records.workEnvironments
-      .filter((environment) => environment.available)
-      .map((environment) => environment.id);
-    const allowedWorkEnvironmentIds = [...new Set(
-      workEnvironmentPolicy?.allowedWorkEnvironmentIds ?? availableWorkEnvironmentIds
-    )]
-      .filter((id) => availableWorkEnvironmentIds.includes(id))
-      .sort();
-    const { allowedWorkEnvironmentIds: effectiveAllowedWorkEnvironmentIds, inheritedDefaultWorkEnvironmentId } =
-      applyInheritedWorkEnvironmentBoundary(
-        allowedWorkEnvironmentIds,
-        request.inheritedWorkEnvironmentPolicy,
-        availableWorkEnvironmentIds
-      );
+    const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
+      link.conversationId === request.conversationId && link.role === 'active'
+    ));
+    const environmentSelection = resolveWorkEnvironmentSelection({
+      environments: records.workEnvironments,
+      policy: workEnvironmentPolicy,
+      inheritedPolicy: request.inheritedWorkEnvironmentPolicy,
+      explicitWorkEnvironmentId: selectedEnvironment?.workEnvironmentId,
+      preferredWorkEnvironmentId: request.preferredWorkEnvironmentId,
+      project: request.workspace
+    });
+    if (environmentSelection.error) throw new Error(environmentSelection.error);
+    const effectiveAllowedWorkEnvironmentIds = environmentSelection.allowed.map(environment => environment.id).sort();
+    const defaultWorkEnvironmentId = environmentSelection.active?.id ?? null;
     const promptWorkEnvironments = workEnvironmentPolicy?.enabled === true
       || request.inheritedWorkEnvironmentPolicy !== undefined
-      ? effectiveAllowedWorkEnvironmentIds
-        .map((id) => records.workEnvironments.find((environment) => environment.id === id))
-        .filter((environment): environment is WorkEnvironmentRecord => !!environment)
-      // 与旧 ECS runtimeContextWorkEnvironmentsForConversation 一致：策略停用时只暴露本地 folder，
-      // 不把不可通过工具使用的 SSH/远程环境写进模型上下文。
-      : records.workEnvironments.filter((environment) =>
-          environment.available !== false && isLocalFolderWorkEnvironment(environment));
+      ? environmentSelection.allowed
+      : environmentSelection.allowed.filter(environment =>
+        isLocalFolderWorkEnvironment(environment) || environment.id === defaultWorkEnvironmentId);
     const promptRenderContext: ReliablePromptRenderContext = {
       now: new Date(),
       platform: process.platform,
@@ -368,18 +397,6 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       .filter(Boolean);
     // 与旧 ECS RuntimeContextSnapshotSystem 一致：渲染后的运行时上下文在前，规则区域原样追加在后。
     const runtimeContextText = [...renderedRuntimeContextParts, ...composeRuntimeContextRuleParts(ruleFiles)].join('\n\n');
-    const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
-      link.conversationId === request.conversationId && link.role === 'active'
-    ));
-    const preferredWorkEnvironmentId = selectedEnvironment?.workEnvironmentId
-      && effectiveAllowedWorkEnvironmentIds.includes(selectedEnvironment.workEnvironmentId)
-      ? selectedEnvironment.workEnvironmentId
-      : workEnvironmentPolicy?.defaultWorkEnvironmentId ?? inheritedDefaultWorkEnvironmentId ?? undefined;
-    const defaultWorkEnvironmentId = preferredWorkEnvironmentId
-      && effectiveAllowedWorkEnvironmentIds.includes(preferredWorkEnvironmentId)
-      ? preferredWorkEnvironmentId
-      : effectiveAllowedWorkEnvironmentIds[0] ?? null;
-
     const executionPreset = {
       kind: 'turn-execution-preset',
       turnId: request.turnId,
@@ -405,6 +422,10 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         enableMultimodalTools,
         systemPromptPrefix,
         maxOutputTokens,
+        capabilities: clonePlain(primaryCapabilities),
+        ...(primaryGenerationConfig ? { generationConfig: clonePlain(primaryGenerationConfig) } : {}),
+        ...((selectedModelConfig?.requestBody ?? provider.requestBody)
+          ? { requestBody: clonePlain(selectedModelConfig?.requestBody ?? provider.requestBody) } : {}),
         ...(primaryGenerationConfig?.thinkingConfig
           ? { thinkingConfig: clonePlain(primaryGenerationConfig.thinkingConfig) }
           : {}),
@@ -413,6 +434,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
           : {}),
         ...(inheritThinkingToChildren ? { inheritThinkingToChildren: true } : {}),
         ...(nativeResponses ? { nativeResponses } : {}),
+        ...(claudeTurnScopedReminders ? { claudeTurnScopedReminders: true } : {}),
         retryPolicy: frozenProviderRetryPolicy(provider, modelId)
       },
       modelProfile: {
@@ -433,12 +455,10 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         allowedTools,
         preset: toolPolicy.preset,
         toolConfigs: toolPolicy.toolConfigs,
-        sourceConfigs: toolPolicy.sourceConfigs
+        sourceConfigs: toolPolicy.sourceConfigs,
+        ...(toolPolicy.inherited ? { inherited: toolPolicy.inherited } : {})
       },
-      skillPolicy: {
-        id: skillPolicy?.id ?? null,
-        sourceConfigs: clonePlainRecord(skillPolicy?.sourceConfigs)
-      },
+      skillPolicy: frozenSkillPolicy,
       systemPrompt: {
         id: systemPrompt?.id ?? (builtinWorkflow ? `builtin-system-prompt:${workflow?.id}` : builtinAgent ? `builtin-system-prompt:${agentId}` : null),
         text: renderReliableSystemPromptTemplate(composeSystemInstruction(orderedPromptParts), promptRenderContext)
@@ -535,15 +555,32 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     return rules;
   }
 
-  public async synchronizeWorkspaceFolders(
-    folders: readonly CurrentWorkspaceFolder[]
-  ): Promise<void> {
-    this.setCurrentWorkspaceFolders(folders);
-    await this.mutations.synchronizeWorkspaceFolders(folders);
+  public synchronizeWorkspaceFolders(folders: readonly CurrentWorkspaceFolder[]): Promise<void> {
+    const snapshot = folders.map(folder => ({ ...folder }));
+    return this.enqueueWorkspaceOperation(async () => {
+      // Presence is Host-local even when a shared catalog write fails. New Turns fail closed until
+      // a later complete synchronization succeeds; existing Turns retain their frozen identity.
+      this.setCurrentWorkspaceFolders(snapshot);
+      try {
+        await this.mutations.synchronizeWorkspaceFolders(snapshot);
+        this.workspaceSynchronizationError = undefined;
+      } catch (error) {
+        this.workspaceSynchronizationError = error;
+        throw error;
+      }
+    });
+  }
+
+  private enqueueWorkspaceOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const task = this.workspaceOperations.catch(() => undefined).then(operation);
+    this.workspaceOperations = task.then(() => undefined, () => undefined);
+    return task;
   }
 
   /** Configuration-only projection. Runtime facts remain exclusively on the bounded reliable Feed. */
   public async configurationClientState(): Promise<ClientState> {
+    await this.workspaceOperations;
+    if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
     // The client-state tables do not contain provider or compression settings. Keep those independently
     // versioned settings stores out of bridge bootstrap so one invalid section cannot strand every tab.
     const records = await this.loadConfigurationClientRecords();
@@ -556,6 +593,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       planReviewPolicyScopeLinks: records.planReviewPolicyScopeLinks.map(clonePlain),
       toolPolicies: records.toolPolicies.map(clonePlain),
       toolPolicyScopeLinks: records.toolPolicyScopeLinks.map(clonePlain),
+      builtinToolPolicies: builtinToolPolicyRecords(records.agents, records.workflows),
       skillPolicies: records.skillPolicies.map(clonePlain),
       skillPolicyScopeLinks: records.skillPolicyScopeLinks.map(clonePlain),
       systemPrompts: records.systemPrompts.map(clonePlain),
@@ -616,6 +654,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   }
 
   public async workEnvironment(workEnvironmentId: string): Promise<WorkEnvironmentRecord> {
+    await this.workspaceOperations;
+    if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
     const id = requireId(workEnvironmentId, 'workEnvironmentId');
     const environment = (await this.loadWorkEnvironments()).find((candidate) => candidate.id === id);
     if (!environment) throw new Error(`工作环境配置不存在：${id}`);
@@ -623,6 +663,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   }
 
   public async workEnvironments(): Promise<WorkEnvironmentRecord[]> {
+    await this.workspaceOperations;
+    if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
     return (await this.loadWorkEnvironments()).map((environment) => ({ ...environment }));
   }
 
@@ -805,7 +847,6 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     }, observedAt));
     this.currentWorkspaceFolderRecords = new Map(records.map((record) => [record.id, record]));
     this.currentWorkspaceFolderIds = new Set(this.currentWorkspaceFolderRecords.keys());
-    this.currentWorkspaceFolders = folders;
   }
 
   private async loadConfigurationClientRecords(): Promise<ConfigurationClientRecords> {
@@ -839,7 +880,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         paths.modelProfilesRootUri,
         paths.modelProfilesIndexUri,
         'modelProfile'
-      ),
+      ).then((profiles) => profiles?.map(canonicalModelProfile)),
       loadRecordStore<ModelProfileScopeLinkRecord, 'link'>(
         paths.modelProfileScopeLinksRootUri,
         paths.modelProfileScopeLinksIndexUri,
@@ -923,11 +964,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         'link'
       )
     ]);
-    const effectiveWorkEnvironmentPolicies = projectWorkEnvironmentPolicies(
-      workEnvironmentPolicies ?? [],
-      workEnvironments ?? [],
-      this.currentWorkspaceFolderIds
-    );
+
     return {
       agents: mergeAgentsWithBuiltins(agents ?? []),
       workflows: mergeWorkflowsWithBuiltins(workflows ?? []),
@@ -944,7 +981,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       runtimeContexts: runtimeContexts ?? [],
       runtimeContextScopeLinks: runtimeContextScopeLinks ?? [],
       workEnvironments: workEnvironments ?? [],
-      workEnvironmentPolicies: effectiveWorkEnvironmentPolicies,
+      workEnvironmentPolicies: workEnvironmentPolicies ?? [],
       workEnvironmentPolicyScopeLinks: workEnvironmentPolicyScopeLinks ?? [],
       checkpointPolicies: checkpointPolicies ?? [],
       checkpointPolicyScopeLinks: checkpointPolicyScopeLinks ?? [],
@@ -960,7 +997,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       loadLlmProviderConfigsSettings(paths)
     ]);
     const provider = providers.settings.configs.find((item) => item.id === model.providerConfigId);
-    if (!provider || provider.provider !== model.provider || !providerContainsModel(provider, model.model)) throw new Error('当前请求渠道或模型已改变，请重新选择。');
+    if (!provider || provider.provider !== canonicalLlmProviderKind(model.provider) || !providerContainsModel(provider, model.model)) throw new Error('当前请求渠道或模型已改变，请重新选择。');
     // Resolve only this conversation. Agent/workflow/global profiles and parent Turn fallbacks
     // select model identity, never a parent's session-only override.
     const profile = resolveRecordAtScope(records.modelProfileScopeLinks, records.modelProfiles,
@@ -968,17 +1005,17 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const modelConfig = provider.modelConfigs.find((item) => item.modelId === model.model);
     const defaults = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
     const requestBody = (modelConfig ? modelConfig.requestBody : provider.requestBody) ?? {};
-    const override = profile?.providerConfigId === provider.id && profile.provider === provider.provider && profile.model === model.model
+    const saved = profile?.providerConfigId === provider.id && profile.provider === provider.provider && profile.model === model.model
       ? profile.thinkingOverride : undefined;
-    if (override) {
-      if (hasThinkingBodyConflict(provider.provider, requestBody)) throw new Error('自定义请求体与会话思维覆盖冲突，请恢复默认或修改渠道配置。');
-      validateSessionThinkingOverride(override, provider.provider, model.model, defaults, requestBody);
-    }
+    // 升级前保存的覆盖可能已不适用：容错解析，不适用时按渠道设置发送（界面显示“当前不生效”），不让每轮请求失败。
+    const resolved = saved ? resolveSavedSessionThinkingOverride(saved, provider.provider, model.model, defaults, requestBody, provider) : undefined;
+    const override = resolved?.status === 'applied' ? resolved.override : undefined;
     return { model: { ...model }, generationConfig: applySessionThinkingOverride(defaults, override), requestBody: clonePlain(requestBody), thinkingControlledByBody: hasThinkingBodyConflict(provider.provider, requestBody) };
   }
 
   public async loadRequestCompressionSettings(
-    model: ChatModelOverrideRecord
+    model: ChatModelOverrideRecord,
+    generationConfig?: LlmGenerationConfigRecord
   ): Promise<RequestCompressionSettings> {
     const paths = this.getPaths();
     const [providers, configs, selection] = await Promise.all([
@@ -987,7 +1024,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       loadGlobalSettingsFile(paths.settingsRootUri, 'llmCompression')
     ]);
     const provider = providers.settings.configs.find((candidate) => candidate.id === model.providerConfigId);
-    if (!provider || provider.provider !== model.provider || !providerContainsModel(provider, model.model)) {
+    if (!provider || provider.provider !== canonicalLlmProviderKind(model.provider) || !providerContainsModel(provider, model.model)) {
       throw new Error('当前对话使用的模型渠道已删除或改变，请重新选择模型。');
     }
     const contextWindowTokens = resolveContextWindow(provider, model.model);
@@ -997,7 +1034,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         selection.settings as Partial<LlmCompressionSettingsRecord>, configs.settings.configs
       ),
       providerConfigs: providers.settings.configs
-    }, provider, model.model, contextWindowTokens);
+    }, provider, model.model, contextWindowTokens, generationConfig);
     return {
       model: { ...model },
       modelProfile: {
@@ -1121,65 +1158,6 @@ function resolveModelSelection(records: ModelSelectionRecords, request: TurnAuth
       scopesLowToHigh, scopesHighToLow, modelProfile, provider, modelId };
 }
 
-/**
- * Child executions inherit the parent Turn's frozen work-environment boundary: the child's own
- * scoped allow-list is intersected with the parent's, never widened. An empty intersection remains
- * empty so mutually exclusive policies fail closed instead of granting either side's environments.
- */
-function applyInheritedWorkEnvironmentBoundary(
-  allowed: readonly string[],
-  inherited: FrozenWorkEnvironmentBoundaryPolicy | undefined,
-  availableIds: readonly string[]
-): { allowedWorkEnvironmentIds: string[]; inheritedDefaultWorkEnvironmentId: string | null } {
-  if (!inherited) {
-    return { allowedWorkEnvironmentIds: [...allowed], inheritedDefaultWorkEnvironmentId: null };
-  }
-  const inheritedAllowed = [...new Set(inherited.allowedWorkEnvironmentIds)]
-    .filter((id) => availableIds.includes(id));
-  const intersected = allowed.filter((id) => inheritedAllowed.includes(id));
-  return {
-    allowedWorkEnvironmentIds: [...new Set(intersected)].sort(),
-    inheritedDefaultWorkEnvironmentId: inherited.defaultWorkEnvironmentId
-  };
-}
-
-function projectWorkEnvironmentPolicies(
-  policies: readonly WorkEnvironmentPolicyRecord[],
-  environments: readonly WorkEnvironmentRecord[],
-  currentWorkspaceFolderIds: ReadonlySet<string>
-): WorkEnvironmentPolicyRecord[] {
-  const availableIds = new Set(
-    environments.filter((environment) => environment.available).map((environment) => environment.id)
-  );
-  // Each Host projects its own workspace folders into the allow-list and default without
-  // publishing host-local facts into the shared policy store. Folder order follows environment index.
-  const workspaceIds = environments
-    .filter((environment) => environment.available && currentWorkspaceFolderIds.has(environment.id))
-    .sort((left, right) => (left.index ?? 0) - (right.index ?? 0) || left.id.localeCompare(right.id))
-    .map((environment) => environment.id);
-  return policies.map((policy) => {
-    // Workspace folders always join the projected allow-list so they appear checked in the editor
-    // regardless of whether the shared policy already lists them.
-    const allowedWorkEnvironmentIds = workspaceIds.length > 0
-      ? [...new Set([...workspaceIds, ...policy.allowedWorkEnvironmentIds])]
-      : [...policy.allowedWorkEnvironmentIds];
-    const eligibleDefaultIds = allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
-    // Prefer this Host's primary workspace folder as projected default when available;
-    // fall back to the stored policy default if it remains eligible.
-    const defaultWorkEnvironmentId = workspaceIds.length > 0
-      ? workspaceIds[0]
-      : policy.defaultWorkEnvironmentId && eligibleDefaultIds.includes(policy.defaultWorkEnvironmentId)
-        ? policy.defaultWorkEnvironmentId
-        : eligibleDefaultIds[0];
-    const { defaultWorkEnvironmentId: _storedDefault, ...rest } = policy;
-    return {
-      ...rest,
-      allowedWorkEnvironmentIds,
-      ...(defaultWorkEnvironmentId ? { defaultWorkEnvironmentId } : {})
-    };
-  });
-}
-
 interface FrozenCompressionResolution {
   thresholdTokens: number;
   snapshot: Record<string, unknown>;
@@ -1190,7 +1168,9 @@ function resolveFrozenCompression(
   records: Pick<ConfigurationRecords, 'compressionSettings' | 'compressionConfigs' | 'providerConfigs'>,
   primaryProvider: LlmProviderConfigRecord,
   primaryModelId: string,
-  contextWindowTokens: number
+  contextWindowTokens: number,
+  primaryGenerationConfig = primaryProvider.modelConfigs.find((model) => model.modelId === primaryModelId)?.generationConfig
+    ?? primaryProvider.generationConfig
 ): FrozenCompressionResolution {
   const modelBinding = latestUpdated(records.compressionSettings.modelBindings.filter((binding) =>
     binding.providerConfigId === primaryProvider.id && binding.modelId === primaryModelId
@@ -1205,8 +1185,9 @@ function resolveFrozenCompression(
     ?? records.compressionConfigs[0];
   if (!config) throw new Error('没有可用的 LLM 压缩配置。');
 
-  const providerOverride = config.kind === 'openai_responses_compact'
-    ? config.openaiResponsesCompact
+  const providerOverride = (config.kind === 'auto' || config.kind === 'provider_native')
+    && (config.providerNative?.providerConfigId?.trim() || config.providerNative?.model?.trim())
+    ? config.providerNative
     : config.llmSummary;
   const compressionProviderId = providerOverride?.providerConfigId?.trim() || primaryProvider.id;
   const compressionProvider = records.providerConfigs.find((candidate) => candidate.id === compressionProviderId);
@@ -1231,25 +1212,53 @@ function resolveFrozenCompression(
       : Math.floor(contextWindowTokens * 0.9)
   ));
   const frozenConfig: LlmCompressionConfigRecord = clonePlain(config);
+  frozenConfig.providerNative = {
+    ...(frozenConfig.providerNative ?? {}),
+    providerConfigId: compressionProvider.id,
+    model: compressionModelId,
+    trustMode: frozenConfig.providerNative?.trustMode === 'trust_configured_endpoint'
+      ? 'trust_configured_endpoint'
+      : 'verified_only'
+  };
+  const compressionModelConfig = compressionProvider.modelConfigs.find((candidate) =>
+    candidate.modelId === compressionModelId
+  );
+  const inheritedGenerationConfig = compressionModelConfig?.generationConfig
+    ?? compressionProvider.generationConfig;
+  const capabilities = resolveProviderModelCapabilities(
+    compressionProvider,
+    compressionModelId,
+    frozenConfig.providerNative.trustMode
+  );
+  const summaryReasoning = resolveSummaryReasoning({
+    mode: frozenConfig.llmSummary?.reasoning?.mode,
+    methodGenerationConfig: frozenConfig.llmSummary?.generationConfig,
+    inheritedGenerationConfig: frozenConfig.llmSummary?.reasoning?.mode === 'inherit_chat'
+      ? primaryGenerationConfig
+      : inheritedGenerationConfig,
+    capabilities
+  });
+  assertSummaryReasoningPlan(summaryReasoning);
+  const frozenSummary = {
+    ...(frozenConfig.llmSummary ?? {}),
+    providerConfigId: compressionProvider.id,
+    model: compressionModelId,
+    reasoning: { mode: summaryReasoning.intent }
+  };
+  if (summaryReasoning.generationConfig) frozenSummary.generationConfig = summaryReasoning.generationConfig;
+  else delete frozenSummary.generationConfig;
+  frozenConfig.llmSummary = frozenSummary;
+  const nativeSameModel = compressionProvider.id === primaryProvider.id && compressionModelId === primaryModelId;
+  if (!nativeSameModel) capabilities.nativeCompaction = {
+    availability: 'unsupported', reason: '原生压缩状态必须由同一聊天渠道和模型消费；独立总结模型只使用文本摘要。'
+  };
+  const executionPlan = resolveCompressionExecutionPlan(frozenConfig, capabilities);
   const compressionContextWindowTokens = resolveContextWindow(compressionProvider, compressionModelId);
   const compressionMaxOutputTokens = resolveCompressionMaxOutputTokens(
     frozenConfig,
     compressionProvider,
     compressionModelId
   );
-  if (frozenConfig.kind === 'openai_responses_compact') {
-    frozenConfig.openaiResponsesCompact = {
-      ...(frozenConfig.openaiResponsesCompact ?? {}),
-      providerConfigId: compressionProvider.id,
-      model: compressionModelId
-    };
-  } else if (!['disabled', 'deterministic_summary', 'manual_summary'].includes(frozenConfig.kind)) {
-    frozenConfig.llmSummary = {
-      ...(frozenConfig.llmSummary ?? {}),
-      providerConfigId: compressionProvider.id,
-      model: compressionModelId
-    };
-  }
   return {
     thresholdTokens,
     snapshot: {
@@ -1261,6 +1270,7 @@ function resolveFrozenCompression(
           : { kind: 'default', id: records.compressionSettings.defaultConfigId ?? null },
       config: frozenConfig,
       methodKind: frozenConfig.kind,
+      executionPlan: clonePlain(executionPlan),
       trigger,
       thresholdTokens,
       provider: {
@@ -1269,6 +1279,8 @@ function resolveFrozenCompression(
         modelId: compressionModelId,
         contextWindowTokens: compressionContextWindowTokens,
         maxOutputTokens: compressionMaxOutputTokens,
+        capabilities: clonePlain(capabilities),
+        summaryReasoning: clonePlain(summaryReasoning),
         retryPolicy: frozenProviderRetryPolicy(compressionProvider, compressionModelId)
       }
     }
@@ -1283,19 +1295,11 @@ function resolveCompressionMaxOutputTokens(
   const providerGenerationConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId)?.generationConfig
     ?? provider.generationConfig;
   const providerMaximum = positiveSafeIntegerOrUndefined(providerGenerationConfig?.maxOutputTokens);
-  if (config.kind !== 'llm_summary' && config.kind !== 'segmented_summary') {
+  if (!['auto', 'provider_native', 'llm_summary', 'segmented_summary'].includes(config.kind)) {
     return providerMaximum ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
   }
 
-  const methodMaximum = positiveSafeIntegerOrUndefined(config.llmSummary?.generationConfig?.maxOutputTokens);
-  if (methodMaximum !== undefined) return methodMaximum;
-  const configuredTarget = positiveSafeIntegerOrUndefined(config.llmSummary?.targetTokens)
-    ?? DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS;
-  const visibleTarget = Math.min(DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS, configuredTarget);
-  return Math.max(2_048, Math.min(
-    DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
-    Math.ceil(visibleTarget * 2)
-  ));
+  return resolveSummaryOutputBudget(config.llmSummary?.targetTokens, config.llmSummary?.generationConfig);
 }
 
 function positiveSafeIntegerOrUndefined(value: unknown): number | undefined {
@@ -1328,6 +1332,27 @@ function frozenProviderRetryPolicy(
 function latestUpdated<T extends { id: string; updatedAt: number; createdAt: number }>(items: readonly T[]): T | undefined {
   return [...items].sort((left, right) => right.updatedAt - left.updatedAt
     || right.createdAt - left.createdAt || right.id.localeCompare(left.id))[0];
+}
+
+/** The same built-in list each Agent and workflow falls back to in compile, keyed by its scope. */
+function builtinToolPolicyRecords(agents: readonly AgentRecord[], workflows: readonly WorkflowRecord[]): BuiltinToolPolicyRecord[] {
+  const records: BuiltinToolPolicyRecord[] = [];
+  for (const agent of agents) {
+    const builtin = BUILTIN_AGENT_DEFINITIONS[agent.kind] ?? BUILTIN_AGENT_DEFINITIONS[agent.id];
+    if (builtin) {
+      records.push({ id: `builtin-tool-policy:agent:${agent.id}`, scopeKind: 'agent', scopeId: agent.id, allowedTools: [...builtin.toolPolicy.allowedTools],
+        ...(builtin.toolPolicy.sourceConfigs ? { sourceConfigs: clonePlain(builtin.toolPolicy.sourceConfigs) } : {}) });
+    }
+  }
+  for (const workflow of workflows) {
+    const builtin = BUILTIN_WORKFLOW_DEFINITIONS[workflow.id]
+      ?? Object.values(BUILTIN_WORKFLOW_DEFINITIONS).find((candidate) => candidate.id === workflow.id);
+    if (builtin?.toolPolicy) {
+      records.push({ id: `builtin-tool-policy:workflow:${workflow.id}`, scopeKind: 'workflow', scopeId: workflow.id, allowedTools: [...builtin.toolPolicy.allowedTools],
+        ...(builtin.toolPolicy.sourceConfigs ? { sourceConfigs: clonePlain(builtin.toolPolicy.sourceConfigs) } : {}) });
+    }
+  }
+  return records;
 }
 
 function mergeAgentsWithBuiltins(configured: AgentRecord[]): AgentRecord[] {
@@ -1434,6 +1459,8 @@ function resolveRequestedProvider(
   input: { providerConfigId?: string; providerKind?: LlmProviderConfigRecord['provider']; modelId?: string }
 ): LlmProviderConfigRecord | undefined {
   const providerConfigId = input.providerConfigId?.trim();
+  // Agent、工作流和客户端选择里可能还存着原 DeepSeek 渠道类型。
+  input = { ...input, providerKind: canonicalLlmProviderKind(input.providerKind) ?? input.providerKind };
   if (providerConfigId) {
     const provider = providers.find((candidate) => candidate.id === providerConfigId);
     if (!provider) throw new Error(`LLM Provider 配置不存在：${providerConfigId}`);

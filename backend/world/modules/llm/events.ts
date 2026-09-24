@@ -3,7 +3,8 @@ import type {
   LlmRawErrorInfoRecord,
   LlmUsageMetadataRecord,
   MessageContent,
-  ModelOutputItemReference
+  ModelOutputItemReference,
+  ProviderContextPart
 } from '../../../../shared/protocol';
 import type { OpenAIResponsesNativeEvent } from '../../../../shared/openAIResponsesNative';
 import type { LlmCompactResult } from './contracts';
@@ -60,6 +61,11 @@ export interface LlmDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
   text: string;
   outputItem?: ModelOutputItemReference;
+  /**
+   * 收到时就挂在这段可见文字 part 上的签名（Gemini 普通回复的最后一个 part，流式时常是一个空文字 part）。
+   * 带签名的 Delta 只对应那一个 part：不与其他 Delta 合并，存成独立的可见文字 part 原位回放。
+   */
+  thoughtSignature?: string;
 }
 export interface LlmThoughtDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
@@ -88,7 +94,13 @@ export interface LlmThoughtDonePayload extends LlmStreamEpochPayload {
 }
 export interface LlmOutputItemDonePayload extends LlmStreamEpochPayload {
   requestId: string;
-  outputItem: ModelOutputItemReference;
+  /** Output item boundary; absent when the event only delivers `part`. */
+  outputItem?: ModelOutputItemReference;
+  /**
+   * An opaque provider item that belongs in the completed reply, e.g. the Responses `compaction`
+   * item of an ordinary reply; appended in event order, repeats of the same item dropped.
+   */
+  part?: ProviderContextPart;
 }
 export interface LlmToolCallDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
@@ -146,6 +158,8 @@ export interface LlmDonePayload extends LlmStreamEpochPayload {
   streamOutputDurationMs?: number;
   usageMetadata?: LlmUsageMetadataRecord;
   streamAggregation?: LlmStreamAggregationMetrics;
+  /** 这次请求实际使用的 Claude 保留思考处理（含本次新学到的）；内核按对话持久化。 */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 export interface LlmErrorPayload extends LlmStreamEpochPayload {
   requestId: string;

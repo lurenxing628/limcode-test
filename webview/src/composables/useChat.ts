@@ -15,11 +15,24 @@ import { toStructuredClonePlainData } from '@shared/plainData';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import { mergeSteeringReceipts, steeringReceiptsByConversationState } from '@webview/composables/steeringReceipts';
 import {
+  applyForkRequestError,
+  decideForkClick,
+  forkReadyNoticeLinked,
+  forkRequestsToReplay,
+  forkResultNavigation,
+  forkResultResolves,
+  markForkRequestSent,
+  pendingForkMessageIds,
+  restoreForkRequests,
+  type ForkReadyNotice,
+  type ForkRequestRecords,
+  type ForkRequestState
+} from '@webview/composables/forkRequestLifecycle';
+import {
   createMessageId,
   type CompressionCommandTarget,
   type CompressionStartPayload,
   type ConversationCommandMetadata,
-  type ConversationForkPayload,
   type GuidanceControlResultPayload,
   type MessageContent,
   type MessageDeleteFromPayload,
@@ -93,15 +106,6 @@ interface ConversationActionState {
   operationTurnId?: string;
 }
 
-interface ForkRequestState {
-  actionId: string;
-  sourceConversationId: string;
-  messageId: string;
-  payload: ConversationForkPayload;
-  requestId?: string;
-  sentSessionId?: string;
-}
-
 export interface PendingTurnInputSubmission {
   commandId: string;
   command: ConversationCommandMetadata;
@@ -131,7 +135,7 @@ export interface FailedTurnInputSubmission extends PendingTurnInputSubmission {
 interface PersistedConversationControls {
   interrupt?: InterruptState;
   conversationActions: Record<string, ConversationActionState>;
-  forkRequests: Record<string, ForkRequestState>;
+  forkRequests: ForkRequestRecords;
   pendingTurnInputs: Record<string, PendingTurnInputSubmission>;
   failedTurnInputs: Record<string, FailedTurnInputSubmission>;
 }
@@ -158,7 +162,15 @@ interface GuidanceControlFailure {
 const restored = readPersistedControls();
 const interruptState = ref<InterruptState | undefined>(restored.interrupt);
 const conversationActionStates = ref<Record<string, ConversationActionState>>(restored.conversationActions);
-const forkRequests = ref<Record<string, ForkRequestState>>(restored.forkRequests);
+const forkRequests = ref<ForkRequestRecords>(restored.forkRequests);
+/** Fork commands the user clicked in this Webview session; never persisted, so a reload clears it. */
+const forkClicksThisSession = new Set<string>();
+/**
+ * Confirmed forks the user did not open right away, keyed by their source conversation. Kept in
+ * memory only: the notice answers a result this session saw, and after a reload the fork is in the
+ * sidebar. Persisting it would also mean tracking deletions that happen while no Webview is open.
+ */
+const forkReadyNotices = ref<Record<string, ForkReadyNotice>>({});
 const actionNotices = ref<Record<string, string>>({});
 const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>(restored.pendingTurnInputs);
 const failedTurnInputSubmissions = ref<Record<string, FailedTurnInputSubmission>>(restored.failedTurnInputs);
@@ -427,16 +439,20 @@ bridge.on(BridgeMessageType.ConversationForkResult, (message) => {
   const payload = message.payload;
   if (!payload) return;
   const request = forkRequests.value[payload.commandId];
-  if (
-    !request
-    || request.sourceConversationId !== payload.sourceConversationId
-    || request.messageId !== payload.messageId
-    || request.payload.expectedRevisionId !== payload.expectedRevisionId
-  ) return;
-  // Navigation is a separate shell command. Sending it only after the exact durable fork result
-  // makes accepted and replayed forks equally visible without guessing a target Conversation id.
-  bridge.request(BridgeMessageType.ConversationOpen, { conversationId: payload.conversationId });
+  if (!forkResultResolves(request, payload)) return;
+  // Navigation is a separate shell command, sent only after the exact durable fork result, and
+  // only as the answer to a click in this session while the user still looks at the source.
+  const navigation = forkResultNavigation(request, payload, {
+    clickedThisSession: forkClicksThisSession.has(request.actionId),
+    activeConversationId: useReliableConversation().conversationId.value
+  });
+  forkClicksThisSession.delete(request.actionId);
   clearForkRequest(payload.commandId);
+  if (navigation.kind === 'open') {
+    bridge.request(BridgeMessageType.ConversationOpen, { conversationId: payload.conversationId });
+    return;
+  }
+  forkReadyNotices.value = { ...forkReadyNotices.value, [navigation.notice.sourceConversationId]: navigation.notice };
 });
 
 bridge.on(BridgeMessageType.Error, (message) => {
@@ -501,19 +517,17 @@ bridge.on(BridgeMessageType.Error, (message) => {
   }
 
   if (requestType === BridgeMessageType.ConversationFork) {
-    const request = Object.values(forkRequests.value).find((candidate) =>
-      candidate.requestId === message.correlationId
-    );
-    if (!request) return;
-    // The fork transaction may have committed before a later history refresh failed. Retain the
-    // exact command so the next click (or reload) replays it instead of creating a second branch.
-    setForkRequest({ ...request, requestId: undefined });
-    setActionNotice(
-      request.sourceConversationId,
-      message.payload?.message
-        ? `${message.payload.message}（再次点击将重放同一分支命令。）`
-        : '分支提交结果未确认；再次点击将重放同一命令。'
-    );
+    // A permanent rejection drops the command. Any other failure may still have committed, so the
+    // exact command is kept (and persisted) for an explicit replay click, never replayed by itself.
+    const outcome = applyForkRequestError(forkRequests.value, {
+      correlationId: message.correlationId,
+      code: message.payload?.code,
+      message: message.payload?.message
+    }, Date.now(), forkClicksThisSession);
+    if (!outcome) return;
+    if (outcome.kind === 'rejected') forkClicksThisSession.delete(outcome.request.actionId);
+    replaceForkRequests(outcome.requests);
+    setActionNotice(outcome.request.sourceConversationId, outcome.notice);
   }
 });
 
@@ -913,7 +927,11 @@ function clearConversationAction(conversationId: string): void {
 }
 
 function setForkRequest(request: ForkRequestState): void {
-  forkRequests.value = { ...forkRequests.value, [request.actionId]: request };
+  replaceForkRequests({ ...forkRequests.value, [request.actionId]: request });
+}
+
+function replaceForkRequests(requests: ForkRequestRecords): void {
+  forkRequests.value = requests;
   persistControls();
 }
 
@@ -1156,6 +1174,11 @@ export function useChat() {
   const conversationActionLabel = computed(() => currentConversationAction.value?.label);
   const compressionPending = computed(() => currentConversationAction.value?.action === 'compress');
   const conversationActionNotice = computed(() => actionNotices.value[reliableConversation.conversationId.value]);
+  // A fork deleted after its notice appeared must not be offered any more.
+  const conversationForkReadyNotice = computed(() => {
+    const notice = forkReadyNotices.value[reliableConversation.conversationId.value];
+    return notice && forkReadyNoticeLinked(notice, reliableConversation.feed.records.ConversationBranchLink) ? notice : undefined;
+  });
   const reliableRecords = computed(() =>
     reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
   );
@@ -1204,9 +1227,8 @@ export function useChat() {
   const currentSteeringSubmitting = computed(() => Object.values(steeringSubmissions.value)
     .some((submission) => submission.conversationId === reliableConversation.conversationId.value));
   const steeringSubmissionResultsById = computed(() => steeringSubmissionResults.value);
-  const forkPendingTargetIds = computed(() => new Set(Object.values(forkRequests.value)
-    .filter((request) => request.sourceConversationId === reliableConversation.conversationId.value && request.requestId)
-    .map((request) => request.messageId)));
+  const forkPendingTargetIds = computed(() =>
+    pendingForkMessageIds(forkRequests.value, reliableConversation.conversationId.value));
 
   watchEffect(() => {
     const sessionId = reliableConversation.feed.sessionId;
@@ -1462,35 +1484,45 @@ export function useChat() {
   ): boolean {
     const revisionId = expectedRevisionId.trim();
     if (!sourceConversationId || !messageId || !revisionId) return false;
-    const existing = Object.values(forkRequests.value).find((request) =>
-      request.sourceConversationId === sourceConversationId && request.messageId === messageId
+    const decision = decideForkClick(
+      forkRequests.value,
+      { sourceConversationId, messageId, expectedRevisionId: revisionId },
+      nextReliableCommandMetadata
     );
-    if (existing) {
-      if (existing.payload.expectedRevisionId !== revisionId) {
-        setActionNotice(sourceConversationId, '该消息的其他版本正在创建分支。');
-        return false;
-      }
-      clearActionNotice(sourceConversationId);
-      sendForkRequest(existing);
-      return true;
+    if (decision.kind === 'blocked') {
+      setActionNotice(sourceConversationId, decision.notice);
+      return false;
     }
-    const command = nextReliableCommandMetadata();
-    const request: ForkRequestState = {
-      actionId: command.commandId,
-      sourceConversationId,
-      messageId,
-      payload: { sourceConversationId, messageId, expectedRevisionId: revisionId, command }
-    };
-    setForkRequest(request);
+    replaceForkRequests(decision.requests);
     clearActionNotice(sourceConversationId);
-    sendForkRequest(request);
+    forkClicksThisSession.add(decision.request.actionId);
+    sendForkRequest(decision.request);
     return true;
+  }
+
+  /** Opens the fork offered on the current conversation and drops the offer. */
+  function openForkReadyNotice(): void {
+    const notice = conversationForkReadyNotice.value;
+    if (!notice) return;
+    dismissForkReadyNotice();
+    bridge.request(BridgeMessageType.ConversationOpen, { conversationId: notice.conversationId });
+  }
+
+  function dismissForkReadyNotice(): void {
+    const sourceConversationId = reliableConversation.conversationId.value;
+    if (!forkReadyNotices.value[sourceConversationId]) return;
+    const next = { ...forkReadyNotices.value };
+    delete next[sourceConversationId];
+    forkReadyNotices.value = next;
   }
 
   function compressContext(
     conversationId: string,
-    target: { kind: 'current_head' } | { kind: 'through_message'; messageId: string }
+    target: { kind: 'current_head' } | { kind: 'through_message'; messageId: string },
+    options: { sourceReplay?: CompressionStartPayload['sourceReplay'] } = {}
   ): boolean {
+    if (options.sourceReplay !== undefined
+      && (options.sourceReplay !== 'immutable_provenance' || target.kind !== 'current_head')) return false;
     const frozenTarget = freezeCompressionTarget(conversationId, target);
     if (!conversationId || !frozenTarget) return false;
     const targetId = frozenTarget.kind === 'through_message' ? frozenTarget.messageId : frozenTarget.expectedRootId;
@@ -1500,11 +1532,14 @@ export function useChat() {
       conversationId,
       action: 'compress',
       targetId,
-      label: '正在停止后总结',
+      label: options.sourceReplay ? '正在从原始记录重建摘要' : '正在停止后总结',
       phase: 'waiting_for_idle',
       commandPayload: {
         type: BridgeMessageType.CompressionStart,
-        payload: { conversationId, target: frozenTarget, command }
+        payload: {
+          conversationId, target: frozenTarget, command,
+          ...(options.sourceReplay ? { sourceReplay: options.sourceReplay } : {})
+        }
       }
     });
   }
@@ -1672,7 +1707,9 @@ export function useChat() {
       case BridgeMessageType.MessageDeleteFrom:
         return bridge.request(command.type, command.payload);
       case BridgeMessageType.CompressionStart:
-        return bridge.request(command.type, command.payload);
+        return bridge.request(command.type, toStructuredClonePlainData(
+          command.payload, 'compression command'
+        ) as unknown as CompressionStartPayload);
     }
   }
 
@@ -1842,19 +1879,11 @@ export function useChat() {
 
   function sendForkRequest(request: ForkRequestState): void {
     const requestId = bridge.request(BridgeMessageType.ConversationFork, request.payload);
-    setForkRequest({
-      ...request,
-      requestId,
-      ...(reliableConversation.feed.sessionId ? { sentSessionId: reliableConversation.feed.sessionId } : {})
-    });
+    setForkRequest(markForkRequestSent(request, requestId, reliableConversation.feed.sessionId ?? undefined));
   }
 
   function replayForkRequestsForSession(sessionId: string): void {
-    for (const request of Object.values(forkRequests.value)) {
-      if (
-        request.sourceConversationId !== reliableConversation.conversationId.value
-        || request.sentSessionId === sessionId
-      ) continue;
+    for (const request of forkRequestsToReplay(forkRequests.value, reliableConversation.conversationId.value, sessionId)) {
       sendForkRequest(request);
     }
   }
@@ -2003,6 +2032,9 @@ export function useChat() {
     conversationActionPending,
     conversationActionLabel,
     conversationActionNotice,
+    conversationForkReadyNotice,
+    openForkReadyNotice,
+    dismissForkReadyNotice,
     currentPendingTurnInputs,
     currentTurnInputAcknowledgements,
     currentTurnInputFailure,
@@ -2036,7 +2068,7 @@ function readPersistedControls(): PersistedConversationControls {
   return {
     ...(interrupt ? { interrupt } : {}),
     conversationActions: validConversationActionRecords(value.conversationActions),
-    forkRequests: plainRecord(value.forkRequests),
+    forkRequests: restoreForkRequests(value.forkRequests),
     pendingTurnInputs: validTurnInputRecords(value.pendingTurnInputs),
     failedTurnInputs: validFailedTurnInputRecords(value.failedTurnInputs)
   };

@@ -18,6 +18,18 @@ export interface TerminalValidatedFetchOptions {
   bodyIdleTimeoutMs?: number;
   onWireInvariantTrace?: (trace: LlmProviderWireInvariantTrace) => void;
   createObservation?: () => DebugHttpObservation;
+  /**
+   * OpenAI Responses：线上看到的终态（流里的 response.completed / response.incomplete，或非流式响应体的 status）。
+   * 只报线上原文，不依赖接入库怎么解码 response.incomplete。
+   */
+  onResponsesTerminal?: (terminal: ResponsesTerminalEvidence) => void;
+}
+
+/** 一个 Responses 响应的终态：状态、incomplete 原因与原始 usage。 */
+export interface ResponsesTerminalEvidence {
+  status: string;
+  reason?: string;
+  usage?: unknown;
 }
 
 export class LlmHttpStreamTerminationError extends Error {
@@ -59,11 +71,23 @@ export function createTerminalValidatedFetch(
       response = annotateProviderWireError(response, wireTrace.bodySha256);
     }
     const validatedStream = response.ok && isEventStream(response.headers.get('content-type'));
+    const onResponsesTerminal = provider === 'openai-responses' ? options.onResponsesTerminal : undefined;
+    if (onResponsesTerminal && response.ok && !validatedStream && response.body && isJson(response.headers.get('content-type'))) {
+      // 非流式 Responses：先读完响应体取终态，再原样交给接入库解码。
+      const text = await response.text();
+      try {
+        const terminal = responsesTerminalEvidence(JSON.parse(text));
+        if (terminal) onResponsesTerminal(terminal);
+      } catch {
+        // 解析失败由接入库报告；这里只记录明确的终态。
+      }
+      response = new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+    }
     if (!response.body || (!validatedStream && !observation)) return response;
 
     const reader = response.body.getReader();
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const tracker = validatedStream ? new SseTerminalTracker(provider) : undefined;
+    const tracker = validatedStream ? new SseTerminalTracker(provider, onResponsesTerminal) : undefined;
     // Fetch implementations expose decoded response bytes while commonly retaining the encoded
     // Content-Length header. Only compare lengths when no content coding can change the byte count.
     const expectedBytes = hasIdentityContentEncoding(response.headers.get('content-encoding'))
@@ -137,7 +161,10 @@ class SseTerminalTracker {
   private dataLines: string[] = [];
   public sawTerminal = false;
 
-  public constructor(private readonly provider: LlmProviderKind) {}
+  public constructor(
+    private readonly provider: LlmProviderKind,
+    private readonly onResponsesTerminal?: (terminal: ResponsesTerminalEvidence) => void
+  ) {}
 
   public push(bytes: Uint8Array): void {
     this.buffer += this.decoder.decode(bytes, { stream: true });
@@ -188,11 +215,45 @@ class SseTerminalTracker {
     }
     if (!data) return;
     try {
-      if (hasTerminalJsonEvidence(JSON.parse(data), this.provider)) this.sawTerminal = true;
+      const value = JSON.parse(data);
+      if (this.provider === 'openai-responses') {
+        const terminal = responsesTerminalEvidence(value);
+        // response.incomplete 同样是这个响应的终态（https://platform.openai.com/docs/api-reference/responses-streaming），不是被截断的流。
+        if (terminal?.status === 'incomplete') this.sawTerminal = true;
+        if (terminal) this.onResponsesTerminal?.(terminal);
+      }
+      if (hasTerminalJsonEvidence(value, this.provider)) this.sawTerminal = true;
     } catch {
       // The provider package owns parse errors. This layer only records positive terminal evidence.
     }
   }
+}
+
+/** Responses 终态：流事件 `{type, response:{status,…}}` 或非流式响应体 `{object:'response', status,…}`。 */
+function responsesTerminalEvidence(value: unknown): ResponsesTerminalEvidence | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const nested = record.response && typeof record.response === 'object' && !Array.isArray(record.response)
+    ? record.response as Record<string, unknown>
+    : undefined;
+  const response = nested ?? (record.object === 'response' ? record : undefined);
+  if (!response) return undefined;
+  const status = typeof response.status === 'string' ? response.status : undefined;
+  if (status !== 'completed' && status !== 'incomplete') return undefined;
+  const details = response.incomplete_details && typeof response.incomplete_details === 'object'
+    ? response.incomplete_details as Record<string, unknown>
+    : undefined;
+  const reason = typeof details?.reason === 'string' && details.reason.trim() ? details.reason.trim() : undefined;
+  return {
+    status,
+    ...(reason ? { reason } : {}),
+    ...(response.usage !== undefined && response.usage !== null ? { usage: response.usage } : {})
+  };
+}
+
+function isJson(value: string | null): boolean {
+  const type = value?.toLowerCase().split(';', 1)[0]?.trim() ?? '';
+  return type === 'application/json' || type.endsWith('+json');
 }
 
 function terminalEventName(event: string): boolean {

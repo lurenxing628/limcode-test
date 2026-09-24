@@ -29,6 +29,37 @@ export interface ReliableKernelClientChange {
   removalCause?: 'window-eviction';
 }
 
+/** Read-only work-environment authority for the selected Conversation's active Turn. */
+export interface ActiveTurnWorkEnvironmentProjection {
+  conversationId: string;
+  turnId: string;
+  enabled: boolean;
+  defaultWorkEnvironmentId: string | null;
+  allowedWorkEnvironmentIds: string[];
+}
+
+/**
+ * What the next Turn the user starts in the selected child Agent conversation inherits, read from
+ * frozen authority exactly as the kernel does (readChildExecutionBoundary /
+ * readChildExecutionWorkEnvironmentBoundary).
+ */
+export interface ChildConversationBoundaryProjection {
+  conversationId: string;
+  childExecutionId: string;
+  /**
+   * Whether the child's tools and skills are bounded by the conversation that started it. False for
+   * a Plan the user approved to run in a new conversation: it runs with its executor Agent's own settings.
+   */
+  boundedByParent: boolean;
+  /** The work environments of the child's latest Turn, which bound its next Turn; null when none were frozen. */
+  workEnvironment: {
+    turnId: string;
+    enabled: boolean;
+    defaultWorkEnvironmentId: string | null;
+    allowedWorkEnvironmentIds: string[];
+  } | null;
+}
+
 export interface ReliableKernelSnapshotMessage {
   type: typeof RELIABLE_KERNEL_SNAPSHOT_MESSAGE;
   sessionId: string;
@@ -123,15 +154,33 @@ export interface ReliableKernelSubagentContinuationSource {
   title?: string;
 }
 
+export interface ReliableKernelCollaborationContinuationSource {
+  kind: 'collaboration_message';
+  inboxItemId: string;
+  sourceId: string;
+  sourceConversationId: string;
+  mode: 'message' | 'followup';
+  textPreview: string;
+}
+
+/**
+ * Maximum characters of the whitespace-normalized `text_preview` carried by a CollaborationMessage
+ * client record. Source, target and reply relations stay in their own link records; the full body
+ * is never part of the feed.
+ */
+export const RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS = 320;
+
 export type ReliableKernelRuntimeContinuationSource =
   | ReliableKernelBackgroundProcessContinuationSource
-  | ReliableKernelSubagentContinuationSource;
+  | ReliableKernelSubagentContinuationSource
+  | ReliableKernelCollaborationContinuationSource;
 
 export interface ReliableKernelRuntimeContinuationTurnIntentPreview {
   version: 3;
   kind: 'runtime_continuation';
   revisionSeq: string;
-  sourceTurnId: string;
+  /** Null for a collaboration continuation, which runs under the destination's current settings. */
+  sourceTurnId: string | null;
   deliveryId: string;
   deliveryState: string;
   phase: string;
@@ -407,7 +456,13 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'AnswerSubmission',
   'RuntimeInboxItem',
   'RuntimeDelivery',
-  'RuntimeDeliveryIntentLink'
+  'RuntimeDeliveryIntentLink',
+  'CollaborationMessage',
+  'CollaborationMessageSourceLink',
+  'CollaborationMessageTargetLink',
+  'CollaborationMessageReplyLink',
+  'CollaborationRequest',
+  'CollaborationRequestTurnLink'
 ] as const);
 
 export function createEmptyReliableKernelClientState(): ReliableKernelBoundedClientState {
@@ -579,7 +634,15 @@ function seedRecordsFromSnapshot(
     answerSubmissions: 'AnswerSubmission',
     runtimeInboxItems: 'RuntimeInboxItem',
     runtimeDeliveries: 'RuntimeDelivery',
-    runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink'
+    runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
+    collaborationMessages: 'CollaborationMessage',
+    collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',
+    collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
+    collaborationMessageReplyLinks: 'CollaborationMessageReplyLink',
+    collaborationRequests: 'CollaborationRequest',
+    collaborationRequestTurnLinks: 'CollaborationRequestTurnLink',
+    /** Snapshot-only: the peers of the loaded collaboration links, outside the navigation list. */
+    collaborationPeerConversations: 'CollaborationPeerConversation'
   };
   const visit = (value: PlainData): void => {
     if (Array.isArray(value)) {

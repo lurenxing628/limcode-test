@@ -85,15 +85,15 @@ const fixtureProvider = {
 
 const fixtureCompressionConfig = {
   id: 'compression-openai-native',
-  name: 'OpenAI 原生压缩',
-  kind: 'openai_responses_compact',
+  name: 'Provider 原生压缩',
+  kind: 'provider_native',
   trigger: {
     mode: 'token_threshold',
     thresholdUnit: 'tokens',
     thresholdTokens: 330_000,
     thresholdPercent: 88.70967741935483
   },
-  openaiResponsesCompact: {
+  providerNative: {
     providerConfigId: fixtureProvider.id,
     model: fixtureProvider.model
   },
@@ -297,10 +297,10 @@ async function verifyViewport(browser, viewport, outputDirectory) {
     await compressionSection.scrollIntoViewIfNeeded();
     await page.waitForTimeout(100);
 
-    await compressionSection.getByText('当前压缩方法：OpenAI 原生压缩', { exact: false }).waitFor({ state: 'visible' });
+    await compressionSection.getByText('当前策略：Provider 原生压缩', { exact: false }).waitFor({ state: 'visible' });
     await compressionSection.getByText('完整输入 Token 触发阈值', { exact: true }).waitFor({ state: 'visible' });
-    await compressionSection.getByText('最多 48k Token', { exact: false }).first().waitFor({ state: 'visible' });
-    const thresholdInput = compressionSection.locator('input.token-number-input');
+    await compressionSection.getByText('对话主体目标为', { exact: false }).first().waitFor({ state: 'visible' });
+    const thresholdInput = compressionSection.locator('input.token-number-input').first();
     assert(await thresholdInput.inputValue() === '330000', '压缩阈值没有显示 mock snapshot 中的 330000 token');
     const thresholdSlider = compressionSection.getByLabel('拖拽调整自动压缩触发阈值');
     await thresholdSlider.waitFor({ state: 'visible' });
@@ -354,6 +354,7 @@ async function verifyViewport(browser, viewport, outputDirectory) {
     const screenshot = path.join(outputDirectory, `compression-settings-${viewport.name}.png`);
     await page.screenshot({ path: screenshot, animations: 'disabled' });
 
+    const featureAssertions = await verifyCapabilityInteractions(page, compressionSection);
     return {
       viewport: viewport.name,
       width: viewport.width,
@@ -361,6 +362,7 @@ async function verifyViewport(browser, viewport, outputDirectory) {
       screenshot,
       layout,
       saveRecovery,
+      featureAssertions,
       pageErrors,
       consoleErrors,
       consoleWarnings,
@@ -370,6 +372,29 @@ async function verifyViewport(browser, viewport, outputDirectory) {
   } finally {
     await context.close();
   }
+}
+
+async function verifyCapabilityInteractions(page, section) {
+  const probeCount = () => page.evaluate(() => window.__limcodeMockHostPostedMessages
+    .filter((message) => message?.payload?.probeNative === true).length);
+  assert(await probeCount() === 0, '渲染或保存设置意外触发了付费端点探测');
+  const writesBefore = await page.evaluate(() => window.__limcodeMockHostPostedMessages
+    .filter((message) => message.type === 'settings.global.update').length);
+  await section.getByText('高级摘要参数', { exact: true }).click();
+  await section.getByLabel('摘要 generationConfig JSON').fill('{"maxOutputTokens":0}');
+  await section.getByRole('button', { name: '应用摘要参数', exact: true }).click();
+  await section.getByRole('alert').filter({ hasText: '正整数' }).waitFor({ state: 'visible' });
+  await page.waitForTimeout(500);
+  const writesAfter = await page.evaluate(() => window.__limcodeMockHostPostedMessages
+    .filter((message) => message.type === 'settings.global.update').length);
+  assert(writesAfter === writesBefore, '非法摘要输出预算仍触发了设置保存');
+  await section.getByRole('button', { name: '验证原生端点（会调用一次）', exact: true }).click();
+  await page.waitForFunction(() => window.__limcodeMockHostPostedMessages.some((message) => message?.payload?.probeNative === true));
+  assert(await probeCount() === 1, '一次用户点击没有对应一个显式探测请求');
+  const payload = await page.evaluate(() => window.__limcodeMockHostPostedMessages.find((message) => message?.payload?.probeNative === true).payload);
+  assert(payload.config && !payload.contents && !payload.messages && !payload.conversationId,
+    '探测命令包含实际对话内容或缺少目标渠道');
+  return { noAutomaticProbe: true, invalidBudgetNotSaved: true, explicitProbeCount: 1, probeHasNoConversation: true };
 }
 
 async function verifySaveRecovery(page, startIndex) {

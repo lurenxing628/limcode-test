@@ -2,17 +2,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { createServer } from 'vite';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 const root = process.cwd();
 
 async function createWebviewTestServer() {
-  return createServer({
-    configFile: path.join(root, 'vite.config.ts'),
-    server: { middlewareMode: true },
-    appType: 'custom',
-    logLevel: 'error'
-  });
+  return createWebviewSsrServer();
 }
 
 function source(relativePath) {

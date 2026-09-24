@@ -108,6 +108,13 @@ async function checkConversationForkLinks() {
     const faults = [];
     const metrics = {};
     const seeded = await seedParent(ctx, 'fork');
+    // A fork copies completed history only: end the seeded Turn before forking its message.
+    await seeded.control.terminal({
+      source: { kind: 'callback', key: 'fork-seed-terminal' },
+      turnId: seeded.turnId,
+      terminalStatus: 'completed',
+      reason: 'fixture completed before fork'
+    });
     await ctx.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'agent-link-fork-reviewer',
@@ -145,7 +152,6 @@ async function checkConversationForkLinks() {
       sourceContextEndSegmentId: sourceMessageSegment.segment_id,
       sourceMessageRevisionId: seeded.messageRevisionId,
       sourceTurnId: seeded.turnId,
-      expectedSourceHeadRootId: sourceRootId,
       targetTitle: 'Fork target',
       targetAgentId: 'fork-target-agent'
     };
@@ -182,7 +188,10 @@ async function checkConversationForkLinks() {
     const replay = await forks.fork(baseCommand);
     assert.equal(replay.deduplicated, true);
     assert.equal(replay.targetConversationId, forked.targetConversationId);
-    await assert.rejects(forks.fork({ ...baseCommand, targetTitle: 'Conflicting replay title' }), /different facts|does not exist/);
+    // The title is only the target's initial display title, never part of the fork identity.
+    const retitledReplay = await forks.fork({ ...baseCommand, targetTitle: 'Different replay title' });
+    assert.equal(retitledReplay.deduplicated, true);
+    assert.equal(retitledReplay.targetConversationId, forked.targetConversationId);
     const targetRoot = await get(ctx.database, 'ContextSequenceRoot', forked.targetRootId);
     assert.equal(targetRoot.root_node_id, sourceRoot.root_node_id);
     assert.equal(targetRoot.segment_count, sourceRoot.segment_count);
@@ -309,6 +318,12 @@ async function checkConversationForkLinks() {
       summary: 'COMPRESSED_PREFIX_C',
       idempotencyKey: 'fork-recursive-compression'
     });
+    await prefixBControl.terminal({
+      source: { kind: 'callback', key: 'fork-prefix-b-terminal' },
+      turnId: prefixB.turnId,
+      terminalStatus: 'completed',
+      reason: 'fixture completed before fork'
+    });
     const forkThroughB = await forks.fork({
       idempotencyKey: 'fork-prefix-through-b',
       reuseKey: 'reuse-fork-prefix-through-b',
@@ -318,7 +333,6 @@ async function checkConversationForkLinks() {
       sourceMessageRevisionId: prefixB.messageRevisionId,
       expectedCurrentMessageRevisionId: prefixB.messageRevisionId,
       sourceTurnId: prefixB.turnId,
-      expectedSourceHeadRootId: prefixCompression.rootId,
       targetTitle: 'Fork through B',
       targetAgentId: prefixSeed.agentId
     });
@@ -425,7 +439,6 @@ async function checkConversationForkLinks() {
       sourceMessageRevisionId: failedSeed.messageRevisionId,
       expectedCurrentMessageRevisionId: failedSeed.messageRevisionId,
       sourceTurnId: failedSeed.turnId,
-      expectedSourceHeadRootId: failedRootId,
       targetTitle: 'Fork preserves failed Turn',
       targetAgentId: failedSeed.agentId
     });
@@ -446,6 +459,9 @@ async function checkConversationForkLinks() {
     // request/operation/attempt rows through the trusted historicalCopy channel instead of
     // crashing on the creation invariant "ModelRequest insert must start prepared and non-terminal.".
     const mrSeed = await seedParent(ctx, 'fork-terminal-model-request');
+    // Every fork owns copies of its Turns' frozen authority, so the request references the real one.
+    const mrAuthority = (await list(ctx.database, 'AuthoritySnapshot', { turn_id: mrSeed.turnId }))[0];
+    assert.ok(mrAuthority);
     const mrRecipe = await ctx.store.ingest(ctx.database, 'fork-mr-recipe', 'application/json');
     const mrOutput = await ctx.store.ingest(ctx.database, 'fork-mr-output', 'text/plain');
     await ctx.database.transaction([
@@ -460,7 +476,7 @@ async function checkConversationForkLinks() {
         context_window_tokens: 128000n,
         compression_threshold_tokens: 100000n,
         estimated_context_tokens: 1000n,
-        authority_snapshot_id: 'fork-mr-authority',
+        authority_snapshot_id: mrAuthority.id,
         settings_snapshot_object_id: null,
         recipe_object_id: mrRecipe.id,
         usage_json: null,
@@ -554,6 +570,12 @@ async function checkConversationForkLinks() {
       source_id: 'fork-mr-model-revision'
     }))[0];
     assert.ok(mrModelSegment);
+    await mrSeed.control.terminal({
+      source: { kind: 'callback', key: 'fork-terminal-model-request-terminal' },
+      turnId: mrSeed.turnId,
+      terminalStatus: 'failed',
+      reason: 'provider_failed_before_output'
+    });
     const mrFork = await forks.fork({
       idempotencyKey: 'fork-terminal-model-request',
       reuseKey: 'reuse-fork-terminal-model-request',
@@ -587,41 +609,10 @@ async function checkConversationForkLinks() {
     assert.equal(copiedRequestLinks[0].model_request_id, copiedRequests[0].id);
     assertions.push('含终结ModelRequest/Operation/Attempt的历史转录经historicalCopy通道复制进fork目标，不再撞创建不变量');
 
-    await assert.rejects(forks.fork({
-      ...baseCommand,
-      idempotencyKey: 'fork-stale',
-      reuseKey: 'reuse-fork-stale'
-    }), /expected head is stale/);
-    assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-stale' })).length, 0);
-    faults.push('stale expected source head');
-
-    await seeded.control.terminal({
-      source: { kind: 'callback', key: 'fork-fixture-terminal-before-history-mutation' },
-      turnId: seeded.turnId,
-      terminalStatus: 'completed',
-      reason: 'fork fixture completed before soft-delete history mutation'
-    });
-    await seeded.control.delete({
-      source: { kind: 'command', key: 'fork-soft-delete-source' },
-      conversationId: seeded.conversationId,
-      messageId: seeded.messageId
-    });
-    const historical = await forks.fork({
-      ...baseCommand,
-      idempotencyKey: 'fork-historical',
-      reuseKey: 'reuse-fork-historical',
-      expectedSourceHeadRootId: undefined,
-      targetTitle: 'Historical fork'
-    });
-    assert.equal((await get(ctx.database, 'Message', seeded.messageId)).deleted_at !== null, true);
-    assert.equal((await get(ctx.database, 'ContextSequenceRoot', historical.targetRootId)).root_node_id, sourceRoot.root_node_id);
-    assertions.push('Message soft-delete后仍可按immutable历史MessageRevision/root fork，不读取当前删除状态重解释历史');
-
     const concurrent = await Promise.all(['left', 'right'].map((side) => forks.fork({
       ...baseCommand,
       idempotencyKey: `fork-${side}`,
       reuseKey: `reuse-fork-${side}`,
-      expectedSourceHeadRootId: undefined,
       targetTitle: `Concurrent ${side}`
     })));
     assert.equal(new Set(concurrent.map((entry) => entry.targetConversationId)).size, 2);
@@ -635,6 +626,22 @@ async function checkConversationForkLinks() {
     metrics.concurrentForks = concurrent.length;
     metrics.sharedPrefixCopiedNodes = 0;
     assertions.push('同一parent并发fork创建独立target且均引用同一共享前缀，没有复制历史正文或节点');
+    await seeded.control.delete({
+      source: { kind: 'command', key: 'fork-soft-delete-source' },
+      conversationId: seeded.conversationId,
+      messageId: seeded.messageId
+    });
+    await assert.rejects(forks.fork({
+      ...baseCommand,
+      idempotencyKey: 'fork-historical',
+      reuseKey: 'reuse-fork-historical',
+      targetTitle: 'Historical fork'
+    }), (error) => error instanceof kernel.ConversationForkRejectedError && /分支点消息已被删除/.test(error.message));
+    assert.equal((await get(ctx.database, 'Message', seeded.messageId)).deleted_at !== null, true);
+    assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-historical' })).length, 0);
+    faults.push('fork point soft-deleted after selection');
+    assertions.push('分支只复制可见转录：分支点消息软删除后，写入器按旧Revision分支以ConversationForkRejectedError永久拒绝且不写复用关系');
+
     return { assertions, faults, metrics };
   });
 }
@@ -1169,10 +1176,12 @@ async function checkCancelSubtree() {
       leaseExpiresAt: '2026-08-02T00:00:00.000Z'
     };
     const originalTransaction = ctx.database.transaction.bind(ctx.database);
-    let spawnFaultInjected = false;
+    // spawn retries a transaction assertion failure (a concurrent capacity or membership change),
+    // so the fault stays armed for the whole call: every attempt must roll back its lineage facts.
+    let spawnFaultAttempts = 0;
     ctx.database.transaction = async (steps) => {
-      if (!spawnFaultInjected && steps.some((step) => step.kind === 'insert' && step.domain === 'ChildExecution')) {
-        spawnFaultInjected = true;
+      if (steps.some((step) => step.kind === 'insert' && step.domain === 'ChildExecution')) {
+        spawnFaultAttempts += 1;
         return originalTransaction([
           ...steps,
           kernel.DOMAIN_REPOSITORIES.domain('Conversation').assert('missing-spawn-fault', { status: 'active' })
@@ -1180,8 +1189,12 @@ async function checkCancelSubtree() {
       }
       return originalTransaction(steps);
     };
-    await assert.rejects(ctx.services.children.spawn(atomicSpawnCommand), /assertion failed/);
-    ctx.database.transaction = originalTransaction;
+    try {
+      await assert.rejects(ctx.services.children.spawn(atomicSpawnCommand), /assertion failed/);
+    } finally {
+      ctx.database.transaction = originalTransaction;
+    }
+    assert.ok(spawnFaultAttempts > 1, 'spawn retries an assertion failure before giving up');
     assert.equal((await list(ctx.database, 'ChildExecutionParentLink', {
       source_tool_call_id: atomicTool.toolCallId
     })).length, 0);
@@ -1293,7 +1306,8 @@ async function checkCancelSubtree() {
       leaseOwnerId: 'continued-a-owner',
       leaseExpiresAt: '2026-08-02T00:00:00.000Z'
     });
-    const pendingBTool = await createRunAgentTool(ctx, parent.turnId, 'queue-b-pending');
+    // Only B's own parent Conversation (A) may queue a continuation for it.
+    const pendingBTool = await createRunAgentTool(ctx, continuedA.turnId, 'queue-b-pending');
     const pendingB = await ctx.services.children.send({
       sourceKey: 'queue-b-pending',
       sourceToolCallId: pendingBTool.toolCallId,
@@ -1445,8 +1459,11 @@ async function checkCancelSubtree() {
           childAgentId: 'agent-plan-external',
           modelFallback: CHILD_MODEL_FALLBACK,
           sourceSettlement: 'external',
-          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。只有在用户明确要求提交到其它通道时，才传入当前模型上下文中提供的短 childRef。继续同一子对话、中断或重试不会改变默认通道。`,
+          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。显式 childRef 也必须属于当前子任务，不能提交到其它任务的答案通道。同伴交流使用 send_agent_message，向已有同伴续派任务使用 followup_agent_task。继续同一子对话、中断或重试不会改变默认通道。`,
           completionPolicy: 'background',
+          // The first attempt is the durable form written before executor_agent existed and crashes
+          // before launch; the retry after the upgrade asks for the executor Agent own settings.
+          ...(externalEnsureAttempts === 1 ? {} : { authorityBound: 'executor_agent' }),
           leaseOwnerId: `child-owner-plan-external-${externalEnsureAttempts}`,
           leaseExpiresAt: `2026-08-0${externalEnsureAttempts + 1}T00:00:00.000Z`
         });
@@ -3901,7 +3918,10 @@ function emptyClientProjection(conversationId) {
       childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
       childExecutionActiveTurnLinks: [], childExecutionActivities: [], childTurns: [], childExecutionLeases: [],
       childTurnTerminations: [], childTurnExecutorLinks: [], answerBridges: [],
-      answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: []
+      answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [],
+      collaborationMessages: [], collaborationMessageSourceLinks: [], collaborationMessageTargetLinks: [],
+      collaborationMessageReplyLinks: [], collaborationRequests: [], collaborationRequestTurnLinks: [],
+      collaborationPeerConversations: []
     }
   };
 }

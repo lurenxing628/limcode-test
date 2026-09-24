@@ -66,6 +66,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.CheckpointGitStatusGet:
     case BridgeMessageType.CheckpointShadowStatsGet:
     case BridgeMessageType.AttachmentReload:
+    case BridgeMessageType.CompressionRebuildPreviewGet:
       return 'state';
     case BridgeMessageType.GlobalSettingsGet:
     case BridgeMessageType.GlobalSettingsUpdate:

@@ -24,6 +24,20 @@ export function estimateMessageContentTokens(content: MessageContent): number {
     total + estimateContentPartTokens(part), 0);
 }
 
+/**
+ * True when the contents hold a provider compaction item without readable text (OpenAI's
+ * `encrypted_content`). Its size is invisible to this estimator; the Provider's output count for the
+ * compaction is the only measure of what the model reads back.
+ */
+export function hasOpaqueProviderCompaction(contents: readonly MessageContent[]): boolean {
+  const opaque = (context: unknown): boolean => {
+    const raw = asRecord(asRecord(context)?.rawItem);
+    return raw?.type === 'compaction' && typeof raw.content !== 'string';
+  };
+  return contents.some((content) => opaque(asRecord(content as unknown)?.providerContext)
+    || (Array.isArray(content.parts) && content.parts.some((part) => 'providerContext' in part && opaque(part.providerContext))));
+}
+
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
   const estimated = estimateTokenCount(text);
@@ -153,9 +167,10 @@ function estimateProviderContextTokens(value: unknown): number {
       + estimateTextTokens(typeof reasoning?.effort === 'string' ? reasoning.effort : '');
   }
   case 'compaction':
-    // Ciphertext is an opaque provider handle, not a text prompt. The compression envelope carries
-    // the provider-observed output token estimate for this state when one is available.
-    return 0;
+    // Claude's compaction block carries its summary as readable `content` that the model reads on
+    // every later request, so it is counted like text. OpenAI's carries only `encrypted_content`, an
+    // opaque provider handle that is not a text prompt and has no local size.
+    return typeof raw.content === 'string' ? estimateTextTokens(raw.content) : 0;
   default:
     return 0;
   }

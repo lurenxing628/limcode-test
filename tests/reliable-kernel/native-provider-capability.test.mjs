@@ -240,7 +240,7 @@ test('dry-run：configuration_update 历史剥离服务端 compaction 参数', a
   assert.ok(result.body.input.some((item) => item?.type === 'configuration_update'));
 });
 
-test('dry-run：Astra WS 保留显式缓存选项与断点，其他模型维持剥离', async () => {
+test('dry-run：Astra WS 保留显式缓存选项与断点，不支持显式缓存的模型维持剥离', async () => {
   const explicitCache = { enabled: true, mode: 'explicit', ttl: '30m' };
   const astra = await dryRunLlmProvider(
     chatRequest('dry-ws-cache', { systemInstruction: { role: 'user', parts: [{ text: 'stable instructions' }] } }),
@@ -251,8 +251,17 @@ test('dry-run：Astra WS 保留显式缓存选项与断点，其他模型维持�
   assert.ok(developer, 'Astra 显式缓存把 instructions 转为 developer 输入消息');
   assert.deepEqual(developer.content[0].prompt_cache_breakpoint, { mode: 'explicit' });
 
-  const legacy = await dryRunLlmProvider(chatRequest('dry-ws-cache-legacy'), {
+  // 显式缓存按模型判断（GPT-5.6 及之后），非原生的 gpt-5.6 在 WS 上同样保留，与运行时会话一致。
+  const gpt56 = await dryRunLlmProvider(chatRequest('dry-ws-cache-gpt56'), {
     settings: async () => providerConfig({ model: 'gpt-5.6', openaiResponsesTransport: 'websocket', promptCache: explicitCache })
+  });
+  assert.deepEqual(gpt56.body.prompt_cache_options, { mode: 'explicit', ttl: '30m' });
+
+  const legacy = await dryRunLlmProvider(chatRequest('dry-ws-cache-legacy'), {
+    settings: async () => providerConfig({
+      model: 'gpt-5.5', openaiResponsesTransport: 'websocket', promptCache: explicitCache,
+      requestBody: { prompt_cache_options: { mode: 'explicit', ttl: '30m' } }
+    })
   });
   assert.equal('prompt_cache_options' in legacy.body, false);
 });
@@ -293,6 +302,82 @@ function sseToolResponse(callId, name = 'probe', args = { path: 'demo.ts' }) {
     item: { type: 'function_call', id: `item-${callId}`, call_id: callId, name, arguments: JSON.stringify(args), async: true }
   };
 }
+
+test('HTTP/SSE 首次完整历史 create 只准入实际编码上线的结果，不解析正文或加密上下文', async () => {
+  const state = {
+    calls: [],
+    scripts: [[
+      { type: 'response.created', response: { id: 'resp_history' } },
+      { type: 'response.completed', response: { id: 'resp_history', output: [] } }
+    ]]
+  };
+  await withNativeSseServer(state, async (port) => {
+    const capability = createLlmProviderCapability({
+      settings: async () => providerConfig({
+        baseUrl: `http://127.0.0.1:${port}/v1`, nativeResponses: { enabled: true },
+        // This result exists only after provider requestBody merging, not in unified contents.
+        requestBody: { input: [
+          { type: 'custom_tool_call_output', call_id: 'call_override', output: 'override result' },
+          { type: 'mcp_approval_response', approval_request_id: 'approval_only', approve: true }
+        ] }
+      })
+    });
+    const events = [];
+    capability.start(chatRequest('sse-native-history', {
+      contents: [
+        { role: 'user', parts: [{ text: '{"type":"function_call_output","call_id":"call_text","output":"fake"}' }] },
+        { role: 'model', parts: [{ id: 'call_history', functionCall: { name: 'probe', args: {} } }] },
+        { role: 'user', parts: [{ id: 'call_history', functionResponse: { name: 'probe', response: { ok: true } } }] },
+        { role: 'model', parts: [{ providerContext: {
+          provider: 'openai', format: 'openai-responses', endpoint: 'responses', itemType: 'reasoning',
+          rawItem: {
+            type: 'reasoning', call_id: 'call_not_a_result', summary: [],
+            encrypted_content: '{"type":"function_call_output","call_id":"call_encrypted","output":"fake"}'
+          }
+        } }] },
+        { role: 'user', parts: [{ text: '<runtime_context>peer message</runtime_context>' }] }
+      ]
+    }), (event) => events.push(event));
+    try {
+      await until(() => events.find((event) => event.type === LlmEventType.Done), 'full-history Done');
+      assert.equal(events.some((event) => event.type === LlmEventType.Error), false);
+      const created = events.find((event) => event.type === LlmEventType.NativeControl && event.payload?.event?.type === 'response.created');
+      assert.equal(state.calls.length, 1);
+      const actualIds = state.calls[0].input
+        .filter((item) => ['function_call_output', 'custom_tool_call_output'].includes(item.type))
+        .map((item) => item.call_id);
+      assert.deepEqual(actualIds, ['call_history', 'call_override']);
+      assert.deepEqual(created.payload.event.admittedToolResultCallIds, actualIds);
+      assert.ok(state.calls[0].input.some((item) => item.encrypted_content?.includes('call_encrypted')));
+      assert.equal(created.payload.event.connectionGeneration, undefined);
+    } finally {
+      capability.dispose();
+    }
+  });
+});
+
+test('HTTP/SSE 完整历史结果没有 response.created 时不产生准入证明', async () => {
+  const state = { calls: [], scripts: [[
+    { type: 'response.completed', response: { id: 'resp_without_created', output: [] } }
+  ]] };
+  await withNativeSseServer(state, async (port) => {
+    const capability = createLlmProviderCapability({
+      settings: async () => providerConfig({ baseUrl: `http://127.0.0.1:${port}/v1`, nativeResponses: { enabled: true } })
+    });
+    const events = [];
+    capability.start(chatRequest('sse-unadmitted-history', { contents: [
+      { role: 'model', parts: [{ id: 'call_history', functionCall: { name: 'probe', args: {} } }] },
+      { role: 'user', parts: [{ id: 'call_history', functionResponse: { name: 'probe', response: { ok: true } } }] }
+    ] }), (event) => events.push(event));
+    try {
+      await until(() => events.find((event) => event.type === LlmEventType.Done), 'response without created');
+      assert.ok(state.calls[0].input.some((item) => item.type === 'function_call_output' && item.call_id === 'call_history'));
+      assert.equal(events.some((event) => event.payload?.event?.admittedToolResultCallIds), false);
+    } finally {
+      capability.dispose();
+    }
+  });
+});
 
 test('HTTP/SSE 原生泵：准入观察、控制器交付续流与链式聚合', async () => {
   const state = { calls: [], scripts: [] };

@@ -2,9 +2,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { createVscodeStoragePaths } from '../capabilities/vscodeStorage/paths';
-import { ROOT_BINDING_POINTER_FILE, createRuntimeRootPaths } from './contracts';
-import { RootAuthority } from './rootAuthority';
-import { assertRuntimeHostsOffline } from './runtimeHostControl';
+import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import { createRuntimeRootPaths } from './contracts';
+import { RootAuthority, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
+import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
+import { CUTOVER_JOURNAL_FILE, physicalCutoverRecoveryRequired } from './physicalCutover';
 
 type VscodeStoragePaths = ReturnType<typeof createVscodeStoragePaths>;
 
@@ -12,11 +14,10 @@ export const VSCODE_RUNTIME_CONTROL_DIRECTORY = '.limcode-runtime';
 export const VSCODE_RUNTIME_ACTIVE_DIRECTORY = 'active';
 export const VSCODE_WORKSPACE_RUNTIMES_DIRECTORY = '.limcode-workspace-runtimes';
 export const VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY = 'scopes';
-export const VSCODE_LEGACY_RUNTIME_OWNER_DIRECTORY = 'legacy-owner';
-export const VSCODE_LEGACY_RUNTIME_OWNER_FILE = 'owner.json';
+export const VSCODE_RUNTIME_SELECTION_FILE = '.limcode-runtime-selection.json';
 
 const WORKSPACE_RUNTIME_ID_DOMAIN = 'limcode-vscode-workspace-runtime\0';
-const LEGACY_RUNTIME_OWNER_KIND = 'limcode-legacy-runtime-owner';
+const RUNTIME_SELECTION_KIND = 'limcode-runtime-selection';
 
 export type VscodeWorkspaceRuntimeScopeKind =
   | 'workspace-file'
@@ -31,9 +32,9 @@ export interface VscodeWorkspaceRuntimeScopeInput {
 
 export interface VscodeWorkspaceRuntimeScope {
   kind: VscodeWorkspaceRuntimeScopeKind;
-  /** Stable directory/claim key derived only from the canonical workspace identity. */
+  /** Workspace identity only; it never chooses the active Runtime data set. */
   key: string;
-  /** Human-inspectable hash input retained for the one-time legacy assignment record. */
+  /** Human-inspectable workspace identity. */
   identity: string;
 }
 
@@ -41,25 +42,57 @@ export interface VscodeWorkspaceRuntimePlacement {
   scope: VscodeWorkspaceRuntimeScope;
   /** Shared configuration root selected by globalStatus. */
   configurationRootPath: string;
-  /** Root passed to the cutover/reset coordinator for this workspace only. */
+  /** Complete selected root passed to the cutover/reset coordinator. */
   runtimeScopeRootPath: string;
   /** Immutable SQLite/CAS root consumed by RootAuthority. */
   runtimeDataRootPath: string;
   usesLegacyRuntime: boolean;
 }
 
-export interface VscodeLegacyRuntimeOwner {
-  kind: typeof LEGACY_RUNTIME_OWNER_KIND;
-  workspaceKey: string;
-  workspaceKind: VscodeWorkspaceRuntimeScopeKind;
-  workspaceIdentity: string;
-  assignedAt: string;
+export interface VscodeRuntimeDataSetCandidate {
+  id: string;
+  configurationRootPath: string;
+  runtimeScopeRootPath: string;
+  runtimeDataRootPath: string;
+  dataSetId?: string;
+  runtimeKernelEpoch?: number;
+  selected: boolean;
+  source: 'fixed' | 'legacy' | 'workspace';
+  /** A recognized interrupted physical cutover must finish before opening this root. */
+  requiresRecovery?: true;
+}
+
+interface RuntimeDataSetSelection {
+  kind: typeof RUNTIME_SELECTION_KIND;
+  id: string;
+  initialized: boolean;
+  selectionRevision: number;
+  selectedAt: string;
+}
+
+export class VscodeRuntimeDataSetSelectionRequiredError extends Error {
+  public readonly code = 'runtime-dataset-selection-required';
+
+  public constructor(public readonly candidates: readonly VscodeRuntimeDataSetCandidate[]) {
+    super('发现多个已有运行数据集，请先选择当前数据集；工作区文件夹不会自动决定使用哪个数据库。');
+    this.name = 'VscodeRuntimeDataSetSelectionRequiredError';
+  }
+}
+
+export class VscodeRuntimeDataSetError extends Error {
+  public readonly code = 'runtime-dataset-invalid';
+
+  public constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = 'VscodeRuntimeDataSetError';
+    if (cause !== undefined) (this as Error & { cause?: unknown }).cause = cause;
+  }
 }
 
 /**
- * Resolves one immutable Runtime scope for the VS Code window. The workspace file wins for saved
- * and untitled multi-root workspaces; the sorted folder set is only a fallback for hosts without a
- * workspaceFile URI. Names and active editors never participate in identity.
+ * Resolves workspace context and the names of historical scope roots. Saved workspace files
+ * take precedence; untitled workspaces use their sorted folder set. This identity no longer
+ * selects Runtime data. Names and active editors never participate in identity.
  */
 export function resolveVscodeWorkspaceRuntimeScope(
   input: VscodeWorkspaceRuntimeScopeInput
@@ -103,7 +136,7 @@ export function resolveVscodeRuntimeDataRoot(paths: Pick<VscodeStoragePaths, 'gl
   );
 }
 
-/** Directory containing a complete per-workspace cutover/reset control plane. */
+/** Location of an existing historical workspace scope; new roots use the fixed default root. */
 export function resolveVscodeWorkspaceRuntimeScopeRoot(
   paths: Pick<VscodeStoragePaths, 'globalStoragePath'>,
   scope: Pick<VscodeWorkspaceRuntimeScope, 'key'>
@@ -116,42 +149,90 @@ export function resolveVscodeWorkspaceRuntimeScopeRoot(
   );
 }
 
-export function resolveVscodeLegacyRuntimeOwnerPath(
+export function resolveVscodeRuntimeSelectionPath(
   paths: Pick<VscodeStoragePaths, 'globalStoragePath'>
 ): string {
-  return path.join(
-    path.resolve(paths.globalStoragePath),
-    VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
-    VSCODE_LEGACY_RUNTIME_OWNER_DIRECTORY,
-    VSCODE_LEGACY_RUNTIME_OWNER_FILE
-  );
+  return path.join(path.resolve(paths.globalStoragePath), VSCODE_RUNTIME_SELECTION_FILE);
 }
 
-
 /**
- * Selects the workspace Runtime without moving or rewriting an existing fenced root. The first
- * non-empty workspace that encounters the old root atomically records its ownership; subsequent
- * workspaces use the sibling scope tree and initialize independently.
+ * A configuration root has one fixed Runtime selection. The workspace is retained as execution
+ * context only. Existing roots stay in place, including their fenced RootBinding and CAS paths.
+ * Callers hold the same admission through preparation and Host registration; this inner claim
+ * also protects standalone callers. The normal selected-root path never enumerates old scopes.
  */
 export async function resolveVscodeWorkspaceRuntimePlacement(
   paths: Pick<VscodeStoragePaths, 'globalStoragePath'>,
   scope: VscodeWorkspaceRuntimeScope
 ): Promise<VscodeWorkspaceRuntimePlacement> {
   const configurationRootPath = path.resolve(paths.globalStoragePath);
-  let legacyOwner = await readLegacyRuntimeOwner(configurationRootPath);
-  if (!legacyOwner && scope.kind !== 'empty' && await legacyRuntimeExists(configurationRootPath)) {
-    legacyOwner = await assignLegacyRuntimeOwner(configurationRootPath, scope);
-  }
-  const usesLegacyRuntime = legacyOwner?.workspaceKey === scope.key;
-  const runtimeScopeRootPath = usesLegacyRuntime
-    ? configurationRootPath
-    : resolveVscodeWorkspaceRuntimeScopeRoot({ globalStoragePath: configurationRootPath }, scope);
-  return Object.freeze({
-    scope,
-    configurationRootPath,
-    runtimeScopeRootPath,
-    runtimeDataRootPath: resolveVscodeRuntimeDataRoot({ globalStoragePath: runtimeScopeRootPath }),
-    usesLegacyRuntime
+  return withRuntimeDataRootAdmission(configurationRootPath, async () => {
+    const selection = await readRuntimeDataSetSelection(configurationRootPath);
+    let candidate: VscodeRuntimeDataSetCandidate;
+    if (selection) {
+      candidate = await inspectCandidate(configurationRootPath, selection.id, selection, !selection.initialized);
+    } else {
+      const candidates = await enumerateCandidates(configurationRootPath);
+      if (candidates.length > 1) throw new VscodeRuntimeDataSetSelectionRequiredError(candidates);
+      candidate = candidates[0] ?? await inspectCandidate(configurationRootPath, 'default', undefined, true);
+      await assertConfigurationRootRuntimesOffline(configurationRootPath);
+      await publishSelection(configurationRootPath, candidate.id, Boolean(candidate.dataSetId));
+    }
+    return Object.freeze({
+      scope,
+      configurationRootPath,
+      runtimeScopeRootPath: candidate.runtimeScopeRootPath,
+      runtimeDataRootPath: candidate.runtimeDataRootPath,
+      usesLegacyRuntime: candidate.runtimeScopeRootPath === configurationRootPath
+    });
+  });
+}
+
+/** Explicit read-only enumeration for selection/history/storage tools; startup does not use it once selected. */
+export async function listVscodeRuntimeDataSets(
+  paths: Pick<VscodeStoragePaths, 'globalStoragePath'>
+): Promise<VscodeRuntimeDataSetCandidate[]> {
+  const root = path.resolve(paths.globalStoragePath);
+  return enumerateCandidates(root, await readRuntimeDataSetSelection(root));
+}
+
+/** Resolves an opaque candidate id without accepting arbitrary filesystem paths. */
+export async function resolveVscodeRuntimeDataSet(
+  paths: Pick<VscodeStoragePaths, 'globalStoragePath'>,
+  id: string
+): Promise<VscodeRuntimeDataSetCandidate> {
+  const root = path.resolve(paths.globalStoragePath);
+  const selection = await readRuntimeDataSetSelection(root);
+  return inspectCandidate(root, id, selection, selection?.id === id && !selection.initialized);
+}
+
+/** Offline-only selection; every root in the configuration root must have no live/unknown Host. */
+export async function selectVscodeRuntimeDataSet(
+  paths: Pick<VscodeStoragePaths, 'globalStoragePath'>,
+  id: string
+): Promise<VscodeRuntimeDataSetCandidate> {
+  const root = path.resolve(paths.globalStoragePath);
+  return withRuntimeDataRootAdmission(root, async () => {
+    const previous = await readRuntimeDataSetSelection(root);
+    const candidate = await inspectCandidate(root, id, previous, previous?.id === id && !previous.initialized);
+    if (previous?.id === id) return candidate;
+    await assertConfigurationRootRuntimesOffline(root);
+    await publishSelection(root, id, true, previous);
+    return Object.freeze({ ...candidate, selected: true });
+  });
+}
+
+/** Seal the fresh-root reservation after ensureCurrentRoot succeeds, before the Host opens. */
+export async function completeVscodeRuntimeDataSetSelection(
+  paths: Pick<VscodeStoragePaths, 'globalStoragePath'>
+): Promise<void> {
+  const root = path.resolve(paths.globalStoragePath);
+  await withRuntimeDataRootAdmission(root, async () => {
+    const selection = await readRuntimeDataSetSelection(root);
+    if (!selection) throw new VscodeRuntimeDataSetError('当前运行数据集选择不存在。');
+    const candidate = await inspectCandidate(root, selection.id, selection, false);
+    if (candidate.requiresRecovery) throw new VscodeRuntimeDataSetError('运行数据集必须先完成现有cutover恢复。');
+    if (!selection.initialized) await publishSelection(root, selection.id, true, selection);
   });
 }
 
@@ -194,79 +275,248 @@ export async function assertConfigurationRootRuntimesOffline(
   }
 }
 
-async function readLegacyRuntimeOwner(configurationRootPath: string): Promise<VscodeLegacyRuntimeOwner | undefined> {
-  const ownerPath = resolveVscodeLegacyRuntimeOwnerPath({ globalStoragePath: configurationRootPath });
+async function enumerateCandidates(
+  configurationRootPath: string,
+  selection?: RuntimeDataSetSelection
+): Promise<VscodeRuntimeDataSetCandidate[]> {
+  const ids: string[] = [];
+  const defaultControl = path.join(configurationRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY);
+  await assertSafeRootPath(configurationRootPath, defaultControl);
+  if (await hasRuntimeArtifacts(defaultControl) || selection?.id === 'default') ids.push('default');
+  const scopesRoot = path.join(configurationRootPath, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
+  await assertSafeRootPath(configurationRootPath, scopesRoot);
+  for (const key of (await directoryEntryNames(scopesRoot)).sort()) ids.push(`workspace:${key}`);
+  if (selection && !ids.includes(selection.id)) ids.push(selection.id);
+  const candidates: VscodeRuntimeDataSetCandidate[] = [];
+  for (const id of ids) {
+    candidates.push(await inspectCandidate(
+      configurationRootPath, id, selection, selection?.id === id && !selection.initialized
+    ));
+  }
+  return candidates;
+}
+
+async function inspectCandidate(
+  configurationRootPath: string,
+  id: string,
+  selection?: RuntimeDataSetSelection,
+  allowEmpty = false
+): Promise<VscodeRuntimeDataSetCandidate> {
+  const runtimeScopeRootPath = runtimeScopeRootForId(configurationRootPath, id);
+  const runtimeDataRootPath = resolveVscodeRuntimeDataRoot({ globalStoragePath: runtimeScopeRootPath });
+  const expected = createRuntimeRootPaths(runtimeDataRootPath);
+  await assertSafeRootPath(configurationRootPath, expected.dataRootPath);
+  for (const filePath of [expected.rootPointerPath, expected.rootPendingPath, expected.databasePath, expected.casRootPath, expected.runtimeEpochPath]) {
+    await assertSafeRootPath(configurationRootPath, filePath);
+  }
+  // Historical/pending pointers are inspected, never activated here. Exact epoch migration and
+  // completed-pending recovery remain the responsibility of the existing offline startup gate.
+  let binding: HistoricalRootBinding | undefined;
+  let pending: HistoricalRootBinding | undefined;
+  let requiresRecovery = false;
+  try {
+    const pointer = await readOptionalJson(expected.rootPointerPath);
+    const pendingValue = await readOptionalJson(expected.rootPendingPath);
+    if (pendingValue !== undefined) pending = parseHistoricalRootBinding(pendingValue);
+    binding = pointer === undefined ? pending : parseHistoricalRootBinding(pointer);
+  } catch (error) {
+    throw new VscodeRuntimeDataSetError(`运行数据集 RootBinding 无效：${expected.rootPointerPath}`, error);
+  }
+  if (binding) {
+    for (const candidateBinding of pending ? [binding, pending] : [binding]) {
+      for (const key of Object.keys(expected) as (keyof typeof expected)[]) {
+        if (candidateBinding.paths[key] !== expected[key]) {
+          throw new VscodeRuntimeDataSetError(`运行数据集路径与原 RootBinding 不一致：${expected.rootPointerPath}`);
+        }
+      }
+    }
+    try {
+      await requirePathKind(expected.databasePath, 'file');
+      await requirePathKind(expected.casRootPath, 'directory');
+      await requirePathKind(expected.runtimeEpochPath, 'file');
+      await validateCandidateEpoch(binding, pending);
+    } catch (error) {
+      // Physical cutover archives active before replacing it. Only its existing, matching
+      // journal and archived active tree justify deferring completeness to the recovery gate.
+      if (!await hasRecoverableArchivedActive(configurationRootPath, runtimeScopeRootPath, binding)) throw error;
+      requiresRecovery = true;
+    }
+  } else if (!allowEmpty || await hasRuntimeArtifacts(path.dirname(expected.dataRootPath))) {
+    throw new VscodeRuntimeDataSetError(`运行数据集缺少完整 RootBinding，不能当作新数据集初始化：${runtimeScopeRootPath}`);
+  }
+  return Object.freeze({
+    id,
+    configurationRootPath,
+    runtimeScopeRootPath,
+    runtimeDataRootPath,
+    ...(binding ? { dataSetId: binding.dataSetId, runtimeKernelEpoch: binding.runtimeKernelEpoch } : {}),
+    ...(requiresRecovery ? { requiresRecovery: true as const } : {}),
+    selected: selection?.id === id,
+    source: id === 'default' ? binding ? 'legacy' : 'fixed' : 'workspace'
+  });
+}
+
+async function hasRecoverableArchivedActive(
+  configurationRootPath: string,
+  runtimeScopeRootPath: string,
+  binding: HistoricalRootBinding
+): Promise<boolean> {
+  const journalPath = path.join(runtimeScopeRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY, CUTOVER_JOURNAL_FILE);
+  await assertSafeRootPath(configurationRootPath, journalPath);
+  if (!await physicalCutoverRecoveryRequired(runtimeScopeRootPath)) return false;
+  const journal = await readOptionalJson(journalPath) as Record<string, unknown>;
+  if (!['archiving', 'activating', 'rolling-back'].includes(String(journal.state))) return false;
+  const previous = journal.previousBinding as Record<string, unknown> | undefined;
+  if (!previous || ['dataSetId', 'rootInstanceId', 'rootGeneration', 'pointerRevision', 'runtimeKernelEpoch']
+    .some((key) => previous[key] !== binding[key as keyof HistoricalRootBinding])) return false;
+  if (!isText(journal.archiveDirectoryName) || path.basename(journal.archiveDirectoryName) !== journal.archiveDirectoryName
+    || journal.archiveDirectoryName === '.' || journal.archiveDirectoryName === '..') return false;
+  const steps = journal.steps as Array<Record<string, unknown>>;
+  if (!steps.some((step) => step.entryId === 'control.previous-runtime-active'
+    && step.sourceRelativePath === '.limcode-runtime/active' && step.archiveRelativePath === 'runtime-control/active'
+    && step.action === 'runtime-active' && (step.state === 'planned' || step.state === 'archived')
+    && typeof step.sourceDigest === 'string' && /^[a-f0-9]{64}$/.test(step.sourceDigest))) return false;
+  const archivedActive = path.join(runtimeScopeRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY, 'backups', journal.archiveDirectoryName, 'runtime-control', 'active');
+  await assertSafeRootPath(configurationRootPath, archivedActive);
+  await requirePathKind(archivedActive, 'directory');
+  // Digest/step replay remains solely in recoverInterruptedPhysicalCutover, after the Host gate.
+  return true;
+}
+
+async function validateCandidateEpoch(binding: HistoricalRootBinding, pending?: HistoricalRootBinding): Promise<void> {
+  let value: unknown;
+  try { value = await readOptionalJson(binding.paths.runtimeEpochPath); }
+  catch (error) { throw new VscodeRuntimeDataSetError(`运行数据集epoch无法读取：${binding.paths.runtimeEpochPath}`, error); }
+  const manifest = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  if (
+    !manifest
+    || Object.keys(manifest).sort().join(',') !== 'dataSetId,initializedAt,kind,rootGeneration,rootInstanceId,runtimeKernelEpoch'
+    || manifest.kind !== 'limcode-runtime-kernel-epoch' || !isText(manifest.initializedAt)
+  ) throw new VscodeRuntimeDataSetError(`运行数据集epoch无效：${binding.paths.runtimeEpochPath}`);
+  const matches = (candidate: HistoricalRootBinding): boolean =>
+    manifest.dataSetId === candidate.dataSetId && manifest.rootInstanceId === candidate.rootInstanceId
+    && manifest.rootGeneration === candidate.rootGeneration && manifest.runtimeKernelEpoch === candidate.runtimeKernelEpoch;
+  if (matches(binding)) return;
+  // The one permitted in-place upgrade durably writes epoch 4 immediately before publishing its
+  // pending pointer. Preserve that exact crash window for the existing journal recovery gate.
+  if (
+    binding.runtimeKernelEpoch === 3 && pending?.runtimeKernelEpoch === 4
+    && pending.dataSetId === binding.dataSetId && pending.rootInstanceId === binding.rootInstanceId
+    && pending.rootGeneration === binding.rootGeneration + 1
+    && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
+  ) return;
+  throw new VscodeRuntimeDataSetError(`运行数据集epoch身份与RootBinding不一致：${binding.paths.runtimeEpochPath}`);
+}
+
+function runtimeScopeRootForId(configurationRootPath: string, id: string): string {
+  if (id === 'default') return configurationRootPath;
+  const key = id.startsWith('workspace:') ? id.slice('workspace:'.length) : '';
+  if (!/^(workspace-file|folder|folder-set|empty)-[a-f0-9]{64}$/.test(key)) {
+    throw new VscodeRuntimeDataSetError(`运行数据集标识无效：${id}`);
+  }
+  return resolveVscodeWorkspaceRuntimeScopeRoot({ globalStoragePath: configurationRootPath }, { key });
+}
+
+async function readRuntimeDataSetSelection(configurationRootPath: string): Promise<RuntimeDataSetSelection | undefined> {
+  const selectionPath = resolveVscodeRuntimeSelectionPath({ globalStoragePath: configurationRootPath });
+  await assertSafeRootPath(configurationRootPath, selectionPath);
   let value: unknown;
   try {
-    value = JSON.parse(await fs.readFile(ownerPath, 'utf8'));
+    value = await readOptionalJson(selectionPath);
   } catch (error) {
-    if (isMissingPathError(error)) return undefined;
-    throw error;
+    throw new VscodeRuntimeDataSetError(`运行数据集选择指针无法读取：${selectionPath}`, error);
   }
-  const record = value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
+  if (value === undefined) return undefined;
+  const record = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
   if (
-    record?.kind !== LEGACY_RUNTIME_OWNER_KIND
-    || !isText(record.workspaceKey)
-    || !isWorkspaceRuntimeScopeKind(record.workspaceKind)
-    || !isText(record.workspaceIdentity)
-    || !isText(record.assignedAt)
-  ) throw new Error(`Legacy Runtime owner record is invalid: ${ownerPath}`);
-  return {
-    kind: LEGACY_RUNTIME_OWNER_KIND,
-    workspaceKey: record.workspaceKey,
-    workspaceKind: record.workspaceKind,
-    workspaceIdentity: record.workspaceIdentity,
-    assignedAt: record.assignedAt
-  };
+    !record || Object.keys(record).sort().join(',') !== 'id,initialized,kind,selectedAt,selectionRevision'
+    || record.kind !== RUNTIME_SELECTION_KIND || !isText(record.id)
+    || typeof record.initialized !== 'boolean' || !Number.isSafeInteger(record.selectionRevision)
+    || Number(record.selectionRevision) < 1 || !isText(record.selectedAt)
+  ) throw new VscodeRuntimeDataSetError(`运行数据集选择指针无效：${selectionPath}`);
+  runtimeScopeRootForId(configurationRootPath, record.id);
+  if (!record.initialized && record.id !== 'default') {
+    throw new VscodeRuntimeDataSetError(`只有固定默认根允许首次初始化：${selectionPath}`);
+  }
+  return record as unknown as RuntimeDataSetSelection;
 }
 
-async function assignLegacyRuntimeOwner(
+async function publishSelection(
   configurationRootPath: string,
-  scope: VscodeWorkspaceRuntimeScope
-): Promise<VscodeLegacyRuntimeOwner> {
-  const workspaceRuntimeRoot = path.join(configurationRootPath, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY);
-  const ownerRoot = path.join(workspaceRuntimeRoot, VSCODE_LEGACY_RUNTIME_OWNER_DIRECTORY);
-  const candidateRoot = path.join(workspaceRuntimeRoot, `.legacy-owner-${process.pid}-${randomUUID()}`);
-  const owner: VscodeLegacyRuntimeOwner = {
-    kind: LEGACY_RUNTIME_OWNER_KIND,
-    workspaceKey: scope.key,
-    workspaceKind: scope.kind,
-    workspaceIdentity: scope.identity,
-    assignedAt: new Date().toISOString()
+  id: string,
+  initialized: boolean,
+  previous?: RuntimeDataSetSelection
+): Promise<RuntimeDataSetSelection> {
+  const selection: RuntimeDataSetSelection = {
+    kind: RUNTIME_SELECTION_KIND,
+    id,
+    initialized,
+    selectionRevision: (previous?.selectionRevision ?? 0) + 1,
+    selectedAt: new Date().toISOString()
   };
-  await fs.mkdir(workspaceRuntimeRoot, { recursive: true });
-  await fs.mkdir(candidateRoot);
+  const target = resolveVscodeRuntimeSelectionPath({ globalStoragePath: configurationRootPath });
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  await fs.mkdir(configurationRootPath, { recursive: true });
   try {
-    await fs.writeFile(
-      path.join(candidateRoot, VSCODE_LEGACY_RUNTIME_OWNER_FILE),
-      `${JSON.stringify(owner, null, 2)}\n`,
-      { encoding: 'utf8', flag: 'wx' }
-    );
+    const handle = await fs.open(temporary, 'wx');
     try {
-      await fs.rename(candidateRoot, ownerRoot);
-      return owner;
-    } catch (error) {
-      if (!isExistingPathError(error)) throw error;
+      await handle.writeFile(`${JSON.stringify(selection, null, 2)}\n`, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
+    await fs.rename(temporary, target);
+    await syncDirectoryDurably(configurationRootPath);
   } finally {
-    await fs.rm(candidateRoot, { recursive: true, force: true });
+    await fs.rm(temporary, { force: true });
   }
-  const winner = await readLegacyRuntimeOwner(configurationRootPath);
-  if (!winner) throw new Error(`Legacy Runtime owner publication did not produce ${ownerRoot}`);
-  return winner;
+  return selection;
 }
 
-async function legacyRuntimeExists(configurationRootPath: string): Promise<boolean> {
-  const legacyRuntimeRoot = resolveVscodeRuntimeDataRoot({ globalStoragePath: configurationRootPath });
-  try {
-    await fs.access(path.join(path.dirname(legacyRuntimeRoot), ROOT_BINDING_POINTER_FILE));
-    return true;
-  } catch (error) {
-    if (isMissingPathError(error)) return false;
-    throw error;
+/** Empty control/active directories are harmless; any actual entry requires an existing binding. */
+async function hasRuntimeArtifacts(controlPath: string): Promise<boolean> {
+  for (const entry of await directoryEntryNames(controlPath)) {
+    if (entry !== VSCODE_RUNTIME_ACTIVE_DIRECTORY) return true;
+    const activePath = path.join(controlPath, entry);
+    await requirePathKind(activePath, 'directory');
+    if ((await directoryEntryNames(activePath)).length > 0) return true;
   }
+  return false;
+}
+
+/** Reject links below the configured root so candidate ids cannot escape their root via aliases. */
+async function assertSafeRootPath(configurationRootPath: string, target: string): Promise<void> {
+  const relative = path.relative(configurationRootPath, target);
+  if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new VscodeRuntimeDataSetError(`运行数据集路径越过配置根：${target}`);
+  }
+  let current = configurationRootPath;
+  const segments = relative.split(path.sep).filter(Boolean);
+  for (let index = 0; index < segments.length; index += 1) {
+    current = path.join(current, segments[index]);
+    let info;
+    try { info = await fs.lstat(current); }
+    catch (error) { if (isMissingPathError(error)) return; throw error; }
+    if (info.isSymbolicLink() || (index < segments.length - 1 && !info.isDirectory())) {
+      throw new VscodeRuntimeDataSetError(`运行数据集路径包含链接或无效目录：${current}`);
+    }
+  }
+}
+
+async function requirePathKind(target: string, kind: 'file' | 'directory'): Promise<void> {
+  let info;
+  try { info = await fs.lstat(target); }
+  catch (error) { throw new VscodeRuntimeDataSetError(`运行数据集文件缺失：${target}`, error); }
+  if (!(kind === 'file' ? info.isFile() : info.isDirectory())) {
+    throw new VscodeRuntimeDataSetError(`运行数据集文件类型无效：${target}`);
+  }
+}
+
+async function readOptionalJson(filePath: string): Promise<unknown | undefined> {
+  let text: string;
+  try { text = await fs.readFile(filePath, 'utf8'); }
+  catch (error) { if (isMissingPathError(error)) return undefined; throw error; }
+  return JSON.parse(text);
 }
 
 function normalizeUri(value: unknown): string {
@@ -275,10 +525,6 @@ function normalizeUri(value: unknown): string {
 
 function isText(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
-}
-
-function isWorkspaceRuntimeScopeKind(value: unknown): value is VscodeWorkspaceRuntimeScopeKind {
-  return value === 'workspace-file' || value === 'folder' || value === 'folder-set' || value === 'empty';
 }
 
 async function directoryEntryNames(directoryPath: string): Promise<string[]> {
@@ -292,9 +538,4 @@ async function directoryEntryNames(directoryPath: string): Promise<string[]> {
 
 function isMissingPathError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
-}
-
-function isExistingPathError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code;
-  return code === 'EEXIST' || code === 'ENOTEMPTY';
 }

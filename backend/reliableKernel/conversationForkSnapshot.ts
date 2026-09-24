@@ -1,11 +1,14 @@
 import { createHash } from 'node:crypto';
 import { conversationAttachmentHandleLinkId } from './conversationAttachmentHandles';
 import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
-import { NATIVE_STEER_MESSAGE_TURN_ROLE } from './nativeSteering';
+import { NATIVE_STEER_MESSAGE_TURN_ROLE, readNativeSteeringInFlight } from './nativeSteering';
 import {
+  ConversationForkRejectedError,
   isNativeRequest,
   readForkContextLineage,
   readNativeMessageContextRevisions,
+  readVisibleTurnMessages,
+  type ForkLineageCompressionBlock,
   type NativeMessageContextRevision
 } from './conversationForkContext';
 import {
@@ -14,6 +17,7 @@ import {
   type RepositoryRead,
   type RepositoryTransactionStep
 } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface ConversationForkSnapshotPlan {
@@ -21,6 +25,31 @@ export interface ConversationForkSnapshotPlan {
   inserts: RepositoryTransactionStep[];
   copiedVisibleMessageCount: number;
 }
+
+export interface ForkContextRootShape {
+  id: string;
+  rootNodeId: string | null;
+  tailNodeId: string | null;
+  tailSegmentCount: bigint;
+  segmentCount: bigint;
+}
+
+/**
+ * The target Conversation's Context roots. Copied frozen projections are re-homed onto them: the
+ * target head when the frozen root has the same immutable shape, otherwise the copied history root.
+ */
+export interface ForkContextRoots {
+  head: ForkContextRootShape;
+  /** Source ContextSequenceRoot id -> copied target history root id. */
+  history: ReadonlyMap<string, string>;
+  /**
+   * Source pre-compression root of a kept block -> the target root holding exactly its kept part,
+   * for creation roots that are not themselves copied history.
+   */
+  creation: ReadonlyMap<string, string>;
+}
+
+const PAGE_LIMIT = 1000;
 
 interface MessageFact {
   message: DomainRow;
@@ -76,13 +105,26 @@ export async function prepareConversationForkSnapshot(
     sourceConversationId: string;
     targetConversationId: string;
     boundaryMessageSeq?: bigint;
+    /** Child forks select complete committed turns instead of a transcript prefix. */
+    selectedMessageIds?: ReadonlySet<string>;
     contextSegmentIds?: readonly string[];
     targetAgentId: string;
+    /** Target roots for copied request projections; omitted when the target re-sequences Context. */
+    contextRoots?: ForkContextRoots;
     now: string;
   }
 ): Promise<ConversationForkSnapshotPlan> {
-  if (input.boundaryMessageSeq === undefined) {
+  const contextLineage = input.contextSegmentIds
+    ? await readForkContextLineage(database, input.contextSegmentIds, input.sourceConversationId)
+    : undefined;
+  // Summary segments are shared, but each Conversation owns its CompressionBlocks: the target
+  // receives its own copy of every block reachable from the retained Context.
+  const compressionBlocks = contextLineage?.compressionBlocks ?? [];
+  if (input.boundaryMessageSeq === undefined && compressionBlocks.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
+  }
+  if (compressionBlocks.length > 0 && !input.contextRoots) {
+    throw new Error('Copying CompressionBlocks requires the target Context roots.');
   }
 
   const membershipBarrier = await database.snapshotAll(
@@ -92,11 +134,8 @@ export async function prepareConversationForkSnapshot(
       limit: 1000
     })
   );
-  const contextLineage = input.contextSegmentIds
-    ? await readForkContextLineage(database, input.contextSegmentIds)
-    : undefined;
   let boundaryMessageSeq = input.boundaryMessageSeq;
-  if (contextLineage) {
+  if (contextLineage && boundaryMessageSeq !== undefined) {
     const membershipsByMessage = new Map(membershipBarrier.snapshot.map((membership) => [
       id(membership.message_id, 'MessagePartOfConversation.message_id'), membership
     ]));
@@ -120,13 +159,14 @@ export async function prepareConversationForkSnapshot(
         throw new Error('Fork Context MessageRevision provenance is inconsistent.');
       }
       const sequence = integer(membership.message_seq, 'MessagePartOfConversation.message_seq');
-      if (sequence > boundaryMessageSeq) boundaryMessageSeq = sequence;
+      if (sequence > boundaryMessageSeq!) boundaryMessageSeq = sequence;
     }
   }
-  const prefixMemberships = membershipBarrier.snapshot
-    .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq)
+  const prefixMemberships = boundaryMessageSeq === undefined ? [] : membershipBarrier.snapshot
+    .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq!)
+    .filter((row) => !input.selectedMessageIds || input.selectedMessageIds.has(id(row.message_id, 'MessagePartOfConversation.message_id')))
     .sort(compareMessageMembership);
-  if (prefixMemberships.length === 0) {
+  if (prefixMemberships.length === 0 && compressionBlocks.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
   }
 
@@ -140,7 +180,7 @@ export async function prepareConversationForkSnapshot(
       })
     ];
   });
-  const basic = await database.snapshot(basicReads);
+  const basic = basicReads.length > 0 ? await database.snapshot(basicReads) : { snapshot: [] };
   const messageCandidates: Array<{
     message: DomainRow;
     membership: DomainRow;
@@ -155,11 +195,11 @@ export async function prepareConversationForkSnapshot(
     messageCandidates.push({ message, membership, current: currentRows[0] });
   }
 
-  const revisionBarrier = await database.snapshot(messageCandidates.map((candidate) =>
+  const revisionBarrier = messageCandidates.length > 0 ? await database.snapshot(messageCandidates.map((candidate) =>
     DOMAIN_REPOSITORIES.domain('MessageRevision').get(
       id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id')
     )
-  ));
+  )) : { snapshot: [] };
   const visibleCandidates = messageCandidates.flatMap((candidate, index) => {
     const revisionId = id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id');
     const revision = row(revisionBarrier.snapshot[index], `MessageRevision ${revisionId}`);
@@ -190,13 +230,19 @@ export async function prepareConversationForkSnapshot(
   const messageFacts: MessageFact[] = [];
   for (const [index, candidate] of visibleCandidates.entries()) {
     const offset = index * 5;
+    const messageId = id(candidate.message.id, 'Message.id');
+    const revisionId = id(candidate.revision.id, 'MessageRevision.id');
     const fact: MessageFact = {
       ...candidate,
-      attachments: rows(relationBarrier!.snapshot[offset], 'AttachmentLink fork source lookup'),
-      contextSources: rows(relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource fork source lookup'),
-      turnLinks: rows(relationBarrier!.snapshot[offset + 2], 'MessageTurnLink fork source lookup'),
+      attachments: await completeRows(database, relationBarrier!.snapshot[offset], 'AttachmentLink', {
+        message_revision_id: revisionId
+      }),
+      contextSources: await completeRows(database, relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource', {
+        source_kind: 'message_revision', source_id: revisionId
+      }),
+      turnLinks: await completeRows(database, relationBarrier!.snapshot[offset + 2], 'MessageTurnLink', { message_id: messageId }),
       requestLinks: rows(relationBarrier!.snapshot[offset + 3], 'ModelRequestMessageLink fork source lookup'),
-      toolSources: rows(relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink fork source lookup')
+      toolSources: await completeRows(database, relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink', { message_id: messageId })
     };
     if (fact.turnLinks.some((link) => link.role === NATIVE_STEER_MESSAGE_TURN_ROLE)) {
       if (!contextLineage) throw new Error('Native steering fork requires an explicit Context prefix.');
@@ -206,6 +252,11 @@ export async function prepareConversationForkSnapshot(
     }
     messageFacts.push(fact);
   }
+  // A fork owns completed history only: an active Turn's messages, requests and tool calls are
+  // still being written by the source executor and must never be silently copied.
+  requireTerminatedTurns(await getRows(database, 'Turn', unique(messageFacts.flatMap((fact) =>
+    fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))
+  ))));
 
   const requestIds = unique(messageFacts.flatMap((fact) => [
     ...fact.requestLinks.map((link) => id(link.model_request_id, 'ModelRequestMessageLink.model_request_id')),
@@ -214,8 +265,8 @@ export async function prepareConversationForkSnapshot(
   const requestRows = await getRows(database, 'ModelRequest', requestIds);
   const requestAggregates = await readRequestAggregates(database, requestRows);
   const requestIdSet = new Set(requestAggregates.map((entry) => id(entry.request.id, 'ModelRequest.id')));
-  const nativeRevisions = new Map<string, NativeMessageContextRevision[]>();
   const requestRowsById = new Map(requestRows.map((request) => [id(request.id, 'ModelRequest.id'), request]));
+  const nativeRevisions = new Map<string, NativeMessageContextRevision[]>();
   for (const fact of messageFacts) {
     if (fact.revision.role !== 'model' || !fact.requestLinks.some((link) => {
       const request = requestRowsById.get(id(link.model_request_id, 'ModelRequestMessageLink.model_request_id'));
@@ -254,14 +305,78 @@ export async function prepareConversationForkSnapshot(
   }
   const toolResultMessages = await readToolResultMessages(database, tools, input.sourceConversationId);
 
+  // Each copied block keeps the frozen authority of the Turn that compressed (a manual compression
+  // Turn owns no Message), so that Turn is copied too; a Turn still running cannot be copied.
+  const blockAuthorities = await getRows(database, 'AuthoritySnapshot', unique(compressionBlocks.map(({ block }) =>
+    id(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id')
+  )));
+  if (input.boundaryMessageSeq !== undefined) {
+    // A compressing Turn with visible transcript outside the copied history ran after the fork
+    // point: its block is not part of this history (the caller forks from the pre-compression root
+    // instead). A Turn whose transcript was deleted owns no history, like a manual compression Turn.
+    const transcriptTurnIds = new Set([...messageFacts, ...toolResultMessages].flatMap((fact) =>
+      fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))
+    ));
+    const outsideTurnIds = unique(blockAuthorities.map((snapshot) => id(snapshot.turn_id, 'AuthoritySnapshot.turn_id')))
+      .filter((turnId) => !transcriptTurnIds.has(turnId));
+    for (const turnId of outsideTurnIds) {
+      if ((await readVisibleTurnMessages(database, input.sourceConversationId, turnId)).length > 0) {
+        throw new ConversationForkRejectedError(
+          `Fork Context keeps a CompressionBlock made by Turn ${turnId} after the fork point; fork from its pre-compression history.`
+        );
+      }
+    }
+  }
   const turnIds = unique([
     ...messageFacts.flatMap((fact) => fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))),
     ...toolResultMessages.flatMap((fact) => fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))),
     ...requestAggregates.map((entry) => id(entry.request.turn_id, 'ModelRequest.turn_id')),
-    ...tools.map((entry) => id(entry.toolCall.turn_id, 'ToolCall.turn_id'))
+    ...tools.map((entry) => id(entry.toolCall.turn_id, 'ToolCall.turn_id')),
+    ...blockAuthorities.map((snapshot) => id(snapshot.turn_id, 'AuthoritySnapshot.turn_id'))
   ]);
   const turnRows = await getRows(database, 'Turn', turnIds);
+  requireTerminatedTurns(turnRows);
+  const copiedTurnIds = new Set(turnIds);
+  if ((await readNativeSteeringInFlight(database, input.sourceConversationId)).some((entry) => copiedTurnIds.has(entry.turnId))) {
+    throw new Error('Fork source history still has an unsettled native steering instruction; wait for it to settle.');
+  }
   const turnRelations = await readTurnRelations(database, turnRows);
+  // A Turn whose whole visible transcript is copied is copied with every ModelRequest it made,
+  // including compression and failed requests that own no Message, so its original termination
+  // stays valid. Output a retry, edit or delete soft-deleted keeps its Turn links but is not part of
+  // the visible transcript, so it never makes the copied Turn look interrupted.
+  const copiedMessageIds = new Set([...messageFacts, ...toolResultMessages].map((fact) => id(fact.message.id, 'Message.id')));
+  const discarded = await readDiscardedTurnOutput(
+    database,
+    [...turnRelations.values()],
+    copiedMessageIds,
+    new Set(tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')))
+  );
+  const completeTurnRequests = turnRows.flatMap((turn) => {
+    const relation = turnRelations.get(id(turn.id, 'Turn.id'))!;
+    return relation.messageLinks.every((link) => {
+      const messageId = id(link.message_id, 'MessageTurnLink.message_id');
+      return copiedMessageIds.has(messageId) || discarded.messageIds.has(messageId);
+    })
+      ? relation.modelRequests.filter((request) => !requestIdSet.has(id(request.id, 'ModelRequest.id')))
+      : [];
+  });
+  for (const aggregate of await readRequestAggregates(database, completeTurnRequests)) {
+    const requestId = id(aggregate.request.id, 'ModelRequest.id');
+    requestAggregates.push(aggregate);
+    requestIdSet.add(requestId);
+    requestIds.push(requestId);
+  }
+  // Every fork owns its history: each copied Turn owns a copy of its frozen AuthoritySnapshot and
+  // copied requests reference that copy, never a row of the source (or a deleted parent). The copy
+  // is a historical record: a child's own Turns still compile their authority from its assignment.
+  const authoritySnapshots = (await Promise.all(turnRows.map((turn) =>
+    listAllDomainRows(database, 'AuthoritySnapshot', { turn_id: id(turn.id, 'Turn.id') })
+  ))).flat();
+  const projections = input.contextRoots
+    ? await readRequestProjections(database, requestAggregates, input.contextRoots)
+    : [];
+  const blockCopies = await readCompressionBlockCopies(database, compressionBlocks, input.contextRoots);
   const fileFacts = await readFileFacts(database, tools);
   const interactionFacts = await readInteractionFacts(database, tools);
 
@@ -310,6 +425,7 @@ export async function prepareConversationForkSnapshot(
   const requestIdMap = idMap(target, 'model_request', requestIds);
   const toolIdMap = idMap(target, 'tool_call', tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')));
   const modelResultIdMap = idMap(target, 'tool_model_result', tools.map((fact) => id(fact.modelResult.id, 'ToolModelResult.id')));
+  const authorityIdMap = idMap(target, 'authority_snapshot', authoritySnapshots.map((snapshot) => id(snapshot.id, 'AuthoritySnapshot.id')));
 
   const assertions: RepositoryTransactionStep[] = [];
   const inserts: RepositoryTransactionStep[] = [];
@@ -369,20 +485,17 @@ export async function prepareConversationForkSnapshot(
     const targetTurnId = mapped(turnIdMap, sourceTurnId, 'Turn');
     assertions.push(DOMAIN_REPOSITORIES.domain('Turn').assert(sourceTurnId, {
       conversation_id: input.sourceConversationId,
-      status: turn.status
+      status: 'terminated'
     }));
     inserts.unshift(DOMAIN_REPOSITORIES.domain('Turn').insert({
       ...turn,
       id: targetTurnId,
       conversation_id: target,
-      status: 'terminated',
-      updated_at: input.now,
-      terminal_at: turn.terminal_at ?? input.now
+      updated_at: input.now
     }));
     const relation = turnRelations.get(sourceTurnId);
-    const preservesTerminalState = turn.status === 'terminated'
-      && relation !== undefined
-      && hasCompleteTurnClosure(relation, messageIdMap, requestIdMap, toolIdMap);
+    const preservesTerminalState = relation !== undefined
+      && hasCompleteTurnClosure(relation, messageIdMap, requestIdMap, toolIdMap, discarded);
     if (preservesTerminalState && relation) {
       preservedTurnIds.add(sourceTurnId);
       assertions.push(
@@ -433,8 +546,33 @@ export async function prepareConversationForkSnapshot(
     }));
   }
 
+  for (const snapshot of authoritySnapshots) {
+    const sourceSnapshotId = id(snapshot.id, 'AuthoritySnapshot.id');
+    const sourceTurnId = id(snapshot.turn_id, 'AuthoritySnapshot.turn_id');
+    assertions.push(DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').assert(sourceSnapshotId, {
+      turn_id: sourceTurnId,
+      content_object_id: snapshot.content_object_id
+    }));
+    inserts.push(DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
+      ...snapshot,
+      id: mapped(authorityIdMap, sourceSnapshotId, 'AuthoritySnapshot'),
+      turn_id: mapped(turnIdMap, sourceTurnId, 'Turn')
+    }));
+  }
   for (const aggregate of requestAggregates) {
-    addRequestAggregate(assertions, inserts, aggregate, target, turnIdMap, requestIdMap);
+    addRequestAggregate(assertions, inserts, aggregate, target, turnIdMap, requestIdMap, authorityIdMap);
+  }
+  for (const { projection, rootId } of projections) {
+    const sourceRequestId = id(projection.owner_id, 'ModelContextProjection.owner_id');
+    inserts.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
+      ...projection,
+      id: copyId(target, 'model_context_projection', id(projection.id, 'ModelContextProjection.id')),
+      owner_id: mapped(requestIdMap, sourceRequestId, 'ModelRequest'),
+      root_id: rootId
+    }));
+  }
+  for (const copy of blockCopies) {
+    addCompressionBlockCopy(assertions, inserts, copy, input.sourceConversationId, target, authorityIdMap);
   }
   for (const fact of messageFacts) {
     for (const link of fact.requestLinks) {
@@ -473,6 +611,16 @@ export async function prepareConversationForkSnapshot(
   };
 }
 
+function requireTerminatedTurns(turns: readonly DomainRow[]): void {
+  for (const turn of turns) {
+    if (turn.status !== 'terminated') {
+      throw new ConversationForkRejectedError(
+        `Fork source Turn ${String(turn.id)} has not finished; a fork copies completed turns only.`
+      );
+    }
+  }
+}
+
 async function readRequestAggregates(database: RuntimeDatabase, requests: DomainRow[]): Promise<RequestAggregate[]> {
   if (requests.length === 0) return [];
   for (const request of requests) {
@@ -500,14 +648,57 @@ async function readRequestAggregates(database: RuntimeDatabase, requests: Domain
       where: { model_request_id: id(requests[index].id, 'ModelRequest.id') }, limit: 2
     })
   ]));
-  return requests.map((request, index) => {
-    const attempts = rows(aggregateBarrier.snapshot[index * 2], 'Attempt fork source lookup')
-      .sort((left, right) => compareInteger(left.attempt_seq, right.attempt_seq));
+  const aggregates: RequestAggregate[] = [];
+  for (const [index, request] of requests.entries()) {
+    const attempts = (await completeRows(database, aggregateBarrier.snapshot[index * 2], 'Attempt', {
+      operation_id: id(operations[index].id, 'Operation.id')
+    })).sort((left, right) => compareInteger(left.attempt_seq, right.attempt_seq));
     if (attempts.length === 0) throw new Error(`Fork source ModelRequest ${String(request.id)} has no Attempt.`);
     const fences = rows(aggregateBarrier.snapshot[index * 2 + 1], 'ModelStreamFence fork source lookup');
     if (fences.length > 1) throw new Error(`Fork source ModelRequest ${String(request.id)} has multiple fences.`);
-    return { request, operation: operations[index], attempts, fence: fences[0] ?? null };
+    aggregates.push({ request, operation: operations[index], attempts, fence: fences[0] ?? null });
+  }
+  return aggregates;
+}
+
+/** Re-homes each copied request's frozen Context projection onto the equivalent target root. */
+async function readRequestProjections(
+  database: RuntimeDatabase,
+  aggregates: readonly RequestAggregate[],
+  roots: ForkContextRoots
+): Promise<Array<{ projection: DomainRow; rootId: string }>> {
+  if (aggregates.length === 0) return [];
+  const barrier = await database.snapshot(aggregates.map((aggregate) =>
+    DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+      where: { owner_kind: 'model_request', owner_id: id(aggregate.request.id, 'ModelRequest.id') }, limit: 2
+    })
+  ));
+  const projections = barrier.snapshot.flatMap((value) => {
+    const found = rows(value, 'ModelContextProjection fork source lookup');
+    if (found.length > 1) throw new Error('Fork source ModelRequest has multiple Context projections.');
+    return found;
   });
+  const sourceRoots = await getRows(database, 'ContextSequenceRoot', unique(projections.map((projection) =>
+    id(projection.root_id, 'ModelContextProjection.root_id')
+  )));
+  const rootsById = new Map(sourceRoots.map((root) => [id(root.id, 'ContextSequenceRoot.id'), root]));
+  return projections.flatMap((projection) => {
+    const rootId = mapForkContextRoot(rootsById.get(id(projection.root_id, 'ModelContextProjection.root_id'))!, roots);
+    // A frozen root outside the retained history (for example an edited-away prefix) has no
+    // equivalent in the target; that request keeps no projection instead of a foreign root.
+    return rootId ? [{ projection, rootId }] : [];
+  });
+}
+
+export function mapForkContextRoot(sourceRoot: DomainRow, roots: ForkContextRoots): string | undefined {
+  const head = roots.head;
+  if (sourceRoot.root_node_id === head.rootNodeId
+    && sourceRoot.tail_node_id === head.tailNodeId
+    && integer(sourceRoot.tail_segment_count, 'ContextSequenceRoot.tail_segment_count') === head.tailSegmentCount
+    && integer(sourceRoot.segment_count, 'ContextSequenceRoot.segment_count') === head.segmentCount) {
+    return head.id;
+  }
+  return roots.history.get(id(sourceRoot.id, 'ContextSequenceRoot.id'));
 }
 
 async function readToolFacts(
@@ -531,26 +722,27 @@ async function readToolFacts(
     ];
   });
   const barrier = await database.snapshot(reads);
-  const partial = toolCalls.map((toolCall, index) => {
+  const partial = [];
+  for (const [index, toolCall] of toolCalls.entries()) {
     const toolCallId = id(toolCall.id, 'ToolCall.id');
     const execution = one(rows(barrier.snapshot[index * 7 + 2], 'ToolExecution fork source lookup'), 'ToolExecution');
     const outcome = one(rows(barrier.snapshot[index * 7 + 3], 'ToolOutcome fork source lookup'), 'ToolOutcome');
     const modelResult = one(rows(barrier.snapshot[index * 7 + 5], 'ToolModelResult fork source lookup'), 'ToolModelResult');
     const callSources = rows(barrier.snapshot[index * 7 + 6], 'ToolCall Context source lookup');
     if (callSources.length !== 1) throw new Error(`Fork source ToolCall ${toolCallId} has no unique Context occurrence.`);
-    return {
+    partial.push({
       toolCall,
       source: sourceByTool.get(toolCallId)!,
       policy: rows(barrier.snapshot[index * 7], 'ToolCallPolicySnapshot fork source lookup')[0] ?? null,
-      events: rows(barrier.snapshot[index * 7 + 1], 'ToolCallEvent fork source lookup')
+      events: (await completeRows(database, barrier.snapshot[index * 7 + 1], 'ToolCallEvent', { tool_call_id: toolCallId }))
         .sort((left, right) => compareInteger(left.event_seq, right.event_seq)),
       execution,
       outcome,
-      artifacts: rows(barrier.snapshot[index * 7 + 4], 'ToolResultArtifact fork source lookup'),
+      artifacts: await completeRows(database, barrier.snapshot[index * 7 + 4], 'ToolResultArtifact', { tool_call_id: toolCallId }),
       modelResult,
       callSource: callSources[0]
-    };
-  });
+    });
+  }
   const resultSourceBarrier = await database.snapshot(partial.map((fact) =>
     DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
       where: {
@@ -598,7 +790,7 @@ async function readToolResultMessages(
   });
   const barrier = await database.snapshot(reads);
   const byMessage = new Map<string, MessageFact>();
-  revisions.forEach((revision, index) => {
+  for (const [index, revision] of revisions.entries()) {
     const messageId = messageIds[index];
     const message = row(barrier.snapshot[index * 5], `Tool result Message ${messageId}`);
     const membership = one(rows(barrier.snapshot[index * 5 + 1], 'Tool result membership lookup'), 'tool result membership');
@@ -609,13 +801,15 @@ async function readToolResultMessages(
       membership,
       current,
       revision,
-      attachments: rows(barrier.snapshot[index * 5 + 3], 'Tool result AttachmentLink lookup'),
+      attachments: await completeRows(database, barrier.snapshot[index * 5 + 3], 'AttachmentLink', {
+        message_revision_id: id(revision.id, 'MessageRevision.id')
+      }),
       contextSources: [],
-      turnLinks: rows(barrier.snapshot[index * 5 + 4], 'Tool result MessageTurnLink lookup'),
+      turnLinks: await completeRows(database, barrier.snapshot[index * 5 + 4], 'MessageTurnLink', { message_id: messageId }),
       requestLinks: [],
       toolSources: []
     });
-  });
+  }
   return [...byMessage.values()].sort((left, right) => compareMessageMembership(left.membership, right.membership));
 }
 
@@ -632,7 +826,8 @@ async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[]):
       DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').list({ where: { turn_id: turnId }, limit: 2 })
     ];
   }));
-  return new Map(turns.map((turn, index) => {
+  const relations = new Map<string, TurnRelations>();
+  for (const [index, turn] of turns.entries()) {
     const turnId = id(turn.id, 'Turn.id');
     const offset = index * 6;
     const terminations = rows(barrier.snapshot[offset], 'TurnTermination fork lookup');
@@ -641,38 +836,173 @@ async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[]):
     if (terminations.length > 1 || executors.length > 1 || finalOutputFences.length > 1) {
       throw new Error(`Fork source Turn ${turnId} has duplicate relations.`);
     }
-    return [turnId, {
+    relations.set(turnId, {
       termination: terminations[0] ?? null,
       executor: executors[0] ?? null,
-      messageLinks: rows(barrier.snapshot[offset + 2], 'MessageTurnLink Turn closure lookup'),
-      modelRequests: rows(barrier.snapshot[offset + 3], 'ModelRequest Turn closure lookup'),
-      toolCalls: rows(barrier.snapshot[offset + 4], 'ToolCall Turn closure lookup'),
+      messageLinks: await completeRows(database, barrier.snapshot[offset + 2], 'MessageTurnLink', { turn_id: turnId }),
+      modelRequests: await completeRows(database, barrier.snapshot[offset + 3], 'ModelRequest', { turn_id: turnId }),
+      toolCalls: await completeRows(database, barrier.snapshot[offset + 4], 'ToolCall', { turn_id: turnId }),
       finalOutputFences
-    }];
+    });
+  }
+  return relations;
+}
+
+/**
+ * Soft-deleted Messages linked to the copied Turns (output a retry, edit or delete discarded) and
+ * the ToolCalls those Messages issued. Neither is visible history, so neither is copied or required.
+ */
+async function readDiscardedTurnOutput(
+  database: RuntimeDatabase,
+  relations: readonly TurnRelations[],
+  copiedMessageIds: ReadonlySet<string>,
+  copiedToolIds: ReadonlySet<string>
+): Promise<{ messageIds: ReadonlySet<string>; toolCallIds: ReadonlySet<string> }> {
+  const uncopiedTools = relations.flatMap((relation) => relation.toolCalls)
+    .map((tool) => id(tool.id, 'ToolCall.id'))
+    .filter((toolCallId) => !copiedToolIds.has(toolCallId));
+  const toolSourceBarrier = uncopiedTools.length > 0 ? await database.snapshot(uncopiedTools.map((toolCallId) =>
+    DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({ where: { tool_call_id: toolCallId }, limit: 2 })
+  )) : { snapshot: [] };
+  const toolSourceMessages = new Map(uncopiedTools.flatMap((toolCallId, index) => {
+    const sources = rows(toolSourceBarrier.snapshot[index], 'ToolCallSourceLink discarded output lookup');
+    return sources.length === 1 ? [[toolCallId, id(sources[0].message_id, 'ToolCallSourceLink.message_id')] as const] : [];
   }));
+  const candidates = unique([
+    ...relations.flatMap((relation) => relation.messageLinks.map((link) => id(link.message_id, 'MessageTurnLink.message_id'))),
+    ...toolSourceMessages.values()
+  ].filter((messageId) => !copiedMessageIds.has(messageId)));
+  const messageIds = new Set((await getRows(database, 'Message', candidates))
+    .filter((message) => message.deleted_at !== null)
+    .map((message) => id(message.id, 'Message.id')));
+  return {
+    messageIds,
+    toolCallIds: new Set([...toolSourceMessages].flatMap(([toolCallId, messageId]) =>
+      messageIds.has(messageId) ? [toolCallId] : []
+    ))
+  };
 }
 
 function hasCompleteTurnClosure(
   relation: TurnRelations,
   messageIds: Map<string, string>,
   requestIds: Map<string, string>,
-  toolIds: Map<string, string>
+  toolIds: Map<string, string>,
+  discarded: { messageIds: ReadonlySet<string>; toolCallIds: ReadonlySet<string> }
 ): boolean {
   if (!relation.termination) return false;
-  const closureMapped = relation.messageLinks.every((link) =>
-    messageIds.has(id(link.message_id, 'MessageTurnLink.message_id'))
-  )
+  const closureMapped = relation.messageLinks.every((link) => {
+    const messageId = id(link.message_id, 'MessageTurnLink.message_id');
+    return messageIds.has(messageId) || discarded.messageIds.has(messageId);
+  })
     && relation.modelRequests.every((request) => requestIds.has(id(request.id, 'ModelRequest.id')))
-    && relation.toolCalls.every((tool) => toolIds.has(id(tool.id, 'ToolCall.id')));
+    && relation.toolCalls.every((tool) => {
+      const toolCallId = id(tool.id, 'ToolCall.id');
+      return toolIds.has(toolCallId) || discarded.toolCallIds.has(toolCallId);
+    });
   if (!closureMapped) return false;
   if (relation.termination.terminal_status !== 'completed') {
     return relation.finalOutputFences.length === 0;
   }
+  // A completed maintenance Turn (manual compression) produces no transcript and no final output.
+  if (relation.messageLinks.length === 0 && relation.finalOutputFences.length === 0) return true;
   if (relation.finalOutputFences.length !== 1) return false;
   return requestIds.has(id(
     relation.finalOutputFences[0].model_request_id,
     'TurnFinalOutputFence.model_request_id'
   ));
+}
+
+interface CompressionBlockCopy {
+  lineage: ForkLineageCompressionBlock;
+  observationLinks: DomainRow[];
+  projection: { row: DomainRow; rootId: string };
+}
+
+/**
+ * A copied block always keeps its creation projection, re-homed onto the fork's own history: its
+ * readers (fork precedence, replacement) need it. Only a block whose pre-compression root was
+ * rewritten before its end (an in-place edit) has no kept part in the fork; it is refused rather
+ * than copied without a projection.
+ */
+async function readCompressionBlockCopies(
+  database: RuntimeDatabase,
+  blocks: readonly ForkLineageCompressionBlock[],
+  roots: ForkContextRoots | undefined
+): Promise<CompressionBlockCopy[]> {
+  const copies: CompressionBlockCopy[] = [];
+  for (const lineage of blocks) {
+    const blockId = id(lineage.block.id, 'CompressionBlock.id');
+    const observationLinks = await listAllDomainRows(database, 'CompressionBlockObservationLink', { compression_block_id: blockId });
+    const sourceRootId = id(lineage.creationProjection.root_id, 'ModelContextProjection.root_id');
+    const rootId = roots
+      ? roots.creation.get(sourceRootId) ?? mapForkContextRoot((await getRows(database, 'ContextSequenceRoot', [sourceRootId]))[0], roots)
+      : undefined;
+    if (!rootId) {
+      throw new ConversationForkRejectedError(
+        `Fork Context keeps CompressionBlock ${blockId} whose history was rewritten after it; fork from its pre-compression history.`
+      );
+    }
+    copies.push({ lineage, observationLinks, projection: { row: lineage.creationProjection, rootId } });
+  }
+  return copies;
+}
+
+/**
+ * The copied block keeps its status, title, summary and chronology but belongs to the target, uses
+ * the target's frozen authority copy and registers its own source on the shared summary segment.
+ */
+function addCompressionBlockCopy(
+  assertions: RepositoryTransactionStep[],
+  inserts: RepositoryTransactionStep[],
+  copy: CompressionBlockCopy,
+  sourceConversationId: string,
+  target: string,
+  authorityIds: Map<string, string>
+): void {
+  const { block, summarySource, blockSources } = copy.lineage;
+  const sourceBlockId = id(block.id, 'CompressionBlock.id');
+  const targetBlockId = copyId(target, 'compression_block', sourceBlockId);
+  assertions.push(DOMAIN_REPOSITORIES.domain('CompressionBlock').assert(sourceBlockId, {
+    conversation_id: sourceConversationId,
+    status: block.status,
+    summary_object_id: block.summary_object_id
+  }));
+  inserts.push(DOMAIN_REPOSITORIES.domain('CompressionBlock').insert({
+    ...block,
+    id: targetBlockId,
+    conversation_id: target,
+    authority_snapshot_id: mapped(
+      authorityIds,
+      id(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id'),
+      'AuthoritySnapshot'
+    )
+  }));
+  for (const source of blockSources) {
+    inserts.push(DOMAIN_REPOSITORIES.domain('CompressionBlockSource').insert({
+      ...source,
+      id: copyId(target, 'compression_block_source', id(source.id, 'CompressionBlockSource.id')),
+      compression_block_id: targetBlockId
+    }));
+  }
+  for (const link of copy.observationLinks) {
+    inserts.push(DOMAIN_REPOSITORIES.domain('CompressionBlockObservationLink').insert({
+      ...link,
+      id: copyId(target, 'compression_block_observation_link', id(link.id, 'CompressionBlockObservationLink.id')),
+      compression_block_id: targetBlockId
+    }));
+  }
+  inserts.push(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
+    ...summarySource,
+    id: copyId(target, 'context_compression_block', id(summarySource.id, 'ContextSegmentSource.id')),
+    source_id: targetBlockId
+  }));
+  inserts.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
+    ...copy.projection.row,
+    id: copyId(target, 'model_context_projection', id(copy.projection.row.id, 'ModelContextProjection.id')),
+    owner_id: targetBlockId,
+    root_id: copy.projection.rootId
+  }));
 }
 
 async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Promise<ToolFact[]> {
@@ -696,14 +1026,16 @@ async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Prom
       DOMAIN_REPOSITORIES.domain('FileChangeDecision').list({ where: { change_set_id: setId }, limit: 2 })
     ];
   }));
-  const details = new Map(sets.map((set, index) => {
+  const details = new Map<string, { members: DomainRow[]; decision: DomainRow | null }>();
+  for (const [index, set] of sets.entries()) {
+    const setId = id(set.id, 'FileChangeSet.id');
     const decisions = rows(detailBarrier.snapshot[index * 2 + 1], 'FileChangeDecision fork lookup');
     if (decisions.length > 1) throw new Error(`FileChangeSet ${String(set.id)} has duplicate decisions.`);
-    return [id(set.id, 'FileChangeSet.id'), {
-      members: rows(detailBarrier.snapshot[index * 2], 'FileChangeSetMember fork lookup'),
+    details.set(setId, {
+      members: await completeRows(database, detailBarrier.snapshot[index * 2], 'FileChangeSetMember', { change_set_id: setId }),
       decision: decisions[0] ?? null
-    }];
-  }));
+    });
+  }
   return withSets.map((tool) => {
     const detail = tool.fileChangeSet ? details.get(id(tool.fileChangeSet.id, 'FileChangeSet.id')) : undefined;
     return { ...tool, fileMembers: detail?.members ?? [], fileDecision: detail?.decision ?? null };
@@ -722,7 +1054,9 @@ async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[]
       where: { tool_call_id: id(tool.toolCall.id, 'ToolCall.id') }, limit: 1000
     })
   ));
-  const links = linkBarrier.snapshot.flatMap((value) => rows(value, 'InteractionToolCallLink fork lookup'));
+  const links = (await Promise.all(linkBarrier.snapshot.map((value, index) => completeRows(
+    database, value, 'InteractionToolCallLink', { tool_call_id: id(tools[index].toolCall.id, 'ToolCall.id') }
+  )))).flat();
   const requestIds = unique(links.map((link) => id(link.request_id, 'InteractionToolCallLink.request_id')));
   if (requestIds.length === 0) return { requests: [], owners: [], links, responses: [] };
   const requests = await getRows(database, 'InteractionRequest', requestIds);
@@ -825,7 +1159,8 @@ function addRequestAggregate(
   aggregate: RequestAggregate,
   target: string,
   turnIds: Map<string, string>,
-  requestIds: Map<string, string>
+  requestIds: Map<string, string>,
+  authorityIds: Map<string, string>
 ): void {
   const sourceRequestId = id(aggregate.request.id, 'ModelRequest.id');
   const targetRequestId = mapped(requestIds, sourceRequestId, 'ModelRequest');
@@ -837,7 +1172,12 @@ function addRequestAggregate(
   inserts.push(DOMAIN_REPOSITORIES.domain('ModelRequest').insertHistoricalCopy({
     ...aggregate.request,
     id: targetRequestId,
-    turn_id: mapped(turnIds, id(aggregate.request.turn_id, 'ModelRequest.turn_id'), 'Turn')
+    turn_id: mapped(turnIds, id(aggregate.request.turn_id, 'ModelRequest.turn_id'), 'Turn'),
+    authority_snapshot_id: mapped(
+      authorityIds,
+      id(aggregate.request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
+      'AuthoritySnapshot'
+    )
   }));
   const sourceOperationId = id(aggregate.operation.id, 'Operation.id');
   const targetOperationId = copyId(target, 'operation', sourceOperationId);
@@ -998,6 +1338,17 @@ function addInteractionCopies(
   }));
 }
 
+/** A batched first page equal to the page limit may be truncated; re-read that set completely. */
+async function completeRows(
+  database: RuntimeDatabase,
+  firstPage: unknown,
+  domain: string,
+  where: DomainRow
+): Promise<DomainRow[]> {
+  const found = rows(firstPage, `${domain} fork source lookup`);
+  return found.length < PAGE_LIMIT ? found : listAllDomainRows(database, domain, where);
+}
+
 async function getRows(database: RuntimeDatabase, domain: string, ids: string[]): Promise<DomainRow[]> {
   if (ids.length === 0) return [];
   const barrier = await database.snapshot(ids.map((rowId) => DOMAIN_REPOSITORIES.domain(domain).get(rowId)));
@@ -1076,4 +1427,3 @@ function compareMessageMembership(left: DomainRow, right: DomainRow): number {
     || id(left.message_id, 'MessagePartOfConversation.message_id')
       .localeCompare(id(right.message_id, 'MessagePartOfConversation.message_id'));
 }
-

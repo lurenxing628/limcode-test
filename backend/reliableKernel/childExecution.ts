@@ -6,6 +6,10 @@ import {
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { normalizeChildForkTurns, prepareChildContextFork, type ChildForkTurns } from './childContextFork';
+import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { readConversationChildHandles } from './conversationChildHandles';
+import { prepareCollaborationCapacity, CollaborationMembershipChangedError } from './collaborationCapacity';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   parseInputTurnIntentEnvelopeText,
@@ -32,7 +36,15 @@ import {
   type ToolTerminalResult
 } from './effectControlPlane';
 import { frozenModelSelection, frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import { childThinkingInheritanceFromAuthority, childThinkingOverrideForSpawn } from './childThinkingInheritance';
+import type { SessionThinkingOverride } from '../../shared/protocol';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import {
+  frozenSkillPolicyDocument,
+  frozenToolPolicyDocument,
+  readChildExecutionBoundary,
+  type ChildExecutionBoundary
+} from './childExecutionBoundary';
 import { canonicalPlainJson } from './plainJson';
 import {
   isTransactionAssertionFailure,
@@ -58,6 +70,7 @@ import { RuntimeDatabase } from './runtimeDatabase';
 import {
   normalizeTurnModelOverride,
   normalizeCompiledTurnAuthority,
+  type TurnAuthorityCompilationRequest,
   type TurnAuthorityCompiler,
   type TurnModelOverride
 } from './turnControlPlane';
@@ -68,6 +81,13 @@ export const CHILD_INTERRUPTION_RECOVERY_REASON =
 
 export type ChildCompletionPolicy = 'wait_for_answer' | 'background';
 export type ChildSpawnSourceSettlement = 'child_handle' | 'external';
+/**
+ * `parent_turn`: a child the model starts only narrows — every Turn stays within the tools, skills
+ * and work environments the parent Turn froze. `executor_agent`: the user approved a Plan to run in
+ * a new conversation, so the child runs with its executor Agent's own settings (global and its own
+ * scopes still apply) and only starts in the planning Turn's working directory.
+ */
+export type ChildSpawnAuthorityBound = 'parent_turn' | 'executor_agent';
 export type ChildSendMode = 'queue_next_turn' | 'interrupt_current_turn';
 
 export interface ChildExecutionSpawnCommand {
@@ -76,12 +96,16 @@ export interface ChildExecutionSpawnCommand {
   /** Parent Turn's frozen effective model; child-local profiles still have higher precedence. */
   modelFallback: TurnModelOverride;
   prompt: string;
+  /** Inherit only committed completed turns; the new prompt remains a separate child assignment. */
+  forkTurns?: ChildForkTurns;
   completionPolicy: ChildCompletionPolicy;
   /**
    * `child_handle` owns and settles a run_agent ToolCall. `external` only anchors lineage to a
    * ToolCall whose interaction control plane remains its sole settlement owner.
    */
   sourceSettlement: ChildSpawnSourceSettlement;
+  /** Defaults to `parent_turn`; `executor_agent` is only for a user-approved Plan (external settlement). */
+  authorityBound?: ChildSpawnAuthorityBound;
   waitDeadlineAt?: string;
   childConversationId?: string;
   title?: string;
@@ -329,12 +353,33 @@ export class ChildExecutionControlPlane {
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
   }
 
+  /** Model-facing task observations are reconstructed from committed lineage and source facts. */
+  public readConversationTaskProjection(conversationId: string) {
+    return readConversationChildTaskProjection(this.database, this.contentStore,
+      requirePhaseFId(conversationId, 'conversationId'));
+  }
+
+  /** Persistent child references frozen in the Conversation's request history, including a fork's copies. */
+  public readConversationChildHandles(conversationId: string) {
+    return readConversationChildHandles(this.database, this.contentStore,
+      requirePhaseFId(conversationId, 'conversationId'));
+  }
+
   /**
    * Child Conversation, stable lineage/links, first Turn, bridge and spawn Effect facts are one
    * transaction. The CAS request is published first and may remain as an unreferenced orphan if the
    * transaction fails.
    */
   public async spawn(commandInput: ChildExecutionSpawnCommand): Promise<ChildExecutionSpawnResult> {
+    for (let retry = 0; ; retry += 1) {
+      try { return await this.spawnWithCapacity(commandInput); }
+      catch (error) {
+        if (retry >= 15 || (!isTransactionAssertionFailure(error) && !(error instanceof CollaborationMembershipChangedError))) throw error;
+      }
+    }
+  }
+
+  private async spawnWithCapacity(commandInput: ChildExecutionSpawnCommand): Promise<ChildExecutionSpawnResult> {
     const command = normalizeSpawnCommand(commandInput);
     const ids = spawnIds(command);
     const replay = await this.findSpawnReplay(command, ids);
@@ -356,13 +401,20 @@ export class ChildExecutionControlPlane {
       throw new Error(`Source ToolCall cannot spawn from ${String(parent.toolCall.status)}/${String(parent.toolExecution.status)}.`);
     }
 
+    const capacitySteps = await prepareCollaborationCapacity(
+      this.database, this.contentStore, String(parent.conversation.id), String(parent.turn.id)
+    );
+
+    if (command.authorityBound === 'executor_agent' && parent.toolCall.tool_name !== 'submit_plan') {
+      throw new Error('Only a Plan the user approved may start a child with its executor Agent own settings.');
+    }
     const workspace = await projectFolderForConversation(
       this.database,
       requirePhaseFId(parent.conversation.id, 'Conversation.id')
     );
-    const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
-      requirePhaseFId(parent.turn.id, 'parent Turn.id')
-    );
+    const parentTurnId = requirePhaseFId(parent.turn.id, 'parent Turn.id');
+    const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(parentTurnId);
+    const inheritedThinkingOverride = await this.frozenChildThinkingOverrideForTurn(parentTurnId);
     const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
       conversationId: ids.childConversationId,
       turnId: ids.childTurnId,
@@ -370,7 +422,14 @@ export class ChildExecutionControlPlane {
       intentKind: 'input',
       modelFallback: command.modelFallback,
       ...(workspace ? { workspace } : {}),
-      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {})
+      ...(command.authorityBound === 'executor_agent'
+        // The user approved this delegation: no planning-Turn bound, only its working directory.
+        ? (inheritedBoundary?.defaultWorkEnvironmentId
+            ? { preferredWorkEnvironmentId: inheritedBoundary.defaultWorkEnvironmentId }
+            : {})
+        // The child's tools and skills never exceed the parent Turn's; later Turns keep this same bound.
+        : await this.parentTurnBound(parentTurnId, inheritedBoundary)),
+      ...(inheritedThinkingOverride ? { inheritedThinkingOverride } : {})
     }), ids.childTurnId, command.childAgentId);
     const modelSelection = frozenModelSelection(JSON.parse(asUtf8Text(
       compiled.authoritySnapshot.content,
@@ -389,15 +448,24 @@ export class ChildExecutionControlPlane {
         compiled.authoritySnapshot.contentType
       )
     ]);
+    const now = this.timestamp();
+    const inheritedContext = await prepareChildContextFork(this.database, this.contentStore, {
+      sourceConversationId: requirePhaseFId(parent.conversation.id, 'Conversation.id'),
+      targetConversationId: ids.childConversationId,
+      targetAgentId: command.childAgentId,
+      forkTurns: command.forkTurns,
+      now
+    });
     const promptContext = this.contextSequence.prepareFreshConversationMessageMutation({
       conversationId: ids.childConversationId,
       messageRevisionId: ids.childMessageRevisionId,
       contentObjectId: promptContent.metadata.id,
       contentByteLength: promptContent.metadata.byte_length,
-      contentEstimatedTokens: estimateStoredMessageContentTokens(command.prompt, 'text/plain')
+      contentEstimatedTokens: estimateStoredMessageContentTokens(command.prompt, 'text/plain'),
+      inheritedSegments: inheritedContext.segments
     });
-    const now = this.timestamp();
     const steps: RepositoryTransactionStep[] = [
+      ...capacitySteps,
       DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
         id: ids.commandReceiptId,
         source_kind: 'internal',
@@ -445,6 +513,7 @@ export class ChildExecutionControlPlane {
         created_at: now,
         updated_at: now
       }),
+      ...inheritedContext.steps,
       ...(parent.projectLink
         ? [conversationProjectLinkInsertStep({
             conversationId: ids.childConversationId,
@@ -649,6 +718,23 @@ export class ChildExecutionControlPlane {
     return frozenModelSelection(frozen.document);
   }
 
+  /**
+   * The thinking override a child spawned from this (parent) Turn inherits: present only when the parent
+   * conversation had “child Agents use this thinking strength” on when the Turn was frozen.
+   */
+  public async frozenChildThinkingOverrideForTurn(turnIdInput: string): Promise<SessionThinkingOverride | undefined> {
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const snapshots = await this.listRows('AuthoritySnapshot', { turn_id: turnId }, 2);
+    if (snapshots.length !== 1) throw new Error(`Turn ${turnId} must have exactly one AuthoritySnapshot.`);
+    const frozen = await readFrozenTurnAuthority(
+      this.database,
+      this.contentStore,
+      requirePhaseFId(snapshots[0].id, 'AuthoritySnapshot.id'),
+      turnId
+    );
+    return childThinkingOverrideForSpawn(childThinkingInheritanceFromAuthority(frozen.document));
+  }
+
   /** Reads the immutable work-environment boundary frozen for one Turn; absent on legacy snapshots. */
   public async frozenWorkEnvironmentPolicyForTurn(
     turnIdInput: string
@@ -663,6 +749,36 @@ export class ChildExecutionControlPlane {
       turnId
     );
     return frozenWorkEnvironmentPolicy(frozen.document);
+  }
+
+  private async parentTurnBound(
+    parentTurnId: string,
+    inheritedBoundary: FrozenWorkEnvironmentBoundaryPolicy | undefined
+  ): Promise<Pick<TurnAuthorityCompilationRequest,
+    'inheritedWorkEnvironmentPolicy' | 'inheritedToolPolicy' | 'inheritedSkillPolicy'>> {
+    const inherited = await this.frozenChildBoundaryForTurn(parentTurnId);
+    return {
+      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {}),
+      inheritedToolPolicy: inherited.toolPolicy,
+      inheritedSkillPolicy: inherited.skillPolicy
+    };
+  }
+
+  /** Reads the tool and skill settings frozen for one Turn, as a child spawned by it inherits them. */
+  public async frozenChildBoundaryForTurn(turnIdInput: string): Promise<Required<ChildExecutionBoundary>> {
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const snapshots = await this.listRows('AuthoritySnapshot', { turn_id: turnId }, 2);
+    if (snapshots.length !== 1) throw new Error(`Turn ${turnId} must have exactly one AuthoritySnapshot.`);
+    const frozen = await readFrozenTurnAuthority(
+      this.database,
+      this.contentStore,
+      requirePhaseFId(snapshots[0].id, 'AuthoritySnapshot.id'),
+      turnId
+    );
+    return {
+      toolPolicy: frozenToolPolicyDocument(frozen.document),
+      skillPolicy: frozenSkillPolicyDocument(frozen.document)
+    };
   }
 
   public recordSpawnReceipt(input: {
@@ -825,13 +941,48 @@ export class ChildExecutionControlPlane {
       try {
         await this.effects.claimEffectDispatch(effectIntentId);
       } catch (error) {
-        // Parent cancellation and dispatch race through the same exact EffectIntent row.  If the
-        // cancellation won, the refreshed durable state below is authoritative; a still-pending
-        // state means the parent is not currently dispatchable and must be retried by the level
-        // scheduler after its recovery owner is established.
-        facts = await this.readSpawnIntentFacts(effectIntentId);
-        if (facts.intent.dispatch_state === 'pending') return spawnRecoveryResult(facts, false);
-        if (facts.intent.dispatch_state !== 'cancelled_before_dispatch') throw error;
+        // The normal dispatcher can commit between claimEffectDispatch's separate Intent and
+        // Attempt reads. Reconcile an exact durable winner, including an already-written receipt;
+        // an unrelated identity or inconsistent state must never excuse the original claim error.
+        const raced = await this.database.snapshot([
+          DOMAIN_REPOSITORIES.domain('EffectIntent').get(effectIntentId),
+          DOMAIN_REPOSITORIES.domain('Attempt').get(requirePhaseFId(facts.attempt.id, 'Attempt.id')),
+          DOMAIN_REPOSITORIES.domain('Operation').get(requirePhaseFId(facts.operation.id, 'Operation.id')),
+          DOMAIN_REPOSITORIES.domain('EffectReceipt').list({ where: { attempt_id: facts.attempt.id }, limit: 2 })
+        ]);
+        const intent = requireRow(raced.snapshot[0], `EffectIntent ${effectIntentId}`);
+        const attempt = requireRow(raced.snapshot[1], `Attempt ${String(facts.attempt.id)}`);
+        const operation = requireRow(raced.snapshot[2], `Operation ${String(facts.operation.id)}`);
+        const receipts = requireRows(raced.snapshot[3], 'EffectReceipt spawn claim race lookup');
+        if (intent.id !== facts.intent.id || intent.effect_kind !== 'subagent_spawn'
+          || intent.attempt_id !== facts.attempt.id || intent.request_object_id !== facts.intent.request_object_id
+          || attempt.id !== facts.attempt.id || attempt.operation_id !== facts.operation.id
+          || attempt.attempt_seq !== facts.attempt.attempt_seq
+          || operation.id !== facts.operation.id || operation.owner_kind !== 'child_execution'
+          || operation.owner_id !== facts.childExecution.id || operation.tool_call_id !== facts.operation.tool_call_id
+          || operation.operation_seq !== facts.operation.operation_seq) throw error;
+        const pending = intent.dispatch_state === 'pending'
+          && attempt.status === 'pending' && operation.status === 'pending' && receipts.length === 0;
+        const cancelled = intent.dispatch_state === 'cancelled_before_dispatch'
+          && attempt.status === 'cancelled' && operation.status === 'cancelled' && receipts.length === 0;
+        const dispatched = intent.dispatch_state === 'dispatched'
+          && attempt.status === 'dispatched' && operation.status === 'executing' && receipts.length === 0;
+        const receipt = receipts.length === 1 ? receipts[0] : undefined;
+        const receiptWritten = intent.dispatch_state === 'receipt_written' && receipt !== undefined
+          && receipt.attempt_id === attempt.id && receipt.effect_kind === 'subagent_spawn'
+          && receipt.operation_id === operation.id && receipt.tool_call_id === operation.tool_call_id
+          && ['succeeded', 'failed', 'cancelled', 'conflict', 'outcome_unknown'].includes(String(receipt.outcome))
+          && ((attempt.status === 'dispatched' && operation.status === 'executing')
+            || (attempt.status === receipt.outcome
+              && (operation.status === receipt.outcome
+                || (receipt.outcome === 'succeeded'
+                  && (operation.status === 'waiting_answer' || TERMINAL_OPERATION_STATES.has(String(operation.status)))))));
+        if (!pending && !cancelled && !dispatched && !receiptWritten) throw error;
+        if (pending) {
+          // Parent ownership can temporarily prevent dispatch without changing the spawn facts.
+          // Leave that exact pending frontier for the level-triggered recovery scheduler.
+          return spawnRecoveryResult(await this.readSpawnIntentFacts(effectIntentId), false);
+        }
       }
       facts = await this.readSpawnIntentFacts(effectIntentId);
     }
@@ -897,6 +1048,11 @@ export class ChildExecutionControlPlane {
     if (parent.turn.status !== ACTIVE_TURN || parent.termination !== null || !parent.lease) {
       throw new Error('Child continuation requires an active parent Turn and ExecutionLease.');
     }
+    const originalParentTurn = await this.requireExisting('Turn',
+      requirePhaseFId(snapshot.parentLink.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id'));
+    if (originalParentTurn.conversation_id !== parent.conversation.id) {
+      throw new Error('Child continuation is outside the calling Conversation parent lineage.');
+    }
     if (parent.toolCall.status !== 'pending' || parent.toolExecution.status !== 'pending') {
       throw new Error('Child continuation source ToolCall is no longer pending.');
     }
@@ -956,6 +1112,10 @@ export class ChildExecutionControlPlane {
       DOMAIN_REPOSITORIES.domain('ToolExecution').assert(parent.toolExecution.id as string, { status: 'pending' }),
       DOMAIN_REPOSITORIES.domain('ChildExecution').assert(command.childExecutionId, {
         status: snapshot.childExecution.status
+      }),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assert(snapshot.parentLink.id as string, {
+        child_execution_id: command.childExecutionId,
+        parent_turn_id: originalParentTurn.id
       }),
       ...(currentTurn && currentActiveLink ? [
         DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(currentActiveLink.id as string, {
@@ -1320,6 +1480,9 @@ export class ChildExecutionControlPlane {
     if (agentLinks.length !== 1) throw new Error('Child Conversation must have one default Agent link.');
     const executorAgentId = requirePhaseFId(agentLinks[0].agent_id, 'AgentConversationLink.agent_id');
     const childConversationId = requirePhaseFId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
+    const capacitySteps = await prepareCollaborationCapacity(
+      this.database, this.contentStore, childConversationId, String(previousTurn.id)
+    );
     const intentContentObjectId = requirePhaseFId(
       revisions[0].content_object_id,
       'TurnIntentRevision.content_object_id'
@@ -1352,6 +1515,11 @@ export class ChildExecutionControlPlane {
     const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
       requirePhaseFId(previousTurn.id, 'previous Turn.id')
     );
+    const inherited = await readChildExecutionBoundary(
+      this.database,
+      this.contentStore,
+      requirePhaseFId(command.childExecutionId, 'childExecutionId')
+    );
     const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
       conversationId: childConversationId,
       turnId: ids.turnId,
@@ -1359,7 +1527,9 @@ export class ChildExecutionControlPlane {
       intentKind: invisibleRuntimeDelivery ? 'runtime_continuation' : 'continuation',
       sourceTurnId: requirePhaseFId(previousTurn.id, 'previous Turn.id'),
       ...(workspace ? { workspace } : {}),
-      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {})
+      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {}),
+      ...(inherited.toolPolicy ? { inheritedToolPolicy: inherited.toolPolicy } : {}),
+      ...(inherited.skillPolicy ? { inheritedSkillPolicy: inherited.skillPolicy } : {})
     }), ids.turnId, executorAgentId);
     const authorityContent = await this.contentStore.prepare(
       this.database,
@@ -1421,6 +1591,7 @@ export class ChildExecutionControlPlane {
           updated_at: now
         });
     const steps: RepositoryTransactionStep[] = [
+      ...capacitySteps,
       DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
         id: ids.commandReceiptId,
         source_kind: 'internal',
@@ -2985,6 +3156,14 @@ export class ChildExecutionControlPlane {
       canonicalPlainJson(spawnRequestPayload(command, ids)),
       SUBAGENT_SPAWN_CONTENT_TYPE
     ).id;
+    // A Plan delegation made before executor_agent existed was stored without authorityBound; replaying
+    // it after the upgrade returns that child as it was instead of reporting different facts.
+    const legacyRequestObjectId = !preparedRequest && command.authorityBound === 'executor_agent'
+      ? this.contentStore.identity(
+        canonicalPlainJson(spawnRequestPayload({ ...command, authorityBound: 'parent_turn' }, ids)),
+        SUBAGENT_SPAWN_CONTENT_TYPE
+      ).id
+      : undefined;
     const expectedPromptObjectId = this.contentStore.identity(command.prompt, 'text/plain').id;
     const parentTurn = await this.requireExisting(
       'Turn',
@@ -3023,7 +3202,7 @@ export class ChildExecutionControlPlane {
       || attempt.operation_id !== ids.operationId
       || intent.attempt_id !== ids.attemptId
       || intent.effect_kind !== 'subagent_spawn'
-      || intent.request_object_id !== expectedRequestObjectId
+      || (intent.request_object_id !== expectedRequestObjectId && intent.request_object_id !== legacyRequestObjectId)
       || authority.turn_id !== ids.childTurnId
       || promptRevision.message_id !== ids.childMessageId
       || promptRevision.role !== 'user'
@@ -3632,6 +3811,7 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   const childAgentId = requirePhaseFId(command.childAgentId, 'childAgentId');
   const completionPolicy = requireCompletionPolicy(command.completionPolicy);
   const sourceSettlement = requireSpawnSourceSettlement(command.sourceSettlement);
+  const authorityBound = requireSpawnAuthorityBound(command.authorityBound ?? 'parent_turn');
   const waitDeadlineAt = command.waitDeadlineAt === undefined
     ? undefined
     : requireIsoTimestamp(command.waitDeadlineAt, 'waitDeadlineAt');
@@ -3644,13 +3824,18 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   if (sourceSettlement === 'external' && completionPolicy !== 'background') {
     throw new TypeError('external source settlement requires background completion.');
   }
+  if (authorityBound === 'executor_agent' && sourceSettlement !== 'external') {
+    throw new TypeError('executor_agent authority requires an externally settled source (a user-approved Plan).');
+  }
   return {
     sourceToolCallId,
     childAgentId,
     modelFallback: normalizeTurnModelOverride(command.modelFallback),
     prompt: requirePhaseFText(command.prompt, 'prompt'),
+    forkTurns: normalizeChildForkTurns(command.forkTurns),
     completionPolicy,
     sourceSettlement,
+    authorityBound,
     ...(waitDeadlineAt ? { waitDeadlineAt } : {}),
     ...(optionalPhaseFId(command.childConversationId, 'childConversationId')
       ? { childConversationId: optionalPhaseFId(command.childConversationId, 'childConversationId')! }
@@ -3808,9 +3993,11 @@ function spawnRequestPayload(
     inputMessageRevisionId: ids.childMessageRevisionId,
     completionPolicy: command.completionPolicy,
     sourceSettlement: command.sourceSettlement,
+    ...(command.authorityBound === 'executor_agent' ? { authorityBound: command.authorityBound } : {}),
     waitDeadlineAt: command.waitDeadlineAt ?? null,
     title: command.title,
-    prompt: command.prompt
+    prompt: command.prompt,
+    forkTurns: command.forkTurns
   };
 }
 
@@ -3999,6 +4186,13 @@ function requireCompletionPolicy(value: unknown): ChildCompletionPolicy {
 function requireSpawnSourceSettlement(value: unknown): ChildSpawnSourceSettlement {
   if (value !== 'child_handle' && value !== 'external') {
     throw new TypeError('sourceSettlement must be child_handle or external.');
+  }
+  return value;
+}
+
+function requireSpawnAuthorityBound(value: unknown): ChildSpawnAuthorityBound {
+  if (value !== 'parent_turn' && value !== 'executor_agent') {
+    throw new TypeError('authorityBound must be parent_turn or executor_agent.');
   }
   return value;
 }

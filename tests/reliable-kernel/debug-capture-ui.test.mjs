@@ -1,14 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import path from 'node:path';
 import { createRequire } from 'node:module';
-import { createServer } from 'vite';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 const require = createRequire(import.meta.url);
 const { normalizeDebugCaptureSettings } = require('../../dist/extension/shared/debugCapture.js');
 const context = { conversationId: 'conversation-a', modelRequestId: 'request-a', attemptSeq: '1', socketGeneration: '1' };
 const active = { runId: 'capture-a', status: 'recording', target: { scope: 'conversation', conversationId: 'conversation-a' } };
 async function modules(t) {
-  const server = await createServer({ configFile: path.resolve('vite.config.ts'), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
+  const server = await createWebviewSsrServer();
   t.after(() => server.close());
   const trace = await server.ssrLoadModule('/src/domain/debugCaptureTrace.ts');
   const model = await server.ssrLoadModule('/src/domain/reliableTransientModel.ts');

@@ -8,6 +8,7 @@ export const EXTENSION_COMMAND_IDS = {
   openPanel: 'limcode-test.openPanel',
   revealGlobalStorage: 'limcode-test.revealGlobalStorage',
   inspectReliability: 'limcode-test.inspectReliability',
+  manageRuntimeDataSets: 'limcode-test.manageRuntimeDataSets',
   resetDevelopmentData: 'limcode-test.resetDevelopmentData',
   applyLiveDiffPreview: 'limcode-test.applyLiveDiffPreview'
 } as const;

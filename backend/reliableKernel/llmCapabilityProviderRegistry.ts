@@ -3,11 +3,14 @@ import type {
   LlmProviderConfigRecord,
   LlmProviderKind
 } from '../../shared/protocol';
+import { canonicalLlmProviderKind } from '../../shared/protocol';
 import {
   createLlmProviderCapability,
+  probeLlmProviderNativeCompaction,
   type LlmProviderOptions,
   type LlmProviderTransportTrace
 } from '../capabilities/llmProvider';
+import { probeOpenAICompatibleThinking } from '../capabilities/openAICompatibleThinkingProbe';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { LlmCapabilityFullRequestAdapter } from './llmCapabilityProviderAdapter';
 import type { FullRequestProviderAdapter } from './modelProviderControlPlane';
@@ -89,6 +92,40 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
     return this.capability.listModels(config);
   }
 
+  private readonly nativeProbes = new Map<string, ReturnType<typeof probeLlmProviderNativeCompaction>>();
+
+  public verifyNativeCompaction(config: LlmProviderConfigRecord) {
+    this.requireOpen();
+    const key = JSON.stringify([config.id, config.baseUrl, config.model, config.openaiResponsesTransport, config.updatedAt]);
+    const pending = this.nativeProbes.get(key);
+    if (pending) return pending;
+    const task = probeLlmProviderNativeCompaction(config, { ...this.options, settings: async () => config })
+      .finally(() => { if (this.nativeProbes.get(key) === task) this.nativeProbes.delete(key); });
+    this.nativeProbes.set(key, task);
+    return task;
+  }
+
+  private readonly thinkingProbes = new Map<string, ReturnType<typeof probeOpenAICompatibleThinking>>();
+
+  /**
+   * “测试这个模型”（OpenAI 兼容思考参数）：按模型专属配置叠加请求头后测试 `config.model`；
+   * 渠道、接口地址、模型与修改时间都相同的并发测试合并成一次。
+   */
+  public probeOpenAICompatibleThinking(config: LlmProviderConfigRecord) {
+    this.requireOpen();
+    const key = JSON.stringify([config.id, config.baseUrl, config.model, config.updatedAt]);
+    const pending = this.thinkingProbes.get(key);
+    if (pending) return pending;
+    const task = Promise.resolve()
+      .then(() => probeOpenAICompatibleThinking(applyFrozenModelProviderConfig(config, config.model), {
+        ...(this.options.proxy ? { proxy: this.options.proxy } : {}),
+        ...(this.options.headers ? { headers: this.options.headers } : {})
+      }))
+      .finally(() => { if (this.thinkingProbes.get(key) === task) this.thinkingProbes.delete(key); });
+    this.thinkingProbes.set(key, task);
+    return task;
+  }
+
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -115,9 +152,11 @@ export function applyFrozenModelProviderConfig(
   if (!known) throw new Error(`Provider ${config.id} does not contain frozen model ${modelId}.`);
 
   const modelConfig = config.modelConfigs.find((candidate) => candidate.modelId.trim() === modelId);
+  // 历史回合冻结的 'deepseek' 按迁移后的 OpenAI 兼容渠道发送。
+  const frozenProvider = canonicalLlmProviderKind(providerOverride);
   const resolved: LlmProviderConfigRecord = {
     ...config,
-    ...(providerOverride ? { provider: providerOverride } : {}),
+    ...(frozenProvider ? { provider: frozenProvider } : {}),
     model: modelId,
     systemPromptPrefix: frozenSystemPromptPrefix
       ?? modelConfig?.systemPromptPrefix
@@ -141,7 +180,10 @@ export function applyFrozenModelProviderConfig(
       // nativeResponses 遵循与其他高级配置一致的模型级整体替代语义。
       ...(modelConfig.nativeResponses === undefined
         ? { nativeResponses: undefined }
-        : { nativeResponses: { ...modelConfig.nativeResponses } })
+        : { nativeResponses: { ...modelConfig.nativeResponses } }),
+      // 思考参数写法：模型级缺省时跟随渠道。
+      ...(modelConfig.openaiCompatibleThinkingFormat
+        ? { openaiCompatibleThinkingFormat: modelConfig.openaiCompatibleThinkingFormat } : {})
     } : {}),
     // Reliable retry identity lives in ModelRequest/Attempt; the capability must not retry invisibly.
     retryOnError: false,

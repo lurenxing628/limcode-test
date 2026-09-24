@@ -7,10 +7,7 @@ import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { readJson, readJsonStrict, writeJson } from './json';
 import { sortableName } from './naming';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
-import {
-  isRetryableWindowsLockGenerationRenameError,
-  isRetryableWindowsLockPublicationRenameError
-} from './lockRenameErrors';
+import { isRetryableWindowsLockPublicationRenameError } from './lockRenameErrors';
 import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
 
 interface RecordsIndexFile {
@@ -73,9 +70,12 @@ const RECORD_STORE_LOCK_STALE_MS = 30_000;
 const RECORD_STORE_LOCK_WAIT_MS = 30_000;
 const RECORD_STORE_LOCK_INVALID_WAIT_MS = 100;
 const RECORD_STORE_LOCK_OWNER_FILE = 'owner.json';
-const WINDOWS_LOCK_RELEASE_RENAME_ATTEMPTS = 100;
-const WINDOWS_LOCK_RELEASE_RENAME_DELAY_MS = 10;
+const RECORD_STORE_LOCK_FS_ATTEMPTS = 100;
+const RECORD_STORE_LOCK_FS_DELAY_MS = 10;
 const recordStoreMutationQueues = new Map<string, Promise<void>>();
+// Only actions that have settled can enter this map. The next queued operation may finish
+// releasing that exact owner; a live PID or an old timestamp alone never grants this right.
+const recordStorePendingReleases = new Map<string, RecordStoreLockMetadata>();
 
 interface RecordStoreLockMetadata {
   ownerToken: string;
@@ -493,6 +493,11 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
 
   const indexPath = nodeFsStoragePath(indexUri);
   const lockPath = `${indexPath}.lock`;
+  const pendingRelease = recordStorePendingReleases.get(lockPath);
+  if (pendingRelease) {
+    await releaseRecordStoreLock(lockPath, pendingRelease, true);
+    recordStorePendingReleases.delete(lockPath);
+  }
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + RECORD_STORE_LOCK_WAIT_MS;
   const metadata: RecordStoreLockMetadata = {
@@ -502,17 +507,39 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
     indexPath: path.resolve(indexPath)
   };
 
+  let filesystemFailures = 0;
   for (;;) {
     try {
       await createRecordStoreLockDirectory(lockPath, metadata);
       break;
     } catch (error) {
-      if (
-        !isAlreadyExistsError(error)
-        && !isRetryableWindowsLockPublicationRenameError(error, lockPath, process.platform)
-      ) throw error;
-      if (await recoverExistingRecordStoreLock(lockPath, metadata.indexPath) === 'recovered') continue;
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for record store lock: ${indexPath}`);
+      if (!isRecordStoreLockPublicationError(error, lockPath)) {
+        throw recordStoreLockFsError('create', lockPath, error);
+      }
+      let recovery: ExistingRecordStoreLockRecovery;
+      try {
+        recovery = await recoverExistingRecordStoreLock(lockPath, metadata.indexPath);
+      } catch (recoveryError) {
+        if (++filesystemFailures >= RECORD_STORE_LOCK_FS_ATTEMPTS || !isRetryableRecordStoreLockFsError(recoveryError)) {
+          throw recordStoreLockFsError('inspect or recover', lockPath, recoveryError);
+        }
+        await delay(RECORD_STORE_LOCK_FS_DELAY_MS);
+        continue;
+      }
+      if (recovery === 'recovered') continue;
+      if (recovery === 'missing') {
+        // Windows can reject publication even with no canonical owner. That is a bounded
+        // filesystem retry, not evidence of contention with a writer for the full wait period.
+        if (++filesystemFailures >= RECORD_STORE_LOCK_FS_ATTEMPTS) {
+          throw recordStoreLockFsError('publish without an existing owner', lockPath, error);
+        }
+        await delay(RECORD_STORE_LOCK_FS_DELAY_MS);
+        continue;
+      }
+      filesystemFailures = 0;
+      if (Date.now() >= deadline) {
+        throw Object.assign(new Error(`Timed out waiting for record store lock: ${indexPath}`), { cause: error });
+      }
       await delay(25);
     }
   }
@@ -522,16 +549,16 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
     result = await action();
   } catch (error) {
     try {
-      await releaseRecordStoreLock(lockPath, metadata);
+      await releaseCompletedRecordStoreLock(lockPath, metadata);
     } catch (releaseError) {
       throw Object.assign(
         new Error(`Record store action and lock release both failed: ${lockPath}`),
-        { actionError: error, releaseError }
+        { cause: error, actionError: error, releaseError }
       );
     }
     throw error;
   }
-  await releaseRecordStoreLock(lockPath, metadata);
+  await releaseCompletedRecordStoreLock(lockPath, metadata);
   return result;
 }
 
@@ -563,8 +590,8 @@ async function recoverExistingRecordStoreLock(
     return 'recovered';
   } catch (error) {
     if (isFileNotFound(error)) return 'missing';
-    if (isAlreadyExistsError(error)) return 'held';
-    return 'held';
+    if (isAlreadyExistsError(error)) return 'recovered';
+    throw error;
   }
 }
 
@@ -589,22 +616,51 @@ async function createRecordStoreLockDirectory(
   }
 }
 
-async function releaseRecordStoreLock(lockPath: string, expected: RecordStoreLockMetadata): Promise<void> {
-  const raw = await fs.readFile(path.join(lockPath, RECORD_STORE_LOCK_OWNER_FILE), 'utf8');
-  const actual = parseRecordStoreLockMetadata(raw);
-  if (
-    !actual
-    || actual.ownerToken !== expected.ownerToken
-    || actual.pid !== expected.pid
-    || actual.createdAt !== expected.createdAt
-    || path.resolve(actual.indexPath) !== expected.indexPath
-  ) {
-    throw new Error(`Record store lock owner changed; refusing to delete another writer's generation: ${lockPath}`);
-  }
+async function releaseCompletedRecordStoreLock(lockPath: string, expected: RecordStoreLockMetadata): Promise<void> {
+  recordStorePendingReleases.set(lockPath, expected);
+  await releaseRecordStoreLock(lockPath, expected);
+  recordStorePendingReleases.delete(lockPath);
+}
+
+async function releaseRecordStoreLock(
+  lockPath: string,
+  expected: RecordStoreLockMetadata,
+  retryCompletedRelease = false
+): Promise<void> {
   const quarantinePath = recordStoreLockQuarantinePath(lockPath, `owner-${expected.ownerToken}`);
-  await renameRecordStoreLockGeneration(lockPath, quarantinePath);
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const raw = await fs.readFile(path.join(lockPath, RECORD_STORE_LOCK_OWNER_FILE), 'utf8');
+      const actual = parseRecordStoreLockMetadata(raw);
+      if (
+        !actual
+        || actual.ownerToken !== expected.ownerToken
+        || actual.pid !== expected.pid
+        || actual.createdAt !== expected.createdAt
+        || path.resolve(actual.indexPath) !== expected.indexPath
+      ) {
+        if (retryCompletedRelease) return;
+        throw new Error(`Record store lock owner changed; refusing to delete another writer's generation: ${lockPath}`);
+      }
+      // Re-read the owner on every retry; a failed rename does not authorize moving a replacement.
+      await fs.rename(lockPath, quarantinePath);
+      break;
+    } catch (error) {
+      if (retryCompletedRelease && isFileNotFound(error)) return;
+      if (attempt >= RECORD_STORE_LOCK_FS_ATTEMPTS || !isRetryableRecordStoreLockFsError(error)) {
+        throw recordStoreLockFsError('release', lockPath, error);
+      }
+      await delay(RECORD_STORE_LOCK_FS_DELAY_MS);
+    }
+  }
   if (Math.max(0, Date.now() - expected.createdAt) < RECORD_STORE_LOCK_STALE_MS) {
-    await fs.rm(quarantinePath, { recursive: true, force: false });
+    try {
+      await fs.rm(quarantinePath, { recursive: true, force: false });
+    } catch (error) {
+      // The owner-fenced rename already released the canonical lock. Residue cannot turn a
+      // completed configuration write into a failure and provoke an unnecessary business retry.
+      console.warn(`[LimCode] Released record store lock; failed to clean generation: ${quarantinePath}`, error);
+    }
   }
 }
 
@@ -661,24 +717,19 @@ function isAlreadyExistsError(error: unknown): boolean {
   return code === 'EEXIST' || code === 'ENOTEMPTY';
 }
 
-async function renameRecordStoreLockGeneration(sourcePath: string, destinationPath: string): Promise<void> {
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      await fs.rename(sourcePath, destinationPath);
-      return;
-    } catch (error) {
-      if (
-        attempt >= WINDOWS_LOCK_RELEASE_RENAME_ATTEMPTS
-        || !isRetryableWindowsLockGenerationRenameError(
-          error,
-          sourcePath,
-          destinationPath,
-          process.platform
-        )
-      ) throw error;
-      await delay(WINDOWS_LOCK_RELEASE_RENAME_DELAY_MS);
-    }
-  }
+function isRecordStoreLockPublicationError(error: unknown, lockPath: string): boolean {
+  const candidate = error as { syscall?: unknown; dest?: unknown };
+  return (isAlreadyExistsError(error) && candidate.syscall === 'rename' && candidate.dest === lockPath)
+    || isRetryableWindowsLockPublicationRenameError(error, lockPath, process.platform);
+}
+
+function isRetryableRecordStoreLockFsError(error: unknown): boolean {
+  const code = (error as { code?: unknown }).code;
+  return code === 'EACCES' || code === 'EPERM' || code === 'EBUSY';
+}
+
+function recordStoreLockFsError(operation: string, lockPath: string, cause: unknown): Error {
+  return Object.assign(new Error(`Failed to ${operation} record store lock: ${lockPath}`), { cause });
 }
 
 function delay(milliseconds: number): Promise<void> {

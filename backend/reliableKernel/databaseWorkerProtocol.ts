@@ -7,6 +7,12 @@ import type {
   RepositoryTransactionStep
 } from './repositories';
 import type { DatabaseFoundationInspection } from './databaseSchema';
+import type {
+  ActiveTurnWorkEnvironmentProjection,
+  ChildConversationBoundaryProjection
+} from '../../shared/reliableKernelClientFeed';
+import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
+export type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
 
 export const MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT = 33;
 export const MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT = 1;
@@ -34,6 +40,10 @@ export interface ContextMaterializationRecord {
   /** Immutable MessageRevision role resolved through ContextSegmentSource; NULL for non-message segments. */
   messageRole: string | null;
   modelSource?: ContextModelSource;
+  /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
+  sourceRecipeObjectId?: string;
+  /** Claude 保留思考处理：产生这条模型输出的 ModelRequest 实际发出时这个对话已选定的处理（stream_stats 里的持久记录）。 */
+  sourceClaudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 
 export interface ContextMaterializationSnapshot {
@@ -107,7 +117,10 @@ export interface ModelRequestCancelResult {
 
 export interface ClientProjectionSnapshot {
   navigationSummary: Record<string, unknown>;
-  activeConversationWindow: Record<string, unknown>;
+  activeConversationWindow: Record<string, unknown> & {
+    activeTurnWorkEnvironment: ActiveTurnWorkEnvironmentProjection | null;
+    childConversationBoundary: ChildConversationBoundaryProjection | null;
+  };
   activeTurnSummary: Record<string, unknown>;
   activeToolAndInteractionSummary: Record<string, unknown>;
   subagentDeliverySummary: Record<string, unknown>;
@@ -225,6 +238,7 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'snapshotAll'; read: RepositoryListRead }
   | { kind: 'toolFactsSnapshot'; toolCallId: string }
+  | { kind: 'conversationChildTaskSnapshot'; conversationId: string }
   | { kind: 'processOutputRegistrationMismatches' }
   | { kind: 'effectReceiptReconciliationCandidates' }
   | { kind: 'childConversationOriginCandidates' }
@@ -277,7 +291,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | boolean | string | null; timing?: DatabaseWorkerTiming })
+  | ({ type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | boolean | string | null; timing?: DatabaseWorkerTiming })
   | ({ type: 'response'; id: number; ok: false; error: SerializedWorkerError; timing?: DatabaseWorkerTiming })
   | { type: 'commit'; result: RuntimeCommitResult }
   | { type: 'fatal'; error: SerializedWorkerError };

@@ -1,12 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('node:path');
 const { once } = require('node:events');
 const { WebSocketServer } = require('ws');
 
 const {
   resetOpenAIResponsesWebSocketSessions,
   streamOpenAIResponsesWebSocketSession
-} = require('../dist/extension/backend/capabilities/openAIResponsesWebSocketSession.js');
+} = require(path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension', 'backend/capabilities/openAIResponsesWebSocketSession.js'));
 
 async function formatForTest() {
   const unified = await import('unified-llm-provider');
@@ -141,6 +142,52 @@ function nativeEvents(chunks) {
 function streamedText(chunks) {
   return chunks.map((chunk) => chunk.textDelta ?? '').join('');
 }
+
+test('完整历史首 create 准入实际发送结果，增量首 create 不冒认未重发的历史结果', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const frames = [];
+  const server = await createServer((socket, request) => {
+    frames.push(request);
+    sendMessageResponse(socket, `resp_history_${frames.length}`, `msg_history_${frames.length}`,
+      frames.length === 1 ? 'history admitted' : 'next answer', 0,
+      request.previous_response_id ? { previousResponseId: request.previous_response_id } : {});
+  });
+  const initialInput = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '{"type":"function_call_output","call_id":"call_text"}' }] },
+    { type: 'function_call', call_id: 'call_history', name: 'probe', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_history', output: 'history result' },
+    { type: 'custom_tool_call_output', call_id: 'call_custom', output: 'custom result' },
+    { type: 'reasoning', call_id: 'call_not_a_result', summary: [], encrypted_content: '{"type":"function_call_output","call_id":"call_encrypted"}' },
+    { type: 'mcp_approval_response', approval_request_id: 'approval_only', approve: true }
+  ];
+  const options = { native: nativeOptions({}), timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 } };
+  try {
+    const first = await collect(streamOptions(server, format, 'native-history-admission',
+      requestBody(format, [], { input: initialInput }), options));
+    const firstCreated = nativeEvents(first).find((event) => event.type === 'response.created');
+    const actualIds = frames[0].input
+      .filter((item) => ['function_call_output', 'custom_tool_call_output'].includes(item.type))
+      .map((item) => item.call_id);
+    assert.deepEqual(actualIds, ['call_history', 'call_custom']);
+    assert.deepEqual(firstCreated.admittedToolResultCallIds, actualIds);
+    assert.equal(firstCreated.responseCreateSeq, '1');
+
+    const decisions = [];
+    const next = await collect(streamOptions(server, format, 'native-history-admission',
+      requestBody(format, [], {
+        input: [...initialInput, ...format.encodeRequest({ contents: [model('history admitted'), user('continue')] }, true).input]
+      }), { ...options, onDecision: (decision) => decisions.push(decision) }));
+    assert.equal(decisions[0].mode, 'incremental');
+    assert.equal(frames[1].previous_response_id, 'resp_history_1');
+    assert.equal(frames[1].input.length, 1);
+    assert.ok(frames[1].input.every((item) => item.type !== 'function_call_output' && item.type !== 'custom_tool_call_output'));
+    assert.equal(nativeEvents(next).find((event) => event.type === 'response.created').admittedToolResultCallIds, undefined);
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
 
 test('原生转向被接受后以自动续接完成，steered 不完整不失败且续接链可增量延续', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
@@ -845,9 +892,10 @@ test('努力变更在兼容续接上使用 configuration_update 且顶层推理�
   }
 });
 
-test('原生路径保留显式缓存字段而旧路径保持剥离行为', { concurrency: false }, async () => {
+test('原生路径与支持显式缓存的模型保留显式缓存字段，其他模型的旧路径保持剥离行为', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const format = await formatForTest();
+  const unified = await import('unified-llm-provider');
   const frames = [];
   const server = await createServer((socket, request, connection) => {
     frames.push({ request, connection });
@@ -856,8 +904,8 @@ test('原生路径保留显式缓存字段而旧路径保持剥离行为', { con
     sendMessageResponse(socket, `resp_cache_${seq}`, `msg_${seq}`, '好');
   });
   try {
-    const bodyWithCache = (sessionSalt) => {
-      const body = requestBody(format, [user(`缓存问题${sessionSalt}`)], {
+    const bodyWithCache = (sessionSalt, bodyFormat = format) => {
+      const body = requestBody(bodyFormat, [user(`缓存问题${sessionSalt}`)], {
         prompt_cache_options: { mode: 'explicit', ttl: '30m' }
       });
       body.input[0].content[0].prompt_cache_breakpoint = { mode: 'explicit' };
@@ -867,7 +915,15 @@ test('原生路径保留显式缓存字段而旧路径保持剥离行为', { con
       native: nativeOptions({}),
       timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
     }));
-    await collect(streamOptions(server, format, 'legacy-cache', bodyWithCache('旧式'), {
+    // 显式缓存只按模型判断（官方：GPT-5.6 and later），旧路径上的 Astra、Sol、GPT-5.6 同样保留。
+    for (const [salt, model] of [['旧式 Astra', 'gpt-6-astra'], ['旧式 Sol', 'gpt-6-sol'], ['旧式 5.6', 'gpt-5.6']]) {
+      const modelFormat = new unified.OpenAIResponsesFormat(model);
+      await collect(streamOptions(server, modelFormat, `legacy-cache-${model}`, bodyWithCache(salt, modelFormat), {
+        timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+      }));
+    }
+    const olderFormat = new unified.OpenAIResponsesFormat('gpt-5.5');
+    await collect(streamOptions(server, olderFormat, 'legacy-cache-older', bodyWithCache('旧式 5.5', olderFormat), {
       timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
     }));
 
@@ -875,7 +931,14 @@ test('原生路径保留显式缓存字段而旧路径保持剥离行为', { con
     assert.deepEqual(nativeCreate.prompt_cache_options, { mode: 'explicit', ttl: '30m' });
     assert.deepEqual(nativeCreate.input[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
 
-    const legacyCreate = frames[1].request;
+    for (const index of [1, 2, 3]) {
+      const create = frames[index].request;
+      assert.deepEqual(create.prompt_cache_options, { mode: 'explicit', ttl: '30m' }, create.model);
+      assert.deepEqual(create.input[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' }, create.model);
+    }
+
+    const legacyCreate = frames[4].request;
+    assert.equal(legacyCreate.model, 'gpt-5.5');
     assert.equal('prompt_cache_options' in legacyCreate, false);
     assert.equal('prompt_cache_breakpoint' in legacyCreate.input[0].content[0], false);
     assert.equal('stream_id' in nativeCreate, false, 'exclusive native mode uses no named lane');

@@ -1,3 +1,4 @@
+import { createRuntimeDeliveryWakeHandler } from './runtimeDeliveryWakeHandler';
 import * as vscode from 'vscode';
 import { EXTENSION_USER_AGENT } from '../../../shared/extensionIdentity';
 import type { GlobalSettingsRecord, NetworkSettingsRecord } from '../../../shared/protocol';
@@ -11,6 +12,8 @@ import type {
   ReliableAgentTransientObserver
 } from '../../reliableKernel/agentLoop';
 import { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
+import { childConversationModelProfiles } from '../../reliableKernel/childThinkingInheritance';
+import { CollaborationToolDispatcher } from '../../reliableKernel/collaborationToolDispatcher';
 import { ReliableDiagnosticJournal } from '../../reliableKernel/diagnosticJournal';
 import { DebugCaptureService } from '../../reliableKernel/debugCapture/service';
 import { debugCaptureSource } from '../../reliableKernel/debugCapture/source';
@@ -38,6 +41,7 @@ import { applyProxyEnvironment, normalizeProxySetting, proxyForShellAndMcp } fro
 import { VscodeReliableFileDiffEditor } from './VscodeReliableFileDiffEditor';
 import { getRuntimeBuildInfo } from '../runtimeBuildInfo';
 import { ReliableConversationRunner } from './ReliableConversationRunner';
+import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 
 export interface VscodeReliableKernelProductRuntimeOptions {
@@ -48,6 +52,7 @@ export interface VscodeReliableKernelProductRuntimeOptions {
   transientObserver?: ReliableAgentTransientObserver;
   lifecycleObserver?: ReliableAgentLifecycleObserver;
   dispatchSpecial?: VscodeReliableToolHostOptions['dispatchSpecial'];
+  onConfigurationChanged?: () => Promise<void> | void;
 }
 
 export type VscodeReliableKernelRecoveryState =
@@ -69,6 +74,8 @@ export class VscodeReliableKernelProductRuntime {
   public readonly childAgents: ReliableChildAgentCoordinator;
   public readonly fileDiffs: VscodeReliableFileDiffEditor;
   public readonly conversations: ReliableConversationRunner;
+  /** Fork/create writes shared with model tools; the facade adds navigation and sidebar refresh. */
+  public readonly conversationLifecycle: ReliableConversationLifecycle;
   public readonly providerRegistry: ReliableLlmProviderRegistry;
   public readonly diagnostics: ReliableDiagnosticJournal;
   public readonly debugCapture: DebugCaptureService;
@@ -81,6 +88,8 @@ export class VscodeReliableKernelProductRuntime {
   private readonly externalRuntimeWatcher: ExternalDataVersionWatcher;
   private closing = false;
   private readonly initializeConfiguration: () => Promise<void>;
+  private readonly workspaceFoldersSubscription: vscode.Disposable;
+  private workspaceFoldersChangeTask: Promise<void> = Promise.resolve();
 
   private constructor(input: {
     application: ReliableKernelApplication;
@@ -89,10 +98,12 @@ export class VscodeReliableKernelProductRuntime {
     childAgents: ReliableChildAgentCoordinator;
     fileDiffs: VscodeReliableFileDiffEditor;
     conversations: ReliableConversationRunner;
+    conversationLifecycle: ReliableConversationLifecycle;
     providerRegistry: ReliableLlmProviderRegistry;
     diagnostics: ReliableDiagnosticJournal;
     debugCapture: DebugCaptureService;
     initializeConfiguration: () => Promise<void>;
+    onConfigurationChanged?: () => Promise<void> | void;
   }) {
     this.application = input.application;
     this.configuration = input.configuration;
@@ -100,10 +111,23 @@ export class VscodeReliableKernelProductRuntime {
     this.childAgents = input.childAgents;
     this.fileDiffs = input.fileDiffs;
     this.conversations = input.conversations;
+    this.conversationLifecycle = input.conversationLifecycle;
     this.providerRegistry = input.providerRegistry;
     this.diagnostics = input.diagnostics;
     this.debugCapture = input.debugCapture;
     this.initializeConfiguration = input.initializeConfiguration;
+    this.workspaceFoldersSubscription = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      if (this.closing) return;
+      // Schedule synchronously: a Turn admitted after this event must queue behind the complete
+      // folder snapshot. Existing Turns keep their frozen default identity.
+      void this.initializeConfiguration().catch(() => undefined);
+      this.workspaceFoldersChangeTask = this.configuration.synchronizeWorkspaceFolders(currentWorkspaceFolders())
+        .then(async () => { if (!this.closing) await input.onConfigurationChanged?.(); });
+      void this.workspaceFoldersChangeTask.catch(error => {
+        console.error('[LimCode] 工作目录同步失败。', error);
+        if (!this.closing) void vscode.window.showErrorMessage(`LimCode 工作目录同步失败：${error instanceof Error ? error.message : String(error)}`);
+      });
+    });
     this.externalRuntimeWatcher = new ExternalDataVersionWatcher(
       () => this.application.database.externalDataVersion(),
       () => this.application.refreshExternalRuntimeWork(),
@@ -116,12 +140,7 @@ export class VscodeReliableKernelProductRuntime {
     options: VscodeReliableKernelProductRuntimeOptions = {}
   ): Promise<VscodeReliableKernelProductRuntime> {
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
-    const workspaceFolders = (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
-      uri: folder.uri.toString(),
-      name: folder.name,
-      rootPath: folder.uri.fsPath,
-      index
-    }));
+    const workspaceFolders = currentWorkspaceFolders();
     const configuration = new VscodeConfigurationAuthority(
       getPaths,
       context,
@@ -129,7 +148,15 @@ export class VscodeReliableKernelProductRuntime {
     );
     let configurationInitialization: Promise<void> | undefined;
     const initializeConfiguration = (): Promise<void> => {
-      configurationInitialization ??= configuration.synchronizeWorkspaceFolders(workspaceFolders);
+      if (!configurationInitialization) {
+        const pending = configuration.synchronizeWorkspaceFolders(currentWorkspaceFolders());
+        configurationInitialization = pending;
+        // A later folder event or command may retry a failed initialization. Keep successful and
+        // in-flight work deduplicated, but never pin this Host to the first transient sync failure.
+        void pending.catch(() => {
+          if (configurationInitialization === pending) configurationInitialization = undefined;
+        });
+      }
       return configurationInitialization;
     };
     let authority = options.authority;
@@ -147,10 +174,14 @@ export class VscodeReliableKernelProductRuntime {
     const debugCapture = new DebugCaptureService(authority, await authority.current(), debugCaptureSource(''));
     let application: ReliableKernelApplication | undefined;
     let childAgents: ReliableChildAgentCoordinator | undefined;
+    let collaborationTools: CollaborationToolDispatcher | undefined;
     let fileDiffs: VscodeReliableFileDiffEditor | undefined;
     let conversations: ReliableConversationRunner | undefined;
+    let conversationLifecycle: ReliableConversationLifecycle | undefined;
     const toolHost = new VscodeReliableToolHost(context, configuration, {
       dispatchSpecial: async (definition, input, frozenAuthority, signal, admission) => {
+        const collaborationResult = await collaborationTools?.dispatch(input, signal, frozenAuthority);
+        if (collaborationResult) return collaborationResult;
         const childResult = await childAgents?.dispatch(input, signal, frozenAuthority, admission);
         if (childResult) return childResult;
         return options.dispatchSpecial?.(definition, input, frozenAuthority, signal, admission);
@@ -329,60 +360,32 @@ export class VscodeReliableKernelProductRuntime {
         undefined,
         diagnostics
       );
-      application.processDeliveries.setWakeHandler(async (request) => {
-        const app = application;
-        const runner = conversations;
-        if (!app || !runner) return { acknowledged: false };
-        if (!app.database.conversationOwners.owns(request.conversationId)) return { acknowledged: false };
-        await app.database.conversationOwners.assertOwned(request.conversationId);
-        if (request.action === 'notify_only') {
-          const acknowledged = await app.runtime.deliveries.acknowledgeNotification(request.deliveryId);
-          // The RuntimeDelivery ACK is the durable notification fence. A host crash after this point
-          // may omit a toast, but can never emit duplicate toasts on wake replay.
-          if (acknowledged.changed) {
-            if (request.sourceKind === 'child_failure') {
-              void vscode.window.showErrorMessage(
-                'LimCode 子 Agent 执行失败；失败详情已保留在可靠 Runtime 中。'
-              );
-            } else {
-              void vscode.window.showInformationMessage(
-                request.sourceKind === 'answer_submission'
-                  ? 'LimCode 子 Agent 已返回部分或最终结果；来源对话已结束，答案已保留在可靠 Runtime 中。'
-                  : `LimCode 后台进程 ${request.processId ?? request.sourceId} 已完成；来源对话已取消或关闭，结果已保留在可靠 Runtime 中。`
-              );
-            }
+      application.processDeliveries.setWakeHandler(createRuntimeDeliveryWakeHandler({
+        application: () => application,
+        conversations: () => conversations,
+        children: () => childAgents,
+        notify: request => {
+          if (request.sourceKind === 'child_failure') {
+            void vscode.window.showErrorMessage('LimCode 子 Agent 执行失败；失败详情已保留在可靠 Runtime 中。');
+          } else if (request.sourceKind === 'collaboration_message') {
+            void vscode.window.showInformationMessage('LimCode 协作消息已保留；目标任务当前无法继续执行。');
+          } else {
+            void vscode.window.showInformationMessage(request.sourceKind === 'answer_submission'
+              ? 'LimCode 子 Agent 已返回部分或最终结果；来源对话已结束，答案已保留在可靠 Runtime 中。'
+              : `LimCode 后台进程 ${request.processId ?? request.sourceId} 已完成；来源对话已取消或关闭，结果已保留在可靠 Runtime 中。`);
           }
-          return { acknowledged: true };
         }
-        if (request.action === 'resume_current_turn') {
-          if (!request.targetTurnId) return { acknowledged: false };
-          // Scheduling is only an edge hint. The AgentLoop advances and absorbs the Delivery at a
-          // protocol-safe boundary; the outbox remains pending until markInputHandled is durable.
-          if (!await childAgents?.resume(request.targetTurnId)) {
-            runner.resume(request.conversationId, request.targetTurnId);
-          }
-          const summary = await app.runtime.deliveries.summary(request.deliveryId);
-          return { acknowledged: summary.parentHandlingState === 'handled' };
-        }
-        if (request.childExecutionId) {
-          // A Child Turn requires ChildExecutionIntentLink/TurnLink/ActiveTurnLink admission. The
-          // ordinary Conversation runner deliberately cannot claim child scheduler membership.
-          // Keep the durable wake retryable until the child coordinator has created that exact
-          // internal continuation; never create an orphan ordinary Turn in the child Conversation.
-          if (!childAgents) return { acknowledged: false };
-          return childAgents.runtimeDeliveryContinuation({
-            deliveryId: request.deliveryId,
-            childExecutionId: request.childExecutionId,
-            sourceTurnId: request.sourceTurnId
-          });
-        }
-        const continuation = await runner.runtimeContinuation({
-          commandId: `runtime-delivery:${request.deliveryId}`,
-          deliveryId: request.deliveryId,
-          conversationId: request.conversationId,
-          sourceTurnId: request.sourceTurnId
-        });
-        return { acknowledged: Boolean(continuation.intentId) };
+      }));
+      // The tool host's special-dispatch chain was built before the Runtime existed; these
+      // services are bound into it late through the closure variables it reads per call.
+      conversationLifecycle = new ReliableConversationLifecycle({ application, configuration });
+      collaborationTools = new CollaborationToolDispatcher({
+        database: application.database,
+        contentStore: application.contentStore,
+        effects: application.runtime.effects,
+        collaboration: application.runtime.collaboration,
+        board: application.runtime.collaborationBoard,
+        conversations: conversationLifecycle
       });
       childAgents = new ReliableChildAgentCoordinator({
         database: application.database,
@@ -394,15 +397,7 @@ export class VscodeReliableKernelProductRuntime {
         turns: application.turns,
         agentLoop: application.agentLoop,
         agents: { resolve: (input) => configuration.resolveAgent(input) },
-        modelProfiles: {
-          initializeConversation: ({ conversationId, model }) =>
-            configuration.mutations.initializeConversationModelProfile({
-              conversationId,
-              ...(model.providerConfigId ? { providerConfigId: model.providerConfigId } : {}),
-              ...(model.provider ? { provider: model.provider } : {}),
-              model: model.model
-            })
-        },
+        modelProfiles: childConversationModelProfiles(configuration.mutations),
         deliveryWakeups: application.processDeliveries,
         ownedProcessCleanup: application.childOwnedProcessCleanup,
         cancelTurnExecution: async ({ turnId, reason }) => {
@@ -443,10 +438,12 @@ export class VscodeReliableKernelProductRuntime {
         childAgents,
         fileDiffs,
         conversations,
+        conversationLifecycle,
         providerRegistry: providers,
         diagnostics,
         debugCapture,
-        initializeConfiguration
+        initializeConfiguration,
+        onConfigurationChanged: options.onConfigurationChanged
       });
     } catch (error) {
       await debugCapture.close().catch(() => undefined);
@@ -547,6 +544,7 @@ export class VscodeReliableKernelProductRuntime {
 
   public async close(): Promise<void> {
     this.closing = true;
+    this.workspaceFoldersSubscription.dispose();
     const cancellation = new Error('Reliable Runtime recovery cancelled for Host handoff.');
     cancellation.name = 'AbortError';
     this.configuration.mutations.retireModelProfileAuthority();
@@ -556,6 +554,7 @@ export class VscodeReliableKernelProductRuntime {
       await this.debugCapture.close().catch(() => undefined);
       this.fileDiffs.dispose();
       this.conversations.dispose();
+      await this.workspaceFoldersChangeTask.catch(() => undefined);
       await this.application.beginHandoff();
       // MCP discovery has its own AbortSignal generation. Dispose it before awaiting recovery so
       // an unresponsive external server cannot make Extension Host reload wait forever.
@@ -571,4 +570,10 @@ export class VscodeReliableKernelProductRuntime {
       await this.diagnostics.close();
     }
   }
+}
+
+function currentWorkspaceFolders(): Array<{ uri: string; name: string; rootPath: string; index: number }> {
+  return (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
+    uri: folder.uri.toString(), name: folder.name, rootPath: folder.uri.fsPath, index
+  }));
 }

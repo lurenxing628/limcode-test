@@ -30,7 +30,10 @@ export function resolveFrozenWorkEnvironmentBoundary(
     .filter((environment): environment is WorkEnvironmentRecord => !!environment && environment.available);
   const active = policy.defaultWorkEnvironmentId
     ? allowed.find((environment) => environment.id === policy.defaultWorkEnvironmentId)
-    : allowed[0];
+    : undefined;
+  if (policy.defaultWorkEnvironmentId && !active) {
+    throw new Error(`本回合冻结的工作环境已不可用：${policy.defaultWorkEnvironmentId}，请重新选择后开始新回合。`);
+  }
   return {
     switchingEnabled: policy.enabled,
     allowed,

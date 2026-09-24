@@ -24,6 +24,7 @@ Module._load = function(request, parent, isMain) { return request === 'vscode' ?
 after(() => { Module._load = originalLoad; });
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
+const { childConversationModelProfiles } = require('../../dist/extension/backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { ReliableChildAgentCoordinator } = require('../../dist/extension/backend/reliableKernel/childAgentCoordinator.js');
@@ -184,7 +185,8 @@ async function fixture(run, hooks = {}) {
     const list = async (domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 100 }))).snapshot;
     coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime, modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
       agents: { async resolve() { return { agentId: childAgent.id, agentType: 'worker' }; } },
-      modelProfiles: { initializeConversation: ({ conversationId, model, thinkingOverride }) => configuration.mutations.initializeConversationModelProfile({ conversationId, ...model, ...(thinkingOverride ? { thinkingOverride } : {}) }) }
+      // Production wiring (VscodeReliableKernelProductRuntime uses the same adapter).
+      modelProfiles: childConversationModelProfiles(configuration.mutations)
     });
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -241,7 +243,7 @@ for (const inheritedScope of ['agent', 'workflow']) test(`review scope actual co
       assert.equal(effective.providerConfigId, provider.id); assert.equal(effective.model, provider.model);
       // The same effective identity is passed by Composer to this production script-setup.
       const control = ui.control(provider, effective.model);
-      assert.equal(control.defaultLabel.value, '默认 · 1024 tokens');
+      assert.equal(control.defaultLabel.value, '跟随渠道设置：1024 tokens');
       control.save('2048');
       await ui.store.awaitSavedForScope('conversation', 'parent');
       const saved = ui.store.confirmedFor('conversation', 'parent');
@@ -441,7 +443,7 @@ const clearAckTargets = [
   { provider: 'gemini', model: 'gemini-2.5-flash', value: '2048' },
   { provider: 'claude', model: 'claude-sonnet-4-5', value: '2048' },
   { provider: 'claude', model: 'claude-opus-4-6', value: 'none' },
-  { provider: 'deepseek', model: 'deepseek-reasoner', value: 'none' },
+  { provider: 'openai-compatible', model: 'deepseek-reasoner', value: 'none' },
   { provider: 'openai-compatible', model: 'gpt-4o' }
 ];
 for (const target of clearAckTargets) test(`review scope clear receipt is channel-independent across switch/reset/clear/inherited set: ${target.provider}/${target.model}`, async () => {
@@ -565,7 +567,7 @@ test('子 Agent 自有另一渠道和协议优先，父 OpenAI effort 不写入�
       assert.equal(child.body.generationConfig.thinkingConfig.thinkingLevel, undefined);
     }
   }, { async send(request, controls, f) {
-    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: f.requests.length === 1 ? [{ id: 'cross-child', functionCall: { name: 'run_agent', args: { prompt: 'synthetic cross-provider task' } } }] : [{ text: 'done' }] } });
+    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: f.requests.length === 1 ? [{ id: 'cross-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check cross-provider selection', prompt: 'synthetic cross-provider task' } } }] : [{ text: 'done' }] } });
   } });
 });
 
@@ -597,7 +599,7 @@ for (const childModel of [
   }, { async send(request, controls, f) {
     const first = request.conversationId === 'parent' && f.requests.filter(r => r.conversationId === 'parent').length === 1;
     await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [first
-      ? { id: 'incompatible-child', functionCall: { name: 'run_agent', args: { prompt: 'use the child model' } } }
+      ? { id: 'incompatible-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check incompatible child model', prompt: 'use the child model' } } }
       : { text: 'done' }] } });
   } });
 });
@@ -618,6 +620,12 @@ test('勾选子继承时，实际 child generation 使用父会话当前有效 t
     const childWires = f.wires.filter(wire => wire.conversationId !== 'parent');
     assert.ok(childWires.length, 'child must issue an actual provider request');
     assert.ok(childWires.every(wire => wire.body.reasoning_effort === 'high'));
+    // Plan delegation and crash repair read the same choice from the spawning parent Turn.
+    const [child] = await f.list('ChildExecution');
+    const [parentLink] = await f.list('ChildExecutionParentLink', { child_execution_id: child.id });
+    const [parentTurn] = await f.list('Turn', { conversation_id: 'parent' });
+    assert.equal(parentLink.parent_turn_id, parentTurn.id);
+    assert.deepEqual(await f.app.runtime.children.frozenChildThinkingOverrideForTurn(parentLink.parent_turn_id), { kind: 'openai-effort', value: 'high' });
   }, {
     async send(request, controls, f) {
       const firstParentRequest = request.conversationId === 'parent'
@@ -626,12 +634,62 @@ test('勾选子继承时，实际 child generation 使用父会话当前有效 t
         kind: 'completed',
         streamSeq: '1',
         content: { role: 'model', parts: [firstParentRequest
-          ? { id: 'inherit-child', functionCall: { name: 'run_agent', args: { prompt: 'inherit thinking' } } }
+          ? { id: 'inherit-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check inherited thinking', prompt: 'inherit thinking' } } }
           : { text: 'done' }] }
       });
     }
   });
 });
+test('产品接线把父对话冻结的思考强度写入子对话记录，关闭继承时不写', async () => {
+  const source = await fs.readFile(path.resolve('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.ts'), 'utf8');
+  assert.match(source, /modelProfiles: childConversationModelProfiles\(configuration\.mutations\)/);
+  assert.doesNotMatch(source, /initializeConversation: \(\{ conversationId, model \}\)/, 'the product must not drop thinkingOverride');
+  const calls = [];
+  const store = childConversationModelProfiles({ async initializeConversationModelProfile(input) { calls.push(input); return { created: true }; } });
+  await store.initializeConversation({ conversationId: 'child', model: { providerConfigId: 'p', provider: 'claude', model: 'claude-opus-5-5' }, thinkingOverride: { kind: 'claude-effort', value: 'high' } });
+  await store.initializeConversation({ conversationId: 'other', model: { model: 'm' } });
+  assert.deepEqual(calls, [
+    { conversationId: 'child', providerConfigId: 'p', provider: 'claude', model: 'claude-opus-5-5', thinkingOverride: { kind: 'claude-effort', value: 'high' } },
+    { conversationId: 'other', model: 'm' }
+  ]);
+});
+
+test('子对话记录写入前崩溃，启动恢复补写时仍带上父对话选择的思考强度', async () => {
+  let crashed = false;
+  await fixture(async f => {
+    await f.configuration.mutations.setModelProfile({
+      scopeKind: 'conversation', scopeId: 'parent', providerConfigId: f.provider.id, provider: f.provider.provider,
+      model: f.provider.model, thinkingOverride: { kind: 'openai-effort', value: 'high' }, inheritThinkingToChildren: true
+    });
+    const mutations = f.configuration.mutations;
+    const original = mutations.initializeConversationModelProfile;
+    mutations.initializeConversationModelProfile = async function(...args) {
+      if (!crashed) { crashed = true; throw new Error('simulated crash before the child model profile'); }
+      return original.apply(this, args);
+    };
+    await f.app.agentLoop.runInput(f.input('inherit-after-crash'));
+    await f.coordinator.waitForIdle();
+    assert.ok(crashed, 'the spawn must hit the simulated crash');
+    await f.coordinator.recoverStartup();
+    await f.coordinator.waitForIdle();
+    const childWires = f.wires.filter(wire => wire.conversationId !== 'parent');
+    assert.ok(childWires.length, 'the repaired child must issue a provider request');
+    assert.ok(childWires.every(wire => wire.body.reasoning_effort === 'high'), JSON.stringify(childWires.map(wire => wire.body.reasoning_effort)));
+  }, {
+    async send(request, controls, f) {
+      const firstParentRequest = request.conversationId === 'parent'
+        && f.requests.filter(item => item.conversationId === 'parent').length === 1;
+      await controls.onEvent({
+        kind: 'completed',
+        streamSeq: '1',
+        content: { role: 'model', parts: [firstParentRequest
+          ? { id: 'inherit-crash-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check repaired thinking', prompt: 'inherit thinking' } } }
+          : { text: 'done' }] }
+      });
+    }
+  });
+});
+
 test('首次/工具新请求/下一用户请求用新覆盖；旧请求 replay 保持原快照', async () => {
   await fixture(async f => {
     await f.set('parent', 'high');
@@ -717,10 +775,10 @@ test('运行中的子 Agent 默认排队续聊，保留当前执行和同一会�
   }, { async send(request, controls, f) {
     let part = { text: 'done' };
     const count = f.requests.filter(r => r.conversationId === request.conversationId).length;
-    if (request.conversationId === 'parent' && count === 1) part = { id: 'spawn-queued', functionCall: { name: 'run_agent', args: { prompt: 'investigate', taskName: 'Investigate send failure' } } };
+    if (request.conversationId === 'parent' && count === 1) part = { id: 'spawn-queued', functionCall: { name: 'run_agent', args: { operation: 'spawn', prompt: 'investigate', taskName: 'Investigate send failure' } } };
     if (request.conversationId === 'parent' && count === 2) {
       const ref = request.recipe.modelHandleCatalog.entries.find(e => e.kind === 'child').ref;
-      part = { id: 'followup-queued', functionCall: { name: 'run_agent', args: { childRef: ref, prompt: 'also verify configuration saving' } } };
+      part = { id: 'followup-queued', functionCall: { name: 'run_agent', args: { operation: 'send', childRef: ref, prompt: 'also verify configuration saving' } } };
     }
     if (request.conversationId !== 'parent' && count === 1) await childGate;
     await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [part] } });
@@ -756,7 +814,7 @@ test('实际 coordinator 从父工具创建/嵌套/继续子会话：最终普�
     async send(request, controls, f) {
       const depth = request.conversationId === 'parent' ? 0 : new Set(f.requests.filter(r => r.conversationId !== 'parent').map(r => r.conversationId)).size;
       const first = f.requests.filter(r => r.conversationId === request.conversationId).length === 1;
-      await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: first && depth < 2 ? [{ id: `delegate-${depth}`, functionCall: { name: 'run_agent', args: { prompt: 'synthetic child', taskName: `Investigate level ${depth}`, agent: { type: 'worker' } } } }] : [{ text: 'done' }] } });
+      await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: first && depth < 2 ? [{ id: `delegate-${depth}`, functionCall: { name: 'run_agent', args: { operation: 'spawn', prompt: 'synthetic child', taskName: `Investigate level ${depth}`, agent: { type: 'worker' } } } }] : [{ text: 'done' }] } });
     }
   });
 });
@@ -776,7 +834,93 @@ for (const tokens of [0, -1]) test(`review child inheritance sends Gemini budget
   }, { async send(request, controls, f) {
     const first = request.conversationId === 'parent' && f.requests.filter(r => r.conversationId === 'parent').length === 1;
     await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [first
-      ? { id: 'gemini-child', functionCall: { name: 'run_agent', args: { prompt: 'inherit the configured budget' } } }
+      ? { id: 'gemini-child', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'Check inherited Gemini budget', prompt: 'inherit the configured budget' } } }
       : { text: 'done' }] } });
   } });
+});
+
+/** 模拟升级前保存、按现在的规则已不合法的会话思考覆盖：直接写记录，不经过保存校验。 */
+async function injectSavedThinkingOverride(f, provider, override) {
+  const { loadRecordStore, saveRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
+  await f.save('llmProviderConfigs', { configs: [provider] });
+  await f.configuration.mutations.setModelProfile({ scopeKind: 'conversation', scopeId: 'parent', providerConfigId: provider.id, provider: provider.provider, model: provider.model });
+  const paths = f.configuration.getPaths();
+  const records = await loadRecordStore(paths.modelProfilesRootUri, paths.modelProfilesIndexUri, 'modelProfile');
+  const target = records.find(record => record.providerConfigId === provider.id && record.model === provider.model);
+  assert.ok(target);
+  await saveRecordStore(paths.modelProfilesRootUri, paths.modelProfilesIndexUri, records.map(record => record === target ? { ...record, thinkingOverride: override } : record), 'modelProfile');
+}
+
+test('升级前保存的会话思考覆盖：kind 不同但值可用时照常生效，已不合法的按渠道设置发送，对话不再每轮失败', async () => {
+  await fixture(async f => {
+    const deepseek = { ...f.provider, baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', models: [{ id: 'deepseek-v4-pro', name: 'DeepSeek' }], generationConfig: {} };
+    await injectSavedThinkingOverride(f, deepseek, { kind: 'openai-effort', value: 'high' });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-kind'))).terminalStatus, 'completed');
+    assert.deepEqual(f.wires.at(-1).body.thinking, { type: 'enabled' });
+    assert.equal(f.wires.at(-1).body.reasoning_effort, 'high');
+    await injectSavedThinkingOverride(f, deepseek, { kind: 'openai-effort', value: 'medium' });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-value'))).terminalStatus, 'completed');
+    assert.equal(f.wires.at(-1).body.thinking, undefined);
+    assert.equal(f.wires.at(-1).body.reasoning_effort, undefined);
+    // 自定义请求体后来加了思考参数：已保存的覆盖不生效，不报错。
+    await f.save('llmProviderConfigs', { configs: [{ ...deepseek, requestBody: { thinking: { type: 'disabled' } } }] });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-body'))).terminalStatus, 'completed');
+    assert.deepEqual(f.wires.at(-1).body.thinking, { type: 'disabled' });
+    const opus = { ...f.provider, provider: 'claude', baseUrl: 'https://api.anthropic.com', model: 'claude-opus-5-5', models: [{ id: 'claude-opus-5-5', name: 'Opus' }], generationConfig: {} };
+    await injectSavedThinkingOverride(f, opus, { kind: 'claude-effort', value: 'none' });
+    assert.equal((await f.app.agentLoop.runInput(f.input('legacy-opus-none'))).terminalStatus, 'completed');
+    assert.notEqual(f.wires.at(-1).body.thinking?.type, 'disabled');
+    // 修改“子 Agent 也用”开关不因旧覆盖报错，旧覆盖原样保留，界面仍可重置。
+    const { send, receive, T } = scopeRouter(f);
+    const scope = { scopeKind: 'conversation', scopeId: 'parent' };
+    send('legacy-read', T.ModelProfileScopeRead, scope);
+    const observed = await receive('legacy-read');
+    send('legacy-inherit', T.ModelProfileScopeSet, { ...scope, ...observed.effectiveModel, authorityId: observed.authorityId,
+      sessionId: observed.sessionId, expectedRevision: observed.revision, expectedEffectiveModel: observed.effectiveModel,
+      operation: 'inherit', inheritThinkingToChildren: true });
+    const inherited = await receive('legacy-inherit');
+    assert.equal(inherited.outcome, 'committed', inherited.message);
+    assert.equal(inherited.profile.inheritThinkingToChildren, true);
+    assert.deepEqual(inherited.profile.thinkingOverride, { kind: 'claude-effort', value: 'none' });
+    send('legacy-reset', T.ModelProfileScopeSet, { ...scope, ...inherited.effectiveModel, authorityId: inherited.authorityId,
+      sessionId: inherited.sessionId, expectedRevision: inherited.revision, expectedEffectiveModel: inherited.effectiveModel,
+      operation: 'reset', thinkingOverride: null });
+    const reset = await receive('legacy-reset');
+    assert.equal(reset.outcome, 'committed', reset.message);
+    assert.equal(reset.profile?.thinkingOverride, undefined);
+  });
+});
+
+test('孙 Agent 也继承思考强度：继承标记随思考强度写进子对话的模型记录', async () => {
+  await fixture(async f => {
+    await f.configuration.mutations.setModelProfile({
+      scopeKind: 'conversation', scopeId: 'parent', providerConfigId: f.provider.id, provider: f.provider.provider,
+      model: f.provider.model, thinkingOverride: { kind: 'openai-effort', value: 'high' }, inheritThinkingToChildren: true
+    });
+    await f.app.agentLoop.runInput(f.input('inherit-grandchild'));
+    await f.coordinator.waitForIdle();
+    const descendants = [...new Set(f.wires.map(wire => wire.conversationId).filter(id => id !== 'parent'))];
+    // 子对话的第一个回合就冻结了继承（它在写入子对话记录之前编译），子对话记录也带着继承标记。
+    for (const turn of await f.list('Turn')) {
+      const model = (await f.frozen(turn.id)).document.model;
+      assert.deepEqual(model.thinkingOverride, { kind: 'openai-effort', value: 'high' }, turn.conversation_id);
+      assert.equal(model.inheritThinkingToChildren, true, turn.conversation_id);
+    }
+    assert.equal(descendants.length, 2, 'child and grandchild both issue provider requests');
+    assert.ok(f.wires.filter(wire => wire.conversationId !== 'parent').every(wire => wire.body.reasoning_effort === 'high'),
+      JSON.stringify(f.wires.map(wire => [wire.conversationId, wire.body.reasoning_effort])));
+  }, {
+    async send(request, controls, f) {
+      const own = f.requests.filter(item => item.conversationId === request.conversationId);
+      const conversations = [...new Set(f.requests.map(item => item.conversationId))];
+      const depth = conversations.indexOf(request.conversationId);
+      const spawn = own.length === 1 && depth < 2;
+      await controls.onEvent({
+        kind: 'completed', streamSeq: '1',
+        content: { role: 'model', parts: [spawn
+          ? { id: `spawn-${depth}`, functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: `Level ${depth + 1}`, prompt: 'inherit thinking' } } }
+          : { text: 'done' }] }
+      });
+    }
+  });
 });

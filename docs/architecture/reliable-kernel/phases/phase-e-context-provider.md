@@ -40,7 +40,7 @@ Phase E 的 stable ID 验证可靠内核 control plane 本身；旧应用 LLM/co
 
 ## Astra 原生 Responses 执行边界
 
-- 能力门禁由 `shared/openAIResponsesCapabilities.ts` 统一计算：协议、精确型号、渠道信任/中继确认与传输缺一不可。HTTP/SSE 和 WebSocket 都支持原生工具链及动态推理；转向和多路复用仅用于 WebSocket。其他模型沿用原行为。
+- 能力门禁由 `shared/openAIResponsesCapabilities.ts` 统一计算：协议、精确型号（GPT-6 家族 `gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna` 及日期快照）、渠道信任/中继确认与传输缺一不可。HTTP/SSE 和 WebSocket 都支持原生工具链及动态推理（pro 推理模式下不使用动态推理更新）；转向和多路复用仅用于 WebSocket。其他模型沿用原行为。
 - 一个原生 `ModelRequest` 可以包含多个物理 response。持久化 `{attemptSeq, socketGeneration, streamSeq}` 始终存在；物理 `connectionGeneration`、`streamId`、实际发送的 `previousResponseId` 仅在真实存在时记录，HTTP 不伪造这些身份。
 - `native_control`、`native_tool_call` 是不可被普通流式容量上限丢弃的 checkpoint。`output_item.done` 的实际 `async:true` 加冻结的逐工具许可才允许早期准入；缺省/false 必须等本 response 的完成边界。原生控制器在同步结果未回传时同样保持存活，不依赖转向或另一个异步调用来解锁。
 - `NativeRequestSession` 通过 `ReliableToolDispatcher.scheduleAdmittedCall` 使用既有审批、取消、幂等和分类调度限制，不另建绕过策略的执行队列。调用准入事实与调用一起持久化；terminal checkpoint 收敛后仍由 `ToolCallEvent` 的 CAS 事实恢复。
@@ -51,7 +51,7 @@ Phase E 的 stable ID 验证可靠内核 control plane 本身；旧应用 LLM/co
 - reasoning 的 base、有效 effort 和更新事实进入 immutable recipe。适配器从冻结配置构造线级参数；同一新增边界上的更新折叠为最后有效值，不产生相邻 `configuration_update`。模型/渠道切换终止旧 reasoning lineage；压缩移除传输更新后显式重建有效档位与缓存。
 - WebSocket 在完整逻辑输入与缓存前缀精确一致时可发送物理增量；不一致、重连或重建时发送完整输入。命名通道共享匹配连接，最多 16 个活跃 response、32 个通道；连接建立中的 Promise 也必须共享。已证明的工具输入等待可以释放活跃 response 许可，但不能释放逻辑通道归属。
 - 真实通道排队与工具输入等待暂停 idle/semantic watchdog，不暂停总请求时限或取消。异步回调沿用捕获的完整 execution lease fence，不能借用后来的一代租约。
-- 压缩、切换模型与 fork 只把“已结算且结果已进入 Context”视为关闭；Turn 已终止本身不是关闭证明。fork 保留 source/Link 与原 provider call id，拒绝未闭合前缀，不把未应用转向复制为普通用户历史。
+- 压缩、切换模型与 fork 只把“已结算且结果已进入 Context”视为关闭；Turn 已终止本身不是关闭证明。fork 保留 source/Link 与原 provider call id；切点永不延长到其后的历史：保留前缀内的原生调用若在切点之后才结算，其结果作为新的内容寻址节点追加在切点之后，只有分支自身片段内仍未结算的调用才拒绝分支，调用方仍在运行的后续轮次不阻塞分支；分支点消息已被删除时以 ConversationForkRejectedError 永久拒绝，并删除该命令已复制的对话层设置；不把未应用转向复制为普通用户历史。
 - `stream_stats_json` 的 SQL 乐观断言必须使用读到的原始 snapshot JSON。解析后的语义视图可能改变键顺序，不能拿它与 `JSON.stringify` 存储列做字节等值比较；heartbeat 后的同值不同序 JSON 也必须能继续写入 native usage anchor 和终态。
 
 离线入口：`native-provider-capability.test.mjs`、`native-tool-admission.test.mjs`、`native-request-orchestration.test.mjs`、`native-astra-integration.test.mjs` 与 `openAIResponsesWebSocketNative.test.cjs`。真实浏览器验证设置保存/重载、冻结能力门禁、转向回执及后继时间线；这些隔离验证不等同于真实付费模型调用。

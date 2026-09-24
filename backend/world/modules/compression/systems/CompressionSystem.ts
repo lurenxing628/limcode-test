@@ -446,7 +446,7 @@ function completeCompressionBlock(world: WorldReader, cmd: CommandSink, payload:
   });
   completeCompressionInvocation(world, cmd, blockEntity, payload);
   const nativeVariant = cmd.spawn();
-  const isNative = methodKind === 'openai_responses_compact';
+  const isNative = methodKind === 'provider_native';
   cmd.add(nativeVariant, CompressionContextVariant, {
     id: nextAuxiliaryId('cv'),
     block: blockEntity,

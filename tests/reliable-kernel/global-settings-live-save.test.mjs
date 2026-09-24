@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
-import path from 'node:path';
 import { createRequire } from 'node:module';
 import test from 'node:test';
-import { createServer } from 'vite';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 import { createPinia, setActivePinia } from 'pinia';
 import { createSSRApp, h } from 'vue';
 import { renderToString } from 'vue/server-renderer';
@@ -50,7 +49,7 @@ async function withStore(run) {
     clearTimeout(id) { timers.delete(id); },
     acquireVsCodeApi() { return { postMessage(message) { posted.push(message); }, getState() { return persisted; }, setState(value) { persisted = value; } }; }
   };
-  const server = await createServer({ configFile: path.join(process.cwd(), 'vite.config.ts'), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
+  const server = await createWebviewSsrServer();
   try {
     const { useGlobalSettingsStore } = await server.ssrLoadModule('/src/stores/useGlobalSettingsStore.ts');
     const pinia = createPinia();
