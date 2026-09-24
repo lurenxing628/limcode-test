@@ -483,3 +483,100 @@ test('C1 学习：跳过服务端回显的 input 字段，只按 msg / message /
   assert.deepEqual(learnProviderRequestAdaptations(target({ providerConfigId: 'echo-real-repr' }), { status: 400, message: TRT_REASONING_CONTENT }), ['parameter:reasoning_content']);
   resetProviderRequestAdaptations();
 });
+
+// 中转在 HTTP 200 的流里用 status_code 报上游参数错误：同样按 400 学习；但本次尝试已经发出事件时不能立即重发。
+test('C1 流内错误：200 流里带 status_code 400 的参数错误同样立即去掉重发', async () => {
+  resetProviderRequestAdaptations();
+  const IN_STREAM = 'data: {"error":{"message":"reasoning_effort: Extra inputs are not permitted","type":"invalid_request_error"},"status_code":400}\n\n';
+  await withServer((call) => call.body.reasoning_effort !== undefined ? { sse: IN_STREAM } : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    const events = await chat(providerSettings(baseUrl, { id: 'adaptation-in-stream' }), 'in-stream');
+    assert.ok(events.some((event) => event.type === 'llm:done'), JSON.stringify(events.filter((event) => event.type === 'llm:error')));
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].body.reasoning_effort, 'high');
+    assert.equal(calls[1].body.reasoning_effort, undefined);
+  });
+  resetProviderRequestAdaptations();
+});
+
+test('C1 流内错误：本次尝试已经发出输出后才报参数错误时不立即重发，只记住给之后的请求', async () => {
+  resetProviderRequestAdaptations();
+  const PARTIAL_THEN_ERROR = [
+    'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"PARTIAL"},"finish_reason":null}]}',
+    'data: {"error":{"message":"reasoning_effort: Extra inputs are not permitted","type":"invalid_request_error"},"status_code":400}',
+    ''
+  ].join('\n\n');
+  await withServer((call) => call.body.reasoning_effort !== undefined ? { sse: PARTIAL_THEN_ERROR } : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    const settings = providerSettings(baseUrl, { id: 'adaptation-after-output' });
+    const events = await chat(settings, 'after-output');
+    assert.equal(calls.length, 1, '已经发出的输出不能被重发的请求重复一遍');
+    assert.ok(events.some((event) => event.type === 'llm:error'));
+    assert.equal(events.filter((event) => event.type === 'llm:delta').map((event) => event.payload.text).join(''), 'PARTIAL');
+    await chat(settings, 'after-output-2');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].body.reasoning_effort, undefined, '参数错误仍被记住');
+  });
+  resetProviderRequestAdaptations();
+});
+
+// 内核适配层：Provider 内部的自适配重发不是新的 Attempt。一次 sendFullRequest 只产生一段连续的事件、一个 completed；
+// 已经发出输出后才报的参数错误不会被重发成重复输出。
+async function adapterSend(settings, modelRequestId) {
+  const { LlmCapabilityFullRequestAdapter } = await import('../../dist/extension/backend/reliableKernel/index.js');
+  const capability = createLlmProviderCapability({ settings: async () => settings });
+  const adapter = new LlmCapabilityFullRequestAdapter(settings.id, capability);
+  const events = [];
+  let failure;
+  try {
+    await adapter.sendFullRequest({
+      kind: 'full-model-request', modelRequestId, conversationId: 'adapter-conversation', attemptSeq: '1', socketGeneration: '1',
+      providerId: settings.id, modelId: settings.model,
+      authoritySnapshot: {
+        model: { providerConfigId: settings.id, provider: settings.provider, modelId: settings.model, generationConfig: settings.generationConfig },
+        toolPolicy: { allowedTools: [], preset: 'custom' }
+      },
+      recipe: { kind: 'reliable-agent-turn', tools: [] },
+      context: [{ segmentId: 'segment-user', segmentKind: 'message', messageRole: 'user', contentType: 'application/vnd.limcode.message+json',
+        content: JSON.stringify({ role: 'user', parts: [{ text: 'ping' }] }) }],
+      attachmentCatalogState: { catalog: [], placements: [] }
+    }, { async onEvent(event) { events.push(event); return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' }; } });
+  } catch (error) {
+    failure = error;
+  } finally {
+    capability.dispose();
+  }
+  return { events, failure };
+}
+
+test('C1 内核适配层：自适配重发在同一次 sendFullRequest 里完成，只有一个 completed、事件不重复', async () => {
+  resetProviderRequestAdaptations();
+  await withServer((call) => call.body.reasoning_effort !== undefined
+    ? { status: 400, body: GATEWAY_REASONING_EFFORT }
+    : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    const { events, failure } = await adapterSend(providerSettings(baseUrl, { id: 'adapter-adaptation' }), 'adapter-request');
+    assert.equal(failure, undefined, String(failure));
+    assert.equal(calls.length, 2);
+    assert.equal(events.filter((event) => event.kind === 'completed').length, 1);
+    assert.equal(events.at(-1).kind, 'completed');
+    assert.deepEqual(events.map((event) => Number(event.streamSeq)), events.map((_, index) => index + 1), 'streamSeq 连续、不重复');
+    assert.equal(events.filter((event) => event.kind === 'output_delta').map((event) => event.content.text).join(''), 'PONG');
+    assert.deepEqual(events.at(-1).content, { role: 'model', parts: [{ text: 'PONG' }] });
+  });
+  resetProviderRequestAdaptations();
+});
+
+test('C1 内核适配层：输出之后才报的参数错误让本次尝试失败，不重发、不重复输出', async () => {
+  resetProviderRequestAdaptations();
+  const PARTIAL_THEN_ERROR = [
+    'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"PARTIAL"},"finish_reason":null}]}',
+    'data: {"error":{"message":"reasoning_effort: Extra inputs are not permitted","type":"invalid_request_error"},"status_code":400}',
+    ''
+  ].join('\n\n');
+  await withServer((call) => call.body.reasoning_effort !== undefined ? { sse: PARTIAL_THEN_ERROR } : { sse: OK_STREAM }, async (baseUrl, calls) => {
+    const { events, failure } = await adapterSend(providerSettings(baseUrl, { id: 'adapter-after-output' }), 'adapter-after-output');
+    assert.ok(failure, '本次尝试失败，由内核决定下一步');
+    assert.equal(calls.length, 1);
+    assert.equal(events.some((event) => event.kind === 'completed'), false);
+    assert.equal(events.filter((event) => event.kind === 'output_delta').map((event) => event.content.text).join(''), 'PARTIAL');
+  });
+  resetProviderRequestAdaptations();
+});

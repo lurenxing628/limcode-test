@@ -398,12 +398,54 @@ function normalizeErrorText(text: string): string {
   return text.replace(/\\"/g, '"').replace(/\\n/g, '\n');
 }
 
+/**
+ * 错误的 HTTP 状态。中转常在 HTTP 200 的流里报上游错误，状态码写在载荷自己的 `status_code` 里
+ * （例如 `{"error":{…},"status_code":400}`）：传输层状态不是错误码时，改读载荷里的状态码。
+ */
 export function providerErrorStatus(rawError: unknown): number | undefined {
   if (!isRecord(rawError)) return undefined;
-  if (typeof rawError.status === 'number') return rawError.status;
-  for (const key of ['error', 'cause', 'response', 'rawError']) {
-    const nested = rawError[key];
-    if (isRecord(nested) && typeof nested.status === 'number') return nested.status;
+  let status: number | undefined;
+  if (typeof rawError.status === 'number') status = rawError.status;
+  else {
+    for (const key of ['error', 'cause', 'response', 'rawError']) {
+      const nested = rawError[key];
+      if (isRecord(nested) && typeof nested.status === 'number') {
+        status = nested.status;
+        break;
+      }
+    }
+  }
+  if (status !== undefined && status >= 400) return status;
+  return payloadStatusCode(rawError, 0) ?? status;
+}
+
+function payloadStatusCode(value: unknown, depth: number): number | undefined {
+  if (depth > 5) return undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (depth === 0 || !trimmed.startsWith('{') || !/status_?code|http_status/i.test(trimmed)) return undefined;
+    try {
+      return payloadStatusCode(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return undefined;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 32)) {
+      const found = payloadStatusCode(entry, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+  for (const key of ['status_code', 'statusCode', 'http_status']) {
+    const candidate = value[key];
+    if (typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 400 && candidate <= 599) return candidate;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    if (key === 'headers' || key === 'stack') continue;
+    const found = payloadStatusCode(nested, depth + 1);
+    if (found !== undefined) return found;
   }
   return undefined;
 }

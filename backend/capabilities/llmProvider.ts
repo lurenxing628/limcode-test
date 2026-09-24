@@ -515,10 +515,16 @@ export async function startLlmProvider(
     let sawRetry = false;
 
     while (true) {
+      // 本次尝试发出的任何事件（输出、思考、工具调用、原生控制）都已交给下游；之后再立即重发会把它们重复一遍。
+      let attemptEmitted = false;
+      const attemptEmit: Emit = (event) => {
+        attemptEmitted = true;
+        streamEmit(event);
+      };
       try {
         await runLlmAttempt(
           request,
-          streamEmit,
+          attemptEmit,
           settings,
           provider,
           httpFallbackProvider,
@@ -536,7 +542,8 @@ export async function startLlmProvider(
         if (isRequestAbort(signal)) return;
         const failure = failureFromCaughtError(error);
         // 明确的不支持参数 400：按目标记住适配后立即重发；不占普通重试次数，也不等待。
-        if (!retryControl.cancelRequested && adaptationRetry.shouldRetryImmediately(failure.rawError)) continue;
+        // 只有本次尝试还没发出任何事件时才立即重发；已经发出输出的，只记住给之后的请求，本次照常报错。
+        if (!retryControl.cancelRequested && adaptationRetry.shouldRetryImmediately(failure.rawError) && !attemptEmitted) continue;
         const nextRetryCount = retryCount + 1;
         // 接入库标明不可重试的错误（如 finish_reason=length 截断的工具参数）原样重发只会再失败一次。
         const canRetry = retryEnabled
