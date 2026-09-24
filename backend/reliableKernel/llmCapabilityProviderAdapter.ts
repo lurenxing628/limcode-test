@@ -75,8 +75,10 @@ import {
   markedReinjectedInput,
   readTurnReminderMarker,
   turnReminderContent,
-  turnReminderDeliveries
+  turnReminderDeliveries,
+  type TurnReminderLayout
 } from '../capabilities/claudeTurnScopedReminders';
+import { claudeTurnScopedRemindersFallenBackForModel } from '../capabilities/providerParameterAdaptation';
 import { claudeTurnScopedCompaction } from './turnReminderProjection';
 import {
   openAICompatibleModelReadsGeminiSignatures,
@@ -143,16 +145,20 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       return estimateCompactProjection(toLlmCompactRequest(request));
     }
     const projected = toLlmStartRequest(request);
+    // 按实际发出的布局估算：网关拒绝过轮内系统消息的渠道与模型退回尾巴模式（与开关关闭时相同）。
     // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
     // 只有按 user 消息发出的历史提醒计入上下文；本轮提醒照常计入 turnReminderTokens。重新注入输入的历史副本是
     // 普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，也就没有本轮输入。
-    const deliveries = turnReminderDeliveries(projected.contents, 'claude_turn_scoped');
+    const deliveries = turnReminderDeliveries(projected.contents, estimatedTurnReminderLayout(request.providerId, request.modelId));
     let tailInputSuperseded = false;
     const visibleContents = projected.contents.filter((content, index) => {
       const marker = readTurnReminderMarker(content);
       if (!marker) return true;
-      if (marker.placement === 'current' && marker.kind === 'reinjected_input') tailInputSuperseded = true;
-      else if (marker.placement === 'current') return true;
+      if (marker.placement === 'current') {
+        if (deliveries[index] !== 'omitted') return true;
+        if (marker.kind === 'reinjected_input') tailInputSuperseded = true;
+        return false;
+      }
       return deliveries[index] === 'user';
     });
     const frozenCurrent = request.requestAddenda?.currentTurnInput;
@@ -1320,7 +1326,11 @@ export function estimateCompactProjection(request: LlmCompactRequest): Projected
     });
   }
   // Claude 原生压缩带着的历史提醒已被清除，不计 token；重新注入输入的历史副本照常计入。
-  const deliveries = turnReminderDeliveries(request.contents, 'claude_turn_scoped');
+  // 网关拒绝过轮内系统消息时按尾巴模式发送，历史副本都不发送。
+  const deliveries = turnReminderDeliveries(
+    request.contents,
+    estimatedTurnReminderLayout(request.settingsSnapshot?.providerConfigId, request.settingsSnapshot?.modelId)
+  );
   const contents = request.contents.filter((content, index) =>
     !readTurnReminderMarker(content) || deliveries[index] === 'user');
   return estimateProjectedModelInput({
@@ -1329,6 +1339,13 @@ export function estimateCompactProjection(request: LlmCompactRequest): Projected
     contextContents: [...prior, ...contents],
     providerFramingTokens: request.methodKind === 'provider_native' ? 64 : 512
   });
+}
+
+/** 带提醒标记的内容会按哪种布局发出：只有网关拒绝过轮内系统消息的渠道与模型退回尾巴模式。 */
+function estimatedTurnReminderLayout(providerConfigId: string | undefined, modelId: string | undefined): TurnReminderLayout {
+  return providerConfigId && modelId && claudeTurnScopedRemindersFallenBackForModel(providerConfigId, modelId)
+    ? 'tail'
+    : 'claude_turn_scoped';
 }
 
 function compressionContext(

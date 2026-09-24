@@ -44,7 +44,7 @@ const { createLlmProviderCapability, dryRunCompactLlmProvider, dryRunLlmProvider
 const { applyFrozenModelProviderConfig } = load('backend/reliableKernel/llmCapabilityProviderRegistry.js');
 const { workEnvironmentIdFromUri } = load('shared/workEnvironmentCatalog.js');
 const reminders = load('backend/capabilities/claudeTurnScopedReminders.js');
-const { learnedProviderRequestAdaptations, resetProviderRequestAdaptations } = load('backend/capabilities/providerParameterAdaptation.js');
+const { learnProviderRequestAdaptations, learnedProviderRequestAdaptations, resetProviderRequestAdaptations } = load('backend/capabilities/providerParameterAdaptation.js');
 
 const BETA = 'mid-conversation-system-clear-at-2026-08-21';
 const COMPACT_BETA = 'compact-2026-09-04';
@@ -278,6 +278,27 @@ test('(a) 网关回退与其他 provider：尾巴模式与开关关闭逐字节�
     const without = await render(request(false));
     assert.equal(JSON.stringify(withSwitch), JSON.stringify(without), `${provider}: the switch changes nothing`);
     assert.equal(JSON.stringify(withSwitch.start).includes('turnReminder'), false);
+  }
+});
+
+test('(a) 网关回退后估算按实际发出的尾巴布局：与开关关闭时相同，不再计入不会发出的历史副本', async () => {
+  resetProviderRequestAdaptations();
+  try {
+    const [, k1] = reinjectionRounds();
+    const off = await render(reinjectionRounds({ claudeTurnScopedReminders: false })[1]);
+    const turnScoped = await render(k1);
+    assert.notDeepEqual(turnScoped.estimate, off.estimate, 'turn-scoped: the history copy of the input is sent and counted');
+    // 这个渠道与模型的网关拒绝过轮内系统消息：之后按尾巴模式发送，估算也按尾巴模式。
+    learnProviderRequestAdaptations(
+      { providerConfigId: PROVIDER_ID, provider: 'claude', baseUrl: 'https://example.invalid/v1', model: MODEL_ID, configRevision: 1 },
+      { status: 400, rawBody: { type: 'error', error: { type: 'invalid_request_error', message: 'messages.3.clear_at: Extra inputs are not permitted' } } },
+      { claudeTurnScopedReminders: true }
+    );
+    const fallenBack = await render(k1);
+    assert.deepEqual(fallenBack.estimate, off.estimate);
+    assert.deepEqual(await renderTail(fallenBack), off.wire, 'and the wire is the switch-off request');
+  } finally {
+    resetProviderRequestAdaptations();
   }
 });
 

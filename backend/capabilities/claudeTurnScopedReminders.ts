@@ -147,10 +147,11 @@ export function withClaudeTurnScopedSystemBeta(
  * 每一轮都按 1.25 倍价格重写整段历史，历史部分永远命中不了。
  * 官方（https://platform.claude.com/docs/en/build-with-claude/prompt-caching）：缓存按前缀匹配，易变内容要放在最后一个
  * 断点之后；断点前面的前缀在下一次请求里原样出现，才能从之前写入的位置读到。
- * 这里把消息断点挪到易失尾巴之前最后一条 user 消息的最后一块上（同一个 cache_control，断点数不变）；
- * 挪动、增删 cache_control 不改变前缀，也不影响已有思考块的有效性。
+ * 这里把消息断点挪到易失尾巴之前最近一条能打断点的消息上（同一个 cache_control，断点数不变）：
+ * user 消息打在最后一块；续写场景 `[U, M, 提醒]` 里是模型输出 M，打在它最后一个非思考块上
+ * （思考块不能带 cache_control），M 也进缓存。挪动、增删 cache_control 不改变前缀，也不影响已有思考块的有效性。
  * `volatileTailCount` 是内容末尾的易失条数（每条内容编码为一条 user 消息）；形状对不上、尾巴上没有断点、
- * 尾巴前面没有 user 消息时原样返回同一引用。
+ * 尾巴前面没有能打断点的消息时原样返回同一引用。
  */
 export function withClaudeCacheBreakpointBeforeVolatileTail(
   request: EncodedProviderRequest,
@@ -182,12 +183,25 @@ export function withClaudeCacheBreakpointBeforeVolatileTail(
   });
   if (cacheControl === undefined) return request;
   let target = -1;
-  for (let index = tailStart - 1; index >= 0; index -= 1) {
+  let targetBlock = -1;
+  for (let index = tailStart - 1; index >= 0 && target < 0; index -= 1) {
     const message = messages[index];
-    if (!isRecord(message) || message.role !== 'user') continue;
-    if ((typeof message.content === 'string' && message.content)
-      || (Array.isArray(message.content) && message.content.length > 0 && isRecord(message.content[message.content.length - 1]))) {
+    if (!isRecord(message) || (message.role !== 'user' && message.role !== 'assistant')) continue;
+    if (typeof message.content === 'string') {
+      if (message.content) {
+        target = index;
+        targetBlock = 0;
+      }
+      continue;
+    }
+    if (!Array.isArray(message.content)) continue;
+    // user 消息打在最后一块上；模型输出跳过末尾的思考块。形状不对的块不动。
+    for (let block = message.content.length - 1; block >= 0; block -= 1) {
+      const candidate = message.content[block];
+      if (!isRecord(candidate)) break;
+      if (message.role === 'assistant' && (candidate.type === 'thinking' || candidate.type === 'redacted_thinking')) continue;
       target = index;
+      targetBlock = block;
       break;
     }
   }
@@ -196,9 +210,9 @@ export function withClaudeCacheBreakpointBeforeVolatileTail(
   const blocks = typeof targetMessage.content === 'string'
     ? [{ type: 'text', text: targetMessage.content }]
     : targetMessage.content as Record<string, unknown>[];
-  const marked = { ...targetMessage, content: [...blocks.slice(0, -1), { ...blocks[blocks.length - 1], cache_control: cacheControl }] };
+  const markedBlocks = blocks.map((block, index) => index === targetBlock ? { ...block, cache_control: cacheControl } : block);
   const next = [...messages.slice(0, tailStart), ...strippedTail];
-  next[target] = marked;
+  next[target] = { ...targetMessage, content: markedBlocks };
   return { ...request, body: { ...body, messages: next } };
 }
 

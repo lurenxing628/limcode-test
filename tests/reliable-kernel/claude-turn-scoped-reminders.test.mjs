@@ -195,9 +195,10 @@ const withoutCacheControl = (value) => JSON.parse(JSON.stringify(value, (key, ne
 const hasMarker = (value) => /"(?:turnReminder|claudeSystemMessage|claudeTurnScopedReminders)"/.test(JSON.stringify(value));
 
 /**
- * 尾巴模式把消息缓存断点挪到易失尾巴之前（claudeTurnScopedReminders.ts withClaudeCacheBreakpointBeforeVolatileTail）。
- * 这里把断点放回改动前的位置（最后一条 user 消息的最后一块；移走断点的纯文本消息还原成字符串简写），
- * 用来证明除断点位置以外，线上请求与改动前的构建逐字节相同。
+ * 尾巴模式把消息缓存断点挪到易失尾巴之前（claudeTurnScopedReminders.ts withClaudeCacheBreakpointBeforeVolatileTail）；
+ * 续写场景 `[U, M, 提醒]` 挪到模型输出 M 最后一个非思考块上。
+ * 这里把断点放回改动前的位置（最后一条 user 消息的最后一块；移走断点的纯文本 user 消息还原成字符串简写，
+ * 模型输出本来就是块数组），用来证明除断点位置以外，线上请求与改动前的构建逐字节相同。
  */
 function withLegacyBreakpoint(wire) {
   const copy = structuredClone(wire);
@@ -209,7 +210,9 @@ function withLegacyBreakpoint(wire) {
     if (!last?.cache_control) return;
     control = last.cache_control;
     delete last.cache_control;
-    if (message.content.length === 1 && last.type === 'text' && Object.keys(last).length === 2) messages[index] = { ...message, content: last.text };
+    if (message.role === 'user' && message.content.length === 1 && last.type === 'text' && Object.keys(last).length === 2) {
+      messages[index] = { ...message, content: last.text };
+    }
   });
   const lastUser = messages.findLast((message) => message.role === 'user');
   if (control && lastUser) {

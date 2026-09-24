@@ -194,15 +194,45 @@ test('纯函数边界：形状对不上时原样返回同一引用；字符串�
   assert.equal(withClaudeCacheBreakpointBeforeVolatileTail(request, 2), request, 'the tail must be user messages only');
   const unmarked = { headers: {}, body: { messages: [{ role: 'user', content: 'q' }, { role: 'user', content: 'r' }] } };
   assert.equal(withClaudeCacheBreakpointBeforeVolatileTail(unmarked, 1), unmarked, 'no breakpoint on the tail');
-  const onlyAssistantBefore = { headers: {}, body: { messages: [{ role: 'assistant', content: [{ type: 'text', text: 'a' }] }, tailMessage] } };
-  assert.equal(withClaudeCacheBreakpointBeforeVolatileTail(onlyAssistantBefore, 1), onlyAssistantBefore, 'no user message before the tail');
+  const onlyThinkingBefore = { headers: {}, body: { messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 's' }] }, tailMessage] } };
+  assert.equal(withClaudeCacheBreakpointBeforeVolatileTail(onlyThinkingBefore, 1), onlyThinkingBefore, 'thinking blocks cannot carry cache_control');
+  // 续写场景 [U, M, 提醒]：断点落在模型输出最后一个非思考块上，模型输出也在缓存里。
   const moved = withClaudeCacheBreakpointBeforeVolatileTail(request, 1);
   assert.deepEqual(moved.body.messages, [
-    { role: 'user', content: [{ type: 'text', text: 'q', cache_control: CACHE }] },
-    { role: 'assistant', content: [{ type: 'text', text: 'a' }] },
+    { role: 'user', content: 'q' },
+    { role: 'assistant', content: [{ type: 'text', text: 'a', cache_control: CACHE }] },
     { role: 'user', content: [{ type: 'text', text: 'r' }] }
   ]);
   assert.equal(request.body.messages[2].content[0].cache_control, CACHE, 'the input is not mutated');
+  const thinkingLast = { headers: {}, body: { messages: [
+    { role: 'user', content: 'q' },
+    { role: 'assistant', content: [{ type: 'text', text: 'a' }, { type: 'thinking', thinking: '', signature: 's' }] },
+    tailMessage
+  ] } };
+  assert.deepEqual(withClaudeCacheBreakpointBeforeVolatileTail(thinkingLast, 1).body.messages[1].content, [
+    { type: 'text', text: 'a', cache_control: CACHE }, { type: 'thinking', thinking: '', signature: 's' }
+  ]);
+  const thinkingOnly = { headers: {}, body: { messages: [
+    { role: 'user', content: 'q' },
+    { role: 'assistant', content: [{ type: 'redacted_thinking', data: 'x' }] },
+    tailMessage
+  ] } };
+  assert.deepEqual(withClaudeCacheBreakpointBeforeVolatileTail(thinkingOnly, 1).body.messages[0],
+    { role: 'user', content: [{ type: 'text', text: 'q', cache_control: CACHE }] }, 'an assistant turn with only thinking is skipped');
+});
+
+test('尾巴模式的续写（未完成任务检查）：断点在模型输出上，下一次请求读到包括它在内的整段历史', async () => {
+  const done = message('seg-model-done', 'model', { role: 'model', parts: [
+    { text: '', thought: true, thoughtSignature: 'claude:signed-done' }, { text: 'Implemented.' }
+  ] });
+  const first = await wire(fullRequest({ context: [...loopContext(2), done], reminderText: reminder(2) }));
+  const last = first.messages.at(-1);
+  assert.equal(JSON.stringify(last).includes('Current Turn Task Card'), true);
+  assert.deepEqual(markedMessages(first), [first.messages.length - 2]);
+  const assistant = first.messages.at(-2);
+  assert.equal(assistant.role, 'assistant');
+  assert.deepEqual(assistant.content.at(-1), { type: 'text', text: 'Implemented.', cache_control: CACHE });
+  assert.equal(assistant.content.some((block) => block.type === 'thinking' && block.cache_control), false);
 });
 
 const CLAUDE_OK_STREAM = [

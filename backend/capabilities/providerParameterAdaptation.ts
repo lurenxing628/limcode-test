@@ -193,6 +193,18 @@ export function claudeTurnScopedRemindersFallenBack(target: ProviderRequestTarge
 }
 
 /**
+ * 内核估算用：这个渠道配置下的这个模型已经退回尾巴模式（内核只有冻结的渠道 id 与模型，不带接口地址与配置版本；
+ * 改过配置时记忆已按渠道清空，所以按渠道 id 与模型查就是当前配置）。
+ */
+export function claudeTurnScopedRemindersFallenBackForModel(providerConfigId: string, model: string): boolean {
+  for (const [key, state] of adaptationStates) {
+    if (state.providerConfigId !== providerConfigId || state.model !== model) continue;
+    if (liveAdaptationState(key)?.claudeTurnScopedRemindersFallbackAt !== undefined) return true;
+  }
+  return false;
+}
+
+/**
  * 在 provider 的“编码 + requestBody 合并”之后挂一个后处理器。chat、chatStream、dryRun（含 WebSocket
  * 路径取帧用的 dryRun）都经过这一步，因此适配同时作用于真实请求与 dry-run 展示。
  */
