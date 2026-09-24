@@ -4148,9 +4148,15 @@ function packSegmentedSummaryNodes(
   return groups;
 }
 
+/**
+ * 目标长度是上限：压缩后留给最近消息的空间按它扣除。模型数 token 不准，常超出“约 N”两成左右，
+ * 所以请它瞄准上限的八成，并说明超出部分会被机械删减，让它自己决定删什么。
+ */
 function withSummaryTargetInstruction(prompt: string, targetTokens: number | undefined): string {
   if (typeof targetTokens !== 'number' || !Number.isFinite(targetTokens) || targetTokens <= 0) return prompt;
-  return `${prompt}\n\n将可见摘要正文控制在约 ${Math.floor(targetTokens)} tokens；优先保留标识符、数字、文件名、依赖关系、决定和未完成事项。`;
+  const limit = Math.floor(targetTokens);
+  const aim = Math.max(1, Math.floor(limit * 0.8));
+  return `${prompt}\n\n将可见摘要正文控制在约 ${aim} tokens，最多不超过 ${limit} tokens；超出上限的部分会被机械删减，所以宁可写短一些。优先保留标识符、数字、文件名、依赖关系、决定和未完成事项。`;
 }
 
 const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = SEGMENTED_SUMMARY_LEAF_CALL_LIMIT;
@@ -4188,8 +4194,59 @@ async function summarizeSingleRound(
   const trimmed = (await executeSummaryProviderCall(
     resolved, call.request, signal, { allowCompatibilityRetry: false }
   )).trim();
+  const summary = await shortenOversizedSummary(resolved, extractSummaryTag(trimmed), call, signal);
   // Method changes belong to the durable coordinator, never a hidden leaf-level fallback.
-  return finalizeStructuredSummary(extractSummaryTag(trimmed), fallback, call.targetTokens);
+  return finalizeStructuredSummary(summary, fallback, call.targetTokens);
+}
+
+/**
+ * 模型数不准 token，常写得比上限长。超出上限时请它把自己的摘要删短一次，删什么由模型决定；
+ * 仍超出才由 finalizeStructuredSummary 按条目机械删减。拒答、没按标题输出或删短请求失败时原样交回。
+ */
+async function shortenOversizedSummary(
+  resolved: ResolvedSummaryProvider,
+  candidate: string,
+  call: SummaryProviderCall,
+  signal?: AbortSignal
+): Promise<string> {
+  const parsed = candidate.trim() ? parseStructuredSummary(candidate) : undefined;
+  if (!parsed || structuredSummaryFactCount(parsed) === 0) return candidate;
+  const text = modelSummaryText(candidate);
+  const currentTokens = estimateTokenCount(text);
+  const limitTokens = summaryBodyBudget(call.targetTokens);
+  if (currentTokens <= limitTokens) return candidate;
+  logCompressionDebug('summary.shorten.begin', { label: call.label, currentTokens, limitTokens });
+  try {
+    const shortened = extractSummaryTag((await executeSummaryProviderCall(resolved, {
+      contents: [{ role: 'user', parts: [{ text }] }],
+      systemInstruction: { parts: [{ text: summaryShortenInstruction(currentTokens, limitTokens) }] },
+      ...(call.request.generationConfig ? { generationConfig: call.request.generationConfig } : {})
+    }, signal, { allowCompatibilityRetry: false })).trim());
+    const reparsed = parseStructuredSummary(shortened);
+    const accepted = !!reparsed && structuredSummaryFactCount(reparsed) > 0;
+    logCompressionDebug('summary.shorten.done', {
+      label: call.label, accepted, shortenedTokens: estimateTokenCount(modelSummaryText(shortened))
+    });
+    return accepted ? shortened : candidate;
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    logCompressionDebug('summary.shorten.failed', {
+      label: call.label, message: error instanceof Error ? error.message : String(error)
+    });
+    return candidate;
+  }
+}
+
+function summaryShortenInstruction(currentTokens: number, limitTokens: number): string {
+  const aim = Math.max(1, Math.floor(limitTokens * 0.8));
+  const cutPercent = Math.min(90, Math.max(10, Math.round((1 - aim / currentTokens) * 100)));
+  return [
+    `下面是一份对话摘要，现在约 ${currentTokens} tokens，超出了 ${limitTokens} tokens 的上限。`,
+    `把它删短到约 ${aim} tokens（大约删掉 ${cutPercent}%），最多不超过 ${limitTokens} tokens。`,
+    '保持原有标题和结构：目标、重要约束、决定和准确标识、工作状态（已完成 / 正在做 / 受阻）、下一步、相关文件；缺少内容时写“无”。',
+    '先删重复内容、过程描述和能从文件里重新读到的大段代码；保留准确的路径、符号名、命令、报错、URL、版本号、业务 ID 和未完成事项。',
+    '不要添加新内容，只输出删短后的摘要。'
+  ].join('\n');
 }
 
 async function executeSummaryProviderCall(
@@ -4391,8 +4448,9 @@ async function generateSummaryText(
     throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
   }
   const text = extractSummaryTag((await executeSummaryProviderCall(resolved, call.request, signal)).trim());
+  const summary = await shortenOversizedSummary(resolved, text, call, signal);
   return {
-    text: finalizeStructuredSummary(text, fallback, targetTokens),
+    text: finalizeStructuredSummary(summary, fallback, targetTokens),
     settings: resolved.settings
   };
 }
@@ -4562,15 +4620,34 @@ function isStructuredSummaryText(text: string): boolean {
  * 模型给出按标题组织、且有内容的摘要时，它就是最终摘要：模型已拿到旧摘要和新增记录，按提示输出替代它们的最新摘要。
  * 不再把逐条抽取的原始记录（整段工具调用 / 结果 JSON、原样复制的回复）并进来——实测它们会挤满目标长度，
  * 把模型自己的总结挤到被截掉的位置。原始记录始终保存在库里，可随时“从原始记录重建摘要”，不会因此永久丢失。
+ * 在长度上限内原样保留模型写的正文（代码块、编号和层级都不动）；超出时先请模型自己删短一次
+ * （shortenOversizedSummary），仍超出才按条目机械删减。
  * 模型没按标题输出（例如拒答）或各节全是“无”时，才退回逐条抽取的确定性摘要。
  */
 function finalizeStructuredSummary(candidate: string, fallback: string, targetTokens: number): string {
   requireSummaryVisibleOutput(candidate);
   const parsed = parseStructuredSummary(candidate);
-  if (parsed && structuredSummaryFactCount(parsed) > 0) return fitStructuredSummary(parsed, targetTokens);
+  if (parsed && structuredSummaryFactCount(parsed) > 0) {
+    const text = modelSummaryText(candidate);
+    return estimateTokenCount(text) <= summaryBodyBudget(targetTokens) ? text : fitStructuredSummary(parsed, targetTokens);
+  }
   const fallbackSummary = parseStructuredSummary(fallback)
     ?? structuredSummaryFromLooseText(fallback, 'active');
   return fitStructuredSummary(fallbackSummary, targetTokens);
+}
+
+/** The model's summary from its 目标 heading on, so any preamble such as “以下是摘要：” is dropped. */
+function modelSummaryText(candidate: string): string {
+  const lines = stripSummaryEnvelope(candidate).split(/\r?\n/);
+  const start = lines.findIndex((line) => summaryHeading(line.trim().replace(/^#{1,6}\s*/, ''))?.field === 'goals');
+  return (start > 0 ? lines.slice(start) : lines).join('\n').trim();
+}
+
+const CONTEXT_SUMMARY_PREFIX = '[Context Summary]\n\n';
+
+/** Tokens left for the summary body once the context-summary prefix is counted against the target. */
+function summaryBodyBudget(targetTokens: number): number {
+  return Math.max(1, targetTokens - estimateTokenCount(CONTEXT_SUMMARY_PREFIX));
 }
 
 function structuredSummaryFactCount(summary: StructuredSummary): number {
@@ -4709,13 +4786,15 @@ function fitStructuredSummary(input: StructuredSummary, targetTokens: number): s
 }
 
 function summaryContents(summary: string, targetTokens: number): MessageContent[] {
-  const prefix = '[Context Summary]\n\n';
+  const prefix = CONTEXT_SUMMARY_PREFIX;
   const prefixTokens = estimateTokenCount(prefix);
-  const bodyBudget = Math.max(1, targetTokens - prefixTokens);
-  const structured = parseStructuredSummary(summary);
-  const boundedBody = structured
-    ? fitStructuredSummary(structured, bodyBudget)
-    : fitTextToTokenLimit(summary, bodyBudget);
+  const bodyBudget = summaryBodyBudget(targetTokens);
+  // A body already inside the budget is kept exactly as written; only an oversized one is cut.
+  let boundedBody = summary;
+  if (estimateTokenCount(summary) > bodyBudget) {
+    const structured = parseStructuredSummary(summary);
+    boundedBody = structured ? fitStructuredSummary(structured, bodyBudget) : fitTextToTokenLimit(summary, bodyBudget);
+  }
   const text = targetTokens > prefixTokens
     ? `${prefix}${boundedBody}`
     : fitTextToTokenLimit(boundedBody, targetTokens);

@@ -30,7 +30,7 @@ export function summaryRebuildTooltipRows(): Array<{ label: string; value: strin
 
 export const SUMMARY_REBUILD_DESCRIPTION = '把当前上下文里的摘要全部展开成原始对话和工具记录，再按现在的压缩设置重新总结。原始记录和旧摘要都会保留。';
 
-export const SUMMARY_REBUILD_COST_NOTE = '原始记录超过压缩模型的窗口时会分段总结（最多 32 段），输入 token 大约等于原始记录的总量。';
+export const SUMMARY_REBUILD_COST_NOTE = '原始记录超过压缩模型的窗口时会分段总结（最多 32 段），输入 token 大约等于原始记录的总量。模型写的摘要超出目标长度时，会再请求一次让它自己删短。';
 
 const METHOD_LABELS: Record<Extract<CompressionRebuildPreviewOutcome, { kind: 'ready' }>['methodKind'], string> = {
   provider_native: '服务商原生压缩',

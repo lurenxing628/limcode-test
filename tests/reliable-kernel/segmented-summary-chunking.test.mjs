@@ -721,9 +721,19 @@ for (const [provider, baseUrl] of PROVIDERS) {
   });
 }
 
-async function compactWithReply(request, reply) {
+/** `replies` answers the requests in order (the last one repeats); `{ status }` answers with an HTTP error. */
+async function compactWithReply(request, replies, sentBodies = []) {
+  const queue = Array.isArray(replies) ? replies : [replies];
   const server = http.createServer(async (req, res) => {
-    for await (const _chunk of req) { /* drain */ }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    sentBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    const reply = queue[Math.min(sentBodies.length, queue.length) - 1];
+    if (typeof reply === 'object') {
+      res.writeHead(reply.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'shorten failed' } }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       id: 'chatcmpl-authoritative', object: 'chat.completion', created: 1, model: 'gpt-test',
@@ -783,4 +793,69 @@ test('a reply without the required headings (e.g. a refusal) still falls back to
   const text = await compactWithReply(toolHistoryRequest(), 'I cannot help with that request.');
   assert.doesNotMatch(text, /I cannot help/);
   assert.match(text, /SOURCE-USER-ASK/);
+});
+
+test('a model summary inside the target is kept verbatim: code blocks, numbering and nesting survive, a preamble is dropped', async () => {
+  const body = [
+    '目标', '- 给 /health 增加数据库检查，端口保持 8080', '',
+    '重要约束、决定和准确标识', '- 超时 2 秒：', '  ```js', '  await withTimeout(pool.query(\'SELECT 1\'), 2000);', '  ```', '',
+    '工作状态', '- 已完成：', '  1. 读取 package.json', '  2. 替换 /health 路由', '- 正在做：', '  - 补 withTimeout', '- 受阻：', '  - 无', '',
+    '下一步', '1. 定义 withTimeout', '2. 重跑 npm test', '', '相关文件', '- src/server.js'
+  ].join('\n');
+  const sent = [];
+  const text = await compactWithReply(toolHistoryRequest(), `好的，以下是摘要：\n\n${body}`, sent);
+  assert.equal(text, `[Context Summary]\n\n${body}`);
+  const system = JSON.stringify(sent[0].messages?.find((message) => message.role === 'system') ?? sent[0]);
+  assert.match(system, /最多不超过 4000 tokens/);
+  assert.match(system, /控制在约 3200 tokens/);
+});
+
+function oversizedSummaryRequest() {
+  const request = toolHistoryRequest();
+  request.methodConfigSnapshot.llmSummary.targetTokens = 300;
+  return request;
+}
+
+const OVERSIZED_REPLY = [
+  '目标', '- 保留的目标', '', '重要约束、决定和准确标识', '- 无', '',
+  '工作状态', '  - 已完成', '    - 无', '  - 正在做', '    - 无', '  - 受阻', '    - 无', '',
+  '下一步', '- 无', '', '相关文件',
+  ...Array.from({ length: 200 }, (_, index) => `- src/generated/module-${index}/implementation-file-${index}.ts`)
+].join('\n');
+
+const systemTextOf = (body) => JSON.stringify(body.messages?.find((message) => message.role === 'system') ?? body);
+
+test('a model summary over the target is shortened by the model itself and kept verbatim', async () => {
+  const shortened = [
+    '目标', '- 保留的目标', '', '重要约束、决定和准确标识', '- 生成文件共 200 个：', '  ```', '  src/generated/module-*/implementation-file-*.ts', '  ```', '',
+    '工作状态', '- 已完成：', '  1. 生成模块', '- 正在做：无', '- 受阻：无', '', '下一步', '- 无', '', '相关文件', '- src/generated/'
+  ].join('\n');
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), [OVERSIZED_REPLY, shortened], sent);
+  assert.equal(sent.length, 2);
+  assert.match(systemTextOf(sent[1]), /删短到约 \d+ tokens/);
+  assert.equal(JSON.stringify(sent[1].messages.find((message) => message.role === 'user')).includes('implementation-file-199'), true);
+  assert.equal(text, `[Context Summary]\n\n${shortened}`);
+});
+
+test('a summary still over the target after the model shortened it is cut down mechanically', async () => {
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), OVERSIZED_REPLY, sent);
+  assert.equal(sent.length, 2, 'one summary request plus exactly one shorten request');
+  assert.match(text, /保留的目标/);
+  assert.ok(text.length < OVERSIZED_REPLY.length / 4, `expected the oversized summary to be cut, got ${text.length} chars`);
+});
+
+test('a failed shorten request falls back to the mechanical cut instead of failing the compression', async () => {
+  const sent = [];
+  const text = await compactWithReply(oversizedSummaryRequest(), [OVERSIZED_REPLY, { status: 500 }], sent);
+  assert.equal(sent.length, 2);
+  assert.match(text, /保留的目标/);
+  assert.ok(text.length < OVERSIZED_REPLY.length / 4);
+});
+
+test('a summary inside the target sends no shorten request', async () => {
+  const sent = [];
+  await compactWithReply(toolHistoryRequest(), OVERSIZED_REPLY.split('\n').slice(0, 20).join('\n'), sent);
+  assert.equal(sent.length, 1);
 });
