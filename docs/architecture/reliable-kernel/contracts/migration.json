@@ -8,6 +8,18 @@
   "dualWrite": false,
   "fallbackToLegacyRuntime": false,
   "runtimeProtocolNegotiation": false,
+  "boundedEpochUpgrade": {
+    "fromEpochs": [3, 4],
+    "toEpoch": 5,
+    "sourcePolicy": "exact-published-table-index-trigger-manifest-and-binding-fingerprint",
+    "backupPolicy": "sqlite-backup-api-plus-root-binding-and-epoch-manifest",
+    "recoveryPolicy": "durable-journal-forward-only",
+    "retiredEpoch3To4Recovery": "exact-pending-or-journal-before-current-upgrade",
+    "legacyChildContinuationPolicy": "epoch-3-and-exact-epoch-4-missing-link-only",
+    "epoch4MissingLinkPredecessor": "exact-single-missing-runtime-delivery-intent-link",
+    "unknownDriftPolicy": "fail-before-data-change",
+    "compatibilityFallback": false
+  },
   "candidateRoot": {
     "isolated": true,
     "mayReadLegacyRuntime": false,
@@ -2133,22 +2145,25 @@
       "atomic-rename-pointer",
       "delete-pending"
     ],
-    "startupRule": "cutover request 存在时进入 cutover-only coordinator；旧 epoch 在完整 RootBinding 校验和其他 Host 离线核验后 archive/reset 到 epoch 5。当前 epoch 5 只接受完整 table/index/trigger/manifest/RootBinding 指纹，不补表、不改写 client_mapping/digest、不运行已退休 epoch 3→4 升级器。未知当前漂移拒绝打开 Runtime。"
+    "startupRule": "cutover request 存在时进入 cutover-only coordinator；精确已发布 epoch 3、4 在完整 RootBinding、物理 DDL、manifest 与其他 Host 离线核验后，先持久备份再以单事务升级到 epoch 5，保留现有对话、消息和 CAS。中断按 durable journal 向前恢复，旧版 3→4 pending/journal 先核对并收敛。当前 epoch 5 仍只接受完整 table/index/trigger/manifest/RootBinding 指纹；未知漂移拒绝打开 Runtime。"
   },
   "epochPolicy": {
-    "current": "epoch 5 单一当前 schema；旧 epoch 3、4 及更早数据完整归档后创建新 Runtime，配置和 Workspace 保留；不运行前驱升级或单表补丁。",
+    "current": "epoch 5 单一当前 schema；已发布 epoch 3、4 以精确离线升级保留原 Runtime 内容；更早不受支持的旧根保持原样并拒绝自动重置。",
     "status": "单一当前 schema，不做协议协商或长期 migration chain",
-    "roadmapNote": "新增 epoch 必须明确决策，不能引入增量迁移链。"
+    "roadmapNote": "新增 epoch 必须明确决策；当前仅有精确已发布 3/4→5 升级，不引入开放式迁移链。"
   },
   "failureRule": "激活前失败保持旧 active pointer 且旧数据可恢复；激活后失败只修复新内核，不自动回退旧写入器。",
   "rootChange": "配置入口继续拒绝 Runtime 运行期间切换 data root，不新增迁移或切换命令。创建、升级、归档和重置持有目标 Runtime 数据根的维护互斥；重置先核验其他宿主已退出，再关闭本宿主并重新核验。最终 VSIX 的新宿主在数据库打开前完成 cutover-only coordinator 与 RootBinding 原子激活；日常运行不持有工作区终身锁。",
   "currentRuntimeEpoch": 5,
   "schemaUpgradePolicy": {
-    "olderEpoch": "offline-archive-reset",
+    "olderEpoch": "published-3-and-4-exact-offline-upgrade-others-fail-closed",
     "currentEpoch": "exact-manifest-and-physical-fingerprint-only",
     "partialAdditiveUpgrade": false,
     "unknownDrift": "fail-closed",
     "preserve": [
+      "runtime-rows",
+      "cas",
+      "sqlite-backup",
       "runtime-archive",
       "configuration",
       "workspace"

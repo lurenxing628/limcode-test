@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { createVscodeStoragePaths } from '../capabilities/vscodeStorage/paths';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
-import { createRuntimeRootPaths } from './contracts';
+import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths } from './contracts';
 import { RootAuthority, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
 import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { CUTOVER_JOURNAL_FILE, physicalCutoverRecoveryRequired } from './physicalCutover';
@@ -397,8 +397,16 @@ async function validateCandidateEpoch(binding: HistoricalRootBinding, pending?: 
     manifest.dataSetId === candidate.dataSetId && manifest.rootInstanceId === candidate.rootInstanceId
     && manifest.rootGeneration === candidate.rootGeneration && manifest.runtimeKernelEpoch === candidate.runtimeKernelEpoch;
   if (matches(binding)) return;
-  // The one permitted in-place upgrade durably writes epoch 4 immediately before publishing its
-  // pending pointer. Preserve that exact crash window for the existing journal recovery gate.
+  // An exact published predecessor can write the current epoch manifest immediately before
+  // publishing its pending pointer. Candidate selection must preserve that recovery window.
+  if (
+    (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4)
+    && pending?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH
+    && pending.dataSetId === binding.dataSetId && pending.rootInstanceId === binding.rootInstanceId
+    && pending.rootGeneration === binding.rootGeneration + 1
+    && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
+  ) return;
+  // The old 3→4 upgrader may also have been interrupted by a previously installed VSIX.
   if (
     binding.runtimeKernelEpoch === 3 && pending?.runtimeKernelEpoch === 4
     && pending.dataSetId === binding.dataSetId && pending.rootInstanceId === binding.rootInstanceId

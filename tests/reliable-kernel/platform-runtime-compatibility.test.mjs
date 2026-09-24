@@ -425,80 +425,35 @@ test('future/invalid pointer fences physical recovery and request before any mut
   }
 });
 
-for (const previousEpoch of [3, 4]) test(`旧 epoch ${previousEpoch} 整根归档到 epoch 5，配置和 Workspace保持原样`, async () => {
-  const runtimeScopeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-runtime-epoch-reset-'));
-  let runtime;
+test('unsupported old epoch leaves its pointer and data intact instead of starting an empty Runtime', async () => {
+  const runtimeScopeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-unsupported-epoch-'));
   try {
     const dataRootPath = path.join(runtimeScopeRoot, '.limcode-runtime', 'active');
     const paths = kernel.createRuntimeRootPaths(dataRootPath);
-    assert.ok(previousEpoch > 0);
     const previousBinding = {
-      paths,
-      dataSetId: 'previous-data-set',
-      rootInstanceId: 'previous-root-instance',
-      rootGeneration: 7,
-      pointerRevision: 9,
-      runtimeKernelEpoch: previousEpoch
+      paths, dataSetId: 'previous-data-set', rootInstanceId: 'previous-root-instance',
+      rootGeneration: 7, pointerRevision: 9, runtimeKernelEpoch: 2
     };
     const previousEpochManifest = {
-      kind: 'limcode-runtime-kernel-epoch',
-      runtimeKernelEpoch: previousEpoch,
-      dataSetId: previousBinding.dataSetId,
-      rootInstanceId: previousBinding.rootInstanceId,
-      rootGeneration: previousBinding.rootGeneration,
-      initializedAt: '2026-08-12T10:32:06.768Z'
+      kind: 'limcode-runtime-kernel-epoch', runtimeKernelEpoch: 2,
+      dataSetId: previousBinding.dataSetId, rootInstanceId: previousBinding.rootInstanceId,
+      rootGeneration: previousBinding.rootGeneration, initializedAt: '2026-08-12T10:32:06.768Z'
     };
-    const preservedSettingsPath = path.join(runtimeScopeRoot, 'settings-preserved.json');
-    const preservedWorkspacePath = path.join(runtimeScopeRoot, 'workspace-source.ts');
-    const archivedSentinelRelativePath = path.join('active', 'previous-runtime-sentinel.txt');
-
     await fs.mkdir(paths.casRootPath, { recursive: true });
     await fs.writeFile(paths.databasePath, 'previous-runtime-database\n');
     await fs.writeFile(paths.runtimeEpochPath, `${JSON.stringify(previousEpochManifest, null, 2)}\n`);
     await fs.writeFile(paths.rootPointerPath, `${JSON.stringify(previousBinding, null, 2)}\n`);
-    await fs.writeFile(
-      path.join(path.dirname(paths.rootPointerPath), archivedSentinelRelativePath),
-      'previous-runtime\n'
-    );
-    await fs.writeFile(preservedSettingsPath, 'preserved-setting\n');
-    await fs.writeFile(preservedWorkspacePath, 'preserved-workspace\n');
-
+    const pointerBefore = await fs.readFile(paths.rootPointerPath);
     const authority = new kernel.RootAuthority(() => dataRootPath);
-    const result = await new VscodeReliableKernelCutoverCoordinator(
-      authority,
-      runtimeScopeRoot
-    ).ensureCurrentRoot();
-
-    assert.equal(result.initialized, true);
-    assert.equal(result.cutoverPerformed, false);
-    assert.equal(result.epochResetFrom, previousEpoch);
-    assert.equal(result.binding.runtimeKernelEpoch, kernel.RUNTIME_KERNEL_EPOCH);
-    assert.equal(
-      path.dirname(result.epochResetBackupPath),
-      path.join(runtimeScopeRoot, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY)
+    await assert.rejects(
+      new VscodeReliableKernelCutoverCoordinator(authority, runtimeScopeRoot).ensureCurrentRoot(),
+      (error) => error?.code === 'runtime-epoch-upgrade-unsupported'
     );
-    assert.equal(
-      await fs.readFile(path.join(result.epochResetBackupPath, archivedSentinelRelativePath), 'utf8'),
-      'previous-runtime\n'
-    );
-    const archivedPointer = JSON.parse(await fs.readFile(
-      path.join(result.epochResetBackupPath, 'root-binding.json'),
-      'utf8'
-    ));
-    assert.equal(archivedPointer.runtimeKernelEpoch, previousEpoch);
-    assert.equal(await fs.readFile(preservedSettingsPath, 'utf8'), 'preserved-setting\n');
-    assert.equal(await fs.readFile(preservedWorkspacePath, 'utf8'), 'preserved-workspace\n');
-    assert.equal(await fs.readFile(path.join(result.epochResetBackupPath, 'active', 'limcode.sqlite'), 'utf8'), 'previous-runtime-database\n');
-
-    const current = await authority.current();
-    assert.equal(current.runtimeKernelEpoch, kernel.RUNTIME_KERNEL_EPOCH);
-    assert.notEqual(current.dataSetId, previousBinding.dataSetId);
-    runtime = await kernel.RuntimeDatabase.open(authority);
-    assert.equal(runtime.binding.dataSetId, current.dataSetId);
-  } finally {
-    if (runtime) await runtime.close().catch(() => undefined);
-    await fs.rm(runtimeScopeRoot, { recursive: true, force: true });
-  }
+    assert.deepEqual(await fs.readFile(paths.rootPointerPath), pointerBefore);
+    assert.equal(await fs.readFile(paths.databasePath, 'utf8'), 'previous-runtime-database\n');
+    await assert.rejects(fs.access(path.join(runtimeScopeRoot, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY)),
+      { code: 'ENOENT' });
+  } finally { await fs.rm(runtimeScopeRoot, { recursive: true, force: true }); }
 });
 
 test('Windows PowerShell Wrapper 发布完整启动、输出和退出证据', windowsOnly, async () => {

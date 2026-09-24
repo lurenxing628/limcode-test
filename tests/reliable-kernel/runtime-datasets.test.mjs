@@ -30,7 +30,7 @@ const fixture = async (run) => {
   finally { await fs.rm(root, { recursive: true, force: true }); }
 };
 
-async function createRoot(scopeRoot, epoch = 4) {
+async function createRoot(scopeRoot, epoch = 5) {
   const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot }));
   let binding = await authority.initializeEmptyRoot(async (next) => {
     await fs.mkdir(next.paths.casRootPath, { recursive: true });
@@ -38,7 +38,7 @@ async function createRoot(scopeRoot, epoch = 4) {
     // existing startup gate owns that validation, so this fixture never opens a real database.
     await fs.writeFile(next.paths.databasePath, 'selection-fixture');
   });
-  if (epoch !== 4) {
+  if (epoch !== 5) {
     binding = { ...binding, runtimeKernelEpoch: epoch };
     await fs.writeFile(binding.paths.rootPointerPath, JSON.stringify(binding));
     const manifest = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
@@ -165,20 +165,22 @@ test('已完成pending根保留原位置交给既有恢复入口', async () => f
   assert.ok(await fs.stat(binding.paths.rootPendingPath));
 }));
 
-test('epoch 3升级已刷出epoch 4但未发布pointer的精确恢复窗口仍可选中', async () => fixture(async (root, paths) => {
-  const binding = await createRoot(root, 3);
-  const pending = {
-    ...binding, runtimeKernelEpoch: 4,
-    rootGeneration: binding.rootGeneration + 1, pointerRevision: binding.pointerRevision + 1
-  };
-  await fs.writeFile(binding.paths.rootPendingPath, JSON.stringify(pending));
-  const epoch = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
-  await fs.writeFile(binding.paths.runtimeEpochPath, JSON.stringify({
-    ...epoch, runtimeKernelEpoch: pending.runtimeKernelEpoch, rootGeneration: pending.rootGeneration
-  }));
-  const placement = await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'));
-  assert.equal(placement.runtimeDataRootPath, binding.paths.dataRootPath);
-  assert.equal(JSON.parse(await fs.readFile(binding.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch, 3);
+for (const [fromEpoch, toEpoch] of [[3, 4], [3, 5], [4, 5]]) test(
+  `epoch ${fromEpoch}升级已刷出epoch ${toEpoch}但未发布pointer的精确恢复窗口仍可选中`,
+  async () => fixture(async (root, paths) => {
+    const binding = await createRoot(root, fromEpoch);
+    const pending = {
+      ...binding, runtimeKernelEpoch: toEpoch,
+      rootGeneration: binding.rootGeneration + 1, pointerRevision: binding.pointerRevision + 1
+    };
+    await fs.writeFile(binding.paths.rootPendingPath, JSON.stringify(pending));
+    const epoch = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
+    await fs.writeFile(binding.paths.runtimeEpochPath, JSON.stringify({
+      ...epoch, runtimeKernelEpoch: pending.runtimeKernelEpoch, rootGeneration: pending.rootGeneration
+    }));
+    const placement = await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'));
+    assert.equal(placement.runtimeDataRootPath, binding.paths.dataRootPath);
+    assert.equal(JSON.parse(await fs.readFile(binding.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch, fromEpoch);
 }));
 
 test('真实进程在cutover归档active后退出，选库仍放行原journal恢复且不改写身份', async () => fixture(async (root, paths) => {

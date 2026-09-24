@@ -460,16 +460,27 @@ function validateMigration(root, migration, failures) {
   for (const field of ['legacyRuntimeImport', 'dualWrite', 'fallbackToLegacyRuntime', 'runtimeProtocolNegotiation']) {
     if (migration?.[field] !== false) failures.push(`migration.${field}必须为false`);
   }
+  const upgrade = migration?.boundedEpochUpgrade;
+  failures.push(...exactSetProblems('精确升级前驱', [3, 4], upgrade?.fromEpochs ?? []));
   if (migration?.currentRuntimeEpoch !== 5
-    || migration?.boundedEpochUpgrade !== undefined
-    || migration?.schemaUpgradePolicy?.olderEpoch !== 'offline-archive-reset'
+    || upgrade?.toEpoch !== 5
+    || upgrade?.sourcePolicy !== 'exact-published-table-index-trigger-manifest-and-binding-fingerprint'
+    || upgrade?.backupPolicy !== 'sqlite-backup-api-plus-root-binding-and-epoch-manifest'
+    || upgrade?.recoveryPolicy !== 'durable-journal-forward-only'
+    || upgrade?.retiredEpoch3To4Recovery !== 'exact-pending-or-journal-before-current-upgrade'
+    || upgrade?.legacyChildContinuationPolicy !== 'epoch-3-and-exact-epoch-4-missing-link-only'
+    || upgrade?.epoch4MissingLinkPredecessor !== 'exact-single-missing-runtime-delivery-intent-link'
+    || upgrade?.unknownDriftPolicy !== 'fail-before-data-change'
+    || upgrade?.compatibilityFallback !== false
+    || migration?.schemaUpgradePolicy?.olderEpoch !== 'published-3-and-4-exact-offline-upgrade-others-fail-closed'
     || migration?.schemaUpgradePolicy?.currentEpoch !== 'exact-manifest-and-physical-fingerprint-only'
     || migration?.schemaUpgradePolicy?.partialAdditiveUpgrade !== false
     || migration?.schemaUpgradePolicy?.unknownDrift !== 'fail-closed') {
-    failures.push('Runtime epoch 5 只允许旧代离线归档重置，当前代完整指纹严格验证，禁止复用退休升级器或补表');
+    failures.push('Runtime epoch 5 只接受已发布 3/4 精确备份升级及当前代完整指纹；未知漂移必须拒绝');
   }
-  failures.push(...exactSetProblems('epoch reset保留对象',
-    ['runtime-archive', 'configuration', 'workspace'], migration?.schemaUpgradePolicy?.preserve ?? []));
+  failures.push(...exactSetProblems('epoch升级保留对象',
+    ['runtime-rows', 'cas', 'sqlite-backup', 'runtime-archive', 'configuration', 'workspace'],
+    migration?.schemaUpgradePolicy?.preserve ?? []));
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
   }
@@ -601,9 +612,9 @@ function validateAuthority(authority, migration, failures) {
   if (authority?.schemaPolicy?.currentManifestRequired !== true
     || authority?.schemaPolicy?.runtimeKernelEpoch !== 'single-current-epoch'
     || authority?.schemaPolicy?.incrementalLegacyMigrationChain !== false
-    || authority?.schemaPolicy?.incompatibleRuntimeData !== 'archive-and-reset'
+    || authority?.schemaPolicy?.incompatibleRuntimeData !== 'exact-published-upgrade-else-fail-closed'
     || authority?.schemaPolicy?.exactPredecessorUpgrade
-      !== 'none-retired-predecessors-archive-reset'
+      !== 'published-epoch-3-or-4-to-5-with-backup-journal'
     || authority?.schemaPolicy?.currentEpoch !== 5) {
     failures.push('SQLite schema必须只有当前manifest和单一运行epoch，不维护旧迁移链');
   }

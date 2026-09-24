@@ -43,8 +43,8 @@
     "currentManifestRequired": true,
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
-    "incompatibleRuntimeData": "archive-and-reset",
-    "exactPredecessorUpgrade": "none-retired-predecessors-archive-reset",
+    "incompatibleRuntimeData": "exact-published-upgrade-else-fail-closed",
+    "exactPredecessorUpgrade": "published-epoch-3-or-4-to-5-with-backup-journal",
     "currentEpoch": 5
   },
   "sequenceAllocation": {

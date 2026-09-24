@@ -55,7 +55,7 @@ export async function openRuntimeDataSetHistory(
     if (candidate.selected) throw new Error('Use the active conversation view for the selected Runtime data set.');
     const historical = await requireCompleteRuntimeDataSet(candidate);
     if (historical.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
-      throw Object.assign(new Error('Historical Runtime format requires the existing offline upgrade before history can be read.'), {
+      throw Object.assign(new Error('此历史库仍使用旧 Runtime 格式。请在“历史与存储管理”中选择该库并重载窗口，完成备份和离线升级后再读取；原数据保持不变。'), {
         code: 'runtime-history-offline-upgrade-required'
       });
     }
@@ -72,7 +72,7 @@ export async function openRuntimeDataSetHistory(
       } catch (error) {
         await snapshot?.close();
         if (error instanceof Error) {
-          error.message = `Cannot read historical Runtime: ${error.message} Unsupported old schemas require the existing offline upgrade; no migration was performed.`;
+          error.message = `无法读取历史库：${error.message} 未执行任何迁移或重置。`;
         }
         throw error;
       }

@@ -25,7 +25,7 @@ test('epoch5 collaboration schema and authority crosswalk have one exact definit
       assert.deepEqual(schema[key], contract[key], `${schema.key}.${key}`);
     }
   }
-  assert.equal(kernel.migratePreviousRuntimeEpochIfRequired, undefined);
+  assert.equal(typeof kernel.migratePreviousRuntimeEpochIfRequired, 'function');
   assert.equal(kernel.migrateCurrentRuntimeManifestIfRequired, undefined);
 });
 

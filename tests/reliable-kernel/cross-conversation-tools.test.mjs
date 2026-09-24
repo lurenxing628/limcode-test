@@ -1833,7 +1833,7 @@ async function replyDelivery(f) {
 }
 
 /** ROOT lists, sends TASK as a followup to PEER and answers; later ROOT Turns record whether they read RESULT. */
-function peerTask(TASK, RESULT, { rootLater } = {}) {
+function peerTask(TASK, RESULT, { rootLater, peerGate } = {}) {
   let rootRound = 0, firstTurn;
   const later = [];
   return {
@@ -1841,7 +1841,10 @@ function peerTask(TASK, RESULT, { rootLater } = {}) {
     get firstTurn() { return firstTurn; },
     async send(request, f, start) {
       const text = JSON.stringify(start.contents);
-      if (request.conversationId === PEER) return answer(RESULT);
+      if (request.conversationId === PEER) {
+        await peerGate;
+        return answer(RESULT);
+      }
       firstTurn ??= request.turnId;
       if (request.turnId !== firstTurn) {
         later.push({ turnId: request.turnId, result: text.includes(RESULT) });
@@ -1859,20 +1862,25 @@ function peerTask(TASK, RESULT, { rootLater } = {}) {
 }
 
 test('a reply to a cross-conversation task starts exactly one Turn of the idle requester, which reads it', { timeout: 60000 }, async () => {
-  const task = peerTask('CROSS_IDLE_TASK_6601', 'CROSS_IDLE_RESULT_6602');
+  let releasePeer;
+  const peerGate = new Promise(resolve => { releasePeer = resolve; });
+  const task = peerTask('CROSS_IDLE_TASK_6601', 'CROSS_IDLE_RESULT_6602', { peerGate });
   await fixture(task.send, async f => {
-    const delegated = await f.input(ROOT, 'delegate');
-    await f.terminated(delegated.turnId);
-    const reply = await replyDelivery(f);
-    const replyTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: ROOT })).find(turn => turn.id !== delegated.turnId), 'The reply never started a Turn.');
-    assert.equal((await f.terminated(replyTurn.id)).terminal_status, 'completed');
-    assert.deepEqual(task.later, [{ turnId: replyTurn.id, result: true }], 'the Turn the reply starts reads it');
-    assert.deepEqual(await userMessages(f, replyTurn.id), [], 'that Turn carries no user message');
-    const [intent] = await f.rows('TurnIntent', { turn_id: replyTurn.id });
-    assert.deepEqual((await f.rows('RuntimeDeliveryIntentLink', { turn_intent_id: intent.id })).map(link => link.delivery_id), [reply.id], 'the reply started it');
-    assert.equal((await f.rows('RuntimeDelivery', { id: reply.id }))[0].target_turn_id, replyTurn.id);
-    await f.until(async () => (await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id }))[0]?.state === 'acknowledged', 'The reply wake never settled.');
-    assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 2, 'exactly one Turn for the reply');
+    try {
+      const delegated = await f.input(ROOT, 'delegate');
+      await f.terminated(delegated.turnId);
+      releasePeer();
+      const reply = await replyDelivery(f);
+      const replyTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: ROOT })).find(turn => turn.id !== delegated.turnId), 'The reply never started a Turn.');
+      assert.equal((await f.terminated(replyTurn.id)).terminal_status, 'completed');
+      assert.deepEqual(task.later, [{ turnId: replyTurn.id, result: true }], 'the Turn the reply starts reads it');
+      assert.deepEqual(await userMessages(f, replyTurn.id), [], 'that Turn carries no user message');
+      const [intent] = await f.rows('TurnIntent', { turn_id: replyTurn.id });
+      assert.deepEqual((await f.rows('RuntimeDeliveryIntentLink', { turn_intent_id: intent.id })).map(link => link.delivery_id), [reply.id], 'the reply started it');
+      assert.equal((await f.rows('RuntimeDelivery', { id: reply.id }))[0].target_turn_id, replyTurn.id);
+      await f.until(async () => (await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id }))[0]?.state === 'acknowledged', 'The reply wake never settled.');
+      assert.equal((await f.rows('Turn', { conversation_id: ROOT })).length, 2, 'exactly one Turn for the reply');
+    } finally { releasePeer(); }
   });
 });
 
@@ -1908,18 +1916,23 @@ test('a reply to a running requester joins its Turn and starts no other Turn', {
 });
 
 test('a reply whose task budget is spent starts no Turn and joins the next user Turn', { timeout: 60000 }, async () => {
-  const task = peerTask('CROSS_SPENT_TASK_6621', 'CROSS_SPENT_RESULT_6622');
+  let releasePeer;
+  const peerGate = new Promise(resolve => { releasePeer = resolve; });
+  const task = peerTask('CROSS_SPENT_TASK_6621', 'CROSS_SPENT_RESULT_6622', { peerGate });
   await fixture(task.send, async f => {
-    const delegated = await f.input(ROOT, 'delegate');
-    await f.terminated(delegated.turnId);
-    const reply = await replyDelivery(f);
-    await f.until(async () => (await f.rows('CollaborationRequest'))[0].state === 'completed', 'The request was never settled.');
-    await f.until(async () => ['acknowledged', undefined].includes((await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id }))[0]?.state), 'The reply wake never settled.');
-    assert.deepEqual((await f.rows('Turn', { conversation_id: ROOT })).map(turn => turn.id), [delegated.turnId], 'no Turn starts for the reply');
-    assert.deepEqual([(await f.rows('RuntimeDelivery', { id: reply.id }))[0].state, f.errors], ['pending', []], 'the reply waits without an error');
-    const next = await f.input(ROOT, 'any news?');
-    assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
-    assert.deepEqual(task.later, [{ turnId: next.turnId, result: true }], 'the next user Turn reads the reply');
+    try {
+      const delegated = await f.input(ROOT, 'delegate');
+      await f.terminated(delegated.turnId);
+      releasePeer();
+      const reply = await replyDelivery(f);
+      await f.until(async () => (await f.rows('CollaborationRequest'))[0].state === 'completed', 'The request was never settled.');
+      await f.until(async () => ['acknowledged', undefined].includes((await f.rows('RuntimeDeliveryWake', { delivery_id: reply.id }))[0]?.state), 'The reply wake never settled.');
+      assert.deepEqual((await f.rows('Turn', { conversation_id: ROOT })).map(turn => turn.id), [delegated.turnId], 'no Turn starts for the reply');
+      assert.deepEqual([(await f.rows('RuntimeDelivery', { id: reply.id }))[0].state, f.errors], ['pending', []], 'the reply waits without an error');
+      const next = await f.input(ROOT, 'any news?');
+      assert.equal((await f.terminated(next.turnId)).terminal_status, 'completed');
+      assert.deepEqual(task.later, [{ turnId: next.turnId, result: true }], 'the next user Turn reads the reply');
+    } finally { releasePeer(); }
   // The followup itself spends the only automatic followup.
   }, { runAgentConfig: { maxAutomaticFollowups: 1 } });
 });

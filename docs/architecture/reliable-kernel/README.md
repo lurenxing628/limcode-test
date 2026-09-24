@@ -196,7 +196,7 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 - 旧 Runtime 归档，配置按 manifest preserve/filter，Workspace 与未知用户文件不触碰；
 - 激活后只修复新内核，不自动回退旧 writer。
 
-当前 Runtime 使用 **epoch 5**。旧 epoch 3、4 及更早 Runtime 在完整 RootBinding 校验和其他 Host 离线核验后完整归档，再初始化当前 schema；配置、Workspace 和未知用户文件保留。原 epoch 3→4 升级器和 epoch 4 单表补丁均已退休，不作为升级链保留。当前 epoch 5 的 table/index/trigger/manifest/RootBinding 必须完整匹配，任何缺表、client mapping 或 digest 漂移均拒绝打开，不做原地修补。Windows 只在 SQLite 原生 I/O 边界使用 namespaced path，持久 RootBinding 仍保存 canonical path。
+当前 Runtime 使用 **epoch 5**。已发布 epoch 3、4 在完整 RootBinding、物理结构、manifest 和其他 Host 离线核验后先持久备份 SQLite，再以单事务升级原库并通过日志恢复；旧版中断的 3→4 升级先精确收敛；原会话、消息、附件、CAS、配置和 Workspace 保留。不支持的旧 epoch 或未知漂移保留原根并拒绝自动启动空库。当前 epoch 5 的 table/index/trigger/manifest/RootBinding 必须完整匹配，任何缺表、client mapping 或 digest 漂移均拒绝打开，不做原地修补。Windows 只在 SQLite 原生 I/O 边界使用 namespaced path，持久 RootBinding 仍保存 canonical path。
 
 真实 cutover actor 是最终 VSIX 的 `cutover-only coordinator`：旧宿主先关闭 admission、drain 并持久化 request，然后退出；最终 VSIX 安装并重启后先完成 journaled archive、配置过滤和校验，再创建 SQLite/CAS/epoch 并原子激活 RootBinding。归档失败时 active pointer 不变且可按 journal 恢复。
 
@@ -222,7 +222,7 @@ Gate 的机器身份是稳定 `check.id`，handler 使用 `Map<checkId, handler>
 
 ## 9. 明确不做
 
-- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；旧 epoch 只允许离线完整归档重置；
+- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；只接受已发布 epoch 3、4 的精确离线升级；
 - 运行时 schema v1/v2 协商；
 - 在线 Context root/node GC 或 CAS 引用计数；
 - 持久 ClientChangeLog 或跨宿主持久 feed；

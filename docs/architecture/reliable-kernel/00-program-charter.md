@@ -118,7 +118,7 @@ Stage F 拥有：
 
 激活前失败：active pointer 不变，按 journal 逆序恢复；激活后失败：只修复新内核，不回退旧 writer。
 
-`runtimeKernelEpoch` bump 等于 Runtime 数据归档重置，不建立旧格式 migration chain。当前 epoch 5 新增协作消息与留言板的独立领域；旧 epoch 3、4 等根目录在维护互斥和 Host 离线核验后完整归档，独立配置与 Workspace 保留。当前 epoch schema 只读核对完整物理对象与 manifest，缺表和未知漂移均拒绝，已退休升级器不再参与启动。
+当前 epoch 5 新增协作消息与留言板的独立领域。已发布 epoch 3、4 在维护互斥和 Host 离线核验后，以精确物理/manifest 指纹、SQLite 备份、单事务和 durable journal 升级原 Runtime，保留旧会话与 CAS；不支持的旧 epoch 原地拒绝自动重置。当前 epoch schema 只读核对完整物理对象与 manifest，缺表和未知漂移均拒绝；不建立开放式 migration chain。
 
 ## 8. 范围与阶段
 
