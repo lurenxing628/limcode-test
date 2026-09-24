@@ -95,6 +95,8 @@ import type {
 import { LlmEventType } from '../world/modules/llm/events';
 import {
   isAstraModel,
+  isGpt6FamilyModel,
+  isOfficialOpenAIChannel,
   normalizeOpenAIResponsesNativeSettings,
   openAIResponsesNativeCapabilities,
   supportsOpenAIExplicitPromptCache
@@ -1916,6 +1918,12 @@ async function dryRunProviderNativeCompact(
       curl: { includeApiKey: dryRunOptions.includeApiKey === true, prettyBody: true }
     }
   );
+  if (usesOpenAIResponsesWebSocketNativeCompact(runtimeSettings)) {
+    const display = openAIResponsesWebSocketCompactDryRunResult(
+      result, dryRunOptions.includeApiKey === true, runtimeSettings.model
+    );
+    return formatUnifiedDryRunResult(display, runtimeSettings, unified, dryRunOptions, apiKeyAvailable, display.maskedCurl);
+  }
   return formatUnifiedDryRunResult(result, runtimeSettings, unified, dryRunOptions, apiKeyAvailable);
 }
 
@@ -2313,11 +2321,10 @@ async function compactWithProviderNative(
     ...unifiedPromptCacheConfigEntry(settings, requestBody),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as unknown as { compact?: (request: unknown, options?: unknown) => Promise<UnifiedLLMCompactResponse> };
-
-  if (typeof provider.compact !== 'function') {
-    throw new Error('当前 unified-llm-provider 不支持 provider.compact。');
-  }
+  }, registry.llmProviders) as unknown as {
+    compact?: (request: unknown, options?: unknown) => Promise<UnifiedLLMCompactResponse>;
+    compactDryRun?: UnifiedDryRunCapable['compactDryRun'];
+  };
 
   let compacted: UnifiedLLMCompactResponse;
   try {
@@ -2327,15 +2334,36 @@ async function compactWithProviderNative(
       signalAborted: signal?.aborted === true
     });
     const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
-    compacted = await provider.compact(
-      { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
-      {
+    const compactContents = { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) };
+    if (usesOpenAIResponsesWebSocketNativeCompact(settings)) {
+      if (typeof provider.compactDryRun !== 'function') {
+        throw new Error('当前 unified-llm-provider 不支持 provider.compactDryRun。');
+      }
+      const dryRun = await provider.compactDryRun(compactContents, {
+        inputFormat: 'unified',
+        outputFormat: 'unified',
+        ...(compactRequestBody ? { requestBody: compactRequestBody } : {})
+      });
+      const { compactOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
+      const rawResponse = await compactOpenAIResponsesWebSocketSession({
+        url: openAIResponsesWebSocketCompactUrl(dryRun.url),
+        headers: dryRun.headers,
+        body: openAIResponsesWebSocketCompactPayload(dryRun.body, settings.model),
+        signal,
+        proxy
+      });
+      compacted = new unified.OpenAIResponsesFormat(settings.model).decodeCompactResponse(rawResponse);
+    } else {
+      if (typeof provider.compact !== 'function') {
+        throw new Error('当前 unified-llm-provider 不支持 provider.compact。');
+      }
+      compacted = await provider.compact(compactContents, {
         inputFormat: 'unified',
         outputFormat: 'unified',
         signal,
         ...(compactRequestBody ? { requestBody: compactRequestBody } : {})
-      }
-    );
+      });
+    }
     if (hasUnifiedError(compacted)) {
       throw new LlmAttemptFailureError(failureFromProviderError(compacted.error, { rawResponse: compacted.rawResponse ?? compacted }));
     }
@@ -2586,6 +2614,49 @@ function openAIResponsesCompactRequestBody(requestBody: LlmRequestBodyRecord | u
   const entries = Object.entries(requestBody).filter(([key]) => OPENAI_RESPONSES_COMPACT_BODY_FIELDS.has(key));
   if (entries.length === Object.keys(requestBody).length) return requestBody;
   return entries.length > 0 ? Object.fromEntries(entries) as LlmRequestBodyRecord : undefined;
+}
+
+function usesOpenAIResponsesWebSocketNativeCompact(settings: LlmProviderConfigRecord): boolean {
+  return isOpenAIResponsesWebSocketMode(settings)
+    && isGpt6FamilyModel(settings.model)
+    && settings.nativeResponses?.enabled !== false
+    && (isOfficialOpenAIChannel(settings.baseUrl) || settings.nativeResponses?.enabled === true);
+}
+
+function openAIResponsesWebSocketCompactUrl(compactUrl: string): string {
+  const url = new URL(compactUrl);
+  if (!url.pathname.endsWith('/responses/compact')) {
+    throw new TypeError('Responses native Compact dry-run returned an unexpected endpoint.');
+  }
+  url.pathname = url.pathname.slice(0, -'/compact'.length);
+  return toWebSocketUrl(url.toString());
+}
+
+function openAIResponsesWebSocketCompactPayload(body: unknown, model: string): Record<string, unknown> {
+  if (!isRecord(body)) throw new TypeError('Responses native Compact dry-run returned no request body.');
+  const payload = openAIResponsesWebSocketDryRunPayload(body, supportsOpenAIExplicitPromptCache(model));
+  if (!Array.isArray(payload.input) || payload.input.length === 0
+    || payload.input.some((item) => isRecord(item) && item.type === 'compaction_trigger')) {
+    throw new TypeError('Responses native Compact requires a nonempty full window without an existing compaction trigger.');
+  }
+  return { ...payload, input: [...payload.input, { type: 'compaction_trigger' }], tools: [] };
+}
+
+function openAIResponsesWebSocketCompactDryRunResult(
+  result: UnifiedDryRunResult, includeApiKey: boolean, model: string
+): UnifiedDryRunResult & { maskedCurl: string } {
+  const url = openAIResponsesWebSocketCompactUrl(result.url);
+  const body = openAIResponsesWebSocketCompactPayload(result.body, model);
+  const headers = result.headers;
+  return {
+    ...result,
+    providerName: `${result.providerName} WebSocket Compact`,
+    url,
+    body,
+    bodyText: stringifyJsonPretty(body),
+    curl: formatWebSocketDryRun(url, includeApiKey ? headers : maskSensitiveHeaders(headers), body),
+    maskedCurl: formatWebSocketDryRun(url, maskSensitiveHeaders(headers), body)
+  };
 }
 
 function anthropicCompactionBody(value: unknown, methodConfig: LlmCompressionConfigRecord): Record<string, unknown> {
@@ -6074,10 +6145,15 @@ export async function probeLlmProviderNativeCompaction(
       : { availability: 'unknown', reason: '端点响应成功，但没有返回原生 compaction 状态；未标记为验证通过。' };
   } catch (error) {
     const status = error && typeof error === 'object' ? (error as { status?: number }).status : undefined;
+    const code = error && typeof error === 'object' ? (error as { code?: string }).code : undefined;
     const embedded = error instanceof Error ? /Compact API[^\d]*(?:错误\s*)?\((404|405|501)\)/i.exec(error.message) : null;
     const httpStatus = status ?? (embedded ? Number(embedded[1]) : undefined);
-    if (httpStatus !== 404 && httpStatus !== 405 && httpStatus !== 501) throw error;
-    nativeCompaction = { availability: 'unsupported', reason: `原生端点验证返回 HTTP ${httpStatus}，不再对这个端点和模型自动使用原生压缩。` };
+    if (code === 'PROVIDER_CAPABILITY_MISMATCH') {
+      nativeCompaction = { availability: 'unsupported', reason: '端点没有返回可回放的加密 compaction 项。' };
+    } else {
+      if (httpStatus !== 404 && httpStatus !== 405 && httpStatus !== 501) throw error;
+      nativeCompaction = { availability: 'unsupported', reason: `原生端点验证返回 HTTP ${httpStatus}，不再对这个端点和模型自动使用原生压缩。` };
+    }
   }
   return {
     id: config.model, name: config.models.find((model) => model.id === config.model)?.name ?? config.model,

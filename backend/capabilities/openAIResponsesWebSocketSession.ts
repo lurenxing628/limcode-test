@@ -259,6 +259,59 @@ export function resetOpenAIResponsesWebSocketSessions(): void {
   resetOpenAIResponsesWebSocketConnectionState();
 }
 
+/** One-off full-window native compaction. It never joins a conversation's cached response chain. */
+export async function compactOpenAIResponsesWebSocketSession(options: {
+  url: string;
+  headers: Record<string, string>;
+  body: Record<string, unknown>;
+  signal?: AbortSignal;
+  proxy?: string;
+  timeouts?: Partial<OpenAIResponsesWebSocketTimeouts>;
+}): Promise<Record<string, unknown>> {
+  const timeouts = resolvedTimeouts(options.timeouts);
+  const connection = webSocketConnectionConfig(options);
+  const socket = await openSocket(connection, timeouts.handshakeMs, options.signal);
+  try {
+    for await (const event of sendCreateAndReadEvents(
+      socket,
+      options.body,
+      timeouts,
+      options.signal,
+      undefined,
+      connection.identityHash,
+      () => webSocketConnectionConfig(options).identityHash,
+      () => 1
+    )) {
+      if (isProviderErrorPayload(event)) {
+        const info = errorInfoFromPayload(event, false);
+        const error = new Error(String(info.message));
+        Object.assign(error, {
+          ...(typeof info.code === 'string' ? { code: info.code } : {}),
+          ...(typeof info.status === 'number' ? { status: info.status } : {}),
+          ...(typeof info.retryable === 'boolean' ? { retryable: info.retryable } : {}),
+          rawError: info
+        });
+        throw error;
+      }
+      if (eventType(event) !== 'response.completed') continue;
+      const response = isRecord(event.response) ? event.response : undefined;
+      const output = Array.isArray(response?.output) ? response.output : undefined;
+      if (!output?.some((item) => isRecord(item)
+        && item.type === 'compaction'
+        && typeof item.encrypted_content === 'string'
+        && item.encrypted_content.length > 0)) {
+        throw Object.assign(new Error('Responses WebSocket compaction returned no encrypted compaction item.'), {
+          code: 'PROVIDER_CAPABILITY_MISMATCH', retryable: false
+        });
+      }
+      return cloneJson(response!);
+    }
+    throw new Error('Responses WebSocket closed before native compaction completed.');
+  } finally {
+    socket.terminate();
+  }
+}
+
 async function* streamLocked(
   session: WebSocketSession,
   options: OpenAIResponsesWebSocketStreamOptions
