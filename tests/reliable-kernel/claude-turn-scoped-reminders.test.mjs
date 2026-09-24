@@ -343,6 +343,46 @@ test('打开后：前一条不是 user（未完成任务检查续写）时提醒
   assert.deepEqual(after.slice(before.length).map((entry) => entry.role), ['assistant', 'user']);
 });
 
+test('打开后：运行状态卡保持 user 身份，只有任务卡作为轮内系统消息；历史原位重发，估算只计 user 部分', async () => {
+  const split = { user: STATUS_CARD, system: TASK_CARD };
+  const providerId = 'claude-channel';
+  const modelId = 'claude-opus-5-5';
+  const loop = toolLoopContext('claude', modelId, providerId);
+  const request = (context, history, reminder = { content: REMINDER, identitySplit: split }) => {
+    const built = fullRequest({ provider: 'claude', modelId, scenario: 'tool-loop', claudeTurnScopedReminders: true, context, history });
+    built.requestAddenda.turnReminder = { ...built.requestAddenda.turnReminder, ...reminder };
+    return built;
+  };
+  const first = await render(request(loop.slice(0, 3), [{ segmentId: 'seg-model-1', content: HISTORY_REMINDER }]));
+  const second = await render(request(loop, [
+    { segmentId: 'seg-model-1', content: HISTORY_REMINDER },
+    { segmentId: 'seg-model-2', content: REMINDER, identitySplit: split }
+  ]));
+  for (const rendered of [first, second]) {
+    const messages = rendered.wire.body.messages;
+    for (const entry of messages.filter((candidate) => candidate.role === 'system')) {
+      assert.equal(entry.content.includes('[Runtime Status'), false, 'the status card is never a system message');
+    }
+    assert.deepEqual(messages.at(-1), { role: 'system', clear_at: 'next_user_message', content: TASK_CARD });
+    assert.match(JSON.stringify(messages.at(-2)), /\[Runtime Status/);
+    assert.equal(messages.at(-2).role, 'user');
+  }
+  const before = withoutCacheControl(first.wire.body.messages);
+  const after = withoutCacheControl(second.wire.body.messages);
+  assert.deepEqual(after.slice(0, before.length), before, 'the split reminder is re-sent verbatim in place');
+  // 历史里只有 user 部分会显示、计 token（已清除的系统部分不计）；与同一位置只放运行状态卡的历史完全相同。
+  const statusOnly = await render(request(loop, [
+    { segmentId: 'seg-model-1', content: HISTORY_REMINDER },
+    { segmentId: 'seg-model-2', content: STATUS_CARD, identitySplit: { user: STATUS_CARD } }
+  ]));
+  assert.equal(second.estimate.contextTokens, statusOnly.estimate.contextTokens);
+  const cleared = await render(request(loop, [{ segmentId: 'seg-model-1', content: HISTORY_REMINDER }]));
+  assert.ok(second.estimate.contextTokens > cleared.estimate.contextTokens, 'the visible status card is counted');
+  // 尾巴模式（网关退回）与改动前一样：整条提醒作为最后一条 user 消息。
+  const tail = reminders.layoutTurnReminderContents(second.start.contents, 'tail');
+  assert.deepEqual(tail.at(-1), { role: 'user', parts: [{ text: REMINDER }] });
+});
+
 test('发送形态规则：只看前一条已发送的非 system 内容；前一条是模型输出时按 user 消息发出；尾巴模式只留本轮提醒', () => {
   const user = { role: 'user', parts: [{ text: 'u' }] };
   const model = { role: 'model', parts: [{ text: 'm' }] };
@@ -366,6 +406,25 @@ test('发送形态规则：只看前一条已发送的非 system 内容；前一
   const claude = toUnifiedRequest({ id: 'r', contents, tools: [] }, undefined, 'claude', undefined, 'claude_turn_scoped');
   assert.deepEqual(claude.contents.map((content) => content.claudeSystemMessage?.clearAt ?? content.role),
     ['user', 'next_user_message', 'model', 'user', 'model', 'user', 'next_user_message']);
+  // 带运行状态卡的提醒：前一条是 user 时拆成 user（运行状态卡）+ 系统消息（其余）；只有运行状态卡或前一条是模型输出时整条按 user 发出。
+  const split = reminders.turnReminderContent('t\n\ns', { placement: 'history', identitySplit: { user: 's', system: 't' } });
+  const statusOnly = reminders.turnReminderContent('s', { placement: 'current', identitySplit: { user: 's' } });
+  const splitAfterModel = reminders.turnReminderContent('t\n\ns', { placement: 'history', identitySplit: { user: 's', system: 't' } });
+  const withStatus = [user, split, model, splitAfterModel, model, user, statusOnly];
+  assert.deepEqual(reminders.turnReminderDeliveries(withStatus, 'claude_turn_scoped'),
+    [undefined, 'split', undefined, 'user', undefined, undefined, 'user']);
+  assert.deepEqual(reminders.layoutTurnReminderContents(withStatus, 'claude_turn_scoped'), [
+    user,
+    { role: 'user', parts: [{ text: 's' }] },
+    { role: 'user', parts: [{ text: 't' }], claudeSystemMessage: { clearAt: 'next_user_message' } },
+    model,
+    { role: 'user', parts: [{ text: 't\n\ns' }] },
+    model,
+    user,
+    { role: 'user', parts: [{ text: 's' }] }
+  ]);
+  assert.deepEqual(reminders.layoutTurnReminderContents(withStatus, 'tail'),
+    [user, model, model, user, { role: 'user', parts: [{ text: 's' }] }]);
 });
 
 test('recipe 是提醒文本的唯一来源：同一 recipe 永远生成逐字节相同的提醒', () => {
@@ -379,10 +438,16 @@ test('recipe 是提醒文本的唯一来源：同一 recipe 永远生成逐字�
   const projected = projectTurnReminder(recipe);
   assert.deepEqual(projected, {
     content: [TASK_CARD, COMPLETION_CHECK, STATUS_CARD].join('\n\n'),
+    // 运行状态卡带着模型撰写的第三方文本，轮内系统消息模式下仍是 user 身份；其余部分才能作为系统消息。
+    identitySplit: { user: STATUS_CARD, system: [TASK_CARD, COMPLETION_CHECK].join('\n\n') },
     taskCardSha256: 'a'.repeat(64), unfinishedTaskCount: 2, activeChildCount: 1, runningProcessCount: 1
   });
   assert.deepEqual(projectTurnReminder(structuredClone(recipe)), projected);
   assert.equal(projectTurnReminder({ ...recipe, turnTaskCardReminderEnabled: false }).content, [COMPLETION_CHECK, STATUS_CARD].join('\n\n'));
+  const statusOnly = projectTurnReminder({ kind: 'reliable-agent-turn', runtimeStatusCard: recipe.runtimeStatusCard });
+  assert.deepEqual(statusOnly.identitySplit, { user: STATUS_CARD }, 'only the status card: the whole reminder stays a user message');
+  const { runtimeStatusCard, ...withoutStatus } = recipe;
+  assert.equal('identitySplit' in projectTurnReminder(withoutStatus), false, 'no status card: the whole reminder may be a system message');
   assert.equal(projectTurnReminder({ kind: 'reliable-context-compression' }), undefined);
   assert.equal(projectTurnReminder({ kind: 'reliable-agent-turn' }), undefined);
 });

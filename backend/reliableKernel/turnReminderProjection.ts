@@ -10,11 +10,26 @@ import type { PlainJsonValue } from './plainJson';
  * 重发文本（一次性缓存失效、保留思考失效），必须同时更新固定格式的测试。
  */
 export interface TurnReminderProjection {
+  /** 整条提醒：任务卡、未完成任务检查、运行状态卡依次以空行相连。尾巴模式与整条按 user 消息发出时就是这段原文。 */
   content: string;
+  /** 有运行状态卡时才有，见 {@link TurnReminderIdentitySplit}。 */
+  identitySplit?: TurnReminderIdentitySplit;
   taskCardSha256?: string;
   unfinishedTaskCount: number;
   activeChildCount: number;
   runningProcessCount: number;
+}
+
+/**
+ * Claude 轮内系统消息模式下一条提醒的身份拆分。运行状态卡带着模型撰写的第三方文本（子 Agent 的 label、task、
+ * 当前与排队的任务等），不能提升为系统消息，始终作为 user 消息发出（之后原位原样重发）；只有任务卡与内核固定的
+ * 未完成任务检查可以作为轮内系统消息，紧跟在运行状态卡之后。
+ * - user：运行状态卡原文；
+ * - system：其余部分以空行相连；没有时整条提醒就是运行状态卡，整条按 user 消息发出。
+ */
+export interface TurnReminderIdentitySplit {
+  user: string;
+  system?: string;
 }
 
 export function projectTurnReminder(recipe: PlainJsonValue | undefined): TurnReminderProjection | undefined {
@@ -26,16 +41,20 @@ export function projectTurnReminder(recipe: PlainJsonValue | undefined): TurnRem
   const completionCheck = isRecord(recipe.openTaskCompletionCheck)
     ? recipe.openTaskCompletionCheck
     : undefined;
-  const reminderParts = [
+  const systemParts = [
     typeof task?.card === 'string' && task.card.trim() ? task.card.trim() : '',
     typeof completionCheck?.card === 'string' && completionCheck.card.trim()
       ? completionCheck.card.trim()
-      : '',
-    typeof runtime?.card === 'string' && runtime.card.trim() ? runtime.card.trim() : ''
+      : ''
   ].filter(Boolean);
+  const statusCard = typeof runtime?.card === 'string' && runtime.card.trim() ? runtime.card.trim() : '';
+  const reminderParts = statusCard ? [...systemParts, statusCard] : systemParts;
   if (reminderParts.length === 0) return undefined;
   return {
     content: reminderParts.join('\n\n'),
+    ...(statusCard
+      ? { identitySplit: { user: statusCard, ...(systemParts.length ? { system: systemParts.join('\n\n') } : {}) } }
+      : {}),
     ...(typeof task?.cardSha256 === 'string' && task.cardSha256.trim()
       ? { taskCardSha256: task.cardSha256.trim() }
       : {}),

@@ -35,7 +35,8 @@ import {
   projectTurnReminder,
   recipeReinjectedCurrentTurnInput,
   recipeSentClaudeTurnScopedReminders,
-  type ReinjectedCurrentTurnInputReference
+  type ReinjectedCurrentTurnInputReference,
+  type TurnReminderIdentitySplit
 } from './turnReminderProjection';
 import { modelHandleRef, normalizeModelHandleCatalog } from './modelHandleCatalog';
 import { expandTextCompressionSources } from './compressionSourceReplay';
@@ -170,6 +171,8 @@ export interface FullProviderRequest {
     };
     turnReminder?: {
       content: string;
+      /** 有运行状态卡时才有：轮内系统消息模式下运行状态卡保持 user 身份，只有其余部分作为系统消息。 */
+      identitySplit?: TurnReminderIdentitySplit;
       taskCardSha256?: string;
       unfinishedTaskCount: number;
       activeChildCount: number;
@@ -191,6 +194,8 @@ export interface FullProviderRequest {
 export interface TurnReminderHistoryEntry {
   segmentId: string;
   content?: string;
+  /** 那次请求提醒的身份拆分（有运行状态卡时）；与那次请求发出时相同。 */
+  identitySplit?: TurnReminderIdentitySplit;
   reinjectedInput?: {
     messageRevisionId: string;
     contentType: string;
@@ -203,6 +208,7 @@ export interface TurnReminderHistoryEntry {
 /** 一次历史请求要原样放回的内容，只取决于它不可变的 recipe。 */
 interface HistoricalRequestFacts {
   reminder?: string;
+  reminderIdentitySplit?: TurnReminderIdentitySplit;
   reinjectedInput?: ReinjectedCurrentTurnInputReference & { currentTurnAttachmentState?: MessageContent };
 }
 
@@ -2329,7 +2335,12 @@ export class ModelProviderControlPlane {
       });
     }
     const placedInputs = new Set<string>();
-    const planned: Array<{ segmentId: string; reminder?: string; input?: HistoricalRequestFacts['reinjectedInput'] }> = [];
+    const planned: Array<{
+      segmentId: string;
+      reminder?: string;
+      reminderIdentitySplit?: TurnReminderIdentitySplit;
+      input?: HistoricalRequestFacts['reinjectedInput'];
+    }> = [];
     for (const segment of sources) {
       const historical = facts.get(segment.sourceRecipeObjectId as string);
       if (!historical) continue;
@@ -2341,6 +2352,7 @@ export class ModelProviderControlPlane {
       planned.push({
         segmentId: segment.segmentId,
         ...(historical.reminder !== undefined ? { reminder: historical.reminder } : {}),
+        ...(historical.reminderIdentitySplit ? { reminderIdentitySplit: historical.reminderIdentitySplit } : {}),
         ...(input ? { input } : {})
       });
     }
@@ -2362,6 +2374,7 @@ export class ModelProviderControlPlane {
       return {
         segmentId: entry.segmentId,
         ...(entry.reminder !== undefined ? { content: entry.reminder } : {}),
+        ...(entry.reminderIdentitySplit ? { identitySplit: entry.reminderIdentitySplit } : {}),
         ...(entry.input && input
           ? {
               reinjectedInput: {
@@ -2822,7 +2835,8 @@ const HISTORICAL_REMINDER_CACHE_LIMIT = 4096;
  */
 function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string): HistoricalRequestFacts | null {
   if (!recipeSentClaudeTurnScopedReminders(recipe)) return null;
-  const reminder = projectTurnReminder(recipe)?.content;
+  const projected = projectTurnReminder(recipe);
+  const reminder = projected?.content;
   const input = recipeReinjectedCurrentTurnInput(recipe);
   if (reminder === undefined && !input) return null;
   let currentTurnAttachmentState: MessageContent | undefined;
@@ -2843,6 +2857,7 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
   }
   return {
     ...(reminder !== undefined ? { reminder } : {}),
+    ...(projected?.identitySplit ? { reminderIdentitySplit: projected.identitySplit } : {}),
     ...(input ? { reinjectedInput: { ...input, ...(currentTurnAttachmentState ? { currentTurnAttachmentState } : {}) } } : {})
   };
 }

@@ -76,10 +76,11 @@ import {
   readTurnReminderMarker,
   turnReminderContent,
   turnReminderDeliveries,
+  visibleHistoryTurnReminder,
   type TurnReminderLayout
 } from '../capabilities/claudeTurnScopedReminders';
 import { claudeTurnScopedRemindersFallenBackForModel } from '../capabilities/providerParameterAdaptation';
-import { claudeTurnScopedCompaction } from './turnReminderProjection';
+import { claudeTurnScopedCompaction, type TurnReminderIdentitySplit } from './turnReminderProjection';
 import {
   openAICompatibleModelReadsGeminiSignatures,
   withoutGeminiFunctionCallSignatures
@@ -147,19 +148,21 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     const projected = toLlmStartRequest(request);
     // 按实际发出的布局估算：网关拒绝过轮内系统消息的渠道与模型退回尾巴模式（与开关关闭时相同）。
     // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
-    // 只有按 user 消息发出的历史提醒计入上下文；本轮提醒照常计入 turnReminderTokens。重新注入输入的历史副本是
-    // 普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，也就没有本轮输入。
+    // 只有按 user 消息发出的历史提醒（拆分发出的只有运行状态卡那条 user 消息）计入上下文；本轮提醒照常计入
+    // turnReminderTokens。重新注入输入的历史副本是普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，
+    // 也就没有本轮输入。
     const deliveries = turnReminderDeliveries(projected.contents, estimatedTurnReminderLayout(request.providerId, request.modelId));
     let tailInputSuperseded = false;
-    const visibleContents = projected.contents.filter((content, index) => {
+    const visibleContents = projected.contents.flatMap((content, index) => {
       const marker = readTurnReminderMarker(content);
-      if (!marker) return true;
+      if (!marker) return [content];
       if (marker.placement === 'current') {
-        if (deliveries[index] !== 'omitted') return true;
+        if (deliveries[index] !== 'omitted') return [content];
         if (marker.kind === 'reinjected_input') tailInputSuperseded = true;
-        return false;
+        return [];
       }
-      return deliveries[index] === 'user';
+      const visible = visibleHistoryTurnReminder(content, deliveries[index]);
+      return visible ? [visible] : [];
     });
     const frozenCurrent = request.requestAddenda?.currentTurnInput;
     const currentInputCount = frozenCurrent?.reinject && !tailInputSuperseded ? 1 : 0;
@@ -861,7 +864,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     projection.contents,
     contents.length,
     projection.insertions,
-    turnScopedReminders ? turnReminder?.content : undefined,
+    turnScopedReminders ? turnReminder : undefined,
     supersededTailInputIndex
   );
   return {
@@ -921,6 +924,7 @@ interface HistoryInsertion {
   /** 那次请求的模型输出在投影前内容里的位置。 */
   beforeIndex: number;
   reminder?: string;
+  reminderIdentitySplit?: TurnReminderIdentitySplit;
   input?: { messageRevisionId: string; content: MessageContent };
 }
 
@@ -945,6 +949,7 @@ function historyInsertion(entry: TurnReminderHistoryEntry, beforeIndex: number):
   return {
     beforeIndex,
     ...(entry.content !== undefined ? { reminder: entry.content } : {}),
+    ...(entry.content !== undefined && entry.identitySplit ? { reminderIdentitySplit: entry.identitySplit } : {}),
     ...(input ? { input } : {})
   };
 }
@@ -1004,13 +1009,14 @@ function cloneManagedMediaBodyProjectionState(state: ManagedMediaBodyProjectionS
  * 把 Claude 轮内系统消息模式的标记放进已投影的内容：投影逐条一一对应（不增删、不重排），
  * 历史内容按投影前记下的位置插回那次请求的模型输出前面（重新注入的输入在前、提醒在后，与那次请求尾巴的顺序相同），
  * 本轮提醒（投影前按原来的形态放在最后）换成带标记的同一文本；窗口里已有历史副本的尾巴输入标为 current。
+ * 带运行状态卡的提醒把身份拆分放进标记，发送时运行状态卡保持 user 身份（见 claudeTurnScopedReminders.ts）。
  * 历史提醒不参与投影，工具结果分组与媒体去重与开关关闭时完全相同。
  */
 function withTurnReminderMarkers(
   projected: MessageContent[],
   contentCount: number,
   insertions: readonly HistoryInsertion[],
-  currentReminder: string | undefined,
+  currentReminder: { content: string; identitySplit?: TurnReminderIdentitySplit } | undefined,
   supersededTailInputIndex?: number
 ): MessageContent[] {
   if (insertions.length === 0 && currentReminder === undefined && supersededTailInputIndex === undefined) return projected;
@@ -1023,7 +1029,12 @@ function withTurnReminderMarkers(
     while (cursor < insertions.length && insertions[cursor].beforeIndex === index) {
       const insertion = insertions[cursor++];
       if (insertion.input) result.push(markedReinjectedInput(insertion.input.content, 'history'));
-      if (insertion.reminder !== undefined) result.push(turnReminderContent(insertion.reminder, { placement: 'history' }));
+      if (insertion.reminder !== undefined) {
+        result.push(turnReminderContent(insertion.reminder, {
+          placement: 'history',
+          ...(insertion.reminderIdentitySplit ? { identitySplit: insertion.reminderIdentitySplit } : {})
+        }));
+      }
     }
     result.push(index === supersededTailInputIndex ? markedReinjectedInput(content, 'current') : content);
   });
@@ -1031,8 +1042,11 @@ function withTurnReminderMarkers(
   if (currentReminder !== undefined) {
     const last = result.pop();
     const text = last?.role === 'user' && last.parts.length === 1 && 'text' in last.parts[0] ? last.parts[0].text : undefined;
-    if (text !== currentReminder) throw new Error('The current turn reminder must be the last projected content.');
-    result.push(turnReminderContent(currentReminder, { placement: 'current' }));
+    if (text !== currentReminder.content) throw new Error('The current turn reminder must be the last projected content.');
+    result.push(turnReminderContent(currentReminder.content, {
+      placement: 'current',
+      ...(currentReminder.identitySplit ? { identitySplit: currentReminder.identitySplit } : {})
+    }));
   }
   return result;
 }
@@ -1334,14 +1348,17 @@ export function estimateCompactProjection(request: LlmCompactRequest): Projected
       providerFramingTokens: 512
     });
   }
-  // Claude 原生压缩带着的历史提醒已被清除，不计 token；重新注入输入的历史副本照常计入。
+  // Claude 原生压缩带着的历史提醒已被清除，不计 token（运行状态卡按 user 消息发出，照常计入）；重新注入输入的历史副本照常计入。
   // 网关拒绝过轮内系统消息时按尾巴模式发送，历史副本都不发送。
   const deliveries = turnReminderDeliveries(
     request.contents,
     estimatedTurnReminderLayout(request.settingsSnapshot?.providerConfigId, request.settingsSnapshot?.modelId)
   );
-  const contents = request.contents.filter((content, index) =>
-    !readTurnReminderMarker(content) || deliveries[index] === 'user');
+  const contents = request.contents.flatMap((content, index) => {
+    if (!readTurnReminderMarker(content)) return [content];
+    const visible = visibleHistoryTurnReminder(content, deliveries[index]);
+    return visible ? [visible] : [];
+  });
   return estimateProjectedModelInput({
     ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
     ...(request.tools?.length ? { tools: request.tools } : {}),
