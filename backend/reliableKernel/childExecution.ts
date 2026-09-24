@@ -3156,6 +3156,14 @@ export class ChildExecutionControlPlane {
       canonicalPlainJson(spawnRequestPayload(command, ids)),
       SUBAGENT_SPAWN_CONTENT_TYPE
     ).id;
+    // A Plan delegation made before executor_agent existed was stored without authorityBound; replaying
+    // it after the upgrade returns that child as it was instead of reporting different facts.
+    const legacyRequestObjectId = !preparedRequest && command.authorityBound === 'executor_agent'
+      ? this.contentStore.identity(
+        canonicalPlainJson(spawnRequestPayload({ ...command, authorityBound: 'parent_turn' }, ids)),
+        SUBAGENT_SPAWN_CONTENT_TYPE
+      ).id
+      : undefined;
     const expectedPromptObjectId = this.contentStore.identity(command.prompt, 'text/plain').id;
     const parentTurn = await this.requireExisting(
       'Turn',
@@ -3194,7 +3202,7 @@ export class ChildExecutionControlPlane {
       || attempt.operation_id !== ids.operationId
       || intent.attempt_id !== ids.attemptId
       || intent.effect_kind !== 'subagent_spawn'
-      || intent.request_object_id !== expectedRequestObjectId
+      || (intent.request_object_id !== expectedRequestObjectId && intent.request_object_id !== legacyRequestObjectId)
       || authority.turn_id !== ids.childTurnId
       || promptRevision.message_id !== ids.childMessageId
       || promptRevision.role !== 'user'
