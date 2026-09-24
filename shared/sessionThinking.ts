@@ -3,7 +3,7 @@ import { isAstraModel, isGpt6NoneCapableModel } from './openAIResponsesCapabilit
 import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from './geminiThinking';
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
 import { hasThinkingBodyConflict } from './sessionThinkingBody';
-import { anthropicModelReasoningCapability, resolveProviderOpenAICompatibleDialect } from './modelCapabilities';
+import { anthropicModelReasoningCapability, anthropicRejectsNonDefaultSampling, resolveProviderOpenAICompatibleDialect } from './modelCapabilities';
 import {
   mapOpenAICompatibleEffort,
   openAICompatibleEffortValues,
@@ -41,14 +41,12 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     return undefined;
   }
   if (provider === 'claude') {
-    if (/^claude-(opus|sonnet)-4[.-]6(?:-\d{8})?$/.test(model)) {
-      return configuredEffort(provider, configuredThinking)
-        ?? { kind: 'claude-effort', values: model.includes('opus') ? ['none', 'low', 'medium', 'high', 'max'] : ['none', 'low', 'medium', 'high'] };
-    }
-    // Claude 4.7 及之后（能力表 anthropic_adaptive：Opus 5.5、Fable、Sonnet 5 等）只有 adaptive + output_config.effort；
-    // 始终开启的模型（Fable、Mythos、Opus 5.5）不提供关闭。编码与渠道配置同一路径（claudeThinkingAdaptation.ts）。
-    const reasoning = anthropicModelReasoningCapability(model);
-    if (reasoning?.family === 'anthropic_adaptive' && reasoning.levels.length) {
+    // 能力表里的 adaptive 模型（Claude 4.7 及之后：Opus 5.5、Fable、Sonnet 5 等）与混合模型（Opus / Sonnet 4.6、
+    // Mythos Preview）按表给 effort：xhigh 只给官方列出的模型（https://platform.claude.com/docs/en/build-with-claude/effort），
+    // 始终开启的模型（Fable、Mythos、Opus 5.5）不提供关闭。已知模型不被渠道配置放宽。编码见 claudeThinkingAdaptation.ts。
+    // 会话选项也认 `claude-opus-4.6` 这类点号写法。
+    const reasoning = anthropicModelReasoningCapability(model.replace(/\./g, '-'));
+    if ((reasoning?.family === 'anthropic_adaptive' || reasoning?.family === 'anthropic_hybrid') && reasoning.levels.length) {
       return { kind: 'claude-effort', values: [...(reasoning.canDisable ? ['none' as const] : []), ...reasoning.levels] };
     }
     if (/^claude-(?:3[.-]7-sonnet|(?:sonnet|opus)-4(?:[.-][015])?)(?:-|$)/.test(model) && Number.isSafeInteger(maxOutputTokens) && maxOutputTokens! > 1024) {
@@ -98,10 +96,15 @@ export class IncompatibleSessionThinkingError extends Error {}
 export function validateSessionThinkingOverride(value: SessionThinkingOverride, provider: LlmProviderKind, model: string, generation?: LlmGenerationConfigRecord, requestBody?: LlmRequestBodyRecord, providerConfig?: SessionThinkingProviderConfig): SessionThinkingOverride {
   const capability = sessionThinkingCapability(provider, model, generation?.maxOutputTokens, generation?.thinkingConfig, providerConfig);
   if (!value || !capability || value.kind !== capability.kind) throw new IncompatibleSessionThinkingError('当前模型不支持此思维参数，请恢复默认或重新选择。');
-  if (provider === 'claude' && ('tokens' in value || value.value !== 'none')) {
+  const strictSampling = provider === 'claude' && anthropicRejectsNonDefaultSampling(model);
+  if (provider === 'claude' && (strictSampling || 'tokens' in value || value.value !== 'none')) {
     const temperature = requestBody && Object.prototype.hasOwnProperty.call(requestBody, 'temperature') ? requestBody.temperature : generation?.temperature;
     const topK = requestBody && Object.prototype.hasOwnProperty.call(requestBody, 'top_k') ? requestBody.top_k : generation?.topK;
     const topP = requestBody && Object.prototype.hasOwnProperty.call(requestBody, 'top_p') ? requestBody.top_p : generation?.topP;
+    // Claude 4.7 及之后：非默认的采样参数无论是否思考都返回 400。
+    if (strictSampling && ((temperature !== undefined && temperature !== 1) || topK !== undefined || topP !== undefined)) {
+      throw new IncompatibleSessionThinkingError('当前 Claude 模型不接受非默认的采样参数（无论是否思考）：temperature 只能省略或为 1，top_p、top_k 必须省略。未修改渠道采样，请先在渠道设置调整或恢复默认。');
+    }
     if ((temperature !== undefined && temperature !== 1) || topK !== undefined || (topP !== undefined && (typeof topP !== 'number' || topP < .95 || topP > 1))) {
       throw new IncompatibleSessionThinkingError('当前 Claude 思维模式与采样参数冲突：temperature 仅可省略或为 1，top_k 必须省略，top_p 仅可省略或在 0.95–1。未修改渠道采样，请先在渠道设置调整或恢复默认。');
     }
@@ -200,6 +203,10 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
   }
   if (provider === 'openai-responses' && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
   if ((provider === 'openai-responses' || provider === 'openai-compatible') && isGpt6NoneCapableModel(model) && thinking?.thinkingLevel === 'minimal') return 'low（适配器）';
+  // 始终思考的 Claude（Fable、Mythos、Opus 5.5）：none 不发送（claudeThinkingAdaptation 去掉 disabled），模型仍会思考。
+  if (provider === 'claude' && thinking?.thinkingLevel === 'none' && anthropicModelReasoningCapability(model.replace(/\./g, '-'))?.alwaysOn) {
+    return 'none，模型始终思考，实际仍会思考';
+  }
   const compatibleLabel = provider === 'openai-compatible' && providerConfig ? openAICompatibleSentLabel(providerConfig, model, thinking) : undefined;
   if (compatibleLabel) return compatibleLabel;
   if (provider === 'openai-compatible' || provider === 'openai-responses') return thinkingValueLabel({ thinkingLevel: thinking?.thinkingLevel });

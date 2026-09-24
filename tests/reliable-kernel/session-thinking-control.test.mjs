@@ -312,3 +312,8 @@ test('The channel default label shows the value actually sent on OpenAI-compatib
   assert.equal(f.control.defaultLabel.value, '跟随渠道设置：medium，实际发 high');
   assert.equal(f.control.options.value[0].buttonLabel, '思考：跟随渠道（medium，实际发 high）');
 });
+
+test('xhigh reads 极高, the same word the channel editor uses', () => {
+  const f = fixture({ props: { model: 'claude-opus-5-5', config: { id: 'claude', provider: 'claude', model: 'claude-opus-5-5', models: [], modelConfigs: [] } } });
+  assert.equal(f.control.options.value.find(option => option.value === 'xhigh').label, '极高（xhigh）');
+});

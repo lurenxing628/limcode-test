@@ -190,3 +190,26 @@ test('chat_template_kwargs 只在含思考相关子键时才算与会话思考�
   assert.equal(resolveSavedSessionThinkingOverride({ kind: 'deepseek-effort', value: 'high' }, 'openai-compatible', 'deepseek-v4-pro', undefined,
     { chat_template_kwargs: { add_generation_prompt: true } }, deepseekChannel()).status, 'applied');
 });
+
+test('Claude 档位按官方文档：Mythos Preview 没有关闭和 xhigh，Sonnet 4.6 有 max，渠道配置不能放宽已知模型', () => {
+  // https://platform.claude.com/docs/en/build-with-claude/effort：max / xhigh 支持列表；Mythos Preview 始终思考。
+  assert.deepEqual(capability('claude', 'claude-mythos-preview'), { kind: 'claude-effort', values: ['low', 'medium', 'high', 'max'] });
+  assert.deepEqual(capability('claude', 'claude-mythos-preview', undefined, { thinkingLevel: 'xhigh' }).values, ['low', 'medium', 'high', 'max']);
+  assert.deepEqual(capability('claude', 'claude-sonnet-4-6'), { kind: 'claude-effort', values: ['none', 'low', 'medium', 'high', 'max'] });
+  assert.deepEqual(capability('claude', 'claude-opus-4.6', undefined, { thinkingLevel: 'xhigh' }).values, ['none', 'low', 'medium', 'high', 'max']);
+});
+
+test('Claude 4.7 及之后：非默认的 temperature / top_p / top_k 无论是否思考都冲突', () => {
+  // https://platform.claude.com/docs/en/build-with-claude/thinking：“non-default temperature, top_p, or top_k values return a 400 error on every request, regardless of whether thinking is used.”
+  assert.throws(() => validate({ kind: 'claude-effort', value: 'none' }, 'claude', 'claude-sonnet-5', { temperature: 0.7 }), /采样/);
+  assert.throws(() => validate({ kind: 'claude-effort', value: 'high' }, 'claude', 'claude-opus-5-5', { topP: 0.95 }), /采样/);
+  assert.throws(() => validate({ kind: 'claude-effort', value: 'high' }, 'claude', 'claude-mythos-preview', {}, { top_k: 5 }), /采样/);
+  validate({ kind: 'claude-effort', value: 'high' }, 'claude', 'claude-opus-5-5', { temperature: 1 });
+  validate({ kind: 'claude-effort', value: 'high' }, 'claude', 'claude-opus-4-6', { topP: 0.95 });
+  validate({ kind: 'claude-effort', value: 'none' }, 'claude', 'claude-opus-4-6', { temperature: 0.7 });
+});
+
+test('始终思考的模型渠道设了 none 时，说明实际仍会思考', () => {
+  assert.equal(sessionThinkingDisplayLabel('claude', 'claude-opus-5-5', { thinkingLevel: 'none' }), 'none，模型始终思考，实际仍会思考');
+  assert.equal(sessionThinkingDisplayLabel('claude', 'claude-sonnet-5', { thinkingLevel: 'none' }), 'none');
+});

@@ -764,6 +764,16 @@ export function anthropicModelReasoningCapability(modelId: string): ModelReasoni
   return capability.family === 'none' ? undefined : capability;
 }
 
+/**
+ * Claude 4.7 及之后（Fable、Mythos 5 / 5.1、Mythos Preview、Opus 4.7 / 4.8 / 5 / 5.5、Sonnet 5）：
+ * “non-default temperature, top_p, or top_k values return a 400 error on every request, regardless of whether
+ * thinking is used.”（https://platform.claude.com/docs/en/build-with-claude/thinking）
+ */
+export function anthropicRejectsNonDefaultSampling(modelId: string): boolean {
+  const id = modelId.trim().toLowerCase().replace(/\./g, '-').replace(/-\d{8}$/, '');
+  return id === 'claude-mythos-preview' || anthropicReasoningCapability(id).family === 'anthropic_adaptive';
+}
+
 function anthropicNativeCompactionCapability(modelId: string): ModelNativeCompactionCapability {
   const id = modelId.toLowerCase().replace(/-\d{8}$/, '');
   const supported = ['claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5', 'claude-mythos-5-1',

@@ -33,7 +33,7 @@ const channelValue = computed(() => props.config && props.model
   : '');
 const defaultLabel = computed(() => props.config && props.model ? `跟随渠道设置：${channelValue.value}` : '正在读取渠道设置');
 const LEVEL_NAMES: Record<string, string> = {
-  none: '关闭思考', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高'
+  none: '关闭思考', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高'
 };
 const INACTIVE_VALUE = 'saved-inactive';
 const selected = computed(() => {
