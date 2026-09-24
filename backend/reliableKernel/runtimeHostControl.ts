@@ -316,11 +316,14 @@ async function acquireMaintenanceClaim(
         observedToken = undefined;
         continue;
       }
-      throw new RuntimeMaintenanceBusyError(
-        claimPath,
-        record,
-        `liveness re-check failed with ${code ?? String(error)}`
-      );
+      // EPERM on a holder whose start identity was verified alive is still that live holder.
+      if (code !== 'EPERM') {
+        throw new RuntimeMaintenanceBusyError(
+          claimPath,
+          record,
+          `liveness re-check failed with ${code ?? String(error)}`
+        );
+      }
     }
     await delay(MAINTENANCE_RETRY_DELAY_MS);
   }
