@@ -393,14 +393,20 @@ test('网关拒绝文本识别：只认明确的 clear_at / system 角色 / 位�
     "messages.3.role: Input should be 'user' or 'assistant'",
     'Unknown field: messages[3].clear_at',
     'system messages are not supported by this upstream',
-    'messages.4: a system message must immediately follow a user turn'
+    'messages.4: a system message must immediately follow a user turn',
+    // https://platform.claude.com/docs/en/api/beta-headers “Error handling”：beta 不存在或组织没开通时在头这一层拒绝。
+    'Unexpected value(s) `mid-conversation-system-clear-at-2026-08-21` for the `anthropic-beta` header. Please consult our documentation at platform.claude.com/docs or try again without the header.',
+    '{"type":"error","error":{"type":"invalid_request_error","message":"Unexpected value(s) `user-beta-2026-01-01`, `mid-conversation-system-clear-at-2026-08-21` for the `anthropic-beta` header. Please consult our documentation at platform.claude.com/docs or try again without the header."},"request_id":"req_011"}'
   ]) assert.equal(reminders.claudeTurnScopedRemindersRejected(text), true, text);
   for (const text of [
     'max_tokens: Field required',
     'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.',
     'thinking.adaptive.block_binding: Extra inputs are not permitted',
     'temperature: Extra inputs are not permitted',
-    'overloaded_error'
+    'overloaded_error',
+    // 别的 beta 被拒（例如用户自定义的头）不是轮内系统消息的问题。
+    'Unexpected value(s) `user-beta-2026-01-01` for the `anthropic-beta` header. Please consult our documentation at platform.claude.com/docs or try again without the header.',
+    'Unexpected value(s) `thinking-binding-controls-2026-08-01` for the `anthropic-beta` header.'
   ]) assert.equal(reminders.claudeTurnScopedRemindersRejected(text), false, text);
 });
 
@@ -519,6 +525,31 @@ for (const reason of [
       assert.equal(calls.length, 1);
       assert.equal(hasSystem(calls[0].body), true);
     });
+  });
+}
+
+// 开关打开时每个请求都带 beta 头（首轮、没有提醒的请求也一样）；渠道在头这一层拒绝时同样要退回。
+for (const scenario of ['no-reminder', 'tool-loop']) {
+  test(`网关回退：beta 头被拒（Unexpected value(s)）时 ${scenario} 请求退回尾巴模式，重发与开关关闭时逐字节一致`, async () => {
+    resetProviderRequestAdaptations();
+    const headerRejected = 'Unexpected value(s) `mid-conversation-system-clear-at-2026-08-21` for the `anthropic-beta` header. '
+      + 'Please consult our documentation at platform.claude.com/docs or try again without the header.';
+    await withServer((call) => String(call.headers['anthropic-beta'] ?? '').split(',').includes(BETA)
+      ? rejection(headerRejected)
+      : { sse: CLAUDE_OK_STREAM }, async (baseUrl, calls) => {
+      const request = fullRequest({ provider: 'claude', modelId: 'claude-opus-5-5', scenario, claudeTurnScopedReminders: true });
+      const settings = { ...settingsFor('claude', 'claude-opus-5-5', baseUrl), id: `header-rejected-${scenario}`, apiKey: 'dummy-test-key' };
+      const { start } = await render(request, settings);
+      const off = await dryRunLlmProvider({ ...start, settingsSnapshot: { ...start.settingsSnapshot, claudeTurnScopedReminders: undefined } }, { settings });
+      const events = await send({ ...start, id: `header-${scenario}` }, settings);
+      assert.equal(events.some((event) => event.type === 'llm:error'), false, JSON.stringify(events.filter((event) => event.type === 'llm:error')));
+      assert.equal(calls.length, 2);
+      assert.equal(String(calls[0].headers['anthropic-beta']).split(',').includes(BETA), true);
+      assert.deepEqual(calls[1].body, off.body, 'the retry equals the switch-off request');
+      assert.equal(calls[1].headers['anthropic-beta'], off.headers['anthropic-beta']);
+      assert.equal(learnedProviderRequestAdaptations({ providerConfigId: settings.id, provider: 'claude', baseUrl, model: settings.model }).claudeTurnScopedReminders, 'tail');
+    });
+    resetProviderRequestAdaptations();
   });
 }
 

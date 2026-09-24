@@ -221,6 +221,9 @@ export function withAnthropicBetaValue(headers: Record<string, string>, beta: st
  *   \`system\` parameter, not "system" as an input message role.`，以及 pydantic 风格
  *   `messages.3.role: Input should be 'user' or 'assistant'`。
  * - 位置不合法：提到 system 消息且说明必须/不能出现在某个位置的错误。
+ * - beta 头这一层的拒绝（https://platform.claude.com/docs/en/api/beta-headers “Error handling”，beta 不存在或组织没开通）：
+ *   ``Unexpected value(s) `mid-conversation-system-clear-at-2026-08-21` for the `anthropic-beta` header.``；
+ *   开关打开时每个请求都带这个头，所以首轮、没有提醒的请求和原生压缩也会收到它。只认点名本 beta 的，别的 beta 被拒不算。
  */
 const TURN_SCOPED_REJECTIONS: readonly RegExp[] = [
   /(?<![\w])clear_at['"`]?\s*:?\s*extra inputs are not permitted/i,
@@ -230,7 +233,8 @@ const TURN_SCOPED_REJECTIONS: readonly RegExp[] = [
   /unexpected role\W{1,3}system/i,
   /messages\.\d+\.role\W[^\n]{0,40}(?:input should be|must be one of|expected)[^\n]{0,40}user[^\n]{0,20}assistant/i,
   /(?:role\W{1,3}system\W|system role|system messages?\b)[^\n]{0,60}not (?:supported|allowed|permitted)/i,
-  /system messages?\b[^\n]{0,120}(?:must|cannot|can't|can not|may not|may only|only allowed)[^\n]{0,120}(?:follow|after|before|precede|first|position|placed|immediately)/i
+  /system messages?\b[^\n]{0,120}(?:must|cannot|can't|can not|may not|may only|only allowed)[^\n]{0,120}(?:follow|after|before|precede|first|position|placed|immediately)/i,
+  /unexpected value\(s\)[^\n]{0,300}?mid-conversation-system-clear-at-/i
 ];
 
 export function claudeTurnScopedRemindersRejected(errorText: string): boolean {
