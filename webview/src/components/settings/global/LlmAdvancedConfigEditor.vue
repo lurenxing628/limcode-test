@@ -29,7 +29,8 @@ import {
   isGpt6FamilyModel,
   isOfficialOpenAIChannel,
   normalizeOpenAIResponsesNativeSettings,
-  openAIResponsesNativeCapabilities
+  openAIResponsesNativeCapabilities,
+  supportsOpenAIReasoningMode
 } from '@shared/openAIResponsesCapabilities';
 import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
@@ -101,7 +102,10 @@ const chatCompletionsToolHint = computed(() => {
     case 'requires_none_effort':
       return '该模型走 Chat Completions 时工具调用需要推理强度为 none，推理强度不是 none（含未设置时的默认 medium）时带工具的请求会被拒绝。LimCode 不会自动改写推理强度，建议改用 OpenAI Responses 渠道。';
     default:
-      return '';
+      // GPT-5.6（GPT-5.6 与 GPT-6 官方 id 里不属于 GPT-6 家族的那些）：官方文档没写，已有报错实例。
+      return props.config.provider === 'openai-compatible' && supportsOpenAIReasoningMode(props.config.model) && !isGpt6FamilyModel(props.config.model)
+        ? 'GPT-5.6 走 Chat Completions 带工具时，推理强度不是 none 可能被拒绝（报错“Function tools with reasoning_effort are not supported”）；OpenAI 官方文档没有写明这一限制。遇到时把推理强度设为 none，或改用 OpenAI Responses 渠道。'
+        : '';
   }
 });
 const openaiResponsesTransportOptions: SettingsDropdownOption[] = [
@@ -131,13 +135,13 @@ const promptCacheModeOptions: SettingsDropdownOption[] = [
   {
     value: 'explicit',
     label: '显式断点',
-    description: '发送 prompt_cache_options，并在聊天记录末尾写入 prompt_cache_breakpoint；需 LLM 支持。'
+    description: '发送 prompt_cache_options 并放置缓存断点；只有 GPT-5.6 及之后的模型支持，其他模型自动改用缓存 Key。'
   }
 ];
 const promptCacheDescription = computed(() => {
   if (props.config.provider === 'openai-responses') {
     return promptCache.value.mode === 'explicit'
-      ? '显式断点模式会发送 prompt_cache_options，并在聊天记录末尾添加断点；部分 LLM 或兼容渠道不支持该参数。'
+      ? '显式断点模式会发送 prompt_cache_options 并放置缓存断点：HTTP 请求把断点放在本轮提醒等每次都会变的内容之前；WebSocket 连续请求在最新的消息和工具结果上放断点，服务端保留此前的断点。只有 GPT-5.6 及之后的模型支持，其他模型自动改用缓存 Key 模式；部分兼容渠道可能不支持该参数。'
       : '缓存 Key 模式会为同一渠道、LLM 和对话自动生成稳定的 prompt_cache_key；不发送显式断点或缓存时间参数。';
   }
   if (props.config.provider === 'claude') {

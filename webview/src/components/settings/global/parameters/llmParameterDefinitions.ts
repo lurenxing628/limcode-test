@@ -188,16 +188,17 @@ export function parameterDefinitionsForProvider(provider: LlmProviderKind, model
   const supportsThinkingLevel = provider !== 'gemini'
     || geminiCapability?.kind === 'thinkingLevel'
     || geminiCapability?.kind === 'unknown';
-  const result = supportsThinkingLevel ? [...definitions, thinkingLevelDefinition(provider, modelId)] : definitions;
+  // 推理模式 standard / pro：“GPT-5.6 and GPT-6 models support standard and pro reasoning modes in the
+  // Responses API”（https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode）。只认官方 id，
+  // 能力未知的模型与网关别名（gpt-6-sol-xhigh、[az]gpt-6-luna）也不显示。
+  const result = (supportsThinkingLevel ? [...definitions, thinkingLevelDefinition(provider, modelId)] : definitions)
+    .filter((definition) => definition.key !== 'reasoningMode' || (provider === 'openai-responses' && supportsOpenAIReasoningMode(modelId)));
   // OpenAI 兼容的 DeepSeek / enable_thinking 写法（deepseek_toggle）：所有档位都能选，发送时按模型规则就近换算。
   if (!snapshot || snapshot.source === 'unknown' || snapshot.reasoning.family === 'none'
     || snapshot.reasoning.family === 'deepseek_toggle') return result;
   const capability = snapshot.reasoning;
   return result.filter((definition) => {
     if (definition.key === 'thinkingBudget') return capability.supportsBudget;
-    // 推理模式 standard / pro：“GPT-5.6 and GPT-6 models support standard and pro reasoning modes in the
-    // Responses API”（https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode）。只认官方 id。
-    if (definition.key === 'reasoningMode') return provider === 'openai-responses' && supportsOpenAIReasoningMode(modelId);
     if (definition.key === 'thinkingLevel') return capability.levels.length > 0
       || capability.canDisable && provider !== 'gemini';
     return true;

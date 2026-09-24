@@ -704,6 +704,9 @@ function openAIReasoningCapability(modelId: string): ModelReasoningCapability {
   // GPT-6（https://developers.openai.com/api/docs/models/gpt-6-astra、gpt-6-sol、gpt-6-luna）：
   // Astra 的 reasoning.effort 支持 low、medium、high、xhigh、max，不支持 none，官方没有写默认值；
   // Sol 和 Luna 支持 none、low、medium（默认）、high、xhigh、max。`pro` 是 reasoning.mode，不是模型 id。
+  // GPT-5.6（models/gpt-5.6-sol 等；gpt-5.6 指向 sol）：“Reasoning.effort supports: none, low, medium (default),
+  // high, xhigh, and max.” 没有 minimal。
+  const gpt56: LlmThinkingLevel[] = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
   const levels: Record<string, LlmThinkingLevel[]> = {
     'gpt-5': ['minimal', 'low', 'medium', 'high'],
     'gpt-5-mini': ['minimal', 'low', 'medium', 'high'],
@@ -711,11 +714,19 @@ function openAIReasoningCapability(modelId: string): ModelReasoningCapability {
     'gpt-5.1': ['none', 'low', 'medium', 'high'],
     'gpt-5.2': ['none', 'low', 'medium', 'high', 'xhigh'],
     'gpt-5.4': ['none', 'low', 'medium', 'high', 'xhigh'],
+    'gpt-5.6': gpt56,
+    'gpt-5.6-sol': gpt56,
+    'gpt-5.6-terra': gpt56,
+    'gpt-5.6-luna': gpt56,
     'gpt-6-astra': ['low', 'medium', 'high', 'xhigh', 'max'],
     'gpt-6-sol': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
     'gpt-6-luna': ['none', 'low', 'medium', 'high', 'xhigh', 'max']
   };
   const defaultLevels: Record<string, LlmThinkingLevel> = {
+    'gpt-5.6': 'medium',
+    'gpt-5.6-sol': 'medium',
+    'gpt-5.6-terra': 'medium',
+    'gpt-5.6-luna': 'medium',
     'gpt-6-sol': 'medium',
     'gpt-6-luna': 'medium'
   };

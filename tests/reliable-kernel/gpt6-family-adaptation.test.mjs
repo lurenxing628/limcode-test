@@ -203,7 +203,7 @@ test('推理强度表：其他 OpenAI 模型的能力快照逐字节不变', () 
       outputLimitIncludesThinking: true, requiresThoughtSignatures: true
     }), model);
   }
-  for (const model of ['gpt-5.5', 'gpt-5.6', 'gpt-5.6-sol']) assert.equal(officialCapability(model).reasoning.family, 'none', model);
+  for (const model of ['gpt-5.5', 'gpt-5.6-sol-high']) assert.equal(officialCapability(model).reasoning.family, 'none', model);
 });
 
 test('摘要推理预设按新表映射：Astra maximum → max、不能关闭；Sol / Luna 可以关闭', () => {
@@ -232,12 +232,18 @@ test('会话思考选项：Sol / Luna 在 openai-responses 与 openai-compatible
       assert.deepEqual(sessionThinkingCapability(provider, model), { kind: 'openai-effort', values: range }, `${provider}:${model}`);
     }
   }
-  // Astra 保持原样：openai-responses 为 low…max，openai-compatible 跟随渠道配置。
-  assert.deepEqual(sessionThinkingCapability('openai-responses', 'gpt-6-astra'),
-    { kind: 'openai-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] });
-  assert.equal(sessionThinkingCapability('openai-compatible', 'gpt-6-astra'), undefined);
+  // Astra：两种渠道都是 low…max（openai-compatible 同样由适配器把 none / minimal 发成 low）。
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    assert.deepEqual(sessionThinkingCapability(provider, 'gpt-6-astra'),
+      { kind: 'openai-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] }, provider);
+    assert.equal(sessionThinking.sessionThinkingDisplayLabel(provider, 'gpt-6-astra', { thinkingLevel: 'none' }), 'low（适配器）', provider);
+  }
+  // GPT-5.6 各型号（models/gpt-5.6-sol 等）：none、low、medium（默认）、high、xhigh、max，没有 minimal。
+  for (const provider of ['openai-responses', 'openai-compatible']) {
+    for (const model of GPT56) assert.deepEqual(sessionThinkingCapability(provider, model), { kind: 'openai-effort', values: range }, `${provider}:${model}`);
+  }
   // 网关别名与其他模型不变。
-  for (const model of ['gpt-6-sol-xhigh', '[az]gpt-6-luna', 'gpt-5.6-sol']) {
+  for (const model of ['gpt-6-sol-xhigh', '[az]gpt-6-luna', 'gpt-5.6-sol-high']) {
     assert.equal(sessionThinkingCapability('openai-responses', model), undefined, model);
   }
   assert.deepEqual(sessionThinkingCapability('openai-responses', 'gpt-5.2'),
@@ -496,7 +502,8 @@ test('会话思考显示：Sol / Luna 的 minimal 显示为适配器映射，non
     assert.equal(sessionThinkingDisplayLabel(provider, 'gpt-5.6', { thinkingLevel: 'minimal' }), 'minimal');
   }
   assert.equal(sessionThinkingDisplayLabel('openai-responses', 'gpt-6-astra', { thinkingLevel: 'none' }), 'low（适配器）');
-  assert.equal(sessionThinkingDisplayLabel('openai-compatible', 'gpt-6-astra', { thinkingLevel: 'none' }), 'none');
+  // Chat Completions 上的 Astra 同样由适配器把 none 发成 low。
+  assert.equal(sessionThinkingDisplayLabel('openai-compatible', 'gpt-6-astra', { thinkingLevel: 'none' }), 'low（适配器）');
 });
 
 // 显式缓存：https://developers.openai.com/api/docs/guides/prompt-caching（GPT-5.6 and later；ttl 只能是 "30m"；
@@ -616,6 +623,53 @@ test('设置界面：openai-compatible 上的 GPT-6 模型显示工具调用限�
     const pro = await render('openai-responses', 'gpt-6-luna', { thinkingConfig: { reasoningMode: 'pro' } });
     assert.match(pro, /推理模式为 pro 时不可用/);
     assert.match(await render('openai-responses', 'gpt-6-sol-xhigh'), /当前 LLM 不支持/);
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    await server.close();
+  }
+});
+
+test('GPT-5.6 各型号的推理强度表为 none…max、默认 medium，没有 minimal', () => {
+  for (const model of [...GPT56, 'gpt-5.6-terra-2026-07-01']) {
+    const reasoning = officialCapability(model).reasoning;
+    assert.deepEqual(reasoning.levels, ['none', 'low', 'medium', 'high', 'xhigh', 'max'], model);
+    assert.equal(reasoning.defaultLevel, 'medium', model);
+    assert.equal(reasoning.canDisable, true, model);
+  }
+  const { parameterDefinitionsForProvider } = loadWebviewModule('webview/src/components/settings/global/parameters/llmParameterDefinitions.ts');
+  const options = parameterDefinitionsForProvider('openai-responses', 'gpt-5.6-sol', officialCapability('gpt-5.6-sol'))
+    .find((definition) => definition.key === 'thinkingLevel').options.map((option) => option.value);
+  assert.deepEqual(options, ['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+});
+
+test('推理模式 pro 只对 GPT-5.6 / GPT-6 官方 id 开放，能力未知的模型与网关别名也不显示', () => {
+  const { parameterDefinitionsForProvider } = loadWebviewModule('webview/src/components/settings/global/parameters/llmParameterDefinitions.ts');
+  const hasMode = (model, snapshot) => parameterDefinitionsForProvider('openai-responses', model, snapshot).some((definition) => definition.key === 'reasoningMode');
+  for (const model of ['gpt-6-sol-xhigh', '[az]gpt-6-luna', 'gpt-4o']) {
+    assert.equal(hasMode(model, officialCapability(model)), false, model);
+    assert.equal(hasMode(model), false, `${model} without snapshot`);
+  }
+  assert.equal(hasMode('gpt-6-sol'), true);
+});
+
+test('设置界面：GPT-5.6 走 Chat Completions 带工具时的提示与显式缓存说明', async () => {
+  const { createWebviewSsrServer } = await import('./webview-ssr-server.mjs');
+  const server = await createWebviewSsrServer();
+  const previousDocument = globalThis.document;
+  globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
+  try {
+    const { default: editor } = await server.ssrLoadModule('/src/components/settings/global/LlmAdvancedConfigEditor.vue');
+    const { createSSRApp } = await import('vue');
+    const { renderToString } = await import('@vue/server-renderer');
+    const render = (config) => renderToString(createSSRApp(editor, { config: providerConfig(config) }));
+    for (const model of GPT56) {
+      assert.match(await render({ provider: 'openai-compatible', model }), /Function tools with reasoning_effort are not supported/, model);
+    }
+    assert.doesNotMatch(await render({ provider: 'openai-responses', model: 'gpt-5.6-sol' }), /chat-completions-tool-hint/);
+    const explicit = await render({ provider: 'openai-responses', model: 'gpt-5.6-sol', promptCache: { enabled: true, mode: 'explicit', ttl: '30m' } });
+    assert.match(explicit, /只有 GPT-5\.6 及之后的模型支持，其他模型自动改用缓存 Key/);
+    assert.doesNotMatch(explicit, /在聊天记录末尾添加断点/);
   } finally {
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;

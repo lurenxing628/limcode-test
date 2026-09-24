@@ -63,7 +63,12 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     if (/^gpt-5(?:-mini|-nano)?(?:-\d{4}-\d{2}-\d{2})?$/.test(model)) return { kind: 'openai-effort', values: ['minimal', 'low', 'medium', 'high'] };
     if (/^gpt-5\.1(?:-2025-11-13)?$/.test(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high'] };
     if (/^gpt-5\.2(?:-2025-12-11)?$/.test(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh'] };
-    if (isAstraModel(model) && provider === 'openai-responses') return { kind: 'openai-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] };
+    if (/^gpt-5\.6(?:-(?:sol|terra|luna))?(?:-\d{4}-\d{2}-\d{2})?$/.test(model)) {
+      // GPT-5.6 各型号（models/gpt-5.6-sol 等）：none、low、medium（默认）、high、xhigh、max，没有 minimal。
+      return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] };
+    }
+    // Astra 在 Responses 与 Chat Completions 上都由适配器把 none / minimal 发成 low。
+    if (isAstraModel(model)) return { kind: 'openai-effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] };
     // GPT-6 Sol / Luna（models/gpt-6-sol.md、models/gpt-6-luna.md）：none、low、medium（默认）、high、xhigh、max。
     if (isGpt6NoneCapableModel(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] };
   }
@@ -201,7 +206,7 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
     if (capability.kind === 'unsupported') return '不支持（不发送）';
     if (capability.kind === 'unknown') return `能力未确认 · ${thinkingValueLabel(thinking)}`;
   }
-  if (provider === 'openai-responses' && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
+  if ((provider === 'openai-responses' || provider === 'openai-compatible') && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
   if ((provider === 'openai-responses' || provider === 'openai-compatible') && isGpt6NoneCapableModel(model) && thinking?.thinkingLevel === 'minimal') return 'low（适配器）';
   // 始终思考的 Claude（Fable、Mythos、Opus 5.5）：none 不发送（claudeThinkingAdaptation 去掉 disabled），模型仍会思考。
   if (provider === 'claude' && thinking?.thinkingLevel === 'none' && anthropicModelReasoningCapability(model.replace(/\./g, '-'))?.alwaysOn) {
