@@ -45,6 +45,7 @@ import { readNativeSteeringInFlight } from './nativeSteering';
 import {
   compressionOutputTokens,
   estimateCompressionResultTokens,
+  hasUnsizedOpaqueCompaction,
   estimateMaterializedContextTokens,
   providerPromptTokens
 } from './contextTokenEstimator';
@@ -773,7 +774,16 @@ export class ReliableContextCompressionCoordinator {
       fullAttachmentCatalogState,
       fullModelHandleCatalog
     );
-    if (trigger === 'auto' && policy.methodKind !== 'provider_native' && projectedTokens >= currentContextTokens) {
+    // A ciphertext compaction nobody sized makes the "before" figure only a lower bound: every text
+    // summary replacing it would look larger and the already paid summary would be discarded on
+    // every attempt, so the comparison is skipped and no before figure is recorded.
+    const contextSizeKnown = !hasUnsizedOpaqueCompaction(semanticMaterialized.segments);
+    if (
+      trigger === 'auto'
+      && policy.methodKind !== 'provider_native'
+      && contextSizeKnown
+      && projectedTokens >= currentContextTokens
+    ) {
       // A large protected tail can cross the threshold while the currently eligible prefix is
       // already compact.  The durable ModelRequest makes this decision exact-replayable for this
       // frozen head; treating it as a level-triggered skip keeps the primary Agent Turn alive and
@@ -808,7 +818,7 @@ export class ReliableContextCompressionCoordinator {
             calibration
           )
         } : {}),
-        contextTokensBefore: currentContextTokens,
+        ...(contextSizeKnown ? { contextTokensBefore: currentContextTokens } : {}),
         estimatedTokensAfter: projectedTokens,
         providerCalibrationRatio: calibration.ratio,
         calibratedTokensAfter: projectedProviderTokens,

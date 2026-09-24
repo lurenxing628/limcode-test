@@ -321,3 +321,41 @@ test('with a Provider calibration above 1 the frozen summary limit is converted 
     assert.equal(recipes[0].effectiveSummaryMaxTokens, 4_000);
   });
 });
+
+test('a ciphertext compaction without an output count has an unknown size, so a text summary replacing it is not judged non-reducing', async () => {
+  const thresholdTokens = 1;
+  await withTurn('reduction-gate-unsized-ciphertext', thresholdTokens, async (app, seeded) => {
+    await appendMessage(app, seeded, 'paid', 'assistant', `paid-history ${'alpha beta gamma delta '.repeat(200)}`);
+    // A gateway that returned no usage: the OpenAI compaction item is stored without its output count.
+    await app.compression.create({
+      conversationId: seeded.conversationId,
+      headRootId: await app.context.currentHeadRootId(seeded.conversationId),
+      authoritySnapshotId: seeded.authoritySnapshotId,
+      // The Turn's own input and the paid history.
+      compressSegmentCount: 2,
+      title: '原生压缩',
+      idempotencyKey: 'unsized-native-compaction',
+      summary: [{ role: 'model', parts: [{ providerContext: {
+        format: 'openai-responses', itemType: 'compaction',
+        rawItem: { type: 'compaction', id: 'cmp_unsized', encrypted_content: 'gAAAA-ciphertext' }
+      } }] }]
+    });
+    await appendMessage(app, seeded, 'source', 'assistant', 'small-source');
+    await appendMessage(app, seeded, 'tail', 'user', 'protected-tail');
+    const head = await app.context.currentHeadRootId(seeded.conversationId);
+    let dispatches = 0;
+    const result = await summaryCoordinator(app, `REPLACEMENT-${'x'.repeat(4096)}`, () => { dispatches += 1; }).coordinate({
+      turnId: seeded.turnId,
+      authoritySnapshotId: seeded.authoritySnapshotId,
+      headRootId: head,
+      trigger: 'auto',
+      requestBudget: requestBudget(thresholdTokens, 0, 2_000)
+    });
+    assert.equal(dispatches, 1);
+    // Before: the ciphertext measured 0 tokens, every text summary looked larger, and the paid summary
+    // was thrown away as non_reducing on every attempt.
+    assert.equal(result.status, 'compressed', JSON.stringify(result));
+    const metadata = await compressionMetadata(app, seeded.conversationId);
+    assert.equal(metadata.contextTokensBefore, undefined, 'an unknown Context size is not recorded as a before figure');
+  });
+});

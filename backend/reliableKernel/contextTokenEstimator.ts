@@ -424,6 +424,20 @@ function compressionEnvelopeResultTokens(envelope: Record<string, unknown>): num
   return estimateCompressionResultTokens(contents, optionalTokenCount(envelope.providerOutputTokens), ratio);
 }
 
+/**
+ * True when the Context opens with an OpenAI compaction item whose size nobody reported: its
+ * ciphertext is invisible to the estimator and the gateway returned no output count, so any Context
+ * total that includes it is only a lower bound.
+ */
+export function hasUnsizedOpaqueCompaction(segments: readonly MaterializedContextSegment[]): boolean {
+  const first = segments[0];
+  if (!first || first.segmentKind !== 'compression') return false;
+  const envelope = parseRecord(first.content.toString('utf8'));
+  if (!envelope || envelope.kind !== 'compression_contents' || !Array.isArray(envelope.contents)) return false;
+  return hasOpaqueProviderCompaction(envelope.contents.filter(isMessageContent))
+    && optionalTokenCount(envelope.providerOutputTokens) === undefined;
+}
+
 function compressionEstimate(segments: readonly MaterializedContextSegment[]): number | undefined {
   const first = segments[0];
   if (!first || first.segmentKind !== 'compression') return undefined;
