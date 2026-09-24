@@ -26,6 +26,7 @@ import LlmAdvancedConfigEditor from './LlmAdvancedConfigEditor.vue';
 import LlmCompressionSettingsEditor from './LlmCompressionSettingsEditor.vue';
 import ModelFetchDialog from './ModelFetchDialog.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
+import { OPENAI_COMPATIBLE_SERVICE_PRESETS } from '@shared/openAICompatibleDialect';
 
 const settings = useGlobalSettingsStore();
 const { loading: channelLoading, text: channelLoadingText } = useSettingsLoadingText('渠道配置', 'global', undefined, {
@@ -49,17 +50,27 @@ const deleteModelConfigConfirmOpen = ref(false);
 const deletingModelConfigId = ref('');
 
 const providerOptions: SettingsDropdownOption[] = [
-  { value: 'openai-compatible', label: 'OpenAI Compatible' },
+  {
+    value: 'openai-compatible',
+    label: 'OpenAI Compatible',
+    description: 'DeepSeek、Kimi、智谱、百炼等都选这一种，思考参数写法自动识别'
+  },
   { value: 'openai-responses', label: 'OpenAI Responses' },
   { value: 'claude', label: 'Claude' },
-  { value: 'gemini', label: 'Gemini' },
-  { value: 'deepseek', label: 'DeepSeek' }
+  { value: 'gemini', label: 'Gemini' }
 ];
+
+/** 新建 OpenAI 兼容渠道时按服务商填好接口地址；空值表示 OpenAI 或其他服务，自己填地址。 */
+const createServiceOptions: SettingsDropdownOption[] = [
+  { value: '', label: 'OpenAI 或其他服务', description: '先用 OpenAI 的地址，建好后可以改成任意兼容地址' },
+  ...OPENAI_COMPATIBLE_SERVICE_PRESETS.map((preset) => ({ value: preset.id, label: preset.label, description: preset.baseUrl }))
+];
+const createService = ref('');
 
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
   'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
-  | 'claudeTurnScopedReminders'
+  | 'claudeTurnScopedReminders' | 'openaiCompatibleThinkingFormat'
 >>;
 
 const activeConfig = computed(() => settings.activeLlmProviderConfig);
@@ -228,6 +239,8 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
     ...(modelConfig.nativeResponses ? { nativeResponses: { ...modelConfig.nativeResponses } } : {}),
     // 模型级配置缺省时跟随渠道，与运行时冻结的取值一致。
     ...((modelConfig.claudeTurnScopedReminders ?? base?.claudeTurnScopedReminders) === true ? { claudeTurnScopedReminders: true } : {}),
+    ...((modelConfig.openaiCompatibleThinkingFormat ?? base?.openaiCompatibleThinkingFormat)
+      ? { openaiCompatibleThinkingFormat: modelConfig.openaiCompatibleThinkingFormat ?? base?.openaiCompatibleThinkingFormat } : {}),
     headers: modelConfig.headers ?? {},
     generationConfig: modelConfig.generationConfig ?? {},
     requestBody: modelConfig.requestBody ?? {},
@@ -358,12 +371,16 @@ function updateModelCompressionFallbacks(
 
 function openCreate(): void {
   createProvider.value = 'openai-compatible';
+  createService.value = '';
   createOpen.value = true;
 }
 
 function confirmCreate(name: string): void {
   createOpen.value = false;
-  settings.createLlmProviderConfig(name, createProvider.value);
+  const preset = createProvider.value === 'openai-compatible'
+    ? OPENAI_COMPATIBLE_SERVICE_PRESETS.find((candidate) => candidate.id === createService.value)
+    : undefined;
+  settings.createLlmProviderConfig(name, createProvider.value, preset?.baseUrl);
 }
 
 function cancelCreate(): void {
@@ -733,6 +750,10 @@ function cancelDelete(): void {
       <label class="global-settings-field create-channel-provider-field">
         <span>渠道类型</span>
         <SettingsDropdown :model-value="createProvider" :options="providerOptions" title="选择渠道类型" @update:model-value="updateCreateProvider" />
+      </label>
+      <label v-if="createProvider === 'openai-compatible'" class="global-settings-field create-channel-provider-field">
+        <span>服务商</span>
+        <SettingsDropdown :model-value="createService" :options="createServiceOptions" title="选择服务商，自动填好接口地址" @update:model-value="createService = $event" />
       </label>
     </InputPanel>
 

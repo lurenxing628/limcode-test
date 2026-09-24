@@ -1,4 +1,4 @@
-import { loadScopedModelProfiles } from './scopedModelProfiles';
+import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import { applySessionThinkingOverride, validateSessionThinkingOverride } from '../../shared/sessionThinking';
 import type { RequestGenerationSettings } from './requestCompressionSettings';
@@ -51,7 +51,8 @@ import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   MAX_LLM_RETRY_DELAY_SECONDS,
-  MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS
+  MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS,
+  canonicalLlmProviderKind
 } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
 import { normalizeOpenAIResponsesNativeSettings } from '../../shared/openAIResponsesCapabilities';
@@ -867,7 +868,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         paths.modelProfilesRootUri,
         paths.modelProfilesIndexUri,
         'modelProfile'
-      ),
+      ).then((profiles) => profiles?.map(canonicalModelProfile)),
       loadRecordStore<ModelProfileScopeLinkRecord, 'link'>(
         paths.modelProfileScopeLinksRootUri,
         paths.modelProfileScopeLinksIndexUri,
@@ -984,7 +985,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       loadLlmProviderConfigsSettings(paths)
     ]);
     const provider = providers.settings.configs.find((item) => item.id === model.providerConfigId);
-    if (!provider || provider.provider !== model.provider || !providerContainsModel(provider, model.model)) throw new Error('当前请求渠道或模型已改变，请重新选择。');
+    if (!provider || provider.provider !== canonicalLlmProviderKind(model.provider) || !providerContainsModel(provider, model.model)) throw new Error('当前请求渠道或模型已改变，请重新选择。');
     // Resolve only this conversation. Agent/workflow/global profiles and parent Turn fallbacks
     // select model identity, never a parent's session-only override.
     const profile = resolveRecordAtScope(records.modelProfileScopeLinks, records.modelProfiles,
@@ -1012,7 +1013,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       loadGlobalSettingsFile(paths.settingsRootUri, 'llmCompression')
     ]);
     const provider = providers.settings.configs.find((candidate) => candidate.id === model.providerConfigId);
-    if (!provider || provider.provider !== model.provider || !providerContainsModel(provider, model.model)) {
+    if (!provider || provider.provider !== canonicalLlmProviderKind(model.provider) || !providerContainsModel(provider, model.model)) {
       throw new Error('当前对话使用的模型渠道已删除或改变，请重新选择模型。');
     }
     const contextWindowTokens = resolveContextWindow(provider, model.model);
@@ -1447,6 +1448,8 @@ function resolveRequestedProvider(
   input: { providerConfigId?: string; providerKind?: LlmProviderConfigRecord['provider']; modelId?: string }
 ): LlmProviderConfigRecord | undefined {
   const providerConfigId = input.providerConfigId?.trim();
+  // Agent、工作流和客户端选择里可能还存着原 DeepSeek 渠道类型。
+  input = { ...input, providerKind: canonicalLlmProviderKind(input.providerKind) ?? input.providerKind };
   if (providerConfigId) {
     const provider = providers.find((candidate) => candidate.id === providerConfigId);
     if (!provider) throw new Error(`LLM Provider 配置不存在：${providerConfigId}`);

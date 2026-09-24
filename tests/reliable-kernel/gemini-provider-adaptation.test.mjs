@@ -439,7 +439,7 @@ test('E1 pairing only applies to Gemini: other providers keep their own history 
     userText(CATALOG),
     { role: 'user', parts: [response('b')] }
   ];
-  for (const providerKind of ['openai-compatible', 'openai-responses', 'deepseek']) {
+  for (const providerKind of ['openai-compatible', 'openai-responses']) {
     const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, providerKind);
     assert.deepEqual(request.contents.map((content) => content.parts.length), [1, 2, 1, 1, 1], providerKind);
   }
@@ -564,15 +564,33 @@ test('E3 signature-only thought parts from other providers are dropped like any 
   assert.deepEqual(wireShape(contents), ['user:TEXT(go)', 'model:TEXT(answer)', 'user:TEXT(next)']);
 });
 
-test('E3 foreign-thought projection only applies to Gemini', () => {
+test('E3 Gemini-style foreign-thought projection does not apply to OpenAI channels', () => {
   const history = [
     userText('a'),
     { role: 'model', parts: [{ text: 'claude thought', thought: true, thoughtSignature: 'claude:sig' }, { text: 'answer' }] }
   ];
-  for (const providerKind of ['openai-compatible', 'openai-responses', 'deepseek']) {
-    const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, providerKind);
-    assert.equal(request.contents[1].parts[0].thought, true, providerKind);
-  }
+  const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, 'openai-responses');
+  assert.equal(request.contents[1].parts[0].thought, true);
+});
+
+test('E3 OpenAI 兼容渠道只回传本渠道或未签名的思考，其他渠道签名的思考不回传', () => {
+  const history = [
+    userText('a'),
+    { role: 'model', parts: [
+      { text: 'claude thought', thought: true, thoughtSignature: 'claude:sig' },
+      { text: 'own thought', thought: true, thoughtSignature: 'openai-compatible:sig' },
+      { text: 'unsigned thought', thought: true },
+      { text: 'answer' }
+    ] },
+    { role: 'model', parts: [{ text: 'gemini only', thought: true, thoughtSignature: 'gemini:sig' }] },
+    userText('b')
+  ];
+  const request = toUnifiedRequest({ id: 'r', conversationId: 'c', contents: history, tools: [] }, undefined, 'openai-compatible');
+  assert.deepEqual(request.contents.map((content) => content.parts.map((part) => part.text)), [
+    ['a'],
+    ['own thought', 'unsigned thought', 'answer'],
+    ['b']
+  ]);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -924,7 +942,7 @@ async function replayedWire(modelParts, overrides = {}) {
     { role: 'user', parts: [{ text: 'next' }] }
   ], overrides), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
   const settings = overrides.provider && overrides.provider !== 'gemini'
-    ? providerConfig({ provider: overrides.provider, model: overrides.model, apiKey: '' })
+    ? providerConfig({ provider: overrides.provider, model: overrides.model, apiKey: '', ...(overrides.baseUrl ? { baseUrl: overrides.baseUrl } : {}) })
     : geminiConfig(overrides.model ? { model: overrides.model } : {});
   return (await dryRunLlmProvider(start, { settings: async () => settings })).body;
 }
@@ -1121,10 +1139,10 @@ test('E6 signed Gemini text parts add nothing to other providers\' wire bodies',
     { text: '', thoughtSignature: 'gemini:SIG_END' }
   ];
   const unsigned = [{ text: 'Thinking.', thought: true }, { text: 'Hello' }, { text: ' world' }];
-  for (const [provider, model] of [['claude', 'claude-opus-5-5'], ['openai-compatible', 'gpt-5.5'], ['openai-responses', 'gpt-5.5'], ['deepseek', 'deepseek-chat']]) {
+  for (const [provider, model, baseUrl] of [['claude', 'claude-opus-5-5'], ['openai-compatible', 'gpt-5.5'], ['openai-responses', 'gpt-5.5'], ['openai-compatible', 'deepseek-chat', 'https://api.deepseek.com/v1']]) {
     assert.deepEqual(
-      await replayedWire(signed, { provider, model }),
-      await replayedWire(unsigned, { provider, model }),
+      await replayedWire(signed, { provider, model, baseUrl }),
+      await replayedWire(unsigned, { provider, model, baseUrl }),
       provider
     );
   }

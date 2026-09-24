@@ -32,7 +32,7 @@
 | Claude 3.7 Sonnet / 已识别旧4系 | `thinking.budget_tokens` | 明确 maxOutputTokens；整数≥1024且小于输出上限；temperature仅省略/1，top_k省略，top_p仅省略或0.95–1，不合法拒绝保存 |
 | Claude 精确4.6 Opus/Sonnet（及日期标识） | adaptive + `output_config.effort` | 与预算互斥；none为关闭；不猜测未来4.x，不静默降档 |
 | Claude 4.7 及之后（能力表 `anthropic_adaptive`：Opus 4.7/4.8/5/5.5、Sonnet 5、Fable、Mythos） | adaptive + `output_config.effort`（low–xhigh、max） | 只按能力表精确 id（及日期标识）开放；始终开启的 Fable、Mythos、Opus 5.5 不提供 none；编码与渠道配置同一路径 |
-| DeepSeek 已识别 reasoner/v4 | `thinking.type` / `reasoning_effort` | none/high/max；不使用 OpenAI 全部档位 |
+| OpenAI-compatible，DeepSeek 风格模型（DeepSeek、MiMo、Kimi、GLM、混元、Qwen、ERNIE，按模型 ID 识别） | 档位按模型能力给出；发送时按“思考参数写法”换成对方参数：`thinking.type` + `reasoning_effort`、`enable_thinking`，或只发 `reasoning_effort`（`shared/openAICompatibleDialect.ts`） | DeepSeek none/low/high/max；关不掉思考的模型（Kimi K3、GLM-5.3、Kimi K2.7 Code）不提供 none；只能开关的模型为 none/high；对方不接受的强度换成最接近的值 |
 | 未知别名 / 自定义渠道模型 | 显示现有渠道或模型配置；已配置 effort 时复用渠道编辑器的参数集合 | 未配置时不猜测能力；Gemini 保留具体型号约束。参数集合来自 `shared/llmThinkingLevels.ts`，不代表远端服务已通过联调 |
 | 与思维/输出相关 custom body | 保留已有 body，快捷覆盖报冲突 | 失败草稿保留，可确认重试/放弃草稿/恢复默认；不全局阻塞其他会话 |
 

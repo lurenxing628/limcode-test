@@ -443,7 +443,7 @@ const clearAckTargets = [
   { provider: 'gemini', model: 'gemini-2.5-flash', value: '2048' },
   { provider: 'claude', model: 'claude-sonnet-4-5', value: '2048' },
   { provider: 'claude', model: 'claude-opus-4-6', value: 'none' },
-  { provider: 'deepseek', model: 'deepseek-reasoner', value: 'none' },
+  { provider: 'openai-compatible', model: 'deepseek-reasoner', value: 'none' },
   { provider: 'openai-compatible', model: 'gpt-4o' }
 ];
 for (const target of clearAckTargets) test(`review scope clear receipt is channel-independent across switch/reset/clear/inherited set: ${target.provider}/${target.model}`, async () => {

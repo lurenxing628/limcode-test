@@ -130,8 +130,7 @@ const providerOptions: SettingsDropdownOption[] = [
   { value: 'openai-compatible', label: 'OpenAI Compatible' },
   { value: 'openai-responses', label: 'OpenAI Responses' },
   { value: 'claude', label: 'Claude' },
-  { value: 'gemini', label: 'Gemini' },
-  { value: 'deepseek', label: 'DeepSeek' }
+  { value: 'gemini', label: 'Gemini' }
 ];
 
 const selectedProviderSettings = computed(() => {

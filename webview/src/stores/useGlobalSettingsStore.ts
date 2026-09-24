@@ -194,8 +194,6 @@ function providerDefaultBaseUrl(provider: LlmProviderKind): string {
       return 'https://api.anthropic.com/v1';
     case 'gemini':
       return 'https://generativelanguage.googleapis.com/v1beta';
-    case 'deepseek':
-      return 'https://api.deepseek.com/v1';
     case 'openai-responses':
     case 'openai-compatible':
     default:
@@ -258,6 +256,7 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     promptCache: normalizePromptCacheForUi(config.promptCache, config.provider),
     ...(nativeResponses ? { nativeResponses } : {}),
     ...(config.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -367,6 +366,7 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
     ...(nativeResponses ? { nativeResponses } : {}),
     ...(typeof config.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: config.claudeTurnScopedReminders } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -755,6 +755,7 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
       ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
       : {}),
     ...(config.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
@@ -782,6 +783,7 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
       ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
       : {}),
     ...(typeof config.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: config.claudeTurnScopedReminders } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
@@ -1922,8 +1924,9 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.llm.activeProviderConfigId = configId;
       this.saveLlm();
     },
-    createLlmProviderConfig(name = '新渠道配置', provider: LlmProviderKind = 'openai-compatible'): void {
+    createLlmProviderConfig(name = '新渠道配置', provider: LlmProviderKind = 'openai-compatible', baseUrl?: string): void {
       const config = createDefaultProviderConfig(name.trim() || '新渠道配置', provider);
+      if (baseUrl?.trim()) config.baseUrl = baseUrl.trim();
       this.llmProviderConfigs.configs.push(config);
       this.llm.activeProviderConfigId = config.id;
       this.pendingActiveProviderConfigIdAfterConfigsSave = config.id;

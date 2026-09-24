@@ -3,7 +3,7 @@ import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
-import { MAX_LLM_RETRY_DELAY_SECONDS } from '../../shared/protocol';
+import { MAX_LLM_RETRY_DELAY_SECONDS, canonicalLlmProviderKind } from '../../shared/protocol';
 import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind, SkillPolicyRecord } from '../../shared/protocol';
 import type {
   CompressionExecutionPlan,
@@ -138,8 +138,9 @@ export function frozenModelSelection(document: PlainJsonValue): ChatModelOverrid
   if (!isRecord(document) || !isRecord(document.model)) {
     throw new Error('AuthoritySnapshot is missing frozen model selection.');
   }
-  const provider = document.model.provider;
-  if (!isProviderKind(provider)) throw new Error('AuthoritySnapshot.model.provider is invalid.');
+  // 历史回合冻结的 'deepseek' 读作 OpenAI 兼容，与迁移后的渠道配置一致。
+  const provider = canonicalLlmProviderKind(document.model.provider);
+  if (!provider) throw new Error('AuthoritySnapshot.model.provider is invalid.');
   return {
     providerConfigId: requireText(
       document.model.providerConfigId,
@@ -214,8 +215,8 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
     throw new Error('Frozen compression trigger is invalid.');
   }
   const thresholdTokens = positiveSafeInteger(compression.thresholdTokens, 'compression.thresholdTokens');
-  const providerKind = provider.provider;
-  if (!isProviderKind(providerKind)) throw new Error('Frozen compression provider kind is invalid.');
+  const providerKind = canonicalLlmProviderKind(provider.provider);
+  if (!providerKind) throw new Error('Frozen compression provider kind is invalid.');
   const executionPlan = requireCompressionExecutionPlan(compression.executionPlan, methodKind);
   const capabilities = requireModelCapabilities(provider.capabilities, providerKind);
   const summaryReasoning = requireSummaryReasoning(provider.summaryReasoning);
@@ -326,12 +327,13 @@ function requireCompressionExecutionPlan(
 }
 
 function requireModelCapabilities(value: unknown, provider: LlmProviderKind): ModelCapabilitySnapshot {
-  if (!isRecord(value) || value.providerKind !== provider || !isRecord(value.reasoning)
+  if (!isRecord(value) || canonicalLlmProviderKind(value.providerKind) !== provider || !isRecord(value.reasoning)
     || !isRecord(value.nativeCompaction) || typeof value.modelId !== 'string'
     || typeof value.endpointFingerprint !== 'string' || typeof value.source !== 'string') {
     throw new Error('Frozen compression Provider capability snapshot is incomplete.');
   }
-  return normalizePlainJson(value, 'AuthoritySnapshot.compression.provider.capabilities') as unknown as ModelCapabilitySnapshot;
+  const snapshot = normalizePlainJson(value, 'AuthoritySnapshot.compression.provider.capabilities') as unknown as ModelCapabilitySnapshot;
+  return snapshot.providerKind === provider ? snapshot : { ...snapshot, providerKind: provider };
 }
 
 function requireSummaryReasoning(value: unknown): ResolvedSummaryReasoning {
@@ -340,10 +342,6 @@ function requireSummaryReasoning(value: unknown): ResolvedSummaryReasoning {
     throw new Error('Frozen compression summary reasoning plan is incomplete.');
   }
   return normalizePlainJson(value, 'AuthoritySnapshot.compression.provider.summaryReasoning') as unknown as ResolvedSummaryReasoning;
-}
-
-function isProviderKind(value: unknown): value is LlmProviderKind {
-  return ['openai-compatible', 'openai-responses', 'claude', 'gemini', 'deepseek'].includes(String(value));
 }
 
 function positiveSafeInteger(value: unknown, label: string): number {

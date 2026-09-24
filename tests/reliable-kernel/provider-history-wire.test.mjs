@@ -66,12 +66,12 @@ const answer = text => ({ role: 'model', parts: [{ text }] });
  * adapter and the provider request encoder are production code. `send` answers each request and
  * sees the frozen request, the adapter's LlmStartRequest and the encoded wire body.
  */
-async function fixture({ providerKind, modelId, send }, run) {
+async function fixture({ providerKind, modelId, baseUrl = 'https://example.invalid/v1', send }, run) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-tool-batch-wire-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
   const provider = { ...createDefaultLlmProviderConfig({ name: 'synthetic tool batch' }), id: 'synthetic-batch',
-    provider: providerKind, baseUrl: 'https://example.invalid/v1', model: modelId,
+    provider: providerKind, baseUrl, model: modelId,
     models: [{ id: modelId, name: 'synthetic' }], modelConfigs: [], generationConfig: {}, contextWindowTokens: 200000 };
   const errors = [], requests = [];
   let app, runner;
@@ -173,16 +173,17 @@ function wireShape(wire) {
 
 const PROVIDERS = [
   ['openai-compatible', 'gpt-5.5'],
-  ['deepseek', 'deepseek-v4-flash'],
+  // 官方 DeepSeek 接口：OpenAI 兼容渠道里走接入库的 DeepSeek 格式（工具结果可带图片）。
+  ['openai-compatible', 'deepseek-v4-flash', 'https://api.deepseek.com/v1'],
   ['gemini', 'gemini-3.5-flash'],
   ['claude', 'claude-sonnet-5'],
   ['openai-responses', 'gpt-5.5']
 ];
 
 /** Where the catalog of the screenshot lands in the request after one Turn of tool calls. */
-async function catalogAfterToolTurn(providerKind, modelId, calls) {
+async function catalogAfterToolTurn(providerKind, modelId, calls, baseUrl) {
   let shape, start;
-  await fixture({ providerKind, modelId, async send(round, observed) {
+  await fixture({ providerKind, modelId, baseUrl, async send(round, observed) {
     if (round === 1) return { role: 'model', parts: calls };
     if (round === 2) {
       shape = wireShape(observed.wire);
@@ -193,14 +194,13 @@ async function catalogAfterToolTurn(providerKind, modelId, calls) {
   return { shape, start };
 }
 
-for (const [providerKind, modelId] of PROVIDERS) {
-  test(`${providerKind}: an attachment catalog after the first result of a parallel batch waits until the batch ends`, { timeout: 120000 }, async () => {
-    const { shape } = await catalogAfterToolTurn(providerKind, modelId, [call('shot1', 'srv_shot'), call('list2', 'srv_list')]);
+for (const [providerKind, modelId, baseUrl] of PROVIDERS) {
+  test(`${providerKind}/${modelId}: an attachment catalog after the first result of a parallel batch waits until the batch ends`, { timeout: 120000 }, async () => {
+    const { shape } = await catalogAfterToolTurn(providerKind, modelId, [call('shot1', 'srv_shot'), call('list2', 'srv_list')], baseUrl);
     const expected = {
       // Chat Completions: every `tool` message directly after the assistant tool_calls (the dry-run
       // before this fix had the catalog user message between `tool shot1` and `tool list2`).
       'openai-compatible': ['u:text', 'a:calls=shot1,list2', 't:shot1', 't:list2', 'u:catalog'],
-      deepseek: ['u:text', 'a:calls=shot1,list2', 't:shot1', 't:list2', 'u:catalog'],
       // Gemini: both function responses in one turn right after the model's two calls (a split batch is a live 400).
       gemini: ['u:text', 'a:call=shot1+call=list2', 'u:result=shot1+result=list2', 'u:catalog'],
       // Claude: both tool_result blocks in the user message right after the tool_use blocks.
@@ -281,14 +281,14 @@ async function projectNativeHistory(providerKind, modelId, options) {
     start(input, emit) { start = input; emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
   }).sendFullRequest(nativeHistoryRequest(providerKind, modelId, options), { async onEvent() { return { accepted: true, terminal: true, checkpointed: true }; } });
   const settings = { ...createDefaultLlmProviderConfig({ name: 'native history' }), id: 'provider-config', provider: providerKind,
-    baseUrl: providerKind === 'deepseek' ? 'https://api.deepseek.com' : 'https://api.openai.com/v1', model: modelId, apiKey: '' };
+    baseUrl: modelId.startsWith('deepseek') ? 'https://api.deepseek.com' : 'https://api.openai.com/v1', model: modelId, apiKey: '' };
   const unified = start.contents.map(content => `${content.role === 'model' ? 'a' : 'u'}:${content.parts.map(part =>
     part.functionCall ? `call=${part.id}` : part.functionResponse ? `result=${part.id}` : 'text').join('+')}`);
   return { unified, wire: wireShape((await dryRunLlmProvider(start, { settings })).body) };
 }
 
-for (const [providerKind, modelId] of [['openai-compatible', 'gpt-5.5'], ['deepseek', 'deepseek-v4-flash']]) {
-  test(`${providerKind}: a native async result that arrived later is sent right after its call`, async () => {
+for (const [providerKind, modelId] of [['openai-compatible', 'gpt-5.5'], ['openai-compatible', 'deepseek-v4-flash']]) {
+  test(`${providerKind}/${modelId}: a native async result that arrived later is sent right after its call`, async () => {
     // Before: `assistant tool_calls=[call_async]` was followed by another assistant message, and
     // `tool call_async` came four messages later, which Chat Completions rejects.
     assert.deepEqual((await projectNativeHistory(providerKind, modelId)).wire,

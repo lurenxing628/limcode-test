@@ -7,6 +7,7 @@ import type { WorldEvent } from '../ecs/types';
 import { captureDebug, debugCaptureSources, setDebugCaptureContext, type DebugCaptureRecorder } from './debugCapture/observer';
 import {
   READ_TOOL_NAME,
+  canonicalLlmProviderKind,
   type AttachmentCatalogEntry,
   type InlineDataPart,
   type LlmProviderKind,
@@ -1689,7 +1690,7 @@ function decodeFrozenCurrentTurnInput(content: string, contentType: string): Mes
 }
 
 /** Providers speaking Chat Completions, where every `tool` message must follow the assistant `tool_calls` it answers. */
-const CHAT_COMPLETIONS_PROVIDERS: ReadonlySet<LlmProviderKind> = new Set<LlmProviderKind>(['openai-compatible', 'deepseek']);
+const CHAT_COMPLETIONS_PROVIDERS: ReadonlySet<LlmProviderKind> = new Set<LlmProviderKind>(['openai-compatible']);
 
 /**
  * A native (Responses) call is stored as its own call occurrence, and its result as a separate
@@ -2803,10 +2804,10 @@ function requireSha256(value: unknown, label: string): string {
 }
 
 function requireProviderKind(value: PlainJsonValue | undefined): LlmProviderKind {
-  if (!['openai-compatible', 'openai-responses', 'claude', 'gemini', 'deepseek'].includes(String(value))) {
-    throw new TypeError(`Provider authority model.provider is invalid: ${String(value)}.`);
-  }
-  return value as LlmProviderKind;
+  // 历史回合冻结的 'deepseek' 按 OpenAI 兼容渠道发送，方言由接口地址和模型识别。
+  const provider = canonicalLlmProviderKind(value);
+  if (!provider) throw new TypeError(`Provider authority model.provider is invalid: ${String(value)}.`);
+  return provider;
 }
 
 function abortError(signal?: AbortSignal): Error {

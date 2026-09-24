@@ -52,7 +52,9 @@ export function toUnifiedRequest(
     ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(projectGeminiProviderContext(requestContents)))
     : providerKind === 'claude'
       ? projectClaudeThoughtReplay(requestContents)
-      : requestContents;
+      : providerKind === 'openai-compatible'
+        ? projectOpenAICompatibleThoughtReplay(requestContents)
+        : requestContents;
   return {
     contents: contents.flatMap((content) => toUnifiedContents(content, providerKind, nativeAsync)),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map((part) => toUnifiedPart(part, false)) } } : {}),
@@ -163,6 +165,27 @@ function projectGeminiThoughtReplay(contents: readonly MessageContent[]): readon
     // 可观测性永远不是 provider 权威。
   }
   return projected;
+}
+
+/**
+ * OpenAI 兼容格式把历史思考写回 `reasoning_content`。中途换过模型时，Claude、Gemini、Responses
+ * 产出的思考（带各自的签名）不是这个模型的推理过程，回传过去只会误导它，所以去掉；
+ * 本渠道自己的思考（签名为 openai-compatible，或没有签名）照常回传。
+ */
+function projectOpenAICompatibleThoughtReplay(contents: readonly MessageContent[]): readonly MessageContent[] {
+  let dropped = 0;
+  const projected: MessageContent[] = [];
+  for (const content of contents) {
+    if (content.role !== 'model') {
+      projected.push(content);
+      continue;
+    }
+    const parts = content.parts.filter((part) => !isOtherProviderSignedThought(part, 'openai-compatible'));
+    dropped += content.parts.length - parts.length;
+    if (parts.length === content.parts.length) projected.push(content);
+    else if (parts.length > 0) projected.push({ ...content, parts });
+  }
+  return dropped === 0 ? contents : projected;
 }
 
 function isOtherProviderSignedThought(part: ContentPart, provider: string): boolean {

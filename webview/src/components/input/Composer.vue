@@ -644,8 +644,6 @@ function providerLabel(provider: string): string {
       return 'Claude';
     case 'gemini':
       return 'Gemini';
-    case 'deepseek':
-      return 'DeepSeek';
     default:
       return provider;
   }

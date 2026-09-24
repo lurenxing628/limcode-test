@@ -31,7 +31,7 @@ interface ProviderParameterDisplay {
   description?: string;
 }
 
-const ALL_PROVIDERS = ['openai-compatible', 'openai-responses', 'claude', 'gemini', 'deepseek'] as const satisfies readonly LlmProviderKind[];
+const ALL_PROVIDERS = ['openai-compatible', 'openai-responses', 'claude', 'gemini'] as const satisfies readonly LlmProviderKind[];
 const GEMINI_CLAUDE = ['gemini', 'claude'] as const satisfies readonly LlmProviderKind[];
 const REASONING_MODE_OPTIONS = [
   { value: 'standard', label: '标准' },
@@ -70,9 +70,9 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     topP: { path: 'top_p', label: 'Top P / top_p' },
     maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
     thinkingLevel: {
-      path: 'reasoning_effort',
-      label: 'Reasoning Effort',
-      description: 'OpenAI Chat / Compatible 原生推理强度字段。'
+      path: 'reasoning_effort / thinking.type / enable_thinking',
+      label: '思考强度',
+      description: '按“思考参数写法”发送：OpenAI 写法为 reasoning_effort；DeepSeek、Kimi、智谱等为 thinking.type + reasoning_effort；百炼、硅基流动为 enable_thinking。模型不接受的强度会换成最接近的值。'
     }
   },
   'openai-responses': {
@@ -90,16 +90,6 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
       description: 'OpenAI Responses 的推理强度设置。'
     }
   },
-  deepseek: {
-    temperature: { path: 'temperature' },
-    topP: { path: 'top_p', label: 'Top P / top_p' },
-    maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
-    thinkingLevel: {
-      path: 'thinking.type / reasoning_effort',
-      label: '思考强度',
-      description: 'DeepSeek 思考控制：关闭时禁用思考；高和最高会启用对应强度。'
-    }
-  }
 };
 
 export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = [
@@ -227,8 +217,6 @@ export function labelForProvider(provider: LlmProviderKind): string {
       return 'Claude';
     case 'gemini':
       return 'Gemini';
-    case 'deepseek':
-      return 'DeepSeek';
     default:
       return provider;
   }

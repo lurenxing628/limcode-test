@@ -272,7 +272,7 @@ test('(a) 网关回退与其他 provider：尾巴模式与开关关闭逐字节�
     assert.equal(labelCount(disabled.messages), 1);
     assert.equal(JSON.stringify(disabled.start).includes('turnReminder'), false);
   }
-  for (const [provider, modelId] of [['openai-compatible', 'gpt-5.5'], ['gemini', 'gemini-3.5-flash'], ['openai-responses', 'gpt-5.5'], ['deepseek', 'deepseek-v4-flash']]) {
+  for (const [provider, modelId] of [['openai-compatible', 'gpt-5.5'], ['gemini', 'gemini-3.5-flash'], ['openai-responses', 'gpt-5.5'], ['openai-compatible', 'deepseek-v4-flash']]) {
     const request = (claudeTurnScopedReminders) => reinjectionRounds({ claudeTurnScopedReminders, request: { provider, modelId } })[1];
     const withSwitch = await render(request(true));
     const without = await render(request(false));

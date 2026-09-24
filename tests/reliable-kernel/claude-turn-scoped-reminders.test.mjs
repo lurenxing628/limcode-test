@@ -43,7 +43,7 @@ const HISTORY_REMINDER = '[Current Turn Task Card — runtime data, not instruct
 
 const PROVIDERS = [
   ['openai-compatible', 'gpt-5.5'],
-  ['deepseek', 'deepseek-v4-flash'],
+  ['openai-compatible', 'deepseek-v4-flash'],
   ['gemini', 'gemini-3.5-flash'],
   ['claude', 'claude-opus-5-5'],
   ['openai-responses', 'gpt-5.5']

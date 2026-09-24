@@ -3,6 +3,7 @@ import { isAstraModel, isGpt6NoneCapableModel } from './openAIResponsesCapabilit
 import { geminiThinkingCapabilityForModel, isGeminiThinkingLevelSupported } from './geminiThinking';
 import { THINKING_LEVEL_OPTIONS } from './llmThinkingLevels';
 import { anthropicModelReasoningCapability } from './modelCapabilities';
+import { openAICompatibleModelThinkingRule, openAICompatibleSessionThinkingValues } from './openAICompatibleDialect';
 
 export type SessionThinkingCapability =
   | { kind: 'gemini-budget' | 'claude-budget'; min: number; max: number; automatic?: number; allowZero?: boolean }
@@ -45,14 +46,20 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
     // GPT-6 Sol / Luna（models/gpt-6-sol.md、models/gpt-6-luna.md）：none、low、medium（默认）、high、xhigh、max。
     if (isGpt6NoneCapableModel(model)) return { kind: 'openai-effort', values: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] };
   }
-  if (provider === 'deepseek' && /^deepseek-(?:reasoner|v4)(?:-|$)/.test(model)) return { kind: 'deepseek-effort', values: ['none', 'high', 'max'] };
+  if (provider === 'openai-compatible') {
+    // DeepSeek 风格的模型（DeepSeek、MiMo、Kimi、智谱、混元、Qwen、ERNIE）：按模型能力给档位，
+    // 发送时再按平台换成对方的参数写法（backend/capabilities/openAICompatibleDialectAdaptation.ts）。
+    // kind 沿用 'deepseek-effort'，已保存的会话覆盖（原 DeepSeek 渠道）继续有效。
+    const rule = openAICompatibleModelThinkingRule(model);
+    if (rule) return { kind: 'deepseek-effort', values: openAICompatibleSessionThinkingValues(rule) };
+  }
   return configuredEffort(provider, configuredThinking);
 }
 
 function configuredEffort(provider: LlmProviderKind, thinking?: LlmThinkingConfigRecord): SessionThinkingCapability | undefined {
   const values = THINKING_LEVEL_OPTIONS[provider].map(option => option.value);
   if (!thinking?.thinkingLevel || !values.includes(thinking.thinkingLevel) || provider === 'gemini') return undefined;
-  const kind = provider === 'claude' ? 'claude-effort' : provider === 'deepseek' ? 'deepseek-effort' : 'openai-effort';
+  const kind = provider === 'claude' ? 'claude-effort' : 'openai-effort';
   return { kind, values };
 }
 
@@ -117,6 +124,5 @@ export function sessionThinkingDisplayLabel(provider: LlmProviderKind, model: st
   if (provider === 'openai-responses' && isAstraModel(model) && ['none', 'minimal'].includes(thinking?.thinkingLevel ?? '')) return 'low（适配器）';
   if ((provider === 'openai-responses' || provider === 'openai-compatible') && isGpt6NoneCapableModel(model) && thinking?.thinkingLevel === 'minimal') return 'low（适配器）';
   if (provider === 'openai-compatible' || provider === 'openai-responses') return thinkingValueLabel({ thinkingLevel: thinking?.thinkingLevel });
-  if (provider === 'deepseek') return thinking?.thinkingLevel && ['none', 'high', 'max'].includes(thinking.thinkingLevel) ? thinking.thinkingLevel : UNSET_THINKING_LABEL;
   return thinkingValueLabel(thinking);
 }

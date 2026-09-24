@@ -99,6 +99,7 @@ docs/architecture/*
 !/tests/reliable-kernel/openai-request-shaping.test.mjs
 !/tests/reliable-kernel/claude-thinking-adaptation.test.mjs
 !/tests/reliable-kernel/provider-parameter-adaptation.test.mjs
+!/tests/reliable-kernel/openai-compatible-dialect.test.mjs
 !/tests/reliable-kernel/child-agent-status-controls.test.cjs
 !/tests/reliable-kernel/child-compression-memory.test.mjs
 !/tests/reliable-kernel/native-child-handles.test.mjs

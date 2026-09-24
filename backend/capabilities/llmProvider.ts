@@ -136,8 +136,10 @@ import {
   createDefaultLlmPromptCacheConfig,
   defaultLlmPromptCacheModeForProvider,
   defaultLlmPromptCacheTtlForProvider,
-  isPromptCacheSupportedProvider
+  isPromptCacheSupportedProvider,
+  canonicalLlmProviderKind
 } from '../../shared/protocol';
+import { adaptOpenAICompatibleDialect, libraryProviderKind } from './openAICompatibleDialectAdaptation';
 import {
   ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY,
   isUnavailableAttachmentObservation,
@@ -467,7 +469,7 @@ export async function startLlmProvider(
     );
     if (proxy) console.log(`[LimCode] LLM proxy enabled: ${proxy}`);
     const providerConfig = {
-      provider: settings.provider,
+      provider: libraryProviderKind(settings),
       model: settings.model,
       apiKey: settings.apiKey,
       baseUrl: settings.baseUrl,
@@ -1609,7 +1611,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     request.contents
   );
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
-    provider: runtimeSettings.provider,
+    provider: libraryProviderKind(runtimeSettings),
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
     baseUrl: runtimeSettings.baseUrl,
@@ -2394,7 +2396,7 @@ async function buildAnthropicCompactionRequest(
   const configuredHeaders = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
   const requestBody = request.nativeRequestBody ?? settings.requestBody;
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
-    provider: settings.provider,
+    provider: libraryProviderKind(settings),
     model: settings.model,
     apiKey: settings.apiKey,
     baseUrl: settings.baseUrl,
@@ -3556,7 +3558,7 @@ async function resolveSummaryProvider(
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId), reasoningPlan
   );
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
-    provider: runtimeSettings.provider,
+    provider: libraryProviderKind(runtimeSettings),
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
     baseUrl: runtimeSettings.baseUrl,
@@ -4900,12 +4902,11 @@ function installRequestAdaptation<T>(
   const astraSampling = isAstraParameterTarget(settings);
   const gpt6Sampling = astraSampling || isGpt6NoneCapableParameterTarget(settings);
   return installEncodedRequestPostProcessor(provider, (request) => {
-    const adapted = applyLearnedRequestAdaptations(
-      claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
-        : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider, { alwaysReasoning: astraSampling })
-          : request,
-      target
-    );
+    const shaped = claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
+      : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider, { alwaysReasoning: astraSampling })
+        : request;
+    // 方言改写在记住的参数适配之前：网关明确拒绝过的参数（例如某中转不认 thinking）仍会被去掉。
+    const adapted = applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target);
     if (settings.provider === 'openai-responses') {
       return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount);
     }
@@ -4982,6 +4983,7 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
     ...(nonEmptyRecord(requestBody) ? { requestBody } : {}),
     promptCache: normalizePromptCache(settings?.promptCache, normalizeProvider(settings?.provider)),
     ...(nativeResponses ? { nativeResponses } : {}),
+    ...(settings?.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: settings.openaiCompatibleThinkingFormat } : {}),
     modelConfigs: settings?.modelConfigs ?? [],
     createdAt: settings?.createdAt ?? 0,
     updatedAt: settings?.updatedAt ?? 0
@@ -5178,9 +5180,7 @@ function maskSecretValue(value: string): string {
 }
 
 function normalizeProvider(provider: LlmProviderKind | undefined): LlmProviderKind {
-  return provider === 'gemini' || provider === 'claude' || provider === 'openai-compatible' || provider === 'openai-responses' || provider === 'deepseek'
-    ? provider
-    : 'openai-compatible';
+  return canonicalLlmProviderKind(provider) ?? 'openai-compatible';
 }
 
 function normalizeToolCallFormat(format: LlmToolCallFormat | undefined): LlmToolCallFormat {

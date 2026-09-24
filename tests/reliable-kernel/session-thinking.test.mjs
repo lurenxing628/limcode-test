@@ -53,7 +53,9 @@ const matrix = [
   ['claude', 'claude-sonnet-4-5', { kind: 'claude-budget', tokens: 2048 }, body => { assert.equal(body.thinking.budget_tokens, 2048); assert.equal(body.thinking.type, 'enabled'); assert.equal(body.output_config, undefined); }],
   ['claude', 'claude-opus-4-6', { kind: 'claude-effort', value: 'high' }, body => { assert.equal(body.thinking.type, 'adaptive'); assert.equal(body.output_config.effort, 'high'); assert.equal(body.thinking.budget_tokens, undefined); }],
   ['claude', 'claude-opus-4-6', { kind: 'claude-effort', value: 'none' }, body => assert.equal(body.thinking.type, 'disabled')],
-  ['deepseek', 'deepseek-reasoner', { kind: 'deepseek-effort', value: 'high' }, body => { assert.equal(body.thinking.type, 'enabled'); assert.equal(body.reasoning_effort, 'high'); }]
+  ['openai-compatible', 'deepseek-reasoner', { kind: 'deepseek-effort', value: 'high' }, body => { assert.equal(body.thinking.type, 'enabled'); assert.equal(body.reasoning_effort, 'high'); }],
+  ['openai-compatible', 'deepseek-v4-pro', { kind: 'deepseek-effort', value: 'none' }, body => { assert.deepEqual(body.thinking, { type: 'disabled' }); assert.equal(body.reasoning_effort, undefined); }],
+  ['openai-compatible', 'glm-5.2', { kind: 'deepseek-effort', value: 'max' }, body => { assert.equal(body.thinking.type, 'enabled'); assert.equal(body.reasoning_effort, 'max'); }]
 ];
 for (const [provider, model, override, check] of matrix) test(`普通 adapter → 实际 dry-run body: ${provider}/${model}/${JSON.stringify(override)}`, async () => {
   const defaults = { maxOutputTokens: 32768 };
@@ -102,7 +104,7 @@ test('能力负例与特殊值：未知不猜测、格式不等价、合法范�
 });
 
 test('自定义请求体冲突仅针对思维/输出字段，无关自定义字段允许保留', () => {
-  for (const [provider, body] of [['openai-compatible', { reasoning_effort: 'low' }], ['openai-responses', { reasoning: { effort: 'low' } }], ['claude', { thinking: { budget_tokens: 1024 } }], ['gemini', { generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }], ['deepseek', { thinking: { type: 'disabled' } }]]) assert.equal(hasThinkingBodyConflict(provider, body), true);
+  for (const [provider, body] of [['openai-compatible', { reasoning_effort: 'low' }], ['openai-responses', { reasoning: { effort: 'low' } }], ['claude', { thinking: { budget_tokens: 1024 } }], ['gemini', { generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }], ['openai-compatible', { thinking: { type: 'disabled' } }], ['openai-compatible', { enable_thinking: false }], ['openai-compatible', { chat_template_kwargs: { enable_thinking: false } }]]) assert.equal(hasThinkingBodyConflict(provider, body), true);
   assert.equal(hasThinkingBodyConflict('openai-responses', { metadata: { fixture: true } }), false);
 });
 

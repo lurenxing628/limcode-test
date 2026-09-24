@@ -2415,13 +2415,18 @@ test('冻结模型配置完整覆盖模型级字段并关闭 capability 内部�
       openaiResponsesTransport: 'http', stream: false, retryOnError: true, retryMaxAttempts: 5,
       enableMultimodalTools: true, contextWindowTokens: 2000,
       headers: { Model: 'yes' }, generationConfig: { temperature: 0.1 }, requestBody: { model: true },
+      openaiCompatibleThinkingFormat: 'enable_thinking',
       createdAt: 1, updatedAt: 1
     }],
+    openaiCompatibleThinkingFormat: 'omit',
     createdAt: 1,
     updatedAt: 1
   };
+  // 历史回合冻结的原 DeepSeek 渠道类型按 OpenAI 兼容发送；模型级思考参数写法覆盖渠道级。
   const resolved = kernel.applyFrozenModelProviderConfig(base, 'model-a', 'deepseek');
-  assert.equal(resolved.provider, 'deepseek');
+  assert.equal(resolved.provider, 'openai-compatible');
+  assert.equal(resolved.openaiCompatibleThinkingFormat, 'enable_thinking');
+  assert.equal(kernel.applyFrozenModelProviderConfig({ ...base, modelConfigs: [] }, 'model-a').openaiCompatibleThinkingFormat, 'omit');
   assert.equal(resolved.stream, false);
   assert.equal(resolved.enableMultimodalTools, true);
   assert.equal(resolved.contextWindowTokens, 2000);

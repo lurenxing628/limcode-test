@@ -91,7 +91,7 @@ const ADAPTABLE_PARAMETERS: readonly AdaptableRequestParameter[] = [
   ...ASSISTANT_MESSAGE_PARAMETERS,
   ...TOOL_CALL_PARAMETERS
 ];
-const CHAT_COMPLETIONS_PROVIDERS = new Set<LlmProviderKind>(['openai-compatible', 'deepseek']);
+const CHAT_COMPLETIONS_PROVIDERS = new Set<LlmProviderKind>(['openai-compatible']);
 
 interface TargetAdaptationState {
   parameters: Set<AdaptableRequestParameter>;

@@ -10,6 +10,7 @@ import type {
   LlmThinkingConfigRecord,
   LlmThinkingLevel
 } from './protocol';
+import { canonicalLlmProviderKind } from './protocol';
 
 /** Registry entries are documentation evidence, never a claim of a successful live request. */
 export const MODEL_CAPABILITY_REGISTRY_REVISION = '2026-09-22';
@@ -135,13 +136,13 @@ export function resolveModelCapabilities(input: {
       availability: 'unsupported',
       reason: 'Gemini 当前使用本地分段摘要；上下文缓存不等同于可回放的原生压缩状态。'
     };
-  } else if (providerKind === 'deepseek' && isOfficialEndpoint(input.baseUrl, 'api.deepseek.com', ['', '/v1'])) {
+  } else if (providerKind === 'openai-compatible' && isOfficialEndpoint(input.baseUrl, 'api.deepseek.com', ['', '/v1'])) {
     // Compatible transport is not model capability proof. Keep explicit controls available, but
     // do not invent supported levels for an unversioned or newly released DeepSeek model.
     reasoning = unknownReasoningCapability();
     nativeCompaction = {
       availability: 'unsupported',
-      reason: 'DeepSeek 渠道未声明可回放的 Provider 原生压缩契约。'
+      reason: 'DeepSeek 官方接口没有可回放的 Provider 原生压缩契约。'
     };
   } else if (input.trustMode === 'trust_configured_endpoint') {
     source = 'explicit_trust';
@@ -223,7 +224,7 @@ export function resolveProviderModelCapabilities(
 export function normalizeModelCapabilitySnapshot(value: unknown): ModelCapabilitySnapshot | undefined {
   if (!isObject(value) || typeof value.modelId !== 'string' || !value.modelId.trim()
     || typeof value.endpointFingerprint !== 'string' || value.endpointFingerprint.length > 2048
-    || !['openai-responses', 'openai-compatible', 'claude', 'gemini', 'deepseek'].includes(String(value.providerKind))
+    || !canonicalLlmProviderKind(value.providerKind)
     || !['official_registry', 'provider_api', 'verified_probe', 'explicit_trust', 'unknown'].includes(String(value.source))
     || !isObject(value.reasoning) || !isObject(value.nativeCompaction)) return undefined;
   const reasoning = value.reasoning;
@@ -238,7 +239,8 @@ export function normalizeModelCapabilitySnapshot(value: unknown): ModelCapabilit
     || typeof native.reason !== 'string' || native.reason.length > 1024
     || (native.kind !== undefined && native.kind !== 'openai_responses' && native.kind !== 'anthropic_messages')) return undefined;
   const result: ModelCapabilitySnapshot = {
-    providerKind: value.providerKind as LlmProviderKind,
+    // 原 DeepSeek 渠道的快照迁移后仍属于同一个（已改为 OpenAI 兼容的）渠道。
+    providerKind: canonicalLlmProviderKind(value.providerKind)!,
     modelId: value.modelId.trim(),
     endpointFingerprint: normalizedEndpointFingerprint(value.endpointFingerprint),
     source: value.source as ModelCapabilitySource,
@@ -506,9 +508,6 @@ export function reasoningNativeFields(
       ...(Object.keys(config).length ? { extra_body: { google: { thinking_config: config } } } : {})
     };
   }
-  if (provider === 'deepseek') return level === 'none'
-    ? { thinking: { type: 'disabled' } }
-    : level ? { thinking: { type: 'enabled' }, reasoning_effort: level } : {};
   if (provider === 'openai-responses') {
     const reasoning = {
       ...(level ? { effort: level } : {}),

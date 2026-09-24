@@ -487,7 +487,28 @@ export interface SubmitPlanToolOutputRecord {
   answerBridgeId?: string;
 }
 
-export type LlmProviderKind = 'openai-compatible' | 'openai-responses' | 'claude' | 'gemini' | 'deepseek';
+export type LlmProviderKind = 'openai-compatible' | 'openai-responses' | 'claude' | 'gemini';
+
+/**
+ * DeepSeek 曾是独立的渠道类型；它在协议上就是 OpenAI Chat Completions，现在并入 OpenAI 兼容渠道，
+ * 方言按接口地址和模型自动识别（shared/openAICompatibleDialect.ts）。已保存的配置、会话模型选择
+ * 和冻结在历史回合里的快照仍可能带着 'deepseek'，读取时一律换成 'openai-compatible'。
+ */
+export function canonicalLlmProviderKind(value: unknown): LlmProviderKind | undefined {
+  if (value === 'deepseek') return 'openai-compatible';
+  return value === 'openai-compatible' || value === 'openai-responses' || value === 'claude' || value === 'gemini'
+    ? value
+    : undefined;
+}
+
+/**
+ * OpenAI 兼容渠道发送思考参数的写法；缺省为自动识别。
+ * - deepseek：`thinking.type` + `reasoning_effort`（DeepSeek、Kimi、智谱、MiMo、腾讯、火山方舟等）；
+ * - enable_thinking：`enable_thinking` 开关（阿里百炼、硅基流动等）；
+ * - reasoning_effort：只发 `reasoning_effort`（OpenAI 与大多数中转站）；
+ * - omit：不发送任何思考参数，由服务端决定。
+ */
+export type OpenAICompatibleThinkingFormat = 'deepseek' | 'enable_thinking' | 'reasoning_effort' | 'omit';
 export type LlmToolCallFormat = 'function-call';
 export type LlmOpenAIResponsesTransport = 'http' | 'websocket';
 export type LlmPromptCacheTtl = '5m' | '30m' | '1h';
@@ -788,6 +809,8 @@ export interface LlmProviderModelConfigRecord {
   nativeResponses?: OpenAIResponsesNativeSettings;
   /** Claude 每轮提醒改用轮内系统消息；缺省表示跟随渠道级配置。 */
   claudeTurnScopedReminders?: boolean;
+  /** OpenAI 兼容渠道的思考参数写法；缺省表示跟随渠道级配置。 */
+  openaiCompatibleThinkingFormat?: OpenAICompatibleThinkingFormat;
   createdAt: number;
   updatedAt: number;
 }
@@ -828,6 +851,11 @@ export interface LlmProviderConfigRecord {
    * 打开即表示确认模型与渠道支持，扩展自动带上 `mid-conversation-system-clear-at-2026-08-21` beta 头。仅对 Claude 生效。
    */
   claudeTurnScopedReminders?: boolean;
+  /**
+   * OpenAI 兼容渠道的思考参数写法；缺省为按接口地址和模型自动识别。
+   * 只在自动识别不对（例如自建中转改了模型名）时手动指定。
+   */
+  openaiCompatibleThinkingFormat?: OpenAICompatibleThinkingFormat;
   /** 针对单个模型的完整高级配置；命中模型时整体替代渠道默认高级配置。 */
   modelConfigs: LlmProviderModelConfigRecord[];
   createdAt: number;

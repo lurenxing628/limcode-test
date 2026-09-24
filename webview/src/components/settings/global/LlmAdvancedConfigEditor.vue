@@ -16,8 +16,14 @@ import {
   type LlmPromptCacheTtl,
   type LlmProviderHeadersRecord,
   type LlmRequestBodyRecord,
-  type LlmToolCallFormat
+  type LlmToolCallFormat,
+  type OpenAICompatibleThinkingFormat
 } from '@shared/protocol';
+import {
+  OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS,
+  describeOpenAICompatibleDialect,
+  resolveOpenAICompatibleDialect
+} from '@shared/openAICompatibleDialect';
 import {
   gpt6ChatCompletionsToolRestriction,
   isGpt6FamilyModel,
@@ -38,7 +44,7 @@ const TOKEN_STEP = 1_000;
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
   'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
-  | 'claudeTurnScopedReminders'
+  | 'claudeTurnScopedReminders' | 'openaiCompatibleThinkingFormat'
 >>;
 
 const props = defineProps<{
@@ -60,6 +66,28 @@ const emit = defineEmits<{
 const toolCallFormatOptions: SettingsDropdownOption[] = [
   { value: 'function-call', label: 'Function Call' }
 ];
+
+const THINKING_FORMATS: readonly OpenAICompatibleThinkingFormat[] = ['deepseek', 'enable_thinking', 'reasoning_effort', 'omit'];
+/** 自动识别只看接口地址和模型 ID，这里直接把它会得出的结果写在选项说明里。 */
+const thinkingFormatOptions = computed<SettingsDropdownOption[]>(() => [
+  {
+    value: 'auto',
+    label: '自动识别（推荐）',
+    description: describeOpenAICompatibleDialect(resolveOpenAICompatibleDialect(props.config.baseUrl, props.config.model))
+  },
+  ...THINKING_FORMATS.map((value) => ({ value, label: OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS[value] }))
+]);
+const thinkingFormatSummary = computed(() => describeOpenAICompatibleDialect(
+  resolveOpenAICompatibleDialect(props.config.baseUrl, props.config.model, props.config.openaiCompatibleThinkingFormat)
+));
+
+function updateThinkingFormat(value: string): void {
+  emit('update-field', {
+    openaiCompatibleThinkingFormat: THINKING_FORMATS.includes(value as OpenAICompatibleThinkingFormat)
+      ? value as OpenAICompatibleThinkingFormat
+      : undefined
+  });
+}
 
 /**
  * GPT-6 在 Chat Completions 上的工具调用限制（Using GPT-6 “Update API and model parameters”、Sol / Luna 模型页）：
@@ -424,6 +452,17 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         </LcCheckbox>
       </div>
       <span class="stream-checkbox-text">把每轮提醒改为官方轮内系统消息，保持历史前缀不变，提升缓存命中并保留思考；需要模型与渠道支持轮内系统消息，扩展会自动带上所需 beta 头。渠道明确拒绝时自动退回原来的提醒方式。</span>
+    </div>
+
+    <div v-if="config.provider === 'openai-compatible'" class="global-settings-field global-settings-field-wide openai-compatible-thinking-format-field">
+      <span>思考参数写法</span>
+      <SettingsDropdown
+        :model-value="config.openaiCompatibleThinkingFormat ?? 'auto'"
+        :options="thinkingFormatOptions"
+        title="选择思考参数的发送写法"
+        @update:model-value="updateThinkingFormat"
+      />
+      <span class="stream-checkbox-text">当前发送：{{ thinkingFormatSummary }}。先按接口地址识别服务商，认不出的中转站再看模型 ID；只有识别不对（例如中转站改了模型名）时才需要手动指定。</span>
     </div>
 
     <template v-if="config.provider === 'openai-responses'">

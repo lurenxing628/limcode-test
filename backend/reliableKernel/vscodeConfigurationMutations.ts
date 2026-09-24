@@ -2,7 +2,8 @@
 import type { ChatModelOverrideRecord, ModelProfileScopeMutationReceipt, ModelProfileScopeSnapshotPayload, ModelProfileScopeReadPayload, SessionThinkingOverride, SystemPromptScopeSetPayload } from '../../shared/protocol';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import { sourceConfigsProblem } from '../../shared/toolPolicyResolution';
-import { loadScopedModelProfiles } from './scopedModelProfiles';
+import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
+import { canonicalLlmProviderKind } from '../../shared/protocol';
 import { validateSessionThinkingOverride } from '../../shared/sessionThinking';
 import { compatibleChildThinkingOverride } from './childThinkingInheritance';
 import { loadLlmProviderConfigsSettings } from '../capabilities/vscodeStorage/llmProviderConfigs';
@@ -97,6 +98,8 @@ interface StoreSpec<TRecord extends { id: string }, TKey extends string> {
   key: TKey;
   idPrefix: string;
   label(record: TRecord): string;
+  /** 读取时规范化旧格式记录（例如原 DeepSeek 渠道类型）。 */
+  normalize?(record: TRecord): TRecord;
 }
 
 /**
@@ -443,7 +446,7 @@ export class VscodeConfigurationMutations {
         if (scope.scopeKind !== 'conversation') throw new Error('思维覆盖仅限当前对话。');
         const providers = await loadLlmProviderConfigsSettings(paths);
         const provider = providers.settings.configs.find((item) => item.id === payload.providerConfigId);
-        if (!provider || provider.provider !== payload.provider || !(provider.model === model || provider.models.some((item) => item.id === model))) throw new Error('思维覆盖的渠道或模型不存在。');
+        if (!provider || provider.provider !== canonicalLlmProviderKind(payload.provider) || !(provider.model === model || provider.models.some((item) => item.id === model))) throw new Error('思维覆盖的渠道或模型不存在。');
         const modelConfig = provider.modelConfigs.find((item) => item.modelId === model);
         if (hasThinkingBodyConflict(provider.provider, modelConfig ? modelConfig.requestBody : provider.requestBody)) throw new Error('自定义请求体控制思维或输出参数；请先在渠道设置中解除冲突。');
         const generation = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
@@ -515,7 +518,7 @@ export class VscodeConfigurationMutations {
        if (input.thinkingOverride) {
          const providers = await loadLlmProviderConfigsSettings(paths);
          const provider = providers.settings.configs.find((item) => item.id === providerConfigId);
-         if (!provider || provider.provider !== input.provider || !(provider.model === model || provider.models.some((item) => item.id === model))) {
+         if (!provider || provider.provider !== canonicalLlmProviderKind(input.provider) || !(provider.model === model || provider.models.some((item) => item.id === model))) {
            throw new Error('子会话思维覆盖的渠道或模型不存在。');
          }
          const modelConfig = provider.modelConfigs.find((item) => item.modelId === model);
@@ -1118,7 +1121,10 @@ function workflowStore(paths: StoragePaths): StoreSpec<WorkflowRecord, 'workflow
 }
 
 function modelProfileStore(paths: StoragePaths): StoreSpec<ModelProfileRecord, 'modelProfile'> {
-  return { root: paths.modelProfilesRootUri, index: paths.modelProfilesIndexUri, key: 'modelProfile', idPrefix: 'model-profile', label: (record) => record.name };
+  return {
+    root: paths.modelProfilesRootUri, index: paths.modelProfilesIndexUri, key: 'modelProfile', idPrefix: 'model-profile',
+    label: (record) => record.name, normalize: canonicalModelProfile
+  };
 }
 
 function modelProfileLinkStore(paths: StoragePaths): StoreSpec<ModelProfileScopeLinkRecord, 'link'> {
@@ -1208,7 +1214,8 @@ function conversationWorkEnvironmentLinkStore(paths: StoragePaths): StoreSpec<Co
 async function loadStore<TRecord extends { id: string }, TKey extends string>(
   spec: StoreSpec<TRecord, TKey>
 ): Promise<TRecord[]> {
-  return (await loadRecordStore<TRecord, TKey>(spec.root, spec.index, spec.key)) ?? [];
+  const records = (await loadRecordStore<TRecord, TKey>(spec.root, spec.index, spec.key)) ?? [];
+  return spec.normalize ? records.map((record) => spec.normalize!(record)) : records;
 }
 
 async function saveStore<TRecord extends { id: string }, TKey extends string>(

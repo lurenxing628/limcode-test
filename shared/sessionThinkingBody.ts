@@ -13,6 +13,6 @@ export function hasThinkingBodyConflict(provider: LlmProviderKind, body?: LlmReq
   if (provider === 'gemini') return owns('thinkingConfig') || nestedConflict('generationConfig', ['thinkingConfig', 'maxOutputTokens']);
   if (provider === 'claude') return owns('thinking') || owns('max_tokens') || nestedConflict('output_config', ['effort']);
   const keys = provider === 'openai-responses' ? ['reasoning', 'max_output_tokens']
-    : ['reasoning_effort', 'thinking', 'max_tokens', 'max_completion_tokens'];
+    : ['reasoning_effort', 'thinking', 'enable_thinking', 'thinking_budget', 'chat_template_kwargs', 'max_tokens', 'max_completion_tokens'];
   return keys.some(owns);
 }

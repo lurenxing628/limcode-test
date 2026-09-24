@@ -89,8 +89,10 @@ test('provider dry-runs flatten only the edit union and retain complete branch s
   const flatParameters = structuredClone(parameters);
   delete flatParameters.oneOf;
   const cases = [
-    ...['openai-compatible', 'deepseek', 'openai-responses', 'claude', 'gemini']
+    ...['openai-compatible', 'openai-responses', 'claude', 'gemini']
       .map((provider) => ({ provider, stream: false })),
+    // 官方 DeepSeek 接口在 OpenAI 兼容渠道里走接入库的 DeepSeek 格式。
+    { provider: 'openai-compatible', stream: false, baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-flash' },
     { provider: 'openai-responses', stream: true, openaiResponsesTransport: 'http' },
     { provider: 'openai-responses', stream: true, openaiResponsesTransport: 'websocket' }
   ];
@@ -134,7 +136,7 @@ test('provider dry-runs flatten only the edit union and retain complete branch s
     }
     const [schema, unrelatedSchema] = declarations.map((declaration) => provider === 'claude'
       ? declaration.input_schema
-      : provider === 'openai-compatible' || provider === 'deepseek'
+      : provider === 'openai-compatible'
         ? declaration.function.parameters
         : declaration.parameters);
     assert.equal(schema.oneOf, undefined, `${provider} must not send constraint-only edit union branches`);
@@ -149,7 +151,7 @@ test('provider dry-runs flatten only the edit union and retain complete branch s
     assert.equal(schema.properties.delete.type, 'object');
     assert.deepEqual(schema.properties.delete.required, ['startLine', 'endLine']);
     if (provider !== 'gemini') assert.deepEqual(schema, flatParameters);
-    if (provider === 'openai-compatible' || provider === 'deepseek' || provider === 'openai-responses') {
+    if (provider === 'openai-compatible' || provider === 'openai-responses') {
       assert.deepEqual(unrelatedSchema, originalParameters);
     }
     assert.deepEqual(parameters, originalParameters, `${provider} mutated the source schema`);

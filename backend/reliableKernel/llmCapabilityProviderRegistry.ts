@@ -3,6 +3,7 @@ import type {
   LlmProviderConfigRecord,
   LlmProviderKind
 } from '../../shared/protocol';
+import { canonicalLlmProviderKind } from '../../shared/protocol';
 import {
   createLlmProviderCapability,
   probeLlmProviderNativeCompaction,
@@ -129,9 +130,11 @@ export function applyFrozenModelProviderConfig(
   if (!known) throw new Error(`Provider ${config.id} does not contain frozen model ${modelId}.`);
 
   const modelConfig = config.modelConfigs.find((candidate) => candidate.modelId.trim() === modelId);
+  // 历史回合冻结的 'deepseek' 按迁移后的 OpenAI 兼容渠道发送。
+  const frozenProvider = canonicalLlmProviderKind(providerOverride);
   const resolved: LlmProviderConfigRecord = {
     ...config,
-    ...(providerOverride ? { provider: providerOverride } : {}),
+    ...(frozenProvider ? { provider: frozenProvider } : {}),
     model: modelId,
     systemPromptPrefix: frozenSystemPromptPrefix
       ?? modelConfig?.systemPromptPrefix
@@ -155,7 +158,10 @@ export function applyFrozenModelProviderConfig(
       // nativeResponses 遵循与其他高级配置一致的模型级整体替代语义。
       ...(modelConfig.nativeResponses === undefined
         ? { nativeResponses: undefined }
-        : { nativeResponses: { ...modelConfig.nativeResponses } })
+        : { nativeResponses: { ...modelConfig.nativeResponses } }),
+      // 思考参数写法：模型级缺省时跟随渠道。
+      ...(modelConfig.openaiCompatibleThinkingFormat
+        ? { openaiCompatibleThinkingFormat: modelConfig.openaiCompatibleThinkingFormat } : {})
     } : {}),
     // Reliable retry identity lives in ModelRequest/Attempt; the capability must not retry invisibly.
     retryOnError: false,
