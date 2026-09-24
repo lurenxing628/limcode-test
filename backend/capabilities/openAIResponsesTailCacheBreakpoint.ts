@@ -14,16 +14,28 @@
  *
  * 这里把同一个断点挪到易失尾巴之前最后一个可承载项的最后一块上（写入点，开发者指令断点不动）。
  * 可承载项与接入库一致：数组 content 的 message（最后一块是 input_text / input_image / input_file），
- * 以及数组 output 的 function_call_output。只用于无状态的完整重放（HTTP、WebSocket 回退的 HTTP、HTTP dry-run）；
- * WebSocket 续接链里尾巴随 previous_response_id 留在会话原位，由调用方决定不挪。
+ * 以及数组 output 的 function_call_output。只用于 HTTP 完整重放（HTTP、WebSocket 回退的 HTTP、HTTP dry-run）；
+ * WebSocket 续接链里尾巴随 previous_response_id 留在会话原位，由调用方决定不调用。
  *
  * 写入点每个请求都可能换位置（新回合的新输入、数组形式的新工具结果），它的前缀此前没写过；只靠它，新回合第一次请求
  * 只能读到开发者指令，整段历史按写入价重写。所以再在写入点之前最后一条用户消息（上一回合的输入，或本回合的输入）上
- * 放一个读取断点：之前的请求把写入点放在那里时已经写过这段前缀。断点总数最多 3 个（开发者指令、读取点、写入点）。
+ * 放一个读取断点：之前的请求把写入点放在那里时已经写过这段前缀。无状态完整重放最多 3 个断点（开发者指令、读取点、写入点）。
+ *
+ * HTTP 原生会话（GPT-6 异步工具）用同一个 provider 先发首请求，再把模型的调用与交付的结果追加在原内容后面续接：
+ * 会话之内尾巴留在原位，续接要从尾巴上的断点读；会话之后的下一次模型请求里尾巴不在了，要从尾巴之前读。
+ * 所以原生会话的首请求保留尾巴上的断点，再在尾巴之前最后一个可承载项上放一个同样的断点；续接请求（末尾是交付的
+ * 工具结果，不是易失尾巴）保留接入库的断点，只补读取断点。首请求最多 4 个断点（开发者指令、读取点、尾巴之前、尾巴），
+ * 正好是官方 “Each request can create up to four cache writes” 的上限。
  */
 import { supportsOpenAIExplicitPromptCache } from '../../shared/openAIResponsesCapabilities';
 import { isRecord } from './llmStreamEventProjection';
 import type { EncodedProviderRequest } from './providerParameterAdaptation';
+
+/**
+ * HTTP 完整重放的方式：`stateless` 每次请求都是独立的完整重放；`native_session` 是 HTTP 原生会话，
+ * 首请求之后的续接请求在原内容后追加调用与结果，由同一个 provider 发出。
+ */
+export type OpenAIResponsesHttpReplay = 'stateless' | 'native_session';
 
 /**
  * `volatileTailCount` 是内容末尾的易失条数（每条内容编码为一条 user message）。
@@ -31,11 +43,13 @@ import type { EncodedProviderRequest } from './providerParameterAdaptation';
  * 有易失尾巴时：尾巴条数不对或尾巴不全是数组 content 的 user message、尾巴上没有恰好一个断点、尾巴前面没有可承载项、
  * 尾巴前面最后一个可承载项已经带断点（例如只有开发者指令）时原样返回同一引用；否则把尾巴上的断点挪到尾巴之前
  * 最后一个可承载项上（写入点），再补读取断点。没有易失尾巴时接入库的断点就是写入点，只补读取断点。
+ * 原生会话的首请求不挪而是复制（尾巴上的断点保留）；原生会话的续接请求末尾不是用户消息，只补读取断点。
  * 不是 explicit 模式或模型不支持显式断点时原样返回。
  */
 export function withOpenAIResponsesCacheBreakpointBeforeVolatileTail(
   request: EncodedProviderRequest,
-  volatileTailCount: number
+  volatileTailCount: number,
+  replay: OpenAIResponsesHttpReplay = 'stateless'
 ): EncodedProviderRequest {
   const body = request.body;
   if (!Number.isSafeInteger(volatileTailCount) || volatileTailCount < 0) return request;
@@ -43,20 +57,26 @@ export function withOpenAIResponsesCacheBreakpointBeforeVolatileTail(
   if (!isRecord(body.prompt_cache_options) || body.prompt_cache_options.mode !== 'explicit') return request;
   if (typeof body.model !== 'string' || !supportsOpenAIExplicitPromptCache(body.model)) return request;
   const input = body.input as unknown[];
-  if (volatileTailCount === 0) {
+  const nativeContinuation = replay === 'native_session' && volatileTailCount > 0
+    && !input.slice(-volatileTailCount).every(isUserMessageItem);
+  if (volatileTailCount === 0 || nativeContinuation) {
     const target = lastMarkedCarrierIndex(input);
     const next = target === undefined ? undefined : withReadBreakpointBefore(input, target);
     return next ? { ...request, body: { ...body, input: next } } : request;
   }
-  const moved = withBreakpointMovedBeforeTail(input, input.length - volatileTailCount);
-  if (!moved) return request;
-  return { ...request, body: { ...body, input: withReadBreakpointBefore(moved.input, moved.target) ?? moved.input } };
+  const placed = withBreakpointBeforeTail(input, input.length - volatileTailCount, replay === 'native_session');
+  if (!placed) return request;
+  return { ...request, body: { ...body, input: withReadBreakpointBefore(placed.input, placed.target) ?? placed.input } };
 }
 
-/** 尾巴上恰好一个断点挪到尾巴之前最后一个可承载项上；返回新 input 与写入点下标，做不到时返回 undefined。 */
-function withBreakpointMovedBeforeTail(
+/**
+ * 尾巴上恰好一个断点放到尾巴之前最后一个可承载项上：`keepTail` 为 false 时从尾巴挪走，为 true 时尾巴上的保留
+ * （原生会话首请求）。返回新 input 与尾巴之前那个断点的下标，做不到时返回 undefined。
+ */
+function withBreakpointBeforeTail(
   input: readonly unknown[],
-  tailStart: number
+  tailStart: number,
+  keepTail: boolean
 ): { input: unknown[]; target: number } | undefined {
   if (tailStart <= 0) return undefined;
   const tail = input.slice(tailStart);
@@ -86,7 +106,7 @@ function withBreakpointMovedBeforeTail(
     const last = blocks?.[blocks.length - 1];
     if (!blocks || !isCacheableBlock(last)) continue;
     if (hasBreakpoint(last)) return undefined;
-    const next = [...input.slice(0, tailStart), ...strippedTail];
+    const next = [...input.slice(0, tailStart), ...(keepTail ? tail : strippedTail)];
     next[index] = withMarkedCarrier(input[index], breakpoint);
     return { input: next, target: index };
   }

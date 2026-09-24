@@ -34,7 +34,10 @@ import {
   withClaudeTurnScopedSystemBeta,
   type TurnReminderLayout
 } from './claudeTurnScopedReminders';
-import { withOpenAIResponsesCacheBreakpointBeforeVolatileTail } from './openAIResponsesTailCacheBreakpoint';
+import {
+  withOpenAIResponsesCacheBreakpointBeforeVolatileTail,
+  type OpenAIResponsesHttpReplay
+} from './openAIResponsesTailCacheBreakpoint';
 import {
   assertCanonicalProviderToolContext,
   cloneInlineDataPart,
@@ -484,11 +487,13 @@ export async function startLlmProvider(
     const claudeTurnScoped = claudeTurnScopedRemindersRequested(request, settings);
     const volatileTailCount = volatileTailContentCount(request);
     // WebSocket 模式下 provider 只用来取 WebSocket 帧（续接链）；回退用的 HTTP provider 是无状态完整重放。
+    // HTTP 原生会话里同一个 provider 发首请求与续接请求（续接在原内容后追加），断点按会话方式放。
     const provider = installRequestAdaptation(installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
-    ), settings, claudeTurnScoped, volatileTailCount, isOpenAIResponsesWebSocketMode(settings));
+    ), settings, claudeTurnScoped, volatileTailCount, isOpenAIResponsesWebSocketMode(settings),
+    openAIResponsesHttpReplay(settings, nativeCapabilities));
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
@@ -676,9 +681,7 @@ async function runLlmAttempt(
         multiplexing: nativeCapabilities.multiplexing
       }
     : undefined;
-  const nativeHttpSession = !forceStreaming
-    && nativeCapabilities?.asyncTools === true
-    && settings.provider === 'openai-responses';
+  const nativeHttpSession = usesOpenAIResponsesNativeHttpSession(settings, nativeCapabilities);
   try {
     const stream: AsyncIterable<UnifiedLLMStreamChunk> = forceStreaming
       ? streamOpenAIResponsesWithLimCodeSession({
@@ -1612,6 +1615,14 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId),
     request.contents
   );
+  const nativeCapabilities = openAIResponsesNativeCapabilities({
+    provider: runtimeSettings.provider,
+    model: runtimeSettings.model,
+    baseUrl: runtimeSettings.baseUrl,
+    transport: runtimeSettings.openaiResponsesTransport,
+    nativeResponses: runtimeSettings.nativeResponses,
+    ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, runtimeSettings))
+  });
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: libraryProviderKind(runtimeSettings),
     model: runtimeSettings.model,
@@ -1626,21 +1637,13 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings,
   claudeTurnScopedRemindersRequested(request, runtimeSettings), volatileTailContentCount(request),
-  isOpenAIResponsesWebSocketMode(runtimeSettings));
+  isOpenAIResponsesWebSocketMode(runtimeSettings), openAIResponsesHttpReplay(runtimeSettings, nativeCapabilities));
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
     throw new Error('当前 unified-llm-provider 版本不支持 provider.dryRun，请更新依赖。');
   }
 
-  const nativeCapabilities = openAIResponsesNativeCapabilities({
-    provider: runtimeSettings.provider,
-    model: runtimeSettings.model,
-    baseUrl: runtimeSettings.baseUrl,
-    transport: runtimeSettings.openaiResponsesTransport,
-    nativeResponses: runtimeSettings.nativeResponses,
-    ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, runtimeSettings))
-  });
   const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities);
   const webSocketMode = isOpenAIResponsesWebSocketMode(runtimeSettings);
   const result = await dryRun.call(provider, toUnifiedRequest(
@@ -5106,7 +5109,8 @@ function installRequestAdaptation<T>(
   settings: LlmProviderConfigRecord,
   claudeTurnScopedReminders = false,
   volatileTailCount = 0,
-  webSocketChain = false
+  webSocketChain = false,
+  httpReplay: OpenAIResponsesHttpReplay = 'stateless'
 ): T {
   const target = providerRequestTarget(settings);
   const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
@@ -5119,7 +5123,7 @@ function installRequestAdaptation<T>(
     // 方言改写在记住的参数适配之前：网关明确拒绝过的参数（例如某中转不认 thinking）仍会被去掉。
     const adapted = applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target);
     if (settings.provider === 'openai-responses') {
-      return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount);
+      return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount, httpReplay);
     }
     if (settings.provider !== 'claude') return adapted;
     const turnScoped = claudeTurnScopedReminders && !claudeTurnScopedRemindersFallenBack(target);
@@ -5129,6 +5133,27 @@ function installRequestAdaptation<T>(
       turnScoped
     );
   });
+}
+
+/**
+ * HTTP 上的 GPT-6 原生会话：流式、不走 WebSocket、原生异步工具开启时，runLlmAttempt 用
+ * streamOpenAIResponsesNativeHttpSession 在同一个 provider 上发首请求与续接请求。
+ */
+function usesOpenAIResponsesNativeHttpSession(
+  settings: LlmProviderConfigRecord,
+  nativeCapabilities: OpenAIResponsesNativeCapabilities | undefined
+): boolean {
+  return settings.provider === 'openai-responses'
+    && !isOpenAIResponsesWebSocketMode(settings)
+    && settings.stream !== false
+    && nativeCapabilities?.asyncTools === true;
+}
+
+function openAIResponsesHttpReplay(
+  settings: LlmProviderConfigRecord,
+  nativeCapabilities: OpenAIResponsesNativeCapabilities | undefined
+): OpenAIResponsesHttpReplay {
+  return usesOpenAIResponsesNativeHttpSession(settings, nativeCapabilities) ? 'native_session' : 'stateless';
 }
 
 /** 内核放在内容末尾、下一次请求不再原位出现的条数（重新注入的输入、本轮提醒）。 */

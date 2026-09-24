@@ -255,6 +255,17 @@ test('纯函数边界：形状对不上时原样返回同一引用；断点可�
   const outputsOnly = move(body([developer, call, arrayOutput, call, arrayOutput, user('r', true)]), 1);
   assert.deepEqual(breakpointIndexes(outputsOnly.body.input), [0, 4]);
   same(body([developer, user('q', true), user('next', true)]), 0, 'the previous user message already carries a breakpoint');
+
+  // HTTP 原生会话：首请求保留尾巴上的断点并在尾巴之前复制一个，再补读取断点（共 4 个）；
+  // 续接请求末尾是交付的工具结果，接入库的断点不动，只在它之前最后一条用户消息上补读取断点。
+  const nativeFirst = move(body([developer, user('prev'), assistant, user('q'), user('r', true)]), 1, 'native_session');
+  assert.deepEqual(breakpointIndexes(nativeFirst.body.input), [0, 1, 3, 4]);
+  const continued = move(body([developer, user('prev'), assistant, user('q'), user('r', true), call, stringOutput]), 1, 'native_session');
+  assert.deepEqual(breakpointIndexes(continued.body.input), [0, 3, 4]);
+  const markedOutput = { ...arrayOutput, output: [{ type: 'input_text', text: 'A', prompt_cache_breakpoint: BREAKPOINT }] };
+  const continuedToArray = move(body([developer, user('prev'), assistant, user('q'), user('r'), call, markedOutput]), 1, 'native_session');
+  assert.deepEqual(breakpointIndexes(continuedToArray.body.input), [0, 4, 6], 'the continuation reads up to the reminder the first request wrote');
+  same(body([developer, user('prev'), assistant, user('q'), user('r'), call, markedOutput]), 1, 'a stateless request never treats a trailing result as a continuation');
 });
 
 test('尾巴之前只有已带断点的开发者指令（输入被压缩掉、没有摘要）：请求与改动前构建逐字节一致', async () => {
@@ -445,6 +456,76 @@ test('WebSocket 续接链：尾巴与它的断点随链留在原位，每一帧�
   const firstFrame = bodies[0];
   assert.deepEqual(run.dryRuns[0].input, firstFrame.input, 'the WebSocket dry-run shows the first (full) frame');
   assert.deepEqual(run.dryRuns[0].prompt_cache_options, firstFrame.prompt_cache_options);
+});
+
+// ---- GPT-6 官方渠道的 HTTP 原生会话：同一个 provider 先发首请求，再在原内容后追加调用与结果续接 ----
+
+/** 一次 SSE 响应；fetch 被替换，不访问网络。 */
+const sseResponse = (events) => new Response(`${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')}data: [DONE]\n\n`, {
+  headers: { 'content-type': 'text/event-stream' }
+});
+
+async function waitFor(read, label) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+test('GPT-6 官方渠道 HTTP 原生会话：续接读到首请求的全部输入，下一回合读到上一回合输入之前的历史', async (context) => {
+  const modelId = 'gpt-6-sol';
+  // 官方地址：原生能力（异步工具）默认开启，HTTP 上走原生会话。
+  const settings = { ...settingsFor('https://api.openai.com/v1', { model: modelId }), apiKey: 'sk-test' };
+  const scripts = [responseEvents(0, 'resp_1').events, responseEvents(2, 'resp_2').events, responseEvents(3, 'resp_3').events];
+  const sent = [];
+  context.mock.method(globalThis, 'fetch', async (_url, init) => {
+    sent.push(JSON.parse(init.body));
+    return sseResponse(scripts[sent.length - 1]);
+  });
+
+  // 第一回合：首请求模型调用工具，结果经原生控制器交付，同一个会话续接一次。
+  const first = await project(fullRequest({ modelId, context: loopContext(1, modelId), reminderText: reminder(1), id: 'native-http-turn-1' }));
+  const events = [];
+  let controller;
+  const finished = startLlmProvider(first, (event) => events.push(event), { settings: async () => settings }, undefined, undefined, undefined, {
+    native: { onController(next) { if (next) controller = next; } }
+  });
+  await waitFor(() => controller && events.some((event) => event.type === 'llm:toolcall'), 'the first response and its tool call');
+  await controller.submitToolResults([{ type: 'function_call_output', callId: 'call_1', output: '{"ok":true,"condition":"rain"}' }]);
+  await finished;
+  assert.equal(events.some((event) => event.type === 'llm:error'), false, JSON.stringify(events.filter((event) => event.type === 'llm:error')));
+  assert.equal(sent.length, 2, 'the first request and one continuation');
+  assert.equal(sent[1].input.at(-1).type, 'function_call_output', 'the continuation appends the delivered result');
+  const firstDryRun = (await dryRunLlmProvider(first, { settings: async () => settings })).body;
+  assert.deepEqual(firstDryRun, sent[0], 'dry-run shows exactly the first request of the native session');
+
+  // 第二回合：新的模型请求（同一渠道、同一原生会话方式）。
+  const secondContext = [
+    ...conversationHead(modelId),
+    modelCall(1, modelId),
+    toolPair('seg-result-1', 'call_1', { ok: true, condition: 'rain' }),
+    message('seg-answer', 'model', { role: 'model', parts: [{ text: 'It rains in Paris.' }] }, modelId),
+    message('seg-next', 'user', { role: 'user', parts: [{ text: 'And tomorrow?' }] })
+  ];
+  const second = await project(fullRequest({ modelId, context: secondContext, reminderText: reminder(2), id: 'native-http-turn-2' }));
+  await startLlmProvider(second, () => {}, { settings: async () => settings });
+  assert.equal(sent.length, 3);
+
+  for (const [index, body] of sent.entries()) {
+    assert.ok(breakpointIndexes(body.input).length <= 4, `request ${index + 1}: at most four breakpoints`);
+  }
+  const reminderIndex = (body, text) => body.input.findIndex((item) => isTailItem(item, text));
+  // 首请求：写入点仍在提醒上（续接从这里读），另在本回合输入上留一个（下一回合从这里读）。
+  assert.deepEqual(breakpointIndexes(sent[0].input), [0, 1, 3, reminderIndex(sent[0], 'request 1')]);
+  // 续接：接入库的断点仍在提醒上（字符串结果不承载断点），前面补本回合输入上的读取断点。
+  assert.deepEqual(breakpointIndexes(sent[1].input), [0, 3, reminderIndex(sent[1], 'request 1')]);
+  // 下一回合：上一回合输入（读取）、新输入（写入，供之后的请求读）、新提醒（续接读）。
+  assert.deepEqual(breakpointIndexes(sent[2].input), [0, 3, reminderIndex(sent[2], 'request 2') - 1, reminderIndex(sent[2], 'request 2')]);
+  // 改动前：首请求 [0,3]、续接 [0,4]，续接与下一回合都只读到开发者指令（[0, 1, 1]）。
+  assert.deepEqual(simulateExplicitCache(sent), [0, sent[0].input.length, 4]);
 });
 
 // ---- 逐字节回归：以下摘要由改动前的构建（codex/agent-collaboration 84bdbed9 + unified-llm-provider 0.1.37-limcode.6）
