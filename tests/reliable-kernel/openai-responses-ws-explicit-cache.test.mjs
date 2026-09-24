@@ -477,12 +477,12 @@ const WIRE_BASELINE = [
     digest: 'd08525a3fca5a7f83dcc3129427291a6589792a34c11b5335d7cd712ed361e10', decisions: INCREMENTAL_AFTER_FIRST },
   { name: 'websocket-gpt-5.5-explicit-plain', config: { model: 'gpt-5.5', transport: 'websocket', promptCache: EXPLICIT }, reminder: false,
     digest: '3cc75db9bd9edf9bcb04d855c6bed4b7898156758afc49cdf1b5edd1a031f6ab', decisions: INCREMENTAL_AFTER_FIRST },
-  // 唯一的有意差异：HTTP 完整重放下消息断点在易失尾巴（本轮提醒）之前（openai-responses-tail-cache-breakpoint 测试）；
-  // 放回尾巴上之后与改动前逐字节相同。
+  // 有意差异（openai-responses-tail-cache-breakpoint 测试）：HTTP 完整重放下消息断点在易失尾巴（本轮提醒）之前，
+  // 新回合的请求还在上一回合的用户输入上多一个读取断点；去掉读取断点、放回尾巴上之后与改动前逐字节相同。
   { name: 'http-gpt-5.6-explicit-reminder', config: { model: 'gpt-5.6', transport: 'http', promptCache: EXPLICIT }, reminder: true,
     digest: '52cdd32f54ed9bd522c5da709988434a5cd7c227f54a4c8edb055acb58c4a049', decisions: [], breakpointBeforeTail: true },
   { name: 'http-gpt-5.6-explicit-plain', config: { model: 'gpt-5.6', transport: 'http', promptCache: EXPLICIT }, reminder: false,
-    digest: 'fd33e28303f205e454da068fc1ccf56b5a2808c51edf68a2a4f24d843a981c81', decisions: [] },
+    digest: 'fd33e28303f205e454da068fc1ccf56b5a2808c51edf68a2a4f24d843a981c81', decisions: [], readBreakpoint: true },
   { name: 'http-gpt-5.6-key-plain', config: { model: 'gpt-5.6', transport: 'http', promptCache: KEY }, reminder: false,
     digest: 'b7176b372bf884d1d17aeac79785b1bfdf6b07851b71dbecaaae9e1a57b95de9', decisions: [] },
   { name: 'http-gpt-5.5-explicit-plain', config: { model: 'gpt-5.5', transport: 'http', promptCache: EXPLICIT }, reminder: false,
@@ -494,7 +494,7 @@ const WIRE_BASELINE = [
  * 同时断言断点确实在尾巴之前、尾巴上没有断点。
  */
 function withLegacyTailBreakpoint(frame) {
-  const body = JSON.parse(frame.text);
+  const body = withoutReadBreakpoint(JSON.parse(frame.text));
   const marked = breakpointPaths(body.input);
   const tail = body.input.length - 1;
   assert.equal(marked.length, 2, frame.text);
@@ -506,10 +506,32 @@ function withLegacyTailBreakpoint(frame) {
   return { ...frame, text: JSON.stringify(body) };
 }
 
+/**
+ * 去掉新回合请求在上一回合用户输入上的读取断点：断点有 3 个时，中间那个必须落在最后一个断点之前最后一条用户消息上。
+ * 返回改动前（只有开发者指令与一个消息断点）的请求体。
+ */
+function withoutReadBreakpoint(body) {
+  const marked = breakpointPaths(body.input);
+  if (marked.length !== 3) return body;
+  assert.equal(marked[0], '0.0', 'developer instructions');
+  const [readIndex, readBlock] = marked[1].split('.').map(Number);
+  const [writeIndex] = marked[2].split('.').map(Number);
+  const lastUserBeforeWrite = body.input.findLastIndex((item, index) => index < writeIndex && item.role === 'user');
+  assert.equal(readIndex, lastUserBeforeWrite, 'the read breakpoint is on the user message before the write breakpoint');
+  delete body.input[readIndex].content[readBlock].prompt_cache_breakpoint;
+  return body;
+}
+
+const withoutReadBreakpointInFrame = (frame) => ({ ...frame, text: JSON.stringify(withoutReadBreakpoint(JSON.parse(frame.text))) });
+
 test('非 explicit 模式、HTTP 传输与 GPT-5.6 之前的模型：线上帧与改动前构建逐字节一致', async () => {
   for (const scenario of WIRE_BASELINE) {
     const { frames: sent, decisions } = await runScenario(scenario.name, scenario.config, scenario.reminder);
-    const frames = scenario.breakpointBeforeTail ? sent.map(withLegacyTailBreakpoint) : sent;
+    const frames = scenario.breakpointBeforeTail ? sent.map(withLegacyTailBreakpoint)
+      : scenario.readBreakpoint ? sent.map(withoutReadBreakpointInFrame) : sent;
+    if (scenario.readBreakpoint) {
+      assert.deepEqual(sent.map((frame) => breakpointPaths(JSON.parse(frame.text).input).length), [2, 2, 2, 3], scenario.name);
+    }
     assert.deepEqual(decisions, scenario.decisions, scenario.name);
     assert.equal(wireDigest(frames), scenario.digest,
       `${scenario.name} 线上帧与改动前不同：\n${frames.map((frame) => `${frame.kind}: ${frame.text}`).join('\n')}`);
@@ -522,8 +544,10 @@ test('dry-run 与原生 GPT-6 非 explicit 链：与改动前构建逐字节一�
     contents: rounds(true)[3].contents, tools, systemInstruction: system
   }, { settings: async () => settingsFor('http://127.0.0.1:9/v1', config) })).body);
   const digest = (text) => createHash('sha256').update(text).digest('hex');
-  assert.equal(digest(await dryRun('dry-http-gpt-5.6-explicit', { model: 'gpt-5.6', transport: 'http', promptCache: EXPLICIT })),
-    '738bf1917adc550b4d017d20f9cc970b792a49fd9be9dd31732bc648e85410ae');
+  const httpExplicit = await dryRun('dry-http-gpt-5.6-explicit', { model: 'gpt-5.6', transport: 'http', promptCache: EXPLICIT });
+  // 这条请求没有标出易失尾巴：写入点仍是最后一个可承载项，只多一个前一条用户消息上的读取断点。
+  assert.equal(breakpointPaths(JSON.parse(httpExplicit).input).length, 3, 'read breakpoint on the previous user message');
+  assert.equal(digest(withoutReadBreakpointInFrame({ text: httpExplicit }).text), '738bf1917adc550b4d017d20f9cc970b792a49fd9be9dd31732bc648e85410ae');
   assert.equal(digest(await dryRun('dry-websocket-gpt-5.6-key', { model: 'gpt-5.6', transport: 'websocket', promptCache: KEY })),
     'e2beed62bd2d07f569091ace2988038f361f5fdfea92027a4aa103917793201e');
   assert.equal(digest(await dryRun('dry-websocket-gpt-5.5-explicit', { model: 'gpt-5.5', transport: 'websocket', promptCache: EXPLICIT })),

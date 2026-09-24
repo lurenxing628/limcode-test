@@ -177,7 +177,8 @@ test('HTTP 工具循环（尾巴是本轮提醒）：消息断点在尾巴之前
       assert.equal(JSON.stringify(tail).includes('prompt_cache_breakpoint'), false, `${label}: no breakpoint on the volatile reminder`);
       const inputIndex = body.input.findIndex((item) => item.role === 'user' && JSON.stringify(item).includes('Check Paris'));
       assert.equal(inputIndex, 3, label);
-      assert.deepEqual(breakpointIndexes(body.input), [0, inputIndex], `${label}: developer instructions + the carrier before the tail`);
+      // 开发者指令、上一回合的用户输入（读取点）、尾巴之前最后一个可承载项（本回合输入）。
+      assert.deepEqual(breakpointIndexes(body.input), [0, 1, inputIndex], `${label}: developer instructions + previous input + the carrier before the tail`);
       assert.equal(body.input[0].role, 'developer', label);
       assert.deepEqual(body.prompt_cache_options, { mode: 'explicit', ttl: '30m' }, label);
     }
@@ -218,7 +219,7 @@ test('纯函数边界：形状对不上时原样返回同一引用；断点可�
 
   const same = (request, count, why) => assert.equal(move(request, count), request, why);
   const plain = body([developer, user('q'), call, stringOutput, user('r', true)]);
-  same(plain, 0, 'no volatile tail');
+  same(body([developer, call, stringOutput, user('r', true)]), 0, 'no volatile tail and no earlier user message to read');
   same(plain, 5, 'the tail covers the whole input');
   same(plain, 2, 'the tail must be user messages only');
   same(body([developer, user('q'), user('r', true)], { prompt_cache_options: { mode: 'implicit', ttl: '30m' } }), 1, 'implicit mode');
@@ -234,7 +235,7 @@ test('纯函数边界：形状对不上时原样返回同一引用；断点可�
   const moved = move(request, 1);
   assert.deepEqual(moved.body.input, [
     developer,
-    user('q'),
+    user('q', true),
     call,
     { ...arrayOutput, output: [{ type: 'input_text', text: 'A', prompt_cache_breakpoint: BREAKPOINT }] },
     assistant,
@@ -243,6 +244,17 @@ test('纯函数边界：形状对不上时原样返回同一引用；断点可�
   assert.equal(JSON.stringify(request), snapshot, 'the input is not mutated');
   const toUser = move(body([developer, user('q'), call, stringOutput, user('i'), user('r', true)]), 2);
   assert.deepEqual(breakpointIndexes(toUser.body.input), [0, 1], 'string tool results are not carriers; the breakpoint goes to the user message');
+
+  // 新回合：写入点落在新的用户输入上，另在上一条用户消息（上一回合的输入）上放一个读取断点，共 3 个。
+  const nextTurn = move(body([developer, user('q'), call, stringOutput, assistant, user('next'), user('r', true)]), 1);
+  assert.deepEqual(breakpointIndexes(nextTurn.body.input), [0, 1, 5]);
+  // 没有易失尾巴时，接入库的断点就在最后一个可承载项上；同样补上前一条用户消息的读取断点。
+  const noTail = move(body([developer, user('q'), call, arrayOutput, assistant, user('next', true)]), 0);
+  assert.deepEqual(breakpointIndexes(noTail.body.input), [0, 1, 5]);
+  // 读取点只找用户消息：工具结果不算“上一回合输入”；已带断点的不重复标记。
+  const outputsOnly = move(body([developer, call, arrayOutput, call, arrayOutput, user('r', true)]), 1);
+  assert.deepEqual(breakpointIndexes(outputsOnly.body.input), [0, 4]);
+  same(body([developer, user('q', true), user('next', true)]), 0, 'the previous user message already carries a breakpoint');
 });
 
 test('尾巴之前只有已带断点的开发者指令（输入被压缩掉、没有摘要）：请求与改动前构建逐字节一致', async () => {
@@ -395,13 +407,15 @@ test('HTTP 发送与 dry-run 一致；WebSocket 回退的 HTTP 与 HTTP 传输�
   const sent = httpRun.records.map((record) => JSON.parse(record.text));
   assert.equal(httpRun.records.every((record) => record.kind === 'http'), true);
   assert.equal(sent.length, 4);
-  // 'task' 在前三次请求里都是尾巴之前最后一个可承载项；第四次换成新的用户消息 'next'。
-  assert.deepEqual(simulateExplicitCache(sent), [0, 2, 2, 1]);
+  // 'task' 在前三次请求里都是尾巴之前最后一个可承载项；第四次（新回合）换成新的用户消息 'next'，
+  // 同时在上一回合的用户输入 'task' 上放一个读取断点，读到前三次写下的前缀（改动前只读到开发者指令）。
+  assert.deepEqual(simulateExplicitCache(sent), [0, 2, 2, 2]);
   for (const [index, body] of sent.entries()) {
     assert.deepEqual(body, httpRun.dryRuns[index], `round ${index + 1}: dry-run shows exactly what is sent`);
     assert.equal(JSON.stringify(body.input.at(-1)).includes('prompt_cache_breakpoint'), false, `round ${index + 1}: tail unmarked`);
     const lastUser = body.input.findLastIndex((item, itemIndex) => item.role === 'user' && itemIndex < body.input.length - 1);
-    assert.deepEqual(breakpointIndexes(body.input), [0, lastUser], `round ${index + 1}`);
+    assert.deepEqual(breakpointIndexes(body.input), lastUser === 1 ? [0, 1] : [0, 1, lastUser], `round ${index + 1}`);
+    assert.ok(breakpointIndexes(body.input).length <= 4, `round ${index + 1}: at most four breakpoints`);
   }
 
   for (const only of [0, 2]) {
