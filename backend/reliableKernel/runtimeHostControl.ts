@@ -6,13 +6,14 @@ import type { RuntimeRootPaths } from './contracts';
 import {
   classifyRecordedProcess,
   delay,
+  inspectRecordedProcess,
   isolateDeadClaimRecord,
   ownProcessStartIdentity,
   readClaimRecord,
   releaseClaimRecord,
   requireNonEmptyText,
   tryPublishClaimRecord,
-  type RecordedProcessState
+  type RecordedProcessInspection
 } from './runtimeClaimPrimitives';
 
 export const RUNTIME_HOST_LIVENESS_DIRECTORY = 'host-liveness';
@@ -35,10 +36,11 @@ export class RuntimeMaintenanceBusyError extends Error {
 
   public constructor(
     public readonly claimPath: string,
-    public readonly owner: RuntimeMaintenanceMetadata
+    public readonly owner: RuntimeMaintenanceMetadata,
+    public readonly reason: string
   ) {
     super(
-      `Runtime maintenance cannot verify the holder process ${owner.processId} for ${claimPath}; ` +
+      `Runtime maintenance cannot verify the holder process ${owner.processId} for ${claimPath} (${reason}); ` +
       'failing closed instead of taking over an unknown Runtime Host.'
     );
     this.name = 'RuntimeMaintenanceBusyError';
@@ -280,7 +282,7 @@ async function acquireMaintenanceClaim(
   };
   await fs.mkdir(path.dirname(claimPath), { recursive: true, mode: 0o700 });
   let observedToken: string | undefined;
-  let observedState: RecordedProcessState | undefined;
+  let observed: RecordedProcessInspection | undefined;
   for (;;) {
     if (await tryPublishClaimRecord(claimPath, RUNTIME_MAINTENANCE_RECORD_FILE, `${JSON.stringify(metadata)}\n`)) {
       return { claimPath, metadata, active: true, released: false };
@@ -295,23 +297,33 @@ async function acquireMaintenanceClaim(
     if (record.claimToken !== observedToken) {
       // One platform identity probe per observed claim token; liveness re-checks below are cheap.
       observedToken = record.claimToken;
-      observedState = classifyRecordedProcess(record.processId, record.processStartIdentity);
+      observed = inspectRecordedProcess(record.processId, record.processStartIdentity);
     }
-    if (observedState === 'dead') {
+    if (observed!.state === 'dead') {
       await isolateMaintenanceRecord(claimPath, record.claimToken);
       observedToken = undefined;
       continue;
     }
-    if (observedState === 'unknown') throw new RuntimeMaintenanceBusyError(claimPath, record);
+    if (observed!.state === 'unknown') {
+      throw new RuntimeMaintenanceBusyError(claimPath, record, observed!.reason ?? 'holder state unknown');
+    }
     try {
       process.kill(record.processId, 0);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === 'ESRCH') {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code === 'ESRCH') {
         await isolateMaintenanceRecord(claimPath, record.claimToken);
         observedToken = undefined;
         continue;
       }
-      throw new RuntimeMaintenanceBusyError(claimPath, record);
+      // EPERM on a holder whose start identity was verified alive is still that live holder.
+      if (code !== 'EPERM') {
+        throw new RuntimeMaintenanceBusyError(
+          claimPath,
+          record,
+          `liveness re-check failed with ${code ?? String(error)}`
+        );
+      }
     }
     await delay(MAINTENANCE_RETRY_DELAY_MS);
   }

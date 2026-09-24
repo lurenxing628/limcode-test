@@ -1,4 +1,6 @@
 import type { AttachmentIngestService } from './attachmentIngest';
+import { CollaborationControlPlane } from './collaborationControlPlane';
+import { CollaborationBoard } from './collaborationBoard';
 import {
   AnswerControlPlane,
   RuntimeDeliveryControlPlane,
@@ -17,10 +19,7 @@ import {
   ClientDetailReader,
   ClientHistoryReader
 } from './clientFeed';
-import {
-  ConversationForkControlPlane,
-  type ConversationForkCommand
-} from './conversationFork';
+import { ConversationForkControlPlane } from './conversationFork';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { EffectControlPlane, type EffectObservedOutcome } from './effectControlPlane';
 import { PhaseFRecoveryScanner } from './phaseFRecovery';
@@ -32,6 +31,8 @@ export interface ReliableKernelRuntimeServices {
   effects: EffectControlPlane;
   conversationFork: ConversationForkControlPlane;
   deliveries: RuntimeDeliveryControlPlane;
+  collaboration: CollaborationControlPlane;
+  collaborationBoard: CollaborationBoard;
   children: ChildExecutionControlPlane;
   answers: AnswerControlPlane;
   recovery: PhaseFRecoveryScanner;
@@ -55,7 +56,12 @@ export function createReliableKernelRuntimeServices(
   }
 ): ReliableKernelRuntimeServices {
   const effects = new EffectControlPlane(database, contentStore, options);
-  const deliveries = new RuntimeDeliveryControlPlane(database, options);
+  const deliveries = new RuntimeDeliveryControlPlane(database, contentStore, options);
+  const collaboration = new CollaborationControlPlane(database, contentStore, deliveries, options);
+  const collaborationBoard = new CollaborationBoard(database, contentStore, {
+    ...options,
+    notify: notice => collaboration.notifyBoardPost(notice)
+  });
   const children = new ChildExecutionControlPlane(database, contentStore, effects, {
     ...options,
     prepareNextTurnDeliverySteps: (conversationId, turnId, now) =>
@@ -68,6 +74,8 @@ export function createReliableKernelRuntimeServices(
   const history = new ClientHistoryReader(database);
   const details = new ClientDetailReader(database, contentStore);
   const router = new ReliableKernelRuntimeRouter({
+    collaboration,
+    collaborationBoard,
     conversationFork,
     children,
     answers,
@@ -78,6 +86,8 @@ export function createReliableKernelRuntimeServices(
     details
   });
   return {
+    collaboration,
+    collaborationBoard,
     effects,
     conversationFork,
     deliveries,
@@ -130,10 +140,6 @@ export class ReliableKernelRuntimeRouter {
       default:
         return Promise.reject(new Error(`Unsupported run_agent operation: ${String((command as { operation?: unknown }).operation)}.`));
     }
-  }
-
-  public forkConversation(command: ConversationForkCommand) {
-    return this.services.conversationFork.fork(command);
   }
 
   public submitAnswer(command: AnswerSubmitCommand) {

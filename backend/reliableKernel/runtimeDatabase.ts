@@ -37,6 +37,7 @@ import type {
   SerializedWorkerError,
   ToolFactsSnapshot
 } from './databaseWorkerProtocol';
+import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -233,6 +234,14 @@ export class RuntimeDatabase {
       throw new TypeError('toolCallId must be non-empty.');
     }
     return this.request<SnapshotBarrier<ToolFactsSnapshot>>({ kind: 'toolFactsSnapshot', toolCallId });
+  }
+
+  /** Full child lineage and task inputs from one SQLite read transaction; no in-memory runner state. */
+  public async conversationChildTaskSnapshot(conversationId: string): Promise<SnapshotBarrier<ConversationChildTaskFacts>> {
+    if (typeof conversationId !== 'string' || conversationId.length === 0) {
+      throw new TypeError('conversationId must be non-empty.');
+    }
+    return this.request<SnapshotBarrier<ConversationChildTaskFacts>>({ kind: 'conversationChildTaskSnapshot', conversationId });
   }
 
   /** DB-side aggregate: returns only terminal processes whose registered chunk facts are incomplete. */

@@ -11,13 +11,20 @@ import type {
   ToolPolicyScopeKind,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
-import { ASK_USER_TOOL_NAME, EDIT_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
+import { ASK_USER_TOOL_NAME, EDIT_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
+import { isSwitchGrantedTool, mcpSourceConfigFor, toolAllowedByPolicy, toolConfigKey } from '@shared/toolPolicyResolution';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useToolPolicyStore } from '@webview/stores/useToolPolicyStore';
+import {
+  AGENT_COLLABORATION_CONFIG_KEYS,
+  CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
+  SUB_AGENT_TOOL_NAME,
+  cloneSourceConfigs as cloneSourceConfigRecords,
+  useToolPolicyStore
+} from '@webview/stores/useToolPolicyStore';
 import { resolveToolHeaderIcon } from '@webview/components/content/toolDisplay/registry';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
@@ -72,28 +79,53 @@ const visibleTools = computed(() => {
   return builtinTools.value.filter((tool) => toolScope(tool) === scope);
 });
 const visibleEnabledCount = computed(() => visibleTools.value.filter((tool) => isToolEnabled(tool)).length);
+/** A stored tool list on this scope's chain that the backend refuses to compile. */
+const listError = computed(() => store.toolListErrorFor(props.scopeKind, props.scopeId));
+/** A hand-edited MCP source entry on this scope's chain that turns its source off. */
+const sourceError = computed(() => store.sourceConfigErrorFor(props.scopeKind, props.scopeId));
+/** A child task's conversation: the cross-conversation tools are never offered there. */
+const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
+/** Where the cross-conversation switch lives for this scope. */
+const collaborationArea = computed(() => props.scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域');
+// Mirrors the backend child bound (childExecutionBoundary.ts): a child Turn keeps only what its parent Turn also allows.
+// A Plan the user approved to run in a new conversation is the exception: it keeps the executor's own settings.
+const childBoundNote = computed(() => {
+  const rule = '只能使用双方都允许的工具和 MCP 服务；自动执行、自动应用更改和命令白名单也要双方都同意。';
+  if (props.scopeKind === 'agent') {
+    return `这个 Agent 被模型派出作为子 Agent 运行时，还受派出它的对话限制：${rule}`
+      + '用户在 Plan 卡片上选「新开对话执行」交给它时，按它自己的工具设置运行。';
+  }
+  if (!childConversation.value) return '';
+  return store.childConversationBoundedByParent(props.scopeId)
+    ? `这是子 Agent 对话，工具还受派出它的对话限制：${rule}`
+    : '这是用户批准 Plan 后新开的子 Agent 对话，按执行 Agent 自己的工具设置运行，不受派出它的对话限制。';
+});
+const switchGrantedToolNames = computed(() => builtinTools.value.filter((tool) => isSwitchGranted(tool)).map((tool) => tool.name));
+/** This scope's own invalid list blocks every edit that would rewrite it; only a reset repairs it. */
+const editsBlocked = computed(() => props.readonly || listError.value?.own === true);
+/** Any invalid list on the chain blocks tool-list edits, which start from the effective list. */
+const listEditsBlocked = computed(() => props.readonly || !!listError.value);
+/** What the first list saved here adds beyond the tools shown now (global and workflows only). */
+const firstListExtras = computed(() => props.readonly ? [] : store.listSeedExtrasFor(props.scopeKind, props.scopeId));
+/** The built-in read-only Agents and workflows above this scope that deny every MCP source not enabled at their own scope. */
+const mcpDenyingBuiltinsAbove = computed(() => store.mcpDenyingBuiltinsAbove(props.scopeKind, props.scopeId).map((scope) => store.scopeLabel(scope)));
+/** A built-in read-only Agent or workflow denies every MCP source it does not enable itself. */
+const mcpSourcesDeniedHere = computed(() => !!store.builtinPolicyFor(props.scopeKind, props.scopeId)?.sourceConfigs?.[TOOL_POLICY_ALL_MCP_SOURCES]);
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
 const canRestoreDefault = computed(() => {
   if (props.scopeKind !== 'global' || props.readonly) return false;
   return !isUsingToolDefaults.value;
 });
-const isUsingToolDefaults = computed(() => {
-  if (props.scopeKind !== 'global') return false;
-  const policy = effectivePolicy.value;
-  if (!policy) return false;
-  const expectedAllowed = builtinTools.value.filter((tool) => tool.metadata?.defaultEnabled !== false).map((tool) => tool.name).sort();
-  const actualAllowed = [...policy.allowedTools].sort();
-  if (expectedAllowed.length !== actualAllowed.length || !expectedAllowed.every((name, i) => name === actualAllowed[i])) return false;
-  const configs = policy.toolConfigs ?? {};
-  return Object.keys(configs).length === 0;
-});
+/** Global uses the default tool set while it saves no list of its own. */
+const isUsingToolDefaults = computed(() => props.scopeKind === 'global' && localResolution.value.policy?.allowedTools === undefined);
 const sourceLabel = computed(() => {
   if (props.scopeKind === 'global' && runtimePreset.value === 'yolo') return '全局自动执行预设';
   if (props.scopeKind === 'global') return '全局默认策略';
   if (hasLocalOverride.value) return '当前范围的单独设置';
-  const inheritedFrom = effectiveResolution.value.inheritedFrom;
-  void inheritedFrom;
-  return '继承全局默认策略';
+  if (store.builtinPolicyFor(props.scopeKind, props.scopeId)) {
+    return props.scopeKind === 'agent' ? '沿用内置 Agent 的工具列表' : '沿用内置工作流的工具列表';
+  }
+  return props.scopeKind === 'conversation' ? '继承上层策略（全局、Agent 与工作流）' : '继承全局默认策略';
 });
 const presetOptions = computed<Array<{ value: ToolPolicyPresetKind; label: string; description: string }>>(() => [
   ...(props.scopeKind === 'global'
@@ -138,61 +170,92 @@ function updateSelectedToolScope(value: string): void {
     : 'all';
 }
 
+/**
+ * Config-only edits keep this scope's own list state: a scope without a saved list stays without
+ * one, so adjusting approval or display never freezes the inherited tool list here.
+ */
+function localAllowedTools(): string[] | undefined {
+  return store.ownListFor(props.scopeKind, props.scopeId);
+}
+
+function localPolicyName(): string | undefined {
+  return localResolution.value.policy?.name;
+}
+
+/** The list saved when one tool is switched here; see `listSeedFor` for where it starts. */
 function nextAllowed(toolName: string, enabled: boolean): string[] {
-  const names = new Set(effectivePolicy.value?.allowedTools ?? []);
+  const names = new Set(store.listSeedFor(props.scopeKind, props.scopeId));
   if (enabled) names.add(toolName);
   else names.delete(toolName);
   return tools.value.map((tool) => tool.name).filter((name) => names.has(name));
 }
 
 function updatePolicyPreset(value: ToolPolicyPresetKind): void {
-  if (props.readonly || selectedPreset.value === value) return;
+  if (editsBlocked.value || selectedPreset.value === value) return;
   if (props.scopeKind === 'global' && value === 'inherit') return;
   store.setPolicyPresetForScope(props.scopeKind, props.scopeId, value);
 }
 
+/**
+ * The backend's own admission rule over the effective policy: MCP tools follow source settings,
+ * and the cross-conversation switch grants its tools to top-level conversations.
+ */
 function isToolEnabled(tool: ToolDefinitionRecord): boolean {
-  if (allowedSet.value.has(tool.name)) return true;
-  if (tool.source?.kind !== 'mcp') return false;
-  const sourceId = tool.source.sourceId;
-  if (!sourceId) return false;
-  const sourceConfig = effectivePolicy.value?.sourceConfigs?.[sourceId];
-  if (!sourceConfig?.enabled) return false;
-  return !(sourceConfig.disabledTools ?? []).includes(tool.name);
+  if (isSwitchGranted(tool) && childConversation.value) return false;
+  return toolAllowedByPolicy({
+    allowedTools: allowedSet.value,
+    sourceConfigs: effectivePolicy.value?.sourceConfigs,
+    toolConfigs: effectivePolicy.value?.toolConfigs
+  }, tool);
+}
+
+/** A cross-conversation tool: the switch in the Agent 协作 area grants it, not the tool list. */
+function isSwitchGranted(tool: ToolDefinitionRecord): boolean {
+  return tool.source?.kind !== 'mcp' && isSwitchGrantedTool(tool.name);
 }
 
 function isMcpSourceEnabled(sourceId: string): boolean {
-  return effectivePolicy.value?.sourceConfigs?.[sourceId]?.enabled === true;
+  return mcpSourceConfigFor(effectivePolicy.value?.sourceConfigs, sourceId)?.enabled === true;
 }
 
+/** An upper layer turns this source off here, so enabling it at this scope would never apply. */
+function isMcpSourceBlockedAbove(sourceId: string): boolean {
+  return !!store.mcpSourceBlockedAbove(props.scopeKind, props.scopeId, sourceId);
+}
+
+/** An upper layer keeps this MCP tool off here, so its box cannot turn it on. */
+function isMcpToolBlockedAbove(tool: ToolDefinitionRecord): boolean {
+  return store.mcpToolBlockedAbove(props.scopeKind, props.scopeId, tool);
+}
+
+/**
+ * The server switch turns every tool of the source on or off here, including tools it adds later;
+ * the tools disabled one by one stay disabled, and a single-tool allowlist gives way to the whole source.
+ */
 function toggleMcpSource(sourceId: string, enabled: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value || (enabled && isMcpSourceBlockedAbove(sourceId))) return;
   const nextConfigs = cloneSourceConfigs();
-  nextConfigs[sourceId] = {
-    ...(nextConfigs[sourceId] ?? {}),
-    enabled,
-    disabledTools: nextConfigs[sourceId]?.disabledTools ?? []
-  };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, cloneToolConfigs(), nextConfigs);
+  const disabledTools = nextConfigs[sourceId]?.disabledTools ?? [];
+  nextConfigs[sourceId] = { enabled, ...(disabledTools.length > 0 ? { disabledTools } : {}) };
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), cloneToolConfigs(), nextConfigs);
 }
 
+/** One MCP tool follows its source settings: the switch changes that tool alone and never a tool list. */
 function toggleMcpSourceTool(tool: ToolDefinitionRecord, enabled: boolean): void {
-  if (props.readonly || tool.source?.kind !== 'mcp' || !tool.source.sourceId) return;
-  const sourceId = tool.source.sourceId;
-  const nextConfigs = cloneSourceConfigs();
-  const current = nextConfigs[sourceId] ?? { enabled: true, disabledTools: [] };
-  const disabled = new Set(current.disabledTools ?? []);
-  if (enabled) disabled.delete(tool.name);
-  else disabled.add(tool.name);
-  nextConfigs[sourceId] = { enabled: current.enabled !== false, ...(disabled.size > 0 ? { disabledTools: [...disabled] } : {}) };
-  const nextAllowed = enabled ? effectivePolicy.value?.allowedTools ?? [] : (effectivePolicy.value?.allowedTools ?? []).filter((name) => name !== tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed, effectivePolicy.value?.name, cloneToolConfigs(), nextConfigs);
+  if (listEditsBlocked.value || tool.source?.kind !== 'mcp' || enabled === isToolEnabled(tool)) return;
+  if (!enabled) collapseToolConfig(tool.name);
+  store.setMcpToolEnabledForScope(props.scopeKind, props.scopeId, tool, enabled);
 }
 
+/** One tool's box: a built-in tool edits this scope's list; the cross-conversation tools follow their switch only. */
 function setToolEnabled(tool: ToolDefinitionRecord, enabled: boolean): void {
-  if (props.readonly || enabled === isToolEnabled(tool)) return;
+  if (tool.source?.kind === 'mcp') {
+    toggleMcpSourceTool(tool, enabled);
+    return;
+  }
+  if (isSwitchGranted(tool) || listEditsBlocked.value || enabled === isToolEnabled(tool)) return;
   if (!enabled) collapseToolConfig(tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), effectivePolicy.value?.name, cloneToolConfigs(), cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, nextAllowed(tool.name, enabled), localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
 function isToolConfigExpanded(toolName: string): boolean { return expandedToolNames.value.includes(toolName); }
@@ -208,27 +271,32 @@ function collapseToolConfig(toolName: string): void {
 }
 
 function enableAll(): void {
-  if (props.readonly) return;
-  store.setPolicyForScope(props.scopeKind, props.scopeId, builtinTools.value.map((tool) => tool.name), effectivePolicy.value?.name, cloneToolConfigs(), cloneSourceConfigs());
+  if (listEditsBlocked.value) return;
+  const names = builtinTools.value.filter((tool) => !isSwitchGranted(tool)).map((tool) => tool.name);
+  store.setPolicyForScope(props.scopeKind, props.scopeId, names, localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
 function disableAll(): void {
-  if (props.readonly) return;
+  if (listEditsBlocked.value) return;
   expandedToolNames.value = [];
-  store.setPolicyForScope(props.scopeKind, props.scopeId, [], effectivePolicy.value?.name, cloneToolConfigs(), cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, [], localPolicyName(), cloneToolConfigs(), cloneSourceConfigs());
 }
 
+/** 恢复继承 resets this scope's tool settings; the Agent 协作 switch and limits keep their own restore buttons. */
 function restoreInheritance(): void {
   if (!canRestoreInheritance.value) return;
-  store.clearPolicyScope(props.scopeKind, props.scopeId);
+  store.restoreToolInheritance(props.scopeKind, props.scopeId);
 }
 
+/**
+ * 继承默认 resets the global tool list only: the saved list is dropped, so the default tool set and
+ * the built-in Agent/workflow lists apply again. Per-tool settings (approval, display, the
+ * cross-conversation switch and collaboration limits), MCP source settings and the preset stay; a
+ * record left with nothing else is removed.
+ */
 function inheritDefaults(): void {
   if (!canRestoreDefault.value) return;
-  const defaultAllowed = tools.value
-    .filter((tool) => tool.source?.kind !== 'mcp' && tool.metadata?.defaultEnabled !== false)
-    .map((tool) => tool.name);
-  store.setPolicyForScope(props.scopeKind, props.scopeId, defaultAllowed, effectivePolicy.value?.name, {}, {});
+  store.saveOrDropLocalPolicy('global', undefined, undefined, cloneToolConfigs());
 }
 
 function riskLabel(tool: ToolDefinitionRecord): string {
@@ -282,9 +350,14 @@ function toolIcon(tool: ToolDefinitionRecord) {
   return resolveToolHeaderIcon(tool.name);
 }
 
+/**
+ * Edits start from this scope's own saved configs. The effective view merges upper layers in, and
+ * saving it here would freeze those inherited values (for example the global cross-conversation
+ * switch) into this scope.
+ */
 function cloneToolConfigs(): Record<string, ToolPolicyToolConfigRecord> {
   const result: Record<string, ToolPolicyToolConfigRecord> = {};
-  for (const [toolName, record] of Object.entries(effectivePolicy.value?.toolConfigs ?? {})) {
+  for (const [toolName, record] of Object.entries(localResolution.value.policy?.toolConfigs ?? {})) {
     result[toolName] = {
       config: { ...(record.config ?? {}) },
       ...(typeof record.autoApproveExecution === 'boolean' ? { autoApproveExecution: record.autoApproveExecution } : {}),
@@ -299,20 +372,21 @@ function cloneToolConfigs(): Record<string, ToolPolicyToolConfigRecord> {
 }
 
 function cloneSourceConfigs(): Record<string, ToolPolicySourceConfigRecord> {
-  const result: Record<string, ToolPolicySourceConfigRecord> = {};
-  for (const [sourceId, record] of Object.entries(effectivePolicy.value?.sourceConfigs ?? {})) {
-    result[sourceId] = {
-      enabled: record.enabled === true,
-      ...(record.disabledTools?.length ? { disabledTools: [...record.disabledTools] } : {})
-    };
-  }
-  return result;
+  return cloneSourceConfigRecords(localResolution.value.policy?.sourceConfigs) ?? {};
+}
+
+/**
+ * This scope's own config values for one tool; a field edit adds to these only. Per-tool settings
+ * are keyed by `toolConfigKey`: an MCP tool by server id and original name, never its display name.
+ */
+function localConfigForTool(tool: ToolDefinitionRecord): ToolConfigRecord {
+  return { ...(localResolution.value.policy?.toolConfigs?.[toolConfigKey(tool)]?.config ?? {}) };
 }
 
 function configForTool(tool: ToolDefinitionRecord): ToolConfigRecord {
   return {
     ...(tool.defaultConfig ?? {}),
-    ...(effectivePolicy.value?.toolConfigs?.[tool.name]?.config ?? {})
+    ...(effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.config ?? {})
   };
 }
 
@@ -324,39 +398,38 @@ function fieldListText(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord)
 }
 
 function updateStringListField(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord, value: string): void {
-  if (props.readonly) return;
-  const current = configForTool(tool);
+  if (editsBlocked.value) return;
   const config = sanitizeConfigForTool(tool, {
-    ...current,
+    ...localConfigForTool(tool),
     [field.key]: value.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean)
   });
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  nextConfigs[toolConfigKey(tool)] = { ...(nextConfigs[toolConfigKey(tool)] ?? {}), config };
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRecord, value: ToolConfigValue): void {
-  if (props.readonly) return;
-  const config = sanitizeConfigForTool(tool, { ...configForTool(tool), [field.key]: value });
+  if (editsBlocked.value) return;
+  const config = sanitizeConfigForTool(tool, { ...localConfigForTool(tool), [field.key]: value });
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = { ...(nextConfigs[tool.name] ?? {}), config };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  nextConfigs[toolConfigKey(tool)] = { ...(nextConfigs[toolConfigKey(tool)] ?? {}), config };
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 type ToolGateSettingKey = 'autoApproveExecution' | 'autoApplyChange' | 'autoSubmitResult';
 
 function updateGateSetting(tool: ToolDefinitionRecord, key: ToolGateSettingKey, value: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
     [key]: value
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function toolGateValue(tool: ToolDefinitionRecord, key: ToolGateSettingKey): boolean {
-  const configValue = effectivePolicy.value?.toolConfigs?.[tool.name]?.[key];
+  const configValue = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.[key];
   if (configValue !== undefined) return configValue;
   if (key === 'autoApproveExecution') return tool.metadata?.defaultAutoApproveExecution ?? true;
   if (key === 'autoApplyChange') return tool.metadata?.defaultAutoApplyChange ?? true;
@@ -365,17 +438,17 @@ function toolGateValue(tool: ToolDefinitionRecord, key: ToolGateSettingKey): boo
 
 /** 原生异步与执行审批、结果回传、调度预设相互独立；只有显式开启才生效。 */
 function nativeAsyncValue(tool: ToolDefinitionRecord): boolean {
-  return effectivePolicy.value?.toolConfigs?.[tool.name]?.nativeAsync === true;
+  return effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.nativeAsync === true;
 }
 
 function updateNativeAsync(tool: ToolDefinitionRecord, value: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
     nativeAsync: value
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function supportsChangeApply(tool: ToolDefinitionRecord): boolean {
@@ -387,17 +460,17 @@ function supportsDiffPreview(tool: ToolDefinitionRecord): boolean {
 }
 
 function updateAutoApplyChangeDelay(tool: ToolDefinitionRecord, value: number): void {
-  if (props.readonly || !supportsChangeApply(tool)) return;
+  if (editsBlocked.value || !supportsChangeApply(tool)) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
     autoApplyChangeDelaySeconds: Math.min(600, Math.max(0, Math.floor(value)))
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function autoApplyChangeDelayValue(tool: ToolDefinitionRecord): number {
-  const value = effectivePolicy.value?.toolConfigs?.[tool.name]?.autoApplyChangeDelaySeconds;
+  const value = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.autoApplyChangeDelaySeconds;
   if (typeof value === 'number' && Number.isFinite(value)) return Math.min(600, Math.max(0, Math.floor(value)));
   const defaultValue = tool.metadata?.defaultAutoApplyChangeDelaySeconds;
   return typeof defaultValue === 'number' && Number.isFinite(defaultValue)
@@ -406,34 +479,34 @@ function autoApplyChangeDelayValue(tool: ToolDefinitionRecord): number {
 }
 
 function updateDisplayAutoExpand(tool: ToolDefinitionRecord, value: boolean): void {
-  if (props.readonly) return;
+  if (editsBlocked.value) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
-    display: { ...(nextConfigs[tool.name]?.display ?? {}), autoExpand: value }
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
+    display: { ...(nextConfigs[toolConfigKey(tool)]?.display ?? {}), autoExpand: value }
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function displayAutoExpandValue(tool: ToolDefinitionRecord): boolean {
-  const display = effectivePolicy.value?.toolConfigs?.[tool.name]?.display;
+  const display = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.display;
   if (display?.autoExpand !== undefined) return display.autoExpand;
   return tool.metadata?.defaultAutoExpand === true;
 }
 
 function updateDisplayAutoOpenDiffPreview(tool: ToolDefinitionRecord, value: boolean): void {
-  if (props.readonly || !supportsDiffPreview(tool)) return;
+  if (editsBlocked.value || !supportsDiffPreview(tool)) return;
   const nextConfigs = cloneToolConfigs();
-  nextConfigs[tool.name] = {
-    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
-    display: { ...(nextConfigs[tool.name]?.display ?? {}), autoOpenDiffPreview: value }
+  nextConfigs[toolConfigKey(tool)] = {
+    ...(nextConfigs[toolConfigKey(tool)] ?? { config: {} }),
+    display: { ...(nextConfigs[toolConfigKey(tool)]?.display ?? {}), autoOpenDiffPreview: value }
   };
-  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
+  store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
 function displayAutoOpenDiffPreviewValue(tool: ToolDefinitionRecord): boolean {
   if (!supportsDiffPreview(tool)) return false;
-  const display = effectivePolicy.value?.toolConfigs?.[tool.name]?.display;
+  const display = effectivePolicy.value?.toolConfigs?.[toolConfigKey(tool)]?.display;
   if (display?.autoOpenDiffPreview !== undefined) return display.autoOpenDiffPreview;
   return tool.metadata?.defaultAutoOpenDiffPreview === true;
 }
@@ -450,6 +523,12 @@ function sanitizeConfigForTool(tool: ToolDefinitionRecord, config: ToolConfigRec
 
 function supportsInlineField(field: ToolConfigFieldRecord): boolean {
   return field.type === 'stringList' || field.type === 'globList' || field.type === 'string' || field.type === 'number' || field.type === 'boolean' || field.type === 'enum';
+}
+
+function inlineFields(tool: ToolDefinitionRecord): ToolConfigFieldRecord[] {
+  return (tool.configSchema?.fields ?? []).filter((field) => supportsInlineField(field)
+    && !(tool.name === SUB_AGENT_TOOL_NAME && (field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY
+      || AGENT_COLLABORATION_CONFIG_KEYS.some((key) => key === field.key))));
 }
 
 function enumOptions(field: ToolConfigFieldRecord): SettingsDropdownOption[] {
@@ -489,6 +568,9 @@ function inputNumber(event: Event): number {
       </div>
     </header>
 
+    <p v-if="listError" class="tool-policy-error" role="alert">{{ listError.text }}</p>
+    <p v-if="sourceError" class="tool-policy-error" role="alert">{{ sourceError.text }}</p>
+
     <section v-if="interactionApprovalTools.length > 0" class="tool-policy-preset-section interaction-auto-approval" aria-label="无人值守审批">
       <div class="tool-policy-preset-heading">
         <span>无人值守审批 · Ask / Plan</span>
@@ -499,7 +581,7 @@ function inputNumber(event: Event): number {
           v-for="{ tool, field } in interactionApprovalTools"
           :key="tool.name"
           :model-value="configForTool(tool)[field.key] === true"
-          :disabled="readonly"
+          :disabled="editsBlocked"
           :aria-label="field.label"
           @update:model-value="updateScalarField(tool, field, $event)"
         >
@@ -526,7 +608,7 @@ function inputNumber(event: Event): number {
           class="tool-policy-preset-card"
           :class="{ 'is-selected': selectedPreset === option.value }"
           :aria-checked="selectedPreset === option.value"
-          :disabled="readonly"
+          :disabled="editsBlocked"
           @click="updatePolicyPreset(option.value)"
         >
           <span class="preset-card-indicator" aria-hidden="true"></span>
@@ -548,16 +630,23 @@ function inputNumber(event: Event): number {
           @update:model-value="updateSelectedToolScope"
         />
       </div>
-      <button type="button" :disabled="readonly || tools.length === 0" @click="enableAll">启用全部</button>
-      <button type="button" class="secondary" :disabled="readonly || tools.length === 0" @click="disableAll">禁用全部</button>
+      <button type="button" :disabled="listEditsBlocked || tools.length === 0" @click="enableAll">启用全部</button>
+      <button type="button" class="secondary" :disabled="listEditsBlocked || tools.length === 0" @click="disableAll">禁用全部</button>
       <button v-if="canRestoreDefault || isUsingToolDefaults" type="button" class="secondary" :disabled="!canRestoreDefault" @click="inheritDefaults">继承默认</button>
       <button v-else type="button" class="secondary" :disabled="!canRestoreInheritance" @click="restoreInheritance">恢复继承</button>
     </div>
 
+    <p v-if="childBoundNote" class="tool-policy-note">{{ childBoundNote }}</p>
+    <p v-if="switchGrantedToolNames.length > 0" class="tool-policy-note">{{ switchGrantedToolNames.join('、') }} 由{{ collaborationArea }}里的「跨对话协作」开关控制，不受这里的工具开关和工具列表影响。</p>
+    <p v-if="firstListExtras.length > 0" class="tool-policy-note">这里还没有单独保存工具列表。第一次改下方的工具开关会保存一份列表，并带上内置 Agent 列表里的 {{ firstListExtras.join('、') }}，以免这些 Agent 失去它们；没有自己列表的自定义 Agent 也会因此得到 {{ firstListExtras.join('、') }}。工作环境相关工具仍受工作环境策略限制，默认关闭。</p>
+
     <section v-if="mcpSourceGroups.length > 0" class="mcp-source-section" aria-label="MCP 工具来源">
       <div class="mcp-source-heading">
         <span>MCP 服务</span>
-        <small>关闭某个 MCP 服务会停用它提供的全部工具；展开单个工具后仍可调整执行确认与显示。</small>
+        <small>勾选服务会开启它的全部工具（包括以后新增的工具，单独停用的除外）；只勾选单个工具时只开启这些工具，服务以后新增的工具不会自动开启。关闭服务会停用它的全部工具；展开单个工具后仍可调整执行确认与显示。</small>
+        <small v-if="mcpSourcesDeniedHere">内置只读 Agent 和工作流默认不使用 MCP 工具，其它范围开启的服务不会带到这里；需要时在这里单独开启对应服务。</small>
+        <small v-if="mcpDenyingBuiltinsAbove.length > 0">此对话使用的内置只读{{ mcpDenyingBuiltinsAbove.join('和') }}不使用其它范围开启的 MCP 服务，在这里开启不会生效；需要时到该 Agent 或工作流的工具设置里开启对应服务。</small>
+        <small v-else-if="mcpSourceGroups.some((group) => isMcpSourceBlockedAbove(group.source.id) || group.tools.some(isMcpToolBlockedAbove))">不可勾选的服务或工具已被上层关闭，在这里开启不会生效。</small>
       </div>
       <div class="mcp-source-list">
         <article v-for="group in mcpSourceGroups" :key="group.source.id" class="mcp-source-item">
@@ -565,7 +654,8 @@ function inputNumber(event: Event): number {
             <LcCheckbox
               class="mcp-source-toggle"
               :model-value="isMcpSourceEnabled(group.source.id)"
-              :disabled="readonly || group.source.status !== 'connected' || group.tools.length === 0"
+              :aria-label="`MCP 服务 ${group.source.name}`"
+              :disabled="editsBlocked || group.source.status !== 'connected' || group.tools.length === 0 || isMcpSourceBlockedAbove(group.source.id)"
               @update:model-value="toggleMcpSource(group.source.id, $event)"
             >
               <span class="mcp-source-copy">
@@ -581,7 +671,7 @@ function inputNumber(event: Event): number {
               :key="tool.name"
               class="mcp-tool-chip"
               :model-value="isToolEnabled(tool)"
-              :disabled="readonly || !isMcpSourceEnabled(group.source.id)"
+              :disabled="listEditsBlocked || isMcpToolBlockedAbove(tool)"
               @update:model-value="toggleMcpSourceTool(tool, $event)"
             >
               <span>{{ tool.source?.originalToolName ?? tool.name }}</span>
@@ -603,8 +693,8 @@ function inputNumber(event: Event): number {
                   class="tool-enable-toggle"
                   size="sm"
                   :model-value="isToolEnabled(tool)"
-                  :disabled="readonly"
-                  :aria-label="`${isToolEnabled(tool) ? '禁用' : '启用'}工具 ${tool.name}`"
+                  :disabled="listEditsBlocked || isMcpToolBlockedAbove(tool) || isSwitchGranted(tool)"
+                  :aria-label="isSwitchGranted(tool) ? `工具 ${tool.name} 由跨对话协作开关控制` : `${isToolEnabled(tool) ? '禁用' : '启用'}工具 ${tool.name}`"
                   @update:model-value="setToolEnabled(tool, $event)"
                 />
               </div>
@@ -625,6 +715,7 @@ function inputNumber(event: Event): number {
                     <span class="tool-pill">{{ scopeLabel(toolScope(tool)) }}</span>
                     <span class="tool-pill">{{ executionLabel(tool) }}</span>
                     <span class="tool-pill">{{ riskLabel(tool) }}</span>
+                    <span v-if="isSwitchGranted(tool)" class="tool-pill">跨对话协作开关</span>
                   </span>
                 </span>
                 <span class="tool-config-toggle">
@@ -647,10 +738,12 @@ function inputNumber(event: Event): number {
                       <small>由工具定义提供，展开后查看完整说明。</small>
                     </div>
                     <p class="tool-definition-description">{{ toolDescription(tool) }}</p>
+                    <p v-if="tool.name === SUB_AGENT_TOOL_NAME" class="tool-definition-mode-note">子 Agent 深度、团队预算和跨对话协作开关已移至{{ collaborationArea }}。</p>
+                    <p v-if="isSwitchGranted(tool)" class="tool-definition-mode-note">此工具由{{ collaborationArea }}里的「跨对话协作」开关提供：开关开启时提供（工具列表不含 run_agent 时只提供列出和读取对话），这里不能单独启用或停用；可以在下方改为执行前确认。</p>
                     <p v-if="editModeShortLabel(tool)" class="tool-definition-mode-note">{{ editModeShortLabel(tool) }}</p>
                   </div>
 
-                  <template v-if="isToolEnabled(tool)">
+                  <template v-if="isToolEnabled(tool) || isSwitchGranted(tool)">
                     <div class="tool-config-group tool-config-permissions">
                       <div class="tool-config-group-heading">
                         <span class="tool-config-group-title">权限与显示</span>
@@ -661,7 +754,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': toolGateValue(tool, 'autoApproveExecution') }"
                           :model-value="toolGateValue(tool, 'autoApproveExecution')"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateGateSetting(tool, 'autoApproveExecution', $event)"
                         >
                           <span class="permission-copy">
@@ -674,7 +767,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': toolGateValue(tool, 'autoApplyChange') }"
                           :model-value="toolGateValue(tool, 'autoApplyChange')"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateGateSetting(tool, 'autoApplyChange', $event)"
                         >
                           <span class="permission-copy">
@@ -687,7 +780,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': displayAutoOpenDiffPreviewValue(tool) }"
                           :model-value="displayAutoOpenDiffPreviewValue(tool)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateDisplayAutoOpenDiffPreview(tool, $event)"
                         >
                           <span class="permission-copy">
@@ -699,7 +792,7 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': toolGateValue(tool, 'autoSubmitResult') }"
                           :model-value="toolGateValue(tool, 'autoSubmitResult')"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateGateSetting(tool, 'autoSubmitResult', $event)"
                         >
                           <span class="permission-copy">
@@ -711,19 +804,19 @@ function inputNumber(event: Event): number {
                           class="tool-permission-card"
                           :class="{ 'is-enabled': nativeAsyncValue(tool) }"
                           :model-value="nativeAsyncValue(tool)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateNativeAsync(tool, $event)"
                         >
                           <span class="permission-copy">
                             <span class="permission-title">原生异步执行</span>
-                            <span class="permission-desc">仅在 Astra 原生渠道开启「原生异步工具」后生效：该工具可异步执行，结果稍后按原始调用回传；不改变上方的执行审批与调度设置。</span>
+                            <span class="permission-desc">仅在 GPT-6（Astra、Sol、Luna）原生渠道开启「原生异步工具」后生效：该工具可异步执行，结果稍后按原始调用回传；不改变上方的执行审批与调度设置。</span>
                           </span>
                         </LcCheckbox>
                         <LcCheckbox
                           class="tool-permission-card"
                           :class="{ 'is-enabled': displayAutoExpandValue(tool) }"
                           :model-value="displayAutoExpandValue(tool)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateDisplayAutoExpand(tool, $event)"
                         >
                           <span class="permission-copy">
@@ -747,7 +840,7 @@ function inputNumber(event: Event): number {
                             max="600"
                             step="1"
                             :value="autoApplyChangeDelayValue(tool)"
-                            :readonly="readonly"
+                            :readonly="editsBlocked"
                             @change="updateAutoApplyChangeDelay(tool, inputNumber($event))"
                           />
                           <span>秒</span>
@@ -755,26 +848,26 @@ function inputNumber(event: Event): number {
                       </label>
                     </div>
 
-                  <div v-if="tool.configSchema?.fields?.length" class="tool-config-group tool-specific-config">
+                  <div v-if="inlineFields(tool).length" class="tool-config-group tool-specific-config">
                     <div class="tool-config-group-heading">
                       <span class="tool-config-group-title">工具配置</span>
                       <small>这些配置由工具定义提供，并随当前层级的策略保存。</small>
                     </div>
                     <div class="tool-config-fields">
-                      <label v-for="field in tool.configSchema.fields.filter(supportsInlineField)" :key="field.key" class="tool-config-field">
+                      <label v-for="field in inlineFields(tool)" :key="field.key" class="tool-config-field">
                         <span>{{ field.label }}</span>
                         <textarea
                           v-if="field.type === 'stringList' || field.type === 'globList'"
                           :value="fieldListText(tool, field)"
                           :placeholder="field.placeholder"
-                          :readonly="readonly"
+                          :readonly="editsBlocked"
                           rows="3"
                           @change="updateStringListField(tool, field, inputValue($event))"
                         ></textarea>
                         <input
                           v-else-if="field.type === 'number'"
                           :value="configForTool(tool)[field.key] ?? field.defaultValue ?? 0"
-                          :readonly="readonly"
+                          :readonly="editsBlocked"
                           type="number"
                           @change="updateScalarField(tool, field, inputNumber($event))"
                         />
@@ -782,7 +875,7 @@ function inputNumber(event: Event): number {
                           v-else-if="field.type === 'boolean'"
                           class="tool-config-inline-checkbox"
                           :model-value="Boolean(configForTool(tool)[field.key] ?? field.defaultValue)"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           :aria-label="field.label"
                           @update:model-value="updateScalarField(tool, field, $event)"
                         />
@@ -791,13 +884,13 @@ function inputNumber(event: Event): number {
                           :model-value="enumValue(tool, field)"
                           :options="enumOptions(field)"
                           :title="field.label"
-                          :disabled="readonly"
+                          :disabled="editsBlocked"
                           @update:model-value="updateScalarField(tool, field, $event)"
                         />
                         <input
                           v-else
                           :value="String(configForTool(tool)[field.key] ?? field.defaultValue ?? '')"
-                          :readonly="readonly"
+                          :readonly="editsBlocked"
                           type="text"
                           @change="updateScalarField(tool, field, inputValue($event))"
                         />
@@ -905,7 +998,18 @@ function inputNumber(event: Event): number {
   padding-block: var(--space-1);
 }
 
-.interaction-auto-approval-hint {
+.tool-policy-error {
+  margin: 0;
+  border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-panel-border));
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  color: var(--vscode-errorForeground);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
+.interaction-auto-approval-hint,
+.tool-policy-note {
   margin: 0;
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-xs);

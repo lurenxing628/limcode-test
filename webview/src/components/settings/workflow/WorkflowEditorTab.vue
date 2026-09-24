@@ -12,12 +12,14 @@ import type {
   WorkflowIconKey,
   WorkflowRecord
 } from '@shared/protocol';
+import { sourceConfigsProblem } from '@shared/toolPolicyResolution';
 import { useWorkflowStore, workflowRecordToPlain } from '@webview/stores/useWorkflowStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import AdvancedScrollbar from '../../navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '../../ui/ConfirmPanel.vue';
 import InputPanel from '../../ui/InputPanel.vue';
+import AgentCollaborationSettings from '../agent/AgentCollaborationSettings.vue';
 
 const workflowStore = useWorkflowStore();
 const clientState = useClientStateStore();
@@ -246,12 +248,15 @@ function isValidPlanReviewPolicy(policy: PlanReviewPolicyRecord): boolean {
 function isValidToolPolicy(policy: ToolPolicyRecord): boolean {
   if (typeof policy.id !== 'string' || !policy.id.trim()) return setRawError('toolPolicies[0].id 必须是非空字符串。');
   if (typeof policy.name !== 'string' || !policy.name.trim()) return setRawError('toolPolicies[0].name 必须是非空字符串。');
-  if (!Array.isArray(policy.allowedTools) || !policy.allowedTools.every((tool) => typeof tool === 'string' && tool.trim())) {
-    return setRawError('toolPolicies[0].allowedTools 必须是非空字符串数组。');
+  if (policy.allowedTools !== undefined
+    && (!Array.isArray(policy.allowedTools) || !policy.allowedTools.every((tool) => typeof tool === 'string' && tool.trim()))) {
+    return setRawError('toolPolicies[0].allowedTools 省略时不单独限制工具；填写时必须是非空字符串数组。');
   }
   if (policy.preset !== undefined && policy.preset !== 'inherit' && policy.preset !== 'custom' && policy.preset !== 'yolo') {
     return setRawError('toolPolicies[0].preset 只能是 inherit / custom / yolo。');
   }
+  const sourceProblem = sourceConfigsProblem(policy.sourceConfigs);
+  if (sourceProblem) return setRawError(`toolPolicies[0].${sourceProblem}`);
   return true;
 }
 
@@ -286,7 +291,7 @@ function saveWorkflowToolPolicy(parsed: WorkflowRawData, previous: WorkflowRawDa
       scopeKind: 'workflow',
       scopeId: parsed.workflow.id,
       name: policy.name,
-      allowedTools: [...policy.allowedTools],
+      ...(policy.allowedTools ? { allowedTools: [...policy.allowedTools] } : {}),
       ...(policy.preset ? { preset: policy.preset } : {}),
       ...(policy.toolConfigs ? { toolConfigs: clonePlain(policy.toolConfigs) } : {}),
       ...(policy.sourceConfigs ? { sourceConfigs: clonePlain(policy.sourceConfigs) } : {})
@@ -410,6 +415,9 @@ function confirmDeleteWorkflow(): void {
               </button>
             </div>
           </div>
+
+          <AgentCollaborationSettings scope-kind="workflow" :scope-id="selectedWorkflow.id" title="工作流 Agent 协作" :readonly="isDirty" />
+          <p v-if="isDirty" class="workflow-help">先保存或重置下方 JSON 修改，再调整 Agent 协作设置。</p>
 
           <textarea
             v-model="rawText"

@@ -1,13 +1,9 @@
 import assert from 'node:assert/strict';
-import path from 'node:path';
 import test from 'node:test';
-import { createServer } from 'vite';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 test('压缩最长时间输入块位于阈值之后，手动压缩也可设置', async () => {
-  const server = await createServer({
-    configFile: path.join(process.cwd(), 'vite.config.ts'),
-    server: { middlewareMode: true }, appType: 'custom', logLevel: 'error'
-  });
+  const server = await createWebviewSsrServer();
   try {
     const { default: editor } = await server.ssrLoadModule('/src/components/settings/global/LlmCompressionSettingsEditor.vue');
     const { createSSRApp } = await import('vue');
@@ -31,10 +27,7 @@ test('压缩最长时间输入块位于阈值之后，手动压缩也可设置',
 });
 
 test('渠道和模型的压缩时长独立保存，序列化与重新加载不丢值', async (context) => {
-  const server = await createServer({
-    configFile: path.join(process.cwd(), 'vite.config.ts'),
-    server: { middlewareMode: true }, appType: 'custom', logLevel: 'error'
-  });
+  const server = await createWebviewSsrServer();
   const previousWindow = globalThis.window;
   globalThis.window = {
     addEventListener() {}, removeEventListener() {},

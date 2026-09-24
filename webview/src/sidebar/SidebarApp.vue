@@ -91,7 +91,7 @@ const favoritesViewActive = ref(false);
 const projectFolders = ref<ProjectFolderCandidateRecord[]>([]);
 const activeScopeKind = ref<SidebarHistoryScopeKind>('currentProject');
 const activeProjectFolderUri = ref<string | undefined>();
-const currentProjectScope = ref<ConversationHistoryScope>({ kind: 'unbound' });
+const currentProjectScope = ref<ConversationHistoryScope>({ kind: 'all' });
 const openConversations = ref<OpenConversationPanelRecord[]>([]);
 const pageInfo = ref<ConversationHistoryPageInfo>();
 const scopePageIndex = ref(0);
@@ -134,13 +134,14 @@ const historyCountText = computed(() => {
   const page = pageInfo.value ? `第 ${pageInfo.value.pageIndex + 1} 页` : "当前页";
   return `${total} 个对话 · ${page}`;
 });
-const currentScopeLabel = computed(() => currentProjectScope.value.kind === 'unbound' ? '未绑定' : '当前项目');
+const currentScopeLabel = computed(() => currentProjectScope.value.kind === 'all' ? '全部历史'
+  : currentProjectScope.value.kind === 'unbound' ? '未绑定' : '当前项目');
 const activeScopeKey = computed(() => favoritesViewActive.value ? 'favorites' : scopeOptionKey(activeScopeKind.value, activeProjectFolderUri.value));
 const scopeOptions = computed<ScopeOption[]>(() => {
   const options: ScopeOption[] = [
     { key: 'favorites', label: '⭐ 收藏', scopeKind: 'all' },
     { key: 'currentProject', label: currentScopeLabel.value, scopeKind: 'currentProject' },
-    { key: 'all', label: '工作区全部', scopeKind: 'all' },
+    { key: 'all', label: '全部历史', scopeKind: 'all' },
     { key: 'unbound', label: '未绑定', scopeKind: 'unbound' }
   ];
 

@@ -873,7 +873,7 @@ test('Gemini thinking capability follows model-specific official level sets', ()
   assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3.7-flash'), {
     kind: 'thinkingLevel',
     levels: ['low', 'medium', 'high'],
-    defaultLevel: 'high'
+    defaultLevel: 'medium'
   });
   assert.deepEqual(geminiThinkingCapabilityForModel('models/gemini-3-flash-preview').levels, [
     'minimal', 'low', 'medium', 'high'
@@ -889,11 +889,11 @@ test('Gemini thinking capability follows model-specific official level sets', ()
   assert.equal(geminiThinkingCapabilityForModel('gemini-2.5-pro').kind, 'thinkingBudget');
 });
 
-test('Gemini 3.7 parameter definitions expose only low, medium, high with high default', () => {
+test('Gemini 3.7 parameter definitions expose only low, medium, high with medium documented default', () => {
   const definitions = parameterDefinitionsForProvider('gemini', 'gemini-3.7-flash');
   const level = definitions.find((definition) => definition.key === 'thinkingLevel');
   assert.ok(level);
-  assert.equal(level.defaultValue, 'high');
+  assert.equal(level.defaultValue, 'medium');
   assert.deepEqual(level.options.map((option) => option.value), ['low', 'medium', 'high']);
   assert.equal(definitions.some((definition) => definition.key === 'thinkingBudget'), false);
   assert.equal(level.options.some((option) => ['minimal', 'xhigh', 'max'].includes(option.value)), false);
@@ -913,15 +913,12 @@ test('Gemini explicit supported level survives provider config normalization', (
   });
 });
 
-test('Gemini 3.7 dry-run defaults to high thinking and thought summaries', async () => {
+test('Gemini 3.7 dry-run omits thinking controls when the user selects provider defaults', async () => {
   const thinkingConfig = await dryRunGeminiThinkingConfig(
     geminiProviderConfig(),
     'request-gemini-37-default-thinking'
   );
-  assert.deepEqual(thinkingConfig, {
-    thinkingLevel: 'high',
-    includeThoughts: true
-  });
+  assert.equal(thinkingConfig, undefined);
 });
 
 test('Gemini 3.7 preserves every explicitly supported thinking level', async () => {
@@ -934,19 +931,16 @@ test('Gemini 3.7 preserves every explicitly supported thinking level', async () 
   }
 });
 
-test('Gemini 3.7 replaces unsupported levels and legacy numeric budgets with high', async () => {
+test('Gemini 3.7 rejects unsupported explicit levels and numeric budgets instead of inventing high', async () => {
   for (const [label, configured] of [
     ['minimal', { thinkingLevel: 'minimal' }],
     ['xhigh', { thinkingLevel: 'xhigh' }],
     ['max', { thinkingLevel: 'max' }],
     ['budget', { thinkingBudget: 10_000 }]
   ]) {
-    const thinkingConfig = await dryRunGeminiThinkingConfig(geminiProviderConfig({
+    await assert.rejects(dryRunGeminiThinkingConfig(geminiProviderConfig({
       generationConfig: { thinkingConfig: configured }
-    }), `request-gemini-37-invalid-${label}`);
-    assert.equal(thinkingConfig.thinkingLevel, 'high');
-    assert.equal(thinkingConfig.includeThoughts, true);
-    assert.equal('thinkingBudget' in thinkingConfig, false);
+    }), `request-gemini-37-invalid-${label}`), /Unsupported Gemini thinking configuration/);
   }
 });
 
@@ -955,8 +949,7 @@ test('Gemini 2.5 keeps numeric budget and omits thinkingLevel at the request bou
     model: 'gemini-2.5-pro',
     generationConfig: {
       thinkingConfig: {
-        thinkingBudget: 4_096,
-        thinkingLevel: 'high'
+        thinkingBudget: 4_096
       }
     }
   }), 'request-gemini-25-budget');
@@ -1049,9 +1042,9 @@ test('OpenAI Responses compact dry-run stays on the HTTP compact endpoint when c
   const method = {
     id: 'compression-openai-responses',
     name: 'Responses Compact',
-    kind: 'openai_responses_compact',
+    kind: 'provider_native',
     trigger: { mode: 'manual' },
-    openaiResponsesCompact: { model: 'gpt-test' },
+    providerNative: { model: 'gpt-test' },
     createdAt: 1,
     updatedAt: 1
   };

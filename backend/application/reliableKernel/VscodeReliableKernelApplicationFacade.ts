@@ -8,12 +8,12 @@ import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/
 import { RUNTIME_KERNEL_EPOCH } from '../../reliableKernel/contracts';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
-import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
-import { readNativeSteeringInFlight } from '../../reliableKernel/nativeSteering';
-import { ForkContextCandidateProbe, isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
 import {
   createVscodeRootAuthority,
+  completeVscodeRuntimeDataSetSelection,
+  assertConfigurationRootRuntimesOffline,
+  selectVscodeRuntimeDataSet,
   resolveVscodeWorkspaceRuntimePlacement,
   resolveVscodeWorkspaceRuntimeScope,
   type VscodeWorkspaceRuntimePlacement
@@ -37,6 +37,7 @@ import type {
   ConversationHistoryPageRecord,
   ConversationHistoryScope,
   ConversationOriginLinkRecord,
+  ExtensionToWebviewMessage,
   GlobalSettingsSection,
   ProjectFolderCandidateRecord,
   SidebarConversationHistoryEntry,
@@ -56,6 +57,7 @@ import {
   archiveCurrentRuntimeRootForReset
 } from './VscodeReliableKernelCutoverCoordinator';
 import { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
+import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
   InteractionAttentionNotifier,
@@ -121,7 +123,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.commandRouter = new VscodeReliableKernelCommandRouter(product, {
       broadcast: (message) => this.broadcast(message),
       postToConversation: (conversationId, message) =>
-        this.product.application.webviewFeed.postToConversation(conversationId, message as Record<string, unknown>),
+        this.product.application.webviewFeed.postToConversation(conversationId, { ...message }),
       createConversation: (options) => this.createConversation(options),
       forkConversation: (request) => this.forkConversation(request),
       conversationIdForClient: (clientId) => this.webviewConversationIds.get(clientId)
@@ -156,6 +158,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   ): Promise<VscodeReliableKernelApplicationFacade> {
     await loadCommittedGlobalStatus(context);
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
+    let facade: VscodeReliableKernelApplicationFacade | undefined;
     // The data-root admission serializes placement/cutover across every workspace scope sharing
     // this configuration root. It is acquired before placement resolution and the scope
     // maintenance claim nests inside it; both lock orders (open and reset) agree.
@@ -175,20 +178,23 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           authority,
           runtimePlacement.runtimeScopeRootPath
         ).ensureCurrentRoot();
-        if (rootPreparation.epochMigrationBackupPath) {
-          console.warn(
-            `[LimCode] 已把第 ${rootPreparation.epochMigratedFrom} 代运行数据无损升级到 `
-            + `第 ${RUNTIME_KERNEL_EPOCH} 代，升级前数据库备份位于 ${rootPreparation.epochMigrationBackupPath}。`
-          );
-        } else if (rootPreparation.epochResetBackupPath) {
+        if (rootPreparation.epochResetBackupPath) {
           console.warn(
             `[LimCode] 已把第 ${rootPreparation.epochResetFrom} 代运行数据归档到 `
             + `${rootPreparation.epochResetBackupPath}，并创建第 ${RUNTIME_KERNEL_EPOCH} 代运行数据。`
           );
         }
-        return VscodeReliableKernelProductRuntime.open(context, { authority, runtimePlacement });
+        await completeVscodeRuntimeDataSetSelection(getPaths());
+        return VscodeReliableKernelProductRuntime.open(context, {
+          authority, runtimePlacement,
+          onConfigurationChanged: async () => {
+            await facade?.commandRouter.refreshConfiguration();
+            await facade?.refreshConversationHistory();
+          }
+        });
       });
-      return new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
+      facade = new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
+      return facade;
     });
   }
 
@@ -261,239 +267,19 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public async forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult> {
     this.requireOpen();
-    const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
-    // The source Conversation DAG/configuration is read and copied under its ownership pin so a
-    // peer Host cannot mutate or delete it mid-fork.
-    return this.product.application.database.conversationOwners.run(sourceConversationId, () =>
-      this.forkConversationUnderOwnership(request)
-    );
+    const result = await this.conversationLifecycle().fork({
+      sourceConversationId: request.sourceConversationId,
+      messageId: request.messageId,
+      expectedRevisionId: request.expectedRevisionId,
+      commandId: requireText(request.command?.commandId, 'Conversation fork commandId')
+    });
+    await this.refreshConversationHistory();
+    return result;
   }
 
-  private async forkConversationUnderOwnership(request: ConversationForkPayload): Promise<ConversationForkResult> {
-    const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
-    const messageId = requireText(request.messageId, 'Conversation fork messageId');
-    const expectedRevisionId = requireText(request.expectedRevisionId, 'Conversation fork expectedRevisionId');
-    const commandId = requireText(request.command?.commandId, 'Conversation fork commandId');
-    const reuseKey = `conversation-fork-command:${commandId}`;
-
-    // Replay is resolved from the immutable branch/reuse facts before consulting today's mutable
-    // MessageCurrentRevisionLink. A lost result therefore remains replayable even if the source is
-    // edited after the original fork committed.
-    const existingReuse = await this.list('ConversationReuseLink', { reuse_key: reuseKey }, 2);
-    if (existingReuse.length > 1) throw new Error('Conversation fork command identity is not unique.');
-    if (existingReuse.length === 1) {
-      const conversationId = requireText(existingReuse[0].conversation_id, 'ConversationReuseLink.conversation_id');
-      const branches = await this.list('ConversationBranchLink', { target_conversation_id: conversationId }, 2);
-      if (
-        branches.length !== 1
-        || branches[0].source_conversation_id !== sourceConversationId
-        || branches[0].source_message_revision_id !== expectedRevisionId
-      ) throw new Error('Conversation fork command was replayed with different source facts.');
-      const revision = await this.requireRow('MessageRevision', expectedRevisionId);
-      if (revision.message_id !== messageId) {
-        throw new Error('Conversation fork command was replayed with a different source Message.');
-      }
-      // The replayed branch target may be owned by a peer window; its configuration copy runs
-      // under the target ownership pin exactly like a fresh fork.
-      await this.product.application.database.conversationOwners.run(conversationId, () =>
-        this.product.configuration.mutations.copyConversationConfiguration(
-          sourceConversationId,
-          conversationId
-        )
-      );
-      return { conversationId, deduplicated: true };
-    }
-
-    await this.requireRow('Conversation', sourceConversationId);
-    const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
-    if (currentLinks.length !== 1) throw new Error('Fork 源 Message 缺少唯一当前 Revision。');
-    const revisionId = requireText(currentLinks[0].revision_id, 'MessageCurrentRevisionLink.revision_id');
-    if (revisionId !== expectedRevisionId) throw new Error('Fork 源 Message Revision 已变化，请基于当前内容重新创建分支。');
-    const memberships = await this.list('MessagePartOfConversation', {
-      conversation_id: sourceConversationId,
-      message_id: messageId
-    }, 2);
-    if (memberships.length !== 1) throw new Error('Fork 源 Message 不属于当前 Conversation。');
-    const nativeSteering = await readNativeSteeringInFlight(this.product.application.database, sourceConversationId);
-    if (nativeSteering.length > 0) {
-      throw new Error('当前对话仍有未收口的原生转向，请等待完成后再创建分支。');
-    }
-    const nativeWork = await this.product.application.runtime.effects.listNativePendingWork({
-      conversationId: sourceConversationId
-    });
-    for (const work of nativeWork) {
-      if (work.turnActive || !work.settled || !work.callContextSegmentId || work.resultContextSegmentId) continue;
-      await this.product.application.context.appendNativeToolResult({
-        conversationId: sourceConversationId,
-        toolCallId: work.toolCallId,
-        toolModelResultId: requireText(work.toolModelResultId, 'NativePendingToolCall.toolModelResultId')
-      });
-    }
-    await this.product.application.runtime.effects.assertNativeWorkSettledForConversation(sourceConversationId);
-    const sources = await this.list('ContextSegmentSource', {
-      source_kind: 'message_revision',
-      source_id: revisionId
-    }, 10);
-    const sourceSegmentIds = new Set(sources.map((row) => requireText(row.segment_id, 'ContextSegmentSource.segment_id')));
-    const revision = await this.requireRow('MessageRevision', revisionId);
-    const requiredToolContext: Array<{ callSegmentId: string; resultSegmentId: string; native: boolean }> = [];
-    let nativeMessageProjection = false;
-    if (revision.role === 'model') {
-      const requestLinks = await this.list('ModelRequestMessageLink', { message_id: messageId }, 2);
-      if (requestLinks.length === 1) {
-        const request = await this.requireRow('ModelRequest', requireText(requestLinks[0].model_request_id, 'ModelRequestMessageLink.model_request_id'));
-        if (isNativeRequest(request)) {
-          if (request.status !== 'terminal') throw new Error('原生模型消息尚未结束，请等待完整消息收口后再创建分支。');
-          nativeMessageProjection = true;
-          for (const item of await readNativeMessageContextRevisions(this.product.application.database, messageId)) {
-            for (const source of item.sources) {
-              sourceSegmentIds.add(requireText(source.segment_id, 'ContextSegmentSource.segment_id'));
-            }
-          }
-        }
-      }
-      const callLinks = (await this.product.application.database.snapshotAll(
-        DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
-          where: { message_id: messageId },
-          orderBy: { column: 'id', direction: 'asc' },
-          limit: 1000
-        })
-      )).snapshot.sort((left, right) =>
-        compareBigInt(left.provider_ordinal, right.provider_ordinal) || String(left.id).localeCompare(String(right.id))
-      );
-      for (const callLink of callLinks) {
-        const toolCallId = requireText(callLink.tool_call_id, 'ToolCallSourceLink.tool_call_id');
-        const [callSources, results, nativeAdmission] = await Promise.all([
-          this.list('ContextSegmentSource', { source_kind: 'tool_call', source_id: toolCallId }, 2),
-          this.list('ToolModelResult', { tool_call_id: toolCallId }, 2),
-          this.product.application.runtime.effects.readNativeAdmission(toolCallId)
-        ]);
-        if (callSources.length !== 1 || results.length !== 1) {
-          throw new Error('Fork 源模型消息仍有未闭合工具调用，请等待工具完成后再创建分支。');
-        }
-        const resultSources = await this.list('ContextSegmentSource', {
-          source_kind: 'tool_model_result',
-          source_id: requireText(results[0].id, 'ToolModelResult.id')
-        }, 2);
-        if (resultSources.length !== 1
-          || compareBigInt(callSources[0].source_revision, resultSources[0].source_revision) !== 0) {
-          throw new Error('Fork 源工具结果尚未进入对应的 Context，请等待结果收口。');
-        }
-        const callSegmentId = requireText(callSources[0].segment_id, 'ContextSegmentSource.segment_id');
-        const resultSegmentId = requireText(resultSources[0].segment_id, 'ContextSegmentSource.segment_id');
-        if (!nativeAdmission && callSegmentId !== resultSegmentId) {
-          throw new Error('Fork 源同步工具调用与结果没有组成原子 Context 工具对。');
-        }
-        requiredToolContext.push({ callSegmentId, resultSegmentId, native: nativeAdmission !== undefined });
-        if (nativeAdmission) sourceSegmentIds.add(callSegmentId);
-      }
-    }
-    if (sourceSegmentIds.size === 0) throw new Error('Fork 源 MessageRevision 尚未进入 Context DAG。');
-    const roots = (await this.product.application.database.snapshotAll(
-      DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').list({
-        where: { conversation_id: sourceConversationId },
-        orderBy: { column: 'id', direction: 'asc' },
-        limit: 1000
-      })
-    )).snapshot.sort((left, right) =>
-      compareBigInt(left.root_seq, right.root_seq) || String(left.id).localeCompare(String(right.id))
-    );
-    let sourceRootId: string | undefined;
-    let sourceContextEndSegmentId: string | undefined;
-    let sourceContextSegmentIds: string[] | undefined;
-    const nativeContext = nativeMessageProjection || requiredToolContext.some((tool) => tool.native);
-    // Prefer the newest context containing this boundary: an edit can leave the same assistant
-    // revision in an older root whose preceding user revisions no longer match the transcript.
-    const candidates = new ForkContextCandidateProbe(this.product.application.database, sourceSegmentIds);
-    for (const root of [...roots].reverse()) {
-      if (!await candidates.mayContain(root)) continue;
-      const rootId = requireText(root.id, 'ContextSequenceRoot.id');
-      const structure = await this.product.application.context.materializeStructure(rootId);
-      const segmentIndexes = new Map(structure.records.map((record, index) => [String(record.segment.id), index]));
-      let messageIndex = -1;
-      for (const segmentId of sourceSegmentIds) {
-        const index = segmentIndexes.get(segmentId);
-        if (index === undefined) {
-          messageIndex = -1;
-          break;
-        }
-        messageIndex = Math.max(messageIndex, index);
-      }
-      let previousIndex = messageIndex;
-      const containsClosedToolSuffix = messageIndex >= 0 && requiredToolContext.every((tool) => {
-        const callIndex = segmentIndexes.get(tool.callSegmentId) ?? -1;
-        const resultIndex = segmentIndexes.get(tool.resultSegmentId) ?? -1;
-        if (nativeContext) {
-          if (callIndex < 0 || resultIndex < callIndex) return false;
-          previousIndex = Math.max(previousIndex, resultIndex);
-          return true;
-        }
-        if (callIndex <= previousIndex || resultIndex !== callIndex) return false;
-        previousIndex = resultIndex;
-        return true;
-      });
-      if (messageIndex >= 0 && containsClosedToolSuffix) {
-        sourceRootId = rootId;
-        sourceContextEndSegmentId = requireText(structure.records[previousIndex].segment.id, 'ContextSegment.id');
-        sourceContextSegmentIds = structure.records.slice(0, previousIndex + 1).map((record) =>
-          requireText(record.segment.id, 'ContextSegment.id')
-        );
-        break;
-      }
-    }
-    if (!sourceRootId || !sourceContextEndSegmentId || !sourceContextSegmentIds) {
-      throw new Error('无法定位 Fork 源 MessageRevision 对应的 Context root。');
-    }
-    const sourceAttachmentCatalogState = await this.product.application.modelProvider.projectAttachmentCatalogState(
-      sourceConversationId,
-      sourceContextSegmentIds.map((segmentId) => ({ segmentId }))
-    );
-    await this.product.application.modelProvider.ensureAttachmentHandles(
-      sourceConversationId,
-      sourceAttachmentCatalogState.catalog
-    );
-
-    const turnLinks = (await this.product.application.database.snapshotAll(
-      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({
-        where: { message_id: messageId },
-        orderBy: { column: 'id', direction: 'asc' },
-        limit: 1000
-      })
-    )).snapshot;
-    const sourceTurnIds = [...new Set(turnLinks.map((row) => String(row.turn_id)))];
-    const agentLinks = await this.list('AgentConversationLink', {
-      conversation_id: sourceConversationId,
-      role: 'default'
-    }, 2);
-    if (agentLinks.length !== 1) throw new Error('Fork 源 Conversation 缺少唯一默认 Agent 关系。');
-    // The branch target is claimed BEFORE its first write: this Host owns the new Conversation
-    // through the fork transaction and the configuration copy. The id is derived from the fork
-    // command identity so concurrent same-command calls deterministically claim the same target
-    // (and a peer's claim refuses busy) instead of forking divergent targets. The opening view
-    // retains it via claim-before-open; without a view the owner idle-releases after this run.
-    const targetConversationId = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
-    const result = await this.product.application.database.conversationOwners.run(targetConversationId, async () => {
-      const forkResult = await this.product.application.runtime.conversationFork.fork({
-        idempotencyKey: commandId,
-        reuseKey,
-        sourceConversationId,
-        sourceContextRootId: sourceRootId,
-        sourceContextEndSegmentId,
-        sourceMessageRevisionId: revisionId,
-        expectedCurrentMessageRevisionId: revisionId,
-        ...(sourceTurnIds.length === 1 ? { sourceTurnId: sourceTurnIds[0] } : {}),
-        targetConversationId,
-        targetTitle: `${this.getConversationDisplayTitle(sourceConversationId)} 分支`,
-        targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
-      });
-      await this.product.configuration.mutations.copyConversationConfiguration(
-        sourceConversationId,
-        forkResult.targetConversationId
-      );
-      await this.refreshConversationHistory();
-      return forkResult;
-    });
-    return { conversationId: result.targetConversationId, deduplicated: result.deduplicated };
+  /** The stateless lifecycle service shared with model tools; it never posts to a webview. */
+  private conversationLifecycle(): ReliableConversationLifecycle {
+    return new ReliableConversationLifecycle(this.product);
   }
 
   public waitUntilHydrated(): Promise<void> {
@@ -643,7 +429,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public getCurrentProjectHistoryScope(): ConversationHistoryScope {
     const folder = this.currentWorkspaceFolder();
-    return folder ? { kind: 'project', folderUri: folder.uri.toString() } : { kind: 'unbound' };
+    return folder ? { kind: 'project', folderUri: folder.uri.toString() } : { kind: 'all' };
   }
 
   public getProjectFolderCandidates(): ProjectFolderCandidateRecord[] {
@@ -717,6 +503,17 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         turns: await this.list('Turn', { conversation_id: conversationId }, 200)
       } : {})
     };
+  }
+
+  /** Native command confirmation precedes this offline switch; callers reload the window after it. */
+  public async selectRuntimeDataSet(id: string): Promise<void> {
+    this.requireOpen();
+    const paths = this.getPaths();
+    await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
+      await assertConfigurationRootRuntimesOffline(paths.globalStoragePath, this.product.application.database.hostBootId);
+      await this.dispose();
+      await selectVscodeRuntimeDataSet(this.getPaths(), id);
+    });
   }
 
   public attachWebview(webview: vscode.Webview, meta: WebviewClientMeta = { kind: 'unknown' }): BridgeClientId {
@@ -1151,7 +948,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return requireRows(snapshot.snapshot[0], `${domain} list`);
   }
 
-  private broadcast(message: unknown): void {
+  /** Every broadcast is a bridge message of the shared protocol, including its channel. */
+  private broadcast(message: ExtensionToWebviewMessage): void {
     const plain = toStructuredClonePlainData(message, 'reliable configuration broadcast');
     for (const webview of this.webviews.values()) {
       void webview.postMessage(plain).then(undefined, (error) => {
@@ -1193,12 +991,6 @@ function requireDecimal(value: unknown, label: string): string {
     throw new TypeError(`${label} 必须是正十进制整数。`);
   }
   return value;
-}
-
-function compareBigInt(left: unknown, right: unknown): number {
-  const leftValue = typeof left === 'bigint' ? left : BigInt(String(left));
-  const rightValue = typeof right === 'bigint' ? right : BigInt(String(right));
-  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
 }
 
 function timestampMs(value: unknown): number {

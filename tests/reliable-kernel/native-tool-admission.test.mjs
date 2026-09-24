@@ -323,6 +323,8 @@ function nativeItemCheckpoint(entry, overrides = {}) {
     responseId: 'resp-1',
     toolName: entry.toolName,
     arguments: entry.arguments,
+    resolvedArguments: entry.arguments,
+    modelHandleCatalog: { entries: [] },
     providerCallId: entry.providerCallId,
     providerOrdinal: entry.providerOrdinal,
     async: true,
@@ -741,6 +743,137 @@ test('no-lease closure appends settled result occurrences and ordinary pair vali
   });
 });
 
+test('a fork moves a late native result behind its cut and only checks its own retained calls', async () => {
+  await withNativeApp('native-fork-late-result', async (app, conversationId, turnId) => {
+    const effects = app.runtime.effects;
+    const context = app.context;
+    const firstFence = await leaseFence(app, conversationId);
+    const firstRequest = await createStreamingRequest(app, turnId, 'late-req-1');
+    const firstMessage = await insertAssistantMessage(app, firstRequest.modelRequestId, 'late-req-1');
+    const late = nativeEntry('tool-call-late-a');
+    await persistNativeCheckpoint(app, firstRequest, 1, 'native_tool_call', nativeItemCheckpoint(late));
+    await effects.createToolCallBatch({
+      ...batchInput(turnId, firstRequest.modelRequestId, firstMessage, late, 'late-a'),
+      streamIdentity: { ...firstRequest.identity, streamSeq: '1' }
+    });
+    await kernel.runWithExecutionLeaseFence(firstFence, () => context.appendNativeToolCall({ conversationId, toolCallId: late.toolCallId }));
+    // The call settles with its Turn, but its result occurrence has not reached the Context yet.
+    await effects.settleWithoutEffect({
+      source: { kind: 'internal', key: 'late-settle-a' }, toolCallId: late.toolCallId,
+      status: 'succeeded', detail: { output: 'late native result body' }
+    });
+    await firstRequest.controls.onEvent({ kind: 'completed', streamSeq: '90', content: modelOutput('first response') });
+    await kernel.runWithExecutionLeaseFence(firstFence, () => app.turns.terminal({
+      source: { kind: 'internal', key: 'late-first-terminal' }, turnId, terminalStatus: 'cancelled', reason: 'late result fixture'
+    }));
+    const [lateCall] = await list(app, 'ContextSegmentSource', { source_kind: 'tool_call', source_id: late.toolCallId });
+    const fork = (key, rootId, endSegmentId) => app.runtime.conversationFork.fork({
+      idempotencyKey: key, reuseKey: key, sourceConversationId: conversationId, sourceContextRootId: rootId,
+      sourceContextEndSegmentId: endSegmentId, targetTitle: key, targetAgentId: 'agent-main'
+    });
+    const openRoot = (await list(app, 'ConversationContextHeadLink', { conversation_id: conversationId }))[0].root_id;
+    await assert.rejects(fork('late-open-call', openRoot, lateCall.segment_id), (error) => error.code === 'NATIVE_ASYNC_WORK_PENDING',
+      'a retained call whose result is not in the Context still rejects the fork');
+
+    // A later Turn runs and admits its own unsettled native call; then the earlier result's
+    // occurrence is appended behind that later history.
+    const second = await app.turns.input({
+      source: { kind: 'command', key: 'late-second-input' }, conversationId,
+      leaseOwnerId: 'late-second-owner', hostBootId: app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(), content: 'later user input after the cut'
+    });
+    const secondFence = await leaseFence(app, conversationId);
+    const secondRequest = await createStreamingRequest(app, second.turnId, 'late-req-2');
+    const secondMessage = await insertAssistantMessage(app, secondRequest.modelRequestId, 'late-req-2');
+    const running = nativeEntry('tool-call-late-b', { providerCallId: 'call-late-b' });
+    await persistNativeCheckpoint(app, secondRequest, 1, 'native_tool_call', nativeItemCheckpoint(running));
+    await effects.createToolCallBatch({
+      ...batchInput(second.turnId, secondRequest.modelRequestId, secondMessage, running, 'late-b'),
+      streamIdentity: { ...secondRequest.identity, streamSeq: '1' }
+    });
+    await kernel.runWithExecutionLeaseFence(secondFence, () => context.appendNativeToolCall({ conversationId, toolCallId: running.toolCallId }));
+    const [lateResult] = await list(app, 'ToolModelResult', { tool_call_id: late.toolCallId });
+    await kernel.runWithExecutionLeaseFence(secondFence, () => context.appendNativeToolResult({
+      conversationId, toolCallId: late.toolCallId, toolModelResultId: lateResult.id
+    }));
+    const [lateResultSource] = await list(app, 'ContextSegmentSource', { source_kind: 'tool_model_result', source_id: lateResult.id });
+    const [runningCall] = await list(app, 'ContextSegmentSource', { source_kind: 'tool_call', source_id: running.toolCallId });
+    const headRoot = (await list(app, 'ConversationContextHeadLink', { conversation_id: conversationId }))[0].root_id;
+    const sourceSegments = (await context.materializeStructure(headRoot)).records.map((record) => record.segment.id);
+    const cutIndex = sourceSegments.indexOf(lateCall.segment_id);
+    assert.ok(sourceSegments.indexOf(lateResultSource.segment_id) > sourceSegments.indexOf(runningCall.segment_id),
+      'fixture: the late result lands after the later Turn history');
+
+    const moved = await fork('late-result-moved', headRoot, lateCall.segment_id);
+    const forkSegments = (await context.materializeStructure(moved.targetRootId)).records.map((record) => record.segment.id);
+    assert.deepEqual(forkSegments, [...sourceSegments.slice(0, cutIndex + 1), lateResultSource.segment_id],
+      'the cut never extends over later history; the settled result is appended behind it');
+    const forkContent = (await context.materialize(moved.targetRootId)).segments
+      .map((segment) => segment.content.toString('utf8')).join('\n');
+    assert.doesNotMatch(forkContent, /later user input after the cut/);
+    assert.match(forkContent, /late native result body/);
+    const [forkRoot] = await list(app, 'ContextSequenceRoot', { id: moved.targetRootId });
+    assert.ok(forkRoot.estimated_tokens > 0n);
+    assert.equal((await fork('late-result-moved', headRoot, lateCall.segment_id)).deduplicated, true);
+
+    await assert.rejects(fork('late-running-call', headRoot, runningCall.segment_id), (error) => error.code === 'NATIVE_ASYNC_WORK_PENDING',
+      'retaining the running Turn call makes it part of the fork and it still rejects');
+  });
+});
+
+test('fork_conversation copies the completed history of a caller whose native Turn still runs an async call', async () => {
+  const { ReliableConversationLifecycle } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/application/reliableKernel/conversationLifecycle.js')
+  ).href);
+  await withNativeApp('native-fork-completed-history', async (app, conversationId, turnId) => {
+    const firstFence = await leaseFence(app, conversationId);
+    await kernel.runWithExecutionLeaseFence(firstFence, () => app.turns.terminal({
+      source: { kind: 'internal', key: 'native-fork-first-terminal' }, turnId, terminalStatus: 'completed', reason: 'completed fixture Turn'
+    }));
+    // The calling Turn is still running a native logical request with an unsettled async call.
+    const current = await app.turns.input({
+      source: { kind: 'command', key: 'native-fork-current-input' }, conversationId,
+      leaseOwnerId: 'native-fork-owner', hostBootId: app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(), content: 'current native turn asks to fork itself'
+    });
+    const currentFence = await leaseFence(app, conversationId);
+    const request = await createStreamingRequest(app, current.turnId, 'native-fork-current');
+    const message = await insertAssistantMessage(app, request.modelRequestId, 'native-fork-current');
+    const running = nativeEntry('tool-call-native-fork', { providerCallId: 'call-native-fork' });
+    await persistNativeCheckpoint(app, request, 1, 'native_tool_call', nativeItemCheckpoint(running));
+    await app.runtime.effects.createToolCallBatch({
+      ...batchInput(current.turnId, request.modelRequestId, message, running, 'native-fork'),
+      streamIdentity: { ...request.identity, streamSeq: '1' }
+    });
+    await kernel.runWithExecutionLeaseFence(currentFence, () => app.context.appendNativeToolCall({ conversationId, toolCallId: running.toolCallId }));
+    const copied = [];
+    // Recorded, not thrown: a failed cleanup is only logged, so a throwing stub could never fail this test.
+    const cleared = [];
+    const lifecycle = new ReliableConversationLifecycle({ application: app, configuration: { mutations: {
+      async copyConversationConfiguration(source, target) { copied.push([source, target]); },
+      async clearConversationConfiguration(target) { cleared.push(target); }
+    } } });
+
+    const fork = await lifecycle.forkCompletedHistory({ sourceConversationId: conversationId, commandId: 'native-fork-tool-call' });
+    assert.equal(fork.deduplicated, false);
+    assert.deepEqual(copied, [[conversationId, fork.conversationId]]);
+    const [head] = await list(app, 'ConversationContextHeadLink', { conversation_id: fork.conversationId });
+    const content = (await app.context.materialize(head.root_id)).segments.map((segment) => segment.content.toString('utf8')).join('\n');
+    assert.match(content, /native tool admission fixture/);
+    assert.doesNotMatch(content, /current native turn asks to fork itself/, 'the running Turn is never copied');
+    assert.deepEqual(await list(app, 'Turn', { conversation_id: fork.conversationId, status: 'active' }), []);
+    assert.equal((await list(app, 'ToolCall', { id: running.toolCallId }))[0].status !== 'terminal', true, 'the caller keeps running');
+    const replay = await lifecycle.forkCompletedHistory({ sourceConversationId: conversationId, commandId: 'native-fork-tool-call' });
+    assert.deepEqual([replay.conversationId, replay.deduplicated], [fork.conversationId, true]);
+    // A permanent rejection of the same command (here a replay with other facts) never clears the
+    // settings of the fork that command already committed.
+    await assert.rejects(lifecycle.fork({ sourceConversationId: conversationId, messageId: message,
+      expectedRevisionId: 'another-revision', commandId: 'native-fork-tool-call' }), /different source facts/);
+    assert.deepEqual(cleared, [], 'a committed fork never clears its settings');
+    request.close();
+  });
+});
+
 test('frozen nativeAsync policy reaches recipe metadata only for opted-in tools', async () => {
   const host = {
     definitions: () => [
@@ -952,7 +1085,7 @@ test('native scheduler child admission releases the slot at the durable barrier'
         messageId,
         toolCallId: `tool-call-child-${index}`,
         toolName: 'run_agent',
-        arguments: {},
+        arguments: { operation: 'spawn', taskName: `Inspect admission slot ${index}`, prompt: `Check child admission ${index}` },
         streamSeq: index + 1,
         providerOrdinal: index
       }));
@@ -974,4 +1107,3 @@ test('native scheduler child admission releases the slot at the durable barrier'
     assert.ok(results.every((result) => result.disposition === 'paused'));
   }, host, { allowedTools: ['read', 'run_agent'] });
 });
-

@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia';
 import { debugCaptureTrace } from '@webview/transport/debugCapture';
+import { rememberRemovedConversations } from '@webview/domain/collaborationPeer';
 import type { ReliableToolApplyObserver } from '@webview/domain/reliableTransientModel';
 import {
   RELIABLE_KERNEL_CHANGES_MESSAGE,
@@ -170,6 +171,11 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   historyError: string | null;
   historyRequestId: string | null;
   historyLoadedPages: number;
+  /**
+   * Conversations this view saw removed by a committed change. A peer merely missing from the
+   * bounded lists is unknown; only these read as deleted. Memory-only and bounded.
+   */
+  removedConversationIds: string[];
 }
 
 const DETAIL_CHUNK_MAX_BYTES = 262_144;
@@ -217,7 +223,8 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     historyLoading: false,
     historyError: null,
     historyRequestId: null,
-    historyLoadedPages: 0
+    historyLoadedPages: 0,
+    removedConversationIds: []
   }),
   getters: {
     childExecutionFacts: (state) => Object.values(state.records.ChildExecution ?? {}),
@@ -369,6 +376,11 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           this.transientModelRequests,
           removedModelRequestIds(envelope)
         );
+        const removedConversations = rememberRemovedConversations(this.removedConversationIds, envelope?.changes);
+        if (removedConversations.length !== this.removedConversationIds.length
+          || removedConversations.some((id, index) => id !== this.removedConversationIds[index])) {
+          this.removedConversationIds = removedConversations;
+        }
       }
       if (incomingGeneration) this.navigationGeneration = incomingGeneration;
       if (result.ack) {

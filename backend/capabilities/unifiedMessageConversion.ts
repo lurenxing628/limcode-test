@@ -15,6 +15,7 @@ import {
 } from '../../shared/protocol';
 import type {
   ContentPart,
+  FunctionCallPart,
   LlmGenerationConfigRecord,
   LlmProviderKind,
   MessageContent
@@ -27,6 +28,7 @@ import {
   thoughtSignaturesFromPortableSignature
 } from './llmStreamEventProjection';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
+import { layoutTurnReminderContents, type TurnReminderLayout } from './claudeTurnScopedReminders';
 
 type UnifiedContent = import('unified-llm-provider').Content;
 type UnifiedPart = import('unified-llm-provider').Part;
@@ -37,14 +39,22 @@ export function toUnifiedRequest(
   request: LlmStartRequest,
   generationConfig?: LlmGenerationConfigRecord,
   providerKind?: LlmProviderKind,
-  nativeCapabilities?: OpenAIResponsesNativeCapabilities
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities,
+  turnReminderLayout: TurnReminderLayout = 'tail'
 ): UnifiedLLMRequest {
   const nativeAsync = nativeCapabilities?.asyncTools === true;
+  // 轮内系统消息只发给 Claude；其他 provider 一律按原来的尾巴模式，历史提醒不会以任何形式发过去。
+  const requestContents = layoutTurnReminderContents(
+    request.contents,
+    providerKind === 'claude' && turnReminderLayout === 'claude_turn_scoped' ? 'claude_turn_scoped' : 'tail'
+  );
   const contents = providerKind === 'gemini'
-    ? mergeGeminiFunctionResponseTurns(request.contents)
+    ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(projectGeminiProviderContext(requestContents)))
     : providerKind === 'claude'
-      ? projectClaudeThoughtReplay(request.contents)
-      : request.contents;
+      ? projectClaudeThoughtReplay(requestContents)
+      : providerKind === 'openai-compatible'
+        ? projectOpenAICompatibleThoughtReplay(projectForeignProviderContext(requestContents, 'openai-compatible'))
+        : requestContents;
   return {
     contents: contents.flatMap((content) => toUnifiedContents(content, providerKind, nativeAsync)),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map((part) => toUnifiedPart(part, false)) } } : {}),
@@ -94,7 +104,179 @@ function isForeignThoughtPart(part: ContentPart, provider: string): boolean {
   return parsePortableThoughtSignature(signature ?? '')?.provider !== provider;
 }
 
+/**
+ * 发给原生 Gemini 时摘掉别家格式的不透明 provider 项（例如 Responses 普通回复里的服务端 compaction 项、
+ * Claude 的 compaction 块）：接入库的 Gemini 编码器会把 `providerContext` 原样抄进 parts，
+ * Gemini 的 Part/Content 没有这个字段，整条请求会被拒。Gemini 自己格式的项保留（目前没有）。
+ * 摘掉后为空的内容整条去掉，不发出空 parts。
+ * Claude 的编码器本来就不发别家的项（只还原自己的 compaction 块），不在这里处理。
+ */
+function projectGeminiProviderContext(contents: readonly MessageContent[]): readonly MessageContent[] {
+  return projectForeignProviderContext(contents, 'gemini');
+}
+
+/**
+ * 摘掉不是 `format` 格式的 provider 项（part 与内容级的 `providerContext`），摘空的内容整条去掉。
+ * - Gemini：见 projectGeminiProviderContext。
+ * - OpenAI 兼容：编码器不发 provider 项，但一条只剩 provider 项的内容（例如 Responses 回复里只有推理项与
+ *   服务端 compaction 项、思考摘要已被摘掉）会编码成 `{"role":"assistant","content":""}` 这样的空消息。
+ */
+function projectForeignProviderContext(contents: readonly MessageContent[], format: string): readonly MessageContent[] {
+  let changed = false;
+  const projected: MessageContent[] = [];
+  for (const content of contents) {
+    const contentContext = (content as MessageContent & { providerContext?: unknown }).providerContext;
+    const foreignContentContext = contentContext !== undefined && !isProviderContextOfFormat(contentContext, format);
+    const parts = content.parts.filter((part) => !isProviderContextPart(part) || isProviderContextOfFormat(part.providerContext, format));
+    if (!foreignContentContext && parts.length === content.parts.length) {
+      projected.push(content);
+      continue;
+    }
+    changed = true;
+    if (parts.length === 0) continue;
+    const { providerContext: _foreign, ...rest } = content as MessageContent & { providerContext?: unknown };
+    projected.push({ ...(foreignContentContext ? rest : content), parts });
+  }
+  return changed ? projected : contents;
+}
+
+function isProviderContextOfFormat(value: unknown, format: string): boolean {
+  return isRecord(value) && value.format === format;
+}
+
+/**
+ * 发给原生 Gemini 时摘掉别家 provider 签过的思考 part，与 Claude 路径的 projectClaudeThoughtReplay 同理：
+ * 别家签名对 Gemini 无效（接入库本来就不会把它发出去），剩下的只是另一个模型的思考文字，
+ * 却会以 `thought: true` 冒充 Gemini 自己的思考回放。
+ * - Gemini 自己签过的思考原样保留：官方要求“把完整响应的所有 part 按原样回传”，签名留在收到它的 part 上
+ *   （https://ai.google.dev/gemini-api/docs/generate-content/thinking、
+ *   https://ai.google.dev/gemini-api/docs/thought-signatures）。
+ * - 无签名的思考保留：Gemini 3 的思考摘要本身不带签名（签名在函数调用或最后一个 part 上），
+ *   无法与别家无签名思考区分，按官方“完整回传”处理。
+ * 摘掉后为空的 model 内容整条去掉，不发出空 parts。
+ */
+function projectGeminiThoughtReplay(contents: readonly MessageContent[]): readonly MessageContent[] {
+  let dropped = 0;
+  const projected: MessageContent[] = [];
+  for (const content of contents) {
+    if (content.role !== 'model') {
+      projected.push(content);
+      continue;
+    }
+    const parts = content.parts.filter((part) => !isOtherProviderSignedThought(part, 'gemini'));
+    dropped += content.parts.length - parts.length;
+    if (parts.length === content.parts.length) projected.push(content);
+    else if (parts.length > 0) projected.push({ ...content, parts });
+  }
+  if (dropped === 0) return contents;
+  try {
+    console.info('[LimCode][GeminiThoughtReplay]', JSON.stringify({ droppedForeignThoughtParts: dropped }));
+  } catch {
+    // 可观测性永远不是 provider 权威。
+  }
+  return projected;
+}
+
+/**
+ * OpenAI 兼容格式把历史思考写回 `reasoning_content`。中途换过模型时，Claude、Gemini、Responses
+ * 产出的思考（带各自的签名）不是这个模型的推理过程，回传过去只会误导它，所以去掉；
+ * 本渠道自己的思考（签名为 openai-compatible，或没有签名）照常回传。
+ */
+function projectOpenAICompatibleThoughtReplay(contents: readonly MessageContent[]): readonly MessageContent[] {
+  let dropped = 0;
+  const projected: MessageContent[] = [];
+  for (const content of contents) {
+    if (content.role !== 'model') {
+      projected.push(content);
+      continue;
+    }
+    const parts = content.parts.filter((part) => !isOtherProviderSignedThought(part, 'openai-compatible'));
+    dropped += content.parts.length - parts.length;
+    if (parts.length === content.parts.length) projected.push(content);
+    else if (parts.length > 0) projected.push({ ...content, parts });
+  }
+  return dropped === 0 ? contents : projected;
+}
+
+function isOtherProviderSignedThought(part: ContentPart, provider: string): boolean {
+  if (!isTextPart(part) || part.thought !== true) return false;
+  const signature = normalizedSignatureString(part.thoughtSignature);
+  const signedBy = signature ? parsePortableThoughtSignature(signature)?.provider : undefined;
+  return signedBy !== undefined && signedBy !== provider;
+}
+
+/**
+ * Gemini 要求：model 内容里有 N 个函数调用时，紧随其后的那一条 user 内容必须恰好带这 N 个函数响应，
+ * 否则 400 "Please ensure that the number of function response parts is equal to the number of
+ * function call parts of the function call turn"（网关实测 `[v]gemini-3.5-flash`）。官方顺序是
+ * “所有调用之后跟所有响应”（FC1, FC2, FR1, FR2；https://ai.google.dev/gemini-api/docs/thought-signatures
+ * FAQ：交错会 400）。规范上下文把每个工具结果冻结成独立片段，附件目录等文字还会排在它们中间，
+ * 所以这里参照 Claude 的配对修复：把回答同一批调用、分散在多条 user 内容里的函数响应并进紧随其后的
+ * 一条 user 内容，夹在中间的其他片段按原顺序放到这些响应之后。已经在一条内容里配齐的轮次保持原样。
+ */
 function mergeGeminiFunctionResponseTurns(contents: readonly MessageContent[]): MessageContent[] {
+  return mergeAdjacentGeminiFunctionResponseTurns(pairGeminiFunctionResponses(contents));
+}
+
+function pairGeminiFunctionResponses(contents: readonly MessageContent[]): readonly MessageContent[] {
+  const paired: MessageContent[] = [];
+  let regrouped = false;
+  for (let index = 0; index < contents.length; index += 1) {
+    const content = contents[index];
+    paired.push(content);
+    const calls = content.role === 'model' ? content.parts.filter(isFunctionCallPart) : [];
+    if (calls.length === 0) continue;
+    const batch = collectGeminiFunctionResponses(contents, index + 1, calls);
+    // 只有一条 user 内容时已经满足配对（或没有可配的响应），不动它。
+    if (!batch || batch.endIndexExclusive <= index + 2) continue;
+    paired.push({ ...contents[index + 1], role: 'user', parts: [...batch.responses, ...batch.trailing] });
+    regrouped = true;
+    index = batch.endIndexExclusive - 1;
+  }
+  return regrouped ? paired : contents;
+}
+
+interface GeminiFunctionResponseBatch {
+  responses: ContentPart[];
+  trailing: ContentPart[];
+  endIndexExclusive: number;
+}
+
+/** 扫描回答一批调用的 user 内容：按调用 id 认领响应，没有 id 的调用按数量认领；遇到非 user 内容即停。 */
+function collectGeminiFunctionResponses(
+  contents: readonly MessageContent[],
+  startIndex: number,
+  calls: readonly FunctionCallPart[]
+): GeminiFunctionResponseBatch | undefined {
+  const callIds = new Set(calls.flatMap((call) => call.id ? [call.id] : []));
+  const pendingIds = new Set(callIds);
+  let pendingAnonymous = calls.length - callIds.size;
+  const responses: ContentPart[] = [];
+  const trailing: ContentPart[] = [];
+  let index = startIndex;
+  for (; index < contents.length && (pendingIds.size > 0 || pendingAnonymous > 0); index += 1) {
+    const content = contents[index];
+    if (content.role !== 'user') break;
+    for (const part of content.parts) {
+      if (isFunctionResponsePart(part)) {
+        if (part.id && pendingIds.delete(part.id)) {
+          responses.push(part);
+          continue;
+        }
+        if (pendingAnonymous > 0 && !(part.id && callIds.has(part.id))) {
+          pendingAnonymous -= 1;
+          responses.push(part);
+          continue;
+        }
+      }
+      trailing.push(part);
+    }
+  }
+  return responses.length > 0 ? { responses, trailing, endIndexExclusive: index } : undefined;
+}
+
+/** 原有行为：直接相邻、只含函数响应的 user 内容合并成一条。 */
+function mergeAdjacentGeminiFunctionResponseTurns(contents: readonly MessageContent[]): MessageContent[] {
   const merged: MessageContent[] = [];
   for (let index = 0; index < contents.length; index += 1) {
     const content = contents[index];
@@ -165,9 +347,12 @@ export function toUnifiedContents(
 
 function toUnifiedContent(content: MessageContent, nativeAsync = false): UnifiedContent {
   const providerContext = (content as MessageContent & { providerContext?: unknown }).providerContext;
+  // 只有 layoutTurnReminderContents 在 Claude 轮内系统消息模式下才会写这个字段。
+  const claudeSystemMessage = (content as MessageContent & { claudeSystemMessage?: unknown }).claudeSystemMessage;
   return {
     role: content.role === 'model' ? 'model' : 'user',
     parts: content.parts.map((part) => toUnifiedPart(part, nativeAsync)),
+    ...(claudeSystemMessage ? { claudeSystemMessage } : {}),
     ...(providerContext ? { providerContext } : {})
   } as UnifiedContent;
 }

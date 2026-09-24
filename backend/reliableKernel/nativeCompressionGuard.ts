@@ -62,7 +62,7 @@ export type NativeCompressionGuardDecision =
  * call/result identity. Full-window native compact cannot protect a prefix at all and must defer.
  */
 export function evaluateNativeCompressionGuard(input: {
-  /** openai_responses_compact requires the complete model-visible window. */
+  /** provider_native requires the complete model-visible window. */
   fullWindowRequired: boolean;
   facts: NativeCompressionGuardFacts;
   orderedSegmentIds: readonly string[];

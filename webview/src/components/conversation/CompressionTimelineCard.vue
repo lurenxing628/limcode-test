@@ -39,7 +39,7 @@ let copiedResetTimer: number | undefined;
 
 const methodLabel = computed(() => {
   switch (props.block.methodKind) {
-    case 'openai_responses_compact': return 'OpenAI 原生压缩';
+    case 'provider_native': return 'Provider 原生压缩';
     case 'llm_summary': return 'LLM 总结';
     case 'segmented_summary': return '分段总结拼接';
     case 'deterministic_summary': return '确定性摘要';
@@ -282,7 +282,7 @@ function formatRetryAttempt(attempt: number | undefined, max: number | undefined
       <p v-if="block.summaryPreview" class="summary-preview">{{ block.summaryPreview }}</p>
       <p v-if="block.error" class="detail-error">{{ block.error }}</p>
       <p v-if="block.staleReason" class="detail-muted">{{ block.staleReason }}</p>
-      <p v-if="block.methodKind === 'openai_responses_compact'" class="detail-muted">OpenAI 原生压缩块仅在当前 LLM 格式为 openai-responses 且压缩策略仍选中 OpenAI 原生压缩时使用；调用失败会保留失败状态。</p>
+      <p v-if="block.methodKind === 'provider_native'" class="detail-muted">Provider 原生压缩块只在渠道、模型与冻结能力快照兼容时原样复用；不兼容或调用失败时由冻结的后备链处理。</p>
     </div>
 
     <ConfirmPanel

@@ -1,4 +1,5 @@
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import { toolArtifactIdentifiesCall } from './copiedToolIdentity';
 import { readFrozenTurnAuthority } from './frozenAuthority';
 import type { McpAuthorizationRequest, McpExistingPolicyGate } from './mcpEffects';
 import type { PlainJsonValue } from './plainJson';
@@ -6,6 +7,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { contextRootContainsCompleteToolPair } from './turnControlPlane';
+import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
 
 export type FrozenPlanReviewRiskLevel = 'read' | 'write' | 'command' | 'agent';
 
@@ -68,7 +70,8 @@ export class FrozenAuthorityMcpPolicyGate implements McpExistingPolicyGate {
     const toolPolicy = requireRecord(authority.toolPolicy, 'AuthoritySnapshot.toolPolicy');
     const allowed = mcpToolAllowed(toolPolicy, {
       displayName: String(toolCall.tool_name),
-      serverId: request.serverId
+      serverId: request.serverId,
+      originalToolName: request.toolName
     });
     if (!allowed) {
       return {
@@ -122,24 +125,7 @@ async function hasApprovedPlanBeforeCall(
   const calls = (await listAllDomainRows(database, 'ToolCall', { turn_id: turnId }))
     .filter((call) => call.tool_name === 'submit_plan' && requireBigInt(call.call_seq, 'ToolCall.call_seq') < beforeCallSeq);
   for (const call of calls) {
-    const outcomes = await listRows(database, 'ToolOutcome', { tool_call_id: call.id }, 2);
-    if (outcomes.length !== 1 || outcomes[0].status !== 'succeeded') continue;
-    const artifacts = await listRows(database, 'ToolResultArtifact', {
-      tool_call_id: call.id,
-      role: 'no_effect_result'
-    }, 2);
-    if (artifacts.length !== 1) continue;
-    const content = await requireExistingRow(
-      database,
-      'ContentObject',
-      requireId(artifacts[0].content_object_id, 'ToolResultArtifact.content_object_id')
-    ) as unknown as ContentObjectMetadata;
-    const body = requireUnknownRecord(
-      JSON.parse((await contentStore.read(content)).toString('utf8')),
-      'submit_plan result artifact'
-    );
-    const detail = requireUnknownRecord(body.detail, 'submit_plan result artifact.detail');
-    if (body.toolCallId === call.id && body.status === 'succeeded' && detail.status === 'approved') return true;
+    if (await isApprovedPlanResult(database, contentStore, call)) return true;
   }
   const lineage = optionalRecord(authority.retryLineage);
   const inheritedToolCallId = optionalId(lineage?.inheritedPlanApprovalToolCallId);
@@ -148,7 +134,7 @@ async function hasApprovedPlanBeforeCall(
   if (!optionalId(lineage?.sourceMessageId) && !optionalId(lineage?.sourceModelRequestId)) return false;
   const inheritedCall = await requireExistingRow(database, 'ToolCall', inheritedToolCallId);
   if (inheritedCall.turn_id !== sourceTurnId || inheritedCall.tool_name !== 'submit_plan') return false;
-  if (!await isApprovedPlanResult(database, contentStore, inheritedToolCallId)) return false;
+  if (!await isApprovedPlanResult(database, contentStore, inheritedCall)) return false;
 
   const currentCalls = await listAllDomainRows(database, 'ToolCall', { turn_id: turnId });
   const currentCall = currentCalls.find((call) =>
@@ -174,8 +160,9 @@ async function hasApprovedPlanBeforeCall(
 async function isApprovedPlanResult(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
-  toolCallId: string
+  call: DomainRow
 ): Promise<boolean> {
+  const toolCallId = requireId(call.id, 'ToolCall.id');
   const outcomes = await listRows(database, 'ToolOutcome', { tool_call_id: toolCallId }, 2);
   if (outcomes.length !== 1 || outcomes[0].status !== 'succeeded') return false;
   const artifacts = await listRows(database, 'ToolResultArtifact', {
@@ -193,7 +180,10 @@ async function isApprovedPlanResult(
     'submit_plan result artifact'
   );
   const detail = requireUnknownRecord(body.detail, 'submit_plan result artifact.detail');
-  return body.toolCallId === toolCallId && body.status === 'succeeded' && detail.status === 'approved';
+  // A fork copies the ToolCall but shares the artifact content naming the original call.
+  return body.status === 'succeeded'
+    && detail.status === 'approved'
+    && await toolArtifactIdentifiesCall(database, body.toolCallId, call);
 }
 
 async function requireExistingRow(database: RuntimeDatabase, domain: string, id: string): Promise<DomainRow> {
@@ -233,21 +223,18 @@ function optionalId(value: PlainJsonValue | undefined): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/** The frozen source settings decide, by server id and the tool name the server itself uses. */
 function mcpToolAllowed(
   policy: { [key: string]: PlainJsonValue },
-  tool: { displayName: string; serverId: string }
+  tool: { displayName: string; serverId: string; originalToolName: string }
 ): boolean {
-  const explicitlyAllowed = Array.isArray(policy.allowedTools)
-    && policy.allowedTools.some((name) => name === tool.displayName);
-  const sources = policy.sourceConfigs;
-  if (!sources || typeof sources !== 'object' || Array.isArray(sources)) return explicitlyAllowed;
-  const config = sources[tool.serverId];
-  if (!config || typeof config !== 'object' || Array.isArray(config)) return explicitlyAllowed;
-  if (config.enabled !== true) return false;
-  const disabled = Array.isArray(config.disabledTools)
-    ? config.disabledTools.filter((name): name is string => typeof name === 'string')
+  const allowedTools = Array.isArray(policy.allowedTools)
+    ? policy.allowedTools.filter((name): name is string => typeof name === 'string')
     : [];
-  return !disabled.includes(tool.displayName);
+  return toolAllowedByPolicy({ allowedTools, sourceConfigs: policy.sourceConfigs }, {
+    name: tool.displayName,
+    source: { kind: 'mcp', sourceId: tool.serverId, originalToolName: tool.originalToolName }
+  });
 }
 
 function requireId(value: unknown, label: string): string {

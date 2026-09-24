@@ -5,16 +5,16 @@
 - 增加 conversation-scoped `ModelProfileRecord.thinkingOverride`（类型区分预算、OpenAI effort、Gemini level、Claude adaptive effort、DeepSeek 模式）。thinking-only 记录标记 `inheritModel`，不成为模型身份选择器，不往 ModelProfile 塞入完整渠道配置。
 - 复用 `ModelProfileScopeSet/Clear`、配置 authority、现有 record/link 路径；补充仅限 ModelProfile 的 `ScopeRead/ScopeSnapshot` 确认通道（不是全 Bridge 版本重构）。外部 set/clear/thinking/reset 必须带已观察 authority/session/revision；非 conversation scope 拒绝思维覆盖，UI 只发送普通数据。
 - 底栏从 authority 获取 conversation → workflow → agent → global 的有效模型；thinking/reset 在同一 mutation lock 内校验 `expectedEffectiveModel`。继承改变时拒绝旧选择，不把 global fallback 或旧继承身份偷偷固化到会话。
-- 模型专属配置**整体替代**渠道设置；专属配置没有 generationConfig 即未设置，不继承渠道的思维数值。选择默认时显示现有有效设置，未设置显示“服务默认”。Gemini/Astra 的现有适配器补值/归一化另作标注，不把参数编辑器示例值当成服务默认。
+- 模型专属配置**整体替代**渠道设置；专属配置没有 generationConfig 即未设置，不继承渠道的思维数值。默认选项写作“跟随渠道设置：<值>”，显示渠道或模型高级配置里实际会发送的值；未设置时显示“未设置（由服务决定）”，请求不带思考参数。Gemini 默认省略思考参数，类型或等级不受支持时明确拒绝；Astra 的现有适配器归一化另作标注，不把参数编辑器示例值当成服务端默认值。
 - 切渠道/模型走现有 selection 入口并清掉覆盖，不进行数字与等级换算。普通 Fork 沿用已有配置复制，复制成目标独立记录；本改动不修改 Fork 实现。
-- 子 Agent 的模型选择规则不变。默认不继承父会话思维；勾选「子继承」后按现有初始化路径复制兼容的思维覆盖。请求参数解析只查**子会话自身** record；已有子会话覆盖优先。
+- 子 Agent 的模型选择规则不变。默认不继承父会话思维；在下拉面板底部勾选「派出的子 Agent 也用这个思考强度」后，按现有初始化路径复制兼容的思维覆盖。请求参数解析只查**子会话自身** record；已有子会话覆盖优先。
 
 ## 单次请求生效
 
 1. 新 ModelRequest 边界经 authority 加载 `requestGeneration`，使用现有 `settings_snapshot_object_id` 冻结。与 `requestCompression` 是并列数据，不把聊天参数写入压缩配置。
 2. 普通 full-request adapter 把冻结 generationConfig 交给 LLM capability，再经现有 provider mapper 生成线级 body。重试/重放读取原快照；已经冻结的请求不会读到后来编辑。
 3. 原始 requestBody 同时冻结，**先选冻结输入再统一 normalize/adapt**，Astra 不支持字段不会被 normalize 后的原始 body 重新加回；无关自定义字段保留。Gemini 按实际 nested 子键检测 deep-merge 冲突，空对象/无关采样子键允许，null/false 覆盖父对象仍拒绝。Claude `output_config` 仅检查已证实冲突的 effort；非法 thinking+采样组合拒绝本次保存并提示，不偷偷改渠道默认、不永久禁止恢复默认后的发送。
-4. native recipe 使用同一单请求 authority。普通 effort 变更沿用已有 configuration_update；恢复字段省略时丢弃旧动态更新并通过现有 full-request rebase（`thinking_defaults_restored`），不复用旧 anchored effort。压缩 rebase 的 fresh/base 必须由本次**冻结 requestGeneration**重建，不使用旧 compression high，也不在压缩结束后再读 live scope。reset 服务默认省略、reset 渠道 low、显式 medium、合法 high 保持分开验证；不把默认/low 当 off，不改 reasoningMode/native flags/工具配对或重复工具。
+4. native recipe 使用同一单请求 authority。普通 effort 变更沿用已有 configuration_update；恢复字段省略时丢弃旧动态更新并通过现有 full-request rebase（`thinking_defaults_restored`），不复用旧 anchored effort。压缩 rebase 的 fresh/base 必须由本次**冻结 requestGeneration**重建，不使用旧 compression high，也不在压缩结束后再读 live scope。reset 未设置时省略、reset 渠道 low、显式 medium、合法 high 保持分开验证；不把默认/low 当 off，不改 reasoningMode/native flags/工具配对或重复工具。
 5. 底栏当前选择与最近请求冻结参数摘要分开；服务未返回的实际内部思考预算不伪造。摘要位于已有 stream stats，SQLite worker 仍严格校验允许字段和有界字符串。没有 schema migration、旁路 writer 或真实数据修改。
 
 ## 本地能力矩阵
@@ -24,15 +24,18 @@
 | 协议 / 模型族 | 控件和原生字段 | 限制 |
 |---|---|---|
 | OpenAI-compatible，已知 o1/o3/o4（不含 o1-mini/preview） | effort → `reasoning_effort` | low/medium/high；第三方同名转发仍未真实联调 |
-| OpenAI-compatible / Responses，GPT-5 / 5.1 / 5.2 已列明型号 | 分模型 effort；Responses → `reasoning.effort` | 5 为 minimal/low/medium/high；5.1（含2025-11-13）为 none/low/medium/high；5.2（含2025-12-11）才开放 xhigh；未知小版本不按小数点推能力 |
-| Responses，精确 Astra（复用现有识别） | effort + 原有 native continuation | none/minimal 不作为新选项；现有渠道配置适配为 low 时明确标注 |
+| OpenAI-compatible / Responses，GPT-5 / 5.1 / 5.2 / 5.6 已列明型号 | 分模型 effort；Responses → `reasoning.effort` | 5 为 minimal/low/medium/high；5.1（含2025-11-13）为 none/low/medium/high；5.2（含2025-12-11）才开放 xhigh；5.6（gpt-5.6、sol、terra、luna）为 none/low/medium/high/xhigh/max、没有 minimal；未知小版本不按小数点推能力 |
+| OpenAI-compatible / Responses，精确 Astra（复用现有识别） | effort + 原有 native continuation | low/medium/high/xhigh/max；none/minimal 不作为新选项；现有渠道配置适配为 low 时明确标注（两种渠道一致） |
+| OpenAI-compatible / Responses，精确 GPT-6 Sol / Luna（含日期快照） | effort；Responses 另有 native continuation | none/low/medium/high/xhigh/max，官方默认 medium；minimal 适配为 low 时明确标注；强度不是 none 时去掉采样参数 |
 | Gemini 2.5 文本 Pro / Flash | `thinkingBudget` | -1 自动；Pro不允许0；Flash允许0；模型范围与输出上限校验；image/audio/live不开放预算快捷入口 |
 | Gemini 3.x | `thinkingLevel` | 复用 shared/geminiThinking 按具体型号等级集合；不发送预算 |
 | Claude 3.7 Sonnet / 已识别旧4系 | `thinking.budget_tokens` | 明确 maxOutputTokens；整数≥1024且小于输出上限；temperature仅省略/1，top_k省略，top_p仅省略或0.95–1，不合法拒绝保存 |
-| Claude 精确4.6 Opus/Sonnet（及日期标识） | adaptive + `output_config.effort` | 与预算互斥；none为关闭；不猜测未来4.x，不静默降档 |
-| DeepSeek 已识别 reasoner/v4 | `thinking.type` / `reasoning_effort` | none/high/max；不使用 OpenAI 全部档位 |
+| Claude 精确4.6 Opus/Sonnet、Mythos Preview（及日期标识） | adaptive + `output_config.effort` | 与预算互斥；4.6 为 none/low/medium/high/max；Mythos Preview 始终思考、没有 xhigh；渠道配置不放宽已知模型 |
+| Claude 4.7 及之后（能力表 `anthropic_adaptive`：Opus 4.7/4.8/5/5.5、Sonnet 5、Fable、Mythos） | adaptive + `output_config.effort`（low–xhigh、max） | 只按能力表精确 id（及日期标识）开放；始终开启的 Fable、Mythos、Opus 5.5 不提供 none（渠道设了 none 时注明实际仍会思考）；非默认的 temperature / top_p / top_k 无论是否思考都报冲突；编码与渠道配置同一路径 |
+| OpenAI-compatible，DeepSeek 写法或 enable_thinking 写法的模型（DeepSeek、MiMo、Kimi、GLM-4.5 及以上、混元、Qwen3、ERNIE） | 档位按渠道的有效规则给出（手动写法 → 测试结果 → 接口地址 / 模型 ID），与请求改写、能力表共用（`shared/openAICompatibleDialect.ts`、`resolveProviderOpenAICompatibleDialect`） | DeepSeek none/low/high/max；关不掉思考的模型（Kimi K3、GLM-5.3、Kimi K2.7 Code）不提供 none；只能开关的模型为 none/high；平台差异计入（硅基流动 V4 为 high/max，百炼按模型）；发送时就近换算，“跟随渠道”显示实际发出的值；OpenRouter 按原值发送（没有 max），本机服务不套这些档位 |
 | 未知别名 / 自定义渠道模型 | 显示现有渠道或模型配置；已配置 effort 时复用渠道编辑器的参数集合 | 未配置时不猜测能力；Gemini 保留具体型号约束。参数集合来自 `shared/llmThinkingLevels.ts`，不代表远端服务已通过联调 |
-| 与思维/输出相关 custom body | 保留已有 body，快捷覆盖报冲突 | 失败草稿保留，可确认重试/放弃草稿/恢复默认；不全局阻塞其他会话 |
+| 与思维/输出相关 custom body | 保留已有 body，保存覆盖时报冲突；`chat_template_kwargs` 只在含思考相关子键时算冲突 | 失败草稿保留，可确认重试/放弃草稿/恢复默认；不全局阻塞其他会话 |
+| 升级前保存、现在已不适用的覆盖 | 请求冻结、子 Agent 继承与“子 Agent 也用”开关用容错解析：`openai-effort` 与 `deepseek-effort` 的值仍可用时改写 kind 后生效，否则按渠道设置发送 | 保存时仍严格校验；思考下拉单独显示“已保存：X（当前不生效）”，选“跟随渠道”即可清除 |
 
 不声明适用于所有第三方兼容端点。已知名称也可能被中继限制；实际能力报错仍来自原 provider 请求路径。能力白名单需随仓库 adapter 与模型证据更新，不是旧协议 fallback。
 
@@ -44,14 +47,14 @@
 - 快速 high→medium→reset 串行提交并使用前次实际 revision；发送只等**当前 conversation**的保存。Composer 的等待/错误也按 conversation 分离，切会话不会阻塞新会话或把旧 await 发送到新会话。底栏思维控件直接展示失败原因与重试入口；配置编辑页复用 ModelProfileSaveStatus。
 - 读取有效模型失败时仍返回已保存的 profile/link、revision 与 `effectiveModelError`，允许重新选择模型修复。配置读取只载入相关 scope 引用的模型记录，避免扫描所有会话模型文件。
 - 写入结果未知时，第一次重试仍先读取原操作结果。若该读取也失败，下一次显式重试重建编辑会话、保留旧草稿并解除发送等待；不自动重放未知写入。更换 Host 时同样重新读取，迟到回执不能恢复旧状态。
-- `inheritModel` 记录只承载思维设置；发送、编辑和重试均不把其中保存的旧模型身份变成显式模型选择。重置思维保留独立的「子继承」开关，关闭该开关明确保存 false。
+- `inheritModel` 记录只承载思维设置；发送、编辑和重试均不把其中保存的旧模型身份变成显式模型选择。重置思维保留独立的子 Agent 继承开关，关闭该开关明确保存 false。
 - **没有“撤销已提交写入”**：放弃未提交草稿只丢本地草稿；有 requestId 时必须 after-read 确认实际状态后放弃。恢复默认是新的 thinking-only CAS reset，不是补偿回写。显式重连保留旧草稿为 detached，不自动跨代提交。
 
 ### 渠道无关的操作确认契约
 
 `modelProfileObservation`是read及全部成功mutation的共同构造点。成功mutation统一包含宿主确认的`operation`（实际语义为select/thinking/reset/clear）、实际使用的`expectedRevision`、结果`revision`、scope、authority、sequence及原通道关联的session/correlationId。clear不再依靠缺少profile来猜测操作完成。前端使用发送时保存的submitted操作/基线匹配，而不是当前可能已queued的新选择；同时验证profile/link成对、scope和记录id一致。
 
-`profileState`明确区分：`absent`=没有本scope的profile/link，`default`=有模型记录但无思维覆盖，`overridden`=有显式思维覆盖（包括none/0等显式值），`unknown`=结果未确定。异常路由只能返回unknown，不能表示absence；读到或收到不完整/不一致结构也不能当作保存成功。reset仍区分显式模型（保留模型，仅去覆盖）与inherit-only记录（若未启用子继承，则去掉本地记录），不是clear的别名。
+`profileState`明确区分：`absent`=没有本scope的profile/link，`default`=有模型记录但无思维覆盖，`overridden`=有显式思维覆盖（包括none/0等显式值），`unknown`=结果未确定。异常路由只能返回unknown，不能表示absence；读到或收到不完整/不一致结构也不能当作保存成功。reset仍区分显式模型（保留模型，仅去覆盖）与inherit-only记录（若未启用子 Agent 继承，则去掉本地记录），不是clear的别名。
 
 本确认格式与OpenAI/Claude/Gemini/DeepSeek无关，没有改变已有provider能力/格式代码。真实组件script-setup/Pinia→router→authority的交叉测试从OpenAI high切换到：OpenAI另一渠道effort、Gemini budget、Claude budget、Claude adaptive none、DeepSeek none、无thinking能力gpt-4o。每条路径验证select/reset/clear回执、实际落盘与UI观察一致；clear后由当前Agent继承链解析有效模型，再set覆盖（无能力模型执行reset），并生成真实临时Turn/dry-run请求。旧模型expectedEffectiveModel和旧revision均由真实router拒绝，实际absence不改变。
 

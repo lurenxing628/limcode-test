@@ -5,6 +5,7 @@ import {
   IconBolt,
   IconCheck,
   IconGripVertical,
+  IconMessages,
   IconPencil,
   IconPlayerPause,
   IconPlayerPlay,
@@ -23,6 +24,7 @@ import type {
 } from '@shared/reliableKernelClientFeed';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { collaborationPeerLabel, resolveCollaborationPeer } from '@webview/domain/collaborationPeer';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
@@ -257,7 +259,7 @@ function turnIntentPreview(intentId: string): ReliableKernelTurnIntentPreview | 
     }
     if (
       value.kind !== 'runtime_continuation'
-      || typeof value.sourceTurnId !== 'string'
+      || (typeof value.sourceTurnId !== 'string' && value.sourceTurnId !== null)
       || typeof value.deliveryId !== 'string'
       || typeof value.deliveryState !== 'string'
       || typeof value.phase !== 'string'
@@ -304,6 +306,11 @@ function runtimeContinuationSource(value: unknown): ReliableKernelRuntimeContinu
       ...optionalTextField(source, 'exitCode'),
       ...optionalTextField(source, 'exitSignal')
     };
+  }
+  if (source.kind === 'collaboration_message') {
+    const sourceConversationId = nonEmptyText(source.sourceConversationId);
+    if (!sourceConversationId || (source.mode !== 'message' && source.mode !== 'followup') || typeof source.textPreview !== 'string') return undefined;
+    return { kind: 'collaboration_message', inboxItemId, sourceId, sourceConversationId, mode: source.mode, textPreview: source.textPreview };
   }
   if (source.kind !== 'subagent') return undefined;
   const submissionId = nonEmptyText(source.submissionId);
@@ -363,6 +370,9 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
         || `后台命令 ${shortIdentity(preview.source.processId)}`;
       return `${command} · ${processOutcomeLabel(preview.source.outcome)}`;
     }
+    if (preview.source.kind === 'collaboration_message') {
+      return `${collaborationSourceLabel(preview.source.sourceConversationId)} · ${preview.source.mode === 'followup' ? '续派任务' : '消息'} · ${preview.source.textPreview}`;
+    }
     const name = subagentName(preview.source.agentId);
     if (preview.source.title) return `${name} · ${preview.source.title}`;
     return `${name} 已返回${preview.source.interrupted ? '中断结果' : '回答'}`;
@@ -371,6 +381,12 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
   if (text) return `${text}${preview.truncated ? '…' : ''}`;
   if (preview.hasAttachments) return '附件消息';
   return '(空消息)';
+}
+
+/** Same peer label as the collaboration cards: the sidebar title, deleted only when removed. */
+function collaborationSourceLabel(conversationId: string): string {
+  const feed = reliableConversation.feed;
+  return `来自${collaborationPeerLabel(resolveCollaborationPeer(feed.records, conversationId, feed.removedConversationIds))}`;
 }
 
 function subagentName(agentId?: string): string {
@@ -416,7 +432,7 @@ function stateLabel(item: QueueItem): string {
   const runtime = runtimePreview(item.preview);
   if (runtime) {
     if (runtime.deliveryState === 'failed') return '续跑失败';
-    return runtime.source.kind === 'background_process' ? '后台结果' : 'Agent 回答';
+    return runtime.source.kind === 'background_process' ? '后台结果' : runtime.source.kind === 'collaboration_message' ? '协作消息（非用户指令）' : 'Agent 回答';
   }
   if (guidancePreview(item.preview)?.hold === 'paused') return '已暂停';
   return '等待引导';
@@ -602,6 +618,13 @@ function timestamp(value: unknown): number {
           />
           <IconTerminal2
             v-else-if="runtimePreview(item.preview)?.source.kind === 'background_process'"
+            class="reliable-queue-source-icon"
+            :size="14"
+            stroke="2"
+            aria-hidden="true"
+          />
+          <IconMessages
+            v-else-if="runtimePreview(item.preview)?.source.kind === 'collaboration_message'"
             class="reliable-queue-source-icon"
             :size="14"
             stroke="2"

@@ -5,6 +5,14 @@ import type { ApplicationStartup } from '../ApplicationStartup';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 
 export function registerCommands(context: vscode.ExtensionContext, startup: ApplicationStartup): void {
+  const runtimeDataSetsCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.manageRuntimeDataSets, async () => {
+    try {
+      const { manageRuntimeDataSets } = await import('./runtimeDataSetManagement');
+      await manageRuntimeDataSets(context, startup);
+    } catch (error) {
+      await vscode.window.showErrorMessage(`历史与存储管理失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
   const openPanelCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.openPanel, async (options?: unknown) => {
     const backendApp = await readyApplication(startup);
     if (!backendApp) return;
@@ -29,7 +37,7 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
       `归档并重置 ${EXTENSION_BRAND} 开发数据？`,
       {
         modal: true,
-        detail: `扩展将先停止所有写入，把受管数据归档到 data root 内的 .limcode-data-backups，然后创建当前数据 epoch。不会删除该目录中的其它用户文件。\n\n${dataRoot}`
+        detail: `扩展将先停止当前历史库的运行，保留完整备份，再创建空历史库。共享设置与其它历史库保留。归档本身不会释放备份占用的磁盘空间。\n\n${dataRoot}`
       },
       '归档并重置'
     );
@@ -59,6 +67,7 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     if (conversationId === undefined) {
       const entries = backendApp.getConversationHistoryEntries();
       const selected = await vscode.window.showQuickPick([
+        { label: '磁盘占用（按需统计）', description: '正文、SQLite、临时文件和历史备份', conversationId: '__storage__' },
         { label: 'Data root（全局）', description: 'writer、StorageHead、WAL、receipt 与全部 loaded Stable ID', conversationId: '' },
         ...entries.map((entry) => ({
           label: entry.title || entry.id,
@@ -69,6 +78,11 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
       if (!selected) return;
       conversationId = selected.conversationId;
     }
+    if (conversationId === '__storage__') {
+      const { showRuntimeStorage } = await import('./runtimeDataSetManagement');
+      await showRuntimeStorage(context);
+      return;
+    }
     const snapshot = await backendApp.inspectReliability(conversationId || undefined);
     const document = await vscode.workspace.openTextDocument({
       language: 'json',
@@ -77,7 +91,7 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     await vscode.window.showTextDocument(document, { preview: true });
   });
 
-  context.subscriptions.push(openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand);
+  context.subscriptions.push(openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand, runtimeDataSetsCommand);
 }
 
 async function readyApplication(startup: ApplicationStartup): Promise<ApplicationFacade | undefined> {

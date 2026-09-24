@@ -1,11 +1,12 @@
 import type { Component } from 'vue';
-import { IconArchive, IconBook, IconFileText, IconImageGeneration, IconMessage, IconPlugConnected, IconServer, IconSettings2, IconSettingsAi, IconTool } from '@tabler/icons-vue';
+import { IconArchive, IconBook, IconFileText, IconImageGeneration, IconMessage, IconPlugConnected, IconRobot, IconServer, IconSettings2, IconSettingsAi, IconTool } from '@tabler/icons-vue';
 import ChannelSettingsTab from './ChannelSettingsTab.vue';
 import CheckpointSettingsTab from './CheckpointSettingsTab.vue';
 import AppearanceSettingsTab from './AppearanceSettingsTab.vue';
 import OtherSettingsTab from './OtherSettingsTab.vue';
 import SystemPromptSettingsTab from './SystemPromptSettingsTab.vue';
 import ToolSettingsTab from './ToolSettingsTab.vue';
+import AgentCollaborationSettingsTab from './AgentCollaborationSettingsTab.vue';
 import McpToolSettingsTab from './McpToolSettingsTab.vue';
 import SkillSettingsTab from './SkillSettingsTab.vue';
 import RulesSettingsTab from './RulesSettingsTab.vue';
@@ -14,7 +15,7 @@ import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 
-export type GlobalSettingsTabKey = 'channels' | 'prompts' | 'tools' | 'mcp-tools' | 'skills' | 'rules' | 'checkpoints' | 'work-environments' | 'appearance' | 'other';
+export type GlobalSettingsTabKey = 'channels' | 'prompts' | 'agent-collaboration' | 'tools' | 'mcp-tools' | 'skills' | 'rules' | 'checkpoints' | 'work-environments' | 'appearance' | 'other';
 
 export interface GlobalSettingsTabDefinition {
   key: GlobalSettingsTabKey;
@@ -57,6 +58,13 @@ export const GLOBAL_SETTINGS_TABS: readonly GlobalSettingsTabDefinition[] = [
     description: '系统提示词与初始上下文',
     icon: IconMessage,
     component: SystemPromptSettingsTab
+  },
+  {
+    key: 'agent-collaboration',
+    label: 'Agent 协作',
+    description: '子 Agent 深度与团队预算',
+    icon: IconRobot,
+    component: AgentCollaborationSettingsTab
   },
   {
     key: 'tools',

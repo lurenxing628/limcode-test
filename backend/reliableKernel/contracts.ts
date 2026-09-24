@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 
-export const RUNTIME_KERNEL_EPOCH = 4;
+export const RUNTIME_KERNEL_EPOCH = 5;
 export const RUNTIME_DATABASE_FILE = 'limcode.sqlite';
 export const RUNTIME_CAS_DIRECTORY = 'cas';
 export const ROOT_BINDING_POINTER_FILE = 'root-binding.json';

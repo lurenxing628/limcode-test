@@ -219,5 +219,19 @@
     "rule": "订阅不得遗漏 snapshotCommitSeq 之后的 commit；changes.commitSeq 必须严格连续，大于 snapshotCommitSeq。",
     "implementationFreedom": "合同不固定具体 mutex/worker 消息实现，但必须证明无 gap。",
     "persistentClientChangeLog": false
+  },
+  "collaborationProjection": {
+    "scope": "selected-conversation-source-or-target-only",
+    "snapshotSelection": "messages-sent-from-or-delivered-into-a-loaded-Turn-plus-incoming-pending-or-failed; each-incoming-card-loads-its-delivery; at-most-200-newest-by-message_seq",
+    "liveWindow": "existing-per-type-bounds-and-atomic-snapshot-refresh",
+    "byteLimitTrim": "a-collaboration-message-trimmed-under-snapshot-maxBytes-takes-its-links-requests-deliveries-to-its-peer-their-inbox-items-and-a-peer-row-no-kept-link-names; oldest-message_seq-first; deliveries-to-the-selected-conversation-stay",
+    "messageBodiesInFeed": false,
+    "messagePreview": "CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read",
+    "deliveryState": "sender-session-also-sees-the-RuntimeDelivery-of-its-loaded-outgoing-messages; newest-attempt-per-target-decides-waiting-failed-or-settled; failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent-or-before-the-first-message-when-older-than-every-message-and-message-1-is-loaded-even-with-a-gap-after-it-or-among-the-newest-3-pinned-below-every-message-when-newer-than-every-message-or-no-message-has-a-creation-time; a-failure-older-than-a-window-that-starts-after-message-1-appears-once-that-history-loads; a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn",
+    "turnPlacement": "incoming-at-the-first-loaded-message-of-its-delivery-Turn-and-outgoing-at-that-of-its-sending-Turn-a-streaming-reply-included; a-loaded-Turn-without-a-loaded-message-places-its-cards-by-when-it-started-after-the-last-message-created-before-it-or-before-the-first-message-when-older-than-every-message-and-message-1-is-loaded-or-below-every-message-ahead-of-that-Turn-notices-when-newer-than-every-message; a-Turn-not-loaded-or-older-than-a-window-that-starts-after-message-1-is-not-guessed; the-empty-conversation-hint-never-stands-in-for-a-card",
+    "boardBodiesInFeed": false,
+    "relations": "independent-message-source-target-reply-and-request-links",
+    "peerConversations": "snapshot-only-collaborationPeerConversations-for-peers-of-the-loaded-links-outside-navigation; sidebar-display_title; runtime-absent-peer-status-deleted; client-reads-only-observed-Conversation-remove-or-deleted-status-as-deleted-and-a-missing-peer-as-unknown",
+    "runtimeContinuationPreview": "collaboration_message-source-kind-retains-sourceConversationId-mode-and-320-character-text-preview; never-user-authorization"
   }
 }

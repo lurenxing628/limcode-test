@@ -14,7 +14,7 @@ import {
   type TaskListSnapshotView
 } from '../../shared/taskListProjection';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
-import { conversationForkSnapshotCopyId } from './conversationForkSnapshot';
+import { toolArtifactsIdentifyCalls } from './copiedToolIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryRead } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
 
@@ -254,39 +254,23 @@ export async function readCurrentTurnTaskCard(
     });
   }
 
-  const copiedArtifacts = calls.flatMap((call) => {
+  // A fork copies ToolCalls under new ids while the artifact content still names the original call.
+  const claimedArtifacts = calls.flatMap((call) => {
     const toolCallId = requiredText(call.id, 'ToolCall.id');
     const artifact = asRecord(artifactByCallId.get(toolCallId));
-    if (
-      !ordering.has(toolCallId)
-      || !artifact
-      || typeof artifact.toolCallId !== 'string'
-      || taskArtifactIdentifiesToolCall(artifact.toolCallId, toolCallId, conversationId)
-    ) return [];
-    return [{ toolCallId, sourceToolCallId: artifact.toolCallId, callSeq: call.call_seq, artifact }];
+    if (!ordering.has(toolCallId) || !artifact || artifact.toolCallId === toolCallId) return [];
+    return [{ call, toolCallId, artifact }];
   });
   let frozenAtCommitSeq = messageBarrier.snapshotCommitSeq;
-  if (copiedArtifacts.length > 0) {
-    const sourcesBarrier = await database.snapshot(copiedArtifacts.flatMap((copy) =>
-      [copy.toolCallId, copy.sourceToolCallId].map((sourceId) =>
-        DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-          where: {
-            source_kind: 'tool_call',
-            source_id: sourceId,
-            source_revision: positiveBigInt(copy.callSeq, 'ToolCall.call_seq')
-          },
-          limit: 2
-        }))));
-    for (const [index, copy] of copiedArtifacts.entries()) {
-      const currentSources = rows(sourcesBarrier.snapshot[index * 2]);
-      const originalSources = rows(sourcesBarrier.snapshot[index * 2 + 1]);
-      if (
-        currentSources.length === 1
-        && originalSources.length === 1
-        && currentSources[0].segment_id === originalSources[0].segment_id
-      ) artifactByCallId.set(copy.toolCallId, { ...copy.artifact, toolCallId: copy.toolCallId });
-    }
-    frozenAtCommitSeq = sourcesBarrier.snapshotCommitSeq;
+  if (claimedArtifacts.length > 0) {
+    const identities = await toolArtifactsIdentifyCalls(database, claimedArtifacts.map(({ call, artifact }) => ({
+      claimedId: artifact.toolCallId,
+      call
+    })));
+    claimedArtifacts.forEach(({ toolCallId, artifact }, index) => {
+      if (identities.identified[index]) artifactByCallId.set(toolCallId, { ...artifact, toolCallId });
+    });
+    frozenAtCommitSeq = identities.snapshotCommitSeq ?? frozenAtCommitSeq;
   }
 
   const operations: CurrentTurnTaskOperationFact[] = [];
@@ -302,7 +286,7 @@ export async function readCurrentTurnTaskCard(
       ...order
     };
     if (call.tool_name === TASK_LIST_TOOL_NAME) {
-      const operation = taskListOperationFromSettledArtifact(artifact, toolCallId, conversationId);
+      const operation = taskListOperationFromSettledArtifact(artifact, toolCallId);
       if (!operation) continue;
       operations.push({ ...common, toolName: TASK_LIST_TOOL_NAME, operation });
       continue;
@@ -313,8 +297,7 @@ export async function readCurrentTurnTaskCard(
     const operation = approvedSubmitPlanTaskOperation({
       argumentsValue: await readJson(contentStore, argsMetadata, 'submit_plan arguments'),
       resultArtifactValue: artifact,
-      toolCallId,
-      conversationId
+      toolCallId
     });
     if (!operation) continue;
     operations.push({
@@ -350,13 +333,15 @@ export function freezeCurrentTurnTaskCard(projection: CurrentTurnTaskProjection)
   };
 }
 
-/** Non-success is not task state; successful settlement alone receives strict canonical parsing. */
+/**
+ * Non-success is not task state; successful settlement alone receives strict canonical parsing.
+ * Callers resolve copied fork identities (copiedToolIdentity) before handing the artifact over.
+ */
 export function taskListOperationFromSettledArtifact(
   value: unknown,
-  expectedToolCallId: string,
-  conversationId?: string
+  expectedToolCallId: string
 ): TaskListToolOperationRecord | undefined {
-  const envelope = taskArtifactEnvelope(value, expectedToolCallId, conversationId);
+  const envelope = taskArtifactEnvelope(value, expectedToolCallId);
   if (envelope.status !== 'succeeded') return undefined;
   const detail = asRecord(envelope.detail);
   if (!detail || detail.kind !== 'task-list') {
@@ -369,9 +354,8 @@ export function approvedSubmitPlanTaskOperation(input: {
   argumentsValue: unknown;
   resultArtifactValue: unknown;
   toolCallId: string;
-  conversationId?: string;
 }): TaskListToolOperationRecord | undefined {
-  const envelope = taskArtifactEnvelope(input.resultArtifactValue, input.toolCallId, input.conversationId);
+  const envelope = taskArtifactEnvelope(input.resultArtifactValue, input.toolCallId);
   if (envelope.status !== 'succeeded') return undefined;
   const output = submitPlanOutputFromResult(envelope.detail);
   if (output?.status !== 'approved' || output.executionTarget !== 'current_conversation') return undefined;
@@ -462,29 +446,14 @@ function cloneOperationFact(fact: CurrentTurnTaskOperationFact): CurrentTurnTask
   };
 }
 
-function taskArtifactEnvelope(
-  value: unknown,
-  expectedToolCallId: string,
-  conversationId?: string
-): TaskArtifactEnvelope {
+function taskArtifactEnvelope(value: unknown, expectedToolCallId: string): TaskArtifactEnvelope {
   const record = asRecord(value);
   if (!record) throw new Error(`ToolResultArtifact ${expectedToolCallId} content is not an object.`);
-  if (!taskArtifactIdentifiesToolCall(record.toolCallId, expectedToolCallId, conversationId)) {
+  if (record.toolCallId !== expectedToolCallId) {
     throw new Error(`ToolResultArtifact ${expectedToolCallId} identifies another ToolCall.`);
   }
   if (typeof record.status !== 'string') throw new Error(`ToolResultArtifact ${expectedToolCallId} has no status.`);
   return { toolCallId: expectedToolCallId, status: record.status, detail: record.detail };
-}
-
-function taskArtifactIdentifiesToolCall(
-  toolCallId: unknown,
-  expectedToolCallId: string,
-  conversationId?: string
-): boolean {
-  return toolCallId === expectedToolCallId
-    || (typeof toolCallId === 'string'
-      && conversationId !== undefined
-      && conversationForkSnapshotCopyId(conversationId, 'tool_call', toolCallId) === expectedToolCallId);
 }
 
 async function readJson(

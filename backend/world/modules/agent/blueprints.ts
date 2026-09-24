@@ -1,5 +1,5 @@
 import { defineResource } from '../../../ecs/types';
-import type { LlmProviderKind, PlanReviewPolicyRecord, ToolPolicyToolConfigRecord, WorkflowIconKey } from '../../../../shared/protocol';
+import type { LlmProviderKind, PlanReviewPolicyRecord, ToolPolicySourceConfigRecord, ToolPolicyToolConfigRecord, WorkflowIconKey } from '../../../../shared/protocol';
 import { EXTENSION_AGENT_NAME, EXTENSION_BRAND } from '../../../../shared/extensionIdentity';
 import {
   ASK_USER_TOOL_NAME,
@@ -12,6 +12,7 @@ import {
   SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
   SUBMIT_AGENT_ANSWER_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
+  TOOL_POLICY_ALL_MCP_SOURCES,
   TRANSFER_TOOL_NAME,
   WRITE_TOOL_NAME
 } from '../../../../shared/protocol';
@@ -28,6 +29,8 @@ export interface BuiltinToolPolicyDefinition {
   name?: string;
   allowedTools: string[];
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
+  /** MCP source restrictions that stay in force even when the scope saves its own record. */
+  sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;
 }
 
 export interface BuiltinAgentDefinition {
@@ -70,9 +73,17 @@ export const DEFAULT_INTEGRATED_SYSTEM_PROMPT = [
   'Replies render as Markdown; local absolute image paths render inline, e.g. ![](/path/to/shot.png), and local file links open in VS Code.'
 ].join('\n\n');
 
-const DEFAULT_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME, READ_TOOL_NAME, EDIT_TOOL_NAME, WRITE_TOOL_NAME, DELETE_TOOL_NAME, 'shell', 'bash', 'run_agent', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME];
-const READONLY_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, READ_TOOL_NAME, 'shell', 'bash', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME];
+const COLLABORATION_TOOLS = ['list_agents', 'send_agent_message', 'followup_agent_task', 'read_agent_messages', 'wait_agent_messages'];
+// The cross-conversation tools belong to no list: the user's switch grants them (only listing and
+// reading where the list lacks run_agent, as in the read-only lists below).
+const DEFAULT_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME, READ_TOOL_NAME, EDIT_TOOL_NAME, WRITE_TOOL_NAME, DELETE_TOOL_NAME, 'shell', 'bash', 'run_agent', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME, ...COLLABORATION_TOOLS];
+const READONLY_TOOLS = [TASK_LIST_TOOL_NAME, ASK_USER_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, SWITCH_WORK_ENVIRONMENT_TOOL_NAME, READ_TOOL_NAME, 'shell', 'bash', SKILLS_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME, READ_AGENT_ANSWER_TOOL_NAME, 'list_agents', 'send_agent_message', 'read_agent_messages', 'wait_agent_messages'];
 const DEFAULT_TOOL_CONFIGS: Record<string, ToolPolicyToolConfigRecord> = {};
+/**
+ * MCP tools may have side effects and are not known to be read-only, so read-only built-ins deny
+ * every MCP source. Enabling a source in that Agent's or workflow's own tool settings opts it in.
+ */
+const READONLY_MCP_SOURCES: Record<string, ToolPolicySourceConfigRecord> = { [TOOL_POLICY_ALL_MCP_SOURCES]: { enabled: false } };
 
 export function createDefaultAgentBlueprints(): BuiltinAgentRegistry {
   return {
@@ -99,7 +110,7 @@ export function createDefaultAgentBlueprints(): BuiltinAgentRegistry {
         name: 'Explore Agent',
         description: 'Read-only Agent for searching, reading, and analyzing code.',
         systemPrompt: 'You are a read-only exploration agent. Inspect code, run safe read-only commands, and report findings. Do not modify files.',
-        toolPolicy: { name: 'Explore Agent Tools', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS }
+        toolPolicy: { name: 'Explore Agent Tools', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS, sourceConfigs: READONLY_MCP_SOURCES }
       },
       reviewer: {
         id: 'reviewer',
@@ -107,7 +118,7 @@ export function createDefaultAgentBlueprints(): BuiltinAgentRegistry {
         name: 'Reviewer',
         description: 'Review code, design, risks, bugs, and maintainability issues. Only use when you are uncertain about the consequences of changes — skip trivial/small modifications and changes you are confident about.',
         systemPrompt: 'Review code, design, risks, bugs, and maintainability issues. Do not modify files unless explicitly requested. Only use this reviewer when you are uncertain about the consequences of changes — skip trivial/small modifications and changes you are confident about.',
-        toolPolicy: { name: 'Reviewer Agent Tools', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS }
+        toolPolicy: { name: 'Reviewer Agent Tools', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS, sourceConfigs: READONLY_MCP_SOURCES }
       }
     },
     workflows: {
@@ -127,14 +138,14 @@ export function createDefaultAgentBlueprints(): BuiltinAgentRegistry {
         name: 'Review',
         description: 'Review workflow: assess risks, correctness, regressions, security, and maintainability.',
         systemPrompt: 'Act in review workflow. Focus on correctness, risks, regressions, security, maintainability, and concrete improvement suggestions.',
-        toolPolicy: { name: 'Review Workflow Tool Narrowing', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS }
+        toolPolicy: { name: 'Review Workflow Tool Narrowing', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS, sourceConfigs: READONLY_MCP_SOURCES }
       },
       readonly: {
         id: 'builtin:readonly',
         name: 'Read Only',
         description: 'Read-only exploration workflow with tool narrowing to read-only tools.',
         systemPrompt: 'Use read-only exploration workflow. Do not modify files or execute destructive commands.',
-        toolPolicy: { name: 'Read Only Workflow Tools', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS }
+        toolPolicy: { name: 'Read Only Workflow Tools', allowedTools: READONLY_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS, sourceConfigs: READONLY_MCP_SOURCES }
       }
     }
   };

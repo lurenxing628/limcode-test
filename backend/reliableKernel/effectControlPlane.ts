@@ -3250,7 +3250,7 @@ export class EffectControlPlane {
       checkpointContent.toolName !== entry.toolName
       || checkpointContent.providerCallId !== providerCallId
       || checkpointContent.providerOrdinal !== entry.providerOrdinal
-      || canonicalJson(checkpointContent.arguments) !== canonicalJson(entry.arguments)
+      || canonicalJson(checkpointContent.resolvedArguments) !== canonicalJson(entry.arguments)
     ) {
       throw new Error(
         `Native checkpoint ${String(checkpoint.id)} does not match ToolCall ${entry.toolCallId} identity.`

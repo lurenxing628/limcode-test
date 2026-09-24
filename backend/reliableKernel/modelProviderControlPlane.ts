@@ -2,12 +2,16 @@ import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
 import { createHash } from 'node:crypto';
+import { compressionExecutionMetadata, readProviderRequestFailure, safeProviderFailureMessage,
+  type CompressionRequestPurpose, type CompressionRecoveryDecision, type ProviderRequestFailureFact
+} from '../../shared/compressionExecution';
 import { performance } from 'node:perf_hooks';
 import { normalizeLlmCompressionMaxDurationMinutes, type AttachmentCatalogEntry } from '../../shared/protocol';
 import {
   collectAttachmentCatalogFromStoredItems,
   mergeAttachmentCatalog,
   normalizeAttachmentCatalogState,
+  renderAttachmentCatalogPlacement,
   type AttachmentCatalogState
 } from './attachmentCatalog';
 import {
@@ -24,7 +28,18 @@ import {
   type ContentObjectMetadata
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { ContextSequenceControlPlane } from './contextSequence';
+import { ContextSequenceControlPlane, type MaterializedContextSegment } from './contextSequence';
+import {
+  claudeTurnScopedCompaction,
+  claudeTurnScopedRemindersEnabled,
+  projectTurnReminder,
+  recipeReinjectedCurrentTurnInput,
+  recipeSentClaudeTurnScopedReminders,
+  type ReinjectedCurrentTurnInputReference,
+  type TurnReminderIdentitySplit
+} from './turnReminderProjection';
+import { modelHandleRef, normalizeModelHandleCatalog } from './modelHandleCatalog';
+import { expandTextCompressionSources } from './compressionSourceReplay';
 import {
   estimateRequestAuthorityTokens,
   ReliableContextTokenEstimator
@@ -129,6 +144,8 @@ export interface FullProviderRequest {
   settingsSnapshot?: PlainJsonValue;
   recipe: PlainJsonValue;
   context: FullProviderContextItem[];
+  /** Read-only native-source expansion for text summaries; the canonical head is unchanged. */
+  compressionSourceContext?: FullProviderContextItem[];
   /** Frozen relation-derived model state; never persisted in Context or compression envelopes. */
   attachmentCatalogState: AttachmentCatalogState;
   /**
@@ -137,6 +154,12 @@ export interface FullProviderRequest {
    * async-marked call items; populated only for native-frozen requests.
    */
   nativeAsyncAdmittedCallIds?: readonly string[];
+  /**
+   * 这个对话已经选定的 Claude 保留思考处理（官方要求随会话保存、重启后也带上、去掉的思考块不再放回）：
+   * 取发送窗口里各条模型输出所属请求终态里记下的处理中最强的一种。fork 复制请求时一并复制；压缩掉的输出不在窗口里，
+   * 它们的思考块也不会再发送。
+   */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
   requestAddenda?: {
     currentTurnInput?: {
       messageId: string;
@@ -148,12 +171,45 @@ export interface FullProviderRequest {
     };
     turnReminder?: {
       content: string;
+      /** 有运行状态卡时才有：轮内系统消息模式下运行状态卡保持 user 身份，只有其余部分作为系统消息。 */
+      identitySplit?: TurnReminderIdentitySplit;
       taskCardSha256?: string;
       unfinishedTaskCount: number;
       activeChildCount: number;
       runningProcessCount: number;
     };
+    /**
+     * Claude 轮内系统消息模式（本轮冻结开关打开）才有：之前每次请求发过、之后仍要原样放回的内容，按那次请求冻结的
+     * recipe 逐字节重新生成，挂在那次请求模型输出所在的 Context 片段上，发送时放回它的前面。
+     * - content：那次请求的提醒；
+     * - reinjectedInput：那次请求作为易失尾巴重新注入的当前 Turn 输入。同一窗口里同一条输入只在第一次出现时带上：
+     *   之后的请求看到它已在窗口里，尾巴不再重发，因此也就没有要放回的副本。
+     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里；recipe 没记着按轮内方式发出的请求（开关打开之前以尾巴
+     * 方式发出的）也不会：那份提醒当时只是尾巴。普通请求与同渠道同模型的 Claude 原生压缩请求才有。
+     */
+    turnReminderHistory?: TurnReminderHistoryEntry[];
   };
+}
+
+export interface TurnReminderHistoryEntry {
+  segmentId: string;
+  content?: string;
+  /** 那次请求提醒的身份拆分（有运行状态卡时）；与那次请求发出时相同。 */
+  identitySplit?: TurnReminderIdentitySplit;
+  reinjectedInput?: {
+    messageRevisionId: string;
+    contentType: string;
+    content: string;
+    /** 那次请求随重新注入的输入一起渲染的本 Turn 附件目录增量（current_turn_delta）。 */
+    currentTurnAttachmentState?: MessageContent;
+  };
+}
+
+/** 一次历史请求要原样放回的内容，只取决于它不可变的 recipe。 */
+interface HistoricalRequestFacts {
+  reminder?: string;
+  reminderIdentitySplit?: TurnReminderIdentitySplit;
+  reinjectedInput?: ReinjectedCurrentTurnInputReference & { currentTurnAttachmentState?: MessageContent };
 }
 
 export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed' | 'native_control';
@@ -167,6 +223,8 @@ export interface ProviderStreamEvent {
   content: PlainJsonValue;
   usage?: PlainJsonValue;
   timing?: ProviderStreamTiming;
+  /** completed 才有：这次请求实际使用的 Claude 保留思考处理，写进请求终态，之后的请求按对话沿用。 */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
   /** Process-local signal: false for synthetic clocks such as thought_progress. Never persisted. */
   semanticProgress?: boolean;
 }
@@ -324,6 +382,28 @@ export class ProviderTransientError extends Error {
   }
 }
 
+export type ProviderCapabilityFailureReason =
+  | 'native_compaction_unsupported'
+  | 'unsupported_parameter'
+  | 'unsupported_reasoning_mode'
+  | 'provider_contract_violation';
+
+/** Permanent Provider capability mismatch. It must not consume transient retry budget. */
+export class ProviderCapabilityError extends Error {
+  public readonly code = 'PROVIDER_CAPABILITY_MISMATCH';
+  public readonly retryable = false;
+
+  public constructor(
+    public readonly reason: ProviderCapabilityFailureReason,
+    message: string,
+    public readonly status?: number,
+    public readonly endpointKind?: string
+  ) {
+    super(message);
+    this.name = 'ProviderCapabilityError';
+  }
+}
+
 type ModelStreamCheckpointKind =
   | 'output_delta'
   | 'output_item_done'
@@ -333,6 +413,9 @@ type ModelStreamCheckpointKind =
   | 'terminal_summary';
 
 interface StreamStats {
+  compressionPurpose?: CompressionRequestPurpose;
+  compressionDecision?: CompressionRecoveryDecision;
+  failure?: ProviderRequestFailureFact;
   thinkingSelection?: string;
   attemptSeq: string;
   socketGeneration: string;
@@ -354,6 +437,8 @@ interface StreamStats {
    * the original ModelContextProjection root; never substituted by later/cumulative usage.
    */
   nativeInitialPromptTokenCount?: number;
+  /** 终态才写：这次请求实际使用的 Claude 保留思考处理（按对话沿用，见 FullProviderRequest.claudeThinkingBinding）。 */
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
 
 interface StreamIdentity {
@@ -419,6 +504,7 @@ export class ModelProviderControlPlane {
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
+  private readonly historicalTurnReminders = new Map<string, HistoricalRequestFacts | null>();
   /** Durable Astra steering submissions/receipts; shared with the Agent loop's native session. */
   public readonly nativeSteering: NativeSteeringStore;
   private handoff: ExecutionHandoffError | undefined;
@@ -470,6 +556,23 @@ export class ModelProviderControlPlane {
     return this.attachmentHandles.ensure(conversationId, catalog);
   }
 
+  /**
+   * The request settings a new request of this authority would freeze now: the current generation
+   * and compression settings for its model selection. Read-only; freezeRequestSettings stores them.
+   */
+  public async resolveCurrentRequestSettings(
+    authority: PlainJsonValue,
+    conversationId: string
+  ): Promise<PlainJsonValue | undefined> {
+    if (!this.compressionSettingsAuthority) return undefined;
+    const model = frozenModelSelection(authority);
+    const generation = await this.compressionSettingsAuthority.loadRequestGenerationSettings?.(model, requireId(conversationId, 'conversationId'));
+    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(model, generation?.generationConfig);
+    const snapshot = normalizePlainJson({ requestCompression: selected, ...(generation ? { requestGeneration: generation } : {}) }, '请求设置');
+    applyRequestCompressionSettings(authority, snapshot);
+    return snapshot;
+  }
+
   public async freezeRequestSettings(turnId: string, authoritySnapshotId: string): Promise<string | undefined> {
     if (!this.compressionSettingsAuthority) return undefined;
     const lastRead = await this.database.snapshot([
@@ -487,12 +590,12 @@ export class ModelProviderControlPlane {
       }
     }
     const frozen = await readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId);
-    const model = frozenModelSelection(frozen.document);
-    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(model);
     const turn = await this.requireDomain('Turn', turnId);
-    const generation = await this.compressionSettingsAuthority.loadRequestGenerationSettings?.(model, requireId(turn.conversation_id, 'Turn.conversation_id'));
-    const snapshot = normalizePlainJson({ requestCompression: selected, ...(generation ? { requestGeneration: generation } : {}) }, '请求设置');
-    applyRequestCompressionSettings(frozen.document, snapshot);
+    const snapshot = await this.resolveCurrentRequestSettings(
+      frozen.document,
+      requireId(turn.conversation_id, 'Turn.conversation_id')
+    );
+    if (snapshot === undefined) return undefined;
     const content = await this.contentStore.ingest(
       this.database, canonicalPlainJson(snapshot), 'application/vnd.limcode.model-request-settings+json'
     );
@@ -576,7 +679,9 @@ export class ModelProviderControlPlane {
     const recipeContent = await this.contentStore.prepare(this.database, recipeBytes, CONTENT_TYPE_RECIPE);
     const now = this.timestamp();
     const generationModel = isRecord(frozen.document) && isRecord(frozen.document.model) ? frozen.document.model : undefined;
-    const initialStats: StreamStats = { attemptSeq: '1', socketGeneration: '0', retryReason: null,
+    const initialStats: StreamStats = {
+      attemptSeq: '1', socketGeneration: '0', retryReason: null,
+      ...compressionExecutionMetadata(recipe),
       ...(!compressionRequest && generationModel?.generationConfig ? { thinkingSelection: `${frozenModelId}: ${generationModel.thinkingControlledByBody ? '由自定义请求体控制' : sessionThinkingDisplayLabel(generationModel.provider as LlmProviderKind, frozenModelId, generationModel.thinkingConfig as LlmThinkingConfigRecord)}` } : {})
     };
     const steps: RepositoryTransactionStep[] = [
@@ -711,9 +816,9 @@ export class ModelProviderControlPlane {
       materialized.segments
     );
     const requestCreatedAt = domainTimestampMs(request.created_at);
-    const requestAddenda = await this.materializeRequestAddenda(
-      recipe,
-      requireId(request.turn_id, 'ModelRequest.turn_id')
+    const requestAddenda = withTurnReminderHistory(
+      await this.materializeRequestAddenda(recipe, requireId(request.turn_id, 'ModelRequest.turn_id')),
+      await this.materializeTurnReminderHistory(frozenAuthority, recipe, providerSegments)
     );
     const attachmentCatalogState = normalizeAttachmentCatalogState(
       isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
@@ -730,6 +835,21 @@ export class ModelProviderControlPlane {
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
+    if (isRecord(recipe) && recipe.sourceReplay !== undefined
+      && recipe.sourceReplay !== 'immutable_provenance') {
+      throw new TypeError('Unsupported compression source replay policy.');
+    }
+    const sourceReplay = isRecord(recipe) && recipe.sourceReplay === 'immutable_provenance'
+      ? 'immutable_provenance' as const
+      : undefined;
+    if (sourceReplay && (!compressionPolicy || !isRecord(recipe) || recipe.trigger !== 'manual')) {
+      throw new TypeError('Immutable compression source replay requires an explicit manual compression request.');
+    }
+    const compressionSourceContext = compressionPolicy && isRecord(recipe)
+      && (recipe.compressionMethodKind !== 'provider_native' || sourceReplay)
+      ? await expandTextCompressionSources(this.database, this.contentStore, frozen.conversationId, providerContext,
+          sourceReplay ? { sourceReplay } : {})
+      : undefined;
     assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,
       ...(requestAddenda.requestAddenda?.currentTurnInput
@@ -752,10 +872,12 @@ export class ModelProviderControlPlane {
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
       context: providerContext,
+      ...(compressionSourceContext ? { compressionSourceContext } : {}),
       attachmentCatalogState,
       ...(nativeAdmittedCallIds !== undefined && nativeAdmittedCallIds.length > 0
         ? { nativeAsyncAdmittedCallIds: nativeAdmittedCallIds }
         : {}),
+      ...conversationClaudeThinkingBinding(providerSegments),
       ...requestAddenda
     };
   }
@@ -784,7 +906,10 @@ export class ModelProviderControlPlane {
       throw new Error('Preview Context projection belongs to another Conversation.');
     }
     const model = frozenModelIdentity(frozen.document);
-    const requestAddenda = await this.materializeRequestAddenda(recipe, turnId);
+    const requestAddenda = withTurnReminderHistory(
+      await this.materializeRequestAddenda(recipe, turnId),
+      await this.materializeTurnReminderHistory(frozen.document, recipe, materialized.segments)
+    );
     const attachmentCatalogState = normalizeAttachmentCatalogState(
       isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
       'ModelRequest preview recipe.attachmentCatalogState'
@@ -818,6 +943,7 @@ export class ModelProviderControlPlane {
       recipe,
       context: providerContext,
       attachmentCatalogState,
+      ...conversationClaudeThinkingBinding(materialized.segments),
       ...requestAddenda
     };
   }
@@ -1458,7 +1584,8 @@ export class ModelProviderControlPlane {
       streamSeq: event.streamSeq,
       content: event.content,
       ...(event.usage !== undefined ? { usage: event.usage } : {}),
-      ...(event.timing !== undefined ? { timing: event.timing } : {})
+      ...(event.timing !== undefined ? { timing: event.timing } : {}),
+      ...(completed && event.claudeThinkingBinding ? { claudeThinkingBinding: event.claudeThinkingBinding } : {})
     });
   }
 
@@ -1577,6 +1704,7 @@ export class ModelProviderControlPlane {
       content: PlainJsonValue;
       usage?: PlainJsonValue;
       timing?: ProviderStreamTiming;
+      claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
     }
   ): Promise<StreamEventResult> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
@@ -1693,7 +1821,7 @@ export class ModelProviderControlPlane {
       contentObject: content.metadata,
       ...(content.insert ? { contentInsert: content.insert } : {}),
       usage: completed ? (event.usage ?? null) : null,
-      terminalStats: completed ? terminalStreamStats(stats, event.timing) : null,
+      terminalStats: completed ? terminalStreamStats(stats, event.timing, event.claudeThinkingBinding) : null,
       now: this.timestamp()
     });
     transactionCount = result.commit ? 1 : 0;
@@ -1805,7 +1933,8 @@ export class ModelProviderControlPlane {
         retryReason: reason,
         retryMaxAttempts: maxRetries,
         retryDelayMs: delayMs,
-        retryNotBeforeAt
+        retryNotBeforeAt,
+        ...compressionExecutionMetadata(currentStats)
       };
       try {
         await this.database.transaction([
@@ -1981,14 +2110,15 @@ export class ModelProviderControlPlane {
     return this.terminalizeRequest(modelRequestId, identity, {
       attemptStatus: 'failed',
       operationStatus: 'failed',
-      terminalState: providerFailureTerminalState(error)
+      terminalState: providerFailureTerminalState(error),
+      failure: providerFailureFact(error)
     });
   }
 
   private async terminalizeRequest(
     modelRequestId: string,
     identity: StreamIdentity,
-    terminal: { attemptStatus: string; operationStatus: string; terminalState: string }
+    terminal: { attemptStatus: string; operationStatus: string; terminalState: string; failure?: ProviderRequestFailureFact }
   ): Promise<boolean> {
     // The full stream_stats assert doubles as the identity fence, but the activity heartbeat also
     // writes that column. A benign metadata write must not strand the request non-terminal:
@@ -2015,7 +2145,10 @@ export class ModelProviderControlPlane {
             status: terminal.operationStatus, updated_at: now
           }),
           DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-            status: 'terminal', terminal_state: terminal.terminalState, updated_at: now
+            status: 'terminal', terminal_state: terminal.terminalState, updated_at: now,
+            ...(terminal.failure ? { stream_stats_json: {
+              ...currentStats, failure: terminal.failure, completedAt: this.epochNow()
+            } } : {})
           })
         ]);
         return true;
@@ -2154,37 +2287,121 @@ export class ModelProviderControlPlane {
         )
       };
     }
-    const task = recipe.turnTaskCardReminderEnabled === false
-      ? undefined
-      : isRecord(recipe.turnTaskCard) ? recipe.turnTaskCard : undefined;
-    const runtime = isRecord(recipe.runtimeStatusCard) ? recipe.runtimeStatusCard : undefined;
-    const completionCheck = isRecord(recipe.openTaskCompletionCheck)
-      ? recipe.openTaskCompletionCheck
-      : undefined;
-    const reminderParts = [
-      typeof task?.card === 'string' && task.card.trim() ? task.card.trim() : '',
-      typeof completionCheck?.card === 'string' && completionCheck.card.trim()
-        ? completionCheck.card.trim()
-        : '',
-      typeof runtime?.card === 'string' && runtime.card.trim() ? runtime.card.trim() : ''
-    ].filter(Boolean);
-    const unfinishedTaskCount = nonNegativeRecipeInteger(task?.counts, 'unfinished');
-    const activeChildCount = nonNegativeRecipeInteger(runtime, 'activeChildCount');
-    const runningProcessCount = nonNegativeRecipeInteger(runtime, 'runningProcessCount');
-    const turnReminder = reminderParts.length === 0 ? undefined : {
-      content: reminderParts.join('\n\n'),
-      ...(typeof task?.cardSha256 === 'string' && task.cardSha256.trim()
-        ? { taskCardSha256: task.cardSha256.trim() }
-        : {}),
-      unfinishedTaskCount,
-      activeChildCount,
-      runningProcessCount
-    };
+    const turnReminder = projectTurnReminder(recipe);
     if (!currentTurnInput && !turnReminder) return {};
     return { requestAddenda: {
       ...(currentTurnInput ? { currentTurnInput } : {}),
       ...(turnReminder ? { turnReminder } : {})
     } };
+  }
+
+  /**
+   * Claude 轮内系统消息模式下，之前每次请求发过、之后仍要原样放回的内容（见 FullProviderRequest.requestAddenda.turnReminderHistory）。
+   * 每条模型输出片段经 ModelRequestMessageLink 找到产生它的 ModelRequest，再从它冻结的 recipe 重新生成：提醒用同一个
+   * projectTurnReminder，重新注入的输入读 recipe 冻结的那条输入与附件目录增量。重试共用一个 ModelRequest，恢复与重启只读
+   * 持久事实，fork 复制的请求共用同一个 recipe 对象，压缩掉的片段不在 Context 里；没有模型输出进入 Context 的请求不会被找到。
+   *
+   * 重新注入的输入在一个窗口里只放回第一次：那次请求的尾巴带着它，之后的请求看到窗口里已有它（本方法同样的判断），
+   * 尾巴不再重发。这个判断只看本窗口里排在前面的片段，也就是之后那些请求各自的窗口，所以每次得到同样的结果。
+   */
+  private async materializeTurnReminderHistory(
+    authority: PlainJsonValue,
+    recipe: PlainJsonValue,
+    segments: readonly MaterializedContextSegment[]
+  ): Promise<TurnReminderHistoryEntry[] | undefined> {
+    const ordinary = isRecord(recipe) && recipe.kind === 'reliable-agent-turn' && claudeTurnScopedRemindersEnabled(authority);
+    if (!ordinary && !claudeTurnScopedCompaction(authority, recipe)) return undefined;
+    const sources = segments.filter((segment) => segment.segmentKind === 'message'
+      && segment.messageRole === 'model'
+      && typeof segment.sourceRecipeObjectId === 'string');
+    if (sources.length === 0) return undefined;
+    // 本次用到的结果放在局部表里：缓存有界，边读边淘汰不能让某一条提醒悄悄消失。
+    const facts = new Map<string, HistoricalRequestFacts | null>();
+    const missing: string[] = [];
+    for (const id of new Set(sources.map((segment) => segment.sourceRecipeObjectId as string))) {
+      const cached = this.historicalTurnReminders.get(id);
+      if (cached === undefined) missing.push(id);
+      else facts.set(id, cached);
+    }
+    for (let offset = 0; offset < missing.length; offset += HISTORICAL_REMINDER_READ_BATCH) {
+      const ids = missing.slice(offset, offset + HISTORICAL_REMINDER_READ_BATCH);
+      const snapshot = await this.database.snapshot(ids.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
+      const metadata = snapshot.snapshot.map((row, index) => requireRow(row, `ModelRequest recipe ContentObject ${ids[index]}`));
+      const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
+      ids.forEach((id, index) => {
+        const historical = historicalRequestFacts(parsePlainJson(bytes[index], `ModelRequest recipe ${id}`), id);
+        facts.set(id, historical);
+        this.rememberHistoricalTurnReminder(id, historical);
+      });
+    }
+    const placedInputs = new Set<string>();
+    const planned: Array<{
+      segmentId: string;
+      reminder?: string;
+      reminderIdentitySplit?: TurnReminderIdentitySplit;
+      input?: HistoricalRequestFacts['reinjectedInput'];
+    }> = [];
+    for (const segment of sources) {
+      const historical = facts.get(segment.sourceRecipeObjectId as string);
+      if (!historical) continue;
+      const input = historical.reinjectedInput && !placedInputs.has(historical.reinjectedInput.messageRevisionId)
+        ? historical.reinjectedInput
+        : undefined;
+      if (input) placedInputs.add(input.messageRevisionId);
+      if (historical.reminder === undefined && !input) continue;
+      planned.push({
+        segmentId: segment.segmentId,
+        ...(historical.reminder !== undefined ? { reminder: historical.reminder } : {}),
+        ...(historical.reminderIdentitySplit ? { reminderIdentitySplit: historical.reminderIdentitySplit } : {}),
+        ...(input ? { input } : {})
+      });
+    }
+    if (planned.length === 0) return undefined;
+    const inputObjectIds = [...new Set(planned.flatMap((entry) => entry.input ? [entry.input.contentObjectId] : []))];
+    const inputs = new Map<string, { contentType: string; content: string }>();
+    if (inputObjectIds.length > 0) {
+      const snapshot = await this.database.snapshot(inputObjectIds.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
+      const metadata = snapshot.snapshot.map((row, index) =>
+        requireRow(row, `Reinjected current Turn input ContentObject ${inputObjectIds[index]}`));
+      const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
+      inputObjectIds.forEach((id, index) => inputs.set(id, {
+        contentType: requireText(metadata[index].content_type, 'Reinjected current Turn input ContentObject.content_type'),
+        content: decodeUtf8Exact(bytes[index], `Reinjected current Turn input ${id}`)
+      }));
+    }
+    return planned.map((entry) => {
+      const input = entry.input ? inputs.get(entry.input.contentObjectId) : undefined;
+      return {
+        segmentId: entry.segmentId,
+        ...(entry.reminder !== undefined ? { content: entry.reminder } : {}),
+        ...(entry.reminderIdentitySplit ? { identitySplit: entry.reminderIdentitySplit } : {}),
+        ...(entry.input && input
+          ? {
+              reinjectedInput: {
+                messageRevisionId: entry.input.messageRevisionId,
+                contentType: input.contentType,
+                content: input.content,
+                ...(entry.input.currentTurnAttachmentState
+                  ? { currentTurnAttachmentState: entry.input.currentTurnAttachmentState }
+                  : {})
+              }
+            }
+          : {})
+      };
+    });
+  }
+
+  /** recipe 是不可变的内容寻址对象，按对象 id 缓存生成结果；有界，超出时淘汰最早的条目。 */
+  private rememberHistoricalTurnReminder(
+    recipeObjectId: string,
+    facts: HistoricalRequestFacts | null
+  ): void {
+    this.historicalTurnReminders.set(recipeObjectId, facts);
+    while (this.historicalTurnReminders.size > HISTORICAL_REMINDER_CACHE_LIMIT) {
+      const oldest = this.historicalTurnReminders.keys().next().value;
+      if (oldest === undefined) break;
+      this.historicalTurnReminders.delete(oldest);
+    }
   }
 
   private async replayCreation(
@@ -2536,7 +2753,7 @@ function compressionRequestSegments<T>(
   if (!Number.isSafeInteger(count) || (count as number) <= 0 || (count as number) > segments.length) {
     throw new Error('Compression recipe sourceSegmentCount is outside the frozen Context projection.');
   }
-  if (recipe.compressionMethodKind === 'openai_responses_compact') {
+  if (recipe.compressionMethodKind === 'provider_native') {
     if (count !== segments.length) {
       throw new Error('Provider-native compression must freeze the complete model-visible Context projection.');
     }
@@ -2608,10 +2825,49 @@ function estimateFullProviderContextFallback(request: FullProviderRequest): numb
   }, 0);
 }
 
-function nonNegativeRecipeInteger(container: PlainJsonValue | undefined, key: string): number {
-  const record = isRecord(container) ? container : undefined;
-  const value = record?.[key];
-  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : 0;
+const HISTORICAL_REMINDER_READ_BATCH = 200;
+const HISTORICAL_REMINDER_CACHE_LIMIT = 4096;
+
+/**
+ * 一次历史请求要原样放回的内容：它的提醒，以及它作为易失尾巴重新注入的当前 Turn 输入（连同那次一起渲染的
+ * current_turn_delta 附件目录，用那次 recipe 冻结的附件目录与模型句柄，与当时 llmCapabilityProviderAdapter 渲染的逐字节相同）。
+ * 只有 recipe 记着当时就按轮内系统消息发出的请求才有：以尾巴方式发出的提醒与输入副本只在那次请求里出现过，不补回历史。
+ */
+function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string): HistoricalRequestFacts | null {
+  if (!recipeSentClaudeTurnScopedReminders(recipe)) return null;
+  const projected = projectTurnReminder(recipe);
+  const reminder = projected?.content;
+  const input = recipeReinjectedCurrentTurnInput(recipe);
+  if (reminder === undefined && !input) return null;
+  let currentTurnAttachmentState: MessageContent | undefined;
+  if (input && isRecord(recipe)) {
+    const state = normalizeAttachmentCatalogState(
+      recipe.attachmentCatalogState,
+      `ModelRequest recipe ${recipeObjectId}.attachmentCatalogState`
+    );
+    const delta = state.placements.find((placement) => placement.kind === 'current_turn_delta');
+    if (delta) {
+      const handles = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+      currentTurnAttachmentState = renderAttachmentCatalogPlacement(delta, (entry) => {
+        const ref = modelHandleRef(handles, 'attachment', entry.attachmentId);
+        if (!ref) throw new Error(`Attachment ${entry.attachmentId} has no frozen model handle.`);
+        return ref;
+      });
+    }
+  }
+  return {
+    ...(reminder !== undefined ? { reminder } : {}),
+    ...(projected?.identitySplit ? { reminderIdentitySplit: projected.identitySplit } : {}),
+    ...(input ? { reinjectedInput: { ...input, ...(currentTurnAttachmentState ? { currentTurnAttachmentState } : {}) } } : {})
+  };
+}
+
+function withTurnReminderHistory(
+  addenda: Pick<FullProviderRequest, 'requestAddenda'>,
+  history: TurnReminderHistoryEntry[] | undefined
+): Pick<FullProviderRequest, 'requestAddenda'> {
+  if (!history) return addenda;
+  return { requestAddenda: { ...addenda.requestAddenda, turnReminderHistory: history } };
 }
 
 function dispatchResult(
@@ -2713,6 +2969,7 @@ function normalizeStreamEvent(event: ProviderStreamEvent): {
   content: PlainJsonValue;
   usage?: PlainJsonValue;
   timing?: ProviderStreamTiming;
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 } {
   if (!event || !['output_delta', 'output_item_done', 'completed', 'native_control'].includes(event.kind)) {
     throw new TypeError(`Unsupported Provider stream event: ${String(event?.kind)}`);
@@ -2724,8 +2981,23 @@ function normalizeStreamEvent(event: ProviderStreamEvent): {
     streamSeq,
     content: normalizePlainJson(event.content, 'Provider stream event content'),
     ...(event.usage !== undefined ? { usage: normalizePlainJson(event.usage, 'Provider stream usage') } : {}),
-    ...(event.timing !== undefined ? { timing: normalizeProviderTiming(event.timing) } : {})
+    ...(event.timing !== undefined ? { timing: normalizeProviderTiming(event.timing) } : {}),
+    ...(event.claudeThinkingBinding === 'drop_block' || event.claudeThinkingBinding === 'strip_thinking'
+      ? { claudeThinkingBinding: event.claudeThinkingBinding }
+      : {})
   };
+}
+
+/** 发送窗口里各条模型输出所属请求终态里记下的 Claude 保留思考处理中最强的一种。 */
+function conversationClaudeThinkingBinding(
+  segments: readonly Pick<MaterializedContextSegment, 'sourceClaudeThinkingBinding'>[]
+): Pick<FullProviderRequest, 'claudeThinkingBinding'> {
+  let binding: FullProviderRequest['claudeThinkingBinding'];
+  for (const segment of segments) {
+    if (segment.sourceClaudeThinkingBinding === 'strip_thinking') return { claudeThinkingBinding: 'strip_thinking' };
+    if (segment.sourceClaudeThinkingBinding === 'drop_block') binding = 'drop_block';
+  }
+  return binding ? { claudeThinkingBinding: binding } : {};
 }
 
 function parseStreamStats(value: unknown): StreamStats {
@@ -2739,7 +3011,12 @@ function parseStreamStats(value: unknown): StreamStats {
     attemptSeq,
     socketGeneration,
     ...(typeof value.thinkingSelection === 'string' ? { thinkingSelection: value.thinkingSelection } : {}),
+    ...(value.claudeThinkingBinding === 'drop_block' || value.claudeThinkingBinding === 'strip_thinking'
+      ? { claudeThinkingBinding: value.claudeThinkingBinding }
+      : {}),
     retryReason: value.retryReason as ProviderTransientReason | null,
+    ...compressionExecutionMetadata(value),
+    ...(value.failure === undefined ? {} : { failure: readProviderRequestFailure(value.failure) }),
     ...(optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) !== undefined
       ? { retryMaxAttempts: optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) }
       : {}),
@@ -2780,8 +3057,12 @@ function normalizeNativeCapabilitiesSummary(value: unknown): OpenAIResponsesNati
   };
 }
 
-function terminalStreamStats(stats: StreamStats, timing?: ProviderStreamTiming): DomainRow {
-  const terminal: DomainRow = { ...stats, ...(timing ?? {}) };
+function terminalStreamStats(
+  stats: StreamStats,
+  timing?: ProviderStreamTiming,
+  claudeThinkingBinding?: 'drop_block' | 'strip_thinking'
+): DomainRow {
+  const terminal: DomainRow = { ...stats, ...(timing ?? {}), ...(claudeThinkingBinding ? { claudeThinkingBinding } : {}) };
   delete terminal.lastStreamSeq;
   delete terminal.lastStreamEventAt;
   return terminal;
@@ -3000,4 +3281,29 @@ function normalizeModelRequestRecipe(value: PlainJsonValue, label: string): Plai
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Preserve the error's classification atomically with request termination, not only its formatted string. */
+function providerFailureFact(error: unknown): ProviderRequestFailureFact {
+  const raw = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const message = safeProviderFailureMessage(error instanceof Error ? error.message : String(error));
+  const code = typeof raw.code === 'string' ? raw.code.slice(0, 128) : undefined;
+  const status = Number.isInteger(raw.status) && Number(raw.status) >= 100 && Number(raw.status) <= 599
+    ? Number(raw.status) : undefined;
+  const category: ProviderRequestFailureFact['category'] = error instanceof ProviderCapabilityError ? 'capability'
+    : error instanceof ProviderTransientError ? 'transient'
+      : error instanceof Error && (error.name === 'AbortError' || isExecutionHandoffError(error)) ? 'cancelled'
+        : error instanceof TypeError || code && /^(SQLITE|RUNTIME|MODEL_|CONTENT_)/.test(code) ? 'internal'
+          : 'permanent';
+  return {
+    category, message,
+    ...(code ? { code } : {}), ...(status === undefined ? {} : { status }),
+    ...(typeof raw.reason === 'string' && raw.reason ? { reason: raw.reason.slice(0, 128) } : {}),
+    ...(typeof raw.endpointKind === 'string' && raw.endpointKind ? { endpointKind: raw.endpointKind.slice(0, 128) } : {})
+  };
+}
+
+export function restoredProviderRequestFailure(factInput: unknown, terminalState: string): Error {
+  const fact = readProviderRequestFailure(factInput);
+  return Object.assign(new Error(fact.message), fact, { terminalState });
 }

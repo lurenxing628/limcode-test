@@ -6,6 +6,8 @@ import { deleteToolModule } from './delete';
 import { editToolModule } from './edit';
 import { readFileToolModule } from './readFile';
 import { runAgentToolModule } from './runAgent';
+import { agentCollaborationToolModules } from './agentCollaboration';
+import { crossConversationToolModules } from './crossConversation';
 import { submitPlanToolModule } from './submitPlan';
 import { switchWorkEnvironmentToolModule } from './switchWorkEnvironment';
 import { taskListToolModule } from './taskList';
@@ -15,6 +17,9 @@ import { skillsToolModule } from './skills';
 import type { ToolDefinitionContext, ToolDefinitionModule } from './types';
 
 export * from './types';
+export * from './agentCollaboration';
+export * from './crossConversation';
+export * from './agentBoard';
 export { askUserTool, askUserToolModule } from './askUser';
 export { submitPlanTool, submitPlanToolModule } from './submitPlan';
 export { readAgentAnswerTool, readAgentAnswerToolModule, submitAgentAnswerTool, submitAgentAnswerToolModule } from './agentAnswer';
@@ -43,6 +48,8 @@ const BUILTIN_TOOL_MODULES: readonly ToolDefinitionModule[] = [
   submitAgentAnswerToolModule,
   readAgentAnswerToolModule,
   runAgentToolModule,
+  ...agentCollaborationToolModules,
+  ...crossConversationToolModules,
   commandToolModule
 ];
 

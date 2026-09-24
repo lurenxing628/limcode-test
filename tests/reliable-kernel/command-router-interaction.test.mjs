@@ -18,6 +18,10 @@ const { VscodeReliableKernelCommandRouter } = require(path.join(
   root,
   'dist/extension/backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js'
 ));
+const { ConversationForkRejectedError } = require(path.join(
+  root,
+  'dist/extension/backend/reliableKernel/conversationFork.js'
+));
 const {
   INTERACTION_ATTENTION_ACTION,
   InteractionAttentionNotifier,
@@ -57,6 +61,52 @@ test('model profile commit broadcasts only its local scope, never a full configu
   assert.equal(broadcasts[0].payload.scopeId, result.scopeId);
   assert.equal(broadcasts[0].correlationId, undefined);
   assert.equal(broadcasts[0].payload.sessionId, undefined, 'peer panels cannot reuse the writer session token');
+});
+
+test('every InteractionResult the router posts travels on the control channel', async () => {
+  const posted = [];
+  const rows = {
+    InteractionRequest: { ask: { id: 'ask', request_kind: 'ask_user', status: 'pending' } },
+    ToolCall: {
+      'plain-call': { id: 'plain-call', turn_id: 'turn', tool_name: 'read' },
+      'child-call': { id: 'child-call', turn_id: 'turn', tool_name: 'run_agent' }
+    },
+    Turn: { turn: { id: 'turn', conversation_id: 'conversation' } },
+    Process: { process: { id: 'process' } }
+  };
+  const lists = {
+    InteractionOwnerLink: [{ id: 'owner', request_id: 'ask', turn_id: 'turn' }],
+    InteractionToolCallLink: [{ id: 'link', request_id: 'ask', tool_call_id: 'ask-call' }],
+    ChildExecutionParentLink: [{ id: 'parent', source_tool_call_id: 'child-call', child_execution_id: 'child' }],
+    ProcessOriginLink: [{ id: 'origin', process_id: 'process', tool_call_id: 'plain-call' }]
+  };
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
+    toolHost: { setStateChangeListener() {} },
+    application: {
+      database: { conversationOwners: passthroughConversationOwners() },
+      interactions: { async resolveAskUser() { return { won: true }; } },
+      processes: { async stopOwnedProcess() { return { outcome: 'stopped' }; }, async reconcileProcessExit() {} }
+    },
+    childAgents: { async interruptSubtree() { return { deduplicated: false }; }, async resume() { return true; } },
+    conversations: { async interrupt() { return { ignoredBecauseTerminal: false, coalesced: false }; }, resume() {} }
+  });
+  router.maybeRow = async (domain, id) => rows[domain]?.[id];
+  router.list = async (domain, where) => (lists[domain] ?? []).filter((row) => Object.entries(where).every(([key, value]) => row[key] === value));
+  const send = (type, payload) => router.dispatch('control-client', webview(posted), { id: `${type}-${posted.length}`, type, channel: 'command', payload });
+  await send(protocol.BridgeMessageType.InteractionResolve, { conversationId: 'conversation', interactionRequestId: 'ask', interactionRevision: 1,
+    ownerTurnId: 'turn', decision: 'submit', response: { answer: 'yes' } });
+  await send(protocol.BridgeMessageType.ToolExecutionCancel, { conversationId: 'conversation', toolCallId: 'plain-call' });
+  await send(protocol.BridgeMessageType.ToolExecutionCancel, { conversationId: 'conversation', toolCallId: 'child-call' });
+  await send(protocol.BridgeMessageType.ProcessStop, { conversationId: 'conversation', processId: 'process' });
+  const results = posted.filter((message) => message.type === protocol.BridgeMessageType.InteractionResult);
+  assert.deepEqual(results.map((message) => message.payload.requestType), [
+    'ask_user',
+    protocol.BridgeMessageType.ToolExecutionCancel,
+    protocol.BridgeMessageType.ToolExecutionCancel,
+    protocol.BridgeMessageType.ProcessStop
+  ]);
+  for (const message of results) assert.equal(message.channel, 'control', `${message.payload.requestType} result must be a control message`);
 });
 
 test('stale Turn interrupt is idempotently reported as already_terminal', async () => {
@@ -195,6 +245,35 @@ test('failed global settings read preserves section scope for Webview loading st
   assert.equal(posted[0].payload.requestType, protocol.BridgeMessageType.GlobalSettingsGet);
 });
 
+
+test('fork errors mark permanent rejections so the Webview drops instead of replaying them', async () => {
+  const fork = {
+    sourceConversationId: 'fork-source', messageId: 'fork-message', expectedRevisionId: 'fork-revision',
+    command: { commandId: 'fork-command', expectedVersion: 0, issuedAt: 1 }
+  };
+  for (const [failure, code] of [
+    [new ConversationForkRejectedError('分支点所在回合仍在运行。'), 'fork_rejected'],
+    [new Error('history refresh failed after commit'), undefined]
+  ]) {
+    const posted = [];
+    const router = new VscodeReliableKernelCommandRouter({
+      debugCapture: { setListener() {} },
+      toolHost: { setStateChangeListener() {} }
+    }, { async forkConversation() { throw failure; } });
+    router.handle('fork-client', webview(posted), {
+      id: `fork-request-${code ?? 'failed'}`,
+      type: protocol.BridgeMessageType.ConversationFork,
+      channel: 'command',
+      payload: fork
+    });
+    await eventually(() => posted.length === 1);
+    assert.equal(posted[0].type, protocol.BridgeMessageType.Error);
+    assert.equal(posted[0].correlationId, `fork-request-${code ?? 'failed'}`);
+    assert.equal(posted[0].payload.requestType, protocol.BridgeMessageType.ConversationFork);
+    assert.equal(posted[0].payload.message, failure.message);
+    assert.equal(posted[0].payload.code, code);
+  }
+});
 
 test('durable Interaction result is posted before a stalled Agent resume completes', async () => {
   const posted = [];

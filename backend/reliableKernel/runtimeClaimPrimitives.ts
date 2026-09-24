@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { readProcessStartFingerprint } from './processProtocol';
+import { checkWindowsStartIdentityByCreationTime, readProcessStartFingerprint } from './processProtocol';
 
 export type RecordedProcessState = 'alive' | 'dead' | 'unknown';
 
@@ -11,27 +11,64 @@ const RETRYABLE_WINDOWS_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 
 /**
  * Classifies a recorded peer process without any timeout-based judgement. Only ESRCH or a
- * verified process-start fingerprint mismatch prove that the recorded identity is dead or reused;
- * every other OS result (including EPERM) leaves the owner unknown so callers fail closed.
+ * verified process-start identity mismatch prove that the recorded identity is dead or reused;
+ * EPERM proceeds to that identity comparison, and every result that cannot be verified leaves the
+ * owner unknown so callers fail closed.
  */
 export function classifyRecordedProcess(
   processId: number,
   processStartIdentity: string | undefined
 ): RecordedProcessState {
-  if (!Number.isSafeInteger(processId) || processId <= 0) return 'unknown';
+  return inspectRecordedProcess(processId, processStartIdentity).state;
+}
+
+export interface RecordedProcessInspection {
+  state: RecordedProcessState;
+  /** Why the owner could not be proven alive or dead; present only for 'unknown'. */
+  reason?: string;
+}
+
+export function inspectRecordedProcess(
+  processId: number,
+  processStartIdentity: string | undefined
+): RecordedProcessInspection {
+  if (!Number.isSafeInteger(processId) || processId <= 0) {
+    return { state: 'unknown', reason: `recorded process id ${String(processId)} is not a valid pid` };
+  }
   try {
     process.kill(processId, 0);
   } catch (error) {
-    return (error as NodeJS.ErrnoException)?.code === 'ESRCH' ? 'dead' : 'unknown';
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === 'ESRCH') return { state: 'dead' };
+    // EPERM means the pid exists but belongs to another user or a protected process — typical
+    // after the pid was reused. Only a start identity comparison below can settle it.
+    if (code !== 'EPERM') return { state: 'unknown', reason: `liveness signal failed with ${code ?? String(error)}` };
+    if (processStartIdentity === undefined) {
+      return { state: 'unknown', reason: 'liveness signal failed with EPERM and no start identity was recorded' };
+    }
   }
-  if (processStartIdentity === undefined) return 'alive';
+  if (processStartIdentity === undefined) return { state: 'alive' };
   let currentIdentity: string;
   try {
     currentIdentity = readProcessStartFingerprint(processId);
-  } catch {
-    return 'unknown';
+  } catch (error) {
+    const primary = `process ${processId} exists but its start time could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    if (process.platform !== 'win32') return { state: 'unknown', reason: primary };
+    const fallback = checkWindowsStartIdentityByCreationTime(processId, processStartIdentity);
+    if (fallback.verdict === 'reused') return { state: 'dead' };
+    if (fallback.verdict === 'missing' && processVanished(processId)) return { state: 'dead' };
+    return { state: 'unknown', reason: `${primary}; ${fallback.detail}` };
   }
-  return currentIdentity === processStartIdentity ? 'alive' : 'dead';
+  return { state: currentIdentity === processStartIdentity ? 'alive' : 'dead' };
+}
+
+function processVanished(processId: number): boolean {
+  try {
+    process.kill(processId, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ESRCH';
+  }
 }
 
 let ownStartIdentity: string | undefined;

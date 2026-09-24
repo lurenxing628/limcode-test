@@ -3,10 +3,13 @@ import { computed, ref } from 'vue';
 import { IconChevronDown, IconCloudDown, IconPencil, IconPlus, IconSearch, IconTrash } from '@tabler/icons-vue';
 import {
   type LlmCompressionConfigRecord,
+  type LlmCompressionFallbackKind,
   type LlmGenerationConfigRecord,
   type LlmProviderConfigRecord,
   type LlmProviderHeadersRecord,
   type LlmProviderKind,
+  type LlmNativeCompactionTrustMode,
+  type LlmSummaryReasoningMode,
   type LlmProviderModelConfigRecord,
   type LlmProviderModelRecord,
   type LlmPromptCacheConfigRecord,
@@ -15,6 +18,7 @@ import {
 import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
+import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import InputPanel from '@webview/components/ui/InputPanel.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
@@ -23,12 +27,19 @@ import LlmAdvancedConfigEditor from './LlmAdvancedConfigEditor.vue';
 import LlmCompressionSettingsEditor from './LlmCompressionSettingsEditor.vue';
 import ModelFetchDialog from './ModelFetchDialog.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
+import { OPENAI_COMPATIBLE_SERVICE_PRESETS } from '@shared/openAICompatibleDialect';
+import { openAICompatibleThinkingProbeEvidence } from '@shared/modelCapabilities';
+import {
+  describeOpenAICompatibleThinkingProbe,
+  OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS,
+  openAICompatibleThinkingProbeTime
+} from '@shared/openAICompatibleThinkingProbe';
 
 const settings = useGlobalSettingsStore();
 const { loading: channelLoading, text: channelLoadingText } = useSettingsLoadingText('渠道配置', 'global', undefined, {
   globalSettingsSections: ['llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs'] as const
 });
-type SelectableCompressionMethodKind = 'openai_responses_compact' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
+type SelectableCompressionMethodKind = 'auto' | 'provider_native' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
 const createOpen = ref(false);
 const createProvider = ref<LlmProviderKind>('openai-compatible');
 const renameOpen = ref(false);
@@ -44,18 +55,32 @@ const modelSpecificPanelOpen = ref<Record<string, boolean>>({});
 const newModelSpecificModelId = ref('');
 const deleteModelConfigConfirmOpen = ref(false);
 const deletingModelConfigId = ref('');
+/** “测试这个模型”确认框：两处入口（思考参数写法字段、LLM 列表每行）共用。 */
+const thinkingTestModelId = ref('');
+const thinkingTestConfirmOpen = ref(false);
 
 const providerOptions: SettingsDropdownOption[] = [
-  { value: 'openai-compatible', label: 'OpenAI Compatible' },
+  {
+    value: 'openai-compatible',
+    label: 'OpenAI Compatible',
+    description: 'DeepSeek、Kimi、智谱、百炼等都选这一种，思考参数写法自动识别'
+  },
   { value: 'openai-responses', label: 'OpenAI Responses' },
   { value: 'claude', label: 'Claude' },
-  { value: 'gemini', label: 'Gemini' },
-  { value: 'deepseek', label: 'DeepSeek' }
+  { value: 'gemini', label: 'Gemini' }
 ];
+
+/** 新建 OpenAI 兼容渠道时按服务商填好接口地址；空值表示 OpenAI 或其他服务，自己填地址。 */
+const createServiceOptions: SettingsDropdownOption[] = [
+  { value: '', label: 'OpenAI 或其他服务', description: '先用 OpenAI 的地址，建好后可以改成任意兼容地址' },
+  ...OPENAI_COMPATIBLE_SERVICE_PRESETS.map((preset) => ({ value: preset.key, label: preset.label, description: preset.baseUrl }))
+];
+const createService = ref('');
 
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
   'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
+  | 'claudeTurnScopedReminders' | 'openaiCompatibleThinkingFormat'
 >>;
 
 const activeConfig = computed(() => settings.activeLlmProviderConfig);
@@ -204,7 +229,7 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
   const base = activeConfig.value;
   const now = Date.now();
   return {
-    id: modelConfig.id,
+    id: base?.id ?? modelConfig.id,
     name: base ? `${base.name} · ${modelLabel(modelConfig.modelId)}` : modelLabel(modelConfig.modelId),
     provider: base?.provider ?? 'openai-compatible',
     baseUrl: base?.baseUrl ?? '',
@@ -222,6 +247,10 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
     systemPromptPrefix: modelConfig.systemPromptPrefix,
     promptCache: modelConfig.promptCache,
     ...(modelConfig.nativeResponses ? { nativeResponses: { ...modelConfig.nativeResponses } } : {}),
+    // 模型级配置缺省时跟随渠道，与运行时冻结的取值一致。
+    ...((modelConfig.claudeTurnScopedReminders ?? base?.claudeTurnScopedReminders) === true ? { claudeTurnScopedReminders: true } : {}),
+    ...((modelConfig.openaiCompatibleThinkingFormat ?? base?.openaiCompatibleThinkingFormat)
+      ? { openaiCompatibleThinkingFormat: modelConfig.openaiCompatibleThinkingFormat ?? base?.openaiCompatibleThinkingFormat } : {}),
     headers: modelConfig.headers ?? {},
     generationConfig: modelConfig.generationConfig ?? {},
     requestBody: modelConfig.requestBody ?? {},
@@ -297,6 +326,18 @@ function updateDefaultCompressionBodyTargetTokens(value: number): void {
   settings.setActiveCompressionBodyTargetTokens(value);
 }
 
+function updateDefaultCompressionNativeTrustMode(value: LlmNativeCompactionTrustMode): void {
+  settings.setActiveCompressionNativeTrustMode(value);
+}
+
+function updateDefaultCompressionSummaryReasoningMode(value: LlmSummaryReasoningMode): void {
+  settings.setActiveCompressionSummaryReasoningMode(value);
+}
+
+function updateDefaultCompressionFallbacks(values: LlmCompressionFallbackKind[]): void {
+  settings.setActiveCompressionFallbacks(values);
+}
+
 function updateModelCompressionProviderConfigId(modelId: string, providerConfigId: string): void {
   settings.setModelCompressionProviderConfig(modelId, providerConfigId);
 }
@@ -317,14 +358,39 @@ function updateModelCompressionBodyTargetTokens(modelId: string, value: number):
   settings.setModelCompressionBodyTargetTokens(modelId, value);
 }
 
+function updateModelCompressionNativeTrustMode(
+  modelId: string,
+  value: LlmNativeCompactionTrustMode
+): void {
+  settings.setModelCompressionNativeTrustMode(modelId, value);
+}
+
+function updateModelCompressionSummaryReasoningMode(
+  modelId: string,
+  value: LlmSummaryReasoningMode
+): void {
+  settings.setModelCompressionSummaryReasoningMode(modelId, value);
+}
+
+function updateModelCompressionFallbacks(
+  modelId: string,
+  values: LlmCompressionFallbackKind[]
+): void {
+  settings.setModelCompressionFallbacks(modelId, values);
+}
+
 function openCreate(): void {
   createProvider.value = 'openai-compatible';
+  createService.value = '';
   createOpen.value = true;
 }
 
 function confirmCreate(name: string): void {
   createOpen.value = false;
-  settings.createLlmProviderConfig(name, createProvider.value);
+  const preset = createProvider.value === 'openai-compatible'
+    ? OPENAI_COMPATIBLE_SERVICE_PRESETS.find((candidate) => candidate.key === createService.value)
+    : undefined;
+  settings.createLlmProviderConfig(name, createProvider.value, preset?.baseUrl);
 }
 
 function cancelCreate(): void {
@@ -407,6 +473,65 @@ function addFetchedModels(models: LlmProviderModelRecord[]): void {
 
 function cancelDelete(): void {
   deleteConfirmOpen.value = false;
+}
+
+const isOpenAICompatibleChannel = computed(() => activeConfig.value?.provider === 'openai-compatible');
+const thinkingTestDescription = computed(() =>
+  `会向「${modelLabel(thinkingTestModelId.value)}」发送最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求（每次只有一句“Reply with OK.”，看到第一段回复就断开），`
+  + '测出它用哪种思考参数写法、能不能关闭思考、接受哪些思考强度，可能产生少量费用。'
+  + '结果只对这个渠道的这个模型有效；改了接口地址就要重新测试。手动指定了写法时，发送仍按手动指定。'
+);
+
+const thinkingTestTooltipRows = [
+  { label: '测什么', value: '这个模型用哪种思考参数写法、能不能关闭思考、接受哪些思考强度' },
+  { label: '怎么测', value: `发最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求，可能产生少量费用；点了会先确认` }
+];
+
+function thinkingProbeFor(modelId: string) {
+  const config = activeConfig.value;
+  return config ? settings.thinkingProbeState(config.id, modelId) : undefined;
+}
+
+function thinkingProbeEvidenceFor(modelId: string) {
+  const config = activeConfig.value;
+  return config ? openAICompatibleThinkingProbeEvidence(config, modelId) : undefined;
+}
+
+/** LLM 列表里“已测试”标签的悬浮说明。 */
+function thinkingProbeRows(modelId: string) {
+  const evidence = thinkingProbeEvidenceFor(modelId);
+  if (!evidence) return [];
+  const parts = describeOpenAICompatibleThinkingProbe(evidence).split('；');
+  return [
+    ...(parts.length === 3
+      ? [
+          { label: '写法', value: parts[0]! },
+          { label: '关闭思考', value: parts[1]! },
+          { label: '强度', value: parts[2]! }
+        ]
+      : [{ label: '结果', value: parts.join('；') }]),
+    { label: '测试时间', value: openAICompatibleThinkingProbeTime(evidence.verifiedAt) || '未知' }
+  ];
+}
+
+function openThinkingTest(modelId: string): void {
+  if (!isOpenAICompatibleChannel.value || !modelId.trim() || thinkingProbeFor(modelId)?.status === 'running') return;
+  thinkingTestModelId.value = modelId;
+  thinkingTestConfirmOpen.value = true;
+}
+
+function confirmThinkingTest(): void {
+  const config = activeConfig.value;
+  const modelId = thinkingTestModelId.value;
+  thinkingTestConfirmOpen.value = false;
+  thinkingTestModelId.value = '';
+  if (!config || !modelId) return;
+  settings.testOpenAICompatibleThinking(config.id, modelId);
+}
+
+function cancelThinkingTest(): void {
+  thinkingTestConfirmOpen.value = false;
+  thinkingTestModelId.value = '';
 }
 </script>
 
@@ -512,19 +637,55 @@ function cancelDelete(): void {
                 >
                   <span class="model-status" aria-hidden="true"></span>
                   <span class="model-info">
-                    <span class="model-name">{{ model.name }}</span>
+                    <span class="model-name-row">
+                      <span class="model-name">{{ model.name }}</span>
+                      <HoverTooltipPanel
+                        v-if="isOpenAICompatibleChannel && thinkingProbeEvidenceFor(model.id)"
+                        panel-title="思考参数测试结果"
+                        :rows="thinkingProbeRows(model.id)"
+                        :delay-ms="180"
+                      >
+                        <span class="model-probe-tag" tabindex="0">已测试</span>
+                      </HoverTooltipPanel>
+                      <HoverTooltipPanel
+                        v-if="isOpenAICompatibleChannel && thinkingProbeFor(model.id)?.status === 'failed'"
+                        panel-title="思考参数测试失败"
+                        :rows="[{ label: '原因', value: thinkingProbeFor(model.id)?.message ?? '' }]"
+                        :delay-ms="180"
+                      >
+                        <span class="model-probe-tag is-failed" tabindex="0">测试失败</span>
+                      </HoverTooltipPanel>
+                    </span>
                     <span class="model-id">ID: {{ model.id }}</span>
                     <span v-if="model.createdAt" class="model-time">时间：{{ formatModelTime(model.createdAt) }}</span>
                     <span v-if="activeModelConfigs.some((config) => config.modelId === model.id)" class="model-time">已设置 LLM 专属配置</span>
                   </span>
-                  <button
-                    type="button"
-                    class="model-remove-btn"
-                    aria-label="移除 LLM"
-                    @click.stop="removeModel(model.id)"
-                    @keydown.enter.stop.prevent="removeModel(model.id)"
-                    @keydown.space.stop.prevent="removeModel(model.id)"
-                  ><IconTrash stroke="2" aria-hidden="true" /></button>
+                  <span class="model-actions">
+                    <HoverTooltipPanel
+                      v-if="isOpenAICompatibleChannel"
+                      panel-title="测试这个模型"
+                      :rows="thinkingTestTooltipRows"
+                      :delay-ms="320"
+                    >
+                      <button
+                        type="button"
+                        class="model-test-btn"
+                        :aria-label="`测试 ${model.name} 的思考参数`"
+                        :disabled="thinkingProbeFor(model.id)?.status === 'running'"
+                        @click.stop="openThinkingTest(model.id)"
+                        @keydown.enter.stop.prevent="openThinkingTest(model.id)"
+                        @keydown.space.stop.prevent="openThinkingTest(model.id)"
+                      >{{ thinkingProbeFor(model.id)?.status === 'running' ? '测试中…' : '测试' }}</button>
+                    </HoverTooltipPanel>
+                    <button
+                      type="button"
+                      class="model-remove-btn"
+                      aria-label="移除 LLM"
+                      @click.stop="removeModel(model.id)"
+                      @keydown.enter.stop.prevent="removeModel(model.id)"
+                      @keydown.space.stop.prevent="removeModel(model.id)"
+                    ><IconTrash stroke="2" aria-hidden="true" /></button>
+                  </span>
                 </div>
               </div>
             </div>
@@ -547,6 +708,8 @@ function cancelDelete(): void {
           <div v-if="defaultConfigOpen" class="settings-collapse-body">
             <LlmAdvancedConfigEditor
               :config="activeConfig"
+              :thinking-probe="thinkingProbeFor(activeConfig.model)"
+              @test-thinking="openThinkingTest(activeConfig.model)"
               @update-field="updateDefaultAdvancedPatch"
               @update-context-window-tokens="updateDefaultContextWindowTokens"
               @update-generation-config="updateDefaultGenerationConfig"
@@ -556,6 +719,7 @@ function cancelDelete(): void {
               @update-headers="updateDefaultHeaders"
             />
             <LlmCompressionSettingsEditor
+              @verify-native="(configId, modelId) => settings.verifyNativeCompressionCapability(configId, modelId)"
               class="advanced-compression-editor"
               :config="settings.activeCompressionConfig"
               :current-provider-config="activeConfig"
@@ -566,6 +730,10 @@ function cancelDelete(): void {
               @update-trigger="updateDefaultCompressionTrigger"
               @update-max-duration-minutes="updateDefaultCompressionMaxDurationMinutes"
               @update-body-target-tokens="updateDefaultCompressionBodyTargetTokens"
+              @update-native-trust-mode="updateDefaultCompressionNativeTrustMode"
+              @update-summary-reasoning-mode="updateDefaultCompressionSummaryReasoningMode"
+              @update-summary-generation-config="settings.setActiveCompressionSummaryGenerationConfig($event)"
+              @update-fallbacks="updateDefaultCompressionFallbacks"
             />
           </div>
         </article>
@@ -624,6 +792,8 @@ function cancelDelete(): void {
               <div v-if="isModelConfigOpen(modelConfig.id)" class="settings-collapse-body model-config-body">
                 <LlmAdvancedConfigEditor
                   :config="modelConfigAsProviderConfig(modelConfig)"
+                  :thinking-probe="thinkingProbeFor(modelConfig.modelId)"
+                  @test-thinking="openThinkingTest(modelConfig.modelId)"
                   @update-field="updateModelAdvancedPatch(modelConfig.id, $event)"
                   @update-context-window-tokens="updateModelContextWindowTokens(modelConfig.id, $event)"
                   @update-generation-config="updateModelGenerationConfig(modelConfig.id, $event)"
@@ -633,6 +803,7 @@ function cancelDelete(): void {
                   @update-headers="updateModelHeaders(modelConfig.id, $event)"
                 />
                 <LlmCompressionSettingsEditor
+                  @verify-native="(configId, modelId) => settings.verifyNativeCompressionCapability(configId, modelId)"
                   class="advanced-compression-editor"
                   :config="modelCompressionConfig(modelConfig.modelId)"
                   :current-provider-config="modelConfigAsProviderConfig(modelConfig)"
@@ -643,6 +814,10 @@ function cancelDelete(): void {
                   @update-trigger="updateModelCompressionTrigger(modelConfig.modelId, $event)"
                   @update-max-duration-minutes="updateModelCompressionMaxDurationMinutes(modelConfig.modelId, $event)"
                   @update-body-target-tokens="updateModelCompressionBodyTargetTokens(modelConfig.modelId, $event)"
+                  @update-native-trust-mode="updateModelCompressionNativeTrustMode(modelConfig.modelId, $event)"
+                  @update-summary-reasoning-mode="updateModelCompressionSummaryReasoningMode(modelConfig.modelId, $event)"
+                  @update-summary-generation-config="settings.setModelCompressionSummaryGenerationConfig(modelConfig.modelId, $event)"
+                  @update-fallbacks="updateModelCompressionFallbacks(modelConfig.modelId, $event)"
                 />
               </div>
             </article>
@@ -684,6 +859,10 @@ function cancelDelete(): void {
       <label class="global-settings-field create-channel-provider-field">
         <span>渠道类型</span>
         <SettingsDropdown :model-value="createProvider" :options="providerOptions" title="选择渠道类型" @update:model-value="updateCreateProvider" />
+      </label>
+      <label v-if="createProvider === 'openai-compatible'" class="global-settings-field create-channel-provider-field">
+        <span>服务商</span>
+        <SettingsDropdown :model-value="createService" :options="createServiceOptions" title="选择服务商，自动填好接口地址" @update:model-value="createService = $event" />
       </label>
     </InputPanel>
 
@@ -744,6 +923,16 @@ function cancelDelete(): void {
       cancel-label="取消"
       @confirm="confirmDeleteModelConfig"
       @cancel="cancelDeleteModelConfig"
+    />
+
+    <ConfirmPanel
+      :open="thinkingTestConfirmOpen"
+      title="测试这个模型？"
+      :description="thinkingTestDescription"
+      confirm-label="开始测试"
+      cancel-label="取消"
+      @confirm="confirmThinkingTest"
+      @cancel="cancelThinkingTest"
     />
 
     <ModelFetchDialog
@@ -887,6 +1076,54 @@ function cancelDelete(): void {
 
 .model-config-body {
   background: color-mix(in srgb, var(--vscode-editor-background) 98%, var(--vscode-foreground) 2%);
+}
+
+.model-name-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.model-probe-tag {
+  flex: none;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+  padding: 0 5px;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  cursor: default;
+}
+
+.model-probe-tag.is-failed {
+  color: var(--vscode-errorForeground, var(--vscode-descriptionForeground));
+}
+
+.model-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.model-test-btn {
+  height: 24px;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-2);
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.model-test-btn:hover:not(:disabled),
+.model-test-btn:focus-visible {
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 86%, var(--vscode-foreground) 14%);
+  outline: none;
 }
 
 .model-item.has-model-config .model-status {

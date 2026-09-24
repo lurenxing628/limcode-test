@@ -1,6 +1,8 @@
 import { THINKING_LEVEL_OPTIONS } from '@shared/llmThinkingLevels';
 import type { LlmProviderKind, LlmReasoningMode, LlmThinkingLevel } from '@shared/protocol';
 import { geminiThinkingCapabilityForModel } from '@shared/geminiThinking';
+import type { ModelCapabilitySnapshot } from '@shared/modelCapabilities';
+import { supportsOpenAIReasoningMode } from '@shared/openAIResponsesCapabilities';
 
 export type LlmParameterValueType = 'number' | 'boolean' | 'enum';
 
@@ -29,7 +31,7 @@ interface ProviderParameterDisplay {
   description?: string;
 }
 
-const ALL_PROVIDERS = ['openai-compatible', 'openai-responses', 'claude', 'gemini', 'deepseek'] as const satisfies readonly LlmProviderKind[];
+const ALL_PROVIDERS = ['openai-compatible', 'openai-responses', 'claude', 'gemini'] as const satisfies readonly LlmProviderKind[];
 const GEMINI_CLAUDE = ['gemini', 'claude'] as const satisfies readonly LlmProviderKind[];
 const REASONING_MODE_OPTIONS = [
   { value: 'standard', label: '标准' },
@@ -68,9 +70,9 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     topP: { path: 'top_p', label: 'Top P / top_p' },
     maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
     thinkingLevel: {
-      path: 'reasoning_effort',
-      label: 'Reasoning Effort',
-      description: 'OpenAI Chat / Compatible 原生推理强度字段。'
+      path: 'reasoning_effort / thinking.type / enable_thinking',
+      label: '思考强度',
+      description: '按“思考参数写法”发送：OpenAI 写法原样发 reasoning_effort；DeepSeek 写法（DeepSeek、Kimi、智谱等）用 thinking.type 开关思考，enable_thinking 写法（百炼、硅基流动等）用 enable_thinking 开关，模型接受强度时再带 reasoning_effort。模型不接受的强度按模型规则换成相近的档位；只开关思考的模型只发开关；关不掉思考的模型选“关闭”时不发送任何思考参数。'
     }
   },
   'openai-responses': {
@@ -88,16 +90,6 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
       description: 'OpenAI Responses 的推理强度设置。'
     }
   },
-  deepseek: {
-    temperature: { path: 'temperature' },
-    topP: { path: 'top_p', label: 'Top P / top_p' },
-    maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
-    thinkingLevel: {
-      path: 'thinking.type / reasoning_effort',
-      label: '思考强度',
-      description: 'DeepSeek 思考控制：关闭时禁用思考；高和最高会启用对应强度。'
-    }
-  }
 };
 
 export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = [
@@ -184,7 +176,7 @@ export function thinkingLevelDefinition(provider: LlmProviderKind, modelId?: str
   }, provider);
 }
 
-export function parameterDefinitionsForProvider(provider: LlmProviderKind, modelId?: string): LlmParameterDefinition[] {
+export function parameterDefinitionsForProvider(provider: LlmProviderKind, modelId?: string, snapshot?: ModelCapabilitySnapshot): LlmParameterDefinition[] {
   const geminiCapability = provider === 'gemini' ? geminiThinkingCapabilityForModel(modelId) : undefined;
   const definitions = LLM_PARAMETER_DEFINITIONS
     .filter((definition) => definition.providers.includes(provider))
@@ -196,9 +188,26 @@ export function parameterDefinitionsForProvider(provider: LlmProviderKind, model
   const supportsThinkingLevel = provider !== 'gemini'
     || geminiCapability?.kind === 'thinkingLevel'
     || geminiCapability?.kind === 'unknown';
-  return supportsThinkingLevel
-    ? [...definitions, thinkingLevelDefinition(provider, modelId)]
-    : definitions;
+  // 推理模式 standard / pro：“GPT-5.6 and GPT-6 models support standard and pro reasoning modes in the
+  // Responses API”（https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode）。只认官方 id，
+  // 能力未知的模型与网关别名（gpt-6-sol-xhigh、[az]gpt-6-luna）也不显示。
+  const result = (supportsThinkingLevel ? [...definitions, thinkingLevelDefinition(provider, modelId)] : definitions)
+    .filter((definition) => definition.key !== 'reasoningMode' || (provider === 'openai-responses' && supportsOpenAIReasoningMode(modelId)));
+  // OpenAI 兼容的 DeepSeek / enable_thinking 写法（deepseek_toggle）：所有档位都能选，发送时按模型规则就近换算。
+  if (!snapshot || snapshot.source === 'unknown' || snapshot.reasoning.family === 'none'
+    || snapshot.reasoning.family === 'deepseek_toggle') return result;
+  const capability = snapshot.reasoning;
+  return result.filter((definition) => {
+    if (definition.key === 'thinkingBudget') return capability.supportsBudget;
+    if (definition.key === 'thinkingLevel') return capability.levels.length > 0
+      || capability.canDisable && provider !== 'gemini';
+    return true;
+  }).map((definition) => {
+    if (definition.key !== 'thinkingLevel') return definition;
+    const allowed = new Set([...capability.levels, ...(capability.canDisable ? ['none'] : [])]);
+    const options = (definition.options ?? []).filter((option) => allowed.has(option.value as LlmThinkingLevel));
+    return { ...definition, options, defaultValue: capability.defaultLevel ?? options[0]?.value as LlmThinkingLevel };
+  });
 }
 
 export function labelForProvider(provider: LlmProviderKind): string {
@@ -211,8 +220,6 @@ export function labelForProvider(provider: LlmProviderKind): string {
       return 'Claude';
     case 'gemini':
       return 'Gemini';
-    case 'deepseek':
-      return 'DeepSeek';
     default:
       return provider;
   }

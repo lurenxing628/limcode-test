@@ -89,6 +89,8 @@ export enum BridgeMessageType {
   ConversationActionResult = 'conversation.action.result',
   CompressionStart = 'compression.start',
   CompressionCommandResult = 'compression.command.result',
+  CompressionRebuildPreviewGet = 'compression.rebuildPreview.get',
+  CompressionRebuildPreviewResult = 'compression.rebuildPreview.result',
   ToolPolicyScopeSet = 'toolPolicy.scope.set',
   ToolPolicyScopeClear = 'toolPolicy.scope.clear',
   SkillPolicyScopeSet = 'skillPolicy.scope.set',
@@ -388,6 +390,16 @@ export const ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY = 'allowOutsideProjectPaths'
 export const SUBMIT_AGENT_ANSWER_TOOL_NAME = 'submit_agent_answer';
 export const READ_AGENT_ANSWER_TOOL_NAME = 'read_agent_answer';
 export const SKILLS_TOOL_NAME = 'skills';
+/**
+ * Granted by the user's crossConversationCollaboration switch (run_agent config) alone: no tool list
+ * controls them, and a name of theirs saved in a list is ignored.
+ */
+export const CROSS_CONVERSATION_TOOL_NAMES = [
+  'list_conversations', 'read_conversation', 'send_conversation_message', 'create_conversation', 'fork_conversation'
+] as const;
+/** The cross-conversation tools that only look: they need no run_agent in the Turn's tool list. */
+export const READONLY_CROSS_CONVERSATION_TOOL_NAMES = ['list_conversations', 'read_conversation'] as const;
+export const CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY = 'crossConversationCollaboration';
 
 export type EditToolMode = 'hunk' | 'insert' | 'delete';
 
@@ -475,7 +487,28 @@ export interface SubmitPlanToolOutputRecord {
   answerBridgeId?: string;
 }
 
-export type LlmProviderKind = 'openai-compatible' | 'openai-responses' | 'claude' | 'gemini' | 'deepseek';
+export type LlmProviderKind = 'openai-compatible' | 'openai-responses' | 'claude' | 'gemini';
+
+/**
+ * DeepSeek 曾是独立的渠道类型；它在协议上就是 OpenAI Chat Completions，现在并入 OpenAI 兼容渠道，
+ * 方言按接口地址和模型自动识别（shared/openAICompatibleDialect.ts）。已保存的配置、会话模型选择
+ * 和冻结在历史回合里的快照仍可能带着 'deepseek'，读取时一律换成 'openai-compatible'。
+ */
+export function canonicalLlmProviderKind(value: unknown): LlmProviderKind | undefined {
+  if (value === 'deepseek') return 'openai-compatible';
+  return value === 'openai-compatible' || value === 'openai-responses' || value === 'claude' || value === 'gemini'
+    ? value
+    : undefined;
+}
+
+/**
+ * OpenAI 兼容渠道发送思考参数的写法；缺省为自动识别。
+ * - deepseek：`thinking.type` + `reasoning_effort`（DeepSeek、Kimi、智谱、MiMo、腾讯、火山方舟等）；
+ * - enable_thinking：`enable_thinking` 开关（阿里百炼、硅基流动等）；
+ * - reasoning_effort：只发 `reasoning_effort`（OpenAI 与大多数中转站）；
+ * - omit：不发送任何思考参数，由服务端决定。
+ */
+export type OpenAICompatibleThinkingFormat = 'deepseek' | 'enable_thinking' | 'reasoning_effort' | 'omit';
 export type LlmToolCallFormat = 'function-call';
 export type LlmOpenAIResponsesTransport = 'http' | 'websocket';
 export type LlmPromptCacheTtl = '5m' | '30m' | '1h';
@@ -533,7 +566,28 @@ export interface LlmProviderConfigsRecord {
   configs: LlmProviderConfigRecord[];
 }
 
-export type LlmCompressionMethodKind = 'disabled' | 'openai_responses_compact' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary' | 'manual_summary';
+export type LlmCompressionMethodKind =
+  | 'disabled'
+  | 'auto'
+  | 'provider_native'
+  | 'llm_summary'
+  | 'segmented_summary'
+  | 'deterministic_summary'
+  | 'manual_summary';
+export type LlmCompressionFallbackKind =
+  | 'segmented_summary'
+  | 'deterministic_summary'
+  | 'continue_uncompressed_if_fits';
+export type LlmNativeCompactionTrustMode = 'verified_only' | 'trust_configured_endpoint';
+export type LlmSummaryReasoningMode =
+  | 'provider_default'
+  | 'inherit_chat'
+  | 'economy'
+  | 'balanced'
+  | 'quality'
+  | 'maximum'
+  | 'disabled'
+  | 'explicit';
 export type LlmCompressionTriggerMode = 'manual' | 'token_threshold';
 export type LlmCompressionThresholdUnit = 'percent' | 'tokens';
 
@@ -631,16 +685,24 @@ export interface LlmCompressionConfigRecord {
     thresholdPercent?: number;
     thresholdUnit?: LlmCompressionThresholdUnit;
   };
-  openaiResponsesCompact?: {
+  /** Provider-native compaction is enabled only by a frozen verified/declared capability. */
+  providerNative?: {
     providerConfigId?: string;
     model?: string;
+    trustMode?: LlmNativeCompactionTrustMode;
   };
+  /** Ordered fallback chain used after a permanent Provider capability/contract failure. */
+  fallbacks?: LlmCompressionFallbackKind[];
   llmSummary?: {
     providerConfigId?: string;
     model?: string;
     systemPrompt?: string;
     userPrompt?: string;
     targetTokens?: number;
+    /** Reasoning intent; provider_default sends no reasoning/thinking override. */
+    reasoning?: {
+      mode: LlmSummaryReasoningMode;
+    };
     generationConfig?: LlmGenerationConfigRecord;
   };
   createdAt: number;
@@ -666,7 +728,7 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
   return {
     id: `llm-compression-config-${createMessageId()}`,
     name,
-    kind: 'segmented_summary',
+    kind: 'auto',
     maxDurationMinutes: DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES,
     bodyTargetTokens: DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS,
     trigger: {
@@ -674,8 +736,11 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
       thresholdUnit: 'percent',
       thresholdPercent: DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT
     },
+    providerNative: { trustMode: 'verified_only' },
+    fallbacks: ['segmented_summary', 'deterministic_summary', 'continue_uncompressed_if_fits'],
     llmSummary: {
-      targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS
+      targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+      reasoning: { mode: 'provider_default' }
     },
     createdAt: now,
     updatedAt: now
@@ -685,6 +750,8 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
 export interface LlmProviderModelRecord {
   id: string;
   name: string;
+  /** Credential-free evidence obtained by explicit catalog refresh or capability probe. */
+  capabilitySnapshot?: import('./modelCapabilities').ModelCapabilitySnapshot;
   createdAt?: string;
 }
 
@@ -738,8 +805,12 @@ export interface LlmProviderModelConfigRecord {
   headers?: LlmProviderHeadersRecord;
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
-  /** Astra 原生能力配置；缺省表示跟随渠道级配置。 */
+  /** GPT-6 原生能力配置；缺省表示跟随渠道级配置。 */
   nativeResponses?: OpenAIResponsesNativeSettings;
+  /** Claude 每轮提醒改用轮内系统消息；缺省表示跟随渠道级配置。 */
+  claudeTurnScopedReminders?: boolean;
+  /** OpenAI 兼容渠道的思考参数写法；缺省表示跟随渠道级配置。 */
+  openaiCompatibleThinkingFormat?: OpenAICompatibleThinkingFormat;
   createdAt: number;
   updatedAt: number;
 }
@@ -770,10 +841,21 @@ export interface LlmProviderConfigRecord {
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
   /**
-   * Astra 原生能力配置（provider-scoped）。显式 enabled 同时表示确认该兼容渠道支持原生能力；
-   * 仅对 openai-responses + 精确 Astra 模型生效。
+   * GPT-6 原生能力配置（provider-scoped）。显式 enabled 同时表示确认该兼容渠道支持原生能力；
+   * 仅对 openai-responses + 精确的 GPT-6 家族模型（Astra、Sol、Luna）生效。
    */
   nativeResponses?: OpenAIResponsesNativeSettings;
+  /**
+   * Claude 每轮提醒（任务卡、未完成任务检查、运行状态卡）改用官方轮内系统消息
+   * （role: "system" + clear_at: "next_user_message"），已发过的提醒原样留在历史里；默认关闭。
+   * 打开即表示确认模型与渠道支持，扩展自动带上 `mid-conversation-system-clear-at-2026-08-21` beta 头。仅对 Claude 生效。
+   */
+  claudeTurnScopedReminders?: boolean;
+  /**
+   * OpenAI 兼容渠道的思考参数写法；缺省为按接口地址和模型自动识别。
+   * 只在自动识别不对（例如自建中转改了模型名）时手动指定。
+   */
+  openaiCompatibleThinkingFormat?: OpenAICompatibleThinkingFormat;
   /** 针对单个模型的完整高级配置；命中模型时整体替代渠道默认高级配置。 */
   modelConfigs: LlmProviderModelConfigRecord[];
   createdAt: number;
@@ -809,6 +891,8 @@ export interface LlmInvocationSettingsSnapshotRecord {
   requestBody?: LlmRequestBodyRecord;
   /** 本次调用冻结的 Astra 原生能力配置（已按渠道/模型配置合并）。 */
   nativeResponses?: OpenAIResponsesNativeSettings;
+  /** 本次调用冻结：Claude 每轮提醒以轮内系统消息发送（只在打开时出现）。 */
+  claudeTurnScopedReminders?: boolean;
   compressionConfigId?: string;
   compressionMethodKind?: LlmCompressionMethodKind;
   compressionTrigger?: LlmCompressionConfigRecord['trigger'];
@@ -998,7 +1082,7 @@ export interface ToolPolicyToolConfigRecord {
    * 用户拒绝时仍会向 AI 回传“用户拒绝使用该结果”的工具响应，避免 AgentRun 永久等待。
    */
   autoSubmitResult?: boolean;
-  /** 是否在 Astra 原生通道允许该工具异步准入（output_item.done 即持久化准入、结果延迟投递）；缺省/false = 同步。 */
+  /** 是否在 GPT-6 原生通道允许该工具异步准入（output_item.done 即持久化准入、结果延迟投递）；缺省/false = 同步。 */
   nativeAsync?: boolean;
   display?: ToolDisplayPolicyRecord;
   config: ToolConfigRecord;
@@ -1006,16 +1090,50 @@ export interface ToolPolicyToolConfigRecord {
 
 export interface ToolPolicySourceConfigRecord {
   enabled: boolean;
+  /**
+   * When present, the only tools of this source that are on (a single-tool opt-in), so tools the
+   * server adds later stay off. Absent: every tool of the enabled source except `disabledTools`.
+   * Named as the server itself names them (source.originalToolName).
+   */
+  enabledTools?: string[];
+  /** Tools of this source turned off, by the name the server itself gives them (source.originalToolName). */
   disabledTools?: string[];
 }
+
+/**
+ * sourceConfigs key that denies every MCP source the same layer does not enable itself. Built-in
+ * read-only Agents and workflows carry it, so a server enabled at another layer never reaches them.
+ */
+export const TOOL_POLICY_ALL_MCP_SOURCES = '*';
 
 export interface ToolPolicyRecord {
   id: string;
   name: string;
-  allowedTools: string[];
+  /**
+   * The tool list this layer allows; each saved list can only narrow the layers above it. Absent
+   * means the record sets no list of its own: the scope keeps its built-in Agent/workflow list, if
+   * any, and otherwise narrows nothing. Settings that only store per-tool config (for example the
+   * cross-conversation switch) use this so they never freeze a tool list as a side effect.
+   */
+  allowedTools?: string[];
   /** 工具策略预设；非全局 scope 可用 inherit 只继承全局预设，同时保留本 scope 的逐工具配置。 */
   preset?: ToolPolicyPresetKind;
+  /** Per-tool settings keyed by `toolConfigKey`: a built-in tool's name, an MCP tool's `mcp:<source id>/<original name>`. */
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
+  sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;
+}
+
+/**
+ * The tool list a built-in Agent or workflow narrows to while its scope has no saved list. Read-only
+ * projection of the extension's blueprints so settings show and respect the same fallback the
+ * backend applies; never stored.
+ */
+export interface BuiltinToolPolicyRecord {
+  id: string;
+  scopeKind: 'agent' | 'workflow';
+  scopeId: string;
+  allowedTools: string[];
+  /** Built-in MCP source restrictions, for example the read-only scopes' all-sources deny. */
   sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;
 }
 
@@ -2272,6 +2390,7 @@ export interface ClientStateRecordByTable {
   runPlanProposalLinks: RunPlanProposalLinkRecord;
   toolPolicies: ToolPolicyRecord;
   toolPolicyScopeLinks: ToolPolicyScopeLinkRecord;
+  builtinToolPolicies: BuiltinToolPolicyRecord;
   skillDefinitions: SkillDefinitionRecord;
   skillPolicies: SkillPolicyRecord;
   skillPolicyScopeLinks: SkillPolicyScopeLinkRecord;
@@ -2563,6 +2682,8 @@ export interface CompressionStartPayload {
   conversationId: string;
   command: ConversationCommandMetadata;
   target: CompressionCommandTarget;
+  /** Explicitly regenerate the complete current summary from immutable original sources. */
+  sourceReplay?: 'immutable_provenance';
 }
 
 export interface CompressionCommandResultPayload {
@@ -2574,6 +2695,70 @@ export interface CompressionCommandResultPayload {
   modelRequestId?: string;
   compressionBlockId?: string;
   reasonCode?: string;
+}
+
+/** Read-only estimate of rebuilding the current summary from original records; nothing is written. */
+export interface CompressionRebuildPreviewGetPayload {
+  conversationId: string;
+  /** The Context root the dialog was opened for; a changed head is reported instead of estimated. */
+  expectedRootId: string;
+}
+
+/** Model-independent estimates; real Provider token counts differ. */
+export interface CompressionRebuildSourceEstimate {
+  /** Original records after every summary in the current Context is expanded, by the local estimator. */
+  sourceTokens: number;
+  /** Summaries in the current Context that are expanded back to their original records. */
+  summaryCount: number;
+  /** Context window of the compression model. */
+  contextWindowTokens: number;
+  /** Input one compression request may carry: the window minus the reserved output. */
+  inputCapacityTokens: number;
+}
+
+export type CompressionRebuildBlockReason =
+  /** Compression is turned off for this model. */
+  | 'compression_disabled'
+  /** Expanding the summaries exceeds a reconstruction cap (records, bytes or nesting). */
+  | 'replay_limit_exceeded'
+  /** A segmented summary would need more chunks than its leaf request budget. */
+  | 'leaf_budget_exceeded'
+  /** The source exceeds one request and no configured method summarizes in chunks. */
+  | 'no_chunking_method'
+  /** The compression model's window cannot hold even the fixed summary request. */
+  | 'request_too_large';
+
+export type CompressionRebuildPreviewOutcome =
+  | {
+      kind: 'ready';
+      /** First configured method expected to succeed. */
+      methodKind: Exclude<LlmCompressionMethodKind, 'disabled' | 'auto'>;
+      /** All model requests: summaries, merges and attachment analyses. Local methods send none. */
+      providerRequests: number;
+      /** Summary requests over the source: one per chunk when segmented. */
+      summaryRequests: number;
+      /** Merge requests estimated from the per-chunk summary target. */
+      mergeRequests: number;
+      /** Attachments without a reusable analysis; each costs one request. */
+      attachmentRequests: number;
+    }
+  | {
+      kind: 'blocked';
+      reason: CompressionRebuildBlockReason;
+      /** Chunk budget of one segmented summary. */
+      leafRequestLimit?: number;
+      /** The reconstruction cap that was reached, with its value. */
+      replayLimit?: { kind: 'segments' | 'bytes' | 'depth'; value: number };
+    }
+  /** The current Context changed after the dialog opened. */
+  | { kind: 'stale' }
+  | { kind: 'error'; message: string };
+
+export interface CompressionRebuildPreviewResultPayload {
+  conversationId: string;
+  rootId: string;
+  estimate?: CompressionRebuildSourceEstimate;
+  outcome: CompressionRebuildPreviewOutcome;
 }
 export type InteractionOutcomeStatus =
   | 'committed'
@@ -2639,7 +2824,8 @@ export interface ToolPolicyScopeSetPayload {
   scopeKind: ToolPolicyScopeKind;
   scopeId?: string;
   name?: string;
-  allowedTools: string[];
+  /** Replaces the record's list; absent saves a record without a list of its own. */
+  allowedTools?: string[];
   preset?: ToolPolicyPresetKind;
   toolConfigs?: Record<string, ToolPolicyToolConfigRecord>;
   sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>;
@@ -2784,10 +2970,19 @@ export interface ConfigurationSnapshotPayload {
 
 export interface LlmProviderModelsGetPayload {
   config: LlmProviderConfigRecord;
+  /** Explicit, possibly billable synthetic native request; never a catalog side effect. */
+  probeNative?: boolean;
+  /**
+   * “测试这个模型”：向 `config.model` 发最多 9 次很短的合成请求，测出 OpenAI 兼容思考参数写法、
+   * 能否关闭思考与接受的强度。只在用户点按钮时发送，可能产生少量费用。
+   */
+  probeThinking?: boolean;
 }
 
 export interface LlmProviderModelsSnapshotPayload {
   configId: string;
+  /** capability_probe：原生压缩端点验证；thinking_probe：“测试这个模型”的思考参数测试。 */
+  purpose?: 'capability_probe' | 'thinking_probe';
   provider: LlmProviderKind;
   baseUrl: string;
   models: LlmProviderModelRecord[];
@@ -3018,6 +3213,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.MessageDeleteFrom, MessageDeleteFromPayload>
   | BridgeEnvelope<BridgeMessageType.MessageRetryFrom, MessageRetryFromPayload>
   | BridgeEnvelope<BridgeMessageType.CompressionStart, CompressionStartPayload>
+  | BridgeEnvelope<BridgeMessageType.CompressionRebuildPreviewGet, CompressionRebuildPreviewGetPayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeSet, ToolPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeClear, ToolPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.SkillPolicyScopeSet, SkillPolicyScopeSetPayload>
@@ -3063,18 +3259,29 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentPolicyScopeClear, WorkEnvironmentPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.FsStatGet, FsStatGetPayload>;
 
+export type BridgeErrorCode =
+  | 'settings_revision_conflict'
+  /** The Conversation named by a scoped request was deleted or never existed. */
+  | 'stale_conversation'
+  /** The fork command can never succeed and must not be replayed. */
+  | 'fork_rejected';
+
+export interface BridgeErrorPayload {
+  requestType?: string;
+  message: string;
+  code?: BridgeErrorCode;
+  actualRevision?: string;
+  /** The Conversation a Conversation-scoped request failed for. */
+  conversationId?: string;
+}
+
 export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.DebugCaptureResult, DebugCaptureResult>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureObservationAck, DebugCaptureUiAck>
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>
   | BridgeEnvelope<BridgeMessageType.Pong, { text: string; receivedAt: number }>
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
-  | BridgeEnvelope<BridgeMessageType.Error, {
-      requestType?: string;
-      message: string;
-      code?: 'settings_revision_conflict';
-      actualRevision?: string;
-    }>
+  | BridgeEnvelope<BridgeMessageType.Error, BridgeErrorPayload>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInputResult, TurnInputResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>
@@ -3083,6 +3290,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.ConversationActionResult, ConversationActionResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationForkResult, ConversationForkResultPayload>
   | BridgeEnvelope<BridgeMessageType.CompressionCommandResult, CompressionCommandResultPayload>
+  | BridgeEnvelope<BridgeMessageType.CompressionRebuildPreviewResult, CompressionRebuildPreviewResultPayload>
   | BridgeEnvelope<BridgeMessageType.ModelProfileScopeSnapshot, ModelProfileScopeSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ConfigurationSnapshot, ConfigurationSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.LlmProviderModelsSnapshot, LlmProviderModelsSnapshotPayload>

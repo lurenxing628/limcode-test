@@ -456,15 +456,98 @@ function readWindowsStartFingerprint(pidInput: string | number): string {
     }
   }
   const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString())`;
-  const result = spawnSync(resolveWindowsPowerShell().executable, [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
-  ], { encoding: 'utf8', windowsHide: true, timeout: 3_000 });
-  if (result.error) throw result.error;
-  const ticks = result.stdout?.trim();
-  if (result.status !== 0 || !ticks || !/^\d+$/.test(ticks)) {
-    throw Object.assign(new Error(`Cannot read start time for process ${pid}.`), { code: 'ENOENT' });
+  const ticks = runWindowsTicksProbe(pid, script);
+  if (ticks === 'missing') {
+    throw Object.assign(new Error(`Cannot read start time for process ${pid}: unexpected missing marker.`), { code: 'ENOENT' });
   }
-  return `win32-process:${pid}:${BigInt(ticks).toString()}`;
+  return `${WINDOWS_START_IDENTITY_PREFIX}${pid}:${ticks.toString()}`;
+}
+
+export interface WindowsCreationTimeCheck {
+  /**
+   * reused: the pid now belongs to a process created at a clearly different time than recorded.
+   * missing: CIM reports no process with this pid.
+   * inconclusive: nothing proven; callers must keep failing closed.
+   */
+  verdict: 'reused' | 'missing' | 'inconclusive';
+  detail: string;
+}
+
+/**
+ * Secondary Windows identity check for when Get-Process cannot read StartTime — it is denied for
+ * services, lsass, antivirus and other protected processes when the caller is not elevated, while
+ * Win32_Process.CreationDate stays readable. The two sources agree to well under a millisecond,
+ * but this check never manufactures a fingerprint: it can only prove that the pid was reused, and
+ * only when the creation time differs from the recorded one by more than a generous tolerance.
+ */
+export function checkWindowsStartIdentityByCreationTime(
+  processId: number,
+  recordedIdentity: string
+): WindowsCreationTimeCheck {
+  const pid = BigInt(processId).toString();
+  const prefix = `${WINDOWS_START_IDENTITY_PREFIX}${pid}:`;
+  const recordedTicks = recordedIdentity.startsWith(prefix) ? recordedIdentity.slice(prefix.length) : '';
+  if (!/^\d+$/.test(recordedTicks)) {
+    return { verdict: 'inconclusive', detail: 'recorded identity is not a Windows start fingerprint for this pid' };
+  }
+  const script = `$c = Get-CimInstance Win32_Process -Filter ('ProcessId=' + ${pid}) -ErrorAction Stop; ` +
+    `if ($null -eq $c) { [Console]::Out.Write('missing') } ` +
+    `else { [Console]::Out.Write($c.CreationDate.ToUniversalTime().Ticks.ToString()) }`;
+  let observed: bigint | 'missing';
+  try {
+    observed = runWindowsTicksProbe(pid, script);
+  } catch (error) {
+    return { verdict: 'inconclusive', detail: `CIM creation time unavailable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (observed === 'missing') return { verdict: 'missing', detail: 'CIM reports no such process' };
+  const difference = observed - BigInt(recordedTicks);
+  const distance = difference < 0n ? -difference : difference;
+  if (distance > WINDOWS_CREATION_TIME_TOLERANCE_TICKS) {
+    return { verdict: 'reused', detail: `CIM creation time differs from the recorded start by ${distance / 10_000n}ms` };
+  }
+  return { verdict: 'inconclusive', detail: 'CIM creation time matches the recorded start within tolerance' };
+}
+
+const WINDOWS_START_IDENTITY_PREFIX = 'win32-process:';
+/** One second in 100ns ticks; observed disagreement between both sources is below one microsecond. */
+const WINDOWS_CREATION_TIME_TOLERANCE_TICKS = 10_000_000n;
+
+/**
+ * Runs one PowerShell probe that writes either decimal UTC ticks or the literal "missing".
+ * PowerShell cold start can exceed a single budget while the machine is busy (window reload,
+ * antivirus scan); only a timeout is retried, every other outcome is final.
+ */
+function runWindowsTicksProbe(pid: string, script: string): bigint | 'missing' {
+  const executable = resolveWindowsPowerShell().executable;
+  for (let attempt = 0; ; attempt += 1) {
+    const timeout = WINDOWS_START_PROBE_TIMEOUTS_MS[attempt]!;
+    const result = spawnSync(executable, [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
+    ], { encoding: 'utf8', windowsHide: true, timeout });
+    if (result.error) {
+      const code = (result.error as NodeJS.ErrnoException).code;
+      if (code === 'ETIMEDOUT' && attempt + 1 < WINDOWS_START_PROBE_TIMEOUTS_MS.length) continue;
+      throw Object.assign(new Error(
+        code === 'ETIMEDOUT'
+          ? `Cannot read start time for process ${pid}: PowerShell probe timed out ${attempt + 1} times (last budget ${timeout}ms).`
+          : `Cannot read start time for process ${pid}: PowerShell probe failed to run (${code ?? result.error.message}).`
+      ), { code: code ?? 'ENOENT', cause: result.error });
+    }
+    const output = result.stdout?.trim();
+    if (result.status === 0 && output === 'missing') return 'missing';
+    if (result.status === 0 && output && /^\d+$/.test(output)) return BigInt(output);
+    const detail = firstLine(result.stderr) ?? (output ? `unexpected output ${JSON.stringify(output.slice(0, 80))}` : 'no output');
+    throw Object.assign(new Error(
+      `Cannot read start time for process ${pid}: PowerShell exited with status ${result.status ?? 'null'}; ${detail.replace(/\.$/, '')}.`
+    ), { code: 'ENOENT' });
+  }
+}
+
+const WINDOWS_START_PROBE_TIMEOUTS_MS = [3_000, 6_000, 10_000] as const;
+
+function firstLine(text: string | null | undefined): string | undefined {
+  const line = text?.replace(/\x1B\[[0-9;]*m/g, '').split(/\r?\n/).map((value) => value.trim()).find((value) => value.length > 0);
+  return line === undefined ? undefined : line.slice(0, 200);
 }
 
 export function readLinuxStartFingerprint(pidInput: string | number): string {

@@ -13,6 +13,8 @@ import {
   type PreparedForegroundSettlement
 } from './childExecution';
 import { requireChildExecutionStatus } from './childExecutionState';
+import { isCrossConversationFollowup } from './collaborationScope';
+import { displayConversationTitle } from '../../shared/conversationTitle';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   isTransactionAssertionFailure,
@@ -179,7 +181,7 @@ export class AnswerControlPlane {
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
-    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
   }
 
   public async submit(commandInput: AnswerSubmitCommand): Promise<AnswerSubmitResult> {
@@ -1266,10 +1268,11 @@ export class RuntimeDeliveryControlPlane {
 
   public constructor(
     private readonly database: RuntimeDatabase,
+    contentStore: ContentAddressedStore,
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
-    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
   }
 
   public async create(commandInput: RuntimeDeliveryCreateCommand): Promise<RuntimeDeliveryResult & {
@@ -1472,15 +1475,23 @@ export class RuntimeDeliveryControlPlane {
     return this.retargetWithDecision(delivery, decision);
   }
 
-  /** Called before a new Turn transaction; returned steps write back target + inject atomically. */
+  /**
+   * Called before a new Turn transaction; returned steps write back target + inject atomically.
+   * `startingDeliveryId` names the delivery a runtime continuation was admitted for: only that
+   * Turn consumes a cross-conversation followup, every other Turn leaves it waiting.
+   */
   public async prepareNextTurnDeliverySteps(
     conversationIdInput: string,
     turnIdInput: string,
-    nowInput: string
+    nowInput: string,
+    startingDeliveryIdInput?: string | null
   ): Promise<RepositoryTransactionStep[]> {
     const conversationId = requirePhaseFId(conversationIdInput, 'conversationId');
     const turnId = requirePhaseFId(turnIdInput, 'turnId');
     const now = requireIsoTimestamp(nowInput, 'now');
+    const startingDeliveryId = startingDeliveryIdInput == null
+      ? null
+      : requirePhaseFId(startingDeliveryIdInput, 'startingDeliveryId');
     const deliveries = (await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_conversation_id: conversationId,
       target_turn_id: null,
@@ -1492,6 +1503,16 @@ export class RuntimeDeliveryControlPlane {
     );
     const steps: RepositoryTransactionStep[] = [];
     for (const delivery of deliveries) {
+      const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
+      if (inbox.source_kind === 'collaboration_message') {
+        const sources = await this.listRows('CollaborationMessageSourceLink', { message_id: inbox.source_id }, 2);
+        if (sources[0]?.source_kind === 'board') {
+          steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(String(delivery.id), { state: 'pending', phase: 'next_turn', target_turn_id: null }), DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(String(delivery.id), { state: 'failed', failure_reason: 'board-notification-expired', updated_at: now }));
+          continue;
+        }
+        // A peer's task starts its own Turn; a plain message joins whichever Turn comes next.
+        if (delivery.id !== startingDeliveryId && await isCrossConversationFollowup(this.database, String(inbox.source_id))) continue;
+      }
       const contentObjectId = await this.contentObjectIdForInbox(delivery.inbox_item_id as string);
       if (!contentObjectId) {
         steps.push(
@@ -1505,7 +1526,38 @@ export class RuntimeDeliveryControlPlane {
         );
         continue;
       }
-      steps.push(...injectionSteps(delivery, turnId, contentObjectId, now, true, []));
+      steps.push(...injectionSteps(delivery, turnId, contentObjectId, now, true, await this.collaborationRequestInjectionSteps(delivery, turnId, now)));
+    }
+    return steps;
+  }
+
+  /**
+   * Called inside a Turn's terminal commit. Collaboration messages routed into that Turn but never
+   * taken in move to next_turn in the same transaction, so the admission of the next Turn always
+   * sees them instead of racing the wake that would otherwise move them later. Board notices
+   * expire with their Turn through the router; Process and child answers keep their source-Turn
+   * routing.
+   */
+  public async prepareTerminalDeliverySteps(turnIdInput: string, nowInput: string): Promise<RepositoryTransactionStep[]> {
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const now = requireIsoTimestamp(nowInput, 'now');
+    const where = { target_turn_id: turnId, phase: 'current_turn', state: 'pending' };
+    const deliveries = await listAllDomainRows(this.database, 'RuntimeDelivery', where);
+    // A send routed into the Turn after this read fails the terminal commit, which then retries.
+    const steps: RepositoryTransactionStep[] = [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds(
+      where,
+      deliveries.map((delivery) => requirePhaseFId(delivery.id, 'RuntimeDelivery.id'))
+    )];
+    for (const delivery of deliveries) {
+      const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
+      if (inbox.source_kind !== 'collaboration_message') continue;
+      const sources = await this.listRows('CollaborationMessageSourceLink', { message_id: inbox.source_id }, 2);
+      if (sources[0]?.source_kind === 'board') continue;
+      steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(String(delivery.id), {
+        phase: 'next_turn',
+        target_turn_id: null,
+        updated_at: now
+      }));
     }
     return steps;
   }
@@ -1662,6 +1714,35 @@ export class RuntimeDeliveryControlPlane {
       input.created_at,
       'PendingTurnInput.created_at'
     );
+    if (inbox.source_kind === 'collaboration_message') {
+      if (contentType !== 'text/vnd.limcode.collaboration-message') throw new Error('Collaboration Runtime Delivery has an unexpected content type.');
+      const messageId = requirePhaseFId(inbox.source_id, 'Collaboration RuntimeInboxItem.source_id');
+      const [message, sources, targets, payloads, replies] = await Promise.all([
+        this.requireExisting('CollaborationMessage', messageId), this.listRows('CollaborationMessageSourceLink', { message_id: messageId }, 2), this.listRows('CollaborationMessageTargetLink', { message_id: messageId }, 2), this.listRows('CollaborationMessagePayloadLink', { message_id: messageId }, 2), this.listRows('CollaborationMessageReplyLink', { message_id: messageId }, 2)
+      ]);
+      if (sources.length !== 1 || targets.length !== 1 || targets[0].inbox_item_id !== inboxItemId || targets[0].conversation_id !== delivery.target_conversation_id || payloads.length !== 1 || payloads[0].content_object_id !== contentObjectId) throw new Error('Collaboration Runtime Delivery has conflicting identity links.');
+      let board: { postId: string; channelId: string; threadId: string } | undefined;
+      if (sources[0].source_kind === 'board') {
+        const postId = requirePhaseFId(sources[0].board_post_id, 'Board notification post');
+        const [channels, replyLinks] = await Promise.all([this.listRows('CollaborationBoardPostChannelLink', { post_id: postId }, 2), this.listRows('CollaborationBoardReplyLink', { post_id: postId }, 2)]);
+        if (channels.length !== 1) throw new Error('Board notification post has no unique channel.');
+        board = { postId, channelId: String(channels[0].channel_id), threadId: replyLinks[0] ? String(replyLinks[0].thread_id) : postId };
+      }
+      const sourceConversationId = String(sources[0].conversation_id);
+      const targetConversationId = String(targets[0].conversation_id);
+      // A team always has a child task on one side; cross-conversation tools join two top-level
+      // conversations. A deleted sender keeps its ref but loses its title.
+      const [sender, sourceChildren, targetChildren] = await Promise.all([
+        this.maybeGet('Conversation', sourceConversationId),
+        this.listRows('ChildExecution', { child_conversation_id: sourceConversationId }, 1),
+        this.listRows('ChildExecution', { child_conversation_id: targetConversationId }, 1)
+      ]);
+      const senderKind = sources[0].source_kind === 'board' || sourceChildren.length > 0 || targetChildren.length > 0
+        ? 'team_agent' as const : 'other_conversation' as const;
+      const senderTitle = sender ? displayConversationTitle({ id: sourceConversationId, title: String(sender.title), maxLength: 80 }) : null;
+      return projectRuntimeDeliveryForModel({ ...(board ? { board } : {}), kind: 'collaboration_message', phase, deliveryId, inboxItemId, targetTurnId, deliveredAt, messageId, sourceConversationId, targetConversationId, sourceKind: String(sources[0].source_kind), mode: message.mode as 'message' | 'followup', replyToMessageId: replies[0] ? String(replies[0].request_message_id) : null, content: contentBytes.toString('utf8'),
+        failureReply: sources[0].source_kind === 'completion' && sources[0].turn_id === null, senderKind, senderTitle });
+    }
     if (inbox.source_kind === 'process_receipt') {
       if (contentType !== PROCESS_COMPLETION_MODEL_SOURCE_CONTENT_TYPE) {
         throw new Error('Process completion Runtime Delivery has an unexpected content type.');
@@ -1763,6 +1844,16 @@ export class RuntimeDeliveryControlPlane {
     });
   }
 
+  private async collaborationRequestInjectionSteps(delivery: DomainRow, turnId: string, now: string): Promise<RepositoryTransactionStep[]> {
+    const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
+    if (inbox.source_kind !== 'collaboration_message') return [];
+    const requests = await this.listRows('CollaborationRequest', { message_id: inbox.source_id }, 2);
+    if (!requests.length) return [];
+    if (requests.length !== 1) throw new Error('Collaboration message has duplicate requests.');
+    const request = requests[0];
+    return [DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(String(request.id), { state: 'pending', message_id: inbox.source_id }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').insert({ id: stablePhaseFId('collaboration_request_turn', String(request.id)), request_id: request.id, turn_id: turnId, created_at: now })];
+  }
+
   private async inject(
     delivery: DomainRow,
     targetTurn: DomainRow,
@@ -1778,7 +1869,7 @@ export class RuntimeDeliveryControlPlane {
         contentObjectId,
         now,
         false,
-        authoritySteps
+        [...authoritySteps, ...await this.collaborationRequestInjectionSteps(delivery, String(targetTurn.id), now)]
       ));
       const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
       return { ...(await this.summaryFromRow(latest)), changed: true, commitSeq: commit.commitSeq };
@@ -1806,6 +1897,7 @@ export class RuntimeDeliveryControlPlane {
       DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(delivery.id as string, {
         phase: decision.phase,
         target_turn_id: decision.targetTurnId,
+        ...(decision.reason === 'collaboration_notification_expired' ? { state: 'failed', failure_reason: 'board-notification-expired' } : {}),
         updated_at: now
       })
     ]);

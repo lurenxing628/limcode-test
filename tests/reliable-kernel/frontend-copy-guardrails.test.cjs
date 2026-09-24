@@ -37,13 +37,8 @@ test('guidance queue uses a passive bolt and waits for the current response and 
 
 
 test('thought cards render Markdown and merge adjacent reasoning output items', async (context) => {
-  const { createServer } = await import('vite');
-  const server = await createServer({
-    configFile: path.join(ROOT, 'vite.config.ts'),
-    server: { middlewareMode: true },
-    appType: 'custom',
-    logLevel: 'error'
-  });
+  const { createWebviewSsrServer } = await import('./webview-ssr-server.mjs');
+  const server = await createWebviewSsrServer();
   context.after(async () => server.close());
 
   const markdown = await server.ssrLoadModule('/src/components/content/markdown/markdownRenderer.ts');
@@ -82,6 +77,21 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
   assert.doesNotMatch(thoughtView, /<TextPartView[\s\S]*?:text="displayedText"[\s\S]*?:show-streaming-indicator="false"/,
     'expanded thought Markdown must not smooth the already-smoothed preview stream a second time');
   assert.match(thoughtView, /preserve-soft-breaks/);
+  const compressionCard = source('webview/src/components/conversation/ReliableCompressionCard.vue');
+  assert.match(compressionCard, /const tokenChange = computed\(\(\) => compressionTokenChange\(\{/,
+    'the saving comes from the shared Context-against-Context rule');
+  assert.doesNotMatch(compressionCard, /contextBeforeTokens\.value \?\? beforeTokens\.value/,
+    'an older record without a Context figure shows no saving instead of the full request (system + tools) minus the Context');
+  assert.match(compressionCard, /resultSizeUncounted: resultSizeUncounted\.value/,
+    'a record whose after-figure left the ciphertext summary out shows no saving');
+  assert.match(compressionCard, /const beforeTokens = computed\(\(\) => positiveToken\(/,
+    'a legacy 0 full-request figure from manual compression must not be shown or subtracted');
+  assert.doesNotMatch(compressionCard, /Math\.max\(0, before - afterTokens\.value\)/,
+    'a Context that grew must not be clamped to “节省约 0 Token”');
+  assert.match(compressionCard, /`上下文增加约 \$\{formatTokenNumber\(-change\)\} Token`/,
+    'a Context that grew is reported as an increase');
+  assert.match(thoughtView, /props\.streaming \? '正在思考\.\.\.' : EMPTY_THOUGHT_LABEL/,
+    'a finished thought without text (signature only) must not keep saying it is still thinking');
   assert.doesNotMatch(thoughtView, /<pre>\{\{ displayedText \}\}<\/pre>/);
 
   const previousWindow = globalThis.window;
@@ -134,13 +144,8 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
 });
 
 async function createViteServer(context) {
-  const { createServer } = await import('vite');
-  const server = await createServer({
-    configFile: path.join(ROOT, 'vite.config.ts'),
-    server: { middlewareMode: true },
-    appType: 'custom',
-    logLevel: 'error'
-  });
+  const { createWebviewSsrServer } = await import('./webview-ssr-server.mjs');
+  const server = await createWebviewSsrServer();
   context.after(async () => server.close());
   return server;
 }

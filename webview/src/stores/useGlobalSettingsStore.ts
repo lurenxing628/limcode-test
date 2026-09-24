@@ -1,3 +1,5 @@
+import { normalizeModelCapabilitySnapshot } from '@shared/modelCapabilities';
+import { describeOpenAICompatibleThinkingProbe, OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS } from '@shared/openAICompatibleThinkingProbe';
 import { defineStore } from 'pinia';
 import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '@shared/debugCapture';
 import {
@@ -26,11 +28,14 @@ import {
   type LlmGenerationConfigRecord,
   type LlmCompressionConfigRecord,
   type LlmCompressionConfigsRecord,
+  type LlmCompressionFallbackKind,
   type LlmCompressionModelBindingRecord,
   type LlmCompressionThresholdUnit,
   type LlmCompressionSettingsRecord,
   type LlmProviderKind,
   type LlmProviderHeadersRecord,
+  type LlmNativeCompactionTrustMode,
+  type LlmSummaryReasoningMode,
   type LlmOpenAIResponsesTransport,
   type LlmProviderConfigRecord,
   type LlmProviderModelConfigRecord,
@@ -52,7 +57,12 @@ import { normalizeOpenAIResponsesNativeSettings } from '@shared/openAIResponsesC
 import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
 import { bridge, BridgeMessageType } from '@webview/transport';
 
-type SelectableCompressionMethodKind = 'openai_responses_compact' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
+type SelectableCompressionMethodKind = 'auto' | 'provider_native' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
+const DEFAULT_COMPRESSION_FALLBACKS: readonly LlmCompressionFallbackKind[] = [
+  'segmented_summary',
+  'deterministic_summary',
+  'continue_uncompressed_if_fits'
+];
 const TOKEN_STEP = 1_000;
 export const CHANNEL_SETTINGS_SECTIONS = ['llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs'] as const satisfies readonly GlobalSettingsSection[];
 type GlobalSettingsSectionMessages = Partial<Record<GlobalSettingsSection, string>>;
@@ -62,6 +72,18 @@ interface FetchedModelsDialogState {
   loading: boolean;
   configId: string;
   models: LlmProviderModelRecord[];
+}
+
+/** “测试这个模型”进行中或失败的状态；测试成功后删除，结果看模型的 capabilitySnapshot。 */
+export interface OpenAICompatibleThinkingProbeState {
+  configId: string;
+  modelId: string;
+  status: 'running' | 'failed';
+  /** 这次测试的 bridge 请求 id：后端报错按它认出是哪次测试。 */
+  requestId: string;
+  message?: string;
+  /** 测试时的接口地址：地址改了，这次失败就不再显示。 */
+  baseUrl?: string;
 }
 
 interface GlobalSettingsState {
@@ -100,6 +122,8 @@ interface GlobalSettingsState {
   loadingSettingsSections: Partial<Record<GlobalSettingsSection, boolean>>;
   /** 获取模型后等待用户选择导入的临时列表。 */
   fetchedModelsDialog: FetchedModelsDialogState;
+  /** “测试这个模型”的状态，键见 thinkingProbeKey（渠道 ID + 模型 ID）。 */
+  thinkingProbes: Record<string, OpenAICompatibleThinkingProbeState>;
   /** 已发起更新，正在等待后端 snapshot 确认的全局设置 section。 */
   pendingSettingsSections: Partial<Record<GlobalSettingsSection, boolean>>;
   failedSettingsSections: GlobalSettingsSectionMessages;
@@ -185,8 +209,6 @@ function providerDefaultBaseUrl(provider: LlmProviderKind): string {
       return 'https://api.anthropic.com/v1';
     case 'gemini':
       return 'https://generativelanguage.googleapis.com/v1beta';
-    case 'deepseek':
-      return 'https://api.deepseek.com/v1';
     case 'openai-responses':
     case 'openai-compatible':
     default:
@@ -248,6 +270,8 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, config.provider),
     ...(nativeResponses ? { nativeResponses } : {}),
+    ...(config.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -313,7 +337,8 @@ function normalizeModelsForUi(models: LlmProviderModelRecord[] | undefined, acti
     if (!id) continue;
     const name = item.name.trim() || id;
     const createdAt = item.createdAt?.trim();
-    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}) });
+    const capabilitySnapshot = normalizeModelCapabilitySnapshot(item.capabilitySnapshot);
+    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}), ...(capabilitySnapshot ? { capabilitySnapshot } : {}) });
   }
   if (activeModel && !byId.has(activeModel)) byId.set(activeModel, { id: activeModel, name: activeModel });
   return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
@@ -355,6 +380,8 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
     ...(nativeResponses ? { nativeResponses } : {}),
+    ...(typeof config.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: config.claudeTurnScopedReminders } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -415,7 +442,8 @@ function sanitizeModels(models: LlmProviderModelRecord[]): LlmProviderModelRecor
     if (!id) continue;
     const name = item.name.trim() || id;
     const createdAt = item.createdAt?.trim();
-    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}) });
+    const capabilitySnapshot = normalizeModelCapabilitySnapshot(item.capabilitySnapshot);
+    byId.set(id, { id, name, ...(createdAt ? { createdAt } : {}), ...(capabilitySnapshot ? { capabilitySnapshot } : {}) });
   }
   return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
 }
@@ -603,12 +631,82 @@ function normalizeCompressionConfigForUi(
   config: LlmCompressionConfigRecord,
   contextWindowTokens?: number
 ): LlmCompressionConfigRecord {
+  const defaults = createDefaultLlmCompressionConfig('临时');
+  const providerNative = config.providerNative ?? defaults.providerNative ?? { trustMode: 'verified_only' };
+  const llmSummary = config.llmSummary ?? defaults.llmSummary;
   return {
     ...config,
+    kind: isSelectableCompressionMethodKind(config.kind) || config.kind === 'disabled' || config.kind === 'manual_summary'
+      ? config.kind
+      : 'auto',
     maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(config.maxDurationMinutes),
     bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(config.bodyTargetTokens),
-    trigger: normalizeCompressionTriggerForUi(config.trigger, contextWindowTokens)
+    trigger: normalizeCompressionTriggerForUi(config.trigger, contextWindowTokens),
+    providerNative: {
+      ...providerNative,
+      trustMode: normalizeNativeCompactionTrustMode(providerNative.trustMode)
+    },
+    fallbacks: normalizeCompressionFallbacks(config.fallbacks),
+    ...(llmSummary ? {
+      llmSummary: {
+        ...llmSummary,
+        reasoning: { mode: normalizeSummaryReasoningModeForUi(llmSummary.reasoning?.mode) },
+        ...(normalizeGenerationConfigForUi(llmSummary.generationConfig)
+          ? { generationConfig: normalizeGenerationConfigForUi(llmSummary.generationConfig) }
+          : {})
+      }
+    } : {})
   };
+}
+
+function isSelectableCompressionMethodKind(value: unknown): value is SelectableCompressionMethodKind {
+  return value === 'auto'
+    || value === 'provider_native'
+    || value === 'llm_summary'
+    || value === 'segmented_summary'
+    || value === 'deterministic_summary';
+}
+
+function normalizeNativeCompactionTrustMode(value: unknown): LlmNativeCompactionTrustMode {
+  return value === 'trust_configured_endpoint' ? 'trust_configured_endpoint' : 'verified_only';
+}
+
+function normalizeSummaryReasoningModeForUi(value: unknown): LlmSummaryReasoningMode {
+  return value === 'inherit_chat'
+    || value === 'economy'
+    || value === 'balanced'
+    || value === 'quality'
+    || value === 'maximum'
+    || value === 'disabled'
+    || value === 'explicit'
+    ? value
+    : 'provider_default';
+}
+
+function normalizeCompressionFallbacks(
+  values: readonly LlmCompressionFallbackKind[] | undefined
+): LlmCompressionFallbackKind[] {
+  const source = values ?? DEFAULT_COMPRESSION_FALLBACKS;
+  return [...new Set(source.filter((value): value is LlmCompressionFallbackKind =>
+    value === 'segmented_summary'
+      || value === 'deterministic_summary'
+      || value === 'continue_uncompressed_if_fits'))];
+}
+
+function ensureCompressionStrategyDefaults(config: LlmCompressionConfigRecord): void {
+  const defaults = createDefaultLlmCompressionConfig('临时');
+  config.providerNative = {
+    ...(config.providerNative ?? defaults.providerNative ?? {}),
+    trustMode: normalizeNativeCompactionTrustMode(config.providerNative?.trustMode)
+  };
+  config.fallbacks = normalizeCompressionFallbacks(config.fallbacks);
+  const summary = config.llmSummary ?? defaults.llmSummary;
+  if (summary) {
+    config.llmSummary = {
+      ...summary,
+      reasoning: { mode: normalizeSummaryReasoningModeForUi(summary.reasoning?.mode) }
+    };
+  }
 }
 
 /** 写时复制：从共享压缩配置克隆出一份归单个渠道独占的新配置（新 id、新名称、深拷贝嵌套字段避免引用共享）。 */
@@ -671,6 +769,8 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
     ...(normalizeOpenAIResponsesNativeSettings(config.nativeResponses)
       ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
       : {}),
+    ...(config.claudeTurnScopedReminders === true ? { claudeTurnScopedReminders: true } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
@@ -697,6 +797,8 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
     ...(normalizeOpenAIResponsesNativeSettings(config.nativeResponses)
       ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
       : {}),
+    ...(typeof config.claudeTurnScopedReminders === 'boolean' ? { claudeTurnScopedReminders: config.claudeTurnScopedReminders } : {}),
+    ...(config.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: config.openaiCompatibleThinkingFormat } : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
@@ -744,7 +846,7 @@ function toPlainGenerationConfig(config: LlmGenerationConfigRecord | undefined):
 
 function toPlainCompressionConfig(config: LlmCompressionConfigRecord): LlmCompressionConfigRecord {
   const normalized = normalizeCompressionConfigForUi(config);
-  const openaiResponsesCompact = normalized.openaiResponsesCompact;
+  const providerNative = normalized.providerNative;
   const llmSummary = normalized.llmSummary;
   const generationConfig = toPlainGenerationConfig(llmSummary?.generationConfig);
 
@@ -760,12 +862,14 @@ function toPlainCompressionConfig(config: LlmCompressionConfigRecord): LlmCompre
       ...(normalized.trigger.thresholdPercent !== undefined ? { thresholdPercent: normalized.trigger.thresholdPercent } : {}),
       ...(normalized.trigger.thresholdUnit !== undefined ? { thresholdUnit: normalized.trigger.thresholdUnit } : {})
     },
-    ...(openaiResponsesCompact ? {
-      openaiResponsesCompact: {
-        ...(openaiResponsesCompact.providerConfigId ? { providerConfigId: openaiResponsesCompact.providerConfigId } : {}),
-        ...(openaiResponsesCompact.model ? { model: openaiResponsesCompact.model } : {})
+    ...(providerNative ? {
+      providerNative: {
+        ...(providerNative.providerConfigId ? { providerConfigId: providerNative.providerConfigId } : {}),
+        ...(providerNative.model ? { model: providerNative.model } : {}),
+        trustMode: normalizeNativeCompactionTrustMode(providerNative.trustMode)
       }
     } : {}),
+    fallbacks: normalizeCompressionFallbacks(normalized.fallbacks),
     ...(llmSummary ? {
       llmSummary: {
         ...(llmSummary.providerConfigId ? { providerConfigId: llmSummary.providerConfigId } : {}),
@@ -773,6 +877,7 @@ function toPlainCompressionConfig(config: LlmCompressionConfigRecord): LlmCompre
         ...(llmSummary.systemPrompt ? { systemPrompt: llmSummary.systemPrompt } : {}),
         ...(llmSummary.userPrompt ? { userPrompt: llmSummary.userPrompt } : {}),
         ...(llmSummary.targetTokens !== undefined ? { targetTokens: llmSummary.targetTokens } : {}),
+        reasoning: { mode: normalizeSummaryReasoningModeForUi(llmSummary.reasoning?.mode) },
         ...(generationConfig ? { generationConfig } : {})
       }
     } : {}),
@@ -1005,6 +1110,19 @@ function cloneMergeValue(value: MergeNodeValue): MergeNodeValue {
 }
 
 let modelFetchTimeout: number | undefined;
+/** 后端每次请求最多 30 秒、最多 9 次，另留余量。 */
+const THINKING_PROBE_TIMEOUT_MS = 180_000;
+const thinkingProbeTimers = new Map<string, number>();
+
+export function thinkingProbeKey(configId: string, modelId: string): string {
+  return JSON.stringify([configId, modelId.trim()]);
+}
+
+function clearThinkingProbeTimer(key: string): void {
+  const timer = thinkingProbeTimers.get(key);
+  if (timer !== undefined) window.clearTimeout(timer);
+  thinkingProbeTimers.delete(key);
+}
 const LLM_PROVIDER_CONFIGS_AUTOSAVE_DELAY_MS = 400;
 const LLM_COMPRESSION_CONFIGS_AUTOSAVE_DELAY_MS = 400;
 const SETTINGS_SAVE_ACK_TIMEOUT_MS = 5_000;
@@ -1121,11 +1239,20 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     loadedSections: {},
     loadingSettingsSections: {},
     fetchedModelsDialog: emptyFetchedModelsDialog(),
+    thinkingProbes: {},
     pendingSettingsSections: {},
     failedSettingsSections: {},
     status: ''
   }),
   getters: {
+    thinkingProbeState(state): (configId: string, modelId: string) => OpenAICompatibleThinkingProbeState | undefined {
+      return (configId: string, modelId: string) => {
+        const probe = state.thinkingProbes[thinkingProbeKey(configId, modelId)];
+        if (probe?.status !== 'failed' || probe.baseUrl === undefined) return probe;
+        const config = state.llmProviderConfigs.configs.find((candidate) => candidate.id === configId);
+        return config?.baseUrl.trim() === probe.baseUrl ? probe : undefined;
+      };
+    },
     hasExternalSettingsChange(state): boolean {
       return Object.keys(state.externalChangedSections).length > 0;
     },
@@ -1678,13 +1805,46 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     setActiveCompressionMethodKind(kind: SelectableCompressionMethodKind): void {
       const config = this.ensureCompressionConfigForActiveProvider();
       if (!config) return;
+      ensureCompressionStrategyDefaults(config);
       config.kind = kind;
-      if (kind === 'openai_responses_compact' && !config.openaiResponsesCompact) {
-        config.openaiResponsesCompact = {};
-      }
-      if ((kind === 'llm_summary' || kind === 'segmented_summary') && !config.llmSummary) {
-        config.llmSummary = createDefaultLlmCompressionConfig('临时').llmSummary;
-      }
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveProvider(config.id);
+    },
+    setActiveCompressionNativeTrustMode(value: LlmNativeCompactionTrustMode): void {
+      const config = this.ensureCompressionConfigForActiveProvider();
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      config.providerNative!.trustMode = normalizeNativeCompactionTrustMode(value);
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveProvider(config.id);
+    },
+    setActiveCompressionSummaryReasoningMode(value: LlmSummaryReasoningMode): void {
+      const config = this.ensureCompressionConfigForActiveProvider();
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      config.llmSummary!.reasoning = { mode: normalizeSummaryReasoningModeForUi(value) };
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveProvider(config.id);
+    },
+    setActiveCompressionSummaryGenerationConfig(value: LlmGenerationConfigRecord | undefined): void {
+      const config = this.ensureCompressionConfigForActiveProvider();
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      const cleaned = sanitizeGenerationConfig(value);
+      if (cleaned) config.llmSummary!.generationConfig = cleaned;
+      else delete config.llmSummary!.generationConfig;
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveProvider(config.id);
+    },
+    setActiveCompressionFallbacks(values: LlmCompressionFallbackKind[]): void {
+      const config = this.ensureCompressionConfigForActiveProvider();
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      config.fallbacks = normalizeCompressionFallbacks(values);
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
       this.selectCompressionConfigForActiveProvider(config.id);
@@ -1698,7 +1858,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         else delete target.providerConfigId;
         return target;
       };
-      config.openaiResponsesCompact = applyProvider({ ...(config.openaiResponsesCompact ?? {}) });
+      config.providerNative = applyProvider({ ...(config.providerNative ?? {}) });
       config.llmSummary = applyProvider({ ...(config.llmSummary ?? createDefaultLlmCompressionConfig('临时').llmSummary ?? {}) });
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
@@ -1722,13 +1882,46 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     setModelCompressionMethodKind(modelId: string, kind: SelectableCompressionMethodKind): void {
       const config = this.ensureCompressionConfigForActiveModel(modelId);
       if (!config) return;
+      ensureCompressionStrategyDefaults(config);
       config.kind = kind;
-      if (kind === 'openai_responses_compact' && !config.openaiResponsesCompact) {
-        config.openaiResponsesCompact = {};
-      }
-      if ((kind === 'llm_summary' || kind === 'segmented_summary') && !config.llmSummary) {
-        config.llmSummary = createDefaultLlmCompressionConfig('临时').llmSummary;
-      }
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveModel(modelId, config.id);
+    },
+    setModelCompressionNativeTrustMode(modelId: string, value: LlmNativeCompactionTrustMode): void {
+      const config = this.ensureCompressionConfigForActiveModel(modelId);
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      config.providerNative!.trustMode = normalizeNativeCompactionTrustMode(value);
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveModel(modelId, config.id);
+    },
+    setModelCompressionSummaryReasoningMode(modelId: string, value: LlmSummaryReasoningMode): void {
+      const config = this.ensureCompressionConfigForActiveModel(modelId);
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      config.llmSummary!.reasoning = { mode: normalizeSummaryReasoningModeForUi(value) };
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveModel(modelId, config.id);
+    },
+    setModelCompressionSummaryGenerationConfig(modelId: string, value: LlmGenerationConfigRecord | undefined): void {
+      const config = this.ensureCompressionConfigForActiveModel(modelId);
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      const cleaned = sanitizeGenerationConfig(value);
+      if (cleaned) config.llmSummary!.generationConfig = cleaned;
+      else delete config.llmSummary!.generationConfig;
+      config.updatedAt = Date.now();
+      this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveModel(modelId, config.id);
+    },
+    setModelCompressionFallbacks(modelId: string, values: LlmCompressionFallbackKind[]): void {
+      const config = this.ensureCompressionConfigForActiveModel(modelId);
+      if (!config) return;
+      ensureCompressionStrategyDefaults(config);
+      config.fallbacks = normalizeCompressionFallbacks(values);
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
       this.selectCompressionConfigForActiveModel(modelId, config.id);
@@ -1754,7 +1947,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         else delete target.providerConfigId;
         return target;
       };
-      config.openaiResponsesCompact = applyProvider({ ...(config.openaiResponsesCompact ?? {}) });
+      config.providerNative = applyProvider({ ...(config.providerNative ?? {}) });
       config.llmSummary = applyProvider({ ...(config.llmSummary ?? createDefaultLlmCompressionConfig('临时').llmSummary ?? {}) });
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
@@ -1768,8 +1961,9 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.llm.activeProviderConfigId = configId;
       this.saveLlm();
     },
-    createLlmProviderConfig(name = '新渠道配置', provider: LlmProviderKind = 'openai-compatible'): void {
+    createLlmProviderConfig(name = '新渠道配置', provider: LlmProviderKind = 'openai-compatible', baseUrl?: string): void {
       const config = createDefaultProviderConfig(name.trim() || '新渠道配置', provider);
+      if (baseUrl?.trim()) config.baseUrl = baseUrl.trim();
       this.llmProviderConfigs.configs.push(config);
       this.llm.activeProviderConfigId = config.id;
       this.pendingActiveProviderConfigIdAfterConfigsSave = config.id;
@@ -1976,6 +2170,92 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         this.closeFetchedModelsDialog();
       }
     },
+    verifyNativeCompressionCapability(configId: string, modelId?: string): void {
+      const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === configId);
+      if (!config) return;
+      const requestConfig = { ...toPlainProviderConfig(config), ...(modelId ? { model: modelId } : {}) };
+      this.status = '正在验证原生压缩端点（仅发送合成内容，可能消耗少量 Token）…';
+      bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig, probeNative: true });
+    },
+    /**
+     * “测试这个模型”：让后端向这个模型发最多 9 次很短的请求，测出思考参数写法。只在用户确认后调用。
+     * 同一渠道、同一模型测试中时不重复发送；3 分钟没有结果按超时失败。
+     */
+    testOpenAICompatibleThinking(configId: string, modelIdInput: string): void {
+      const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === configId);
+      const modelId = modelIdInput.trim();
+      if (!config || config.provider !== 'openai-compatible' || !modelId) return;
+      const key = thinkingProbeKey(config.id, modelId);
+      if (this.thinkingProbes[key]?.status === 'running') return;
+      const baseUrl = config.baseUrl.trim();
+      let requestId: string;
+      try {
+        requestId = bridge.request(BridgeMessageType.LlmProviderModelsGet, {
+          config: { ...toPlainProviderConfig(config), model: modelId },
+          probeThinking: true
+        });
+      } catch (error) {
+        this.setThinkingProbe({ configId: config.id, modelId, status: 'failed', requestId: '', baseUrl,
+          message: `测试思考参数失败：请求没有发出去（${messageFromError(error)}）` });
+        return;
+      }
+      this.setThinkingProbe({ configId: config.id, modelId, status: 'running', requestId, baseUrl });
+      this.status = `正在测试「${modelId}」的思考参数（最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求）…`;
+      clearThinkingProbeTimer(key);
+      thinkingProbeTimers.set(key, window.setTimeout(() => {
+        thinkingProbeTimers.delete(key);
+        const current = this.thinkingProbes[key];
+        if (current?.status !== 'running' || current.requestId !== requestId) return;
+        this.setThinkingProbe({ ...current, status: 'failed',
+          message: '测试思考参数失败：3 分钟内没有结果，请检查接口地址、API 密钥或网络代理设置。' });
+      }, THINKING_PROBE_TIMEOUT_MS));
+    },
+    /** 写入测试状态；失败时同时显示在状态栏。 */
+    setThinkingProbe(next: OpenAICompatibleThinkingProbeState | { configId: string; modelId: string; clear: true }): void {
+      const key = thinkingProbeKey(next.configId, next.modelId);
+      const probes = { ...this.thinkingProbes };
+      if ('clear' in next) delete probes[key];
+      else probes[key] = next;
+      this.thinkingProbes = probes;
+      if (!('clear' in next) && next.status === 'failed' && next.message) {
+        clearThinkingProbeTimer(key);
+        this.status = next.message;
+      }
+    },
+    /** 后端对某次测试的报错：按请求 id 认出，认出时返回 true（不再当成获取 LLM 列表失败）。 */
+    rejectThinkingProbe(correlationId: string | undefined, message: string): boolean {
+      if (!correlationId) return false;
+      const current = Object.values(this.thinkingProbes).find((probe) => probe.requestId === correlationId);
+      if (!current) return false;
+      this.setThinkingProbe({ ...current, status: 'failed', message: `测试思考参数失败：${message}` });
+      return true;
+    },
+    /** 测试结果：核对渠道和接口地址没变、模型还在，写进这个模型的 capabilitySnapshot 并保存。 */
+    applyThinkingProbeResult(payload: LlmProviderModelsSnapshotPayload): void {
+      const record = payload.models[0];
+      const evidence = normalizeModelCapabilitySnapshot(record?.capabilitySnapshot);
+      const modelId = evidence?.modelId ?? record?.id?.trim() ?? '';
+      const key = thinkingProbeKey(payload.configId, modelId);
+      clearThinkingProbeTimer(key);
+      const current = this.thinkingProbes[key];
+      const fail = (message: string) => this.setThinkingProbe({
+        configId: payload.configId, modelId, status: 'failed', requestId: current?.requestId ?? '', message: `测试思考参数失败：${message}`
+      });
+      const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === payload.configId);
+      if (!config) { this.setThinkingProbe({ configId: payload.configId, modelId, clear: true }); return; }
+      if (!evidence) { fail('没有返回测试结果。'); return; }
+      if (config.provider !== payload.provider || config.baseUrl.trim() !== payload.baseUrl.trim()) {
+        fail('测试期间接口地址改了，这次结果作废，请重新测试。');
+        return;
+      }
+      const model = config.models.find((candidate) => candidate.id === evidence.modelId);
+      if (!model) { fail('这个模型已从 LLM 列表移除，结果没有保存。'); return; }
+      model.capabilitySnapshot = evidence;
+      config.updatedAt = Date.now();
+      this.setThinkingProbe({ configId: payload.configId, modelId, clear: true });
+      this.saveLlmProviderConfigs();
+      this.status = `「${model.name || model.id}」测试完成：${describeOpenAICompatibleThinkingProbe(evidence)}`;
+    },
     closeFetchedModelsDialog(): void {
       this.fetchedModelsDialog = emptyFetchedModelsDialog();
     },
@@ -1988,9 +2268,14 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         return;
       }
       const selectedIds = new Set(selected.map((model) => model.id));
+      const previous = new Map(config.models.map((model) => [model.id, model.capabilitySnapshot]));
       config.models = sanitizeModels([
         ...config.models.filter((model) => !selectedIds.has(model.id)),
-        ...selected
+        // 重新添加同名模型时保留原来的能力证据（例如“测试这个模型”的结果）；测试证据优先于列表自带的信息。
+        ...selected.map((model) => {
+          const kept = previous.get(model.id);
+          return kept && (kept.source === 'verified_probe' || !model.capabilitySnapshot) ? { ...model, capabilitySnapshot: kept } : model;
+        })
       ]);
       if (!config.model) config.model = selected[0]?.id ?? '';
       config.updatedAt = Date.now();
@@ -2321,14 +2606,35 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       else this.clearPendingSettingSection(section);
     },
     applyLlmProviderModelsSnapshot(payload: LlmProviderModelsSnapshotPayload): void {
+      // 测试结果与获取 LLM 列表互不影响：不清获取超时，也不动获取弹窗。
+      if (payload.purpose === 'thinking_probe') {
+        this.applyThinkingProbeResult(payload);
+        return;
+      }
       clearModelFetchTimeout();
       const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === payload.configId);
       if (!config) return;
+      if (config.provider !== payload.provider || config.baseUrl !== payload.baseUrl) {
+        this.status = '渠道已改变，忽略旧端点返回的模型能力。';
+        return;
+      }
       const models = sanitizeModels(payload.models);
+      if (payload.purpose === 'capability_probe') {
+        const evidence = models[0]?.capabilitySnapshot;
+        if (!evidence) { this.status = '端点验证未返回能力证据。'; return; }
+        const before = config.models.find((model) => model.id === evidence.modelId);
+        if (!before) { this.status = '目标模型已被移除，忽略验证结果。'; return; }
+        before.capabilitySnapshot = evidence;
+        config.updatedAt = Date.now();
+        this.status = evidence.nativeCompaction.reason;
+        this.saveLlmProviderConfigs();
+        return;
+      }
       this.fetchedModelsDialog = { open: true, loading: false, configId: payload.configId, models };
       this.status = models.length ? `已获取 ${models.length} 个 LLM，请选择要添加的 LLM` : '没有获取到 LLM';
     },
     setError(message: string, options: GlobalSettingsErrorOptions = {}): void {
+      if (options.requestType === BridgeMessageType.LlmProviderModelsGet && this.rejectThinkingProbe(options.correlationId, message)) return;
       clearModelFetchTimeout();
       if (options.requestType === BridgeMessageType.LlmProviderModelsGet) {
         this.closeFetchedModelsDialog();

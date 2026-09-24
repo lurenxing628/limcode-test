@@ -857,8 +857,9 @@ function preferredTurnVariant(
   const variants = facts.compressionContextVariants
     .filter((variant) => variant.blockId === blockId)
     .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id));
-  const nativeAllowed = purpose.settingsSnapshot?.provider === 'openai-responses'
-    && purpose.settingsSnapshot.compressionMethodKind === 'openai_responses_compact';
+  const nativeAllowed = (purpose.settingsSnapshot?.provider === 'openai-responses'
+    || purpose.settingsSnapshot?.provider === 'claude')
+    && purpose.settingsSnapshot.compressionMethodKind === 'provider_native';
   return (nativeAllowed ? variants.find((variant) => variant.kind === 'provider_native') : undefined)
     ?? variants.find((variant) => variant.kind === 'provider_neutral_summary');
 }
@@ -868,7 +869,8 @@ function variantCompatible(
   purpose: Extract<ModelContextPurpose, { kind: 'turn' }>
 ): boolean {
   if (variant.kind !== 'provider_native') return true;
-  if (purpose.settingsSnapshot?.provider !== 'openai-responses') return false;
+  if (purpose.settingsSnapshot?.provider !== 'openai-responses'
+    && purpose.settingsSnapshot?.provider !== 'claude') return false;
   const compatibility = variant.compatibility;
   if (!compatibility) return true;
   if (compatibility.provider && compatibility.provider !== purpose.settingsSnapshot.provider) return false;
@@ -902,7 +904,7 @@ function preferredCompressionVariant(
   const variants = facts.compressionContextVariants
     .filter((variant) => variant.blockId === blockId)
     .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id));
-  return methodKind === 'openai_responses_compact'
+  return methodKind === 'provider_native'
     ? variants.find((variant) => variant.kind === 'provider_native') ?? variants.find((variant) => variant.kind === 'provider_neutral_summary')
     : variants.find((variant) => variant.kind === 'provider_neutral_summary');
 }

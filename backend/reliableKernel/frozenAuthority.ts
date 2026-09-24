@@ -3,8 +3,13 @@ import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
-import { MAX_LLM_RETRY_DELAY_SECONDS } from '../../shared/protocol';
-import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind } from '../../shared/protocol';
+import { MAX_LLM_RETRY_DELAY_SECONDS, canonicalLlmProviderKind } from '../../shared/protocol';
+import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind, SkillPolicyRecord } from '../../shared/protocol';
+import type {
+  CompressionExecutionPlan,
+  ModelCapabilitySnapshot,
+  ResolvedSummaryReasoning
+} from '../../shared/modelCapabilities';
 
 export interface FrozenContextProfile {
   contextWindowTokens: number;
@@ -37,12 +42,15 @@ export interface FrozenCompressionPolicy {
   config: LlmCompressionConfigRecord;
   triggerMode: LlmCompressionConfigRecord['trigger']['mode'];
   thresholdTokens: number;
+  executionPlan: CompressionExecutionPlan;
   provider: {
     providerConfigId: string;
     provider: LlmProviderKind;
     modelId: string;
     contextWindowTokens: number;
     maxOutputTokens: number;
+    capabilities: ModelCapabilitySnapshot;
+    summaryReasoning: ResolvedSummaryReasoning;
     retryPolicy: FrozenProviderRetryPolicy;
   };
 }
@@ -101,6 +109,20 @@ export function frozenInteractionAutoApproval(
   return isRecord(tool) && isRecord(tool.config) && tool.config.autoApprove === true;
 }
 
+/**
+ * The skill settings frozen in one AuthoritySnapshot. Absent means every skill is on (skills are
+ * opt-out); a malformed value throws. Listing skills to the model and loading one both use this.
+ */
+export function frozenSkillPolicy(document: PlainJsonValue): Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined {
+  if (!isRecord(document)) throw new TypeError('AuthoritySnapshot must be an object.');
+  if (document.skillPolicy === undefined || document.skillPolicy === null) return undefined;
+  if (!isRecord(document.skillPolicy)) throw new TypeError('AuthoritySnapshot.skillPolicy must be an object.');
+  const sourceConfigs = document.skillPolicy.sourceConfigs;
+  if (sourceConfigs === undefined || sourceConfigs === null) return {};
+  if (!isRecord(sourceConfigs)) throw new TypeError('AuthoritySnapshot.skillPolicy.sourceConfigs must be an object.');
+  return { sourceConfigs: sourceConfigs as SkillPolicyRecord['sourceConfigs'] };
+}
+
 export function frozenModelIdentity(document: PlainJsonValue): { providerId: string; modelId: string } {
   if (!isRecord(document) || !isRecord(document.model)) {
     throw new Error('AuthoritySnapshot is missing frozen model identity.');
@@ -116,8 +138,9 @@ export function frozenModelSelection(document: PlainJsonValue): ChatModelOverrid
   if (!isRecord(document) || !isRecord(document.model)) {
     throw new Error('AuthoritySnapshot is missing frozen model selection.');
   }
-  const provider = document.model.provider;
-  if (!isProviderKind(provider)) throw new Error('AuthoritySnapshot.model.provider is invalid.');
+  // 历史回合冻结的 'deepseek' 读作 OpenAI 兼容，与迁移后的渠道配置一致。
+  const provider = canonicalLlmProviderKind(document.model.provider);
+  if (!provider) throw new Error('AuthoritySnapshot.model.provider is invalid.');
   return {
     providerConfigId: requireText(
       document.model.providerConfigId,
@@ -192,14 +215,18 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
     throw new Error('Frozen compression trigger is invalid.');
   }
   const thresholdTokens = positiveSafeInteger(compression.thresholdTokens, 'compression.thresholdTokens');
-  const providerKind = provider.provider;
-  if (!isProviderKind(providerKind)) throw new Error('Frozen compression provider kind is invalid.');
+  const providerKind = canonicalLlmProviderKind(provider.provider);
+  if (!providerKind) throw new Error('Frozen compression provider kind is invalid.');
+  const executionPlan = requireCompressionExecutionPlan(compression.executionPlan, methodKind);
+  const capabilities = requireModelCapabilities(provider.capabilities, providerKind);
+  const summaryReasoning = requireSummaryReasoning(provider.summaryReasoning);
   return {
     enabled: true,
     methodKind,
     config: normalizePlainJson(config, 'AuthoritySnapshot.compression.config') as unknown as LlmCompressionConfigRecord,
     triggerMode: trigger.mode,
     thresholdTokens,
+    executionPlan,
     provider: {
       providerConfigId: requireText(provider.providerConfigId, 'AuthoritySnapshot.compression.provider.providerConfigId'),
       provider: providerKind,
@@ -212,6 +239,8 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
         provider.maxOutputTokens,
         'compression.provider.maxOutputTokens'
       ),
+      capabilities,
+      summaryReasoning,
       retryPolicy: normalizeFrozenRetryPolicy(
         provider.retryPolicy,
         'compression.provider.retryPolicy',
@@ -269,14 +298,50 @@ function normalizeFrozenRetryPolicy(
 }
 
 function requireCompressionKind(value: unknown): LlmCompressionConfigRecord['kind'] {
-  if (!['disabled', 'openai_responses_compact', 'llm_summary', 'segmented_summary', 'deterministic_summary', 'manual_summary'].includes(String(value))) {
+  if (!['disabled', 'auto', 'provider_native', 'llm_summary', 'segmented_summary', 'deterministic_summary', 'manual_summary'].includes(String(value))) {
     throw new Error(`Unsupported frozen compression method: ${String(value)}.`);
   }
   return value as LlmCompressionConfigRecord['kind'];
 }
 
-function isProviderKind(value: unknown): value is LlmProviderKind {
-  return ['openai-compatible', 'openai-responses', 'claude', 'gemini', 'deepseek'].includes(String(value));
+function requireCompressionExecutionPlan(
+  value: unknown,
+  strategy: LlmCompressionConfigRecord['kind']
+): CompressionExecutionPlan {
+  if (!isRecord(value) || value.strategy !== strategy || !Array.isArray(value.attempts)
+    || typeof value.continueUncompressedIfFits !== 'boolean' || !isRecord(value.nativeCapability)) {
+    throw new Error('Frozen compression execution plan is incomplete.');
+  }
+  for (const attempt of value.attempts) {
+    if (!isRecord(attempt)
+      || !['provider_native', 'llm_summary', 'segmented_summary', 'deterministic_summary', 'manual_summary'].includes(String(attempt.methodKind))) {
+      throw new Error('Frozen compression execution plan contains an unsupported attempt.');
+    }
+    if (attempt.methodKind === 'provider_native'
+      && attempt.nativeKind !== 'openai_responses'
+      && attempt.nativeKind !== 'anthropic_messages') {
+      throw new Error('Frozen native compression attempt is missing its Provider adapter kind.');
+    }
+  }
+  return normalizePlainJson(value, 'AuthoritySnapshot.compression.executionPlan') as unknown as CompressionExecutionPlan;
+}
+
+function requireModelCapabilities(value: unknown, provider: LlmProviderKind): ModelCapabilitySnapshot {
+  if (!isRecord(value) || canonicalLlmProviderKind(value.providerKind) !== provider || !isRecord(value.reasoning)
+    || !isRecord(value.nativeCompaction) || typeof value.modelId !== 'string'
+    || typeof value.endpointFingerprint !== 'string' || typeof value.source !== 'string') {
+    throw new Error('Frozen compression Provider capability snapshot is incomplete.');
+  }
+  const snapshot = normalizePlainJson(value, 'AuthoritySnapshot.compression.provider.capabilities') as unknown as ModelCapabilitySnapshot;
+  return snapshot.providerKind === provider ? snapshot : { ...snapshot, providerKind: provider };
+}
+
+function requireSummaryReasoning(value: unknown): ResolvedSummaryReasoning {
+  if (!isRecord(value) || typeof value.intent !== 'string' || typeof value.status !== 'string'
+    || typeof value.description !== 'string') {
+    throw new Error('Frozen compression summary reasoning plan is incomplete.');
+  }
+  return normalizePlainJson(value, 'AuthoritySnapshot.compression.provider.summaryReasoning') as unknown as ResolvedSummaryReasoning;
 }
 
 function positiveSafeInteger(value: unknown, label: string): number {

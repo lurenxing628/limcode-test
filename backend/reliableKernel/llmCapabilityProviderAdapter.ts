@@ -7,12 +7,14 @@ import type { WorldEvent } from '../ecs/types';
 import { captureDebug, debugCaptureSources, setDebugCaptureContext, type DebugCaptureRecorder } from './debugCapture/observer';
 import {
   READ_TOOL_NAME,
+  canonicalLlmProviderKind,
   type AttachmentCatalogEntry,
   type InlineDataPart,
   type LlmProviderKind,
   type LlmThinkingLevel,
   type MessageContent,
-  type ModelOutputItemReference
+  type ModelOutputItemReference,
+  type ProviderContextPart
 } from '../../shared/protocol';
 import {
   normalizeAttachmentCatalogState,
@@ -33,6 +35,7 @@ import { classifyOpenAIResponsesPreTerminalWebSocketClose } from '../capabilitie
 import { frozenProviderRetryPolicy } from './frozenAuthority';
 import {
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
+  ProviderCapabilityError,
   ProviderTransientError
 } from './modelProviderControlPlane';
 import type {
@@ -40,17 +43,21 @@ import type {
   FullProviderRequest,
   FullRequestProviderAdapter,
   ProviderDispatchControls,
-  ProviderOutputStreamEvent
+  ProviderOutputStreamEvent,
+  TurnReminderHistoryEntry
 } from './modelProviderControlPlane';
 import {
   collectNativeConfigurationUpdates,
   isNativeConfigurationUpdatePart,
+  createAttachmentPlacementQueue,
   createManagedMediaBodyProjectionState,
   estimateProjectedModelInput,
+  isToolResultContents,
   projectOrdinaryModelWindow,
   projectSummaryModelWindow,
   stripNativeConfigurationUpdates,
   suppressRepeatedManagedMediaBodies,
+  type ManagedMediaBodyProjectionState,
   type ProjectedRequestTokenBreakdown
 } from './modelFacingContextProjection';
 import {
@@ -62,6 +69,22 @@ import {
   type ModelHandleCatalog
 } from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
+import { isGpt6NoneCapableModel } from '../../shared/openAIResponsesCapabilities';
+import {
+  markedReinjectedInput,
+  readTurnReminderMarker,
+  turnReminderContent,
+  turnReminderDeliveries,
+  visibleHistoryTurnReminder,
+  type TurnReminderLayout
+} from '../capabilities/claudeTurnScopedReminders';
+import { claudeTurnScopedRemindersFallenBackForModel } from '../capabilities/providerParameterAdaptation';
+import { claudeTurnScopedCompaction, type TurnReminderIdentitySplit } from './turnReminderProjection';
+import {
+  openAICompatibleModelReadsGeminiSignatures,
+  withoutGeminiFunctionCallSignatures
+} from '../capabilities/geminiProviderAdaptation';
 import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
@@ -123,14 +146,32 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       return estimateCompactProjection(toLlmCompactRequest(request));
     }
     const projected = toLlmStartRequest(request);
+    // 按实际发出的布局估算：网关拒绝过轮内系统消息的渠道与模型退回尾巴模式（与开关关闭时相同）。
+    // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
+    // 只有按 user 消息发出的历史提醒（拆分发出的只有运行状态卡那条 user 消息）计入上下文；本轮提醒照常计入
+    // turnReminderTokens。重新注入输入的历史副本是普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，
+    // 也就没有本轮输入。
+    const deliveries = turnReminderDeliveries(projected.contents, estimatedTurnReminderLayout(request.providerId, request.modelId));
+    let tailInputSuperseded = false;
+    const visibleContents = projected.contents.flatMap((content, index) => {
+      const marker = readTurnReminderMarker(content);
+      if (!marker) return [content];
+      if (marker.placement === 'current') {
+        if (deliveries[index] !== 'omitted') return [content];
+        if (marker.kind === 'reinjected_input') tailInputSuperseded = true;
+        return [];
+      }
+      const visible = visibleHistoryTurnReminder(content, deliveries[index]);
+      return visible ? [visible] : [];
+    });
     const frozenCurrent = request.requestAddenda?.currentTurnInput;
-    const currentInputCount = frozenCurrent?.reinject ? 1 : 0;
+    const currentInputCount = frozenCurrent?.reinject && !tailInputSuperseded ? 1 : 0;
     const reminderCount = request.requestAddenda?.turnReminder ? 1 : 0;
-    const contextEnd = projected.contents.length - currentInputCount - reminderCount;
+    const contextEnd = visibleContents.length - currentInputCount - reminderCount;
     const currentEnd = contextEnd + currentInputCount;
-    const projectedContext = projected.contents.slice(0, contextEnd);
+    const projectedContext = visibleContents.slice(0, contextEnd);
     let currentInputContents = currentInputCount
-      ? projected.contents.slice(contextEnd, currentEnd)
+      ? visibleContents.slice(contextEnd, currentEnd)
       : [];
     if (frozenCurrent && !frozenCurrent.reinject) {
       const decodedCurrent = decodeFrozenCurrentTurnInput(frozenCurrent.content, frozenCurrent.contentType);
@@ -153,7 +194,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       tools: projected.tools,
       contextContents: projectedContext,
       ...(currentInputContents.length ? { currentInputContents } : {}),
-      ...(reminderCount ? { turnReminderContents: projected.contents.slice(currentEnd) } : {}),
+      ...(reminderCount ? { turnReminderContents: visibleContents.slice(currentEnd) } : {}),
       providerFramingTokens: 64
     });
   }
@@ -238,9 +279,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           case LlmEventType.Delta: {
             const delta = optionalText(payload?.text);
             const outputItem = modelOutputItemFromPayload(payload);
+            const partSignature = optionalText(payload?.thoughtSignature);
             text += delta;
+            if (partSignature) appendSignedTextPart(outputParts, delta, partSignature, outputItem);
             if (delta) {
-              appendTextPart(outputParts, delta, false, undefined, outputItem);
+              if (!partSignature) appendTextPart(outputParts, delta, false, undefined, outputItem);
               enqueue({
                 kind: 'output_delta',
                 content: {
@@ -341,6 +384,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           }
           case LlmEventType.OutputItemDone: {
             const outputItem = modelOutputItemFromPayload(payload);
+            const providerContextPart = providerContextPartFromPayload(payload?.part, outputItem);
+            if (providerContextPart) appendProviderContextPart(outputParts, providerContextPart);
             if (outputItem) {
               applyOutputItemMetadata(outputParts, outputItem);
               enqueue({
@@ -415,10 +460,15 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               completedThoughtBlockDurations,
               thoughtTimingObserved ? completedThoughtDurationMs : undefined
             ));
+            // 这次请求实际使用的 Claude 保留思考处理（含本次新学到的）写进请求终态；没带时沿用窗口里已有的选择。
+            const claudeThinkingBinding = payload?.claudeThinkingBinding === 'drop_block' || payload?.claudeThinkingBinding === 'strip_thinking'
+              ? payload.claudeThinkingBinding
+              : request.claudeThinkingBinding;
             enqueue({
               kind: 'completed',
               content: normalizePlainJson(completedContent, 'LLM completed MessageContent'),
               ...(usage !== undefined ? { usage } : {}),
+              ...(claudeThinkingBinding ? { claudeThinkingBinding } : {}),
               timing: {
                 ...(providerStartedAt !== undefined ? { providerStartedAt } : {}),
                 ...(optionalPositiveNumber(payload?.createdAt) !== undefined
@@ -573,6 +623,76 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
   }
 }
 
+/**
+ * Provider state stored in a model reply that only its source can read is not replayed elsewhere:
+ * GPT reasoning signatures across Responses channels, Responses compaction items to another channel
+ * or model, and Gemini call signatures to an OpenAI-compatible model that is not Gemini.
+ */
+function isolateCrossSourceProviderState(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  return isolateCrossSourceGeminiCallSignatures(
+    isolateCrossSourceResponsesCompaction(
+      isolateCrossChannelGptThoughtSignatures(content, source, request, provider),
+      source,
+      request,
+      provider
+    ),
+    source,
+    request,
+    provider
+  );
+}
+
+/**
+ * The encrypted Responses `compaction` item of an ordinary reply made with `context_management` is
+ * replayed as it came (https://developers.openai.com/api/docs/guides/compaction), but only to the
+ * channel and model that produced it, like provider-native compression state (assertCompressionBinding).
+ * After a switch of channel or model, or for a reply of unknown source, the item is not sent: the
+ * history it condenses is still in the window. Other providers already drop Responses items.
+ */
+function isolateCrossSourceResponsesCompaction(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  if (
+    provider !== 'openai-responses'
+    || content.role !== 'model'
+    || (source?.providerId === request.providerId && source.modelId === request.modelId)
+  ) return content;
+  const parts = content.parts.filter((part) => !('providerContext' in part)
+    || part.providerContext.format !== 'openai-responses'
+    || part.providerContext.itemType !== 'compaction');
+  return parts.length === content.parts.length ? content : { ...content, parts };
+}
+
+/**
+ * The OpenAI-compatible encoder returns a stored Gemini call signature as
+ * `tool_calls[].extra_content.google.thought_signature`. Chat Completions documents only
+ * `id`/`type`/`function` there and strict servers reject the field, so the signature goes back
+ * only to a Gemini-like model, or to the same channel and model that produced the call (a Gemini
+ * behind a gateway alias). A reply of unknown source keeps it only for Gemini-like models.
+ */
+function isolateCrossSourceGeminiCallSignatures(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  if (
+    provider !== 'openai-compatible'
+    || content.role !== 'model'
+    || openAICompatibleModelReadsGeminiSignatures(request.modelId)
+    || (source?.providerId === request.providerId && source.modelId === request.modelId)
+  ) return content;
+  return withoutGeminiFunctionCallSignatures(content);
+}
+
 function isolateCrossChannelGptThoughtSignatures(
   content: MessageContent,
   source: FullProviderContextItem['modelSource'],
@@ -612,6 +732,11 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     .map((tool) => tool.schema);
   const authorityModel = requireRecord(authority.model, 'Provider authority model');
   const provider = requireProviderKind(authorityModel.provider);
+  // Claude 轮内系统消息模式（本轮冻结的开关）：之前发过的提醒与重新注入的输入放回它那次请求的模型输出前面，本轮提醒
+  // 标为 current；发送形态由 claudeTurnScopedReminders.ts 决定。开关关闭时这里不产生任何标记，内容与原来完全一致。
+  const turnScopedReminders = provider === 'claude' && authorityModel.claudeTurnScopedReminders === true;
+  const reminderHistory = turnScopedReminders ? turnReminderHistoryBySegment(request) : undefined;
+  const historyInsertions: HistoryInsertion[] = [];
   const systemPromptPrefix = typeof authorityModel.systemPromptPrefix === 'string'
     ? authorityModel.systemPromptPrefix
     : '';
@@ -639,19 +764,24 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId),
     { allowCurrentTurnDelta: currentTurnInput?.reinject === true }
   );
-  const appendAttachmentState = (segmentId: string): void => {
-    const placement = renderedAttachmentState.afterSegment.get(segmentId);
-    if (placement) contents.push(placement);
+  const attachmentPlacements = createAttachmentPlacementQueue((content) => contents.push(content));
+  const appendAttachmentState = (segmentId: string, toolResults = false): void => {
+    attachmentPlacements.leave(toolResults, renderedAttachmentState.afterSegment.get(segmentId));
   };
-  for (const item of request.context) {
+  for (const item of nativeResultsAfterTheirCalls(request.context, provider)) {
+    const pairContents = item.segmentKind === 'tool_pair'
+      ? toolPairContents(item.content, modelHandleCatalog)
+      : undefined;
+    const toolResults = pairContents !== undefined && isToolResultContents(pairContents);
+    attachmentPlacements.enter(toolResults);
     if (item.segmentKind === 'system') {
       systemParts.push(contextText(item.content, item.contentType));
       appendAttachmentState(item.segmentId);
       continue;
     }
-    if (item.segmentKind === 'tool_pair') {
-      contents.push(...toolPairContents(item.content, modelHandleCatalog));
-      appendAttachmentState(item.segmentId);
+    if (pairContents) {
+      contents.push(...pairContents);
+      appendAttachmentState(item.segmentId, toolResults);
       continue;
     }
     const compressed = decodeCompressionContents(item.content, item.contentType);
@@ -674,7 +804,9 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     }
     const decoded = decodeMessageContent(item.content, item.contentType);
     if (decoded) {
-      contents.push(isolateCrossChannelGptThoughtSignatures(decoded, item.modelSource, request, provider));
+      const historical = decoded.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
+      if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
+      contents.push(isolateCrossSourceProviderState(decoded, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
     }
@@ -682,16 +814,18 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     contents.push({ role, parts: [{ text: item.content }] });
     appendAttachmentState(item.segmentId);
   }
+  attachmentPlacements.release();
   const tools = modelFacingToolsForHandleCatalog(
     readToolsForAttachmentCatalog(availableTools, attachmentCatalogState.catalog),
     modelHandleCatalog
   );
   // 冻结原生 reasoning：configuration_update 历史/待决更新按序置于持久化上下文之后、
   // 当前 Turn 易失尾之前（最新 update 支配后续 response；cache 前缀不被尾部易失内容干扰）。
-  const nativeReasoning = frozenNativeReasoning(recipe);
+  const nativeReasoning = frozenNativeReasoning(recipe, request.modelId);
   if (nativeReasoning) {
     contents = appendNativeConfigurationUpdates(contents, nativeReasoning);
   }
+  let tailInputIndex: number | undefined;
   if (currentTurnInput?.reinject) {
     const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
     if (!current || current.role !== 'user') {
@@ -701,8 +835,14 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     if (renderedAttachmentState.currentTurn) {
       reinjected.parts.push(...renderedAttachmentState.currentTurn.parts);
     }
+    tailInputIndex = contents.length;
     contents.push(reinjected);
   }
+  // 窗口里已有这条输入的历史副本：轮内系统消息模式下尾巴副本不再发送（尾巴模式照常发送）。
+  const supersededTailInputIndex = tailInputIndex !== undefined && historyInsertions.some((insertion) =>
+    insertion.input?.messageRevisionId === currentTurnInput?.messageRevisionId)
+    ? tailInputIndex
+    : undefined;
   const turnReminder = request.requestAddenda?.turnReminder;
   if (turnReminder) {
     contents.push({ role: 'user', parts: [{ text: turnReminder.content }] });
@@ -714,10 +854,18 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...(turnReminder ? ['turn_reminder' as const] : [])
   ];
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
-  const projectedContents = projectOrdinaryContentsPreservingRanges(
+  const projection = projectOrdinaryContentsWithDetachedInputs(
     contents,
     canonicalCompressionRanges,
-    modelHandleCatalog
+    modelHandleCatalog,
+    historyInsertions
+  );
+  const projectedContents = withTurnReminderMarkers(
+    projection.contents,
+    contents.length,
+    projection.insertions,
+    turnScopedReminders ? turnReminder : undefined,
+    supersededTailInputIndex
   );
   return {
     id: request.modelRequestId,
@@ -734,6 +882,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       provider,
       modelId: request.modelId,
       systemPromptPrefix,
+      ...(turnScopedReminders ? { claudeTurnScopedReminders: true } : {}),
       // The complete generation config is frozen per ordinary request, not re-read on retry.
       ...(asRecord(authorityModel.generationConfig)
         ? { generationConfig: authorityModel.generationConfig as NonNullable<LlmStartRequest['settingsSnapshot']>['generationConfig'],
@@ -765,8 +914,141 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...(request.nativeAsyncAdmittedCallIds?.length
       ? { nativeAsyncAdmittedCallIds: [...request.nativeAsyncAdmittedCallIds] }
       : {}),
+    ...(request.claudeThinkingBinding ? { claudeThinkingBinding: request.claudeThinkingBinding } : {}),
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
   };
+}
+
+/** 某次历史请求要放回它模型输出前面的内容：先是它重新注入的输入，再是它的提醒。 */
+interface HistoryInsertion {
+  /** 那次请求的模型输出在投影前内容里的位置。 */
+  beforeIndex: number;
+  reminder?: string;
+  reminderIdentitySplit?: TurnReminderIdentitySplit;
+  input?: { messageRevisionId: string; content: MessageContent };
+}
+
+function turnReminderHistoryBySegment(request: FullProviderRequest): Map<string, TurnReminderHistoryEntry> {
+  return new Map((request.requestAddenda?.turnReminderHistory ?? []).map((entry) => [entry.segmentId, entry]));
+}
+
+/** 按那次请求的原样重建：与本请求的尾巴副本同一个构造（标签 part、冻结原文 parts、那次的附件目录增量）。 */
+function historyInsertion(entry: TurnReminderHistoryEntry, beforeIndex: number): HistoryInsertion {
+  let input: HistoryInsertion['input'];
+  if (entry.reinjectedInput) {
+    const current = decodeFrozenCurrentTurnInput(entry.reinjectedInput.content, entry.reinjectedInput.contentType);
+    if (!current || current.role !== 'user') {
+      throw new TypeError('Historical reinjected Turn input must be a user MessageContent.');
+    }
+    const content = reinjectedCurrentTurnInput(current);
+    if (entry.reinjectedInput.currentTurnAttachmentState) {
+      content.parts.push(...entry.reinjectedInput.currentTurnAttachmentState.parts);
+    }
+    input = { messageRevisionId: entry.reinjectedInput.messageRevisionId, content };
+  }
+  return {
+    beforeIndex,
+    ...(entry.content !== undefined ? { reminder: entry.content } : {}),
+    ...(entry.content !== undefined && entry.identitySplit ? { reminderIdentitySplit: entry.identitySplit } : {}),
+    ...(input ? { input } : {})
+  };
+}
+
+/**
+ * 普通投影，外加重新注入输入的历史副本：每个副本用它所在位置之前的托管媒体状态单独投影，与那次请求把它放在尾巴时
+ * 看到的状态相同，所以投影结果逐字节相同；它不写回媒体状态，其余内容的投影与没有副本时（开关关闭、尾巴模式）完全相同。
+ * 副本都在模型输出之前，切分点不会落在一组工具调用与结果之间，也不会落在规范压缩范围里面。
+ */
+function projectOrdinaryContentsWithDetachedInputs(
+  contents: readonly MessageContent[],
+  canonicalRanges: readonly { start: number; end: number }[],
+  modelHandleCatalog: ModelHandleCatalog,
+  insertions: readonly HistoryInsertion[]
+): { contents: MessageContent[]; insertions: HistoryInsertion[] } {
+  const detached = insertions.filter((insertion) => insertion.input);
+  if (detached.length === 0) {
+    return {
+      contents: projectOrdinaryContentsPreservingRanges(contents, canonicalRanges, modelHandleCatalog),
+      insertions: [...insertions]
+    };
+  }
+  const projectedInputs = new Map<number, MessageContent>();
+  const projected = projectOrdinaryContentsPreservingRanges(
+    contents,
+    canonicalRanges,
+    modelHandleCatalog,
+    {
+      cuts: detached.map((insertion) => insertion.beforeIndex),
+      atCut(index, mediaState) {
+        const insertion = detached.find((candidate) => candidate.beforeIndex === index)!;
+        projectedInputs.set(index, projectOrdinaryModelWindow(
+          [insertion.input!.content],
+          modelHandleCatalog,
+          cloneManagedMediaBodyProjectionState(mediaState)
+        ).contents[0]);
+      }
+    }
+  );
+  return {
+    contents: projected,
+    insertions: insertions.map((insertion) => insertion.input
+      ? { ...insertion, input: { ...insertion.input, content: projectedInputs.get(insertion.beforeIndex)! } }
+      : insertion)
+  };
+}
+
+function cloneManagedMediaBodyProjectionState(state: ManagedMediaBodyProjectionState): ManagedMediaBodyProjectionState {
+  return {
+    seenAttachmentMetadata: new Map(state.seenAttachmentMetadata),
+    uniqueBodyCount: state.uniqueBodyCount,
+    suppressedBodyCount: state.suppressedBodyCount
+  };
+}
+
+/**
+ * 把 Claude 轮内系统消息模式的标记放进已投影的内容：投影逐条一一对应（不增删、不重排），
+ * 历史内容按投影前记下的位置插回那次请求的模型输出前面（重新注入的输入在前、提醒在后，与那次请求尾巴的顺序相同），
+ * 本轮提醒（投影前按原来的形态放在最后）换成带标记的同一文本；窗口里已有历史副本的尾巴输入标为 current。
+ * 带运行状态卡的提醒把身份拆分放进标记，发送时运行状态卡保持 user 身份（见 claudeTurnScopedReminders.ts）。
+ * 历史提醒不参与投影，工具结果分组与媒体去重与开关关闭时完全相同。
+ */
+function withTurnReminderMarkers(
+  projected: MessageContent[],
+  contentCount: number,
+  insertions: readonly HistoryInsertion[],
+  currentReminder: { content: string; identitySplit?: TurnReminderIdentitySplit } | undefined,
+  supersededTailInputIndex?: number
+): MessageContent[] {
+  if (insertions.length === 0 && currentReminder === undefined && supersededTailInputIndex === undefined) return projected;
+  if (projected.length !== contentCount) {
+    throw new Error('Ordinary Context projection must keep one projected content per input content.');
+  }
+  const result: MessageContent[] = [];
+  let cursor = 0;
+  projected.forEach((content, index) => {
+    while (cursor < insertions.length && insertions[cursor].beforeIndex === index) {
+      const insertion = insertions[cursor++];
+      if (insertion.input) result.push(markedReinjectedInput(insertion.input.content, 'history'));
+      if (insertion.reminder !== undefined) {
+        result.push(turnReminderContent(insertion.reminder, {
+          placement: 'history',
+          ...(insertion.reminderIdentitySplit ? { identitySplit: insertion.reminderIdentitySplit } : {})
+        }));
+      }
+    }
+    result.push(index === supersededTailInputIndex ? markedReinjectedInput(content, 'current') : content);
+  });
+  if (cursor !== insertions.length) throw new Error('Historical turn reminder lost its model output position.');
+  if (currentReminder !== undefined) {
+    const last = result.pop();
+    const text = last?.role === 'user' && last.parts.length === 1 && 'text' in last.parts[0] ? last.parts[0].text : undefined;
+    if (text !== currentReminder.content) throw new Error('The current turn reminder must be the last projected content.');
+    result.push(turnReminderContent(currentReminder.content, {
+      placement: 'current',
+      ...(currentReminder.identitySplit ? { identitySplit: currentReminder.identitySplit } : {})
+    }));
+  }
+  return result;
 }
 
 function requireAttachmentHandle(catalog: ModelHandleCatalog, attachmentId: string): string {
@@ -813,13 +1095,21 @@ function isCompressionRequest(recipe: PlainJsonValue): boolean {
   return asRecord(recipe)?.kind === 'reliable-context-compression';
 }
 
+/**
+ * The compact request a frozen compression request projects to, exactly as dispatch builds it.
+ * Planning only: nothing is sent and nothing is written.
+ */
+export function compactRequestForCompressionPlanning(request: FullProviderRequest): LlmCompactRequest {
+  return toLlmCompactRequest(request);
+}
+
 function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
   const recipe = requireRecord(request.recipe, 'Compression recipe');
   if (recipe.kind !== 'reliable-context-compression') throw new TypeError('ModelRequest is not a compression request.');
   const authority = requireRecord(request.authoritySnapshot, 'Compression authority');
   const compression = requireRecord(authority.compression, 'Compression authority policy');
   const authorityMethodConfig = requireRecord(compression.config, 'Compression authority config');
-  const methodKind = requireText(authorityMethodConfig.kind, 'Compression method kind') as LlmCompactRequest['methodKind'];
+  const methodKind = requireExecutableCompressionMethod(recipe.compressionMethodKind);
   const methodConfig = frozenEffectiveCompressionConfig(authorityMethodConfig, recipe, methodKind);
   const conversationId = requireText(request.conversationId, 'Provider request conversationId');
   const authorityConversationId = optionalText(authority.conversationId);
@@ -833,16 +1123,35 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     modelId: requireText(provider.modelId, 'Compression modelId')
   };
   const context = compressionContext(request, compressionProvider, methodKind);
+  const toolPolicy = authorityToolPolicy(authority);
+  const availableTools = normalizeToolDefinitions(recipe.tools)
+    .filter((tool) => providerToolAllowed(toolPolicy, tool))
+    .map((tool) => tool.schema);
+  const tools = modelFacingToolsForHandleCatalog(
+    readToolsForAttachmentCatalog(availableTools, context.attachmentCatalogState.catalog),
+    context.modelHandleCatalog
+  );
   const attachmentObservationContract = frozenAttachmentObservationContract(
     recipe,
     methodKind,
     context.attachmentCatalogState.catalog,
     context.modelHandleCatalog
   );
+  // 压缩渠道就是本轮对话的渠道与模型时（原生压缩必然如此），用本轮冻结的前置提示词，与普通请求的 system 逐字节相同；
+  // 不带它时 capability 会回落到渠道当前的配置，渠道改过前置提示词后 system 就与普通请求不同。
+  const authorityModel = asRecord(authority.model);
+  const frozenSystemPromptPrefix = authorityModel
+    && authorityModel.providerConfigId === compressionProvider.providerConfigId
+    && authorityModel.modelId === compressionProvider.modelId
+    ? typeof authorityModel.systemPromptPrefix === 'string' ? authorityModel.systemPromptPrefix : ''
+    : undefined;
   const settingsSnapshot = normalizePlainJson({
     providerConfigId: compressionProvider.providerConfigId,
     provider: compressionProvider.provider,
     modelId: compressionProvider.modelId,
+    ...(frozenSystemPromptPrefix !== undefined ? { systemPromptPrefix: frozenSystemPromptPrefix } : {}),
+    // 与普通请求一样把冻结的开关交给 capability：决定轮内系统消息形态、beta 头与网关回退。
+    ...(claudeTurnScopedCompaction(request.authoritySnapshot, recipe) ? { claudeTurnScopedReminders: true } : {}),
     compressionConfigId: requireText(methodConfig.id, 'Compression config id'),
     compressionMethodKind: methodKind,
     compressionTrigger: methodConfig.trigger,
@@ -856,15 +1165,23 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     methodKind,
     methodConfigSnapshot: methodConfig as unknown as NonNullable<LlmCompactRequest['methodConfigSnapshot']>,
     settingsSnapshot,
+    ...(asRecord(provider.summaryReasoning) ? { summaryReasoning: provider.summaryReasoning as unknown as LlmCompactRequest['summaryReasoning'] } : {}),
+    ...(asRecord(asRecord(authority.model)?.generationConfig) ? { nativeGenerationConfig: asRecord(authority.model)!.generationConfig as unknown as LlmCompactRequest['nativeGenerationConfig'] } : {}),
+    ...(asRecord(asRecord(authority.model)?.requestBody) ? { nativeRequestBody: asRecord(authority.model)!.requestBody as unknown as LlmCompactRequest['nativeRequestBody'] } : {}),
+    ...(context.systemInstruction ? { systemInstruction: context.systemInstruction } : {}),
+    ...(tools.length > 0 ? { tools } : {}),
     contents: context.contents,
     ...(methodKind === 'segmented_summary' && context.segments.length > 0
       ? { segments: context.segments }
       : {}),
-    ...(methodKind !== 'openai_responses_compact' && context.priorSummaryContents.length > 0
+    ...(methodKind !== 'provider_native' && context.priorSummaryContents.length > 0
       ? { priorSummaryContents: context.priorSummaryContents }
       : {}),
     ...attachmentObservationContract,
-    ...(optionalText(recipe.sourceHash) ? { sourceHash: optionalText(recipe.sourceHash) } : {})
+    ...(optionalText(recipe.sourceHash) ? { sourceHash: optionalText(recipe.sourceHash) } : {}),
+    ...(methodKind === 'provider_native' && request.claudeThinkingBinding
+      ? { claudeThinkingBinding: request.claudeThinkingBinding }
+      : {})
   };
 }
 
@@ -881,7 +1198,7 @@ function frozenAttachmentObservationContract(
 ): CompactAttachmentObservationContract {
   const rawProfile = recipe.attachmentObservationProfileSha256;
   const rawRequirements = recipe.attachmentObservationRequirements;
-  if (methodKind === 'openai_responses_compact') {
+  if (methodKind === 'provider_native') {
     if (rawProfile !== undefined || rawRequirements !== undefined) {
       throw new TypeError('Provider-native Compact cannot carry text-summary Attachment observations.');
     }
@@ -976,12 +1293,17 @@ function frozenEffectiveCompressionConfig(
   recipe: { [key: string]: PlainJsonValue },
   methodKind: LlmCompactRequest['methodKind']
 ): { [key: string]: PlainJsonValue } {
-  if (methodKind === 'openai_responses_compact') {
+  if (methodKind === 'provider_native') {
     if (recipe.effectiveSummaryMaxTokens !== undefined) {
       throw new TypeError('Provider-native Compact recipe cannot carry a text summary target.');
     }
-    return authorityConfig;
+    return normalizePlainJson(
+      { ...authorityConfig, kind: methodKind },
+      'Effective frozen native compression config'
+    ) as { [key: string]: PlainJsonValue };
   }
+  // Frozen in the local estimator unit the summary writer measures and cuts with; the coordinator
+  // has already converted the Provider-unit reservation by the Conversation's calibration ratio.
   const effective = recipe.effectiveSummaryMaxTokens;
   if (!Number.isSafeInteger(effective) || (effective as number) <= 0 || (effective as number) > 8_000) {
     throw new RangeError('Text compression recipe requires effectiveSummaryMaxTokens in [1, 8000].');
@@ -989,25 +1311,67 @@ function frozenEffectiveCompressionConfig(
   const summary = asRecord(authorityConfig.llmSummary) ?? {};
   return normalizePlainJson({
     ...authorityConfig,
+    kind: methodKind,
     llmSummary: { ...summary, targetTokens: effective as number }
   }, 'Effective frozen compression config') as { [key: string]: PlainJsonValue };
 }
 
-function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
-  const prior = request.priorSummaryContents ?? [];
-  if (request.methodKind === 'segmented_summary' && request.segments?.length) {
-    const candidates = request.segments.map((segment, index) => estimateProjectedModelInput({
-      contextContents: index === 0 ? [...prior, ...segment] : segment,
-      providerFramingTokens: 512
-    }));
-    return candidates.reduce((largest, candidate) =>
-      candidate.fullTokens > largest.fullTokens ? candidate : largest
-    );
+function requireExecutableCompressionMethod(value: unknown): NonNullable<LlmCompactRequest['methodKind']> {
+  if (value === 'provider_native'
+    || value === 'llm_summary'
+    || value === 'segmented_summary'
+    || value === 'deterministic_summary'
+    || value === 'manual_summary') {
+    return value;
   }
-  return estimateProjectedModelInput({
-    contextContents: [...prior, ...request.contents],
-    providerFramingTokens: request.methodKind === 'openai_responses_compact' ? 64 : 512
+  throw new TypeError(`Compression recipe method is not executable: ${String(value)}.`);
+}
+
+/**
+ * Compression admission estimate for one frozen compact request.
+ *
+ * Single-call methods send the whole source at once, so the whole source must fit. Segmented
+ * summary never sends the source at once: the Provider-side splitter packs it into at most 32
+ * rolling leaf calls, splits even one oversized message or tool exchange, and rejects every call
+ * that still cannot fit with its own `compression_request_too_large` / `compression_source_too_large`.
+ * What every leaf and the final merge must carry regardless of the source is the fixed overhead plus
+ * the prior summary, so only that is admitted here; measuring a whole Turn instead rejected long
+ * Turns the splitter handles.
+ */
+export function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
+  const prior = request.priorSummaryContents ?? [];
+  if (request.methodKind === 'segmented_summary') {
+    return estimateProjectedModelInput({
+      ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
+      ...(request.tools?.length ? { tools: request.tools } : {}),
+      contextContents: prior,
+      providerFramingTokens: 512
+    });
+  }
+  // Claude 原生压缩带着的历史提醒已被清除，不计 token（运行状态卡按 user 消息发出，照常计入）；重新注入输入的历史副本照常计入。
+  // 网关拒绝过轮内系统消息时按尾巴模式发送，历史副本都不发送。
+  const deliveries = turnReminderDeliveries(
+    request.contents,
+    estimatedTurnReminderLayout(request.settingsSnapshot?.providerConfigId, request.settingsSnapshot?.modelId)
+  );
+  const contents = request.contents.flatMap((content, index) => {
+    if (!readTurnReminderMarker(content)) return [content];
+    const visible = visibleHistoryTurnReminder(content, deliveries[index]);
+    return visible ? [visible] : [];
   });
+  return estimateProjectedModelInput({
+    ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
+    ...(request.tools?.length ? { tools: request.tools } : {}),
+    contextContents: [...prior, ...contents],
+    providerFramingTokens: request.methodKind === 'provider_native' ? 64 : 512
+  });
+}
+
+/** 带提醒标记的内容会按哪种布局发出：只有网关拒绝过轮内系统消息的渠道与模型退回尾巴模式。 */
+function estimatedTurnReminderLayout(providerConfigId: string | undefined, modelId: string | undefined): TurnReminderLayout {
+  return providerConfigId && modelId && claudeTurnScopedRemindersFallenBackForModel(providerConfigId, modelId)
+    ? 'tail'
+    : 'claude_turn_scoped';
 }
 
 function compressionContext(
@@ -1018,10 +1382,24 @@ function compressionContext(
   contents: MessageContent[];
   segments: MessageContent[][];
   priorSummaryContents: MessageContent[];
+  systemInstruction?: MessageContent;
   attachmentCatalogState: ReturnType<typeof normalizeAttachmentCatalogState>;
   modelHandleCatalog: ModelHandleCatalog;
 } {
   const contents: MessageContent[] = [];
+  const systemParts: string[] = [];
+  const authority = requireRecord(request.authoritySnapshot, 'Compression authority snapshot');
+  const systemPrompt = asRecord(authority.systemPrompt);
+  if (typeof systemPrompt?.text === 'string' && systemPrompt.text.trim()) {
+    systemParts.push(systemPrompt.text.trim());
+  }
+  const runtimeContext = asRecord(authority.runtimeContext);
+  const runtimeContextText = typeof runtimeContext?.text === 'string' && runtimeContext.text.trim()
+    ? runtimeContext.text.trim()
+    : typeof runtimeContext?.template === 'string' && runtimeContext.template.trim()
+      ? runtimeContext.template.trim()
+      : '';
+  if (runtimeContextText) systemParts.push(runtimeContextText);
   const priorSummaryContents: MessageContent[] = [];
   const segments: MessageContent[][] = [];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
@@ -1031,10 +1409,16 @@ function compressionContext(
     current = [];
   };
   const recipe = requireRecord(request.recipe, 'Compression recipe');
-  const sourceContext = request.context.slice(
-    0,
-    typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length
-  );
+  const sourceContext = request.compressionSourceContext
+    && (methodKind !== 'provider_native' || recipe.sourceReplay === 'immutable_provenance')
+    ? request.compressionSourceContext
+    : request.context.slice(0, typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length);
+  // Claude 原生压缩按对话原样发送（见 claudeTurnScopedCompaction）：普通请求放回的历史提醒与重新注入的输入，
+  // 在这里放到同样的位置，按同样的规则投影与标记；发送形态仍由 claudeTurnScopedReminders.ts 决定。
+  const reminderHistory = claudeTurnScopedCompaction(request.authoritySnapshot, recipe)
+    ? turnReminderHistoryBySegment(request)
+    : undefined;
+  const historyInsertions: HistoryInsertion[] = [];
   const attachmentCatalogState = normalizeAttachmentCatalogState(
     request.attachmentCatalogState,
     'Compression request attachmentCatalogState'
@@ -1047,12 +1431,21 @@ function compressionContext(
     sourceContext.map((item) => item.content),
     seededHandleCatalog.entries
   );
+  // The coordinator freezes the complete ordinary identity map. Discovering a new child here
+  // means that history/recipe provenance is missing, not permission to reuse A1 in this prefix.
+  for (const entry of modelHandleCatalog.entries) {
+    if (entry.kind === 'child' && modelHandleRef(seededHandleCatalog, 'child', entry.target) !== entry.ref) {
+      throw Object.assign(new Error(`Compression source child ${entry.target} has no frozen reference.`), {
+        code: 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT'
+      });
+    }
+  }
   const requestedCount = recipe.sourceSegmentCount;
   if (!Number.isSafeInteger(requestedCount) || (requestedCount as number) <= 0
     || (requestedCount as number) > request.context.length) {
     throw new RangeError('Compression recipe sourceSegmentCount is outside its frozen Context projection.');
   }
-  if (methodKind === 'openai_responses_compact' && requestedCount !== request.context.length) {
+  if (methodKind === 'provider_native' && requestedCount !== request.context.length) {
     throw new Error('Provider-native compression requires the complete frozen model-visible window.');
   }
   if (request.context[requestedCount as number]?.segmentKind === 'tool_pair') {
@@ -1063,9 +1456,27 @@ function compressionContext(
     sourceContext.map((item) => item.segmentId),
     (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId)
   );
+  const attachmentPlacements = createAttachmentPlacementQueue((content) => {
+    current.push(content);
+    contents.push(content);
+  });
+  // Summary inputs render calls and results as text, and native compact is Responses-only, so the
+  // Chat reordering of late native results (nativeResultsAfterTheirCalls) does not apply here.
   for (const item of sourceContext) {
+    const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
+    const pairContents = item.segmentKind === 'tool_pair'
+      ? toolPairContents(item.content, modelHandleCatalog)
+      : undefined;
+    const toolResults = pairContents !== undefined && isToolResultContents(pairContents);
+    attachmentPlacements.enter(toolResults);
+    if (item.segmentKind === 'system') {
+      const text = contextText(item.content, item.contentType).trim();
+      if (text) systemParts.push(text);
+      attachmentPlacements.leave(false, attachmentStateContent);
+      continue;
+    }
     let decoded: MessageContent[];
-    if (item.segmentKind === 'tool_pair') decoded = toolPairContents(item.content, modelHandleCatalog);
+    if (pairContents) decoded = pairContents;
     else if (item.segmentKind === 'runtime_context') {
       decoded = [runtimeContextContent(item.content, item.contentType, modelHandleCatalog)];
     }
@@ -1077,15 +1488,16 @@ function compressionContext(
       }
       else {
         const message = decodeMessageContent(item.content, item.contentType);
+        const historical = message?.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
+        if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
         decoded = message ? [message] : [{
           role: item.messageRole === 'model' ? 'model' : 'user',
           parts: [{ text: contextText(item.content, item.contentType) }]
         }];
       }
     }
-    const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
     if (item.segmentKind === 'compression' && contents.length === 0
-      && methodKind !== 'openai_responses_compact') {
+      && methodKind !== 'provider_native') {
       priorSummaryContents.push(...decoded);
       if (attachmentStateContent) priorSummaryContents.push(attachmentStateContent);
       continue;
@@ -1099,28 +1511,33 @@ function compressionContext(
       current.push(content);
       contents.push(content);
     }
-    if (item.segmentKind === 'compression' && methodKind === 'openai_responses_compact') {
+    if (item.segmentKind === 'compression' && methodKind === 'provider_native') {
       canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
     }
-    if (attachmentStateContent) {
-      current.push(attachmentStateContent);
-      contents.push(attachmentStateContent);
-    }
+    attachmentPlacements.leave(toolResults, attachmentStateContent);
   }
+  attachmentPlacements.release();
   flush();
-  if (methodKind === 'openai_responses_compact') {
+  const systemText = systemParts.filter(Boolean).join('\n\n').trim();
+  const systemInstruction = systemText
+    ? { role: 'user' as const, parts: [{ text: systemText }] }
+    : undefined;
+  if (methodKind === 'provider_native') {
     // 独立 /responses/compact 拒绝 configuration_update 输入项：只剥传输级 reasoning 选择，
     // 语义上下文保持完整；有效 effort 由 Compression 的 rebase 计划在下一个请求重锚。
+    const projection = projectOrdinaryContentsWithDetachedInputs(
+      contents,
+      canonicalCompressionRanges,
+      modelHandleCatalog,
+      historyInsertions
+    );
     return {
       contents: stripNativeConfigurationUpdates(
-        projectOrdinaryContentsPreservingRanges(
-          contents,
-          canonicalCompressionRanges,
-          modelHandleCatalog
-        )
+        withTurnReminderMarkers(projection.contents, contents.length, projection.insertions, undefined)
       ).contents,
       segments: [],
       priorSummaryContents: [],
+      ...(systemInstruction ? { systemInstruction } : {}),
       attachmentCatalogState,
       modelHandleCatalog
     };
@@ -1132,6 +1549,7 @@ function compressionContext(
     segments: segments.map((segment) =>
       projectSummaryModelWindow(segment, modelHandleCatalog, segmentsMediaState).contents),
     priorSummaryContents,
+    ...(systemInstruction ? { systemInstruction } : {}),
     attachmentCatalogState,
     modelHandleCatalog
   };
@@ -1148,9 +1566,10 @@ function runtimeContextContent(
 ): MessageContent {
   const envelope = decodeRuntimeDeliveryModelEnvelope(content, contentType);
   return {
-    // The shared Provider contract currently has only user/model roles. The explicit envelope is
-    // therefore the authority boundary: runtime data never masquerades as naked user prose, and
-    // its body cannot elevate a fake "System" heading into an instruction.
+    // Every Runtime Delivery, peer messages included, is user-role runtime data: providers reject a
+    // request that starts or ends with an assistant message, and an assistant slot would make the
+    // model read a peer's words as its own. Authority comes from the kernel envelope, not the slot:
+    // its fixed header names the sender kind and says it is not this conversation's user.
     role: 'user',
     parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope, undefined, modelHandleCatalog) }]
   };
@@ -1159,12 +1578,33 @@ function runtimeContextContent(
 function projectOrdinaryContentsPreservingRanges(
   contents: readonly MessageContent[],
   canonicalRanges: readonly { start: number; end: number }[],
-  modelHandleCatalog: ModelHandleCatalog
+  modelHandleCatalog: ModelHandleCatalog,
+  observer?: {
+    /** Positions (never inside a canonical range) at which the running media state is observed. */
+    cuts: readonly number[];
+    atCut(index: number, mediaState: ManagedMediaBodyProjectionState): void;
+  }
 ): MessageContent[] {
-  if (canonicalRanges.length === 0) {
+  if (canonicalRanges.length === 0 && !observer) {
     return projectOrdinaryModelWindow(contents, modelHandleCatalog).contents;
   }
   const mediaState = createManagedMediaBodyProjectionState();
+  const cuts = [...new Set(observer?.cuts ?? [])].sort((left, right) => left - right);
+  let nextCut = 0;
+  /** Ordinary slices are projected piecewise at observed cuts; the cuts sit before a model content. */
+  const projectOrdinarySlice = (start: number, end: number): MessageContent[] => {
+    const sliceProjection: MessageContent[] = [];
+    let sliceStart = start;
+    while (nextCut < cuts.length && cuts[nextCut] <= end) {
+      const cut = cuts[nextCut++];
+      if (cut < start) throw new RangeError('Detached projection cut falls inside a canonical compression range.');
+      sliceProjection.push(...projectOrdinaryModelWindow(contents.slice(sliceStart, cut), modelHandleCatalog, mediaState).contents);
+      observer!.atCut(cut, mediaState);
+      sliceStart = cut;
+    }
+    sliceProjection.push(...projectOrdinaryModelWindow(contents.slice(sliceStart, end), modelHandleCatalog, mediaState).contents);
+    return sliceProjection;
+  };
   const projected: MessageContent[] = [];
   let cursor = 0;
   for (const range of canonicalRanges) {
@@ -1172,11 +1612,7 @@ function projectOrdinaryContentsPreservingRanges(
       || range.start < cursor || range.end < range.start || range.end > contents.length) {
       throw new RangeError('Canonical compression ranges are invalid or overlapping.');
     }
-    projected.push(...projectOrdinaryModelWindow(
-      contents.slice(cursor, range.start),
-      modelHandleCatalog,
-      mediaState
-    ).contents);
+    projected.push(...projectOrdinarySlice(cursor, range.start));
     // Provider-native Compact output is the canonical next window. Only repeat-media suppression is
     // applied here; tool results and provider-native items are not projected a second time.
     projected.push(...suppressRepeatedManagedMediaBodies(
@@ -1186,11 +1622,8 @@ function projectOrdinaryContentsPreservingRanges(
     ));
     cursor = range.end;
   }
-  projected.push(...projectOrdinaryModelWindow(
-    contents.slice(cursor),
-    modelHandleCatalog,
-    mediaState
-  ).contents);
+  projected.push(...projectOrdinarySlice(cursor, contents.length));
+  if (nextCut !== cuts.length) throw new RangeError('Detached projection cut is outside the projected contents.');
   return projected;
 }
 
@@ -1223,10 +1656,15 @@ const LLM_THINKING_LEVELS: Record<string, true> = {
   max: true
 };
 
-/** Astra 不接受 none/minimal；与 llmProvider 的 Astra→low 适配一致，在冻结解析层归一。 */
-function normalizeNativeEffort(value: unknown): string | undefined {
+/**
+ * 冻结解析层按模型归一原生 effort，与 llmProvider 的参数适配一致：Astra 不接受 none/minimal，
+ * 两者都转成 low；GPT-6 Sol / Luna 支持 none，只把 minimal 转成 low（Using GPT-6 “Update API and
+ * model parameters”）。
+ */
+function normalizeNativeEffort(value: unknown, modelId: string): string | undefined {
   const effort = optionalText(value);
   if (!effort) return undefined;
+  if (isGpt6NoneCapableModel(modelId)) return effort === 'minimal' ? 'low' : effort;
   return effort === 'none' || effort === 'minimal' ? 'low' : effort;
 }
 
@@ -1234,21 +1672,24 @@ function asLlmThinkingLevel(value: string | undefined): LlmThinkingLevel | undef
   return value !== undefined && LLM_THINKING_LEVELS[value] ? (value as LlmThinkingLevel) : undefined;
 }
 
-function frozenNativeReasoning(recipe: { [key: string]: PlainJsonValue }): FrozenNativeReasoning | undefined {
+function frozenNativeReasoning(
+  recipe: { [key: string]: PlainJsonValue },
+  modelId: string
+): FrozenNativeReasoning | undefined {
   const value = asRecord(recipe.nativeReasoning);
   if (!value) return undefined;
   const updates = Array.isArray(value.updates)
     ? value.updates.map((entry, index) => {
         const record = requireRecord(entry, `Provider recipe.nativeReasoning.updates[${index}]`);
-        const effort = normalizeNativeEffort(record.effort);
+        const effort = normalizeNativeEffort(record.effort, modelId);
         return effort ? { effort } : {};
       })
     : [];
   const pending = asRecord(value.pendingConfigurationUpdate);
-  const pendingEffort = pending ? normalizeNativeEffort(pending.effort) : undefined;
-  const baseEffort = asLlmThinkingLevel(normalizeNativeEffort(value.baseEffort));
+  const pendingEffort = pending ? normalizeNativeEffort(pending.effort, modelId) : undefined;
+  const baseEffort = asLlmThinkingLevel(normalizeNativeEffort(value.baseEffort, modelId));
   const baseModeRaw = optionalText(value.baseMode);
-  const effectiveEffort = normalizeNativeEffort(value.effectiveEffort);
+  const effectiveEffort = normalizeNativeEffort(value.effectiveEffort, modelId);
   const forceFullReason = optionalText(value.forceFullReason);
   return {
     ...(baseEffort ? { baseEffort } : {}),
@@ -1376,6 +1817,67 @@ function decodeFrozenCurrentTurnInput(content: string, contentType: string): Mes
   return { role: 'user', parts: [{ text: content }] };
 }
 
+/**
+ * Providers whose wire pairs each tool call with a result that directly follows it: Chat Completions
+ * (a `tool` message right after the assistant `tool_calls`), Claude Messages (the `tool_result` in the
+ * very next user message after its `tool_use`) and Gemini (a model turn's function calls answered by
+ * the next user turn). Only Responses accepts a `function_call_output` anywhere after its call.
+ */
+const PROVIDERS_KEEPING_CHRONOLOGICAL_NATIVE_RESULTS: ReadonlySet<LlmProviderKind> = new Set<LlmProviderKind>(['openai-responses']);
+
+/**
+ * A native (Responses) call is stored as its own call occurrence, and its result as a separate
+ * occurrence appended when the result was delivered, possibly after other items (an async call).
+ * Chat Completions, Claude and Gemini reject a call whose result does not directly follow it (the
+ * outgoing pairing repairs only look at the adjacent user messages and cannot reach a result sent
+ * after an assistant reply), so for every provider except Responses each result that came later is
+ * moved to right after its own call occurrence. Responses keeps the chronological native placement.
+ * Only this outgoing order changes; the stored Context does not, and a window without a late native
+ * result is returned as it is.
+ */
+function nativeResultsAfterTheirCalls<T extends Pick<FullProviderContextItem, 'segmentKind' | 'content'>>(
+  items: readonly T[],
+  provider: LlmProviderKind
+): readonly T[] {
+  if (PROVIDERS_KEEPING_CHRONOLOGICAL_NATIVE_RESULTS.has(provider)) return items;
+  const nativeOccurrences = items.map((item) => nativeToolOccurrence(item));
+  const resultIndexByCall = new Map<string, number>();
+  nativeOccurrences.forEach((occurrence, index) => {
+    if (occurrence?.kind === 'result') resultIndexByCall.set(occurrence.toolCallId, index);
+  });
+  if (resultIndexByCall.size === 0) return items;
+  const moved = new Set<number>();
+  const ordered: T[] = [];
+  items.forEach((item, index) => {
+    if (moved.has(index)) return;
+    ordered.push(item);
+    const occurrence = nativeOccurrences[index];
+    const resultIndex = occurrence?.kind === 'call' ? resultIndexByCall.get(occurrence.toolCallId) : undefined;
+    if (resultIndex !== undefined && resultIndex > index + 1) {
+      ordered.push(items[resultIndex]);
+      moved.add(resultIndex);
+    }
+  });
+  return moved.size > 0 ? ordered : items;
+}
+
+/** The native call or result occurrence a tool_pair item holds, by its kernel ToolCall id. */
+function nativeToolOccurrence(
+  item: Pick<FullProviderContextItem, 'segmentKind' | 'content'>
+): { kind: 'call' | 'result'; toolCallId: string } | undefined {
+  if (item.segmentKind !== 'tool_pair') return undefined;
+  let pair: Record<string, unknown> | undefined;
+  try {
+    pair = asRecord(JSON.parse(item.content));
+  } catch {
+    return undefined;
+  }
+  if (pair?.native !== true) return undefined;
+  const toolCallId = optionalText(asRecord(pair.toolCall)?.id);
+  if (!toolCallId) return undefined;
+  return { kind: pair.toolModelResult === undefined ? 'call' : 'result', toolCallId };
+}
+
 function toolPairContents(
   content: string,
   modelHandleCatalog: ModelHandleCatalog = { entries: [] }
@@ -1466,6 +1968,7 @@ function authorityToolPolicy(authority: { [key: string]: PlainJsonValue }): {
   allowedTools: Set<string>;
   preset: string;
   sourceConfigs: { [key: string]: PlainJsonValue };
+  toolConfigs: { [key: string]: PlainJsonValue };
 } {
   const policy = requireRecord(authority.toolPolicy, 'Provider authority toolPolicy');
   if (!Array.isArray(policy.allowedTools)) throw new TypeError('Provider authority toolPolicy.allowedTools must be an array.');
@@ -1474,7 +1977,10 @@ function authorityToolPolicy(authority: { [key: string]: PlainJsonValue }): {
     preset: typeof policy.preset === 'string' ? policy.preset : 'custom',
     sourceConfigs: policy.sourceConfigs === undefined
       ? {}
-      : requireRecord(policy.sourceConfigs, 'Provider authority toolPolicy.sourceConfigs')
+      : requireRecord(policy.sourceConfigs, 'Provider authority toolPolicy.sourceConfigs'),
+    toolConfigs: policy.toolConfigs === undefined
+      ? {}
+      : requireRecord(policy.toolConfigs, 'Provider authority toolPolicy.toolConfigs')
   };
 }
 
@@ -1531,6 +2037,7 @@ function modelFacingToolsForHandleCatalog(
       renameSchemaProperty(parameters, 'processId', 'processRef');
       renameSchemaProperty(parameters, 'outputHandle', 'cursor');
     } else if (tool.name === 'run_agent' || tool.name === 'read_agent_answer' || tool.name === 'submit_agent_answer') {
+      renameSchemaProperty(parameters, 'answerBridgeIds', 'childRefs');
       renameSchemaProperty(parameters, 'answerBridgeId', 'childRef');
       if (tool.name === 'run_agent') {
         const properties = asRecord(parameters.properties);
@@ -1577,6 +2084,7 @@ function modelFacingHandleText(value: string, catalog: ModelHandleCatalog): stri
     ['attachmentId', 'attachmentRef'],
     ['processId', 'processRef'],
     ['outputHandle', 'cursor'],
+    ['answerBridgeIds', 'childRefs'],
     ['answerBridgeId', 'childRef'],
     ['workEnvironmentId', 'workEnvironmentRef']
   ] as const) text = text.split(from).join(to);
@@ -1593,17 +2101,7 @@ function providerToolAllowed(
   policy: ReturnType<typeof authorityToolPolicy>,
   tool: NormalizedProviderToolDefinition
 ): boolean {
-  const explicitlyAllowed = policy.allowedTools.has(tool.schema.name);
-  if (tool.source?.kind !== 'mcp' || typeof tool.source.sourceId !== 'string' || !tool.source.sourceId.trim()) {
-    return explicitlyAllowed;
-  }
-  const config = policy.sourceConfigs[tool.source.sourceId];
-  if (!config || typeof config !== 'object' || Array.isArray(config)) return explicitlyAllowed;
-  if (config.enabled !== true) return false;
-  const disabled = Array.isArray(config.disabledTools)
-    ? config.disabledTools.filter((name): name is string => typeof name === 'string')
-    : [];
-  return !disabled.includes(tool.schema.name);
+  return toolAllowedByPolicy(policy, { name: tool.schema.name, ...(tool.source ? { source: tool.source } : {}) });
 }
 
 function shouldFreezeFailedPartialOutput(request: FullProviderRequest, error: unknown): boolean {
@@ -1642,7 +2140,7 @@ function appendTextPart(
     : last?.outputItem === undefined;
   if (last && 'text' in last && (last.thought === true) === thought
     && sameOutputItem
-    && (!thought || last.thoughtDurationMs === undefined)) {
+    && (thought ? last.thoughtDurationMs === undefined : last.thoughtSignature === undefined)) {
     last.text += delta;
     if (thought && thoughtSignature) last.thoughtSignature = thoughtSignature;
     if (outputItem) last.outputItem = outputItem;
@@ -1653,6 +2151,21 @@ function appendTextPart(
     ...(thought ? { thought: true, ...(thoughtSignature ? { thoughtSignature } : {}) } : {}),
     ...(outputItem ? { outputItem } : {})
   });
+}
+
+/**
+ * A visible text part received with a signature (Gemini's last part of a reply without function
+ * calls, often an empty text part while streaming) is stored as that part, in place: it is not merged
+ * with the text before it, and later text starts a new part, so the signature goes back "in the exact
+ * part where it was received" (https://ai.google.dev/gemini-api/docs/thought-signatures).
+ */
+function appendSignedTextPart(
+  parts: MessageContent['parts'],
+  text: string,
+  thoughtSignature: string,
+  outputItem?: ModelOutputItemReference
+): void {
+  parts.push({ text, thoughtSignature, ...(outputItem ? { outputItem } : {}) });
 }
 
 function completeLastThoughtPart(
@@ -1740,12 +2253,50 @@ function plainModelOutputItem(outputItem: ModelOutputItemReference): PlainJsonVa
 
 function messageContentFromDonePayload(value: unknown): MessageContent | undefined {
   if (value === undefined) return undefined;
-  const normalized = normalizePlainJson(value, 'LLM completed MessageContent');
+  // Provider items copied from the SDK (providerContext parts) may carry absent optional fields as
+  // `undefined`; they are omitted, while arrays and every other value keep the strict JSON boundary.
+  const normalized = normalizeProviderPlainJson(value, 'LLM completed MessageContent');
   const record = requireRecord(normalized, 'LLM completed MessageContent');
   if (record.role !== 'model' || !Array.isArray(record.parts)) {
     throw new TypeError('LLM completed MessageContent must contain model parts.');
   }
   return normalized as unknown as MessageContent;
+}
+
+/**
+ * An opaque provider item delivered with an output item: the capability emits it as
+ * `OutputItemDone { part: { providerContext } }`. The one produced today is the Responses
+ * `compaction` item of an ordinary reply made with `context_management`, which later requests must
+ * send back as it came (https://developers.openai.com/api/docs/guides/compaction: "append output
+ * items as usual"); it joins the completed reply in stream order and is stored and replayed with it.
+ */
+function providerContextPartFromPayload(
+  value: unknown,
+  outputItem: ModelOutputItemReference | undefined
+): ProviderContextPart | undefined {
+  if (value === undefined) return undefined;
+  const part = asRecord(normalizeProviderPlainJson(value, 'LLM output item part'));
+  const context = asRecord(part?.providerContext);
+  if (!context || !optionalText(context.provider) || !optionalText(context.format)) {
+    throw new TypeError('LLM output item part must be a providerContext part with provider and format.');
+  }
+  const partOutputItem = outputItem ?? modelOutputItemFromPayload(part);
+  return {
+    providerContext: context as unknown as ProviderContextPart['providerContext'],
+    ...(partOutputItem ? { outputItem: partOutputItem } : {})
+  };
+}
+
+/**
+ * Appends a provider item once: a stream may report the same item again at its end (the Responses
+ * stream decoder reads compaction items both from `response.output_item.done` and from the final
+ * `response.completed` output), and sending it twice would replay the same state twice.
+ */
+function appendProviderContextPart(parts: MessageContent['parts'], part: ProviderContextPart): void {
+  const identity = canonicalPlainJson(part.providerContext as unknown as PlainJsonValue, 'LLM provider context item');
+  if (parts.some((existing) => 'providerContext' in existing
+    && canonicalPlainJson(existing.providerContext as unknown as PlainJsonValue, 'LLM provider context item') === identity)) return;
+  parts.push(part);
 }
 
 function compactReadToolCallsInContent(content: MessageContent): MessageContent {
@@ -2075,6 +2626,7 @@ function capabilityThrownProviderError(error: unknown): Error {
     const structured = error as Error & {
       code?: unknown;
       status?: unknown;
+      endpointKind?: unknown;
       retryable?: unknown;
       transportAttemptsExhausted?: unknown;
       receivedServerEvent?: unknown;
@@ -2085,6 +2637,7 @@ function capabilityThrownProviderError(error: unknown): Error {
     };
     if (structured.code !== undefined) raw.code ??= structured.code;
     if (structured.status !== undefined) raw.status ??= structured.status;
+    if (structured.endpointKind !== undefined) raw.endpointKind ??= structured.endpointKind;
     if (structured.retryable !== undefined) raw.retryable ??= structured.retryable;
     if (structured.transportAttemptsExhausted !== undefined) {
       raw.transportAttemptsExhausted ??= structured.transportAttemptsExhausted;
@@ -2106,10 +2659,12 @@ function capabilityThrownProviderError(error: unknown): Error {
 function classifyProviderFailure(message: string, raw: Record<string, unknown> | undefined): Error {
   const signature = collectErrorSignature(raw, message).toLowerCase();
   const structuredStatus = findNumericStatus(raw);
-  const embeddedStatus = /\b(?:streaming error|unexpected server response):\s*([45]\d{2})\b/.exec(signature);
-  const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299)) && embeddedStatus
-    ? Number(embeddedStatus[1])
+  const embeddedStatus = embeddedHttpStatus(signature) ?? findPayloadStatusCode(raw);
+  const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299))
+    && embeddedStatus !== undefined
+    ? embeddedStatus
     : structuredStatus;
+  const endpointKind = findStringMetadata(raw, 'endpointKind');
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
@@ -2128,6 +2683,27 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
     return new ProviderTransientError('connection_interrupted', message, true);
   }
   if (preTerminalWebSocketClose?.retryable === false) return new Error(message);
+  const nativeCompactionEndpoint = endpointKind === 'provider_native'
+    || endpointKind === 'openai_responses_compact'
+    || endpointKind === 'anthropic_messages_compact'
+    || signature.includes('llm compact api');
+  if (nativeCompactionEndpoint && (status === 404 || status === 405 || status === 501)) {
+    return new ProviderCapabilityError(
+      'native_compaction_unsupported',
+      message,
+      status,
+      endpointKind ?? 'provider_native_compaction'
+    );
+  }
+  if ((status === 400 || status === 422)
+    && /unsupported|not supported|unknown parameter|invalid.*(?:reasoning|thinking|compaction)|thinking.*(?:disabled|adaptive|enabled)/.test(signature)) {
+    return new ProviderCapabilityError(
+      /reasoning|thinking/.test(signature) ? 'unsupported_reasoning_mode' : 'unsupported_parameter',
+      message,
+      status,
+      endpointKind
+    );
+  }
   if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
     return new Error(message);
   }
@@ -2147,6 +2723,9 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
       && /\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bservice_busy\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b|模型服务暂时不可用|服务繁忙/.test(signature));
   if (receivedSemanticOutput === true && !temporaryServiceFailure) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
+  }
+  if (status !== undefined && status >= 400 && status <= 499 && status !== 408 && status !== 425 && status !== 429) {
+    return Object.assign(new Error(message), { status, ...(endpointKind ? { endpointKind } : {}) });
   }
   if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
   if (status === 429) {
@@ -2194,11 +2773,74 @@ function compactProviderError(payload: Record<string, unknown> | undefined): Err
   return capabilityProviderError(payload);
 }
 
-function capabilityRetryError(payload: Record<string, unknown> | undefined): ProviderTransientError {
-  const mapped = capabilityProviderError(payload);
-  return mapped instanceof ProviderTransientError
-    ? mapped
-    : new ProviderTransientError('temporary_service_error', mapped.message);
+function capabilityRetryError(payload: Record<string, unknown> | undefined): Error {
+  // A dependency scheduling a retry is not authority to relabel a permanent 4xx as transient.
+  return capabilityProviderError(payload);
+}
+
+/**
+ * Relays report upstream failures inside an HTTP 200 SSE payload, for example
+ * `{"error":{"message":"ConnectError","type":"upstream_stream_error"},"status_code":502}`. The error
+ * signature keeps values but not keys, so read the payload's own status code field structurally.
+ */
+function findPayloadStatusCode(value: unknown, depth = 0): number | undefined {
+  if (depth > 5 || value === null || value === undefined || typeof value !== 'object') return undefined;
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 32)) {
+      const nested = findPayloadStatusCode(entry, depth + 1);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ['status_code', 'statusCode', 'http_status']) {
+    const candidate = record[key];
+    if (typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 400 && candidate <= 599) return candidate;
+  }
+  for (const nested of Object.values(record)) {
+    const found = findPayloadStatusCode(nested, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function embeddedHttpStatus(signature: string): number | undefined {
+  const patterns = [
+    /\b(?:streaming error|unexpected server response|http(?: status)?|api error|api 错误)\s*(?:\(|:)?\s*([45]\d{2})\)?\b/,
+    /\bcompact api 错误\s*\(([45]\d{2})\)/,
+    /\bstatus(?: code)?\s*(?:=|:)?\s*([45]\d{2})\b/
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(signature);
+    if (match) return Number(match[1]);
+  }
+  return undefined;
+}
+
+function findStringMetadata(
+  value: unknown,
+  key: string,
+  depth = 0,
+  seen = new Set<object>()
+): string | undefined {
+  if (depth > 6 || value === null || value === undefined || typeof value !== 'object' || seen.has(value)) {
+    return undefined;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 32)) {
+      const nested = findStringMetadata(entry, key, depth + 1, seen);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record[key] === 'string' && record[key].trim()) return record[key].trim();
+  for (const nested of Object.values(record).slice(0, 32)) {
+    const result = findStringMetadata(nested, key, depth + 1, seen);
+    if (result !== undefined) return result;
+  }
+  return undefined;
 }
 
 function findBooleanMetadata(value: unknown, key: string, depth = 0, seen = new Set<object>()): boolean | undefined {
@@ -2296,10 +2938,10 @@ function requireSha256(value: unknown, label: string): string {
 }
 
 function requireProviderKind(value: PlainJsonValue | undefined): LlmProviderKind {
-  if (!['openai-compatible', 'openai-responses', 'claude', 'gemini', 'deepseek'].includes(String(value))) {
-    throw new TypeError(`Provider authority model.provider is invalid: ${String(value)}.`);
-  }
-  return value as LlmProviderKind;
+  // 历史回合冻结的 'deepseek' 按 OpenAI 兼容渠道发送，方言由接口地址和模型识别。
+  const provider = canonicalLlmProviderKind(value);
+  if (!provider) throw new TypeError(`Provider authority model.provider is invalid: ${String(value)}.`);
+  return provider;
 }
 
 function abortError(signal?: AbortSignal): Error {

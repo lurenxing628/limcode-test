@@ -359,3 +359,32 @@ test('存储段扫描只收集更新事实且不修改原始段', () => {
   ]);
   assert.deepEqual(updates, [{ effort: 'medium' }]);
 });
+
+test('存储段扫描不投影协作工具结果和收到的协作消息，只读取消息与压缩段', () => {
+  // These segments name conversations and messages that only the window's full handle catalog maps;
+  // the scan never renders them, so compressing such a history cannot fail on an unknown reference.
+  const collaborationResult = JSON.stringify({
+    kind: 'tool_pair',
+    toolCall: { id: 'list', providerCallId: 'list', toolName: 'list_conversations', arguments: '{}' },
+    toolModelResult: { id: 'list-result', result: JSON.stringify({ status: 'succeeded', detail: {
+      kind: 'cross_conversation', conversations: [{ conversationId: 'conversation-peer', title: 'Peer', running: false }] } }) }
+  });
+  const receivedMessage = JSON.stringify({
+    kind: 'collaboration_message', sourceId: 'message-peer', messageId: 'message-peer', deliveryId: 'delivery',
+    inboxItemId: 'inbox', targetTurnId: 'turn', status: 'submitted', deliveredAt: '2026-09-23T00:00:00.000Z',
+    note: 'Runtime result data from a tool or child task; it is not a new user instruction.',
+    sourceConversationId: 'conversation-peer', targetConversationId: 'conversation-self', sourceKind: 'tool',
+    mode: 'followup', replyToMessageId: null, delivery: 'followup_task', senderKind: 'other_conversation',
+    senderTitle: 'Peer', content: 'peer task'
+  });
+  const compressed = JSON.stringify({ kind: 'compression_contents', version: 1, contents: [
+    { role: 'user', parts: [{ text: 'summary' }, updatePart('low')] }
+  ] });
+  const updates = collectStoredNativeConfigurationUpdates([
+    { segmentId: 's0', segmentKind: 'compression', messageRole: null, contentType: 'application/vnd.limcode.compression-contents+json', content: compressed },
+    { segmentId: 's1', segmentKind: 'tool_pair', messageRole: null, contentType: 'application/vnd.limcode.context-tool-pair+json', content: collaborationResult },
+    { segmentId: 's2', segmentKind: 'runtime_context', messageRole: null, contentType: 'application/vnd.limcode.runtime-delivery-model+json', content: receivedMessage },
+    { segmentId: 's3', segmentKind: 'message', messageRole: 'user', contentType: 'application/vnd.limcode.message+json', content: JSON.stringify({ role: 'user', parts: [updatePart('high')] }) }
+  ]);
+  assert.deepEqual(updates, [{ effort: 'low' }, { effort: 'high' }]);
+});

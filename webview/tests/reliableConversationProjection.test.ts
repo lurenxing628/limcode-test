@@ -1047,6 +1047,8 @@ test('an active transient uses its frozen model and a Turn anchor instead of the
   ]);
   assert.equal(projection.messages[1]?.model, 'gpt-5.6-sol');
   assert.equal(projection.messages[1]?.seq, 10.5);
+  assert.equal(projection.turnIdByMessageId['transient:request-active'], 'turn-a',
+    'a streaming reply belongs to its Turn, so what is placed at that Turn keeps its place');
 });
 
 test('the latest failed terminal partial retains exact model_request retry identity', () => {
@@ -1130,4 +1132,62 @@ test('a durable failed partial retries its ModelRequest instead of the Context-e
   const partial = projection.messages.find((message) => message.id === 'message-failed');
   assert.equal(partial?.status, 'partial');
   assert.deepEqual(partial?.retryTarget, { kind: 'model_request', modelRequestId: 'request-failed' });
+});
+
+test('a forked transcript keeps copied Turn terminations and never shows fork interruption rows', () => {
+  const at = (second: number) => `2026-09-20T00:00:${String(second).padStart(2, '0')}.000Z`;
+  const message = (id: string, seq: number, role: 'user' | 'model') => ({
+    id, conversation_id: 'fork', message_seq: String(seq), revision_id: `revision-${id}`, role, created_at: at(seq)
+  });
+  const request = (id: string, turnId: string, seq: number, terminalState: string, extraStats = {}) => ({
+    id, turn_id: turnId, request_seq: String(seq), provider_id: 'provider', model_id: 'model',
+    status: 'terminal', terminal_state: terminalState, created_at: at(seq),
+    stream_stats_json: { attemptSeq: '1', socketGeneration: '1', retryReason: null, ...extraStats }
+  });
+  const projection = projectReliableConversation({
+    conversationId: 'fork',
+    records: {
+      Turn: {
+        compressed: { id: 'compressed', conversation_id: 'fork', status: 'terminated', created_at: at(1), updated_at: at(4) },
+        failed: { id: 'failed', conversation_id: 'fork', status: 'terminated', created_at: at(5), updated_at: at(6) }
+      },
+      Message: {
+        'user-1': message('user-1', 1, 'user'),
+        'model-1': message('model-1', 2, 'model'),
+        'user-2': message('user-2', 3, 'user')
+      },
+      MessageTurnLink: {
+        'user-1': { id: 'link-user-1', message_id: 'user-1', turn_id: 'compressed', role: 'input' },
+        'model-1': { id: 'link-model-1', message_id: 'model-1', turn_id: 'compressed', role: 'model' },
+        'user-2': { id: 'link-user-2', message_id: 'user-2', turn_id: 'failed', role: 'input' }
+      },
+      ModelRequest: {
+        compression: request('compression', 'compressed', 1, 'completed', {
+          compressionPurpose: { kind: 'compression', trigger: 'auto' }
+        }),
+        answer: request('answer', 'compressed', 2, 'completed'),
+        rejected: request('rejected', 'failed', 1, 'provider_failed')
+      },
+      ModelRequestMessageLink: {
+        answer: { id: 'answer-link', model_request_id: 'answer', message_id: 'model-1' }
+      },
+      TurnTermination: {
+        compressed: { id: 'termination-compressed', turn_id: 'compressed', terminal_status: 'completed', reason: 'completed', created_at: at(4) },
+        failed: {
+          id: 'termination-failed', turn_id: 'failed', terminal_status: 'failed',
+          reason: 'offline provider rejected request 2', created_at: at(6)
+        }
+      }
+    },
+    details: {
+      'message-content:revision-user-1': ready(JSON.stringify({ role: 'user', parts: [{ text: 'history' }] })),
+      'message-content:revision-model-1': ready(JSON.stringify({ role: 'model', parts: [{ text: 'answer after compression' }] })),
+      'message-content:revision-user-2': ready(JSON.stringify({ role: 'user', parts: [{ text: 'rejected' }] }))
+    }
+  });
+
+  assert.deepEqual(Object.keys(projection.terminationByMessageId), ['user-2']);
+  assert.equal(projection.terminationByMessageId['user-2']?.kind, 'failed');
+  assert.ok(Object.values(projection.terminationByMessageId).every((termination) => termination.kind !== 'interrupted'));
+  assert.equal(projection.messages.find((entry) => entry.id === 'model-1')?.status === 'partial', false);
 });

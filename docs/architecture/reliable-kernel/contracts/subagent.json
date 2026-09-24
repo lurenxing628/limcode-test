@@ -1,16 +1,122 @@
 {
   "contractKind": "subagent",
-  "contractRevision": "2026-07-31-r4",
+  "contractRevision": "2026-09-22-r5",
   "status": "active",
   "scope": "保留日常多Agent协作能力，用稳定子执行谱系、答案桥和运行时收件箱表达控制与交付。",
   "toolName": "run_agent",
   "operations": [
     "spawn",
     "send",
-    "wait",
     "list",
+    "read",
+    "wait",
     "interrupt_subtree"
   ],
+  "modelContract": {
+    "required": [
+      "operation"
+    ],
+    "implicitSpawnAllowed": false,
+    "legacyModeAllowed": false,
+    "spawnRequired": [
+      "taskName",
+      "prompt"
+    ],
+    "sendRequired": [
+      "childRef",
+      "prompt"
+    ],
+    "singleTargetRequired": [
+      "read",
+      "interrupt_subtree"
+    ],
+    "waitTarget": "childRef 或 childRefs 二选一；childRefs 必须有 1 至 32 个已知引用",
+    "waitTimeoutMs": {
+      "minimum": 0,
+      "maximum": 60000
+    },
+    "depthLimit": "深度上限只禁止 spawn；保留 send/list/read/wait/interrupt_subtree，执行器独立重验 spawn 的冻结深度策略。",
+    "controlScope": "send 与 interrupt_subtree 只允许当前 Conversation 的直接子任务；list/read/wait 可显式读取真实后代树。",
+    "missingReference": "需要既有目标的操作缺少引用、引用未知或超出当前会话父链权限时直接拒绝，不转入 spawn。",
+    "deduplication": "同一 source ToolCall 重放使用既有稳定身份；不同 ToolCall 不因任务文字相同而自动合并。"
+  },
+  "assignmentProjection": {
+    "authority": "只投影独立 Runtime domains、Links 与不可变 CAS 正文，不创建团队 JSON、汇总任务表或第二份任务 authority。",
+    "runtimeSchemaChangeRequired": false,
+    "scope": "默认 direct 列当前 Conversation 各 Turn 的直接子任务；显式 tree 才沿 ParentLink 展开后代，不把 Fork 来源关系当成 ChildExecution 父关系。",
+    "sourceDomains": [
+      "ChildExecution",
+      "ChildExecutionParentLink",
+      "ChildExecutionTurnLink",
+      "ChildExecutionIntentLink",
+      "ChildExecutionActiveTurnLink",
+      "Turn",
+      "TurnTermination",
+      "MessageRevision",
+      "MessageTurnLink",
+      "TurnIntent",
+      "TurnIntentRevision",
+      "ContentObject",
+      "PendingTurnInput",
+      "AnswerBridge",
+      "AnswerSubmission",
+      "RuntimeInboxItem",
+      "RuntimeDelivery",
+      "RuntimeDeliveryInputLink",
+      "RuntimeDeliveryWake",
+      "ToolModelResult",
+      "ToolResultArtifact",
+      "ContextSegmentSource"
+    ],
+    "taskSources": "分别解码首轮 MessageRevision、模型 continuation 正文、UI input envelope、Plan delegation、retry/runtime continuation/maintenance 来源及 native steering 收据；不能把标题或任意 CAS JSON 当成完整当前任务。",
+    "taskStates": [
+      "initial",
+      "current",
+      "queued"
+    ],
+    "answers": "按精确 submission 与 delivery/input 区分答案存在、已注入及已处理，不只查询 AnswerBridge.current_submission_id。",
+    "snapshot": "worker 在单个 SQLite 读事务内取得完整作用域事实及不可变正文 identity；事务外按 identity 读 CAS，禁止把多个时刻的查询结果拼成一个快照。",
+    "snapshotRevision": "投影来源事实内容指纹；snapshotCommitSeq 仅诊断，不能声明为跨 Host 全局提交序号。",
+    "freeze": "每个新 ModelRequest 将快照冻结到 recipe 与模型尾部；同 request retry 复用冻结快照，后续请求及压缩后请求重新投影。",
+    "cardLimit": 32,
+    "counts": "计数覆盖完整查询作用域；状态卡和列表详情的截断必须显式报告，不能用当前页长度代替成员总数。",
+    "handles": "普通与压缩请求共用持久 recipe 映射恢复；旧 childRef 永不重分配。历史引用仅供辨认，操作权由当前父链验证，Fork 不继承源会话成员权限；Fork 状态卡以 {inheritedChildRefs, operable:false} 列出这些继承引用，对其操作时明确报告属于分支来源对话。",
+    "hostBoundary": "读取共享 Runtime 已提交事实，不从本 Host Promise 集合推导成员；操作继续遵守 Conversation ownership 和 ExecutionLease。",
+    "compressionSummary": "逐条保留派发 identity；不同工具调用和不同子结果不得因通用冒号标签相同而互相覆盖。",
+    "nativeHandles": "native_child_handle_projection ToolCallEvent 在发送前冻结工具输出与累计 childHandles；同请求后续调用和恢复读取该事实，普通/压缩继承映射，wire 不发送内部 metadata。",
+    "continuationSources": "最新代际由 turn_seq 决定；没有新业务输入的 retry/runtime/maintenance 沿 typed sourceTurnId 继承业务任务，不退回初始标题。",
+    "deliveryFailure": "consumed 且 unhandled 的 RuntimeDeliveryWake=dead_letter 仍表示交付失败；foreground ToolModelResult 与 RuntimeDelivery 分别提供结果证据，缺证据为 unknown。"
+  },
+  "list": {
+    "readOnly": true,
+    "scopes": [
+      "direct",
+      "tree"
+    ],
+    "defaultScope": "direct",
+    "pagination": {
+      "defaultLimit": 32,
+      "maximumLimit": 100,
+      "cursor": true,
+      "maximumPageTokens": 2600,
+      "rereadCursor": true
+    },
+    "rule": "从当前 Conversation 真实父链查询；状态过滤和分页不改变完整作用域计数，被 cardLimit 省略的成员仍可查。"
+  },
+  "read": {
+    "readOnly": true,
+    "target": "childRef",
+    "pagination": {
+      "defaultLimit": 32,
+      "maximumLimit": 100,
+      "cursor": true,
+      "maximumPageTokens": 2600,
+      "rereadCursor": true
+    },
+    "changesDeliveryState": false,
+    "bodyChunks": "长正文按 textOffset/totalCharacters/textComplete/textSha256/textFormat 分块；游标绑定 scope/query/来源高水位与正文身份，不以可变活动快照强制失效。",
+    "rule": "按精确子任务引用读取任务来源、正文及答案；只读不能把 RuntimeDelivery 标记 consumed 或把 InputLink 标记 handled。"
+  },
   "lineage": {
     "domains": [
       "ChildExecution",
@@ -53,6 +159,7 @@
     "precheck": "父树已终止（父Turn终态或所属ChildExecution子树已写入终止意图）时拒绝创建，不产生半创建事实。",
     "prepareAtomicity": "ChildExecution、稳定父边、首个Turn、membership、active link、AnswerBridge与spawn EffectIntent在一个SQLite事务中建立。",
     "rule": "wait_for_answer可以在本地等待到期后转为后台返回控制句柄，子Turn继续运行；background在启动成功后立即返回控制句柄。",
+    "toolBoundary": "model-spawned-children-only-narrow: every-Turn-of-a-child-execution-the-model-started-intersects-its-own-tool-settings-with-the-parent-Turn-policy-frozen-at-spawn(toolPolicy.inherited-with-its-own-ancestors); parent-and-team-continuations-and-user-input-retry-or-edit-in-the-child-conversation-reuse-the-spawn-Turn-bound; later-parent-settings-changes-reach-only-new-children; built-in-tools-need-both-lists-except-submit_agent_answer-kept-from-the-child-own-list; MCP-sources-need-both-sides-enabledTools-intersect-disabledTools-add-up-a-source-the-parent-never-enabled-stays-off; allowOutsideProjectPaths-and-ask_user-submit_plan-autoApprove-need-both-denyCommands-add-up-maxChildAgentDepth-takes-the-minimum; execution-approval-change-application(longest-delay)-result-submission-and-allowCommands-are-automatic-or-allowed-only-when-every-ancestor-agrees; yolo-loosens-only-its-own-level; tool-parameters-display-native-async-and-preset-stay-the-child-own; skills-a-skill-or-source-either-side-turns-off-stays-off(skillPolicy.inherited)-and-a-disabled-skill-can-be-neither-listed-nor-loaded; work-environments-intersect-the-parent-Turn-at-spawn-and-the-child-latest-Turn-afterwards-including-Turns-the-user-starts-in-the-child-conversation; spawn-snapshots-without-inherited(legacy)-stay-unbounded; a-Plan-the-user-approves-to-run-in-a-new-conversation(submit_plan-source-with-external-settlement-and-authorityBound-executor_agent)-compiles-the-executor-Agent-own-tools-skills-and-work-environments-with-no-inherited-bound-on-this-or-later-Turns(global-and-its-own-scopes-still-narrow)-starts-in-the-planning-Turn-working-directory-only-when-its-own-settings-allow-it-and-keeps-the-planning-Turn-model-fallback-and-child-thinking-inheritance",
     "failureSettlement": {
       "syncOrDispatchFailure": "同步创建失败或派发失败经EffectReceipt(failed) reconcile为ToolOutcome(failed)，生成唯一ToolModelResult，并终止已准备但未启动的child Turn。",
       "unknownAfterDispatch": "已派发但无法核验时写outcome_unknown receipt，ChildExecution进入needs_human，不自动重复spawn。"
@@ -130,7 +237,7 @@
       "RuntimeDeliveryWake",
       "TurnFinalOutputFence"
     ],
-    "intentLink": "phase=next_turn 且需要新 Turn 时，RuntimeDeliveryIntentLink 一对一记录该 Delivery 触发的 TurnIntent；Intent 使用 runtime_continuation 类型，不借用 retry。",
+    "intentLink": "phase=next_turn 且需要新 Turn 时，RuntimeDeliveryIntentLink 一对一记录该 Delivery 触发的 TurnIntent；Intent 使用 runtime_continuation 类型，不借用 retry。后台进程与子 Agent 答案续跑继承同对话 sourceTurnId 的冻结权限；协作消息续跑的 sourceTurnId 为 null，按目标对话当前设置编译权限，可开启对话的第一轮。",
     "inboxBoundary": "RuntimeInboxItem只保存来源事实；目标Conversation、目标Turn、phase与attempt都属于RuntimeDelivery。",
     "phases": [
       "current_turn",
@@ -286,5 +393,101 @@
   ],
   "releaseDecisions": {
     "interruptSubtree": "required-first-release"
+  },
+  "collaboration": {
+    "teamScope": "derive-root-conversation-from-ChildExecutionParentLink-no-team-table",
+    "addressing": "root-relative-path-or-runtime-conversation-id; request-scoped-childRef-is-not-a-global-address",
+    "messageDomains": [
+      "CollaborationMessage",
+      "CollaborationMessageSourceLink",
+      "CollaborationMessageTargetLink",
+      "CollaborationMessagePayloadLink",
+      "CollaborationMessageReplyLink",
+      "CollaborationBudget",
+      "CollaborationRequest",
+      "CollaborationRequestTurnLink"
+    ],
+    "messageAuthority": "peer-tool-output-never-user-or-developer-authorization",
+    "messageText": {
+      "maxBytes": 64000,
+      "rule": "every-collaboration-message-body-is-1-to-maxBytes-UTF-8-bytes; a-longer-send-is-refused-and-writes-nothing; a-longer-final-answer-in-a-completion-reply-is-truncated-with-a-note-to-read-the-target",
+      "pageTokens": 2400,
+      "pageMaxCharacters": 12000,
+      "paging": "read_agent_messages-with-M#-messageRef-and-offset-returns-one-page-of-at-most-pageTokens-estimated-tokens-and-pageMaxCharacters-characters-with-offset-nextOffset-and-totalCharacters; never-splits-a-surrogate-pair; following-nextOffset-until-null-returns-the-whole-text; sender-and-recipient-may-read-it-in-teams-and-across-conversations",
+      "preview": "an-envelope-over-the-runtime-delivery-budget-shows-head-and-tail-only; its-marker-names-the-exact-call-read_agent_messages-with-messageRef-and-offset=0; the-sender-result-stays-accepted-and-adds-recipientSeesPreview-with-a-note"
+    },
+    "delivery": "reuse-RuntimeInboxItem-RuntimeDelivery-RuntimeDeliveryInputLink-RuntimeDeliveryWake",
+    "sendMessage": "persist-message-and-delivery-without-idle-turn-admission; active-target-consumes-at-safe-boundary; cross-conversation-sends-instead-queue-behind-the-running-Turn-see-crossConversation.delivery",
+    "followupTask": "explicit-request-may-wake-idle-or-join-active; never-implicitly-cancel",
+    "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
+    "permissions": "same-root-peer-communication; conversations-outside-the-team-are-reachable-only-through-cross-conversation-tools-or-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
+    "revocation": "check-current-team-lineage-and-target-state-again-at-admission",
+    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; a-followup-no-Turn-will-answer-fails(all-deliveries-failed-or-acknowledged-without-a-Turn-or-its-Turn-deleted-with-the-target); a-cross-conversation-followup-first-gets-one-failure-completion-reply; a-team-followup-fails-without-a-reply; a-reply-committed-before-the-deletion-only-settles-its-request(completed-when-a-Turn-wrote-it-failed-for-a-failure-reply)-and-is-never-sent-twice",
+    "limits": "frozen-policy-bounds-active-team-size-recursion-and-turn-wakeup-budget",
+    "forkTurns": [
+      "none",
+      "all",
+      "positive-integer-string"
+    ],
+    "forkAuthority": "completed-committed-context-only; no-active-turn-no-child-control-links-no-lease-or-ownership-copy; copied-Turns-own-copies-of-their-historical-AuthoritySnapshot; the-child-own-Turns-compile-authority-from-its-assignment",
+    "board": {
+      "domains": [
+        "CollaborationBoardChannel",
+        "CollaborationBoardChannelScopeLink",
+        "CollaborationBoardPost",
+        "CollaborationBoardPostChannelLink",
+        "CollaborationBoardPostSourceLink",
+        "CollaborationBoardReplyLink",
+        "CollaborationBoardSubscriptionLink",
+        "CollaborationBoardCommandReceipt"
+      ],
+      "offering": "not-offered-to-models-in-phase-one; agent_board-is-not-in-the-builtin-tool-registry; domain-and-control-plane-code-retained",
+      "scope": "existing-root-conversation-no-membership-authority",
+      "access": "bounded-authorized-query; no-board-body-in-client-feed",
+      "notification": "active-subscribers-only; no-idle-wake",
+      "deletion": "root-channel-posts-and-source-posts-delete-with-conversation; request-receipts-and-links-cascade"
+    },
+    "budget": "independent-CollaborationBudget; recursive-tool-followups-inherit-origin-budget-and-frozen-authority; zero-disables-automatic-followups",
+    "crossConversation": {
+      "switch": "ToolPolicy.toolConfigs.run_agent.config.crossConversationCollaboration; boolean; default-off; non-boolean-fails-closed; frozen-in-Turn-authority; configSchema-defaultValue-only",
+      "tools": [
+        "list_conversations",
+        "read_conversation",
+        "send_conversation_message",
+        "create_conversation",
+        "fork_conversation"
+      ],
+      "readonlyTools": [
+        "list_conversations",
+        "read_conversation"
+      ],
+      "offering": "top-level-conversations-only; hidden-and-rejected-when-switch-off; control-plane-rechecks-calling-Turn-frozen-authority",
+      "targets": "other-active-top-level-conversations-of-the-caller-project-by-ConversationProjectLink; conversations-without-a-project-reach-only-each-other; child-task-conversations-never-listed-or-addressed",
+      "scope": "the-Runtime-is-shared-by-every-VS-Code-window-so-the-project-bounds-list-read-send-and-fork; create_conversation-creates-in-the-caller-project; every-read-send-and-fork-target-is-checked-by-the-control-plane-however-its-reference-was-obtained; another-project-is-refused-with-nothing-read-sent-or-created; a-project-link-never-changes-while-its-Conversation-exists",
+      "read": "newest-first-page; entries-spend-at-most-pageTokens-and-one-entry-at-most-messagePreviewTokens-so-the-result-stays-under-the-tool-result-cap; older-messages-that-do-not-fit-are-left-out-not-relabelled-and-olderMessageRef-leads-to-them; a-longer-message-shows-its-start-with-truncated-and-nextOffset-and-read_conversation-with-R#-messageRef-and-offset-pages-it-whole; collaboration-inputs-a-Turn-took-in-precede-its-messages-as-bounded-previews",
+      "readBudget": {
+        "pageTokens": 3000,
+        "messagePreviewTokens": 2000
+      },
+      "approval": "send-type-tools-auto-approved-by-default; per-tool-autoApproveExecution-false-requires-confirmation",
+      "consent": "sender-only-authorization-as-in-Codex; the-target-has-no-switch-or-consent-check; defences-are-the-untrusted-data-envelope-and-peer-text-never-gaining-user-text-authority",
+      "decisions": "turning-the-sender-switch-off-never-cancels-already-queued-followups; no-top-level-fan-out-cap-beyond-the-followup-budget-and-the-two-fixed-limits; team-parent-child-messages-still-render-as-collaboration-cards; only-cross-conversation-followups-no-Turn-will-answer-get-a-failure-reply-and-only-a-Turn-they-start-spends-their-own-budget; team-followups-keep-their-pre-cross-conversation-rules; a-cross-conversation-reply-starts-an-idle-requester-Turn-that-spends-and-continues-the-budget-of-the-request-it-answers",
+      "allowlist": "the-switch-is-the-grant; the-Turn-frozen-switch-alone-offers-and-admits-the-five-tools-in-top-level-conversations; send-create-and-fork-only-while-the-Turn-effective-allowedTools-include-run_agent(otherwise-list-and-read-only); no-tool-list-controls-them-and-their-names-in-saved-lists-are-ignored-by-the-resolver-and-dropped-by-the-next-settings-save; the-settings-switch-writes-only-its-own-value; no-per-tool-disable(the-switch-is-the-only-on-off-control); per-tool-autoApproveExecution-false-still-requires-confirmation; stored-crossConversationGrantedTools-fields-are-ignored-without-migration",
+      "delivery": "running-target-queues-behind-its-current-Turn; followup-starts-its-own-Turn-and-only-that-Turn-consumes-it; followup-waits-behind-any-running-Turn-at-dispatch-including-one-started-after-its-anchor; followups-from-different-senders-start-sequential-Turns-never-merged; queued-followups-start-in-send-order-by-the-CollaborationMessage.message_seq-their-send-transaction-assigned-never-by-timestamp; that-Turn-spends-only-the-requester-budget; message-joins-the-next-Turn-whatever-starts-it; completion-replies-join-a-running-requester-Turn-at-a-safe-boundary; a-cross-conversation-completion-or-failure-reply-to-an-idle-requester(also-after-a-user-stop)-starts-one-requester-Turn-that-spends-the-chain-automatic-followup-budget; with-the-budget-spent-the-reply-waits-for-the-next-Turn-without-error; team-replies-and-plain-messages-start-no-Turn",
+      "authority": "peer-text-is-an-attributed-collaboration-envelope-sent-as-user-role-runtime-data-never-a-user-message; its-fixed-kernel-header-says-it-is-from-another-conversation-or-team-agent-not-this-conversation-user-and-untrusted; list-and-read-carry-an-untrusted-data-notice",
+      "create": "stable-Conversation-id-from-ToolCall; switch-live-ToolCall-spawn-limit-and-followup-budget-checked-before-any-write; work-environment-and-model-profile-fill-empty-slots-first; Conversation-default-AgentConversationLink-project-link-and-followup-commit-in-one-transaction; refused-or-interrupted-creation-leaves-no-Conversation; an-attempt-refused-after-admission-clears-the-settings-it-wrote-under-the-same-ownership-pin; the-committed-task-marks-creation-and-a-replay-after-deletion-is-refused; a-replay-refused-at-admission-clears-settings-a-crashed-attempt-left-only-when-a-read-finds-some; no-ConversationOriginLink",
+      "fork": "commandId-is-ToolCall; completed-history-up-to-the-last-ended-Turn; starts-no-Turn; replay-keeps-the-committed-boundary; never-navigates-the-view; a-source-hosted-by-another-window-is-refused-with-a-clear-error-while-list-read-and-send-need-no-ownership; any-failed-attempt-clears-copied-settings-of-the-uncreated-target-and-says-nothing-was-created",
+      "inheritedRefs": "a-fork-and-a-forked-child-keep-the-conversation-and-message-refs-of-copied-history; the-runtime-card-names-selfConversationRef-forkedFromConversationRefs-and-inheritedMessageRefs; reading-or-answering-an-inherited-message-fails-with-where-it-came-from-and-what-to-do-instead",
+      "limits": {
+        "automaticFollowupBudget": "cross-conversation-followups-and-create_conversation-spend-maxAutomaticFollowups; checked-before-any-write; so-does-each-requester-Turn-a-cross-conversation-reply-starts-checked-in-its-admission-transaction",
+        "deletedChainOrigin": "the-limit-is-frozen-in-the-Turn-that-started-the-chain; once-its-Conversation-is-deleted-tasks-it-started-may-finish-and-send-plain-messages-but-followups-and-create_conversation-get-a-clear-refusal",
+        "maxPendingInboundMessages": 16,
+        "pendingInbound": "undelivered-message-and-followup-deliveries-from-any-sender-per-target; completion-replies-exempt; enforced-on-cross-conversation-sends",
+        "pendingInboundRefusal": "names-the-unread-count-and-that-no-message-or-followup-can-be-queued-until-the-target-takes-them-in-with-its-next-turn; suggests-no-retry",
+        "maxConversationSpawnsPerTurn": 8,
+        "spawns": "create_conversation-and-fork_conversation-calls-of-one-sender-Turn-ranked-by-committed-call-order",
+        "overflow": "clear-tool-error; nothing-written; no-new-settings"
+      }
+    }
   }
 }

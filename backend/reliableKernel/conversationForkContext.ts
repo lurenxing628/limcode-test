@@ -1,11 +1,42 @@
+import { resolveConversationCompressionBlock, selectConversationCompressionBlock } from './compressionBlockOwnership';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+
+/**
+ * The fork command can never succeed, so retrying the same command is pointless and it leaves
+ * nothing behind (the application removes settings an earlier attempt copied). Causes: the fork
+ * point is gone or changed (missing source Conversation, a Message without a current Revision or of
+ * another Conversation, a changed Revision, a deleted fork-point Message, no completed history for
+ * fork_conversation); the copy would include history that is not completed (a Turn still running,
+ * or a compression made after the fork point, including one whose pre-compression history was
+ * rewritten in place); or the command is replayed with different source facts. Broken invariants,
+ * such as a block without exactly one creation projection, are plain errors, never rejections.
+ */
+export class ConversationForkRejectedError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'ConversationForkRejectedError';
+  }
+}
 
 export interface ForkContextLineage {
   segmentIds: ReadonlySet<string>;
   messageSources: readonly DomainRow[];
   contentObjectIds: ReadonlyMap<string, string>;
+  /** The Conversation's own CompressionBlocks over every summary segment in the lineage. */
+  compressionBlocks: readonly ForkLineageCompressionBlock[];
+}
+
+export interface ForkLineageCompressionBlock {
+  summarySegmentId: string;
+  block: DomainRow;
+  /** The block's ContextSegmentSource row on the summary segment. */
+  summarySource: DomainRow;
+  /** Ordered CompressionBlockSource rows. */
+  blockSources: readonly DomainRow[];
+  /** The block's only ModelContextProjection: the root it compressed when it was created. */
+  creationProjection: DomainRow;
 }
 
 export interface NativeMessageContextRevision {
@@ -14,15 +45,20 @@ export interface NativeMessageContextRevision {
   attachments: DomainRow[];
 }
 
-/** The selected immutable prefix includes the sources hidden behind its compression blocks. */
+/**
+ * The selected immutable prefix includes the sources hidden behind its compression blocks. Summary
+ * segments are shared by forks, so their lineage follows the blocks owned by this Conversation.
+ */
 export async function readForkContextLineage(
   database: RuntimeDatabase,
-  rootSegmentIds: readonly string[]
+  rootSegmentIds: readonly string[],
+  conversationId: string
 ): Promise<ForkContextLineage> {
   const segmentIds = new Set<string>();
   const messageSources: DomainRow[] = [];
   const contentObjectIds = new Map<string, string>();
   const childrenBySegment = new Map<string, string[]>();
+  const compressionBlocks: ForkLineageCompressionBlock[] = [];
   let frontier = [...new Set(rootSegmentIds)];
   while (frontier.length > 0) {
     const next = new Set<string>();
@@ -35,7 +71,7 @@ export async function readForkContextLineage(
           where: { segment_id: segmentId }, limit: 257
         }))
       ]);
-      const compressed: Array<{ segmentId: string; blockId: string }> = [];
+      const compressed: Array<{ segmentId: string; blockId: string; summarySource: DomainRow }> = [];
       for (const [index, segmentId] of batch.entries()) {
         const segment = requireRow(snapshot.snapshot[index], `ContextSegment ${segmentId}`);
         const first = requireRows(snapshot.snapshot[batch.length + index], 'ContextSegmentSource');
@@ -48,10 +84,13 @@ export async function readForkContextLineage(
           if (source.source_kind === 'message_revision') messageSources.push(source);
         }
         if (segment.segment_kind === 'compression') {
-          if (sources.length !== 1 || sources[0].source_kind !== 'compression_block') {
-            throw new Error(`Compression segment ${segmentId} lacks its unique block source.`);
-          }
-          compressed.push({ segmentId, blockId: requireId(sources[0].source_id, 'ContextSegmentSource.source_id') });
+          const block = await selectConversationCompressionBlock(database, segmentId, conversationId, sources);
+          const blockId = requireId(block.id, 'CompressionBlock.id');
+          compressed.push({
+            segmentId,
+            blockId,
+            summarySource: sources.find((source) => source.source_id === blockId)!
+          });
         }
       }
       if (compressed.length === 0) continue;
@@ -59,9 +98,12 @@ export async function readForkContextLineage(
         ...compressed.map(({ blockId }) => DOMAIN_REPOSITORIES.domain('CompressionBlock').get(blockId)),
         ...compressed.map(({ blockId }) => DOMAIN_REPOSITORIES.domain('CompressionBlockSource').list({
           where: { compression_block_id: blockId }, limit: 257
+        })),
+        ...compressed.map(({ blockId }) => DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+          where: { owner_kind: 'compression_block', owner_id: blockId }, limit: 2
         }))
       ]);
-      for (const [index, { segmentId, blockId }] of compressed.entries()) {
+      for (const [index, { segmentId, blockId, summarySource }] of compressed.entries()) {
         const block = requireRow(blocks.snapshot[index], `CompressionBlock ${blockId}`);
         if (block.summary_object_id !== contentObjectIds.get(segmentId)) {
           throw new Error(`Compression segment ${segmentId} does not reference its block summary.`);
@@ -71,12 +113,17 @@ export async function readForkContextLineage(
           compression_block_id: blockId
         });
         if (sources.length === 0) throw new Error(`CompressionBlock ${blockId} has no registered sources.`);
+        const projections = requireRows(blocks.snapshot[compressed.length * 2 + index], 'ModelContextProjection');
+        if (projections.length !== 1) throw new Error(`CompressionBlock ${blockId} must have exactly one creation projection.`);
         sources.sort((left, right) => compareIntegers(left.position, right.position));
         const children = sources.map((source, position) => {
           if (source.position !== BigInt(position)) throw new Error(`CompressionBlock ${blockId} source order is invalid.`);
           return requireId(source.segment_id, 'CompressionBlockSource.segment_id');
         });
         childrenBySegment.set(segmentId, children);
+        compressionBlocks.push({
+          summarySegmentId: segmentId, block, summarySource, blockSources: sources, creationProjection: projections[0]
+        });
         for (const child of children) if (!segmentIds.has(child)) next.add(child);
       }
     }
@@ -93,7 +140,139 @@ export async function readForkContextLineage(
     visited.add(segmentId);
   }
   for (const segmentId of rootSegmentIds) visit(segmentId);
-  return { segmentIds, messageSources, contentObjectIds };
+  return { segmentIds, messageSources, contentObjectIds, compressionBlocks };
+}
+
+interface CompressionPrecedenceFacts {
+  /** Segment ids of the tail the block's pre-compression root kept after its compressed range. */
+  creationTail: readonly string[];
+}
+
+/**
+ * Whether a compressed root may supply a fork prefix. A fork owns completed history only, so the
+ * compression must precede the cut: the cut never lies strictly inside the tail that existed when
+ * the block was created (its pre-compression projection root), and the Turn that compressed has
+ * ended inside the kept history — it owns kept visible transcript, or none at all like a manual
+ * compression Turn or a Turn whose transcript was deleted. Otherwise the pre-compression root holds
+ * the same prefix uncompressed and the caller forks from it instead. Facts are memoized per summary
+ * segment across the caller's candidate roots.
+ */
+export class ForkCompressionPrecedence {
+  private readonly facts = new Map<string, Promise<CompressionPrecedenceFacts | null>>();
+
+  public constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly conversationId: string,
+    private readonly boundaryMessageSeq: bigint
+  ) {}
+
+  public async precedesCut(records: readonly { node: DomainRow; segment: DomainRow }[], cutIndex: number): Promise<boolean> {
+    const summary = records[0]?.segment;
+    if (!summary || summary.segment_kind !== 'compression') return true;
+    if (!records[cutIndex]) throw new Error('Fork cut is outside the candidate Context root.');
+    const resolved = await this.factsFor(requireId(summary.id, 'ContextSegment.id'));
+    if (!resolved) return false;
+    // Strictly inside: the kept tail up to the cut is still exactly the history the block was
+    // created over, and part of that history still follows the cut in this root. Creation history
+    // after the cut that a delete or retry discarded is no longer history. Segments, not nodes,
+    // identify that history, because a delete or edit rebuilds the nodes of a compressed tail.
+    const tail = resolved.creationTail;
+    if (cutIndex >= tail.length) return true;
+    for (let index = 1; index <= cutIndex; index += 1) {
+      if (records[index].segment.id !== tail[index - 1]) return true;
+    }
+    const later = new Set(records.slice(cutIndex + 1).map((record) => requireId(record.segment.id, 'ContextSegment.id')));
+    return !tail.slice(cutIndex).some((segmentId) => later.has(segmentId));
+  }
+
+  /**
+   * False when no cut can follow this summary's compression (its Turn is not kept), so a caller can
+   * skip a candidate root without reading it.
+   */
+  public async mayPrecede(summarySegmentId: string): Promise<boolean> {
+    return (await this.factsFor(summarySegmentId)) !== null;
+  }
+
+  private factsFor(summarySegmentId: string): Promise<CompressionPrecedenceFacts | null> {
+    let facts = this.facts.get(summarySegmentId);
+    if (!facts) {
+      facts = this.readFacts(summarySegmentId);
+      this.facts.set(summarySegmentId, facts);
+    }
+    return facts;
+  }
+
+  private async readFacts(summarySegmentId: string): Promise<CompressionPrecedenceFacts | null> {
+    const block = await resolveConversationCompressionBlock(this.database, summarySegmentId, this.conversationId);
+    if (!await this.compressingTurnIsKept(block)) return null;
+    const blockId = requireId(block.id, 'CompressionBlock.id');
+    const [projections, sources] = await Promise.all([
+      listAllDomainRows(this.database, 'ModelContextProjection', { owner_kind: 'compression_block', owner_id: blockId }),
+      listAllDomainRows(this.database, 'CompressionBlockSource', { compression_block_id: blockId })
+    ]);
+    // Every block, a fork's copied blocks included, has exactly one creation projection on a root of
+    // its own Conversation.
+    if (projections.length !== 1) throw new Error(`CompressionBlock ${blockId} must have exactly one creation projection.`);
+    const creation = (await this.database.materializeContext(
+      requireId(projections[0].root_id, 'ModelContextProjection.root_id')
+    )).snapshot;
+    if (creation.root.conversation_id !== this.conversationId) {
+      throw new Error(`CompressionBlock ${blockId} creation projection belongs to another Conversation.`);
+    }
+    sources.sort((left, right) => compareIntegers(left.position, right.position));
+    if (sources.length > creation.records.length
+      || sources.some((source, index) => source.segment_id !== creation.records[index].segment.id)) {
+      throw new Error(`CompressionBlock ${blockId} creation projection does not start with its compressed range.`);
+    }
+    return {
+      creationTail: creation.records.slice(sources.length).map((record) => requireId(record.segment.id, 'ContextSegment.id'))
+    };
+  }
+
+  private async compressingTurnIsKept(block: DomainRow): Promise<boolean> {
+    const authority = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').get(
+      requireId(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id')
+    )]);
+    const snapshot = optionalRow(authority.snapshot[0], 'AuthoritySnapshot');
+    if (!snapshot) return false;
+    const turnId = requireId(snapshot.turn_id, 'AuthoritySnapshot.turn_id');
+    const [turnRead, visible] = await Promise.all([
+      this.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').get(turnId)]),
+      readVisibleTurnMessages(this.database, this.conversationId, turnId)
+    ]);
+    const turn = optionalRow(turnRead.snapshot[0], 'Turn');
+    if (!turn || turn.status !== 'terminated') return false;
+    // A Turn without visible transcript (a manual compression, or one whose output a delete or
+    // retry discarded) is placed by the creation tail alone.
+    return visible.length === 0 || visible.some((message) => message.messageSeq <= this.boundaryMessageSeq);
+  }
+}
+
+/**
+ * The Messages of a Turn that are still visible history of the Conversation. Output a delete, retry
+ * or edit soft-deleted keeps its Turn links but no longer belongs to the transcript.
+ */
+export async function readVisibleTurnMessages(
+  database: RuntimeDatabase,
+  conversationId: string,
+  turnId: string
+): Promise<Array<{ messageId: string; messageSeq: bigint }>> {
+  const links = await listAllDomainRows(database, 'MessageTurnLink', { turn_id: turnId });
+  const messageIds = [...new Set(links.map((link) => requireId(link.message_id, 'MessageTurnLink.message_id')))];
+  if (messageIds.length === 0) return [];
+  const read = await database.snapshot(messageIds.flatMap((messageId) => [
+    DOMAIN_REPOSITORIES.domain('Message').get(messageId),
+    DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+      where: { conversation_id: conversationId, message_id: messageId }, limit: 2
+    })
+  ]));
+  return messageIds.flatMap((messageId, index) => {
+    const message = optionalRow(read.snapshot[index * 2], 'Message');
+    const [membership] = requireRows(read.snapshot[index * 2 + 1], 'MessagePartOfConversation');
+    if (!message || message.deleted_at !== null || !membership) return [];
+    if (typeof membership.message_seq !== 'bigint') throw new Error('MessagePartOfConversation.message_seq is invalid.');
+    return [{ messageId, messageSeq: membership.message_seq }];
+  });
 }
 
 /** Native UI aggregates do not own Context; their immutable item revisions do. */
@@ -169,13 +348,7 @@ export class ForkContextCandidateProbe {
       return false;
     }
     const node = await this.node(rootId);
-    const segmentId = requireId(node.segment_id, 'ContextSequenceNode.segment_id');
-    let kind = this.segmentKinds.get(segmentId);
-    if (kind === undefined) {
-      const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)]);
-      kind = requireId(requireRow(result.snapshot[0], 'ContextSegment').segment_kind, 'ContextSegment.segment_kind');
-      this.segmentKinds.set(segmentId, kind);
-    }
+    const kind = await this.segmentKind(requireId(node.segment_id, 'ContextSequenceNode.segment_id'));
     if (kind === 'compression') {
       if (node.parent_node_id !== null || count !== tailCount + 1 || (tailId === null) !== (tailCount === 0)) {
         throw new Error('Invalid compression Fork candidate window.');
@@ -188,6 +361,24 @@ export class ForkContextCandidateProbe {
     }
     if (tailId !== null || tailCount !== 0) throw new Error('Invalid ordinary Fork candidate tail.');
     return this.window(rootId, count, true);
+  }
+
+  /** The summary segment a compressed candidate root starts with; null for an ordinary root. */
+  public async compressionSummary(root: DomainRow): Promise<string | null> {
+    const rootId = this.pointer(root.root_node_id);
+    if (rootId === null) return null;
+    const segmentId = requireId((await this.node(rootId)).segment_id, 'ContextSequenceNode.segment_id');
+    return await this.segmentKind(segmentId) === 'compression' ? segmentId : null;
+  }
+
+  private async segmentKind(segmentId: string): Promise<string> {
+    let kind = this.segmentKinds.get(segmentId);
+    if (kind === undefined) {
+      const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)]);
+      kind = requireId(requireRow(result.snapshot[0], 'ContextSegment').segment_kind, 'ContextSegment.segment_kind');
+      this.segmentKinds.set(segmentId, kind);
+    }
+    return kind;
   }
 
   private async window(tip: string, length: number, exactDepth: boolean): Promise<boolean> {
@@ -244,6 +435,12 @@ export class ForkContextCandidateProbe {
 
 function requireRow(value: unknown, label: string): DomainRow {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} is missing.`);
+  return value as DomainRow;
+}
+
+function optionalRow(value: unknown, label: string): DomainRow | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} snapshot is invalid.`);
   return value as DomainRow;
 }
 

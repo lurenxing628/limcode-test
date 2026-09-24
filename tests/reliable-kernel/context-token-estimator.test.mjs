@@ -131,6 +131,69 @@ test('provider compaction ciphertext只保留rawItem权威副本且不按密文�
   assert.ok(kernel.estimateMessageContentsTokens(contents) < 20);
 });
 
+test('Claude 原生压缩块的可读摘要按文本计入上下文；旧库里只记了外壳大小的压缩块也按内容计', () => {
+  const summaryText = '已读取 README.md，第 1 行 hello，派过 A1 和 A2 两个子 Agent。'.repeat(60);
+  const contents = [{
+    role: 'model',
+    parts: [{
+      providerContext: {
+        provider: 'anthropic',
+        format: 'claude',
+        itemType: 'compaction',
+        rawItem: { type: 'compaction', content: summaryText, signature: 'signed-compaction' }
+      }
+    }]
+  }];
+  const measured = kernel.estimateMessageContentsTokens(contents);
+  assert.ok(measured >= kernel.estimateTextTokens(summaryText), `compaction text must be counted, got ${measured}`);
+  // Blocks written before this fix stored estimatedTokens of the envelope overhead only (4 in a real run).
+  const envelope = JSON.stringify({ kind: 'compression_contents', version: 1, contents, methodKind: 'provider_native', estimatedTokens: 4 });
+  const compression = segment('compression', COMPRESSION_TYPE, envelope, 'model');
+  assert.equal(kernel.estimateContextSegmentTokens(compression), measured);
+  const question = segment('message', MESSAGE_TYPE, JSON.stringify({ role: 'user', parts: [{ text: '还记得吗？' }] }), 'user');
+  const total = kernel.estimateMaterializedContextTokens([compression, question]);
+  assert.ok(total >= measured, `Context estimate ${total} must include the ${measured}-token compaction summary`);
+  // A larger stored estimate (e.g. rendered attachment state) is still honoured.
+  const richer = segment('compression', COMPRESSION_TYPE, JSON.stringify({
+    kind: 'compression_contents', version: 1, contents, methodKind: 'provider_native', estimatedTokens: measured + 500
+  }), 'model');
+  assert.equal(kernel.estimateContextSegmentTokens(richer), measured + 500);
+  assert.equal(kernel.estimateMaterializedContextTokens([richer, question]) - total, 500);
+});
+
+test('OpenAI 原生压缩的密文按服务商输出计入上下文；旧库里记成 0 的压缩块也按输出纠正', () => {
+  const opaque = [{
+    role: 'model',
+    parts: [{
+      providerContext: {
+        provider: 'openai',
+        format: 'openai-responses',
+        itemType: 'compaction',
+        rawItem: { type: 'compaction', encrypted_content: 'cipher'.repeat(2_000) }
+      }
+    }]
+  }];
+  const observation = { role: 'user', parts: [{ text: '附件观察：截图里是登录页，按钮文字为“继续”。' }] };
+  assert.ok(kernel.estimateMessageContentsTokens(opaque) < 20, 'ciphertext itself is never charged by characters');
+  // New results: the readable part (e.g. Attachment observation state) plus the compaction output.
+  const measured = kernel.estimateMessageContentsTokens([...opaque, observation]);
+  assert.equal(kernel.estimateCompressionResultTokens([...opaque, observation], 2_845, 1.25), measured + Math.floor(2_845 / 1.25));
+  assert.equal(kernel.estimateCompressionResultTokens([...opaque, observation], undefined, 1.25), measured);
+  // Readable Claude compaction text is measured, never topped up with the output count.
+  const claude = [{ role: 'model', parts: [{ providerContext: { provider: 'anthropic', format: 'claude', itemType: 'compaction',
+    rawItem: { type: 'compaction', content: '摘要正文', signature: 'sig' } } }] }];
+  assert.equal(kernel.estimateCompressionResultTokens(claude, 1_817, 1), kernel.estimateMessageContentsTokens(claude));
+  // A block written between 2026-08-21 and this fix stored estimatedTokens 0 (real run: output 2,845).
+  const stored = segment('compression', COMPRESSION_TYPE, JSON.stringify({
+    kind: 'compression_contents', version: 1, contents: opaque, methodKind: 'provider_native',
+    estimatedTokens: 0, providerOutputTokens: 2_845, providerCalibrationRatio: 1.25
+  }), 'model');
+  const expected = kernel.estimateMessageContentsTokens(opaque) + Math.floor(2_845 / 1.25);
+  assert.equal(kernel.estimateContextSegmentTokens(stored), expected);
+  const question = segment('message', MESSAGE_TYPE, JSON.stringify({ role: 'user', parts: [{ text: '继续' }] }), 'user');
+  assert.ok(kernel.estimateMaterializedContextTokens([stored, question]) >= expected);
+});
+
 test('tool_pair只估算实际重传的functionResponse，不重复计算历史工具参数', () => {
   const hugeArguments = JSON.stringify({ content: 'x'.repeat(500_000) });
   const pair = JSON.stringify({
@@ -241,6 +304,31 @@ test('provider usage上下文口径优先prompt/input，而不是input+output to
   assert.equal(kernel.providerPromptTokens(usage), 47_100);
   assert.equal(kernel.providerTotalTokens(usage), 48_000);
   assert.equal(kernel.compressionOutputTokens(usage), 900);
+});
+
+test('压缩输出token不含推理：OpenAI把推理算进输出时减掉，Gemini另计推理时不减', () => {
+  // unified 把 Responses 的 output_tokens（含 reasoning_tokens）映射成 candidatesTokenCount。
+  assert.equal(kernel.compressionOutputTokens({
+    promptTokenCount: 1_000, candidatesTokenCount: 900, thoughtsTokenCount: 600, totalTokenCount: 1_900
+  }), 300);
+  assert.equal(kernel.compressionOutputTokens({
+    input_tokens: 1_000, output_tokens: 900, output_tokens_details: { reasoning_tokens: 600 }, total_tokens: 1_900
+  }), 300);
+  assert.equal(kernel.compressionOutputTokens({
+    prompt_tokens: 1_000, completion_tokens: 900, completion_tokens_details: { reasoning_tokens: 600 }, total_tokens: 1_900
+  }), 300);
+  // Gemini 的 candidatesTokenCount 本来就不含思考，总数另加 thoughtsTokenCount。
+  assert.equal(kernel.compressionOutputTokens({
+    promptTokenCount: 1_000, candidatesTokenCount: 300, thoughtsTokenCount: 600, totalTokenCount: 1_900
+  }), 300);
+  // 密文压缩块按输出计入上下文，推理不回到上下文。
+  const compaction = [{ role: 'model', parts: [{ providerContext: { format: 'openai-responses', itemType: 'compaction',
+    rawItem: { type: 'compaction', encrypted_content: 'ciphertext' } } }] }];
+  const openAIUsage = { promptTokenCount: 1_000, candidatesTokenCount: 900, thoughtsTokenCount: 600, totalTokenCount: 1_900 };
+  assert.equal(
+    kernel.estimateCompressionResultTokens(compaction, kernel.compressionOutputTokens(openAIUsage)),
+    kernel.estimateMessageContentsTokens(compaction) + 300
+  );
 });
 
 test('实用版压缩规划使用48K主体、8K摘要和16K输出且没有全局估算硬门槛', () => {
@@ -673,4 +761,23 @@ test('当前扩展替换命令等待process真实终态，其他命令保持请�
     ),
     1_000
   );
+});
+
+test('压缩块的压缩后估算是否计入了密文：旧OpenAI原生记录与缺少输出token的记录判为未计入', () => {
+  const compaction = [{ role: 'model', parts: [{ providerContext: { format: 'openai-responses', itemType: 'compaction',
+    rawItem: { type: 'compaction', encrypted_content: 'ciphertext' } } }] }];
+  const measured = kernel.estimateMessageContentsTokens(compaction);
+  const envelope = (fields) => ({ kind: 'compression_contents', version: 1, contents: compaction, ...fields });
+  // 9448944e 之前：密文按 0 计，压缩后估算只含可读部分。
+  assert.equal(kernel.compressionResultSizeCounted(envelope({ estimatedTokens: measured, providerOutputTokens: 900 })), false);
+  // 网关没有返回 usage：密文大小无从得知。
+  assert.equal(kernel.compressionResultSizeCounted(envelope({ estimatedTokens: measured })), false);
+  // 现在的记录：密文按服务商输出计入。
+  assert.equal(kernel.compressionResultSizeCounted(envelope({
+    estimatedTokens: measured + 450, providerOutputTokens: 900, providerCalibrationRatio: 2
+  })), true);
+  // 可读的文本摘要总是计入。
+  assert.equal(kernel.compressionResultSizeCounted({
+    kind: 'compression_contents', version: 1, contents: [{ role: 'user', parts: [{ text: '[Context Summary]\n目标' }] }]
+  }), true);
 });

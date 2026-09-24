@@ -6,6 +6,7 @@ import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import ToolPolicyEditor from '@webview/components/settings/tools/ToolPolicyEditor.vue';
+import AgentCollaborationSettings from './AgentCollaborationSettings.vue';
 import SkillPolicyEditor from '@webview/components/settings/skills/SkillPolicyEditor.vue';
 import WorkEnvironmentPolicyEditor from '@webview/components/settings/workEnvironment/WorkEnvironmentPolicyEditor.vue';
 import CheckpointPolicyEditor from '@webview/components/settings/checkpoints/CheckpointPolicyEditor.vue';
@@ -70,6 +71,8 @@ function explainDeleteRestriction(): void { const agent = activeAgent.value; if 
       </span>
       <span class="agent-pill">{{ activeAgent.source === 'builtin' ? '内置' : '用户' }}</span>
     </div>
+
+    <AgentCollaborationSettings v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 协作" />
 
     <label v-if="activeAgent" class="global-settings-field global-settings-field-wide">
       <span>Agent 描述</span>

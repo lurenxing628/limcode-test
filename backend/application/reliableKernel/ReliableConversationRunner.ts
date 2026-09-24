@@ -35,6 +35,11 @@ import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
 import type { CoordinateCompressionResult } from '../../reliableKernel/contextCompressionCoordinator';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnosticJournal';
+import {
+  CompressionRebuildPreviewCache,
+  type CompressionRebuildPreview
+} from '../../reliableKernel/compressionRebuildPreview';
+import { applyRequestCompressionSettings } from '../../reliableKernel/requestCompressionSettings';
 
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 const EXTERNAL_WAKE_POLL_MS = 500;
@@ -67,7 +72,7 @@ interface DriveSlot {
   task: Promise<void>;
 }
 
-type ManualCompressionMaintenance =
+type ManualCompressionMaintenance = (
   | {
       kind: 'manual_context_compression';
       version: 1;
@@ -80,10 +85,11 @@ type ManualCompressionMaintenance =
       compressSegmentCount: number;
       target: CompressionCommandTarget;
       commandSourceKey: string;
-    };
+    }) & { sourceReplay?: 'immutable_provenance' };
 
 interface FrozenManualCompressionDrive {
   descriptor: ManualCompressionMaintenance;
+  settingsSnapshotContentObjectId?: string;
   authoritySnapshotId: string;
   headRootId: string;
   compressSegmentCount: number;
@@ -160,6 +166,7 @@ export class ReliableConversationRunner {
   private externalWakeTask: Promise<void> | undefined;
   private localWakeRequested = false;
   private readonly unsubscribeCommit: () => void;
+  private readonly rebuildPreviews = new CompressionRebuildPreviewCache();
   private disposed = false;
 
   public constructor(
@@ -365,12 +372,15 @@ export class ReliableConversationRunner {
     });
   }
 
-  /** Durable internal continuation: no visible synthetic user message and frozen source authority. */
+  /**
+   * Durable internal continuation without a visible synthetic user message. A non-null source Turn
+   * supplies frozen authority; a collaboration delivery (null) runs under current settings.
+   */
   public async runtimeContinuation(input: {
     commandId: string;
     deliveryId: string;
     conversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
     return this.conversationOwners.run(input.conversationId, async () => {
@@ -396,13 +406,15 @@ export class ReliableConversationRunner {
     conversationId: string;
     compressSegmentCount: number;
     target?: CompressionCommandTarget;
+    sourceReplay?: 'immutable_provenance';
   }): Promise<ReliableManualCompressionResult> {
     this.requireOpen();
     return this.conversationOwners.run(input.conversationId, async () => {
       const replay = await this.inspectManualCompression({
         commandId: input.commandId,
         conversationId: input.conversationId,
-        target: input.target
+        target: input.target,
+        sourceReplay: input.sourceReplay
       });
       if (replay) return replay;
       const started = await this.admitManualCompression(input);
@@ -435,13 +447,28 @@ export class ReliableConversationRunner {
     conversationId: string;
     compressSegmentCount: number;
     target?: CompressionCommandTarget;
+    sourceReplay?: 'immutable_provenance';
     childExecution?: {
       childExecutionId: string;
       leaseOwnerId: string;
     };
   }): Promise<TurnCommandResult> {
     this.requireOpen();
+    const sourceReplay = parseManualCompressionSourceReplay(input.sourceReplay, input.target);
     return this.conversationOwners.run(input.conversationId, async () => {
+      if (sourceReplay) {
+        const heads = await listAllDomainRows(this.application.database, 'ConversationContextHeadLink', {
+          conversation_id: input.conversationId
+        });
+        if (heads.length !== 1 || input.target?.kind !== 'current_head'
+          || heads[0].root_id !== input.target.expectedRootId) {
+          throw new Error('重建摘要的当前上下文已变化，请重新确认。');
+        }
+        const structure = await this.application.context.materializeStructure(input.target.expectedRootId);
+        if (structure.records.length === 0 || structure.records.length !== input.compressSegmentCount) {
+          throw new Error('从原始记录重建摘要必须包含当前完整上下文。');
+        }
+      }
       const commandSourceKey = `manual-compression:${input.commandId}:turn`;
       const sourceTurnId = await this.manualCompressionSourceTurn(
         input.conversationId,
@@ -475,6 +502,7 @@ export class ReliableConversationRunner {
               version: 2,
               compressSegmentCount: input.compressSegmentCount,
               target: input.target,
+              ...(sourceReplay ? { sourceReplay } : {}),
               commandSourceKey
             }
           : {
@@ -504,10 +532,16 @@ export class ReliableConversationRunner {
     return frozen ? this.driveManualCompression(slot, frozen) : null;
   }
 
+  /**
+   * The Turn whose frozen authority a manual compression inherits: the latest ended Turn the
+   * Conversation admitted itself. Copied history Turns of a fork have no TurnIntent here and never
+   * supply the authority of new work; without an own Turn the maintenance Turn (null) compiles the
+   * Conversation's current settings.
+   */
   private async manualCompressionSourceTurn(
     conversationId: string,
     childExecutionId?: string
-  ): Promise<string> {
+  ): Promise<string | null> {
     if (childExecutionId) {
       const links = (await listAllDomainRows(this.application.database, 'ChildExecutionTurnLink', {
         child_execution_id: childExecutionId
@@ -528,11 +562,15 @@ export class ReliableConversationRunner {
       }
       return sourceTurnId;
     }
+    const ownTurnIds = new Set((await listAllDomainRows(this.application.database, 'TurnIntent', {
+      conversation_id: conversationId
+    })).flatMap((intent) => typeof intent.turn_id === 'string' ? [intent.turn_id] : []));
     const candidates = (await listAllDomainRows(this.application.database, 'Turn', {
       conversation_id: conversationId,
       status: 'terminated'
     }))
-      .filter((turn) => turn.conversation_id === conversationId && turn.status === 'terminated')
+      .filter((turn) => turn.conversation_id === conversationId && turn.status === 'terminated'
+        && ownTurnIds.has(requireId(turn.id, 'Manual compression source Turn.id')))
       .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
         || String(right.id).localeCompare(String(left.id)));
     for (const candidate of candidates) {
@@ -545,7 +583,37 @@ export class ReliableConversationRunner {
         return candidateId;
       }
     }
-    throw new Error('当前对话没有可供手动压缩继承的冻结模型配置。');
+    return null;
+  }
+
+  /**
+   * Read-only estimate of rebuilding the current summary from original records. It resolves the same
+   * source Turn, maintenance authority and current compression settings a rebuild would freeze and
+   * previews that frozen plan; no Turn is admitted and nothing is written.
+   */
+  public async previewSourceReplayCompression(input: {
+    conversationId: string;
+    expectedRootId: string;
+    childExecutionId?: string;
+  }): Promise<CompressionRebuildPreview> {
+    this.requireOpen();
+    const conversationId = requireId(input.conversationId, 'Compression rebuild preview Conversation.id');
+    const expectedRootId = requireId(input.expectedRootId, 'Compression rebuild preview expectedRootId');
+    const heads = await listAllDomainRows(this.application.database, 'ConversationContextHeadLink', {
+      conversation_id: conversationId
+    });
+    if (heads.length !== 1) throw new Error('Conversation 缺少唯一当前 Context head。');
+    if (heads[0].root_id !== expectedRootId) return { outcome: { kind: 'stale' } };
+    const sourceTurnId = await this.manualCompressionSourceTurn(conversationId, input.childExecutionId);
+    const authority = await this.application.turns.previewMaintenanceAuthority(conversationId, sourceTurnId);
+    const settings = await this.application.modelProvider.resolveCurrentRequestSettings(authority, conversationId);
+    return this.rebuildPreviews.preview({
+      database: this.application.database,
+      contentStore: this.application.contentStore,
+      conversationId,
+      rootId: expectedRootId,
+      authority: settings === undefined ? authority : applyRequestCompressionSettings(authority, settings)
+    });
   }
 
   /** Reads an already-admitted exact maintenance command without consulting the mutable Context head. */
@@ -553,8 +621,10 @@ export class ReliableConversationRunner {
     commandId: string;
     conversationId: string;
     target?: CompressionCommandTarget;
+    sourceReplay?: 'immutable_provenance';
   }): Promise<ReliableManualCompressionResult | null> {
     this.requireOpen();
+    const sourceReplay = parseManualCompressionSourceReplay(input.sourceReplay, input.target);
     const commandSourceKey = `manual-compression:${input.commandId}:turn`;
     const existingReceipts = await listAllDomainRows(this.application.database, 'CommandReceipt', {
       source_kind: 'internal',
@@ -570,10 +640,11 @@ export class ReliableConversationRunner {
     });
     if (
       !descriptor
+      || descriptor.sourceReplay !== sourceReplay
       || (descriptor.version === 1 && input.target !== undefined)
       || (descriptor.version === 2 && (!input.target || !sameCompressionTarget(descriptor.target, input.target)))
     ) {
-      throw new Error('相同的手动压缩命令被用于不同的冻结目标。');
+      throw new Error('相同的手动压缩命令被用于不同的冻结目标或原始记录重建方式。');
     }
     const existing = (await listAllDomainRows(this.application.database, 'Turn', { id: existingTurnId }))[0];
     if (!existing || existing.conversation_id !== input.conversationId) {
@@ -774,6 +845,7 @@ export class ReliableConversationRunner {
     this.deferredRecovery.clear();
     this.terminationRecoveryFailures.clear();
     this.interruptCancellationSignaled.clear();
+    this.rebuildPreviews.clear();
   }
 
   private wake(result: TurnCommandResult): void {
@@ -967,38 +1039,47 @@ export class ReliableConversationRunner {
     const requests = (await listAllDomainRows(this.application.database, 'ModelRequest', {
       turn_id: slot.turnId
     })).sort((left, right) => compareBigInt(left.request_seq, right.request_seq));
-    if (requests.length > 1) {
-      throw new Error(`Manual compression Turn ${slot.turnId} contains multiple ModelRequests.`);
-    }
-    if (requests.length === 1) {
-      const request = requests[0];
-      if (request.authority_snapshot_id !== authoritySnapshotId) {
-        throw new Error('Manual compression ModelRequest is bound to another AuthoritySnapshot.');
-      }
-      const recipe = await this.readJsonContentObject(
-        requireId(request.recipe_object_id, 'Manual compression ModelRequest.recipe_object_id'),
-        `Manual compression ModelRequest ${String(request.id)} recipe`
+    if (requests.length > 6) throw new Error('Manual compression exceeded its bounded method chain.');
+    if (requests.length > 0) {
+      let headRootId: string | undefined;
+      const settingsSnapshotContentObjectId = requireId(
+        requests[0].settings_snapshot_object_id, 'Manual compression frozen request settings'
       );
-      if (!recipe) throw new Error('Manual compression ModelRequest recipe has an unexpected content type.');
-      if (
-        recipe.kind !== 'reliable-context-compression'
-        || recipe.trigger !== 'manual'
-        || recipe.requestKind !== 'context_compression_manual'
-      ) {
-        throw new Error(`Maintenance Turn ${slot.turnId} contains a non-manual-compression ModelRequest.`);
-      }
-      const frozenCount = requireSafePositiveInteger(
-        recipe.sourceSegmentCount,
-        'Manual compression recipe.sourceSegmentCount'
-      );
-      if (frozenCount > descriptor.compressSegmentCount) {
-        throw new Error('Manual compression recipe widened the requested frozen prefix.');
+      for (const [index, request] of requests.entries()) {
+        if (request.authority_snapshot_id !== authoritySnapshotId
+          || request.settings_snapshot_object_id !== settingsSnapshotContentObjectId) {
+          throw new Error('Manual compression methods do not share the same frozen authority/settings.');
+        }
+        if (index < requests.length - 1 && request.status !== 'terminal') {
+          throw new Error('Manual compression started a fallback before its predecessor terminated.');
+        }
+        const recipe = await this.readJsonContentObject(
+          requireId(request.recipe_object_id, 'Manual compression ModelRequest.recipe_object_id'),
+          `Manual compression ModelRequest ${String(request.id)} recipe`
+        );
+        if (!recipe || recipe.kind !== 'reliable-context-compression'
+          || recipe.trigger !== 'manual' || recipe.requestKind !== 'context_compression_manual') {
+          throw new Error(`Maintenance Turn ${slot.turnId} contains a non-manual-compression ModelRequest.`);
+        }
+        if (recipe.sourceReplay !== descriptor.sourceReplay) {
+          throw new Error('Manual compression replay changed its immutable source replay selection.');
+        }
+        const sourceRootId = requireId(recipe.sourceRootId, 'Manual compression source root');
+        const sourceCount = requireSafePositiveInteger(recipe.sourceSegmentCount, 'Manual compression prefix');
+        if ((headRootId && headRootId !== sourceRootId) || sourceCount > descriptor.compressSegmentCount) {
+          throw new Error('Manual compression fallback changed its frozen source or widened the selected prefix.');
+        }
+        if (descriptor.sourceReplay && (sourceCount !== descriptor.compressSegmentCount
+          || descriptor.version !== 2 || descriptor.target.kind !== 'current_head'
+          || sourceRootId !== descriptor.target.expectedRootId)) {
+          throw new Error('Immutable source rebuild replay changed its complete frozen context.');
+        }
+        headRootId = sourceRootId;
       }
       return {
-        descriptor,
-        authoritySnapshotId,
-        headRootId: requireId(recipe.sourceRootId, 'Manual compression recipe.sourceRootId'),
-        compressSegmentCount: frozenCount
+        descriptor, authoritySnapshotId, settingsSnapshotContentObjectId,
+        headRootId: requireId(headRootId, 'Manual compression source root'),
+        compressSegmentCount: descriptor.compressSegmentCount
       };
     }
 
@@ -1010,6 +1091,10 @@ export class ReliableConversationRunner {
     });
     if (heads.length !== 1) {
       throw new Error(`Manual compression Turn ${slot.turnId} lacks one current Context head.`);
+    }
+    if (descriptor.sourceReplay && (descriptor.version !== 2 || descriptor.target.kind !== 'current_head'
+      || heads[0].root_id !== descriptor.target.expectedRootId)) {
+      throw new Error('Immutable source rebuild lost its frozen current Context head.');
     }
     return {
       descriptor,
@@ -1080,10 +1165,12 @@ export class ReliableConversationRunner {
       const compression = await this.application.compressionCoordinator.coordinate({
         turnId: slot.turnId,
         authoritySnapshotId: frozen.authoritySnapshotId,
+        ...(frozen.settingsSnapshotContentObjectId ? { settingsSnapshotContentObjectId: frozen.settingsSnapshotContentObjectId } : {}),
         headRootId: frozen.headRootId,
         trigger: 'manual',
         compressSegmentCount: frozen.compressSegmentCount,
-        title: '手动上下文压缩'
+        ...(frozen.descriptor.sourceReplay ? { sourceReplay: frozen.descriptor.sourceReplay } : {}),
+        title: frozen.descriptor.sourceReplay ? '从原始记录重建摘要' : '手动上下文压缩'
       });
       if (await this.hasPendingTermination(slot.turnId)) {
         await this.settleManualCompressionInterrupted(slot, 'manual_context_compression_interrupted_after_provider');
@@ -1765,6 +1852,8 @@ function parseManualCompressionMaintenance(value: unknown): ManualCompressionMai
     descriptor.commandSourceKey,
     'Runtime maintenance commandSourceKey'
   );
+  const target = descriptor.version === 2 ? parseCompressionTarget(descriptor.target) : undefined;
+  const sourceReplay = parseManualCompressionSourceReplay(descriptor.sourceReplay, target);
   if (descriptor.version === 1) {
     return {
       kind: 'manual_context_compression',
@@ -1777,9 +1866,24 @@ function parseManualCompressionMaintenance(value: unknown): ManualCompressionMai
     kind: 'manual_context_compression',
     version: 2,
     compressSegmentCount,
-    target: parseCompressionTarget(descriptor.target),
+    target: target!,
+    ...(sourceReplay ? { sourceReplay } : {}),
     commandSourceKey
   };
+}
+
+function parseManualCompressionSourceReplay(
+  value: unknown,
+  target: CompressionCommandTarget | undefined
+): 'immutable_provenance' | undefined {
+  if (value === undefined) return undefined;
+  if (value !== 'immutable_provenance') {
+    throw new TypeError('Manual compression sourceReplay is invalid.');
+  }
+  if (target?.kind !== 'current_head') {
+    throw new TypeError('从原始记录重建摘要必须明确选择当前完整上下文。');
+  }
+  return value;
 }
 
 function parseCompressionTarget(value: unknown): CompressionCommandTarget {

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
+import { projectCompressionNotices, type CompressionNotice as CompressionWarningRecord } from '@shared/compressionNotices';
 import { useChat } from '@webview/composables/useChat';
+import { messageForkBlocked } from '@webview/composables/forkRequestLifecycle';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
@@ -20,9 +22,12 @@ import {
   reliableRetryStreamingActivityLabel
 } from '@webview/domain/reliableTransientActivity';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
+import { projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
 import MessageItem from './MessageItem.vue';
+import ReliableCollaborationCard from './ReliableCollaborationCard.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
+import ReliableCompressionWarningRow from './ReliableCompressionWarningRow.vue';
 import TimelineActivityRow from './TimelineActivityRow.vue';
 import {
   TIMELINE_MOUNT_LIMIT,
@@ -56,6 +61,9 @@ const {
   conversationActionPending,
   conversationActionLabel,
   conversationActionNotice,
+  conversationForkReadyNotice,
+  openForkReadyNotice,
+  dismissForkReadyNotice,
   forkPendingTargetIds,
   currentAuthoritySelection
 } = useChat();
@@ -105,6 +113,9 @@ const canRequestEarlierHistory = computed(() =>
   && (earliestLoadedFloor.value > 1 || hasLoadedFloorGap.value)
 );
 const hasEarlierSegment = computed(() => segmentStart.value > 0 || canRequestEarlierHistory.value);
+// The loaded rows begin at the Conversation's first message: nothing earlier exists, whatever a
+// later gap holds.
+const loadedFromFirstMessage = computed(() => earliestLoadedFloor.value <= 1);
 const hasLaterSegment = computed(() => segmentStart.value + TIMELINE_MOUNT_LIMIT < messages.value.length);
 const earlierSegmentLabel = computed(() => feed.historyLoading
   ? '正在加载更早内容'
@@ -128,6 +139,34 @@ const terminationRowsByAnchor = computed(() => {
   }
   return result;
 });
+
+// Collaboration envelopes from or to other Conversations, placed at the Turn they belong to.
+const collaborationTimeline = computed(() => projectCollaborationTimeline({
+  conversationId: conversationId.value,
+  records: feed.records,
+  messages: messages.value,
+  turnIdByMessageId: projection.value.turnIdByMessageId,
+  removedConversationIds: feed.removedConversationIds,
+  loadedFromFirstMessage: loadedFromFirstMessage.value
+}));
+
+// With no message every card is below the messages; the empty hint never stands in for one.
+const hasCollaborationCards = computed(() =>
+  collaborationTimeline.value.turnWithoutMessage.length > 0 || collaborationTimeline.value.unbound.length > 0);
+
+const compressionNotices = computed(() => projectCompressionNotices({
+  conversationId: conversationId.value, records: feed.records, messages: messages.value,
+  turnIdByMessageId: projection.value.turnIdByMessageId,
+  placedTerminationIds: Object.values(projection.value.terminationByMessageId).map((item) => item.id)
+}));
+const compressionWarningsByAnchor = computed(() => Object.fromEntries(
+  Object.entries(compressionNotices.value.byAnchor).map(([anchor, notices]) => [anchor,
+    notices.filter((notice) => !timelinePresentation.isSuppressed(conversationId.value, 'compression-warning', notice.id))])
+));
+const unanchoredCompressionWarnings = computed(() => compressionNotices.value.unanchored.filter((notice) =>
+  !timelinePresentation.isSuppressed(conversationId.value, 'compression-warning', notice.id)));
+const unanchoredTurnFailures = computed(() => compressionNotices.value.unanchoredFailures.filter((notice) =>
+  !timelinePresentation.isSuppressed(conversationId.value, 'turn-termination', notice.id)));
 
 watch(
   () => props.followLatest,
@@ -482,6 +521,16 @@ function deleteFrom(message: MessageRecord): void {
   deleteMessagesFrom(message.conversationId, message.id);
 }
 
+function forkBlocked(message: MessageRecord): boolean {
+  // A fork copies completed turns only; messages of the running turn become forkable once it ends.
+  return messageForkBlocked(message, {
+    activeTurnId: reliableText(activeTurn.value?.id),
+    pendingMessageIds: forkPendingTargetIds.value,
+    revisionIdByMessageId: projection.value.messageRevisionIdByMessageId,
+    turnIdByMessageId: projection.value.turnIdByMessageId
+  });
+}
+
 function forkFrom(message: MessageRecord): void {
   const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
   if (revisionId) forkConversationFrom(message.conversationId, message.id, revisionId);
@@ -521,6 +570,10 @@ function dismissTermination(termination: RunTerminationRecord): void {
 
 function dismissCompression(block: Record<string, unknown>): void {
   timelinePresentation.suppress(conversationId.value, 'compression-block', reliableText(block.id));
+}
+
+function dismissCompressionWarning(warning: CompressionWarningRecord): void {
+  timelinePresentation.suppress(conversationId.value, 'compression-warning', warning.id);
 }
 
 function messageDetailDemandSignature(message: MessageRecord): string {
@@ -634,6 +687,12 @@ function messageRenderKey(message: MessageRecord): string {
       >
         {{ retryBoundaryLabel }}
       </p>
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.beforeMessage[message.id] ?? []"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
+      />
       <MessageItem
         :message="message"
         :run-id="projection.turnIdByMessageId[message.id]"
@@ -648,7 +707,7 @@ function messageRenderKey(message: MessageRecord): string {
         :mutation-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
         :retry-blocked="retryBlocked(message)"
         :compact-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
-        :fork-blocked="forkPendingTargetIds.has(message.id) || !projection.messageRevisionIdByMessageId[message.id] || message.status === 'streaming'"
+        :fork-blocked="forkBlocked(message)"
         :pending-label="conversationActionLabel ?? '正在提交操作'"
         :floor-number="timelineFloor(message, index)"
         @edit-message="emit('edit-message', message, deleteCount(message))"
@@ -664,12 +723,25 @@ function messageRenderKey(message: MessageRecord): string {
         :termination="termination"
         @dismiss="dismissTermination(termination)"
       />
+      <ReliableCompressionWarningRow
+        v-for="warning in compressionWarningsByAnchor[message.id] ?? []"
+        :key="warning.id"
+        :title="warning.title"
+        :detail="warning.detail"
+        @dismiss="dismissCompressionWarning(warning)"
+      />
       <ReliableCompressionCard
         v-for="block in compressionBlocksByAnchor[message.id] ?? []"
         :key="`compression:${String(block.id)}`"
         :block="block"
         :data-timeline-row-key="`compression:${String(block.id)}`"
         @dismiss="dismissCompression(block)"
+      />
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.afterMessage[message.id] ?? []"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
       />
     </div>
     <button
@@ -687,6 +759,28 @@ function messageRenderKey(message: MessageRecord): string {
     >
       {{ retryBoundaryLabel }}
     </p>
+    <template v-if="!hasLaterSegment">
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.turnWithoutMessage"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
+      />
+      <ReliableCompressionWarningRow v-for="warning in unanchoredCompressionWarnings"
+        :key="warning.id" :title="warning.title" :detail="warning.detail"
+        @dismiss="dismissCompressionWarning(warning)" />
+      <ReliableCompressionWarningRow v-for="failure in unanchoredTurnFailures"
+        :key="failure.id" :title="failure.title" :detail="failure.detail" severity="error"
+        @dismiss="timelinePresentation.suppress(conversationId, 'turn-termination', failure.id)" />
+    </template>
+    <template v-if="!hasLaterSegment">
+      <ReliableCollaborationCard
+        v-for="card in collaborationTimeline.unbound"
+        :key="`collaboration:${card.messageId}`"
+        :card="card"
+        :data-timeline-row-key="`collaboration:${card.messageId}`"
+      />
+    </template>
     <ReliableCompressionCard
       v-if="activeCompressionCard && !hasLaterSegment"
       :key="`compression:${String(activeCompressionCard.id)}`"
@@ -702,7 +796,12 @@ function messageRenderKey(message: MessageRecord): string {
     <p v-if="conversationActionNotice" class="reliable-action-notice" role="status">
       {{ conversationActionNotice }}
     </p>
-    <div v-if="messages.length === 0 && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
+    <p v-if="conversationForkReadyNotice" class="reliable-action-notice reliable-fork-ready" role="status">
+      <span>{{ conversationForkReadyNotice.replayed ? '之前的分支请求已完成，分支已创建。' : '分支已创建。' }}</span>
+      <button type="button" @click="openForkReadyNotice">打开分支</button>
+      <button type="button" aria-label="关闭分支提示" @click="dismissForkReadyNotice">关闭</button>
+    </p>
+    <div v-if="messages.length === 0 && !hasCollaborationCards && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
       <p class="reliable-message-empty">{{ emptyHint }}</p>
     </div>
   </div>
@@ -766,6 +865,31 @@ function messageRenderKey(message: MessageRecord): string {
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-sm);
   text-align: center;
+}
+
+.reliable-fork-ready {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.reliable-fork-ready button {
+  padding: 1px var(--space-2);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  cursor: pointer;
+}
+
+.reliable-fork-ready button:hover,
+.reliable-fork-ready button:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--vscode-foreground) 45%, transparent);
+  outline-offset: 1px;
+  background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
 }
 
 .reliable-message-empty-container {

@@ -107,6 +107,40 @@ export class ConversationAttachmentHandleRegistry {
     };
   }
 
+  /**
+   * Read-only counterpart of ensure(): existing handles as they are, and the handles ensure() would
+   * allocate next for Attachments that have none yet. Nothing is written.
+   */
+  public async peek(
+    conversationIdInput: string,
+    catalogInput: readonly AttachmentCatalogEntry[]
+  ): Promise<ConversationAttachmentHandleProjection> {
+    const conversationId = requireText(conversationIdInput, 'conversationId');
+    const catalog = normalizeAttachmentCatalog(catalogInput, 'attachmentCatalog');
+    if (catalog.length === 0) return { entries: [] };
+    const links = validateLinks(await this.readConversationLinks(conversationId), conversationId);
+    let nextSequence = [...links.values()].reduce((highest, link) => {
+      const sequence = requirePositiveBigInt(link.handle_seq, 'ConversationAttachmentHandleLink.handle_seq');
+      return sequence > highest ? sequence : highest;
+    }, 0n);
+    return {
+      entries: catalog.map((entry): ModelHandleEntry => {
+        const link = links.get(entry.attachmentId);
+        const sequence = link
+          ? requirePositiveBigInt(link.handle_seq, 'ConversationAttachmentHandleLink.handle_seq')
+          : (nextSequence += 1n);
+        return {
+          kind: 'attachment',
+          ref: `F${sequence.toString()}`,
+          target: entry.attachmentId,
+          name: entry.name,
+          mimeType: entry.mimeType,
+          sizeBytes: entry.sizeBytes
+        };
+      })
+    };
+  }
+
   private readConversationLinks(conversationId: string): Promise<DomainRow[]> {
     return listAllDomainRows(this.database, 'ConversationAttachmentHandleLink', {
       conversation_id: conversationId

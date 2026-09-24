@@ -16,18 +16,28 @@ import {
   type LlmPromptCacheTtl,
   type LlmProviderHeadersRecord,
   type LlmRequestBodyRecord,
-  type LlmToolCallFormat
+  type LlmToolCallFormat,
+  type OpenAICompatibleThinkingFormat
 } from '@shared/protocol';
 import {
-  isAstraModel,
+  OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS,
+  describeOpenAICompatibleDialect
+} from '@shared/openAICompatibleDialect';
+import { openAICompatibleThinkingProbeEvidence, resolveProviderOpenAICompatibleDialect } from '@shared/modelCapabilities';
+import { OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS, openAICompatibleThinkingProbeSummary } from '@shared/openAICompatibleThinkingProbe';
+import {
+  gpt6ChatCompletionsToolRestriction,
+  isGpt6FamilyModel,
   isOfficialOpenAIChannel,
   normalizeOpenAIResponsesNativeSettings,
-  openAIResponsesNativeCapabilities
+  openAIResponsesNativeCapabilities,
+  supportsOpenAIReasoningMode
 } from '@shared/openAIResponsesCapabilities';
 import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
+import { IconFlask } from '@tabler/icons-vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
 import LlmHeadersSettings from './parameters/LlmHeadersSettings.vue';
 import LlmParameterSettings from './parameters/LlmParameterSettings.vue';
@@ -37,10 +47,13 @@ const TOKEN_STEP = 1_000;
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
   'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
+  | 'claudeTurnScopedReminders' | 'openaiCompatibleThinkingFormat'
 >>;
 
 const props = defineProps<{
   config: LlmProviderConfigRecord;
+  /** “测试这个模型”进行中或失败的状态；不传表示没有在测试。 */
+  thinkingProbe?: { status: 'running' | 'failed'; message?: string };
 }>();
 
 const systemPromptPrefixScroller = ref<HTMLTextAreaElement | null>(null);
@@ -53,11 +66,69 @@ const emit = defineEmits<{
   (event: 'update-prompt-cache', value: LlmPromptCacheConfigRecord | undefined): void;
   (event: 'update-native-responses', value: OpenAIResponsesNativeSettings | undefined): void;
   (event: 'update-headers', value: LlmProviderHeadersRecord | undefined): void;
+  /** 点了“测试这个模型”：由上层确认后测试 config.model。 */
+  (event: 'test-thinking'): void;
 }>();
 
 const toolCallFormatOptions: SettingsDropdownOption[] = [
   { value: 'function-call', label: 'Function Call' }
 ];
+
+const THINKING_FORMATS: readonly OpenAICompatibleThinkingFormat[] = ['deepseek', 'enable_thinking', 'reasoning_effort', 'omit'];
+/** 自动识别按测试结果、接口地址和模型 ID 得出，这里直接把正在编辑的模型会得出的结果写在选项说明里。 */
+const thinkingFormatOptions = computed<SettingsDropdownOption[]>(() => [
+  {
+    value: 'auto',
+    label: '自动识别（推荐）',
+    description: describeOpenAICompatibleDialect(resolveProviderOpenAICompatibleDialect(props.config, props.config.model, { manual: null }))
+  },
+  ...THINKING_FORMATS.map((value) => ({ value, label: OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS[value] }))
+]);
+// 这个编辑器编辑的就是 config 上的写法（模型专属配置已按“模型级优先”合并好）。
+const thinkingFormatSummary = computed(() => describeOpenAICompatibleDialect(
+  resolveProviderOpenAICompatibleDialect(props.config, props.config.model, { manual: props.config.openaiCompatibleThinkingFormat ?? null })
+));
+
+/** “测试这个模型”的结果（身份匹配才显示）与测试中、失败的状态。 */
+const thinkingProbeRunning = computed(() => props.thinkingProbe?.status === 'running');
+const thinkingProbeText = computed(() => {
+  if (props.thinkingProbe?.status === 'running') {
+    return `正在测试：最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求，一般几秒到几十秒。`;
+  }
+  if (props.thinkingProbe?.status === 'failed' && props.thinkingProbe.message) return props.thinkingProbe.message;
+  const evidence = openAICompatibleThinkingProbeEvidence(props.config, props.config.model);
+  if (!evidence) {
+    return `还没有测试。点“测试这个模型”会向 ${props.config.model || '这个模型'} 发最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求，测出它用哪种思考参数写法、能不能关闭思考、接受哪些思考强度。`;
+  }
+  const summary = openAICompatibleThinkingProbeSummary(evidence);
+  return props.config.openaiCompatibleThinkingFormat ? `${summary}。已手动指定写法，发送时不采用测试结果。` : `${summary}。`;
+});
+
+function updateThinkingFormat(value: string): void {
+  emit('update-field', {
+    openaiCompatibleThinkingFormat: THINKING_FORMATS.includes(value as OpenAICompatibleThinkingFormat)
+      ? value as OpenAICompatibleThinkingFormat
+      : undefined
+  });
+}
+
+/**
+ * GPT-6 在 Chat Completions 上的工具调用限制（Using GPT-6 “Update API and model parameters”、Sol / Luna 模型页）：
+ * Astra 的工具调用需要 Responses；Sol、Luna 只有 reasoning_effort 为 none 时才能调用工具。只提示，不改写推理强度。
+ */
+const chatCompletionsToolHint = computed(() => {
+  switch (gpt6ChatCompletionsToolRestriction(props.config.provider, props.config.model)) {
+    case 'unsupported':
+      return 'GPT-6 Astra 走 Chat Completions 时不支持工具调用（官方要求工具调用使用 Responses），带工具的请求会被拒绝，建议改用 OpenAI Responses 渠道。';
+    case 'requires_none_effort':
+      return '该模型走 Chat Completions 时工具调用需要推理强度为 none，推理强度不是 none（含未设置时的默认 medium）时带工具的请求会被拒绝。LimCode 不会自动改写推理强度，建议改用 OpenAI Responses 渠道。';
+    default:
+      // GPT-5.6（GPT-5.6 与 GPT-6 官方 id 里不属于 GPT-6 家族的那些）：官方文档没写，已有报错实例。
+      return props.config.provider === 'openai-compatible' && supportsOpenAIReasoningMode(props.config.model) && !isGpt6FamilyModel(props.config.model)
+        ? 'GPT-5.6 走 Chat Completions 带工具时，推理强度不是 none 可能被拒绝（报错“Function tools with reasoning_effort are not supported”）；OpenAI 官方文档没有写明这一限制。遇到时把推理强度设为 none，或改用 OpenAI Responses 渠道。'
+        : '';
+  }
+});
 const openaiResponsesTransportOptions: SettingsDropdownOption[] = [
   {
     value: 'http',
@@ -85,13 +156,13 @@ const promptCacheModeOptions: SettingsDropdownOption[] = [
   {
     value: 'explicit',
     label: '显式断点',
-    description: '发送 prompt_cache_options，并在聊天记录末尾写入 prompt_cache_breakpoint；需 LLM 支持。'
+    description: '发送 prompt_cache_options 并放置缓存断点；只有 GPT-5.6 及之后的模型支持，其他模型自动改用缓存 Key。'
   }
 ];
 const promptCacheDescription = computed(() => {
   if (props.config.provider === 'openai-responses') {
     return promptCache.value.mode === 'explicit'
-      ? '显式断点模式会发送 prompt_cache_options，并在聊天记录末尾添加断点；部分 LLM 或兼容渠道不支持该参数。'
+      ? '显式断点模式会发送 prompt_cache_options 并放置缓存断点：HTTP 请求把断点放在本轮提醒等每次都会变的内容之前；WebSocket 连续请求在最新的消息和工具结果上放断点，服务端保留此前的断点。只有 GPT-5.6 及之后的模型支持，其他模型自动改用缓存 Key 模式；部分兼容渠道可能不支持该参数。'
       : '缓存 Key 模式会为同一渠道、LLM 和对话自动生成稳定的 prompt_cache_key；不发送显式断点或缓存时间参数。';
   }
   if (props.config.provider === 'claude') {
@@ -198,23 +269,27 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
   return defaultLlmPromptCacheTtlForProvider(props.config.provider);
 }
 
-const nativeModelSupported = computed(() => props.config.provider === 'openai-responses' && isAstraModel(props.config.model));
+const nativeModelSupported = computed(() => props.config.provider === 'openai-responses' && isGpt6FamilyModel(props.config.model));
 const nativeOfficialChannel = computed(() => isOfficialOpenAIChannel(props.config.baseUrl));
 const nativeSettings = computed(() => normalizeOpenAIResponsesNativeSettings(props.config.nativeResponses));
-/** 原生能力总闸：精确 Astra 模型，且官方渠道或显式确认中继支持；显式禁用永远关闭。 */
+/** 原生能力总闸：精确的 GPT-6 家族模型（Astra、Sol、Luna），且官方渠道或显式确认中继支持；显式禁用永远关闭。 */
 const nativeGateAvailable = computed(() => {
   if (!nativeModelSupported.value) return false;
   const enabled = nativeSettings.value?.enabled;
   if (enabled === false) return false;
   return enabled === true || nativeOfficialChannel.value;
 });
+const nativeReasoningMode = computed(() => props.config.generationConfig?.thinkingConfig?.reasoningMode);
 const nativeCapabilities = computed(() => openAIResponsesNativeCapabilities({
   provider: props.config.provider,
   model: props.config.model,
   baseUrl: props.config.baseUrl,
   transport: props.config.openaiResponsesTransport,
-  nativeResponses: props.config.nativeResponses
+  nativeResponses: props.config.nativeResponses,
+  ...(nativeReasoningMode.value ? { reasoningMode: nativeReasoningMode.value } : {})
 }));
+/** 官方文档：configuration_update 只支持标准推理模式（standard）与单 Agent。 */
+const nativeReasoningUpdatesBlockedByPro = computed(() => nativeGateAvailable.value && nativeReasoningMode.value === 'pro');
 const nativeWebsocketTransport = computed(() => (props.config.openaiResponsesTransport ?? 'http') === 'websocket');
 const nativeEnabledState = computed(() => {
   const enabled = nativeSettings.value?.enabled;
@@ -224,12 +299,12 @@ const nativeEnabledStateOptions: SettingsDropdownOption[] = [
   {
     value: 'default',
     label: '按渠道默认',
-    description: '官方 OpenAI 渠道视为支持 Astra 原生能力；第三方中继默认不使用。'
+    description: '官方 OpenAI 渠道视为支持 GPT-6 原生能力；第三方中继默认不使用。'
   },
   {
     value: 'enabled',
     label: '确认支持并启用',
-    description: '显式确认该渠道或中继支持 Astra 原生 Responses 能力（异步工具、转向、动态推理、多路复用）。'
+    description: '显式确认该渠道或中继支持 GPT-6 原生 Responses 能力（异步工具、转向、动态推理、多路复用）。'
   },
   {
     value: 'disabled',
@@ -252,13 +327,13 @@ const nativeCapabilityRows = computed(() => [
 const nativeGateHint = computed(() => {
   if (props.config.provider !== 'openai-responses') return '';
   if (!nativeModelSupported.value) {
-    return '原生能力只对精确的 gpt-6-astra（含日期版本）开放，不会从其它 gpt-* 名称推断；当前 LLM 使用普通 Responses 行为。';
+    return '原生能力只对精确的 gpt-6-astra、gpt-6-sol、gpt-6-luna（含日期版本）开放，不会从其它 gpt-* 名称或网关别名推断；当前 LLM 使用普通 Responses 行为。';
   }
   if (nativeSettings.value?.enabled === false) return '原生能力已显式禁用；当前 LLM 使用普通 Responses 行为。';
   if (!nativeOfficialChannel.value && nativeSettings.value?.enabled !== true) {
     return '第三方中继默认不使用原生能力；确认该中继支持后，将上方设置改为「确认支持并启用」。';
   }
-  return '原生能力只影响 Astra 原生请求；进行中的请求以发起时冻结的能力为准，修改设置不会改变已发出的请求。';
+  return '原生能力适用于 GPT-6 Astra、Sol、Luna 的原生请求；进行中的请求以发起时冻结的能力为准，修改设置不会改变已发出的请求。';
 });
 
 function emitNativeResponses(next: OpenAIResponsesNativeSettings): void {
@@ -295,6 +370,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         title="选择工具调用格式"
         @update:model-value="updateToolCallFormat"
       />
+      <span v-if="chatCompletionsToolHint" class="stream-checkbox-text chat-completions-tool-hint">{{ chatCompletionsToolHint }}</span>
     </label>
 
     <label v-if="config.provider === 'openai-responses'" class="global-settings-field openai-responses-transport-field">
@@ -389,10 +465,48 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
       />
     </label>
 
+    <div v-if="config.provider === 'claude'" class="global-settings-field stream-field claude-turn-scoped-reminders-field">
+      <span>轮内系统消息提醒</span>
+      <div class="stream-checkbox-row">
+        <LcCheckbox
+          :model-value="config.claudeTurnScopedReminders === true"
+          size="sm"
+          aria-label="每轮提醒改用轮内系统消息"
+          @update:model-value="emit('update-field', { claudeTurnScopedReminders: $event })"
+        >
+          <span class="stream-checkbox-enable">启用</span>
+        </LcCheckbox>
+      </div>
+      <span class="stream-checkbox-text">把每轮提醒改为官方轮内系统消息，保持历史前缀不变，提升缓存命中并保留思考；需要模型与渠道支持轮内系统消息，扩展会自动带上所需 beta 头。渠道明确拒绝时自动退回原来的提醒方式。对话进行到一半时打开或关闭，下一次请求的缓存会失效一次，之前的提醒不会被补进历史。</span>
+    </div>
+
+    <div v-if="config.provider === 'openai-compatible'" class="global-settings-field global-settings-field-wide openai-compatible-thinking-format-field">
+      <span>思考参数写法</span>
+      <SettingsDropdown
+        :model-value="config.openaiCompatibleThinkingFormat ?? 'auto'"
+        :options="thinkingFormatOptions"
+        title="选择思考参数的发送写法"
+        @update:model-value="updateThinkingFormat"
+      />
+      <span class="stream-checkbox-text">当前发送（{{ config.model }}）：{{ thinkingFormatSummary }}。依次看手动指定、测试结果、接口地址和模型 ID；只有识别不对（例如中转站改了模型名）时才需要手动指定。</span>
+      <div class="thinking-probe-row">
+        <button
+          type="button"
+          class="model-manager-button thinking-probe-button"
+          :disabled="thinkingProbeRunning || !config.model"
+          @click="emit('test-thinking')"
+        >
+          <IconFlask stroke="2" aria-hidden="true" />
+          <span>{{ thinkingProbeRunning ? '测试中…' : '测试这个模型' }}</span>
+        </button>
+        <span class="stream-checkbox-text thinking-probe-text" :class="{ 'is-failed': thinkingProbe?.status === 'failed' }">{{ thinkingProbeText }}</span>
+      </div>
+    </div>
+
     <template v-if="config.provider === 'openai-responses'">
       <div class="global-settings-field global-settings-field-wide native-capabilities-field">
         <span class="native-capabilities-heading">
-          <span>Astra 原生能力</span>
+          <span>GPT-6 原生能力</span>
           <HoverTooltipPanel
             panel-title="原生能力状态"
             :rows="nativeCapabilityRows"
@@ -412,10 +526,10 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
           :model-value="nativeEnabledState"
           :options="nativeEnabledStateOptions"
           :disabled="!nativeModelSupported"
-          title="选择 Astra 原生能力支持方式"
+          title="选择 GPT-6 原生能力支持方式"
           @update:model-value="updateNativeEnabledState"
         />
-        <span class="stream-checkbox-text">第三方中继选择「确认支持并启用」，即确认该中继支持 Astra 原生能力。</span>
+        <span class="stream-checkbox-text">第三方中继选择「确认支持并启用」，即确认该中继支持 GPT-6（Astra、Sol、Luna）原生能力。</span>
       </label>
 
       <div class="global-settings-field stream-field">
@@ -455,7 +569,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         <div class="stream-checkbox-row">
           <LcCheckbox
             :model-value="nativeCapabilities.reasoningUpdates"
-            :disabled="!nativeGateAvailable"
+            :disabled="!nativeGateAvailable || nativeReasoningUpdatesBlockedByPro"
             size="sm"
             aria-label="启用动态推理更新"
             @update:model-value="updateNativeFlag('reasoningUpdates', $event)"
@@ -464,6 +578,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
           </LcCheckbox>
         </div>
         <span class="stream-checkbox-text">允许在两个响应之间调整推理档位。Limcode 的本地上下文压缩与动态推理兼容：压缩请求不携带推理更新，压缩完成后自动恢复当前档位（缓存会重置并可观察）；与服务端自动压缩不兼容的机制 Limcode 不使用。</span>
+        <span v-if="nativeReasoningUpdatesBlockedByPro" class="stream-checkbox-text">推理模式为 pro 时不可用：官方只在标准推理模式（standard）下支持动态推理更新。</span>
       </div>
 
       <div class="global-settings-field stream-field">
@@ -484,7 +599,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
 
       <div v-if="nativeCapabilities.explicitCaching" class="global-settings-field stream-field native-explicit-cache-field">
         <span>显式缓存</span>
-        <span class="stream-checkbox-text">Astra 原生连接保留显式缓存参数：prompt_cache_options（30 分钟 TTL）与内容缓存断点不会被剥离；本地上下文压缩后缓存重置，并随后续请求重建。在上方「提示词缓存」中选择缓存模式。</span>
+        <span class="stream-checkbox-text">GPT-6 原生连接保留显式缓存参数：prompt_cache_options（30 分钟 TTL）与内容缓存断点不会被剥离；本地上下文压缩后缓存重置，并随后续请求重建。在上方「提示词缓存」中选择缓存模式。</span>
       </div>
     </template>
 
@@ -625,6 +740,26 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-xs);
   line-height: 1.45;
+}
+
+.thinking-probe-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.thinking-probe-button {
+  flex: none;
+}
+
+.thinking-probe-text {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.thinking-probe-text.is-failed {
+  color: var(--vscode-errorForeground, var(--vscode-descriptionForeground));
 }
 
 .native-capabilities-heading {

@@ -1,4 +1,8 @@
 import { createHash } from 'crypto';
+import { discoverAnthropicModels } from './modelCapabilityDiscovery';
+import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
+import { anthropicModelReasoningCapability, resolveProviderModelCapabilities } from '../../shared/modelCapabilities';
+import { frozenSummaryReasoning, summaryConfiguredRequestBody, summaryRequestBody } from './summaryReasoning';
 import { associateDebugCapture, captureDebug, debugCaptureSources, debugSource, DebugHttpObservation, getDebugCaptureContext, type DebugCaptureRecorder } from '../reliableKernel/debugCapture/observer';
 import {
   groupAtomicMessageContents,
@@ -7,10 +11,40 @@ import {
 import { estimateTokenCount, sliceByTokens } from 'tokenx';
 import { mapWithBoundedConcurrency } from './boundedConcurrency';
 import { createProxyFetch } from './proxyFetch';
-import { createTerminalValidatedFetch } from './terminalValidatedFetch';
+import { createTerminalValidatedFetch, type ResponsesTerminalEvidence } from './terminalValidatedFetch';
 import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
 import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 import { installProviderCompatibility } from './geminiProviderAdaptation';
+import { adaptClaudeThinkingForFamily, claudeThinkingFamilyProfile, type ClaudeThinkingFamilyProfile } from './claudeThinkingAdaptation';
+import {
+  adaptGpt6NoneCapableGenerationConfig,
+  adaptGpt6RequestBodyReasoningEffort,
+  adaptGpt6SamplingForReasoningEffort,
+  GPT6_ASTRA_EFFORT_MAPPING,
+  GPT6_NONE_CAPABLE_EFFORT_MAPPING,
+  isGpt6NoneCapableParameterTarget
+} from './gpt6ParameterAdaptation';
+import {
+  applyLearnedRequestAdaptations,
+  claudeTurnScopedRemindersFallenBack,
+  createProviderRequestAdaptationRetry,
+  createProviderRequestAdaptationSession,
+  userRequestBodyRejectionMessage,
+  type ProviderRequestAdaptationRetry,
+  type ProviderRequestAdaptationSession,
+  installEncodedRequestPostProcessor,
+  type ProviderRequestTarget
+} from './providerParameterAdaptation';
+import {
+  layoutTurnReminderContents,
+  withClaudeCacheBreakpointBeforeVolatileTail,
+  withClaudeTurnScopedSystemBeta,
+  type TurnReminderLayout
+} from './claudeTurnScopedReminders';
+import {
+  withOpenAIResponsesCacheBreakpointBeforeVolatileTail,
+  type OpenAIResponsesHttpReplay
+} from './openAIResponsesTailCacheBreakpoint';
 import {
   assertCanonicalProviderToolContext,
   cloneInlineDataPart,
@@ -62,7 +96,8 @@ import { LlmEventType } from '../world/modules/llm/events';
 import {
   isAstraModel,
   normalizeOpenAIResponsesNativeSettings,
-  openAIResponsesNativeCapabilities
+  openAIResponsesNativeCapabilities,
+  supportsOpenAIExplicitPromptCache
 } from '../../shared/openAIResponsesCapabilities';
 import type {
   OpenAIResponsesNativeCapabilities,
@@ -75,6 +110,7 @@ import type {
   OpenAIResponsesNativeResultAdmission
 } from './openAIResponsesNativeControl';
 import { ATTACHMENT_OBSERVATION_PROMPT_REVISION } from '../world/modules/llm/contracts';
+import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import type {
   LlmCompactDryRunResult,
   LlmCompactRequest,
@@ -110,8 +146,10 @@ import {
   createDefaultLlmPromptCacheConfig,
   defaultLlmPromptCacheModeForProvider,
   defaultLlmPromptCacheTtlForProvider,
-  isPromptCacheSupportedProvider
+  isPromptCacheSupportedProvider,
+  canonicalLlmProviderKind
 } from '../../shared/protocol';
+import { adaptOpenAICompatibleDialect, libraryProviderKind } from './openAICompatibleDialectAdaptation';
 import {
   ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY,
   isUnavailableAttachmentObservation,
@@ -226,6 +264,8 @@ export interface LlmProviderOptions {
   resolveAttachment?: (input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }) => Promise<InlineDataPart | undefined>;
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
   onCompressionProgress?: () => void;
+  /** 内部：本次压缩请求的自适配状态（原生压缩的立即重发据此判断上一次实际发出了什么）。 */
+  requestAdaptationSession?: ProviderRequestAdaptationSession;
 }
 interface RetryControl {
   cancelRequested: boolean;
@@ -405,25 +445,46 @@ export async function startLlmProvider(
       model: settings.model,
       baseUrl: settings.baseUrl,
       transport: settings.openaiResponsesTransport,
-      nativeResponses: settings.nativeResponses
+      nativeResponses: settings.nativeResponses,
+      ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, settings))
     });
 
     const unified = await importUnifiedLlmProvider();
     const registry = unified.createBootstrapExtensionRegistry();
     const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
     const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+    const nativeHttpWireAdmission: OpenAIResponsesNativeHttpWireAdmission = { toolResultCallIds: [] };
+    const baseProviderFetch = proxyFetch ?? fetch;
+    const observeNativeHttpFetch: typeof fetch = async (input, init) => {
+      // Observe the final encoded wire body, including requestBody overrides. Unified contents
+      // and providerContext are not evidence that a result actually entered this POST.
+      const callIds = settings.provider === 'openai-responses' && nativeCapabilities.asyncTools
+        && !isOpenAIResponsesWebSocketMode(settings)
+        ? nativeHttpWireToolResultCallIds(init?.body)
+        : [];
+      const response = await baseProviderFetch(input, init);
+      nativeHttpWireAdmission.toolResultCallIds = callIds;
+      return response;
+    };
     const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
-    const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider, {
-      createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined
+    // Responses HTTP：本次尝试线上看到的终态（每次尝试开始时清空），用来判断空回复是不是 incomplete。
+    const responsesTerminal: ResponsesTerminalObservation = {};
+    const providerFetch = createTerminalValidatedFetch(observeNativeHttpFetch, settings.provider, {
+      createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined,
+      onResponsesTerminal: (terminal) => { responsesTerminal.current = terminal; }
     });
-    const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+    const headers = headersForProviderContext(
+      settings,
+      request.contents,
+      mergeHeaders(await resolveMaybe(options.headers), settings.headers)
+    );
     const requestBody = withoutNativeServerSideCompaction(
       requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId),
       request.contents
     );
     if (proxy) console.log(`[LimCode] LLM proxy enabled: ${proxy}`);
     const providerConfig = {
-      provider: settings.provider,
+      provider: libraryProviderKind(settings),
       model: settings.model,
       apiKey: settings.apiKey,
       baseUrl: settings.baseUrl,
@@ -435,46 +496,78 @@ export async function startLlmProvider(
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
     };
-    const provider = installProviderCompatibility(
+    const claudeTurnScoped = claudeTurnScopedRemindersRequested(request, settings);
+    const volatileTailCount = volatileTailContentCount(request);
+    // 本请求的自适配状态：保留思考处理从这个对话已持久化的选择开始。
+    const adaptationSession = createProviderRequestAdaptationSession({
+      conversationId: request.conversationId,
+      claudeThinkingBinding: request.claudeThinkingBinding
+    });
+    // WebSocket 模式下 provider 只用来取 WebSocket 帧（续接链）；回退用的 HTTP provider 是无状态完整重放。
+    // HTTP 原生会话里同一个 provider 发首请求与续接请求（续接在原内容后追加），断点按会话方式放。
+    const provider = installRequestAdaptation(installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
-    );
+    ), settings, claudeTurnScoped, volatileTailCount, isOpenAIResponsesWebSocketMode(settings),
+    openAIResponsesHttpReplay(settings, nativeCapabilities), adaptationSession);
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
-      ? installProviderCompatibility(unified.createLLMFromConfig({
+      ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
+          ...unifiedPromptCacheConfigEntry(settings, requestBody, false),
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model)
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount, false,
+        'stateless', adaptationSession)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
     const maxRetries = normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
+    const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(settings), {
+      claudeTurnScopedReminders: claudeTurnScoped,
+      userRequestBodyKeys: Object.keys(settings.requestBody ?? {})
+    }, adaptationSession);
     let retryCount = 0;
     let sawRetry = false;
 
     while (true) {
+      // 本次尝试发出的任何事件（输出、思考、工具调用、原生控制）都已交给下游；之后再立即重发会把它们重复一遍。
+      let attemptEmitted = false;
+      const attemptEmit: Emit = (event) => {
+        attemptEmitted = true;
+        streamEmit(event);
+      };
+      responsesTerminal.current = undefined;
       try {
         await runLlmAttempt(
           request,
-          streamEmit,
+          attemptEmit,
           settings,
           provider,
           httpFallbackProvider,
           unified,
           options,
+          nativeHttpWireAdmission,
           signal,
           sawRetry ? { retryAttempt: retryCount, retryMaxAttempts: maxRetries } : undefined,
           proxy,
           nativeCapabilities,
-          controls
+          controls,
+          responsesTerminal,
+          adaptationSession
         );
         return;
       } catch (error) {
         if (isRequestAbort(signal)) return;
-        const failure = failureFromCaughtError(error);
+        let failure = failureFromCaughtError(error);
+        // 明确的不支持参数 400：按目标记住适配后立即重发；不占普通重试次数，也不等待。
+        // 只有本次尝试还没发出任何事件时才立即重发；已经发出输出的，只记住给之后的请求，本次照常报错。
+        if (!retryControl.cancelRequested && adaptationRetry.shouldRetryImmediately(failure.rawError) && !attemptEmitted) continue;
+        failure = withUserRequestBodyRejection(failure, adaptationRetry, settings);
         const nextRetryCount = retryCount + 1;
+        // 接入库标明不可重试的错误（如 finish_reason=length 截断的工具参数）原样重发只会再失败一次。
         const canRetry = retryEnabled
+          && failure.rawError?.retryable !== false
           && !retryControl.cancelRequested
           && (maxRetries === -1 || nextRetryCount <= maxRetries);
 
@@ -529,13 +622,23 @@ async function runLlmAttempt(
   httpFallbackProvider: UnifiedChatProvider | undefined,
   unified: UnifiedModule,
   options: LlmProviderOptions,
+  nativeHttpWireAdmission: OpenAIResponsesNativeHttpWireAdmission,
   signal?: AbortSignal,
   retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice,
   proxy?: string,
   nativeCapabilities?: OpenAIResponsesNativeCapabilities,
-  controls?: LlmStartRuntimeControls
+  controls?: LlmStartRuntimeControls,
+  responsesTerminal: ResponsesTerminalObservation = {},
+  adaptationSession?: ProviderRequestAdaptationSession
 ): Promise<void> {
+  // 这个对话的 Claude 保留思考处理随 Done 交回内核持久化（官方要求随会话保存、重启后也带上）。
+  const conversationAdaptation = adaptationSession?.claudeThinkingBinding
+    ? { claudeThinkingBinding: adaptationSession.claudeThinkingBinding }
+    : {};
   const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
+  const maxOutputTokens = effectiveRequestGenerationConfig(request, settings)?.maxOutputTokens;
+  const emptyResponsesTerminal = (): LlmAttemptFailure | undefined =>
+    responsesEmptyTerminalFailure(responsesTerminal.current, maxOutputTokens);
   const observingEmit = (value: unknown): Emit => {
     if (!options.debugCapture?.active(debugContext)) return emit;
     const sdkSource = debugSource(unified.getLlmObservation(value));
@@ -551,7 +654,8 @@ async function runLlmAttempt(
     preparedRequest,
     effectiveRequestGenerationConfig(request, settings),
     settings.provider,
-    nativeCapabilities
+    nativeCapabilities,
+    turnReminderLayoutFor(request, settings)
   );
   const forceStreaming = isOpenAIResponsesWebSocketMode(settings);
   if (settings.stream === false && !forceStreaming) {
@@ -561,9 +665,14 @@ async function runLlmAttempt(
       signal
     });
     if (signal?.aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
+    const visible = !hasUnifiedError(response) && unifiedPartsHaveVisibleOutputOrToolCall(response.content?.parts);
+    const emptyTerminal = visible ? undefined : emptyResponsesTerminal();
+    if (emptyTerminal) throw new LlmAttemptFailureError(emptyTerminal);
     if (hasUnifiedError(response)) {
       throw new LlmAttemptFailureError(failureFromProviderError(response.error, { rawResponse: response.rawResponse }));
     }
+    const abnormalFinish = visible ? undefined : abnormalFinishReason(response.finishReason);
+    if (abnormalFinish) throw new LlmAttemptFailureError(emptyAbnormalFinishFailure(abnormalFinish));
     emitRetryRecovered(request.id, emit, retryRecoveryNotice);
     emitUnifiedResponse(request.id, response, observingEmit(response));
     const completedAt = Date.now();
@@ -574,7 +683,8 @@ async function runLlmAttempt(
         createdAt: completedAt,
         completedAt,
         streamOutputDurationMs: 0,
-        ...(usageMetadataFromCompact(response.usageMetadata) ? { usageMetadata: usageMetadataFromCompact(response.usageMetadata) } : {})
+        ...(usageMetadataFromCompact(response.usageMetadata) ? { usageMetadata: usageMetadataFromCompact(response.usageMetadata) } : {}),
+        ...conversationAdaptation
       }
     });
     return;
@@ -587,6 +697,8 @@ async function runLlmAttempt(
   const timing: LlmAttemptTimingState = { streamTimingChunkCount: 0 };
   let activeThoughtBlock: ActiveThoughtBlock | undefined;
   let retryRecoveryPending = retryRecoveryNotice !== undefined;
+  let sawVisibleOutputOrToolCall = false;
+  let lastFinishReason: string | undefined;
   const nativeHooks = controls?.native;
   // 只包装 onController（媒体解析）；onLaneQueueState 等其他本地 hook 原样透传。
   const wrappedNativeHooks: OpenAIResponsesNativeHooks | undefined = nativeHooks
@@ -610,9 +722,7 @@ async function runLlmAttempt(
         multiplexing: nativeCapabilities.multiplexing
       }
     : undefined;
-  const nativeHttpSession = !forceStreaming
-    && nativeCapabilities?.asyncTools === true
-    && settings.provider === 'openai-responses';
+  const nativeHttpSession = usesOpenAIResponsesNativeHttpSession(settings, nativeCapabilities);
   try {
     const stream: AsyncIterable<UnifiedLLMStreamChunk> = forceStreaming
       ? streamOpenAIResponsesWithLimCodeSession({
@@ -634,6 +744,7 @@ async function runLlmAttempt(
             provider,
             unifiedRequest,
             signal,
+            wireAdmission: nativeHttpWireAdmission,
             ...(wrappedNativeHooks ? { hooks: wrappedNativeHooks } : {})
           })
         : provider.chatStream<UnifiedLLMStreamChunk>(unifiedRequest, {
@@ -645,12 +756,17 @@ async function runLlmAttempt(
       const chunkEmit = observingEmit(chunk);
       if (signal?.aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
       if (hasUnifiedError(chunk)) {
+        // 接入库把 response.incomplete 报成错误块时，没有任何可见输出的按空回复写明原因。
+        const emptyTerminal = sawVisibleOutputOrToolCall ? undefined : emptyResponsesTerminal();
+        if (emptyTerminal) throw new LlmAttemptFailureError(emptyTerminal);
         const failure = failureFromProviderError(chunk.error, {
           rawChunk: (chunk as { rawChunk?: unknown }).rawChunk ?? chunk,
           ...createDoneTiming(timing.firstStreamChunkAt, Date.now(), timing.firstStreamChunkMark, nowMonotonicMs(), timing.streamTimingChunkCount)
         });
         throw new LlmAttemptFailureError(failure);
       }
+      if (!sawVisibleOutputOrToolCall && chunkHasVisibleOutputOrToolCall(chunk)) sawVisibleOutputOrToolCall = true;
+      if (typeof chunk.finishReason === 'string' && chunk.finishReason.trim()) lastFinishReason = chunk.finishReason.trim();
       const chunkAt = Date.now();
       const chunkMark = nowMonotonicMs();
       const nativeEvent = (chunk as LimCodeOpenAIResponsesStreamChunk).nativeEvent;
@@ -699,6 +815,12 @@ async function runLlmAttempt(
       }
       emitUnifiedChunk(request.id, chunk, chunkEmit, nativeChain);
     }
+    // 流正常结束但没有任何可见输出和工具调用，且结束原因表示出错、被过滤或被截断：按失败上报，不当成成功的空回复。
+    // Responses 没有 finishReason，按线上终态（incomplete，或推理用尽 max_output_tokens）判断。
+    const abnormalFinish = sawVisibleOutputOrToolCall ? undefined : abnormalFinishReason(lastFinishReason);
+    if (abnormalFinish) throw new LlmAttemptFailureError(emptyAbnormalFinishFailure(abnormalFinish));
+    const emptyTerminal = sawVisibleOutputOrToolCall ? undefined : emptyResponsesTerminal();
+    if (emptyTerminal) throw new LlmAttemptFailureError(emptyTerminal);
   } catch (error) {
     const aborted = isRequestAbort(signal);
     if (activeThoughtBlock) activeThoughtBlock = aborted
@@ -744,9 +866,100 @@ async function runLlmAttempt(
       ...(authoritativeCompletedContent ? { content: authoritativeCompletedContent } : {}),
       ...createDoneTiming(timing.firstStreamChunkAt, finishedAt, timing.firstStreamChunkMark, finishedMark, timing.streamTimingChunkCount),
       completedAt: finishedAt,
-      ...(aggregatedUsageMetadata ? { usageMetadata: aggregatedUsageMetadata } : {})
+      ...(aggregatedUsageMetadata ? { usageMetadata: aggregatedUsageMetadata } : {}),
+      ...conversationAdaptation
     }
   });
+}
+
+/**
+ * 表示出错、被过滤或被截断的结束原因（统一格式透传各家原值；Claude 的 max_tokens 映射为 MAX_TOKENS）：
+ * - OpenAI Chat Completions `length`、`content_filter`（https://platform.openai.com/docs/api-reference/chat/object），
+ *   OpenRouter 流中途出错的 `error`（https://openrouter.ai/docs/api-reference/errors）；
+ * - Claude `max_tokens`、`refusal`、`model_context_window_exceeded`
+ *   （https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons）；
+ * - Gemini `MAX_TOKENS`、`SAFETY`、`RECITATION`、`MALFORMED_FUNCTION_CALL`、`PROHIBITED_CONTENT`、`BLOCKLIST`、
+ *   `SPII`、`IMAGE_SAFETY`、`UNEXPECTED_TOOL_CALL`（https://ai.google.dev/api/generate-content#FinishReason）。
+ */
+const ABNORMAL_FINISH_REASONS: ReadonlySet<string> = new Set([
+  'length', 'content_filter', 'error',
+  'max_tokens', 'refusal', 'model_context_window_exceeded',
+  'safety', 'recitation', 'malformed_function_call', 'prohibited_content', 'blocklist', 'spii', 'image_safety',
+  'unexpected_tool_call'
+]);
+
+function abnormalFinishReason(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return ABNORMAL_FINISH_REASONS.has(trimmed.toLowerCase()) ? trimmed : undefined;
+}
+
+/** 可见输出：非思考的非空文字、媒体；以及任何工具调用。思考与 providerContext 不算。 */
+function unifiedPartsHaveVisibleOutputOrToolCall(parts: readonly unknown[] | undefined): boolean {
+  return (parts ?? []).some((part) => isRecord(part) && (
+    (typeof part.text === 'string' && part.thought !== true && part.text.trim().length > 0)
+    || isRecord(part.functionCall)
+    || isRecord(part.inlineData)
+    || isRecord(part.fileData)
+  ));
+}
+
+function chunkHasVisibleOutputOrToolCall(chunk: UnifiedLLMStreamChunk): boolean {
+  if (typeof chunk.textDelta === 'string' && chunk.textDelta.trim()) return true;
+  if ((chunk.functionCalls?.length ?? 0) > 0) return true;
+  if (unifiedPartsHaveVisibleOutputOrToolCall(chunk.partsDelta)) return true;
+  const native = chunk as LimCodeOpenAIResponsesStreamChunk & OpenAIResponsesHttpNativeStreamChunk;
+  if ((native.toolCallArgumentDeltas?.length ?? 0) > 0) return true;
+  if (native.completedContent && unifiedPartsHaveVisibleOutputOrToolCall(native.completedContent.parts)) return true;
+  return Array.isArray(native.completedContents)
+    && native.completedContents.some((content) => unifiedPartsHaveVisibleOutputOrToolCall(content.parts));
+}
+
+function emptyAbnormalFinishFailure(finishReason: string): LlmAttemptFailure {
+  const message = `模型没有返回任何可见内容或工具调用就结束了（结束原因：${finishReason}）。`;
+  return { message, rawError: { kind: 'empty_response', finishReason, message }, createdAt: Date.now() };
+}
+
+interface ResponsesTerminalObservation {
+  current?: ResponsesTerminalEvidence;
+}
+
+/**
+ * OpenAI Responses 的空回复（https://platform.openai.com/docs/api-reference/responses/object）：接入库不产出 finishReason，
+ * 按线上终态判断。`status: "incomplete"`（`incomplete_details.reason` 为 max_output_tokens 或 content_filter），
+ * 或网关报 completed 但推理用掉了全部 max_output_tokens，都说明这次回复没有完成，不能当成成功的空回复。
+ */
+function responsesEmptyTerminalFailure(
+  terminal: ResponsesTerminalEvidence | undefined,
+  maxOutputTokens: number | undefined
+): LlmAttemptFailure | undefined {
+  if (!terminal) return undefined;
+  const usage = isRecord(terminal.usage) ? terminal.usage : undefined;
+  const outputTokens = typeof usage?.output_tokens === 'number' ? usage.output_tokens : undefined;
+  const details = isRecord(usage?.output_tokens_details) ? usage.output_tokens_details : undefined;
+  const reasoningTokens = typeof details?.reasoning_tokens === 'number' ? details.reasoning_tokens : undefined;
+  const reasoningUsedAll = outputTokens !== undefined && outputTokens > 0
+    && reasoningTokens !== undefined && reasoningTokens >= outputTokens;
+  let reason: string | undefined;
+  if (terminal.status === 'incomplete') reason = terminal.reason;
+  else if (terminal.status === 'completed' && reasoningUsedAll && maxOutputTokens !== undefined && outputTokens! >= maxOutputTokens) {
+    reason = 'max_output_tokens';
+  } else return undefined;
+  const explanation = reason === 'max_output_tokens' && reasoningUsedAll
+    ? `；${outputTokens} 个输出 token 全部用在了推理上，可以调高输出上限或降低思考强度`
+    : reason === 'content_filter' ? '；回复被内容过滤拦下' : '';
+  const message = `模型没有返回任何可见内容或工具调用就结束了（Responses 状态：${terminal.status}${reason ? `，原因：${reason}` : ''}${explanation}）。`;
+  return {
+    message,
+    rawError: {
+      kind: 'empty_response',
+      responseStatus: terminal.status,
+      ...(reason ? { finishReason: reason, incompleteReason: reason } : {}),
+      ...(terminal.usage !== undefined ? { usage: toPlainJsonLike(terminal.usage) } : {}),
+      message
+    },
+    createdAt: Date.now()
+  };
 }
 
 async function* streamOpenAIResponsesWithLimCodeSession(input: {
@@ -887,6 +1100,25 @@ interface OpenAIResponsesHttpNativeStreamChunk extends UnifiedLLMStreamChunk {
   completedContents?: UnifiedContent[];
 }
 
+interface OpenAIResponsesNativeHttpWireAdmission {
+  toolResultCallIds: string[];
+}
+
+function nativeHttpWireToolResultCallIds(body: RequestInit['body']): string[] {
+  // The provider sends JSON text. Fail closed if its transport changes instead of treating
+  // an uninspectable request as evidence for results reconstructed from another source.
+  if (typeof body !== 'string') throw new Error('Native HTTP request body must be encoded JSON text.');
+  const encoded: unknown = JSON.parse(body);
+  if (!isRecord(encoded) || !Array.isArray(encoded.input)) {
+    throw new Error('Native HTTP request body must contain an encoded Responses input array.');
+  }
+  return [...new Set(encoded.input.flatMap((item: unknown) =>
+    isRecord(item) && (item.type === 'function_call_output' || item.type === 'custom_tool_call_output')
+      && typeof item.call_id === 'string' && item.call_id.trim()
+      ? [item.call_id]
+      : []))];
+}
+
 /**
  * HTTP/SSE 原生会话：与 WS 同一个 OpenAIResponsesNativeController 契约的轻量泵。
  * 逻辑请求跨多个物理 SSE response 存活；submitToolResults 排入队列，达界后以
@@ -899,6 +1131,7 @@ async function* streamOpenAIResponsesNativeHttpSession(input: {
   unifiedRequest: UnifiedLLMRequest;
   signal?: AbortSignal;
   hooks?: OpenAIResponsesNativeHooks;
+  wireAdmission: OpenAIResponsesNativeHttpWireAdmission;
 }): AsyncGenerator<UnifiedLLMStreamChunk> {
   const queue: OpenAIResponsesNativeHttpQueuedSubmission[] = [];
   let logicalEnded = false;
@@ -971,16 +1204,16 @@ async function* streamOpenAIResponsesNativeHttpSession(input: {
           const nativeEvent = nativeChunk.nativeEvent;
           if (nativeEvent?.type === 'response.created' && typeof nativeEvent.responseId === 'string' && nativeEvent.responseId) {
             latestResponseId = nativeEvent.responseId;
+            // Includes full-history results on the first POST as well as later continuations.
+            // A successful fetch alone is insufficient; only response.created admits them.
+            const admittedToolResultCallIds = input.wireAdmission.toolResultCallIds;
+            if (admittedToolResultCallIds.length > 0) {
+              nativeChunk.nativeEvent = { ...nativeEvent, admittedToolResultCallIds: [...admittedToolResultCallIds] };
+            }
             if (!drainedSettled && drained.length > 0) {
               drainedSettled = true;
               const admission: OpenAIResponsesNativeResultAdmission = { responseId: nativeEvent.responseId };
               for (const submission of drained) submission.resolve(admission);
-              // 数据级观察：本 create 实际携带的结果 call_id，供内核先落投递事实再处理新输出。
-              const admittedToolResultCallIds = drained.flatMap((submission) =>
-                submission.outputs.map((output) => output.callId).filter((callId): callId is string => !!callId));
-              if (admittedToolResultCallIds.length > 0) {
-                nativeChunk.nativeEvent = { ...nativeEvent, admittedToolResultCallIds };
-              }
             }
           }
           collectNativeHttpOutstandingCallIds(chunk, pendingNativeCallIds);
@@ -1463,13 +1696,25 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
-  const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
+  const headers = headersForProviderContext(
+    runtimeSettings,
+    request.contents,
+    mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers)
+  );
   const requestBody = withoutNativeServerSideCompaction(
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId),
     request.contents
   );
-  const provider = installProviderCompatibility(unified.createLLMFromConfig({
+  const nativeCapabilities = openAIResponsesNativeCapabilities({
     provider: runtimeSettings.provider,
+    model: runtimeSettings.model,
+    baseUrl: runtimeSettings.baseUrl,
+    transport: runtimeSettings.openaiResponsesTransport,
+    nativeResponses: runtimeSettings.nativeResponses,
+    ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, runtimeSettings))
+  });
+  const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
+    provider: libraryProviderKind(runtimeSettings),
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
     baseUrl: runtimeSettings.baseUrl,
@@ -1480,27 +1725,27 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model);
+  }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings,
+  claudeTurnScopedRemindersRequested(request, runtimeSettings), volatileTailContentCount(request),
+  isOpenAIResponsesWebSocketMode(runtimeSettings), openAIResponsesHttpReplay(runtimeSettings, nativeCapabilities),
+  createProviderRequestAdaptationSession({
+    conversationId: request.conversationId,
+    claudeThinkingBinding: request.claudeThinkingBinding
+  }));
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
     throw new Error('当前 unified-llm-provider 版本不支持 provider.dryRun，请更新依赖。');
   }
 
-  const nativeCapabilities = openAIResponsesNativeCapabilities({
-    provider: runtimeSettings.provider,
-    model: runtimeSettings.model,
-    baseUrl: runtimeSettings.baseUrl,
-    transport: runtimeSettings.openaiResponsesTransport,
-    nativeResponses: runtimeSettings.nativeResponses
-  });
   const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities);
   const webSocketMode = isOpenAIResponsesWebSocketMode(runtimeSettings);
   const result = await dryRun.call(provider, toUnifiedRequest(
     preparedRequest,
     effectiveRequestGenerationConfig(request, runtimeSettings),
     runtimeSettings.provider,
-    nativeCapabilities
+    nativeCapabilities,
+    turnReminderLayoutFor(request, runtimeSettings)
   ), {
     inputFormat: 'unified',
     outputFormat: 'unified',
@@ -1526,16 +1771,16 @@ export async function dryRunCompactLlmProvider(
   );
   if (methodConfig.kind === 'disabled') throw new Error('当前压缩方法已关闭。');
   const generatedAt = Date.now();
-  if (methodConfig.kind === 'openai_responses_compact') {
+  if (methodConfig.kind === 'provider_native') {
     const observationContract = normalizeCompressionAttachmentObservationContract(request);
     if (observationContract.requirements.length > 0) {
       throw new TypeError('Provider-native Compact cannot carry text-summary Attachment observations.');
     }
-    const call = await dryRunOpenAIResponsesCompact(request, methodConfig, options, dryRunOptions);
+    const call = await dryRunProviderNativeCompact(request, methodConfig, options, dryRunOptions);
     return {
       kind: 'provider_requests',
       methodKind: methodConfig.kind,
-      calls: [{ ...call, id: `${request.id}:compact`, label: 'Responses Compact', ordinal: 0 }],
+      calls: [{ ...call, id: `${request.id}:compact`, label: 'Provider Native Compact', ordinal: 0 }],
       generatedAt
     };
   }
@@ -1616,16 +1861,27 @@ export async function dryRunCompactLlmProvider(
   };
 }
 
-async function dryRunOpenAIResponsesCompact(
+async function dryRunProviderNativeCompact(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
   options: LlmProviderOptions,
   dryRunOptions: LlmDryRunOptions
 ): Promise<LlmDryRunResult> {
   const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
-  const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
-  const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
-  if (settings.provider !== 'openai-responses') throw new Error('OpenAI 原生压缩仅支持 openai-responses 渠道格式。');
+  const canonicalContext = assertCanonicalProviderToolContext(preparedContext);
+  const settings = await resolveCompactProviderSettings(request, methodConfig, canonicalContext, options);
+  // Claude 原生压缩与普通请求一样放置历史提醒；其他目标、关闭与网关回退时没有轮内系统消息（无标记时原样返回同一个数组）。
+  const normalizedContext = layoutTurnReminderContents(canonicalContext, turnReminderLayoutFor(request, settings));
+  if (settings.provider === 'claude') {
+    return dryRunAnthropicCompaction(request, methodConfig, normalizedContext, settings, options, dryRunOptions);
+  }
+  if (settings.provider !== 'openai-responses') {
+    throw nativeCompactionCapabilityError(
+      `当前 ${settings.provider} 渠道没有可用的 Provider 原生压缩适配器。`,
+      undefined,
+      'provider_native_compaction'
+    );
+  }
   const apiKeyAvailable = !!settings.apiKey;
   const runtimeSettings = apiKeyAvailable ? settings : { ...settings, apiKey: 'limcode-dry-run-placeholder-key' };
   const unified = await importUnifiedLlmProvider();
@@ -1650,12 +1906,13 @@ async function dryRunOpenAIResponsesCompact(
   if (typeof provider.compactDryRun !== 'function') {
     throw new Error('当前 unified-llm-provider 版本不支持 provider.compactDryRun。');
   }
+  const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
   const result = await provider.compactDryRun(
     { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
     {
       inputFormat: 'unified',
       outputFormat: 'unified',
-      ...(requestBody ? { requestBody } : {}),
+      ...(compactRequestBody ? { requestBody: compactRequestBody } : {}),
       curl: { includeApiKey: dryRunOptions.includeApiKey === true, prettyBody: true }
     }
   );
@@ -1695,6 +1952,10 @@ export async function listLlmProviderModels(config: LlmProviderConfigRecord, opt
 
   const unified = await importUnifiedLlmProvider();
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  if (settings.provider === 'claude') {
+    const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
+    return discoverAnthropicModels(settings, proxy ? createProxyFetch(proxy) : fetch, headers);
+  }
   const result = await unified.listAvailableModels({
     provider: settings.provider,
     apiKey: settings.apiKey,
@@ -1721,7 +1982,7 @@ export function registerLlmCompressionMethod(kind: LlmCompressionConfigRecord['k
 
 function ensureDefaultCompressionMethodsRegistered(): void {
   if (compressionMethodHandlers.size > 0) return;
-  registerLlmCompressionMethod('openai_responses_compact', compactWithOpenAIResponses);
+  registerLlmCompressionMethod('provider_native', compactWithProviderNative);
   registerLlmCompressionMethod('llm_summary', compactWithSummary);
   registerLlmCompressionMethod('segmented_summary', compactWithSegmentedSummary);
   registerLlmCompressionMethod('deterministic_summary', compactWithSummary);
@@ -1757,7 +2018,7 @@ export async function compactLlmProvider(
 
     // Freeze resolved media once for the whole native compact operation. Capability retries must
     // replay identical bytes even when the original reference was a mutable local sourcePath.
-    const handlerRequest = methodConfig.kind === 'openai_responses_compact'
+    const handlerRequest = methodConfig.kind === 'provider_native'
       ? { ...request, contents: await prepareNativeCompactContentsMultimodal(request.contents, options) }
       : request;
 
@@ -1768,10 +2029,22 @@ export async function compactLlmProvider(
       && isRetryCapableCompressionMethod(methodConfig.kind)
       && methodConfig.kind !== 'segmented_summary';
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
+    // 摘要类方法在 executeSummaryProviderCall 内逐次调用自适配；这里只覆盖单次调用的原生压缩。
+    const adaptationSession = createProviderRequestAdaptationSession({
+      conversationId: request.conversationId,
+      claudeThinkingBinding: request.claudeThinkingBinding
+    });
+    const adaptationRetry = retrySettings && methodConfig.kind === 'provider_native'
+      ? createProviderRequestAdaptationRetry(providerRequestTarget(retrySettings), {
+          claudeTurnScopedReminders: claudeTurnScopedRemindersRequested(request, retrySettings),
+          userRequestBodyKeys: Object.keys(request.nativeRequestBody ?? retrySettings.requestBody ?? {})
+        }, adaptationSession)
+      : undefined;
     let retryCount = 0;
     let sawRetry = false;
     const handlerOptions: LlmProviderOptions = {
       ...options,
+      requestAdaptationSession: adaptationSession,
       onCompressionProgress: () => {
         if (signal?.aborted) return;
         emit({ type: LlmEventType.CompactProgress, payload: { requestId: request.id } });
@@ -1803,7 +2076,9 @@ export async function compactLlmProvider(
           return;
         }
 
-        const failure = failureFromCaughtError(error);
+        let failure = failureFromCaughtError(error);
+        if (!retryControl.cancelRequested && adaptationRetry?.shouldRetryImmediately(failure.rawError)) continue;
+        if (adaptationRetry && retrySettings) failure = withUserRequestBodyRejection(failure, adaptationRetry, retrySettings);
         const nextRetryCount = retryCount + 1;
         const canRetry = retryEnabled
           && isRetryableCompactFailure(error, failure)
@@ -1919,13 +2194,13 @@ async function resolveCompactRetrySettings(
 }
 
 function isRetryCapableCompressionMethod(kind: LlmCompressionConfigRecord['kind']): boolean {
-  return kind === 'openai_responses_compact' || kind === 'llm_summary' || kind === 'segmented_summary';
+  return kind === 'provider_native' || kind === 'llm_summary' || kind === 'segmented_summary';
 }
 
 function compressionMethodModelOverride(methodConfig: LlmCompressionConfigRecord): LlmModelSettings | undefined {
-  if (methodConfig.kind === 'openai_responses_compact') {
-    const providerConfigId = methodConfig.openaiResponsesCompact?.providerConfigId?.trim();
-    const model = methodConfig.openaiResponsesCompact?.model?.trim();
+  if (methodConfig.kind === 'provider_native') {
+    const providerConfigId = methodConfig.providerNative?.providerConfigId?.trim();
+    const model = methodConfig.providerNative?.model?.trim();
     return providerConfigId || model ? { ...(providerConfigId ? { providerConfigId } : {}), model: model || '' } : undefined;
   }
   if (methodConfig.kind === 'llm_summary' || methodConfig.kind === 'segmented_summary') {
@@ -1937,12 +2212,20 @@ function compressionMethodModelOverride(methodConfig: LlmCompressionConfigRecord
 }
 
 function isRetryableCompactFailure(error: unknown, failure: LlmAttemptFailure): boolean {
-  const text = `${failure.message}\n${errorSearchText(error)}`.toLowerCase();
+  const text = `${failure.message}\n${errorSearchText(error)}\n${stringifyJson(failure.rawError ?? {})}`.toLowerCase();
+  const raw = isRecord(failure.rawError) ? failure.rawError : undefined;
+  const code = typeof raw?.code === 'string' ? raw.code : undefined;
+  const retryable = typeof raw?.retryable === 'boolean' ? raw.retryable : undefined;
+  const status = typeof raw?.status === 'number' ? raw.status : undefined;
+  if (code === 'PROVIDER_CAPABILITY_MISMATCH' || retryable === false) return false;
+  if ((status === 404 || status === 405 || status === 501)
+    && (text.includes('compact') || text.includes('compaction'))) return false;
   return !(
     text.includes('当前压缩方法已关闭')
     || text.includes('未注册的压缩方法')
     || text.includes('缺少 llm api key')
-    || text.includes('openai 原生压缩仅支持')
+    || text.includes('没有可用的 provider 原生压缩适配器')
+    || text.includes('native_compaction_unsupported')
     || text.includes('media_size_unknown')
     || text.includes('media_semantics_unavailable')
     || text.includes('compression_request_too_large')
@@ -1958,8 +2241,8 @@ async function resolveCompactProviderSettings(
   contents: MessageContent[],
   options: LlmProviderOptions
 ): Promise<LlmProviderConfigRecord> {
-  const modelOverride = methodConfig.openaiResponsesCompact?.model?.trim();
-  const providerConfigId = methodConfig.openaiResponsesCompact?.providerConfigId?.trim();
+  const modelOverride = methodConfig.providerNative?.model?.trim();
+  const providerConfigId = methodConfig.providerNative?.providerConfigId?.trim();
   return resolveRuntimeSettings({
     id: request.id,
     contents,
@@ -1973,18 +2256,27 @@ async function resolveCompactProviderSettings(
   }, options);
 }
 
-async function compactWithOpenAIResponses(
+async function compactWithProviderNative(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
   options: LlmProviderOptions,
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
   const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
-  const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
-  const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
+  const canonicalContext = assertCanonicalProviderToolContext(preparedContext);
+  const settings = await resolveCompactProviderSettings(request, methodConfig, canonicalContext, options);
+  // 每次尝试按当前记忆决定形态：网关明确拒绝过轮内系统消息的目标退回尾巴模式（历史提醒不发）。
+  const normalizedContext = layoutTurnReminderContents(canonicalContext, turnReminderLayoutFor(request, settings));
 
+  if (settings.provider === 'claude') {
+    return compactWithAnthropic(request, methodConfig, normalizedContext, settings, options, signal);
+  }
   if (settings.provider !== 'openai-responses') {
-    throw new Error('OpenAI 原生压缩仅支持 openai-responses 渠道格式。');
+    throw nativeCompactionCapabilityError(
+      `当前 ${settings.provider} 渠道没有可用的 Provider 原生压缩适配器。`,
+      undefined,
+      'provider_native_compaction'
+    );
   }
   if (!settings.apiKey) {
     throw new Error('缺少 LLM API Key。请在全局设置的“渠道”页签里填写并保存。');
@@ -2034,13 +2326,14 @@ async function compactWithOpenAIResponses(
       normalizedContentCount: normalizedContext.length,
       signalAborted: signal?.aborted === true
     });
+    const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
     compacted = await provider.compact(
       { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
       {
         inputFormat: 'unified',
         outputFormat: 'unified',
         signal,
-        ...(requestBody ? { requestBody } : {})
+        ...(compactRequestBody ? { requestBody: compactRequestBody } : {})
       }
     );
     if (hasUnifiedError(compacted)) {
@@ -2059,8 +2352,8 @@ async function compactWithOpenAIResponses(
       error: errorDebugInfo(error),
       signalAborted: signal?.aborted === true
     });
-    // 压缩方法是用户明确选择的策略。OpenAI 原生压缩失败时必须保持该策略失败，
-    // 交给外层按同一方法重试，不能在单次尝试内偷偷切换为分段总结。
+    // 单次 Provider 原生压缩尝试只负责当前适配器；失败由冻结的外层后备链决定是否
+    // 切换为分段总结或确定性摘要，不能在 capability 内部偷偷改变执行方法。
     throw error;
   }
 
@@ -2076,6 +2369,352 @@ async function compactWithOpenAIResponses(
     settingsSnapshot: snapshotFromSettings(settings, methodConfig),
     rawResponse: compacted.rawResponse,
     methodConfig
+  };
+}
+
+async function dryRunAnthropicCompaction(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  contents: MessageContent[],
+  settings: LlmProviderConfigRecord,
+  options: LlmProviderOptions,
+  dryRunOptions: LlmDryRunOptions
+): Promise<LlmDryRunResult> {
+  const apiKeyAvailable = !!settings.apiKey;
+  const runtimeSettings = apiKeyAvailable ? settings : { ...settings, apiKey: 'limcode-dry-run-placeholder-key' };
+  const built = await buildAnthropicCompactionRequest(
+    request,
+    methodConfig,
+    contents,
+    runtimeSettings,
+    options,
+    dryRunOptions.includeApiKey === true
+  );
+  return formatUnifiedDryRunResult(
+    built.result,
+    runtimeSettings,
+    built.unified,
+    dryRunOptions,
+    apiKeyAvailable
+  );
+}
+
+async function compactWithAnthropic(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  contents: MessageContent[],
+  settings: LlmProviderConfigRecord,
+  options: LlmProviderOptions,
+  signal?: AbortSignal
+): Promise<LlmCompactResult> {
+  if (!settings.apiKey) {
+    throw new Error('缺少 LLM API Key。请在全局设置的“渠道”页签里填写并保存。');
+  }
+  const built = await buildAnthropicCompactionRequest(
+    request,
+    methodConfig,
+    contents,
+    settings,
+    options,
+    true
+  );
+  const response = await built.fetch(built.result.url, {
+    method: 'POST',
+    headers: built.result.headers,
+    body: JSON.stringify(built.result.body),
+    signal,
+    redirect: 'error'
+  });
+  const rawText = await response.text();
+  let raw: unknown;
+  try {
+    raw = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    raw = { message: rawText };
+  }
+  if (!response.ok) {
+    const message = providerHttpErrorMessage('Anthropic Compaction API', response.status, raw);
+    if (response.status === 404 || response.status === 405 || response.status === 501) {
+      throw nativeCompactionCapabilityError(message, response.status, 'anthropic_messages_compact', raw);
+    }
+    throw Object.assign(new Error(message), {
+      status: response.status,
+      endpointKind: 'anthropic_messages_compact',
+      rawResponse: raw
+    });
+  }
+  const record = isRecord(raw) ? raw : {};
+  const content = Array.isArray(record.content) ? record.content : [];
+  const block = content.find((candidate) => isRecord(candidate) && candidate.type === 'compaction');
+  const stopReason = typeof record.stop_reason === 'string' ? record.stop_reason : undefined;
+  if (content.length !== 1 || !isRecord(block) || typeof block.content !== 'string' || !block.content.trim()
+    || typeof block.signature !== 'string' || !block.signature.trim() || stopReason !== 'compaction') {
+    throw Object.assign(new Error(
+      `Anthropic 原生压缩未返回可回放的签名 compaction block（stop_reason=${stopReason ?? 'unknown'}）。`
+    ), {
+      code: 'ANTHROPIC_COMPACTION_EMPTY',
+      retryable: stopReason === 'max_tokens' || stopReason === 'model_context_window_exceeded',
+      endpointKind: 'anthropic_messages_compact',
+      stopReason,
+      rawResponse: raw
+    });
+  }
+  const providerContext: MessageContent = {
+    role: 'model',
+    parts: [{
+      providerContext: {
+        provider: 'anthropic',
+        format: 'claude',
+        endpoint: '/v1/messages',
+        itemType: 'compaction',
+        rawItem: block
+      }
+    }]
+  };
+  return {
+    id: typeof record.id === 'string' ? record.id : undefined,
+    object: typeof record.type === 'string' ? record.type : 'message',
+    contents: [providerContext],
+    usageMetadata: usageMetadataFromAnthropicCompaction(record.usage),
+    settingsSnapshot: snapshotFromSettings(settings, methodConfig),
+    rawResponse: raw,
+    methodConfig
+  };
+}
+
+async function buildAnthropicCompactionRequest(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  contents: MessageContent[],
+  settings: LlmProviderConfigRecord,
+  options: LlmProviderOptions,
+  includeApiKey: boolean
+): Promise<{
+  result: UnifiedDryRunResult;
+  unified: UnifiedModule;
+  fetch: typeof fetch;
+}> {
+  const unified = await importUnifiedLlmProvider();
+  const registry = unified.createBootstrapExtensionRegistry();
+  const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
+  const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+  const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
+  const configuredHeaders = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const requestBody = request.nativeRequestBody ?? settings.requestBody;
+  const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
+    provider: libraryProviderKind(settings),
+    model: settings.model,
+    apiKey: settings.apiKey,
+    baseUrl: settings.baseUrl,
+    ...(settings.contextWindowTokens ? { contextWindow: settings.contextWindowTokens } : {}),
+    ...(configuredHeaders ? { headers: configuredHeaders } : {}),
+    ...(requestBody ? { requestBody } : {}),
+    // 与普通请求同一份渠道缓存配置：tools、system 与最后一条 user 消息上的断点位置和写法都相同，
+    // 压缩请求才能读到对话此前写入的缓存（没有任何 cache_control 的请求既不读也不写缓存）。
+    ...unifiedPromptCacheConfigEntry(settings, requestBody),
+    ...(proxy ? { proxy } : {}),
+    fetch: providerFetch
+  }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings,
+  claudeTurnScopedRemindersRequested(request, settings), 0, false, 'stateless',
+  options.requestAdaptationSession ?? createProviderRequestAdaptationSession({
+    conversationId: request.conversationId,
+    claudeThinkingBinding: request.claudeThinkingBinding
+  }));
+  const generationConfig = request.nativeGenerationConfig ?? settings.generationConfig;
+  const systemInstruction = prependSystemInstructionPrefix(
+    request.systemInstruction,
+    settings.systemPromptPrefix
+  );
+  // 官方要求压缩请求发送“对话当前的样子”，并使用与对话其余请求相同的 system 与 tools
+  // （https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand）。所以与普通请求走同一个转换：
+  // 存储的工具调用 id 写成 callId（否则接入库按顺序生成 toolu_0、toolu_1…），便携思考签名展开、别家签过的思考摘掉，
+  // ToolSchema 转成函数声明（否则 tools 被编码成空数组），轮内系统消息按同一布局放置（contents 已布局过，再布局一次不变）。
+  const unifiedRequest = toUnifiedRequest(
+    {
+      id: request.id,
+      contents,
+      tools: request.tools ?? [],
+      ...(systemInstruction ? { systemInstruction } : {})
+    },
+    generationConfig,
+    settings.provider,
+    undefined,
+    turnReminderLayoutFor(request, settings)
+  );
+  const result = await provider.dryRun(unifiedRequest, {
+    inputFormat: 'unified',
+    outputFormat: 'unified',
+    stream: false,
+    curl: { includeApiKey, prettyBody: true }
+  });
+  const body = anthropicCompactionBody(result.body, methodConfig);
+  const headers = withAnthropicBetaHeader(result.headers, 'compact-2026-09-04');
+  return {
+    result: {
+      ...result,
+      stream: false,
+      headers,
+      body,
+      bodyText: JSON.stringify(body, null, 2),
+      curl: unified.formatRequestAsCurl(result.url, headers, body, { includeApiKey, prettyBody: true }),
+      timestamp: Date.now()
+    },
+    unified,
+    fetch: providerFetch
+  };
+}
+
+/**
+ * `/responses/compact` 只接受这些请求体字段
+ * （https://developers.openai.com/api/reference/resources/responses/methods/compact 的 Body Parameters）。
+ * 渠道 requestBody 面向 `/responses`，其中的 context_management、reasoning、store 等并入压缩请求会得到
+ * 400 Unknown parameter；只转发官方允许的字段。全部是允许字段时原样返回同一引用。
+ */
+const OPENAI_RESPONSES_COMPACT_BODY_FIELDS: ReadonlySet<string> = new Set([
+  'model',
+  'input',
+  'instructions',
+  'previous_response_id',
+  'prompt_cache_key',
+  'prompt_cache_options',
+  'prompt_cache_retention',
+  'service_tier'
+]);
+
+function openAIResponsesCompactRequestBody(requestBody: LlmRequestBodyRecord | undefined): LlmRequestBodyRecord | undefined {
+  if (!requestBody) return requestBody;
+  const entries = Object.entries(requestBody).filter(([key]) => OPENAI_RESPONSES_COMPACT_BODY_FIELDS.has(key));
+  if (entries.length === Object.keys(requestBody).length) return requestBody;
+  return entries.length > 0 ? Object.fromEntries(entries) as LlmRequestBodyRecord : undefined;
+}
+
+function anthropicCompactionBody(value: unknown, methodConfig: LlmCompressionConfigRecord): Record<string, unknown> {
+  if (!isRecord(value)) throw new TypeError('Anthropic compaction dry-run did not produce a JSON request body.');
+  const body: Record<string, unknown> = { ...value };
+  delete body.stream;
+  delete body.context_management;
+  delete body.stop_sequences;
+  if (isRecord(body.tool_choice) && (body.tool_choice.type === 'any' || body.tool_choice.type === 'tool')) {
+    delete body.tool_choice;
+  }
+  if (isRecord(body.output_config)) {
+    const outputConfig: Record<string, unknown> = { ...body.output_config };
+    delete outputConfig.format;
+    if (isRecord(outputConfig.task_budget)) {
+      const taskBudget: Record<string, unknown> = { ...outputConfig.task_budget };
+      delete taskBudget.remaining;
+      if (Object.keys(taskBudget).length > 0) outputConfig.task_budget = taskBudget;
+      else delete outputConfig.task_budget;
+    }
+    if (Object.keys(outputConfig).length > 0) body.output_config = outputConfig;
+    else delete body.output_config;
+  }
+  const custom = methodConfig.llmSummary?.systemPrompt?.trim();
+  const instructions = [
+    custom || 'Summarize the transcript for exact continuation in a future context window.',
+    'Preserve identifiers, file paths, numbers, decisions, constraints, tool results, open tasks, and the current state.',
+    'Do not call tools while writing this summary; return summary text only.'
+  ].join(' ').slice(0, 16_384);
+  body.compaction = { type: 'summarize', instructions };
+  return body;
+}
+
+/**
+ * 前置提示词与普通请求同样合进系统提示词的同一段文本（prependSystemPromptPrefix：空一行）。
+ * 单独作为一个 part 时 Claude 编码器用单个换行连接各 part，system 文本就与普通请求差一个换行，缓存前缀对不上。
+ */
+function prependSystemInstructionPrefix(
+  systemInstruction: MessageContent | undefined,
+  prefixInput: string | undefined
+): MessageContent | undefined {
+  const prefix = prefixInput?.trim() ?? '';
+  if (!prefix) return systemInstruction;
+  if (!systemInstruction) return { role: 'user', parts: [{ text: prefix }] };
+  const [first, ...rest] = systemInstruction.parts;
+  if (first && isVisibleTextPart(first)) {
+    return {
+      ...systemInstruction,
+      parts: [{ ...first, text: prependSystemPromptPrefix(first.text, prefix) }, ...rest]
+    };
+  }
+  return {
+    ...systemInstruction,
+    parts: [{ text: prefix }, ...systemInstruction.parts]
+  };
+}
+
+function headersForProviderContext(
+  settings: Pick<LlmProviderConfigRecord, 'provider'>,
+  contents: readonly MessageContent[],
+  headers: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  return settings.provider === 'claude' && containsAnthropicCompactionBlock(contents)
+    ? withAnthropicBetaHeader(headers, 'compact-2026-09-04')
+    : headers;
+}
+
+function containsAnthropicCompactionBlock(contents: readonly MessageContent[]): boolean {
+  return contents.some((content) => content.parts.some((part) =>
+    isProviderContextPart(part)
+      && part.providerContext.format === 'claude'
+      && part.providerContext.itemType === 'compaction'
+      && isRecord(part.providerContext.rawItem)
+      && part.providerContext.rawItem.type === 'compaction'
+  ));
+}
+
+function withAnthropicBetaHeader(
+  input: Record<string, string> | undefined,
+  beta: string
+): Record<string, string> {
+  const headers = { ...(input ?? {}) };
+  const existingKey = Object.keys(headers).find((key) => key.toLowerCase() === 'anthropic-beta');
+  const existing = existingKey ? headers[existingKey] : '';
+  const values = new Set((existing ?? '').split(',').map((value) => value.trim()).filter(Boolean));
+  values.add(beta);
+  if (existingKey && existingKey !== 'anthropic-beta') delete headers[existingKey];
+  headers['anthropic-beta'] = [...values].join(',');
+  return headers;
+}
+
+function nativeCompactionCapabilityError(
+  message: string,
+  status?: number,
+  endpointKind = 'provider_native_compaction',
+  rawResponse?: unknown
+): Error {
+  return Object.assign(new Error(message), {
+    name: 'ProviderCapabilityError',
+    code: 'PROVIDER_CAPABILITY_MISMATCH',
+    reason: 'native_compaction_unsupported',
+    retryable: false,
+    ...(status === undefined ? {} : { status }),
+    endpointKind,
+    ...(rawResponse === undefined ? {} : { rawResponse })
+  });
+}
+
+function providerHttpErrorMessage(label: string, status: number, raw: unknown): string {
+  const nested = isRecord(raw) && isRecord(raw.error) && typeof raw.error.message === 'string'
+    ? raw.error.message
+    : isRecord(raw) && typeof raw.message === 'string'
+      ? raw.message
+      : stringifyJson(toPlainJsonLike(raw));
+  return `${label} 错误 (${status}): ${nested || 'Unknown provider error'}`;
+}
+
+function usageMetadataFromAnthropicCompaction(value: unknown): LlmUsageMetadataRecord | undefined {
+  if (!isRecord(value)) return undefined;
+  const iterations = Array.isArray(value.iterations) ? value.iterations.filter(isRecord) : [];
+  const inputTokens = iterations.reduce((sum, item) =>
+    sum + (typeof item.input_tokens === 'number' ? item.input_tokens : 0), 0);
+  const outputTokens = iterations.reduce((sum, item) =>
+    sum + (typeof item.output_tokens === 'number' ? item.output_tokens : 0), 0);
+  return {
+    promptTokenCount: inputTokens,
+    candidatesTokenCount: outputTokens,
+    totalTokenCount: inputTokens + outputTokens,
+    ...value
   };
 }
 
@@ -2564,9 +3203,7 @@ function buildAttachmentObservationProviderCall(
       contents: [sourceContent],
       systemInstruction: { parts: [{ text: systemPrompt }] },
       generationConfig: {
-        temperature: 0,
-        maxOutputTokens: ATTACHMENT_OBSERVATION_MAX_OUTPUT_TOKENS,
-        thinkingConfig: { thinkingLevel: 'low' }
+        maxOutputTokens: ATTACHMENT_OBSERVATION_MAX_OUTPUT_TOKENS
       }
     }
   };
@@ -2810,16 +3447,37 @@ function attachmentObservationModelRecord(
   };
 }
 
+/** The Attachment observation state a text compression appends after its summary, if any. */
+function compressionAttachmentState(prepared: PreparedCompressionMediaSemantics): MessageContent | undefined {
+  if (prepared.requirements.length === 0) return undefined;
+  const byRef = new Map(prepared.observations.map((observation) => [observation.attachmentRef, observation]));
+  return attachmentObservationStateContent(prepared.requirements, byRef);
+}
+
+/**
+ * The frozen limit covers everything the compression puts back into the Context: the summary and
+ * the Attachment observation state appended after it. The summary is written to the room the state
+ * leaves, but keeps at least a quarter of the limit; many large observations then overrun the limit
+ * instead of leaving no room for the task itself.
+ */
+function summaryConfigBesideAttachmentState(
+  methodConfig: LlmCompressionConfigRecord,
+  state: MessageContent | undefined
+): LlmCompressionConfigRecord {
+  if (!state) return methodConfig;
+  const limitTokens = effectiveSummaryTargetTokens(methodConfig);
+  const stateTokens = state.parts.reduce((total, part) => total + (isTextPart(part) ? estimateTokenCount(part.text) : 0), 0);
+  const targetTokens = Math.max(Math.ceil(limitTokens / 4), limitTokens - stateTokens);
+  return { ...methodConfig, llmSummary: { ...(methodConfig.llmSummary ?? {}), targetTokens } };
+}
+
 function compressionSummaryContents(
   summary: string,
   targetTokens: number,
-  requirements: readonly LlmAttachmentObservationRequirement[],
-  observations: readonly LlmAttachmentObservation[]
+  state: MessageContent | undefined
 ): MessageContent[] {
   const contents = summaryContents(summary, targetTokens);
-  if (requirements.length === 0) return contents;
-  const byRef = new Map(observations.map((observation) => [observation.attachmentRef, observation]));
-  return [...contents, attachmentObservationStateContent(requirements, byRef)];
+  return state ? [...contents, state] : contents;
 }
 
 function attachmentObservationResultFields(
@@ -2862,18 +3520,19 @@ async function compactWithSummary(
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
   const mediaSemantics = await prepareCompressionMediaSemantics(request, methodConfig, options, signal);
+  const attachmentState = compressionAttachmentState(mediaSemantics);
+  const summaryConfig = summaryConfigBesideAttachmentState(methodConfig, attachmentState);
   const summary = await generateSummaryText(
     mediaSemantics.request,
-    methodConfig,
+    summaryConfig,
     options,
     signal,
     mediaSemantics.provider
   );
   const contents = compressionSummaryContents(
     summary.text,
-    effectiveSummaryTargetTokens(methodConfig),
-    mediaSemantics.requirements,
-    mediaSemantics.observations
+    effectiveSummaryTargetTokens(summaryConfig),
+    attachmentState
   );
   return {
     id: `summary-${request.blockId}`,
@@ -2903,7 +3562,9 @@ async function compactWithSegmentedSummary(
   );
   const provider = mediaSemantics.provider ?? initialProvider;
   const semanticRequest = mediaSemantics.request;
-  const targetTokens = effectiveSummaryTargetTokens(methodConfig);
+  const attachmentState = compressionAttachmentState(mediaSemantics);
+  const summaryConfig = summaryConfigBesideAttachmentState(methodConfig, attachmentState);
+  const targetTokens = effectiveSummaryTargetTokens(summaryConfig);
   const priorSummaryText = semanticRequest.priorSummaryContents?.length
     ? plainTextOfContents(semanticRequest.priorSummaryContents)
     : '';
@@ -2912,8 +3573,8 @@ async function compactWithSegmentedSummary(
   let finalSummary = deterministic;
 
   if (sourceContents.length > 0 && provider.provider) {
-    const calls = buildSegmentedSummaryProviderCalls(semanticRequest, methodConfig, provider.settings);
-    const deltaSummaries = await mapWithBoundedConcurrency(
+    const calls = buildSegmentedSummaryProviderCalls(semanticRequest, summaryConfig, provider.settings);
+    const leaves = await mapWithBoundedConcurrency(
       calls,
       isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
       (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
@@ -2921,24 +3582,26 @@ async function compactWithSegmentedSummary(
     );
     const merged = await mergeSegmentedSummaryHierarchy(
       provider,
-      calls.map((call, index) => ({
-        summary: deltaSummaries[index] ?? '',
-        sourceContents: call.sourceContents
-      })),
+      leaves,
       priorSummaryText,
-      methodConfig,
+      summaryConfig,
       targetTokens,
       signal
     );
-    if (merged) finalSummary = finalizeStructuredSummary(merged, deterministic, targetTokens);
+    // Only the final summary is shortened, once: leaf and intermediate results are merge inputs that
+    // the next merge rewrites anyway, so shortening each of them doubled the requests.
+    if (merged) {
+      const shortened = await shortenOversizedSummary(
+        provider,
+        merged.candidate,
+        { ...merged.call, targetTokens },
+        signal
+      );
+      finalSummary = finalizeStructuredSummary(shortened, deterministic, targetTokens);
+    }
   }
 
-  const contents = compressionSummaryContents(
-    finalSummary,
-    targetTokens,
-    mediaSemantics.requirements,
-    mediaSemantics.observations
-  );
+  const contents = compressionSummaryContents(finalSummary, targetTokens, attachmentState);
   return {
     id: `summary-${request.blockId}`,
     object: 'limcode.context_summary',
@@ -2993,7 +3656,7 @@ interface ResolvedSummaryProvider {
   onCompressionProgress?: () => void;
 }
 
-/** 组装总结用 provider（复用运行时渠道解析 + 代理/头合并）；无 API Key 时 provider 为 undefined 表示回退确定性摘要。 */
+/** 组装总结 Provider；无密钥的自托管渠道仍走真实请求，认证失败不得伪装成摘要成功。 */
 async function resolveSummaryProvider(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
@@ -3012,26 +3675,28 @@ async function resolveSummaryProvider(
     ...(providerConfigId || model ? { model: { ...(providerConfigId ? { providerConfigId } : {}), model: model || '' } } : {})
   }, options);
 
+  const reasoningPlan = frozenSummaryReasoning(request, methodConfig, settings);
   const apiKeyAvailable = !!settings.apiKey;
-  if (!apiKeyAvailable && behavior.allowPlaceholderApiKey !== true) {
-    return {
-      provider: undefined,
-      settings,
-      stream: false,
-      apiKeyAvailable: false,
-      omitUnsupportedMaxOutputTokens: false
-    };
-  }
-  const runtimeSettings = apiKeyAvailable ? settings : { ...settings, apiKey: 'limcode-dry-run-placeholder-key' };
+  const runtimeSettings = !apiKeyAvailable && behavior.allowPlaceholderApiKey === true
+    ? { ...settings, apiKey: 'limcode-dry-run-placeholder-key' }
+    : settings;
   const unified = await importUnifiedLlmProvider();
   const registry = unified.createBootstrapExtensionRegistry();
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
-  const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
-  const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = installProviderCompatibility(unified.createLLMFromConfig({
-    provider: runtimeSettings.provider,
+  const headers = headersForProviderContext(
+    runtimeSettings,
+    request.contents,
+    mergeHeaders(await resolveMaybe(options.headers), settings.headers)
+  );
+  const configuredRequestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
+  const requestBody = summaryRequestBody(configuredRequestBody, reasoningPlan);
+  // 请求改写按摘要实际带上的渠道请求体判断用户是否自己写了思考参数（那些键已被去掉），
+  // 不能看渠道原始请求体，否则摘要推理计划的 reasoning_effort 会不经改写直接发出。
+  const adaptationSettings = { ...runtimeSettings, requestBody: summaryConfiguredRequestBody(configuredRequestBody) };
+  const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
+    provider: libraryProviderKind(runtimeSettings),
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
     baseUrl: runtimeSettings.baseUrl,
@@ -3042,7 +3707,7 @@ async function resolveSummaryProvider(
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders), runtimeSettings.provider, runtimeSettings.model);
+  }, registry.llmProviders), runtimeSettings.provider, runtimeSettings.model), adaptationSettings);
   return {
     provider,
     settings,
@@ -3086,13 +3751,15 @@ const ROLLING_SUMMARY_STRUCTURE_INSTRUCTION = [
   '  - 受阻',
   '下一步',
   '相关文件',
-  '必须保留准确的路径、符号名、命令、报错、URL、版本号和业务 ID。'
+  '必须保留准确的路径、符号名、命令、报错、URL、版本号和业务 ID。',
+  '子 Agent 的引用、派发任务和未完成补充必须一一对应；不得合并不同子 Agent 或不同派发，不得重编引用。',
+  '摘要中的子任务信息属于历史；继续执行时以重新提供的运行状态卡和子任务查询结果为准。'
 ].join('\n');
 
 function buildSummaryProviderCall(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord
+  settings: SummaryWindowSettings
 ): SummaryProviderCall {
   const summarySettings = methodConfig.llmSummary;
   const targetTokens = effectiveSummaryTargetTokens(methodConfig);
@@ -3125,9 +3792,73 @@ function buildSummaryProviderCall(
   };
 }
 
+/** The only Provider setting the summary splitter measures against. */
+type SummaryWindowSettings = Pick<LlmProviderConfigRecord, 'contextWindowTokens'>;
+
+export interface CompressionSummaryCallPlan {
+  /** Summary requests over the source: one for a single-call summary, one per chunk when segmented. */
+  summaryCalls: number;
+  /**
+   * Merge requests that fold segmented summaries into one. The real count depends on the summaries
+   * the Provider returns; this assumes each segment summary fills its per-call target.
+   */
+  mergeCalls: number;
+}
+
+/** Most chunks one segmented summary may send. */
+export const SEGMENTED_SUMMARY_LEAF_CALL_LIMIT = 32;
+
+/**
+ * Plans a text summary with the exact request builders and window checks the compact call runs,
+ * without calling a Provider. Throws the same `compression_source_too_large` /
+ * `compression_request_too_large` errors the real call throws before sending anything.
+ */
+export function planCompressionSummaryCalls(
+  request: LlmCompactRequest,
+  settings: SummaryWindowSettings
+): CompressionSummaryCallPlan {
+  const methodConfig = request.methodConfigSnapshot;
+  if (!methodConfig || (methodConfig.kind !== 'llm_summary' && methodConfig.kind !== 'segmented_summary')) {
+    throw new TypeError('Summary call planning requires a frozen llm_summary or segmented_summary config.');
+  }
+  const plan = (summaryCalls: number, mergeCalls = 0): CompressionSummaryCallPlan => ({ summaryCalls, mergeCalls });
+  const sourceContents = summaryDeltaContents(request);
+  if (sourceContents.length === 0) return plan(0);
+  if (methodConfig.kind === 'llm_summary') {
+    if (!isSummaryProviderCallWithinWindow(buildSummaryProviderCall(request, methodConfig, settings), settings)) {
+      throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
+    }
+    return plan(1);
+  }
+  const targetTokens = effectiveSummaryTargetTokens(methodConfig);
+  const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, settings);
+  const placeholder = (tokens: number): SegmentedSummaryNode => ({
+    summary: fitTextToTokenLimit('summary '.repeat(tokens), tokens),
+    sourceContents: []
+  });
+  let nodes = calls.map((call) => placeholder(call.targetTokens));
+  let mergeCalls = 0;
+  for (let level = 0; nodes.length > 1; level += 1) {
+    if (level >= MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS) {
+      throw new Error('compression_source_too_large: segmented summary exceeded the hierarchy depth limit.');
+    }
+    const groups = packSegmentedSummaryNodes(nodes, methodConfig, settings, targetTokens);
+    if (groups.length >= nodes.length) {
+      throw new Error('compression_request_too_large: summary deltas cannot be merged inside the frozen Provider window.');
+    }
+    mergeCalls += groups.filter((group) => group.length > 1).length;
+    nodes = groups.map((group) => group.length > 1 ? placeholder(targetTokens) : group[0]!);
+  }
+  const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
+  if (nodes.length > 0 && priorSummaryText) mergeCalls += 1;
+  return plan(calls.length, mergeCalls);
+}
+
 interface SegmentedSummaryChunk {
   requestContents: MessageContent[];
   sourceContents: MessageContent[];
+  /** Least the chunk's escaped transcript adds to any call, when a split already measured it. */
+  transcriptTokensFloor?: number;
 }
 
 interface SegmentedSummaryUnit extends SegmentedSummaryChunk {
@@ -3140,7 +3871,7 @@ interface SegmentedSummaryUnit extends SegmentedSummaryChunk {
 function buildSegmentedSummaryProviderCalls(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord
+  settings: SummaryWindowSettings
 ): SummaryProviderCall[] {
   const totalTargetTokens = effectiveSummaryTargetTokens(methodConfig);
   const sourceSegments = (request.segments && request.segments.length > 0
@@ -3148,6 +3879,20 @@ function buildSegmentedSummaryProviderCalls(
     : request.contents.length > 0 ? [request.contents] : [])
     .filter((segment) => segment.length > 0);
   if (sourceSegments.length === 0) return [];
+  // Every packing call carries the same generation config, so they share one input limit.
+  const packingLimitTokens = summaryProviderInputLimitTokens(
+    buildSegmentDeltaCall([], 0, '', methodConfig, settings, totalTargetTokens),
+    settings
+  );
+  // Every chunk carries less transcript than one call may hold, so a transcript clearly beyond the
+  // whole leaf budget cannot fit; report it before splitting the whole source chunk by chunk.
+  const transcriptTokens = estimateTokenCount(JSON.stringify(renderContentsForSummary(sourceSegments.flat())));
+  if (packingLimitTokens > 0 && transcriptTokens
+    > packingLimitTokens * MAX_SEGMENTED_SUMMARY_LEAF_CALLS * SEGMENTED_SUMMARY_BUDGET_OVERFLOW_MARGIN) {
+    throw new Error(
+      `compression_source_too_large: segmented summary exceeds the ${MAX_SEGMENTED_SUMMARY_LEAF_CALLS}-leaf call budget.`
+    );
+  }
   const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
   const units: SegmentedSummaryUnit[] = sourceSegments.flatMap((segment) =>
     groupAtomicMessageContents(segment).map((group) => ({
@@ -3165,10 +3910,14 @@ function buildSegmentedSummaryProviderCalls(
   const priorFor = (index: number): string => index === 0
     ? priorSummaryText
     : finalAnswerTextOf(groups[index - 1]?.requestContents ?? []);
+  const callFor = (contents: MessageContent[], index: number): SummaryProviderCall =>
+    buildSegmentDeltaCall(contents, index, priorFor(index), methodConfig, settings, totalTargetTokens);
   const fits = (contents: MessageContent[], index: number): boolean => isSummaryProviderCallWithinWindow(
-    buildSegmentDeltaCall(contents, index, priorFor(index), methodConfig, settings, totalTargetTokens),
+    callFor(contents, index),
     settings
   );
+  // Upper bound on the current chunk's call tokens; undefined until the next exact measurement.
+  let currentCallTokensBound: number | undefined;
   const pushCurrent = (): void => {
     if (current.requestContents.length === 0) return;
     if (groups.length >= MAX_SEGMENTED_SUMMARY_LEAF_CALLS) {
@@ -3178,14 +3927,41 @@ function buildSegmentedSummaryProviderCalls(
     }
     groups.push(current);
     current = { requestContents: [], sourceContents: [] };
+    currentCallTokensBound = undefined;
   };
 
   for (const unit of units) {
-    const candidate = [...current.requestContents, ...unit.requestContents];
-    if (fits(candidate, groups.length)) {
-      current.requestContents = candidate;
-      current.sourceContents.push(...unit.sourceContents);
-      continue;
+    // A unit whose own text is already beyond one call is split straight away: measuring a
+    // multi-megabyte record whole (appended, then alone) only to learn that took seconds.
+    const transcriptFloor = summaryUnitTranscriptTokensFloor(unit);
+    const beyondOneCall = packingLimitTokens > 0 && transcriptFloor !== undefined && transcriptFloor > packingLimitTokens;
+    let measuredAlone = beyondOneCall;
+    if (!beyondOneCall) {
+      // Re-measuring the whole growing chunk for every unit made packing quadratic. The token
+      // estimator is additive across the escaped transcript, so a unit whose rendered cost still fits
+      // under the last exact measurement is accepted without re-rendering the chunk; anything closer
+      // to the limit takes the exact measurement below.
+      if (currentCallTokensBound !== undefined && current.requestContents.length > 0) {
+        const bound = currentCallTokensBound + appendedSummaryTranscriptTokensBound(
+          unit.requestContents,
+          current.requestContents.length
+        );
+        if (bound <= packingLimitTokens) {
+          current.requestContents = [...current.requestContents, ...unit.requestContents];
+          current.sourceContents.push(...unit.sourceContents);
+          currentCallTokensBound = bound;
+          continue;
+        }
+      }
+      measuredAlone = current.requestContents.length === 0;
+      const candidate = [...current.requestContents, ...unit.requestContents];
+      const candidateTokens = summaryProviderCallInputTokens(callFor(candidate, groups.length));
+      if (packingLimitTokens > 0 && candidateTokens <= packingLimitTokens) {
+        current.requestContents = candidate;
+        current.sourceContents.push(...unit.sourceContents);
+        currentCallTokensBound = candidateTokens;
+        continue;
+      }
     }
     pushCurrent();
     const safeUnits = splitOversizedSummaryUnit(
@@ -3195,12 +3971,29 @@ function buildSegmentedSummaryProviderCalls(
       methodConfig,
       settings,
       totalTargetTokens,
-      MAX_SEGMENTED_SUMMARY_LEAF_CALLS - groups.length
+      MAX_SEGMENTED_SUMMARY_LEAF_CALLS - groups.length,
+      measuredAlone
     );
+    // Exact tokens of the current call while it holds only what was measured alone.
+    let currentTokens: number | undefined;
     for (const safeUnit of safeUnits) {
-      const next = [...current.requestContents, ...safeUnit.requestContents];
-      if (!fits(next, groups.length)) pushCurrent();
-      if (!fits(safeUnit.requestContents, groups.length)) {
+      if (current.requestContents.length > 0) {
+        // A split piece fills most of a call by itself, so joining it to the previous piece is
+        // measured only when the room left could possibly hold it.
+        const joinedFloor = currentTokens !== undefined && safeUnit.transcriptTokensFloor !== undefined
+          ? currentTokens + safeUnit.transcriptTokensFloor - SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS
+          : undefined;
+        if ((joinedFloor === undefined || joinedFloor <= packingLimitTokens)
+          && fits([...current.requestContents, ...safeUnit.requestContents], groups.length)) {
+          current.requestContents.push(...safeUnit.requestContents);
+          current.sourceContents.push(...safeUnit.sourceContents);
+          currentTokens = undefined;
+          continue;
+        }
+        pushCurrent();
+      }
+      currentTokens = summaryProviderCallInputTokens(callFor(safeUnit.requestContents, groups.length));
+      if (packingLimitTokens <= 0 || currentTokens > packingLimitTokens) {
         throw new Error(
           `compression_request_too_large: fixed summary prompt cannot fit chunk ${groups.length + 1} in the frozen Provider window.`
         );
@@ -3208,6 +4001,7 @@ function buildSegmentedSummaryProviderCalls(
       current.requestContents.push(...safeUnit.requestContents);
       current.sourceContents.push(...safeUnit.sourceContents);
     }
+    currentCallTokensBound = currentTokens;
   }
   pushCurrent();
   if (groups.length > MAX_SEGMENTED_SUMMARY_LEAF_CALLS) {
@@ -3240,22 +4034,26 @@ function splitOversizedSummaryUnit(
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number,
-  maxChunks: number
+  maxChunks: number,
+  /** The caller already measured this unit alone, with this prior, beyond the window. */
+  knownOversized = false
 ): SegmentedSummaryChunk[] {
   if (maxChunks <= 0) {
     throw new Error('compression_source_too_large: segmented summary exhausted the leaf call budget.');
   }
-  const direct = buildSegmentDeltaCall(
-    unit.requestContents,
-    index,
-    priorContext,
-    methodConfig,
-    settings,
-    targetTokens
-  );
-  if (isSummaryProviderCallWithinWindow(direct, settings)) return [unit];
+  if (!knownOversized) {
+    const direct = buildSegmentDeltaCall(
+      unit.requestContents,
+      index,
+      priorContext,
+      methodConfig,
+      settings,
+      targetTokens
+    );
+    if (isSummaryProviderCallWithinWindow(direct, settings)) return [unit];
+  }
 
   const message = unit.kind === 'message' && unit.requestContents.length === 1
     ? unit.requestContents[0]
@@ -3285,9 +4083,9 @@ function splitOversizedSummaryUnit(
         targetTokens
       );
       if (!fitting) break;
-      const chunk: MessageContent = { role: message.role, parts: [{ ...textPart, text: fitting }] };
-      chunks.push({ requestContents: [chunk], sourceContents: [chunk] });
-      remaining = remaining.slice(fitting.length);
+      const chunk: MessageContent = { role: message.role, parts: [{ ...textPart, text: fitting.text }] };
+      chunks.push({ requestContents: [chunk], sourceContents: [chunk], transcriptTokensFloor: fitting.transcriptTokensFloor });
+      remaining = remaining.slice(fitting.text.length);
     }
     if (remaining.length === 0 && chunks.length > 0) return chunks;
   }
@@ -3314,9 +4112,9 @@ function splitOversizedSummaryUnit(
       targetTokens
     );
     if (!fitting) break;
-    const chunk: MessageContent = { role: 'user', parts: [{ text: fitting }] };
-    chunks.push({ requestContents: [chunk], sourceContents: [chunk] });
-    remaining = remaining.slice(fitting.length);
+    const chunk: MessageContent = { role: 'user', parts: [{ text: fitting.text }] };
+    chunks.push({ requestContents: [chunk], sourceContents: [chunk], transcriptTokensFloor: fitting.transcriptTokensFloor });
+    remaining = remaining.slice(fitting.text.length);
   }
   if (remaining.length === 0 && chunks.length > 0) return chunks;
   throw new Error(
@@ -3324,41 +4122,105 @@ function splitOversizedSummaryUnit(
   );
 }
 
+/**
+ * Largest prefix of `text` whose summary call still fits the frozen window.
+ *
+ * The call is measured as JSON, where the text is escaped, and the estimator sums independent
+ * segments: the call costs its fixed framing plus what the escaped text costs alone, give or take
+ * the one segment that may merge across either edge. So the prefix is cut once at the budget the
+ * framing leaves and then confirmed with one exact measurement. Bisecting with a full measurement per
+ * probe (and slicing the whole remainder first) took seconds on a multi-megabyte message, all of it
+ * on the extension host while the rebuild dialog waited for its estimate.
+ */
 function largestFittingSummaryTextPrefix(
   text: string,
   role: MessageContent['role'],
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number
-): string {
-  let low = 1;
-  let high = Math.max(1, estimateTokenCount(text));
-  let best = '';
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    const candidateText = sliceByTokens(text, 0, middle);
-    if (!candidateText) {
-      low = middle + 1;
-      continue;
+): { text: string; transcriptTokensFloor: number } | undefined {
+  const callWith = (candidateText: string): SummaryProviderCall => buildSegmentDeltaCall(
+    [{ role, parts: [{ text: candidateText }] }],
+    index,
+    priorContext,
+    methodConfig,
+    settings,
+    targetTokens
+  );
+  const empty = callWith('');
+  const limitTokens = summaryProviderInputLimitTokens(empty, settings);
+  if (limitTokens <= 0) return undefined;
+  const framingTokens = summaryProviderCallInputTokens(empty);
+  let budget = limitTokens - framingTokens - SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS;
+  for (let attempt = 0; budget > 0 && attempt < LARGEST_FITTING_PREFIX_ATTEMPTS; attempt += 1) {
+    const prefix = escapedTextPrefixByTokens(text, budget);
+    if (!prefix) return undefined;
+    const callTokens = summaryProviderCallInputTokens(callWith(prefix));
+    if (callTokens <= limitTokens) {
+      return {
+        text: prefix,
+        transcriptTokensFloor: Math.max(0, callTokens - framingTokens - SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS)
+      };
     }
-    const call = buildSegmentDeltaCall(
-      [{ role, parts: [{ text: candidateText }] }],
-      index,
-      priorContext,
-      methodConfig,
-      settings,
-      targetTokens
-    );
-    if (isSummaryProviderCallWithinWindow(call, settings)) {
-      best = candidateText;
-      low = middle + 1;
-    } else {
-      high = middle - 1;
-    }
+    budget -= Math.max(SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS, callTokens - limitTokens);
   }
-  return best;
+  return undefined;
+}
+
+const LARGEST_FITTING_PREFIX_ATTEMPTS = 8;
+/** Characters one estimator token usually spans; only whitespace and digit runs span more. */
+const ESTIMATOR_TYPICAL_CHARS_PER_TOKEN = 4;
+
+/**
+ * Longest prefix of `text` whose JSON-escaped form the estimator counts at no more than `tokens`.
+ * Only a window slightly larger than the answer is escaped and measured: it starts at a typical
+ * character count for `tokens` and doubles while it still holds fewer tokens than asked for.
+ */
+function escapedTextPrefixByTokens(text: string, tokens: number): string {
+  let windowChars = Math.max(1_024, (tokens + 1) * ESTIMATOR_TYPICAL_CHARS_PER_TOKEN);
+  for (;;) {
+    const window = text.length <= windowChars ? text : text.slice(0, windowChars);
+    const escaped = JSON.stringify(window).slice(1, -1);
+    const escapedPrefix = sliceByTokens(escaped, 0, tokens);
+    if (escapedPrefix.length < escaped.length || window.length === text.length) {
+      return rawPrefixForEscapedLength(window, escapedPrefix.length);
+    }
+    windowChars *= 2;
+  }
+}
+
+/** Longest prefix of `text` whose JSON.stringify escaping is at most `escapedLength` characters; never splits a surrogate pair. */
+function rawPrefixForEscapedLength(text: string, escapedLength: number): string {
+  let used = 0;
+  let end = 0;
+  while (end < text.length) {
+    const code = text.charCodeAt(end);
+    let units = 1;
+    let cost: number;
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x0c || code === 0x0a || code === 0x0d || code === 0x09) {
+      cost = 2;
+    } else if (code < 0x20) {
+      cost = 6;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = end + 1 < text.length ? text.charCodeAt(end + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        units = 2;
+        cost = 2;
+      } else {
+        cost = 6;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      cost = 6;
+    } else {
+      cost = 1;
+    }
+    if (used + cost > escapedLength) break;
+    used += cost;
+    end += units;
+  }
+  return text.slice(0, end);
 }
 
 function buildSegmentDeltaCall(
@@ -3366,7 +4228,7 @@ function buildSegmentDeltaCall(
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number,
   sourceContents: MessageContent[] = segment
 ): SummaryProviderCall {
@@ -3398,7 +4260,7 @@ function buildSummaryReplacementMergeCall(
   deltaSummaries: readonly string[],
   sourceContents: MessageContent[],
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number
 ): SummaryProviderCall {
   return {
@@ -3423,18 +4285,31 @@ function buildSummaryReplacementMergeCall(
 }
 
 interface SegmentedSummaryNode {
+  /** Bounded to the call's target; what a later merge reads. */
   summary: string;
   sourceContents: MessageContent[];
 }
 
+/** A summary produced by one Provider call: the bounded node plus the model's unbounded text. */
+interface SummarizedSegmentNode extends SegmentedSummaryNode {
+  candidate: string;
+  call: SummaryProviderCall;
+}
+
+interface FinalSegmentedSummary {
+  /** The model's own text for the final summary, before any shortening or mechanical cut. */
+  candidate: string;
+  call: SummaryProviderCall;
+}
+
 async function mergeSegmentedSummaryHierarchy(
   provider: ResolvedSummaryProvider,
-  initialNodes: readonly SegmentedSummaryNode[],
+  initialNodes: readonly SummarizedSegmentNode[],
   priorSummaryText: string,
   methodConfig: LlmCompressionConfigRecord,
   targetTokens: number,
   signal?: AbortSignal
-): Promise<string> {
+): Promise<FinalSegmentedSummary | undefined> {
   let nodes = [...initialNodes];
   for (let level = 0; nodes.length > 1; level += 1) {
     if (level >= MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS) {
@@ -3457,20 +4332,18 @@ async function mergeSegmentedSummaryHierarchy(
           provider.settings,
           targetTokens
         );
-        return {
-          summary: await summarizeSingleRound(provider, call, siblingSignal),
-          sourceContents: call.sourceContents
-        };
+        return summarizeSingleRound(provider, call, siblingSignal);
       },
       signal
     );
   }
-  if (nodes.length === 0) return '';
-  if (!priorSummaryText) return nodes[0]!.summary;
+  const top = nodes[0];
+  if (!top) return undefined;
+  if (!priorSummaryText) return { candidate: top.candidate, call: top.call };
   const call = buildSummaryReplacementMergeCall(
     priorSummaryText,
-    [nodes[0]!.summary],
-    nodes[0]!.sourceContents,
+    [top.summary],
+    top.sourceContents,
     methodConfig,
     provider.settings,
     targetTokens
@@ -3478,17 +4351,17 @@ async function mergeSegmentedSummaryHierarchy(
   if (!isSummaryProviderCallWithinWindow(call, provider.settings)) {
     throw new Error('compression_request_too_large: prior summary and segmented delta cannot fit a merge request.');
   }
-  return summarizeSingleRound(provider, call, signal);
+  return { candidate: await requestSummaryCandidate(provider, call, signal), call };
 }
 
-function packSegmentedSummaryNodes(
-  nodes: readonly SegmentedSummaryNode[],
+function packSegmentedSummaryNodes<Node extends SegmentedSummaryNode>(
+  nodes: readonly Node[],
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokens: number
-): SegmentedSummaryNode[][] {
-  const groups: SegmentedSummaryNode[][] = [];
-  let current: SegmentedSummaryNode[] = [];
+): Node[][] {
+  const groups: Node[][] = [];
+  let current: Node[] = [];
   for (const node of nodes) {
     const candidate = [...current, node];
     const fits = current.length === 0 || isSummaryProviderCallWithinWindow(
@@ -3513,95 +4386,130 @@ function packSegmentedSummaryNodes(
   return groups;
 }
 
+/**
+ * 目标长度是上限：压缩后留给最近消息的空间按它扣除。模型数 token 不准，常超出“约 N”两成左右，
+ * 所以请它瞄准上限的八成，并说明超出部分会被机械删减，让它自己决定删什么。
+ */
 function withSummaryTargetInstruction(prompt: string, targetTokens: number | undefined): string {
   if (typeof targetTokens !== 'number' || !Number.isFinite(targetTokens) || targetTokens <= 0) return prompt;
-  return `${prompt}\n\n将可见摘要正文控制在约 ${Math.floor(targetTokens)} tokens；优先保留标识符、数字、文件名、依赖关系、决定和未完成事项。`;
+  const limit = Math.floor(targetTokens);
+  const aim = Math.max(1, Math.floor(limit * 0.8));
+  return `${prompt}\n\n将可见摘要正文控制在约 ${aim} tokens，最多不超过 ${limit} tokens；超出上限的部分会被机械删减，所以宁可写短一些。优先保留标识符、数字、文件名、依赖关系、决定和未完成事项。`;
 }
 
-const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = 32;
+const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = SEGMENTED_SUMMARY_LEAF_CALL_LIMIT;
 const MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS = 6;
 const SEGMENTED_SUMMARY_CONCURRENCY = 3;
 const SEGMENTED_PRIOR_CONTEXT_TOKENS = 1_024;
-const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 2_048;
+const SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS = 4;
+const SEGMENTED_SUMMARY_BUDGET_OVERFLOW_MARGIN = 1.1;
+const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 8_192;
 const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 2;
 const SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS = 8_000;
 
 /**
- * `targetTokens` is the desired visible summary length, while Provider output accounting also
- * includes hidden reasoning tokens. Keep those two budgets separate: use the target in the prompt,
- * default summary reasoning to low, and reserve a bounded hard-output ceiling. An explicit method
- * `maxOutputTokens`/`thinkingConfig` remains authoritative.
+ * `targetTokens` is the desired visible summary length, while Provider output accounting can also
+ * include hidden reasoning tokens. Reasoning intent is resolved and frozen by the configuration
+ * authority; this request builder must never invent a cross-provider `low`/`medium` default.
  */
 function summaryGenerationConfig(
   methodConfig: LlmCompressionConfigRecord,
-  settings: LlmProviderConfigRecord,
+  settings: SummaryWindowSettings,
   targetTokensOverride?: number
 ): LlmGenerationConfigRecord | undefined {
   const targetTokens = targetTokensOverride ?? methodConfig.llmSummary?.targetTokens;
-  const inherited = settings.generationConfig ?? {};
   const method = methodConfig.llmSummary?.generationConfig ?? {};
-  const {
-    maxOutputTokens: inheritedMaxOutputTokens,
-    thinkingConfig: inheritedThinkingConfig,
-    ...inheritedRest
-  } = inherited;
-  const {
-    maxOutputTokens: methodMaxOutputTokens,
-    thinkingConfig: methodThinkingConfig,
-    ...methodRest
-  } = method;
-  const derivedMaxOutputTokens = typeof targetTokens === 'number'
-    && Number.isFinite(targetTokens)
-    && targetTokens > 0
-    ? Math.max(
-        SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS,
-        Math.min(
-          DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
-          Math.ceil(targetTokens * SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER)
-        )
-      )
-    : inheritedMaxOutputTokens;
-  const generationConfig = {
-    ...inheritedRest,
-    ...methodRest,
-    ...((methodMaxOutputTokens ?? derivedMaxOutputTokens) !== undefined
-      ? { maxOutputTokens: methodMaxOutputTokens ?? derivedMaxOutputTokens }
-      : {}),
-    thinkingConfig: methodThinkingConfig ?? {
-      ...(inheritedThinkingConfig ?? {}),
-      thinkingLevel: 'low' as const
-    }
-  };
-  return Object.keys(generationConfig).length > 0 ? generationConfig : undefined;
+  const { thinkingConfig: _thinking, maxOutputTokens: _maximum, ...methodRest } = method;
+  return { ...methodRest, maxOutputTokens: resolveSummaryOutputBudget(targetTokens, method) };
 }
 
-async function summarizeSingleRound(
+/** One summary request; the model's text (inside `<summary>` when present), not yet bounded. */
+async function requestSummaryCandidate(
   resolved: ResolvedSummaryProvider,
   call: SummaryProviderCall,
   signal?: AbortSignal
 ): Promise<string> {
-  const fallback = deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
-  if (!resolved.provider) return fallback;
+  return extractSummaryTag((await executeSummaryProviderCall(
+    resolved, call.request, signal, { allowCompatibilityRetry: false }
+  )).trim());
+}
 
+/**
+ * A leaf or intermediate merge summary. It only feeds a later merge, so an oversized one is cut to
+ * its target mechanically instead of costing another request; the final summary alone is shortened
+ * by the model (compactWithSegmentedSummary).
+ */
+async function summarizeSingleRound(
+  resolved: ResolvedSummaryProvider,
+  call: SummaryProviderCall,
+  signal?: AbortSignal
+): Promise<SummarizedSegmentNode> {
+  const fallback = deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
+  const candidate = await requestSummaryCandidate(resolved, call, signal);
+  // Method changes belong to the durable coordinator, never a hidden leaf-level fallback.
+  return {
+    summary: finalizeStructuredSummary(candidate, fallback, call.targetTokens),
+    sourceContents: call.sourceContents,
+    candidate,
+    call
+  };
+}
+
+/** Tokens of the seven headings with every section empty; no shorter structured summary exists. */
+const EMPTY_STRUCTURED_SUMMARY_TOKENS = estimateTokenCount(formatStructuredSummary(emptyStructuredSummary()));
+
+/**
+ * 模型数不准 token，常写得比上限长。超出上限时请它把自己的摘要删短一次，删什么由模型决定；
+ * 仍超出才由 finalizeStructuredSummary 按条目机械删减。只对最终摘要调用一次。
+ * 拒答、没按标题输出、删短请求失败，或上限连七个空标题都放不下时原样交回。
+ */
+async function shortenOversizedSummary(
+  resolved: ResolvedSummaryProvider,
+  candidate: string,
+  call: SummaryProviderCall,
+  signal?: AbortSignal
+): Promise<string> {
+  const parsed = candidate.trim() ? parseStructuredSummary(candidate) : undefined;
+  if (!parsed || structuredSummaryFactCount(parsed) === 0) return candidate;
+  const text = modelSummaryText(candidate);
+  const currentTokens = estimateTokenCount(text);
+  const limitTokens = summaryBodyBudget(call.targetTokens);
+  if (currentTokens <= limitTokens) return candidate;
+  // No rewrite can keep the headings under such a limit; the mechanical cut handles it without a request.
+  if (limitTokens < EMPTY_STRUCTURED_SUMMARY_TOKENS) return candidate;
+  logCompressionDebug('summary.shorten.begin', { label: call.label, currentTokens, limitTokens });
   try {
-    const trimmed = (await executeSummaryProviderCall(
-      resolved,
-      call.request,
-      signal,
-      { allowCompatibilityRetry: false }
-    )).trim();
-    return finalizeStructuredSummary(extractSummaryTag(trimmed), fallback, call.targetTokens);
+    const shortened = extractSummaryTag((await executeSummaryProviderCall(resolved, {
+      contents: [{ role: 'user', parts: [{ text }] }],
+      systemInstruction: { parts: [{ text: summaryShortenInstruction(currentTokens, limitTokens) }] },
+      ...(call.request.generationConfig ? { generationConfig: call.request.generationConfig } : {})
+    }, signal, { allowCompatibilityRetry: false })).trim());
+    const reparsed = parseStructuredSummary(shortened);
+    const shortenedTokens = estimateTokenCount(modelSummaryText(shortened));
+    // A rewrite that is not actually shorter would only replace the model's first answer with a
+    // second one that the mechanical cut then trims harder.
+    const accepted = !!reparsed && structuredSummaryFactCount(reparsed) > 0 && shortenedTokens < currentTokens;
+    logCompressionDebug('summary.shorten.done', { label: call.label, accepted, shortenedTokens });
+    return accepted ? shortened : candidate;
   } catch (error) {
-    if (isRequestAbort(signal)) throw error;
-    const contextLength = isContextLengthExceededError(error);
-    logCompressionDebug('provider.compact.segmentedSummary.segmentFallback', {
-      error: errorDebugInfo(error),
-      segmentContents: call.sourceContents.length,
-      contextLength
+    if (signal?.aborted) throw error;
+    logCompressionDebug('summary.shorten.failed', {
+      label: call.label, message: error instanceof Error ? error.message : String(error)
     });
-    if (!contextLength) throw error;
-    return fallback;
+    return candidate;
   }
+}
+
+function summaryShortenInstruction(currentTokens: number, limitTokens: number): string {
+  const aim = Math.max(1, Math.floor(limitTokens * 0.8));
+  const cutPercent = Math.min(90, Math.max(10, Math.round((1 - aim / currentTokens) * 100)));
+  return [
+    `下面是一份对话摘要，现在约 ${currentTokens} tokens，超出了 ${limitTokens} tokens 的上限。`,
+    `把它删短到约 ${aim} tokens（大约删掉 ${cutPercent}%），最多不超过 ${limitTokens} tokens。`,
+    '保持原有标题和结构：目标、重要约束、决定和准确标识、工作状态（已完成 / 正在做 / 受阻）、下一步、相关文件；缺少内容时写“无”。',
+    '先删重复内容、过程描述和能从文件里重新读到的大段代码；保留准确的路径、符号名、命令、报错、URL、版本号、业务 ID 和未完成事项。',
+    '不要添加新内容，只输出删短后的摘要。'
+  ].join('\n');
 }
 
 async function executeSummaryProviderCall(
@@ -3610,7 +4518,7 @@ async function executeSummaryProviderCall(
   signal?: AbortSignal,
   options: { allowCompatibilityRetry?: boolean } = {}
 ): Promise<string> {
-  if (!resolved.provider) return '';
+  if (!resolved.provider) throw new Error('Summary provider was not resolved.');
   const execute = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
     if (resolved.stream || isOpenAIResponsesWebSocketMode(resolved.settings)) {
       let text = '';
@@ -3627,6 +4535,10 @@ async function executeSummaryProviderCall(
             rawChunk: (chunk as { rawChunk?: unknown }).rawChunk ?? chunk
           }));
         }
+        if (/length|max_tokens|max_output_tokens/i.test(String((chunk as { finishReason?: unknown }).finishReason ?? ''))) {
+          throw Object.assign(new Error('Summary output limit exhausted; the stream did not produce a complete summary.'),
+            { code: 'SUMMARY_OUTPUT_LIMIT_EXHAUSTED' });
+        }
         text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
         if (chunk.textDelta?.trim() || chunk.partsDelta?.some((part) =>
           'text' in part && typeof part.text === 'string' && part.text.trim()
@@ -3634,7 +4546,7 @@ async function executeSummaryProviderCall(
           resolved.onCompressionProgress?.();
         }
       }
-      return text;
+      return requireSummaryVisibleOutput(text);
     }
 
     const response = await resolved.provider!.chat<UnifiedLLMResponse>(activeRequest, {
@@ -3647,16 +4559,36 @@ async function executeSummaryProviderCall(
         rawResponse: response.rawResponse ?? response
       }));
     }
-    return visibleTextFromParts(response.content?.parts ?? []);
+    if (/length|max_tokens|max_output_tokens/i.test(String(response.finishReason ?? ''))) {
+      throw Object.assign(new Error('Summary output limit exhausted; the configured method did not produce a complete summary.'), { code: 'SUMMARY_OUTPUT_LIMIT_EXHAUSTED' });
+    }
+    return requireSummaryVisibleOutput(visibleTextFromParts(response.content?.parts ?? []));
   };
 
+  // 明确的不支持参数 400：记住目标适配后立即重发同一请求；与下面按方法配置的兼容重试相互独立。
+  const adaptationRetry = createProviderRequestAdaptationRetry(providerRequestTarget(resolved.settings), {
+    userRequestBodyKeys: Object.keys(resolved.settings.requestBody ?? {})
+  });
+  const executeAdapting = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
+    for (;;) {
+      try {
+        return await execute(activeRequest);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        const failure = failureFromCaughtError(error);
+        if (adaptationRetry.shouldRetryImmediately(failure.rawError)) continue;
+        const explained = withUserRequestBodyRejection(failure, adaptationRetry, resolved.settings);
+        throw explained === failure ? error : new LlmAttemptFailureError(explained);
+      }
+    }
+  };
   const initialRequest = resolved.omitUnsupportedMaxOutputTokens
     ? withoutMaxOutputTokens(request)
     : request;
   try {
-    return await execute(initialRequest);
+    return await executeAdapting(initialRequest);
   } catch (error) {
-    if (options.allowCompatibilityRetry === false) throw error;
+    if (options.allowCompatibilityRetry !== true) throw error;
     if (hasMaxOutputTokens(initialRequest) && isUnsupportedMaxOutputTokensError(error)) {
       resolved.omitUnsupportedMaxOutputTokens = true;
       logCompressionDebug('provider.compact.summary.compatibilityRetry', {
@@ -3665,7 +4597,7 @@ async function executeSummaryProviderCall(
         transport: resolved.settings.openaiResponsesTransport,
         removedParameter: 'max_output_tokens'
       });
-      return execute(withoutMaxOutputTokens(initialRequest));
+      return executeAdapting(withoutMaxOutputTokens(initialRequest));
     }
     if (hasMaxOutputTokens(initialRequest) && isMaxOutputTokensIncompleteError(error)) {
       const previousMaxOutputTokens = initialRequest.generationConfig!.maxOutputTokens!;
@@ -3680,7 +4612,7 @@ async function executeSummaryProviderCall(
           previousMaxOutputTokens,
           nextMaxOutputTokens
         });
-        return execute(withMaxOutputTokens(initialRequest, nextMaxOutputTokens));
+        return executeAdapting(withMaxOutputTokens(initialRequest, nextMaxOutputTokens));
       }
     }
     throw error;
@@ -3778,15 +4710,16 @@ async function generateSummaryText(
   if (request.contents.length === 0) return { text: fallback };
 
   const resolved = resolvedProvider ?? await resolveSummaryProvider(request, methodConfig, options);
-  if (!resolved.provider) return { text: fallback, settings: resolved.settings };
+  if (!resolved.provider) throw new Error('Summary provider was not resolved.');
 
   const call = buildSummaryProviderCall(request, methodConfig, resolved.settings);
   if (!isSummaryProviderCallWithinWindow(call, resolved.settings)) {
     throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
   }
   const text = extractSummaryTag((await executeSummaryProviderCall(resolved, call.request, signal)).trim());
+  const summary = await shortenOversizedSummary(resolved, text, call, signal);
   return {
-    text: finalizeStructuredSummary(text, fallback, targetTokens),
+    text: finalizeStructuredSummary(summary, fallback, targetTokens),
     settings: resolved.settings
   };
 }
@@ -3800,7 +4733,7 @@ function normalizeCompressionConfig(input: LlmCompressionConfigRecord | undefine
     kind,
     maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(input?.maxDurationMinutes),
     trigger: input?.trigger ?? { mode: 'manual' },
-    ...(input?.openaiResponsesCompact ? { openaiResponsesCompact: input.openaiResponsesCompact } : {}),
+    ...(input?.providerNative ? { providerNative: input.providerNative } : {}),
     ...(input?.llmSummary ? { llmSummary: input.llmSummary } : {}),
     createdAt: input?.createdAt ?? now,
     updatedAt: input?.updatedAt ?? now
@@ -3812,8 +4745,8 @@ function usageMetadataFromCompact(value: unknown): LlmUsageMetadataRecord | unde
   return isRecord(cleaned) && Object.keys(cleaned).length > 0 ? cleaned as LlmUsageMetadataRecord : undefined;
 }
 
-function renderContentsForSummary(contents: MessageContent[]): string {
-  return contents.map((content, index) => `${index + 1}. ${content.role}: ${content.parts.map(renderSummaryPart).filter(Boolean).join('\n') || '[empty]'}`).join('\n\n');
+function renderContentsForSummary(contents: MessageContent[], startIndex = 0): string {
+  return contents.map((content, index) => `${startIndex + index + 1}. ${content.role}: ${content.parts.map(renderSummaryPart).filter(Boolean).join('\n') || '[empty]'}`).join('\n\n');
 }
 
 function renderSummaryPart(part: ContentPart): string {
@@ -3913,7 +4846,7 @@ function parseStructuredSummary(text: string): StructuredSummary | undefined {
       if (heading.rest && heading.rest !== '无') appendSummaryFact(summary, field, heading.rest);
       continue;
     }
-    if (line === '工作状态' || line === '工作状态：') {
+    if (isWorkStatusHeading(line)) {
       field = undefined;
       continue;
     }
@@ -3925,15 +4858,12 @@ function parseStructuredSummary(text: string): StructuredSummary | undefined {
 }
 
 function summaryHeading(line: string): { field: StructuredSummaryField; rest: string } | undefined {
-  const normalized = line.replace(/[：:]\s*/, ':');
+  const normalized = summaryHeadingText(line).replace(/[：:]\s*/, ':');
   const headings: Array<[string, StructuredSummaryField]> = [
     ['重要约束、决定和准确标识', 'constraints'],
     ['重要约束、决定和标识', 'constraints'],
-    ['- 已完成', 'completed'],
     ['已完成', 'completed'],
-    ['- 正在做', 'active'],
     ['正在做', 'active'],
-    ['- 受阻', 'blocked'],
     ['受阻', 'blocked'],
     ['下一步', 'next'],
     ['相关文件', 'files'],
@@ -3946,20 +4876,79 @@ function summaryHeading(line: string): { field: StructuredSummaryField; rest: st
   return undefined;
 }
 
+const SUMMARY_HEADING_DECORATION = [
+  /^#{1,6}\s*/,
+  /^[-*•+]\s*/,
+  /^(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*[.．、)）]\s*/,
+  /^[（(](?:\d{1,2}|[一二三四五六七八九十]{1,3})[)）]\s*/
+];
+
+/**
+ * A line reduced to the words a heading is matched on. Models dress headings up as `**目标**`,
+ * `- **已完成**：`, `1. 目标`, `一、目标` or `### 3. 工作状态`; the decoration carries no meaning,
+ * and not recognizing it made a well-formed summary look unstructured.
+ */
+function summaryHeadingText(line: string): string {
+  let text = line.trim().replace(/\*\*|__/g, '').trim();
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const pattern of SUMMARY_HEADING_DECORATION) {
+      const next = text.replace(pattern, '');
+      if (next !== text) {
+        text = next.trim();
+        changed = true;
+      }
+    }
+  }
+  return text;
+}
+
+/** 工作状态 only groups 已完成 / 正在做 / 受阻 and holds no facts of its own. */
+function isWorkStatusHeading(line: string): boolean {
+  return /^工作状态[：:]?$/.test(summaryHeadingText(line));
+}
+
 function isStructuredSummaryText(text: string): boolean {
   const source = stripSummaryEnvelope(text);
   return ['目标', '重要约束、决定', '工作状态', '已完成', '正在做', '受阻', '下一步', '相关文件']
     .every((heading) => source.includes(heading));
 }
 
+/**
+ * 模型给出按标题组织、且有内容的摘要时，它就是最终摘要：模型已拿到旧摘要和新增记录，按提示输出替代它们的最新摘要。
+ * 不再把逐条抽取的原始记录（整段工具调用 / 结果 JSON、原样复制的回复）并进来——实测它们会挤满目标长度，
+ * 把模型自己的总结挤到被截掉的位置。原始记录始终保存在库里，可随时“从原始记录重建摘要”，不会因此永久丢失。
+ * 在长度上限内原样保留模型写的正文（代码块、编号和层级都不动）；超出时先请模型自己删短一次
+ * （shortenOversizedSummary），仍超出才按条目机械删减。
+ * 模型没按标题输出（例如拒答）或各节全是“无”时，才退回逐条抽取的确定性摘要。
+ */
 function finalizeStructuredSummary(candidate: string, fallback: string, targetTokens: number): string {
+  requireSummaryVisibleOutput(candidate);
+  const parsed = parseStructuredSummary(candidate);
+  if (parsed && structuredSummaryFactCount(parsed) > 0) {
+    const text = modelSummaryText(candidate);
+    return estimateTokenCount(text) <= summaryBodyBudget(targetTokens) ? text : fitStructuredSummary(parsed, targetTokens);
+  }
   const fallbackSummary = parseStructuredSummary(fallback)
     ?? structuredSummaryFromLooseText(fallback, 'active');
-  const parsed = parseStructuredSummary(candidate);
-  if (!parsed || structuredSummaryFactCount(parsed) === 0) {
-    return fitStructuredSummary(fallbackSummary, targetTokens);
-  }
-  return fitStructuredSummary(mergeStructuredSummaries(fallbackSummary, parsed), targetTokens);
+  return fitStructuredSummary(fallbackSummary, targetTokens);
+}
+
+/**
+ * The model's summary from its first recognizable heading on, whichever section it wrote first, so
+ * only a preamble such as “以下是摘要：” is dropped.
+ */
+function modelSummaryText(candidate: string): string {
+  const lines = stripSummaryEnvelope(candidate).split(/\r?\n/);
+  const start = lines.findIndex((line) => summaryHeading(line) !== undefined || isWorkStatusHeading(line));
+  return (start > 0 ? lines.slice(start) : lines).join('\n').trim();
+}
+
+const CONTEXT_SUMMARY_PREFIX = '[Context Summary]\n\n';
+
+/** Tokens left for the summary body once the context-summary prefix is counted against the target. */
+function summaryBodyBudget(targetTokens: number): number {
+  return Math.max(1, targetTokens - estimateTokenCount(CONTEXT_SUMMARY_PREFIX));
 }
 
 function structuredSummaryFactCount(summary: StructuredSummary): number {
@@ -3994,14 +4983,10 @@ function replacementMergeFacts(prior: readonly string[], delta: readonly string[
 }
 
 function summaryReplacementKey(fact: string): string {
-  const keyValue = /^(.{1,96}?)[：:=]\s*/.exec(fact)?.[1]
-    ?.trim()
-    .replace(/^(?:必须|不得|不要|只能|需要|require|must|never|only)\s*/i, '')
-    .toLowerCase();
-  if (keyValue) return `key:${keyValue}`;
-  const file = extractFileReferences(fact)[0];
-  if (file && fact.length < 180) return `file:${file.toLowerCase()}`;
-  return `fact:${fact.toLowerCase()}`;
+  // Labels, JSON field names, paths and provider call ids do not prove that two facts are the
+  // same revision (provider ids can repeat in different requests). Without durable source/revision
+  // authority in this text boundary, remove only exact duplicates and preserve distinct records.
+  return `fact:${fact}`;
 }
 
 function appendSummaryFact(summary: StructuredSummary, field: StructuredSummaryField, fact: string): void {
@@ -4102,13 +5087,15 @@ function fitStructuredSummary(input: StructuredSummary, targetTokens: number): s
 }
 
 function summaryContents(summary: string, targetTokens: number): MessageContent[] {
-  const prefix = '[Context Summary]\n\n';
+  const prefix = CONTEXT_SUMMARY_PREFIX;
   const prefixTokens = estimateTokenCount(prefix);
-  const bodyBudget = Math.max(1, targetTokens - prefixTokens);
-  const structured = parseStructuredSummary(summary);
-  const boundedBody = structured
-    ? fitStructuredSummary(structured, bodyBudget)
-    : fitTextToTokenLimit(summary, bodyBudget);
+  const bodyBudget = summaryBodyBudget(targetTokens);
+  // A body already inside the budget is kept exactly as written; only an oversized one is cut.
+  let boundedBody = summary;
+  if (estimateTokenCount(summary) > bodyBudget) {
+    const structured = parseStructuredSummary(summary);
+    boundedBody = structured ? fitStructuredSummary(structured, bodyBudget) : fitTextToTokenLimit(summary, bodyBudget);
+  }
   const text = targetTokens > prefixTokens
     ? `${prefix}${boundedBody}`
     : fitTextToTokenLimit(boundedBody, targetTokens);
@@ -4148,20 +5135,67 @@ function fitTextToTokenLimit(text: string, limit: number): string {
 
 function isSummaryProviderCallWithinWindow(
   call: SummaryProviderCall,
-  settings: LlmProviderConfigRecord
+  settings: SummaryWindowSettings
 ): boolean {
+  const inputLimit = summaryProviderInputLimitTokens(call, settings);
+  if (inputLimit <= 0) return false;
+  return summaryProviderCallInputTokens(call) <= inputLimit;
+}
+
+function summaryProviderInputLimitTokens(call: SummaryProviderCall, settings: SummaryWindowSettings): number {
   const contextWindowTokens = settings.contextWindowTokens ?? DEFAULT_LLM_CONTEXT_WINDOW_TOKENS;
   const outputTokens = call.request.generationConfig?.maxOutputTokens
     ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
-  const inputLimit = contextWindowTokens
+  return contextWindowTokens
     - Math.max(DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, outputTokens)
     - SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS;
-  if (inputLimit <= 0) return false;
+}
+
+function summaryProviderCallInputTokens(call: SummaryProviderCall): number {
   return estimateTokenCount(JSON.stringify({
     contents: call.request.contents,
     systemInstruction: call.request.systemInstruction
-  })) <= inputLimit;
+  }));
 }
+
+/**
+ * Upper bound on what appending messages adds to a summary call already holding `startIndex`
+ * messages. JSON escapes character by character and the estimator sums independent segments, so
+ * the appended escaped text costs what it costs alone; the quotes JSON adds around it and a small
+ * allowance cover the one segment that may merge across either edge.
+ */
+function appendedSummaryTranscriptTokensBound(contents: MessageContent[], startIndex: number): number {
+  return estimateTokenCount(JSON.stringify(`\n\n${renderContentsForSummary(contents, startIndex)}`))
+    + SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS;
+}
+
+/**
+ * Least a unit's transcript adds to a summary call, from the estimate made when it was grouped, or
+ * undefined when the transcript renders it differently (hidden thoughts, media, provider items).
+ * The call escapes the rendered text as JSON, which never lowers the estimator's count, and renders
+ * every part the estimate counted; only the per-message and per-call overheads are not rendered.
+ */
+function summaryUnitTranscriptTokensFloor(unit: SegmentedSummaryUnit): number | undefined {
+  let overhead = 0;
+  for (const content of unit.requestContents) {
+    if (isRecord((content as unknown as Record<string, unknown>).providerContext)) return undefined;
+    overhead += SUMMARY_UNIT_MESSAGE_OVERHEAD_TOKENS;
+    for (const part of content.parts) {
+      if (isTextPart(part)) {
+        if (part.thought === true) return undefined;
+      } else if (isFunctionCallPart(part) || (isFunctionResponsePart(part) && !part.functionResponse.parts?.length)) {
+        overhead += SUMMARY_UNIT_FUNCTION_OVERHEAD_TOKENS;
+      } else {
+        return undefined;
+      }
+    }
+  }
+  return unit.estimatedTokens - overhead;
+}
+
+/** The fixed overheads groupAtomicMessageContents counts per message and per function part. */
+const SUMMARY_UNIT_MESSAGE_OVERHEAD_TOKENS = 4;
+const SUMMARY_UNIT_FUNCTION_OVERHEAD_TOKENS = 4;
 
 function modelCatalogEntryToRecord(model: UnifiedModelCatalogEntry): LlmProviderModelRecord {
   return {
@@ -4171,6 +5205,122 @@ function modelCatalogEntryToRecord(model: UnifiedModelCatalogEntry): LlmProvider
   };
 }
 
+function providerRequestTarget(settings: LlmProviderConfigRecord): ProviderRequestTarget {
+  return {
+    providerConfigId: settings.id,
+    provider: settings.provider,
+    baseUrl: settings.baseUrl,
+    model: settings.model,
+    configRevision: settings.updatedAt
+  };
+}
+
+/** 用户自己写在自定义请求参数里的键被服务明确拒绝：不替用户删，报错改成写明哪个参数、去哪里改（保留原始错误）。 */
+function withUserRequestBodyRejection(
+  failure: LlmAttemptFailure,
+  retry: ProviderRequestAdaptationRetry,
+  settings: Pick<LlmProviderConfigRecord, 'name'>
+): LlmAttemptFailure {
+  const rejected = retry.userRequestBodyRejection();
+  if (rejected.length === 0) return failure;
+  return { ...failure, message: userRequestBodyRejectionMessage(rejected, settings.name, failure.message) };
+}
+
+/**
+ * 编码后请求的最终适配：先按模型族做静态适配（Claude 思考类型；GPT-6 Sol / Luna 按实际推理强度去掉
+ * 采样参数，Astra 一律去掉），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习），最后为 Claude
+ * 轮内系统消息合并 beta 头；Claude 尾巴模式下把消息缓存断点挪到易失尾巴（本轮提醒、重新注入的输入）之前。
+ * OpenAI Responses 显式缓存在无状态完整重放（HTTP、WebSocket 回退的 HTTP、HTTP dry-run）下同样挪到尾巴之前；
+ * `webSocketChain` 表示编码结果交给 WebSocket 续接链（含 WebSocket dry-run 展示的首帧）：尾巴随 previous_response_id
+ * 留在服务端会话的原位，下一帧的会话里仍有它和它的断点，不是易失的，断点留在尾巴上。
+ */
+function installRequestAdaptation<T>(
+  provider: T,
+  settings: LlmProviderConfigRecord,
+  claudeTurnScopedReminders = false,
+  volatileTailCount = 0,
+  webSocketChain = false,
+  httpReplay: OpenAIResponsesHttpReplay = 'stateless',
+  session?: ProviderRequestAdaptationSession
+): T {
+  const target = providerRequestTarget(settings);
+  const claudeThinking = settings.provider === 'claude' ? claudeThinkingProfileForSettings(settings) : undefined;
+  const astraSampling = isAstraParameterTarget(settings);
+  const gpt6Sampling = astraSampling || isGpt6NoneCapableParameterTarget(settings);
+  return installEncodedRequestPostProcessor(provider, (request) => {
+    const shaped = claudeThinking ? adaptClaudeThinkingForFamily(request, claudeThinking)
+      : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider, { alwaysReasoning: astraSampling })
+        : request;
+    // 方言改写在记住的参数适配之前：方言写上的顶层 `thinking` / `enable_thinking` 若被网关明确拒绝过，这里仍会去掉。
+    const adapted = applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target, session);
+    if (settings.provider === 'openai-responses') {
+      return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount, httpReplay);
+    }
+    if (settings.provider !== 'claude') return adapted;
+    const turnScoped = claudeTurnScopedReminders && !claudeTurnScopedRemindersFallenBack(target);
+    // 轮内系统消息模式下尾巴内容之后会在原位原样重发，不是易失的；只有尾巴模式才挪断点。
+    return withClaudeTurnScopedSystemBeta(
+      turnScoped ? adapted : withClaudeCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount),
+      turnScoped
+    );
+  });
+}
+
+/**
+ * HTTP 上的 GPT-6 原生会话：流式、不走 WebSocket、原生异步工具开启时，runLlmAttempt 用
+ * streamOpenAIResponsesNativeHttpSession 在同一个 provider 上发首请求与续接请求。
+ */
+function usesOpenAIResponsesNativeHttpSession(
+  settings: LlmProviderConfigRecord,
+  nativeCapabilities: OpenAIResponsesNativeCapabilities | undefined
+): boolean {
+  return settings.provider === 'openai-responses'
+    && !isOpenAIResponsesWebSocketMode(settings)
+    && settings.stream !== false
+    && nativeCapabilities?.asyncTools === true;
+}
+
+function openAIResponsesHttpReplay(
+  settings: LlmProviderConfigRecord,
+  nativeCapabilities: OpenAIResponsesNativeCapabilities | undefined
+): OpenAIResponsesHttpReplay {
+  return usesOpenAIResponsesNativeHttpSession(settings, nativeCapabilities) ? 'native_session' : 'stateless';
+}
+
+/** 内核放在内容末尾、下一次请求不再原位出现的条数（重新注入的输入、本轮提醒）。 */
+function volatileTailContentCount(request: Pick<LlmStartRequest, 'openAIResponsesContinuation'>): number {
+  const kinds = request.openAIResponsesContinuation?.volatileTailContentKinds;
+  return Array.isArray(kinds) ? kinds.length : 0;
+}
+
+/** 冻结的调用设置要求 Claude 每轮提醒使用轮内系统消息（开关只对 Claude 生效）。 */
+function claudeTurnScopedRemindersRequested(
+  request: Pick<LlmStartRequest, 'settingsSnapshot'>,
+  settings: Pick<LlmProviderConfigRecord, 'provider'>
+): boolean {
+  return settings.provider === 'claude' && request.settingsSnapshot?.claudeTurnScopedReminders === true;
+}
+
+/** 每次发送前按当前记忆决定提醒形态：网关明确拒绝过轮内系统消息的目标退回原来的尾巴模式。 */
+function turnReminderLayoutFor(
+  request: Pick<LlmStartRequest, 'settingsSnapshot'>,
+  settings: LlmProviderConfigRecord
+): TurnReminderLayout {
+  return claudeTurnScopedRemindersRequested(request, settings)
+    && !claudeTurnScopedRemindersFallenBack(providerRequestTarget(settings))
+    ? 'claude_turn_scoped'
+    : 'tail';
+}
+
+/**
+ * Claude 思考族：先用该渠道/模型已确认的能力快照（官方端点的能力表或 Models API 结果），
+ * 网关端点再按模型 id 查能力表；不在能力表里的模型不改写。
+ */
+function claudeThinkingProfileForSettings(settings: LlmProviderConfigRecord): ClaudeThinkingFamilyProfile | undefined {
+  return claudeThinkingFamilyProfile(resolveProviderModelCapabilities(settings, settings.model).reasoning)
+    ?? claudeThinkingFamilyProfile(anthropicModelReasoningCapability(settings.model));
+}
+
 function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmProviderConfigRecord {
   const headers = normalizeHeaders(settings?.headers);
   const generationConfig = settings?.generationConfig;
@@ -4178,7 +5328,7 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
   const nativeResponses = normalizeOpenAIResponsesNativeSettings(settings?.nativeResponses);
   const contextWindowTokens = normalizeContextWindowTokens(settings?.contextWindowTokens);
   const retryMaxAttempts = normalizeRetryMaxAttempts(settings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
-  return adaptAstraNativeParameterSettings({
+  return adaptGpt6NoneCapableParameterSettings(adaptAstraNativeParameterSettings({
     id: settings?.id?.trim() || 'llm-provider-config-default',
     name: settings?.name?.trim() || '默认渠道',
     provider: normalizeProvider(settings?.provider),
@@ -4200,10 +5350,28 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
     ...(nonEmptyRecord(requestBody) ? { requestBody } : {}),
     promptCache: normalizePromptCache(settings?.promptCache, normalizeProvider(settings?.provider)),
     ...(nativeResponses ? { nativeResponses } : {}),
+    ...(settings?.openaiCompatibleThinkingFormat ? { openaiCompatibleThinkingFormat: settings.openaiCompatibleThinkingFormat } : {}),
     modelConfigs: settings?.modelConfigs ?? [],
     createdAt: settings?.createdAt ?? 0,
     updatedAt: settings?.updatedAt ?? 0
-  });
+  }));
+}
+
+/**
+ * GPT-6 Sol / Luna：设置解析时只把 minimal 提升为 low（none 保留），冻结快照因此携带有效值；
+ * 采样参数按最终请求里实际生效的推理强度在编码后去掉（见 gpt6ParameterAdaptation）。其他模型原样返回。
+ */
+function adaptGpt6NoneCapableParameterSettings(settings: LlmProviderConfigRecord): LlmProviderConfigRecord {
+  if (!isGpt6NoneCapableParameterTarget(settings)) return settings;
+  const generationConfig = adaptGpt6NoneCapableGenerationConfig(settings.generationConfig);
+  // 渠道 requestBody 里直接写的 minimal 同样提升为 low（原样发出会被官方拒绝）。
+  const requestBody = adaptGpt6RequestBodyReasoningEffort(settings.requestBody, GPT6_NONE_CAPABLE_EFFORT_MAPPING);
+  if ((generationConfig === settings.generationConfig || !generationConfig) && requestBody === settings.requestBody) return settings;
+  return {
+    ...settings,
+    ...(generationConfig && generationConfig !== settings.generationConfig ? { generationConfig } : {}),
+    ...(requestBody !== settings.requestBody ? { requestBody } : {})
+  };
 }
 
 /** Astra 模型不支持的请求参数；reasoning none/minimal 也不受支持。 */
@@ -4218,14 +5386,17 @@ const ASTRA_UNSUPPORTED_INCLUDE_VALUES: Record<string, true> = {
 };
 
 /**
- * Astra 参数适配：精确 Astra 模型 + openai-responses 时，剔除不支持的 temperature/top_p/
- * top_logprobs/logprobs，把 reasoning none/minimal 提升为 low。其他模型/渠道原样返回（同一引用）。
+ * Astra 参数适配：精确 Astra 模型走 openai-responses 或 openai-compatible 时，剔除不支持的
+ * temperature/top_p/top_logprobs/logprobs，把 reasoning none/minimal 提升为 low。其他模型/渠道原样返回（同一引用）。
+ * 依据 https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md “Update API and model parameters”：
+ * Astra 不支持 `none`（用 `low`）；effort 不是 `none` 时去掉 temperature、top_p、top_logprobs，
+ * Chat Completions 另去掉 logprobs，Responses 另从 include 去掉 message.output_text.logprobs。
  * 适配在设置解析时完成，冻结快照/恢复因此总是携带有效值。幂等。
  */
 function adaptAstraNativeParameterSettings(settings: LlmProviderConfigRecord): LlmProviderConfigRecord {
-  if (settings.provider !== 'openai-responses' || !isAstraModel(settings.model)) return settings;
+  if (!isAstraParameterTarget(settings)) return settings;
   const generationConfig = adaptAstraGenerationConfig(settings.generationConfig);
-  const requestBody = adaptAstraRequestBody(settings.requestBody);
+  const requestBody = adaptAstraRequestBody(settings.requestBody, settings.provider);
   if (generationConfig === settings.generationConfig && requestBody === settings.requestBody) return settings;
   const next = { ...settings };
   if (generationConfig !== settings.generationConfig) {
@@ -4260,7 +5431,8 @@ function adaptAstraGenerationConfig(
 
 /**
  * 单次请求实际使用的 generationConfig：冻结调用快照携带时以快照为准（冻结 recipe 的
- * base reasoning 等），否则用解析出的渠道/模型配置。Astra 目标上快照值同样过一遍参数适配。
+ * base reasoning 等），否则用解析出的渠道/模型配置。GPT-6 目标上快照值同样过一遍参数适配
+ * （Astra 按原规则；Sol / Luna 只把 minimal 提升为 low）。
  */
 function effectiveRequestGenerationConfig(
   request: LlmStartRequest,
@@ -4268,15 +5440,41 @@ function effectiveRequestGenerationConfig(
 ): LlmGenerationConfigRecord | undefined {
   const frozen = request.settingsSnapshot?.generationConfig;
   if (!frozen) return settings.generationConfig;
-  return settings.provider === 'openai-responses' && isAstraModel(settings.model)
-    ? adaptAstraGenerationConfig(frozen)
-    : frozen;
+  if (isAstraParameterTarget(settings)) return adaptAstraGenerationConfig(frozen);
+  if (isGpt6NoneCapableParameterTarget(settings)) return adaptGpt6NoneCapableGenerationConfig(frozen);
+  return frozen;
 }
 
-function adaptAstraRequestBody(requestBody: LlmRequestBodyRecord | undefined): LlmRequestBodyRecord | undefined {
+/** 原生能力门禁需要本次请求实际使用的推理模式：pro 模式不支持 configuration_update。 */
+function nativeReasoningModeInput(generationConfig: LlmGenerationConfigRecord | undefined): { reasoningMode?: string } {
+  const reasoningMode = generationConfig?.thinkingConfig?.reasoningMode;
+  return typeof reasoningMode === 'string' ? { reasoningMode } : {};
+}
+
+/** Astra 参数适配只作用于精确 Astra 模型的 Responses 与 Chat Completions 形状请求。 */
+function isAstraParameterTarget(settings: Pick<LlmProviderConfigRecord, 'provider' | 'model'>): boolean {
+  return (settings.provider === 'openai-responses' || settings.provider === 'openai-compatible') && isAstraModel(settings.model);
+}
+
+function adaptAstraRequestBody(
+  requestBody: LlmRequestBodyRecord | undefined,
+  provider: LlmProviderKind
+): LlmRequestBodyRecord | undefined {
   if (!requestBody) return requestBody;
+  // requestBody 里直接写的 none / minimal 同样提升为 low（Astra 不支持这两档）。
+  return adaptAstraUnsupportedRequestBodyKeys(
+    adaptGpt6RequestBodyReasoningEffort(requestBody, GPT6_ASTRA_EFFORT_MAPPING) ?? requestBody,
+    provider
+  );
+}
+
+function adaptAstraUnsupportedRequestBodyKeys(
+  requestBody: LlmRequestBodyRecord,
+  provider: LlmProviderKind
+): LlmRequestBodyRecord {
   const entries = Object.entries(requestBody).filter(([key]) => !ASTRA_UNSUPPORTED_REQUEST_BODY_KEYS[key]);
-  const include = requestBody.include;
+  // include 过滤只属于 Responses；Chat Completions 没有该字段，原样保留用户配置。
+  const include = provider === 'openai-responses' ? requestBody.include : undefined;
   const adaptedInclude = Array.isArray(include)
     ? include.filter((value) => !(typeof value === 'string' && ASTRA_UNSUPPORTED_INCLUDE_VALUES[value]))
     : undefined;
@@ -4367,9 +5565,7 @@ function maskSecretValue(value: string): string {
 }
 
 function normalizeProvider(provider: LlmProviderKind | undefined): LlmProviderKind {
-  return provider === 'gemini' || provider === 'claude' || provider === 'openai-compatible' || provider === 'openai-responses' || provider === 'deepseek'
-    ? provider
-    : 'openai-compatible';
+  return canonicalLlmProviderKind(provider) ?? 'openai-compatible';
 }
 
 function normalizeToolCallFormat(format: LlmToolCallFormat | undefined): LlmToolCallFormat {
@@ -4400,12 +5596,20 @@ function normalizePromptCacheTtl(input: unknown, provider: LlmProviderKind): Llm
   return defaultLlmPromptCacheTtlForProvider(provider);
 }
 
-function unifiedPromptCacheConfigEntry(settings: LlmProviderConfigRecord, requestBody?: LlmRequestBodyRecord): { promptCache: Record<string, unknown> } | Record<string, never> {
-  const promptCache = unifiedPromptCacheFromSettings(settings, requestBody);
+function unifiedPromptCacheConfigEntry(
+  settings: LlmProviderConfigRecord,
+  requestBody?: LlmRequestBodyRecord,
+  webSocket = isOpenAIResponsesWebSocketMode(settings)
+): { promptCache: Record<string, unknown> } | Record<string, never> {
+  const promptCache = unifiedPromptCacheFromSettings(settings, requestBody, webSocket);
   return promptCache ? { promptCache } : {};
 }
 
-function unifiedPromptCacheFromSettings(settings: LlmProviderConfigRecord, requestBody?: LlmRequestBodyRecord): Record<string, unknown> | undefined {
+function unifiedPromptCacheFromSettings(
+  settings: LlmProviderConfigRecord,
+  requestBody: LlmRequestBodyRecord | undefined,
+  webSocket: boolean
+): Record<string, unknown> | undefined {
   if (!isPromptCacheSupportedProvider(settings.provider)) return undefined;
   const promptCache = normalizePromptCache(settings.promptCache, settings.provider);
   if (!promptCache.enabled) return undefined;
@@ -4414,12 +5618,20 @@ function unifiedPromptCacheFromSettings(settings: LlmProviderConfigRecord, reque
     const key = typeof effectiveRequestBody?.prompt_cache_key === 'string' && effectiveRequestBody.prompt_cache_key.trim()
       ? effectiveRequestBody.prompt_cache_key.trim()
       : undefined;
-    if (promptCache.mode === 'key') return key ? { enabled: true, mode: 'key', key } : undefined;
+    // 显式断点与 prompt_cache_options 只在 GPT-5.6 及之后的模型上可用（官方 id 清单见 shared 的
+    // supportsOpenAIExplicitPromptCache；/responses/compact 参考同样写明 “Supported for gpt-5.6 and later
+    // models”）；其他模型（实测 gpt-5.5 返回 400）退回 key 模式。
+    if (promptCache.mode === 'key' || !supportsOpenAIExplicitPromptCache(settings.model)) {
+      return key ? { enabled: true, mode: 'key', key } : undefined;
+    }
     return {
       enabled: true,
       mode: 'explicit',
       ttl: promptCache.ttl,
-      breakpoints: { messages: true },
+      // WebSocket 续接链里服务端保留此前各帧的断点（Responses 参考：“considers up to the latest 80
+      // breakpoints in the conversation”），工具结果改用数组形式后每帧的断点能落在最新的工具结果上；
+      // 无状态 HTTP 完整重放只有一个随请求移动的断点，保持原来的字符串形式。
+      breakpoints: webSocket ? { messages: true, toolOutputs: true } : { messages: true },
       ...(key ? { key } : {})
     };
   }
@@ -4467,7 +5679,7 @@ function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, 
 
 function openAIResponsesWebSocketDryRunResult(result: UnifiedDryRunResult, includeApiKey: boolean, model?: string): UnifiedDryRunResult & { maskedCurl: string } {
   const url = toWebSocketUrl(result.url);
-  const body = openAIResponsesWebSocketDryRunPayload(result.body, isAstraModel(model));
+  const body = openAIResponsesWebSocketDryRunPayload(result.body, supportsOpenAIExplicitPromptCache(model));
   const headers = result.headers;
   return {
     ...result,
@@ -4486,7 +5698,8 @@ function openAIResponsesWebSocketDryRunPayload(body: unknown, preserveNativeCach
   delete record.stream;
   delete record.background;
   delete record.previous_response_id;
-  // Astra WS 必须保留显式缓存选项与断点；其他模型保持原有剥离行为。
+  // 支持显式缓存的模型（GPT-5.6 及之后的官方 id）在 WS 上保留显式缓存选项与断点，与运行时会话一致；
+  // 其他模型保持原有剥离行为。
   if (!preserveNativeCache) delete record.prompt_cache_options;
   return { type: 'response.create', ...record, store: false };
 }
@@ -4818,4 +6031,63 @@ function emitLlmRetryCancelled(emit: Emit, requestId: string, message: string, r
 
 function emitLlmRetryRecovered(emit: Emit, requestId: string, message: string, retryAttempt: number, retryMaxAttempts: number): void {
   emit({ type: LlmEventType.RetryRecovered, payload: { requestId, message, retryAttempt, retryMaxAttempts, createdAt: Date.now() } });
+}
+
+/** Explicit UI action. One synthetic request may consume Provider tokens; never automatic. */
+export async function probeLlmProviderNativeCompaction(
+  config: LlmProviderConfigRecord, options: LlmProviderOptions
+): Promise<LlmProviderModelRecord> {
+  if (config.provider !== 'openai-responses' && config.provider !== 'claude') {
+    throw new Error('当前接口没有原生压缩适配器。');
+  }
+  const url = new URL(config.baseUrl);
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('能力验证端点不能包含 URL 凭据、查询串或片段；请使用渠道请求头配置认证。');
+  }
+  const settings = normalizeSettings(config);
+  const baseline = resolveProviderModelCapabilities(config, config.model);
+  const method: LlmCompressionConfigRecord = {
+    id: 'native-capability-probe', name: '原生压缩能力验证', kind: 'provider_native',
+    trigger: { mode: 'manual' }, providerNative: { providerConfigId: config.id, model: config.model },
+    llmSummary: { targetTokens: 128 }, createdAt: 0, updatedAt: 0
+  };
+  const contents: MessageContent[] = [
+    { role: 'user', parts: [{ text: 'Capability check only. Remember verification_marker=42. No tools or external actions.' }] },
+    { role: 'model', parts: [{ text: 'verification_marker=42.' }] },
+    { role: 'user', parts: [{ text: 'Preserve this marker when compacting.' }] }
+  ];
+  let nativeCompaction = baseline.nativeCompaction;
+  try {
+    const result = await compactWithProviderNative({
+      id: 'native-capability-probe', blockId: 'native-capability-probe', conversationId: 'native-capability-probe',
+      methodKind: 'provider_native', methodConfigSnapshot: method, contents,
+      nativeGenerationConfig: { maxOutputTokens: 4096 }, nativeRequestBody: {}, tools: []
+    }, method, {
+      ...options,
+      settings: async () => ({ ...settings, requestBody: {}, retryOnError: false })
+    }, AbortSignal.timeout(30_000));
+    const validNative = result.contents.some((content) => content.parts.some((part) =>
+      isProviderContextPart(part) && (part.providerContext.itemType === 'compaction'
+        || isRecord(part.providerContext.rawItem) && part.providerContext.rawItem.type === 'compaction')));
+    nativeCompaction = validNative
+      ? { kind: config.provider === 'claude' ? 'anthropic_messages' : 'openai_responses', availability: 'verified', reason: '一次独立的合成请求已返回可回放的原生压缩状态。' }
+      : { availability: 'unknown', reason: '端点响应成功，但没有返回原生 compaction 状态；未标记为验证通过。' };
+  } catch (error) {
+    const status = error && typeof error === 'object' ? (error as { status?: number }).status : undefined;
+    const embedded = error instanceof Error ? /Compact API[^\d]*(?:错误\s*)?\((404|405|501)\)/i.exec(error.message) : null;
+    const httpStatus = status ?? (embedded ? Number(embedded[1]) : undefined);
+    if (httpStatus !== 404 && httpStatus !== 405 && httpStatus !== 501) throw error;
+    nativeCompaction = { availability: 'unsupported', reason: `原生端点验证返回 HTTP ${httpStatus}，不再对这个端点和模型自动使用原生压缩。` };
+  }
+  return {
+    id: config.model, name: config.models.find((model) => model.id === config.model)?.name ?? config.model,
+    capabilitySnapshot: { ...baseline, source: 'verified_probe', verifiedAt: new Date().toISOString(), nativeCompaction }
+  };
+}
+
+function requireSummaryVisibleOutput(text: string): string {
+  if (!text.trim()) throw Object.assign(new Error(
+    'Summary provider returned no visible summary. Reasoning-only or empty output is not successful compression.'
+  ), { code: 'SUMMARY_EMPTY_OUTPUT' });
+  return text;
 }

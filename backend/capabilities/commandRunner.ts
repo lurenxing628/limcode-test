@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process';
 import * as path from 'node:path';
-import * as vscode from 'vscode';
 import type { CommandCapability, CommandOutputLimits, CommandRunArgs, CommandRunObserver, CommandRunResult, WorkEnvironmentCapabilityOptions } from './types';
 import {
   BackgroundProcessManager,
@@ -8,7 +7,6 @@ import {
 } from './backgroundProcessManager';
 import {
   WORK_ENVIRONMENT_CAPABILITY,
-  isLocalFolderWorkEnvironment,
   workEnvironmentDisplayName,
   workEnvironmentSupportsCapability
 } from '../../shared/workEnvironmentCatalog';
@@ -373,7 +371,8 @@ function resolveForegroundWaitMs(value: number | undefined): number {
 }
 
 function resolveWorkDir(cwd: string | undefined, options: WorkEnvironmentCapabilityOptions): string {
-  const root = workEnvironmentRootPath(options) ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  const root = workEnvironmentRootPath(options);
+  if (!root) throw new Error('命令执行需要明确且可用的工作环境，请重新选择。');
   if (!cwd?.trim()) return root;
   if (path.isAbsolute(cwd)) return cwd;
   return path.resolve(root, cwd);
@@ -385,14 +384,12 @@ function workEnvironmentRootPath(options: WorkEnvironmentCapabilityOptions): str
     const rootPath = workEnvironment.rootPath?.trim();
     if (rootPath) return rootPath;
   }
-  return options.accessibleWorkEnvironments
-    ?.find((environment) => environment.available !== false && isLocalFolderWorkEnvironment(environment) && workEnvironmentSupportsCapability(environment, WORK_ENVIRONMENT_CAPABILITY.LocalCommand) && environment.rootPath?.trim())
-    ?.rootPath?.trim();
+  return undefined;
 }
 
 function validateCommandWorkEnvironment(options: WorkEnvironmentCapabilityOptions): string | undefined {
   const workEnvironment = options.workEnvironment;
-  if (!workEnvironment) return undefined;
+  if (!workEnvironment) return '命令执行需要明确且可用的工作环境，请重新选择。';
   if (!workEnvironmentSupportsCapability(workEnvironment, WORK_ENVIRONMENT_CAPABILITY.LocalCommand)) return `当前工作环境暂不支持本地命令执行：${workEnvironmentDisplayName(workEnvironment)} (${workEnvironment.kind})`;
   if (workEnvironment.available === false) return `当前工作环境不可用：${workEnvironmentDisplayName(workEnvironment)}`;
   if (!workEnvironment.rootPath?.trim()) return `当前工作环境缺少可执行根目录：${workEnvironmentDisplayName(workEnvironment)}`;

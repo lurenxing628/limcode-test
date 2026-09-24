@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { compressionExecutionMetadata, readProviderRequestFailure } from '../../shared/compressionExecution';
 import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -10,6 +11,7 @@ import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, Snap
 import type { ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
+import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
 import {
   deriveCommittedParentHandling,
   executeClientKeysetPage,
@@ -18,6 +20,7 @@ import {
   executeConversationHistoryProjection,
   projectAnswerBridgeRecord,
   projectChildExecutionActivityRecord,
+  projectCollaborationMessageRecord,
   projectCompressionBlockRecord,
   projectConversationCommandReceiptRecord,
   projectConversationContextStatusRecord,
@@ -229,6 +232,14 @@ async function start(): Promise<void> {
       if (request.kind === 'toolFactsSnapshot') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeToolFactsSnapshot(reader, request.toolCallId, commitSeq);
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'conversationChildTaskSnapshot') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeConversationChildTaskSnapshot(
+          reader, request.conversationId, commitSeq, executeRead, clientProjectionContent.readVerifiedBytes
+        );
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
@@ -562,6 +573,9 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       }
       if (row.domain === 'Process') {
         record = projectProcessRecord(database, row.id, clientProjectionContent);
+      }
+      if (row.domain === 'CollaborationMessage') {
+        record = projectCollaborationMessageRecord(database, row.id, clientProjectionContent);
       }
       if (row.domain === 'RuntimeDelivery') {
         const links = database.prepare(`
@@ -1007,7 +1021,11 @@ function decodeModelStreamIdentity(value: unknown): {
     'lastStreamEventAt',
     'nativeCapabilities',
     'thinkingSelection',
-    'nativeInitialPromptTokenCount'
+    'nativeInitialPromptTokenCount',
+    'compressionPurpose',
+    'compressionDecision',
+    'failure',
+    'claudeThinkingBinding'
   ]);
   if (
     !keys.includes('attemptSeq')
@@ -1024,6 +1042,8 @@ function decodeModelStreamIdentity(value: unknown): {
       && record.retryReason !== 'compression_timeout'
     )
   ) throw new TypeError('ModelRequest.stream_stats_json has an invalid shape.');
+  compressionExecutionMetadata(record);
+  if (record.failure !== undefined) readProviderRequestFailure(record.failure);
   assertOptionalBoundedInteger(record.retryMaxAttempts, 'retryMaxAttempts', 1, 10);
   assertOptionalBoundedInteger(record.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER);
   assertOptionalBoundedInteger(record.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER);
@@ -1041,6 +1061,10 @@ function decodeModelStreamIdentity(value: unknown): {
   optionalPositiveInteger(record.lastStreamEventAt, 'lastStreamEventAt');
   if (record.thinkingSelection !== undefined && (typeof record.thinkingSelection !== 'string' || record.thinkingSelection.length > 1024)) {
     throw new TypeError('ModelRequest.stream_stats_json.thinkingSelection must be a bounded string.');
+  }
+  if (record.claudeThinkingBinding !== undefined
+    && record.claudeThinkingBinding !== 'drop_block' && record.claudeThinkingBinding !== 'strip_thinking') {
+    throw new TypeError('ModelRequest.stream_stats_json.claudeThinkingBinding is invalid.');
   }
   optionalNonNegativeInteger(record.nativeInitialPromptTokenCount, 'nativeInitialPromptTokenCount');
   if (record.nativeCapabilities !== undefined) {
@@ -1144,7 +1168,7 @@ function executeSteps(
       continue;
     }
     if (step.kind === 'assertExactIds') {
-      executeAssertExactIds(database, step.domain, step.where, step.expectedIds);
+      executeAssertExactIds(database, step.domain, step.where, step.expectedIds, step.collaborationBacklog === true);
       continue;
     }
     if (step.kind !== 'savepoint') {
@@ -1235,16 +1259,30 @@ function executeAssertAll(
   }
 }
 
+/**
+ * Deliveries of collaboration messages other than completion replies: the inbound backlog a
+ * cross-conversation send is capped by. Unrelated Process or answer deliveries never enter it.
+ */
+const COLLABORATION_BACKLOG_PREDICATE = 'EXISTS (SELECT 1 FROM runtime_inbox_item AS inbox'
+  + ' JOIN collaboration_message_source_link AS source ON source.message_id = inbox.source_id'
+  + ' WHERE inbox.id = runtime_delivery.inbox_item_id AND inbox.source_kind = \'collaboration_message\''
+  + ' AND source.source_kind <> \'completion\')';
+
 function executeAssertExactIds(
   database: Database.Database,
   domain: string,
   where: DomainRow,
-  expectedIds: readonly string[]
+  expectedIds: readonly string[],
+  collaborationBacklog: boolean
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(domain);
   const encoded = repository.codec.encodeWhere(where);
   const { predicates, parameters } = whereClause(encoded);
   if (predicates.length === 0) throw new Error(`${repository.name} assertExactIds requires predicates.`);
+  if (collaborationBacklog) {
+    if (repository.schema.key !== 'RuntimeDelivery') throw new TypeError('Collaboration backlog scope is only valid for RuntimeDelivery.');
+    predicates.push(COLLABORATION_BACKLOG_PREDICATE);
+  }
   const actualIds = (database.prepare(
     `SELECT id FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} ORDER BY id ASC`
   ).all(parameters) as Array<{ id: unknown }>).map((row) => requireRuntimeId(row.id));
@@ -2124,13 +2162,20 @@ function decodeContextRecords(
     .map((row) => requireRuntimeId(row.segment_id));
   const roles = new Map<string, string[]>();
   const modelSources = new Map<string, ContextModelSource | null>();
+  // Frozen recipe of the ModelRequest that produced a model message segment. A fork copy of the same
+  // request shares the recipe object; any disagreement or an unlinked source leaves it unset.
+  const recipeSources = new Map<string, string | null>();
+  // Claude 保留思考处理：产生这条模型输出的请求终态里记下的对话选择；多个来源取更强的一种（只会单向推进）。
+  const thinkingBindings = new Map<string, 'drop_block' | 'strip_thinking'>();
   for (let offset = 0; offset < messageSegmentIds.length; offset += 500) {
     const chunk = messageSegmentIds.slice(offset, offset + 500);
     const placeholders = chunk.map(() => '?').join(',');
     const sourceRows = database.prepare(`
       SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role,
              model_request.provider_id AS source_provider_id,
-             model_request.model_id AS source_model_id
+             model_request.model_id AS source_model_id,
+             model_request.recipe_object_id AS source_recipe_object_id,
+             model_request.stream_stats_json AS source_stream_stats_json
         FROM context_segment_source AS source
         JOIN message_revision AS revision
           ON revision.id = source.source_id
@@ -2149,6 +2194,8 @@ function decodeContextRecords(
       role: string;
       source_provider_id: string | null;
       source_model_id: string | null;
+      source_recipe_object_id: string | null;
+      source_stream_stats_json: string | null;
     }>;
     for (const source of sourceRows) {
       const segmentId = requireRuntimeId(source.segment_id);
@@ -2168,19 +2215,47 @@ function decodeContextRecords(
         || previousSource.providerId !== modelSource.providerId
         || previousSource.modelId !== modelSource.modelId
       )) modelSources.set(segmentId, null);
+      const recipeObjectId = typeof source.source_recipe_object_id === 'string' && source.source_recipe_object_id
+        ? source.source_recipe_object_id
+        : null;
+      const previousRecipe = recipeSources.get(segmentId);
+      if (previousRecipe === undefined) recipeSources.set(segmentId, recipeObjectId);
+      else if (previousRecipe !== recipeObjectId) recipeSources.set(segmentId, null);
+      const binding = sourceClaudeThinkingBinding(source.source_stream_stats_json);
+      if (binding && thinkingBindings.get(segmentId) !== 'strip_thinking') thinkingBindings.set(segmentId, binding);
     }
   }
   return rows.map((row) => decodeContextRecord(
     row,
     roles.get(String(row.segment_id)) ?? [],
-    modelSources.get(String(row.segment_id))
+    modelSources.get(String(row.segment_id)),
+    recipeSources.get(String(row.segment_id)),
+    thinkingBindings.get(String(row.segment_id))
   ));
+}
+
+/** ModelRequest.stream_stats_json 里持久化的 Claude 保留思考处理；没有或形状不对时为空。 */
+function sourceClaudeThinkingBinding(value: unknown): 'drop_block' | 'strip_thinking' | undefined {
+  let stats: unknown = value;
+  if (typeof value === 'string') {
+    try {
+      stats = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  const binding = stats && typeof stats === 'object' && !Array.isArray(stats)
+    ? (stats as Record<string, unknown>).claudeThinkingBinding
+    : undefined;
+  return binding === 'drop_block' || binding === 'strip_thinking' ? binding : undefined;
 }
 
 function decodeContextRecord(
   row: Record<string, unknown>,
   messageRoles: readonly string[],
-  modelSource?: ContextModelSource | null
+  modelSource?: ContextModelSource | null,
+  sourceRecipeObjectId?: string | null,
+  sourceThinkingBinding?: 'drop_block' | 'strip_thinking'
 ): ContextMaterializationRecord {
   const segmentKind = typeof row.segment_kind === 'string' ? row.segment_kind : '';
   let messageRole: string | null = null;
@@ -2212,7 +2287,9 @@ function decodeContextRecord(
       created_at: row.content_created_at
     }),
     messageRole,
-    ...(modelSource ? { modelSource } : {})
+    ...(modelSource ? { modelSource } : {}),
+    ...(messageRole === 'model' && sourceRecipeObjectId ? { sourceRecipeObjectId } : {}),
+    ...(messageRole === 'model' && sourceThinkingBinding ? { sourceClaudeThinkingBinding: sourceThinkingBinding } : {})
   };
 }
 
@@ -2494,8 +2571,28 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
     parameters.__after_id = requireRuntimeId(read.afterId);
     predicates.push(`${quote('id')} > @__after_id`);
   }
+  if (read.keyset) {
+    if (read.afterId !== undefined) throw new TypeError('Cannot combine afterId and keyset cursors.');
+    const column = repository.codec.column(read.keyset.column);
+    if (!column || column.type === 'BLOB' || column.json || column.nullable || read.keyset.column !== orderColumn) throw new TypeError('Keyset requires its non-null scalar order column.');
+    if (!['before', 'after'].includes(read.keyset.direction)) throw new TypeError('Keyset direction must be before or after.');
+    const encoded = repository.codec.encodeWhere({ [column.name]: read.keyset.value });
+    parameters.__keyset_value = encoded[column.name];
+    parameters.__keyset_id = requireRuntimeId(read.keyset.id);
+    const operator = read.keyset.direction === 'after' ? '>' : '<';
+    predicates.push(`(${quote(column.name)} ${operator} @__keyset_value OR (${quote(column.name)} = @__keyset_value AND ${quote('id')} ${operator} @__keyset_id))`);
+  }
+  if (read.collaborationBacklog !== undefined) {
+    if (read.collaborationBacklog !== true || schema.key !== 'RuntimeDelivery') throw new TypeError('Collaboration backlog scope is only valid for RuntimeDelivery.');
+    predicates.push(COLLABORATION_BACKLOG_PREDICATE);
+  }
+  if (read.collaborationConversationId !== undefined) {
+    if (schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');
+    parameters.__mailbox_conversation = requireRuntimeId(read.collaborationConversationId);
+    predicates.push(`(EXISTS (SELECT 1 FROM collaboration_message_source_link AS source WHERE source.message_id = collaboration_message.id AND source.conversation_id = @__mailbox_conversation) OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target WHERE target.message_id = collaboration_message.id AND target.conversation_id = @__mailbox_conversation))`);
+  }
   parameters.__limit = BigInt(read.limit);
-  const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction} LIMIT @__limit`;
+  const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction}${orderColumn === 'id' ? '' : `, id ${direction}`} LIMIT @__limit`;
   return (database.prepare(sql).all(parameters) as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));
 }
 

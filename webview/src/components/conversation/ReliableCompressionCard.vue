@@ -14,6 +14,7 @@ import {
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import { formatTokenNumber } from './tokenUsageModel';
+import { compressionTokenChange } from './compressionTokenChange';
 
 const props = defineProps<{
   block: Record<string, unknown>;
@@ -55,7 +56,7 @@ const title = computed(() => titleDetail.value?.status === 'ready' && titleDetai
     || (trigger.value === 'auto' ? '自动上下文压缩' : '上下文压缩'));
 const methodLabel = computed(() => {
   switch (methodKind.value) {
-    case 'openai_responses_compact': return 'OpenAI 原生压缩';
+    case 'provider_native': return 'Provider 原生压缩';
     case 'llm_summary': return 'LLM 总结';
     case 'segmented_summary': return '分段总结';
     case 'deterministic_summary': return '确定性摘要';
@@ -81,11 +82,16 @@ const summaryText = computed(() => renderContents(envelope.value.contents));
 const providerNative = computed(() => envelope.value.contents.some((content) =>
   content.parts.some((part) => isProviderContextPart(part))
 ));
-const beforeTokens = computed(() => firstToken(
+// A 0 full-request estimate only comes from manual compression recorded before it stopped writing one.
+const beforeTokens = computed(() => positiveToken(firstToken(
   props.block.estimated_tokens_before,
   props.block.estimatedTokensBefore,
   presentation.value.estimatedTokensBefore,
   envelope.value.estimatedTokensBefore
+)));
+const contextBeforeTokens = computed(() => firstToken(
+  presentation.value.contextTokensBefore,
+  envelope.value.contextTokensBefore
 ));
 const afterTokens = computed(() => firstToken(
   props.block.estimated_tokens_after,
@@ -93,9 +99,17 @@ const afterTokens = computed(() => firstToken(
   presentation.value.estimatedTokensAfter,
   envelope.value.estimatedTokensAfter
 ));
-const savedTokens = computed(() => beforeTokens.value !== undefined && afterTokens.value !== undefined
-  ? Math.max(0, beforeTokens.value - afterTokens.value)
-  : undefined);
+const resultSizeUncounted = computed(() => presentation.value.resultSizeUncounted === true);
+// Saving compares context with context (same estimator); the full-request estimate also counts the
+// system prompt and tool definitions, which compression never removes, so older blocks without a
+// context figure show no saving. Negative when the Context grew — e.g. a summary rebuilt from raw
+// records came out longer than the one it replaced; that is reported as an increase instead of being
+// clamped to “节省约 0 Token”.
+const tokenChange = computed(() => compressionTokenChange({
+  ...(contextBeforeTokens.value === undefined ? {} : { contextTokensBefore: contextBeforeTokens.value }),
+  ...(afterTokens.value === undefined ? {} : { estimatedTokensAfter: afterTokens.value }),
+  resultSizeUncounted: resultSizeUncounted.value
+}));
 const triggerReason = computed(() =>
   stringValue(props.block.trigger_reason ?? props.block.triggerReason)
   || presentation.value.triggerReason
@@ -145,8 +159,14 @@ const diagnosticRows = computed(() => [
   { label: '触发值来源', value: triggerTokenSourceLabel.value },
   { label: '配置压缩阈值', value: tokenLabel(configuredThresholdTokens.value) },
   { label: '触发时完整请求估算', value: tokenLabel(beforeTokens.value) },
-  { label: '触发时请求构成', value: envelope.value.requestBreakdownLabel ?? '' },
-  { label: '压缩后上下文估算', value: tokenLabel(afterTokens.value) },
+  { label: '触发时请求构成', value: beforeTokens.value === undefined ? '' : envelope.value.requestBreakdownLabel ?? '' },
+  { label: '压缩前上下文估算', value: tokenLabel(contextBeforeTokens.value) },
+  {
+    label: '压缩后上下文估算',
+    value: afterTokens.value !== undefined && resultSizeUncounted.value
+      ? `${tokenLabel(afterTokens.value)}（没有算入服务商加密的压缩结果，实际更大）`
+      : tokenLabel(afterTokens.value)
+  },
   { label: '压缩 Provider 实际输入', value: tokenLabel(providerInputTokens.value) },
   { label: '压缩 Provider 实际输出', value: tokenLabel(providerOutputTokens.value) },
   { label: '保留附件目录', value: envelope.value.attachmentCount === undefined ? '' : `${envelope.value.attachmentCount} 项（无正文）` }
@@ -173,7 +193,10 @@ const subtitle = computed(() => {
   }
   const facts = [methodLabel.value, triggerLabel.value];
   if (sourceCount.value !== undefined) facts.push(`${sourceCount.value} 个上下文段`);
-  if (savedTokens.value !== undefined) facts.push(`节省约 ${formatTokenNumber(savedTokens.value)} Token`);
+  const change = tokenChange.value;
+  if (change !== undefined) {
+    facts.push(change >= 0 ? `节省约 ${formatTokenNumber(change)} Token` : `上下文增加约 ${formatTokenNumber(-change)} Token`);
+  }
   return facts.join(' · ');
 });
 
@@ -210,6 +233,7 @@ interface CompressionDiagnosticData {
   triggerTokenSource?: string;
   configuredThresholdTokens?: number;
   estimatedTokensBefore?: number;
+  contextTokensBefore?: number;
   estimatedTokensAfter?: number;
   providerInputTokens?: number;
   providerOutputTokens?: number;
@@ -254,6 +278,7 @@ function parsePresentation(text: string): CompressionDiagnosticData & {
   title?: string;
   trigger?: string;
   methodKind?: string;
+  resultSizeUncounted?: boolean;
 } {
   if (!text.trim()) return {};
   try {
@@ -263,6 +288,7 @@ function parsePresentation(text: string): CompressionDiagnosticData & {
       ...(stringValue(record.title) ? { title: stringValue(record.title) } : {}),
       ...(stringValue(record.trigger) ? { trigger: stringValue(record.trigger) } : {}),
       ...(stringValue(record.methodKind) ? { methodKind: stringValue(record.methodKind) } : {}),
+      ...(record.resultSizeUncounted === true ? { resultSizeUncounted: true } : {}),
       ...parseDiagnosticFields(record)
     };
   } catch {
@@ -280,6 +306,7 @@ function parseDiagnosticFields(record: Record<string, unknown>): CompressionDiag
     triggerTokens: ['triggerTokens', 'trigger_tokens'],
     configuredThresholdTokens: ['configuredThresholdTokens', 'configured_threshold_tokens'],
     estimatedTokensBefore: ['estimatedTokensBefore', 'estimated_tokens_before'],
+    contextTokensBefore: ['contextTokensBefore', 'context_tokens_before'],
     estimatedTokensAfter: ['estimatedTokensAfter', 'estimated_tokens_after'],
     providerInputTokens: ['providerInputTokens', 'provider_input_tokens'],
     providerOutputTokens: ['providerOutputTokens', 'provider_output_tokens']
@@ -314,6 +341,10 @@ function firstToken(...values: unknown[]): number | undefined {
     if (normalized !== undefined) return normalized;
   }
   return undefined;
+}
+
+function positiveToken(value: number | undefined): number | undefined {
+  return value === undefined || value === 0 ? undefined : value;
 }
 
 function tokenLabel(value: number | undefined): string {
@@ -414,7 +445,7 @@ function nonNegativeInteger(value: unknown): number | undefined {
             <dd>{{ row.value }}</dd>
           </div>
         </dl>
-        <p v-if="providerNative" class="compression-provider-note">该块保留 OpenAI Responses 专用上下文；下一次请求会按原有结构复用，不会转换成 Markdown。</p>
+        <p v-if="providerNative" class="compression-provider-note">该块保留当前 Provider 的签名或不透明上下文；仅在渠道、模型与能力快照兼容时原样复用，不会转换成 Markdown。</p>
         <pre v-if="summaryText" data-testid="compression-detail-summary">{{ summaryText }}</pre>
         <p v-else>压缩结果没有可见文本，但可能包含渠道专用上下文。</p>
         <button v-if="summaryText" type="button" class="compression-copy" @click="copySummary">

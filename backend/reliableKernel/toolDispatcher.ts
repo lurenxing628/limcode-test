@@ -1,3 +1,10 @@
+import { AGENT_COLLABORATION_TOOL_NAMES, isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
+import {
+  CROSS_CONVERSATION_TOOL_NAMES,
+  isCrossConversationTool,
+  isReadonlyCrossConversationTool
+} from '../world/modules/tools/definitions/crossConversation';
+import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
 import {
   MAX_CONCURRENT_ATTACHMENT_READS_PER_TURN,
   MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN,
@@ -9,7 +16,6 @@ import {
   SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
   TRANSFER_TOOL_NAME,
   type SkillDefinitionRecord,
-  type SkillPolicyRecord,
   type ToolDefinitionMetadataRecord,
   type ToolPolicyToolConfigRecord,
   type WorkEnvironmentRecord
@@ -17,6 +23,14 @@ import {
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE, PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import { BACKGROUND_ASK_USER_AUTO_ANSWER } from '../../shared/askUser';
 import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
+import {
+  crossConversationSwitchOn,
+  crossConversationToolPermitted,
+  toolAllowedByPolicy,
+  toolConfigFor,
+  toolConfigKey,
+  type ToolPolicyTool
+} from '../../shared/toolPolicyResolution';
 import {
   mapSettledWithBoundedAdmissionConcurrency,
   mapSettledWithBoundedConcurrency,
@@ -29,6 +43,8 @@ import {
 } from '../world/modules/tools/definitions/command';
 import {
   RUN_AGENT_TOOL_NAME,
+  RUN_AGENT_OPERATIONS,
+  isReadonlyRunAgentOperation,
   runAgentToolAvailableAtDepth
 } from '../world/modules/tools/definitions/runAgent';
 import { effectiveLocalPathReadMode } from '../world/modules/tools/definitions/readFile';
@@ -70,7 +86,8 @@ import type {
   FileMutationDispatcher
 } from './fileEffects';
 import { authorizeFrozenPlanReview, type FrozenPlanReviewRiskLevel } from './frozenMcpPolicyGate';
-import { frozenInteractionAutoApproval, readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenInteractionAutoApproval, frozenSkillPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import { inheritedToolPolicyChain, type InheritedToolPolicyLayer } from './childExecutionBoundary';
 import type { McpEffectDispatcher } from './mcpEffects';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import type { ProcessControlPlane, ProcessWaitObservation } from './processEffects';
@@ -96,6 +113,17 @@ import {
 export interface ReliableToolDispatchAuthority {
   snapshotId: string;
   document: PlainJsonValue;
+  toolConfig?: ToolPolicyToolConfigRecord;
+  /**
+   * Child Turns only: each ancestor Turn's preset and settings for this tool, nearest first. A call
+   * runs automatically, applies changes or submits its result on its own only when every one of
+   * them agrees, and a command must pass every ancestor's command rules.
+   */
+  inheritedToolConfigs?: readonly InheritedToolConfig[];
+}
+
+export interface InheritedToolConfig {
+  preset: string;
   toolConfig?: ToolPolicyToolConfigRecord;
 }
 
@@ -174,7 +202,10 @@ const PROCESS_TOOLS = new Set(['bash', 'shell']);
 const SPECIAL_TOOLS = new Set([
   RUN_AGENT_TOOL_NAME,
   'submit_agent_answer',
-  'read_agent_answer'
+  'read_agent_answer',
+  ...AGENT_COLLABORATION_TOOL_NAMES,
+  ...CROSS_CONVERSATION_TOOL_NAMES,
+  'agent_board'
 ]);
 const WORK_ENVIRONMENT_TOOLS = new Set([SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME]);
 const NO_EFFECT_CAPABILITY_TIMEOUT_MS = 30_000;
@@ -244,7 +275,7 @@ function nativeSchedulingLaneKind(
 ): NativeSchedulingLaneKind {
   if (
     input.toolName === RUN_AGENT_TOOL_NAME
-    && optionalText(plainOptionalRecord(input.arguments)?.mode) !== 'interrupt'
+    && ['spawn', 'send'].includes(optionalText(plainOptionalRecord(input.arguments)?.operation) ?? '')
   ) return 'child';
   if (
     PROCESS_TOOLS.has(input.toolName)
@@ -582,11 +613,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
           skipProviderDefinitionCheck: true,
           deferNoEffectSettlement: false,
           definitions: preflight.definitions,
-          authority: {
-            snapshotId: preflight.baseAuthority.snapshotId,
-            document: preflight.baseAuthority.document,
-            ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
-          },
+          authority: callAuthority(preflight.baseAuthority, policy, callTool(preflight.definitions, input.toolName)),
           ...(specialAdmission ? { specialAdmission } : {})
         });
       } catch (error) {
@@ -637,11 +664,11 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       : available;
     const nativeAsyncTools = turnId === undefined
       ? undefined
-      : nativeAsyncEnabledTools(await this.readAuthority(turnId, 'tool-definitions'));
+      : nativeAsyncEnabledTools(await this.readAuthority(turnId));
     return definitions.map((definition) => {
       const name = requireText(definition.declaration.name, 'Tool declaration.name');
       const metadata = nativeAsyncToolMetadata(
-        name,
+        toolConfigKey(definition.declaration),
         definition.declaration.metadata
           ? normalizePlainJson(definition.declaration.metadata, `Tool ${name} metadata`)
           : undefined,
@@ -680,7 +707,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       throw new Error('freezeCalls requires every Provider call to belong to the same Turn.');
     }
     const [authority, liveDefinitions] = await Promise.all([
-      this.readAuthority(turnId, 'tool-definitions'),
+      this.readAuthority(turnId),
       this.dependencies.host.definitions()
     ]);
     const policy = authorityPolicy(authority.document);
@@ -693,11 +720,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       const live = liveCandidate && sameToolSource(liveCandidate.declaration.source, input.definition.source)
         ? liveCandidate
         : undefined;
-      return this.freezeDecision(input, live, {
-        snapshotId: authority.snapshotId,
-        document: authority.document,
-        ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
-      });
+      return this.freezeDecision(input, live, callAuthority(authority, policy,
+        { name: input.definition.name, source: plainOptionalRecord(input.definition.source) }));
     });
     this.rememberPreparedProviderBatch(inputs, decisions, liveDefinitions, authority);
     return decisions;
@@ -746,7 +770,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       const recipeMatches = recipeByName.get(call.toolName) ?? [];
       let definitionMismatch: string | undefined;
       if (recipeMatches.length !== 1) {
-        definitionMismatch = `ModelRequest recipe 中工具 ${call.toolName} 不是唯一声明。`;
+        definitionMismatch = recipeToolDeclarationError(call.toolName, recipeMatches.length);
       } else if (!sameReliableToolDefinition(recipeMatches[0], pending.frozenDefinition)) {
         return undefined;
       } else {
@@ -831,16 +855,6 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const config = authority.toolConfig;
     const yolo = policy.preset === 'yolo';
     const supportsChangeApply = FILE_TOOLS.has(input.toolName) || metadata?.supportsChangeApply === true;
-    const automaticChangeApply = supportsChangeApply && (
-      yolo
-      || config?.autoApplyChange
-      || (config?.autoApplyChange === undefined && metadata?.defaultAutoApplyChange === true)
-    );
-    const delay = automaticChangeApply
-      ? yolo ? 0 : normalizeAutoApplyDelay(
-          config?.autoApplyChangeDelaySeconds ?? metadata?.defaultAutoApplyChangeDelaySeconds ?? 0
-        )
-      : 0;
     const commandClassification = PROCESS_TOOLS.has(input.toolName)
       ? classifyCommandCall(input.arguments)
       : undefined;
@@ -848,20 +862,17 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       ? frozenCommandScheduling(commandClassification, input.arguments)
       : live?.scheduling?.(input.arguments, { toolName: input.toolName })
         ?? frozenSchedulingFallback(input.definition, input.arguments);
-    const commandConfig = commandPolicyConfig(authority.toolConfig);
     const command = PROCESS_TOOLS.has(input.toolName)
       ? optionalText(requireRecord(input.arguments, `${input.toolName} arguments`).command)
       : '';
-    const allowlistedCommand = !!command && firstMatchedCommandRule(command, commandConfig.allowCommands) !== undefined;
-    const autoApproveReadonly = PROCESS_TOOLS.has(input.toolName)
-      && commandConfig.autoApproveReadonly
-      && isReadonlyCommandCall(input.arguments);
-    const executionAutomatic = yolo
-      || input.toolName === 'ask_user'
-      || input.toolName === 'submit_plan'
-      || allowlistedCommand
-      || autoApproveReadonly
-      || (config?.autoApproveExecution ?? metadata?.defaultAutoApproveExecution ?? true);
+    // A child Turn's call is automatic only where its own settings and every ancestor Turn's agree.
+    const sides = [
+      { preset: policy.preset, toolConfig: config },
+      ...(authority.inheritedToolConfigs ?? [])
+    ].map((side) => sideAutomation(input, metadata, supportsChangeApply, command, side.preset === 'yolo', side.toolConfig));
+    const automaticChangeApply = sides.every((side) => side.automaticChangeApply);
+    const delay = automaticChangeApply ? Math.max(...sides.map((side) => side.changeApplyDelaySeconds)) : 0;
+    const executionAutomatic = sides.every((side) => side.executionAutomatic);
     const summary = live?.summary?.(input.arguments, {
       toolName: input.toolName,
       argsJson: canonicalPlainJson(input.arguments, `Tool ${input.toolName} summary arguments`)
@@ -879,7 +890,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         ? automaticChangeApply ? 'automatic' : 'manual'
         : 'unsupported',
       changeApplyDelaySeconds: delay,
-      autoSubmitResult: yolo || (config?.autoSubmitResult ?? metadata?.defaultAutoSubmitResult ?? true),
+      autoSubmitResult: sides.every((side) => side.autoSubmitResult),
       schedulingMode: scheduling.mode,
       ...(scheduling.reason ? { schedulingReason: scheduling.reason } : {})
     };
@@ -1029,7 +1040,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
 
     const [definitions, baseAuthority, preflight] = await Promise.all([
       this.dependencies.host.definitions(),
-      this.readAuthority(turnId, 'tool-definitions'),
+      this.readAuthority(turnId),
       this.dependencies.database.snapshot(inputs.flatMap((input) => [
         DOMAIN_REPOSITORIES.domain('ToolCall').get(input.toolCallId),
         DOMAIN_REPOSITORIES.domain('Operation').list({ where: { tool_call_id: input.toolCallId }, limit: 1 }),
@@ -1081,13 +1092,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         internalCallIds.add(inputs[index].toolCallId);
         const definition = definitionsByName.get(inputs[index].toolName);
         if (definition) {
-          const authority: ReliableToolDispatchAuthority = {
-            snapshotId: baseAuthority.snapshotId,
-            document: baseAuthority.document,
-            ...(policy.toolConfigs[inputs[index].toolName]
-              ? { toolConfig: policy.toolConfigs[inputs[index].toolName] }
-              : {})
-          };
+          const authority = callAuthority(baseAuthority, policy, definition.declaration);
           frozenDecisionsById.set(inputs[index].toolCallId, this.freezeDecision({
             ...inputs[index],
             definition: reliableDefinitionFromTool(definition)
@@ -1190,7 +1195,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const indexed = inputs.map((input, index): IndexedInput => ({ input, index }));
     const requiresChildAdmission = (input: ReliableAgentToolDispatchInput): boolean =>
       input.toolName === 'run_agent'
-      && optionalText(plainOptionalRecord(input.arguments)?.mode) !== 'interrupt';
+      && ['spawn', 'send'].includes(optionalText(plainOptionalRecord(input.arguments)?.operation) ?? '');
     const childInputs = indexed.filter(({ input }) => requiresChildAdmission(input));
     const processOrMcpInputs = indexed.filter(({ input }) =>
       !requiresChildAdmission(input) && (
@@ -1224,11 +1229,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
           skipProviderDefinitionCheck: true,
           deferNoEffectSettlement: !isAttachmentReadInput(input),
           definitions,
-          authority: {
-            snapshotId: baseAuthority.snapshotId,
-            document: baseAuthority.document,
-            ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
-          },
+          authority: callAuthority(baseAuthority, policy, callTool(definitions, input.toolName)),
           ...(admission ? { specialAdmission: admission } : {})
         });
       } catch (error) {
@@ -1397,8 +1398,16 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       ? undefined
       : await this.providerDefinitionMismatch(input, definition);
     if (definitionMismatch) return this.reject(input, definitionMismatch);
-    const authority = options.authority ?? await this.readAuthority(input.turnId, input.toolName);
+    const authority = options.authority ?? await this.readAuthority(input.turnId, definition.declaration);
     const policy = authorityPolicy(authority.document);
+    if (isCrossConversationTool(input.toolName)) {
+      if (!crossConversationSwitchOn(policy.toolConfigs) || !await this.topLevelTurn(input.turnId)) {
+        return this.reject(input, `当前 Turn 未开启跨对话协作，或当前对话是子 Agent 对话，不允许工具 ${input.toolName}。`);
+      }
+      if (!crossConversationToolPermitted(policy.allowedTools, input.toolName)) {
+        return this.reject(input, `当前 Turn 的工具策略不含 run_agent，跨对话协作只允许列出和读取对话，不允许工具 ${input.toolName}。`);
+      }
+    }
     if (!definitionAllowedByAuthority(policy, definition)) {
       return this.reject(input, `冻结 ToolPolicy 不允许工具 ${input.toolName}。`);
     }
@@ -1806,6 +1815,15 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (commandConfig.allowCommands.length > 0 && !firstMatchedCommandRule(command, commandConfig.allowCommands)) {
       return this.reject(input, '命令未匹配冻结 ToolPolicy 白名单；可靠执行批准门禁未启用，因此不会执行。');
     }
+    // A child Turn's command must also pass the rules of every ancestor Turn.
+    for (const inherited of authority.inheritedToolConfigs ?? []) {
+      const rules = commandPolicyConfig(inherited.toolConfig);
+      const deniedByParent = firstMatchedCommandRule(command, rules.denyCommands);
+      if (deniedByParent) return this.reject(input, `命令被上级对话冻结的 ToolPolicy 黑名单拒绝：${deniedByParent}`);
+      if (rules.allowCommands.length > 0 && !firstMatchedCommandRule(command, rules.allowCommands)) {
+        return this.reject(input, '命令未匹配上级对话冻结的 ToolPolicy 白名单；子 Agent 的命令不能超出上级对话允许的范围，因此不会执行。');
+      }
+    }
     const foregroundWaitMs = requireWaitMs(args.foregroundWaitMs);
     const executionTimeoutMs = requireOptionalBoundedInteger(
       args.executionTimeoutMs,
@@ -2043,25 +2061,52 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     definitions: ToolDefinition[],
     turnId: string
   ): Promise<ToolDefinition[]> {
-    const authority = await this.readAuthority(turnId, 'tool-definitions');
+    const authority = await this.readAuthority(turnId);
     const toolPolicy = authorityPolicy(authority.document);
     const workEnvironmentPolicy = authorityWorkEnvironmentPolicy(authority.document);
     const runAgentDefinition = definitions.find((definition) =>
       definition.declaration.name === RUN_AGENT_TOOL_NAME
       && definitionAllowedByAuthority(toolPolicy, definition)
     );
-    const exposeRunAgent = !runAgentDefinition || runAgentToolAvailableAtDepth(
+    const allowChildSpawn = !runAgentDefinition || runAgentToolAvailableAtDepth(
       await childAgentDepthForTurn(this.dependencies.database, turnId),
       toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
     );
+    // The frozen switch grants the cross-conversation tools (see toolAllowedByPolicy); they stay
+    // with top-level conversations, since a child task collaborates inside its own team.
+    const topLevel = definitions.some((definition) => isCrossConversationTool(definition.declaration.name))
+      && crossConversationSwitchOn(toolPolicy.toolConfigs)
+      && await this.topLevelTurn(turnId);
     const allowed = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
-      && (definition.declaration.name !== RUN_AGENT_TOOL_NAME || exposeRunAgent)
-    );
+      && (!isCrossConversationTool(definition.declaration.name) || topLevel)
+    ).map(definition => {
+      if (definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn) return definition;
+      const parameters = plainOptionalRecord(normalizePlainJson(definition.declaration.parameters ?? {})) ?? {};
+      const properties = plainOptionalRecord(parameters.properties) ?? {};
+      const operation = plainOptionalRecord(properties.operation) ?? {};
+      return { ...definition, declaration: { ...definition.declaration,
+        description: `${definition.declaration.description}\nNew child spawning is unavailable at the current depth. Use list/read/wait/send/interrupt_subtree for existing children.`,
+        parameters: { ...parameters, properties: { ...properties,
+          operation: { ...operation, enum: RUN_AGENT_OPERATIONS.filter(value => value !== 'spawn') }
+        } }
+      } } as ToolDefinition;
+    });
     const withSkills = this.augmentSkillsDefinition(allowed, authority.document);
     const withEnvironments = await this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
     return this.augmentRunAgentDefinition(withEnvironments);
+  }
+
+  /**
+   * Whether the Turn runs in a top-level conversation. Phase one offers the cross-conversation
+   * tools only there: a child task keeps collaborating inside its own team.
+   */
+  private async topLevelTurn(turnId: string): Promise<boolean> {
+    const turns = await this.list('Turn', { id: turnId }, 1);
+    if (turns.length !== 1) throw new Error(`Turn ${turnId} does not exist.`);
+    const conversationId = requireId(turns[0].conversation_id, 'Turn.conversation_id');
+    return (await this.list('ChildExecution', { child_conversation_id: conversationId }, 1)).length === 0;
   }
 
   /**
@@ -2158,7 +2203,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (index === -1) return definitions;
     let enabled: SkillDefinitionRecord[];
     try {
-      const policy = authoritySkillPolicy(document);
+      const policy = frozenSkillPolicy(document);
       enabled = host.skillDefinitions().filter((skill) => isSkillEnabledByPolicy(policy, skill));
     } catch {
       // 与其他动态注入点一致：目录/冻结策略异常时降级为静态描述，不拖垮整个 Turn。
@@ -2177,7 +2222,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     return next;
   }
 
-  private async readAuthority(turnId: string, toolName: string): Promise<ReliableToolDispatchAuthority> {
+  /** The Turn's frozen authority, with one tool's per-tool settings when a tool is named. */
+  private async readAuthority(turnId: string, tool?: ToolPolicyTool): Promise<ReliableToolDispatchAuthority> {
     let cached = this.authorityCache.get(turnId);
     if (!cached) {
       cached = (async () => {
@@ -2205,12 +2251,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       if (this.authorityCache.get(turnId) === cached) this.authorityCache.delete(turnId);
       throw error;
     }
-    const policy = authorityPolicy(base.document);
-    return {
-      snapshotId: base.snapshotId,
-      document: base.document,
-      ...(policy.toolConfigs[toolName] ? { toolConfig: policy.toolConfigs[toolName] } : {})
-    };
+    return callAuthority(base, authorityPolicy(base.document), tool);
   }
 
   private async reject(
@@ -2626,7 +2667,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     }
     const childPlan = memberships.length === 1;
     if (!childPlan) {
-      const frozen = authority ?? await this.readAuthority(input.turnId, toolName);
+      const frozen = authority ?? await this.readAuthority(input.turnId);
       if (!frozenInteractionAutoApproval(frozen.document, toolName)) return undefined;
     }
     if (await this.turnTerminationRequested(input.turnId)) return undefined;
@@ -2699,6 +2740,8 @@ function authorityPolicy(document: PlainJsonValue): {
   preset: string;
   toolConfigs: Record<string, ToolPolicyToolConfigRecord>;
   sourceConfigs: Record<string, unknown>;
+  /** Ancestor Turns' presets and per-tool settings, nearest first; empty outside child Turns. */
+  inherited: InheritedToolPolicyLayer[];
 } {
   const authority = requireRecord(document, 'AuthoritySnapshot');
   const policy = requireRecord(authority.toolPolicy, 'AuthoritySnapshot.toolPolicy');
@@ -2717,21 +2760,8 @@ function authorityPolicy(document: PlainJsonValue): {
     allowedTools,
     preset: typeof policy.preset === 'string' ? policy.preset : 'custom',
     toolConfigs: toolConfigsRaw as unknown as Record<string, ToolPolicyToolConfigRecord>,
-    sourceConfigs
-  };
-}
-
-/**
- * 读取冻结 Authority 中的 skillPolicy。缺失/为空时返回 undefined（默认全部启用，opt-out）。
- * sourceConfigs 由 configuration authority 冻结时 plain-clone，结构与 SkillPolicyRecord 一致。
- */
-function authoritySkillPolicy(document: PlainJsonValue): Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined {
-  const authority = requireRecord(document, 'AuthoritySnapshot');
-  if (authority.skillPolicy === undefined || authority.skillPolicy === null) return undefined;
-  const raw = plainRecord(authority.skillPolicy, 'AuthoritySnapshot.skillPolicy');
-  if (raw.sourceConfigs === undefined || raw.sourceConfigs === null) return {};
-  return {
-    sourceConfigs: plainRecord(raw.sourceConfigs as PlainJsonValue | undefined, 'AuthoritySnapshot.skillPolicy.sourceConfigs') as unknown as SkillPolicyRecord['sourceConfigs']
+    sourceConfigs,
+    inherited: inheritedToolPolicyChain(policy)
   };
 }
 
@@ -2755,27 +2785,45 @@ function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {
   };
 }
 
+/**
+ * The authority one call runs under: the frozen document plus the tool's own per-tool settings,
+ * found by `toolConfigKey` (an MCP tool by source id and original name, never its display name).
+ */
+function callAuthority(
+  base: { snapshotId: string; document: PlainJsonValue },
+  policy: ReturnType<typeof authorityPolicy>,
+  tool: ToolPolicyTool | undefined
+): ReliableToolDispatchAuthority {
+  const toolConfig = tool ? toolConfigFor(policy.toolConfigs, tool) : undefined;
+  const inheritedToolConfigs = policy.inherited.map((layer): InheritedToolConfig => {
+    const inherited = tool ? toolConfigFor(layer.toolConfigs, tool) : undefined;
+    return { preset: layer.preset, ...(inherited ? { toolConfig: inherited } : {}) };
+  });
+  return {
+    snapshotId: base.snapshotId,
+    document: base.document,
+    ...(toolConfig ? { toolConfig } : {}),
+    ...(inheritedToolConfigs.length > 0 ? { inheritedToolConfigs } : {})
+  };
+}
+
+/** The declaration a call names, which carries the identity its per-tool settings are keyed by. */
+function callTool(definitions: readonly ToolDefinition[], toolName: string): ToolPolicyTool {
+  return definitions.find((definition) => definition.declaration.name === toolName)?.declaration ?? { name: toolName };
+}
+
+/** The shared frozen-policy rule; MCP tools follow their source settings, including all-sources denies. */
 function definitionAllowedByAuthority(
   policy: ReturnType<typeof authorityPolicy>,
   definition: ToolDefinition
 ): boolean {
-  const explicitlyAllowed = policy.allowedTools.has(definition.declaration.name);
-  const source = definition.declaration.source;
-  if (source?.kind !== 'mcp' || !source.sourceId?.trim()) return explicitlyAllowed;
-  const config = policy.sourceConfigs[source.sourceId];
-  if (!config || typeof config !== 'object' || Array.isArray(config)) return explicitlyAllowed;
-  const configRecord = config as Record<string, unknown>;
-  if (configRecord.enabled !== true) return false;
-  const disabled = Array.isArray(configRecord.disabledTools)
-    ? configRecord.disabledTools.filter((name): name is string => typeof name === 'string')
-    : [];
-  return !disabled.includes(definition.declaration.name);
+  return toolAllowedByPolicy(policy, { name: definition.declaration.name, source: definition.declaration.source });
 }
 
 /**
- * Frozen-policy native async opt-in set. Only tools explicitly configured with nativeAsync:true
- * may ever be declared async on a native channel; false/missing policy means synchronous, and a
- * declaration-carried flag is never enough on its own.
+ * Frozen-policy native async opt-in set, by `toolConfigKey`. Only tools explicitly configured with
+ * nativeAsync:true may ever be declared async on a native channel; false/missing policy means
+ * synchronous, and a declaration-carried flag is never enough on its own.
  */
 function nativeAsyncEnabledTools(authority: ReliableToolDispatchAuthority): ReadonlySet<string> {
   const enabled = new Set<string>();
@@ -2802,6 +2850,56 @@ function nativeAsyncToolMetadata(
   const rest = { ...base };
   delete rest.nativeAsync;
   return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+interface SideAutomation {
+  executionAutomatic: boolean;
+  automaticChangeApply: boolean;
+  changeApplyDelaySeconds: number;
+  autoSubmitResult: boolean;
+}
+
+/**
+ * What one Turn's settings (a child's own, or one ancestor's) let this call do on its own. The same
+ * rules apply to every side; `freezeDecision` requires all of them.
+ */
+function sideAutomation(
+  input: ReliableAgentToolDispatchInput,
+  metadata: ToolDefinitionMetadataRecord | undefined,
+  supportsChangeApply: boolean,
+  command: string,
+  yolo: boolean,
+  config: ToolPolicyToolConfigRecord | undefined
+): SideAutomation {
+  const automaticChangeApply = supportsChangeApply && (
+    yolo
+    || config?.autoApplyChange
+    || (config?.autoApplyChange === undefined && metadata?.defaultAutoApplyChange === true)
+  ) === true;
+  const commandConfig = commandPolicyConfig(config);
+  const allowlistedCommand = !!command && firstMatchedCommandRule(command, commandConfig.allowCommands) !== undefined;
+  const autoApproveReadonly = PROCESS_TOOLS.has(input.toolName)
+    && commandConfig.autoApproveReadonly
+    && isReadonlyCommandCall(input.arguments);
+  return {
+    executionAutomatic: yolo
+      || input.toolName === 'ask_user'
+      || input.toolName === 'submit_plan'
+      || (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments))
+      || isReadonlyAgentCollaborationTool(input.toolName)
+      || isReadonlyCrossConversationTool(input.toolName)
+      || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))
+      || allowlistedCommand
+      || autoApproveReadonly
+      || (config?.autoApproveExecution ?? metadata?.defaultAutoApproveExecution ?? true),
+    automaticChangeApply,
+    changeApplyDelaySeconds: automaticChangeApply
+      ? yolo ? 0 : normalizeAutoApplyDelay(
+          config?.autoApplyChangeDelaySeconds ?? metadata?.defaultAutoApplyChangeDelaySeconds ?? 0
+        )
+      : 0,
+    autoSubmitResult: yolo || (config?.autoSubmitResult ?? metadata?.defaultAutoSubmitResult ?? true)
+  };
 }
 
 interface CommandPolicyConfig {
@@ -2846,7 +2944,11 @@ function frozenSchedulingFallback(
     return { mode: args.scheduling, reason: `provider_selected_${args.scheduling}` };
   }
   const metadata = plainOptionalRecord(definition.metadata);
-  if (metadata?.readonly === true || metadata?.riskLevel === 'read') {
+  if ((definition.name === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(value))
+    || isReadonlyAgentCollaborationTool(definition.name)
+    || isReadonlyCrossConversationTool(definition.name)
+    || (definition.name === 'agent_board' && isReadonlyAgentBoardOperation(value))
+    || metadata?.readonly === true || metadata?.riskLevel === 'read') {
     return { mode: 'parallel', reason: 'frozen_readonly_metadata' };
   }
   return { mode: 'serial', reason: 'frozen_default_serial' };
@@ -2856,6 +2958,9 @@ function frozenPlanReviewRiskLevel(
   definition: ToolDefinition,
   input: ReliableAgentToolDispatchInput
 ): FrozenPlanReviewRiskLevel {
+  if (input.toolName === RUN_AGENT_TOOL_NAME && isReadonlyRunAgentOperation(input.arguments)) return 'read';
+  if (isReadonlyAgentCollaborationTool(input.toolName) || isReadonlyCrossConversationTool(input.toolName)
+    || (input.toolName === 'agent_board' && isReadonlyAgentBoardOperation(input.arguments))) return 'read';
   if (FILE_TOOLS.has(input.toolName)) return 'write';
   if (PROCESS_TOOLS.has(input.toolName)) {
     return isReadonlyCommandCall(input.arguments) ? 'read' : 'command';
@@ -2981,10 +3086,17 @@ function providerDefinitionMismatchFromRecipe(
   const matches = recipe.tools
     .map((value, index) => requireRecord(value, `ModelRequest recipe.tools[${index}]`))
     .filter((value) => value.name === toolName);
-  if (matches.length !== 1) return `ModelRequest recipe 中工具 ${toolName} 不是唯一声明。`;
+  if (matches.length !== 1) return recipeToolDeclarationError(toolName, matches.length);
   return sameToolSource(definition.declaration.source, matches[0].source)
     ? undefined
     : `工具 ${toolName} 的当前 capability source 与 Provider 请求冻结 source 不一致；拒绝跨源执行。`;
+}
+
+/** 返回给模型的工具结果：没声明的工具要说清“不存在”，模型才会改用本次请求提供的工具，而不是当成配置冲突。 */
+function recipeToolDeclarationError(toolName: string, count: number): string {
+  return count === 0
+    ? `本次请求没有提供工具 ${toolName}，只能调用请求里声明的工具。`
+    : `ModelRequest recipe 中工具 ${toolName} 声明了 ${count} 次，不是唯一声明。`;
 }
 
 function sameToolSource(left: unknown, right: unknown): boolean {

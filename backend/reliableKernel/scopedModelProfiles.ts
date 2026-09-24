@@ -2,6 +2,14 @@ import type { ConfigScopeKind, ModelProfileRecord, ModelProfileScopeLinkRecord }
 import type { StoragePaths } from '../capabilities/vscodeStorage/paths';
 import { loadRecordStore, loadRecordStoreByIds } from '../capabilities/vscodeStorage/recordStore';
 
+/**
+ * 原 DeepSeek 渠道并入 OpenAI 兼容后，会话、Agent 上保存的模型选择按迁移后的渠道类型读取，
+ * 否则“渠道或模型已改变”之类的身份检查会把它们当成另一个渠道。
+ */
+export function canonicalModelProfile(profile: ModelProfileRecord): ModelProfileRecord {
+  return (profile.provider as unknown) === 'deepseek' ? { ...profile, provider: 'openai-compatible' } : profile;
+}
+
 /** Read current links, then only the profiles referenced by the requested scopes. No TTL cache. */
 export async function loadScopedModelProfiles(
   paths: StoragePaths,
@@ -17,5 +25,5 @@ export async function loadScopedModelProfiles(
     paths.modelProfilesRootUri, paths.modelProfilesIndexUri, 'modelProfile',
     modelProfileScopeLinks.map(link => link.modelProfileId)
   ) : [];
-  return { modelProfiles, modelProfileScopeLinks };
+  return { modelProfiles: modelProfiles.map(canonicalModelProfile), modelProfileScopeLinks };
 }

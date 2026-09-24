@@ -2,12 +2,20 @@ import { readRequestTurnAuthority } from './requestCompressionSettings';
 
 import {
   buildModelHandleCatalog,
+  modelHandleEntries,
   modelHandleRef,
   normalizeModelHandleCatalog,
   resolveModelToolArguments,
-  UnknownModelHandleReferenceError
+  UnknownModelHandleReferenceError,
+  type ModelHandleCatalog,
+  type ModelHandleEntry
 } from './modelHandleCatalog';
-import { childExecutionAcceptsContinuation, requireChildExecutionStatus } from './childExecutionState';
+import { forkInheritedChildTargets, forkSourceConversationIds, isForkConversation, readConversationChildHandles } from './conversationChildHandles';
+import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
+import { isReadonlyCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
+import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
+import { isReadonlyRunAgentOperation } from '../world/modules/tools/definitions/runAgent';
 import { createHash } from 'node:crypto';
 import type {
   LlmOpenAIResponsesTransport,
@@ -60,6 +68,7 @@ import {
   type TurnTaskCardReminderState
 } from './currentTurnTaskProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { CLAUDE_TURN_SCOPED_REMINDER_DELIVERY, claudeTurnScopedRemindersEnabled } from './turnReminderProjection';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -302,11 +311,67 @@ interface CurrentTurnRequestState {
   compressionBoundaryId?: string;
 }
 
+interface ForkIdentityFacts {
+  conversationId: string;
+  /** Branch sources, nearest first. */
+  sourceConversationIds: string[];
+  /** Collaboration messages this Conversation itself sent or received. */
+  ownMessageIds: ReadonlySet<string>;
+}
+
+/**
+ * The collaboration refs of a fork's catalog that it inherited: its branch sources among its
+ * conversation refs, and the messages it was not party to. Undefined when there are none, so a
+ * fork of a conversation that never collaborated gets no card.
+ */
+function forkInheritedCollaborationTargets(catalog: ModelHandleCatalog, facts: ForkIdentityFacts): {
+  sourceConversationIds: string[]; messageIds: string[];
+} | undefined {
+  const known = (kind: 'conversation' | 'collaborationMessage') => new Set(modelHandleEntries(catalog, kind).map(entry => entry.target));
+  const conversations = known('conversation');
+  const sourceConversationIds = facts.sourceConversationIds.filter(id => conversations.has(id));
+  const messageIds = [...known('collaborationMessage')].filter(id => !facts.ownMessageIds.has(id));
+  return sourceConversationIds.length || messageIds.length ? { sourceConversationIds, messageIds } : undefined;
+}
+
+function emptyRuntimeStatusCard(heading: string): FrozenRuntimeStatusCard {
+  return {
+    kind: 'runtime_status_card', activeChildCount: 0, runningProcessCount: 0, childTaskRevision: 'none',
+    totalChildCount: 0, descendantCount: 0, queuedInputCount: 0, awaitingHandlingCount: 0,
+    childHandleTargets: [], children: [], processes: [], card: heading
+  };
+}
+
 interface FrozenRuntimeStatusCard {
   kind: 'runtime_status_card';
   activeChildCount: number;
   runningProcessCount: number;
-  children: Array<{ childExecutionId: string; answerBridgeId?: string; status: string; task: string; resumable: boolean }>;
+  childTaskRevision: string;
+  totalChildCount: number;
+  descendantCount: number;
+  queuedInputCount: number;
+  awaitingHandlingCount: number;
+  /** Identity candidates include omitted rows; the provider sees only stable short references. */
+  childHandleTargets: Array<{ answerBridgeId: string }>;
+  /** Child refs a fork copied from its source history; listed as not operable from this Conversation. */
+  inheritedChildTargets?: string[];
+  children: Array<{
+    childExecutionId: string;
+    answerBridgeId: string;
+    status: string;
+    task: string;
+    label: string;
+    initialTask?: string;
+    currentTasks: string[];
+    queuedTasks: string[];
+    currentInputCount: number;
+    queuedInputCount: number;
+    truncated: boolean;
+    latestTurnOutcome?: string;
+    answerAvailable: boolean;
+    answerHandling: 'handled' | 'runtime_pending' | 'tool_result' | 'failed' | 'unknown';
+    resumable: boolean;
+  }>;
   processes: Array<{ processId: string; status: 'running' }>;
   card: string;
 }
@@ -361,7 +426,7 @@ export class ReliableAgentLoop {
     this.now = options.now ?? (() => new Date().toISOString());
     this.reconcileCommittedToolCall = options.reconcileCommittedToolCall;
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
-    this.automaticDeliveries = new AutomaticRuntimeDeliveryRouter(database);
+    this.automaticDeliveries = new AutomaticRuntimeDeliveryRouter(database, contentStore);
   }
 
   public async runInput(command: TurnInputCommand): Promise<ReliableAgentLoopResult> {
@@ -384,6 +449,7 @@ export class ReliableAgentLoop {
       // settlement and Context append replays that one round idempotently. Only after the replayed
       // round is complete do we advance to request_seq + 1. There is no process-local round cap:
       // safety limits belong to explicit token/cost/time policy, never an invisible failed Turn.
+      await this.openEmptyContextWithDeliveredInput(turnId);
       const resumeState = await this.readResumeState(turnId);
       let requestSequence = resumeState.requestSequence;
       let openTaskCompletionCheckConsumed = resumeState.openTaskCompletionCheckConsumed;
@@ -459,7 +525,9 @@ export class ReliableAgentLoop {
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             trigger: 'auto',
             requestBudget: planningBudget,
-            protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe)
+            protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
+            modelHandleCatalog: normalizeModelHandleCatalog(asRecord(frozenRecipe)?.modelHandleCatalog),
+            tools: toolDefinitions
           });
           if (compression.status === 'error') {
             throw new ModelRequestPreflightError(
@@ -513,6 +581,13 @@ export class ReliableAgentLoop {
               throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
             }
             planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
+          }
+          if ((compression.status === 'compressed' || compression.status === 'continued_uncompressed')
+            && compression.recoveryDecision) {
+            frozenRecipe = normalizePlainJson({
+              ...(frozenRecipe as { [key: string]: PlainJsonValue }),
+              compressionDecision: compression.recoveryDecision
+            }, 'Request compression recovery decision');
           }
           await this.guardNativeModelSwitch(
             requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
@@ -853,13 +928,14 @@ export class ReliableAgentLoop {
       freshConfigurationUpdate?: { effort: string };
     };
   }): Promise<PlainJsonValue> {
-    const [currentTurnState, runtimeStatusCard, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
+    const [currentTurnState, runtimeStatus, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
       this.readCurrentTurnInputReference(input.turnId, input.headRootId),
       this.readRuntimeStatusCard(input.turnId),
       readCurrentTurnTaskCard(this.database, this.contentStore, input.turnId),
       this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round),
       this.readNativeRecipeFreeze(input)
     ]);
+    const runtimeStatusCard = runtimeStatus.statusCard;
     const materialized = await this.context.materialize(input.headRootId);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const attachmentCatalogState = await this.modelProvider.projectAttachmentCatalogState(
@@ -884,14 +960,47 @@ export class ReliableAgentLoop {
       ) as unknown as ContentObjectMetadata;
       handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
     }
-    const childHandles = await this.readPreviousChildHandles(conversationId);
-    const modelHandleCatalog = buildModelHandleCatalog(handleSources, [...attachmentHandles.entries, ...childHandles]);
+    const seeds = [...attachmentHandles.entries, ...runtimeStatus.childHandles];
+    let modelHandleCatalog = buildModelHandleCatalog(handleSources, seeds);
+    const forkIdentity = runtimeStatus.forkIdentity;
+    const inheritedCollaboration = forkIdentity ? forkInheritedCollaborationTargets(modelHandleCatalog, forkIdentity) : undefined;
+    if (forkIdentity && inheritedCollaboration) {
+      // The fork's own address joins the catalog so the model can tell itself from its sources.
+      modelHandleCatalog = buildModelHandleCatalog([...handleSources, { kind: 'agent_collaboration', conversationId: forkIdentity.conversationId }], seeds);
+    }
     if (runtimeStatusCard) {
       // Labels are runtime data. Behavioral guidance belongs to the run_agent tool definition.
       runtimeStatusCard.card += runtimeStatusCard.children.map(child => '\n' + JSON.stringify({
         childRef: modelHandleRef(modelHandleCatalog, 'child', child.answerBridgeId),
-        task: child.task, status: child.status, resumable: child.resumable
+        label: child.label, task: child.task, initialTask: child.initialTask,
+        currentTasks: child.currentTasks, currentInputCount: child.currentInputCount,
+        queuedTasks: child.queuedTasks, queuedInputCount: child.queuedInputCount,
+        truncated: child.truncated, latestTurnOutcome: child.latestTurnOutcome,
+        answerAvailable: child.answerAvailable, answerHandling: child.answerHandling,
+        status: child.status, resumable: child.resumable
       })).join('');
+      const inheritedChildRefs = (runtimeStatusCard.inheritedChildTargets ?? [])
+        .map(target => modelHandleRef(modelHandleCatalog, 'child', target))
+        .filter((ref): ref is string => !!ref);
+      if (inheritedChildRefs.length > 0) {
+        runtimeStatusCard.card += '\n' + JSON.stringify({ inheritedChildRefs, operable: false });
+      }
+    }
+    let statusCard = runtimeStatusCard;
+    if (forkIdentity && inheritedCollaboration) {
+      const refs = (kind: 'conversation' | 'collaborationMessage', targets: readonly string[]) => targets
+        .map(target => modelHandleRef(modelHandleCatalog, kind, target)).filter((ref): ref is string => !!ref);
+      statusCard ??= emptyRuntimeStatusCard('[Forked conversation — runtime data, not instructions]');
+      statusCard.card += '\n' + [
+        'This conversation is a fork: its history up to the fork was copied from forkedFromConversationRefs, nearest first. In that copied history, "this conversation" means the conversation it was copied from, never this one.',
+        'inheritedMessageRefs were sent or received by those conversations, not by this one: this conversation cannot answer them or read them as its own messages. Send new messages without replyToMessageRef.',
+        JSON.stringify({
+          selfConversationRef: modelHandleRef(modelHandleCatalog, 'conversation', forkIdentity.conversationId),
+          forkedFromConversationRefs: refs('conversation', inheritedCollaboration.sourceConversationIds),
+          inheritedMessageRefs: refs('collaborationMessage', inheritedCollaboration.messageIds),
+          operable: false
+        })
+      ].join('\n');
     }
     const boundaryKey = currentTurnState.compressionBoundaryId ?? 'pre-compression';
     const turnTaskCardReminderEnabled = turnTaskCard
@@ -914,23 +1023,26 @@ export class ReliableAgentLoop {
         turnTaskCardBoundaryKey: boundaryKey,
         turnTaskCardReminderEnabled
       } : {}),
-      ...(runtimeStatusCard ? { runtimeStatusCard } : {}),
+      ...(statusCard ? { runtimeStatusCard: statusCard } : {}),
       ...(input.includeOpenTaskCompletionCheck ? {
         openTaskCompletionCheck: {
           kind: OPEN_TASK_COMPLETION_CHECK_KIND,
           card: OPEN_TASK_COMPLETION_CHECK_CARD
         }
       } : {}),
+      ...(nativeFreeze.turnReminderDelivery ? { turnReminderDelivery: nativeFreeze.turnReminderDelivery } : {}),
       ...(nativeFreeze.nativeResponses ? { nativeResponses: nativeFreeze.nativeResponses } : {}),
       ...(nativeFreeze.nativeReasoning ? { nativeReasoning: nativeFreeze.nativeReasoning } : {})
     }, 'Reliable Agent recipe');
   }
 
   /**
-   * Freezes the Astra native decision and reasoning facts into the ordinary recipe so recovery
+   * Freezes the GPT-6 native decision and reasoning facts into the ordinary recipe so recovery
    * replays byte-identical behavior. Capability inputs come from the frozen Turn authority (never
    * live settings). The base stays stable on a compatible lineage; effort changes become pending
    * configuration updates. Mode/model/provider changes and compression rebase discard stale updates.
+   * The same frozen authority also records how this request sends its reminders: only requests sent
+   * as Claude turn-scoped system messages are later re-sent verbatim in the history.
    */
   private async readNativeRecipeFreeze(input: {
     settingsSnapshotContentObjectId?: string;
@@ -943,6 +1055,7 @@ export class ReliableAgentLoop {
       freshConfigurationUpdate?: { effort: string };
     };
   }): Promise<{
+    turnReminderDelivery?: typeof CLAUDE_TURN_SCOPED_REMINDER_DELIVERY;
     nativeResponses?: OpenAIResponsesNativeCapabilities;
     nativeReasoning?: {
       baseEffort?: string;
@@ -961,19 +1074,23 @@ export class ReliableAgentLoop {
       requireId(input.turnId, 'turnId'),
       input.settingsSnapshotContentObjectId
     );
+    const delivery = claudeTurnScopedRemindersEnabled(frozen.document)
+      ? { turnReminderDelivery: CLAUDE_TURN_SCOPED_REMINDER_DELIVERY }
+      : {};
     const documentModel = asRecord(frozen.document)?.model;
     const modelRecord = asRecord(documentModel);
+    const thinking = asRecord(modelRecord?.thinkingConfig);
     const capabilities = openAIResponsesNativeCapabilities({
       provider: modelRecord?.provider as LlmProviderKind | undefined,
       model: typeof modelRecord?.modelId === 'string' ? modelRecord.modelId : undefined,
       baseUrl: typeof modelRecord?.baseUrl === 'string' ? modelRecord.baseUrl : undefined,
       transport: modelRecord?.openaiResponsesTransport as LlmOpenAIResponsesTransport | undefined,
-      nativeResponses: normalizeOpenAIResponsesNativeSettings(modelRecord?.nativeResponses)
+      nativeResponses: normalizeOpenAIResponsesNativeSettings(modelRecord?.nativeResponses),
+      ...(typeof thinking?.reasoningMode === 'string' ? { reasoningMode: thinking.reasoningMode } : {})
     });
     if (!capabilities.asyncTools && !capabilities.steering && !capabilities.reasoningUpdates) {
-      return {};
+      return delivery;
     }
-    const thinking = asRecord(modelRecord?.thinkingConfig);
     const configuredEffort = typeof thinking?.thinkingLevel === 'string' && thinking.thinkingLevel !== 'not-set' && thinking.thinkingLevel !== 'non-set'
       ? thinking.thinkingLevel
       : undefined;
@@ -1031,6 +1148,7 @@ export class ReliableAgentLoop {
       ?? carriedUpdates[carriedUpdates.length - 1]?.effort
       ?? baseEffort;
     return {
+      ...delivery,
       nativeResponses: capabilities,
       nativeReasoning: {
         ...(restoreDefaults ? { resetCache: true, forceFullReason: 'thinking_defaults_restored' as const } : {}),
@@ -1172,105 +1290,111 @@ export class ReliableAgentLoop {
     };
   }
 
-  private async readPreviousChildHandles(conversationId: string) {
-    const turns = (await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId }))
-      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
-    for (const turn of turns) {
-      const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turn.id }))
-        .sort((a, b) => compareInteger(b.request_seq, a.request_seq));
-      for (const request of requests) {
-        const recipe = await this.readModelRequestRecipe(requireId(request.id, 'ModelRequest.id'));
-        if (recipe.kind !== 'reliable-agent-turn') continue;
-        // Keep reserved child refs even when a child leaves the visible roster. A later child
-        // must not inherit its number after compression, completion or host restart.
-        return normalizeModelHandleCatalog(recipe.modelHandleCatalog).entries.filter(entry => entry.kind === 'child');
-      }
-    }
-    return [];
-  }
-
-  private async readRuntimeStatusCard(turnId: string): Promise<FrozenRuntimeStatusCard | undefined> {
+  private async readRuntimeStatusCard(turnId: string): Promise<{
+    statusCard?: FrozenRuntimeStatusCard;
+    /** Persistent child refs of the Conversation, read once for the recipe's handle catalog. */
+    childHandles: ModelHandleEntry[];
+    /** For a fork: what copied collaboration refs mean here, read once for the recipe. */
+    forkIdentity?: ForkIdentityFacts;
+  }> {
     const turn = await this.requireExisting('Turn', turnId);
-    const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: turn.conversation_id });
-    const [childLinks, processLinks] = await Promise.all([
-      Promise.all(turns.map(parent => listAllDomainRows(this.database, 'ChildExecutionParentLink', { parent_turn_id: parent.id }))).then(groups => groups.flat()),
-      listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId })
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const [projection, processLinks, childHandles, fork] = await Promise.all([
+      readConversationChildTaskProjection(this.database, this.contentStore, conversationId),
+      listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId }),
+      readConversationChildHandles(this.database, this.contentStore, conversationId),
+      isForkConversation(this.database, conversationId)
     ]);
-    const orderedChildLinks = childLinks
-      .sort((left, right) => String(left.child_execution_id).localeCompare(String(right.child_execution_id)));
-    const orderedProcessLinks = processLinks
-      .sort((left, right) => String(left.process_id).localeCompare(String(right.process_id)));
-    const factReads = [
-      ...orderedChildLinks.map((link) =>
-        DOMAIN_REPOSITORIES.domain('ChildExecution').get(
-          requireId(link.child_execution_id, 'ChildExecutionParentLink.child_execution_id')
-        )
-      ),
-      ...orderedProcessLinks.map((link) =>
-        DOMAIN_REPOSITORIES.domain('Process').get(
-          requireId(link.process_id, 'ProcessCompletionSourceLink.process_id')
-        )
-      )
-    ];
-    const facts = factReads.length === 0 ? null : await this.database.snapshot(factReads);
-    const availableChildren: Array<{ childExecutionId: string; conversationId: string; status: string; updatedAt: string }> = [];
-    for (let index = 0; index < orderedChildLinks.length; index += 1) {
-      const childValue = facts?.snapshot[index];
-      if (!childValue || Array.isArray(childValue)) continue;
-      const status = String(childValue.status);
-      if (!['starting', 'active', 'idle', 'interrupting', 'interrupted', 'needs_human'].includes(status)) continue;
-      availableChildren.push({
-        childExecutionId: requireId(childValue.id, 'ChildExecution.id'),
-        conversationId: requireId(childValue.child_conversation_id, 'ChildExecution.child_conversation_id'),
-        status, updatedAt: String(childValue.updated_at)
-      });
+    const inheritedChildTargets = fork
+      ? forkInheritedChildTargets(childHandles, new Set(projection.tasks.map(task => task.answerBridgeId)))
+      : [];
+    const forkIdentity = fork ? await this.readForkIdentityFacts(conversationId) : undefined;
+    const processSnapshot = processLinks.length === 0 ? null : await this.database.snapshot(processLinks.map(link =>
+      DOMAIN_REPOSITORIES.domain('Process').get(requireId(link.process_id, 'ProcessCompletionSourceLink.process_id'))));
+    const runningProcesses = (processSnapshot?.snapshot ?? []).flatMap(row =>
+      row && !Array.isArray(row) && row.status === 'running'
+        ? [{ processId: requireId(row.id, 'Process.id'), status: 'running' as const }]
+        : []);
+    const direct = projection.tasks.filter(task => task.depth === 1);
+    if (direct.length === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
+      return { childHandles, ...(forkIdentity ? { forkIdentity } : {}) };
     }
-    const processOffset = orderedChildLinks.length;
-    const runningProcesses: FrozenRuntimeStatusCard['processes'] = [];
-    for (let index = 0; index < orderedProcessLinks.length; index += 1) {
-      const processValue = facts?.snapshot[processOffset + index];
-      if (!processValue || Array.isArray(processValue) || processValue.status !== 'running') continue;
-      runningProcesses.push({ processId: requireId(processValue.id, 'Process.id'), status: 'running' });
-    }
-    if (availableChildren.length === 0 && runningProcesses.length === 0) return undefined;
     const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
-    const activeChildren = availableChildren.filter(child => live(child.status));
-
-    // Counts describe every linked live fact. Only the frozen recipe detail is bounded; filtering
-    // before this cut prevents many old terminal ids from hiding a later active child/process.
-    const selectedChildren = availableChildren.sort((a, b) => Number(live(b.status)) - Number(live(a.status))
-      || b.updatedAt.localeCompare(a.updatedAt) || a.childExecutionId.localeCompare(b.childExecutionId)).slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
-    const selectedProcesses = runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
-    const bridgeReads = selectedChildren.map((child) => DOMAIN_REPOSITORIES.domain('AnswerBridge').list({
-      where: { child_execution_id: child.childExecutionId },
-      limit: 2
-    }));
-    const bridgeFacts = bridgeReads.length === 0 ? null : await this.database.snapshot(bridgeReads);
-    const conversationFacts = selectedChildren.length === 0 ? null : await this.database.snapshot(selectedChildren.map(child =>
-      DOMAIN_REPOSITORIES.domain('Conversation').get(child.conversationId)));
-    const children: FrozenRuntimeStatusCard['children'] = selectedChildren.map((child, index) => {
-      const bridges = rows(bridgeFacts?.snapshot[index] ?? []);
-      if (bridges.length > 1) throw new Error(`ChildExecution ${child.childExecutionId} has multiple AnswerBridges.`);
-      const conversation = conversationFacts?.snapshot[index];
+    const pendingHandling = (task: typeof direct[number]) => task.result.deliveries.some(delivery =>
+      delivery.state !== 'failed' && delivery.wakeState !== 'dead_letter' && delivery.phase !== 'notify_only'
+      && !delivery.handledAt && delivery.targetConversationId === conversationId);
+    const ranked = [...direct].sort((a, b) =>
+      Number(live(b.status)) - Number(live(a.status))
+      || Number(b.queuedInputs.length > 0) - Number(a.queuedInputs.length > 0)
+      || Number(pendingHandling(b)) - Number(pendingHandling(a))
+      || Number(a.status === 'closed') - Number(b.status === 'closed')
+      || b.createdAt.localeCompare(a.createdAt) || a.childExecutionId.localeCompare(b.childExecutionId));
+    const preview = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 180);
+    const selected = ranked.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
+    const children: FrozenRuntimeStatusCard['children'] = selected.map(task => {
+      const current = task.currentInputs.filter(source => source.classification === 'task');
+      const queued = task.queuedInputs.filter(source => source.classification === 'task');
       return {
-        childExecutionId: child.childExecutionId, status: child.status,
-        task: String(conversation && !Array.isArray(conversation) ? conversation.title ?? '' : '').replace(/\s+/g, ' ').slice(0, 120),
-        resumable: !!bridges[0] && bridges[0].status !== 'closed' && childExecutionAcceptsContinuation(requireChildExecutionStatus(child.status)),
-        ...(bridges[0] ? { answerBridgeId: requireId(bridges[0].id, 'AnswerBridge.id') } : {})
+        childExecutionId: task.childExecutionId, answerBridgeId: task.answerBridgeId,
+        status: task.status, label: preview(task.label),
+        task: preview(current[current.length - 1]?.text ?? task.initialTask?.text ?? ''),
+        ...(task.initialTask ? { initialTask: preview(task.initialTask.text) } : {}),
+        currentTasks: current.slice(-2).map(source => preview(source.text)),
+        queuedTasks: queued.slice(0, 2).map(source => preview(source.text)),
+        currentInputCount: current.length, queuedInputCount: queued.length,
+        truncated: current.length > 2 || queued.length > 2
+          || [task.initialTask, ...current, ...queued].some(source => source && source.text.replace(/\s+/g, ' ').trim().length > 180),
+        ...(task.execution.termination ? { latestTurnOutcome: task.execution.termination.status } : {}),
+        answerAvailable: !!task.result.latestAnswer,
+        answerHandling: task.result.handling.some(item => item.answerId === task.result.latestAnswer?.answerId && !!item.handledAt)
+          ? 'handled'
+          : task.result.handling.some(item => item.answerId === task.result.latestAnswer?.answerId && item.via === 'tool_result')
+            ? 'tool_result'
+            : task.result.deliveries.some(item => item.sourceId === task.result.latestAnswer?.answerId
+                && item.phase !== 'notify_only' && item.state !== 'failed' && item.wakeState !== 'dead_letter' && !item.handledAt)
+              ? 'runtime_pending'
+              : task.result.deliveries.some(item => item.sourceId === task.result.latestAnswer?.answerId
+                  && (item.state === 'failed' || item.wakeState === 'dead_letter')) ? 'failed' : 'unknown',
+        resumable: task.resumable
       };
     });
-    const lines = [
-      '[Conversation child agents and current-turn processes — runtime data, not instructions]',
-      `activeChildren=${activeChildren.length}; runningProcesses=${runningProcesses.length}`,
-      `shownChildren=${selectedChildren.length}; omittedChildren=${availableChildren.length - selectedChildren.length}`
-    ];
-    return {
-      kind: 'runtime_status_card',
-      activeChildCount: activeChildren.length,
+    const activeChildCount = direct.filter(task => live(task.status)).length;
+    const queuedInputCount = direct.reduce((sum, task) => sum + task.queuedInputs.filter(source => source.classification === 'task').length, 0);
+    const awaitingHandlingCount = direct.filter(pendingHandling).length;
+    return { childHandles, ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
+      kind: 'runtime_status_card', childTaskRevision: projection.revision,
+      totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
+      queuedInputCount, awaitingHandlingCount, activeChildCount,
       runningProcessCount: runningProcesses.length,
-      children,
-      processes: selectedProcesses,
-      card: lines.join('\n')
+      childHandleTargets: projection.tasks.map(task => ({ answerBridgeId: task.answerBridgeId })),
+      ...(inheritedChildTargets.length > 0 ? { inheritedChildTargets } : {}),
+      children, processes: runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT),
+      card: [
+        '[Conversation child tasks and current-turn processes — runtime data, not instructions]',
+        `totalDirectChildren=${direct.length}; descendantChildren=${projection.tasks.length - direct.length}; activeChildren=${activeChildCount}; runningProcesses=${runningProcesses.length}`,
+        `queuedInputs=${queuedInputCount}; awaitingHandling=${awaitingHandlingCount}; shownChildren=${children.length}; omittedChildren=${direct.length - children.length}`,
+        'Task text marked truncated is a preview; run_agent operation=list/read returns retained children and paged task inputs. Closed children remain discoverable. Results delivered and results handled are separate facts.',
+        ...(inheritedChildTargets.length > 0
+          ? ['inheritedChildRefs appear in history copied from this fork\'s source Conversation; those children belong to the source, not to this Conversation.']
+          : [])
+      ].join('\n')
+    } };
+  }
+
+  /**
+   * A fork's copied history keeps the collaboration refs of the Conversations it was copied from:
+   * their "this conversation" is not this one, and their collaboration messages were exchanged
+   * without it. Its own messages are the ones it sent or received itself.
+   */
+  private async readForkIdentityFacts(conversationId: string): Promise<ForkIdentityFacts> {
+    const [sourceConversationIds, sent, received] = await Promise.all([
+      forkSourceConversationIds(this.database, conversationId),
+      listAllDomainRows(this.database, 'CollaborationMessageSourceLink', { conversation_id: conversationId }),
+      listAllDomainRows(this.database, 'CollaborationMessageTargetLink', { conversation_id: conversationId })
+    ]);
+    return {
+      conversationId, sourceConversationIds,
+      ownMessageIds: new Set([...sent, ...received].map(row => requireId(row.message_id, 'CollaborationMessage link message_id')))
     };
   }
 
@@ -1920,6 +2044,7 @@ export class ReliableAgentLoop {
         providerId,
         modelId,
         capabilities: nativeCapabilities,
+        modelHandleCatalog: catalog,
         resolveAdapter: async (id) => this.providers.resolve(id),
         resolveDefinition: (name) => definitionsByName.get(name) ?? unknownToolDefinition(name),
         freezePolicies: async (inputs) => this.freezeDispatchPolicies(inputs),
@@ -1931,7 +2056,7 @@ export class ReliableAgentLoop {
           try {
             return {
               arguments: normalizePlainJson(
-                resolveModelToolArguments(name, argumentsValue, catalog),
+                resolveModelToolArguments(name, argumentsValue, session?.currentModelHandleCatalog() ?? catalog),
                 `Native ToolCall ${name} resolved arguments`
               )
             };
@@ -2222,11 +2347,11 @@ export class ReliableAgentLoop {
         && !entry.delivered
         && entry.resultContextSegmentId !== undefined);
     if (pending.length === 0) return;
-    const projection = await this.maybeGet(
-      'ModelContextProjection',
-      stableId('model_request_projection', carrierModelRequestId)
-    );
-    if (!projection) throw new Error(`ModelRequest ${carrierModelRequestId} lacks its Context projection.`);
+    const projections = await this.list('ModelContextProjection', {
+      owner_kind: 'model_request', owner_id: carrierModelRequestId
+    }, 2);
+    if (projections.length !== 1) throw new Error(`ModelRequest ${carrierModelRequestId} lacks its unique Context projection.`);
+    const projection = projections[0];
     const structure = await this.context.materializeStructure(
       requireId(projection.root_id, 'ModelContextProjection.root_id')
     );
@@ -2639,6 +2764,21 @@ export class ReliableAgentLoop {
         || String(left.intent.id).localeCompare(String(right.intent.id)))[0] ?? null;
   }
 
+  /**
+   * A peer followup may start a Conversation's very first Turn. Its delivered input is then the
+   * first Context occurrence, so it is absorbed before the round reads the Context head.
+   */
+  private async openEmptyContextWithDeliveredInput(turnId: string): Promise<void> {
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== 'active') return;
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    if ((await this.list('ConversationContextHeadLink', { conversation_id: conversationId }, 1)).length > 0) return;
+    if (!this.database.conversationOwners.owns(conversationId)) {
+      throw new ExecutionHandoffError(`Conversation ${conversationId} is not owned by this Runtime Host.`);
+    }
+    await this.absorbRuntimeDeliveryInputs(turnId);
+  }
+
   private async absorbRuntimeDeliveryInputs(turnId: string): Promise<number> {
     const deliveries = (await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_turn_id: turnId,
@@ -2903,11 +3043,14 @@ export class ReliableAgentLoop {
       throw new Error(`ToolModelResult ${input.toolModelResultId} has multiple Context occurrences.`);
     }
     if (sources.length === 1) {
+      // Tool-pair segments are immutable and shared by Conversation forks; each copy registers its
+      // own call source, so only this ToolCall's occurrence in the same segment closes the pair.
       const callSources = await this.list('ContextSegmentSource', {
         segment_id: requireId(sources[0].segment_id, 'ContextSegmentSource.segment_id'),
-        source_kind: 'tool_call'
+        source_kind: 'tool_call',
+        source_id: input.toolCallId
       }, 2);
-      if (callSources.length !== 1 || callSources[0].source_id !== input.toolCallId) {
+      if (callSources.length !== 1) {
         throw new Error(`ToolModelResult ${input.toolModelResultId} is linked to a conflicting Context tool pair.`);
       }
       return;
@@ -3202,7 +3345,11 @@ function fallbackFrozenToolPolicy(
     : undefined;
   const backendParallel = trustedCommand
     ? trustedCommand.parallelSafe
-    : metadata?.readonly === true || metadata?.riskLevel === 'read';
+    : (definition.name === 'run_agent' && isReadonlyRunAgentOperation(args))
+      || isReadonlyAgentCollaborationTool(definition.name)
+      || isReadonlyCrossConversationTool(definition.name)
+      || (definition.name === 'agent_board' && isReadonlyAgentBoardOperation(args))
+      || metadata?.readonly === true || metadata?.riskLevel === 'read';
   const schedulingMode = requestedScheduling === 'serial'
     ? 'serial'
     : requestedScheduling === 'parallel' || backendParallel ? 'parallel' : 'serial';

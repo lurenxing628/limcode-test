@@ -1,8 +1,10 @@
 ﻿import { createStorageRevision } from '../capabilities/vscodeStorage/storageRevision';
 import type { ChatModelOverrideRecord, ModelProfileScopeMutationReceipt, ModelProfileScopeSnapshotPayload, ModelProfileScopeReadPayload, SessionThinkingOverride, SystemPromptScopeSetPayload } from '../../shared/protocol';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
-import { loadScopedModelProfiles } from './scopedModelProfiles';
-import { validateSessionThinkingOverride } from '../../shared/sessionThinking';
+import { sourceConfigsProblem } from '../../shared/toolPolicyResolution';
+import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
+import { canonicalLlmProviderKind } from '../../shared/protocol';
+import { resolveSavedSessionThinkingOverride, validateSessionThinkingOverride } from '../../shared/sessionThinking';
 import { compatibleChildThinkingOverride } from './childThinkingInheritance';
 import { loadLlmProviderConfigsSettings } from '../capabilities/vscodeStorage/llmProviderConfigs';
 import { randomUUID } from 'node:crypto';
@@ -96,6 +98,8 @@ interface StoreSpec<TRecord extends { id: string }, TKey extends string> {
   key: TKey;
   idPrefix: string;
   label(record: TRecord): string;
+  /** 读取时规范化旧格式记录（例如原 DeepSeek 渠道类型）。 */
+  normalize?(record: TRecord): TRecord;
 }
 
 /**
@@ -187,7 +191,7 @@ export class VscodeConfigurationMutations {
       const operation = clear ? 'clear' : set.operation;
       if (!operation || (!clear && operation !== 'select' && operation !== 'thinking' && operation !== 'reset' && operation !== 'inherit')) throw new Error('ModelProfile UI mutation 缺少有效操作。');
       if (!clear && set.inheritThinkingToChildren !== undefined && scope.scopeKind !== 'conversation') {
-        throw new Error('子继承仅限当前对话。');
+        throw new Error('“子 Agent 也用这个思考强度”只能在对话里设置。');
       }
       const inheritThinkingToChildren = scope.scopeKind === 'conversation'
         ? set.inheritThinkingToChildren ?? before.profile?.inheritThinkingToChildren
@@ -213,7 +217,7 @@ export class VscodeConfigurationMutations {
             };
           }
         } else if (operation === 'inherit') {
-          if (scope.scopeKind !== 'conversation') throw new Error('子继承仅限当前对话。');
+          if (scope.scopeKind !== 'conversation') throw new Error('“子 Agent 也用这个思考强度”只能在对话里设置。');
           const current = await effective?.();
           if (!current || createStorageRevision(current) !== createStorageRevision(set.expectedEffectiveModel ?? null)) throw new Error('当前继承模型已改变；没有固定旧模型，请重新读取。');
           profile = {
@@ -242,8 +246,16 @@ export class VscodeConfigurationMutations {
         if (!provider || provider.provider !== profile.provider || !(provider.model === profile.model || provider.models.some(item => item.id === profile!.model))) throw new Error('思维覆盖模型已改变。');
         const modelConfig = provider.modelConfigs.find(item => item.modelId === profile!.model);
         const body = modelConfig ? modelConfig.requestBody : provider.requestBody;
-        if (hasThinkingBodyConflict(provider.provider, body)) throw new Error('自定义请求体与本次思维修改冲突；未改变已保存配置。');
-        profile.thinkingOverride = validateSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, modelConfig ? modelConfig.generationConfig : provider.generationConfig, body);
+        const generation = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
+        if (operation === 'thinking') {
+          // 用户这次选择的强度：严格校验。
+          if (hasThinkingBodyConflict(provider.provider, body)) throw new Error('自定义请求体与本次思维修改冲突；未改变已保存配置。');
+          profile.thinkingOverride = validateSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, generation, body, provider);
+        } else {
+          // 只改“子 Agent 也用”时带着的旧覆盖：容错解析，适用就规范化，不适用就原样保留（界面显示“当前不生效”，可重置）。
+          const saved = resolveSavedSessionThinkingOverride(profile.thinkingOverride, provider.provider, profile.model, generation, body, provider);
+          if (saved.status === 'applied') profile.thinkingOverride = saved.override;
+        }
       }
       guard();
       if (profile) {
@@ -434,7 +446,7 @@ export class VscodeConfigurationMutations {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
     const model = requireId(payload.model, 'model');
     if (payload.inheritThinkingToChildren !== undefined && scope.scopeKind !== 'conversation') {
-      throw new Error('子继承仅限当前对话。');
+      throw new Error('“子 Agent 也用这个思考强度”只能在对话里设置。');
     }
     return this.mutate(async (paths) => {
       let thinkingOverride: SessionThinkingOverride | undefined;
@@ -442,11 +454,11 @@ export class VscodeConfigurationMutations {
         if (scope.scopeKind !== 'conversation') throw new Error('思维覆盖仅限当前对话。');
         const providers = await loadLlmProviderConfigsSettings(paths);
         const provider = providers.settings.configs.find((item) => item.id === payload.providerConfigId);
-        if (!provider || provider.provider !== payload.provider || !(provider.model === model || provider.models.some((item) => item.id === model))) throw new Error('思维覆盖的渠道或模型不存在。');
+        if (!provider || provider.provider !== canonicalLlmProviderKind(payload.provider) || !(provider.model === model || provider.models.some((item) => item.id === model))) throw new Error('思维覆盖的渠道或模型不存在。');
         const modelConfig = provider.modelConfigs.find((item) => item.modelId === model);
         if (hasThinkingBodyConflict(provider.provider, modelConfig ? modelConfig.requestBody : provider.requestBody)) throw new Error('自定义请求体控制思维或输出参数；请先在渠道设置中解除冲突。');
         const generation = modelConfig ? modelConfig.generationConfig : provider.generationConfig;
-        thinkingOverride = validateSessionThinkingOverride(payload.thinkingOverride, provider.provider, model, generation, modelConfig ? modelConfig.requestBody : provider.requestBody);
+        thinkingOverride = validateSessionThinkingOverride(payload.thinkingOverride, provider.provider, model, generation, modelConfig ? modelConfig.requestBody : provider.requestBody, provider);
       }
       return this.setScoped(
       modelProfileStore(paths),
@@ -514,7 +526,7 @@ export class VscodeConfigurationMutations {
        if (input.thinkingOverride) {
          const providers = await loadLlmProviderConfigsSettings(paths);
          const provider = providers.settings.configs.find((item) => item.id === providerConfigId);
-         if (!provider || provider.provider !== input.provider || !(provider.model === model || provider.models.some((item) => item.id === model))) {
+         if (!provider || provider.provider !== canonicalLlmProviderKind(input.provider) || !(provider.model === model || provider.models.some((item) => item.id === model))) {
            throw new Error('子会话思维覆盖的渠道或模型不存在。');
          }
          const modelConfig = provider.modelConfigs.find((item) => item.modelId === model);
@@ -524,7 +536,8 @@ export class VscodeConfigurationMutations {
            provider.provider,
            model,
            modelConfig ? modelConfig.generationConfig : provider.generationConfig,
-           body
+           body,
+           provider
          );
        }
 
@@ -534,8 +547,9 @@ export class VscodeConfigurationMutations {
         ...(providerConfigId ? { providerConfigId } : {}),
         ...(input.provider ? { provider: input.provider } : {}),
         model,
-        ...(thinkingOverride ? { thinkingOverride } : {}),
-
+        // 只有父对话开着“派出的子 Agent 也用这个思考强度”时才会带来思考强度；继承标记一起写进子对话，
+        // 这个子 Agent 再派出的孙 Agent 也按同一强度。
+        ...(thinkingOverride ? { thinkingOverride, inheritThinkingToChildren: true } : {})
       };
       const link: ModelProfileScopeLinkRecord = {
         id: scopeLinkId('model-profile', scope),
@@ -560,7 +574,11 @@ export class VscodeConfigurationMutations {
 
   public setToolPolicy(payload: ToolPolicyScopeSetPayload): Promise<void> {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
-    const allowedTools = uniqueStrings(payload.allowedTools);
+    // Refuse source settings the policy would only read as a disabled source, naming the field.
+    const sourceProblem = sourceConfigsProblem(payload.sourceConfigs);
+    if (sourceProblem) return Promise.reject(new TypeError(`工具策略的 ${sourceProblem}`));
+    // The payload states the record's whole list: absent saves a record that narrows nothing.
+    const allowedTools = payload.allowedTools === undefined ? undefined : uniqueStrings(payload.allowedTools);
     return this.mutate((paths) => this.setScoped(
       toolPolicyStore(paths),
       toolPolicyLinkStore(paths),
@@ -569,7 +587,7 @@ export class VscodeConfigurationMutations {
       (existing, id) => ({
         id,
         name: normalizedOptionalText(payload.name) ?? existing?.name ?? defaultPolicyName('工具', scope.scopeKind),
-        allowedTools,
+        ...(allowedTools ? { allowedTools } : {}),
         ...(payload.preset !== undefined ? { preset: payload.preset } : existing?.preset !== undefined ? { preset: existing.preset } : {}),
         ...(payload.toolConfigs !== undefined ? { toolConfigs: plainClone(payload.toolConfigs) } : existing?.toolConfigs ? { toolConfigs: plainClone(existing.toolConfigs) } : {}),
         ...(payload.sourceConfigs !== undefined ? { sourceConfigs: plainClone(payload.sourceConfigs) } : existing?.sourceConfigs ? { sourceConfigs: plainClone(existing.sourceConfigs) } : {})
@@ -765,11 +783,10 @@ export class VscodeConfigurationMutations {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
     return this.mutate(async (paths) => {
       const configured = await loadStore(workEnvironmentStore(paths));
-      const available = new Set(configured.filter((record) => record.available).map((record) => record.id));
-      const allowed = uniqueStrings(payload.allowedWorkEnvironmentIds).filter((id) => available.has(id));
-      const defaultId = payload.defaultWorkEnvironmentId && allowed.includes(payload.defaultWorkEnvironmentId)
-        ? payload.defaultWorkEnvironmentId
-        : allowed[0];
+      const existingIds = new Set(configured.map((record) => record.id));
+      const allowed = uniqueStrings(payload.allowedWorkEnvironmentIds).filter((id) => existingIds.has(id));
+      const defaultId = normalizedOptionalText(payload.defaultWorkEnvironmentId);
+      if (defaultId && !allowed.includes(defaultId)) throw new Error('默认工作环境必须包含在允许列表中。');
       await this.setScoped(
         workEnvironmentPolicyStore(paths),
         workEnvironmentPolicyLinkStore(paths),
@@ -832,22 +849,8 @@ export class VscodeConfigurationMutations {
       if (!canRemoveWorkEnvironment(record)) throw new Error('系统管理的工作环境不能删除。');
       await saveStore(spec, records.filter((candidate) => candidate.id !== workEnvironmentId));
 
-      const selections = conversationWorkEnvironmentLinkStore(paths);
-      await saveStore(selections, (await loadStore(selections)).filter((link) => link.workEnvironmentId !== workEnvironmentId));
-
-      const policies = workEnvironmentPolicyStore(paths);
-      await saveStore(policies, (await loadStore(policies)).map((policy) => {
-        const allowedWorkEnvironmentIds = policy.allowedWorkEnvironmentIds.filter((id) => id !== workEnvironmentId);
-        const defaultWorkEnvironmentId = policy.defaultWorkEnvironmentId === workEnvironmentId
-          ? allowedWorkEnvironmentIds[0]
-          : policy.defaultWorkEnvironmentId;
-        const { defaultWorkEnvironmentId: _removedDefault, ...rest } = policy;
-        return {
-          ...rest,
-          allowedWorkEnvironmentIds,
-          ...(defaultWorkEnvironmentId ? { defaultWorkEnvironmentId } : {})
-        };
-      }));
+      // Keep explicit selections and policy identities. A deleted selected/default environment
+      // must remain a visible error until the user chooses another root, never become implicit A.
     });
   }
 
@@ -876,7 +879,44 @@ export class VscodeConfigurationMutations {
     });
   }
 
-  /** Copies only the explicit Conversation selections that define a fork's execution identity. */
+  /**
+   * Seeds a newly created Conversation's work environment. An existing selection is authoritative,
+   * so replaying the seed never overwrites a later user choice.
+   */
+  public initializeConversationWorkEnvironment(
+    conversationIdInput: string,
+    workEnvironmentIdInput: string
+  ): Promise<{ created: boolean }> {
+    return this.mutate(async (paths) => {
+      const conversationId = requireId(conversationIdInput, 'conversationId');
+      const workEnvironmentId = requireId(workEnvironmentIdInput, 'workEnvironmentId');
+      const spec = conversationWorkEnvironmentLinkStore(paths);
+      const records = await loadStore(spec);
+      if (records.some((record) => record.conversationId === conversationId && record.role === 'active')) {
+        return { created: false };
+      }
+      const environment = (await loadStore(workEnvironmentStore(paths))).find((record) => record.id === workEnvironmentId);
+      if (!environment?.available) throw new Error(`工作环境不可用：${workEnvironmentId}`);
+      const now = Date.now();
+      const record: ConversationWorkEnvironmentLinkRecord = {
+        id: `conversation-work-environment:${conversationId}`,
+        conversationId,
+        workEnvironmentId,
+        role: 'active' as const,
+        createdAt: now,
+        updatedAt: now
+      };
+      await saveStore(spec, upsert(records, record));
+      return { created: true };
+    });
+  }
+
+  /**
+   * Copies every Conversation-layer selection that defines a fork's execution identity: all scoped
+   * record/link pairs, the workflow selection and the work-environment link. Only empty target
+   * slots are filled, so repeating an interrupted copy never overwrites what the target already
+   * owns. Global, Agent and Workflow layers are neither read nor written.
+   */
   public copyConversationConfiguration(
     sourceConversationIdInput: string,
     targetConversationIdInput: string
@@ -887,34 +927,32 @@ export class VscodeConfigurationMutations {
       throw new TypeError('Conversation configuration fork requires different source and target ids.');
     }
     return this.mutate(async (paths) => {
-      const sourceScope: ScopeRef = { scopeKind: 'conversation', scopeId: sourceConversationId };
-      const targetScope: ScopeRef = { scopeKind: 'conversation', scopeId: targetConversationId };
-      const modelRecordStore = modelProfileStore(paths);
-      const modelLinkStore = modelProfileLinkStore(paths);
-      const [modelRecords, modelLinks] = await Promise.all([
-        loadStore(modelRecordStore),
-        loadStore(modelLinkStore)
-      ]);
-      const sourceModelLink = latest(modelLinks.filter((link) => scopeMatches(link, sourceScope)));
-      const targetModelLink = latest(modelLinks.filter((link) => scopeMatches(link, targetScope)));
-      if (sourceModelLink && !targetModelLink) {
-        const sourceModel = modelRecords.find((record) => record.id === sourceModelLink.modelProfileId);
-        if (!sourceModel) throw new Error(`配置 Link ${sourceModelLink.id} 指向不存在的记录。`);
-        const now = Date.now();
-        const modelProfileId = scopeRecordId(modelRecordStore.idPrefix, targetScope);
-        await saveStore(modelRecordStore, upsert(modelRecords, {
-          ...plainClone(sourceModel),
-          id: modelProfileId
-        }));
-        await saveStore(modelLinkStore, upsert(modelLinks, {
-          ...plainClone(sourceModelLink),
-          id: scopeLinkId('model-profile', targetScope),
-          ...targetScope,
-          modelProfileId,
-          createdAt: now,
-          updatedAt: now
-        }));
-      }
+      const source: ScopeRef = { scopeKind: 'conversation', scopeId: sourceConversationId };
+      const target: ScopeRef = { scopeKind: 'conversation', scopeId: targetConversationId };
+      await this.copyScoped(modelProfileStore(paths), modelProfileLinkStore(paths), source, target,
+        (link) => link.modelProfileId,
+        (link, modelProfileId, now) => ({ ...link, id: scopeLinkId('model-profile', target), ...target, modelProfileId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(planReviewPolicyStore(paths), planReviewPolicyLinkStore(paths), source, target,
+        (link) => link.planReviewPolicyId,
+        (link, planReviewPolicyId, now) => ({ ...link, id: planReviewScopeLinkId(target), ...target, planReviewPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(toolPolicyStore(paths), toolPolicyLinkStore(paths), source, target,
+        (link) => link.toolPolicyId,
+        (link, toolPolicyId, now) => ({ ...link, id: scopeLinkId('tool-policy', target), ...target, toolPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(skillPolicyStore(paths), skillPolicyLinkStore(paths), source, target,
+        (link) => link.skillPolicyId,
+        (link, skillPolicyId, now) => ({ ...link, id: scopeLinkId('skill-policy', target), ...target, skillPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(systemPromptStore(paths), systemPromptLinkStore(paths), source, target,
+        (link) => link.systemPromptId,
+        (link, systemPromptId, now) => ({ ...link, id: scopeLinkId('system-prompt', target), ...target, systemPromptId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(runtimeContextStore(paths), runtimeContextLinkStore(paths), source, target,
+        (link) => link.runtimeContextId,
+        (link, runtimeContextId, now) => ({ ...link, id: scopeLinkId('runtime-context', target), ...target, runtimeContextId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(workEnvironmentPolicyStore(paths), workEnvironmentPolicyLinkStore(paths), source, target,
+        (link) => link.workEnvironmentPolicyId,
+        (link, workEnvironmentPolicyId, now) => ({ ...link, id: scopeLinkId('work-environment-policy', target), ...target, workEnvironmentPolicyId, createdAt: now, updatedAt: now }));
+      await this.copyScoped(checkpointPolicyStore(paths), checkpointPolicyLinkStore(paths), source, target,
+        (link) => link.checkpointPolicyId,
+        (link, checkpointPolicyId, now) => ({ ...link, id: scopeLinkId('checkpoint-policy', target), ...target, checkpointPolicyId, createdAt: now, updatedAt: now }));
 
       const workflowStore = conversationWorkflowSelectionStore(paths);
       const workflowSelections = await loadStore(workflowStore);
@@ -960,6 +998,29 @@ export class VscodeConfigurationMutations {
     });
   }
 
+  /**
+   * Removes every Conversation-layer selection of a Conversation id that will never exist, such as
+   * a permanently rejected fork target: exactly what copyConversationConfiguration can write (the
+   * scoped record/link pairs, the workflow selection and the work-environment link). Global, Agent
+   * and Workflow layers are neither read nor written.
+   */
+  public clearConversationConfiguration(conversationIdInput: string): Promise<void> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    return this.mutate(async (paths) => {
+      await this.clearOwnerScopes(paths, 'conversation', conversationId);
+      const workflowStore = conversationWorkflowSelectionStore(paths);
+      const workflowSelections = await loadStore(workflowStore);
+      if (workflowSelections.some((record) => record.conversationId === conversationId)) {
+        await saveStore(workflowStore, workflowSelections.filter((record) => record.conversationId !== conversationId));
+      }
+      const environmentStore = conversationWorkEnvironmentLinkStore(paths);
+      const environmentLinks = await loadStore(environmentStore);
+      if (environmentLinks.some((record) => record.conversationId === conversationId)) {
+        await saveStore(environmentStore, environmentLinks.filter((record) => record.conversationId !== conversationId));
+      }
+    });
+  }
+
   private mutate<T>(action: (paths: StoragePaths) => Promise<T>): Promise<T> {
     const paths = this.getPaths();
     const lockUri = vscode.Uri.joinPath(paths.settingsRootUri, CONFIGURATION_MUTATION_LOCK);
@@ -981,6 +1042,30 @@ export class VscodeConfigurationMutations {
     await this.clearScoped(runtimeContextStore(paths), runtimeContextLinkStore(paths), scope, (link) => link.runtimeContextId);
     await this.clearScoped(workEnvironmentPolicyStore(paths), workEnvironmentPolicyLinkStore(paths), scope, (link) => link.workEnvironmentPolicyId);
     await this.clearScoped(checkpointPolicyStore(paths), checkpointPolicyLinkStore(paths), scope, (link) => link.checkpointPolicyId);
+  }
+
+  /** Copies one scope's active record/link pair into an empty target scope as the target's own record. */
+  private async copyScoped<
+    TRecord extends { id: string },
+    TLink extends ScopeLinkBase,
+    TRecordKey extends string,
+    TLinkKey extends string
+  >(
+    recordStore: StoreSpec<TRecord, TRecordKey>,
+    linkStore: StoreSpec<TLink, TLinkKey>,
+    source: ScopeRef,
+    target: ScopeRef,
+    linkedRecordId: (link: TLink) => string,
+    buildLink: (source: TLink, recordId: string, now: number) => TLink
+  ): Promise<void> {
+    const [records, links] = await Promise.all([loadStore(recordStore), loadStore(linkStore)]);
+    const sourceLink = latest(links.filter((link) => scopeMatches(link, source)));
+    if (!sourceLink || links.some((link) => scopeMatches(link, target))) return;
+    const sourceRecord = records.find((record) => record.id === linkedRecordId(sourceLink));
+    if (!sourceRecord) throw new Error(`配置 Link ${sourceLink.id} 指向不存在的记录。`);
+    const recordId = scopeRecordId(recordStore.idPrefix, target);
+    await saveStore(recordStore, upsert(records, { ...plainClone(sourceRecord), id: recordId }));
+    await saveStore(linkStore, upsert(links, buildLink(plainClone(sourceLink), recordId, Date.now())));
   }
 
   private async setScoped<
@@ -1046,7 +1131,10 @@ function workflowStore(paths: StoragePaths): StoreSpec<WorkflowRecord, 'workflow
 }
 
 function modelProfileStore(paths: StoragePaths): StoreSpec<ModelProfileRecord, 'modelProfile'> {
-  return { root: paths.modelProfilesRootUri, index: paths.modelProfilesIndexUri, key: 'modelProfile', idPrefix: 'model-profile', label: (record) => record.name };
+  return {
+    root: paths.modelProfilesRootUri, index: paths.modelProfilesIndexUri, key: 'modelProfile', idPrefix: 'model-profile',
+    label: (record) => record.name, normalize: canonicalModelProfile
+  };
 }
 
 function modelProfileLinkStore(paths: StoragePaths): StoreSpec<ModelProfileScopeLinkRecord, 'link'> {
@@ -1136,7 +1224,8 @@ function conversationWorkEnvironmentLinkStore(paths: StoragePaths): StoreSpec<Co
 async function loadStore<TRecord extends { id: string }, TKey extends string>(
   spec: StoreSpec<TRecord, TKey>
 ): Promise<TRecord[]> {
-  return (await loadRecordStore<TRecord, TKey>(spec.root, spec.index, spec.key)) ?? [];
+  const records = (await loadRecordStore<TRecord, TKey>(spec.root, spec.index, spec.key)) ?? [];
+  return spec.normalize ? records.map((record) => spec.normalize!(record)) : records;
 }
 
 async function saveStore<TRecord extends { id: string }, TKey extends string>(

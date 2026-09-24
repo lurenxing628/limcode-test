@@ -15,6 +15,18 @@ export const DELEGATED_PLAN_APPROVAL_MESSAGE = 'Plan 已下发给 Agent 执行�
 export const CHILD_PLAN_AUTO_APPROVAL_MESSAGE = '子 Agent 的 Plan 已按父任务授权自动批准，请继续执行。';
 export const PLAN_AUTO_APPROVAL_MESSAGE = 'Plan 已按自动审批设置批准，请在当前会话继续执行。';
 
+/**
+ * What choosing “新开对话执行” on a Plan card does. The user's approval lets the executor run with
+ * its own settings instead of the planning conversation's (ChildSpawnAuthorityBound 'executor_agent').
+ */
+export function delegatedPlanDispatchDescription(agentName?: string): string {
+  const name = agentName?.trim();
+  const executor = name ? `「${name}」` : '所选 Agent ';
+  return `将新建一个子 Agent 对话，在后台执行已批准的 Plan。将按${executor}自己的工具权限执行：`
+    + '工具、技能和可用的工作目录都按它自己的设置，不受当前对话规划时的限制；它自己的设置允许时，从规划时的工作目录开始。'
+    + '全局设置里关掉的工具仍然用不了。';
+}
+
 export function normalizeSubmitPlanToolRequest(value: unknown): SubmitPlanToolRequestRecord {
   const record = asRecord(parseJsonValue(value));
   if (!record) throw new Error('submit_plan arguments must be an object');

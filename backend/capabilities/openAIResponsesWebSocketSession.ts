@@ -9,6 +9,7 @@ import type {
   StreamDecodeState
 } from 'unified-llm-provider';
 import type { AssistantMessagePhase, ModelOutputItemReference } from '../../shared/protocol';
+import { supportsOpenAIExplicitPromptCache } from '../../shared/openAIResponsesCapabilities';
 import type {
   OpenAIResponsesNativeEvent,
   OpenAIResponsesRequiredInput,
@@ -185,6 +186,8 @@ interface PreparedCreatePayload {
   durableInputItems: unknown[];
   baseSignature: string;
   volatileTailLayout?: string;
+  /** Explicit-only caching with content breakpoints (see usesExplicitPromptCacheBreakpoints). */
+  explicitBreakpoints: boolean;
   decision: OpenAIResponsesWebSocketDecision;
   /** Native mode: reasoning anchored on the wire for the committed baseline. */
   nativeAnchoredReasoning?: unknown;
@@ -277,7 +280,7 @@ async function* streamLocked(
     throw new Error('OpenAI Responses WebSocket connection is unavailable.');
   }
 
-  const fullBody = sanitizeResponsesCreateBody(options.body);
+  const fullBody = sanitizeResponsesCreateBody(options.body, preservesExplicitPromptCache(options.body));
   const prepared = prepareCreatePayload(
     session,
     { key: session.key, connectionGeneration: session.connectionGeneration },
@@ -674,7 +677,14 @@ function prepareCreatePayload(
 ): PreparedCreatePayload {
   const connectionReused = connection.reused;
   const fullInputItems = Array.isArray(fullBody.input) ? fullBody.input.map(cloneJson) : [];
-  const boundary = localContinuationBoundary(fullInputItems, format, continuationHint, native !== undefined);
+  const explicitBreakpoints = usesExplicitPromptCacheBreakpoints(fullBody);
+  const boundary = localContinuationBoundary(
+    fullInputItems,
+    format,
+    continuationHint,
+    native !== undefined || preservesExplicitPromptCache(fullBody),
+    explicitBreakpoints
+  );
   // Native dynamic reasoning keeps request-level reasoning out of the baseline signature so a pure
   // effort change can ride a configuration_update instead of rewriting the cached prefix.
   const signatureBase = requestBase(fullBody);
@@ -695,7 +705,7 @@ function prepareCreatePayload(
   } else if (continuation.successfulIncrementalRequests >= MAX_SUCCESSFUL_INCREMENTAL_REQUESTS) {
     reason = 'periodic_rebase';
   } else {
-    const mismatch = prefixMismatchReason(boundary.durableInputItems, baseline);
+    const mismatch = prefixMismatchReason(boundary.durableInputItems, baseline, explicitBreakpoints);
     if (mismatch) reason = mismatch;
     else if (
       boundary.durableInputItems.length === baseline.length
@@ -730,6 +740,10 @@ function prepareCreatePayload(
     }
   }
 
+  // The incremental frame is exactly the full input's suffix after the baseline. With explicit
+  // breakpoints the encoder marks the newest carrier of the full input, so that marker lands on the
+  // newest carrier of this frame whenever the frame has one; earlier markers already live in the
+  // server-side chain (see usesExplicitPromptCacheBreakpoints).
   const sentInput = canIncrement && baseline
     ? [
         ...boundary.durableInputItems.slice(baseline.length),
@@ -771,6 +785,7 @@ function prepareCreatePayload(
     durableInputItems: boundary.durableInputItems,
     baseSignature,
     ...(boundary.volatileTailLayout ? { volatileTailLayout: boundary.volatileTailLayout } : {}),
+    explicitBreakpoints,
     ...(native
       ? {
           ...(nativeAnchoredReasoning !== undefined
@@ -814,7 +829,8 @@ function localContinuationBoundary(
   fullInputItems: unknown[],
   format: OpenAIResponsesFormatAdapter,
   continuation: OpenAIResponsesWebSocketStreamOptions['continuation'],
-  native = false
+  native = false,
+  explicitBreakpoints = false
 ): LocalContinuationBoundary {
   if (!continuation) {
     return {
@@ -877,7 +893,8 @@ function localContinuationBoundary(
     };
   }
   for (let index = 0; index < volatileInputItems.length; index += 1) {
-    if (canonicalString(fullInputItems[offset + index]) === canonicalString(volatileInputItems[index])) continue;
+    if (continuationItemKey(fullInputItems[offset + index], explicitBreakpoints)
+      === continuationItemKey(volatileInputItems[index], explicitBreakpoints)) continue;
     return {
       durableInputItems: fullInputItems,
       volatileInputItems: [],
@@ -887,9 +904,81 @@ function localContinuationBoundary(
   }
   return {
     durableInputItems: fullInputItems.slice(0, offset),
-    volatileInputItems,
+    // The separately encoded tail carries no cache markers; with explicit breakpoints the full
+    // body's own tail items are sent so the encoder-placed breakpoint survives.
+    volatileInputItems: explicitBreakpoints ? fullInputItems.slice(offset) : volatileInputItems,
     volatileTailLayout
   };
+}
+
+/**
+ * Explicit prompt caching (`prompt_cache_options` and content `prompt_cache_breakpoint`) is documented
+ * for GPT-5.6 and later (https://developers.openai.com/api/docs/guides/prompt-caching#summary-of-model-differences),
+ * and the WebSocket mode guide places no model restriction on request fields. Those exact official ids keep
+ * the fields on every WebSocket path; any other model keeps the historical strip behavior unchanged.
+ */
+function preservesExplicitPromptCache(body: unknown): boolean {
+  return isRecord(body) && typeof body.model === 'string' && supportsOpenAIExplicitPromptCache(body.model);
+}
+
+/**
+ * Explicit-only caching with at least one `prompt_cache_breakpoint` on a supported model. A breakpoint
+ * only "marks the exact end of a reusable prompt prefix" (Responses create reference) and the encoder
+ * moves the message breakpoint to the newest carrier on every request, so continuation comparisons
+ * ignore exactly that marker. Over `previous_response_id` the server keeps each earlier frame's
+ * markers ("OpenAI considers up to the latest 80 breakpoints in the conversation"), so an incremental
+ * frame only needs its own newest marker. The encoder is configured with `breakpoints.toolOutputs` in
+ * this same configuration (WebSocket + explicit mode), so function results are content-block arrays.
+ */
+function usesExplicitPromptCacheBreakpoints(body: Record<string, unknown>): boolean {
+  return preservesExplicitPromptCache(body)
+    && isRecord(body.prompt_cache_options)
+    && body.prompt_cache_options.mode === 'explicit'
+    && Array.isArray(body.input)
+    && body.input.some((item) => breakpointCarrierBlocks(item)?.some(
+      (block) => isRecord(block) && isRecord(block.prompt_cache_breakpoint)
+    ) === true);
+}
+
+/** Content blocks that can carry `prompt_cache_breakpoint`: message content and function_call_output arrays. */
+function breakpointCarrierBlocks(item: unknown): unknown[] | undefined {
+  if (!isRecord(item)) return undefined;
+  const blocks = item.type === 'function_call_output'
+    ? item.output
+    : item.type === undefined || item.type === 'message'
+      ? item.content
+      : undefined;
+  return Array.isArray(blocks) ? blocks : undefined;
+}
+
+function withoutContentBreakpoints(item: unknown): unknown {
+  const blocks = breakpointCarrierBlocks(item);
+  if (!blocks || !blocks.some((block) => isRecord(block) && 'prompt_cache_breakpoint' in block)) return item;
+  const stripped = blocks.map((block) => {
+    if (!isRecord(block) || !('prompt_cache_breakpoint' in block)) return block;
+    const { prompt_cache_breakpoint: _marker, ...rest } = block;
+    return rest;
+  });
+  const record = item as Record<string, unknown>;
+  return record.type === 'function_call_output' ? { ...record, output: stripped } : { ...record, content: stripped };
+}
+
+/** Continuation identity of one input item; only content-block cache markers may be ignored. */
+function continuationItemKey(item: unknown, ignoreBreakpoints: boolean): string {
+  return canonicalString(ignoreBreakpoints ? withoutContentBreakpoints(item) : item);
+}
+
+/** Marks the newest carrier block of an explicit-cache continuation frame (input items are cloned). */
+function markNewestBreakpointCarrier(items: unknown[]): unknown[] {
+  const marked = items.map(cloneJson);
+  for (let index = marked.length - 1; index >= 0; index -= 1) {
+    const blocks = breakpointCarrierBlocks(marked[index]);
+    const last = blocks?.[blocks.length - 1];
+    if (!isRecord(last) || (last.type !== 'input_text' && last.type !== 'input_image' && last.type !== 'input_file')) continue;
+    last.prompt_cache_breakpoint = { mode: 'explicit' };
+    break;
+  }
+  return marked;
 }
 
 function sanitizeResponsesCreateBody(value: unknown, native = false): Record<string, unknown> {
@@ -899,8 +988,8 @@ function sanitizeResponsesCreateBody(value: unknown, native = false): Record<str
   delete next.stream;
   delete next.background;
   delete next.previous_response_id;
-  // Explicit prompt caching is retained on supported native Astra channels only; the legacy
-  // compatibility endpoint keeps the historical strip behavior unchanged.
+  // Explicit prompt caching is retained on native GPT-6 channels and for models that support it
+  // (see preservesExplicitPromptCache); other models keep the historical strip behavior unchanged.
   if (!native) delete next.prompt_cache_options;
   next.store = false;
   next.input = Array.isArray(next.input) ? next.input.map((item) => stripWebSocketOnlyInputFields(item, native)) : [];
@@ -928,10 +1017,10 @@ function requestBase(body: Record<string, unknown>): Record<string, unknown> {
   return result;
 }
 
-function prefixMismatchReason(items: unknown[], prefix: unknown[]): string | undefined {
+function prefixMismatchReason(items: unknown[], prefix: unknown[], ignoreBreakpoints = false): string | undefined {
   if (prefix.length > items.length) return `cached_prefix_longer:${prefix.length}>${items.length}`;
   for (let index = 0; index < prefix.length; index += 1) {
-    if (canonicalString(items[index]) !== canonicalString(prefix[index])) {
+    if (continuationItemKey(items[index], ignoreBreakpoints) !== continuationItemKey(prefix[index], ignoreBreakpoints)) {
       return `input_prefix_mismatch_at:${index}`;
     }
   }
@@ -2152,7 +2241,11 @@ function startNativeResponse(
   }
 
   let admittedSeq = state.seenAnyResponse ? undefined : state.initialResponseCreateSeq;
-  let admittedToolResultCallIds: string[] | undefined;
+  // Only the prepared input was sent: incremental creates may omit results that remain in
+  // fullBody/history, while rebased initial creates can carry prior native tool results.
+  let admittedToolResultCallIds: string[] | undefined = state.seenAnyResponse
+    ? undefined
+    : nativeWireToolResultCallIds(state.prepared.payload.input);
   const inFlight = state.createInFlight;
   if (inFlight) {
     state.createInFlight = undefined;
@@ -2619,7 +2712,7 @@ function enqueueNativeToolSubmission(
   }
   let built: { wireItems: unknown[]; callIds: string[]; coverageKeys: string[] };
   try {
-    built = buildNativeToolOutputItems(outputs);
+    built = buildNativeToolOutputItems(outputs, state.prepared.explicitBreakpoints);
   } catch {
     return Promise.reject(nativeDeliveryError('not_sent', 'invalid_input'));
   }
@@ -2664,10 +2757,13 @@ function pumpCreateQueue(state: NativeChainState): void {
   }
   const batch = state.createQueue.splice(0);
   const previousResponseId = state.latestTerminalResponseId;
+  const input = batch.flatMap((sub) => sub.wireItems);
   const frame: Record<string, unknown> = {
     ...state.frozenWireSettings,
     type: 'response.create',
-    input: batch.flatMap((sub) => sub.wireItems),
+    // Explicit breakpoints: this continuation frame marks its own newest carrier (the chain keeps
+    // earlier markers server-side); the chain tail records the unmarked items.
+    input: state.prepared.explicitBreakpoints ? markNewestBreakpointCarrier(input) : input,
     previous_response_id: previousResponseId,
     store: false
   };
@@ -2874,7 +2970,8 @@ function commitNativeContinuation(state: NativeChainState): void {
 }
 
 function buildNativeToolOutputItems(
-  outputs: readonly OpenAIResponsesToolOutput[]
+  outputs: readonly OpenAIResponsesToolOutput[],
+  explicitBreakpoints = false
 ): { wireItems: unknown[]; callIds: string[]; coverageKeys: string[] } {
   const wireItems: unknown[] = [];
   const callIds: string[] = [];
@@ -2896,11 +2993,28 @@ function buildNativeToolOutputItems(
     const payload = typeof output.output === 'string'
       ? output.output
       : JSON.stringify(output.output ?? null);
-    wireItems.push({ type: output.type, call_id: callId, output: payload });
+    // Explicit breakpoints: function results use the same input_text array form as the encoder's
+    // `breakpoints.toolOutputs`, so the next full-history request matches this chain tail.
+    wireItems.push({
+      type: output.type,
+      call_id: callId,
+      output: explicitBreakpoints && output.type === 'function_call_output' && payload
+        ? [{ type: 'input_text', text: payload }]
+        : payload
+    });
     callIds.push(callId);
     coverageKeys.push(callId);
   }
   return { wireItems, callIds, coverageKeys };
+}
+
+function nativeWireToolResultCallIds(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return [...new Set(input.flatMap((item: unknown) =>
+    isRecord(item) && (item.type === 'function_call_output' || item.type === 'custom_tool_call_output')
+      && typeof item.call_id === 'string' && item.call_id.trim()
+      ? [item.call_id]
+      : []))];
 }
 
 function encodeNativeSteerInput(

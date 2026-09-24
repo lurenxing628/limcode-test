@@ -168,6 +168,10 @@ function mergeAdjacentDeltaEvents(previous: WorldEvent, next: WorldEvent): World
   if (!sameStreamIdentity(previousPayload, nextPayload)) return undefined;
 
   if (previous.type === LlmEventType.Delta) {
+    // 带签名的文字就是收到签名的那个 part，既不并入前面的文字，也不吸收后面的文字。
+    if ((previousPayload as LlmDeltaPayload).thoughtSignature || (nextPayload as LlmDeltaPayload).thoughtSignature) {
+      return undefined;
+    }
     return {
       ...next,
       payload: {

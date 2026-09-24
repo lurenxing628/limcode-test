@@ -14,6 +14,7 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'snapshot'
   | 'snapshotAll'
   | 'toolFactsSnapshot'
+  | 'conversationChildTaskSnapshot'
   | 'processOutputRegistrationMismatches'
   | 'effectReceiptReconciliationCandidates'
   | 'childConversationOriginCandidates'

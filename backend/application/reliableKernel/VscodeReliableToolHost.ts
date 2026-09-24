@@ -1,13 +1,5 @@
 import * as path from 'node:path';
 import type * as vscode from 'vscode';
-import type {
-  CommandCapability,
-  CommandOutputLimits,
-  CommandRunArgs,
-  CommandRunObserver,
-  CommandRunResult,
-  WorkEnvironmentCapabilityOptions
-} from '../../capabilities/types';
 import { createSkillCatalogCapability } from '../../capabilities/skillCatalog';
 import { createRulesCatalogCapability } from '../../capabilities/rulesCatalog';
 import { createVsCodeFsCapability } from '../../capabilities/vscodeFs';
@@ -15,6 +7,7 @@ import { createWorkEnvironmentRuntimeCapability } from '../../capabilities/workE
 import { McpRuntimeManager, dedupeMcpToolNames } from '../mcpRuntimeManager';
 import { proxyForShellAndMcp } from './proxyEnvironment';
 import { createBuiltinToolDefinitions } from '../../world/modules/tools/definitions';
+import { commandDeclarationCapability } from '../../reliableKernel/builtinToolCatalog';
 import {
   toolDefinitionRecord,
   type ToolDefinition,
@@ -42,6 +35,8 @@ import type {
 import { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
 import type { PlainJsonValue } from '../../reliableKernel/plainJson';
 import { resolveFrozenWorkEnvironmentBoundary } from '../../reliableKernel/workEnvironmentBoundary';
+import { frozenSkillPolicy } from '../../reliableKernel/frozenAuthority';
+import { lazySkillCatalogWithinPolicy } from '../../world/modules/skill/policy';
 import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 
 export interface VscodeReliableToolHostOptions {
@@ -68,10 +63,6 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   private readonly commandDeclaration = commandDeclarationCapability();
   private readonly builtins: ToolDefinition[];
   private readonly filePlanner: LocalFileToolPlanner;
-  private readonly environmentBoundaryCache = new Map<string, {
-    expiresAt: number;
-    promise: Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
-  }>();
   private initialization: Promise<void> | undefined;
   private mcpInitialization: Promise<void> | undefined;
   private onStateChange: (() => void) | undefined;
@@ -114,7 +105,6 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   }
 
   public async dispose(): Promise<void> {
-    this.environmentBoundaryCache.clear();
     await this.mcp.dispose();
   }
 
@@ -185,7 +175,9 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       fs: this.fs,
       command: this.commandDeclaration,
       workEnvironment: this.workEnvironment,
-      skills: this.skills,
+      // A skill the Turn's frozen policy turns off (for a child, also off in its parent) cannot be loaded.
+      // The settings are parsed only when a skill is looked up, so `read` of an ordinary file never depends on them.
+      skills: lazySkillCatalogWithinPolicy(this.skills, () => frozenSkillPolicy(authority.document)),
       ...(this.options.resolveAttachmentReference ? {
         attachments: {
           reference: this.options.resolveAttachmentReference,
@@ -312,7 +304,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       .map((agent) => ({ id: agent.id, label: agent.description?.trim() || agent.name.trim() }));
   }
 
-  /** 供 toolDispatcher 构建模型可见的工作环境列表；与执行时路径边界共用同一份解析与缓存。 */
+  /** 供 toolDispatcher 构建模型可见的工作环境列表；与执行时路径边界共用本 Host 的实时目录投影。 */
   public async workEnvironmentsForAuthority(authority: ReliableToolDispatchAuthority): Promise<{
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
@@ -324,28 +316,10 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
   }> {
-    const cacheKey = authority.snapshotId;
-    const cached = this.environmentBoundaryCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return cloneEnvironmentBoundary(await cached.promise);
-    const promise = (async () => {
-      const policy = authorityWorkEnvironmentPolicy(authority.document);
-      const records = await this.configuration.workEnvironments();
-      const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
-      return { ...(boundary.active ? { active: boundary.active } : {}), allowed: boundary.allowed };
-    })();
-    this.environmentBoundaryCache.set(cacheKey, { expiresAt: Date.now() + 1_000, promise });
-    if (this.environmentBoundaryCache.size > 64) {
-      const oldest = this.environmentBoundaryCache.keys().next().value as string | undefined;
-      if (oldest && oldest !== cacheKey) this.environmentBoundaryCache.delete(oldest);
-    }
-    try {
-      return cloneEnvironmentBoundary(await promise);
-    } catch (error) {
-      if (this.environmentBoundaryCache.get(cacheKey)?.promise === promise) {
-        this.environmentBoundaryCache.delete(cacheKey);
-      }
-      throw error;
-    }
+    const policy = authorityWorkEnvironmentPolicy(authority.document);
+    const records = await this.configuration.workEnvironments();
+    const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
+    return cloneEnvironmentBoundary(boundary);
   }
 
   private async loadAttachmentMaxBytes(): Promise<number> {
@@ -398,26 +372,6 @@ function authorityMultimodalEnabled(document: PlainJsonValue): boolean {
   const authority = requireRecord(document, 'AuthoritySnapshot');
   const model = requireRecord(authority.model, 'AuthoritySnapshot.model');
   return model.enableMultimodalTools !== false;
-}
-
-function commandDeclarationCapability(): CommandCapability {
-  const toolName: 'shell' | 'bash' = process.platform === 'win32' ? 'shell' : 'bash';
-  const unavailable = (): never => {
-    throw new Error(`${toolName} execution must use reliable ProcessControlPlane.`);
-  };
-  return {
-    toolName,
-    executable: undefined,
-    description: `${toolName === 'shell' ? 'Run a non-interactive PowerShell command' : 'Run a non-interactive Bash/Shell command'} in the project workspace. Returns stdout, stderr, and exitCode. Foreground wait moves a still-running process to the reliable detached wrapper; running results carry exitCode=null.`,
-    run(_args: CommandRunArgs, _observer?: CommandRunObserver, _options?: WorkEnvironmentCapabilityOptions, _limits?: CommandOutputLimits): Promise<CommandRunResult> {
-      return Promise.reject(unavailable());
-    },
-    backgroundForeground: unavailable,
-    readOutput: unavailable,
-    kill: unavailable,
-    quiesce() {},
-    dispose() {}
-  } as CommandCapability;
 }
 
 function assertInsideRoot(root: string, target: string, label: string): void {

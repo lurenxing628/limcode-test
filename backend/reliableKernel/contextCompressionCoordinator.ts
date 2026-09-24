@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
+import { safeProviderFailureMessage, type CompressionAttemptFailure, type CompressionRecoveryDecision } from '../../shared/compressionExecution';
+export type { CompressionAttemptFailure } from '../../shared/compressionExecution';
 import type { MessageContent } from '../../shared/protocol';
+import type { CompressionExecutionAttempt } from '../../shared/modelCapabilities';
 import {
   rebaseAttachmentCatalogState,
   selectAttachmentCatalogStateSegments,
@@ -14,6 +17,7 @@ import {
 } from './attachmentObservations';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { mergeConversationChildHandles, readConversationChildHandles } from './conversationChildHandles';
 import {
   ContextCompressionControlPlane,
   compressionBlockIdFor,
@@ -27,6 +31,7 @@ import {
   type StructuralContextRecord
 } from './contextSequence';
 import { EffectControlPlane } from './effectControlPlane';
+import { isExecutionHandoffError } from './executionLeaseFence';
 import { frozenCompressionPolicy, frozenContextProfile } from './frozenAuthority';
 import { readRequestTurnAuthority } from './requestCompressionSettings';
 import {
@@ -39,7 +44,9 @@ import {
 import { readNativeSteeringInFlight } from './nativeSteering';
 import {
   compressionOutputTokens,
-  estimateMessageContentsTokens,
+  estimateCompressionResultTokens,
+  hasUnsizedOpaqueCompaction,
+  estimateMaterializedContextTokens,
   providerPromptTokens
 } from './contextTokenEstimator';
 import {
@@ -48,6 +55,7 @@ import {
   calculateFullRequestPlanningBudget,
   calibrateEstimatorToProvider,
   calibratedTailBudgetTokens,
+  summaryTargetEstimatorTokens,
   collectStoredNativeConfigurationUpdates,
   projectStoredModelFacingWindow,
   providerTokenCalibration,
@@ -57,19 +65,30 @@ import {
   type ContextPlanningFailureCode,
   type FullRequestPlanningBudget
 } from './modelFacingContextProjection';
-import type { ModelHandleCatalog } from './modelHandleCatalog';
+import { buildModelHandleCatalog, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
+  restoredProviderRequestFailure,
   modelRequestIdFor,
   type FullRequestProviderAdapter
 } from './modelProviderControlPlane';
 import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export type CompressionTrigger = 'auto' | 'manual';
 export type CompressionTriggerReason = 'manual' | 'configured_threshold';
+
+export interface CompressionToolDefinition {
+  name: string;
+  description: string;
+  parameters: PlainJsonValue;
+  source?: PlainJsonValue;
+  metadata?: PlainJsonValue;
+  defaultConfig?: PlainJsonValue;
+}
 
 export interface CoordinateCompressionCommand {
   turnId: string;
@@ -81,6 +100,12 @@ export interface CoordinateCompressionCommand {
   requestBudget?: FullRequestPlanningBudget;
   /** Exact active-Turn input that may need request-level reinjection after this compression. */
   protectedCurrentInputTokens?: number;
+  /** Frozen ordinary tool definitions; Provider-native compaction must use the same tool contract. */
+  tools?: readonly CompressionToolDefinition[];
+  /** The ordinary preview's exact references, including children allocated before request commit. */
+  modelHandleCatalog?: ModelHandleCatalog;
+  /** Explicit manual reconstruction of every compressed source, including old text summaries. */
+  sourceReplay?: 'immutable_provenance';
   /** Manual callers may freeze an explicit prefix. Automatic text selection uses a continuous token tail. */
   compressSegmentCount?: number;
   title?: string;
@@ -113,13 +138,25 @@ export type CoordinateCompressionResult =
       limitTokens: number;
     }
   | {
+      status: 'continued_uncompressed';
+      reason: 'fallbacks_exhausted_but_request_fits';
+      recoveryDecision: CompressionRecoveryDecision;
+      attemptedMethods: CompressionExecutionAttempt['methodKind'][];
+      failures: CompressionAttemptFailure[];
+      estimatedTokens: number;
+      limitTokens: number;
+    }
+  | {
       status: 'compressed';
       trigger: CompressionTrigger;
       triggerReason: CompressionTriggerReason;
       modelRequestId: string;
       sourceRootId: string;
       sourceSegmentCount: number;
-      diagnostics?: Array<'native_over_target'>;
+      diagnostics?: Array<'native_over_target' | 'fallback_used'>;
+      attemptedMethods?: CompressionExecutionAttempt['methodKind'][];
+      failures?: CompressionAttemptFailure[];
+      recoveryDecision?: CompressionRecoveryDecision;
       /**
        * Explicit full-context rebase for the native path: fresh chain (forceFullReason), observable
        * cache reset, and the effective reasoning re-applied as one fresh configuration_update.
@@ -157,6 +194,134 @@ export class ReliableContextCompressionCoordinator {
   }
 
   public async coordinate(command: CoordinateCompressionCommand): Promise<CoordinateCompressionResult> {
+    if (command.sourceReplay !== undefined
+      && (command.sourceReplay !== 'immutable_provenance' || command.trigger !== 'manual')) {
+      throw new TypeError('Immutable compression source reconstruction is an explicit manual operation.');
+    }
+    const turnId = requireId(command.turnId, 'turnId');
+    const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
+    const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId
+      ?? await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId);
+    const frozen = await readRequestTurnAuthority(
+      this.database,
+      this.contentStore,
+      authoritySnapshotId,
+      turnId,
+      settingsSnapshotContentObjectId
+    );
+    const policy = frozenCompressionPolicy(frozen.document);
+    if (!policy || policy.methodKind === 'disabled') return { status: 'skipped', reason: 'disabled' };
+    if (command.trigger === 'auto' && policy.triggerMode !== 'token_threshold') {
+      return { status: 'skipped', reason: 'manual_only' };
+    }
+    if (command.trigger === 'auto' && !command.requestBudget) {
+      throw new TypeError('Automatic compression requires the exact frozen ordinary request budget.');
+    }
+
+    const attemptedMethods: CompressionExecutionAttempt['methodKind'][] = [];
+    const failures: CompressionAttemptFailure[] = [];
+    let lastPlanningError: Extract<CoordinateCompressionResult, { status: 'error' }> | undefined;
+    const groupId = `compression_group_${createHash('sha256')
+      .update(JSON.stringify([turnId, command.headRootId, settingsSnapshotContentObjectId, command.sourceReplay ?? null])).digest('hex')}`;
+    const attemptCommand: CoordinateCompressionCommand = { ...command, settingsSnapshotContentObjectId };
+    if (command.trigger === 'auto') {
+      const evaluated = await this.compression.evaluate(command.headRootId, authoritySnapshotId, settingsSnapshotContentObjectId);
+      if (!evaluated.shouldCompress) return {
+        status: 'skipped', reason: 'below_threshold', estimatedTokens: evaluated.estimatedTokens,
+        thresholdTokens: evaluated.thresholdTokens
+      };
+    }
+
+    for (let index = 0; index < policy.executionPlan.attempts.length; index += 1) {
+      const attempt = policy.executionPlan.attempts[index]!;
+      attemptedMethods.push(attempt.methodKind);
+      let result: CoordinateCompressionResult;
+      try {
+        result = await this.coordinateAttempt(attemptCommand, attempt, { groupId, failures: [...failures] });
+      } catch (error) {
+        if (isExecutionHandoffError(error)) throw error;
+        if (!(error instanceof CompressionProviderAttemptError) || !compressionAttemptMayFallback(error)) {
+          throw error instanceof CompressionProviderAttemptError ? error.cause : error;
+        }
+        failures.push(compressionAttemptFailure(attempt.methodKind, error.cause, error.modelRequestId));
+        continue;
+      }
+
+      if (result.status === 'compressed') {
+        const diagnostics = new Set(result.diagnostics ?? []);
+        if (failures.length > 0) diagnostics.add('fallback_used');
+        return {
+          ...result,
+          ...(diagnostics.size > 0 ? { diagnostics: [...diagnostics] } : {}),
+          attemptedMethods: [...attemptedMethods],
+          recoveryDecision: { groupId, outcome: 'compressed', methodKind: attempt.methodKind, failures: [...failures] },
+          ...(failures.length > 0 ? { failures: [...failures] } : {})
+        };
+      }
+
+      if (result.status === 'error') {
+        lastPlanningError = result;
+        if (compressionPlanningErrorMayFallback(result.code)) {
+          failures.push({
+            methodKind: attempt.methodKind,
+            code: result.code,
+            message: result.message
+          });
+          continue;
+        }
+        return result;
+      }
+
+      if (result.status === 'skipped') {
+        const hasFallback = index + 1 < policy.executionPlan.attempts.length;
+        if (hasFallback && (result.reason === 'native_pending_tools' || result.reason === 'native_steering_in_flight')) {
+          failures.push({
+            methodKind: attempt.methodKind,
+            code: result.reason,
+            message: `Provider 原生压缩暂不可执行：${result.reason}`
+          });
+          continue;
+        }
+        if (failures.length > 0) break;
+        return result;
+      }
+
+      return result;
+    }
+
+    if (command.trigger === 'auto' && policy.executionPlan.continueUncompressedIfFits && command.requestBudget) {
+      const requestBudget = requireFullRequestPlanningBudget(command.requestBudget, policy.thresholdTokens);
+      if (requestBudget.estimatedFullInputTokens <= requestBudget.planningInputCapacityTokens) {
+        return {
+          status: 'continued_uncompressed',
+          reason: 'fallbacks_exhausted_but_request_fits',
+          recoveryDecision: {
+            groupId, outcome: 'continued_uncompressed', failures: [...failures],
+            estimatedTokens: requestBudget.estimatedFullInputTokens,
+            limitTokens: requestBudget.planningInputCapacityTokens
+          },
+          attemptedMethods,
+          failures,
+          estimatedTokens: requestBudget.estimatedFullInputTokens,
+          limitTokens: requestBudget.planningInputCapacityTokens
+        };
+      }
+    }
+    // The last planning error alone would hide why the earlier methods failed, for example a
+    // segmented summary beyond its leaf budget followed by a fallback that cannot admit the source.
+    if (lastPlanningError) {
+      return failures.length > 1
+        ? { ...lastPlanningError, message: compressionFallbackExhaustedMessage(attemptedMethods, failures) }
+        : lastPlanningError;
+    }
+    throw new Error(compressionFallbackExhaustedMessage(attemptedMethods, failures));
+  }
+
+  private async coordinateAttempt(
+    command: CoordinateCompressionCommand,
+    attempt: CompressionExecutionAttempt,
+    recovery: { groupId: string; failures: CompressionAttemptFailure[] }
+  ): Promise<CoordinateCompressionResult> {
     const turnId = requireId(command.turnId, 'turnId');
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
     const headRootId = requireId(command.headRootId, 'headRootId');
@@ -166,8 +331,14 @@ export class ReliableContextCompressionCoordinator {
     const frozen = await readRequestTurnAuthority(
       this.database, this.contentStore, authoritySnapshotId, turnId, settingsSnapshotContentObjectId
     );
-    const policy = frozenCompressionPolicy(frozen.document);
-    if (!policy || policy.methodKind === 'disabled') return { status: 'skipped', reason: 'disabled' };
+    const basePolicy = frozenCompressionPolicy(frozen.document);
+    if (!basePolicy || basePolicy.methodKind === 'disabled') return { status: 'skipped', reason: 'disabled' };
+    if (!basePolicy.executionPlan.attempts.some((candidate) =>
+      candidate.methodKind === attempt.methodKind && candidate.nativeKind === attempt.nativeKind
+    )) {
+      throw new Error(`Compression attempt ${attempt.methodKind} is not part of the frozen execution plan.`);
+    }
+    const policy = { ...basePolicy, methodKind: attempt.methodKind };
     if (trigger === 'auto' && policy.triggerMode !== 'token_threshold') {
       return { status: 'skipped', reason: 'manual_only' };
     }
@@ -238,20 +409,35 @@ export class ReliableContextCompressionCoordinator {
       this.context.materialize(headRootId)
     ]);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
+    if (command.sourceReplay && command.compressSegmentCount !== undefined
+      && command.compressSegmentCount !== materialized.records.length) {
+      throw new TypeError('Immutable compression source reconstruction requires the complete current window.');
+    }
     const fullAttachmentCatalogState = await this.attachmentCatalog.projectState(
       frozen.conversationId,
       semanticMaterialized.segments.map((segment) => ({ segmentId: segment.segmentId }))
     );
-    const fullModelHandleCatalog = await this.modelProvider.ensureAttachmentHandles(
+    const fullAttachmentHandles = await this.modelProvider.ensureAttachmentHandles(
       frozen.conversationId,
       fullAttachmentCatalogState.catalog
     );
+    const childHandles = mergeConversationChildHandles(
+      await readConversationChildHandles(this.database, this.contentStore, frozen.conversationId),
+      normalizeModelHandleCatalog(command.modelHandleCatalog).entries
+    );
+    const fullModelHandleCatalog = buildModelHandleCatalog(
+      semanticMaterialized.segments.map(segment => Buffer.from(segment.content).toString('utf8')),
+      [...fullAttachmentHandles.entries, ...childHandles]
+    );
     if (
-      policy.methodKind === 'openai_responses_compact'
+      policy.methodKind === 'provider_native' && attempt.nativeKind === 'openai_responses'
       && command.compressSegmentCount !== undefined
       && command.compressSegmentCount !== materialized.records.length
     ) {
-      throw new RangeError('OpenAI native Compact must receive the complete frozen model-visible Context window.');
+      throw new CompressionProviderAttemptError(attempt.methodKind, Object.assign(
+        new Error('OpenAI 原生压缩需要完整窗口；当前手动前缀改用已配置的文本后备方法。'),
+        { code: 'NATIVE_FULL_WINDOW_REQUIRED', category: 'capability' }
+      ));
     }
     // The level trigger already anchors this Context on a Provider prompt count. Reusing that anchor
     // as the estimator calibration keeps the retained tail sized in the same unit as the threshold
@@ -268,13 +454,13 @@ export class ReliableContextCompressionCoordinator {
         ? {}
         : { bodyTargetTokens: policy.config.bodyTargetTokens })
     });
-    const effectiveSummaryMaxTokens = policy.methodKind === 'openai_responses_compact'
+    const effectiveSummaryMaxTokens = policy.methodKind === 'provider_native'
       ? undefined
       : calculateEffectiveSummaryMaxTokens(
           policy.config.llmSummary?.targetTokens,
           rooms.calibratedBodyTargetTokens
         );
-    const textTailPlan = policy.methodKind === 'openai_responses_compact' || command.compressSegmentCount !== undefined
+    const textTailPlan = command.sourceReplay || policy.methodKind === 'provider_native' || command.compressSegmentCount !== undefined
       ? undefined
       : selectCompressionPrefixByTokens(
             materialized.records,
@@ -292,12 +478,12 @@ export class ReliableContextCompressionCoordinator {
         hardContextRoomTokens
       );
     }
-    const requestedSourceSegmentCount = policy.methodKind === 'openai_responses_compact'
-      ? materialized.records.length
+    const requestedSourceSegmentCount = command.sourceReplay ? materialized.records.length : policy.methodKind === 'provider_native'
+      ? command.compressSegmentCount ?? materialized.records.length
       : command.compressSegmentCount === undefined
         ? textTailPlan?.sourceSegmentCount ?? 0
         : requirePrefixCount(command.compressSegmentCount, materialized.records.length);
-    const plannedSourceSegmentCount = policy.methodKind === 'openai_responses_compact'
+    const plannedSourceSegmentCount = policy.methodKind === 'provider_native' && attempt.nativeKind === 'openai_responses'
       ? requestedSourceSegmentCount
       : closeToolExchangeBoundary(materialized.records, requestedSourceSegmentCount);
     if (plannedSourceSegmentCount <= 0 || plannedSourceSegmentCount > materialized.records.length) {
@@ -314,7 +500,7 @@ export class ReliableContextCompressionCoordinator {
     // prefix so the closure stays in the retained tail.
     const nativeGuardFacts = await this.readNativeCompressionGuardFacts(frozen.conversationId);
     const nativeGuard = evaluateNativeCompressionGuard({
-      fullWindowRequired: policy.methodKind === 'openai_responses_compact',
+      fullWindowRequired: policy.methodKind === 'provider_native' && attempt.nativeKind === 'openai_responses',
       facts: nativeGuardFacts,
       orderedSegmentIds: materialized.records.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
       requestedSourceSegmentCount: plannedSourceSegmentCount
@@ -332,6 +518,11 @@ export class ReliableContextCompressionCoordinator {
     const sourceSegmentCount = nativeGuard.status === 'protect'
       ? closeToolExchangeBoundary(materialized.records, nativeGuard.sourceSegmentCount)
       : plannedSourceSegmentCount;
+    if (command.sourceReplay && sourceSegmentCount !== materialized.records.length) {
+      throw Object.assign(new Error('Immutable source reconstruction cannot leave a protected partial window; finish pending work first.'), {
+        code: 'MODEL_CONTEXT_REBUILD_PARTIAL'
+      });
+    }
     if (sourceSegmentCount <= 0) {
       return {
         status: 'skipped',
@@ -353,7 +544,7 @@ export class ReliableContextCompressionCoordinator {
       frozen.conversationId,
       sourceAttachmentCatalogState.catalog
     );
-    const attachmentObservationProfileSha256 = policy.methodKind !== 'openai_responses_compact'
+    const attachmentObservationProfileSha256 = policy.methodKind !== 'provider_native'
       && sourceAttachmentCatalogState.catalog.length > 0
         ? attachmentObservationAnalysisProfileSha256(policy.provider)
         : undefined;
@@ -367,13 +558,15 @@ export class ReliableContextCompressionCoordinator {
         )
       : [];
     const sourceHash = hashSource(sourceSegments);
-    // configuration_update items are transport-only: they leave the compacted window (the
-    // provider-native compact input is stripped downstream) while the effective reasoning effort
-    // survives in the frozen rebase plan, re-applied as one fresh update before the next user
-    // message. The cache/continuation reset this forces stays observable through the plan.
+    // OpenAI configuration_update items are transport-only: they leave the compacted window while
+    // the effective effort survives in the frozen rebase plan. Anthropic signed compaction blocks
+    // do not use this OpenAI-specific rebase contract.
     const nativeRebase = await this.planNativeRebase(turnId, semanticMaterialized, sourceSegmentCount);
     const idempotencyKey = [
-      'context-compression', trigger, headRootId, policy.config.id, String(sourceSegmentCount), sourceHash,
+      'context-compression', trigger, headRootId, policy.config.id,
+      attempt.methodKind, attempt.nativeKind ?? 'text',
+      String(sourceSegmentCount), sourceHash,
+      ...(command.sourceReplay ? [command.sourceReplay] : []),
       ...(settingsSnapshotContentObjectId ? [settingsSnapshotContentObjectId] : [])
     ].join(':');
     const expectedModelRequestId = modelRequestIdFor(turnId, idempotencyKey);
@@ -384,6 +577,10 @@ export class ReliableContextCompressionCoordinator {
     );
     let request = await this.optionalDomain('ModelRequest', expectedModelRequestId);
     if (!request) {
+      // An explicitly empty current tool list must not resurrect tools from an earlier model round.
+      const tools = policy.methodKind !== 'provider_native' ? []
+        : command.tools !== undefined ? normalizeCompressionToolDefinitions(command.tools, 'Compression command.tools')
+          : await this.readLatestFrozenToolDefinitions(frozen.conversationId);
       const created = await this.modelProvider.createModelRequest({
         turnId,
         contextRootId: headRootId,
@@ -401,13 +598,19 @@ export class ReliableContextCompressionCoordinator {
           sourceRootId: headRootId,
           sourceSegmentCount,
           sourceHash,
+          ...(command.sourceReplay ? { sourceReplay: command.sourceReplay } : {}),
           blockId: compressionBlockId,
           compressionConfigId: policy.config.id,
           compressionMethodKind: policy.methodKind,
+          compressionPurpose: {
+            groupId: recovery.groupId, blockId: compressionBlockId, trigger,
+            methodKind: policy.methodKind, priorFailures: recovery.failures
+          },
+          ...(policy.methodKind === 'provider_native' ? { tools } : {}),
           ...(nativeRebase ? { nativeRebase } : {}),
           attachmentCatalogState: sourceAttachmentCatalogState,
-          ...(sourceAttachmentHandles.entries.length > 0
-            ? { modelHandleCatalog: sourceAttachmentHandles }
+          ...(fullModelHandleCatalog.entries.length > 0
+            ? { modelHandleCatalog: fullModelHandleCatalog }
             : {}),
           ...(attachmentObservationProfileSha256
             ? {
@@ -415,7 +618,9 @@ export class ReliableContextCompressionCoordinator {
                 attachmentObservationRequirements
               }
             : {}),
-          ...(effectiveSummaryMaxTokens === undefined ? {} : { effectiveSummaryMaxTokens })
+          ...(effectiveSummaryMaxTokens === undefined ? {} : {
+            effectiveSummaryMaxTokens: summaryTargetEstimatorTokens(effectiveSummaryMaxTokens, calibration)
+          })
         }, 'Reliable compression recipe'),
         idempotencyKey
       });
@@ -440,14 +645,29 @@ export class ReliableContextCompressionCoordinator {
         await this.modelProvider.dispatch(expectedModelRequestId, adapter, { reconnect: true });
       } catch (error) {
         if (error instanceof ModelRequestPreflightError) {
-          return compressionError(error.code, error.message, error.estimatedTokens, error.limitTokens);
+          // Callers prefix the code themselves; keep it out of the message to avoid repeating it.
+          const message = error.message.startsWith(`${error.code}: `)
+            ? error.message.slice(error.code.length + 2)
+            : error.message;
+          return compressionError(error.code, message, error.estimatedTokens, error.limitTokens);
         }
-        throw error;
+        if (isExecutionHandoffError(error)) throw error;
+        throw new CompressionProviderAttemptError(attempt.methodKind, error, expectedModelRequestId);
       }
       request = await this.requireDomain('ModelRequest', expectedModelRequestId);
     }
     if (request.terminal_state !== 'completed') {
-      throw new Error(`Compression ModelRequest ${expectedModelRequestId} ended as ${String(request.terminal_state)}.`);
+      throw new CompressionProviderAttemptError(
+        attempt.methodKind,
+        request.stream_stats_json && typeof request.stream_stats_json === 'object'
+          && !Array.isArray(request.stream_stats_json) && (request.stream_stats_json as Record<string, unknown>).failure !== undefined
+          ? restoredProviderRequestFailure((request.stream_stats_json as Record<string, unknown>).failure, String(request.terminal_state))
+          : Object.assign(
+              new Error(`Compression ModelRequest ${expectedModelRequestId} ended as ${String(request.terminal_state)}.`),
+              { terminalState: request.terminal_state, category: 'internal' }
+            ),
+        expectedModelRequestId
+      );
     }
     const completed = await this.modelProvider.completedEvent(expectedModelRequestId);
     const compressionResult = parseCompressionResult(completed.content);
@@ -512,9 +732,10 @@ export class ReliableContextCompressionCoordinator {
     const providerInputTokens = providerPromptTokens(completed.usage);
     const providerOutputTokens = compressionOutputTokens(completed.usage);
     // The durable replacement may include locally rendered Attachment observation state that is not
-    // part of Provider output accounting. Project the complete structured result instead of silently
-    // undercounting that model-visible state.
-    const summaryEstimatedTokens = estimateMessageContentsTokens(summary);
+    // part of Provider output accounting, so the readable result is measured; an OpenAI compaction
+    // item is ciphertext and is sized by the Provider's output count instead (measuring it alone
+    // recorded 0 and made every later estimate of this Context too small).
+    const summaryEstimatedTokens = estimateCompressionResultTokens(summary, providerOutputTokens, calibration.ratio);
     const projectedTokens = summaryEstimatedTokens
       + Math.max(0, candidateProjection.tokenCount - summaryProjectionTokens);
     const projectedBodyTokens = calibrateEstimatorToProvider(
@@ -543,7 +764,26 @@ export class ReliableContextCompressionCoordinator {
     }
     const projectedProviderTokens = calibrateEstimatorToProvider(projectedTokens, calibration)
       + rooms.calibratedFixedTokens;
-    if (policy.methodKind !== 'openai_responses_compact' && projectedProviderTokens >= decision.estimatedTokens) {
+    // Only the Context changes, so compare the Context before and after in the same local estimator
+    // unit. The level-trigger estimate is not a like-for-like "before": without a Provider anchor it
+    // measures the Context alone, and with one it is Provider-counted, while fixed tokens here are
+    // estimated. Under a small threshold the fixed overhead dominates both sides, so mixing units
+    // skipped compressions that did shrink the Context.
+    const currentContextTokens = estimateMaterializedContextTokens(
+      semanticMaterialized.segments,
+      fullAttachmentCatalogState,
+      fullModelHandleCatalog
+    );
+    // A ciphertext compaction nobody sized makes the "before" figure only a lower bound: every text
+    // summary replacing it would look larger and the already paid summary would be discarded on
+    // every attempt, so the comparison is skipped and no before figure is recorded.
+    const contextSizeKnown = !hasUnsizedOpaqueCompaction(semanticMaterialized.segments);
+    if (
+      trigger === 'auto'
+      && policy.methodKind !== 'provider_native'
+      && contextSizeKnown
+      && projectedTokens >= currentContextTokens
+    ) {
       // A large protected tail can cross the threshold while the currently eligible prefix is
       // already compact.  The durable ModelRequest makes this decision exact-replayable for this
       // frozen head; treating it as a level-triggered skip keeps the primary Agent Turn alive and
@@ -569,20 +809,24 @@ export class ReliableContextCompressionCoordinator {
         triggerTokens: decision.estimatedTokens,
         triggerTokenSource: decision.source,
         configuredThresholdTokens: requestBudget.compressionThresholdTokens,
-        requestBreakdown: requestBudget.breakdown,
-        estimatedTokensBefore: requestBudget.estimatedFullInputTokens,
+        // Manual compression runs outside any request: there is no full-request size to report.
+        ...(command.requestBudget ? {
+          requestBreakdown: requestBudget.breakdown,
+          estimatedTokensBefore: requestBudget.estimatedFullInputTokens,
+          calibratedTokensBefore: calibrateEstimatorToProvider(
+            requestBudget.estimatedFullInputTokens,
+            calibration
+          )
+        } : {}),
+        ...(contextSizeKnown ? { contextTokensBefore: currentContextTokens } : {}),
         estimatedTokensAfter: projectedTokens,
         providerCalibrationRatio: calibration.ratio,
-        calibratedTokensBefore: calibrateEstimatorToProvider(
-          requestBudget.estimatedFullInputTokens,
-          calibration
-        ),
         calibratedTokensAfter: projectedProviderTokens,
         ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
         ...(providerOutputTokens === undefined ? {} : { providerOutputTokens }),
         methodKind: policy.methodKind,
         estimatedTokens: summaryEstimatedTokens,
-        ...(policy.methodKind === 'openai_responses_compact'
+        ...(policy.methodKind === 'provider_native'
           ? { nativeBinding: policy.provider }
           : {}),
         ...(nativeRebase
@@ -607,7 +851,7 @@ export class ReliableContextCompressionCoordinator {
       modelRequestId: expectedModelRequestId,
       sourceRootId: headRootId,
       sourceSegmentCount,
-      ...(policy.methodKind === 'openai_responses_compact'
+      ...(policy.methodKind === 'provider_native'
         && calibrateEstimatorToProvider(projectedTokens, calibration) > rooms.calibratedBodyTargetTokens
         ? { diagnostics: ['native_over_target' as const] }
         : {}),
@@ -710,6 +954,16 @@ export class ReliableContextCompressionCoordinator {
   }
 
   /**
+   * Manual compression runs in a maintenance Turn and therefore has no ordinary request recipe of
+   * its own. Reuse the newest ordinary recipe from the same Conversation so Anthropic on-demand
+   * compaction receives the same frozen tool contract as the history it is summarizing. Automatic
+   * callers pass the current definitions directly and never enter this lookup.
+   */
+  private readLatestFrozenToolDefinitions(conversationId: string): Promise<CompressionToolDefinition[]> {
+    return readLatestFrozenCompressionTools(this.database, this.contentStore, conversationId);
+  }
+
+  /**
    * Reads the kernel-frozen native reasoning facts from the latest ordinary ModelRequest recipe of
    * the Turn. Compression recipes are skipped; an ordinary recipe without nativeReasoning means the
    * Turn is not on the native reasoning path. Update-selected effort is the only value a fresh
@@ -771,6 +1025,79 @@ export class ReliableContextCompressionCoordinator {
     if (!row) throw new Error(`${domain} ${id} does not exist.`);
     return row;
   }
+}
+
+class CompressionProviderAttemptError extends Error {
+  public constructor(
+    public readonly methodKind: CompressionExecutionAttempt['methodKind'],
+    public readonly cause: unknown,
+    public readonly modelRequestId?: string
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'CompressionProviderAttemptError';
+  }
+}
+
+function compressionAttemptMayFallback(error: CompressionProviderAttemptError): boolean {
+  const source = error.cause as { code?: unknown; category?: unknown; name?: unknown; status?: unknown; terminalState?: unknown; retryable?: unknown } | undefined;
+  if (source?.code === 'EXECUTION_HANDOFF' || source?.name === 'AbortError'
+    || source?.category === 'internal' || source?.category === 'cancelled'
+    || source?.status === 401 || source?.status === 403
+    || error.cause instanceof TypeError
+    || typeof source?.code === 'string' && /^(SQLITE|RUNTIME|MODEL_|CONTENT_)/.test(source.code)) return false;
+  const terminalState = typeof source?.terminalState === 'string' ? source.terminalState.toLowerCase() : '';
+  const text = `${error.message}\n${terminalState}`.toLowerCase();
+  return !(
+    terminalState.includes('cancel')
+    || terminalState.includes('interrupt')
+    || text.includes('aborterror')
+    || text.includes('cancelled')
+    || text.includes('canceled')
+    || text.includes('interrupted')
+    || text.includes('execution handoff')
+    || /invalid_api_key|authentication_error|permission_denied|insufficient_quota|billing_hard_limit|unauthorized|forbidden/.test(text)
+  );
+}
+
+function compressionAttemptFailure(
+  methodKind: CompressionExecutionAttempt['methodKind'],
+  error: unknown,
+  modelRequestId?: string
+): CompressionAttemptFailure {
+  const record = error && typeof error === 'object' && !Array.isArray(error)
+    ? error as { code?: unknown; status?: unknown; message?: unknown }
+    : undefined;
+  return {
+    methodKind,
+    message: safeProviderFailureMessage(error instanceof Error ? error.message
+      : typeof record?.message === 'string' ? record.message : String(error)),
+    ...(modelRequestId ? { modelRequestId } : {}),
+    ...(typeof record?.code === 'string' ? { code: record.code } : {}),
+    ...(typeof record?.status === 'number' && Number.isInteger(record.status)
+      ? { status: record.status }
+      : {})
+  };
+}
+
+function compressionPlanningErrorMayFallback(code: ContextPlanningFailureCode): boolean {
+  return code === 'compression_request_too_large'
+    || code === 'compressed_context_too_large'
+    || code === 'finite_tail_too_large'
+    || code === 'atomic_group_too_large';
+}
+
+function compressionFallbackExhaustedMessage(
+  attemptedMethods: readonly CompressionExecutionAttempt['methodKind'][],
+  failures: readonly CompressionAttemptFailure[]
+): string {
+  const attempted = attemptedMethods.length > 0 ? attemptedMethods.join(' → ') : '无可执行方法';
+  const detail = failures.length > 0
+    ? failures.map((failure) => {
+      const code = failure.code && !failure.message.includes(failure.code) ? `${failure.code}: ` : '';
+      return `${failure.methodKind}: ${code}${failure.message}`;
+    }).join('；')
+    : '没有可用的压缩结果。';
+  return `上下文压缩后备链已耗尽（${attempted}）：${detail}`;
 }
 
 function assertFrozenCompressionModelRequestIdentity(
@@ -852,7 +1179,47 @@ function selectCompressionPrefixByTokens(
   };
 }
 
-function manualRequestPlanningBudget(
+/**
+ * Tool definitions of the latest ordinary ModelRequest of a Conversation, which Provider-native
+ * compaction must resend unchanged. Read-only.
+ */
+export async function readLatestFrozenCompressionTools(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  conversationIdInput: string
+): Promise<CompressionToolDefinition[]> {
+  const conversationId = requireId(conversationIdInput, 'conversationId');
+  const turns = (await listAllDomainRows(database, 'Turn', { conversation_id: conversationId }))
+    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
+      || String(right.id).localeCompare(String(left.id)));
+  for (const turn of turns) {
+    const turnId = requireId(turn.id, 'Turn.id');
+    const requests = (await listAllDomainRows(database, 'ModelRequest', { turn_id: turnId }))
+      .sort((left, right) => compareBigIntDescending(left.request_seq, right.request_seq)
+        || String(right.id).localeCompare(String(left.id)));
+    for (const request of requests) {
+      const recipeRead = await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(
+        requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
+      )]);
+      const recipeRow = recipeRead.snapshot[0];
+      if (Array.isArray(recipeRow)) throw new Error('ContentObject lookup returned a list.');
+      if (!recipeRow) continue;
+      const recipe = requireRecord(
+        normalizePlainJson(
+          JSON.parse((await contentStore.read(asContentObjectMetadata(recipeRow))).toString('utf8')),
+          'ModelRequest recipe'
+        ),
+        'ModelRequest recipe'
+      );
+      if (recipe.kind !== 'reliable-agent-turn') continue;
+      return normalizeCompressionToolDefinitions(recipe.tools, 'ModelRequest recipe.tools');
+    }
+  }
+  return [];
+}
+
+/** Budget of the maintenance Turn a manual compression runs in; it has no ordinary request of its own. */
+export function manualRequestPlanningBudget(
   document: PlainJsonValue,
   thresholdTokens: number
 ): FullRequestPlanningBudget {
@@ -967,6 +1334,40 @@ function parseCompressionResult(value: PlainJsonValue): ParsedCompressionResult 
     contents,
     ...(attachmentObservationProfileSha256 ? { attachmentObservationProfileSha256, attachmentObservations } : {})
   };
+}
+
+function normalizeCompressionToolDefinitions(
+  value: unknown,
+  label: string
+): CompressionToolDefinition[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array.`);
+  return value.map((entry, index) => {
+    const normalized = normalizePlainJson(entry, `${label}[${index}]`);
+    const record = requireRecord(normalized, `${label}[${index}]`);
+    const description = typeof record.description === 'string' ? record.description : '';
+    const parameters = normalizePlainJson(record.parameters ?? {}, `${label}[${index}].parameters`);
+    return {
+      name: requireText(record.name, `${label}[${index}].name`),
+      description,
+      parameters,
+      ...(record.source === undefined
+        ? {}
+        : { source: normalizePlainJson(record.source, `${label}[${index}].source`) }),
+      ...(record.metadata === undefined
+        ? {}
+        : { metadata: normalizePlainJson(record.metadata, `${label}[${index}].metadata`) }),
+      ...(record.defaultConfig === undefined
+        ? {}
+        : { defaultConfig: normalizePlainJson(record.defaultConfig, `${label}[${index}].defaultConfig`) })
+    };
+  });
+}
+
+function compareBigIntDescending(left: unknown, right: unknown): number {
+  const leftValue = BigInt(String(left ?? 0));
+  const rightValue = BigInt(String(right ?? 0));
+  return leftValue > rightValue ? -1 : leftValue < rightValue ? 1 : 0;
 }
 
 function hashSource(records: readonly StructuralContextRecord[]): string {

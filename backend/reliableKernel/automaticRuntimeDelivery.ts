@@ -18,6 +18,9 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
+import { isCrossConversationFollowup, isCrossConversationReply } from './collaborationScope';
+import type { ContentAddressedStore } from './contentAddressedStore';
+import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -32,12 +35,17 @@ export type AutomaticRuntimeDeliveryReason =
   | 'source_turn_conversation_mismatch'
   | 'conversation_not_active'
   | 'terminal_evidence_incomplete'
-  | 'child_generation_stale_or_terminal';
+  | 'child_generation_stale_or_terminal'
+  | 'collaboration_message_waiting'
+  | 'collaboration_followup_requested'
+  | 'collaboration_queued_behind_active_turn'
+  | 'collaboration_notification_expired';
 
 export interface AutomaticRuntimeDeliveryDecision {
   phase: RuntimeDeliveryPhase;
   targetTurnId: string | null;
-  sourceTurnId: string;
+  /** Null only for a collaboration delivery to a Conversation that has no Turn yet. */
+  sourceTurnId: string | null;
   targetConversationId: string;
   reason: AutomaticRuntimeDeliveryReason;
   childExecutionId: string | null;
@@ -67,7 +75,10 @@ const TERMINAL_FAILURES = new Set(['interrupted', 'cancelled', 'failed', 'outcom
  * only a scheduling hint.
  */
 export class AutomaticRuntimeDeliveryRouter {
-  public constructor(private readonly database: RuntimeDatabase) {}
+  public constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly contentStore: ContentAddressedStore
+  ) {}
 
   /**
    * Fences a no-tool-call Provider result before it becomes visible. A delivery that won first
@@ -215,9 +226,11 @@ export class AutomaticRuntimeDeliveryRouter {
   public async resolve(input: {
     inboxItemId: string;
     targetConversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
   }): Promise<AutomaticRuntimeDeliveryDecision> {
     const inboxItemId = requireId(input.inboxItemId, 'inboxItemId');
+    const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+    if (inbox.source_kind === 'collaboration_message') return this.resolveCollaboration(input, inbox);
     const targetConversationId = requireId(input.targetConversationId, 'targetConversationId');
     const sourceTurnId = requireId(input.sourceTurnId, 'sourceTurnId');
     const [conversation, sourceTurn] = await Promise.all([
@@ -402,11 +415,82 @@ export class AutomaticRuntimeDeliveryRouter {
     });
   }
 
+  /** Collaboration has destination authority, separate from the sender's Turn or user authority. */
+  private async resolveCollaboration(input: {
+    inboxItemId: string; targetConversationId: string; sourceTurnId: string | null;
+  }, inbox: DomainRow): Promise<AutomaticRuntimeDeliveryDecision> {
+    const message = await this.requireExisting('CollaborationMessage', requireId(inbox.source_id, 'Collaboration message id'));
+    const links = await this.list('CollaborationMessageTargetLink', { message_id: message.id }, 2);
+    if (links.length !== 1 || links[0].conversation_id !== input.targetConversationId || links[0].inbox_item_id !== input.inboxItemId) throw new Error('Collaboration delivery destination conflicts with its immutable target link.');
+    if (message.mode !== 'message' && message.mode !== 'followup') throw new Error('Unsupported collaboration mode.');
+    const sources = await this.list('CollaborationMessageSourceLink', { message_id: message.id }, 2);
+    if (sources.length !== 1) throw new Error('Collaboration message has no unique source.');
+    const boardNotice = sources[0].source_kind === 'board';
+    const conversation = await this.maybeGet('Conversation', input.targetConversationId);
+    const steps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(input.inboxItemId, { source_kind: 'collaboration_message', source_id: message.id }),
+      DOMAIN_REPOSITORIES.domain('CollaborationMessage').assert(String(message.id), { mode: message.mode }),
+      DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assert(String(links[0].id), { conversation_id: input.targetConversationId, inbox_item_id: input.inboxItemId })
+    ];
+    if (!conversation || conversation.status !== 'active') return decision({ ...input, reason: 'conversation_not_active', authoritySteps: steps });
+    steps.push(DOMAIN_REPOSITORIES.domain('Conversation').assert(input.targetConversationId, { status: 'active' }));
+    const children = await this.list('ChildExecution', { child_conversation_id: input.targetConversationId }, 2);
+    if (children.length > 1) throw new Error('Collaboration target has multiple child memberships.');
+    const child = children[0];
+    if (child) {
+      steps.push(DOMAIN_REPOSITORIES.domain('ChildExecution').assert(String(child.id), { status: child.status, child_conversation_id: input.targetConversationId }));
+      if (!['active', 'idle'].includes(String(child.status))) return decision({ ...input, reason: 'child_generation_stale_or_terminal', childExecutionId: String(child.id), authoritySteps: steps });
+    }
+    const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: input.targetConversationId });
+    turns.sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)) || String(right.id).localeCompare(String(left.id)));
+    const active = turns.filter((turn) => turn.status === 'active');
+    if (active.length > 1) throw new Error('Collaboration target has multiple active Turns.');
+    const turn = active[0];
+    const anchor = turn ?? turns[0];
+    const sourceTurnId = anchor ? String(anchor.id) : input.sourceTurnId;
+    if (boardNotice && (!turn || links[0].anchor_turn_id !== turn.id)) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
+    // A manual compression or summary rebuild never takes a delivery in. The delivery waits; the
+    // commit that ends the maintenance Turn triggers the scan that routes it to the next real Turn.
+    if (turn && await isRuntimeMaintenanceTurn(this.database, this.contentStore, String(turn.id))) {
+      steps.push(DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { status: 'active', conversation_id: input.targetConversationId }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turn.id }));
+      if (boardNotice) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
+      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason: 'collaboration_queued_behind_active_turn', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+    }
+    // A send queued behind the target's running Turn is never injected into that Turn. It stays a
+    // next-Turn delivery until the anchor Turn ends; the level-triggered wake then routes it. A
+    // cross-conversation followup starts a Turn of its own, so it keeps waiting behind whichever
+    // Turn is running when it is dispatched, even one that started after its anchor ended.
+    if (!boardNotice && turn && (links[0].anchor_turn_id === turn.id
+      || await isCrossConversationFollowup(this.database, String(message.id)))) {
+      steps.push(DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').assert(String(links[0].id), { anchor_turn_id: links[0].anchor_turn_id }),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { status: 'active', conversation_id: input.targetConversationId }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turn.id }));
+      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason: 'collaboration_queued_behind_active_turn', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+    }
+    if (!turn) {
+      steps.push(DOMAIN_REPOSITORIES.domain('Turn').assertNone({ conversation_id: input.targetConversationId, status: 'active' }));
+      if (anchor) steps.push(DOMAIN_REPOSITORIES.domain('Turn').assert(String(anchor.id), { status: anchor.status }));
+      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason: message.mode === 'followup' ? 'collaboration_followup_requested' : 'collaboration_message_waiting', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+    }
+    const fences = await this.list('TurnFinalOutputFence', { turn_id: turn.id }, 2);
+    steps.push(DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { status: 'active', conversation_id: input.targetConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turn.id }));
+    if (fences.length) {
+      steps.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fences[0].id), { turn_id: turn.id }));
+      if (boardNotice) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
+      // A reply to a cross-conversation task starts a Turn of its own once this finishing one ends.
+      const reason = await isCrossConversationReply(this.database, String(message.id)) ? 'collaboration_queued_behind_active_turn' : 'source_turn_final_output_fenced';
+      return decision({ ...input, sourceTurnId, phase: 'next_turn', reason, childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+    }
+    steps.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: turn.id }));
+    return decision({ ...input, sourceTurnId, phase: 'current_turn', targetTurnId: String(turn.id), reason: 'source_turn_active', childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
+  }
+
   /** Revalidates and, if necessary, retargets one still-pending delivery in the same CAS. */
   public async reconcilePendingDelivery(input: {
     deliveryId: string;
     targetConversationId: string;
-    sourceTurnId: string;
+    sourceTurnId: string | null;
   }): Promise<{ delivery: DomainRow; decision: AutomaticRuntimeDeliveryDecision; changed: boolean }> {
     const deliveryId = requireId(input.deliveryId, 'deliveryId');
     const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
@@ -432,6 +516,7 @@ export class AutomaticRuntimeDeliveryRouter {
       ...(changed ? [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(deliveryId, {
         phase: decision.phase,
         target_turn_id: decision.targetTurnId,
+        ...(decision.reason === 'collaboration_notification_expired' ? { state: 'failed', failure_reason: 'board-notification-expired' } : {}),
         updated_at: now
       })] : [])
     ]);
@@ -585,7 +670,7 @@ function decision(input: {
   phase?: RuntimeDeliveryPhase;
   targetTurnId?: string | null;
   targetConversationId: string;
-  sourceTurnId: string;
+  sourceTurnId: string | null;
   reason: AutomaticRuntimeDeliveryReason;
   childExecutionId?: string;
   authoritySteps?: RepositoryTransactionStep[];

@@ -13,6 +13,8 @@ import {
 } from '../capabilities/openAIResponsesNativeControl';
 import type { ModelOutputItemReference } from '../../shared/protocol';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { freezeNativeChildToolProjection, readNativeRequestChildHandles, withChildHandles } from './conversationChildHandles';
+import { isCollaborationHandleTool, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import { ContextSequenceControlPlane } from './contextSequence';
 import {
   EffectControlPlane,
@@ -105,6 +107,8 @@ export interface NativeRequestSessionDeps {
   providerId: string;
   modelId: string;
   capabilities: OpenAIResponsesNativeCapabilities;
+  /** Immutable initial recipe catalog; committed native tool projections extend its child identities. */
+  modelHandleCatalog?: ModelHandleCatalog;
   resolveAdapter: (providerId: string) => Promise<{
     providerId: string;
     materializeNativeToolOutput?(
@@ -165,8 +169,12 @@ export class NativeRequestSession {
   private pumpDirty = false;
   private readonly inFlightDeliveries = new Set<string>();
   private disposed = false;
+  private yieldingForRuntimeInput = false;
+  private childCatalog: ModelHandleCatalog;
+  private readonly callResolutions = new Map<string, { arguments: PlainJsonValue; error?: string; catalog: ModelHandleCatalog }>();
 
   public constructor(private readonly deps: NativeRequestSessionDeps) {
+    this.childCatalog = normalizeModelHandleCatalog(deps.modelHandleCatalog);
     this.creationFence = currentExecutionLeaseFence();
     this.unsubscribeSettlements = deps.tools.subscribeToolSettlements?.(
       { turnId: deps.turnId },
@@ -179,8 +187,14 @@ export class NativeRequestSession {
     );
   }
 
+  public currentModelHandleCatalog(): ModelHandleCatalog {
+    return normalizeModelHandleCatalog(this.childCatalog);
+  }
+
   /** Rebuilds in-memory orchestration state from durable facts after a crash/reconnect. */
   public async reconcile(): Promise<void> {
+    this.childCatalog = withChildHandles(this.childCatalog,
+      await readNativeRequestChildHandles(this.deps.database, this.deps.contentStore, this.deps.modelRequestId));
     const checkpoints = await listAllDomainRows(this.deps.database, 'ModelStreamCheckpoint', {
       model_request_id: this.deps.modelRequestId
     });
@@ -201,6 +215,11 @@ export class NativeRequestSession {
       if (!content) throw new Error(`Native stream checkpoint ${String(checkpoint.id)} has no content.`);
       if (kind === 'native_tool_call') {
         const proof = parseNativeToolCallCheckpoint(content);
+        this.callResolutions.set(proof.providerCallId, {
+          arguments: normalizePlainJson(proof.resolvedArguments, 'Frozen native resolved arguments'),
+          catalog: proof.modelHandleCatalog,
+          ...(proof.argumentResolutionError !== undefined ? { error: proof.argumentResolutionError } : {})
+        });
         const toolCallId = this.deps.toolCallIdFor(proof.providerOrdinal, proof.providerCallId, proof.toolName);
         if (!this.calls.has(toolCallId)) {
           const call: NativeSessionCall = {
@@ -238,13 +257,12 @@ export class NativeRequestSession {
     // exactly one part and must never create a second occurrence during recovery.
     const message = await this.getOptional('Message', assistantMessageIdFor(this.deps.turnId, this.deps.modelRequestId));
     if (message) {
-      const { snapshot: revisions } = await this.deps.database.snapshotAll(
-        DOMAIN_REPOSITORIES.domain('MessageRevision').list({
-          where: { message_id: requireId(message.id, 'Message.id') },
-          orderBy: { column: 'revision_seq', direction: 'asc' },
-          limit: 1000
-        })
-      );
+      const revisions = (await listAllDomainRows(this.deps.database, 'MessageRevision', {
+        message_id: requireId(message.id, 'Message.id')
+      })).sort((left, right) => {
+        const a = BigInt(String(left.revision_seq)); const b = BigInt(String(right.revision_seq));
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
       const rebuiltCallCounts = new Map<string, number>();
       for (const revision of revisions) {
         const metadata = await this.requireDomain(
@@ -436,11 +454,17 @@ export class NativeRequestSession {
    */
   public buildCallProof(item: NativeCallItemEnvelope): PlainJsonValue {
     const responseId = item.outputItem!.providerResponseId!;
+    const resolution = this.callResolutions.get(item.call.id)
+      ?? { ...this.deps.resolveCallArguments(item.call.name, item.call.arguments), catalog: this.currentModelHandleCatalog() };
+    this.callResolutions.set(item.call.id, resolution);
     return normalizePlainJson({
       type: 'native_tool_call',
       responseId,
       toolName: item.call.name,
       arguments: item.call.arguments,
+      resolvedArguments: resolution.arguments,
+      modelHandleCatalog: resolution.catalog,
+      ...(resolution.error !== undefined ? { argumentResolutionError: resolution.error } : {}),
       providerCallId: item.call.id,
       providerOrdinal: this.nextGlobalCallOrdinal(responseId),
       // The exact flag the provider returned; admission eligibility is decided separately at the
@@ -881,7 +905,8 @@ export class NativeRequestSession {
     if (call.admitted || this.disposed) return;
     const stream = this.requireStream();
     const definition = this.deps.resolveDefinition(call.name);
-    const resolution = this.deps.resolveCallArguments(call.name, call.arguments);
+    const resolution = this.callResolutions.get(call.providerCallId);
+    if (!resolution) throw new Error(`Native call ${call.providerCallId} has no frozen argument resolution proof.`);
     call.arguments = resolution.arguments;
     const dispatchInput: ReliableAgentToolDispatchInput & { definition: ReliableAgentToolDefinition } = {
       turnId: this.deps.turnId,
@@ -993,14 +1018,27 @@ export class NativeRequestSession {
     const fence = this.activeFence();
     const run = async () => {
       try {
-        await this.deps.dispatchCall({
-          turnId: this.deps.turnId,
-          modelRequestId: this.deps.modelRequestId,
-          toolCallId: call.toolCallId,
-          providerCallId: call.providerCallId,
-          toolName: call.name,
-          arguments: call.arguments
-        });
+        const resolution = this.callResolutions.get(call.providerCallId);
+        if (!resolution) throw new Error(`Native call ${call.providerCallId} has no frozen argument resolution proof.`);
+        call.arguments = resolution.arguments;
+        if (resolution.error !== undefined) {
+          // A crash may happen after admission but before the rejected reference is settled.
+          // Recovery must reproduce that failure, never dispatch the raw childRef as a new call.
+          await this.deps.effects.settleWithoutEffect({
+            source: { kind: 'internal', key: `agent-loop:${call.toolCallId}:invalid-model-handle-reference` },
+            toolCallId: call.toolCallId, status: 'failed',
+            detail: { code: 'invalid_model_handle_reference', error: resolution.error }
+          });
+        } else {
+          await this.deps.dispatchCall({
+            turnId: this.deps.turnId,
+            modelRequestId: this.deps.modelRequestId,
+            toolCallId: call.toolCallId,
+            providerCallId: call.providerCallId,
+            toolName: call.name,
+            arguments: call.arguments
+          });
+        }
       } catch (error) {
         if (!isExecutionHandoffError(error)) {
           this.diagnose(`native call ${call.toolCallId} dispatch failed: ${errorMessage(error)}`);
@@ -1084,14 +1122,18 @@ export class NativeRequestSession {
   private async pumpLoop(): Promise<void> {
     for (;;) {
       this.pumpDirty = false;
-      if (this.disposed || !this.controller) return;
+      if (this.disposed || this.yieldingForRuntimeInput || !this.controller) return;
       const ready = this.collectDeliverable();
       if (ready.length === 0) return;
+      if (await this.yieldAtRuntimeInputBoundary(ready)) return;
       const adapter = await this.deps.resolveAdapter(this.deps.providerId);
       if (!adapter.materializeNativeToolOutput) {
         throw new Error(`Provider adapter ${this.deps.providerId} lacks materializeNativeToolOutput.`);
       }
-      const baseOutputs = await Promise.all(ready.map((call) => this.buildFunctionCallOutput(call)));
+      // Freeze and reserve newly exposed child refs in delivery order. Concurrent settlements
+      // must never both allocate A1 from the same pre-batch catalog.
+      const baseOutputs: OpenAIResponsesToolOutput[] = [];
+      for (const call of ready) baseOutputs.push(await this.buildFunctionCallOutput(call));
       const outputs = await adapter.materializeNativeToolOutput(baseOutputs);
       const controller = this.controller;
       // The batch stays in-flight until the admission commit lands via the checkpointed
@@ -1110,6 +1152,42 @@ export class NativeRequestSession {
       }
       if (!this.pumpDirty && this.collectDeliverable().length === 0) return;
     }
+  }
+
+  /**
+   * Peer/runtime data cannot use the user-steering channel. At a completed physical response with
+   * all tools settled, close the transport chain normally and let the next ModelRequest absorb
+   * RuntimeDelivery through the existing context authority. No tool is cancelled and no provider
+   * ACK is invented: undelivered results are retained in Context for the carrier request.
+   */
+  private async yieldAtRuntimeInputBoundary(ready: readonly NativeSessionCall[]): Promise<boolean> {
+    const latestResponseId = this.responseOrder[this.responseOrder.length - 1];
+    const latest = latestResponseId ? this.responses.get(latestResponseId) : undefined;
+    if (!latest?.admissionBoundary || !latest.boundarySeq || this.inFlightDeliveries.size > 0
+      || [...this.calls.values()].some(call => !call.admitted || !call.settled)
+      || [...this.steerReceipts.values()].some(receipt =>
+        ['queued', 'sent', 'accepted', 'waiting_for_input'].includes(receipt.state))) return false;
+    const pending = await this.deps.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('RuntimeDelivery').list({
+        where: { target_turn_id: this.deps.turnId, phase: 'current_turn', state: 'pending' }, limit: 1
+      }),
+      DOMAIN_REPOSITORIES.domain('PendingTurnInput').list({
+        where: { turn_id: this.deps.turnId, input_kind: 'runtime_delivery', state: 'pending' }, limit: 1
+      })
+    ]);
+    if (!pending.snapshot.some(value => Array.isArray(value) && value.length > 0)) return false;
+    const controller = this.controller;
+    if (!controller || this.disposed) return false;
+    for (const call of ready) {
+      // Reserve refs before another request can rebuild from these newly retained results.
+      await this.buildFunctionCallOutput(call);
+      await this.appendResultOccurrence(call);
+    }
+    if (this.controller !== controller || this.disposed) return false;
+    this.yieldingForRuntimeInput = true;
+    controller.endLogicalRequest();
+    this.diagnose('Native logical request yielded at a settled tool boundary for pending runtime input.');
+    return true;
   }
 
   private collectDeliverable(): NativeSessionCall[] {
@@ -1143,6 +1221,19 @@ export class NativeRequestSession {
       requireId(revision.content_object_id, 'MessageRevision.content_object_id')
     ) as unknown as ContentObjectMetadata;
     const raw = (await this.deps.contentStore.read(metadata)).toString('utf8');
+    if (['run_agent', 'read_agent_answer', 'submit_agent_answer', 'submit_plan'].includes(call.name)
+      || isCollaborationHandleTool(call.name)) {
+      const frozen = await freezeNativeChildToolProjection({
+        database: this.deps.database, contentStore: this.deps.contentStore,
+        modelRequestId: this.deps.modelRequestId, toolCallId: call.toolCallId,
+        toolModelResultId: call.toolModelResultId, messageRevisionId: String(revision.id),
+        contentObjectId: metadata.id, toolName: call.name, raw,
+        catalog: this.childCatalog, now: this.deps.now()
+      });
+      this.childCatalog = frozen.catalog;
+      // Projection metadata is local authority only; the provider receives the frozen output bytes.
+      return { type: 'function_call_output', callId: call.providerCallId, output: frozen.output };
+    }
     const parsed = asRecord(normalizePlainJson(JSON.parse(raw), 'Native ToolModelResult content'));
     const parts = Array.isArray(parsed?.parts) ? parsed.parts : undefined;
     let output: string | Array<Record<string, unknown>> = raw;
