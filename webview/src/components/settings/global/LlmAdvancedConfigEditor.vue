@@ -23,7 +23,8 @@ import {
   OPENAI_COMPATIBLE_THINKING_FORMAT_LABELS,
   describeOpenAICompatibleDialect
 } from '@shared/openAICompatibleDialect';
-import { resolveProviderOpenAICompatibleDialect } from '@shared/modelCapabilities';
+import { openAICompatibleThinkingProbeEvidence, resolveProviderOpenAICompatibleDialect } from '@shared/modelCapabilities';
+import { OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS, openAICompatibleThinkingProbeSummary } from '@shared/openAICompatibleThinkingProbe';
 import {
   gpt6ChatCompletionsToolRestriction,
   isGpt6FamilyModel,
@@ -36,6 +37,7 @@ import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNativ
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
+import { IconFlask } from '@tabler/icons-vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
 import LlmHeadersSettings from './parameters/LlmHeadersSettings.vue';
 import LlmParameterSettings from './parameters/LlmParameterSettings.vue';
@@ -50,6 +52,8 @@ type AdvancedConfigPatch = Partial<Pick<
 
 const props = defineProps<{
   config: LlmProviderConfigRecord;
+  /** “测试这个模型”进行中或失败的状态；不传表示没有在测试。 */
+  thinkingProbe?: { status: 'running' | 'failed'; message?: string };
 }>();
 
 const systemPromptPrefixScroller = ref<HTMLTextAreaElement | null>(null);
@@ -62,6 +66,8 @@ const emit = defineEmits<{
   (event: 'update-prompt-cache', value: LlmPromptCacheConfigRecord | undefined): void;
   (event: 'update-native-responses', value: OpenAIResponsesNativeSettings | undefined): void;
   (event: 'update-headers', value: LlmProviderHeadersRecord | undefined): void;
+  /** 点了“测试这个模型”：由上层确认后测试 config.model。 */
+  (event: 'test-thinking'): void;
 }>();
 
 const toolCallFormatOptions: SettingsDropdownOption[] = [
@@ -82,6 +88,21 @@ const thinkingFormatOptions = computed<SettingsDropdownOption[]>(() => [
 const thinkingFormatSummary = computed(() => describeOpenAICompatibleDialect(
   resolveProviderOpenAICompatibleDialect(props.config, props.config.model, { manual: props.config.openaiCompatibleThinkingFormat ?? null })
 ));
+
+/** “测试这个模型”的结果（身份匹配才显示）与测试中、失败的状态。 */
+const thinkingProbeRunning = computed(() => props.thinkingProbe?.status === 'running');
+const thinkingProbeText = computed(() => {
+  if (props.thinkingProbe?.status === 'running') {
+    return `正在测试：最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求，一般几秒到几十秒。`;
+  }
+  if (props.thinkingProbe?.status === 'failed' && props.thinkingProbe.message) return props.thinkingProbe.message;
+  const evidence = openAICompatibleThinkingProbeEvidence(props.config, props.config.model);
+  if (!evidence) {
+    return `还没有测试。点“测试这个模型”会向 ${props.config.model || '这个模型'} 发最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求，测出它用哪种思考参数写法、能不能关闭思考、接受哪些思考强度。`;
+  }
+  const summary = openAICompatibleThinkingProbeSummary(evidence);
+  return props.config.openaiCompatibleThinkingFormat ? `${summary}。已手动指定写法，发送时不采用测试结果。` : `${summary}。`;
+});
 
 function updateThinkingFormat(value: string): void {
   emit('update-field', {
@@ -468,6 +489,18 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
         @update:model-value="updateThinkingFormat"
       />
       <span class="stream-checkbox-text">当前发送（{{ config.model }}）：{{ thinkingFormatSummary }}。依次看手动指定、测试结果、接口地址和模型 ID；只有识别不对（例如中转站改了模型名）时才需要手动指定。</span>
+      <div class="thinking-probe-row">
+        <button
+          type="button"
+          class="model-manager-button thinking-probe-button"
+          :disabled="thinkingProbeRunning || !config.model"
+          @click="emit('test-thinking')"
+        >
+          <IconFlask stroke="2" aria-hidden="true" />
+          <span>{{ thinkingProbeRunning ? '测试中…' : '测试这个模型' }}</span>
+        </button>
+        <span class="stream-checkbox-text thinking-probe-text" :class="{ 'is-failed': thinkingProbe?.status === 'failed' }">{{ thinkingProbeText }}</span>
+      </div>
     </div>
 
     <template v-if="config.provider === 'openai-responses'">
@@ -707,6 +740,26 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-xs);
   line-height: 1.45;
+}
+
+.thinking-probe-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.thinking-probe-button {
+  flex: none;
+}
+
+.thinking-probe-text {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.thinking-probe-text.is-failed {
+  color: var(--vscode-errorForeground, var(--vscode-descriptionForeground));
 }
 
 .native-capabilities-heading {

@@ -605,3 +605,100 @@ test('设置 store：测试期间改了接口地址，结果作废；重新获�
     assert.deepEqual(kept.capabilitySnapshot, snapshot);
   });
 });
+
+/** SSR 渲染设置组件：HoverTooltipPanel 在 setup 里读取视口尺寸，给一个最小的 document 桩。 */
+async function withSsr(run) {
+  // 先建 Vite 服务：它加载配置时看到 document 会按浏览器处理。
+  const server = await createWebviewSsrServer();
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
+  globalThis.window = {
+    addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout,
+    acquireVsCodeApi() { return { postMessage() {}, getState() { return undefined; }, setState() {} }; }
+  };
+  try {
+    const { createSSRApp } = await import('vue');
+    const { renderToString } = await import('@vue/server-renderer');
+    await run({ server, createSSRApp, renderToString });
+  } finally {
+    await server.close();
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+}
+
+const UI_BASE = 'https://relay.example.invalid/v1';
+
+test('界面：“思考参数写法”旁有“测试这个模型”，下方显示测试结果、测试中与失败', async () => {
+  await withSsr(async ({ server, createSSRApp, renderToString }) => {
+    const { default: editor } = await server.ssrLoadModule('/src/components/settings/global/LlmAdvancedConfigEditor.vue');
+    const render = (config, props = {}) => renderToString(createSSRApp(editor, { config, ...props }));
+    const untested = channel(UI_BASE, 'deepseek-like', { requestBody: undefined, generationConfig: undefined });
+    const tested = withEvidence(untested, snapshotFixture(UI_BASE, 'deepseek-like', TESTED));
+
+    const plain = await render(untested);
+    assert.match(plain, /测试这个模型/);
+    assert.match(plain, /还没有测试/);
+
+    const result = await render(tested);
+    assert.match(result, /测试结果（\d\d-\d\d \d\d:\d\d）：DeepSeek 写法（thinking\.type）；可以关闭思考；接受 low \/ high \/ max/);
+    assert.match(result, /· 按测试结果/);
+    assert.doesNotMatch(result, /还没有测试/);
+
+    const manual = await render({ ...tested, openaiCompatibleThinkingFormat: 'enable_thinking' });
+    assert.match(manual, /已手动指定写法，发送时不采用测试结果/);
+
+    // 换了接口地址，旧结果不再显示。
+    assert.match(await render({ ...tested, baseUrl: 'https://changed.example.invalid/v1' }), /还没有测试/);
+
+    const running = await render(tested, { thinkingProbe: { status: 'running' } });
+    assert.match(running, /测试中…/);
+    assert.match(running, /<button[^>]*disabled[^>]*>[\s\S]*?测试中…/);
+    const failed = await render(untested, { thinkingProbe: { status: 'failed', message: '测试思考参数失败：第 1 次请求失败（HTTP 401）' } });
+    assert.match(failed, /测试思考参数失败：第 1 次请求失败（HTTP 401）/);
+
+    assert.doesNotMatch(await render({ ...untested, provider: 'claude' }), /测试这个模型/);
+  });
+});
+
+test('界面：OpenAI 兼容渠道的 LLM 列表每行有“测试”按钮，已测试显示标签，测试中显示“测试中…”', async () => {
+  await withSsr(async ({ server, createSSRApp, renderToString }) => {
+    const { default: tab } = await server.ssrLoadModule('/src/components/settings/global/ChannelSettingsTab.vue');
+    const { useGlobalSettingsStore } = await server.ssrLoadModule('/src/stores/useGlobalSettingsStore.ts');
+    const render = async (config, setup = () => {}) => {
+      const app = createSSRApp(tab);
+      const pinia = createPinia();
+      app.use(pinia);
+      setActivePinia(pinia);
+      const store = useGlobalSettingsStore();
+      store.applySnapshot({ section: 'llmProviderConfigs', settings: { configs: [config] }, filePath: 'fixture', revision: 'initial' });
+      store.applySnapshot({ section: 'llm', settings: { activeProviderConfigId: config.id }, filePath: 'fixture', revision: 'initial' });
+      setup(store);
+      return renderToString(app);
+    };
+    const models = [{ id: 'deepseek-like', name: '类 DeepSeek' }, { id: 'plain-chat', name: '普通模型' }, { id: 'third', name: '第三个' }];
+    const config = channel(UI_BASE, 'deepseek-like', { models, requestBody: undefined, generationConfig: undefined });
+    const tested = withEvidence(config, snapshotFixture(UI_BASE, 'deepseek-like', TESTED));
+    const html = await render(tested, (store) => {
+      store.setThinkingProbe({ configId: 'probe-channel', modelId: 'plain-chat', status: 'running', requestId: 'r1' });
+      store.setThinkingProbe({ configId: 'probe-channel', modelId: 'third', status: 'failed', requestId: 'r2', message: '测试思考参数失败：网络错误' });
+    });
+    // 当前选中的行 class 是“enabled model-item”。
+    const rows = html.split(/<div class="[^"]*\bmodel-item\b[^"]*"/).slice(1);
+    assert.equal(rows.length, 3);
+    assert.match(rows[0], /已测试/);
+    assert.match(rows[0], /class="model-test-btn"[^>]*>[\s\S]*?测试</);
+    assert.match(rows[1], /测试中…/);
+    assert.match(rows[2], /测试失败/);
+    for (const row of rows) assert.match(row, /model-remove-btn/);
+    // 确认框只在点了按钮后打开。
+    assert.doesNotMatch(html, /可能产生少量费用/);
+
+    const claude = await render({ ...config, provider: 'claude', baseUrl: 'https://api.anthropic.com/v1' });
+    assert.doesNotMatch(claude, /model-test-btn/);
+    assert.doesNotMatch(claude, /测试这个模型/);
+  });
+});
