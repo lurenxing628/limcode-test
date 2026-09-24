@@ -1,12 +1,12 @@
 diff --git a/package.json b/package.json
-index 5b0475d..a6a7de4 100644
+index 5b0475d..5b32322 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "unified-llm-provider",
 -  "version": "0.1.37",
-+  "version": "0.1.37-limcode.6",
++  "version": "0.1.37-limcode.7",
    "description": "统一 LLM Provider npm 包：一套统一结构接入 Gemini / Claude / OpenAI Compatible / OpenAI Responses / DeepSeek",
    "license": "MIT",
    "type": "module",
@@ -392,7 +392,7 @@ index bad39bb..be3cb42 100644
    input: LLMPromptCacheConfig | boolean | undefined,
    autoCaching?: boolean,
 diff --git a/src/llm/formats/openai-compatible.ts b/src/llm/formats/openai-compatible.ts
-index 08a6ccc..51b3366 100644
+index 08a6ccc..d1755b3 100644
 --- a/src/llm/formats/openai-compatible.ts
 +++ b/src/llm/formats/openai-compatible.ts
 @@ -4,7 +4,8 @@
@@ -708,7 +708,7 @@ index 08a6ccc..51b3366 100644
        }
      }
  
-@@ -367,9 +430,416 @@ export class OpenAICompatibleFormat implements FormatAdapter {
+@@ -367,9 +430,449 @@ export class OpenAICompatibleFormat implements FormatAdapter {
    }
  
    createStreamState(): StreamDecodeState {
@@ -727,7 +727,9 @@ index 08a6ccc..51b3366 100644
 +   *
 +   * 1. 工具调用：部分网关（实测：把 Chat Completions 转成其他协议的中转）在工具调用流里不发
 +   *    finish_reason，最后一个调用（尤其是 arguments 为空串的无参数调用）永远等不到输出信号。
-+   *    流已正常结束时，空参数按 `{}` 发出；参数 JSON 不完整的调用视为被截断，返回解码错误块。
++   *    收到 `data: [DONE]`（state.streamEnd === 'done'）时流确实已经结束，空参数按 `{}` 发出；
++   *    没有 [DONE] 的 EOF 可能是连接在参数发完之前断开，只收到工具名的调用不按 `{}` 补发
++   *    （否则参数全可选的工具会以空参数真的执行），与参数 JSON 不完整的调用一样按截断返回解码错误块。
 +   * 2. OpenRouter reasoning_details：整条流累积完成后才完整（签名、加密块常在正文或工具调用之后
 +   *    才到），所以只在这里作为一个仅含签名的思考 part 发出一次，与官方 AI SDK 在 finish 时给出
 +   *    完整 reasoning_details 的做法一致。
@@ -751,10 +753,13 @@ index 08a6ccc..51b3366 100644
 +    }
 +
 +    if (pending.size > 0) {
++      const receivedDone = streamState.streamEnd === 'done';
 +      const failures: FailedStreamToolCall[] = [];
 +      for (const [, entry] of pending) {
-+        const problem = emitStreamToolCall(chunk, entry, { allowEmptyArgs: true });
++        const problem = emitStreamToolCall(chunk, entry, { allowEmptyArgs: receivedDone });
 +        if (problem) failures.push({ entry, problem });
++        // 没有 [DONE] 时空参数调用不会被发出：它的参数可能还没到，按截断上报。
++        else if (!entry.emitted && entry.name) failures.push({ entry, problem: 'incomplete' });
 +      }
 +      pending.clear();
 +      streamState.lastToolCallKey = undefined;
@@ -764,7 +769,7 @@ index 08a6ccc..51b3366 100644
 +            id: entry.callId,
 +            function: { name: entry.name, arguments: entry.arguments },
 +          })),
-+        });
++        }, receivedDone ? 'done' : 'eof');
 +      }
 +    }
 +    return chunk.partsDelta?.length ? chunk : undefined;
@@ -903,12 +908,17 @@ index 08a6ccc..51b3366 100644
 +  rawArgs: string,
 +  problem: StreamToolArgumentsProblem,
 +  finishReason?: string,
++  streamEnd?: 'done' | 'eof',
 +): string {
 +  const call = describeToolCall(name, callId);
 +  if (problem === 'not_object') {
 +    return `工具调用 ${call} 的参数不是 JSON 对象：${previewToolArguments(rawArgs)}`;
 +  }
-+  const reason = finishReason ? `finish_reason: ${finishReason}` : '流结束时仍未收到完整参数';
++  const reason = finishReason
++    ? `finish_reason: ${finishReason}`
++    : streamEnd === 'eof'
++      ? '连接在没有 finish_reason 和 [DONE] 的情况下结束，参数可能还没发完'
++      : '流结束时仍未收到完整参数';
 +  return `工具调用 ${call} 的参数 JSON 不完整，参数可能被截断（${reason}，已收到 ${rawArgs.length} 个字符）：${previewToolArguments(rawArgs)}`;
 +}
 +
@@ -916,12 +926,18 @@ index 08a6ccc..51b3366 100644
 +  failures: FailedStreamToolCall[],
 +  finishReason: string | undefined,
 +  rawChunk: unknown,
++  streamEnd?: 'done' | 'eof',
 +): LLMStreamChunk {
 +  const message = failures
-+    .map(({ entry, problem }) => describeToolArgumentsProblem(entry.name, entry.callId, entry.arguments, problem, finishReason))
++    .map(({ entry, problem }) => describeToolArgumentsProblem(entry.name, entry.callId, entry.arguments, problem, finishReason, streamEnd))
 +    .join('\n');
 +  return {
-+    error: { kind: 'decode_error', message, rawChunk },
++    error: {
++      kind: 'decode_error',
++      message,
++      rawChunk,
++      ...(isOutputLimitFinishReason(finishReason) ? { retryable: false } : {}),
++    },
 +    rawChunk,
 +    ...(finishReason ? { finishReason } : {}),
 +  };
@@ -1062,7 +1078,8 @@ index 08a6ccc..51b3366 100644
 + * 已经返回 200 之后发生的错误，流式以一个 `finish_reason: "error"` 的块终止流，非流式把 error
 + * 放在 choice 里并带 `finish_reason: "error"`；choice 上可能带 `native_finish_reason`
 + * （如 Gemini 的 MALFORMED_FUNCTION_CALL）。顶层带 `error` 的块已由 response 层按 stream_error
-+ * 处理；这里补上只有 `finish_reason: "error"` 的情况，按错误上报而不是当作正常结束。
++ * 处理（此后 response 层不再调用 finalizeStream）；这里补上只有 `finish_reason: "error"` 的情况，
++ * 按错误上报而不是当作正常结束。
 + */
 +function describeFinishReasonError(data: any, choice: any): { message: string; code?: string } {
 +  const nativeFinishReason = typeof choice?.native_finish_reason === 'string' && choice.native_finish_reason
@@ -1102,6 +1119,22 @@ index 08a6ccc..51b3366 100644
 +}
 +
 +/**
++ * finish_reason "length"：输出达到请求里的 token 上限（OpenAI Chat Completions：“the maximum number of
++ * tokens specified in the request was reached”）。原样重发会在同一上限处再次截断，所以这种截断造成的
++ * 工具参数错误带 retryable:false，调用方的重试策略不应整包重发。
++ */
++function isOutputLimitFinishReason(finishReason: string | undefined): boolean {
++  return finishReason === 'length';
++}
++
++/** 非流式解码抛出的工具参数错误；带 retryable 时由 response 层原样写进 decode_error。 */
++function toolArgumentsDecodeError(message: string, finishReason: string | undefined): Error {
++  const error = new Error(message);
++  if (isOutputLimitFinishReason(finishReason)) Object.assign(error, { retryable: false });
++  return error;
++}
++
++/**
 + * 非流式 tool_calls[].function.arguments 解码。
 + *
 + * OpenAI 文档：arguments 是模型生成的 JSON 字符串，“the model does not always generate valid JSON”
@@ -1114,7 +1147,7 @@ index 08a6ccc..51b3366 100644
 +  if (raw === undefined || raw === null) return {};
 +  if (typeof raw === 'object') {
 +    if (Array.isArray(raw)) {
-+      throw new Error(describeToolArgumentsProblem(tc?.function?.name, tc?.id, JSON.stringify(raw), 'not_object', finishReason));
++      throw toolArgumentsDecodeError(describeToolArgumentsProblem(tc?.function?.name, tc?.id, JSON.stringify(raw), 'not_object', finishReason), finishReason);
 +    }
 +    return raw as Record<string, unknown>;
 +  }
@@ -1123,11 +1156,11 @@ index 08a6ccc..51b3366 100644
 +  try {
 +    return JSON.parse(text);
 +  } catch {
-+    throw new Error(describeToolArgumentsProblem(tc?.function?.name, tc?.id, text, 'incomplete', finishReason));
++    throw toolArgumentsDecodeError(describeToolArgumentsProblem(tc?.function?.name, tc?.id, text, 'incomplete', finishReason), finishReason);
    }
  }
  
-@@ -406,11 +876,30 @@ function encodeOpenAICompatibleToolMediaBlock(part: NonNullable<FunctionResponse
+@@ -406,11 +909,30 @@ function encodeOpenAICompatibleToolMediaBlock(part: NonNullable<FunctionResponse
    return undefined;
  }
  
@@ -1162,7 +1195,7 @@ index 08a6ccc..51b3366 100644
    if (mediaBlocks.length === 0) return text;
    return [
 diff --git a/src/llm/formats/openai-responses.ts b/src/llm/formats/openai-responses.ts
-index 1be02a5..9f6a6da 100644
+index 1be02a5..1ff5467 100644
 --- a/src/llm/formats/openai-responses.ts
 +++ b/src/llm/formats/openai-responses.ts
 @@ -8,6 +8,7 @@
@@ -1173,7 +1206,7 @@ index 1be02a5..9f6a6da 100644
    isVisibleTextPart, isInlineDataPart, isFunctionCallPart, isFunctionResponsePart, isTextPart, isProviderContextPart,
  } from '../../types.js';
  import type { LLMPromptCacheConfig, LLMPromptCacheMode } from '../../config/types.js';
-@@ -24,16 +25,90 @@ interface NormalizedOpenAIResponsesPromptCacheConfig {
+@@ -24,16 +25,91 @@ interface NormalizedOpenAIResponsesPromptCacheConfig {
    ttl: '30m';
    breakpoints: {
      messages: boolean;
@@ -1251,8 +1284,9 @@ index 1be02a5..9f6a6da 100644
 -  constructor(private model: string, promptCache?: LLMPromptCacheConfig) {
 +  /**
 +   * limcodeNativeEvents：仅 LimCode HTTP/SSE 原生路径开启。开启且模型属于 GPT-6 家族（精确 id）时，
-+   * 解码在 chunk 上附加 nativeEvent/completedContents（无 WS 物理身份）。LimCode 自带的
-+   * WebSocket 会话直接构造本类且不开启此模式，WS 上的权威 nativeEvent 由会话自身产出。
++   * 解码在 chunk 上附加 nativeEvent（response.created / response.completed）与 completedContents
++   * （无 WS 物理身份）。response.incomplete 在 SSE 上由 response 层按 stream_error 上报，不产出原生事件。
++   * LimCode 自带的 WebSocket 会话直接构造本类且不开启此模式，WS 上的权威 nativeEvent 由会话自身产出。
 +   */
 +  constructor(private model: string, promptCache?: LLMPromptCacheConfig, private readonly limcodeNativeEvents = false) {
      this.promptCache = normalizeOpenAIResponsesPromptCacheConfig(promptCache);
@@ -1265,7 +1299,7 @@ index 1be02a5..9f6a6da 100644
    // ============ 编码请求：Gemini (Internal) → OpenAI Responses ============
  
    private encodeInstructions(request: LLMRequest): string | undefined {
-@@ -60,6 +135,9 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -60,6 +136,9 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
  
        if (content.role === 'model') {
          let currentMessageItem: any = null;
@@ -1275,7 +1309,7 @@ index 1be02a5..9f6a6da 100644
  
          for (const part of content.parts) {
            if (isProviderContextPart(part)) {
-@@ -86,8 +164,11 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -86,8 +165,11 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
              inputItems.push(reasoningItem);
              currentMessageItem = null;
            } else if (isVisibleTextPart(part) && part.text) {
@@ -1289,7 +1323,7 @@ index 1be02a5..9f6a6da 100644
                inputItems.push(currentMessageItem);
              }
              currentMessageItem.content.push({ type: 'output_text', text: part.text });
-@@ -98,6 +179,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -98,6 +180,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
                call_id: callId,
                name: part.functionCall.name,
                arguments: JSON.stringify(part.functionCall.args),
@@ -1298,7 +1332,7 @@ index 1be02a5..9f6a6da 100644
              });
              pendingToolCallIds.push(callId);
              currentMessageItem = null;
-@@ -171,6 +254,15 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -171,6 +255,15 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          name: decl.name,
          description: decl.description,
          parameters: sanitizeSchemaForOpenAI(decl.parameters),
@@ -1314,7 +1348,7 @@ index 1be02a5..9f6a6da 100644
        }));
      }
  
-@@ -209,7 +301,39 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -209,7 +302,39 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
        mode: this.promptCache.mode === 'implicit' ? 'implicit' : 'explicit',
        ttl: this.promptCache.ttl,
      };
@@ -1355,7 +1389,7 @@ index 1be02a5..9f6a6da 100644
        inputItems.push(createOpenAICacheMarkerMessage(' '));
      }
    }
-@@ -266,19 +390,25 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -266,19 +391,27 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
      }
  
      const parts: Part[] = [];
@@ -1367,9 +1401,11 @@ index 1be02a5..9f6a6da 100644
          const part = createReasoningPart(item, { includeText: true, includeSignature: true });
          if (part) parts.push(part);
        } else if (item.type === 'message') {
-+        // B6：GPT-6 家族以外的模型的 assistant message 带 phase 时，文本 part 附带 outputItem
-+        // （GPT-6 家族与 Astra 原生路径保持一致，不附加）。
-+        const outputItem = isLimcodeGpt6FamilyModel(this.model) ? undefined : createAssistantPhaseOutputItem(item, index);
++        // B6：assistant message 带 phase 时，文本 part 附带 outputItem，GPT-6 家族也一样。
++        // 非流式没有原生事件和 completedContents，phase 只能从这里带出；官方要求所有 assistant
++        // message 都保留并回传 phase（https://developers.openai.com/api/reference/resources/responses：
++        // “preserve and resend phase on all assistant messages — dropping it can degrade performance”）。
++        const outputItem = createAssistantPhaseOutputItem(item, index);
          for (const block of item.content ?? []) {
            if (block.type === 'output_text') {
 -            parts.push({ text: block.text });
@@ -1383,7 +1419,7 @@ index 1be02a5..9f6a6da 100644
          parts.push(createProviderContextPart(item, 'responses'));
        }
      }
-@@ -304,7 +434,42 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -304,7 +437,27 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          chunk.textDelta = data.delta;
          chunk.partsDelta = [{ text: data.delta }];
        }
@@ -1404,29 +1440,14 @@ index 1be02a5..9f6a6da 100644
 +          };
 +        }
 +      }
-+    } else if (event === 'response.incomplete') {
-+      if (this.limcodeGpt6Native) {
-+        const response = data.response ?? data;
-+        const responseId = response?.id;
-+        if (typeof responseId === 'string' && responseId) {
-+          const usage = response?.usage ?? data.usage;
-+          chunk.nativeEvent = {
-+            type: 'response.incomplete',
-+            responseId,
-+            ...(typeof response?.status_details?.reason === 'string' && response.status_details.reason
-+              ? { reason: response.status_details.reason }
-+              : {}),
-+            ...(usage ? { usage } : {}),
-+          };
-+        }
-+      }
      } else if (event === 'response.output_item.added') {
++      // response.incomplete 没有分支：response 层把它当作上游错误，在这里之前就返回 stream_error。
 +      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
 +      else if (!isLimcodeGpt6FamilyModel(this.model)) rememberAssistantMessagePhase(streamState, data);
        const item = data.item;
        if (item?.type === 'reasoning') {
          // Responses API 的 reasoning item 在 added 阶段通常只有空 summary；
-@@ -312,29 +477,37 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -312,29 +465,37 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          // encrypted_content 只在 output_item.done 阶段采信，避免保存未完成或最终全量重复签名。
          emitReasoningItemSummary(chunk, streamState, item, data);
        } else if (item?.type === 'function_call') {
@@ -1467,7 +1488,7 @@ index 1be02a5..9f6a6da 100644
        const item = data.item;
        if (item?.type === 'reasoning') {
          // 如果前面没有 reasoning_summary_text.delta，done 里的完整 summary 是最后兜底，
-@@ -342,14 +515,49 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -342,14 +503,49 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          emitReasoningItemSummary(chunk, streamState, item, data);
          emitReasoningSignature(chunk, streamState, item, data);
        } else if (item?.type === 'function_call') {
@@ -1520,7 +1541,7 @@ index 1be02a5..9f6a6da 100644
        for (const item of data.response?.output ?? data.output ?? []) {
          if (item?.type === 'reasoning') {
            // 部分网关不会发送 reasoning_* delta，只在 completed.response.output
-@@ -361,10 +569,12 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -361,10 +557,12 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
            // 会在历史里形成额外的 signature-only thought part。保持原逻辑：
            // 只在 output_item.done 阶段接收 reasoning.encrypted_content。
          } else if (item?.type === 'compaction') {
@@ -1535,7 +1556,7 @@ index 1be02a5..9f6a6da 100644
      }
  
      return chunk;
-@@ -376,6 +586,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -376,6 +574,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
        pendingFunctionCalls: new Map<string, PendingOpenAIResponsesFunctionCall>(),
        reasoningTextByKey: new Map<string, string>(),
        emittedReasoningSignatures: new Set<string>(),
@@ -1544,7 +1565,7 @@ index 1be02a5..9f6a6da 100644
      } as OpenAIResponsesStreamState;
    }
  }
-@@ -385,12 +597,59 @@ interface OpenAIResponsesStreamState extends StreamDecodeState {
+@@ -385,12 +585,59 @@ interface OpenAIResponsesStreamState extends StreamDecodeState {
    pendingFunctionCalls: Map<string, PendingOpenAIResponsesFunctionCall>;
    reasoningTextByKey: Map<string, string>;
    emittedReasoningSignatures: Set<string>;
@@ -1604,7 +1625,7 @@ index 1be02a5..9f6a6da 100644
  }
  
  function isPlainObject(value: unknown): value is Record<string, unknown> {
-@@ -492,6 +751,7 @@ function normalizeOpenAIResponsesPromptCacheConfig(promptCache: LLMPromptCacheCo
+@@ -492,6 +739,7 @@ function normalizeOpenAIResponsesPromptCacheConfig(promptCache: LLMPromptCacheCo
      ttl: '30m',
      breakpoints: {
        messages: breakpoints.messages !== false,
@@ -1612,7 +1633,7 @@ index 1be02a5..9f6a6da 100644
      },
    };
  }
-@@ -525,6 +785,49 @@ function markLastOpenAIResponsesCacheableBlockAtRequestEnd(inputItems: any[]): b
+@@ -525,6 +773,49 @@ function markLastOpenAIResponsesCacheableBlockAtRequestEnd(inputItems: any[]): b
    return true;
  }
  
@@ -1662,7 +1683,7 @@ index 1be02a5..9f6a6da 100644
  function isOpenAIResponsesCacheableContentBlock(block: unknown): block is Record<string, unknown> {
    if (!block || typeof block !== 'object' || Array.isArray(block)) return false;
    const type = (block as Record<string, unknown>).type;
-@@ -801,6 +1104,8 @@ function createFunctionCallPart(item: any): FunctionCallPart {
+@@ -801,6 +1092,8 @@ function createFunctionCallPart(item: any): FunctionCallPart {
        name: item.name,
        args: parseFunctionCallArguments(item.arguments),
        callId: normalizeCallId(item.call_id) ?? normalizeCallId(item.id),
@@ -1671,7 +1692,7 @@ index 1be02a5..9f6a6da 100644
      },
    };
  }
-@@ -819,13 +1124,16 @@ function parseFunctionCallArguments(argumentsValue: unknown): Record<string, unk
+@@ -819,13 +1112,16 @@ function parseFunctionCallArguments(argumentsValue: unknown): Record<string, unk
  function rememberPendingFunctionCall(
    state: OpenAIResponsesStreamState,
    item: any,
@@ -1688,7 +1709,7 @@ index 1be02a5..9f6a6da 100644
    if (typeof item.name === 'string' && item.name.trim()) pending.name = item.name;
    if (typeof item.arguments === 'string') {
      if (item.arguments || !pending.argumentsText) {
-@@ -836,6 +1144,7 @@ function rememberPendingFunctionCall(
+@@ -836,6 +1132,7 @@ function rememberPendingFunctionCall(
    }
  
    state.pendingFunctionCalls.set(itemKey, pending);
@@ -1696,7 +1717,7 @@ index 1be02a5..9f6a6da 100644
    return itemKey;
  }
  
-@@ -843,13 +1152,16 @@ function appendPendingFunctionCallArguments(
+@@ -843,13 +1140,16 @@ function appendPendingFunctionCallArguments(
    state: OpenAIResponsesStreamState,
    itemId: unknown,
    delta: unknown,
@@ -1713,7 +1734,7 @@ index 1be02a5..9f6a6da 100644
  }
  
  function getPendingFunctionCallKey(item: any): string | undefined {
-@@ -860,38 +1172,55 @@ function emitFunctionCallChunk(
+@@ -860,38 +1160,55 @@ function emitFunctionCallChunk(
    chunk: LLMStreamChunk,
    itemOrKey: any,
    state: OpenAIResponsesStreamState,
@@ -1775,7 +1796,7 @@ index 1be02a5..9f6a6da 100644
  function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
    try {
      return createFunctionCallPart(item);
-@@ -899,3 +1228,4 @@ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
+@@ -899,3 +1216,4 @@ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
      return undefined;
    }
  }
@@ -2040,10 +2061,23 @@ index 1052c0c..dc3675e 100644
        return undefined;
    }
 diff --git a/src/llm/formats/types.ts b/src/llm/formats/types.ts
-index 0f88d4b..2045ba0 100644
+index 0f88d4b..99a7b46 100644
 --- a/src/llm/formats/types.ts
 +++ b/src/llm/formats/types.ts
-@@ -24,6 +24,37 @@ export interface FormatAdapter {
+@@ -10,6 +10,12 @@ import { LLMCompactResponse, LLMRequest, LLMResponse, LLMStreamChunk } from '../
+ /** 流式解码跨 chunk 状态（如 OpenAI tool_call 分片累积） */
+ export interface StreamDecodeState {
+   [key: string]: unknown;
++  /**
++   * 流怎样结束，由 processStreamResponse 在调用 finalizeStream 之前写入：
++   * `done` 表示收到了 `data: [DONE]`；`eof` 表示连接在没有 [DONE] 的情况下结束。
++   * 放在 state 上而不是作为参数传入，这样包装 finalizeStream(state) 的调用方不需要改动也能传到。
++   */
++  streamEnd?: 'done' | 'eof';
+ }
+ 
+ export interface FormatAdapter {
+@@ -24,6 +30,39 @@ export interface FormatAdapter {
  
    /** 创建流式解码状态（每次流式调用前调用） */
    createStreamState(): StreamDecodeState;
@@ -2053,7 +2087,9 @@ index 0f88d4b..2045ba0 100644
 +   *
 +   * 用于上游没有给出结束信号（如缺少 finish_reason）时，把仍在 state 里等待的内容
 +   * （未发出的工具调用、跨块累积的签名等）交给调用方。没有需要补发的内容时返回 undefined，
-+   * 此时流的输出与未实现该钩子时完全一致。读取中断（stream_read_error）时不会调用。
++   * 此时流的输出与未实现该钩子时完全一致。读取中断（stream_read_error）或流里已经发出过错误块
++   * （上游错误事件、非 JSON 数据、解码失败、适配器自己的错误块）时不会调用。
++   * 调用时 `state.streamEnd` 标明流是以 [DONE] 结束还是在没有 [DONE] 的情况下 EOF。
 +   */
 +  finalizeStream?(state: StreamDecodeState): LLMStreamChunk | undefined;
 +
@@ -2337,7 +2373,7 @@ index cc859a5..2dee403 100644
        url,
        streamUrl: config.endpoint?.streamUrl,
 diff --git a/src/llm/response.ts b/src/llm/response.ts
-index 8c4e118..b4478d5 100644
+index 8c4e118..92bd014 100644
 --- a/src/llm/response.ts
 +++ b/src/llm/response.ts
 @@ -7,6 +7,7 @@
@@ -2356,7 +2392,18 @@ index 8c4e118..b4478d5 100644
    return parsed.ok ? { bodyText, rawBody: parsed.value } : { bodyText };
  }
  
-@@ -119,33 +121,39 @@ export async function processResponse(
+@@ -56,6 +58,10 @@ function createErrorStreamChunk(error: LLMRawErrorInfo): LLMStreamChunk {
+   };
+ }
+ 
++function isNonRetryableError(err: unknown): boolean {
++  return err instanceof Error && (err as Error & { retryable?: unknown }).retryable === false;
++}
++
+ function stringField(value: unknown): string | undefined {
+   return typeof value === 'string' ? value : undefined;
+ }
+@@ -119,33 +125,39 @@ export async function processResponse(
    const headers = headersToRecord(res.headers);
    const { bodyText, rawBody } = await readResponseBody(res);
    const rawResponse = rawBody ?? bodyText;
@@ -2402,16 +2449,18 @@ index 8c4e118..b4478d5 100644
        kind: 'decode_error',
        status: res.status,
        statusText: res.statusText,
-@@ -153,7 +161,7 @@ export async function processResponse(
+@@ -153,7 +165,9 @@ export async function processResponse(
        bodyText,
        rawBody: rawResponse,
        message: stringifyError(err),
 -    });
++      // 格式适配器可以在抛出的错误上标明不可重试（如 finish_reason=length 截断的工具参数）。
++      ...(isNonRetryableError(err) ? { retryable: false } : {}),
 +    }));
    }
  }
  
-@@ -165,26 +173,37 @@ export async function* processStreamResponse(
+@@ -165,26 +179,41 @@ export async function* processStreamResponse(
    format: FormatAdapter,
  ): AsyncGenerator<LLMStreamChunk> {
    const headers = headersToRecord(res.headers);
@@ -2443,16 +2492,21 @@ index 8c4e118..b4478d5 100644
 +  };
 +  let lastPayload: unknown;
 +  let streamCompleted = false;
++  // 流里已经发出过错误块（上游错误事件、非 JSON 数据、解码失败或适配器自己的错误块）。
++  let emittedErrorChunk = false;
++  const sseEnd: SSEEnd = { receivedDone: false };
    try {
-     for await (const sse of parseSSE(res)) {
+-    for await (const sse of parseSSE(res)) {
++    for await (const sse of parseSSE(res, sseEnd)) {
        const parsed = tryParseJson(sse.data);
        if (!parsed.ok) {
 -        yield createErrorStreamChunk({
++        emittedErrorChunk = true;
 +        yield observed(createErrorStreamChunk({
            kind: 'stream_parse_error',
            status: res.status,
            statusText: res.statusText,
-@@ -194,16 +213,19 @@ export async function* processStreamResponse(
+@@ -194,16 +223,20 @@ export async function* processStreamResponse(
            bodyText: sse.data,
            message: `SSE data 不是 JSON: ${sse.data}`,
            rawChunk: sse.data,
@@ -2470,11 +2524,12 @@ index 8c4e118..b4478d5 100644
  
        if (isProviderErrorPayload(payload, sse.event)) {
 -        yield createErrorStreamChunk({
++        emittedErrorChunk = true;
 +        yield observed(createErrorStreamChunk({
            kind: 'stream_error',
            status: res.status,
            statusText: res.statusText,
-@@ -211,14 +233,18 @@ export async function* processStreamResponse(
+@@ -211,14 +244,20 @@ export async function* processStreamResponse(
            event: sse.event ?? stringField(isPlainObject(payload) ? payload.event : undefined),
            data: sse.data,
            rawChunk: payload,
@@ -2487,16 +2542,18 @@ index 8c4e118..b4478d5 100644
        try {
 -        yield format.decodeStreamChunk(payload, state);
 +        const chunk = withHttpErrorContext(format.decodeStreamChunk(payload, state));
++        if (chunk.error) emittedErrorChunk = true;
 +        yield observeLlmObject(chunk, getLlmResponseObserver(res), () => ({
 +          kind: 'decoded', parent: getLlmObservation(payload), value: chunk,
 +        }));
        } catch (err) {
 -        yield createErrorStreamChunk({
++        emittedErrorChunk = true;
 +        yield observed(createErrorStreamChunk({
            kind: 'decode_error',
            status: res.status,
            statusText: res.statusText,
-@@ -227,18 +253,39 @@ export async function* processStreamResponse(
+@@ -227,18 +266,43 @@ export async function* processStreamResponse(
            data: sse.data,
            rawChunk: payload,
            message: stringifyError(err),
@@ -2518,7 +2575,11 @@ index 8c4e118..b4478d5 100644
 +  }
 +
 +  // 流正常结束（[DONE] 或 EOF）后给格式适配器一次补发机会；读取中断时流不完整，不补发。
-+  if (!streamCompleted || typeof format.finalizeStream !== 'function') return;
++  // 已经发出过错误块的流（例如 OpenRouter 带顶层 error 和 finish_reason:"error" 的中途错误块，
++  // 它在这里就被拦下，格式适配器看不到）已经失败，不再补发待定的工具调用、截断错误或签名信封。
++  if (!streamCompleted || emittedErrorChunk || typeof format.finalizeStream !== 'function') return;
++  // 告诉格式适配器流是否以 [DONE] 结束：没有 [DONE] 的 EOF 可能是连接在工具参数发完之前断开。
++  state.streamEnd = sseEnd.receivedDone ? 'done' : 'eof';
 +  const parent = getLlmObservation(lastPayload);
 +  let finalChunk: LLMStreamChunk | undefined;
 +  try {
@@ -2539,7 +2600,27 @@ index 8c4e118..b4478d5 100644
  }
  
  // ============ SSE 解析 ============
-@@ -262,6 +309,8 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+@@ -248,11 +312,17 @@ export interface SSEChunk {
+   data: string;
+ }
+ 
++/** parseSSE 结束时写入：是否收到了 `data: [DONE]`（否则是没有 [DONE] 的 EOF）。 */
++interface SSEEnd {
++  receivedDone: boolean;
++}
++
+ /**
+  * 从 fetch Response 中解析 SSE 流，逐条 yield 包含 data 字段的原始字符串的对象。
+- * 遇到 `data: [DONE]` 时自动结束。
++ * 遇到 `data: [DONE]` 时自动结束，并把 end.receivedDone 置为 true；
++ * `for await` 拿不到生成器的返回值，所以通过这个对象告诉调用方。
+  */
+-async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
++async function* parseSSE(response: Response, end: SSEEnd): AsyncGenerator<SSEChunk> {
+   const body = response.body;
+   if (!body) throw new Error('Response body is null');
+ 
+@@ -262,6 +332,8 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
    let currentEvent: string | undefined;
    let dataLines: string[] = [];
    let chunksRead = 0;
@@ -2548,19 +2629,23 @@ index 8c4e118..b4478d5 100644
  
    const dispatch = (): SSEChunk | 'done' | undefined => {
      const data = dataLines.join('\n');
-@@ -269,8 +318,10 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+@@ -269,8 +341,13 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
      dataLines = [];
      currentEvent = undefined;
  
+-    if (data === '[DONE]') return 'done';
+-    return data ? { event, data } : undefined;
 +    const chunk = data ? { event, data } : undefined;
 +    observation?.dispatch(chunk, data, event);
-     if (data === '[DONE]') return 'done';
--    return data ? { event, data } : undefined;
++    if (data === '[DONE]') {
++      end.receivedDone = true;
++      return 'done';
++    }
 +    return chunk;
    };
  
    const handleLine = (rawLine: string): SSEChunk | 'done' | undefined => {
-@@ -299,6 +350,7 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+@@ -299,6 +376,7 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
        const { done, value } = await reader.read();
        if (done) break;
        chunksRead++;
@@ -2568,7 +2653,7 @@ index 8c4e118..b4478d5 100644
  
        buffer += decoder.decode(value, { stream: true });
  
-@@ -306,12 +358,14 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+@@ -306,12 +384,14 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
        buffer = lines.pop() ?? '';
  
        for (const line of lines) {
@@ -2584,7 +2669,7 @@ index 8c4e118..b4478d5 100644
      if (buffer) {
        const lines = buffer.split('\n');
 diff --git a/src/types/llm.ts b/src/types/llm.ts
-index 53d444d..fed1b1d 100644
+index 53d444d..f34cd7d 100644
 --- a/src/types/llm.ts
 +++ b/src/types/llm.ts
 @@ -4,7 +4,7 @@
@@ -2596,14 +2681,15 @@ index 53d444d..fed1b1d 100644
  import { FunctionDeclaration } from './tool.js';
  
  export interface LLMThinkingConfig {
-@@ -167,4 +167,33 @@ export interface LLMStreamChunk {
+@@ -167,4 +167,34 @@ export interface LLMStreamChunk {
    error?: LLMRawErrorInfo;
    /** 上游原始 SSE 块；错误 chunk 会尽量保留。 */
    rawChunk?: unknown;
 +  /**
 +   * LimCode Astra 扩展：response 生命周期观察。HTTP/SSE 原生解码模式只产出
-+   * created/completed/incomplete（无 WS 物理身份）；完整事件面（含 steering 与连接代）
-+   * 由 LimCode WebSocket 会话在自身 chunk 上权威产出，字段形状与 shared 原生事件保持一致。
++   * created/completed（无 WS 物理身份）；SSE 上的 response.incomplete 由 response 层按 stream_error
++   * 上报。完整事件面（含 steered incomplete、steering 与连接代）由 LimCode WebSocket 会话在自身 chunk
++   * 上权威产出，字段形状与 shared 原生事件保持一致。
 +   */
 +  nativeEvent?: {
 +    type: 'response.created' | 'response.completed' | 'response.incomplete'
@@ -8464,10 +8550,10 @@ index 415af05..84e2f05 100644
  });
 diff --git a/tests/openai-compatible-finish-reason-error.test.ts b/tests/openai-compatible-finish-reason-error.test.ts
 new file mode 100644
-index 0000000..0d5171e
+index 0000000..1e91a77
 --- /dev/null
 +++ b/tests/openai-compatible-finish-reason-error.test.ts
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,149 @@
 +import { describe, expect, it, vi } from 'vitest';
 +
 +import { createOpenAICompatibleProvider } from '../src/index.js';
@@ -8521,6 +8607,46 @@ index 0000000..0d5171e
 +    expect(chunks).toHaveLength(1);
 +    expect(chunks[0].error).toMatchObject({ kind: 'stream_error', rawChunk: payload });
 +    expect(chunks[0].error?.message).toBeUndefined();
++  });
++
++  it('带顶层 error 的中途错误块之后，流结束时不再补发工具调用、解码错误或签名信封', async () => {
++    // OpenRouter 文档的中途错误块同时带顶层 error 和 finish_reason:"error"。它由 response 层按 stream_error
++    // 拦下，格式适配器看不到这一块；流此后已经失败，不能再补发任何内容。
++    const payload = {
++      id: 'gen-abc123',
++      object: 'chat.completion.chunk',
++      created: 1,
++      model: 'google/gemini-3.5-flash',
++      provider: 'Google',
++      error: { code: 502, message: 'Provider disconnected mid-stream' },
++      choices: [{ index: 0, delta: { content: '' }, finish_reason: 'error' }],
++    };
++    for (const end of [['[DONE]'], []]) {
++      const chunks = await decodeStream(sse(
++        chatChunk({ reasoning: 'thinking', reasoning_details: [{ type: 'reasoning.text', text: 'thinking', index: 0 }] }),
++        chatChunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'list_items', arguments: '' } }] }),
++        chatChunk({ tool_calls: [{ index: 1, id: 'call_2', type: 'function', function: { name: 'read_file', arguments: '{"path":' } }] }),
++        payload,
++        ...end,
++      ));
++      const errors = chunks.filter(chunk => chunk.error);
++      expect(errors, `end=${end.join()}`).toHaveLength(1);
++      expect(errors[0].error).toMatchObject({ kind: 'stream_error', rawChunk: payload });
++      expect(chunks[chunks.length - 1], `end=${end.join()}`).toBe(errors[0]);
++      // list_items 在 call_2 出现时已按“下一个调用出现”规则发出；错误之后不再补发 read_file 或签名信封。
++      expect(functionCallsOf(chunks).map(call => call.name)).toEqual(['list_items']);
++      expect(chunks.some(chunk => chunk.thoughtSignature)).toBe(false);
++    }
++  });
++
++  it('SSE data 不是 JSON 时（stream_parse_error）同样不再补发', async () => {
++    const chunks = await decodeStream(sse(
++      chatChunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'list_items', arguments: '' } }] }),
++      '{not json',
++      '[DONE]',
++    ));
++    expect(chunks.filter(chunk => chunk.error).map(chunk => chunk.error?.kind)).toEqual(['stream_parse_error']);
++    expect(functionCallsOf(chunks)).toEqual([]);
 +  });
 +
 +  it('非流式 choice 带 finish_reason:"error" 时返回 response_error 而不是空的成功回复', async () => {
@@ -9111,10 +9237,10 @@ index 0000000..85b43d1
 +});
 diff --git a/tests/openai-compatible-stream-tool-calls.test.ts b/tests/openai-compatible-stream-tool-calls.test.ts
 new file mode 100644
-index 0000000..d164463
+index 0000000..ea43edf
 --- /dev/null
 +++ b/tests/openai-compatible-stream-tool-calls.test.ts
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,343 @@
 +import { describe, expect, it, vi } from 'vitest';
 +
 +import { OpenAICompatibleFormat, createOpenAICompatibleProvider } from '../src/index.js';
@@ -9242,11 +9368,38 @@ index 0000000..d164463
 +    expect(chunks[chunks.length - 1].error?.message).toContain('不是 JSON 对象');
 +  });
 +
-+  it('EOF（没有 [DONE]）同样补发', async () => {
++  it('连接干净断开（没有 finish_reason 也没有 [DONE]）时，只收到工具名的调用按参数截断报错，不按 {} 补发', async () => {
++    // Chat Completions 流以 `data: [DONE]` 结束（OpenAI OpenAPI：stream_options.include_usage
++    // “an additional chunk will be streamed before the data: [DONE] message”）。没有 [DONE] 的 EOF
++    // 说明流没有正常结束，只收到工具名分片（arguments:""）的调用可能还没发完参数；按 {} 补发会让
++    // 参数全可选的工具（如 write_file）真的以空参数执行。
++    const chunks = await decodeStream(sse(
++      chatChunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'write_file', arguments: '' } }] }),
++    ));
++    expect(functionCallsOf(chunks)).toEqual([]);
++    const last = chunks[chunks.length - 1];
++    expect(last.error).toMatchObject({ kind: 'decode_error', status: 200 });
++    expect(last.error?.message).toContain('"write_file"');
++    expect(last.error?.message).toContain('call_1');
++    expect(last.error?.message).toContain('参数可能被截断');
++    expect(last.error?.message).toContain('[DONE]');
++  });
++
++  it('连接干净断开时，参数已完整、已在流中发出的调用不受影响，也不追加错误块', async () => {
++    const chunks = await decodeStream(sse(
++      chatChunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] }),
++    ));
++    expect(functionCallsOf(chunks)).toEqual([{ name: 'read_file', args: { path: 'a' }, callId: 'call_1' }]);
++    expect(chunks.some(chunk => chunk.error)).toBe(false);
++  });
++
++  it('收到 [DONE] 后，只收到工具名的调用仍按 {} 补发（无参数调用）', async () => {
 +    const chunks = await decodeStream(sse(
 +      chatChunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'list_items', arguments: '' } }] }),
++      '[DONE]',
 +    ));
 +    expect(functionCallsOf(chunks)).toEqual([{ name: 'list_items', args: {}, callId: 'call_1' }]);
++    expect(chunks.some(chunk => chunk.error)).toBe(false);
 +  });
 +
 +  it('读取中断时流不完整，不补发调用（只返回 stream_read_error）', async () => {
@@ -9379,6 +9532,56 @@ index 0000000..d164463
 +  it('原行为不变：实测非流式响应（arguments 为 "{}" 字符串）解码结果与修复前一致', async () => {
 +    const decoded = new OpenAICompatibleFormat('m').decodeResponse(JSON.parse(readFixture('claude-noargs-nostream.json')));
 +    expect(plain(decoded)).toEqual(readBaseline('claude-noargs-nostream.json'));
++  });
++});
++
++describe('finish_reason=length 截断的工具参数错误标为不可重试', () => {
++  // OpenAI Chat Completions：finish_reason "length" 表示 “the maximum number of tokens specified in the
++  // request was reached”。原样重发会再次在同一输出上限处截断，所以错误带 retryable:false，
++  // 调用方的重试策略不应整包重发。其他原因的解析失败（没有 finish_reason、tool_calls 等）不标记。
++  it('流式：finish_reason=length 的截断错误带 retryable:false', async () => {
++    const chunks = await decodeStream(sse(
++      chatChunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'write_file', arguments: '{"path":"a.txt","content":"hel' } }] }),
++      chatChunk({}, { finish_reason: 'length' }),
++      '[DONE]',
++    ));
++    expect(chunks.at(-1)?.error).toMatchObject({ kind: 'decode_error', retryable: false });
++  });
++
++  it('流式：没有 finish_reason 的截断（流结束时参数仍不完整）不标记 retryable', async () => {
++    const chunks = await decodeStream(sse(
++      chatChunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":' } }] }),
++      '[DONE]',
++    ));
++    expect(chunks.at(-1)?.error?.kind).toBe('decode_error');
++    expect(chunks.at(-1)?.error).not.toHaveProperty('retryable');
++  });
++
++  it('非流式：finish_reason=length 且参数无法解析时 decode_error 带 retryable:false', async () => {
++    const decoded = await decodeJson({
++      id: 'chatcmpl-test',
++      object: 'chat.completion',
++      choices: [{
++        index: 0,
++        message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_a', type: 'function', function: { name: 'write_file', arguments: '{"path":"a' } }] },
++        finish_reason: 'length',
++      }],
++    });
++    expect(decoded.error).toMatchObject({ kind: 'decode_error', retryable: false });
++  });
++
++  it('非流式：其他原因的参数解析失败不标记 retryable', async () => {
++    const decoded = await decodeJson({
++      id: 'chatcmpl-test',
++      object: 'chat.completion',
++      choices: [{
++        index: 0,
++        message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_a', type: 'function', function: { name: 'write_file', arguments: '{"path":"a' } }] },
++        finish_reason: 'tool_calls',
++      }],
++    });
++    expect(decoded.error?.kind).toBe('decode_error');
++    expect(decoded.error).not.toHaveProperty('retryable');
 +  });
 +});
 diff --git a/tests/openai-compatible-tool-result-content.test.ts b/tests/openai-compatible-tool-result-content.test.ts
@@ -9550,10 +9753,10 @@ index 0000000..defc1e5
 +});
 diff --git a/tests/openai-responses-format-fixes.test.ts b/tests/openai-responses-format-fixes.test.ts
 new file mode 100644
-index 0000000..f4d9cb9
+index 0000000..edf48cb
 --- /dev/null
 +++ b/tests/openai-responses-format-fixes.test.ts
-@@ -0,0 +1,1761 @@
+@@ -0,0 +1,1843 @@
 +/**
 + * OpenAI Responses 格式修复（组 B：B4 strict、B5 显式缓存断点、B6 phase、B8 服务端 compaction）。
 + *
@@ -9562,7 +9765,7 @@ index 0000000..f4d9cb9
 + */
 +import { describe, expect, it } from 'vitest';
 +
-+import { OpenAIResponsesFormat } from '../src/index.js';
++import { OpenAIResponsesFormat, processStreamResponse } from '../src/index.js';
 +import type { LLMRequest } from '../src/index.js';
 +
 +// ---- 与 /tmp/api-research/responses/sse.mjs 同形的脚本化 SSE 事件 ----
@@ -10633,6 +10836,17 @@ index 0000000..f4d9cb9
 +  }
 +};
 +
++/** limcode.7：GPT-6 家族非流式解码与其他模型一样，给带 phase 的 message 文本附带 outputItem；其余字段与基线相同。 */
++const ASTRA_DECODE_PHASE_WITH_OUTPUT_ITEM = {
++  ...BASELINE_ASTRA_DECODE_PHASE,
++  content: {
++    ...BASELINE_ASTRA_DECODE_PHASE.content,
++    parts: BASELINE_ASTRA_DECODE_PHASE.content.parts.map((part: any) => (part.text === 'Let me check.'
++      ? { ...part, outputItem: { id: 'msg_1', ordinal: 1, phase: 'commentary' } }
++      : part)),
++  },
++};
++
 +const BASELINE_ASTRA_WS_STREAM_PHASE = [
 +  {},
 +  {},
@@ -10762,8 +10976,9 @@ index 0000000..f4d9cb9
 +    expect(JSON.stringify(http)).toBe(JSON.stringify(BASELINE_ASTRA_STREAM_PHASE));
 +    const ws = decodeAll(new OpenAIResponsesFormat('gpt-6-astra'), sseEvents('resp_w', PHASE_OUTPUT));
 +    expect(JSON.stringify(ws)).toBe(JSON.stringify(BASELINE_ASTRA_WS_STREAM_PHASE));
++    // 非流式解码只多出带 phase 的 message 文本上的 outputItem（GPT-6 家族不再排除），其余与修复前逐字节一致。
 +    const decoded = new OpenAIResponsesFormat('gpt-6-astra', undefined, true).decodeResponse(structuredClone({ id: 'resp_a', output: PHASE_OUTPUT }));
-+    expect(JSON.stringify(decoded)).toBe(JSON.stringify(BASELINE_ASTRA_DECODE_PHASE));
++    expect(JSON.stringify(decoded)).toBe(JSON.stringify(ASTRA_DECODE_PHASE_WITH_OUTPUT_ITEM));
 +  });
 +});
 +
@@ -11294,7 +11509,7 @@ index 0000000..f4d9cb9
 +      const ws = decodeAll(new OpenAIResponsesFormat(model), sseEvents('resp_w', PHASE_OUTPUT));
 +      expect(JSON.stringify(ws), model).toBe(JSON.stringify(BASELINE_ASTRA_WS_STREAM_PHASE));
 +      const decoded = new OpenAIResponsesFormat(model, undefined, true).decodeResponse(structuredClone({ id: 'resp_a', output: PHASE_OUTPUT }));
-+      expect(JSON.stringify(decoded), model).toBe(JSON.stringify(BASELINE_ASTRA_DECODE_PHASE));
++      expect(JSON.stringify(decoded), model).toBe(JSON.stringify(ASTRA_DECODE_PHASE_WITH_OUTPUT_ITEM));
 +    }
 +  });
 +
@@ -11313,6 +11528,76 @@ index 0000000..f4d9cb9
 +      expect(JSON.stringify(withoutPhase), model).toBe(JSON.stringify(BASELINE_STREAM_NO_PHASE));
 +      expect(chunks.filter(chunk => chunk.outputItem).map(chunk => chunk.outputItem.phase), model).toEqual(['commentary', 'commentary']);
 +    }
++  });
++});
++
++describe('非流式：GPT-6 家族的 assistant message 与其他模型一样保留 phase', () => {
++  // 依据：OpenAI Responses 参考 https://developers.openai.com/api/reference/resources/responses
++  // （phase：“preserve and resend phase on all assistant messages — dropping it can degrade performance”），
++  // 以及 https://developers.openai.com/api/docs/guides/reasoning#phase-parameter。
++  // 非流式没有原生事件和 completedContents，phase 只能随文本 part 的 outputItem 带出。
++  const MODELS = ['gpt-6-sol', 'gpt-6-astra', 'gpt-6-luna-2026-06-01', 'gpt-5.5', 'gpt-5.6-sol'];
++
++  it('decodeResponse 给带 phase 的 message 文本附带 outputItem，与模型无关', () => {
++    for (const model of MODELS) {
++      for (const native of [true, false]) {
++        const decoded = new OpenAIResponsesFormat(model, undefined, native).decodeResponse(structuredClone({ id: 'resp_1', output: PHASE_OUTPUT }));
++        expect(decoded.content.parts[1], `${model} native=${native}`).toEqual({
++          text: 'Let me check.',
++          outputItem: { id: 'msg_1', ordinal: 1, phase: 'commentary' },
++        });
++      }
++    }
++  });
++
++  it('解码结果回编时带回原 phase', () => {
++    for (const model of MODELS) {
++      const format = new OpenAIResponsesFormat(model, undefined, true);
++      const decoded = format.decodeResponse(structuredClone({ id: 'resp_1', output: PHASE_OUTPUT }));
++      const body = format.encodeRequest({
++        contents: [
++          { role: 'user', parts: [{ text: 'go' }] },
++          decoded.content,
++          { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { ok: 1 }, callId: 'call_1' } }] },
++        ],
++      }) as any;
++      const assistantMessages = body.input.filter((item: any) => item.type === 'message' && item.role === 'assistant');
++      expect(assistantMessages, model).toEqual([
++        { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Let me check.' }] },
++      ]);
++    }
++  });
++});
++
++describe('response.incomplete 在 HTTP/SSE 上按错误上报', () => {
++  // response 层（isProviderErrorPayload）把事件名或 type 含 incomplete 的 SSE 事件当作上游错误，
++  // 在格式适配器之前就返回 stream_error，所以原生解码里为 response.incomplete 产出 nativeEvent 的分支
++  // 走不到，已删除。这与 LimCode WebSocket 原生会话一致：只有 WS 上的 steered 边界不算失败，其余
++  // incomplete（如 max_output_tokens）都按失败处理。
++  const incompleteEvent = {
++    type: 'response.incomplete',
++    response: {
++      id: 'resp_inc', object: 'response', status: 'incomplete',
++      incomplete_details: { reason: 'max_output_tokens' },
++      output: [msg('1', 'Partial answer')],
++      usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
++    },
++  };
++
++  it('原生解码的 GPT-6 家族 SSE 流：response.incomplete 只产生一个 stream_error，没有 response.incomplete 原生事件', async () => {
++    const events = sseEvents('resp_inc', [msg('1', 'Partial answer')]).slice(0, -1);
++    const body = [...events, incompleteEvent].map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('');
++    const res = new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
++    const chunks: any[] = [];
++    for await (const chunk of processStreamResponse(res, new OpenAIResponsesFormat('gpt-6-sol', undefined, true))) chunks.push(chunk);
++    expect(chunks.filter(chunk => chunk.error).map(chunk => chunk.error.kind)).toEqual(['stream_error']);
++    expect(chunks.at(-1).error.event).toBe('response.incomplete');
++    expect(chunks.some(chunk => chunk.nativeEvent?.type === 'response.incomplete')).toBe(false);
++  });
++
++  it('格式适配器本身不再为 response.incomplete 产出原生事件', () => {
++    const format = new OpenAIResponsesFormat('gpt-6-astra', undefined, true);
++    expect(format.decodeStreamChunk(structuredClone(incompleteEvent), format.createStreamState())).toEqual({});
 +  });
 +});
 diff --git a/tests/request-body-tools-normalization.test.ts b/tests/request-body-tools-normalization.test.ts

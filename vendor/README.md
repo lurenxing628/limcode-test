@@ -4,13 +4,13 @@
 
 - 上游：`https://github.com/Lianues/unified-llm-provider`，许可证 MIT。
 - 基础发布：0.1.37，源码提交 `7857da99d5faec0865b8a402eb9c9d828f87b114`（上游 main，已含 schema 属性名误删、tools 非数组两个修复）。
-- 本地构建：0.1.37-limcode.6，内容如下。
+- 本地构建：0.1.37-limcode.7，内容如下。
 - 完整源码分支已发布在 https://github.com/lurenxing628/unified-llm-provider/tree/limcode/provider-fixes （本目录的补丁即该分支相对基础提交的差异）。
 
 limcode.2 带来的内容（保持不变）：
 - 只读观察接口。
 - function 工具声明、function_call 输入与解码 item 上的 `async` 标记原样透传（Astra 异步工具）。
-- 可选的原生解码模式：由 provider 内部构造时开启，LimCode WebSocket 会话不开启。开启时，精确匹配的 Astra 模型在 SSE 解码时附加 `nativeEvent`（response.created/completed/incomplete）和终端 `completedContents`。
+- 可选的原生解码模式：由 provider 内部构造时开启，LimCode WebSocket 会话不开启。开启时，精确匹配的 Astra 模型在 SSE 解码时附加 `nativeEvent`（response.created/completed）和终端 `completedContents`；SSE 上的 `response.incomplete` 按错误上报，不产出原生事件（limcode.7 更正，见下）。
 - Astra 显式缓存断点：把顶层 instructions 转为带 `prompt_cache_breakpoint` 的 developer 输入消息。
 
 limcode.3 新增的协议修复（每项在源码注释和测试里写明了官方依据）：
@@ -45,6 +45,13 @@ limcode.5 新增 Claude 消息中段 system 消息（依据 Anthropic 官方 mid
 limcode.6 新增 Responses 显式缓存下工具结果承载断点（依据 OpenAI 官方提示缓存指南与 WebSocket 模式指南）：
 - 新的可选项 `breakpoints.toolOutputs`：只在显式缓存模式、且模型支持显式缓存时生效，把字符串形式的 `function_call_output` 改为 `input_text` 数组，最新的工具结果因此能带断点。
 - 只有 LimCode 的 WebSocket 续接链开启；HTTP 与未开启时编码逐字节不变。
+
+limcode.7 新增的修复（每项在源码注释和测试里写明了官方依据）：
+- Responses：GPT-6 家族的非流式回复也保留 assistant `phase`。非流式没有原生事件和 `completedContents`，以前对 GPT-6 家族跳过了 phase，回放时丢失。依据 OpenAI Responses API 参考 `phase` 字段：“preserve and resend phase on all assistant messages — dropping it can degrade performance”。
+- OpenAI 兼容格式：只有收到 `data: [DONE]` 时，才把只收到工具名（`arguments:""`）的调用按 `{}` 补发。连接在没有 finish_reason 和 [DONE] 的情况下结束时，这种调用按参数截断报解码错误，不再以空参数发出（参数全可选的工具会真的执行）。依据 OpenAI OpenAPI 对 Chat Completions 流的说明：`stream_options.include_usage` “an additional chunk will be streamed before the `data: [DONE]` message”，即流以 `data: [DONE]` 结束。
+- 流里已经发出过错误块（上游错误事件、非 JSON 数据、解码失败、格式适配器自己的错误块）时，不再调用 `finalizeStream`，不会在错误之后补发待定的工具调用、截断错误或签名信封。依据 OpenRouter errors-and-debugging：中途错误块同时带顶层 `error` 和 `finish_reason: "error"`，“The stream is terminated after this event”。
+- Responses：删除走不到的 `response.incomplete` 原生解码分支。response 层把事件名或 type 含 incomplete 的 SSE 事件当作上游错误，在格式适配器之前就返回 `stream_error`；保留这一行为，与 LimCode WebSocket 原生会话一致（只有 WebSocket 上的 steered 边界不算失败，其余 incomplete 按失败处理）。OpenAI 对该事件的定义是 “emitted when a response finishes as incomplete”。
+- OpenAI 兼容格式：`finish_reason:"length"` 截断造成的工具参数错误（流式和非流式）带 `retryable:false`。依据 Chat Completions `finish_reason`：“`length` if the maximum number of tokens specified in the request was reached”，原样重发会在同一上限处再次截断。
 
 文件与命令：
 - `unified-llm-provider.patch`：相对基础提交的完整源码与测试差异，不直接作用于依赖安装目录。
