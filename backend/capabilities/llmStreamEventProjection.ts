@@ -210,7 +210,7 @@ export function emitUnifiedResponse(requestId: string, response: UnifiedLLMRespo
   const parts = response.content?.parts ?? [];
   // Provider items (the compaction item precedes the other output items) go first.
   emitProviderContextParts(requestId, parts, emit);
-  if (parts.some(isSignedVisibleTextPart)) {
+  if (parts.some(isSignedVisibleTextPart) || parts.some(isOutputItemVisibleTextPart)) {
     emitUnifiedResponsePartsInOrder(requestId, parts, emit);
     return;
   }
@@ -230,19 +230,39 @@ export function emitUnifiedResponse(requestId: string, response: UnifiedLLMRespo
  * ... in the exact part where it was received"; https://ai.google.dev/gemini-api/docs/thought-signatures).
  * Its parts are emitted in response order, so the signed text part keeps both its signature and its
  * place after the thoughts. Replies without such a part keep the emission above unchanged.
+ *
+ * The same in-order emission serves a reply whose visible text carries an output item (a Responses
+ * assistant message with `phase`, which must be preserved and resent on every assistant message:
+ * https://developers.openai.com/api/reference/resources/responses). Consecutive text of one output
+ * item becomes one group whose Deltas carry that item, so each message is stored, and replayed, as its
+ * own item with its own phase instead of being merged into one untagged text.
  */
 function emitUnifiedResponsePartsInOrder(requestId: string, parts: readonly UnifiedPart[], emit: Emit): void {
   let callIndex = 0;
+  let textGroup: UnifiedPart[] = [];
+  let textGroupItem: ModelOutputItemReference | undefined;
+  const flushTextGroup = (): void => {
+    if (textGroup.length > 0) emitVisibleTextParts(requestId, textGroup, emit, textGroupItem);
+    textGroup = [];
+    textGroupItem = undefined;
+  };
   for (const part of parts) {
+    if (isUnifiedVisibleTextPart(part)) {
+      const outputItem = modelOutputItemFromValue(part);
+      if (textGroup.length > 0 && outputItem?.id !== textGroupItem?.id) flushTextGroup();
+      textGroup.push(part);
+      textGroupItem = outputItem;
+      continue;
+    }
+    flushTextGroup();
     if (isUnifiedThoughtTextPart(part)) {
       emitCompletedThoughtPart(requestId, part, emit);
-    } else if (isUnifiedVisibleTextPart(part)) {
-      emitVisibleTextParts(requestId, [part], emit);
     } else if (isUnifiedFunctionCallPart(part)) {
       emit({ type: LlmEventType.ToolCall, payload: { requestId, calls: [completedToolCall(part, callIndex)] } });
       callIndex += 1;
     }
   }
+  flushTextGroup();
 }
 
 function emitCompletedThoughtPart(requestId: string, part: UnifiedPart, emit: Emit): void {
@@ -563,6 +583,11 @@ function isUnifiedVisibleTextPart(part: UnifiedPart): boolean {
 /** A visible text part that arrived with a signature: only Gemini returns these today. */
 function isSignedVisibleTextPart(part: UnifiedPart): boolean {
   return isUnifiedVisibleTextPart(part) && !!thoughtSignatureFromPart(part);
+}
+
+/** A visible text part tagged with its output item (a Responses assistant message with `phase`). */
+function isOutputItemVisibleTextPart(part: UnifiedPart): boolean {
+  return isUnifiedVisibleTextPart(part) && modelOutputItemFromValue(part) !== undefined;
 }
 
 function hasSignedVisibleTextPart(chunk: UnifiedLLMStreamChunk): boolean {

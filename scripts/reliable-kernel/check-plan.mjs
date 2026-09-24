@@ -144,6 +144,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/gemini-provider-adaptation.test.mjs',
   'tests/reliable-kernel/gemini-thought-signature-runtime.test.mjs',
   'tests/reliable-kernel/provider-vendor-check.test.mjs',
+  'tests/reliable-kernel/unified-provider-regressions.test.mjs',
   'tests/reliable-kernel/provider-websocket-policy.test.mjs',
   'tests/reliable-kernel/session-thinking-runtime.test.mjs',
   'tests/reliable-kernel/session-thinking-control.test.mjs',
