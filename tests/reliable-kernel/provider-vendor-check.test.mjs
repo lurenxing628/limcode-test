@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { createRequire } from 'node:module';
 
 // 固定模型接入库（vendor/unified-llm-provider-*.tgz）的一致性检查。
 // `build-provider-debug-fork.mjs --check` 在每次 compile 前运行：除了 vendor 目录里的补丁与安装包摘要，
@@ -95,5 +96,45 @@ test('package.json 或 package-lock.json 没有指向 vendor 里的安装包时 
     const result = check(fixture(mutate));
     assert.notEqual(result.status, 0, label);
     assert.match(result.output, /package(?:-lock)?\.json/, label);
+  }
+});
+
+// ---- 显式提示缓存的模型清单：扩展与接入库各有一份，必须一致 ----
+
+const require = createRequire(import.meta.url);
+const { supportsOpenAIExplicitPromptCache } = require(path.join(root, 'dist/extension/shared/openAIResponsesCapabilities.js'));
+const unified = await import('unified-llm-provider');
+
+function setLiteral(source, name) {
+  const match = new RegExp(`${name}(?::[^=]+)?\\s*=\\s*new Set\\(\\[([^\\]]*)\\]\\)`).exec(source);
+  assert.ok(match, `找不到 ${name} 的清单`);
+  return [...match[1].matchAll(/'([^']+)'/g)].map((item) => item[1]).sort();
+}
+
+/** 接入库对这个模型是否按显式缓存编码：instructions 转为带断点的 developer 消息。 */
+function libraryUsesExplicitCache(model) {
+  const body = new unified.OpenAIResponsesFormat(model, { enabled: true, mode: 'explicit' }).encodeRequest({
+    systemInstruction: { parts: [{ text: 'You are helpful.' }] },
+    contents: [{ role: 'user', parts: [{ text: 'hi' }] }]
+  }, true);
+  return body.instructions === undefined && body.input[0]?.role === 'developer';
+}
+
+test('显式提示缓存模型清单：shared/openAIResponsesCapabilities.ts 与接入库一致', () => {
+  // 显式缓存只支持 “GPT-5.6 and later”（https://developers.openai.com/api/docs/guides/prompt-caching）；
+  // 扩展决定是否发 prompt_cache_options，接入库决定是否把 instructions 转成带断点的 developer 消息，两份清单漂移
+  // 会让一边开启、另一边不开启。
+  const extension = setLiteral(fs.readFileSync(path.join(root, 'shared/openAIResponsesCapabilities.ts'), 'utf8'), 'OPENAI_GPT56_AND_LATER_MODELS');
+  const library = setLiteral(fs.readFileSync(path.join(root, 'node_modules/unified-llm-provider/dist/llm/formats/openai-responses.js'), 'utf8'), 'LIMCODE_EXPLICIT_PROMPT_CACHE_MODELS');
+  assert.deepEqual(extension, library);
+
+  const candidates = [
+    ...library,
+    ...library.map((model) => `${model}-2026-05-01`),
+    ...library.map((model) => model.toUpperCase()),
+    'gpt-5.5', 'gpt-5.4', 'gpt-5', 'gpt-6', 'gpt-6-sol-xhigh', '[az]gpt-5.6-sol', 'gpt-6-astra-pro', 'gpt-5.6-sol-20260501'
+  ];
+  for (const model of candidates) {
+    assert.equal(supportsOpenAIExplicitPromptCache(model), libraryUsesExplicitCache(model), model);
   }
 });

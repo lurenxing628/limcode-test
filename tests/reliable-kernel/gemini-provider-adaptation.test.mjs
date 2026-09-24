@@ -228,35 +228,31 @@ test('E0 dummy signatures for unsigned history are only added for Gemini models 
   }
 });
 
-test('E0 calls flushed by an end-of-stream finalizeStream hook get their signatures from the same tracker', () => {
-  // The vendored package has no finalizeStream yet; this stands in for the one that flushes calls
-  // still pending when a gateway ends the stream without finish_reason.
+test('E0 calls flushed by the end-of-stream finalizeStream hook get their signatures from the same tracker', async () => {
+  // The package's OpenAICompatibleFormat.finalizeStream flushes calls still pending when a gateway ends
+  // the stream with [DONE] but without finish_reason. The wrapper keeps the same signature tracker for
+  // them; the stream goes through the package's own SSE loop, which tells finalizeStream it saw [DONE].
   const model = '[v]gemini-3.5-flash';
-  const format = new unified.OpenAICompatibleFormat(model);
-  format.finalizeStream = (state) => {
-    const pending = [...state.pendingToolCalls.values()].filter((entry) => !entry.emitted && entry.name);
-    for (const entry of pending) entry.emitted = true;
-    const functionCalls = pending.map((entry) => ({ functionCall: { name: entry.name, args: {}, callId: entry.callId } }));
-    return functionCalls.length > 0 ? { functionCalls, partsDelta: [...functionCalls] } : undefined;
+  const decode = async (provider, deltas) => {
+    const chunks = [];
+    for await (const chunk of unified.processStreamResponse(sse(deltas), provider.format)) chunks.push(chunk);
+    return chunks;
   };
-  const provider = installGeminiOpenAICompatibleThoughtSignatures({ format }, 'openai-compatible', model);
-  const state = provider.format.createStreamState();
-  const emitted = [
+  const chunks = await decode(openAICompatibleGemini(model), [
     delta({ tool_calls: [{ index: 0, id: 'call_a', type: 'function', function: { name: 'list_items', arguments: '' }, extra_content: { google: { thoughtSignature: 'SIG_A' } } }] }),
     delta({ tool_calls: [{ index: 1, id: 'call_b', type: 'function', function: { name: 'list_items', arguments: '' } }] })
-  ].flatMap((chunk) => provider.format.decodeStreamChunk(chunk, state).functionCalls ?? []);
-  emitted.push(...(provider.format.finalizeStream(state)?.functionCalls ?? []));
-  assert.deepEqual(emitted.map((part) => [part.functionCall.callId, part.thoughtSignatures?.gemini]), [
+  ]);
+  assert.deepEqual(chunks.flatMap((chunk) => chunk.functionCalls ?? []).map((part) => [part.functionCall.callId, part.thoughtSignatures?.gemini]), [
     ['call_a', 'SIG_A'],
     ['call_b', undefined]
   ]);
+  // call_b has no later call to close it and no finish_reason: only the end-of-stream flush emits it.
+  assert.deepEqual(chunks.at(-1).functionCalls.map((part) => part.functionCall.callId), ['call_b']);
 
-  const onlyAtFinalize = installGeminiOpenAICompatibleThoughtSignatures({
-    format: Object.assign(new unified.OpenAICompatibleFormat(model), { finalizeStream: format.finalizeStream })
-  }, 'openai-compatible', model);
-  const finalizeState = onlyAtFinalize.format.createStreamState();
-  onlyAtFinalize.format.decodeStreamChunk(delta({ tool_calls: [{ index: 0, id: 'call_only', type: 'function', function: { name: 'list_items', arguments: '' }, extra_content: { google: { thought_signature: 'SIG_ONLY' } } }] }), finalizeState);
-  assert.equal(onlyAtFinalize.format.finalizeStream(finalizeState).functionCalls[0].thoughtSignatures.gemini, 'SIG_ONLY');
+  const onlyAtFinalize = await decode(openAICompatibleGemini(model), [
+    delta({ tool_calls: [{ index: 0, id: 'call_only', type: 'function', function: { name: 'list_items', arguments: '' }, extra_content: { google: { thought_signature: 'SIG_ONLY' } } }] })
+  ]);
+  assert.equal(onlyAtFinalize.at(-1).functionCalls[0].thoughtSignatures.gemini, 'SIG_ONLY');
 });
 
 test('E0 no dummy is injected next to OpenRouter reasoning_details, which carry the Gemini signature', () => {
