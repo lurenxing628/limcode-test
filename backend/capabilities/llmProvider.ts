@@ -18,7 +18,10 @@ import { installProviderCompatibility } from './geminiProviderAdaptation';
 import { adaptClaudeThinkingForFamily, claudeThinkingFamilyProfile, type ClaudeThinkingFamilyProfile } from './claudeThinkingAdaptation';
 import {
   adaptGpt6NoneCapableGenerationConfig,
+  adaptGpt6RequestBodyReasoningEffort,
   adaptGpt6SamplingForReasoningEffort,
+  GPT6_ASTRA_EFFORT_MAPPING,
+  GPT6_NONE_CAPABLE_EFFORT_MAPPING,
   isGpt6NoneCapableParameterTarget
 } from './gpt6ParameterAdaptation';
 import {
@@ -5233,7 +5236,14 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
 function adaptGpt6NoneCapableParameterSettings(settings: LlmProviderConfigRecord): LlmProviderConfigRecord {
   if (!isGpt6NoneCapableParameterTarget(settings)) return settings;
   const generationConfig = adaptGpt6NoneCapableGenerationConfig(settings.generationConfig);
-  return generationConfig === settings.generationConfig || !generationConfig ? settings : { ...settings, generationConfig };
+  // 渠道 requestBody 里直接写的 minimal 同样提升为 low（原样发出会被官方拒绝）。
+  const requestBody = adaptGpt6RequestBodyReasoningEffort(settings.requestBody, GPT6_NONE_CAPABLE_EFFORT_MAPPING);
+  if ((generationConfig === settings.generationConfig || !generationConfig) && requestBody === settings.requestBody) return settings;
+  return {
+    ...settings,
+    ...(generationConfig && generationConfig !== settings.generationConfig ? { generationConfig } : {}),
+    ...(requestBody !== settings.requestBody ? { requestBody } : {})
+  };
 }
 
 /** Astra 模型不支持的请求参数；reasoning none/minimal 也不受支持。 */
@@ -5323,6 +5333,17 @@ function adaptAstraRequestBody(
   provider: LlmProviderKind
 ): LlmRequestBodyRecord | undefined {
   if (!requestBody) return requestBody;
+  // requestBody 里直接写的 none / minimal 同样提升为 low（Astra 不支持这两档）。
+  return adaptAstraUnsupportedRequestBodyKeys(
+    adaptGpt6RequestBodyReasoningEffort(requestBody, GPT6_ASTRA_EFFORT_MAPPING) ?? requestBody,
+    provider
+  );
+}
+
+function adaptAstraUnsupportedRequestBodyKeys(
+  requestBody: LlmRequestBodyRecord,
+  provider: LlmProviderKind
+): LlmRequestBodyRecord {
   const entries = Object.entries(requestBody).filter(([key]) => !ASTRA_UNSUPPORTED_REQUEST_BODY_KEYS[key]);
   // include 过滤只属于 Responses；Chat Completions 没有该字段，原样保留用户配置。
   const include = provider === 'openai-responses' ? requestBody.include : undefined;

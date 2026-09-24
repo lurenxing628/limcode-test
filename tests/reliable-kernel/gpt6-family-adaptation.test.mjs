@@ -350,6 +350,38 @@ test('Sol / Luna：按最终请求里生效的强度判断（requestBody 覆盖�
   assert.equal('top_p' in updated, false);
 });
 
+test('渠道 requestBody 里直接写的推理强度同样按 GPT-6 规则适配（Sol / Luna minimal → low；Astra none / minimal → low）', async () => {
+  // Using GPT-6：“GPT-6 Sol and Luna support none. If your existing request uses minimal, start with low.”；
+  // Astra 不支持 none（用 low）。requestBody 原样发出这些值会被官方 400。
+  const cases = [
+    ['gpt-6-sol', 'minimal', 'low'], ['gpt-6-luna', 'minimal', 'low'], ['gpt-6-sol', 'none', 'none'], ['gpt-6-luna', 'high', 'high'],
+    ['gpt-6-astra', 'minimal', 'low'], ['gpt-6-astra', 'none', 'low'], ['gpt-6-astra', 'high', 'high']
+  ];
+  for (const [model, written, expected] of cases) {
+    const responses = await parameterDryRun('openai-responses', model, undefined, {
+      settings: { requestBody: { reasoning: { effort: written, summary: 'auto' }, other: 'keep' } }
+    });
+    assert.deepEqual(responses.reasoning, { effort: expected, summary: 'auto' }, `responses:${model}:${written}`);
+    assert.equal(responses.other, 'keep');
+    const chat = await parameterDryRun('openai-compatible', model, undefined, {
+      settings: { requestBody: { reasoning_effort: written, other: 'keep' } }
+    });
+    assert.equal(chat.reasoning_effort, expected, `chat:${model}:${written}`);
+    assert.equal(chat.other, 'keep');
+  }
+  // 冻结快照里的 requestBody 同样适配。
+  const frozen = await parameterDryRun('openai-responses', 'gpt-6-sol', undefined, {
+    settings: { requestBody: { reasoning: { effort: 'high' } } },
+    request: { settingsSnapshot: { generationConfig: { maxOutputTokens: 512 }, requestBody: { reasoning: { effort: 'minimal' } } } }
+  });
+  assert.equal(frozen.reasoning.effort, 'low');
+  // 其他模型原样发送。
+  for (const model of ['gpt-5.5', 'gpt-5.6', '[az]gpt-6-luna']) {
+    const other = await parameterDryRun('openai-responses', model, undefined, { settings: { requestBody: { reasoning: { effort: 'minimal' } } } });
+    assert.equal(other.reasoning.effort, 'minimal', model);
+  }
+});
+
 test('Astra 与其他模型的参数适配不变', async () => {
   // Astra：none/minimal → low，始终去掉采样参数（原行为）。
   for (const provider of ['openai-responses', 'openai-compatible']) {

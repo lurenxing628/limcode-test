@@ -7,7 +7,8 @@
  *   also remove `logprobs`. For Responses, remove `message.output_text.logprobs` from `include`.”
  * 模型页（models/gpt-6-sol.md、models/gpt-6-luna.md）：effort 默认 `medium`，所以没有设置强度时同样要去掉。
  *
- * `minimal → low` 在设置解析与冻结快照层完成（与 Astra 相同位置）；采样参数按线上请求体里实际生效的强度
+ * `minimal → low` 在设置解析与冻结快照层完成（与 Astra 相同位置，generationConfig 与渠道 requestBody 里直接写的强度
+ * 都适配）；采样参数按线上请求体里实际生效的强度
  * 决定：请求级 effort（缺省按 medium）以及 Responses input 里 configuration_update 选择的 effort，只要有一个
  * 不是 none 就去掉。这样 requestBody 覆盖、会话思考覆盖、冻结配方与原生动态推理都按最终请求判断。
  */
@@ -35,6 +36,36 @@ export function adaptGpt6NoneCapableGenerationConfig(
   const thinkingConfig = generationConfig?.thinkingConfig;
   if (!generationConfig || !thinkingConfig || thinkingConfig.thinkingLevel !== 'minimal') return generationConfig;
   return { ...generationConfig, thinkingConfig: { ...thinkingConfig, thinkingLevel: 'low' } };
+}
+
+/** Sol / Luna 支持 none，只把 minimal 提升为 low。 */
+export const GPT6_NONE_CAPABLE_EFFORT_MAPPING: Readonly<Record<string, string>> = { minimal: 'low' };
+/** Astra 不支持 none 与 minimal，都提升为 low。 */
+export const GPT6_ASTRA_EFFORT_MAPPING: Readonly<Record<string, string>> = { none: 'low', minimal: 'low' };
+
+/**
+ * 渠道 requestBody 里直接写的推理强度按同样的规则适配：Responses 的 `reasoning.effort` 与 Chat Completions 的
+ * `reasoning_effort`（两者都在时各自适配，不新增字段）。没有改动时返回同一引用。
+ */
+export function adaptGpt6RequestBodyReasoningEffort<T extends Record<string, unknown>>(
+  requestBody: T | undefined,
+  mapping: Readonly<Record<string, string>>
+): T | undefined {
+  if (!requestBody) return requestBody;
+  const mapped = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const target = mapping[value.trim().toLowerCase()];
+    return target !== undefined && target !== value ? target : undefined;
+  };
+  const reasoning = isRecord(requestBody.reasoning) ? requestBody.reasoning : undefined;
+  const reasoningEffort = mapped(reasoning?.effort);
+  const chatEffort = mapped(requestBody.reasoning_effort);
+  if (reasoningEffort === undefined && chatEffort === undefined) return requestBody;
+  return {
+    ...requestBody,
+    ...(reasoning && reasoningEffort !== undefined ? { reasoning: { ...reasoning, effort: reasoningEffort } } : {}),
+    ...(chatEffort !== undefined ? { reasoning_effort: chatEffort } : {})
+  };
 }
 
 /**
