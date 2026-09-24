@@ -190,6 +190,7 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - `provider_default` 必须清除从普通聊天 requestBody 继承的推理控制，不能只从 generationConfig 删除 thinkingLevel 后又被原生 body 覆盖。高级摘要参数仅作用于摘要目的，不改变普通聊天模型的参数。
 - 模型目录条目的 `capabilitySnapshot` 是有界、无凭据的能力证据。后端归一化、前端 sanitize/serialize、保存和快照均保留它；证据必须绑定渠道 ID、精确模型、端点指纹和 transport。修改身份后不复用旧证据。
 - 显式能力探测复用模型列表获取/快照通道的 `probeNative` / `purpose: capability_probe`。只在用户点击“验证原生端点（会调用一次）”时执行；可能产生费用，只发送合成内容，不发送当前对话或附件。普通保存不触发探测，重复进行中的同目标探测由宿主合并。
+- “测试这个模型”（OpenAI 兼容思考参数）复用同一通道的 `probeThinking` / `purpose: thinking_probe`。只在用户点击并确认后执行，只对 OpenAI 兼容渠道；向一个模型发最多 9 次很短的合成请求（不带当前对话和渠道请求体，看到第一段回复就断开），结果写进该模型的 `capabilitySnapshot`（`source: verified_probe`，带 `reasoning.wireFormat`，同样绑定渠道 ID、模型和端点指纹）。失败按请求 id 回到设置页显示在该模型旁，不当成获取 LLM 列表失败；同一渠道、地址、模型与修改时间的进行中测试由宿主合并。
 - Models API 能力、文档登记、在线探测和用户显式信任分开显示。官方文档中的 documented 不等于 verified；界面不能仅按 provider 字符串启用原生压缩，也不能把缓存当作压缩。
 - 高级摘要 JSON 由 `LlmSummaryGenerationEditor` 校验后交给 store 保存；非法字段、非法预算以及已知模型不支持的显式思考模式不得保存。保存仍使用原有 revision、延迟合并与 flush 机制。
 - 普通模型参数编辑器按能力过滤可添加选项；已有但不支持的配置保留可见供用户检查或删除，不偷偷换成 high 或另一档。未知兼容端点的手工参数要保留未验证语义。
