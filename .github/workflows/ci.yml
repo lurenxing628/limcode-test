@@ -50,7 +50,8 @@ jobs:
   linux-reliability-tests:
     name: Linux reliability tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Serial critical tests have their own 30-minute guard; allow setup, compile and browser time.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v6
