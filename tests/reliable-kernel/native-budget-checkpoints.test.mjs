@@ -546,7 +546,9 @@ test('105 native tools checkpoint complete batches into successive requests of O
       now: () => new Date().toISOString()
     });
     await recovered.reconcile();
-    recovered.bindStream({ attemptSeq: '2', socketGeneration: '2' });
+    assert.throws(() => recovered.bindStream({ attemptSeq: '2', socketGeneration: '2' }),
+      /durable chain progress/, 'a new Attempt never replays the frozen input of a chain with progress');
+    recovered.bindStream({ attemptSeq: '1', socketGeneration: '2' });
     assert.equal(recovered.nextGlobalCallOrdinal('response-0', 'call-0-0'), 0,
       'a re-streamed old call retains its original ToolCall identity');
     assert.equal(recovered.nextGlobalCallOrdinal('response-new', 'call-new'), 5,

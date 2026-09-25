@@ -306,6 +306,157 @@ const acceptSteer = async ({ command, emit, live }) => {
     submissionId: command.submissionId, steerId: `provider-${command.submissionId}` });
 };
 
+test('a transient failure after a tool executed never retries the frozen input; the Turn continues from Context', { timeout: 30000 }, async () => {
+  await withNativeKernel({
+    retryPolicy,
+    async script({ round, request, emit, responseId, app }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'call-A', 0, { async: true });
+        await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'call-A settled');
+        await delay(30);
+        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture socket reset after output', true);
+      }
+      if (request.attemptSeq !== '1') {
+        // A replayed frozen input makes the model re-issue the executed tool under a new identity.
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'call-B', 0, { async: true });
+        await emitFinalText(emit, `${responseId}-final`, 'replayed');
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued from Context');
+    }
+  }, async ({ app, requests, executions, startTurn, driveUntilSettled }) => {
+    const turn = await startTurn('transient-after-tool', 'Run the probe.');
+    const outcome = await driveUntilSettled(turn);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
+    assert.deepEqual(executions, ['call-A'], 'the external effect runs exactly once; no re-issued call');
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests.map(request => request.attemptSeq), ['1', '1'], 'no second Attempt re-sent the frozen input');
+    assert.notEqual(requests[1].modelRequestId, requests[0].modelRequestId);
+    const modelRequests = (await rows(app, 'ModelRequest', { turn_id: turn.turnId }))
+      .sort((left, right) => Number(left.request_seq) - Number(right.request_seq));
+    assert.equal(modelRequests[0].terminal_state, 'native_chain_rebased');
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
+  });
+});
+
+test('a transient failure without chain progress still uses the frozen retry policy', { timeout: 30000 }, async () => {
+  await withNativeKernel({
+    retryPolicy,
+    async script({ round, request, emit, responseId }) {
+      if (round === 0) throw new kernel.ProviderTransientError('connection_interrupted', 'reset before any output', true);
+      assert.equal(request.attemptSeq, '2');
+      await emitFinalText(emit, responseId, 'answer after retry');
+    }
+  }, async ({ app, requests, startTurn, drive }) => {
+    const turn = await startTurn('transient-before-progress', 'Say hello.');
+    const outcome = await drive(turn);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].modelRequestId, requests[0].modelRequestId, 'the same request is retried');
+  });
+});
+
+test('a transient failure while an admitted tool runs parks the Turn; re-drives never dispatch it twice', { timeout: 30000 }, async () => {
+  await withNativeKernel({
+    retryPolicy,
+    async script({ round, request, emit, responseId }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'call-A', 0, { async: true });
+        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture socket reset while the tool runs', true);
+      }
+      if (request.attemptSeq !== '1') {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'call-B', 0, { async: true });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued after the tool settled');
+    }
+  }, async ({ app, requests, executions, duplicates, gates, startTurn, drive }) => {
+    gates.set('call-A', deferred());
+    const turn = await startTurn('transient-while-running', 'Run the slow probe.');
+    const first = await drive(turn);
+    assert.equal(first.terminalStatus, 'waiting', 'the running admitted tool is neither cancelled nor abandoned');
+    assert.equal(requests.length, 1, 'nothing is re-sent while the admitted tool is still running');
+    assert.deepEqual(executions, ['call-A']);
+    // The runner re-drives a waiting Turn whenever its facts change; the tool is still running.
+    const second = await drive(turn);
+    assert.equal(second.terminalStatus, 'waiting');
+    assert.equal(requests.length, 1, 'a re-drive never freezes a request with the running call unresolved');
+    assert.deepEqual(duplicates, [], 'the re-drive attaches to the running execution instead of dispatching again');
+    gates.get('call-A').resolve();
+    await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'call-A settled');
+    let outcome = await drive(turn);
+    for (let index = 0; outcome.terminalStatus === 'waiting' && index < 10; index += 1) {
+      await delay(20);
+      outcome = await drive(turn);
+    }
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
+    assert.deepEqual(executions, ['call-A']);
+    assert.deepEqual(duplicates, []);
+    const [result] = await rows(app, 'ToolModelResult');
+    const [outcomeRow] = await rows(app, 'ToolOutcome', { tool_call_id: result.tool_call_id });
+    assert.equal(outcomeRow.status, 'succeeded', 'the real result is the call\'s only outcome');
+    assert.equal(requests.length, 2);
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+  });
+});
+
+test('a Host lost during a transient retry delay still rebases a chain with durable progress', { timeout: 15000 }, async () => {
+  await withNativeKernel({
+    retryPolicy: { enabled: true, maxRetries: 2, retryDelayMs: 20000 },
+    async script({ round, controls, emit, responseId, app }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'call-A', 0, { async: true });
+        await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'call-A settled');
+        await new Promise(resolve => controls.signal.addEventListener('abort', resolve, { once: true }));
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued after the retry-delay handoff');
+    }
+  }, async (state) => {
+    const { requests, executions, startTurn, drive, reopen, recover } = state;
+    const turn = await startTurn('retrying-host-loss', 'Run the probe.');
+    const driving = drive(turn);
+    void driving.catch(() => undefined);
+    await waitFor(async () => (await rows(state.app, 'ToolModelResult')).length === 1, 'call-A settled');
+    await delay(30);
+    await state.app.modelProvider.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture Host loss'));
+    await assert.rejects(driving, error => kernel.isExecutionHandoffError(error));
+    await reopen();
+    const recovered = await recover(turn.turnId);
+    const [request] = await rows(state.app, 'ModelRequest', { turn_id: turn.turnId });
+    // An older build (or any pre-progress failure) left this request parked between Attempts.
+    const abort = new AbortController();
+    const parked = kernel.runWithExecutionLeaseFence(recovered.fence, () => state.app.modelProvider.dispatch(request.id, {
+      providerId: 'native-provider',
+      async sendFullRequest() { throw new kernel.ProviderTransientError('connection_interrupted', 'reset', true); }
+    }, { reconnect: true, signal: abort.signal }));
+    void parked.catch(() => undefined);
+    await waitFor(async () => (await rows(state.app, 'ModelRequest', { id: request.id }))[0].status === 'retrying',
+      'request parked in its retry delay');
+    abort.abort(new kernel.ExecutionHandoffError('fixture Host loss during the retry delay'));
+    await assert.rejects(parked, error => kernel.isExecutionHandoffError(error));
+    const [retrying] = await rows(state.app, 'ModelRequest', { id: request.id });
+    assert.equal(retrying.status, 'retrying');
+    const outcome = await drive(recovered);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(state.app, 'TurnTermination', { turn_id: turn.turnId })));
+    assert.equal(requests.length, 2, 'the parked Attempt never re-sends the frozen input');
+    assert.deepEqual(executions, ['call-A']);
+    const [sealed] = await rows(state.app, 'ModelRequest', { id: request.id });
+    assert.equal(sealed.terminal_state, 'native_chain_rebased');
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+  });
+});
+
 test('a terminal unknown steer whose successor exists no longer blocks the batch checkpoint', { timeout: 20000 }, async () => {
   await withNativeKernel({
     steer: acceptSteer,

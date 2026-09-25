@@ -296,6 +296,31 @@ export interface ProviderDispatchOptions {
   timeoutMs?: number;
   /** Memory-only terminal overlay, emitted only after the matching durable failure/cancel fact. */
   onTransientTerminal?(observation: ProviderTransientTerminalObservation): void;
+  /**
+   * Native logical requests only: true once the chain has durable progress (admitted calls,
+   * streamed item revisions, applied steering) or an unverified result admission. A transient
+   * failure then never opens a new Attempt that re-sends the frozen input; dispatch rejects with
+   * NativeChainReplayUnsafeError and leaves the request open for the caller's local rebase.
+   */
+  nativeReplayUnsafe?(): boolean;
+}
+
+/**
+ * A transient transport failure hit a native chain whose frozen input no longer describes the
+ * conversation. The ModelRequest stays open (never failed, never retried); the Agent loop closes
+ * its settled results into Context, seals it as native_chain_rebased and continues the Turn.
+ */
+export class NativeChainReplayUnsafeError extends Error {
+  public readonly code = 'NATIVE_CHAIN_REPLAY_UNSAFE';
+
+  public constructor(public readonly transient: ProviderTransientError) {
+    super(`${transient.message} (native chain has durable progress; it is rebased from Context instead of replayed)`);
+    this.name = 'NativeChainReplayUnsafeError';
+  }
+}
+
+export function isNativeChainReplayUnsafeError(error: unknown): error is NativeChainReplayUnsafeError {
+  return error instanceof NativeChainReplayUnsafeError;
 }
 
 const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
@@ -1423,6 +1448,12 @@ export class ModelProviderControlPlane {
           providerFailureTerminalState(error)
         );
         throw error;
+      }
+      if (nativeRequest && options.nativeReplayUnsafe?.() === true) {
+        // Retrying would re-send the frozen input after tools were admitted or items committed:
+        // the model would re-issue executed calls under new identities. Keep the request open and
+        // unfailed; the caller closes its settled results into Context and rebases the Turn.
+        throw new NativeChainReplayUnsafeError(error);
       }
       if (sawReplayUnsafeProviderEvent && !error.retryAfterOutput) {
         const replayUnsafe = Object.assign(

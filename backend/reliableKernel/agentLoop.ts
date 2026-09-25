@@ -46,6 +46,7 @@ import {
   type ToolTerminalResult
 } from './effectControlPlane';
 import {
+  isNativeChainReplayUnsafeError,
   ModelRequestPreflightError,
   ModelProviderControlPlane,
   modelRequestIdFor,
@@ -2280,19 +2281,13 @@ export class ReliableAgentLoop {
       // A previously dispatched chain with durable progress is never replayed from its frozen
       // input after a Host change: the model would redo admitted tools and duplicate items. The
       // same holds for a chain whose result admission is unknown. Wait for admitted effects, close
-      // their results into Context, seal the chain, and let the Turn continue from Context.
+      // their results into Context, seal the chain, and let the Turn continue from Context. A
+      // request parked between transient Attempts ('retrying') was dispatched too.
       const previouslyDispatched = reliableDecimal(asRecord(request.stream_stats_json)?.socketGeneration) > 0n
-        || request.status === 'streaming';
+        || request.status === 'streaming' || request.status === 'retrying';
       if (session.unsafeResultAdmissionError()
         || (previouslyDispatched && session.hasDurableChainProgress())) {
-        const [running] = session.unsettledAdmittedCallIds();
-        if (running) {
-          await session.dispose('handoff');
-          throw new NativeSafetyWaitError(running);
-        }
-        await session.dispose('completed');
-        await this.modelProvider.sealNativeChainForRebase(modelRequestId);
-        return NATIVE_CHAIN_REBASED_TERMINAL_STATE;
+        return this.closeNativeChainForRebase(session, modelRequestId);
       }
     }
     const activeSession = session;
@@ -2440,10 +2435,19 @@ export class ReliableAgentLoop {
     };
     const streamStats = asRecord(request.stream_stats_json);
     const reconnect = reliableDecimal(streamStats?.socketGeneration) > 0n || request.status === 'streaming';
-    let outcome: 'completed' | 'failed' | 'cancelled' | 'handoff' = 'completed';
+    let outcome: 'completed' | 'failed' | 'cancelled' | 'handoff' | 'rebase' = 'completed';
     try {
       await this.modelProvider.dispatch(modelRequestId, wrapped, {
         ...(reconnect ? { reconnect: true } : {}),
+        // A transient transport failure after durable chain progress must not start a new Attempt
+        // that re-sends the frozen input: admitted tools would be issued again under new
+        // identities. The provider plane leaves the request open and this loop rebases it.
+        ...(activeSession
+          ? {
+              nativeReplayUnsafe: () => activeSession.hasDurableChainProgress()
+                || activeSession.unsafeResultAdmissionError() !== undefined
+            }
+          : {}),
         onTransientTerminal: (terminal) => this.observeTransientEvent({
           conversationId,
           turnId,
@@ -2460,14 +2464,18 @@ export class ReliableAgentLoop {
         })
       });
     } catch (error) {
-      outcome = isExecutionHandoffError(error)
-        ? 'handoff'
-        : error instanceof Error && error.name === 'AbortError'
-          ? 'cancelled'
-          : 'failed';
-      throw error;
+      if (session && isNativeChainReplayUnsafeError(error)) {
+        outcome = 'rebase';
+      } else {
+        outcome = isExecutionHandoffError(error)
+          ? 'handoff'
+          : error instanceof Error && error.name === 'AbortError'
+            ? 'cancelled'
+            : 'failed';
+        throw error;
+      }
     } finally {
-      if (session) {
+      if (session && outcome !== 'rebase') {
         try {
           await session.dispose(outcome);
         } catch (disposeError) {
@@ -2480,6 +2488,12 @@ export class ReliableAgentLoop {
         }
       }
     }
+    if (outcome === 'rebase' && session) {
+      // The live session still knows every admitted call and its settlement: close the chain
+      // into Context now (or park the Turn until its running tools settle) and continue the Turn
+      // with a fresh full request instead of failing it.
+      return this.closeNativeChainForRebase(session, modelRequestId);
+    }
     // An ambiguous result admission ended the physical chain; dispose closed every settled result
     // into Context. The next request is a fresh full request built from that Context, so the model
     // sees each result exactly once whether or not the abandoned chain consumed it. No external
@@ -2487,6 +2501,27 @@ export class ReliableAgentLoop {
     // The terminal CAS checkpoint is the only final output authority. The transient collector exists
     // solely to drive low-latency UI observation and must never become a second durable result path.
     return this.readTerminalProviderOutput(modelRequestId);
+  }
+
+  /**
+   * Local end of a native physical chain that must not be replayed from its frozen input (Host
+   * change, unknown result admission, transient transport failure after durable progress). An
+   * admitted tool that is still running keeps the Turn waiting until it settles — it is never
+   * cancelled or dispatched again. Otherwise every settled result is closed into Context, the
+   * ModelRequest is sealed as rebased and the Turn continues with a fresh full request.
+   */
+  private async closeNativeChainForRebase(
+    session: NativeRequestSession,
+    modelRequestId: string
+  ): Promise<typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE> {
+    const [running] = session.unsettledAdmittedCallIds();
+    if (running) {
+      await session.dispose('handoff');
+      throw new NativeSafetyWaitError(running);
+    }
+    await session.dispose('completed');
+    await this.modelProvider.sealNativeChainForRebase(modelRequestId);
+    return NATIVE_CHAIN_REBASED_TERMINAL_STATE;
   }
 
   /**

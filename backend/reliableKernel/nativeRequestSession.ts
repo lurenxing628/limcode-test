@@ -156,6 +156,8 @@ export class NativeRequestSession {
   private unregisterSteering?: () => void;
   private unsubscribeSettlements?: () => void;
   private stream?: { attemptSeq: string; socketGeneration: string };
+  /** Latest Attempt that produced durable stream facts, reconstructed by reconcile(). */
+  private durableAttemptSeq?: string;
   private readonly calls = new Map<string, NativeSessionCall>();
   private readonly callByProviderId = new Map<string, NativeSessionCall>();
   /** Global ordinals live on SourceLinks beyond bounded proofs or a new socket generation. */
@@ -225,7 +227,11 @@ export class NativeRequestSession {
    * not replay it (the model would redo admitted tools and duplicate items); it closes the chain.
    */
   public hasDurableChainProgress(): boolean {
-    return this.calls.size > 0 || this.itemPartsOrdered.length > 0;
+    return this.calls.size > 0 || this.itemPartsOrdered.length > 0
+      // A steering Message applied to Context belongs to this chain's successor, not its input.
+      || [...this.steerReceipts.values()].some(receipt =>
+        receipt.modelRequestId === this.deps.modelRequestId
+        && (receipt.state === 'continuing' || receipt.state === 'completed'));
   }
 
   /** Admitted calls whose external effect has not settled yet (a restarted Host must wait for them). */
@@ -267,6 +273,9 @@ export class NativeRequestSession {
       if (admission.providerCallId !== providerCallId) {
         throw new Error(`Native admission for ${toolCallId} disagrees with ToolCallSourceLink.`);
       }
+      if (this.durableAttemptSeq === undefined || BigInt(admission.attemptSeq) > BigInt(this.durableAttemptSeq)) {
+        this.durableAttemptSeq = admission.attemptSeq;
+      }
       const toolCall = await this.requireDomain('ToolCall', toolCallId);
       const metadata = await this.requireDomain('ContentObject',
         requireId(toolCall.arguments_object_id, 'ToolCall.arguments_object_id')) as unknown as ContentObjectMetadata;
@@ -296,6 +305,10 @@ export class NativeRequestSession {
     const checkpointCreatedOrder: string[] = [];
     const contentRows = new Map<string, DomainRow>();
     for (const checkpoint of checkpoints) {
+      const attemptSeq = String(checkpoint.attempt_seq);
+      if (this.durableAttemptSeq === undefined || BigInt(attemptSeq) > BigInt(this.durableAttemptSeq)) {
+        this.durableAttemptSeq = attemptSeq;
+      }
       const kind = String(checkpoint.checkpoint_kind);
       if (kind !== 'native_tool_call' && kind !== 'native_control') continue;
       const contentObjectId = requireId(checkpoint.content_object_id, 'ModelStreamCheckpoint.content_object_id');
@@ -507,6 +520,15 @@ export class NativeRequestSession {
 
   /** Binds the durable stream identity of the current dispatch attempt/socket generation. */
   public bindStream(identity: { attemptSeq: string; socketGeneration: string }): void {
+    const boundAttemptSeq = this.stream?.attemptSeq ?? this.durableAttemptSeq;
+    if (boundAttemptSeq !== undefined && boundAttemptSeq !== identity.attemptSeq && this.hasDurableChainProgress()) {
+      // A new Attempt re-sends the frozen input. After admitted calls or streamed items that input
+      // no longer describes the conversation: the model would re-issue executed tools under new
+      // identities. Such a chain is closed into Context and rebased, never replayed.
+      throw new Error(
+        `Native ModelRequest ${this.deps.modelRequestId} has durable chain progress; Attempt ${identity.attemptSeq} must not replay its frozen input.`
+      );
+    }
     if (
       this.stream
       && (this.stream.attemptSeq !== identity.attemptSeq || this.stream.socketGeneration !== identity.socketGeneration)
