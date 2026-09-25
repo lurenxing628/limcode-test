@@ -143,7 +143,7 @@ test('history click keeps the visible message anchored after the production Vue 
     const rows = (from, count) => Array.from({length:count}, (_, i) => ({id:'message-'+(from+i), seq:from+i, role:'user', content:{role:'user',parts:[{text:'synthetic history'}]}, createdAt:from+i, status:'completed', conversationId:'scroll-conversation'}));
     export const projection = ref({messages:rows(101,30), absoluteFloorByMessageId:{}, terminationByMessageId:{}, turnIdByMessageId:{}, interactionByToolCallId:{}, messageRevisionIdByMessageId:{}, modelRequestIdByMessageId:{}, toolCalls:[]});
     export const conversationId = ref('scroll-conversation');
-    export const feed = reactive({records:{}, details:{}, transientModelRequests:{}, historyConversationId:'scroll-conversation', historyHasMore:true, historyLoading:false, historyLoadedPages:1,
+    export const feed = reactive({records:{}, details:{}, transientModelRequests:{}, historyConversationId:'scroll-conversation', historyRecords:{}, historyHasMore:true, historyLoading:false, historyLoadedPages:1,
       requestEarlierHistory(){this.historyLoading=true;return true;}, setPinnedDetailKeys(){}, requestDetail(){} });
     export const useReliableConversation = () => ({feed, conversationId, projection, ensureDetails(){}});
     export const useChat = () => ({conversationAction:ref(null), conversationActionPending:ref(false), conversationActionLabel:ref(null), conversationActionNotice:ref(null), forkPendingTargetIds:ref(new Set()), currentAuthoritySelection:()=>({})});
