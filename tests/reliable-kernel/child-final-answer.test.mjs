@@ -541,6 +541,37 @@ test('closing the child scheduler while a child Turn completes still submits its
   });
 });
 
+test('a stop observed after the final answer is shown but before completion publishes no answer', { timeout: 90000 }, async () => {
+  const TASK = 'LATE_STOP_TASK_1510';
+  let rootRound = 0;
+  await fixture(async (request) => {
+    if (request.conversationId === 'root') return ++rootRound === 1 ? toolsAnswer(spawn('spawn-late-stop', TASK)) : answer(`Root round ${rootRound}.`);
+    return answer('LATE_STOP_FINAL_1511');
+  }, async f => {
+    const output = f.app.agentLoop.turnOutput;
+    const append = output.appendAssistantMessage;
+    let stopped = false;
+    output.appendAssistantMessage = async function(input) {
+      const committed = await append.call(this, input);
+      const [turn] = await f.rows('Turn', { id: input.turnId });
+      if (turn.conversation_id !== 'root' && !stopped) {
+        stopped = true;
+        // The user stops the child exactly after its final answer became visible.
+        await f.app.turns.interrupt({ source: { kind: 'command', key: 'late-stop' }, turnId: input.turnId, reason: 'user stop' });
+      }
+      return committed;
+    };
+    const started = await f.input('root', 'root-spawns-late-stop');
+    await f.terminated(started.turnId);
+    const task = await f.until(() => f.child(TASK), 'child never started');
+    const childTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: task.conversationId }))[0], 'child Turn missing');
+    assert.equal((await f.terminated(childTurn.id)).terminal_status, 'interrupted');
+    await f.settled();
+    output.appendAssistantMessage = append;
+    assert.equal((await f.rows('AnswerSubmission')).length, 0, 'a stopped Turn publishes no full answer');
+  });
+});
+
 const nativeCapabilities = { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false, explicitCaching: true };
 const nativeProbe = { name: 'native_probe', description: 'one durable native tool', parameters: { type: 'object' }, metadata: { nativeAsync: true } };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -550,3 +581,147 @@ const deferred = () => { let resolve; const promise = new Promise(done => { reso
  * both async tool results are delivered to the server inside that request and the aggregate ends
  * with its final text, so the Turn completes on the native final-output path.
  */
+test('a child Turn completed on the native final-output path answers its parent before it completes', { timeout: 60000 }, async () => {
+  const NATIVE_FINAL = 'NATIVE_CHILD_FINAL_ANSWER_1610';
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-native-child-answer-'));
+  const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
+  await kernel.initializeEmptyRuntimeRoot(root);
+  let app, coordinator;
+  const releaseB = deferred();
+  const delivered = [];
+  const rows = async (domain, where = {}) => (await app.database.snapshotAll(repo(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot;
+  const waitFor = async (check, label) => {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 10)); }
+    assert.fail(`Timed out waiting for ${label}`);
+  };
+  const adapter = {
+    providerId: 'native-provider',
+    async materializeNativeToolOutput(outputs) { return outputs; },
+    async sendFullRequest(request, controls) {
+      let sequence = 0;
+      let current = 'native-response-1';
+      let responses = 1;
+      const emit = (kind, content) => controls.onEvent({ kind, streamSeq: String(++sequence), content });
+      controls.native.onController({
+        get responseId() { return current; },
+        endLogicalRequest() { assert.fail('a fully delivered batch never needs a carrier request'); },
+        async steer() { assert.fail('no steering in this fixture'); },
+        async submitToolResults(outputs) {
+          const previous = current;
+          current = `native-response-${++responses}`;
+          const callIds = outputs.map(output => output.callId);
+          // The server admits exactly these results into its next physical response.
+          await emit('native_control', { type: 'response.created', responseId: current, previousResponseId: previous,
+            admittedToolResultCallIds: callIds });
+          delivered.push(...callIds);
+          return { responseId: current, previousResponseId: previous };
+        }
+      });
+      await emit('native_control', { type: 'response.created', responseId: current, capabilities: nativeCapabilities });
+      const parts = [];
+      for (const [index, callId] of ['native-call-a', 'native-call-b'].entries()) {
+        const outputItem = { id: `item-${callId}`, ordinal: index, providerResponseId: current };
+        parts.push({ id: callId, functionCall: { name: 'native_probe', args: { index } }, outputItem, async: true });
+        await emit('output_item_done', { type: 'tool_calls', outputItem,
+          calls: [{ id: callId, ordinal: index, name: 'native_probe', arguments: { index }, async: true }] });
+      }
+      await emit('native_control', { type: 'response.completed', responseId: current,
+        usage: { input_tokens: 240, output_tokens: 12, input_tokens_details: { cached_tokens: 0 } } });
+      await waitFor(() => delivered.includes('native-call-a'), 'the first settled result reached the server');
+      releaseB.resolve();
+      await waitFor(() => delivered.includes('native-call-b'), 'the second result reached the server');
+      await waitFor(async () => (await rows('ToolCallEvent', { event_kind: 'native_delivery' })).length === 2, 'both delivery facts committed');
+      await emit('native_control', { type: 'response.completed', responseId: current,
+        usage: { input_tokens: 300, output_tokens: 8, input_tokens_details: { cached_tokens: 0 } } });
+      await emit('completed', { role: 'model', parts: [...parts, { text: NATIVE_FINAL }] });
+      controls.native.onController(undefined);
+    }
+  };
+  const dependencies = {
+    authorityCompiler: { async compile(request) { return {
+      turnId: request.turnId, executorAgentId: request.executorAgentId,
+      executionPreset: { content: JSON.stringify({ providerConfigId: 'native-provider', modelId: 'gpt-6-astra' }) },
+      authoritySnapshot: { content: JSON.stringify({ kind: 'effective-turn-authority',
+        turnId: request.turnId, conversationId: request.conversationId, executorAgentId: request.executorAgentId,
+        model: { providerConfigId: 'native-provider', provider: 'openai-responses', modelId: 'gpt-6-astra',
+          baseUrl: 'https://native-child.invalid/v1', openaiResponsesTransport: 'http',
+          nativeResponses: { enabled: true, asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false },
+          retryPolicy: { enabled: false, maxRetries: 0 } },
+        modelProfile: { compressionThresholdTokens: 1000000, contextWindowTokens: 1200000,
+          tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
+        toolPolicy: { id: 'native-tools', allowedTools: ['native_probe', 'run_agent'], preset: 'custom', toolConfigs: {}, sourceConfigs: {} },
+        planReviewPolicy: { mode: 'never' }, systemPrompt: { id: 'prompt', text: '' },
+        runtimeContext: { id: null, name: '', template: '' },
+        workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
+      }) }
+    }; } },
+    resolveWorkEnvironment: async () => undefined,
+    mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { throw new Error('unexpected MCP call'); } },
+    mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
+    attachmentSettings: { async loadGlobalSettings() { return { section: 'attachments', settings: { maxStoredInlineFileMb: 25 }, filePath: 'unused' }; } },
+    providers: { resolve() { return adapter; } },
+    toolDispatcher: {
+      definitions() { return [nativeProbe]; },
+      async dispatch() { assert.fail('native calls must use the durable admitted-call dispatcher'); },
+      async scheduleAdmittedCall(input) {
+        if (input.providerCallId === 'native-call-b') await releaseB.promise;
+        const settled = await app.runtime.effects.settleWithoutEffect({ source: { kind: 'internal', key: `native-child:${input.toolCallId}` },
+          toolCallId: input.toolCallId, status: 'succeeded', detail: { ok: true, callId: input.providerCallId } });
+        return settled.terminal;
+      }
+    }
+  };
+  try {
+    app = await kernel.ReliableKernelApplication.open(root, dependencies);
+    coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime,
+      modelProvider: app.modelProvider, turns: app.turns, agentLoop: app.agentLoop,
+      agents: { async resolve() { return { agentId: 'agent-child', agentType: 'worker' }; } },
+      modelProfiles: { async initializeConversation() { return { created: true }; } } });
+    const now = new Date().toISOString();
+    await app.database.transaction([
+      repo('Conversation').insert({ id: 'native-parent', title: 'native parent', status: 'active', created_at: now, updated_at: now }),
+      repo('AgentConversationLink').insert({ id: 'native-parent-agent', conversation_id: 'native-parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
+    ]);
+    const parent = await app.turns.input({ source: { kind: 'command', key: 'native-parent-turn' }, conversationId: 'native-parent',
+      content: 'Delegate one native task.', leaseOwnerId: 'native-parent-owner', hostBootId: app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 120000).toISOString() });
+    await app.runtime.effects.createToolCall({ source: { kind: 'internal', key: 'native-spawn-call' }, toolCallId: 'native-spawn-call',
+      turnId: parent.turnId, toolName: 'run_agent', arguments: { operation: 'spawn', taskName: 'native task', prompt: 'Probe twice.' } });
+    const spawned = await app.runtime.children.spawn({ sourceToolCallId: 'native-spawn-call', childAgentId: 'agent-child',
+      modelFallback: { providerConfigId: 'native-provider', model: 'gpt-6-astra' }, prompt: 'Probe twice.',
+      completionPolicy: 'background', sourceSettlement: 'child_handle', leaseOwnerId: 'native-child-owner',
+      leaseExpiresAt: new Date(Date.now() + 120000).toISOString() });
+    assert.equal(await app.runtime.children.claimSpawnDispatch(spawned.effectIntentId), true);
+    const receipt = await app.runtime.children.recordSpawnReceipt({ sourceKey: 'native-spawn-receipt', attemptId: spawned.attemptId, outcome: 'succeeded' });
+    await app.runtime.children.reconcileSpawnReceipt(receipt.effectReceiptId);
+    await app.database.conversationOwners.claim(spawned.childConversationId);
+    const [lease] = await rows('ExecutionLease', { turn_id: spawned.childTurnId });
+    const fence = { id: lease.id, conversationId: lease.conversation_id, turnId: lease.turn_id,
+      ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) };
+    const turns = app.agentLoop.turns;
+    const terminal = turns.terminal;
+    let answeredWhenCompleted;
+    turns.terminal = async function(command) {
+      if (command.turnId === spawned.childTurnId && command.terminalStatus === 'completed') {
+        answeredWhenCompleted = (await rows('AnswerSubmission')).some(row => row.turn_id === spawned.childTurnId);
+      }
+      return terminal.call(this, command);
+    };
+    const outcome = await kernel.runWithExecutionLeaseFence(fence, () => app.agentLoop.drive(spawned.childTurnId));
+    turns.terminal = terminal;
+    assert.equal(outcome.terminalStatus, 'completed', JSON.stringify(await rows('TurnTermination', { turn_id: spawned.childTurnId })));
+    assert.equal(outcome.modelRequestIds.length, 1, 'one native logical request, no carrier request');
+    const [termination] = await rows('TurnTermination', { turn_id: spawned.childTurnId });
+    assert.equal(termination.reason, 'native_logical_request_completed', 'the Turn ended on the native final-output path');
+    assert.equal(answeredWhenCompleted, true, 'the native final output became the answer before the Turn was recorded completed');
+    const current = await app.runtime.answers.readCurrent(spawned.answerBridgeId);
+    assert.equal(current.status, 'submitted');
+    assert.equal(current.content, NATIVE_FINAL, 'the answer is the text after the last tool call');
+    assert.equal((await rows('RuntimeDelivery', { target_conversation_id: 'native-parent' })).length, 1, 'the answer is handed on to the parent');
+  } finally {
+    if (coordinator) await coordinator.dispose();
+    await app?.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});

@@ -815,11 +815,12 @@ export class ReliableAgentLoop {
         if (output.toolCalls.length === 0) {
           // The final-output fence was committed before this visible Message. Automatic runtime
           // input must now target a new Turn; extending this Turn would rewrite a displayed final.
-          await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
           for (;;) {
             if (await this.terminateIfRequested(turnId, `round:${round}:before-complete:${modelRequestId}`)) {
               return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
             }
+            // Like the native path: a stop observed first means this Turn publishes no answer.
+            await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
             this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
             try {
               await this.turns.terminal({
