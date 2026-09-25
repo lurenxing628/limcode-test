@@ -365,9 +365,13 @@ test('transient sequence gap retains the contiguous prefix and atomically adopts
     message.type === 'reliable-kernel.client-diagnostic'
     && message.eventKind === 'transient-snapshot-replayed'
   ));
+  // The panel routes Feed control through the one shared predicate (main-panel-feed-routing drives it).
+  const { isReliableKernelControlMessage } = await server.ssrLoadModule(path.join(root, 'shared/reliableKernelClientFeed.ts'));
+  for (const type of ['reliable-kernel.transient-ack', 'reliable-kernel.transient-snapshot-request']) {
+    assert.equal(isReliableKernelControlMessage({ type }), true, `${type} is Feed control`);
+  }
   const mainPanel = fs.readFileSync(path.join(root, 'vscode/panels/MainPanel.ts'), 'utf8');
-  assert.match(mainPanel, /type === RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE/);
-  assert.match(mainPanel, /type === RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE/);
+  assert.match(mainPanel, /isReliableKernelControlMessage\(raw\)/);
 });
 
 test('completed transient tool preview remains authoritative until message body and tool facts are ready', async (context) => {
