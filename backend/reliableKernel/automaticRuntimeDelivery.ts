@@ -27,6 +27,7 @@ import { RuntimeDatabase } from './runtimeDatabase';
 
 export type AutomaticRuntimeDeliveryReason =
   | 'source_turn_active'
+  | 'target_turn_active'
   | 'source_turn_final_output_fenced'
   | 'source_turn_completed'
   | 'source_turn_stopped_with_deliverable_answer'
@@ -69,10 +70,12 @@ const TERMINAL_FAILURES = new Set(['interrupted', 'cancelled', 'failed', 'outcom
 /**
  * One fail-closed policy for automatic Process/Child answer delivery.
  *
- * It deliberately routes from the immutable source Turn and durable Inbox source facts, never from
- * whichever Turn happens to be active when a delayed callback arrives. Callers must include
- * `authoritySteps` in the transaction that injects/retargets the delivery; a read-only decision is
- * only a scheduling hint.
+ * Authority comes from the immutable source Turn and durable Inbox source facts: a stale, failed or
+ * stopped source never delivers because some other Turn happens to be active. Once the source Turn
+ * has legitimately handed its result on, a top-level Conversation that is running a Turn takes the
+ * result in at that Turn's next request boundary (data, not a new instruction) instead of waiting
+ * for the whole Turn to end. Callers must include `authoritySteps` in the transaction that
+ * injects/retargets the delivery; a read-only decision is only a scheduling hint.
  */
 export class AutomaticRuntimeDeliveryRouter {
   public constructor(
@@ -364,6 +367,17 @@ export class AutomaticRuntimeDeliveryRouter {
           authoritySteps: terminalSteps
         });
       }
+      const running = await this.runningTargetTurn(targetConversationId, childAuthority);
+      if (running) {
+        return decision({
+          phase: 'current_turn',
+          targetTurnId: running.turnId,
+          targetConversationId,
+          sourceTurnId,
+          reason: 'target_turn_active',
+          authoritySteps: [...terminalSteps, ...running.steps]
+        });
+      }
       return decision({
         phase: 'next_turn',
         targetConversationId,
@@ -384,6 +398,17 @@ export class AutomaticRuntimeDeliveryRouter {
             reason: 'child_generation_stale_or_terminal',
             childExecutionId: childAuthority.childExecutionId,
             authoritySteps: stoppedSourceSteps
+          });
+        }
+        const running = await this.runningTargetTurn(targetConversationId, childAuthority);
+        if (running) {
+          return decision({
+            phase: 'current_turn',
+            targetTurnId: running.turnId,
+            targetConversationId,
+            sourceTurnId,
+            reason: 'target_turn_active',
+            authoritySteps: [...stoppedSourceSteps, ...running.steps]
           });
         }
         return decision({
@@ -596,6 +621,38 @@ export class AutomaticRuntimeDeliveryRouter {
         && sourceId !== failedSubmissionId
       ),
       steps
+    };
+  }
+
+  /**
+   * The running Turn of a top-level target Conversation that may still take runtime input in: no
+   * termination, no final-output fence (a displayed final answer is never extended) and not a
+   * maintenance Turn. Child Conversations keep strict per-generation routing.
+   */
+  private async runningTargetTurn(
+    targetConversationId: string,
+    sourceChildAuthority: ChildGenerationAuthority
+  ): Promise<{ turnId: string; steps: RepositoryTransactionStep[] } | undefined> {
+    if (sourceChildAuthority.childExecutionId) return undefined;
+    const active = await this.list('Turn', { conversation_id: targetConversationId, status: 'active' }, 2);
+    if (active.length > 1) throw new Error(`Conversation ${targetConversationId} has multiple active Turns.`);
+    const turn = active[0];
+    if (!turn) return undefined;
+    const turnId = requireId(turn.id, 'Turn.id');
+    if ((await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 1)).length > 0) return undefined;
+    const [terminations, fences] = await Promise.all([
+      this.list('TurnTermination', { turn_id: turnId }, 1),
+      this.list('TurnFinalOutputFence', { turn_id: turnId }, 1)
+    ]);
+    if (terminations.length > 0 || fences.length > 0) return undefined;
+    if (await isRuntimeMaintenanceTurn(this.database, this.contentStore, turnId)) return undefined;
+    return {
+      turnId,
+      steps: [
+        DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active', conversation_id: targetConversationId }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
+        DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: turnId })
+      ]
     };
   }
 
