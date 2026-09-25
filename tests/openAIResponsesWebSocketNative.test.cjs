@@ -328,7 +328,10 @@ test('已接受转向仅是排队；自动后继无归属证明时标未知、�
     assert.equal(continuationCreate.previous_response_id, undefined);
     assert.match(JSON.stringify(continuationCreate.input), /写一份项目计划/);
     assert.match(JSON.stringify(continuationCreate.input), /两周内由一名开发者完成/);
-    assert.match(JSON.stringify(continuationCreate.input), /草稿|小计划|继续/);
+    // Full history, in order: the steered user text and both model outputs, not only the new input.
+    assert.deepEqual(continuationCreate.input.map((item) => [item.role, item.content.map((part) => part.text).join('')]), [
+      ['user', '写一份项目计划'], ['assistant', '草稿'], ['user', '两周内由一名开发者完成'], ['assistant', '小计划'], ['user', '继续']
+    ]);
     assert.equal(decisions[0].mode, 'full');
     assert.equal(decisions[0].reason, 'no_completed_baseline');
   } finally {
@@ -1215,7 +1218,9 @@ test('同一前驱两条 steer 只送首条：唯一后继也不证明归属，�
     assert.equal(recovered.previous_response_id, undefined);
     assert.match(JSON.stringify(recovered.input), /第一条/);
     assert.match(JSON.stringify(recovered.input), /第二条/);
-    assert.match(JSON.stringify(recovered.input), /原稿|后继|继续/);
+    assert.deepEqual(recovered.input.map((item) => [item.role, item.content.map((part) => part.text).join('')]), [
+      ['user', '长跑任务'], ['assistant', '原稿'], ['user', '第一条'], ['user', '第二条'], ['assistant', '后继'], ['user', '继续']
+    ], 'recovery carries the model output from both sides of the steer, not only the new input');
     assert.equal(frames.filter((frame) => frame.type === 'response.steer').length, 1,
       'delivery-unknown and rejected work are never automatically retried');
   } finally {
@@ -1284,7 +1289,9 @@ test('已接受转向断线交付未知、原始模型输出保留且新连接�
     const secondCreate = frames.find((frame) => frame.request.type === 'response.create' && frame.connection === 1);
     assert.ok(secondCreate, 'reconnect must open a new physical generation');
     assert.equal(secondCreate.request.previous_response_id, undefined);
-    assert.match(JSON.stringify(secondCreate.request.input), /断线前的原稿|首条|恢复/);
+    assert.deepEqual(secondCreate.request.input.map((item) => [item.role, item.content.map((part) => part.text).join('')]), [
+      ['user', '开始'], ['assistant', '断线前的原稿'], ['user', '首条'], ['user', '恢复']
+    ], 'recovery carries the pre-disconnect model output and the accepted steer, not only the new input');
     assert.equal(frames.filter((frame) => frame.request.type === 'response.steer').length, 1);
   } finally {
     resetOpenAIResponsesWebSocketSessions();
