@@ -70,7 +70,7 @@ test('父 Conversation 删除会递归删除全部 Subagent Conversation，但�
   });
 });
 
-test('对话树任意节点被其他宿主打开时拒绝整棵删除且不留下部分删除', async () => {
+test('对话树任意节点被其他宿主持有写者时拒绝整棵删除且不留下部分删除', async () => {
   await withRuntime('conversation-delete-owned-child', async ({ database, binding }) => {
     await seedConversation(database, 'a-parent');
     await seedConversation(database, 'z-child');
@@ -83,14 +83,14 @@ test('对话树任意节点被其他宿主打开时拒绝整棵删除且不留�
     const peer = new ConversationRuntimeOwnerManager(binding, 'other-window');
     peer.setPendingWorkProbe(async () => false);
     try {
-      await peer.retain('z-child', 'child-panel');
+      await peer.claim('z-child');
       const control = new kernel.ConversationDeletionControlPlane(database);
       await assert.rejects(control.delete('a-parent'), { code: 'conversation-runtime-owner-busy' });
       assert.equal((await maybeGet(database, 'Conversation', 'a-parent')).title, 'a-parent');
       assert.equal((await maybeGet(database, 'Conversation', 'z-child')).title, 'z-child');
       assert.equal((await list(database, 'ChildExecution', {}))[0].child_conversation_id, 'z-child');
 
-      await peer.release('z-child', 'child-panel');
+      await peer.releaseIfIdle('z-child');
       assert.deepEqual((await control.delete('a-parent')).deletedConversationIds, ['z-child', 'a-parent']);
       assert.equal(await maybeGet(database, 'Conversation', 'a-parent'), null);
       assert.equal(await maybeGet(database, 'Conversation', 'z-child'), null);

@@ -2169,7 +2169,7 @@ test('a fork is told which copied collaboration refs are inherited and which ref
   });
 });
 
-test('fork_conversation of a conversation another window hosts says so and creates nothing, while reading it still works', { timeout: 60000 }, async () => {
+test('fork_conversation refuses a peer-owned writer while reading still works', { timeout: 60000 }, async () => {
   const { ConversationRuntimeOwnerManager } = load('backend/reliableKernel/ConversationRuntimeOwnerManager.js');
   let rootRound = 0, forked, read;
   await fixture(async (request, f, start) => {
@@ -2188,9 +2188,9 @@ test('fork_conversation of a conversation another window hosts says so and creat
     const otherWindow = new ConversationRuntimeOwnerManager(f.app.database.binding, 'other-window');
     otherWindow.setPendingWorkProbe(async () => false);
     try {
-      // This window lets go of the idle peer before the other window can open it.
+      // This window releases its idle writer before the other Host claims the same Conversation.
       await f.until(async () => {
-        try { await otherWindow.retain(PEER, 'other-window-panel'); return true; }
+        try { await otherWindow.claim(PEER); return true; }
         catch (error) {
           if (error?.code !== 'conversation-runtime-owner-busy') throw error;
           await f.app.database.conversationOwners.releaseIfIdle(PEER);
