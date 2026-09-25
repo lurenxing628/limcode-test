@@ -2086,6 +2086,32 @@ export function executeClientCollaborationHistoryPage(
       database.exec('COMMIT');
       return empty;
     }
+    // Each envelope's CAS preview and each peer's title are read once for this page; trimming the
+    // page under the byte cap only reselects them.
+    const projectedMessages = new Map<string, DomainRow>();
+    const projectMessage = (id: string): DomainRow => {
+      let record = projectedMessages.get(id);
+      if (!record) {
+        record = projectCollaborationMessageRecord(database, id, content);
+        projectedMessages.set(id, record);
+      }
+      return record;
+    };
+    let projectedPeers: Map<string, Record<string, unknown>> | undefined;
+    const projectPeers = (peerIds: readonly string[]): Array<Record<string, unknown>> => {
+      if (!projectedPeers) {
+        const allIds = candidates.map((row) => String(row.id));
+        const allLinks = [
+          ...queryAllByIds(database, 'collaboration_message_source_link', 'message_id', allIds),
+          ...queryAllByIds(database, 'collaboration_message_target_link', 'message_id', allIds)
+        ];
+        projectedPeers = new Map(projectCollaborationPeerConversations(database, conversationId,
+          allLinks.map((row) => String(row.conversation_id)), content).map((row) => [String(row.id), row]));
+      }
+      const peers = projectedPeers;
+      return [...new Set(peerIds)].filter((id) => id && id !== conversationId).sort()
+        .flatMap((id) => peers.has(id) ? [peers.get(id)!] : []);
+    };
     const materialize = (count: number): ClientCollaborationHistoryPageResult => {
       const selected = candidates.slice(0, count);
       const ids = selected.map((row) => String(row.id));
@@ -2099,7 +2125,7 @@ export function executeClientCollaborationHistoryPage(
           return bounded;
         });
       };
-      include('CollaborationMessage', [...ids].reverse().map((id) => projectCollaborationMessageRecord(database, id, content)));
+      include('CollaborationMessage', [...ids].reverse().map(projectMessage));
       const sources = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', ids);
       const targets = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', ids);
       if (sources.length !== ids.length || targets.length !== ids.length) {
@@ -2129,10 +2155,10 @@ export function executeClientCollaborationHistoryPage(
       ].filter((id): id is string => typeof id === 'string' && id.length > 0))];
       include('Turn', queryAllByIds(database, 'turn', 'id', turnIds)
         .filter((turn) => turn.conversation_id === conversationId));
-      include('CollaborationPeerConversation', projectCollaborationPeerConversations(database, conversationId, [
+      include('CollaborationPeerConversation', projectPeers([
         ...sources.map((row) => String(row.conversation_id)),
         ...targets.map((row) => String(row.conversation_id))
-      ], content));
+      ]));
       const oldest = selected[selected.length - 1];
       // If the byte cap shortened a page, resume at its oldest OUTPUT row: newer matches in the
       // inspected window must never be skipped. Only a completely materialized underfull page can
@@ -2150,9 +2176,13 @@ export function executeClientCollaborationHistoryPage(
       settleClientWireResponseBytes(page);
       return page;
     };
+    // The whole candidate page usually fits: try it first, and only search a shorter prefix when
+    // the byte cap is actually crossed.
+    const maximumCount = Math.min(input.limit, candidates.length);
+    const full = materialize(maximumCount);
+    let page: ClientCollaborationHistoryPageResult | undefined = full.responseBytes <= CLIENT_PAGE_MAX_BYTES ? full : undefined;
     let low = 1;
-    let high = Math.min(input.limit, candidates.length);
-    let page: ClientCollaborationHistoryPageResult | undefined;
+    let high = page ? 0 : maximumCount - 1;
     while (low <= high) {
       const count = Math.floor((low + high) / 2);
       const candidate = materialize(count);

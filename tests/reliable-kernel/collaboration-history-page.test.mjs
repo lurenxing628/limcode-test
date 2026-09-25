@@ -492,6 +492,70 @@ test('large CAS previews and peer labels reduce page rows before crossing the by
   } finally { await f.close(); }
 });
 
+test('a page that fits reads each CAS preview once; only a page past the byte cap searches a shorter prefix', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-collaboration-page-reads-'));
+  let database;
+  let native;
+  try {
+    const root = await kernel.resetCandidateRuntimeRoot(directory);
+    database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: 'collaboration-page-reads' });
+    const cas = new kernel.ContentAddressedStore(root.authority, root.binding);
+    const small = await cas.ingest(database, '协作正文', 'text/vnd.limcode.collaboration-message');
+    const large = await cas.ingest(database, '汉'.repeat(1200), 'text/vnd.limcode.collaboration-message');
+    await database.transaction([
+      row('Conversation', { id: 'target', title: '当前对话', status: 'active', created_at: NOW, updated_at: NOW }),
+      row('Conversation', { id: 'sender', title: '研究对话', status: 'active', created_at: NOW, updated_at: NOW })
+    ]);
+    const envelope = (id, payloadId, failureReason, peerId = 'sender') => [
+      kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence(
+        { id, dedupe_key: id, mode: 'message', created_at: NOW }, { column: 'message_seq', scope: {} }),
+      row('CollaborationMessageSourceLink', { id: `${id}-source`, message_id: id, conversation_id: 'target',
+        source_kind: 'tool', source_key: id, turn_id: null, tool_call_id: null, created_at: NOW }),
+      row('RuntimeInboxItem', { id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message',
+        source_id: id, state: 'available', created_at: NOW, updated_at: NOW }),
+      row('CollaborationMessageTargetLink', { id: `${id}-target`, message_id: id, conversation_id: peerId,
+        inbox_item_id: `${id}-inbox`, anchor_turn_id: null, created_at: NOW }),
+      row('CollaborationMessagePayloadLink', { id: `${id}-payload`, message_id: id, content_object_id: payloadId, created_at: NOW }),
+      row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: peerId,
+        target_turn_id: null, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null,
+        state: failureReason ? 'failed' : 'pending', failure_reason: failureReason ?? null, created_at: NOW, updated_at: NOW })
+    ];
+    await database.transaction(Array.from({ length: 60 }, (_value, index) =>
+      envelope(`small-${String(index).padStart(2, '0')}`, small.id)).flat());
+    // Long peer titles and failure reasons make 200 envelopes cross the page byte cap.
+    await database.transaction(Array.from({ length: 200 }, (_value, index) => row('Conversation', {
+      id: `large-peer-${index}`, title: '同伴'.repeat(800), status: 'active', created_at: NOW, updated_at: NOW })));
+    await database.transaction(Array.from({ length: 200 }, (_value, index) =>
+      envelope(`large-${String(index).padStart(3, '0')}`, large.id, '错误'.repeat(500), `large-peer-${index}`)).flat());
+    await database.close();
+    database = undefined;
+    native = new NativeDatabase(root.binding.paths.databasePath, { readonly: true });
+    native.defaultSafeIntegers(true);
+    const { executeClientCollaborationHistoryPage } = require(path.resolve(
+      process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension', 'backend/reliableKernel/clientProjection.js'));
+    const reads = new Map();
+    const content = { readVerifiedBytes(metadata) {
+      reads.set(metadata.id, (reads.get(metadata.id) ?? 0) + 1);
+      return Buffer.from(metadata.id === large.id ? '汉'.repeat(1200) : '协作正文', 'utf8');
+    } };
+    const crowded = executeClientCollaborationHistoryPage(native, { conversationId: 'target', limit: 200 }, content);
+    assert.ok(crowded.records.CollaborationMessage.length < 200, 'the byte cap still shortens a page that does not fit');
+    assert.ok(crowded.responseBytes <= 524_288);
+    assert.equal(reads.get(large.id), 200, 'searching a shorter prefix reuses each envelope preview it already read');
+
+    reads.clear();
+    const fitting = executeClientCollaborationHistoryPage(native, {
+      conversationId: 'target', limit: 50, beforeMessageSeq: '61', beforeId: 'large-000'
+    }, content);
+    assert.equal(fitting.records.CollaborationMessage.length, 50);
+    assert.equal(reads.get(small.id), 50, 'a page that fits is materialized once, one CAS read per envelope');
+  } finally {
+    native?.close();
+    await database?.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('Host bridge fences historical replies after navigation and rejects a foreign Conversation request', async () => {
   const { ReliableKernelWebviewFeedBridge } = require(path.resolve(
     process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension',
