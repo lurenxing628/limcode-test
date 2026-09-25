@@ -242,7 +242,8 @@ export class NativeSteeringStore {
 
   /**
    * Forward-only receipt transition; rewrites the immutable envelope with the new extras and flips
-   * PendingTurnInput.state atomically. Same-state writes are idempotent replays.
+   * PendingTurnInput.state atomically. Same-state writes (with or without extras) are idempotent
+   * replays that return the committed receipt unchanged.
    */
   public async transition(input: {
     turnId: string;
@@ -263,7 +264,10 @@ export class NativeSteeringStore {
     const existing = await this.readEnvelopeRow(ids.pendingInputId);
     if (!existing) throw new Error(`Native steering submission ${commandId} does not exist.`);
     const current = existing.row.state as OpenAIResponsesSteeringState;
-    if (current === input.to && !input.extras) {
+    if (current === input.to) {
+      // Two observers may report the same outcome (for example a transport-queued steer.failed
+      // event and the rejected send promise). The first durable write owns the receipt; a repeated
+      // transition to the state it already holds is a replay, never a drift or a second write.
       return nativeSteeringReceipt(existing.row, existing.envelope);
     }
     if (!input.from.includes(current) || !NATIVE_STEERING_TRANSITIONS[current]?.includes(input.to)) {

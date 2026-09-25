@@ -173,6 +173,8 @@ export class NativeRequestSession {
   /** Per-socket-generation call counts by response; reset on every new durable stream generation. */
   private readonly responseCallCounts = new Map<string, number>();
   private readonly steerReceipts = new Map<string, NativeSteeringReceipt>();
+  /** Per-submission serialization of durable receipt writes (see transitionSteer). */
+  private readonly steerTails = new Map<string, Promise<void>>();
   private firstResponseId?: string;
   private firstResponseLost = false;
   private pumpRunning = false;
@@ -856,17 +858,20 @@ export class NativeRequestSession {
         // instead of inventing application by order or even by a sole local candidate.
         const submissionId = content.submissionId;
         if (content.previousResponseId && submissionId) {
-          const receipt = this.steerReceipts.get(submissionId);
-          if (receipt && (receipt.state === 'accepted' || receipt.state === 'waiting_for_input')
-            && (receipt.targetResponseId === content.previousResponseId
-              || receipt.responseId === content.previousResponseId)
-            && (!content.steerId || !receipt.steerId || content.steerId === receipt.steerId)) {
+          const applied = await this.serializeSteer(submissionId, async () => {
+            const receipt = this.steerReceipts.get(submissionId);
+            if (!receipt || (receipt.state !== 'accepted' && receipt.state !== 'waiting_for_input')
+              || (receipt.targetResponseId !== content.previousResponseId
+                && receipt.responseId !== content.previousResponseId)
+              || (content.steerId && receipt.steerId && content.steerId !== receipt.steerId)) return false;
             const next = await this.deps.modelProvider.nativeSteering.applyToContext({
               turnId: this.deps.turnId, commandId: submissionId, responseId: content.responseId
             });
             this.steerReceipts.set(next.submissionId, next);
             this.emitSteering(next);
-          } else {
+            return true;
+          });
+          if (!applied) {
             this.diagnose(`Native successor ${content.responseId} supplied an unverified steering submission ${submissionId}; no receipt was applied.`);
           }
         } else if (content.previousResponseId && [...this.steerReceipts.values()].some(receipt =>
@@ -1620,7 +1625,36 @@ export class NativeRequestSession {
    * Replay-tolerant receipt transition: re-streamed events are idempotent no-ops when the receipt
    * already reached (or moved past) the target state; genuine drift is diagnosed, never hidden.
    */
-  private async transitionSteer(
+  private transitionSteer(
+    commandId: string,
+    from: readonly OpenAIResponsesSteeringState[],
+    to: OpenAIResponsesSteeringState,
+    extras?: {
+      steerId?: string;
+      responseId?: string;
+      successorResponseId?: string;
+      requiredInput?: OpenAIResponsesRequiredInput[];
+      error?: string;
+    }
+  ): Promise<NativeSteeringReceipt | undefined> {
+    // The provider event tail and the steering command's send promise can both report one
+    // submission's outcome concurrently. Serialize per submission so each observer decides from
+    // the committed state of the previous one instead of racing on the same stale in-memory state.
+    return this.serializeSteer(commandId, () => this.transitionSteerNow(commandId, from, to, extras));
+  }
+
+  private serializeSteer<T>(commandId: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.steerTails.get(commandId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    const tail = next.then(() => undefined, () => undefined);
+    this.steerTails.set(commandId, tail);
+    void tail.then(() => {
+      if (this.steerTails.get(commandId) === tail) this.steerTails.delete(commandId);
+    });
+    return next;
+  }
+
+  private async transitionSteerNow(
     commandId: string,
     from: readonly OpenAIResponsesSteeringState[],
     to: OpenAIResponsesSteeringState,
