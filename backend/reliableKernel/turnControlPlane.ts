@@ -75,6 +75,7 @@ import {
   type ProjectFolderAssignment
 } from './conversationProject';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import { NATIVE_STEER_MESSAGE_TURN_ROLE } from './nativeSteering';
 import {
   readChildExecutionBoundary,
   readChildExecutionWorkEnvironmentBoundary,
@@ -2557,6 +2558,11 @@ export class TurnControlPlane {
       throw new Error(`Message ${messageId} revision changed before edit-and-run; refresh and retry.`);
     }
     if (relation.currentRevision.role !== 'user') throw new Error('Edit-and-run requires a user Message.');
+    if ((await this.listRows('MessageTurnLink', { message_id: messageId, role: NATIVE_STEER_MESSAGE_TURN_ROLE }, 1)).length > 0) {
+      // A steering instruction was inserted into a running Turn; that Turn has its own input
+      // Message. Truncating at the steer would rewrite a Turn that never started from it.
+      throw new Error('转向消息是在轮次进行中插入的补充指令，不能编辑后重新运行；请把内容作为新消息发送。');
+    }
     const sourceLinks = await this.listRows('MessageTurnLink', { message_id: messageId, role: 'input' }, 2);
     if (sourceLinks.length !== 1) throw new Error(`Message ${messageId} has no unique source Turn.`);
     const sourceTurnId = requireId(sourceLinks[0].turn_id, 'MessageTurnLink.turn_id');

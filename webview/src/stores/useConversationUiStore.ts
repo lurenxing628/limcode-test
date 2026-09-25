@@ -100,6 +100,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
   });
   const composerMode = ref<ComposerMode>('chat');
   const composerHighlightKey = ref(0);
+  const composerFocusKey = ref(0);
   const editingMessage = shallowRef<EditingMessageState>();
   const editingTurnIntent = shallowRef<EditingTurnIntentState>();
   const editConfirmOpen = ref(false);
@@ -270,6 +271,15 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     composerSnapshots.value.chat.draft = '';
   }
 
+  /** Puts an earlier Message's text back into the chat composer so the user can send it anew. */
+  function prefillChatDraft(message: MessageRecord): void {
+    const text = visibleMessageText(message);
+    if (!text) return;
+    if (composerMode.value === 'edit') cancelEditMode();
+    composerSnapshots.value.chat.draft = text;
+    composerFocusKey.value += 1;
+  }
+
   function phaseForMessage(id: string, index: number, messages: readonly MessageRecord[]): MessageViewPhase {
     const exitStart = exitingFromId ? messages.findIndex((message) => message.id === exitingFromId) : -1;
     if (exitStart >= 0 && index >= exitStart) return 'exiting';
@@ -328,6 +338,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     checkpointMarkers,
     composerMode,
     composerHighlightKey,
+    composerFocusKey,
     composerDraft,
     editingMessage,
     editingTurnIntent,
@@ -342,7 +353,8 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     startEditTurnIntent,
     cancelEditMode,
     setComposerDraft,
-    clearChatDraft
+    clearChatDraft,
+    prefillChatDraft
   };
 });
 

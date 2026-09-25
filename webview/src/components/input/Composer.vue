@@ -393,6 +393,14 @@ watch(
 let highlightTimer: number | undefined;
 
 watch(
+  () => ui.composerFocusKey,
+  () => {
+    pulseHighlight();
+    void nextTick(() => editor.value?.focus());
+  }
+);
+
+watch(
   () => ui.composerHighlightKey,
   () => {
     if (!ui.isEditing) return;

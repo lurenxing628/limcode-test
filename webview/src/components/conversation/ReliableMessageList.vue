@@ -51,6 +51,7 @@ const props = withDefaults(defineProps<{
 });
 const emit = defineEmits<{
   (event: 'edit-message', message: MessageRecord, deleteCount: number): void;
+  (event: 'resend-as-new', message: MessageRecord): void;
 }>();
 const { feed, conversationId, projection, ensureDetails } = useReliableConversation();
 const {
@@ -737,6 +738,7 @@ function messageRenderKey(message: MessageRecord): string {
           :pending-label="conversationActionLabel ?? '正在提交操作'"
           :floor-number="timelineFloor(row.message)"
           @edit-message="emit('edit-message', row.message, deleteCount(row.message))"
+          @resend-as-new="emit('resend-as-new', row.message)"
           @retry-from="retryFrom"
           @delete-from="deleteFrom"
           @fork-from="forkFrom"

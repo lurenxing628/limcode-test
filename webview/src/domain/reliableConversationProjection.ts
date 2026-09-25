@@ -142,10 +142,14 @@ export function projectReliableConversation(
     .sort(compareSequence('message_seq'));
   const messageTurnLinks = values(input.records.MessageTurnLink);
   const turnIdByMessageId: Record<string, string> = {};
+  // A steering Message is linked to its Turn as native_steer, never as that Turn's input: it cannot
+  // be edited-and-rerun from its own position, only sent again as a new Message.
+  const steeringInputMessageIds = new Set<string>();
   for (const link of messageTurnLinks) {
     const messageId = text(link.message_id);
     const turnId = text(link.turn_id);
     if (!messageId || !turnId) continue;
+    if (link.role === 'native_steer') steeringInputMessageIds.add(messageId);
     if (link.role === 'model' || turnIdByMessageId[messageId] === undefined) {
       turnIdByMessageId[messageId] = turnId;
     }
@@ -184,6 +188,7 @@ export function projectReliableConversation(
         status: role === 'user' ? 'final' : 'partial',
         createdAt: timestamp(record.created_at),
         ...(role === 'model' ? { retryTarget: { kind: 'message' as const, messageId: id } } : {}),
+        ...(role === 'user' && steeringInputMessageIds.has(id) ? { steeringInput: true as const } : {}),
         seq: integer(record.display_seq) || integer(record.message_seq)
       },
       revisionReady: detail?.status === 'ready',

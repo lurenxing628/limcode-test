@@ -1826,6 +1826,8 @@ export interface MessageRecord {
   usageMetadata?: LlmUsageMetadataRecord;
   /** Exact Runtime fact used when the user retries this projected model output. */
   retryTarget?: MessageRetryTarget;
+  /** A steering instruction inserted into a running Turn (never that Turn's input). */
+  steeringInput?: true;
   seq: number;
 }
 

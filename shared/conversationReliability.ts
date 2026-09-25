@@ -591,7 +591,7 @@ export interface ChildTurnLinkRecord {
   rowVersion: number;
 }
 
-export type MessageTurnRole = 'input' | 'model' | 'tool_response' | 'notification';
+export type MessageTurnRole = 'input' | 'native_steer' | 'model' | 'tool_result' | 'tool_response' | 'notification';
 
 export interface MessageTurnLinkRecord {
   id: string;

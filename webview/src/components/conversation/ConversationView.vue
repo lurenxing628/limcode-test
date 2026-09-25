@@ -204,6 +204,7 @@ function compactMessagePreview(parts: MessageContent['parts']): string {
           :scroller="scroller"
           :follow-latest="followLatestTimeline"
           @edit-message="startReliableMessageEdit"
+          @resend-as-new="conversationUi.prefillChatDraft"
         />
       </div>
       <AdvancedScrollbar

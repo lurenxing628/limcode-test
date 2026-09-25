@@ -554,3 +554,30 @@ test('modelRequestNativeCapabilities reads the frozen projection exactly and fai
   });
   assert.equal(invalidFlags?.steering, false, '非布尔旗标必须按不可用处理，不得宽松解释为真');
 });
+
+test('a steering Message is marked as steering input so it is resent as new, never edited in place', () => {
+  const records = nativeShellRecords('streaming');
+  const typed = records as Record<string, Record<string, Record<string, unknown>>>;
+  typed.Message['input-message'] = {
+    id: 'input-message', conversation_id: 'conversation-a', message_seq: '0', revision_id: 'input-revision',
+    role: 'user', created_at: '2026-08-03T00:00:00.500Z'
+  };
+  typed.Message['steer-message'] = {
+    id: 'steer-message', conversation_id: 'conversation-a', message_seq: '2', revision_id: 'steer-revision',
+    role: 'user', created_at: '2026-08-03T00:00:03.000Z'
+  };
+  typed.MessageTurnLink['input-link'] = { id: 'input-link', message_id: 'input-message', turn_id: 'turn-a', role: 'input' };
+  typed.MessageTurnLink['steer-link'] = { id: 'steer-link', message_id: 'steer-message', turn_id: 'turn-a', role: 'native_steer' };
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a',
+    records,
+    details: {
+      'message-content:input-revision': ready(JSON.stringify({ role: 'user', parts: [{ text: 'start' }] })),
+      'message-content:steer-revision': ready(JSON.stringify({ role: 'user', parts: [{ text: 'change direction' }] })),
+      'message-content:revision-a': ready(JSON.stringify({ role: 'model', parts: [ITEM_ONE] }))
+    }
+  });
+  const byId = new Map(projection.messages.map(message => [message.id, message]));
+  assert.equal(byId.get('steer-message')?.steeringInput, true);
+  assert.equal(byId.get('input-message')?.steeringInput, undefined, 'a Turn input Message stays editable');
+});

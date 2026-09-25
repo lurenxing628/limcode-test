@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import {
+  IconArrowBackUp,
   IconArrowFork,
   IconArrowNarrowDown,
   IconArrowNarrowUp,
@@ -48,6 +49,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   (event: 'edit-message', message: MessageRecord): void;
+  (event: 'resend-as-new', message: MessageRecord): void;
   (event: 'retry-from', message: MessageRecord): void;
   (event: 'delete-from', message: MessageRecord): void;
   (event: 'compact-to', message: MessageRecord): void;
@@ -849,7 +851,18 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
     </div>
     <div class="message-actions" aria-label="消息操作">
       <button
-        v-if="message.role === 'user'"
+        v-if="message.role === 'user' && message.steeringInput"
+        type="button"
+        class="message-action-button"
+        :disabled="!detailReady"
+        aria-label="作为新消息发送"
+        title="转向消息不能编辑重跑；把内容放回输入框，作为新消息发送"
+        @click="emit('resend-as-new', message)"
+      >
+        <IconArrowBackUp class="message-action-icon" stroke="2" aria-hidden="true" />
+      </button>
+      <button
+        v-if="message.role === 'user' && !message.steeringInput"
         type="button"
         class="message-action-button"
         :disabled="editMutationBlocked"

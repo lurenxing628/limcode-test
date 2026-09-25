@@ -561,6 +561,14 @@ test('accepted steer and required result on one predecessor continue from Contex
     assert.equal(restored.state, 'delivery_unknown');
     assert.equal(restored.messageId, durable.messageId);
     assert.equal(frames.filter(frame => frame.body.type === 'response.steer').length, 1, 'never automatically re-submit');
+    const turnsBeforeEdit = await rows(app, 'Turn', { conversation_id: conversationId });
+    await assert.rejects(app.turns.editAndRun({
+      source: { kind: 'command', key: 'edit-steering-message' }, conversationId,
+      leaseOwnerId: 'fixture', hostBootId: app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      messageId: durable.messageId, content: 'edited steering text'
+    }), /转向消息.*不能编辑后重新运行/, 'a steering Message is resent as a new Message, never edited in place');
+    assert.equal((await rows(app, 'Turn', { conversation_id: conversationId })).length, turnsBeforeEdit.length);
     const [result] = await rows(app, 'ToolModelResult', { tool_call_id: admitted.id });
     assert.ok(result, 'the real external effect settled durably');
     const [resultRevision] = await rows(app, 'MessageRevision', { id: result.message_revision_id });
