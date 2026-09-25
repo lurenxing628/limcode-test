@@ -1,49 +1,57 @@
 import { IconPlaylistAdd } from '@tabler/icons-vue';
 import type { TaskListToolOperationRecord } from '@shared/protocol';
 import {
-  formatTaskListProgress,
   taskListDisplayItemsFromOperation,
   taskListOperationFromArgs,
-  taskListOperationFromToolCall,
-  taskListTimelineEntryForToolCall,
-  type TaskListChangeItemView,
-  type TaskListItemView
+  taskListOperationFromToolCall
 } from '@webview/components/taskList/taskListModel';
-import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from './types';
+import type { ToolDisplayResolver, ToolDisplaySection } from './types';
 
 export const taskListToolDisplay: ToolDisplayResolver = (context) => {
-  const operation = taskListOperationFromToolCall(context.toolCall, { allowArgsFallback: true })
+  const detail = plainRecord(context.result);
+  // A completed ToolOutcome AND its hydrated, canonical result are required for an output card.
+  // Pending/failed calls may show their arguments, but arguments cannot establish task state.
+  const settled = context.toolCall?.status === 'success' && detail?.kind === 'task-list'
+    ? taskListOperationFromArgs(detail.operation)
+    : undefined;
+  const proposed = taskListOperationFromToolCall(context.toolCall, { allowArgsFallback: true })
     ?? taskListOperationFromArgs(context.args);
+  const operation = settled ?? proposed;
   if (!operation) return undefined;
 
   return {
     headerIcon: IconPlaylistAdd,
-    inputSections: inputSections(operation),
-    outputSections: outputSections(operation, context)
+    inputSections: inputSections(operation, !settled),
+    outputSections: settled ? outputSections(settled) : []
   };
 };
 
-function inputSections(operation: TaskListToolOperationRecord): ToolDisplaySection[] {
+function inputSections(operation: TaskListToolOperationRecord, preview: boolean): ToolDisplaySection[] {
   return [{
     kind: 'input',
-    title: '任务清单操作',
+    title: preview ? '任务清单参数预览（未确认完成）' : '任务清单操作',
     rows: [
       { label: '操作方式', value: operation.mode === 'rewrite' ? '重建完整任务清单' : '更新现有任务清单' },
-      { label: '任务数', value: `${operation.items.length} 项` }
+      { label: '任务数', value: `${operation.items.length} 项` },
+      ...(preview ? operation.items.map((item) => ({
+        label: item.delete ? '拟删除' : '拟设置',
+        value: `${item.title}${item.delete ? '' : ` · 目标状态：${item.status ?? 'pending'}`}`
+      })) : [])
     ],
     rowStyle: 'keyValue'
   }];
 }
 
-function outputSections(operation: TaskListToolOperationRecord, context: ToolDisplayContext): ToolDisplaySection[] {
-  const entry = timelineEntry(context);
-  const items = displayItems(operation, entry?.changes, entry?.snapshotAfter.items);
+function outputSections(operation: TaskListToolOperationRecord): ToolDisplaySection[] {
+  // The timeline reconstructs state from ToolCall arguments, which can disagree with the actual
+  // result (or omit earlier artifacts). Never let that speculative replay replace settled output.
+  const items = taskListDisplayItemsFromOperation(operation);
   const title = operation.mode === 'rewrite' ? '完整任务清单' : '任务清单变更';
   const emptyText = operation.mode === 'rewrite' ? '任务清单已清空。' : '没有可显示的变更。';
 
   return [{
     kind: 'output',
-    title: entry ? `${title} · ${formatTaskListProgress(entry.snapshotAfter)}` : title,
+    title,
     taskList: {
       items,
       showChange: operation.mode === 'update',
@@ -52,25 +60,8 @@ function outputSections(operation: TaskListToolOperationRecord, context: ToolDis
   }];
 }
 
-function timelineEntry(context: ToolDisplayContext) {
-  const toolCall = context.toolCall;
-  const conversationId = context.currentConversationId;
-  if (!toolCall || !conversationId || !context.messages || !context.toolCalls) return undefined;
-  return taskListTimelineEntryForToolCall({
-    messages: context.messages,
-    toolCalls: context.toolCalls,
-    conversationId,
-    toolCallId: toolCall.id
-  });
-}
-
-function displayItems(
-  operation: TaskListToolOperationRecord,
-  changes: TaskListChangeItemView[] | undefined,
-  snapshotItems: TaskListItemView[] | undefined
-): Array<TaskListItemView | TaskListChangeItemView> {
-  if (operation.mode === 'rewrite') {
-    return snapshotItems ?? taskListDisplayItemsFromOperation(operation).filter((item) => item.deleted !== true);
-  }
-  return changes ?? taskListDisplayItemsFromOperation(operation);
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }

@@ -306,7 +306,7 @@ function functionCallPartIndex(message: MessageRecord | undefined, toolCall: Too
 }
 
 function isAppliedTaskListToolCall(toolCall: ToolCallRecord): boolean {
-  if (toolCall.status !== 'success' && toolCall.status !== 'warning') return false;
+  if (toolCall.status !== 'success') return false;
   return toolCall.name === TASK_LIST_TOOL_NAME;
 }
 
