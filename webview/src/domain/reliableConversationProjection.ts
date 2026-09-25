@@ -17,7 +17,7 @@ import type {
 import { reliableKernelDetailKey } from './reliableDetailKey.ts';
 import { modelRequestNativeCapabilities } from '../reliability/modelRequestStreamStats.ts';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
-import { hasSteeringApplicationReceipt } from '../composables/steeringReceipts.ts';
+import { hasSteeringApplicationReceipt } from './steeringReceiptProof.ts';
 import type {
   ReliableKernelDetailState,
   ReliableKernelTransientState

@@ -204,7 +204,11 @@ const TEST_TIMEOUT_MS = 30 * 60 * 1000;
 // Several gate tests intentionally read/write shared evidence files. Node's default per-file
 // parallelism makes those durable fixtures race each other, so the advertised stable order must be
 // real rather than merely sorting the argv list.
-const webviewTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'limcode-webview-tests-'));
+// SSR bundles keep bare package imports (vue) external; Node resolves them by walking up from the
+// bundle, so the bundle must live inside this checkout's node_modules tree, not the system tmpdir.
+const webviewTestCache = path.join(root, 'node_modules', '.cache');
+fs.mkdirSync(webviewTestCache, { recursive: true });
+const webviewTestRoot = fs.mkdtempSync(path.join(webviewTestCache, 'limcode-webview-tests-'));
 // Vite sets NODE_ENV while bundling; do not leak its production environment into Node/SSR tests.
 const testEnvironment = { ...process.env };
 let result;
