@@ -328,6 +328,32 @@ export interface ProviderDispatchResult {
   superseded?: true;
 }
 
+/** One independent native Responses physical response, never the logical chain's billing total. */
+export interface NativePhysicalResponseUsageObservation {
+  responseId: string;
+  previousResponseId?: string;
+  streamSeq: string | bigint;
+  usage?: Record<string, unknown>;
+  /** A frozen local Context root, not by itself evidence of the whole provider-visible prompt. */
+  contextRootId?: string;
+  /** Only an adapter proving complete actual wire coverage may assert this. */
+  contextCovered?: boolean;
+}
+
+/** Bounded latest physical observation, stored inside existing ModelRequest.stream_stats_json. */
+export interface NativeLatestResponseUsage {
+  responseId: string;
+  previousResponseId?: string;
+  streamSeq: string;
+  attemptSeq: string;
+  socketGeneration: string;
+  physicalResponseCount: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  contextRootId?: string;
+  contextCovered?: true;
+}
+
 export interface StreamEventResult {
   accepted: boolean;
   checkpointed: boolean;
@@ -437,6 +463,8 @@ interface StreamStats {
    * the original ModelContextProjection root; never substituted by later/cumulative usage.
    */
   nativeInitialPromptTokenCount?: number;
+  /** Constant-size last physical usage plus saturating distinct-response count; not cumulative billing. */
+  nativeLatestResponseUsage?: NativeLatestResponseUsage;
   /** 终态才写：这次请求实际使用的 Claude 保留思考处理（按对话沿用，见 FullProviderRequest.claudeThinkingBinding）。 */
   claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
@@ -1650,10 +1678,36 @@ export class ModelProviderControlPlane {
   }
 
   /**
-   * Optimistic stream-stats merge for native anchors. The heartbeat writer mutates the same JSON
-   * column mid-stream, so a stale full-column assert is retried from a fresh read (bounded)
-   * instead of failing the dispatch; an identity change or a concurrent anchor write ends the
-   * attempt honestly, and every retry re-validates before writing.
+   * Fenced idempotent observation, callable after the physical native_control checkpoint. A missing
+   * usage is still a real response with an unknown token count; it must not inherit a predecessor's
+   * input count. No new physical SQLite schema/table is created.
+   */
+  public async persistNativeResponseUsage(
+    modelRequestId: string,
+    attemptSeq: string | bigint,
+    socketGeneration: string | bigint,
+    observation: NativePhysicalResponseUsageObservation
+  ): Promise<boolean> {
+    // Parse and validate before touching persistent state (including on duplicate delivery).
+    foldNativeResponseUsage(undefined, observation, attemptSeq, socketGeneration);
+    return this.mergeNativeStreamStats(modelRequestId, attemptSeq, socketGeneration, (stats) => {
+      const latest = foldNativeResponseUsage(stats.nativeLatestResponseUsage, observation, attemptSeq, socketGeneration);
+      return latest === stats.nativeLatestResponseUsage
+        ? { outcome: 'present' as const }
+        : { outcome: 'write' as const, stats: { ...stats, nativeLatestResponseUsage: latest } };
+    });
+  }
+
+  /** Read-only fenced request observation for the live native checkpoint; unknown remains unknown. */
+  public async readNativeLatestResponseUsage(modelRequestId: string): Promise<NativeLatestResponseUsage | undefined> {
+    const request = await this.requireDomain('ModelRequest', requireId(modelRequestId, 'modelRequestId'));
+    return parseStreamStats(request.stream_stats_json).nativeLatestResponseUsage;
+  }
+
+  /**
+   * Optimistic stream-stats merge for native anchors and physical observations. The heartbeat
+   * writer mutates the same JSON column mid-stream, so a stale full-column assert is retried
+   * from a fresh read (bounded) instead of failing dispatch.
    */
   private async mergeNativeStreamStats(
     modelRequestIdInput: string,
@@ -3000,6 +3054,133 @@ function conversationClaudeThinkingBinding(
   return binding ? { claudeThinkingBinding: binding } : {};
 }
 
+const MAX_NATIVE_PHYSICAL_RESPONSE_COUNT = 8;
+
+/** Raw Responses usage alone is evidence of per-response billing, not of Context coverage. */
+export function foldNativeResponseUsage(
+  previous: NativeLatestResponseUsage | undefined,
+  observation: NativePhysicalResponseUsageObservation,
+  attemptSeqInput: string | bigint,
+  socketGenerationInput: string | bigint
+): NativeLatestResponseUsage {
+  const responseId = requireId(observation.responseId, 'native responseId');
+  const streamSeq = decimalBigInt(observation.streamSeq, 'native streamSeq').toString();
+  const attemptSeq = decimalBigInt(attemptSeqInput, 'native attemptSeq').toString();
+  const socketGeneration = decimalBigInt(socketGenerationInput, 'native socketGeneration').toString();
+  const previousResponseId = observation.previousResponseId === undefined
+    ? undefined : requireId(observation.previousResponseId, 'native previousResponseId');
+  const contextRootId = observation.contextRootId === undefined
+    ? undefined : requireId(observation.contextRootId, 'native contextRootId');
+  if (observation.contextCovered === true && !contextRootId) {
+    throw new Error('Native physical response cannot claim full Context coverage without a root identity.');
+  }
+  if (observation.contextCovered !== undefined && typeof observation.contextCovered !== 'boolean') {
+    throw new TypeError('Native physical response Context coverage must be boolean.');
+  }
+  const usage = observation.usage;
+  if (usage !== undefined && !isRecord(usage)) throw new TypeError('Native response usage must be a record.');
+  // OpenAI Responses raw usage is *independent per physical response*. Cache-read tokens are a
+  // subset of input_tokens, not an additional amount; no provider-independent metadata guesses.
+  const inputTokens = optionalNonNegativeTokenCount(usage?.input_tokens);
+  const outputTokens = optionalNonNegativeTokenCount(usage?.output_tokens);
+  const old = previous ? parseNativeLatestResponseUsage(previous) : undefined;
+  const count = old?.physicalResponseCount ?? 0;
+  const candidate: NativeLatestResponseUsage = {
+    responseId,
+    ...(previousResponseId ? { previousResponseId } : {}),
+    streamSeq,
+    attemptSeq,
+    socketGeneration,
+    physicalResponseCount: Math.min(MAX_NATIVE_PHYSICAL_RESPONSE_COUNT, count + 1),
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(contextRootId ? { contextRootId } : {}),
+    ...(contextRootId && observation.contextCovered === true ? { contextCovered: true as const } : {})
+  };
+  if (!old) return candidate;
+  const attemptOrder = BigInt(attemptSeq) - BigInt(old.attemptSeq);
+  if (attemptOrder < 0n) return previous!;
+  const generationOrder = BigInt(socketGeneration) - BigInt(old.socketGeneration);
+  if (attemptOrder === 0n && generationOrder < 0n) return previous!;
+  const sameIdentity = old.responseId === responseId;
+  // Same responseId is one physical bill even if a newer socket replays its events. Its usage and
+  // coverage must never be silently upgraded or changed; a conflict is not an exact observation.
+  if (sameIdentity) {
+    if (old.previousResponseId !== candidate.previousResponseId
+      || old.inputTokens !== candidate.inputTokens
+      || old.outputTokens !== candidate.outputTokens
+      || old.contextRootId !== candidate.contextRootId
+      || old.contextCovered !== candidate.contextCovered) {
+      throw new Error(`Native physical response ${responseId} usage/frontier conflict.`);
+    }
+    return previous!;
+  }
+  if (attemptOrder === 0n && generationOrder === 0n) {
+    if (BigInt(streamSeq) < BigInt(old.streamSeq)) return previous!;
+    if (BigInt(streamSeq) === BigInt(old.streamSeq)) {
+      throw new Error('Native physical response streamSeq identity conflict.');
+    }
+  } else if (previousResponseId !== old.responseId) {
+    // A different socket resets its streamSeq. Count/sequence alone cannot distinguish a new
+    // response from a replay of r1 after r3, so only the committed latest ID can anchor a
+    // continuation. The SQLite worker enforces the same fence on every persisted transition.
+    return previous!;
+  }
+  // A broken provider predecessor chain cannot attest coverage or an exact response count. Force
+  // the bounded safety batch checkpoint while retaining the independent observed input count.
+  if (previousResponseId && previousResponseId !== old.responseId && attemptOrder === 0n) {
+    candidate.physicalResponseCount = MAX_NATIVE_PHYSICAL_RESPONSE_COUNT;
+    delete candidate.contextCovered;
+  }
+  return candidate;
+}
+
+/** Exact only if an explicit full-wire coverage proof matches the current Context root. */
+export function nativeResponseContextTokens(
+  response: NativeLatestResponseUsage | undefined,
+  currentRootId: string | undefined
+): number | undefined {
+  return response?.contextCovered === true && currentRootId && response.contextRootId === currentRootId
+    ? optionalNonNegativeTokenCount(response.inputTokens)
+    : undefined;
+}
+
+function parseNativeLatestResponseUsage(value: unknown): NativeLatestResponseUsage {
+  if (!isRecord(value)) throw new TypeError('Native latest response usage must be a record.');
+  const count = value.physicalResponseCount;
+  if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 1
+    || count > MAX_NATIVE_PHYSICAL_RESPONSE_COUNT) {
+    throw new TypeError('Native latest response count must be a bounded positive integer.');
+  }
+  const contextRootId = value.contextRootId === undefined
+    ? undefined : requireId(value.contextRootId, 'native contextRootId');
+  if (value.contextCovered === true && !contextRootId) {
+    throw new Error('Native latest response full Context coverage needs a root identity.');
+  }
+  if (value.contextCovered !== undefined && value.contextCovered !== true) {
+    throw new TypeError('Native latest response has an invalid Context coverage flag.');
+  }
+  if (value.inputTokens !== undefined && optionalNonNegativeTokenCount(value.inputTokens) === undefined) {
+    throw new TypeError('Native latest response inputTokens must be non-negative safe integer.');
+  }
+  if (value.outputTokens !== undefined && optionalNonNegativeTokenCount(value.outputTokens) === undefined) {
+    throw new TypeError('Native latest response outputTokens must be non-negative safe integer.');
+  }
+  return {
+    responseId: requireId(value.responseId, 'native responseId'),
+    ...(value.previousResponseId === undefined ? {}
+      : { previousResponseId: requireId(value.previousResponseId, 'native previousResponseId') }),
+    streamSeq: decimalBigInt(value.streamSeq, 'native streamSeq').toString(),
+    attemptSeq: decimalBigInt(value.attemptSeq, 'native attemptSeq').toString(),
+    socketGeneration: decimalBigInt(value.socketGeneration, 'native socketGeneration').toString(),
+    physicalResponseCount: count,
+    ...(value.inputTokens === undefined ? {} : { inputTokens: value.inputTokens as number }),
+    ...(value.outputTokens === undefined ? {} : { outputTokens: value.outputTokens as number }),
+    ...(contextRootId ? { contextRootId } : {}),
+    ...(value.contextCovered === true ? { contextCovered: true as const } : {})
+  };
+}
+
 function parseStreamStats(value: unknown): StreamStats {
   if (!isRecord(value)) throw new Error('ModelRequest.stream_stats_json must be an object.');
   const attemptSeq = decimalString(value.attemptSeq, 'stream_stats.attemptSeq');
@@ -3038,6 +3219,9 @@ function parseStreamStats(value: unknown): StreamStats {
       : {}),
     ...(optionalNonNegativeTokenCount(value.nativeInitialPromptTokenCount) !== undefined
       ? { nativeInitialPromptTokenCount: optionalNonNegativeTokenCount(value.nativeInitialPromptTokenCount) }
+      : {}),
+    ...(value.nativeLatestResponseUsage !== undefined
+      ? { nativeLatestResponseUsage: parseNativeLatestResponseUsage(value.nativeLatestResponseUsage) }
       : {})
   };
 }

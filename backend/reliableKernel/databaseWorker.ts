@@ -994,6 +994,25 @@ const NATIVE_CAPABILITY_FIELDS: Readonly<Record<string, true>> = {
   explicitCaching: true
 };
 
+const NATIVE_RESPONSE_USAGE_FIELDS = new Set([
+  'responseId', 'previousResponseId', 'streamSeq', 'attemptSeq', 'socketGeneration',
+  'physicalResponseCount', 'inputTokens', 'outputTokens', 'contextRootId', 'contextCovered'
+]);
+const MAX_NATIVE_PHYSICAL_RESPONSE_COUNT = 8;
+
+interface NativeResponseUsageStats {
+  responseId: string;
+  previousResponseId?: string;
+  streamSeq: bigint;
+  attemptSeq: bigint;
+  socketGeneration: bigint;
+  physicalResponseCount: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  contextRootId?: string;
+  contextCovered?: true;
+}
+
 function decodeModelStreamIdentity(value: unknown): {
   attemptSeq: bigint;
   socketGeneration: bigint;
@@ -1022,6 +1041,7 @@ function decodeModelStreamIdentity(value: unknown): {
     'nativeCapabilities',
     'thinkingSelection',
     'nativeInitialPromptTokenCount',
+    'nativeLatestResponseUsage',
     'compressionPurpose',
     'compressionDecision',
     'failure',
@@ -1084,13 +1104,135 @@ function decodeModelStreamIdentity(value: unknown): {
       }
     }
   }
+  const socketGeneration = decimalRuntimeInteger(record.socketGeneration, 'stream_stats.socketGeneration');
+  if (record.nativeLatestResponseUsage !== undefined) {
+    decodeNativeResponseUsage(record.nativeLatestResponseUsage, attemptSeq, socketGeneration);
+  }
   return {
     attemptSeq,
-    socketGeneration: decimalRuntimeInteger(record.socketGeneration, 'stream_stats.socketGeneration'),
+    socketGeneration,
     ...(retryMaxAttempts !== undefined ? { retryMaxAttempts } : {}),
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     ...(retryNotBeforeAt !== undefined ? { retryNotBeforeAt } : {})
   };
+}
+
+function decodeNativeResponseUsage(
+  value: unknown,
+  outerAttemptSeq: bigint,
+  outerSocketGeneration: bigint
+): NativeResponseUsageStats {
+  const label = 'ModelRequest.stream_stats_json.nativeLatestResponseUsage';
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object.`);
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !NATIVE_RESPONSE_USAGE_FIELDS.has(key))) {
+    throw new TypeError(`${label} has an unknown field.`);
+  }
+  const responseId = requireRuntimeId(record.responseId);
+  const previousResponseId = record.previousResponseId === undefined
+    ? undefined : requireRuntimeId(record.previousResponseId);
+  const contextRootId = record.contextRootId === undefined
+    ? undefined : requireRuntimeId(record.contextRootId);
+  if (record.contextCovered !== undefined && record.contextCovered !== true) {
+    throw new TypeError(`${label}.contextCovered must be true when declared.`);
+  }
+  if (record.contextCovered === true && !contextRootId) {
+    throw new TypeError(`${label}.contextCovered needs an explicit contextRootId.`);
+  }
+  const attemptSeq = decimalRuntimeInteger(record.attemptSeq, `${label}.attemptSeq`);
+  const socketGeneration = decimalRuntimeInteger(record.socketGeneration, `${label}.socketGeneration`);
+  const streamSeq = decimalRuntimeInteger(record.streamSeq, `${label}.streamSeq`);
+  if (attemptSeq > outerAttemptSeq || (attemptSeq === outerAttemptSeq && socketGeneration > outerSocketGeneration)) {
+    throw new TypeError(`${label} cannot claim a future stream identity.`);
+  }
+  assertOptionalBoundedInteger(record.physicalResponseCount, `${label}.physicalResponseCount`, 1, MAX_NATIVE_PHYSICAL_RESPONSE_COUNT);
+  if (record.physicalResponseCount === undefined) throw new TypeError(`${label}.physicalResponseCount is required.`);
+  assertOptionalBoundedInteger(record.inputTokens, `${label}.inputTokens`, 0, Number.MAX_SAFE_INTEGER);
+  assertOptionalBoundedInteger(record.outputTokens, `${label}.outputTokens`, 0, Number.MAX_SAFE_INTEGER);
+  return {
+    responseId,
+    previousResponseId,
+    contextRootId,
+    ...(record.contextCovered === true ? { contextCovered: true } : {}),
+    attemptSeq,
+    socketGeneration,
+    streamSeq,
+    physicalResponseCount: record.physicalResponseCount as number,
+    ...(record.inputTokens === undefined ? {} : { inputTokens: record.inputTokens as number }),
+    ...(record.outputTokens === undefined ? {} : { outputTokens: record.outputTokens as number })
+  };
+}
+
+function assertNativeResponseUsageTransition(
+  currentValue: unknown,
+  nextValue: unknown,
+  currentIdentity: { attemptSeq: bigint; socketGeneration: bigint },
+  nextIdentity: { attemptSeq: bigint; socketGeneration: bigint }
+): void {
+  const current = currentValue as Record<string, unknown>;
+  const next = nextValue as Record<string, unknown>;
+  const previous = current.nativeLatestResponseUsage === undefined ? undefined
+    : decodeNativeResponseUsage(current.nativeLatestResponseUsage, currentIdentity.attemptSeq, currentIdentity.socketGeneration);
+  const latest = next.nativeLatestResponseUsage === undefined ? undefined
+    : decodeNativeResponseUsage(next.nativeLatestResponseUsage, nextIdentity.attemptSeq, nextIdentity.socketGeneration);
+  if (!previous) {
+    if (latest && (latest.attemptSeq !== nextIdentity.attemptSeq
+      || latest.socketGeneration !== nextIdentity.socketGeneration)) {
+      throw new Error('A new native response usage observation must belong to the active stream identity.');
+    }
+    return;
+  }
+  if (!latest) {
+    // A retry starts a new attempt and may discard the old physical observation. Within one
+    // attempt, heartbeat/terminal metadata must not silently erase a committed response.
+    if (nextIdentity.attemptSeq === currentIdentity.attemptSeq) {
+      throw new Error('ModelRequest native response usage cannot disappear within one attempt.');
+    }
+    return;
+  }
+  if (latest.responseId === previous.responseId) {
+    // Replayed physical responses cannot upgrade unknown usage or invent Context coverage.
+    if (latest.previousResponseId !== previous.previousResponseId
+      || latest.streamSeq !== previous.streamSeq
+      || latest.attemptSeq !== previous.attemptSeq
+      || latest.socketGeneration !== previous.socketGeneration
+      || latest.physicalResponseCount !== previous.physicalResponseCount
+      || latest.inputTokens !== previous.inputTokens
+      || latest.outputTokens !== previous.outputTokens
+      || latest.contextRootId !== previous.contextRootId
+      || latest.contextCovered !== previous.contextCovered) {
+      throw new Error('Duplicate native physical response usage conflicts with committed facts.');
+    }
+    return;
+  }
+  if (latest.attemptSeq < previous.attemptSeq
+    || (latest.attemptSeq === previous.attemptSeq && latest.socketGeneration < previous.socketGeneration)
+    || latest.attemptSeq !== nextIdentity.attemptSeq
+    || latest.socketGeneration !== nextIdentity.socketGeneration) {
+    throw new Error('Native physical response usage cannot write from an old stream identity.');
+  }
+  const sameStreamIdentity = latest.attemptSeq === previous.attemptSeq
+    && latest.socketGeneration === previous.socketGeneration;
+  if (sameStreamIdentity && latest.streamSeq <= previous.streamSeq) {
+    throw new Error('Native physical response stream sequence must advance within one socket generation.');
+  }
+  // A new socket can restart streamSeq, so sequence alone cannot distinguish a fresh physical
+  // response from replaying an earlier responseId. The committed latest ID is the only bounded
+  // continuation anchor: a new ID across stream identities must name it exactly. A retry that
+  // explicitly cleared nativeLatestResponseUsage is handled by the no-previous branch above.
+  // Within one socket stateless HTTP responses need not carry previousResponseId.
+  if (!sameStreamIdentity && latest.previousResponseId !== previous.responseId) {
+    throw new Error('Native physical response continuation lacks the committed latest predecessor.');
+  }
+  const brokenPredecessor = latest.attemptSeq === previous.attemptSeq
+    && latest.previousResponseId !== undefined && latest.previousResponseId !== previous.responseId;
+  const expectedCount = brokenPredecessor ? MAX_NATIVE_PHYSICAL_RESPONSE_COUNT
+    : Math.min(MAX_NATIVE_PHYSICAL_RESPONSE_COUNT, previous.physicalResponseCount + 1);
+  if (latest.physicalResponseCount !== expectedCount || (brokenPredecessor && latest.contextCovered === true)) {
+    throw new Error('Native physical response count or Context coverage conflicts with its predecessor.');
+  }
 }
 
 function optionalDecimalInteger(value: unknown, label: string): bigint | undefined {
@@ -1768,6 +1910,9 @@ function assertRuntimeStateTransition(
     if ('stream_stats_json' in patch) {
       const currentIdentity = decodeModelStreamIdentity(current.stream_stats_json);
       const nextIdentity = decodeModelStreamIdentity(patch.stream_stats_json);
+      assertNativeResponseUsageTransition(
+        current.stream_stats_json, patch.stream_stats_json, currentIdentity, nextIdentity
+      );
       const sameAttempt = nextIdentity.attemptSeq === currentIdentity.attemptSeq;
       const sameRetryBudget = currentIdentity.retryMaxAttempts === nextIdentity.retryMaxAttempts;
       const oneRetry = nextIdentity.attemptSeq === currentIdentity.attemptSeq + 1n

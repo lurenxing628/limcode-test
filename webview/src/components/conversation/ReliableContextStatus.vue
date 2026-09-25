@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue';
+import { computed } from 'vue';
 import {
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
   type LlmCompressionConfigRecord,
@@ -9,9 +9,8 @@ import {
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
-import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
-import { formatCompactTokenNumber, formatTokenNumber, normalizeTokenUsage } from './tokenUsageModel';
+import { currentRootEstimatedTokens, formatCompactTokenNumber, formatTokenNumber, nativePhysicalContextUsage, normalizeTokenUsage } from './tokenUsageModel';
 
 const reliableConversation = useReliableConversation();
 const globalSettings = useGlobalSettingsStore();
@@ -30,8 +29,12 @@ const ordinaryRequestIds = computed(() => new Set(
 ));
 // Compression calls are ModelRequests too, but their usage describes the compaction operation rather
 // than the ordinary model prompt. Only requests that own an assistant Message are context baselines.
+const requestProjections = computed(() => Object.values(reliableConversation.feed.records.ModelContextProjection ?? {}));
 const ordinaryRequests = computed(() => conversationRequests.value
-  .filter((request) => ordinaryRequestIds.value.has(text(request.id))));
+  .filter((request) => ordinaryRequestIds.value.has(text(request.id))
+    || (request.status !== 'terminal' && isNativeRequest(request)
+      && requestProjections.value.some((projection) =>
+        projection.owner_kind === 'model_request' && projection.owner_id === request.id))));
 const latestOrdinaryRequest = computed(() => ordinaryRequests.value[0]);
 const currentContextStatus = computed(() => Object.values(
   reliableConversation.feed.records.ConversationContextStatus ?? {}
@@ -39,13 +42,13 @@ const currentContextStatus = computed(() => Object.values(
 const latestOrdinaryProjection = computed(() => {
   const requestId = text(latestOrdinaryRequest.value?.id);
   if (!requestId) return undefined;
-  return Object.values(reliableConversation.feed.records.ModelContextProjection ?? {})
+  return requestProjections.value
     .find((projection) => projection.owner_kind === 'model_request' && projection.owner_id === requestId);
 });
 const ordinaryUsageStale = computed(() => {
   if (!latestOrdinaryRequest.value) return false;
   const currentRootId = text(currentContextStatus.value?.root_id);
-  if (!currentRootId) return false;
+  if (!currentRootId) return true;
   const requestRootId = text(latestOrdinaryProjection.value?.root_id);
   return !requestRootId || requestRootId !== currentRootId;
 });
@@ -62,65 +65,49 @@ const contextWindowTokens = computed(() =>
   ?? positiveInteger(modelConfig.value?.contextWindowTokens)
   ?? positiveInteger(providerConfig.value?.contextWindowTokens)
 );
+const latestPhysicalResponse = computed(() => nativePhysicalContextUsage(
+  latestOrdinaryRequest.value?.stream_stats_json,
+  text(currentContextStatus.value?.root_id)
+));
 const latestExactUsage = computed(() => {
+  if (isNativeRequest(latestOrdinaryRequest.value)) return undefined;
   const requestId = text(latestOrdinaryRequest.value?.id);
   const transient = requestId
     ? reliableConversation.feed.transientModelRequests[requestId]?.usageMetadata
     : undefined;
   return transient ?? usageFromRequest(latestOrdinaryRequest.value);
 });
-const latestExactContextTokens = computed(() => tokenCount(latestExactUsage.value));
+const latestExactContextTokens = computed(() => isNativeRequest(latestOrdinaryRequest.value)
+  ? (latestPhysicalResponse.value?.exact ? latestPhysicalResponse.value.inputTokens : undefined)
+  : tokenCount(latestExactUsage.value));
 const exactContextTokens = computed(() => ordinaryUsageStale.value
   ? undefined
   : latestExactContextTokens.value);
-const estimatedContextTokens = computed(() =>
-  positiveInteger(currentContextStatus.value?.estimated_tokens)
-  ?? positiveInteger(latestRequest.value?.estimated_context_tokens)
-);
-// The Context root only carries estimator units. A compaction that already ran published the
-// Provider-calibrated size of the Context it produced, which is what the next request will actually
-// report, so prefer that over re-estimating a body nobody has measured yet.
-const latestCompressionBlock = computed(() => Object.values(reliableConversation.feed.records.CompressionBlock ?? {})
-  .filter((block) => block.conversation_id === reliableConversation.conversationId.value && block.status === 'enabled')
-  .sort((left, right) => timestamp(right.created_at) - timestamp(left.created_at))[0]);
-const compressionProjectionApplies = computed(() => {
-  if (!ordinaryUsageStale.value) return false;
-  const blockCreatedAt = timestamp(latestCompressionBlock.value?.created_at);
-  if (!blockCreatedAt) return false;
-  // A rewind installs an older root; the projection then describes a Context nobody is sending.
-  const rootCreatedAt = timestamp(currentContextStatus.value?.root_created_at);
-  if (!rootCreatedAt || rootCreatedAt < blockCreatedAt) return false;
-  return blockCreatedAt >= timestamp(latestOrdinaryRequest.value?.created_at);
-});
-const compressionProjectedContextTokens = computed(() => {
-  if (!compressionProjectionApplies.value) return undefined;
-  const blockId = text(latestCompressionBlock.value?.id);
-  if (!blockId) return undefined;
-  const detail = reliableConversation.feed.details[reliableKernelDetailKey('compression-presentation', blockId)];
-  if (detail?.status !== 'ready') return undefined;
-  return positiveInteger(parsePresentationTokens(detail.text));
-});
+const estimatedContextTokens = computed(() => currentRootEstimatedTokens(
+  text(currentContextStatus.value?.root_id),
+  currentContextStatus.value?.estimated_tokens,
+  text(latestOrdinaryProjection.value?.root_id),
+  latestOrdinaryRequest.value?.estimated_context_tokens
+));
+// CompressionBlock presentation has no block → output-root link in this feed. Its
+// ModelContextProjection.root_id names the source root, and matching timestamps prove nothing
+// about a later edited root. Without an estimate for the current root, stay unknown.
 const previousExactContextTokens = computed(() => {
+  if (isNativeRequest(latestOrdinaryRequest.value)) return latestPhysicalResponse.value?.inputTokens;
   if (ordinaryUsageStale.value && latestExactContextTokens.value !== undefined) {
     return latestExactContextTokens.value;
   }
   for (const request of ordinaryRequests.value) {
+    if (isNativeRequest(request)) continue;
     const tokens = tokenCount(usageFromRequest(request));
     if (tokens !== undefined && tokens !== exactContextTokens.value) return tokens;
   }
   return undefined;
 });
-const actualContextTokens = computed(() =>
-  exactContextTokens.value
-  ?? compressionProjectedContextTokens.value
-  ?? estimatedContextTokens.value
-  ?? previousExactContextTokens.value
-);
-const usageQuality = computed<'exact' | 'compression_projected' | 'estimated' | 'previous_exact' | 'unknown'>(() => {
+const actualContextTokens = computed(() => exactContextTokens.value ?? estimatedContextTokens.value);
+const usageQuality = computed<'exact' | 'estimated' | 'unknown'>(() => {
   if (exactContextTokens.value !== undefined) return 'exact';
-  if (compressionProjectedContextTokens.value !== undefined) return 'compression_projected';
   if (estimatedContextTokens.value !== undefined) return 'estimated';
-  if (previousExactContextTokens.value !== undefined) return 'previous_exact';
   return 'unknown';
 });
 const thresholdTokens = computed(() =>
@@ -150,9 +137,7 @@ const thresholdStyle = computed(() => ({
     : '100%'
 }));
 const compactLabel = computed(() => {
-  const prefix = usageQuality.value === 'estimated' || usageQuality.value === 'compression_projected'
-    ? '≈'
-    : usageQuality.value === 'previous_exact' ? '≤' : '';
+  const prefix = usageQuality.value === 'estimated' ? '≈' : '';
   const used = actualContextTokens.value === undefined ? '?' : `${prefix}${formatCompactTokenNumber(actualContextTokens.value)}`;
   const window = contextWindowTokens.value === undefined ? '?' : formatCompactTokenNumber(contextWindowTokens.value);
   return `${used} / ${window}`;
@@ -161,8 +146,11 @@ const percentLabel = computed(() => usageRatio.value === undefined ? '未知' : 
 const tooltipRows = computed(() => [
   { label: 'LLM', value: modelId.value || '尚未发起 LLM 请求' },
   { label: '当前上下文', value: contextUsageLabel() },
-  ...(ordinaryUsageStale.value && latestExactContextTokens.value !== undefined
-    ? [{ label: '最近请求精确输入', value: `${formatTokenNumber(latestExactContextTokens.value)} Token` }]
+  ...(previousExactContextTokens.value !== undefined && exactContextTokens.value === undefined
+    ? [{ label: isNativeRequest(latestOrdinaryRequest.value) ? '最近物理响应输入（非当前占用）' : '上一请求实际输入（非当前占用）', value: `${formatTokenNumber(previousExactContextTokens.value)} Token` }]
+    : []),
+  ...(latestPhysicalResponse.value && latestPhysicalResponse.value.inputTokens === undefined
+    ? [{ label: '最近物理响应输入', value: '未知（渠道未提供实际用量）' }]
     : []),
   { label: '上下文窗口', value: contextWindowTokens.value === undefined ? '未知（暂未获取，且配置中未设置）' : `${formatTokenNumber(contextWindowTokens.value)} Token` },
   { label: '窗口占用', value: percentLabel.value },
@@ -173,21 +161,6 @@ const tooltipRows = computed(() => [
 const overThreshold = computed(() => actualContextTokens.value !== undefined
   && thresholdTokens.value !== undefined
   && actualContextTokens.value >= thresholdTokens.value);
-
-watch(
-  () => (compressionProjectionApplies.value ? text(latestCompressionBlock.value?.id) : ''),
-  (blockId) => {
-    if (!blockId) return;
-    if (reliableConversation.feed.details[reliableKernelDetailKey('compression-presentation', blockId)]) return;
-    reliableConversation.feed.requestDetail('compression-presentation', blockId, { priority: 'visible' });
-  },
-  { immediate: true }
-);
-
-function parsePresentationTokens(detailText: string): unknown {
-  const record = asRecord(parseJson(detailText));
-  return record?.calibratedTokensAfter;
-}
 
 function activeProviderConfig(): LlmProviderConfigRecord | undefined {
   const providerId = text(latestRequest.value?.provider_id);
@@ -240,6 +213,15 @@ function configuredCompressionThreshold(contextWindow: number | undefined): numb
   return Math.round(contextWindow * Math.max(0, Math.min(100, percent)) / 100);
 }
 
+function isNativeRequest(request: Record<string, unknown> | undefined): boolean {
+  if (!request) return false;
+  const stats = asRecord(typeof request.stream_stats_json === 'string'
+    ? parseJson(request.stream_stats_json) : request.stream_stats_json);
+  return stats?.nativeCapabilities !== undefined
+    || stats?.nativeInitialPromptTokenCount !== undefined
+    || stats?.nativeLatestResponseUsage !== undefined;
+}
+
 function usageFromRequest(request: Record<string, unknown> | undefined): LlmUsageMetadataRecord | undefined {
   if (!request) return undefined;
   const value = typeof request.usage_json === 'string' ? parseJson(request.usage_json) : request.usage_json;
@@ -248,31 +230,29 @@ function usageFromRequest(request: Record<string, unknown> | undefined): LlmUsag
 
 function tokenCount(usage: LlmUsageMetadataRecord | undefined): number | undefined {
   const normalized = usage ? normalizeTokenUsage(usage) : undefined;
-  return normalized?.input ?? normalized?.total;
+  return normalized?.sourceEstimated ? undefined : normalized?.input;
 }
 
 function contextUsageLabel(): string {
   const tokens = actualContextTokens.value;
-  if (tokens === undefined) return '未知（尚未建立上下文）';
-  const suffix = usageQuality.value === 'compression_projected'
-    ? ' Token（压缩后实测换算）'
-    : usageQuality.value === 'estimated'
-      ? ' Token（当前估算）'
-      : usageQuality.value === 'previous_exact'
-        ? ' Token（上一轮精确值）'
-        : ' Token（精确）';
+  if (tokens === undefined) return latestPhysicalResponse.value
+    ? '未知（物理响应输入未覆盖当前上下文）'
+    : '未知（尚未建立上下文）';
+  const suffix = usageQuality.value === 'estimated' ? ' Token（当前估算）' : ' Token（精确）';
   return `${formatTokenNumber(tokens)}${suffix}`;
 }
 
 function usageSourceLabel(): string {
-  if (usageQuality.value === 'exact') return '最近一次 LLM 请求的实际输入用量';
-  if (usageQuality.value === 'compression_projected') return '最近一次压缩按渠道实测倍率换算出的上下文体积';
+  if (usageQuality.value === 'exact') return isNativeRequest(latestOrdinaryRequest.value)
+    ? '已证明覆盖当前 Context root 的物理响应实际输入用量'
+    : '最近一次 LLM 请求的实际输入用量';
   if (usageQuality.value === 'estimated') {
-    return ordinaryUsageStale.value
-      ? '当前 Context root 估算；最近请求精确输入仅作为校准'
-      : '根据当前模型渠道的上下文规则估算';
+    return isNativeRequest(latestOrdinaryRequest.value)
+      ? '当前 Context root 估算；物理响应输入未证明覆盖当前窗口，链累计仅作计费'
+      : ordinaryUsageStale.value
+        ? '当前 Context root 估算；最近请求实际输入仅作为历史参考'
+        : '根据当前模型渠道的上下文规则估算';
   }
-  if (usageQuality.value === 'previous_exact') return '上一次已完成 LLM 请求的实际输入用量';
   return latestRequest.value ? 'LLM 请求 / 当前 LLM 配置' : '当前 LLM 配置';
 }
 

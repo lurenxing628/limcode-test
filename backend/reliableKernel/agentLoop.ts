@@ -61,7 +61,13 @@ import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIRespo
 import { NativeRequestSession } from './nativeRequestSession';
 import { NativeAsyncWorkPendingError, TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY, parseNativeControlCheckpoint } from './nativeToolFacts';
 import { readNativeSteeringInFlight } from './nativeSteering';
-import { planNativeCompressionRebase } from './nativeCompressionGuard';
+import {
+  NativeRequestBudgetError,
+  NativeSafetyWaitError,
+  nativePhysicalResponseBudgetPressure,
+  planNativeCompressionRebase,
+  type NativeLogicalRequestBudget
+} from './nativeCompressionGuard';
 import {
   readCurrentTurnTaskCard,
   shouldInjectTurnTaskCard,
@@ -78,7 +84,7 @@ import {
   TurnControlPlane,
   type TurnInputCommand
 } from './turnControlPlane';
-import { readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenCompressionPolicy, readFrozenTurnAuthority } from './frozenAuthority';
 import { assistantMessageIdFor, TurnOutputControlPlane } from './turnOutput';
 import { ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
 import type {
@@ -591,6 +597,51 @@ export class ReliableAgentLoop {
               compressionDecision: compression.recoveryDecision
             }, 'Request compression recovery decision');
           }
+          if (readFrozenNativeCapabilities(requireRecord(frozenRecipe, 'Native request recipe'))) {
+            const compressionPolicy = frozenCompressionPolicy(preview.authoritySnapshot);
+            const nativeBudget: NativeLogicalRequestBudget = {
+              planningInputCapacityTokens: planningBudget.planningInputCapacityTokens,
+              compressionThresholdTokens: planningBudget.compressionThresholdTokens,
+              autoCompressionEnabled: compressionPolicy?.triggerMode === 'token_threshold'
+                && compressionPolicy.methodKind !== 'disabled'
+            };
+            // Freeze the actual full-request planning budget with the recipe; a reconnected Host
+            // must not derive a different safety capacity from mutable settings or a later head.
+            frozenRecipe = normalizePlainJson({
+              ...(frozenRecipe as { [key: string]: PlainJsonValue }),
+              nativeLogicalBudget: nativeBudget
+            }, 'Native logical request budget');
+            if (requestSequence > 1n) {
+              const previousId = modelRequestIdFor(turnId,
+                `agent-loop:${turnId}:round:${(requestSequence - 1n).toString()}`);
+              const previous = await this.maybeGet('ModelRequest', previousId);
+              if (previous && previous.provider_id === preview.providerId && previous.model_id === preview.modelId) {
+                const observed = await this.modelProvider.readNativeLatestResponseUsage(previousId);
+                const previousStream = asRecord(previous.stream_stats_json);
+                if (observed?.inputTokens !== undefined
+                  && observed.attemptSeq === String(previousStream?.attemptSeq)
+                  && observed.socketGeneration === String(previousStream?.socketGeneration)
+                  && nativePhysicalResponseBudgetPressure({
+                    budget: nativeBudget,
+                    physicalInputTokens: observed.inputTokens,
+                    // The eighth physical response is a periodic preflight checkpoint, not by
+                    // itself evidence that its input is near capacity. Only actual raw input may
+                    // force a refusal when the user disabled compression.
+                    physicalResponseCount: 1
+                  }) && (compression.status !== 'compressed'
+                    || nativePhysicalResponseBudgetPressure({
+                      budget: nativeBudget,
+                      physicalInputTokens: planningBudget.estimatedFullInputTokens,
+                      physicalResponseCount: 1
+                    }))) {
+                  // A committed compression still needs to leave planning headroom. Never send a
+                  // growing raw input a second time or enable a user-disabled method implicitly.
+                  throw new NativeRequestBudgetError(observed.inputTokens,
+                    nativeBudget.planningInputCapacityTokens);
+                }
+              }
+            }
+          }
           await this.guardNativeModelSwitch(
             requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
             preview.providerId,
@@ -852,6 +903,18 @@ export class ReliableAgentLoop {
         requestSequence += 1n;
       }
     } catch (error) {
+      if (error instanceof NativeSafetyWaitError) {
+        if (await this.terminateIfRequested(turnId, 'native-safety-wait')) {
+          return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+        }
+        // An ambiguous wire result cannot be resent, but this already-admitted external tool
+        // must not be cancelled merely to turn a pending Turn into a failure. The durable
+        // dispatcher/runner wakes the same Turn after settlement, then refusal can close it.
+        return {
+          turnId, terminalStatus: 'waiting', modelRequestIds, assistantMessageIds,
+          toolCallIds, waitingToolCallId: error.toolCallId
+        };
+      }
       // Host shutdown / lease replacement is a recoverable transport handoff. Recording a failed
       // Turn here would destroy the exact durable frontier the next Host needs to resume.
       if (isExecutionHandoffError(error)) throw error;
@@ -2023,6 +2086,10 @@ export class ReliableAgentLoop {
       const definitions = await this.readModelRequestToolDefinitions(modelRequestId, recipe);
       const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
       const catalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+      const projection = await this.list('ModelContextProjection', {
+        owner_kind: 'model_request', owner_id: modelRequestId
+      }, 2);
+      if (projection.length !== 1) throw new Error(`Native ModelRequest ${modelRequestId} has no unique frozen Context root.`);
       session = new NativeRequestSession({
         database: this.database,
         contentStore: this.contentStore,
@@ -2037,6 +2104,8 @@ export class ReliableAgentLoop {
         providerId,
         modelId,
         capabilities: nativeCapabilities,
+        budget: readFrozenNativeLogicalBudget(recipe),
+        initialContextRootId: requireId(projection[0]!.root_id, 'ModelContextProjection.root_id'),
         modelHandleCatalog: catalog,
         resolveAdapter: async (id) => this.providers.resolve(id),
         resolveDefinition: (name) => definitionsByName.get(name) ?? unknownToolDefinition(name),
@@ -2064,6 +2133,19 @@ export class ReliableAgentLoop {
         now: this.now
       });
       await session.reconcile();
+      const unsafeAdmission = session.unsafeResultAdmissionError();
+      if (unsafeAdmission) {
+        const running = (await this.effects.listNativePendingWork({ conversationId, turnId }))
+          .find(call => call.modelRequestId === modelRequestId && !call.settled);
+        if (running) {
+          await session.dispose('handoff');
+          throw new NativeSafetyWaitError(running.toolCallId);
+        }
+        // No admitted external effect remains in flight. Close the local results, never
+        // reissue a physically ambiguous result create, then fail this user Turn explicitly.
+        await session.dispose('failed');
+        throw unsafeAdmission;
+      }
     }
     const activeSession = session;
     // Native controls consume provider stream sequence numbers but never enter the Webview
@@ -2239,6 +2321,12 @@ export class ReliableAgentLoop {
     } finally {
       if (session) await session.dispose(outcome);
     }
+    // The Provider may have accepted an ambiguous result/steer successor without furnishing
+    // separate admission proofs. The physical chain has ended, its settled ToolModelResult was
+    // durably closed into Context by dispose, but another automatic full request would risk
+    // replaying a result that the Provider already consumed. Fail the Turn visibly instead.
+    const unsafeAdmission = session?.unsafeResultAdmissionError();
+    if (unsafeAdmission) throw unsafeAdmission;
     // The terminal CAS checkpoint is the only final output authority. The transient collector exists
     // solely to drive low-latency UI observation and must never become a second durable result path.
     return this.readTerminalProviderOutput(modelRequestId);
@@ -3329,6 +3417,24 @@ function readFrozenNativeCapabilities(
   return capabilities.asyncTools || capabilities.steering || capabilities.reasoningUpdates
     ? capabilities
     : undefined;
+}
+
+function readFrozenNativeLogicalBudget(
+  recipe: { [key: string]: PlainJsonValue }
+): NativeLogicalRequestBudget {
+  const budget = asRecord(recipe.nativeLogicalBudget);
+  if (!budget || !Number.isSafeInteger(budget.planningInputCapacityTokens)
+    || (budget.planningInputCapacityTokens as number) < 0
+    || !Number.isSafeInteger(budget.compressionThresholdTokens)
+    || (budget.compressionThresholdTokens as number) <= 0
+    || typeof budget.autoCompressionEnabled !== 'boolean') {
+    throw new Error('Native ModelRequest has no valid frozen full-request safety budget.');
+  }
+  return {
+    planningInputCapacityTokens: budget.planningInputCapacityTokens as number,
+    compressionThresholdTokens: budget.compressionThresholdTokens as number,
+    autoCompressionEnabled: budget.autoCompressionEnabled as boolean
+  };
 }
 
 function providerToolCallId(modelRequestId: string, call: NormalizedToolCall): string {

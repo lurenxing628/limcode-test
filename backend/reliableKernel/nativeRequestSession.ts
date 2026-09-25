@@ -16,6 +16,7 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { freezeNativeChildToolProjection, readNativeRequestChildHandles, withChildHandles } from './conversationChildHandles';
 import { isCollaborationHandleTool, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { nativePhysicalResponseBudgetPressure, type NativeLogicalRequestBudget } from './nativeCompressionGuard';
 import {
   EffectControlPlane,
   type FrozenToolCallPolicyDecision,
@@ -87,9 +88,12 @@ interface NativeSessionCall {
 
 interface NativeSessionResponse {
   responseId: string;
+  previousResponseId?: string;
   boundarySeq?: string;
   boundaryReason?: string;
   admissionBoundary: boolean;
+  /** Only a real completed response is a safe logical-request checkpoint (not a steered incomplete). */
+  completed: boolean;
   syncRequired: boolean;
 }
 
@@ -107,6 +111,9 @@ export interface NativeRequestSessionDeps {
   providerId: string;
   modelId: string;
   capabilities: OpenAIResponsesNativeCapabilities;
+  budget: NativeLogicalRequestBudget;
+  /** Root frozen in the original request; not proof that any subsequent native wire input covers it. */
+  initialContextRootId: string;
   /** Immutable initial recipe catalog; committed native tool projections extend its child identities. */
   modelHandleCatalog?: ModelHandleCatalog;
   resolveAdapter: (providerId: string) => Promise<{
@@ -151,6 +158,8 @@ export class NativeRequestSession {
   private stream?: { attemptSeq: string; socketGeneration: string };
   private readonly calls = new Map<string, NativeSessionCall>();
   private readonly callByProviderId = new Map<string, NativeSessionCall>();
+  /** Global ordinals live on SourceLinks beyond bounded proofs or a new socket generation. */
+  private readonly durableCallOrdinals = new Map<string, { toolCallId: string; providerOrdinal: number }>();
   private readonly responses = new Map<string, NativeSessionResponse>();
   private readonly responseOrder: string[] = [];
   private readonly itemAccumulators = new Map<string, { text: string; thought: string; thoughtSignature?: string }>();
@@ -165,11 +174,17 @@ export class NativeRequestSession {
   private readonly responseCallCounts = new Map<string, number>();
   private readonly steerReceipts = new Map<string, NativeSteeringReceipt>();
   private firstResponseId?: string;
+  private firstResponseLost = false;
   private pumpRunning = false;
   private pumpDirty = false;
   private readonly inFlightDeliveries = new Set<string>();
+  /** Wire-written but unacknowledged results must never be auto-resubmitted on this chain. */
+  private readonly uncertainResultCalls = new Set<string>();
+  private unsafeResultAdmission?: Error;
   private disposed = false;
   private yieldingForRuntimeInput = false;
+  private preparingCheckpoint = false;
+  private lastBackpressureResponseId?: string;
   private childCatalog: ModelHandleCatalog;
   private readonly callResolutions = new Map<string, { arguments: PlainJsonValue; error?: string; catalog: ModelHandleCatalog }>();
 
@@ -191,13 +206,72 @@ export class NativeRequestSession {
     return normalizeModelHandleCatalog(this.childCatalog);
   }
 
+  /** The Provider chain must fail explicitly rather than rebasing an ambiguous result/steer. */
+  public unsafeResultAdmissionError(): Error | undefined {
+    return this.unsafeResultAdmission;
+  }
+
   /** Rebuilds in-memory orchestration state from durable facts after a crash/reconnect. */
   public async reconcile(): Promise<void> {
     this.childCatalog = withChildHandles(this.childCatalog,
       await readNativeRequestChildHandles(this.deps.database, this.deps.contentStore, this.deps.modelRequestId));
-    const checkpoints = await listAllDomainRows(this.deps.database, 'ModelStreamCheckpoint', {
+    const previouslyObserved = await this.deps.modelProvider.readNativeLatestResponseUsage(this.deps.modelRequestId);
+    // Terminal checkpoints can be compacted/pruned. If the first response is no longer
+    // represented, the earliest surviving response.created cannot calibrate its initial root.
+    this.firstResponseLost = (previouslyObserved?.physicalResponseCount ?? 0) > 1;
+    if (previouslyObserved?.physicalResponseCount === 1) this.firstResponseId = previouslyObserved.responseId;
+    const sourceLinks = (await listAllDomainRows(this.deps.database, 'ToolCallSourceLink', {
       model_request_id: this.deps.modelRequestId
+    })).sort((left, right) => {
+      const a = BigInt(String(left.provider_ordinal));
+      const b = BigInt(String(right.provider_ordinal));
+      return a < b ? -1 : a > b ? 1 : 0;
     });
+    for (const source of sourceLinks) {
+      const providerCallId = typeof source.provider_call_id === 'string' ? source.provider_call_id : undefined;
+      if (!providerCallId) continue;
+      const toolCallId = requireId(source.tool_call_id, 'ToolCallSourceLink.tool_call_id');
+      const providerOrdinal = Number(source.provider_ordinal);
+      if (!Number.isSafeInteger(providerOrdinal) || providerOrdinal < 0) {
+        throw new Error(`Native ToolCallSourceLink ${String(source.id)} has an invalid provider ordinal.`);
+      }
+      const old = this.durableCallOrdinals.get(providerCallId);
+      if (old && (old.toolCallId !== toolCallId || old.providerOrdinal !== providerOrdinal)) {
+        throw new Error(`Native provider call ${providerCallId} has conflicting durable identities.`);
+      }
+      this.durableCallOrdinals.set(providerCallId, { toolCallId, providerOrdinal });
+      const admission = await this.deps.effects.readNativeAdmission(toolCallId);
+      if (!admission) continue;
+      if (admission.providerCallId !== providerCallId) {
+        throw new Error(`Native admission for ${toolCallId} disagrees with ToolCallSourceLink.`);
+      }
+      const toolCall = await this.requireDomain('ToolCall', toolCallId);
+      const metadata = await this.requireDomain('ContentObject',
+        requireId(toolCall.arguments_object_id, 'ToolCall.arguments_object_id')) as unknown as ContentObjectMetadata;
+      const argumentsValue = normalizePlainJson(JSON.parse((await this.deps.contentStore.read(metadata)).toString('utf8')),
+        'Durable native tool arguments');
+      this.callResolutions.set(providerCallId, { arguments: argumentsValue, catalog: this.currentModelHandleCatalog() });
+      const call: NativeSessionCall = {
+        toolCallId, providerCallId, providerOrdinal, responseId: admission.responseId,
+        name: requireId(toolCall.tool_name, 'ToolCall.tool_name'), arguments: argumentsValue,
+        itemSeq: admission.streamSeq, asyncDeclared: admission.declaredAsync,
+        admitted: true, settled: false, resultOccurrence: false, delivered: false
+      };
+      this.calls.set(toolCallId, call);
+      this.callByProviderId.set(providerCallId, call);
+      this.responseFor(admission.responseId);
+    }
+    const checkpoints = (await listAllDomainRows(this.deps.database, 'ModelStreamCheckpoint', {
+      model_request_id: this.deps.modelRequestId
+    })).sort((left, right) => {
+      for (const key of ['attempt_seq', 'socket_generation', 'stream_seq']) {
+        const a = BigInt(String(left[key]));
+        const b = BigInt(String(right[key]));
+        if (a !== b) return a < b ? -1 : 1;
+      }
+      return 0;
+    });
+    const checkpointCreatedOrder: string[] = [];
     const contentRows = new Map<string, DomainRow>();
     for (const checkpoint of checkpoints) {
       const kind = String(checkpoint.checkpoint_kind);
@@ -243,16 +317,39 @@ export class NativeRequestSession {
       } else {
         const control = parseNativeControlCheckpoint(content);
         if (control.type === 'response.created') {
+          const unverifiedIds = nativeUnverifiedResultCallIds(content);
+          if (unverifiedIds) {
+            for (const providerCallId of unverifiedIds) {
+              const call = this.callByProviderId.get(providerCallId);
+              if (!call || !this.durableCallOrdinals.has(providerCallId)) {
+                throw new Error(`Native unverified result ${providerCallId} has no durable admission identity.`);
+              }
+              this.uncertainResultCalls.add(call.toolCallId);
+            }
+            this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
+          }
+          if (!checkpointCreatedOrder.includes(control.responseId)) checkpointCreatedOrder.push(control.responseId);
           this.responseFor(control.responseId);
-          this.firstResponseId ??= control.responseId;
+          if (!this.firstResponseLost && !this.firstResponseId && !previouslyObserved
+            && this.responseOrder.length === 1) this.firstResponseId = control.responseId;
         } else if (control.type === 'response.completed' || control.type === 'response.incomplete') {
           const response = this.responseFor(control.responseId);
           response.boundarySeq = String(checkpoint.stream_seq);
           response.boundaryReason = control.reason;
+          response.completed = control.type === 'response.completed';
           response.admissionBoundary = isNativeAdmissionBoundary(control);
         }
       }
     }
+    if (previouslyObserved?.previousResponseId) {
+      // Restore attribution without changing the order reconstructed from durable stream facts.
+      this.responseFor(previouslyObserved.responseId).previousResponseId = previouslyObserved.previousResponseId;
+    }
+    // SourceLinks may predate the bounded checkpoints. Within the surviving tail the accepted
+    // response.created stream sequence, not a hashed row id or a SourceLink read, owns the order.
+    const retainedCreated = new Set(checkpointCreatedOrder);
+    this.responseOrder.splice(0, this.responseOrder.length,
+      ...this.responseOrder.filter(id => !retainedCreated.has(id)), ...checkpointCreatedOrder);
     // Rebuild only deterministic item revisions; a cumulative/final revision may also contain
     // exactly one part and must never create a second occurrence during recovery.
     const message = await this.getOptional('Message', assistantMessageIdFor(this.deps.turnId, this.deps.modelRequestId));
@@ -303,6 +400,7 @@ export class NativeRequestSession {
       conversationId: this.deps.conversationId,
       turnId: this.deps.turnId
     });
+    const request = await this.requireDomain('ModelRequest', this.deps.modelRequestId);
     const pendingByCallId = new Map(pending.map((entry) => [entry.toolCallId, entry]));
     for (const call of this.calls.values()) {
       const admission = await this.deps.effects.readNativeAdmission(call.toolCallId);
@@ -321,13 +419,49 @@ export class NativeRequestSession {
         const terminal = await this.deps.effects.readTerminalResult(call.toolCallId, false);
         call.toolModelResultId = terminal?.toolModelResultId;
       }
-      if (call.admitted && !call.settled) {
-        // Never re-executes committed effects: the dispatcher reconciles its own durable frontier.
-        this.scheduleExecution(call);
-      }
+      // Schedule only after reconstructing all steering/result uncertainty. A Host takeover
+      // discovering an unverified result must not launch more side effects before it refuses.
     }
     for (const receipt of await this.deps.modelProvider.nativeSteering.receiptsForTurn(this.deps.turnId)) {
       this.steerReceipts.set(receipt.submissionId, receipt);
+    }
+    // A Host may die after the tool result create reached the wire but before any correlated
+    // response.created checkpoint was observed. Unresolved steering on this same request plus
+    // an admitted undelivered tool result cannot prove it was never sent. Fail closed rather
+    // than automatically re-submitting the result, even without a specific CAS marker.
+    const ambiguousSteer = [...this.steerReceipts.values()].some(receipt =>
+      receipt.modelRequestId === this.deps.modelRequestId
+      && ['sent', 'accepted', 'waiting_for_input', 'delivery_unknown'].includes(receipt.state));
+    if (ambiguousSteer) {
+      for (const call of this.calls.values()) {
+        if (call.admitted && !call.delivered) this.uncertainResultCalls.add(call.toolCallId);
+      }
+      if (this.uncertainResultCalls.size > 0) {
+        this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
+      }
+    }
+    // A result committed before this Host boot but not durably marked delivered might have
+    // reached a response.create before the previous process vanished. No current-epoch writer
+    // persists a *pre-wire* result-submission intent, so even without a provider-created marker
+    // we cannot prove "never sent". Refuse the active request rather than auto-replay an already
+    // settled result. An unsettled call did not have a ToolModelResult to send and may reconcile.
+    if (request.status !== 'terminal') {
+      for (const call of this.calls.values()) {
+        if (call.admitted && call.settled && !call.delivered) {
+          this.uncertainResultCalls.add(call.toolCallId);
+        }
+      }
+      if (this.uncertainResultCalls.size > 0) {
+        this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
+      }
+    }
+    for (const call of this.calls.values()) {
+      if (call.admitted && !call.settled) {
+        // Even an unsafe provider admission must not discard a previously started tool. The
+        // dispatcher reconciles its durable EffectIntent/Receipt without issuing it twice;
+        // AgentLoop parks the Turn until all admitted external work has settled.
+        this.scheduleExecution(call);
+      }
     }
   }
 
@@ -374,18 +508,30 @@ export class NativeRequestSession {
   }
 
   /**
-   * Pure peek at the chain-global call ordinal for the next call of one response: call counts of
-   * every earlier response plus this response's count so far. Observation order across the logical
-   * chain matches the terminal aggregate's call array order; provider-local ordinals are never
-   * used as identity.
+   * Chain-global call ordinal. A durable ToolCallSourceLink outlives a pruned proof or a
+   * socket-generation reset, so replayed provider IDs reuse that ordinal and genuinely new
+   * calls start after the highest committed/proven call; response-local output ordinals never
+   * become ToolCall identities.
    */
-  private nextGlobalCallOrdinal(responseId: string): number {
-    let ordinal = 0;
-    for (const id of this.responseOrder) {
-      if (id === responseId) break;
-      ordinal += this.responseCallCounts.get(id) ?? 0;
+  private nextGlobalCallOrdinal(responseId: string, providerCallId: string): number {
+    const known = this.durableCallOrdinals.get(providerCallId);
+    if (known) {
+      const call = this.calls.get(known.toolCallId);
+      if (call && call.responseId !== responseId) {
+        throw new Error(`Native provider call ${providerCallId} changed its response identity.`);
+      }
+      return known.providerOrdinal;
     }
-    return ordinal + (this.responseCallCounts.get(responseId) ?? 0);
+    const live = this.callByProviderId.get(providerCallId);
+    if (live) {
+      if (live.responseId !== responseId) throw new Error(`Native provider call ${providerCallId} changed responses.`);
+      return live.providerOrdinal;
+    }
+    // This generation's call count is not a global identity after a reconnect/pruned proof.
+    let max = -1;
+    for (const entry of this.durableCallOrdinals.values()) max = Math.max(max, entry.providerOrdinal);
+    for (const call of this.calls.values()) max = Math.max(max, call.providerOrdinal);
+    return max + 1;
   }
 
   private countCallItem(responseId: string): void {
@@ -454,8 +600,20 @@ export class NativeRequestSession {
    */
   public buildCallProof(item: NativeCallItemEnvelope): PlainJsonValue {
     const responseId = item.outputItem!.providerResponseId!;
-    const resolution = this.callResolutions.get(item.call.id)
-      ?? { ...this.deps.resolveCallArguments(item.call.name, item.call.arguments), catalog: this.currentModelHandleCatalog() };
+    const knownCall = this.callByProviderId.get(item.call.id);
+    if (knownCall && (knownCall.responseId !== responseId || knownCall.name !== item.call.name
+      || knownCall.asyncDeclared !== (item.call.async === true))) {
+      throw new Error(`Native call ${item.call.id} changed its durable response/tool identity on replay.`);
+    }
+    const freshResolution = this.deps.resolveCallArguments(item.call.name, item.call.arguments);
+    const frozenResolution = this.callResolutions.get(item.call.id);
+    if (frozenResolution && (frozenResolution.error !== freshResolution.error
+      || canonicalPlainJson(frozenResolution.arguments, 'Frozen replayed tool arguments')
+        !== canonicalPlainJson(freshResolution.arguments, 'Replayed tool arguments'))) {
+      throw new Error(`Native call ${item.call.id} changed its frozen tool arguments on replay.`);
+    }
+    const resolution = frozenResolution
+      ?? { ...freshResolution, catalog: this.currentModelHandleCatalog() };
     this.callResolutions.set(item.call.id, resolution);
     return normalizePlainJson({
       type: 'native_tool_call',
@@ -466,7 +624,7 @@ export class NativeRequestSession {
       modelHandleCatalog: resolution.catalog,
       ...(resolution.error !== undefined ? { argumentResolutionError: resolution.error } : {}),
       providerCallId: item.call.id,
-      providerOrdinal: this.nextGlobalCallOrdinal(responseId),
+      providerOrdinal: this.nextGlobalCallOrdinal(responseId, item.call.id),
       // The exact flag the provider returned; admission eligibility is decided separately at the
       // admission boundary (declared policy + actual flag), never by rewriting transport facts.
       async: item.call.async === true,
@@ -506,9 +664,18 @@ export class NativeRequestSession {
   ): Promise<void> {
     const responseId = item.outputItem!.providerResponseId!;
     this.responseFor(responseId);
-    const localCallIndex = this.responseCallCounts.get(responseId) ?? 0;
-    const providerOrdinal = this.nextGlobalCallOrdinal(responseId);
+    const durableResponseCalls = [...this.calls.values()].filter(call => call.responseId === responseId).length;
+      // The response-local revision index must survive a socket reconnect even if that
+      // generation did not replay earlier call items of this same physical response.
+      const localCallIndex = Math.max(this.responseCallCounts.get(responseId) ?? 0, durableResponseCalls);
+    const providerOrdinal = this.nextGlobalCallOrdinal(responseId, item.call.id);
     const toolCallId = this.deps.toolCallIdFor(providerOrdinal, item.call.id, item.call.name);
+    if (result.checkpointed && this.durableCallOrdinals.has(item.call.id)) {
+      // A pruned proof can be checkpointed again on re-stream. SourceLink/native admission is
+      // already the durable identity; never append a second item revision or re-execute its tool.
+      if (!this.calls.has(toolCallId)) throw new Error(`Native admitted call ${item.call.id} was not recovered.`);
+      return;
+    }
     if (!result.checkpointed) {
       if (result.ignoredReason === 'duplicate' && !this.calls.has(toolCallId)) {
         // Re-stream after reconnect: rebuild the record and resume its durable frontier.
@@ -646,7 +813,27 @@ export class NativeRequestSession {
     switch (content.type) {
       case 'response.created': {
         this.responseFor(content.responseId);
-        this.firstResponseId ??= content.responseId;
+        const unverifiedIds = nativeUnverifiedResultCallIds(content as unknown as Record<string, unknown>);
+        if (unverifiedIds) {
+          for (const providerCallId of unverifiedIds) {
+            const call = this.callByProviderId.get(providerCallId);
+            if (!call || !call.admitted) {
+              throw new Error(`Native unverified result ${providerCallId} has no admitted tool identity.`);
+            }
+            this.uncertainResultCalls.add(call.toolCallId);
+          }
+          this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
+        }
+        if (content.previousResponseId) {
+          const created = this.responseFor(content.responseId);
+          if (created.previousResponseId && created.previousResponseId !== content.previousResponseId) {
+            throw new Error(`Native response ${created.responseId} changed its predecessor.`);
+          }
+          created.previousResponseId = content.previousResponseId;
+        }
+        if (!this.firstResponseLost && !this.firstResponseId && this.responseOrder.length === 1) {
+          this.firstResponseId = content.responseId;
+        }
         if (content.capabilities) {
           await this.deps.modelProvider.persistNativeCapabilities(
             this.deps.modelRequestId,
@@ -655,23 +842,32 @@ export class NativeRequestSession {
             content.capabilities
           );
         }
-        // A successor created after an accepted steer proves application: the steering user
-        // Message enters Context exactly once and the receipt becomes 'continuing'.
-        const previousResponseId = content.previousResponseId;
-        if (previousResponseId) {
-          for (const receipt of [...this.steerReceipts.values()]) {
-            if (receipt.state !== 'accepted' && receipt.state !== 'waiting_for_input') continue;
-            if (receipt.targetResponseId !== previousResponseId && receipt.responseId !== previousResponseId) {
-              continue;
-            }
+        // previous_response_id only identifies a chain predecessor, not the steering
+        // submission responsible for a successor. Two simultaneous commands may share that
+        // predecessor, and a tool-result create can use it too. Only an explicitly observed
+        // provider submission identity may apply a user Message to Context. Current native
+        // transports do not expose one on response.created: keep the receipts pending/unknown
+        // instead of inventing application by order or even by a sole local candidate.
+        const submissionId = content.submissionId;
+        if (content.previousResponseId && submissionId) {
+          const receipt = this.steerReceipts.get(submissionId);
+          if (receipt && (receipt.state === 'accepted' || receipt.state === 'waiting_for_input')
+            && (receipt.targetResponseId === content.previousResponseId
+              || receipt.responseId === content.previousResponseId)
+            && (!content.steerId || !receipt.steerId || content.steerId === receipt.steerId)) {
             const next = await this.deps.modelProvider.nativeSteering.applyToContext({
-              turnId: this.deps.turnId,
-              commandId: receipt.submissionId,
-              responseId: content.responseId
+              turnId: this.deps.turnId, commandId: submissionId, responseId: content.responseId
             });
             this.steerReceipts.set(next.submissionId, next);
             this.emitSteering(next);
+          } else {
+            this.diagnose(`Native successor ${content.responseId} supplied an unverified steering submission ${submissionId}; no receipt was applied.`);
           }
+        } else if (content.previousResponseId && [...this.steerReceipts.values()].some(receipt =>
+          (receipt.state === 'accepted' || receipt.state === 'waiting_for_input')
+          && (receipt.targetResponseId === content.previousResponseId
+            || receipt.responseId === content.previousResponseId))) {
+          this.diagnose(`Native successor ${content.responseId} lacks a provider-attested steering submission identity; receipt application is deferred.`);
         }
         // Result admission: the server admitted these call outputs into the chain at exactly this
         // point. Append their Context occurrences and mark delivery BEFORE any successor output —
@@ -717,6 +913,22 @@ export class NativeRequestSession {
         const response = this.responseFor(content.responseId);
         response.boundarySeq = String(event.streamSeq);
         response.boundaryReason = content.reason;
+        response.completed = content.type === 'response.completed';
+        // Preserve this physical response's independent raw input/output observation before
+        // releasing a tool batch. Aggregate ModelRequest usage_json is billing for the whole chain,
+        // never a measure of its latest model-visible prompt. Missing usage remains unknown.
+        const stream = this.requireStream();
+        await this.deps.modelProvider.persistNativeResponseUsage(
+          this.deps.modelRequestId, stream.attemptSeq, stream.socketGeneration, {
+            responseId: content.responseId,
+            ...(response.previousResponseId || content.previousResponseId
+              ? { previousResponseId: response.previousResponseId ?? content.previousResponseId } : {}),
+            streamSeq: event.streamSeq,
+            ...(content.usage ? { usage: content.usage } : {}),
+            ...(content.responseId === this.firstResponseId
+              ? { contextRootId: this.deps.initialContextRootId } : {})
+          }
+        );
         // Original-root calibration: only the FIRST physical response's actual input tokens,
         // exactly once; later/cumulative usage never substitutes for this anchor.
         if (content.responseId === this.firstResponseId) {
@@ -738,6 +950,15 @@ export class NativeRequestSession {
         if (content.requiredInput) await this.admitRequiredInput(content.requiredInput);
         if (response.admissionBoundary) {
           await this.admitResponseSyncCalls(response);
+        }
+        if (response.completed) {
+          for (const receipt of [...this.steerReceipts.values()]) {
+            // response.created already durably applied the correct user message to Context;
+            // only this *same* completed successor proves its continuation finished.
+            if (receipt.state === 'continuing' && receipt.successorResponseId === response.responseId) {
+              await this.transitionSteer(receipt.submissionId, ['continuing'], 'completed');
+            }
+          }
         }
         this.pumpSignal();
         return;
@@ -778,6 +999,7 @@ export class NativeRequestSession {
         await this.transitionSteer(commandId, ['queued', 'sent', 'accepted', 'waiting_for_input'], 'failed', {
           error: content.error?.message ?? 'Native steering rejected by the provider.'
         });
+        this.pumpSignal();
         return;
       }
       case 'response.steer.disconnected': {
@@ -785,11 +1007,14 @@ export class NativeRequestSession {
         if (!commandId) return;
         const receipt = this.steerReceipts.get(commandId);
         if (!receipt || receipt.state === 'continuing' || receipt.state === 'completed') return;
-        if (receipt.state !== 'sent' && receipt.state !== 'accepted' && receipt.state !== 'waiting_for_input') {
-          return;
-        }
-        // Sent-unacked or accepted-unapplied: retain body/status, never auto-resend.
-        await this.transitionSteer(commandId, ['sent', 'accepted', 'waiting_for_input'], 'delivery_unknown');
+        if (receipt.state !== 'queued' && receipt.state !== 'sent'
+          && receipt.state !== 'accepted' && receipt.state !== 'waiting_for_input') return;
+        // The transport may have begun wire-writing before a submitted control was committed:
+        // queued + a real disconnect is UNKNOWN, not proof of a never-sent submission. Retain
+        // body/status, never automatically resend or mark the user instruction applied.
+        await this.transitionSteer(commandId,
+          ['queued', 'sent', 'accepted', 'waiting_for_input'], 'delivery_unknown');
+        this.pumpSignal();
         return;
       }
       default:
@@ -815,9 +1040,9 @@ export class NativeRequestSession {
       this.controller = undefined;
       return;
     }
-    if (outcome !== 'completed') {
-      for (const call of this.calls.values()) {
-        if (!call.admitted || call.settled) continue;
+    for (const call of this.calls.values()) {
+      if (!call.admitted) continue;
+      if (outcome !== 'completed' && !call.settled) {
         await this.deps.closeAdmittedCall(
           call.toolCallId,
           `agent-loop:${this.deps.modelRequestId}:native-chain-${outcome}:${call.toolCallId}`
@@ -825,9 +1050,14 @@ export class NativeRequestSession {
         call.settled = true;
         const terminal = await this.deps.effects.readTerminalResult(call.toolCallId, false);
         call.toolModelResultId = terminal?.toolModelResultId;
-        if (call.toolModelResultId && !call.resultOccurrence) {
-          await this.appendResultOccurrence(call);
-        }
+      }
+      if (call.settled && !call.delivered && call.toolModelResultId && !call.resultOccurrence) {
+        // A provider create with ambiguous steering is NOT a delivery receipt. Once its logical
+        // transport ends, the already-settled result still belongs in durable Context for the
+        // next full-request preflight (or for a visible failed/cancelled Turn). Freeze child refs
+        // first; never send another wire result or invent native_delivery on this closure path.
+        await this.buildFunctionCallOutput(call);
+        await this.appendResultOccurrence(call);
       }
     }
     for (const receipt of [...this.steerReceipts.values()]) {
@@ -863,6 +1093,11 @@ export class NativeRequestSession {
     if (!this.deps.capabilities.steering) {
       throw new Error('Native steering is not enabled for this request.');
     }
+    // Do not accept an input against a transport chain whose settled batch is already being
+    // durably transferred to the next logical request.
+    if (this.preparingCheckpoint || this.yieldingForRuntimeInput || this.disposed) {
+      throw new Error('Native request is checkpointing; send steering input to the next request.');
+    }
     const controller = this.controller;
     if (!controller) throw new Error('Turn has no live native chain for steering.');
     let receipt = await this.deps.modelProvider.nativeSteering.submit({
@@ -880,6 +1115,11 @@ export class NativeRequestSession {
     this.emitSteering(receipt);
     if (receipt.state !== 'queued') return receipt;
     const previousResponseId = controller.responseId;
+    // Write-ahead fence: Host loss after a wire write but before an observed submitted event
+    // must never leave a replayable queued receipt. 'sent' is an attempted-send state here; a
+    // proven not_sent rejection below closes it as failed rather than inventing delivery.
+    const attempted = await this.transitionSteer(command.commandId, ['queued'], 'sent');
+    if (!attempted || attempted.state !== 'sent') return this.steerReceipts.get(command.commandId) ?? receipt;
     try {
       await controller.steer({
         submissionId: command.commandId,
@@ -887,15 +1127,24 @@ export class NativeRequestSession {
         ...(previousResponseId ? { previousResponseId } : {})
       });
     } catch (error) {
-      if (isOpenAIResponsesNativeDeliveryError(error) && error.disposition === 'not_sent') {
-        // Never wire-written: the durable submission stays queued and resubmission is safe.
-        return receipt;
+      if (isOpenAIResponsesNativeDeliveryError(error)) {
+        if (error.disposition === 'not_sent') {
+          const failed = await this.transitionSteer(command.commandId, ['sent'], 'failed', {
+            error: error.detail.reason === 'steering_pending_unproven'
+              ? 'A previous native steering submission is still awaiting provider attribution; this instruction was not sent.'
+              : `Native steering was not sent (${error.detail.reason ?? 'transport refused'}); submit a new instruction to retry.`
+          });
+          return failed ?? this.steerReceipts.get(command.commandId) ?? attempted;
+        }
+        if (error.disposition === 'admission_unknown') {
+          const unknown = await this.transitionSteer(command.commandId,
+            ['sent', 'accepted', 'waiting_for_input'], 'delivery_unknown');
+          return unknown ?? this.steerReceipts.get(command.commandId) ?? attempted;
+        }
       }
       throw error;
     }
-    if (this.controller !== controller) return receipt;
-    const sent = await this.transitionSteer(command.commandId, ['queued'], 'sent');
-    return sent ?? receipt;
+    return this.steerReceipts.get(command.commandId) ?? attempted;
   }
 
   private async admitCall(
@@ -1123,9 +1372,46 @@ export class NativeRequestSession {
     for (;;) {
       this.pumpDirty = false;
       if (this.disposed || this.yieldingForRuntimeInput || !this.controller) return;
+      if (this.unsafeResultAdmission) {
+        // A result that may already have reached the Provider can NEVER be resubmitted, nor can
+        // another tool result be sent into that ambiguous physical chain. Do not end the chain
+        // until every admitted external effect truly settles; requestNativeLogicalEnd otherwise
+        // clears the transport's outstanding-async set before the work exists durably.
+        if (this.inFlightDeliveries.size === 0
+          && [...this.calls.values()].every(call => !call.admitted || call.settled)) {
+          this.yieldingForRuntimeInput = true;
+          this.controller.endLogicalRequest();
+        }
+        return;
+      }
       const ready = this.collectDeliverable();
       if (ready.length === 0) return;
-      if (await this.yieldAtRuntimeInputBoundary(ready)) return;
+      if (await this.yieldAtNativeBatchBoundary(ready)) return;
+      const latestBoundary = [...this.responseOrder].reverse()
+        .map(id => this.responses.get(id)).find(response => response?.admissionBoundary && response.boundarySeq);
+      const observed = await this.deps.modelProvider.readNativeLatestResponseUsage(this.deps.modelRequestId);
+      const stream = this.requireStream();
+      const pressure = latestBoundary !== undefined && (
+        !observed || observed.responseId !== latestBoundary.responseId
+        || observed.attemptSeq !== stream.attemptSeq || observed.socketGeneration !== stream.socketGeneration
+        || nativePhysicalResponseBudgetPressure({
+          budget: this.deps.budget,
+          physicalInputTokens: observed.inputTokens,
+          physicalResponseCount: observed.physicalResponseCount
+        })
+      );
+      if (pressure || this.inFlightDeliveries.size > 0) {
+        // An unattributed steer blocks a logical-request checkpoint, but need not block a
+        // required tool-result create when physical usage is known safely below capacity.
+        // Conversely, never send another create near capacity or while an earlier result
+        // admission is unresolved; both preserve the batch's exact provider response identity.
+        const blockedResponseId = this.responseOrder[this.responseOrder.length - 1] ?? 'unknown';
+        if (this.lastBackpressureResponseId !== blockedResponseId) {
+          this.lastBackpressureResponseId = blockedResponseId;
+          this.diagnose('Native response cannot checkpoint yet; tool-result delivery is backpressured.');
+        }
+        return;
+      }
       const adapter = await this.deps.resolveAdapter(this.deps.providerId);
       if (!adapter.materializeNativeToolOutput) {
         throw new Error(`Provider adapter ${this.deps.providerId} lacks materializeNativeToolOutput.`);
@@ -1136,6 +1422,8 @@ export class NativeRequestSession {
       for (const call of ready) baseOutputs.push(await this.buildFunctionCallOutput(call));
       const outputs = await adapter.materializeNativeToolOutput(baseOutputs);
       const controller = this.controller;
+      if (!controller || this.disposed || this.yieldingForRuntimeInput
+        || this.inFlightDeliveries.size > 0) return;
       // The batch stays in-flight until the admission commit lands via the checkpointed
       // response.created carrying admittedToolResultCallIds — never marked from this promise alone.
       for (const call of ready) this.inFlightDeliveries.add(call.toolCallId);
@@ -1144,9 +1432,15 @@ export class NativeRequestSession {
       } catch (error) {
         for (const call of ready) this.inFlightDeliveries.delete(call.toolCallId);
         if (!isOpenAIResponsesNativeDeliveryError(error)) throw error;
-        // Every rejection surfaces honestly: nothing is marked, the settled result stays
-        // recoverable, and only future proven events (settlement/boundary/registration) may
-        // re-drive delivery — never a timer loop bypassing frozen retry policy.
+        if (error.disposition === 'admission_unknown') {
+          for (const call of ready) this.uncertainResultCalls.add(call.toolCallId);
+          if (error.detail.reason === 'response_created_without_unique_result_admission') {
+            this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
+            // Stop only after all admitted effects settle; pumpLoop requests the real physical
+            // response boundary without cancelling or re-sending any of those effects.
+            this.pumpDirty = true;
+          }
+        }
         this.diagnose(`native result delivery ${error.disposition}: ${error.message}`);
         return;
       }
@@ -1155,39 +1449,53 @@ export class NativeRequestSession {
   }
 
   /**
-   * Peer/runtime data cannot use the user-steering channel. At a completed physical response with
-   * all tools settled, close the transport chain normally and let the next ModelRequest absorb
-   * RuntimeDelivery through the existing context authority. No tool is cancelled and no provider
-   * ACK is invented: undelivered results are retained in Context for the carrier request.
+   * The safe default is one complete physical response + its entire settled tool batch per
+   * logical ModelRequest. The same user Turn continues via AgentLoop's next frozen full-request
+   * CompressionCoordinator preflight. Native delivery is NOT acknowledged on a local yield:
+   * result occurrences (and child-handle projections) are durably retained for the next request.
+   * An incomplete steered response, any unadmitted/unsettled call, in-flight result admission or
+   * steering receipt prevents the checkpoint; already-issued external effects are never cancelled.
    */
-  private async yieldAtRuntimeInputBoundary(ready: readonly NativeSessionCall[]): Promise<boolean> {
+  private async yieldAtNativeBatchBoundary(ready: readonly NativeSessionCall[]): Promise<boolean> {
     const latestResponseId = this.responseOrder[this.responseOrder.length - 1];
     const latest = latestResponseId ? this.responses.get(latestResponseId) : undefined;
-    if (!latest?.admissionBoundary || !latest.boundarySeq || this.inFlightDeliveries.size > 0
-      || [...this.calls.values()].some(call => !call.admitted || !call.settled)
-      || [...this.steerReceipts.values()].some(receipt =>
-        ['queued', 'sent', 'accepted', 'waiting_for_input'].includes(receipt.state))) return false;
-    const pending = await this.deps.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('RuntimeDelivery').list({
-        where: { target_turn_id: this.deps.turnId, phase: 'current_turn', state: 'pending' }, limit: 1
-      }),
-      DOMAIN_REPOSITORIES.domain('PendingTurnInput').list({
-        where: { turn_id: this.deps.turnId, input_kind: 'runtime_delivery', state: 'pending' }, limit: 1
-      })
-    ]);
-    if (!pending.snapshot.some(value => Array.isArray(value) && value.length > 0)) return false;
+    const readyIds = new Set(ready.map(call => call.toolCallId));
+    if (!latest?.completed || !latest.boundarySeq || this.inFlightDeliveries.size > 0
+      || this.hasPendingSteering()
+      || [...this.calls.values()].some(call =>
+        !call.admitted || !call.settled || (!call.delivered && !readyIds.has(call.toolCallId)))) return false;
     const controller = this.controller;
     if (!controller || this.disposed) return false;
-    for (const call of ready) {
-      // Reserve refs before another request can rebuild from these newly retained results.
-      await this.buildFunctionCallOutput(call);
-      await this.appendResultOccurrence(call);
+    this.preparingCheckpoint = true;
+    try {
+      for (const call of ready) {
+        // Freeze output bytes/child refs before the Context occurrence: replay must not allocate
+        // a new handle or regenerate a different tool result for the successor request.
+        await this.buildFunctionCallOutput(call);
+        await this.appendResultOccurrence(call);
+      }
+      if (this.controller !== controller || this.disposed || this.hasPendingSteering()
+        || this.inFlightDeliveries.size > 0
+        || this.responseOrder[this.responseOrder.length - 1] !== latestResponseId) {
+        throw new Error('Native checkpoint lost its completed response/controller frontier.');
+      }
+      this.yieldingForRuntimeInput = true;
+      controller.endLogicalRequest();
+      this.deps.onDiagnostic?.('Native logical request checkpointed at a complete, settled physical tool batch.');
+      return true;
+    } finally {
+      this.preparingCheckpoint = false;
     }
-    if (this.controller !== controller || this.disposed) return false;
-    this.yieldingForRuntimeInput = true;
-    controller.endLogicalRequest();
-    this.diagnose('Native logical request yielded at a settled tool boundary for pending runtime input.');
-    return true;
+  }
+
+  private hasPendingSteering(): boolean {
+    return [...this.steerReceipts.values()].some(receipt =>
+      // A delivery-unknown steer in THIS live logical request can still produce a successor;
+      // the provider may create it after a local disconnect observation. Do not end the chain
+      // merely because its user-visible receipt is terminal. Historical unknowns belong to
+      // older ModelRequests and cannot block a freshly frozen full-request continuation.
+      (!receipt.modelRequestId || receipt.modelRequestId === this.deps.modelRequestId)
+      && ['queued', 'sent', 'accepted', 'waiting_for_input', 'continuing', 'delivery_unknown'].includes(receipt.state));
   }
 
   private collectDeliverable(): NativeSessionCall[] {
@@ -1201,7 +1509,9 @@ export class NativeRequestSession {
       const syncUnsettled = calls.some((call) => !call.asyncDeclared && !call.settled);
       if (syncUnsettled) continue;
       for (const call of calls) {
-        if (call.admitted && call.settled && !call.delivered && !this.inFlightDeliveries.has(call.toolCallId)) {
+        if (call.admitted && call.settled && !call.delivered
+          && !this.inFlightDeliveries.has(call.toolCallId)
+          && !this.uncertainResultCalls.has(call.toolCallId)) {
           ready.push(call);
         }
       }
@@ -1257,6 +1567,7 @@ export class NativeRequestSession {
     const response: NativeSessionResponse = {
       responseId,
       admissionBoundary: false,
+      completed: false,
       syncRequired: false
     };
     this.responses.set(responseId, response);
@@ -1347,6 +1658,27 @@ export class NativeRequestSession {
   private diagnose(message: string): void {
     (this.deps.onDiagnostic ?? ((text) => console.warn('[reliable-kernel]', text)))(message);
   }
+}
+
+function nativeResultAdmissionUnknownError(): Error {
+  return Object.assign(new Error(
+    'NATIVE_RESULT_ADMISSION_UNKNOWN: A physical response may have consumed a tool result while an in-flight steer shares its predecessor. No provider admission or steering application can be proven; the Turn must fail safely without resending the result or automatically rebasing its chain.'
+  ), { code: 'NATIVE_RESULT_ADMISSION_UNKNOWN' });
+}
+
+/** Local uncertainty observation, NEVER a provider result-admission proof. */
+function nativeUnverifiedResultCallIds(content: Record<string, unknown>): string[] | undefined {
+  const marker = 'response_created_without_unique_result_admission';
+  const raw = content.unverifiedToolResultCallIds;
+  if (raw === undefined && content.reason !== marker) return undefined;
+  if (content.type !== 'response.created' || content.reason !== marker
+    || content.admittedToolResultCallIds !== undefined
+    || !Array.isArray(raw) || raw.length === 0
+    || raw.some(value => typeof value !== 'string' || value.length === 0)
+    || new Set(raw).size !== raw.length) {
+    throw new Error('Native unverified tool results require one strictly identified response.created without an admission acknowledgment.');
+  }
+  return [...raw] as string[];
 }
 
 function stableNativeBatchId(modelRequestId: string, toolCallId: string): string {

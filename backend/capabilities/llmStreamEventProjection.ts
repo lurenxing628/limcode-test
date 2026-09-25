@@ -388,6 +388,32 @@ export function nowMonotonicMs(): number {
     : Date.now();
 }
 
+/** OpenAI Responses raw usage: independent physical input/output; cached is included in input. */
+export function nativeUsageMetadataFromResponse(value: unknown): LlmUsageMetadataRecord | undefined {
+  if (!isRecord(value)) return undefined;
+  const input = nativeNonNegativeTokenCount(value.input_tokens);
+  const output = nativeNonNegativeTokenCount(value.output_tokens);
+  const total = nativeNonNegativeTokenCount(value.total_tokens);
+  const inputDetails = isRecord(value.input_tokens_details) ? value.input_tokens_details : undefined;
+  const outputDetails = isRecord(value.output_tokens_details) ? value.output_tokens_details : undefined;
+  const cached = nativeNonNegativeTokenCount(inputDetails?.cached_tokens);
+  const reasoning = nativeNonNegativeTokenCount(outputDetails?.reasoning_tokens);
+  const usage: LlmUsageMetadataRecord = {
+    ...(input === undefined ? {} : { promptTokenCount: input }),
+    ...(output === undefined ? {} : { candidatesTokenCount: output }),
+    ...(total === undefined ? {} : { totalTokenCount: total }),
+    ...(cached === undefined || input === undefined || cached > input
+      ? {} : { cachedContentTokenCount: cached }),
+    ...(reasoning === undefined || output === undefined || reasoning > output
+      ? {} : { thoughtsTokenCount: reasoning })
+  };
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+function nativeNonNegativeTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 export function usageMetadataFromChunk(chunk: UnifiedLLMStreamChunk): LlmUsageMetadataRecord | undefined {
   const cleaned = stripUndefined(chunk.usageMetadata);
   return isRecord(cleaned) && Object.keys(cleaned).length > 0
@@ -408,22 +434,99 @@ export interface OpenAIResponsesNativeChainContext {
   current?: { responseId: string; previousResponseId?: string };
 }
 
-/** 跨 response 聚合计费 token：链上每个物理 response 的输入/输出都是真实计费量。 */
-export function sumUsageMetadata(
-  previous: LlmUsageMetadataRecord | undefined,
-  next: LlmUsageMetadataRecord
-): LlmUsageMetadataRecord {
-  if (!previous) return next;
-  const summed: LlmUsageMetadataRecord = { ...previous };
-  for (const [key, value] of Object.entries(next)) {
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-      (summed as Record<string, unknown>)[key] = value;
+/**
+ * Logical-chain billing and physical-response occupancy are independent facts. Unified chunks may
+ * repeat a complete response's usage on reconnect, and multiple chunks of one response are updates,
+ * not additive bills. Keep at most a bounded number of identities rather than attributing the sum
+ * to the latest provider prompt; excessive chains fail closed instead of silently double billing.
+ */
+export class NativePhysicalUsageAccumulator {
+  private static readonly MAX_RESPONSES = 1024;
+  /** Bounded physical identities: a late completed event updates its own response, not the tail. */
+  private readonly usageByResponse = new Map<string, LlmUsageMetadataRecord | undefined>();
+  private currentResponseId?: string;
+
+  public get started(): boolean { return this.currentResponseId !== undefined; }
+
+  public beginResponse(responseId: string): boolean {
+    if (typeof responseId !== 'string' || responseId.trim().length === 0) {
+      throw new TypeError('Native physical response requires a non-empty responseId.');
+    }
+    if (this.usageByResponse.has(responseId)) return false;
+    if (this.usageByResponse.size >= NativePhysicalUsageAccumulator.MAX_RESPONSES) {
+      throw new RangeError('Native physical response observation count exceeded its bounded limit.');
+    }
+    this.usageByResponse.set(responseId, undefined);
+    this.currentResponseId = responseId;
+    return true;
+  }
+
+  /** Raw usage without a preceding physical identity is not attributed to an adjacent response. */
+  public observeUsage(responseId: string, usage: LlmUsageMetadataRecord): boolean {
+    if (!this.usageByResponse.has(responseId)) return false;
+    if (!isRecord(usage)) throw new TypeError('Native physical response usage must be a record.');
+    this.usageByResponse.set(responseId, mergeUsageMetadata(this.usageByResponse.get(responseId), usage));
+    return true;
+  }
+
+  public latestUsage(): LlmUsageMetadataRecord | undefined {
+    return this.currentResponseId ? this.usageByResponse.get(this.currentResponseId) : undefined;
+  }
+
+  public billingTotals(): LlmUsageMetadataRecord | undefined {
+    if (!this.started) return undefined;
+    const usages = [...this.usageByResponse.values()];
+    const input = sumCompleteNativeUsageField(usages, 'promptTokenCount');
+    const output = sumCompleteNativeUsageField(usages, 'candidatesTokenCount');
+    const rawTotal = sumCompleteNativeUsageField(usages, 'totalTokenCount');
+    const cached = sumCompleteNativeUsageField(usages, 'cachedContentTokenCount');
+    const reasoning = sumCompleteNativeUsageField(usages, 'thoughtsTokenCount');
+    const derivedTotal = input.value !== undefined && output.value !== undefined
+      && Number.isSafeInteger(input.value + output.value)
+      ? input.value + output.value : undefined;
+    const total = rawTotal.value ?? derivedTotal;
+    const totals: LlmUsageMetadataRecord = {
+      ...(input.value === undefined ? {} : { promptTokenCount: input.value }),
+      ...(output.value === undefined ? {} : { candidatesTokenCount: output.value }),
+      ...(total === undefined ? {} : { totalTokenCount: total }),
+      ...(cached.value === undefined || input.value === undefined ? {} : { cachedContentTokenCount: cached.value }),
+      ...(reasoning.value === undefined || output.value === undefined ? {} : { thoughtsTokenCount: reasoning.value })
+    };
+    // An observed physical response without raw usage still belongs to the chain. Emit an
+    // explicit unknown marker even when every numeric dimension is unavailable; omitting the
+    // entire Done usage would erase the native billing identity and invite estimated fallbacks.
+    if (input.value === undefined || output.value === undefined || total === undefined) {
+      totals.nativeChainUsageIncomplete = true;
+    }
+    if ((cached.observed && cached.value === undefined) || (reasoning.observed && reasoning.value === undefined)) {
+      totals.nativeChainUsageDetailsIncomplete = true;
+    }
+    return totals;
+  }
+}
+
+/** Raw physical metadata is per response; each reported dimension needs all responses to be a total. */
+function sumCompleteNativeUsageField(
+  usages: readonly (LlmUsageMetadataRecord | undefined)[],
+  field: 'promptTokenCount' | 'candidatesTokenCount' | 'totalTokenCount' | 'cachedContentTokenCount' | 'thoughtsTokenCount'
+): { value?: number; observed: boolean } {
+  let sum = 0;
+  let observed = false;
+  let complete = true;
+  for (const usage of usages) {
+    const count = nativeNonNegativeTokenCount(usage?.[field]);
+    if (count === undefined) {
+      complete = false;
       continue;
     }
-    const base = (previous as Record<string, unknown>)[key];
-    (summed as Record<string, unknown>)[key] = (typeof base === 'number' && Number.isFinite(base) ? base : 0) + value;
+    observed = true;
+    if (!Number.isSafeInteger(sum + count)) {
+      complete = false;
+      continue;
+    }
+    sum += count;
   }
-  return summed;
+  return complete && observed ? { value: sum, observed } : { observed };
 }
 
 /** 给 output item 元数据标记原生 response 边界；非原生路径原样返回（同一引用）。 */

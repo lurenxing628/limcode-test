@@ -129,7 +129,8 @@ function nativeAdapter(behavior) {
     steers: [],
     submissions: [],
     endLogicalRequestCalls: 0,
-    dispatchedInputs: []
+    dispatchedInputs: [],
+    requests: []
   };
   let dispatchOrdinal = 0;
   const adapter = {
@@ -137,7 +138,10 @@ function nativeAdapter(behavior) {
     async materializeNativeToolOutput(outputs) { return outputs; },
     async sendFullRequest(request, controls) {
       dispatchOrdinal += 1;
+      record.requests.push(request);
       let streamSeq = 0;
+      let end;
+      const ended = new Promise(resolve => { end = resolve; });
       const emit = async (kind, content, extra = {}) => {
         streamSeq += 1;
         return controls.onEvent({ kind, streamSeq: String(streamSeq), content, ...extra });
@@ -151,12 +155,12 @@ function nativeAdapter(behavior) {
           record.submissions.push(outputs);
           return { responseId: 'r-submit-1', previousResponseId: 'r1', connectionGeneration: 1 };
         },
-        endLogicalRequest() { record.endLogicalRequestCalls += 1; }
+        endLogicalRequest() { record.endLogicalRequestCalls += 1; end(); }
       };
       record.controller = controller;
       controls.native?.onController?.(controller);
       try {
-        await behavior({ emit, controls, request, record, controller, dispatchOrdinal });
+        await behavior({ emit, ended, controls, request, record, controller, dispatchOrdinal });
       } finally {
         controls.native?.onController?.(undefined);
       }
@@ -286,17 +290,15 @@ function textItemEnvelope(itemId, ordinal, responseId) {
   };
 }
 
-test('native async call executes mid-stream and delivery commits only at admission created', async () => {
+test('native async result checkpoints into a second ModelRequest of the same Turn without forging result admission', async () => {
   const name = 'native-async-early';
   await withNativeApp(name, [{ name: 'read_file', nativeAsync: true }], async ({ app, turnId, fence, record }) => {
     const result = await driveWithCauses(app, fence, turnId);
     await expectDriveTerminal(app, turnId, result, 'completed');
     assert.equal(record.dispatchedInputs.length, 1);
     assert.equal(record.dispatchedBeforeCompleted, true, 'tool dispatch preceded the terminal completed event');
-    assert.equal(record.submissions.length, 1, 'settled async result submitted exactly once');
-    const submission = record.submissions[0][0];
-    assert.equal(submission.type, 'function_call_output');
-    assert.equal(submission.callId, 'call-1');
+    assert.equal(record.submissions.length, 0, 'safe full-request carryover does not submit a second physical result create');
+    assert.equal(record.endLogicalRequestCalls, 1, 'exactly one settled tool batch ends its physical chain');
 
     const calls = await list(app, 'ToolCall', { turn_id: turnId });
     assert.equal(calls.length, 1);
@@ -304,17 +306,17 @@ test('native async call executes mid-stream and delivery commits only at admissi
     const events = await list(app, 'ToolCallEvent', { tool_call_id: toolCallId });
     assert.equal(events.filter((row) => row.event_kind === 'native_admission').length, 1,
       'exactly one durable native admission');
-    assert.equal(events.filter((row) => row.event_kind === 'native_delivery').length, 1,
-      'delivery marked exactly once at the admission created');
+    assert.equal(events.filter((row) => row.event_kind === 'native_delivery').length, 0,
+      'scripted next response.created did not attest any explicit native call result');
 
     const callOccurrences = await list(app, 'ContextSegmentSource', { source_kind: 'tool_call', source_id: toolCallId });
     assert.equal(callOccurrences.length, 1, 'one call context occurrence, never duplicated');
     const results = await list(app, 'ToolModelResult', { tool_call_id: toolCallId });
     assert.equal(results.length, 1);
     const resultOccurrences = await list(app, 'ContextSegmentSource', { source_kind: 'tool_model_result', source_id: results[0].id });
-    assert.equal(resultOccurrences.length, 1, 'one result occurrence appended at admission');
-    assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId: name }), [],
-      'no pending native work after admission');
+    assert.equal(resultOccurrences.length, 1, 'one settled result occurrence survives the batch checkpoint');
+    assert.equal((await list(app, 'ToolModelResult', { tool_call_id: toolCallId })).length, 1,
+      'the completed tool retains its CAS-backed result instead of being run again');
 
     // Canonical order: user input < prefix text < call < suffix text < result.
     const head = (await list(app, 'ConversationContextHeadLink', { conversation_id: name }))[0];
@@ -329,9 +331,13 @@ test('native async call executes mid-stream and delivery commits only at admissi
     assert.ok(pairIndexes[1] > messageIndexes[2], 'result occurrence after the suffix segment');
 
     const modelRequests = await list(app, 'ModelRequest', { turn_id: turnId });
-    assert.equal(modelRequests.length, 1, 'one logical ModelRequest for the delivered native chain');
+    assert.equal(modelRequests.length, 2, 'the settled batch continues inside the same Turn after one full preflight');
+    assert.equal(record.requests.length, 2);
+    const observed = await app.modelProvider.readNativeLatestResponseUsage(record.requests[0].modelRequestId);
+    assert.equal(observed.inputTokens, undefined,
+      'omitted physical usage stays unknown even when logical completed reports a bill');
     const requestLinks = (await list(app, 'ModelRequestMessageLink', {}))
-      .filter((row) => row.model_request_id === modelRequests[0].id);
+      .filter((row) => row.model_request_id === record.requests[0].modelRequestId);
     assert.equal(requestLinks.length, 1);
     const revisions = (await list(app, 'MessageRevision', { message_id: requestLinks[0].message_id }))
       .sort((left, right) => Number(right.revision_seq - left.revision_seq));
@@ -340,7 +346,18 @@ test('native async call executes mid-stream and delivery commits only at admissi
     ])).snapshot[0];
     const aggregate = JSON.parse((await app.contentStore.read(aggregateMetadata)).toString('utf8'));
     assert.equal(aggregate.parts.length, 3, 'current aggregate revision = prefix + call + suffix');
-  }, async ({ emit, record }) => {
+  }, async ({ emit, ended, request, record, dispatchOrdinal }) => {
+    if (dispatchOrdinal === 2) {
+      assert.ok(request.context.some(segment => segment.segmentKind === 'tool_pair'
+        && segment.content.includes('toolModelResult')),
+        'the second ModelRequest carries the original CAS-backed result from this Turn');
+      await emit('native_control', { type: 'response.created', responseId: 'r2' });
+      await emit('native_control', { type: 'response.completed', responseId: 'r2',
+        usage: { input_tokens: 70, output_tokens: 5, total_tokens: 75 } });
+      await emit('completed', { role: 'model', parts: [{ text: 'result carried to final answer' }] });
+      return;
+    }
+    assert.equal(dispatchOrdinal, 1);
     await emit('native_control', {
       type: 'response.created', responseId: 'r1',
       capabilities: { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: true, explicitCaching: true }
@@ -359,12 +376,9 @@ test('native async call executes mid-stream and delivery commits only at admissi
     await waitFor(() => record.dispatchedInputs.length === 1, 'mid-stream dispatch');
     record.dispatchedBeforeCompleted = record.dispatchedInputs.length === 1;
     await emit('native_control', { type: 'response.completed', responseId: 'r1' });
-    await waitFor(() => record.submissions.length === 1, 'async result submission');
-    await emit('native_control', {
-      type: 'response.created', responseId: 'r-submit-1', previousResponseId: 'r1',
-      admittedToolResultCallIds: ['call-1']
-    });
-    await emit('native_control', { type: 'response.completed', responseId: 'r-submit-1' });
+    await ended;
+    assert.equal(record.submissions.length, 0,
+      'unknown physical input never induces an unpreflighted result create');
     await emit('completed', {
       role: 'model',
       parts: [
@@ -376,7 +390,7 @@ test('native async call executes mid-stream and delivery commits only at admissi
   });
 });
 
-test('steering persists user message, transitions, applies exactly once, rejects stale lease', async () => {
+test('steering persists its user Message but an unattested successor never applies it to Context', async () => {
   const name = 'native-steer-flow';
   let driveStartedResolve;
   const driveStarted = new Promise((resolve) => { driveStartedResolve = resolve; });
@@ -416,13 +430,16 @@ test('steering persists user message, transitions, applies exactly once, rejects
     await expectDriveTerminal(app, turnId, result, 'completed');
     const receipts = await app.modelProvider.steeringReceipts(name);
     assert.equal(receipts.length, 1);
-    assert.equal(receipts[0].state, 'completed');
-    assert.equal(receipts[0].successorResponseId, 'r2');
+    assert.equal(receipts[0].state, 'delivery_unknown');
+    assert.equal(receipts[0].successorResponseId, undefined);
     assert.equal(typeof receipts[0].updatedAt, 'number');
     const steerMessageRevision = (await list(app, 'MessageRevision', { message_id: steerLinks[0].message_id }))[0];
+    const [body] = await list(app, 'ContentObject', { id: steerMessageRevision.content_object_id });
+    assert.match((await app.contentStore.read(body)).toString('utf8'), /steer note/);
     const occurrences = await list(app, 'ContextSegmentSource', { source_kind: 'message_revision', source_id: steerMessageRevision.id });
-    assert.equal(occurrences.length, 1, 'steering user message enters context exactly once');
-    assert.ok(updates.length >= 3, 'sent, accepted, continuing broadcasts observed');
+    assert.equal(occurrences.length, 0, 'without an attributed steer the persisted user message is not Context');
+    assert.ok(updates.length >= 3, 'sent, accepted and delivery-unknown broadcasts observed');
+    assert.equal(record.steers.length, 1, 'unknown delivery must not silently resubmit');
     assert.equal(updates[0].conversationId, name);
     assert.equal(updates[0].receipts[0].submissionId, 'cmd-1');
   }, async ({ emit, record }) => {
@@ -437,7 +454,10 @@ test('steering persists user message, transitions, applies exactly once, rejects
     await emit('native_control', { type: 'response.steer.accepted', responseId: 'r1', submissionId: 'cmd-1', steerId: 'steer-1' });
     await emit('output_delta', { type: 'text_delta', text: 'pre-successor ', outputItem: { id: 'i2', ordinal: 1, providerResponseId: 'r1' } });
     await emit('output_item_done', textItemEnvelope('i2', 1, 'r1'));
-    await emit('native_control', { type: 'response.completed', responseId: 'r1', reason: 'steered' });
+    await emit('native_control', { type: 'response.incomplete', responseId: 'r1', reason: 'steered',
+      usage: { input_tokens: 55, output_tokens: 5, total_tokens: 60 } });
+    await emit('native_control', { type: 'response.steer.disconnected', responseId: 'r1',
+      submissionId: 'cmd-1', reason: 'successor_application_unverified' });
     await emit('native_control', { type: 'response.created', responseId: 'r2', previousResponseId: 'r1' });
     await emit('output_delta', { type: 'text_delta', text: 'after steer', outputItem: { id: 'i3', ordinal: 2, providerResponseId: 'r2' } });
     await emit('output_item_done', textItemEnvelope('i3', 2, 'r2'));
@@ -453,26 +473,39 @@ test('steering persists user message, transitions, applies exactly once, rejects
   });
 });
 
-test('synchronous call admits only at a proven response boundary, never fabricated', async () => {
+test('synchronous tool waits for a real completion boundary then checkpoints a settled result without forged admission', async () => {
   const name = 'native-sync-boundary';
   await withNativeApp(name, [{ name: 'write_file', nativeAsync: false }], async ({ app, turnId, fence, record }) => {
     const result = await driveWithCauses(app, fence, turnId);
     await expectDriveTerminal(app, turnId, result, 'completed');
     assert.equal(record.dispatchedInputs.length, 1);
-    assert.equal(record.submissions.length, 1);
-    assert.equal(record.submissions[0][0].callId, 'call-sync-1');
+    assert.equal(record.endLogicalRequestCalls, 1);
+    assert.equal(record.submissions.length, 0, 'local checkpoint does not fabricate provider result admission');
     const calls = await list(app, 'ToolCall', { turn_id: turnId });
     assert.equal(calls.length, 1);
     const deliveries = (await list(app, 'ToolCallEvent', { tool_call_id: calls[0].id }))
       .filter((row) => row.event_kind === 'native_delivery');
-    assert.equal(deliveries.length, 1);
-    assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId: name }), []);
+    assert.equal(deliveries.length, 0);
+    assert.equal((await list(app, 'ToolModelResult', { tool_call_id: calls[0].id })).length, 1);
+    assert.equal((await list(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1);
+    assert.equal((await list(app, 'ModelRequest', { turn_id: turnId })).length, 2,
+      'the completed safe batch advances within the same Turn via a full request');
     const modelRequestId = (await list(app, 'ModelRequest', { turn_id: turnId }))
       .sort((left, right) => (BigInt(left.request_seq) < BigInt(right.request_seq) ? -1 : 1))[0].id;
     const proofs = await readCheckpointContents(app, modelRequestId, 'native_tool_call');
     assert.equal(proofs.length, 1);
     assert.equal(proofs[0].content.async, false, 'sync proof is honestly not async');
-  }, async ({ emit, record }) => {
+  }, async ({ emit, ended, request, record, dispatchOrdinal }) => {
+    if (dispatchOrdinal === 2) {
+      assert.ok(request.context.some(segment => segment.segmentKind === 'tool_pair'
+        && segment.content.includes('toolModelResult')));
+      await emit('native_control', { type: 'response.created', responseId: 'r2' });
+      await emit('native_control', { type: 'response.completed', responseId: 'r2',
+        usage: { input_tokens: 75, output_tokens: 5, total_tokens: 80 } });
+      await emit('completed', { role: 'model', parts: [{ text: 'sync result carried' }] });
+      return;
+    }
+    assert.equal(dispatchOrdinal, 1);
     await emit('native_control', { type: 'response.created', responseId: 'r1', capabilities: { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: true, explicitCaching: true } });
     await emit('output_item_done', {
       type: 'tool_calls',
@@ -482,23 +515,15 @@ test('synchronous call admits only at a proven response boundary, never fabricat
     // No execution before the proven boundary + required input: the pump must wait for both.
     await emit('native_control', {
       type: 'response.completed', responseId: 'r1',
+      usage: { input_tokens: 70, output_tokens: 10, total_tokens: 80 },
       requiredInput: [{ type: 'function_call_output', callId: 'call-sync-1' }]
     });
-    await waitFor(() => record.submissions.length === 1, 'sync result submission');
-    await emit('native_control', {
-      type: 'response.created', responseId: 'r-submit-1', previousResponseId: 'r1',
-      admittedToolResultCallIds: ['call-sync-1']
-    });
-    await emit('output_delta', { type: 'text_delta', text: 'done', outputItem: { id: 'i2', ordinal: 1, providerResponseId: 'r-submit-1' } });
-    await emit('output_item_done', textItemEnvelope('i2', 1, 'r-submit-1'));
-    await emit('native_control', { type: 'response.completed', responseId: 'r-submit-1' });
-    await emit('completed', {
-      role: 'model',
-      parts: [
-        { id: 'call-sync-1', functionCall: { name: 'write_file', args: { path: 'out.txt', text: 'x' } }, outputItem: { id: 'i1', ordinal: 0, providerResponseId: 'r1' } },
-        { text: 'done', outputItem: { id: 'i2', ordinal: 1, providerResponseId: 'r-submit-1' } }
-      ]
-    }, { usage: { input_tokens: 70, output_tokens: 10, total_tokens: 80 } });
+    await ended;
+    assert.equal(record.submissions.length, 0, 'settled synchronous batch waits for next full request');
+    await emit('completed', { role: 'model', parts: [
+      { id: 'call-sync-1', functionCall: { name: 'write_file', args: { path: 'out.txt', text: 'x' } },
+        outputItem: { id: 'i1', ordinal: 0, providerResponseId: 'r1' } }
+    ] }, { usage: { input_tokens: 70, output_tokens: 10, total_tokens: 80 } });
   });
 });
 

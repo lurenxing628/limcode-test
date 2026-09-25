@@ -21,6 +21,8 @@ export interface NormalizedTokenUsage {
   reasoning?: number;
   cached?: number;
   attachmentTokens?: number;
+  /** Native logical-chain usage is billing across physical responses, never one prompt size. */
+  nativeChainBilling?: boolean;
   totalEstimated?: boolean;
   sourceEstimated?: boolean;
 }
@@ -50,10 +52,61 @@ export interface TokenUsageMessageEntry {
   ratio: number;
 }
 
+export interface NativePhysicalContextUsage {
+  responseId: string;
+  inputTokens?: number;
+  /** Only a complete provider-wire frontier covering this exact current root is precise. */
+  exact: boolean;
+}
+
+/** Read the latest raw physical response, never the logical ModelRequest's sum of bills. */
+export function nativePhysicalContextUsage(
+  streamStats: unknown,
+  currentRootId: string | undefined
+): NativePhysicalContextUsage | undefined {
+  const stats = asUsageRecord(streamStats);
+  const latest = asUsageRecord(stats?.nativeLatestResponseUsage);
+  const responseId = typeof latest?.responseId === 'string' ? latest.responseId.trim() : '';
+  if (!responseId) return undefined;
+  const inputTokens = typeof latest?.inputTokens === 'number' && Number.isSafeInteger(latest.inputTokens)
+    && latest.inputTokens >= 0 ? latest.inputTokens : undefined;
+  const boundedCount = typeof latest?.physicalResponseCount === 'number'
+    && Number.isSafeInteger(latest.physicalResponseCount)
+    && latest.physicalResponseCount >= 1 && latest.physicalResponseCount <= 8;
+  const exact = boundedCount && inputTokens !== undefined
+    && latest?.contextCovered === true
+    && typeof currentRootId === 'string' && currentRootId.length > 0
+    && latest?.contextRootId === currentRootId
+    && latest?.attemptSeq === stats?.attemptSeq
+    && latest?.socketGeneration === stats?.socketGeneration;
+  return { responseId, ...(inputTokens === undefined ? {} : { inputTokens }), exact };
+}
+
+function asUsageRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value === 'string') {
+    try { return asUsageRecord(JSON.parse(value) as unknown); } catch { return undefined; }
+  }
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+}
+
+/** A frozen request's estimate is usable only for the very same current Context root. */
+export function currentRootEstimatedTokens(
+  currentRootId: string | undefined,
+  currentRootEstimate: unknown,
+  requestRootId: string | undefined,
+  requestEstimate: unknown
+): number | undefined {
+  if (!currentRootId) return undefined;
+  return normalizeTokenNumber(currentRootEstimate)
+    ?? (requestRootId === currentRootId ? normalizeTokenNumber(requestEstimate) : undefined);
+}
+
 export function buildTokenUsageMessages(messages: MessageRecord[]): TokenUsageMessageEntry[] {
   const sortedMessages = [...messages].sort((left, right) => left.seq - right.seq || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
   const normalEntries: Array<Omit<TokenUsageMessageEntry, 'ratio'>> = [];
   let firstModelUsage: { usage: NormalizedTokenUsage; floorNumber: number } | undefined;
+  let nativeBeforeFirstModelUsage = false;
   let userInputBeforeFirstModel = 0;
   let previousModelInput: number | undefined;
   let userInputSincePreviousModel = 0;
@@ -63,7 +116,11 @@ export function buildTokenUsageMessages(messages: MessageRecord[]): TokenUsageMe
     const usage = message.usageMetadata ? normalizeTokenUsage(message.usageMetadata) : undefined;
     if (!usage) return;
 
-    if (message.role === 'model' && usage.total !== undefined && firstModelUsage === undefined) {
+    if (message.role === 'model' && usage.nativeChainBilling === true && firstModelUsage === undefined) {
+      nativeBeforeFirstModelUsage = true;
+    }
+    if (message.role === 'model' && usage.nativeChainBilling !== true
+      && usage.total !== undefined && firstModelUsage === undefined) {
       firstModelUsage = { usage, floorNumber };
     }
 
@@ -72,8 +129,14 @@ export function buildTokenUsageMessages(messages: MessageRecord[]): TokenUsageMe
 
     let tool: number | undefined;
     if (message.role === 'model') {
-      tool = toolTokensFromInputDelta(usage.input, previousModelInput, userInputSincePreviousModel);
-      if (usage.input !== undefined) previousModelInput = usage.input;
+      if (usage.nativeChainBilling === true) {
+        // A chain total is neither one prompt nor a tool delta. Break the ordinary-provider
+        // baseline here, so a later request cannot compare its input to an older native bill.
+        previousModelInput = undefined;
+      } else {
+        tool = toolTokensFromInputDelta(usage.input, previousModelInput, userInputSincePreviousModel);
+        if (usage.input !== undefined) previousModelInput = usage.input;
+      }
       userInputSincePreviousModel = 0;
     } else {
       userInputSincePreviousModel += userInput;
@@ -84,7 +147,8 @@ export function buildTokenUsageMessages(messages: MessageRecord[]): TokenUsageMe
   });
 
   const maxNormalTotal = Math.max(0, ...normalEntries.map((entry) => entry.total));
-  const systemEntry = buildSystemPromptEntry(firstModelUsage, userInputBeforeFirstModel);
+  const systemEntry = nativeBeforeFirstModelUsage
+    ? undefined : buildSystemPromptEntry(firstModelUsage, userInputBeforeFirstModel);
   const entries = systemEntry ? [systemEntry, ...normalEntries] : normalEntries;
 
   return entries.map((entry) => ({
@@ -100,7 +164,7 @@ export function normalizeTokenUsage(usage: LlmUsageMetadataRecord): NormalizedTo
   const cached = usageNumber(usage, CACHED_TOKEN_KEYS);
   const explicitTotal = usageNumber(usage, TOTAL_TOKEN_KEYS);
   const attachmentTokens = normalizeTokenNumber(usage.attachmentTokenEstimate);
-  const output = outputTokensIncludingReasoning(input, rawOutput, reasoning, explicitTotal);
+  const output = outputTokensIncludingReasoning(input, rawOutput, reasoning, explicitTotal, usage.nativeChainBilling === true);
   const fallbackTotal = explicitTotal === undefined ? sumDefined([input, output]) : undefined;
   const sourceEstimated = usage.estimated === true || usage.tokenEstimator === 'tokenx';
 
@@ -111,16 +175,27 @@ export function normalizeTokenUsage(usage: LlmUsageMetadataRecord): NormalizedTo
     ...(reasoning !== undefined ? { reasoning } : {}),
     ...(cached !== undefined ? { cached } : {}),
     ...(attachmentTokens !== undefined && attachmentTokens > 0 ? { attachmentTokens } : {}),
+    ...(usage.nativeChainBilling === true ? { nativeChainBilling: true } : {}),
     ...(sourceEstimated ? { sourceEstimated: true } : {})
   };
 }
 
-function outputTokensIncludingReasoning(input: number | undefined, rawOutput: number | undefined, reasoning: number | undefined, total: number | undefined): number | undefined {
+function outputTokensIncludingReasoning(
+  input: number | undefined,
+  rawOutput: number | undefined,
+  reasoning: number | undefined,
+  total: number | undefined,
+  nativeChainBilling: boolean
+): number | undefined {
+  // A native physical output_tokens count already includes reasoning, and that count remains
+  // authoritative even when a raw total is absent or inconsistent. Reasoning alone is only a
+  // subset of native output: it cannot prove a complete output bill.
+  if (nativeChainBilling && rawOutput !== undefined) return rawOutput;
   if (total !== undefined && input !== undefined) {
     return Math.max(0, total - input);
   }
-
-  return sumDefined([rawOutput, reasoning]);
+  // Non-native Gemini-style candidates exclude thinking unless the Provider supplied a total.
+  return nativeChainBilling ? undefined : sumDefined([rawOutput, reasoning]);
 }
 
 export function formatTokenNumber(value: number): string {
@@ -168,8 +243,9 @@ function messageUsageEntry(message: MessageRecord, floorNumber: number, usage: N
 
 function totalForMessage(role: MsgRole, usage: NormalizedTokenUsage, tool: number | undefined): number | undefined {
   if (role === 'user') return usage.input ?? usage.total;
-  const outputWithReasoning = usage.output ?? usage.reasoning;
-  return sumDefined([outputWithReasoning, tool]) ?? nonInputFromTotal(usage) ?? usage.total;
+  const outputWithReasoning = usage.output ?? (usage.nativeChainBilling === true ? undefined : usage.reasoning);
+  return sumDefined([outputWithReasoning, tool]) ?? nonInputFromTotal(usage)
+    ?? (usage.nativeChainBilling === true ? undefined : usage.total);
 }
 
 function usagePartsForMessage(role: MsgRole, usage: NormalizedTokenUsage, tool: number | undefined): Pick<TokenUsageMessageEntry, 'input' | 'output' | 'reasoning' | 'tool'> {
@@ -181,7 +257,11 @@ function usagePartsForMessage(role: MsgRole, usage: NormalizedTokenUsage, tool: 
   };
 }
 
-function toolTokensFromInputDelta(currentInput: number | undefined, previousModelInput: number | undefined, userInputSincePreviousModel: number): number | undefined {
+function toolTokensFromInputDelta(
+  currentInput: number | undefined,
+  previousModelInput: number | undefined,
+  userInputSincePreviousModel: number
+): number | undefined {
   if (currentInput === undefined || previousModelInput === undefined) return undefined;
   return Math.max(0, currentInput - previousModelInput - userInputSincePreviousModel);
 }
@@ -195,7 +275,7 @@ function buildSystemPromptEntry(
   firstModelUsage: { usage: NormalizedTokenUsage; floorNumber: number } | undefined,
   userInputBeforeFirstModel: number
 ): Omit<TokenUsageMessageEntry, 'ratio'> | undefined {
-  if (!firstModelUsage?.usage.total) return undefined;
+  if (!firstModelUsage?.usage.total || firstModelUsage.usage.nativeChainBilling === true) return undefined;
   const total = Math.max(0, firstModelUsage.usage.total - userInputBeforeFirstModel);
   if (total <= 0) return undefined;
   return {
@@ -220,12 +300,12 @@ function usageNumber(usage: LlmUsageMetadataRecord, keys: readonly string[]): nu
 }
 
 function normalizeTokenNumber(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
-  if (!trimmed) return undefined;
+  if (!/^(0|[1-9][0-9]*)$/.test(trimmed)) return undefined;
   const numeric = Number(trimmed);
-  return Number.isFinite(numeric) ? numeric : undefined;
+  return Number.isSafeInteger(numeric) ? numeric : undefined;
 }
 
 function sumDefined(values: Array<number | undefined>): number | undefined {

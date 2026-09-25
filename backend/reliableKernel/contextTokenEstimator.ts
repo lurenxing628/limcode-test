@@ -518,11 +518,15 @@ function compareRequestsNewestFirst(left: DomainRow, right: DomainRow): number {
 
 export function providerPromptTokens(value: unknown): number | undefined {
   const usage = usageRecord(value);
+  // A native logical request may bill many separate physical prompts; TurnOutput's no-item
+  // fallback must not write their summed bill as the resulting Context root's occupancy.
+  if (usage?.nativeChainBilling === true) return undefined;
   return firstTokenCount(usage, ['promptTokenCount', 'prompt_tokens', 'input_tokens', 'inputTokens']);
 }
 
 export function providerTotalTokens(value: unknown): number | undefined {
   const usage = usageRecord(value);
+  if (usage?.nativeChainBilling === true) return undefined;
   const explicit = firstTokenCount(usage, ['totalTokenCount', 'total_tokens', 'totalTokens']);
   if (explicit !== undefined) return explicit;
   const input = firstTokenCount(usage, ['promptTokenCount', 'prompt_tokens', 'input_tokens', 'inputTokens']);
@@ -565,7 +569,9 @@ function reasoningInsideOutputTokens(usage: Record<string, unknown> | undefined,
  */
 export function nativePromptCalibration(streamStats: unknown): { native: boolean; promptTokens?: number } {
   const stats = typeof streamStats === 'string' ? parseRecord(streamStats) : asRecord(streamStats);
-  if (!stats || (stats.nativeCapabilities === undefined && stats.nativeInitialPromptTokenCount === undefined)) {
+  if (!stats || (stats.nativeCapabilities === undefined
+    && stats.nativeInitialPromptTokenCount === undefined
+    && stats.nativeLatestResponseUsage === undefined)) {
     return { native: false };
   }
   const initial = stats.nativeInitialPromptTokenCount;

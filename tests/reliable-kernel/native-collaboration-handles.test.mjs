@@ -20,71 +20,82 @@ const definition = name => ({ name, description: 'native collaboration handle fi
 const rows = async (app, domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain)
   .list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot;
 
+async function frozenNativeOutput(app, providerCallId) {
+  const [source] = await rows(app, 'ToolCallSourceLink', { provider_call_id: providerCallId });
+  assert.ok(source, `${providerCallId} has a durable native ToolCall`);
+  const [projection] = await rows(app, 'ToolCallEvent', {
+    tool_call_id: source.tool_call_id, event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT
+  });
+  assert.ok(projection, `${providerCallId} freezes its model-facing output before checkpoint`);
+  const [metadata] = await rows(app, 'ContentObject', { id: projection.content_object_id });
+  const bytes = (await app.contentStore.read(metadata)).toString('utf8');
+  return { output: JSON.parse(bytes).output, source };
+}
+
 for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_message', 'agent_collaboration'],
-  ['list_conversations', 'send_conversation_message', 'cross_conversation']]) test(`native ${sendTool} references freeze before output and survive same-request send, restart and replay`, { timeout: 30000 }, async () => {
+  ['list_conversations', 'send_conversation_message', 'cross_conversation']]) test(`native ${sendTool} freezes references across ModelRequests of one Turn, restart and replay`, { timeout: 30000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'native-child-handles-'));
   const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(root);
   let app;
-  let capturedRequest;
+  const capturedRequests = [];
   const executed = [];
-  const outputs = [];
   const adapter = {
     providerId: 'native-provider',
     async materializeNativeToolOutput(values) { return values; },
     async sendFullRequest(request, controls) {
-      capturedRequest = request;
+      capturedRequests.push(request);
+      const round = capturedRequests.length;
       assert.ok(controls.native, 'this must exercise nativeResponses execution, not provider_native compression');
       let sequence = 0;
       const event = (kind, content) => controls.onEvent({ kind, streamSeq: String(++sequence), content });
       const control = content => event('native_control', content);
       const call = (id, ordinal, args, responseId) => event('output_item_done', {
-        type: 'tool_calls', calls: [{ id, ordinal, name: args.operation === 'spawn' ? listTool : sendTool, arguments: args.operation === 'spawn' ? {} : args, async: false }],
+        type: 'tool_calls', calls: [{ id, ordinal, name: args.operation === 'spawn' ? listTool : sendTool,
+          arguments: args.operation === 'spawn' ? {} : args, async: false }],
         outputItem: { id: `item-${id}`, ordinal, providerResponseId: responseId }
       });
       let finish;
-      let fail;
-      const done = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
-      const submitted = [];
+      const done = new Promise(resolve => { finish = resolve; });
       controls.native.onController({
-        endLogicalRequest() {}, async steer() {},
-        async submitToolResults(batch) {
-          try {
-            const projections = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });
-            const deliveries = await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' });
-            assert.equal(projections.length, submitted.length + batch.length, 'freeze must commit before wire submission');
-            assert.equal(deliveries.length, submitted.length, 'freeze must not pretend to be delivery acknowledgment');
-            const decoded = batch.map(item => JSON.parse(item.output));
-            outputs.push(...batch);
-            submitted.push(...batch.map(item => item.callId));
-            assert.doesNotMatch(JSON.stringify(decoded), /conversationId|childExecutionId|modelRequestId|childHandles/);
-            if (submitted.length === 2) {
-              assert.deepEqual(decoded.map(item => item.detail.conversationRef), ['C1', 'C2']);
-              await control({ type: 'response.created', responseId: 'response-followup', previousResponseId: 'response-spawn',
-                admittedToolResultCallIds: batch.map(item => item.callId) });
-              const mode = sendTool === 'send_conversation_message' ? { mode: 'followup' } : {};
-              await call('send', 0, { conversationRef: 'C1', text: 'follow up original peer', ...mode }, 'response-followup');
-              await call('unknown', 1, { conversationRef: 'C999', text: 'must not run', ...mode }, 'response-followup');
-              await control({ type: 'response.completed', responseId: 'response-followup' });
-            } else {
-              assert.equal(submitted.length, 4);
-              assert.equal(decoded[0].detail.conversationRef, 'C1');
-              assert.equal(decoded[1].status, 'failed');
-              assert.match(decoded[1].detail.error, /C999/);
-              await control({ type: 'response.created', responseId: 'response-final', previousResponseId: 'response-followup',
-                admittedToolResultCallIds: batch.map(item => item.callId) });
-              await control({ type: 'response.completed', responseId: 'response-final' });
-              await event('completed', { role: 'model', parts: [{ text: 'done' }] });
-              finish();
-            }
-          } catch (error) { fail(error); throw error; }
-        }
+        endLogicalRequest() { finish(); },
+        async steer() { assert.fail('peer tool results never become user steering'); },
+        async submitToolResults() { assert.fail('safe tool batches need a new preflighted full request'); }
       });
-      await control({ type: 'response.created', responseId: 'response-spawn', capabilities });
-      await call('spawn-one', 0, { operation: 'spawn', taskName: 'one', prompt: 'first independent task' }, 'response-spawn');
-      await call('spawn-two', 1, { operation: 'spawn', taskName: 'two', prompt: 'second independent task' }, 'response-spawn');
-      await control({ type: 'response.completed', responseId: 'response-spawn' });
-      await done;
+      const responseId = ['response-spawn', 'response-followup', 'response-final'][round - 1];
+      assert.ok(responseId);
+      if (round > 1) {
+        const projected = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });
+        assert.equal(projected.length, round === 2 ? 2 : 4,
+          'all prior child refs freeze before the next request');
+        assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
+          'local checkpoint is not provider result admission');
+        const refs = request.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'conversation');
+        assert.deepEqual(refs.map(entry => [entry.ref, entry.target]),
+          [['C1', 'conversation_one'], ['C2', 'conversation_two']]);
+        assert.ok(request.context.some(segment => segment.segmentKind === 'tool_pair'),
+          'the successor carries frozen Context tool results within this Turn');
+      }
+      await control({ type: 'response.created', responseId, capabilities });
+      if (round === 1) {
+        await call('spawn-one', 0, { operation: 'spawn', taskName: 'one' }, responseId);
+        await call('spawn-two', 1, { operation: 'spawn', taskName: 'two' }, responseId);
+      } else if (round === 2) {
+        const mode = sendTool === 'send_conversation_message' ? { mode: 'followup' } : {};
+        await call('send', 0, { conversationRef: 'C1', text: 'follow up original peer', ...mode }, responseId);
+        await call('unknown', 1, { conversationRef: 'C999', text: 'must not run', ...mode }, responseId);
+      }
+      await control({ type: 'response.completed', responseId });
+      if (round === 3) {
+        await event('completed', { role: 'model', parts: [{ text: 'done' }] });
+      } else {
+        await done;
+        await event('completed', { role: 'model', parts: round === 1
+          ? [{ id: 'spawn-one', functionCall: { name: listTool, args: {} } },
+            { id: 'spawn-two', functionCall: { name: listTool, args: {} } }]
+          : [{ id: 'send', functionCall: { name: sendTool, args: { conversationRef: 'C1' } } },
+            { id: 'unknown', functionCall: { name: sendTool, args: { conversationRef: 'C999' } } }] });
+      }
       controls.native.onController(undefined);
     }
   };
@@ -143,14 +154,14 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
     if (result.terminalStatus !== 'completed') {
       assert.fail(JSON.stringify(await rows(app, 'TurnTermination', { turn_id: started.turnId })));
     }
-    assert.equal(result.modelRequestIds.length, 1, 'spawn and send share one actual native logical request');
+    assert.equal(result.modelRequestIds.length, 3, 'two settled batches cross separately preflighted ModelRequests in ONE Turn');
     assert.equal(executed.length, 3, 'unknown short reference never dispatches or spawns');
-    assert.deepEqual(capturedRequest.recipe.modelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
+    assert.deepEqual(capturedRequests[0].recipe.modelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
     const frozenRefs = await readConversationChildHandles(app.database, app.contentStore, 'parent');
     assert.deepEqual(frozenRefs.map(entry => [entry.ref, entry.target]), [['C1', 'conversation_one'], ['C2', 'conversation_two']]);
     const eventRows = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });
     assert.equal(eventRows.length, 4);
-    const checkpointRows = await rows(app, 'ModelStreamCheckpoint', { model_request_id: capturedRequest.modelRequestId });
+    const checkpointRows = await rows(app, 'ModelStreamCheckpoint', { model_request_id: capturedRequests[0].modelRequestId });
     // Admission events retain source proofs after stream checkpoint pruning; the raw model history
     // and resolved ToolCall facts must still disagree exactly where short refs were translated.
     const [sendSource] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'send' });
@@ -159,16 +170,36 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
     const sendArgs = JSON.parse((await app.contentStore.read(argsMetadata)).toString('utf8'));
     assert.equal(sendArgs.targetConversationId, 'conversation_one');
     assert.equal(checkpointRows.length >= 1, true);
+    const frozenOutputs = [];
+    for (const providerCallId of ['spawn-one', 'spawn-two', 'send', 'unknown']) {
+      const frozen = await frozenNativeOutput(app, providerCallId);
+      assert.doesNotMatch(frozen.output, /conversationId|childExecutionId|modelRequestId|childHandles/);
+      frozenOutputs.push({ ...frozen, decoded: JSON.parse(frozen.output) });
+    }
+    assert.deepEqual(frozenOutputs.slice(0, 2).map(item => item.decoded.detail.conversationRef), ['C1', 'C2']);
+    assert.equal(frozenOutputs[2].decoded.detail.conversationRef, 'C1');
+    assert.equal(frozenOutputs[3].decoded.status, 'failed');
+    assert.match(frozenOutputs[3].decoded.detail.error, /C999/);
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 4);
+    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
     await app.close();
     app = await kernel.ReliableKernelApplication.open(root, dependencies);
-    assert.deepEqual(await readNativeRequestChildHandles(app.database, app.contentStore, capturedRequest.modelRequestId), frozenRefs);
+    assert.deepEqual(await readNativeRequestChildHandles(app.database, app.contentStore, capturedRequests[0].modelRequestId), frozenRefs);
     assert.deepEqual(await readConversationChildHandles(app.database, app.contentStore, 'parent'), frozenRefs);
-    const recoveredSources = await rows(app, 'ToolCallSourceLink', { model_request_id: capturedRequest.modelRequestId });
+    const recoveredSources = await rows(app, 'ToolCallSourceLink', { model_request_id: capturedRequests[0].modelRequestId });
+    const [persistedRequest] = await rows(app, 'ModelRequest', { id: capturedRequests[0].modelRequestId });
+    const [recipeMetadata] = await rows(app, 'ContentObject', { id: persistedRequest.recipe_object_id });
+    const frozenBudget = JSON.parse((await app.contentStore.read(recipeMetadata)).toString('utf8')).nativeLogicalBudget;
+    const [projection] = await rows(app, 'ModelContextProjection', {
+      owner_kind: 'model_request', owner_id: capturedRequests[0].modelRequestId
+    });
+    assert.deepEqual(frozenBudget, capturedRequests[0].recipe.nativeLogicalBudget);
     const recovered = new NativeRequestSession({
       database: app.database, contentStore: app.contentStore, context: app.context, turnOutput: app.turnOutput,
       effects: app.runtime.effects, tools: dependencies.toolDispatcher, modelProvider: app.modelProvider,
-      conversationId: 'parent', turnId: started.turnId, modelRequestId: capturedRequest.modelRequestId,
+      conversationId: 'parent', turnId: started.turnId, modelRequestId: capturedRequests[0].modelRequestId,
       providerId: 'native-provider', modelId: 'gpt-6-astra', capabilities, modelHandleCatalog: { entries: [] },
+      budget: frozenBudget, initialContextRootId: projection.root_id,
       resolveAdapter: async () => adapter, resolveDefinition: definition,
       resolveCallArguments: (name, args) => ({ arguments: resolveModelToolArguments(name, args, recovered.currentModelHandleCatalog()) }),
       freezePolicies: async () => { throw new Error('recovery must not admit new calls'); },
@@ -186,7 +217,9 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
     const [firstResult] = await rows(app, 'ToolModelResult', { tool_call_id: firstSource.tool_call_id });
     const replay = await recovered.buildFunctionCallOutput({ name: listTool, toolCallId: firstSource.tool_call_id,
       providerCallId: 'spawn-one', toolModelResultId: firstResult.id });
-    assert.equal(replay.output, outputs[0].output, 'replay bytes cannot change after later child allocations');
+    assert.equal(replay.output, frozenOutputs[0].output, 'replay bytes cannot change after later child allocations');
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 4,
+      'replaying a frozen output never duplicates a Context occurrence');
     assert.equal((await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT })).length, 4);
   } finally {
     await app?.close();
@@ -194,7 +227,7 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
   }
 });
 
-test('native fork_conversation runs through the dispatcher and its frozen reference addresses the fork in the same request', { timeout: 30000 }, async () => {
+test('native fork_conversation freezes the fork reference before a preflighted send in the same Turn', { timeout: 30000 }, async () => {
   const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
   const { CollaborationToolDispatcher } = load('backend/reliableKernel/collaborationToolDispatcher.js');
   const { ReliableConversationLifecycle } = load('backend/application/reliableKernel/conversationLifecycle.js');
@@ -225,36 +258,50 @@ test('native fork_conversation runs through the dispatcher and its frozen refere
         type: 'tool_calls', calls: [{ id, ordinal, name, arguments: args, async: false }],
         outputItem: { id: `item-${id}`, ordinal, providerResponseId: responseId }
       });
-      let finish, fail;
-      const done = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+      let finish;
+      const done = new Promise(resolve => { finish = resolve; });
       controls.native.onController({
-        endLogicalRequest() {}, async steer() {},
-        async submitToolResults(batch) {
-          try {
-            const [output] = batch.map(item => JSON.parse(item.output));
-            assert.doesNotMatch(JSON.stringify(output), /conversationId|native-fork-dispatch-parent/);
-            if (!forkOutput) {
-              forkOutput = output;
-              assert.equal(output.status, 'succeeded', JSON.stringify(output));
-              assert.match(output.detail.conversationRef, /^C\d+$/);
-              assert.notEqual(output.detail.conversationRef, output.detail.sourceConversationRef);
-              await control({ type: 'response.created', responseId: 'response-send', previousResponseId: 'response-fork', admittedToolResultCallIds: batch.map(item => item.callId) });
-              await call('send-to-fork', 0, 'send_conversation_message', { conversationRef: output.detail.conversationRef, text: NOTE, mode: 'message' }, 'response-send');
-              await control({ type: 'response.completed', responseId: 'response-send' });
-            } else {
-              sendOutput = output;
-              await control({ type: 'response.created', responseId: 'response-final', previousResponseId: 'response-send', admittedToolResultCallIds: batch.map(item => item.callId) });
-              await control({ type: 'response.completed', responseId: 'response-final' });
-              await event('completed', { role: 'model', parts: [{ text: 'forked and informed' }] });
-              finish();
-            }
-          } catch (error) { fail(error); throw error; }
-        }
+        endLogicalRequest() { finish(); },
+        async steer() { assert.fail('fork results are not user steering'); },
+        async submitToolResults() { assert.fail('a settled fork or send batch must checkpoint before the next request'); }
       });
-      await control({ type: 'response.created', responseId: 'response-fork', capabilities });
-      await call('fork-self', 0, 'fork_conversation', {}, 'response-fork');
-      await control({ type: 'response.completed', responseId: 'response-fork' });
-      await done;
+      if (round === 3) {
+        const frozen = await frozenNativeOutput(app, 'fork-self');
+        assert.doesNotMatch(frozen.output, /conversationId|native-fork-dispatch-parent/);
+        forkOutput = JSON.parse(frozen.output);
+        assert.equal(forkOutput.status, 'succeeded', JSON.stringify(forkOutput));
+        assert.match(forkOutput.detail.conversationRef, /^C\d+$/);
+        assert.notEqual(forkOutput.detail.conversationRef, forkOutput.detail.sourceConversationRef);
+        assert.ok(request.recipe.modelHandleCatalog.entries.some(entry =>
+          entry.ref === forkOutput.detail.conversationRef), 'successor recipe freezes the new fork reference');
+        assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
+        await control({ type: 'response.created', responseId: 'response-send', capabilities });
+        await call('send-to-fork', 0, 'send_conversation_message',
+          { conversationRef: forkOutput.detail.conversationRef, text: NOTE, mode: 'message' }, 'response-send');
+        await control({ type: 'response.completed', responseId: 'response-send' });
+      } else if (round === 4) {
+        const frozen = await frozenNativeOutput(app, 'send-to-fork');
+        assert.doesNotMatch(frozen.output, /conversationId|native-fork-dispatch-parent/);
+        sendOutput = JSON.parse(frozen.output);
+        assert.ok(request.recipe.modelHandleCatalog.entries.some(entry =>
+          entry.ref === forkOutput.detail.conversationRef), 'fork identity persists across the second checkpoint');
+        assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
+        await control({ type: 'response.created', responseId: 'response-final', capabilities });
+        await control({ type: 'response.completed', responseId: 'response-final' });
+        await event('completed', { role: 'model', parts: [{ text: 'forked and informed' }] });
+      } else {
+        assert.equal(round, 2);
+        await control({ type: 'response.created', responseId: 'response-fork', capabilities });
+        await call('fork-self', 0, 'fork_conversation', {}, 'response-fork');
+        await control({ type: 'response.completed', responseId: 'response-fork' });
+      }
+      if (round < 4) {
+        await done;
+        await event('completed', { role: 'model', parts: round === 2
+          ? [{ id: 'fork-self', functionCall: { name: 'fork_conversation', args: {} } }]
+          : [{ id: 'send-to-fork', functionCall: { name: 'send_conversation_message',
+            args: { conversationRef: forkOutput.detail.conversationRef, text: NOTE, mode: 'message' } } }] });
+      }
       controls.native.onController(undefined);
     }
   };
@@ -322,7 +369,8 @@ test('native fork_conversation runs through the dispatcher and its frozen refere
     ]);
     await drive('native-fork-history', 'NATIVE_FIRST_QUESTION_4503');
     const second = await drive('native-fork-current', 'NATIVE_CURRENT_QUESTION_4504');
-    assert.equal(second.result.modelRequestIds.length, 1, 'fork and send share one native logical request');
+    assert.equal(second.result.modelRequestIds.length, 3,
+      'fork and send each yield a complete safe tool batch, preserving the same user Turn');
     assert.deepEqual(dispatched, ['fork_conversation', 'send_conversation_message'], 'both calls ran through the production dispatcher');
     assert.equal(sendOutput.status, 'succeeded', JSON.stringify(sendOutput));
     const [forkSource] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'fork-self' });
@@ -343,7 +391,11 @@ test('native fork_conversation runs through the dispatcher and its frozen refere
     assert.ok(target, 'the note was addressed to the fork');
     const refs = await readNativeRequestChildHandles(app.database, app.contentStore, second.result.modelRequestIds[0]);
     assert.ok(refs.some(entry => entry.ref === forkOutput.detail.conversationRef && entry.target === forkId), JSON.stringify(refs));
-    assert.ok((await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT })).length >= 2, 'references freeze before each native output');
+    assert.ok((await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT })).length >= 2,
+      'references freeze into CAS before both native checkpoints');
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 2);
+    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
+    assert.deepEqual(dispatched, ['fork_conversation', 'send_conversation_message'], 'no external effect is replayed');
   } finally {
     await app?.close();
     await fs.rm(directory, { recursive: true, force: true });

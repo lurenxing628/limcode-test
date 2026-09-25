@@ -41,6 +41,64 @@ export function selectBlockingNativePendingCalls(
   );
 }
 
+export interface NativeLogicalRequestBudget {
+  /** Exact frozen full-request planning capacity (context window minus output reserve). */
+  planningInputCapacityTokens: number;
+  /** Frozen user threshold; relevant only if automatic compression is actually enabled. */
+  compressionThresholdTokens: number;
+  autoCompressionEnabled: boolean;
+}
+
+/**
+ * A logical native request can contain many physical responses, but each completed response's
+ * input_tokens counts only THAT physical prompt. Never add response usages together: their sum is
+ * billing, not context occupancy. The headroom is deliberately conservative because the next
+ * response may add tool output and model text before the next safe boundary.
+ */
+export function nativePhysicalResponseBudgetPressure(input: {
+  budget: NativeLogicalRequestBudget;
+  physicalInputTokens?: number;
+  physicalResponseCount: number;
+}): boolean {
+  const { budget, physicalInputTokens, physicalResponseCount } = input;
+  if (!Number.isSafeInteger(budget.planningInputCapacityTokens) || budget.planningInputCapacityTokens < 0
+    || !Number.isSafeInteger(budget.compressionThresholdTokens) || budget.compressionThresholdTokens <= 0
+    || !Number.isSafeInteger(physicalResponseCount) || physicalResponseCount < 0) {
+    throw new TypeError('Native physical response budget contains invalid token counts.');
+  }
+  if (physicalInputTokens !== undefined
+    && (!Number.isSafeInteger(physicalInputTokens) || physicalInputTokens < 0)) {
+    throw new TypeError('Native physical response input must be a non-negative safe integer.');
+  }
+  // An unknown usage is not zero and is never used to assert that another physical create fits.
+  if (physicalInputTokens === undefined) return true;
+  if (physicalResponseCount >= 8) return true;
+  const headroom = Math.min(2048, Math.max(256, Math.ceil(budget.planningInputCapacityTokens / 10)));
+  const capacityBoundary = Math.max(0, budget.planningInputCapacityTokens - headroom);
+  const boundary = budget.autoCompressionEnabled
+    ? Math.min(capacityBoundary, budget.compressionThresholdTokens)
+    : capacityBoundary;
+  return physicalInputTokens >= boundary;
+}
+
+export class NativeSafetyWaitError extends Error {
+  public readonly code = 'NATIVE_SAFETY_WAIT';
+
+  public constructor(public readonly toolCallId: string) {
+    super(`Native result admission is unverified while tool ${toolCallId} is still running. Preserve the admitted external effect and wait for its durable terminal result before a safe refusal.`);
+    this.name = 'NativeSafetyWaitError';
+  }
+}
+
+export class NativeRequestBudgetError extends Error {
+  public readonly code = 'NATIVE_CONTEXT_BUDGET_EXHAUSTED';
+
+  public constructor(observedInputTokens: number, capacityTokens: number) {
+    super(`NATIVE_CONTEXT_BUDGET_EXHAUSTED: The latest physical native response used ${observedInputTokens} input tokens near the ${capacityTokens}-token planning capacity, but full-request preflight did not produce a safely sized compacted request. Automatic compression remains under the user's frozen policy; reduce the context or enable automatic compression before continuing.`);
+    this.name = 'NativeRequestBudgetError';
+  }
+}
+
 export type NativeCompressionGuardDecision =
   | { status: 'allow' }
   | {

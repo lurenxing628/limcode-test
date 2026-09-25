@@ -1648,7 +1648,7 @@ interface NativePendingSteer {
   wireInput: unknown[];
   targetResponseId: string;
   steerId?: string;
-  state: 'queued' | 'sent' | 'accepted' | 'waiting_for_input' | 'continuing' | 'failed';
+  state: 'queued' | 'sending' | 'sent' | 'accepted' | 'waiting_for_input' | 'failed' | 'unknown';
   resolve: () => void;
   reject: (error: Error) => void;
 }
@@ -1666,8 +1666,6 @@ interface NativePendingToolSubmission {
 interface NativeAdmittedPendingBatch {
   batch: NativePendingToolSubmission[];
   previousResponseId: string;
-  /** Accepted steers the server prepends to this create (snapshot at send), in accept order. */
-  appliedSteerCount: number;
   responseCreateSeq?: number;
 }
 
@@ -1703,12 +1701,18 @@ interface NativeChainState {
   firstEventSeen: boolean;
   steerQueue: NativePendingSteer[];
   steerInFlight?: NativePendingSteer;
+  /** A write started but not yet acknowledged by the local send callback. */
+  steerSendingSubmission?: NativePendingSteer;
   steerSending: boolean;
   steersById: Map<string, NativePendingSteer>;
   acceptedUnapplied: NativePendingSteer[];
+  /** Once a steer write may have escaped, a created from its target is never a unique result admission. */
+  ambiguousCreatePredecessors: Set<string>;
   createQueue: NativePendingToolSubmission[];
   createInFlight?: NativeAdmittedPendingBatch;
   createSending: boolean;
+  /** Provider may already have received these result/approval items; never resend on this lane. */
+  unknownToolCoverageKeys: Set<string>;
   outstandingAsyncCalls: Set<string>;
   pendingRequiredCalls: Map<string, OpenAIResponsesRequiredInput>;
   requiredCalls: Map<string, OpenAIResponsesRequiredInput>;
@@ -1965,8 +1969,10 @@ async function* runNativeChain(
     steerSending: false,
     steersById: new Map(),
     acceptedUnapplied: [],
+    ambiguousCreatePredecessors: new Set(),
     createQueue: [],
     createSending: false,
+    unknownToolCoverageKeys: new Set(),
     outstandingAsyncCalls: new Set(),
     pendingRequiredCalls: new Map(),
     requiredCalls: new Map(),
@@ -2003,7 +2009,9 @@ async function* runNativeChain(
     observeOpenAIResponsesWebSocketFailure(identity, options.onPhase, options.signal, annotated);
     const aborted = isAbort(options.signal, annotated);
     staleCreatesExpected = countStaleCreatesExpected(state);
-    const disconnected = aborted ? [] : disconnectNativeSteerChunks(state);
+    // A sent or accepted steer remains delivery-unknown even when the caller aborts: the
+    // provider may already have queued it. Never make cancellation look like not_sent.
+    const disconnected = disconnectNativeSteerChunks(state, aborted ? 'request_aborted' : 'connection_lost');
     rejectNativePendingWork(state, aborted ? 'abort' : 'admission_unknown', 'connection_lost');
     releaseOutcome = aborted ? 'abort' : 'error';
     for (const chunk of disconnected) yield chunk;
@@ -2299,29 +2307,46 @@ function startNativeResponse(
   let admittedToolResultCallIds: string[] | undefined = state.seenAnyResponse
     ? undefined
     : nativeWireToolResultCallIds(state.prepared.payload.input);
+  let unverifiedToolResultCallIds: string[] | undefined;
+  // response.created attests only a response id and its predecessor. Neither an accepted
+  // steer id nor its input/submission digest is echoed, even for a single local candidate.
+  // Preserve the real successor/output, but explicitly mark all unresolved steering unknown;
+  // never place unverified user input in the trusted incremental continuation tail.
+  const unresolvedSteerAtCreate = (state.createInFlight !== undefined
+    && state.ambiguousCreatePredecessors.has(state.createInFlight.previousResponseId))
+    || state.steerSendingSubmission !== undefined
+    || state.steerInFlight !== undefined || state.acceptedUnapplied.length > 0;
+  const unknownSteers = state.seenAnyResponse
+    ? disconnectNativeSteerChunks(state, 'successor_application_unverified')
+    : [];
   const inFlight = state.createInFlight;
   if (inFlight) {
     state.createInFlight = undefined;
-    // The server prepends only the accepted steers snapshotted when this create was sent;
-    // steers accepted afterwards keep waiting for their own continuation boundary.
-    const appliedSteers = state.acceptedUnapplied.splice(0, inFlight.appliedSteerCount);
-    markNativeSteersApplied(state, appliedSteers);
-    for (const steer of appliedSteers) {
-      state.chainTail.push(...steer.wireInput);
+    // A local response.create sequence is NOT echoed by the provider. If a queued steer
+    // could also create a response from this predecessor (including waiting_for_input), a
+    // created with the same previous_response_id is not evidence that it consumed the tool
+    // results. Nor can a missing/mismatched predecessor admit those results. Retain the real
+    // model response, but do not commit a false result occurrence or trusted chain tail.
+    if (unresolvedSteerAtCreate || previousResponseId !== inFlight.previousResponseId) {
+      state.chainTailReliable = false;
+      // A real provider.created was observed, but it does not prove which create supplied its
+      // input. Persist this distinct, local sent-but-unverified result identity ON this created
+      // control fact before rejecting the process-local admission promise. A future Host must
+      // never mistake the still-undelivered ToolModelResult for one that was never sent.
+      unverifiedToolResultCallIds = inFlight.batch.flatMap((sub) => sub.callIds);
+      rejectUnverifiedNativeToolBatch(state, inFlight.batch, 'response_created_without_unique_result_admission');
+    } else {
+      state.chainTail.push(...inFlight.batch.flatMap((sub) => sub.wireItems));
+      const admission: OpenAIResponsesNativeResultAdmission = {
+        responseId,
+        previousResponseId,
+        connectionGeneration: state.lease.connectionGeneration,
+        ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+      };
+      admittedSeq = inFlight.responseCreateSeq;
+      admittedToolResultCallIds = inFlight.batch.flatMap((sub) => sub.callIds);
+      for (const sub of inFlight.batch) sub.resolve(admission);
     }
-    state.chainTail.push(...inFlight.batch.flatMap((sub) => sub.wireItems));
-    const admission: OpenAIResponsesNativeResultAdmission = {
-      responseId,
-      previousResponseId: inFlight.previousResponseId,
-      connectionGeneration: state.lease.connectionGeneration,
-      ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
-    };
-    admittedSeq = inFlight.responseCreateSeq;
-    admittedToolResultCallIds = inFlight.batch.flatMap((sub) => sub.callIds);
-    for (const sub of inFlight.batch) sub.resolve(admission);
-  } else if (state.seenAnyResponse && state.acceptedUnapplied.length > 0) {
-    // Automatic steering successor: the accepted input enters history before this response.
-    appendAcceptedSteerInputsToTail(state);
   }
 
   state.requiredCalls = new Map();
@@ -2339,7 +2364,10 @@ function startNativeResponse(
   state.seenAnyResponse = true;
   state.chainResponseIds.add(responseId);
   state.latestResponseId = responseId;
-  queueNativeEvent(state, {
+  // The shared native event type predates this CAS-checkpoint-only observation. Keep its new
+  // field local to this transport; the bridge carries a plain Object/Array and the control plane
+  // persists the entire event, while its parser/Host recovery must validate this field strictly.
+  const created: OpenAIResponsesNativeEvent & { unverifiedToolResultCallIds?: string[] } = {
     type: 'response.created',
     responseId,
     connectionGeneration: state.lease.connectionGeneration,
@@ -2348,9 +2376,16 @@ function startNativeResponse(
     ...(admittedSeq !== undefined ? { responseCreateSeq: String(admittedSeq) } : {}),
     ...(admittedToolResultCallIds && admittedToolResultCallIds.length > 0
       ? { admittedToolResultCallIds }
+      : {}),
+    ...(unverifiedToolResultCallIds !== undefined
+      ? {
+          reason: 'response_created_without_unique_result_admission',
+          unverifiedToolResultCallIds
+        }
       : {})
-  });
-  return drainNativeOutbox(state);
+  };
+  queueNativeEvent(state, created);
+  return [...unknownSteers, ...drainNativeOutbox(state)];
 }
 
 function finishNativeResponse(
@@ -2405,15 +2440,16 @@ function finishNativeResponse(
   const requiredInput = [...state.requiredCalls.values()];
   state.latestTerminalResponseId = responseId || undefined;
   state.activeResponse = undefined;
+  // A steered incomplete may have its own raw physical usage. Retain exactly the provider's
+  // observation for this response; neither infer missing usage nor add it to a prompt estimate.
+  const usage = nativeResponseUsage(raw);
   queueNativeEvent(state, {
     type,
     responseId,
     connectionGeneration: state.lease.connectionGeneration,
     ...(state.lease.streamId ? { streamId: state.lease.streamId } : {}),
     ...(incompleteReason ? { reason: incompleteReason } : {}),
-    ...(type === 'response.completed'
-      ? nativeResponseUsage(raw) ? { usage: nativeResponseUsage(raw) } : {}
-      : {}),
+    ...(usage ? { usage } : {}),
     ...(requiredInput.length > 0 ? { requiredInput } : {}),
     ...(active?.responseCreateSeq !== undefined
       ? { responseCreateSeq: String(active.responseCreateSeq) }
@@ -2434,7 +2470,12 @@ function failNativeChainWithProviderError(
   raw: Record<string, unknown>
 ): LimCodeOpenAIResponsesStreamChunk[] {
   state.providerErrorEnd = true;
-  return [createErrorStreamChunk(errorInfoFromPayload(raw, state.sawSemanticOutput))];
+  // A terminal provider error is also a close without per-submission application proof.
+  // Preserve the unresolved user input as delivery-unknown before surfacing the model error.
+  return [
+    ...disconnectNativeSteerChunks(state, 'provider_error'),
+    createErrorStreamChunk(errorInfoFromPayload(raw, state.sawSemanticOutput))
+  ];
 }
 
 function decodeNativeWireEvent(
@@ -2543,7 +2584,7 @@ function handleNativeSteerAccepted(state: NativeChainState, raw: Record<string, 
   const steerId = steer ? normalizedString(steer.id) : undefined;
   const target = steer ? normalizedString(steer.previous_response_id) : undefined;
   const inFlight = state.steerInFlight;
-  if (!inFlight || (target !== undefined && target !== inFlight.targetResponseId)) {
+  if (!inFlight || !target || target !== inFlight.targetResponseId) {
     captureDebug(state.options.debugCapture?.recorder, state.options.debugCapture?.context, () => ({
       stage: 'ws.steer_stale',
       payload: { steerId, target }
@@ -2552,6 +2593,9 @@ function handleNativeSteerAccepted(state: NativeChainState, raw: Record<string, 
   }
   inFlight.steerId = steerId;
   inFlight.state = 'accepted';
+  // Queue acceptance is not application proof. Once the provider may have prepended this
+  // instruction, no next-turn incremental prefix can be trusted without an input digest.
+  state.chainTailReliable = false;
   if (steerId) state.steersById.set(steerId, inFlight);
   state.acceptedUnapplied.push(inFlight);
   state.steerInFlight = undefined;
@@ -2570,8 +2614,12 @@ function handleNativeSteerAccepted(state: NativeChainState, raw: Record<string, 
 function handleNativeSteerPending(state: NativeChainState, raw: Record<string, unknown>): void {
   const steer = isRecord(raw.steer) ? raw.steer : undefined;
   const steerId = steer ? normalizedString(steer.id) : undefined;
-  const submission = (steerId ? state.steersById.get(steerId) : undefined) ?? state.steerInFlight;
-  if (!submission) return;
+  const target = steer ? normalizedString(steer.previous_response_id) : undefined;
+  // An unrecognized server steer id may be a late frame from an already unknown submission.
+  // Never fall back to a new in-flight local command merely because it is the only candidate.
+  const submission = steerId ? state.steersById.get(steerId)
+    : target && state.steerInFlight?.targetResponseId === target ? state.steerInFlight : undefined;
+  if (!submission || (target && target !== submission.targetResponseId)) return;
   submission.state = 'waiting_for_input';
   state.requiredInputPending = true;
   const requiredInput = parseNativeRequiredInput(raw.required_input);
@@ -2593,12 +2641,14 @@ function handleNativeSteerPending(state: NativeChainState, raw: Record<string, u
 function handleNativeSteerFailed(state: NativeChainState, raw: Record<string, unknown>): void {
   const steer = isRecord(raw.steer) ? raw.steer : undefined;
   const steerId = steer ? normalizedString(steer.id) : undefined;
-  const submission = (steerId ? state.steersById.get(steerId) : undefined) ?? state.steerInFlight;
-  if (!submission) return;
+  const target = steer ? normalizedString(steer.previous_response_id) : undefined;
+  const submission = steerId ? state.steersById.get(steerId)
+    : target && state.steerInFlight?.targetResponseId === target ? state.steerInFlight : undefined;
+  if (!submission || (target && target !== submission.targetResponseId)) return;
   submission.state = 'failed';
   if (steerId) state.steersById.delete(steerId);
-  const appliedIndex = state.acceptedUnapplied.indexOf(submission);
-  if (appliedIndex >= 0) state.acceptedUnapplied.splice(appliedIndex, 1);
+  const acceptedIndex = state.acceptedUnapplied.indexOf(submission);
+  if (acceptedIndex >= 0) state.acceptedUnapplied.splice(acceptedIndex, 1);
   if (state.steerInFlight === submission) state.steerInFlight = undefined;
   state.requiredInputPending = [...state.steersById.values()].some(
     (pending) => pending.state === 'waiting_for_input'
@@ -2664,6 +2714,28 @@ function enqueueNativeSteer(
   if (!targetResponseId) {
     return Promise.reject(nativeDeliveryError('not_sent', 'no_response_yet', submissionId));
   }
+  if (targetResponseId !== state.latestResponseId) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'stale_response_target', submissionId));
+  }
+  if (state.steerSending || state.steerInFlight || state.steerQueue.length > 0
+    || state.acceptedUnapplied.length > 0) {
+    // The ack has no client correlation and a created successor has no application proof.
+    // Do not send two candidate inputs against the same predecessor. A rejected queued
+    // submission gets an explicit provider-control failure, not a silently stranded receipt.
+    queueNativeEvent(state, {
+      type: 'response.steer.failed',
+      responseId: targetResponseId,
+      submissionId,
+      input: command.input,
+      error: {
+        code: 'steering_pending_unproven',
+        message: 'A previous steering instruction is still unverified; send this instruction in a new request.'
+      },
+      connectionGeneration: state.lease.connectionGeneration,
+      ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+    });
+    return Promise.reject(nativeDeliveryError('not_sent', 'steering_pending_unproven', submissionId));
+  }
   let wireInput: unknown[];
   try {
     wireInput = encodeNativeSteerInput(state.options.format, command.input);
@@ -2685,10 +2757,9 @@ function enqueueNativeSteer(
 }
 
 /**
- * Steering sends are serialized per lane: only one submission may await its accepted/failed ack,
- * because the official ack carries no client correlation. Queued-unsent submissions reject as
- * `not_sent` on teardown; only the sent-unacked one (and accepted-unapplied ones) can become
- * `response.steer.disconnected` observations.
+ * Steering sends are serialized per lane: only one submission may remain unverified until a
+ * provider successor/close settles it as delivery-unknown. A second local submission rejects
+ * explicitly rather than joining an uncorrelatable provider queue.
  */
 function pumpSteerQueue(state: NativeChainState): void {
   if (state.steerSending || state.steerInFlight || state.steerQueue.length === 0) return;
@@ -2712,23 +2783,32 @@ function pumpSteerQueue(state: NativeChainState): void {
         : nativeDeliveryError('not_sent', state.released ? 'controller_released' : 'capacity_unavailable', steer.submissionId));
       return;
     }
-    if (state.released || state.endRequested) {
+    if (state.released || state.endRequested || state.latestResponseId !== steer.targetResponseId) {
       state.steerSending = false;
       state.lease.releasePermit();
       steer.reject(nativeDeliveryError(
         'not_sent',
-        state.released ? 'controller_released' : 'logical_request_ended',
+        state.released ? 'controller_released'
+          : state.endRequested ? 'logical_request_ended' : 'stale_response_target',
         steer.submissionId
       ));
       return;
     }
-    // The permit is intentionally retained after this send: an accepted steer may produce an
-    // automatic successor, which must count against active-response capacity.
+    // A send callback can race the provider response/connection close. Once the write starts,
+    // failure/timeout is admission-unknown, never a safe not_sent retry.
+    // Mark the predecessor before writing. Even if an automatic successor arrives before the
+    // local send callback sets createInFlight, a later created from this same predecessor cannot
+    // uniquely attest that it consumed a tool-result create.
+    state.ambiguousCreatePredecessors.add(steer.targetResponseId);
+    state.chainTailReliable = false;
+    steer.state = 'sending';
+    state.steerSendingSubmission = steer;
     state.lease.sendFrame(frame, state.timeouts.sendMs, state.options.signal).then(
       () => {
         state.steerSending = false;
-        if (state.released) {
-          steer.reject(nativeDeliveryError('not_sent', 'controller_released', steer.submissionId));
+        if (state.steerSendingSubmission === steer) state.steerSendingSubmission = undefined;
+        if (state.released || state.endRequested || steer.state === 'unknown') {
+          steer.reject(nativeDeliveryError('admission_unknown', 'steering_application_unverified', steer.submissionId));
           return;
         }
         state.steerInFlight = steer;
@@ -2743,11 +2823,15 @@ function pumpSteerQueue(state: NativeChainState): void {
           ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
         });
       },
-      (error: unknown) => {
+      (_error: unknown) => {
         state.steerSending = false;
-        steer.reject(isAbort(state.options.signal, error)
-          ? abortError(state.options.signal)
-          : nativeDeliveryError('not_sent', 'send_failed', steer.submissionId));
+        if (state.steerSendingSubmission === steer) {
+          // A failed local send callback cannot prove that the frame never reached the socket.
+          // Surface uncertainty even if the physical connection remains usable.
+          state.outbox.push(...disconnectNativeSteerChunks(state, 'send_outcome_unverified'));
+          notifyNativeOutbox(state);
+        }
+        steer.reject(nativeDeliveryError('admission_unknown', 'send_outcome_unverified', steer.submissionId));
       }
     );
   })();
@@ -2772,6 +2856,13 @@ function enqueueNativeToolSubmission(
   if (built.wireItems.length === 0) {
     return Promise.reject(nativeDeliveryError('not_sent', 'invalid_input'));
   }
+  if (built.coverageKeys.some((key) => state.unknownToolCoverageKeys.has(key))) {
+    // The prior response could have consumed the same result even though the provider did not
+    // attest it. Do not auto-submit duplicate tool results/approvals within this live chain.
+    return Promise.reject(nativeDeliveryError(
+      'admission_unknown', 'previous_result_send_unverified', undefined, built.callIds
+    ));
+  }
   for (const callId of built.callIds) state.outstandingAsyncCalls.delete(callId);
   for (const key of built.coverageKeys) {
     state.requiredCalls.delete(key);
@@ -2792,16 +2883,16 @@ function enqueueNativeToolSubmission(
  * successor ahead of this create — an unread automatic response.created must never be
  * misattributed as a result admission. Once coverage is complete and no automatic successor is
  * expected, the queued submissions merge into one create carrying the frozen original settings
- * and the latest response ID. Accepted steering is server-prepended by the API and never repeated
- * in this input; the create snapshots how many accepted steers the server will prepend to it.
+ * and the latest response ID. Provider-queued steering is never repeated in this input, but
+ * queue acceptance does not attest that the steering input reached any specific successor.
  */
 function pumpCreateQueue(state: NativeChainState): void {
   if (state.createSending || state.createInFlight || state.createQueue.length === 0) return;
   if (state.released || state.endRequested) return;
   if (state.activeResponse || !state.latestTerminalResponseId) return;
   // A queued, sending or sent-unacked steer may still be accepted and queue an automatic
-  // successor ahead of this create; an accepted steer without a pending required input
-  // definitively will. Only waiting_for_required_input steers cannot auto-continue.
+  // successor ahead of this create. An accepted steer without a pending required input can
+  // still produce one; only waiting_for_required_input can allow an explicit create.
   if (state.steerQueue.length > 0 || state.steerSending || state.steerInFlight) return;
   if (state.acceptedUnapplied.some((steer) => steer.state === 'accepted')) return;
   const covered = new Set(state.createQueue.flatMap((sub) => sub.coverageKeys));
@@ -2833,8 +2924,8 @@ function pumpCreateQueue(state: NativeChainState): void {
       }
       return;
     }
-    // Revalidate the full gate after the capacity wait: a steer accepted meanwhile now expects
-    // an automatic successor ahead of this create, and anything else may have ended the chain.
+    // Revalidate after the capacity wait: an accepted steer could start an automatic successor
+    // ahead of this create; only an explicit required-input wait permits this create.
     const covered = new Set(batch.flatMap((sub) => sub.coverageKeys));
     const gateOpen = !state.released
       && !state.endRequested
@@ -2857,29 +2948,33 @@ function pumpCreateQueue(state: NativeChainState): void {
       ({ responseCreateSeq }) => {
         state.createSending = false;
         if (state.released) {
-          for (const sub of batch) {
-            sub.reject(nativeDeliveryError('not_sent', 'controller_released', undefined, sub.callIds));
-          }
+          rejectUnverifiedNativeToolBatch(state, batch, 'controller_released_after_result_send');
           return;
         }
         state.createInFlight = {
           batch,
           previousResponseId,
-          appliedSteerCount: state.acceptedUnapplied.length,
           ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {})
         };
         notifyNativeOutbox(state);
       },
       (error: unknown) => {
         state.createSending = false;
-        for (const sub of batch) {
-          sub.reject(isAbort(state.options.signal, error)
-            ? abortError(state.options.signal)
-            : nativeDeliveryError('not_sent', 'send_failed', undefined, sub.callIds));
-        }
+        rejectUnverifiedNativeToolBatch(state, batch, 'result_send_outcome_unverified');
       }
     );
   })();
+}
+
+function rejectUnverifiedNativeToolBatch(
+  state: NativeChainState,
+  batch: NativePendingToolSubmission[],
+  reason: string
+): void {
+  for (const sub of batch) {
+    for (const key of sub.coverageKeys) state.unknownToolCoverageKeys.add(key);
+    sub.reject(nativeDeliveryError('admission_unknown', reason, undefined, sub.callIds));
+  }
 }
 
 function requestNativeLogicalEnd(state: NativeChainState): void {
@@ -2893,27 +2988,10 @@ function requestNativeLogicalEnd(state: NativeChainState): void {
   for (const sub of state.createQueue.splice(0)) {
     sub.reject(nativeDeliveryError('not_sent', 'logical_request_ended', undefined, sub.callIds));
   }
+  // Closing a logical request does not prove that a queued provider steer ran. Deliver the
+  // uncertainty before the event loop quiesces so native receipts cannot remain accepted.
+  state.outbox.push(...disconnectNativeSteerChunks(state, 'logical_request_ended'));
   notifyNativeOutbox(state);
-}
-
-function appendAcceptedSteerInputsToTail(state: NativeChainState): void {
-  const applied = state.acceptedUnapplied.splice(0);
-  markNativeSteersApplied(state, applied);
-  for (const steer of applied) {
-    state.chainTail.push(...steer.wireInput);
-  }
-}
-
-/**
- * Once a continuation exists for an accepted steer (automatic successor or an admitted explicit
- * create), the steer is no longer pending: it transitions to continuing and leaves the ack map,
- * so requiredInputPending recomputes false and a late failure frame is treated as stale.
- */
-function markNativeSteersApplied(state: NativeChainState, steers: NativePendingSteer[]): void {
-  for (const steer of steers) {
-    steer.state = 'continuing';
-    if (steer.steerId) state.steersById.delete(steer.steerId);
-  }
 }
 
 /**
@@ -2925,38 +3003,65 @@ function countStaleCreatesExpected(state: NativeChainState): number {
   return (state.initialResponseCreateSeq !== undefined && !state.seenAnyResponse ? 1 : 0)
     + state.acceptedUnapplied.length
     + (state.createInFlight ? 1 : 0)
-    + (state.steerInFlight ? 1 : 0);
+    + (state.steerInFlight || state.steerSendingSubmission ? 1 : 0);
 }
 
 /**
- * Connection loss with unresolved steering: sent-unacked and accepted-unapplied submissions are
- * delivery-unknown and surface as response.steer.disconnected observations. Queued-unsent
- * submissions instead reject as `not_sent`; they were never on the wire.
+ * A sent or accepted steer has no application proof on created/close/disconnect. The existing
+ * disconnected control observation means delivery-unknown also on a successor; its reason makes
+ * that distinction visible without inventing an applied signal. Queued-unsent work is not_sent.
  */
-function disconnectNativeSteerChunks(state: NativeChainState): LimCodeOpenAIResponsesStreamChunk[] {
+function disconnectNativeSteerChunks(
+  state: NativeChainState,
+  reason: 'successor_application_unverified' | 'logical_request_ended'
+    | 'connection_lost' | 'request_aborted' | 'provider_error' | 'send_outcome_unverified'
+): LimCodeOpenAIResponsesStreamChunk[] {
   const events: OpenAIResponsesNativeEvent[] = [];
+  if (state.steerSendingSubmission || state.steerInFlight || state.acceptedUnapplied.length > 0) {
+    state.chainTailReliable = false;
+  }
+  if (state.steerSendingSubmission) {
+    const sending = state.steerSendingSubmission;
+    state.steerSendingSubmission = undefined;
+    sending.state = 'unknown';
+    events.push({
+      type: 'response.steer.disconnected',
+      responseId: sending.targetResponseId,
+      submissionId: sending.submissionId,
+      input: sending.input,
+      reason,
+      connectionGeneration: state.lease.connectionGeneration,
+      ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+    });
+  }
   if (state.steerInFlight) {
     events.push({
       type: 'response.steer.disconnected',
       responseId: state.steerInFlight.targetResponseId,
       submissionId: state.steerInFlight.submissionId,
       input: state.steerInFlight.input,
+      reason,
       connectionGeneration: state.lease.connectionGeneration,
       ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
     });
+    state.steerInFlight.state = 'unknown';
     state.steerInFlight = undefined;
   }
   for (const steer of state.acceptedUnapplied.splice(0)) {
+    steer.state = 'unknown';
     events.push({
       type: 'response.steer.disconnected',
       responseId: steer.targetResponseId,
       submissionId: steer.submissionId,
       ...(steer.steerId ? { steerId: steer.steerId } : {}),
       input: steer.input,
+      reason,
       connectionGeneration: state.lease.connectionGeneration,
       ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
     });
   }
+  state.steersById.clear();
+  state.requiredInputPending = false;
   return events.map((nativeEvent) => ({ nativeEvent }));
 }
 

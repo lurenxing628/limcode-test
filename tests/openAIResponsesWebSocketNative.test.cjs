@@ -189,19 +189,15 @@ test('完整历史首 create 准入实际发送结果，增量首 create 不冒�
   }
 });
 
-test('原生转向被接受后以自动续接完成，steered 不完整不失败且续接链可增量延续', { concurrency: false }, async () => {
+test('已接受转向仅是排队；自动后继无归属证明时标未知、保留输出用量并以完整历史恢复', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const format = await formatForTest();
   const frames = [];
   const server = await createServer((socket, request, connection) => {
     frames.push({ request, connection });
     if (request.type === 'response.create') {
-      if (request.previous_response_id === 'resp_2') {
-        socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_3', previous_response_id: 'resp_2' } }));
-        socket.send(JSON.stringify({
-          type: 'response.completed',
-          response: { id: 'resp_3', status: 'completed', output: [], usage: { input_tokens: 3, output_tokens: 0, total_tokens: 3 } }
-        }));
+      if (frames.filter((frame) => frame.request.type === 'response.create').length > 1) {
+        sendMessageResponse(socket, 'resp_3', 'msg_3', '恢复', 0);
         return;
       }
       socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } }));
@@ -225,7 +221,10 @@ test('原生转向被接受后以自动续接完成，steered 不完整不失败
       }));
       socket.send(JSON.stringify({
         type: 'response.incomplete',
-        response: { id: 'resp_1', status: 'incomplete', incomplete_details: { reason: 'steered' } }
+        response: {
+          id: 'resp_1', status: 'incomplete', incomplete_details: { reason: 'steered' },
+          usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 }
+        }
       }));
       socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_2', previous_response_id: 'resp_1' } }));
       socket.send(JSON.stringify({
@@ -276,16 +275,21 @@ test('原生转向被接受后以自动续接完成，steered 不完整不失败
       'response.steer.submitted',
       'response.steer.accepted',
       'response.incomplete',
+      'response.steer.disconnected',
       'response.created',
       'response.completed'
     ]);
     assert.deepEqual(events.map((event) => event.responseId), [
-      'resp_1', 'resp_1', 'resp_1', 'resp_1', 'resp_2', 'resp_2'
+      'resp_1', 'resp_1', 'resp_1', 'resp_1', 'resp_1', 'resp_2', 'resp_2'
     ]);
     assert.equal(events[1].submissionId, 'sub-1');
     assert.equal(events[2].steerId, 'steer_1');
     assert.equal(events[3].reason, 'steered');
-    assert.equal(events[4].previousResponseId, 'resp_1');
+    assert.deepEqual(events[3].usage, { input_tokens: 7, output_tokens: 2, total_tokens: 9 });
+    assert.equal(events[4].submissionId, 'sub-1');
+    assert.equal(events[4].reason, 'successor_application_unverified');
+    assert.equal(events[5].previousResponseId, 'resp_1');
+    assert.equal(events[5].submissionId, undefined, 'response.created contains no provider steering identity');
     assert.equal(streamedText(chunks), '草稿小计划');
     assert.ok(!chunks.some((chunk) => chunk.error), 'steered incomplete must not surface as an error');
 
@@ -299,7 +303,8 @@ test('原生转向被接受后以自动续接完成，steered 不完整不失败
     assert.equal(holder.calls.length, 2);
     assert.equal(holder.calls[1], undefined);
 
-    // The logical chain commits a continuation tail that a later turn can continue incrementally.
+    // A successor does not echo a steering submission/input digest. Reuse must NOT infer that
+    // the steered user input entered the server chain, even when exactly one steer was queued.
     const decisions = [];
     await collect(streamOptions(
       server,
@@ -320,12 +325,12 @@ test('原生转向被接受后以自动续接完成，steered 不完整不失败
     ));
     const continuationCreate = frames[2].request;
     assert.equal(continuationCreate.type, 'response.create');
-    assert.equal(continuationCreate.previous_response_id, 'resp_2');
-    assert.equal(continuationCreate.input.length, 1);
-    assert.match(JSON.stringify(continuationCreate.input[0]), /继续/);
-    assert.doesNotMatch(JSON.stringify(continuationCreate.input), /草稿|小计划|两周内/);
-    assert.equal(decisions[0].mode, 'incremental');
-    assert.equal(decisions[0].reason, 'matched_exact_prefix');
+    assert.equal(continuationCreate.previous_response_id, undefined);
+    assert.match(JSON.stringify(continuationCreate.input), /写一份项目计划/);
+    assert.match(JSON.stringify(continuationCreate.input), /两周内由一名开发者完成/);
+    assert.match(JSON.stringify(continuationCreate.input), /草稿|小计划|继续/);
+    assert.equal(decisions[0].mode, 'full');
+    assert.equal(decisions[0].reason, 'no_completed_baseline');
   } finally {
     resetOpenAIResponsesWebSocketSessions();
     await server.close();
@@ -403,9 +408,12 @@ test('原生转向在已完成竞先后仍然续接且不失联', { concurrency:
       'response.steer.submitted',
       'response.completed',
       'response.steer.accepted',
+      'response.steer.disconnected',
       'response.created',
       'response.completed'
     ]);
+    assert.equal(events.find((event) => event.type === 'response.steer.disconnected').reason,
+      'successor_application_unverified');
     assert.equal(streamedText(chunks), '初稿修订');
     assert.ok(!chunks.some((chunk) => chunk.error));
     assert.equal(holder.calls.at(-1), undefined);
@@ -489,17 +497,21 @@ test('转向等待必需输入时提交工具结果恢复续接且不重复转�
           return;
         }
         if (chunk.nativeEvent?.type === 'response.steer.pending' && !admissionPromise) {
-          // Capture only: the admission resolves when this same generator processes the matching
-          // response.created, so awaiting it inside the consumer callback would deadlock.
-          admissionPromise = holder.controller.submitToolResults([{
+          // A waiting steer can also race an automatic successor with this same predecessor.
+          // The provider's response.created echoes no result-input digest/create sequence, so a
+          // local create in flight cannot prove this result was admitted. Attach the rejection
+          // observer immediately to avoid an unhandled promise before the stream drains.
+          admissionPromise = assert.rejects(holder.controller.submitToolResults([{
             type: 'function_call_output',
             callId: 'call_project',
             output: '{"status":"设计完成"}'
-          }]);
+          }]), (error) => error.disposition === 'admission_unknown'
+            && error.detail?.reason === 'response_created_without_unique_result_admission'
+            && error.detail?.callIds?.includes('call_project'));
         }
       }
     );
-    const admission = await admissionPromise;
+    await admissionPromise;
 
     const events = nativeEvents(chunks);
     assert.deepEqual(events.map((event) => event.type), [
@@ -508,16 +520,25 @@ test('转向等待必需输入时提交工具结果恢复续接且不重复转�
       'response.completed',
       'response.steer.accepted',
       'response.steer.pending',
+      'response.steer.disconnected',
       'response.created',
       'response.completed'
     ]);
     const pending = events.find((event) => event.type === 'response.steer.pending');
     assert.deepEqual(pending.requiredInput, [{ type: 'function_call_output', callId: 'call_project', name: 'get_project_status' }]);
+    assert.equal(events.find((event) => event.type === 'response.steer.disconnected').reason,
+      'successor_application_unverified');
 
-    // Admission resolves with the identity captured from the matching response.created.
-    assert.equal(admission.responseId, 'resp_2');
-    assert.equal(admission.previousResponseId, 'resp_1');
-    assert.equal(typeof admission.connectionGeneration, 'number');
+    // Same predecessor is insufficient proof: not even the apparently matching explicit
+    // successor may claim tool-result admission or a fabricated per-create sequence.
+    const nextCreated = events.find((event) => event.type === 'response.created' && event.responseId === 'resp_2');
+    assert.equal(nextCreated.admittedToolResultCallIds, undefined);
+    assert.equal(nextCreated.responseCreateSeq, undefined);
+    assert.equal(nextCreated.reason, 'response_created_without_unique_result_admission');
+    assert.deepEqual(nextCreated.unverifiedToolResultCallIds, ['call_project']);
+    const initialCreated = events.find((event) => event.type === 'response.created' && event.responseId === 'resp_1');
+    assert.equal(initialCreated.reason, undefined);
+    assert.equal(initialCreated.unverifiedToolResultCallIds, undefined);
 
     // The continuation create carries frozen original settings, the latest response ID and only
     // the tool output: the accepted steering is server-prepended, never repeated by the client.
@@ -533,6 +554,145 @@ test('转向等待必需输入时提交工具结果恢复续接且不重复转�
     assert.equal(continuation.request.store, false);
     assert.equal(streamedText(chunks), '更新后的计划');
     assert.equal(holder.calls.at(-1), undefined);
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('waiting_for_input 的结果 create 与自动后继同前驱竞跑时不得假认工具结果准入', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const frames = [];
+  const tools = [{
+    type: 'function', name: 'probe',
+    parameters: { type: 'object', properties: {}, additionalProperties: false }
+  }];
+  const server = await createServer((socket, request) => {
+    frames.push(request);
+    if (request.type === 'response.create' && !request.previous_response_id) {
+      if (frames.filter((frame) => frame.type === 'response.create' && !frame.previous_response_id).length > 1) {
+        sendMessageResponse(socket, 'resp_rebased', 'msg_rebased', '完整重建');
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_root' } }));
+      socket.send(JSON.stringify({
+        type: 'response.output_item.done', response_id: 'resp_root', output_index: 0,
+        item: { id: 'fc_race', type: 'function_call', call_id: 'call_race', name: 'probe', arguments: '{}' }
+      }));
+      socket.send(JSON.stringify({ type: 'response.completed', response: {
+        id: 'resp_root', status: 'completed', output: [], usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 }
+      } }));
+      return;
+    }
+    if (request.type === 'response.steer') {
+      socket.send(JSON.stringify({ type: 'response.steer.accepted', steer: {
+        id: 'steer_race', previous_response_id: 'resp_root'
+      } }));
+      socket.send(JSON.stringify({ type: 'response.steer.pending', steer: {
+        id: 'steer_race', previous_response_id: 'resp_root'
+      }, reason: 'waiting_for_required_input', required_input: [
+        { type: 'function_call_output', call_id: 'call_race', name: 'probe' }
+      ] }));
+      return;
+    }
+    if (request.type === 'response.create' && request.previous_response_id === 'resp_root') {
+      // The provider emits an automatic steer successor before answering the explicit create.
+      // BOTH created frames contain only the SAME previous_response_id; neither echoes the
+      // client's result call_id, input digest or local responseCreateSeq.
+      // The first automatic successor may still be active when the explicit create also
+      // materializes. Keep both created events observable (and neither owns this result).
+      socket.send(JSON.stringify({ type: 'response.created', response: {
+        id: 'resp_auto', previous_response_id: 'resp_root'
+      } }));
+      socket.send(JSON.stringify({
+        type: 'response.output_text.delta', response_id: 'resp_auto', item_id: 'msg_auto',
+        output_index: 0, content_index: 0, delta: '自动后继'
+      }));
+      sendMessageResponse(socket, 'resp_explicit', 'msg_explicit', '另一后继', 0, { previousResponseId: 'resp_root' });
+    }
+  });
+  const holder = { calls: [] };
+  try {
+    let steered = false;
+    let admission;
+    let repeatedDelivery;
+    const chunks = await drive(streamOptions(server, format, 'native-race-no-fake-result',
+      requestBody(format, [user('先查结果')], { tools }), {
+        native: nativeOptions({ steering: true }, holder),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+      }), async (chunk) => {
+      if (chunk.nativeEvent?.type === 'response.created' && !steered) {
+        steered = true;
+        await holder.controller.steer({ submissionId: 'sub-race', input: [user('调整方向')] });
+      }
+      if (chunk.nativeEvent?.type === 'response.steer.pending' && !admission) {
+        admission = assert.rejects(holder.controller.submitToolResults([{
+          type: 'function_call_output', callId: 'call_race', output: '工具已执行且只执行一次'
+        }]), (error) => error.disposition === 'admission_unknown'
+          && error.detail?.reason === 'response_created_without_unique_result_admission'
+          && error.detail?.callIds?.includes('call_race'));
+      }
+      if (chunk.nativeEvent?.type === 'response.created' && chunk.nativeEvent.responseId === 'resp_auto') {
+        repeatedDelivery = assert.rejects(holder.controller.submitToolResults([{
+          type: 'function_call_output', callId: 'call_race', output: '工具已执行且只执行一次'
+        }]), (error) => error.disposition === 'admission_unknown'
+          && error.detail?.reason === 'previous_result_send_unverified');
+      }
+    });
+    assert.ok(admission, 'required-input coverage must cause exactly one explicit result create');
+    await admission;
+    assert.ok(repeatedDelivery, 'the still-active chain must reject replay of uncertain results');
+    await repeatedDelivery;
+    const explicit = frames.filter((frame) => frame.type === 'response.create' && frame.previous_response_id);
+    assert.equal(explicit.length, 1, 'never duplicate the external result create');
+    assert.equal(explicit[0].previous_response_id, 'resp_root');
+    assert.equal(explicit[0].input.filter((item) => item.type === 'function_call_output').length, 1);
+    const events = nativeEvents(chunks);
+    assert.equal(events.filter((event) => event.type === 'response.steer.disconnected').length, 1);
+    assert.equal(events.find((event) => event.type === 'response.steer.disconnected')?.reason,
+      'successor_application_unverified');
+    const rootCreated = events.find((event) => event.type === 'response.created' && event.responseId === 'resp_root');
+    assert.equal(rootCreated.reason, undefined);
+    assert.equal(rootCreated.unverifiedToolResultCallIds, undefined);
+    for (const responseId of ['resp_auto', 'resp_explicit']) {
+      const created = events.find((event) => event.type === 'response.created' && event.responseId === responseId);
+      assert.ok(created);
+      assert.equal(created.previousResponseId, 'resp_root');
+      assert.equal(created.admittedToolResultCallIds, undefined, `cannot claim ${responseId} admitted call_race`);
+      assert.equal(created.responseCreateSeq, undefined, 'local create sequence is not provider evidence');
+      if (responseId === 'resp_auto') {
+        assert.equal(created.reason, 'response_created_without_unique_result_admission');
+        assert.deepEqual(created.unverifiedToolResultCallIds, ['call_race']);
+      } else {
+        assert.equal(created.reason, undefined, 'a later created must never claim an already rejected batch');
+        assert.equal(created.unverifiedToolResultCallIds, undefined);
+      }
+    }
+    assert.equal(streamedText(chunks), '自动后继另一后继', 'real model output is preserved even while result admission is unknown');
+    const decisions = [];
+    const rebase = await collect(streamOptions(server, format, 'native-race-no-fake-result',
+      requestBody(format, [user('先查结果'), model('自动后继'), user('调整方向'), model('另一后继'), user('继续')], {
+        tools,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '先查结果' }] },
+          { type: 'function_call', call_id: 'call_race', name: 'probe', arguments: '{}' },
+          { type: 'function_call_output', call_id: 'call_race', output: '工具已执行且只执行一次' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '调整方向' }] },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] }
+        ]
+      }), {
+        native: nativeOptions({ steering: true }),
+        onDecision: (decision) => decisions.push(decision),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+      }));
+    assert.equal(streamedText(rebase), '完整重建');
+    assert.equal(decisions[0].mode, 'full');
+    const freshCreate = frames.filter((frame) => frame.type === 'response.create' && !frame.previous_response_id)[1];
+    assert.equal(freshCreate.previous_response_id, undefined);
+    assert.equal(freshCreate.input.filter((item) => item.type === 'function_call_output').length, 1);
+    assert.match(JSON.stringify(freshCreate.input), /调整方向|继续/);
+    assert.equal(frames.filter((frame) => frame.type === 'response.steer').length, 1);
   } finally {
     resetOpenAIResponsesWebSocketSessions();
     await server.close();
@@ -973,42 +1133,43 @@ test('未启用原生时流行为逐字节保持：无原生事件、控制器�
   }
 });
 
-test('转向发送按车道串行：前一次确认后才放行下一次', { concurrency: false }, async () => {
+test('同一前驱两条 steer 只送首条：唯一后继也不证明归属，第二条明确失败并以完整历史恢复', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const format = await formatForTest();
-  const steerFrames = [];
-  let acceptedSent = 0;
+  const frames = [];
   const server = await createServer((socket, request) => {
+    frames.push(request);
     if (request.type === 'response.create') {
-      socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } }));
-      socket.send(JSON.stringify({
-        type: 'response.output_text.delta',
-        response_id: 'resp_1',
-        item_id: 'msg_1',
-        output_index: 0,
-        content_index: 0,
-        delta: '运行中'
-      }));
+      if (frames.filter((frame) => frame.type === 'response.create').length === 1) {
+        socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } }));
+        socket.send(JSON.stringify({
+          type: 'response.output_text.delta', response_id: 'resp_1', item_id: 'msg_1',
+          output_index: 0, content_index: 0, delta: '原稿'
+        }));
+      } else {
+        sendMessageResponse(socket, 'resp_3', 'msg_3', '恢复完成');
+      }
       return;
     }
     if (request.type === 'response.steer') {
-      steerFrames.push({ request, acceptedSentAtArrival: acceptedSent });
-      const steerIndex = steerFrames.length;
-      socket.send(JSON.stringify({ type: 'response.steer.accepted', steer: { id: `steer_${steerIndex}`, previous_response_id: 'resp_1' } }));
-      acceptedSent += 1;
-      if (steerIndex === 2) {
-        socket.send(JSON.stringify({
-          type: 'response.incomplete',
-          response: { id: 'resp_1', status: 'incomplete', incomplete_details: { reason: 'steered' } }
-        }));
-        sendMessageResponse(socket, 'resp_2', 'msg_2', '完成', 0, { previousResponseId: 'resp_1' });
-      }
+      socket.send(JSON.stringify({ type: 'response.steer.accepted', steer: { id: 'steer_1', previous_response_id: 'resp_1' } }));
+      socket.send(JSON.stringify({
+        type: 'response.output_item.done', response_id: 'resp_1', output_index: 0,
+        item: messageItem('msg_1', '原稿', 0)
+      }));
+      socket.send(JSON.stringify({
+        type: 'response.incomplete', response: {
+          id: 'resp_1', status: 'incomplete', incomplete_details: { reason: 'steered' }
+        }
+      }));
+      // Exactly one successor, and no echoed submission identity or steering input digest.
+      sendMessageResponse(socket, 'resp_2', 'msg_2', '后继', 0, { previousResponseId: 'resp_1' });
     }
   });
   const holder = { calls: [] };
   try {
     let started = false;
-    let steerPromises = [];
+    let second;
     const chunks = await drive(
       streamOptions(server, format, 'native-steer-serial', requestBody(format, [user('长跑任务')]), {
         native: nativeOptions({ steering: true }, holder),
@@ -1017,19 +1178,197 @@ test('转向发送按车道串行：前一次确认后才放行下一次', { con
       async (chunk) => {
         if (!started && chunk.nativeEvent?.type === 'response.created') {
           started = true;
-          steerPromises = [
-            holder.controller.steer({ submissionId: 'sub-one', input: [user('第一条')] }),
-            holder.controller.steer({ submissionId: 'sub-two', input: [user('第二条')] })
-          ];
+          const predecessor = chunk.nativeEvent.responseId;
+          await holder.controller.steer({
+            submissionId: 'sub-one', previousResponseId: predecessor, input: [user('第一条')]
+          });
+          second = assert.rejects(holder.controller.steer({
+            submissionId: 'sub-two', previousResponseId: predecessor, input: [user('第二条')]
+          }), (error) => error.disposition === 'not_sent'
+            && error.detail?.reason === 'steering_pending_unproven');
         }
       }
     );
-    await Promise.all(steerPromises);
-    assert.equal(steerFrames.length, 2);
-    assert.equal(steerFrames[0].acceptedSentAtArrival, 0, 'first steer goes out before any ack');
-    assert.equal(steerFrames[1].acceptedSentAtArrival, 1, 'second steer waits for the first ack');
-    const submissions = nativeEvents(chunks).filter((event) => event.type === 'response.steer.submitted');
-    assert.deepEqual(submissions.map((event) => event.submissionId), ['sub-one', 'sub-two']);
+    await second;
+    assert.equal(frames.filter((frame) => frame.type === 'response.steer').length, 1);
+    assert.match(JSON.stringify(frames.find((frame) => frame.type === 'response.steer').input), /第一条/);
+    const events = nativeEvents(chunks);
+    assert.deepEqual(events.filter((event) => event.type === 'response.steer.submitted')
+      .map((event) => event.submissionId), ['sub-one']);
+    assert.equal(events.find((event) => event.type === 'response.steer.failed')?.submissionId, 'sub-two');
+    assert.equal(events.find((event) => event.type === 'response.steer.failed')?.error?.code, 'steering_pending_unproven');
+    assert.equal(events.find((event) => event.type === 'response.steer.disconnected')?.submissionId, 'sub-one');
+    assert.equal(events.find((event) => event.type === 'response.steer.disconnected')?.reason,
+      'successor_application_unverified');
+    assert.equal(events.find((event) => event.type === 'response.created' && event.responseId === 'resp_2')?.submissionId,
+      undefined, 'one local candidate and one successor still do not prove steering attribution');
+    assert.equal(streamedText(chunks), '原稿后继');
+    const decisions = [];
+    await collect(streamOptions(server, format, 'native-steer-serial',
+      requestBody(format, [user('长跑任务'), model('原稿'), user('第一条'), user('第二条'), model('后继'), user('继续')]), {
+        native: nativeOptions({ steering: true }),
+        onDecision: (decision) => decisions.push(decision),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+      }));
+    const recovered = frames.filter((frame) => frame.type === 'response.create')[1];
+    assert.equal(decisions[0].mode, 'full');
+    assert.equal(recovered.previous_response_id, undefined);
+    assert.match(JSON.stringify(recovered.input), /第一条/);
+    assert.match(JSON.stringify(recovered.input), /第二条/);
+    assert.match(JSON.stringify(recovered.input), /原稿|后继|继续/);
+    assert.equal(frames.filter((frame) => frame.type === 'response.steer').length, 1,
+      'delivery-unknown and rejected work are never automatically retried');
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('已接受转向断线交付未知、原始模型输出保留且新连接全量恢复不重发 steer', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const frames = [];
+  const server = await createServer((socket, request, connection) => {
+    frames.push({ request, connection });
+    if (request.type === 'response.create') {
+      if (connection === 0) {
+        socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } }));
+        socket.send(JSON.stringify({
+          type: 'response.output_text.delta', response_id: 'resp_1', item_id: 'msg_1',
+          output_index: 0, content_index: 0, delta: '断线前的原稿'
+        }));
+        return;
+      }
+      sendMessageResponse(socket, 'resp_recovered', 'msg_recovered', '恢复完成');
+      return;
+    }
+    if (request.type === 'response.steer') {
+      socket.send(JSON.stringify({ type: 'response.steer.accepted',
+        steer: { id: 'steer_disconnected', previous_response_id: 'resp_1' } }));
+      setTimeout(() => socket.terminate(), 40);
+    }
+  });
+  const holder = { calls: [] };
+  const chunks = [];
+  try {
+    let submitted = false;
+    await assert.rejects(drive(
+      streamOptions(server, format, 'native-steer-disconnected', requestBody(format, [user('开始')]), {
+        native: nativeOptions({ steering: true }, holder),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 1000, responseMs: 8000 }
+      }),
+      async (chunk) => {
+        chunks.push(chunk);
+        if (!submitted && chunk.nativeEvent?.type === 'response.created') {
+          submitted = true;
+          await holder.controller.steer({ submissionId: 'sub-disconnected', input: [user('首条')] });
+        }
+      }
+    ), (error) => error instanceof Error);
+    assert.equal(streamedText(chunks), '断线前的原稿');
+    const events = nativeEvents(chunks);
+    assert.equal(events.find((event) => event.type === 'response.steer.accepted')?.submissionId, 'sub-disconnected');
+    const unknown = events.filter((event) => event.type === 'response.steer.disconnected');
+    assert.equal(unknown.length, 1);
+    assert.equal(unknown[0].submissionId, 'sub-disconnected');
+    assert.equal(unknown[0].reason, 'connection_lost');
+    const decisions = [];
+    const recovered = await collect(streamOptions(server, format, 'native-steer-disconnected',
+      requestBody(format, [user('开始'), model('断线前的原稿'), user('首条'), user('恢复')]), {
+        native: nativeOptions({ steering: true }),
+        onDecision: (decision) => decisions.push(decision),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+      }));
+    assert.equal(streamedText(recovered), '恢复完成');
+    assert.equal(decisions[0].mode, 'full');
+    const secondCreate = frames.find((frame) => frame.request.type === 'response.create' && frame.connection === 1);
+    assert.ok(secondCreate, 'reconnect must open a new physical generation');
+    assert.equal(secondCreate.request.previous_response_id, undefined);
+    assert.match(JSON.stringify(secondCreate.request.input), /断线前的原稿|首条|恢复/);
+    assert.equal(frames.filter((frame) => frame.request.type === 'response.steer').length, 1);
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('逻辑关闭时已接受转向没有应用证明，不能静默作为已生效', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const server = await createServer((socket, request) => {
+    if (request.type === 'response.create') {
+      socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } }));
+      return;
+    }
+    if (request.type === 'response.steer') {
+      socket.send(JSON.stringify({ type: 'response.steer.accepted',
+        steer: { id: 'steer_queued', previous_response_id: 'resp_1' } }));
+      socket.send(JSON.stringify({ type: 'response.completed',
+        response: { id: 'resp_1', status: 'completed', output: [], usage: { input_tokens: 2, output_tokens: 0, total_tokens: 2 } }
+      }));
+    }
+  });
+  const holder = { calls: [] };
+  try {
+    let submitted = false;
+    const chunks = await drive(streamOptions(server, format, 'native-steer-logical-end',
+      requestBody(format, [user('开始')]), {
+        native: nativeOptions({ steering: true }, holder),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 1000, responseMs: 8000 }
+      }), async (chunk) => {
+      if (!submitted && chunk.nativeEvent?.type === 'response.created') {
+        submitted = true;
+        await holder.controller.steer({ submissionId: 'sub-queued', input: [user('排队消息')] });
+      }
+      if (chunk.nativeEvent?.type === 'response.steer.accepted') holder.controller.endLogicalRequest();
+    });
+    const events = nativeEvents(chunks);
+    const unknown = events.filter((event) => event.type === 'response.steer.disconnected');
+    assert.equal(unknown.length, 1);
+    assert.equal(unknown[0].reason, 'logical_request_ended');
+    assert.equal(unknown[0].submissionId, 'sub-queued');
+    assert.ok(events.some((event) => event.type === 'response.completed' && event.responseId === 'resp_1'));
+    assert.ok(!events.some((event) => event.type === 'response.created' && event.responseId !== 'resp_1'));
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('服务端拒绝整条链时未决 steer 仍先明确交付未知', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const server = await createServer((socket, request) => {
+    if (request.type === 'response.create') {
+      socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } }));
+      return;
+    }
+    if (request.type === 'response.steer') {
+      socket.send(JSON.stringify({ type: 'response.steer.accepted',
+        steer: { id: 'steer_error', previous_response_id: 'resp_1' } }));
+      socket.send(JSON.stringify({ type: 'error', status: 500,
+        error: { code: 'server_error', message: 'Provider cannot continue.' } }));
+    }
+  });
+  const holder = { calls: [] };
+  try {
+    let submitted = false;
+    const chunks = await drive(streamOptions(server, format, 'native-steer-error',
+      requestBody(format, [user('开始')]), {
+        native: nativeOptions({ steering: true }, holder),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 1000, responseMs: 8000 }
+      }), async (chunk) => {
+      if (!submitted && chunk.nativeEvent?.type === 'response.created') {
+        submitted = true;
+        await holder.controller.steer({ submissionId: 'sub-error', input: [user('保留未证实的输入')] });
+      }
+    });
+    const events = nativeEvents(chunks);
+    assert.deepEqual(events.filter((event) => event.type.startsWith('response.steer.'))
+      .map((event) => event.type),
+    ['response.steer.submitted', 'response.steer.accepted', 'response.steer.disconnected']);
+    assert.equal(events.find((event) => event.type === 'response.steer.disconnected')?.reason, 'provider_error');
+    assert.ok(chunks.some((chunk) => chunk.error), 'the original provider error is still propagated');
   } finally {
     resetOpenAIResponsesWebSocketSessions();
     await server.close();
@@ -1118,6 +1457,8 @@ test('已接受转向等待自动续接时就绪的异步结果排队到续接�
       `accepted steer → automatic successor → admitted explicit continuation: ${types.join(',')}`);
     const admittedCreated = events[admittedIndex];
     assert.deepEqual(admittedCreated.admittedToolResultCallIds, ['call_price']);
+    assert.equal(admittedCreated.reason, undefined);
+    assert.equal(admittedCreated.unverifiedToolResultCallIds, undefined);
     assert.equal(events[autoIndex].admittedToolResultCallIds, undefined,
       'the automatic successor is never labeled as a result admission');
     assert.equal(streamedText(chunks), '自动续接结果已用');

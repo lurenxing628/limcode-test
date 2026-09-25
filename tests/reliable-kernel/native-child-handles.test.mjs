@@ -20,19 +20,19 @@ const definition = { name: 'run_agent', description: 'native child handle fixtur
 const rows = async (app, domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain)
   .list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot;
 
-test('native logical request persists new child refs before output, resolves same-request send, and restores after reopen', { timeout: 30000 }, async () => {
+test('native settled batches freeze child refs across ModelRequests of the same Turn and restore them after reopen', { timeout: 30000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'native-child-handles-'));
   const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(root);
   let app;
-  let capturedRequest;
+  const capturedRequests = [];
   const executed = [];
-  const outputs = [];
   const adapter = {
     providerId: 'native-provider',
     async materializeNativeToolOutput(values) { return values; },
     async sendFullRequest(request, controls) {
-      capturedRequest = request;
+      capturedRequests.push(request);
+      const round = capturedRequests.length;
       assert.ok(controls.native, 'this must exercise nativeResponses execution, not provider_native compression');
       let sequence = 0;
       const event = (kind, content) => controls.onEvent({ kind, streamSeq: String(++sequence), content });
@@ -42,47 +42,46 @@ test('native logical request persists new child refs before output, resolves sam
         outputItem: { id: `item-${id}`, ordinal, providerResponseId: responseId }
       });
       let finish;
-      let fail;
-      const done = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
-      const submitted = [];
+      const done = new Promise(resolve => { finish = resolve; });
       controls.native.onController({
-        endLogicalRequest() {}, async steer() {},
-        async submitToolResults(batch) {
-          try {
-            const projections = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });
-            const deliveries = await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' });
-            assert.equal(projections.length, submitted.length + batch.length, 'freeze must commit before wire submission');
-            assert.equal(deliveries.length, submitted.length, 'freeze must not pretend to be delivery acknowledgment');
-            const decoded = batch.map(item => JSON.parse(item.output));
-            outputs.push(...batch);
-            submitted.push(...batch.map(item => item.callId));
-            assert.doesNotMatch(JSON.stringify(decoded), /answerBridgeId|childExecutionId|modelRequestId|childHandles/);
-            if (submitted.length === 2) {
-              assert.deepEqual(decoded.map(item => item.detail.childRef), ['A1', 'A2']);
-              await control({ type: 'response.created', responseId: 'response-followup', previousResponseId: 'response-spawn',
-                admittedToolResultCallIds: batch.map(item => item.callId) });
-              await call('send', 0, { operation: 'send', childRef: 'A1', prompt: 'follow up original child' }, 'response-followup');
-              await call('unknown', 1, { operation: 'send', childRef: 'A999', prompt: 'must not run' }, 'response-followup');
-              await control({ type: 'response.completed', responseId: 'response-followup' });
-            } else {
-              assert.equal(submitted.length, 4);
-              assert.equal(decoded[0].detail.childRef, 'A1');
-              assert.equal(decoded[1].status, 'failed');
-              assert.match(decoded[1].detail.error, /A999/);
-              await control({ type: 'response.created', responseId: 'response-final', previousResponseId: 'response-followup',
-                admittedToolResultCallIds: batch.map(item => item.callId) });
-              await control({ type: 'response.completed', responseId: 'response-final' });
-              await event('completed', { role: 'model', parts: [{ text: 'done' }] });
-              finish();
-            }
-          } catch (error) { fail(error); throw error; }
-        }
+        endLogicalRequest() { finish(); },
+        async steer() { assert.fail('child tool results never become user steering'); },
+        async submitToolResults() { assert.fail('the complete settled batch must yield to a preflighted full request'); }
       });
-      await control({ type: 'response.created', responseId: 'response-spawn', capabilities });
-      await call('spawn-one', 0, { operation: 'spawn', taskName: 'one', prompt: 'first independent task' }, 'response-spawn');
-      await call('spawn-two', 1, { operation: 'spawn', taskName: 'two', prompt: 'second independent task' }, 'response-spawn');
-      await control({ type: 'response.completed', responseId: 'response-spawn' });
-      await done;
+      const responseId = ['response-spawn', 'response-followup', 'response-final'][round - 1];
+      assert.ok(responseId, 'two complete batches then one final response');
+      if (round > 1) {
+        const projected = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });
+        assert.equal(projected.length, round === 2 ? 2 : 4,
+          'prior batch child refs are frozen before the carrier request');
+        assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
+          'context carryover is not a native provider admission');
+        const childRefs = request.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'child');
+        assert.deepEqual(childRefs.map(entry => [entry.ref, entry.target]),
+          [['A1', 'answer_bridge_one'], ['A2', 'answer_bridge_two']]);
+        assert.ok(request.context.some(segment => segment.segmentKind === 'tool_pair'
+          && segment.content.includes(round === 2 ? 'spawn-one' : 'send')),
+        'the next frozen full-request context retains the previous tool batch');
+      }
+      await control({ type: 'response.created', responseId, capabilities });
+      if (round === 1) {
+        await call('spawn-one', 0, { operation: 'spawn', taskName: 'one', prompt: 'first independent task' }, responseId);
+        await call('spawn-two', 1, { operation: 'spawn', taskName: 'two', prompt: 'second independent task' }, responseId);
+      } else if (round === 2) {
+        await call('send', 0, { operation: 'send', childRef: 'A1', prompt: 'follow up original child' }, responseId);
+        await call('unknown', 1, { operation: 'send', childRef: 'A999', prompt: 'must not run' }, responseId);
+      }
+      await control({ type: 'response.completed', responseId });
+      if (round === 3) {
+        await event('completed', { role: 'model', parts: [{ text: 'done' }] });
+      } else {
+        await done;
+        await event('completed', { role: 'model', parts: round === 1
+          ? [{ id: 'spawn-one', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'one', prompt: 'first independent task' } } },
+            { id: 'spawn-two', functionCall: { name: 'run_agent', args: { operation: 'spawn', taskName: 'two', prompt: 'second independent task' } } }]
+          : [{ id: 'send', functionCall: { name: 'run_agent', args: { operation: 'send', childRef: 'A1', prompt: 'follow up original child' } } },
+            { id: 'unknown', functionCall: { name: 'run_agent', args: { operation: 'send', childRef: 'A999', prompt: 'must not run' } } }] });
+      }
       controls.native.onController(undefined);
     }
   };
@@ -141,14 +140,15 @@ test('native logical request persists new child refs before output, resolves sam
     if (result.terminalStatus !== 'completed') {
       assert.fail(JSON.stringify(await rows(app, 'TurnTermination', { turn_id: started.turnId })));
     }
-    assert.equal(result.modelRequestIds.length, 1, 'spawn and send share one actual native logical request');
+    assert.equal(result.modelRequestIds.length, 3, 'two safe tool batches yield before the final ModelRequest of ONE Turn');
+    assert.equal(new Set(result.modelRequestIds).size, 3);
     assert.equal(executed.length, 3, 'unknown short reference never dispatches or spawns');
-    assert.deepEqual(capturedRequest.recipe.modelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
+    assert.deepEqual(capturedRequests[0].recipe.modelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
     const frozenRefs = await readConversationChildHandles(app.database, app.contentStore, 'parent');
     assert.deepEqual(frozenRefs.map(entry => [entry.ref, entry.target]), [['A1', 'answer_bridge_one'], ['A2', 'answer_bridge_two']]);
     const eventRows = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });
     assert.equal(eventRows.length, 4);
-    const checkpointRows = await rows(app, 'ModelStreamCheckpoint', { model_request_id: capturedRequest.modelRequestId });
+    const checkpointRows = await rows(app, 'ModelStreamCheckpoint', { model_request_id: capturedRequests[0].modelRequestId });
     // Admission events retain source proofs after stream checkpoint pruning; the raw model history
     // and resolved ToolCall facts must still disagree exactly where short refs were translated.
     const [sendSource] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'send' });
@@ -157,16 +157,42 @@ test('native logical request persists new child refs before output, resolves sam
     const sendArgs = JSON.parse((await app.contentStore.read(argsMetadata)).toString('utf8'));
     assert.equal(sendArgs.answerBridgeId, 'answer_bridge_one');
     assert.equal(checkpointRows.length >= 1, true);
+    const frozenOutputs = [];
+    for (const row of eventRows) {
+      const [metadata] = await rows(app, 'ContentObject', { id: row.content_object_id });
+      const projection = JSON.parse((await app.contentStore.read(metadata)).toString('utf8'));
+      assert.ok([capturedRequests[0].modelRequestId, capturedRequests[1].modelRequestId]
+        .includes(projection.modelRequestId), 'frozen child result belongs to its own ModelRequest');
+      const decoded = JSON.parse(projection.output);
+      assert.doesNotMatch(projection.output, /answerBridgeId|childExecutionId|modelRequestId|childHandles/);
+      frozenOutputs.push({ toolCallId: row.tool_call_id, output: projection.output, decoded });
+    }
+    assert.deepEqual(frozenOutputs.filter(item => item.decoded.detail?.childRef)
+      .map(item => item.decoded.detail.childRef).sort(), ['A1', 'A1', 'A2']);
+    assert.equal(frozenOutputs.filter(item => item.decoded.status === 'failed').length, 1);
+    assert.match(frozenOutputs.find(item => item.decoded.status === 'failed').decoded.detail.error, /A999/);
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 4);
+    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
     await app.close();
     app = await kernel.ReliableKernelApplication.open(root, dependencies);
-    assert.deepEqual(await readNativeRequestChildHandles(app.database, app.contentStore, capturedRequest.modelRequestId), frozenRefs);
+    assert.deepEqual(await readNativeRequestChildHandles(app.database, app.contentStore, capturedRequests[0].modelRequestId), frozenRefs);
     assert.deepEqual(await readConversationChildHandles(app.database, app.contentStore, 'parent'), frozenRefs);
-    const recoveredSources = await rows(app, 'ToolCallSourceLink', { model_request_id: capturedRequest.modelRequestId });
+    const recoveredSources = await rows(app, 'ToolCallSourceLink', { model_request_id: capturedRequests[0].modelRequestId });
+    const [frozenRequest] = await rows(app, 'ModelRequest', { id: capturedRequests[0].modelRequestId });
+    const [projection] = await rows(app, 'ModelContextProjection', {
+      owner_kind: 'model_request', owner_id: capturedRequests[0].modelRequestId
+    });
+    const [requestRecipeMetadata] = await rows(app, 'ContentObject', { id: frozenRequest.recipe_object_id });
+    const persistedRecipe = JSON.parse((await app.contentStore.read(requestRecipeMetadata)).toString('utf8'));
+    const frozenBudget = persistedRecipe.nativeLogicalBudget;
+    assert.deepEqual(frozenBudget, capturedRequests[0].recipe.nativeLogicalBudget);
+    assert.ok(frozenBudget && projection?.root_id, 'recovery must use the request\'s real frozen budget and Context root');
     const recovered = new NativeRequestSession({
       database: app.database, contentStore: app.contentStore, context: app.context, turnOutput: app.turnOutput,
       effects: app.runtime.effects, tools: dependencies.toolDispatcher, modelProvider: app.modelProvider,
-      conversationId: 'parent', turnId: started.turnId, modelRequestId: capturedRequest.modelRequestId,
+      conversationId: 'parent', turnId: started.turnId, modelRequestId: capturedRequests[0].modelRequestId,
       providerId: 'native-provider', modelId: 'gpt-6-astra', capabilities, modelHandleCatalog: { entries: [] },
+      budget: frozenBudget, initialContextRootId: projection.root_id,
       resolveAdapter: async () => adapter, resolveDefinition: () => definition,
       resolveCallArguments: (name, args) => ({ arguments: resolveModelToolArguments(name, args, recovered.currentModelHandleCatalog()) }),
       freezePolicies: async () => { throw new Error('recovery must not admit new calls'); },
@@ -184,7 +210,10 @@ test('native logical request persists new child refs before output, resolves sam
     const [firstResult] = await rows(app, 'ToolModelResult', { tool_call_id: firstSource.tool_call_id });
     const replay = await recovered.buildFunctionCallOutput({ name: 'run_agent', toolCallId: firstSource.tool_call_id,
       providerCallId: 'spawn-one', toolModelResultId: firstResult.id });
-    assert.equal(replay.output, outputs[0].output, 'replay bytes cannot change after later child allocations');
+    assert.equal(replay.output, frozenOutputs.find(item => item.toolCallId === firstSource.tool_call_id).output,
+      'replay bytes cannot change after later child allocations');
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 4,
+      'replay never adds a second result occurrence');
     assert.equal((await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT })).length, 4);
   } finally {
     await app?.close();
@@ -220,7 +249,8 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
   const database = {
     async snapshotAll(query) {
       if (query.domain === 'ModelStreamCheckpoint') return { snapshot: proofs.map((_, index) => ({
-        checkpoint_kind: 'native_tool_call', content_object_id: String(index), stream_seq: String(index + 1)
+        checkpoint_kind: 'native_tool_call', content_object_id: String(index), stream_seq: String(index + 1),
+        attempt_seq: '1', socket_generation: '1'
       })) };
       return { snapshot: [] };
     },
@@ -234,11 +264,16 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
   }
   const session = new NativeRequestSession({
     database, contentStore: { async read(metadata) { return Buffer.from(JSON.stringify({ content: proofs[Number(metadata.id)] })); } },
-    effects, tools: {}, modelProvider: { nativeSteering: { async receiptsForTurn() { return []; } } },
+    effects, tools: {}, modelProvider: {
+      async readNativeLatestResponseUsage() { return undefined; },
+      nativeSteering: { async receiptsForTurn() { return []; } }
+    },
     conversationId: 'parent', turnId: 'turn', modelRequestId: 'request', providerId: 'provider', modelId: 'gpt-6-astra',
     // Even a later runtime map must not reinterpret the frozen failed proof into a valid call.
     modelHandleCatalog: { entries: [...catalog.entries, { kind: 'child', ref: 'A999', target: 'answer_bridge_later' }] },
-    capabilities, resolveAdapter: async () => { throw new Error('not sending during recovery fixture'); },
+    capabilities, budget: { planningInputCapacityTokens: 128000, compressionThresholdTokens: 100000,
+      autoCompressionEnabled: false }, initialContextRootId: 'fixture-frozen-context-root',
+    resolveAdapter: async () => { throw new Error('not sending during recovery fixture'); },
     resolveDefinition: () => definition, resolveCallArguments: () => { throw new Error('recovery must use persisted resolution'); },
     freezePolicies: async () => { throw new Error('admitted calls do not refreeze policy'); },
     async dispatchCall(input) { dispatched.push(input); settle(input.toolCallId); return terminals.get(input.toolCallId); },

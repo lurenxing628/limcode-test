@@ -70,12 +70,13 @@ import {
   isRecord,
   isSensitiveLlmErrorField,
   mergeUsageMetadata,
+  nativeUsageMetadataFromResponse,
+  NativePhysicalUsageAccumulator,
   nonEmptyRecord,
   nowMonotonicMs,
   shouldCloseThoughtBlock,
   stringifyJson,
   stripUndefined,
-  sumUsageMetadata,
   toPlainJsonLike,
   usageMetadataFromChunk,
   visibleTextFromParts,
@@ -693,7 +694,7 @@ async function runLlmAttempt(
   }
 
   let latestUsageMetadata: LlmUsageMetadataRecord | undefined;
-  let chainUsageTotals: LlmUsageMetadataRecord | undefined;
+  const nativeUsage = new NativePhysicalUsageAccumulator();
   const nativeChain: OpenAIResponsesNativeChainContext = {};
   const completedContents: MessageContent[] = [];
   const timing: LlmAttemptTimingState = { streamTimingChunkCount: 0 };
@@ -774,11 +775,9 @@ async function runLlmAttempt(
       const nativeEvent = (chunk as LimCodeOpenAIResponsesStreamChunk).nativeEvent;
       if (nativeEvent) {
         if (nativeEvent.type === 'response.created') {
-          // 新 response 开始：上一 response 的 usage 并入链聚合，输出 item 归属切换。
-          if (latestUsageMetadata) {
-            chainUsageTotals = sumUsageMetadata(chainUsageTotals, latestUsageMetadata);
-            latestUsageMetadata = undefined;
-          }
+          // 真实物理 response 独立记账；重连/回放不得再加一次。同一 response 的
+          // usage chunk 是更新而不是增量，逻辑 Done 的聚合只用于总计费。
+          nativeUsage.beginResponse(nativeEvent.responseId);
           nativeChain.current = {
             responseId: nativeEvent.responseId,
             ...(nativeEvent.previousResponseId ? { previousResponseId: nativeEvent.previousResponseId } : {})
@@ -801,7 +800,15 @@ async function runLlmAttempt(
       activeThoughtBlock = emitThoughtDeltas(request.id, activeThoughtBlock, chunk, chunkAt, chunkEmit, nativeChain);
       if (activeThoughtBlock && shouldCloseThoughtBlock(chunk)) activeThoughtBlock = finishThoughtBlock(request.id, activeThoughtBlock, chunkAt, chunkEmit);
       const chunkUsageMetadata = usageMetadataFromChunk(chunk);
-      if (chunkUsageMetadata) latestUsageMetadata = mergeUsageMetadata(latestUsageMetadata, chunkUsageMetadata);
+      if (chunkUsageMetadata && !nativeUsage.started) {
+        latestUsageMetadata = mergeUsageMetadata(latestUsageMetadata, chunkUsageMetadata);
+      }
+      if (nativeEvent && (nativeEvent.type === 'response.completed' || nativeEvent.type === 'response.incomplete')) {
+        // Only the raw physical response usage attests its own bill. Unified stream metadata can
+        // be incomplete/estimated; it must not fill unknown native input with a guessed count.
+        const raw = nativeUsageMetadataFromResponse(nativeEvent.usage);
+        if (raw) nativeUsage.observeUsage(nativeEvent.responseId, raw);
+      }
       const completedContent = (chunk as LimCodeOpenAIResponsesStreamChunk).completedContent;
       if (completedContent) completedContents.push(fromUnifiedCompletedContent(completedContent, nativeChain));
       const httpCompletedContents = (chunk as OpenAIResponsesHttpNativeStreamChunk).completedContents;
@@ -858,9 +865,7 @@ async function runLlmAttempt(
     : completedContents.length === 1
       ? completedContents[0]
       : { role: 'model' as const, parts: completedContents.flatMap((content) => content.parts) };
-  const aggregatedUsageMetadata = latestUsageMetadata
-    ? sumUsageMetadata(chainUsageTotals, latestUsageMetadata)
-    : chainUsageTotals;
+  const aggregatedUsageMetadata = nativeUsage.started ? nativeUsage.billingTotals() : latestUsageMetadata;
   emit({
     type: LlmEventType.Done,
     payload: {
@@ -868,7 +873,10 @@ async function runLlmAttempt(
       ...(authoritativeCompletedContent ? { content: authoritativeCompletedContent } : {}),
       ...createDoneTiming(timing.firstStreamChunkAt, finishedAt, timing.firstStreamChunkMark, finishedMark, timing.streamTimingChunkCount),
       completedAt: finishedAt,
-      ...(aggregatedUsageMetadata ? { usageMetadata: aggregatedUsageMetadata } : {}),
+      ...(aggregatedUsageMetadata ? { usageMetadata: {
+        ...aggregatedUsageMetadata,
+        ...(nativeUsage.started ? { nativeChainBilling: true } : {})
+      } } : {}),
       ...conversationAdaptation
     }
   });

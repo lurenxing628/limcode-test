@@ -386,22 +386,27 @@ test('Astra executes a durable async call before response completion and deliver
     harness.releaseTool.resolve();
     const delivery = await until(() => frames.find(frame => frame.body.type === 'response.create'
       && frame.body.input?.some(item => item.type === 'function_call_output')), 'native result delivery');
-    assert.equal(delivery.body.previous_response_id, 'native-response-1');
+    assert.equal(delivery.body.previous_response_id, undefined, 'the settled batch uses a preflighted full request');
+    const carriedCalls = delivery.body.input.filter(item => item.type === 'function_call');
+    assert.equal(carriedCalls.length, 1);
+    assert.equal(carriedCalls[0].call_id, 'original-native-call');
     const outputs = delivery.body.input.filter(item => item.type === 'function_call_output');
     assert.equal(outputs.length, 1);
     assert.equal(outputs[0].call_id, 'original-native-call');
     assert.match(JSON.stringify(outputs[0].output), /content from the real native probe file/);
     assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 0);
-    created(delivery.socket, 'native-response-2', 'native-response-1');
+    created(delivery.socket, 'native-response-2');
     const answer = text(delivery.socket, 'native-response-2', 0, 'The probe result has arrived.');
     completed(delivery.socket, 'native-response-2', [answer]);
     const finished = await turn.completion;
     assert.equal(finished.terminalStatus, 'completed');
     assert.equal(harness.executions(), 1);
     assert.equal(harness.httpCalls(), 0);
+    assert.equal(finished.modelRequestIds.length, 2, 'the original result continues this same Turn in a separate request');
     assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1);
-    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 1);
-    assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId }), []);
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1);
+    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 1,
+      'the carrier response.created explicitly acknowledges the tool output carried in its wire input');
     const [head] = await rows(app, 'ConversationContextHeadLink', { conversation_id: conversationId });
     const [callSource] = await rows(app, 'ContextSegmentSource', { source_kind: 'tool_call', source_id: admitted.id });
     const [resultRow] = await rows(app, 'ToolModelResult', { tool_call_id: admitted.id });
@@ -444,7 +449,7 @@ test('Astra executes a durable async call before response completion and deliver
   });
 });
 
-test('accepted steering waits for an actual synchronous result without resending the queued instruction', { timeout: 60_000 }, async () => {
+test('accepted steer and required result on one predecessor fail closed without false admission or replay', { timeout: 30_000 }, async () => {
   await withNativeRuntime(async harness => {
     const { app, conversationId, frames, created, text, completed, send, until } = harness;
     const turn = await harness.startTurn('native-pending-steer', 'Read the probe.');
@@ -501,29 +506,74 @@ test('accepted steering waits for an actual synchronous result without resending
     assert.equal(delivery.body.input.find(item => item.type === 'function_call_output').call_id, 'original-synchronous-call');
     assert.equal(JSON.stringify(delivery.body.input).includes(instruction), false);
     created(delivery.socket, 'steer-response-2', 'steer-response-1');
-    await until(async () => (await receipt())?.state === 'continuing', 'proven steering continuation');
+    await until(async () => (await receipt())?.state === 'delivery_unknown', 'unattested steering successor');
+    const [admitted] = await rows(app, 'ToolCall', { turn_id: turn.turnId });
+    assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1,
+      'the effect settled once even when the result create races a steer successor');
+    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 0,
+      'same-predecessor created has no unique result-admission attestation');
     completed(delivery.socket, 'steer-response-2', [
-      text(delivery.socket, 'steer-response-2', 0, 'The probe contains 39 characters.')
+      text(delivery.socket, 'steer-response-2', 0, 'The provider produced an unattributed successor.')
     ]);
-    const finished = await turn.completion;
-    assert.equal(finished.terminalStatus, 'completed');
-    assert.equal(finished.modelRequestIds.length, 1);
+    let timeoutId;
+    const finished = await Promise.race([
+      turn.completion,
+      new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error(
+        'Ambiguous result admission must terminate promptly, not wait for a new create or rebase.'
+      )), 12_000); })
+    ]).finally(() => clearTimeout(timeoutId));
+    assert.equal(finished.terminalStatus, 'failed');
+    assert.equal(finished.modelRequestIds.length, 1, 'no automatic full-request replay of a possibly admitted result');
+    const [termination] = await rows(app, 'TurnTermination', { turn_id: turn.turnId });
+    assert.equal(termination.terminal_status, 'failed');
+    assert.match(termination.reason, /NATIVE_RESULT_ADMISSION_UNKNOWN/);
+    assert.deepEqual(frames.filter(frame => frame.body.type === 'response.create'), [first, delivery],
+      'provider received only the original request and the single required result submission');
     const durable = await receipt();
-    assert.equal(durable.state, 'completed');
+    assert.equal(durable.state, 'delivery_unknown', 'created does not identify the applied steer submission');
     assert.equal(durable.targetResponseId, 'steer-response-1');
-    assert.equal(durable.successorResponseId, 'steer-response-2');
+    assert.equal(durable.successorResponseId, undefined);
     assert.ok(durable.messageId);
+    const [steerRevision] = await rows(app, 'MessageRevision', { message_id: durable.messageId });
+    const [steerBody] = await rows(app, 'ContentObject', { id: steerRevision.content_object_id });
+    assert.match((await app.contentStore.read(steerBody)).toString('utf8'), /report only its length/);
+    assert.equal((await rows(app, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: steerRevision.id
+    })).length, 0, 'unverified steer remains visible and durable but not applied to Context');
     const restoredProvider = new kernel.ModelProviderControlPlane(app.database, app.contentStore, { attachments: app.attachments });
     const restored = (await restoredProvider.steeringReceipts(conversationId))
       .find(value => value.submissionId === queued.submissionId);
-    assert.equal(restored.state, 'completed');
+    assert.equal(restored.state, 'delivery_unknown');
     assert.equal(restored.messageId, durable.messageId);
-    assert.equal(frames.filter(frame => frame.body.type === 'response.steer').length, 1);
+    assert.equal(frames.filter(frame => frame.body.type === 'response.steer').length, 1, 'never automatically re-submit');
+    const [result] = await rows(app, 'ToolModelResult', { tool_call_id: admitted.id });
+    assert.ok(result, 'the real external effect settled durably');
+    const [resultRevision] = await rows(app, 'MessageRevision', { id: result.message_revision_id });
+    const [resultBody] = await rows(app, 'ContentObject', { id: resultRevision.content_object_id });
+    assert.match((await app.contentStore.read(resultBody)).toString('utf8'), /content from the real native probe file/,
+      'the original result body survives in CAS without being regenerated');
+    assert.equal((await rows(app, 'ContextSegmentSource', {
+      source_kind: 'tool_model_result', source_id: result.id
+    })).length, 1, 'the settled result has one durable Context occurrence even on failure');
+    const checkpoints = await rows(app, 'ModelStreamCheckpoint', { model_request_id: finished.modelRequestIds[0] });
+    const controls = [];
+    for (const checkpoint of checkpoints.filter(row => row.checkpoint_kind === 'native_control')) {
+      const [body] = await rows(app, 'ContentObject', { id: checkpoint.content_object_id });
+      controls.push(JSON.parse((await app.contentStore.read(body)).toString('utf8')).content);
+    }
+    const successor = controls.find(control => control?.type === 'response.created'
+      && control.responseId === 'steer-response-2');
+    assert.equal(successor?.reason, 'response_created_without_unique_result_admission');
+    assert.deepEqual(successor.unverifiedToolResultCallIds, ['original-synchronous-call'],
+      'durable CAS records the uncertainty, never a fabricated provider result ACK');
+    assert.equal(successor.admittedToolResultCallIds, undefined);
+    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 0);
     assert.equal(harness.executions(), 1);
+    assert.equal(harness.httpCalls(), 0);
   });
 });
 
-test('a steered incomplete response consumes its automatic successor within the same logical request', { timeout: 60_000 }, async () => {
+test('an unattested automatic steer successor remains in the same request but never claims application', { timeout: 60_000 }, async () => {
   await withNativeRuntime(async harness => {
     const { app, conversationId, frames, created, text, completed, send, until } = harness;
     const turn = await harness.startTurn('native-automatic-steer', 'Begin the first direction.');
@@ -562,9 +612,21 @@ test('a steered incomplete response consumes its automatic successor within the 
     assert.equal(harness.httpCalls(), 0);
     const receipt = (await app.modelProvider.steeringReceipts(conversationId))
       .find(value => value.submissionId === queued.submissionId);
-    assert.equal(receipt.state, 'completed');
+    assert.equal(receipt.state, 'delivery_unknown');
     assert.equal(receipt.targetResponseId, 'automatic-response-1');
-    assert.equal(receipt.successorResponseId, 'automatic-response-2');
+    assert.equal(receipt.successorResponseId, undefined);
+    const [steerRevision] = await rows(app, 'MessageRevision', { message_id: receipt.messageId });
+    const [steerBody] = await rows(app, 'ContentObject', { id: steerRevision.content_object_id });
+    assert.match((await app.contentStore.read(steerBody)).toString('utf8'), /Change direction without discarding/);
+    assert.equal((await rows(app, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: steerRevision.id
+    })).length, 0, 'a successor without steer attestation does not add user input to Context');
+    assert.equal(frames.filter(frame => frame.body.type === 'response.steer').length, 1, 'no silent retry');
+    const [head] = await rows(app, 'ConversationContextHeadLink', { conversation_id: conversationId });
+    const contextText = (await app.context.materialize(head.root_id)).segments
+      .map(segment => segment.content.toString('utf8')).join('\n');
+    assert.match(contextText, /The already-visible original direction/);
+    assert.match(contextText, /The new direction after steering/);
   });
 });
 
@@ -611,7 +673,9 @@ test('native SSE admits async work before completion and resumes statelessly wit
     ]);
     assert.equal((await turn.completion).terminalStatus, 'completed');
     assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1);
-    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 1);
+    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 1,
+      'the stateless carrier response.created attests the tool output present in its wire input');
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1);
     assert.equal(harness.executions(), 1);
     assert.equal(harness.httpCalls(), 2);
     assert.equal(frames.some(frame => frame.socket), false);
@@ -649,7 +713,13 @@ for (const transport of ['websocket', 'http']) {
       const delivery = await until(() => frames.find(frame => frame !== first
         && frame.body.input?.some(item => item.type === 'function_call_output')), 'synchronous result carrier');
       if (transport === 'http') {
-        assert.equal(delivery.body.input.find(item => item.type === 'function_call').async, false);
+        assert.equal(delivery.body.previous_response_id, undefined,
+          'stateless HTTP resumes via a full request');
+        assert.notEqual(delivery.body.input.find(item => item.type === 'function_call').async, true);
+        assert.equal(delivery.body.input.filter(item => item.type === 'function_call_output').length, 1);
+      } else {
+        assert.equal(delivery.body.previous_response_id, 'native-sync-1',
+          'the preflighted successor may reuse the WebSocket native predecessor when its input is proven');
       }
       assert.equal(delivery.body.input.find(item => item.type === 'function_call_output').call_id,
         'original-native-sync-call');
@@ -659,7 +729,14 @@ for (const transport of ['websocket', 'http']) {
         text(carrier, 'native-sync-2', 0, 'The synchronous result was received.')
       ]);
       assert.equal((await turn.completion).terminalStatus, 'completed');
-      assert.equal((await rows(app, 'ModelRequest', { turn_id: turn.turnId })).length, 1);
+      assert.equal((await rows(app, 'ModelRequest', { turn_id: turn.turnId })).length, 2,
+        'the settled batch continues the same Turn through a separately preflighted logical request');
+      const [admitted] = await rows(app, 'ToolCall', { turn_id: turn.turnId });
+      assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1);
+      assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1);
+      assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 1,
+        'the explicit result create proves a single tool admission');
+      assert.equal(harness.executions(), 1);
     }, { transport });
   });
 }
@@ -819,7 +896,7 @@ for (const model of ['gpt-6-astra', 'gpt-6-sol']) {
   }
 }
 
-test('ready async results wait behind an automatic steer successor and retain actual context order', { timeout: 60_000 }, async () => {
+test('ready async results remain ordered behind an unattested steer successor without applying its instruction', { timeout: 60_000 }, async () => {
   await withNativeRuntime(async harness => {
     const { app, conversationId, frames, created, text, completed, send, until } = harness;
     const turn = await harness.startTurn('combined-native-turn', 'Start the probe and keep working.');
@@ -836,7 +913,7 @@ test('ready async results wait behind an automatic steer successor and retain ac
     await until(() => harness.executions() === 1, 'combined native execution');
     const [lease] = await rows(app, 'ExecutionLease', { turn_id: turn.turnId });
     const instruction = 'Continue in the new direction while the probe runs.';
-    await app.modelProvider.steer({
+    const queued = await app.modelProvider.steer({
       commandId: 'combined-native-steer', conversationId, turnId: turn.turnId,
       leaseEpoch: BigInt(lease.generation), content: { role: 'user', parts: [{ text: instruction }] }
     });
@@ -859,6 +936,22 @@ test('ready async results wait behind an automatic steer successor and retain ac
       text(delivery.socket, 'combined-response-3', 0, 'The result is now available.')
     ]);
     assert.equal((await turn.completion).terminalStatus, 'completed');
+    const receipt = (await app.modelProvider.steeringReceipts(conversationId))
+      .find(value => value.submissionId === queued.submissionId);
+    assert.equal(receipt.state, 'delivery_unknown');
+    assert.equal(receipt.successorResponseId, undefined);
+    const [steerRevision] = await rows(app, 'MessageRevision', { message_id: receipt.messageId });
+    const [steerBody] = await rows(app, 'ContentObject', { id: steerRevision.content_object_id });
+    assert.match((await app.contentStore.read(steerBody)).toString('utf8'), /new direction while the probe runs/);
+    assert.equal((await rows(app, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: steerRevision.id
+    })).length, 0);
+    const [admitted] = await rows(app, 'ToolCall', { turn_id: turn.turnId });
+    assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1);
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1);
+    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 1,
+      'an explicit result create alone proves its tool admission');
+    assert.equal(frames.filter(frame => frame.body.type === 'response.steer').length, 1);
     resetOpenAIResponsesWebSocketSessions();
     const before = frames.length;
     const next = await harness.startTurn('combined-next-turn', 'Confirm the actual chronology.');
@@ -869,9 +962,9 @@ test('ready async results wait behind an automatic steer successor and retain ac
       JSON.stringify(item).includes('Automatic successor has not received the probe result.')
     );
     const resultPosition = input.findIndex(item => item.type === 'function_call_output' && item.call_id === 'steered-async-call');
-    assert.ok(userPosition >= 0 && userPosition < automaticPosition);
-    assert.ok(automaticPosition < resultPosition);
-    assert.equal(input.filter(item => JSON.stringify(item).includes(instruction)).length, 1);
+    assert.equal(userPosition, -1, 'an unattested steer must never enter the next Turn\'s Context');
+    assert.ok(automaticPosition >= 0 && automaticPosition < resultPosition,
+      'real successor output and settled tool result retain their proven chronology');
     created(restored.socket, 'combined-response-4');
     completed(restored.socket, 'combined-response-4', [
       text(restored.socket, 'combined-response-4', 0, 'Chronology confirmed.')
