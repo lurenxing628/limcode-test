@@ -91,7 +91,7 @@
   },
   "scripts": {
     "precompile": "node scripts/reliable-kernel/patch-better-sqlite3-report.mjs && node scripts/reliable-kernel/sqlite-reportless-smoke.mjs",
-    "test:browser": "npm run build && node --test tests/webview-session-thinking.browser.mjs",
+    "test:browser": "npm run build && node --test tests/webview-session-thinking.browser.mjs tests/webview-agent-status-panel.browser.mjs",
     "clean:extension": "node -e \"require('fs').rmSync('dist/extension',{recursive:true,force:true})\"",
     "generate:cutover-manifest": "node scripts/reliable-kernel/generate-physical-cutover-manifest.mjs",
     "check:cutover-manifest": "node scripts/reliable-kernel/generate-physical-cutover-manifest.mjs --check",

@@ -31,7 +31,10 @@ function loadTypeScript(relativePath) {
   return loaded.exports;
 }
 
-const { projectReliableAgentStatus } = loadTypeScript('webview/src/domain/reliableAgentStatusProjection.ts');
+const {
+  presentReliableChildTask,
+  projectReliableAgentStatus
+} = loadTypeScript('webview/src/domain/reliableAgentStatusProjection.ts');
 const { projectReliableConversation } = loadTypeScript('webview/src/domain/reliableConversationProjection.ts');
 
 test('Agent status separates current child activity from the original task', () => {
@@ -77,6 +80,24 @@ test('Agent status separates current child activity from the original task', () 
   assert.equal(projection.children[0].activitySummary, '正在运行命令 · npm test');
   assert.equal(projection.children[0].interruptible, true);
   assert.equal(projection.children[0].group, 'executing');
+});
+
+test('Agent status titles each child by its task name rather than its Agent type', () => {
+  assert.deepEqual(presentReliableChildTask(JSON.stringify({
+    operation: 'spawn',
+    agent: { type: 'worker' },
+    taskName: '  修复\n 转向归属  ',
+    prompt: '用户已授权修复计划。\n先读 AGENTS.md。'
+  })), { title: '修复 转向归属', body: '用户已授权修复计划。\n先读 AGENTS.md。' });
+  assert.deepEqual(presentReliableChildTask(JSON.stringify({ plan: '# 计划\n1. 修复', taskList: { mode: 'rewrite', items: [] } })), {
+    title: '执行已批准的 Plan',
+    body: '# 计划\n1. 修复'
+  });
+  assert.deepEqual(presentReliableChildTask(JSON.stringify({ operation: 'spawn' })), {
+    title: '未命名任务',
+    body: JSON.stringify({ operation: 'spawn' }, null, 2)
+  });
+  assert.deepEqual(presentReliableChildTask('not json'), { title: '未命名任务', body: 'not json' });
 });
 
 test('interrupted and permanently terminal children do not expose a stop action', () => {

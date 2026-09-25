@@ -10,8 +10,10 @@ import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import { bridge } from '@webview/transport';
 import {
+  presentReliableChildTask,
   projectReliableAgentStatus,
-  type ReliableChildAgentStatus
+  type ReliableChildAgentStatus,
+  type ReliableChildTaskPresentation
 } from '@webview/domain/reliableAgentStatusProjection';
 
 interface TooltipRow {
@@ -43,6 +45,7 @@ const entries = computed(() => projection.value.children);
 const selectedEntry = computed(() =>
   entries.value.find((child) => child.id === selectedChildId.value) ?? entries.value[0]
 );
+const taskPresentations = computed(() => new Map(entries.value.map((child) => [child.id, presentTask(child)])));
 const runningCount = computed(() => entries.value.filter((child) => child.group === 'executing').length);
 const activeTurn = computed(() => Object.values(reliableConversation.feed.records.Turn ?? {}).find((turn) =>
   turn.conversation_id === reliableConversation.conversationId.value && turn.status === 'active'
@@ -205,25 +208,27 @@ function onDocumentKeydown(event: KeyboardEvent): void {
   if (open.value && event.key === 'Escape') closePanel();
 }
 
-function taskText(child: ReliableChildAgentStatus): string {
+function presentTask(child: ReliableChildAgentStatus): ReliableChildTaskPresentation {
   const detail = reliableConversation.feed.details[
     reliableKernelDetailKey('tool-arguments-content', child.sourceToolCallId)
   ];
-  if (!detail || detail.status === 'loading') return '正在加载任务…';
-  if (detail.status === 'error') return `任务加载失败：${detail.error?.trim() || '未知错误'}`;
-  try {
-    const value = JSON.parse(detail.text) as unknown;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return detail.text || '(无任务内容)';
-    const args = value as Record<string, unknown>;
-    const task = text(args.prompt) ?? text(args.plan);
-    return task ?? JSON.stringify(value, null, 2);
-  } catch {
-    return detail.text || '(无任务内容)';
+  if (!detail || detail.status === 'loading') return { title: '正在加载任务…', body: '正在加载任务…' };
+  if (detail.status === 'error') {
+    return { title: '任务加载失败', body: `任务加载失败：${detail.error?.trim() || '未知错误'}` };
   }
+  return presentReliableChildTask(detail.text);
+}
+
+function taskTitle(child: ReliableChildAgentStatus): string {
+  return taskPresentations.value.get(child.id)?.title ?? '正在加载任务…';
+}
+
+function taskText(child: ReliableChildAgentStatus): string {
+  return taskPresentations.value.get(child.id)?.body ?? '正在加载任务…';
 }
 
 function taskPreview(child: ReliableChildAgentStatus): string {
-  return truncate(taskText(child).replace(/\s+/g, ' ').trim(), 88);
+  return truncate(taskText(child).replace(/\s+/g, ' ').trim(), 160);
 }
 
 function answerContent(child: ReliableChildAgentStatus): string {
@@ -352,19 +357,24 @@ function statusText(value: string): string {
     starting: '启动中',
     active: '运行中',
     idle: '可继续',
+    stopping: '正在停止',
     interrupting: '正在终止',
     interrupted: '已终止',
     closed: '已结束',
+    terminated: '已结束',
     needs_human: '需要处理',
     pending: '等待中',
     delivering: '正在发送',
     consumed: '已接收',
     handled: '已处理',
     unhandled: '待处理',
+    not_applicable: '无需处理',
     failed: '失败',
     completed: '已完成',
     cancelled: '已取消',
-    open: '已建立'
+    outcome_unknown: '结果未知',
+    open: '已建立',
+    submitted: '已提交'
   };
   return labels[value] ?? value;
 }
@@ -404,7 +414,7 @@ function text(value: unknown): string | undefined {
             type="button"
             class="agent-run-action-button"
             :disabled="selectedEntry ? interruptButtonDisabled(selectedEntry) : true"
-            :aria-label="selectedEntry ? `${interruptButtonLabel(selectedEntry)} ${selectedEntry.agentName}` : '终止子 Agent'"
+            :aria-label="selectedEntry ? `${interruptButtonLabel(selectedEntry)} ${taskTitle(selectedEntry)}` : '终止子 Agent'"
             @click.stop="selectedEntry && interruptChild(selectedEntry)"
           >
             <IconPlayerStop aria-hidden="true" />
@@ -431,16 +441,17 @@ function text(value: unknown): string | undefined {
               <button
                 type="button"
                 class="agent-run-item-select"
-                :aria-label="`查看 ${child.agentName} 的运行详情`"
+                :aria-label="`查看 ${taskTitle(child)} 的运行详情`"
                 @click="selectEntry(child)"
               >
-                <span class="agent-run-item-top">
+                <span class="agent-run-target">{{ taskTitle(child) }}</span>
+                <span class="agent-run-item-meta">
                   <span class="agent-run-status" :class="`is-${statusTone(child)}`">{{ child.lifecycleLabel }}</span>
-                  <span class="agent-run-target">{{ child.agentName }}</span>
+                  <span class="agent-run-agent">{{ child.agentName }}</span>
+                  <span class="agent-run-time">{{ formatTime(child.createdAt) }}</span>
                 </span>
                 <span v-if="child.activitySummary" class="agent-run-activity">{{ child.activitySummary }}</span>
                 <span class="agent-run-preview">{{ taskPreview(child) }}</span>
-                <span class="agent-run-subline">{{ formatTime(child.createdAt) }}</span>
                 <span v-if="deliveryLabel(child)" class="agent-run-answer-line" :class="{ 'is-error': child.deliveryBadge === 'delivery_failed' }">
                   {{ deliveryLabel(child) }}
                 </span>
@@ -450,7 +461,7 @@ function text(value: unknown): string | undefined {
                 type="button"
                 class="agent-run-item-stop"
                 :disabled="interruptButtonDisabled(child)"
-                :aria-label="`${interruptButtonLabel(child)} ${child.agentName} 对话及其下级子 Agent；不影响其他同级子 Agent`"
+                :aria-label="`${interruptButtonLabel(child)} ${taskTitle(child)} 对话及其下级子 Agent；不影响其他同级子 Agent`"
                 @click.stop="interruptChild(child)"
               >
                 <IconPlayerStop aria-hidden="true" />
@@ -477,12 +488,12 @@ function text(value: unknown): string | undefined {
               >
                 <span>{{ selectedEntry.lifecycleLabel }}</span>
               </HoverTooltipPanel>
-              <span class="agent-run-detail-name">{{ selectedEntry.agentName }}</span>
+              <span class="agent-run-detail-name">{{ taskTitle(selectedEntry) }}</span>
             </span>
             <button
               type="button"
               class="agent-run-open-conversation"
-              :aria-label="`打开 ${selectedEntry.agentName} 的对话`"
+              :aria-label="`打开 ${taskTitle(selectedEntry)} 的对话`"
               @click="openConversationForEntry(selectedEntry)"
             >
               <IconMessage2 stroke="2" aria-hidden="true" />
@@ -495,6 +506,7 @@ function text(value: unknown): string | undefined {
               <section class="agent-run-detail-section">
                 <h3>运行状态</h3>
                 <dl class="agent-run-param-grid">
+                  <dt>Agent</dt><dd>{{ selectedEntry.agentName }}</dd>
                   <dt>子 Agent</dt><dd>{{ selectedEntry.lifecycleLabel }} ({{ selectedEntry.lifecycle }})</dd>
                   <dt>当前回合</dt><dd>{{ selectedEntry.turnStatus ? `${statusText(selectedEntry.turnStatus)} (${selectedEntry.turnStatus})` : '-' }}</dd>
                   <dt>当前活动</dt><dd>{{ selectedEntry.activitySummary || statusText(selectedEntry.activityKind || 'idle') }}</dd>
@@ -653,7 +665,12 @@ function text(value: unknown): string | undefined {
 
 .agent-run-action-button svg { width: 13px; height: 13px; }
 .agent-run-action-button:not(:disabled):hover,
-.agent-run-action-button:not(:disabled):focus-visible { color: var(--vscode-errorForeground, #f48771); border-color: currentColor; outline: none; }
+.agent-run-action-button:not(:disabled):focus-visible {
+  color: var(--vscode-errorForeground, #f48771);
+  border-color: currentColor;
+  background: color-mix(in srgb, currentColor 8%, var(--vscode-editor-background) 92%);
+  outline: none;
+}
 .agent-run-action-button:disabled { opacity: .62; cursor: default; }
 
 .agent-run-close {
@@ -732,8 +749,11 @@ function text(value: unknown): string | undefined {
   text-align: left;
 }
 
-.agent-run-item.has-stop-action .agent-run-item-select { padding-right: 64px; }
+/* The row highlight lives on .agent-run-item; keep the global button hover fill off the row. */
+.agent-run-item-select:hover:not(:disabled) { background: transparent; }
 .agent-run-item-select:focus-visible { outline: none; }
+/* Only the title line shares its row with the absolutely placed stop button. */
+.agent-run-item.has-stop-action .agent-run-target { padding-right: 70px; }
 
 .agent-run-item-stop {
   position: absolute;
@@ -763,7 +783,14 @@ function text(value: unknown): string | undefined {
   outline: none;
 }
 .agent-run-item-stop:disabled { opacity: .62; cursor: default; }
-.agent-run-item-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.agent-run-item-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--font-size-xs);
+}
 
 .agent-run-status {
   flex: 0 0 auto;
@@ -784,21 +811,29 @@ function text(value: unknown): string | undefined {
 .agent-run-status:focus-visible { outline: 1px solid var(--vscode-focusBorder, currentColor); outline-offset: 1px; }
 
 .agent-run-target,
+.agent-run-agent,
 .agent-run-activity,
-.agent-run-preview,
-.agent-run-subline,
 .agent-run-answer-line { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-run-target { color: var(--vscode-foreground); font-weight: 500; }
+.agent-run-agent { flex: 1 1 auto; }
+.agent-run-time { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .agent-run-activity { color: var(--vscode-foreground); font-size: var(--font-size-sm); }
-.agent-run-preview { font-size: var(--font-size-sm); }
-.agent-run-subline,
-.agent-run-answer-line { color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); font-variant-numeric: tabular-nums; }
+.agent-run-preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-sm);
+  line-height: 1.4;
+}
+.agent-run-answer-line { color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); }
 .agent-run-answer-line.is-error { color: var(--vscode-errorForeground, #f48771); }
 
 .agent-run-detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .agent-run-detail-header { min-height: 36px; padding: 7px 10px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.18)); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .agent-run-detail-main { min-width: 0; display: inline-flex; align-items: center; gap: 8px; }
-.agent-run-detail-name { min-width: 0; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-xs); }
+.agent-run-detail-name { min-width: 0; color: var(--vscode-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-sm); font-weight: 500; }
 
 .agent-run-open-conversation {
   flex: 0 0 auto;
@@ -848,13 +883,13 @@ function text(value: unknown): string | undefined {
 .agent-run-state-note.is-error { color: var(--vscode-errorForeground, #f48771); }
 .agent-run-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); }
 
+/* Side by side, a narrow panel leaves the list too little width to read titles; stack it instead. */
 @media (max-width: 620px) {
-  .agent-run-panel { width: min(760px, calc(100vw - 112px)); }
-  .agent-run-body { grid-template-columns: minmax(104px, 0.38fr) minmax(0, 0.62fr); }
-  .agent-run-item.has-stop-action .agent-run-item-select { padding-right: 36px; }
+  .agent-run-panel { width: min(760px, calc(100vw - 112px)); height: min(560px, calc(100vh - 120px)); }
+  .agent-run-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 2fr) minmax(0, 3fr); }
+  .agent-run-list { border-right: 0; border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.22)); }
+  .agent-run-item.has-stop-action .agent-run-target { padding-right: 26px; }
   .agent-run-item-stop { width: 22px; padding-inline: 0; }
   .agent-run-item-stop span { display: none; }
-  .agent-run-param-grid { grid-template-columns: 1fr; gap: 2px; }
-  .agent-run-param-grid dd { margin-bottom: 4px; }
 }
 </style>

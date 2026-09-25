@@ -50,6 +50,31 @@ export interface ReliableAgentStatusProjection {
   children: ReliableChildAgentStatus[];
 }
 
+export interface ReliableChildTaskPresentation {
+  title: string;
+  body: string;
+}
+
+/**
+ * Reads a child's task from its source ToolCall arguments, the same fact the timeline card shows:
+ * run_agent names every spawned task, while an approved Plan delegation carries the plan itself.
+ */
+export function presentReliableChildTask(argumentsText: string): ReliableChildTaskPresentation {
+  let args: Record<string, unknown> | undefined;
+  try {
+    const value = JSON.parse(argumentsText) as unknown;
+    if (value && typeof value === 'object' && !Array.isArray(value)) args = value as Record<string, unknown>;
+  } catch {
+    // Non-JSON arguments are shown verbatim.
+  }
+  if (!args) return { title: '未命名任务', body: argumentsText || '(无任务内容)' };
+  const plan = stringValue(args.plan);
+  return {
+    title: stringValue(args.taskName)?.replace(/\s+/g, ' ') ?? (plan ? '执行已批准的 Plan' : '未命名任务'),
+    body: stringValue(args.prompt) ?? plan ?? JSON.stringify(args, null, 2)
+  };
+}
+
 /** Projects direct children only; lifecycle and delivery remain orthogonal facts. */
 export function projectReliableAgentStatus(input: {
   conversationId: string;

@@ -47,6 +47,7 @@ function isTestArtifactPath(file) {
 
 const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/webview-session-thinking.browser.mjs',
+  'tests/webview-agent-status-panel.browser.mjs',
   'scripts/reliable-kernel/benchmark-concurrency-tuning.mjs',
   'scripts/reliable-kernel/benchmark-model-independent-hotpaths.mjs',
   'scripts/reliable-kernel/benchmark-phase0-milestones.mjs',
