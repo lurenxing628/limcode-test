@@ -10,7 +10,8 @@ import { useReliableConversation } from '@webview/composables/useReliableConvers
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
-import { currentRootEstimatedTokens, formatCompactTokenNumber, formatTokenNumber, nativePhysicalContextUsage, normalizeTokenUsage } from './tokenUsageModel';
+import { currentRootEstimatedTokens, formatCompactTokenNumber, formatTokenNumber } from './tokenUsageModel';
+import { compressionEstimateHint, observeContextInput, type ContextInputObservation } from './contextUsageModel';
 
 const reliableConversation = useReliableConversation();
 const globalSettings = useGlobalSettingsStore();
@@ -29,12 +30,13 @@ const ordinaryRequestIds = computed(() => new Set(
 ));
 // Compression calls are ModelRequests too, but their usage describes the compaction operation rather
 // than the ordinary model prompt. Only requests that own an assistant Message are context baselines.
-const requestProjections = computed(() => Object.values(reliableConversation.feed.records.ModelContextProjection ?? {}));
+const requestProjections = computed(() => new Map(Object.values(reliableConversation.feed.records.ModelContextProjection ?? {})
+  .filter((projection) => projection.owner_kind === 'model_request')
+  .map((projection) => [text(projection.owner_id), projection])));
 const ordinaryRequests = computed(() => conversationRequests.value
   .filter((request) => ordinaryRequestIds.value.has(text(request.id))
     || (request.status !== 'terminal' && isNativeRequest(request)
-      && requestProjections.value.some((projection) =>
-        projection.owner_kind === 'model_request' && projection.owner_id === request.id))));
+      && requestProjections.value.has(text(request.id)))));
 const latestOrdinaryRequest = computed(() => ordinaryRequests.value[0]);
 const currentContextStatus = computed(() => Object.values(
   reliableConversation.feed.records.ConversationContextStatus ?? {}
@@ -42,15 +44,7 @@ const currentContextStatus = computed(() => Object.values(
 const latestOrdinaryProjection = computed(() => {
   const requestId = text(latestOrdinaryRequest.value?.id);
   if (!requestId) return undefined;
-  return requestProjections.value
-    .find((projection) => projection.owner_kind === 'model_request' && projection.owner_id === requestId);
-});
-const ordinaryUsageStale = computed(() => {
-  if (!latestOrdinaryRequest.value) return false;
-  const currentRootId = text(currentContextStatus.value?.root_id);
-  if (!currentRootId) return true;
-  const requestRootId = text(latestOrdinaryProjection.value?.root_id);
-  return !requestRootId || requestRootId !== currentRootId;
+  return requestProjections.value.get(requestId);
 });
 // Configuration may fall back to a compression request before an ordinary response is linked, but
 // usage below must never use that compaction call as the conversation-context baseline.
@@ -65,102 +59,88 @@ const contextWindowTokens = computed(() =>
   ?? positiveInteger(modelConfig.value?.contextWindowTokens)
   ?? positiveInteger(providerConfig.value?.contextWindowTokens)
 );
-const latestPhysicalResponse = computed(() => nativePhysicalContextUsage(
-  latestOrdinaryRequest.value?.stream_stats_json,
-  text(currentContextStatus.value?.root_id)
-));
-const latestExactUsage = computed(() => {
-  if (isNativeRequest(latestOrdinaryRequest.value)) return undefined;
-  const requestId = text(latestOrdinaryRequest.value?.id);
-  const transient = requestId
-    ? reliableConversation.feed.transientModelRequests[requestId]?.usageMetadata
-    : undefined;
-  return transient ?? usageFromRequest(latestOrdinaryRequest.value);
+const inputObservation = computed<ContextInputObservation>(() => {
+  let latest: ContextInputObservation | undefined;
+  for (const [index, request] of ordinaryRequests.value.entries()) {
+    const requestId = text(request.id);
+    const observation = observeContextInput({
+      native: isNativeRequest(request),
+      usage: reliableConversation.feed.transientModelRequests[requestId]?.usageMetadata ?? usageFromRequest(request),
+      streamStats: request.stream_stats_json,
+      requestRootId: text(requestProjections.value.get(requestId)?.root_id),
+      currentRootId: text(currentContextStatus.value?.root_id)
+    });
+    latest ??= observation;
+    // Keep the preceding observed input through a new request's streaming/retry phase. Select
+    // committed request facts in this Conversation; no cached display number or estimated fill.
+    if (observation.tokens !== undefined) return index === 0
+      ? observation
+      : { ...observation, quality: 'recent' };
+  }
+  return latest ?? { native: false, quality: 'unknown' };
 });
-const latestExactContextTokens = computed(() => isNativeRequest(latestOrdinaryRequest.value)
-  ? (latestPhysicalResponse.value?.exact ? latestPhysicalResponse.value.inputTokens : undefined)
-  : tokenCount(latestExactUsage.value));
-const exactContextTokens = computed(() => ordinaryUsageStale.value
-  ? undefined
-  : latestExactContextTokens.value);
 const estimatedContextTokens = computed(() => currentRootEstimatedTokens(
   text(currentContextStatus.value?.root_id),
   currentContextStatus.value?.estimated_tokens,
   text(latestOrdinaryProjection.value?.root_id),
   latestOrdinaryRequest.value?.estimated_context_tokens
 ));
-// CompressionBlock presentation has no block → output-root link in this feed. Its
-// ModelContextProjection.root_id names the source root, and matching timestamps prove nothing
-// about a later edited root. Without an estimate for the current root, stay unknown.
-const previousExactContextTokens = computed(() => {
-  if (isNativeRequest(latestOrdinaryRequest.value)) return latestPhysicalResponse.value?.inputTokens;
-  if (ordinaryUsageStale.value && latestExactContextTokens.value !== undefined) {
-    return latestExactContextTokens.value;
-  }
-  for (const request of ordinaryRequests.value) {
-    if (isNativeRequest(request)) continue;
-    const tokens = tokenCount(usageFromRequest(request));
-    if (tokens !== undefined && tokens !== exactContextTokens.value) return tokens;
-  }
-  return undefined;
-});
-const actualContextTokens = computed(() => exactContextTokens.value ?? estimatedContextTokens.value);
-const usageQuality = computed<'exact' | 'estimated' | 'unknown'>(() => {
-  if (exactContextTokens.value !== undefined) return 'exact';
-  if (estimatedContextTokens.value !== undefined) return 'estimated';
-  return 'unknown';
-});
-const thresholdTokens = computed(() =>
-  positiveInteger(latestRequest.value?.compression_threshold_tokens)
-  ?? positiveInteger(latestRequest.value?.compressionThresholdTokens)
-  ?? nestedToken(latestRequest.value?.model_profile_json, 'compressionThresholdTokens', 'compression_threshold_tokens')
-  ?? configuredCompressionThreshold(contextWindowTokens.value)
-);
+// Use provider input for the label and fill; estimates remain separate compression hints.
+const displayedContextTokens = computed(() => inputObservation.value.tokens);
+const usageQuality = computed(() => inputObservation.value.quality);
 const currentConfiguredWindow = computed(() => positiveInteger(modelConfig.value?.contextWindowTokens)
   ?? positiveInteger(providerConfig.value?.contextWindowTokens));
 const currentConfiguredThreshold = computed(() => configuredCompressionThreshold(currentConfiguredWindow.value));
+const automaticCompression = computed(() => {
+  const config = configuredCompressionConfig();
+  return config !== undefined && config.kind !== 'disabled' && config.trigger.mode === 'token_threshold';
+});
+const compressionHint = computed(() => compressionEstimateHint({
+  automatic: automaticCompression.value,
+  observation: inputObservation.value,
+  estimatedTokens: estimatedContextTokens.value,
+  thresholdTokens: currentConfiguredThreshold.value
+}));
+const compressionHintLabel = computed(() => compressionHint.value?.atThreshold
+  ? '预估达阈值' : '临近压缩');
 const currentCompressionMode = computed(() => {
   const config = configuredCompressionConfig();
   if (config?.kind === 'disabled') return '已关闭';
   if (config?.trigger.mode === 'manual') return '仅手动压缩';
   return tokenValueLabel(currentConfiguredThreshold.value);
 });
-const usageRatio = computed(() => actualContextTokens.value !== undefined && contextWindowTokens.value !== undefined
-  ? actualContextTokens.value / contextWindowTokens.value
+const usageRatio = computed(() => displayedContextTokens.value !== undefined && contextWindowTokens.value !== undefined
+  ? displayedContextTokens.value / contextWindowTokens.value
   : undefined);
 const fillStyle = computed(() => ({
   width: usageRatio.value === undefined ? '0%' : `${Math.max(0, Math.min(1, usageRatio.value)) * 100}%`
 }));
 const thresholdStyle = computed(() => ({
-  left: contextWindowTokens.value && thresholdTokens.value !== undefined
-    ? `${Math.max(0, Math.min(100, thresholdTokens.value / contextWindowTokens.value * 100))}%`
+  left: contextWindowTokens.value && currentConfiguredThreshold.value !== undefined
+    ? `${Math.max(0, Math.min(100, currentConfiguredThreshold.value / contextWindowTokens.value * 100))}%`
     : '100%'
 }));
 const compactLabel = computed(() => {
-  const prefix = usageQuality.value === 'estimated' ? '≈' : '';
-  const used = actualContextTokens.value === undefined ? '?' : `${prefix}${formatCompactTokenNumber(actualContextTokens.value)}`;
+  const used = displayedContextTokens.value === undefined ? '?' : formatCompactTokenNumber(displayedContextTokens.value);
   const window = contextWindowTokens.value === undefined ? '?' : formatCompactTokenNumber(contextWindowTokens.value);
   return `${used} / ${window}`;
 });
 const percentLabel = computed(() => usageRatio.value === undefined ? '未知' : `${(usageRatio.value * 100).toFixed(usageRatio.value < 0.1 ? 1 : 0)}%`);
 const tooltipRows = computed(() => [
-  { label: 'LLM', value: modelId.value || '尚未发起 LLM 请求' },
-  { label: '当前上下文', value: contextUsageLabel() },
-  ...(previousExactContextTokens.value !== undefined && exactContextTokens.value === undefined
-    ? [{ label: isNativeRequest(latestOrdinaryRequest.value) ? '最近物理响应输入（非当前占用）' : '上一请求实际输入（非当前占用）', value: `${formatTokenNumber(previousExactContextTokens.value)} Token` }]
-    : []),
-  ...(latestPhysicalResponse.value && latestPhysicalResponse.value.inputTokens === undefined
-    ? [{ label: '最近物理响应输入', value: '未知（渠道未提供实际用量）' }]
-    : []),
-  { label: '上下文窗口', value: contextWindowTokens.value === undefined ? '未知（暂未获取，且配置中未设置）' : `${formatTokenNumber(contextWindowTokens.value)} Token` },
-  { label: '窗口占用', value: percentLabel.value },
-  { label: '当前配置压缩阈值', value: currentCompressionMode.value },
-  { label: '最近请求采用阈值', value: latestRequest.value ? tokenValueLabel(thresholdTokens.value) : '尚未发起请求' },
-  { label: '数据来源', value: usageSourceLabel() }
+  { label: '模型', value: modelId.value || '未知' },
+  { label: '输入', value: tokenValueLabel(displayedContextTokens.value) },
+  { label: '窗口', value: tokenValueLabel(contextWindowTokens.value) },
+  { label: '占比', value: percentLabel.value },
+  { label: '压缩阈值', value: currentCompressionMode.value },
+  ...(compressionHint.value
+    ? [{ label: '压缩预估', value: `≈${formatTokenNumber(compressionHint.value.tokens)} Token` }]
+    : [])
 ]);
-const overThreshold = computed(() => actualContextTokens.value !== undefined
-  && thresholdTokens.value !== undefined
-  && actualContextTokens.value >= thresholdTokens.value);
+const overThreshold = computed(() => automaticCompression.value && (
+  compressionHint.value?.atThreshold === true
+  || (usageQuality.value === 'current' && displayedContextTokens.value !== undefined
+    && currentConfiguredThreshold.value !== undefined && displayedContextTokens.value >= currentConfiguredThreshold.value)
+));
 
 function activeProviderConfig(): LlmProviderConfigRecord | undefined {
   const providerId = text(latestRequest.value?.provider_id);
@@ -217,7 +197,8 @@ function isNativeRequest(request: Record<string, unknown> | undefined): boolean 
   if (!request) return false;
   const stats = asRecord(typeof request.stream_stats_json === 'string'
     ? parseJson(request.stream_stats_json) : request.stream_stats_json);
-  return stats?.nativeCapabilities !== undefined
+  return usageFromRequest(request)?.nativeChainBilling === true
+    || stats?.nativeCapabilities !== undefined
     || stats?.nativeInitialPromptTokenCount !== undefined
     || stats?.nativeLatestResponseUsage !== undefined;
 }
@@ -226,34 +207,6 @@ function usageFromRequest(request: Record<string, unknown> | undefined): LlmUsag
   if (!request) return undefined;
   const value = typeof request.usage_json === 'string' ? parseJson(request.usage_json) : request.usage_json;
   return asRecord(value) as LlmUsageMetadataRecord | undefined;
-}
-
-function tokenCount(usage: LlmUsageMetadataRecord | undefined): number | undefined {
-  const normalized = usage ? normalizeTokenUsage(usage) : undefined;
-  return normalized?.sourceEstimated ? undefined : normalized?.input;
-}
-
-function contextUsageLabel(): string {
-  const tokens = actualContextTokens.value;
-  if (tokens === undefined) return latestPhysicalResponse.value
-    ? '未知（物理响应输入未覆盖当前上下文）'
-    : '未知（尚未建立上下文）';
-  const suffix = usageQuality.value === 'estimated' ? ' Token（当前估算）' : ' Token（精确）';
-  return `${formatTokenNumber(tokens)}${suffix}`;
-}
-
-function usageSourceLabel(): string {
-  if (usageQuality.value === 'exact') return isNativeRequest(latestOrdinaryRequest.value)
-    ? '已证明覆盖当前 Context root 的物理响应实际输入用量'
-    : '最近一次 LLM 请求的实际输入用量';
-  if (usageQuality.value === 'estimated') {
-    return isNativeRequest(latestOrdinaryRequest.value)
-      ? '当前 Context root 估算；物理响应输入未证明覆盖当前窗口，链累计仅作计费'
-      : ordinaryUsageStale.value
-        ? '当前 Context root 估算；最近请求实际输入仅作为历史参考'
-        : '根据当前模型渠道的上下文规则估算';
-  }
-  return latestRequest.value ? 'LLM 请求 / 当前 LLM 配置' : '当前 LLM 配置';
 }
 
 function tokenValueLabel(value: number | undefined): string {
@@ -319,17 +272,18 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 <template>
   <HoverTooltipPanel
     class="reliable-context-status"
-    :class="{ 'is-over-threshold': overThreshold, 'is-unknown': actualContextTokens === undefined }"
+    :class="{ 'is-over-threshold': overThreshold, 'is-unknown': displayedContextTokens === undefined }"
     panel-title="LLM 上下文"
     :rows="tooltipRows"
     :delay-ms="180"
   >
-    <button type="button" class="reliable-context-button" :aria-label="`LLM 上下文 ${compactLabel}`">
+    <button type="button" class="reliable-context-button" :aria-label="`LLM 上下文 ${compactLabel}${compressionHint ? `，${compressionHintLabel}` : ''}`">
       <span class="reliable-context-track" aria-hidden="true">
         <span class="reliable-context-fill" :style="fillStyle"></span>
-        <span v-if="thresholdTokens !== undefined && contextWindowTokens" class="reliable-context-threshold" :style="thresholdStyle"></span>
+        <span v-if="automaticCompression && currentConfiguredThreshold !== undefined && contextWindowTokens" class="reliable-context-threshold" :style="thresholdStyle"></span>
       </span>
       <span class="reliable-context-label">{{ compactLabel }}</span>
+      <span v-if="compressionHint" class="reliable-context-compression-hint">{{ compressionHintLabel }}</span>
     </button>
   </HoverTooltipPanel>
 </template>
@@ -388,6 +342,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   bottom: 0;
   width: 1px;
   background: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.reliable-context-compression-hint {
+  grid-column: 1 / -1;
+  justify-self: end;
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  white-space: nowrap;
 }
 
 .reliable-context-label {

@@ -12,7 +12,7 @@ const workspace = path.resolve(import.meta.dirname ?? path.dirname(new URL(impor
 const temp = mkdtempSync(path.join(tmpdir(), 'limcode-native-usage-observation-'));
 process.env.NODE_PATH = [path.join(workspace, 'node_modules'), process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
 Module._initPaths();
-let stream, control, estimator, projection, token, contextView;
+let stream, control, estimator, projection, token, contextUsage, contextView;
 
 const viewStubs = new Map([
   ['@webview/composables/useReliableConversation',
@@ -24,7 +24,7 @@ const viewStubs = new Map([
   ['@webview/domain/reliableDetailKey',
     'export function reliableKernelDetailKey(kind, id) { return `${kind}:${id}`; }'],
   ['@webview/components/ui/HoverTooltipPanel.vue',
-    'import { defineComponent, h } from "vue"; export default defineComponent({ props: ["rows", "panelTitle"], setup(props, { slots }) { return () => h("div", { class: "usage-tooltip" }, [h("div", { class: "usage-tooltip-current" }, String(props.rows?.[1]?.value ?? "")), ...(slots.default?.() ?? [])]); } });']
+    'import { defineComponent, h } from "vue"; export default defineComponent({ props: ["rows", "panelTitle"], setup(props, { slots }) { return () => h("div", { class: "usage-tooltip" }, [...(props.rows ?? []).map(row => h("div", { class: "usage-tooltip-row" }, `${row.label}: ${row.value}`)), ...(slots.default?.() ?? [])]); } });']
 ]);
 
 before(async () => {
@@ -33,7 +33,8 @@ before(async () => {
     control: 'backend/reliableKernel/modelProviderControlPlane.ts',
     estimator: 'backend/reliableKernel/contextTokenEstimator.ts',
     projection: 'backend/reliableKernel/modelFacingContextProjection.ts',
-    token: 'webview/src/components/conversation/tokenUsageModel.ts'
+    token: 'webview/src/components/conversation/tokenUsageModel.ts',
+    contextUsage: 'webview/src/components/conversation/contextUsageModel.ts'
   })) {
     await build({
       entryPoints: [path.join(workspace, source)],
@@ -50,6 +51,7 @@ before(async () => {
   estimator = require(path.join(temp, 'estimator.cjs'));
   projection = require(path.join(temp, 'projection.cjs'));
   token = require(path.join(temp, 'token.cjs'));
+  contextUsage = require(path.join(temp, 'contextUsage.cjs'));
   const { parse, compileScript } = require('@vue/compiler-sfc');
   await build({
     entryPoints: [path.join(workspace, 'webview/src/components/conversation/ReliableContextStatus.vue')],
@@ -335,7 +337,210 @@ test('raw Responses 缓存是输入子集，不额外加钱；物理 usage 丢�
 });
 
 
-test('Vue feed 中压缩后编辑/追加的新 root 只显示自身 estimate，旧压缩块不能覆盖也不能假精确', async () => {
+function contextStatusFixture({ native = false, input = 24_000, estimated = 80_000 } = {}) {
+  const request = {
+    id: 'request', turn_id: 'turn', status: 'terminal', terminal_state: 'completed', request_seq: '1',
+    provider_id: 'config', model_id: 'gpt-6-astra', context_window_tokens: 200_000,
+    compression_threshold_tokens: 100_000, estimated_context_tokens: 150_000,
+    created_at: '2026-09-25T12:00:00.000Z',
+    usage_json: native
+      ? { promptTokenCount: 330_000, candidatesTokenCount: 6000, nativeChainBilling: true }
+      : { promptTokenCount: input, candidatesTokenCount: 1000 },
+    stream_stats_json: native ? {
+      attemptSeq: '1', socketGeneration: '1', nativeCapabilities: { asyncTools: true },
+      nativeLatestResponseUsage: { responseId: 'resp-latest', inputTokens: input, contextRootId: 'root-request',
+        attemptSeq: '1', socketGeneration: '1', streamSeq: '10', physicalResponseCount: 3 }
+    } : { attemptSeq: '1', socketGeneration: '1' }
+  };
+  return {
+    conversation: { conversationId: { value: 'conv' }, feed: {
+      records: {
+        Turn: { turn: { id: 'turn', conversation_id: 'conv', created_at: request.created_at } },
+        ModelRequest: { request },
+        ModelRequestMessageLink: { link: { id: 'link', model_request_id: 'request', message_id: 'message' } },
+        ModelContextProjection: { projection: { owner_kind: 'model_request', owner_id: 'request', root_id: 'root-request' } },
+        ConversationContextStatus: { head: { id: 'head', conversation_id: 'conv', root_id: 'root-after-output', estimated_tokens: estimated } }
+      }, transientModelRequests: {}, details: {}, requestDetail() { throw new Error('No details needed'); }
+    } },
+    settings: {
+      llmProviderConfigs: { configs: [{ id: 'config', provider: native ? 'openai-responses' : 'openai-compatible',
+        model: 'gpt-6-astra', contextWindowTokens: 200_000, modelConfigs: [] }] },
+      llm: { activeProviderConfigId: 'config' },
+      llmCompression: { defaultConfigId: 'compression', modelBindings: [], providerBindings: [] },
+      llmCompressionConfigs: { configs: [{ id: 'compression', kind: 'auto',
+        trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 100_000 } }] }
+    }
+  };
+}
+
+async function renderContextStatus(fixture) {
+  globalThis.__nativeUsageViewFixture = fixture;
+  try {
+    const { createSSRApp } = require('vue');
+    const { renderToString } = require('@vue/server-renderer');
+    return await renderToString(createSSRApp(contextView));
+  } finally { delete globalThis.__nativeUsageViewFixture; }
+}
+
+function primaryContextLabel(html) {
+  return /class="reliable-context-label"[^>]*>([^<]*)</.exec(html)?.[1];
+}
+
+test('状态框不显示文字前缀和解释段落，悬浮面板只保留必要字段', async () => {
+  const html = await renderContextStatus(contextStatusFixture());
+  assert.equal(primaryContextLabel(html), '24k / 200k');
+  assert.deepEqual([...html.matchAll(/class="usage-tooltip-row">([^<]*)</g)].map(match => match[1]), [
+    '模型: gpt-6-astra', '输入: 24,000 Token', '窗口: 200,000 Token', '占比: 12%', '压缩阈值: 100,000 Token'
+  ]);
+  for (const fixture of [contextStatusFixture(), contextStatusFixture({ native: true }), contextStatusFixture({ estimated: 95_000 })]) {
+    assert.doesNotMatch(await renderContextStatus(fixture),
+      /最近输入|待计量|非当前占用|不代表|尚未|仅用于|数据来源|预检决定|最近请求采用阈值|reliable-context-kind|（|）/);
+  }
+});
+
+for (const native of [false, true]) test(`${native ? '原生' : '普通'}请求运行和重试期间沿用上一轮实际计量，新计量到达才更新`, async () => {
+  const fixture = contextStatusFixture({ native, input: 24_000, estimated: 40_000 });
+  const records = fixture.conversation.feed.records;
+  const next = { ...records.ModelRequest.request, id: 'request-next', request_seq: '2',
+    status: 'streaming', terminal_state: null, usage_json: null,
+    stream_stats_json: { attemptSeq: '1', socketGeneration: '1', ...(native ? { nativeCapabilities: { asyncTools: true } } : {}) } };
+  records.ModelRequest.next = next;
+  records.ModelRequestMessageLink.next = { model_request_id: next.id, message_id: 'message-next' };
+  records.ModelContextProjection.next = { owner_kind: 'model_request', owner_id: next.id, root_id: 'root-after-output' };
+  for (const status of ['streaming', 'retrying']) {
+    next.status = status;
+    const running = await renderContextStatus(fixture);
+    assert.equal(primaryContextLabel(running), '24k / 200k');
+    assert.doesNotMatch(running, /待计量|最近输入|reliable-context-kind/);
+  }
+  next.status = 'streaming';
+  if (native) {
+    next.stream_stats_json.nativeLatestResponseUsage = { responseId: 'resp-next', inputTokens: 32_000,
+      contextRootId: 'root-after-output', attemptSeq: '1', socketGeneration: '1', streamSeq: '3', physicalResponseCount: 1 };
+  } else {
+    next.usage_json = { promptTokenCount: 32_000, candidatesTokenCount: 1200 };
+  }
+  assert.equal(primaryContextLabel(await renderContextStatus(fixture)), '32k / 200k');
+  next.status = 'terminal';
+  next.terminal_state = 'completed';
+  assert.equal(primaryContextLabel(await renderContextStatus(fixture)), '32k / 200k');
+});
+
+test('运行中回查上一轮计量只在本对话普通请求中取值，不取其它对话或压缩请求', async () => {
+  const fixture = contextStatusFixture();
+  const records = fixture.conversation.feed.records;
+  records.ModelRequest.request.status = 'streaming';
+  records.ModelRequest.request.usage_json = null;
+  records.Turn.foreign = { id: 'foreign-turn', conversation_id: 'other', created_at: '2026-09-25T13:00:00.000Z' };
+  records.ModelRequest.foreign = { ...records.ModelRequest.request, id: 'foreign-request', turn_id: 'foreign-turn',
+    status: 'terminal', usage_json: { promptTokenCount: 999_000 } };
+  records.ModelRequestMessageLink.foreign = { model_request_id: 'foreign-request', message_id: 'foreign-message' };
+  records.ModelRequest.compression = { ...records.ModelRequest.request, id: 'compression-request', request_seq: '2',
+    status: 'terminal', usage_json: { promptTokenCount: 888_000 } };
+  const html = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(html), '? / 200k');
+  assert.doesNotMatch(html, /待计量|999|888/);
+});
+
+test('回复提交使 root 前进后，底部保留最近实际输入，不用偏大的估算替代主数字', async () => {
+  const html = await renderContextStatus(contextStatusFixture());
+  assert.equal(primaryContextLabel(html), '24k / 200k', '楼层输入24k，不应被当前root的80k估算替换');
+  assert.doesNotMatch(html, /最近输入|待计量|reliable-context-kind/);
+  assert.doesNotMatch(html, /≈|当前估算|压缩预估/);
+});
+
+test('原生底部显示最近物理输入而非链累计计费，不要求它与楼层330k计费强行相等', async () => {
+  const html = await renderContextStatus(contextStatusFixture({ native: true, input: 120_000, estimated: 80_000 }));
+  assert.equal(primaryContextLabel(html), '120k / 200k');
+  assert.doesNotMatch(html, /最近输入|待计量|reliable-context-kind/);
+  assert.doesNotMatch(html, /330k|≈80k|is-over-threshold/);
+});
+
+test('预估只在临近压缩时单独提示，不替换实际主数字；关闭或手动压缩不提示', async () => {
+  const fixture = contextStatusFixture({ estimated: 89_999 });
+  const trigger = fixture.settings.llmCompressionConfigs.configs[0].trigger;
+  assert.doesNotMatch(await renderContextStatus(fixture), /压缩预估/);
+  fixture.conversation.feed.records.ConversationContextStatus.head.estimated_tokens = 90_000;
+  const near = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(near), '24k / 200k');
+  assert.match(near, /压缩预估: ≈90,000 Token/);
+  assert.match(near, /临近压缩/);
+  assert.doesNotMatch(near, /width:45%/, '进度条也不能把估算冒充实际输入');
+  fixture.conversation.feed.records.ConversationContextStatus.head.estimated_tokens = 100_000;
+  assert.match(await renderContextStatus(fixture), /预估达阈值/);
+  trigger.mode = 'manual';
+  assert.doesNotMatch(await renderContextStatus(fixture), /压缩预估|临近压缩|is-over-threshold/);
+  trigger.mode = 'token_threshold';
+  fixture.settings.llmCompressionConfigs.configs[0].kind = 'disabled';
+  assert.doesNotMatch(await renderContextStatus(fixture), /压缩预估|临近压缩|is-over-threshold/);
+});
+
+test('未提供实际输入时常态保持未知，只有临近压缩的独立提示可用估算', async () => {
+  const fixture = contextStatusFixture({ native: true });
+  delete fixture.conversation.feed.records.ModelRequest.request.stream_stats_json.nativeLatestResponseUsage.inputTokens;
+  const unknown = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(unknown), '? / 200k');
+  assert.doesNotMatch(unknown, /330k|≈|压缩预估/);
+  fixture.conversation.feed.records.ConversationContextStatus.head.estimated_tokens = 95_000;
+  const near = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(near), '? / 200k');
+  assert.match(near, /压缩预估: ≈95,000 Token/);
+});
+
+test('当前root实测优先：原生覆盖证明不被逻辑请求最初root否定，缺少证明不假称当前占用', async () => {
+  const fixture = contextStatusFixture({ native: true, input: 24_000, estimated: 100_000 });
+  const latest = fixture.conversation.feed.records.ModelRequest.request.stream_stats_json.nativeLatestResponseUsage;
+  latest.contextRootId = 'root-after-output';
+  latest.contextCovered = true;
+  const exact = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(exact), '24k / 200k');
+  assert.match(exact, /输入: 24,000 Token/);
+  assert.doesNotMatch(exact, /压缩预估|最近输入/);
+  delete latest.contextCovered;
+  assert.match(await renderContextStatus(fixture), /压缩预估: ≈100,000 Token/);
+});
+
+test('压缩提示只占阈值前10%且最多16k的范围，不改变后端预算或把历史输入当当前超限', () => {
+  const observation = { quality: 'recent', native: false, tokens: 5000 };
+  const hint = (estimatedTokens, thresholdTokens) => contextUsage.compressionEstimateHint({
+    automatic: true, observation, estimatedTokens, thresholdTokens
+  });
+  assert.equal(hint(179_999, 200_000), undefined);
+  assert.equal(hint(183_999, 200_000), undefined);
+  assert.deepEqual(hint(184_000, 200_000), { tokens: 184_000, atThreshold: false });
+  assert.equal(hint(899, 1000), undefined, '小阈值不能因16k余量而始终展示估算');
+  assert.deepEqual(hint(900, 1000), { tokens: 900, atThreshold: false });
+  assert.equal(hint(undefined, 1000), undefined);
+  assert.equal(hint(950, undefined), undefined);
+  assert.equal(hint(-1, 1000), undefined);
+  assert.equal(hint(Infinity, 1000), undefined);
+});
+
+test('实际输入保留零值，标记为预估的 usage 和缺物理计量的原生计费不能冒充实测', async () => {
+  const fixture = contextStatusFixture({ input: 0, estimated: 10_000 });
+  fixture.conversation.feed.records.ConversationContextStatus.head.root_id = 'root-request';
+  const zero = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(zero), '0 / 200k');
+  assert.match(zero, /输入: 0 Token/);
+  fixture.conversation.feed.records.ModelRequest.request.usage_json = { promptTokenCount: 20_000, estimated: true };
+  assert.equal(primaryContextLabel(await renderContextStatus(fixture)), '? / 200k');
+  fixture.conversation.feed.records.ModelRequest.request.usage_json = { promptTokenCount: 330_000, nativeChainBilling: true };
+  assert.equal(primaryContextLabel(await renderContextStatus(fixture)), '? / 200k');
+});
+
+test('已压缩root不因上一请求的大额实测而报警；缺当前root估算时也不借用旧估算', async () => {
+  const fixture = contextStatusFixture({ input: 150_000, estimated: 16_000 });
+  const compressed = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(compressed), '150k / 200k');
+  assert.doesNotMatch(compressed, /最近输入|非当前占用/);
+  assert.doesNotMatch(compressed, /is-over-threshold|压缩预估/);
+  delete fixture.conversation.feed.records.ConversationContextStatus.head.estimated_tokens;
+  const withoutEstimate = await renderContextStatus(fixture);
+  assert.equal(primaryContextLabel(withoutEstimate), '150k / 200k');
+  assert.doesNotMatch(withoutEstimate, /is-over-threshold|压缩预估/);
+});
+
+test('Vue feed 中压缩后编辑/追加的新 root 不常态展示估算，也不沿用旧压缩块或请求的数字', async () => {
   const { createSSRApp } = require('vue');
   const { renderToString } = require('@vue/server-renderer');
   const root = {
@@ -381,7 +586,8 @@ test('Vue feed 中压缩后编辑/追加的新 root 只显示自身 estimate，�
   try {
     const htmlForCurrentFeed = () => renderToString(createSSRApp(contextView));
     const compressed = await htmlForCurrentFeed();
-    assert.match(compressed, /≈60k \/ 130k/, '压缩后 root 的独立估算仍是权威，不用历史 calibrated80k');
+    assert.match(compressed, /\? \/ 130k/, '压缩后没有实际观测且远离阈值，不再常态显示60k估算');
+    assert.doesNotMatch(compressed, /≈60k|压缩预估/);
     assert.doesNotMatch(compressed, /80k/, '即使压缩块与 head 同事务创建，当前 root 独立估算也优先');
     root.root_id = 'root-edited-same-timestamp';
     root.estimated_tokens = null;
@@ -400,7 +606,8 @@ test('Vue feed 中压缩后编辑/追加的新 root 只显示自身 estimate，�
     root.root_created_at = '2026-09-24T12:00:03.000Z';
     root.estimated_tokens = 16_000;
     const edited = await htmlForCurrentFeed();
-    assert.match(edited, /≈16k \/ 130k/);
+    assert.match(edited, /\? \/ 130k/);
+    assert.doesNotMatch(edited, /≈16k|压缩预估/);
     assert.doesNotMatch(edited, /80k/);
     root.root_id = 'root-added';
     root.root_created_at = '2026-09-24T12:00:04.000Z';

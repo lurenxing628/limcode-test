@@ -202,7 +202,7 @@ test('保存比较只忽略记录元数据，不忽略用户自定义参数中�
   });
 });
 
-test('对话提示实时显示当前压缩配置，最近请求采用值仍保持原值', async () => {
+test('对话提示只显示当前压缩阈值并实时更新，历史请求事实不变', async () => {
   await withStore(async ({ store, initial, server, pinia }) => {
     const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
     const { default: ContextStatus } = await server.ssrLoadModule('/src/components/conversation/ReliableContextStatus.vue');
@@ -214,7 +214,8 @@ test('对话提示实时显示当前压缩配置，最近请求采用值仍保�
         id: 'request', turn_id: 'turn', provider_id: 'provider', model_id: 'model',
         context_window_tokens: 200000, compression_threshold_tokens: 120000, request_seq: '1'
       } },
-      ModelRequestMessageLink: { link: { model_request_id: 'request' } }
+      ModelRequestMessageLink: { link: { model_request_id: 'request' } },
+      ConversationContextStatus: { head: { id: 'head', conversation_id: 'conversation', root_id: 'current-root', estimated_tokens: 45000 } }
     };
     store.applySnapshot({ section: 'llmProviderConfigs', settings: { configs: [providerFixture()] }, filePath: 'fixture', revision: 'initial' });
     store.llmCompression.defaultConfigId = initial.settings.configs[0].id;
@@ -228,16 +229,21 @@ test('对话提示实时显示当前压缩配置，最近请求采用值仍保�
       }
     }).use(pinia));
     const row = (label) => status.tooltipRows.value.find((item) => item.label === label).value;
-    assert.equal(row('当前配置压缩阈值'), '40,000 Token');
-    assert.equal(row('最近请求采用阈值'), '120,000 Token');
+    assert.equal(row('压缩阈值'), '40,000 Token');
+    assert.equal(feed.records.ModelRequest.request.compression_threshold_tokens, 120000);
+    assert.equal(status.tooltipRows.value.some(item => item.label === '最近请求采用阈值'), false);
+    assert.equal(status.compressionHint.value?.tokens, 45000, '临近提示跟随当前配置40k，不沿用最近请求的120k');
+    assert.equal(status.compactLabel.value, '? / 200k', '无实际输入时估算不填进主数字');
     config.trigger.thresholdUnit = 'percent';
     config.trigger.thresholdPercent = 30;
-    assert.equal(row('当前配置压缩阈值'), '60,000 Token');
+    assert.equal(row('压缩阈值'), '60,000 Token');
+    assert.equal(status.compressionHint.value, undefined, '阈值上调后立即收起远离阈值的估算提示');
     config.trigger.mode = 'manual';
-    assert.equal(row('当前配置压缩阈值'), '仅手动压缩');
+    assert.equal(row('压缩阈值'), '仅手动压缩');
     config.kind = 'disabled';
-    assert.equal(row('当前配置压缩阈值'), '已关闭');
-    assert.equal(row('最近请求采用阈值'), '120,000 Token');
+    assert.equal(row('压缩阈值'), '已关闭');
+    assert.equal(feed.records.ModelRequest.request.compression_threshold_tokens, 120000);
+    assert.equal(status.tooltipRows.value.some(item => item.label === '最近请求采用阈值'), false);
   });
 });
 
