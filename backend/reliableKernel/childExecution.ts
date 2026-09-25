@@ -289,7 +289,7 @@ export interface ChildExecutionControlPlaneOptions {
    * Budget steps committed with the continuation a collaboration wake opens for a delivery; throws
    * when its automatic followup budget is spent, so no continuation is committed.
    */
-  prepareRuntimeContinuationSteps?: (deliveryId: string) => Promise<RepositoryTransactionStep[]>;
+  prepareRuntimeContinuationSteps: (deliveryId: string) => Promise<RepositoryTransactionStep[]>;
 }
 
 interface InterruptionReplayFacts {
@@ -350,7 +350,7 @@ export class ChildExecutionControlPlane {
   private readonly contextSequence: ContextSequenceControlPlane;
   private readonly attachments: AttachmentIngestService | undefined;
   private readonly prepareNextTurnDeliverySteps?: ChildExecutionControlPlaneOptions['prepareNextTurnDeliverySteps'];
-  private readonly prepareRuntimeContinuationSteps?: ChildExecutionControlPlaneOptions['prepareRuntimeContinuationSteps'];
+  private readonly prepareRuntimeContinuationSteps: ChildExecutionControlPlaneOptions['prepareRuntimeContinuationSteps'];
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -1324,9 +1324,7 @@ export class ChildExecutionControlPlane {
       || delivery.target_turn_id !== null
       || delivery.target_conversation_id !== snapshot.childExecution.child_conversation_id
     ) return null;
-    const budgetSteps = this.prepareRuntimeContinuationSteps
-      ? await this.prepareRuntimeContinuationSteps(command.deliveryId)
-      : [];
+    const budgetSteps = await this.prepareRuntimeContinuationSteps(command.deliveryId);
 
     const [intentContent, presetContent] = await Promise.all([
       this.contentStore.prepare(

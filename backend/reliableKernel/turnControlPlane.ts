@@ -457,7 +457,7 @@ export interface TurnControlPlaneOptions {
    * Budget steps a runtime continuation commits with its TurnIntent: a Turn a cross-conversation
    * reply starts spends the budget of the task it answers. Throws when that budget is spent.
    */
-  prepareRuntimeContinuationSteps?: (deliveryId: string) => Promise<RepositoryTransactionStep[]>;
+  prepareRuntimeContinuationSteps: (deliveryId: string) => Promise<RepositoryTransactionStep[]>;
   now?: () => string;
 }
 
@@ -571,7 +571,7 @@ export class TurnControlPlane {
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
   private readonly prepareNextTurnDeliverySteps?: TurnControlPlaneOptions['prepareNextTurnDeliverySteps'];
   private readonly prepareTerminalDeliverySteps?: TurnControlPlaneOptions['prepareTerminalDeliverySteps'];
-  private readonly prepareRuntimeContinuationSteps?: TurnControlPlaneOptions['prepareRuntimeContinuationSteps'];
+  private readonly prepareRuntimeContinuationSteps: TurnControlPlaneOptions['prepareRuntimeContinuationSteps'];
   private readonly contextSequence: ContextSequenceControlPlane;
   private readonly guidanceQueue: TurnGuidanceQueueOperations;
 
@@ -1496,12 +1496,7 @@ export class TurnControlPlane {
         })
       : null;
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps
-      ? await this.prepareNextTurnDeliverySteps(
-          conversationId,
-          ids.turn,
-          now,
-          deliveryIntentLink ? requireId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id') : null
-        )
+      ? await this.prepareNextTurnDeliverySteps(conversationId, ids.turn, now, continuationDeliveryId)
       : [];
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
@@ -1856,7 +1851,7 @@ export class TurnControlPlane {
           contentEstimatedTokens: messageContentEstimatedTokens
         })
       : null;
-    const continuationSteps = plan.operation === 'runtime_continuation' && plan.deliveryId && this.prepareRuntimeContinuationSteps
+    const continuationSteps = plan.operation === 'runtime_continuation' && plan.deliveryId
       ? await this.prepareRuntimeContinuationSteps(plan.deliveryId)
       : [];
     // A manual compression or summary rebuild runs no model over new input: pending deliveries
