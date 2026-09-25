@@ -27,7 +27,7 @@
 模型派出的子 Agent 的每一轮只能使用它自己的设置和派出它的父对话轮次都允许的东西，和 Codex 一致：Codex 的子 Agent 从父任务的有效配置出发，角色只能收紧、不能放宽，技能也只能关不能开；Codex 当前的多 Agent 实现（V2）干脆不接受用户直接向子 Agent 输入。本项目保留在子 Agent 对话里直接输入，但这些轮次同样受下面的边界约束。
 
 - **边界来源**：新建子 Agent 时读取父轮次冻结的工具设置（连同父轮次自己的上级边界）和技能设置，冻结进子 Agent 首轮 authority 的 `toolPolicy.inherited` 与 `skillPolicy.inherited`。之后父 Agent 或团队成员续派、用户在子 Agent 对话里输入、重试或编辑重跑，都沿用首轮这份边界。事后修改父 Agent 的设置只影响之后新建的子 Agent。
-- **内置工具**：两边列表都有才提供。`submit_agent_answer` 是回答父任务的通道，只要子 Agent 自己的列表有就保留。
+- **内置工具**：两边列表都有才提供，没有例外。子 Agent 每轮的最终回复就是它交给父任务的回答，不需要单独的提交工具。
 - **MCP**：来源两边都启用才可用；`enabledTools` 取交集，`disabledTools` 相加；父轮次没有启用的来源，在子 Agent 里关闭。
 - **能否执行的设置**直接合并进子 Agent 冻结的设置：项目外路径（`allowOutsideProjectPaths`）和 ask_user、submit_plan 的自动批准须两边都开；命令黑名单相加；`maxChildAgentDepth` 取较小值。
 - **按调用判断的设置**：执行确认、自动应用更改、自动提交结果和命令白名单，要子 Agent 自己和每一级上级都同意才自动或放行，自动应用的等待时间取最长。YOLO 只放宽它所在的那一级。

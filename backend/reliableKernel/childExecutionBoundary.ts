@@ -6,7 +6,6 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import {
   ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY,
-  SUBMIT_AGENT_ANSWER_TOOL_NAME,
   TOOL_POLICY_ALL_MCP_SOURCES,
   type SkillPolicySourceConfigRecord,
   type SkillSource,
@@ -61,12 +60,6 @@ export interface ChildExecutionBoundary {
   skillPolicy?: FrozenSkillPolicyDocument;
 }
 
-/**
- * The tool a child must keep to answer its parent. Every other tool needs both the child's own
- * settings and the parent Turn to allow it.
- */
-const CHILD_ANSWER_TOOLS: ReadonlySet<string> = new Set([SUBMIT_AGENT_ANSWER_TOOL_NAME]);
-
 /** Nesting deeper than this is a corrupt snapshot, not a real Agent tree. */
 const MAX_INHERITED_DEPTH = 64;
 
@@ -75,7 +68,7 @@ const MAX_INHERITED_DEPTH = 64;
  * Nothing the parent lacks is added back, whatever the child's Agent, workflow or conversation
  * settings say.
  *
- * - Built-in tools: in both lists. `submit_agent_answer` stays when the child's own list has it.
+ * - Built-in tools: in both lists. A child answers its parent with its final output, not a tool.
  * - MCP tools: the source is enabled on both sides; `enabledTools` lists intersect and
  *   `disabledTools` add up; a source the parent never enabled stays off.
  * - Settings that decide whether something may run at all, merged exactly: a path outside the
@@ -90,7 +83,7 @@ export function boundChildToolPolicy(own: ResolvedToolPolicy, parent: FrozenTool
   const parentTools = new Set(parent.allowedTools);
   return {
     ...own,
-    allowedTools: own.allowedTools.filter((name) => parentTools.has(name) || CHILD_ANSWER_TOOLS.has(name)),
+    allowedTools: own.allowedTools.filter((name) => parentTools.has(name)),
     toolConfigs: intersectToolConfigs(own.toolConfigs, parent.toolConfigs),
     sourceConfigs: intersectSourceConfigs(own.sourceConfigs, parent.sourceConfigs),
     inherited: clonePlain(parent)

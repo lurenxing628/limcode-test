@@ -188,10 +188,15 @@ export class ReliableChildAgentCoordinator {
   private readonly repairedChildModelProfiles = new Set<string>();
   /** Recovery failures already logged, so a failure that repeats on every pass is logged once. */
   private readonly reportedRecoveryFailures = new Set<string>();
+  private readonly unregisterFinalOutput: () => void;
 
   public constructor(private readonly dependencies: ReliableChildAgentCoordinatorDependencies) {
     this.now = dependencies.now ?? (() => new Date().toISOString());
     this.childLeaseOwnerId = `child-driver:${dependencies.database.hostBootId}`;
+    // A child's answer is the final output of its Turn: one channel, no separate submit tool.
+    this.unregisterFinalOutput = dependencies.agentLoop?.registerFinalOutputObserver({
+      beforeTurnCompleted: (input) => this.submitTurnFinalAnswer(input)
+    }) ?? (() => undefined);
   }
 
   public async dispatch(
@@ -206,8 +211,6 @@ export class ReliableChildAgentCoordinator {
     switch (input.toolName) {
       case 'run_agent':
         return this.runAgent(input, signal, authority, admission);
-      case 'submit_agent_answer':
-        return this.submitAnswer(input);
       case 'read_agent_answer':
         return this.readAnswer(input);
       default:
@@ -689,6 +692,7 @@ export class ReliableChildAgentCoordinator {
   public dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
     this.disposing = true;
+    this.unregisterFinalOutput();
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = undefined;
     this.waitingOwned.clear();
@@ -1035,9 +1039,9 @@ export class ReliableChildAgentCoordinator {
     }
 
     // Answer submission and parent delivery are intentionally separate commits. Reconcile the
-    // missing edge while this coordinator is online as well as at startup: a failed
-    // submit_agent_answer invocation must not strand its already durable answer behind a live-host
-    // fence that only the owning coordinator is allowed to cross.
+    // missing edge while this coordinator is online as well as at startup: a final-answer
+    // submission interrupted before its delivery must not strand its already durable answer behind
+    // a live-host fence that only the owning coordinator is allowed to cross.
     signal?.throwIfAborted();
     await this.reconcileCommittedAnswers(
       scopedActiveLinks.map((link) => requireId(
@@ -1765,47 +1769,37 @@ export class ReliableChildAgentCoordinator {
     }, `run-agent-interrupt:${input.toolCallId}`);
   }
 
-  private async submitAnswer(input: ReliableAgentToolDispatchInput): Promise<ChildDispatchResult> {
-    const args = requireRecord(input.arguments, 'submit_agent_answer arguments');
-    const explicitBridgeId = optionalText(args.answerBridgeId);
-    const answerBridgeId = explicitBridgeId || await this.defaultAnswerBridgeForTurn(input.turnId);
-    const title = requireText(args.title, 'submit_agent_answer.title');
-    const content = requireText(args.content, 'submit_agent_answer.content');
-    const submissionId = stablePhaseFId('answer_submission', input.toolCallId, answerBridgeId);
-    try {
-      const submitted = await this.dependencies.answers.submit({
-        answerBridgeId,
-        submissionId,
-        sourceTurnId: input.turnId,
-        title,
-        content,
-        contentType: 'text/plain'
-      });
-      const answerDetail = {
-        ok: true,
-        answerBridgeId,
-        title,
-        content,
-        submissionId
-      };
-      if (!submitted.historicalReplay) {
-        const waits = await this.dependencies.answers.reconcileCommittedWaits(submissionId);
-        if (!waits.settledByAnswer) {
-          await this.deliverBackgroundAnswer(answerBridgeId, submitted.inboxItemId);
-        }
-      }
-      return this.settleOwnTool(
-        input.toolCallId,
-        answerDetail,
-        `submit-agent-answer:${submissionId}`
-      );
-    } catch (error) {
-      // The stable submission identity lets recovery distinguish validation failure (no fact) from
-      // a post-commit lost orchestration edge. Keep the original tool failure visible, but always
-      // schedule the idempotent scan so a committed answer never waits for restart/deadline expiry.
-      this.triggerRecoveryPass();
-      throw error;
-    }
+  /**
+   * The final output of a child Turn becomes the answer on its AnswerBridge, exactly as a submitted
+   * answer did: it settles a waiting run_agent call or is delivered to the parent. A Turn that took
+   * in a peer's task answers that peer through its collaboration reply instead. Runs before the Turn
+   * is recorded completed, so the active-generation authority of the submission still holds.
+   */
+  private async submitTurnFinalAnswer(input: { turnId: string; modelRequestId: string; finalText: string }): Promise<void> {
+    const memberships = await this.list('ChildExecutionTurnLink', { turn_id: input.turnId }, 2);
+    if (memberships.length !== 1) return;
+    if ((await this.list('CollaborationRequestTurnLink', { turn_id: input.turnId }, 1)).length > 0) return;
+    const childExecutionId = requireId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
+    const bridges = await this.list('AnswerBridge', { child_execution_id: childExecutionId }, 2);
+    if (bridges.length !== 1) return;
+    // A child being interrupted or closed answers through its interruption path, if at all; its
+    // otherwise normal completion must not turn into a failed Turn over a refused submission.
+    const child = await this.get('ChildExecution', childExecutionId);
+    if (child?.status !== 'active' || !['open', 'submitted'].includes(String(bridges[0].status))) return;
+    const answerBridgeId = requireId(bridges[0].id, 'AnswerBridge.id');
+    const content = input.finalText.trim() || '（子 Agent 本轮结束时没有输出文字。）';
+    const submissionId = stablePhaseFId('answer_submission', 'turn-final-output', input.turnId, input.modelRequestId, answerBridgeId);
+    const submitted = await this.dependencies.answers.submit({
+      answerBridgeId,
+      submissionId,
+      sourceTurnId: input.turnId,
+      title: finalAnswerTitle(content),
+      content,
+      contentType: 'text/plain'
+    });
+    if (submitted.historicalReplay) return;
+    const waits = await this.dependencies.answers.reconcileCommittedWaits(submissionId);
+    if (!waits.settledByAnswer) await this.deliverBackgroundAnswer(answerBridgeId, submitted.inboxItemId);
   }
 
   private async readAnswer(input: ReliableAgentToolDispatchInput): Promise<ChildDispatchResult> {
@@ -2269,18 +2263,6 @@ export class ReliableChildAgentCoordinator {
     this.dependencies.deliveryWakeups?.notifyRuntimeDelivery(deliveryId);
   }
 
-  private async defaultAnswerBridgeForTurn(turnId: string): Promise<string> {
-    const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
-    if (memberships.length !== 1) {
-      throw new Error('submit_agent_answer 未提供 answerBridgeId，且当前 Turn 不属于唯一 ChildExecution。');
-    }
-    const bridges = await this.list('AnswerBridge', {
-      child_execution_id: requireId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id')
-    }, 2);
-    if (bridges.length !== 1) throw new Error('ChildExecution 必须拥有唯一 AnswerBridge。');
-    return requireId(bridges[0].id, 'AnswerBridge.id');
-  }
-
   private async snapshotForBridge(answerBridgeId: string): Promise<ChildExecutionSnapshot> {
     const bridge = await this.get('AnswerBridge', requireId(answerBridgeId, 'answerBridgeId'));
     if (!bridge) throw new Error(`未找到 answerBridgeId：${answerBridgeId}`);
@@ -2391,7 +2373,14 @@ function frozenParentModelSelection(
 }
 
 function promptWithAnswerBridge(prompt: string): string {
-  return `${prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。显式 childRef 也必须属于当前子任务，不能提交到其它任务的答案通道。同伴交流使用 send_agent_message，向已有同伴续派任务使用 followup_agent_task。继续同一子对话、中断或重试不会改变默认通道。`;
+  return `${prompt}\n\n[Agent answer]\n完成任务后直接写出最终回复：本轮最后一条回复会自动作为结果交给派发任务的 Agent，不需要调用工具提交。中途需要告知进展或提问时用 send_agent_message，向已有同伴续派任务用 followup_agent_task。`;
+}
+
+/** A short title for a final answer: its first non-empty line, bounded. */
+function finalAnswerTitle(content: string): string {
+  const firstLine = content.split('\n').map((line) => line.replace(/^[#>*\-\s]+/, '').trim()).find(Boolean) ?? '';
+  const title = firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine;
+  return title || '子 Agent 最终结果';
 }
 
 function assertExpectedPlanDelegation(

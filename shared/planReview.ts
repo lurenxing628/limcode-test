@@ -61,7 +61,7 @@ export function createDelegatedPlanPrompt(request: SubmitPlanToolRequestRecord):
     '1. 严格按照已批准 Plan 和任务清单推进；仅在确有必要时做最小调整。',
     '2. 如果提供了任务清单，先使用 update_task_list 将其同步到当前子对话，并在执行过程中持续更新状态。',
     '3. 完成实现后运行适当验证，清楚记录结果、剩余风险和任何未完成事项。',
-    '4. 完成或需要向来源 Agent 返回阶段性结论时，必须调用 submit_agent_answer({ title, content })；不要只依赖普通自然语言回复。'
+    '4. 全部完成后直接写出最终回复：本轮最后一条回复会自动作为结果交给来源 Agent；需要中途告知进展时使用 send_agent_message。'
   ].join('\n');
 }
 

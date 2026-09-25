@@ -387,6 +387,7 @@ export const EDIT_TOOL_NAME = 'edit';
 export const WRITE_TOOL_NAME = 'write';
 export const DELETE_TOOL_NAME = 'delete';
 export const ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY = 'allowOutsideProjectPaths';
+/** No longer offered: a child answers with its Turn's final output. Names historical tool results only. */
 export const SUBMIT_AGENT_ANSWER_TOOL_NAME = 'submit_agent_answer';
 export const READ_AGENT_ANSWER_TOOL_NAME = 'read_agent_answer';
 export const SKILLS_TOOL_NAME = 'skills';

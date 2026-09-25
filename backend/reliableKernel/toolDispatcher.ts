@@ -201,7 +201,6 @@ const FILE_TOOLS = new Set(['write', 'edit', 'delete']);
 const PROCESS_TOOLS = new Set(['bash', 'shell']);
 const SPECIAL_TOOLS = new Set([
   RUN_AGENT_TOOL_NAME,
-  'submit_agent_answer',
   'read_agent_answer',
   ...AGENT_COLLABORATION_TOOL_NAMES,
   ...CROSS_CONVERSATION_TOOL_NAMES,

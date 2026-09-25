@@ -215,7 +215,7 @@ export function projectKnownToolValue(
     if (!hasMore) delete record.nextCursor;
     if (!running && !hasMore) delete record.processRef;
   }
-  if (toolName === 'run_agent' || toolName === 'read_agent_answer' || toolName === 'submit_agent_answer') {
+  if (toolName === 'run_agent' || toolName === 'read_agent_answer') {
     for (const key of [
       'agentId', 'runId', 'conversationId', 'childExecutionId', 'submissionId',
       'sourceTurnId', 'activeTurnIds', 'cancelledIntentIds'
@@ -258,7 +258,7 @@ export function resolveModelToolArguments(
     }
     replaceRef(record, 'processRef', 'processId', 'process', catalog);
     replaceRef(record, 'cursor', 'outputHandle', 'cursor', catalog);
-  } else if (toolName === 'run_agent' || toolName === 'read_agent_answer' || toolName === 'submit_agent_answer') {
+  } else if (toolName === 'run_agent' || toolName === 'read_agent_answer') {
     if ('childRef' in record) {
       const ref = optionalText(record.childRef);
       const target = ref ? modelHandleTarget(catalog, 'child', ref) : undefined;
@@ -600,8 +600,7 @@ function modelReferenceKeys(toolName: string, record: Record<string, unknown>): 
     case 'bash':
     case 'shell': return ['processRef', 'cursor'];
     case 'run_agent':
-    case 'read_agent_answer':
-    case 'submit_agent_answer': return ['childRef', 'childRefs'];
+    case 'read_agent_answer': return ['childRef', 'childRefs'];
     case 'switch_work_environment': return ['workEnvironmentRef'];
     default: return [];
   }

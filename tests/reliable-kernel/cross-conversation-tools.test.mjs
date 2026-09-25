@@ -492,7 +492,15 @@ test('list excludes this conversation, its team and child tasks; read returns th
     const children = await f.rows('ChildExecution');
     assert.equal(children.length, 2);
     await f.until(async () => childRequests >= 2, 'Both child tasks must reach the provider.');
-    assert.equal((await f.rows('Turn', { conversation_id: PEER })).length, 1, 'reading never starts the other conversation');
+    // The peer's own child answers it with its final reply, which may start a peer Turn; reading
+    // the peer never does.
+    const peerAnswerTurns = new Set();
+    for (const delivery of await f.rows('RuntimeDelivery', { target_conversation_id: PEER })) {
+      const [inbox] = await f.rows('RuntimeInboxItem', { id: delivery.inbox_item_id });
+      if (inbox.source_kind === 'answer_submission') peerAnswerTurns.add(delivery.target_turn_id);
+    }
+    assert.ok((await f.rows('Turn', { conversation_id: PEER })).every(turn => turn.id === peer.turnId || peerAnswerTurns.has(turn.id)),
+      'reading never starts the other conversation');
     for (const child of children) {
       await assert.rejects(f.app.runtime.collaboration.readConversation({ conversationId: ROOT, targetConversationId: child.child_conversation_id,
         crossConversationTurnId: started.turnId }), /child task/);

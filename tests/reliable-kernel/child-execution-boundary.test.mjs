@@ -51,15 +51,15 @@ const frozenPolicy = (overrides = {}) => ({
 });
 const mcp = (sourceId, toolName) => ({ name: `${sourceId}_${toolName}`, source: { kind: 'mcp', sourceId, originalToolName: toolName } });
 
-test('child built-in tools are its own list intersected with the parent Turn, keeping only its answer tool', () => {
+test('child built-in tools are its own list intersected with the parent Turn, with no exception', () => {
   const bound = boundChildToolPolicy(
-    resolved({ allowedTools: ['bash', 'read', 'submit_agent_answer', 'write'] }),
+    resolved({ allowedTools: ['bash', 'read', 'write'] }),
     frozenPolicy({ allowedTools: ['read', 'run_agent', 'write'] })
   );
-  assert.deepEqual(bound.allowedTools, ['read', 'submit_agent_answer', 'write']);
+  assert.deepEqual(bound.allowedTools, ['read', 'write']);
   assert.deepEqual(bound.inherited.allowedTools, ['read', 'run_agent', 'write']);
   // A tool the child's own settings drop is never added back from the parent.
-  assert.deepEqual(boundChildToolPolicy(resolved({ allowedTools: ['read'] }), frozenPolicy({ allowedTools: ['read', 'submit_agent_answer'] })).allowedTools, ['read']);
+  assert.deepEqual(boundChildToolPolicy(resolved({ allowedTools: ['read'] }), frozenPolicy({ allowedTools: ['read', 'write'] })).allowedTools, ['read']);
 });
 
 test('child MCP sources need both sides: allowlists intersect, disables add up, unconfigured parent sources stay off', () => {
@@ -139,9 +139,9 @@ test('the inherited chain reaches the top-level Turn, nearest first', () => {
   assert.equal(child.inherited.inherited.id, 'root');
   assert.deepEqual(inheritedToolPolicyChain(child).map(layer => layer.preset), ['yolo', 'custom']);
   assert.deepEqual(inheritedToolPolicyChain(resolved()), []);
-  // A parent Turn that froze no tool policy could call no tool, so its child keeps only its answer tool.
-  assert.deepEqual(boundChildToolPolicy(resolved({ allowedTools: ['read', 'submit_agent_answer'] }), frozenToolPolicyDocument({})).allowedTools,
-    ['submit_agent_answer']);
+  // A parent Turn that froze no tool policy could call no tool, so its child gets none either: it
+  // still answers its parent with its final reply.
+  assert.deepEqual(boundChildToolPolicy(resolved({ allowedTools: ['read', 'write'] }), frozenToolPolicyDocument({})).allowedTools, []);
 });
 
 test('a skill either side turns off stays off in the child; untouched sources stay on', () => {
@@ -232,7 +232,7 @@ test('VscodeConfigurationAuthority compiles a child Turn within its parent Turn 
     await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: parentAgent.id,
       allowedTools: ['read', 'run_agent'], sourceConfigs: { exa: { enabled: true, enabledTools: ['search'] } } });
     await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: childAgent.id,
-      allowedTools: ['bash', 'read', 'submit_agent_answer', 'write'], sourceConfigs: { exa: { enabled: true }, github: { enabled: true } } });
+      allowedTools: ['bash', 'read', 'write'], sourceConfigs: { exa: { enabled: true }, github: { enabled: true } } });
     await configuration.mutations.setSkillPolicy({ scopeKind: 'agent', scopeId: parentAgent.id, sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] } } });
     await configuration.mutations.setSkillPolicy({ scopeKind: 'agent', scopeId: childAgent.id, sourceConfigs: { claude: { enabled: false } } });
     const compile = async (turnId, agentId, extra = {}) => JSON.parse((await configuration.compile({
@@ -242,18 +242,18 @@ test('VscodeConfigurationAuthority compiles a child Turn within its parent Turn 
     assert.equal(parent.toolPolicy.inherited, undefined, 'a top-level Turn carries no inherited bound');
     assert.deepEqual(Object.keys(parent.skillPolicy), ['id', 'sourceConfigs'], 'nor inherited skill settings');
     const unbound = await compile('child-unbound', childAgent.id);
-    assert.deepEqual(unbound.toolPolicy.allowedTools, ['bash', 'read', 'submit_agent_answer', 'write']);
+    assert.deepEqual(unbound.toolPolicy.allowedTools, ['bash', 'read', 'write']);
     const child = await compile('child-turn', childAgent.id, {
       inheritedToolPolicy: frozenToolPolicyDocument(parent), inheritedSkillPolicy: frozenSkillPolicyDocument(parent)
     });
     assert.deepEqual(child.skillPolicy.sourceConfigs, { agents: { enabled: true, disabledSkills: ['deploy'] }, claude: { enabled: false } });
     assert.deepEqual(child.skillPolicy.inherited, frozenSkillPolicyDocument(parent));
-    assert.deepEqual(child.toolPolicy.allowedTools, ['read', 'submit_agent_answer']);
+    assert.deepEqual(child.toolPolicy.allowedTools, ['read']);
     assert.deepEqual(child.toolPolicy.sourceConfigs, { exa: { enabled: true, enabledTools: ['search'] }, github: { enabled: false } });
     assert.deepEqual(child.toolPolicy.inherited, frozenToolPolicyDocument(parent));
     const preset = JSON.parse((await configuration.compile({ conversationId: 'conversation:preset', turnId: 'preset-turn',
       executorAgentId: childAgent.id, intentKind: 'input', inheritedToolPolicy: frozenToolPolicyDocument(parent) })).executionPreset.content);
-    assert.deepEqual(preset.allowedTools, ['read', 'submit_agent_answer'], 'the execution preset shows the bounded list too');
+    assert.deepEqual(preset.allowedTools, ['read'], 'the execution preset shows the bounded list too');
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -360,7 +360,7 @@ test('spawned, continued and user-started child Turns all stay within the parent
       .sort((left, right) => Number(left.turn_seq) - Number(right.turn_seq));
     const [spawnTurn] = await turns();
     const spawned = (await f.frozen(spawnTurn.turn_id)).document.toolPolicy;
-    assert.deepEqual(spawned.allowedTools, ['read', 'submit_agent_answer']);
+    assert.deepEqual(spawned.allowedTools, ['read']);
     assert.deepEqual(spawned.inherited.allowedTools, ['read', 'run_agent']);
     const childWire = f.wires.find(wire => wire.conversationId === child.child_conversation_id);
     assert.deepEqual(childWire.body.tools.map(tool => tool.function.name).sort(), ['read'], 'bash never reaches the child model');
@@ -378,7 +378,7 @@ test('spawned, continued and user-started child Turns all stay within the parent
     assert.equal(all.length, 3, 'spawn, parent follow-up and user input each ran one child Turn');
     for (const link of all) {
       const { toolPolicy, skillPolicy } = (await f.frozen(link.turn_id)).document;
-      assert.deepEqual(toolPolicy.allowedTools, ['read', 'submit_agent_answer'], `child Turn ${link.turn_seq} stays bounded`);
+      assert.deepEqual(toolPolicy.allowedTools, ['read'], `child Turn ${link.turn_seq} stays bounded`);
       assert.deepEqual(toolPolicy.inherited, spawned.inherited);
       assert.deepEqual(skillPolicy.sourceConfigs, { agents: { enabled: true, disabledSkills: ['deploy'] } }, 'the parent skill setting reaches every child Turn');
     }
@@ -445,7 +445,7 @@ test('editing a message in a child conversation reruns within the bound frozen a
     assert.deepEqual(rerun.inheritedWorkEnvironmentPolicy, { enabled, allowedWorkEnvironmentIds, defaultWorkEnvironmentId },
       'and the work environments of the child latest Turn');
     const { toolPolicy } = (await f.frozen(links[1].turn_id)).document;
-    assert.deepEqual(toolPolicy.allowedTools, ['read', 'submit_agent_answer'], 'bash and write stay off after the edit');
+    assert.deepEqual(toolPolicy.allowedTools, ['read'], 'bash and write stay off after the edit');
   }, {
     async send(request, controls, f) {
       let part = { text: 'done' };
@@ -543,9 +543,9 @@ test('a Plan the user approves to run in a new conversation runs with the execut
     await f.configuration.mutations.setModelProfile({ scopeKind: 'conversation', scopeId: 'parent', providerConfigId: f.provider.id,
       provider: f.provider.provider, model: f.provider.model, thinkingOverride: { kind: 'openai-effort', value: 'high' }, inheritThinkingToChildren: true });
     // The worker may edit and use an MCP source; the global settings still leave bash out for everyone.
-    await f.configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'run_agent', 'submit_agent_answer', 'submit_plan', 'write'] });
+    await f.configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'run_agent', 'submit_plan', 'write'] });
     await f.configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: f.childAgent.id,
-      allowedTools: ['bash', 'read', 'run_agent', 'submit_agent_answer', 'write'], sourceConfigs: { github: { enabled: true } } });
+      allowedTools: ['bash', 'read', 'run_agent', 'write'], sourceConfigs: { github: { enabled: true } } });
 
     await f.app.agentLoop.runInput(f.input('plan'));
     const [request] = await f.list('InteractionRequest');
@@ -562,7 +562,7 @@ test('a Plan the user approves to run in a new conversation runs with the execut
     assert.ok(child, 'the approved Plan starts a child conversation');
     const [firstLink] = await f.list('ChildExecutionTurnLink', { child_execution_id: child.id });
     const { toolPolicy, skillPolicy, workEnvironmentPolicy } = (await f.frozen(firstLink.turn_id)).document;
-    assert.deepEqual(toolPolicy.allowedTools, ['read', 'run_agent', 'submit_agent_answer', 'write'],
+    assert.deepEqual(toolPolicy.allowedTools, ['read', 'run_agent', 'write'],
       'the worker keeps its own tools (bash stays off globally), not the planner read-only list');
     assert.equal(toolPolicy.inherited, undefined, 'no planning-Turn bound is frozen');
     assert.deepEqual(toolPolicy.sourceConfigs, { github: { enabled: true } });
@@ -589,7 +589,7 @@ test('a Plan the user approves to run in a new conversation runs with the execut
       .sort((left, right) => Number(left.turn_seq) - Number(right.turn_seq));
     assert.equal(links.length, 2);
     const later = (await f.frozen(links[1].turn_id)).document;
-    assert.deepEqual(later.toolPolicy.allowedTools, ['read', 'run_agent', 'submit_agent_answer', 'write']);
+    assert.deepEqual(later.toolPolicy.allowedTools, ['read', 'run_agent', 'write']);
     assert.equal(later.toolPolicy.inherited, undefined);
     assert.equal(later.workEnvironmentPolicy.defaultWorkEnvironmentId, beta);
     const boundary = (await f.app.database.clientProjectionSnapshot(child.child_conversation_id)).snapshot.activeConversationWindow.childConversationBoundary;
@@ -646,7 +646,7 @@ async function runtimeFixture(run, hooks, options = {}) {
     await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: parentAgent.id,
       allowedTools: ['read', 'run_agent'], toolConfigs: { run_agent: { config: { maxChildAgentDepth: 3 } } } });
     await configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: childAgent.id,
-      allowedTools: ['bash', 'read', 'submit_agent_answer', 'write'] });
+      allowedTools: ['bash', 'read', 'write'] });
     await configuration.mutations.setSkillPolicy({ scopeKind: 'agent', scopeId: parentAgent.id, sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] } } });
     const authority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(authority);

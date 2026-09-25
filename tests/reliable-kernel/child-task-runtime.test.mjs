@@ -471,6 +471,44 @@ for (const mode of ['llm_summary', 'provider_native']) for (const forkTurns of [
   });
 });
 
+test('a child answers its parent with the final reply of its Turn, without any submit tool', { timeout: 120000 }, async () => {
+  const CHILD_ANSWER = 'CHILD_FINAL_ANSWER_8812: the dispatch path is backend/reliableKernel/agentLoop.ts.';
+  let parentRound = 0, childRequest, waitResult;
+  await fixture('llm_summary', {
+    async send(request, controls, f, wire, start) {
+      if (request.conversationId !== 'parent') {
+        childRequest = request;
+        return complete(controls, { role: 'model', parts: [{ text: CHILD_ANSWER }] });
+      }
+      parentRound += 1;
+      if (parentRound === 1) return complete(controls, { role: 'model', parts: [tool('spawn-answering-child', {
+        operation: 'spawn', taskName: 'Trace dispatch', prompt: 'Find the dispatch path.', foregroundWaitMs: 60000 })] });
+      waitResult = start.contents.flatMap(content => content.parts)
+        .find(part => part.functionResponse?.name === 'run_agent')?.functionResponse.response;
+      return complete(controls, done());
+    }
+  }, async f => {
+    assert.equal((await f.runInput('parent-waits-for-child-answer', 'Delegate the trace.')).terminalStatus, 'completed');
+    await f.coordinator.waitForIdle();
+    assert.ok(childRequest, 'the child ran');
+    const childTools = (childRequest.recipe.tools ?? []).map(definition => definition.name);
+    assert.equal(childTools.includes('submit_agent_answer'), false, 'no separate answer tool is offered');
+    const childPrompt = JSON.stringify(childRequest.context);
+    assert.equal(childPrompt.includes('submit_agent_answer'), false);
+    assert.ok(childPrompt.includes('[Agent answer]'), 'the child is told that its final reply is its answer');
+    const [bridge] = await f.list('AnswerBridge');
+    const [submission] = await f.list('AnswerSubmission');
+    assert.equal(waitResult?.status, 'succeeded');
+    assert.equal(waitResult.detail.answerSubmissionId, submission.id, 'the foreground wait settles with the child final reply');
+    assert.equal(waitResult.detail.interrupted, false);
+    const current = await f.app.runtime.answers.readCurrent(bridge.id);
+    assert.equal(current.status, 'submitted');
+    assert.equal(current.content, CHILD_ANSWER);
+    assert.equal(current.title, `${CHILD_ANSWER.slice(0, 80)}…`, 'the title is the first line, bounded');
+    assert.equal((await f.list('AnswerSubmission')).length, 1, 'one completed child Turn is one answer');
+  });
+});
+
 test('a user fork of a forkTurns child owns its inherited history and outlives the deleted parent', { timeout: 120000 }, async () => {
   let phase = 1;
   const rounds = new Map();
@@ -519,6 +557,10 @@ test('a user fork of a forkTurns child owns its inherited history and outlives t
     await assertSelfContainedAuthority(fork.conversationId);
 
     await f.coordinator.waitForIdle();
+    // The child's final reply is its answer; the parent's next Turn takes it in before deletion.
+    await eventually(async () => (await f.list('AnswerSubmission')).length > 0, 'the child final reply became its answer');
+    assert.equal((await f.runInput('parent-takes-child-answer', 'PARENT_TAKES_CHILD_ANSWER_5530')).terminalStatus, 'completed');
+    assert.deepEqual((await f.list('RuntimeDelivery', { target_conversation_id: 'parent' })).map(delivery => delivery.state), ['consumed']);
     const deleted = await f.app.database.conversationOwners.run('parent', () => f.app.conversationDeletion.delete('parent'));
     assert.ok(deleted.deletedConversationIds.includes('parent'));
     assert.equal(deleted.deletedConversationIds.includes(fork.conversationId), false);

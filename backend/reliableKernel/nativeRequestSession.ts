@@ -1548,7 +1548,7 @@ export class NativeRequestSession {
       requireId(revision.content_object_id, 'MessageRevision.content_object_id')
     ) as unknown as ContentObjectMetadata;
     const raw = (await this.deps.contentStore.read(metadata)).toString('utf8');
-    if (['run_agent', 'read_agent_answer', 'submit_agent_answer', 'submit_plan'].includes(call.name)
+    if (['run_agent', 'read_agent_answer', 'submit_plan'].includes(call.name)
       || isCollaborationHandleTool(call.name)) {
       const frozen = await freezeNativeChildToolProjection({
         database: this.deps.database, contentStore: this.deps.contentStore,

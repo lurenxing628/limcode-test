@@ -1,6 +1,5 @@
 import {
   EDIT_TOOL_NAME,
-  SUBMIT_AGENT_ANSWER_TOOL_NAME,
   SUBMIT_PLAN_TOOL_NAME,
   WRITE_TOOL_NAME,
   type ToolCallPreviewRecord
@@ -160,18 +159,6 @@ export function toolCallPreviewPresentation(preview: ToolCallPreviewRecord): Too
       title: '正在编写计划',
       detail: previewDetail(preview),
       ...(plan ? { previewText: plan, renderMode: 'markdown' as const } : {})
-    };
-  }
-
-  if (name === SUBMIT_AGENT_ANSWER_TOOL_NAME) {
-    const title = previewStringField(preview, 'title');
-    const content = stringFieldPreview(preview, 'content');
-    return {
-      kind: 'agent_answer',
-      title: '正在生成 Agent 回答',
-      ...(title ? { subject: title } : {}),
-      detail: previewDetail(preview),
-      ...(content ? { previewText: content, renderMode: 'markdown' as const } : {})
     };
   }
 

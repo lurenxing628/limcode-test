@@ -2044,7 +2044,7 @@ function modelFacingToolsForHandleCatalog(
     } else if (tool.name === 'bash' || tool.name === 'shell') {
       renameSchemaProperty(parameters, 'processId', 'processRef');
       renameSchemaProperty(parameters, 'outputHandle', 'cursor');
-    } else if (tool.name === 'run_agent' || tool.name === 'read_agent_answer' || tool.name === 'submit_agent_answer') {
+    } else if (tool.name === 'run_agent' || tool.name === 'read_agent_answer') {
       renameSchemaProperty(parameters, 'answerBridgeIds', 'childRefs');
       renameSchemaProperty(parameters, 'answerBridgeId', 'childRef');
       if (tool.name === 'run_agent') {

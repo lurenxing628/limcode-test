@@ -1459,7 +1459,7 @@ async function checkCancelSubtree() {
           childAgentId: 'agent-plan-external',
           modelFallback: CHILD_MODEL_FALLBACK,
           sourceSettlement: 'external',
-          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。显式 childRef 也必须属于当前子任务，不能提交到其它任务的答案通道。同伴交流使用 send_agent_message，向已有同伴续派任务使用 followup_agent_task。继续同一子对话、中断或重试不会改变默认通道。`,
+          prompt: `${request.prompt}\n\n[Agent answer]\n完成任务后直接写出最终回复：本轮最后一条回复会自动作为结果交给派发任务的 Agent，不需要调用工具提交。中途需要告知进展或提问时用 send_agent_message，向已有同伴续派任务用 followup_agent_task。`,
           completionPolicy: 'background',
           // The first attempt is the durable form written before executor_agent existed and crashes
           // before launch; the retry after the upgrade asks for the executor Agent own settings.

@@ -17,10 +17,11 @@ import { isReadonlyCrossConversationTool } from '../world/modules/tools/definiti
 import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
 import { isReadonlyRunAgentOperation } from '../world/modules/tools/definitions/runAgent';
 import { createHash } from 'node:crypto';
-import type {
-  LlmOpenAIResponsesTransport,
-  LlmProviderKind,
-  MessageContent
+import {
+  isVisibleTextPart,
+  type LlmOpenAIResponsesTransport,
+  type LlmProviderKind,
+  type MessageContent
 } from '../../shared/protocol';
 import { mapSettledWithBoundedConcurrency } from '../capabilities/boundedConcurrency';
 import { classifyCommandCall } from '../world/modules/tools/definitions/command';
@@ -273,6 +274,15 @@ export interface ReliableAgentLifecycleObserver {
   observe(event: ReliableAgentLifecycleEvent): void;
 }
 
+/**
+ * Observes the final answer of a Turn after it is committed and fenced, before the Turn is recorded
+ * completed. A child execution uses it to hand that answer to its parent. Must be idempotent: a
+ * recovered drive of the same Turn calls it again for the same ModelRequest.
+ */
+export interface ReliableTurnFinalOutputObserver {
+  beforeTurnCompleted(input: { turnId: string; modelRequestId: string; finalText: string }): Promise<void>;
+}
+
 export interface ReliableAgentLoopResult {
   turnId: string;
   terminalStatus: 'completed' | 'failed' | 'interrupted' | 'waiting';
@@ -408,6 +418,7 @@ const OPEN_TASK_COMPLETION_CHECK_CARD = [
  * 再幂等提交 assistant Message；工具结果按 call_seq 持久化并追加 Context tool_pair。
  */
 export class ReliableAgentLoop {
+  private readonly finalOutputObservers = new Set<ReliableTurnFinalOutputObserver>();
   private readonly context: ContextSequenceControlPlane;
   private readonly automaticDeliveries: AutomaticRuntimeDeliveryRouter;
   private readonly now: () => string;
@@ -443,6 +454,18 @@ export class ReliableAgentLoop {
     const started = await this.turns.input(command);
     const turnId = requireId(started.turnId, 'Turn input result.turnId');
     return this.drive(turnId);
+  }
+
+  public registerFinalOutputObserver(observer: ReliableTurnFinalOutputObserver): () => void {
+    this.finalOutputObservers.add(observer);
+    return () => { this.finalOutputObservers.delete(observer); };
+  }
+
+  private async notifyFinalOutput(turnId: string, modelRequestId: string, content: MessageContent): Promise<void> {
+    const finalText = finalAnswerText(content);
+    for (const observer of this.finalOutputObservers) {
+      await observer.beforeTurnCompleted({ turnId, modelRequestId, finalText });
+    }
   }
 
   /** Safe for explicit recovery/re-entry; every round and output identity is deterministic. */
@@ -773,6 +796,7 @@ export class ReliableAgentLoop {
         if (output.toolCalls.length === 0) {
           // The final-output fence was committed before this visible Message. Automatic runtime
           // input must now target a new Turn; extending this Turn would rewrite a displayed final.
+          await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
           for (;;) {
             if (await this.terminateIfRequested(turnId, `round:${round}:before-complete:${modelRequestId}`)) {
               return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
@@ -894,6 +918,7 @@ export class ReliableAgentLoop {
           if (await this.terminateIfRequested(turnId, `round:${round}:native-final-output-fenced:${modelRequestId}`)) {
             return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
           }
+          await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
           this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
           try {
             await this.turns.terminal({
@@ -3421,6 +3446,22 @@ function isProviderFailureTerminalState(value: string): boolean {
 
 function providerOutputMessage(output: NormalizedProviderOutput): MessageContent {
   return output.content;
+}
+
+/**
+ * The answer a Turn ends with: the visible text after its last tool call (a native aggregate also
+ * carries the commentary written between earlier physical responses). Thoughts are never part of it.
+ */
+function finalAnswerText(content: MessageContent): string {
+  let texts: string[] = [];
+  for (const part of content.parts) {
+    if ('functionCall' in part) {
+      texts = [];
+      continue;
+    }
+    if (isVisibleTextPart(part) && part.text.trim()) texts.push(part.text.trim());
+  }
+  return texts.join('\n\n');
 }
 
 function normalizeProviderOutput(value: PlainJsonValue): NormalizedProviderOutput {

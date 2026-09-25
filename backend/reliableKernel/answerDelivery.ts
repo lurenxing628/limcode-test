@@ -258,7 +258,7 @@ export class AnswerControlPlane {
 
   /**
    * Materializes one deterministic weak-signal answer when cancellation terminated a child Turn
-   * before submit_agent_answer ran. Already submitted answers always win; concurrent recovery
+   * before its final answer was submitted. Already submitted answers always win; concurrent recovery
    * contenders share the same submission identity and the bridge's current-submission CAS.
    */
   public async ensureInterruptedPartial(input: {
@@ -644,7 +644,7 @@ export class AnswerControlPlane {
    * Replays the post-submit parent-wait edge from immutable AnswerSubmission facts.
    *
    * AnswerSubmission/RuntimeInboxItem commit before coordinator orchestration. If that caller is
-   * interrupted after the commit (or its submit_agent_answer ToolCall is subsequently failed), the
+   * interrupted after the commit (or the child Turn then fails before completing), the
    * answer must still win every eligible parent wait bound to its exact child Turn generation.
    * This method is deliberately idempotent and is shared by live coordinator and startup recovery.
    */

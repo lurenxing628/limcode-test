@@ -262,7 +262,7 @@ test('AgentLoop把未知短引用隔离为失败ToolCall并继续同批其它工
   loop.lifecycleObserver = { observe() {} };
   loop.now = () => '2026-01-01T00:00:00.000Z';
   loop.readModelRequestToolDefinitions = async () => [
-    { name: 'submit_agent_answer', description: 'submit', parameters: { type: 'object' } },
+    { name: 'read_agent_answer', description: 'read answer', parameters: { type: 'object' } },
     { name: 'read', description: 'read', parameters: { type: 'object' } }
   ];
 
@@ -277,8 +277,8 @@ test('AgentLoop把未知短引用隔离为失败ToolCall并继续同批其它工
         {
           providerCallId: 'provider-invalid-child-ref',
           providerOrdinal: 0,
-          name: 'submit_agent_answer',
-          arguments: { childRef: canonicalBridgeId, title: '完成', content: '正文' }
+          name: 'read_agent_answer',
+          arguments: { childRef: canonicalBridgeId }
         },
         {
           providerCallId: 'provider-valid-read',
@@ -293,9 +293,7 @@ test('AgentLoop把未知短引用隔离为失败ToolCall并继续同批其它工
   assert.match(calls[0].argumentResolutionError, /未知子 Agent引用/);
   assert.equal(calls[1].argumentResolutionError, undefined);
   assert.deepEqual(createdBatch.entries[0].arguments, {
-    childRef: canonicalBridgeId,
-    title: '完成',
-    content: '正文'
+    childRef: canonicalBridgeId
   });
 
   const finalizedByDispatcher = await loop.dispatchProviderToolGroup({

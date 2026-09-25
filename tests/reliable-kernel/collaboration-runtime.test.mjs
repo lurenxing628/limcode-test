@@ -350,6 +350,8 @@ test('a child follow-up to its idle root enters the owning runner while conversa
         assert.equal((await f.rows('ChildExecutionTurnLink', { turn_id: request.turnId })).length, 0, 'a root follow-up never acquires child lineage');
         return answer(resultText);
       }
+      // The worker's final reply of each of its Turns is its answer; an idle root takes it in.
+      if (text.includes('Child task final result')) return answer('Root noted the worker result.');
       assert.fail(`Unexpected root Turn ${request.turnId}.`);
     }
     child ??= request.conversationId;
@@ -391,7 +393,20 @@ test('a child follow-up to its idle root enters the owning runner while conversa
       && (await f.rows('Turn', { conversation_id: 'root' })).every(turn => turn.status === 'terminated')
       && (await f.rows('Turn', { conversation_id: child })).every(turn => turn.status === 'terminated')
       && (await f.rows('RuntimeDelivery', { state: 'pending' })).length === 0, 'Team work did not settle.');
-    assert.equal((await f.rows('Turn', { conversation_id: 'root' })).length, 2, 'the follow-up starts exactly one root Turn');
+    const rootDeliveries = (await f.rows('RuntimeDelivery', { target_conversation_id: 'root' }));
+    const rootSources = new Map();
+    for (const delivery of rootDeliveries) {
+      const [inbox] = await f.rows('RuntimeInboxItem', { id: delivery.inbox_item_id });
+      rootSources.set(delivery.id, inbox.source_kind);
+    }
+    const followupDeliveries = rootDeliveries.filter(delivery => rootSources.get(delivery.id) === 'collaboration_message');
+    assert.deepEqual(followupDeliveries.map(delivery => delivery.target_turn_id), [followupTurn], 'the follow-up starts exactly one root Turn');
+    const answerTurns = new Set(rootDeliveries.filter(delivery => rootSources.get(delivery.id) === 'answer_submission')
+      .map(delivery => delivery.target_turn_id));
+    for (const turn of await f.rows('Turn', { conversation_id: 'root' })) {
+      if (turn.id === rootFirstTurn || turn.id === followupTurn) continue;
+      assert.ok(answerTurns.has(turn.id), `root Turn ${turn.id} was started only by a worker final result`);
+    }
     assert.ok(f.wakes.some(wake => wake.conversationId === 'root' && wake.sourceKind === 'collaboration_message'
       && wake.action === 'start_continuation' && !wake.childExecutionId), 'the root follow-up is scheduled through the conversation runner');
     const completion = (await f.app.runtime.collaboration.listMessages({ conversationId: child })).messages.find(message => message.sourceKind === 'completion');

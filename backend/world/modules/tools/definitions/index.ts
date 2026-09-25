@@ -1,5 +1,5 @@
 import type { ToolDefinition } from '../registry';
-import { readAgentAnswerToolModule, submitAgentAnswerToolModule } from './agentAnswer';
+import { readAgentAnswerToolModule } from './agentAnswer';
 import { askUserToolModule } from './askUser';
 import { commandToolModule } from './command';
 import { deleteToolModule } from './delete';
@@ -22,7 +22,7 @@ export * from './crossConversation';
 export * from './agentBoard';
 export { askUserTool, askUserToolModule } from './askUser';
 export { submitPlanTool, submitPlanToolModule } from './submitPlan';
-export { readAgentAnswerTool, readAgentAnswerToolModule, submitAgentAnswerTool, submitAgentAnswerToolModule } from './agentAnswer';
+export { readAgentAnswerTool, readAgentAnswerToolModule } from './agentAnswer';
 export { commandToolModule, createCommandTool } from './command';
 export { deleteToolModule, deleteTool } from './delete';
 export { editToolModule, editTool } from './edit';
@@ -45,7 +45,6 @@ const BUILTIN_TOOL_MODULES: readonly ToolDefinitionModule[] = [
   writeToolModule,
   deleteToolModule,
   skillsToolModule,
-  submitAgentAnswerToolModule,
   readAgentAnswerToolModule,
   runAgentToolModule,
   ...agentCollaborationToolModules,
