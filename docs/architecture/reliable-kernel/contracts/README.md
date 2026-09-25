@@ -1,6 +1,6 @@
 # 机器合同说明
 
-> 基础合同修订：`2026-07-31-r4`；Client Feed 合同 `client-feed.json`：`2026-09-25-r2`；子 Agent 合同 `subagent.json`：`2026-09-25-r6`。校验器逐文件固定核验，不进行运行时版本协商。
+> 基础合同修订：`2026-07-31-r4`；Client Feed 合同 `client-feed.json`：`2026-09-25-r3`；子 Agent 合同 `subagent.json`：`2026-09-25-r6`。校验器逐文件固定核验，不进行运行时版本协商。
 
 本目录保存可由脚本直接检查的计划底线。Markdown 解释“为什么”，JSON 限制“不能悄悄变成什么”；Runtime 不使用这些 revision 做版本协商、旧格式 fallback 或 migration chain。
 
@@ -12,7 +12,7 @@
 - `file.json`：FileChangeSet、approval、actual mutation 与 receipt；
 - `context.json`：source-occurrence Context DAG、HeadLink、compression replacement、Provider `disabled-full-request`；
 - `subagent.json`：ChildExecution lineage、required interrupt_subtree、Answer/Delivery/InputLink；
-- `client-feed.json`：bounded snapshot/changes/queue、commitSeq barrier、pagination；
+- `client-feed.json`：bounded snapshot/changes/queue、commitSeq barrier、pagination；普通记录维持 2 KiB 摘要，ModelRequest 计量单独投影为最多 32 KiB 的结构化事实（原生最多 8 个最近 response），不得按文本截断 usage/timing；
 - `migration.json`：71 个 registered roots、files/settings/external inputs 的 physical manifest 与 cutover actor；
 - `gate-registry.json`：三个出口、四组 validator、stable atomic check IDs；
 - `targets.json`：本机 package/provenance 与 9 个 installed smoke；

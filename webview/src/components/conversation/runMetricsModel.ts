@@ -33,7 +33,8 @@ export interface ModelRunMetrics {
  */
 export function modelRunMetrics(message: MessageRecord, streaming: boolean): ModelRunMetrics {
   const requestStartedAt = positiveNumber(message.requestStartedAt);
-  const firstChunkAt = positiveNumber(message.firstChunkAt ?? message.createdAt);
+  // Message creation is a storage/display timestamp, not evidence of the provider's first output.
+  const firstChunkAt = positiveNumber(message.firstChunkAt);
   const completedAt = streaming ? undefined : positiveNumber(message.completedAt);
   const observedTtftMs = requestStartedAt !== undefined && firstChunkAt !== undefined && firstChunkAt >= requestStartedAt
     ? firstChunkAt - requestStartedAt

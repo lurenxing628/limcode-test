@@ -16,7 +16,7 @@ export const CONTRACT_FILES = [
 ];
 
 const CONTRACT_REVISION = '2026-07-31-r4';
-const CLIENT_FEED_CONTRACT_REVISION = '2026-09-25-r2';
+const CLIENT_FEED_CONTRACT_REVISION = '2026-09-25-r3';
 const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r6';
 // Contracts revised after the base revision; every other contract file stays at CONTRACT_REVISION.
 const FILE_CONTRACT_REVISIONS = new Map([
@@ -1213,6 +1213,13 @@ function validateClient(client, failures) {
   if (client?.sequence?.persistenceAcrossHostRestart !== false || client?.sequence?.wireType !== 'decimal-integer-string') failures.push('commitSeq只能在hostBoot内单调并用十进制整数字符串传输');
 
   const snapshot = client?.snapshot;
+  if (snapshot?.windowRecordSummaryMaxBytes !== 2048 || snapshot?.modelRequestSummaryMaxBytes !== 32768) {
+    failures.push('普通窗口摘要须保持 2 KiB，ModelRequest 结构化计量摘要须有独立 32 KiB 硬上限');
+  }
+  const metricSummaryRule = String(snapshot?.modelRequestSummaryRule ?? '');
+  for (const marker of ['usage_json', 'stream_stats_json', '最多 8', '不得截断', '显式失败', 'snapshot/changes/history']) {
+    if (!metricSummaryRule.includes(marker)) failures.push(`ModelRequest 计量摘要合同缺少${marker}`);
+  }
   if (!positiveInteger(snapshot?.messageWindowLimit) || !positiveInteger(snapshot?.activeRecordLimitPerType) || !positiveInteger(snapshot?.maxBytes)) failures.push('前端首屏必须有明确正整数上限');
   failures.push(...exactSetProblems('snapshot字段', ['sessionId', 'hostBootId', 'snapshotCommitSeq', 'projections'], snapshot?.fields ?? []));
   if (snapshot?.includesFullContextHistory !== false || snapshot?.includesLargeToolContent !== false) failures.push('首屏快照不得携带完整上下文或大工具正文');

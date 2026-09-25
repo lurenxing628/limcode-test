@@ -847,9 +847,7 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
     ...(retryTarget ? { retryTarget } : {}),
     ...(model ? { model } : {}),
     ...(usageMetadata ? { usageMetadata } : {}),
-    ...((providerStartedAt || timestamp(request.created_at)) > 0
-      ? { requestStartedAt: providerStartedAt || timestamp(request.created_at) }
-      : {}),
+    ...(providerStartedAt > 0 ? { requestStartedAt: providerStartedAt } : {}),
     ...(firstChunkAt > 0 ? { firstChunkAt } : {}),
     ...(completedAt > 0 ? { completedAt } : {}),
     ...(streamOutputDurationMs !== undefined && streamOutputDurationMs >= 0

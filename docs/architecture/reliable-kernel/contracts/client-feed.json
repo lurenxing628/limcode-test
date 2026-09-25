@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-09-25-r2",
+  "contractRevision": "2026-09-25-r3",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -54,7 +54,9 @@
     "maxBytes": 5242880,
     "maxBytesEnforcement": "hard-limit",
     "windowRecordSummaryMaxBytes": 2048,
-    "windowRecordRule": "窗口记录只含摘要（单条不超过 windowRecordSummaryMaxBytes），正文一律经 details.onDemand 按需读取。",
+    "modelRequestSummaryMaxBytes": 32768,
+    "modelRequestSummaryRule": "ModelRequest 使用独立的结构化计量摘要：明确字段白名单，usage_json/stream_stats_json 统一解码为纯对象，保留未知值、请求身份、原生首轮/总计及最多 8 个最近物理 response；不得截断 JSON 文本或丢弃计量以满足普通文本摘要上限。超出该领域硬上限显式失败；snapshot/changes/history 共用同一投影，整帧与分页总字节上限不变。",
+    "windowRecordRule": "窗口记录只含摘要（普通记录不超过 windowRecordSummaryMaxBytes，ModelRequest 不超过 modelRequestSummaryMaxBytes），正文一律经 details.onDemand 按需读取。",
     "includesFullContextHistory": false,
     "includesLargeToolContent": false,
     "fields": [
@@ -223,7 +225,8 @@
     "r5: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；共享ACK基线的未发送commit range先压缩净变化，仍超限才转单一snapshot-required；未发送批次不占用wire messageSeq",
     "r6: RuntimeDeliveryIntentLink 进入有界投影；turn-intent-preview v3 以 guidance/runtime_continuation 判别，并展示后台进程或子 Agent 的真实来源",
     "2026-09-25-r1: 协作卡片按所属回合定位；未加载或早于已加载消息的回合放在第一条消息之上，未进入回合的卡片只在消息下方保留最新几条，最新消息不会被挤出最新分段",
-    "2026-09-25-r2: 子 Agent 回答记录带宿主推导的 outcome（submitted/interrupted/failed），续跑预览以 outcome 取代 interrupted；快照为每条已投递回答带上其提交、桥与子执行"
+    "2026-09-25-r2: 子 Agent 回答记录带宿主推导的 outcome（submitted/interrupted/failed），续跑预览以 outcome 取代 interrupted；快照为每条已投递回答带上其提交、桥与子执行",
+    "2026-09-25-r3: ModelRequest 在实时增量、快照和历史页统一投影有界结构化计量，防止通用 2 KiB 文本裁剪让瞬态退场后的 Token 和时间指标消失；缺失计量保持未知"
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",

@@ -1964,7 +1964,7 @@ export function executeClientVisibleMessageHistoryPage(
       const result: ClientVisibleMessageHistoryPageResult = {
         records: Object.fromEntries(Object.entries(rawRecords).map(([domain, rows]) => [
           domain,
-          rows.map((row) => boundClientRecordSummary(row))
+          rows.map((row) => boundClientRecordSummary(row, domain))
         ])),
         nextBeforeMessageSeq: String(oldest.message_seq),
         nextBeforeId: String(oldest.id),
@@ -2118,7 +2118,7 @@ export function executeClientCollaborationHistoryPage(
       const records: Record<string, DomainRow[]> = {};
       const include = (domain: string, rows: readonly Record<string, unknown>[]): void => {
         if (rows.length > 0) records[domain] = mergeRowsById(rows).map((row) => {
-          const bounded = boundClientRecordSummary(row);
+          const bounded = boundClientRecordSummary(row, domain);
           if (clientWireBytes(bounded) > CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES) {
             throw new Error(`Collaboration history ${domain} record exceeds summary byte limit.`);
           }

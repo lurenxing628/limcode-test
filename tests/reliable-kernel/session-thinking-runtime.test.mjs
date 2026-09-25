@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 import { after, test } from 'node:test';
 const require = createRequire(import.meta.url);
 const Module = require('node:module');
@@ -96,6 +97,50 @@ test('子继承可开关，恢复思维默认保留独立的子继承选择', as
     assert.equal(restored.model, f.provider.model);
     assert.equal(restored.inheritThinkingToChildren, true);
   });
+});
+
+test('已提交模型回复保留 Message、Request、用量与指标的独立关联，不在瞬态结束时消失', async () => {
+  await fixture(async f => {
+    const result = await f.app.agentLoop.runInput(f.input('metrics-durable'));
+    assert.equal(result.terminalStatus, 'completed');
+    const snapshot = (await f.app.database.clientProjectionSnapshot('parent')).snapshot;
+    const model = snapshot.activeConversationWindow.messages.find(row => row.role === 'model');
+    assert.ok(model?.created_at, '已提交消息和楼层仍在');
+    const link = snapshot.activeTurnSummary.modelRequestMessageLinks.find(row => row.message_id === model.id);
+    assert.ok(link, '已提交模型回复必须有精确的请求关联');
+    const request = snapshot.activeTurnSummary.modelRequests.find(row => row.id === link.model_request_id);
+    assert.ok(request, '关联的已提交请求必须仍在 Feed 中');
+    assert.deepEqual(typeof request.usage_json === 'string' ? JSON.parse(request.usage_json) : request.usage_json,
+      { promptTokenCount: 37, candidatesTokenCount: 11, totalTokenCount: 48, cachedContentTokenCount: 5 });
+    const stats = typeof request.stream_stats_json === 'string'
+      ? JSON.parse(request.stream_stats_json) : request.stream_stats_json;
+    assert.ok(stats?.completedAt > 0, '最终指标随请求持久化');
+    const server = await createWebviewSsrServer();
+    try {
+      const { projectReliableConversation } = await server.ssrLoadModule('/src/domain/reliableConversationProjection.ts');
+      const { modelRunMetrics } = await server.ssrLoadModule('/src/components/conversation/runMetricsModel.ts');
+      const bucket = (rows) => Object.fromEntries(rows.map(row => [row.id, row]));
+      const projection = projectReliableConversation({ conversationId: 'parent', details: {}, records: {
+        Message: bucket(snapshot.activeConversationWindow.messages),
+        MessageTurnLink: bucket(snapshot.activeToolAndInteractionSummary.messageTurnLinks),
+        ModelRequest: bucket(snapshot.activeTurnSummary.modelRequests),
+        ModelRequestMessageLink: bucket(snapshot.activeTurnSummary.modelRequestMessageLinks)
+      } });
+      const durable = projection.messages.find(message => message.id === model.id);
+      assert.ok(durable?.createdAt > 0, '已提交模型消息保留用于页脚展示的时间');
+      assert.equal(durable?.usageMetadata?.cachedContentTokenCount, 5, '缓存命中随持久请求展示');
+      assert.equal(durable?.usageMetadata?.promptTokenCount, 37);
+      assert.equal(durable?.usageMetadata?.candidatesTokenCount, 11);
+      const metrics = modelRunMetrics(durable, false);
+      assert.ok(metrics.ttftMs >= 0 && metrics.totalMs >= 0 && metrics.tokenSpeed > 0,
+        '首字、总耗、速度不应在瞬态结束后丢失');
+    } finally { await server.close(); }
+  }, { send: (_request, controls) => controls.onEvent({
+    kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ text: 'done' }] },
+    usage: { promptTokenCount: 37, candidatesTokenCount: 11, totalTokenCount: 48, cachedContentTokenCount: 5 },
+    timing: { providerStartedAt: Date.now() - 250, firstOutputAt: Date.now() - 150,
+      completedAt: Date.now(), streamOutputDurationMs: 150 }
+  }) });
 });
 
 test('会话思维保存不重写其他会话的配置，确认后可以发送', async () => {

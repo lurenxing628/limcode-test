@@ -1,5 +1,6 @@
 import type { PlainData } from '../../shared/plainData';
-import { CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES } from './clientFeedBounds';
+import { CLIENT_MODEL_REQUEST_SUMMARY_MAX_BYTES, CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES } from './clientFeedBounds';
+import { projectModelRequestSummary } from './clientModelRequestSummary';
 
 /** Converts database/runtime values to the exact plain representation sent to the Webview. */
 export function toClientWirePlain(value: unknown, ancestors = new WeakSet<object>()): PlainData {
@@ -36,8 +37,16 @@ export function toClientWirePlain(value: unknown, ancestors = new WeakSet<object
 }
 
 /** Applies the same per-record summary bound before page sizing and final bridge transport. */
-export function boundClientRecordSummary(recordInput: Record<string, unknown>): Record<string, PlainData> {
+export function boundClientRecordSummary(recordInput: Record<string, unknown>, domain?: string): Record<string, PlainData> {
   let record = toClientWirePlain(recordInput) as Record<string, PlainData>;
+  if (domain === 'ModelRequest') {
+    const summary = projectModelRequestSummary(record);
+    if (clientWireBytes(summary) > CLIENT_MODEL_REQUEST_SUMMARY_MAX_BYTES) {
+      // A broken bound is explicit, never a successfully delivered record with missing metrics.
+      throw new RangeError('ModelRequest client summary exceeds its structured measurement byte limit.');
+    }
+    return summary;
+  }
   if (clientWireBytes(record) <= CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES) return record;
   record = truncateStrings(record, 256) as Record<string, PlainData>;
   if (clientWireBytes(record) <= CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES) return record;

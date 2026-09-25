@@ -1062,7 +1062,7 @@ function toReliableClientChange(change: ClientScopedRuntimeChange): ReliableKern
     };
   }
   if (!change.record) throw new Error(`Committed client upsert ${change.domain}/${change.id} has no record projection.`);
-  const record = boundRecord(toWirePlain(change.record) as Record<string, PlainData>);
+  const record = boundRecord(toWirePlain(change.record) as Record<string, PlainData>, change.domain);
   if (record.id !== change.id) throw new Error('Committed client upsert record identity mismatch.');
   return { type: change.domain, operation: 'upsert', id: change.id, record };
 }
@@ -1124,7 +1124,7 @@ export class ClientHistoryReader {
     }
     const records: ReliableKernelCollaborationHistoryPage['records'] = {};
     for (const [domain, rows] of Object.entries(result.records)) {
-      records[domain] = rows.map((row) => boundRecord(toWirePlain(row) as Record<string, PlainData>));
+      records[domain] = rows.map((row) => boundRecord(toWirePlain(row) as Record<string, PlainData>, domain));
     }
     const page: ReliableKernelCollaborationHistoryPage = {
       records,
@@ -1158,7 +1158,7 @@ export class ClientHistoryReader {
     const records: ReliableKernelHistoryPage['records'] = {};
     for (const [domain, rows] of Object.entries(result.records)) {
       records[domain] = rows.map((row) => boundRecord(
-        toWirePlain(row) as Record<string, PlainData>
+        toWirePlain(row) as Record<string, PlainData>, domain
       ));
     }
     const page: ReliableKernelHistoryPage = {
@@ -3017,15 +3017,17 @@ function buildDetailChunk(
 }
 
 function boundProjectionRecords(projections: Record<string, PlainData>): Record<string, PlainData> {
-  const visit = (value: PlainData): PlainData => {
+  const visit = (value: PlainData, domain?: string): PlainData => {
     if (Array.isArray(value)) {
       return value.map((entry) => {
-        if (entry && typeof entry === 'object' && !Array.isArray(entry)) return boundRecord(entry);
+        if (entry && typeof entry === 'object' && !Array.isArray(entry)) return boundRecord(entry, domain);
         return visit(entry);
       });
     }
     if (!value || typeof value !== 'object') return value;
-    return Object.fromEntries(Object.entries(value).map(([nestedKey, nested]) => [nestedKey, visit(nested)]));
+    return Object.fromEntries(Object.entries(value).map(([nestedKey, nested]) => [
+      nestedKey, visit(nested, CLIENT_PROJECTION_ARRAY_DOMAINS[nestedKey])
+    ]));
   };
   return visit(projections) as Record<string, PlainData>;
 }

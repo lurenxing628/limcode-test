@@ -7,6 +7,8 @@ export const CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE = 200;
 export const CLIENT_TOOL_EVENT_SUMMARY_LIMIT_PER_CALL = 32;
 export const CLIENT_SNAPSHOT_MAX_BYTES = 5_242_880;
 export const CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES = 2_048;
+/** Structured usage + first/recent (at most eight) native response metrics, never text-truncated. */
+export const CLIENT_MODEL_REQUEST_SUMMARY_MAX_BYTES = 32_768;
 export const CLIENT_CHANGE_BATCH_MAX_RECORDS = 500;
 export const CLIENT_CHANGE_BATCH_MAX_BYTES = 1_048_576;
 export const CLIENT_PAGE_MAX_ROWS = 200;
