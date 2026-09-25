@@ -581,3 +581,49 @@ test('a steering Message is marked as steering input so it is resent as new, nev
   assert.equal(byId.get('steer-message')?.steeringInput, true);
   assert.equal(byId.get('input-message')?.steeringInput, undefined, 'a Turn input Message stays editable');
 });
+
+/** resp-1 → (tool result) resp-2 → (steer) resp-3 → (tool result) resp-4, all in one aggregate. */
+function toolAndSteerChain() {
+  const { records, details } = steeringChainRecords();
+  const part = (text: string, id: string, responseId: string, previousResponseId?: string) =>
+    ({ text, outputItem: { id, ordinal: 1, providerResponseId: responseId, ...(previousResponseId ? { previousResponseId } : {}) } });
+  details['message-content:revision-a'] = ready(JSON.stringify({ role: 'model', parts: [
+    part('before the tool', 'item-1', 'resp-1'),
+    part('after the tool result', 'item-2', 'resp-2', 'resp-1'),
+    part('answer to the steer', 'item-3', 'resp-3', 'resp-2'),
+    part('after another tool result', 'item-4', 'resp-4', 'resp-3')
+  ] }));
+  return { records, details };
+}
+
+const TOOL_CHAIN_RECEIPT = { ...STEER_RECEIPT, state: 'completed' as const, targetResponseId: 'resp-2', successorResponseId: 'resp-3' };
+const partTexts = (message: { content: { parts: unknown[] } } | undefined) =>
+  (message?.content.parts ?? []).map((part) => (part as { text?: string }).text);
+
+test('tool-result continuations before and after a steer stay in their segments; the steer output renders after it', () => {
+  const { records, details } = toolAndSteerChain();
+  for (const receipt of [TOOL_CHAIN_RECEIPT, { ...TOOL_CHAIN_RECEIPT, targetResponseId: 'resp-1' }]) {
+    const projection = projectReliableConversation({ conversationId: 'conversation-a', records, details, steeringReceipts: [receipt] });
+    assert.deepEqual(projection.messages.map((message) => message.id), ['message-a', 'message-steer', 'message-a:steer-successor:resp-3'],
+      `a boundary no receipt claims is a continuation (steer targeted ${receipt.targetResponseId})`);
+    assert.deepEqual(partTexts(projection.messages[0]), ['before the tool', 'after the tool result']);
+    assert.deepEqual(partTexts(projection.messages[2]), ['answer to the steer', 'after another tool result'],
+      'post-steer output, including a later tool continuation, renders below the steering message');
+    assert.deepEqual(projection.pendingSteeringBoundaryMessageIds, [], 'complete receipts leave nothing to confirm');
+  }
+});
+
+test('an unresolved receipt stops splitting only at the boundary it claims and stays flagged', () => {
+  const { records, details } = toolAndSteerChain();
+  const accepted = { ...TOOL_CHAIN_RECEIPT, state: 'accepted' as const, successorResponseId: undefined };
+  const projection = projectReliableConversation({ conversationId: 'conversation-a', records, details, steeringReceipts: [accepted] });
+  assert.deepEqual(projection.messages.map((message) => message.id), ['message-a', 'message-steer']);
+  assert.deepEqual(partTexts(projection.messages[0]),
+    ['before the tool', 'after the tool result', 'answer to the steer', 'after another tool result'], 'no output is dropped');
+  assert.deepEqual(projection.pendingSteeringBoundaryMessageIds, ['message-a'],
+    'the response after the steered one may be its successor, so its attribution stays unconfirmed');
+
+  const failed = projectReliableConversation({ conversationId: 'conversation-a', records, details,
+    steeringReceipts: [{ ...accepted, state: 'failed' as const }] });
+  assert.deepEqual(failed.pendingSteeringBoundaryMessageIds, [], 'a failed steer claims no response');
+});

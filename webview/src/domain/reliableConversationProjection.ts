@@ -886,9 +886,12 @@ interface SteeringBoundaryProjection {
 }
 
 /**
- * 原生一个 ModelRequest 的聚合 Message 可跨多次物理 response。只按同一请求/Turn、
- * 精确前驱与后继 response 身份、已提交模型上下文的转向回执、真实用户 Message 配对。
- * 缺少证明的后缀留在最后一个已证实条目，不倒退前缀，也绝不凭消息/回执顺序配对。
+ * 原生一个 ModelRequest 的聚合 Message 可跨多次物理 response（工具结果续流与转向后继都会产生新
+ * response）。只在转向回执认领的边界上拆分或标记待确认：
+ * - 没有任何回执认领的边界是同一段的续流（例如工具结果后的新 response），内容留在当前段；
+ * - 恰好一条已证实回执认领、后继身份与盖章前驱一致、且对应真实转向用户 Message 时拆出新段；
+ * - 被认领但无法证实（未生效、冲突、盖章不符、转向消息缺失）时停止拆分，其后内容留在当前段并标记待确认。
+ * 同一回合里还有未被任何回执覆盖的转向消息时，续流的归属无法确认，同样标记待确认。
  * 所有拆分只影响展示，ToolCallSourceLink 和持久化消息身份仍归来源聚合 Message。
  */
 function splitAggregateMessagesAtSteeringBoundaries(
@@ -902,6 +905,7 @@ function splitAggregateMessagesAtSteeringBoundaries(
   };
   if (steeringReceipts.length === 0) return result;
   const messagesById = new Map(messages.map((entry) => [entry.message.id, entry]));
+  const receiptMessageIds = new Set(steeringReceipts.flatMap((receipt) => receipt.messageId ? [receipt.messageId] : []));
   for (const entry of [...messages].sort(compareParsedMessages)) {
     if (entry.message.role !== 'model') continue;
     const runs = responseRunsByProviderResponseId(entry.message.content);
@@ -915,48 +919,56 @@ function splitAggregateMessagesAtSteeringBoundaries(
     );
     if (requestReceipts.length === 0) continue;
 
-    const proved: Array<{ run: (typeof runs)[number]; steer: ParsedMessage }> = [];
-    const usedSteerMessageIds = new Set<string>();
+    const segments: Array<{ steer?: ParsedMessage; responseId?: string; parts: MessageContent['parts'] }> = [
+      { parts: [...runs[0]!.parts] }
+    ];
+    const usedSubmissionIds = new Set<string>();
     let previousSteerSeq = entry.message.seq;
+    let unresolved = false;
+    let continued = false;
     for (let index = 1; index < runs.length; index += 1) {
       const run = runs[index]!;
-      const previousResponseId = runs[index - 1]!.responseId;
-      if (!run.responseId || !previousResponseId || run.responseId === previousResponseId) break;
-      // 一个物理后继被两次转向同时认领是证据冲突，不能挑任意一条渲染为生效。
-      const matching = requestReceipts.filter((receipt) =>
-        hasSteeringApplicationReceipt(receipt, requestReceipts)
-        && receipt.targetResponseId === previousResponseId
-        && receipt.successorResponseId === run.responseId
-      );
-      if (matching.length !== 1) break;
-      if (run.parts.some((part) => {
-        const stampedPredecessor = text(partOutputItem(part)?.previousResponseId);
-        return stampedPredecessor !== previousResponseId;
-      })) break;
-      const messageId = matching[0]!.messageId!;
-      const steer = messagesById.get(messageId);
-      if (!steer || steer.message.role !== 'user' || steer.turnId !== entry.turnId
-        || steer.message.seq <= previousSteerSeq || usedSteerMessageIds.has(messageId)) break;
-      usedSteerMessageIds.add(messageId);
-      proved.push({ run, steer });
-      previousSteerSeq = steer.message.seq;
+      const current = segments[segments.length - 1]!;
+      if (unresolved) {
+        current.parts.push(...run.parts);
+        continue;
+      }
+      const boundary = classifySteeringBoundary({
+        runs, index, requestReceipts, usedSubmissionIds, messagesById, entry, previousSteerSeq
+      });
+      if (boundary.kind === 'split') {
+        usedSubmissionIds.add(boundary.receipt.submissionId);
+        previousSteerSeq = boundary.steer.message.seq;
+        segments.push({ steer: boundary.steer, responseId: run.responseId, parts: [...run.parts] });
+        continue;
+      }
+      current.parts.push(...run.parts);
+      if (boundary.kind === 'unresolved') unresolved = true;
+      else continued = true;
     }
-    if (proved.length === 0) {
-      // 只有本请求实际有转向收据时才报告未知边界；多 response 也可能只是工具续流。
-      result.pendingSteeringBoundaryMessageIds.push(entry.message.id);
+    // A steering Message of this Turn that no receipt accounts for may own a continuation.
+    const unaccountedSteer = continued && messages.some((candidate) =>
+      candidate.turnId === entry.turnId
+      && candidate.message.role === 'user'
+      && candidate.message.steeringInput === true
+      && candidate.message.seq > entry.message.seq
+      && !receiptMessageIds.has(candidate.message.id)
+    );
+    const originalMessage = entry.message;
+    const pendingIds = (lastId: string): void => {
+      if (unresolved || unaccountedSteer) result.pendingSteeringBoundaryMessageIds.push(lastId);
+    };
+    if (segments.length === 1) {
+      pendingIds(originalMessage.id);
       continue;
     }
-    const originalMessage = entry.message;
     entry.message = {
       ...originalMessage,
-      content: { ...originalMessage.content, parts: runs[0]!.parts }
+      content: { ...originalMessage.content, parts: segments[0]!.parts }
     };
-    for (const [index, pairing] of proved.entries()) {
-      const syntheticId = `${originalMessage.id}:steer-successor:${pairing.run.responseId}`;
-      // 未证明的尾部保留在最后一段、仍位于下一条转向用户消息之前；不吞掉任何输出。
-      const unknownSuffix = index === proved.length - 1
-        ? runs.slice(proved.length + 1).flatMap((run) => run.parts)
-        : [];
+    let lastId = originalMessage.id;
+    for (const segment of segments.slice(1)) {
+      const syntheticId = `${originalMessage.id}:steer-successor:${segment.responseId}`;
       const { retryTarget: _retryTarget, usageMetadata: _usageMetadata, ...messageBase } = originalMessage;
       result.splitSourceMessageIdByMessageId[syntheticId] = originalMessage.id;
       messages.push({
@@ -967,15 +979,62 @@ function splitAggregateMessagesAtSteeringBoundaries(
         message: {
           ...messageBase,
           id: syntheticId,
-          content: { ...originalMessage.content, parts: [...pairing.run.parts, ...unknownSuffix] },
-          seq: pairing.steer.message.seq + 0.25
+          content: { ...originalMessage.content, parts: segment.parts },
+          seq: segment.steer!.message.seq + 0.25
         }
       });
-      if (unknownSuffix.length > 0) result.pendingSteeringBoundaryMessageIds.push(syntheticId);
+      lastId = syntheticId;
     }
+    pendingIds(lastId);
   }
   messages.sort(compareParsedMessages);
   return result;
+}
+
+type SteeringBoundary =
+  | { kind: 'continuation' }
+  | { kind: 'unresolved' }
+  | { kind: 'split'; receipt: NativeSteeringReceipt; steer: ParsedMessage };
+
+/**
+ * A receipt claims the boundary into its recorded successor; one without a successor yet claims the
+ * boundary after the response it steered (its target, or its latest observed response), since that
+ * next response may be its successor. Failed receipts and receipts already placed claim nothing.
+ */
+function classifySteeringBoundary(input: {
+  runs: Array<{ responseId?: string; parts: MessageContent['parts'] }>;
+  index: number;
+  requestReceipts: readonly NativeSteeringReceipt[];
+  usedSubmissionIds: ReadonlySet<string>;
+  messagesById: ReadonlyMap<string, ParsedMessage>;
+  entry: ParsedMessage;
+  previousSteerSeq: number;
+}): SteeringBoundary {
+  const run = input.runs[input.index]!;
+  const previousResponseId = input.runs[input.index - 1]!.responseId;
+  const open = input.requestReceipts.filter((receipt) =>
+    receipt.state !== 'failed' && !input.usedSubmissionIds.has(receipt.submissionId));
+  // Without both response identities the boundary cannot be told apart from a steer successor.
+  if (!run.responseId || !previousResponseId) return open.length > 0 ? { kind: 'unresolved' } : { kind: 'continuation' };
+  const claiming = open.filter((receipt) => receipt.successorResponseId
+    ? receipt.successorResponseId === run.responseId
+    : receipt.targetResponseId === previousResponseId || receipt.responseId === previousResponseId);
+  if (claiming.length === 0) return { kind: 'continuation' };
+  const receipt = claiming[0]!;
+  // 一个物理后继被两次转向同时认领是证据冲突，不能挑任意一条渲染为生效。
+  if (claiming.length !== 1 || !hasSteeringApplicationReceipt(receipt, input.requestReceipts)
+    || receipt.successorResponseId !== run.responseId) return { kind: 'unresolved' };
+  // The steer targeted this response or an earlier one of the same request (a tool continuation
+  // may come in between); the successor itself must be stamped as following the previous response.
+  const earlierResponseIds = new Set(input.runs.slice(0, input.index).map((candidate) => candidate.responseId));
+  if (!earlierResponseIds.has(receipt.targetResponseId)) return { kind: 'unresolved' };
+  if (run.parts.some((part) => text(partOutputItem(part)?.previousResponseId) !== previousResponseId)) {
+    return { kind: 'unresolved' };
+  }
+  const steer = input.messagesById.get(receipt.messageId!);
+  if (!steer || steer.message.role !== 'user' || steer.turnId !== input.entry.turnId
+    || steer.message.seq <= input.previousSteerSeq) return { kind: 'unresolved' };
+  return { kind: 'split', receipt, steer };
 }
 
 function functionCallTargets(messages: ParsedMessage[]): FunctionCallTarget[] {
