@@ -49,6 +49,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/collaboration-timeline-ssr.test.mjs',
   'tests/reliable-kernel/main-panel-feed-routing.test.mjs',
   'tests/reliable-kernel/child-answer-cards.test.mjs',
+  'tests/reliable-kernel/steering-status-dismissal.test.mjs',
   'tests/reliable-kernel/agent-collaboration-settings-ui.test.mjs',
   'tests/reliable-kernel/fork-request-wiring.test.mjs',
   'tests/reliable-kernel/collaboration-board.test.mjs',

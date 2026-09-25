@@ -6,8 +6,12 @@ import { bridge, BridgeMessageType } from '@webview/transport';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import {
+  STEERING_DISMISSAL_STATE_KEY,
   nextSteeringCompletionExpiry,
+  persistSteeringDismissal,
+  readSteeringDismissals,
   steeringReceiptDismissKey,
+  type SteeringDismissalState,
   steeringReceiptPresentation,
   steeringReceiptVersion,
   steeringStatusSessionKey,
@@ -28,6 +32,14 @@ const statusCommandIds = new Set<string>();
 let completionTimer: ReturnType<typeof setTimeout> | undefined;
 
 const conversationId = computed(() => reliableConversation.conversationId.value);
+const dismissalState: SteeringDismissalState = {
+  read: () => bridge.readPersistedState(STEERING_DISMISSAL_STATE_KEY),
+  write: (value) => bridge.writePersistedState(STEERING_DISMISSAL_STATE_KEY, value)
+};
+// Terminal receipts the user closed stay closed after a reload of this view.
+watch(conversationId, (id) => {
+  if (id) dismissedReceiptVersions.value = { ...dismissedReceiptVersions.value, ...readSteeringDismissals(dismissalState, id) };
+}, { immediate: true });
 const receipts = computed(() => visibleSteeringReceipts(
   currentSteeringReceipts.value,
   now.value,
@@ -139,6 +151,7 @@ function dismissReceipt(receipt: NativeSteeringReceipt): void {
     ...dismissedReceiptVersions.value,
     [steeringReceiptDismissKey(receipt)]: steeringReceiptVersion(receipt)
   };
+  persistSteeringDismissal(dismissalState, receipt);
 }
 
 function formatTime(value: number): string {

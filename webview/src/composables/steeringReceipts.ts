@@ -53,7 +53,7 @@ export function steeringReceiptPresentation(
   }
 }
 
-export function steeringReceiptDismissKey(receipt: NativeSteeringReceipt): string {
+export function steeringReceiptDismissKey(receipt: Pick<NativeSteeringReceipt, 'conversationId' | 'submissionId'>): string {
   return `${receipt.conversationId}\u0000${receipt.submissionId}`;
 }
 
@@ -61,6 +61,69 @@ export function steeringReceiptDismissKey(receipt: NativeSteeringReceipt): strin
 export function steeringReceiptVersion(receipt: NativeSteeringReceipt): string {
   return [receipt.state, receipt.updatedAt, receipt.modelRequestId, receipt.messageId,
     receipt.targetResponseId, receipt.successorResponseId, receipt.responseId].join('\u0000');
+}
+
+/** The key of this view's persisted state (VS Code webview state) that holds terminal dismissals. */
+export const STEERING_DISMISSAL_STATE_KEY = 'steeringReceiptDismissals';
+const STEERING_DISMISSALS_PER_CONVERSATION = 64;
+const STEERING_DISMISSAL_CONVERSATIONS = 32;
+
+/** This view's persisted state; per-viewer convenience only, never Runtime authority. */
+export interface SteeringDismissalState {
+  read(): unknown;
+  write(value: Record<string, Record<string, string>>): void;
+}
+
+function persistedSteeringDismissals(state: SteeringDismissalState): Record<string, Record<string, string>> {
+  let stored: unknown;
+  try {
+    stored = state.read();
+  } catch {
+    return {};
+  }
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return {};
+  const result: Record<string, Record<string, string>> = {};
+  for (const [conversationId, entries] of Object.entries(stored as Record<string, unknown>)) {
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) continue;
+    const versions = Object.entries(entries as Record<string, unknown>)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+    if (versions.length > 0) result[conversationId] = Object.fromEntries(versions);
+  }
+  return result;
+}
+
+/**
+ * Dismissed terminal receipts of one Conversation from this view's persisted state, keyed like
+ * `steeringReceiptDismissKey`. A reload or a new Host session therefore does not bring back a failed
+ * or unknown steer the user already closed; its durable receipt is unchanged.
+ */
+export function readSteeringDismissals(state: SteeringDismissalState, conversationId: string): Record<string, string> {
+  const entries = persistedSteeringDismissals(state)[conversationId] ?? {};
+  return Object.fromEntries(Object.entries(entries).map(([submissionId, version]) =>
+    [steeringReceiptDismissKey({ conversationId, submissionId }), version]));
+}
+
+/**
+ * Remembers the dismissal of a terminal receipt (the only kind that can be dismissed; it never
+ * changes again). Bounded per Conversation and in Conversations; a failing state write keeps the
+ * dismissal for this session only.
+ */
+export function persistSteeringDismissal(state: SteeringDismissalState, receipt: NativeSteeringReceipt): void {
+  if (!steeringReceiptPresentation(receipt).dismissible) return;
+  const all = persistedSteeringDismissals(state);
+  const { [receipt.conversationId]: current = {}, ...others } = all;
+  const { [receipt.submissionId]: _previous, ...kept } = current;
+  const entries = Object.entries({ ...kept, [receipt.submissionId]: steeringReceiptVersion(receipt) })
+    .slice(-STEERING_DISMISSALS_PER_CONVERSATION);
+  const next = Object.fromEntries([
+    ...Object.entries(others).slice(-(STEERING_DISMISSAL_CONVERSATIONS - 1)),
+    [receipt.conversationId, Object.fromEntries(entries)]
+  ]);
+  try {
+    state.write(next);
+  } catch {
+    // Persisted view state is a convenience; the in-memory dismissal still applies.
+  }
 }
 
 /** 当前 Host 会话的全量 status 最多自动读取一次；换 Host 必须再从持久记录读取。 */
