@@ -3,15 +3,22 @@ import { isCrossConversationTool } from '../world/modules/tools/definitions/cros
 export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment'
   | 'conversation' | 'collaborationMessage' | 'conversationMessage' | 'boardChannel' | 'boardThread' | 'boardPost';
 
+/**
+ * A model tool argument that cannot be turned into a canonical internal target. The message is
+ * shown to the model: it names the argument, the accepted form and, when the model used an internal
+ * key, the key to use instead. It echoes a rejected value only when that value is itself a short
+ * reference; a rejected canonical ID would otherwise be projected into its authorized short ref and
+ * read as if that valid reference had been refused.
+ */
 export class UnknownModelHandleReferenceError extends Error {
   public readonly code = 'UNKNOWN_MODEL_HANDLE_REFERENCE';
 
   public constructor(
     public readonly kind: ModelHandleKind,
-    public readonly ref: string,
-    detail?: string
+    public readonly argument: string,
+    message: string
   ) {
-    super(`未知${handleKindLabel(kind)}引用：${detail ?? (HANDLE_PATTERN.test(ref) ? ref : '(invalid model reference)')}`);
+    super(message);
     this.name = 'UnknownModelHandleReferenceError';
   }
 }
@@ -239,50 +246,24 @@ export function resolveModelToolArguments(
   if (isCollaborationHandleTool(toolName)) {
     resolveCollaborationArguments(toolName, record, catalog);
   } else if (toolName === 'read') {
-    replaceRef(record, 'attachmentRef', 'attachmentId', 'attachment', catalog);
+    replaceRef(toolName, record, 'attachmentRef', 'attachmentId', 'attachment', catalog);
   } else if (toolName === 'bash' || toolName === 'shell') {
-    if ('processId' in record) throw new UnknownModelHandleReferenceError('process', '(canonical id is not a model reference)');
-    if ('outputHandle' in record) throw new UnknownModelHandleReferenceError('cursor', '(canonical output handle is not a model reference)');
-    const mode = record.mode === 'output' || record.mode === 'kill' ? record.mode : 'execute';
-    if (mode === 'execute' && 'processRef' in record) {
-      throw new UnknownModelHandleReferenceError('process', '(processRef only belongs to output/kill)',
-        'processRef 仅用于 mode=output/kill，执行新命令请勿提供进程引用');
-    }
-    if (mode !== 'output' && 'cursor' in record) {
-      throw new UnknownModelHandleReferenceError('process', '(cursor only belongs to output)',
-        'cursor 仅用于 mode=output 的分页读取');
-    }
-    if (mode !== 'execute' && !('processRef' in record)) {
-      throw new UnknownModelHandleReferenceError('process', '(mode=output/kill requires processRef)',
-        'mode=output/kill 必须提供当前目录授权的 processRef');
-    }
-    replaceRef(record, 'processRef', 'processId', 'process', catalog);
-    replaceRef(record, 'cursor', 'outputHandle', 'cursor', catalog);
+    resolveCommandArguments(toolName, record, catalog);
   } else if (toolName === 'run_agent' || toolName === 'read_agent_answer') {
-    if ('childRef' in record) {
-      const ref = optionalText(record.childRef);
-      const target = ref ? modelHandleTarget(catalog, 'child', ref) : undefined;
-      if (!target) throw new UnknownModelHandleReferenceError('child', ref ?? '(invalid childRef)');
-    }
-    replaceRef(record, 'childRef', 'answerBridgeId', 'child', catalog);
-    if ('answerBridgeIds' in record) {
-      throw new UnknownModelHandleReferenceError('child', '(canonical ids are not model references)');
-    }
+    replaceRef(toolName, record, 'childRef', 'answerBridgeId', 'child', catalog);
+    if ('answerBridgeIds' in record) throw canonicalArgumentError(toolName, 'answerBridgeIds', 'childRefs', 'child', true);
     if ('childRefs' in record) {
       if (!Array.isArray(record.childRefs) || record.childRefs.length === 0 || record.childRefs.length > 32) {
-        throw new UnknownModelHandleReferenceError('child', '(invalid childRefs)');
+        throw new UnknownModelHandleReferenceError('child', 'childRefs',
+          `childRefs 必须是包含 1 到 32 个${shortRefForm('child')}的数组。`);
       }
-      const targets = record.childRefs.map((value) => {
-        const ref = optionalText(value);
-        const target = ref ? modelHandleTarget(catalog, 'child', ref) : undefined;
-        if (!target) throw new UnknownModelHandleReferenceError('child', ref ?? '(invalid childRef)');
-        return target;
-      });
+      const targets = record.childRefs.map((value, index) =>
+        requireRefTarget(catalog, 'child', `childRefs[${index}]`, value));
       delete record.childRefs;
       record.answerBridgeIds = targets;
     }
   } else if (toolName === 'switch_work_environment') {
-    replaceRef(record, 'workEnvironmentRef', 'workEnvironmentId', 'workEnvironment', catalog);
+    replaceRef(toolName, record, 'workEnvironmentRef', 'workEnvironmentId', 'workEnvironment', catalog);
   } else if (toolName === 'transfer_files' && Array.isArray(record.transfers)) {
     for (const transferValue of record.transfers) {
       const transfer = asRecord(transferValue);
@@ -339,7 +320,7 @@ function projectKnownValue(value: unknown, catalog: ModelHandleCatalog): unknown
     if (key === 'answerBridgeIds' && Array.isArray(child)) {
       output.childRefs = child.map((target) => {
         const ref = modelHandleRef(catalog, 'child', target);
-        if (!ref) throw new UnknownModelHandleReferenceError('child', '(unmapped child result)');
+        if (!ref) throw unmappedResultError('child', key);
         return ref;
       });
       continue;
@@ -511,17 +492,16 @@ function mergeMetadata(target: ModelHandleEntry, candidate: ModelHandleCandidate
 }
 
 function replaceRef(
+  toolName: string,
   record: Record<string, unknown>,
   refKey: string,
   targetKey: string,
   kind: ModelHandleKind,
   catalog: ModelHandleCatalog
 ): void {
-  if (targetKey in record) throw new UnknownModelHandleReferenceError(kind, '(canonical id is not a model reference)');
+  if (targetKey in record) throw canonicalArgumentError(toolName, targetKey, refKey, kind);
   if (!(refKey in record)) return;
-  const ref = optionalText(record[refKey]);
-  const target = ref ? modelHandleTarget(catalog, kind, ref) : undefined;
-  if (!target) throw new UnknownModelHandleReferenceError(kind, ref ?? `(invalid ${refKey})`);
+  const target = requireRefTarget(catalog, kind, refKey, record[refKey], toolName);
   delete record[refKey];
   record[targetKey] = target;
 }
@@ -531,11 +511,101 @@ function replaceEnvironmentValue(
   key: 'fromEnvironment' | 'toEnvironment',
   catalog: ModelHandleCatalog
 ): void {
-  const ref = optionalText(record[key]);
-  if (ref === 'current') return;
-  const target = ref ? modelHandleTarget(catalog, 'workEnvironment', ref) : undefined;
-  if (!target) throw new UnknownModelHandleReferenceError('workEnvironment', ref ?? `(invalid ${key})`);
-  record[key] = target;
+  if (optionalText(record[key]) === 'current') return;
+  record[key] = requireRefTarget(catalog, 'workEnvironment', key, record[key]);
+}
+
+/** Resolves one short reference of the expected kind or explains precisely why the value is not one. */
+function requireRefTarget(
+  catalog: ModelHandleCatalog,
+  kind: ModelHandleKind,
+  argument: string,
+  value: unknown,
+  toolName?: string
+): string {
+  const ref = optionalText(value);
+  const target = ref ? modelHandleTarget(catalog, kind, ref) : undefined;
+  if (target) return target;
+  const accepted = `上下文或工具结果中出现过的${shortRefForm(kind)}`;
+  const refKind = ref ? handleKindOfRef(ref) : undefined;
+  let message: string;
+  if (refKind === kind) {
+    message = `${argument}=${ref} 不是当前可用的${kindNoun(kind, '引用')}；请使用${accepted}。`;
+  } else if (refKind) {
+    message = `${argument} 收到的 ${ref} 是${kindNoun(refKind, '引用')}；请使用${accepted}。`;
+    if (toolName === 'read_agent_messages' && kind === 'collaborationMessage' && refKind === 'conversationMessage') {
+      message += '读取对话历史消息（R#）时请同时传 view=conversation。';
+    }
+  } else {
+    message = `${argument} 只接受${accepted}；不接受内部 ID、名称或其它形式的值。`;
+  }
+  return rejectArgument(kind, argument, message);
+}
+
+function canonicalArgumentError(
+  toolName: string,
+  canonicalKey: string,
+  refKey: string,
+  kind: ModelHandleKind,
+  list = false
+): UnknownModelHandleReferenceError {
+  const form = list ? `由${shortRefForm(kind)}组成的数组` : shortRefForm(kind);
+  return new UnknownModelHandleReferenceError(kind, canonicalKey,
+    `${toolName} 不接受参数 ${canonicalKey}；请改用 ${refKey} 传入${form}。`);
+}
+
+function unmappedResultError(kind: ModelHandleKind, field: string): UnknownModelHandleReferenceError {
+  return new UnknownModelHandleReferenceError(kind, field,
+    `工具结果字段 ${field} 中的${handleKindLabel(kind)}不在当前上下文的引用表中。`);
+}
+
+function rejectArgument(kind: ModelHandleKind, argument: string, message: string): never {
+  throw new UnknownModelHandleReferenceError(kind, argument, message);
+}
+
+function shortRefForm(kind: ModelHandleKind): string {
+  return `${kindNoun(kind, '短引用')}（${HANDLE_PREFIX[kind]}#）`;
+}
+
+function handleKindOfRef(value: string): ModelHandleKind | undefined {
+  if (!HANDLE_PATTERN.test(value)) return undefined;
+  return (Object.keys(HANDLE_PREFIX) as ModelHandleKind[]).find((kind) => HANDLE_PREFIX[kind] === value[0]);
+}
+
+/**
+ * shell/bash execute a new command by default; processRef and cursor only observe a background
+ * process. Mode misuse is reported as such, so a valid P#/O# is never described as unknown.
+ */
+function resolveCommandArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
+  if ('processId' in record) throw canonicalArgumentError(toolName, 'processId', 'processRef', 'process');
+  if ('outputHandle' in record) throw canonicalArgumentError(toolName, 'outputHandle', 'cursor', 'cursor');
+  const mode = record.mode === 'output' || record.mode === 'kill' ? record.mode : 'execute';
+  const executeText = record.mode === undefined
+    ? '未传 mode 时按 mode=execute 执行新命令'
+    : record.mode === 'execute' ? 'mode=execute 用于执行新命令' : 'mode 只能是 execute、output 或 kill';
+  if (mode === 'execute' && 'processRef' in record) {
+    const ref = optionalText(record.processRef);
+    const known = ref && modelHandleTarget(catalog, 'process', ref) ? ref : undefined;
+    rejectArgument('process', 'processRef',
+      `processRef 只用于 mode=output（读取后台进程输出）或 mode=kill（终止后台进程），${executeText}。`
+      + (known ? `要读取或终止 ${known}，请同时传 mode=output 或 mode=kill。` : '执行新命令时不要传 processRef。'));
+  }
+  if (mode !== 'output' && 'cursor' in record) {
+    rejectArgument('cursor', 'cursor',
+      `cursor 只用于 mode=output 的分页读取；${mode === 'kill' ? 'mode=kill 不接受 cursor' : executeText}。`);
+  }
+  if (mode !== 'execute' && !('processRef' in record)) {
+    rejectArgument('process', 'processRef',
+      `mode=${mode} 需要 processRef：请传之前 ${toolName} 结果或后台完成通知中给出的${shortRefForm('process')}。`);
+  }
+  replaceRef(toolName, record, 'processRef', 'processId', 'process', catalog);
+  replaceRef(toolName, record, 'cursor', 'outputHandle', 'cursor', catalog);
+}
+
+/** Joins a kind label and a following noun, keeping a space after a Latin word such as "Agent". */
+function kindNoun(kind: ModelHandleKind, noun: string): string {
+  const label = handleKindLabel(kind);
+  return /[A-Za-z]$/.test(label) ? `${label} ${noun}` : `${label}${noun}`;
 }
 
 function handleKindLabel(kind: ModelHandleKind): string {
@@ -670,12 +740,12 @@ function projectCollaborationValue(value: unknown, catalog: ModelHandleCatalog):
       output[field[1]] = child;
     } else if (field) {
       const ref = modelHandleRef(catalog, field[2], child);
-      if (!ref) throw new UnknownModelHandleReferenceError(field[2], '(unmapped collaboration result)');
+      if (!ref) throw unmappedResultError(field[2], key);
       output[field[1]] = ref;
     } else if (key === 'notifyConversationIds' && Array.isArray(child)) {
       output.notifyConversationRefs = child.map(target => {
         const ref = modelHandleRef(catalog, 'conversation', target);
-        if (!ref) throw new UnknownModelHandleReferenceError('conversation', '(unmapped notification target)');
+        if (!ref) throw unmappedResultError('conversation', key);
         return ref;
       });
     } else output[key] = projectCollaborationValue(child, catalog);
@@ -700,26 +770,20 @@ function collaborationArgumentFields(
 
 function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
   const fields = collaborationArgumentFields(toolName, record);
-  for (const [refKey, targetKey, kind] of fields) {
-    // Provider contracts accept only frozen short references. Canonical IDs cannot bypass the map.
-    if (targetKey in record) throw new UnknownModelHandleReferenceError(kind, '(canonical id is not a model reference)');
-    if (!(refKey in record)) continue;
-    const ref = optionalText(record[refKey]);
-    if (!ref || !modelHandleTarget(catalog, kind, ref)) {
-      throw new UnknownModelHandleReferenceError(kind, ref ?? `(invalid ${refKey})`);
-    }
-    replaceRef(record, refKey, targetKey, kind, catalog);
-  }
+  // Provider contracts accept only frozen short references. Canonical IDs cannot bypass the map.
+  for (const [refKey, targetKey, kind] of fields) replaceRef(toolName, record, refKey, targetKey, kind, catalog);
   if (toolName === 'agent_board') {
-    if ('notifyConversationIds' in record) throw new UnknownModelHandleReferenceError('conversation', '(canonical notification targets)');
+    if ('notifyConversationIds' in record) {
+      throw canonicalArgumentError(toolName, 'notifyConversationIds', 'notifyConversationRefs', 'conversation', true);
+    }
     if ('notifyConversationRefs' in record) {
       const refs = record.notifyConversationRefs;
-      if (!Array.isArray(refs) || refs.length > 256) throw new UnknownModelHandleReferenceError('conversation', '(invalid notification targets)');
-      record.notifyConversationIds = refs.map(ref => {
-        const target = modelHandleTarget(catalog, 'conversation', ref);
-        if (!target) throw new UnknownModelHandleReferenceError('conversation', typeof ref === 'string' ? ref : '(invalid reference)');
-        return target;
-      });
+      if (!Array.isArray(refs) || refs.length > 256) {
+        rejectArgument('conversation', 'notifyConversationRefs',
+          `notifyConversationRefs 必须是最多包含 256 个${shortRefForm('conversation')}的数组。`);
+      }
+      record.notifyConversationIds = refs.map((ref, index) =>
+        requireRefTarget(catalog, 'conversation', `notifyConversationRefs[${index}]`, ref, toolName));
       delete record.notifyConversationRefs;
     }
   }

@@ -290,7 +290,8 @@ test('AgentLoop把未知短引用隔离为失败ToolCall并继续同批其它工
     }
   });
 
-  assert.match(calls[0].argumentResolutionError, /未知子 Agent引用/);
+  assert.match(calls[0].argumentResolutionError, /^childRef 只接受.*子 Agent 短引用（A#）/);
+  assert.doesNotMatch(calls[0].argumentResolutionError, new RegExp(canonicalBridgeId));
   assert.equal(calls[1].argumentResolutionError, undefined);
   assert.deepEqual(createdBatch.entries[0].arguments, {
     childRef: canonicalBridgeId
@@ -477,19 +478,20 @@ for (const tool of ['bash', 'shell']) {
       { command: 'pwd', explanation: 'inspect', foregroundWaitMs: 0 });
     assert.throws(() => resolveModelToolArguments(tool, { mode: 'output' }, catalog), error => {
       assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
-      assert.match(error.message, /mode=output\/kill.*processRef/);
+      assert.match(error.message, /mode=output 需要 processRef/);
       return true;
     });
     assert.throws(() => resolveModelToolArguments(tool, { mode: 'kill', processRef, cursor }, catalog), error => {
       assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
-      assert.match(error.message, /cursor.*mode=output/);
+      assert.equal(error.kind, 'cursor');
+      assert.match(error.message, /cursor 只用于 mode=output.*mode=kill 不接受 cursor/);
       return true;
     });
 
     for (const args of [
       { mode: 'output' }, { mode: 'kill' }, { mode: 'output', processRef: '' },
       { mode: 'output', processRef: 'P999' }, { mode: 'output', processRef: ref('child') },
-      { mode: 'output', processRef: 3 }, { mode: 'kill', processRef, cursor },
+      { mode: 'output', processRef: 3 },
       { mode: 'execute', processRef, command: 'pwd', foregroundWaitMs: 0 }
     ]) rejected(tool, args, 'process');
     for (const args of [
@@ -498,6 +500,8 @@ for (const tool of ['bash', 'shell']) {
       { command: 'pwd', processId: 'internal-process', foregroundWaitMs: 0 }
     ]) rejected(tool, args, 'process');
     for (const args of [
+      { mode: 'kill', processRef, cursor },
+      { cursor, command: 'pwd', foregroundWaitMs: 0 },
       { mode: 'output', processRef, cursor: 'O999' },
       { mode: 'output', processRef, cursor: ref('conversation') },
       { mode: 'output', processRef, outputHandle: 'rk-process-output:cursor-one' },
@@ -505,6 +509,84 @@ for (const tool of ['bash', 'shell']) {
     ]) rejected(tool, args, 'cursor');
   });
 }
+
+test('参数错误说明具体字段、应传形式和正确键名，不把有效引用说成未知', () => {
+  const failure = (toolName, args, handles = catalog) => {
+    try {
+      resolveModelToolArguments(toolName, args, handles);
+    } catch (error) {
+      assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+      return error;
+    }
+    assert.fail(`${toolName} ${JSON.stringify(args)} 必须被拒绝`);
+  };
+  const processRef = ref('process');
+  const cursor = ref('cursor');
+
+  // 有效 P# 漏传 mode：是模式错误，不是未知进程。
+  const missingMode = failure('bash', { processRef });
+  assert.equal(missingMode.kind, 'process');
+  assert.equal(missingMode.argument, 'processRef');
+  assert.doesNotMatch(missingMode.message, /未知/);
+  assert.match(missingMode.message, /processRef 只用于 mode=output.*mode=kill/);
+  assert.match(missingMode.message, /未传 mode 时按 mode=execute/);
+  assert.match(missingMode.message, new RegExp(`要读取或终止 ${processRef}，请同时传 mode=output 或 mode=kill`));
+  const unknownWithExecute = failure('shell', { mode: 'execute', processRef: 'P999', command: 'pwd' });
+  assert.match(unknownWithExecute.message, /mode=execute 用于执行新命令.*执行新命令时不要传 processRef/);
+  assert.doesNotMatch(unknownWithExecute.message, /要读取或终止/, '未知 P# 不能被描述成可读取的进程');
+
+  // 游标误用归为输出游标，不归为进程。
+  const cursorMisuse = failure('bash', { command: 'pwd', foregroundWaitMs: 0, cursor });
+  assert.equal(cursorMisuse.kind, 'cursor');
+  assert.equal(cursorMisuse.argument, 'cursor');
+  assert.match(cursorMisuse.message, /cursor 只用于 mode=output 的分页读取/);
+
+  // mode=output 缺 processRef 时说明来源，不再提“目录授权”。
+  const missingProcess = failure('bash', { mode: 'output' });
+  assert.match(missingProcess.message, /mode=output 需要 processRef：请传之前 bash 结果或后台完成通知中给出的进程短引用（P#）/);
+  assert.doesNotMatch(missingProcess.message, /目录授权/);
+
+  // 内部键：点名错误字段和正确键，不回显内部值。
+  for (const [toolName, args, canonicalKey, refKey, form] of [
+    ['read', { attachmentId: 'internal-attachment' }, 'attachmentId', 'attachmentRef', '附件短引用（F#）'],
+    ['bash', { mode: 'output', processId: 'internal-process' }, 'processId', 'processRef', '进程短引用（P#）'],
+    ['shell', { mode: 'output', processRef, outputHandle: 'rk-process-output:cursor-one' }, 'outputHandle', 'cursor', '输出游标短引用（O#）'],
+    ['run_agent', { operation: 'send', answerBridgeId: 'internal-child' }, 'answerBridgeId', 'childRef', '子 Agent 短引用（A#）'],
+    ['run_agent', { operation: 'wait', answerBridgeIds: ['internal-child'] }, 'answerBridgeIds', 'childRefs', '由子 Agent 短引用（A#）组成的数组'],
+    ['switch_work_environment', { workEnvironmentId: 'work-env-owned' }, 'workEnvironmentId', 'workEnvironmentRef', '工作环境短引用（W#）'],
+    ['send_agent_message', { targetConversationId: 'internal-conversation', text: 'hi' }, 'targetConversationId', 'conversationRef', '对话短引用（C#）'],
+    ['agent_board', { operation: 'post', notifyConversationIds: ['internal-conversation'] }, 'notifyConversationIds', 'notifyConversationRefs', '由对话短引用（C#）组成的数组']
+  ]) {
+    const error = failure(toolName, args);
+    assert.equal(error.argument, canonicalKey);
+    assert.equal(error.message, `${toolName} 不接受参数 ${canonicalKey}；请改用 ${refKey} 传入${form}。`);
+  }
+
+  // 短引用种类不对、当前上下文没有、或根本不是短引用，各自给出准确说明。
+  assert.equal(failure('read', { attachmentRef: processRef }).message,
+    `attachmentRef 收到的 ${processRef} 是进程引用；请使用上下文或工具结果中出现过的附件短引用（F#）。`);
+  assert.equal(failure('read', { attachmentRef: 'F999' }).message,
+    'attachmentRef=F999 不是当前可用的附件引用；请使用上下文或工具结果中出现过的附件短引用（F#）。');
+  assert.equal(failure('run_agent', { operation: 'wait', childRefs: [ref('child'), 'A9'] }).argument, 'childRefs[1]');
+  const history = buildModelHandleCatalog([], [{ kind: 'conversationMessage', ref: 'R1', target: 'history-message' }]);
+  assert.match(failure('read_agent_messages', { messageRef: 'R1' }, history).message,
+    /messageRef 收到的 R1 是对话历史消息引用.*请同时传 view=conversation/);
+
+  // 被拒绝的内部 ID 既不回显，投影后也不会变成看似有效的短引用。
+  for (const [toolName, args] of [
+    ['read', { attachmentRef: 'internal-attachment' }],
+    ['bash', { mode: 'output', processRef: 'internal-process' }],
+    ['switch_work_environment', { workEnvironmentRef: 'work-env-owned' }]
+  ]) {
+    const error = failure(toolName, args);
+    assert.match(error.message, /只接受上下文或工具结果中出现过的.*不接受内部 ID、名称或其它形式的值/);
+    const projected = projectToolResultForModel(toolName, {
+      status: 'failed', detail: { code: 'invalid_model_handle_reference', error: error.message }
+    }, catalog);
+    assert.equal(projected.detail.error, error.message);
+    assert.doesNotMatch(projected.detail.error, /\b[FPOAWC][1-9]\d*\b/);
+  }
+});
 
 test('transfer_files 不把可猜测的 work-env ID 当作短引用；current 和目录授权 W# 可用', () => {
   const transfers = [
