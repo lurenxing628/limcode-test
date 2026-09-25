@@ -130,22 +130,20 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
       const config = normalizeCommandToolConfig(ctx?.config);
       const mode = args.mode === 'output' || args.mode === 'kill' ? args.mode : 'execute';
 
-      if (mode === 'output') {
-        const processId = (args.processId ?? '').trim();
-        if (!processId) return { ok: false, output: '缺少 processId：mode=output 需要指定后台进程 id。' };
-        return {
-          ok: true,
-          output: deps.command.readOutput(processId)
-        };
+      if (mode === 'output' || mode === 'kill') {
+        const processId = typeof args.processId === 'string' ? args.processId.trim() : '';
+        if (!processId) return { ok: false, output: `缺少有效 processId：mode=${mode} 需要指定后台进程 id。` };
+        // Direct command capability supports only unpaged output. Reliable Runtime routes
+        // mode=output and its validated cursor through ProcessEffects instead of this executor.
+        if (args.outputHandle !== undefined) {
+          return { ok: false, output: `mode=${mode} 的 outputHandle 必须由可靠运行内核读取，此执行通道不支持分页游标。` };
+        }
+        return mode === 'output'
+          ? { ok: true, output: deps.command.readOutput(processId) }
+          : { ok: true, output: deps.command.kill(processId) };
       }
 
-      if (mode === 'kill') {
-        const processId = (args.processId ?? '').trim();
-        if (!processId) return { ok: false, output: '缺少 processId：mode=kill 需要指定后台进程 id。' };
-        return { ok: true, output: deps.command.kill(processId) };
-      }
-
-      const commandText = (args.command ?? '').trim();
+      const commandText = typeof args.command === 'string' ? args.command.trim() : '';
       if (!commandText) return { ok: false, output: 'mode=execute 需要提供 command。' };
       if (typeof args.explanation !== 'string' || args.explanation.trim().length === 0) {
         return { ok: false, output: 'mode=execute 需要提供 explanation。' };

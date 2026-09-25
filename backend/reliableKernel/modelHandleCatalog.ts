@@ -8,9 +8,10 @@ export class UnknownModelHandleReferenceError extends Error {
 
   public constructor(
     public readonly kind: ModelHandleKind,
-    public readonly ref: string
+    public readonly ref: string,
+    detail?: string
   ) {
-    super(`未知${handleKindLabel(kind)}引用：${ref}`);
+    super(`未知${handleKindLabel(kind)}引用：${detail ?? (HANDLE_PATTERN.test(ref) ? ref : '(invalid model reference)')}`);
     this.name = 'UnknownModelHandleReferenceError';
   }
 }
@@ -51,6 +52,7 @@ const HANDLE_PREFIX: Record<ModelHandleKind, string> = {
 };
 
 const HANDLE_PATTERN = /^(?:F|P|O|A|W|C|M|R|H|T|B)[1-9]\d*$/;
+const HANDLE_TOKEN_PATTERN = /\b(?:F|P|O|A|W|C|M|R|H|T|B)[1-9]\d*\b/g;
 const WORK_ENVIRONMENT_PATTERN = /\bwork-env-[a-zA-Z0-9._-]+\b/g;
 const MAX_NESTED_JSON_CHARS = 16 * 1024 * 1024;
 
@@ -239,17 +241,33 @@ export function resolveModelToolArguments(
   } else if (toolName === 'read') {
     replaceRef(record, 'attachmentRef', 'attachmentId', 'attachment', catalog);
   } else if (toolName === 'bash' || toolName === 'shell') {
+    if ('processId' in record) throw new UnknownModelHandleReferenceError('process', '(canonical id is not a model reference)');
+    if ('outputHandle' in record) throw new UnknownModelHandleReferenceError('cursor', '(canonical output handle is not a model reference)');
+    const mode = record.mode === 'output' || record.mode === 'kill' ? record.mode : 'execute';
+    if (mode === 'execute' && 'processRef' in record) {
+      throw new UnknownModelHandleReferenceError('process', '(processRef only belongs to output/kill)',
+        'processRef 仅用于 mode=output/kill，执行新命令请勿提供进程引用');
+    }
+    if (mode !== 'output' && 'cursor' in record) {
+      throw new UnknownModelHandleReferenceError('process', '(cursor only belongs to output)',
+        'cursor 仅用于 mode=output 的分页读取');
+    }
+    if (mode !== 'execute' && !('processRef' in record)) {
+      throw new UnknownModelHandleReferenceError('process', '(mode=output/kill requires processRef)',
+        'mode=output/kill 必须提供当前目录授权的 processRef');
+    }
     replaceRef(record, 'processRef', 'processId', 'process', catalog);
     replaceRef(record, 'cursor', 'outputHandle', 'cursor', catalog);
   } else if (toolName === 'run_agent' || toolName === 'read_agent_answer' || toolName === 'submit_agent_answer') {
     if ('childRef' in record) {
       const ref = optionalText(record.childRef);
       const target = ref ? modelHandleTarget(catalog, 'child', ref) : undefined;
-      if (!target || ('answerBridgeId' in record && record.answerBridgeId !== target)) {
-        throw new UnknownModelHandleReferenceError('child', ref ?? '(invalid childRef)');
-      }
+      if (!target) throw new UnknownModelHandleReferenceError('child', ref ?? '(invalid childRef)');
     }
     replaceRef(record, 'childRef', 'answerBridgeId', 'child', catalog);
+    if ('answerBridgeIds' in record) {
+      throw new UnknownModelHandleReferenceError('child', '(canonical ids are not model references)');
+    }
     if ('childRefs' in record) {
       if (!Array.isArray(record.childRefs) || record.childRefs.length === 0 || record.childRefs.length > 32) {
         throw new UnknownModelHandleReferenceError('child', '(invalid childRefs)');
@@ -260,9 +278,6 @@ export function resolveModelToolArguments(
         if (!target) throw new UnknownModelHandleReferenceError('child', ref ?? '(invalid childRef)');
         return target;
       });
-      if ('answerBridgeIds' in record && JSON.stringify(record.answerBridgeIds) !== JSON.stringify(targets)) {
-        throw new UnknownModelHandleReferenceError('child', '(conflicting childRefs)');
-      }
       delete record.childRefs;
       record.answerBridgeIds = targets;
     }
@@ -345,9 +360,58 @@ function projectKnownValue(value: unknown, catalog: ModelHandleCatalog): unknown
 }
 
 function projectKnownText(value: string, catalog: ModelHandleCatalog): string {
-  let text = value;
-  for (const entry of catalog.entries) text = text.split(entry.target).join(entry.ref);
-  return text;
+  // A tool result can claim any code, including the kernel's invalid-model-reference code. Never
+  // exempt its "error" text from projection. Instead, avoid replacing only *part* of an already
+  // written short reference: target "999" must not turn a rejected P999 into an apparent PC1.
+  const references = Array.from(value.matchAll(HANDLE_TOKEN_PATTERN), (match) => ({
+    start: match.index,
+    end: match.index + match[0].length
+  }));
+  let projected = '';
+  let offset = 0;
+  // Keep each next match in the original text; rescanning a large result for every replacement
+  // would make a result with many IDs quadratic in its text length.
+  const nextIndexes = catalog.entries.map((entry) => value.indexOf(entry.target));
+  while (offset < value.length) {
+    let nextIndex = value.length;
+    let nextEntry: ModelHandleEntry | undefined;
+    for (let candidate = 0; candidate < catalog.entries.length; candidate += 1) {
+      const entry = catalog.entries[candidate];
+      let index = nextIndexes[candidate];
+      if (index >= 0 && index < offset) index = value.indexOf(entry.target, offset);
+      while (index >= 0 && overlapsPartOfHandleToken(index, index + entry.target.length, references)) {
+        index = value.indexOf(entry.target, index + 1);
+      }
+      nextIndexes[candidate] = index;
+      if (index >= 0 && (index < nextIndex
+        || (index === nextIndex && entry.target.length > (nextEntry?.target.length ?? 0)))) {
+        nextIndex = index;
+        nextEntry = entry;
+      }
+    }
+    if (!nextEntry) break;
+    projected += value.slice(offset, nextIndex) + nextEntry.ref;
+    offset = nextIndex + nextEntry.target.length;
+  }
+  return projected + value.slice(offset);
+}
+
+function overlapsPartOfHandleToken(
+  start: number,
+  end: number,
+  references: readonly { start: number; end: number }[]
+): boolean {
+  let low = 0;
+  let high = references.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (references[middle].end <= start) low = middle + 1;
+    else high = middle;
+  }
+  for (let index = low; index < references.length && references[index].start < end; index += 1) {
+    if (start > references[index].start || end < references[index].end) return true;
+  }
+  return false;
 }
 
 function collectCandidates(
@@ -453,10 +517,11 @@ function replaceRef(
   kind: ModelHandleKind,
   catalog: ModelHandleCatalog
 ): void {
+  if (targetKey in record) throw new UnknownModelHandleReferenceError(kind, '(canonical id is not a model reference)');
+  if (!(refKey in record)) return;
   const ref = optionalText(record[refKey]);
-  if (!ref) return;
-  const target = modelHandleTarget(catalog, kind, ref);
-  if (!target) throw new UnknownModelHandleReferenceError(kind, ref);
+  const target = ref ? modelHandleTarget(catalog, kind, ref) : undefined;
+  if (!target) throw new UnknownModelHandleReferenceError(kind, ref ?? `(invalid ${refKey})`);
   delete record[refKey];
   record[targetKey] = target;
 }
@@ -467,9 +532,9 @@ function replaceEnvironmentValue(
   catalog: ModelHandleCatalog
 ): void {
   const ref = optionalText(record[key]);
-  if (!ref || ref === 'current' || !/^W[1-9]\d*$/.test(ref)) return;
-  const target = modelHandleTarget(catalog, 'workEnvironment', ref);
-  if (!target) throw new UnknownModelHandleReferenceError('workEnvironment', ref);
+  if (ref === 'current') return;
+  const target = ref ? modelHandleTarget(catalog, 'workEnvironment', ref) : undefined;
+  if (!target) throw new UnknownModelHandleReferenceError('workEnvironment', ref ?? `(invalid ${key})`);
   record[key] = target;
 }
 
@@ -533,7 +598,7 @@ function modelReferenceKeys(toolName: string, record: Record<string, unknown>): 
   switch (toolName) {
     case 'read': return ['attachmentRef'];
     case 'bash':
-    case 'shell': return ['processRef'];
+    case 'shell': return ['processRef', 'cursor'];
     case 'run_agent':
     case 'read_agent_answer':
     case 'submit_agent_answer': return ['childRef', 'childRefs'];

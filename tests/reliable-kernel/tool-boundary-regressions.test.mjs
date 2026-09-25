@@ -418,3 +418,227 @@ test('已消费或重放的 Provider 准入证明必须重新检查持久化事�
   });
   assert.equal(replayAdmission, undefined, 'deduplicated/recovery 创建不得获得快路径准入');
 });
+
+// 模型短引用边界回归：仅编译目录可授权的 refs，生产 ToolCall 不接受内部 canonical id。
+
+const { buildModelHandleCatalog, resolveModelToolArguments, projectToolResultForModel } =
+  require(path.join(root, 'dist/extension/backend/reliableKernel/modelHandleCatalog.js'));
+
+const catalog = buildModelHandleCatalog([
+  { attachmentId: 'internal-attachment', processId: 'internal-process', nextOutputHandle: 'rk-process-output:cursor-one',
+    answerBridgeId: 'internal-child', workEnvironmentId: 'work-env-owned' },
+  { kind: 'cross_conversation', conversationId: 'internal-conversation' }
+]);
+const ref = kind => catalog.entries.find(entry => entry.kind === kind).ref;
+const rejected = (toolName, args, kind) => assert.throws(
+  () => resolveModelToolArguments(toolName, args, catalog),
+  error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE' && error.kind === kind
+);
+
+test('read, run_agent, switch_work_environment 只接受冻结短引用，不接受内部 ID', () => {
+  assert.deepEqual(resolveModelToolArguments('read', { attachmentRef: ref('attachment') }, catalog),
+    { attachmentId: 'internal-attachment' });
+  assert.deepEqual(resolveModelToolArguments('run_agent', { childRef: ref('child') }, catalog),
+    { answerBridgeId: 'internal-child' });
+  assert.deepEqual(resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: ref('workEnvironment') }, catalog),
+    { workEnvironmentId: 'work-env-owned' });
+  assert.throws(() => resolveModelToolArguments('read', { attachmentRef: 'internal-attachment' }, catalog), error => {
+    assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+    assert.doesNotMatch(error.message, /internal-attachment/, '不能把被拒绝的 canonical ID 又回显给模型');
+    return true;
+  });
+  for (const [tool, canonical, target, kind] of [
+    ['read', 'attachmentId', 'internal-attachment', 'attachment'],
+    ['run_agent', 'answerBridgeId', 'internal-child', 'child'],
+    ['switch_work_environment', 'workEnvironmentId', 'work-env-owned', 'workEnvironment']
+  ]) {
+    rejected(tool, { [canonical]: target }, kind);
+    rejected(tool, { [canonical]: target, [kind === 'child' ? 'childRef' : kind === 'attachment' ? 'attachmentRef' : 'workEnvironmentRef']: ref(kind) }, kind);
+  }
+  rejected('run_agent', { answerBridgeIds: ['internal-child'] }, 'child');
+  rejected('run_agent', { childRefs: [ref('child')], answerBridgeIds: ['internal-child'] }, 'child');
+  for (const args of [{ attachmentRef: 'F999' }, { attachmentRef: ref('process') }, { attachmentRef: 7 }]) {
+    rejected('read', args, 'attachment');
+  }
+});
+
+for (const tool of ['bash', 'shell']) {
+  test(`${tool} 执行与后台观察只接受当前目录授权的 P#/O#，拒绝所有内部 ID`, () => {
+    const processRef = ref('process');
+    const cursor = ref('cursor');
+    const output = { mode: 'output', processRef, cursor };
+    assert.deepEqual(resolveModelToolArguments(tool, output, catalog), {
+      mode: 'output', processId: 'internal-process', outputHandle: 'rk-process-output:cursor-one'
+    });
+    assert.deepEqual(output, { mode: 'output', processRef, cursor }, '短引用转换不得修改模型原参数');
+    assert.deepEqual(resolveModelToolArguments(tool, { mode: 'output', processRef }, catalog),
+      { mode: 'output', processId: 'internal-process' }, '首个输出页面不需要游标');
+    assert.deepEqual(resolveModelToolArguments(tool, { mode: 'kill', processRef }, catalog),
+      { mode: 'kill', processId: 'internal-process' });
+    assert.deepEqual(resolveModelToolArguments(tool, { command: 'pwd', explanation: 'inspect', foregroundWaitMs: 0 }, catalog),
+      { command: 'pwd', explanation: 'inspect', foregroundWaitMs: 0 });
+    assert.throws(() => resolveModelToolArguments(tool, { mode: 'output' }, catalog), error => {
+      assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+      assert.match(error.message, /mode=output\/kill.*processRef/);
+      return true;
+    });
+    assert.throws(() => resolveModelToolArguments(tool, { mode: 'kill', processRef, cursor }, catalog), error => {
+      assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+      assert.match(error.message, /cursor.*mode=output/);
+      return true;
+    });
+
+    for (const args of [
+      { mode: 'output' }, { mode: 'kill' }, { mode: 'output', processRef: '' },
+      { mode: 'output', processRef: 'P999' }, { mode: 'output', processRef: ref('child') },
+      { mode: 'output', processRef: 3 }, { mode: 'kill', processRef, cursor },
+      { mode: 'execute', processRef, command: 'pwd', foregroundWaitMs: 0 }
+    ]) rejected(tool, args, 'process');
+    for (const args of [
+      { mode: 'output', processId: 'internal-process' },
+      { mode: 'kill', processId: 'internal-process', processRef },
+      { command: 'pwd', processId: 'internal-process', foregroundWaitMs: 0 }
+    ]) rejected(tool, args, 'process');
+    for (const args of [
+      { mode: 'output', processRef, cursor: 'O999' },
+      { mode: 'output', processRef, cursor: ref('conversation') },
+      { mode: 'output', processRef, outputHandle: 'rk-process-output:cursor-one' },
+      { mode: 'output', processRef, cursor, outputHandle: 'rk-process-output:cursor-one' }
+    ]) rejected(tool, args, 'cursor');
+  });
+}
+
+test('transfer_files 不把可猜测的 work-env ID 当作短引用；current 和目录授权 W# 可用', () => {
+  const transfers = [
+    { fromEnvironment: 'current', fromPath: 'a.txt', toEnvironment: ref('workEnvironment'), toPath: 'b.txt' }
+  ];
+  assert.deepEqual(resolveModelToolArguments('transfer_files', { transfers }, catalog), {
+    transfers: [{ ...transfers[0], toEnvironment: 'work-env-owned' }]
+  });
+  rejected('transfer_files', { transfers: [{ ...transfers[0], toEnvironment: 'work-env-owned' }] }, 'workEnvironment');
+  rejected('transfer_files', { transfers: [{ ...transfers[0], toEnvironment: 'W999' }] }, 'workEnvironment');
+});
+
+test('未知短引用的内核失败保留 P999/C999，已知 canonical ID 仍脱敏', () => {
+  // 目录目标 "999" 与未知短引用重叠，不能把 P999/C999 改写成似乎有权的 PC1/CC1。
+  const overlapping = buildModelHandleCatalog([{ processId: 'internal-process' }],
+    [{ kind: 'conversation', ref: 'C1', target: '999' }]);
+  for (const [tool, args, unknown] of [
+    ['bash', { mode: 'output', processRef: 'P999' }, 'P999'],
+    ['send_agent_message', { conversationRef: 'C999' }, 'C999']
+  ]) {
+    let error;
+    try {
+      resolveModelToolArguments(tool, args, overlapping);
+      assert.fail('未知短引用必须在内核解析时被拒绝');
+    } catch (caught) {
+      assert.equal(caught.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+      error = caught.message;
+    }
+    assert.match(error, new RegExp(unknown));
+    assert.deepEqual(projectToolResultForModel(tool, {
+      status: 'failed', detail: { code: 'invalid_model_handle_reference', error }
+    }, overlapping), {
+      status: 'failed', detail: { code: 'invalid_model_handle_reference', error }
+    });
+  }
+  assert.deepEqual(projectToolResultForModel('bash', {
+    status: 'failed', detail: {
+      code: 'invalid_model_handle_reference', error: '未知引用：P999；诊断 internal-process；目标 999'
+    }
+  }, overlapping), {
+    status: 'failed', detail: {
+      code: 'invalid_model_handle_reference', error: '未知引用：P999；诊断 P1；目标 C1'
+    }
+  }, '错误不能因为自报 code 就保留其它 canonical ID');
+});
+
+test('MCP 工具伪造引用失败 code 时不能绕过深层结果 ID 脱敏', () => {
+  const result = projectToolResultForModel('example_mcp_tool', {
+    status: 'succeeded',
+    detail: {
+      result: {
+        structuredContent: {
+          code: 'invalid_model_handle_reference',
+          error: 'internal-process',
+          nested: [{ code: 'invalid_model_handle_reference', error: 'internal-process' }]
+        }
+      }
+    }
+  }, buildModelHandleCatalog([{ processId: 'internal-process' }]));
+  assert.deepEqual(result, {
+    status: 'succeeded',
+    detail: {
+      result: {
+        structuredContent: {
+          code: 'invalid_model_handle_reference',
+          error: 'P1',
+          nested: [{ code: 'invalid_model_handle_reference', error: 'P1' }]
+        }
+      }
+    }
+  });
+  assert.doesNotMatch(JSON.stringify(result), /internal-process/);
+  assert.deepEqual(projectToolResultForModel('example_mcp_tool', {
+    status: 'failed', detail: { code: 'invalid_model_handle_reference', error: 'internal-process' }
+  }, buildModelHandleCatalog([{ processId: 'internal-process' }])), {
+    status: 'failed', detail: { code: 'invalid_model_handle_reference', error: 'P1' }
+  }, '失败外壳也不能由第三方结果自报 code 获得豁免');
+  assert.deepEqual(projectToolResultForModel('example_mcp_tool', {
+    status: 'succeeded', detail: { message: 'work-env-P999；未知引用 P999' }
+  }, buildModelHandleCatalog([{ workEnvironmentId: 'work-env-P999' }])), {
+    status: 'succeeded', detail: { message: 'W1；未知引用 P999' }
+  }, '完整 canonical ID 可包含短引用外形，不得被词元保护误跳过');
+});
+
+for (const name of ['bash', 'shell']) {
+  test(`${name} execute 必填 foregroundWaitMs，错误不执行命令；边界值仍可用`, async () => {
+    const runs = [];
+    const command = {
+      toolName: name, description: 'Test command',
+      async run(input) { runs.push(input); return { status: 'completed', exitCode: 0 }; }
+    };
+    const tool = createCommandTool(command);
+    const properties = tool.declaration.parameters.properties;
+    assert.match(properties.foregroundWaitMs.description, /Required for mode=execute/);
+    assert.equal(properties.foregroundWaitMs.type, 'integer');
+    const args = { command: 'pwd', explanation: 'Inspect working directory' };
+    for (const invalid of [undefined, null, -1, 60_001, 0.5, '0']) {
+      const response = await tool.execute({ ...args, foregroundWaitMs: invalid }, { command });
+      assert.equal(response.ok, false);
+      assert.match(response.output, /foregroundWaitMs/);
+    }
+    assert.equal(runs.length, 0);
+    for (const wait of [0, 60_000]) {
+      const response = await tool.execute({ ...args, foregroundWaitMs: wait }, { command });
+      assert.equal(response.ok, true);
+    }
+    assert.deepEqual(runs.map(input => input.foregroundWaitMs), [0, 60_000]);
+  });
+
+  test(`${name} output/kill 缺失、类型错误或额外游标返回一致可诊断错误，合法 ID 可用`, async () => {
+    const reads = [], kills = [];
+    const command = {
+      toolName: name, description: 'Test command',
+      readOutput(processId) { reads.push(processId); return { processId, stdout: 'ready' }; },
+      kill(processId) { kills.push(processId); return { processId, status: 'killed' }; }
+    };
+    const tool = createCommandTool(command);
+    for (const mode of ['output', 'kill']) {
+      for (const bad of [undefined, '', '   ', 3, {}, null]) {
+        const response = await tool.execute({ mode, processId: bad }, { command });
+        assert.equal(response.ok, false, `${mode} 必须拒绝 ${String(bad)}`);
+        assert.match(response.output, /processId/);
+        assert.match(response.output, new RegExp(`mode=${mode}`));
+      }
+      const valid = await tool.execute({ mode, processId: ' internal-process ' }, { command });
+      assert.equal(valid.ok, true);
+    }
+    assert.deepEqual(reads, ['internal-process']);
+    assert.deepEqual(kills, ['internal-process']);
+    const killCursor = await tool.execute({ mode: 'kill', processId: 'internal-process', outputHandle: 'opaque' }, { command });
+    assert.equal(killCursor.ok, false);
+    assert.match(killCursor.output, /outputHandle/);
+    assert.deepEqual(kills, ['internal-process'], 'kill 不应静默丢弃额外的输出游标');
+  });
+}
