@@ -3152,7 +3152,12 @@ export class ReliableAgentLoop {
     await this.absorbRuntimeDeliveryInputs(turnId);
   }
 
-  private async absorbRuntimeDeliveryInputs(turnId: string): Promise<number> {
+  /**
+   * Takes committed runtime input into this Turn's Context at a request boundary. A Turn that is
+   * ending (`routed: 'leave'`) still takes in results of its own work, but leaves results routed in
+   * from another source Turn to its terminal commit, which passes them on to the next Turn.
+   */
+  private async absorbRuntimeDeliveryInputs(turnId: string, routed: 'take' | 'leave' = 'take'): Promise<number> {
     const deliveries = (await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_turn_id: turnId,
       phase: 'current_turn',
@@ -3162,7 +3167,10 @@ export class ReliableAgentLoop {
       || String(left.id).localeCompare(String(right.id))
     );
     for (const delivery of deliveries) {
-      await this.runtimeDeliveries.advance(requireId(delivery.id, 'RuntimeDelivery.id'));
+      await this.runtimeDeliveries.advance(
+        requireId(delivery.id, 'RuntimeDelivery.id'),
+        routed === 'take' ? { boundaryTurnId: turnId } : {}
+      );
     }
     const pending = (await listAllDomainRows(this.database, 'PendingTurnInput', {
       turn_id: turnId,
@@ -3234,7 +3242,7 @@ export class ReliableAgentLoop {
         reason: `Turn observed ${String(request.input_kind)} at ${stage}.`
       });
       await this.closeInterruptedToolContext(turnId, requireId(request.id, 'PendingTurnInput.id'), pendingToolCallId);
-      await this.absorbRuntimeDeliveryInputs(turnId);
+      await this.absorbRuntimeDeliveryInputs(turnId, 'leave');
       try {
         await this.turns.terminal({
           source: { kind: 'internal', key: `agent-loop:${turnId}:termination-request:${request.id}` },
@@ -3453,7 +3461,7 @@ export class ReliableAgentLoop {
         sourcePrefix: `agent-loop:${turnId}:failed:${stableDigest(reason)}:native-closure`,
         scope: 'terminating_turn'
       });
-      await this.absorbRuntimeDeliveryInputs(turnId);
+      await this.absorbRuntimeDeliveryInputs(turnId, 'leave');
       try {
         await this.turns.terminal({
           source: {

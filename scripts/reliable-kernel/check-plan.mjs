@@ -87,6 +87,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/native-context-closure.test.mjs',
   'tests/reliable-kernel/native-chain-recovery.test.mjs',
   'tests/reliable-kernel/runtime-delivery-running-turn.test.mjs',
+  'tests/reliable-kernel/child-final-answer.test.mjs',
   'tests/reliable-kernel/native-usage-observation.test.mjs',
   'tests/reliable-kernel/task-live-feed.test.mjs',
   'tests/reliable-kernel/cross-conversation-tools.test.mjs',

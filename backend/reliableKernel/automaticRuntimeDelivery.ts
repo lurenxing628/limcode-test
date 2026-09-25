@@ -67,6 +67,39 @@ interface DeliverySourceAuthority {
 }
 
 const TERMINAL_FAILURES = new Set(['interrupted', 'cancelled', 'failed', 'outcome_unknown']);
+/** Reads of the routed delivery set a final-output fence may redo after losing a routing race. */
+const FINAL_FENCE_ATTEMPTS = 3;
+const ROUTED_DELIVERY_SET_CHANGED = 'RuntimeDeliveryRepository transaction assertExactIds failed.';
+
+/**
+ * The source Turn a Process or child-answer result belongs to: the Turn that started the Process,
+ * or the parent Turn that spawned the answering child. Collaboration messages have no source Turn
+ * of their own, and incomplete source facts resolve to null so the caller keeps the Turn's own rules.
+ */
+export async function runtimeDeliverySourceTurn(database: RuntimeDatabase, inboxItemIdInput: string): Promise<string | null> {
+  const get = async (domain: string, id: unknown): Promise<DomainRow | null> => {
+    if (typeof id !== 'string' || id.length === 0) return null;
+    return (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | null;
+  };
+  const first = async (domain: string, where: DomainRow): Promise<DomainRow | null> => {
+    const rows = (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({ where, limit: 2 })])).snapshot[0] as DomainRow[];
+    return rows.length === 1 ? rows[0] : null;
+  };
+  const inbox = await get('RuntimeInboxItem', requireId(inboxItemIdInput, 'inboxItemId'));
+  if (inbox?.source_kind === 'process_receipt') {
+    const receipt = await get('ProcessReceipt', inbox.source_id);
+    const source = receipt ? await first('ProcessCompletionSourceLink', { process_id: receipt.process_id }) : null;
+    return typeof source?.source_turn_id === 'string' ? source.source_turn_id : null;
+  }
+  if (inbox?.source_kind === 'answer_submission') {
+    const submission = await get('AnswerSubmission', inbox.source_id);
+    const bridge = submission ? await get('AnswerBridge', submission.answer_bridge_id) : null;
+    const parent = bridge ? await first('ChildExecutionParentLink', { child_execution_id: bridge.child_execution_id }) : null;
+    return typeof parent?.parent_turn_id === 'string' ? parent.parent_turn_id : null;
+  }
+  return null;
+}
+
 /**
  * One fail-closed policy for automatic Process/Child answer delivery.
  *
@@ -84,8 +117,10 @@ export class AutomaticRuntimeDeliveryRouter {
   ) {}
 
   /**
-   * Fences a no-tool-call Provider result before it becomes visible. A delivery that won first
-   * makes this return false so the Agent loop absorbs it and asks the model for a new final answer.
+   * Fences a no-tool-call Provider result before it becomes visible. A delivery of this Turn's own
+   * work that won first makes this return false so the Agent loop absorbs it and asks the model for
+   * a new final answer. A result routed in from another source Turn never discards the answer: the
+   * fence moves it on to the next Turn in the same transaction.
    */
   public async establishFinalOutputFence(input: {
     turnId: string;
@@ -94,18 +129,32 @@ export class AutomaticRuntimeDeliveryRouter {
     const turnId = requireId(input.turnId, 'turnId');
     const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
     const fenceId = stablePhaseFId('turn_final_output_fence', turnId, modelRequestId);
+    for (let attempt = 1; ; attempt += 1) {
+      const outcome = await this.tryEstablishFinalOutputFence(turnId, modelRequestId, fenceId);
+      // A routed result committed between the read and the CAS only needs a fresh read.
+      if (outcome !== 'routed_delivery_raced' || attempt >= FINAL_FENCE_ATTEMPTS) {
+        return { established: outcome === 'established', fenceId };
+      }
+    }
+  }
+
+  private async tryEstablishFinalOutputFence(
+    turnId: string,
+    modelRequestId: string,
+    fenceId: string
+  ): Promise<'established' | 'refused' | 'routed_delivery_raced'> {
     const existing = await this.list('TurnFinalOutputFence', { turn_id: turnId }, 2);
     if (existing.length > 1) throw new Error(`Turn ${turnId} has multiple final-output fences.`);
     if (existing.length === 1) {
       assertFinalFenceReplay(existing[0], fenceId, turnId, modelRequestId);
-      return { established: true, fenceId };
+      return 'established';
     }
     const [turn, request] = await Promise.all([
       this.requireExisting('Turn', turnId),
       this.requireExisting('ModelRequest', modelRequestId)
     ]);
     if (turn.status !== 'active' || request.turn_id !== turnId || request.status !== 'terminal') {
-      return { established: false, fenceId };
+      return 'refused';
     }
     // Legacy rule: a final-output fence requires a no-tool-call request. The native exception must
     // atomically prove every candidate-linked call terminal, context-closed and server-admitted —
@@ -118,8 +167,15 @@ export class AutomaticRuntimeDeliveryRouter {
       ];
     } else {
       const proof = await this.buildNativeDeliveredCallGuard(sourceLinks);
-      if (!proof) return { established: false, fenceId };
+      if (!proof) return 'refused';
       callGuardSteps = proof;
+    }
+    const pendingWhere = { target_turn_id: turnId, phase: 'current_turn', state: 'pending' };
+    const pending = await listAllDomainRows(this.database, 'RuntimeDelivery', pendingWhere);
+    const routed: DomainRow[] = [];
+    for (const delivery of pending) {
+      if (!await this.isRoutedInto(delivery, turnId)) return 'refused';
+      routed.push(delivery);
     }
     const now = new Date().toISOString();
     try {
@@ -131,11 +187,14 @@ export class AutomaticRuntimeDeliveryRouter {
           status: 'terminal'
         }),
         ...callGuardSteps,
-        DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertNone({
-          target_turn_id: turnId,
-          phase: 'current_turn',
-          state: 'pending'
-        }),
+        DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds(
+          pendingWhere,
+          routed.map((delivery) => requireId(delivery.id, 'RuntimeDelivery.id'))
+        ),
+        ...routed.map((delivery) => DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(
+          requireId(delivery.id, 'RuntimeDelivery.id'),
+          { phase: 'next_turn', target_turn_id: null, updated_at: now }
+        )),
         DOMAIN_REPOSITORIES.domain('PendingTurnInput').assertNone({
           turn_id: turnId,
           input_kind: 'runtime_delivery',
@@ -148,20 +207,44 @@ export class AutomaticRuntimeDeliveryRouter {
           created_at: now
         })
       ]);
-      return { established: true, fenceId };
+      return 'established';
     } catch (error) {
       const raced = await this.list('TurnFinalOutputFence', { turn_id: turnId }, 2);
       if (raced.length === 1) {
         assertFinalFenceReplay(raced[0], fenceId, turnId, modelRequestId);
-        return { established: true, fenceId };
+        return 'established';
       }
-      if (isTransactionAssertionFailure(error) || sqliteUniqueFailureIncludes(error, [
+      if (isTransactionAssertionFailure(error)) {
+        return (error as Error).message === ROUTED_DELIVERY_SET_CHANGED ? 'routed_delivery_raced' : 'refused';
+      }
+      if (sqliteUniqueFailureIncludes(error, [
         'turn_final_output_fence.id',
         'turn_final_output_fence.turn_id',
         'turn_final_output_fence.model_request_id'
-      ])) return { established: false, fenceId };
+      ])) return 'refused';
       throw error;
     }
+  }
+
+  /**
+   * The Process or child-answer source Turn of a delivery, or null when it has none (a
+   * collaboration message) or its source facts are incomplete. Such a delivery is never "routed".
+   */
+  public deliverySourceTurn(inboxItemId: string): Promise<string | null> {
+    return runtimeDeliverySourceTurn(this.database, inboxItemId);
+  }
+
+  /**
+   * True when a pending current_turn delivery was routed into this Turn from another, completed
+   * source Turn: the result is data for the running Turn, never part of this Turn's own work.
+   */
+  public async isRoutedInto(delivery: DomainRow, turnId: string): Promise<boolean> {
+    if (delivery.phase !== 'current_turn' || delivery.target_turn_id !== turnId) return false;
+    const sourceTurnId = await runtimeDeliverySourceTurn(
+      this.database,
+      requireId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
+    );
+    return sourceTurnId !== null && sourceTurnId !== turnId;
   }
 
   /**

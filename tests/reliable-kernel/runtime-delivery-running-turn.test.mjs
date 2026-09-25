@@ -207,6 +207,122 @@ test('an interrupted source Turn never gains delivery authority because another 
   });
 });
 
+test('a running Turn never takes in results for a child lineage, a child Turn, a displayed final answer or a maintenance Turn', { timeout: 30000 }, async t => {
+  const expectNextTurn = async (router, inboxItemId, sourceTurnId, label) => {
+    const decision = await router.resolve({ inboxItemId, targetConversationId: CONVERSATION, sourceTurnId });
+    assert.equal(decision.phase, 'next_turn', label);
+    assert.equal(decision.targetTurnId, null, label);
+    assert.equal(decision.reason, 'source_turn_completed', label);
+  };
+  await t.test('the source Turn belongs to a child lineage', () => withKernel(async ({ router, startTurn, endTurn, inbox, childLineage }) => {
+    const source = await startTurn('child-source');
+    await endTurn(source, 'completed');
+    await startTurn('unrelated-running');
+    await childLineage('child-source-lineage', [source.turnId]);
+    await expectNextTurn(router, await inbox('child-source-result'), source.turnId,
+      'a child keeps strict per-generation routing instead of joining whatever Turn runs');
+  }));
+  await t.test('the running Turn is a child generation', () => withKernel(async ({ router, startTurn, endTurn, inbox, childLineage }) => {
+    const source = await startTurn('top-level-source');
+    await endTurn(source, 'completed');
+    const running = await startTurn('child-running');
+    await childLineage('running-child-lineage', [running.turnId]);
+    await expectNextTurn(router, await inbox('child-target-result'), source.turnId, 'a child Turn never takes in foreign results');
+  }));
+  await t.test('the running Turn already fenced its final answer', () => withKernel(async ({ router, startTurn, endTurn, inbox, finalRequest }) => {
+    const source = await startTurn('fenced-source');
+    await endTurn(source, 'completed');
+    const running = await startTurn('fenced-running');
+    const modelRequestId = await finalRequest(running);
+    assert.equal((await router.establishFinalOutputFence({ turnId: running.turnId, modelRequestId })).established, true);
+    await expectNextTurn(router, await inbox('fenced-result'), source.turnId, 'a displayed final answer is never extended');
+  }));
+  await t.test('the running Turn is a manual compression', () => withKernel(async ({ app, router, startTurn, endTurn, inbox }) => {
+    const source = await startTurn('maintenance-source');
+    await endTurn(source, 'completed');
+    const maintenance = await app.turns.runtimeContinuation({ source: { kind: 'internal', key: 'fixture-maintenance' },
+      conversationId: CONVERSATION, leaseOwnerId: 'fixture', hostBootId: app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 300000).toISOString(), sourceTurnId: source.turnId,
+      maintenance: { kind: 'manual_context_compression', version: 1, compressSegmentCount: 1, commandSourceKey: 'fixture-maintenance' } });
+    assert.ok(maintenance.admitted && maintenance.turnId);
+    await expectNextTurn(router, await inbox('maintenance-result'), source.turnId, 'a maintenance Turn takes nothing in');
+  }));
+});
+
+test('a final answer fences out a result routed into its Turn and hands it to the next Turn, but still yields to its own results', { timeout: 30000 }, async () => {
+  await withKernel(async ({ app, router, startTurn, endTurn, processResult, finalRequest, rows }) => {
+    const source = await startTurn('routed-source');
+    await endTurn(source, 'completed');
+    const running = await startTurn('answering-turn');
+    const routed = await app.runtime.deliveries.createAutomatic({ inboxItemId: await processResult('routed-process', source.turnId),
+      targetConversationId: CONVERSATION, sourceTurnId: source.turnId });
+    assert.equal(routed.delivery.phase, 'current_turn');
+    assert.equal(routed.delivery.target_turn_id, running.turnId);
+    const own = await app.runtime.deliveries.createAutomatic({ inboxItemId: await processResult('own-process', running.turnId),
+      targetConversationId: CONVERSATION, sourceTurnId: running.turnId });
+    assert.equal(own.delivery.target_turn_id, running.turnId);
+    const modelRequestId = await finalRequest(running);
+    assert.equal((await router.establishFinalOutputFence({ turnId: running.turnId, modelRequestId })).established, false,
+      'a result of the Turn\'s own work still makes it answer again with that result');
+    assert.equal((await rows('RuntimeDelivery', { id: routed.delivery.id }))[0].phase, 'current_turn', 'a refused fence moves nothing');
+    await kernel.runWithExecutionLeaseFence(running.fence, () => app.runtime.deliveries.advance(own.delivery.id, { boundaryTurnId: running.turnId }));
+    for (const input of await rows('PendingTurnInput', { turn_id: running.turnId, input_kind: 'runtime_delivery' })) {
+      await app.runtime.deliveries.markInputHandled(input.id);
+    }
+    const fenced = await router.establishFinalOutputFence({ turnId: running.turnId, modelRequestId });
+    assert.equal(fenced.established, true, 'a result routed in from another Turn never discards the streamed final answer');
+    const [moved] = await rows('RuntimeDelivery', { id: routed.delivery.id });
+    assert.equal(moved.state, 'pending');
+    assert.equal(moved.phase, 'next_turn', 'the fence hands the routed result to the next Turn in the same transaction');
+    assert.equal(moved.target_turn_id, null);
+    assert.equal((await rows('TurnFinalOutputFence', { turn_id: running.turnId })).length, 1);
+  });
+});
+
+test('a stopped Turn hands a result routed into it to the next Turn instead of re-deciding it as its own', { timeout: 30000 }, async () => {
+  await withKernel(async ({ app, router, startTurn, endTurn, processResult, rows }) => {
+    const source = await startTurn('stop-source');
+    await endTurn(source, 'completed');
+    const running = await startTurn('stopped-running');
+    const routed = await app.runtime.deliveries.createAutomatic({ inboxItemId: await processResult('stop-process', source.turnId),
+      targetConversationId: CONVERSATION, sourceTurnId: source.turnId });
+    assert.equal(routed.delivery.target_turn_id, running.turnId);
+    // Only the Turn itself injects a routed result, at a request boundary; recovery does not.
+    assert.equal((await app.runtime.deliveries.advance(routed.delivery.id)).changed, false);
+    assert.equal((await rows('PendingTurnInput', { turn_id: running.turnId })).length, 0);
+    await endTurn(running, 'interrupted');
+    const [moved] = await rows('RuntimeDelivery', { id: routed.delivery.id });
+    assert.equal(moved.phase, 'next_turn', 'the stopping Turn\'s terminal commit passes the result on');
+    assert.equal(moved.target_turn_id, null);
+    assert.equal(moved.state, 'pending');
+    await app.runtime.deliveries.advance(routed.delivery.id);
+    assert.equal((await rows('RuntimeDelivery', { id: routed.delivery.id }))[0].phase, 'next_turn',
+      'the stopped Turn is only the destination, never the source that decides it');
+    const decision = await router.resolve({ inboxItemId: routed.delivery.inbox_item_id, targetConversationId: CONVERSATION,
+      sourceTurnId: source.turnId });
+    assert.equal(decision.phase, 'next_turn');
+    assert.equal(decision.reason, 'source_turn_completed');
+  });
+});
+
+test('a routed result still aimed at a Turn that already ended is re-decided from its real source Turn', { timeout: 30000 }, async () => {
+  await withKernel(async ({ app, startTurn, endTurn, processResult, rows }) => {
+    const source = await startTurn('ended-source');
+    await endTurn(source, 'completed');
+    const ended = await startTurn('ended-destination');
+    await endTurn(ended, 'interrupted');
+    const inboxItemId = await processResult('late-process', source.turnId);
+    const at = new Date().toISOString();
+    await app.database.transaction([repo('RuntimeDelivery').insert({ id: 'late-routed-delivery', inbox_item_id: inboxItemId,
+      target_conversation_id: CONVERSATION, target_turn_id: ended.turnId, phase: 'current_turn', attempt_seq: 1n,
+      retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: at, updated_at: at })]);
+    await app.runtime.deliveries.advance('late-routed-delivery');
+    const [delivery] = await rows('RuntimeDelivery', { id: 'late-routed-delivery' });
+    assert.equal(delivery.phase, 'next_turn', 'a completed source continues; the stopped destination never makes it notify-only');
+    assert.equal(delivery.target_turn_id, null);
+  });
+});
+
 test('an answer for a stopped parent Turn that a newer child generation superseded settles instead of retrying forever', { timeout: 30000 }, async () => {
   await withKernel(async ({ app, startTurn, endTurn, childAnswer, wakes, rows }) => {
     const parent = await startTurn('stopped-parent');

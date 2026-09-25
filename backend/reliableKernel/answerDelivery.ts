@@ -1435,7 +1435,15 @@ export class RuntimeDeliveryControlPlane {
     return { ...(await this.summaryFromRow(row)), retryOfDeliveryId: failedDeliveryId, commitSeq: commit.commitSeq };
   }
 
-  public async advance(deliveryIdInput: string): Promise<RuntimeDeliveryAdvanceResult> {
+  /**
+   * Moves one pending delivery toward its target. A result routed into a running Turn from another
+   * source Turn is injected only by that Turn itself at a request boundary (`boundaryTurnId`), so a
+   * Turn that is stopping or failing never swallows it: its terminal commit passes it on instead.
+   */
+  public async advance(
+    deliveryIdInput: string,
+    options: { boundaryTurnId?: string } = {}
+  ): Promise<RuntimeDeliveryAdvanceResult> {
     const deliveryId = requirePhaseFId(deliveryIdInput, 'deliveryId');
     const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
     requireDeliveryState(delivery.state);
@@ -1459,16 +1467,26 @@ export class RuntimeDeliveryControlPlane {
     }
     if (!targetTurn) throw new Error('current_turn delivery requires a target Turn.');
     if (targetTurn.conversation_id !== conversation.id) return this.failTargetGone(delivery);
+    const inboxItemId = requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id');
+    const targetTurnId = requirePhaseFId(targetTurn.id, 'Turn.id');
+    // Authority always comes from the delivery's real source Turn; a Turn it was routed into is only
+    // its destination and never re-decides it as if it were the source.
+    const sourceTurnId = await this.automaticDeliveryRouter.deliverySourceTurn(inboxItemId) ?? targetTurnId;
     const decision = await this.automaticDeliveryRouter.resolve({
-      inboxItemId: requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id'),
+      inboxItemId,
       targetConversationId: requirePhaseFId(conversation.id, 'Conversation.id'),
-      sourceTurnId: requirePhaseFId(targetTurn.id, 'Turn.id')
+      sourceTurnId
     });
     if (
       targetTurn.status === ACTIVE_TURN
       && decision.phase === 'current_turn'
       && decision.targetTurnId === targetTurn.id
-    ) return this.inject(delivery, targetTurn, decision.authoritySteps);
+    ) {
+      if (sourceTurnId !== targetTurnId && options.boundaryTurnId !== targetTurnId) {
+        return { ...(await this.summaryFromRow(delivery)), changed: false };
+      }
+      return this.inject(delivery, targetTurn, decision.authoritySteps, options);
+    }
     if (targetTurn.status !== ACTIVE_TURN && targetTurn.status !== TERMINATED_TURN) {
       throw new Error(`RuntimeDelivery target Turn has unsupported status ${String(targetTurn.status)}.`);
     }
@@ -1534,9 +1552,10 @@ export class RuntimeDeliveryControlPlane {
   /**
    * Called inside a Turn's terminal commit. Collaboration messages routed into that Turn but never
    * taken in move to next_turn in the same transaction, so the admission of the next Turn always
-   * sees them instead of racing the wake that would otherwise move them later. Board notices
-   * expire with their Turn through the router; Process and child answers keep their source-Turn
-   * routing.
+   * sees them instead of racing the wake that would otherwise move them later. A Process or child
+   * result routed in from another source Turn moves on the same way: the ending Turn never took it
+   * in, so the next Turn (or a continuation of its own) must. Board notices expire with their Turn
+   * through the router; results of this Turn's own work keep their source-Turn routing.
    */
   public async prepareTerminalDeliverySteps(turnIdInput: string, nowInput: string): Promise<RepositoryTransactionStep[]> {
     const turnId = requirePhaseFId(turnIdInput, 'turnId');
@@ -1550,7 +1569,15 @@ export class RuntimeDeliveryControlPlane {
     )];
     for (const delivery of deliveries) {
       const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
-      if (inbox.source_kind !== 'collaboration_message') continue;
+      if (inbox.source_kind !== 'collaboration_message') {
+        if (!await this.automaticDeliveryRouter.isRoutedInto(delivery, turnId)) continue;
+        steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(String(delivery.id), {
+          phase: 'next_turn',
+          target_turn_id: null,
+          updated_at: now
+        }));
+        continue;
+      }
       const sources = await this.listRows('CollaborationMessageSourceLink', { message_id: inbox.source_id }, 2);
       if (sources[0]?.source_kind === 'board') continue;
       steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(String(delivery.id), {
@@ -1857,7 +1884,8 @@ export class RuntimeDeliveryControlPlane {
   private async inject(
     delivery: DomainRow,
     targetTurn: DomainRow,
-    authoritySteps: RepositoryTransactionStep[]
+    authoritySteps: RepositoryTransactionStep[],
+    options: { boundaryTurnId?: string }
   ): Promise<RuntimeDeliveryAdvanceResult> {
     const contentObjectId = await this.contentObjectIdForInbox(delivery.inbox_item_id as string);
     if (!contentObjectId) return this.failTargetGone(delivery);
@@ -1877,7 +1905,7 @@ export class RuntimeDeliveryControlPlane {
       if (!isExpectedDeliveryInjectionRace(error)) throw error;
       const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
       if (latest.state === 'consumed') return { ...(await this.summaryFromRow(latest)), changed: false };
-      if (latest.state === 'pending') return this.advance(latest.id as string);
+      if (latest.state === 'pending') return this.advance(latest.id as string, options);
       return { ...(await this.summaryFromRow(latest)), changed: false };
     }
   }
