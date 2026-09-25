@@ -90,6 +90,7 @@ import {
 import { frozenCompressionPolicy, readFrozenTurnAuthority } from './frozenAuthority';
 import { assistantMessageIdFor, TurnOutputControlPlane } from './turnOutput';
 import { ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
+import { childTaskTextForPreview } from './childSkillPreload';
 import type {
   CoordinateCompressionCommand,
   CoordinateCompressionResult
@@ -1453,7 +1454,7 @@ export class ReliableAgentLoop {
       || Number(pendingHandling(b)) - Number(pendingHandling(a))
       || Number(a.status === 'closed') - Number(b.status === 'closed')
       || b.createdAt.localeCompare(a.createdAt) || a.childExecutionId.localeCompare(b.childExecutionId));
-    const preview = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 180);
+    const preview = (text: string) => childTaskTextForPreview(text).replace(/\s+/g, ' ').trim().slice(0, 180);
     const selected = ranked.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
     const children: FrozenRuntimeStatusCard['children'] = selected.map(task => {
       const current = task.currentInputs.filter(source => source.classification === 'task');
@@ -1467,7 +1468,7 @@ export class ReliableAgentLoop {
         queuedTasks: queued.slice(0, 2).map(source => preview(source.text)),
         currentInputCount: current.length, queuedInputCount: queued.length,
         truncated: current.length > 2 || queued.length > 2
-          || [task.initialTask, ...current, ...queued].some(source => source && source.text.replace(/\s+/g, ' ').trim().length > 180),
+          || [task.initialTask, ...current, ...queued].some(source => source && childTaskTextForPreview(source.text).replace(/\s+/g, ' ').trim().length > 180),
         ...(task.execution.termination ? { latestTurnOutcome: task.execution.termination.status } : {}),
         answerAvailable: !!task.result.latestAnswer,
         answerHandling: task.result.handling.some(item => item.answerId === task.result.latestAnswer?.answerId && !!item.handledAt)

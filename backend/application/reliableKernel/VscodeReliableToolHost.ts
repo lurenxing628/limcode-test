@@ -15,7 +15,7 @@ import {
   type ToolResultOut,
   type ToolRuntimeEvent
 } from '../../world/modules/tools/registry';
-import { SKILLS_TOOL_NAME, type GlobalSettingsRecord, type RuleFileRecord, type RuleScope, type SkillDefinitionRecord, type ToolDefinitionRecord, type WorkEnvironmentRecord } from '../../../shared/protocol';
+import { SKILLS_TOOL_NAME, type GlobalSettingsRecord, type RuleFileRecord, type RuleScope, type SkillDefinitionRecord, type SkillPolicyRecord, type ToolDefinitionRecord, type WorkEnvironmentRecord } from '../../../shared/protocol';
 import type {
   ReliableAgentToolDispatchInput,
   ReliableAgentToolPause,
@@ -39,6 +39,7 @@ import { frozenSkillPolicy } from '../../reliableKernel/frozenAuthority';
 import { frozenToolPolicyDocument } from '../../reliableKernel/childExecutionBoundary';
 import { realPathOfNearestExisting } from '../../capabilities/vscodeFs';
 import { lazySkillCatalogWithinPolicy, skillCatalogWithinPolicy } from '../../world/modules/skill/policy';
+import { describeSkillLookupFailure, renderSkillRecord } from '../../world/modules/skill/skillLookup';
 import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 
 export interface VscodeReliableToolHostOptions {
@@ -156,6 +157,32 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   public async refreshSkillCatalog(): Promise<void> {
     await this.skills.refresh();
     this.notifyStateChange();
+  }
+
+  /**
+   * Loads skills by name within one Turn's frozen skill settings, rendered as the model reads them
+   * (a child agent's preloaded skills). A name that is unknown, turned off or ambiguous throws with
+   * the same explanation the skills tool gives.
+   */
+  public async loadSkillsWithinPolicy(
+    names: readonly string[],
+    policy: Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined
+  ): Promise<{ skill: SkillDefinitionRecord; text: string }[]> {
+    const bounded = skillCatalogWithinPolicy(this.skills, policy);
+    const loaded: { skill: SkillDefinitionRecord; text: string }[] = [];
+    let refreshed = false;
+    for (const name of names) {
+      let lookup = bounded.lookup(name);
+      if (lookup.status === 'missing' && !lookup.disabled && !refreshed) {
+        await this.skills.refresh();
+        refreshed = true;
+        lookup = bounded.lookup(name);
+      }
+      if (lookup.status !== 'found') throw new Error(describeSkillLookupFailure(name, lookup, bounded.list()));
+      if (loaded.some((entry) => entry.skill.id === lookup.skill.id)) continue;
+      loaded.push({ skill: { ...lookup.skill }, text: renderSkillRecord(lookup.skill, (await bounded.readBody(lookup.skill)).text) });
+    }
+    return loaded;
   }
 
   public async refreshRulesCatalog(): Promise<void> {

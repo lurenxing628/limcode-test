@@ -17,7 +17,9 @@ const { stablePhaseFId } = fromDist('backend/reliableKernel/phaseFIdentity.js');
 const {
   DEFAULT_MAX_CHILD_AGENT_DEPTH,
   MAX_CHILD_AGENT_DEPTH_CONFIG_KEY,
+  MAX_RUN_AGENT_SKILLS,
   maxChildAgentDepthFromConfig,
+  normalizeRunAgentSkillNames,
   runAgentToolAvailableAtDepth,
   runAgentTool
 } = fromDist('backend/world/modules/tools/definitions/runAgent/index.js');
@@ -42,6 +44,21 @@ test('Agent 工具声明要求显式操作，异步派发与既有任务操作�
     ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree']);
   assert.equal(runAgentTool.declaration.parameters.properties.mode, undefined,
     '旧 mode 不再进入模型工具合同');
+  const skills = runAgentTool.declaration.parameters.properties.skills;
+  assert.deepEqual({ type: skills.type, items: skills.items, maxItems: skills.maxItems },
+    { type: 'array', items: { type: 'string' }, maxItems: 8 });
+  assert.equal(MAX_RUN_AGENT_SKILLS, 8);
+  assert.match(skills.description, /For spawn only/);
+  assert.match(skills.description, /The child does not inherit skills you loaded/);
+  assert.match(runAgentTool.declaration.description, /spawn skills optionally preloads skills/);
+  assert.deepEqual(normalizeRunAgentSkillNames(undefined), []);
+  assert.deepEqual(normalizeRunAgentSkillNames([' pdf ', 'superpowers:brainstorming', 'pdf']), ['pdf', 'superpowers:brainstorming'],
+    '名字去掉首尾空白，重复的只留一个');
+  assert.throws(() => normalizeRunAgentSkillNames('pdf'), /run_agent\.skills must be an array/);
+  assert.throws(() => normalizeRunAgentSkillNames(['pdf', ' ']), /non-empty skill names/);
+  assert.throws(() => normalizeRunAgentSkillNames(Array.from({ length: 9 }, (_, index) => `skill-${index}`)), /at most 8 skills/);
+  assert.equal(runAgentTool.summary({ operation: 'spawn', prompt: 'read the report', skills: ['pdf'] }, {}),
+    'Run worker · skills pdf · read the report');
   assert.deepEqual(readAgentAnswerTool.declaration.parameters.required, ['answerBridgeId']);
   assert.deepEqual(deleteTool.declaration.parameters.required, ['paths']);
 
@@ -198,6 +215,22 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，spawn 与 in
   assert.doesNotMatch(spawnCommand.prompt, /answer_bridge_[a-f0-9]{64}/);
   assert.equal(spawnCommand.prompt.includes(answerBridgeId), false, '子提示不得泄漏 canonical AnswerBridge ID');
   assert.equal(background.disposition, 'settled');
+
+  await assert.rejects(() => coordinator.dispatch({
+    turnId: 'parent-turn',
+    modelRequestId: 'skills-request',
+    toolCallId: 'skills-tool-call',
+    toolName: 'run_agent',
+    arguments: { operation: 'spawn', taskName: 'Preload', prompt: 'read the report', skills: ['pdf'] }
+  }, undefined, frozenRunAgentAuthority(1)), /没有接入技能目录.*没有创建子 Agent/,
+  '没有技能目录的宿主拒绝预载，而不是悄悄丢掉技能');
+  await assert.rejects(() => coordinator.dispatch({
+    turnId: 'parent-turn',
+    modelRequestId: 'send-skills-request',
+    toolCallId: 'send-skills-tool-call',
+    toolName: 'run_agent',
+    arguments: { operation: 'send', answerBridgeId: 'continuation-bridge', prompt: 'continue', skills: ['pdf'] }
+  }), /run_agent\.send does not accept skills/);
 
   await assert.rejects(() => coordinator.dispatch({
     turnId: 'parent-turn',

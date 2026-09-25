@@ -399,6 +399,7 @@ export class VscodeReliableKernelProductRuntime {
         agentLoop: application.agentLoop,
         agents: { resolve: (input) => configuration.resolveAgent(input) },
         modelProfiles: childConversationModelProfiles(configuration.mutations),
+        skills: { loadSkillsWithinPolicy: (names, policy) => toolHost.loadSkillsWithinPolicy(names, policy) },
         deliveryWakeups: application.processDeliveries,
         ownedProcessCleanup: application.childOwnedProcessCleanup,
         cancelTurnExecution: async ({ turnId, reason }) => {

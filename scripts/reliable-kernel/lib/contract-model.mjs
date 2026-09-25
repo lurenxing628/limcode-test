@@ -17,7 +17,7 @@ export const CONTRACT_FILES = [
 
 const CONTRACT_REVISION = '2026-07-31-r4';
 const CLIENT_FEED_CONTRACT_REVISION = '2026-09-25-r3';
-const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r6';
+const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r7';
 // Contracts revised after the base revision; every other contract file stays at CONTRACT_REVISION.
 const FILE_CONTRACT_REVISIONS = new Map([
   ['client-feed.json', CLIENT_FEED_CONTRACT_REVISION],
@@ -1001,6 +1001,11 @@ function validateSubagent(subagent, failures) {
     'model-spawned-children-only-narrow', 'a-Plan-the-user-approves-to-run-in-a-new-conversation', 'authorityBound-executor_agent',
     'global-and-its-own-scopes-still-narrow', 'only-when-its-own-settings-allow-it', 'keeps-the-planning-Turn-model-fallback-and-child-thinking-inheritance']) {
     if (!toolBoundary.includes(marker)) failures.push(`子Agent工具边界规则缺少${marker}`);
+  }
+  const skillPreload = String(subagent?.spawn?.skillPreload ?? '');
+  for (const marker of ['resolved-within-the-skill-settings-frozen-for-the-child-first-Turn', 'fails-the-spawn-before-any-fact-is-written',
+    'lead-the-child-first-input-MessageRevision-in-CAS', 'never-read-skills-again']) {
+    if (!skillPreload.includes(marker)) failures.push(`子Agent预载技能规则缺少${marker}`);
   }
   const collaboration = subagent?.collaboration;
   if (collaboration?.teamScope !== 'derive-root-conversation-from-ChildExecutionParentLink-no-team-table'

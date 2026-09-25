@@ -438,7 +438,10 @@ function childToolArgumentPreview(
       return compactChildActivitySummary(args.command);
     }
     if (toolName === 'run_agent' && typeof args.prompt === 'string') {
-      return compactChildActivitySummary(args.prompt);
+      const skills = Array.isArray(args.skills)
+        ? args.skills.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()))
+        : [];
+      return compactChildActivitySummary(skills.length > 0 ? `技能 ${skills.join(', ')} · ${args.prompt}` : args.prompt);
     }
     if (toolName === 'skills' && typeof args.name === 'string') {
       return compactChildActivitySummary(args.name);

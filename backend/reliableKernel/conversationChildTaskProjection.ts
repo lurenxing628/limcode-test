@@ -12,6 +12,7 @@ import { CHILD_RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE } from './runtimeDeliv
 import type { DomainRow } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { estimateJsonTokens } from './modelTokenEstimator';
+import { childTaskTextForPreview } from './childSkillPreload';
 
 export type ConversationChildTaskScope = 'direct' | 'tree';
 export type ConversationChildTaskSourceState = 'effective' | 'queued' | 'superseded' | 'cancelled' | 'pending' | 'rejected';
@@ -785,7 +786,8 @@ export function readConversationChildTask(
 }
 
 export function childTaskSummary(task: ConversationChildTaskRecord): ConversationChildTaskSummary {
-  const text = task.currentInputs[task.currentInputs.length - 1]?.text ?? task.initialTask?.text;
+  const input = task.currentInputs[task.currentInputs.length - 1]?.text ?? task.initialTask?.text;
+  const text = input === undefined ? undefined : childTaskTextForPreview(input);
   return {
     childExecutionId: task.childExecutionId, answerBridgeId: task.answerBridgeId, depth: task.depth,
     status: task.status, label: task.label.slice(0, 80),
@@ -834,7 +836,7 @@ function sourceLine(label: string, source: ConversationChildTaskSourcePreview): 
 
 function sourcePreview(source: ConversationChildTaskSource): ConversationChildTaskSourcePreview {
   const { text, content: _content, ...identity } = source;
-  return { ...identity, ...previewText(text) };
+  return { ...identity, ...previewText(childTaskTextForPreview(text)) };
 }
 
 function previewText(text: string): { preview: string; truncated: boolean; characters: number } {

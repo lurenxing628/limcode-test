@@ -35,9 +35,12 @@ import {
   type ToolOutcomeStatus,
   type ToolTerminalResult
 } from './effectControlPlane';
-import { frozenModelSelection, frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenModelSelection, frozenSkillPolicy, frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from './frozenAuthority';
 import { childThinkingInheritanceFromAuthority, childThinkingOverrideForSpawn } from './childThinkingInheritance';
-import type { SessionThinkingOverride } from '../../shared/protocol';
+import { SKILLS_TOOL_NAME, type SessionThinkingOverride, type SkillPolicyRecord } from '../../shared/protocol';
+import { estimateTextTokens } from './modelTokenEstimator';
+import { SKILL_TOOL_RESULT_MAX_TOKENS } from './skillToolResultProjection';
+import { normalizeRunAgentSkillNames } from '../world/modules/tools/definitions/runAgent';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import {
   frozenSkillPolicyDocument,
@@ -45,7 +48,7 @@ import {
   readChildExecutionBoundary,
   type ChildExecutionBoundary
 } from './childExecutionBoundary';
-import { canonicalPlainJson } from './plainJson';
+import { canonicalPlainJson, type PlainJsonValue } from './plainJson';
 import {
   isTransactionAssertionFailure,
   optionalPhaseFId,
@@ -91,12 +94,45 @@ export type ChildSpawnSourceSettlement = 'child_handle' | 'external';
 export type ChildSpawnAuthorityBound = 'parent_turn' | 'executor_agent';
 export type ChildSendMode = 'queue_next_turn' | 'interrupt_current_turn';
 
+/**
+ * Skills the parent preloads into a child's first input. The names are part of the spawn identity;
+ * the rendered text is committed with the first input and never read again from disk.
+ */
+export interface ChildSkillPreload {
+  names: readonly string[];
+  /**
+   * Renders the named skills within the skill settings frozen for the child's first Turn, one text
+   * per skill. Called only while the spawn is being created, never on replay or recovery; throws a
+   * model-readable explanation for a name that is unknown, turned off or ambiguous.
+   */
+  load(names: readonly string[], policy: Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined): Promise<readonly string[]>;
+}
+
+import { PRELOADED_SKILLS_HEADER, MAX_PRELOADED_SKILL_BYTES, childInputWithPreloadedSkills, splitPreloadedSkills } from './childSkillPreload';
+export { PRELOADED_SKILLS_HEADER, MAX_PRELOADED_SKILL_BYTES, childInputWithPreloadedSkills };
+
+/**
+ * Tokens a child's preloaded skills may take: half of its frozen context window after the reserved
+ * output. Undefined when the child's model froze no window.
+ */
+function preloadRoomTokens(childAuthority: PlainJsonValue): number | undefined {
+  const authority = childAuthority !== null && typeof childAuthority === 'object' && !Array.isArray(childAuthority) ? childAuthority : {};
+  const record = (value: unknown) => (value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {});
+  const window = record(authority.modelProfile).contextWindowTokens;
+  if (typeof window !== 'number' || !Number.isSafeInteger(window) || window <= 0) return undefined;
+  const output = record(authority.model).maxOutputTokens;
+  const reserved = typeof output === 'number' && Number.isSafeInteger(output) && output > 0 ? output : 0;
+  return Math.max(0, Math.floor((window - reserved) / 2));
+}
+
 export interface ChildExecutionSpawnCommand {
   sourceToolCallId: string;
   childAgentId: string;
   /** Parent Turn's frozen effective model; child-local profiles still have higher precedence. */
   modelFallback: TurnModelOverride;
   prompt: string;
+  /** Loaded within the child's first Turn skill settings and placed before the prompt. */
+  preloadSkills?: ChildSkillPreload;
   /** Inherit only committed completed turns; the new prompt remains a separate child assignment. */
   forkTurns?: ChildForkTurns;
   completionPolicy: ChildCompletionPolicy;
@@ -447,17 +483,19 @@ export class ChildExecutionControlPlane {
         : await this.parentTurnBound(parentTurnId, inheritedBoundary)),
       ...(inheritedThinkingOverride ? { inheritedThinkingOverride } : {})
     }), ids.childTurnId, command.childAgentId);
-    const modelSelection = frozenModelSelection(JSON.parse(asUtf8Text(
+    const childAuthority = JSON.parse(asUtf8Text(
       compiled.authoritySnapshot.content,
       'Child AuthoritySnapshot'
-    )));
+    ));
+    const modelSelection = frozenModelSelection(childAuthority);
+    const input = await this.childFirstInput(command, childAuthority);
     const [requestContent, promptContent, authorityContent] = await Promise.all([
       this.contentStore.prepare(
         this.database,
         canonicalPlainJson(spawnRequestPayload(command, ids)),
         SUBAGENT_SPAWN_CONTENT_TYPE
       ),
-      this.contentStore.prepare(this.database, command.prompt, 'text/plain'),
+      this.contentStore.prepare(this.database, input, 'text/plain'),
       this.contentStore.prepare(
         this.database,
         compiled.authoritySnapshot.content,
@@ -477,7 +515,7 @@ export class ChildExecutionControlPlane {
       messageRevisionId: ids.childMessageRevisionId,
       contentObjectId: promptContent.metadata.id,
       contentByteLength: promptContent.metadata.byte_length,
-      contentEstimatedTokens: estimateStoredMessageContentTokens(command.prompt, 'text/plain'),
+      contentEstimatedTokens: estimateStoredMessageContentTokens(input, 'text/plain'),
       inheritedSegments: inheritedContext.segments
     });
     const steps: RepositoryTransactionStep[] = [
@@ -714,6 +752,43 @@ export class ChildExecutionControlPlane {
       if (!raced) throw error;
       return raced;
     }
+  }
+
+  /**
+   * The child's first input: its prompt, preceded by the skills the parent preloads, rendered within
+   * the skill settings frozen for this same first Turn so the child never gets a skill its Turn
+   * turns off.
+   */
+  private async childFirstInput(
+    command: ReturnType<typeof normalizeSpawnCommand>,
+    childAuthority: PlainJsonValue
+  ): Promise<string> {
+    if (command.skills.length === 0) return command.prompt;
+    // A child whose tools leave out `skills` works without skills; handing it one anyway would bypass that.
+    if (!frozenToolPolicyDocument(childAuthority).allowedTools.includes(SKILLS_TOOL_NAME)) {
+      throw new Error('子 Agent 的工具设置没有开启 skills 工具，不能给它预载技能；没有创建子 Agent。请去掉 skills 参数。');
+    }
+    const texts = await command.loadSkills!(command.skills, frozenSkillPolicy(childAuthority));
+    const fallback = '请少预载几个技能，或在 prompt 里让子 Agent 自己用 skills 工具载入（过长的技能会按行截断并给出续读位置）。';
+    for (const [index, text] of texts.entries()) {
+      const tokens = estimateTextTokens(text);
+      if (tokens > SKILL_TOOL_RESULT_MAX_TOKENS) {
+        throw new Error(`预载技能 ${command.skills[index]} 约 ${tokens} token，超过单个预载技能的上限 ${SKILL_TOOL_RESULT_MAX_TOKENS} token，没有创建子 Agent。${fallback}`);
+      }
+    }
+    const bytes = texts.reduce((total, text) => total + Buffer.byteLength(text, 'utf8'), 0);
+    if (bytes > MAX_PRELOADED_SKILL_BYTES) {
+      throw new Error(`预载的 ${texts.length} 个技能正文共 ${Math.ceil(bytes / 1024)} KB，超过子 Agent 首条输入的预载上限 `
+        + `${MAX_PRELOADED_SKILL_BYTES / 1024} KB，没有创建子 Agent。${fallback}`);
+    }
+    // The first input must leave the child room to work: at most half of what its context window holds
+    // besides the reserved output.
+    const room = preloadRoomTokens(childAuthority);
+    const total = texts.reduce((sum, text) => sum + estimateTextTokens(text), 0);
+    if (room !== undefined && total > room) {
+      throw new Error(`预载的 ${texts.length} 个技能约 ${total} token，超过子 Agent 模型上下文可留给预载的 ${room} token，没有创建子 Agent。${fallback}`);
+    }
+    return childInputWithPreloadedSkills(texts, command.prompt);
   }
 
   public claimSpawnDispatch(effectIntentId: string): Promise<boolean> {
@@ -3249,7 +3324,10 @@ export class ChildExecutionControlPlane {
         SUBAGENT_SPAWN_CONTENT_TYPE
       ).id
       : undefined;
-    const expectedPromptObjectId = this.contentStore.identity(command.prompt, 'text/plain').id;
+    // Preloaded skills were rendered once from disk; a replay checks the committed input carries this prompt.
+    const promptMatches = command.skills.length === 0
+      ? promptRevision.content_object_id === this.contentStore.identity(command.prompt, 'text/plain').id
+      : await this.committedInputCarriesPrompt(promptRevision.content_object_id, command.prompt);
     const parentTurn = await this.requireExisting(
       'Turn',
       requirePhaseFId(links[0].parent_turn_id, 'ChildExecutionParentLink.parent_turn_id')
@@ -3291,7 +3369,7 @@ export class ChildExecutionControlPlane {
       || authority.turn_id !== ids.childTurnId
       || promptRevision.message_id !== ids.childMessageId
       || promptRevision.role !== 'user'
-      || promptRevision.content_object_id !== expectedPromptObjectId
+      || !promptMatches
       || promptMembership.conversation_id !== ids.childConversationId
       || promptMembership.message_id !== ids.childMessageId
       || contextHeads.length !== 1
@@ -3877,6 +3955,13 @@ export class ChildExecutionControlPlane {
     return requireRows(barrier.snapshot[0], `${domain} list`);
   }
 
+  private async committedInputCarriesPrompt(contentObjectId: unknown, prompt: string): Promise<boolean> {
+    const metadata = await this.requireExisting('ContentObject', requirePhaseFId(contentObjectId, 'MessageRevision.content_object_id'));
+    if (metadata.content_type !== 'text/plain') return false;
+    const text = (await this.contentStore.read(metadata as ContentObjectMetadata)).toString('utf8');
+    return splitPreloadedSkills(text)?.prompt === prompt;
+  }
+
   private async maybeGet(domain: string, id: string): Promise<DomainRow | null> {
     const barrier = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)]);
     return barrier.snapshot[0] as DomainRow | null;
@@ -3912,11 +3997,17 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   if (authorityBound === 'executor_agent' && sourceSettlement !== 'external') {
     throw new TypeError('executor_agent authority requires an externally settled source (a user-approved Plan).');
   }
+  const skills = normalizeRunAgentSkillNames(command.preloadSkills?.names);
+  if (skills.length > 0 && typeof command.preloadSkills?.load !== 'function') {
+    throw new TypeError('Preloading skills into a child requires a skill loader.');
+  }
   return {
     sourceToolCallId,
     childAgentId,
     modelFallback: normalizeTurnModelOverride(command.modelFallback),
     prompt: requirePhaseFText(command.prompt, 'prompt'),
+    skills,
+    ...(skills.length > 0 ? { loadSkills: command.preloadSkills!.load.bind(command.preloadSkills) } : {}),
     forkTurns: normalizeChildForkTurns(command.forkTurns),
     completionPolicy,
     sourceSettlement,
@@ -4082,6 +4173,7 @@ function spawnRequestPayload(
     waitDeadlineAt: command.waitDeadlineAt ?? null,
     title: command.title,
     prompt: command.prompt,
+    ...(command.skills.length > 0 ? { skills: command.skills } : {}),
     forkTurns: command.forkTurns
   };
 }

@@ -14,11 +14,31 @@ export const DEFAULT_MAX_AUTOMATIC_FOLLOWUPS = 32;
 /** Boolean user switch, frozen per Turn; it has no defaultConfig entry and is off unless set. */
 export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY };
 export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree'] as const;
+/** Skills one spawn may preload into its child's first input. */
+export const MAX_RUN_AGENT_SKILLS = 8;
 export type RunAgentOperation = typeof RUN_AGENT_OPERATIONS[number];
 
 export function isReadonlyRunAgentOperation(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   return ['list', 'read', 'wait'].includes(String((value as { operation?: unknown }).operation));
+}
+
+/**
+ * The skill names of a run_agent spawn: trimmed, in the given order, repeats dropped. Anything but a
+ * list of at most MAX_RUN_AGENT_SKILLS non-empty names throws a model-readable error.
+ */
+export function normalizeRunAgentSkillNames(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new TypeError('run_agent.skills must be an array of skill names.');
+  const names: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || !entry.trim()) throw new TypeError('run_agent.skills must contain non-empty skill names.');
+    if (!names.includes(entry.trim())) names.push(entry.trim());
+  }
+  if (names.length > MAX_RUN_AGENT_SKILLS) {
+    throw new RangeError(`run_agent.skills accepts at most ${MAX_RUN_AGENT_SKILLS} skills; the child can load more itself with the skills tool.`);
+  }
+  return names;
 }
 
 export function maxChildAgentDepthFromConfig(
@@ -55,6 +75,7 @@ export const runAgentTool: ToolDefinition = {
     description: `Inspect and control child tasks using an explicit operation.
 - Before spawn, inspect the conversation roster. Use list for omitted tasks and read for the original assignment, current inputs and queued work. These operations never create or resume a child.
 - spawn requires taskName and prompt. Give the complete objective, context, constraints, expected result, verification and editing permission. agent.type chooses a configuration, never an existing child identity.
+- spawn skills optionally preloads skills, by the names the skills tool lists, into the child's first input. The child does not inherit skills you loaded; an unknown or disabled name fails the spawn without creating a child.
 - spawn forkTurns defaults to "none". Use "all" or a positive integer string to inherit all or the most recent N completed turns. Current, failed and interrupted turns are excluded; inherited child references never grant control. The prompt always starts a new assignment.
 - send requires answerBridgeId and prompt, reusing that child conversation and answer channel. It queues after the current child turn unless interrupt=true explicitly redirects current work. An unknown or missing reference fails; it never creates a replacement child.
 - A child's answer is the final reply of each of its turns: it settles a foreground wait, otherwise it is delivered to you as that child's final result. Progress the child reports mid-task arrives separately as a collaboration message.
@@ -87,6 +108,10 @@ export const runAgentTool: ToolDefinition = {
         taskName: {
           type: 'string',
           description: 'Required for spawn. Short responsibility label, such as "trace send failure"; the full task belongs in prompt.'
+        },
+        skills: {
+          type: 'array', items: { type: 'string' }, maxItems: MAX_RUN_AGENT_SKILLS,
+          description: 'For spawn only. Skills to preload into the child, by name as listed in the skills tool (e.g. "pdf", "superpowers:brainstorming"). The child does not inherit skills you loaded.'
         },
         forkTurns: {
           type: 'string',
@@ -184,7 +209,7 @@ interface RunAgentSchedulingArgs {
 }
 
 function summarizeRunAgentToolCall(rawArgs: unknown, context: ToolCallSummaryContext): string | undefined {
-  const args = (rawArgs ?? {}) as RunAgentSchedulingArgs & { prompt?: unknown; answerBridgeId?: unknown; agent?: { type?: unknown; id?: unknown } };
+  const args = (rawArgs ?? {}) as RunAgentSchedulingArgs & { prompt?: unknown; answerBridgeId?: unknown; skills?: unknown; agent?: { type?: unknown; id?: unknown } };
   const answerBridgeId = typeof args.answerBridgeId === 'string' ? args.answerBridgeId.trim() : '';
   if (args.operation === 'interrupt_subtree') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
   if (args.operation && ['list', 'read', 'wait'].includes(args.operation)) return `${args.operation} child tasks${answerBridgeId ? ` · ${answerBridgeId}` : ''}`;
@@ -196,7 +221,11 @@ function summarizeRunAgentToolCall(rawArgs: unknown, context: ToolCallSummaryCon
   const hasIndirectTarget = (typeof args.answerBridgeId === 'string' && !!args.answerBridgeId.trim())
     || (typeof args.agent?.id === 'string' && !!args.agent.id.trim());
   const targetType = resolvedType ?? requestedType ?? (hasIndirectTarget ? 'Agent' : DEFAULT_RUN_AGENT_TYPE);
-  return prompt ? `Run ${targetType} · ${truncateSummary(prompt, 96)}` : `Run ${targetType}`;
+  const skills = Array.isArray(args.skills)
+    ? args.skills.filter((name): name is string => typeof name === 'string' && !!name.trim()).map((name) => name.trim())
+    : [];
+  const target = skills.length > 0 ? `${targetType} · skills ${truncateSummary(skills.join(', '), 48)}` : targetType;
+  return prompt ? `Run ${target} · ${truncateSummary(prompt, 96)}` : `Run ${target}`;
 }
 
 function runAgentTypeFromValue(value: unknown): string | undefined {

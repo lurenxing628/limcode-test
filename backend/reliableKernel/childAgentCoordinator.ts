@@ -37,7 +37,13 @@ import type {
   TurnControlPlane,
   TurnModelOverride
 } from './turnControlPlane';
-import type { CompressionCommandTarget, MessageRetryTarget, SessionThinkingOverride } from '../../shared/protocol';
+import type {
+  CompressionCommandTarget,
+  MessageRetryTarget,
+  SessionThinkingOverride,
+  SkillDefinitionRecord,
+  SkillPolicyRecord
+} from '../../shared/protocol';
 import {
   ExecutionHandoffError,
   isExecutionHandoffError,
@@ -47,7 +53,11 @@ import {
 } from './executionLeaseFence';
 import { isConversationRuntimeOwnerBusyError } from './ConversationRuntimeOwnerManager';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
-import { maxChildAgentDepthFromConfig, RUN_AGENT_OPERATIONS } from '../world/modules/tools/definitions/runAgent';
+import {
+  maxChildAgentDepthFromConfig,
+  normalizeRunAgentSkillNames,
+  RUN_AGENT_OPERATIONS
+} from '../world/modules/tools/definitions/runAgent';
 import {
   listConversationChildTasks,
   readConversationChildTask,
@@ -78,6 +88,18 @@ export interface ReliableChildModelProfileStore {
   }): Promise<{ created: boolean }>;
 }
 
+/** Loads skills a parent preloads into a child (the tool host's skill catalog). */
+export interface ReliableChildSkillLoader {
+  /**
+   * The named skills as the model reads them, within one Turn's frozen skill settings. Throws a
+   * model-readable explanation when a name is unknown, turned off or ambiguous.
+   */
+  loadSkillsWithinPolicy(
+    names: readonly string[],
+    policy: Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined
+  ): Promise<Array<{ skill: SkillDefinitionRecord; text: string }>>;
+}
+
 export interface ReliableChildAgentCoordinatorDependencies {
   database: RuntimeDatabase;
   effects: EffectControlPlane;
@@ -89,6 +111,8 @@ export interface ReliableChildAgentCoordinatorDependencies {
   agentLoop: ReliableAgentLoop;
   agents: ReliableChildAgentSelector;
   modelProfiles: ReliableChildModelProfileStore;
+  /** Required only for a spawn that preloads skills (run_agent `skills`). */
+  skills?: ReliableChildSkillLoader;
   deliveryWakeups?: {
     notifyRuntimeDelivery(deliveryId: string): void;
   };
@@ -1551,11 +1575,23 @@ export class ReliableChildAgentCoordinator {
       : undefined;
     const inheritance = childThinkingInheritanceFromAuthority(authority?.document);
     const inheritedThinkingOverride = childThinkingOverrideForSpawn(inheritance);
+    const skillNames = normalizeRunAgentSkillNames(args.skills);
+    const skillLoader = this.dependencies.skills;
+    if (skillNames.length > 0 && !skillLoader) {
+      throw new Error('当前宿主没有接入技能目录，run_agent 不能预载技能；没有创建子 Agent。请去掉 skills，在 prompt 里让子 Agent 自己载入。');
+    }
     const spawned = await this.dependencies.children.spawn({
       sourceToolCallId: input.toolCallId,
       childAgentId: selection.agentId,
       modelFallback: frozenParentModelSelection(authority),
       prompt: promptWithAnswerBridge(prompt),
+      // Loaded by the control plane within the child's own first-Turn skill settings, which are
+      // already bounded by this parent Turn; a failed name rejects the spawn before any fact is written.
+      ...(skillNames.length > 0 ? { preloadSkills: {
+        names: skillNames,
+        load: async (names: readonly string[], policy: Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined) =>
+          (await skillLoader!.loadSkillsWithinPolicy(names, policy)).map((loaded) => loaded.text)
+      } } : {}),
       forkTurns: normalizeChildForkTurns(args.forkTurns),
       completionPolicy,
       sourceSettlement: 'child_handle',
@@ -2577,7 +2613,7 @@ function assertRunAgentArguments(operation: string, args: { [key: string]: Plain
     throw new Error(`Unsupported run_agent operation: ${operation}.`);
   }
   const fields: Record<string, readonly string[]> = {
-    spawn: ['taskName', 'prompt', 'agent', 'foregroundWaitMs', 'forkTurns'],
+    spawn: ['taskName', 'prompt', 'agent', 'foregroundWaitMs', 'forkTurns', 'skills'],
     send: ['answerBridgeId', 'prompt', 'interrupt', 'foregroundWaitMs'],
     list: ['scope', 'status', 'limit', 'cursor'],
     read: ['answerBridgeId', 'scope', 'limit', 'cursor'],
@@ -2586,12 +2622,17 @@ function assertRunAgentArguments(operation: string, args: { [key: string]: Plain
   };
   const allowed = new Set(['operation', 'scheduling', ...fields[operation]]);
   for (const key of Object.keys(args)) {
+    // Models often fill every schema field; an empty skills list asks for nothing and is fine anywhere.
+    if (key === 'skills' && Array.isArray(args.skills) && args.skills.length === 0) continue;
     if (!allowed.has(key)) throw new Error(`run_agent.${operation} does not accept ${key}.`);
   }
   if (args.scheduling !== undefined && args.scheduling !== 'serial' && args.scheduling !== 'parallel') {
     throw new Error('run_agent.scheduling must be parallel or serial.');
   }
-  if (operation === 'spawn') normalizeChildForkTurns(args.forkTurns);
+  if (operation === 'spawn') {
+    normalizeChildForkTurns(args.forkTurns);
+    normalizeRunAgentSkillNames(args.skills);
+  }
   if (args.agent !== undefined) {
     const agent = requireRecord(args.agent, 'run_agent.agent');
     if (Object.keys(agent).some(key => key !== 'type')) throw new Error('run_agent.agent only accepts type.');

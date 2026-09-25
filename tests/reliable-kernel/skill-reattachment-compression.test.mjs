@@ -355,3 +355,33 @@ test('同名不同来源的技能按名字加来源区分，各自附上', () =>
   assert.deepEqual(both.skills, ['pdf'], 'the user pdf is re-attached although a .claude pdf is still in the tail');
   assert.match(both.content.parts[1].text, /# pdf from user/);
 });
+
+test('技能由 run_agent 预载进子 Agent 首条输入时，压缩后同样重新附上；太大的只列名字让子 Agent 重新载入', () => {
+  const { childInputWithPreloadedSkills } = load('backend/reliableKernel/childSkillPreload.js');
+  const block = (name, body) => renderLoadedSkill({ name, source: '.claude', baseDirectory: `/skills/${name}` }, body);
+  const firstInput = (text) => ({
+    segmentKind: 'message', contentType: 'application/vnd.limcode.message+json',
+    content: JSON.stringify({ role: 'user', parts: [{ text }] })
+  });
+  const input = firstInput(childInputWithPreloadedSkills([block('review', '# review\n\n1. read the diff'), block('huge', BODY)], 'Review src/app.ts.'));
+  const plan = planSkillReattachment({ compressed: [input], retained: [], budgetTokens: 25_000 });
+  assert.deepEqual(plan.skills, ['review']);
+  assert.deepEqual(plan.omitted, ['huge'], 'a preload over the per-skill allowance is named, never cut without a line reference');
+  assert.equal(plan.content.parts[1].text, block('review', '# review\n\n1. read the diff'), 'the preload is re-attached exactly as the child read it');
+  assert.equal(planSkillReattachment({ compressed: [input], retained: [input], budgetTokens: 25_000 }), undefined,
+    'a first input still in the retained tail needs nothing re-attached');
+  assert.equal(planSkillReattachment({ compressed: [firstInput('Plain task, no skills.')], retained: [], budgetTokens: 25_000 }), undefined);
+});
+
+test('子 Agent 首条输入按 text/plain 存储时同样识别预载技能', () => {
+  const { childInputWithPreloadedSkills } = load('backend/reliableKernel/childSkillPreload.js');
+  const block = (name, source, body) => renderLoadedSkill({ name, source, baseDirectory: `/skills/${name}` }, body);
+  const stored = {
+    segmentKind: 'message', messageRole: 'user', contentType: 'text/plain',
+    content: childInputWithPreloadedSkills([block('review', '.agents', '# review\n\n1. read the diff')], 'Review src/app.ts.')
+  };
+  const plan = planSkillReattachment({ compressed: [stored], retained: [], budgetTokens: 25_000 });
+  assert.deepEqual(plan.skills, ['review'], 'the stored form of a child first input is recognised');
+  assert.equal(planSkillReattachment({ compressed: [{ ...stored, messageRole: 'model' }], retained: [], budgetTokens: 25_000 }), undefined,
+    'only a user input carries preloaded skills');
+});

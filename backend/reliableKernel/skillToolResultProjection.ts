@@ -2,6 +2,9 @@ import { SKILLS_TOOL_NAME, type MessageContent } from '../../shared/protocol';
 import { renderLoadedSkill } from '../world/modules/skill/skillLookup';
 import type { SkillsToolOutput } from '../world/modules/tools/definitions/skills';
 import { estimateMessageContentsTokens, estimateTextTokens } from './modelTokenEstimator';
+import { PRELOADED_SKILLS_HEADER, splitPreloadedSkills } from './childSkillPreload';
+
+const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
 
 /**
  * Model-visible allowance of one loaded skill. Claude Code keeps a loaded skill whole, and nearly
@@ -25,7 +28,7 @@ const SKILL_REATTACHMENT_MIN_TOKENS = 500;
 
 /** First line of the re-attachment content; it also identifies that content in a compression segment. */
 export const SKILL_REATTACHMENT_HEADER = '[Skills loaded earlier in this conversation]';
-const SKILL_REATTACHMENT_NOTE = 'These skills were loaded with the skills tool before the conversation was compressed, and their '
+const SKILL_REATTACHMENT_NOTE = 'These skills were loaded (with the skills tool, or preloaded for this task) before the conversation was compressed, and their '
   + 'instructions still apply: continue from the step you had reached (the compressed history above records it). '
   + 'A skill shortened here says where its SKILL.md continues; read the rest with the read tool before relying on '
   + 'a missing step.';
@@ -145,6 +148,7 @@ function skillCutNotice(
 /** The minimal stored Context item shape the re-attachment reads (see StoredModelFacingContextItem). */
 export interface SkillReattachmentSourceItem {
   segmentKind: string;
+  messageRole?: string | null;
   contentType: string;
   content: string;
 }
@@ -176,7 +180,7 @@ export function planSkillReattachment(input: {
   // Keyed by name and source: two different skills may share a name across sources.
   const retainedKeys = new Set(input.retained.flatMap((item) => {
     const skill = item.segmentKind === 'tool_pair' ? storedSkillLoad(item.content) : undefined;
-    return skill ? [skillKey(skill.name, skill.source)] : [];
+    return skill ? [skillKey(skill.name, skill.source)] : preloadedSkillLoads(item).map((load) => load.key);
   }));
   const seen = new Set<string>();
   const texts: string[] = [];
@@ -256,6 +260,10 @@ function skillLoadsInOrder(items: readonly SkillReattachmentSourceItem[]): Skill
       }
       continue;
     }
+    if (item.segmentKind === 'message') {
+      loads.push(...preloadedSkillLoads(item));
+      continue;
+    }
     if (item.segmentKind !== 'compression') continue;
     for (const content of storedCompressionContents(item)) {
       if (!isSkillReattachmentContent(content)) continue;
@@ -270,6 +278,33 @@ function skillLoadsInOrder(items: readonly SkillReattachmentSourceItem[]): Skill
     }
   }
   return loads;
+}
+
+/**
+ * Skills a parent preloaded into a child's first input (run_agent `skills`), as the child read them.
+ * They are re-attached whole or, when over the allowance, named so the child loads them again: the
+ * stored block does not record where its body starts in SKILL.md, so it is never cut.
+ */
+function preloadedSkillLoads(item: SkillReattachmentSourceItem): SkillLoadOccurrence[] {
+  if (item.segmentKind !== 'message' || !item.content.includes(PRELOADED_SKILLS_HEADER)) return [];
+  // A child's first input is stored as its plain text; a message content form carries it as text parts.
+  const texts = item.contentType === 'text/plain'
+    ? (item.messageRole === 'user' ? [item.content] : [])
+    : item.contentType === MESSAGE_CONTENT_TYPE ? userMessageTexts(item.content) : [];
+  return texts.flatMap((text) => splitPreloadedSkills(text)?.skills ?? []).map(({ name, text }) => ({
+    name,
+    key: renderedSkillKey(text)?.key ?? skillKey(name, ''),
+    render: (maxTokens: number) => estimateTextTokens(text) <= maxTokens ? text : undefined
+  }));
+}
+
+function userMessageTexts(content: string): string[] {
+  const message = asRecord(parseJson(content));
+  if (message?.role !== 'user' || !Array.isArray(message.parts)) return [];
+  return message.parts.flatMap((part) => {
+    const text = asRecord(part)?.text;
+    return typeof text === 'string' ? [text] : [];
+  });
 }
 
 function reattachedSkills(content: MessageContent): { skills: Array<{ name: string; key: string; text: string }>; omitted: string[] } {
