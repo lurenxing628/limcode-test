@@ -1,15 +1,26 @@
 import type { PlainData } from '@shared/plainData';
-import { collaborationPeerLabel, resolveCollaborationPeer, type CollaborationPeer } from './collaborationPeer';
+import {
+  collaborationPeerLabel,
+  collaborationPeerRelation,
+  resolveCollaborationPeer,
+  type CollaborationPeer,
+  type CollaborationPeerRelation
+} from './collaborationPeer';
 
 type FeedRecord = { [key: string]: PlainData };
 type FeedRecords = Record<string, Record<string, FeedRecord>>;
 
-/** An independent collaboration envelope, never a Message or a transcript floor. */
+/**
+ * An independent envelope between Agents, never a Message or a transcript floor: a collaboration
+ * message, or the answer a child Agent returned with the final reply of its Turn.
+ */
 export interface CollaborationTimelineCard {
+  /** The CollaborationMessage id, or `answer:<AnswerSubmission id>` for a child answer. */
   messageId: string;
   direction: 'incoming' | 'outgoing';
   peer: CollaborationPeer;
-  kind: 'message' | 'followup' | 'result';
+  peerRelation: CollaborationPeerRelation;
+  kind: 'message' | 'followup' | 'result' | 'answer' | 'partial_answer';
   textPreview: string;
   /** The newest delivery attempt, or unknown when its delivery is not in the bounded feed. */
   status: 'waiting' | 'failed' | 'settled' | 'unknown';
@@ -70,6 +81,7 @@ export function projectCollaborationTimeline(input: {
       messageId,
       direction: incoming ? 'incoming' : 'outgoing',
       peer: resolveCollaborationPeer(input.records, peerConversationId, input.removedConversationIds),
+      peerRelation: collaborationPeerRelation(input.records, input.conversationId, peerConversationId),
       kind: source.source_kind === 'completion' ? 'result' : message.mode === 'followup' ? 'followup' : 'message',
       textPreview: text(message.text_preview),
       status: !delivery ? 'unknown' : delivery.state === 'failed' ? 'failed'
@@ -83,22 +95,52 @@ export function projectCollaborationTimeline(input: {
     const turnId = incoming
       ? card.status === 'failed' ? '' : text(delivery?.target_turn_id)
       : text(source.turn_id);
+    place(card, turnId);
+  }
+  // A child's answer delivered to this Conversation: same card, told apart by its kind. An answer
+  // that settled a waiting run_agent call has no delivery and stays with that tool call.
+  for (const delivery of latestDeliveries.values()) {
+    if (text(delivery.target_conversation_id) !== input.conversationId) continue;
+    const inbox = input.records.RuntimeInboxItem?.[text(delivery.inbox_item_id)];
+    if (!inbox || inbox.source_kind !== 'answer_submission') continue;
+    const submission = input.records.AnswerSubmission?.[text(inbox.source_id)];
+    const bridge = input.records.AnswerBridge?.[text(submission?.answer_bridge_id)];
+    const child = input.records.ChildExecution?.[text(bridge?.child_execution_id)];
+    const peerConversationId = text(child?.child_conversation_id);
+    if (!submission || !peerConversationId) continue;
+    const card: CollaborationTimelineCard = {
+      messageId: `answer:${text(submission.id)}`,
+      direction: 'incoming',
+      peer: resolveCollaborationPeer(input.records, peerConversationId, input.removedConversationIds),
+      peerRelation: 'child',
+      kind: submission.interrupted === true || submission.interrupted === 1 || submission.interrupted === '1'
+        ? 'partial_answer' : 'answer',
+      textPreview: '',
+      status: delivery.state === 'failed' ? 'failed'
+        : delivery.state === 'pending' ? 'waiting'
+          : delivery.state === 'consumed' ? 'settled' : 'unknown',
+      placement: 'unbound'
+    };
+    place(card, card.status === 'failed' ? '' : text(delivery.target_turn_id));
+  }
+  return result;
+
+  function place(card: CollaborationTimelineCard, turnId: string): void {
     if (!turnId) {
       result.unlocated.push(card);
-      continue;
+      return;
     }
     const anchorId = lastMessageByTurn.get(turnId);
     if (anchorId) {
       card.placement = 'turn';
       (result.afterMessage[anchorId] ??= []).push(card);
-      continue;
+      return;
     }
     const turn = input.records.Turn?.[turnId];
     card.placement = turn?.conversation_id === input.conversationId
       ? 'turn-without-message' : 'turn-not-loaded';
     result.unlocated.push(card);
   }
-  return result;
 }
 
 /** Every card gets a truthful explanation of grouping instead of a fabricated exact position. */
@@ -110,7 +152,7 @@ export function collaborationCardPlacementLabel(card: CollaborationTimelineCard)
 }
 
 export function collaborationCardLabel(card: CollaborationTimelineCard): string {
-  const peer = collaborationPeerLabel(card.peer);
+  const peer = collaborationPeerLabel(card.peer, card.peerRelation);
   return card.direction === 'incoming' ? `来自${peer}` : `发往${peer}`;
 }
 
@@ -127,6 +169,8 @@ export function collaborationCardStatusLabel(card: CollaborationTimelineCard): s
 }
 
 export function collaborationCardKindLabel(card: CollaborationTimelineCard): string {
+  if (card.kind === 'answer') return '最终结果';
+  if (card.kind === 'partial_answer') return '部分结果（已中断）';
   if (card.kind === 'result') return '任务结果';
   return card.kind === 'followup' ? '续派任务' : '消息';
 }

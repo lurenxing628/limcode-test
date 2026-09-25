@@ -56,11 +56,33 @@ export function rememberRemovedConversations(previous: readonly string[], change
   return [...previous.filter((id) => !removed.includes(id)), ...removed].slice(-limit);
 }
 
-/** "对话 标题", "已删除的对话" or, for an unknown peer, "对话 3f9a2c…". */
-export function collaborationPeerLabel(peer: CollaborationPeer): string {
-  if (peer.state === 'known') return `对话 ${peer.title}`;
-  if (peer.state === 'deleted') return '已删除的对话';
-  return `对话 ${shortConversationId(peer.conversationId)}…`;
+/** How the peer relates to this Conversation, as far as committed child links in this view show. */
+export type CollaborationPeerRelation = 'child' | 'conversation';
+
+/**
+ * A peer is this Conversation's child Agent when its ChildExecution was spawned by a Turn of this
+ * Conversation. Anything the bounded view cannot prove stays an ordinary conversation.
+ */
+export function collaborationPeerRelation(
+  records: FeedRecords,
+  conversationId: string,
+  peerConversationId: string
+): CollaborationPeerRelation {
+  const child = Object.values(records.ChildExecution ?? {})
+    .find((execution) => text(execution.child_conversation_id) === peerConversationId);
+  if (!child) return 'conversation';
+  const parent = Object.values(records.ChildExecutionParentLink ?? {})
+    .find((link) => text(link.child_execution_id) === text(child.id));
+  const parentTurn = records.Turn?.[text(parent?.parent_turn_id)];
+  return parentTurn && text(parentTurn.conversation_id) === conversationId ? 'child' : 'conversation';
+}
+
+/** "对话 标题" / "子 Agent 标题", "已删除的对话" or, for an unknown peer, "对话 3f9a2c…". */
+export function collaborationPeerLabel(peer: CollaborationPeer, relation: CollaborationPeerRelation = 'conversation'): string {
+  const noun = relation === 'child' ? '子 Agent' : '对话';
+  if (peer.state === 'known') return `${noun} ${peer.title}`;
+  if (peer.state === 'deleted') return relation === 'child' ? '已删除的子 Agent' : '已删除的对话';
+  return `${noun} ${shortConversationId(peer.conversationId)}…`;
 }
 
 function shortConversationId(conversationId: string): string {

@@ -166,3 +166,50 @@ test('messages between other Conversations are not projected into this Conversat
     RuntimeDelivery: byId(delivery('foreign', 'other', null, 'pending'))
   }, [{ id: 'm1' }], { m1: 'peer-turn' }), { afterMessage: {}, unlocated: [] });
 });
+
+test('a child answer delivered to this Conversation is the same card, labelled as that child Agent final result', () => {
+  const answerRecords = (interrupted: number, state: string, turnId: string | null) => ({
+    Conversation: byId({ id: 'child-conversation', title: '调研子任务', status: 'active' }),
+    Turn: byId({ id: 'self-turn', conversation_id: 'self' }, { id: 'spawn-turn', conversation_id: 'self' }),
+    ChildExecution: byId({ id: 'child-execution', child_conversation_id: 'child-conversation', status: 'idle' }),
+    ChildExecutionParentLink: byId({ id: 'parent-link', child_execution_id: 'child-execution', parent_turn_id: 'spawn-turn' }),
+    AnswerBridge: byId({ id: 'bridge', child_execution_id: 'child-execution' }),
+    AnswerSubmission: byId({ id: 'submission', answer_bridge_id: 'bridge', interrupted }),
+    RuntimeInboxItem: byId({ id: 'answer-inbox', source_kind: 'answer_submission', source_id: 'submission' }),
+    RuntimeDelivery: byId({ id: 'answer-delivery', inbox_item_id: 'answer-inbox', target_conversation_id: 'self',
+      target_turn_id: turnId, state, attempt_seq: '1' })
+  });
+  const timeline = project(answerRecords(0, 'consumed', 'self-turn'), [{ id: 'm1' }], { m1: 'self-turn' });
+  const [card] = timeline.afterMessage.m1;
+  assert.equal(card.messageId, 'answer:submission');
+  assert.equal(collaborationCardLabel(card), '来自子 Agent 调研子任务');
+  assert.equal(collaborationCardKindLabel(card), '最终结果');
+  assert.equal(collaborationCardStatusLabel(card), '');
+
+  const interrupted = project(answerRecords(1, 'pending', null)).unlocated[0];
+  assert.equal(collaborationCardKindLabel(interrupted), '部分结果（已中断）');
+  assert.equal(collaborationCardStatusLabel(interrupted), '等待下一轮处理');
+
+  const foreground = answerRecords(0, 'consumed', 'self-turn');
+  delete (foreground as Record<string, unknown>).RuntimeDelivery;
+  const settledByWait = project(foreground, [{ id: 'm1' }], { m1: 'self-turn' });
+  assert.deepEqual(settledByWait.afterMessage, {}, 'an answer that settled a waiting run_agent call stays with that tool call');
+  assert.deepEqual(settledByWait.unlocated, []);
+});
+
+test('a collaboration message from a spawned child is labelled as that child Agent, others stay conversations', () => {
+  const timeline = project({
+    Conversation: byId({ id: 'child-conversation', title: '实现子任务', status: 'active' }, { id: 'peer', title: '调研对话', status: 'active' }),
+    Turn: byId({ id: 'self-turn', conversation_id: 'self' }),
+    ChildExecution: byId({ id: 'child-execution', child_conversation_id: 'child-conversation', status: 'active' }),
+    ChildExecutionParentLink: byId({ id: 'parent-link', child_execution_id: 'child-execution', parent_turn_id: 'self-turn' }),
+    CollaborationMessage: byId(message('from-child', '1', 'message', '进展'), message('from-peer', '2', 'message', '你好')),
+    CollaborationMessageSourceLink: byId(source('from-child', 'child-conversation', 'child-turn'), source('from-peer', 'peer', 'peer-turn')),
+    CollaborationMessageTargetLink: byId(target('from-child', 'self'), target('from-peer', 'self')),
+    RuntimeDelivery: byId(delivery('from-child', 'self', 'self-turn', 'consumed'), delivery('from-peer', 'self', 'self-turn', 'consumed'))
+  }, [{ id: 'm1' }], { m1: 'self-turn' });
+  assert.deepEqual(timeline.afterMessage.m1.map((card) => [collaborationCardLabel(card), collaborationCardKindLabel(card)]), [
+    ['来自子 Agent 实现子任务', '消息'],
+    ['来自对话 调研对话', '消息']
+  ]);
+});

@@ -24,7 +24,7 @@ import type {
 } from '@shared/reliableKernelClientFeed';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
-import { collaborationPeerLabel, resolveCollaborationPeer } from '@webview/domain/collaborationPeer';
+import { collaborationPeerLabel, collaborationPeerRelation, resolveCollaborationPeer } from '@webview/domain/collaborationPeer';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
@@ -386,7 +386,8 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
 /** Same peer label as the collaboration cards: the sidebar title, deleted only when removed. */
 function collaborationSourceLabel(conversationId: string): string {
   const feed = reliableConversation.feed;
-  return `来自${collaborationPeerLabel(resolveCollaborationPeer(feed.records, conversationId, feed.removedConversationIds))}`;
+  const peer = resolveCollaborationPeer(feed.records, conversationId, feed.removedConversationIds);
+  return `来自${collaborationPeerLabel(peer, collaborationPeerRelation(feed.records, reliableConversation.conversationId.value, conversationId))}`;
 }
 
 function subagentName(agentId?: string): string {
@@ -432,7 +433,7 @@ function stateLabel(item: QueueItem): string {
   const runtime = runtimePreview(item.preview);
   if (runtime) {
     if (runtime.deliveryState === 'failed') return '续跑失败';
-    return runtime.source.kind === 'background_process' ? '后台结果' : runtime.source.kind === 'collaboration_message' ? '协作消息（非用户指令）' : 'Agent 回答';
+    return runtime.source.kind === 'background_process' ? '后台结果' : runtime.source.kind === 'collaboration_message' ? '协作消息（非用户指令）' : '子 Agent 最终结果';
   }
   if (guidancePreview(item.preview)?.hold === 'paused') return '已暂停';
   return '等待引导';
