@@ -66,8 +66,8 @@ export interface CollaborationTimeline {
  * with the Turns of the loaded messages (never with a message or envelope timestamp); a Turn
  * outside loaded history belongs to older history and sits above the first loaded message. Of the
  * cards that never entered a Turn, only the newest few waiting or failed ones stay below every
- * message. None of these records
- * are promoted to a Message, given a transcript floor, or silently dropped.
+ * message. None of these records are promoted to a Message, given a transcript floor, or silently
+ * dropped.
  */
 export function projectCollaborationTimeline(input: {
   conversationId: string;
