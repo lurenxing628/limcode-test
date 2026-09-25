@@ -2098,11 +2098,8 @@ export class TurnControlPlane {
           column: 'turn_seq',
           scope: { child_execution_id: childExecutionId }
         }),
-        DOMAIN_REPOSITORIES.domain('AnswerBridge').update(requireId(bridge.id, 'AnswerBridge.id'), {
-          status: 'open',
-          current_submission_id: null,
-          updated_at: input.now
-        }),
+        // A Turn the user starts in the child Conversation is not work on the parent's task: the
+        // task answer on the AnswerBridge stays exactly as the last task Turn left it.
         DOMAIN_REPOSITORIES.domain('ChildExecution').update(childExecutionId, {
           status: 'active',
           updated_at: input.now

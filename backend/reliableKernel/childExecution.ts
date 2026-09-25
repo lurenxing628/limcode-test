@@ -66,6 +66,7 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import { runtimeDeliverySourceTurn } from './automaticRuntimeDelivery';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   normalizeTurnModelOverride,
@@ -1015,6 +1016,64 @@ export class ChildExecutionControlPlane {
     return spawnRecoveryResult(facts, true);
   }
 
+  /**
+   * True when a child Turn works on the task its parent dispatched: the spawn Turn, a Turn a
+   * run_agent send queued, or a continuation of such a Turn (its own background Process results,
+   * the answers of its own children). Only these Turns answer the parent on the AnswerBridge. A Turn
+   * the user started in the child Conversation, a peer's followup task, and continuations of those
+   * belong to someone else: they never publish, replace or deliver the task answer.
+   */
+  public async isTaskTurn(turnIdInput: string): Promise<boolean> {
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const memberships = await this.listRows('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (memberships.length !== 1) return false;
+    return this.isTaskTurnOf(
+      requirePhaseFId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id'),
+      turnId,
+      new Set()
+    );
+  }
+
+  private async isTaskTurnOf(childExecutionId: string, turnId: string, visited: Set<string>): Promise<boolean> {
+    if (visited.has(turnId)) return false;
+    visited.add(turnId);
+    const memberships = await this.listRows('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (memberships.length !== 1 || memberships[0].child_execution_id !== childExecutionId) return false;
+    const intents = await this.listRows('TurnIntent', { turn_id: turnId }, 2);
+    // The spawn Turn is created together with its ChildExecution and has no TurnIntent.
+    if (intents.length === 0) return true;
+    if (intents.length !== 1) throw new Error(`Turn ${turnId} was admitted from multiple TurnIntents.`);
+    return this.isTaskIntent(childExecutionId, requirePhaseFId(intents[0].id, 'TurnIntent.id'), visited);
+  }
+
+  /** Whether admitting this TurnIntent starts (or started) a Turn of the parent's task. */
+  private async isTaskIntent(childExecutionId: string, turnIntentId: string, visited: Set<string>): Promise<boolean> {
+    const deliveryLinks = await this.listRows('RuntimeDeliveryIntentLink', { turn_intent_id: turnIntentId }, 2);
+    if (deliveryLinks.length > 0) {
+      const delivery = await this.maybeGet(
+        'RuntimeDelivery',
+        requirePhaseFId(deliveryLinks[0].delivery_id, 'RuntimeDeliveryIntentLink.delivery_id')
+      );
+      if (!delivery) return false;
+      // A continuation belongs to the Turn whose result it handles; a peer's task has none.
+      const sourceTurnId = await runtimeDeliverySourceTurn(
+        this.database,
+        requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
+      );
+      return sourceTurnId !== null && this.isTaskTurnOf(childExecutionId, sourceTurnId, visited);
+    }
+    // Only run_agent send freezes the child-continuation preset for the Turn it queues.
+    const presets = await this.listRows('TurnExecutionPresetRevision', { intent_id: turnIntentId, revision_seq: '1' }, 2);
+    if (presets.length !== 1) return false;
+    const preset = await this.maybeGet(
+      'ContentObject',
+      requirePhaseFId(presets[0].preset_object_id, 'TurnExecutionPresetRevision.preset_object_id')
+    );
+    if (!preset || preset.content_type !== TURN_EXECUTION_PRESET_CONTENT_TYPE) return false;
+    const value = JSON.parse((await this.contentStore.read(preset as ContentObjectMetadata)).toString('utf8')) as { kind?: unknown };
+    return value.kind === 'child-continuation';
+  }
+
   /** Complete pending child continuations in stable lineage order; admission remains a separate CAS. */
   public async listPendingContinuations(childExecutionIdInput?: string): Promise<PendingChildContinuation[]> {
     const childExecutionId = childExecutionIdInput === undefined
@@ -1510,6 +1569,7 @@ export class ChildExecutionControlPlane {
       messageContentObject.id,
       'queued child message ContentObject.id'
     );
+    const taskIntent = await this.isTaskIntent(command.childExecutionId, command.turnIntentId, new Set());
     const messageContentType = requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type');
     const workspace = await projectFolderForConversation(this.database, childConversationId);
     const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
@@ -1606,11 +1666,13 @@ export class ChildExecutionControlPlane {
         status: bridge.status,
         current_submission_id: bridge.current_submission_id
       }),
-      DOMAIN_REPOSITORIES.domain('AnswerBridge').update(bridge.id as string, {
+      // A Turn of the parent's task owes a new answer. A Turn the user or a peer's task starts
+      // leaves the task answer exactly as the last task Turn left it.
+      ...(taskIntent ? [DOMAIN_REPOSITORIES.domain('AnswerBridge').update(bridge.id as string, {
         status: 'open',
         current_submission_id: null,
         updated_at: now
-      }),
+      })] : []),
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(command.turnIntentId, { state: 'queued', turn_id: null }),
       ...(deliveryIntentLink ? [
         DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').assert(

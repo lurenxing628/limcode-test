@@ -257,6 +257,18 @@ export class AnswerControlPlane {
   }
 
   /**
+   * True when a child Turn works on the task its parent dispatched: the spawn Turn, a Turn a
+   * run_agent send queued (the parent waits on exactly that Turn generation), or a continuation of
+   * such a Turn (its own background Process results, the answers of its own children). Only these
+   * Turns answer the parent on the AnswerBridge. A Turn the user started in the child Conversation,
+   * a peer's followup task, and continuations of those belong to someone else: they never publish,
+   * replace or deliver the task answer.
+   */
+  public isChildTaskTurn(turnIdInput: string): Promise<boolean> {
+    return this.children.isTaskTurn(turnIdInput);
+  }
+
+  /**
    * Materializes one deterministic weak-signal answer when cancellation terminated a child Turn
    * before its final answer was submitted. Already submitted answers always win; concurrent recovery
    * contenders share the same submission identity and the bridge's current-submission CAS.
@@ -273,6 +285,8 @@ export class AnswerControlPlane {
     if (snapshot.currentSubmission) return null;
     const childStatus = requireChildExecutionStatus(snapshot.childExecution.status);
     if (childStatus !== 'interrupting' && childStatus !== 'interrupted') return null;
+    // Only a Turn working on the parent's task stands in for its missing answer.
+    if (!await this.isChildTaskTurn(turnId)) return null;
     if (snapshot.activeTurnLink !== null) return null;
     const allTurnLinks = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
       child_execution_id: childExecutionId
@@ -386,6 +400,8 @@ export class AnswerControlPlane {
     const reason = requirePhaseFText(input.reason, 'reason');
     const snapshot = await this.children.readExecutionSnapshot(childExecutionId);
     if (snapshot.currentSubmission) return null;
+    // A failed Turn the user or a peer started never reports failure as the parent's task answer.
+    if (!await this.isChildTaskTurn(turnId)) return null;
     const allTurnLinks = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
       child_execution_id: childExecutionId
     });

@@ -1770,15 +1770,16 @@ export class ReliableChildAgentCoordinator {
   }
 
   /**
-   * The final output of a child Turn becomes the answer on its AnswerBridge, exactly as a submitted
-   * answer did: it settles a waiting run_agent call or is delivered to the parent. A Turn that took
-   * in a peer's task answers that peer through its collaboration reply instead. Runs before the Turn
-   * is recorded completed, so the active-generation authority of the submission still holds.
+   * The final output of a child task Turn becomes the answer on its AnswerBridge: it settles a
+   * waiting run_agent call or is delivered to the parent. A peer's followup taken in by that Turn
+   * is answered through its own collaboration reply as well; a Turn a peer's followup started answers
+   * only that peer, and a Turn the user started answers only the user. Runs before the Turn is
+   * recorded completed, so the active-generation authority of the submission still holds.
    */
   private async submitTurnFinalAnswer(input: { turnId: string; modelRequestId: string; finalText: string }): Promise<void> {
     const memberships = await this.list('ChildExecutionTurnLink', { turn_id: input.turnId }, 2);
     if (memberships.length !== 1) return;
-    if ((await this.list('CollaborationRequestTurnLink', { turn_id: input.turnId }, 1)).length > 0) return;
+    if (!await this.dependencies.answers.isChildTaskTurn(input.turnId)) return;
     const childExecutionId = requireId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
     const bridges = await this.list('AnswerBridge', { child_execution_id: childExecutionId }, 2);
     if (bridges.length !== 1) return;
