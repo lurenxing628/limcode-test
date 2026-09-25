@@ -43,6 +43,7 @@ import {
   requireTimestamp,
   sourceOperationMismatch,
   TURN_INTENT_STATE_ADMITTED,
+  TURN_INTENT_STATE_CANCELLED,
   TURN_INTENT_STATE_QUEUED,
   type CommandCommit,
   type TurnCommandCommitOptions
@@ -785,13 +786,17 @@ export class TurnControlPlane {
             ?? initialGuidancePosition(requireTimestamp(candidate.created_at, 'TurnIntent.created_at'))
         });
       }
-      const intent = ranked.sort((left, right) =>
+      ranked.sort((left, right) =>
         compareGuidancePositions(left.position, right.position)
         || String(left.intent.created_at).localeCompare(String(right.intent.created_at))
         || String(left.intent.id).localeCompare(String(right.intent.id))
-      )[0]?.intent;
-      if (!intent) return null;
-      return this.admitQueuedIntent(intent, input);
+      );
+      for (const { intent } of ranked) {
+        const admitted = await this.admitQueuedIntent(intent, input);
+        // A continuation whose delivery another Turn already took in was cancelled: try the next.
+        if (admitted !== 'superseded') return admitted;
+      }
+      return null;
     });
   }
 
@@ -1416,7 +1421,7 @@ export class TurnControlPlane {
   private async admitQueuedIntent(
     intent: DomainRow,
     input: { conversationId: string; leaseOwnerId: string; hostBootId: string; leaseExpiresAt: string }
-  ): Promise<TurnCommandResult | null> {
+  ): Promise<TurnCommandResult | null | 'superseded'> {
     const intentId = requireId(intent.id, 'TurnIntent.id');
     const conversationId = requireId(intent.conversation_id, 'TurnIntent.conversation_id');
     if (conversationId !== input.conversationId) throw new Error('Queued TurnIntent belongs to another Conversation.');
@@ -1452,6 +1457,10 @@ export class TurnControlPlane {
     if (decoded.operation === 'runtime_continuation' && !deliveryIntentLink) {
       throw new Error(`Runtime continuation TurnIntent ${intentId} has no RuntimeDeliveryIntentLink.`);
     }
+    const continuationDeliveryId = deliveryIntentLink
+      ? requireId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id')
+      : null;
+    if (continuationDeliveryId && await this.cancelSupersededContinuation(intentId, continuationDeliveryId)) return 'superseded';
     const ids = dependentStartCommandIds(intentId, decoded.messageContent !== null);
     const admissionReceiptId = intentDependentEntityId(intentId, 'admission_command_receipt');
     const now = this.timestamp();
@@ -1496,14 +1505,13 @@ export class TurnControlPlane {
       : [];
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
-      ...(deliveryIntentLink ? [
+      ...(deliveryIntentLink && continuationDeliveryId ? [
         DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').assert(
           requireId(deliveryIntentLink.id, 'RuntimeDeliveryIntentLink.id'),
-          {
-            delivery_id: requireId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id'),
-            turn_intent_id: intentId
-          }
-        )
+          { delivery_id: continuationDeliveryId, turn_intent_id: intentId }
+        ),
+        // The continuation opens a Turn only while its delivery still waits for one.
+        DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(continuationDeliveryId, { state: 'pending' })
       ] : []),
       DOMAIN_REPOSITORIES.domain('TurnIntentRevision').assertExactIds(
         { intent_id: intentId },
@@ -1601,6 +1609,34 @@ export class TurnControlPlane {
     } catch (error) {
       if (isTransactionAssertionError(error) || isLeaseAdmissionConflict(error)) return null;
       throw error;
+    }
+  }
+
+  /**
+   * A runtime continuation exists to open a Turn for its delivery. Once another Turn took that
+   * delivery in (or it failed), admitting it would start a Turn with nothing to do: it is cancelled
+   * instead, including intents queued before cancellation happened on absorption. True when the
+   * intent is (now) cancelled.
+   */
+  private async cancelSupersededContinuation(intentId: string, deliveryId: string): Promise<boolean> {
+    const delivery = await this.maybeGet('RuntimeDelivery', deliveryId);
+    if (delivery?.state === 'pending') return false;
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
+        ...(delivery
+          ? [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(deliveryId, { state: delivery.state })]
+          : [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertNone({ id: deliveryId })]),
+        DOMAIN_REPOSITORIES.domain('TurnIntent').update(intentId, {
+          state: TURN_INTENT_STATE_CANCELLED,
+          updated_at: this.timestamp()
+        })
+      ]);
+      return true;
+    } catch (error) {
+      if (!isTransactionAssertionError(error)) throw error;
+      const latest = await this.maybeGet('TurnIntent', intentId);
+      return latest?.state === TURN_INTENT_STATE_CANCELLED;
     }
   }
 

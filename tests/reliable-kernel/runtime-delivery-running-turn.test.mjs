@@ -389,3 +389,113 @@ test('a wake rescans without a failure only when its delivery moved; an authorit
     router.reconcilePendingDelivery = reconcile;
   });
 });
+
+/**
+ * Results that arrive while the Conversation's Turn finishes its final answer each queue a runtime
+ * continuation behind it. `result(index, sourceTurnId)` commits one such result.
+ */
+async function queueResultsBehindFinishingTurn({ app, startTurn, finalRequest, router, rows }, count, result) {
+  const finishing = await startTurn('finishing-turn');
+  const modelRequestId = await finalRequest(finishing);
+  assert.equal((await router.establishFinalOutputFence({ turnId: finishing.turnId, modelRequestId })).established, true);
+  const lease = { leaseOwnerId: 'fixture', hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 300000).toISOString() };
+  const deliveries = [];
+  for (let index = 0; index < count; index += 1) {
+    const created = await app.runtime.deliveries.createAutomatic({ inboxItemId: await result(index, finishing.turnId),
+      targetConversationId: CONVERSATION, sourceTurnId: finishing.turnId });
+    assert.deepEqual([created.delivery.phase, created.delivery.target_turn_id], ['next_turn', null]);
+    const queued = await app.turns.runtimeContinuation({ source: { kind: 'internal', key: `runtime-delivery:${created.delivery.id}` },
+      conversationId: CONVERSATION, deliveryId: created.delivery.id, sourceTurnId: finishing.turnId, ...lease });
+    assert.equal(queued.admitted, false, 'the continuation waits behind the finishing Turn');
+    deliveries.push(created.delivery.id);
+  }
+  return { finishing, deliveries, lease };
+}
+
+async function continuationIntents(rows, deliveries) {
+  const intents = [];
+  for (const deliveryId of deliveries) {
+    const [link] = await rows('RuntimeDeliveryIntentLink', { delivery_id: deliveryId });
+    const [intent] = await rows('TurnIntent', { id: link.turn_intent_id });
+    intents.push(intent);
+  }
+  return intents;
+}
+
+for (const kind of ['child answers', 'background process results']) {
+  test(`${kind} queued behind a finishing Turn open exactly one Turn that takes them all in`, { timeout: 30000 }, async () => {
+    await withKernel(async fixture => {
+      const { app, endTurn, rows, childAnswer, processResult } = fixture;
+      const result = kind === 'child answers'
+        ? async (index, sourceTurnId) => (await childAnswer(`answer-${index}`, sourceTurnId)).inboxItemId
+        : (index, sourceTurnId) => processResult(`process-${index}`, sourceTurnId);
+      const { finishing, deliveries, lease } = await queueResultsBehindFinishingTurn(fixture, 6, result);
+      await endTurn(finishing, 'completed');
+      const admitted = await app.turns.admitNextQueued({ conversationId: CONVERSATION, ...lease });
+      assert.ok(admitted?.turnId, 'the first continuation opens a Turn');
+      for (const deliveryId of deliveries) {
+        const [delivery] = await rows('RuntimeDelivery', { id: deliveryId });
+        assert.deepEqual([delivery.state, delivery.target_turn_id], ['consumed', admitted.turnId], 'the one Turn takes in every result');
+      }
+      const intents = await continuationIntents(rows, deliveries);
+      assert.deepEqual(intents.map(intent => intent.state), ['admitted', 'cancelled', 'cancelled', 'cancelled', 'cancelled', 'cancelled']);
+      assert.deepEqual((await rows('TurnIntent')).filter(intent => intent.state === 'queued'), [], 'no queued continuation is left');
+      await takeInputs(app, rows, admitted.turnId);
+      await endTurn({ turnId: admitted.turnId, fence: await leaseFence(rows, admitted.turnId) }, 'completed');
+      assert.equal(await app.turns.admitNextQueued({ conversationId: CONVERSATION, ...lease }), null, 'no second Turn opens');
+      assert.equal((await rows('Turn', { conversation_id: CONVERSATION })).length, 2);
+    });
+  });
+}
+
+/** What the Agent loop does at its first boundary: every injected input is taken into Context. */
+async function takeInputs(app, rows, turnId) {
+  for (const input of await rows('PendingTurnInput', { turn_id: turnId, input_kind: 'runtime_delivery', state: 'pending' })) {
+    await app.runtime.deliveries.markInputHandled(input.id);
+  }
+}
+
+async function leaseFence(rows, turnId) {
+  const [lease] = await rows('ExecutionLease', { turn_id: turnId });
+  return { id: lease.id, conversationId: lease.conversation_id, turnId: lease.turn_id, ownerId: lease.owner_id,
+    hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) };
+}
+
+test('a Turn the user starts takes pending results in and cancels the continuations queued for them', { timeout: 30000 }, async () => {
+  await withKernel(async fixture => {
+    const { app, endTurn, rows, processResult, startTurn } = fixture;
+    const { finishing, deliveries, lease } = await queueResultsBehindFinishingTurn(fixture, 2,
+      (index, sourceTurnId) => processResult(`typed-process-${index}`, sourceTurnId));
+    await endTurn(finishing, 'completed');
+    const typed = await startTurn('user-types-next');
+    for (const deliveryId of deliveries) {
+      assert.equal((await rows('RuntimeDelivery', { id: deliveryId }))[0].target_turn_id, typed.turnId);
+    }
+    assert.deepEqual((await continuationIntents(rows, deliveries)).map(intent => intent.state), ['cancelled', 'cancelled'],
+      'the user Turn cancels the continuations queued for what it took in');
+    await takeInputs(app, rows, typed.turnId);
+    await endTurn(typed, 'completed');
+    assert.equal(await app.turns.admitNextQueued({ conversationId: CONVERSATION, ...lease }), null);
+    assert.equal((await rows('Turn', { conversation_id: CONVERSATION })).length, 2);
+  });
+});
+
+test('a continuation whose delivery another Turn already took in is cancelled at admission, not admitted', { timeout: 30000 }, async () => {
+  await withKernel(async fixture => {
+    const { app, endTurn, rows, processResult, startTurn } = fixture;
+    const { finishing, deliveries, lease } = await queueResultsBehindFinishingTurn(fixture, 1,
+      (index, sourceTurnId) => processResult(`stale-process-${index}`, sourceTurnId));
+    await endTurn(finishing, 'completed');
+    const taker = await startTurn('takes-the-result');
+    assert.equal((await rows('RuntimeDelivery', { id: deliveries[0] }))[0].target_turn_id, taker.turnId);
+    // Written before absorption cancelled queued continuations: the delivery was taken in and the
+    // continuation queued for it was left behind.
+    const [intent] = await continuationIntents(rows, deliveries);
+    await app.database.transaction([repo('TurnIntent').update(intent.id, { state: 'queued', updated_at: new Date().toISOString() })]);
+    await takeInputs(app, rows, taker.turnId);
+    await endTurn(taker, 'completed');
+    assert.equal(await app.turns.admitNextQueued({ conversationId: CONVERSATION, ...lease }), null, 'nothing is admitted');
+    assert.deepEqual((await continuationIntents(rows, deliveries)).map(row => row.state), ['cancelled']);
+    assert.equal((await rows('Turn', { conversation_id: CONVERSATION })).length, 2, 'no Turn opens without input');
+  });
+});

@@ -760,8 +760,13 @@ export class CollaborationControlPlane {
     const replyDeliveryIds = requests.map((request) => collaborationReplyDeliveryId(String(request.id)));
     const links = replyDeliveryIds.length === 0 ? [] : (await this.database.snapshot(replyDeliveryIds.map((deliveryId) =>
       DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').list({ where: { delivery_id: deliveryId }, limit: 1 })))).snapshot as DomainRow[][];
+    // A reply continuation spends only while it opens (or opened) a Turn: one cancelled because
+    // another Turn took its reply in never started anything. Cancellation is final, so this read
+    // only ever overstates what the transaction below adds to.
+    const replyTurns = await Promise.all(links.map(async (rows) => rows.length > 0
+      && !await this.isCancelledIntent(String(rows[0].turn_intent_id))));
     return {
-      spent: requests.length + links.filter((rows) => rows.length > 0).length,
+      spent: requests.length + replyTurns.filter(Boolean).length,
       steps: [
         DOMAIN_REPOSITORIES.domain('CollaborationRequest').assertExactIds({ budget_id: budgetId, automatic: 1n }, requests.map((row) => String(row.id))),
         ...replyDeliveryIds.filter((deliveryId, index) => links[index].length === 0 && deliveryId !== startingReplyDeliveryId)
@@ -871,6 +876,9 @@ export class CollaborationControlPlane {
       if (requests.length === 1) return this.existing('CollaborationBudget', String(requests[0].budget_id));
     }
     return null;
+  }
+  private async isCancelledIntent(turnIntentId: string): Promise<boolean> {
+    return (await this.maybe('TurnIntent', turnIntentId))?.state === 'cancelled';
   }
   private async finishRequest(request: DomainRow, state: string): Promise<void> {
     try { await this.database.transaction([DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(String(request.id), { state: 'pending' }), DOMAIN_REPOSITORIES.domain('CollaborationRequest').update(String(request.id), { state, updated_at: this.now() })]); }

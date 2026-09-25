@@ -193,6 +193,13 @@ export interface ChildContinuationAdmissionResult {
   commitSeq?: string;
 }
 
+/** A runtime continuation whose delivery another Turn already took in: cancelled, never admitted. */
+export interface ChildContinuationSuperseded {
+  superseded: true;
+  childExecutionId: string;
+  turnIntentId: string;
+}
+
 export interface ChildRuntimeDeliveryContinuationCommand {
   deliveryId: string;
   childExecutionId: string;
@@ -275,7 +282,8 @@ export interface ChildExecutionControlPlaneOptions {
   prepareNextTurnDeliverySteps?: (
     conversationId: string,
     turnId: string,
-    now: string
+    now: string,
+    startingDeliveryId: string | null
   ) => Promise<RepositoryTransactionStep[]>;
 }
 
@@ -1074,6 +1082,40 @@ export class ChildExecutionControlPlane {
     return value.kind === 'child-continuation';
   }
 
+  /**
+   * A child runtime continuation exists to open a Turn for its delivery. Once another Turn took that
+   * delivery in, admitting it would start a Turn with nothing to do: the intent and its lineage link
+   * are cancelled instead. True when they are (now) cancelled.
+   */
+  private async cancelSupersededContinuation(
+    command: ReturnType<typeof normalizeAdmissionCommand>,
+    intentLink: DomainRow,
+    deliveryId: string
+  ): Promise<boolean> {
+    const delivery = await this.maybeGet('RuntimeDelivery', deliveryId);
+    if (delivery?.state === 'pending') return false;
+    const now = this.timestamp();
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('TurnIntent').assert(command.turnIntentId, { state: 'queued', turn_id: null }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(String(intentLink.id), {
+          child_execution_id: command.childExecutionId,
+          turn_intent_id: command.turnIntentId,
+          state: 'pending'
+        }),
+        ...(delivery
+          ? [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(deliveryId, { state: delivery.state })]
+          : [DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertNone({ id: deliveryId })]),
+        DOMAIN_REPOSITORIES.domain('TurnIntent').update(command.turnIntentId, { state: 'cancelled', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').update(String(intentLink.id), { state: 'cancelled', updated_at: now })
+      ]);
+      return true;
+    } catch (error) {
+      if (!isTransactionAssertionFailure(error)) throw error;
+      return (await this.maybeGet('TurnIntent', command.turnIntentId))?.state === 'cancelled';
+    }
+  }
+
   /** Complete pending child continuations in stable lineage order; admission remains a separate CAS. */
   public async listPendingContinuations(childExecutionIdInput?: string): Promise<PendingChildContinuation[]> {
     const childExecutionId = childExecutionIdInput === undefined
@@ -1448,7 +1490,7 @@ export class ChildExecutionControlPlane {
   /** Admits a queued continuation without creating a new ChildExecution or AnswerBridge. */
   public async admitQueuedIntent(
     commandInput: ChildContinuationAdmissionCommand
-  ): Promise<ChildContinuationAdmissionResult> {
+  ): Promise<ChildContinuationAdmissionResult | ChildContinuationSuperseded> {
     const command = normalizeAdmissionCommand(commandInput);
     const ids = admissionIds(command);
     const replay = await this.findAdmissionReplay(command, ids);
@@ -1554,6 +1596,12 @@ export class ChildExecutionControlPlane {
     if (invisibleRuntimeDelivery && !deliveryIntentLink) {
       throw new Error(`Child Runtime continuation TurnIntent ${command.turnIntentId} has no RuntimeDeliveryIntentLink.`);
     }
+    const continuationDeliveryId = deliveryIntentLink
+      ? requirePhaseFId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id')
+      : null;
+    if (continuationDeliveryId && await this.cancelSupersededContinuation(command, intentLink, continuationDeliveryId)) {
+      return { superseded: true, childExecutionId: command.childExecutionId, turnIntentId: command.turnIntentId };
+    }
     if (messageContentObject.content_type === TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
       const envelope = parseInputTurnIntentEnvelopeText(
         (await this.contentStore.read(messageContentObject as ContentObjectMetadata)).toString('utf8')
@@ -1637,7 +1685,7 @@ export class ChildExecutionControlPlane {
         });
     const now = this.timestamp();
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps
-      ? await this.prepareNextTurnDeliverySteps(child.child_conversation_id as string, ids.turnId, now)
+      ? await this.prepareNextTurnDeliverySteps(child.child_conversation_id as string, ids.turnId, now, continuationDeliveryId)
       : [];
     const activeMutation = activeLink
       ? DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').update(activeLink.id as string, {
@@ -1681,6 +1729,11 @@ export class ChildExecutionControlPlane {
             delivery_id: requirePhaseFId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id'),
             turn_intent_id: command.turnIntentId
           }
+        ),
+        // The continuation opens a Turn only while its delivery still waits for one.
+        DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(
+          requirePhaseFId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id'),
+          { state: 'pending' }
         )
       ] : []),
       DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(intentLink.id as string, {

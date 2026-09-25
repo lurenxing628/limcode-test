@@ -1021,6 +1021,8 @@ export class ReliableChildAgentCoordinator {
             leaseOwnerId: this.childLeaseOwnerId,
             leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
           });
+          // Another Turn already took its delivery in: the intent was cancelled, nothing starts.
+          if ('superseded' in admitted) return { kind: 'superseded' as const };
           return { kind: 'admitted' as const, admitted };
         } catch (error) {
           // Another Host may still be clearing the previous terminal pointer. Exact admission CAS
@@ -1746,6 +1748,8 @@ export class ReliableChildAgentCoordinator {
           leaseOwnerId: this.childLeaseOwnerId,
           leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
         });
+        // A run_agent send has no delivery of its own, so it is never superseded.
+        if ('superseded' in admitted) throw new Error(`run_agent send ${sent.turnIntentId} was cancelled as a runtime continuation.`);
         this.launch(admitted.childExecutionId, admitted.turnId);
       } catch (error) {
         if (!(error instanceof CollaborationCapacityError) && !(error instanceof CollaborationMembershipChangedError) && !isTransactionAssertionFailure(error)) throw error;

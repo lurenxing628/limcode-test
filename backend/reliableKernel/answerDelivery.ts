@@ -1668,6 +1668,9 @@ export class RuntimeDeliveryControlPlane {
         continue;
       }
       steps.push(...injectionSteps(delivery, turnId, contentObjectId, now, true, await this.collaborationRequestInjectionSteps(delivery, turnId, now)));
+      // This Turn takes the delivery in, so a continuation queued to open a Turn for it would start
+      // one with nothing to do: it is cancelled here, unless it is the one this Turn admits.
+      if (delivery.id !== startingDeliveryId) steps.push(...await this.supersededContinuationSteps(String(delivery.id), now));
     }
     return steps;
   }
@@ -1994,6 +1997,29 @@ export class RuntimeDeliveryControlPlane {
     });
   }
 
+  /**
+   * Cancels the continuation still queued to open a Turn for this delivery: the Turn that takes
+   * the delivery in now does that work, so one idle period opens exactly one Turn. A cancelled
+   * intent never starts a Turn and leaves the queue at once; a child lineage link goes with it.
+   */
+  private async supersededContinuationSteps(deliveryId: string, now: string): Promise<RepositoryTransactionStep[]> {
+    const links = await this.listRows('RuntimeDeliveryIntentLink', { delivery_id: deliveryId }, 2);
+    if (links.length === 0) return [];
+    const intentId = requirePhaseFId(links[0].turn_intent_id, 'RuntimeDeliveryIntentLink.turn_intent_id');
+    const intent = await this.maybeGet('TurnIntent', intentId);
+    if (!intent || intent.state !== 'queued' || intent.turn_id !== null) return [];
+    const childLinks = (await this.listRows('ChildExecutionIntentLink', { turn_intent_id: intentId }, 2))
+      .filter((link) => link.state === 'pending');
+    return [
+      DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: 'queued', turn_id: null }),
+      DOMAIN_REPOSITORIES.domain('TurnIntent').update(intentId, { state: 'cancelled', updated_at: now }),
+      ...childLinks.flatMap((link) => [
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(String(link.id), { turn_intent_id: intentId, state: 'pending' }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').update(String(link.id), { state: 'cancelled', updated_at: now })
+      ])
+    ];
+  }
+
   private async collaborationRequestInjectionSteps(delivery: DomainRow, turnId: string, now: string): Promise<RepositoryTransactionStep[]> {
     const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));
     if (inbox.source_kind !== 'collaboration_message') return [];
@@ -2020,7 +2046,11 @@ export class RuntimeDeliveryControlPlane {
         contentObjectId,
         now,
         false,
-        [...authoritySteps, ...await this.collaborationRequestInjectionSteps(delivery, String(targetTurn.id), now)]
+        [
+          ...authoritySteps,
+          ...await this.collaborationRequestInjectionSteps(delivery, String(targetTurn.id), now),
+          ...await this.supersededContinuationSteps(String(delivery.id), now)
+        ]
       ));
       const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
       return { ...(await this.summaryFromRow(latest)), changed: true, commitSeq: commit.commitSeq };
