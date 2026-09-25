@@ -10,7 +10,7 @@ export { hasSteeringApplicationReceipt };
  */
 const receiptsByConversation = ref<Record<string, Record<string, NativeSteeringReceipt>>>({});
 
-export const STEERING_COMPLETION_NOTICE_MS = 4_000;
+export const STEERING_SUCCESS_NOTICE_MS = 4_000;
 
 export interface SteeringReceiptPresentation {
   label: string;
@@ -31,25 +31,25 @@ export function steeringReceiptPresentation(
   const provenApplied = hasSteeringApplicationReceipt(receipt, requestReceipts);
   switch (receipt.state) {
     case 'queued':
-      return { label: '已提交 · 未确认生效', detail: '已保存转向消息，尚未确认发送。', provenApplied, dismissible: false };
+      return { label: '已提交', detail: '等待发送，生效待确认。', provenApplied, dismissible: false };
     case 'sent':
-      return { label: '已发送 · 未确认生效', detail: '已发送到提供方，不能据此判断内容已生效。', provenApplied, dismissible: false };
+      return { label: '已发送', detail: '生效待确认。', provenApplied, dismissible: false };
     case 'accepted':
-      return { label: '已接受 · 未确认生效', detail: '提供方已接受提交，仍需等待精确后继响应及持久回执。', provenApplied, dismissible: false };
+      return { label: '已接受', detail: '生效待确认。', provenApplied, dismissible: false };
     case 'waiting_for_input':
-      return { label: '等待输入 · 未确认生效', detail: '提供方仍在等待必需输入；转向是否生效尚未确认。', provenApplied, dismissible: false };
+      return { label: '等待输入', detail: '生效待确认。', provenApplied, dismissible: false };
     case 'continuing':
       return provenApplied
-        ? { label: '已生效 · 正在继续', detail: '已确认后继响应与转向回执，并已提交模型上下文。', provenApplied, dismissible: false }
-        : { label: '正在继续 · 生效待确认', detail: '后继身份缺失或多条回执相互冲突，请等待并核对历史详情。', provenApplied, dismissible: false };
+        ? { label: '已生效', detail: '', provenApplied, dismissible: false }
+        : { label: '继续中', detail: '生效待确认，请核对历史。', provenApplied, dismissible: false };
     case 'completed':
       return provenApplied
-        ? { label: '已完成', detail: '已确认转向生效；输入区提示将自动收起，历史消息与回执仍保留。', provenApplied, dismissible: false }
-        : { label: '已结束 · 生效待确认', detail: '后继身份缺失或多条回执相互冲突；请核对历史详情，必要时在输入框重新提交。', provenApplied, dismissible: true };
+        ? { label: '已生效', detail: '', provenApplied, dismissible: false }
+        : { label: '已结束', detail: '生效待确认，请核对历史。', provenApplied, dismissible: false };
     case 'failed':
-      return { label: '失败 · 未生效', detail: '转向未生效；请检查原因，在输入框调整后重新提交。不会自动重发。', provenApplied, dismissible: true };
+      return { label: '转向失败', detail: '', provenApplied, dismissible: true };
     case 'delivery_unknown':
-      return { label: '投递状态未知', detail: '无法确认是否生效；请先核对后继回复及历史详情，再决定是否重新提交。不会自动重发。', provenApplied, dismissible: true };
+      return { label: '投递未知', detail: '请核对历史后决定是否重试（不会自动重发）。', provenApplied, dismissible: false };
   }
 }
 
@@ -93,9 +93,8 @@ function persistedSteeringDismissals(state: SteeringDismissalState): Record<stri
 }
 
 /**
- * Dismissed terminal receipts of one Conversation from this view's persisted state, keyed like
- * `steeringReceiptDismissKey`. A reload or a new Host session therefore does not bring back a failed
- * or unknown steer the user already closed; its durable receipt is unchanged.
+ * Dismissed failed receipts of one Conversation from this view's persisted state, keyed like
+ * `steeringReceiptDismissKey`. A reload or a new Host session does not bring back a failed steer the user already closed; its durable receipt is unchanged.
  */
 export function readSteeringDismissals(state: SteeringDismissalState, conversationId: string): Record<string, string> {
   const entries = persistedSteeringDismissals(state)[conversationId] ?? {};
@@ -104,9 +103,8 @@ export function readSteeringDismissals(state: SteeringDismissalState, conversati
 }
 
 /**
- * Remembers the dismissal of a terminal receipt (the only kind that can be dismissed; it never
- * changes again). Bounded per Conversation and in Conversations; a failing state write keeps the
- * dismissal for this session only.
+ * Remembers the dismissal of a failed receipt. Bounded per Conversation and across Conversations;
+ * a failing state write keeps the dismissal for this session only.
  */
 export function persistSteeringDismissal(state: SteeringDismissalState, receipt: NativeSteeringReceipt): void {
   if (!steeringReceiptPresentation(receipt).dismissible) return;
@@ -131,30 +129,31 @@ export function steeringStatusSessionKey(conversationId: string, sessionId: stri
   return `${sessionId}\u0000${conversationId}`;
 }
 
+/** 输入区只展示已证实生效的短暂结果和明确失败；其它回执仍保留供历史投影使用。 */
 export function visibleSteeringReceipts(
   receipts: readonly NativeSteeringReceipt[],
   now: number,
   dismissedVersions: Readonly<Record<string, string>> = {}
 ): NativeSteeringReceipt[] {
   return receipts.filter((receipt) =>
-    dismissedVersions[steeringReceiptDismissKey(receipt)] !== steeringReceiptVersion(receipt)
-    && !(receipt.state === 'completed'
-      && hasSteeringApplicationReceipt(receipt, receipts)
-      && receipt.updatedAt + STEERING_COMPLETION_NOTICE_MS <= now)
+    (receipt.state === 'failed' || hasSteeringApplicationReceipt(receipt, receipts))
+    && dismissedVersions[steeringReceiptDismissKey(receipt)] !== steeringReceiptVersion(receipt)
+    && !(hasSteeringApplicationReceipt(receipt, receipts)
+      && receipt.updatedAt + STEERING_SUCCESS_NOTICE_MS <= now)
   );
 }
 
-/** 真实定时器由 Vue 面板使用此期限唤醒，状态不需要新的推送才能自动退出。 */
-export function nextSteeringCompletionExpiry(
+/** 已证实生效的继续中/已完成回执只短暂显示；面板按期限唤醒，无需等待下一次推送。 */
+export function nextSteeringSuccessExpiry(
   receipts: readonly NativeSteeringReceipt[],
   now: number,
   dismissedVersions: Readonly<Record<string, string>> = {}
 ): number | undefined {
   let earliest: number | undefined;
   for (const receipt of receipts) {
-    if (receipt.state !== 'completed' || !hasSteeringApplicationReceipt(receipt, receipts)) continue;
+    if (!hasSteeringApplicationReceipt(receipt, receipts)) continue;
     if (dismissedVersions[steeringReceiptDismissKey(receipt)] === steeringReceiptVersion(receipt)) continue;
-    const deadline = receipt.updatedAt + STEERING_COMPLETION_NOTICE_MS;
+    const deadline = receipt.updatedAt + STEERING_SUCCESS_NOTICE_MS;
     if (deadline <= now) continue;
     if (earliest === undefined || deadline < earliest) earliest = deadline;
   }

@@ -3,10 +3,10 @@ import test from 'node:test';
 import { projectReliableConversation } from '../src/domain/reliableConversationProjection.ts';
 import { modelRequestNativeCapabilities } from '../src/reliability/modelRequestStreamStats.ts';
 import {
-  STEERING_COMPLETION_NOTICE_MS,
+  STEERING_SUCCESS_NOTICE_MS,
   hasSteeringApplicationReceipt,
   mergeSteeringReceipts,
-  nextSteeringCompletionExpiry,
+  nextSteeringSuccessExpiry,
   steeringReceiptDismissKey,
   steeringReceiptPresentation,
   steeringReceiptVersion,
@@ -429,7 +429,7 @@ test('reload projects confirmed boundaries from durable receipt and stamped revi
   ]);
 });
 
-test('accepted ACK is not application proof; completed UI exits after 4s, durable receipt remains', () => {
+test('accepted ACK is not application proof; proven continuation and completion notices exit after 4s', () => {
   const id = 'presentation-test-conversation';
   const accepted = { ...STEER_RECEIPT, conversationId: id, state: 'accepted' as const, updatedAt: 25_000 };
   for (const state of ['queued', 'sent', 'accepted', 'waiting_for_input'] as const) {
@@ -437,6 +437,9 @@ test('accepted ACK is not application proof; completed UI exits after 4s, durabl
     assert.equal(hasSteeringApplicationReceipt(candidate), false);
     assert.equal(steeringReceiptPresentation(candidate).provenApplied, false);
   }
+  const continuing = { ...STEER_RECEIPT, conversationId: id, state: 'continuing' as const, updatedAt: 25_500 };
+  assert.deepEqual(visibleSteeringReceipts([continuing], 25_500 + STEERING_SUCCESS_NOTICE_MS), [],
+    '生效已经确认时无需等待整个回复结束才收起提示');
   const completed = { ...STEER_RECEIPT, conversationId: id, state: 'completed' as const, updatedAt: 26_000 };
   mergeSteeringReceipts(id, [completed]);
   mergeSteeringReceipts(id, [{ ...accepted, updatedAt: 27_000 }]);
@@ -444,33 +447,32 @@ test('accepted ACK is not application proof; completed UI exits after 4s, durabl
     'Host 重读迟到的旧 ACK，即使 timestamp 较新也不能让终态回退');
   assert.notEqual(steeringStatusSessionKey(id, 'host-before'), steeringStatusSessionKey(id, 'host-after'));
   assert.deepEqual(visibleSteeringReceipts([completed], 26_000), [completed]);
-  assert.equal(nextSteeringCompletionExpiry([completed], 26_000), 26_000 + STEERING_COMPLETION_NOTICE_MS);
-  assert.deepEqual(visibleSteeringReceipts([completed], 26_000 + STEERING_COMPLETION_NOTICE_MS), []);
+  assert.equal(nextSteeringSuccessExpiry([completed], 26_000), 26_000 + STEERING_SUCCESS_NOTICE_MS);
+  assert.deepEqual(visibleSteeringReceipts([completed], 26_000 + STEERING_SUCCESS_NOTICE_MS), []);
   assert.deepEqual(steeringReceiptsByConversationState().value[id]?.[completed.submissionId], completed,
     '仅 UI 消失，已持久回执依然可供重读/投影');
 });
 
-test('failure and uncertain delivery remain visible until dismissed, without an automatic retry', () => {
-  for (const state of ['failed', 'delivery_unknown'] as const) {
-    const receipt = { ...STEER_RECEIPT, state };
-    assert.equal(steeringReceiptPresentation(receipt).dismissible, true);
-    assert.match(steeringReceiptPresentation(receipt).detail, /重新|核对|确认/);
-    assert.deepEqual(visibleSteeringReceipts([receipt], 100_000), [receipt]);
-    const dismissed = { [steeringReceiptDismissKey(receipt)]: steeringReceiptVersion(receipt) };
-    assert.deepEqual(visibleSteeringReceipts([receipt], 100_000, dismissed), []);
-    assert.deepEqual(visibleSteeringReceipts([{ ...receipt, updatedAt: receipt.updatedAt + 1 }], 100_000, dismissed).length, 1);
-  }
+test('only failed receipts need manual dismissal; unknown or unproven states do not create notices', () => {
+  const failed = { ...STEER_RECEIPT, state: 'failed' as const, message: '提供方拒绝' };
+  assert.equal(steeringReceiptPresentation(failed).dismissible, true);
+  assert.equal(steeringReceiptPresentation(failed).detail, '');
+  assert.deepEqual(visibleSteeringReceipts([failed], 100_000), [failed]);
+  const dismissed = { [steeringReceiptDismissKey(failed)]: steeringReceiptVersion(failed) };
+  assert.deepEqual(visibleSteeringReceipts([failed], 100_000, dismissed), []);
+  assert.deepEqual(visibleSteeringReceipts([{ ...failed, updatedAt: failed.updatedAt + 1 }], 100_000, dismissed).length, 1);
+  const unknown = { ...STEER_RECEIPT, state: 'delivery_unknown' as const };
+  assert.equal(steeringReceiptPresentation(unknown).dismissible, false);
+  assert.deepEqual(visibleSteeringReceipts([unknown], 100_000), []);
   const incomplete = { ...STEER_RECEIPT, state: 'completed' as const, successorResponseId: undefined };
-  assert.deepEqual(visibleSteeringReceipts([incomplete], 100_000), [incomplete],
-    '生效证明不完整时禁止按成功终态自动隐藏');
+  assert.deepEqual(visibleSteeringReceipts([incomplete], 100_000), [],
+    '生效证明不完整时不显示成功提示');
   assert.notEqual(steeringReceiptVersion(incomplete), steeringReceiptVersion({
     ...incomplete, successorResponseId: 'resp-2'
-  }), '同毫秒补齐后继证据时，用户关闭的仅是旧状态提示');
-  assert.deepEqual(visibleSteeringReceipts([STEER_RECEIPT, {
+  }), '同毫秒补齐后继证据时仍能识别新的真实结果');
+  assert.deepEqual(visibleSteeringReceipts([{ ...STEER_RECEIPT, updatedAt: SECOND_STEER_RECEIPT.updatedAt }, {
     ...SECOND_STEER_RECEIPT, targetResponseId: 'resp-1', state: 'completed'
-  }], 100_000), [STEER_RECEIPT, {
-    ...SECOND_STEER_RECEIPT, targetResponseId: 'resp-1', state: 'completed'
-  }], '争议中的完成回执不按已生效完成自动隐藏');
+  }], SECOND_STEER_RECEIPT.updatedAt), [], '相互冲突的回执不能显示为成功');
 });
 
 test('unstamped aggregate content is never split', () => {

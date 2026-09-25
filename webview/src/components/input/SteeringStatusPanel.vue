@@ -7,7 +7,7 @@ import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import {
   STEERING_DISMISSAL_STATE_KEY,
-  nextSteeringCompletionExpiry,
+  nextSteeringSuccessExpiry,
   persistSteeringDismissal,
   readSteeringDismissals,
   steeringReceiptDismissKey,
@@ -24,12 +24,11 @@ const reliableConversation = useReliableConversation();
 const listScroller = ref<HTMLElement | null>(null);
 const now = ref(Date.now());
 const dismissedReceiptVersions = ref<Record<string, string>>({});
-const dismissedPendingKey = ref('');
 const statusReadError = ref('');
 const requestedStatusSessions = new Set<string>();
 const pendingStatusCommands = new Map<string, string>();
 const statusCommandIds = new Set<string>();
-let completionTimer: ReturnType<typeof setTimeout> | undefined;
+let successTimer: ReturnType<typeof setTimeout> | undefined;
 
 const conversationId = computed(() => reliableConversation.conversationId.value);
 const dismissalState: SteeringDismissalState = {
@@ -47,21 +46,13 @@ const receipts = computed(() => visibleSteeringReceipts(
 ).slice(0, 8));
 const failure = computed(() => {
   const candidate = currentSteeringFailure.value;
-  return candidate?.commandId && statusCommandIds.has(candidate.commandId) ? undefined : candidate;
+  if (candidate?.commandId && (
+    statusCommandIds.has(candidate.commandId)
+    || currentSteeringReceipts.value.some((receipt) =>
+      receipt.submissionId === candidate.commandId && receipt.state === 'failed')
+  )) return undefined;
+  return candidate;
 });
-const pendingMessageIds = computed(() => reliableConversation.projection.value.pendingSteeringBoundaryMessageIds);
-const pendingKey = computed(() => {
-  const projection = reliableConversation.projection.value;
-  return [conversationId.value, reliableConversation.feed.sessionId,
-    ...currentSteeringReceipts.value.map((receipt) =>
-      `${steeringReceiptDismissKey(receipt)}:${steeringReceiptVersion(receipt)}`
-    ),
-    ...pendingMessageIds.value.map((id) =>
-      `${id}:${projection.messageRevisionIdByMessageId[projection.splitSourceMessageIdByMessageId[id] ?? id] ?? ''}`
-    )
-  ].join('\u0000');
-});
-const showPending = computed(() => pendingMessageIds.value.length > 0 && dismissedPendingKey.value !== pendingKey.value);
 
 /** status 仅读取已持久化回执；Host feed session 更新时必须从新 Host 再读一次。 */
 function refreshReceipts(): void {
@@ -87,7 +78,7 @@ function refreshReceipts(): void {
       pendingStatusCommands.delete(commandId);
       statusCommandIds.delete(commandId);
     }
-    statusReadError.value = '读取转向回执失败，请重新读取；不会自动重发转向内容。';
+    statusReadError.value = '回执读取失败';
   }
 }
 
@@ -100,7 +91,7 @@ const stopStatusResults = bridge.on(BridgeMessageType.TurnSteerResult, ({ payloa
   const sessionId = reliableConversation.feed.sessionId;
   if (!sessionId || statusKey !== steeringStatusSessionKey(conversationId.value, sessionId)) return;
   statusReadError.value = payload.error
-    ? `读取转向回执失败：${payload.error}。请重新读取；不会自动重发转向内容。`
+    ? `回执读取失败：${payload.error}`
     : '';
 });
 
@@ -114,24 +105,24 @@ watch(
   { immediate: true }
 );
 
-function scheduleCompletionExit(): void {
-  if (completionTimer !== undefined) clearTimeout(completionTimer);
+function scheduleSuccessExit(): void {
+  if (successTimer !== undefined) clearTimeout(successTimer);
   now.value = Date.now();
-  const deadline = nextSteeringCompletionExpiry(
+  const deadline = nextSteeringSuccessExpiry(
     currentSteeringReceipts.value,
     now.value,
     dismissedReceiptVersions.value
   );
   if (deadline === undefined) return;
-  completionTimer = setTimeout(() => {
-    completionTimer = undefined;
-    scheduleCompletionExit();
+  successTimer = setTimeout(() => {
+    successTimer = undefined;
+    scheduleSuccessExit();
   }, Math.min(Math.max(1, deadline - now.value), 2_147_483_647));
 }
 
-watch([conversationId, currentSteeringReceipts], scheduleCompletionExit, { immediate: true });
+watch([conversationId, currentSteeringReceipts], scheduleSuccessExit, { immediate: true });
 onBeforeUnmount(() => {
-  if (completionTimer !== undefined) clearTimeout(completionTimer);
+  if (successTimer !== undefined) clearTimeout(successTimer);
   stopStatusResults();
   pendingStatusCommands.clear();
 });
@@ -141,9 +132,7 @@ function presentation(receipt: NativeSteeringReceipt) {
 }
 
 function receiptDetail(receipt: NativeSteeringReceipt): string {
-  const detail = presentation(receipt).detail;
-  const message = receipt.message?.trim();
-  return message ? `${message} ${detail}` : detail;
+  return receipt.state === 'failed' ? receipt.message?.trim() || '' : '';
 }
 
 function dismissReceipt(receipt: NativeSteeringReceipt): void {
@@ -163,15 +152,12 @@ function formatTime(value: number): string {
 </script>
 
 <template>
-  <section v-if="receipts.length > 0 || failure || statusReadError || showPending" class="steering-status" aria-label="转向回执状态">
-    <div class="steering-status-header">
-      <span class="steering-status-title">转向回执</span>
-      <span class="steering-status-hint">已发送 / 已接受不代表生效</span>
-    </div>
+  <section v-if="receipts.length > 0 || failure || statusReadError" class="steering-status" aria-label="转向回执状态">
+    <div class="steering-status-title">转向回执</div>
 
     <div v-if="failure" class="steering-status-error" role="alert">
       <IconAlertCircle :size="14" stroke="2" aria-hidden="true" />
-      <span>{{ failure.message }} 请核对回执后在输入框重新提交；不会自动重发。</span>
+      <span>{{ failure.message }}</span>
       <button type="button" aria-label="关闭转向失败提示" @click="dismissSteeringFailure">
         <IconX :size="13" stroke="2" aria-hidden="true" />
       </button>
@@ -180,16 +166,8 @@ function formatTime(value: number): string {
     <div v-if="statusReadError" class="steering-status-error" role="alert">
       <IconAlertCircle :size="14" stroke="2" aria-hidden="true" />
       <span>{{ statusReadError }}</span>
-      <button type="button" class="steering-status-action" @click="refreshReceipts">重新读取</button>
+      <button type="button" class="steering-status-action" @click="refreshReceipts">重试</button>
       <button type="button" aria-label="关闭回执读取失败提示" @click="statusReadError = ''">
-        <IconX :size="13" stroke="2" aria-hidden="true" />
-      </button>
-    </div>
-
-    <div v-if="showPending" class="steering-status-pending" role="status">
-      <span>后续响应归属待确认；已证实的转向仍单独显示。请核对历史详情。</span>
-      <button type="button" class="steering-status-action" @click="refreshReceipts">重新读取回执</button>
-      <button type="button" aria-label="关闭待确认提示" @click="dismissedPendingKey = pendingKey">
         <IconX :size="13" stroke="2" aria-hidden="true" />
       </button>
     </div>
@@ -203,7 +181,7 @@ function formatTime(value: number): string {
           :class="`is-${receipt.state}`"
         >
           <span class="steering-state-chip">{{ presentation(receipt).label }}</span>
-          <span class="steering-state-detail">{{ receiptDetail(receipt) }}</span>
+          <span v-if="receiptDetail(receipt)" class="steering-state-detail">{{ receiptDetail(receipt) }}</span>
           <span class="steering-state-time">{{ formatTime(receipt.updatedAt) }}</span>
           <button
             v-if="presentation(receipt).dismissible"
@@ -232,25 +210,12 @@ function formatTime(value: number): string {
   background: var(--vscode-sideBar-background, transparent);
 }
 
-.steering-status-header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-2);
-}
-
 .steering-status-title {
   font-size: var(--font-size-xs);
   color: var(--vscode-foreground);
 }
 
-.steering-status-hint {
-  font-size: var(--font-size-xs);
-  color: var(--vscode-descriptionForeground);
-}
-
-.steering-status-error,
-.steering-status-pending {
+.steering-status-error {
   display: flex;
   align-items: center;
   gap: var(--space-1);
@@ -260,8 +225,7 @@ function formatTime(value: number): string {
 
 .steering-status-error { color: var(--vscode-errorForeground); }
 
-.steering-status-error span,
-.steering-status-pending span { flex: 1 1 auto; }
+.steering-status-error span { flex: 1 1 auto; }
 
 .steering-status button {
   display: inline-flex;
