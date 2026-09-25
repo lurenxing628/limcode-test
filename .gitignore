@@ -87,6 +87,7 @@ docs/architecture/*
 !/tests/reliable-kernel/command-router-interaction.test.mjs
 !/tests/reliable-kernel/conversation-settings-isolation.test.mjs
 !/tests/reliable-kernel/work-environment-transfer-boundary.test.cjs
+!/tests/reliable-kernel/run-local-tests-cleanup.test.mjs
 !/tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs
 !/tests/reliable-kernel/reliable-control-lifecycle.test.mjs
 !/tests/reliable-kernel/plan-interrupt-recovery.test.mjs

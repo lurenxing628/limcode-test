@@ -155,6 +155,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/active-turn-work-environment-projection.test.mjs',
   'tests/reliable-kernel/runtime-dataset-commands.test.cjs',
   'tests/reliable-kernel/work-environment-transfer-boundary.test.cjs',
+  'tests/reliable-kernel/run-local-tests-cleanup.test.mjs',
   'tests/runAgentToolSchema.test.cjs',
   'tests/settingsRevisionConflict.test.cjs',
   'tests/storageLockRace.test.cjs',
@@ -208,9 +209,18 @@ const TEST_TIMEOUT_MS = 30 * 60 * 1000;
 // real rather than merely sorting the argv list.
 // SSR bundles keep bare package imports (vue) external; Node resolves them by walking up from the
 // bundle, so the bundle must live inside this checkout's node_modules tree, not the system tmpdir.
+const WEBVIEW_BUILD_PREFIX = 'limcode-webview-tests-';
 const webviewTestCache = path.join(root, 'node_modules', '.cache');
 fs.mkdirSync(webviewTestCache, { recursive: true });
-const webviewTestRoot = fs.mkdtempSync(path.join(webviewTestCache, 'limcode-webview-tests-'));
+removeAbandonedWebviewBuilds(webviewTestCache);
+// The owner PID in the name lets a later run tell an abandoned build from one still in use by a
+// concurrent run of another checkout that shares this node_modules tree.
+const webviewTestRoot = fs.mkdtempSync(path.join(webviewTestCache, `${WEBVIEW_BUILD_PREFIX}${process.pid}-`));
+const removeWebviewTestRoot = () => fs.rmSync(webviewTestRoot, { recursive: true, force: true });
+process.on('exit', removeWebviewTestRoot);
+let testRun;
+let stoppedBy;
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => stopForSignal(signal));
 // Vite sets NODE_ENV while bundling; do not leak its production environment into Node/SSR tests.
 const testEnvironment = { ...process.env };
 let result;
@@ -236,19 +246,77 @@ try {
   const runnableFiles = files.map(file => file.endsWith('.ts')
     ? path.join(webviewTestRoot, `${path.basename(file, '.ts')}.mjs`)
     : file);
-  result = childProcess.spawnSync(
-    process.execPath,
-    ['--test', '--test-concurrency=1', ...runnableFiles],
-    { cwd: root, env: testEnvironment, stdio: 'inherit', timeout: TEST_TIMEOUT_MS }
-  );
+  // Asynchronous so this process can still react to a stop signal while the suite runs.
+  result = await runTests(runnableFiles);
 } finally {
-  fs.rmSync(webviewTestRoot, { recursive: true, force: true });
+  removeWebviewTestRoot();
 }
-if (result.error) {
-  if (result.error.code === 'ETIMEDOUT') {
-    console.error(`本机测试超过${Math.round(TEST_TIMEOUT_MS / 60000)}分钟上限，已强制终止。`);
-    process.exit(1);
-  }
-  throw result.error;
+if (stoppedBy) process.exit(signalExitCode(stoppedBy));
+if (result.timedOut) {
+  console.error(`本机测试超过${Math.round(TEST_TIMEOUT_MS / 60000)}分钟上限，已强制终止。`);
+  process.exit(1);
 }
 process.exit(result.status ?? 1);
+
+function runTests(runnableFiles) {
+  return new Promise((resolve, reject) => {
+    testRun = childProcess.spawn(
+      process.execPath,
+      ['--test', '--test-concurrency=1', ...runnableFiles],
+      { cwd: root, env: testEnvironment, stdio: 'inherit' }
+    );
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      testRun.kill('SIGTERM');
+    }, TEST_TIMEOUT_MS);
+    testRun.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    testRun.once('close', (status) => {
+      clearTimeout(timer);
+      resolve({ status, timedOut });
+    });
+  });
+}
+
+/**
+ * Stop signals default to terminating this runner without running `finally`, which left one build
+ * behind per interrupted run. While the suite runs, forward the signal and let the normal path
+ * remove the build after the suite exits; before that, exit now and let the exit hook remove it.
+ */
+function stopForSignal(signal) {
+  stoppedBy ??= signal;
+  if (testRun && testRun.exitCode === null && testRun.signalCode === null) {
+    testRun.kill(signal);
+    return;
+  }
+  process.exit(signalExitCode(signal));
+}
+
+function signalExitCode(signal) {
+  return 128 + (os.constants.signals[signal] ?? 0);
+}
+
+/** Removes builds left by runs that died without cleanup; a live owner's build is never touched. */
+function removeAbandonedWebviewBuilds(cacheDirectory) {
+  for (const entry of fs.readdirSync(cacheDirectory, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(WEBVIEW_BUILD_PREFIX)) continue;
+    const owner = /^\d+(?=-)/.exec(entry.name.slice(WEBVIEW_BUILD_PREFIX.length))?.[0];
+    const abandoned = owner
+      ? !processIsAlive(Number(owner))
+      // A build named without its owner cannot be checked; one older than any possible run is abandoned.
+      : Date.now() - fs.statSync(path.join(cacheDirectory, entry.name)).mtimeMs > 2 * TEST_TIMEOUT_MS;
+    if (abandoned) fs.rmSync(path.join(cacheDirectory, entry.name), { recursive: true, force: true });
+  }
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}

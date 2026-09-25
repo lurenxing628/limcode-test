@@ -193,6 +193,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/active-turn-work-environment-projection.test.mjs',
   'tests/reliable-kernel/runtime-dataset-commands.test.cjs',
   'tests/reliable-kernel/work-environment-transfer-boundary.test.cjs',
+  'tests/reliable-kernel/run-local-tests-cleanup.test.mjs',
   'tests/llmErrorRedaction.test.cjs',
   'tests/localFileResources.test.cjs',
   'tests/processSpoolCleanup.test.cjs',
