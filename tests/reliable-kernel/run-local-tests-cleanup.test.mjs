@@ -6,10 +6,12 @@ import path from 'node:path';
 import test from 'node:test';
 
 const runner = path.join(process.cwd(), 'scripts', 'reliable-kernel', 'run-local-tests.mjs');
-const WEBVIEW_TEST_FILES = [
-  'reliableConversationProjection', 'segmentedTimeline', 'nativeConversationProjection', 'forkRequestLifecycle',
-  'reliableCollaborationTimeline', 'summaryRebuildPreview', 'compressionTokenChange'
-];
+// The fixture needs every webview test the runner builds; take the runner's own list so a newly
+// registered webview test cannot make the fixture build fail before its tests start.
+const WEBVIEW_TEST_FILES = childProcess.spawnSync(process.execPath, [runner, '--list'], { encoding: 'utf8' }).stdout
+  .split('\n')
+  .filter((file) => file.startsWith('webview/tests/'))
+  .map((file) => path.basename(file, '.test.ts'));
 const BUILD_PREFIX = 'limcode-webview-tests-';
 
 /** A checkout-shaped fixture: the runner builds its webview tests into <root>/node_modules/.cache. */
