@@ -171,7 +171,6 @@ export interface NativePendingToolCall {
   settled: boolean;
   /** A native_delivery ToolCallEvent records a server-admitted result delivery. */
   delivered: boolean;
-  admittedAt: string;
 }
 
 export interface NativeResultDeliveryInput {
@@ -303,6 +302,10 @@ interface CommandReceiptPreflight {
 }
 
 const ACTIVE_TURN = 'active';
+/** Turns or ToolCalls whose native facts are read in one worker snapshot (five reads per call). */
+const NATIVE_PENDING_WORK_BATCH = 200;
+/** One repository page of a Turn's ToolCalls inside the batched listing snapshot. */
+const NATIVE_PENDING_TOOL_CALL_PAGE = 1000;
 const TERMINAL_TURN = 'terminated';
 const EFFECT_KINDS: readonly PhaseDEffectKind[] = [
   'file_mutation',
@@ -751,91 +754,156 @@ export class EffectControlPlane {
   }
 
   /**
-   * Outstanding native work of one Conversation (optionally one Turn): durably admitted native
-   * calls whose result is not settled, not server-admission-marked, or whose result Context
-   * occurrence is not appended yet. Fully closed calls are omitted; callers filter by turnActive
-   * and the settled/delivered flags for their own guard semantics.
+   * Open native work of one Conversation (optionally one Turn): durably admitted native calls
+   * whose result is not settled or whose call/result Context occurrence is missing. A call closed
+   * in Context is not open work even without a provider native_delivery fact (a chain closed
+   * locally never gets one); `includeUndelivered` additionally returns those closed-undelivered
+   * calls for callers that attach a later carrier delivery. Every per-call fact is read in bounded
+   * batched snapshots instead of sequential round-trips per call.
    */
   public async listNativePendingWork(input: {
     conversationId: string;
     turnId?: string;
+    includeUndelivered?: boolean;
   }): Promise<NativePendingToolCall[]> {
     const conversationId = requireId(input.conversationId, 'conversationId');
     const turns = input.turnId === undefined
       ? await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId })
       : [await this.requireExisting('Turn', requireId(input.turnId, 'turnId'))];
-    const pending: NativePendingToolCall[] = [];
     for (const turn of turns) {
       if (turn.conversation_id !== conversationId) {
         throw new Error(`Turn ${String(turn.id)} belongs to another Conversation.`);
       }
-      const calls = await listAllDomainRows(this.database, 'ToolCall', { turn_id: turn.id as string });
-      for (const call of calls) {
-        const toolCallId = requireId(call.id, 'ToolCall.id');
-        const admissions = await this.list('ToolCallEvent', {
-          tool_call_id: toolCallId,
-          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
-        }, 2);
-        if (admissions.length === 0) continue;
-        if (admissions.length > 1) {
-          throw new Error(`ToolCall ${toolCallId} has multiple native admission events.`);
-        }
-        const links = await this.list('ToolCallSourceLink', { tool_call_id: toolCallId }, 2);
-        if (links.length !== 1) {
-          throw new Error(`Native ToolCall ${toolCallId} lacks its unique ToolCallSourceLink.`);
-        }
-        const results = await this.list('ToolModelResult', { tool_call_id: toolCallId }, 2);
-        if (results.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple ToolModelResult rows.`);
-        const result = results[0];
-        const deliveries = await this.list('ToolCallEvent', {
-          tool_call_id: toolCallId,
-          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
-        }, 2);
-        if (deliveries.length > 1) {
-          throw new Error(`ToolCall ${toolCallId} has multiple native delivery events.`);
-        }
-        const callSources = await this.list('ContextSegmentSource', {
-          source_kind: 'tool_call',
-          source_id: toolCallId
-        }, 2);
-        if (callSources.length > 1) {
-          throw new Error(`ToolCall ${toolCallId} has multiple Context occurrences.`);
-        }
-        const resultSources = result === undefined
-          ? []
-          : await this.list('ContextSegmentSource', {
-              source_kind: 'tool_model_result',
-              source_id: requireId(result.id, 'ToolModelResult.id')
-            }, 2);
-        if (resultSources.length > 1) {
-          throw new Error(`ToolModelResult ${String(result?.id)} has multiple Context occurrences.`);
-        }
-        const resultContextSegmentId = resultSources.length === 1
-          ? requireId(resultSources[0].segment_id, 'ContextSegmentSource.segment_id')
-          : undefined;
-        const settled = result !== undefined;
-        const delivered = deliveries.length === 1;
-        if (settled && delivered && resultContextSegmentId !== undefined) continue;
-        const admission = parseNativeAdmissionContent(await this.readToolCallEventContent(admissions[0]));
-        pending.push({
-          toolCallId,
-          toolName: requireText(call.tool_name, 'ToolCall.tool_name'),
-          turnId: requireId(turn.id, 'Turn.id'),
-          turnActive: turn.status === ACTIVE_TURN,
-          status: requireText(call.status, 'ToolCall.status'),
-          providerCallId: admission.providerCallId,
-          messageId: requireId(links[0].message_id, 'ToolCallSourceLink.message_id'),
-          modelRequestId: requireId(links[0].model_request_id, 'ToolCallSourceLink.model_request_id'),
-          toolModelResultId: result === undefined ? undefined : requireId(result.id, 'ToolModelResult.id'),
-          callContextSegmentId: callSources.length === 1
-            ? requireId(callSources[0].segment_id, 'ContextSegmentSource.segment_id')
-            : undefined,
-          resultContextSegmentId,
-          settled,
-          delivered,
-          admittedAt: admission.admittedAt
-        });
+    }
+    // ToolCalls of many Turns are listed in one snapshot per chunk; only a Turn filling a whole
+    // page falls back to paginated listing.
+    const calls: Array<{ turn: DomainRow; call: DomainRow }> = [];
+    for (let offset = 0; offset < turns.length; offset += NATIVE_PENDING_WORK_BATCH) {
+      const chunk = turns.slice(offset, offset + NATIVE_PENDING_WORK_BATCH);
+      const listed = await this.database.snapshot(chunk.map((turn) =>
+        DOMAIN_REPOSITORIES.domain('ToolCall').list({
+          where: { turn_id: requireId(turn.id, 'Turn.id') },
+          orderBy: { column: 'id', direction: 'asc' },
+          limit: NATIVE_PENDING_TOOL_CALL_PAGE
+        })
+      ));
+      for (const [index, turn] of chunk.entries()) {
+        const page = listed.snapshot[index];
+        if (!Array.isArray(page)) throw new TypeError('Native pending-work ToolCall read did not return rows.');
+        const turnCalls = page.length < NATIVE_PENDING_TOOL_CALL_PAGE
+          ? page
+          : await listAllDomainRows(this.database, 'ToolCall', { turn_id: requireId(turn.id, 'Turn.id') });
+        for (const call of turnCalls) calls.push({ turn, call });
       }
+    }
+    const pending: NativePendingToolCall[] = [];
+    for (let offset = 0; offset < calls.length; offset += NATIVE_PENDING_WORK_BATCH) {
+      pending.push(...await this.readNativePendingBatch(
+        calls.slice(offset, offset + NATIVE_PENDING_WORK_BATCH),
+        input.includeUndelivered === true
+      ));
+    }
+    return pending;
+  }
+
+  private async readNativePendingBatch(
+    batch: ReadonlyArray<{ turn: DomainRow; call: DomainRow }>,
+    includeUndelivered: boolean
+  ): Promise<NativePendingToolCall[]> {
+    const calls = batch.map((entry) => entry.call);
+    const toolCallIds = calls.map((call) => requireId(call.id, 'ToolCall.id'));
+    const facts = await this.database.snapshot(toolCallIds.flatMap((toolCallId) => [
+      DOMAIN_REPOSITORIES.domain('ToolCallEvent').list({
+        where: { tool_call_id: toolCallId, event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION }, limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({ where: { tool_call_id: toolCallId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('ToolModelResult').list({ where: { tool_call_id: toolCallId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('ToolCallEvent').list({
+        where: { tool_call_id: toolCallId, event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY }, limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'tool_call', source_id: toolCallId }, limit: 2
+      })
+    ]));
+    const batchRows = (index: number): DomainRow[] => {
+      const value = facts.snapshot[index];
+      if (!Array.isArray(value)) throw new TypeError('Native pending-work batch read did not return rows.');
+      return value;
+    };
+    const admitted: Array<{
+      turn: DomainRow;
+      call: DomainRow;
+      toolCallId: string;
+      link: DomainRow;
+      result?: DomainRow;
+      delivered: boolean;
+      callSource?: DomainRow;
+    }> = [];
+    for (const [index, call] of calls.entries()) {
+      const toolCallId = toolCallIds[index]!;
+      const base = index * 5;
+      const admissions = batchRows(base);
+      if (admissions.length === 0) continue;
+      if (admissions.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple native admission events.`);
+      const links = batchRows(base + 1);
+      if (links.length !== 1) throw new Error(`Native ToolCall ${toolCallId} lacks its unique ToolCallSourceLink.`);
+      const results = batchRows(base + 2);
+      if (results.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple ToolModelResult rows.`);
+      const deliveries = batchRows(base + 3);
+      if (deliveries.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple native delivery events.`);
+      const callSources = batchRows(base + 4);
+      if (callSources.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple Context occurrences.`);
+      admitted.push({
+        turn: batch[index]!.turn, call, toolCallId, link: links[0]!,
+        ...(results[0] ? { result: results[0] } : {}),
+        delivered: deliveries.length === 1,
+        ...(callSources[0] ? { callSource: callSources[0] } : {})
+      });
+    }
+    const settledEntries = admitted.filter((entry) => entry.result !== undefined);
+    const resultFacts = settledEntries.length === 0 ? { snapshot: [] } : await this.database.snapshot(
+      settledEntries.map((entry) => DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'tool_model_result', source_id: requireId(entry.result!.id, 'ToolModelResult.id') },
+        limit: 2
+      }))
+    );
+    const resultSourceByCall = new Map<string, DomainRow>();
+    for (const [index, entry] of settledEntries.entries()) {
+      const sources = resultFacts.snapshot[index];
+      if (!Array.isArray(sources)) throw new TypeError('Native result occurrence batch read did not return rows.');
+      if (sources.length > 1) {
+        throw new Error(`ToolModelResult ${String(entry.result!.id)} has multiple Context occurrences.`);
+      }
+      if (sources[0]) resultSourceByCall.set(entry.toolCallId, sources[0]);
+    }
+    const pending: NativePendingToolCall[] = [];
+    for (const entry of admitted) {
+      const resultSource = resultSourceByCall.get(entry.toolCallId);
+      const settled = entry.result !== undefined;
+      const closed = settled && entry.callSource !== undefined && resultSource !== undefined;
+      if (closed && (entry.delivered || !includeUndelivered)) continue;
+      // The admission and its SourceLink commit together from the same provider call identity;
+      // reading the link avoids a CAS read per listed call.
+      const providerCallId = requireText(entry.link.provider_call_id, 'Native ToolCallSourceLink.provider_call_id');
+      pending.push({
+        toolCallId: entry.toolCallId,
+        toolName: requireText(entry.call.tool_name, 'ToolCall.tool_name'),
+        turnId: requireId(entry.turn.id, 'Turn.id'),
+        turnActive: entry.turn.status === ACTIVE_TURN,
+        status: requireText(entry.call.status, 'ToolCall.status'),
+        providerCallId,
+        messageId: requireId(entry.link.message_id, 'ToolCallSourceLink.message_id'),
+        modelRequestId: requireId(entry.link.model_request_id, 'ToolCallSourceLink.model_request_id'),
+        toolModelResultId: entry.result === undefined ? undefined : requireId(entry.result.id, 'ToolModelResult.id'),
+        callContextSegmentId: entry.callSource === undefined
+          ? undefined
+          : requireId(entry.callSource.segment_id, 'ContextSegmentSource.segment_id'),
+        resultContextSegmentId: resultSource === undefined
+          ? undefined
+          : requireId(resultSource.segment_id, 'ContextSegmentSource.segment_id'),
+        settled,
+        delivered: entry.delivered
+      });
     }
     return pending;
   }

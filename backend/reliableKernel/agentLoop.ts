@@ -2710,7 +2710,12 @@ export class ReliableAgentLoop {
     admittedToolResultCallIds: readonly string[]
   ): Promise<void> {
     const admittedCallIds = new Set(admittedToolResultCallIds);
-    const pending = (await this.effects.listNativePendingWork({ conversationId }))
+    // Only settled results of EARLIER requests of this same Turn can be carried here. The first
+    // request of a Turn has nothing earlier: skip the scan (every new full request's first
+    // response.created lists all history results it re-sent).
+    const carrier = await this.maybeGet('ModelRequest', carrierModelRequestId);
+    if (!carrier || requirePositiveInteger(carrier.request_seq, 'ModelRequest.request_seq') <= 1n) return;
+    const pending = (await this.effects.listNativePendingWork({ conversationId, turnId, includeUndelivered: true }))
       .filter((entry) =>
         entry.turnId === turnId
         && entry.modelRequestId !== carrierModelRequestId

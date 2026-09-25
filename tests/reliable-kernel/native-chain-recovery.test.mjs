@@ -726,6 +726,42 @@ test('a synchronous admitted call still running parks the Turn even when another
   });
 });
 
+test('closed native calls without a provider delivery are not open work, and listing is batched', { timeout: 60000 }, async () => {
+  const callIds = Array.from({ length: 24 }, (_, index) => `call-${index}`);
+  await withNativeKernel({
+    async script({ round, emit, responseId, ended }) {
+      if (round === 0) {
+        await emitToolResponse(emit, responseId, callIds);
+        await ended.promise;
+        await emit('completed', { role: 'model', parts: callIds.map((id, index) => callPart(id, index, responseId)) });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'all closed locally');
+    }
+  }, async ({ app, startTurn, drive }) => {
+    const turn = await startTurn('batched-listing', 'Run all probes.');
+    assert.equal((await drive(turn)).terminalStatus, 'completed');
+    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
+    const database = app.database;
+    const original = { snapshot: database.snapshot, snapshotAll: database.snapshotAll };
+    let reads = 0;
+    database.snapshot = function (...args) { reads += 1; return original.snapshot.apply(this, args); };
+    database.snapshotAll = function (...args) { reads += 1; return original.snapshotAll.apply(this, args); };
+    let open;
+    try {
+      open = await app.runtime.effects.listNativePendingWork({ conversationId: CONVERSATION });
+    } finally {
+      database.snapshot = original.snapshot;
+      database.snapshotAll = original.snapshotAll;
+    }
+    assert.deepEqual(open, [], 'a call closed in Context is not open work without a native_delivery');
+    assert.ok(reads <= 8, `listing ${callIds.length} closed calls took ${reads} worker round-trips`);
+    const undelivered = await app.runtime.effects.listNativePendingWork({ conversationId: CONVERSATION,
+      turnId: turn.turnId, includeUndelivered: true });
+    assert.equal(undelivered.length, callIds.length, 'carrier marking can still find closed undelivered calls');
+  });
+});
+
 test('steering outcome reported twice is idempotent in the durable receipt store', { timeout: 30000 }, async () => {
   await withNativeKernel({
     async script({ controls }) {

@@ -433,7 +433,8 @@ export class NativeRequestSession {
     }
     const pending = await this.deps.effects.listNativePendingWork({
       conversationId: this.deps.conversationId,
-      turnId: this.deps.turnId
+      turnId: this.deps.turnId,
+      includeUndelivered: true
     });
     const pendingByCallId = new Map(pending.map((entry) => [entry.toolCallId, entry]));
     for (const call of this.calls.values()) {
