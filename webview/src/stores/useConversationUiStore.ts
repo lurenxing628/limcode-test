@@ -6,7 +6,7 @@ import {
   type ConversationCompressionTimelineRow,
   type ConversationTimelineRow
 } from '@shared/conversationTimeline';
-import { isVisibleTextPart, type CheckpointRecord, type CheckpointTimelineAnchorRecord, type CompressionBlockRecord, type MessageRecord } from '@shared/protocol';
+import { isVisibleTextPart, type CheckpointRecord, type CheckpointTimelineAnchorRecord, type CompressionBlockRecord, type InlineDataPart, type MessageRecord } from '@shared/protocol';
 
 export type MessageViewPhase = 'stable' | 'entering' | 'exiting';
 export type ComposerMode = 'chat' | 'edit';
@@ -63,6 +63,13 @@ export interface EditingTurnIntentState {
   rowVersion: number;
 }
 
+/** A request to put an earlier Message back into the chat composer, attachments included. */
+export interface ChatDraftPrefillRequest {
+  key: number;
+  text: string;
+  attachments: InlineDataPart[];
+}
+
 interface TimelineSyncSnapshot {
   messages: MessageRecord[];
   anchorMessages: MessageRecord[];
@@ -105,6 +112,8 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
   const editingTurnIntent = shallowRef<EditingTurnIntentState>();
   const editConfirmOpen = ref(false);
   const pendingEditText = ref('');
+  const chatDraftPrefill = shallowRef<ChatDraftPrefillRequest>();
+  let chatDraftPrefillKey = 0;
 
   const seenMessageIds = new Set<string>();
   const enterTimers = new Map<string, number>();
@@ -116,6 +125,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
   const isEditing = computed(() => composerMode.value === 'edit');
   const activeComposerSnapshot = computed(() => composerSnapshots.value[composerMode.value]);
   const composerDraft = computed(() => activeComposerSnapshot.value.draft);
+  const chatDraft = computed(() => composerSnapshots.value.chat.draft);
 
   function syncMessages(messages: readonly MessageRecord[]): void {
     syncTimeline(messages, messages, [], [], []);
@@ -271,10 +281,29 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     composerSnapshots.value.chat.draft = '';
   }
 
-  /** Puts an earlier Message's text back into the chat composer so the user can send it anew. */
+  /**
+   * Asks the composer to put an earlier Message's text and attachments back into the chat draft so
+   * the user can send it anew. Nothing is replaced here: the composer owns the attachments and asks
+   * before it replaces a non-empty draft or leaves an open edit.
+   */
   function prefillChatDraft(message: MessageRecord): void {
     const text = visibleMessageText(message);
-    if (!text) return;
+    const attachments = message.content.parts.flatMap((part) =>
+      'inlineData' in part ? [{ inlineData: { ...part.inlineData } }] : []);
+    if (!text && attachments.length === 0) return;
+    chatDraftPrefillKey += 1;
+    chatDraftPrefill.value = { key: chatDraftPrefillKey, text, attachments };
+  }
+
+  function takeChatDraftPrefill(key: number): ChatDraftPrefillRequest | undefined {
+    const request = chatDraftPrefill.value;
+    if (request?.key !== key) return undefined;
+    chatDraftPrefill.value = undefined;
+    return request;
+  }
+
+  /** Replaces the chat draft text (leaving any open edit) and focuses the composer. */
+  function replaceChatDraft(text: string): void {
     if (composerMode.value === 'edit') cancelEditMode();
     composerSnapshots.value.chat.draft = text;
     composerFocusKey.value += 1;
@@ -340,6 +369,8 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     composerHighlightKey,
     composerFocusKey,
     composerDraft,
+    chatDraft,
+    chatDraftPrefill,
     editingMessage,
     editingTurnIntent,
     editConfirmOpen,
@@ -354,7 +385,9 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     cancelEditMode,
     setComposerDraft,
     clearChatDraft,
-    prefillChatDraft
+    prefillChatDraft,
+    takeChatDraftPrefill,
+    replaceChatDraft
   };
 });
 

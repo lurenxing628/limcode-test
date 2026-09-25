@@ -29,6 +29,8 @@ import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandP
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import SummaryRebuildConfirm from '@webview/components/input/SummaryRebuildConfirm.vue';
+import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
+import { useChatDraftPrefill } from '@webview/components/input/chatDraftPrefill';
 import { summaryRebuildTooltipRows } from '@webview/components/input/summaryRebuildPreview';
 import { useSummaryRebuildPreview } from '@webview/composables/useSummaryRebuildPreview';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
@@ -323,6 +325,14 @@ const selectedAttachments = computed<InlineDataPart[]>({
     attachmentSnapshots.value = { ...attachmentSnapshots.value, [ui.composerMode]: value };
   }
 });
+const chatAttachments = computed<InlineDataPart[]>({
+  get: () => attachmentSnapshots.value.chat,
+  set: (chat) => {
+    attachmentSnapshots.value = { ...attachmentSnapshots.value, chat };
+  }
+});
+// "Send as a new message" never silently replaces a draft or an open edit (see chatDraftPrefill).
+const chatDraftPrefill = useChatDraftPrefill(ui, chatAttachments);
 const attachmentRefreshKey = computed(() => selectedAttachments.value.map((part, index) => index + ':' + (part.inlineData.name ?? '') + ':' + (part.inlineData.sizeBytes ?? 0)).join('|'));
 const hasDraftContent = computed(() => draft.value.trim().length > 0 || selectedAttachments.value.length > 0);
 const attachmentLimitBytes = computed(() => Math.max(1, globalSettings.attachments.maxStoredInlineFileMb || 20) * 1024 * 1024);
@@ -1130,6 +1140,15 @@ function middleEllipsis(value: string, maxLength: number): string {
         </button>
       </div>
     </div>
+    <ConfirmPanel
+      :open="!!chatDraftPrefill.pending.value"
+      title="替换输入框内容？"
+      :description="chatDraftPrefill.confirmDescription.value"
+      confirm-label="替换"
+      test-id="chat-draft-prefill-confirm"
+      @confirm="chatDraftPrefill.confirm"
+      @cancel="chatDraftPrefill.cancel"
+    />
     <SummaryRebuildConfirm
       :open="!!summaryRebuildTarget"
       :preview="summaryRebuildPreview.state.value"
