@@ -159,7 +159,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，spawn 与 in
     deliveries: {},
     modelProvider: {},
     turns: {},
-    agentLoop: {},
+    agentLoop: finalOutputObserverHost(),
     agents: {
       async resolve(selection) {
         resolvedSelection = selection;
@@ -350,6 +350,7 @@ test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后�
       async renewExecutionLease() { return true; }
     },
     agentLoop: {
+      ...finalOutputObserverHost(),
       async drive(requestedTurnId) {
         driveCalls += 1;
         if (driveCalls === 1) {
@@ -382,6 +383,17 @@ test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后�
   assert.equal(driveCalls, 2);
   await coordinator.dispose();
 });
+
+/** The agent-loop surface a child coordinator subscribes to: final outputs of child Turns. */
+function finalOutputObserverHost() {
+  const observers = new Set();
+  return {
+    registerFinalOutputObserver(observer) {
+      observers.add(observer);
+      return () => { observers.delete(observer); };
+    }
+  };
+}
 
 function frozenRunAgentAuthority(maxDepth) {
   return {
@@ -506,7 +518,7 @@ function createDepthCoordinator(lineageFromCurrentToRoot) {
     deliveries: {},
     modelProvider: {},
     turns: {},
-    agentLoop: {},
+    agentLoop: finalOutputObserverHost(),
     agents: {
       async resolve() {
         resolutions += 1;
