@@ -813,6 +813,29 @@ export class ContextSequenceControlPlane {
   }
 
   /**
+   * Idempotent repair of the CALL occurrence of one durably admitted native ToolCall. Admission
+   * (ToolCall batch) and its Context call occurrence commit in separate transactions; a Host lost
+   * between them leaves an admitted call the model never saw. Recovery and closure append it once
+   * before any result occurrence so the tool pair can close. Returns whether it appended.
+   */
+  public async ensureNativeToolCall(command: {
+    conversationId: string;
+    toolCallId: string;
+    providerCallId?: string;
+  }): Promise<boolean> {
+    const toolCallId = requireId(command.toolCallId, 'toolCallId');
+    const existing = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'tool_call', source_id: toolCallId },
+        limit: 2
+      })
+    ]);
+    if (rows(existing.snapshot[0]).length > 0) return false;
+    await this.appendNativeToolCall(command);
+    return true;
+  }
+
+  /**
    * Appends the chronological RESULT occurrence of one settled native ToolCall. Trigger contract:
    * (a) the Kernel delivery pump, on the checkpointed response.created that admits the matched
    * explicit result create (before the carrier's own output commits, never waiting on the network

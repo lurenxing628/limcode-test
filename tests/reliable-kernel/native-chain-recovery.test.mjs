@@ -684,6 +684,51 @@ test('a Turn whose physical input passed the threshold continues when compressio
   });
 });
 
+test('an admission whose Context call occurrence was lost is repaired on recovery and closed', { timeout: 30000 }, async () => {
+  await withNativeKernel({
+    async script({ round, controls, emit, responseId }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'call-lost', 0, { async: true });
+        await new Promise(resolve => controls.signal.addEventListener('abort', resolve, { once: true }));
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued after the repair');
+    }
+  }, async (state) => {
+    const { requests, executions, startTurn, drive, reopen, recover } = state;
+    // The Host is lost after the admission (ToolCall batch) commits, before its Context occurrence:
+    // the second write never happens in this process.
+    const loop = state.app.agentLoop;
+    const original = loop.context.appendNativeToolCall;
+    loop.context.appendNativeToolCall = () => {
+      loop.context.appendNativeToolCall = original;
+      return new Promise(() => {});
+    };
+    const turn = await startTurn('lost-call-occurrence', 'Run the probe.');
+    const driving = drive(turn);
+    void driving.catch(() => undefined);
+    await waitFor(async () => (await rows(state.app, 'ToolCallSourceLink')).length === 1, 'the call was admitted');
+    await state.app.modelProvider.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture Host loss'));
+    await assert.rejects(driving, error => kernel.isExecutionHandoffError(error));
+    assert.equal((await rows(state.app, 'ContextSegmentSource', { source_kind: 'tool_call' })).length, 0,
+      'its Context call occurrence was lost');
+    assert.deepEqual(executions, [], 'the admitted effect had not started yet');
+    await reopen();
+    const recovered = await recover(turn.turnId);
+    let outcome = await drive(recovered);
+    for (let index = 0; outcome.terminalStatus === 'waiting' && index < 20; index += 1) {
+      await delay(20);
+      outcome = await drive(recovered);
+    }
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(state.app, 'TurnTermination', { turn_id: turn.turnId })));
+    assert.deepEqual(executions, ['call-lost']);
+    assert.deepEqual(nativeToolPairs(requests[requests.length - 1]).get('call-lost'), { calls: 1, results: 1 });
+    assert.deepEqual(await unresolvedNativeCalls(state.app), []);
+  });
+});
+
 test('a synchronous admitted call still running parks the Turn even when another call progressed', { timeout: 30000 }, async () => {
   await withNativeKernel({
     background: ['call-background'],

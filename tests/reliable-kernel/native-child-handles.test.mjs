@@ -241,7 +241,8 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
   const completed = new Promise(resolve => { complete = resolve; });
   const settle = id => { terminals.set(id, { toolModelResultId: `result-${id}` }); if (terminals.size === 2) complete(); };
   const effects = {
-    async listNativePendingWork() { return proofs.map(proof => ({ toolCallId: proof.providerCallId, settled: false, delivered: false })); },
+    async listNativePendingWork() { return proofs.map(proof => ({ toolCallId: proof.providerCallId, settled: false, delivered: false,
+      callContextSegmentId: `segment-${proof.providerCallId}` })); },
     async readNativeAdmission(id) { return admissions.get(id); },
     async readTerminalResult(id) { return terminals.get(id); },
     async settleWithoutEffect(input) { rejected.push(input); settle(input.toolCallId); return { terminal: terminals.get(input.toolCallId) }; }

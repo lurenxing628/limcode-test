@@ -441,6 +441,15 @@ export class NativeRequestSession {
       const admission = await this.deps.effects.readNativeAdmission(call.toolCallId);
       call.admitted = admission !== undefined;
       const pendingEntry = pendingByCallId.get(call.toolCallId);
+      if (call.admitted && pendingEntry && pendingEntry.callContextSegmentId === undefined) {
+        // A Host lost between the admission commit and its Context call occurrence. Repair the
+        // occurrence now; otherwise no result occurrence could ever close this call.
+        await this.deps.context.ensureNativeToolCall({
+          conversationId: this.deps.conversationId,
+          toolCallId: call.toolCallId,
+          providerCallId: call.providerCallId
+        });
+      }
       if (pendingEntry) {
         call.settled = pendingEntry.settled;
         call.delivered = pendingEntry.delivered;
