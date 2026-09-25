@@ -729,6 +729,74 @@ test('an admission whose Context call occurrence was lost is repaired on recover
   });
 });
 
+test('an interrupted Turn closes every settled native result even when the chain closure could not', { timeout: 30000 }, async () => {
+  const running = deferred();
+  const originalAppend = NativeRequestSession.prototype.appendResultOccurrence;
+  await withNativeKernel({
+    async script({ round, controls, emit, responseId }) {
+      if (round === 0) {
+        await emitToolResponse(emit, responseId, ['call-done', 'call-slow']);
+        running.resolve();
+        await new Promise(resolve => controls.signal.addEventListener('abort', resolve, { once: true }));
+        const error = new Error('aborted by the user');
+        error.name = 'AbortError';
+        throw error;
+      }
+      await emitFinalText(emit, responseId, 'next Turn');
+    }
+  }, async ({ app, executions, gates, startTurn, drive }) => {
+    gates.set('call-slow', deferred());
+    const turn = await startTurn('interrupt-closure', 'Run both probes.');
+    const driving = drive(turn);
+    await running.promise;
+    await waitFor(async () => executions.includes('call-slow')
+      && (await rows(app, 'ToolModelResult')).length === 1, 'one settled and one running call');
+    // The chain's own closure cannot write this time; only the termination closure can repair it.
+    NativeRequestSession.prototype.appendResultOccurrence = async function () {
+      throw new Error('fixture: chain closure unavailable');
+    };
+    try {
+      await app.turns.interrupt({ source: { kind: 'command', key: 'interrupt-closure-stop' },
+        turnId: turn.turnId, reason: 'user stop' });
+      await kernel.runWithExecutionLeaseFence(turn.fence,
+        () => app.modelProvider.cancelTurnDispatches(turn.turnId, 'user stop'));
+      assert.equal((await driving).terminalStatus, 'interrupted');
+    } finally {
+      NativeRequestSession.prototype.appendResultOccurrence = originalAppend;
+    }
+    assert.deepEqual(await unresolvedNativeCalls(app), [],
+      'the termination closure closes the settled and the cancelled call');
+  });
+});
+
+test('a failed Turn closes settled native results even when the chain closure could not', { timeout: 30000 }, async () => {
+  const originalAppend = NativeRequestSession.prototype.appendResultOccurrence;
+  await withNativeKernel({
+    async script({ round, emit, responseId, app }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'call-before-failure', 0, { async: true });
+        await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'tool settled');
+        await delay(30);
+        NativeRequestSession.prototype.appendResultOccurrence = async function () {
+          throw new Error('fixture: chain closure unavailable');
+        };
+        throw new Error('provider rejected the chain');
+      }
+    }
+  }, async ({ app, startTurn, drive }) => {
+    const turn = await startTurn('failure-closure', 'Run the probe.');
+    try {
+      const outcome = await drive(turn);
+      assert.equal(outcome.terminalStatus, 'failed');
+    } finally {
+      NativeRequestSession.prototype.appendResultOccurrence = originalAppend;
+    }
+    assert.deepEqual(await unresolvedNativeCalls(app), [],
+      'the failure closure closes the settled result into Context');
+  });
+});
+
 test('a synchronous admitted call still running parks the Turn even when another call progressed', { timeout: 30000 }, async () => {
   await withNativeKernel({
     background: ['call-background'],
