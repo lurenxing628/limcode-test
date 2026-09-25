@@ -306,6 +306,102 @@ const acceptSteer = async ({ command, emit, live }) => {
     submissionId: command.submissionId, steerId: `provider-${command.submissionId}` });
 };
 
+test('a terminal unknown steer whose successor exists no longer blocks the batch checkpoint', { timeout: 20000 }, async () => {
+  await withNativeKernel({
+    steer: acceptSteer,
+    async script({ round, emit, responseId, live, ended, app, shared }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId: 'response-0', capabilities });
+        await steerDuring(app, shared.turn.turnId, shared.turn.fence, 'steer-unknown', 'Shorter, please.');
+        await emit('native_control', { type: 'response.incomplete', responseId: 'response-0', reason: 'steered',
+          usage: { input_tokens: 150, output_tokens: 3 } });
+        await emit('native_control', { type: 'response.steer.disconnected', responseId: 'response-0',
+          submissionId: 'steer-unknown', reason: 'successor_application_unverified' });
+        live.responseId = 'response-0b';
+        await emit('native_control', { type: 'response.created', responseId: 'response-0b',
+          previousResponseId: 'response-0' });
+        await emitCall(emit, 'response-0b', 'call-A', 0);
+        await emit('native_control', { type: 'response.completed', responseId: 'response-0b',
+          usage: { input_tokens: 200, output_tokens: 10 } });
+        await ended.promise;
+        await emit('completed', { role: 'model', parts: [callPart('call-A', 0, 'response-0b')] });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued after the checkpoint');
+    }
+  }, async ({ app, requests, executions, submissions, ended, shared, startTurn, drive }) => {
+    shared.turn = await startTurn('unknown-steer-successor', 'Run the probe.');
+    const outcome = await within(drive(shared.turn), 'the steered chain');
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: shared.turn.turnId })));
+    assert.deepEqual(submissions, [], 'the settled batch checkpoints instead of waiting on the unknown steer');
+    assert.deepEqual(ended, [0]);
+    assert.deepEqual(executions, ['call-A']);
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+  });
+});
+
+test('a pending steer plus budget pressure ends the chain instead of stalling for the provider timeout', { timeout: 20000 }, async () => {
+  await withNativeKernel({
+    steer: acceptSteer,
+    async script({ round, emit, responseId, ended, app, shared }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await steerDuring(app, shared.turn.turnId, shared.turn.fence, 'steer-pending', 'Use a table.');
+        await emitCall(emit, responseId, 'call-A', 0);
+        // No usage on the physical response: its size is unknown, so no further create may be sent.
+        await emit('native_control', { type: 'response.completed', responseId });
+        await ended.promise;
+        await emit('completed', { role: 'model', parts: [callPart('call-A', 0, responseId)] });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued with a fresh full request');
+    }
+  }, async ({ app, requests, executions, submissions, ended, shared, startTurn, drive }) => {
+    shared.turn = await startTurn('steer-pressure', 'Run the probe.');
+    const outcome = await within(drive(shared.turn), 'the pressured steered chain', 8000);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: shared.turn.turnId })));
+    assert.deepEqual(submissions, [], 'no create is sent into a chain at its physical budget');
+    assert.deepEqual(ended, [0], 'the logical request is ended once the admitted tool settled');
+    assert.deepEqual(executions, ['call-A']);
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+    const receipt = (await app.modelProvider.steeringReceipts(CONVERSATION))
+      .find(value => value.submissionId === 'steer-pending');
+    assert.equal(receipt.state, 'delivery_unknown', 'an unapplied steer is honestly closed, never replayed');
+  });
+});
+
+test('a result write with an unverified outcome ends the chain instead of stalling', { timeout: 20000 }, async () => {
+  await withNativeKernel({
+    steer: acceptSteer,
+    async script({ round, emit, responseId, ended, app, shared }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await steerDuring(app, shared.turn.turnId, shared.turn.fence, 'steer-open', 'Keep it brief.');
+        await emitCall(emit, responseId, 'call-A', 0);
+        await emit('native_control', { type: 'response.completed', responseId,
+          usage: { input_tokens: 200, output_tokens: 10 } });
+        await ended.promise;
+        await emit('completed', { role: 'model', parts: [callPart('call-A', 0, responseId)] });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued after the unverified write');
+    }
+  }, async ({ app, requests, executions, submissions, ended, shared, startTurn, drive }) => {
+    shared.turn = await startTurn('unverified-result-write', 'Run the probe.');
+    const outcome = await within(drive(shared.turn), 'the chain with an unverified result write', 8000);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: shared.turn.turnId })));
+    assert.deepEqual(submissions, [['call-A']], 'the result was written exactly once and never resent');
+    assert.deepEqual(ended, [0]);
+    assert.deepEqual(executions, ['call-A']);
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
+      'an unverified write is never recorded as a provider delivery');
+  });
+});
+
 test('an accepted steer attributed to its successor is carried by the next full request', { timeout: 20000 }, async () => {
   await withNativeKernel({
     steer: acceptSteer,

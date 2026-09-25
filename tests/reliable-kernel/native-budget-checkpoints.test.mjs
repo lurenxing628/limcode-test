@@ -769,12 +769,22 @@ test('two same-predecessor steering receipts do not claim a successor without su
   assert.equal(session.steerReceipts.get('steer-b').successorResponseId, 'successor-2');
   session.responses.get('successor-2').completed = true;
   session.responses.get('successor-2').boundarySeq = '3';
-  session.steerReceipts.set('steer-a', { ...session.steerReceipts.get('steer-a'), state: 'delivery_unknown' });
   session.steerReceipts.set('steer-b', { ...session.steerReceipts.get('steer-b'), state: 'completed' });
+  session.steerReceipts.set('steer-a', { ...session.steerReceipts.get('steer-a'), state: 'delivery_unknown',
+    targetResponseId: 'successor-2', responseId: 'successor-2' });
   assert.equal(await session.yieldAtNativeBatchBoundary([settledCall]), false);
-  assert.equal(ended, 0, 'an unknown steer on this live request can still produce a successor');
-  session.steerReceipts.clear();
+  assert.equal(ended, 0, 'an unknown steer whose target has no successor yet can still produce one');
+  session.steerReceipts.set('steer-a', { ...session.steerReceipts.get('steer-a'),
+    targetResponseId: 'predecessor', responseId: 'predecessor' });
   session.inFlightDeliveries.add(settledCall.toolCallId);
   assert.equal(await session.yieldAtNativeBatchBoundary([settledCall]), false);
   assert.equal(ended, 0, 'an unacknowledged physical result is not a safe checkpoint');
+  session.inFlightDeliveries.clear();
+  const closed = [];
+  session.buildFunctionCallOutput = async call => ({ type: 'function_call_output', callId: call.toolCallId, output: 'CAS' });
+  session.appendResultOccurrence = async call => { closed.push(call.toolCallId); call.resultOccurrence = true; };
+  assert.equal(await session.yieldAtNativeBatchBoundary([settledCall]), true,
+    'a terminal unknown steer whose successor already exists no longer blocks the checkpoint');
+  assert.equal(ended, 1);
+  assert.deepEqual(closed, ['tool-a'], 'the settled result is closed into Context before the chain ends');
 });

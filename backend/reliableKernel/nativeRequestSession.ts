@@ -183,6 +183,8 @@ export class NativeRequestSession {
   /** Wire-written but unacknowledged results must never be auto-resubmitted on this chain. */
   private readonly uncertainResultCalls = new Set<string>();
   private unsafeResultAdmission?: Error;
+  /** No further create fits the physical budget: end the chain once admitted work settles. */
+  private budgetClosureRequested = false;
   private disposed = false;
   private yieldingForRuntimeInput = false;
   private preparingCheckpoint = false;
@@ -1392,15 +1394,21 @@ export class NativeRequestSession {
     for (;;) {
       this.pumpDirty = false;
       if (this.disposed || this.yieldingForRuntimeInput || !this.controller) return;
-      if (this.unsafeResultAdmission) {
+      if (this.unsafeResultAdmission || this.budgetClosureRequested) {
         // A result that may already have reached the Provider can NEVER be resubmitted, nor can
-        // another tool result be sent into that ambiguous physical chain. Do not end the chain
-        // until every admitted external effect truly settles; requestNativeLogicalEnd otherwise
-        // clears the transport's outstanding-async set before the work exists durably.
+        // another tool result be sent into that ambiguous physical chain; a chain at its physical
+        // budget cannot carry another create either. Both end the logical request: dispose closes
+        // every settled result into Context and the Turn continues with a fresh full request. Do
+        // not end the chain until every admitted external effect truly settles;
+        // requestNativeLogicalEnd otherwise clears the transport's outstanding-async set before
+        // the work exists durably.
         if (this.inFlightDeliveries.size === 0
           && [...this.calls.values()].every(call => !call.admitted || call.settled)) {
           this.yieldingForRuntimeInput = true;
           this.controller.endLogicalRequest();
+          this.deps.onDiagnostic?.(this.unsafeResultAdmission
+            ? 'Native logical request ended after an unverified result admission; settled results continue from Context.'
+            : 'Native logical request ended at its physical budget; settled results continue from Context.');
         }
         return;
       }
@@ -1420,17 +1428,24 @@ export class NativeRequestSession {
           physicalResponseCount: observed.physicalResponseCount
         })
       );
-      if (pressure || this.inFlightDeliveries.size > 0) {
-        // An unattributed steer blocks a logical-request checkpoint, but need not block a
-        // required tool-result create when physical usage is known safely below capacity.
-        // Conversely, never send another create near capacity or while an earlier result
-        // admission is unresolved; both preserve the batch's exact provider response identity.
+      if (this.inFlightDeliveries.size > 0) {
+        // Never send another create while an earlier result admission is unresolved; its
+        // response.created (or its uncertainty) re-runs this pump.
         const blockedResponseId = this.responseOrder[this.responseOrder.length - 1] ?? 'unknown';
         if (this.lastBackpressureResponseId !== blockedResponseId) {
           this.lastBackpressureResponseId = blockedResponseId;
           this.diagnose('Native response cannot checkpoint yet; tool-result delivery is backpressured.');
         }
         return;
+      }
+      if (pressure) {
+        // An unattributed steer blocks a logical-request checkpoint, but need not block a
+        // required tool-result create when physical usage is known safely below capacity. Near
+        // capacity (or with unknown usage) no create may be sent: waiting would leave the
+        // provider waiting for these outputs with nothing that ever ends the chain. End the
+        // logical request instead once every admitted effect settles.
+        this.budgetClosureRequested = true;
+        continue;
       }
       const adapter = await this.deps.resolveAdapter(this.deps.providerId);
       if (!adapter.materializeNativeToolOutput) {
@@ -1454,12 +1469,13 @@ export class NativeRequestSession {
         if (!isOpenAIResponsesNativeDeliveryError(error)) throw error;
         if (error.disposition === 'admission_unknown') {
           for (const call of ready) this.uncertainResultCalls.add(call.toolCallId);
-          if (error.detail.reason === 'response_created_without_unique_result_admission') {
-            this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
-            // Stop only after all admitted effects settle; pumpLoop requests the real physical
-            // response boundary without cancelling or re-sending any of those effects.
-            this.pumpDirty = true;
-          }
+          // Whatever made the admission unknown (an ambiguous successor, a local write that
+          // outlived its deadline, a released controller), these results can never be resent on
+          // this chain and nothing else would ever deliver them. Stop only after all admitted
+          // effects settle; pumpLoop requests the real physical response boundary without
+          // cancelling or re-sending any of those effects.
+          this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
+          this.pumpDirty = true;
         }
         this.diagnose(`native result delivery ${error.disposition}: ${error.message}`);
         return;
@@ -1509,13 +1525,25 @@ export class NativeRequestSession {
   }
 
   private hasPendingSteering(): boolean {
-    return [...this.steerReceipts.values()].some(receipt =>
-      // A delivery-unknown steer in THIS live logical request can still produce a successor;
-      // the provider may create it after a local disconnect observation. Do not end the chain
-      // merely because its user-visible receipt is terminal. Historical unknowns belong to
-      // older ModelRequests and cannot block a freshly frozen full-request continuation.
-      (!receipt.modelRequestId || receipt.modelRequestId === this.deps.modelRequestId)
-      && ['queued', 'sent', 'accepted', 'waiting_for_input', 'continuing', 'delivery_unknown'].includes(receipt.state));
+    return [...this.steerReceipts.values()].some(receipt => {
+      // Historical receipts belong to older ModelRequests and cannot block a freshly frozen
+      // full-request continuation.
+      if (receipt.modelRequestId && receipt.modelRequestId !== this.deps.modelRequestId) return false;
+      if (['queued', 'sent', 'accepted', 'waiting_for_input', 'continuing'].includes(receipt.state)) return true;
+      // A delivery-unknown steer can still produce a successor after a local disconnect
+      // observation, but only while no successor of its target exists. Once the provider created
+      // a response after that target, the steer was consumed (or dropped) by it; the terminal
+      // receipt must not block every later checkpoint of this logical request.
+      return receipt.state === 'delivery_unknown' && !this.steerTargetHasSuccessor(receipt);
+    });
+  }
+
+  private steerTargetHasSuccessor(receipt: NativeSteeringReceipt): boolean {
+    const target = receipt.targetResponseId ?? receipt.responseId;
+    if (!target) return false;
+    const index = this.responseOrder.indexOf(target);
+    if (index >= 0 && index < this.responseOrder.length - 1) return true;
+    return [...this.responses.values()].some(response => response.previousResponseId === target);
   }
 
   private collectDeliverable(): NativeSessionCall[] {
