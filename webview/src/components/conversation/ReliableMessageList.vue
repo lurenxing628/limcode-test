@@ -22,7 +22,7 @@ import {
   reliableRetryStreamingActivityLabel
 } from '@webview/domain/reliableTransientActivity';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
-import { projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
+import { collaborationCardPlacementLabel, projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
 import MessageItem from './MessageItem.vue';
 import ReliableCollaborationCard from './ReliableCollaborationCard.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
@@ -34,6 +34,7 @@ import {
   TIMELINE_SEGMENT_STEP,
   absoluteTimelineFloor,
   clampTimelineSegmentStart,
+  composeTimelineRows,
   latestTimelineSegmentStart,
   prioritizedTimelineDetailDemand
 } from './segmentedTimeline';
@@ -88,10 +89,6 @@ const segmentStart = ref(0);
 const followLatestSegment = ref(true);
 const pendingHistoryAnchorId = ref<string | null>(null);
 const pendingScrollAnchor = ref<ScrollAnchor | null>(null);
-const visibleTimelineRows = computed(() => messages.value.slice(
-  segmentStart.value,
-  segmentStart.value + TIMELINE_MOUNT_LIMIT
-));
 const earliestLoadedFloor = computed(() => {
   const first = messages.value[0];
   if (!first) return 0;
@@ -113,10 +110,7 @@ const canRequestEarlierHistory = computed(() =>
   && (earliestLoadedFloor.value > 1 || hasLoadedFloorGap.value)
 );
 const hasEarlierSegment = computed(() => segmentStart.value > 0 || canRequestEarlierHistory.value);
-// The loaded rows begin at the Conversation's first message: nothing earlier exists, whatever a
-// later gap holds.
-const loadedFromFirstMessage = computed(() => earliestLoadedFloor.value <= 1);
-const hasLaterSegment = computed(() => segmentStart.value + TIMELINE_MOUNT_LIMIT < messages.value.length);
+const hasLaterSegment = computed(() => segmentStart.value + TIMELINE_MOUNT_LIMIT < timelineRows.value.length);
 const earlierSegmentLabel = computed(() => feed.historyLoading
   ? '正在加载更早内容'
   : feed.historyError && segmentStart.value === 0
@@ -140,19 +134,36 @@ const terminationRowsByAnchor = computed(() => {
   return result;
 });
 
-// Collaboration envelopes from or to other Conversations, placed at the Turn they belong to.
+// Historical collaboration pages can add older independent facts; the live committed feed wins
+// on overlap. Do not convert those envelopes into Messages or infer their place from created_at.
+const collaborationRecords = computed(() => {
+  const history: typeof feed.historyRecords = feed.historyConversationId === conversationId.value ? feed.historyRecords : {};
+  const collaboration: typeof feed.collaborationHistoryRecords = feed.collaborationHistoryConversationId === conversationId.value
+    ? feed.collaborationHistoryRecords : {};
+  const records: typeof feed.records = { ...history, ...collaboration, ...feed.records };
+  for (const type of [
+    'Conversation', 'Turn', 'CollaborationMessage', 'CollaborationMessageSourceLink',
+    'CollaborationMessageTargetLink', 'RuntimeDelivery', 'CollaborationPeerConversation'
+  ]) {
+    records[type] = { ...(history[type] ?? {}), ...(collaboration[type] ?? {}), ...(feed.records[type] ?? {}) };
+  }
+  return records;
+});
 const collaborationTimeline = computed(() => projectCollaborationTimeline({
   conversationId: conversationId.value,
-  records: feed.records,
+  records: collaborationRecords.value,
   messages: messages.value,
   turnIdByMessageId: projection.value.turnIdByMessageId,
-  removedConversationIds: feed.removedConversationIds,
-  loadedFromFirstMessage: loadedFromFirstMessage.value
+  removedConversationIds: feed.removedConversationIds
 }));
-
-// With no message every card is below the messages; the empty hint never stands in for one.
-const hasCollaborationCards = computed(() =>
-  collaborationTimeline.value.turnWithoutMessage.length > 0 || collaborationTimeline.value.unbound.length > 0);
+const timelineRows = computed(() => composeTimelineRows(messages.value, collaborationTimeline.value));
+const visibleTimelineRows = computed(() => timelineRows.value.slice(
+  segmentStart.value, segmentStart.value + TIMELINE_MOUNT_LIMIT
+));
+const visibleMessageRows = computed(() => visibleTimelineRows.value.flatMap((row) =>
+  row.kind === 'message' ? [row.message] : []
+));
+const hasCollaborationCards = computed(() => timelineRows.value.some((row) => row.kind === 'collaboration'));
 
 const compressionNotices = computed(() => projectCompressionNotices({
   conversationId: conversationId.value, records: feed.records, messages: messages.value,
@@ -172,15 +183,15 @@ watch(
   () => props.followLatest,
   (followLatest) => {
     followLatestSegment.value = followLatest;
-    if (followLatest) segmentStart.value = latestTimelineSegmentStart(messages.value.length);
+    if (followLatest) segmentStart.value = latestTimelineSegmentStart(timelineRows.value.length);
   },
   { immediate: true }
 );
 
 watch(
-  () => `${messages.value.length}:${messages.value[messages.value.length - 1]?.id ?? ''}`,
+  () => timelineRows.value.map((row) => row.id).join('|'),
   () => {
-    const total = messages.value.length;
+    const total = timelineRows.value.length;
     segmentStart.value = followLatestSegment.value
       ? latestTimelineSegmentStart(total)
       : clampTimelineSegmentStart(total, segmentStart.value);
@@ -193,22 +204,22 @@ watch(conversationId, () => {
   pendingScrollAnchor.value = null;
   followLatestSegment.value = props.followLatest;
   segmentStart.value = props.followLatest
-    ? latestTimelineSegmentStart(messages.value.length)
-    : clampTimelineSegmentStart(messages.value.length, segmentStart.value);
+    ? latestTimelineSegmentStart(timelineRows.value.length)
+    : clampTimelineSegmentStart(timelineRows.value.length, segmentStart.value);
 });
 
 watch(
-  () => feed.historyLoadedPages,
-  (loadedPages, previousLoadedPages) => {
-    if (loadedPages <= previousLoadedPages) return;
+  () => [feed.historyLoadedPages, feed.collaborationHistoryLoadedPages],
+  ([messagePages, collaborationPages], [previousMessagePages, previousCollaborationPages]) => {
+    if (messagePages <= previousMessagePages && collaborationPages <= previousCollaborationPages) return;
     const anchorId = pendingHistoryAnchorId.value;
     pendingHistoryAnchorId.value = null;
     if (!anchorId) return;
-    const anchorIndex = messages.value.findIndex((message) => message.id === anchorId);
+    const anchorIndex = timelineRows.value.findIndex((row) => row.id === anchorId);
     if (anchorIndex < 0) return;
     followLatestSegment.value = false;
     segmentStart.value = clampTimelineSegmentStart(
-      messages.value.length,
+      timelineRows.value.length,
       Math.max(0, anchorIndex - TIMELINE_SEGMENT_STEP)
     );
 
@@ -232,7 +243,7 @@ const latestActiveTurnRequest = computed(() => activeTurnRequests.value[0]);
 const latestRequestHasVisibleModelRow = computed(() => {
   const requestId = reliableText(latestActiveTurnRequest.value?.id);
   if (!requestId) return false;
-  return visibleTimelineRows.value.some((message) =>
+  return visibleMessageRows.value.some((message) =>
     message.role === 'model'
     && message.status === 'streaming'
     && message.content.parts.length > 0
@@ -404,26 +415,26 @@ const visibleRetryBoundaryMessageId = computed(() => {
     ? conversationAction.value.operationTurnId
     : undefined;
   if (!turnId) return undefined;
-  return visibleTimelineRows.value.find((message) =>
+  return visibleMessageRows.value.find((message) =>
     projection.value.turnIdByMessageId[message.id] === turnId
   )?.id;
 });
 
 watch(
   () => [
-    ...visibleTimelineRows.value.map(messageDetailDemandSignature),
+    ...visibleMessageRows.value.map(messageDetailDemandSignature),
     ...Object.entries(projection.value.interactionByToolCallId)
       .filter(([, interaction]) => interaction.status === 'pending')
       .map(([toolCallId]) => toolCallId)
   ].join('|'),
   () => {
-    const pinnedDetailKeys = visibleTimelineRows.value.flatMap((message) => {
+    const pinnedDetailKeys = visibleMessageRows.value.flatMap((message) => {
       const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
       return revisionId ? [reliableKernelDetailKey('message-content', revisionId)] : [];
     });
     feed.setPinnedDetailKeys(pinnedDetailKeys);
     const demand = prioritizedTimelineDetailDemand(
-      visibleTimelineRows.value.map((message) => message.id)
+      visibleMessageRows.value.map((message) => message.id)
     );
     // The body nearest the composer must win the first transport slot. Pending interactions remain
     // critical, but are admitted only after that body so an old Conversation never paints its tail
@@ -462,6 +473,22 @@ async function restorePendingScrollAnchor(): Promise<void> {
   restoreScrollAfterHistoryLoad({ scroller, anchor });
 }
 
+function showEarlierCollaboration(): void {
+  if (feed.collaborationHistoryLoading || !feed.collaborationHistoryHasMore) return;
+  pendingScrollAnchor.value = captureScrollAnchor({
+    scroller: props.scroller,
+    visibleRows: visibleTimelineRows.value
+  });
+  releaseStickyFromUserScroll(props.scroller);
+  followLatestSegment.value = false;
+  const anchorId = visibleTimelineRows.value[0]?.id ?? null;
+  if (feed.requestEarlierCollaborationHistory(conversationId.value)) {
+    pendingHistoryAnchorId.value = anchorId;
+  } else {
+    pendingScrollAnchor.value = null;
+  }
+}
+
 function showEarlierSegment(): void {
   if (feed.historyLoading || !hasEarlierSegment.value) return;
   const scroller = props.scroller;
@@ -474,7 +501,7 @@ function showEarlierSegment(): void {
   if (segmentStart.value > 0) {
     followLatestSegment.value = false;
     segmentStart.value = clampTimelineSegmentStart(
-      messages.value.length,
+      timelineRows.value.length,
       segmentStart.value - TIMELINE_SEGMENT_STEP
     );
     void restorePendingScrollAnchor();
@@ -491,11 +518,11 @@ function showEarlierSegment(): void {
 
 function showLaterSegment(): void {
   const next = clampTimelineSegmentStart(
-    messages.value.length,
+    timelineRows.value.length,
     segmentStart.value + TIMELINE_SEGMENT_STEP
   );
   segmentStart.value = next;
-  followLatestSegment.value = next >= latestTimelineSegmentStart(messages.value.length);
+  followLatestSegment.value = next >= latestTimelineSegmentStart(timelineRows.value.length);
 }
 
 function retryFrom(message: MessageRecord): void {
@@ -505,10 +532,7 @@ function retryFrom(message: MessageRecord): void {
     message.retryTarget,
     currentAuthoritySelection(),
     projection.value.messageRevisionIdByMessageId[message.id],
-    timelineFloor(
-      message,
-      messages.value.findIndex((candidate) => candidate.id === message.id) - segmentStart.value
-    )
+    timelineFloor(message)
   );
 }
 
@@ -602,9 +626,9 @@ function messageDetailLoading(message: MessageRecord): boolean {
   return status === undefined || status === 'loading';
 }
 
-function timelineFloor(message: MessageRecord, visibleIndex: number): number {
+function timelineFloor(message: MessageRecord): number {
   const projected = projection.value.absoluteFloorByMessageId[message.id] ?? message.seq;
-  return absoluteTimelineFloor(projected, segmentStart.value + visibleIndex + 1);
+  return absoluteTimelineFloor(projected, Math.max(1, messages.value.findIndex((row) => row.id === message.id) + 1));
 }
 
 function modelRequestRetryState(request: Record<string, unknown>): {
@@ -653,6 +677,19 @@ function messageRenderKey(message: MessageRecord): string {
 <template>
   <div class="reliable-message-list">
     <button
+      v-if="feed.collaborationHistoryConversationId === conversationId && feed.collaborationHistoryHasMore"
+      type="button"
+      class="reliable-segment-control"
+      :disabled="feed.collaborationHistoryLoading"
+      @click="showEarlierCollaboration"
+    >
+      {{ feed.collaborationHistoryLoading ? '正在加载更早协作记录'
+        : feed.collaborationHistoryScanProgress ? '继续查找更早协作记录' : '显示更早协作记录' }}
+    </button>
+    <p v-if="feed.collaborationHistoryError" class="reliable-history-error" role="alert">
+      {{ feed.collaborationHistoryError }}
+    </p>
+    <button
       v-if="hasEarlierSegment"
       type="button"
       class="reliable-segment-control"
@@ -668,76 +705,70 @@ function messageRenderKey(message: MessageRecord): string {
     >
       {{ feed.historyError }}
     </p>
-    <div
-      v-for="(message, index) in visibleTimelineRows"
-      :key="messageRenderKey(message)"
-      class="reliable-message-row"
-      :data-timeline-row-key="message.id"
-    >
-      <p
-        v-if="retryBoundaryLabel && visibleRetryBoundaryMessageId === message.id"
-        class="reliable-retry-boundary"
-        role="status"
+    <template v-for="row in visibleTimelineRows" :key="row.id">
+      <div
+        v-if="row.kind === 'message'"
+        :key="messageRenderKey(row.message)"
+        class="reliable-message-row"
+        :data-timeline-row-key="row.id"
       >
-        {{ retryBoundaryLabel }}
-      </p>
-      <ReliableCollaborationCard
-        v-for="card in collaborationTimeline.beforeMessage[message.id] ?? []"
-        :key="`collaboration:${card.messageId}`"
-        :card="card"
-        :data-timeline-row-key="`collaboration:${card.messageId}`"
-      />
-      <MessageItem
-        :message="message"
-        :run-id="projection.turnIdByMessageId[message.id]"
-        :termination="messageTermination(message)"
-        :termination-notice-suppressed="isMessageTerminationSuppressed(message)"
-        :run-had-completed-tools="runHadCompletedTools(message)"
-        :delete-count="deleteCount(message)"
-        :compact-count="Math.max(1, timelineFloor(message, index))"
-        :detail-loading="messageDetailLoading(message)"
-        :detail-ready="messageDetailReady(message)"
-        :mutation-pending="conversationActionPending && isConversationActionTarget(message)"
-        :mutation-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
-        :retry-blocked="retryBlocked(message)"
-        :compact-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
-        :fork-blocked="forkBlocked(message)"
-        :pending-label="conversationActionLabel ?? '正在提交操作'"
-        :floor-number="timelineFloor(message, index)"
-        @edit-message="emit('edit-message', message, deleteCount(message))"
-        @retry-from="retryFrom"
-        @delete-from="deleteFrom"
-        @fork-from="forkFrom"
-        @compact-to="compactTo"
-        @dismiss-termination="dismissTermination"
-      />
-      <ReliableTurnTerminationRow
-        v-for="termination in terminationRowsByAnchor[message.id] ?? []"
-        :key="termination.id"
-        :termination="termination"
-        @dismiss="dismissTermination(termination)"
-      />
-      <ReliableCompressionWarningRow
-        v-for="warning in compressionWarningsByAnchor[message.id] ?? []"
-        :key="warning.id"
-        :title="warning.title"
-        :detail="warning.detail"
-        @dismiss="dismissCompressionWarning(warning)"
-      />
-      <ReliableCompressionCard
-        v-for="block in compressionBlocksByAnchor[message.id] ?? []"
-        :key="`compression:${String(block.id)}`"
-        :block="block"
-        :data-timeline-row-key="`compression:${String(block.id)}`"
-        @dismiss="dismissCompression(block)"
-      />
-      <ReliableCollaborationCard
-        v-for="card in collaborationTimeline.afterMessage[message.id] ?? []"
-        :key="`collaboration:${card.messageId}`"
-        :card="card"
-        :data-timeline-row-key="`collaboration:${card.messageId}`"
-      />
-    </div>
+        <p
+          v-if="retryBoundaryLabel && visibleRetryBoundaryMessageId === row.message.id"
+          class="reliable-retry-boundary"
+          role="status"
+        >
+          {{ retryBoundaryLabel }}
+        </p>
+        <MessageItem
+          :message="row.message"
+          :run-id="projection.turnIdByMessageId[row.message.id]"
+          :termination="messageTermination(row.message)"
+          :termination-notice-suppressed="isMessageTerminationSuppressed(row.message)"
+          :run-had-completed-tools="runHadCompletedTools(row.message)"
+          :delete-count="deleteCount(row.message)"
+          :compact-count="Math.max(1, timelineFloor(row.message))"
+          :detail-loading="messageDetailLoading(row.message)"
+          :detail-ready="messageDetailReady(row.message)"
+          :mutation-pending="conversationActionPending && isConversationActionTarget(row.message)"
+          :mutation-blocked="(conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
+          :retry-blocked="retryBlocked(row.message)"
+          :compact-blocked="(conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
+          :fork-blocked="forkBlocked(row.message)"
+          :pending-label="conversationActionLabel ?? '正在提交操作'"
+          :floor-number="timelineFloor(row.message)"
+          @edit-message="emit('edit-message', row.message, deleteCount(row.message))"
+          @retry-from="retryFrom"
+          @delete-from="deleteFrom"
+          @fork-from="forkFrom"
+          @compact-to="compactTo"
+          @dismiss-termination="dismissTermination"
+        />
+        <ReliableTurnTerminationRow
+          v-for="termination in terminationRowsByAnchor[row.message.id] ?? []"
+          :key="termination.id"
+          :termination="termination"
+          @dismiss="dismissTermination(termination)"
+        />
+        <ReliableCompressionWarningRow
+          v-for="warning in compressionWarningsByAnchor[row.message.id] ?? []"
+          :key="warning.id"
+          :title="warning.title"
+          :detail="warning.detail"
+          @dismiss="dismissCompressionWarning(warning)"
+        />
+        <ReliableCompressionCard
+          v-for="block in compressionBlocksByAnchor[row.message.id] ?? []"
+          :key="`compression:${String(block.id)}`"
+          :block="block"
+          :data-timeline-row-key="`compression:${String(block.id)}`"
+          @dismiss="dismissCompression(block)"
+        />
+      </div>
+      <div v-else class="reliable-collaboration-row" :data-timeline-row-key="row.id">
+        <ReliableCollaborationCard :card="row.card" />
+        <p class="reliable-collaboration-placement">{{ collaborationCardPlacementLabel(row.card) }}</p>
+      </div>
+    </template>
     <button
       v-if="hasLaterSegment"
       type="button"
@@ -754,26 +785,12 @@ function messageRenderKey(message: MessageRecord): string {
       {{ retryBoundaryLabel }}
     </p>
     <template v-if="!hasLaterSegment">
-      <ReliableCollaborationCard
-        v-for="card in collaborationTimeline.turnWithoutMessage"
-        :key="`collaboration:${card.messageId}`"
-        :card="card"
-        :data-timeline-row-key="`collaboration:${card.messageId}`"
-      />
       <ReliableCompressionWarningRow v-for="warning in unanchoredCompressionWarnings"
         :key="warning.id" :title="warning.title" :detail="warning.detail"
         @dismiss="dismissCompressionWarning(warning)" />
       <ReliableCompressionWarningRow v-for="failure in unanchoredTurnFailures"
         :key="failure.id" :title="failure.title" :detail="failure.detail" severity="error"
         @dismiss="timelinePresentation.suppress(conversationId, 'turn-termination', failure.id)" />
-    </template>
-    <template v-if="!hasLaterSegment">
-      <ReliableCollaborationCard
-        v-for="card in collaborationTimeline.unbound"
-        :key="`collaboration:${card.messageId}`"
-        :card="card"
-        :data-timeline-row-key="`collaboration:${card.messageId}`"
-      />
     </template>
     <ReliableCompressionCard
       v-if="activeCompressionCard && !hasLaterSegment"
@@ -796,7 +813,10 @@ function messageRenderKey(message: MessageRecord): string {
       <button type="button" aria-label="关闭分支提示" @click="dismissForkReadyNotice">关闭</button>
     </p>
     <div v-if="messages.length === 0 && !hasCollaborationCards && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
-      <p class="reliable-message-empty">{{ emptyHint }}</p>
+      <p class="reliable-message-empty">
+        {{ feed.collaborationHistoryLoading ? '正在查找协作记录…'
+          : feed.collaborationHistoryScanProgress ? '本页未找到协作记录，可继续查找更早记录。' : emptyHint }}
+      </p>
     </div>
   </div>
 </template>
@@ -818,8 +838,16 @@ function messageRenderKey(message: MessageRecord): string {
   overflow-anchor: none;
 }
 
-.reliable-message-row {
+.reliable-message-row,
+.reliable-collaboration-row {
   display: block;
+}
+
+.reliable-collaboration-placement {
+  margin: -4px var(--conversation-content-padding-right, var(--space-4)) var(--space-2)
+    var(--conversation-content-padding-left, var(--space-4));
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--font-size-xs);
 }
 
 .reliable-segment-control {

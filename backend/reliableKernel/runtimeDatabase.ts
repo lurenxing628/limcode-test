@@ -10,6 +10,8 @@ import {
   type SnapshotBarrier
 } from './contracts';
 import type {
+  ClientCollaborationHistoryPageInput,
+  ClientCollaborationHistoryPageResult,
   ClientKeysetPageInput,
   ClientKeysetPageResult,
   ClientVisibleMessageHistoryPageInput,
@@ -309,6 +311,14 @@ export class RuntimeDatabase {
     return this.request<ClientVisibleMessageHistoryPageResult>({
       kind: 'clientVisibleMessageHistoryPage',
       input
+    });
+  }
+
+  public async clientCollaborationHistoryPage(
+    input: ClientCollaborationHistoryPageInput
+  ): Promise<ClientCollaborationHistoryPageResult> {
+    return this.request<ClientCollaborationHistoryPageResult>({
+      kind: 'clientCollaborationHistoryPage', input
     });
   }
 
@@ -831,7 +841,7 @@ function databaseMetricRequestKind(
   kind: DatabaseWorkerRequestPayload['kind']
 ): RuntimeDatabaseMetricRequestKind {
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
-  if (kind === 'clientVisibleMessageHistoryPage') return 'clientKeysetPage';
+  if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';
   // The conversation pending-work probe is one fixed worker read snapshot.
   if (kind === 'conversationRuntimeWork') return 'snapshot';
   return kind;

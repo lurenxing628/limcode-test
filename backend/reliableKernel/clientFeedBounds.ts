@@ -11,4 +11,6 @@ export const CLIENT_CHANGE_BATCH_MAX_RECORDS = 500;
 export const CLIENT_CHANGE_BATCH_MAX_BYTES = 1_048_576;
 export const CLIENT_PAGE_MAX_ROWS = 200;
 export const CLIENT_PAGE_MAX_BYTES = 524_288;
+/** One immutable global-sequence window per collaboration read, regardless of the Conversation's size. */
+export const CLIENT_COLLABORATION_SCAN_MAX_ROWS = 4096;
 export const CLIENT_DETAIL_MAX_RESPONSE_BYTES = 2_097_152;

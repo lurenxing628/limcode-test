@@ -77,7 +77,7 @@ async function openRuntime() {
         source_message_revision_id: 'target-first-revision', created_at: NOW }),
       ...await incoming('from-sender', 'sender', '来自调研对话'),
       ...await incoming('from-gone', 'gone', '来自将被删除的对话'),
-      // Failed before the first message of `target`, whose whole history the snapshot loads.
+      // Failed delivery has no proven Turn position; its earlier timestamp is not a transcript key.
       ...await incoming('failed-early', 'sender', '比第一条消息更早的任务', EARLIER)
     ]);
     const feed = new kernel.BoundedClientFeed(database);
@@ -176,8 +176,9 @@ test('a real snapshot and Conversation deletion drive the card and queue labels,
     let queue = await mount(queuePanel);
     assert.deepEqual(labels(list.setup), ['来自对话 会被删除的对话', '来自对话 调研登录流程']);
     assert.match(list.html, /来自对话 调研登录流程/);
-    assert.deepEqual(list.setup.collaborationTimeline.beforeMessage['target-first']?.map((card) => [card.messageId, card.status]),
-      [['failed-early', 'failed']], 'a failure older than every message sits above the first one when the whole history is loaded');
+    assert.deepEqual(list.setup.collaborationTimeline.unlocated.map((card) => [card.messageId, card.status, card.placement]),
+      [['failed-early', 'failed', 'unbound']], 'a failed delivery has no proven within-transcript position, even when timestamp is early');
+    assert.match(list.html, /位置待确认/);
     assert.match(list.html, /比第一条消息更早的任务/);
     assert.equal(queue.setup.collaborationSourceLabel('gone'), '来自对话 会被删除的对话');
 
@@ -418,174 +419,52 @@ async function withMessageList(body) {
   }
 }
 
-/** Card ids per bucket of the mounted list's collaboration timeline. */
-function placedCards(setup) {
-  const ids = (buckets) => Object.fromEntries(Object.entries(buckets).map(([anchor, cards]) => [anchor, cards.map((card) => card.messageId)]));
-  const timeline = setup.collaborationTimeline;
-  return {
-    before: ids(timeline.beforeMessage),
-    after: ids(timeline.afterMessage),
-    turnWithoutMessage: timeline.turnWithoutMessage.map((card) => card.messageId),
-    unbound: timeline.unbound.map((card) => card.messageId)
-  };
-}
-
-test('a failed card older than every loaded message is placed by whether message 1 is loaded', async (t) => {
+/** No timestamp can prove the position of an envelope in ordinary Message history. */
+test('unbound deliveries remain independent rows despite older timestamps and transcript gaps', async () => {
   await withMessageList(async (open) => {
-    await t.test('a gap after message 1 leaves the card above message 1', async () => {
-      const scenario = await openScenario('gap', async (ingest) => [
-        ...(await Promise.all([1, 2, 3].map(async (seq) => targetMessageRows({ id: `target-${seq}`, seq, contentId: await ingest.message('user', `第 ${seq} 条`) })))).flat(),
-        ...incomingRows({ id: 'failed-early', at: EARLIER, payloadId: await ingest.payload('比第一条消息更早的任务'), delivery: { state: 'failed' } })
-      ]);
-      try {
-        const snapshot = await scenario.snapshot();
-        // Message 2 is missing, as a byte trim that keeps a protected first message leaves the window.
-        const window = snapshot.projections.activeConversationWindow;
-        assert.deepEqual(window.messages.map((message) => message.id), ['target-1', 'target-2', 'target-3']);
-        window.messages = window.messages.filter((message) => message.id !== 'target-2');
-        const view = open(scenario);
-        await view.observe(snapshot);
-        const { html, setup } = await view.mount();
-        assert.equal(setup.hasLoadedFloorGap, true);
-        assert.deepEqual(placedCards(setup), { before: { 'target-1': ['failed-early'] }, after: {}, turnWithoutMessage: [], unbound: [] },
-          'a failure older than message 1 belongs above it whatever the gap holds');
-        assert.match(html, /比第一条消息更早的任务/);
-      } finally { await scenario.close(); }
+    const scenario = await openScenario('unbound-gap', async (ingest) => {
+      const contentId = await ingest.message('user', '正文');
+      return [
+        ...Array.from({ length: 201 }, (_value, index) => targetMessageRows({
+          id: `target-${index + 1}`, seq: index + 1, contentId
+        })).flat(),
+        ...incomingRows({ id: 'failed-early', at: EARLIER,
+          payloadId: await ingest.payload('比第一条消息更早的任务'), delivery: { state: 'failed' } })
+      ];
     });
-
-    await t.test('a window that starts after message 1 holds the card back until the earlier history loads', async () => {
-      const scenario = await openScenario('window', async (ingest) => {
-        const contentId = await ingest.message('user', '较早的消息');
-        return [
-          // One more message than the snapshot window holds, so message 1 stays in the earlier history.
-          ...Array.from({ length: 201 }, (_value, index) => targetMessageRows({ id: `target-${index + 1}`, seq: index + 1, contentId })).flat(),
-          ...incomingRows({ id: 'failed-early', at: EARLIER, payloadId: await ingest.payload('比第一条消息更早的任务'), delivery: { state: 'failed' } })
-        ];
-      });
-      try {
-        const snapshot = await scenario.snapshot();
-        const window = snapshot.projections.activeConversationWindow;
-        assert.equal(window.messages[0]?.id, 'target-2', 'the window starts after message 1');
-        const view = open(scenario);
-        await view.observe(snapshot);
-        const { html, setup } = await view.mount();
-        assert.equal(setup.earliestLoadedFloor, 2);
-        assert.equal(setup.canRequestEarlierHistory, true, 'the earlier history can be loaded');
-        assert.deepEqual(placedCards(setup), { before: {}, after: {}, turnWithoutMessage: [], unbound: [] },
-          'the card is neither above nor below a loaded message: the earlier history holds its position');
-        assert.doesNotMatch(html, /比第一条消息更早的任务/);
-      } finally { await scenario.close(); }
-    });
+    try {
+      const snapshot = await scenario.snapshot();
+      assert.equal(snapshot.projections.activeConversationWindow.messages[0]?.id, 'target-2');
+      const view = open(scenario);
+      await view.observe(snapshot);
+      const { html, setup } = await view.mount();
+      assert.deepEqual(setup.collaborationTimeline.unlocated.map((card) => [card.messageId, card.placement]),
+        [['failed-early', 'unbound']]);
+      assert.equal(setup.collaborationTimeline.afterMessage['target-2'], undefined);
+      assert.match(html, /比第一条消息更早的任务/);
+      assert.match(html, /投递未进入回合，位置待确认/);
+    } finally { await scenario.close(); }
   });
 });
 
-/** `NOW` plus the given seconds. */
-const after = (seconds) => new Date(Date.parse(NOW) + seconds * 1000).toISOString();
-
-/** A Turn of `target` started at `at`, ended with `ended` when given. */
-function targetTurnRows({ id, at, ended }) {
-  return [
-    row('Turn', { id, conversation_id: 'target', status: ended ? 'terminated' : 'active', created_at: at, updated_at: at, terminal_at: ended ? at : null }),
-    ...(ended ? [row('TurnTermination', { id: `${id}-termination`, turn_id: id, terminal_status: ended.status, reason: ended.reason, created_at: at })] : [])
-  ];
-}
-
-test('an incoming card stays visible while the Turn it started has no saved message', async (t) => {
-  const TASK = '请调研登录流程并汇报';
+test('delivered followup in a Turn with no Message remains visible and order-unknown', async () => {
   await withMessageList(async (open) => {
-    /** The task that created `target` started `task-turn`, which ended as `ended` before saving any text. */
-    const firstTurnEnded = async (name, ended) => {
-      const scenario = await openScenario(name, async (ingest) => [
-        ...targetTurnRows({ id: 'task-turn', at: after(1), ended }),
-        ...incomingRows({ id: 'task', mode: 'followup', at: NOW, payloadId: await ingest.payload(TASK), delivery: { state: 'consumed', turnId: 'task-turn' } })
-      ]);
-      try {
-        const view = open(scenario);
-        await view.observe(await scenario.snapshot());
-        return await view.mount();
-      } finally { await scenario.close(); }
-    };
-
-    await t.test('a created Conversation whose first request failed shows its task above the failure', async () => {
-      const { html, setup } = await firstTurnEnded('first-request-failed', { status: 'failed', reason: 'HTTP 429' });
-      assert.match(html, new RegExp(TASK), 'the task the Conversation was created for is shown');
-      assert.deepEqual(placedCards(setup), { before: {}, after: {}, turnWithoutMessage: ['task'], unbound: [] });
-      assert.ok(html.indexOf(TASK) < html.indexOf('本轮执行失败'), 'the task that started the Turn precedes its failure');
-      assert.doesNotMatch(html, /还没有消息/, 'the empty hint does not stand in for the card');
-    });
-
-    await t.test('a first Turn the user stopped still shows its task', async () => {
-      const { html, setup } = await firstTurnEnded('first-turn-stopped', { status: 'interrupted', reason: 'User requested stop.' });
-      assert.match(html, new RegExp(TASK));
-      assert.deepEqual(placedCards(setup).turnWithoutMessage, ['task']);
+    const scenario = await openScenario('without-message', async (ingest) => [
+      row('Turn', { id: 'task-turn', conversation_id: 'target', status: 'terminated',
+        created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+      ...incomingRows({ id: 'task', mode: 'followup', at: EARLIER,
+        payloadId: await ingest.payload('请调研登录流程并汇报'),
+        delivery: { state: 'consumed', turnId: 'task-turn' } })
+    ]);
+    try {
+      const view = open(scenario);
+      await view.observe(await scenario.snapshot());
+      const { html, setup } = await view.mount();
+      assert.deepEqual(setup.collaborationTimeline.unlocated.map((card) => [card.messageId, card.placement]),
+        [['task', 'turn-without-message']]);
+      assert.match(html, /请调研登录流程并汇报/);
+      assert.match(html, /所属回合暂无消息，位置待确认/);
       assert.doesNotMatch(html, /还没有消息/);
-    });
-
-    await t.test('the card stays visible across the first request, in the same place', async () => {
-      const scenario = await openScenario('first-request', async (ingest) => [
-        ...incomingRows({ id: 'task', mode: 'followup', at: NOW, payloadId: await ingest.payload(TASK), delivery: { state: 'pending' } })
-      ]);
-      try {
-        const live = await scenario.connect();
-        const view = open(scenario);
-        const stage = async (frames) => {
-          await view.observe(...frames);
-          const mounted = await view.mount();
-          assert.match(mounted.html, new RegExp(TASK));
-          assert.doesNotMatch(mounted.html, /还没有消息/);
-          return mounted;
-        };
-        let mounted = await stage(await live.take());
-        assert.deepEqual(placedCards(mounted.setup).unbound, ['task'], 'waiting for the next Turn');
-
-        const recipeId = await scenario.ingest.payload('{}');
-        await scenario.commit([
-          ...targetTurnRows({ id: 'task-turn', at: after(1) }),
-          kernel.DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update('task-delivery', { state: 'consumed', target_turn_id: 'task-turn', updated_at: after(1) }),
-          row('RuntimeDeliveryInputLink', { id: 'task-input', delivery_id: 'task-delivery', pending_turn_input_id: 'task-pending-input', handled_at: after(1), created_at: after(1), updated_at: after(1) }),
-          row('ModelRequest', { id: 'task-request', turn_id: 'task-turn', request_seq: 1n, status: 'prepared', terminal_state: null, provider_id: 'provider', model_id: 'model',
-            context_window_tokens: 1000n, compression_threshold_tokens: 800n, estimated_context_tokens: 10n, authority_snapshot_id: 'authority', settings_snapshot_object_id: null,
-            recipe_object_id: recipeId, usage_json: null, stream_stats_json: { attemptSeq: '1', socketGeneration: '0', retryReason: null }, created_at: after(2), updated_at: after(2) }),
-          row('Operation', { id: 'task-operation', owner_kind: 'model_request', owner_id: 'task-request', operation_seq: 1n, tool_call_id: null, status: 'pending', created_at: after(2), updated_at: after(2) }),
-          row('Attempt', { id: 'task-attempt', operation_id: 'task-operation', attempt_seq: 1n, status: 'pending', created_at: after(2), updated_at: after(2), completed_at: null })
-        ]);
-        mounted = await stage(await live.take());
-        assert.deepEqual(placedCards(mounted.setup), { before: {}, after: {}, turnWithoutMessage: ['task'], unbound: [] },
-          'the first request has nothing to show yet');
-        assert.match(mounted.html, /正在启动 LLM 请求/);
-        assert.ok(mounted.html.indexOf(TASK) < mounted.html.indexOf('正在启动 LLM 请求'), 'the task precedes the running request');
-
-        await scenario.commit([
-          ...targetMessageRows({ id: 'reply', seq: 1, role: 'model', turnId: 'task-turn', at: after(3), contentId: await scenario.ingest.message('model', '已开始调研') }),
-          row('ModelRequestMessageLink', { id: 'task-request-message', model_request_id: 'task-request', message_id: 'reply', created_at: after(3) })
-        ]);
-        mounted = await stage(await live.take());
-        assert.deepEqual(placedCards(mounted.setup), { before: { reply: ['task'] }, after: {}, turnWithoutMessage: [], unbound: [] },
-          'above the reply once it is saved');
-        const task = mounted.html.indexOf(TASK);
-        assert.ok(mounted.html.indexOf('data-timeline-row-key="reply"') < task && task < mounted.html.indexOf('data-message-id="reply"'),
-          'drawn in the reply\'s row, above the reply');
-      } finally { await scenario.close(); }
-    });
-
-    await t.test('an older card of a Turn without a message sits where that Turn started, between earlier and later messages', async () => {
-      const scenario = await openScenario('older-turn', async (ingest) => [
-        ...targetTurnRows({ id: 'user-turn', at: NOW, ended: { status: 'completed', reason: 'completed' } }),
-        ...targetMessageRows({ id: 'earlier-question', seq: 1, turnId: 'user-turn', at: NOW, contentId: await ingest.message('user', '早先的问题') }),
-        ...targetMessageRows({ id: 'earlier-answer', seq: 2, role: 'model', turnId: 'user-turn', at: after(1), contentId: await ingest.message('model', '早先的回答') }),
-        ...incomingRows({ id: 'task', mode: 'followup', at: after(2), payloadId: await ingest.payload(TASK), delivery: { state: 'consumed', turnId: 'task-turn' } }),
-        ...targetTurnRows({ id: 'task-turn', at: after(3), ended: { status: 'failed', reason: 'HTTP 429' } }),
-        ...targetTurnRows({ id: 'later-turn', at: after(10) }),
-        ...targetMessageRows({ id: 'later-question', seq: 3, turnId: 'later-turn', at: after(10), contentId: await ingest.message('user', '后来的问题') })
-      ]);
-      try {
-        const view = open(scenario);
-        await view.observe(await scenario.snapshot());
-        const { html, setup } = await view.mount();
-        assert.deepEqual(placedCards(setup), { before: {}, after: { 'earlier-answer': ['task'] }, turnWithoutMessage: [], unbound: [] },
-          'after the last message created before that Turn started');
-        assert.ok(html.indexOf('早先的回答') < html.indexOf(TASK) && html.indexOf(TASK) < html.indexOf('后来的问题'));
-      } finally { await scenario.close(); }
-    });
+    } finally { await scenario.close(); }
   });
 });

@@ -16,6 +16,7 @@ export const CONTRACT_FILES = [
 ];
 
 const CONTRACT_REVISION = '2026-07-31-r4';
+const CLIENT_FEED_CONTRACT_REVISION = '2026-09-24-r5';
 const SUBAGENT_CONTRACT_REVISION = '2026-09-22-r5';
 const STAGES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 const ROOT_BINDING_FIELDS = [
@@ -368,7 +369,8 @@ function validateCommon(documents, failures) {
       continue;
     }
     if (document.contractKind !== kind) failures.push(`${file}.contractKind必须是${kind}`);
-    const expectedRevision = file === 'subagent.json' ? SUBAGENT_CONTRACT_REVISION : CONTRACT_REVISION;
+    const expectedRevision = file === 'client-feed.json' ? CLIENT_FEED_CONTRACT_REVISION
+      : file === 'subagent.json' ? SUBAGENT_CONTRACT_REVISION : CONTRACT_REVISION;
     if (document.contractRevision !== expectedRevision) failures.push(`${file}.contractRevision必须为${expectedRevision}`);
     if (!['planned', 'active'].includes(document.status)) failures.push(`${file}.status必须是planned或active`);
     if ('$schema' in document) failures.push(`${file}不应通过另一份JSON Schema绕开直接校验`);
@@ -1145,6 +1147,25 @@ function validateSubagent(subagent, failures) {
 }
 
 function validateClient(client, failures) {
+  const history = client?.collaborationHistory;
+  if (history?.authority !== 'CollaborationMessage+CollaborationMessageSourceLink+CollaborationMessageTargetLink; independent-of-Message'
+    || history?.order !== 'CollaborationMessage.message_seq+id-desc; never-created_at'
+    || history?.cursor !== 'exclusive-beforeMessageSeq+beforeId; omitted-pair-starts-newest; matched-limit-stops-at-oldest-match; underfull-window-progresses-at-last-inspected-global-key-even-when-empty'
+    || history?.scan !== 'bounded-global-message_seq-index-window; indexed-source-target-message_id-probes; zero-match-page-requires-explicit-user-continue; never-infer-created_at-or-exhaustion'
+    || history?.peerTitle !== 'at-most-256-indexed-Message-memberships-per-placeholder-peer; fallback-to-stored-title'
+    || history?.lostResponse !== 'collaboration-result-or-error-false-or-reject-reconnects-exact-session; renderer-deadline-clears-loading-and-allows-manual-retry'
+    || history?.transport !== 'sessionId+requestId+conversationId+navigationGeneration-fenced; ACK-before-optional-read'
+    || history?.view !== 'separate-bounded-keyset-page; no-Message-row-or-display-floor; explicit-within-Turn-order-unknown'
+    || history?.merge !== 'historical-records-by-type-id; committed-live-records-win; no-duplicate-cards; reset-on-conversation-change'
+    || history?.maxPageRows !== 200 || history?.maxScannedRows !== 4096
+    || history?.maxPeerTitleMembershipRows !== 256
+    || history?.maxRecordBytes !== 2048 || history?.maxPageBytes !== 524288) {
+    failures.push('协作历史必须按独立持久序号有界分页、按请求和会话隔离、与实时记录去重合并');
+  }
+  failures.push(...exactSetProblems('协作历史因果闭包', [
+    'CollaborationMessage', 'CollaborationMessageSourceLink', 'CollaborationMessageTargetLink',
+    'RuntimeDelivery(latest-attempt)', 'Turn(own-conversation)', 'CollaborationPeerConversation'
+  ], history?.closure ?? []));
   const collaboration = client?.collaborationProjection;
   if (collaboration?.scope !== 'selected-conversation-source-or-target-only'
     || collaboration?.snapshotSelection !== 'messages-sent-from-or-delivered-into-a-loaded-Turn-plus-incoming-pending-or-failed; each-incoming-card-loads-its-delivery; at-most-200-newest-by-message_seq'

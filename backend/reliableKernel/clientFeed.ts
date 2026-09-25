@@ -9,6 +9,7 @@ import {
   type ReliableKernelClientDetailKind,
   type ReliableKernelDataMessage,
   type ReliableKernelHistoryPage,
+  type ReliableKernelCollaborationHistoryPage,
   type ReliableKernelRuntimeContinuationSource,
   type ReliableKernelRuntimeContinuationTurnIntentPreview,
   type ReliableKernelSnapshotMessage,
@@ -25,6 +26,7 @@ import {
 } from './guidanceIntent';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
+  CLIENT_COLLABORATION_SCAN_MAX_ROWS,
   CLIENT_CHANGE_BATCH_MAX_BYTES,
   CLIENT_CHANGE_BATCH_MAX_RECORDS,
   CLIENT_DETAIL_MAX_RESPONSE_BYTES,
@@ -43,6 +45,7 @@ import {
   toClientWirePlain as toWirePlain
 } from './clientWireData';
 import type {
+  ClientCollaborationHistoryPageInput,
   ClientKeysetPageInput,
   ClientKeysetPageResult,
   ClientProjectionSnapshot,
@@ -1102,6 +1105,40 @@ export class ClientHistoryReader {
       throw new Error('Database worker returned an out-of-bounds keyset page.');
     }
     return toWirePlain(result) as unknown as ClientKeysetPageResult;
+  }
+
+  public async backwardCollaboration(
+    input: ClientCollaborationHistoryPageInput
+  ): Promise<ReliableKernelCollaborationHistoryPage> {
+    if ('offset' in (input as unknown as Record<string, unknown>)) {
+      throw new TypeError('Offset pagination is forbidden.');
+    }
+    const result = await this.database.clientCollaborationHistoryPage(input);
+    if ((result.records.CollaborationMessage?.length ?? 0) > CLIENT_PAGE_MAX_ROWS
+      || !Number.isSafeInteger(result.scannedRows)
+      || result.scannedRows < 0
+      || result.scannedRows > CLIENT_COLLABORATION_SCAN_MAX_ROWS
+      || result.responseBytes > CLIENT_PAGE_MAX_BYTES) {
+      throw new Error('Database worker returned an out-of-bounds collaboration history page.');
+    }
+    const records: ReliableKernelCollaborationHistoryPage['records'] = {};
+    for (const [domain, rows] of Object.entries(result.records)) {
+      records[domain] = rows.map((row) => boundRecord(toWirePlain(row) as Record<string, PlainData>));
+    }
+    const page: ReliableKernelCollaborationHistoryPage = {
+      records,
+      ...(result.nextBeforeMessageSeq === undefined ? {} : { nextBeforeMessageSeq: result.nextBeforeMessageSeq }),
+      ...(result.nextBeforeId === undefined ? {} : { nextBeforeId: result.nextBeforeId }),
+      hasMore: result.hasMore,
+      scanProgress: result.scanProgress,
+      scannedRows: result.scannedRows,
+      responseBytes: 0
+    };
+    settleClientWireResponseBytes(page);
+    if (page.responseBytes > CLIENT_PAGE_MAX_BYTES) {
+      throw new Error('Collaboration history page exceeds maxPageBytes after wire encoding.');
+    }
+    return page;
   }
 
   public async backwardVisibleMessages(

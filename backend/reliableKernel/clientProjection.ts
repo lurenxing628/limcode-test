@@ -22,6 +22,7 @@ import type { MessageContent } from '../../shared/protocol';
 import type { SnapshotBarrier } from './contracts';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
+  CLIENT_COLLABORATION_SCAN_MAX_ROWS,
   CLIENT_MESSAGE_WINDOW_LIMIT,
   CLIENT_PAGE_MAX_BYTES,
   CLIENT_PAGE_MAX_ROWS,
@@ -30,6 +31,7 @@ import {
 } from './clientFeedBounds';
 import {
   boundClientRecordSummary,
+  clientWireBytes,
   settleClientWireResponseBytes
 } from './clientWireData';
 import { toolArtifactIdentifiesCallInWorker } from './copiedToolIdentity';
@@ -40,6 +42,8 @@ import {
   type CurrentTurnTaskOperationFact
 } from './currentTurnTaskProjection';
 import type {
+  ClientCollaborationHistoryPageInput,
+  ClientCollaborationHistoryPageResult,
   ClientKeysetPageInput,
   ClientKeysetPageResult,
   ClientProjectionSnapshot,
@@ -62,6 +66,7 @@ export interface ClientProjectionContentAccess {
 const TURN_INTENT_CONTENT_TYPE = 'application/vnd.limcode.turn-intent+json';
 const CHILD_ACTIVITY_ARGUMENTS_MAX_BYTES = 64 * 1024;
 const CHILD_ACTIVITY_SUMMARY_MAX_CHARACTERS = 180;
+const COLLABORATION_PEER_TITLE_MEMBERSHIP_SCAN_LIMIT = 256;
 const TURN_AUTHORITY_PROJECTION_MAX_BYTES = 16 * 1024 * 1024;
 
 export function projectQueuedTurnIntentRecord(database: Database.Database, intentId: string): DomainRow | null {
@@ -547,7 +552,7 @@ function projectCollaborationPeerConversations(
     .filter((row) => displayConversationTitle({ id: String(row.id), title: String(row.title) }) === DEFAULT_CONVERSATION_TITLE
       || String(row.title).startsWith(GENERATED_CONVERSATION_TITLE_PREFIX))
     .map((row) => String(row.id));
-  for (const first of queryFirstUserRevisions(database, placeholderIds)) {
+  for (const first of queryFirstUserRevisionsForCollaborationPeers(database, placeholderIds)) {
     const title = readFirstUserTitleContent(database, String(first.revision_id), content);
     if (title) firstUserText.set(String(first.conversation_id), title);
   }
@@ -565,6 +570,37 @@ function projectCollaborationPeerConversations(
         ...(first ? { messages: [{ role: 'user' as const, content: first }] } : {})
       })
     };
+  });
+}
+
+function queryFirstUserRevisionsForCollaborationPeers(
+  database: Database.Database,
+  conversationIds: readonly string[]
+): Array<Record<string, unknown>> {
+  if (conversationIds.length === 0) return [];
+  // The peer title is optional presentation, not a reason to replay a very long conversation.
+  // The epoch-5 membership index orders by (conversation_id,message_seq); MATERIALIZED prevents
+  // the user-role filter from widening the read past the first 256 immutable memberships.
+  const statement = database.prepare(`
+    WITH earliest AS MATERIALIZED (
+      SELECT message_id, message_seq
+        FROM message_part_of_conversation INDEXED BY ux_message_part_of_conversation_01
+       WHERE conversation_id = @conversationId
+       ORDER BY message_seq ASC
+       LIMIT @limit
+    )
+    SELECT @conversationId AS conversation_id, revision.id AS revision_id
+      FROM earliest AS membership
+      JOIN message ON message.id = membership.message_id
+      JOIN message_current_revision_link AS current ON current.message_id = message.id
+      JOIN message_revision AS revision ON revision.id = current.revision_id
+     WHERE message.deleted_at IS NULL AND revision.role = 'user'
+     ORDER BY membership.message_seq ASC
+     LIMIT 1
+  `);
+  return conversationIds.flatMap((conversationId) => {
+    const first = statement.get({ conversationId, limit: BigInt(COLLABORATION_PEER_TITLE_MEMBERSHIP_SCAN_LIMIT) });
+    return first ? [first as Record<string, unknown>] : [];
   });
 }
 
@@ -1934,6 +1970,177 @@ export function executeClientVisibleMessageHistoryPage(
   }
 }
 
+/**
+ * Read collaboration envelopes by their own immutable sequence. Message membership (including an
+ * empty transcript) is irrelevant. Select only ids connected to this Conversation by an explicit
+ * source/target link, then materialize every card dependency in the same SQLite read transaction.
+ */
+export function executeClientCollaborationHistoryPage(
+  database: Database.Database,
+  input: ClientCollaborationHistoryPageInput,
+  content: ClientProjectionContentAccess
+): ClientCollaborationHistoryPageResult {
+  if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) {
+    throw new RangeError(`Collaboration history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
+  }
+  const conversationId = requireRuntimeId(input.conversationId);
+  if ((input.beforeMessageSeq === undefined) !== (input.beforeId === undefined)) {
+    throw new TypeError('Collaboration history cursor requires both beforeMessageSeq and beforeId.');
+  }
+  const beforeMessageSeq = input.beforeMessageSeq === undefined ? undefined
+    : requireNonNegativeIntegerString(input.beforeMessageSeq, 'beforeMessageSeq');
+  if (beforeMessageSeq === '0') throw new RangeError('beforeMessageSeq must be positive.');
+  const beforeId = input.beforeId === undefined ? undefined : requireRuntimeId(input.beforeId);
+  database.exec('BEGIN');
+  try {
+    // The epoch-5 Source/Target links index conversation_id with created_at, not message_seq.
+    // Sorting all links for every page is unbounded. Inspect one fixed global-sequence window
+    // instead; a page without any match advances with the last INSPECTED key, never a guessed time.
+    // The unique message_seq makes id a cursor identity check, not a second ordering pass.
+    if (beforeMessageSeq !== undefined) {
+      const anchor = queryPlainRows(database, `
+        SELECT id FROM collaboration_message INDEXED BY ux_collaboration_message_02
+         WHERE message_seq = @beforeMessageSeq LIMIT 1
+      `, { beforeMessageSeq: BigInt(beforeMessageSeq) })[0];
+      if (anchor?.id !== beforeId) throw new Error('Collaboration history cursor does not identify its durable sequence.');
+    }
+    const scanned = queryPlainRows(database, `
+      WITH bounded AS MATERIALIZED (
+        SELECT message.id, message.message_seq
+          FROM collaboration_message AS message INDEXED BY ux_collaboration_message_02
+         ${beforeMessageSeq === undefined ? '' : 'WHERE message.message_seq < @beforeMessageSeq'}
+         ORDER BY message.message_seq DESC
+         LIMIT @scanLimit
+      )
+      SELECT bounded.id, bounded.message_seq,
+             CASE WHEN EXISTS (
+               SELECT 1 FROM collaboration_message_source_link AS source
+                WHERE source.message_id = bounded.id AND source.conversation_id = @conversationId
+             ) OR EXISTS (
+               SELECT 1 FROM collaboration_message_target_link AS target
+                WHERE target.message_id = bounded.id AND target.conversation_id = @conversationId
+             ) THEN 1 ELSE 0 END AS in_scope
+        FROM bounded
+       ORDER BY bounded.message_seq DESC
+    `, {
+      conversationId,
+      scanLimit: BigInt(CLIENT_COLLABORATION_SCAN_MAX_ROWS),
+      ...(beforeMessageSeq === undefined ? {} : { beforeMessageSeq: BigInt(beforeMessageSeq) })
+    });
+    const oldestInspected = scanned[scanned.length - 1];
+    const olderGlobalExists = scanned.length === CLIENT_COLLABORATION_SCAN_MAX_ROWS && oldestInspected
+      ? queryPlainRows(database, `
+          SELECT id FROM collaboration_message INDEXED BY ux_collaboration_message_02
+           WHERE message_seq < @oldestInspectedSeq LIMIT 1
+        `, { oldestInspectedSeq: BigInt(String(oldestInspected.message_seq)) }).length > 0
+      : false;
+    const matches = scanned.filter((row) => row.in_scope === 1n || row.in_scope === 1);
+    const candidates = matches.slice(0, input.limit + 1);
+    if (candidates.length === 0) {
+      const progress = olderGlobalExists;
+      const empty: ClientCollaborationHistoryPageResult = {
+        records: {},
+        ...(progress ? {
+          nextBeforeMessageSeq: String(oldestInspected!.message_seq),
+          nextBeforeId: String(oldestInspected!.id)
+        } : {}),
+        hasMore: progress,
+        scanProgress: progress,
+        scannedRows: scanned.length,
+        responseBytes: 0
+      };
+      settleClientWireResponseBytes(empty);
+      database.exec('COMMIT');
+      return empty;
+    }
+    const materialize = (count: number): ClientCollaborationHistoryPageResult => {
+      const selected = candidates.slice(0, count);
+      const ids = selected.map((row) => String(row.id));
+      const records: Record<string, DomainRow[]> = {};
+      const include = (domain: string, rows: readonly Record<string, unknown>[]): void => {
+        if (rows.length > 0) records[domain] = mergeRowsById(rows).map((row) => {
+          const bounded = boundClientRecordSummary(row);
+          if (clientWireBytes(bounded) > CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES) {
+            throw new Error(`Collaboration history ${domain} record exceeds summary byte limit.`);
+          }
+          return bounded;
+        });
+      };
+      include('CollaborationMessage', [...ids].reverse().map((id) => projectCollaborationMessageRecord(database, id, content)));
+      const sources = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', ids);
+      const targets = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', ids);
+      if (sources.length !== ids.length || targets.length !== ids.length) {
+        throw new Error('Collaboration history requires exactly one source and target link per message.');
+      }
+      include('CollaborationMessageSourceLink', sources);
+      include('CollaborationMessageTargetLink', targets);
+      const messageParameters: Record<string, string | bigint> = {};
+      const messagePlaceholders = ids.map((id, index) => {
+        messageParameters[`message${index}`] = id;
+        return `@message${index}`;
+      });
+      const deliveries = queryPlainRows(database, `
+        SELECT delivery.* FROM collaboration_message_target_link AS target
+        JOIN runtime_delivery AS delivery ON delivery.id = (
+          SELECT newest.id FROM runtime_delivery AS newest
+           WHERE newest.inbox_item_id = target.inbox_item_id
+             AND newest.target_conversation_id = target.conversation_id
+           ORDER BY newest.attempt_seq DESC LIMIT 1
+        )
+       WHERE target.message_id IN (${messagePlaceholders.join(',')})
+      `, messageParameters);
+      include('RuntimeDelivery', deliveries);
+      const turnIds = [...new Set([
+        ...sources.map((row) => row.turn_id),
+        ...deliveries.map((row) => row.target_turn_id)
+      ].filter((id): id is string => typeof id === 'string' && id.length > 0))];
+      include('Turn', queryAllByIds(database, 'turn', 'id', turnIds)
+        .filter((turn) => turn.conversation_id === conversationId));
+      include('CollaborationPeerConversation', projectCollaborationPeerConversations(database, conversationId, [
+        ...sources.map((row) => String(row.conversation_id)),
+        ...targets.map((row) => String(row.conversation_id))
+      ], content));
+      const oldest = selected[selected.length - 1];
+      // If the byte cap shortened a page, resume at its oldest OUTPUT row: newer matches in the
+      // inspected window must never be skipped. Only a completely materialized underfull page can
+      // advance across an inspected stretch of unrelated Conversations (including a zero-row page).
+      const progress = count === candidates.length && candidates.length < input.limit && olderGlobalExists;
+      const cursor = progress ? oldestInspected : oldest;
+      const page: ClientCollaborationHistoryPageResult = {
+        records,
+        ...(cursor ? { nextBeforeMessageSeq: String(cursor.message_seq), nextBeforeId: String(cursor.id) } : {}),
+        hasMore: matches.length > count || olderGlobalExists,
+        scanProgress: progress,
+        scannedRows: scanned.length,
+        responseBytes: 0
+      };
+      settleClientWireResponseBytes(page);
+      return page;
+    };
+    let low = 1;
+    let high = Math.min(input.limit, candidates.length);
+    let page: ClientCollaborationHistoryPageResult | undefined;
+    while (low <= high) {
+      const count = Math.floor((low + high) / 2);
+      const candidate = materialize(count);
+      if (candidate.responseBytes <= CLIENT_PAGE_MAX_BYTES) {
+        page = candidate;
+        low = count + 1;
+      } else {
+        high = count - 1;
+      }
+    }
+    if (!page) {
+      throw new Error('A single collaboration history summary exceeds maxPageBytes.');
+    }
+    database.exec('COMMIT');
+    return page;
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 function buildClientVisibleMessageHistoryRecords(
   database: Database.Database,
   messages: readonly Record<string, unknown>[],
@@ -2061,7 +2268,7 @@ function buildClientVisibleMessageHistoryRecords(
 function queryPlainRows(
   database: Pick<Database.Database, 'prepare'>,
   sql: string,
-  parameters: Record<string, string | bigint> = {}
+  parameters: Record<string, string | bigint | null> = {}
 ): Array<Record<string, unknown>> {
   return database.prepare(sql).all(parameters) as Array<Record<string, unknown>>;
 }

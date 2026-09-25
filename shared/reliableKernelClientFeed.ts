@@ -13,6 +13,9 @@ export const RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE = 'reliable-kernel.detail-erro
 export const RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE = 'reliable-kernel.history-page-request';
 export const RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE = 'reliable-kernel.history-page-result';
 export const RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE = 'reliable-kernel.history-page-error';
+export const RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE = 'reliable-kernel.collaboration-history-request';
+export const RELIABLE_KERNEL_COLLABORATION_HISTORY_RESULT_MESSAGE = 'reliable-kernel.collaboration-history-result';
+export const RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE = 'reliable-kernel.collaboration-history-error';
 export const RELIABLE_KERNEL_TRANSIENT_MESSAGE = 'reliable-kernel.transient';
 export const RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE = 'reliable-kernel.transient-batch';
 export const RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE = 'reliable-kernel.transient-ack';
@@ -255,6 +258,46 @@ export interface ReliableKernelHistoryPageResultMessage {
 
 export interface ReliableKernelHistoryPageErrorMessage {
   type: typeof RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  conversationId: string;
+  message: string;
+}
+
+/** Independent CollaborationMessage sequence, unrelated to Message membership or its display floor. */
+export interface ReliableKernelCollaborationHistoryRequestMessage {
+  type: typeof RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  conversationId: string;
+  /** Exclusive backward cursor. Omit both fields for the newest page. */
+  beforeMessageSeq?: string;
+  beforeId?: string;
+  limit: number;
+}
+
+export interface ReliableKernelCollaborationHistoryPage {
+  records: Record<string, Array<Record<string, PlainData>>>;
+  nextBeforeMessageSeq?: string;
+  nextBeforeId?: string;
+  hasMore: boolean;
+  /** The next cursor is the oldest inspected global CollaborationMessage, possibly not from this Conversation. */
+  scanProgress: boolean;
+  /** Exact number of immutable global-sequence candidates inspected, at most 4096. */
+  scannedRows: number;
+  responseBytes: number;
+}
+
+export interface ReliableKernelCollaborationHistoryResultMessage {
+  type: typeof RELIABLE_KERNEL_COLLABORATION_HISTORY_RESULT_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  conversationId: string;
+  page: ReliableKernelCollaborationHistoryPage;
+}
+
+export interface ReliableKernelCollaborationHistoryErrorMessage {
+  type: typeof RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE;
   requestId: string;
   sessionId: string;
   conversationId: string;

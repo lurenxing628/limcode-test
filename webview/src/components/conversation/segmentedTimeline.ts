@@ -5,6 +5,31 @@ export const PENDING_TIMELINE_MOUNT_LIMIT = 8;
 /** The newest rows hydrate ahead of the rest of the mounted segment. */
 export const TIMELINE_FOREGROUND_DETAIL_LIMIT = 8;
 
+export type SegmentedTimelineRow<Message extends { id: string }, Card extends { messageId: string }> =
+  | { kind: 'message'; id: string; message: Message }
+  | { kind: 'collaboration'; id: string; card: Card };
+
+/**
+ * Collaboration envelopes occupy real, independently keyed rows in the same bounded window as
+ * Message rows. Their ids and count do not become Message ids, Message floors or detail demands.
+ * A Turn group follows its last loaded Message; unlocated cards occupy their own tail rows.
+ */
+export function composeTimelineRows<Message extends { id: string }, Card extends { messageId: string }>(
+  messages: readonly Message[],
+  collaboration: { afterMessage: Readonly<Record<string, readonly Card[]>>; unlocated: readonly Card[] }
+): Array<SegmentedTimelineRow<Message, Card>> {
+  const rows: Array<SegmentedTimelineRow<Message, Card>> = [];
+  const appendCard = (card: Card): void => {
+    rows.push({ kind: 'collaboration', id: `collaboration:${card.messageId}`, card });
+  };
+  for (const message of messages) {
+    rows.push({ kind: 'message', id: message.id, message });
+    for (const card of collaboration.afterMessage[message.id] ?? []) appendCard(card);
+  }
+  for (const card of collaboration.unlocated) appendCard(card);
+  return rows;
+}
+
 export interface TimelineDetailDemand {
   critical: string[];
   visible: string[];

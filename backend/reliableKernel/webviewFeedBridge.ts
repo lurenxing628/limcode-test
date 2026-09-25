@@ -5,6 +5,9 @@ import {
   RELIABLE_KERNEL_ACK_MESSAGE,
   RELIABLE_KERNEL_CHANGES_MESSAGE,
   RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
+  RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE,
+  RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_COLLABORATION_HISTORY_RESULT_MESSAGE,
   RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE,
   RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
   RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE,
@@ -19,6 +22,7 @@ import {
   RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE,
   type ReliableKernelAckMessage,
   type ReliableKernelClientDiagnosticMessage,
+  type ReliableKernelCollaborationHistoryRequestMessage,
   type ReliableKernelDataMessage,
   type ReliableKernelDetailRequestMessage,
   type ReliableKernelHistoryPageRequestMessage,
@@ -449,6 +453,7 @@ export class ReliableKernelWebviewFeedBridge {
       && message.type !== RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE
+      && message.type !== RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE
     ) {
       return false;
@@ -526,6 +531,12 @@ export class ReliableKernelWebviewFeedBridge {
         this.observeClientDiagnostic(diagnostic);
         return true;
       }
+      if (message.type === RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE) {
+        const request = normalizeCollaborationHistoryRequest(message);
+        if (request.sessionId !== connection.sessionId) return true;
+        await this.readCollaborationHistory(client, connection, request);
+        return true;
+      }
       if (message.type === RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE) {
         const request = normalizeHistoryPageRequest(message);
         if (request.sessionId && request.sessionId !== connection.sessionId) return true;
@@ -599,6 +610,62 @@ export class ReliableKernelWebviewFeedBridge {
           sessionId: connection.sessionId,
           conversationId: request.conversationId,
           message: error instanceof Error ? error.message : '读取更早消息失败。'
+        });
+      }
+    } finally {
+      client.historyRequests.delete(request.requestId);
+    }
+  }
+
+  private async readCollaborationHistory(
+    client: FeedClient,
+    connection: ClientFeedConnection,
+    request: ReliableKernelCollaborationHistoryRequestMessage
+  ): Promise<void> {
+    if (client.historyRequests.has(request.requestId)) return;
+    if (client.historyRequests.size >= 2 || client.meta.conversationId !== request.conversationId) {
+      this.post(client, {
+        type: RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE,
+        requestId: request.requestId,
+        sessionId: connection.sessionId,
+        conversationId: request.conversationId,
+        message: '协作历史请求过多或不属于当前对话。'
+      });
+      return;
+    }
+    const navigationGeneration = client.navigationGeneration;
+    const connectionPromise = client.connection;
+    client.historyRequests.add(request.requestId);
+    try {
+      if (!this.history) throw new Error('当前 Runtime 未配置协作历史读取器。');
+      const page = await this.history.backwardCollaboration({
+        conversationId: request.conversationId,
+        ...(request.beforeMessageSeq === undefined ? {} : {
+          beforeMessageSeq: request.beforeMessageSeq,
+          beforeId: request.beforeId
+        }),
+        limit: request.limit
+      });
+      if (client.closed || !client.ready || !client.visible || client.connection !== connectionPromise
+        || client.navigationGeneration !== navigationGeneration
+        || client.meta.conversationId !== request.conversationId) return;
+      this.post(client, {
+        type: RELIABLE_KERNEL_COLLABORATION_HISTORY_RESULT_MESSAGE,
+        requestId: request.requestId,
+        sessionId: connection.sessionId,
+        conversationId: request.conversationId,
+        page
+      });
+    } catch (error) {
+      if (!client.closed && client.ready && client.visible && client.connection === connectionPromise
+        && client.navigationGeneration === navigationGeneration
+        && client.meta.conversationId === request.conversationId) {
+        this.post(client, {
+          type: RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE,
+          requestId: request.requestId,
+          sessionId: connection.sessionId,
+          conversationId: request.conversationId,
+          message: error instanceof Error ? error.message : '读取协作历史失败。'
         });
       }
     } finally {
@@ -1106,7 +1173,9 @@ export class ReliableKernelWebviewFeedBridge {
     const requestResponseMessage = message.type === RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE
       || message.type === RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE
       || message.type === RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE
-      || message.type === RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE;
+      || message.type === RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE
+      || message.type === RELIABLE_KERNEL_COLLABORATION_HISTORY_RESULT_MESSAGE
+      || message.type === RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE;
     let plain: unknown;
     try {
       plain = toStructuredClonePlainData(message, 'reliable kernel webview message');
@@ -1603,6 +1672,31 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     ...(message.expectedTotalBytes === undefined
       ? {}
       : { expectedTotalBytes: message.expectedTotalBytes as number })
+  };
+}
+
+function normalizeCollaborationHistoryRequest(
+  message: Record<string, unknown>
+): ReliableKernelCollaborationHistoryRequestMessage {
+  if ((message.beforeMessageSeq === undefined) !== (message.beforeId === undefined)) {
+    throw new TypeError('collaborationHistory cursor requires both sequence and id.');
+  }
+  const beforeMessageSeq = message.beforeMessageSeq === undefined ? undefined
+    : requireDecimal(message.beforeMessageSeq, 'collaborationHistory.beforeMessageSeq');
+  if (beforeMessageSeq === '0') throw new TypeError('collaborationHistory.beforeMessageSeq must be positive.');
+  if (!Number.isSafeInteger(message.limit) || (message.limit as number) < 1 || (message.limit as number) > 200) {
+    throw new TypeError('collaborationHistory.limit must be from 1 to 200.');
+  }
+  return {
+    type: RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE,
+    requestId: requireText(message.requestId, 'collaborationHistory.requestId'),
+    sessionId: requireText(message.sessionId, 'collaborationHistory.sessionId'),
+    conversationId: requireText(message.conversationId, 'collaborationHistory.conversationId'),
+    ...(beforeMessageSeq === undefined ? {} : {
+      beforeMessageSeq,
+      beforeId: requireText(message.beforeId, 'collaborationHistory.beforeId')
+    }),
+    limit: message.limit as number
   };
 }
 

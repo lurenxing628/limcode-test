@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-07-31-r4",
+  "contractRevision": "2026-09-24-r5",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -116,6 +116,23 @@
     "maxPageRows": 200,
     "maxPageBytes": 524288,
     "rule": "使用上一页最后一行的稳定排序键继续查询；新插入的行不会让后续页重复或漏读已有行。"
+  },
+  "collaborationHistory": {
+    "authority": "CollaborationMessage+CollaborationMessageSourceLink+CollaborationMessageTargetLink; independent-of-Message",
+    "order": "CollaborationMessage.message_seq+id-desc; never-created_at",
+    "cursor": "exclusive-beforeMessageSeq+beforeId; omitted-pair-starts-newest; matched-limit-stops-at-oldest-match; underfull-window-progresses-at-last-inspected-global-key-even-when-empty",
+    "scan": "bounded-global-message_seq-index-window; indexed-source-target-message_id-probes; zero-match-page-requires-explicit-user-continue; never-infer-created_at-or-exhaustion",
+    "peerTitle": "at-most-256-indexed-Message-memberships-per-placeholder-peer; fallback-to-stored-title",
+    "lostResponse": "collaboration-result-or-error-false-or-reject-reconnects-exact-session; renderer-deadline-clears-loading-and-allows-manual-retry",
+    "closure": ["CollaborationMessage", "CollaborationMessageSourceLink", "CollaborationMessageTargetLink", "RuntimeDelivery(latest-attempt)", "Turn(own-conversation)", "CollaborationPeerConversation"],
+    "transport": "sessionId+requestId+conversationId+navigationGeneration-fenced; ACK-before-optional-read",
+    "view": "separate-bounded-keyset-page; no-Message-row-or-display-floor; explicit-within-Turn-order-unknown",
+    "merge": "historical-records-by-type-id; committed-live-records-win; no-duplicate-cards; reset-on-conversation-change",
+    "maxPageRows": 200,
+    "maxScannedRows": 4096,
+    "maxPeerTitleMembershipRows": 256,
+    "maxRecordBytes": 2048,
+    "maxPageBytes": 524288
   },
   "details": {
     "onDemand": [

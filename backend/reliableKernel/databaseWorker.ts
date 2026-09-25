@@ -14,6 +14,7 @@ import { createConversationRuntimeWorkProbe } from './conversationRuntimePending
 import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
 import {
   deriveCommittedParentHandling,
+  executeClientCollaborationHistoryPage,
   executeClientKeysetPage,
   executeClientProjectionSnapshot,
   executeClientVisibleMessageHistoryPage,
@@ -333,6 +334,12 @@ async function start(): Promise<void> {
       if (request.kind === 'clientVisibleMessageHistoryPage') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeClientVisibleMessageHistoryPage(reader, request.input, clientProjectionContent);
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'clientCollaborationHistoryPage') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeClientCollaborationHistoryPage(reader, request.input, clientProjectionContent);
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }

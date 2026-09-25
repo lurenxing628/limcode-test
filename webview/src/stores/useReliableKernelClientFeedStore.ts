@@ -5,6 +5,9 @@ import type { ReliableToolApplyObserver } from '@webview/domain/reliableTransien
 import {
   RELIABLE_KERNEL_CHANGES_MESSAGE,
   RELIABLE_KERNEL_CLIENT_CHANGE_TYPES,
+  RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE,
+  RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_COLLABORATION_HISTORY_RESULT_MESSAGE,
   RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
   RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE,
   RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
@@ -23,6 +26,8 @@ import {
   createEmptyReliableKernelClientState,
   type ReliableKernelBoundedClientState,
   type ReliableKernelClientDetailKind,
+  type ReliableKernelCollaborationHistoryErrorMessage,
+  type ReliableKernelCollaborationHistoryResultMessage,
   type ReliableKernelDetailErrorMessage,
   type ReliableKernelDetailResultMessage,
   type ReliableKernelHistoryPageErrorMessage,
@@ -171,6 +176,17 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   historyError: string | null;
   historyRequestId: string | null;
   historyLoadedPages: number;
+  /** CollaborationMessage's own independent keyset, never seeded by Message membership. */
+  collaborationHistoryConversationId: string | null;
+  collaborationHistoryRecords: ReliableKernelBoundedClientState['records'];
+  collaborationHistoryNextBeforeMessageSeq: string | null;
+  collaborationHistoryNextBeforeId: string | null;
+  collaborationHistoryHasMore: boolean;
+  collaborationHistoryScanProgress: boolean;
+  collaborationHistoryLoading: boolean;
+  collaborationHistoryError: string | null;
+  collaborationHistoryRequestId: string | null;
+  collaborationHistoryLoadedPages: number;
   /**
    * Conversations this view saw removed by a committed change. A peer merely missing from the
    * bounded lists is unknown; only these read as deleted. Memory-only and bounded.
@@ -187,6 +203,8 @@ const DETAIL_AUTO_RETRY_DELAYS_MS = [250, 750, 2_000] as const;
 const DETAIL_CACHE_MAX_ENTRIES = 1_024;
 const DETAIL_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 const HISTORY_PAGE_LIMIT = 200;
+const COLLABORATION_HISTORY_REQUEST_DEADLINE_MS = 20_000;
+const collaborationHistoryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 const MAX_REPORTED_TRANSIENT_PAINTS = 512;
 const reportedTransientPaints = new Set<string>();
 const detailDecoders = new Map<string, TextDecoder>();
@@ -224,6 +242,16 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     historyError: null,
     historyRequestId: null,
     historyLoadedPages: 0,
+    collaborationHistoryConversationId: null,
+    collaborationHistoryRecords: {},
+    collaborationHistoryNextBeforeMessageSeq: null,
+    collaborationHistoryNextBeforeId: null,
+    collaborationHistoryHasMore: false,
+    collaborationHistoryScanProgress: false,
+    collaborationHistoryLoading: false,
+    collaborationHistoryError: null,
+    collaborationHistoryRequestId: null,
+    collaborationHistoryLoadedPages: 0,
     removedConversationIds: []
   }),
   getters: {
@@ -246,6 +274,14 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       }
       if (isReliableKernelDetailErrorMessage(message)) {
         this.observeDetailError(message);
+        return;
+      }
+      if (isReliableKernelCollaborationHistoryResultMessage(message)) {
+        this.observeCollaborationHistoryResult(message);
+        return;
+      }
+      if (isReliableKernelCollaborationHistoryErrorMessage(message)) {
+        this.observeCollaborationHistoryError(message);
         return;
       }
       if (isReliableKernelHistoryPageResultMessage(message)) {
@@ -398,10 +434,19 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
             seedHistoryCursorFromLiveRecords(this.$state, nextConversationId);
           }
         }
+        this.synchronizeCollaborationHistoryScope(
+          nextConversationId ?? '',
+          Boolean(previousSessionId && previousSessionId !== result.state.sessionId)
+        );
       }
       // ACK means the ordered durable state was accepted. Send it before optional detail replay and
       // transient-overlay reconciliation so rendering work cannot head-of-line block the Feed.
       if (result.ack) bridge.postRaw(result.ack);
+      if (result.ack && nextConversationId && this.collaborationHistoryLoadedPages === 0
+        && !this.collaborationHistoryLoading && !this.collaborationHistoryError) {
+        // Always bootstrap: a Conversation with no ordinary Message can still have older cards.
+        this.requestEarlierCollaborationHistory(nextConversationId);
+      }
       for (const detail of replayDetails) {
         if (detail.mode === 'refresh') {
           this.refreshDetail(detail.kind, detail.recordId, { priority: detail.priority });
@@ -435,6 +480,104 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       }
       if (!normalized || this.historyLoadedPages > 0 || this.historyLoading) return;
       seedHistoryCursorFromLiveRecords(this.$state, normalized);
+    },
+
+    synchronizeCollaborationHistoryScope(conversationId: string, sessionChanged: boolean): void {
+      const normalized = conversationId.trim() || null;
+      if (this.collaborationHistoryConversationId !== normalized || sessionChanged) {
+        // A new session can also bind the same Conversation id in another Runtime root.
+        // Re-read rather than keep a page whose root identity the Webview cannot prove.
+        resetCollaborationHistoryState(this.$state, normalized);
+      }
+    },
+
+    requestEarlierCollaborationHistory(conversationId: string): boolean {
+      const normalized = conversationId.trim();
+      const sessionId = this.sessionId;
+      if (!normalized || !sessionId || activeConversationId(this.projections) !== normalized
+        || this.collaborationHistoryConversationId !== normalized || this.collaborationHistoryLoading
+        || !this.collaborationHistoryHasMore) return false;
+      const beforeMessageSeq = this.collaborationHistoryNextBeforeMessageSeq;
+      const beforeId = this.collaborationHistoryNextBeforeId;
+      if ((beforeMessageSeq === null) !== (beforeId === null)) {
+        this.collaborationHistoryError = '协作历史分页游标不可用。';
+        return false;
+      }
+      const requestId = createMessageId();
+      this.collaborationHistoryLoading = true;
+      this.collaborationHistoryError = null;
+      this.collaborationHistoryRequestId = requestId;
+      const timeout = setTimeout(() => {
+        collaborationHistoryTimeouts.delete(requestId);
+        if (this.collaborationHistoryRequestId !== requestId || this.sessionId !== sessionId
+          || this.collaborationHistoryConversationId !== normalized) return;
+        this.collaborationHistoryLoading = false;
+        this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryError = '协作历史请求超时，请重试。';
+      }, COLLABORATION_HISTORY_REQUEST_DEADLINE_MS);
+      // Node SSR regressions must not keep the process alive for an unanswered optional read.
+      (timeout as unknown as { unref?: () => void }).unref?.();
+      collaborationHistoryTimeouts.set(requestId, timeout);
+      try {
+        bridge.postRaw({
+          type: RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE,
+          requestId, sessionId, conversationId: normalized,
+          ...(beforeMessageSeq === null ? {} : { beforeMessageSeq, beforeId }),
+          limit: HISTORY_PAGE_LIMIT
+        });
+      } catch (error) {
+        clearCollaborationHistoryTimeout(requestId);
+        this.collaborationHistoryLoading = false;
+        this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryError = error instanceof Error ? error.message : '请求更早协作历史失败。';
+        return false;
+      }
+      return true;
+    },
+
+    observeCollaborationHistoryResult(message: ReliableKernelCollaborationHistoryResultMessage): void {
+      if (message.sessionId !== this.sessionId
+        || message.conversationId !== this.collaborationHistoryConversationId
+        || message.conversationId !== activeConversationId(this.projections)
+        || message.requestId !== this.collaborationHistoryRequestId) return;
+      if (!isCollaborationHistoryPage(message.page, this.collaborationHistoryNextBeforeMessageSeq,
+        this.collaborationHistoryNextBeforeId)) {
+        clearCollaborationHistoryTimeout(message.requestId);
+        this.collaborationHistoryLoading = false;
+        this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryError = '协作历史分页游标或记录格式无效。';
+        return;
+      }
+      try {
+        this.collaborationHistoryRecords = mergeHistoryRecordPage(
+          this.collaborationHistoryRecords, message.page.records, COLLABORATION_HISTORY_RECORD_TYPES
+        );
+      } catch (error) {
+        clearCollaborationHistoryTimeout(message.requestId);
+        this.collaborationHistoryLoading = false;
+        this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryError = error instanceof Error ? error.message : '协作历史页面格式无效。';
+        return;
+      }
+      clearCollaborationHistoryTimeout(message.requestId);
+      this.collaborationHistoryNextBeforeMessageSeq = message.page.nextBeforeMessageSeq ?? null;
+      this.collaborationHistoryNextBeforeId = message.page.nextBeforeId ?? null;
+      this.collaborationHistoryHasMore = message.page.hasMore;
+      this.collaborationHistoryScanProgress = message.page.scanProgress;
+      this.collaborationHistoryLoading = false;
+      this.collaborationHistoryError = null;
+      this.collaborationHistoryRequestId = null;
+      this.collaborationHistoryLoadedPages += 1;
+    },
+
+    observeCollaborationHistoryError(message: ReliableKernelCollaborationHistoryErrorMessage): void {
+      if (message.sessionId !== this.sessionId
+        || message.conversationId !== this.collaborationHistoryConversationId
+        || message.requestId !== this.collaborationHistoryRequestId) return;
+      clearCollaborationHistoryTimeout(message.requestId);
+      this.collaborationHistoryLoading = false;
+      this.collaborationHistoryRequestId = null;
+      this.collaborationHistoryError = message.message.trim() || '读取协作历史失败。';
     },
 
     requestEarlierHistory(conversationId: string): boolean {
@@ -1419,6 +1562,8 @@ export function isReliableKernelFeedMessage(message: unknown): boolean {
   return isReliableKernelFeedDataMessage(message)
     || isReliableKernelDetailResultMessage(message)
     || isReliableKernelDetailErrorMessage(message)
+    || isReliableKernelCollaborationHistoryResultMessage(message)
+    || isReliableKernelCollaborationHistoryErrorMessage(message)
     || isReliableKernelHistoryPageResultMessage(message)
     || isReliableKernelHistoryPageErrorMessage(message)
     || isReliableKernelTransientSnapshotMessage(message)
@@ -1438,6 +1583,19 @@ function isReliableKernelDetailResultMessage(message: unknown): message is Relia
 
 function isReliableKernelDetailErrorMessage(message: unknown): message is ReliableKernelDetailErrorMessage {
   return isRecord(message) && message.type === RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE;
+}
+
+function isReliableKernelCollaborationHistoryResultMessage(
+  message: unknown
+): message is ReliableKernelCollaborationHistoryResultMessage {
+  return isRecord(message) && message.type === RELIABLE_KERNEL_COLLABORATION_HISTORY_RESULT_MESSAGE
+    && isRecord(message.page) && isRecord(message.page.records);
+}
+
+function isReliableKernelCollaborationHistoryErrorMessage(
+  message: unknown
+): message is ReliableKernelCollaborationHistoryErrorMessage {
+  return isRecord(message) && message.type === RELIABLE_KERNEL_COLLABORATION_HISTORY_ERROR_MESSAGE;
 }
 
 function isReliableKernelHistoryPageResultMessage(message: unknown): message is ReliableKernelHistoryPageResultMessage {
@@ -1759,6 +1917,71 @@ function nonEmptyString(value: unknown): string | undefined {
 
 function positiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function clearCollaborationHistoryTimeout(requestId: string | null): void {
+  if (!requestId) return;
+  const timer = collaborationHistoryTimeouts.get(requestId);
+  if (timer !== undefined) clearTimeout(timer);
+  collaborationHistoryTimeouts.delete(requestId);
+}
+
+function resetCollaborationHistoryState(
+  state: ReliableKernelFeedStoreState,
+  conversationId: string | null
+): void {
+  clearCollaborationHistoryTimeout(state.collaborationHistoryRequestId);
+  state.collaborationHistoryConversationId = conversationId;
+  state.collaborationHistoryRecords = {};
+  state.collaborationHistoryNextBeforeMessageSeq = null;
+  state.collaborationHistoryNextBeforeId = null;
+  state.collaborationHistoryHasMore = Boolean(conversationId);
+  state.collaborationHistoryScanProgress = false;
+  state.collaborationHistoryLoading = false;
+  state.collaborationHistoryError = null;
+  state.collaborationHistoryRequestId = null;
+  state.collaborationHistoryLoadedPages = 0;
+}
+
+/** Reject a backward page that would loop or splice in foreign/mismatched independent facts. */
+function isCollaborationHistoryPage(
+  page: ReliableKernelCollaborationHistoryResultMessage['page'],
+  beforeMessageSeq: string | null,
+  beforeId: string | null
+): boolean {
+  const rows = page.records.CollaborationMessage ?? [];
+  if (!Array.isArray(rows) || rows.length > HISTORY_PAGE_LIMIT || typeof page.hasMore !== 'boolean'
+    || typeof page.scanProgress !== 'boolean'
+    || !Number.isSafeInteger(page.scannedRows) || page.scannedRows < 0 || page.scannedRows > 4096
+    || !Number.isSafeInteger(page.responseBytes) || page.responseBytes > 524_288
+    || (page.scanProgress && !page.hasMore)
+    || (page.hasMore && !page.nextBeforeMessageSeq)
+    || (page.nextBeforeMessageSeq === undefined) !== (page.nextBeforeId === undefined)
+    || (rows.length > 0 && (page.nextBeforeMessageSeq === undefined || page.nextBeforeId === undefined))) return false;
+  const cursorSeq = page.nextBeforeMessageSeq === undefined ? undefined : positiveDecimal(page.nextBeforeMessageSeq);
+  const cursorId = page.nextBeforeId;
+  if (page.nextBeforeMessageSeq !== undefined && (!cursorSeq || !nonEmptyString(cursorId))) return false;
+  if (cursorSeq && beforeMessageSeq && (BigInt(cursorSeq) >= BigInt(beforeMessageSeq)
+    || cursorSeq === beforeMessageSeq && cursorId === beforeId)) return false;
+  let previous: { seq: bigint; id: string } | undefined;
+  for (const row of rows) {
+    if (!isRecord(row) || !nonEmptyString(row.id)) return false;
+    const seq = positiveDecimal(row.message_seq);
+    if (!seq) return false;
+    const current = { seq: BigInt(seq), id: row.id as string };
+    if (previous && (current.seq < previous.seq || current.seq === previous.seq && current.id <= previous.id)) return false;
+    if (beforeMessageSeq && beforeId && (current.seq > BigInt(beforeMessageSeq)
+      || current.seq === BigInt(beforeMessageSeq) && current.id >= beforeId)) return false;
+    previous = current;
+  }
+  const oldest = rows[0];
+  if (page.scanProgress) {
+    return Boolean(cursorSeq && cursorId && page.scannedRows > 0
+      && (rows.length === 0 || BigInt(cursorSeq) <= BigInt(String(oldest?.message_seq))));
+  }
+  return rows.length === 0
+    ? !page.hasMore && page.nextBeforeMessageSeq === undefined
+    : page.nextBeforeMessageSeq === oldest?.message_seq && page.nextBeforeId === oldest.id;
 }
 
 function resetHistoryState(
@@ -2216,13 +2439,19 @@ function isVisibleConversationMessage(
     && (message.role === 'user' || message.role === 'model');
 }
 
+const COLLABORATION_HISTORY_RECORD_TYPES = new Set([
+  'CollaborationMessage', 'CollaborationMessageSourceLink', 'CollaborationMessageTargetLink',
+  'RuntimeDelivery', 'Turn', 'CollaborationPeerConversation'
+]);
+
 function mergeHistoryRecordPage(
   current: ReliableKernelBoundedClientState['records'],
-  page: ReliableKernelHistoryPageResultMessage['page']['records']
+  page: ReliableKernelHistoryPageResultMessage['page']['records'],
+  allowedTypes?: ReadonlySet<string>
 ): ReliableKernelBoundedClientState['records'] {
   const next = { ...current };
   for (const [type, rows] of Object.entries(page)) {
-    if (!RELIABLE_KERNEL_CLIENT_CHANGE_TYPES.has(type as never)) {
+    if (allowedTypes ? !allowedTypes.has(type) : !RELIABLE_KERNEL_CLIENT_CHANGE_TYPES.has(type as never)) {
       throw new TypeError(`更早消息页面包含未知记录类型：${type}`);
     }
     if (!Array.isArray(rows)) throw new TypeError(`更早消息页面的 ${type} 记录无效。`);
