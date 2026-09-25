@@ -17,7 +17,12 @@ export const CONTRACT_FILES = [
 
 const CONTRACT_REVISION = '2026-07-31-r4';
 const CLIENT_FEED_CONTRACT_REVISION = '2026-09-24-r5';
-const SUBAGENT_CONTRACT_REVISION = '2026-09-22-r5';
+const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r5';
+// Contracts revised after the base revision; every other contract file stays at CONTRACT_REVISION.
+const FILE_CONTRACT_REVISIONS = new Map([
+  ['client-feed.json', CLIENT_FEED_CONTRACT_REVISION],
+  ['subagent.json', SUBAGENT_CONTRACT_REVISION]
+]);
 const STAGES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 const ROOT_BINDING_FIELDS = [
   'paths',
@@ -369,8 +374,7 @@ function validateCommon(documents, failures) {
       continue;
     }
     if (document.contractKind !== kind) failures.push(`${file}.contractKind必须是${kind}`);
-    const expectedRevision = file === 'client-feed.json' ? CLIENT_FEED_CONTRACT_REVISION
-      : file === 'subagent.json' ? SUBAGENT_CONTRACT_REVISION : CONTRACT_REVISION;
+    const expectedRevision = FILE_CONTRACT_REVISIONS.get(file) ?? CONTRACT_REVISION;
     if (document.contractRevision !== expectedRevision) failures.push(`${file}.contractRevision必须为${expectedRevision}`);
     if (!['planned', 'active'].includes(document.status)) failures.push(`${file}.status必须是planned或active`);
     if ('$schema' in document) failures.push(`${file}不应通过另一份JSON Schema绕开直接校验`);
@@ -1358,6 +1362,16 @@ function validateHumanPlanMarkers(root, failures) {
   const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
   const readme = read('docs/architecture/reliable-kernel/README.md');
   if (!readme.includes(CONTRACT_REVISION)) failures.push(`可靠内核README必须标记合同修订${CONTRACT_REVISION}`);
+  // The contracts README headline names the base revision and every file revised after it, each
+  // next to its own file, so a reader never takes a newer contract for the base one.
+  const contractsHeadline = read('docs/architecture/reliable-kernel/contracts/README.md')
+    .split(/\r?\n/).find((line) => line.startsWith('>')) ?? '';
+  if (!contractsHeadline.includes(`基础合同修订：\`${CONTRACT_REVISION}\``)) {
+    failures.push(`合同README首行必须标记基础合同修订${CONTRACT_REVISION}`);
+  }
+  for (const [file, revision] of FILE_CONTRACT_REVISIONS) {
+    if (!contractsHeadline.includes(`\`${file}\`：\`${revision}\``)) failures.push(`合同README首行必须标记${file}修订${revision}`);
+  }
   if (readme.includes('AnswerBridge / ChildTurnLink')) failures.push('README仍把ChildTurnLink写成目标模型');
   for (const marker of ['ChildExecution', 'disabled-full-request', 'detached wrapper', 'mcp_tool_call']) {
     if (!readme.includes(marker)) failures.push(`README缺少r4冻结口径：${marker}`);

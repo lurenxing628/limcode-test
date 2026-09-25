@@ -1,6 +1,6 @@
 {
   "contractKind": "subagent",
-  "contractRevision": "2026-09-22-r5",
+  "contractRevision": "2026-09-25-r5",
   "status": "active",
   "scope": "保留日常多Agent协作能力，用稳定子执行谱系、答案桥和运行时收件箱表达控制与交付。",
   "toolName": "run_agent",
