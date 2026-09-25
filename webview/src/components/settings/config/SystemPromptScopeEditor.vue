@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue';
 import type { ConfigScopeKind } from '@shared/protocol';
+import { DEFAULT_INTEGRATED_SYSTEM_PROMPT } from '@shared/defaultSystemPrompt';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import { useSystemPromptStore } from '@webview/stores/useSystemPromptStore';
@@ -14,6 +15,8 @@ const props = withDefaults(defineProps<{ scopeKind: ConfigScopeKind; scopeId?: s
 const store = useSystemPromptStore();
 const { loading: promptLoading, text: promptLoadingText } = useSettingsLoadingText('提示词配置', () => props.scopeKind, () => props.scopeId);
 const scroller = ref<HTMLTextAreaElement | null>(null);
+const defaultScroller = ref<HTMLTextAreaElement | null>(null);
+const builtInGlobalPrompt = DEFAULT_INTEGRATED_SYSTEM_PROMPT;
 const draft = ref('');
 const inheritMode = ref(false);
 const currentScopeKey = ref('');
@@ -28,7 +31,7 @@ const statusLabel = computed(() => {
   if (props.scopeKind === 'global') {
     if (local.value.prompt?.text.trim()) return '全局已配置';
     if (local.value.link || local.value.prompt) return '全局覆盖为空';
-    return '等待内置默认';
+    return '使用内置默认';
   }
   if (local.value.prompt) return '当前范围已配置';
   return resolution.value.inheritedText ? '继承上级 / 内置' : '继承中（上级未配置）';
@@ -130,6 +133,13 @@ function insertPlaceholder(token: string): void {
       <textarea ref="scroller" :value="draft" :readonly="isInherited" rows="8" :placeholder="promptPlaceholder" @input="onInput"></textarea>
       <AdvancedScrollbar :scroller="scroller" variant="minimal" />
     </div>
+    <div v-if="scopeKind === 'global'" class="builtin-prompt-shell">
+      <span>内置默认提示词 · {{ local.prompt ? '已被上方的自定义提示词取代' : '当前生效' }}</span>
+      <div class="prompt-shell is-inherited">
+        <textarea ref="defaultScroller" :value="builtInGlobalPrompt" readonly rows="6" aria-label="内置默认系统提示词"></textarea>
+        <AdvancedScrollbar :scroller="defaultScroller" variant="minimal" />
+      </div>
+    </div>
     <div class="scope-editor-actions">
       <button v-if="isInherited" type="button" @click="startCustom">自定义提示词</button>
       <button v-else type="button" :disabled="!canSave" @click="save">保存提示词</button>
@@ -156,6 +166,9 @@ p { margin: 2px 0 0; font-size: var(--font-size-sm); }
 textarea { width: 100%; min-height: 130px; box-sizing: border-box; resize: vertical; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: var(--radius-sm); background: var(--vscode-input-background); color: var(--vscode-input-foreground); padding: var(--space-2); font: inherit; scrollbar-width: none; }
 textarea:read-only { cursor: text; }
 textarea::-webkit-scrollbar { display: none; }
+.builtin-prompt-shell { display: flex; flex-direction: column; gap: var(--space-1); color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); }
+.builtin-prompt-shell .prompt-shell { min-height: 110px; }
+.builtin-prompt-shell textarea { min-height: 110px; }
 .scope-editor-actions { display: flex; align-items: center; gap: var(--space-2); color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); flex-wrap: wrap; }
 .scope-editor-actions button {
   min-height: 28px;

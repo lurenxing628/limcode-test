@@ -1,6 +1,11 @@
 import { defineResource } from '../../../ecs/types';
 import type { LlmProviderKind, PlanReviewPolicyRecord, ToolPolicySourceConfigRecord, ToolPolicyToolConfigRecord, WorkflowIconKey } from '../../../../shared/protocol';
 import { EXTENSION_AGENT_NAME, EXTENSION_BRAND } from '../../../../shared/extensionIdentity';
+export {
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT,
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID,
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT_NAME
+} from '../../../../shared/defaultSystemPrompt';
 import {
   ASK_USER_TOOL_NAME,
   DELETE_TOOL_NAME,
@@ -61,16 +66,6 @@ export interface BuiltinAgentRegistry {
 export const AgentBlueprintsKey = defineResource<BuiltinAgentRegistry>('AgentBlueprints');
 
 export const DEFAULT_SYSTEM_PROMPT = `You are ${EXTENSION_BRAND}, a concise and helpful AI coding assistant running inside VS Code. Reply in the user's language unless asked otherwise.`;
-export const DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID = 'system-prompt:global:integrated';
-export const DEFAULT_INTEGRATED_SYSTEM_PROMPT_NAME = 'Integrated Global System Prompt';
-
-export const DEFAULT_INTEGRATED_SYSTEM_PROMPT = [
-  'You are {{$agent.name}}, a concise and helpful AI coding assistant running inside VS Code.',
-  '{{$agent.description}}',
-  '{{$workflow.description}}',
-  'Follow the active agent profile, active workflow, user instructions, and project rules. Reply in the user\'s language unless asked otherwise.',
-  'Replies render as Markdown; local absolute image paths render inline, e.g. ![](/path/to/shot.png), and local file links open in VS Code.'
-].join('\n\n');
 
 const COLLABORATION_TOOLS = ['list_agents', 'send_agent_message', 'followup_agent_task', 'read_agent_messages', 'wait_agent_messages'];
 // The cross-conversation tools belong to no list: the user's switch grants them (only listing and

@@ -1,5 +1,10 @@
 import { defineStore } from 'pinia';
 import { type ConfigScopeKind, type PromptPlaceholderRecord, type SystemPromptRecord, type SystemPromptScopeLinkRecord } from '@shared/protocol';
+import {
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT,
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID,
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT_NAME
+} from '@shared/defaultSystemPrompt';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
@@ -29,6 +34,11 @@ function matches(link: SystemPromptScopeLinkRecord, scopeKind: ConfigScopeKind, 
 function latest<T extends { createdAt: number; updatedAt: number; id: string }>(items: T[]): T | undefined { return [...items].sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt || b.id.localeCompare(a.id))[0]; }
 function sortPlaceholders(items: PromptPlaceholderRecord[]): PromptPlaceholderRecord[] { return [...items].sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.label.localeCompare(b.label) || a.id.localeCompare(b.id)); }
 function promptText(prompts: SystemPromptRecord[]): string { return prompts.map((prompt) => prompt.text.trim()).filter(Boolean).join('\n\n'); }
+const builtInGlobalPrompt: SystemPromptRecord = {
+  id: DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID,
+  name: DEFAULT_INTEGRATED_SYSTEM_PROMPT_NAME,
+  text: DEFAULT_INTEGRATED_SYSTEM_PROMPT
+};
 
 export const useSystemPromptStore = defineStore('systemPrompt', {
   state: (): SystemPromptStoreState => ({ status: '' }),
@@ -64,16 +74,22 @@ export const useSystemPromptStore = defineStore('systemPrompt', {
         const prompt = this.localPromptFor(kind, id).prompt;
         if (prompt?.text.trim()) prompts.push(prompt);
       };
+      const pushGlobal = (): void => {
+        const global = this.localPromptFor('global').prompt;
+        if (global) {
+          if (global.text.trim()) prompts.push(global);
+        } else prompts.push(builtInGlobalPrompt);
+      };
 
       switch (scopeKind) {
         case 'global':
-          return [];
+          return this.localPromptFor('global').prompt ? [] : [builtInGlobalPrompt];
         case 'agent':
         case 'workflow':
-          pushLocal('global');
+          pushGlobal();
           return prompts;
         case 'conversation': {
-          pushLocal('global');
+          pushGlobal();
           const conversationId = scopeIdFor(scopeKind, scopeId);
           if (!conversationId) return prompts;
           const agentId = activeAgentIdForConversation(conversationId);
@@ -83,7 +99,7 @@ export const useSystemPromptStore = defineStore('systemPrompt', {
           return prompts;
         }
         case 'run': {
-          pushLocal('global');
+          pushGlobal();
           const runId = scopeIdFor(scopeKind, scopeId);
           if (!runId) return prompts;
           const target = clientState.agentRunTargetLinks.find((link) => link.runId === runId && link.role === 'executor');

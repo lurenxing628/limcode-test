@@ -70,6 +70,11 @@ import {
   workEnvironmentIdFromUri
 } from '../../shared/workEnvironmentCatalog';
 import { resolveWorkEnvironmentSelection } from '../../shared/workEnvironmentSelection';
+import {
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT,
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID,
+  DEFAULT_INTEGRATED_SYSTEM_PROMPT_NAME
+} from '../../shared/defaultSystemPrompt';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
 import {
   loadLlmCompressionConfigsSettings,
@@ -301,7 +306,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       (link) => link.systemPromptId
     );
     const orderedPromptParts = [
-      globalPrompt,
+      globalPrompt ?? {
+        id: DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID,
+        name: DEFAULT_INTEGRATED_SYSTEM_PROMPT_NAME,
+        text: DEFAULT_INTEGRATED_SYSTEM_PROMPT
+      },
       agentPrompt ?? builtinSystemPromptPart(builtinAgent?.systemPrompt),
       workflowPrompt ?? builtinSystemPromptPart(builtinWorkflow?.systemPrompt),
       ...systemPrompts.filter((prompt) =>

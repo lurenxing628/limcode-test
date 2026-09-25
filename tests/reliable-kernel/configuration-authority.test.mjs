@@ -35,6 +35,30 @@ const {
   workEnvironmentIdFromUri
 } = require('../../dist/extension/shared/workEnvironmentCatalog.js');
 
+test('全局内置提示词只在没有自定义记录时生效，清除后恢复且不覆盖用户文本', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-default-system-prompt-'));
+  try {
+    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(vscode.Uri.file(root)));
+    const provider = { ...createDefaultLlmProviderConfig({ name: 'Prompt fixture' }), id: 'prompt-provider', model: 'o3',
+      models: [{ id: 'o3', name: 'o3' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const request = { conversationId: 'prompt-conversation', turnId: 'prompt-turn', executorAgentId: 'main', intentKind: 'input' };
+    const compiledPrompt = async () => JSON.parse((await authority.compile(request)).authoritySnapshot.content).systemPrompt.text;
+    const defaultPrompt = await compiledPrompt();
+    assert.match(defaultPrompt, /You are Limcode test/i);
+    assert.match(defaultPrompt, /Follow the active agent profile/);
+    assert.equal(defaultPrompt.includes('[Integrated Global System Prompt]'), false);
+    assert.equal((await authority.configurationClientState()).systemPrompts.length, 0, '只读内置默认不写入用户配置');
+    await authority.mutations.setSystemPrompt({ scopeKind: 'global', name: '我的提示词', text: 'ONLY MY TEXT' });
+    const ownPrompt = await compiledPrompt();
+    assert.match(ownPrompt, /\[我的提示词\]\nONLY MY TEXT/);
+    assert.equal(ownPrompt.includes('Follow the active agent profile'), false, '自定义全局规则不应重复注入内置模板');
+    await authority.mutations.clearSystemPrompt('global');
+    assert.equal(await compiledPrompt(), defaultPrompt, '清除自定义后回到只读内置模板');
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test('渠道、压缩与 MCP 目录保存只修改选中记录，重复保存保持文件和 revision', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-catalog-delta-'));
   try {
