@@ -9,11 +9,14 @@ import {
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS,
   MAX_LLM_COMPRESSION_BODY_TARGET_ROOM_SHARE,
+  READ_TOOL_NAME,
+  SKILLS_TOOL_NAME,
   type ContentPart,
   type InlineDataPart,
   type ModelOutputItemReference,
   type MessageContent
 } from '../../shared/protocol';
+import { renderLoadedSkill } from '../world/modules/skill/skillLookup';
 import {
   estimateJsonTokens,
   estimateMessageContentsMediaTokens,
@@ -31,11 +34,18 @@ import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
+import {
+  SKILL_TOOL_RESULT_MAX_TOKENS,
+  loadedSkillFromToolResult,
+  renderSkillWithinTokens,
+  skillLoadFailureText
+} from './skillToolResultProjection';
 
 /** Decimal compression-planning budgets. Only the body target below is Conversation-configurable. */
 export const TURN_REMINDER_MAX_TOKENS = 2_000;
 export const TOOL_RESULT_MAX_TOKENS = 4_000;
 export const TOOL_RESULT_BATCH_MAX_TOKENS = 16_000;
+export { SKILL_TOOL_RESULT_MAX_TOKENS };
 export const DEFAULT_OUTPUT_RESERVE_TOKENS = DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
 export const SUMMARY_TARGET_TOKENS = DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS;
 export const MODEL_BODY_TARGET_TOKENS = DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS;
@@ -47,6 +57,30 @@ export function isModelToolResponseMultimodalMimeType(value: string): boolean {
     || value === 'image/webp'
     || value === 'application/pdf'
     || value === 'text/plain';
+}
+
+/**
+ * A tool result the model reads as plain text instead of JSON: `{ output }` for a result, `{ error }`
+ * for a failure, and no other field. Provider requests send the string itself where the wire takes
+ * text (Claude tool_result content, Chat Completions tool message, Responses function_call_output);
+ * Gemini's FunctionResponse.response must be an object and documents exactly these two keys. No other
+ * model-visible tool result has this shape: committed results always project as `{ status, detail }`.
+ * (A `text/plain` functionResponse part is media: providers send it as a document or file block.)
+ */
+export type ModelTextToolResponse = { output: string } | { error: string };
+
+export function modelTextToolResponse(text: string, error = false): ModelTextToolResponse {
+  return error ? { error: text } : { output: text };
+}
+
+export function readModelTextToolResponse(value: unknown): { text: string; error: boolean } | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const keys = Object.keys(record);
+  if (keys.length !== 1) return undefined;
+  if (keys[0] === 'output' && typeof record.output === 'string') return { text: record.output, error: false };
+  if (keys[0] === 'error' && typeof record.error === 'string') return { text: record.error, error: true };
+  return undefined;
 }
 
 export function calculateEffectiveSummaryMaxTokens(
@@ -624,6 +658,8 @@ export interface ToolResultProjectionItem {
   allocatedTokens: number;
   truncated: boolean;
   digest: string;
+  /** Where the model continues reading a result cut at a line boundary; also stated in the response. */
+  reread?: ToolResultRereadTarget;
 }
 
 export interface ToolResultBatchProjection {
@@ -639,22 +675,48 @@ export interface ToolResultBatchProjection {
 /**
  * Produces bounded model copies without mutating the source responses. Mandatory skeletons are
  * reserved first; the remaining batch budget is distributed by deterministic water filling.
+ *
+ * Results the model reads as text (a loaded skill, or a skills load refusal) are projected beside
+ * the batch with their own allowance: a loaded skill is instructions the model must follow whole, so
+ * the other results of the same call batch never cut it. The shared batch figures below
+ * (mandatoryTokens, batchTargetTokens) describe the other results only.
  */
 export function projectToolResultBatch(
   inputs: readonly ToolResultProjectionInput[],
-  options: { perResultTokens?: number; batchTokens?: number } = {}
+  options: { perResultTokens?: number; batchTokens?: number; skillResultTokens?: number } = {}
 ): ToolResultBatchProjection {
   const perResultTokens = positiveTokenCount(options.perResultTokens ?? TOOL_RESULT_MAX_TOKENS, 'perResultTokens');
   const batchTokens = positiveTokenCount(options.batchTokens ?? TOOL_RESULT_BATCH_MAX_TOKENS, 'batchTokens');
-  const prepared = inputs.map((input, index) => prepareToolResult(input, index, perResultTokens));
+  const skillResultTokens = positiveTokenCount(
+    options.skillResultTokens ?? SKILL_TOOL_RESULT_MAX_TOKENS,
+    'skillResultTokens'
+  );
+  // Loaded skills of one batch share one allowance: each keeps its whole text when that fits,
+  // otherwise the allowance is split evenly (water filling) so several large skills loaded together
+  // stay bounded like one. The first pass only measures each skill's whole text.
+  const measured = inputs.map((input, index) =>
+    projectTextToolResult(input, index, perResultTokens, Number.MAX_SAFE_INTEGER));
+  const skillIndexes = measured.flatMap((item, index) => (item?.toolName === SKILLS_TOOL_NAME ? [index] : []));
+  const skillShares = new Map(waterFillTokens(
+    skillIndexes.map((index) => measured[index]!.originalTokens),
+    skillResultTokens
+  ).map((share, position): [number, number] => [skillIndexes[position], share]));
+  const dedicated = inputs.map((input, index) => measured[index] === undefined
+    ? undefined
+    : projectTextToolResult(input, index, perResultTokens, skillShares.get(index) ?? skillResultTokens));
+  const shared = inputs.flatMap((input, index) => dedicated[index] ? [] : [{ input, index }]);
+  const prepared = shared.map(({ input, index }) => prepareToolResult(input, index, perResultTokens));
   const mandatoryTokens = safeSum(prepared.map((item) => item.baseTokens));
   const remaining = Math.max(0, batchTokens - mandatoryTokens);
   const allocations = allocateToolResultPreviewTokens(prepared, remaining);
-  const items = prepared.map((item, index): ToolResultProjectionItem => {
-    const target = safeSum([item.baseTokens, allocations[index]]);
+  const sharedItems = new Map(prepared.map((item, position): [number, ToolResultProjectionItem] => {
+    const target = safeSum([item.baseTokens, allocations[position]]);
     const exact = item.originalTokens <= target;
-    const response = exact ? cloneJsonValue(item.input.response) : boundedPreviewEnvelope(item, target);
-    return {
+    const preview = exact ? undefined : item.readView
+      ? boundedReadPreview(item.readView, target)
+      : { response: boundedPreviewEnvelope(item, target) };
+    const response = preview ? preview.response : cloneJsonValue(item.input.response);
+    return [shared[position].index, {
       toolName: item.input.toolName,
       ...(item.input.callId ? { callId: item.input.callId } : {}),
       ...(item.input.resultId ? { resultId: item.input.resultId } : {}),
@@ -663,18 +725,117 @@ export function projectToolResultBatch(
       projectedTokens: estimateJsonTokens(response),
       allocatedTokens: target,
       truncated: !exact,
-      digest: item.digest
-    };
-  });
+      digest: item.digest,
+      ...(preview?.reread ? { reread: preview.reread } : {})
+    }];
+  }));
+  const items = inputs.map((_, index) => dedicated[index] ?? sharedItems.get(index)!);
   return {
     status: 'projected',
     items,
-    originalTokens: safeSum(prepared.map((item) => item.originalTokens)),
+    originalTokens: safeSum(items.map((item) => item.originalTokens)),
     projectedTokens: safeSum(items.map((item) => item.projectedTokens)),
     mandatoryTokens,
     batchTargetTokens: batchTokens,
     mandatoryBatchOverTarget: mandatoryTokens > batchTokens
   };
+}
+
+/** Splits `total` over `demands`: small demands are met whole, the rest share what remains evenly. */
+function waterFillTokens(demands: readonly number[], total: number): number[] {
+  const shares = demands.map(() => 0);
+  let remaining = total;
+  const order = demands.map((demand, index) => ({ demand, index })).sort((left, right) => left.demand - right.demand || left.index - right.index);
+  order.forEach(({ demand, index }, position) => {
+    const share = Math.min(demand, Math.floor(remaining / (order.length - position)));
+    shares[index] = share;
+    remaining -= share;
+  });
+  return shares;
+}
+
+/**
+ * The text-form projection of a `skills` result (see ModelTextToolResponse), or of a result already
+ * in text form. A loaded skill keeps its own SKILL_TOOL_RESULT_MAX_TOKENS allowance; when it still does
+ * not fit, the head of its body is kept up to a line boundary and the text says where it was cut and
+ * how to read the rest, with the same place as a structured rereadHint. Undefined for other results.
+ */
+function projectTextToolResult(
+  rawInput: ToolResultProjectionInput,
+  index: number,
+  perResultTokens: number,
+  skillResultTokens: number
+): ToolResultProjectionItem | undefined {
+  const toolName = requireText(rawInput.toolName, `toolResults[${index}].toolName`);
+  const skill = toolName === SKILLS_TOOL_NAME ? loadedSkillFromToolResult(rawInput.response) : undefined;
+  const failure = toolName === SKILLS_TOOL_NAME && !skill ? skillLoadFailureText(rawInput.response) : undefined;
+  const existing = !skill && failure === undefined ? readModelTextToolResponse(rawInput.response) : undefined;
+  if (!skill && failure === undefined && !existing) return undefined;
+  const allocatedTokens = toolName === SKILLS_TOOL_NAME ? skillResultTokens : perResultTokens;
+  const error = failure !== undefined || existing?.error === true;
+  const measure = (text: string): number => estimateJsonTokens(modelTextToolResponse(text, error));
+  const fullText = skill ? renderLoadedSkill(skill, skill.body) : failure ?? existing!.text;
+  const originalTokens = measure(fullText);
+  let text = fullText;
+  let reread: ToolResultRereadTarget | undefined;
+  if (originalTokens > allocatedTokens) {
+    const rendered = skill ? renderSkillWithinTokens(skill, allocatedTokens, 'tool_result', measure) : undefined;
+    if (rendered) {
+      text = rendered.text;
+      if (rendered.rereadStartLine !== undefined) {
+        reread = { kind: 'file', path: skill!.entryPath, startLine: rendered.rereadStartLine };
+      }
+    } else {
+      text = textHeadWithinTokens(fullText, allocatedTokens, measure);
+    }
+  }
+  const response = modelTextToolResponse(text, error);
+  return {
+    toolName,
+    ...(rawInput.callId ? { callId: rawInput.callId } : {}),
+    ...(rawInput.resultId ? { resultId: rawInput.resultId } : {}),
+    response,
+    originalTokens,
+    projectedTokens: estimateJsonTokens(response),
+    allocatedTokens,
+    truncated: text !== fullText,
+    digest: createHash('sha256').update(stableJson(rawInput.response)).digest('hex'),
+    ...(reread ? { reread } : {})
+  };
+}
+
+/**
+ * The head of a text result up to a line boundary, followed by a statement of what was left out.
+ * Only a single line longer than the whole allowance is cut inside the line.
+ */
+function textHeadWithinTokens(text: string, maxTokens: number, measure: (text: string) => number): string {
+  const lines = text.split('\n');
+  const render = (shown: number): string => [
+    ...lines.slice(0, shown),
+    `[Truncated: lines ${shown + 1}-${lines.length} of this result did not fit in the model context.]`
+  ].join('\n');
+  let low = 1;
+  let high = lines.length - 1;
+  let best: string | undefined;
+  while (low <= high) {
+    const shown = Math.floor((low + high) / 2);
+    const candidate = render(shown);
+    if (measure(candidate) <= maxTokens) {
+      best = candidate;
+      low = shown + 1;
+    } else {
+      high = shown - 1;
+    }
+  }
+  if (best !== undefined) return best;
+  // Not even the first line fits: keep the beginning of it rather than nothing.
+  const notice = `\n[Truncated: only the beginning of this result fits in the model context; it has ${text.length} `
+    + `characters on ${lines.length} line(s).]`;
+  let chars = 0;
+  for (let size = Math.floor(text.length / 2); size >= 1; size = Math.floor(size / 2)) {
+    while (chars + size <= text.length && measure(`${text.slice(0, chars + size)}…${notice}`) <= maxTokens) chars += size;
+  }
+  return `${text.slice(0, chars)}…${notice}`;
 }
 
 export interface ModelWindowProjection {
@@ -1283,12 +1444,23 @@ function summaryParts(part: ContentPart): ContentPart[] {
     }) }];
   }
   if ('functionResponse' in part) {
+    // A text result (a loaded skill) keeps its head up to a line boundary: the summary writer needs
+    // the skill's opening and step list, and the skill itself is re-attached after the compression.
+    const text = readModelTextToolResponse(part.functionResponse.response);
+    const measure = (candidate: string): number => estimateJsonTokens(modelTextToolResponse(candidate, text?.error));
     return [
       { text: stableJson({
         kind: 'historical_tool_result',
         ...(part.id ? { callId: part.id } : {}),
         toolName: part.functionResponse.name,
-        result: boundedValueDescriptor(part.functionResponse.response, TOOL_RESULT_MAX_TOKENS)
+        result: text
+          ? modelTextToolResponse(
+              measure(text.text) <= TOOL_RESULT_MAX_TOKENS
+                ? text.text
+                : textHeadWithinTokens(text.text, TOOL_RESULT_MAX_TOKENS, measure),
+              text.error
+            )
+          : boundedValueDescriptor(part.functionResponse.response, TOOL_RESULT_MAX_TOKENS)
       }) },
       ...(part.functionResponse.parts ?? []).map((media) => cloneJsonValue(media) as InlineDataPart)
     ];
@@ -1337,6 +1509,8 @@ interface PreparedToolResult {
   baseTokens: number;
   demandTokens: number;
   shortExactEligible: boolean;
+  /** A text read: previews keep whole lines and report the lines actually shown. */
+  readView?: ReadResultView;
 }
 
 function prepareToolResult(
@@ -1351,7 +1525,10 @@ function prepareToolResult(
   const serialized = stableJson(input.response);
   const digest = createHash('sha256').update(serialized).digest('hex');
   const originalTokens = estimateJsonTokens(input.response);
-  const skeleton = toolResultSkeleton(input, serialized.length, originalTokens, digest);
+  const readView = input.toolName === READ_TOOL_NAME ? readResultView(input.response) : undefined;
+  const skeleton = readView
+    ? readPreviewResponse(readView, 0).response
+    : toolResultSkeleton(input, serialized.length, originalTokens, digest);
   const skeletonTokens = estimateJsonTokens(skeleton);
   const baseTokens = Math.min(originalTokens, skeletonTokens);
   const targetTokens = Math.min(originalTokens, Math.max(perResultTokens, baseTokens));
@@ -1364,7 +1541,8 @@ function prepareToolResult(
     skeletonTokens,
     baseTokens,
     demandTokens: Math.max(0, targetTokens - baseTokens),
-    shortExactEligible: originalTokens <= perResultTokens
+    shortExactEligible: originalTokens <= perResultTokens,
+    ...(readView ? { readView } : {})
   };
 }
 
@@ -1504,6 +1682,165 @@ function boundedPreviewEnvelope(item: PreparedToolResult, targetTokens: number):
     }
   }
   return best;
+}
+
+interface ReadFileView {
+  record: Record<string, unknown>;
+  path: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  /** The numbered lines of `content` (`<line> <text>`), one per line from startLine to endLine. */
+  lines: string[];
+}
+
+interface ReadResultView {
+  envelope: Record<string, unknown>;
+  /** A batch read holds its slices under detail.files; a single read's detail is the slice itself. */
+  batch: boolean;
+  files: ReadFileView[];
+  lineCount: number;
+}
+
+/**
+ * The line slices of a committed text read. Undefined for any other read result (attachments, pages,
+ * failures) and for a slice whose content does not hold exactly its startLine..endLine lines.
+ */
+function readResultView(response: unknown): ReadResultView | undefined {
+  const envelope = asRecord(response);
+  const detail = asRecord(envelope?.detail);
+  if (!envelope || !detail || typeof envelope.status !== 'string') return undefined;
+  const batch = Array.isArray(detail.files);
+  const files: ReadFileView[] = [];
+  for (const value of batch ? detail.files as unknown[] : [detail]) {
+    const record = asRecord(value);
+    if (!record || typeof record.path !== 'string' || typeof record.content !== 'string'
+      || !Number.isSafeInteger(record.startLine) || (record.startLine as number) < 1
+      || !Number.isSafeInteger(record.endLine) || !Number.isSafeInteger(record.totalLines)) {
+      return undefined;
+    }
+    const startLine = record.startLine as number;
+    const endLine = record.endLine as number;
+    const lines = record.content ? record.content.split('\n') : [];
+    if (lines.length !== endLine - startLine + 1) return undefined;
+    if (lines.length > 0 && (!lines[0].startsWith(`${startLine} `) || !lines[lines.length - 1].startsWith(`${endLine} `))) {
+      return undefined;
+    }
+    files.push({ record, path: record.path, startLine, endLine, totalLines: record.totalLines as number, lines });
+  }
+  if (files.length === 0) return undefined;
+  return { envelope, batch, files, lineCount: safeSum(files.map((file) => file.lines.length)) };
+}
+
+/**
+ * A read result showing its first `shownLines` lines, filled in file order. A cut slice keeps read's
+ * own contract truthful: endLine is the last line actually shown, so "continue from endLine + 1"
+ * still holds, and the slice says so in words and as a rereadHint.
+ */
+function readPreviewResponse(
+  view: ReadResultView,
+  shownLines: number
+): { response: Record<string, unknown>; reread?: ToolResultRereadTarget } {
+  let remaining = shownLines;
+  let reread: ToolResultRereadTarget | undefined;
+  const files = view.files.map((file): unknown => {
+    const shown = Math.min(remaining, file.lines.length);
+    remaining -= shown;
+    if (shown === file.lines.length) return cloneJsonValue(file.record);
+    const endLine = file.startLine + shown - 1;
+    const target: ToolResultRereadTarget = { kind: 'file', path: file.path, startLine: endLine + 1 };
+    reread ??= target;
+    const { path: _path, startLine: _startLine, endLine: _endLine, totalLines: _totalLines, content: _content, ...rest } = file.record;
+    return {
+      path: file.path,
+      startLine: file.startLine,
+      endLine,
+      totalLines: file.totalLines,
+      content: file.lines.slice(0, shown).join('\n'),
+      ...cloneJsonValue(rest) as Record<string, unknown>,
+      truncated: true,
+      note: shown > 0
+        ? `Only lines ${file.startLine}-${endLine} of this read fit in the model context; lines ${endLine + 1}-${file.endLine} `
+          + `were read but are not shown${file.endLine < file.totalLines ? `, and the file continues to line ${file.totalLines}` : ''}. `
+          + `Continue with read startLine ${endLine + 1}.`
+        : `None of lines ${file.startLine}-${file.endLine} of this read fit in the model context. Read the file again from `
+          + `startLine ${file.startLine} on its own or with a smaller endLine; a single line longer than a tool result can `
+          + 'only be inspected with a shell command.',
+      rereadHint: rereadHint(target)
+    };
+  });
+  const { detail, ...envelope } = view.envelope;
+  const { files: _files, ...batchDetail } = view.batch ? asRecord(detail) ?? {} : {};
+  return {
+    response: {
+      ...cloneJsonValue(envelope) as Record<string, unknown>,
+      detail: view.batch ? { ...cloneJsonValue(batchDetail) as Record<string, unknown>, files } : files[0]
+    },
+    ...(reread ? { reread } : {})
+  };
+}
+
+function boundedReadPreview(
+  view: ReadResultView,
+  targetTokens: number
+): { response: unknown; reread?: ToolResultRereadTarget } {
+  let best = readPreviewResponse(view, 0);
+  if (estimateJsonTokens(best.response) > targetTokens) return best;
+  // Showing every line is the exact result, which did not fit.
+  let low = 1;
+  let high = view.lineCount - 1;
+  let bestShown = 0;
+  while (low <= high) {
+    const shown = Math.floor((low + high) / 2);
+    const candidate = readPreviewResponse(view, shown);
+    if (estimateJsonTokens(candidate.response) <= targetTokens) {
+      best = candidate;
+      bestShown = shown;
+      low = shown + 1;
+    } else {
+      high = shown - 1;
+    }
+  }
+  if (bestShown > 0 || view.files[0].lines.length === 0) return best;
+  // Not even the first line fits (minified code, one-line data): show its head rather than nothing,
+  // and point past it, since read can never show that line whole.
+  let lowChars = 1;
+  let highChars = view.files[0].lines[0].length;
+  while (lowChars <= highChars) {
+    const chars = Math.floor((lowChars + highChars) / 2);
+    const candidate = readPartialFirstLinePreview(view, chars);
+    if (estimateJsonTokens(candidate.response) <= targetTokens) {
+      best = candidate;
+      lowChars = chars + 1;
+    } else {
+      highChars = chars - 1;
+    }
+  }
+  return best;
+}
+
+/** A read result showing only the first `chars` characters of its first line (see boundedReadPreview). */
+function readPartialFirstLinePreview(
+  view: ReadResultView,
+  chars: number
+): { response: Record<string, unknown>; reread?: ToolResultRereadTarget } {
+  const preview = readPreviewResponse(view, 0);
+  const file = view.files[0];
+  const line = file.startLine;
+  const next = line + 1;
+  const target: ToolResultRereadTarget | undefined = next <= file.totalLines ? { kind: 'file', path: file.path, startLine: next } : undefined;
+  const detail = asRecord(preview.response.detail);
+  const first = view.batch ? asRecord((detail?.files as unknown[] | undefined)?.[0]) : detail;
+  if (first) {
+    first.endLine = line;
+    first.content = `${file.lines[0].slice(0, chars)}…`;
+    first.note = `Line ${line} is longer than fits in a tool result: only its first ${chars} characters are shown, and read `
+      + 'cannot show the rest of it; inspect that line with a shell command (for example cut -c or head -c).'
+      + (target ? ` Continue with read startLine ${next} for the lines after it.` : '');
+    if (target) first.rereadHint = rereadHint(target);
+    else delete first.rereadHint;
+  }
+  return { response: preview.response, ...(target ? { reread: target } : {}) };
 }
 
 function boundedValueDescriptor(value: unknown, maxTokens: number): unknown {

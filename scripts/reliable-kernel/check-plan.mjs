@@ -114,6 +114,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/global-settings-live-save.test.mjs',
   'tests/reliable-kernel/read-file-slice.test.mjs',
+  'tests/reliable-kernel/skill-tool-result-projection.test.mjs',
+  'tests/reliable-kernel/skill-reattachment-compression.test.mjs',
   'tests/reliable-kernel/request-compression-settings.test.mjs',
   'tests/reliable-kernel/model-capabilities.test.mjs',
   'tests/reliable-kernel/compression-provider-contracts.test.mjs',

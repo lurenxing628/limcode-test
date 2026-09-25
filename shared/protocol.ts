@@ -621,7 +621,7 @@ export const MAX_LLM_COMPRESSION_BODY_TARGET_ROOM_SHARE = 0.5;
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS = 8_000;
 /** Default frozen output allowance when a compression Provider has no explicit maximum. */
 export const DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS = 16_000;
-export const DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT = 'You have written a partial transcript for the initial task above. Please write a summary of the transcript. The purpose of this summary is to provide continuity so you can continue to make progress towards solving the task in a future context, where the raw history above may not be accessible and will be replaced with this summary. Write down anything that would be helpful, including the state, next steps, learnings etc. You must wrap your summary in a <summary></summary> block.';
+export const DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT = 'You have written a partial transcript for the initial task above. Please write a summary of the transcript. The purpose of this summary is to provide continuity so you can continue to make progress towards solving the task in a future context, where the raw history above may not be accessible and will be replaced with this summary. Write down anything that would be helpful, including the state, next steps, learnings etc. If skills were loaded with the skills tool, name each loaded skill exactly and the step of it the work had reached; their instructions are re-attached after the summary, so do not copy them. You must wrap your summary in a <summary></summary> block.';
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT = 'Transcript:';
 export const DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT = [
   '你正在对一段很长的对话做“分段”压缩。下面【本回合记录】是对话中的一个回合的完整记录',

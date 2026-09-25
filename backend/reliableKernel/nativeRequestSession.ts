@@ -11,10 +11,11 @@ import {
   type OpenAIResponsesNativeController,
   type OpenAIResponsesNativeHooks
 } from '../capabilities/openAIResponsesNativeControl';
-import type { ModelOutputItemReference, ModelResponseTiming } from '../../shared/protocol';
+import { SKILLS_TOOL_NAME, type ModelOutputItemReference, type ModelResponseTiming } from '../../shared/protocol';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { freezeNativeChildToolProjection, readNativeRequestChildHandles, withChildHandles } from './conversationChildHandles';
-import { isCollaborationHandleTool, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { isCollaborationHandleTool, normalizeModelHandleCatalog, projectToolResultForModel, type ModelHandleCatalog } from './modelHandleCatalog';
+import { projectToolResultBatch, readModelTextToolResponse } from './modelFacingContextProjection';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { nativePhysicalResponseBudgetPressure, type NativeLogicalRequestBudget } from './nativeCompressionGuard';
 import {
@@ -1639,6 +1640,15 @@ export class NativeRequestSession {
       this.childCatalog = frozen.catalog;
       // Projection metadata is local authority only; the provider receives the frozen output bytes.
       return { type: 'function_call_output', callId: call.providerCallId, output: frozen.output };
+    }
+    if (call.name === SKILLS_TOOL_NAME) {
+      // A loaded skill is read as its rendered text, the same bytes a full request replays for it.
+      const projected = projectToolResultBatch([{
+        toolName: call.name,
+        response: projectToolResultForModel(call.name, JSON.parse(raw) as unknown, this.childCatalog)
+      }]).items[0].response;
+      const text = readModelTextToolResponse(projected);
+      if (text) return { type: 'function_call_output', callId: call.providerCallId, output: text.text };
     }
     const parsed = asRecord(normalizePlainJson(JSON.parse(raw), 'Native ToolModelResult content'));
     const parts = Array.isArray(parsed?.parts) ? parsed.parts : undefined;

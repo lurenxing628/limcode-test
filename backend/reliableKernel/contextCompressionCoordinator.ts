@@ -54,6 +54,7 @@ import {
   calculateEffectiveSummaryMaxTokens,
   calculateFullRequestPlanningBudget,
   calibrateEstimatorToProvider,
+  calibrateProviderToEstimator,
   calibratedTailBudgetTokens,
   summaryTargetEstimatorTokens,
   collectStoredNativeConfigurationUpdates,
@@ -62,8 +63,10 @@ import {
   selectContinuousAtomicTail,
   UNCALIBRATED_PROVIDER_TOKENS,
   type AtomicContextGroup,
+  type CalibratedCompressionRooms,
   type ContextPlanningFailureCode,
-  type FullRequestPlanningBudget
+  type FullRequestPlanningBudget,
+  type StoredModelFacingContextItem
 } from './modelFacingContextProjection';
 import { buildModelHandleCatalog, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import {
@@ -77,6 +80,11 @@ import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import {
+  SKILL_REATTACHMENT_MAX_BODY_TARGET_SHARE,
+  SKILL_REATTACHMENT_TOTAL_TOKENS,
+  planSkillReattachment
+} from './skillToolResultProjection';
 
 export type CompressionTrigger = 'auto' | 'manual';
 export type CompressionTriggerReason = 'manual' | 'configured_threshold';
@@ -460,12 +468,25 @@ export class ReliableContextCompressionCoordinator {
           policy.config.llmSummary?.targetTokens,
           rooms.calibratedBodyTargetTokens
         );
+    // Skills whose loads this compression removes are re-attached after its result. Re-attaching every
+    // skill loaded anywhere in the window is the most any prefix can add, so the retained tail leaves
+    // room for that beside the summary and the post-compression body still lands on its target.
+    const storedWindow = storedContextItems(semanticMaterialized.segments);
+    const plannedSkillBudgetTokens = skillReattachmentBudgetTokens(rooms);
+    const skillReserveTokens = planSkillReattachment({
+      compressed: storedWindow,
+      retained: [],
+      budgetTokens: plannedSkillBudgetTokens
+    })?.estimatedTokens ?? 0;
     const textTailPlan = command.sourceReplay || policy.methodKind === 'provider_native' || command.compressSegmentCount !== undefined
       ? undefined
       : selectCompressionPrefixByTokens(
             materialized.records,
             semanticMaterialized.segments,
-            calibratedTailBudgetTokens(rooms, effectiveSummaryMaxTokens ?? 0),
+            calibratedTailBudgetTokens(
+              rooms,
+              (effectiveSummaryMaxTokens ?? 0) + calibrateEstimatorToProvider(skillReserveTokens, calibration)
+            ),
             fullAttachmentCatalogState,
             fullModelHandleCatalog
           );
@@ -620,7 +641,9 @@ export class ReliableContextCompressionCoordinator {
             : {}),
           ...(effectiveSummaryMaxTokens === undefined ? {} : {
             effectiveSummaryMaxTokens: summaryTargetEstimatorTokens(effectiveSummaryMaxTokens, calibration)
-          })
+          }),
+          // Frozen so a retried or recovered compression re-attaches the same bytes (the block is idempotent).
+          ...(skillReserveTokens > 0 ? { skillReattachmentBudgetTokens: plannedSkillBudgetTokens } : {})
         }, 'Reliable compression recipe'),
         idempotencyKey
       });
@@ -671,7 +694,7 @@ export class ReliableContextCompressionCoordinator {
     }
     const completed = await this.modelProvider.completedEvent(expectedModelRequestId);
     const compressionResult = parseCompressionResult(completed.content);
-    const summary = compressionResult.contents;
+    const providerSummary = compressionResult.contents;
     if (compressionResult.attachmentObservationProfileSha256 !== attachmentObservationProfileSha256) {
       throw new Error('Compression terminal Attachment observation profile conflicts with its frozen recipe.');
     }
@@ -684,11 +707,21 @@ export class ReliableContextCompressionCoordinator {
       : [];
     if (attachmentObservationProfileSha256) {
       assertAttachmentObservationStateContent(
-        summary,
+        providerSummary,
         attachmentObservationRequirements,
         compressionResult.attachmentObservations ?? []
       );
     }
+    // Every compression method ends here, so every one re-attaches the skills it removed: text and
+    // segmented summaries, and provider-native compaction, whose output the kernel stores and follows
+    // with this content. Forks and child contexts copy the committed block, re-attachment included.
+    const skillBudgetTokens = await this.readFrozenSkillReattachmentBudget(request);
+    const skillReattachment = skillBudgetTokens === undefined ? undefined : planSkillReattachment({
+      compressed: storedWindow.slice(0, sourceSegmentCount),
+      retained: storedWindow.slice(sourceSegmentCount),
+      budgetTokens: skillBudgetTokens
+    });
+    const summary = skillReattachment ? [...providerSummary, skillReattachment.content] : providerSummary;
     const tailSegments = semanticMaterialized.segments.slice(sourceSegmentCount);
     const tailAttachmentCatalogState = await this.attachmentCatalog.projectState(
       frozen.conversationId,
@@ -929,17 +962,10 @@ export class ReliableContextCompressionCoordinator {
     semanticMaterialized: MaterializedContext,
     sourceSegmentCount: number
   ): Promise<NativeCompressionRebasePlan | undefined> {
-    const storedItems = (segments: MaterializedContextSegment[]) => segments.map((segment) => ({
-      segmentId: segment.segmentId,
-      segmentKind: segment.segmentKind,
-      messageRole: segment.messageRole,
-      contentType: segment.contentObject.content_type,
-      content: segment.content.toString('utf8')
-    }));
-    const updates = collectStoredNativeConfigurationUpdates(storedItems(
+    const updates = collectStoredNativeConfigurationUpdates(storedContextItems(
       semanticMaterialized.segments.slice(0, sourceSegmentCount)
     ));
-    const retainedUpdates = collectStoredNativeConfigurationUpdates(storedItems(
+    const retainedUpdates = collectStoredNativeConfigurationUpdates(storedContextItems(
       semanticMaterialized.segments.slice(sourceSegmentCount)
     ));
     const frozenNativeReasoning = await this.readLatestFrozenNativeReasoning(turnId);
@@ -1011,6 +1037,24 @@ export class ReliableContextCompressionCoordinator {
       return effectiveEffort === undefined ? {} : { effectiveEffort };
     }
     return undefined;
+  }
+
+  /** The re-attachment budget the compression ModelRequest froze; absent when its window had no skill loads. */
+  private async readFrozenSkillReattachmentBudget(request: DomainRow): Promise<number | undefined> {
+    const recipeRow = await this.requireDomain(
+      'ContentObject',
+      requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
+    );
+    const recipe = requireRecord(
+      normalizePlainJson(
+        JSON.parse((await this.contentStore.read(asContentObjectMetadata(recipeRow))).toString('utf8')),
+        'Compression ModelRequest recipe'
+      ),
+      'Compression ModelRequest recipe'
+    );
+    const budget = recipe.skillReattachmentBudgetTokens;
+    if (budget === undefined) return undefined;
+    return requireNonNegativeTokenCount(budget as number, 'Compression recipe skillReattachmentBudgetTokens');
   }
 
   private async optionalDomain(domain: string, id: string): Promise<DomainRow | undefined> {
@@ -1177,6 +1221,30 @@ function selectCompressionPrefixByTokens(
     sourceSegmentCount: selected.prefixItems.length,
     ...(newest ? { newestGroupTokens: newest.estimatedTokens, newestGroupKind: newest.kind } : {})
   };
+}
+
+function storedContextItems(segments: readonly MaterializedContextSegment[]): StoredModelFacingContextItem[] {
+  return segments.map((segment) => ({
+    segmentId: segment.segmentId,
+    segmentKind: segment.segmentKind,
+    messageRole: segment.messageRole,
+    contentType: segment.contentObject.content_type,
+    content: segment.content.toString('utf8')
+  }));
+}
+
+/**
+ * Local-estimator room for re-attached skills: Claude Code's 25k total, but never more than a quarter
+ * of the post-compression body target, which also holds the summary, the retained tail and new work.
+ */
+function skillReattachmentBudgetTokens(rooms: CalibratedCompressionRooms): number {
+  return Math.min(
+    SKILL_REATTACHMENT_TOTAL_TOKENS,
+    calibrateProviderToEstimator(
+      Math.floor(rooms.calibratedBodyTargetTokens * SKILL_REATTACHMENT_MAX_BODY_TARGET_SHARE),
+      rooms.calibration
+    )
+  );
 }
 
 /**

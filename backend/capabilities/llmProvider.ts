@@ -45,6 +45,7 @@ import {
   withOpenAIResponsesCacheBreakpointBeforeVolatileTail,
   type OpenAIResponsesHttpReplay
 } from './openAIResponsesTailCacheBreakpoint';
+import { installPlainTextToolResultCompactEncoding, withPlainTextToolResultRequest } from './textToolResultEncoding';
 import {
   assertCanonicalProviderToolContext,
   cloneInlineDataPart,
@@ -1913,7 +1914,7 @@ async function dryRunProviderNativeCompact(
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = unified.createLLMFromConfig({
+  const provider = installPlainTextToolResultCompactEncoding(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -1924,7 +1925,7 @@ async function dryRunProviderNativeCompact(
     ...unifiedPromptCacheConfigEntry(runtimeSettings, requestBody),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as unknown as Partial<UnifiedDryRunCapable>;
+  }, registry.llmProviders), runtimeSettings.provider) as unknown as Partial<UnifiedDryRunCapable>;
   if (typeof provider.compactDryRun !== 'function') {
     throw new Error('当前 unified-llm-provider 版本不支持 provider.compactDryRun。');
   }
@@ -2330,7 +2331,7 @@ async function compactWithProviderNative(
     headerKeys: headers ? Object.keys(headers) : [],
     hasRequestBody: !!requestBody
   });
-  const provider = unified.createLLMFromConfig({
+  const provider = installPlainTextToolResultCompactEncoding(unified.createLLMFromConfig({
     provider: settings.provider,
     model: settings.model,
     apiKey: settings.apiKey,
@@ -2341,7 +2342,7 @@ async function compactWithProviderNative(
     ...unifiedPromptCacheConfigEntry(settings, requestBody),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders) as unknown as {
+  }, registry.llmProviders), settings.provider) as unknown as {
     compact?: (request: unknown, options?: unknown) => Promise<UnifiedLLMCompactResponse>;
     compactDryRun?: UnifiedDryRunCapable['compactDryRun'];
   };
@@ -3844,7 +3845,9 @@ const ROLLING_SUMMARY_STRUCTURE_INSTRUCTION = [
   '相关文件',
   '必须保留准确的路径、符号名、命令、报错、URL、版本号和业务 ID。',
   '子 Agent 的引用、派发任务和未完成补充必须一一对应；不得合并不同子 Agent 或不同派发，不得重编引用。',
-  '摘要中的子任务信息属于历史；继续执行时以重新提供的运行状态卡和子任务查询结果为准。'
+  '摘要中的子任务信息属于历史；继续执行时以重新提供的运行状态卡和子任务查询结果为准。',
+  '用 skills 工具载入过技能时，在“重要约束、决定和准确标识”里逐个写出技能的准确名字（如 superpowers:writing-plans），'
+    + '并在“正在做”里写明正按哪个技能执行、做到了它的哪一步；技能正文会在压缩后自动重新附上，不要抄写正文。'
 ].join('\n');
 
 function buildSummaryProviderCall(
@@ -4074,10 +4077,10 @@ function buildSegmentedSummaryProviderCalls(
         const joinedFloor = currentTokens !== undefined && safeUnit.transcriptTokensFloor !== undefined
           ? currentTokens + safeUnit.transcriptTokensFloor - SUMMARY_TRANSCRIPT_APPEND_SLACK_TOKENS
           : undefined;
-        if ((joinedFloor === undefined || joinedFloor <= packingLimitTokens)
-          && fits([...current.requestContents, ...safeUnit.requestContents], groups.length)) {
-          current.requestContents.push(...safeUnit.requestContents);
-          current.sourceContents.push(...safeUnit.sourceContents);
+        const joined = joinSplitSummaryPieces(current.requestContents, safeUnit.requestContents);
+        if ((joinedFloor === undefined || joinedFloor <= packingLimitTokens) && fits(joined, groups.length)) {
+          current.requestContents = joined;
+          current.sourceContents = joinSplitSummaryPieces(current.sourceContents, safeUnit.sourceContents);
           currentTokens = undefined;
           continue;
         }
@@ -4118,6 +4121,24 @@ function buildSegmentedSummaryProviderCalls(
     }
     return call;
   });
+}
+
+/**
+ * Only pieces of one split record meet here (the chunk is emptied before a record is split), and each
+ * piece continues the previous one's text. Joined as one text they stay the single transcript entry
+ * they were cut from; appended as two contents they would render as two separate records.
+ */
+function joinSplitSummaryPieces(previous: MessageContent[], next: MessageContent[]): MessageContent[] {
+  const last = previous[previous.length - 1];
+  const first = next[0];
+  const lastText = last?.parts.length === 1 && isVisibleTextPart(last.parts[0]) ? last.parts[0] : undefined;
+  const firstText = first?.parts.length === 1 && isVisibleTextPart(first.parts[0]) ? first.parts[0] : undefined;
+  if (!last || !first || !lastText || !firstText || last.role !== first.role) return [...previous, ...next];
+  return [
+    ...previous.slice(0, -1),
+    { ...last, parts: [{ ...lastText, text: lastText.text + firstText.text }] },
+    ...next.slice(1)
+  ];
 }
 
 function splitOversizedSummaryUnit(
@@ -5343,7 +5364,11 @@ function installRequestAdaptation<T>(
       : gpt6Sampling ? adaptGpt6SamplingForReasoningEffort(request, settings.provider, { alwaysReasoning: astraSampling })
         : request;
     // 方言改写在记住的参数适配之前：方言写上的顶层 `thinking` / `enable_thinking` 若被网关明确拒绝过，这里仍会去掉。
-    const adapted = applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target, session);
+    // 文本工具结果（已载入的技能）在断点放置之前换回原文，断点落在最终发出的内容上。
+    const adapted = withPlainTextToolResultRequest(
+      applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target, session),
+      settings.provider
+    );
     if (settings.provider === 'openai-responses') {
       return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount, httpReplay);
     }

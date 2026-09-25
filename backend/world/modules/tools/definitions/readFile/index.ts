@@ -478,7 +478,11 @@ function normalizeReadItems(value: unknown): ReadFileItem[] | string {
   return items;
 }
 
-function boundBatchReadOutput<T extends { content: string }>(files: T[]): Array<T & {
+/**
+ * Keeps a batch within one read's budget. A slice that does not fit keeps whole lines only and its
+ * endLine becomes the last line kept, so "continue from endLine + 1" stays true for every file.
+ */
+function boundBatchReadOutput<T extends { content: string; startLine: number; endLine: number }>(files: T[]): Array<T & {
   contentTruncated?: boolean;
   omittedChars?: number;
 }> {
@@ -488,10 +492,12 @@ function boundBatchReadOutput<T extends { content: string }>(files: T[]): Array<
       remaining -= file.content.length;
       return file;
     }
-    const content = remaining > 0 ? file.content.slice(0, remaining) : '';
+    const cut = remaining > 0 ? file.content.lastIndexOf('\n', remaining) : -1;
+    const content = cut > 0 ? file.content.slice(0, cut) : '';
+    const keptLines = content ? content.split('\n').length : 0;
     const omittedChars = file.content.length - content.length;
     remaining = 0;
-    return { ...file, content, contentTruncated: true, omittedChars };
+    return { ...file, content, endLine: file.startLine + keptLines - 1, contentTruncated: true, omittedChars };
   });
 }
 

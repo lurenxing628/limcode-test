@@ -89,6 +89,7 @@ import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
+import { isSkillReattachmentContent, skillReattachmentSummaryNote } from './skillToolResultProjection';
 
 interface ToolCallOutput {
   id?: string;
@@ -1506,7 +1507,10 @@ function compressionContext(
     }
     if (item.segmentKind === 'compression' && contents.length === 0
       && methodKind !== 'provider_native') {
-      priorSummaryContents.push(...decoded);
+      // 上次压缩后重新附上的技能正文不交给摘要：这次压缩会再附上它们，摘要只需记住技能名与做到哪一步。
+      priorSummaryContents.push(...decoded.map((content) => isSkillReattachmentContent(content)
+        ? { role: 'user' as const, parts: [{ text: skillReattachmentSummaryNote(content) }] }
+        : content));
       if (attachmentStateContent) priorSummaryContents.push(attachmentStateContent);
       continue;
     }

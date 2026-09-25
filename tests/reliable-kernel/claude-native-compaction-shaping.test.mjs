@@ -402,11 +402,13 @@ test('Claude 原生压缩：实际发出的请求体与 dry-run 相同，返回�
  * sha256(JSON.stringify({url, headers, body})) of these dry-runs as produced before this change
  * (codex/agent-collaboration ecdc1b2b): the fix is Claude-only. The summary pin was re-taken when the
  * length instruction became “约 800 tokens，最多不超过 1000 tokens…”; with the old instruction text
- * swapped back in, the new body hashes to the ecdc1b2b value 61bbdd12….
+ * swapped back in, the new body hashes to the ecdc1b2b value 61bbdd12…. It was re-taken again when the
+ * summary instructions gained the loaded-skills rule (keep skill names and the step reached); without
+ * those two sentences the body hashes to the previous pin 860242ec….
  */
 const UNCHANGED_BASELINE = {
   openaiResponsesNative: 'a0b88af17076c4d3a7b6b52e32ab0c7e662ce12a3ea0e41a9b2e0f4e6ce09762',
-  claudeLlmSummary: '860242ec49eec60c9ced1c9431d50afe8a1e51eacf3247b3b2ba81c2e61334c2'
+  claudeLlmSummary: '1e278352f55d7d957a848763f44372516e445440cfd736d895fe909f430636ad'
 };
 
 function handcraftedCompactRequest(provider, model, methodKind) {
