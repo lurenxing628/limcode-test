@@ -166,6 +166,13 @@ export interface ReliableKernelBackgroundProcessContinuationSource {
   exitSignal?: string;
 }
 
+/**
+ * How one child Agent answer ended, derived by the Host from committed facts: an interrupted
+ * partial answer, the stable failed-submission of a failed child run, or a submitted final answer.
+ * Client AnswerSubmission records carry it as `outcome`.
+ */
+export type ReliableKernelAnswerOutcome = 'submitted' | 'interrupted' | 'failed';
+
 export interface ReliableKernelSubagentContinuationSource {
   kind: 'subagent';
   inboxItemId: string;
@@ -174,7 +181,7 @@ export interface ReliableKernelSubagentContinuationSource {
   childExecutionId: string;
   childConversationId: string;
   childStatus: string;
-  interrupted: boolean;
+  outcome: ReliableKernelAnswerOutcome;
   agentId?: string;
   title?: string;
 }

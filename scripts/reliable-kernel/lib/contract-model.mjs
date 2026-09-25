@@ -16,7 +16,7 @@ export const CONTRACT_FILES = [
 ];
 
 const CONTRACT_REVISION = '2026-07-31-r4';
-const CLIENT_FEED_CONTRACT_REVISION = '2026-09-25-r1';
+const CLIENT_FEED_CONTRACT_REVISION = '2026-09-25-r2';
 const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r5';
 // Contracts revised after the base revision; every other contract file stays at CONTRACT_REVISION.
 const FILE_CONTRACT_REVISIONS = new Map([

@@ -57,6 +57,7 @@ import {
 } from './contentAddressedStore';
 import type { RuntimeChange, RuntimeCommitResult } from './contracts';
 import { compressionResultSizeCounted } from './contextTokenEstimator';
+import { answerSubmissionClientOutcome } from './answerSubmissionOutcome';
 import { requirePhaseFId, requirePhaseFText } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -1978,7 +1979,7 @@ export class ClientDetailReader {
     }
     const payloads = await this.listRows('AnswerPayload', { submission_id: sourceId }, 2);
     if (payloads.length !== 1) throw new Error(`AnswerSubmission ${sourceId} must have one AnswerPayload.`);
-    const interrupted = runtimeBoolean(submission.interrupted, 'AnswerSubmission.interrupted');
+    const outcome = answerSubmissionClientOutcome(submission, childExecutionId);
     const title = payloads[0]!.title === null
       ? undefined
       : boundedTurnIntentSourceText(
@@ -1993,7 +1994,7 @@ export class ClientDetailReader {
       childExecutionId,
       childConversationId,
       childStatus: requirePhaseFText(child.status, 'ChildExecution.status'),
-      interrupted,
+      outcome,
       agentId: requirePhaseFId(agentLinks[0]!.agent_id, 'AgentConversationLink.agent_id'),
       ...(title ? { title } : {})
     };
@@ -2154,12 +2155,6 @@ export class ClientDetailReader {
     if (!row) throw new Error(`${domain} ${id} does not exist.`);
     return row;
   }
-}
-
-function runtimeBoolean(value: unknown, label: string): boolean {
-  if (value === 0n) return false;
-  if (value === 1n) return true;
-  throw new TypeError(`${label} must be SQLite boolean 0 or 1.`);
 }
 
 function optionalRuntimeIntegerText(value: unknown, label: string): string | undefined {

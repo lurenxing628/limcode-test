@@ -20,6 +20,7 @@ import {
   executeClientVisibleMessageHistoryPage,
   executeConversationHistoryProjection,
   projectAnswerBridgeRecord,
+  projectAnswerSubmissionRecord,
   projectChildExecutionActivityRecord,
   projectCollaborationMessageRecord,
   projectCompressionBlockRecord,
@@ -577,6 +578,9 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       }
       if (row.domain === 'AnswerBridge') {
         record = projectAnswerBridgeRecord(database, row.id);
+      }
+      if (row.domain === 'AnswerSubmission') {
+        record = projectAnswerSubmissionRecord(database, row.id);
       }
       if (row.domain === 'Process') {
         record = projectProcessRecord(database, row.id, clientProjectionContent);

@@ -179,29 +179,35 @@ test('messages between other Conversations are not projected into this Conversat
 });
 
 test('a child answer delivered to this Conversation is the same card, labelled as that child Agent final result', () => {
-  const answerRecords = (interrupted: number, state: string, turnId: string | null) => ({
+  const answerRecords = (outcome: string, state: string, turnId: string | null) => ({
     Conversation: byId({ id: 'child-conversation', title: '调研子任务', status: 'active' }),
     Turn: byId({ id: 'self-turn', conversation_id: 'self' }, { id: 'spawn-turn', conversation_id: 'self' }),
     ChildExecution: byId({ id: 'child-execution', child_conversation_id: 'child-conversation', status: 'idle' }),
     ChildExecutionParentLink: byId({ id: 'parent-link', child_execution_id: 'child-execution', parent_turn_id: 'spawn-turn' }),
     AnswerBridge: byId({ id: 'bridge', child_execution_id: 'child-execution' }),
-    AnswerSubmission: byId({ id: 'submission', answer_bridge_id: 'bridge', interrupted }),
+    AnswerSubmission: byId({ id: 'submission', answer_bridge_id: 'bridge', interrupted: outcome === 'interrupted' ? '1' : '0', outcome }),
     RuntimeInboxItem: byId({ id: 'answer-inbox', source_kind: 'answer_submission', source_id: 'submission' }),
     RuntimeDelivery: byId({ id: 'answer-delivery', inbox_item_id: 'answer-inbox', target_conversation_id: 'self',
       target_turn_id: turnId, state, attempt_seq: '1' })
   });
-  const timeline = project(answerRecords(0, 'consumed', 'self-turn'), [{ id: 'm1' }], { m1: 'self-turn' });
+  const timeline = project(answerRecords('submitted', 'consumed', 'self-turn'), [{ id: 'm1' }], { m1: 'self-turn' });
   const [card] = timeline.afterMessage.m1;
   assert.equal(card.messageId, 'answer:submission');
   assert.equal(collaborationCardLabel(card), '来自子 Agent 调研子任务');
   assert.equal(collaborationCardKindLabel(card), '最终结果');
   assert.equal(collaborationCardStatusLabel(card), '');
 
-  const interrupted = project(answerRecords(1, 'pending', null)).unlocated[0];
+  const interrupted = project(answerRecords('interrupted', 'pending', null)).unlocated[0];
   assert.equal(collaborationCardKindLabel(interrupted), '部分结果（已中断）');
   assert.equal(collaborationCardStatusLabel(interrupted), '等待下一轮处理');
 
-  const foreground = answerRecords(0, 'consumed', 'self-turn');
+  // A failed child run is not a final result, even though its failure notice is not interrupted.
+  const failed = project(answerRecords('failed', 'consumed', 'self-turn'), [{ id: 'm1' }], { m1: 'self-turn' }).afterMessage.m1[0];
+  assert.equal(failed.kind, 'failed_answer');
+  assert.equal(collaborationCardKindLabel(failed), '执行失败');
+  assert.equal(collaborationCardLabel(failed), '来自子 Agent 调研子任务');
+
+  const foreground = answerRecords('submitted', 'consumed', 'self-turn');
   delete (foreground as Record<string, unknown>).RuntimeDelivery;
   const settledByWait = project(foreground, [{ id: 'm1' }], { m1: 'self-turn' });
   assert.deepEqual(settledByWait.afterMessage, {}, 'an answer that settled a waiting run_agent call stays with that tool call');

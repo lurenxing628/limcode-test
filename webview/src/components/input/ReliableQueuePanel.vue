@@ -322,7 +322,7 @@ function runtimeContinuationSource(value: unknown): ReliableKernelRuntimeContinu
     || !childExecutionId
     || !childConversationId
     || !childStatus
-    || typeof source.interrupted !== 'boolean'
+    || (source.outcome !== 'submitted' && source.outcome !== 'interrupted' && source.outcome !== 'failed')
   ) return undefined;
   return {
     kind: 'subagent',
@@ -332,7 +332,7 @@ function runtimeContinuationSource(value: unknown): ReliableKernelRuntimeContinu
     childExecutionId,
     childConversationId,
     childStatus,
-    interrupted: source.interrupted,
+    outcome: source.outcome,
     ...optionalTextField(source, 'agentId'),
     ...optionalTextField(source, 'title')
   };
@@ -375,7 +375,8 @@ function previewText(preview?: ReliableKernelTurnIntentPreview): string {
     }
     const name = subagentName(preview.source.agentId);
     if (preview.source.title) return `${name} · ${preview.source.title}`;
-    return `${name} 已返回${preview.source.interrupted ? '中断结果' : '回答'}`;
+    if (preview.source.outcome === 'failed') return `${name} 执行失败`;
+    return `${name} 已返回${preview.source.outcome === 'interrupted' ? '中断结果' : '回答'}`;
   }
   const text = preview.text.trim();
   if (text) return `${text}${preview.truncated ? '…' : ''}`;
@@ -433,7 +434,10 @@ function stateLabel(item: QueueItem): string {
   const runtime = runtimePreview(item.preview);
   if (runtime) {
     if (runtime.deliveryState === 'failed') return '续跑失败';
-    return runtime.source.kind === 'background_process' ? '后台结果' : runtime.source.kind === 'collaboration_message' ? '协作消息（非用户指令）' : '子 Agent 最终结果';
+    if (runtime.source.kind === 'background_process') return '后台结果';
+    if (runtime.source.kind === 'collaboration_message') return '协作消息（非用户指令）';
+    if (runtime.source.outcome === 'failed') return '子 Agent 执行失败';
+    return runtime.source.outcome === 'interrupted' ? '子 Agent 部分结果' : '子 Agent 最终结果';
   }
   if (guidancePreview(item.preview)?.hold === 'paused') return '已暂停';
   return '等待引导';

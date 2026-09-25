@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-09-25-r1",
+  "contractRevision": "2026-09-25-r2",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -222,7 +222,8 @@
     "r4: commitSeq 只在同一 hostBootId 内单调；snapshot 与 changes 通过原子 barrier 交接",
     "r5: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；共享ACK基线的未发送commit range先压缩净变化，仍超限才转单一snapshot-required；未发送批次不占用wire messageSeq",
     "r6: RuntimeDeliveryIntentLink 进入有界投影；turn-intent-preview v3 以 guidance/runtime_continuation 判别，并展示后台进程或子 Agent 的真实来源",
-    "2026-09-25-r1: 协作卡片按所属回合定位；未加载或早于已加载消息的回合放在第一条消息之上，未进入回合的卡片只在消息下方保留最新几条，最新消息不会被挤出最新分段"
+    "2026-09-25-r1: 协作卡片按所属回合定位；未加载或早于已加载消息的回合放在第一条消息之上，未进入回合的卡片只在消息下方保留最新几条，最新消息不会被挤出最新分段",
+    "2026-09-25-r2: 子 Agent 回答记录带宿主推导的 outcome（submitted/interrupted/failed），续跑预览以 outcome 取代 interrupted；快照为每条已投递回答带上其提交、桥与子执行"
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",
@@ -250,6 +251,7 @@
     "boardBodiesInFeed": false,
     "relations": "independent-message-source-target-reply-and-request-links",
     "peerConversations": "snapshot-only-collaborationPeerConversations-for-peers-of-the-loaded-links-outside-navigation; sidebar-display_title; runtime-absent-peer-status-deleted; client-reads-only-observed-Conversation-remove-or-deleted-status-as-deleted-and-a-missing-peer-as-unknown",
-    "runtimeContinuationPreview": "collaboration_message-source-kind-retains-sourceConversationId-mode-and-320-character-text-preview; never-user-authorization"
+    "runtimeContinuationPreview": "collaboration_message-source-kind-retains-sourceConversationId-mode-and-320-character-text-preview; never-user-authorization",
+    "childAnswers": "every-projected-answer-RuntimeDelivery-carries-its-own-AnswerSubmission-AnswerBridge-and-ChildExecution-not-only-the-bridge-current-submission; AnswerSubmission-client-record-carries-Host-derived-outcome-submitted-interrupted-or-failed; failed-is-the-stable-failed-submission-of-a-failed-child-run; subagent-runtime-continuation-preview-carries-the-same-outcome-instead-of-an-interrupted-bit"
   }
 }

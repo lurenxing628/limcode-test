@@ -20,7 +20,8 @@ export interface CollaborationTimelineCard {
   direction: 'incoming' | 'outgoing';
   peer: CollaborationPeer;
   peerRelation: CollaborationPeerRelation;
-  kind: 'message' | 'followup' | 'result' | 'answer' | 'partial_answer';
+  /** For a child answer: its Host-derived outcome (final, interrupted partial, or failed run). */
+  kind: 'message' | 'followup' | 'result' | 'answer' | 'partial_answer' | 'failed_answer';
   textPreview: string;
   /** The newest delivery attempt, or unknown when its delivery is not in the bounded feed. */
   status: 'waiting' | 'failed' | 'settled' | 'unknown';
@@ -135,14 +136,14 @@ export function projectCollaborationTimeline(input: {
     const bridge = input.records.AnswerBridge?.[text(submission?.answer_bridge_id)];
     const child = input.records.ChildExecution?.[text(bridge?.child_execution_id)];
     const peerConversationId = text(child?.child_conversation_id);
-    if (!submission || !peerConversationId) continue;
+    const kind = submission ? ANSWER_KIND_BY_OUTCOME[text(submission.outcome)] : undefined;
+    if (!submission || !peerConversationId || !kind) continue;
     const card: CollaborationTimelineCard = {
       messageId: `answer:${text(submission.id)}`,
       direction: 'incoming',
       peer: resolveCollaborationPeer(input.records, peerConversationId, input.removedConversationIds),
       peerRelation: 'child',
-      kind: submission.interrupted === true || submission.interrupted === 1 || submission.interrupted === '1'
-        ? 'partial_answer' : 'answer',
+      kind,
       textPreview: '',
       status: delivery.state === 'failed' ? 'failed'
         : delivery.state === 'pending' ? 'waiting'
@@ -230,10 +231,17 @@ export function collaborationCardStatusLabel(card: CollaborationTimelineCard): s
 
 export function collaborationCardKindLabel(card: CollaborationTimelineCard): string {
   if (card.kind === 'answer') return '最终结果';
+  if (card.kind === 'failed_answer') return '执行失败';
   if (card.kind === 'partial_answer') return '部分结果（已中断）';
   if (card.kind === 'result') return '任务结果';
   return card.kind === 'followup' ? '续派任务' : '消息';
 }
+
+const ANSWER_KIND_BY_OUTCOME: Readonly<Record<string, CollaborationTimelineCard['kind']>> = Object.freeze({
+  submitted: 'answer',
+  interrupted: 'partial_answer',
+  failed: 'failed_answer'
+});
 
 function deliveryKey(inboxItemId: PlainData | undefined, conversationId: PlainData | undefined): string {
   return `${text(inboxItemId)}\0${text(conversationId)}`;

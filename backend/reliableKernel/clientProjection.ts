@@ -52,6 +52,7 @@ import type {
   ConversationHistoryProjectionInput,
   ConversationHistoryProjectionResult
 } from './databaseWorkerProtocol';
+import { answerSubmissionClientOutcome } from './answerSubmissionOutcome';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { quote, requireNonNegativeIntegerString, requireRuntimeId } from './runtimeSqlRows';
 
@@ -271,6 +272,27 @@ export function projectAnswerBridgeRecord(database: Database.Database, answerBri
   `, { answerBridgeId });
   if (rows.length !== 1) throw new Error(`AnswerBridge ${answerBridgeId} does not exist.`);
   return rows[0];
+}
+
+/** Client AnswerSubmission records: the committed row plus its derived `outcome`. */
+export function projectAnswerSubmissionRecords(
+  database: Database.Database,
+  submissionIds: readonly string[]
+): DomainRow[] {
+  const submissions = queryAllByIds(database, 'answer_submission', 'id', submissionIds);
+  const childByBridge = new Map(queryAllByIds(database, 'answer_bridge', 'id',
+    submissions.map((row) => String(row.answer_bridge_id))).map((bridge) => [String(bridge.id), String(bridge.child_execution_id)]));
+  return submissions.map((submission) => {
+    const childExecutionId = childByBridge.get(String(submission.answer_bridge_id));
+    if (!childExecutionId) throw new Error(`AnswerSubmission ${String(submission.id)} has no AnswerBridge.`);
+    return { ...submission, outcome: answerSubmissionClientOutcome(submission, childExecutionId) };
+  });
+}
+
+export function projectAnswerSubmissionRecord(database: Database.Database, submissionId: string): DomainRow {
+  const [record] = projectAnswerSubmissionRecords(database, [submissionId]);
+  if (!record) throw new Error(`AnswerSubmission ${submissionId} does not exist.`);
+  return record;
 }
 
 /**
@@ -1124,7 +1146,7 @@ export function executeClientProjectionSnapshot(
     // A child's bridge is reused by every Turn it answers, so its current submission is only the
     // newest answer. Each projected answer delivery keeps its own submission, bridge and child, or
     // the card of an earlier answer would vanish from every reloaded view.
-    const answerSubmissions = queryAllByIds(database, 'answer_submission', 'id', [
+    const answerSubmissions = projectAnswerSubmissionRecords(database, [
       ...childAnswerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : []),
       ...inboxItems.flatMap((row) => row.source_kind === 'answer_submission' ? [String(row.source_id)] : [])
     ]);
@@ -2251,10 +2273,8 @@ function buildClientVisibleMessageHistoryRecords(
   const answerBridges = queryAllByIds(database, 'answer_bridge', 'child_execution_id', childExecutionIds)
     .map((row) => projectAnswerBridgeRecord(database, String(row.id)));
   include('AnswerBridge', answerBridges);
-  include('AnswerSubmission', queryAllByIds(
+  include('AnswerSubmission', projectAnswerSubmissionRecords(
     database,
-    'answer_submission',
-    'id',
     answerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : [])
   ));
 

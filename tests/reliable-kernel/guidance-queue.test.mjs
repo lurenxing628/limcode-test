@@ -434,7 +434,8 @@ test('Subagent RuntimeDelivery continuation 在当前回复和工具批次结束
     assert.equal(preview.source.agentId, 'agent-reviewer');
     assert.equal(preview.source.childExecutionId, 'runtime-handoff-child-execution');
     assert.equal(preview.source.title, 'Interrupted Subagent result');
-    assert.equal(preview.source.interrupted, true);
+    assert.equal(preview.source.outcome, 'interrupted');
+    assert.equal('interrupted' in preview.source, false, 'the preview names the answer outcome, not a raw bit');
     const projection = await app.database.clientProjectionSnapshot(conversationId);
     assert.deepEqual(
       projection.snapshot.subagentDeliverySummary.runtimeDeliveryIntentLinks.map((link) => ({

@@ -18,7 +18,7 @@ const statusLabel = computed(() => collaborationCardStatusLabel(props.card));
 <template>
   <article
     class="collaboration-card"
-    :class="{ 'is-outgoing': card.direction === 'outgoing', 'is-waiting': card.status === 'waiting', 'is-failed': card.status === 'failed' }"
+    :class="{ 'is-outgoing': card.direction === 'outgoing', 'is-waiting': card.status === 'waiting', 'is-failed': card.status === 'failed' || card.kind === 'failed_answer' }"
     :aria-label="[label, kindLabel, statusLabel].filter(Boolean).join(' · ')"
   >
     <header class="collaboration-card-header">
