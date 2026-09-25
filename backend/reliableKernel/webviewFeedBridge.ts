@@ -20,6 +20,7 @@ import {
   RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE,
   RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE,
   RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE,
+  isReliableKernelControlMessage,
   type ReliableKernelAckMessage,
   type ReliableKernelClientDiagnosticMessage,
   type ReliableKernelCollaborationHistoryRequestMessage,
@@ -445,19 +446,7 @@ export class ReliableKernelWebviewFeedBridge {
 
   /** Returns true only when the message belongs to the reliable feed control protocol. */
   public async handleControl(clientId: BridgeClientId, message: unknown): Promise<boolean> {
-    if (!isRecord(message)) return false;
-    if (
-      message.type !== RELIABLE_KERNEL_ACK_MESSAGE
-      && message.type !== RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE
-      && message.type !== RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE
-      && message.type !== RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
-      && message.type !== RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE
-      && message.type !== RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE
-      && message.type !== RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE
-      && message.type !== RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE
-    ) {
-      return false;
-    }
+    if (!isRecord(message) || !isReliableKernelControlMessage(message)) return false;
     const client = this.clients.get(clientId);
     const connectionPromise = client?.connection;
     if (!client || client.closed || !client.ready || !client.visible || !connectionPromise) return true;

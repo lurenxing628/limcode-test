@@ -18,15 +18,7 @@ import {
   getWebviewStaticResourceRoots,
   resolveLocalFileSourceUri
 } from '../webview/getWebviewHtml';
-import {
-  RELIABLE_KERNEL_ACK_MESSAGE,
-  RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
-  RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
-  RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE,
-  RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE,
-  RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE,
-  RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE
-} from '../../shared/reliableKernelClientFeed';
+import { isReliableKernelControlMessage } from '../../shared/reliableKernelClientFeed';
 import type { ApplicationFacade } from '../ApplicationFacade';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { isConversationRuntimeOwnerBusyError } from '../../backend/reliableKernel/ConversationRuntimeOwnerManager';
@@ -594,18 +586,6 @@ function panelTitle(options: MainPanelOptions, backendApp: ApplicationFacade): s
     ? displayConversationTitle({ id: options.conversationId, title: options.title })
     : backendApp.getConversationDisplayTitle(options.conversationId);
   return panelTabTitle(title);
-}
-
-function isReliableKernelControlMessage(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const type = (value as Record<string, unknown>).type;
-  return type === RELIABLE_KERNEL_ACK_MESSAGE
-    || type === RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE
-    || type === RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE
-    || type === RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
-    || type === RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE
-    || type === RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE
-    || type === RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE;
 }
 
 async function resolveRestoredPanelOptions(

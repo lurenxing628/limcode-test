@@ -23,6 +23,28 @@ export const RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE = 'reliable-kern
 export const RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE = 'reliable-kernel.transient-snapshot';
 export const RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE = 'reliable-kernel.client-diagnostic';
 
+/**
+ * Every Webview→Host message owned by the client-feed bridge. The panel router and the bridge both
+ * read this one list, so a new request type cannot reach the bridge in tests yet fall through to the
+ * command router in the real extension.
+ */
+export const RELIABLE_KERNEL_CONTROL_MESSAGE_TYPES: readonly string[] = Object.freeze([
+  RELIABLE_KERNEL_ACK_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE
+]);
+
+export function isReliableKernelControlMessage(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const type = (value as Record<string, unknown>).type;
+  return typeof type === 'string' && RELIABLE_KERNEL_CONTROL_MESSAGE_TYPES.includes(type);
+}
+
 export interface ReliableKernelClientChange {
   type: string;
   operation: 'upsert' | 'remove';
