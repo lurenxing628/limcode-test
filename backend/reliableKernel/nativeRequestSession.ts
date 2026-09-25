@@ -206,9 +206,27 @@ export class NativeRequestSession {
     return normalizeModelHandleCatalog(this.childCatalog);
   }
 
-  /** The Provider chain must fail explicitly rather than rebasing an ambiguous result/steer. */
+  /**
+   * The physical chain can no longer carry a result create: a result may already have been
+   * admitted without proof. The chain ends once every admitted effect settles; the Turn continues
+   * with a fresh full request from Context instead of resubmitting into this chain.
+   */
   public unsafeResultAdmissionError(): Error | undefined {
     return this.unsafeResultAdmission;
+  }
+
+  /**
+   * True once this logical request has durable chain progress: a streamed item revision or a
+   * checkpointed call. Its frozen input no longer describes the conversation, so a new Host must
+   * not replay it (the model would redo admitted tools and duplicate items); it closes the chain.
+   */
+  public hasDurableChainProgress(): boolean {
+    return this.calls.size > 0 || this.itemPartsOrdered.length > 0;
+  }
+
+  /** Admitted calls whose external effect has not settled yet (a restarted Host must wait for them). */
+  public unsettledAdmittedCallIds(): string[] {
+    return [...this.calls.values()].filter(call => call.admitted && !call.settled).map(call => call.toolCallId);
   }
 
   /** Rebuilds in-memory orchestration state from durable facts after a crash/reconnect. */
@@ -400,7 +418,6 @@ export class NativeRequestSession {
       conversationId: this.deps.conversationId,
       turnId: this.deps.turnId
     });
-    const request = await this.requireDomain('ModelRequest', this.deps.modelRequestId);
     const pendingByCallId = new Map(pending.map((entry) => [entry.toolCallId, entry]));
     for (const call of this.calls.values()) {
       const admission = await this.deps.effects.readNativeAdmission(call.toolCallId);
@@ -440,21 +457,10 @@ export class NativeRequestSession {
         this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
       }
     }
-    // A result committed before this Host boot but not durably marked delivered might have
-    // reached a response.create before the previous process vanished. No current-epoch writer
-    // persists a *pre-wire* result-submission intent, so even without a provider-created marker
-    // we cannot prove "never sent". Refuse the active request rather than auto-replay an already
-    // settled result. An unsettled call did not have a ToolModelResult to send and may reconcile.
-    if (request.status !== 'terminal') {
-      for (const call of this.calls.values()) {
-        if (call.admitted && call.settled && !call.delivered) {
-          this.uncertainResultCalls.add(call.toolCallId);
-        }
-      }
-      if (this.uncertainResultCalls.size > 0) {
-        this.unsafeResultAdmission ??= nativeResultAdmissionUnknownError();
-      }
-    }
+    // A result settled before this Host boot may or may not have reached a result create. That is
+    // not resolved here: AgentLoop never resumes a physical chain with durable progress after a
+    // Host change (hasDurableChainProgress); it closes the chain locally and continues the Turn
+    // with a fresh full request built from Context, where each result occurs exactly once.
     for (const call of this.calls.values()) {
       if (call.admitted && !call.settled) {
         // Even an unsafe provider admission must not discard a previously started tool. The

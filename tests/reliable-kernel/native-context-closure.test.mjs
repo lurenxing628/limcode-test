@@ -289,6 +289,45 @@ test('a Context left with unresolved native calls by an older Host is repaired b
   });
 });
 
+test('a Host restart never replays a native chain with durable progress; the Turn continues from Context', { timeout: 30000 }, async () => {
+  const checkpointRequested = deferred();
+  await withNativeKernel(async ({ round, controls, emit, responseId, ended }) => {
+    if (round === 0) {
+      await emitToolResponse(emit, responseId, ['call-before-restart']);
+      await ended.promise;
+      checkpointRequested.resolve();
+      // The Host dies before the chain's terminal event is committed.
+      await new Promise(resolve => controls.signal.addEventListener('abort', resolve, { once: true }));
+      return;
+    }
+    await emitFinalText(emit, responseId, 'continued after the restart');
+  }, async (state) => {
+    const { requests, executions, startTurn, drive, reopen, recover } = state;
+    const first = await startTurn('closure-restart', 'Run one probe.');
+    const driving = drive(first);
+    void driving.catch(() => undefined);
+    await checkpointRequested.promise;
+    const [interrupted] = await rows(state.app, 'ModelRequest', { turn_id: first.turnId });
+    assert.notEqual(interrupted.status, 'terminal', 'the first request is still open when the Host dies');
+    await state.app.modelProvider.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture Host restart'));
+    await assert.rejects(driving, error => kernel.isExecutionHandoffError(error));
+    await reopen();
+    const recovered = await recover(first.turnId);
+    const outcome = await drive(recovered);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(state.app, 'TurnTermination', { turn_id: first.turnId })));
+    assert.equal(requests.length, 2, 'the frozen input of the first request is never sent again');
+    assert.notEqual(requests[1].modelRequestId, requests[0].modelRequestId);
+    const modelRequests = (await rows(state.app, 'ModelRequest', { turn_id: first.turnId }))
+      .sort((left, right) => Number(left.request_seq) - Number(right.request_seq));
+    assert.equal(modelRequests.length, 2);
+    assert.equal(modelRequests[0].terminal_state, 'native_chain_rebased');
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-before-restart'), { calls: 1, results: 1 },
+      'the new full request carries the admitted call and its result exactly once');
+    assert.equal(executions.length, 1, 'the admitted tool is not executed again after the restart');
+  });
+});
+
 test('closing an ended native chain closes every settled call even when one call cannot be cancelled', async () => {
   const appended = [];
   const session = new NativeRequestSession({

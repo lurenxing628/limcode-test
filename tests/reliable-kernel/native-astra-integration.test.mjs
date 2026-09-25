@@ -449,7 +449,7 @@ test('Astra executes a durable async call before response completion and deliver
   });
 });
 
-test('accepted steer and required result on one predecessor fail closed without false admission or replay', { timeout: 30_000 }, async () => {
+test('accepted steer and required result on one predecessor continue from Context without false admission or chain replay', { timeout: 30_000 }, async () => {
   await withNativeRuntime(async harness => {
     const { app, conversationId, frames, created, text, completed, send, until } = harness;
     const turn = await harness.startTurn('native-pending-steer', 'Read the probe.');
@@ -515,20 +515,35 @@ test('accepted steer and required result on one predecessor fail closed without 
     completed(delivery.socket, 'steer-response-2', [
       text(delivery.socket, 'steer-response-2', 0, 'The provider produced an unattributed successor.')
     ]);
+    // The ambiguous chain is abandoned, never resubmitted into; the Turn continues with a fresh full
+    // request built from Context, where the settled result occurs exactly once.
+    const rebase = await until(() => frames.filter(frame => frame.body.type === 'response.create')[2],
+      'fresh full request after the ambiguous chain');
+    assert.equal(rebase.body.previous_response_id, undefined, 'an unreliable chain tail is never continued');
+    const rebaseItems = rebase.body.input ?? [];
+    assert.equal(rebaseItems.filter(item => item.type === 'function_call'
+      && item.call_id === 'original-synchronous-call').length, 1);
+    assert.equal(rebaseItems.filter(item => item.type === 'function_call_output'
+      && item.call_id === 'original-synchronous-call').length, 1, 'the settled result is carried exactly once');
+    assert.equal(JSON.stringify(rebaseItems).includes(instruction), false,
+      'an unverified steering instruction is not silently replayed');
+    created(rebase.socket, 'steer-response-3');
+    completed(rebase.socket, 'steer-response-3', [
+      text(rebase.socket, 'steer-response-3', 0, 'Final answer from the rebased request.')
+    ]);
     let timeoutId;
     const finished = await Promise.race([
       turn.completion,
       new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error(
-        'Ambiguous result admission must terminate promptly, not wait for a new create or rebase.'
+        'Ambiguous result admission must continue promptly from Context.'
       )), 12_000); })
     ]).finally(() => clearTimeout(timeoutId));
-    assert.equal(finished.terminalStatus, 'failed');
-    assert.equal(finished.modelRequestIds.length, 1, 'no automatic full-request replay of a possibly admitted result');
+    assert.equal(finished.terminalStatus, 'completed');
+    assert.equal(finished.modelRequestIds.length, 2, 'one new logical request continues the same Turn');
     const [termination] = await rows(app, 'TurnTermination', { turn_id: turn.turnId });
-    assert.equal(termination.terminal_status, 'failed');
-    assert.match(termination.reason, /NATIVE_RESULT_ADMISSION_UNKNOWN/);
-    assert.deepEqual(frames.filter(frame => frame.body.type === 'response.create'), [first, delivery],
-      'provider received only the original request and the single required result submission');
+    assert.equal(termination.terminal_status, 'completed');
+    assert.deepEqual(frames.filter(frame => frame.body.type === 'response.create'), [first, delivery, rebase],
+      'provider received the original request, the single required result submission and one full rebase');
     const durable = await receipt();
     assert.equal(durable.state, 'delivery_unknown', 'created does not identify the applied steer submission');
     assert.equal(durable.targetResponseId, 'steer-response-1');
@@ -554,7 +569,7 @@ test('accepted steer and required result on one predecessor fail closed without 
       'the original result body survives in CAS without being regenerated');
     assert.equal((await rows(app, 'ContextSegmentSource', {
       source_kind: 'tool_model_result', source_id: result.id
-    })).length, 1, 'the settled result has one durable Context occurrence even on failure');
+    })).length, 1, 'the settled result has one durable Context occurrence');
     const checkpoints = await rows(app, 'ModelStreamCheckpoint', { model_request_id: finished.modelRequestIds[0] });
     const controls = [];
     for (const checkpoint of checkpoints.filter(row => row.checkpoint_kind === 'native_control')) {
@@ -567,7 +582,12 @@ test('accepted steer and required result on one predecessor fail closed without 
     assert.deepEqual(successor.unverifiedToolResultCallIds, ['original-synchronous-call'],
       'durable CAS records the uncertainty, never a fabricated provider result ACK');
     assert.equal(successor.admittedToolResultCallIds, undefined);
-    assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 0);
+    const deliveries = await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' });
+    assert.equal(deliveries.length, 1, 'only the full rebase request that really carried the result proves delivery');
+    const [deliveryBody] = await rows(app, 'ContentObject', { id: deliveries[0].content_object_id });
+    const deliveryFact = JSON.parse((await app.contentStore.read(deliveryBody)).toString('utf8'));
+    assert.equal(deliveryFact.carrierModelRequestId, finished.modelRequestIds[1]);
+    assert.equal(deliveryFact.providerResponseId, 'steer-response-3');
     assert.equal(harness.executions(), 1);
     assert.equal(harness.httpCalls(), 0);
   });

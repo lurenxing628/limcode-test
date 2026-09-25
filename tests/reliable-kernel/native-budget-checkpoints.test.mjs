@@ -24,6 +24,20 @@ const deferred = () => {
   return { promise, resolve };
 };
 
+/** Per provider call id: native call occurrences and result-pair occurrences one full request carries. */
+function nativeToolPairs(request) {
+  const calls = new Map();
+  for (const item of request.context) {
+    if (item.contentType !== 'application/vnd.limcode.context-tool-pair+json') continue;
+    const pair = JSON.parse(item.content);
+    const id = pair.toolCall.providerCallId ?? pair.toolCall.id;
+    const entry = calls.get(id) ?? { calls: 0, results: 0 };
+    if (pair.toolModelResult) entry.results += 1; else entry.calls += 1;
+    calls.set(id, entry);
+  }
+  return calls;
+}
+
 async function waitFor(predicate, label, timeoutMs = 10000) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
@@ -107,7 +121,7 @@ async function withNativeTurn(options, verify) {
           });
         }
       }
-      if (options.ambiguous) {
+      if (options.ambiguous && round === 0) {
         await app.modelProvider.steer({ commandId: 'ambiguous-steer', turnId: activeTurnId,
           conversationId: 'native-budget', leaseEpoch: activeLeaseEpoch,
           content: { role: 'user', parts: [{ text: 'Steer while the result is required' }] } });
@@ -138,7 +152,7 @@ async function withNativeTurn(options, verify) {
         }
         await completion.promise;
       }
-      if (options.ambiguous && !options.ambiguousPending) {
+      if (options.ambiguous && !options.ambiguousPending && round === 0) {
         await emit('native_control', { type: 'response.completed', responseId: 'response-ambiguous-r2',
           usage: { input_tokens: 305, output_tokens: 8 } });
       }
@@ -420,27 +434,27 @@ test('ambiguous native result admission closes settled CAS output into Context w
   assert.equal(contextAppends, 1, 'terminal closure is idempotent');
 });
 
-test('R2.completed with unverified steer/result fails the Turn promptly and retains real SQLite/CAS facts', { timeout: 15000 }, async () => {
+test('R2.completed with unverified steer/result ends the chain and continues the Turn from Context without replay', { timeout: 15000 }, async () => {
   await withNativeTurn({ ambiguous: true, batches: 1, inputTokens: 210 },
     async ({ app, started, outcome, requests, executions, ended }) => {
-      assert.equal(outcome.terminalStatus, 'failed');
-      assert.equal(requests.length, 1, 'an unknown admission must never auto-open a full rebase');
+      assert.equal(outcome.terminalStatus, 'completed',
+        JSON.stringify(await rows(app, 'TurnTermination', { turn_id: started.turnId })));
       assert.equal(ended.length, 1, 'the real R2 boundary closes, rather than waiting indefinitely');
+      assert.equal(requests.length, 2, 'the Turn continues with one fresh full request, not a chain resubmission');
       assert.equal(new Set(executions).size, 1, 'the external tool effect is executed exactly once');
-      const [termination] = await rows(app, 'TurnTermination', { turn_id: started.turnId });
-      assert.match(termination.reason, /NATIVE_RESULT_ADMISSION_UNKNOWN/);
       const [source] = await rows(app, 'ToolCallSourceLink', { model_request_id: requests[0].modelRequestId });
       assert.equal(source.provider_call_id, 'call-0-0');
+      assert.deepEqual(nativeToolPairs(requests[1]).get('call-0-0'), { calls: 1, results: 1 },
+        'the continuation carries the call occurrence and its exact result occurrence once each');
       assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
         'R2 has no provider proof that it consumed the result');
       const [result] = await rows(app, 'ToolModelResult', { tool_call_id: source.tool_call_id });
-      assert.ok(result, 'the already-executed result is independently durable');
       const [revision] = await rows(app, 'MessageRevision', { id: result.message_revision_id });
       const [metadata] = await rows(app, 'ContentObject', { id: revision.content_object_id });
       assert.match((await app.contentStore.read(metadata)).toString('utf8'), /"ok":true/,
-        'the exact ToolModelResult bytes remain readable from CAS after the safe refusal');
+        'the exact ToolModelResult bytes remain readable from CAS');
       assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result',
-        source_id: result.id })).length, 1, 'the local result occurrence is retained, not mistaken for native_delivery');
+        source_id: result.id })).length, 1, 'the local result occurrence is retained once, not mistaken for native_delivery');
       const steering = (await app.modelProvider.steeringReceipts('native-budget'))
         .find(receipt => receipt.submissionId === 'ambiguous-steer');
       assert.equal(steering.state, 'delivery_unknown');
@@ -451,18 +465,19 @@ test('R2.completed with unverified steer/result fails the Turn promptly and reta
     });
 });
 
-test('ambiguous A waits for a separately admitted async B before refusing, without cancelling either effect', { timeout: 15000 }, async () => {
+test('ambiguous A waits for a separately admitted async B, then continues from Context without cancelling either effect', { timeout: 15000 }, async () => {
   await withNativeTurn({ ambiguous: true, ambiguousPending: true, batches: 1, batchSize: 2,
     asyncTools: true, inputTokens: 210 }, async ({ app, started, outcome, requests, executions, ended }) => {
-    assert.equal(outcome.terminalStatus, 'failed');
-    assert.equal(requests.length, 1, 'uncertain A must not be automatically replayed in a new request');
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: started.turnId })));
     assert.equal(ended.length, 1, 'chain ends only after both admitted external effects really settle');
+    assert.equal(requests.length, 2);
     assert.equal(new Set(executions).size, 2);
-    const [termination] = await rows(app, 'TurnTermination', { turn_id: started.turnId });
-    assert.match(termination.reason, /NATIVE_RESULT_ADMISSION_UNKNOWN/);
     assert.equal((await rows(app, 'ToolModelResult')).length, 2);
     assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 2);
     assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
+    const pairs = nativeToolPairs(requests[1]);
+    assert.deepEqual([...pairs.values()], [{ calls: 1, results: 1 }, { calls: 1, results: 1 }]);
   });
 });
 

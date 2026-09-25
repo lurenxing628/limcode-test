@@ -48,6 +48,7 @@ import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
   modelRequestIdFor,
+  NATIVE_CHAIN_REBASED_TERMINAL_STATE,
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   type FullRequestProviderAdapter,
   type ProviderTransientStreamEvent,
@@ -688,18 +689,27 @@ export class ReliableAgentLoop {
         if (await this.terminateIfRequested(turnId, `round:${round}:model-request:${modelRequestId}`)) {
           return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
         }
-        let output: NormalizedProviderOutput;
+        let dispatched: NormalizedProviderOutput | typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE;
         if (request.status === 'terminal') {
-          output = await this.readTerminalProviderOutput(modelRequestId);
+          dispatched = request.terminal_state === NATIVE_CHAIN_REBASED_TERMINAL_STATE
+            ? NATIVE_CHAIN_REBASED_TERMINAL_STATE
+            : await this.readTerminalProviderOutput(modelRequestId);
         } else {
           this.observeLifecycle({ turnId, stage: 'provider_dispatch_started', round, modelRequestId });
-          output = await this.dispatchAndCapture(
+          dispatched = await this.dispatchAndCapture(
             requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
             turnId,
             modelRequestId,
             request
           );
         }
+        if (dispatched === NATIVE_CHAIN_REBASED_TERMINAL_STATE) {
+          // The sealed chain's items, admitted calls and closed results already live in Context;
+          // the Turn continues with a new full request (where queued runtime input is absorbed).
+          requestSequence += 1n;
+          continue agentRounds;
+        }
+        const output = dispatched;
         this.observeLifecycle({ turnId, stage: 'provider_output_ready', round, modelRequestId });
         if (await this.terminateIfRequested(turnId, `round:${round}:provider-output:${modelRequestId}`)) {
           return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
@@ -2171,7 +2181,7 @@ export class ReliableAgentLoop {
     turnId: string,
     modelRequestId: string,
     request: DomainRow
-  ): Promise<NormalizedProviderOutput> {
+  ): Promise<NormalizedProviderOutput | typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE> {
     const providerId = requireText(request.provider_id, 'ModelRequest.provider_id');
     const modelId = requireText(request.model_id, 'ModelRequest.model_id');
     const requestSeq = requirePositiveInteger(request.request_seq, 'ModelRequest.request_seq').toString();
@@ -2232,18 +2242,22 @@ export class ReliableAgentLoop {
         now: this.now
       });
       await session.reconcile();
-      const unsafeAdmission = session.unsafeResultAdmissionError();
-      if (unsafeAdmission) {
-        const running = (await this.effects.listNativePendingWork({ conversationId, turnId }))
-          .find(call => call.modelRequestId === modelRequestId && !call.settled);
+      // A previously dispatched chain with durable progress is never replayed from its frozen
+      // input after a Host change: the model would redo admitted tools and duplicate items. The
+      // same holds for a chain whose result admission is unknown. Wait for admitted effects, close
+      // their results into Context, seal the chain, and let the Turn continue from Context.
+      const previouslyDispatched = reliableDecimal(asRecord(request.stream_stats_json)?.socketGeneration) > 0n
+        || request.status === 'streaming';
+      if (session.unsafeResultAdmissionError()
+        || (previouslyDispatched && session.hasDurableChainProgress())) {
+        const [running] = session.unsettledAdmittedCallIds();
         if (running) {
           await session.dispose('handoff');
-          throw new NativeSafetyWaitError(running.toolCallId);
+          throw new NativeSafetyWaitError(running);
         }
-        // No admitted external effect remains in flight. Close the local results, never
-        // reissue a physically ambiguous result create, then fail this user Turn explicitly.
-        await session.dispose('failed');
-        throw unsafeAdmission;
+        await session.dispose('completed');
+        await this.modelProvider.sealNativeChainForRebase(modelRequestId);
+        return NATIVE_CHAIN_REBASED_TERMINAL_STATE;
       }
     }
     const activeSession = session;
@@ -2431,12 +2445,10 @@ export class ReliableAgentLoop {
         }
       }
     }
-    // The Provider may have accepted an ambiguous result/steer successor without furnishing
-    // separate admission proofs. The physical chain has ended, its settled ToolModelResult was
-    // durably closed into Context by dispose, but another automatic full request would risk
-    // replaying a result that the Provider already consumed. Fail the Turn visibly instead.
-    const unsafeAdmission = session?.unsafeResultAdmissionError();
-    if (unsafeAdmission) throw unsafeAdmission;
+    // An ambiguous result admission ended the physical chain; dispose closed every settled result
+    // into Context. The next request is a fresh full request built from that Context, so the model
+    // sees each result exactly once whether or not the abandoned chain consumed it. No external
+    // effect is ever re-executed: tool execution is keyed on durable EffectIntents, not on wire input.
     // The terminal CAS checkpoint is the only final output authority. The transient collector exists
     // solely to drive low-latency UI observation and must never become a second durable result path.
     return this.readTerminalProviderOutput(modelRequestId);

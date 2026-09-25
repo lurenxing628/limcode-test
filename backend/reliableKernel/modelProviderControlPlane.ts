@@ -214,6 +214,8 @@ interface HistoricalRequestFacts {
 
 export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed' | 'native_control';
 export const PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE = 'partial_output_snapshot';
+/** Terminal state of a native logical request closed locally after a Host change (see sealNativeChainForRebase). */
+export const NATIVE_CHAIN_REBASED_TERMINAL_STATE = 'native_chain_rebased';
 export type ProviderTransientTerminalEventKind = 'failed' | 'cancelled';
 export type ProviderStreamEventKind = ProviderOutputStreamEventKind | ProviderTransientTerminalEventKind;
 
@@ -1484,6 +1486,20 @@ export class ModelProviderControlPlane {
   }
 
   /** Persistent request-level cancellation; one writer transaction always targets the latest identity. */
+  /**
+   * Closes a native logical request locally after a Host change. Its durable chain progress
+   * (items, admitted calls and their results) is already represented in Context; replaying the
+   * frozen input would make the model redo that work, so the physical chain is abandoned and the
+   * Turn continues with a new full request.
+   */
+  public async sealNativeChainForRebase(modelRequestIdInput: string): Promise<void> {
+    const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
+    const result = await this.cancelCurrentRequest(modelRequestId, NATIVE_CHAIN_REBASED_TERMINAL_STATE);
+    if (!result.cancelled && result.terminalState !== NATIVE_CHAIN_REBASED_TERMINAL_STATE) {
+      throw new Error(`Native ModelRequest ${modelRequestId} became terminal (${String(result.terminalState)}) before its rebase seal.`);
+    }
+  }
+
   public async cancel(modelRequestIdInput: string, reason = 'cancelled-by-user'): Promise<boolean> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
     try {
