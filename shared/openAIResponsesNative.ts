@@ -19,6 +19,40 @@ export type OpenAIResponsesNativeCapabilities = {
 
 export type OpenAIResponsesSteeringState = 'queued' | 'sent' | 'accepted' | 'waiting_for_input' | 'continuing' | 'completed' | 'failed' | 'delivery_unknown';
 
+/**
+ * The forward-only steering receipt lifecycle: every durable state change is one of these steps.
+ * The Host enforces it on each write; clients read the same table (identical-state writes are
+ * idempotent replays and are not listed).
+ */
+export const NATIVE_STEERING_TRANSITIONS: Readonly<Record<OpenAIResponsesSteeringState, readonly OpenAIResponsesSteeringState[]>> = Object.freeze({
+  queued: ['sent', 'failed', 'delivery_unknown'],
+  sent: ['accepted', 'waiting_for_input', 'failed', 'delivery_unknown'],
+  accepted: ['waiting_for_input', 'continuing', 'completed', 'failed', 'delivery_unknown'],
+  waiting_for_input: ['continuing', 'completed', 'failed', 'delivery_unknown'],
+  continuing: ['completed', 'delivery_unknown'],
+  completed: [],
+  failed: [],
+  delivery_unknown: []
+});
+
+/**
+ * Whether a receipt in state `to` can follow one in state `from` after one or more committed steps.
+ * A client may miss intermediate states between a live push and a status read, so it accepts any
+ * later state of the same lifecycle, and never an earlier one.
+ */
+export function nativeSteeringStateFollows(from: OpenAIResponsesSteeringState, to: OpenAIResponsesSteeringState): boolean {
+  const seen = new Set<OpenAIResponsesSteeringState>();
+  const pending = [...(NATIVE_STEERING_TRANSITIONS[from] ?? [])];
+  while (pending.length > 0) {
+    const state = pending.pop()!;
+    if (state === to) return true;
+    if (seen.has(state)) continue;
+    seen.add(state);
+    pending.push(...(NATIVE_STEERING_TRANSITIONS[state] ?? []));
+  }
+  return false;
+}
+
 export type OpenAIResponsesRequiredInput = {
   type: 'function_call_output' | 'custom_tool_call_output' | 'mcp_approval_response';
   callId?: string;

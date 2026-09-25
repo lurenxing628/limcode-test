@@ -215,7 +215,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'webview/tests/forkRequestLifecycle.test.ts',
   'webview/tests/summaryRebuildPreview.test.ts',
   'webview/tests/compressionTokenChange.test.ts',
-  'webview/tests/chatDraftPrefill.test.ts'
+  'webview/tests/chatDraftPrefill.test.ts',
+  'webview/tests/steeringReceipts.test.ts'
 ]);
 
 const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([

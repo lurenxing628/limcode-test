@@ -1,5 +1,5 @@
 import { ref } from 'vue';
-import type { NativeSteeringReceipt, OpenAIResponsesSteeringState } from '@shared/openAIResponsesNative';
+import { nativeSteeringStateFollows, type NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import { hasSteeringApplicationReceipt } from '../domain/steeringReceiptProof.ts';
 
 export { hasSteeringApplicationReceipt };
@@ -98,17 +98,6 @@ export function nextSteeringCompletionExpiry(
   return earliest;
 }
 
-const FORWARD_STATES: Record<OpenAIResponsesSteeringState, readonly OpenAIResponsesSteeringState[]> = {
-  queued: ['sent', 'accepted', 'waiting_for_input', 'continuing', 'completed', 'failed', 'delivery_unknown'],
-  sent: ['accepted', 'waiting_for_input', 'continuing', 'completed', 'failed', 'delivery_unknown'],
-  accepted: ['waiting_for_input', 'continuing', 'completed', 'failed', 'delivery_unknown'],
-  waiting_for_input: ['continuing', 'completed', 'failed', 'delivery_unknown'],
-  continuing: ['completed'],
-  completed: [],
-  failed: [],
-  delivery_unknown: []
-};
-
 const STEERING_IDENTITY_FIELDS = ['modelRequestId', 'messageId', 'targetResponseId', 'successorResponseId'] as const;
 
 function sameStateUpdateIsMoreComplete(previous: NativeSteeringReceipt, candidate: NativeSteeringReceipt): boolean {
@@ -129,8 +118,7 @@ export function mergeSteeringReceipts(conversationId: string, receipts: readonly
       previous.turnId !== receipt.turnId
       || STEERING_IDENTITY_FIELDS.some((field) => previous[field] && previous[field] !== receipt[field])
       || previous.updatedAt > receipt.updatedAt
-      || (previous.state !== receipt.state
-        && !(FORWARD_STATES[previous.state] as readonly string[]).includes(receipt.state))
+      || (previous.state !== receipt.state && !nativeSteeringStateFollows(previous.state, receipt.state))
       || (previous.state === receipt.state
         && !sameStateUpdateIsMoreComplete(previous, receipt)
         && (previous.updatedAt === receipt.updatedAt

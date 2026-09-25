@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
-import type {
-  NativeSteeringReceipt,
-  OpenAIResponsesRequiredInput,
-  OpenAIResponsesSteeringState
+import {
+  NATIVE_STEERING_TRANSITIONS,
+  type NativeSteeringReceipt,
+  type OpenAIResponsesRequiredInput,
+  type OpenAIResponsesSteeringState
 } from '../../shared/openAIResponsesNative';
 
 export type { NativeSteeringReceipt };
@@ -70,18 +71,6 @@ interface NativeSteerEnvelope {
 }
 
 const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
-
-/** Forward-only receipt lifecycle; identical-state writes are idempotent replays. */
-const NATIVE_STEERING_TRANSITIONS: Readonly<Record<OpenAIResponsesSteeringState, readonly OpenAIResponsesSteeringState[]>> = {
-  queued: ['sent', 'failed', 'delivery_unknown'],
-  sent: ['accepted', 'waiting_for_input', 'failed', 'delivery_unknown'],
-  accepted: ['waiting_for_input', 'continuing', 'completed', 'failed', 'delivery_unknown'],
-  waiting_for_input: ['continuing', 'completed', 'failed', 'delivery_unknown'],
-  continuing: ['completed', 'delivery_unknown'],
-  completed: [],
-  failed: [],
-  delivery_unknown: []
-};
 
 /**
  * Durable steering submissions on PendingTurnInput plus their visible user Messages. The user
