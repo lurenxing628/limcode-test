@@ -815,11 +815,19 @@ export class ProcessCompletionDeliveryControlPlane {
       'RuntimeInboxPayloadLink.content_object_id'
     );
     const source = await this.resolveWakeSource(inbox, delivery, contentObjectId);
-    const reconciled = await this.automaticDeliveryRouter.reconcilePendingDelivery({
-      deliveryId: requirePhaseFId(delivery.id, 'RuntimeDelivery.id'),
-      targetConversationId: source.conversationId,
-      sourceTurnId: source.sourceTurnId
-    });
+    let reconciled: Awaited<ReturnType<AutomaticRuntimeDeliveryRouter['reconcilePendingDelivery']>>;
+    try {
+      reconciled = await this.automaticDeliveryRouter.reconcilePendingDelivery({
+        deliveryId: requirePhaseFId(delivery.id, 'RuntimeDelivery.id'),
+        targetConversationId: source.conversationId,
+        sourceTurnId: source.sourceTurnId
+      });
+    } catch (error) {
+      // The delivery or its authority moved between the read and the CAS (absorbed by the running
+      // Turn, retargeted by its terminal commit). That is a race, not a failed wake: rescan now.
+      if (isTransactionAssertionFailure(error)) return 'deferred';
+      throw error;
+    }
     delivery = reconciled.delivery;
     if (delivery.state === 'failed') {
       await this.deadLetterClaim('RuntimeDeliveryWake', wakeInput, boundedError(
