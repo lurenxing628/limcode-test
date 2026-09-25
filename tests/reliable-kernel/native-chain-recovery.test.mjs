@@ -863,3 +863,28 @@ test('two concurrent observers of one steer outcome never race the receipt', asy
   assert.deepEqual(writes, ['failed'], 'exactly one observer writes the outcome');
 });
 
+test('a frozen native call proof is trusted as recorded and never re-derived with the current resolver', () => {
+  const proof = {
+    type: 'native_tool_call', responseId: 'r1', toolName: 'native_probe', providerCallId: 'call-1', providerOrdinal: 0,
+    async: false, arguments: { path: 'a.txt' },
+    // Frozen by an earlier build whose resolver interpreted the arguments differently.
+    resolvedArguments: { path: 'a.txt', cursor: '' }, argumentResolutionError: 'older resolver wording',
+    modelHandleCatalog: { entries: [] }
+  };
+  const parsed = parseNativeToolCallCheckpoint(proof);
+  assert.deepEqual(parsed.resolvedArguments, { path: 'a.txt', cursor: '' });
+  assert.equal(parsed.argumentResolutionError, 'older resolver wording');
+  const session = new NativeRequestSession({ tools: {}, capabilities, modelRequestId: 'request', turnId: 'turn',
+    resolveCallArguments: (_, value) => ({ arguments: value }) });
+  session.callResolutions.set('call-1', { arguments: { path: 'a.txt', cursor: '' }, catalog: { entries: [] },
+    original: { path: 'a.txt' } });
+  const replayed = session.buildCallProof({
+    outputItem: { id: 'item-1', ordinal: 0, providerResponseId: 'r1' },
+    call: { id: 'call-1', ordinal: 0, name: 'native_probe', arguments: { path: 'a.txt' } }
+  });
+  assert.deepEqual(replayed.resolvedArguments, { path: 'a.txt', cursor: '' }, 'a replay keeps the frozen resolution');
+  assert.throws(() => session.buildCallProof({
+    outputItem: { id: 'item-1', ordinal: 0, providerResponseId: 'r1' },
+    call: { id: 'call-1', ordinal: 0, name: 'native_probe', arguments: { path: 'b.txt' } }
+  }), /changed its provider arguments/, 'changed provider arguments on replay are still rejected');
+});

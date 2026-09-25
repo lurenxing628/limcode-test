@@ -192,7 +192,13 @@ export class NativeRequestSession {
   private preparingCheckpoint = false;
   private lastBackpressureResponseId?: string;
   private childCatalog: ModelHandleCatalog;
-  private readonly callResolutions = new Map<string, { arguments: PlainJsonValue; error?: string; catalog: ModelHandleCatalog }>();
+  private readonly callResolutions = new Map<string, {
+    arguments: PlainJsonValue;
+    error?: string;
+    catalog: ModelHandleCatalog;
+    /** Original provider arguments of the frozen proof; replay identity, never re-resolved. */
+    original?: PlainJsonValue;
+  }>();
 
   public constructor(private readonly deps: NativeRequestSessionDeps) {
     this.childCatalog = normalizeModelHandleCatalog(deps.modelHandleCatalog);
@@ -327,6 +333,7 @@ export class NativeRequestSession {
         this.callResolutions.set(proof.providerCallId, {
           arguments: normalizePlainJson(proof.resolvedArguments, 'Frozen native resolved arguments'),
           catalog: proof.modelHandleCatalog,
+          original: normalizePlainJson(proof.arguments, 'Frozen native provider arguments'),
           ...(proof.argumentResolutionError !== undefined ? { error: proof.argumentResolutionError } : {})
         });
         const toolCallId = this.deps.toolCallIdFor(proof.providerOrdinal, proof.providerCallId, proof.toolName);
@@ -647,15 +654,20 @@ export class NativeRequestSession {
       || knownCall.asyncDeclared !== (item.call.async === true))) {
       throw new Error(`Native call ${item.call.id} changed its durable response/tool identity on replay.`);
     }
-    const freshResolution = this.deps.resolveCallArguments(item.call.name, item.call.arguments);
     const frozenResolution = this.callResolutions.get(item.call.id);
-    if (frozenResolution && (frozenResolution.error !== freshResolution.error
-      || canonicalPlainJson(frozenResolution.arguments, 'Frozen replayed tool arguments')
-        !== canonicalPlainJson(freshResolution.arguments, 'Replayed tool arguments'))) {
-      throw new Error(`Native call ${item.call.id} changed its frozen tool arguments on replay.`);
+    if (frozenResolution?.original !== undefined
+      && canonicalPlainJson(frozenResolution.original, 'Frozen replayed provider arguments')
+        !== canonicalPlainJson(normalizePlainJson(item.call.arguments, 'Replayed provider arguments'),
+          'Replayed provider arguments')) {
+      throw new Error(`Native call ${item.call.id} changed its provider arguments on replay.`);
     }
-    const resolution = frozenResolution
-      ?? { ...freshResolution, catalog: this.currentModelHandleCatalog() };
+    // A frozen, content-addressed resolution is the authority for a replayed call; the current
+    // resolver is consulted only for a call seen for the first time.
+    const resolution = frozenResolution ?? {
+      ...this.deps.resolveCallArguments(item.call.name, item.call.arguments),
+      catalog: this.currentModelHandleCatalog(),
+      original: normalizePlainJson(item.call.arguments, 'Native provider arguments')
+    };
     this.callResolutions.set(item.call.id, resolution);
     return normalizePlainJson({
       type: 'native_tool_call',

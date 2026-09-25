@@ -290,7 +290,7 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
   assert.equal(rejected[0].detail.error, unknownMessage);
 });
 
-test('native call proofs reject missing catalogs, missing resolutions and raw-to-resolved tampering', () => {
+test('native call proofs reject missing catalogs and missing resolutions and keep the frozen resolution as recorded', () => {
   const proof = { type: 'native_tool_call', responseId: 'response', toolName: 'run_agent', providerCallId: 'call',
     providerOrdinal: 0, async: true, arguments: { operation: 'spawn', prompt: 'original' },
     resolvedArguments: { operation: 'spawn', prompt: 'original' }, modelHandleCatalog: { entries: [] } };
@@ -301,5 +301,7 @@ test('native call proofs reject missing catalogs, missing resolutions and raw-to
   assert.throws(() => parseNativeToolCallCheckpoint(missingCatalog), /modelHandleCatalog/);
   assert.throws(() => parseNativeToolCallCheckpoint({ ...proof, modelHandleCatalog: null }), /modelHandleCatalog/);
   assert.throws(() => parseNativeToolCallCheckpoint({ ...proof, modelHandleCatalog: {} }), /entries/);
-  assert.throws(() => parseNativeToolCallCheckpoint({ ...proof, arguments: { operation: 'spawn', prompt: 'tampered' } }), /conflicts with original/);
+  // The content-addressed frozen resolution is the authority; a later resolver never re-derives it.
+  const frozen = { ...proof, resolvedArguments: { operation: 'spawn', prompt: 'original', frozenBy: 'an earlier build' } };
+  assert.deepEqual(parseNativeToolCallCheckpoint(frozen).resolvedArguments, frozen.resolvedArguments);
 });

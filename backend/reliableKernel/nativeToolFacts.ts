@@ -11,8 +11,8 @@
  * Stage E (contextSequence) can share it without a module cycle.
  */
 import type { ModelOutputItemReference } from '../../shared/protocol';
-import { normalizeModelHandleCatalog, resolveModelToolArguments, UnknownModelHandleReferenceError, type ModelHandleCatalog } from './modelHandleCatalog';
-import { canonicalPlainJson, normalizePlainJson } from './plainJson';
+import { normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { normalizePlainJson } from './plainJson';
 
 /** ToolCallEvent.event_kind marking the durable native async/sync streamed admission of a call. */
 export const TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION = 'native_admission';
@@ -235,20 +235,13 @@ export function parseNativeToolCallCheckpoint(value: unknown): NativeToolCallChe
   const catalogValue = requireObjectRecord(record.modelHandleCatalog, 'Native tool-call modelHandleCatalog');
   if (!Array.isArray(catalogValue.entries)) throw new TypeError('Native tool-call checkpoint requires modelHandleCatalog.entries.');
   const modelHandleCatalog = normalizeModelHandleCatalog(catalogValue);
+  // The frozen resolution is content-addressed authority captured when the call was proven. It is
+  // never re-derived with the current resolver: a later build may interpret handle references
+  // differently, and re-deriving would reject (or silently change) an in-flight call. Only its
+  // shape is validated here; identity fields above bind it to the provider call.
+  normalizePlainJson(record.arguments, 'Native tool-call checkpoint arguments');
+  normalizePlainJson(record.resolvedArguments, 'Native tool-call checkpoint resolvedArguments');
   const argumentResolutionError = optionalRecordText(record, 'argumentResolutionError', 'Native tool-call checkpoint');
-  let resolvedArguments: unknown;
-  let resolutionError: string | undefined;
-  try {
-    resolvedArguments = resolveModelToolArguments(toolName, record.arguments, modelHandleCatalog);
-  } catch (error) {
-    if (!(error instanceof UnknownModelHandleReferenceError)) throw error;
-    resolvedArguments = record.arguments;
-    resolutionError = error.message;
-  }
-  if (canonicalPlainJson(normalizePlainJson(resolvedArguments)) !== canonicalPlainJson(normalizePlainJson(record.resolvedArguments))
-    || resolutionError !== argumentResolutionError) {
-    throw new TypeError('Native tool-call frozen resolution conflicts with original provider arguments.');
-  }
   const outputItem = parseNativeOutputItem(record.outputItem, 'Native tool-call checkpoint outputItem');
   return {
     type: NATIVE_TOOL_CALL_CHECKPOINT_TYPE,
