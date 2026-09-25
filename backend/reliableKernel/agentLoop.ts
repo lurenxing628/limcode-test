@@ -420,6 +420,14 @@ const OPEN_TASK_COMPLETION_CHECK_CARD = [
 export class ReliableAgentLoop {
   private readonly finalOutputObservers = new Set<ReliableTurnFinalOutputObserver>();
   private readonly context: ContextSequenceControlPlane;
+  /**
+   * Host-local in-flight native call executions. A recovery re-drive attaches to the running
+   * execution instead of dispatching the same admitted ToolCall a second time.
+   */
+  private readonly nativeCallExecutions = new Map<
+    string,
+    Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>
+  >();
   private readonly automaticDeliveries: AutomaticRuntimeDeliveryRouter;
   private readonly now: () => string;
   private readonly reconcileCommittedToolCall:
@@ -1782,8 +1790,10 @@ export class ReliableAgentLoop {
         return { status: 'interrupted', toolCallId: call.toolCallId };
       }
       let terminal = await this.effects.readTerminalResult(call.toolCallId, false);
-      if (!terminal) {
-        // The dispatcher reconciles its own durable frontier; this never re-executes committed effects.
+      if (!terminal && !this.nativeCallExecutions.has(call.toolCallId)) {
+        // The dispatcher reconciles its own durable frontier; this never re-executes committed
+        // effects. An execution this Host already runs is never dispatched a second time: the
+        // call stays pending below and its settlement wakes the Turn.
         await this.dispatchProviderToolCall({
           turnId: input.turnId,
           round: input.round,
@@ -2555,7 +2565,26 @@ export class ReliableAgentLoop {
    * admissions require the dispatcher's own scheduling; falling back to the old single-call path
    * would recreate the scheduling bypass, so an unsupported dispatcher fails explicitly.
    */
-  private async dispatchNativeCall(
+  private dispatchNativeCall(
+    input: ReliableAgentToolDispatchInput
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    // A waiting Turn is re-driven whenever its facts change, possibly while an admitted call it
+    // already started is still running in this Host. Dispatching it again would make the
+    // dispatcher's "already has an active host execution" refusal the call's only outcome and
+    // replace its real result. Re-drive attaches to the running execution instead.
+    const running = this.nativeCallExecutions.get(input.toolCallId);
+    if (running) return running;
+    const execution = this.dispatchNativeCallOnce(input);
+    this.nativeCallExecutions.set(input.toolCallId, execution);
+    void execution.then(() => undefined, () => undefined).then(() => {
+      if (this.nativeCallExecutions.get(input.toolCallId) === execution) {
+        this.nativeCallExecutions.delete(input.toolCallId);
+      }
+    });
+    return execution;
+  }
+
+  private async dispatchNativeCallOnce(
     input: ReliableAgentToolDispatchInput
   ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
     const existing = await this.effects.readTerminalResult(input.toolCallId, false);

@@ -436,6 +436,48 @@ test('an accepted steer attributed to its successor is carried by the next full 
   });
 });
 
+test('a synchronous admitted call still running parks the Turn even when another call progressed', { timeout: 30000 }, async () => {
+  await withNativeKernel({
+    background: ['call-background'],
+    async script({ round, emit, responseId, app }) {
+      if (round === 0) {
+        await emitToolResponse(emit, responseId, ['call-background', 'call-sync']);
+        // The background effect settles outside this chain's observation; the chain then ends at
+        // the transport while the synchronous call is still running.
+        const [link] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'call-background' });
+        await waitFor(async () => (await rows(app, 'ToolCallEvent', { tool_call_id: link.tool_call_id,
+          event_kind: 'native_admission' })).length === 1, 'background call admitted');
+        await app.runtime.effects.settleWithoutEffect({
+          source: { kind: 'internal', key: 'native-chain-background-settle' }, toolCallId: link.tool_call_id,
+          status: 'succeeded', detail: { ok: true, callId: 'call-background' }
+        });
+        await emit('completed', { role: 'model', parts: [callPart('call-background', 0, responseId),
+          callPart('call-sync', 1, responseId)] });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued with every result');
+    }
+  }, async ({ app, requests, duplicates, gates, startTurn, drive }) => {
+    gates.set('call-sync', deferred());
+    const turn = await startTurn('sync-pending', 'Run both probes.');
+    const first = await drive(turn);
+    assert.equal(first.terminalStatus, 'waiting', 'an unresolved synchronous call cannot reach the Provider');
+    assert.equal(requests.length, 1);
+    const [background] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'call-background' });
+    const [backgroundResult] = await rows(app, 'ToolModelResult', { tool_call_id: background.tool_call_id });
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result',
+      source_id: backgroundResult.id })).length, 1, 'the settled sibling progressed into Context');
+    gates.get('call-sync').resolve();
+    await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 2, 'both calls settled');
+    const outcome = await drive(turn);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
+    assert.deepEqual(duplicates, []);
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-sync'), { calls: 1, results: 1 });
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-background'), { calls: 1, results: 1 });
+  });
+});
+
 test('steering outcome reported twice is idempotent in the durable receipt store', { timeout: 30000 }, async () => {
   await withNativeKernel({
     async script({ controls }) {
