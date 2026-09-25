@@ -380,3 +380,18 @@ test('原生压缩不透明状态的文本后备从不可变来源重建，而�
     } finally { runner.dispose(); }
   });
 });
+
+const { CLIENT_STATE_TABLE_KEYS, createEmptyClientState } =
+  require('../../dist/extension/shared/clientStateSchema.js');
+
+test('压缩设置视觉夹具的空 ClientState 覆盖共享 schema 全部表（包括 builtinToolPolicies）', async () => {
+  const source = await fs.readFile(path.resolve('scripts/playwright/verify-compression-settings.mjs'), 'utf8');
+  const fixture = source.match(/const EMPTY_CONFIGURATION_STATE = Object\.fromEntries\(\[([\s\S]*?)\]\.map\(\(key\) => \[key, \[\]\]\)\);/);
+  assert.ok(fixture, '视觉夹具的完整空 ClientState 不存在');
+  const keys = [...fixture[1].matchAll(/'([a-zA-Z]+)'/g)].map(match => match[1]);
+  assert.deepEqual(keys, CLIENT_STATE_TABLE_KEYS, '视觉夹具需与 shared/clientStateSchema 的表顺序保持一致');
+  assert.deepEqual(Object.keys(createEmptyClientState()), keys);
+  assert.ok(keys.includes('builtinToolPolicies'));
+  assert.match(source, /--vscode-button-background: #454545/, '视觉夹具保持中性灰按钮主题');
+  assert.match(source, /--vscode-focusBorder: #8b8b8b/, '视觉夹具保持中性灰焦点主题');
+});
