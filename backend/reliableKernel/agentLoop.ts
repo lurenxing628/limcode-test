@@ -241,7 +241,8 @@ export type ReliableAgentLifecycleStage =
   | 'drive_failed'
   | 'failure_terminal_started'
   | 'failure_terminal_completed'
-  | 'failure_terminal_failed';
+  | 'failure_terminal_failed'
+  | 'native_context_closure_failed';
 
 /** Bounded metadata-only diagnostics. No prompt, model output, tool arguments, or credentials are exposed. */
 export interface ReliableAgentLifecycleEvent {
@@ -462,6 +463,7 @@ export class ReliableAgentLoop {
       let requestSequence = resumeState.requestSequence;
       let openTaskCompletionCheckConsumed = resumeState.openTaskCompletionCheckConsumed;
       let includeOpenTaskCompletionCheck = false;
+      let endedTurnsClosed = false;
       agentRounds: for (;;) {
         const round = requestSequence.toString();
         let facts = await this.readRoundFacts(turnId);
@@ -491,6 +493,17 @@ export class ReliableAgentLoop {
         const expectedModelRequestId = modelRequestIdFor(turnId, idempotencyKey);
         let request = await this.maybeGet('ModelRequest', expectedModelRequestId);
         if (!request) {
+          // A new root must not freeze an unresolved native call: close committed results left by
+          // an interrupted/failed chain (this Turn or an earlier one) before anything else lands.
+          if (await this.closeNativeResultOccurrences({
+            conversationId,
+            turnId,
+            sourcePrefix: `agent-loop:${turnId}:round:${round}:native-closure`,
+            scope: endedTurnsClosed ? 'turn' : 'conversation'
+          }) > 0) {
+            facts = await this.readRoundFacts(turnId);
+          }
+          endedTurnsClosed = true;
           // Runtime input is admitted only at a new request boundary. On recovery an existing
           // request may still be waiting for its tool results; inserting runtime_context before
           // those results would split the atomic assistant-tool/result pair.
@@ -1707,6 +1720,7 @@ export class ReliableAgentLoop {
     }
     let progressed = false;
     let firstPending: string | undefined;
+    let firstPendingSync: string | undefined;
     let cursor = 0;
     while (cursor < input.calls.length) {
       const call = input.calls[cursor];
@@ -1763,11 +1777,96 @@ export class ReliableAgentLoop {
         }
       } else {
         firstPending ??= call.toolCallId;
+        if (admissions.get(call.toolCallId)?.declaredAsync !== true) firstPendingSync ??= call.toolCallId;
       }
       cursor += 1;
     }
+    // Only an admitted async call may stay pending across the next request; a synchronous call
+    // without a result would reach the Provider as an unresolved function call.
+    if (firstPendingSync) return { status: 'waiting', toolCallId: firstPendingSync };
     if (firstPending && !progressed) return { status: 'waiting', toolCallId: firstPending };
     return { status: 'completed' };
+  }
+
+  /**
+   * Native tool-pair closure. Every native call occurrence in Context must be followed by the
+   * occurrence of its committed ToolModelResult before another request root is frozen or a Turn
+   * terminates; otherwise every later Provider request carries an unresolved call. A settled result
+   * is a committed fact, so appending its occurrence records no delivery and resends nothing.
+   * Unsettled calls of ended Turns (or of the terminating Turn itself) are closed through the same
+   * cancellation path as an abandoned chain. Live calls of the current Turn stay with their owner:
+   * sync calls park the Turn, admitted async calls may legally stay pending at the Provider.
+   */
+  private async closeNativeResultOccurrences(input: {
+    conversationId: string;
+    turnId: string;
+    sourcePrefix: string;
+    /**
+     * conversation: every ended Turn too (their gaps only appear when a Turn ends, so once per drive
+     * suffices); turn: this live Turn only; terminating_turn: this Turn while it is being closed.
+     */
+    scope: 'conversation' | 'turn' | 'terminating_turn';
+  }): Promise<number> {
+    const open = (await this.effects.listNativePendingWork({
+      conversationId: input.conversationId,
+      ...(input.scope === 'conversation' ? {} : { turnId: input.turnId })
+    })).filter((entry) => entry.callContextSegmentId !== undefined && entry.resultContextSegmentId === undefined);
+    const stillRunning: Array<{ toolCallId: string; reason: string }> = [];
+    let closureError: unknown;
+    let appended = 0;
+    for (const entry of open) {
+      if (!entry.settled && entry.turnActive && input.scope !== 'terminating_turn') continue;
+      try {
+        let toolModelResultId = entry.toolModelResultId;
+        if (!entry.settled) {
+          try {
+            await this.closeNativeAdmittedCall(entry.toolCallId, `${input.sourcePrefix}:${entry.toolCallId}`);
+          } catch (error) {
+            if (isExecutionHandoffError(error)) throw error;
+            stillRunning.push({ toolCallId: entry.toolCallId, reason: errorMessage(error) });
+            continue;
+          }
+          toolModelResultId = (await this.requireTerminalToolResult(entry.toolCallId)).toolModelResultId;
+        }
+        if (!await this.appendNativeResultOccurrenceOnce({
+          conversationId: input.conversationId,
+          toolCallId: entry.toolCallId,
+          toolModelResultId: requireId(toolModelResultId, 'NativePendingToolCall.toolModelResultId')
+        })) continue;
+        appended += 1;
+        this.observeLifecycle({
+          turnId: input.turnId,
+          stage: 'context_tool_pair_committed',
+          toolCallId: entry.toolCallId,
+          contextPairCount: 1,
+          contextTransactionCount: 1
+        });
+      } catch (error) {
+        if (isExecutionHandoffError(error)) throw error;
+        closureError ??= error;
+      }
+    }
+    if (input.scope === 'terminating_turn') {
+      // Termination must still be recordable; the next request boundary retries the closure once
+      // a still-running effect has produced its receipt.
+      if (closureError !== undefined || stillRunning.length > 0) {
+        this.observeLifecycle({
+          turnId: input.turnId,
+          stage: 'native_context_closure_failed',
+          ...(stillRunning[0] ? { toolCallId: stillRunning[0].toolCallId } : {}),
+          ...(closureError !== undefined ? errorDiagnostic(closureError) : {})
+        });
+      }
+      return appended;
+    }
+    if (closureError !== undefined) throw closureError;
+    if (stillRunning.length > 0) {
+      throw new NativeAsyncWorkPendingError(
+        stillRunning,
+        `${stillRunning.length} 个已结束轮次的原生工具仍在执行，结果写回上下文前不能发送新的模型请求；请等待其结束后重试。`
+      );
+    }
+    return appended;
   }
 
   /** Idempotent explicit result occurrence append of the native closure path. */
@@ -2319,7 +2418,18 @@ export class ReliableAgentLoop {
           : 'failed';
       throw error;
     } finally {
-      if (session) await session.dispose(outcome);
+      if (session) {
+        try {
+          await session.dispose(outcome);
+        } catch (disposeError) {
+          // A completed chain must not continue past an unclosed result. After an abort/failure
+          // the original error stays authoritative; the terminal/request-boundary closure retries.
+          if (outcome === 'completed' || isExecutionHandoffError(disposeError)) throw disposeError;
+          this.observeLifecycle({
+            turnId, stage: 'native_context_closure_failed', modelRequestId, ...errorDiagnostic(disposeError)
+          });
+        }
+      }
     }
     // The Provider may have accepted an ambiguous result/steer successor without furnishing
     // separate admission proofs. The physical chain has ended, its settled ToolModelResult was
@@ -3088,6 +3198,15 @@ export class ReliableAgentLoop {
       }
     }
 
+    // Native calls of a chain that ended without a completed ModelRequest (interrupt/abort while a
+    // sibling was running) are not represented above; close every committed/cancelled result.
+    await this.closeNativeResultOccurrences({
+      conversationId,
+      turnId,
+      sourcePrefix: `agent-loop:${turnId}:termination-request:${terminationRequestId}:native-closure`,
+      scope: 'terminating_turn'
+    });
+
     if (pendingToolCallId && !representedToolCallIds.has(pendingToolCallId)
       && !await this.effects.readTerminalResult(pendingToolCallId, false)) {
       await this.cancelUndispatchedToolEffects(
@@ -3188,6 +3307,13 @@ export class ReliableAgentLoop {
       const turn = await this.maybeGet('Turn', turnId);
       if (!turn || turn.status !== 'active') return;
       if (await this.terminateIfRequested(turnId, 'failure-terminal')) return;
+      // A failed Provider chain may leave settled siblings of a still-open batch outside Context.
+      await this.closeNativeResultOccurrences({
+        conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+        turnId,
+        sourcePrefix: `agent-loop:${turnId}:failed:${stableDigest(reason)}:native-closure`,
+        scope: 'terminating_turn'
+      });
       await this.absorbRuntimeDeliveryInputs(turnId);
       try {
         await this.turns.terminal({

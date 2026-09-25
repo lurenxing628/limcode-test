@@ -1040,24 +1040,33 @@ export class NativeRequestSession {
       this.controller = undefined;
       return;
     }
+    // Every admitted call is closed independently: one call whose effect cannot be cancelled yet
+    // must not leave its already-settled siblings without a result occurrence in Context.
+    let closureError: unknown;
     for (const call of this.calls.values()) {
       if (!call.admitted) continue;
-      if (outcome !== 'completed' && !call.settled) {
-        await this.deps.closeAdmittedCall(
-          call.toolCallId,
-          `agent-loop:${this.deps.modelRequestId}:native-chain-${outcome}:${call.toolCallId}`
-        );
-        call.settled = true;
-        const terminal = await this.deps.effects.readTerminalResult(call.toolCallId, false);
-        call.toolModelResultId = terminal?.toolModelResultId;
-      }
-      if (call.settled && !call.delivered && call.toolModelResultId && !call.resultOccurrence) {
-        // A provider create with ambiguous steering is NOT a delivery receipt. Once its logical
-        // transport ends, the already-settled result still belongs in durable Context for the
-        // next full-request preflight (or for a visible failed/cancelled Turn). Freeze child refs
-        // first; never send another wire result or invent native_delivery on this closure path.
-        await this.buildFunctionCallOutput(call);
-        await this.appendResultOccurrence(call);
+      try {
+        if (outcome !== 'completed' && !call.settled) {
+          await this.deps.closeAdmittedCall(
+            call.toolCallId,
+            `agent-loop:${this.deps.modelRequestId}:native-chain-${outcome}:${call.toolCallId}`
+          );
+          call.settled = true;
+          const terminal = await this.deps.effects.readTerminalResult(call.toolCallId, false);
+          call.toolModelResultId = terminal?.toolModelResultId;
+        }
+        if (call.settled && !call.delivered && call.toolModelResultId && !call.resultOccurrence) {
+          // A provider create with ambiguous steering is NOT a delivery receipt. Once its logical
+          // transport ends, the already-settled result still belongs in durable Context for the
+          // next full-request preflight (or for a visible failed/cancelled Turn). Freeze child refs
+          // first; never send another wire result or invent native_delivery on this closure path.
+          await this.buildFunctionCallOutput(call);
+          await this.appendResultOccurrence(call);
+        }
+      } catch (error) {
+        if (isExecutionHandoffError(error)) throw error;
+        closureError ??= error;
+        this.diagnose(`native result closure failed for ${call.toolCallId}: ${errorMessage(error)}`);
       }
     }
     for (const receipt of [...this.steerReceipts.values()]) {
@@ -1087,6 +1096,8 @@ export class NativeRequestSession {
       this.controller?.endLogicalRequest();
     }
     this.controller = undefined;
+    // AgentLoop's request-boundary closure retries whatever could not be closed here.
+    if (closureError !== undefined) throw closureError;
   }
 
   private async steerCommand(command: NativeSteerCommand): Promise<NativeSteeringReceipt> {
