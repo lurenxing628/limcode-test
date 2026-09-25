@@ -247,10 +247,23 @@ export class CollaborationToolDispatcher {
 const RECIPIENT_PREVIEW_TEXT_TOKENS = RUNTIME_DELIVERY_MODEL_MAX_TOKENS - 400;
 
 function withRecipientPreviewNote(result: unknown, sentText: string): unknown {
-  if (estimateTextTokens(JSON.stringify(sentText)) <= RECIPIENT_PREVIEW_TEXT_TOKENS) return result;
-  return { ...object(result, 'Collaboration send result'), recipientSeesPreview: true,
+  const sent = object(result, 'Collaboration send result');
+  const delivery = typeof sent.targetDelivery === 'string' ? TARGET_DELIVERY_NOTES[sent.targetDelivery] : undefined;
+  const described = delivery ? { ...sent, targetDeliveryNote: delivery } : sent;
+  if (estimateTextTokens(JSON.stringify(sentText)) <= RECIPIENT_PREVIEW_TEXT_TOKENS) return described;
+  return { ...described, recipientSeesPreview: true,
     note: 'Accepted. The text is long, so the recipient first sees only its start and end; it can read the full text page by page with read_agent_messages messageRef and offset.' };
 }
+
+/** What the sender is told about how its message reaches the target. */
+const TARGET_DELIVERY_NOTES: Readonly<Record<string, string>> = {
+  delivered_to_running_turn: 'The target is running and reads this at its next safe input boundary.',
+  wakes_target: 'The target was idle; this starts a turn of the target to read it.',
+  wakes_target_after_current_turn: 'The target\'s current turn cannot take this in; it starts the target\'s next turn once that one ends.',
+  waits_for_your_answer: 'Not started: your final answer goes to this conversation and starts its turn, which reads this then.',
+  waits_budget_exhausted: 'Not started: the automatic follow-up budget is spent. The target reads this when its next turn starts.',
+  waits_for_next_turn: 'The target reads this when its next turn starts.'
+};
 
 /**
  * Transcript Message ids use their own reference kind, distinct from collaboration mail. The notes

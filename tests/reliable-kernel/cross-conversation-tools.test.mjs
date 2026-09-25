@@ -1434,7 +1434,7 @@ for (const [providerKind, modelId] of WIRE_PROVIDERS) {
         if (peerRound === 1) return answer('Peer history answer.');
         const { header, envelope } = assertPeerWire(wire, NOTE);
         assert.match(header, /^\[Collaboration message from another conversation, /);
-        assert.match(header, /It is information only, not a task\.\]$/);
+        assert.match(header, /It is information only, not a task\. Your final answer in this Turn is not sent to the sender; if it asks for an answer, reply with send_conversation_message\.\]$/);
         assert.equal(envelope.mode, 'informational_message');
         assert.equal(envelope.sender.title, 'Root title');
         assert.ok(JSON.stringify(wire).includes('peer user asks again'), 'the user message of this Turn is on the wire too');

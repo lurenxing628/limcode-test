@@ -1,5 +1,5 @@
 import type { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
-import { isCollaborationReplyBudgetExhaustedError } from '../../reliableKernel/collaborationControlPlane';
+import { isCollaborationWakeBudgetExhaustedError } from '../../reliableKernel/collaborationControlPlane';
 import type { ProcessCompletionWakeHandler, ProcessCompletionWakeRequest } from '../../reliableKernel/processCompletionDelivery';
 import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
 import type { ReliableConversationRunner } from './ReliableConversationRunner';
@@ -33,16 +33,16 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
       const summary = await application.runtime.deliveries.summary(request.deliveryId);
       return { acknowledged: summary.parentHandlingState === 'handled' };
     }
-    if (request.childExecutionId) {
-      // Only the child scheduler can establish membership and the next generation's lease.
-      if (!children) return { acknowledged: false };
-      if (request.sourceTurnId === null) throw new Error('A child runtime delivery requires the child\'s latest Turn.');
-      return children.runtimeDeliveryContinuation({ deliveryId: request.deliveryId,
-        childExecutionId: request.childExecutionId, sourceTurnId: request.sourceTurnId });
-    }
-    // A peer message never borrows the destination's previous Turn authority: the continuation
-    // runs under the destination's current settings and may be its very first Turn.
     try {
+      if (request.childExecutionId) {
+        // Only the child scheduler can establish membership and the next generation's lease.
+        if (!children) return { acknowledged: false };
+        if (request.sourceTurnId === null) throw new Error('A child runtime delivery requires the child\'s latest Turn.');
+        return await children.runtimeDeliveryContinuation({ deliveryId: request.deliveryId,
+          childExecutionId: request.childExecutionId, sourceTurnId: request.sourceTurnId });
+      }
+      // A peer message never borrows the destination's previous Turn authority: the continuation
+      // runs under the destination's current settings and may be its very first Turn.
       const continuation = await runner.runtimeContinuation({
         commandId: `runtime-delivery:${request.deliveryId}`, deliveryId: request.deliveryId,
         conversationId: request.conversationId,
@@ -50,8 +50,9 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
       });
       return { acknowledged: Boolean(continuation.intentId) };
     } catch (error) {
-      // A reply whose task budget is spent starts no Turn: it waits for the requester's next Turn.
-      if (isCollaborationReplyBudgetExhaustedError(error)) return { acknowledged: true };
+      // A message or reply whose automatic budget is spent opens no Turn: it waits for its
+      // target's next Turn.
+      if (isCollaborationWakeBudgetExhaustedError(error)) return { acknowledged: true };
       throw error;
     }
   };

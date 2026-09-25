@@ -202,9 +202,9 @@ function assertPeerWire(wire, marker) {
   return delivered;
 }
 
-for (const providerType of ['openai-compatible', 'openai-responses']) test(`${providerType}: real sibling tools deliver at a safe boundary, preserve depth 1, and wake only explicit follow-ups with results returned to the requester`, { timeout: 90000 }, async () => {
+for (const providerType of ['openai-compatible', 'openai-responses']) test(`${providerType}: real sibling tools deliver at a safe boundary, preserve depth 1, wake an idle sibling for a message and return follow-up results to the requester`, { timeout: 90000 }, async () => {
   let a, b, aRound = 0, bRound = 0, rootRound = 0, bInitialTurn, bRef, activeMessageRef, idleTurnCount;
-  let siblingFinished = false, activeObserved = false, followupObserved = false;
+  let siblingFinished = false, activeObserved = false, followupObserved = false, idleMessageObserved = false;
   await fixture(async (request, f, start, wire) => {
     if (request.conversationId === 'root') {
       if (++rootRound === 1) return toolsAnswer(
@@ -241,13 +241,16 @@ for (const providerType of ['openai-compatible', 'openai-responses']) test(`${pr
         return toolsAnswer(call('a-send-idle', 'send_agent_message', { conversationRef: bRef, text: IDLE_MESSAGE }));
       }
       if (aRound === 4) {
-        await f.app.processDeliveries.scanNow();
-        assert.equal((await f.rows('Turn', { conversation_id: b })).length, idleTurnCount, 'pure idle message must not start another Turn');
+        assert.equal(detail(start, 'send_agent_message').targetDelivery, 'wakes_target', 'the sender is told the idle sibling is started');
         const source = (await f.rows('CollaborationMessageSourceLink')).find(row => row.tool_call_id === f.dispatches.find(input => input.providerCallId === 'a-send-idle').toolCallId);
         const target = (await f.rows('CollaborationMessageTargetLink', { message_id: source.message_id }))[0];
-        const delivery = (await f.rows('RuntimeDelivery', { inbox_item_id: target.inbox_item_id }))[0];
-        assert.equal(delivery.phase, 'next_turn');
-        assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: delivery.id })).length, 0);
+        const [delivery] = await f.rows('RuntimeDelivery', { inbox_item_id: target.inbox_item_id });
+        assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: delivery.id })).length, 1);
+        await f.until(async () => idleMessageObserved
+          && (await f.rows('Turn', { conversation_id: b })).every(turn => turn.status === 'terminated'), 'the idle message never started B.');
+        assert.equal((await f.rows('Turn', { conversation_id: b })).length, idleTurnCount + 1, 'the idle message starts exactly one Turn');
+        const [consumed] = await f.rows('RuntimeDelivery', { inbox_item_id: target.inbox_item_id });
+        assert.equal(consumed.state, 'consumed');
         return toolsAnswer(call('a-followup-b', 'followup_agent_task', { conversationRef: bRef, text: FOLLOWUP }));
       }
       if (aRound === 5) {
@@ -292,13 +295,19 @@ for (const providerType of ['openai-compatible', 'openai-responses']) test(`${pr
       assert.equal(detail(start, 'send_agent_message').accepted, true, 'the fresh C and M references from incoming runtime data resolve in the next actual tool call');
       return answer('B initial work complete.');
     }
-    assert.ok(text.includes(FOLLOWUP));
+    if (!text.includes(FOLLOWUP)) {
+      // The idle message started B on its own: B reads it and has nothing to send back.
+      const { header } = assertPeerWire(wire, IDLE_MESSAGE);
+      assert.match(header, /Your final answer in this Turn is not sent to the sender; if it asks for an answer, reply with send_agent_message\.\]$/);
+      idleMessageObserved = true;
+      return answer('B read the idle message.');
+    }
     const followup = assertPeerWire(wire, FOLLOWUP);
     assert.match(followup.header, /^\[Collaboration task from another agent in your team, /);
     assert.equal(followup.envelope.mode, 'followup_task');
     assert.equal(followup.envelope.sender.name, 'collaborator A');
-    assert.ok(text.includes(IDLE_MESSAGE), 'the preceding queued message is absorbed by the explicitly authorized follow-up Turn');
-    assert.equal((await f.rows('Turn', { conversation_id: b })).length, 2, 'followup creates exactly one child Turn');
+    assert.ok(text.includes(IDLE_MESSAGE), 'the Turn the idle message started kept it in B history');
+    assert.equal((await f.rows('Turn', { conversation_id: b })).length, 3, 'followup creates exactly one child Turn');
     const links = await f.rows('ChildExecutionTurnLink', { turn_id: request.turnId });
     assert.equal(links.length, 1, 'followup must enter the real child scheduler, never an ordinary orphan Turn');
     followupObserved = true;

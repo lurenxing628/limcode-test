@@ -2,7 +2,8 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
-import { isCrossConversationFollowup, isCrossConversationReply } from './collaborationScope';
+import { isCrossConversationFollowup } from './collaborationScope';
+import { collaborationMessageWakePolicy } from './collaborationWake';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import {
@@ -471,8 +472,10 @@ export class ProcessCompletionDeliveryControlPlane {
       if (!active) return false;
       if (await isRuntimeMaintenanceTurn(this.database, this.contentStore, String(active.id))) return true;
       if (await isCrossConversationFollowup(this.database, messageId)) return true;
-      return await isCrossConversationReply(this.database, messageId)
-        && (await this.listRows('TurnFinalOutputFence', { turn_id: active.id }, 1)).length > 0;
+      // A message or reply that opens a Turn of its own waits behind a Turn that has already
+      // produced its final output and so can no longer take it in.
+      return (await this.listRows('TurnFinalOutputFence', { turn_id: active.id }, 1)).length > 0
+        && await collaborationMessageWakePolicy(this.database, this.contentStore, messageId) === 'opens_turn';
     } catch {
       // Malformed facts surface through the normal claimed dispatch failure path.
       return false;
@@ -831,12 +834,15 @@ export class ProcessCompletionDeliveryControlPlane {
 
     if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending' && delivery.phase === 'next_turn' && delivery.target_turn_id === null) {
       const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
-      // A send-only message never creates a Turn: after the final-output fence race, or once the
-      // user stopped the Turn it was injected into, only the target's next Turn takes it in. That
-      // admission needs no wake, so this one settles instead of polling until then. A reply to a
-      // cross-conversation task instead starts a Turn of its idle requester while the task's
-      // budget lasts; the continuation's admission decides that.
-      if (message.mode === 'message' && !await isCrossConversationReply(this.database, String(message.id))) return this.acknowledgeWake(wakeInput);
+      // A team message or a completion reply opens a Turn of its idle target (the continuation's
+      // admission spends and checks the automatic budget; one idle period opens one Turn). A
+      // message the sender's answer will deliver, a board notice or a cross-conversation plain
+      // message never does: the target's next Turn takes it in, which needs no wake, so this one
+      // settles instead of polling until then.
+      if (message.mode === 'message'
+        && await collaborationMessageWakePolicy(this.database, this.contentStore, String(message.id)) !== 'opens_turn') {
+        return this.acknowledgeWake(wakeInput);
+      }
     }
     const targetTurnId = delivery.target_turn_id === null
       ? null

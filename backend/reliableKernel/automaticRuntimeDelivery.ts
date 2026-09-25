@@ -18,11 +18,13 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
-import { isCrossConversationFollowup, isCrossConversationReply } from './collaborationScope';
+import { isCrossConversationFollowup } from './collaborationScope';
+import { collaborationMessageWakePolicy } from './collaborationWake';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { runtimeDeliverySourceTurn } from './childTaskTurn';
 
 
 export type AutomaticRuntimeDeliveryReason =
@@ -70,35 +72,6 @@ const TERMINAL_FAILURES = new Set(['interrupted', 'cancelled', 'failed', 'outcom
 /** Reads of the routed delivery set a final-output fence may redo after losing a routing race. */
 const FINAL_FENCE_ATTEMPTS = 3;
 const ROUTED_DELIVERY_SET_CHANGED = 'RuntimeDeliveryRepository transaction assertExactIds failed.';
-
-/**
- * The source Turn a Process or child-answer result belongs to: the Turn that started the Process,
- * or the parent Turn that spawned the answering child. Collaboration messages have no source Turn
- * of their own, and incomplete source facts resolve to null so the caller keeps the Turn's own rules.
- */
-export async function runtimeDeliverySourceTurn(database: RuntimeDatabase, inboxItemIdInput: string): Promise<string | null> {
-  const get = async (domain: string, id: unknown): Promise<DomainRow | null> => {
-    if (typeof id !== 'string' || id.length === 0) return null;
-    return (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | null;
-  };
-  const first = async (domain: string, where: DomainRow): Promise<DomainRow | null> => {
-    const rows = (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({ where, limit: 2 })])).snapshot[0] as DomainRow[];
-    return rows.length === 1 ? rows[0] : null;
-  };
-  const inbox = await get('RuntimeInboxItem', requireId(inboxItemIdInput, 'inboxItemId'));
-  if (inbox?.source_kind === 'process_receipt') {
-    const receipt = await get('ProcessReceipt', inbox.source_id);
-    const source = receipt ? await first('ProcessCompletionSourceLink', { process_id: receipt.process_id }) : null;
-    return typeof source?.source_turn_id === 'string' ? source.source_turn_id : null;
-  }
-  if (inbox?.source_kind === 'answer_submission') {
-    const submission = await get('AnswerSubmission', inbox.source_id);
-    const bridge = submission ? await get('AnswerBridge', submission.answer_bridge_id) : null;
-    const parent = bridge ? await first('ChildExecutionParentLink', { child_execution_id: bridge.child_execution_id }) : null;
-    return typeof parent?.parent_turn_id === 'string' ? parent.parent_turn_id : null;
-  }
-  return null;
-}
 
 /**
  * One fail-closed policy for automatic Process/Child answer delivery.
@@ -586,8 +559,9 @@ export class AutomaticRuntimeDeliveryRouter {
     if (fences.length) {
       steps.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fences[0].id), { turn_id: turn.id }));
       if (boardNotice) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
-      // A reply to a cross-conversation task starts a Turn of its own once this finishing one ends.
-      const reason = await isCrossConversationReply(this.database, String(message.id)) ? 'collaboration_queued_behind_active_turn' : 'source_turn_final_output_fenced';
+      // A message or reply that opens a Turn of its own does so once this finishing one ends.
+      const reason = await collaborationMessageWakePolicy(this.database, this.contentStore, String(message.id)) === 'opens_turn'
+        ? 'collaboration_queued_behind_active_turn' : 'source_turn_final_output_fenced';
       return decision({ ...input, sourceTurnId, phase: 'next_turn', reason, childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
     }
     steps.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: turn.id }));

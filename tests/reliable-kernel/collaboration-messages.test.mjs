@@ -58,14 +58,15 @@ async function fixture(run, budget = 32) {
   } finally { await database.close(); await fs.rm(directory, { recursive: true, force: true }); }
 }
 
-test('sibling send commits once, preserves source identity, and never wakes idle recipient', async () => fixture(async f => {
+test('sibling send commits once, preserves source identity, and wakes the idle recipient with one durable wake', async () => fixture(async f => {
   const source = await f.source();
   const input = { source, targetConversationId: 'right', text: 'peer evidence 中文', mode: 'message' };
   const results = await Promise.all([f.collaboration.send(input), f.collaboration.send(input)]);
   assert.equal(results[0].messageId, results[1].messageId);
   assert.equal(results.filter(result => result.deduplicated).length, 1);
+  assert.equal(results.find(result => !result.deduplicated).targetDelivery, 'wakes_target');
   assert.equal((await f.rows('CollaborationMessage')).length, 1);
-  assert.equal((await f.rows('RuntimeDeliveryWake')).length, 0);
+  assert.equal((await f.rows('RuntimeDeliveryWake')).length, 1, 'the idle sibling is woken once, committed with the message');
   assert.equal((await f.rows('RuntimeDelivery'))[0].phase, 'next_turn');
   assert.equal((await f.rows('Turn', { conversation_id: 'right' })).length, 1);
   await assert.rejects(f.collaboration.send({ ...input, text: 'changed' }), /replay conflicts/);
@@ -107,7 +108,7 @@ test('current-turn delivery preserves non-user provenance and separates injected
   assert.equal((await f.collaboration.readMessage({ conversationId: 'root', messageId: accepted.messageId })).handled, true);
 }));
 
-test('send-only message on a final-output fence queues without an idle wake or a lost payload', async () => fixture(async f => {
+test('a child task progress message on its parent final-output fence queues without an idle wake or a lost payload', async () => fixture(async f => {
   const content = await f.store.prepare(f.database, '{}', 'application/json');
   await f.database.transaction([...preparedContentObjectSteps([content], 'request'), repo('ModelRequest').insertHistoricalCopy({ id: 'final-request', turn_id: 'root-turn', request_seq: 1n, status: 'terminal', terminal_state: 'completed', provider_id: 'p', model_id: 'm', context_window_tokens: 1000n, compression_threshold_tokens: 900n, estimated_context_tokens: 1n, authority_snapshot_id: 'root-authority', settings_snapshot_object_id: null, recipe_object_id: content.metadata.id, usage_json: null, stream_stats_json: { attemptSeq: '1', socketGeneration: '1', retryReason: null }, created_at: NOW, updated_at: NOW }),
     repo('Operation').insertHistoricalCopy({ id: 'final-operation', owner_kind: 'model_request', owner_id: 'final-request', operation_seq: 1n, tool_call_id: null, status: 'completed', created_at: NOW, updated_at: NOW }),
@@ -197,11 +198,12 @@ test('a nested child spawned by a followup Turn cannot reset the team followup b
   assert.equal((await f.rows('CollaborationBudget')).length, 1);
 }, 1));
 
-test('zero automatic budget rejects every agent followup while plain messages still queue', async () => fixture(async f => {
+test('zero automatic budget rejects every agent followup while plain messages still queue without a wake', async () => fixture(async f => {
   await assert.rejects(f.collaboration.send({ source: await f.source('zero-followup'), targetConversationId: 'right', text: 'continue this task', mode: 'followup' }), /budget exhausted \(0\)/);
   assert.equal((await f.rows('CollaborationRequest')).length, 0);
   const message = await f.collaboration.send({ source: await f.source('zero-message'), targetConversationId: 'right', text: 'plain update', mode: 'message' });
   assert.equal(message.accepted, true);
+  assert.equal(message.targetDelivery, 'waits_budget_exhausted');
   assert.equal((await f.rows('RuntimeDeliveryWake')).length, 0);
 }, 0));
 
@@ -224,7 +226,7 @@ test('team transcript reads are bounded while conversations outside the team sta
   assert.equal((await f.collaboration.readConversation({ conversationId: 'left', targetConversationId: 'right' })).messages[0].text, 'child initial task in plain text');
 }));
 
-test('the durable wake scanner starts exactly one followup while idle messages stay queued', async () => fixture(async f => {
+test('the durable wake scanner opens exactly one Turn that takes in both an idle message and a followup', async () => fixture(async f => {
   const plain = await f.collaboration.send({ source: await f.source('quiet-send'), targetConversationId: 'right', text: 'quiet', mode: 'message' });
   const followup = await f.collaboration.send({ source: await f.source('wake-send'), targetConversationId: 'right', text: 'work', mode: 'followup' });
   const wakes = [];
@@ -292,8 +294,9 @@ test('a queued followup waits for the running target Turn and then starts exactl
   } finally { await scanner.dispose(); }
 }));
 
-test('a queued plain message waits for the target next Turn without waking it', async () => fixture(async f => {
+test('a queued plain message from a child task to its parent waits for the parent next Turn without waking it', async () => fixture(async f => {
   const accepted = await f.collaboration.send({ source: await f.source('queued-message'), targetConversationId: 'root', text: 'queued note', mode: 'message', queueBehindActiveTurn: true });
+  assert.equal(accepted.targetDelivery, 'waits_for_your_answer', 'the child task answer starts the parent, which reads it then');
   assert.equal((await f.get('RuntimeDelivery', accepted.deliveryId)).phase, 'next_turn');
   assert.equal((await f.rows('RuntimeDeliveryWake')).length, 0);
   await f.deliveries.advance(accepted.deliveryId);
@@ -969,7 +972,7 @@ test('a completion reply the stopped requester Turn never took in starts a Turn 
   } finally { await scanner.dispose(); }
 }));
 
-test('a team message the stopped target Turn never took in settles its wake and joins the next Turn', async () => fixture(async f => {
+test('a child task progress message the stopped parent Turn never took in settles its wake and joins the next Turn', async () => fixture(async f => {
   const sent = await f.collaboration.send({ source: await f.source('note-to-running-root'), targetConversationId: 'root', text: 'note for the running root', mode: 'message' });
   const injected = await f.get('RuntimeDelivery', sent.deliveryId);
   assert.deepEqual([injected.phase, injected.target_turn_id], ['current_turn', 'root-turn'], 'fixture: the message joins the running Turn');
@@ -1079,31 +1082,30 @@ async function answeredWhileIdle(f, callId, requester, requesterTurn, target, se
   return { task, delivery: (await f.rows('RuntimeDelivery', { inbox_item_id: inbox.id }))[0] };
 }
 
-test('a team reply to an idle requester waits for its next Turn while a peer reply asks for a Turn of its own', async () => fixture(async f => {
+test('team and peer replies to an idle requester each open a Turn of their requester', async () => fixture(async f => {
   await topLevel(f, ['peer-a', true], ['target-b', false]);
   const team = await answeredWhileIdle(f, 'root-asks-right', 'root', 'root-turn', 'right',
     async id => f.collaboration.send({ source: await f.source(id, 'root', 'root-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'team task', mode: 'followup' }));
   const peer = await answeredWhileIdle(f, 'a-asks-b', 'peer-a', 'peer-a-turn', 'target-b', id => crossSend(f, id, 'peer-a', 'peer-a-turn', 'target-b', 'followup'));
   for (const { delivery } of [team, peer]) assert.deepEqual([delivery.state, delivery.phase, delivery.target_turn_id], ['pending', 'next_turn', null]);
-  assert.deepEqual(await f.rows('RuntimeDeliveryWake', { delivery_id: team.delivery.id }), [], 'nothing wakes the team requester');
+  assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: team.delivery.id })).length, 1, 'the team reply wakes its idle requester');
   const started = [];
   const { scanner, scan } = continuationScanner(f, started);
   try {
     await scan();
     await scan();
-    assert.deepEqual(started.map(entry => entry.deliveryId), [peer.delivery.id], 'only the peer reply starts a Turn');
-    assert.equal((await f.get('RuntimeDelivery', team.delivery.id)).state, 'pending', 'the team reply waits for the next Turn');
+    assert.deepEqual(new Set(started.map(entry => entry.deliveryId)), new Set([team.delivery.id, peer.delivery.id]), 'each reply starts its requester');
   } finally { await scanner.dispose(); }
-  await admitPending(f, 'root', 'root-next');
-  assert.equal((await f.get('RuntimeDelivery', team.delivery.id)).target_turn_id, 'root-next');
+  assert.deepEqual(await f.collaboration.prepareWakeContinuationSteps(team.task.deliveryId), [], 'the followup itself spends nothing more');
+  assert.notDeepEqual(await f.collaboration.prepareWakeContinuationSteps(team.delivery.id), [], 'the team reply Turn spends the task budget');
 }));
 
 test('the Turn a peer reply starts spends the task budget, and once it is spent the reply starts nothing', async () => fixture(async f => {
-  const { isCollaborationReplyBudgetExhaustedError } = load('collaborationControlPlane.js');
+  const { isCollaborationWakeBudgetExhaustedError } = load('collaborationControlPlane.js');
   await topLevel(f, ['peer-a', true], ['target-b', false]);
   const first = await answeredWhileIdle(f, 'a-asks-b-1', 'peer-a', 'peer-a-turn', 'target-b', id => crossSend(f, id, 'peer-a', 'peer-a-turn', 'target-b', 'followup'));
-  assert.notDeepEqual(await f.collaboration.prepareReplyContinuationSteps(first.delivery.id), [], 'the first reply may start a Turn');
-  assert.deepEqual(await f.collaboration.prepareReplyContinuationSteps(first.task.deliveryId), [], 'a followup continuation spends nothing more');
+  assert.notDeepEqual(await f.collaboration.prepareWakeContinuationSteps(first.delivery.id), [], 'the first reply may start a Turn');
+  assert.deepEqual(await f.collaboration.prepareWakeContinuationSteps(first.task.deliveryId), [], 'a followup continuation spends nothing more');
   await admitContinuation(f, 'peer-a', 'a-reads-1', first.delivery.id);
   // A asks B again from the Turn the reply started: that Turn spends the chain budget.
   const second = await answeredWhileIdle(f, 'a-asks-b-2', 'peer-a', 'a-reads-1', 'target-b', async id => {
@@ -1113,7 +1115,7 @@ test('the Turn a peer reply starts spends the task budget, and once it is spent 
     await assert.rejects(crossSend(f, 'a-asks-b-3', 'peer-a', 'a-reads-1', 'target-b', 'followup'), /budget exhausted \(3\)/);
     return sent;
   });
-  await assert.rejects(f.collaboration.prepareReplyContinuationSteps(second.delivery.id), isCollaborationReplyBudgetExhaustedError);
+  await assert.rejects(f.collaboration.prepareWakeContinuationSteps(second.delivery.id), isCollaborationWakeBudgetExhaustedError);
 }, 3));
 test('message pages never split a surrogate pair and stay under the page token budget', () => {
   const { collaborationTextPage, COLLABORATION_TEXT_PAGE_TOKENS } = load('collaborationControlPlane.js');
@@ -1130,3 +1132,138 @@ test('message pages never split a surrogate pair and stay under the page token b
     assert.equal(pages.join(''), text);
   }
 });
+
+test('a team message anchored behind the target running Turn wakes the target once that Turn ends', async () => fixture(async f => {
+  await admitPending(f, 'right', 'right-busy');
+  const anchored = await f.collaboration.send({ source: await f.source('anchored-note'), targetConversationId: 'right', text: 'after your turn', mode: 'message', queueBehindActiveTurn: true });
+  assert.equal(anchored.targetDelivery, 'wakes_target_after_current_turn');
+  assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: anchored.deliveryId })).length, 1);
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    assert.deepEqual(started, [], 'nothing starts while the anchor Turn runs');
+    assert.deepEqual(await f.rows('PendingTurnInput', { turn_id: 'right-busy' }), [], 'the anchor Turn never takes it in');
+    await endTurn(f, 'right-busy');
+    await scan();
+    assert.deepEqual(started.map(entry => entry.deliveryId), [anchored.deliveryId], 'the message opens the next Turn by itself');
+    await scan();
+    assert.equal(started.length, 1);
+  } finally { await scanner.dispose(); }
+  assert.equal((await f.get('RuntimeDelivery', anchored.deliveryId)).target_turn_id, started[0].turnId);
+}));
+
+test('a Host restart between the message commit and its wake still opens exactly one Turn', async () => fixture(async f => {
+  const sent = await f.collaboration.send({ source: await f.source('restart-note'), targetConversationId: 'right', text: 'survives restart', mode: 'message' });
+  assert.equal(sent.targetDelivery, 'wakes_target');
+  // The wake was committed with the message; nothing ran it before the Host went away.
+  await f.reopen();
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    await scan();
+    await scan();
+  } finally { await scanner.dispose(); }
+  assert.deepEqual(started.map(entry => entry.deliveryId), [sent.deliveryId]);
+  assert.equal((await f.rows('Turn', { conversation_id: 'right' })).length, 2);
+}));
+
+test('a message delivery that waited before wakes existed is not woken by the new code', async () => fixture(async f => {
+  // The shape every older idle message left behind: a pending next_turn delivery, no wake, no intent.
+  const payload = await f.store.prepare(f.database, 'older idle note', 'text/vnd.limcode.collaboration-message');
+  const messageId = 'older-message', inboxItemId = 'older-inbox', deliveryId = 'older-delivery';
+  await f.database.transaction([
+    ...preparedContentObjectSteps([payload], 'older_message'),
+    repo('CollaborationMessage').insertWithNextSequence({ id: messageId, dedupe_key: 'collaboration:tool:older-call', mode: 'message', created_at: NOW }, { column: 'message_seq', scope: {} }),
+    repo('CollaborationMessageSourceLink').insert({ id: 'older-source', message_id: messageId, conversation_id: 'left', source_kind: 'tool', source_key: 'older-call', turn_id: 'left-turn', tool_call_id: null, board_post_id: null, created_at: NOW }),
+    repo('RuntimeInboxItem').insert({ id: inboxItemId, dedupe_key: 'collaboration:tool:older-call', source_kind: 'collaboration_message', source_id: messageId, state: 'routed', created_at: NOW, updated_at: NOW }),
+    repo('CollaborationMessageTargetLink').insert({ id: 'older-target', message_id: messageId, conversation_id: 'right', inbox_item_id: inboxItemId, anchor_turn_id: null, created_at: NOW }),
+    repo('CollaborationMessagePayloadLink').insert({ id: 'older-payload', message_id: messageId, content_object_id: payload.metadata.id, created_at: NOW }),
+    repo('RuntimeInboxPayloadLink').insert({ id: 'older-inbox-payload', inbox_item_id: inboxItemId, content_object_id: payload.metadata.id, created_at: NOW }),
+    repo('RuntimeDelivery').insert({ id: deliveryId, inbox_item_id: inboxItemId, target_conversation_id: 'right', target_turn_id: null, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: NOW, updated_at: NOW })
+  ]);
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    await scan();
+  } finally { await scanner.dispose(); }
+  assert.deepEqual(started, [], 'no Turn starts for it');
+  assert.deepEqual(await f.rows('RuntimeDeliveryWake', { delivery_id: deliveryId }), [], 'no scan writes a wake for it');
+  assert.deepEqual(await f.rows('RuntimeDeliveryIntentLink', { delivery_id: deliveryId }), []);
+  await admitPending(f, 'right', 'right-next');
+  assert.equal((await f.get('RuntimeDelivery', deliveryId)).target_turn_id, 'right-next', 'the target next Turn takes it in, as before');
+}));
+
+test('the Turn a message opens checks the budget when it opens, after a spend since the send', async () => fixture(async f => {
+  const { isCollaborationWakeBudgetExhaustedError } = load('collaborationControlPlane.js');
+  const note = await f.collaboration.send({ source: await f.source('budget-note'), targetConversationId: 'right', text: 'note', mode: 'message' });
+  assert.equal(note.targetDelivery, 'wakes_target', 'the budget was available when it was sent');
+  await f.collaboration.send({ source: await f.source('budget-task', 'left', 'left-turn', 'followup_agent_task'), targetConversationId: 'right', text: 'task', mode: 'followup' });
+  await assert.rejects(f.collaboration.prepareWakeContinuationSteps(note.deliveryId), isCollaborationWakeBudgetExhaustedError,
+    'the followup spent the last of it: the message opens no Turn');
+}, 1));
+
+test('a message continuation cancelled because another Turn took its message in spends no budget', async () => fixture(async f => {
+  const first = await f.collaboration.send({ source: await f.source('first-note'), targetConversationId: 'right', text: 'first', mode: 'message' });
+  assert.equal(first.targetDelivery, 'wakes_target');
+  // The wake queues a continuation for the message, which spends the only budget unit.
+  const charge = await f.collaboration.prepareWakeContinuationSteps(first.deliveryId);
+  const envelope = await f.store.prepare(f.database, JSON.stringify({ version: 1, kind: 'runtime_continuation', sourceTurnId: null }), 'application/vnd.limcode.turn-intent+json');
+  await f.database.transaction([...preparedContentObjectSteps([envelope], 'queued_continuation'), ...charge,
+    repo('TurnIntent').insert({ id: 'first-note-intent', conversation_id: 'right', turn_id: null, state: 'queued', created_at: NOW, updated_at: NOW }),
+    repo('TurnIntentRevision').insert({ id: 'first-note-intent-revision', intent_id: 'first-note-intent', revision_seq: 1n, content_object_id: envelope.metadata.id, created_at: NOW }),
+    repo('RuntimeDeliveryIntentLink').insert({ id: 'first-note-link', delivery_id: first.deliveryId, turn_intent_id: 'first-note-intent', created_at: NOW })]);
+  const spent = await f.collaboration.send({ source: await f.source('spent-note'), targetConversationId: 'right', text: 'second', mode: 'message' });
+  assert.equal(spent.targetDelivery, 'waits_budget_exhausted', 'the queued continuation holds the budget');
+  // A Turn the user starts takes the message in and cancels the continuation queued for it.
+  await admitPending(f, 'right', 'right-user');
+  assert.equal((await f.get('TurnIntent', 'first-note-intent')).state, 'cancelled');
+  await endTurn(f, 'right-user');
+  const later = await f.collaboration.send({ source: await f.source('later-note'), targetConversationId: 'right', text: 'third', mode: 'message' });
+  assert.equal(later.targetDelivery, 'wakes_target', 'a cancelled continuation never opened a Turn and spends nothing');
+}, 1));
+
+for (const status of ['interrupted', 'failed']) {
+  test(`a team message the ${status} target Turn never took in opens one Turn of its target once that Turn ends`, async () => fixture(async f => {
+    await admitPending(f, 'right', 'right-busy');
+    const sent = await f.collaboration.send({ source: await f.source(`note-${status}`), targetConversationId: 'right', text: 'note for the running sibling', mode: 'message' });
+    assert.equal(sent.targetDelivery, 'delivered_to_running_turn');
+    const injected = await f.get('RuntimeDelivery', sent.deliveryId);
+    assert.deepEqual([injected.phase, injected.target_turn_id], ['current_turn', 'right-busy'], 'fixture: the message joins the running Turn');
+    // The Turn ends before its loop took the message in: the message is handed to the next Turn.
+    await endTurn(f, 'right-busy', status);
+    const started = [];
+    const { scanner, scan } = continuationScanner(f, started);
+    try {
+      await scan();
+      await scan();
+    } finally { await scanner.dispose(); }
+    assert.deepEqual(started.map(entry => entry.deliveryId), [sent.deliveryId], 'the handed-off message opens exactly one Turn');
+    assert.equal((await f.get('RuntimeDelivery', sent.deliveryId)).target_turn_id, started[0].turnId);
+  }));
+}
+
+test('a team message that reaches a Turn already streaming its final answer wakes the target once that Turn ends', async () => fixture(async f => {
+  await admitPending(f, 'right', 'right-busy');
+  const content = await f.store.prepare(f.database, '{}', 'application/json');
+  await f.database.transaction([...preparedContentObjectSteps([content], 'request'), repo('ModelRequest').insertHistoricalCopy({ id: 'busy-final-request', turn_id: 'right-busy', request_seq: 1n, status: 'terminal', terminal_state: 'completed', provider_id: 'p', model_id: 'm', context_window_tokens: 1000n, compression_threshold_tokens: 900n, estimated_context_tokens: 1n, authority_snapshot_id: 'root-authority', settings_snapshot_object_id: null, recipe_object_id: content.metadata.id, usage_json: null, stream_stats_json: { attemptSeq: '1', socketGeneration: '1', retryReason: null }, created_at: NOW, updated_at: NOW }),
+    repo('Operation').insertHistoricalCopy({ id: 'busy-final-operation', owner_kind: 'model_request', owner_id: 'busy-final-request', operation_seq: 1n, tool_call_id: null, status: 'completed', created_at: NOW, updated_at: NOW }),
+    repo('Attempt').insertHistoricalCopy({ id: 'busy-final-attempt', operation_id: 'busy-final-operation', attempt_seq: 1n, status: 'completed', created_at: NOW, updated_at: NOW, completed_at: NOW }),
+    repo('ModelStreamFence').insertHistoricalCopy({ id: 'busy-final-stream-fence', model_request_id: 'busy-final-request', attempt_seq: 1n, socket_generation: 1n, terminal_stream_seq: 1n, outcome: 'completed', created_at: NOW }),
+    repo('TurnFinalOutputFence').insert({ id: 'busy-fence', turn_id: 'right-busy', model_request_id: 'busy-final-request', created_at: NOW })]);
+  const sent = await f.collaboration.send({ source: await f.source('late-note'), targetConversationId: 'right', text: 'late sibling note', mode: 'message' });
+  assert.equal(sent.targetDelivery, 'wakes_target_after_current_turn', 'the finishing Turn cannot take it in');
+  const started = [];
+  const { scanner, scan } = continuationScanner(f, started);
+  try {
+    await scan();
+    assert.deepEqual(started, [], 'nothing starts while the finishing Turn runs');
+    await endTurn(f, 'right-busy');
+    await scan();
+    await scan();
+  } finally { await scanner.dispose(); }
+  assert.deepEqual(started.map(entry => entry.deliveryId), [sent.deliveryId], 'the message opens exactly one Turn after it');
+  assert.equal((await f.get('RuntimeDelivery', sent.deliveryId)).target_turn_id, started[0].turnId);
+}));

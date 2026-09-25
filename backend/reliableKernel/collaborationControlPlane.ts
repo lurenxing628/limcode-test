@@ -2,7 +2,8 @@ import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { isCrossConversationFollowup, isCrossConversationReply, readCollaborationScope, type CollaborationScope } from './collaborationScope';
+import { isCrossConversationFollowup, isCrossConversationSend, readCollaborationScope, type CollaborationScope } from './collaborationScope';
+import { collaborationWakePolicy } from './collaborationWake';
 import { CROSS_CONVERSATION_LIMITS, readTurnCollaborationLimits, readTurnCrossConversationEnabled } from './collaborationPolicy';
 import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { TURN_INTENT_ENVELOPE_CONTENT_TYPE, parseRuntimeContinuationTurnIntentEnvelopeText } from './guidanceIntent';
@@ -18,19 +19,39 @@ export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboratio
 /** Every collaboration message body is 1..COLLABORATION_MESSAGE_MAX_TEXT_BYTES UTF-8 bytes. */
 export const COLLABORATION_MESSAGE_MAX_TEXT_BYTES = 64_000;
 /**
- * The budget of the task a cross-conversation reply answers is spent, or the Conversation that
- * funded it was deleted: the reply starts no Turn and waits for the requester's next Turn.
+ * The automatic followup budget that would fund a Turn a collaboration wake opens is spent, or the
+ * Conversation that funded it was deleted: the message or reply starts no Turn and waits for its
+ * target's next Turn.
  */
-export class CollaborationReplyBudgetExhaustedError extends Error {
-  public readonly code = 'COLLABORATION_REPLY_BUDGET_EXHAUSTED';
+export class CollaborationWakeBudgetExhaustedError extends Error {
+  public readonly code = 'COLLABORATION_WAKE_BUDGET_EXHAUSTED';
   public constructor(message: string) {
     super(message);
-    this.name = 'CollaborationReplyBudgetExhaustedError';
+    this.name = 'CollaborationWakeBudgetExhaustedError';
   }
 }
-export function isCollaborationReplyBudgetExhaustedError(error: unknown): error is CollaborationReplyBudgetExhaustedError {
-  return error instanceof CollaborationReplyBudgetExhaustedError;
+export function isCollaborationWakeBudgetExhaustedError(error: unknown): error is CollaborationWakeBudgetExhaustedError {
+  return error instanceof CollaborationWakeBudgetExhaustedError;
 }
+/**
+ * A CollaborationBudget row with this origin is not a budget: it records that one automatic wake
+ * opened a Turn for the delivery named by origin_key, charged to the budget whose limit is frozen
+ * in authority_turn_id. Real budgets use origin_kind 'turn'. Nothing lists these rows as budgets.
+ */
+export const WAKE_CHARGE_ORIGIN_KIND = 'delivery_wake';
+/**
+ * What a collaboration send does at its target: taken in by the running Turn; opens a Turn of the
+ * idle target (now, or once the Turn it waits behind ends); or waits for the target's next Turn,
+ * because the sender's final answer starts that Turn, because the automatic followup budget is
+ * spent, or because this kind of message never wakes its target.
+ */
+export type CollaborationTargetDelivery =
+  | 'delivered_to_running_turn'
+  | 'wakes_target'
+  | 'wakes_target_after_current_turn'
+  | 'waits_for_your_answer'
+  | 'waits_budget_exhausted'
+  | 'waits_for_next_turn';
 /**
  * Cross-conversation tools reach only Conversations of the caller's project. Conversations without
  * a project reach only each other, as the sidebar groups them under one 未绑定 scope.
@@ -162,7 +183,9 @@ export class CollaborationControlPlane {
       if (message.mode !== input.mode || origins.length !== 1 || origins[0].conversation_id !== sourceConversationId || origins[0].turn_id !== sourceTurnId || targets.length !== 1 || targets[0].conversation_id !== targetConversationId || payloads.length !== 1 || payloads[0].content_object_id !== prepared.metadata.id || (replies[0]?.request_message_id ?? null) !== replyToMessageId) throw new Error('Collaboration send replay conflicts with immutable message facts.');
       // A tool send anchored to a running target Turn waits until that Turn ends.
       const queued = source.kind === 'tool' && targets[0].anchor_turn_id !== null;
-      return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued, deduplicated: true };
+      const woken = (await this.rows('RuntimeDeliveryWake', { delivery_id: deliveryId })).length > 0;
+      const targetDelivery: CollaborationTargetDelivery = woken ? (queued ? 'wakes_target_after_current_turn' : 'wakes_target') : 'waits_for_next_turn';
+      return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued, deduplicated: true, targetDelivery };
     };
     const existing = await replay(); if (existing) return existing;
     if (input.crossConversation) await this.authorizeCrossConversation({ turnId: requirePhaseFId(sourceTurnId, 'turnId'), ...(creating ? {} : { targetConversationId }) });
@@ -244,9 +267,13 @@ export class CollaborationControlPlane {
       budgetSteps.push(...spendSteps);
       budgetSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').insert({ id: requestId, message_id: messageId, budget_id: budget.id, automatic: 1n, state: 'pending', created_at: now, updated_at: now }));
     }
-    // A reply to a cross-conversation task starts a Turn of its requester once none is running;
-    // that wake waits behind a Turn which will not take the reply in.
-    const startsRequesterTurn = source.kind === 'completion' && await isCrossConversationFollowup(this.database, requirePhaseFId(replyToMessageId, 'replyToMessageId'));
+    // Every send the running target can take in gets a wake that resumes it. Otherwise a followup,
+    // a team message or a completion reply opens one Turn of its target once none is running (a
+    // wake waits behind a Turn that will not take it in); see collaborationWakePolicy for what
+    // never wakes. A message is not woken when its budget is already spent: the binding check is
+    // the transaction that opens the Turn, but a spent budget stays spent.
+    const targetDelivery = await this.targetDelivery({ input, source, sourceTurnId, sourceScope, targetConversationId, currentTurnId, activeTurnId: active[0] ? String(active[0].id) : null });
+    const wakes = targetDelivery === 'delivered_to_running_turn' || targetDelivery === 'wakes_target' || targetDelivery === 'wakes_target_after_current_turn';
     const wakeId = stablePhaseFId('runtime_delivery_wake', deliveryId);
     try {
       await this.database.transaction([
@@ -263,14 +290,42 @@ export class CollaborationControlPlane {
         ...(replyToMessageId ? [DOMAIN_REPOSITORIES.domain('CollaborationMessageReplyLink').insert({ id: stablePhaseFId('collaboration_reply', messageId), message_id: messageId, request_message_id: replyToMessageId, created_at: now })] : []),
         ...budgetSteps,
         DOMAIN_REPOSITORIES.domain('RuntimeDelivery').insert({ id: deliveryId, inbox_item_id: inboxItemId, target_conversation_id: targetConversationId, target_turn_id: currentTurnId, phase: currentTurnId ? 'current_turn' : 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: now, updated_at: now }),
-        ...(input.mode === 'followup' || currentTurnId || startsRequesterTurn ? [DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').insert({ id: wakeId, delivery_id: deliveryId, state: 'pending', claim_owner_host_boot_id: null, claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n, next_attempt_at: null, last_error: null, acknowledged_at: null, created_at: now, updated_at: now })] : [])
+        ...(wakes ? [DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').insert({ id: wakeId, delivery_id: deliveryId, state: 'pending', claim_owner_host_boot_id: null, claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n, next_attempt_at: null, last_error: null, acknowledged_at: null, created_at: now, updated_at: now })] : [])
       ]);
     } catch (error) {
       if (!isTransactionAssertionFailure(error) && !sqliteUniqueFailureIncludes(error, ['collaboration_message.id', 'collaboration_message.dedupe_key', 'collaboration_message_source_link.source_kind, collaboration_message_source_link.source_key', ...(creating ? ['conversation.id'] : [])])) throw error;
       const raced = await replay(); if (raced) return raced;
       throw error;
     }
-    return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued: queuedTurnId !== null, deduplicated: false };
+    return { messageId, inboxItemId, deliveryId, mode: input.mode, accepted: true as const, queued: queuedTurnId !== null, deduplicated: false, targetDelivery };
+  }
+
+  /** What this send does at its target; decides whether its commit also writes a wake. */
+  private async targetDelivery(input: {
+    input: Omit<CollaborationSendCommand, 'source'>;
+    source: CollaborationSource | CompletionSource | BoardSource;
+    sourceTurnId: string | null;
+    sourceScope: CollaborationScope | null;
+    targetConversationId: string;
+    currentTurnId: string | null;
+    activeTurnId: string | null;
+  }): Promise<CollaborationTargetDelivery> {
+    if (input.currentTurnId) return 'delivered_to_running_turn';
+    const wakes: CollaborationTargetDelivery = input.activeTurnId ? 'wakes_target_after_current_turn' : 'wakes_target';
+    const policy = await collaborationWakePolicy(this.database, this.contentStore, {
+      mode: input.input.mode,
+      sourceKind: input.source.kind,
+      crossConversation: input.input.crossConversation === true,
+      senderTurnId: input.sourceTurnId,
+      targetConversationId: input.targetConversationId
+    });
+    if (policy === 'never') return 'waits_for_next_turn';
+    if (policy === 'waits_for_answer') return 'waits_for_your_answer';
+    if (input.input.mode === 'message' && input.source.kind === 'tool'
+      && !await this.messageWakeBudgetAvailable(requirePhaseFId(input.sourceTurnId, 'turnId'), input.sourceScope?.rootTurnId ?? null)) {
+      return 'waits_budget_exhausted';
+    }
+    return wakes;
   }
 
   public async listMessages(input: { conversationId: string; targetConversationId?: string; afterMessageId?: string; beforeMessageId?: string; limit?: number }): Promise<{ messages: CollaborationMessageSummary[]; nextCursor: string | null; olderCursor: string | null; hasMore: boolean }> {
@@ -744,61 +799,120 @@ export class CollaborationControlPlane {
     const budget = await this.budgetForTurn(sourceTurnId, rootTurnId);
     const persisted = await this.maybe('CollaborationBudget', String(budget.id));
     if (persisted && (persisted.origin_kind !== budget.origin_kind || persisted.origin_key !== budget.origin_key || persisted.authority_turn_id !== budget.authority_turn_id)) throw new Error('Collaboration budget identity conflicts.');
-    const spend = await this.budgetSpend(String(budget.id), null);
+    const spend = await this.budgetSpend(budget, null);
     const limit = await this.followupBudgetLimit(String(budget.authority_turn_id));
     if (spend.spent >= limit) throw new Error(`Automatic followup budget exhausted (${limit}).`);
     return { budget, persisted: persisted !== null, spendSteps: spend.steps };
   }
   /**
    * What one automatic followup budget has spent: its automatic requests (followups and the first
-   * tasks of create_conversation) plus every Turn a reply to one of them started in its idle
-   * requester. The steps freeze exactly that spend for the transaction that adds to it; the reply
-   * a starting Turn is admitted for is the one it may add.
+   * tasks of create_conversation), every Turn a reply to one of them opened in its idle requester,
+   * and every Turn a peer message funded by it opened in its idle target (the wake charges of its
+   * authority Turn). A continuation cancelled because another Turn took its delivery in never
+   * opened anything and spends nothing. The steps freeze exactly that spend for the transaction
+   * that adds to it; the reply a starting Turn is admitted for is the one it may add.
    */
-  private async budgetSpend(budgetId: string, startingReplyDeliveryId: string | null): Promise<{ spent: number; steps: RepositoryTransactionStep[] }> {
+  private async budgetSpend(budget: DomainRow, startingReplyDeliveryId: string | null): Promise<{ spent: number; steps: RepositoryTransactionStep[] }> {
+    const budgetId = String(budget.id);
     const requests = await this.rows('CollaborationRequest', { budget_id: budgetId, automatic: 1n });
     const replyDeliveryIds = requests.map((request) => collaborationReplyDeliveryId(String(request.id)));
     const links = replyDeliveryIds.length === 0 ? [] : (await this.database.snapshot(replyDeliveryIds.map((deliveryId) =>
       DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').list({ where: { delivery_id: deliveryId }, limit: 1 })))).snapshot as DomainRow[][];
-    // A reply continuation spends only while it opens (or opened) a Turn: one cancelled because
-    // another Turn took its reply in never started anything. Cancellation is final, so this read
-    // only ever overstates what the transaction below adds to.
+    // Cancellation is final, so a read that finds a continuation still open only ever overstates
+    // what the transaction below adds to.
     const replyTurns = await Promise.all(links.map(async (rows) => rows.length > 0
       && !await this.isCancelledIntent(String(rows[0].turn_intent_id))));
+    const chargeWhere = { authority_turn_id: budget.authority_turn_id, origin_kind: WAKE_CHARGE_ORIGIN_KIND };
+    const charges = await this.rows('CollaborationBudget', chargeWhere);
+    const chargedTurns = await Promise.all(charges.map((charge) => this.wakeOpenedTurn(String(charge.origin_key))));
     return {
-      spent: requests.length + replyTurns.filter(Boolean).length,
+      spent: requests.length + replyTurns.filter(Boolean).length + chargedTurns.filter(Boolean).length,
       steps: [
         DOMAIN_REPOSITORIES.domain('CollaborationRequest').assertExactIds({ budget_id: budgetId, automatic: 1n }, requests.map((row) => String(row.id))),
         ...replyDeliveryIds.filter((deliveryId, index) => links[index].length === 0 && deliveryId !== startingReplyDeliveryId)
-          .map((deliveryId) => DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').assertNone({ delivery_id: deliveryId }))
+          .map((deliveryId) => DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').assertNone({ delivery_id: deliveryId })),
+        DOMAIN_REPOSITORIES.domain('CollaborationBudget').assertExactIds(chargeWhere, charges.map((row) => String(row.id)))
       ]
     };
   }
+  /** Whether the continuation a wake charge paid for still opens (or opened) a Turn. */
+  private async wakeOpenedTurn(deliveryId: string): Promise<boolean> {
+    const [link] = await this.rows('RuntimeDeliveryIntentLink', { delivery_id: deliveryId });
+    return !link || !await this.isCancelledIntent(String(link.turn_intent_id));
+  }
   /**
-   * The Turn a reply to a cross-conversation task starts in its idle requester spends the budget of
-   * the task it answers, so two conversations trading followups and replies stay bounded. The
-   * returned steps commit with that Turn's TurnIntent; every other runtime continuation spends
-   * nothing here. A spent budget, or a deleted Conversation that funded it, throws
-   * CollaborationReplyBudgetExhaustedError: the reply then waits for the requester's next Turn.
+   * Every Turn a collaboration wake opens in an idle Conversation spends an automatic followup
+   * budget, checked and counted in the transaction that commits its continuation (which opens the
+   * Turn, or queues it behind the Turn it waits for):
+   * - a completion or failure reply (team or cross-conversation) spends the budget of the task it
+   *   answers, derived from that request;
+   * - a team peer message spends the budget its sender's own followups would spend, recorded as a
+   *   wake charge of that budget's authority Turn.
+   * Followups spent their budget when they were sent; other continuations spend nothing here. A
+   * spent budget, or a deleted Conversation that funded it, throws
+   * CollaborationWakeBudgetExhaustedError: the delivery then waits for its target's next Turn.
    */
-  public async prepareReplyContinuationSteps(deliveryIdInput: string): Promise<RepositoryTransactionStep[]> {
+  public async prepareWakeContinuationSteps(deliveryIdInput: string): Promise<RepositoryTransactionStep[]> {
     const deliveryId = requirePhaseFId(deliveryIdInput, 'deliveryId');
     const delivery = await this.existing('RuntimeDelivery', deliveryId);
     const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
     if (inbox.source_kind !== 'collaboration_message') return [];
-    const request = await this.answeredCrossConversationRequest(String(inbox.source_id));
-    if (!request) return [];
-    const budget = await this.existing('CollaborationBudget', String(request.budget_id));
-    const authorityTurnId = String(budget.authority_turn_id);
-    if (!await this.maybe('Turn', authorityTurnId)) throw new CollaborationReplyBudgetExhaustedError('The conversation that started this task was deleted, so its reply starts no turn.');
-    const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, authorityTurnId)).maxAutomaticFollowups;
-    const spend = await this.budgetSpend(String(budget.id), deliveryId);
-    if (spend.spent >= limit) throw new CollaborationReplyBudgetExhaustedError(`Automatic followup budget exhausted (${limit}); the reply waits for the next turn.`);
-    return spend.steps;
+    const messageId = String(inbox.source_id);
+    const message = await this.existing('CollaborationMessage', messageId);
+    if (message.mode !== 'message') return [];
+    const source = await this.one('CollaborationMessageSourceLink', { message_id: messageId });
+    if (source.source_kind === 'completion') {
+      const reply = await this.one('CollaborationMessageReplyLink', { message_id: messageId });
+      const request = await this.one('CollaborationRequest', { message_id: reply.request_message_id });
+      const budget = await this.existing('CollaborationBudget', String(request.budget_id));
+      const authorityTurnId = String(budget.authority_turn_id);
+      if (!await this.maybe('Turn', authorityTurnId)) throw new CollaborationWakeBudgetExhaustedError('The conversation that started this task was deleted, so its reply starts no turn.');
+      const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, authorityTurnId)).maxAutomaticFollowups;
+      const spend = await this.budgetSpend(budget, deliveryId);
+      if (spend.spent >= limit) throw new CollaborationWakeBudgetExhaustedError(`Automatic followup budget exhausted (${limit}); the reply waits for the next turn.`);
+      return spend.steps;
+    }
+    if (source.source_kind !== 'tool' || await isCrossConversationSend(this.database, messageId, 'message')) return [];
+    const funded = await this.messageWakeBudget(String(source.turn_id), String(source.conversation_id));
+    if (!funded || funded.spend.spent >= funded.limit) {
+      throw new CollaborationWakeBudgetExhaustedError('Automatic followup budget exhausted; the message waits for its target\'s next turn.');
+    }
+    return [
+      ...funded.spend.steps,
+      DOMAIN_REPOSITORIES.domain('CollaborationBudget').insert({
+        id: stablePhaseFId('collaboration_budget', WAKE_CHARGE_ORIGIN_KIND, deliveryId),
+        origin_kind: WAKE_CHARGE_ORIGIN_KIND,
+        origin_key: deliveryId,
+        authority_turn_id: funded.budget.authority_turn_id,
+        created_at: this.now()
+      })
+    ];
   }
-  /** The cross-conversation request a completion or failure reply answers; null for any other message. */
-  private async answeredCrossConversationRequest(messageId: string): Promise<DomainRow | null> {
-    if (!await isCrossConversationReply(this.database, messageId)) return null;
+  /** Whether a team message from this Turn may still open a Turn of an idle target. */
+  private async messageWakeBudgetAvailable(senderTurnId: string, rootTurnId: string | null): Promise<boolean> {
+    const funded = await this.messageWakeBudget(senderTurnId, null, rootTurnId);
+    return funded !== null && funded.spend.spent < funded.limit;
+  }
+  /**
+   * The budget a team message from this Turn spends when it opens a Turn: the one its sender's own
+   * followups would spend. Null once the sender or the Turn that funded the budget is deleted.
+   */
+  private async messageWakeBudget(senderTurnId: string, senderConversationId: string | null, rootTurnId?: string | null): Promise<{
+    budget: DomainRow; limit: number; spend: { spent: number; steps: RepositoryTransactionStep[] };
+  } | null> {
+    if (!await this.maybe('Turn', senderTurnId)) return null;
+    const root = rootTurnId !== undefined ? rootTurnId
+      : (await readCollaborationScope(this.database, requirePhaseFId(senderConversationId, 'senderConversationId'))).rootTurnId;
+    const budget = await this.budgetForTurn(senderTurnId, root);
+    const authorityTurnId = String(budget.authority_turn_id);
+    if (!await this.maybe('Turn', authorityTurnId)) return null;
+    const limit = (await readTurnCollaborationLimits(this.database, this.contentStore, authorityTurnId)).maxAutomaticFollowups;
+    return { budget, limit, spend: await this.budgetSpend(budget, null) };
+  }
+  /** The request a completion or failure reply (team or cross-conversation) answers; null for any other message. */
+  private async answeredRequest(messageId: string): Promise<DomainRow | null> {
+    const [source] = await this.rows('CollaborationMessageSourceLink', { message_id: messageId });
+    if (source?.source_kind !== 'completion') return null;
     const reply = await this.one('CollaborationMessageReplyLink', { message_id: messageId });
     return this.one('CollaborationRequest', { message_id: reply.request_message_id });
   }
@@ -857,9 +971,11 @@ export class CollaborationControlPlane {
     return visit(sourceTurnId, rootTurnId, new Set());
   }
   /**
-   * The budget of the cross-conversation followup, or of the task a reply answers, whose runtime
-   * continuation admitted this Turn, if any. Team and child continuations keep pooling what they
-   * absorbed, so their independent root budgets still refuse to combine.
+   * The budget of the cross-conversation followup, of the task a reply answers, or of the peer
+   * message whose wake opened this Turn, if any: automatic work that one wake funded keeps
+   * spending that same budget, so agents trading messages, followups and replies stay bounded.
+   * Team and child continuations otherwise keep pooling what they absorbed, so their independent
+   * root budgets still refuse to combine.
    */
   private async startingFollowupBudget(turnId: string): Promise<DomainRow | null> {
     for (const intent of await this.rows('TurnIntent', { turn_id: turnId })) {
@@ -869,8 +985,15 @@ export class CollaborationControlPlane {
       if (delivery.target_turn_id !== turnId) continue;
       const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
       if (inbox.source_kind !== 'collaboration_message') continue;
-      const answered = await this.answeredCrossConversationRequest(String(inbox.source_id));
+      const answered = await this.answeredRequest(String(inbox.source_id));
       if (answered) return this.existing('CollaborationBudget', String(answered.budget_id));
+      const charge = await this.maybe('CollaborationBudget', stablePhaseFId('collaboration_budget', WAKE_CHARGE_ORIGIN_KIND, String(delivery.id)));
+      if (charge?.origin_kind === WAKE_CHARGE_ORIGIN_KIND) {
+        const authorityTurnId = String(charge.authority_turn_id);
+        const budgetId = stablePhaseFId('collaboration_budget', 'turn', authorityTurnId);
+        return await this.maybe('CollaborationBudget', budgetId)
+          ?? { id: budgetId, origin_kind: 'turn', origin_key: authorityTurnId, authority_turn_id: authorityTurnId, created_at: this.now() };
+      }
       if (!await isCrossConversationFollowup(this.database, String(inbox.source_id))) continue;
       const requests = await this.rows('CollaborationRequest', { message_id: inbox.source_id });
       if (requests.length === 1) return this.existing('CollaborationBudget', String(requests[0].budget_id));

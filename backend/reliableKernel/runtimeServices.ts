@@ -65,7 +65,8 @@ export function createReliableKernelRuntimeServices(
   const children = new ChildExecutionControlPlane(database, contentStore, effects, {
     ...options,
     prepareNextTurnDeliverySteps: (conversationId, turnId, now, startingDeliveryId) =>
-      deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now, startingDeliveryId)
+      deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now, startingDeliveryId),
+    prepareRuntimeContinuationSteps: (deliveryId) => collaboration.prepareWakeContinuationSteps(deliveryId)
   });
   const answers = new AnswerControlPlane(database, contentStore, children, options);
   const conversationFork = new ConversationForkControlPlane(database, contentStore, options);
