@@ -17,6 +17,7 @@ import type {
 import { reliableKernelDetailKey } from './reliableDetailKey.ts';
 import { modelRequestNativeCapabilities } from '../reliability/modelRequestStreamStats.ts';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
+import { hasSteeringApplicationReceipt } from '../composables/steeringReceipts.ts';
 import type {
   ReliableKernelDetailState,
   ReliableKernelTransientState
@@ -80,6 +81,8 @@ export interface ReliableConversationProjection {
   messageRevisionIdByMessageId: Record<string, string>;
   /** 转向边界拆分出的展示条目 → 来源聚合消息 id；用于预览/详请归属，不代表持久化身份。 */
   splitSourceMessageIdByMessageId: Record<string, string>;
+  /** 展示层只知道尾部归属尚未有完整证明，绝不猜它属于哪条转向消息。 */
+  pendingSteeringBoundaryMessageIds: string[];
   terminationByMessageId: Record<string, RunTerminationRecord>;
   toolResultByCallId: Record<string, unknown>;
   toolOutcomeStatusByCallId: Record<string, ReliableToolOutcomeProjectionStatus>;
@@ -227,11 +230,12 @@ export function projectReliableConversation(
   for (const entry of parsedMessages) {
     if (entry.turnId && entry.message.id.startsWith('transient:')) turnIdByMessageId[entry.message.id] = entry.turnId;
   }
-  const splitSourceMessageIdByMessageId = splitAggregateMessagesAtSteeringBoundaries(
+  const steeringBoundaries = splitAggregateMessagesAtSteeringBoundaries(
     parsedMessages,
     input.steeringReceipts ?? [],
     modelRequestIdByMessageId
   );
+  const splitSourceMessageIdByMessageId = steeringBoundaries.splitSourceMessageIdByMessageId;
   // 拆分条目继承来源消息的 Turn 归属；终止/运行展示按同一 Turn 解释，不虚构独立边界。
   for (const [syntheticId, sourceId] of Object.entries(splitSourceMessageIdByMessageId)) {
     const turnId = turnIdByMessageId[sourceId];
@@ -343,6 +347,7 @@ export function projectReliableConversation(
     modelRequestIdByMessageId,
     messageRevisionIdByMessageId,
     splitSourceMessageIdByMessageId,
+    pendingSteeringBoundaryMessageIds: steeringBoundaries.pendingSteeringBoundaryMessageIds,
     terminationByMessageId,
     toolResultByCallId,
     toolOutcomeStatusByCallId,
@@ -854,83 +859,118 @@ function compareParsedMessages(left: ParsedMessage, right: ParsedMessage): numbe
 }
 
 /**
- * 原生聚合内容按 outputItem.providerResponseId 连续段分组。任何一个部分缺少 response
- * 身份（非原生、占位、注入部件）都返回 undefined——只有完整标记的原生聚合链才拆分。
+ * 原生聚合内容按物理 response 身份的连续段分组；缺少身份的 part 是单独的未知段，
+ * 不能使已经证明的前缀边界整段回退，也不能被挪进未经证明的后继消息。
  */
 function responseRunsByProviderResponseId(
   content: MessageContent
-): Array<{ responseId: string; parts: MessageContent['parts'] }> | undefined {
-  const runs: Array<{ responseId: string; parts: MessageContent['parts'] }> = [];
+): Array<{ responseId?: string; parts: MessageContent['parts'] }> | undefined {
+  const runs: Array<{ responseId?: string; parts: MessageContent['parts'] }> = [];
   for (const part of content.parts) {
     const responseId = text(partOutputItem(part)?.providerResponseId);
-    if (!responseId) return undefined;
     const last = runs[runs.length - 1];
     if (last && last.responseId === responseId) last.parts.push(part);
-    else runs.push({ responseId, parts: [part] });
+    else runs.push({ ...(responseId ? { responseId } : {}), parts: [part] });
   }
   return runs.length >= 2 ? runs : undefined;
 }
 
+interface SteeringBoundaryProjection {
+  splitSourceMessageIdByMessageId: Record<string, string>;
+  pendingSteeringBoundaryMessageIds: string[];
+}
+
 /**
- * 原生聚合消息（一个 ModelRequest 一条 Message）横跨多个 response：初始响应 + 每次被接受
- * 转向产生的自动后继。转向用户消息必须按真实时序渲染在初始输出与后继输出之间，所以把聚合
- * 内容在转向边界拆开：第一段留在原消息位置，后继段作为拆分展示条目插入对应转向消息之后。
- * 配对完全依据持久化转向回执（modelRequestId + successorResponseId + messageId）——
- * 任何后继 response 缺少权威回执时保留完整聚合内容，绝不按顺序猜测配对。
- * 拆分只影响展示：条目经 splitFromMessageId 回溯来源，持久化身份与 ToolCallSourceLink 不变。
+ * 原生一个 ModelRequest 的聚合 Message 可跨多次物理 response。只按同一请求/Turn、
+ * 精确前驱与后继 response 身份、已提交模型上下文的转向回执、真实用户 Message 配对。
+ * 缺少证明的后缀留在最后一个已证实条目，不倒退前缀，也绝不凭消息/回执顺序配对。
+ * 所有拆分只影响展示，ToolCallSourceLink 和持久化消息身份仍归来源聚合 Message。
  */
 function splitAggregateMessagesAtSteeringBoundaries(
   messages: ParsedMessage[],
   steeringReceipts: readonly NativeSteeringReceipt[],
   modelRequestIdByMessageId: Record<string, string>
-): Record<string, string> {
-  const splitSourceMessageIdByMessageId: Record<string, string> = {};
-  if (steeringReceipts.length === 0) return splitSourceMessageIdByMessageId;
+): SteeringBoundaryProjection {
+  const result: SteeringBoundaryProjection = {
+    splitSourceMessageIdByMessageId: {},
+    pendingSteeringBoundaryMessageIds: []
+  };
+  if (steeringReceipts.length === 0) return result;
   const messagesById = new Map(messages.map((entry) => [entry.message.id, entry]));
   for (const entry of [...messages].sort(compareParsedMessages)) {
     if (entry.message.role !== 'model') continue;
     const runs = responseRunsByProviderResponseId(entry.message.content);
-    if (!runs) continue;
+    if (!runs?.[0]?.responseId) continue;
     const requestId = modelRequestIdByMessageId[entry.message.id];
-    if (!requestId) continue;
-    const steerMessageIdBySuccessorResponseId = new Map<string, string>();
-    for (const receipt of steeringReceipts) {
-      if (receipt.modelRequestId !== requestId) continue;
-      const successorResponseId = receipt.successorResponseId?.trim();
-      const messageId = receipt.messageId?.trim();
-      if (successorResponseId && messageId) steerMessageIdBySuccessorResponseId.set(successorResponseId, messageId);
+    if (!requestId || !entry.turnId) continue;
+    const requestReceipts = steeringReceipts.filter((receipt) =>
+      receipt.modelRequestId === requestId
+      && receipt.conversationId === entry.message.conversationId
+      && receipt.turnId === entry.turnId
+    );
+    if (requestReceipts.length === 0) continue;
+
+    const proved: Array<{ run: (typeof runs)[number]; steer: ParsedMessage }> = [];
+    const usedSteerMessageIds = new Set<string>();
+    let previousSteerSeq = entry.message.seq;
+    for (let index = 1; index < runs.length; index += 1) {
+      const run = runs[index]!;
+      const previousResponseId = runs[index - 1]!.responseId;
+      if (!run.responseId || !previousResponseId || run.responseId === previousResponseId) break;
+      // 一个物理后继被两次转向同时认领是证据冲突，不能挑任意一条渲染为生效。
+      const matching = requestReceipts.filter((receipt) =>
+        hasSteeringApplicationReceipt(receipt, requestReceipts)
+        && receipt.targetResponseId === previousResponseId
+        && receipt.successorResponseId === run.responseId
+      );
+      if (matching.length !== 1) break;
+      if (run.parts.some((part) => {
+        const stampedPredecessor = text(partOutputItem(part)?.previousResponseId);
+        return stampedPredecessor !== previousResponseId;
+      })) break;
+      const messageId = matching[0]!.messageId!;
+      const steer = messagesById.get(messageId);
+      if (!steer || steer.message.role !== 'user' || steer.turnId !== entry.turnId
+        || steer.message.seq <= previousSteerSeq || usedSteerMessageIds.has(messageId)) break;
+      usedSteerMessageIds.add(messageId);
+      proved.push({ run, steer });
+      previousSteerSeq = steer.message.seq;
     }
-    const [firstRun, ...successorRuns] = runs;
-    const pairings = successorRuns.map((run) => steerMessageIdBySuccessorResponseId.get(run.responseId));
-    // 任一后继 response 缺少权威配对（回执尚未加载）→ 保留完整内容，等待精确状态。
-    if (pairings.some((messageId) => !messageId || !messagesById.has(messageId))) continue;
+    if (proved.length === 0) {
+      // 只有本请求实际有转向收据时才报告未知边界；多 response 也可能只是工具续流。
+      result.pendingSteeringBoundaryMessageIds.push(entry.message.id);
+      continue;
+    }
+    const originalMessage = entry.message;
     entry.message = {
-      ...entry.message,
-      content: { ...entry.message.content, parts: firstRun.parts }
+      ...originalMessage,
+      content: { ...originalMessage.content, parts: runs[0]!.parts }
     };
-    successorRuns.forEach((run, index) => {
-      const steerMessageId = pairings[index]!;
-      const steer = messagesById.get(steerMessageId)!;
-      const syntheticId = `${entry.message.id}:steer-successor:${run.responseId}`;
-      // 拆分条目不复制定位/用量元数据：重试入口与 Token 展示只属于完整聚合消息。
-      const { retryTarget: _retryTarget, usageMetadata: _usageMetadata, ...messageBase } = entry.message;
-      splitSourceMessageIdByMessageId[syntheticId] = entry.message.id;
+    for (const [index, pairing] of proved.entries()) {
+      const syntheticId = `${originalMessage.id}:steer-successor:${pairing.run.responseId}`;
+      // 未证明的尾部保留在最后一段、仍位于下一条转向用户消息之前；不吞掉任何输出。
+      const unknownSuffix = index === proved.length - 1
+        ? runs.slice(proved.length + 1).flatMap((run) => run.parts)
+        : [];
+      const { retryTarget: _retryTarget, usageMetadata: _usageMetadata, ...messageBase } = originalMessage;
+      result.splitSourceMessageIdByMessageId[syntheticId] = originalMessage.id;
       messages.push({
         record: entry.record,
         ...(entry.turnId ? { turnId: entry.turnId } : {}),
         revisionReady: entry.revisionReady,
-        splitFromMessageId: entry.message.id,
+        splitFromMessageId: originalMessage.id,
         message: {
           ...messageBase,
           id: syntheticId,
-          content: { ...entry.message.content, parts: run.parts },
-          seq: steer.message.seq + 0.25
+          content: { ...originalMessage.content, parts: [...pairing.run.parts, ...unknownSuffix] },
+          seq: pairing.steer.message.seq + 0.25
         }
       });
-    });
+      if (unknownSuffix.length > 0) result.pendingSteeringBoundaryMessageIds.push(syntheticId);
+    }
   }
   messages.sort(compareParsedMessages);
-  return splitSourceMessageIdByMessageId;
+  return result;
 }
 
 function functionCallTargets(messages: ParsedMessage[]): FunctionCallTarget[] {
@@ -1393,6 +1433,7 @@ function emptyProjection(): ReliableConversationProjection {
     modelRequestIdByMessageId: {},
     messageRevisionIdByMessageId: {},
     splitSourceMessageIdByMessageId: {},
+    pendingSteeringBoundaryMessageIds: [],
     terminationByMessageId: {},
     toolResultByCallId: {},
     toolOutcomeStatusByCallId: {},

@@ -2,6 +2,18 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { projectReliableConversation } from '../src/domain/reliableConversationProjection.ts';
 import { modelRequestNativeCapabilities } from '../src/reliability/modelRequestStreamStats.ts';
+import {
+  STEERING_COMPLETION_NOTICE_MS,
+  hasSteeringApplicationReceipt,
+  mergeSteeringReceipts,
+  nextSteeringCompletionExpiry,
+  steeringReceiptDismissKey,
+  steeringReceiptPresentation,
+  steeringReceiptVersion,
+  steeringReceiptsByConversationState,
+  steeringStatusSessionKey,
+  visibleSteeringReceipts
+} from '../src/composables/steeringReceipts.ts';
 
 const ready = (text: string) => ({ status: 'ready' as const, text, totalBytes: text.length });
 
@@ -242,6 +254,198 @@ test('aggregate without an authoritative receipt keeps full content instead of g
   });
   assert.equal(wrongSuccessor.messages.filter((message) => message.role === 'model').length, 1,
     'successorResponseId 与聚合内容不匹配时保留完整内容');
+
+  for (const state of ['queued', 'sent', 'accepted', 'waiting_for_input'] as const) {
+    const unproven = projectReliableConversation({
+      conversationId: 'conversation-a', records, details,
+      steeringReceipts: [{ ...STEER_RECEIPT, state }]
+    });
+    assert.equal(unproven.messages.filter((message) => message.role === 'model').length, 1,
+      `${state} 仅证明投递阶段，不代表指令已进入后继响应`);
+  }
+  const wrongTarget = projectReliableConversation({
+    conversationId: 'conversation-a', records, details,
+    steeringReceipts: [{ ...STEER_RECEIPT, targetResponseId: 'resp-other' }]
+  });
+  assert.equal(wrongTarget.messages.filter((message) => message.role === 'model').length, 1,
+    '目标响应身份不等于上一物理响应时不得配对');
+});
+
+function twoSteeringChain() {
+  const { records, details } = steeringChainRecords();
+  records.Message['message-steer-2'] = {
+    id: 'message-steer-2', conversation_id: 'conversation-a', message_seq: '3', revision_id: 'revision-steer-2',
+    role: 'user', created_at: '2026-08-03T00:00:06.000Z'
+  };
+  records.MessageTurnLink['link-steer-2'] = {
+    id: 'link-steer-2', message_id: 'message-steer-2', turn_id: 'turn-a', role: 'native_steer'
+  };
+  details['message-content:revision-steer-2'] = ready(JSON.stringify({
+    role: 'user', parts: [{ text: '再换个方向' }]
+  }));
+  const firstParts = JSON.parse(details['message-content:revision-a'].text) as { role: 'model'; parts: unknown[] };
+  firstParts.parts.push({
+    text: 'second successor answer',
+    outputItem: { id: 'item-11', ordinal: 1, providerResponseId: 'resp-3', previousResponseId: 'resp-2' }
+  });
+  details['message-content:revision-a'] = ready(JSON.stringify(firstParts));
+  return { records, details };
+}
+
+const SECOND_STEER_RECEIPT = {
+  ...STEER_RECEIPT,
+  submissionId: 'submission-2',
+  messageId: 'message-steer-2',
+  targetResponseId: 'resp-2',
+  successorResponseId: 'resp-3',
+  updatedAt: 8_000
+};
+
+test('two consecutive steering receipts place each physical response after its own instruction', () => {
+  const { records, details } = twoSteeringChain();
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a', records, details,
+    steeringReceipts: [STEER_RECEIPT, SECOND_STEER_RECEIPT]
+  });
+  assert.deepEqual(projection.messages.map((message) => message.id), [
+    'message-a', 'message-steer', 'message-a:steer-successor:resp-2',
+    'message-steer-2', 'message-a:steer-successor:resp-3'
+  ]);
+  assert.equal(projection.messages[2]?.content.parts.length, 2);
+  assert.equal(projection.messages[4]?.content.parts.length, 1);
+});
+
+test('missing later receipt does not roll back the earlier proven boundary or invent the later one', () => {
+  const { records, details } = twoSteeringChain();
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a', records, details,
+    steeringReceipts: [STEER_RECEIPT, { ...SECOND_STEER_RECEIPT, state: 'accepted' }]
+  });
+  assert.deepEqual(projection.messages.map((message) => message.id), [
+    'message-a', 'message-steer', 'message-a:steer-successor:resp-2', 'message-steer-2'
+  ], '尚未配对 resp-3 时，只撤回未知边界而非撤回 resp-2 的既有证据');
+  assert.equal(projection.messages[2]?.content.parts.length, 3,
+    '未知尾部保留在上一条已证明展示条目里，内容不能丢失或移入错误指令之后');
+  assert.equal(projection.messages[3]?.role, 'user');
+  assert.deepEqual(projection.pendingSteeringBoundaryMessageIds, ['message-a:steer-successor:resp-2'],
+    '未知尾部必须显式保留待确认状态而不是假装已落在第二条转向后');
+  assert.deepEqual(projection.splitSourceMessageIdByMessageId, {
+    'message-a:steer-successor:resp-2': 'message-a'
+  });
+});
+
+test('second steer without any durable receipt leaves the first proven boundary intact', () => {
+  const { records, details } = twoSteeringChain();
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a', records, details,
+    steeringReceipts: [STEER_RECEIPT]
+  });
+  assert.deepEqual(projection.messages.map((message) => message.id), [
+    'message-a', 'message-steer', 'message-a:steer-successor:resp-2', 'message-steer-2'
+  ]);
+  assert.equal(projection.messages[2]?.content.parts.length, 3, '未知后缀不得丢弃');
+  assert.deepEqual(projection.pendingSteeringBoundaryMessageIds, ['message-a:steer-successor:resp-2']);
+});
+
+test('successor without stamped predecessor cannot be paired by receipt alone', () => {
+  const { records, details } = steeringChainRecords();
+  const content = JSON.parse(details['message-content:revision-a'].text) as {
+    role: 'model'; parts: Array<{ outputItem?: { previousResponseId?: string } }>;
+  };
+  delete content.parts[1]!.outputItem?.previousResponseId;
+  details['message-content:revision-a'] = ready(JSON.stringify(content));
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a', records, details, steeringReceipts: [STEER_RECEIPT]
+  });
+  assert.equal(projection.messages.filter((message) => message.role === 'model').length, 1);
+  assert.deepEqual(projection.pendingSteeringBoundaryMessageIds, ['message-a']);
+});
+
+test('ambiguous receipts cannot both claim the same physical successor', () => {
+  const { records, details } = twoSteeringChain();
+  const withoutThirdResponse = JSON.parse(details['message-content:revision-a'].text) as { role: 'model'; parts: unknown[] };
+  withoutThirdResponse.parts.pop();
+  details['message-content:revision-a'] = ready(JSON.stringify(withoutThirdResponse));
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a', records, details,
+    steeringReceipts: [STEER_RECEIPT, { ...SECOND_STEER_RECEIPT, targetResponseId: 'resp-1', successorResponseId: 'resp-2' }]
+  });
+  assert.equal(projection.messages.filter((message) => message.role === 'model').length, 1,
+    '两次提交被误认作同一个后继 response 时，客户端必须拒绝制造任何已确认边界');
+});
+
+test('same predecessor with two distinct claimed successors remains unproven', () => {
+  const { records, details } = twoSteeringChain();
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a', records, details,
+    steeringReceipts: [STEER_RECEIPT, { ...SECOND_STEER_RECEIPT, targetResponseId: 'resp-1' }]
+  });
+  assert.deepEqual(projection.messages.map((message) => message.id), [
+    'message-a', 'message-steer', 'message-steer-2'
+  ]);
+  assert.deepEqual(projection.pendingSteeringBoundaryMessageIds, ['message-a']);
+  assert.equal(steeringReceiptPresentation(STEER_RECEIPT, [STEER_RECEIPT, SECOND_STEER_RECEIPT]).provenApplied, true,
+    '两次依序提交且前驱后继成链可分别被证明');
+  assert.equal(steeringReceiptPresentation(STEER_RECEIPT, [STEER_RECEIPT, {
+    ...SECOND_STEER_RECEIPT, targetResponseId: 'resp-1'
+  }]).provenApplied, false, '同一前驱被两次标为应用时输入区不能称任何一条已生效');
+});
+
+test('reload projects confirmed boundaries from durable receipt and stamped revision alone', () => {
+  const { records, details } = twoSteeringChain();
+  const storedReceipts = JSON.parse(JSON.stringify([STEER_RECEIPT, SECOND_STEER_RECEIPT]));
+  const restored = projectReliableConversation({
+    conversationId: 'conversation-a', records, details,
+    steeringReceipts: storedReceipts
+  });
+  assert.deepEqual(restored.messages.map((message) => message.id), [
+    'message-a', 'message-steer', 'message-a:steer-successor:resp-2',
+    'message-steer-2', 'message-a:steer-successor:resp-3'
+  ]);
+});
+
+test('accepted ACK is not application proof; completed UI exits after 4s, durable receipt remains', () => {
+  const id = 'presentation-test-conversation';
+  const accepted = { ...STEER_RECEIPT, conversationId: id, state: 'accepted' as const, updatedAt: 25_000 };
+  for (const state of ['queued', 'sent', 'accepted', 'waiting_for_input'] as const) {
+    const candidate = { ...accepted, state };
+    assert.equal(hasSteeringApplicationReceipt(candidate), false);
+    assert.equal(steeringReceiptPresentation(candidate).provenApplied, false);
+  }
+  const completed = { ...STEER_RECEIPT, conversationId: id, state: 'completed' as const, updatedAt: 26_000 };
+  mergeSteeringReceipts(id, [completed]);
+  mergeSteeringReceipts(id, [{ ...accepted, updatedAt: 27_000 }]);
+  assert.deepEqual(steeringReceiptsByConversationState().value[id]?.[completed.submissionId], completed,
+    'Host 重读迟到的旧 ACK，即使 timestamp 较新也不能让终态回退');
+  assert.notEqual(steeringStatusSessionKey(id, 'host-before'), steeringStatusSessionKey(id, 'host-after'));
+  assert.deepEqual(visibleSteeringReceipts([completed], 26_000), [completed]);
+  assert.equal(nextSteeringCompletionExpiry([completed], 26_000), 26_000 + STEERING_COMPLETION_NOTICE_MS);
+  assert.deepEqual(visibleSteeringReceipts([completed], 26_000 + STEERING_COMPLETION_NOTICE_MS), []);
+  assert.deepEqual(steeringReceiptsByConversationState().value[id]?.[completed.submissionId], completed,
+    '仅 UI 消失，已持久回执依然可供重读/投影');
+});
+
+test('failure and uncertain delivery remain visible until dismissed, without an automatic retry', () => {
+  for (const state of ['failed', 'delivery_unknown'] as const) {
+    const receipt = { ...STEER_RECEIPT, state };
+    assert.equal(steeringReceiptPresentation(receipt).dismissible, true);
+    assert.match(steeringReceiptPresentation(receipt).detail, /重新|核对|确认/);
+    assert.deepEqual(visibleSteeringReceipts([receipt], 100_000), [receipt]);
+    const dismissed = { [steeringReceiptDismissKey(receipt)]: steeringReceiptVersion(receipt) };
+    assert.deepEqual(visibleSteeringReceipts([receipt], 100_000, dismissed), []);
+    assert.deepEqual(visibleSteeringReceipts([{ ...receipt, updatedAt: receipt.updatedAt + 1 }], 100_000, dismissed).length, 1);
+  }
+  const incomplete = { ...STEER_RECEIPT, state: 'completed' as const, successorResponseId: undefined };
+  assert.deepEqual(visibleSteeringReceipts([incomplete], 100_000), [incomplete],
+    '生效证明不完整时禁止按成功终态自动隐藏');
+  assert.notEqual(steeringReceiptVersion(incomplete), steeringReceiptVersion({
+    ...incomplete, successorResponseId: 'resp-2'
+  }), '同毫秒补齐后继证据时，用户关闭的仅是旧状态提示');
+  assert.deepEqual(visibleSteeringReceipts([STEER_RECEIPT, {
+    ...SECOND_STEER_RECEIPT, targetResponseId: 'resp-1', state: 'completed'
+  }], 100_000), [STEER_RECEIPT, {
+    ...SECOND_STEER_RECEIPT, targetResponseId: 'resp-1', state: 'completed'
+  }], '争议中的完成回执不按已生效完成自动隐藏');
 });
 
 test('unstamped aggregate content is never split', () => {
