@@ -1088,15 +1088,8 @@ export function executeClientProjectionSnapshot(
       const activity = projectChildExecutionActivityRecord(database, String(child.id), content);
       return activity ? [activity] : [];
     });
-    const answerBridges = queryAllByIds(database, 'answer_bridge', 'child_execution_id', childIds)
+    const childAnswerBridges = queryAllByIds(database, 'answer_bridge', 'child_execution_id', childIds)
       .map((bridge) => projectAnswerBridgeRecord(database, String(bridge.id)));
-    const bridgeIds = answerBridges.map((row) => String(row.id));
-    const answerSubmissions = queryAllByIds(
-      database,
-      'answer_submission',
-      'id',
-      answerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : [])
-    );
     // Collaboration cards sit at the Turns this snapshot loads, so the selection follows those
     // Turns instead of a fixed count of the newest messages.
     const collaborationMessages = queryCollaborationMessagesForTurns(database, conversationId, turnIds)
@@ -1128,6 +1121,24 @@ export function executeClientProjectionSnapshot(
     });
     const inboxIds = deliveries.map((row) => String(row.inbox_item_id));
     const inboxItems = queryAllByIds(database, 'runtime_inbox_item', 'id', inboxIds);
+    // A child's bridge is reused by every Turn it answers, so its current submission is only the
+    // newest answer. Each projected answer delivery keeps its own submission, bridge and child, or
+    // the card of an earlier answer would vanish from every reloaded view.
+    const answerSubmissions = queryAllByIds(database, 'answer_submission', 'id', [
+      ...childAnswerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : []),
+      ...inboxItems.flatMap((row) => row.source_kind === 'answer_submission' ? [String(row.source_id)] : [])
+    ]);
+    const projectedBridgeIds = new Set(childAnswerBridges.map((row) => String(row.id)));
+    const answerBridges = [
+      ...childAnswerBridges,
+      ...[...new Set(answerSubmissions.map((row) => String(row.answer_bridge_id)))]
+        .filter((id) => !projectedBridgeIds.has(id))
+        .map((id) => projectAnswerBridgeRecord(database, id))
+    ];
+    const projectedChildIds = new Set(childExecutions.map((row) => String(row.id)));
+    const answeringChildren = queryAllByIds(database, 'child_execution', 'id', answerBridges
+      .map((row) => String(row.child_execution_id))
+      .filter((id) => !projectedChildIds.has(id)));
     const queuedTurnIntentIds = new Set(queuedTurnIntents.map((row) => String(row.id)));
     const runtimeDeliveryIntentLinks = queryAllByIds(
       database,
@@ -1204,7 +1215,7 @@ export function executeClientProjectionSnapshot(
         processReceipts
       },
       subagentDeliverySummary: {
-        childExecutions,
+        childExecutions: [...childExecutions, ...answeringChildren],
         childExecutionParentLinks: childParentLinks,
         childExecutionTurnLinks: childTurnLinks,
         childExecutionActiveTurnLinks: childActiveLinks,

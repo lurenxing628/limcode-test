@@ -3265,10 +3265,19 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   const childParentLinks = snapshotArray(subagents, 'childExecutionParentLinks');
   const activeConversationId = snapshotField(window, 'conversationId')
     ?? (typeof window.conversationId === 'string' ? window.conversationId : undefined);
+  // A child whose answer was delivered here stays with that delivery's card, even when the tool
+  // call that started it is outside the window.
+  const deliveredSubmissionIds = new Set(snapshotArray(subagents, 'runtimeInboxItems').flatMap((inbox) =>
+    snapshotField(inbox, 'source_kind') === 'answer_submission' ? [snapshotField(inbox, 'source_id') ?? ''] : []));
+  const deliveredBridgeIds = new Set(snapshotArray(subagents, 'answerSubmissions').flatMap((submission) =>
+    deliveredSubmissionIds.has(snapshotRecordId(submission) ?? '') ? [snapshotField(submission, 'answer_bridge_id') ?? ''] : []));
+  const answeringChildIds = new Set(snapshotArray(subagents, 'answerBridges').flatMap((bridge) =>
+    deliveredBridgeIds.has(snapshotRecordId(bridge) ?? '') ? [snapshotField(bridge, 'child_execution_id') ?? ''] : []));
   filterSnapshotArray(subagents, 'childExecutions', (child) => {
     const childId = snapshotRecordId(child);
     if (!childId) return false;
     if (activeConversationId && snapshotField(child, 'child_conversation_id') === activeConversationId) return true;
+    if (answeringChildIds.has(childId)) return true;
     return childParentLinks.some((link) =>
       snapshotField(link, 'child_execution_id') === childId
       && toolCallIds.has(snapshotField(link, 'source_tool_call_id') ?? '')
