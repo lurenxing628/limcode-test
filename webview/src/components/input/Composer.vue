@@ -1042,8 +1042,14 @@ function middleEllipsis(value: string, maxLength: number): string {
             </template>
           </SettingsDropdown>
         </template>
+        <SessionThinkingControl
+          v-if="clientState.currentConversationId"
+          :conversation-id="clientState.currentConversationId"
+          :config="confirmedChannelConfig"
+          :model="confirmedEffectiveModel?.model"
+        />
         <template v-if="workEnvironmentSwitchingEnabled && (workEnvironmentOptions.length || workEnvironmentSelection.error)">
-          <HoverTooltipPanel :panel-title="frozenWorkEnvironmentSelection ? '下一回合工作目录' : '工作目录'" :rows="[{ label: '目录', value: workEnvironmentDescription }]">
+          <HoverTooltipPanel class="composer-work-environment-trigger" :panel-title="frozenWorkEnvironmentSelection ? '下一回合工作目录' : '工作目录'" :rows="[{ label: '目录', value: workEnvironmentDescription }]">
             <SettingsDropdown
               v-model="activeWorkEnvironmentId"
               class="composer-meta-dropdown composer-work-environment-dropdown"
@@ -1065,15 +1071,9 @@ function middleEllipsis(value: string, maxLength: number): string {
         >
           <span class="composer-work-directory" :class="{ 'has-error': displayedWorkEnvironmentSelection.error }" tabindex="0">
             <IconFolder :size="12" aria-hidden="true" />
-            {{ frozenWorkEnvironmentSelection ? '本回合：' : '' }}{{ displayedWorkEnvironmentLabel }}
+            {{ displayedWorkEnvironmentLabel }}
           </span>
         </HoverTooltipPanel>
-        <SessionThinkingControl
-          v-if="clientState.currentConversationId"
-          :conversation-id="clientState.currentConversationId"
-          :config="confirmedChannelConfig"
-          :model="confirmedEffectiveModel?.model"
-        />
       </div>
       <div class="composer-actions">
         <span
@@ -1459,28 +1459,16 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-meta-dropdown {
+  width: max-content;
+  max-width: 100%;
+  min-width: 0;
+  flex: 0 1 auto;
   --lc-dropdown-transform-origin: bottom left;
   --lc-dropdown-offset-y: 4px;
 }
 
-.composer-workflow-dropdown {
-  width: min(120px, 18vw);
-  min-width: 100px;
-}
-
-.composer-agent-dropdown {
-  width: min(120px, 19vw);
-  min-width: 80px;
-}
-
-.composer-channel-dropdown {
-  width: min(174px, 25vw);
-  min-width: 132px;
-}
-
-.composer-work-environment-dropdown {
-  width: min(210px, 32vw);
-  min-width: 130px;
+.composer-work-environment-trigger {
+  max-width: 100%;
 }
 
 .composer-meta-dropdown :deep(button.settings-dropdown-button) {
@@ -1505,11 +1493,6 @@ function middleEllipsis(value: string, maxLength: number): string {
   top: auto;
   bottom: calc(100% + 4px);
   width: 100%;
-}
-
-.composer-channel-dropdown {
-  width: min(174px, 25vw);
-  min-width: 132px;
 }
 
 .composer-channel-dropdown :deep(.settings-dropdown-panel) {

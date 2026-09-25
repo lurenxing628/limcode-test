@@ -80,7 +80,7 @@ test('built chat can read thinking, recover an expired save session, and send wi
     }, { T, state: createEmptyClientState() });
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     const thinking = page.locator('.session-thinking-dropdown');
-    await thinking.getByRole('button').filter({ hasText: '思考：跟随渠道（high）' }).waitFor();
+    await thinking.getByRole('button').filter({ hasText: '思考：高' }).waitFor();
     await page.locator('textarea').fill('browser regression message');
     await thinking.getByRole('button').click();
     await page.getByRole('option', { name: '中（medium）', exact: true }).click();
@@ -95,7 +95,7 @@ test('built chat can read thinking, recover an expired save session, and send wi
     await page.waitForFunction(() => !document.querySelector('.session-thinking-error'));
     await page.evaluate(() => window.replaceHost());
     await page.waitForFunction(T => window.requests.some(r => r.type === T.ModelProfileScopeRead && r.clientId === 'host-b'), T);
-    await thinking.getByRole('button').filter({ hasText: '思考：跟随渠道（high）' }).waitFor();
+    await thinking.getByRole('button').filter({ hasText: '思考：高' }).waitFor();
     await send.click();
     await page.waitForFunction(T => window.requests.some(r => r.type === T.TurnStart), T);
     const requests = await page.evaluate(() => window.requests);
@@ -103,6 +103,26 @@ test('built chat can read thinking, recover an expired save session, and send wi
     assert.equal(sent.payload.model, undefined, 'a thinking-only profile must not pin its old model');
     assert.equal(sent.clientId, 'host-b');
     assert.equal(requests.filter(r => r.type === T.ModelProfileScopeSet).length, 1, 'recovery must not silently replay failed writes');
+    await page.setViewportSize({ width: 1200, height: 800 });
+    const expanded = await page.evaluate(() => {
+      const selectors = [...document.querySelectorAll('.composer-meta .composer-meta-dropdown, .composer-meta .session-thinking-dropdown')];
+      return selectors.map((selector, index) => {
+        const label = selector.querySelector('.settings-dropdown-label');
+        const before = selector.getBoundingClientRect().width;
+        label.textContent = `比较长的配置名称示例${index}继续显示完整名称`;
+        return { before, after: selector.getBoundingClientRect().width, visible: label.clientWidth, content: label.scrollWidth };
+      });
+    });
+    assert.ok(expanded.length >= 3, '工作流、渠道、思考强度下拉框必须在输入栏中');
+    assert.ok(expanded.some(item => item.after > item.before + 20), '按钮宽度应随选中名称增长');
+    assert.ok(expanded.every(item => item.visible + 1 >= item.content), '宽面板应完整显示选中名称');
+    await page.setViewportSize({ width: 360, height: 800 });
+    const narrow = await page.evaluate(() => {
+      const meta = document.querySelector('.composer-meta').getBoundingClientRect();
+      return [...document.querySelectorAll('.composer-meta .composer-meta-dropdown, .composer-meta .session-thinking-dropdown')]
+        .map(selector => { const rect = selector.getBoundingClientRect(); return rect.left >= meta.left - 1 && rect.right <= meta.right + 1; });
+    });
+    assert.ok(narrow.every(Boolean), '窄窗口可换行，但下拉框不能越出输入栏');
     assert.deepEqual(errors, []);
   } catch (error) {
     console.error('Browser diagnostics:', errors, await page?.locator('body').innerText(), await page?.evaluate(() => window.requests));

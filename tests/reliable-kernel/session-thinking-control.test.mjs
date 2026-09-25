@@ -69,6 +69,13 @@ test('Composer renders one thinking control beside model/workspace selectors, wi
   assert.ok(elements(row).includes(controls[0]));
   assert.match(source, /activateScope\('conversation', conversationId\)/);
   assert.match(source, /:model="confirmedEffectiveModel\?\.model/);
+  assert.doesNotMatch(source, /本回合：/, '工作目录旁直接显示目录名称');
+  const meta = elements(row);
+  const thinkingPosition = meta.indexOf(controls[0]);
+  const directoryDropdownPosition = meta.findIndex(node => attribute(node, 'class')?.includes('composer-work-environment-dropdown'));
+  const directoryLabelPosition = meta.findIndex(node => attribute(node, 'class')?.includes('composer-work-directory'));
+  assert.ok(thinkingPosition < directoryDropdownPosition && thinkingPosition < directoryLabelPosition,
+    '思考强度排在可切换或只读工作目录之前');
 });
 
 test('Thinking UI is one dropdown whose panel footer holds the child-inheritance checkbox, plus an inline retry', () => {
@@ -88,16 +95,16 @@ test('Thinking UI is one dropdown whose panel footer holds the child-inheritance
   assert.doesNotMatch(source, /ModelProfileSaveStatus|应用|放弃草稿|重新接入/);
 });
 
-test('Default option says it follows the channel and shows the value the channel sends', () => {
+test('Default option identifies channel defaults, while the button shows the effective strength', () => {
   const f = fixture();
-  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：未设置（由服务决定）');
+  assert.equal(f.control.defaultLabel.value, '渠道默认：未设置（由服务决定）');
   assert.equal(f.control.selected.value, 'default');
-  assert.equal(f.control.options.value[0].buttonLabel, '思考：跟随渠道');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：由服务决定');
   f.props.config.generationConfig = { thinkingConfig: { thinkingLevel: 'high' } };
-  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：high');
-  assert.equal(f.control.options.value[0].buttonLabel, '思考：跟随渠道（high）');
+  assert.equal(f.control.defaultLabel.value, '渠道默认：high');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：高');
   f.props.config.modelConfigs = [{ modelId: 'o3', generationConfig: {} }];
-  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：未设置（由服务决定）', 'model config replaces channel defaults');
+  assert.equal(f.control.defaultLabel.value, '渠道默认：未设置（由服务决定）', 'model config replaces channel defaults');
 });
 
 test('Level options read as plain Chinese with the wire value in brackets; the button marks child inheritance', () => {
@@ -116,12 +123,13 @@ test('Level options read as plain Chinese with the wire value in brackets; the b
 
 test('Budget defaults remain visible; unknown and unsupported model shortcuts remain disabled', () => {
   const f = fixture({ props: { model: 'gemini-2.5-flash', config: { id: 'gemini', provider: 'gemini', modelConfigs: [], generationConfig: { thinkingConfig: { thinkingBudget: 1024 } } } } });
-  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：1024 tokens');
+  assert.equal(f.control.defaultLabel.value, '渠道默认：1024 tokens');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：1024 tokens');
   assert.equal(f.control.options.value.find(option => option.value === '2048').label, '思考预算 2048 tokens');
   for (const [model, label] of [
-    ['gemini-2.0-flash', '跟随渠道设置：能力未确认 · 1024 tokens'],
-    ['gemini-9-flash', '跟随渠道设置：能力未确认 · 1024 tokens'],
-    ['unknown-relay', '跟随渠道设置：不支持（不发送）']
+    ['gemini-2.0-flash', '渠道默认：能力未确认 · 1024 tokens'],
+    ['gemini-9-flash', '渠道默认：能力未确认 · 1024 tokens'],
+    ['unknown-relay', '渠道默认：不支持（不发送）']
   ]) {
     f.props.model = model;
     assert.equal(f.control.defaultLabel.value, label);
@@ -196,7 +204,7 @@ test('Mounted template binds dropdown change and checkbox checked/change to the 
     f.state.inherit = false;
     await vue.nextTick();
     assert.equal(mounted.find('select')[0].props.disabled, true);
-    assert.equal(mounted.find('option')[0].text, '跟随渠道设置：未设置（由服务决定）');
+    assert.equal(mounted.find('option')[0].text, '渠道默认：未设置（由服务决定）');
   } finally { mounted.dispose(); }
 });
 
@@ -283,7 +291,7 @@ test('A stale override on a model without options can still be reset; the child 
 
 test('Following the channel does not claim child Agents use a session choice', () => {
   const f = fixture({ state: { inherit: true } });
-  assert.equal(f.control.displayOptions.value.find(option => option.value === 'default').buttonLabel, '思考：跟随渠道');
+  assert.equal(f.control.displayOptions.value.find(option => option.value === 'default').buttonLabel, '思考：由服务决定');
   assert.equal(f.control.displayOptions.value.find(option => option.value === 'high').buttonLabel, '思考：高 · 含子 Agent');
 });
 
@@ -309,8 +317,15 @@ test('OpenAI 兼容渠道的选项按渠道配置计算：硅基流动的 DeepSe
 test('The channel default label shows the value actually sent on OpenAI-compatible channels', () => {
   const model = 'deepseek-v4-pro';
   const f = fixture({ props: { model, config: { id: 'channel', provider: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', model, models: [{ id: model, name: model }], modelConfigs: [], generationConfig: { thinkingConfig: { thinkingLevel: 'medium' } } } } });
-  assert.equal(f.control.defaultLabel.value, '跟随渠道设置：medium，实际发 high');
-  assert.equal(f.control.options.value[0].buttonLabel, '思考：跟随渠道（medium，实际发 high）');
+  assert.equal(f.control.defaultLabel.value, '渠道默认：medium，实际发 high');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：高');
+});
+
+test('适配器降低强度时，按钮显示实际发送的强度', () => {
+  const model = 'gpt-6-sol';
+  const f = fixture({ props: { model, config: { id: 'responses', provider: 'openai-responses', model, modelConfigs: [], generationConfig: { thinkingConfig: { thinkingLevel: 'minimal' } } } } });
+  assert.equal(f.control.defaultLabel.value, '渠道默认：low（适配器）');
+  assert.equal(f.control.options.value[0].buttonLabel, '思考：低');
 });
 
 test('xhigh reads 极高, the same word the channel editor uses', () => {

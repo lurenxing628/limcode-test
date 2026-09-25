@@ -31,10 +31,17 @@ const disabled = computed(() => !ready.value || busy.value || (!capability.value
 const channelValue = computed(() => props.config && props.model
   ? sessionThinkingDisplayLabel(props.config.provider, props.model, settings.value?.generationConfig?.thinkingConfig, props.config)
   : '');
-const defaultLabel = computed(() => props.config && props.model ? `跟随渠道设置：${channelValue.value}` : '正在读取渠道设置');
+const defaultLabel = computed(() => props.config && props.model ? `渠道默认：${channelValue.value}` : '正在读取渠道设置');
 const LEVEL_NAMES: Record<string, string> = {
   none: '关闭思考', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高'
 };
+/** 输入栏只显示实际强度；来源及适配说明留在下拉选项里。 */
+const channelButtonValue = computed(() => {
+  const value = channelValue.value;
+  const effectiveLevel = value.match(/(?:^|，实际发 )(none|minimal|low|medium|high|xhigh|max)(?:（适配器）)?$/)?.[1];
+  return effectiveLevel === 'none' ? '关闭' : effectiveLevel ? LEVEL_NAMES[effectiveLevel]
+    : value === UNSET_THINKING_LABEL ? '由服务决定' : value || '读取中';
+});
 const INACTIVE_VALUE = 'saved-inactive';
 const selected = computed(() => {
   if (inactiveOverride.value) return INACTIVE_VALUE;
@@ -53,16 +60,16 @@ const options = computed<SettingsDropdownOption[]>(() => {
   const result: SettingsDropdownOption[] = [{
     value: 'default',
     label: defaultLabel.value,
-    buttonLabel: channelValue.value && channelValue.value !== UNSET_THINKING_LABEL ? `思考：跟随渠道（${channelValue.value}）` : '思考：跟随渠道',
+    buttonLabel: `思考：${channelButtonValue.value}`,
     description: '使用渠道或模型高级配置里的设置'
   }];
   if (inactiveOverride.value) {
-    // 单独列出不生效的旧覆盖：再选“跟随渠道”时值确实改变，才会真正清掉它。
+    // 单独列出不生效的旧覆盖：再选“渠道默认”时值确实改变，才会真正清掉它。
     result.push({
       value: INACTIVE_VALUE,
       label: `已保存：${savedValueLabel()}（当前不生效）`,
       buttonLabel: `思考：已保存的${savedValueLabel()}不生效`,
-      description: `${inactiveOverride.value.reason}选择“跟随渠道”即可清除。`,
+      description: `${inactiveOverride.value.reason}选择“渠道默认”即可清除。`,
       disabled: true
     });
   }
@@ -104,7 +111,7 @@ const displayOptions = computed(() => inheritChildren.value
   : options.value);
 const hint = computed(() => [
   '这个对话使用的思考强度，下一次请求开始生效，不影响其他对话。',
-  `“跟随渠道”即渠道或模型高级配置里的值，当前是：${channelValue.value || '读取中'}。`,
+  `渠道默认来自渠道或模型高级配置，当前是：${channelValue.value || '读取中'}。`,
   ...(inactiveOverride.value ? [inactiveOverride.value.reason || INACTIVE_SESSION_THINKING_NOTICE] : []),
   inheritChildren.value ? '这个对话派出的子 Agent 也使用这里的选择。' : '子 Agent 按它自己的 Agent 设置。'
 ].join('\n'));
@@ -188,8 +195,8 @@ function retry(): void {
 
 <style scoped>
 .session-thinking-control { display: inline-flex; align-items: center; flex-wrap: nowrap; gap: 6px; min-width: 0; max-width: 100%; }
-/* Sized by its label (up to 260px) so the chosen strength stays readable; longer labels end with an ellipsis. */
-.session-thinking-dropdown { width: max-content; max-width: min(260px, 100%); min-width: 96px; --lc-dropdown-transform-origin: bottom left; --lc-dropdown-offset-y: 4px; }
+/* The button follows the chosen label and only truncates when the whole selector reaches its container edge. */
+.session-thinking-dropdown { width: max-content; max-width: 100%; min-width: 0; --lc-dropdown-transform-origin: bottom left; --lc-dropdown-offset-y: 4px; }
 /* Same quiet look as the neighbouring Agent / channel / directory selectors in the composer. */
 .session-thinking-dropdown :deep(button.settings-dropdown-button) {
   min-height: 24px; padding: 2px 6px; border-color: transparent; background: transparent;
