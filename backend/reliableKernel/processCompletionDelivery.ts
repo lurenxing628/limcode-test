@@ -25,6 +25,8 @@ const DEFAULT_CLAIM_TTL_MS = 30_000;
 const DEFAULT_RETRY_BASE_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 60_000;
 const DEFAULT_MAX_FAILURE_COUNT = 8;
+/** One authority re-decision per wake before an unchanged delivery counts as a failed wake. */
+const WAKE_RECONCILE_ATTEMPTS = 2;
 
 export type ProcessCompletionWakeAction =
   | 'resume_current_turn'
@@ -815,19 +817,8 @@ export class ProcessCompletionDeliveryControlPlane {
       'RuntimeInboxPayloadLink.content_object_id'
     );
     const source = await this.resolveWakeSource(inbox, delivery, contentObjectId);
-    let reconciled: Awaited<ReturnType<AutomaticRuntimeDeliveryRouter['reconcilePendingDelivery']>>;
-    try {
-      reconciled = await this.automaticDeliveryRouter.reconcilePendingDelivery({
-        deliveryId: requirePhaseFId(delivery.id, 'RuntimeDelivery.id'),
-        targetConversationId: source.conversationId,
-        sourceTurnId: source.sourceTurnId
-      });
-    } catch (error) {
-      // The delivery or its authority moved between the read and the CAS (absorbed by the running
-      // Turn, retargeted by its terminal commit). That is a race, not a failed wake: rescan now.
-      if (isTransactionAssertionFailure(error)) return 'deferred';
-      throw error;
-    }
+    const reconciled = await this.reconcileWakeDelivery(delivery, source);
+    if (reconciled === 'deferred') return 'deferred';
     delivery = reconciled.delivery;
     if (delivery.state === 'failed') {
       await this.deadLetterClaim('RuntimeDeliveryWake', wakeInput, boundedError(
@@ -874,6 +865,33 @@ export class ProcessCompletionDeliveryControlPlane {
     });
     if (!result.acknowledged) return 'retry';
     return this.acknowledgeWake(wakeInput);
+  }
+
+  /**
+   * Revalidates the claimed delivery under fresh authority. When the delivery itself moved between
+   * the read and the CAS (absorbed by the running Turn, retargeted by its terminal commit) it is a
+   * race, not a failed wake: the caller rescans now. When only its authority moved, it decides once
+   * more from fresh facts; an authority that keeps failing the CAS is a real failure and goes
+   * through failure counting and dead-letter.
+   */
+  private async reconcileWakeDelivery(
+    delivery: DomainRow,
+    source: { conversationId: string; sourceTurnId: string | null }
+  ): Promise<Awaited<ReturnType<AutomaticRuntimeDeliveryRouter['reconcilePendingDelivery']>> | 'deferred'> {
+    const deliveryId = requirePhaseFId(delivery.id, 'RuntimeDelivery.id');
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.automaticDeliveryRouter.reconcilePendingDelivery({
+          deliveryId,
+          targetConversationId: source.conversationId,
+          sourceTurnId: source.sourceTurnId
+        });
+      } catch (error) {
+        if (!isTransactionAssertionFailure(error)) throw error;
+        if (deliveryRowChanged(delivery, await this.requireExisting('RuntimeDelivery', deliveryId))) return 'deferred';
+        if (attempt >= WAKE_RECONCILE_ATTEMPTS) throw error;
+      }
+    }
   }
 
   private async acknowledgeWake(claim: DomainRow): Promise<'acknowledged'> {
@@ -1415,6 +1433,14 @@ function addMilliseconds(timestamp: string, milliseconds: number): string {
 function retryDelay(attempt: bigint, baseMilliseconds: number): number {
   const exponent = Number(attempt > 6n ? 6n : attempt > 0n ? attempt - 1n : 0n);
   return Math.min(MAX_RETRY_DELAY_MS, baseMilliseconds * (2 ** exponent));
+}
+
+/** A delivery row moved on by another commit (state, destination or revision), not merely re-read. */
+function deliveryRowChanged(before: DomainRow, after: DomainRow): boolean {
+  return before.state !== after.state
+    || before.phase !== after.phase
+    || before.target_turn_id !== after.target_turn_id
+    || before.updated_at !== after.updated_at;
 }
 
 function isTransactionAssertionFailure(error: unknown): boolean {

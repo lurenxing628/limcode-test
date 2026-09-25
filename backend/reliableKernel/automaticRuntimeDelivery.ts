@@ -582,10 +582,14 @@ export class AutomaticRuntimeDeliveryRouter {
     }));
     const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
     const childExecutionId = requireId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+    // Only the bridge's current answer may continue a stopped parent. A later generation of the
+    // child superseded this one for good; the decision freezes exactly the value it read.
+    const current = bridge.current_submission_id === sourceId;
     steps.push(DOMAIN_REPOSITORIES.domain('AnswerBridge').assert(answerBridgeId, {
       child_execution_id: childExecutionId,
-      current_submission_id: sourceId
+      current_submission_id: bridge.current_submission_id
     }));
+    if (!current) return { continueAfterStoppedSource: false, steps };
     const parentLinks = await this.list('ChildExecutionParentLink', {
       child_execution_id: childExecutionId
     }, 2);
