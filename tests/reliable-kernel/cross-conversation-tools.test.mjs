@@ -119,7 +119,11 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     },
     /** Restarts the window: a new Host opens the same Runtime and recovers it. */
     async reopen() {
+      // Same order as the product Host: stop scheduling, hand off in-flight work, let every
+      // drive settle, and only then close the database underneath it.
       runner.dispose();
+      await app.beginHandoff();
+      await runner.waitForIdle();
       await coordinator.dispose();
       await app.close();
       await open();
@@ -192,7 +196,8 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
       modelProfiles: childConversationModelProfiles(configuration.mutations),
       deliveryWakeups: app.processDeliveries, ownedProcessCleanup: app.childOwnedProcessCleanup
     });
-    runner = new ReliableConversationRunner(app, 'synthetic-cross-owner');
+    runner = new ReliableConversationRunner(app, 'synthetic-cross-owner',
+      (error, context) => errors.push(new Error(`Runner ${context.operation} failed: ${error?.stack ?? error}`)));
     const wake = productionWake = createRuntimeDeliveryWakeHandler({ application: () => app, conversations: () => runner, children: () => coordinator });
     app.processDeliveries.setWakeHandler(async request => { wakes.push(structuredClone(request)); await wakeGate?.(request); return wake(request); });
   }
@@ -229,9 +234,15 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     };
     await app.recover();
     await run(f);
+    // Settle every drive/watch before judging: a write after the database closes is a failure too.
+    runner.dispose();
+    await app.beginHandoff();
+    await runner.waitForIdle();
     assert.deepEqual(errors, []);
   } finally {
     runner?.dispose();
+    if (app) await app.beginHandoff();
+    await runner?.waitForIdle();
     if (coordinator) await coordinator.dispose();
     if (app) await app.close();
     await fs.rm(root, { recursive: true, force: true });
