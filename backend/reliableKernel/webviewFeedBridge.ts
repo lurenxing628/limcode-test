@@ -506,8 +506,8 @@ export class ReliableKernelWebviewFeedBridge {
       if (message.type === RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE) {
         const request = normalizeSnapshotRequest(message);
         if (request.sessionId && request.sessionId !== connection.sessionId) return true;
-        // Renderer refresh requests cannot retarget a panel behind its retained owner reference.
-        // Conversation navigation goes through the host's claim-before-open path instead.
+        // Renderer refresh requests cannot retarget a panel behind its Conversation binding.
+        // Conversation navigation goes through the host's panel opening path instead.
         this.feed.requestSnapshot(
           connection.sessionId,
           client.meta.conversationId ?? null

@@ -214,7 +214,6 @@ async function withRuntime(run) {
         });
       },
       async turn(conversationId, text) {
-        await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
         const input = await app.turns.input({
           source: { kind: 'command', key: `${conversationId}:${text}:${requests.length}` }, conversationId,
           leaseOwnerId: 'gemini-fixture-owner', hostBootId: app.database.hostBootId,

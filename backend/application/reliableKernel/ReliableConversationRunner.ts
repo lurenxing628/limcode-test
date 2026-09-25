@@ -803,15 +803,17 @@ export class ReliableConversationRunner {
     reason: string;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    return this.conversationOwners.run(input.conversationId, async () => {
-      const result = await this.application.turns.interrupt({
-        source: { kind: 'command', key: input.commandId },
-        turnId: input.turnId,
-        ...(input.expectedLeaseGeneration
-          ? { expectedLeaseGeneration: input.expectedLeaseGeneration }
-          : {}),
-        reason: input.reason
-      });
+    const result = await this.application.turns.requestExternalInterrupt(input.conversationId, {
+      source: { kind: 'command', key: input.commandId },
+      turnId: input.turnId,
+      ...(input.expectedLeaseGeneration
+        ? { expectedLeaseGeneration: input.expectedLeaseGeneration }
+        : {}),
+      reason: input.reason
+    });
+    // The sender may be a passive observer of another live Host. Only a locally owned Turn can
+    // be driven/cancelled here; its owner sees the durable interrupt in the external wake poll.
+    if (this.conversationOwners.owns(input.conversationId)) {
       this.scheduleDrive(input.conversationId, input.turnId);
       void this.cancelLocalExecution(input.conversationId, input.turnId, input.reason).catch((error) => {
         this.onError(error, {
@@ -820,8 +822,8 @@ export class ReliableConversationRunner {
           turnId: input.turnId
         });
       });
-      return result;
-    });
+    }
+    return result;
   }
 
   public async waitForIdle(): Promise<void> {

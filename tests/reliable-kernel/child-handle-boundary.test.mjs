@@ -71,7 +71,6 @@ test('a fork lists inherited child refs as not operable and names the source whe
     const [bridge] = await h.rows('AnswerBridge', { child_execution_id: child.id });
 
     const fork = await h.forkParent();
-    await h.app.database.conversationOwners.retain(fork, 'fixture-fork-panel');
     const result = await h.app.agentLoop.runInput(h.input(fork, 'operate-inherited-child'));
     assert.equal(result.terminalStatus, 'completed');
     const [first] = h.requests.filter(request => request.conversationId === fork);
@@ -177,7 +176,6 @@ async function withForkedChildHistory(run) {
     const input = (conversationId, key) => ({ source: { kind: 'command', key }, conversationId,
       leaseOwnerId: 'fork-child-owner', hostBootId: app.database.hostBootId,
       leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(), content: key });
-    await app.database.conversationOwners.retain('parent', 'fixture-parent-panel');
     assert.equal((await app.agentLoop.runInput(input('parent', 'delegate'))).terminalStatus, 'completed');
     await coordinator.waitForIdle();
     assert.equal((await app.agentLoop.runInput(input('parent', 'after-child'))).terminalStatus, 'completed');

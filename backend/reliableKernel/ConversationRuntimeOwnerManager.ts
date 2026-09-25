@@ -118,7 +118,6 @@ interface OwnedConversation {
   readonly conversationId: string;
   readonly claimPath: string;
   readonly ownerToken: string;
-  readonly references: Set<string>;
   pins: number;
 }
 
@@ -126,8 +125,8 @@ interface OwnedConversation {
  * Durable single-owner registry for Conversations on one shared Runtime root. Distinct from
  * ExecutionLease: ownership identifies the one Runtime Host allowed to drive/mutate a
  * conversation and is only ever taken over from a definitely dead or reused process identity —
- * never because of elapsed time. Local references (panel views) and activity pins (commands,
- * drives) delay idle release; a conservative pending-work probe guards the durable gaps.
+ * never because of elapsed time. Activity pins (commands, drives) delay idle release; a
+ * conservative pending-work probe guards the durable gaps. Passive views do not own a writer.
  */
 export class ConversationRuntimeOwnerManager {
   private readonly paths: RuntimeRootPaths;
@@ -155,7 +154,7 @@ export class ConversationRuntimeOwnerManager {
     }
   }
 
-  /** Local owned-set membership; stable while any reference or pin is held for the conversation. */
+  /** Local owned-set membership, stable while an activity pin or durable work is present. */
   public owns(conversationId: string): boolean {
     return this.owned.has(conversationId);
   }
@@ -188,8 +187,7 @@ export class ConversationRuntimeOwnerManager {
 
   /**
    * Claims the conversation and holds an activity pin for the whole callback, then releases the
-   * owner if it became idle. Pins are counted and independent from view references, so nested or
-   * overlapping runs and view dispose during a run can never drop ownership midway.
+   * owner if it became idle. Nested or overlapping runs cannot drop ownership midway.
    */
   public async run<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
@@ -210,37 +208,15 @@ export class ConversationRuntimeOwnerManager {
     }
   }
 
-  /** Claims the conversation and attaches one independent view reference (main or auxiliary). */
-  public async retain(conversationId: string, referenceId: string): Promise<void> {
-    const id = requireNonEmptyText(conversationId, 'conversationId');
-    const reference = requireNonEmptyText(referenceId, 'referenceId');
-    await this.enqueue(id, async () => {
-      const state = await this.claimLocked(id, 'throw');
-      state.references.add(reference);
-    });
-  }
-
-  /** Detaches one view reference; the owner is released immediately when nothing else retains it. */
-  public async release(conversationId: string, referenceId: string): Promise<void> {
-    const id = requireNonEmptyText(conversationId, 'conversationId');
-    const reference = requireNonEmptyText(referenceId, 'referenceId');
-    await this.enqueue(id, async () => {
-      const state = this.owned.get(id);
-      if (!state) return;
-      state.references.delete(reference);
-      await this.releaseIfIdleLocked(id);
-    });
-  }
-
   public async releaseIfIdle(conversationId: string): Promise<boolean> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
     return this.enqueue(id, () => this.releaseIfIdleLocked(id));
   }
 
-  /** Best-effort idle pass over every locally owned conversation with no references and no pins. */
+  /** Best-effort idle pass over locally owned conversations without activity pins. */
   public async sweepIdle(): Promise<void> {
     const candidates = [...this.owned.values()]
-      .filter((state) => state.references.size === 0 && state.pins === 0)
+      .filter((state) => state.pins === 0)
       .map((state) => state.conversationId);
     for (const id of candidates) {
       if (this.closed) return;
@@ -302,7 +278,7 @@ export class ConversationRuntimeOwnerManager {
 
   private async releaseIfIdleLocked(conversationId: string): Promise<boolean> {
     const state = this.owned.get(conversationId);
-    if (!state || state.references.size > 0 || state.pins > 0) return false;
+    if (!state || state.pins > 0) return false;
     let pending = true;
     try {
       pending = await this.pendingWorkProbe(conversationId);
@@ -349,7 +325,7 @@ export class ConversationRuntimeOwnerManager {
         CONVERSATION_RUNTIME_OWNER_RECORD_FILE,
         `${JSON.stringify(metadata)}\n`
       )) {
-        return { conversationId, claimPath, ownerToken: metadata.ownerToken, references: new Set(), pins: 0 };
+        return { conversationId, claimPath, ownerToken: metadata.ownerToken, pins: 0 };
       }
       const record = await this.readRecord(claimPath);
       if (!record) continue;

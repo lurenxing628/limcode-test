@@ -41,9 +41,9 @@ export class MainPanel {
   public static readonly viewType = MAIN_PANEL_VIEW_TYPE;
 
   private static readonly panels = new Map<string, MainPanel>();
-  /** In-flight claim-before-open per Conversation view identity; simultaneous opens share it. */
+  /** In-flight open per Conversation view identity; simultaneous opens share it. */
   private static readonly pendingConversationOpens = new Map<string, Promise<void>>();
-  /** Serializes the check-claim-register section across command, restore and navigation opens. */
+  /** Serializes local duplicate checks across command, restore and navigation opens. */
   private static readonly conversationOpenChains = new Map<string, Promise<void>>();
   private static readonly conversationPanelStateEmitter = new vscode.EventEmitter<void>();
   public static readonly onDidChangeConversationPanelState = MainPanel.conversationPanelStateEmitter.event;
@@ -57,8 +57,6 @@ export class MainPanel {
   private readonly conversationId?: string;
   private readonly toolCallId?: string;
   private readonly planProposalId?: string;
-  /** This view's independent Conversation owner reference; released only on dispose. */
-  private readonly ownerReferenceId?: string;
   private readonly disposables: vscode.Disposable[] = [];
 
   public static registerSerializer(context: vscode.ExtensionContext, startup: ApplicationStartup): void {
@@ -76,7 +74,7 @@ export class MainPanel {
               startupDispose.dispose();
               return;
             }
-            await MainPanel.claimRestoredConversationPanel(
+            await MainPanel.restoreConversationPanel(
               webviewPanel,
               context.extensionUri,
               backendApp,
@@ -98,12 +96,10 @@ export class MainPanel {
   }
 
   /**
-   * Restored Conversation views join the same per-Conversation open section as live opens: an
-   * already-live main chat panel is adopted (the restored duplicate closes), otherwise the
-   * restored view retains the Conversation owner before it revives. Every failure path either
-   * leaves the reference held by the revived view or releases it; nothing leaks.
+   * Restored views join the same local open section as live opens. Views only observe committed
+   * facts: a different Host driving this Conversation must never make its panel unavailable.
    */
-  private static async claimRestoredConversationPanel(
+  private static async restoreConversationPanel(
     webviewPanel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
@@ -129,24 +125,9 @@ export class MainPanel {
         webviewPanel.dispose();
         return;
       }
-      const referenceId = createMessageId();
-      try {
-        await backendApp.retainConversation(conversationId, referenceId);
-      } catch (error) {
-        if (!isDisposed()) MainPanel.renderUnavailable(webviewPanel, MainPanel.conversationOpenFailureMessage(error));
-        return;
-      }
       // A restore blocked behind a queued open may already have been closed by the user.
-      if (isDisposed()) {
-        await backendApp.releaseConversation(conversationId, referenceId);
-        return;
-      }
-      try {
-        MainPanel.revive(webviewPanel, extensionUri, backendApp, options, referenceId);
-      } catch (error) {
-        await backendApp.releaseConversation(conversationId, referenceId);
-        throw error;
-      }
+      if (isDisposed()) return;
+      MainPanel.revive(webviewPanel, extensionUri, backendApp, options);
       if (options.conversationId) {
         MainPanel.scheduleRestoredTitleRefresh(backendApp, options.conversationId);
       }
@@ -183,11 +164,8 @@ export class MainPanel {
   }
 
   /**
-   * Opens or focuses a panel. Conversation views claim the Conversation Runtime owner BEFORE the
-   * panel exists: the main chat view is unique per Conversation in this Host regardless of the
-   * reuse flag, simultaneous opens of the same view identity share one in-flight Promise, and a
-   * failed claim reports a per-Conversation error without leaking the owner reference. Surfaces
-   * without a Conversation identity (settings kinds) never touch ownership.
+   * Opens or focuses a passive view. The main chat view is unique per Conversation in this Host;
+   * peer-owned Conversations remain viewable, and commands acquire ownership separately.
    */
   public static createOrShow(
     extensionUri: vscode.Uri,
@@ -234,7 +212,7 @@ export class MainPanel {
     const pending = MainPanel.pendingConversationOpens.get(flightKey);
     if (pending) return pending;
     const open = MainPanel.enqueueConversationOpen(conversationId, () =>
-      MainPanel.openClaimedConversationPanel(extensionUri, backendApp, options, conversationId, column)
+      MainPanel.openConversationPanel(extensionUri, backendApp, options, conversationId, column)
     );
     MainPanel.pendingConversationOpens.set(flightKey, open);
     const cleanup = () => {
@@ -274,7 +252,7 @@ export class MainPanel {
     return current;
   }
 
-  private static async openClaimedConversationPanel(
+  private static async openConversationPanel(
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
     options: MainPanelOptions,
@@ -290,28 +268,22 @@ export class MainPanel {
       MainPanel.notifyConversationPanelStateChanged();
       return;
     }
-    const referenceId = createMessageId();
     let panel: vscode.WebviewPanel | undefined;
     try {
-      await backendApp.retainConversation(conversationId, referenceId);
       panel = vscode.window.createWebviewPanel(
         MainPanel.viewType,
         panelTitle(options, backendApp),
         column,
         MainPanel.webviewPanelOptions(extensionUri, kind)
       );
-      MainPanel.revive(panel, extensionUri, backendApp, options, referenceId);
+      MainPanel.revive(panel, extensionUri, backendApp, options);
     } catch (error) {
       panel?.dispose();
-      await backendApp.releaseConversation(conversationId, referenceId);
       void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: ${MainPanel.conversationOpenFailureMessage(error)}`);
     }
   }
 
   private static conversationOpenFailureMessage(error: unknown): string {
-    // A busy Conversation is the only expected refusal: another window owns exactly that
-    // Conversation while the rest of this window keeps working.
-    if (isConversationRuntimeOwnerBusyError(error)) return error.message;
     console.error('[LimCode] Failed to open conversation panel.', error);
     return `无法打开对话：${error instanceof Error ? error.message : String(error)}`;
   }
@@ -320,12 +292,21 @@ export class MainPanel {
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
-    options: MainPanelOptions = {},
-    ownerReferenceId?: string
+    options: MainPanelOptions = {}
   ): void {
-    const instance = new MainPanel(panel, extensionUri, backendApp, options, ownerReferenceId);
+    const instance = new MainPanel(panel, extensionUri, backendApp, options);
     MainPanel.panels.set(instance.panelId, instance);
     MainPanel.notifyConversationPanelStateChanged();
+    // Recovery is optional and never blocks a peer-owned view. A dead Host may have exited after
+    // startup recovery, so opening a view also attempts scoped takeover in the background.
+    const conversationId = instance.conversationId;
+    if (conversationId) {
+      void Promise.resolve().then(() => backendApp.recoverConversation(conversationId)).catch((error: unknown) => {
+        if (!isConversationRuntimeOwnerBusyError(error)) {
+          console.warn('[LimCode] Scoped Conversation recovery after opening a view failed.', error);
+        }
+      });
+    }
   }
 
   private static webviewPanelOptions(
@@ -369,8 +350,7 @@ export class MainPanel {
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
-    options: MainPanelOptions,
-    ownerReferenceId?: string
+    options: MainPanelOptions
   ) {
     this.panel = panel;
     this.extensionUri = extensionUri;
@@ -380,7 +360,6 @@ export class MainPanel {
     this.conversationId = options.conversationId;
     this.toolCallId = options.toolCallId;
     this.planProposalId = options.planProposalId;
-    this.ownerReferenceId = ownerReferenceId;
 
     this.refreshTitle(options.title);
     this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri, this.kind);
@@ -438,12 +417,6 @@ export class MainPanel {
     MainPanel.panels.delete(this.panelId);
     MainPanel.notifyConversationPanelStateChanged();
     this.backendApp.detachWebview(this.clientId);
-    // Only dispose releases this view's owner reference; a hidden panel stays retained so its
-    // Conversation cannot idle-release to a peer Host while it is merely backgrounded.
-    if (this.conversationId && this.ownerReferenceId) {
-      void this.backendApp.releaseConversation(this.conversationId, this.ownerReferenceId);
-    }
-
     while (this.disposables.length) {
       const disposable = this.disposables.pop();
       disposable?.dispose();

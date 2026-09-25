@@ -37,15 +37,8 @@ export interface ApplicationFacade {
   forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult>;
   waitUntilHydrated(): Promise<void>;
   conversationExists(conversationId: string): Promise<boolean>;
-  /**
-   * Claims this Host as the Conversation Runtime owner for one view reference. Rejects with
-   * `conversation-runtime-owner-busy` when a live/unknown peer Host owns the Conversation. Each
-   * view (main or auxiliary) uses its own unique referenceId; hiding a view keeps the reference,
-   * only dispose may release it.
-   */
-  retainConversation(conversationId: string, referenceId: string): Promise<void>;
-  /** Best-effort release of one view reference; never fails a dispose path. */
-  releaseConversation(conversationId: string, referenceId: string): Promise<void>;
+  /** Best-effort scoped recovery after opening a passive Conversation view; a live peer may own it. */
+  recoverConversation(conversationId: string): Promise<void>;
   getConversationDisplayTitle(conversationId: string | undefined): string;
   renameConversationTitle(conversationId: string, title: string): Promise<boolean>;
   deleteConversation(conversationId: string): Promise<string[] | null>;

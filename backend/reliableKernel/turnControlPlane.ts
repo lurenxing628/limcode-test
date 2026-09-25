@@ -604,12 +604,12 @@ export class TurnControlPlane {
   }
 
   /**
-   * Conversation-runtime ownership boundary shared by every mutating command, admission and
-   * recovery entry below. A direct control-plane caller (child execution, delivery, recovery,
-   * tests) receives the same guard as the product Runner: a Conversation owned by a live or
-   * unknown peer Host rejects with ConversationRuntimeOwnerBusyError before any receipt or row
-   * is written, and the held activity pin covers the full read-check-write sequence so an idle
-   * release cannot race the mutation. Read-only facts/fence queries stay ungated.
+   * Conversation-runtime ownership boundary for ordinary mutating commands, admission and
+   * recovery. A direct control-plane caller (child execution, delivery, recovery, tests) gets
+   * the same guard as the product Runner: a Conversation owned by a live/unknown peer Host
+   * rejects before any receipt or row is written, and an activity pin covers read-check-write.
+   * The sole exception is requestExternalInterrupt: a fenced, durable interrupt request for the
+   * current owner to execute. Read-only facts/fence queries stay ungated.
    */
   private runOwnedConversationMutation<T>(
     conversationId: string,
@@ -750,6 +750,23 @@ export class TurnControlPlane {
       requireId(turn.conversation_id, 'Turn.conversation_id'),
       () => this.requestInterrupt(command)
     );
+  }
+
+  /**
+   * Only an interrupt *request* may cross a live Conversation owner. This commits a fenced,
+   * idempotent PendingTurnInput, never drives a Turn, changes an ExecutionLease or touches a
+   * foreign Host's local capabilities. The owner observes the durable input and cancels itself.
+   */
+  public async requestExternalInterrupt(
+    conversationId: string,
+    command: TurnInterruptCommand
+  ): Promise<TurnCommandResult> {
+    const id = requireId(conversationId, 'conversationId');
+    const turn = await this.getTurn(requireId(command.turnId, 'turnId'));
+    if (turn.conversation_id !== id) {
+      throw new Error('Turn interrupt target does not belong to the requested Conversation.');
+    }
+    return this.requestInterrupt(command);
   }
 
   public async terminal(command: TurnTerminalCommand): Promise<TurnCommandResult> {

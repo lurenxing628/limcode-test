@@ -606,9 +606,7 @@ export class ReliableChildAgentCoordinator {
   }): Promise<TurnCommandResult> {
     const childExecutionId = requireId(input.childExecutionId, 'childExecutionId');
     const turnId = requireId(input.turnId, 'turnId');
-    await this.dependencies.database.conversationOwners.assertOwned(
-      requireId(input.conversationId, 'conversationId')
-    );
+    const conversationId = requireId(input.conversationId, 'conversationId');
     const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
     if (
       memberships.length !== 1
@@ -616,7 +614,7 @@ export class ReliableChildAgentCoordinator {
     ) {
       throw new Error('Turn 不属于当前 ChildExecution 谱系。');
     }
-    const result = await this.dependencies.turns.interrupt({
+    const result = await this.dependencies.turns.requestExternalInterrupt(conversationId, {
       source: { kind: 'command', key: requireId(input.commandId, 'commandId') },
       turnId,
       ...(input.expectedLeaseGeneration
@@ -624,9 +622,11 @@ export class ReliableChildAgentCoordinator {
         : {}),
       reason: input.reason
     });
-    this.waitingOwned.delete(turnId);
-    await this.cancelLocalChildTurn(turnId, input.reason);
-    if (!result.ignoredBecauseTerminal) this.launch(childExecutionId, turnId);
+    if (this.dependencies.database.conversationOwners.owns(conversationId)) {
+      this.waitingOwned.delete(turnId);
+      await this.cancelLocalChildTurn(turnId, input.reason);
+      if (!result.ignoredBecauseTerminal) this.launch(childExecutionId, turnId);
+    }
     return result;
   }
 

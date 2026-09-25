@@ -96,6 +96,7 @@ docs/architecture/*
 !/tests/reliable-kernel/reliable-queue-ordering.test.mjs
 !/tests/reliable-kernel/webview-feed-lifecycle.test.mjs
 !/tests/reliable-kernel/panel-owner-lifecycle.test.mjs
+!/tests/reliable-kernel/sidebar-cross-host-abort.test.mjs
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs
 !/tests/reliable-kernel/provider-semantic-watchdog.test.mjs
 !/tests/reliable-kernel/llm-finish-reason.test.mjs

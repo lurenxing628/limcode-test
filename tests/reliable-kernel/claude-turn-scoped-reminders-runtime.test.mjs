@@ -173,7 +173,6 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, retryOnError
       },
       claude, openai,
       async turn(conversationId, text, expected = 'completed') {
-        await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
         const input = await app.turns.input({
           source: { kind: 'command', key: `${conversationId}:${text}:${requests.length}` }, conversationId,
           leaseOwnerId: 'reminder-fixture-owner', hostBootId: app.database.hostBootId,

@@ -153,8 +153,6 @@ async function withForkRuntime(run, {
       /** `whileClosed` runs with the Runtime database closed, for example to stage an older data shape. */
       async reopen(whileClosed) { await app.close(); await whileClosed?.(); await open(); },
       async start(conversationId, key, retry, message = {}) {
-        // Match claim-before-open: keep the panel's reference through the whole fake-provider turn.
-        await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
         const command = {
           source: { kind: 'command', key }, conversationId,
           leaseOwnerId: 'fork-fixture-owner', hostBootId: app.database.hostBootId,
@@ -766,7 +764,6 @@ async function assertForkableAfterRewrite(h, label, assertFork, compressedAway) 
   const refork = await h.facade.forkConversation(await h.command(fork.conversationId, `${label}-refork`));
   await assertFork(refork.conversationId);
 
-  await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
   assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
   const orphan = await h.facade.forkConversation(await h.command(fork.conversationId, `${label}-fork-after-delete`));
   await assertFork(orphan.conversationId);
@@ -1254,7 +1251,6 @@ test('fork_conversation of a source deleted after a crashed attempt is refused a
     const lifecycle = new ReliableConversationLifecycle({ application: h.app, configuration: h.configuration });
     const request = { sourceConversationId: 'source', commandId: 'fork-tool-call-source-deleted' };
     await copiedByCrashedAttempt(h, request.commandId);
-    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
     assert.deepEqual((await h.app.conversationDeletion.delete('source')).deletedConversationIds, ['source']);
     await assert.rejects(lifecycle.forkCompletedHistory(request),
       error => error instanceof kernel.ConversationForkRejectedError && /Fork 源 Conversation source 不存在/.test(error.message));
@@ -1533,7 +1529,6 @@ test('forks keep running, re-forking and child-forking after their tool-history 
   await withForkRuntime(async h => {
     await h.turn('source', 'deleted-source-tool-turn');
     const first = await h.facade.forkConversation(await h.command('source', 'fork-before-source-delete'));
-    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
     assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
     const [callSource] = await rows(h.app, 'ContextSegmentSource', { source_kind: 'tool_call' });
     assert.equal((await rows(h.app, 'ContextSegmentSource', { segment_id: callSource.segment_id })).length, 4,
@@ -1614,7 +1609,6 @@ test('a fork owns its compression blocks and keeps running, re-forking and child
     const forkMessageIds = (await rows(h.app, 'MessagePartOfConversation', { conversation_id: fork.conversationId })).map(row => row.message_id);
     assert.ok(forkMessageIds.includes(feed.compressionBlocks[0].anchor_message_id));
 
-    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
     assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
     assert.deepEqual(await rows(h.app, 'CompressionBlock', { id: sourceBlock.id }), []);
     await h.turn(fork.conversationId, 'fork-after-compressed-source-delete');
@@ -1726,7 +1720,6 @@ test('compression management acts only on the fork\'s own block, before and afte
     await h.turn('source', 'source-keeps-its-summary');
     assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /Offline managed summary/);
 
-    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
     assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
     const afterDelete = async () => Object.fromEntries(Object.entries(await statuses()).filter(([id]) => id !== 'source'));
     const secondBlock = await ownBlock(second);
@@ -1780,7 +1773,6 @@ test('the attachment catalog of a compressed fork reads only its own block, also
     for (const conversationId of ['source', first, second]) {
       assert.deepEqual(await catalog(conversationId), ['fork-attachment.png'], conversationId);
     }
-    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
     assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
     for (const conversationId of [first, second]) {
       assert.deepEqual(await catalog(conversationId), ['fork-attachment.png'], `${conversationId} after the source is deleted`);
@@ -1880,7 +1872,6 @@ test('forks keep the task panel and the approved plan of copied tool calls, also
       assert.deepEqual(await currentTaskItems(h.app, conversationId), expected, 'copied task calls keep the task panel');
     }
 
-    await h.app.database.conversationOwners.release('source', 'fixture-panel:source');
     assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
     for (const conversationId of [fork.conversationId, nested.conversationId]) {
       assert.deepEqual(await currentTaskItems(h.app, conversationId), expected, 'copied identity survives deleting the source');

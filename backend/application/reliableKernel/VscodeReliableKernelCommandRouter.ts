@@ -68,7 +68,7 @@ export interface VscodeReliableKernelCommandRouterOptions {
   openPlanProposal?(payload: { conversationId?: string; toolCallId?: string; planProposalId?: string; title?: string }): void;
   /**
    * The Conversation bound at attach time for one client. A feed may reconnect/resync only to
-   * this binding; in-panel navigation must go through the Host panel claim-before-open path.
+   * this binding; in-panel navigation must go through the Host panel opening path.
    */
   conversationIdForClient?(clientId: string): string | undefined;
 }
@@ -195,10 +195,9 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   /**
-   * Every Conversation-mutating command runs under the Conversation Runtime owner: this Host
-   * claims (or re-enters) ownership and pins it for the whole mutation, so a peer Host owning
-   * the Conversation rejects the command with `conversation-runtime-owner-busy` instead of
-   * racing it.
+   * Ordinary Conversation-mutating commands still acquire and pin the writer owner. Turn
+   * interruption is the only exception: it commits a fenced durable request for the owner to
+   * execute, without taking over its running capabilities.
    */
   private runConversationCommand<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
     return this.product.application.database.conversationOwners.run(conversationId, operation);
@@ -278,9 +277,9 @@ export class VscodeReliableKernelCommandRouter {
         const conversationId = message.payload?.conversationId?.trim();
         if (conversationId) {
           if (this.options.conversationIdForClient?.(clientId) !== conversationId) {
-            // A feed may never retarget to a Conversation this view does not own. Navigation
-            // belongs to the Host panel claim-before-open path, which panels intercept first.
-            throw new Error('该对话导航必须由宿主面板路径完成；当前视图未持有目标会话。');
+            // A feed may never retarget to a different Conversation than its bound view.
+            // Navigation belongs to the Host panel opening path, which panels intercept first.
+            throw new Error('该对话导航必须由宿主面板路径完成；当前视图未绑定目标会话。');
           }
           await this.product.application.webviewFeed.setActiveConversation(clientId, conversationId);
         }
@@ -291,7 +290,7 @@ export class VscodeReliableKernelCommandRouter {
         const bound = this.options.conversationIdForClient?.(clientId) ?? null;
         if (requested !== bound) {
           // A hidden/reconnecting session must not silently bind a Conversation other than the
-          // one its view reference owns; resync always re-attaches to the view binding.
+          // one its view was originally bound to; resync always re-attaches to that binding.
           console.warn('[LimCode] Ignored ClientResync Conversation mismatch; reconnecting to the bound Conversation.');
         }
         this.product.application.webviewFeed.reconnect(clientId, bound);
@@ -344,8 +343,8 @@ export class VscodeReliableKernelCommandRouter {
         await this.options.createConversation({
           ...(message.payload?.projectFolderUri?.trim() ? { projectFolderUri: message.payload.projectFolderUri.trim() } : {})
         });
-        // Navigation to the new Conversation belongs to the Host panel claim-before-open path.
-        // This view's feed is never retargeted behind panel ownership; the creating Webview
+        // Navigation to the new Conversation belongs to the Host panel opening path.
+        // This view's feed is never retargeted behind its Conversation binding; the creating Webview
         // reaches the new Conversation through the intercepted ConversationOpen navigation.
         return;
       }
@@ -1398,11 +1397,10 @@ export class VscodeReliableKernelCommandRouter {
     if (!Number.isSafeInteger(payload.leaseEpoch) || payload.leaseEpoch < 0) {
       throw new TypeError('Turn interrupt 缺少有效的 ExecutionLease generation。');
     }
-    await this.runConversationCommand(payload.conversationId, () =>
-      this.handleInterruptUnderOwnership(webview, correlationId, payload));
+    await this.handleInterruptRequest(webview, correlationId, payload);
   }
 
-  private async handleInterruptUnderOwnership(
+  private async handleInterruptRequest(
     webview: vscode.Webview,
     correlationId: string,
     payload: TurnInterruptPayload

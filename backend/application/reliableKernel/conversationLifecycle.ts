@@ -532,8 +532,8 @@ export class ReliableConversationLifecycle {
     // The branch target is claimed BEFORE its first write: this Host owns the new Conversation
     // through the configuration copy and the fork transaction. The id is derived from the fork
     // command identity so concurrent same-command calls deterministically claim the same target
-    // (and a peer's claim refuses busy) instead of forking divergent targets. The opening view
-    // retains it via claim-before-open; without a view the owner idle-releases after this run.
+    // (and a peer's claim refuses busy) instead of forking divergent targets. The owner
+    // idle-releases after this run if no runtime work remains; the opening view is passive.
     const targetTitle = `${await this.durableConversationTitle(sourceConversation)} 分支`;
     const result = await this.application.database.conversationOwners.run(targetConversationId, () =>
       this.application.runtime.conversationFork.fork({

@@ -155,6 +155,80 @@ test('多宿主在同一数据集并行推进不同 Conversation，外部提交�
   }
 });
 
+test('被动宿主可持久请求中断活宿主的 Turn，不能执行其它越权写入，收尾后自动让出', {
+  timeout: 180_000
+}, async () => {
+  const children = [];
+  const { outer, binding } = await createIsolatedRoot('remote-interrupt');
+  const conversationId = 'conversation-remote-interrupt';
+  const gatePath = path.join(outer, 'provider-gate');
+  let observer;
+  let runner;
+  try {
+    const driver = spawnTracked(children, 'turn-driver', binding.paths.dataRootPath, {
+      LIMCODE_OWNER_CONVERSATION: conversationId,
+      LIMCODE_OWNER_MARKER: '远端中断',
+      LIMCODE_OWNER_STARTED: path.join(outer, 'provider-started'),
+      LIMCODE_OWNER_GATE: gatePath,
+      LIMCODE_OWNER_RESULT: path.join(outer, 'driver-result.json')
+    });
+    await waitForFile(path.join(outer, 'provider-started'), 60_000);
+    observer = await kernel.ReliableKernelApplication.open(
+      new kernel.RootAuthority(() => binding.paths.dataRootPath),
+      ownerProofDependencies({ providerId: PROVIDER_ID, async sendFullRequest() {
+        assert.fail('被动宿主不得派发 Provider');
+      } })
+    );
+    runner = new ReliableConversationRunner(observer, `remote-interrupt:${observer.database.hostBootId}`);
+    const [turn] = await listRows(observer, 'Turn', { conversation_id: conversationId });
+    const [lease] = await listRows(observer, 'ExecutionLease', { turn_id: turn.id });
+    assert.equal(turn.status, 'active');
+    assert.equal(await observer.database.conversationOwners.tryClaim(conversationId), false,
+      '活宿主仍是唯一 writer');
+    await assert.rejects(observer.turns.interrupt({
+      source: { kind: 'command', key: 'foreign-ordinary-interrupt' },
+      turnId: turn.id, reason: '普通控制面仍必须有 owner'
+    }), { code: OWNER_BUSY_CODE });
+    await assert.rejects(runner.interrupt({
+      commandId: 'wrong-lease-generation', conversationId, turnId: turn.id,
+      expectedLeaseGeneration: String(BigInt(lease.generation) + 1n), reason: '不得误中断'
+    }), /generation was replaced/);
+    assert.equal((await listRows(observer, 'PendingTurnInput', { turn_id: turn.id })).length, 0);
+    await assert.rejects(observer.turns.requestExternalInterrupt('unrelated-conversation', {
+      source: { kind: 'command', key: 'wrong-conversation' }, turnId: turn.id, reason: '不得串会话'
+    }), /does not belong/);
+
+    const requested = await runner.interrupt({
+      commandId: 'remote-stop', conversationId, turnId: turn.id,
+      expectedLeaseGeneration: String(lease.generation), reason: '从另一窗口停止'
+    });
+    assert.ok(requested.pendingTurnInputId, '远端只提交持久中断请求');
+    assert.equal(observer.database.conversationOwners.owns(conversationId), false,
+      '提交请求不取得另一个宿主的 writer owner');
+    assert.equal((await listRows(observer, 'PendingTurnInput', { turn_id: turn.id })).length, 1);
+    await eventually(async () => (await listRows(observer, 'TurnTermination', { turn_id: turn.id }))[0]?.terminal_status === 'interrupted',
+      30_000, '活宿主未观察到持久中断并完成终态');
+    const duplicate = await runner.interrupt({
+      commandId: 'remote-stop', conversationId, turnId: turn.id,
+      expectedLeaseGeneration: String(lease.generation), reason: '相同命令重试'
+    });
+    assert.equal(duplicate.deduplicated, true, '重复请求只回放同一 receipt');
+    assert.equal((await listRows(observer, 'PendingTurnInput', { turn_id: turn.id })).length, 1);
+
+    await fs.writeFile(gatePath, 'release\n', 'utf8');
+    await waitForExit(driver, 120_000, true);
+    assert.equal(await observer.database.conversationOwners.tryClaim(conversationId), true,
+      '宿主收尾退出后另一个窗口无需关闭面板即可接管');
+    assert.equal(await observer.database.conversationOwners.releaseIfIdle(conversationId), true);
+  } finally {
+    await fs.writeFile(gatePath, 'release\n', 'utf8').catch(() => undefined);
+    runner?.dispose();
+    if (observer) await observer.close().catch(() => undefined);
+    await cleanupChildren(children);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 test('同一 Conversation 的跨进程并发 claim 只有一个胜者，同宿主并发 claim 单飞（所有权管理器作用域）', {
   timeout: 120_000
 }, async () => {
@@ -235,23 +309,15 @@ test('同一 Conversation 的跨进程并发 claim 只有一个胜者，同宿�
   }
 });
 
-test('同宿主引用去重、活动 pin 与空闲释放串行化（所有权管理器作用域）', { timeout: 120_000 }, async () => {
-  const { outer, binding } = await createIsolatedRoot('refs');
-  const manager = new ConversationRuntimeOwnerManager(binding, 'reference-host');
+test('活动 pin、并发调用与空闲释放串行化（所有权管理器作用域）', { timeout: 120_000 }, async () => {
+  const { outer, binding } = await createIsolatedRoot('pins');
+  const manager = new ConversationRuntimeOwnerManager(binding, 'pin-host');
   manager.setPendingWorkProbe(async () => false);
   try {
-    const referenced = 'conversation-referenced';
-    await manager.claim(referenced);
-    await manager.retain(referenced, 'view-main');
-    await manager.retain(referenced, 'view-main');
-    await manager.retain(referenced, 'view-aux');
-    assert.equal(await manager.releaseIfIdle(referenced), false, '任一视图引用都必须阻止空闲释放');
-    await manager.release(referenced, 'view-main');
-    assert.equal(await manager.releaseIfIdle(referenced), false, '辅助视图引用仍然保留所有权');
-    await manager.release(referenced, 'view-aux');
-    assert.equal(manager.owns(referenced), false,
-      '重复 retain 同一引用必须去重：每个独立引用只需释放一次，末次视图释放立即空闲释放');
-    await assert.rejects(manager.assertOwned(referenced),
+    const idle = 'conversation-idle';
+    await manager.claim(idle);
+    assert.equal(await manager.releaseIfIdle(idle), true, '被动视图不持有 owner；无活动工作应立即释放');
+    await assert.rejects(manager.assertOwned(idle),
       (error) => error?.code === OWNER_MISMATCH_CODE);
 
     const pinned = 'conversation-pinned';
@@ -259,7 +325,7 @@ test('同宿主引用去重、活动 pin 与空闲释放串行化（所有权管
       assert.equal(manager.owns(pinned), true);
       assert.equal(await manager.releaseIfIdle(pinned), false, '活动 pin 期间不得空闲释放');
     });
-    assert.equal(manager.owns(pinned), false, 'run 结束后无引用无待处理工作必须立即空闲释放');
+    assert.equal(manager.owns(pinned), false, 'run 结束后无待处理工作必须立即空闲释放');
 
     const nested = 'conversation-nested-pin';
     await manager.run(nested, () => manager.run(nested, async () => {
@@ -267,21 +333,27 @@ test('同宿主引用去重、活动 pin 与空闲释放串行化（所有权管
     }));
     assert.equal(manager.owns(nested), false);
 
-    const disposedMidRun = 'conversation-disposed-mid-run';
-    await manager.retain(disposedMidRun, 'view-early');
-    await manager.run(disposedMidRun, async () => {
-      await manager.release(disposedMidRun, 'view-early');
-      assert.equal(manager.owns(disposedMidRun), true, 'run 期间释放视图不得中途丢权');
-      assert.equal(await manager.releaseIfIdle(disposedMidRun), false);
+    const concurrent = 'conversation-overlapping-pins';
+    let started;
+    let finish;
+    const began = new Promise(resolve => { started = resolve; });
+    const gate = new Promise(resolve => { finish = resolve; });
+    const first = manager.run(concurrent, async () => { started(); await gate; });
+    await began;
+    await manager.run(concurrent, async () => {
+      assert.equal(await manager.releaseIfIdle(concurrent), false);
     });
-    assert.equal(manager.owns(disposedMidRun), false);
+    assert.equal(manager.owns(concurrent), true, '另一并发操作的 pin 必须保留 owner');
+    finish();
+    await first;
+    assert.equal(manager.owns(concurrent), false);
   } finally {
     await manager.close();
     await fs.rm(outer, { recursive: true, force: true });
   }
 });
 
-test('pending-work 探针在视图引用清零后保留所有权，探针失败与默认探针均保守保留（所有权管理器作用域）', {
+test('pending-work 探针在活动 pin 清零后保留所有权，探针失败与默认探针均保守保留（所有权管理器作用域）', {
   timeout: 120_000
 }, async () => {
   const { outer, binding } = await createIsolatedRoot('probe');

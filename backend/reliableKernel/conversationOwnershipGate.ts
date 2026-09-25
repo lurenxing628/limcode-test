@@ -58,7 +58,7 @@ export class ConversationOwnershipGate {
 
   /**
    * Best-effort idle release of only the conversations this gate claimed during the pass.
-   * Activity pins, view references and the pending-work probe veto each release.
+   * Activity pins and the pending-work probe veto each release; passive views do not.
    */
   public async releaseClaimed(): Promise<void> {
     const claimed = [...this.claimed];

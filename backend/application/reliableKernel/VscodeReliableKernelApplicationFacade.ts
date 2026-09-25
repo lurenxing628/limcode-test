@@ -233,8 +233,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     const agent = await this.product.configuration.resolveAgent({ agentType: 'main' });
     const now = new Date().toISOString();
     const projectFolder = this.resolveProjectFolderForNewConversation(options.projectFolderUri);
-    // This Host owns the new Conversation from its first write. The opening view retains it
-    // through claim-before-open; without a view the owner idle-releases after this run.
+    // The new Conversation is owned only for this write; passive views do not keep the writer.
+    // The owner idle-releases once the transaction and pending-work probe complete.
     await this.product.application.database.conversationOwners.run(conversationId, async () => {
       await this.product.application.database.transaction([
         DOMAIN_REPOSITORIES.domain('Conversation').insert({
@@ -291,30 +291,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return !!await this.maybeRow('Conversation', conversationId);
   }
 
-  public async retainConversation(conversationId: string, referenceId: string): Promise<void> {
+  /** Passive views may recover a definitely dead owner, but never hold ownership themselves. */
+  public recoverConversation(conversationId: string): Promise<void> {
     this.requireOpen();
-    const owners = this.product.application.database.conversationOwners;
-    await owners.retain(conversationId, referenceId);
-    try {
-      // A peer Host may have died owning this Conversation; converging it here turns the open
-      // into a takeover instead of a stale read-only view. The view reference stays held even
-      // when recovery fails: background convergence/idle sweeps keep retrying, and every
-      // mutation path still gates on ownership.
-      await this.product.recoverConversation(conversationId);
-    } catch (error) {
-      console.warn('[LimCode] Scoped Conversation recovery after claim failed; the view remains owned.', error);
-    }
-  }
-
-  public async releaseConversation(conversationId: string, referenceId: string): Promise<void> {
-    // Dispose may race facade teardown; the owner manager closes with the database and releases
-    // every reference, so a late release is a no-op rather than an error.
-    if (this.disposed || this.productClosed) return;
-    try {
-      await this.product.application.database.conversationOwners.release(conversationId, referenceId);
-    } catch (error) {
-      console.warn('[LimCode] Failed to release Conversation ownership reference.', error);
-    }
+    return this.product.recoverConversation(conversationId);
   }
 
   public getConversationDisplayTitle(conversationId: string | undefined): string {
@@ -359,51 +339,50 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     target: ConversationAbortTarget
   ): Promise<ConversationAbortResult> {
     this.requireOpen();
-    return this.product.application.database.conversationOwners.run(conversationId, async () => {
-      const turnId = requireText(target.turnId, 'abort target Turn.id');
-      const expectedLeaseGeneration = requireDecimal(target.leaseGeneration, 'abort target lease generation');
-      const turn = await this.maybeRow('Turn', turnId);
-      if (!turn || turn.conversation_id !== conversationId) {
-        return { status: 'stale', reason: 'target_turn_not_current', turnId };
+    // A stop is a fenced durable request, not a second writer for the peer-owned Turn.
+    const turnId = requireText(target.turnId, 'abort target Turn.id');
+    const expectedLeaseGeneration = requireDecimal(target.leaseGeneration, 'abort target lease generation');
+    const turn = await this.maybeRow('Turn', turnId);
+    if (!turn || turn.conversation_id !== conversationId) {
+      return { status: 'stale', reason: 'target_turn_not_current', turnId };
+    }
+    if (turn.status === 'terminated') {
+      return { status: 'already_satisfied', reason: 'target_turn_already_terminal', turnId };
+    }
+    if (turn.status !== 'active') return { status: 'stale', reason: 'target_turn_not_active', turnId };
+    const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
+    if (leases.length !== 1 || requireBigInt(leases[0].generation, 'ExecutionLease.generation') !== BigInt(expectedLeaseGeneration)) {
+      return { status: 'stale', reason: 'lease_generation_replaced', turnId };
+    }
+    try {
+      const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+      if (childMemberships.length > 1) throw new Error('Turn 存在多个 ChildExecution 调度归属。');
+      if (childMemberships[0]) {
+        await this.product.childAgents.interruptSubtree({
+          sourceKey: `sidebar-child-interrupt:${requestId}`,
+          childExecutionId: requireText(
+            childMemberships[0].child_execution_id,
+            'ChildExecutionTurnLink.child_execution_id'
+          ),
+          reason: '用户从侧栏请求递归终止当前子 Agent。'
+        });
+      } else {
+        await this.product.conversations.interrupt({
+          commandId: requestId,
+          conversationId,
+          turnId,
+          expectedLeaseGeneration,
+          reason: '用户从侧栏请求终止当前 Conversation。'
+        });
       }
-      if (turn.status === 'terminated') {
+      return { status: 'committed', turnId };
+    } catch (error) {
+      const turn = await this.maybeRow('Turn', turnId);
+      if (turn?.status === 'terminated') {
         return { status: 'already_satisfied', reason: 'target_turn_already_terminal', turnId };
       }
-      if (turn.status !== 'active') return { status: 'stale', reason: 'target_turn_not_active', turnId };
-      const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
-      if (leases.length !== 1 || requireBigInt(leases[0].generation, 'ExecutionLease.generation') !== BigInt(expectedLeaseGeneration)) {
-        return { status: 'stale', reason: 'lease_generation_replaced', turnId };
-      }
-      try {
-        const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
-        if (childMemberships.length > 1) throw new Error('Turn 存在多个 ChildExecution 调度归属。');
-        if (childMemberships[0]) {
-          await this.product.childAgents.interruptSubtree({
-            sourceKey: `sidebar-child-interrupt:${requestId}`,
-            childExecutionId: requireText(
-              childMemberships[0].child_execution_id,
-              'ChildExecutionTurnLink.child_execution_id'
-            ),
-            reason: '用户从侧栏请求递归终止当前子 Agent。'
-          });
-        } else {
-          await this.product.conversations.interrupt({
-            commandId: requestId,
-            conversationId,
-            turnId,
-            expectedLeaseGeneration,
-            reason: '用户从侧栏请求终止当前 Conversation。'
-          });
-        }
-        return { status: 'committed', turnId };
-      } catch (error) {
-        const turn = await this.maybeRow('Turn', turnId);
-        if (turn?.status === 'terminated') {
-          return { status: 'already_satisfied', reason: 'target_turn_already_terminal', turnId };
-        }
-        throw error;
-      }
-    });
+      throw error;
+    }
   }
 
   public getConversationHistoryEntries(): SidebarConversationHistoryEntry[] {

@@ -659,7 +659,6 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, compression 
         assert.fail('no such message');
       },
       async turn(text, conversationId = 'source') {
-        await app.database.conversationOwners.retain(conversationId, `fixture-panel:${conversationId}`);
         const input = await app.turns.input({
           source: { kind: 'command', key: `${conversationId}:${requests.length}:${text.slice(0, 16)}` }, conversationId,
           leaseOwnerId: 'reminder-edges-owner', hostBootId: app.database.hostBootId,
