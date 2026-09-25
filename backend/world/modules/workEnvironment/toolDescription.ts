@@ -2,7 +2,7 @@ import type { WorkEnvironmentRecord } from '../../../../shared/protocol';
 import { formatWorkEnvironmentForDisplay } from '../../../../shared/workEnvironmentCatalog';
 
 export const SWITCH_WORK_ENVIRONMENTS_TITLE = 'Switchable work environments (pass workEnvironmentId to switch precisely):';
-export const TRANSFER_WORK_ENVIRONMENTS_TITLE = 'Work environments available for file transfer (pass the id for fromEnvironment/toEnvironment; current refers to the active one):';
+export const TRANSFER_WORK_ENVIRONMENTS_TITLE = 'Work environments available for file transfer (pass the leading W# reference as fromEnvironment/toEnvironment; current refers to the active one):';
 
 /**
  * 把可用工作环境列表渲染为工具描述文本。

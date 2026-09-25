@@ -17,7 +17,7 @@ export const transferFilesTool: ToolDefinition = {
     name: TRANSFER_TOOL_NAME,
     description: [
       'Transfer files or directories between work environments. Supports local workspace ↔ remote server, remote server ↔ remote server, and local ↔ local.',
-      'fromEnvironment / toEnvironment take a work environment id; you can also use current to refer to the currently active work environment.',
+      'fromEnvironment / toEnvironment each take the W# reference of a work environment listed in this description, or current for the currently active work environment. Work environment names and any other values are rejected.',
       'fromPath / toPath accept relative and absolute paths; relative paths are resolved against the root/workdir of fromEnvironment / toEnvironment respectively.',
       'A path ending with / or \\ denotes a directory; when type=auto, the kind is inferred from the stat result of the source path.',
       'overwrite defaults to false, so the transfer fails if the target exists; files are written via a temp file + verification + rename.',
@@ -32,9 +32,9 @@ export const transferFilesTool: ToolDefinition = {
           items: {
             type: 'object',
             properties: {
-              fromEnvironment: { type: 'string', description: 'Source work environment id, or current for the currently active work environment.' },
+              fromEnvironment: { type: 'string', description: 'Source work environment: its W# reference from the listed work environments, or current for the currently active work environment.' },
               fromPath: { type: 'string', description: 'Source path, relative or absolute. Relative paths are resolved against the root/workdir of fromEnvironment; directories should end with / or \\.' },
-              toEnvironment: { type: 'string', description: 'Target work environment id, or current for the currently active work environment.' },
+              toEnvironment: { type: 'string', description: 'Target work environment: its W# reference from the listed work environments, or current for the currently active work environment.' },
               toPath: { type: 'string', description: 'Target path, relative or absolute. Relative paths are resolved against the root/workdir of toEnvironment; a directory path refers to the target directory itself.' },
               type: { type: 'string', enum: ['auto', 'file', 'directory'], description: 'Transfer type, defaults to auto.' },
               overwrite: { type: 'boolean', description: 'Whether to overwrite when the target exists, defaults to false.' },

@@ -588,15 +588,171 @@ test('参数错误说明具体字段、应传形式和正确键名，不把有�
   }
 });
 
-test('transfer_files 不把可猜测的 work-env ID 当作短引用；current 和目录授权 W# 可用', () => {
+const { transferFilesTool } = require(path.join(
+  root,
+  'dist/extension/backend/world/modules/tools/definitions/transferFiles/index.js'
+));
+const { createWorkEnvironmentRuntimeCapability } = require(path.join(
+  root,
+  'dist/extension/backend/capabilities/workEnvironmentTransfer.js'
+));
+const TRANSFER_ACCEPTED = '工具说明列出的工作环境短引用（W#），或表示当前工作环境的 current';
+
+test('transfer 只接受工具说明列出的 W# 或 current，名称、active 与内部 ID 明确拒绝', () => {
+  const toolName = transferFilesTool.declaration.name;
+  assert.equal(toolName, 'transfer');
+  const description = JSON.stringify(transferFilesTool.declaration);
+  assert.match(description, /W# reference/);
+  assert.doesNotMatch(description, /work environment id/i, '工具说明不能再要求模型传内部 ID');
+
   const transfers = [
-    { fromEnvironment: 'current', fromPath: 'a.txt', toEnvironment: ref('workEnvironment'), toPath: 'b.txt' }
+    { fromEnvironment: ' current ', fromPath: 'a.txt', toEnvironment: ref('workEnvironment'), toPath: 'b.txt' }
   ];
-  assert.deepEqual(resolveModelToolArguments('transfer_files', { transfers }, catalog), {
-    transfers: [{ ...transfers[0], toEnvironment: 'work-env-owned' }]
+  assert.deepEqual(resolveModelToolArguments(toolName, { transfers }, catalog), {
+    transfers: [{ ...transfers[0], fromEnvironment: 'current', toEnvironment: 'work-env-owned' }]
   });
-  rejected('transfer_files', { transfers: [{ ...transfers[0], toEnvironment: 'work-env-owned' }] }, 'workEnvironment');
-  rejected('transfer_files', { transfers: [{ ...transfers[0], toEnvironment: 'W999' }] }, 'workEnvironment');
+  const failure = (toEnvironment, extra = []) => {
+    try {
+      resolveModelToolArguments(toolName, { transfers: [{ ...transfers[0], toEnvironment }, ...extra] }, catalog);
+    } catch (error) {
+      assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
+      assert.equal(error.kind, 'workEnvironment');
+      return error;
+    }
+    assert.fail(`toEnvironment=${toEnvironment} 必须被拒绝`);
+  };
+  for (const value of ['work-env-owned', 'active', 'owned-server', 7]) {
+    const error = failure(value);
+    assert.equal(error.argument, 'transfers[0].toEnvironment');
+    assert.equal(error.message,
+      `transfers[0].toEnvironment 只接受${TRANSFER_ACCEPTED}；不接受内部 ID、名称或其它形式的值。`);
+    const projected = projectToolResultForModel(toolName, {
+      status: 'failed', detail: { code: 'invalid_model_handle_reference', error: error.message }
+    }, catalog);
+    assert.doesNotMatch(projected.detail.error, /\bW[1-9]\d*\b/, '被拒绝的内部 ID 不能投影成看似有效的 W#');
+  }
+  assert.equal(failure('W999').message,
+    `transfers[0].toEnvironment=W999 不是当前可用的工作环境引用；请使用${TRANSFER_ACCEPTED}。`);
+  assert.equal(failure(ref('process')).message,
+    `transfers[0].toEnvironment 收到的 ${ref('process')} 是进程引用；请使用${TRANSFER_ACCEPTED}。`);
+  assert.equal(failure(ref('workEnvironment'), [{ fromPath: 'c.txt', toEnvironment: 'current', toPath: 'd.txt' }]).message,
+    `缺少 transfers[1].fromEnvironment；请提供${TRANSFER_ACCEPTED}。`);
+});
+
+test('transfer 经 AgentLoop 解析 W# 后由真实 capability 写入目标工作环境', async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-transfer-ref-'));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const environment = async (id, name) => {
+    const rootPath = path.join(base, name);
+    await fs.mkdir(rootPath, { recursive: true });
+    return {
+      id, kind: 'localFolder', source: 'workspaceFolder', name, uri: `file://${rootPath}`, rootPath,
+      displayPath: rootPath, index: 0, available: true, createdAt: 1, updatedAt: 1
+    };
+  };
+  const source = await environment('work-env-local-transfer-source', 'source-folder');
+  const target = await environment('work-env-local-transfer-target', 'target-folder');
+  await fs.writeFile(path.join(source.rootPath, 'notes.txt'), 'transfer-by-short-ref');
+  // Environment IDs reach the catalog through the transfer description, exactly as in production.
+  const handles = buildModelHandleCatalog([`- ${source.id} · ${source.name}\n- ${target.id} · ${target.name}`]);
+  const targetRef = handles.entries.find((entry) => entry.target === target.id).ref;
+  assert.match(targetRef, /^W[1-9]\d*$/);
+
+  const policy = {
+    summary: null, displayAutoExpand: false, displayAutoOpenDiff: false, executionGate: 'immediate',
+    changeApplyMode: 'unsupported', changeApplyDelaySeconds: 0, autoSubmitResult: true,
+    schedulingMode: 'serial', schedulingReason: 'test'
+  };
+  const transferCall = (providerOrdinal, toEnvironment) => ({
+    providerCallId: `provider-transfer-${providerOrdinal}`,
+    providerOrdinal,
+    name: transferFilesTool.declaration.name,
+    arguments: {
+      transfers: [{ fromEnvironment: 'current', fromPath: 'notes.txt', toEnvironment, toPath: `copied-${providerOrdinal}/notes.txt` }]
+    }
+  });
+  let invalidSettlements;
+  const executed = [];
+  const loop = Object.create(ReliableAgentLoop.prototype);
+  loop.database = { async snapshotAll() { return { snapshotCommitSeq: '0', snapshot: [] }; } };
+  loop.effects = {
+    async createToolCallBatch(input) {
+      return {
+        receiptId: 'receipt-transfer-ref', batchId: input.batchId,
+        calls: input.entries.map((entry, index) => ({
+          toolCallId: entry.toolCallId, toolExecutionId: `execution-transfer-ref-${index}`,
+          callSeq: String(index + 1), providerOrdinal: entry.providerOrdinal
+        })),
+        deduplicated: false, commitSeq: '1'
+      };
+    },
+    async settleWithoutEffectBatch(input) {
+      invalidSettlements = input;
+      return input.settlements.map((entry) => ({ toolCallId: entry.toolCallId, status: entry.status }));
+    }
+  };
+  loop.tools = {
+    async freezeCalls(inputs) { return inputs.map(() => policy); },
+    async confirmPreparedBatch() { return Object.freeze({ fixture: 'transfer-ref-admission' }); },
+    async dispatchBatch(inputs) {
+      const results = [];
+      for (const input of inputs) {
+        const response = await transferFilesTool.execute(input.arguments, {
+          workEnvironment: createWorkEnvironmentRuntimeCapability()
+        }, { workEnvironment: source, workEnvironments: [source, target], config: {}, emit() {} });
+        executed.push({ arguments: input.arguments, response });
+        results.push({ disposition: 'settled', toolCallId: input.toolCallId, status: response.ok ? 'succeeded' : 'failed' });
+      }
+      return results;
+    }
+  };
+  loop.lifecycleObserver = { observe() {} };
+  loop.now = () => '2026-01-01T00:00:00.000Z';
+  loop.readModelRequestToolDefinitions = async () => [
+    { name: transferFilesTool.declaration.name, description: 'transfer', parameters: { type: 'object' } }
+  ];
+
+  const calls = await loop.prepareProviderToolBatch({
+    turnId: 'turn-transfer-ref',
+    modelRequestId: 'model-transfer-ref',
+    messageId: 'message-transfer-ref',
+    recipe: { tools: [], modelHandleCatalog: handles },
+    output: {
+      content: { role: 'model', parts: [] },
+      toolCalls: [
+        transferCall(0, targetRef),
+        transferCall(1, 'active'),
+        transferCall(2, target.id),
+        transferCall(3, target.name)
+      ]
+    }
+  });
+  assert.equal(calls[0].argumentResolutionError, undefined);
+  assert.equal(calls[0].arguments.transfers[0].toEnvironment, target.id);
+  for (const call of calls.slice(1)) {
+    assert.equal(call.argumentResolutionError,
+      `transfers[0].toEnvironment 只接受${TRANSFER_ACCEPTED}；不接受内部 ID、名称或其它形式的值。`);
+  }
+
+  assert.equal(await loop.dispatchProviderToolGroup({
+    turnId: 'turn-transfer-ref', round: '1', modelRequestId: 'model-transfer-ref', calls
+  }), true);
+  assert.equal(executed.length, 1, '只有解析成功的 W# 调用进入执行');
+  assert.equal(executed[0].response.ok, true, JSON.stringify(executed[0].response.output));
+  assert.equal(await fs.readFile(path.join(target.rootPath, 'copied-0', 'notes.txt'), 'utf8'), 'transfer-by-short-ref');
+  assert.deepEqual(invalidSettlements.settlements.map((entry) => entry.detail.code),
+    Array(3).fill('invalid_model_handle_reference'));
+
+  // The capability itself matches only `current` and exact IDs; names and `active` are not selectors.
+  const capability = createWorkEnvironmentRuntimeCapability();
+  for (const selector of ['active', target.name]) {
+    const result = await capability.transferFiles({
+      transfers: [{ fromEnvironment: 'current', fromPath: 'notes.txt', toEnvironment: selector, toPath: 'by-selector.txt' }]
+    }, undefined, { activeWorkEnvironment: source, availableWorkEnvironments: [source, target] });
+    assert.equal(result.failCount, 1, selector);
+    assert.match(result.results[0].error, /未知或当前策略不允许使用工作环境/);
+  }
+  await assert.rejects(fs.access(path.join(target.rootPath, 'by-selector.txt')));
 });
 
 test('未知短引用的内核失败保留 P999/C999，已知 canonical ID 仍脱敏', () => {

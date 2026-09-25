@@ -403,7 +403,7 @@ test('LLM capability adapter 只向模型暴露 P/O/A/W 短引用 schema', async
   const answerBridgeId = 'answer_bridge_provider_schema_internal';
   const workEnvironmentId = 'work-env-local-provider-schema';
   fullRequest.authoritySnapshot.toolPolicy.allowedTools = [
-    'bash', 'run_agent', 'switch_work_environment', 'transfer_files'
+    'bash', 'run_agent', 'switch_work_environment', 'transfer'
   ];
   fullRequest.recipe.modelHandleCatalog = {
     entries: [
@@ -439,7 +439,7 @@ test('LLM capability adapter 只向模型暴露 P/O/A/W 短引用 schema', async
       parameters: { type: 'object', properties: { workEnvironmentId: { type: 'string' } } }
     },
     {
-      name: 'transfer_files',
+      name: 'transfer',
       description: `transfer from ${workEnvironmentId}`,
       parameters: { type: 'object', properties: { transfers: { type: 'array' } } }
     }
@@ -463,6 +463,7 @@ test('LLM capability adapter 只向模型暴露 P/O/A/W 短引用 schema', async
   assert.deepEqual(tools.get('run_agent').parameters.required, ['operation', 'childRef', 'prompt']);
   assert.equal(tools.get('run_agent').parameters.properties.agent.properties.id, undefined);
   assert.ok(tools.get('switch_work_environment').parameters.properties.workEnvironmentRef);
+  assert.equal(tools.get('transfer').description, 'transfer from W1');
   const encoded = JSON.stringify(captured.tools);
   assert.match(encoded, /P1|O1|A1|W1/);
   assert.doesNotMatch(encoded, /process_provider_schema_internal|provider-schema-internal|answer_bridge_provider_schema_internal|work-env-local-provider-schema/);

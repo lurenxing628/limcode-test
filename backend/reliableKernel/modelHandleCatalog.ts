@@ -1,3 +1,4 @@
+import { SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME } from '../../shared/protocol';
 import { isCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
 
 export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment'
@@ -262,15 +263,16 @@ export function resolveModelToolArguments(
       delete record.childRefs;
       record.answerBridgeIds = targets;
     }
-  } else if (toolName === 'switch_work_environment') {
+  } else if (toolName === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
     replaceRef(toolName, record, 'workEnvironmentRef', 'workEnvironmentId', 'workEnvironment', catalog);
-  } else if (toolName === 'transfer_files' && Array.isArray(record.transfers)) {
-    for (const transferValue of record.transfers) {
+  } else if (toolName === TRANSFER_TOOL_NAME && Array.isArray(record.transfers)) {
+    record.transfers.forEach((transferValue, index) => {
       const transfer = asRecord(transferValue);
-      if (!transfer) continue;
-      replaceEnvironmentValue(transfer, 'fromEnvironment', catalog);
-      replaceEnvironmentValue(transfer, 'toEnvironment', catalog);
-    }
+      if (!transfer) return;
+      for (const key of ['fromEnvironment', 'toEnvironment'] as const) {
+        resolveTransferEnvironment(transfer, key, `transfers[${index}].${key}`, catalog);
+      }
+    });
   }
   return args;
 }
@@ -506,13 +508,23 @@ function replaceRef(
   record[targetKey] = target;
 }
 
-function replaceEnvironmentValue(
+/**
+ * transfer advertises exactly two environment forms: a W# from its environment list and `current`.
+ * Environment names, `active` and canonical work-env IDs are rejected here instead of being matched
+ * later by the capability, so the model's contract and the executed target cannot diverge.
+ */
+function resolveTransferEnvironment(
   record: Record<string, unknown>,
   key: 'fromEnvironment' | 'toEnvironment',
+  argument: string,
   catalog: ModelHandleCatalog
 ): void {
-  if (optionalText(record[key]) === 'current') return;
-  record[key] = requireRefTarget(catalog, 'workEnvironment', key, record[key]);
+  if (optionalText(record[key]) === 'current') {
+    record[key] = 'current';
+    return;
+  }
+  record[key] = requireRefTarget(catalog, 'workEnvironment', argument, record[key], TRANSFER_TOOL_NAME,
+    `工具说明列出的${shortRefForm('workEnvironment')}，或表示当前工作环境的 current`);
 }
 
 /** Resolves one short reference of the expected kind or explains precisely why the value is not one. */
@@ -521,15 +533,17 @@ function requireRefTarget(
   kind: ModelHandleKind,
   argument: string,
   value: unknown,
-  toolName?: string
+  toolName?: string,
+  accepted = `上下文或工具结果中出现过的${shortRefForm(kind)}`
 ): string {
   const ref = optionalText(value);
   const target = ref ? modelHandleTarget(catalog, kind, ref) : undefined;
   if (target) return target;
-  const accepted = `上下文或工具结果中出现过的${shortRefForm(kind)}`;
   const refKind = ref ? handleKindOfRef(ref) : undefined;
   let message: string;
-  if (refKind === kind) {
+  if (value === undefined) {
+    message = `缺少 ${argument}；请提供${accepted}。`;
+  } else if (refKind === kind) {
     message = `${argument}=${ref} 不是当前可用的${kindNoun(kind, '引用')}；请使用${accepted}。`;
   } else if (refKind) {
     message = `${argument} 收到的 ${ref} 是${kindNoun(refKind, '引用')}；请使用${accepted}。`;
@@ -671,7 +685,7 @@ function modelReferenceKeys(toolName: string, record: Record<string, unknown>): 
     case 'shell': return ['processRef', 'cursor'];
     case 'run_agent':
     case 'read_agent_answer': return ['childRef', 'childRefs'];
-    case 'switch_work_environment': return ['workEnvironmentRef'];
+    case SWITCH_WORK_ENVIRONMENT_TOOL_NAME: return ['workEnvironmentRef'];
     default: return [];
   }
 }

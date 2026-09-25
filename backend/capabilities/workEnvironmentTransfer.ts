@@ -226,13 +226,17 @@ async function runTransfer(
   };
 }
 
+/**
+ * The model boundary resolves W# to a work environment ID and passes `current` through; those are
+ * the only selectors. Names are not identities and are never matched.
+ */
 function resolveEnvironment(selector: string, context: WorkEnvironmentTransferContext): WorkEnvironmentRecord {
-  if (selector === 'current' || selector === 'active') {
+  if (selector === 'current') {
     if (!context.activeWorkEnvironment) throw new Error('当前没有 active 工作环境。');
     return context.activeWorkEnvironment;
   }
   const candidates = context.availableWorkEnvironments ?? [];
-  const found = candidates.find((environment) => environment.id === selector || environment.name === selector);
+  const found = candidates.find((environment) => environment.id === selector);
   if (!found) throw new Error(`未知或当前策略不允许使用工作环境：${selector}`);
   return found;
 }
