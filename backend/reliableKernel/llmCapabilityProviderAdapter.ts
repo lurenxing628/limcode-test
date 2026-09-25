@@ -237,6 +237,14 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             sourceUnlinked: event.kind !== 'completed' && event.semanticProgress !== false && Boolean(source) && !debugCaptureSources(source).length },
           sources: debugCaptureSources(source) }));
         tail = tail.then(() => controls.onEvent(completeEvent)).then(() => undefined);
+        tail.catch((error: unknown) => {
+          // A failed durable event handler ends the stream now. A native chain would otherwise sit
+          // at its tool boundary, waiting for results that can never be admitted, until the socket
+          // idles out minutes later.
+          if (terminal) return;
+          this.capability.abort(request.modelRequestId);
+          finish(error);
+        });
       };
       const finish = (error?: unknown): void => {
         if (terminal) return;

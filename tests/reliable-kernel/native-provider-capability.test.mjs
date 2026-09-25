@@ -575,6 +575,37 @@ test('adapter：native hooks 透传、native_control 转换与准入名单下传
   assert.equal(streamEvents.at(-1).kind, 'completed');
 });
 
+test('adapter：事件落库失败立即结束请求并中止底层连接，不等原生边界超时', async () => {
+  const aborted = [];
+  const capability = {
+    start(request, emit) {
+      emit({ type: LlmEventType.NativeControl, payload: { requestId: request.id,
+        event: { type: 'response.created', responseId: 'resp_failing' } } });
+      // The chain now waits at its tool boundary: no Done/Error is ever emitted by the provider.
+    },
+    abort(modelRequestId) { aborted.push(modelRequestId); },
+    resolveInvocation() {},
+    compact() {},
+    dryRun() { throw new Error('unused'); },
+    dryRunCompact() { throw new Error('unused'); },
+    listModels() { return Promise.resolve([]); },
+    cancelRetry() {},
+    dispose() {}
+  };
+  const adapter = new LlmCapabilityFullRequestAdapter('provider-config', capability);
+  const failure = new Error('UNIQUE constraint failed: tool_call_source_link.model_request_id, tool_call_source_link.provider_ordinal');
+  let timer;
+  const outcome = await Promise.race([
+    adapter.sendFullRequest(adapterFixture(), {
+      native: { onController() {} },
+      async onEvent() { throw failure; }
+    }).then(() => 'resolved', error => error),
+    new Promise(resolve => { timer = setTimeout(() => resolve('still waiting'), 2_000); })
+  ]).finally(() => clearTimeout(timer));
+  assert.equal(outcome, failure, 'the durable handling error ends the request at once');
+  assert.deepEqual(aborted, ['model-request-native'], 'the underlying socket/request is aborted');
+});
+
 test('adapter materializeNativeToolOutput：托管媒体解析为线级块', async () => {
   const adapter = new LlmCapabilityFullRequestAdapter(
     'provider-config',
