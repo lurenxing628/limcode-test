@@ -2198,20 +2198,29 @@ export class ChildExecutionControlPlane {
       throw new Error('ActiveTurnLink can only be cleared after its exact Turn is terminal.');
     }
     const now = this.timestamp();
-    await this.database.transaction([
-      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TERMINATED_TURN }),
-      DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(snapshot.activeTurnLink.id as string, {
-        child_execution_id: childExecutionId,
-        turn_id: turnId
-      }),
-      DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').delete(snapshot.activeTurnLink.id as string),
-      DOMAIN_REPOSITORIES.domain('ChildExecution').update(childExecutionId, {
-        status: interruptedStatusAfterTurnTerminal(
-          requireChildExecutionStatus(snapshot.childExecution.status)
-        ),
-        updated_at: now
-      })
-    ]);
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TERMINATED_TURN }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(snapshot.activeTurnLink.id as string, {
+          child_execution_id: childExecutionId,
+          turn_id: turnId
+        }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').delete(snapshot.activeTurnLink.id as string),
+        DOMAIN_REPOSITORIES.domain('ChildExecution').update(childExecutionId, {
+          status: interruptedStatusAfterTurnTerminal(
+            requireChildExecutionStatus(snapshot.childExecution.status)
+          ),
+          updated_at: now
+        })
+      ]);
+    } catch (error) {
+      if (!isTransactionAssertionFailure(error)) throw error;
+      // The drive's own cleanup and a recovery pass may observe the same terminal Turn; whichever
+      // commits first clears the pointer, and the other finds it already cleared.
+      const latest = await this.readExecutionSnapshot(childExecutionId);
+      if (latest.activeTurnLink?.turn_id === turnId) throw error;
+      return false;
+    }
     return true;
   }
 

@@ -688,19 +688,26 @@ export class ReliableChildAgentCoordinator {
     }
   }
 
-  /** Stops new launches, aborts per-child Provider dispatches, then drains local Turn tasks. */
+  /**
+   * Stops new launches, aborts per-child Provider dispatches, then drains local Turn tasks. A child
+   * Turn that completes while draining still submits its final answer; only then does this
+   * coordinator stop observing final outputs.
+   */
   public dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
     this.disposing = true;
-    this.unregisterFinalOutput();
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = undefined;
     this.waitingOwned.clear();
     this.pendingDriveWakes.clear();
     this.disposePromise = (async () => {
-      await this.quiesce(this.handoff ?? new ExecutionHandoffError('Child coordinator is handing off.'));
-      await this.waitForRecoveryIdle();
-      await this.waitForIdle();
+      try {
+        await this.quiesce(this.handoff ?? new ExecutionHandoffError('Child coordinator is handing off.'));
+        await this.waitForRecoveryIdle();
+        await this.waitForIdle();
+      } finally {
+        this.unregisterFinalOutput();
+      }
     })();
     return this.disposePromise;
   }
@@ -1038,16 +1045,26 @@ export class ReliableChildAgentCoordinator {
       }
     }
 
+    // A completed child task Turn whose fenced final output never became its answer (the Host
+    // closed in between, or the live submission failed) submits exactly that output now.
+    signal?.throwIfAborted();
+    await this.reconcileCompletedTaskAnswers(inScope, signal, gate);
+
     // Answer submission and parent delivery are intentionally separate commits. Reconcile the
     // missing edge while this coordinator is online as well as at startup: a final-answer
     // submission interrupted before its delivery must not strand its already durable answer behind
-    // a live-host fence that only the owning coordinator is allowed to cross.
+    // a live-host fence that only the owning coordinator is allowed to cross. Besides the active
+    // generations this covers every current answer still undelivered, including one whose Turn
+    // already completed and left the active pointer.
     signal?.throwIfAborted();
     await this.reconcileCommittedAnswers(
-      scopedActiveLinks.map((link) => requireId(
-        link.child_execution_id,
-        'ChildExecutionActiveTurnLink.child_execution_id'
-      )),
+      [
+        ...scopedActiveLinks.map((link) => requireId(
+          link.child_execution_id,
+          'ChildExecutionActiveTurnLink.child_execution_id'
+        )),
+        ...(await this.childrenWithUndeliveredAnswers()).filter(inScope)
+      ],
       signal,
       gate
     );
@@ -1774,7 +1791,9 @@ export class ReliableChildAgentCoordinator {
    * waiting run_agent call or is delivered to the parent. A peer's followup taken in by that Turn
    * is answered through its own collaboration reply as well; a Turn a peer's followup started answers
    * only that peer, and a Turn the user started answers only the user. Runs before the Turn is
-   * recorded completed, so the active-generation authority of the submission still holds.
+   * recorded completed, so the active-generation authority of the submission still holds. Neither a
+   * refused submission nor a failed delivery edge fails the Turn: its fenced final output stays
+   * durable and recovery hands it on.
    */
   private async submitTurnFinalAnswer(input: { turnId: string; modelRequestId: string; finalText: string }): Promise<void> {
     const memberships = await this.list('ChildExecutionTurnLink', { turn_id: input.turnId }, 2);
@@ -1785,22 +1804,47 @@ export class ReliableChildAgentCoordinator {
     if (bridges.length !== 1) return;
     // A child being interrupted or closed answers through its interruption path, if at all; its
     // otherwise normal completion must not turn into a failed Turn over a refused submission.
-    const child = await this.get('ChildExecution', childExecutionId);
-    if (child?.status !== 'active' || !['open', 'submitted'].includes(String(bridges[0].status))) return;
+    if (!await this.childAcceptsAnswer(childExecutionId)) return;
     const answerBridgeId = requireId(bridges[0].id, 'AnswerBridge.id');
-    const content = input.finalText.trim() || '（子 Agent 本轮结束时没有输出文字。）';
-    const submissionId = stablePhaseFId('answer_submission', 'turn-final-output', input.turnId, input.modelRequestId, answerBridgeId);
-    const submitted = await this.dependencies.answers.submit({
-      answerBridgeId,
-      submissionId,
-      sourceTurnId: input.turnId,
-      title: finalAnswerTitle(content),
-      content,
-      contentType: 'text/plain'
-    });
+    const answer = childFinalAnswer(input.turnId, input.modelRequestId, input.finalText, answerBridgeId);
+    let submitted: Awaited<ReturnType<AnswerControlPlane['submit']>>;
+    try {
+      submitted = await this.dependencies.answers.submit(answer);
+    } catch (error) {
+      // Refused because the child stopped accepting answers meanwhile: this Turn has no answer.
+      if (!await this.childAcceptsAnswer(childExecutionId)) return;
+      this.reportError(error, 'submit-turn-final-answer', input.turnId);
+      this.triggerRecoveryPass();
+      return;
+    }
     if (submitted.historicalReplay) return;
-    const waits = await this.dependencies.answers.reconcileCommittedWaits(submissionId);
-    if (!waits.settledByAnswer) await this.deliverBackgroundAnswer(answerBridgeId, submitted.inboxItemId);
+    await this.handOnCommittedAnswer(answerBridgeId, answer.submissionId, submitted.inboxItemId, input.turnId);
+  }
+
+  private async childAcceptsAnswer(childExecutionId: string): Promise<boolean> {
+    const [child, bridges] = await Promise.all([
+      this.get('ChildExecution', childExecutionId),
+      this.list('AnswerBridge', { child_execution_id: childExecutionId }, 2)
+    ]);
+    return child?.status === 'active' && bridges.length === 1 && ['open', 'submitted'].includes(String(bridges[0].status));
+  }
+
+  /** The edge from a committed answer to its waiting parent call or parent delivery. */
+  private async handOnCommittedAnswer(
+    answerBridgeId: string,
+    submissionId: string,
+    inboxItemId: string,
+    turnId: string
+  ): Promise<void> {
+    try {
+      const waits = await this.dependencies.answers.reconcileCommittedWaits(submissionId);
+      if (!waits.settledByAnswer) await this.deliverBackgroundAnswer(answerBridgeId, inboxItemId);
+    } catch (error) {
+      // The answer is durable; only its hand-off failed. The recovery pass reconciles committed
+      // answers whose Inbox item is still undelivered, so the parent still receives it.
+      this.reportError(error, 'deliver-turn-final-answer', turnId);
+      this.triggerRecoveryPass();
+    }
   }
 
   private async readAnswer(input: ReliableAgentToolDispatchInput): Promise<ChildDispatchResult> {
@@ -2177,6 +2221,80 @@ export class ReliableChildAgentCoordinator {
     // and explicitly acknowledges it. A control-plane recovery pass is not that consumer.
   }
 
+  /**
+   * Children whose current answer has neither settled a parent wait nor been routed to the parent:
+   * its Inbox item is still available. Bounded by undelivered answers, not by answer history.
+   */
+  private async childrenWithUndeliveredAnswers(): Promise<string[]> {
+    const available = (await listAllDomainRows(this.dependencies.database, 'RuntimeInboxItem', { state: 'available' }))
+      .filter((inbox) => inbox.source_kind === 'answer_submission');
+    const childExecutionIds: string[] = [];
+    for (const inbox of available) {
+      const submission = await this.get('AnswerSubmission', requireId(inbox.source_id, 'RuntimeInboxItem.source_id'));
+      if (!submission) continue;
+      const bridge = await this.get('AnswerBridge', requireId(submission.answer_bridge_id, 'AnswerSubmission.answer_bridge_id'));
+      if (!bridge || bridge.current_submission_id !== submission.id) continue;
+      const childExecutionId = requireId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+      // A parent deleted with its Conversation has no one left to deliver to.
+      const [parentLink] = await this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId }, 1);
+      if (!parentLink || !await this.get('Turn', requireId(parentLink.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id'))) continue;
+      childExecutionIds.push(childExecutionId);
+    }
+    return childExecutionIds;
+  }
+
+  /**
+   * Submits the answer of a completed child task Turn that fenced its final output but never
+   * submitted it. Its bridge has no current answer (the dispatch that admitted the Turn cleared
+   * it), which bounds the scan to children still owing their parent an answer.
+   */
+  private async reconcileCompletedTaskAnswers(
+    inScope: (childExecutionId: string) => boolean,
+    signal: AbortSignal | undefined,
+    gate: ConversationOwnershipGate
+  ): Promise<void> {
+    const bridges = await listAllDomainRows(this.dependencies.database, 'AnswerBridge', { current_submission_id: null });
+    for (const bridge of bridges) {
+      signal?.throwIfAborted();
+      if (!['open', 'submitted'].includes(String(bridge.status))) continue;
+      const childExecutionId = requireId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+      if (!inScope(childExecutionId)) continue;
+      const child = await this.get('ChildExecution', childExecutionId);
+      if (!child || !['active', 'idle'].includes(String(child.status))) continue;
+      const latest = await this.latestChildTurnId(childExecutionId);
+      if (!latest) continue;
+      const turn = await this.get('Turn', latest);
+      if (turn?.status !== 'terminated') continue;
+      const [termination] = await this.list('TurnTermination', { turn_id: latest }, 1);
+      if (termination?.terminal_status !== 'completed') continue;
+      if ((await this.list('TurnFinalOutputFence', { turn_id: latest }, 1)).length === 0) continue;
+      const answerBridgeId = requireId(bridge.id, 'AnswerBridge.id');
+      const history = await listAllDomainRows(this.dependencies.database, 'AnswerSubmission', { answer_bridge_id: answerBridgeId });
+      if (history.some((submission) => submission.turn_id === latest)) continue;
+      await gate.run(requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id'), async () => {
+        if (!await this.dependencies.answers.isChildTaskTurn(latest)) return;
+        const final = await this.dependencies.agentLoop.readFinalOutput(latest);
+        if (!final) return;
+        // The committed answer is handed on by the undelivered-answer reconciliation that follows.
+        await this.dependencies.answers.submitCompletedTurnAnswer(
+          childFinalAnswer(latest, final.modelRequestId, final.finalText, answerBridgeId)
+        );
+      });
+    }
+  }
+
+  private async latestChildTurnId(childExecutionId: string): Promise<string | undefined> {
+    const snapshot = await this.dependencies.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').list({
+        where: { child_execution_id: childExecutionId },
+        orderBy: { column: 'turn_seq', direction: 'desc' },
+        limit: 1
+      })
+    ]);
+    const [latest] = snapshot.snapshot[0] as DomainRow[];
+    return latest ? requireId(latest.turn_id, 'ChildExecutionTurnLink.turn_id') : undefined;
+  }
+
   private async reconcileCommittedAnswers(
     activeChildExecutionIds: readonly string[],
     signal: AbortSignal | undefined,
@@ -2375,6 +2493,19 @@ function frozenParentModelSelection(
 
 function promptWithAnswerBridge(prompt: string): string {
   return `${prompt}\n\n[Agent answer]\n完成任务后直接写出最终回复：本轮最后一条回复会自动作为结果交给派发任务的 Agent，不需要调用工具提交。中途需要告知进展或提问时用 send_agent_message，向已有同伴续派任务用 followup_agent_task。`;
+}
+
+/** The answer a child task Turn submits for its final output; live and recovery use one identity. */
+function childFinalAnswer(turnId: string, modelRequestId: string, finalText: string, answerBridgeId: string) {
+  const content = finalText.trim() || '（子 Agent 本轮结束时没有输出文字。）';
+  return {
+    answerBridgeId,
+    submissionId: stablePhaseFId('answer_submission', 'turn-final-output', turnId, modelRequestId, answerBridgeId),
+    sourceTurnId: turnId,
+    title: finalAnswerTitle(content),
+    content,
+    contentType: 'text/plain'
+  };
 }
 
 /** A short title for a final answer: its first non-empty line, bounded. */

@@ -477,6 +477,20 @@ export class ReliableAgentLoop {
     }
   }
 
+  /**
+   * The final answer a Turn fenced, read back from its durable Provider output: exactly what the
+   * observers were (or would have been) given. Null when the Turn never fenced a final output.
+   */
+  public async readFinalOutput(turnIdInput: string): Promise<{ modelRequestId: string; finalText: string } | null> {
+    const turnId = requireId(turnIdInput, 'turnId');
+    const fences = await this.list('TurnFinalOutputFence', { turn_id: turnId }, 2);
+    if (fences.length > 1) throw new Error(`Turn ${turnId} has multiple final-output fences.`);
+    if (fences.length === 0) return null;
+    const modelRequestId = requireId(fences[0].model_request_id, 'TurnFinalOutputFence.model_request_id');
+    const output = await this.readTerminalProviderOutput(modelRequestId);
+    return { modelRequestId, finalText: finalAnswerText(providerOutputMessage(output)) };
+  }
+
   /** Safe for explicit recovery/re-entry; every round and output identity is deterministic. */
   public async drive(turnIdInput: string): Promise<ReliableAgentLoopResult> {
     const turnId = requireId(turnIdInput, 'turnId');

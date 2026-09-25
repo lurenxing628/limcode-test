@@ -401,6 +401,146 @@ test('stopping a Turn that a child answer was routed into still starts a continu
   });
 });
 
+test('a failed hand-off of a committed child answer neither fails the child Turn nor loses the answer', { timeout: 90000 }, async () => {
+  const TASK = 'HANDOFF_TASK_9910', CHILD_ANSWER = 'HANDOFF_CHILD_ANSWER_9911';
+  let rootRound = 0, rootSawAnswer = false, failures = 0;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === 'root') {
+      if (++rootRound === 1) return toolsAnswer(spawn('spawn-handoff', TASK));
+      if (text(start).includes(CHILD_ANSWER)) rootSawAnswer = true;
+      return answer(`Root round ${rootRound}.`);
+    }
+    return answer(CHILD_ANSWER);
+  }, async f => {
+    const deliveries = f.app.runtime.deliveries;
+    const createAutomatic = deliveries.createAutomatic;
+    let repairable = false;
+    deliveries.createAutomatic = async function(input) {
+      const [inbox] = await f.rows('RuntimeInboxItem', { id: input.inboxItemId });
+      if (inbox?.source_kind === 'answer_submission' && !repairable) {
+        // Every hand-off tried while the child Turn is still its active generation loses the
+        // delivery CAS (for example to the parent's final-output fence).
+        failures += 1;
+        throw Object.assign(new Error('fixture lost the delivery CAS'), { code: 'RUNTIME_TRANSACTION_ASSERTION_FAILED' });
+      }
+      return createAutomatic.call(this, input);
+    };
+    const started = await f.input('root', 'root-spawns-handoff');
+    await f.terminated(started.turnId);
+    const task = await f.until(() => f.child(TASK), 'child never started');
+    const childTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: task.conversationId }))[0], 'child Turn missing');
+    assert.equal((await f.terminated(childTurn.id)).terminal_status, 'completed', 'a delivery-edge failure never fails the answered child Turn');
+    await f.until(async () => (await f.rows('ChildExecutionActiveTurnLink', { child_execution_id: task.childExecutionId })).length === 0,
+      'the completed child Turn never left the active pointer');
+    await f.coordinator.waitForIdle();
+    // Let every recovery pass that saw the child as an active generation finish (and fail) first.
+    await f.coordinator.recoverStartup().catch(() => undefined);
+    assert.ok(failures >= 1, 'the live hand-off failed');
+    assert.equal(rootSawAnswer, false);
+    // Only now can a hand-off succeed: the answer's Turn is no longer any active generation.
+    repairable = true;
+    await f.coordinator.recoverStartup();
+    await f.until(async () => rootSawAnswer, 'the committed answer of a completed child Turn was never delivered after its hand-off failed');
+    await f.settled();
+    assert.equal((await f.rows('Turn', { conversation_id: task.conversationId })).length, 1);
+    assert.equal((await f.rows('AnswerSubmission')).length, 1);
+  });
+});
+
+test('a child Turn that completed without its answer submitted is answered by recovery, and a refused submission is no answer', { timeout: 90000 }, async () => {
+  const TASK = 'RECOVER_TASK_1210', CHILD_ANSWER = 'RECOVER_CHILD_ANSWER_1211';
+  let rootRound = 0, rootSawAnswer = false, refused = 0;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === 'root') {
+      if (++rootRound === 1) return toolsAnswer(spawn('spawn-recover', TASK));
+      if (text(start).includes(CHILD_ANSWER)) rootSawAnswer = true;
+      return answer(`Root round ${rootRound}.`);
+    }
+    return answer(CHILD_ANSWER);
+  }, async f => {
+    const answers = f.app.runtime.answers;
+    const submit = answers.submit;
+    answers.submit = async function(input) {
+      // The live submission is lost (an unexpected storage error); the Turn must still complete.
+      if (++refused === 1) throw new Error('fixture storage error during submission');
+      return submit.call(this, input);
+    };
+    const started = await f.input('root', 'root-spawns-recover');
+    await f.terminated(started.turnId);
+    await f.until(async () => rootSawAnswer, 'recovery never submitted the fenced final output of the completed child Turn');
+    await f.settled();
+    const task = await f.child(TASK);
+    const [childTurn] = await f.rows('Turn', { conversation_id: task.conversationId });
+    assert.equal((await f.rows('TurnTermination', { turn_id: childTurn.id }))[0].terminal_status, 'completed');
+    const current = await f.app.runtime.answers.readCurrent(task.bridgeId);
+    assert.equal(current.content, CHILD_ANSWER, 'recovery submits exactly the fenced final output');
+    assert.equal((await f.rows('AnswerSubmission')).length, 1);
+  });
+});
+
+test('a submission refused because the child was closed meanwhile completes the Turn with no answer', { timeout: 90000 }, async () => {
+  const TASK = 'CLOSED_TASK_1310';
+  let rootRound = 0;
+  await fixture(async (request) => {
+    if (request.conversationId === 'root') return ++rootRound === 1 ? toolsAnswer(spawn('spawn-closed', TASK)) : answer(`Root round ${rootRound}.`);
+    return answer('CLOSED_CHILD_FINAL_1311');
+  }, async f => {
+    const answers = f.app.runtime.answers;
+    const submit = answers.submit;
+    answers.submit = async function(input) {
+      const [bridge] = await f.rows('AnswerBridge', { id: input.answerBridgeId });
+      // The child is closed between the final output and its submission.
+      await f.app.database.transaction([repo('AnswerBridge').update(bridge.id, { status: 'closed', updated_at: new Date().toISOString() })]);
+      return submit.call(this, input);
+    };
+    const started = await f.input('root', 'root-spawns-closed');
+    await f.terminated(started.turnId);
+    const task = await f.until(() => f.child(TASK), 'child never started');
+    const childTurn = await f.until(async () => (await f.rows('Turn', { conversation_id: task.conversationId }))[0], 'child Turn missing');
+    assert.equal((await f.terminated(childTurn.id)).terminal_status, 'completed', 'a refused submission never fails the Turn');
+    await f.settled();
+    assert.equal((await f.rows('AnswerSubmission')).length, 0);
+    answers.submit = submit;
+  });
+});
+
+test('closing the child scheduler while a child Turn completes still submits its answer', { timeout: 90000 }, async () => {
+  const TASK = 'DISPOSE_TASK_1410', CHILD_ANSWER = 'DISPOSE_CHILD_ANSWER_1411';
+  let rootRound = 0, rootSawAnswer = false, disposing;
+  await fixture(async (request, f, start) => {
+    if (request.conversationId === 'root') {
+      if (++rootRound === 1) return toolsAnswer(spawn('spawn-dispose', TASK));
+      if (text(start).includes(CHILD_ANSWER)) rootSawAnswer = true;
+      return answer(`Root round ${rootRound}.`);
+    }
+    return answer(CHILD_ANSWER);
+  }, async f => {
+    const router = f.app.agentLoop.automaticDeliveries;
+    const establish = router.establishFinalOutputFence;
+    router.establishFinalOutputFence = async function(input) {
+      const fenced = await establish.call(this, input);
+      const [turn] = await f.rows('Turn', { id: input.turnId });
+      // The Host starts closing right after the child fenced its final answer.
+      if (fenced.established && turn.conversation_id !== 'root' && !disposing) disposing = f.coordinator.dispose();
+      return fenced;
+    };
+    const started = await f.input('root', 'root-spawns-dispose');
+    await f.terminated(started.turnId);
+    await f.until(() => disposing !== undefined, 'the child never reached its final answer');
+    await disposing;
+    router.establishFinalOutputFence = establish;
+    const task = await f.child(TASK);
+    const [childTurn] = await f.rows('Turn', { conversation_id: task.conversationId });
+    assert.equal((await f.rows('TurnTermination', { turn_id: childTurn.id }))[0]?.terminal_status, 'completed');
+    assert.equal((await f.rows('AnswerSubmission')).length, 1, 'the draining child Turn submitted its answer before the scheduler closed');
+    await f.replaceCoordinator();
+    await f.coordinator.recoverStartup();
+    await f.until(async () => rootSawAnswer, 'the parent never received the answer');
+    await f.settled();
+    assert.equal((await f.app.runtime.answers.readCurrent(task.bridgeId)).content, CHILD_ANSWER);
+  });
+});
+
 const nativeCapabilities = { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false, explicitCaching: true };
 const nativeProbe = { name: 'native_probe', description: 'one durable native tool', parameters: { type: 'object' }, metadata: { nativeAsync: true } };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };

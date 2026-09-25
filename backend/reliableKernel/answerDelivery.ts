@@ -269,6 +269,113 @@ export class AnswerControlPlane {
   }
 
   /**
+   * Submits the fenced final output of a completed child task Turn whose answer never reached the
+   * bridge: the Host stopped between that output and its submission, or the live submission
+   * failed. The answer and its identity are exactly what the live final-output path submits, and
+   * only while that Turn is still the latest generation of its ChildExecution.
+   */
+  public async submitCompletedTurnAnswer(commandInput: AnswerSubmitCommand): Promise<AnswerSubmitResult | null> {
+    const command = normalizeAnswerCommand(commandInput);
+    const ids = answerIds(command.answerBridgeId, command.submissionId);
+    const replay = await this.findReplay(command, ids);
+    if (replay) return replay.historicalReplay ? null : replay;
+    const turnId = command.sourceTurnId;
+    if (!await this.isChildTaskTurn(turnId)) return null;
+    const bridge = await this.requireExisting('AnswerBridge', command.answerBridgeId);
+    const childExecutionId = requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+    const snapshot = await this.children.readExecutionSnapshot(childExecutionId);
+    if (snapshot.answerBridge.id !== command.answerBridgeId || snapshot.answerBridge.current_submission_id !== null) return null;
+    const childStatus = requireChildExecutionStatus(snapshot.childExecution.status);
+    if (childStatus !== 'active' && childStatus !== 'idle') return null;
+    if (!['open', 'submitted'].includes(String(snapshot.answerBridge.status))) return null;
+    const allTurnLinks = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
+      child_execution_id: childExecutionId
+    });
+    const sourceTurnLink = allTurnLinks.find((link) => link.turn_id === turnId);
+    if (!sourceTurnLink) return null;
+    const latestTurnLink = [...allTurnLinks].sort((left, right) => compareCounter(right.turn_seq, left.turn_seq))[0];
+    if (latestTurnLink?.id !== sourceTurnLink.id) return null;
+    const activeTurnLink = snapshot.activeTurnLink;
+    if (activeTurnLink && activeTurnLink.turn_id !== turnId) return null;
+    const [turn, terminations, fences] = await Promise.all([
+      this.requireExisting('Turn', turnId),
+      this.listRows('TurnTermination', { turn_id: turnId }, 2),
+      this.listRows('TurnFinalOutputFence', { turn_id: turnId }, 2)
+    ]);
+    if (turn.status !== TERMINATED_TURN || terminations.length !== 1 || terminations[0].terminal_status !== 'completed') return null;
+    if (fences.length !== 1) return null;
+    const payloadContent = await this.contentStore.prepare(this.database, command.content, command.contentType);
+    const now = this.timestamp();
+    const foreground = await this.children.prepareForegroundSettlement({
+      childExecutionId,
+      status: 'succeeded',
+      detail: {
+        answerBridgeId: command.answerBridgeId,
+        answerSubmissionId: command.submissionId,
+        answerContentObjectId: payloadContent.metadata.id,
+        interrupted: false
+      },
+      sourceIdentity: `answer:${command.answerBridgeId}:${command.submissionId}`
+    });
+    const eligibleForeground = foreground && Date.parse(now) <= Date.parse(foreground.waitDeadlineAt)
+      ? foreground
+      : null;
+    const authoritySteps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('ChildExecution').assert(childExecutionId, { status: childStatus }),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertExactIds(
+        { child_execution_id: childExecutionId },
+        allTurnLinks.map((link) => requirePhaseFId(link.id, 'ChildExecutionTurnLink.id'))
+      ),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(requirePhaseFId(sourceTurnLink.id, 'ChildExecutionTurnLink.id'), {
+        child_execution_id: childExecutionId,
+        turn_id: turnId,
+        turn_seq: sourceTurnLink.turn_seq
+      }),
+      activeTurnLink
+        ? DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(
+            requirePhaseFId(activeTurnLink.id, 'ChildExecutionActiveTurnLink.id'),
+            { child_execution_id: childExecutionId, turn_id: turnId }
+          )
+        : DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assertNone({ child_execution_id: childExecutionId }),
+      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TERMINATED_TURN }),
+      DOMAIN_REPOSITORIES.domain('TurnTermination').assert(requirePhaseFId(terminations[0].id, 'TurnTermination.id'), {
+        turn_id: turnId,
+        terminal_status: 'completed'
+      }),
+      DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(requirePhaseFId(fences[0].id, 'TurnFinalOutputFence.id'), {
+        turn_id: turnId
+      })
+    ];
+    const factSteps = answerFactSteps(command, ids, snapshot.answerBridge, payloadContent, now, 'submitted');
+    try {
+      const commit = await this.database.transaction([
+        ...authoritySteps,
+        ...factSteps,
+        ...(eligibleForeground ? eligibleForeground.steps : [])
+      ]);
+      if (eligibleForeground) {
+        await this.children.finalizeWaitSettlement(eligibleForeground.toolCallId);
+        await this.markInboxSettled(ids.inboxItemId);
+      }
+      return answerResult(command, ids, eligibleForeground !== null, false, false, commit.commitSeq);
+    } catch (error) {
+      if (eligibleForeground && isExpectedForegroundRace(error) && await this.foregroundRaceHasDurableWinner(eligibleForeground)) {
+        try {
+          const commit = await this.database.transaction([...authoritySteps, ...factSteps]);
+          return answerResult(command, ids, false, false, false, commit.commitSeq);
+        } catch (retryError) {
+          error = retryError;
+        }
+      }
+      if (isTransactionAssertionFailure(error)) return null;
+      if (!isExpectedAnswerIdentityConflict(error)) throw error;
+      const raced = await this.findReplay(command, ids, payloadContent);
+      if (raced) return raced.historicalReplay ? null : raced;
+      throw error;
+    }
+  }
+
+  /**
    * Materializes one deterministic weak-signal answer when cancellation terminated a child Turn
    * before its final answer was submitted. Already submitted answers always win; concurrent recovery
    * contenders share the same submission identity and the bridge's current-submission CAS.
