@@ -189,7 +189,7 @@ test('完整历史首 create 准入实际发送结果，增量首 create 不冒�
   }
 });
 
-test('已接受转向仅是排队；自动后继无归属证明时标未知、保留输出用量并以完整历史恢复', { concurrency: false }, async () => {
+test('唯一已接受转向由其前驱的自动后继应用：created 标注提交身份、保留输出用量并以完整历史恢复', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const format = await formatForTest();
   const frames = [];
@@ -275,21 +275,20 @@ test('已接受转向仅是排队；自动后继无归属证明时标未知、�
       'response.steer.submitted',
       'response.steer.accepted',
       'response.incomplete',
-      'response.steer.disconnected',
       'response.created',
       'response.completed'
     ]);
     assert.deepEqual(events.map((event) => event.responseId), [
-      'resp_1', 'resp_1', 'resp_1', 'resp_1', 'resp_1', 'resp_2', 'resp_2'
+      'resp_1', 'resp_1', 'resp_1', 'resp_1', 'resp_2', 'resp_2'
     ]);
     assert.equal(events[1].submissionId, 'sub-1');
     assert.equal(events[2].steerId, 'steer_1');
     assert.equal(events[3].reason, 'steered');
     assert.deepEqual(events[3].usage, { input_tokens: 7, output_tokens: 2, total_tokens: 9 });
-    assert.equal(events[4].submissionId, 'sub-1');
-    assert.equal(events[4].reason, 'successor_application_unverified');
-    assert.equal(events[5].previousResponseId, 'resp_1');
-    assert.equal(events[5].submissionId, undefined, 'response.created contains no provider steering identity');
+    assert.equal(events[4].previousResponseId, 'resp_1');
+    assert.equal(events[4].submissionId, 'sub-1',
+      'the successor of the single accepted steer on its predecessor applied that steer');
+    assert.equal(events[4].steerId, 'steer_1');
     assert.equal(streamedText(chunks), '草稿小计划');
     assert.ok(!chunks.some((chunk) => chunk.error), 'steered incomplete must not surface as an error');
 
@@ -303,8 +302,8 @@ test('已接受转向仅是排队；自动后继无归属证明时标未知、�
     assert.equal(holder.calls.length, 2);
     assert.equal(holder.calls[1], undefined);
 
-    // A successor does not echo a steering submission/input digest. Reuse must NOT infer that
-    // the steered user input entered the server chain, even when exactly one steer was queued.
+    // The kernel records the steering Message in Context; the transport still rebuilds the next
+    // request from full history instead of trusting its own wire-encoded steer as a prefix.
     const decisions = [];
     await collect(streamOptions(
       server,
@@ -411,12 +410,11 @@ test('原生转向在已完成竞先后仍然续接且不失联', { concurrency:
       'response.steer.submitted',
       'response.completed',
       'response.steer.accepted',
-      'response.steer.disconnected',
       'response.created',
       'response.completed'
     ]);
-    assert.equal(events.find((event) => event.type === 'response.steer.disconnected').reason,
-      'successor_application_unverified');
+    assert.equal(events.find((event) => event.type === 'response.created' && event.responseId === 'resp_2').submissionId,
+      'sub-race', 'a steer accepted after completion is applied by its continuation');
     assert.equal(streamedText(chunks), '初稿修订');
     assert.ok(!chunks.some((chunk) => chunk.error));
     assert.equal(holder.calls.at(-1), undefined);
@@ -523,14 +521,13 @@ test('转向等待必需输入时提交工具结果恢复续接且不重复转�
       'response.completed',
       'response.steer.accepted',
       'response.steer.pending',
-      'response.steer.disconnected',
       'response.created',
       'response.completed'
     ]);
     const pending = events.find((event) => event.type === 'response.steer.pending');
     assert.deepEqual(pending.requiredInput, [{ type: 'function_call_output', callId: 'call_project', name: 'get_project_status' }]);
-    assert.equal(events.find((event) => event.type === 'response.steer.disconnected').reason,
-      'successor_application_unverified');
+    assert.equal(events.find((event) => event.type === 'response.created' && event.responseId === 'resp_2').submissionId,
+      'sub-wait', 'the waiting steer is prepended to the next response of its predecessor');
 
     // Same predecessor is insufficient proof: not even the apparently matching explicit
     // successor may claim tool-result admission or a fabricated per-create sequence.
@@ -652,9 +649,12 @@ test('waiting_for_input 的结果 create 与自动后继同前驱竞跑时不得
     assert.equal(explicit[0].previous_response_id, 'resp_root');
     assert.equal(explicit[0].input.filter((item) => item.type === 'function_call_output').length, 1);
     const events = nativeEvents(chunks);
-    assert.equal(events.filter((event) => event.type === 'response.steer.disconnected').length, 1);
-    assert.equal(events.find((event) => event.type === 'response.steer.disconnected')?.reason,
-      'successor_application_unverified');
+    assert.equal(events.filter((event) => event.type === 'response.steer.disconnected').length, 0,
+      'the single accepted steer is attributed, not left delivery-unknown');
+    assert.equal(events.find((event) => event.type === 'response.created' && event.responseId === 'resp_auto')?.submissionId,
+      'sub-race', 'the first successor of the predecessor applied the steer');
+    assert.equal(events.find((event) => event.type === 'response.created' && event.responseId === 'resp_explicit')?.submissionId,
+      undefined, 'an applied steer is never attributed twice');
     const rootCreated = events.find((event) => event.type === 'response.created' && event.responseId === 'resp_root');
     assert.equal(rootCreated.reason, undefined);
     assert.equal(rootCreated.unverifiedToolResultCallIds, undefined);
@@ -1136,7 +1136,7 @@ test('未启用原生时流行为逐字节保持：无原生事件、控制器�
   }
 });
 
-test('同一前驱两条 steer 只送首条：唯一后继也不证明归属，第二条明确失败并以完整历史恢复', { concurrency: false }, async () => {
+test('同一前驱两条 steer 只送首条：唯一后继应用首条，第二条明确失败并以完整历史恢复', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const format = await formatForTest();
   const frames = [];
@@ -1200,11 +1200,9 @@ test('同一前驱两条 steer 只送首条：唯一后继也不证明归属，�
       .map((event) => event.submissionId), ['sub-one']);
     assert.equal(events.find((event) => event.type === 'response.steer.failed')?.submissionId, 'sub-two');
     assert.equal(events.find((event) => event.type === 'response.steer.failed')?.error?.code, 'steering_pending_unproven');
-    assert.equal(events.find((event) => event.type === 'response.steer.disconnected')?.submissionId, 'sub-one');
-    assert.equal(events.find((event) => event.type === 'response.steer.disconnected')?.reason,
-      'successor_application_unverified');
+    assert.equal(events.filter((event) => event.type === 'response.steer.disconnected').length, 0);
     assert.equal(events.find((event) => event.type === 'response.created' && event.responseId === 'resp_2')?.submissionId,
-      undefined, 'one local candidate and one successor still do not prove steering attribution');
+      'sub-one', 'the only provider-accepted steer on the predecessor is applied by its successor');
     assert.equal(streamedText(chunks), '原稿后继');
     const decisions = [];
     await collect(streamOptions(server, format, 'native-steer-serial',
@@ -1223,6 +1221,60 @@ test('同一前驱两条 steer 只送首条：唯一后继也不证明归属，�
     ], 'recovery carries the model output from both sides of the steer, not only the new input');
     assert.equal(frames.filter((frame) => frame.type === 'response.steer').length, 1,
       'delivery-unknown and rejected work are never automatically retried');
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('后继出现时转向尚未被接受：无唯一归属，保持交付未知且不标注提交身份', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const server = await createServer((socket, request) => {
+    if (request.type === 'response.create') {
+      socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } }));
+      socket.send(JSON.stringify({
+        type: 'response.output_text.delta', response_id: 'resp_1', item_id: 'msg_1',
+        output_index: 0, content_index: 0, delta: '原稿'
+      }));
+      return;
+    }
+    if (request.type === 'response.steer') {
+      socket.send(JSON.stringify({
+        type: 'response.output_item.done', response_id: 'resp_1', output_index: 0,
+        item: messageItem('msg_1', '原稿', 0)
+      }));
+      socket.send(JSON.stringify({ type: 'response.completed', response: {
+        id: 'resp_1', status: 'completed', output: [], usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 }
+      } }));
+      // A successor of the same predecessor appears before any acceptance of the written steer.
+      sendMessageResponse(socket, 'resp_2', 'msg_2', '后继', 0, { previousResponseId: 'resp_1' });
+      socket.send(JSON.stringify({ type: 'response.steer.accepted', steer: { id: 'steer_late', previous_response_id: 'resp_1' } }));
+    }
+  });
+  const holder = { calls: [] };
+  try {
+    let steered = false;
+    const chunks = await drive(
+      streamOptions(server, format, 'native-steer-unacked-successor', requestBody(format, [user('起草')]), {
+        native: nativeOptions({ steering: true }, holder),
+        timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+      }),
+      async (chunk) => {
+        if (!steered && chunk.nativeEvent?.type === 'response.created') {
+          steered = true;
+          await holder.controller.steer({ submissionId: 'sub-unacked', input: [user('改短')] });
+        }
+      }
+    );
+    const events = nativeEvents(chunks);
+    const successor = events.find((event) => event.type === 'response.created' && event.responseId === 'resp_2');
+    assert.equal(successor.submissionId, undefined, 'an unacknowledged steer is never attributed to a successor');
+    const unknown = events.filter((event) => event.type === 'response.steer.disconnected');
+    assert.deepEqual(unknown.map((event) => [event.submissionId, event.reason]),
+      [['sub-unacked', 'successor_application_unverified']]);
+    assert.equal(events.filter((event) => event.type === 'response.steer.accepted').length, 0,
+      'a late acceptance after the unknown close is stale');
   } finally {
     resetOpenAIResponsesWebSocketSessions();
     await server.close();

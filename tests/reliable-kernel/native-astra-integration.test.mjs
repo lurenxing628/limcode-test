@@ -449,7 +449,7 @@ test('Astra executes a durable async call before response completion and deliver
   });
 });
 
-test('accepted steer and required result on one predecessor continue from Context without false admission or chain replay', { timeout: 30_000 }, async () => {
+test('accepted steer and required result on one predecessor apply the steer, continue from Context without false admission or chain replay', { timeout: 30_000 }, async () => {
   await withNativeRuntime(async harness => {
     const { app, conversationId, frames, created, text, completed, send, until } = harness;
     const turn = await harness.startTurn('native-pending-steer', 'Read the probe.');
@@ -506,7 +506,8 @@ test('accepted steer and required result on one predecessor continue from Contex
     assert.equal(delivery.body.input.find(item => item.type === 'function_call_output').call_id, 'original-synchronous-call');
     assert.equal(JSON.stringify(delivery.body.input).includes(instruction), false);
     created(delivery.socket, 'steer-response-2', 'steer-response-1');
-    await until(async () => (await receipt())?.state === 'delivery_unknown', 'unattested steering successor');
+    await until(async () => ['continuing', 'completed'].includes((await receipt())?.state),
+      'the unique accepted steer is applied by its successor');
     const [admitted] = await rows(app, 'ToolCall', { turn_id: turn.turnId });
     assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1,
       'the effect settled once even when the result create races a steer successor');
@@ -525,8 +526,8 @@ test('accepted steer and required result on one predecessor continue from Contex
       && item.call_id === 'original-synchronous-call').length, 1);
     assert.equal(rebaseItems.filter(item => item.type === 'function_call_output'
       && item.call_id === 'original-synchronous-call').length, 1, 'the settled result is carried exactly once');
-    assert.equal(JSON.stringify(rebaseItems).includes(instruction), false,
-      'an unverified steering instruction is not silently replayed');
+    assert.equal(rebaseItems.filter(item => JSON.stringify(item).includes(instruction)).length, 1,
+      'the applied steering instruction is part of Context and carried exactly once');
     created(rebase.socket, 'steer-response-3');
     completed(rebase.socket, 'steer-response-3', [
       text(rebase.socket, 'steer-response-3', 0, 'Final answer from the rebased request.')
@@ -545,20 +546,20 @@ test('accepted steer and required result on one predecessor continue from Contex
     assert.deepEqual(frames.filter(frame => frame.body.type === 'response.create'), [first, delivery, rebase],
       'provider received the original request, the single required result submission and one full rebase');
     const durable = await receipt();
-    assert.equal(durable.state, 'delivery_unknown', 'created does not identify the applied steer submission');
+    assert.equal(durable.state, 'completed', 'the successor of the single accepted steer applied it');
     assert.equal(durable.targetResponseId, 'steer-response-1');
-    assert.equal(durable.successorResponseId, undefined);
+    assert.equal(durable.successorResponseId, 'steer-response-2');
     assert.ok(durable.messageId);
     const [steerRevision] = await rows(app, 'MessageRevision', { message_id: durable.messageId });
     const [steerBody] = await rows(app, 'ContentObject', { id: steerRevision.content_object_id });
     assert.match((await app.contentStore.read(steerBody)).toString('utf8'), /report only its length/);
     assert.equal((await rows(app, 'ContextSegmentSource', {
       source_kind: 'message_revision', source_id: steerRevision.id
-    })).length, 0, 'unverified steer remains visible and durable but not applied to Context');
+    })).length, 1, 'the applied steer enters Context exactly once');
     const restoredProvider = new kernel.ModelProviderControlPlane(app.database, app.contentStore, { attachments: app.attachments });
     const restored = (await restoredProvider.steeringReceipts(conversationId))
       .find(value => value.submissionId === queued.submissionId);
-    assert.equal(restored.state, 'delivery_unknown');
+    assert.equal(restored.state, 'completed');
     assert.equal(restored.messageId, durable.messageId);
     assert.equal(frames.filter(frame => frame.body.type === 'response.steer').length, 1, 'never automatically re-submit');
     const turnsBeforeEdit = await rows(app, 'Turn', { conversation_id: conversationId });
@@ -601,7 +602,7 @@ test('accepted steer and required result on one predecessor continue from Contex
   });
 });
 
-test('an unattested automatic steer successor remains in the same request but never claims application', { timeout: 60_000 }, async () => {
+test('the automatic successor of a single accepted steer applies the instruction to Context in the same request', { timeout: 60_000 }, async () => {
   await withNativeRuntime(async harness => {
     const { app, conversationId, frames, created, text, completed, send, until } = harness;
     const turn = await harness.startTurn('native-automatic-steer', 'Begin the first direction.');
@@ -640,21 +641,24 @@ test('an unattested automatic steer successor remains in the same request but ne
     assert.equal(harness.httpCalls(), 0);
     const receipt = (await app.modelProvider.steeringReceipts(conversationId))
       .find(value => value.submissionId === queued.submissionId);
-    assert.equal(receipt.state, 'delivery_unknown');
+    assert.equal(receipt.state, 'completed');
     assert.equal(receipt.targetResponseId, 'automatic-response-1');
-    assert.equal(receipt.successorResponseId, undefined);
+    assert.equal(receipt.successorResponseId, 'automatic-response-2');
     const [steerRevision] = await rows(app, 'MessageRevision', { message_id: receipt.messageId });
     const [steerBody] = await rows(app, 'ContentObject', { id: steerRevision.content_object_id });
     assert.match((await app.contentStore.read(steerBody)).toString('utf8'), /Change direction without discarding/);
     assert.equal((await rows(app, 'ContextSegmentSource', {
       source_kind: 'message_revision', source_id: steerRevision.id
-    })).length, 0, 'a successor without steer attestation does not add user input to Context');
+    })).length, 1, 'the accepted steering Message enters Context exactly once');
     assert.equal(frames.filter(frame => frame.body.type === 'response.steer').length, 1, 'no silent retry');
     const [head] = await rows(app, 'ConversationContextHeadLink', { conversation_id: conversationId });
     const contextText = (await app.context.materialize(head.root_id)).segments
       .map(segment => segment.content.toString('utf8')).join('\n');
-    assert.match(contextText, /The already-visible original direction/);
-    assert.match(contextText, /The new direction after steering/);
+    const originalAt = contextText.indexOf('The already-visible original direction');
+    const steerAt = contextText.indexOf('Change direction without discarding');
+    const successorAt = contextText.indexOf('The new direction after steering');
+    assert.ok(originalAt >= 0 && originalAt < steerAt && steerAt < successorAt,
+      'Context keeps the real chronology: original output, steering input, steered successor');
   });
 });
 
@@ -924,7 +928,7 @@ for (const model of ['gpt-6-astra', 'gpt-6-sol']) {
   }
 }
 
-test('ready async results remain ordered behind an unattested steer successor without applying its instruction', { timeout: 60_000 }, async () => {
+test('ready async results remain ordered behind an accepted steer successor that applies its instruction', { timeout: 60_000 }, async () => {
   await withNativeRuntime(async harness => {
     const { app, conversationId, frames, created, text, completed, send, until } = harness;
     const turn = await harness.startTurn('combined-native-turn', 'Start the probe and keep working.');
@@ -966,14 +970,14 @@ test('ready async results remain ordered behind an unattested steer successor wi
     assert.equal((await turn.completion).terminalStatus, 'completed');
     const receipt = (await app.modelProvider.steeringReceipts(conversationId))
       .find(value => value.submissionId === queued.submissionId);
-    assert.equal(receipt.state, 'delivery_unknown');
-    assert.equal(receipt.successorResponseId, undefined);
+    assert.equal(receipt.state, 'completed');
+    assert.equal(receipt.successorResponseId, 'combined-response-2');
     const [steerRevision] = await rows(app, 'MessageRevision', { message_id: receipt.messageId });
     const [steerBody] = await rows(app, 'ContentObject', { id: steerRevision.content_object_id });
     assert.match((await app.contentStore.read(steerBody)).toString('utf8'), /new direction while the probe runs/);
     assert.equal((await rows(app, 'ContextSegmentSource', {
       source_kind: 'message_revision', source_id: steerRevision.id
-    })).length, 0);
+    })).length, 1);
     const [admitted] = await rows(app, 'ToolCall', { turn_id: turn.turnId });
     assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1);
     assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1);
@@ -990,7 +994,8 @@ test('ready async results remain ordered behind an unattested steer successor wi
       JSON.stringify(item).includes('Automatic successor has not received the probe result.')
     );
     const resultPosition = input.findIndex(item => item.type === 'function_call_output' && item.call_id === 'steered-async-call');
-    assert.equal(userPosition, -1, 'an unattested steer must never enter the next Turn\'s Context');
+    assert.ok(userPosition >= 0 && userPosition < automaticPosition,
+      'the applied steer precedes the automatic successor it produced in the next Turn\'s Context');
     assert.ok(automaticPosition >= 0 && automaticPosition < resultPosition,
       'real successor output and settled tool result retain their proven chronology');
     created(restored.socket, 'combined-response-4');

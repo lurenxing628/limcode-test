@@ -850,12 +850,10 @@ export class NativeRequestSession {
             content.capabilities
           );
         }
-        // previous_response_id only identifies a chain predecessor, not the steering
-        // submission responsible for a successor. Two simultaneous commands may share that
-        // predecessor, and a tool-result create can use it too. Only an explicitly observed
-        // provider submission identity may apply a user Message to Context. Current native
-        // transports do not expose one on response.created: keep the receipts pending/unknown
-        // instead of inventing application by order or even by a sole local candidate.
+        // previous_response_id alone only identifies a chain predecessor. The transport attributes
+        // a successor to a submission (submissionId) only when exactly one provider-accepted steer
+        // is outstanding on that predecessor; the accepted user Message then enters Context here,
+        // exactly once. Ambiguous candidates stay pending/unknown instead of being guessed.
         const submissionId = content.submissionId;
         if (content.previousResponseId && submissionId) {
           const applied = await this.serializeSteer(submissionId, async () => {

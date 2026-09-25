@@ -1648,7 +1648,7 @@ interface NativePendingSteer {
   wireInput: unknown[];
   targetResponseId: string;
   steerId?: string;
-  state: 'queued' | 'sending' | 'sent' | 'accepted' | 'waiting_for_input' | 'failed' | 'unknown';
+  state: 'queued' | 'sending' | 'sent' | 'accepted' | 'waiting_for_input' | 'applied' | 'failed' | 'unknown';
   resolve: () => void;
   reject: (error: Error) => void;
 }
@@ -2308,14 +2308,30 @@ function startNativeResponse(
     ? undefined
     : nativeWireToolResultCallIds(state.prepared.payload.input);
   let unverifiedToolResultCallIds: string[] | undefined;
-  // response.created attests only a response id and its predecessor. Neither an accepted
-  // steer id nor its input/submission digest is echoed, even for a single local candidate.
-  // Preserve the real successor/output, but explicitly mark all unresolved steering unknown;
-  // never place unverified user input in the trusted incremental continuation tail.
+  // A tool-result create racing any steer on the same predecessor stays unverified: the created
+  // frame echoes neither the create sequence nor a result digest.
   const unresolvedSteerAtCreate = (state.createInFlight !== undefined
     && state.ambiguousCreatePredecessors.has(state.createInFlight.previousResponseId))
     || state.steerSendingSubmission !== undefined
     || state.steerInFlight !== undefined || state.acceptedUnapplied.length > 0;
+  // The provider prepends accepted steering to the next response created from its target. When
+  // exactly one provider-accepted steer is outstanding and nothing else could have been queued
+  // against that predecessor, this successor applied it: attribute it on response.created so the
+  // kernel moves the steering Message into Context. Anything more ambiguous (a second candidate,
+  // an unacknowledged write) stays delivery-unknown below.
+  const appliedSteer = state.seenAnyResponse
+    && previousResponseId !== undefined
+    && state.steerSendingSubmission === undefined
+    && state.steerInFlight === undefined
+    && state.acceptedUnapplied.length === 1
+    && state.acceptedUnapplied[0]!.targetResponseId === previousResponseId
+    && (state.acceptedUnapplied[0]!.state === 'accepted' || state.acceptedUnapplied[0]!.state === 'waiting_for_input')
+    ? state.acceptedUnapplied.splice(0, 1)[0]
+    : undefined;
+  if (appliedSteer) {
+    appliedSteer.state = 'applied';
+    if (appliedSteer.steerId) state.steersById.delete(appliedSteer.steerId);
+  }
   const unknownSteers = state.seenAnyResponse
     ? disconnectNativeSteerChunks(state, 'successor_application_unverified')
     : [];
@@ -2373,6 +2389,9 @@ function startNativeResponse(
     connectionGeneration: state.lease.connectionGeneration,
     ...(previousResponseId ? { previousResponseId } : {}),
     ...(state.lease.streamId ? { streamId: state.lease.streamId } : {}),
+    ...(appliedSteer
+      ? { submissionId: appliedSteer.submissionId, ...(appliedSteer.steerId ? { steerId: appliedSteer.steerId } : {}) }
+      : {}),
     ...(admittedSeq !== undefined ? { responseCreateSeq: String(admittedSeq) } : {}),
     ...(admittedToolResultCallIds && admittedToolResultCallIds.length > 0
       ? { admittedToolResultCallIds }

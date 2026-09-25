@@ -306,6 +306,40 @@ const acceptSteer = async ({ command, emit, live }) => {
     submissionId: command.submissionId, steerId: `provider-${command.submissionId}` });
 };
 
+test('an accepted steer attributed to its successor is carried by the next full request', { timeout: 20000 }, async () => {
+  await withNativeKernel({
+    steer: acceptSteer,
+    async script({ round, emit, responseId, live, ended, app, shared }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId: 'response-0', capabilities });
+        await steerDuring(app, shared.turn.turnId, shared.turn.fence, 'steer-applied', 'Answer in French.');
+        await emit('native_control', { type: 'response.incomplete', responseId: 'response-0', reason: 'steered' });
+        live.responseId = 'response-0b';
+        await emit('native_control', { type: 'response.created', responseId: 'response-0b',
+          previousResponseId: 'response-0', submissionId: 'steer-applied', steerId: 'provider-steer-applied' });
+        await emitCall(emit, 'response-0b', 'call-A', 0);
+        await emit('native_control', { type: 'response.completed', responseId: 'response-0b',
+          usage: { input_tokens: 200, output_tokens: 10 } });
+        await ended.promise;
+        await emit('completed', { role: 'model', parts: [callPart('call-A', 0, 'response-0b')] });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'Réponse finale.');
+    }
+  }, async ({ app, requests, shared, startTurn, drive }) => {
+    shared.turn = await startTurn('applied-steer', 'Run the probe.');
+    const outcome = await within(drive(shared.turn), 'the applied-steer chain');
+    assert.equal(outcome.terminalStatus, 'completed');
+    const receipt = (await app.modelProvider.steeringReceipts(CONVERSATION))
+      .find(value => value.submissionId === 'steer-applied');
+    assert.equal(receipt.state, 'completed');
+    assert.equal(receipt.successorResponseId, 'response-0b');
+    const text = requestText(requests[1]);
+    assert.equal(text.split('Answer in French.').length - 1, 1, 'the steering instruction is in Context exactly once');
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+  });
+});
+
 test('steering outcome reported twice is idempotent in the durable receipt store', { timeout: 30000 }, async () => {
   await withNativeKernel({
     async script({ controls }) {
