@@ -557,8 +557,17 @@ test('a user fork of a forkTurns child owns its inherited history and outlives t
     await assertSelfContainedAuthority(fork.conversationId);
 
     await f.coordinator.waitForIdle();
-    // The child's final reply is its answer; the parent's next Turn takes it in before deletion.
+    // The child's final reply is its answer. While it still waits for the parent's next Turn the
+    // parent cannot be deleted; once that Turn took it in, deletion proceeds.
     await eventually(async () => (await f.list('AnswerSubmission')).length > 0, 'the child final reply became its answer');
+    const pendingAnswers = await eventually(async () => {
+      const deliveries = await f.list('RuntimeDelivery', { target_conversation_id: 'parent' });
+      return deliveries.length > 0 ? deliveries : undefined;
+    }, 'the child answer was never routed to its parent');
+    assert.deepEqual(pendingAnswers.map(delivery => [delivery.state, delivery.phase]), [['pending', 'next_turn']]);
+    await assert.rejects(f.app.database.conversationOwners.run('parent', () => f.app.conversationDeletion.delete('parent')),
+      /待接收的后台结果/, 'a parent with a child answer still pending is not deleted');
+    assert.equal((await f.list('Conversation', { id: 'parent' })).length, 1);
     assert.equal((await f.runInput('parent-takes-child-answer', 'PARENT_TAKES_CHILD_ANSWER_5530')).terminalStatus, 'completed');
     assert.deepEqual((await f.list('RuntimeDelivery', { target_conversation_id: 'parent' })).map(delivery => delivery.state), ['consumed']);
     const deleted = await f.app.database.conversationOwners.run('parent', () => f.app.conversationDeletion.delete('parent'));

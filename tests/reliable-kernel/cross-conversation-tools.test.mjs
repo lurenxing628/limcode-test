@@ -451,7 +451,13 @@ test('list excludes this conversation, its team and child tasks; read returns th
   for (const name of CROSS_CONVERSATION_TOOL_NAMES) assert.ok(builtin.includes(name), `${name} is registered`);
   await fixture(async (request, f, start) => {
     const names = start.tools.map(tool => tool.name);
-    if (request.conversationId === PEER) return ++peerRound === 1 ? spawn('peer-spawn', 'peer worker') : answer(REPLY);
+    if (request.conversationId === PEER) {
+      if (++peerRound === 1) return spawn('peer-spawn', 'peer worker');
+      // The peer's own child answers while the peer's Turn is still running: that Turn takes the
+      // answer in before its final reply, so reading the peer later finds exactly one peer Turn.
+      if (peerRound === 2) await f.until(async () => (await f.rows('RuntimeDelivery', { target_conversation_id: PEER })).length > 0, 'the peer child never answered');
+      return answer(REPLY);
+    }
     // Real child tasks of both teams: phase one never lists or addresses them across teams, and a
     // child task is not offered the cross-conversation tools even though its Turn froze the switch on.
     if (request.conversationId !== ROOT) {
@@ -492,15 +498,9 @@ test('list excludes this conversation, its team and child tasks; read returns th
     const children = await f.rows('ChildExecution');
     assert.equal(children.length, 2);
     await f.until(async () => childRequests >= 2, 'Both child tasks must reach the provider.');
-    // The peer's own child answers it with its final reply, which may start a peer Turn; reading
-    // the peer never does.
-    const peerAnswerTurns = new Set();
-    for (const delivery of await f.rows('RuntimeDelivery', { target_conversation_id: PEER })) {
-      const [inbox] = await f.rows('RuntimeInboxItem', { id: delivery.inbox_item_id });
-      if (inbox.source_kind === 'answer_submission') peerAnswerTurns.add(delivery.target_turn_id);
-    }
-    assert.ok((await f.rows('Turn', { conversation_id: PEER })).every(turn => turn.id === peer.turnId || peerAnswerTurns.has(turn.id)),
-      'reading never starts the other conversation');
+    assert.equal((await f.rows('Turn', { conversation_id: PEER })).length, 1, 'reading never starts the other conversation');
+    const [peerAnswer] = await f.rows('RuntimeDelivery', { target_conversation_id: PEER });
+    assert.equal(peerAnswer.target_turn_id, peer.turnId, 'the peer child answer was taken in by the peer\'s own running Turn');
     for (const child of children) {
       await assert.rejects(f.app.runtime.collaboration.readConversation({ conversationId: ROOT, targetConversationId: child.child_conversation_id,
         crossConversationTurnId: started.turnId }), /child task/);
