@@ -21,6 +21,7 @@ import RichContentView from '@webview/components/content/RichContentView.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import { normalizeTokenUsage } from './tokenUsageModel';
+import { modelRunMetrics, type ModelRunRound } from './runMetricsModel';
 
 const props = withDefaults(
   defineProps<{
@@ -63,16 +64,12 @@ const roleLabel = computed(() => {
   return model || 'LLM';
 });
 type RunMetricKey = 'time' | 'ttft' | 'total' | 'speed';
-interface RunMetricDetailItem {
-  label: string;
-  value: string;
-}
 interface RunMetricItem {
   key: RunMetricKey;
   label: string;
   value: string;
   tooltipTitle: string;
-  details: RunMetricDetailItem[];
+  details: TooltipPanelItem[];
 }
 interface TooltipPanelRow {
   kind?: 'row';
@@ -182,67 +179,72 @@ const runMetricItems = computed<RunMetricItem[]>(() => {
       }
     : undefined;
 
-  if (props.message.role === 'user' || streaming.value) {
+  if (props.message.role === 'user') {
     return [timeMetric].filter((item): item is RunMetricItem => item !== undefined);
   }
 
-  const explicitStreamDurationMs = normalizeDurationMs(props.message.streamOutputDurationMs);
-  const requestStartedAt = normalizeTimestamp(props.message.requestStartedAt);
-  const firstChunkAt = normalizeTimestamp(props.message.firstChunkAt ?? props.message.createdAt);
-  const completedAt = normalizeTimestamp(props.message.completedAt);
-  const streamDurationMs = explicitStreamDurationMs
-    ?? (firstChunkAt !== undefined && completedAt !== undefined && completedAt >= firstChunkAt
-      ? completedAt - firstChunkAt
-      : undefined);
-  const ttftMs = requestStartedAt !== undefined && firstChunkAt !== undefined && firstChunkAt >= requestStartedAt
-    ? firstChunkAt - requestStartedAt
-    : undefined;
-  const totalMs = requestStartedAt !== undefined && completedAt !== undefined && completedAt >= requestStartedAt
-    ? completedAt - requestStartedAt
-    : ttftMs !== undefined && streamDurationMs !== undefined
-      ? ttftMs + streamDurationMs
-      : undefined;
-  const outputTokens = props.message.usageMetadata
-    ? normalizeTokenUsage(props.message.usageMetadata).output
-    : undefined;
-  const tokenSpeed = streamDurationMs !== undefined && streamDurationMs > 0 && outputTokens !== undefined
-    ? outputTokens / (streamDurationMs / 1000)
-    : undefined;
-
+  const metrics = modelRunMetrics(props.message, streaming.value);
+  const rounds = metrics.rounds ?? [];
+  const multipleRounds = (metrics.roundCount ?? 0) > 1;
+  const omittedRounds = (metrics.roundCount ?? 0) - rounds.length;
+  const roundRows = (value: (round: ModelRunRound) => string | undefined): TooltipPanelItem[] => {
+    if (!multipleRounds) return [];
+    const rows = rounds.flatMap((round) => {
+      const text = value(round);
+      return text === undefined ? [] : [{ label: `第 ${round.index} 轮`, value: text, nested: true }];
+    });
+    if (rows.length === 0) return [];
+    return [
+      { kind: 'divider' as const },
+      { label: '每轮', value: `共 ${metrics.roundCount} 轮${omittedRounds > 0 ? `，列出最近 ${rounds.length} 轮` : ''}` },
+      ...rows
+    ];
+  };
   const items: Array<RunMetricItem | undefined> = [
     timeMetric,
-    ttftMs !== undefined
+    metrics.ttftMs !== undefined
       ? {
           key: 'ttft' as const,
           label: '首字',
-          value: formatDurationMs(ttftMs),
+          value: formatDurationMs(metrics.ttftMs),
           tooltipTitle: '首字用时',
-          details: [{ label: '首字用时', value: formatDurationMs(ttftMs) }]
-        }
-      : undefined,
-    totalMs !== undefined
-      ? {
-          key: 'total' as const,
-          label: '总耗',
-          value: formatDurationMs(totalMs),
-          tooltipTitle: '总耗时',
           details: [
-            { label: '总耗时', value: formatDurationMs(totalMs) },
-            ...(ttftMs !== undefined ? [{ label: '首字用时', value: formatDurationMs(ttftMs) }] : []),
-            ...(streamDurationMs !== undefined ? [{ label: '输出耗时', value: formatDurationMs(streamDurationMs) }] : [])
+            { label: multipleRounds ? '首轮首字' : '首字用时', value: formatDurationMs(metrics.ttftMs) },
+            ...(multipleRounds && metrics.averageTtftMs !== undefined
+              ? [{ label: '平均首字', value: formatDurationMs(metrics.averageTtftMs) }]
+              : []),
+            ...roundRows((round) => round.ttftMs === undefined ? undefined : formatDurationMs(round.ttftMs))
           ]
         }
       : undefined,
-    tokenSpeed !== undefined
+    metrics.totalMs !== undefined
+      ? {
+          key: 'total' as const,
+          label: '总耗',
+          value: formatDurationMs(metrics.totalMs),
+          tooltipTitle: '总耗时',
+          details: [
+            { label: '总耗时', value: formatDurationMs(metrics.totalMs) },
+            ...(metrics.ttftMs !== undefined ? [{ label: '首字用时', value: formatDurationMs(metrics.ttftMs) }] : []),
+            ...(metrics.outputDurationMs !== undefined
+              ? [{ label: metrics.roundCount ? '模型输出耗时（不含工具）' : '输出耗时', value: formatDurationMs(metrics.outputDurationMs) }]
+              : [])
+          ]
+        }
+      : undefined,
+    metrics.tokenSpeed !== undefined
       ? {
           key: 'speed' as const,
           label: '速度',
-          value: formattokenSpeed(tokenSpeed),
-          tooltipTitle: '输出 Token 速度（含思考）',
+          value: formattokenSpeed(metrics.tokenSpeed),
+          tooltipTitle: metrics.roundCount ? '输出 Token 速度（含思考，不含工具时间）' : '输出 Token 速度（含思考）',
           details: [
-            { label: '输出 Token（含思考）', value: formatExactNumber(outputTokens!) },
-            { label: '输出耗时', value: formatDurationMs(streamDurationMs!) },
-            { label: '速度', value: formattokenSpeedExact(tokenSpeed) }
+            { label: '输出 Token（含思考）', value: formatExactNumber(metrics.outputTokens!) },
+            { label: '输出耗时', value: formatDurationMs(metrics.outputDurationMs!) },
+            { label: '速度', value: formattokenSpeedExact(metrics.tokenSpeed) },
+            ...roundRows((round) => round.tokenSpeed === undefined
+              ? undefined
+              : `${formattokenSpeedExact(round.tokenSpeed)}（${formatExactNumber(round.outputTokens!)} Token · ${formatDurationMs(round.outputDurationMs!)}）`)
           ]
         }
       : undefined
@@ -359,10 +361,6 @@ function normalizeTokenNumber(value: unknown): number | undefined {
 
 function normalizeTimestamp(value: number | undefined): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-function normalizeDurationMs(value: number | undefined): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function formatCallTime(timestamp: number): string {

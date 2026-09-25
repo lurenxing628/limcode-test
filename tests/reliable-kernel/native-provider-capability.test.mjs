@@ -275,12 +275,16 @@ async function withNativeSseServer(state, run) {
     }
     const chunks = [];
     request.on('data', (chunk) => chunks.push(chunk));
-    request.once('end', () => {
+    request.once('end', async () => {
       const bodyText = Buffer.concat(chunks).toString('utf8');
       state.calls.push(bodyText ? JSON.parse(bodyText) : {});
       const events = state.scripts[state.calls.length - 1] ?? [];
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-      for (const event of events) response.write(`data: ${JSON.stringify(event)}\n\n`);
+      for (const event of events) {
+        // `{ delayMs }` holds the stream, e.g. to model the time before a response's first output.
+        if (typeof event.delayMs === 'number') await delay(event.delayMs);
+        else response.write(`data: ${JSON.stringify(event)}\n\n`);
+      }
       response.write('data: [DONE]\n\n');
       response.end();
     });
@@ -469,6 +473,70 @@ test('HTTP/SSE 原生泵：准入观察、控制器交付续流与链式聚合',
     assert.ok(responseIds.has('resp_2'), '链聚合内容保留第二个 response 边界');
     const asyncPart = parts.find((part) => 'functionCall' in part && part.id === 'call_1');
     assert.equal(asyncPart?.async, true);
+    capability.dispose();
+  });
+});
+
+test('HTTP/SSE 原生链：每个 response 结束时带自己的首字与输出用时，续接从提交工具结果算起', async () => {
+  const state = { calls: [], scripts: [] };
+  state.scripts[0] = [
+    { type: 'response.created', response: { id: 'resp_1' } },
+    { delayMs: 150 },
+    sseToolResponse('call_1'),
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_1',
+        usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+        output: [{ type: 'function_call', id: 'item-call_1', call_id: 'call_1', name: 'probe', arguments: '{"path":"demo.ts"}', async: true }]
+      }
+    }
+  ];
+  state.scripts[1] = [
+    { type: 'response.created', response: { id: 'resp_2' } },
+    { delayMs: 100 },
+    { type: 'response.output_text.delta', delta: 'done after tool' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_2',
+        usage: { input_tokens: 130, output_tokens: 5, total_tokens: 135 },
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done after tool' }] }]
+      }
+    }
+  ];
+  await withNativeSseServer(state, async (port) => {
+    const capability = createLlmProviderCapability({
+      settings: async () => providerConfig({ baseUrl: `http://127.0.0.1:${port}/v1`, nativeResponses: { enabled: true } })
+    });
+    const events = [];
+    let controller;
+    const controllerSeen = deferred();
+    capability.start(
+      chatRequest('sse-native-timing', {
+        tools: [{ name: 'probe', description: 'd', parameters: { type: 'object', properties: {} }, async: true }]
+      }),
+      (event) => events.push(event),
+      { native: { onController(next) { controller = next; if (next) controllerSeen.resolve(); } } }
+    );
+    await controllerSeen.promise;
+    const ended = (responseId) => until(() => events.find((event) => event.type === LlmEventType.NativeControl
+      && event.payload?.event?.type === 'response.completed' && event.payload.event.responseId === responseId), responseId);
+    const first = (await ended('resp_1')).payload.event.timing;
+    assert.ok(first.ttftMs >= 140, `首个 response 的首字含服务端首个输出前的等待：${first.ttftMs}`);
+    assert.equal(first.firstOutputAt - first.startedAt >= 140, true);
+    assert.ok(first.completedAt >= first.firstOutputAt);
+    const created = events.find((event) => event.type === LlmEventType.NativeControl && event.payload?.event?.type === 'response.created');
+    assert.equal(created.payload.event.timing, undefined, '只有 response 结束事件带计时');
+    // 模拟 400ms 的工具执行，然后提交结果。
+    await delay(400);
+    const submittedAt = Date.now();
+    await controller.submitToolResults([{ type: 'function_call_output', callId: 'call_1', output: '{"ok":true}' }]);
+    const second = (await ended('resp_2')).payload.event.timing;
+    assert.ok(second.startedAt >= submittedAt - 5, '续接 response 从提交工具结果算起');
+    assert.ok(second.ttftMs >= 90 && second.ttftMs < 400, `续接首字不含工具执行时间：${second.ttftMs}`);
+    assert.ok(second.outputDurationMs < 400);
+    await until(() => events.find((event) => event.type === LlmEventType.Done), 'logical Done');
     capability.dispose();
   });
 });

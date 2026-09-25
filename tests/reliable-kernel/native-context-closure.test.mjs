@@ -346,3 +346,40 @@ test('closing an ended native chain closes every settled call even when one call
   assert.deepEqual(appended, ['settled'], 'a sibling that cannot be cancelled does not strand a settled result');
   assert.equal(settled.delivered, false, 'a local Context append is not native_delivery');
 });
+
+test('each physical response of a native chain records its own first-token time and output speed on the request', { timeout: 30000 }, async () => {
+  const timing = (startedAt, ttftMs, outputDurationMs) => ({
+    startedAt, completedAt: startedAt + ttftMs + outputDurationMs, firstOutputAt: startedAt + ttftMs, ttftMs, outputDurationMs
+  });
+  await withNativeKernel(async ({ round, emit, responseId, ended }) => {
+    if (round === 0) {
+      await emit('native_control', { type: 'response.created', responseId, capabilities });
+      await emit('output_item_done', {
+        type: 'tool_calls',
+        calls: [{ id: 'call-timed', ordinal: 0, name: 'native_probe', arguments: { callId: 'call-timed' } }],
+        outputItem: { id: 'item-call-timed', ordinal: 0, providerResponseId: responseId }
+      });
+      await emit('native_control', { type: 'response.completed', responseId,
+        usage: { input_tokens: 200, output_tokens: 120 }, timing: timing(1_000, 700, 1_500) });
+      await ended.promise;
+      await emit('completed', { role: 'model', parts: [{ id: 'call-timed',
+        functionCall: { name: 'native_probe', args: { callId: 'call-timed' } },
+        outputItem: { id: 'item-call-timed', ordinal: 0, providerResponseId: responseId } }] });
+      return;
+    }
+    await emit('native_control', { type: 'response.created', responseId, capabilities });
+    await emit('native_control', { type: 'response.completed', responseId,
+      usage: { input_tokens: 260, output_tokens: 30 }, timing: timing(20_000, 300, 500) });
+    await emit('completed', { role: 'model', parts: [{ text: 'done' }] });
+  }, async ({ app, startTurn, drive }) => {
+    const turn = await startTurn('metrics-1', 'Probe once.');
+    assert.equal((await drive(turn)).terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
+    const requests = (await rows(app, 'ModelRequest', { turn_id: turn.turnId }))
+      .sort((left, right) => Number(left.request_seq) - Number(right.request_seq));
+    const metrics = requests.map(request => request.stream_stats_json.nativeResponseMetrics);
+    assert.deepEqual(metrics.map(entry => [entry.responseCount, entry.first.ttftMs, entry.speedOutputTokens, entry.speedOutputDurationMs]),
+      [[1, 700, 120, 1_500], [1, 300, 30, 500]],
+      'each full request keeps the metrics of the responses it carried, written as each response ended');
+  });
+});

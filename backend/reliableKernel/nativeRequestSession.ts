@@ -11,7 +11,7 @@ import {
   type OpenAIResponsesNativeController,
   type OpenAIResponsesNativeHooks
 } from '../capabilities/openAIResponsesNativeControl';
-import type { ModelOutputItemReference } from '../../shared/protocol';
+import type { ModelOutputItemReference, ModelResponseTiming } from '../../shared/protocol';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { freezeNativeChildToolProjection, readNativeRequestChildHandles, withChildHandles } from './conversationChildHandles';
 import { isCollaborationHandleTool, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
@@ -973,6 +973,7 @@ export class NativeRequestSession {
         // releasing a tool batch. Aggregate ModelRequest usage_json is billing for the whole chain,
         // never a measure of its latest model-visible prompt. Missing usage remains unknown.
         const stream = this.requireStream();
+        const timing = asRecord(event.content)?.timing;
         await this.deps.modelProvider.persistNativeResponseUsage(
           this.deps.modelRequestId, stream.attemptSeq, stream.socketGeneration, {
             responseId: content.responseId,
@@ -981,7 +982,10 @@ export class NativeRequestSession {
             streamSeq: event.streamSeq,
             ...(content.usage ? { usage: content.usage } : {}),
             ...(content.responseId === this.firstResponseId
-              ? { contextRootId: this.deps.initialContextRootId } : {})
+              ? { contextRootId: this.deps.initialContextRootId } : {}),
+            // The capability measured this response's first output and output time; the control
+            // plane validates it before folding it into the request's per-response metrics.
+            ...(timing !== undefined ? { timing: timing as ModelResponseTiming } : {})
           }
         );
         // Original-root calibration: only the FIRST physical response's actual input tokens,

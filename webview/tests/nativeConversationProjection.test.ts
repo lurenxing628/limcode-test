@@ -119,6 +119,31 @@ test('terminal aggregate revision still supersedes the transient on the native p
   );
 });
 
+test('a running native request carries its per-response metrics onto the message as each response ends', () => {
+  const metric = {
+    responseId: 'resp-1', startedAt: 1_000, completedAt: 3_000, firstOutputAt: 1_800, ttftMs: 800, outputDurationMs: 1_200,
+    outputTokens: 240
+  };
+  const metrics = {
+    responseCount: 1, first: metric, recent: [metric],
+    ttftTotalMs: 800, ttftCount: 1, speedOutputTokens: 240, speedOutputDurationMs: 1_200
+  };
+  const records = nativeShellRecords('streaming');
+  (records.ModelRequest['request-a'] as Record<string, unknown>).stream_stats_json = JSON.stringify({
+    attemptSeq: '1', socketGeneration: '1', retryReason: null, nativeResponseMetrics: metrics
+  });
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a',
+    records,
+    details: {
+      'message-content:revision-a': ready(JSON.stringify({ role: 'model', parts: [ITEM_ONE] }))
+    },
+    transientModelRequests: nativeTransient([ITEM_ONE, ITEM_LIVE])
+  });
+  assert.equal(projection.messages[0]?.status, 'streaming');
+  assert.deepEqual(projection.messages[0]?.responseMetrics, metrics);
+});
+
 function steeringChainRecords() {
   const aggregateParts = [
     ITEM_ONE,

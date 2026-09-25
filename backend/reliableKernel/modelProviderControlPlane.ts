@@ -92,13 +92,14 @@ import type {
   OpenAIResponsesNativeCapabilities,
   OpenAIResponsesToolOutput
 } from '../../shared/openAIResponsesNative';
-import type { MessageContent } from '../../shared/protocol';
+import type { MessageContent, ModelResponseMetrics, ModelResponseTiming } from '../../shared/protocol';
 import {
   NativeSteeringStore,
   type NativeSteeringReceipt,
   type NativeSteeringUpdate
 } from './nativeSteering';
 import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
+import { foldNativeResponseMetrics, parseNativeResponseMetrics, parseNativeResponseTiming } from './nativeResponseMetrics';
 import type { AttachmentIngestService } from './attachmentIngest';
 
 export interface CreateModelRequestCommand {
@@ -365,6 +366,8 @@ export interface NativePhysicalResponseUsageObservation {
   contextRootId?: string;
   /** Only an adapter proving complete actual wire coverage may assert this. */
   contextCovered?: boolean;
+  /** Measured by the capability while decoding this response; absent for a replayed response. */
+  timing?: ModelResponseTiming;
 }
 
 /** Bounded latest physical observation, stored inside existing ModelRequest.stream_stats_json. */
@@ -492,6 +495,8 @@ interface StreamStats {
   nativeInitialPromptTokenCount?: number;
   /** Constant-size last physical usage plus saturating distinct-response count; not cumulative billing. */
   nativeLatestResponseUsage?: NativeLatestResponseUsage;
+  /** Per-response first-token time and output speed of a native chain, for the message footer. */
+  nativeResponseMetrics?: ModelResponseMetrics;
   /** 终态才写：这次请求实际使用的 Claude 保留思考处理（按对话沿用，见 FullProviderRequest.claudeThinkingBinding）。 */
   claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
@@ -1737,11 +1742,18 @@ export class ModelProviderControlPlane {
   ): Promise<boolean> {
     // Parse and validate before touching persistent state (including on duplicate delivery).
     foldNativeResponseUsage(undefined, observation, attemptSeq, socketGeneration);
+    const timing = observation.timing === undefined ? undefined : parseNativeResponseTiming(observation.timing);
     return this.mergeNativeStreamStats(modelRequestId, attemptSeq, socketGeneration, (stats) => {
       const latest = foldNativeResponseUsage(stats.nativeLatestResponseUsage, observation, attemptSeq, socketGeneration);
-      return latest === stats.nativeLatestResponseUsage
-        ? { outcome: 'present' as const }
-        : { outcome: 'write' as const, stats: { ...stats, nativeLatestResponseUsage: latest } };
+      if (latest === stats.nativeLatestResponseUsage) return { outcome: 'present' as const };
+      // The usage fold accepted this response as new, so its metrics are folded exactly once too.
+      const metrics = timing === undefined
+        ? stats.nativeResponseMetrics
+        : foldNativeResponseMetrics(stats.nativeResponseMetrics, observation.responseId, timing, observation.usage);
+      return {
+        outcome: 'write' as const,
+        stats: { ...stats, nativeLatestResponseUsage: latest, ...(metrics ? { nativeResponseMetrics: metrics } : {}) }
+      };
     });
   }
 
@@ -3269,6 +3281,9 @@ function parseStreamStats(value: unknown): StreamStats {
       : {}),
     ...(value.nativeLatestResponseUsage !== undefined
       ? { nativeLatestResponseUsage: parseNativeLatestResponseUsage(value.nativeLatestResponseUsage) }
+      : {}),
+    ...(value.nativeResponseMetrics !== undefined
+      ? { nativeResponseMetrics: parseNativeResponseMetrics(value.nativeResponseMetrics) }
       : {})
   };
 }

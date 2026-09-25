@@ -332,3 +332,36 @@ test('真实 ModelProviderControlPlane → SQLite worker：重复回执无新提
     assert.equal(latest.physicalResponseCount, 2);
   });
 });
+
+test('SQLite worker 接受每轮首字与速度统计，并精确拒绝畸形记录', async () => {
+  await fixture(async ({ read, write }) => {
+    const metric = (responseId, extra = {}) => ({
+      responseId, startedAt: 1_000, completedAt: 3_000, firstOutputAt: 1_800, ttftMs: 800, outputDurationMs: 1_200,
+      outputTokens: 240, ...extra
+    });
+    const metrics = {
+      responseCount: 2, first: metric('resp-1'), recent: [metric('resp-1'), metric('resp-2', { reasoningTokens: 40 })],
+      ttftTotalMs: 1_600, ttftCount: 2, speedOutputTokens: 480, speedOutputDurationMs: 2_400
+    };
+    await write({ ...stats(), nativeResponseMetrics: metrics });
+    assert.deepEqual((await read()).nativeResponseMetrics, metrics);
+    const { firstOutputAt: _firstOutputAt, ...withoutFirstOutput } = metric('resp-3');
+    const malformed = [
+      ['unknown field', { ...metrics, extra: 1 }],
+      ['unknown metric field', { ...metrics, recent: [metric('resp-1', { surprise: true })] }],
+      ['empty recent', { ...metrics, recent: [] }],
+      ['recent above bound', { ...metrics, responseCount: 9, recent: Array.from({ length: 9 }, (_, index) => metric(`resp-${index}`)) }],
+      ['recent above count', { ...metrics, responseCount: 1 }],
+      ['first output fields apart', { ...metrics, recent: [withoutFirstOutput] }],
+      ['negative ttft', { ...metrics, first: metric('resp-1', { ttftMs: -1 }) }],
+      ['ttft count above responses', { ...metrics, ttftCount: 3 }],
+      ['empty response id', { ...metrics, first: metric('') }],
+      ['string tokens', { ...metrics, speedOutputTokens: '480' }]
+    ];
+    const before = await read();
+    for (const [caseName, value] of malformed) {
+      await assert.rejects(write({ ...stats(), nativeResponseMetrics: value }), undefined, caseName);
+      assert.deepEqual(await read(), before, `${caseName}: invalid worker transaction changed SQLite`);
+    }
+  });
+});

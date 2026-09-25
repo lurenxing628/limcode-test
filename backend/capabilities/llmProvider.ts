@@ -66,12 +66,14 @@ import {
   errorSearchText,
   finishThoughtBlock,
   fromUnifiedCompletedContent,
+  hasModelOutputChunk,
   hasStreamTimingChunk,
   isRecord,
   isSensitiveLlmErrorField,
   mergeUsageMetadata,
   nativeUsageMetadataFromResponse,
   NativePhysicalUsageAccumulator,
+  NativeResponseTimingTracker,
   nonEmptyRecord,
   nowMonotonicMs,
   shouldCloseThoughtBlock,
@@ -634,6 +636,7 @@ async function runLlmAttempt(
   responsesTerminal: ResponsesTerminalObservation = {},
   adaptationSession?: ProviderRequestAdaptationSession
 ): Promise<void> {
+  const attemptStarted = { at: Date.now(), mark: nowMonotonicMs() };
   // 这个对话的 Claude 保留思考处理随 Done 交回内核持久化（官方要求随会话保存、重启后也带上）。
   const conversationAdaptation = adaptationSession?.claudeThinkingBinding
     ? { claudeThinkingBinding: adaptationSession.claudeThinkingBinding }
@@ -695,6 +698,7 @@ async function runLlmAttempt(
 
   let latestUsageMetadata: LlmUsageMetadataRecord | undefined;
   const nativeUsage = new NativePhysicalUsageAccumulator();
+  const responseTiming = new NativeResponseTimingTracker(attemptStarted);
   const nativeChain: OpenAIResponsesNativeChainContext = {};
   const completedContents: MessageContent[] = [];
   const timing: LlmAttemptTimingState = { streamTimingChunkCount: 0 };
@@ -710,7 +714,10 @@ async function runLlmAttempt(
         ...(nativeHooks.onController
           ? {
               onController: (controller: OpenAIResponsesNativeController | undefined) =>
-                nativeHooks.onController!(controller ? wrapOpenAIResponsesNativeController(controller, options) : undefined)
+                nativeHooks.onController!(controller
+                  ? wrapOpenAIResponsesNativeController(controller, options,
+                    () => responseTiming.inputSubmitted(Date.now(), nowMonotonicMs()))
+                  : undefined)
             }
           : {})
       }
@@ -773,23 +780,28 @@ async function runLlmAttempt(
       const chunkAt = Date.now();
       const chunkMark = nowMonotonicMs();
       const nativeEvent = (chunk as LimCodeOpenAIResponsesStreamChunk).nativeEvent;
+      if (nativeEvent?.type === 'response.created') {
+        // 真实物理 response 独立记账；重连/回放不得再加一次。同一 response 的
+        // usage chunk 是更新而不是增量，逻辑 Done 的聚合只用于总计费。
+        if (nativeUsage.beginResponse(nativeEvent.responseId)) responseTiming.responseCreated(nativeEvent.responseId);
+        nativeChain.current = {
+          responseId: nativeEvent.responseId,
+          ...(nativeEvent.previousResponseId ? { previousResponseId: nativeEvent.previousResponseId } : {})
+        };
+      }
+      if (hasModelOutputChunk(chunk)) responseTiming.outputObserved(chunkAt, chunkMark);
       if (nativeEvent) {
-        if (nativeEvent.type === 'response.created') {
-          // 真实物理 response 独立记账；重连/回放不得再加一次。同一 response 的
-          // usage chunk 是更新而不是增量，逻辑 Done 的聚合只用于总计费。
-          nativeUsage.beginResponse(nativeEvent.responseId);
-          nativeChain.current = {
-            responseId: nativeEvent.responseId,
-            ...(nativeEvent.previousResponseId ? { previousResponseId: nativeEvent.previousResponseId } : {})
-          };
-        }
+        // 每个物理 response 结束时带上它自己的首字与输出用时；工具执行时间不属于任何 response。
+        const responseEndTiming = nativeEvent.type === 'response.completed' || nativeEvent.type === 'response.incomplete'
+          ? responseTiming.responseEnded(nativeEvent.responseId, chunkAt, chunkMark)
+          : undefined;
         chunkEmit({
           type: LlmEventType.NativeControl,
           payload: {
             requestId: request.id,
             event: nativeEvent.type === 'response.created' && nativeCapabilities
               ? { ...nativeEvent, capabilities: nativeCapabilities }
-              : nativeEvent
+              : responseEndTiming ? { ...nativeEvent, timing: responseEndTiming } : nativeEvent
           }
         });
       }
@@ -5891,7 +5903,8 @@ type NativeAttachmentResolverOptions = Pick<LlmProviderOptions, 'resolveAttachme
  */
 function wrapOpenAIResponsesNativeController(
   controller: OpenAIResponsesNativeController,
-  options: LlmProviderOptions
+  options: LlmProviderOptions,
+  onInputSubmitted: () => void
 ): OpenAIResponsesNativeController {
   return {
     get responseId() { return controller.responseId; },
@@ -5899,10 +5912,12 @@ function wrapOpenAIResponsesNativeController(
     get streamId() { return controller.streamId; },
     async steer(command) {
       const input = await Promise.all(command.input.map((content) => resolveNativeSteeringContent(content, options)));
+      onInputSubmitted();
       await controller.steer({ ...command, input });
     },
     async submitToolResults(outputs) {
       const resolved = await resolveOpenAIResponsesNativeToolOutputs(outputs, options);
+      onInputSubmitted();
       return controller.submitToolResults(resolved);
     },
     endLogicalRequest() {

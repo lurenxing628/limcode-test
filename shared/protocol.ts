@@ -1808,6 +1808,38 @@ export function textContent(role: ContentRole, text: string): MessageContent {
 
 export type MessagePresentation = 'visible' | 'internal';
 
+/** Timing of one physical model response: from its start (request or submitted input) to its end. */
+export interface ModelResponseTiming {
+  startedAt: number;
+  completedAt: number;
+  firstOutputAt?: number;
+  ttftMs?: number;
+  /** First output to the end of the response; tool execution between responses is excluded. */
+  outputDurationMs?: number;
+}
+
+export interface ModelResponseMetric extends ModelResponseTiming {
+  responseId: string;
+  /** Output tokens of this response, reasoning included. */
+  outputTokens?: number;
+  reasoningTokens?: number;
+}
+
+/**
+ * Per-response metrics of a native request that spans several physical responses. `recent` holds
+ * the newest responses for the breakdown; the totals cover every response of the request.
+ */
+export interface ModelResponseMetrics {
+  responseCount: number;
+  first: ModelResponseMetric;
+  recent: ModelResponseMetric[];
+  ttftTotalMs: number;
+  ttftCount: number;
+  /** Output tokens and output time summed over the responses that reported both. */
+  speedOutputTokens: number;
+  speedOutputDurationMs: number;
+}
+
 export interface MessageRecord {
   id: string;
   /** Immutable revision observed when an edit interaction begins. */
@@ -1824,6 +1856,8 @@ export interface MessageRecord {
   firstChunkAt?: number;
   completedAt?: number;
   streamOutputDurationMs?: number;
+  /** Native requests only: first-token time and output speed of each physical response. */
+  responseMetrics?: ModelResponseMetrics;
   usageMetadata?: LlmUsageMetadataRecord;
   /** Exact Runtime fact used when the user retries this projected model output. */
   retryTarget?: MessageRetryTarget;

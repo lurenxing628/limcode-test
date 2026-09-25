@@ -15,7 +15,11 @@ import type {
   ToolSchedulingMode
 } from '@shared/protocol';
 import { reliableKernelDetailKey } from './reliableDetailKey.ts';
-import { modelRequestNativeCapabilities } from '../reliability/modelRequestStreamStats.ts';
+import {
+  modelRequestNativeCapabilities,
+  modelRequestResponseMetrics,
+  modelRequestStreamStats
+} from '../reliability/modelRequestStreamStats.ts';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import { hasSteeringApplicationReceipt } from './steeringReceiptProof.ts';
 import type {
@@ -587,6 +591,7 @@ function appendTransientMessages(input: {
       messageIdByModelRequestId: input.messageIdByModelRequestId
     });
     if (anchoredSequence === undefined) continue;
+    const responseMetrics = request ? modelRequestResponseMetrics(modelRequestStreamStats(request)) : undefined;
     messages.push({
       record: {
         model_request_id: transient.modelRequestId,
@@ -608,6 +613,7 @@ function appendTransientMessages(input: {
         ...(transient.streamOutputDurationMs !== undefined
           ? { streamOutputDurationMs: transient.streamOutputDurationMs }
           : {}),
+        ...(responseMetrics ? { responseMetrics } : {}),
         ...(usageMetadata ? { usageMetadata } : {}),
         retryTarget: { kind: 'model_request', modelRequestId: transient.modelRequestId },
         seq: anchoredSequence
@@ -822,6 +828,7 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
   const firstChunkAt = timestamp(streamStats?.firstOutputAt);
   const completedAt = timestamp(streamStats?.completedAt);
   const streamOutputDurationMs = finiteNumber(streamStats?.streamOutputDurationMs);
+  const responseMetrics = modelRequestResponseMetrics(streamStats);
   const materializationStatus: MessageRecord['status'] = request.status === 'terminal'
     ? request.terminal_state === 'completed' ? 'final' : 'partial'
     : 'streaming';
@@ -847,7 +854,8 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
     ...(completedAt > 0 ? { completedAt } : {}),
     ...(streamOutputDurationMs !== undefined && streamOutputDurationMs >= 0
       ? { streamOutputDurationMs }
-      : {})
+      : {}),
+    ...(responseMetrics ? { responseMetrics } : {})
   };
 }
 
@@ -969,7 +977,13 @@ function splitAggregateMessagesAtSteeringBoundaries(
     let lastId = originalMessage.id;
     for (const segment of segments.slice(1)) {
       const syntheticId = `${originalMessage.id}:steer-successor:${segment.responseId}`;
-      const { retryTarget: _retryTarget, usageMetadata: _usageMetadata, ...messageBase } = originalMessage;
+      // 用量与每轮指标属于整个请求，只留在来源条目上，不在拆出的后继上重复。
+      const {
+        retryTarget: _retryTarget,
+        usageMetadata: _usageMetadata,
+        responseMetrics: _responseMetrics,
+        ...messageBase
+      } = originalMessage;
       result.splitSourceMessageIdByMessageId[syntheticId] = originalMessage.id;
       messages.push({
         record: entry.record,

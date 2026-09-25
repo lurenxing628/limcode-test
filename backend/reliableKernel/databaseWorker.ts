@@ -7,6 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { toSqliteFilePath } from './sqliteFilePath';
+import { parseNativeResponseMetrics } from './nativeResponseMetrics';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
@@ -1053,6 +1054,7 @@ function decodeModelStreamIdentity(value: unknown): {
     'thinkingSelection',
     'nativeInitialPromptTokenCount',
     'nativeLatestResponseUsage',
+    'nativeResponseMetrics',
     'compressionPurpose',
     'compressionDecision',
     'failure',
@@ -1119,6 +1121,7 @@ function decodeModelStreamIdentity(value: unknown): {
   if (record.nativeLatestResponseUsage !== undefined) {
     decodeNativeResponseUsage(record.nativeLatestResponseUsage, attemptSeq, socketGeneration);
   }
+  if (record.nativeResponseMetrics !== undefined) parseNativeResponseMetrics(record.nativeResponseMetrics);
   return {
     attemptSeq,
     socketGeneration,
