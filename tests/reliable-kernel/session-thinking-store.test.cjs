@@ -15,6 +15,11 @@ function fixture() {
     on(type, callback) { listeners.set(type, callback); return () => listeners.delete(type); }, ready() {}, currentClientId() { return 'fixture-client'; } };
   let client, store;
   const noopStore = new Proxy({ records: {}, viewKind: 'test' }, { get(target, key) { return key in target ? target[key] : () => undefined; } });
+  const globalSettings = {
+    loadedSections: {}, revisions: {},
+    requestChannelSettings() {}, reconcilePendingSettings() {},
+    applySnapshot({ section, revision }) { this.loadedSections[section] = true; this.revisions[section] = revision; }
+  };
   function load(file) {
     const code = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
     const module = { exports: {} };
@@ -26,6 +31,7 @@ function fixture() {
       if (name.endsWith('/useClientStateStore') || name === './useClientStateStore') return { useClientStateStore: () => client };
       if (name.endsWith('/useModelProfileStore')) return { useModelProfileStore: () => store };
       if (name === '@webview/transport') return { BridgeMessageType: protocol.BridgeMessageType, bridge };
+      if (name.endsWith('/useGlobalSettingsStore')) return { useGlobalSettingsStore: () => globalSettings };
       if (name.startsWith('@webview/stores/')) return { [name.split('/').at(-1)]: () => noopStore };
       throw new Error(`Unexpected dependency: ${name}`);
     } });
@@ -38,7 +44,7 @@ function fixture() {
   const reply = (request, payload) => emit(protocol.BridgeMessageType.ModelProfileScopeSnapshot,
     payload.outcome === 'committed' ? { operation: request.type === protocol.BridgeMessageType.ModelProfileScopeClear ? 'clear' : request.payload.operation, expectedRevision: request.payload.expectedRevision, ...payload } : payload, request.id);
   const read = (scopeId, payload = snapshot(scopeId, 'low', 1)) => { store.refreshScope('conversation', scopeId); reply(requests.at(-1), payload); };
-  return { store, client, requests, timers, emit, reply, read };
+  return { store, client, globalSettings, requests, timers, emit, reply, read };
 }
 const model = { providerConfigId: 'fixture', provider: 'openai-compatible', model: 'o3' };
 function snapshot(scopeId, value, sequence, authorityId = 'root-a') {
@@ -130,6 +136,31 @@ test('真实bootstrap full payload迟到不覆盖已确认scope；只触发受�
   const count = f.requests.length;
   f.emit(protocol.BridgeMessageType.ConfigurationSnapshot, { state: { ...createEmptyClientState(), modelProfiles: [old.profile], modelProfileScopeLinks: [old.link] } });
   assert.equal(f.requests.length, count, 'unchanged catalogs cannot create read loops');
+});
+
+test('相同渠道设置 revision 的重复快照不让 Agent 默认 LLM 持续重读或闪烁', () => {
+  const f = fixture();
+  const agentSnapshot = (sequence) => {
+    const value = snapshot('main', 'low', sequence);
+    return { ...value, scopeKind: 'agent', link: { ...value.link, scopeKind: 'agent' } };
+  };
+  f.store.activateScope('agent', 'main');
+  const firstRead = f.requests.at(-1);
+  f.emit(protocol.BridgeMessageType.GlobalSettingsSnapshot, { section: 'llm', revision: 'llm-r1', settings: {} });
+  f.reply(firstRead, agentSnapshot(1));
+  const invalidatedRead = f.requests.at(-1);
+  assert.notEqual(invalidatedRead.id, firstRead.id, '首次载入设置期间的失效应读取一次最新模型');
+  f.reply(invalidatedRead, agentSnapshot(2));
+  assert.equal(f.store.readingFor('agent', 'main'), false);
+  const stableCount = f.requests.length;
+  f.emit(protocol.BridgeMessageType.GlobalSettingsSnapshot, { section: 'llm', revision: 'llm-r1', settings: {} });
+  f.emit(protocol.BridgeMessageType.GlobalSettingsSnapshot, { section: 'llm', revision: 'llm-r1', settings: {} });
+  assert.equal(f.requests.length, stableCount, '相同已保存值不能再次触发读取');
+  assert.equal(f.store.readingFor('agent', 'main'), false);
+  f.emit(protocol.BridgeMessageType.GlobalSettingsSnapshot, { section: 'llm', revision: 'llm-r2', settings: {} });
+  assert.equal(f.requests.length, stableCount + 1, '真正变更 revision 仍须重读');
+  f.reply(f.requests.at(-1), agentSnapshot(3));
+  assert.equal(f.store.readingFor('agent', 'main'), false);
 });
 
 test('scope序号独立、absence受保护，迟到scoped与陌生host payload不倒退', () => {

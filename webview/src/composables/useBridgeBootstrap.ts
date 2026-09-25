@@ -81,8 +81,12 @@ export function useBridgeBootstrap(): void {
     }),
     bridge.on(BridgeMessageType.GlobalSettingsSnapshot, (message) => {
       if (message.payload) {
+        const { section, revision } = message.payload;
+        const modelSettingsChanged = (section === 'llm' || section === 'llmProviderConfigs')
+          && (!globalSettings.loadedSections[section] || globalSettings.revisions[section] !== revision);
         globalSettings.applySnapshot(message.payload, message.correlationId);
-        if (message.payload.section === 'llm' || message.payload.section === 'llmProviderConfigs') modelProfiles.invalidateActiveScopes();
+        if (modelSettingsChanged && globalSettings.loadedSections[section]
+          && globalSettings.revisions[section] === revision) modelProfiles.invalidateActiveScopes();
       }
     }),
     bridge.on(BridgeMessageType.GlobalSettingsFlush, (message) => {
