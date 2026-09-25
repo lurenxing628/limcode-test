@@ -15,7 +15,7 @@ import {
   type ToolResultOut,
   type ToolRuntimeEvent
 } from '../../world/modules/tools/registry';
-import type { GlobalSettingsRecord, RuleFileRecord, RuleScope, SkillDefinitionRecord, ToolDefinitionRecord, WorkEnvironmentRecord } from '../../../shared/protocol';
+import { SKILLS_TOOL_NAME, type GlobalSettingsRecord, type RuleFileRecord, type RuleScope, type SkillDefinitionRecord, type ToolDefinitionRecord, type WorkEnvironmentRecord } from '../../../shared/protocol';
 import type {
   ReliableAgentToolDispatchInput,
   ReliableAgentToolPause,
@@ -36,7 +36,9 @@ import { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigu
 import type { PlainJsonValue } from '../../reliableKernel/plainJson';
 import { resolveFrozenWorkEnvironmentBoundary } from '../../reliableKernel/workEnvironmentBoundary';
 import { frozenSkillPolicy } from '../../reliableKernel/frozenAuthority';
-import { lazySkillCatalogWithinPolicy } from '../../world/modules/skill/policy';
+import { frozenToolPolicyDocument } from '../../reliableKernel/childExecutionBoundary';
+import { realPathOfNearestExisting } from '../../capabilities/vscodeFs';
+import { lazySkillCatalogWithinPolicy, skillCatalogWithinPolicy } from '../../world/modules/skill/policy';
 import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 
 export interface VscodeReliableToolHostOptions {
@@ -64,6 +66,8 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   private readonly builtins: ToolDefinition[];
   private readonly filePlanner: LocalFileToolPlanner;
   private initialization: Promise<void> | undefined;
+  private skillWatcher: vscode.Disposable | undefined;
+  private disposed = false;
   private mcpInitialization: Promise<void> | undefined;
   private onStateChange: (() => void) | undefined;
 
@@ -85,10 +89,29 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   }
 
   public initialize(): Promise<void> {
-    this.initialization ??= Promise.all([
-      this.skills.refresh(),
-      this.rules.refresh()
-    ]).then(() => { this.notifyStateChange(); });
+    if (!this.initialization) {
+      const pending = Promise.all([
+        this.skills.refresh(),
+        this.rules.refresh()
+      ]).then(() => {
+        // SKILL.md added, edited or removed (by the user or an agent) shows up without a manual refresh.
+        // A host closed while its first scan ran never starts watching; a watcher that cannot start
+        // leaves the catalog refreshing on demand only.
+        if (!this.disposed && !this.skillWatcher) {
+          try {
+            this.skillWatcher = this.skills.watch(() => this.notifyStateChange());
+          } catch (error) {
+            console.warn('[LimCode] Skill catalog watching failed to start.', error);
+          }
+        }
+        this.notifyStateChange();
+      });
+      this.initialization = pending;
+      // A later command retries a failed scan instead of every Turn failing on the first one.
+      void pending.catch(() => {
+        if (this.initialization === pending) this.initialization = undefined;
+      });
+    }
     // Start discovery alongside the core catalogs, but do not make builtin Turn admission wait for
     // a remote MCP initialize/listTools round trip. A completed refresh naturally changes the tool
     // definitions frozen by the next ModelRequest.
@@ -105,6 +128,9 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   }
 
   public async dispose(): Promise<void> {
+    this.disposed = true;
+    this.skillWatcher?.dispose();
+    this.skillWatcher = undefined;
     await this.mcp.dispose();
   }
 
@@ -166,7 +192,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       workEnvironments: environments.allowed,
       accessibleWorkEnvironments: environments.allowed,
       ...(definition.declaration.name === 'read' && !reliableReadAttachmentId(input.arguments)
-        ? { attachmentMaxBytes: await this.loadAttachmentMaxBytes() }
+        ? { attachmentMaxBytes: await this.loadAttachmentMaxBytes(), skillDirectories: this.skillDirectoriesFor(authority) }
         : {}),
       signal,
       emit
@@ -185,6 +211,22 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
         }
       } : {})
     }, context);
+  }
+
+  /**
+   * Directories of the skills this Turn may use (and of the plugins they belong to), whose bundled
+   * files read serves and whose scripts may run there. Only a Turn that may call the skills tool has
+   * any. A malformed frozen setting only means no extra directories: ordinary reads and commands never
+   * depend on it.
+   */
+  private skillDirectoriesFor(authority: ReliableToolDispatchAuthority): string[] {
+    try {
+      if (!frozenToolPolicyDocument(authority.document).allowedTools.includes(SKILLS_TOOL_NAME)) return [];
+      const skills = skillCatalogWithinPolicy(this.skills, frozenSkillPolicy(authority.document)).list();
+      return [...new Set(skills.flatMap((skill) => [skill.dir, ...(skill.pluginRoot ? [skill.pluginRoot] : [])]))];
+    } catch {
+      return [];
+    }
   }
 
   public async executeWorkEnvironmentTransfer(
@@ -241,6 +283,14 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     }
     const args = asRecord(input.arguments);
     const requested = typeof args?.cwd === 'string' && args.cwd.trim() ? args.cwd.trim() : '.';
+    // A skill's bundled scripts may expect to run from the skill's own directory (by real path, so a
+    // link inside a skill cannot lead the command out of it).
+    if (path.isAbsolute(requested)) {
+      const real = await realPathOfNearestExisting(requested);
+      for (const dir of this.skillDirectoriesFor(authority)) {
+        if (isInsideRoot(dir, requested) && isInsideRoot(await realPathOfNearestExisting(dir), real)) return path.resolve(requested);
+      }
+    }
     const root = path.resolve(active.rootPath);
     const cwd = path.resolve(root, requested);
     assertInsideRoot(root, cwd, 'command cwd');

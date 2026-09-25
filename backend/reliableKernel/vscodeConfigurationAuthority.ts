@@ -64,6 +64,7 @@ import {
 } from '../../shared/modelCapabilities';
 import { resolveToolPolicyLayers, toolPolicyScopeLayer, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
 import { boundChildSkillPolicy, boundChildToolPolicy, type BoundSkillPolicy, type BoundToolPolicy } from './childExecutionBoundary';
+import { requireSkillSourceConfigs } from '../world/modules/skill/policy';
 import {
   createLocalFolderWorkEnvironmentRecord,
   isLocalFolderWorkEnvironment,
@@ -359,7 +360,12 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       && (selectedModelConfig?.claudeTurnScopedReminders ?? provider.claudeTurnScopedReminders) === true;
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
     const compressionThresholdTokens = compression.thresholdTokens;
-    const ownSkillPolicy = { id: skillPolicy?.id ?? null, sourceConfigs: clonePlainRecord(skillPolicy?.sourceConfigs) };
+    // The stored settings are checked like saved ones, so a hand-edited list can never be spread into
+    // characters when bounded by the parent (see requireSkillSourceConfigs).
+    const ownSkillPolicy = {
+      id: skillPolicy?.id ?? null,
+      sourceConfigs: requireSkillSourceConfigs(skillPolicy?.sourceConfigs, `Skill Policy ${skillPolicy?.id ?? ''} sourceConfigs`)
+    };
     // A skill the parent Turn turned off stays off in its child.
     const frozenSkillPolicy: BoundSkillPolicy = request.inheritedSkillPolicy
       ? boundChildSkillPolicy(ownSkillPolicy, request.inheritedSkillPolicy)
@@ -1507,11 +1513,6 @@ function providerContainsModel(provider: LlmProviderConfigRecord, modelId: strin
 
 function builtinSystemPromptPart(text: string | undefined): SystemPromptTextPart | undefined {
   return text?.trim() ? { text } : undefined;
-}
-
-function clonePlainRecord<T>(value: Record<string, T> | undefined): Record<string, T> {
-  if (!value) return {};
-  return JSON.parse(JSON.stringify(value)) as Record<string, T>;
 }
 
 function clonePlain<T>(value: T): T {

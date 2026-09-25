@@ -8,6 +8,11 @@ export interface RuntimeDeliveryWakeDependencies {
   application(): ReliableKernelApplication | undefined;
   conversations(): ReliableConversationRunner | undefined;
   children(): ReliableChildAgentCoordinator | undefined;
+  /**
+   * The post-activation catalogs (skills, rules, workspace configuration) every Turn and model
+   * request reads; a wake right after activation waits for them like a user command does.
+   */
+  ready?(): Promise<void>;
   notify?(request: ProcessCompletionWakeRequest): void;
 }
 
@@ -26,6 +31,7 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
       if (acknowledged.changed) dependencies.notify?.(request);
       return { acknowledged: true };
     }
+    await dependencies.ready?.();
     if (request.action === 'resume_current_turn') {
       if (!request.targetTurnId) return { acknowledged: false };
       // This is a scheduling hint. The loop absorbs committed input at a safe protocol boundary.

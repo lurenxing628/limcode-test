@@ -2,6 +2,7 @@
 import type { ChatModelOverrideRecord, ModelProfileScopeMutationReceipt, ModelProfileScopeSnapshotPayload, ModelProfileScopeReadPayload, SessionThinkingOverride, SystemPromptScopeSetPayload } from '../../shared/protocol';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import { sourceConfigsProblem } from '../../shared/toolPolicyResolution';
+import { requireSkillSourceConfigs } from '../world/modules/skill/policy';
 import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
 import { canonicalLlmProviderKind } from '../../shared/protocol';
 import { resolveSavedSessionThinkingOverride, validateSessionThinkingOverride } from '../../shared/sessionThinking';
@@ -612,6 +613,14 @@ export class VscodeConfigurationMutations {
 
   public setSkillPolicy(payload: SkillPolicyScopeSetPayload): Promise<void> {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
+    let sourceConfigs: SkillPolicyRecord['sourceConfigs'];
+    try {
+      sourceConfigs = payload.sourceConfigs === undefined
+        ? undefined
+        : requireSkillSourceConfigs(payload.sourceConfigs, 'Skill Policy sourceConfigs');
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.mutate((paths) => this.setScoped(
       skillPolicyStore(paths),
       skillPolicyLinkStore(paths),
@@ -620,7 +629,7 @@ export class VscodeConfigurationMutations {
       (existing, id) => ({
         id,
         name: normalizedOptionalText(payload.name) ?? existing?.name ?? defaultPolicyName('技能', scope.scopeKind),
-        ...(payload.sourceConfigs !== undefined ? { sourceConfigs: plainClone(payload.sourceConfigs) } : existing?.sourceConfigs ? { sourceConfigs: plainClone(existing.sourceConfigs) } : {})
+        ...(sourceConfigs !== undefined ? { sourceConfigs } : existing?.sourceConfigs ? { sourceConfigs: plainClone(existing.sourceConfigs) } : {})
       }),
       (existing, recordId, now) => ({
         id: existing?.id ?? scopeLinkId('skill-policy', scope),

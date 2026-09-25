@@ -3,6 +3,7 @@ import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import { requireSkillSourceConfigs } from '../world/modules/skill/policy';
 import { MAX_LLM_RETRY_DELAY_SECONDS, canonicalLlmProviderKind } from '../../shared/protocol';
 import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind, SkillPolicyRecord } from '../../shared/protocol';
 import type {
@@ -119,8 +120,7 @@ export function frozenSkillPolicy(document: PlainJsonValue): Pick<SkillPolicyRec
   if (!isRecord(document.skillPolicy)) throw new TypeError('AuthoritySnapshot.skillPolicy must be an object.');
   const sourceConfigs = document.skillPolicy.sourceConfigs;
   if (sourceConfigs === undefined || sourceConfigs === null) return {};
-  if (!isRecord(sourceConfigs)) throw new TypeError('AuthoritySnapshot.skillPolicy.sourceConfigs must be an object.');
-  return { sourceConfigs: sourceConfigs as SkillPolicyRecord['sourceConfigs'] };
+  return { sourceConfigs: requireSkillSourceConfigs(sourceConfigs, 'AuthoritySnapshot.skillPolicy.sourceConfigs') };
 }
 
 export function frozenModelIdentity(document: PlainJsonValue): { providerId: string; modelId: string } {

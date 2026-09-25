@@ -576,7 +576,7 @@ function fallbackToolSummary(toolName: string, args: unknown): string | undefine
     const rawSource = typeof source.source === 'string'
       ? source.source.trim().replace(/^\./, '').toLowerCase()
       : '';
-    const skillSource = ['agents', 'claude', 'global'].includes(rawSource) ? rawSource : '';
+    const skillSource = ['agents', 'claude', 'github', 'codex', 'user', 'global'].includes(rawSource) ? rawSource : '';
     return `载入技能 · ${skillSource ? `${skillSource}:` : ''}${name}`;
   }
   if (toolName === SUBMIT_AGENT_ANSWER_TOOL_NAME) {
@@ -599,7 +599,9 @@ function fallbackToolSummary(toolName: string, args: unknown): string | undefine
     const agent = isRecord(source.agent) ? source.agent : undefined;
     const agentType = boundedInlineValue(agent?.type) ?? 'worker';
     const taskName = boundedInlineValue(source.taskName);
-    return taskName ? `启动 ${agentType} · ${taskName}` : `启动 ${agentType}`;
+    const skills = Array.isArray(source.skills) ? source.skills.map(boundedInlineValue).filter(Boolean) : [];
+    const skillSuffix = skills.length > 0 ? ` · 技能 ${skills.join(', ')}` : '';
+    return taskName ? `启动 ${agentType} · ${taskName}${skillSuffix}` : `启动 ${agentType}${skillSuffix}`;
   }
   if (toolName === TRANSFER_TOOL_NAME) {
     const transfers = Array.isArray(source.transfers) ? source.transfers.filter(isRecord) : [];

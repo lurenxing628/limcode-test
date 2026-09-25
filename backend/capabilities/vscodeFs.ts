@@ -80,6 +80,12 @@ export function createVsCodeFsCapability(): FsCapability {
 }
 
 export async function readWorkspaceTextFile(relPath: string, startLine?: number, endLine?: number, options: WorkEnvironmentCapabilityOptions = {}): Promise<FsReadFileResult> {
+  const skillFile = await localReadOnlyRootOptions(relPath, options);
+  if (skillFile) {
+    const raw = await readWorkspaceRawTextFile(relPath, MAX_SOURCE_BYTES, skillFile);
+    if (!raw.existed) throw new Error(`File not found: ${relPath}`);
+    return sliceTextFile(relPath, raw.content, startLine, endLine);
+  }
   if (isRemoteServerCommandEnvironment(options.workEnvironment)) {
     return readRemoteServerTextFile(options.workEnvironment, relPath, startLine, endLine, {
       allowOutsideProjectPaths: options.allowOutsideProjectPaths,
@@ -91,7 +97,8 @@ export async function readWorkspaceTextFile(relPath: string, startLine?: number,
   return sliceTextFile(relPath, raw.content, startLine, endLine);
 }
 
-export async function readWorkspaceBinaryFile(relPath: string, mimeType: string, options: WorkEnvironmentCapabilityOptions = {}): Promise<FsReadBinaryFileResult> {
+export async function readWorkspaceBinaryFile(relPath: string, mimeType: string, inputOptions: WorkEnvironmentCapabilityOptions = {}): Promise<FsReadBinaryFileResult> {
+  const options = await localReadOnlyRootOptions(relPath, inputOptions) ?? inputOptions;
   if (isRemoteServerCommandEnvironment(options.workEnvironment)) {
     throw new Error('当前远程工作环境暂不支持二进制附件读取。');
   }
@@ -747,6 +754,47 @@ function isAbsoluteLocalPath(input: string): boolean {
 
 function relativeLocalPath(input: string): string {
   return input.replace(/[\\/]+/g, path.sep);
+}
+
+/**
+ * An absolute path inside one of the Turn's local skill directories reads from this machine without
+ * the project-root limit; any other path keeps the caller's options. Inside means by real path too:
+ * a link in a skill directory that leads out of it (`evil/up -> ../../..`) grants nothing.
+ */
+async function localReadOnlyRootOptions(
+  relPath: string,
+  options: WorkEnvironmentCapabilityOptions
+): Promise<WorkEnvironmentCapabilityOptions | undefined> {
+  const roots = options.localReadOnlyRoots ?? [];
+  const target = normalizePathArg(relPath);
+  if (roots.length === 0 || !target || !isAbsoluteLocalPath(target)) return undefined;
+  const uri = vscode.Uri.file(target);
+  const candidates = roots.filter((root) => localPathInsideRoot(uri, vscode.Uri.file(root)));
+  if (candidates.length === 0) return undefined;
+  const realTarget = vscode.Uri.file(await realPathOfNearestExisting(target));
+  let inside = false;
+  for (const root of candidates) {
+    if (localPathInsideRoot(realTarget, vscode.Uri.file(await realPathOfNearestExisting(root)))) inside = true;
+  }
+  if (!inside) return undefined;
+  const { workEnvironment: _workEnvironment, localReadOnlyRoots: _roots, ...local } = options;
+  return { ...local, allowOutsideProjectPaths: true };
+}
+
+/** The real path of `input`, resolving links of its nearest existing ancestor (the file itself may not exist). */
+export async function realPathOfNearestExisting(input: string): Promise<string> {
+  let current = path.resolve(input);
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      return path.join(await fs.realpath(current), ...rest);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(input);
+      rest.unshift(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 function assertLocalPathInsideAnyRoot(uri: vscode.Uri, roots: readonly vscode.Uri[]): void {

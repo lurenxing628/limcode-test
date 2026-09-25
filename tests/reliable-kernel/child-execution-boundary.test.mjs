@@ -42,6 +42,7 @@ const {
 } = dist('backend/reliableKernel/childExecutionBoundary.js');
 const { toolAllowedByPolicy } = dist('shared/toolPolicyResolution.js');
 const { isSkillEnabledByPolicy, skillCatalogWithinPolicy } = dist('backend/world/modules/skill/policy.js');
+const { lookupSkill } = dist('backend/world/modules/skill/skillLookup.js');
 
 const resolved = (overrides = {}) => ({
   id: 'policy:child', allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {}, ...overrides
@@ -167,40 +168,40 @@ test('a skill the frozen policy turns off can be neither listed nor loaded', asy
   const skills = [{ id: 'deploy', slug: 'deploy', name: 'deploy', source: 'agents' }, { id: 'review', slug: 'review', name: 'review', source: 'agents' }];
   const catalog = {
     list: () => skills,
-    get: (name, source) => skills.find(skill => skill.name === name && (!source || skill.source === source)),
-    async readBody(name) { return `body of ${name}`; },
+    lookup: (name, source) => lookupSkill(skills, name, source),
+    async readBody(skill) { return { text: `body of ${skill.id}`, startLine: 4 }; },
     async refresh() {}
   };
   const visible = skillCatalogWithinPolicy(catalog, { sourceConfigs: { agents: { enabled: true, disabledSkills: ['deploy'] } } });
   assert.deepEqual(visible.list().map(skill => skill.id), ['review']);
-  assert.equal(visible.get('deploy'), undefined);
-  assert.equal(visible.get('review').id, 'review');
-  assert.equal(await visible.readBody('review', 'agents'), 'body of review');
-  await assert.rejects(visible.readBody('deploy', 'agents'), /未找到技能：deploy/);
-  assert.equal(skillCatalogWithinPolicy(catalog, undefined).get('deploy').id, 'deploy', 'no frozen skill settings: every skill is on');
+  assert.deepEqual(visible.lookup('deploy'), { status: 'missing', disabled: skills[0] }, 'a turned-off skill is reported as such');
+  assert.equal(visible.lookup('review').skill.id, 'review');
+  assert.equal((await visible.readBody(skills[1])).text, 'body of review');
+  await assert.rejects(visible.readBody(skills[0]), /技能已关闭或不存在：deploy/);
+  assert.equal(skillCatalogWithinPolicy(catalog, undefined).lookup('deploy').skill.id, 'deploy', 'no frozen skill settings: every skill is on');
 });
 
 test('a skill name without a source loads the highest-priority candidate the frozen policy leaves on', async () => {
   const skills = ['agents', 'claude', 'global'].map(source => ({ id: `skill:${source}:foo`, slug: 'foo', name: 'foo', source }));
   const catalog = {
     list: () => skills,
-    // Like the real catalog: without a source, the first of .agents > .claude > global.
-    get: (name, source) => skills.find(skill => skill.name === name && (!source || skill.source === source)),
-    async readBody(name, source) { return `body of ${catalog.get(name, source).id}`; },
+    lookup: (name, source) => lookupSkill(skills, name, source),
+    async readBody(skill) { return { text: `body of ${skill.id}`, startLine: 4 }; },
     async refresh() {}
   };
   const agentsOff = skillCatalogWithinPolicy(catalog, { sourceConfigs: { agents: { enabled: false } } });
   assert.deepEqual(agentsOff.list().map(skill => skill.id), ['skill:claude:foo', 'skill:global:foo']);
-  assert.equal(agentsOff.get('foo').id, 'skill:claude:foo', 'the listed claude:foo is what loading foo finds');
-  assert.equal(await agentsOff.readBody('foo'), 'body of skill:claude:foo', 'and its body, not the disabled .agents one');
-  assert.equal(agentsOff.get('foo', 'agents'), undefined);
-  await assert.rejects(agentsOff.readBody('foo', 'agents'), /未找到技能：foo/);
+  const found = agentsOff.lookup('foo');
+  assert.equal(found.skill.id, 'skill:claude:foo', 'the listed claude:foo is what loading foo finds');
+  assert.equal((await agentsOff.readBody(found.skill)).text, 'body of skill:claude:foo', 'and its body, not the disabled .agents one');
+  assert.equal(agentsOff.lookup('foo', 'agents').disabled.id, 'skill:agents:foo');
+  await assert.rejects(agentsOff.readBody(skills[0]), /技能已关闭或不存在：foo/);
   const skillOff = skillCatalogWithinPolicy(catalog, { sourceConfigs: {
     agents: { enabled: true, disabledSkills: ['skill:agents:foo'] }, claude: { enabled: false } } });
-  assert.equal(skillOff.get('foo').id, 'skill:global:foo');
+  assert.equal(skillOff.lookup('foo').skill.id, 'skill:global:foo');
   const allOff = skillCatalogWithinPolicy(catalog, { sourceConfigs: { agents: { enabled: false }, claude: { enabled: false }, global: { enabled: false } } });
-  assert.equal(allOff.get('foo'), undefined);
-  await assert.rejects(allOff.readBody('foo'), /未找到技能：foo/);
+  assert.equal(allOff.lookup('foo').status, 'missing');
+  await assert.rejects(allOff.readBody(skills[2]), /技能已关闭或不存在：foo/);
 });
 
 test('read does not parse the frozen skill settings; loading a skill still does', async () => {
@@ -210,7 +211,8 @@ test('read does not parse the frozen skill settings; loading a skill still does'
     async resolveEnvironments() { return { allowed: [] }; },
     async loadAttachmentMaxBytes() { return 1024; },
     fs: {}, commandDeclaration: {}, workEnvironment: {}, options: {},
-    skills: { list: () => [skill], get: () => skill, async readBody() { return 'body'; }, async refresh() {} }
+    skills: { list: () => [skill], lookup: () => ({ status: 'found', skill }), async readBody() { return { text: 'body', startLine: 1 }; }, async refresh() {} },
+    skillDirectoriesFor(authority) { return VscodeReliableToolHost.prototype.skillDirectoriesFor.call(this, authority); }
   };
   // A hand-edited, malformed skill setting in the Turn's frozen authority.
   const authority = { snapshotId: 'snapshot', document: { conversationId: 'conversation', model: {}, skillPolicy: { sourceConfigs: 'broken' } } };
@@ -219,7 +221,7 @@ test('read does not parse the frozen skill settings; loading a skill still does'
     { turnId: 'turn', modelRequestId: 'request', toolCallId: `${name}-call`, toolName: name, arguments: { path: 'a.txt' } },
     authority, () => {}, new AbortController().signal);
   assert.equal(await run('read', async () => 'file contents'), 'file contents', 'reading an ordinary file never touches skills');
-  await assert.rejects(run('skills', async (_args, deps) => deps.skills.get('review')), /skillPolicy\.sourceConfigs must be an object/);
+  await assert.rejects(run('skills', async (_args, deps) => deps.skills.lookup('review')), /skillPolicy\.sourceConfigs must be an object/);
 });
 
 test('VscodeConfigurationAuthority compiles a child Turn within its parent Turn and leaves top-level Turns unchanged', async () => {

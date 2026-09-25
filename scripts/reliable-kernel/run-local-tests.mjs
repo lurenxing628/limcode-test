@@ -33,6 +33,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/conversation-runtime-ownership.test.mjs',
   'tests/reliable-kernel/panel-owner-lifecycle.test.mjs',
   'tests/reliable-kernel/sidebar-cross-host-abort.test.mjs',
+  'tests/reliable-kernel/skill-catalog.test.mjs',
   'tests/reliable-kernel/conversation-settings-isolation.test.mjs',
   'tests/reliable-kernel/child-agent-status-controls.test.cjs',
   'tests/reliable-kernel/child-compression-memory.test.mjs',

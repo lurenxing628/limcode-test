@@ -85,6 +85,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/collaboration-timeline-ssr.test.mjs',
   'tests/reliable-kernel/main-panel-feed-routing.test.mjs',
   'tests/reliable-kernel/sidebar-cross-host-abort.test.mjs',
+  'tests/reliable-kernel/skill-catalog.test.mjs',
   'tests/reliable-kernel/child-answer-cards.test.mjs',
   'tests/reliable-kernel/steering-status-dismissal.test.mjs',
   'tests/reliable-kernel/model-request-native-usage-worker.test.mjs',

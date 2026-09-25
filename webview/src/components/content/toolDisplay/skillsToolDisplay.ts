@@ -3,9 +3,12 @@ import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from
 
 interface SkillsArgs {
   name?: string;
+  source?: string;
 }
 
 interface SkillsOutputRecord {
+  name?: string;
+  source?: string;
   entryPath?: string;
   body?: string;
 }
@@ -25,7 +28,13 @@ export const skillsToolDisplay: ToolDisplayResolver = (context) => {
 function skillsInputSections(args: SkillsArgs): ToolDisplaySection[] | undefined {
   const name = args.name?.trim();
   if (!name) return undefined;
-  return [{ kind: 'input', title: '载入技能', rows: [{ label: '名称', value: name }], rowStyle: 'keyValue' }];
+  const source = args.source?.trim();
+  return [{
+    kind: 'input',
+    title: '载入技能',
+    rows: [{ label: '名称', value: name }, ...(source ? [{ label: '来源', value: source }] : [])],
+    rowStyle: 'keyValue'
+  }];
 }
 
 function skillsOutputSections(context: ToolDisplayContext): ToolDisplaySection[] | undefined {
@@ -34,14 +43,16 @@ function skillsOutputSections(context: ToolDisplayContext): ToolDisplaySection[]
   const output = toolOutput(context.result);
 
   if (typeof output === 'string') {
-    return output ? [{ kind: 'output', title: '技能内容', text: output }] : undefined;
+    // A string output is the skills tool's explanation of why nothing was loaded.
+    return output ? [{ kind: 'output', title: '未载入技能', text: output }] : undefined;
   }
 
   const record = outputRecord(output);
   if (!record) return undefined;
 
   const path = normalizePath(record.entryPath);
-  const title = path ? `技能内容 · ${path}` : '技能内容';
+  const loaded = [record.name?.trim(), record.source?.trim() ? `(${record.source.trim()})` : ''].filter(Boolean).join(' ');
+  const title = ['技能内容', loaded, path].filter(Boolean).join(' · ');
 
   if (typeof record.body === 'string' && record.body.trim()) {
     return [{ kind: 'output', title, text: record.body, markdown: true }];
@@ -51,7 +62,7 @@ function skillsOutputSections(context: ToolDisplayContext): ToolDisplaySection[]
 
 function skillsArgs(value: unknown): SkillsArgs {
   const record = asRecord(value);
-  return record ? { name: stringValue(record.name) } : {};
+  return record ? { name: stringValue(record.name), source: stringValue(record.source) } : {};
 }
 
 function toolOutput(result: unknown): unknown {

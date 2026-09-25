@@ -32,11 +32,14 @@ interface SkillSourceGroup {
   skills: SkillDefinitionRecord[];
 }
 
-const SKILL_SOURCES: readonly SkillSource[] = ['agents', 'claude', 'global'];
+const SKILL_SOURCES: readonly SkillSource[] = ['agents', 'claude', 'github', 'codex', 'user', 'global'];
 const SOURCE_META: Record<SkillSource, { label: string; hint: string }> = {
-  agents: { label: '.agents 技能', hint: '来自当前项目 .agents/skills/ 目录。' },
+  agents: { label: '.agents 技能', hint: '来自当前项目 .agents/skills/ 目录（Codex、Copilot 等通用位置）。' },
   claude: { label: '.claude 技能', hint: '来自当前项目 .claude/skills/ 目录（Claude Code 兼容）。' },
-  global: { label: '全局技能', hint: '来自数据根 skills/ 目录，所有项目共享。' }
+  github: { label: '.github 技能', hint: '来自当前项目 .github/skills/ 目录（GitHub Copilot 兼容）。' },
+  codex: { label: '.codex 技能', hint: '来自当前项目 .codex/skills/ 目录（Codex 兼容）。' },
+  user: { label: '用户技能', hint: '来自用户主目录 ~/.agents、~/.claude、~/.codex、~/.copilot 下的 skills/ 与 Claude Code 已安装的插件，所有项目共享。' },
+  global: { label: '数据根技能', hint: '来自 LimCode 数据根 skills/ 目录，所有项目共享。' }
 };
 
 const store = useSkillPolicyStore();
@@ -76,7 +79,9 @@ const childBoundNote = computed(() => {
 const sourceLabel = computed(() => {
   if (props.scopeKind === 'global') return '全局默认策略';
   if (hasLocalOverride.value) return '当前范围的单独设置';
-  return '继承全局默认策略';
+  const inherited = effectiveResolution.value;
+  if (!inherited.inheritedFrom || inherited.inheritedFrom === 'global') return '继承全局默认策略';
+  return `继承${useToolPolicyStore().scopeLabel({ scopeKind: inherited.inheritedFrom, scopeId: inherited.inheritedScopeId })}的技能设置`;
 });
 
 function sourceConfig(source: SkillSource): SkillPolicySourceConfigRecord | undefined {
@@ -201,7 +206,7 @@ function toggleSkillExpanded(id: string): void {
     <div class="skill-list-shell">
       <div ref="scroller" class="skill-list-scroll">
         <div v-if="skills.length === 0" class="skill-list-empty">
-          未发现技能。将 SKILL.md 放入项目 .agents/skills/&lt;名称&gt;/、.claude/skills/&lt;名称&gt;/ 或数据根 skills/&lt;名称&gt;/ 后会自动出现。
+          未发现技能。将 SKILL.md 放入项目或用户主目录的 .agents/skills/&lt;名称&gt;/、.claude/skills/&lt;名称&gt;/ 等技能目录，或数据根 skills/&lt;名称&gt;/ 后会自动出现。
         </div>
         <template v-else>
           <section v-for="group in groups" :key="group.source" class="skill-source-group" aria-label="技能来源分组">
@@ -243,6 +248,8 @@ function toggleSkillExpanded(id: string): void {
                     <span class="skill-name">{{ skill.name }}</span>
                     <span v-if="skill.description" class="skill-desc">{{ skill.description }}</span>
                     <span v-else class="skill-desc is-empty">无描述</span>
+                    <span v-if="skill.hiddenFromModel" class="skill-desc">技能文件声明只在被点名时使用，不列给模型。</span>
+                    <span v-if="isSkillExpanded(skill.id)" class="skill-desc skill-path">{{ skill.path }}</span>
                   </span>
                   <span class="skill-item-caret" :class="{ 'is-expanded': isSkillExpanded(skill.id) }" aria-hidden="true"></span>
                 </button>
@@ -475,6 +482,10 @@ function toggleSkillExpanded(id: string): void {
   font-size: var(--font-size-xs);
   line-height: 1.4;
   overflow-wrap: anywhere;
+}
+
+.skill-path {
+  font-family: var(--vscode-editor-font-family, monospace);
 }
 
 .skill-desc.is-empty {

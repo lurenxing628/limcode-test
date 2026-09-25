@@ -1149,17 +1149,32 @@ export interface ToolPolicyScopeLinkRecord {
   updatedAt: number;
 }
 
-/** 技能来源：agents=项目 .agents/skills/；claude=项目 .claude/skills/；global=数据根 skills/。三者相互独立，同名 slug 可共存。 */
-export type SkillSource = 'agents' | 'claude' | 'global';
+/**
+ * 技能来源：agents/claude/github/codex=项目 .agents|.claude|.github|.codex/skills/；
+ * user=用户主目录下各 Agent 工具共用的技能目录（~/.agents、~/.claude、~/.codex、~/.copilot 的 skills/）；
+ * global=数据根 skills/。来源相互独立，同名技能可共存。
+ */
+export type SkillSource = 'agents' | 'claude' | 'github' | 'codex' | 'user' | 'global';
 /** 技能策略作用域，与 ToolPolicyScopeKind 保持一致，便于不同 scope 复用配置。 */
 export type SkillPolicyScopeKind = ToolPolicyScopeKind;
 
 /** 磁盘扫描出的技能定义。不落 record-store，来自 SkillCatalog 资源投影，类似 ToolDefinitionRecord。 */
 export interface SkillDefinitionRecord {
+  /** `skill:<source>:<name>`，同一来源内唯一。 */
   id: string;
-  slug: string;
+  /** 模型调用时用的名字：插件内的技能为 `<namespace>:<slug>`，其余为目录名。 */
   name: string;
+  /** SKILL.md 所在目录的名字。 */
+  slug: string;
+  /** 技能上方最近的插件清单（.claude-plugin/.codex-plugin/.cursor-plugin 的 plugin.json）给出的名字。 */
+  namespace?: string;
+  /** 该插件清单所在的目录；插件技能里的路径可能相对它书写。 */
+  pluginRoot?: string;
+  /** 其它也能找到这个技能的名字，如与目录名不同的 frontmatter name。 */
+  aliases?: string[];
   description: string;
+  /** frontmatter `disable-model-invocation: true`：不列给模型，只在被点名时载入。 */
+  hiddenFromModel?: true;
   source: SkillSource;
   path: string;
   dir: string;

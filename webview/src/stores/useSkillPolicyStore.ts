@@ -10,11 +10,13 @@ import type {
 } from '@shared/protocol';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
+import { useToolPolicyStore } from './useToolPolicyStore';
 
 export interface SkillPolicyResolution {
   policy?: SkillPolicyRecord;
   link?: SkillPolicyScopeLinkRecord;
   inheritedFrom?: SkillPolicyScopeKind;
+  inheritedScopeId?: string;
 }
 
 function scopeIdFor(scopeKind: SkillPolicyScopeKind, scopeId?: string): string | undefined {
@@ -82,12 +84,19 @@ export const useSkillPolicyStore = defineStore('skillPolicy', {
       const policy = clientState.skillPolicies.find((candidate) => candidate.id === link?.skillPolicyId);
       return { ...(policy ? { policy } : {}), ...(link ? { link } : {}) };
     },
+    /**
+     * The backend's resolution (vscodeConfigurationAuthority): the nearest scope with its own skill
+     * record replaces the whole policy — a Conversation inherits its workflow, then its Agent, then
+     * global — so a child Agent's conversation shows the Agent's own settings, not global ones.
+     */
     effectivePolicyFor(scopeKind: SkillPolicyScopeKind, scopeId?: string): SkillPolicyResolution {
       const local = this.localPolicyFor(scopeKind, scopeId);
       if (local.policy) return local;
-      if (scopeKind !== 'global') {
-        const global = this.localPolicyFor('global');
-        if (global.policy) return { ...global, inheritedFrom: 'global' };
+      for (const scope of [...useToolPolicyStore().upperScopesFor(scopeKind, scopeId)].reverse()) {
+        const inherited = this.localPolicyFor(scope.scopeKind, scope.scopeId);
+        if (inherited.policy) {
+          return { ...inherited, inheritedFrom: scope.scopeKind, ...(scope.scopeId ? { inheritedScopeId: scope.scopeId } : {}) };
+        }
       }
       return {};
     },

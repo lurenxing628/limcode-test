@@ -63,6 +63,8 @@ export interface ToolExecutionContext {
   accessibleWorkEnvironments?: WorkEnvironmentRecord[];
   /** Attachment byte budget captured by the runtime host for this tool execution. */
   attachmentMaxBytes?: number;
+  /** Directories of the skills this Turn may use; read serves their bundled files (see localReadOnlyRoots). */
+  skillDirectories?: readonly string[];
   /** 用户中断时触发；工具可将其透传给底层调用（如 MCP callTool、fetch）以尽力真中断。 */
   signal?: AbortSignal;
   emit(event: ToolRuntimeEvent): void;

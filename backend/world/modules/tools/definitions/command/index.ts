@@ -36,7 +36,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           },
           cwd: {
             type: 'string',
-            description: 'Working directory relative to the workspace root. Defaults to the workspace root. Only used when mode=execute.'
+            description: 'Working directory relative to the workspace root, or the absolute base directory of a loaded skill. Defaults to the workspace root. Only used when mode=execute.'
           },
           foregroundWaitMs: {
             type: 'integer',

@@ -364,6 +364,7 @@ export class VscodeReliableKernelProductRuntime {
         application: () => application,
         conversations: () => conversations,
         children: () => childAgents,
+        ready: () => Promise.all([toolHost.initialize(), initializeConfiguration()]).then(() => undefined),
         notify: request => {
           if (request.sourceKind === 'child_failure') {
             void vscode.window.showErrorMessage('LimCode 子 Agent 执行失败；失败详情已保留在可靠 Runtime 中。');

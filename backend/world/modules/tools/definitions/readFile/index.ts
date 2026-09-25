@@ -261,6 +261,7 @@ export const readFileTool: ToolDefinition = {
         workEnvironment: ctx?.workEnvironment,
         accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
         allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true),
+        ...(ctx?.skillDirectories ? { localReadOnlyRoots: ctx.skillDirectories } : {}),
         ...(ctx?.attachmentMaxBytes ? { maxBytes: ctx.attachmentMaxBytes } : {})
       });
       const part: InlineDataPart = {
@@ -320,7 +321,8 @@ async function readTextFile(
     signal: ctx?.signal,
     workEnvironment: ctx?.workEnvironment,
     accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
-    allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true)
+    allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true),
+    ...(ctx?.skillDirectories ? { localReadOnlyRoots: ctx.skillDirectories } : {})
   });
   return {
     path: text.path,

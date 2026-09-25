@@ -208,19 +208,39 @@ export interface WorkEnvironmentCapabilityOptions {
    */
   accessibleWorkEnvironments?: WorkEnvironmentRecord[];
   allowOutsideProjectPaths?: boolean;
+  /**
+   * 本机上当前 Turn 可用技能的目录。读取落在其中的文件时不受项目根限制，远程工作环境下也从本机读取：
+   * 技能的 references/、assets/ 等附带文件总是在扫描到它的这台机器上。
+   */
+  localReadOnlyRoots?: readonly string[];
   /** Optional caller-provided byte ceiling for binary attachment reads. */
   maxBytes?: number;
 }
 
 /**
+ * 按名字查找技能的结果。`missing` 时若技能存在但被当前策略关掉，带上 `disabled`。
+ */
+export type SkillLookup =
+  | { status: 'found'; skill: SkillDefinitionRecord }
+  | { status: 'ambiguous'; candidates: SkillDefinitionRecord[] }
+  | { status: 'missing'; disabled?: SkillDefinitionRecord };
+
+/** 技能正文与它在 SKILL.md 中的起始行号（1 起算，frontmatter 与开头空行之后）。 */
+export interface SkillBody {
+  text: string;
+  startLine: number;
+}
+
+/**
  * 技能目录扫描能力。
- * 从项目 <projectRoot>/.agents/skills/ 与数据根 <dataRoot>/skills/ 扫描 SKILL.md，
- * 产出 SkillDefinitionRecord 列表；skills 工具执行时按 id/name 读取正文。
+ * 扫描项目与用户主目录下各 Agent 工具的 skills 目录以及数据根 skills/ 中的 SKILL.md，
+ * 产出 SkillDefinitionRecord 列表；skills 工具执行时按名字查找并读取正文。
  */
 export interface SkillCatalogCapability {
   list(): SkillDefinitionRecord[];
-  get(name: string, source?: SkillSource): SkillDefinitionRecord | undefined;
-  readBody(name: string, source?: SkillSource): Promise<string>;
+  lookup(name: string, source?: SkillSource): SkillLookup;
+  /** SKILL.md 去掉 frontmatter 后的正文；技能不在本目录（或被策略关掉）时抛错。 */
+  readBody(skill: SkillDefinitionRecord): Promise<SkillBody>;
   refresh(): Promise<void>;
 }
 

@@ -4,6 +4,7 @@ import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
+import { requireSkillSourceConfigs } from '../world/modules/skill/policy';
 import {
   ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY,
   TOOL_POLICY_ALL_MCP_SOURCES,
@@ -231,9 +232,7 @@ function parseSkillPolicy(value: unknown, label: string): FrozenSkillPolicyDocum
   const policy = requireRecord(value, label);
   return {
     id: typeof policy.id === 'string' ? policy.id : null,
-    sourceConfigs: policy.sourceConfigs === undefined || policy.sourceConfigs === null
-      ? {}
-      : clonePlain(requireRecord(policy.sourceConfigs, `${label}.sourceConfigs`)) as SkillSourceConfigs
+    sourceConfigs: requireSkillSourceConfigs(policy.sourceConfigs, `${label}.sourceConfigs`)
   };
 }
 
