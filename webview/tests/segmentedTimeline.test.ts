@@ -22,7 +22,7 @@ test('60 through 10,000-floor conversations retain a constant mounted row budget
 
 test('collaboration cards share the 30-row window and keep stable independent scroll anchors', () => {
   const messages = Array.from({ length: 35 }, (_, index) => ({ id: `m${index + 1}`, seq: index + 1 }));
-  const cards = { afterMessage: { m35: [{ messageId: 'bound' }] }, unlocated: [{ messageId: 'waiting' }] };
+  const cards = { beforeMessages: [], afterMessage: { m35: [{ messageId: 'bound' }] }, unlocated: [{ messageId: 'waiting' }] };
   const rows = composeTimelineRows(messages, cards);
   const latest = latestTimelineSegmentStart(rows.length);
   const visible = rows.slice(latest, latest + TIMELINE_MOUNT_LIMIT);
@@ -46,7 +46,7 @@ test('collaboration cards share the 30-row window and keep stable independent sc
 
 test('a Conversation with no Messages pages through only collaboration rows at constant DOM cost', () => {
   const rows = composeTimelineRows([], {
-    afterMessage: {}, unlocated: Array.from({ length: 70 }, (_, index) => ({ messageId: `card-${index + 1}` }))
+    beforeMessages: Array.from({ length: 70 }, (_, index) => ({ messageId: `card-${index + 1}` })), afterMessage: {}, unlocated: []
   });
   const latest = latestTimelineSegmentStart(rows.length);
   assert.equal(latest, 40);
@@ -55,6 +55,17 @@ test('a Conversation with no Messages pages through only collaboration rows at c
     latest - TIMELINE_SEGMENT_STEP + TIMELINE_MOUNT_LIMIT).length, TIMELINE_MOUNT_LIMIT);
   assert.equal(rows[0].id, 'collaboration:card-1');
   assert.equal(rows.at(-1)?.id, 'collaboration:card-70');
+});
+
+test('cards of older Turns sit above the first Message and never push the newest Messages out of the latest segment', () => {
+  const messages = Array.from({ length: 10 }, (_, index) => ({ id: `m${index + 1}` }));
+  const older = Array.from({ length: 40 }, (_, index) => ({ messageId: `older-${index + 1}` }));
+  const rows = composeTimelineRows(messages, { beforeMessages: older, afterMessage: {}, unlocated: [{ messageId: 'waiting' }] });
+  assert.deepEqual(rows.slice(0, 2).map((row) => row.id), ['collaboration:older-1', 'collaboration:older-2']);
+  const latest = rows.slice(latestTimelineSegmentStart(rows.length));
+  assert.deepEqual(latest.filter((row) => row.kind === 'message').map((row) => row.id), messages.map((message) => message.id),
+    'every one of the newest Messages stays mounted beside 40 older cards');
+  assert.equal(latest.at(-1)?.id, 'collaboration:waiting');
 });
 
 test('bounded snapshots preserve absolute transcript floors after the first 200 messages', () => {

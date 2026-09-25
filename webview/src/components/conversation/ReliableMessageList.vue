@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue';
 import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
 import { projectCompressionNotices, type CompressionNotice as CompressionWarningRecord } from '@shared/compressionNotices';
 import { useChat } from '@webview/composables/useChat';
@@ -90,6 +90,8 @@ const segmentStart = ref(0);
 const followLatestSegment = ref(true);
 const pendingHistoryAnchorId = ref<string | null>(null);
 const pendingScrollAnchor = ref<ScrollAnchor | null>(null);
+/** Timeline rows present when the user asked for older collaboration records. */
+const pendingCollaborationRowIds = shallowRef<Set<string> | null>(null);
 const earliestLoadedFloor = computed(() => {
   const first = messages.value[0];
   if (!first) return 0;
@@ -189,19 +191,28 @@ watch(
   { immediate: true }
 );
 
+let previousRowIds: string[] = [];
 watch(
   () => timelineRows.value.map((row) => row.id).join('|'),
   () => {
-    const total = timelineRows.value.length;
-    segmentStart.value = followLatestSegment.value
-      ? latestTimelineSegmentStart(total)
-      : clampTimelineSegmentStart(total, segmentStart.value);
+    const ids = timelineRows.value.map((row) => row.id);
+    const previousFirst = previousRowIds[segmentStart.value];
+    previousRowIds = ids;
+    if (followLatestSegment.value) {
+      segmentStart.value = latestTimelineSegmentStart(ids.length);
+      return;
+    }
+    // Rows inserted above the mounted window (an older collaboration page, a card of an earlier
+    // Turn) must not shift the rows the user is reading.
+    const kept = previousFirst ? ids.indexOf(previousFirst) : -1;
+    segmentStart.value = clampTimelineSegmentStart(ids.length, kept >= 0 ? kept : segmentStart.value);
   },
   { immediate: true }
 );
 
 watch(conversationId, () => {
   pendingHistoryAnchorId.value = null;
+  pendingCollaborationRowIds.value = null;
   pendingScrollAnchor.value = null;
   followLatestSegment.value = props.followLatest;
   segmentStart.value = props.followLatest
@@ -210,9 +221,9 @@ watch(conversationId, () => {
 });
 
 watch(
-  () => [feed.historyLoadedPages, feed.collaborationHistoryLoadedPages],
-  ([messagePages, collaborationPages], [previousMessagePages, previousCollaborationPages]) => {
-    if (messagePages <= previousMessagePages && collaborationPages <= previousCollaborationPages) return;
+  () => feed.historyLoadedPages,
+  (messagePages, previousMessagePages) => {
+    if (messagePages <= previousMessagePages) return;
     const anchorId = pendingHistoryAnchorId.value;
     pendingHistoryAnchorId.value = null;
     if (!anchorId) return;
@@ -225,6 +236,22 @@ watch(
     );
 
     void restorePendingScrollAnchor();
+  }
+);
+
+// Older collaboration records are placed with their Turns, which are older than the loaded
+// messages or outside loaded history: they appear above the first message. After the page the user
+// asked for arrives, mount the segment that starts at its first new card, directly below the button.
+watch(
+  () => feed.collaborationHistoryLoadedPages,
+  (pages, previousPages) => {
+    const known = pendingCollaborationRowIds.value;
+    if (pages <= previousPages || !known) return;
+    pendingCollaborationRowIds.value = null;
+    const firstNew = timelineRows.value.findIndex((row) => row.kind === 'collaboration' && !known.has(row.id));
+    if (firstNew < 0) return;
+    followLatestSegment.value = false;
+    segmentStart.value = clampTimelineSegmentStart(timelineRows.value.length, firstNew);
   }
 );
 
@@ -476,18 +503,10 @@ async function restorePendingScrollAnchor(): Promise<void> {
 
 function showEarlierCollaboration(): void {
   if (feed.collaborationHistoryLoading || !feed.collaborationHistoryHasMore) return;
-  pendingScrollAnchor.value = captureScrollAnchor({
-    scroller: props.scroller,
-    visibleRows: visibleTimelineRows.value
-  });
   releaseStickyFromUserScroll(props.scroller);
   followLatestSegment.value = false;
-  const anchorId = visibleTimelineRows.value[0]?.id ?? null;
-  if (feed.requestEarlierCollaborationHistory(conversationId.value)) {
-    pendingHistoryAnchorId.value = anchorId;
-  } else {
-    pendingScrollAnchor.value = null;
-  }
+  const known = new Set(timelineRows.value.map((row) => row.id));
+  if (feed.requestEarlierCollaborationHistory(conversationId.value)) pendingCollaborationRowIds.value = known;
 }
 
 function showEarlierSegment(): void {

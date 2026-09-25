@@ -25,14 +25,32 @@ export interface CollaborationTimelineCard {
   /** The newest delivery attempt, or unknown when its delivery is not in the bounded feed. */
   status: 'waiting' | 'failed' | 'settled' | 'unknown';
   readBy?: 'current-turn' | 'next-turn';
-  /** Only Turn membership is known; no within-Turn acceptance/send order is inferred. */
-  placement: 'turn' | 'turn-without-message' | 'turn-not-loaded' | 'unbound';
+  /**
+   * Only Turn membership is known; no within-Turn acceptance/send order is inferred.
+   * - turn: grouped after the newest loaded message of its Turn.
+   * - turn-started: its Turn is loaded but none of its messages is; placed after the last loaded
+   *   message whose Turn started no later than it (Turns of one Conversation share its start order).
+   * - earlier-turn: its loaded Turn started before the Turn of every loaded message.
+   * - turn-without-message: its Turn is loaded, but no loaded message has a Turn to compare with.
+   * - turn-not-loaded: its Turn is outside loaded history.
+   * - unbound: it never entered a Turn (waiting or failed delivery, or sent outside a Turn).
+   */
+  placement: 'turn' | 'turn-started' | 'earlier-turn' | 'turn-without-message' | 'turn-not-loaded' | 'unbound';
 }
 
+/** Waiting or failed cards that never entered a Turn stay below every message, but only the newest few. */
+export const COLLABORATION_UNLOCATED_TAIL_LIMIT = 3;
+
 export interface CollaborationTimeline {
-  /** Grouped by the last loaded message of that Turn, not inserted into a Message. */
+  /**
+   * Above the first loaded message, oldest first: cards of Turns older than every loaded message
+   * or outside loaded history (history pages add these), and cards that never entered a Turn but
+   * are neither among the newest waiting/failed ones. None of them may displace the newest messages.
+   */
+  beforeMessages: CollaborationTimelineCard[];
+  /** Grouped by a loaded message, not inserted into a Message. */
   afterMessage: Record<string, CollaborationTimelineCard[]>;
-  /** The Turn has no loaded message, or delivery never entered a Turn. Location is not asserted. */
+  /** At most COLLABORATION_UNLOCATED_TAIL_LIMIT newest waiting, then failed, cards that never entered a Turn. */
   unlocated: CollaborationTimelineCard[];
 }
 
@@ -43,9 +61,12 @@ export interface CollaborationTimeline {
  * happened after that message. There is no committed within-Turn acceptance position here: show
  * that uncertainty to the user rather than comparing unrelated created_at timestamps.
  *
- * An envelope without a loaded Turn message remains a separate, unlocated row. This includes
- * waiting and failed deliveries, a Turn with no Message, and a Turn outside loaded history. None
- * of these records are promoted to a Message, given a transcript floor, or silently dropped.
+ * A card whose Turn has no loaded message is placed by that Turn only: a loaded Turn is compared
+ * with the Turns of the loaded messages (never with a message or envelope timestamp); a Turn
+ * outside loaded history belongs to older history and sits above the first loaded message. Of the
+ * cards that never entered a Turn, only the newest few waiting or failed ones stay below every
+ * message. None of these records
+ * are promoted to a Message, given a transcript floor, or silently dropped.
  */
 export function projectCollaborationTimeline(input: {
   conversationId: string;
@@ -54,13 +75,20 @@ export function projectCollaborationTimeline(input: {
   turnIdByMessageId: Readonly<Record<string, string>>;
   removedConversationIds: readonly string[];
 }): CollaborationTimeline {
-  const result: CollaborationTimeline = { afterMessage: {}, unlocated: [] };
+  const result: CollaborationTimeline = { beforeMessages: [], afterMessage: {}, unlocated: [] };
   if (!input.conversationId) return result;
   const lastMessageByTurn = new Map<string, string>();
+  /** Loaded messages with the start of their Turn, in transcript order. */
+  const messageTurnStarts: Array<{ messageId: string; startedAt: string }> = [];
   for (const message of input.messages) {
     const turnId = input.turnIdByMessageId[message.id];
-    if (turnId) lastMessageByTurn.set(turnId, message.id);
+    if (!turnId) continue;
+    lastMessageByTurn.set(turnId, message.id);
+    const startedAt = ownTurnStart(turnId);
+    if (startedAt) messageTurnStarts.push({ messageId: message.id, startedAt });
   }
+  // Every card in processing order (message_seq, then answers) with where it was placed.
+  const placed: Array<{ card: CollaborationTimelineCard; anchorId?: string }> = [];
   const sources = linksByMessage(input.records.CollaborationMessageSourceLink);
   const targets = linksByMessage(input.records.CollaborationMessageTargetLink);
   const latestDeliveries = latestDeliveryByTarget(input.records.RuntimeDelivery);
@@ -123,31 +151,64 @@ export function projectCollaborationTimeline(input: {
     };
     place(card, card.status === 'failed' ? '' : text(delivery.target_turn_id));
   }
+  // Below the messages stay only the newest Turn-less cards that still need attention: waiting
+  // ones first, then failed ones. Everything else that never entered a Turn joins older history.
+  const unbound = placed.filter((entry) => entry.card.placement === 'unbound').map((entry) => entry.card);
+  const waiting = unbound.filter((card) => card.status === 'waiting').slice(-COLLABORATION_UNLOCATED_TAIL_LIMIT);
+  const room = COLLABORATION_UNLOCATED_TAIL_LIMIT - waiting.length;
+  const failed = room > 0 ? unbound.filter((card) => card.status === 'failed').slice(-room) : [];
+  const tail = new Set([...waiting, ...failed]);
+  for (const { card, anchorId } of placed) {
+    if (anchorId) (result.afterMessage[anchorId] ??= []).push(card);
+    else if (tail.has(card)) result.unlocated.push(card);
+    else result.beforeMessages.push(card);
+  }
   return result;
+
+  function ownTurnStart(turnId: string): string {
+    const turn = input.records.Turn?.[turnId];
+    return turn && turn.conversation_id === input.conversationId ? text(turn.created_at) : '';
+  }
 
   function place(card: CollaborationTimelineCard, turnId: string): void {
     if (!turnId) {
-      result.unlocated.push(card);
+      placed.push({ card });
       return;
     }
     const anchorId = lastMessageByTurn.get(turnId);
     if (anchorId) {
       card.placement = 'turn';
-      (result.afterMessage[anchorId] ??= []).push(card);
+      placed.push({ card, anchorId });
       return;
     }
     const turn = input.records.Turn?.[turnId];
-    card.placement = turn?.conversation_id === input.conversationId
-      ? 'turn-without-message' : 'turn-not-loaded';
-    result.unlocated.push(card);
+    if (!turn || turn.conversation_id !== input.conversationId) {
+      card.placement = 'turn-not-loaded';
+      placed.push({ card });
+      return;
+    }
+    const startedAt = text(turn.created_at);
+    if (!startedAt || messageTurnStarts.length === 0) {
+      card.placement = 'turn-without-message';
+      placed.push({ card });
+      return;
+    }
+    let previous: string | undefined;
+    for (const entry of messageTurnStarts) {
+      if (entry.startedAt <= startedAt) previous = entry.messageId;
+    }
+    card.placement = previous ? 'turn-started' : 'earlier-turn';
+    placed.push({ card, ...(previous ? { anchorId: previous } : {}) });
   }
 }
 
 /** Every card gets a truthful explanation of grouping instead of a fabricated exact position. */
 export function collaborationCardPlacementLabel(card: CollaborationTimelineCard): string {
   if (card.placement === 'turn') return '按回合归组，具体顺序待确认';
-  if (card.placement === 'turn-without-message') return '所属回合暂无消息，位置待确认';
-  if (card.placement === 'turn-not-loaded') return '所属回合未加载，位置待确认';
+  if (card.placement === 'turn-started') return '所属回合没有已加载的消息，按回合开始顺序排列';
+  if (card.placement === 'earlier-turn') return '所属回合早于已加载的消息，位置待确认';
+  if (card.placement === 'turn-without-message') return '所属回合没有已加载的消息，位置待确认';
+  if (card.placement === 'turn-not-loaded') return '所属回合在更早的历史中，位置待确认';
   return card.status === 'failed' ? '投递未进入回合，位置待确认' : '尚未关联回合，位置待确认';
 }
 
@@ -161,8 +222,7 @@ export function collaborationCardStatusLabel(card: CollaborationTimelineCard): s
   if (card.status === 'failed') return '投递失败';
   if (card.status === 'unknown') return '投递状态待确认';
   if (card.status === 'settled') return '';
-  if (card.direction === 'incoming') return card.placement === 'turn' || card.placement === 'turn-without-message'
-    ? '已送达，等待本轮处理' : '等待下一轮处理';
+  if (card.direction === 'incoming') return card.placement === 'unbound' ? '等待下一轮处理' : '已送达，等待本轮处理';
   if (card.readBy === 'current-turn') return '已送达，对方本轮读取';
   if (card.readBy === 'next-turn') return '已送达，对方下一轮读取';
   return '等待对方处理';

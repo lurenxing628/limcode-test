@@ -377,7 +377,8 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
       assert.equal(client.collaborationHistoryLoading, false);
       assert.equal(client.collaborationHistoryHasMore, false);
       assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage).length, 201);
-      assert.equal(view.setup.collaborationTimeline.unlocated.length, 201);
+      assert.equal(view.setup.timelineRows.filter((row) => row.kind === 'collaboration').length, 201);
+      assert.ok(view.setup.collaborationTimeline.unlocated.length <= 3, 'Turn-less cards below the messages stay bounded');
       assert.equal(view.setup.messages.length, 0);
       assert.doesNotMatch(view.html, /继续查找更早协作记录/);
     } finally {
@@ -728,7 +729,9 @@ test('Vue SSR merges collaboration pages with ACKed live facts, fences old sessi
       const html = await renderToString(app);
       assert.equal(setup.messages.length, 0, 'no ordinary Message was invented');
       assert.equal(Object.values(setup.collaborationTimeline.afterMessage).flat().length, 0);
-      assert.equal(setup.collaborationTimeline.unlocated.length, 241, 'live and historical overlap renders once');
+      assert.equal(setup.timelineRows.filter((row) => row.kind === 'collaboration').length, 241,
+        'live and historical overlap renders once');
+      assert.equal(new Set(setup.timelineRows.map((row) => row.id)).size, setup.timelineRows.length);
       assert.match(html, /协作正文/);
       assert.match(html, /位置待确认/);
       assert.doesNotMatch(html, /还没有消息/);

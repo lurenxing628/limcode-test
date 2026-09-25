@@ -12,16 +12,23 @@ export type SegmentedTimelineRow<Message extends { id: string }, Card extends { 
 /**
  * Collaboration envelopes occupy real, independently keyed rows in the same bounded window as
  * Message rows. Their ids and count do not become Message ids, Message floors or detail demands.
- * A Turn group follows its last loaded Message; unlocated cards occupy their own tail rows.
+ * Cards of older or unloaded Turns come before the first Message, a Turn group follows its last
+ * loaded Message, and only a bounded few Turn-less cards follow the newest Message, so the latest
+ * segment always keeps the newest Messages (including a streaming reply) mounted.
  */
 export function composeTimelineRows<Message extends { id: string }, Card extends { messageId: string }>(
   messages: readonly Message[],
-  collaboration: { afterMessage: Readonly<Record<string, readonly Card[]>>; unlocated: readonly Card[] }
+  collaboration: {
+    beforeMessages: readonly Card[];
+    afterMessage: Readonly<Record<string, readonly Card[]>>;
+    unlocated: readonly Card[];
+  }
 ): Array<SegmentedTimelineRow<Message, Card>> {
   const rows: Array<SegmentedTimelineRow<Message, Card>> = [];
   const appendCard = (card: Card): void => {
     rows.push({ kind: 'collaboration', id: `collaboration:${card.messageId}`, card });
   };
+  for (const card of collaboration.beforeMessages) appendCard(card);
   for (const message of messages) {
     rows.push({ kind: 'message', id: message.id, message });
     for (const card of collaboration.afterMessage[message.id] ?? []) appendCard(card);

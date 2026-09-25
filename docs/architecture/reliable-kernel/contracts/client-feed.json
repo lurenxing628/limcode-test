@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-09-24-r5",
+  "contractRevision": "2026-09-25-r1",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -221,7 +221,8 @@
   "notes": [
     "r4: commitSeq 只在同一 hostBootId 内单调；snapshot 与 changes 通过原子 barrier 交接",
     "r5: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；共享ACK基线的未发送commit range先压缩净变化，仍超限才转单一snapshot-required；未发送批次不占用wire messageSeq",
-    "r6: RuntimeDeliveryIntentLink 进入有界投影；turn-intent-preview v3 以 guidance/runtime_continuation 判别，并展示后台进程或子 Agent 的真实来源"
+    "r6: RuntimeDeliveryIntentLink 进入有界投影；turn-intent-preview v3 以 guidance/runtime_continuation 判别，并展示后台进程或子 Agent 的真实来源",
+    "2026-09-25-r1: 协作卡片按所属回合定位；未加载或早于已加载消息的回合放在第一条消息之上，未进入回合的卡片只在消息下方保留最新几条，最新消息不会被挤出最新分段"
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",
@@ -244,8 +245,8 @@
     "byteLimitTrim": "a-collaboration-message-trimmed-under-snapshot-maxBytes-takes-its-links-requests-deliveries-to-its-peer-their-inbox-items-and-a-peer-row-no-kept-link-names; oldest-message_seq-first; deliveries-to-the-selected-conversation-stay",
     "messageBodiesInFeed": false,
     "messagePreview": "CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read",
-    "deliveryState": "sender-session-also-sees-the-RuntimeDelivery-of-its-loaded-outgoing-messages; newest-attempt-per-target-decides-waiting-failed-or-settled; failed-incoming-stays-visible-after-the-last-message-created-before-it-was-sent-or-before-the-first-message-when-older-than-every-message-and-message-1-is-loaded-even-with-a-gap-after-it-or-among-the-newest-3-pinned-below-every-message-when-newer-than-every-message-or-no-message-has-a-creation-time; a-failure-older-than-a-window-that-starts-after-message-1-appears-once-that-history-loads; a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn",
-    "turnPlacement": "incoming-at-the-first-loaded-message-of-its-delivery-Turn-and-outgoing-at-that-of-its-sending-Turn-a-streaming-reply-included; a-loaded-Turn-without-a-loaded-message-places-its-cards-by-when-it-started-after-the-last-message-created-before-it-or-before-the-first-message-when-older-than-every-message-and-message-1-is-loaded-or-below-every-message-ahead-of-that-Turn-notices-when-newer-than-every-message; a-Turn-not-loaded-or-older-than-a-window-that-starts-after-message-1-is-not-guessed; the-empty-conversation-hint-never-stands-in-for-a-card",
+    "deliveryState": "sender-session-also-sees-the-RuntimeDelivery-of-its-loaded-outgoing-messages; newest-attempt-per-target-decides-waiting-failed-or-settled; failed-incoming-stays-visible-bounded: the-newest-3-waiting-then-failed-cards-that-never-entered-a-Turn-stay-below-every-message-and-older-Turn-less-cards-move-above-the-first-message; a-waiting-outgoing-message-or-result-reads-as-delivered-for-the-recipient-current-or-next-Turn",
+    "turnPlacement": "a-card-whose-Turn-has-a-loaded-message-follows-the-newest-loaded-message-of-that-Turn-a-streaming-reply-included; a-loaded-Turn-without-a-loaded-message-is-ordered-only-against-the-Turns-of-loaded-messages-by-Turn-start-never-by-message-or-envelope-timestamps; a-Turn-older-than-every-loaded-message-or-outside-loaded-history-places-its-cards-above-the-first-loaded-message-where-earlier-pages-load; cards-never-displace-the-newest-messages-from-the-latest-segment; the-empty-conversation-hint-never-stands-in-for-a-card",
     "boardBodiesInFeed": false,
     "relations": "independent-message-source-target-reply-and-request-links",
     "peerConversations": "snapshot-only-collaborationPeerConversations-for-peers-of-the-loaded-links-outside-navigation; sidebar-display_title; runtime-absent-peer-status-deleted; client-reads-only-observed-Conversation-remove-or-deleted-status-as-deleted-and-a-missing-peer-as-unknown",

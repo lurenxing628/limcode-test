@@ -460,10 +460,10 @@ test('delivered followup in a Turn with no Message remains visible and order-unk
       const view = open(scenario);
       await view.observe(await scenario.snapshot());
       const { html, setup } = await view.mount();
-      assert.deepEqual(setup.collaborationTimeline.unlocated.map((card) => [card.messageId, card.placement]),
+      assert.deepEqual(setup.collaborationTimeline.beforeMessages.map((card) => [card.messageId, card.placement]),
         [['task', 'turn-without-message']]);
       assert.match(html, /请调研登录流程并汇报/);
-      assert.match(html, /所属回合暂无消息，位置待确认/);
+      assert.match(html, /所属回合没有已加载的消息，位置待确认/);
       assert.doesNotMatch(html, /还没有消息/);
     } finally { await scenario.close(); }
   });

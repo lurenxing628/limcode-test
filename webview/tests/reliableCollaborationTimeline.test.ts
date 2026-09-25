@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  COLLABORATION_UNLOCATED_TAIL_LIMIT,
   collaborationCardKindLabel,
   collaborationCardLabel,
   collaborationCardPlacementLabel,
@@ -88,8 +89,8 @@ test('no Message, loaded Turn without a Message, and transient reply all retain 
   };
   const empty = project(records);
   assert.deepEqual(composeTimelineRows([], empty).map((row) => row.id), ['collaboration:task']);
-  assert.equal(empty.unlocated[0].placement, 'turn-without-message');
-  assert.equal(collaborationCardPlacementLabel(empty.unlocated[0]), '所属回合暂无消息，位置待确认');
+  assert.equal(empty.beforeMessages[0].placement, 'turn-without-message');
+  assert.equal(collaborationCardPlacementLabel(empty.beforeMessages[0]), '所属回合没有已加载的消息，位置待确认');
   const running = project(records, [{ id: 'transient:request' }], { 'transient:request': 'task-turn' });
   assert.deepEqual(composeTimelineRows([{ id: 'transient:request' }], running).map((row) => row.id),
     ['transient:request', 'collaboration:task']);
@@ -98,6 +99,8 @@ test('no Message, loaded Turn without a Message, and transient reply all retain 
 
 test('unbound, failed, no-delivery and unloaded Turn cards all remain independently pageable', () => {
   const ids = ['waiting', 'failed-1', 'failed-2', 'failed-3', 'failed-4', 'no-delivery', 'unloaded'];
+  const byMessageId = (timeline: ReturnType<typeof project>) => Object.fromEntries(
+    [...timeline.beforeMessages, ...timeline.unlocated].map((card) => [card.messageId, card]));
   const timeline = project({
     CollaborationMessage: byId(...ids.map((id, index) => message(id, String(index + 1)))),
     CollaborationMessageSourceLink: byId(...ids.map((id) => source(id, 'peer', 'peer-turn'))),
@@ -106,14 +109,21 @@ test('unbound, failed, no-delivery and unloaded Turn cards all remain independen
       ...ids.slice(1, 5).map((id) => delivery(id, 'self', null, 'failed')),
       delivery('unloaded', 'self', 'older-turn', 'consumed'))
   }, [{ id: 'm1' }], { m1: 'another-turn' });
-  assert.deepEqual(timeline.unlocated.map((card) => card.messageId), ids);
-  assert.equal(timeline.unlocated[0].status, 'waiting');
-  assert.deepEqual(timeline.unlocated.slice(1, 5).map((card) => collaborationCardStatusLabel(card)),
+  // Only the newest waiting, then failed, Turn-less cards stay below the message; the rest are
+  // older history above it. Nothing is dropped.
+  assert.deepEqual(timeline.unlocated.map((card) => card.messageId), ['waiting', 'failed-3', 'failed-4']);
+  assert.deepEqual(timeline.beforeMessages.map((card) => card.messageId), ['failed-1', 'failed-2', 'no-delivery', 'unloaded']);
+  const cards = byMessageId(timeline);
+  assert.equal(cards.waiting.status, 'waiting');
+  assert.deepEqual(['failed-1', 'failed-2', 'failed-3', 'failed-4'].map((id) => collaborationCardStatusLabel(cards[id])),
     Array(4).fill('投递失败'));
-  assert.equal(timeline.unlocated[5].status, 'unknown', 'absence of a delivery never means delivered');
-  assert.equal(timeline.unlocated[6].placement, 'turn-not-loaded');
-  assert.match(collaborationCardPlacementLabel(timeline.unlocated[1]), /位置待确认/);
-  assert.equal(composeTimelineRows([{ id: 'm1' }], timeline).length, ids.length + 1);
+  assert.equal(cards['no-delivery'].status, 'unknown', 'absence of a delivery never means delivered');
+  assert.equal(cards.unloaded.placement, 'turn-not-loaded');
+  assert.equal(collaborationCardPlacementLabel(cards.unloaded), '所属回合在更早的历史中，位置待确认');
+  assert.match(collaborationCardPlacementLabel(cards['failed-1']), /位置待确认/);
+  const rows = composeTimelineRows([{ id: 'm1' }], timeline);
+  assert.equal(rows.length, ids.length + 1);
+  assert.deepEqual(rows.slice(-4).map((row) => row.id), ['m1', 'collaboration:waiting', 'collaboration:failed-3', 'collaboration:failed-4']);
 });
 
 test('created_at cannot place a failed delivery or a Turn without a Message among visible Messages', () => {
@@ -125,10 +135,11 @@ test('created_at cannot place a failed delivery or a Turn without a Message amon
     CollaborationMessageTargetLink: byId(target('failed', 'self'), target('silent', 'peer')),
     RuntimeDelivery: byId(delivery('failed', 'self', null, 'failed'), delivery('silent', 'peer', null, 'pending'))
   }, [{ id: 'm1' }, { id: 'm2' }], { m1: 'other-turn', m2: 'other-turn' });
-  assert.deepEqual(timeline.unlocated.map((card) => card.messageId), ['failed', 'silent']);
+  assert.deepEqual(timeline.unlocated.map((card) => card.messageId), ['failed']);
+  assert.deepEqual(timeline.beforeMessages.map((card) => card.messageId), ['silent']);
   assert.deepEqual(timeline.afterMessage, {});
-  assert.deepEqual(timeline.unlocated.map(collaborationCardPlacementLabel), [
-    '投递未进入回合，位置待确认', '所属回合暂无消息，位置待确认'
+  assert.deepEqual([...timeline.unlocated, ...timeline.beforeMessages].map(collaborationCardPlacementLabel), [
+    '投递未进入回合，位置待确认', '所属回合没有已加载的消息，位置待确认'
   ]);
 });
 
@@ -164,7 +175,7 @@ test('messages between other Conversations are not projected into this Conversat
     CollaborationMessageSourceLink: byId(source('foreign', 'peer', 'peer-turn')),
     CollaborationMessageTargetLink: byId(target('foreign', 'other')),
     RuntimeDelivery: byId(delivery('foreign', 'other', null, 'pending'))
-  }, [{ id: 'm1' }], { m1: 'peer-turn' }), { afterMessage: {}, unlocated: [] });
+  }, [{ id: 'm1' }], { m1: 'peer-turn' }), { beforeMessages: [], afterMessage: {}, unlocated: [] });
 });
 
 test('a child answer delivered to this Conversation is the same card, labelled as that child Agent final result', () => {
@@ -195,6 +206,7 @@ test('a child answer delivered to this Conversation is the same card, labelled a
   const settledByWait = project(foreground, [{ id: 'm1' }], { m1: 'self-turn' });
   assert.deepEqual(settledByWait.afterMessage, {}, 'an answer that settled a waiting run_agent call stays with that tool call');
   assert.deepEqual(settledByWait.unlocated, []);
+  assert.deepEqual(settledByWait.beforeMessages, []);
 });
 
 test('a collaboration message from a spawned child is labelled as that child Agent, others stay conversations', () => {
@@ -212,4 +224,58 @@ test('a collaboration message from a spawned child is labelled as that child Age
     ['来自子 Agent 实现子任务', '消息'],
     ['来自对话 调研对话', '消息']
   ]);
+});
+
+test('cards from older or unloaded Turns sit above the first message and never displace the newest messages', () => {
+  const at = (day: number) => `2026-01-${String(day).padStart(2, '0')}T00:00:00.000Z`;
+  const messages = Array.from({ length: 10 }, (_, index) => ({ id: `m${index + 1}` }));
+  const turnIdByMessageId = Object.fromEntries(messages.map(({ id }, index) => [id, index < 5 ? 'turn-a' : 'turn-b']));
+  const older = Array.from({ length: 40 }, (_, index) => `older-${String(index + 1).padStart(2, '0')}`);
+  const timeline = project({
+    // turn-a/turn-b hold the loaded messages; history-turn came from a collaboration history page;
+    // quiet-turn started between them without a loaded message; active-turn has not replied yet.
+    Turn: byId({ id: 'history-turn', conversation_id: 'self', created_at: at(1) }, { id: 'turn-a', conversation_id: 'self', created_at: at(2) },
+      { id: 'quiet-turn', conversation_id: 'self', created_at: at(3) }, { id: 'turn-b', conversation_id: 'self', created_at: at(4) },
+      { id: 'active-turn', conversation_id: 'self', created_at: at(5), status: 'active' }),
+    CollaborationMessage: byId(...older.map((id, index) => message(id, String(index + 1))), message('history', '41'),
+      message('quiet', '42'), message('bound', '43'), message('current', '44')),
+    CollaborationMessageSourceLink: byId(...[...older, 'history', 'quiet', 'bound', 'current'].map((id) => source(id, 'peer', 'peer-turn'))),
+    CollaborationMessageTargetLink: byId(...[...older, 'history', 'quiet', 'bound', 'current'].map((id) => target(id, 'self'))),
+    RuntimeDelivery: byId(...older.map((id, index) => delivery(id, 'self', `unloaded-turn-${index}`, 'consumed')),
+      delivery('history', 'self', 'history-turn', 'consumed'), delivery('quiet', 'self', 'quiet-turn', 'consumed'),
+      delivery('bound', 'self', 'turn-b', 'consumed'), delivery('current', 'self', 'active-turn', 'pending'))
+  }, messages, turnIdByMessageId);
+  assert.deepEqual(timeline.beforeMessages.map((card) => card.messageId), [...older, 'history']);
+  assert.deepEqual(timeline.unlocated, []);
+  assert.deepEqual(Object.fromEntries(Object.entries(timeline.afterMessage).map(([id, cards]) => [id, cards.map((card) => card.messageId)])),
+    { m5: ['quiet'], m10: ['bound', 'current'] });
+  const placement = (id: string) => [...timeline.beforeMessages, ...Object.values(timeline.afterMessage).flat()]
+    .find((card) => card.messageId === id)!;
+  assert.equal(collaborationCardPlacementLabel(placement('older-01')), '所属回合在更早的历史中，位置待确认',
+    'a Turn outside loaded history is not described as having no messages');
+  assert.equal(collaborationCardPlacementLabel(placement('history')), '所属回合早于已加载的消息，位置待确认');
+  assert.equal(collaborationCardPlacementLabel(placement('quiet')), '所属回合没有已加载的消息，按回合开始顺序排列');
+  assert.equal(collaborationCardStatusLabel(placement('current')), '已送达，等待本轮处理');
+
+  const rows = composeTimelineRows(messages, timeline);
+  assert.equal(rows[0].id, 'collaboration:older-01', 'older history cards come first, where earlier pages load');
+  const latest = rows.slice(latestTimelineSegmentStart(rows.length));
+  assert.equal(latest.length, TIMELINE_MOUNT_LIMIT);
+  assert.deepEqual(latest.filter((row) => row.kind === 'message').map((row) => row.id), messages.map(({ id }) => id),
+    'all ten newest messages stay mounted beside 41 older cards');
+  assert.deepEqual(latest.slice(-3).map((row) => row.id), ['m10', 'collaboration:bound', 'collaboration:current']);
+});
+
+test('Turn-less waiting and failed cards stay visible below the messages but bounded', () => {
+  const ids = Array.from({ length: 12 }, (_, index) => `failed-${String(index + 1).padStart(2, '0')}`);
+  const timeline = project({
+    CollaborationMessage: byId(...ids.map((id, index) => message(id, String(index + 1))), message('waiting', '13')),
+    CollaborationMessageSourceLink: byId(...[...ids, 'waiting'].map((id) => source(id, 'peer', 'peer-turn'))),
+    CollaborationMessageTargetLink: byId(...[...ids, 'waiting'].map((id) => target(id, 'self'))),
+    RuntimeDelivery: byId(...ids.map((id) => delivery(id, 'self', null, 'failed')), delivery('waiting', 'self', null, 'pending'))
+  }, [{ id: 'm1' }], { m1: 'self-turn' });
+  assert.equal(COLLABORATION_UNLOCATED_TAIL_LIMIT, 3);
+  assert.deepEqual(timeline.unlocated.map((card) => card.messageId), ['failed-11', 'failed-12', 'waiting']);
+  assert.equal(timeline.beforeMessages.length, 10, 'older Turn-less cards remain reachable above the message');
+  assert.equal(composeTimelineRows([{ id: 'm1' }], timeline).at(-4)?.id, 'm1');
 });
