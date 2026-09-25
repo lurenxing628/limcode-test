@@ -587,6 +587,64 @@ test('an accepted steer attributed to its successor is carried by the next full 
   });
 });
 
+test('closure never appends a result for a call cut out of the current head', { timeout: 30000 }, async () => {
+  const running = deferred();
+  await withNativeKernel({
+    async script({ round, controls, emit, responseId }) {
+      if (round === 0) {
+        await emitToolResponse(emit, responseId, ['call-cut']);
+        running.resolve();
+        await new Promise(resolve => controls.signal.addEventListener('abort', resolve, { once: true }));
+        return;
+      }
+      await emitFinalText(emit, responseId, 'answer to the edited question');
+    }
+  }, async (state) => {
+    const { requests, gates, startTurn, drive, reopen, recover } = state;
+    gates.set('call-cut', deferred());
+    const first = await startTurn('truncate-1', 'Original question.');
+    const driving = drive(first);
+    void driving.catch(() => undefined);
+    await running.promise;
+    await waitFor(async () => (await unresolvedNativeCalls(state.app)).length === 1, 'call occurrence committed');
+    await state.app.modelProvider.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture Host loss'));
+    await assert.rejects(driving, error => kernel.isExecutionHandoffError(error));
+    await reopen();
+    const recovered = await recover(first.turnId);
+    await kernel.runWithExecutionLeaseFence(recovered.fence, async () => {
+      // An older Host settled the call but ended the Turn without closing its result into Context.
+      const [open] = await state.app.runtime.effects.listNativePendingWork({ conversationId: CONVERSATION });
+      await state.app.runtime.effects.settleWithoutEffect({
+        source: { kind: 'internal', key: 'fixture-cut-settle' }, toolCallId: open.toolCallId,
+        status: 'cancelled', detail: { reason: 'native_logical_request_ended' }
+      });
+      const [request] = await rows(state.app, 'ModelRequest', { turn_id: first.turnId });
+      await state.app.modelProvider.cancel(request.id, 'provider_failed');
+      await state.app.turns.terminal({
+        source: { kind: 'internal', key: 'fixture-cut-failure' }, turnId: first.turnId,
+        terminalStatus: 'failed', reason: 'older Host failed without native closure'
+      });
+    });
+    const [input] = await rows(state.app, 'MessageTurnLink', { turn_id: first.turnId, role: 'input' });
+    const edited = await state.app.turns.editAndRun({
+      source: { kind: 'command', key: 'truncate-edit' }, conversationId: CONVERSATION,
+      leaseOwnerId: 'fixture', hostBootId: state.app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 300000).toISOString(),
+      messageId: input.message_id, content: 'Edited question.'
+    });
+    const [lease] = await rows(state.app, 'ExecutionLease', { turn_id: edited.turnId });
+    const second = { turnId: edited.turnId, fence: { id: lease.id, conversationId: lease.conversation_id,
+      turnId: lease.turn_id, ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) } };
+    const outcome = await drive(second);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(state.app, 'TurnTermination', { turn_id: second.turnId })));
+    const last = requests[requests.length - 1];
+    assert.equal(nativeToolPairs(last).get('call-cut'), undefined,
+      'the truncated call gains no orphan result occurrence in the edited head');
+    assert.doesNotMatch(requestText(last), /Original question/);
+  });
+});
+
 test('a synchronous admitted call still running parks the Turn even when another call progressed', { timeout: 30000 }, async () => {
   await withNativeKernel({
     background: ['call-background'],

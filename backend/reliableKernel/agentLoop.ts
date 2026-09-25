@@ -1853,10 +1853,20 @@ export class ReliableAgentLoop {
      */
     scope: 'conversation' | 'turn' | 'terminating_turn';
   }): Promise<number> {
-    const open = (await this.effects.listNativePendingWork({
+    const candidates = (await this.effects.listNativePendingWork({
       conversationId: input.conversationId,
       ...(input.scope === 'conversation' ? {} : { turnId: input.turnId })
     })).filter((entry) => entry.callContextSegmentId !== undefined && entry.resultContextSegmentId === undefined);
+    if (candidates.length === 0) return 0;
+    // Only calls whose call occurrence is part of the CURRENT head can be closed there. A call
+    // cut away by edit-and-run/retry truncation must never gain a result occurrence in the new
+    // head: that orphan result would make every later Provider request invalid.
+    const headRootId = await this.context.currentHeadRootId(input.conversationId);
+    const headSegmentIds = new Set(headRootId
+      ? (await this.context.materializeStructure(headRootId)).records.map((record) =>
+        requireId(record.segment.id, 'ContextSegment.id'))
+      : []);
+    const open = candidates.filter((entry) => headSegmentIds.has(entry.callContextSegmentId!));
     const stillRunning: Array<{ toolCallId: string; reason: string }> = [];
     let closureError: unknown;
     let appended = 0;
@@ -2535,8 +2545,19 @@ export class ReliableAgentLoop {
     providerId: string,
     modelId: string
   ): Promise<void> {
-    const pending = (await this.effects.listNativePendingWork({ conversationId }))
+    let pending = (await this.effects.listNativePendingWork({ conversationId }))
       .filter((entry) => !entry.settled || entry.resultContextSegmentId === undefined);
+    if (pending.length > 0) {
+      // A call cut out of the current head by edit/retry truncation is no longer model-visible
+      // and is never closed into this head; it cannot pin the Conversation to its old model.
+      const headRootId = await this.context.currentHeadRootId(conversationId);
+      const headSegmentIds = new Set(headRootId
+        ? (await this.context.materializeStructure(headRootId)).records.map((record) =>
+          requireId(record.segment.id, 'ContextSegment.id'))
+        : []);
+      pending = pending.filter((entry) =>
+        entry.callContextSegmentId === undefined || headSegmentIds.has(entry.callContextSegmentId));
+    }
     const steering = await readNativeSteeringInFlight(this.database, conversationId);
     if (pending.length === 0 && steering.length === 0) return;
     const allowedTargets = new Set<string>();
