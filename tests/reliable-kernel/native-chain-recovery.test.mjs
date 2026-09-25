@@ -645,6 +645,45 @@ test('closure never appends a result for a call cut out of the current head', { 
   });
 });
 
+test('native budget refusal respects the compression decision and only refuses a genuinely overfull request', () => {
+  const budget = { planningInputCapacityTokens: 10000, compressionThresholdTokens: 5000, autoCompressionEnabled: true };
+  const refuse = (observed, planned, compression, overrides = {}) => nativeFullRequestExceedsBudget({
+    budget: { ...budget, ...overrides }, observedPhysicalInputTokens: observed, plannedFullInputTokens: planned, compression
+  });
+  assert.equal(refuse(6000, 900, { status: 'skipped', reason: 'below_threshold' }), false);
+  assert.equal(refuse(6000, 900, { status: 'continued_uncompressed' }), false);
+  assert.equal(refuse(9500, 9500, { status: 'continued_uncompressed' }), false, 'enabled compression said continue');
+  assert.equal(refuse(9500, 900, { status: 'compressed' }), false, 'the compacted request fits');
+  assert.equal(refuse(9500, 9500, { status: 'compressed' }), true, 'the compacted request still does not fit');
+  assert.equal(refuse(9500, 900, { status: 'skipped', reason: 'native_pending_tools' }), true,
+    'a deferred compression cannot make an overfull input fit');
+  assert.equal(refuse(9500, 900, { status: 'skipped', reason: 'disabled' }, { autoCompressionEnabled: false }), true);
+  assert.equal(refuse(6000, 900, { status: 'skipped', reason: 'disabled' }, { autoCompressionEnabled: false }), false);
+  assert.equal(refuse(undefined, 9900, { status: 'skipped', reason: 'disabled' }, { autoCompressionEnabled: false }), false);
+});
+
+test('a Turn whose physical input passed the threshold continues when compression says the request fits', { timeout: 30000 }, async () => {
+  await withNativeKernel({
+    compressionThreshold: 5000, threshold: 5000, window: 100000,
+    async script({ round, emit, responseId, ended }) {
+      if (round === 0) {
+        await emitToolResponse(emit, responseId, ['call-A'], { usage: { input_tokens: 6000, output_tokens: 10 } });
+        await ended.promise;
+        await emit('completed', { role: 'model', parts: [callPart('call-A', 0, responseId)] });
+        return;
+      }
+      await emitFinalText(emit, responseId, 'continued below the compression threshold estimate');
+    }
+  }, async ({ app, requests, startTurn, drive }) => {
+    const turn = await startTurn('budget-threshold', 'Run the probe.');
+    const outcome = await drive(turn);
+    assert.equal(outcome.terminalStatus, 'completed',
+      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
+    assert.equal(requests.length, 2);
+    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+  });
+});
+
 test('a synchronous admitted call still running parks the Turn even when another call progressed', { timeout: 30000 }, async () => {
   await withNativeKernel({
     background: ['call-background'],

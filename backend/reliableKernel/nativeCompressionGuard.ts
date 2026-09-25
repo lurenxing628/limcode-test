@@ -81,6 +81,41 @@ export function nativePhysicalResponseBudgetPressure(input: {
   return physicalInputTokens >= boundary;
 }
 
+/**
+ * Refusal of the next full request of a native Turn. Only a genuinely overfull request is refused:
+ * the previous physical response of the same lineage already used the frozen planning capacity
+ * (minus headroom). The user threshold never refuses by itself, and the compression coordinator's
+ * decision is respected — when automatic compression is enabled and it continued (the request
+ * fits, or it is below the threshold) the request is sent. A committed compression is refused only
+ * when the compacted request itself still does not fit.
+ */
+export function nativeFullRequestExceedsBudget(input: {
+  budget: NativeLogicalRequestBudget;
+  /** Raw input tokens of the latest physical response of the previous request (same lineage). */
+  observedPhysicalInputTokens?: number;
+  /** Planned estimate of the full request about to be frozen. */
+  plannedFullInputTokens: number;
+  compression:
+    | { status: 'compressed' }
+    | { status: 'continued_uncompressed' }
+    | { status: 'skipped'; reason: string };
+}): boolean {
+  const { budget, observedPhysicalInputTokens: observed, plannedFullInputTokens: planned } = input;
+  if (observed === undefined) return false;
+  const capacityOnly: NativeLogicalRequestBudget = { ...budget, autoCompressionEnabled: false };
+  const overCapacity = (tokens: number): boolean => nativePhysicalResponseBudgetPressure({
+    budget: capacityOnly,
+    physicalInputTokens: tokens,
+    // The eighth physical response is a periodic checkpoint, not evidence of an overfull input.
+    physicalResponseCount: 1
+  });
+  if (!overCapacity(observed)) return false;
+  if (input.compression.status === 'compressed') return overCapacity(planned);
+  if (budget.autoCompressionEnabled && (input.compression.status === 'continued_uncompressed'
+    || input.compression.reason === 'below_threshold')) return false;
+  return true;
+}
+
 export class NativeSafetyWaitError extends Error {
   public readonly code = 'NATIVE_SAFETY_WAIT';
 

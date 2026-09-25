@@ -67,7 +67,7 @@ import { readNativeSteeringInFlight } from './nativeSteering';
 import {
   NativeRequestBudgetError,
   NativeSafetyWaitError,
-  nativePhysicalResponseBudgetPressure,
+  nativeFullRequestExceedsBudget,
   planNativeCompressionRebase,
   type NativeLogicalRequestBudget
 } from './nativeCompressionGuard';
@@ -664,25 +664,21 @@ export class ReliableAgentLoop {
               if (previous && previous.provider_id === preview.providerId && previous.model_id === preview.modelId) {
                 const observed = await this.modelProvider.readNativeLatestResponseUsage(previousId);
                 const previousStream = asRecord(previous.stream_stats_json);
-                if (observed?.inputTokens !== undefined
+                const sameStream = observed?.inputTokens !== undefined
                   && observed.attemptSeq === String(previousStream?.attemptSeq)
-                  && observed.socketGeneration === String(previousStream?.socketGeneration)
-                  && nativePhysicalResponseBudgetPressure({
-                    budget: nativeBudget,
-                    physicalInputTokens: observed.inputTokens,
-                    // The eighth physical response is a periodic preflight checkpoint, not by
-                    // itself evidence that its input is near capacity. Only actual raw input may
-                    // force a refusal when the user disabled compression.
-                    physicalResponseCount: 1
-                  }) && (compression.status !== 'compressed'
-                    || nativePhysicalResponseBudgetPressure({
-                      budget: nativeBudget,
-                      physicalInputTokens: planningBudget.estimatedFullInputTokens,
-                      physicalResponseCount: 1
-                    }))) {
-                  // A committed compression still needs to leave planning headroom. Never send a
-                  // growing raw input a second time or enable a user-disabled method implicitly.
-                  throw new NativeRequestBudgetError(observed.inputTokens,
+                  && observed.socketGeneration === String(previousStream?.socketGeneration);
+                if (sameStream && nativeFullRequestExceedsBudget({
+                  budget: nativeBudget,
+                  observedPhysicalInputTokens: observed.inputTokens,
+                  plannedFullInputTokens: planningBudget.estimatedFullInputTokens,
+                  compression: compression.status === 'skipped'
+                    ? { status: 'skipped', reason: compression.reason }
+                    : { status: compression.status }
+                })) {
+                  // Never send a raw input that already filled the planning capacity a second
+                  // time or enable a user-disabled method implicitly; the coordinator's decision
+                  // (the threshold, a continue-if-fits fallback) is otherwise respected.
+                  throw new NativeRequestBudgetError(observed.inputTokens!,
                     nativeBudget.planningInputCapacityTokens);
                 }
               }
