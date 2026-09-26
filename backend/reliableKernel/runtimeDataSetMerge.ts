@@ -3,92 +3,114 @@ import { constants, createReadStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import Database from 'better-sqlite3';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { storageKeyForDigest } from './contentAddressedStore';
 import { RUNTIME_KERNEL_EPOCH, type RootBinding, type RuntimeRootPaths } from './contracts';
-import { assertCurrentSchema, auditDatabaseIntegrity, configureWriterConnection } from './databaseSchema';
-import { type HistoricalRootBinding } from './rootAuthority';
+import { assertCurrentSchema, auditDatabaseIntegrity } from './databaseSchema';
+import { DOMAIN_REPOSITORIES, HISTORICAL_COPY_DOMAINS, type DomainRow, type RepositoryTransactionStep } from './repositories';
+import type { HistoricalRootBinding } from './rootAuthority';
+import type { RuntimeDatabase } from './runtimeDatabase';
+import {
+  describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, inspectUnfinishedWork, MERGE_FINALIZATION_REASON
+} from './runtimeDataSetMergeWork';
+import {
+  pruneRuntimeDataSetMergeCommits, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeLedger,
+  readRuntimeDataSetMergeRequests, removeRuntimeDataSetMergeCommit, removeRuntimeDataSetMergeRequest, runtimeDataSetFingerprint,
+  sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit,
+  writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
+  type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeLedgerRecord
+} from './runtimeDataSetMergeLedger';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
-  assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance,
-  type RuntimeHostActiveDescriptor
+  assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance
 } from './runtimeHostControl';
-import type { RuntimeExclusiveMaintenanceOutcome } from './runtimeExclusiveMaintenance';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import {
-  assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet
+  assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet,
+  type RuntimeDataSetDatabaseSnapshot
 } from './runtimeStorageInspection';
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 import { toSqliteFilePath } from './sqliteFilePath';
 import {
-  inspectVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet, type VscodeRuntimeDataSetCandidate
+  createVscodeRootAuthority, inspectVscodeRuntimeDataSets, isVscodeRuntimeDataSetKept, legacyWorkspaceRuntimeOwnerState,
+  resolveVscodeRuntimeDataSet, type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
-/** Per-source durable state, kept in the selected target's control root beside its active root. */
-export const RUNTIME_DATA_SET_MERGE_RECORDS_DIRECTORY = 'merged-sources';
-/** Explicit user requests to merge a non-workspace data set on the next exclusive startup. */
-export const RUNTIME_DATA_SET_MERGE_REQUESTS_DIRECTORY = 'merge-requests';
-/** One verified SQLite Backup API copy of the target per startup batch that changes it. */
-export const RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY = 'merge-backups';
+/**
+ * Historical data-set merge, online. The selected Runtime is already open; a source (another data
+ * set of this configuration root) must be offline. Per source, inside configuration admission and
+ * the source's maintenance claim: exact published 3/4 upgrade, unfinished-work finalization (after
+ * a source backup), integrity checks, verified CAS pre-copy, then ONE ordinary RuntimeDatabase
+ * write transaction of Repository insert steps (codec-validated, worker insert invariants apply,
+ * other Hosts keep running and see it as an external commit). Sources above the online size limit
+ * need the exclusive fallback. The ledger records every outcome by exact source file state.
+ */
 
-const MERGE_RECORD_KIND = 'limcode-runtime-data-set-merge';
-const MERGE_REQUEST_KIND = 'limcode-runtime-data-set-merge-request';
+/** One verified online Backup API copy of the target per batch that changes it (target control root). */
+export const RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY = 'merge-backups';
+/** Backup of a source taken before its unfinished work is finalized (source control root). */
+export const RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY = 'merge-source-backups';
+/** Target backups kept per control root; older ones are removed after a successful batch. */
+export const RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION = 3;
+/**
+ * Online transaction bound: the merge transaction blocks other Hosts' writes (busy_timeout 5 s).
+ * Measured on this machine (see the merge report): ~6,000 rows commit in about one second.
+ */
+export const RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object.freeze({ maxRows: 6_000, maxBytes: 16 * 1024 * 1024 });
+
 const MAX_REPORTED_CONFLICTS = 20;
 
 /**
- * Domains whose id is derived from content identity. The same id in two data sets is the same
- * content/project; only these presentation or creation-time columns may differ, and the
- * selected target keeps its row. Every other domain must match exactly or the source is refused.
+ * Insert order for one transaction with immediate foreign keys: the manifest order, except that a
+ * domain moves just past every table it references (three manifest entries reference a later
+ * table). Stable, so trigger-sensitive manifest pairs keep their relative order.
+ */
+const MERGE_DOMAIN_ORDER: readonly (typeof RUNTIME_DOMAIN_SCHEMAS)[number][] = (() => {
+  const remaining = [...RUNTIME_DOMAIN_SCHEMAS];
+  const placed = new Set<string>();
+  const ordered: (typeof RUNTIME_DOMAIN_SCHEMAS)[number][] = [];
+  while (remaining.length > 0) {
+    const index = remaining.findIndex((schema) => schema.columns.every((column) => {
+      const table = column.references?.table;
+      return table === undefined || table === schema.table || placed.has(table);
+    }));
+    if (index < 0) throw new Error('Runtime domain references form a cycle; historical merge cannot order inserts.');
+    const [schema] = remaining.splice(index, 1);
+    placed.add(schema.table);
+    ordered.push(schema);
+  }
+  return Object.freeze(ordered);
+})();
+const READ_CHUNK = 250;
+
+/**
+ * Content-derived identities. The same id in two data sets is the same content, project or
+ * observation; only these columns may differ and the receiving data set keeps its row.
  */
 const IDENTITY_MERGE_DIFFERENCES: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   // id = hash(content_type, sha256, byte_length); storage_key derives from sha256.
   ['ContentObject', new Set(['created_at'])],
-  // id = hash(uri); kind/uri must match, name and timestamps are mutable presentation facts.
+  // id = hash(uri); kind/uri must match, name and timestamps are presentation facts.
   ['ProjectContext', new Set(['name', 'created_at', 'updated_at'])],
-  // id = hash(sha256, mime type, name); storage and content object follow from the same bytes.
-  ['Attachment', new Set(['created_at'])]
+  // id = hash(sha256, mime type, name).
+  ['Attachment', new Set(['created_at'])],
+  // id = hash(attachment_id, analysis_profile_sha256): the Runtime reuses an existing observation
+  // for that pair instead of observing again, so the receiving data set's observation stays.
+  ['AttachmentObservationLink', new Set(['content_object_id', 'created_at'])]
 ]);
 
 /**
- * Work that the current Runtime would resume, reconcile, deliver or ask about after a merge.
- * A source containing any of it is not merged: finalizing it offline would invent semantics
- * that the kernel only defines for a live Runner (resume judgment, effect reconciliation).
+ * Columns renumbered on insert. CollaborationMessage.message_seq is one global, unique ordering
+ * key (allocated as MAX + 1); it is not frozen in any JSON, CAS content or other row. Source rows
+ * are shifted past the receiving maximum, which keeps their relative order.
  */
-const UNFINISHED_WORK_PROBES: ReadonlyArray<readonly [label: string, sql: string]> = Object.freeze([
-  ['Turn(active)', "SELECT COUNT(*) FROM turn WHERE status = 'active'"],
-  ['ExecutionLease', 'SELECT COUNT(*) FROM execution_lease'],
-  ['TurnIntent(queued)', "SELECT COUNT(*) FROM turn_intent WHERE state = 'queued'"],
-  ['PendingTurnInput(pending)', "SELECT COUNT(*) FROM pending_turn_input WHERE state = 'pending'"],
-  ['ToolCall(unfinished)', "SELECT COUNT(*) FROM tool_call WHERE status IN ('pending', 'executing', 'waiting_approval', 'waiting_answer')"],
-  ['Operation(unfinished)', "SELECT COUNT(*) FROM operation WHERE status IN ('pending', 'executing', 'waiting_answer')"],
-  ['EffectIntent(unreceipted)', "SELECT COUNT(*) FROM effect_intent WHERE dispatch_state IN ('pending', 'dispatched')"],
-  ['ModelRequest(unfinished)', "SELECT COUNT(*) FROM model_request WHERE status <> 'terminal'"],
-  ['InteractionRequest(pending)', "SELECT COUNT(*) FROM interaction_request WHERE status = 'pending'"],
-  ['ChildExecution(active)', "SELECT COUNT(*) FROM child_execution WHERE status IN ('starting', 'active', 'interrupting')"],
-  ['ChildExecutionActiveTurnLink', 'SELECT COUNT(*) FROM child_execution_active_turn_link'],
-  ['ChildExecutionIntentLink(pending)', "SELECT COUNT(*) FROM child_execution_intent_link WHERE state = 'pending'"],
-  ['RuntimeDelivery(pending)', "SELECT COUNT(*) FROM runtime_delivery WHERE state = 'pending'"],
-  ['RuntimeDeliveryWake(pending)', "SELECT COUNT(*) FROM runtime_delivery_wake WHERE state IN ('pending', 'claimed')"],
-  ['CollaborationRequest(pending)', "SELECT COUNT(*) FROM collaboration_request WHERE state = 'pending'"],
-  ['Process(running)', "SELECT COUNT(*) FROM process WHERE status NOT IN ('exited', 'cancelled', 'timed_out', 'output_limit_exceeded')"],
-  ['ProcessCompletionDispatch(pending)', "SELECT COUNT(*) FROM process_completion_dispatch WHERE state IN ('pending', 'claimed')"],
-  // Terminal output that is not fully registered would be re-read from the source-local spool.
-  ['ProcessOutputChunk(unregistered)', `
-    SELECT COUNT(*) FROM (
-      SELECT process.id
-        FROM process
-        LEFT JOIN process_output_chunk AS chunk ON chunk.process_id = process.id
-       GROUP BY process.id, process.retained_chunks, process.retained_bytes
-      HAVING COUNT(chunk.id) <> process.retained_chunks
-          OR COALESCE(SUM(chunk.byte_length), 0) <> process.retained_bytes
-          OR (process.retained_chunks > 0 AND MIN(chunk.chunk_seq) <> 1)
-          OR (process.retained_chunks > 0 AND MAX(chunk.chunk_seq) <> process.retained_chunks)
-    )`]
-]);
+const RENUMBERED_COLUMNS: ReadonlyMap<string, string> = new Map([['CollaborationMessage', 'message_seq']]);
 
 export type RuntimeDataSetMergeFaultPoint =
+  | 'after-source-backup'
   | 'after-target-backup'
   | 'after-cas-transfer'
   | 'before-row-commit'
@@ -99,19 +121,53 @@ export interface RuntimeDataSetMergeOptions {
   onFaultPoint?(point: RuntimeDataSetMergeFaultPoint): void | Promise<void>;
   /** Defaults to fs.link; a cross-device or unsupported link falls back to a verified copy. */
   linkFile?(source: string, target: string): Promise<void>;
+  /** Defaults to {@link RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS}. */
+  limits?: { maxRows: number; maxBytes: number };
 }
 
-/** A complete Runtime root addressed directly, e.g. a fresh root under another data directory. */
-export interface RuntimeDataSetMergeEndpoint {
+/** The open Runtime that receives the merge. */
+export interface RuntimeDataSetMergeTarget {
   configurationRootPath: string;
-  binding: HistoricalRootBinding;
+  database: RuntimeDatabase;
 }
 
-export interface RuntimeDataSetMergeIntoTargetOptions extends RuntimeDataSetMergeOptions {
+/** `reason` is the user-facing Chinese reason of an abandoned coordination. */
+export type RuntimeDataSetExclusiveOutcome = { state: 'completed' } | { state: string; reason?: string };
+
+/** One oversized source that is known to merge now; see coordinateOversized. */
+export interface RuntimeDataSetOversizedMerge {
+  targetPaths: RuntimeRootPaths;
+  /** This window's own Host on the target: it stays open and runs the merge itself. */
+  requesterHostBootId: string;
+  candidateId: string;
+  /** Identity of this work (source and its exact file state), for the coordination backoff. */
+  operationKey: string;
+  /** The user explicitly asked for this merge (the caller may wait for busy windows). */
+  requested: boolean;
+}
+
+export interface RuntimeDataSetMergeBatchOptions extends RuntimeDataSetMergeOptions {
+  /** Stop before the next source when activation ends or its configuration root changes. */
+  shouldContinue?(): boolean;
+  /** Called once, only when at least one source actually needs work. */
+  onWorkStart?(total: number): void;
+  onSourceStart?(candidate: VscodeRuntimeDataSetCandidate, index: number, total: number): void;
+  /** Restricts the batch, e.g. to a source the user just asked to merge. */
+  candidateIds?: readonly string[];
   /**
-   * Only for moving a whole data set into a root that becomes the selected root for the same
-   * work (data-root migration): unfinished work is carried and recovered there as after a crash.
-   * Historical merges never set this.
+   * Exclusive fallback for one source above the online limits, called only after the source was
+   * prepared and checked and is known to merge now, inside configuration admission and the
+   * target's maintenance claim: ask the other windows of the target to go offline (the two-phase
+   * exclusive maintenance primitive), then run `merge` (the same transaction, now uncontended).
+   */
+  coordinateOversized?(input: RuntimeDataSetOversizedMerge, merge: () => Promise<void>): Promise<RuntimeDataSetExclusiveOutcome>;
+}
+
+export interface RuntimeDataSetIntoDatabaseOptions extends RuntimeDataSetMergeOptions {
+  /**
+   * Only for moving a whole data set into a fresh root that then becomes the selected root
+   * (data-root migration): unfinished work is carried unchanged and recovered there as after a
+   * crash. Historical merges never set this.
    */
   allowUnfinishedWork?: boolean;
 }
@@ -122,88 +178,53 @@ export interface RuntimeDataSetCasTransfer {
   reusedCasObjects: number;
 }
 
-export interface RuntimeDataSetMergeResult {
+export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   candidateId: string;
   sourceDataSetId: string;
   targetDataSetId: string;
   insertedRows: number;
   reusedRows: number;
   insertedConversations: number;
-  linkedCasObjects: number;
-  copiedCasObjects: number;
-  reusedCasObjects: number;
-  backupPath: string;
-  /** A previous commit was found through its committing record; rows were not merged again. */
+  /** Absent when an interrupted commit was only confirmed. */
+  backupPath?: string;
+  /** A previous commit was found through its exact id set; rows were not merged again. */
   recoveredCommit: boolean;
   /** The source was upgraded from a published predecessor immediately before merging. */
   upgradedFromEpoch?: 3 | 4;
+  /** Unfinished work closed before the merge (source backup kept beside the source). */
+  finalized?: { turns: number; intents: number; sourceBackupPath: string };
+  /** Merged through the exclusive fallback because the source exceeded the online limits. */
+  exclusive?: boolean;
 }
 
 export interface RuntimeDataSetMergeIssue {
   candidateId?: string;
   code: string;
   message: string;
-}
-
-export interface RuntimeDataSetMergeBlocked extends RuntimeDataSetMergeIssue {
-  candidateId: string;
-  /** False when the same unchanged source was already reported on an earlier startup. */
-  newlyBlocked: boolean;
-}
-
-export interface RuntimeDataSetMergeBatchOptions extends RuntimeDataSetMergeOptions {
-  /** Stop before the next source when activation ends or its configuration root changes. */
-  shouldContinue?(): boolean;
-  /** Called once, only when at least one source actually needs work. */
-  onWorkStart?(total: number): void;
-  onSourceStart?(candidate: VscodeRuntimeDataSetCandidate, index: number, total: number): void;
-  /**
-   * Called under the batch's configuration admission and target maintenance claim when other Hosts
-   * use the target. Typically {@link requestExclusiveRuntimeMaintenance} with `operationKey`, which
-   * identifies the pending sources so backoff never delays a different set: every other window
-   * first answers, and only when all can yield do they reload and `merge` runs. Without it such a
-   * batch is only reported.
-   */
-  coordinateTargetHosts?(
-    targetPaths: RuntimeRootPaths,
-    merge: () => Promise<void>,
-    operationKey: string
-  ): Promise<RuntimeExclusiveMaintenanceOutcome<void>>;
+  /** False when the same unchanged source state was already reported earlier. */
+  newly?: boolean;
+  /** The user asked for this merge; its outcome is always reported. */
+  requested?: boolean;
 }
 
 export interface RuntimeDataSetMergeBatchResult {
   targetCandidateId?: string;
-  /** Selected target root, for callers that coordinate exclusivity on it. */
-  targetRuntimeDataRootPath?: string;
   merged: RuntimeDataSetMergeResult[];
-  /** Sources still used by a live or unverifiable Host (typically an older window). */
+  /** Retried at a later startup: source in use, or too large while other windows stay busy. */
   deferred: RuntimeDataSetMergeIssue[];
-  blocked: RuntimeDataSetMergeBlocked[];
+  /** Unfinished work without a terminal transition, or a conflict with the receiving data set. */
+  blocked: RuntimeDataSetMergeIssue[];
+  /** The source itself cannot be merged in its current state (format, drift, integrity). */
   failures: RuntimeDataSetMergeIssue[];
-  /** Non-empty when other Hosts still use the selected target; nothing was merged. */
-  targetHostsActive: RuntimeHostActiveDescriptor[];
-  /** Number of sources that would be processed once the target is exclusive. */
   pendingSources: number;
   stopped: boolean;
 }
 
 export type RuntimeDataSetMergeState =
-  | { state: 'merged'; mergedAt: string }
-  | { state: 'blocked'; code: string; message: string }
-  | { state: 'requested'; requestedAt: string };
-
-export class RuntimeDataSetMergeBlockedError extends Error {
-  public constructor(
-    public readonly code:
-      | 'runtime-data-set-merge-unfinished-work'
-      | 'runtime-data-set-merge-conflict'
-      | 'runtime-data-set-merge-source-cas-invalid',
-    message: string
-  ) {
-    super(message);
-    this.name = 'RuntimeDataSetMergeBlockedError';
-  }
-}
+  | { state: 'merged'; mergedAt: string; intoCurrent: boolean; changedSinceMerge: boolean }
+  | { state: 'blocked' | 'failed'; code: string; message: string }
+  | { state: 'requested'; requestedAt: string }
+  | { state: 'kept' };
 
 export class RuntimeDataSetMergeError extends Error {
   public constructor(public readonly code: string, message: string, cause?: unknown) {
@@ -213,76 +234,39 @@ export class RuntimeDataSetMergeError extends Error {
   }
 }
 
-interface SourceFingerprint {
-  dataSetId: string;
-  rootInstanceId: string;
-  rootGeneration: number;
-  pointerRevision: number;
-  databaseSize: number;
-  databaseMtimeMs: number;
-  walSize: number;
-  walMtimeMs: number;
-}
+type SourceOutcome =
+  | { kind: 'merged'; result: RuntimeDataSetMergeResult }
+  | { kind: 'deferred' | 'blocked' | 'failed'; code: string; message: string };
 
-interface TargetIdentity {
-  dataSetId: string;
-  rootInstanceId: string;
-}
-
-type MergeRecord = {
-  kind: typeof MERGE_RECORD_KIND;
-  candidateId: string;
-  target: TargetIdentity;
-  source: SourceFingerprint;
-  updatedAt: string;
-} & (
-  | { state: 'committing'; backupDirectoryName: string }
-  | {
-    state: 'merged';
-    mergedAt: string;
-    backupDirectoryName: string;
-    insertedRows: number;
-    reusedRows: number;
-    insertedConversations: number;
-  }
-  | { state: 'blocked'; code: string; message: string }
-);
-
-interface MergeRequest {
-  kind: typeof MERGE_REQUEST_KIND;
-  candidateId: string;
-  expectedDataSetId: string;
-  expectedRootInstanceId: string;
-  target: TargetIdentity;
-  requestedAt: string;
-}
-
-interface SelectedTarget {
-  candidate: VscodeRuntimeDataSetCandidate;
-  binding: HistoricalRootBinding;
+interface TargetContext {
+  configurationRootPath: string;
+  database: RuntimeDatabase;
+  binding: RootBinding;
+  identity: RuntimeDataSetIdentity;
   controlRoot: string;
-  identity: TargetIdentity;
+  backup: { path?: string };
 }
 
-interface BatchBackup {
-  directoryName?: string;
+class Outcome extends Error {
+  public constructor(public readonly outcome: Exclude<SourceOutcome, { kind: 'merged' }>) {
+    super(outcome.message);
+  }
 }
 
 /**
- * Merges every unmerged historical workspace scope, plus explicitly requested data sets, into the
- * selected data set. Call before the selected Runtime registers its Host (startup) — the whole
- * batch holds configuration admission and target maintenance, and the target must have no other
- * live or unverifiable Host. Sources are handled one at a time; a source failure never blocks the
- * others. Sources and their CAS stay unchanged, selection is not switched, and no source work is
- * resumed: sources with unfinished work are refused.
+ * Merges pending historical data sets of this configuration root into the open selected Runtime.
+ * From before this version: every other data set (workspace scopes and the fixed root) is merged
+ * once. Data sets the user switched away from in this version, and sources already merged once,
+ * merge only on explicit request. Never throws for a single source; each outcome is recorded.
  */
-export async function mergeRuntimeDataSetsIntoSelected(
+export async function mergeHistoricalDataSetsOnline(
   paths: { globalStoragePath: string },
+  targetInput: RuntimeDataSetMergeTarget,
   options: RuntimeDataSetMergeBatchOptions = {}
 ): Promise<RuntimeDataSetMergeBatchResult> {
   const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
   const report: RuntimeDataSetMergeBatchResult = {
-    merged: [], deferred: [], blocked: [], failures: [], targetHostsActive: [], pendingSources: 0, stopped: false
+    merged: [], deferred: [], blocked: [], failures: [], pendingSources: 0, stopped: false
   };
   const keepGoing = (): boolean => {
     if (options.shouldContinue?.() !== false) return true;
@@ -290,173 +274,160 @@ export async function mergeRuntimeDataSetsIntoSelected(
     return false;
   };
   if (!keepGoing()) return report;
-  return withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
-    let inspection;
-    try { inspection = await inspectVscodeRuntimeDataSets(storagePaths); }
-    catch (error) {
-      report.failures.push(mergeIssue(error));
-      return report;
-    }
+  const target = targetContext(targetInput);
+  const sources = await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
+    const inspection = await inspectVscodeRuntimeDataSets(storagePaths);
     const selected = inspection.candidates.filter((candidate) => candidate.selected);
-    if (selected.length !== 1 || !selected[0].dataSetId || selected[0].requiresRecovery) return report;
-    let target: SelectedTarget;
-    try { target = await requireSelectedTarget(selected[0]); }
-    catch (error) {
-      report.failures.push(mergeIssue(error));
-      return report;
-    }
-    report.targetCandidateId = target.candidate.id;
-    report.targetRuntimeDataRootPath = target.binding.paths.dataRootPath;
-    const records = await readMergeRecords(target);
-    const history = await readAutomaticMergeHistory(inspection.candidates);
-    const requests = await readMergeRequests(target);
-    const sources: VscodeRuntimeDataSetCandidate[] = [];
+    if (selected.length !== 1 || !sameRuntimeDataSetIdentity(target.identity, selected[0])) return [];
+    report.targetCandidateId = selected[0].id;
+    const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
+    const requests = await readRuntimeDataSetMergeRequests(storagePaths);
+    const picked: Array<{ candidate: VscodeRuntimeDataSetCandidate; requested: boolean; record?: RuntimeDataSetMergeLedgerRecord }> = [];
     for (const candidate of inspection.candidates) {
       if (candidate.selected || !candidate.dataSetId || !candidate.rootInstanceId) continue;
+      if (options.candidateIds && !options.candidateIds.includes(candidate.id)) continue;
       const request = requests.get(candidate.id);
-      const requested = request !== undefined
-        && request.expectedDataSetId === candidate.dataSetId
-        && request.expectedRootInstanceId === candidate.rootInstanceId;
-      if (candidate.source !== 'workspace' && !requested) continue;
-      if (!requested && (history.targets.has(candidate.id)
-        || history.mergedElsewhere.has(sourceKey(candidate.id, candidate.dataSetId, candidate.rootInstanceId)))) continue;
-      const record = records.get(candidate.id);
-      if (record && record.source.dataSetId === candidate.dataSetId
-        && record.source.rootInstanceId === candidate.rootInstanceId) {
-        if (record.state === 'merged') {
-          if (requested) await removeMergeRequest(target, candidate.id);
+      const requested = request !== undefined && sameRuntimeDataSetIdentity(request.target, target.identity)
+        && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId;
+      const recorded = ledger.get(candidate.id);
+      const record = recorded && sameRuntimeDataSetIdentity(recorded.source, candidate) ? recorded : undefined;
+      const fingerprint = record ? await runtimeDataSetFingerprint(candidate).catch(() => undefined) : undefined;
+      const unchanged = record !== undefined && sameRuntimeDataSetFingerprint(record.source, fingerprint);
+      if (record?.state === 'merged' && sameRuntimeDataSetIdentity(record.target, target.identity) && unchanged) {
+        if (requested) await removeRuntimeDataSetMergeRequest(storagePaths, candidate.id);
+        continue;
+      }
+      if (!requested) {
+        // Kept by the user, or merged once already (into any data set): explicit request only.
+        if (record?.state === 'merged' || await isVscodeRuntimeDataSetKept(candidate)) continue;
+        const known = unchanged && (record?.state === 'failed'
+          || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, target.identity)));
+        if (known && (record.state === 'failed' || record.state === 'blocked')) {
+          (record.state === 'failed' ? report.failures : report.blocked).push({
+            candidateId: candidate.id, code: record.code, message: record.message, newly: false
+          });
           continue;
         }
-        if (record.state === 'blocked' && !requested
-          && sameFingerprint(record.source, await sourceFingerprint(candidate).catch(() => undefined))) {
-          report.blocked.push({ candidateId: candidate.id, code: record.code, message: record.message, newlyBlocked: false });
-          continue;
-        }
       }
-      sources.push(candidate);
+      picked.push({ candidate, requested, ...(record ? { record } : {}) });
     }
-    report.pendingSources = sources.length;
-    if (sources.length === 0) return report;
-    return withRuntimeMaintenance(target.binding.paths, async () => {
-      try {
-        await assertRuntimeHostsOffline(target.binding.paths);
-      } catch (error) {
-        if (!isRuntimeHostsActiveError(error)) throw error;
-        const hosts = [...(error as { hosts: RuntimeHostActiveDescriptor[] }).hosts];
-        if (!options.coordinateTargetHosts) {
-          report.targetHostsActive = hosts;
-          return report;
-        }
-        const operationKey = sources
-          .map((source) => `${source.id}@${source.dataSetId ?? ''}/${source.rootInstanceId ?? ''}`)
-          .sort().join('|');
-        const outcome = await options.coordinateTargetHosts(target.binding.paths, () => mergeSources(), operationKey);
-        if (outcome.state !== 'completed') report.targetHostsActive = outcome.hosts;
-        return report;
-      }
-      await mergeSources();
-      return report;
-    });
-
-    async function mergeSources(): Promise<void> {
-      // The pointer may have been recovered by another admission holder; recheck under maintenance.
-      const current = await requireSelectedTarget(await resolveVscodeRuntimeDataSet(storagePaths, target.candidate.id));
-      if (current.identity.dataSetId !== target.identity.dataSetId
-        || current.identity.rootInstanceId !== target.identity.rootInstanceId) {
-        throw new RuntimeDataSetMergeError('runtime-data-set-merge-target-changed', '当前历史库在合并前发生了变化，本次不合并。');
-      }
-      options.onWorkStart?.(sources.length);
-      const backup: BatchBackup = {};
-      for (const [index, source] of sources.entries()) {
-        if (!keepGoing()) break;
-        options.onSourceStart?.(source, index, sources.length);
-        try {
-          report.merged.push(await mergeOneSource(storagePaths, current, source, backup, records.get(source.id), options));
-          await removeMergeRequest(current, source.id);
-        } catch (error) {
-          if (isRuntimeHostsActiveError(error)) {
-            report.deferred.push({ candidateId: source.id, code: 'runtime-hosts-active', message: errorMessage(error) });
-          } else if (error instanceof RuntimeDataSetMergeBlockedError) {
-            const fingerprint = await sourceFingerprint(
-              await resolveVscodeRuntimeDataSet(storagePaths, source.id)
-            ).catch(() => undefined);
-            if (fingerprint) {
-              await writeMergeRecord(current, source.id, {
-                state: 'blocked', source: fingerprint, code: error.code, message: error.message
-              }).catch(() => undefined);
-            }
-            await removeMergeRequest(current, source.id).catch(() => undefined);
-            report.blocked.push({ candidateId: source.id, code: error.code, message: error.message, newlyBlocked: true });
-          } else {
-            report.failures.push(mergeIssue(error, source.id));
-          }
-        }
-      }
-    }
+    return picked;
   });
+  report.pendingSources = sources.length;
+  let started = false;
+  for (const [index, source] of sources.entries()) {
+    if (!keepGoing()) break;
+    if (!started) {
+      started = true;
+      options.onWorkStart?.(sources.length);
+    }
+    options.onSourceStart?.(source.candidate, index, sources.length);
+    const outcome = await mergeOneSource(storagePaths, target, source.candidate.id, source.record, options,
+      { finalizeWork: true, requested: source.requested })
+      .catch((error: unknown): SourceOutcome => ({ kind: 'deferred', code: errorCode(error), message: errorMessage(error) }));
+    if (outcome.kind === 'merged') {
+      report.merged.push(outcome.result);
+      await removeRuntimeDataSetMergeRequest(storagePaths, source.candidate.id).catch(() => undefined);
+      continue;
+    }
+    const issue = { candidateId: source.candidate.id, code: outcome.code, message: outcome.message, newly: true, requested: source.requested };
+    if (outcome.kind === 'deferred') report.deferred.push(issue);
+    else {
+      (outcome.kind === 'blocked' ? report.blocked : report.failures).push(issue);
+      await removeRuntimeDataSetMergeRequest(storagePaths, source.candidate.id).catch(() => undefined);
+    }
+  }
+  if (report.merged.some((result) => result.backupPath)) await pruneTargetBackups(target).catch(() => undefined);
+  if (sources.length > 0) {
+    await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, () => pruneRuntimeDataSetMergeCommits(storagePaths))
+      .catch(() => undefined);
+  }
+  return report;
 }
 
 /**
- * Merges one complete data set of this configuration root into an explicitly addressed target root
- * (which may live under another data directory or filesystem). The caller must already hold the
- * target's configuration admission when it differs from `paths`; this function takes `paths`
- * admission and the target maintenance claim, and requires both roots to have no live Host.
- * Pre-copy CAS with {@link precopyRuntimeDataSetCas} first to keep the exclusive window short.
+ * Merges one complete data set of this configuration root into an explicitly given open Runtime
+ * (e.g. a fresh root under another data directory, for data-root migration). Throws for any
+ * outcome other than merged. The caller holds the target's configuration admission when that
+ * differs from `paths`; the source must be offline.
  */
-export async function mergeRuntimeDataSetIntoTarget(
+export async function mergeRuntimeDataSetIntoDatabase(
   paths: { globalStoragePath: string },
   input: { candidateId: string; expectedDataSetId: string; expectedRootInstanceId: string },
-  targetEndpoint: RuntimeDataSetMergeEndpoint,
-  options: RuntimeDataSetMergeIntoTargetOptions = {}
+  targetInput: RuntimeDataSetMergeTarget,
+  options: RuntimeDataSetIntoDatabaseOptions = {}
 ): Promise<RuntimeDataSetMergeResult> {
   const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
-  return withRuntimeDataRootAdmission(storagePaths.globalStoragePath, () =>
-    withRuntimeMaintenance(targetEndpoint.binding.paths, async () => {
-      await assertRuntimeHostsOffline(targetEndpoint.binding.paths);
-      const target = await requireTargetEndpoint(targetEndpoint);
-      const candidate = await resolveVscodeRuntimeDataSet(storagePaths, input.candidateId);
-      if (candidate.dataSetId !== input.expectedDataSetId || candidate.rootInstanceId !== input.expectedRootInstanceId) {
-        throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '来源历史库的身份已变化，本次不合并。');
-      }
-      const records = await readMergeRecords(target);
-      return mergeOneSource(storagePaths, target, candidate, {}, records.get(candidate.id), options);
-    }));
+  const target = targetContext(targetInput);
+  const candidate = await resolveVscodeRuntimeDataSet(storagePaths, input.candidateId);
+  if (candidate.dataSetId !== input.expectedDataSetId || candidate.rootInstanceId !== input.expectedRootInstanceId) {
+    throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '来源历史库的身份已变化，本次不合并。');
+  }
+  const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
+  // A fresh migration target has no other Host, so the online transaction bound does not apply.
+  const outcome = await mergeOneSource(storagePaths, target, candidate.id, ledger.get(candidate.id),
+    { limits: { maxRows: Infinity, maxBytes: Infinity }, ...options },
+    { finalizeWork: !options.allowUnfinishedWork, requested: true });
+  if (outcome.kind === 'merged') return outcome.result;
+  throw new RuntimeDataSetMergeError(outcome.code, outcome.message);
 }
 
 /**
- * Online CAS pre-copy for a later exclusive merge. Safe while the source Runtime is running: the
- * referenced objects come from a snapshot (SQLite Backup API while a WAL exists, otherwise a plain
- * copy, so an offline source gets no new sidecar files) and CAS files are immutable and verified.
- * The merge later transfers only what is still missing; unreferenced target blobs are harmless.
+ * Online CAS pre-copy for a later exclusive merge or migration. The source is resolved and
+ * validated through its RootAuthority binding. Best effort by design: a live source is read
+ * through a SQLite Backup API snapshot (so the source's own files are never opened outside
+ * SQLite), every published object is digest-verified before it becomes visible, and anything
+ * missed is transferred again inside the later merge. An offline source (no WAL) is copied as a
+ * plain file instead, so no SQLite sidecar is left beside it. Precondition: this process must not
+ * have the source open; pass `sourceDatabase` when it does (the backup then runs on its worker).
  */
 export async function precopyRuntimeDataSetCas(
-  source: RuntimeDataSetMergeEndpoint,
-  target: RuntimeDataSetMergeEndpoint,
-  options: Pick<RuntimeDataSetMergeOptions, 'linkFile'> = {}
+  paths: { globalStoragePath: string },
+  input: { candidateId: string; expectedDataSetId: string; expectedRootInstanceId: string },
+  target: { configurationRootPath: string; binding: HistoricalRootBinding },
+  options: Pick<RuntimeDataSetMergeOptions, 'linkFile'> & { sourceDatabase?: RuntimeDatabase } = {}
 ): Promise<RuntimeDataSetCasTransfer> {
+  const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
+  const candidate = await resolveVscodeRuntimeDataSet(storagePaths, input.candidateId);
+  if (candidate.dataSetId !== input.expectedDataSetId || candidate.rootInstanceId !== input.expectedRootInstanceId) {
+    throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '来源历史库的身份已变化，本次不预复制。');
+  }
+  const binding = await requireCompleteRuntimeDataSet(candidate);
   const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-merge-precopy-'));
   try {
     const snapshotPath = path.join(temporaryRoot, 'limcode.sqlite');
-    const databasePath = source.binding.paths.databasePath;
-    await assertNoSymbolicPath(source.configurationRootPath, databasePath);
-    if (await fs.stat(`${databasePath}-wal`).then(() => true, () => false)) {
-      const live = new Database(toSqliteFilePath(databasePath), { readonly: true, fileMustExist: true });
-      try { await live.backup(toSqliteFilePath(snapshotPath)); }
+    if (options.sourceDatabase) {
+      if (!sameRuntimeDataSetIdentity(options.sourceDatabase.binding, candidate)) {
+        throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '传入的数据库与来源历史库不一致。');
+      }
+      const staged = path.join(path.dirname(binding.paths.dataRootPath), `merge-precopy-${randomUUID()}.sqlite`);
+      try {
+        await options.sourceDatabase.backupTo(staged);
+        await fs.copyFile(staged, snapshotPath);
+      } finally {
+        await removeSqliteFiles(staged);
+      }
+    } else if (await fs.stat(`${binding.paths.databasePath}-wal`).then(() => true, () => false)) {
+      // A live source (its WAL exists): read through SQLite's Backup API.
+      const live = new Database(toSqliteFilePath(binding.paths.databasePath), { readonly: true, fileMustExist: true });
+      try { await live.backup(toSqliteFilePath(snapshotPath), { progress: () => 0x7fffffff }); }
       finally { live.close(); }
     } else {
-      await fs.copyFile(databasePath, snapshotPath, constants.COPYFILE_FICLONE);
+      // An offline, checkpointed source: a plain copy, so no SQLite sidecar appears beside it.
+      await assertNoSymbolicPath(candidate.configurationRootPath, binding.paths.databasePath);
+      await fs.copyFile(binding.paths.databasePath, snapshotPath, constants.COPYFILE_FICLONE);
     }
     const snapshot = new Database(toSqliteFilePath(snapshotPath), { readonly: true, fileMustExist: true });
     try {
       snapshot.defaultSafeIntegers(true);
-      return await transferCas(source, target, snapshot, options);
+      return await transferCas(candidate.configurationRootPath, binding, target.configurationRootPath, target.binding, snapshot, options);
     } finally { snapshot.close(); }
   } finally {
     await fs.rm(temporaryRoot, { recursive: true, force: true });
   }
 }
 
-/** Records an explicit merge of a complete non-selected data set for the next exclusive startup. */
+/** Records an explicit merge request of a complete non-selected data set into the current one. */
 export async function requestRuntimeDataSetMerge(
   paths: { globalStoragePath: string },
   input: { candidateId: string; expectedDataSetId: string; expectedRootInstanceId: string }
@@ -464,10 +435,9 @@ export async function requestRuntimeDataSetMerge(
   const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
   await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
     const selected = (await inspectVscodeRuntimeDataSets(storagePaths)).candidates.filter((candidate) => candidate.selected);
-    if (selected.length !== 1 || !selected[0].dataSetId) {
+    if (selected.length !== 1 || !selected[0].dataSetId || !selected[0].rootInstanceId) {
       throw new RuntimeDataSetMergeError('runtime-data-set-merge-target-missing', '请先选定当前历史库，再合并其它历史库。');
     }
-    const target = await requireSelectedTarget(selected[0]);
     const candidate = await resolveVscodeRuntimeDataSet(storagePaths, input.candidateId);
     if (candidate.selected) {
       throw new RuntimeDataSetMergeError('runtime-data-set-merge-source-selected', '不能把当前历史库合并到自身。');
@@ -475,186 +445,473 @@ export async function requestRuntimeDataSetMerge(
     if (candidate.dataSetId !== input.expectedDataSetId || candidate.rootInstanceId !== input.expectedRootInstanceId) {
       throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '所选历史库的身份已变化，请重新打开历史与存储管理。');
     }
-    const request: MergeRequest = {
-      kind: MERGE_REQUEST_KIND,
+    await writeRuntimeDataSetMergeRequest(storagePaths, {
       candidateId: candidate.id,
       expectedDataSetId: input.expectedDataSetId,
       expectedRootInstanceId: input.expectedRootInstanceId,
-      target: target.identity,
-      requestedAt: new Date().toISOString()
-    };
-    await writeDurableJson(path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_REQUESTS_DIRECTORY, recordFileName(candidate.id)), request);
+      target: { dataSetId: selected[0].dataSetId, rootInstanceId: selected[0].rootInstanceId }
+    });
   });
 }
 
-/** Read-only merge state of each non-selected candidate relative to the selected data set. */
+/** Merge state of every non-selected data set, relative to the currently selected one. */
 export async function readRuntimeDataSetMergeStates(
   paths: { globalStoragePath: string }
 ): Promise<Map<string, RuntimeDataSetMergeState>> {
+  const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
   const result = new Map<string, RuntimeDataSetMergeState>();
-  const inspection = await inspectVscodeRuntimeDataSets({ globalStoragePath: path.resolve(paths.globalStoragePath) });
-  const selected = inspection.candidates.filter((candidate) => candidate.selected);
-  if (selected.length !== 1 || !selected[0].dataSetId) return result;
-  let target: SelectedTarget;
-  try { target = await requireSelectedTarget(selected[0]); } catch { return result; }
-  const records = await readMergeRecords(target);
-  const requests = await readMergeRequests(target);
+  const inspection = await inspectVscodeRuntimeDataSets(storagePaths);
+  const selected = inspection.candidates.find((candidate) => candidate.selected);
+  const current = selected?.dataSetId && selected.rootInstanceId
+    ? { dataSetId: selected.dataSetId, rootInstanceId: selected.rootInstanceId } : undefined;
+  const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
+  const requests = await readRuntimeDataSetMergeRequests(storagePaths);
   for (const candidate of inspection.candidates) {
-    if (candidate.selected) continue;
-    const record = records.get(candidate.id);
-    const current = record && record.source.dataSetId === candidate.dataSetId
-      && record.source.rootInstanceId === candidate.rootInstanceId ? record : undefined;
+    if (candidate.selected || !candidate.dataSetId) continue;
     const request = requests.get(candidate.id);
-    if (current?.state === 'merged') result.set(candidate.id, { state: 'merged', mergedAt: current.mergedAt });
-    else if (request && request.expectedDataSetId === candidate.dataSetId
-      && request.expectedRootInstanceId === candidate.rootInstanceId) {
+    if (request && current && sameRuntimeDataSetIdentity(request.target, current)
+      && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId) {
       result.set(candidate.id, { state: 'requested', requestedAt: request.requestedAt });
-    } else if (current?.state === 'blocked') {
-      result.set(candidate.id, { state: 'blocked', code: current.code, message: current.message });
+      continue;
+    }
+    const record = ledger.get(candidate.id);
+    const applies = record !== undefined && sameRuntimeDataSetIdentity(record.source, candidate);
+    const fingerprint = applies ? await runtimeDataSetFingerprint(candidate).catch(() => undefined) : undefined;
+    const unchanged = applies && sameRuntimeDataSetFingerprint(record.source, fingerprint);
+    if (applies && record.state === 'merged') {
+      result.set(candidate.id, {
+        state: 'merged', mergedAt: record.mergedAt,
+        intoCurrent: sameRuntimeDataSetIdentity(record.target, current), changedSinceMerge: !unchanged
+      });
+    } else if (applies && unchanged && (record.state === 'failed'
+      || (record.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
+      result.set(candidate.id, { state: record.state, code: record.code, message: record.message });
+    } else if (await isVscodeRuntimeDataSetKept(candidate).catch(() => false)) {
+      result.set(candidate.id, { state: 'kept' });
     }
   }
   return result;
 }
 
+function targetContext(input: RuntimeDataSetMergeTarget): TargetContext {
+  const binding = input.database.binding;
+  if (binding.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
+    throw new RuntimeDataSetMergeError('runtime-data-set-merge-target-unsupported', '当前历史库还不是当前格式，不能接收合并。');
+  }
+  const controlRoot = path.dirname(path.resolve(binding.paths.dataRootPath));
+  if (!isPathBelow(path.resolve(input.configurationRootPath), controlRoot)) {
+    throw new RuntimeDataSetMergeError('runtime-data-set-merge-target-invalid', '当前历史库路径越出配置根。');
+  }
+  return {
+    configurationRootPath: path.resolve(input.configurationRootPath),
+    database: input.database,
+    binding,
+    identity: { dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId },
+    controlRoot,
+    backup: {}
+  };
+}
+
 async function mergeOneSource(
   paths: { globalStoragePath: string },
-  target: SelectedTarget,
-  initial: VscodeRuntimeDataSetCandidate,
-  backup: BatchBackup,
-  previousRecord: MergeRecord | undefined,
-  options: RuntimeDataSetMergeIntoTargetOptions
-): Promise<RuntimeDataSetMergeResult> {
-  let candidate = initial;
-  let upgradedFromEpoch: 3 | 4 | undefined;
-  if (candidate.runtimeKernelEpoch === 3 || candidate.runtimeKernelEpoch === 4) {
-    // Published predecessors go through the exact P2 upgrade first; it requires the source offline.
-    const upgrade = await upgradeRuntimeDataSet(paths, {
-      candidateId: candidate.id,
-      expectedDataSetId: candidate.dataSetId!,
-      expectedRootInstanceId: candidate.rootInstanceId!
-    });
-    upgradedFromEpoch = upgrade.previousEpoch;
-    candidate = await resolveVscodeRuntimeDataSet(paths, candidate.id);
-  }
-  if (candidate.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH || candidate.requiresRecovery) {
-    throw new RuntimeDataSetMergeError(
-      'runtime-data-set-merge-source-unsupported',
-      `第 ${candidate.runtimeKernelEpoch ?? '?'} 代或待恢复的历史库不能合并；原数据保持不变。`
-    );
-  }
-  const sourceIdentity = { dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! };
-  if (sourceIdentity.dataSetId === target.identity.dataSetId) {
-    throw new RuntimeDataSetMergeError('runtime-data-set-merge-same-identity', '来源与当前历史库是同一个数据集，不能合并。');
-  }
-  const sourceBinding = await requireCompleteRuntimeDataSet(candidate);
-  return withRuntimeMaintenance(sourceBinding.paths, async () => {
-    try {
-      await assertNoSymbolicPath(candidate.configurationRootPath, path.join(sourceBinding.paths.dataRootPath, 'host-liveness'));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    await assertRuntimeHostsOffline(sourceBinding.paths);
-    const current = await resolveVscodeRuntimeDataSet(paths, candidate.id);
-    if (current.dataSetId !== sourceIdentity.dataSetId || current.rootInstanceId !== sourceIdentity.rootInstanceId) {
-      throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '来源历史库在合并前发生了变化，本次不合并。');
-    }
-    const binding = await requireCompleteRuntimeDataSet(current);
-    const fingerprint = await sourceFingerprint(current);
-    const snapshot = await createRuntimeDataSetDatabaseSnapshot(current, binding);
-    try {
-      const source = snapshot.database;
-      assertCurrentSchema(source, binding as RootBinding);
-      assertRuntimePhysicalSchemaFingerprint(source, RUNTIME_DOMAIN_SCHEMAS);
-      auditDatabaseIntegrity(source);
-
-      if (previousRecord?.state === 'committing'
-        && previousRecord.source.dataSetId === sourceIdentity.dataSetId
-        && previousRecord.source.rootInstanceId === sourceIdentity.rootInstanceId) {
-        const presence = sourceRowPresence(target, source);
-        if (presence.present > 0 && presence.present < presence.total) {
-          throw new RuntimeDataSetMergeBlockedError(
-            'runtime-data-set-merge-conflict',
-            '上次合并在提交前后中断，且当前历史库只包含这份旧记录的一部分，无法确认合并状态；原数据保持不变。'
-          );
+  target: TargetContext,
+  candidateId: string,
+  previousRecord: RuntimeDataSetMergeLedgerRecord | undefined,
+  options: RuntimeDataSetMergeBatchOptions & RuntimeDataSetIntoDatabaseOptions,
+  mode: SourceMode
+): Promise<SourceOutcome> {
+  const state: SourceProgress = {};
+  try {
+    return await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
+      try {
+        return await mergeAdmittedSource(paths, target, candidateId, previousRecord, options, mode, state);
+      } catch (error) {
+        const outcome = sourceOutcome(error, state);
+        if (outcome.kind !== 'deferred' && state.fingerprint) {
+          // Judged against the source files as they are now, still inside admission: a failed
+          // upgrade attempt may itself have touched them, and an unchanged source is not retried.
+          const current = await resolveVscodeRuntimeDataSet(paths, candidateId)
+            .then((candidate) => runtimeDataSetFingerprint(candidate)).catch(() => state.fingerprint!);
+          await writeRuntimeDataSetMergeLedgerRecord(paths, outcome.kind === 'failed'
+            ? { candidateId, state: 'failed', source: current, code: outcome.code, message: outcome.message }
+            : { candidateId, state: 'blocked', source: current, target: target.identity, code: outcome.code, message: outcome.message }
+          ).catch(() => undefined);
         }
-        if (presence.total > 0 && presence.present === presence.total) {
-          // The row transaction committed before its record was finalized. Rows may have changed
-          // since (the Runtime could have opened); never re-merge them, only finish the record.
-          const counts = countSourceRows(source);
-          await writeMergeRecord(target, current.id, {
-            state: 'merged', source: fingerprint, mergedAt: new Date().toISOString(),
-            backupDirectoryName: previousRecord.backupDirectoryName,
-            insertedRows: 0, reusedRows: counts.rows, insertedConversations: 0
-          });
-          return {
-            candidateId: current.id, sourceDataSetId: sourceIdentity.dataSetId, targetDataSetId: target.identity.dataSetId,
-            insertedRows: 0, reusedRows: counts.rows, insertedConversations: 0,
-            linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0,
-            backupPath: backupRootPath(target, previousRecord.backupDirectoryName), recoveredCommit: true,
-            ...(upgradedFromEpoch !== undefined ? { upgradedFromEpoch } : {})
-          };
+        return outcome;
+      }
+    });
+  } catch (error) {
+    return sourceOutcome(error, state);
+  }
+}
+
+interface SourceMode {
+  /** Close finalizable unfinished work first (every historical merge; never a migration). */
+  finalizeWork: boolean;
+  requested: boolean;
+}
+
+interface SourceProgress {
+  fingerprint?: RuntimeDataSetFingerprint;
+  upgradedFromEpoch?: 3 | 4;
+}
+
+function sourceOutcome(error: unknown, state: SourceProgress): Exclude<SourceOutcome, { kind: 'merged' }> {
+  const outcome = error instanceof Outcome
+    ? { ...error.outcome }
+    : isRuntimeHostsActiveError(error)
+      ? { kind: 'deferred' as const, code: 'runtime-hosts-active', message: '这个历史库正被其它窗口使用，关闭那个窗口后会自动合并。' }
+      : { kind: 'failed' as const, code: errorCode(error), message: `合并前核验未通过：${errorMessage(error)}` };
+  if (state.upgradedFromEpoch !== undefined) {
+    // The published predecessor was backed up and upgraded in place before this outcome.
+    outcome.message += `（这个库已按已发布的第 ${state.upgradedFromEpoch} 代格式先备份并就地升级到当前格式，对话内容未改动。）`;
+  }
+  return outcome;
+}
+
+async function mergeAdmittedSource(
+  paths: { globalStoragePath: string },
+  target: TargetContext,
+  candidateId: string,
+  previousRecord: RuntimeDataSetMergeLedgerRecord | undefined,
+  options: RuntimeDataSetMergeBatchOptions & RuntimeDataSetIntoDatabaseOptions,
+  mode: SourceMode,
+  state: SourceProgress
+): Promise<SourceOutcome> {
+  let candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
+  if (candidate.selected || !candidate.dataSetId || !candidate.rootInstanceId) {
+    throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '来源已成为当前库或已被清空，本次不合并。' });
+  }
+  if (sameRuntimeDataSetIdentity(target.identity, candidate)) {
+    throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-same-identity', message: '来源与当前历史库是同一个数据集，不能合并。' });
+  }
+  await assertSourceIdle(candidate);
+  state.fingerprint = await runtimeDataSetFingerprint(candidate);
+  if (candidate.requiresRecovery) {
+    throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这个历史库有一次未完成的归档或切换，需要先切换到它完成恢复，才能合并。' });
+  }
+  const epoch = candidate.runtimeKernelEpoch;
+  if (epoch === 3 || epoch === 4) {
+    const upgrade = await upgradeRuntimeDataSet(paths, {
+      candidateId, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
+    }).catch((error: unknown) => {
+      if (isRuntimeHostsActiveError(error)) throw new Outcome({ kind: 'deferred', code: 'runtime-hosts-active', message: '这个历史库正被旧版本窗口使用，关闭那个窗口后会自动合并。' });
+      throw new Outcome({ kind: 'failed', code: errorCode(error), message: `这份已发布的旧格式无法自动升级：${errorMessage(error)}` });
+    });
+    state.upgradedFromEpoch = upgrade.previousEpoch;
+    candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
+    state.fingerprint = await runtimeDataSetFingerprint(candidate);
+  } else if (epoch !== RUNTIME_KERNEL_EPOCH) {
+    throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-epoch-unsupported', message: `第 ${epoch ?? '?'} 代格式的历史库不能合并。` });
+  }
+  const binding = await requireCompleteRuntimeDataSet(candidate);
+  return withRuntimeMaintenance(binding.paths, async () => {
+    await assertSourceIdle(candidate);
+    const current = await resolveVscodeRuntimeDataSet(paths, candidateId);
+    if (!sameRuntimeDataSetIdentity(current as RuntimeDataSetIdentity, candidate)) {
+      throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '来源历史库在合并前发生了变化，稍后重试。' });
+    }
+    if (previousRecord?.state === 'committing' && sameRuntimeDataSetIdentity(previousRecord.target, target.identity)
+      && sameRuntimeDataSetIdentity(previousRecord.source, candidate)) {
+      const presence = await commitPresence(paths, previousRecord.commitId, target.database);
+      if (presence === 'all') {
+        await writeRuntimeDataSetMergeLedgerRecord(paths, {
+          candidateId, state: 'merged', source: state.fingerprint!, target: target.identity,
+          mergedAt: new Date().toISOString(), insertedRows: 0, reusedRows: 0, insertedConversations: 0
+        });
+        await removeRuntimeDataSetMergeCommit(paths, previousRecord.commitId).catch(() => undefined);
+        return { kind: 'merged', result: {
+          candidateId, sourceDataSetId: candidate.dataSetId!, targetDataSetId: target.identity.dataSetId,
+          insertedRows: 0, reusedRows: 0, insertedConversations: 0,
+          linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0, recoveredCommit: true,
+          ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {})
+        } };
+      }
+      if (presence === 'partial') {
+        throw new Outcome({ kind: 'blocked', code: 'runtime-data-set-merge-conflict', message: '上次合并在提交时中断，之后当前库里这批对话已有增删，无法确认合并状态；请在历史与存储管理中手动合并。' });
+      }
+    }
+    let snapshot = await openVerifiedSnapshot(current, binding);
+    try {
+      let finalized: RuntimeDataSetMergeResult['finalized'];
+      if (!mode.finalizeWork) {
+        // Carried unfinished work must be expressible as ordinary Repository rows: a request that
+        // was receiving a reply has no such form (the source's own recovery closes it first).
+        const streaming = Number(snapshot.database.prepare(
+          "SELECT COUNT(*) FROM model_request WHERE status NOT IN ('prepared', 'terminal')"
+        ).pluck().get() as bigint);
+        if (streaming > 0) {
+          throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-streaming-model-request', message: `这个历史库里有 ${streaming} 个正在接收回复的模型请求，需要先打开它完成恢复后再迁移。` });
+        }
+      } else {
+        let work = inspectUnfinishedWork(snapshot.database);
+        if (work.refused.length > 0) throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(work.refused)));
+        if (hasFinalizableWork(work)) {
+          const sourceBackupPath = await backupSource(binding);
+          await fault(options, 'after-source-backup');
+          await finalizeUnfinishedWork(createVscodeRootAuthority(current), work);
+          await snapshot.close();
+          snapshot = await openVerifiedSnapshot(current, binding);
+          const counts = { turns: work.turns.length, intents: work.intents.length };
+          work = inspectUnfinishedWork(snapshot.database);
+          if (work.refused.length > 0 || hasFinalizableWork(work)) {
+            throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(work.refused) || '收尾后仍有未结束的任务'));
+          }
+          finalized = { ...counts, sourceBackupPath };
+          state.fingerprint = await runtimeDataSetFingerprint(current);
         }
       }
-
-      if (!options.allowUnfinishedWork) assertSourceQuiescent(source);
-      const backupDirectoryName = await ensureTargetBackup(target, backup);
-      await fault(options, 'after-target-backup');
-      const cas = await transferCas(
-        { configurationRootPath: current.configurationRootPath, binding },
-        { configurationRootPath: target.candidate.configurationRootPath, binding: target.binding },
-        source, options
-      );
-      await fault(options, 'after-cas-transfer');
-      const rows = await mergeRows(target, source, async () => {
-        await writeMergeRecord(target, current.id, { state: 'committing', source: fingerprint, backupDirectoryName });
-        await fault(options, 'before-row-commit');
-      });
-      await fault(options, 'after-row-commit');
-      await writeMergeRecord(target, current.id, {
-        state: 'merged', source: fingerprint, mergedAt: new Date().toISOString(), backupDirectoryName,
-        insertedRows: rows.insertedRows, reusedRows: rows.reusedRows, insertedConversations: rows.insertedConversations
-      });
-      return {
-        candidateId: current.id,
-        sourceDataSetId: sourceIdentity.dataSetId,
-        targetDataSetId: target.identity.dataSetId,
-        ...rows,
-        ...cas,
-        backupPath: backupRootPath(target, backupDirectoryName),
-        recoveredCommit: false,
-        ...(upgradedFromEpoch !== undefined ? { upgradedFromEpoch } : {})
-      };
+      const size = measureSource(snapshot.database);
+      const limits = options.limits ?? RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
+      const run = (): Promise<RuntimeDataSetMergeResult> => mergePreparedSource(paths, target, current, binding, snapshot.database, state.fingerprint!, options);
+      if (size.rows <= limits.maxRows && size.bytes <= limits.maxBytes) {
+        const result = await run();
+        return { kind: 'merged', result: { ...result, ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}), ...(finalized ? { finalized } : {}) } };
+      }
+      if (!options.coordinateOversized) {
+        throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-too-large', message: `这份旧聊天记录较大（约 ${size.rows} 行），需要其它窗口暂时让出后才能合并，稍后重试。` });
+      }
+      let result: RuntimeDataSetMergeResult | undefined;
+      const coordinate = options.coordinateOversized;
+      const exclusive = await withRuntimeMaintenance(target.binding.paths, () => coordinate({
+        targetPaths: target.binding.paths,
+        requesterHostBootId: target.database.hostBootId,
+        candidateId,
+        operationKey: `${candidateId}@${fingerprintDigest(state.fingerprint!)}`,
+        requested: mode.requested
+      }, async () => { result = await run(); }));
+      if (exclusive.state !== 'completed' || !result) {
+        const reason = 'reason' in exclusive && exclusive.reason ? exclusive.reason : '其它窗口暂时无法让出';
+        throw new Outcome({ kind: 'deferred', code: `runtime-data-set-merge-exclusive-${exclusive.state}`,
+          message: `这份旧聊天记录较大（约 ${size.rows} 行），需要其它窗口暂时让出才能合并：${reason}。以后会自动重试。` });
+      }
+      return { kind: 'merged', result: { ...(result as RuntimeDataSetMergeResult), exclusive: true, ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}), ...(finalized ? { finalized } : {}) } };
     } finally {
       await snapshot.close();
     }
   });
 }
 
-function assertSourceQuiescent(source: Database.Database): void {
-  const found: string[] = [];
-  for (const [label, sql] of UNFINISHED_WORK_PROBES) {
-    const count = Number(source.prepare(sql).pluck().get() as bigint | number);
-    if (count > 0) found.push(`${label}×${count}`);
+function unfinishedWorkOutcome(found: string): Exclude<SourceOutcome, { kind: 'merged' }> {
+  return {
+    kind: 'blocked',
+    code: 'runtime-data-set-merge-unfinished-work',
+    message: `这份旧聊天记录里还有无法自动收尾的工作（${found}），为避免在当前库里被自动继续执行，暂不合并；这个库的对话内容没有改动。`
+      + '可以在“历史与存储管理”里切换到这个库，等任务结束或手动停止后，再切回当前库并选择“合并到当前库”。'
+      + '切换过去时，这些任务会按那个库的正常恢复继续执行。'
+  };
+}
+
+/** Other windows (current, or v0.0.10–v0.0.20 through their scope claim) must not use the source. */
+async function assertSourceIdle(candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
+  const legacyOwner = await legacyWorkspaceRuntimeOwnerState(candidate);
+  if (legacyOwner !== 'absent') {
+    throw new Outcome({ kind: 'deferred', code: 'runtime-legacy-owner-active', message: '这个历史库正被旧版本窗口使用，关闭那个窗口后会自动合并。' });
   }
-  if (found.length > 0) {
-    throw new RuntimeDataSetMergeBlockedError(
-      'runtime-data-set-merge-unfinished-work',
-      `这份旧聊天记录里还有未结束的任务（${found.join('、')}），为避免在当前库里被自动继续执行，暂不合并；原数据保持不变。`
-    );
+  if (!candidate.dataSetId) return;
+  const binding = await requireCompleteRuntimeDataSet(candidate);
+  try {
+    await assertNoSymbolicPath(candidate.configurationRootPath, path.join(binding.paths.dataRootPath, 'host-liveness'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  await assertRuntimeHostsOffline(binding.paths);
+}
+
+async function openVerifiedSnapshot(
+  candidate: VscodeRuntimeDataSetCandidate,
+  binding: HistoricalRootBinding
+): Promise<RuntimeDataSetDatabaseSnapshot> {
+  const snapshot = await createRuntimeDataSetDatabaseSnapshot(candidate, binding);
+  try {
+    assertCurrentSchema(snapshot.database, binding as RootBinding);
+    assertRuntimePhysicalSchemaFingerprint(snapshot.database, RUNTIME_DOMAIN_SCHEMAS);
+    auditDatabaseIntegrity(snapshot.database);
+    return snapshot;
+  } catch (error) {
+    await snapshot.close();
+    throw new Outcome({ kind: 'failed', code: errorCode(error), message: `这个历史库的结构或完整性核验未通过：${errorMessage(error)}` });
   }
 }
 
+function measureSource(source: Database.Database): { rows: number; bytes: number } {
+  let rows = 0;
+  for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
+    rows += Number(source.prepare(`SELECT COUNT(*) FROM "${schema.table}"`).pluck().get() as bigint);
+  }
+  const pageSize = Number(source.pragma('page_size', { simple: true }) as bigint | number);
+  const pageCount = Number(source.pragma('page_count', { simple: true }) as bigint | number);
+  return { rows, bytes: pageSize * pageCount };
+}
+
+async function mergePreparedSource(
+  paths: { globalStoragePath: string },
+  target: TargetContext,
+  candidate: VscodeRuntimeDataSetCandidate,
+  binding: HistoricalRootBinding,
+  source: Database.Database,
+  fingerprint: RuntimeDataSetFingerprint,
+  options: RuntimeDataSetMergeOptions
+): Promise<RuntimeDataSetMergeResult> {
+  // Conflicts are found before anything touches the target (no backup, no CAS object).
+  const plan = await planRows(source, target.database);
+  if (plan.conflicts.count > 0) {
+    throw new Outcome({
+      kind: 'blocked',
+      code: 'runtime-data-set-merge-conflict',
+      message: `这份旧聊天记录与当前历史库有 ${plan.conflicts.count} 处同一条记录但内容不同（通常是合并后两边又各自改动了同一对话），整体未合并，两边内容都没有改动。`
+        + '如需保留两边的改动，可以先切换到这个库查看，再决定删除哪一份。'
+        + `\n${plan.conflicts.samples.join('\n')}`
+    });
+  }
+  const backupPath = await ensureTargetBackup(target);
+  await fault(options, 'after-target-backup');
+  const cas = await transferCas(candidate.configurationRootPath, binding, target.configurationRootPath, target.binding, source, options)
+    .catch((error: unknown) => {
+      if (error instanceof Outcome) throw error;
+      throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `复制正文文件时出错，稍后重试：${errorMessage(error)}` });
+    });
+  await fault(options, 'after-cas-transfer');
+  const commitId = await writeRuntimeDataSetMergeCommit(paths, plan.inserted);
+  await writeRuntimeDataSetMergeLedgerRecord(paths, {
+    candidateId: candidate.id, state: 'committing', source: fingerprint, target: target.identity, commitId
+  });
+  await fault(options, 'before-row-commit');
+  if (plan.steps.length > 0) {
+    try {
+      await target.database.transaction(plan.steps);
+    } catch (error) {
+      // Nothing was committed (one transaction); the committing record converges next time.
+      throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `写入当前库时出错，稍后重试：${errorMessage(error)}` });
+    }
+  }
+  await fault(options, 'after-row-commit');
+  await writeRuntimeDataSetMergeLedgerRecord(paths, {
+    candidateId: candidate.id, state: 'merged', source: fingerprint, target: target.identity,
+    mergedAt: new Date().toISOString(), insertedRows: plan.inserted.length, reusedRows: plan.reused,
+    insertedConversations: plan.insertedConversations
+  });
+  await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
+  return {
+    candidateId: candidate.id,
+    sourceDataSetId: candidate.dataSetId!,
+    targetDataSetId: target.identity.dataSetId,
+    insertedRows: plan.inserted.length,
+    reusedRows: plan.reused,
+    insertedConversations: plan.insertedConversations,
+    ...cas,
+    backupPath,
+    recoveredCommit: false
+  };
+}
+
+interface RowPlan {
+  steps: RepositoryTransactionStep[];
+  inserted: Array<[string, string]>;
+  reused: number;
+  insertedConversations: number;
+  conflicts: { count: number; samples: string[] };
+}
+
+/**
+ * Builds one transaction: every source row is decoded by its domain codec and, when new, written
+ * through the domain Repository insert step (historical copies for the terminal model-stream
+ * domains). Existing ids are compared on decoded values. The transaction ends by asserting that
+ * every source id exists in the receiving data set, so the committed row set is measured, not assumed.
+ */
+async function planRows(source: Database.Database, target: RuntimeDatabase): Promise<RowPlan> {
+  const plan: RowPlan = { steps: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
+  const presence: RepositoryTransactionStep[] = [];
+  for (const schema of MERGE_DOMAIN_ORDER) {
+    const repository = DOMAIN_REPOSITORIES.domain(schema.key);
+    const allowed = IDENTITY_MERGE_DIFFERENCES.get(schema.key);
+    const renumbered = RENUMBERED_COLUMNS.get(schema.key);
+    const offset = renumbered ? await maximumValue(target, schema.key, renumbered) : 0n;
+    const historical = HISTORICAL_COPY_DOMAINS.includes(schema.key);
+    // A request that has not started yet is inserted exactly as the Runtime itself creates it
+    // (prepared request, pending Operation and Attempt); started or finished ones are historical copies.
+    const notStarted = (row: DomainRow): boolean => schema.key === 'ModelRequest' ? row.status === 'prepared'
+      : schema.key === 'Operation' ? row.owner_kind === 'model_request' && row.status === 'pending'
+        : schema.key === 'Attempt' && row.status === 'pending';
+    const statement = source.prepare(`SELECT * FROM "${schema.table}" ORDER BY rowid`);
+    let chunk: DomainRow[] = [];
+    const flush = async (): Promise<void> => {
+      if (chunk.length === 0) return;
+      const existing = (await target.snapshot(chunk.map((row) => repository.get(String(row.id))))).snapshot as Array<DomainRow | null>;
+      for (const [index, row] of chunk.entries()) {
+        const id = String(row.id);
+        const current = existing[index];
+        presence.push(repository.assert(id, {}));
+        if (current) {
+          const differences = schema.columns.map((column) => column.name)
+            .filter((column) => column !== renumbered && !isDeepStrictEqual(row[column], current[column]));
+          if (differences.length === 0 || (allowed && differences.every((column) => allowed.has(column)))) {
+            plan.reused += 1;
+          } else {
+            plan.conflicts.count += 1;
+            if (plan.conflicts.samples.length < MAX_REPORTED_CONFLICTS) {
+              plan.conflicts.samples.push(`${schema.key}#${id} 字段不同：${differences.join(',')}`);
+            }
+          }
+          continue;
+        }
+        const inserted = renumbered ? { ...row, [renumbered]: (row[renumbered] as bigint) + offset } : row;
+        plan.steps.push(historical && !notStarted(row) ? repository.insertHistoricalCopy(inserted) : repository.insert(inserted));
+        plan.inserted.push([schema.key, id]);
+        if (schema.key === 'Conversation') plan.insertedConversations += 1;
+      }
+      chunk = [];
+      // Decoding stays on the extension thread; yield so a large source never monopolizes it.
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    for (const raw of statement.iterate() as IterableIterator<Record<string, unknown>>) {
+      chunk.push(repository.codec.decode(raw));
+      if (chunk.length >= READ_CHUNK) await flush();
+    }
+    await flush();
+  }
+  if (plan.steps.length > 0) plan.steps.push(...presence);
+  return plan;
+}
+
+async function maximumValue(database: RuntimeDatabase, domain: string, column: string): Promise<bigint> {
+  const rows = (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({
+    orderBy: { column, direction: 'desc' }, limit: 1
+  })])).snapshot[0] as DomainRow[];
+  const value = rows[0]?.[column];
+  return typeof value === 'bigint' ? value : 0n;
+}
+
+/** Exact inserted id set of an interrupted commit: all present, none present, or changed since. */
+async function commitPresence(
+  paths: { globalStoragePath: string },
+  commitId: string,
+  database: RuntimeDatabase
+): Promise<'all' | 'none' | 'partial'> {
+  const commit = await readRuntimeDataSetMergeCommit(paths, commitId);
+  if (!commit || commit.rows.length === 0) return 'none';
+  let present = 0;
+  for (let start = 0; start < commit.rows.length; start += READ_CHUNK) {
+    const rows = commit.rows.slice(start, start + READ_CHUNK);
+    const found = (await database.snapshot(rows.map(([domain, id]) => DOMAIN_REPOSITORIES.domain(domain).get(id)))).snapshot;
+    present += found.filter((row) => row !== null).length;
+  }
+  return present === 0 ? 'none' : present === commit.rows.length ? 'all' : 'partial';
+}
+
 async function transferCas(
-  sourceEndpoint: RuntimeDataSetMergeEndpoint,
-  targetEndpoint: RuntimeDataSetMergeEndpoint,
+  sourceConfigurationRootPath: string,
+  sourceBinding: HistoricalRootBinding,
+  targetConfigurationRootPath: string,
+  targetBinding: HistoricalRootBinding,
   source: Database.Database,
   options: Pick<RuntimeDataSetMergeOptions, 'linkFile'>
 ): Promise<RuntimeDataSetCasTransfer> {
   const result = { linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0 };
-  const sourceCas = path.resolve(sourceEndpoint.binding.paths.casRootPath);
-  const targetCas = path.resolve(targetEndpoint.binding.paths.casRootPath);
-  await assertNoSymbolicPath(sourceEndpoint.configurationRootPath, sourceCas);
-  await assertNoSymbolicPath(targetEndpoint.configurationRootPath, targetCas);
+  const sourceCas = path.resolve(sourceBinding.paths.casRootPath);
+  const targetCas = path.resolve(targetBinding.paths.casRootPath);
+  await assertNoSymbolicPath(sourceConfigurationRootPath, sourceCas);
+  await assertNoSymbolicPath(targetConfigurationRootPath, targetCas);
   const rows = source.prepare(`
     SELECT storage_key, sha256, MAX(byte_length) AS byte_length, MIN(byte_length) AS min_length
       FROM content_object GROUP BY storage_key, sha256
@@ -664,53 +921,42 @@ async function transferCas(
   const link = options.linkFile ?? ((from: string, to: string) => fs.link(from, to));
   for (const row of rows) {
     if (row.byte_length !== row.min_length || storageKeyForDigest(row.sha256) !== row.storage_key || seen.has(row.storage_key)) {
-      throw new RuntimeDataSetMergeBlockedError(
-        'runtime-data-set-merge-source-cas-invalid', `来源的正文登记不一致：${row.storage_key}。原数据保持不变。`
-      );
+      throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源的正文登记不一致：${row.storage_key}。原数据保持不变。` });
     }
     seen.add(row.storage_key);
-    const byteLength = row.byte_length;
     const sourceFile = casPath(sourceCas, row.storage_key);
     const targetFile = casPath(targetCas, row.storage_key);
-    if (await regularFileSize(targetFile) !== undefined) {
-      if (await regularFileSize(targetFile) !== byteLength) {
-        throw new RuntimeDataSetMergeBlockedError(
-          'runtime-data-set-merge-conflict', `当前历史库已有同名但长度不同的正文文件：${row.storage_key}。`
-        );
+    const existing = await regularFileSize(targetFile);
+    if (existing !== undefined) {
+      // CAS files are never rewritten: an existing object must already be exactly these bytes.
+      if (existing !== row.byte_length || await sha256File(targetFile) !== row.sha256) {
+        throw new Outcome({ kind: 'blocked', code: 'runtime-data-set-merge-target-cas-damaged', message: `当前历史库里的正文文件已损坏：${row.storage_key}。为免覆盖，暂不合并。` });
       }
       result.reusedCasObjects += 1;
       continue;
     }
-    const sourceSize = await regularFileSize(sourceFile);
-    if (sourceSize !== byteLength) {
-      throw new RuntimeDataSetMergeBlockedError(
-        'runtime-data-set-merge-source-cas-invalid', `来源缺少正文文件或长度不符：${row.storage_key}。原数据保持不变。`
-      );
+    if (await regularFileSize(sourceFile) !== row.byte_length || await sha256File(sourceFile) !== row.sha256) {
+      throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源缺少正文文件或内容与摘要不符：${row.storage_key}。原数据保持不变。` });
     }
     const prefix = path.dirname(targetFile);
     await ensureDirectory(targetCas, path.join(targetCas, 'sha256'), touchedDirectories);
     await ensureDirectory(path.join(targetCas, 'sha256'), prefix, touchedDirectories);
     let copied = false;
     try {
+      // The source object was verified just above; a hard link publishes those same bytes.
       await link(sourceFile, targetFile);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'EEXIST') {
-        if (await regularFileSize(targetFile) !== byteLength) throw error;
+        if (await regularFileSize(targetFile) !== row.byte_length || await sha256File(targetFile) !== row.sha256) throw error;
       } else if (code === 'EXDEV' || code === 'EPERM' || code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EMLINK') {
-        await copyIntoCas(targetCas, sourceFile, targetFile);
+        await copyIntoCas(targetCas, sourceFile, targetFile, row.sha256);
         copied = true;
       } else {
         throw error;
       }
     }
     touchedDirectories.add(prefix);
-    if (await sha256File(targetFile) !== row.sha256) {
-      await fs.rm(targetFile, { force: true });
-      throw new RuntimeDataSetMergeBlockedError(
-        'runtime-data-set-merge-source-cas-invalid', `来源正文文件摘要不符：${row.storage_key}。原数据保持不变。`
-      );
-    }
     if (copied) result.copiedCasObjects += 1;
     else result.linkedCasObjects += 1;
   }
@@ -718,7 +964,8 @@ async function transferCas(
   return result;
 }
 
-async function copyIntoCas(targetCas: string, sourceFile: string, targetFile: string): Promise<void> {
+/** Copy, fsync and verify a private temporary file; only verified bytes are linked into the CAS. */
+async function copyIntoCas(targetCas: string, sourceFile: string, targetFile: string, digest: string): Promise<void> {
   const temporaryRoot = path.join(targetCas, 'tmp');
   await fs.mkdir(temporaryRoot, { recursive: true });
   const temporary = path.join(temporaryRoot, `${process.pid}-${randomUUID()}.merge.tmp`);
@@ -727,10 +974,14 @@ async function copyIntoCas(targetCas: string, sourceFile: string, targetFile: st
     await fs.chmod(temporary, 0o600);
     const handle = await fs.open(temporary, 'r');
     try { await handle.sync(); } finally { await handle.close(); }
+    if (await sha256File(temporary) !== digest) {
+      throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `复制出的正文文件摘要不符：${path.basename(targetFile)}。` });
+    }
     try {
       await fs.link(temporary, targetFile);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (await sha256File(targetFile) !== digest) throw error;
     }
   } finally {
     await fs.rm(temporary, { force: true });
@@ -738,400 +989,108 @@ async function copyIntoCas(targetCas: string, sourceFile: string, targetFile: st
   }
 }
 
-async function mergeRows(
-  target: SelectedTarget,
-  source: Database.Database,
-  beforeCommit: () => Promise<void>
-): Promise<{ insertedRows: number; reusedRows: number; insertedConversations: number }> {
-  const database = new Database(toSqliteFilePath(target.binding.paths.databasePath), { fileMustExist: true });
-  try {
-    configureWriterConnection(database);
-    assertCurrentSchema(database, target.binding as RootBinding);
-    assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS);
-    const conflicts: string[] = [];
-    let conflictCount = 0;
-    let insertedRows = 0;
-    let reusedRows = 0;
-    let insertedConversations = 0;
-    database.pragma('foreign_keys = OFF');
-    database.exec('BEGIN IMMEDIATE');
-    try {
-      for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
-        const columns = schema.columns.map((column) => column.name);
-        const list = columns.map((column) => `"${column}"`).join(', ');
-        const select = source.prepare(`SELECT ${list} FROM "${schema.table}" ORDER BY id`);
-        const find = database.prepare(`SELECT ${list} FROM "${schema.table}" WHERE id = ?`);
-        const insert = database.prepare(
-          `INSERT INTO "${schema.table}" (${list}) VALUES (${columns.map(() => '?').join(', ')})`
-        );
-        const allowed = IDENTITY_MERGE_DIFFERENCES.get(schema.key);
-        let sourceRows = 0;
-        let domainPresent = 0;
-        for (const row of select.iterate() as IterableIterator<Record<string, unknown>>) {
-          sourceRows += 1;
-          const existing = find.get(row.id) as Record<string, unknown> | undefined;
-          if (existing) {
-            const differences = columns.filter((column) => !sameSqliteValue(row[column], existing[column]));
-            if (differences.length === 0 || (allowed && differences.every((column) => allowed.has(column)))) {
-              reusedRows += 1;
-              domainPresent += 1;
-              continue;
-            }
-            conflictCount += 1;
-            if (conflicts.length < MAX_REPORTED_CONFLICTS) {
-              conflicts.push(`${schema.key}#${String(row.id)} 字段不同：${differences.join(',')}`);
-            }
-            continue;
-          }
-          try {
-            insert.run(columns.map((column) => row[column]));
-          } catch (error) {
-            if (!String((error as { code?: unknown }).code ?? '').startsWith('SQLITE_CONSTRAINT')) throw error;
-            conflictCount += 1;
-            if (conflicts.length < MAX_REPORTED_CONFLICTS) {
-              conflicts.push(`${schema.key}#${String(row.id)} 违反唯一约束：${errorMessage(error)}`);
-            }
-            continue;
-          }
-          insertedRows += 1;
-          domainPresent += 1;
-          if (schema.key === 'Conversation') insertedConversations += 1;
-        }
-        if (conflictCount === 0 && domainPresent !== sourceRows) {
-          throw new RuntimeDataSetMergeError('runtime-data-set-merge-integrity', `${schema.key} 行数核对失败。`);
-        }
-      }
-      if (conflictCount > 0) {
-        throw new RuntimeDataSetMergeBlockedError(
-          'runtime-data-set-merge-conflict',
-          `这份旧聊天记录与当前历史库有 ${conflictCount} 处同一身份但内容不同的数据，整体未合并；原数据保持不变。`
-            + `\n${conflicts.join('\n')}`
-        );
-      }
-      const violations = database.pragma('foreign_key_check') as unknown[];
-      if (violations.length > 0) {
-        throw new RuntimeDataSetMergeError(
-          'runtime-data-set-merge-integrity', `合并结果有 ${violations.length} 处外键不完整，已回滚。`
-        );
-      }
-      const quickCheck = database.pragma('quick_check') as Array<{ quick_check: string }>;
-      if (quickCheck.length !== 1 || quickCheck[0]?.quick_check !== 'ok') {
-        throw new RuntimeDataSetMergeError('runtime-data-set-merge-integrity', '合并结果 quick_check 未通过，已回滚。');
-      }
-      await beforeCommit();
-      database.exec('COMMIT');
-    } catch (error) {
-      if (database.inTransaction) database.exec('ROLLBACK');
-      throw error;
-    } finally {
-      database.pragma('foreign_keys = ON');
-    }
-    database.pragma('wal_checkpoint(TRUNCATE)');
-    return { insertedRows, reusedRows, insertedConversations };
-  } finally {
-    database.close();
-  }
-}
-
-/**
- * Source ids are random or derived from source-only ids, so after an interrupted commit either
- * none or all of them are present. Shared content identities are excluded: they may predate it.
- */
-function sourceRowPresence(target: SelectedTarget, source: Database.Database): { present: number; total: number } {
-  const database = new Database(toSqliteFilePath(target.binding.paths.databasePath), { readonly: true, fileMustExist: true });
-  try {
-    database.defaultSafeIntegers(true);
-    let present = 0;
-    let total = 0;
-    for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
-      if (IDENTITY_MERGE_DIFFERENCES.has(schema.key)) continue;
-      const find = database.prepare(`SELECT 1 FROM "${schema.table}" WHERE id = ?`).pluck();
-      for (const id of source.prepare(`SELECT id FROM "${schema.table}"`).pluck().iterate()) {
-        total += 1;
-        if (find.get(id) !== undefined) present += 1;
-      }
-    }
-    return { present, total };
-  } finally {
-    database.close();
-  }
-}
-
-function countSourceRows(source: Database.Database): { rows: number } {
-  let rows = 0;
-  for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
-    rows += Number(source.prepare(`SELECT COUNT(*) FROM "${schema.table}"`).pluck().get() as bigint);
-  }
-  return { rows };
-}
-
-async function ensureTargetBackup(target: SelectedTarget, backup: BatchBackup): Promise<string> {
-  if (backup.directoryName) return backup.directoryName;
-  const directoryName = `${timestampSlug()}-${randomUUID().slice(0, 8)}`;
-  const root = backupRootPath(target, directoryName);
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
-  await writeDurableJson(path.join(root, 'root-binding.json'), target.binding);
+/** Online Backup API copy of the target, once per batch; failures leave no partial files behind. */
+async function ensureTargetBackup(target: TargetContext): Promise<string> {
+  if (target.backup.path) return target.backup.path;
+  const backups = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
+  const root = path.join(backups, `${timestampSlug()}-${randomUUID().slice(0, 8)}`);
   const destination = path.join(root, 'limcode.sqlite');
   const temporary = `${destination}.${process.pid}.tmp`;
-  const database = new Database(toSqliteFilePath(target.binding.paths.databasePath), { readonly: true, fileMustExist: true });
   try {
-    await database.backup(toSqliteFilePath(temporary));
-  } catch (error) {
-    throw new RuntimeDataSetMergeError('runtime-data-set-merge-backup-failed', '合并前备份当前历史库失败，本次不合并。', error);
-  } finally {
-    database.close();
-  }
-  await fs.chmod(temporary, 0o600);
-  const copy = new Database(toSqliteFilePath(temporary), { readonly: true, fileMustExist: true });
-  try {
-    copy.defaultSafeIntegers(true);
-    assertCurrentSchema(copy, target.binding as RootBinding);
-  } finally {
-    copy.close();
-    await removeSqliteSidecars(temporary);
-  }
-  await fs.rename(temporary, destination);
-  await syncDirectoryDurably(root);
-  await syncDirectoryDurably(path.dirname(root));
-  backup.directoryName = directoryName;
-  return directoryName;
-}
-
-async function requireSelectedTarget(candidate: VscodeRuntimeDataSetCandidate): Promise<SelectedTarget> {
-  const binding = await requireCompleteRuntimeDataSet(candidate);
-  if (binding.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
-    throw new RuntimeDataSetMergeError('runtime-data-set-merge-target-unsupported', '当前历史库还不是当前格式，不能接收合并。');
-  }
-  const controlRoot = path.dirname(path.resolve(binding.paths.dataRootPath));
-  if (!isPathBelow(path.resolve(candidate.configurationRootPath), controlRoot)) {
-    throw new RuntimeDataSetMergeError('runtime-data-set-merge-target-invalid', '当前历史库路径越出配置根。');
-  }
-  return {
-    candidate,
-    binding,
-    controlRoot,
-    identity: { dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId }
-  };
-}
-
-async function requireTargetEndpoint(endpoint: RuntimeDataSetMergeEndpoint): Promise<SelectedTarget> {
-  const dataRoot = path.resolve(endpoint.binding.paths.dataRootPath);
-  return requireSelectedTarget({
-    id: 'default',
-    configurationRootPath: path.resolve(endpoint.configurationRootPath),
-    runtimeScopeRootPath: path.dirname(path.dirname(dataRoot)),
-    runtimeDataRootPath: dataRoot,
-    dataSetId: endpoint.binding.dataSetId,
-    rootInstanceId: endpoint.binding.rootInstanceId,
-    runtimeKernelEpoch: endpoint.binding.runtimeKernelEpoch,
-    selected: false,
-    source: 'fixed'
-  });
-}
-
-async function sourceFingerprint(candidate: VscodeRuntimeDataSetCandidate): Promise<SourceFingerprint> {
-  const binding = await requireCompleteRuntimeDataSet(candidate);
-  const database = await fs.stat(binding.paths.databasePath);
-  let wal: { size: number; mtimeMs: number } = { size: 0, mtimeMs: 0 };
-  try { wal = await fs.stat(`${binding.paths.databasePath}-wal`); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  return {
-    dataSetId: binding.dataSetId,
-    rootInstanceId: binding.rootInstanceId,
-    rootGeneration: binding.rootGeneration,
-    pointerRevision: binding.pointerRevision,
-    databaseSize: database.size,
-    databaseMtimeMs: database.mtimeMs,
-    walSize: wal.size,
-    walMtimeMs: wal.mtimeMs
-  };
-}
-
-function sameFingerprint(left: SourceFingerprint, right: SourceFingerprint | undefined): boolean {
-  return right !== undefined && (Object.keys(left) as (keyof SourceFingerprint)[]).every((key) => left[key] === right[key]);
-}
-
-async function readMergeRecords(target: SelectedTarget): Promise<Map<string, MergeRecord>> {
-  const result = new Map<string, MergeRecord>();
-  for (const value of await readAllMergeRecords(target.controlRoot)) {
-    if (value.target.dataSetId !== target.identity.dataSetId
-      || value.target.rootInstanceId !== target.identity.rootInstanceId) continue;
-    result.set(value.candidateId, value);
-  }
-  return result;
-}
-
-interface AutomaticMergeHistory {
-  /** Sources already merged elsewhere: into a since deselected data set or before a reset. */
-  mergedElsewhere: Set<string>;
-  /** Data sets whose current incarnation received merges; never merged away automatically. */
-  targets: Set<string>;
-}
-
-/**
- * Automatic merge happens at most once per source within one configuration root. After the user
- * switches the current data set or archives and resets it, earlier merges are not repeated (and a
- * former target is not merged away); only an explicit request merges such a data set again.
- */
-async function readAutomaticMergeHistory(
-  candidates: readonly VscodeRuntimeDataSetCandidate[]
-): Promise<AutomaticMergeHistory> {
-  const history: AutomaticMergeHistory = { mergedElsewhere: new Set(), targets: new Set() };
-  for (const candidate of candidates) {
-    if (!candidate.dataSetId) continue;
-    const records = await readAllMergeRecords(path.dirname(path.resolve(candidate.runtimeDataRootPath)))
-      .catch(() => [] as MergeRecord[]);
-    for (const record of records) {
-      if (record.state === 'blocked') continue;
-      const intoCurrentIncarnation = record.target.dataSetId === candidate.dataSetId
-        && record.target.rootInstanceId === candidate.rootInstanceId;
-      if (intoCurrentIncarnation) history.targets.add(candidate.id);
-      if (candidate.selected && intoCurrentIncarnation) continue;
-      history.mergedElsewhere.add(sourceKey(record.candidateId, record.source.dataSetId, record.source.rootInstanceId));
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
+    await writeDurableJson(path.join(root, 'root-binding.json'), target.binding);
+    await target.database.backupTo(temporary);
+    await fs.chmod(temporary, 0o600);
+    const copy = new Database(toSqliteFilePath(temporary), { readonly: true, fileMustExist: true });
+    try {
+      copy.defaultSafeIntegers(true);
+      assertCurrentSchema(copy, target.binding);
+    } finally {
+      copy.close();
     }
+    await removeSqliteSidecars(temporary);
+    await fs.rename(temporary, destination);
+    await syncDirectoryDurably(root);
+    await syncDirectoryDurably(backups);
+  } catch (error) {
+    await removeSqliteFiles(temporary);
+    await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+    await fs.rmdir(backups).catch(() => undefined);
+    throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-backup-failed', message: `合并前备份当前历史库失败，稍后重试：${errorMessage(error)}` });
   }
-  return history;
+  target.backup.path = root;
+  return root;
 }
 
-function sourceKey(candidateId: string, dataSetId: string | undefined, rootInstanceId: string | undefined): string {
-  return `${candidateId}\u0000${dataSetId ?? ''}\u0000${rootInstanceId ?? ''}`;
-}
-
-async function readAllMergeRecords(controlRoot: string): Promise<MergeRecord[]> {
-  const result: MergeRecord[] = [];
-  const directory = path.join(controlRoot, RUNTIME_DATA_SET_MERGE_RECORDS_DIRECTORY);
-  for (const name of await directoryEntries(directory)) {
-    if (!name.endsWith('.json')) continue;
-    const value = await readJson(path.join(directory, name)).catch(() => undefined) as MergeRecord | undefined;
-    if (!value || value.kind !== MERGE_RECORD_KIND || typeof value.candidateId !== 'string'
-      || recordFileName(value.candidateId) !== name || !value.target || !value.source
-      || !['committing', 'merged', 'blocked'].includes(value.state)) continue;
-    result.push(value);
+/** Keeps the newest target backups; the ones removed only ever held pre-merge copies. */
+async function pruneTargetBackups(target: TargetContext): Promise<void> {
+  const backups = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
+  const names = (await fs.readdir(backups)).filter((name) => /^\d{8}T\d{6}Z-[0-9a-f]{8}$/.test(name)).sort();
+  for (const name of names.slice(0, Math.max(0, names.length - RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION))) {
+    await fs.rm(path.join(backups, name), { recursive: true, force: true });
   }
-  return result;
+  await syncDirectoryDurably(backups);
 }
 
-async function readMergeRequests(target: SelectedTarget): Promise<Map<string, MergeRequest>> {
-  const result = new Map<string, MergeRequest>();
-  const directory = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_REQUESTS_DIRECTORY);
-  for (const name of await directoryEntries(directory)) {
-    if (!name.endsWith('.json')) continue;
-    const value = await readJson(path.join(directory, name)).catch(() => undefined) as MergeRequest | undefined;
-    if (!value || value.kind !== MERGE_REQUEST_KIND || typeof value.candidateId !== 'string'
-      || recordFileName(value.candidateId) !== name
-      || value.target?.dataSetId !== target.identity.dataSetId
-      || value.target?.rootInstanceId !== target.identity.rootInstanceId) continue;
-    result.set(value.candidateId, value);
+/** Source backup before finalization, with the offline SQLite Backup API, beside the source. */
+async function backupSource(binding: HistoricalRootBinding): Promise<string> {
+  const backups = path.join(path.dirname(binding.paths.dataRootPath), RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY);
+  const root = path.join(backups, `${timestampSlug()}-${randomUUID().slice(0, 8)}`);
+  const destination = path.join(root, 'limcode.sqlite');
+  const temporary = `${destination}.${process.pid}.tmp`;
+  try {
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
+    await writeDurableJson(path.join(root, 'root-binding.json'), binding);
+    const live = new Database(toSqliteFilePath(binding.paths.databasePath), { readonly: true, fileMustExist: true });
+    try { await live.backup(toSqliteFilePath(temporary), { progress: () => 0x7fffffff }); }
+    finally { live.close(); }
+    await fs.chmod(temporary, 0o600);
+    await removeSqliteSidecars(temporary);
+    await fs.rename(temporary, destination);
+    await syncDirectoryDurably(root);
+    await syncDirectoryDurably(backups);
+  } catch (error) {
+    await removeSqliteFiles(temporary);
+    await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+    await fs.rmdir(backups).catch(() => undefined);
+    throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-backup-failed', message: `收尾前备份来源失败，稍后重试：${errorMessage(error)}` });
   }
-  return result;
+  return root;
 }
 
-type MergeRecordBody =
-  | { state: 'committing'; source: SourceFingerprint; backupDirectoryName: string }
-  | {
-    state: 'merged'; source: SourceFingerprint; mergedAt: string; backupDirectoryName: string;
-    insertedRows: number; reusedRows: number; insertedConversations: number;
-  }
-  | { state: 'blocked'; source: SourceFingerprint; code: string; message: string };
-
-async function writeMergeRecord(target: SelectedTarget, candidateId: string, body: MergeRecordBody): Promise<void> {
-  const record = {
-    kind: MERGE_RECORD_KIND,
-    candidateId,
-    target: target.identity,
-    updatedAt: new Date().toISOString(),
-    ...body
-  } as MergeRecord;
-  await writeDurableJson(
-    path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_RECORDS_DIRECTORY, recordFileName(candidateId)),
-    record
-  );
+function fingerprintDigest(fingerprint: RuntimeDataSetFingerprint): string {
+  return createHash('sha256').update(JSON.stringify(fingerprint)).digest('hex').slice(0, 16);
 }
 
-async function removeMergeRequest(target: SelectedTarget, candidateId: string): Promise<void> {
-  const directory = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_REQUESTS_DIRECTORY);
-  const file = path.join(directory, recordFileName(candidateId));
-  try { await fs.rm(file); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
-  }
-  await syncDirectoryDurably(directory);
-}
-
-function recordFileName(candidateId: string): string {
-  if (!/^(default|workspace:(workspace-file|folder|folder-set|empty)-[a-f0-9]{64})$/.test(candidateId)) {
-    throw new RuntimeDataSetMergeError('runtime-data-set-merge-candidate-invalid', `历史库标识无效：${candidateId}`);
-  }
-  return `${candidateId.replace(':', '-')}.json`;
-}
-
-function backupRootPath(target: SelectedTarget, directoryName: string): string {
-  return path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY, directoryName);
+async function fault(options: RuntimeDataSetMergeOptions, point: RuntimeDataSetMergeFaultPoint): Promise<void> {
+  await options.onFaultPoint?.(point);
 }
 
 function casPath(casRoot: string, storageKey: string): string {
-  const candidate = path.resolve(casRoot, ...storageKey.split('/'));
-  if (!isPathBelow(casRoot, candidate)) throw new Error('CAS storage key escapes its root.');
-  return candidate;
-}
-
-async function ensureDirectory(parent: string, child: string, touched: Set<string>): Promise<void> {
-  try {
-    await fs.mkdir(child);
-    touched.add(parent);
-    touched.add(child);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    const stat = await fs.lstat(child);
-    if (!stat.isDirectory()) throw new Error(`CAS path is not a directory: ${child}`);
-  }
+  const file = path.resolve(casRoot, ...storageKey.split('/'));
+  if (!isPathBelow(casRoot, file)) throw new Error(`CAS path escapes its root: ${storageKey}`);
+  return file;
 }
 
 async function regularFileSize(file: string): Promise<bigint | undefined> {
-  let stat;
-  try { stat = await fs.lstat(file, { bigint: true }); }
-  catch (error) {
+  try {
+    const info = await fs.lstat(file, { bigint: true });
+    if (!info.isFile()) throw new Error(`CAS entry is not a regular file: ${file}`);
+    return info.size;
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
-  if (!stat.isFile()) throw new RuntimeDataSetMergeBlockedError('runtime-data-set-merge-source-cas-invalid', `正文路径不是普通文件：${file}`);
-  return stat.size;
 }
 
-function sameSqliteValue(left: unknown, right: unknown): boolean {
-  if (left === right) return true;
-  if (Buffer.isBuffer(left) && Buffer.isBuffer(right)) return left.equals(right);
-  return false;
-}
-
-async function writeDurableJson(file: string, value: unknown): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await fs.open(temporary, 'wx', 0o600);
+async function ensureDirectory(parent: string, directory: string, touched: Set<string>): Promise<void> {
   try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    await fs.rename(temporary, file);
-  } finally {
-    await fs.rm(temporary, { force: true });
-  }
-  await syncDirectoryDurably(path.dirname(file));
-}
-
-async function readJson(file: string): Promise<unknown> {
-  return JSON.parse(await fs.readFile(file, 'utf8')) as unknown;
-}
-
-async function directoryEntries(directory: string): Promise<string[]> {
-  try { return (await fs.readdir(directory)).sort(); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw error;
+    await fs.mkdir(directory, { mode: 0o700 });
+    touched.add(parent);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const info = await fs.lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`CAS path is not a directory: ${directory}`);
   }
 }
 
@@ -1142,37 +1101,37 @@ async function sha256File(file: string): Promise<string> {
 }
 
 async function removeSqliteSidecars(file: string): Promise<void> {
-  await Promise.all([fs.rm(`${file}-wal`, { force: true }), fs.rm(`${file}-shm`, { force: true })]);
+  await Promise.all(['-wal', '-shm', '-journal'].map((suffix) => fs.rm(`${file}${suffix}`, { force: true })));
 }
 
-async function fault(options: RuntimeDataSetMergeOptions, point: RuntimeDataSetMergeFaultPoint): Promise<void> {
-  await options.onFaultPoint?.(point);
+async function removeSqliteFiles(file: string): Promise<void> {
+  await Promise.all(['', '-wal', '-shm', '-journal'].map((suffix) => fs.rm(`${file}${suffix}`, { force: true }).catch(() => undefined)));
+}
+
+async function writeDurableJson(file: string, value: unknown): Promise<void> {
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  const handle = await fs.open(temporary, 'wx', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try { await fs.rename(temporary, file); }
+  finally { await fs.rm(temporary, { force: true }); }
 }
 
 function timestampSlug(): string {
   return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 }
 
+function errorCode(error: unknown): string {
+  const code = (error as { code?: unknown })?.code;
+  return typeof code === 'string' && code.length > 0 ? code : 'runtime-data-set-merge-failed';
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function mergeIssue(error: unknown, candidateId?: string): RuntimeDataSetMergeIssue {
-  const messages: string[] = [];
-  const seen = new Set<unknown>();
-  let current: unknown = error;
-  let code: string | undefined;
-  for (let depth = 0; current !== undefined && !seen.has(current) && depth < 8; depth += 1) {
-    seen.add(current);
-    const record = current && typeof current === 'object' ? current as Record<string, unknown> : undefined;
-    if (!code && typeof record?.code === 'string') code = record.code;
-    const message = typeof record?.message === 'string' ? record.message : String(current);
-    if (messages[messages.length - 1] !== message) messages.push(message);
-    current = record?.cause;
-  }
-  return {
-    ...(candidateId !== undefined ? { candidateId } : {}),
-    code: code ?? 'runtime-data-set-merge-failed',
-    message: messages.join(' → ') || '旧聊天记录合并失败，未获得具体错误信息。'
-  };
-}
+export { MERGE_FINALIZATION_REASON };

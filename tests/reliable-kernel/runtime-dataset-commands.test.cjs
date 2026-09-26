@@ -6,6 +6,8 @@ const test = require('node:test');
 const ts = require('typescript');
 
 const action = name => items => items.find(item => item.action === name);
+/** Values created inside the loaded module's context compare structurally only after a copy. */
+const plain = value => JSON.parse(JSON.stringify(value));
 
 function loadSource(relative, dependencies, globals = {}) {
   const filename = path.resolve(__dirname, '../..', relative);
@@ -24,18 +26,21 @@ function loadSource(relative, dependencies, globals = {}) {
 }
 
 function emptyMergeReport(overrides = {}) {
-  return { merged: [], deferred: [], blocked: [], failures: [], targetHostsActive: [], pendingSources: 0, stopped: false, ...overrides };
+  return { merged: [], deferred: [], blocked: [], failures: [], pendingSources: 0, stopped: false, ...overrides };
 }
+
+/** The window's open Runtime that receives online merges. */
+const mergeHost = () => ({ product: { application: { database: { hostBootId: 'this-window' } } } });
 
 function fixture({
   picks = [], confirmation, application, currentEpoch = 5, oldEpoch = 5,
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
-  mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, coordinatedReport, globalState,
+  mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, exclusiveOutcome = 'completed', summaries = {}, globalState,
   lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {})
 } = {}) {
-  const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current' };
-  const old = { id: 'workspace:old', dataSetId: 'old', rootInstanceId: 'old-instance', runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old' };
+  const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current', source: 'legacy' };
+  const old = { id: 'workspace:old', dataSetId: 'old', rootInstanceId: 'old-instance', runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old', source: 'workspace' };
   const calls = [];
   class SelectionRequired extends Error { constructor() { super('select'); this.candidates = [current, old]; this.problems = problems; } }
   const vscode = {
@@ -90,16 +95,13 @@ function fixture({
       }
     },
     '../../backend/reliableKernel/runtimeDataSetMerge': {
-      mergeRuntimeDataSetsIntoSelected: async (_paths, options) => {
-        calls.push(['merge-batch', options.shouldContinue()]);
-        if (mergeHook) await mergeHook(options);
-        if (mergeError) throw mergeError;
-        if (mergeReport.targetHostsActive.length && options.coordinateTargetHosts) {
-          let merged = false;
-          const outcome = await options.coordinateTargetHosts({ dataRootPath: '/fixture/current' }, async () => { merged = true; }, 'workspace:old@old-set/old-root');
-          calls.push(['coordinated', outcome.state, merged]);
-          return outcome.state === 'completed' ? coordinatedReport : mergeReport;
+      mergeHistoricalDataSetsOnline: async (_paths, target, options) => {
+        calls.push(['merge-online', target.database.hostBootId, options.shouldContinue(), options.candidateIds ?? null]);
+        if (mergeHook) {
+          const hooked = await mergeHook(options);
+          if (hooked) return hooked;
         }
+        if (mergeError) throw mergeError;
         return mergeReport;
       },
       readRuntimeDataSetMergeStates: async () => new Map(Object.entries(mergeStates)),
@@ -117,6 +119,9 @@ function fixture({
         };
       }
     },
+    '../../backend/reliableKernel/runtimeDataSetPreflight': {
+      summarizeRuntimeDataSet: async candidate => { calls.push(['summarize', candidate.id]); return summaries[candidate.id]; }
+    },
     '../../backend/reliableKernel/runtimeStorageInspection': {
       deleteUnselectedRuntimeDataSet: async (_paths, id, expected) => calls.push(['delete', id, expected])
     },
@@ -124,9 +129,9 @@ function fixture({
     '../runtimeDataSetUpgradeLifetime': lifetime,
     '../runtimeExclusiveMaintenance': {
       async runWithExclusiveMaintenance(paths, input, operation) {
-        calls.push(['exclusive', paths.dataRootPath, input.operation, input.operationKey, input.message,
-          input.configurationRootPath, input.isCurrent()]);
-        if (coordinatedReport === undefined) return { state: 'busy', hosts: [], reason: '其它窗口正在忙' };
+        const { isCurrent, ...rest } = input;
+        calls.push(['exclusive', paths.dataRootPath, rest, isCurrent()]);
+        if (exclusiveOutcome !== 'completed') return { state: exclusiveOutcome, hosts: [], reason: '有 1 个窗口正在忙（有任务正在进行）' };
         return { state: 'completed', result: await operation(), coordinated: true };
       }
     }
@@ -302,6 +307,7 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
   const finishUpgrade = deferred();
   let startup;
   const application = {
+    ...mergeHost(),
     async dispose() { events.push('dispose'); },
     async startRuntimeRecovery() { events.push('recover'); }
   };
@@ -465,75 +471,88 @@ test('upgrade lifetime closes admission before a registered operation starts and
 });
 
 
-test('startup merges historical workspace libraries before Runtime open without any question or selection change', async () => {
+test('after Runtime ready old libraries merge online in the background without any question or reload', async () => {
   const f = fixture({ mergeReport: emptyMergeReport({
-    merged: [{ candidateId: 'workspace:old', insertedRows: 12, insertedConversations: 3, backupPath: '/fixture/merge-backup' }]
+    merged: [{ candidateId: 'workspace:old', insertedRows: 12, insertedConversations: 3, backupPath: '/fixture/merge-backup',
+      finalized: { turns: 2, intents: 1, sourceBackupPath: '/fixture/old-backup' } }]
   }) });
-  await f.mergeHistoricalDataSetsBeforeOpen(f.context);
-  assert.deepEqual(f.calls.filter(call => call[0] === 'merge-batch'), [['merge-batch', true]]);
-  assert.match(f.calls.find(call => call[0] === 'info')[1], /已把 1 份旧聊天记录合并到当前历史库（新增 3 个对话）/);
-  assert.equal(f.calls.some(call => ['pick', 'warning', 'select', 'command', 'history', 'upgrade'].includes(call[0])), false);
+  await f.mergeHistoricalDataSetsInBackground(f.context, mergeHost());
+  assert.deepEqual(f.calls.filter(call => call[0] === 'merge-online'), [['merge-online', 'this-window', true, null]]);
+  const info = f.calls.find(call => call[0] === 'info')[1];
+  assert.match(info, /已把 1 份旧聊天记录合并到当前历史库（新增 3 个对话）/);
+  assert.match(info, /2 个旧版本中断的任务已按“中止”收尾，不会被继续执行/);
+  assert.equal(f.calls.some(call => ['pick', 'warning', 'select', 'command', 'history', 'upgrade', 'exclusive'].includes(call[0])), false);
 });
 
-test('startup merge reports new blocks once, stays silent for known blocks and never throws', async () => {
-  const blocked = { candidateId: 'workspace:old', code: 'runtime-data-set-merge-unfinished-work', message: '还有未结束的任务' };
-  const known = fixture({ mergeReport: emptyMergeReport({ blocked: [{ ...blocked, newlyBlocked: false }] }) });
-  await known.mergeHistoricalDataSetsBeforeOpen(known.context);
+test('background merge reports new outcomes once, stays silent for known ones and never throws', async () => {
+  const blocked = { candidateId: 'workspace:old', code: 'runtime-data-set-merge-unfinished-work', message: '还有等待你回答的请求' };
+  const known = fixture({ mergeReport: emptyMergeReport({ blocked: [{ ...blocked, newly: false }] }) });
+  await known.mergeHistoricalDataSetsInBackground(known.context, mergeHost());
   assert.equal(known.calls.some(call => ['warning', 'info'].includes(call[0])), false);
-  const fresh = fixture({ mergeReport: emptyMergeReport({ blocked: [{ ...blocked, newlyBlocked: true }] }) });
-  await fresh.mergeHistoricalDataSetsBeforeOpen(fresh.context);
-  assert.match(fresh.calls.find(call => call[0] === 'warning')[1], /未能合并到当前库，原数据未被修改/);
+  const fresh = fixture({ mergeReport: emptyMergeReport({ blocked: [{ ...blocked, newly: true }] }) });
+  await fresh.mergeHistoricalDataSetsInBackground(fresh.context, mergeHost());
+  assert.match(fresh.calls.find(call => call[0] === 'warning')[1],
+    /未能合并到当前库，这些库里的内容没有被改动（已发布的旧格式会先备份并就地升级）/);
+  const deferredIssue = { candidateId: 'workspace:old', code: 'runtime-hosts-active', message: '这个历史库正被其它窗口使用', newly: true };
+  const deferred = fixture({ mergeReport: emptyMergeReport({ deferred: [deferredIssue] }) });
+  await deferred.mergeHistoricalDataSetsInBackground(deferred.context, mergeHost());
+  assert.match(deferred.calls.find(call => call[0] === 'info')[1], /1 份旧聊天记录暂时无法合并（这个历史库正被其它窗口使用），以后启动时会自动重试/);
   const failing = fixture({ mergeError: Object.assign(new Error('磁盘已满'), { code: 'ENOSPC' }) });
-  await failing.mergeHistoricalDataSetsBeforeOpen(failing.context);
+  await failing.mergeHistoricalDataSetsInBackground(failing.context, mergeHost());
   assert.match(failing.calls.find(call => call[0] === 'warning')[1], /暂时无法合并.*磁盘已满/);
-  const busy = fixture({ mergeReport: emptyMergeReport({ targetHostsActive: [{ hostBootId: 'peer', state: 'live' }], pendingSources: 2 }) });
-  await busy.mergeHistoricalDataSetsBeforeOpen(busy.context);
-  assert.deepEqual(busy.calls.filter(call => ['exclusive', 'coordinated'].includes(call[0])), [
-    ['exclusive', '/fixture/current', 'historical-merge', 'workspace:old@old-set/old-root', '为合并旧聊天记录', '/fixture', true],
-    ['coordinated', 'busy', false]
-  ]);
-  assert.match(busy.calls.find(call => call[0] === 'info')[1], /有 2 份旧聊天记录等待合并.*关闭其它窗口后重载本窗口/);
   const obsolete = fixture();
-  await obsolete.mergeHistoricalDataSetsBeforeOpen(obsolete.context, () => false);
-  assert.equal(obsolete.calls.some(call => call[0] === 'merge-batch'), false);
+  await obsolete.mergeHistoricalDataSetsInBackground(obsolete.context, mergeHost(), () => false);
+  assert.equal(obsolete.calls.some(call => call[0] === 'merge-online'), false);
 });
 
-test('startup merge asks other windows for exclusivity and reports the merge done after they reloaded', async () => {
-  const f = fixture({
-    mergeReport: emptyMergeReport({ targetHostsActive: [{ hostBootId: 'peer', state: 'live' }], pendingSources: 1 }),
-    coordinatedReport: emptyMergeReport({
-      merged: [{ candidateId: 'workspace:old', insertedRows: 4, insertedConversations: 1, backupPath: '/fixture/merge-backup' }]
-    })
+test('only an oversized source the engine prepared asks other windows to yield, keyed by that source state', async () => {
+  const oversized = requested => ({
+    targetPaths: { dataRootPath: '/fixture/current' }, requesterHostBootId: 'this-window',
+    candidateId: 'workspace:old', operationKey: 'workspace:old@0123456789abcdef', requested
   });
-  await f.mergeHistoricalDataSetsBeforeOpen(f.context);
-  assert.deepEqual(f.calls.filter(call => call[0] === 'coordinated'), [['coordinated', 'completed', true]]);
-  assert.match(f.calls.find(call => call[0] === 'info')[1], /已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话）/);
-  assert.equal(f.calls.some(call => ['warning', 'pick', 'select', 'command'].includes(call[0])), false);
+  for (const [requested, outcome] of [[false, 'completed'], [false, 'busy'], [true, 'completed']]) {
+    let merged = false;
+    let result;
+    const f = fixture({ exclusiveOutcome: outcome, mergeHook: async options => {
+      result = await options.coordinateOversized(oversized(requested), async () => { merged = true; });
+    } });
+    await f.mergeHistoricalDataSetsInBackground(f.context, mergeHost());
+    const [call] = f.calls.filter(item => item[0] === 'exclusive');
+    assert.equal(call[1], '/fixture/current');
+    assert.deepEqual(call[2], {
+      operation: 'historical-merge', operationKey: 'workspace:old@0123456789abcdef', message: '为合并较大的旧聊天记录',
+      waitingTitle: '正在等待其它窗口空闲后合并较大的旧聊天记录', configurationRootPath: '/fixture',
+      requesterHostBootId: 'this-window',
+      ...(requested ? { whenBusy: 'wait', ignoreBackoff: true, participantConfirmation: 'notice' } : {})
+    });
+    assert.equal(call[3], true);
+    assert.equal(merged, outcome === 'completed');
+    assert.deepEqual(plain(result), outcome === 'completed' ? { state: 'completed' } : { state: 'busy', reason: '有 1 个窗口正在忙（有任务正在进行）' });
+  }
 });
 
-test('startup notices about old libraries appear once per cause and again when the cause changes', async () => {
+test('startup notices accumulate by cause: an unevaluated cause is kept, a user-requested outcome is always shown', async () => {
   const values = new Map();
   const globalState = { get: key => values.get(key), update: async (key, value) => { values.set(key, value); } };
-  const failure = { candidateId: 'workspace:old', code: 'EACCES', message: '没有权限' };
-  const busy = emptyMergeReport({ targetHostsActive: [{ hostBootId: 'old-window', state: 'live' }], pendingSources: 1, failures: [failure] });
-  const notices = async overrides => {
-    const f = fixture({ globalState, ...overrides });
-    await f.mergeHistoricalDataSetsBeforeOpen(f.context);
+  const busy = { candidateId: 'workspace:old', code: 'runtime-hosts-active', message: '正被旧窗口使用', newly: true };
+  const denied = { candidateId: 'workspace:other', code: 'EACCES', message: '没有权限', newly: true };
+  const merged = candidateId => ({ candidateId, insertedRows: 1, insertedConversations: 1, backupPath: '/fixture/backup' });
+  const notices = async (mergeReport, candidateIds) => {
+    const f = fixture({ globalState, mergeReport });
+    await f.mergeHistoricalDataSetsInBackground(f.context, mergeHost(), () => true, candidateIds);
     return f.calls.filter(call => ['warning', 'info'].includes(call[0])).map(call => call[1]);
   };
-  const first = await notices({ mergeReport: busy });
-  assert.equal(first.length, 2);
-  assert.match(first[0], /等待合并/);
-  assert.match(first[1], /未能合并/);
-  assert.deepEqual(await notices({ mergeReport: busy }), []);
-  assert.equal((await notices({ mergeReport: emptyMergeReport({ failures: [{ ...failure, code: 'ENOSPC' }] }) })).length, 1);
-  assert.deepEqual(await notices({}), []);
-  assert.equal((await notices({ mergeReport: busy })).length, 2, '原因消失后再次出现会重新提示');
-  assert.equal((await notices({ mergeError: new Error('目录不可读') })).length, 1);
-  assert.deepEqual(await notices({ mergeError: new Error('目录不可读') }), []);
+  assert.equal((await notices(emptyMergeReport({ deferred: [busy], failures: [denied] }))).length, 2);
+  assert.deepEqual(await notices(emptyMergeReport({ deferred: [busy], failures: [denied] })), []);
+  // Only the other library was evaluated this time: its cause clears, the old library's stays.
+  assert.equal((await notices(emptyMergeReport({ merged: [merged('workspace:other')] }))).length, 1);
+  assert.deepEqual(await notices(emptyMergeReport({ deferred: [busy] })), [], '未评估的原因不会被清掉后重复提示');
+  assert.equal((await notices(emptyMergeReport({ failures: [denied] }))).length, 1, '清掉后再出现会重新提示');
+  assert.equal((await notices(emptyMergeReport({ deferred: [{ ...busy, requested: true }] }))).length, 1, '用户明确请求的结果总是提示');
+  assert.equal((await notices(emptyMergeReport({ blocked: [{ ...busy, code: 'runtime-data-set-merge-conflict', newly: false, requested: true }] }))).length, 1);
 
   const upgrades = async () => {
-    const f = fixture({ globalState, batchReport: { results: [], failures: [failure] } });
+    const f = fixture({ globalState, batchReport: { results: [], failures: [denied] } });
     await f.upgradeHistoricalDataSetsOnStartup(f.context);
     return f.calls.filter(call => call[0] === 'warning').length;
   };
@@ -541,49 +560,96 @@ test('startup notices about old libraries appear once per cause and again when t
   assert.equal(await upgrades(), 0);
 });
 
-test('merge action lists only unmerged libraries, confirms once, records the request and reloads', async () => {
-  const cancelled = fixture({ picks: [action('merge'), 0] });
+test('explicit merge runs online in this window without a reload; without a Runtime it is recorded for the next start', async () => {
+  const cancelled = fixture({ picks: [action('merge'), 0], application: mergeHost() });
   await cancelled.manageRuntimeDataSets(cancelled.context, cancelled.startup);
-  assert.equal(cancelled.calls.some(call => ['merge-request', 'command'].includes(call[0])), false);
-  const f = fixture({ picks: [action('merge'), items => {
+  assert.equal(cancelled.calls.some(call => ['merge-request', 'merge-online', 'command'].includes(call[0])), false);
+
+  const f = fixture({ application: mergeHost(), confirmation: '合并', picks: [action('merge'), items => {
     assert.deepEqual(Array.from(items, item => item.candidate?.id), ['workspace:old']);
     return items[0];
-  }], confirmation: '合并并重载' });
+  }], mergeReport: emptyMergeReport({ blocked: [{
+    candidateId: 'workspace:old', code: 'runtime-data-set-merge-unfinished-work', message: '还有等待你回答的请求', newly: false, requested: true
+  }] }) });
   await f.manageRuntimeDataSets(f.context, f.startup);
-  assert.deepEqual(f.calls.filter(call => ['merge-request', 'command'].includes(call[0])), [
+  const confirm = f.calls.find(call => call[0] === 'warning' && call[1] === '把这个历史库合并到当前库？');
+  assert.match(confirm[2].detail, /不需要重载窗口/);
+  assert.match(confirm[2].detail, /已发布的旧格式会先备份并就地升级/);
+  assert.match(confirm[2].detail, /按“中止”收尾，不会在当前库被继续执行/);
+  assert.deepEqual(plain(f.calls.filter(call => ['merge-request', 'merge-online', 'command'].includes(call[0]))), [
     ['merge-request', 'workspace:old', 'old', 'old-instance'],
-    ['command', 'workbench.action.reloadWindow']
-  ]);
-  const merged = fixture({ picks: [action('merge')], mergeStates: { 'workspace:old': { state: 'merged', mergedAt: '2026-09-26' } } });
-  await merged.manageRuntimeDataSets(merged.context, merged.startup);
-  assert.match(merged.calls.find(call => call[0] === 'info')[1], /都已合并到当前库/);
-  const history = fixture({ picks: [action('history'), items => {
-    assert.match(items[0].label, /已合并到当前库/);
-    return undefined;
-  }], mergeStates: { 'workspace:old': { state: 'merged', mergedAt: '2026-09-26' } } });
-  await history.manageRuntimeDataSets(history.context, history.startup);
+    ['merge-online', 'this-window', true, ['workspace:old']]
+  ], '在线合并，不重载窗口');
+  assert.ok(f.calls.some(call => call[0] === 'warning' && /未能合并到当前库/.test(call[1])), '用户请求的结果即使不是新原因也提示');
+
+  const offline = fixture({ confirmation: '合并', picks: [action('merge'), 0] });
+  await offline.manageRuntimeDataSets(offline.context, offline.startup);
+  assert.deepEqual(offline.calls.filter(call => ['merge-request', 'merge-online', 'command'].includes(call[0])),
+    [['merge-request', 'workspace:old', 'old', 'old-instance']]);
+  assert.match(offline.calls.find(call => call[0] === 'info')[1], /已记录合并请求/);
+
+  const done = fixture({ picks: [action('merge')], mergeStates: { 'workspace:old': { state: 'merged', mergedAt: '2026-09-26', intoCurrent: true, changedSinceMerge: false } } });
+  await done.manageRuntimeDataSets(done.context, done.startup);
+  assert.match(done.calls.find(call => call[0] === 'info')[1], /都已合并到当前库/);
 });
 
-test('extension runs the historical merge inside Runtime open, before the Host is ready', async t => {
-  let release;
-  const f = extensionEntryFixture({ mergeHook: () => new Promise(resolve => { release = resolve; }) });
+test('library pickers show folder names, conversation counts, last activity and merge state instead of ids', async () => {
+  const summaries = { 'workspace:old': { projectNames: ['limcode', 'notes'], conversationCount: 12, lastActivityAt: '2026-09-24T08:00:00.000Z' } };
+  const changed = { 'workspace:old': { state: 'merged', mergedAt: '2026-09-20', intoCurrent: true, changedSinceMerge: true } };
+  let shown;
+  const f = fixture({ summaries, mergeStates: changed, picks: [action('merge'), items => { shown = items; return undefined; }] });
+  await f.manageRuntimeDataSets(f.context, f.startup);
+  assert.equal(shown.length, 1, '合并后有新变化的库仍可再次合并');
+  assert.equal(shown[0].label, '其他历史库 · limcode、notes · 已合并，但合并后有新变化');
+  assert.match(shown[0].description, /^12 个对话 · 最后活动 2026-09-2\d \d\d:\d\d$/);
+  assert.equal(/old-instance|\bold\b/.test(shown[0].label), false);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'summarize'), [['summarize', 'workspace:old']], '本窗口打开着的当前库不做快照');
+
+  const kept = fixture({ mergeStates: { 'workspace:old': { state: 'kept' } }, picks: [action('history'), items => { shown = items; return undefined; }] });
+  await kept.manageRuntimeDataSets(kept.context, kept.startup);
+  assert.equal(shown[0].label, '其他历史库 · 旧工作区历史 · 你保留的库（不自动合并）');
+
+  const warned = fixture({ mergeStates: changed, picks: [action('delete'), 0], confirmation: '永久删除' });
+  await warned.manageRuntimeDataSets(warned.context, warned.startup);
+  assert.match(warned.calls.find(call => call[0] === 'warning')[2].detail, /合并之后又有新的变化.*删除会永久丢失它们/);
+});
+
+test('startup picker names every library and shows a preflight rejection on the library itself', async () => {
+  const summaries = {
+    default: { projectNames: ['limcode'], conversationCount: 5, lastActivityAt: '2026-09-25T10:00:00.000Z' },
+    'workspace:old': { projectNames: ['notes'], conversationCount: 2, lastActivityAt: '2026-09-01T10:00:00.000Z' }
+  };
+  const problems = [{ id: 'workspace:old', runtimeScopeRootPath: '/fixture/old', message: '这个历史库的结构或完整性核验未通过：missing index' }];
+  let shown;
+  const f = fixture({ summaries, problems, picks: [items => { shown = items; return items[0]; }] });
+  let opens = 0;
+  await f.openWithRuntimeDataSetSelection(f.context, async () => { if (++opens === 1) throw new f.SelectionRequired(); return 'ready'; });
+  assert.equal(shown.length, 2, '被预检拒绝的库不再重复列成单独的问题项');
+  assert.deepEqual(plain(shown.map(item => item.label)), ['当前历史库 · limcode', '其他历史库 · notes']);
+  assert.match(shown[1].description, /^暂时无法自动打开 · 2 个对话/);
+  assert.match(shown[1].detail, /打开前检查未通过：这个历史库的结构或完整性核验未通过/);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'select'), [['select', 'default']]);
+});
+
+test('extension merges old libraries online only after Runtime ready and after the background upgrades', async t => {
+  const f = extensionEntryFixture();
   t.after(async () => {
-    release?.();
     f.opened.resolve(f.application);
     f.finishUpgrade.resolve();
     await f.deactivate();
   });
   f.activate(f.context);
-  f.startup.wait();
+  const ready = f.startup.wait();
   await f.opening.promise;
-  assert.equal(typeof f.openOptions[0]?.beforeRuntimeOpen, 'function');
-  const merging = f.openOptions[0].beforeRuntimeOpen();
+  assert.equal(f.openOptions[0], undefined, 'Runtime open 不再带启动前合并钩子');
+  f.opened.resolve(f.application);
+  await ready;
+  await f.upgradeStarted.promise;
   await new Promise(setImmediate);
-  assert.deepEqual(f.calls.filter(call => call[0] === 'merge-batch'), [['merge-batch', true]]);
-  assert.equal(f.startup.current(), undefined);
-  assert.equal(f.calls.some(call => call[0] === 'auto-upgrade'), false);
-  release();
-  await merging;
+  assert.equal(f.calls.some(call => call[0] === 'merge-online'), false, '升级完成之前不合并');
+  f.finishUpgrade.resolve();
+  for (let i = 0; i < 10 && !f.calls.some(call => call[0] === 'merge-online'); i += 1) await new Promise(setImmediate);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'merge-online'), [['merge-online', 'this-window', true, null]]);
   assert.equal(f.calls.some(call => ['pick', 'warning', 'select', 'command'].includes(call[0])), false);
 });
 

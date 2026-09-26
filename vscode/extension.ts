@@ -45,13 +45,9 @@ async function startApplication(
     );
     const moduleLoadedAt = Date.now();
     const {
-      mergeHistoricalDataSetsBeforeOpen, openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup
+      mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup
     } = await import('./commands/runtimeDataSetManagement');
-    // Historical workspace scopes merge offline into the selected data set before this Host
-    // registers on it; later windows wait on the same admission until the merge finishes.
-    const application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context, {
-      beforeRuntimeOpen: () => mergeHistoricalDataSetsBeforeOpen(context, () => activeStartup === startup)
-    }));
+    const application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context));
     const applicationOpenedAt = Date.now();
 
     // Deactivation may race a slow filesystem/SQLite open. Publish the result so deactivate() can
@@ -104,9 +100,12 @@ async function startApplication(
     // reads ahead of background scans on the single SQLite worker.
     setImmediate(() => {
       if (activeStartup !== startup || backendApp !== application) return;
-      void upgradeHistoricalDataSetsOnStartup(context,
-        () => activeStartup === startup && backendApp === application)
-        .catch(error => console.error(`${EXTENSION_BRAND} historical data upgrade failed.`, error));
+      const isCurrent = () => activeStartup === startup && backendApp === application;
+      // Old data sets are upgraded, then merged online into this Runtime, both in the background.
+      void upgradeHistoricalDataSetsOnStartup(context, isCurrent)
+        .catch(error => console.error(`${EXTENSION_BRAND} historical data upgrade failed.`, error))
+        .then(() => mergeHistoricalDataSetsInBackground(context, application, isCurrent))
+        .catch(error => console.error(`${EXTENSION_BRAND} historical data merge failed.`, error));
       const recoveryStartedAt = Date.now();
       void application.startRuntimeRecovery().then(
         () => console.log(`${EXTENSION_BRAND} reliable Runtime recovery converged in ${Date.now() - recoveryStartedAt}ms.`),

@@ -250,7 +250,7 @@ function classifyStoragePath(candidate: VscodeRuntimeDataSetCandidate, filePath:
   const control = path.join(candidate.runtimeScopeRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY);
   const controlRelative = path.relative(control, filePath).split(path.sep);
   if (controlRelative[0] === 'backups' || controlRelative[0] === 'epoch-migration-backups'
-    || controlRelative[0] === 'merge-backups') return 'historicalBackups';
+    || controlRelative[0] === 'merge-backups' || controlRelative[0] === 'merge-source-backups') return 'historicalBackups';
   const relative = path.relative(candidate.runtimeDataRootPath, filePath).split(path.sep);
   if (relative.length === 1 && ['limcode.sqlite', 'limcode.sqlite-wal', 'limcode.sqlite-shm', 'limcode.sqlite-journal'].includes(relative[0])) return 'sqlite';
   if (relative[0] === 'cas') return relative[1] === 'tmp' ? 'casTemporary' : 'cas';
