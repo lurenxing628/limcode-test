@@ -28,6 +28,7 @@ import {
   type ExecutionLeaseFence
 } from '../../reliableKernel/executionLeaseFence';
 import {
+  ConversationHostIneligibleError,
   isConversationRuntimeOwnerBusyError,
   type ConversationRuntimeEligibleClaimResult,
   type ConversationRuntimeOwnerManager
@@ -46,6 +47,10 @@ const DEFAULT_LEASE_DURATION_MS = 30_000;
 const EXTERNAL_WAKE_POLL_MS = 500;
 const TERMINATION_RECOVERY_BASE_DELAY_MS = 250;
 const TERMINATION_RECOVERY_MAX_DELAY_MS = 10_000;
+/** A Host that does not serve a Conversation re-checks it rarely; folder changes trigger a rescan. */
+const INELIGIBLE_RECHECK_MS = 30_000;
+const UNKNOWN_ELIGIBILITY_BASE_DELAY_MS = 1_000;
+const UNKNOWN_ELIGIBILITY_MAX_DELAY_MS = 30_000;
 const LOCAL_TURN_WAKE_DOMAINS = new Set([
   'EffectIntent',
   'EffectReceipt',
@@ -115,6 +120,7 @@ interface DeferredRecoveryTurn {
   turnId: string;
   nextAttemptAt?: number;
   failureCount?: number;
+  unknownEligibilityCount?: number;
 }
 
 export interface ReliableConversationRunnerRecoveryReport {
@@ -125,6 +131,10 @@ export interface ReliableConversationRunnerRecoveryReport {
   liveOwnedTurnIds: string[];
   /** Active Turns left untouched for a Host that serves their project/frozen work environment. */
   ineligibleTurnIds: string[];
+  /** Active Turns whose eligibility could not be established here; retried with backoff. */
+  eligibilityUnknownTurnIds: string[];
+  /** Stop requests this Host settled to a terminal state without executing the Turn. */
+  interruptedTurnIds: string[];
   queuedConversationIds: string[];
 }
 
@@ -195,6 +205,7 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
+    await this.requireExecutionHost(input.conversationId);
     return this.conversationOwners.run(input.conversationId, async () => {
       const content = serializeUserContent(input.text, input.content);
       const command: TurnInputCommand = {
@@ -303,6 +314,7 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
+    await this.requireExecutionHost(input.conversationId);
     return this.conversationOwners.run(input.conversationId, async () => {
       const command: TurnRetryCommand = {
         source: { kind: 'command', key: input.commandId },
@@ -333,6 +345,7 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
+    await this.requireExecutionHost(input.conversationId);
     return this.conversationOwners.run(input.conversationId, async () => {
       const content = serializeUserContent(input.text, input.content);
       const command: TurnEditAndRunCommand = {
@@ -360,6 +373,7 @@ export class ReliableConversationRunner {
     content?: MessageContent;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
+    await this.requireExecutionHost(input.conversationId);
     return this.conversationOwners.run(input.conversationId, async () => {
       const content = serializeUserContent(input.text, input.content);
       const command: TurnContinuationCommand = {
@@ -386,6 +400,7 @@ export class ReliableConversationRunner {
     sourceTurnId: string | null;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
+    await this.requireExecutionHost(input.conversationId);
     return this.conversationOwners.run(input.conversationId, async () => {
       const command: TurnRuntimeContinuationCommand = {
         source: { kind: 'internal', key: input.commandId },
@@ -412,6 +427,7 @@ export class ReliableConversationRunner {
     sourceReplay?: 'immutable_provenance';
   }): Promise<ReliableManualCompressionResult> {
     this.requireOpen();
+    await this.requireExecutionHost(input.conversationId);
     return this.conversationOwners.run(input.conversationId, async () => {
       const replay = await this.inspectManualCompression({
         commandId: input.commandId,
@@ -457,6 +473,7 @@ export class ReliableConversationRunner {
     };
   }): Promise<TurnCommandResult> {
     this.requireOpen();
+    await this.requireExecutionHost(input.conversationId);
     const sourceReplay = parseManualCompressionSourceReplay(input.sourceReplay, input.target);
     return this.conversationOwners.run(input.conversationId, async () => {
       if (sourceReplay) {
@@ -528,6 +545,7 @@ export class ReliableConversationRunner {
       conversationId: requireId(input.conversationId, 'Manual compression Conversation.id'),
       turnId: requireId(input.turnId, 'Manual compression Turn.id')
     };
+    await this.requireExecutionHost(slot.conversationId);
     // The caller holds the execution fence; it must also hold this Conversation's runtime
     // ownership. Driving peer-owned work is never allowed, even through an established fence.
     await this.conversationOwners.assertOwned(slot.conversationId);
@@ -687,9 +705,11 @@ export class ReliableConversationRunner {
    * poisoning unrelated recovery; resume candidates stay level-triggered via deferredRecovery so
    * a later peer release/shutdown still reclaims execution in this Host.
    *
-   * A Conversation this Host is not eligible to run (its project folder or frozen work environment
-   * is not open here) is neither claimed, finalized nor deferred: its durable Turn stays active
-   * for a Host that serves it, and a later sweep here picks it up once the folder is opened.
+   * A Conversation this Host does not serve (its project folder or frozen work environment is not
+   * open here, or that cannot be established) is never executed here. Control-only settlement still
+   * happens in any window: an orphan Turn is finalized and a durable stop request is recorded as the
+   * terminal state. Other Turns stay active for the Host that serves them and remain low-frequency
+   * candidates here, so opening the folder (rescan) or recovering eligibility picks them up.
    *
    * Passing conversationId scopes every repository scan and ownership claim to that one
    * Conversation: a view taking over a crashed peer's Conversation recovers it inside this
@@ -725,6 +745,8 @@ export class ReliableConversationRunner {
       needsHumanTurnIds: [],
       liveOwnedTurnIds: [],
       ineligibleTurnIds: [],
+      eligibilityUnknownTurnIds: [],
+      interruptedTurnIds: [],
       queuedConversationIds: []
     };
     const admissionBlockedConversationIds = new Set<string>();
@@ -740,20 +762,26 @@ export class ReliableConversationRunner {
         continue;
       }
       const claim = await this.tryOwnConversation(turnConversationId, ownership);
-      if (claim === 'ineligible') {
-        report.ineligibleTurnIds.push(turnId);
-        admissionBlockedConversationIds.add(turnConversationId);
-        this.deferredRecovery.delete(turnId);
-        continue;
-      }
       if (claim === 'busy') {
         // A live peer Host owns this Conversation. Skipping it must not poison unrelated
         // recovery; the resume candidate stays level-triggered for a later release/shutdown.
         report.liveOwnedTurnIds.push(turnId);
         admissionBlockedConversationIds.add(turnConversationId);
-        if (facts.judgment === 'resume') {
-          this.deferredRecovery.set(turnId, { conversationId: turnConversationId, turnId });
-          this.ensureExternalWakePolling();
+        if (facts.judgment === 'resume') this.deferRecoveryCandidate(turnConversationId, turnId, 'busy');
+        continue;
+      }
+      if (claim === 'ineligible' || claim === 'unknown') {
+        admissionBlockedConversationIds.add(turnConversationId);
+        const settled = await this.settleWithoutExecution(turnConversationId, turnId);
+        if (settled === 'finalized') report.finalizedTurnIds.push(turnId);
+        else if (settled === 'interrupted') report.interruptedTurnIds.push(turnId);
+        else if (settled === 'inactive') continue;
+        else if (settled === 'busy') {
+          report.liveOwnedTurnIds.push(turnId);
+          this.deferRecoveryCandidate(turnConversationId, turnId, 'busy');
+        } else {
+          (claim === 'ineligible' ? report.ineligibleTurnIds : report.eligibilityUnknownTurnIds).push(turnId);
+          this.deferRecoveryCandidate(turnConversationId, turnId, claim);
         }
         continue;
       }
@@ -776,10 +804,10 @@ export class ReliableConversationRunner {
         // non-error startup outcomes; this Host must not schedule the Turn.
         report.liveOwnedTurnIds.push(turnId);
         admissionBlockedConversationIds.add(turnConversationId);
-        this.deferredRecovery.set(turnId, { conversationId: turnConversationId, turnId });
-        this.ensureExternalWakePolling();
+        this.deferRecoveryCandidate(turnConversationId, turnId, 'busy');
         continue;
       }
+      this.deferredRecovery.delete(turnId);
       report.resumedTurnIds.push(turnId);
       admissionBlockedConversationIds.add(turnConversationId);
       this.scheduleDrive(turnConversationId, turnId);
@@ -802,14 +830,54 @@ export class ReliableConversationRunner {
     for (const queuedConversationId of queuedConversationIds) {
       signal?.throwIfAborted();
       // Queued admission drains only under this Host's Conversation ownership; a live peer owner
-      // drains its own queue and an ineligible Host leaves it for the project's Host.
+      // drains its own queue and a Host that does not serve it leaves it for the project's Host.
       if (await this.tryOwnConversation(queuedConversationId, ownership) !== 'owned') continue;
       report.queuedConversationIds.push(queuedConversationId);
       this.scheduleAdmission(queuedConversationId);
     }
+    if (!scopedConversationId) {
+      // Counts only; no identifiers or content. `unchanged` = left for the Host serving the project,
+      // `unknown` = eligibility could not be established here.
+      this.diagnostics?.observe({
+        eventKind: 'recovery.scan.completed',
+        scopeKind: 'runtime',
+        metadata: {
+          kind: 'conversation-runner',
+          status: 'completed',
+          hostBootId: this.application.database.hostBootId,
+          scanned: report.activeTurnsScanned,
+          reconciled: report.resumedTurnIds.length + report.finalizedTurnIds.length + report.interruptedTurnIds.length,
+          unchanged: report.ineligibleTurnIds.length,
+          unknown: report.eligibilityUnknownTurnIds.length
+        }
+      });
+    }
     return report;
   }
 
+  /**
+   * Re-evaluates every candidate now, for example after the window's folders changed or its
+   * workspace synchronization recovered. Busy results go back to the deferred candidates.
+   */
+  public async rescan(signal?: AbortSignal): Promise<ReliableConversationRunnerRecoveryReport> {
+    this.requireOpen();
+    for (const deferred of this.deferredRecovery.values()) delete deferred.nextAttemptAt;
+    // A waiting Turn whose folder left this window stops being held here for execution.
+    for (const waiting of [...this.waitingOwned.values()]) {
+      const eligibility = await this.conversationOwners.executionEligibility(waiting.conversationId);
+      if (eligibility === 'eligible') continue;
+      this.deferRecoveryCandidate(waiting.conversationId, waiting.turnId, eligibility);
+      await this.conversationOwners.releaseIfIdle(waiting.conversationId);
+    }
+    return this.recoverStartup(signal);
+  }
+
+  /**
+   * A stop works in every window. The durable request is always written first; a live owner then
+   * executes it. Without one, a Host that serves the Conversation recovers and drives the Turn,
+   * which records the interrupt; any other Host settles the request to the terminal state under a
+   * short control claim, without the Provider or tools, and hands the Conversation back.
+   */
   public async interrupt(input: {
     commandId: string;
     conversationId: string;
@@ -826,9 +894,10 @@ export class ReliableConversationRunner {
         : {}),
       reason: input.reason
     });
-    // The sender may be a passive observer of another live Host. Only a locally owned Turn can
-    // be driven/cancelled here; its owner sees the durable interrupt in the external wake poll.
-    if (this.conversationOwners.owns(input.conversationId)) {
+    if (result.ignoredBecauseTerminal) return result;
+    const eligibility = await this.conversationOwners.executionEligibility(input.conversationId);
+    // A Turn running here stops through its own drive, whatever this window serves now.
+    if (this.active.has(input.turnId) || (eligibility === 'eligible' && this.conversationOwners.owns(input.conversationId))) {
       this.scheduleDrive(input.conversationId, input.turnId);
       void this.cancelLocalExecution(input.conversationId, input.turnId, input.reason).catch((error) => {
         this.onError(error, {
@@ -837,8 +906,81 @@ export class ReliableConversationRunner {
           turnId: input.turnId
         });
       });
+      return result;
+    }
+    if (eligibility === 'eligible') {
+      // Not owned here: take it over like a view would; a live owner keeps it and executes the stop.
+      void this.recoverStartup(undefined, input.conversationId).catch((error) => {
+        this.onError(error, { operation: 'watch-recovery', conversationId: input.conversationId, turnId: input.turnId });
+      });
+      return result;
+    }
+    const settled = await this.settleWithoutExecution(input.conversationId, input.turnId);
+    if (settled === 'busy') this.deferRecoveryCandidate(input.conversationId, input.turnId, 'busy');
+    else if (settled === 'retry' || settled === 'none') {
+      this.deferRecoveryCandidate(input.conversationId, input.turnId, eligibility);
     }
     return result;
+  }
+
+  /**
+   * Control-only settlement for a Host that must not execute the Conversation. An orphan Turn (no
+   * lease, no pending input) is finalized; a durable stop request is recorded as the terminal state
+   * through the Agent loop's termination path, which cancels durable waits and never dispatches the
+   * Provider or tools. The short claim is handed back by the owner manager right after. 'busy'
+   * means a live Host owns the Conversation and executes the request itself.
+   */
+  private async settleWithoutExecution(
+    conversationId: string,
+    turnId: string
+  ): Promise<'finalized' | 'interrupted' | 'inactive' | 'none' | 'busy' | 'retry'> {
+    try {
+      // Read-only preview first, so a candidate with nothing to settle never touches the owner record.
+      const preview = await this.application.turns.recoveryFacts(turnId);
+      if (preview.turnStatus !== 'active') return 'inactive';
+      if (preview.judgment === 'needs_human') return 'none';
+      if (preview.judgment === 'resume' && !await this.findPendingTermination(turnId)) return 'none';
+      return await this.conversationOwners.run(conversationId, async () => {
+        const facts = await this.application.turns.recoveryFacts(turnId);
+        if (facts.turnStatus !== 'active') return 'inactive';
+        if (facts.judgment === 'finalize') {
+          await this.application.turns.finalizeRecovery({
+            source: { kind: 'recovery', key: `runner-finalize-orphan:${turnId}` },
+            turnId,
+            terminalStatus: 'cancelled',
+            reason: 'Recovery finalized an active Turn with no execution ownership or pending input.'
+          });
+          return 'finalized';
+        }
+        if (facts.judgment !== 'resume' || !await this.findPendingTermination(turnId)) return 'none';
+        // A tool that was already executing can only be settled by the Host serving the project
+        // (effect recovery there). Claiming the lease here would only block that Host.
+        const executing = await listAllDomainRows(this.application.database, 'ToolCall', {
+          turn_id: turnId,
+          status: 'executing'
+        });
+        if (executing.length > 0) return 'none';
+        const claimed = await this.application.turns.claimRecoveryExecution({
+          turnId,
+          ...this.lease(conversationId)
+        });
+        // A live lease holder observes the durable request and stops the Turn itself.
+        if (!claimed) return 'busy';
+        const fence = await this.application.turns.executionLeaseFence({
+          turnId,
+          leaseOwnerId: this.leaseOwnerId,
+          hostBootId: this.application.database.hostBootId
+        });
+        if (!fence) return 'retry';
+        const terminated = await runWithExecutionLeaseFence(fence, () =>
+          this.application.agentLoop.terminateRequested(turnId));
+        return terminated ? 'interrupted' : 'retry';
+      });
+    } catch (error) {
+      if (isConversationRuntimeOwnerBusyError(error)) return 'busy';
+      this.onError(error, { operation: 'watch-recovery', conversationId, turnId });
+      return 'retry';
+    }
   }
 
   public async waitForIdle(): Promise<void> {
@@ -918,11 +1060,23 @@ export class ReliableConversationRunner {
    * candidate reclaims execution here once the peer releases ownership or shuts down.
    */
   private async runOwnedDriveSlot(slot: DriveSlot): Promise<void> {
-    if (!await this.conversationOwners.claimEligible(slot.conversationId)) {
-      // A scheduling nudge (for example an answer submitted from another project's window) must not
-      // take the Conversation over here; the Host serving its project resumes it.
+    // Driving is execution: only a Host serving the Conversation claims it, and holding the owner
+    // record is not enough. A scheduling nudge in another project's window (an answer or stop
+    // recorded there) settles control-only facts and leaves the Turn to the Host serving it.
+    const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
+    if (claim !== 'owned') {
       slot.terminal = true;
       slot.completedGeneration = slot.requestedGeneration;
+      if (claim === 'busy') {
+        this.deferExecutionRecovery(slot);
+        return;
+      }
+      const settled = await this.settleWithoutExecution(slot.conversationId, slot.turnId);
+      if (settled === 'busy') this.deferRecoveryCandidate(slot.conversationId, slot.turnId, 'busy');
+      else if (settled === 'none' || settled === 'retry') {
+        this.deferRecoveryCandidate(slot.conversationId, slot.turnId, claim);
+      }
+      await this.conversationOwners.releaseIfIdle(slot.conversationId);
       return;
     }
     try {
@@ -1351,11 +1505,18 @@ export class ReliableConversationRunner {
         const version = await this.application.database.externalDataVersion();
         for (const waiting of [...this.waitingOwned.values()]) {
           if (!localWake && waiting.externalDataVersion === version) continue;
-          if (await this.tryOwnConversation(waiting.conversationId, ownership) !== 'owned') {
-            // A live peer Host owns this Conversation now (or it lost ownership and no longer serves
-            // it); that Host observes and drives the waiting Turn. Keeping the local entry would
-            // auto-drive another Host's work.
+          const claim = await this.tryOwnConversation(waiting.conversationId, ownership);
+          if (claim === 'busy') {
+            // A live peer Host owns this Conversation now; that Host observes and drives the
+            // waiting Turn. Keeping the local entry would auto-drive another Host's work.
             this.waitingOwned.delete(waiting.turnId);
+            continue;
+          }
+          if (claim !== 'owned') {
+            // This Host no longer serves the Conversation (or cannot tell): keep a candidate so a
+            // stop is still settled here and the Turn resumes once eligibility returns.
+            this.deferRecoveryCandidate(waiting.conversationId, waiting.turnId, claim);
+            await this.conversationOwners.releaseIfIdle(waiting.conversationId);
             continue;
           }
           const observation = await this.observeWaitingWake(waiting.turnId);
@@ -1372,21 +1533,38 @@ export class ReliableConversationRunner {
       for (const deferred of [...this.deferredRecovery.values()]) {
         if (deferred.nextAttemptAt !== undefined && Date.now() < deferred.nextAttemptAt) continue;
         const facts = await this.application.turns.recoveryFacts(deferred.turnId);
-        if (facts.judgment !== 'resume') {
-          this.deferredRecovery.delete(deferred.turnId);
-          this.terminationRecoveryFailures.delete(deferred.turnId);
+        if (facts.turnStatus !== 'active' || facts.judgment === 'needs_human') {
+          this.forgetRecoveryCandidate(deferred.turnId);
           continue;
         }
         // A live/unknown peer Conversation owner must never be displaced. The candidate stays
-        // level-triggered so a later peer release/shutdown still reclaims execution here. A
-        // Conversation this Host no longer serves is dropped; the next eligible sweep rediscovers it.
-        const claim = await this.tryOwnConversation(deferred.conversationId, ownership);
-        if (claim === 'ineligible') {
-          this.deferredRecovery.delete(deferred.turnId);
-          this.terminationRecoveryFailures.delete(deferred.turnId);
+        // level-triggered so a later peer release/shutdown still reclaims execution here.
+        const claim = facts.judgment === 'finalize'
+          ? 'control'
+          : await this.tryOwnConversation(deferred.conversationId, ownership);
+        if (claim === 'busy') continue;
+        if (claim !== 'owned') {
+          // Control-only work happens in any window: an orphan is finalized and a stop request is
+          // settled. Anything else stays a candidate: rarely re-checked when this Host does not
+          // serve the Conversation, with backoff when that cannot be established. It is never
+          // dropped, so opening the folder or a recovered probe resumes it.
+          if (this.active.has(deferred.turnId)) continue;
+          const settled = await this.settleWithoutExecution(deferred.conversationId, deferred.turnId);
+          if (settled === 'finalized' || settled === 'interrupted' || settled === 'inactive') {
+            this.forgetRecoveryCandidate(deferred.turnId);
+            continue;
+          }
+          if (settled === 'busy') {
+            this.deferRecoveryCandidate(deferred.conversationId, deferred.turnId, 'busy');
+            continue;
+          }
+          const eligibility = claim === 'control'
+            ? await this.conversationOwners.executionEligibility(deferred.conversationId)
+            : claim;
+          if (eligibility === 'eligible') continue;
+          this.deferRecoveryCandidate(deferred.conversationId, deferred.turnId, eligibility);
           continue;
         }
-        if (claim !== 'owned') continue;
         const claimed = await this.application.turns.claimRecoveryExecution({
           turnId: deferred.turnId,
           ...this.lease(deferred.conversationId)
@@ -1621,6 +1799,52 @@ export class ReliableConversationRunner {
     this.ensureExternalWakePolling();
   }
 
+  /**
+   * Keeps a Turn this Host cannot execute right now as a level-triggered candidate. 'busy' retries
+   * on the next poll; 'ineligible' (this window does not serve it) is re-checked rarely, and a
+   * folder change rescans at once; 'unknown' (the eligibility probe failed) backs off
+   * exponentially. The candidate is only dropped once the Turn is no longer active.
+   */
+  private deferRecoveryCandidate(
+    conversationId: string,
+    turnId: string,
+    reason: 'busy' | 'ineligible' | 'unknown'
+  ): void {
+    if (this.disposed) return;
+    if (reason === 'busy') {
+      this.deferExecutionRecovery({ conversationId, turnId });
+      return;
+    }
+    this.waitingOwned.delete(turnId);
+    const existing = this.deferredRecovery.get(turnId);
+    const unknownCount = reason === 'unknown' ? (existing?.unknownEligibilityCount ?? 0) + 1 : 0;
+    const delayMs = reason === 'unknown'
+      ? Math.min(
+        UNKNOWN_ELIGIBILITY_MAX_DELAY_MS,
+        UNKNOWN_ELIGIBILITY_BASE_DELAY_MS * (2 ** Math.min(10, unknownCount - 1))
+      )
+      : INELIGIBLE_RECHECK_MS;
+    this.deferredRecovery.set(turnId, {
+      conversationId,
+      turnId,
+      nextAttemptAt: Date.now() + delayMs,
+      ...(existing?.failureCount ? { failureCount: existing.failureCount } : {}),
+      ...(unknownCount > 0 ? { unknownEligibilityCount: unknownCount } : {})
+    });
+    this.ensureExternalWakePolling();
+  }
+
+  private forgetRecoveryCandidate(turnId: string): void {
+    this.deferredRecovery.delete(turnId);
+    this.terminationRecoveryFailures.delete(turnId);
+  }
+
+  /** Execution commands (new input, retry, edit, continuation, compression) need a serving Host. */
+  private async requireExecutionHost(conversationId: string): Promise<void> {
+    const eligibility = await this.conversationOwners.executionEligibility(conversationId);
+    if (eligibility !== 'eligible') throw new ConversationHostIneligibleError(conversationId, eligibility);
+  }
+
   private deferExecutionRecovery(slot: Pick<DriveSlot, 'conversationId' | 'turnId'>): void {
     if (this.disposed) return;
     this.waitingOwned.delete(slot.turnId);
@@ -1782,7 +2006,13 @@ export class ReliableConversationRunner {
    * its own queue; standing down is a safe no-op because the queued Intent stays durable.
    */
   private async runOwnedAdmissionSlot(slot: AdmissionSlot): Promise<void> {
-    if (!await this.conversationOwners.claimEligible(slot.conversationId)) return;
+    // Admission starts a Turn, so it is execution: the queued Intent stays durable for the Host
+    // serving the Conversation.
+    const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
+    if (claim !== 'owned') {
+      if (claim !== 'busy') await this.conversationOwners.releaseIfIdle(slot.conversationId);
+      return;
+    }
     try {
       await this.conversationOwners.run(slot.conversationId, () => this.runAdmissionSlot(slot));
     } catch (error) {

@@ -83,6 +83,31 @@ export class ConversationRuntimeOwnerReleasedError extends ExecutionHandoffError
   }
 }
 
+/**
+ * An execution-class command (a new Turn, retry, compression, resume) reached a Host that does not
+ * serve the conversation: its project folder or frozen work environment is not open here, or that
+ * could not be established. Nothing was written; the Host serving the project executes it.
+ */
+export class ConversationHostIneligibleError extends Error {
+  public readonly code = 'conversation-host-ineligible';
+
+  public constructor(
+    public readonly conversationId: string,
+    public readonly eligibility: Exclude<ConversationRuntimeExecutionEligibility, 'eligible'>,
+    message?: string
+  ) {
+    super(message ?? (eligibility === 'ineligible'
+      ? `会话 ${conversationId} 不属于当前窗口的项目或工作环境；请在打开该项目的窗口中执行。`
+      : `无法确认当前窗口能否执行会话 ${conversationId}；未写入任何执行事实。`));
+    this.name = 'ConversationHostIneligibleError';
+  }
+}
+
+export function isConversationHostIneligibleError(error: unknown): error is ConversationHostIneligibleError {
+  return error instanceof ConversationHostIneligibleError
+    || (error instanceof Error && (error as Error & { code?: unknown }).code === 'conversation-host-ineligible');
+}
+
 export function isConversationRuntimeOwnerBusyError(error: unknown): error is ConversationRuntimeOwnerBusyError {
   return error instanceof ConversationRuntimeOwnerBusyError
     || (error instanceof Error && (error as Error & { code?: unknown }).code === 'conversation-runtime-owner-busy');
@@ -115,13 +140,16 @@ export function conversationRuntimeOwnerClaimPath(paths: RuntimeRootPaths, conve
 export type ConversationRuntimePendingWorkProbe = (conversationId: string) => Promise<boolean>;
 
 /**
- * Host-local answer to "may this Host start background work for the conversation?" (for example,
- * whether its project folder is open here). It only narrows which Host attempts a background claim;
- * the durable owner record, ExecutionLease and fences remain the execution authority.
+ * Host-local answer to "may this Host execute the conversation?" (its project folder and frozen work
+ * environment are open here). A rejection means the Host is ineligible; a thrown error means
+ * eligibility is unknown. It only decides which Host executes and which Host keeps ownership while
+ * work is pending; the durable owner record, ExecutionLease and fences remain the authority.
  */
 export type ConversationRuntimeClaimEligibilityProbe = (conversationId: string) => Promise<boolean>;
 
-export type ConversationRuntimeEligibleClaimResult = 'owned' | 'busy' | 'ineligible';
+export type ConversationRuntimeExecutionEligibility = 'eligible' | 'ineligible' | 'unknown';
+
+export type ConversationRuntimeEligibleClaimResult = 'owned' | 'busy' | 'ineligible' | 'unknown';
 
 interface OwnedConversation {
   readonly conversationId: string;
@@ -183,32 +211,37 @@ export class ConversationRuntimeOwnerManager {
   }
 
   /**
-   * Whether background work (startup/deferred recovery, delivery wakes, scheduling nudges) may run
-   * the conversation here: already owned, or the eligibility probe accepts this Host. Probe failures
-   * fail closed. Explicit user commands keep using claim()/run() and are not narrowed by this.
+   * Whether this Host may execute the conversation (drive a Turn, call the Provider, run tools or
+   * effects). Holding the owner record is not evidence: a control command in any window holds it
+   * briefly. A probe failure is 'unknown' and never counts as eligible.
    */
-  public async claimEligible(conversationId: string): Promise<boolean> {
+  public async executionEligibility(conversationId: string): Promise<ConversationRuntimeExecutionEligibility> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
-    if (this.owned.has(id)) return true;
     try {
-      return await this.claimEligibilityProbe(id) === true;
-    } catch (error) {
-      console.warn('[reliable-kernel] Conversation claim eligibility failed closed.', id, error);
-      return false;
+      return await this.claimEligibilityProbe(id) === true ? 'eligible' : 'ineligible';
+    } catch {
+      return 'unknown';
     }
   }
 
   /**
-   * Background claim: 'ineligible' leaves every durable record untouched so a Host that can run the
-   * conversation claims it instead; 'busy' means another live or unknown Host owns it.
+   * Execution claim for background work: only an eligible Host claims, and eligibility is checked
+   * again after the claim so a folder removed in between hands the fresh claim straight back.
+   * 'busy' means another live or unknown Host owns it; the other results leave records untouched.
    */
   public async tryClaimEligible(conversationId: string): Promise<ConversationRuntimeEligibleClaimResult> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
-    if (!await this.claimEligible(id)) return 'ineligible';
-    return await this.tryClaim(id) ? 'owned' : 'busy';
+    const before = await this.executionEligibility(id);
+    if (before !== 'eligible') return before;
+    const wasOwned = this.owned.has(id);
+    if (!await this.tryClaim(id)) return 'busy';
+    const after = await this.executionEligibility(id);
+    if (after === 'eligible') return 'owned';
+    if (!wasOwned) await this.enqueue(id, () => this.releaseIfIdleLocked(id, true)).catch(() => undefined);
+    return after;
   }
 
-  /** Installs the Host-local background claim eligibility; the default accepts every conversation. */
+  /** Installs the Host-local execution eligibility; the default accepts every conversation. */
   public setClaimEligibilityProbe(probe: ConversationRuntimeClaimEligibilityProbe): void {
     if (typeof probe !== 'function') throw new TypeError('Claim eligibility probe must be a function.');
     this.claimEligibilityProbe = probe;
@@ -229,11 +262,15 @@ export class ConversationRuntimeOwnerManager {
 
   /**
    * Claims the conversation and holds an activity pin for the whole callback, then releases the
-   * owner if it became idle. Nested or overlapping runs cannot drop ownership midway.
+   * owner if it became idle. Nested or overlapping runs cannot drop ownership midway. On a Host that
+   * does not serve the conversation this is a control command: pending work never keeps the claim,
+   * so the Host that serves the project can take the conversation over right after.
    */
   public async run<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
+    let claimedByThisRun = false;
     await this.enqueue(id, async () => {
+      claimedByThisRun = !this.owned.has(id);
       const state = await this.claimLocked(id, 'throw');
       state.pins += 1;
     });
@@ -243,7 +280,7 @@ export class ConversationRuntimeOwnerManager {
       await this.enqueue(id, async () => {
         const state = this.owned.get(id);
         if (state && state.pins > 0) state.pins -= 1;
-        await this.releaseIfIdleLocked(id);
+        await this.releaseIfIdleLocked(id, claimedByThisRun);
       }).catch((error: unknown) => {
         if (!this.closed) throw error;
       });
@@ -318,7 +355,7 @@ export class ConversationRuntimeOwnerManager {
     return state;
   }
 
-  private async releaseIfIdleLocked(conversationId: string): Promise<boolean> {
+  private async releaseIfIdleLocked(conversationId: string, claimedByCaller = false): Promise<boolean> {
     const state = this.owned.get(conversationId);
     if (!state || state.pins > 0) return false;
     let pending = true;
@@ -328,7 +365,14 @@ export class ConversationRuntimeOwnerManager {
       // A probe failure can never be interpreted as proof that no work is pending.
       pending = true;
     }
-    if (pending) return false;
+    if (pending) {
+      // Pending work keeps the owner only on a Host that executes it. A Host that does not serve the
+      // conversation hands it back at once; an unknown answer keeps an existing owner but never a
+      // claim the caller just made for a control command.
+      const eligibility = await this.executionEligibility(conversationId);
+      if (eligibility === 'eligible') return false;
+      if (eligibility === 'unknown' && !claimedByCaller) return false;
+    }
     // Local ownership drops before the durable record so stale fenced writes fail immediately;
     // the durable release below is exact-token and never touches another owner's record.
     this.owned.delete(conversationId);

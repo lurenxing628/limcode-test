@@ -1,30 +1,78 @@
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import fs from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+// The command router and the panel import 'vscode'; the kernel does not.
+const require = createRequire(import.meta.url);
+const Module = require('node:module');
+const originalLoad = Module._load;
+const informationMessages = [];
+class StubEventEmitter {
+  listeners = new Set();
+  event = (listener) => {
+    this.listeners.add(listener);
+    return { dispose: () => this.listeners.delete(listener) };
+  };
+  fire(value) { for (const listener of this.listeners) listener(value); }
+  dispose() { this.listeners.clear(); }
+}
+class StubUri {
+  constructor(fsPath) { this.fsPath = fsPath; this.path = fsPath; this.scheme = 'file'; this.authority = ''; }
+  static file(fsPath) { return new StubUri(fsPath); }
+  static joinPath(base, ...parts) { return new StubUri(path.join(base.fsPath, ...parts)); }
+  toString() { return `file://${this.fsPath}`; }
+}
+const vscodeStub = {
+  Uri: StubUri,
+  EventEmitter: StubEventEmitter,
+  ViewColumn: { One: 1 },
+  workspace: { workspaceFolders: [] },
+  window: {
+    async showInformationMessage(message) { informationMessages.push(message); },
+    async showWarningMessage() {},
+    async showErrorMessage() {},
+    registerWebviewPanelSerializer() { return { dispose() {} }; }
+  }
+};
+Module._load = function load(request, parent, isMain) {
+  return request === 'vscode' ? vscodeStub : originalLoad.call(this, request, parent, isMain);
+};
+
 const root = process.cwd();
-const load = (relative) => import(pathToFileURL(path.join(root, 'dist/extension', relative)).href);
+const compiled = (relative) => path.join(root, 'dist/extension', relative);
+const load = (relative) => import(pathToFileURL(compiled(relative)).href);
 const kernel = await load('backend/reliableKernel/index.js');
 const { ReliableConversationRunner } = await load('backend/application/reliableKernel/ReliableConversationRunner.js');
-const { evaluateConversationHostEligibility } = await load('backend/application/reliableKernel/conversationHostEligibility.js');
+const {
+  conversationHostIneligibleMessage,
+  createDiagnosedConversationHostEligibility,
+  evaluateConversationHostEligibility,
+  viewConversationHostEligibility
+} = await load('backend/application/reliableKernel/conversationHostEligibility.js');
 const { readPendingInteractionAttention, InteractionLeaseEdgeTracker } = await load(
   'backend/application/reliableKernel/interactionAttention.js'
 );
 const { projectFolderAssignmentSteps } = await load('backend/reliableKernel/conversationProject.js');
 const { conversationRuntimeOwnerClaimPath } = await load('backend/reliableKernel/ConversationRuntimeOwnerManager.js');
+const { askUserTool } = await load('backend/world/modules/tools/definitions/askUser/index.js');
+const { VscodeReliableKernelCommandRouter } = require(compiled('backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js'));
+const { BridgeMessageType } = require(compiled('shared/protocol.js'));
+const { EXTENSION_BRAND } = require(compiled('shared/extensionIdentity.js'));
 
 const PROVIDER_ID = 'eligibility-provider';
 const PROJECT_ONE = 'file:///workspace/project-one';
 const PROJECT_TWO = 'file:///workspace/project-two';
+const PROJECT_TWO_FOLDER = { uri: PROJECT_TWO, name: '项目二' };
 const TEST_FILE = fileURLToPath(import.meta.url);
 
 const workerMode = process.env.LIMCODE_ELIGIBILITY_WORKER;
 if (workerMode) {
-  runRecoveryWorker().then(
+  runWorker(workerMode).then(
     () => process.exit(0),
     (error) => {
       console.error(error?.stack ?? error);
@@ -32,27 +80,40 @@ if (workerMode) {
     }
   );
 } else {
+after(() => { Module._load = originalLoad; });
 
-test('其它项目的窗口不恢复该项目的活动 Turn，保持等待；打开该项目后同一窗口接上', { timeout: 180_000 }, async () => {
+test('其它项目的窗口不执行该项目的活动 Turn，也不持有它；打开该项目并重扫后同一窗口接上', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('project-gate');
   let other;
   try {
     const conversationId = 'conversation-project-two';
-    const turnId = await startTurnThenCloseHost(dataRoot, conversationId, { uri: PROJECT_TWO, name: '项目二' });
+    const turnId = await startTurnThenCloseHost(dataRoot, conversationId, PROJECT_TWO_FOLDER);
 
     const provider = gatedProvider();
-    other = await openHost(dataRoot, provider, { folders: [PROJECT_ONE], label: 'project-one-window' });
+    const diagnostics = recordingDiagnostics();
+    other = await openHost(dataRoot, provider, { folders: [PROJECT_ONE], label: 'project-one-window', diagnostics });
     await other.app.recover();
     assert.equal(other.owns(conversationId), false, '启动恢复（Phase D/F）不得认领其它项目的对话');
     const report = await other.runner.recoverStartup();
     assert.deepEqual(report.ineligibleTurnIds, [turnId]);
     assert.deepEqual(report.resumedTurnIds, []);
     assert.deepEqual(report.liveOwnedTurnIds, []);
-    assert.deepEqual(report.finalizedTurnIds, [], '不合格窗口绝不可 finalize 其它项目的 Turn');
+    assert.deepEqual(report.finalizedTurnIds, [], '有执行租约的 Turn 不是孤儿，不得收尾');
+    assert.deepEqual(report.interruptedTurnIds, []);
     assert.equal(other.owns(conversationId), false);
-    assert.equal(await ownerRecordExists(dataRoot, conversationId), false, '不合格窗口不得写入所有权记录');
+    assert.equal(await ownerRecordExists(dataRoot, conversationId), false, '不合格窗口不得留下归属记录');
+    const scan = diagnostics.events.filter((event) => event.eventKind === 'recovery.scan.completed');
+    assert.deepEqual(scan.map((event) => event.metadata), [{
+      kind: 'conversation-runner',
+      status: 'completed',
+      hostBootId: other.app.database.hostBootId,
+      scanned: 1,
+      reconciled: 0,
+      unchanged: 1,
+      unknown: 0
+    }], '恢复事件写出本窗口留给其它窗口的数量');
 
-    // 其它窗口里回答问题后的"恢复提示"也不得把对话接过来。
+    // 其它窗口里的"续跑提示"也不得把对话接过来。
     other.runner.resume(conversationId, turnId);
     await other.runner.waitForIdle();
     await sleep(700);
@@ -61,9 +122,9 @@ test('其它项目的窗口不恢复该项目的活动 Turn，保持等待；打
     assert.equal((await rows(other.app, 'Turn', { id: turnId }))[0]?.status, 'active', 'Turn 必须保持等待');
     assert.equal((await rows(other.app, 'TurnTermination', { turn_id: turnId })).length, 0);
 
-    // 同一窗口打开该项目文件夹后，重新扫描即可接上。
+    // 同一窗口打开该项目文件夹后，重扫立即接上（不等 30 秒的低频复查）。
     other.folders.push(PROJECT_TWO);
-    const resumed = await other.runner.recoverStartup();
+    const resumed = await other.runner.rescan();
     assert.deepEqual(resumed.resumedTurnIds, [turnId]);
     assert.deepEqual(resumed.ineligibleTurnIds, []);
     await provider.started;
@@ -78,7 +139,7 @@ test('其它项目的窗口不恢复该项目的活动 Turn，保持等待；打
   }
 });
 
-test('资格判定：项目未打开、冻结工作环境不可用分别拒绝；无项目无环境的对话任何窗口都可承接', { timeout: 120_000 }, async () => {
+test('资格判定：项目未打开、冻结工作环境不可用分别拒绝；持有不等于可执行；不合格或未知时新输入在写入前被拒绝', { timeout: 120_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('decisions');
   let host;
   try {
@@ -87,39 +148,397 @@ test('资格判定：项目未打开、冻结工作环境不可用分别拒绝�
       folders: [],
       label: 'decision-window',
       defaultWorkEnvironmentId: 'env-frozen',
-      environments: [{ id: 'env-frozen', available: false }]
+      environments: [{ id: 'env-frozen', available: true }]
     });
     const bound = 'conversation-bound';
     const unbound = 'conversation-unbound';
     const idle = 'conversation-idle';
-    await createConversation(host.app, bound, { uri: PROJECT_TWO, name: '项目二' });
+    await createConversation(host.app, bound, PROJECT_TWO_FOLDER);
     await createConversation(host.app, unbound);
     await createConversation(host.app, idle);
+    const owners = host.app.database.conversationOwners;
 
     assert.deepEqual(await host.eligibility(bound), {
       eligible: false, reason: 'project_not_open', projectUri: PROJECT_TWO, projectName: '项目二'
     });
+    await assert.rejects(host.runner.input({ commandId: 'bound-input', conversationId: bound, text: '开始' }),
+      (error) => error.code === 'conversation-host-ineligible' && error.eligibility === 'ineligible');
+    assert.equal((await rows(host.app, 'TurnIntent', { conversation_id: bound })).length, 0, '被拒绝的输入不得写入');
+    assert.equal(host.owns(bound), false);
     host.folders.push(PROJECT_TWO);
     assert.deepEqual(await host.eligibility(bound), { eligible: true });
     assert.deepEqual(await host.eligibility(idle), { eligible: true });
 
-    // 用户在本窗口的显式输入不受资格收窄；活动 Turn 冻结的默认工作环境决定后台承接资格。
+    // 资格探针出错是"未知"，从不当作合格。
+    host.failProbe = true;
+    assert.equal(await owners.executionEligibility(idle), 'unknown');
+    await assert.rejects(host.runner.input({ commandId: 'idle-input', conversationId: idle, text: '开始' }),
+      (error) => error.code === 'conversation-host-ineligible' && error.eligibility === 'unknown');
+    assert.equal((await rows(host.app, 'TurnIntent', { conversation_id: idle })).length, 0);
+    host.failProbe = false;
+
+    // 活动 Turn 冻结的默认工作环境在本窗口消失后，已持有归属也不代表可以执行。
     const started = await host.runner.input({ commandId: 'unbound-input', conversationId: unbound, text: '开始' });
     await provider.started;
-    const denied = await host.eligibility(unbound);
-    assert.deepEqual(denied, {
+    host.environments[0].available = false;
+    assert.deepEqual(await host.eligibility(unbound), {
       eligible: false, reason: 'work_environment_unavailable', turnId: started.turnId, workEnvironmentId: 'env-frozen'
     });
-    assert.equal(await host.app.database.conversationOwners.claimEligible(unbound), true,
-      '本窗口已持有的对话继续由本窗口推进');
+    assert.equal(host.owns(unbound), true, '正在本窗口运行的 Turn 仍由本窗口持有');
+    assert.equal(await owners.executionEligibility(unbound), 'ineligible');
+    assert.equal(await owners.tryClaimEligible(unbound), 'ineligible');
+    const intentsBefore = (await rows(host.app, 'TurnIntent', { conversation_id: unbound })).length;
+    await assert.rejects(host.runner.input({ commandId: 'unbound-input-2', conversationId: unbound, text: '再来' }),
+      (error) => error.code === 'conversation-host-ineligible');
+    assert.equal((await rows(host.app, 'TurnIntent', { conversation_id: unbound })).length, intentsBefore);
     host.environments[0].available = true;
     assert.deepEqual(await host.eligibility(unbound), { eligible: true });
     provider.release();
     await eventually(async () => (await rows(host.app, 'Turn', { id: started.turnId }))[0]?.status === 'terminated',
-      60_000, '显式输入的 Turn 未完成');
+      60_000, '已开始的 Turn 未完成');
+
+    // 认领之后原子复核：资格在检查与认领之间消失时，刚认领的归属立即交还，即使对话仍有工作。
+    const now = new Date().toISOString();
+    await host.app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Turn').insert({
+        id: 'turn-toctou', conversation_id: bound, status: 'active', created_at: now, updated_at: now, terminal_at: null
+      })
+    ]);
+    let probeCalls = 0;
+    owners.setClaimEligibilityProbe(async () => (probeCalls += 1) === 1);
+    assert.equal(await owners.tryClaimEligible(bound), 'ineligible');
+    assert.equal(host.owns(bound), false);
+    assert.equal(await ownerRecordExists(dataRoot, bound), false);
+    owners.setClaimEligibilityProbe(async (conversationId) => (await host.eligibility(conversationId)).eligible);
   } finally {
     await host?.close();
     await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('#1 不合格窗口的控制命令用完即交还：重命名后 P1 不再持有，P2 在 P1 存活时就能接上；P1 发新消息在写入前被拒绝（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('control-release');
+  let p2;
+  let child;
+  try {
+    const conversationId = 'conversation-control-release';
+    const turnId = await startTurnThenCloseHost(dataRoot, conversationId, PROJECT_TWO_FOLDER);
+    const files = workerFiles(outer, 'p1');
+    child = spawnWorker(dataRoot, 'control-p1', { ...files.env, LIMCODE_ELIGIBILITY_CONVERSATION: conversationId });
+    const p1 = await waitForWorkerJson(child, files.ready, 90_000);
+    assert.deepEqual(p1.report.ineligibleTurnIds, [turnId]);
+    assert.equal(p1.title, '改个名字', '控制命令在不合格窗口照常生效');
+    assert.equal(p1.ownsAfterRename, false, '不合格窗口做完控制命令立即交还');
+    assert.equal(p1.ownerRecordAfterRename, false);
+    assert.match(p1.inputRejection ?? '', /项目“项目二”.*未写入任何内容/);
+    assert.equal(p1.intentsAfter, p1.intentsBefore, '被拒绝的新消息不得写入');
+    assert.equal(p1.ownsAfterInput, false);
+
+    const provider = gatedProvider();
+    p2 = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'p2' });
+    await p2.app.recover();
+    const report = await p2.runner.recoverStartup();
+    assert.deepEqual(report.resumedTurnIds, [turnId], 'P1 仍存活时合格窗口即可接上');
+    assert.deepEqual(report.liveOwnedTurnIds, []);
+    await provider.started;
+    provider.release();
+    await eventually(async () => (await rows(p2.app, 'Turn', { id: turnId }))[0]?.status === 'terminated',
+      60_000, 'P2 接上后 Turn 未完成');
+
+    await fs.writeFile(files.finish, 'finish\n', 'utf8');
+    await waitForExit(child, 90_000, true);
+    const result = await readJson(files.result);
+    assert.equal(result.providerCalls, 0, 'P1 从未执行');
+    assert.equal(result.ownsAtFinish, false);
+    assert.deepEqual(result.runnerErrors, []);
+    assert.deepEqual(p2.runnerErrors, []);
+  } finally {
+    await p2?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('#2 在不合格窗口经真实命令路由回答提问：只记录回答并提示，Turn 由打开项目的窗口继续（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('answer');
+  let p2;
+  let child;
+  try {
+    const conversationId = 'conversation-answer';
+    const { turnId, requestId } = await startAskTurnThenCloseHost(dataRoot, conversationId, PROJECT_TWO_FOLDER);
+    const files = workerFiles(outer, 'p1');
+    child = spawnWorker(dataRoot, 'answer-p1', {
+      ...files.env,
+      LIMCODE_ELIGIBILITY_CONVERSATION: conversationId,
+      LIMCODE_ELIGIBILITY_TURN: turnId,
+      LIMCODE_ELIGIBILITY_REQUEST: requestId
+    });
+    const p1 = await waitForWorkerJson(child, files.ready, 90_000);
+    assert.deepEqual(p1.report.ineligibleTurnIds, [turnId]);
+    assert.deepEqual(p1.postedStatuses, ['committed'], '回答被持久记录');
+    assert.equal(p1.responses, 1);
+    assert.equal(p1.providerCalls, 0, '不合格窗口不得续跑');
+    assert.equal(p1.leaseOnP1, false, '执行租约不得落到不合格窗口');
+    assert.equal(p1.ownsAfterAnswer, false, '回答后立即交还');
+    assert.equal(p1.turnStatus, 'active');
+    assert.deepEqual(p1.informationMessages, [`${EXTENSION_BRAND}：回答已记录，将在打开项目“项目二”的窗口中继续执行。`]);
+
+    const provider = scriptedProvider([{ role: 'model', parts: [{ text: '已按回答继续。' }] }]);
+    p2 = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'p2', askUser: true });
+    await p2.app.recover();
+    const report = await p2.runner.recoverStartup();
+    assert.deepEqual(report.resumedTurnIds, [turnId]);
+    await eventually(async () => (await rows(p2.app, 'Turn', { id: turnId }))[0]?.status === 'terminated',
+      60_000, '打开项目的窗口未继续完成 Turn');
+    assert.equal(provider.calls, 1);
+    assert.deepEqual((await rows(p2.app, 'ToolCall', { turn_id: turnId })).map((row) => row.status), ['terminal']);
+
+    await fs.writeFile(files.finish, 'finish\n', 'utf8');
+    await waitForExit(child, 90_000, true);
+    const result = await readJson(files.result);
+    assert.equal(result.providerCalls, 0);
+    assert.deepEqual(result.runnerErrors, []);
+    assert.deepEqual(p2.runnerErrors, []);
+  } finally {
+    await p2?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('#3 没有合格窗口时：停止在不合格窗口生效、之后可以删除；孤儿 Turn 被收尾（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('stop');
+  let child;
+  let observer;
+  try {
+    const conversationId = 'conversation-stop';
+    const orphanConversationId = 'conversation-orphan';
+    const turnId = await startTurnThenCloseHost(dataRoot, conversationId, PROJECT_TWO_FOLDER);
+    observer = await kernel.ReliableKernelApplication.open(
+      new kernel.RootAuthority(() => dataRoot),
+      fixtureDependencies(gatedProvider(), null)
+    );
+    await createConversation(observer, orphanConversationId, PROJECT_TWO_FOLDER);
+    const now = new Date().toISOString();
+    await observer.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Turn').insert({
+        id: 'turn-orphan', conversation_id: orphanConversationId, status: 'active',
+        created_at: now, updated_at: now, terminal_at: null
+      })
+    ]);
+    await observer.close();
+    observer = undefined;
+
+    const files = workerFiles(outer, 'p1');
+    child = spawnWorker(dataRoot, 'stop-p1', {
+      ...files.env,
+      LIMCODE_ELIGIBILITY_CONVERSATION: conversationId,
+      LIMCODE_ELIGIBILITY_TURN: turnId
+    });
+    const p1 = await waitForWorkerJson(child, files.ready, 90_000);
+    assert.match(p1.deleteBeforeStop ?? '', /活动 Turn/);
+    assert.equal(p1.ownsAfterFailedDelete, false, '删除失败也不得让不合格窗口一直持有');
+    assert.equal(p1.turnAfterStop, 'terminated', '停止在不合格窗口立即生效');
+    assert.equal(p1.terminationStatus, 'interrupted');
+    assert.equal(p1.ownsAfterStop, false);
+    assert.deepEqual(p1.deleted, [conversationId], '停止之后可以删除');
+    assert.deepEqual(p1.report.finalizedTurnIds, ['turn-orphan'], '孤儿 Turn 在任何窗口都收尾');
+    assert.deepEqual(p1.report.ineligibleTurnIds, [turnId]);
+    assert.deepEqual(p1.orphanDeleted, [orphanConversationId]);
+    assert.equal(p1.ownsAfterDelete, false);
+    assert.equal(p1.providerCalls, 0, '控制类收尾不驱动 Provider');
+    await fs.writeFile(files.finish, 'finish\n', 'utf8');
+    await waitForExit(child, 90_000, true);
+    const result = await readJson(files.result);
+    assert.deepEqual(result.runnerErrors, []);
+
+    observer = await kernel.RuntimeDatabase.open(new kernel.RootAuthority(() => dataRoot), { hostBootId: 'stop-observer' });
+    assert.deepEqual(await rows(observer, 'Conversation', { id: conversationId }), []);
+    assert.deepEqual(await rows(observer, 'Conversation', { id: orphanConversationId }), []);
+    assert.equal(await ownerRecordExists(dataRoot, conversationId), false);
+  } finally {
+    if (observer) await observer.close().catch(() => undefined);
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('#4 资格探针暂时出错：候选保留并退避，恢复后在存活 owner 关闭时接上；出错写入诊断并限频（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('probe-backoff');
+  let waiter;
+  let child;
+  try {
+    const conversationId = 'conversation-probe-backoff';
+    const files = workerFiles(outer, 'origin');
+    child = spawnWorker(dataRoot, 'origin', { ...files.env, LIMCODE_ELIGIBILITY_CONVERSATION: conversationId });
+    const { turnId } = await waitForWorkerJson(child, files.ready, 90_000);
+
+    const provider = gatedProvider();
+    const diagnostics = recordingDiagnostics();
+    waiter = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'waiter', diagnostics });
+    await waiter.app.recover();
+    const report = await waiter.runner.recoverStartup();
+    assert.deepEqual(report.liveOwnedTurnIds, [turnId], '同项目存活 owner：交回延迟候选');
+
+    waiter.failProbe = true;
+    await sleep(2_500);
+    waiter.failProbe = false;
+    const failures = diagnostics.events.filter((event) => event.eventKind === 'eligibility.probe_failed');
+
+    await fs.writeFile(files.finish, 'close\n', 'utf8');
+    await waitForExit(child, 90_000, true);
+    await eventually(async () => provider.calls > 0, 30_000, '探针恢复后，owner 关闭时应当接上');
+    provider.release();
+    await eventually(async () => (await rows(waiter.app, 'Turn', { id: turnId }))[0]?.status === 'terminated',
+      60_000, 'Turn 未完成');
+    assert.deepEqual(waiter.runnerErrors, []);
+    assert.equal(failures.length, 1, '同一对话一分钟内只逐条记录一次');
+    assert.deepEqual(failures[0].metadata, { conversationId, reasonCode: 'probe_failed', errorName: 'TransientProbeError' });
+    assert.ok(diagnostics.samples.some((sample) => sample.dimensions?.reasonCode === 'probe_failed'));
+    assert.ok(diagnostics.samples.some((sample) => sample.dimensions?.reasonCode === 'eligible'));
+  } finally {
+    await waiter?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('#4 不合格 → 打开文件夹重扫 → 存活 owner 占用则交回延迟候选 → owner 关闭后很快接上（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('rescan-busy');
+  let waiter;
+  let child;
+  try {
+    const conversationId = 'conversation-rescan-busy';
+    const files = workerFiles(outer, 'origin');
+    child = spawnWorker(dataRoot, 'origin', { ...files.env, LIMCODE_ELIGIBILITY_CONVERSATION: conversationId });
+    const { turnId } = await waitForWorkerJson(child, files.ready, 90_000);
+
+    const provider = gatedProvider();
+    waiter = await openHost(dataRoot, provider, { folders: [PROJECT_ONE], label: 'waiter' });
+    await waiter.app.recover();
+    assert.deepEqual((await waiter.runner.recoverStartup()).ineligibleTurnIds, [turnId]);
+    waiter.folders.push(PROJECT_TWO);
+    const rescanned = await waiter.runner.rescan();
+    assert.deepEqual(rescanned.liveOwnedTurnIds, [turnId], '重扫遇到存活 owner');
+    assert.deepEqual(rescanned.ineligibleTurnIds, []);
+
+    const closedAt = Date.now();
+    await fs.writeFile(files.finish, 'close\n', 'utf8');
+    await waitForExit(child, 90_000, true);
+    await eventually(async () => provider.calls > 0, 20_000, 'owner 关闭后应由延迟候选接上');
+    assert.ok(Date.now() - closedAt < 20_000, '走的是 busy 候选，而不是 30 秒的不合格复查');
+    provider.release();
+    await eventually(async () => (await rows(waiter.app, 'Turn', { id: turnId }))[0]?.status === 'terminated',
+      60_000, 'Turn 未完成');
+    assert.deepEqual(waiter.runnerErrors, []);
+  } finally {
+    await waiter?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('资格判定写入诊断：按原因汇总，探针失败逐条记录并限频；面板显示可见原因', async () => {
+  const diagnostics = recordingDiagnostics();
+  let now = 1_000;
+  const decisions = new Map([
+    ['open', { eligible: true }],
+    ['elsewhere', { eligible: false, reason: 'project_not_open', projectUri: PROJECT_TWO, projectName: '项目二' }],
+    ['environment', { eligible: false, reason: 'work_environment_unavailable', turnId: 'turn', workEnvironmentId: 'env' }]
+  ]);
+  const probe = createDiagnosedConversationHostEligibility(async (conversationId) => {
+    if (conversationId === 'broken') throw Object.assign(new Error('AuthoritySnapshot 重复'), { name: 'CorruptFactError' });
+    return decisions.get(conversationId);
+  }, diagnostics, () => now);
+  for (const conversationId of decisions.keys()) await probe(conversationId);
+  await assert.rejects(probe('broken'), /AuthoritySnapshot 重复/);
+  await assert.rejects(probe('broken'), /AuthoritySnapshot 重复/);
+  now += 60_000;
+  await assert.rejects(probe('broken'), /AuthoritySnapshot 重复/);
+  assert.deepEqual(diagnostics.samples.map((sample) => [sample.eventKind, sample.scopeKind, sample.dimensions.reasonCode]), [
+    ['eligibility.decision', 'runtime', 'eligible'],
+    ['eligibility.decision', 'runtime', 'project_not_open'],
+    ['eligibility.decision', 'runtime', 'work_environment_unavailable'],
+    ['eligibility.decision', 'runtime', 'probe_failed'],
+    ['eligibility.decision', 'runtime', 'probe_failed'],
+    ['eligibility.decision', 'runtime', 'probe_failed']
+  ]);
+  const failures = diagnostics.events.filter((event) => event.eventKind === 'eligibility.probe_failed');
+  assert.equal(failures.length, 2, '同一对话 60 秒内只记一次');
+  assert.deepEqual(failures.map((event) => [event.scopeKind, event.scopeId]), [['conversation', 'broken'], ['conversation', 'broken']]);
+  assert.deepEqual(failures[0].metadata, { conversationId: 'broken', reasonCode: 'probe_failed', errorName: 'CorruptFactError' });
+
+  // 确定性数据损坏让所有窗口都"未知"：面板必须说出原因，而不是只写日志。
+  const view = await viewConversationHostEligibility(probe, 'broken');
+  assert.deepEqual(view, { eligible: false, reason: 'probe_failed', errorName: 'CorruptFactError', message: 'AuthoritySnapshot 重复' });
+  const { conversationRecoveryWaitingMessage } = require(compiled('vscode/panels/MainPanel.js'));
+  assert.equal(
+    conversationRecoveryWaitingMessage({ status: 'eligibility_unknown', message: conversationHostIneligibleMessage(view) }),
+    `${EXTENSION_BRAND}：无法确认当前窗口能否继续这个对话（AuthoritySnapshot 重复），因此不会在这里执行。`
+  );
+  assert.equal(
+    conversationRecoveryWaitingMessage({ status: 'waiting_for_project', projectName: '项目二' }),
+    `${EXTENSION_BRAND}：该对话属于项目“项目二”，未完成的任务会在打开该项目的窗口中继续执行。`
+  );
+  assert.equal(conversationRecoveryWaitingMessage({ status: 'checked' }), undefined);
+});
+
+test('文件修改审批：不合格窗口只记录决定，不派发修改、不续跑并提示；合格窗口照常派发并续跑', async () => {
+  for (const eligible of [false, true]) {
+    informationMessages.length = 0;
+    const calls = { decided: 0, dispatched: 0, resumed: 0 };
+    const router = new VscodeReliableKernelCommandRouter({
+      debugCapture: { setListener() {} },
+      toolHost: { setStateChangeListener() {} },
+      application: {
+        database: { conversationOwners: { async run(_conversationId, operation) { return operation(); } } },
+        files: {
+          async decide() {
+            calls.decided += 1;
+            return { won: true, preparedEffect: { effectIntentId: 'effect-edit' } };
+          }
+        },
+        fileMutations: { async dispatchRecordAndReconcile() { calls.dispatched += 1; } }
+      },
+      childAgents: { async resume() { return false; } },
+      conversations: { resume() { calls.resumed += 1; } },
+      async conversationHostEligibility() {
+        return eligible
+          ? { eligible: true }
+          : { eligible: false, reason: 'project_not_open', projectUri: PROJECT_TWO, projectName: '项目二' };
+      }
+    });
+    const requestRows = { approval: { id: 'approval', request_kind: 'file_change_approval', status: 'pending' } };
+    const lists = {
+      InteractionOwnerLink: [{ id: 'owner', request_id: 'approval', turn_id: 'turn' }],
+      InteractionToolCallLink: [{ id: 'link', request_id: 'approval', tool_call_id: 'edit-call' }],
+      FileChangeSet: [{ id: 'change-set', tool_call_id: 'edit-call' }]
+    };
+    router.maybeRow = async (domain, id) => domain === 'InteractionRequest' ? requestRows[id] : undefined;
+    router.list = async (domain, where) => (lists[domain] ?? [])
+      .filter((row) => Object.entries(where).every(([key, value]) => row[key] === value));
+    const posted = [];
+    await router.dispatch('approval-client', webview(posted), {
+      id: `approve-${eligible}`,
+      type: BridgeMessageType.InteractionResolve,
+      channel: 'command',
+      payload: {
+        conversationId: 'conversation', interactionRequestId: 'approval', interactionRevision: 1,
+        ownerTurnId: 'turn', decision: 'accept', response: {}
+      }
+    });
+    await sleep(50);
+    assert.equal(calls.decided, 1);
+    assert.deepEqual(posted.map((message) => message.payload.status), ['committed']);
+    if (eligible) {
+      assert.equal(calls.dispatched, 1);
+      assert.equal(calls.resumed, 1);
+      assert.deepEqual(informationMessages, []);
+    } else {
+      assert.equal(calls.dispatched, 0, '批准的文件修改留给打开项目的窗口派发');
+      assert.equal(calls.resumed, 0);
+      assert.deepEqual(informationMessages, [`${EXTENSION_BRAND}：回答已记录，将在打开项目“项目二”的窗口中继续执行。`]);
+    }
   }
 });
 
@@ -129,7 +548,7 @@ test('同项目两个窗口并发恢复只有一个承接，其它项目窗口�
   let observer;
   try {
     const conversationId = 'conversation-race';
-    const turnId = await startTurnThenCloseHost(dataRoot, conversationId, { uri: PROJECT_TWO, name: '项目二' });
+    const turnId = await startTurnThenCloseHost(dataRoot, conversationId, PROJECT_TWO_FOLDER);
     const go = path.join(outer, 'go');
     const gate = path.join(outer, 'gate');
     const finish = path.join(outer, 'finish');
@@ -146,7 +565,7 @@ test('同项目两个窗口并发恢复只有一个承接，其它项目窗口�
     for (const worker of workers) {
       children.push({
         worker,
-        child: spawnWorker(dataRoot, {
+        child: spawnWorker(dataRoot, 'recoverer', {
           LIMCODE_ELIGIBILITY_FOLDERS: JSON.stringify(worker.folders),
           LIMCODE_ELIGIBILITY_READY: worker.ready,
           LIMCODE_ELIGIBILITY_GO: go,
@@ -185,10 +604,7 @@ test('同项目两个窗口并发恢复只有一个承接，其它项目窗口�
     for (const result of Object.values(results)) assert.deepEqual(result.runnerErrors, []);
   } finally {
     if (observer) await observer.close().catch(() => undefined);
-    for (const { child } of children) {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      await waitForExit(child, 15_000).catch(() => undefined);
-    }
+    for (const { child } of children) await stopChild(child);
     await fs.rm(outer, { recursive: true, force: true });
   }
 });
@@ -271,8 +687,154 @@ test('审批与提问提示只在持有其 Turn 执行租约的窗口出现，�
 
 }
 
-async function runRecoveryWorker() {
+async function runWorker(mode) {
   const dataRoot = requiredEnv('LIMCODE_ELIGIBILITY_DATA_ROOT');
+  if (mode === 'recoverer') {
+    await runRecoveryWorker(dataRoot);
+    return;
+  }
+  const conversationId = requiredEnv('LIMCODE_ELIGIBILITY_CONVERSATION');
+  if (mode === 'origin') {
+    const provider = gatedProvider();
+    const host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'origin' });
+    try {
+      await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+      const started = await host.runner.input({ commandId: `input-${conversationId}`, conversationId, text: '开始' });
+      await provider.started;
+      await writeJson(requiredEnv('LIMCODE_ELIGIBILITY_READY'), { turnId: started.turnId });
+      await waitForFile(requiredEnv('LIMCODE_ELIGIBILITY_FINISH'), 300_000);
+    } finally {
+      await host.close();
+    }
+    return;
+  }
+  const provider = gatedProvider();
+  const host = await openHost(dataRoot, provider, { folders: [PROJECT_ONE], label: 'p1', askUser: mode === 'answer-p1' });
+  try {
+    await host.app.recover();
+    const report = await host.runner.recoverStartup();
+    let ready;
+    if (mode === 'control-p1') {
+      // VscodeReliableKernelApplicationFacade.renameConversationTitle
+      await host.app.database.conversationOwners.run(conversationId, () => host.app.database.transaction([
+        kernel.DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
+          title: '改个名字', updated_at: new Date().toISOString()
+        })
+      ]));
+      const ownsAfterRename = host.owns(conversationId);
+      const ownerRecordAfterRename = await ownerRecordExists(dataRoot, conversationId);
+      const intentsBefore = (await rows(host.app, 'TurnIntent', { conversation_id: conversationId })).length;
+      let inputRejection = null;
+      try {
+        await createRouter(host).dispatch('p1-client', webview([]), {
+          id: 'p1-input',
+          type: BridgeMessageType.TurnStart,
+          channel: 'command',
+          payload: {
+            conversationId,
+            command: { commandId: 'p1-input', expectedVersion: 0, issuedAt: Date.now() },
+            text: '在其它项目窗口发的新消息'
+          }
+        });
+      } catch (error) {
+        inputRejection = error instanceof Error ? error.message : String(error);
+      }
+      ready = {
+        report,
+        title: (await rows(host.app, 'Conversation', { id: conversationId }))[0]?.title,
+        ownsAfterRename,
+        ownerRecordAfterRename,
+        inputRejection,
+        intentsBefore,
+        intentsAfter: (await rows(host.app, 'TurnIntent', { conversation_id: conversationId })).length,
+        ownsAfterInput: host.owns(conversationId)
+      };
+    } else if (mode === 'answer-p1') {
+      const turnId = requiredEnv('LIMCODE_ELIGIBILITY_TURN');
+      const requestId = requiredEnv('LIMCODE_ELIGIBILITY_REQUEST');
+      const posted = [];
+      await createRouter(host).dispatch('p1-client', webview(posted), {
+        id: 'p1-answer',
+        type: BridgeMessageType.InteractionResolve,
+        channel: 'command',
+        payload: {
+          conversationId,
+          interactionRequestId: requestId,
+          interactionRevision: 1,
+          ownerTurnId: turnId,
+          decision: 'submit',
+          response: { answer: { selectedOptionIndexes: [0], customText: '' } }
+        }
+      });
+      // The router nudges the owner with setImmediate; give any (wrong) resume time to drive.
+      await sleep(1_500);
+      const lease = (await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0];
+      ready = {
+        report,
+        postedStatuses: posted
+          .filter((message) => message.type === BridgeMessageType.InteractionResult)
+          .map((message) => message.payload.status),
+        responses: (await rows(host.app, 'InteractionResponse', { request_id: requestId })).length,
+        informationMessages: [...informationMessages],
+        providerCalls: provider.calls,
+        ownsAfterAnswer: host.owns(conversationId),
+        leaseOnP1: lease?.host_boot_id === host.app.database.hostBootId,
+        turnStatus: (await rows(host.app, 'Turn', { id: turnId }))[0]?.status
+      };
+    } else if (mode === 'stop-p1') {
+      const turnId = requiredEnv('LIMCODE_ELIGIBILITY_TURN');
+      let deleteBeforeStop = null;
+      try {
+        await deleteConversation(host, conversationId);
+      } catch (error) {
+        deleteBeforeStop = error instanceof Error ? error.message : String(error);
+      }
+      const ownsAfterFailedDelete = host.owns(conversationId);
+      const lease = (await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0];
+      // VscodeReliableKernelApplicationFacade.abortConversation
+      await host.runner.interrupt({
+        commandId: 'p1-stop',
+        conversationId,
+        turnId,
+        expectedLeaseGeneration: String(lease.generation),
+        reason: '用户在其它项目窗口停止'
+      });
+      const turnAfterStop = (await rows(host.app, 'Turn', { id: turnId }))[0]?.status;
+      const termination = (await rows(host.app, 'TurnTermination', { turn_id: turnId }))[0];
+      const ownsAfterStop = host.owns(conversationId);
+      const deleted = await deleteConversation(host, conversationId)
+        .catch((error) => ({ deletedConversationIds: String(error?.message ?? error) }));
+      const orphanDeleted = await deleteConversation(host, 'conversation-orphan')
+        .catch((error) => ({ deletedConversationIds: String(error?.message ?? error) }));
+      ready = {
+        report,
+        deleteBeforeStop,
+        ownsAfterFailedDelete,
+        turnAfterStop,
+        terminationStatus: termination?.terminal_status,
+        ownsAfterStop,
+        deleted: deleted?.deletedConversationIds,
+        orphanDeleted: orphanDeleted?.deletedConversationIds,
+        ownsAfterDelete: host.owns(conversationId),
+        providerCalls: provider.calls
+      };
+    } else {
+      throw new Error(`Unknown eligibility worker ${mode}.`);
+    }
+    await writeJson(requiredEnv('LIMCODE_ELIGIBILITY_READY'), ready);
+    await waitForFile(requiredEnv('LIMCODE_ELIGIBILITY_FINISH'), 300_000);
+    await host.runner.waitForIdle();
+    await writeJson(requiredEnv('LIMCODE_ELIGIBILITY_RESULT'), {
+      providerCalls: provider.calls,
+      ownsAtFinish: host.owns(conversationId),
+      runnerErrors: host.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error))
+    });
+  } finally {
+    await host.close();
+  }
+}
+
+async function runRecoveryWorker(dataRoot) {
   const gatePath = requiredEnv('LIMCODE_ELIGIBILITY_GATE');
   let providerCalls = 0;
   const provider = {
@@ -304,6 +866,25 @@ async function runRecoveryWorker() {
   }
 }
 
+/** VscodeReliableKernelApplicationFacade.deleteConversation */
+function deleteConversation(host, conversationId) {
+  return host.app.database.conversationOwners.run(conversationId, () =>
+    host.app.conversationDeletion.delete(conversationId));
+}
+
+/** The production router over this Host's real application and Runner. */
+function createRouter(host) {
+  return new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
+    toolHost: { setStateChangeListener() {} },
+    application: host.app,
+    conversations: host.runner,
+    childAgents: { async resume() { return false; } },
+    async ensureCapabilitiesReady() {},
+    conversationHostEligibility: (conversationId) => viewConversationHostEligibility(host.eligibility, conversationId)
+  });
+}
+
 /** Starts a Turn in a window serving `project`, waits for its lease, then closes that window. */
 async function startTurnThenCloseHost(dataRoot, conversationId, project) {
   const provider = gatedProvider();
@@ -320,25 +901,57 @@ async function startTurnThenCloseHost(dataRoot, conversationId, project) {
   }
 }
 
+/** Starts a Turn whose model asks the user a question, waits for the question, then closes that window. */
+async function startAskTurnThenCloseHost(dataRoot, conversationId, project) {
+  const provider = scriptedProvider([{
+    role: 'model',
+    parts: [{
+      id: 'provider-ask-call',
+      functionCall: { name: 'ask_user', args: { question: '继续吗？', options: [{ label: '继续' }, { label: '停止' }] } }
+    }]
+  }]);
+  const origin = await openHost(dataRoot, provider, { folders: [project.uri], label: 'origin-window', askUser: true });
+  try {
+    await createConversation(origin.app, conversationId, project);
+    const started = await origin.runner.input({ commandId: `input-${conversationId}`, conversationId, text: '问我一个问题' });
+    await eventually(async () => (await rows(origin.app, 'InteractionRequest', {
+      request_kind: 'ask_user',
+      status: 'pending'
+    })).length === 1, 30_000, '提问未进入等待');
+    await origin.runner.waitForIdle();
+    const request = (await rows(origin.app, 'InteractionRequest', { request_kind: 'ask_user', status: 'pending' }))[0];
+    return { turnId: started.turnId, requestId: String(request.id) };
+  } finally {
+    await origin.close();
+  }
+}
+
 async function openHost(dataRoot, provider, options) {
   const folders = [...options.folders];
   const environments = (options.environments ?? []).map((environment) => ({ ...environment }));
   const app = await kernel.ReliableKernelApplication.open(
     new kernel.RootAuthority(() => dataRoot),
-    fixtureDependencies(provider, options.defaultWorkEnvironmentId ?? null)
+    fixtureDependencies(provider, options.defaultWorkEnvironmentId ?? null, { askUser: options.askUser === true })
   );
   const runnerErrors = [];
   const runner = new ReliableConversationRunner(
     app,
     `${options.label}:${app.database.hostBootId}`,
-    (error, context) => runnerErrors.push({ error, context })
+    (error, context) => runnerErrors.push({ error, context }),
+    undefined,
+    options.diagnostics
   );
-  const eligibility = (conversationId) => evaluateConversationHostEligibility({
-    database: app.database,
-    contentStore: app.contentStore,
-    workspaceFolderUris: () => folders,
-    workEnvironments: async () => environments
-  }, conversationId);
+  let failProbe = false;
+  // Same wiring as VscodeReliableKernelProductRuntime: the diagnosed decision is the claim probe.
+  const eligibility = createDiagnosedConversationHostEligibility(async (conversationId) => {
+    if (failProbe) throw Object.assign(new Error('工作环境目录暂时读取失败'), { name: 'TransientProbeError' });
+    return evaluateConversationHostEligibility({
+      database: app.database,
+      contentStore: app.contentStore,
+      workspaceFolderUris: () => folders,
+      workEnvironments: async () => environments
+    }, conversationId);
+  }, options.diagnostics);
   app.database.conversationOwners.setClaimEligibilityProbe(async (conversationId) =>
     (await eligibility(conversationId)).eligible);
   let closed = false;
@@ -349,6 +962,8 @@ async function openHost(dataRoot, provider, options) {
     folders,
     environments,
     eligibility,
+    get failProbe() { return failProbe; },
+    set failProbe(value) { failProbe = value; },
     owns: (conversationId) => app.database.conversationOwners.owns(conversationId),
     async close() {
       if (closed) return;
@@ -373,6 +988,17 @@ async function createConversation(app, conversationId, project) {
     }),
     ...(project ? projectFolderAssignmentSteps({ conversationId, folder: project, now }) : [])
   ]);
+}
+
+function recordingDiagnostics() {
+  const events = [];
+  const samples = [];
+  return {
+    events,
+    samples,
+    observe(event) { events.push(event); },
+    aggregate(sample) { samples.push(sample); }
+  };
 }
 
 function gatedProvider() {
@@ -407,7 +1033,21 @@ function gatedProvider() {
   };
 }
 
-function fixtureDependencies(provider, defaultWorkEnvironmentId) {
+function scriptedProvider(replies) {
+  let calls = 0;
+  return {
+    providerId: PROVIDER_ID,
+    get calls() { return calls; },
+    async sendFullRequest(_request, controls) {
+      calls += 1;
+      const content = replies[calls - 1];
+      if (!content) throw new Error(`Unexpected Provider call ${calls}.`);
+      await controls.onEvent({ kind: 'completed', streamSeq: '1', content });
+    }
+  };
+}
+
+function fixtureDependencies(provider, defaultWorkEnvironmentId, tools = {}) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -434,7 +1074,14 @@ function fixtureDependencies(provider, defaultWorkEnvironmentId) {
                 contextWindowTokens: 128_000,
                 tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
               },
-              toolPolicy: { id: 'eligibility-tools', allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {} },
+              toolPolicy: {
+                id: 'eligibility-tools',
+                allowedTools: tools.askUser ? ['ask_user'] : [],
+                preset: 'custom',
+                toolConfigs: {},
+                sourceConfigs: {}
+              },
+              planReviewPolicy: { mode: 'optional' },
               systemPrompt: { id: 'eligibility-prompt', text: '' },
               runtimeContext: { id: null, name: '', template: '' },
               workEnvironmentPolicy: {
@@ -478,7 +1125,7 @@ function fixtureDependencies(provider, defaultWorkEnvironmentId) {
         mcp,
         interactions,
         host: {
-          definitions() { return []; },
+          definitions() { return tools.askUser ? [askUserTool] : []; },
           async cancelTurnWaits() {},
           async dispose() {}
         }
@@ -508,29 +1155,68 @@ async function rows(appOrDatabase, domain, where = {}) {
   }))).snapshot;
 }
 
-function spawnWorker(dataRoot, environment) {
-  return childProcess.spawn(process.execPath, [TEST_FILE], {
+function workerFiles(outer, name) {
+  const files = {
+    ready: path.join(outer, `${name}-ready.json`),
+    finish: path.join(outer, `${name}-finish`),
+    result: path.join(outer, `${name}-result.json`)
+  };
+  return {
+    ...files,
+    env: {
+      LIMCODE_ELIGIBILITY_READY: files.ready,
+      LIMCODE_ELIGIBILITY_FINISH: files.finish,
+      LIMCODE_ELIGIBILITY_RESULT: files.result
+    }
+  };
+}
+
+function spawnWorker(dataRoot, mode, environment) {
+  const child = childProcess.spawn(process.execPath, [TEST_FILE], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       ...environment,
-      LIMCODE_ELIGIBILITY_WORKER: 'recoverer',
+      LIMCODE_ELIGIBILITY_WORKER: mode,
       LIMCODE_ELIGIBILITY_DATA_ROOT: dataRoot
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
   });
+  child.output = { stdout: '', stderr: '' };
+  child.stdout.on('data', (chunk) => { child.output.stdout += chunk; });
+  child.stderr.on('data', (chunk) => { child.output.stderr += chunk; });
+  return child;
+}
+
+/** Waits for a worker's JSON file, failing at once (with its output) if the worker exits first. */
+async function waitForWorkerJson(child, filePath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return await readJson(filePath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`eligibility worker exited before ${path.basename(filePath)} (code=${child.exitCode})\n${child.output.stdout}\n${child.output.stderr}`);
+    }
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${filePath}`);
+    await sleep(20);
+  }
+}
+
+async function stopChild(child) {
+  if (!child) return;
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  await waitForExit(child, 15_000).catch(() => undefined);
 }
 
 function waitForExit(child, timeoutMs, rejectNonZero = false) {
   return new Promise((resolve, reject) => {
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (chunk) => { stdout += chunk; });
-    child.stderr?.on('data', (chunk) => { stderr += chunk; });
     const settle = (code, signal) => {
       if (rejectNonZero && code !== 0) {
-        reject(new Error(`eligibility worker failed (code=${code}, signal=${signal})\n${stdout}\n${stderr}`));
+        reject(new Error(`eligibility worker failed (code=${code}, signal=${signal})\n${child.output?.stdout ?? ''}\n${child.output?.stderr ?? ''}`));
       } else {
         resolve({ code, signal });
       }
@@ -541,13 +1227,22 @@ function waitForExit(child, timeoutMs, rejectNonZero = false) {
     }
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error(`eligibility worker timed out after ${timeoutMs}ms\n${stdout}\n${stderr}`));
+      reject(new Error(`eligibility worker timed out after ${timeoutMs}ms\n${child.output?.stdout ?? ''}\n${child.output?.stderr ?? ''}`));
     }, timeoutMs);
     child.once('exit', (code, signal) => {
       clearTimeout(timer);
       settle(code, signal);
     });
   });
+}
+
+function webview(posted) {
+  return {
+    async postMessage(message) {
+      posted.push(message);
+      return true;
+    }
+  };
 }
 
 async function waitForFile(filePath, timeoutMs) {

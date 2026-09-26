@@ -493,6 +493,23 @@ export class ReliableAgentLoop {
   }
 
   /** Safe for explicit recovery/re-entry; every round and output identity is deterministic. */
+  /**
+   * Control-only settlement of a durable stop request, for a window that must not execute the
+   * Conversation: it opens the same Context boundary as drive() and records the pending interrupt
+   * as the Turn's terminal state. It never dispatches the Provider or runs a tool; durable waits
+   * are cancelled and non-terminal ModelRequests are closed as cancelled. Returns false when no
+   * termination request is pending.
+   */
+  public async terminateRequested(turnIdInput: string): Promise<boolean> {
+    const turnId = requireId(turnIdInput, 'turnId');
+    const turn = await this.requireExisting('Turn', turnId);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    await this.database.conversationOwners.assertOwned(conversationId);
+    if (turn.status !== 'active') return turn.status === 'terminated';
+    await this.openEmptyContextWithDeliveredInput(turnId);
+    return this.terminateIfRequested(turnId, 'control-settlement');
+  }
+
   public async drive(turnIdInput: string): Promise<ReliableAgentLoopResult> {
     const turnId = requireId(turnIdInput, 'turnId');
     const modelRequestIds: string[] = [];

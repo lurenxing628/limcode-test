@@ -55,6 +55,13 @@ import type { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelP
 import { readVscodeSshWorkEnvironments } from './VscodeSshConfigurationReader';
 import { applyProxyEnvironment, currentProxyEnvironment, proxyForShellAndMcp } from './proxyEnvironment';
 import { GlobalSettingsSaveBarrier } from './GlobalSettingsSaveBarrier';
+import {
+  conversationAnswerRecordedMessage,
+  conversationHostIneligibleMessage,
+  type ConversationHostEligibilityView
+} from './conversationHostEligibility';
+import { ConversationHostIneligibleError } from '../../reliableKernel/ConversationRuntimeOwnerManager';
+import { EXTENSION_BRAND } from '../../../shared/extensionIdentity';
 
 export interface VscodeReliableKernelCommandRouterOptions {
   broadcast?(message: ExtensionToWebviewMessage): void;
@@ -203,6 +210,26 @@ export class VscodeReliableKernelCommandRouter {
    */
   private runConversationCommand<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
     return this.product.application.database.conversationOwners.run(conversationId, operation);
+  }
+
+  /** Whether this window executes the Conversation; undefined when the runtime cannot say (tests). */
+  private conversationHostEligibility(conversationId: string): Promise<ConversationHostEligibilityView | undefined> {
+    return Promise.resolve(this.product.conversationHostEligibility?.(conversationId));
+  }
+
+  /**
+   * New input, retry, edit-and-run and compression execute the Conversation. A window that does not
+   * serve it rejects them before anything is written: no existing durable fact could hold such
+   * input for another window, so the user is told where to continue instead.
+   */
+  private async requireExecutionHost(conversationId: string): Promise<void> {
+    const view = await this.conversationHostEligibility(conversationId);
+    if (!view || view.eligible) return;
+    throw new ConversationHostIneligibleError(
+      conversationId,
+      view.reason === 'probe_failed' ? 'unknown' : 'ineligible',
+      `${conversationHostIneligibleMessage(view)}未写入任何内容。`
+    );
   }
 
   /** 文件监听器发现其他 Extension Host 已提交设置后，重新读盘并广播。 */
@@ -1187,6 +1214,7 @@ export class VscodeReliableKernelCommandRouter {
     requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue,
     payload: TurnStartPayload
   ): Promise<void> {
+    await this.requireExecutionHost(payload.conversationId);
     await this.runConversationCommand(payload.conversationId, () =>
       this.handleTurnInputUnderOwnership(webview, correlationId, requestType, payload));
   }
@@ -1492,6 +1520,7 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: MessageEditPayload
   ): Promise<void> {
+    if (payload.runAfterEdit) await this.requireExecutionHost(payload.conversationId);
     await this.runConversationCommand(payload.conversationId, () =>
       this.handleMessageEditUnderOwnership(webview, correlationId, payload));
   }
@@ -1610,6 +1639,7 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: MessageRetryFromPayload
   ): Promise<void> {
+    await this.requireExecutionHost(payload.conversationId);
     await this.runConversationCommand(payload.conversationId, () =>
       this.handleMessageRetryUnderOwnership(webview, correlationId, payload));
   }
@@ -1701,6 +1731,7 @@ export class VscodeReliableKernelCommandRouter {
     payload: CompressionStartPayload
   ): Promise<void> {
     const conversationId = requireText(payload.conversationId, 'conversationId');
+    await this.requireExecutionHost(conversationId);
     await this.runConversationCommand(conversationId, () =>
       this.handleCompressionStartUnderOwnership(webview, correlationId, payload, conversationId));
   }
@@ -1926,7 +1957,11 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string | undefined,
     payload: InteractionResolvePayload
   ): Promise<void> {
+    // Recording the answer is control and works in any window; continuing the Turn (and applying
+    // an approved file change) is execution, which only the window serving the Conversation does.
+    let hostView: ConversationHostEligibilityView | undefined;
     const { requestKind, won } = await this.runConversationCommand(payload.conversationId, async () => {
+      hostView = await this.conversationHostEligibility(payload.conversationId);
       const request = await this.requireRow('InteractionRequest', payload.interactionRequestId);
       const owner = (await this.list('InteractionOwnerLink', { request_id: payload.interactionRequestId }, 2))[0];
       const toolLink = (await this.list('InteractionToolCallLink', { request_id: payload.interactionRequestId }, 2))[0];
@@ -1955,7 +1990,7 @@ export class VscodeReliableKernelCommandRouter {
               : 'rejected',
           response: payload.response
         });
-        if (result.preparedEffect) {
+        if (result.preparedEffect && hostView?.eligible !== false) {
           await this.product.application.fileMutations.dispatchRecordAndReconcile(result.preparedEffect.effectIntentId);
         }
         return { requestKind: String(request.request_kind), won: result.won };
@@ -1996,6 +2031,11 @@ export class VscodeReliableKernelCommandRouter {
         status: won ? 'committed' : 'already_resolved'
       }
     });
+    const recordedHere = hostView as ConversationHostEligibilityView | undefined;
+    if (recordedHere && !recordedHere.eligible) {
+      if (won) void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${conversationAnswerRecordedMessage(recordedHere)}`);
+      return;
+    }
     // Durable first-response-wins resolution is already committed. A slow child lookup or Agent
     // resume must not hold the Webview button receipt hostage; startup recovery/local DB wake remains
     // the execution safety net if this best-effort nudge fails.

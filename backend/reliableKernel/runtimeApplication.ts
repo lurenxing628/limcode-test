@@ -579,7 +579,9 @@ export class ReliableKernelApplication {
       return;
     }
     const owners = this.database.conversationOwners;
-    if (!owners.owns(conversationId)) return;
+    // A control command may hold the owner in a window that does not serve the conversation; only
+    // the Host that executes it dispatches its effects.
+    if (!owners.owns(conversationId) || await owners.executionEligibility(conversationId) !== 'eligible') return;
     await owners.run(conversationId, async () => { await operation(); });
   }
 

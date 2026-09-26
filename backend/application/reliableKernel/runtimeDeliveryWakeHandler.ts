@@ -31,6 +31,11 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
       if (acknowledged.changed) dependencies.notify?.(request);
       return { acknowledged: true };
     }
+    // Everything below executes the Conversation. A Host that does not serve it leaves the durable
+    // delivery pending for the Host that does.
+    if (await application.database.conversationOwners.executionEligibility(request.conversationId) !== 'eligible') {
+      return { acknowledged: false };
+    }
     await dependencies.ready?.();
     if (request.action === 'resume_current_turn') {
       if (!request.targetTurnId) return { acknowledged: false };

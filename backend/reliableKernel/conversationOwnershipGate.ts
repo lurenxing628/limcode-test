@@ -8,7 +8,7 @@ import type { RuntimeDatabase } from './runtimeDatabase';
  * How a background scan may obtain conversation ownership:
  * - `claim`: explicit startup/recovery may claim unowned work this host is eligible to run (fail
  *   closed for live/unknown peers and for conversations whose project this host does not serve);
- * - `owned`: recurring convergence only touches conversations this host already owns.
+ * - `owned`: recurring convergence only touches conversations this host already owns and serves.
  */
 export type ConversationOwnershipAcquisition = 'claim' | 'owned';
 
@@ -75,7 +75,9 @@ export class ConversationOwnershipGate {
 
   private async resolve(conversationId: string): Promise<boolean> {
     const owners = this.database.conversationOwners;
-    if (owners.owns(conversationId)) return true;
+    // Background scans execute effects, so holding the owner record (a control command may hold it
+    // briefly in any window) is not enough: this Host must also serve the conversation.
+    if (owners.owns(conversationId)) return await owners.executionEligibility(conversationId) === 'eligible';
     if (this.acquisition === 'owned') return false;
     try {
       // An ineligible conversation stays unclaimed for the Host that serves its project.

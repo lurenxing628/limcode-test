@@ -31,12 +31,15 @@ export interface ConversationForkResult {
 
 /**
  * Outcome of the opportunistic takeover a passive view attempts. The waiting variants mean the
- * Conversation still has unfinished work that this window does not serve, so it stayed untouched.
+ * Conversation still has unfinished work that this window does not serve: only control-only facts
+ * were settled here. `eligibility_unknown` means this window could not establish whether it serves
+ * the Conversation (for example damaged placement facts), so it executes nothing and says why.
  */
 export type ConversationRecoveryResult =
   | { status: 'checked' }
   | { status: 'waiting_for_project'; projectName: string }
-  | { status: 'waiting_for_work_environment'; workEnvironmentId: string };
+  | { status: 'waiting_for_work_environment'; workEnvironmentId: string }
+  | { status: 'eligibility_unknown'; message: string };
 
 /**
  * A Conversation this window just created, forked or sent input to. The sidebar returns to the first

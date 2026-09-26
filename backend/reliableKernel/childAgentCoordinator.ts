@@ -425,15 +425,16 @@ export class ReliableChildAgentCoordinator {
     if (turn) {
       const owners = this.dependencies.database.conversationOwners;
       const turnConversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
-      let eligible = owners.owns(turnConversationId);
-      if (!eligible) {
-        try {
-          eligible = await owners.tryClaim(turnConversationId);
-        } catch (error) {
-          if (!isConversationRuntimeOwnerBusyError(error)) {
-            this.reportError(error, 'resume-ownership-claim', turnId);
-          }
-          eligible = false;
+      // Holding the owner is not enough: a control command may hold it in a window that does not
+      // serve the child's project; only the Host that serves it drives the child Turn.
+      let eligible = false;
+      try {
+        eligible = owners.owns(turnConversationId)
+          ? await owners.executionEligibility(turnConversationId) === 'eligible'
+          : await owners.tryClaimEligible(turnConversationId) === 'owned';
+      } catch (error) {
+        if (!isConversationRuntimeOwnerBusyError(error)) {
+          this.reportError(error, 'resume-ownership-claim', turnId);
         }
       }
       if (!eligible) return false;
@@ -1764,15 +1765,14 @@ export class ReliableChildAgentCoordinator {
       'ChildExecution.child_conversation_id'
     );
     const owners = this.dependencies.database.conversationOwners;
-    let drivesChild = owners.owns(childConversationId);
-    if (!drivesChild) {
-      try {
-        drivesChild = await owners.tryClaim(childConversationId);
-      } catch (error) {
-        if (!isConversationRuntimeOwnerBusyError(error)) {
-          console.warn('[reliable-kernel] Child conversation ownership claim failed closed.', childConversationId, error);
-        }
-        drivesChild = false;
+    let drivesChild = false;
+    try {
+      drivesChild = owners.owns(childConversationId)
+        ? await owners.executionEligibility(childConversationId) === 'eligible'
+        : await owners.tryClaimEligible(childConversationId) === 'owned';
+    } catch (error) {
+      if (!isConversationRuntimeOwnerBusyError(error)) {
+        console.warn('[reliable-kernel] Child conversation ownership claim failed closed.', childConversationId, error);
       }
     }
     if (drivesChild) {

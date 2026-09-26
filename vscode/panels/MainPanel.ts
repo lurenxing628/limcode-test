@@ -721,12 +721,13 @@ function isWideCharacter(char: string): boolean {
 }
 
 /** Explains why a window left another project's unfinished task untouched; undefined when nothing waits. */
-function conversationRecoveryWaitingMessage(result: ConversationRecoveryResult | undefined): string | undefined {
+export function conversationRecoveryWaitingMessage(result: ConversationRecoveryResult | undefined): string | undefined {
   if (result?.status === 'waiting_for_project') {
     return `${EXTENSION_BRAND}：该对话属于项目“${result.projectName}”，未完成的任务会在打开该项目的窗口中继续执行。`;
   }
   if (result?.status === 'waiting_for_work_environment') {
     return `${EXTENSION_BRAND}：该对话冻结的工作环境在当前窗口不可用，未完成的任务会在打开该工作环境的窗口中继续执行。`;
   }
+  if (result?.status === 'eligibility_unknown') return `${EXTENSION_BRAND}：${result.message}`;
   return undefined;
 }
