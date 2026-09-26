@@ -1,26 +1,15 @@
-import type Database from 'better-sqlite3';
 import * as fs from 'node:fs/promises';
-import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths, type RootBinding } from './contracts';
-import { assertCurrentSchema } from './databaseSchema';
-import { assertPublishedPreviousRuntimeEpochSnapshot } from './runtimeEpochMigration';
-import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
-import { createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
-import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
+import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths } from './contracts';
+import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
+import { readRuntimeDataSetFacts, runtimeDataSetFileState } from './runtimeDataSetFacts';
 import type { VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
+
+export type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 
 /** Why a data set cannot be opened or merged as it is; `code` is stable for records. */
 export interface RuntimeDataSetPreflightProblem {
   code: string;
   message: string;
-}
-
-/** Human-facing facts of one data set, for choosing between data sets without reading UUIDs. */
-export interface RuntimeDataSetSummary {
-  /** Project folder names recorded in the data set, most conversations first. */
-  projectNames: string[];
-  conversationCount: number;
-  /** Latest Conversation.updated_at, when any conversation exists. */
-  lastActivityAt?: string;
 }
 
 /**
@@ -44,18 +33,7 @@ export async function preflightRuntimeDataSet(
     return undefined;
   }
   try {
-    const binding = await requireCompleteRuntimeDataSet(candidate);
-    const snapshot = await createRuntimeDataSetDatabaseSnapshot(candidate, binding);
-    try {
-      if (binding.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
-        assertCurrentSchema(snapshot.database, binding as RootBinding);
-        assertRuntimePhysicalSchemaFingerprint(snapshot.database, RUNTIME_DOMAIN_SCHEMAS);
-      } else {
-        await assertPublishedPreviousRuntimeEpochSnapshot(snapshot.database, binding);
-      }
-    } finally {
-      await snapshot.close();
-    }
+    await readRuntimeDataSetFacts(candidate, { openable: true });
   } catch (error) {
     return {
       code: typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : 'runtime-data-set-preflight-failed',
@@ -66,49 +44,27 @@ export async function preflightRuntimeDataSet(
 }
 
 /**
- * Names, conversation count and last activity of a data set from a private snapshot copy. Older
- * formats without project links still report counts. Same POSIX lock rule as the preflight.
+ * Names, conversation count and last activity of a data set, read in the facts worker from a
+ * private copy and kept per exact file state for this process, so opening a picker again reads
+ * nothing. Undefined for a data set without data; a failed read rejects. Same POSIX lock rule as
+ * the preflight.
  */
 export async function summarizeRuntimeDataSet(candidate: VscodeRuntimeDataSetCandidate): Promise<RuntimeDataSetSummary | undefined> {
   if (!candidate.dataSetId) return undefined;
-  try {
-    const binding = await requireCompleteRuntimeDataSet(candidate);
-    const snapshot = await createRuntimeDataSetDatabaseSnapshot(candidate, binding);
-    try {
-      return readSummary(snapshot.database);
-    } finally {
-      await snapshot.close();
-    }
-  } catch {
-    return undefined;
+  const databasePath = createRuntimeRootPaths(candidate.runtimeDataRootPath).databasePath;
+  const files = await runtimeDataSetFileState(databasePath);
+  const key = `${candidate.dataSetId}\0${candidate.rootInstanceId ?? ''}\0${files}`;
+  const known = summaries.get(candidate.runtimeDataRootPath);
+  if (known?.key === key) return known.summary;
+  const facts = await readRuntimeDataSetFacts(candidate, { summary: true });
+  // Kept only when nothing moved while the copy was taken.
+  if (await runtimeDataSetFileState(databasePath).catch(() => undefined) === files) {
+    summaries.set(candidate.runtimeDataRootPath, { key, summary: facts.summary! });
   }
+  return facts.summary;
 }
 
-export function readSummary(database: Database.Database): RuntimeDataSetSummary {
-  const conversations = database.prepare(
-    'SELECT COUNT(*) AS count, MAX(updated_at) AS last FROM conversation'
-  ).get() as { count: bigint | number; last: string | null };
-  let projectNames: string[] = [];
-  if (hasTable(database, 'project_context') && hasTable(database, 'conversation_project_link')) {
-    projectNames = (database.prepare(`
-      SELECT project.name AS name, COUNT(link.id) AS uses
-        FROM project_context AS project
-        LEFT JOIN conversation_project_link AS link ON link.project_context_id = project.id
-       GROUP BY project.id
-       ORDER BY uses DESC, project.name ASC
-       LIMIT 3
-    `).all() as Array<{ name: string }>).map((row) => row.name).filter((name) => typeof name === 'string' && name.length > 0);
-  }
-  return {
-    projectNames,
-    conversationCount: Number(conversations.count),
-    ...(conversations.last ? { lastActivityAt: conversations.last } : {})
-  };
-}
-
-function hasTable(database: Database.Database, table: string): boolean {
-  return database.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table) !== undefined;
-}
+const summaries = new Map<string, { key: string; summary: RuntimeDataSetSummary }>();
 
 async function pathExists(file: string): Promise<boolean> {
   try {

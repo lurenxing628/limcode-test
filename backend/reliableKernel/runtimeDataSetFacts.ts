@@ -1,3 +1,5 @@
+import type { BigIntStats } from 'node:fs';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { HistoricalRootBinding } from './rootAuthority';
@@ -61,6 +63,16 @@ export async function readRuntimeDataSetFacts(
   } finally {
     await copy.remove();
   }
+}
+
+/** Exact state of a database and its WAL file: any rewrite, copy or restore changes it. */
+export async function runtimeDataSetFileState(databasePath: string): Promise<string> {
+  const describe = (stat: BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  const database = describe(await fs.stat(databasePath, { bigint: true }));
+  let wal = 'absent';
+  try { wal = describe(await fs.stat(`${databasePath}-wal`, { bigint: true })); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  return `db=${database};wal=${wal}`;
 }
 
 function runWorker(data: RuntimeDataSetFactsWorkerData): Promise<Omit<RuntimeDataSetFacts, 'binding'>> {

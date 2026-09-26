@@ -131,10 +131,11 @@ async function chooseDataSet(
   mergeStates: ReadonlyMap<string, RuntimeDataSetMergeState> = new Map(),
   options: { summarizeSelected?: boolean } = {}
 ) {
-  const summaries = new Map<string, RuntimeDataSetSummary>();
+  // Read in a worker from private copies, one data set at a time, kept per file state.
+  const summaries = new Map<string, RuntimeDataSetSummary | 'unreadable'>();
   for (const candidate of candidates) {
     if (candidate.selected && !options.summarizeSelected) continue;
-    const summary = await summarizeRuntimeDataSet(candidate).catch(() => undefined);
+    const summary = await summarizeRuntimeDataSet(candidate).catch(() => 'unreadable' as const);
     if (summary) summaries.set(candidate.id, summary);
   }
   // A startup preflight rejection names a candidate: shown on that candidate, still choosable.
@@ -143,13 +144,18 @@ async function chooseDataSet(
   const items: Array<vscode.QuickPickItem & { candidate?: VscodeRuntimeDataSetCandidate; problem?: VscodeRuntimeDataSetProblem }> = [
     ...candidates.map(candidate => {
       const merge = mergeStates.get(candidate.id);
-      const summary = summaries.get(candidate.id);
+      const read = summaries.get(candidate.id);
+      const summary = read === 'unreadable' ? undefined : read;
       const rejected = candidateProblems.get(candidate.id);
       const message = rejected ? `\n打开前检查未通过：${rejected.message}`
         : merge?.state === 'blocked' || merge?.state === 'failed' ? `\n${merge.message}` : '';
       return {
         label: dataSetLabel(candidate, merge, summary),
-        description: [rejected ? '暂时无法自动打开' : '', dataSetFacts(candidate, summary)].filter(Boolean).join(' · '),
+        description: [
+          rejected ? '暂时无法自动打开' : '',
+          read === 'unreadable' ? '对话数和最后活动读取失败（只是没读到，库没有被改动）' : '',
+          dataSetFacts(candidate, summary)
+        ].filter(Boolean).join(' · '),
         detail: `${candidate.runtimeDataRootPath}${message}`, candidate
       };
     }),

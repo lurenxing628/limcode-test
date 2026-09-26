@@ -12,6 +12,17 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const compiled = process.env.LIMCODE_TEST_EXTENSION_ROOT
   ? path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT) : path.resolve('dist/extension');
+// Counts SQLite connections opened on this (the extension host's) thread; worker threads load their own copy.
+const sqlite = require.resolve('better-sqlite3');
+const RealDatabase = require(sqlite);
+let mainThreadOpens = 0;
+function CountingDatabase(...args) {
+  mainThreadOpens += 1;
+  return new RealDatabase(...args);
+}
+Object.setPrototypeOf(CountingDatabase, RealDatabase);
+CountingDatabase.prototype = RealDatabase.prototype;
+require.cache[sqlite].exports = CountingDatabase;
 const kernelFile = (file) => require(path.join(compiled, 'backend/reliableKernel', file));
 const kernel = kernelFile('index.js');
 const { RootAuthority } = kernelFile('rootAuthority.js');
@@ -20,6 +31,7 @@ const {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
 const { runtimeDataSetFingerprint } = kernelFile('runtimeDataSetMergeLedger.js');
+const { preflightRuntimeDataSet, summarizeRuntimeDataSet } = kernelFile('runtimeDataSetPreflight.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
@@ -209,6 +221,44 @@ test('内容指纹按确切文件状态缓存：文件没动时不再复制读�
   const now = new Date();
   await fs.utimes(fixture.alpha.binding.paths.databasePath, now, now);
   assert.equal((await runtimeDataSetFingerprint(candidate)).contentDigest, first.contentDigest, '文件状态变了就重新计算，内容相同摘要相同');
+});
+
+test('选库预检、界面摘要和内容指纹在 worker 中读私有副本：主线程不打开任何数据库，摘要按文件状态复用', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_summary', project: SHARED_PROJECT }]);
+  const candidate = await resolveVscodeRuntimeDataSet(fixture.paths, fixture.alpha.id);
+  const opensBefore = mainThreadOpens;
+  assert.equal(await preflightRuntimeDataSet(candidate), undefined);
+  const summary = await summarizeRuntimeDataSet(candidate);
+  assert.deepEqual(summary, { projectNames: ['shared'], conversationCount: 1, lastActivityAt: NOW });
+  await runtimeDataSetFingerprint(candidate);
+  assert.equal(mainThreadOpens, opensBefore, '主线程没有打开任何 SQLite 连接');
+
+  // The same file state is answered from memory: nothing is copied (no temporary directory works now).
+  const temporary = process.env.TMPDIR;
+  process.env.TMPDIR = path.join(fixture.root, 'no-such-temporary-directory');
+  t.after(() => { if (temporary === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = temporary; });
+  assert.deepEqual(await summarizeRuntimeDataSet(candidate), summary);
+  // Another file state is read again; a failed read rejects instead of looking like an empty data set.
+  const later = new Date(Date.now() + 1000);
+  await fs.utimes(fixture.alpha.binding.paths.databasePath, later, later);
+  await assert.rejects(summarizeRuntimeDataSet(candidate), { code: 'ENOENT' });
+  assert.match((await preflightRuntimeDataSet(candidate))?.message ?? '', /结构或完整性核验未通过/);
+  if (temporary === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = temporary;
+  assert.deepEqual(await summarizeRuntimeDataSet(candidate), summary);
+});
+
+test('预检在 worker 中照常拒绝结构漂移的库', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_drift', project: SHARED_PROJECT }]);
+  const drift = new RealDatabase(fixture.alpha.binding.paths.databasePath);
+  try {
+    const index = drift.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL ORDER BY name LIMIT 1").pluck().get();
+    drift.exec(`DROP INDEX "${index}"`);
+  } finally { drift.close(); }
+  const candidate = await resolveVscodeRuntimeDataSet(fixture.paths, fixture.alpha.id);
+  const problem = await preflightRuntimeDataSet(candidate);
+  assert.match(problem?.message ?? '', /结构或完整性核验未通过：.*index/i, '漂移的库被拒绝并写明原因');
 });
 
 function pick(state) {

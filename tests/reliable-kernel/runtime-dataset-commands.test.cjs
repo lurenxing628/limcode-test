@@ -120,7 +120,11 @@ function fixture({
       }
     },
     '../../backend/reliableKernel/runtimeDataSetPreflight': {
-      summarizeRuntimeDataSet: async candidate => { calls.push(['summarize', candidate.id]); return summaries[candidate.id]; }
+      summarizeRuntimeDataSet: async candidate => {
+        calls.push(['summarize', candidate.id]);
+        if (summaries[candidate.id] instanceof Error) throw summaries[candidate.id];
+        return summaries[candidate.id];
+      }
     },
     '../../backend/reliableKernel/runtimeStorageInspection': {
       deleteUnselectedRuntimeDataSet: async (_paths, id, expected) => calls.push(['delete', id, expected])
@@ -657,6 +661,13 @@ test('switching away explains the kept rule and warns before continuing merged c
   assert.match(detail, /还没合并过、也不是你保留的旧库，会在下次打开时自动合并进新的当前库/);
   assert.match(detail, /在已合并的对话里继续聊天，这个库以后就不能再合并回当前库.*只新建对话.*新对话以后仍可合并回来/);
   assert.equal(f.calls.some(call => ['select', 'command'].includes(call[0])), false, '未确认不切换');
+});
+
+test('a library whose summary cannot be read says so instead of looking empty', async () => {
+  let shown;
+  const f = fixture({ summaries: { 'workspace:old': new Error('EACCES') }, picks: [action('history'), items => { shown = items; return undefined; }] });
+  await f.manageRuntimeDataSets(f.context, f.startup);
+  assert.match(shown[0].description, /对话数和最后活动读取失败（只是没读到，库没有被改动）/);
 });
 
 test('startup picker names every library and shows a preflight rejection on the library itself', async () => {

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
-import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
+import { readRuntimeDataSetFacts, runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import { resolveVscodeRuntimeMergeLedgerRoot, type VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
 
@@ -100,7 +100,7 @@ export async function runtimeDataSetFingerprint(candidate: VscodeRuntimeDataSetC
   const paths = { globalStoragePath: candidate.configurationRootPath };
   const binding = await requireCompleteRuntimeDataSet(candidate);
   const identity = fingerprintIdentity(binding);
-  const files = await databaseFileState(binding.paths.databasePath);
+  const files = await runtimeDataSetFileState(binding.paths.databasePath);
   const cached = await readFingerprintCache(paths, candidate.id).catch(() => undefined);
   if (cached?.files === files && sameFingerprintIdentity(cached.fingerprint, identity)) return cached.fingerprint;
   let facts: Awaited<ReturnType<typeof readRuntimeDataSetFacts>>;
@@ -113,7 +113,7 @@ export async function runtimeDataSetFingerprint(candidate: VscodeRuntimeDataSetC
   const fingerprint: RuntimeDataSetFingerprint = { ...fingerprintIdentity(facts.binding), contentDigest: facts.contentDigest! };
   // Cached only when nothing moved while the copy was taken.
   if (sameFingerprintIdentity(fingerprint, identity)
-    && await databaseFileState(binding.paths.databasePath).catch(() => undefined) === files) {
+    && await runtimeDataSetFileState(binding.paths.databasePath).catch(() => undefined) === files) {
     await writeLedgerJson(paths, FINGERPRINTS, candidate.id, { kind: FINGERPRINT_KIND, candidateId: candidate.id, files, fingerprint })
       .catch(() => undefined);
   }
@@ -139,17 +139,6 @@ function fingerprintIdentity(binding: FingerprintIdentity): FingerprintIdentity 
 function sameFingerprintIdentity(left: FingerprintIdentity, right: FingerprintIdentity): boolean {
   return left.dataSetId === right.dataSetId && left.rootInstanceId === right.rootInstanceId
     && left.rootGeneration === right.rootGeneration && left.pointerRevision === right.pointerRevision;
-}
-
-/** Exact state of the database and WAL files: any rewrite, copy or restore changes it. */
-async function databaseFileState(databasePath: string): Promise<string> {
-  const describe = (stat: import('node:fs').BigIntStats): string =>
-    `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-  const database = describe(await fs.stat(databasePath, { bigint: true }));
-  let wal = 'absent';
-  try { wal = describe(await fs.stat(`${databasePath}-wal`, { bigint: true })); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  return `db=${database};wal=${wal}`;
 }
 
 async function readFingerprintCache(
