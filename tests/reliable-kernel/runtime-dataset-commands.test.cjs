@@ -31,7 +31,7 @@ function fixture({
   picks = [], confirmation, application, currentEpoch = 5, oldEpoch = 5,
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
-  mergeReport = emptyMergeReport(), mergeError, mergeHook, coordinatedReport, globalState,
+  mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, coordinatedReport, globalState,
   lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {})
 } = {}) {
   const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current' };
@@ -101,6 +101,10 @@ function fixture({
           return outcome.state === 'completed' ? coordinatedReport : mergeReport;
         }
         return mergeReport;
+      },
+      readRuntimeDataSetMergeStates: async () => new Map(Object.entries(mergeStates)),
+      requestRuntimeDataSetMerge: async (_paths, input) => {
+        calls.push(['merge-request', input.candidateId, input.expectedDataSetId, input.expectedRootInstanceId]);
       }
     },
     '../../backend/reliableKernel/runtimeDataSetHistory': {
@@ -534,6 +538,29 @@ test('startup notices about old libraries appear once per cause and again when t
   };
   assert.equal(await upgrades(), 1);
   assert.equal(await upgrades(), 0);
+});
+
+test('merge action lists only unmerged libraries, confirms once, records the request and reloads', async () => {
+  const cancelled = fixture({ picks: [action('merge'), 0] });
+  await cancelled.manageRuntimeDataSets(cancelled.context, cancelled.startup);
+  assert.equal(cancelled.calls.some(call => ['merge-request', 'command'].includes(call[0])), false);
+  const f = fixture({ picks: [action('merge'), items => {
+    assert.deepEqual(Array.from(items, item => item.candidate?.id), ['workspace:old']);
+    return items[0];
+  }], confirmation: '合并并重载' });
+  await f.manageRuntimeDataSets(f.context, f.startup);
+  assert.deepEqual(f.calls.filter(call => ['merge-request', 'command'].includes(call[0])), [
+    ['merge-request', 'workspace:old', 'old', 'old-instance'],
+    ['command', 'workbench.action.reloadWindow']
+  ]);
+  const merged = fixture({ picks: [action('merge')], mergeStates: { 'workspace:old': { state: 'merged', mergedAt: '2026-09-26' } } });
+  await merged.manageRuntimeDataSets(merged.context, merged.startup);
+  assert.match(merged.calls.find(call => call[0] === 'info')[1], /都已合并到当前库/);
+  const history = fixture({ picks: [action('history'), items => {
+    assert.match(items[0].label, /已合并到当前库/);
+    return undefined;
+  }], mergeStates: { 'workspace:old': { state: 'merged', mergedAt: '2026-09-26' } } });
+  await history.manageRuntimeDataSets(history.context, history.startup);
 });
 
 test('extension runs the historical merge inside Runtime open, before the Host is ready', async t => {

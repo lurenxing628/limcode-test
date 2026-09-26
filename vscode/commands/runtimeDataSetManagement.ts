@@ -8,7 +8,10 @@ import {
 } from '../../backend/reliableKernel/vscodeRootAuthority';
 import { openRuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeDataSetHistory';
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
-import { mergeRuntimeDataSetsIntoSelected, type RuntimeDataSetMergeBatchResult } from '../../backend/reliableKernel/runtimeDataSetMerge';
+import {
+  mergeRuntimeDataSetsIntoSelected, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
+  type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergeState
+} from '../../backend/reliableKernel/runtimeDataSetMerge';
 import { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } from '../../backend/reliableKernel/runtimeStorageInspection';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
@@ -57,9 +60,12 @@ export async function openWithRuntimeDataSetSelection<T>(context: vscode.Extensi
   }
 }
 
-function dataSetLabel(candidate: VscodeRuntimeDataSetCandidate): string {
+function dataSetLabel(candidate: VscodeRuntimeDataSetCandidate, merge?: RuntimeDataSetMergeState): string {
   const version = isPublishedOldDataSet(candidate) ? ` · 旧格式（版本 ${candidate.runtimeKernelEpoch}）` : '';
-  return `${candidate.selected ? '当前历史库' : '其他历史库'} · ${candidate.dataSetId ?? candidate.id}${version}`;
+  const state = merge?.state === 'merged' ? ' · 已合并到当前库'
+    : merge?.state === 'blocked' ? ' · 未能合并'
+      : merge?.state === 'requested' ? ' · 等待合并' : '';
+  return `${candidate.selected ? '当前历史库' : '其他历史库'} · ${candidate.dataSetId ?? candidate.id}${version}${state}`;
 }
 
 function isPublishedOldDataSet(candidate: VscodeRuntimeDataSetCandidate): boolean {
@@ -69,12 +75,17 @@ function isPublishedOldDataSet(candidate: VscodeRuntimeDataSetCandidate): boolea
 async function chooseDataSet(
   candidates: readonly VscodeRuntimeDataSetCandidate[],
   placeHolder: string,
-  problems: readonly VscodeRuntimeDataSetProblem[] = []
+  problems: readonly VscodeRuntimeDataSetProblem[] = [],
+  mergeStates: ReadonlyMap<string, RuntimeDataSetMergeState> = new Map()
 ) {
   const items: Array<vscode.QuickPickItem & { candidate?: VscodeRuntimeDataSetCandidate; problem?: VscodeRuntimeDataSetProblem }> = [
-    ...candidates.map(candidate => ({
-      label: dataSetLabel(candidate), description: candidate.runtimeDataRootPath, candidate
-    })),
+    ...candidates.map(candidate => {
+      const merge = mergeStates.get(candidate.id);
+      return {
+        label: dataSetLabel(candidate, merge), description: candidate.runtimeDataRootPath, candidate,
+        ...(merge?.state === 'blocked' ? { detail: merge.message } : {})
+      };
+    }),
     ...problems.map(problem => ({
       label: '暂时无法打开的历史库', description: problem.runtimeScopeRootPath,
       detail: problem.message, problem
@@ -99,6 +110,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   const action = await vscode.window.showQuickPick([
     { label: '其他历史库', description: '查看旧聊天；旧格式会先自动备份升级', action: 'history' },
     { label: '查看存储占用', description: '按需统计正文、数据库、临时文件与备份', action: 'storage' },
+    { label: '合并到当前库', description: '把其他历史库的对话并入当前库；原库保留，重载后执行', action: 'merge' },
     { label: '切换当前历史库', description: '保留完整原库，切换后重载窗口', action: 'select' },
     { label: '删除其他历史库', description: '仅删除明确选定的非当前完整历史库', action: 'delete' },
     { label: '归档并重置当前历史库', description: '保留备份并创建空库；归档本身不释放磁盘', action: 'reset' }
@@ -110,18 +122,24 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   }
   const { candidates, problems } = await inspectVscodeRuntimeDataSets(pathsFor(context));
   if (!canStartRuntimeDataSetUpgrade(context)) return;
-  const eligible = action.action === 'history' || action.action === 'delete'
-    ? candidates.filter(candidate => !candidate.selected) : candidates;
+  const mergeStates = await readRuntimeDataSetMergeStates(pathsFor(context)).catch(() => new Map<string, RuntimeDataSetMergeState>());
+  const eligible = action.action === 'merge'
+    ? candidates.filter(candidate => !candidate.selected && candidate.dataSetId && mergeStates.get(candidate.id)?.state !== 'merged')
+    : action.action === 'history' || action.action === 'delete'
+      ? candidates.filter(candidate => !candidate.selected) : candidates;
   if (!eligible.length) {
     if (problems.length) {
       await chooseDataSet([], '这些历史库暂时无法打开；选择一项查看原因', problems);
     } else {
-      await vscode.window.showInformationMessage(candidates.length ? '没有其他历史库。当前库的对话可在侧栏查看。' : '尚无历史库，打开对话后会创建。');
+      await vscode.window.showInformationMessage(action.action === 'merge' && candidates.some(candidate => !candidate.selected)
+        ? '其他历史库都已合并到当前库。'
+        : candidates.length ? '没有其他历史库。当前库的对话可在侧栏查看。' : '尚无历史库，打开对话后会创建。');
     }
     return;
   }
-  const candidate = await chooseDataSet(eligible, action.label, problems);
+  const candidate = await chooseDataSet(eligible, action.label, problems, mergeStates);
   if (!candidate || !canStartRuntimeDataSetUpgrade(context)) return;
+  if (action.action === 'merge') { await requestMergeAndReload(context, candidate); return; }
   if (action.action === 'storage') { await showRuntimeStorage(context, candidate); return; }
   if (action.action === 'history') {
     const readable = isPublishedOldDataSet(candidate) ? await upgradeHistoryBeforeRead(context, candidate) : candidate;
@@ -131,7 +149,8 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   if (action.action === 'delete') {
     // Native VS Code command: no settings Webview exists here, so use the shell's modal confirmation.
     const confirmed = await vscode.window.showWarningMessage('永久删除这个历史库及其备份？', {
-      modal: true, detail: `${dataSetLabel(candidate)}\n${candidate.runtimeDataRootPath}\n\n此操作不能撤销，不会删除当前历史库或共享设置。`
+      modal: true, detail: `${dataSetLabel(candidate, mergeStates.get(candidate.id))}\n${candidate.runtimeDataRootPath}\n\n此操作不能撤销，不会删除当前历史库或共享设置。`
+        + (mergeStates.get(candidate.id)?.state === 'merged' ? '已合并到当前库的对话和正文不受影响。' : '')
     }, '永久删除');
     if (confirmed !== '永久删除') return;
     if (!candidate.dataSetId) throw new Error('历史库尚未完整初始化，不能删除。');
@@ -140,6 +159,18 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     return;
   }
   await switchHistory(context, startup, candidate);
+}
+
+async function requestMergeAndReload(context: vscode.ExtensionContext, candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
+  const confirmed = await vscode.window.showWarningMessage('把这个历史库合并到当前库并重载窗口？', {
+    modal: true, detail: `来源：${candidate.runtimeDataRootPath}\n\n重载后在当前库打开前合并：先备份当前库，原库保持不变。`
+      + '有未结束任务或数据冲突时不会合并，并会说明原因。使用同一历史库的其它窗口会在任务结束后提示并自动重载。'
+  }, '合并并重载');
+  if (confirmed !== '合并并重载' || !candidate.dataSetId || !candidate.rootInstanceId) return;
+  await requestRuntimeDataSetMerge(pathsFor(context), {
+    candidateId: candidate.id, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
+  });
+  await vscode.commands.executeCommand('workbench.action.reloadWindow');
 }
 
 async function switchHistory(context: vscode.ExtensionContext, startup: ApplicationStartup, candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
