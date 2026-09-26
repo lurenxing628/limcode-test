@@ -311,10 +311,24 @@ export async function selectVscodeRuntimeDataSet(
     if (previous?.id === id) return candidate;
     await assertConfigurationRootRuntimesOffline(root);
     // Switching away is an explicit decision to keep that data set apart: it is never merged
-    // automatically afterwards. Data sets from before this version carry no such record.
+    // automatically afterwards. Data sets from before this version carry no such record. The
+    // record is written before the selection moves; a readable data set that cannot be marked is
+    // not switched away from. One that cannot even be inspected is marked for any incarnation, as
+    // far as its control root still takes a file: switching away from a broken data set never
+    // depends on it.
     if (previous) {
-      const kept = await inspectCandidate(root, previous.id, previous, !previous.initialized).catch(() => undefined);
-      if (kept?.dataSetId && kept.rootInstanceId) await markRuntimeDataSetKept(kept);
+      let kept: VscodeRuntimeDataSetCandidate | undefined;
+      try { kept = await inspectCandidate(root, previous.id, previous, !previous.initialized); }
+      catch {
+        const runtimeDataRootPath = resolveVscodeRuntimeDataRoot({ globalStoragePath: runtimeScopeRootForId(root, previous.id) });
+        await markRuntimeDataSetKept({ configurationRootPath: root, runtimeDataRootPath }).catch(() => undefined);
+      }
+      if (kept?.dataSetId && kept.rootInstanceId) {
+        await markRuntimeDataSetKept(kept).catch((error: unknown) => {
+          throw new VscodeRuntimeDataSetError(
+            '无法在原当前库里记下“你保留的库”（切走的库以后只在你选择时才合并），切换未进行；请检查数据目录能否写入后重试。', error);
+        });
+      }
     }
     await publishSelection(root, id, true, previous);
     return Object.freeze({ ...candidate, selected: true });
@@ -326,17 +340,23 @@ export function resolveVscodeRuntimeMergeLedgerRoot(paths: Pick<VscodeStoragePat
   return path.join(path.resolve(paths.globalStoragePath), VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY);
 }
 
-/** True when the user switched away from exactly this data set incarnation in this version. */
+/**
+ * True when the user switched away from exactly this data set incarnation in this version, or
+ * when that cannot be ruled out: automatic merging needs a readable marker that names another
+ * incarnation, or no marker at all.
+ */
 export async function isVscodeRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<boolean> {
   if (!candidate.dataSetId || !candidate.rootInstanceId) return false;
   const file = keptMarkerPath(candidate);
   await assertSafeRootPath(candidate.configurationRootPath, file);
   let value: unknown;
   try { value = await readOptionalJson(file); }
-  catch { return false; }
-  const record = value as Record<string, unknown> | undefined;
-  return record?.kind === RUNTIME_DATA_SET_KEPT_KIND
-    && record.dataSetId === candidate.dataSetId && record.rootInstanceId === candidate.rootInstanceId;
+  catch { return true; }
+  if (value === undefined) return false;
+  const record = value as Record<string, unknown> | null;
+  if (record?.kind !== RUNTIME_DATA_SET_KEPT_KIND) return true;
+  if (record.anyIncarnation === true) return true;
+  return record.dataSetId === candidate.dataSetId && record.rootInstanceId === candidate.rootInstanceId;
 }
 
 /**
@@ -372,17 +392,22 @@ export async function markVscodeRuntimeDataSetKept(candidate: VscodeRuntimeDataS
   await markRuntimeDataSetKept(candidate);
 }
 
-async function markRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
+/** Without an identity (a data set that could not be inspected) the marker covers any incarnation. */
+async function markRuntimeDataSetKept(
+  candidate: Pick<VscodeRuntimeDataSetCandidate, 'configurationRootPath' | 'runtimeDataRootPath' | 'dataSetId' | 'rootInstanceId'>
+): Promise<void> {
   const file = keptMarkerPath(candidate);
   await assertSafeRootPath(candidate.configurationRootPath, file);
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  const identity = candidate.dataSetId && candidate.rootInstanceId
+    ? { dataSetId: candidate.dataSetId, rootInstanceId: candidate.rootInstanceId }
+    : { anyIncarnation: true };
   try {
     const handle = await fs.open(temporary, 'wx', 0o600);
     try {
       await handle.writeFile(`${JSON.stringify({
         kind: RUNTIME_DATA_SET_KEPT_KIND,
-        dataSetId: candidate.dataSetId,
-        rootInstanceId: candidate.rootInstanceId,
+        ...identity,
         keptAt: new Date().toISOString()
       }, null, 2)}\n`, 'utf8');
       await handle.sync();

@@ -21,7 +21,7 @@ const {
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
-  resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
+  resolveVscodeWorkspaceRuntimeScopeRoot, resolveVscodeRuntimeSelectionPath, selectVscodeRuntimeDataSet
 } = kernelFile('vscodeRootAuthority.js');
 
 const NOW = '2026-09-26T00:00:00.000Z';
@@ -30,6 +30,7 @@ const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
 const SHARED_PROJECT = { uri: 'file:///workspace/shared', name: 'shared' };
 const SHARED_TEXT = JSON.stringify({ role: 'user', parts: [{ text: '各工作区都用过的同一段正文' }] });
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
+const asRoot = process.getuid?.() === 0;
 
 test('合并目标被删除后，来源显示目标已不存在，也不会被再次自动合并', async (t) => {
   const fixture = await createFixture(t);
@@ -107,6 +108,49 @@ test('合并后只在来源里新建对话：再次明确合并只写入新对�
   assert.deepEqual(again.merged.map((item) => item.insertedConversations), [1]);
   const seen = (await database.snapshot([repo('Conversation').get('conversation_alpha_new')])).snapshot[0];
   assert.equal(seen?.id, 'conversation_alpha_new');
+});
+
+test('“用户保留”标记无法读取或内容不明时按保留处理，不自动合并', { skip: asRoot }, async (t) => {
+  const fixture = await createFixture(t, { selected: 'alpha' });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_kept', project: SHARED_PROJECT }]);
+  await selectVscodeRuntimeDataSet(fixture.paths, fixture.beta.id);
+  const marker = path.join(controlRoot(fixture.alpha), 'kept-by-user.json');
+  assert.equal(JSON.parse(await fs.readFile(marker, 'utf8')).dataSetId, fixture.alpha.binding.dataSetId);
+  await fs.chmod(marker, 0);
+  t.after(() => fs.chmod(marker, 0o600).catch(() => undefined));
+  const database = await openTarget(t, fixture.beta);
+  let report = await merge(fixture, database);
+  assert.equal(report.merged.some((item) => item.candidateId === fixture.alpha.id), false, '读不了标记时不自动合并');
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'kept');
+
+  await fs.chmod(marker, 0o600);
+  await fs.writeFile(marker, '{"torn":');
+  report = await merge(fixture, database);
+  assert.equal(report.merged.some((item) => item.candidateId === fixture.alpha.id), false, '损坏的标记不当作“未保留”');
+
+  // A marker of an earlier incarnation (the data set was reset since) does not keep this one.
+  await fs.writeFile(marker, JSON.stringify({ kind: 'limcode-runtime-data-set-kept', dataSetId: 'other', rootInstanceId: 'other' }));
+  report = await merge(fixture, database);
+  assert.deepEqual(report.merged.map((item) => item.candidateId), [fixture.alpha.id]);
+});
+
+test('切走时写不了“用户保留”标记就不切换；切走无法检查的库时记为保留任何实例', { skip: asRoot }, async (t) => {
+  const fixture = await createFixture(t, { selected: 'alpha' });
+  const selectionPath = resolveVscodeRuntimeSelectionPath(fixture.paths);
+  const before = await fs.readFile(selectionPath, 'utf8');
+  const alphaControl = controlRoot(fixture.alpha);
+  await fs.chmod(alphaControl, 0o500);
+  t.after(() => fs.chmod(alphaControl, 0o700).catch(() => undefined));
+  await assert.rejects(selectVscodeRuntimeDataSet(fixture.paths, fixture.beta.id), /无法在原当前库里记下“你保留的库”.*切换未进行/);
+  assert.equal(await fs.readFile(selectionPath, 'utf8'), before, '选择没有改变');
+  await fs.chmod(alphaControl, 0o700);
+
+  // A current data set that can no longer be inspected can still be switched away from.
+  await fs.rm(fixture.alpha.binding.paths.rootPointerPath);
+  await selectVscodeRuntimeDataSet(fixture.paths, fixture.beta.id);
+  const marker = JSON.parse(await fs.readFile(path.join(alphaControl, 'kept-by-user.json'), 'utf8'));
+  assert.equal(marker.anyIncarnation, true);
+  assert.equal(marker.dataSetId, undefined);
 });
 
 function pick(state) {
@@ -209,6 +253,10 @@ function messageSteps(conversationId, messageId, seq, contentObjectId, at) {
 async function readLedgerRecord(fixture, candidateId) {
   const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records', `${candidateId.replace(/:/g, '-')}.json`);
   return JSON.parse(await fs.readFile(file, 'utf8'));
+}
+
+function controlRoot(dataSet) {
+  return path.dirname(dataSet.binding.paths.dataRootPath);
 }
 
 function messageText(conversationId, index) {
