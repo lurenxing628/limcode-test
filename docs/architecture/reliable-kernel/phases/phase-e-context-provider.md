@@ -44,7 +44,7 @@ Phase E 的 stable ID 验证可靠内核 control plane 本身；旧应用 LLM/co
 - 一个原生 `ModelRequest` 可以包含多个物理 response。持久化 `{attemptSeq, socketGeneration, streamSeq}` 始终存在；物理 `connectionGeneration`、`streamId`、实际发送的 `previousResponseId` 仅在真实存在时记录，HTTP 不伪造这些身份。
 - `native_control`、`native_tool_call` 是不可被普通流式容量上限丢弃的 checkpoint。`output_item.done` 的实际 `async:true` 加冻结的逐工具许可才允许早期准入；缺省/false 必须等本 response 的完成边界。原生控制器在同步结果未回传时同样保持存活，不依赖转向或另一个异步调用来解锁。
 - `NativeRequestSession` 通过 `ReliableToolDispatcher.scheduleAdmittedCall` 使用既有审批、取消、幂等和分类调度限制，不另建绕过策略的执行队列。调用准入事实与调用一起持久化；terminal checkpoint 收敛后仍由 `ToolCallEvent` 的 CAS 事实恢复。
-- 模型输出 item 的 ordinal 是 response 局部身份，不能独自作为跨 response 的 revision/dedupe key。item revision 使用 response 作用域；当前累计/最终 Message revision 只服务展示，不重复进入 Context。
+- 模型输出 item 的 ordinal 是 response 局部身份，不能独自作为跨 response 的 revision/dedupe key。item revision 使用 response 作用域；当前累计/最终 Message revision 只服务展示，不重复进入 Context。恢复重建链时按确定身份跳过累计与最终 revision，只读取 item revision 正文。
 - 工具结果完成后先保存真实 `ToolModelResult`。只有匹配的 `response.created` checkpoint 明确包含 `admittedToolResultCallIds`，才追加结果 Context occurrence 并记录 delivery；socket write 不代表送达。转向自动后继尚未接纳结果时，结果不得排在该后继之前。
 - 转向使用独立 `PendingTurnInput(input_kind='native_steer')` 与 `MessageTurnLink(role='native_steer')`。提交时保存不可变用户消息，证明后继接纳后才把原 revision 加入 Context；`prepareMessageAppendMutation(existingRevisionSeq)` 引用已提交 revision，不为应用关系复制一份消息 revision。已发送/已接受不等于生效；未证明应用的逻辑收尾标记 `delivery_unknown`，不自动重发。
 - 原生最终输出可以与同一逻辑请求内已交付的工具调用共存。`TurnFinalOutputFence` 仍要求没有待吸收 runtime delivery；原生例外必须在同一事务内固定精确调用集合、terminal 调用、唯一结果、结果 Context occurrence、准入与送达事件。普通请求仍保持无工具 SourceLink 的最终输出规则。

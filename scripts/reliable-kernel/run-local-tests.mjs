@@ -118,6 +118,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/native-budget-checkpoints.test.mjs',
   'tests/reliable-kernel/native-context-closure.test.mjs',
   'tests/reliable-kernel/native-chain-recovery.test.mjs',
+  'tests/reliable-kernel/native-reconcile-revision-reads.test.mjs',
   'tests/reliable-kernel/native-response-metrics.test.mjs',
   'tests/reliable-kernel/model-request-client-summary.test.mjs',
   'tests/reliable-kernel/model-reply-metrics-handoff.test.mjs',

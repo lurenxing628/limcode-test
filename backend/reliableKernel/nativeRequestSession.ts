@@ -46,7 +46,13 @@ import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './p
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { assistantMessageIdFor, nativeItemRevisionId, TurnOutputControlPlane } from './turnOutput';
+import {
+  assistantMessageIdFor,
+  assistantMessageRevisionIdFor,
+  nativeCumulativeRevisionId,
+  nativeItemRevisionId,
+  TurnOutputControlPlane
+} from './turnOutput';
 import type {
   ReliableAgentToolDefinition,
   ReliableAgentToolDispatchInput,
@@ -403,8 +409,19 @@ export class NativeRequestSession {
         const a = BigInt(String(left.revision_seq)); const b = BigInt(String(right.revision_seq));
         return a < b ? -1 : a > b ? 1 : 0;
       });
+      // Each item's cumulative revision is committed after it in the same transaction and holds the
+      // whole chain so far. Skip it and the final aggregate by identity instead of reading their
+      // content, so a retry or takeover of a long chain reads O(items) bytes, not O(items^2).
+      const projectionRevisionIds = new Set([
+        assistantMessageRevisionIdFor(this.deps.turnId, this.deps.modelRequestId)
+      ]);
+      const rebuildItem = (itemKey: string, part: Record<string, unknown>): void => {
+        this.recordItemPart(itemKey, part);
+        projectionRevisionIds.add(nativeCumulativeRevisionId(this.deps.turnId, this.deps.modelRequestId, itemKey));
+      };
       const rebuiltCallCounts = new Map<string, number>();
       for (const revision of revisions) {
+        if (projectionRevisionIds.has(requireId(revision.id, 'MessageRevision.id'))) continue;
         const metadata = await this.requireDomain(
           'ContentObject',
           requireId(revision.content_object_id, 'MessageRevision.content_object_id')
@@ -427,7 +444,7 @@ export class NativeRequestSession {
           const itemKey = `call:${responseId}:${localCallIndex}`;
           if (revision.id !== nativeItemRevisionId(this.deps.turnId, this.deps.modelRequestId, itemKey)) continue;
           rebuiltCallCounts.set(responseId, localCallIndex + 1);
-          this.recordItemPart(itemKey, part);
+          rebuildItem(itemKey, part);
         } else {
           const ordinal = typeof outputItem?.ordinal === 'number' && Number.isSafeInteger(outputItem.ordinal)
             ? outputItem.ordinal
@@ -435,7 +452,7 @@ export class NativeRequestSession {
           if (ordinal === undefined) continue;
           const itemKey = `content:${responseId}:${ordinal}`;
           if (revision.id !== nativeItemRevisionId(this.deps.turnId, this.deps.modelRequestId, itemKey)) continue;
-          this.recordItemPart(itemKey, part);
+          rebuildItem(itemKey, part);
         }
       }
     }
