@@ -52,6 +52,7 @@ import {
   type ExecutionLeaseFence
 } from './executionLeaseFence';
 import { isConversationRuntimeOwnerBusyError } from './ConversationRuntimeOwnerManager';
+import { DEAD_HOST_STOP_REASON, type DeadHostTurnEffects } from './phaseDRecovery';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import {
   maxChildAgentDepthFromConfig,
@@ -120,6 +121,11 @@ export interface ReliableChildAgentCoordinatorDependencies {
     notify(): void;
   };
   cancelTurnExecution?: (input: { turnId: string; reason: string }) => Promise<void>;
+  /** Closes work a window left running when it exited unexpectedly; used only by a user's stop. */
+  deadHostEffects?: {
+    deadHostEffectsForTurn(turnId: string, selfHostBootId: string): Promise<DeadHostTurnEffects>;
+    abandonDeadHostEffects(input: { sourceKey: string; effectIntentIds: readonly string[]; reason: string }): Promise<number>;
+  };
   quiesceTurnExecution?: (input: { turnId: string; reason: ExecutionHandoffError }) => Promise<void>;
   manualCompression?: {
     admit(input: {
@@ -628,7 +634,7 @@ export class ReliableChildAgentCoordinator {
     turnId: string;
     expectedLeaseGeneration?: string;
     reason: string;
-  }): Promise<TurnCommandResult> {
+  }): Promise<TurnCommandResult & { executingWindowAlive?: true }> {
     const childExecutionId = requireId(input.childExecutionId, 'childExecutionId');
     const turnId = requireId(input.turnId, 'turnId');
     const conversationId = requireId(input.conversationId, 'conversationId');
@@ -650,9 +656,16 @@ export class ReliableChildAgentCoordinator {
     if (this.dependencies.database.conversationOwners.owns(conversationId)) {
       this.waitingOwned.delete(turnId);
       await this.cancelLocalChildTurn(turnId, input.reason);
-      if (!result.ignoredBecauseTerminal) this.launch(childExecutionId, turnId);
     }
-    return result;
+    if (result.ignoredBecauseTerminal) return result;
+    if (this.activeTurns.has(turnId)) {
+      this.launch(childExecutionId, turnId);
+      return result;
+    }
+    // This is always a user's stop (the child's own panel).
+    return await this.settleStoppedChildTurn(childExecutionId, turnId)
+      ? { ...result, executingWindowAlive: true }
+      : result;
   }
 
   /**
@@ -661,8 +674,9 @@ export class ReliableChildAgentCoordinator {
    * local cancellation step only removes the avoidable wake-poll delay for product/UI commands.
    */
   public async interruptSubtree(
-    input: ChildExecutionCancelCommand
-  ): Promise<ChildExecutionCancelSubtreeResult> {
+    input: ChildExecutionCancelCommand,
+    options: { userStop?: boolean } = {}
+  ): Promise<ChildExecutionCancelSubtreeResult & { executingWindowAlive?: true }> {
     const cancelled = await this.dependencies.children.interruptSubtree({
       sourceKey: requireId(input.sourceKey, 'sourceKey'),
       childExecutionId: requireId(input.childExecutionId, 'childExecutionId'),
@@ -672,7 +686,132 @@ export class ReliableChildAgentCoordinator {
       this.cancelLocalChildTurn(turnId, input.reason)
     ));
     this.dependencies.ownedProcessCleanup?.notify();
-    return cancelled;
+    // Only a user's stop (sidebar, panel cascade, tool cancel) settles Turns no Host here runs;
+    // a model's run_agent interrupt leaves them to their scheduler as before.
+    if (!options.userStop) return cancelled;
+    let executingWindowAlive = false;
+    for (const turnId of cancelled.activeTurnIds) {
+      if (this.activeTurns.has(turnId)) continue;
+      const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+      if (memberships.length !== 1) continue;
+      const childExecutionId = requireId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
+      if (await this.settleStoppedChildTurn(childExecutionId, turnId)) executingWindowAlive = true;
+    }
+    return executingWindowAlive ? { ...cancelled, executingWindowAlive: true } : cancelled;
+  }
+
+  /**
+   * A user's stop of a child Turn that no Host here runs. A Host serving the child Conversation,
+   * with no work left by an exited window, takes the Turn over through the recovery pass, which
+   * drives the stop. Otherwise the stop is settled control-only, in any window: an orphan Turn is
+   * closed; work a window left running when it exited unexpectedly is closed as outcome_unknown,
+   * but only once every Host that ran it is proven dead; the recorded stop becomes the terminal
+   * state; and the lineage converges. Nothing is dispatched or retried. Returns true when a Host
+   * that is alive (or cannot be verified) still runs the Turn, which then handles the stop itself.
+   */
+  private async settleStoppedChildTurn(childExecutionId: string, turnId: string): Promise<boolean> {
+    if (this.disposing || this.handoff || this.activeTurns.has(turnId)) return false;
+    const child = await this.get('ChildExecution', childExecutionId);
+    if (!child) return false;
+    const conversationId = requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
+    const hostBootId = this.dependencies.database.hostBootId;
+    const inspect = (): Promise<DeadHostTurnEffects> => this.dependencies.deadHostEffects
+      ? this.dependencies.deadHostEffects.deadHostEffectsForTurn(turnId, hostBootId)
+      : Promise.resolve({ state: 'none' });
+    const owners = this.dependencies.database.conversationOwners;
+    try {
+      const preview = await inspect();
+      if (preview.state === 'live') return true;
+      if (preview.state === 'unsupported' || (
+        preview.state === 'none' && await owners.executionEligibility(conversationId) === 'eligible'
+      )) {
+        this.triggerRecoveryPass();
+        return false;
+      }
+      return await owners.run(conversationId, async () => {
+        const facts = await this.dependencies.turns.recoveryFacts(turnId);
+        if (facts.turnStatus !== 'active') return false;
+        if (facts.judgment === 'finalize') {
+          await this.dependencies.turns.finalizeRecovery({
+            source: { kind: 'recovery', key: `child-driver-finalize:${turnId}` },
+            turnId,
+            terminalStatus: 'cancelled',
+            reason: 'Child scheduler recovered an active Turn without execution authority.'
+          });
+          await this.finishStoppedChildTurn(childExecutionId, turnId);
+          return false;
+        }
+        if (facts.judgment !== 'resume' || !await this.hasPendingTermination(turnId)) return false;
+        // A tool still executing without proof that its window is gone stays with the Host serving it.
+        if (preview.state !== 'dead' && (await this.list('ToolCall', { turn_id: turnId, status: 'executing' }, 1)).length > 0) {
+          return false;
+        }
+        const claimed = await this.dependencies.turns.claimRecoveryExecution({
+          turnId,
+          leaseOwnerId: this.childLeaseOwnerId,
+          hostBootId,
+          leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+        });
+        if (!claimed) return true;
+        const fence = await this.dependencies.turns.executionLeaseFence({
+          turnId,
+          leaseOwnerId: this.childLeaseOwnerId,
+          hostBootId
+        });
+        if (!fence) return false;
+        const outcome = await runWithoutExecutionLeaseFence(() => runWithExecutionLeaseFence(fence, async () => {
+          // Re-read under the lease: another stop may have closed some of the work meanwhile.
+          const current = await inspect();
+          if (current.state === 'live') return 'live' as const;
+          if (current.state === 'unsupported') return 'open' as const;
+          if (current.state === 'dead') {
+            await this.dependencies.deadHostEffects!.abandonDeadHostEffects({
+              sourceKey: `user-stop-dead-host:${turnId}`,
+              effectIntentIds: current.effectIntentIds,
+              reason: DEAD_HOST_STOP_REASON
+            });
+          }
+          return await this.dependencies.agentLoop.terminateRequested(turnId, 'user-stop-after-window-exit')
+            ? 'terminated' as const
+            : 'open' as const;
+        }));
+        if (outcome === 'terminated') await this.finishStoppedChildTurn(childExecutionId, turnId);
+        return outcome === 'live';
+      });
+    } catch (error) {
+      // A live owner of the child Conversation observes the durable stop and executes it.
+      if (isConversationRuntimeOwnerBusyError(error)) return true;
+      this.reportError(error, 'user-stop-child', turnId);
+      return false;
+    }
+  }
+
+  /** The same lineage convergence a child drive performs after its Turn becomes terminal. */
+  private async finishStoppedChildTurn(childExecutionId: string, turnId: string): Promise<void> {
+    const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
+    const cancellationRecovery = snapshot.childExecution.status === 'interrupting';
+    if (snapshot.activeTurn?.id === turnId && snapshot.activeTurn.status === 'terminated') {
+      await this.dependencies.children.observeTurnTerminal(childExecutionId, turnId);
+    }
+    await this.reconcileTerminalChildTurn(childExecutionId, turnId);
+    if (cancellationRecovery) {
+      await this.dependencies.children.reconcileCancelledLineage(
+        childExecutionId,
+        `Child Turn ${turnId} reached terminal state after cancellation.`
+      );
+    }
+  }
+
+  private async hasPendingTermination(turnId: string): Promise<boolean> {
+    const pending = await listAllDomainRows(this.dependencies.database, 'PendingTurnInput', {
+      turn_id: turnId,
+      state: 'pending'
+    });
+    return pending.some((input) => [
+      'interrupt_request',
+      'interrupt_current_turn',
+      'termination_request'
+    ].includes(String(input.input_kind)));
   }
 
   /**

@@ -57,6 +57,7 @@ import { readVscodeSshWorkEnvironments } from './VscodeSshConfigurationReader';
 import { applyProxyEnvironment, currentProxyEnvironment, proxyForShellAndMcp } from './proxyEnvironment';
 import { GlobalSettingsSaveBarrier } from './GlobalSettingsSaveBarrier';
 import {
+  STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE,
   conversationAnswerRecordedMessage,
   conversationHostIneligibleMessage,
   type ConversationHostEligibilityView
@@ -1488,16 +1489,22 @@ export class VscodeReliableKernelCommandRouter {
           childExecutionId
         })
       : await this.product.conversations.interrupt(interruptInput);
+    if ('executingWindowAlive' in result && result.executingWindowAlive) {
+      void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);
+    }
     if (payload.cascadeChildAgents) {
       const children = await this.listAll('ChildExecutionParentLink', {
         parent_turn_id: payload.turnId
       });
       for (const link of children) {
-        await this.product.childAgents.interruptSubtree({
+        const interrupted = await this.product.childAgents.interruptSubtree({
           sourceKey: `${payload.command.commandId}:child:${String(link.child_execution_id)}`,
           childExecutionId: String(link.child_execution_id),
           reason: 'parent_turn_interrupted'
-        });
+        }, { userStop: true });
+        if (interrupted?.executingWindowAlive) {
+          void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);
+        }
         // interruptSubtree is the cross-Host authority. The owning child scheduler observes its
         // durable PendingTurnInput and is the only process allowed to touch local AbortControllers
         // under that child Turn's exact ExecutionLease generation.
@@ -2093,7 +2100,10 @@ export class VscodeReliableKernelCommandRouter {
           sourceKey: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
           childExecutionId: String(childLinks[0].child_execution_id),
           reason: payload.reason ?? '用户取消此子 Agent 执行。'
-        }));
+        }, { userStop: true }));
+      if (result?.executingWindowAlive) {
+        void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);
+      }
       this.post(webview, {
         id: randomUUID(),
         type: BridgeMessageType.InteractionResult,
@@ -2115,6 +2125,9 @@ export class VscodeReliableKernelCommandRouter {
         turnId: String(turn.id),
         reason: payload.reason ?? '用户取消工具执行。'
       }));
+    if (interrupted.executingWindowAlive) {
+      void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);
+    }
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,

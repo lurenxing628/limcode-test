@@ -500,14 +500,14 @@ export class ReliableAgentLoop {
    * are cancelled and non-terminal ModelRequests are closed as cancelled. Returns false when no
    * termination request is pending.
    */
-  public async terminateRequested(turnIdInput: string): Promise<boolean> {
+  public async terminateRequested(turnIdInput: string, stage = 'control-settlement'): Promise<boolean> {
     const turnId = requireId(turnIdInput, 'turnId');
     const turn = await this.requireExisting('Turn', turnId);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     await this.database.conversationOwners.assertOwned(conversationId);
     if (turn.status !== 'active') return turn.status === 'terminated';
     await this.openEmptyContextWithDeliveredInput(turnId);
-    return this.terminateIfRequested(turnId, 'control-settlement');
+    return this.terminateIfRequested(turnId, stage);
   }
 
   public async drive(turnIdInput: string): Promise<ReliableAgentLoopResult> {

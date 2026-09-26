@@ -34,7 +34,8 @@ import {
   displayConversationTitle
 } from '../../../shared/conversationTitle';
 import { BridgeMessageType } from '../../../shared/protocol';
-import { EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
+import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
+import { STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE } from './conversationHostEligibility';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
 import type {
   BridgeClientId,
@@ -394,22 +395,28 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
       if (childMemberships.length > 1) throw new Error('Turn 存在多个 ChildExecution 调度归属。');
       if (childMemberships[0]) {
-        await this.product.childAgents.interruptSubtree({
+        const interrupted = await this.product.childAgents.interruptSubtree({
           sourceKey: `sidebar-child-interrupt:${requestId}`,
           childExecutionId: requireText(
             childMemberships[0].child_execution_id,
             'ChildExecutionTurnLink.child_execution_id'
           ),
           reason: '用户从侧栏请求递归终止当前子 Agent。'
-        });
+        }, { userStop: true });
+        if (interrupted?.executingWindowAlive) {
+          void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);
+        }
       } else {
-        await this.product.conversations.interrupt({
+        const interrupted = await this.product.conversations.interrupt({
           commandId: requestId,
           conversationId,
           turnId,
           expectedLeaseGeneration,
           reason: '用户从侧栏请求终止当前 Conversation。'
         });
+        if (interrupted?.executingWindowAlive) {
+          void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);
+        }
       }
       return { status: 'committed', turnId };
     } catch (error) {

@@ -738,6 +738,49 @@ export class FileChangeControlPlane {
     return this.reconcileEffectReceipt(recorded.effectReceiptId);
   }
 
+  /**
+   * Closes a dispatched file mutation whose executing Host is proven dead, for a user's explicit
+   * stop. The workspace is not inspected again: every approved member is recorded as
+   * outcome_unknown with `reason`.
+   */
+  public async recordUnknownDispatchedEffect(input: {
+    source: PhaseDCommandSource;
+    effectIntentId: string;
+    reason: string;
+  }): Promise<ToolTerminalResult | null> {
+    const source = normalizeSource(input.source, ['recovery'], 'file-effect-recovery');
+    const reason = requireText(input.reason, 'reason');
+    const intent = await this.requireExisting('EffectIntent', requireId(input.effectIntentId, 'effectIntentId'));
+    if (intent.effect_kind !== FILE_EFFECT_KIND) throw new Error('Recovery target is not file_mutation.');
+    const existingReceipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
+    if (existingReceipts.length > 0) return this.reconcileEffectReceipt(existingReceipts[0].id as string);
+    if (intent.dispatch_state !== 'dispatched') throw new Error('Only dispatched file EffectIntent is recoverable.');
+    const attempt = await this.requireExisting('Attempt', requireId(intent.attempt_id, 'EffectIntent.attempt_id'));
+    const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
+    if (operation.owner_kind !== 'file_change_set') throw new Error('file_mutation Operation must belong to FileChangeSet.');
+    const changeSetId = requireId(operation.owner_id, 'Operation.owner_id');
+    const members = await this.readStoredMembers(changeSetId);
+    const observation: FileMutationObservation = {
+      changeSetId,
+      outcome: 'outcome_unknown',
+      members: members.map((member) => ({
+        memberId: member.id,
+        memberSeq: member.memberSeq.toString(),
+        outcome: 'outcome_unknown',
+        actualDigest: null,
+        error: reason
+      }))
+    };
+    const recorded = await this.effects.recordEffectReceipt({
+      source,
+      attemptId: intent.attempt_id as string,
+      effectKind: FILE_EFFECT_KIND,
+      outcome: 'outcome_unknown',
+      detail: observation
+    });
+    return this.reconcileEffectReceipt(recorded.effectReceiptId);
+  }
+
   private async readObservation(receipt: DomainRow, changeSetId: string): Promise<FileMutationObservation> {
     const approved = await this.readStoredMembers(changeSetId);
     if (receipt.response_object_id === null) {

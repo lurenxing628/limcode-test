@@ -448,6 +448,7 @@ export class VscodeReliableKernelProductRuntime {
         skills: { loadSkillsWithinPolicy: (names, policy) => toolHost.loadSkillsWithinPolicy(names, policy) },
         deliveryWakeups: application.processDeliveries,
         ownedProcessCleanup: application.childOwnedProcessCleanup,
+        deadHostEffects: application.phaseDRecovery,
         cancelTurnExecution: async ({ turnId, reason }) => {
           await Promise.all([
             application!.modelProvider.cancelTurnDispatches(turnId, reason),

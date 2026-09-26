@@ -140,6 +140,10 @@ export function conversationHostIneligibleMessage(
   return `无法确认当前窗口能否继续这个对话（${view.message}），因此不会在这里执行。`;
 }
 
+/** A stop whose Turn still has a tool running in another window that is alive or unverifiable. */
+export const STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE =
+  '停止请求已记录。这个对话的工具仍在另一个窗口中执行，请到该窗口查看停止结果。';
+
 /** An answer or approval recorded in a window that does not serve the Conversation. */
 export function conversationAnswerRecordedMessage(
   view: Exclude<ConversationHostEligibilityView, { eligible: true }>

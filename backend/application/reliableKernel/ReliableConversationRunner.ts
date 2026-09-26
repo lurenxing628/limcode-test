@@ -34,6 +34,7 @@ import {
   type ConversationRuntimeOwnerManager
 } from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
+import { DEAD_HOST_STOP_REASON } from '../../reliableKernel/phaseDRecovery';
 import type { CoordinateCompressionResult } from '../../reliableKernel/contextCompressionCoordinator';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnosticJournal';
@@ -137,6 +138,12 @@ export interface ReliableConversationRunnerRecoveryReport {
   interruptedTurnIds: string[];
   queuedConversationIds: string[];
 }
+
+/**
+ * A stop's outcome. `executingWindowAlive` means a tool of the Turn is still running in another
+ * window that is alive (or cannot be proven gone): the stop is recorded for that window.
+ */
+export type ReliableInterruptResult = TurnCommandResult & { executingWindowAlive?: true };
 
 export interface ReliableManualCompressionResult {
   turnId: string;
@@ -884,7 +891,7 @@ export class ReliableConversationRunner {
     turnId: string;
     expectedLeaseGeneration?: string;
     reason: string;
-  }): Promise<TurnCommandResult> {
+  }): Promise<ReliableInterruptResult> {
     this.requireOpen();
     const result = await this.application.turns.requestExternalInterrupt(input.conversationId, {
       source: { kind: 'command', key: input.commandId },
@@ -895,6 +902,19 @@ export class ReliableConversationRunner {
       reason: input.reason
     });
     if (result.ignoredBecauseTerminal) return result;
+    // Only this explicit stop may close work a window left running when it exited unexpectedly.
+    if (!this.active.has(input.turnId)) {
+      const closed = await this.settleDeadHostExecution(input.conversationId, input.turnId);
+      if (closed === 'interrupted') return result;
+      if (closed === 'live') return { ...await this.interruptThroughOwner(input, result), executingWindowAlive: true };
+    }
+    return this.interruptThroughOwner(input, result);
+  }
+
+  private async interruptThroughOwner(
+    input: { conversationId: string; turnId: string; reason: string },
+    result: TurnCommandResult
+  ): Promise<ReliableInterruptResult> {
     const eligibility = await this.conversationOwners.executionEligibility(input.conversationId);
     // A Turn running here stops through its own drive, whatever this window serves now.
     if (this.active.has(input.turnId) || (eligibility === 'eligible' && this.conversationOwners.owns(input.conversationId))) {
@@ -979,6 +999,63 @@ export class ReliableConversationRunner {
     } catch (error) {
       if (isConversationRuntimeOwnerBusyError(error)) return 'busy';
       this.onError(error, { operation: 'watch-recovery', conversationId, turnId });
+      return 'retry';
+    }
+  }
+
+  /**
+   * A user's explicit stop of a Turn whose tool is still marked executing by a window that exited
+   * unexpectedly. Only when every Host that dispatched that work, and the Host holding the Turn's
+   * lease, is proven dead (process gone or PID reused) is the work closed as outcome_unknown with
+   * DEAD_HOST_STOP_REASON and the Turn recorded as interrupted; nothing is dispatched or retried.
+   * Works in any window. 'live' means a Host that is alive or cannot be verified still runs it,
+   * so nothing is marked; 'none' leaves the stop to the ordinary paths.
+   */
+  private async settleDeadHostExecution(
+    conversationId: string,
+    turnId: string
+  ): Promise<'interrupted' | 'live' | 'none' | 'retry'> {
+    const phaseD = this.application.phaseDRecovery;
+    const hostBootId = this.application.database.hostBootId;
+    try {
+      const preview = await phaseD.deadHostEffectsForTurn(turnId, hostBootId);
+      if (preview.state === 'live') return 'live';
+      if (preview.state !== 'dead') return 'none';
+      return await this.conversationOwners.run(conversationId, async () => {
+        const facts = await this.application.turns.recoveryFacts(turnId);
+        if (facts.turnStatus !== 'active' || facts.judgment !== 'resume') return 'none';
+        if (!await this.findPendingTermination(turnId)) return 'none';
+        const claimed = await this.application.turns.claimRecoveryExecution({
+          turnId,
+          ...this.lease(conversationId)
+        });
+        if (!claimed) return 'live';
+        const fence = await this.application.turns.executionLeaseFence({
+          turnId,
+          leaseOwnerId: this.leaseOwnerId,
+          hostBootId
+        });
+        if (!fence) return 'retry';
+        return runWithExecutionLeaseFence(fence, async () => {
+          // Re-read under the lease: another stop may have closed some of the work meanwhile.
+          const current = await phaseD.deadHostEffectsForTurn(turnId, hostBootId);
+          if (current.state === 'live') return 'live';
+          if (current.state === 'unsupported') return 'none';
+          if (current.state === 'dead') {
+            await phaseD.abandonDeadHostEffects({
+              sourceKey: `user-stop-dead-host:${turnId}`,
+              effectIntentIds: current.effectIntentIds,
+              reason: DEAD_HOST_STOP_REASON
+            });
+          }
+          return await this.application.agentLoop.terminateRequested(turnId, 'user-stop-after-window-exit')
+            ? 'interrupted'
+            : 'retry';
+        });
+      });
+    } catch (error) {
+      if (isConversationRuntimeOwnerBusyError(error)) return 'live';
+      this.onError(error, { operation: 'drive', conversationId, turnId });
       return 'retry';
     }
   }

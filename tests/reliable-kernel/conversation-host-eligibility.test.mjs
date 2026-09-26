@@ -542,6 +542,40 @@ test('文件修改审批：不合格窗口只记录决定，不派发修改、�
   }
 });
 
+test('停止时工具仍在另一个存活窗口执行：面板停止提示去该窗口查看结果', async () => {
+  informationMessages.length = 0;
+  const interrupts = [];
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
+    toolHost: { setStateChangeListener() {} },
+    application: { database: { conversationOwners: { async run(_conversationId, operation) { return operation(); } } } },
+    conversations: {
+      async interrupt(input) {
+        interrupts.push(input.turnId);
+        return { receiptId: 'receipt', deduplicated: false, conversationId: input.conversationId, turnId: input.turnId,
+          pendingTurnInputId: 'stop', executingWindowAlive: true };
+      }
+    }
+  });
+  router.maybeRow = async (domain, id) => domain === 'Turn' ? { id, conversation_id: 'conversation', status: 'active' } : undefined;
+  router.list = async () => [];
+  const posted = [];
+  await router.dispatch('stop-client', webview(posted), {
+    id: 'stop',
+    type: BridgeMessageType.TurnInterrupt,
+    channel: 'command',
+    payload: {
+      conversationId: 'conversation', turnId: 'turn', leaseEpoch: 0,
+      command: { commandId: 'stop', expectedVersion: 0, issuedAt: Date.now() }, cascadeChildAgents: false
+    }
+  });
+  assert.deepEqual(interrupts, ['turn']);
+  assert.deepEqual(posted.map((message) => message.payload.status), ['accepted']);
+  assert.deepEqual(informationMessages, [
+    `${EXTENSION_BRAND}：停止请求已记录。这个对话的工具仍在另一个窗口中执行，请到该窗口查看停止结果。`
+  ]);
+});
+
 test('同项目两个窗口并发恢复只有一个承接，其它项目窗口不参与（跨进程证明）', { timeout: 240_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('race');
   const children = [];
