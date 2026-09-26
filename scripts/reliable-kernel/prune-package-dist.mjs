@@ -9,10 +9,11 @@ const extensionRoot = path.join(root, 'dist/extension');
 const manifestPath = path.join(root, 'dist/package-runtime-closure.json');
 const seedPaths = [
   'vscode/extension.js',
-  // RuntimeDatabase/ProcessControlPlane/snapshot audit resolve these by __dirname rather than CommonJS require().
+  // RuntimeDatabase/ProcessControlPlane/snapshot audit/data-set facts resolve these by __dirname rather than CommonJS require().
   'backend/reliableKernel/databaseWorker.js',
   'backend/reliableKernel/processWrapper.js',
-  'backend/reliableKernel/runtimeSnapshotAuditWorker.js'
+  'backend/reliableKernel/runtimeSnapshotAuditWorker.js',
+  'backend/reliableKernel/runtimeDataSetFactsWorker.js'
 ];
 
 if (!fs.existsSync(extensionRoot)) throw new Error('dist/extension does not exist; run build before package pruning.');

@@ -571,6 +571,14 @@ interface SourceMode {
   migration?: boolean;
 }
 
+/**
+ * The recorded source state. A migration writes no ledger record and has no size limit, so it
+ * needs none, and computing one would read the whole source again and cache it in the old directory.
+ */
+async function sourceFingerprint(candidate: VscodeRuntimeDataSetCandidate, mode: SourceMode): Promise<RuntimeDataSetFingerprint | undefined> {
+  return mode.migration ? undefined : runtimeDataSetFingerprint(candidate);
+}
+
 interface SourceProgress {
   fingerprint?: RuntimeDataSetFingerprint;
   upgradedFromEpoch?: 3 | 4;
@@ -606,7 +614,7 @@ async function mergeAdmittedSource(
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-same-identity', message: '来源与当前历史库是同一个数据集，不能合并。' });
   }
   await assertSourceIdle(candidate);
-  state.fingerprint = await runtimeDataSetFingerprint(candidate);
+  state.fingerprint = await sourceFingerprint(candidate, mode);
   if (candidate.requiresRecovery) {
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这个历史库有一次未完成的归档或切换，需要先切换到它完成恢复，才能合并。' });
   }
@@ -620,7 +628,7 @@ async function mergeAdmittedSource(
     });
     state.upgradedFromEpoch = upgrade.previousEpoch;
     candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
-    state.fingerprint = await runtimeDataSetFingerprint(candidate);
+    state.fingerprint = await sourceFingerprint(candidate, mode);
   } else if (epoch !== RUNTIME_KERNEL_EPOCH) {
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-epoch-unsupported', message: `第 ${epoch ?? '?'} 代格式的历史库不能合并。` });
   }
@@ -681,7 +689,7 @@ async function mergeAdmittedSource(
             throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(work.refused) || '收尾后仍有未结束的任务'));
           }
           finalized = { ...counts, sourceBackupPath };
-          state.fingerprint = await runtimeDataSetFingerprint(current);
+          state.fingerprint = await sourceFingerprint(current, mode);
         }
       }
       const size = audit.size!;

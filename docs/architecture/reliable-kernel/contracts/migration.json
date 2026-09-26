@@ -53,7 +53,7 @@
       "CollaborationMessage": ["message_seq"]
     },
     "integrity": "source-foreign-key-quick-check-before; every-source-id-asserted-present-inside-the-transaction",
-    "recordPolicy": "configuration-root-ledger-survives-target-deletion; committing-with-exact-inserted-id-set-counts-as-unmerged; outcomes-keyed-by-exact-source-file-state; user-kept-marker-in-source-control-root",
+    "recordPolicy": "configuration-root-ledger-survives-target-deletion; committing-with-exact-inserted-id-set-counts-as-unmerged; outcomes-keyed-by-source-content-digest-cached-by-exact-file-state; later-failed-attempt-keeps-last-merge; user-kept-marker-in-source-control-root",
     "noticePolicy": "causes-accumulate-per-configuration-root; only-reevaluated-sources-drop-causes; explicit-request-outcome-always-shown; details-in-log-and-data-set-management",
     "sourceRetention": "conversation-content-unchanged; published-3-4-backed-up-and-upgraded-in-place; backup-before-finalization",
     "selectionPolicy": "never-switch",

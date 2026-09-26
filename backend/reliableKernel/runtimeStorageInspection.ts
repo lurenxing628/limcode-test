@@ -156,22 +156,10 @@ export async function createRuntimeDataSetDatabaseSnapshot(
     beforeOpen?(snapshotPath: string): Promise<void>;
   } = {}
 ): Promise<RuntimeDataSetDatabaseSnapshot> {
-  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-runtime-history-'));
+  const copy = await copyRuntimeDataSetDatabase(candidate, binding);
   let database: Database.Database | undefined;
   try {
-    const snapshotPath = path.join(temporaryRoot, 'limcode.sqlite');
-    await fs.copyFile(binding.paths.databasePath, snapshotPath, constants.COPYFILE_FICLONE);
-    for (const suffix of ['-wal', '-journal']) {
-      const source = `${binding.paths.databasePath}${suffix}`;
-      if (!await exists(source)) continue;
-      await assertNoSymbolicPath(candidate.configurationRootPath, source);
-      const stat = await fs.lstat(source);
-      if (!stat.isFile()) throw new Error(`Historical SQLite sidecar is not a regular file: ${suffix}`);
-      if (suffix === '-journal' && stat.size > 0) {
-        throw new Error('Historical SQLite has a rollback journal; finish its existing offline recovery first.');
-      }
-      if (suffix === '-wal') await fs.copyFile(source, `${snapshotPath}${suffix}`, constants.COPYFILE_FICLONE);
-    }
+    const snapshotPath = copy.databasePath;
     await options.beforeOpen?.(snapshotPath);
     database = new Database(toSqliteFilePath(snapshotPath), { readonly: true, fileMustExist: true });
     configureReaderConnection(database);
@@ -185,12 +173,43 @@ export async function createRuntimeDataSetDatabaseSnapshot(
         if (closed) return;
         closed = true;
         database!.close();
-        await fs.rm(temporaryRoot, { recursive: true, force: true });
+        await copy.remove();
       }
     };
   } catch (error) {
     database?.close();
-    await fs.rm(temporaryRoot, { recursive: true, force: true });
+    await copy.remove();
+    throw error;
+  }
+}
+
+/**
+ * Private copy of a data set's SQLite database and WAL (never its -shm) in a fresh temporary
+ * directory; nothing of the source is opened. Same caller contract as the snapshot above.
+ */
+export async function copyRuntimeDataSetDatabase(
+  candidate: VscodeRuntimeDataSetCandidate,
+  binding: HistoricalRootBinding
+): Promise<{ databasePath: string; remove(): Promise<void> }> {
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-runtime-history-'));
+  const remove = () => fs.rm(temporaryRoot, { recursive: true, force: true });
+  try {
+    const databasePath = path.join(temporaryRoot, 'limcode.sqlite');
+    await fs.copyFile(binding.paths.databasePath, databasePath, constants.COPYFILE_FICLONE);
+    for (const suffix of ['-wal', '-journal']) {
+      const source = `${binding.paths.databasePath}${suffix}`;
+      if (!await exists(source)) continue;
+      await assertNoSymbolicPath(candidate.configurationRootPath, source);
+      const stat = await fs.lstat(source);
+      if (!stat.isFile()) throw new Error(`Historical SQLite sidecar is not a regular file: ${suffix}`);
+      if (suffix === '-journal' && stat.size > 0) {
+        throw new Error('Historical SQLite has a rollback journal; finish its existing offline recovery first.');
+      }
+      if (suffix === '-wal') await fs.copyFile(source, `${databasePath}${suffix}`, constants.COPYFILE_FICLONE);
+    }
+    return { databasePath, remove };
+  } catch (error) {
+    await remove();
     throw error;
   }
 }

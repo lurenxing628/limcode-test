@@ -398,7 +398,8 @@ function checkBridgePayloadPlain() {
   const internalStructuredClonePaths = new Set([
     'dist/extension/backend/reliableKernel/databaseWorker.js',
     'dist/extension/backend/reliableKernel/runtimeDatabase.js',
-    'dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js'
+    'dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js',
+    'dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js'
   ]);
   const problems = [];
 

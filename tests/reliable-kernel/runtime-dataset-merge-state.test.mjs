@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -18,9 +19,10 @@ const { projectFolderAssignmentSteps } = kernelFile('conversationProject.js');
 const {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
+const { runtimeDataSetFingerprint } = kernelFile('runtimeDataSetMergeLedger.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const {
-  resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
+  resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot, resolveVscodeRuntimeSelectionPath, selectVscodeRuntimeDataSet
 } = kernelFile('vscodeRootAuthority.js');
 
@@ -151,6 +153,62 @@ test('切走时写不了“用户保留”标记就不切换；切走无法检�
   const marker = JSON.parse(await fs.readFile(path.join(alphaControl, 'kept-by-user.json'), 'utf8'));
   assert.equal(marker.anyIncarnation, true);
   assert.equal(marker.dataSetId, undefined);
+});
+
+test('合并后有无改动按内容判断：旧窗口崩溃留下的 WAL 被打开一次、文件被原样恢复都不算改动，写入一行才算', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_wal', project: SHARED_PROJECT }]);
+  // An old window writes, then dies without checkpointing: the source carries a non-empty WAL.
+  const script = `
+    const Database = require(${JSON.stringify(require.resolve('better-sqlite3'))});
+    const db = new Database(${JSON.stringify(fixture.alpha.binding.paths.databasePath)});
+    db.pragma('wal_autocheckpoint = 0');
+    db.prepare("UPDATE conversation SET title = 'renamed by old window' WHERE id = 'conversation_alpha_wal'").run();
+    process.kill(process.pid, 'SIGKILL');`;
+  await new Promise((resolve) => execFile(process.execPath, ['-e', script], () => resolve()));
+  assert.ok((await fs.stat(`${fixture.alpha.binding.paths.databasePath}-wal`)).size > 0, '来源带着非空 WAL');
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database, { candidateIds: [fixture.alpha.id] })).merged.length, 1);
+  const changed = async () => (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id).changedSinceMerge;
+  assert.equal(await changed(), false);
+
+  // Opened once (switched to and back): the WAL is checkpointed into the database, nothing is written.
+  const databaseBefore = await fs.stat(fixture.alpha.binding.paths.databasePath);
+  const opened = await kernel.RuntimeDatabase.open(fixture.alpha.authority, { hostBootId: `view-${randomUUID()}` });
+  const row = (await opened.snapshot([repo('Conversation').get('conversation_alpha_wal')])).snapshot[0];
+  assert.equal(row.title, 'renamed by old window');
+  await opened.close();
+  const databaseAfter = await fs.stat(fixture.alpha.binding.paths.databasePath);
+  assert.notDeepEqual([databaseAfter.size, databaseAfter.mtimeMs], [databaseBefore.size, databaseBefore.mtimeMs], '文件确实被改写过');
+  assert.equal(await changed(), false, '只是检查点合并，不算合并后有改动');
+
+  // The files are restored in place from a copy (another inode, another modification time).
+  const copy = path.join(fixture.root, 'restored.sqlite');
+  await fs.copyFile(fixture.alpha.binding.paths.databasePath, copy);
+  await fs.rm(fixture.alpha.binding.paths.databasePath);
+  await fs.rename(copy, fixture.alpha.binding.paths.databasePath);
+  assert.equal(await changed(), false, '原样恢复不算改动');
+
+  await continueConversation(fixture.alpha, 'conversation_alpha_wal');
+  assert.equal(await changed(), true, '写入一行就算合并后有改动');
+});
+
+test('内容指纹按确切文件状态缓存：文件没动时不再复制读取，文件一动就重新计算', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_cached', project: SHARED_PROJECT }]);
+  const candidate = await resolveVscodeRuntimeDataSet(fixture.paths, fixture.alpha.id);
+  const first = await runtimeDataSetFingerprint(candidate);
+  assert.match(first.contentDigest, /^[0-9a-f]{64}$/);
+  assert.deepEqual(Object.keys(first).sort(), ['contentDigest', 'dataSetId', 'pointerRevision', 'rootGeneration', 'rootInstanceId']);
+  const cacheFile = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'fingerprints', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const cache = JSON.parse(await fs.readFile(cacheFile, 'utf8'));
+  assert.deepEqual(cache.fingerprint, first);
+  // A marked cache entry proves the next read used it instead of copying the database again.
+  await fs.writeFile(cacheFile, JSON.stringify({ ...cache, fingerprint: { ...first, contentDigest: 'from-cache' } }));
+  assert.equal((await runtimeDataSetFingerprint(candidate)).contentDigest, 'from-cache');
+  const now = new Date();
+  await fs.utimes(fixture.alpha.binding.paths.databasePath, now, now);
+  assert.equal((await runtimeDataSetFingerprint(candidate)).contentDigest, first.contentDigest, '文件状态变了就重新计算，内容相同摘要相同');
 });
 
 function pick(state) {

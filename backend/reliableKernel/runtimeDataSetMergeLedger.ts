@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
 import { requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import { resolveVscodeRuntimeMergeLedgerRoot, type VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
 
@@ -13,22 +14,26 @@ import { resolveVscodeRuntimeMergeLedgerRoot, type VscodeRuntimeDataSetCandidate
 const RECORD_KIND = 'limcode-runtime-data-set-merge';
 const REQUEST_KIND = 'limcode-runtime-data-set-merge-request';
 const COMMIT_KIND = 'limcode-runtime-data-set-merge-commit';
+const FINGERPRINT_KIND = 'limcode-runtime-data-set-fingerprint';
 const RECORDS = 'records';
 const REQUESTS = 'requests';
 const COMMITS = 'commits';
+/** Cache only: the content digest last computed for an exact file state. Never a merge fact. */
+const FINGERPRINTS = 'fingerprints';
 
 type StoragePaths = { globalStoragePath: string };
 
-/** Identity plus exact SQLite file state; a changed source is judged again. */
+/**
+ * Identity plus logical content; a changed source is judged again. The digest covers every row
+ * (runtimeDataSetContentDigest), so checkpointing a WAL, copying or restoring the files, or opening
+ * the data set without writing leaves it unchanged, while any written row changes it.
+ */
 export interface RuntimeDataSetFingerprint {
   dataSetId: string;
   rootInstanceId: string;
   rootGeneration: number;
   pointerRevision: number;
-  databaseSize: number;
-  databaseMtimeMs: number;
-  walSize: number;
-  walMtimeMs: number;
+  contentDigest: string;
 }
 
 export interface RuntimeDataSetIdentity {
@@ -86,26 +91,82 @@ export interface RuntimeDataSetMergeCommit {
   rows: Array<[domain: string, id: string]>;
 }
 
+/**
+ * Reads the data set through a private copy in a worker (see runtimeDataSetFacts), except when the
+ * SQLite files are exactly as they were when the cached digest was computed. Same caller contract
+ * as the copy: never for a database this process has open.
+ */
 export async function runtimeDataSetFingerprint(candidate: VscodeRuntimeDataSetCandidate): Promise<RuntimeDataSetFingerprint> {
+  const paths = { globalStoragePath: candidate.configurationRootPath };
   const binding = await requireCompleteRuntimeDataSet(candidate);
-  const database = await fs.stat(binding.paths.databasePath);
-  let wal: { size: number; mtimeMs: number } = { size: 0, mtimeMs: 0 };
-  try { wal = await fs.stat(`${binding.paths.databasePath}-wal`); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const identity = fingerprintIdentity(binding);
+  const files = await databaseFileState(binding.paths.databasePath);
+  const cached = await readFingerprintCache(paths, candidate.id).catch(() => undefined);
+  if (cached?.files === files && sameFingerprintIdentity(cached.fingerprint, identity)) return cached.fingerprint;
+  let facts: Awaited<ReturnType<typeof readRuntimeDataSetFacts>>;
+  try { facts = await readRuntimeDataSetFacts(candidate, { contentDigest: true }); }
+  catch {
+    // Content that cannot be read (a damaged file, an unknown format, no room for the copy) is
+    // judged by its exact file state, never cached: the merge's own checks report the cause.
+    return { ...identity, contentDigest: `unreadable:${files}` };
+  }
+  const fingerprint: RuntimeDataSetFingerprint = { ...fingerprintIdentity(facts.binding), contentDigest: facts.contentDigest! };
+  // Cached only when nothing moved while the copy was taken.
+  if (sameFingerprintIdentity(fingerprint, identity)
+    && await databaseFileState(binding.paths.databasePath).catch(() => undefined) === files) {
+    await writeLedgerJson(paths, FINGERPRINTS, candidate.id, { kind: FINGERPRINT_KIND, candidateId: candidate.id, files, fingerprint })
+      .catch(() => undefined);
+  }
+  return fingerprint;
+}
+
+export function sameRuntimeDataSetFingerprint(left: RuntimeDataSetFingerprint, right: RuntimeDataSetFingerprint | undefined): boolean {
+  return right !== undefined && sameFingerprintIdentity(left, right)
+    && typeof left.contentDigest === 'string' && left.contentDigest === right.contentDigest;
+}
+
+type FingerprintIdentity = Omit<RuntimeDataSetFingerprint, 'contentDigest'>;
+
+function fingerprintIdentity(binding: FingerprintIdentity): FingerprintIdentity {
   return {
     dataSetId: binding.dataSetId,
     rootInstanceId: binding.rootInstanceId,
     rootGeneration: binding.rootGeneration,
-    pointerRevision: binding.pointerRevision,
-    databaseSize: database.size,
-    databaseMtimeMs: database.mtimeMs,
-    walSize: wal.size,
-    walMtimeMs: wal.mtimeMs
+    pointerRevision: binding.pointerRevision
   };
 }
 
-export function sameRuntimeDataSetFingerprint(left: RuntimeDataSetFingerprint, right: RuntimeDataSetFingerprint | undefined): boolean {
-  return right !== undefined && (Object.keys(left) as (keyof RuntimeDataSetFingerprint)[]).every((key) => left[key] === right[key]);
+function sameFingerprintIdentity(left: FingerprintIdentity, right: FingerprintIdentity): boolean {
+  return left.dataSetId === right.dataSetId && left.rootInstanceId === right.rootInstanceId
+    && left.rootGeneration === right.rootGeneration && left.pointerRevision === right.pointerRevision;
+}
+
+/** Exact state of the database and WAL files: any rewrite, copy or restore changes it. */
+async function databaseFileState(databasePath: string): Promise<string> {
+  const describe = (stat: import('node:fs').BigIntStats): string =>
+    `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  const database = describe(await fs.stat(databasePath, { bigint: true }));
+  let wal = 'absent';
+  try { wal = describe(await fs.stat(`${databasePath}-wal`, { bigint: true })); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  return `db=${database};wal=${wal}`;
+}
+
+async function readFingerprintCache(
+  paths: StoragePaths,
+  candidateId: string
+): Promise<{ files: string; fingerprint: RuntimeDataSetFingerprint } | undefined> {
+  const file = await ledgerFile(paths, FINGERPRINTS, candidateId);
+  let value: unknown;
+  try { value = JSON.parse(await fs.readFile(file, 'utf8')) as unknown; }
+  catch { return undefined; }
+  const entry = value as { kind?: unknown; candidateId?: unknown; files?: unknown; fingerprint?: Partial<RuntimeDataSetFingerprint> } | null;
+  const fingerprint = entry?.fingerprint;
+  if (entry?.kind !== FINGERPRINT_KIND || entry.candidateId !== candidateId || typeof entry.files !== 'string' || !fingerprint
+    || typeof fingerprint.dataSetId !== 'string' || typeof fingerprint.rootInstanceId !== 'string'
+    || typeof fingerprint.rootGeneration !== 'number' || typeof fingerprint.pointerRevision !== 'number'
+    || typeof fingerprint.contentDigest !== 'string') return undefined;
+  return { files: entry.files, fingerprint: fingerprint as RuntimeDataSetFingerprint };
 }
 
 export function sameRuntimeDataSetIdentity(
