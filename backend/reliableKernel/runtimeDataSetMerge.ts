@@ -60,6 +60,11 @@ import {
 export const RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY = 'merge-backups';
 /** Backup of a source taken before its unfinished work is finalized (source control root). */
 export const RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY = 'merge-source-backups';
+/**
+ * A recorded merge request keeps its source pending for later startups (a window closed, or the
+ * merge was deferred) until it merged, was refused, or this long passed.
+ */
+export const RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Target backups kept per control root; older ones are removed after a successful batch. */
 export const RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION = 3;
 /**
@@ -151,6 +156,13 @@ export interface RuntimeDataSetOversizedMerge {
   operationKey: string;
   /** The user explicitly asked for this merge (the caller may wait for busy windows). */
   requested: boolean;
+  /**
+   * Takes configuration admission and then the target's maintenance claim around `body`: the
+   * coordination calls it only once every window is ready (see runExclusiveRuntimeMaintenance).
+   */
+  withLocks<R>(body: () => Promise<R>): Promise<R>;
+  /** A failure of `merge` that will fail the same way again, so the coordination may stop retrying it. */
+  isDeterministicFailure(error: unknown): boolean;
 }
 
 export interface RuntimeDataSetMergeBatchOptions extends RuntimeDataSetMergeOptions {
@@ -163,11 +175,18 @@ export interface RuntimeDataSetMergeBatchOptions extends RuntimeDataSetMergeOpti
   /** Restricts the batch, e.g. to a source the user just asked to merge. */
   candidateIds?: readonly string[];
   /**
+   * This very call is the user's explicit request to merge the sources in candidateIds (required
+   * with it): merged even when kept or merged before, a recorded refusal is tried again, every
+   * outcome is reported, and an oversized source's coordination may wait for busy windows. Never
+   * inferred from a recorded request: a later startup treats that source as ordinarily pending.
+   */
+  requested?: boolean;
+  /**
    * Exclusive fallback for one source above the online limits, called only after everything that
    * can refuse the source passed (unfinished work, conflicts, CAS objects, which are already
-   * transferred) and the target backup exists, inside configuration admission and the target's
-   * maintenance claim: ask the other windows of the target to go offline (the two-phase exclusive
-   * maintenance primitive), then run `merge`: the final re-check and the one row transaction only.
+   * transferred) and the target backup exists, outside every claim: ask the other windows of the
+   * target to go offline (waiting for busy ones without a lock), then run `merge` inside
+   * `input.withLocks`. `merge` is the final re-check of the source and the one row transaction.
    */
   coordinateOversized?(input: RuntimeDataSetOversizedMerge, merge: () => Promise<void>): Promise<RuntimeDataSetExclusiveOutcome>;
 }
@@ -321,28 +340,38 @@ export async function mergeHistoricalDataSetsOnline(
     report.targetCandidateId = selected[0].id;
     const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
     const requests = await readRuntimeDataSetMergeRequests(storagePaths);
+    const explicit = options.requested === true && options.candidateIds !== undefined;
     const picked: Array<{ candidate: VscodeRuntimeDataSetCandidate; requested: boolean }> = [];
     for (const candidate of inspection.candidates) {
       if (candidate.selected || !candidate.dataSetId || !candidate.rootInstanceId) continue;
+      let request = requests.get(candidate.id);
+      if (request && !(Date.now() - Date.parse(request.requestedAt) < RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS)) {
+        await removeRuntimeDataSetMergeRequest(storagePaths, candidate.id);
+        request = undefined;
+      }
       if (options.candidateIds && !options.candidateIds.includes(candidate.id)) continue;
-      const request = requests.get(candidate.id);
-      const requested = request !== undefined && sameRuntimeDataSetIdentity(request.target, target.identity)
+      const requested = explicit;
+      // A recorded request only keeps its source pending (see RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS).
+      const pending = request !== undefined && sameRuntimeDataSetIdentity(request.target, target.identity)
         && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId;
       const recorded = ledger.get(candidate.id);
       const record = recorded && sameRuntimeDataSetIdentity(recorded.source, candidate) ? recorded : undefined;
       const fingerprint = record ? await runtimeDataSetFingerprint(candidate).catch(() => undefined) : undefined;
       const unchanged = record !== undefined && sameRuntimeDataSetFingerprint(record.source, fingerprint);
       if (record?.state === 'merged' && sameRuntimeDataSetIdentity(record.target, target.identity) && unchanged) {
-        if (requested) await removeRuntimeDataSetMergeRequest(storagePaths, candidate.id);
+        if (request) await removeRuntimeDataSetMergeRequest(storagePaths, candidate.id);
         continue;
       }
       if (!requested) {
         // Kept by the user, or merged once already (into any data set, also when a later explicit
-        // attempt ended otherwise): explicit request only. An interrupted commit still converges.
-        if ((record && record.state !== 'committing' && runtimeDataSetLastMerge(record))
-          || await isVscodeRuntimeDataSetKept(candidate)) continue;
+        // attempt ended otherwise): only on request. An interrupted commit still converges.
+        if (!pending && ((record && record.state !== 'committing' && runtimeDataSetLastMerge(record))
+          || await isVscodeRuntimeDataSetKept(candidate))) continue;
+        // A refusal of this unchanged source is reported again without redoing it, unless the
+        // request came after that judgment.
         const known = unchanged && (record?.state === 'failed'
-          || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, target.identity)));
+          || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, target.identity)))
+          && !(pending && request!.requestedAt > record.updatedAt);
         if (known && (record.state === 'failed' || record.state === 'blocked')) {
           (record.state === 'failed' ? report.failures : report.blocked).push({
             candidateId: candidate.id, code: record.code, message: record.message, newly: false
@@ -527,6 +556,7 @@ export async function readRuntimeDataSetMergeStates(
     const carried = lastMerged ? { lastMerged } : {};
     const request = requests.get(candidate.id);
     if (request && current && sameRuntimeDataSetIdentity(request.target, current)
+      && Date.now() - Date.parse(request.requestedAt) < RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS
       && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId) {
       result.set(candidate.id, { state: 'requested', requestedAt: request.requestedAt, ...carried });
     } else if (unchanged && (record?.state === 'failed'
@@ -982,7 +1012,8 @@ async function commitSource(
 
 /**
  * Oversized source: only now, with everything prepared and checked, the other windows of the
- * target are asked to go offline, and the coordination wraps the final commit alone.
+ * target are asked to go offline (waiting without any claim); the locks the coordination takes
+ * once they are offline wrap the final commit alone.
  */
 async function commitExclusively(
   paths: { globalStoragePath: string },
@@ -995,13 +1026,16 @@ async function commitExclusively(
   commit: () => Promise<SourceOutcome>
 ): Promise<SourceOutcome> {
   const done: { outcome?: SourceOutcome } = {};
-  const exclusive = await withRuntimeDataRootAdmission(paths.globalStoragePath, () => withRuntimeMaintenance(target.binding.paths, () => coordinate({
+  const exclusive = await coordinate({
     targetPaths: target.binding.paths,
     requesterHostBootId: target.database.hostBootId,
     candidateId,
     operationKey: `${candidateId}@${fingerprintDigest(state.fingerprint!)}`,
-    requested: mode.requested
-  }, async () => { done.outcome = await commit(); })));
+    requested: mode.requested,
+    withLocks: (body) => withRuntimeDataRootAdmission(paths.globalStoragePath,
+      () => withRuntimeMaintenance(target.binding.paths, body)),
+    isDeterministicFailure: (error) => error instanceof Outcome && error.outcome.kind !== 'deferred'
+  }, async () => { done.outcome = await commit(); });
   if (exclusive.state !== 'completed' || !done.outcome) {
     const reason = 'reason' in exclusive && exclusive.reason ? exclusive.reason : '其它窗口暂时无法让出';
     throw new Outcome({ kind: 'deferred', code: `runtime-data-set-merge-exclusive-${exclusive.state}`,

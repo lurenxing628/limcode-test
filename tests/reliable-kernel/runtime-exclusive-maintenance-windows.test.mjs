@@ -227,7 +227,7 @@ test('复现改写（严重）：用户请求过的大来源在其它窗口让�
     expectedDataSetId: fixture.alpha.binding.dataSetId,
     expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
   });
-  const windows = createWindows(t, fixture.root, { limits: LIMITS, failLink: true });
+  const windows = createWindows(t, fixture.root, { limits: LIMITS, failCommit: true });
   const a = await windows.start('A');
   await a.waitFor('report');
   await windows.start('B');
@@ -240,6 +240,19 @@ test('复现改写（严重）：用户请求过的大来源在其它窗口让�
   // A alone: fails without anybody reloading; B: A reloads once and it fails; A again: backoff.
   assert.ok(coordination.includes('backoff'), JSON.stringify(coordination));
   for (const report of windows.reports()) assert.deepEqual(report.merged, []);
+});
+
+test('复审 merge2 #3：大来源的正文复制失败发生在协调之前，从不请求其它窗口让出', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
+  const windows = createWindows(t, fixture.root, { limits: LIMITS, failLink: true });
+  await (await windows.start('B', { noMerge: true })).waitFor('ready');
+  const report = await (await windows.start('A')).waitFor('report');
+  await delay(500);
+  await windows.stop();
+  assert.deepEqual(report.deferred, ['EIO']);
+  assert.deepEqual(windows.events().filter((event) => event.event === 'coordination'), []);
+  assert.deepEqual(windows.reloads(), { B: 0, A: 0 });
 });
 
 test('复现改写：用户请求过的大来源遇到忙窗口时不在锁内等待，新窗口可以立即打开', async (t) => {

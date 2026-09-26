@@ -100,6 +100,13 @@ if (behavior.request) {
       // Stands in for a persistent I/O failure while linking/copying CAS (EIO, EACCES, ENOSPC …).
       linkFile: async () => { throw Object.assign(new Error('input/output error'), { code: 'EIO' }); }
     } : {}),
+    ...(behavior.failCommit ? {
+      // Stands in for a persistent failure of the final commit, the only step after the other
+      // windows yielded (the CAS transfer and the backup run before any coordination).
+      onFaultPoint(point) {
+        if (point === 'before-row-commit') throw Object.assign(new Error('input/output error'), { code: 'EIO' });
+      }
+    } : {}),
     coordinateOversized: (input, merge) => requestOtherWindowsToYield({ globalStoragePath: root }, input, merge)
   });
   await emit('report', {
@@ -121,7 +128,9 @@ async function requestOtherWindowsToYield(storagePaths, input, merge) {
     configurationRootPath: storagePaths.globalStoragePath,
     requesterHostBootId: input.requesterHostBootId,
     ignoreBackoff: input.requested,
-    ...(input.requested ? { participantConfirmation: 'notice' } : {}),
+    ...(input.requested ? { whenBusy: 'wait', participantConfirmation: 'notice' } : {}),
+    isDeterministicFailure: input.isDeterministicFailure,
+    withLocks: input.withLocks,
     isCurrent: () => true
   }, merge).catch(async (error) => {
     await emit('coordination', { state: 'threw', requested: input.requested, reason: String(error?.message ?? error) });

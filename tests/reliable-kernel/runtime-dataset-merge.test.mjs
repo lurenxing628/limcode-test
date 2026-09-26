@@ -20,11 +20,12 @@ const { attachmentObservationLinkId } = kernelFile('attachmentObservations.js');
 const { stablePhaseDId } = kernelFile('effectControlPlane.js');
 const { createConversationRuntimeWorkProbe } = kernelFile('conversationRuntimePendingWork.js');
 const {
-  MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, mergeHistoricalDataSetsOnline,
+  MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS,
+  mergeHistoricalDataSetsOnline,
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
-const { requestExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
+const { runExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
@@ -204,9 +205,13 @@ test('无现成终态转换的未完成工作拒绝合并：写明原因与出�
 
   await requestMerge(fixture, fixture.alpha);
   assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'requested');
-  const retried = await merge(fixture, database);
+  // A later startup finds the recorded request: tried again, but as an ordinary pending source.
+  const background = await merge(fixture, database);
+  const pending = background.blocked.find((item) => item.candidateId === fixture.alpha.id);
+  assert.deepEqual([pending?.newly, pending?.requested], [true, false], '复审 coord2 #1：持久请求不算用户明确请求');
+  const retried = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
   const alpha = retried.blocked.find((item) => item.candidateId === fixture.alpha.id);
-  assert.deepEqual([alpha?.newly, alpha?.requested], [true, true], '用户明确请求的结果总是提示');
+  assert.deepEqual([alpha?.newly, alpha?.requested], [true, true], '用户点击的那一次调用：结果总是提示');
 });
 
 test('协作消息 message_seq 平移到当前库最大值之后并保持相对顺序；附件观察按内容身份复用', async (t) => {
@@ -498,13 +503,8 @@ test('复审 merge2 #3/#9：超限来源在冲突之前从不请求协调；协�
   const calls = [];
   const limits = { maxRows: 5, maxBytes: 1 << 30 };
   const coordinateOversized = async (input, run) => {
-    calls.push({
-      input,
-      admission: isRuntimeDataRootAdmissionHeld(fixture.root),
-      targetClaim: isRuntimeMaintenanceHeld(input.targetPaths),
-      sourceClaim: isRuntimeMaintenanceHeld(fixture.alpha.binding.paths)
-    });
-    await run();
+    calls.push(input.candidateId);
+    await input.withLocks(run);
     return { state: 'completed' };
   };
   const blocked = await merge(fixture, database, { limits, coordinateOversized });
@@ -524,13 +524,18 @@ test('复审 merge2 #3/#9：超限来源在冲突之前从不请求协调；协�
       const text = messageText('conversation_alpha_large', 0);
       calls.push({ cas: await fs.readFile(casFile(clean.current.binding, text), 'utf8') === text,
         backups: (await fs.readdir(path.join(controlRoot(clean.current), 'merge-backups'))).length,
-        admission: isRuntimeDataRootAdmissionHeld(clean.root), sourceClaim: isRuntimeMaintenanceHeld(clean.alpha.binding.paths) });
-      await run();
+        claims: [isRuntimeDataRootAdmissionHeld(clean.root), isRuntimeMaintenanceHeld(input.targetPaths)] });
+      await input.withLocks(async () => {
+        calls.push({ locked: [isRuntimeDataRootAdmissionHeld(clean.root), isRuntimeMaintenanceHeld(input.targetPaths),
+          isRuntimeMaintenanceHeld(clean.alpha.binding.paths)] });
+        await run();
+      });
       return { state: 'completed' };
     }
   });
   assert.deepEqual(report.merged.map((item) => item.exclusive), [true]);
-  assert.deepEqual(calls, [{ cas: true, backups: 1, admission: true, sourceClaim: false }], '协调前正文已复制、备份已完成；来源锁只在事务那一步');
+  assert.deepEqual(calls, [{ cas: true, backups: 1, claims: [false, false] }, { locked: [true, true, false] }],
+    '协调在锁外开始（正文已复制、备份已完成），拿锁后才执行；来源锁只在复核与事务那一步');
   assert.deepEqual(heldAt, {
     'after-target-backup': [false, false], 'after-cas-transfer': [false, false],
     'before-row-commit': [true, true], 'after-row-commit': [true, true]
@@ -596,6 +601,25 @@ test('复审 startup2 #2：合并中当前库被关闭（重载/切库）记为�
   assert.deepEqual(await treeSnapshot(stop.alpha.scopeRoot), sourceBefore, '停止时来源没有被收尾');
   assert.equal(databaseDigest(stop.current), targetBefore);
   await assert.rejects(fs.stat(path.join(controlRoot(stop.current), 'merge-backups')), { code: 'ENOENT' });
+});
+
+test('复审 startup2 #6：持久合并请求有期限，过期后删除，不再让保留的库自动合并', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false, selected: 'alpha' });
+  await seed(fixture.current, [{ id: 'conversation_default_kept', project: SHARED_PROJECT }]);
+  let database = await openTarget(t, fixture.alpha);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  await database.close();
+  await selectVscodeRuntimeDataSet(fixture.paths, 'default');
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_kept', project: SHARED_PROJECT }]);
+  await requestMerge(fixture, fixture.alpha);
+  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'requests', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const request = JSON.parse(await fs.readFile(file, 'utf8'));
+  await fs.writeFile(file, JSON.stringify({ ...request, requestedAt: new Date(Date.now() - RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS - 1000).toISOString() }));
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'kept', '过期请求不再显示为已请求');
+  database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database);
+  assert.deepEqual([report.pendingSources, report.merged], [0, []]);
+  await assert.rejects(fs.stat(file), { code: 'ENOENT' }, '过期请求被删除');
 });
 
 test('审查 #8：当前库备份失败时不留临时文件与空目录并推迟；成功后只保留最新几份备份', async (t) => {
@@ -665,15 +689,16 @@ test('超过在线事务上限的来源：无协调则推迟；协调成功走�
   assert.equal(calls[0].requested, false);
   assert.match(busy.deferred.find((item) => item.candidateId === delta.id).message, /需要其它窗口暂时让出才能合并/);
 
-  // Through the real two-phase primitive: called inside the target maintenance claim and the
-  // configuration admission; with no other window it runs at once, this window stays open.
+  // Through the real two-phase primitive: called outside every claim, it takes the engine's locks
+  // once every window is ready; with no other window it runs at once, this window stays open.
   const exclusive = await merge(fixture, database, {
     limits,
     coordinateOversized: (input, run) => {
       calls.push(input);
-      return requestExclusiveRuntimeMaintenance(input.targetPaths, {
+      return runExclusiveRuntimeMaintenance(input.targetPaths, {
         operation: 'historical-merge', operationKey: input.operationKey, message: '为合并较大的旧聊天记录',
-        configurationRootPath: fixture.root, requesterHostBootId: input.requesterHostBootId, ignoreBackoff: false
+        configurationRootPath: fixture.root, requesterHostBootId: input.requesterHostBootId, ignoreBackoff: false,
+        isDeterministicFailure: input.isDeterministicFailure, withLocks: input.withLocks
       }, run);
     }
   });
@@ -684,9 +709,15 @@ test('超过在线事务上限的来源：无协调则推迟；协调成功走�
   await requestMerge(fixture, fixture.beta);
   await fs.rm(path.join(fixture.beta.binding.paths.dataRootPath, 'host-liveness'), { recursive: true });
   await seed(fixture.beta, [{ id: 'conversation_beta_more', project: SHARED_PROJECT }]);
-  const requested = await merge(fixture, database, { limits, coordinateOversized: coordinate('completed') });
+  const later = await merge(fixture, database, { limits, coordinateOversized: coordinate('busy') });
+  assert.equal(calls.at(-1).candidateId, fixture.beta.id);
+  assert.equal(calls.at(-1).requested, false, '复审 startup2 #6：之后的启动不按“用户刚请求”协调');
+  assert.equal(later.deferred.find((item) => item.candidateId === fixture.beta.id)?.requested, false);
+  const requested = await merge(fixture, database, {
+    limits, coordinateOversized: coordinate('completed'), candidateIds: [fixture.beta.id], requested: true
+  });
   assert.deepEqual(requested.merged.map((item) => item.candidateId), [fixture.beta.id]);
-  assert.equal(calls.at(-1).requested, true, '用户明确请求的合并交给协调方用等待模式');
+  assert.equal(calls.at(-1).requested, true, '用户点击的那一次合并交给协调方用等待模式');
 });
 
 test('用户切走的库记为保留、不自动合并，只能明确请求；旧版本留下的固定根在当前库是工作区库时也自动合并', async (t) => {

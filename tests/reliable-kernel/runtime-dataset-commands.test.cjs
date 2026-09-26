@@ -510,9 +510,11 @@ test('background merge reports new outcomes once, stays silent for known ones an
 });
 
 test('only an oversized source the engine prepared asks other windows to yield, keyed by that source state', async () => {
+  const withLocks = body => body();
+  const isDeterministicFailure = () => false;
   const oversized = requested => ({
     targetPaths: { dataRootPath: '/fixture/current' }, requesterHostBootId: 'this-window',
-    candidateId: 'workspace:old', operationKey: 'workspace:old@0123456789abcdef', requested
+    candidateId: 'workspace:old', operationKey: 'workspace:old@0123456789abcdef', requested, withLocks, isDeterministicFailure
   });
   for (const [requested, outcome] of [[false, 'completed'], [false, 'busy'], [true, 'completed']]) {
     let merged = false;
@@ -527,8 +529,9 @@ test('only an oversized source the engine prepared asks other windows to yield, 
       operation: 'historical-merge', operationKey: 'workspace:old@0123456789abcdef', message: '为合并较大的旧聊天记录',
       waitingTitle: '正在等待其它窗口空闲后合并较大的旧聊天记录', configurationRootPath: '/fixture',
       requesterHostBootId: 'this-window', ignoreBackoff: requested,
-      ...(requested ? { participantConfirmation: 'notice' } : {})
-    });
+      ...(requested ? { whenBusy: 'wait', participantConfirmation: 'notice' } : {}),
+      isDeterministicFailure, withLocks
+    }, '引擎在锁外调用：等忙窗口不持锁，全部就绪后才用引擎给的 withLocks 拿锁');
     assert.equal(call[3], true);
     assert.equal(merged, outcome === 'completed');
     assert.deepEqual(plain(result), outcome === 'completed' ? { state: 'completed' } : { state: 'busy', reason: '有 1 个窗口正在忙（有任务正在进行）' });

@@ -404,7 +404,8 @@ export async function mergeHistoricalDataSetsInBackground(
       database: host.product.application.database
     }, {
       shouldContinue: stillCurrent,
-      ...(candidateIds ? { candidateIds } : {}),
+      // Only the call made for the user's click is an explicit request (the engine never infers it).
+      ...(candidateIds ? { candidateIds, requested: true } : {}),
       onWorkStart: () => {
         const done = new Promise<void>(resolve => { finishProgress = resolve; });
         void vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在合并旧聊天记录' },
@@ -430,10 +431,11 @@ export async function mergeHistoricalDataSetsInBackground(
 /**
  * The only place that asks other windows to yield, for one source above the online merge limit
  * that the engine already prepared and checked. The two-phase primitive decides how windows are
- * asked (backoff per source state; a busy or older window withdraws the request). It runs inside the
- * engine's locks, so it never waits for busy windows. A merge the user explicitly asked for skips
- * the per-source backoff (never the cooldown); other windows then only see a notice, because the
- * user already confirmed here.
+ * asked (backoff per source state; a busy or older window withdraws the request). The engine calls
+ * it outside its locks and hands over `withLocks`, which the primitive takes only once every window
+ * is ready. A merge the user explicitly asked for waits, bounded and without any lock, for busy
+ * windows and skips the per-source backoff (never the cooldown); other windows then only see a
+ * notice, because the user already confirmed here.
  */
 async function requestOtherWindowsToYield(
   paths: { globalStoragePath: string },
@@ -448,9 +450,10 @@ async function requestOtherWindowsToYield(
     waitingTitle: '正在等待其它窗口空闲后合并较大的旧聊天记录',
     configurationRootPath: paths.globalStoragePath,
     requesterHostBootId: input.requesterHostBootId,
-    // Called inside the engine's locks: a busy window abandons at once (waiting happens only outside locks).
     ignoreBackoff: input.requested,
-    ...(input.requested ? { participantConfirmation: 'notice' as const } : {}),
+    ...(input.requested ? { whenBusy: 'wait' as const, participantConfirmation: 'notice' as const } : {}),
+    isDeterministicFailure: input.isDeterministicFailure,
+    withLocks: input.withLocks,
     isCurrent
   }, merge);
   return outcome.state === 'completed' ? { state: 'completed' } : { state: outcome.state, reason: outcome.reason };
