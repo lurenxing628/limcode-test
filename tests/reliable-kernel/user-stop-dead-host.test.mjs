@@ -75,6 +75,20 @@ test('执行窗口被杀、工具仍在执行、项目在任何窗口都打不�
     await sleep(1_500);
     assert.deepEqual(await rows(p1.app, 'EffectReceipt', { attempt_id: intent.attempt_id }), []);
 
+    // 停止请求已记录（例如来自别的入口），自动的控制类收尾也不碰已派发却没有回执的效果：
+    // 不认领租约、不写回执、不报错，留给用户停止或执行它的窗口。
+    const [leaseBefore] = await rows(p1.app, 'ExecutionLease', { turn_id: turnId });
+    await p1.app.turns.requestExternalInterrupt(conversationId, {
+      source: { kind: 'command', key: 'recorded-stop' }, turnId, reason: '别的入口记录的停止'
+    });
+    const automatic = await p1.runner.recoverStartup();
+    assert.deepEqual(automatic.interruptedTurnIds, []);
+    const [leaseAfter] = await rows(p1.app, 'ExecutionLease', { turn_id: turnId });
+    assert.deepEqual([leaseAfter.host_boot_id, leaseAfter.generation], [leaseBefore.host_boot_id, leaseBefore.generation],
+      '自动收尾不认领执行宿主已死但效果结果未知的 Turn');
+    assert.deepEqual(await rows(p1.app, 'EffectReceipt', { attempt_id: intent.attempt_id }), []);
+    assert.deepEqual(p1.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error)), []);
+
     const [lease] = await rows(p1.app, 'ExecutionLease', { turn_id: turnId });
     const stopped = await p1.runner.interrupt({
       commandId: 'user-stop',
@@ -228,12 +242,71 @@ test('子 Agent 同样适用：执行窗口被杀后，用户停止子 Agent 把
   }
 });
 
+test('复审 #7：父对话等待子 Agent 时执行窗口被杀，没有合格窗口：在不合格窗口停止父对话并级联，父子 Turn 都收尾，子 Agent 的停止不必等合格窗口（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('parent-waits');
+  let p1;
+  let child;
+  try {
+    const conversationId = 'conversation-parent-waits';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId }, 'origin-parent-waits');
+    const spawned = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+
+    p1 = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_ONE], label: 'p1', children: true });
+    await p1.app.recover();
+    await p1.runner.recoverStartup();
+    await p1.coordinator.recoverStartup();
+    const [parentTurn] = await rows(p1.app, 'Turn', { conversation_id: conversationId, status: 'active' });
+    assert.ok(parentTurn, '父 Turn 在等待子 Agent');
+    const [runAgent] = await rows(p1.app, 'ToolCall', { turn_id: parentTurn.id, tool_name: 'run_agent' });
+    assert.equal(runAgent.status, 'executing', '父等子时 run_agent 处于执行中');
+
+    // A stop recorded for the child (here a model's run_agent interrupt) is settled control-only by
+    // the child scheduler's own recovery in this window, symmetric to the Conversation runner.
+    await p1.coordinator.interruptSubtree({ sourceKey: 'recorded-child-stop', childExecutionId: spawned.childExecutionId,
+      reason: 'run_agent interrupt_subtree requested' });
+    assert.equal((await rows(p1.app, 'Turn', { id: spawned.childTurnId }))[0]?.status, 'active');
+    await p1.coordinator.recoverStartup();
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: spawned.childTurnId }))[0]?.status === 'terminated',
+      30_000, '子调度没有在不合格窗口收尾已记录停止的子 Turn');
+
+    // The panel's stop with cascade (VscodeReliableKernelCommandRouter.handleInterruptRequest).
+    const lease = (await rows(p1.app, 'ExecutionLease', { turn_id: parentTurn.id }))[0];
+    const stopped = await p1.runner.interrupt({ commandId: 'stop-parent', conversationId, turnId: String(parentTurn.id),
+      expectedLeaseGeneration: String(lease.generation), reason: '用户请求中断当前 Turn 及其子执行。' });
+    assert.equal(stopped.executingWindowAlive, undefined);
+    const cascaded = await p1.coordinator.interruptSubtree({ sourceKey: 'stop-parent:child', childExecutionId: spawned.childExecutionId,
+      reason: 'parent_turn_interrupted' }, { userStop: true });
+    assert.equal(cascaded.executingWindowAlive, undefined);
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: parentTurn.id }))[0]?.status === 'terminated', 30_000, '父 Turn 未收尾');
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: spawned.childTurnId }))[0]?.status === 'terminated', 30_000, '子 Turn 未收尾');
+    const [execution] = await rows(p1.app, 'ChildExecution', { id: spawned.childExecutionId });
+    assert.equal(['starting', 'active', 'interrupting'].includes(String(execution.status)), false, `子执行仍为 ${execution.status}`);
+    assert.equal((await rows(p1.app, 'ToolCall', { turn_id: parentTurn.id, status: 'executing' })).length, 0);
+    assert.equal(p1.owns(conversationId), false);
+    assert.equal(p1.owns(spawned.childConversationId), false);
+    assert.deepEqual(p1.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error)), []);
+    const blocked = await deleteConversation(p1, conversationId).then(() => null, (error) => String(error?.message ?? error));
+    console.log('[parent-waits] delete after stop:', blocked ?? 'deleted');
+  } finally {
+    await p1?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 }
 
 /** The executing window: starts a Turn whose MCP call never answers, then waits to be killed. */
 async function runWorker(mode) {
   if (mode === 'origin-child') {
     await runChildOrigin();
+    return;
+  }
+  if (mode === 'origin-parent-waits') {
+    await runChildOrigin({ foreground: true });
     return;
   }
   if (mode !== 'origin') throw new Error(`Unknown worker ${mode}.`);
@@ -259,13 +332,13 @@ async function runWorker(mode) {
 }
 
 /** The executing window for a child: the parent spawns a child whose MCP call never answers. */
-async function runChildOrigin() {
+async function runChildOrigin(options = {}) {
   const dataRoot = requiredEnv('LIMCODE_DEAD_HOST_DATA_ROOT');
   const conversationId = requiredEnv('LIMCODE_DEAD_HOST_CONVERSATION');
   const parentReplies = [
     { role: 'model', parts: [{ id: 'provider-spawn', functionCall: {
       name: 'run_agent',
-      args: { operation: 'spawn', taskName: 'hang', prompt: '调用外部工具', foregroundWaitMs: 0 }
+      args: { operation: 'spawn', taskName: 'hang', prompt: '调用外部工具', foregroundWaitMs: options.foreground ? 600_000 : 0 }
     } }] },
     { role: 'model', parts: [{ text: '子任务已开始。' }] }
   ];
@@ -277,6 +350,11 @@ async function runChildOrigin() {
   const provider = {
     providerId: PROVIDER_ID,
     async sendFullRequest(request, controls) {
+      // A waiting parent's child keeps streaming until its window dies.
+      if (options.foreground && request.conversationId !== conversationId) {
+        childCalls += 1;
+        return new Promise(() => {});
+      }
       const content = request.conversationId === conversationId
         ? parentReplies[parentCalls++]
         : childReplies[childCalls++];
@@ -288,7 +366,11 @@ async function runChildOrigin() {
   try {
     await createConversation(host.app, conversationId, PROJECT_TWO);
     await host.runner.input({ commandId: `input-${conversationId}`, conversationId, text: '派一个子 Agent' });
-    await eventually(async () => host.mcpCalls() > 0, 60_000, '子 Agent 的 MCP 调用未派发');
+    if (options.foreground) {
+      await eventually(async () => childCalls > 0, 60_000, '子 Agent 未开始');
+    } else {
+      await eventually(async () => host.mcpCalls() > 0, 60_000, '子 Agent 的 MCP 调用未派发');
+    }
     const [execution] = await rows(host.app, 'ChildExecution', {});
     const [link] = await rows(host.app, 'ChildExecutionActiveTurnLink', { child_execution_id: execution.id });
     await writeJson(requiredEnv('LIMCODE_DEAD_HOST_READY'), {
