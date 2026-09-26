@@ -24,7 +24,10 @@ export const VSCODE_RUNTIME_SELECTION_FILE = '.limcode-runtime-selection.json';
 export const VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY = '.limcode-runtime-merges';
 /** Written into a data set's own control root when the user switches the current data set away from it. */
 export const VSCODE_RUNTIME_DATA_SET_KEPT_FILE = 'kept-by-user.json';
-/** v0.0.10–v0.0.20 per-scope window claim (`<scope>/runtime-owner/owner.json`); later versions publish host-liveness. */
+/**
+ * v0.0.10–v0.0.20 per-scope window claim (`<scope>/runtime-owner/owner.json`). Those versions also
+ * publish host-liveness in the data root like every version since v0.0.10; the claim is checked too.
+ */
 export const VSCODE_LEGACY_WORKSPACE_RUNTIME_OWNER_DIRECTORY = 'runtime-owner';
 
 const WORKSPACE_RUNTIME_ID_DOMAIN = 'limcode-vscode-workspace-runtime\0';
@@ -233,11 +236,12 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
 
 /**
  * First selection when no explicit choice exists (an upgrade from per-workspace versions). Only
- * data sets that pass the read-only upgrade preflight (recognized epoch 3/4/5, exact fingerprint,
- * integrity, no pending recovery, no recorded merge failure for the same files) are eligible. The
- * fixed default root with a complete RootBinding wins; otherwise the historical workspace scope
- * whose SQLite changed last. Every other data set from before this version is merged into it
- * after the Runtime opens, so the choice only decides which in-place root receives the others.
+ * data sets that pass the read-only upgrade preflight (recognized epoch 3/4/5, exact schema and
+ * physical fingerprint, quick_check for the published 3/4 formats, no pending recovery, no recorded
+ * merge failure for the same content) are eligible. The fixed default root with a complete
+ * RootBinding wins; otherwise the historical workspace scope whose SQLite changed last. Every other
+ * data set from before this version is merged into it after the Runtime opens, so the choice only
+ * decides which in-place root receives the others.
  */
 async function chooseInitialRuntimeDataSet(
   configurationRootPath: string,
@@ -360,9 +364,10 @@ export async function isVscodeRuntimeDataSetKept(candidate: VscodeRuntimeDataSet
 }
 
 /**
- * v0.0.10–v0.0.20 windows claimed their scope through `<scope>/runtime-owner/owner.json` and
- * published no Host liveness. Judged with the same process-start identity rule as other claims:
- * only a proven dead or reused owner is absent; a malformed record proves nothing.
+ * v0.0.10–v0.0.20 windows also claimed their scope through `<scope>/runtime-owner/owner.json`
+ * (their Host liveness in the data root is checked as for every version). Judged with the same
+ * process-start identity rule as other claims: only a proven dead or reused owner is absent; a
+ * malformed record proves nothing.
  */
 export async function legacyWorkspaceRuntimeOwnerState(
   candidate: Pick<VscodeRuntimeDataSetCandidate, 'configurationRootPath' | 'runtimeScopeRootPath'>

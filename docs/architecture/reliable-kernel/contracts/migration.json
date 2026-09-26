@@ -29,7 +29,7 @@
   "historicalMerge": {
     "sources": ["pre-switch-history-data-sets-automatic-once", "user-kept-or-already-merged-explicit-request-only"],
     "target": "selected-current-epoch-data-set-open-in-requesting-host",
-    "initialSelection": "no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-exact-fingerprint-integrity-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-data-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched",
+    "initialSelection": "no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-exact-schema-and-physical-fingerprint-published-3-4-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched",
     "trigger": "background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; first-host-to-claim-source-maintenance-merges-others-skip",
     "requiresUserConfirmation": false,
     "explicitRequestConfirmation": "modal-then-online-merge-in-requesting-window-no-reload",
@@ -53,7 +53,7 @@
       "CollaborationMessage": ["message_seq"]
     },
     "integrity": "source-foreign-key-quick-check-before; every-source-id-asserted-present-inside-the-transaction",
-    "recordPolicy": "configuration-root-ledger-survives-target-deletion; committing-with-exact-inserted-id-set-counts-as-unmerged; outcomes-keyed-by-source-content-digest-cached-by-exact-file-state; later-failed-attempt-keeps-last-merge; user-kept-marker-in-source-control-root",
+    "recordPolicy": "configuration-root-ledger-survives-target-deletion; committing-with-exact-inserted-id-set-counts-as-unmerged; outcomes-keyed-by-source-content-digest-cached-by-exact-file-state; later-failed-attempt-keeps-last-merge; user-kept-marker-in-source-control-root-unreadable-counts-as-kept-unwritable-refuses-switch",
     "noticePolicy": "causes-accumulate-per-configuration-root; only-reevaluated-sources-drop-causes; explicit-request-outcome-always-shown; details-in-log-and-data-set-management",
     "sourceRetention": "conversation-content-unchanged; published-3-4-backed-up-and-upgraded-in-place; backup-before-finalization",
     "selectionPolicy": "never-switch",

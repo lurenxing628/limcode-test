@@ -14,10 +14,11 @@ export interface RuntimeDataSetPreflightProblem {
 
 /**
  * Read-only check that a data set can be opened (after the exact published 3/4 upgrade when
- * needed): recognized epoch, complete binding, and the same integrity and physical fingerprint
- * checks the upgrade or open would perform. A pending recovery window passes to its gate.
- * Nothing is written; the SQLite file is read through a private snapshot copy. Never call it for
- * a database this process has open: copying its files would release this process's POSIX locks.
+ * needed): recognized epoch, complete binding, the exact schema and physical fingerprint opening
+ * checks, and for the published 3/4 formats the upgrade's own checks (quick_check included). A
+ * pending recovery window passes to its gate. Nothing is written; a worker reads a private copy.
+ * Never call it for a database this process has open: copying its files would release this
+ * process's POSIX locks.
  */
 export async function preflightRuntimeDataSet(
   candidate: VscodeRuntimeDataSetCandidate
