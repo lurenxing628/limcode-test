@@ -125,7 +125,6 @@ test('在线合并时另一个窗口（进程）持续写同一当前库：双�
 });
 
 test('复审 merge2 #4：接近在线上限的来源合并时，另一个窗口（进程）的每次写入最长等待远低于 busy_timeout', async (t) => {
-  assert.ok(RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS.maxRows <= 1_500, '上限按实测收紧');
   const fixture = await createFixture(t, { withBeta: false });
   const messages = 10;
   // Each conversation is 2 + 5 × messages rows (conversation, project link, message rows, body).

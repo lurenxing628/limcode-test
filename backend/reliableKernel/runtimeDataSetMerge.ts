@@ -70,21 +70,23 @@ export const RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION = 3;
 /**
  * Online transaction bound: the merge transaction blocks other Hosts' writes, and those have no
- * retry beyond busy_timeout (5 s). Measured (source rows, one transaction, another process writing
- * every 2 ms): 1,249 rows commit in ~0.2 s on an idle machine and in ~1.5 s with the merge, the
- * other writer and six CPU-bound processes all pinned to one core (the other writer's longest wait
- * ~1.4 s). 1,200 rows keep that worst case well below busy_timeout; larger sources use the
- * exclusive fallback.
+ * retry beyond busy_timeout (5 s). Measured with the SQLite worker reusing prepared statements
+ * (runtimeStatementCache.ts): ~30 ms + 0.044 ms per source row and ~6 ms per MiB, ~0.2 s at 4,000
+ * rows on an idle machine. With the merge, another process writing every 2 ms and six CPU-bound
+ * processes all pinned to one core, 3,953 rows commit in ≤1.3 s (the other writer's longest wait
+ * ~1.1 s) and 4,000 rows carrying 11.7 MiB in ~1.2 s, well below busy_timeout. Larger sources use
+ * the exclusive fallback.
  */
-export const RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object.freeze({ maxRows: 1_200, maxBytes: 4 * 1024 * 1024 });
+export const RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object.freeze({ maxRows: 4_000, maxBytes: 12 * 1024 * 1024 });
 /**
  * Hard bound of one historical merge transaction, online or exclusive: the plan and the worker's
- * transaction hold every row in memory (measured ~150 MB + 30 KB per row in the extension host, over
- * 1 GB at ~28,000 rows). A larger source is not merged at all (no coordination, backup or
- * finalization) and is recorded as too large for this limit; a version with another limit judges
- * it again. Data-root migration has no such bound.
+ * transaction hold every row in memory. With prepared statements reused by the worker a merge
+ * measures ~175 MB + 8 KB per row (~30 KB per row before); a 60,000-row source peaked at ~690 MB,
+ * below ~1 GB even with a heavier extension host. A larger source is not merged at all (no
+ * coordination, backup or finalization) and is recorded as too large for this limit; a version
+ * with another limit judges it again. Data-root migration has no such bound.
  */
-export const RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS = 25_000;
+export const RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS = 60_000;
 
 const MAX_REPORTED_CONFLICTS = 20;
 
