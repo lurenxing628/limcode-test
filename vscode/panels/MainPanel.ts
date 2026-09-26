@@ -19,7 +19,7 @@ import {
   resolveLocalFileSourceUri
 } from '../webview/getWebviewHtml';
 import { isReliableKernelControlMessage } from '../../shared/reliableKernelClientFeed';
-import type { ApplicationFacade } from '../ApplicationFacade';
+import type { ApplicationFacade, ConversationRecoveryResult } from '../ApplicationFacade';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { isConversationRuntimeOwnerBusyError } from '../../backend/reliableKernel/ConversationRuntimeOwnerManager';
 
@@ -301,7 +301,10 @@ export class MainPanel {
     // startup recovery, so opening a view also attempts scoped takeover in the background.
     const conversationId = instance.conversationId;
     if (conversationId) {
-      void Promise.resolve().then(() => backendApp.recoverConversation(conversationId)).catch((error: unknown) => {
+      void Promise.resolve().then(() => backendApp.recoverConversation(conversationId)).then((result) => {
+        const message = conversationRecoveryWaitingMessage(result);
+        if (message) void vscode.window.showInformationMessage(message);
+      }).catch((error: unknown) => {
         if (!isConversationRuntimeOwnerBusyError(error)) {
           console.warn('[LimCode] Scoped Conversation recovery after opening a view failed.', error);
         }
@@ -715,4 +718,15 @@ function displayUnits(text: string): number {
 function isWideCharacter(char: string): boolean {
   const codePoint = char.codePointAt(0) ?? 0;
   return codePoint >= 0x1f300 || /[\u1100-\u115f\u2329\u232a\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u.test(char);
+}
+
+/** Explains why a window left another project's unfinished task untouched; undefined when nothing waits. */
+function conversationRecoveryWaitingMessage(result: ConversationRecoveryResult | undefined): string | undefined {
+  if (result?.status === 'waiting_for_project') {
+    return `${EXTENSION_BRAND}：该对话属于项目“${result.projectName}”，未完成的任务会在打开该项目的窗口中继续执行。`;
+  }
+  if (result?.status === 'waiting_for_work_environment') {
+    return `${EXTENSION_BRAND}：该对话冻结的工作环境在当前窗口不可用，未完成的任务会在打开该工作环境的窗口中继续执行。`;
+  }
+  return undefined;
 }

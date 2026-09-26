@@ -29,6 +29,7 @@ import {
 } from '../../reliableKernel/executionLeaseFence';
 import {
   isConversationRuntimeOwnerBusyError,
+  type ConversationRuntimeEligibleClaimResult,
   type ConversationRuntimeOwnerManager
 } from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
@@ -122,6 +123,8 @@ export interface ReliableConversationRunnerRecoveryReport {
   finalizedTurnIds: string[];
   needsHumanTurnIds: string[];
   liveOwnedTurnIds: string[];
+  /** Active Turns left untouched for a Host that serves their project/frozen work environment. */
+  ineligibleTurnIds: string[];
   queuedConversationIds: string[];
 }
 
@@ -684,6 +687,10 @@ export class ReliableConversationRunner {
    * poisoning unrelated recovery; resume candidates stay level-triggered via deferredRecovery so
    * a later peer release/shutdown still reclaims execution in this Host.
    *
+   * A Conversation this Host is not eligible to run (its project folder or frozen work environment
+   * is not open here) is neither claimed, finalized nor deferred: its durable Turn stays active
+   * for a Host that serves it, and a later sweep here picks it up once the folder is opened.
+   *
    * Passing conversationId scopes every repository scan and ownership claim to that one
    * Conversation: a view taking over a crashed peer's Conversation recovers it inside this
    * already-running Host without a reboot or a global sweep.
@@ -717,10 +724,11 @@ export class ReliableConversationRunner {
       finalizedTurnIds: [],
       needsHumanTurnIds: [],
       liveOwnedTurnIds: [],
+      ineligibleTurnIds: [],
       queuedConversationIds: []
     };
     const admissionBlockedConversationIds = new Set<string>();
-    const ownership = new Map<string, boolean>();
+    const ownership = new Map<string, ConversationRuntimeEligibleClaimResult>();
     for (const turn of activeTurns) {
       signal?.throwIfAborted();
       const turnId = requireId(turn.id, 'Turn.id');
@@ -731,7 +739,14 @@ export class ReliableConversationRunner {
         admissionBlockedConversationIds.add(turnConversationId);
         continue;
       }
-      if (!await this.tryOwnConversation(turnConversationId, ownership)) {
+      const claim = await this.tryOwnConversation(turnConversationId, ownership);
+      if (claim === 'ineligible') {
+        report.ineligibleTurnIds.push(turnId);
+        admissionBlockedConversationIds.add(turnConversationId);
+        this.deferredRecovery.delete(turnId);
+        continue;
+      }
+      if (claim === 'busy') {
         // A live peer Host owns this Conversation. Skipping it must not poison unrelated
         // recovery; the resume candidate stays level-triggered for a later release/shutdown.
         report.liveOwnedTurnIds.push(turnId);
@@ -787,8 +802,8 @@ export class ReliableConversationRunner {
     for (const queuedConversationId of queuedConversationIds) {
       signal?.throwIfAborted();
       // Queued admission drains only under this Host's Conversation ownership; a live peer owner
-      // drains its own queue and is skipped here.
-      if (!await this.tryOwnConversation(queuedConversationId, ownership)) continue;
+      // drains its own queue and an ineligible Host leaves it for the project's Host.
+      if (await this.tryOwnConversation(queuedConversationId, ownership) !== 'owned') continue;
       report.queuedConversationIds.push(queuedConversationId);
       this.scheduleAdmission(queuedConversationId);
     }
@@ -903,6 +918,13 @@ export class ReliableConversationRunner {
    * candidate reclaims execution here once the peer releases ownership or shuts down.
    */
   private async runOwnedDriveSlot(slot: DriveSlot): Promise<void> {
+    if (!await this.conversationOwners.claimEligible(slot.conversationId)) {
+      // A scheduling nudge (for example an answer submitted from another project's window) must not
+      // take the Conversation over here; the Host serving its project resumes it.
+      slot.terminal = true;
+      slot.completedGeneration = slot.requestedGeneration;
+      return;
+    }
     try {
       await this.conversationOwners.run(slot.conversationId, () => this.runDriveSlot(slot));
     } catch (error) {
@@ -1321,7 +1343,7 @@ export class ReliableConversationRunner {
     ) return;
     this.externalWakePollInFlight = true;
     try {
-      const ownership = new Map<string, boolean>();
+      const ownership = new Map<string, ConversationRuntimeEligibleClaimResult>();
       await this.cancelDurablyInterruptedLocalTurns();
       if (this.waitingOwned.size > 0) {
         const localWake = this.localWakeRequested;
@@ -1329,9 +1351,10 @@ export class ReliableConversationRunner {
         const version = await this.application.database.externalDataVersion();
         for (const waiting of [...this.waitingOwned.values()]) {
           if (!localWake && waiting.externalDataVersion === version) continue;
-          if (!await this.tryOwnConversation(waiting.conversationId, ownership)) {
-            // A live peer Host owns this Conversation now; its runner observes and drives the
-            // waiting Turn. Keeping the local entry would auto-drive peer-owned work.
+          if (await this.tryOwnConversation(waiting.conversationId, ownership) !== 'owned') {
+            // A live peer Host owns this Conversation now (or it lost ownership and no longer serves
+            // it); that Host observes and drives the waiting Turn. Keeping the local entry would
+            // auto-drive another Host's work.
             this.waitingOwned.delete(waiting.turnId);
             continue;
           }
@@ -1355,8 +1378,15 @@ export class ReliableConversationRunner {
           continue;
         }
         // A live/unknown peer Conversation owner must never be displaced. The candidate stays
-        // level-triggered so a later peer release/shutdown still reclaims execution here.
-        if (!await this.tryOwnConversation(deferred.conversationId, ownership)) continue;
+        // level-triggered so a later peer release/shutdown still reclaims execution here. A
+        // Conversation this Host no longer serves is dropped; the next eligible sweep rediscovers it.
+        const claim = await this.tryOwnConversation(deferred.conversationId, ownership);
+        if (claim === 'ineligible') {
+          this.deferredRecovery.delete(deferred.turnId);
+          this.terminationRecoveryFailures.delete(deferred.turnId);
+          continue;
+        }
+        if (claim !== 'owned') continue;
         const claimed = await this.application.turns.claimRecoveryExecution({
           turnId: deferred.turnId,
           ...this.lease(deferred.conversationId)
@@ -1752,6 +1782,7 @@ export class ReliableConversationRunner {
    * its own queue; standing down is a safe no-op because the queued Intent stays durable.
    */
   private async runOwnedAdmissionSlot(slot: AdmissionSlot): Promise<void> {
+    if (!await this.conversationOwners.claimEligible(slot.conversationId)) return;
     try {
       await this.conversationOwners.run(slot.conversationId, () => this.runAdmissionSlot(slot));
     } catch (error) {
@@ -1810,19 +1841,20 @@ export class ReliableConversationRunner {
   }
 
   /**
-   * Claims a Conversation for recovery/poll work with stand-down semantics: false means a
-   * live/unknown peer Host owns it and this Host must not drive its work. Results are cached per
-   * recovery sweep/poll tick; each new tick re-evaluates, which keeps the level trigger alive.
+   * Claims a Conversation for recovery/poll work with stand-down semantics: 'busy' means a
+   * live/unknown peer Host owns it, 'ineligible' means this Host does not serve its project or
+   * frozen work environment; in both cases this Host must not drive its work. Results are cached
+   * per recovery sweep/poll tick; each new tick re-evaluates, which keeps the level trigger alive.
    */
   private async tryOwnConversation(
     conversationId: string,
-    cache: Map<string, boolean>
-  ): Promise<boolean> {
+    cache: Map<string, ConversationRuntimeEligibleClaimResult>
+  ): Promise<ConversationRuntimeEligibleClaimResult> {
     const cached = cache.get(conversationId);
     if (cached !== undefined) return cached;
-    const owned = await this.conversationOwners.tryClaim(conversationId);
-    cache.set(conversationId, owned);
-    return owned;
+    const claim = await this.conversationOwners.tryClaimEligible(conversationId);
+    cache.set(conversationId, claim);
+    return claim;
   }
 
   private requireOpen(): void {

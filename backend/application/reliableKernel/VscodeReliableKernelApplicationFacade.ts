@@ -50,7 +50,8 @@ import type {
   ApplicationFacade,
   ConversationAbortResult,
   ConversationAbortTarget,
-  ConversationForkResult
+  ConversationForkResult,
+  ConversationRecoveryResult
 } from '../../../vscode/ApplicationFacade';
 import { VscodeReliableKernelCommandRouter } from './VscodeReliableKernelCommandRouter';
 import {
@@ -62,9 +63,9 @@ import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
   InteractionAttentionNotifier,
-  runtimeCommitNeedsInteractionAttention,
-  type InteractionAttentionKind,
-  type PendingInteractionAttention
+  InteractionLeaseEdgeTracker,
+  readPendingInteractionAttention,
+  runtimeCommitNeedsInteractionAttention
 } from './interactionAttention';
 import {
   conversationHistoryPreviewFromBytes,
@@ -89,6 +90,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private readonly commandRouter: VscodeReliableKernelCommandRouter;
   private readonly externalHistoryWatcher: ExternalDataVersionWatcher;
   private readonly interactionAttentionNotifier: InteractionAttentionNotifier;
+  private readonly interactionLeaseEdges: InteractionLeaseEdgeTracker;
   private historyEntries: SidebarConversationHistoryEntry[] = [];
   private originLinks: ConversationOriginLinkRecord[] = [];
   private readonly historyPreviewByRevisionId = new Map<string, string>();
@@ -121,6 +123,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       ),
       onError: (error) => console.warn('[LimCode] Failed to notify pending user interaction.', error)
     });
+    this.interactionLeaseEdges = new InteractionLeaseEdgeTracker(product.application.database.hostBootId);
     this.commandRouter = new VscodeReliableKernelCommandRouter(product, {
       broadcast: (message) => this.broadcast(message),
       postToConversation: (conversationId, message) =>
@@ -293,7 +296,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   /** Passive views may recover a definitely dead owner, but never hold ownership themselves. */
-  public recoverConversation(conversationId: string): Promise<void> {
+  public recoverConversation(conversationId: string): Promise<ConversationRecoveryResult> {
     this.requireOpen();
     return this.product.recoverConversation(conversationId);
   }
@@ -552,7 +555,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   private onRuntimeCommit(commit: RuntimeCommitResult): void {
     if (this.disposed) return;
-    if (runtimeCommitNeedsInteractionAttention(commit)) this.scheduleInteractionAttentionRefresh();
+    const leaseAcquired = this.interactionLeaseEdges.observe(commit);
+    if (leaseAcquired || runtimeCommitNeedsInteractionAttention(commit)) this.scheduleInteractionAttentionRefresh();
     if (!commit.changes.some((change) => [
       'Conversation',
       'Turn',
@@ -594,44 +598,12 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     }, INTERACTION_ATTENTION_REFRESH_DELAY_MS);
   }
 
+  /** Only the Host holding the owner Turn's ExecutionLease announces a pending ASK/Plan. */
   private async refreshInteractionAttention(): Promise<void> {
-    const requests = await this.list('InteractionRequest', { status: 'pending' }, 1000);
-    const resolved = await Promise.all(requests.map((request) => this.resolveInteractionAttention(request)));
+    const database = this.product.application.database;
+    const pending = await readPendingInteractionAttention(database, database.hostBootId);
     if (this.disposed) return;
-    this.interactionAttentionNotifier.synchronize(
-      resolved.filter((request): request is PendingInteractionAttention => request !== undefined)
-    );
-  }
-
-  private async resolveInteractionAttention(
-    request: DomainRow
-  ): Promise<PendingInteractionAttention | undefined> {
-    const kind = interactionAttentionKind(request.request_kind);
-    if (!kind) return undefined;
-    const requestId = requireText(request.id, 'InteractionRequest.id');
-    const owners = await this.list('InteractionOwnerLink', { request_id: requestId }, 2);
-    if (owners.length !== 1) return undefined;
-    const turnId = requireText(owners[0].turn_id, 'InteractionOwnerLink.turn_id');
-    if (kind === 'plan_review') {
-      const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 1);
-      if (childMemberships.length > 0) return undefined;
-    }
-    const turn = await this.maybeRow('Turn', turnId);
-    if (!turn) return undefined;
-    const conversationId = requireText(turn.conversation_id, 'Turn.conversation_id');
-    const conversation = await this.maybeRow('Conversation', conversationId);
-    if (!conversation) return undefined;
-    const conversationTitle = displayConversationTitle({
-      id: conversationId,
-      title: typeof conversation.title === 'string' ? conversation.title : ''
-    });
-    return {
-      requestId,
-      kind,
-      conversationId,
-      conversationTitle,
-      createdAt: timestampMs(request.created_at)
-    };
+    this.interactionAttentionNotifier.synchronize(pending);
   }
 
   private refreshConversationHistory(): Promise<void> {
@@ -949,10 +921,6 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private requireOpen(): void {
     if (this.disposed || this.productClosed) throw new Error('可靠 ApplicationFacade 已关闭。');
   }
-}
-
-function interactionAttentionKind(value: unknown): InteractionAttentionKind | undefined {
-  return value === 'ask_user' || value === 'plan_review' ? value : undefined;
 }
 
 function runtimeId(prefix: string): string {

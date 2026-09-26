@@ -43,6 +43,13 @@ import { getRuntimeBuildInfo } from '../runtimeBuildInfo';
 import { ReliableConversationRunner } from './ReliableConversationRunner';
 import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
+import {
+  evaluateConversationHostEligibility,
+  type ConversationHostEligibilityDecision
+} from './conversationHostEligibility';
+import { isConversationRuntimeOwnerBusyError } from '../../reliableKernel/ConversationRuntimeOwnerManager';
+import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
+import type { ConversationRecoveryResult } from '../../../vscode/ApplicationFacade';
 
 export interface VscodeReliableKernelProductRuntimeOptions {
   /** Tests/candidate validation may supply an isolated authority. Production resolves it through getPaths(). */
@@ -85,6 +92,8 @@ export class VscodeReliableKernelProductRuntime {
   private recoveryTask: Promise<ReliableKernelRecoveryReport> | undefined;
   private readonly recoveryController = new AbortController();
   private readonly conversationRecoveryTasks = new Map<string, Promise<void>>();
+  private readonly conversationEligibility: (conversationId: string) => Promise<ConversationHostEligibilityDecision>;
+  private eligibleWorkRecovery: Promise<void> = Promise.resolve();
   private readonly externalRuntimeWatcher: ExternalDataVersionWatcher;
   private closing = false;
   private readonly initializeConfiguration: () => Promise<void>;
@@ -102,6 +111,7 @@ export class VscodeReliableKernelProductRuntime {
     providerRegistry: ReliableLlmProviderRegistry;
     diagnostics: ReliableDiagnosticJournal;
     debugCapture: DebugCaptureService;
+    conversationEligibility: (conversationId: string) => Promise<ConversationHostEligibilityDecision>;
     initializeConfiguration: () => Promise<void>;
     onConfigurationChanged?: () => Promise<void> | void;
   }) {
@@ -115,6 +125,7 @@ export class VscodeReliableKernelProductRuntime {
     this.providerRegistry = input.providerRegistry;
     this.diagnostics = input.diagnostics;
     this.debugCapture = input.debugCapture;
+    this.conversationEligibility = input.conversationEligibility;
     this.initializeConfiguration = input.initializeConfiguration;
     this.workspaceFoldersSubscription = vscode.workspace.onDidChangeWorkspaceFolders(() => {
       if (this.closing) return;
@@ -122,7 +133,12 @@ export class VscodeReliableKernelProductRuntime {
       // folder snapshot. Existing Turns keep their frozen default identity.
       void this.initializeConfiguration().catch(() => undefined);
       this.workspaceFoldersChangeTask = this.configuration.synchronizeWorkspaceFolders(currentWorkspaceFolders())
-        .then(async () => { if (!this.closing) await input.onConfigurationChanged?.(); });
+        .then(async () => {
+          if (this.closing) return;
+          await input.onConfigurationChanged?.();
+          // A newly opened folder can make this window the Host for another project's waiting work.
+          this.scheduleEligibleWorkRecovery();
+        });
       void this.workspaceFoldersChangeTask.catch(error => {
         console.error('[LimCode] 工作目录同步失败。', error);
         if (!this.closing) void vscode.window.showErrorMessage(`LimCode 工作目录同步失败：${error instanceof Error ? error.message : String(error)}`);
@@ -350,6 +366,19 @@ export class VscodeReliableKernelProductRuntime {
         diagnosticObserver: diagnostics,
         runtimeBuildInfo: getRuntimeBuildInfo
       });
+      const runtimeDatabase = application.database;
+      const runtimeContent = application.contentStore;
+      const conversationEligibility = (conversationId: string) => evaluateConversationHostEligibility({
+        database: runtimeDatabase,
+        contentStore: runtimeContent,
+        workspaceFolderUris: () => currentWorkspaceFolders().map((folder) => folder.uri),
+        workEnvironments: () => configuration.workEnvironments()
+      }, conversationId);
+      // Background recovery and wakes only claim Conversations whose project folder and frozen work
+      // environment this window serves; explicit commands in this window are not narrowed.
+      runtimeDatabase.conversationOwners.setClaimEligibilityProbe(
+        async (conversationId) => (await conversationEligibility(conversationId)).eligible
+      );
       fileDiffs = new VscodeReliableFileDiffEditor(application.files, diagnostics);
       debugCapture.source.hostBootId = application.database.hostBootId;
       application.webviewFeed.setDebugCapture(debugCapture);
@@ -444,6 +473,7 @@ export class VscodeReliableKernelProductRuntime {
         providerRegistry: providers,
         diagnostics,
         debugCapture,
+        conversationEligibility,
         initializeConfiguration,
         onConfigurationChanged: options.onConfigurationChanged
       });
@@ -507,8 +537,28 @@ export class VscodeReliableKernelProductRuntime {
     ]).then(() => undefined);
   }
 
-  /** A view may take over a crashed peer after this host's startup recovery has already finished. */
-  public recoverConversation(conversationId: string): Promise<void> {
+  /**
+   * A view may take over a crashed peer after this host's startup recovery has already finished.
+   * A window that does not serve the Conversation's project or frozen work environment stays
+   * passive and reports why when unfinished work is waiting for another window.
+   */
+  public async recoverConversation(conversationId: string): Promise<ConversationRecoveryResult> {
+    if (this.closing) throw new Error('Reliable Runtime is closing.');
+    const database = this.application.database;
+    if (!database.conversationOwners.owns(conversationId)) {
+      const decision = await this.conversationEligibility(conversationId);
+      if (!decision.eligible) {
+        if (!await database.hasConversationRuntimeWork(conversationId)) return { status: 'checked' };
+        return decision.reason === 'project_not_open'
+          ? { status: 'waiting_for_project', projectName: decision.projectName }
+          : { status: 'waiting_for_work_environment', workEnvironmentId: decision.workEnvironmentId };
+      }
+    }
+    await this.recoverOwnedConversation(conversationId);
+    return { status: 'checked' };
+  }
+
+  private recoverOwnedConversation(conversationId: string): Promise<void> {
     if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
     const existing = this.conversationRecoveryTasks.get(conversationId);
     if (existing) return existing;
@@ -528,6 +578,45 @@ export class VscodeReliableKernelProductRuntime {
     });
     this.conversationRecoveryTasks.set(conversationId, task);
     return task;
+  }
+
+  /**
+   * Startup recovery skipped work this window was not eligible for. After a folder change, sweep the
+   * unowned active/queued Conversations again; each goes through the same eligibility gate and
+   * scoped takeover as a view, so a live peer owner is never displaced.
+   */
+  private scheduleEligibleWorkRecovery(): void {
+    const startup = this.recoveryTask;
+    if (this.closing || !startup) return;
+    this.eligibleWorkRecovery = this.eligibleWorkRecovery
+      .then(() => startup)
+      .then(() => this.recoverNewlyEligibleWork())
+      .catch((error) => {
+        if (!this.closing) console.warn('[LimCode] 工作目录变化后的任务恢复失败。', error);
+      });
+  }
+
+  private async recoverNewlyEligibleWork(): Promise<void> {
+    const database = this.application.database;
+    const [activeTurns, queuedIntents] = await Promise.all([
+      listAllDomainRows(database, 'Turn', { status: 'active' }),
+      listAllDomainRows(database, 'TurnIntent', { state: 'queued', turn_id: null })
+    ]);
+    const candidates = [...new Set([...activeTurns, ...queuedIntents]
+      .map((row) => String(row.conversation_id)))]
+      .filter((conversationId) => !database.conversationOwners.owns(conversationId))
+      .sort();
+    for (const conversationId of candidates) {
+      if (this.closing) return;
+      try {
+        await this.recoverConversation(conversationId);
+      } catch (error) {
+        if (this.closing) return;
+        if (!isConversationRuntimeOwnerBusyError(error)) {
+          console.warn('[LimCode] 工作目录变化后的对话恢复失败。', conversationId, error);
+        }
+      }
+    }
   }
 
   public recoveryState(): VscodeReliableKernelRecoveryState {
@@ -562,6 +651,7 @@ export class VscodeReliableKernelProductRuntime {
       // an unresponsive external server cannot make Extension Host reload wait forever.
       await this.toolHost.dispose();
       await this.recoveryTask?.catch(() => undefined);
+      await this.eligibleWorkRecovery;
       await Promise.allSettled(this.conversationRecoveryTasks.values());
       await this.externalRuntimeWatcher.stop();
       await this.conversations.waitForIdle();

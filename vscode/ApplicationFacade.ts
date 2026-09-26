@@ -29,6 +29,15 @@ export interface ConversationForkResult {
   deduplicated: boolean;
 }
 
+/**
+ * Outcome of the opportunistic takeover a passive view attempts. The waiting variants mean the
+ * Conversation still has unfinished work that this window does not serve, so it stayed untouched.
+ */
+export type ConversationRecoveryResult =
+  | { status: 'checked' }
+  | { status: 'waiting_for_project'; projectName: string }
+  | { status: 'waiting_for_work_environment'; workEnvironmentId: string };
+
 /** VS Code shell 只依赖此门面，不拥有或推断 Runtime 领域关系。 */
 export interface ApplicationFacade {
   readonly onDidChangeConversationHistory: vscode.Event<void>;
@@ -37,8 +46,11 @@ export interface ApplicationFacade {
   forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult>;
   waitUntilHydrated(): Promise<void>;
   conversationExists(conversationId: string): Promise<boolean>;
-  /** Best-effort scoped recovery after opening a passive Conversation view; a live peer may own it. */
-  recoverConversation(conversationId: string): Promise<void>;
+  /**
+   * Best-effort scoped recovery after opening a passive Conversation view; a live peer may own it,
+   * and a window that does not serve the Conversation's project never takes it over.
+   */
+  recoverConversation(conversationId: string): Promise<ConversationRecoveryResult>;
   getConversationDisplayTitle(conversationId: string | undefined): string;
   renameConversationTitle(conversationId: string, title: string): Promise<boolean>;
   deleteConversation(conversationId: string): Promise<string[] | null>;

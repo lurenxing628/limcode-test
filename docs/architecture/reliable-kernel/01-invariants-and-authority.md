@@ -53,6 +53,8 @@ Runtime domain exact set 只在 [`authority.json#runtimeDomains`](./contracts/au
 
 同宿主主聊天页按对话共享正在打开的 Promise，重复打开聚焦已有面板。计划和工具详情等附属视图保留同一对话归属。关闭最后一个视图，仅在没有在途命令、执行、队列、回执收尾或待投递工作时释放；仍有后台工作则保留至收尾。外部 EffectReceipt / ProcessReceipt 按既有幂等规则落盘，后续继续执行和通知由目标对话宿主处理。
 
+后台承接只交给服务该对话的宿主：启动与延迟恢复、Phase D/F 与子任务的 claim 扫描、投递唤醒、回答后的调度提示和面板接管，只认领主 ProjectContext 文件夹在本窗口打开、且每个活动 Turn 冻结的默认工作环境在本窗口可用的对话。本宿主已持有的对话和用户在本窗口的显式命令不受此收窄。不合格宿主不写归属记录、不 finalize、不延迟重试，Turn 保持等待；合格宿主启动或本窗口新增该文件夹后重新扫描即可接上，面板在不合格窗口打开时提示原因。没有项目链接也没有冻结默认环境的对话缺少持久放置事实，任一宿主都可承接。审批与提问提示只在持有其 Turn `ExecutionLease` 的宿主出现。资格判断是宿主本地筛选，归属权威仍是归属记录、`ExecutionLease` 与栅栏。
+
 打开或恢复面板必须在初始化失败时释放尚未交给面板的归属引用；如果 Feed 已连接但页面初始化失败，同时断开该连接。认领等待期间关闭的面板也不能遗留引用。失败面板没有后台工作时，其他宿主可以立即重新认领该对话。
 
 配置根 admission 覆盖 placement 选择到宿主注册，锁顺序固定为配置根 admission → Runtime scope maintenance。旧文件 physical cutover 会过滤共享的 conversation settings / scope links，因此必须在此 admission 内核验所有 Runtime scopes 离线；不能只枚举当前目录后放任新 scope 注册。普通运行、模型等待和工具执行不持有 admission。

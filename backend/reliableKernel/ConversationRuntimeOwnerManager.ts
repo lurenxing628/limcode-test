@@ -114,6 +114,15 @@ export function conversationRuntimeOwnerClaimPath(paths: RuntimeRootPaths, conve
 
 export type ConversationRuntimePendingWorkProbe = (conversationId: string) => Promise<boolean>;
 
+/**
+ * Host-local answer to "may this Host start background work for the conversation?" (for example,
+ * whether its project folder is open here). It only narrows which Host attempts a background claim;
+ * the durable owner record, ExecutionLease and fences remain the execution authority.
+ */
+export type ConversationRuntimeClaimEligibilityProbe = (conversationId: string) => Promise<boolean>;
+
+export type ConversationRuntimeEligibleClaimResult = 'owned' | 'busy' | 'ineligible';
+
 interface OwnedConversation {
   readonly conversationId: string;
   readonly claimPath: string;
@@ -138,6 +147,7 @@ export class ConversationRuntimeOwnerManager {
   private readonly owned = new Map<string, OwnedConversation>();
   private readonly chains = new Map<string, Promise<void>>();
   private pendingWorkProbe: ConversationRuntimePendingWorkProbe = () => Promise.resolve(true);
+  private claimEligibilityProbe: ConversationRuntimeClaimEligibilityProbe = () => Promise.resolve(true);
   private closed = false;
 
   public constructor(
@@ -170,6 +180,38 @@ export class ConversationRuntimeOwnerManager {
   public async tryClaim(conversationId: string): Promise<boolean> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
     return this.enqueue(id, async () => (await this.claimLocked(id, 'return')) !== undefined);
+  }
+
+  /**
+   * Whether background work (startup/deferred recovery, delivery wakes, scheduling nudges) may run
+   * the conversation here: already owned, or the eligibility probe accepts this Host. Probe failures
+   * fail closed. Explicit user commands keep using claim()/run() and are not narrowed by this.
+   */
+  public async claimEligible(conversationId: string): Promise<boolean> {
+    const id = requireNonEmptyText(conversationId, 'conversationId');
+    if (this.owned.has(id)) return true;
+    try {
+      return await this.claimEligibilityProbe(id) === true;
+    } catch (error) {
+      console.warn('[reliable-kernel] Conversation claim eligibility failed closed.', id, error);
+      return false;
+    }
+  }
+
+  /**
+   * Background claim: 'ineligible' leaves every durable record untouched so a Host that can run the
+   * conversation claims it instead; 'busy' means another live or unknown Host owns it.
+   */
+  public async tryClaimEligible(conversationId: string): Promise<ConversationRuntimeEligibleClaimResult> {
+    const id = requireNonEmptyText(conversationId, 'conversationId');
+    if (!await this.claimEligible(id)) return 'ineligible';
+    return await this.tryClaim(id) ? 'owned' : 'busy';
+  }
+
+  /** Installs the Host-local background claim eligibility; the default accepts every conversation. */
+  public setClaimEligibilityProbe(probe: ConversationRuntimeClaimEligibilityProbe): void {
+    if (typeof probe !== 'function') throw new TypeError('Claim eligibility probe must be a function.');
+    this.claimEligibilityProbe = probe;
   }
 
   /** Verifies local ownership; never acquires implicitly. */
