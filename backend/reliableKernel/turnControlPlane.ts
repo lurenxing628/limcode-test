@@ -223,6 +223,20 @@ export interface CompiledTurnAuthority {
 
 export interface TurnAuthorityCompiler {
   compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority>;
+  /** The work environment compile() would freeze for such a request, against this Host's catalog. */
+  previewWorkEnvironment?(request: TurnWorkEnvironmentPreviewRequest): Promise<TurnWorkEnvironmentPreview>;
+}
+
+export type TurnWorkEnvironmentPreviewRequest = Pick<
+  TurnAuthorityCompilationRequest,
+  'conversationId' | 'executorAgentId' | 'workspace' | 'inheritedWorkEnvironmentPolicy'
+>;
+
+export interface TurnWorkEnvironmentPreview {
+  /** The default work environment the Turn would freeze; absent when none applies. */
+  workEnvironmentId?: string;
+  /** Why no Turn could start here, in the user's words (the same text compile() would fail with). */
+  error?: string;
 }
 
 export interface TurnExecutionCommand {
@@ -2237,6 +2251,35 @@ export class TurnControlPlane {
       ...(boundary?.toolPolicy ? { inheritedToolPolicy: boundary.toolPolicy } : {}),
       ...(boundary?.skillPolicy ? { inheritedSkillPolicy: boundary.skillPolicy } : {})
     }), turnId, executorAgentId);
+  }
+
+  /**
+   * The work environment the next Turn of an idle Conversation would freeze in this Host, resolved
+   * from the same inputs compile() receives (default Agent, project, a child's inherited boundary).
+   * Undefined when the compiler cannot preview or the Conversation has no default Agent.
+   */
+  public async previewNextTurnWorkEnvironment(conversationIdInput: string): Promise<TurnWorkEnvironmentPreview | undefined> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    if (!this.authorityCompiler.previewWorkEnvironment) return undefined;
+    const [agents, workspace, children] = await Promise.all([
+      this.listRows('AgentConversationLink', { conversation_id: conversationId, role: DEFAULT_AGENT_CONVERSATION_ROLE }, 2),
+      projectFolderForConversation(this.database, conversationId),
+      this.listRows('ChildExecution', { child_conversation_id: conversationId }, 2)
+    ]);
+    if (agents.length !== 1 || children.length > 1) return undefined;
+    const inheritedWorkEnvironmentPolicy = children[0]
+      ? await readChildExecutionWorkEnvironmentBoundary(
+          this.database,
+          this.contentStore,
+          requireId(children[0].id, 'ChildExecution.id')
+        )
+      : undefined;
+    return this.authorityCompiler.previewWorkEnvironment({
+      conversationId,
+      executorAgentId: requireId(agents[0].agent_id, 'AgentConversationLink.agent_id'),
+      ...(workspace ? { workspace } : {}),
+      ...(inheritedWorkEnvironmentPolicy ? { inheritedWorkEnvironmentPolicy } : {})
+    });
   }
 
   private async inheritTurnAuthority(

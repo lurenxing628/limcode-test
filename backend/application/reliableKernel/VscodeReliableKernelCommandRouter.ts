@@ -220,12 +220,16 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   /**
-   * New input, retry, edit-and-run and compression execute the Conversation. A window that does not
-   * serve it rejects them before anything is written: no existing durable fact could hold such
-   * input for another window, so the user is told where to continue instead.
+   * New input, retry, edit-and-run and compression execute the Conversation. A window that cannot
+   * start the Turn rejects them before anything is written: no existing durable fact could hold
+   * such input for another window, so the user is told where to continue instead. An idle
+   * Conversation starts wherever its next Turn's work environment is available (see
+   * evaluateConversationEntryEligibility), so a moved project continues after choosing one here.
    */
   private async requireExecutionHost(conversationId: string): Promise<void> {
-    const view = await this.conversationHostEligibility(conversationId);
+    const view = this.product.conversationEntryEligibility
+      ? await this.product.conversationEntryEligibility(conversationId)
+      : await this.conversationHostEligibility(conversationId);
     if (!view || view.eligible) return;
     throw new ConversationHostIneligibleError(
       conversationId,

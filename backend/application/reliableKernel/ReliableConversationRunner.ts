@@ -32,6 +32,7 @@ import {
   ConversationHostIneligibleError,
   isConversationRuntimeOwnerBusyError,
   type ConversationRuntimeEligibleClaimResult,
+  type ConversationRuntimeExecutionEligibility,
   type ConversationRuntimeOwnerManager
 } from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
@@ -183,6 +184,7 @@ export class ReliableConversationRunner {
   private readonly admissions = new Map<string, AdmissionSlot>();
   private readonly waitingOwned = new Map<string, WaitingOwnedTurn>();
   private readonly deferredRecovery = new Map<string, DeferredRecoveryTurn>();
+  private entryEligibility: ((conversationId: string) => Promise<ConversationRuntimeExecutionEligibility>) | undefined;
   private unheldScanAt = 0;
   private unheldScanTimer: NodeJS.Timeout | undefined;
   private unheldScanTask: Promise<void> | undefined;
@@ -2007,9 +2009,19 @@ export class ReliableConversationRunner {
     this.terminationRecoveryFailures.delete(turnId);
   }
 
+  /**
+   * Installs how new input decides whether it may start a Turn here (see
+   * evaluateConversationEntryEligibility); by default it is the Conversation's execution eligibility.
+   */
+  public setEntryEligibility(probe: (conversationId: string) => Promise<ConversationRuntimeExecutionEligibility>): void {
+    this.entryEligibility = probe;
+  }
+
   /** Execution commands (new input, retry, edit, continuation, compression) need a serving Host. */
   private async requireExecutionHost(conversationId: string): Promise<void> {
-    const eligibility = await this.conversationOwners.executionEligibility(conversationId);
+    const eligibility = this.entryEligibility
+      ? await this.entryEligibility(conversationId)
+      : await this.conversationOwners.executionEligibility(conversationId);
     if (eligibility !== 'eligible') throw new ConversationHostIneligibleError(conversationId, eligibility);
   }
 

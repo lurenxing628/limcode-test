@@ -114,6 +114,8 @@ import type { AttachmentSettingsAuthority } from './attachmentIngest';
 import type {
   CompiledTurnAuthority,
   TurnAuthorityCompilationRequest,
+  TurnWorkEnvironmentPreview,
+  TurnWorkEnvironmentPreviewRequest,
   TurnAuthorityCompiler
 } from './turnControlPlane';
 
@@ -225,6 +227,48 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     return this.enqueueWorkspaceOperation(async () => {
       if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
       return this.compileWithCurrentWorkspace(request);
+    });
+  }
+
+  /**
+   * The default work environment compile() would freeze for a new Turn, resolved the same way
+   * (explicit choice, inherited boundary, project, scoped policy default) against this window's
+   * catalog. An idle Conversation accepts new input in a window exactly when this has no error.
+   */
+  public previewWorkEnvironment(request: TurnWorkEnvironmentPreviewRequest): Promise<TurnWorkEnvironmentPreview> {
+    return this.enqueueWorkspaceOperation(async () => {
+      if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
+      const records = await this.loadRecords();
+      const workflowSelection = latestScopedSelection(records.conversationWorkflowSelections.filter((selection) =>
+        selection.conversationId === request.conversationId && selection.role === 'active'
+      ));
+      const scopesHighToLow: ScopeReference[] = [
+        { scopeKind: 'conversation', scopeId: request.conversationId },
+        ...(workflowSelection?.scopeKind === 'workflow'
+          ? [{ scopeKind: 'workflow' as const, scopeId: workflowSelection.workflowId }]
+          : []),
+        { scopeKind: 'agent', scopeId: request.executorAgentId },
+        { scopeKind: 'global' }
+      ];
+      const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
+        link.conversationId === request.conversationId && link.role === 'active'
+      ));
+      const selection = resolveWorkEnvironmentSelection({
+        environments: records.workEnvironments,
+        policy: resolveScopedRecord(
+          records.workEnvironmentPolicyScopeLinks,
+          records.workEnvironmentPolicies,
+          scopesHighToLow,
+          (link) => link.workEnvironmentPolicyId
+        ),
+        inheritedPolicy: request.inheritedWorkEnvironmentPolicy,
+        explicitWorkEnvironmentId: selectedEnvironment?.workEnvironmentId,
+        project: request.workspace
+      });
+      return {
+        ...(selection.active ? { workEnvironmentId: selection.active.id } : {}),
+        ...(selection.error ? { error: selection.error } : {})
+      };
     });
   }
 

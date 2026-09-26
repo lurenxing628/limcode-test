@@ -1,10 +1,12 @@
 import type { WorkEnvironmentRecord } from '../../../shared/protocol';
+import { workEnvironmentIdFromUri } from '../../../shared/workEnvironmentCatalog';
 import type { ContentAddressedStore } from '../../reliableKernel/contentAddressedStore';
 import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnosticJournal';
 import { projectFolderForConversation } from '../../reliableKernel/conversationProject';
 import { frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from '../../reliableKernel/frozenAuthority';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { RuntimeDatabase } from '../../reliableKernel/runtimeDatabase';
+import type { TurnWorkEnvironmentPreview } from '../../reliableKernel/turnControlPlane';
 
 export type ConversationHostEligibilityDecision =
   | { eligible: true }
@@ -16,7 +18,8 @@ export type ConversationHostEligibilityDecision =
       workEnvironmentId: string;
       /** Name and path from this window's catalog, for messages; never the internal id. */
       workEnvironmentLabel?: string;
-    };
+    }
+  | { eligible: false; reason: 'next_work_environment_unavailable'; message: string };
 
 /** What a window shows: the decision, or why it could not be made (the probe failed). */
 export type ConversationHostEligibilityView =
@@ -40,28 +43,38 @@ export interface ConversationHostEligibilityDependencies {
 const FROZEN_WORK_ENVIRONMENT_CACHE_ENTRIES = 1_000;
 
 /**
- * Decides whether this Host may take over a Conversation's background work from committed facts:
- * its primary ProjectContext folder must be open here, and every active Turn's frozen default work
- * environment must be available here (the same condition tool dispatch enforces). A Conversation
- * without a project link and without a frozen default environment has no durable placement fact,
- * so every Host remains eligible for it.
+ * Decides whether this Host may take over a Conversation's background work from committed facts.
+ * Every active Turn's frozen default work environment must be available here (the same condition
+ * tool dispatch enforces), and the primary ProjectContext folder must be open here, unless every
+ * active Turn froze a work environment other than the project's own: that Turn was started in a
+ * work environment the user chose (for example after the project folder moved), which is then its
+ * placement. A Conversation without a project link and without a frozen default environment has
+ * no durable placement fact, so every Host remains eligible for it.
  */
 export async function evaluateConversationHostEligibility(
   dependencies: ConversationHostEligibilityDependencies,
   conversationId: string
 ): Promise<ConversationHostEligibilityDecision> {
   const project = await projectFolderForConversation(dependencies.database, conversationId);
-  if (project && !dependencies.workspaceFolderUris().includes(project.uri)) {
-    return { eligible: false, reason: 'project_not_open', projectUri: project.uri, projectName: project.name };
-  }
   const activeTurns = await listAllDomainRows(dependencies.database, 'Turn', {
     conversation_id: conversationId,
     status: 'active'
   });
-  let environments: readonly WorkEnvironmentRecord[] | undefined;
+  const frozen: Array<{ turnId: string; workEnvironmentId: string | undefined }> = [];
   for (const turn of activeTurns) {
     const turnId = requireId(turn.id, 'Turn.id');
-    const workEnvironmentId = await frozenDefaultWorkEnvironment(dependencies, turnId);
+    frozen.push({ turnId, workEnvironmentId: await frozenDefaultWorkEnvironment(dependencies, turnId) });
+  }
+  if (project && !dependencies.workspaceFolderUris().includes(project.uri)) {
+    const projectEnvironmentId = workEnvironmentIdFromUri(project.uri);
+    const placedElsewhere = frozen.length > 0 && frozen.every((turn) =>
+      turn.workEnvironmentId !== undefined && turn.workEnvironmentId !== projectEnvironmentId);
+    if (!placedElsewhere) {
+      return { eligible: false, reason: 'project_not_open', projectUri: project.uri, projectName: project.name };
+    }
+  }
+  let environments: readonly WorkEnvironmentRecord[] | undefined;
+  for (const { turnId, workEnvironmentId } of frozen) {
     if (!workEnvironmentId) continue;
     environments ??= await dependencies.workEnvironments();
     const environment = environments.find((candidate) => candidate.id === workEnvironmentId);
@@ -76,6 +89,34 @@ export async function evaluateConversationHostEligibility(
       };
     }
   }
+  return { eligible: true };
+}
+
+export interface ConversationEntryEligibilityDependencies extends ConversationHostEligibilityDependencies {
+  /** The work environment the next Turn would freeze here; undefined when it cannot be previewed. */
+  nextTurnWorkEnvironment(conversationId: string): Promise<TurnWorkEnvironmentPreview | undefined>;
+}
+
+/**
+ * Whether new input, retry, edit-and-run or compression may start a Turn in this window. While the
+ * Conversation has an active Turn or queued input, that work decides (evaluateConversationHostEligibility).
+ * An idle Conversation may start wherever the work environment its next Turn would freeze is
+ * available, including one the user chose in this window, even when the project folder moved.
+ */
+export async function evaluateConversationEntryEligibility(
+  dependencies: ConversationEntryEligibilityDependencies,
+  conversationId: string
+): Promise<ConversationHostEligibilityDecision> {
+  const [activeTurns, queuedIntents] = await Promise.all([
+    listAllDomainRows(dependencies.database, 'Turn', { conversation_id: conversationId, status: 'active' }),
+    listAllDomainRows(dependencies.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued' })
+  ]);
+  if (activeTurns.length > 0 || queuedIntents.length > 0) {
+    return evaluateConversationHostEligibility(dependencies, conversationId);
+  }
+  const next = await dependencies.nextTurnWorkEnvironment(conversationId);
+  if (!next) return evaluateConversationHostEligibility(dependencies, conversationId);
+  if (next.error) return { eligible: false, reason: 'next_work_environment_unavailable', message: next.error };
   return { eligible: true };
 }
 
@@ -180,6 +221,9 @@ export function conversationHostIneligibleMessage(
       ? `这个对话正在工作环境“${view.workEnvironmentLabel}”中运行，当前窗口不能使用它，请在有它的窗口中继续。`
       : '这个对话正在一个当前窗口没有的工作环境中运行，请在有它的窗口中继续。';
   }
+  if (view.reason === 'next_work_environment_unavailable') {
+    return `${view.message}也可以在本窗口手动选择工作环境后继续。`;
+  }
   return `无法确认当前窗口能否继续这个对话（${view.message}），因此不会在这里执行。`;
 }
 
@@ -197,6 +241,7 @@ export function conversationAnswerRecordedMessage(
       ? `回答已记录，将在有工作环境“${view.workEnvironmentLabel}”的窗口中继续执行。`
       : '回答已记录，将在有该对话工作环境的窗口中继续执行。';
   }
+  if (view.reason === 'next_work_environment_unavailable') return `回答已记录。${view.message}`;
   return `回答已记录；无法确认当前窗口能否继续这个对话（${view.message}），因此不会在这里继续执行。`;
 }
 

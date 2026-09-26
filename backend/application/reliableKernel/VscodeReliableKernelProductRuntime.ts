@@ -46,6 +46,7 @@ import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
   conversationHostIneligibleMessage,
   createDiagnosedConversationHostEligibility,
+  evaluateConversationEntryEligibility,
   evaluateConversationHostEligibility,
   viewConversationHostEligibility,
   type ConversationHostEligibilityDecision,
@@ -97,6 +98,7 @@ export class VscodeReliableKernelProductRuntime {
   private readonly recoveryController = new AbortController();
   private readonly conversationRecoveryTasks = new Map<string, Promise<void>>();
   private readonly conversationEligibility: (conversationId: string) => Promise<ConversationHostEligibilityDecision>;
+  private readonly conversationEntryEligibilityProbe: (conversationId: string) => Promise<ConversationHostEligibilityDecision>;
   private eligibilityRescan: Promise<void> = Promise.resolve();
   private workspaceSyncFailed = false;
   private readonly externalRuntimeWatcher: ExternalDataVersionWatcher;
@@ -117,6 +119,7 @@ export class VscodeReliableKernelProductRuntime {
     diagnostics: ReliableDiagnosticJournal;
     debugCapture: DebugCaptureService;
     conversationEligibility: (conversationId: string) => Promise<ConversationHostEligibilityDecision>;
+    conversationEntryEligibility: (conversationId: string) => Promise<ConversationHostEligibilityDecision>;
     initializeConfiguration: () => Promise<void>;
     onConfigurationChanged?: () => Promise<void> | void;
   }) {
@@ -131,6 +134,7 @@ export class VscodeReliableKernelProductRuntime {
     this.diagnostics = input.diagnostics;
     this.debugCapture = input.debugCapture;
     this.conversationEligibility = input.conversationEligibility;
+    this.conversationEntryEligibilityProbe = input.conversationEntryEligibility;
     this.initializeConfiguration = () => {
       const initialization = input.initializeConfiguration();
       void initialization.then(() => this.noteWorkspaceSyncSucceeded(), () => {
@@ -384,6 +388,7 @@ export class VscodeReliableKernelProductRuntime {
       });
       const runtimeDatabase = application.database;
       const runtimeContent = application.contentStore;
+      const runtimeTurns = application.turns;
       const frozenWorkEnvironmentCache = new Map<string, string | null>();
       const conversationEligibility = createDiagnosedConversationHostEligibility(
         (conversationId) => evaluateConversationHostEligibility({
@@ -401,6 +406,16 @@ export class VscodeReliableKernelProductRuntime {
       runtimeDatabase.conversationOwners.setClaimEligibilityProbe(
         async (conversationId) => (await conversationEligibility(conversationId)).eligible
       );
+      // New input starts a Turn: an idle Conversation may start wherever the work environment its
+      // next Turn would freeze is available, even after its project folder moved.
+      const conversationEntryEligibility = (conversationId: string) => evaluateConversationEntryEligibility({
+        database: runtimeDatabase,
+        contentStore: runtimeContent,
+        workspaceFolderUris: () => currentWorkspaceFolders().map((folder) => folder.uri),
+        workEnvironments: () => configuration.workEnvironments(),
+        frozenWorkEnvironmentCache,
+        nextTurnWorkEnvironment: (id) => runtimeTurns.previewNextTurnWorkEnvironment(id)
+      }, conversationId);
       fileDiffs = new VscodeReliableFileDiffEditor(application.files, diagnostics);
       debugCapture.source.hostBootId = application.database.hostBootId;
       application.webviewFeed.setDebugCapture(debugCapture);
@@ -411,6 +426,13 @@ export class VscodeReliableKernelProductRuntime {
         undefined,
         diagnostics
       );
+      conversations.setEntryEligibility(async (conversationId) => {
+        try {
+          return (await conversationEntryEligibility(conversationId)).eligible ? 'eligible' : 'ineligible';
+        } catch {
+          return 'unknown';
+        }
+      });
       application.processDeliveries.setWakeHandler(createRuntimeDeliveryWakeHandler({
         application: () => application,
         conversations: () => conversations,
@@ -497,6 +519,7 @@ export class VscodeReliableKernelProductRuntime {
         diagnostics,
         debugCapture,
         conversationEligibility,
+        conversationEntryEligibility,
         initializeConfiguration,
         onConfigurationChanged: options.onConfigurationChanged
       });
@@ -558,6 +581,11 @@ export class VscodeReliableKernelProductRuntime {
       this.toolHost.initialize(),
       this.initializeConfiguration()
     ]).then(() => undefined);
+  }
+
+  /** Whether new input may start a Turn of the Conversation in this window; a probe failure is reported. */
+  public conversationEntryEligibility(conversationId: string): Promise<ConversationHostEligibilityView> {
+    return viewConversationHostEligibility(this.conversationEntryEligibilityProbe, conversationId);
   }
 
   /** Whether this window executes the Conversation, and why not; a probe failure is reported, not thrown. */
