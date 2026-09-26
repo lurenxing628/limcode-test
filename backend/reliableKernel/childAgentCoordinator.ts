@@ -281,11 +281,23 @@ export class ReliableChildAgentCoordinator {
     };
   }
 
+  /** Starting the delegated child runs the executor Agent: only a Host serving the parent may. */
+  public async mayEnsureApprovedPlan(input: PlanDelegationRequest): Promise<boolean> {
+    const parentTurn = await this.get('Turn', requireId(input.parentTurnId, 'parentTurnId'));
+    if (!parentTurn) throw new Error(`Plan delegation parent Turn ${input.parentTurnId} does not exist.`);
+    return await this.dependencies.database.conversationOwners.executionEligibility(
+      requireId(parentTurn.conversation_id, 'Turn.conversation_id')
+    ) === 'eligible';
+  }
+
   /**
    * Ensures the child lineage for an already-committed approved Plan. The durable Plan response is
    * the intent; this method is idempotent and never owns settlement of the source submit_plan call.
    */
   public async ensureApprovedPlan(input: PlanDelegationEnsureRequest): Promise<PlanDelegationResult> {
+    if (!await this.mayEnsureApprovedPlan(input)) {
+      throw new Error('Plan delegation starts its child only in a Host that serves the parent Conversation.');
+    }
     const { result: preview, selection } = await this.planDelegationPreview(input);
     assertExpectedPlanDelegation(preview, input.expected);
     const sourceToolCallId = requireId(input.sourceToolCallId, 'sourceToolCallId');
@@ -2124,13 +2136,27 @@ export class ReliableChildAgentCoordinator {
   private async driveChild(childExecutionId: string, turnId: string): Promise<ReliableChildDriveResult> {
     const child = await this.get('ChildExecution', childExecutionId);
     if (!child) throw new Error(`ChildExecution ${childExecutionId} does not exist.`);
+    const conversationId = requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
+    const owners = this.dependencies.database.conversationOwners;
+    // Driving is execution: only a Host serving the child Conversation does it. A child started
+    // here for a Conversation this Host does not serve hands its lease back for the Host that does.
+    const serves = owners.owns(conversationId)
+      ? await owners.executionEligibility(conversationId) === 'eligible'
+      : await owners.tryClaimEligible(conversationId) === 'owned';
+    if (!serves) {
+      const fence = await this.dependencies.turns.executionLeaseFence({
+        turnId,
+        leaseOwnerId: this.childLeaseOwnerId,
+        hostBootId: this.dependencies.database.hostBootId
+      });
+      if (fence) await this.dependencies.turns.releaseExecutionLease(fence);
+      throw new ExecutionHandoffError(`Child Conversation ${conversationId} is not served by this Host.`);
+    }
     // The child Conversation's owner drives it. The activity pin holds ownership for the whole
     // drive and releases-if-idle afterwards, so ownership follows real work across Hosts.
-    return this.dependencies.database.conversationOwners.run(
-      requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
-      () => this.driveChildOwned(childExecutionId, turnId)
-    );
+    return owners.run(conversationId, () => this.driveChildOwned(childExecutionId, turnId));
   }
+
 
   private async driveChildOwned(childExecutionId: string, turnId: string): Promise<ReliableChildDriveResult> {
     const fence = await this.readChildExecutionFence(turnId);

@@ -496,7 +496,8 @@ export class VscodeReliableKernelProductRuntime {
       });
       application.interactions.setPlanDelegator({
         preview: (input) => childAgents!.previewApprovedPlan(input),
-        ensure: (input) => childAgents!.ensureApprovedPlan(input)
+        ensure: (input) => childAgents!.ensureApprovedPlan(input),
+        mayEnsure: (input) => childAgents!.mayEnsureApprovedPlan(input)
       });
       // shell 覆盖是显式 opt-in；开启后把代理注入扩展宿主进程环境，子孙进程
       // （wrapper → PowerShell → curl/git）自动继承。这里必须在 open 返回前完成，

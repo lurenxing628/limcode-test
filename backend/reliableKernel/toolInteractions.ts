@@ -79,6 +79,12 @@ export interface PlanDelegationEnsureRequest extends PlanDelegationRequest {
 export interface PlanDelegator {
   preview(request: PlanDelegationRequest): Promise<PlanDelegationResult>;
   ensure(request: PlanDelegationEnsureRequest): Promise<PlanDelegationResult>;
+  /**
+   * Whether this Host may start the delegated child now: starting it runs the executor Agent, so
+   * only a Host serving the parent Conversation does. Elsewhere the approval is only recorded and
+   * the serving Host's resume of the parent Turn starts the child (completeRecordedPlanReview).
+   */
+  mayEnsure?(request: PlanDelegationRequest): Promise<boolean>;
 }
 
 export interface ExecutionApprovalPauseResult {
@@ -784,7 +790,9 @@ export class ToolInteractionControlPlane {
       await this.helpWinningPlanResolution(requestId);
       return this.lostPlanResolution(committed.receipt, requestId, proposalId, false);
     }
-    await this.ensureWinningPlanDelegation(requestId, receiptId, proposalId, subject.planRequest);
+    if (await this.ensureWinningPlanDelegation(requestId, receiptId, proposalId, subject.planRequest) === 'deferred') {
+      return { receiptId, requestId, proposalId, won: true, deduplicated: false, commitSeq: committed.commitSeq };
+    }
     await this.settleWinningPlanResponse(requestId, receiptId);
     const finalized = await this.effects.finalizeReadyInOrder(facts.turn.id as string);
     const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
@@ -801,6 +809,20 @@ export class ToolInteractionControlPlane {
   }
 
   /** update_task_list remains structured Tool facts; Phase F will derive its client projection. */
+  /**
+   * Completes a Plan review whose winning response was recorded but not settled: the approval came
+   * from a Host that must not start the delegated child, or the recording Host stopped before
+   * settling. Called when the parent Turn resumes; false when no response is recorded yet.
+   */
+  public async completeRecordedPlanReview(requestIdInput: string): Promise<boolean> {
+    const requestId = requireId(requestIdInput, 'requestId');
+    const requests = await this.list('InteractionRequest', { id: requestId }, 2);
+    if (requests.length !== 1 || requests[0].request_kind !== 'plan_review' || requests[0].status !== 'pending') return false;
+    if ((await this.list('InteractionResponse', { request_id: requestId }, 2)).length === 0) return false;
+    await this.helpWinningPlanResolution(requestId);
+    return true;
+  }
+
   public async settleTaskList(input: {
     source: PhaseDCommandSource;
     toolCallId: string;
@@ -954,12 +976,13 @@ export class ToolInteractionControlPlane {
     return body.sourceReceiptId === receiptId;
   }
 
+  /** 'deferred' means the winning approval delegates and this Host must not start the child. */
   private async ensureWinningPlanDelegation(
     requestId: string,
     expectedReceiptId: string,
     expectedProposalId: string,
     planRequest: SubmitPlanToolRequestRecord
-  ): Promise<void> {
+  ): Promise<'ensured' | 'deferred' | 'none'> {
     const responses = await this.list('InteractionResponse', { request_id: requestId }, 2);
     if (responses.length !== 1) throw new Error('Stable Plan resolution must have one InteractionResponse.');
     const metadata = await this.requireExisting(
@@ -967,12 +990,12 @@ export class ToolInteractionControlPlane {
       requireId(responses[0].content_object_id, 'InteractionResponse.content_object_id')
     ) as ContentObjectMetadata;
     const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
-    if (body.sourceReceiptId !== expectedReceiptId) return;
+    if (body.sourceReceiptId !== expectedReceiptId) return 'none';
     const output = submitPlanOutputFromResult(body.output);
     if (!output || output.proposalId !== expectedProposalId) {
       throw new Error('Winning Plan response lost its durable submit_plan result.');
     }
-    if (output.status !== 'approved' || output.executionTarget !== 'new_conversation') return;
+    if (output.status !== 'approved' || output.executionTarget !== 'new_conversation') return 'none';
     if (output.delegationStatus !== 'backgrounded') {
       throw new Error('Approved delegated Plan response lost its durable delegation intent.');
     }
@@ -987,17 +1010,20 @@ export class ToolInteractionControlPlane {
       agentId: output.agentId,
       agentType: output.agentType
     });
-    const ensured = normalizePlanDelegationResult(await this.requirePlanDelegator().ensure({
+    const delegator = this.requirePlanDelegator();
+    const request: PlanDelegationRequest = {
       sourceToolCallId: subject.toolCallId,
       parentTurnId: requireId(
         (await this.requireExisting('ToolCall', subject.toolCallId)).turn_id,
         'Plan delegation parent Turn.id'
       ),
       requestedAgentId,
-      prompt: createDelegatedPlanPrompt(planRequest),
-      expected
-    }));
+      prompt: createDelegatedPlanPrompt(planRequest)
+    };
+    if (delegator.mayEnsure && !await delegator.mayEnsure(request)) return 'deferred';
+    const ensured = normalizePlanDelegationResult(await delegator.ensure({ ...request, expected }));
     assertPlanDelegationIdentity(ensured, expected);
+    return 'ensured';
   }
 
   private async settleWinningPlanResponse(requestId: string, expectedReceiptId: string): Promise<void> {
@@ -1204,12 +1230,12 @@ export class ToolInteractionControlPlane {
     if (winnerReceipt.turn_id !== parentTurnId) {
       throw new Error('Durable Plan winner receipt does not belong to the Plan parent Turn.');
     }
-    await this.ensureWinningPlanDelegation(
+    if (await this.ensureWinningPlanDelegation(
       requestId,
       winnerReceiptId,
       subject.proposalId,
       subject.planRequest
-    );
+    ) === 'deferred') return;
     await this.settleWinningPlanResponse(requestId, winnerReceiptId);
     await this.effects.finalizeReadyInOrder(parentTurnId);
   }

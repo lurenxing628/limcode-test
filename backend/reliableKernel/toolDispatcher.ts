@@ -1388,6 +1388,16 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (readySettlement) return readySettlement;
     const existingPause = options.assumeFresh ? undefined : await this.readExistingPause(input.toolCallId);
     if (existingPause) {
+      // A Plan approval recorded by a Host that must not start its delegated child (or that stopped
+      // before settling) is completed by the Host resuming this Turn.
+      if (
+        existingPause.reason === 'awaiting_plan_review'
+        && existingPause.resumeKey !== undefined
+        && await this.dependencies.interactions.completeRecordedPlanReview(existingPause.resumeKey)
+      ) {
+        return await this.dependencies.effects.readTerminalResult(input.toolCallId, false)
+          ?? { ...existingPause, reason: 'converging' };
+      }
       return await this.autoApproveInteraction(input, existingPause) ?? existingPause;
     }
     const definitions = options.definitions ?? await this.dependencies.host.definitions();
