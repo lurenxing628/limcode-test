@@ -23,8 +23,43 @@
     "requiresUserConfirmation": false,
     "targetHostPolicy": "target-offline-current-other-data-set-may-run",
     "sourceFailurePolicy": "report-per-source-and-continue-other-sources",
-    "selectionPolicy": "preserve-selection-no-implicit-merge",
+    "selectionPolicy": "preserve-selection-merge-only-via-historical-merge",
     "historicalExecutionPolicy": "no-host-registration-or-task-recovery"
+  },
+  "historicalMerge": {
+    "sources": ["legacy-workspace-scope-automatic", "other-data-set-explicit-request"],
+    "target": "selected-current-epoch-data-set",
+    "initialSelection": "no-selection-file-fixed-root-with-data-else-latest-modified-historical-scope; unreadable-fixed-root-or-scope-container-requires-explicit-choice; existing-selection-never-switched",
+    "trigger": "startup-before-selected-host-registration",
+    "requiresUserConfirmation": false,
+    "explicitRequestConfirmation": "modal-then-reload",
+    "exclusivity": "configuration-admission-and-target-maintenance; other-target-hosts-via-exclusive-maintenance-else-defer-batch",
+    "sourcePolicy": "exact-published-3-4-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot",
+    "busySourcePolicy": "defer-source",
+    "unfinishedWorkPolicy": "refuse-source-and-report",
+    "backupPolicy": "sqlite-backup-api-of-target-once-per-startup-batch",
+    "casPolicy": "hard-link-or-digest-verified-copy-before-row-commit",
+    "rowPolicy": "single-transaction-all-domains; identical-rows-reused; content-identity-domains-keep-target; any-other-difference-or-unique-conflict-rolls-back-source",
+    "identityDomains": {
+      "ContentObject": ["created_at"],
+      "ProjectContext": ["name", "created_at", "updated_at"],
+      "Attachment": ["created_at"]
+    },
+    "integrity": "foreign-key-check-quick-check-and-per-domain-row-count-before-commit",
+    "recordPolicy": "per-source-record-in-target-control-root; committing-before-commit; blocked-keyed-by-source-fingerprint; automatic-once-per-source-per-configuration-root",
+    "noticePolicy": "once-per-cause-per-configuration-root; blocked-once-per-source-fingerprint; details-in-log-and-data-set-management",
+    "sourceRetention": "unchanged",
+    "selectionPolicy": "never-switch",
+    "historicalExecutionPolicy": "no-host-registration-or-task-recovery"
+  },
+  "exclusiveMaintenance": {
+    "location": "target-control-root/exclusive-maintenance",
+    "request": "operation-and-user-message-published-under-configuration-admission-and-target-maintenance",
+    "participation": "host-registers-after-runtime-ready; wait-only-if-every-live-host-participates-else-not-coordinatable",
+    "peerBehavior": "finish-owned-execution-then-5s-cancellable-non-modal-countdown-then-reload",
+    "reloadedHostBehavior": "wait-on-configuration-admission-until-maintenance-ends",
+    "waitBound": "requester-timeout-or-cancel-then-report-and-retry-next-startup",
+    "exclusivityProof": "host-liveness-records-only; request-advisory"
   },
   "candidateRoot": {
     "isolated": true,

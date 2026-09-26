@@ -492,9 +492,48 @@ function validateMigration(root, migration, failures) {
   if (upgrade?.requiresUserConfirmation !== false
     || upgrade?.targetHostPolicy !== 'target-offline-current-other-data-set-may-run'
     || upgrade?.sourceFailurePolicy !== 'report-per-source-and-continue-other-sources'
-    || upgrade?.selectionPolicy !== 'preserve-selection-no-implicit-merge'
+    || upgrade?.selectionPolicy !== 'preserve-selection-merge-only-via-historical-merge'
     || upgrade?.historicalExecutionPolicy !== 'no-host-registration-or-task-recovery') {
     failures.push('旧历史必须自动备份升级，仅要求目标离线；逐库报告失败，不切换当前库或执行旧任务');
+  }
+  const merge = migration?.historicalMerge;
+  failures.push(...exactSetProblems('历史合并来源',
+    ['legacy-workspace-scope-automatic', 'other-data-set-explicit-request'], merge?.sources ?? []));
+  const identityDomains = merge?.identityDomains ?? {};
+  failures.push(...exactSetProblems('历史合并内容派生身份领域',
+    ['ContentObject', 'ProjectContext', 'Attachment'], Object.keys(identityDomains)));
+  if (merge?.target !== 'selected-current-epoch-data-set'
+    || merge?.initialSelection !== 'no-selection-file-fixed-root-with-data-else-latest-modified-historical-scope; unreadable-fixed-root-or-scope-container-requires-explicit-choice; existing-selection-never-switched'
+    || merge?.trigger !== 'startup-before-selected-host-registration'
+    || merge?.requiresUserConfirmation !== false
+    || merge?.explicitRequestConfirmation !== 'modal-then-reload'
+    || merge?.exclusivity !== 'configuration-admission-and-target-maintenance; other-target-hosts-via-exclusive-maintenance-else-defer-batch'
+    || merge?.sourcePolicy !== 'exact-published-3-4-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot'
+    || merge?.busySourcePolicy !== 'defer-source'
+    || merge?.unfinishedWorkPolicy !== 'refuse-source-and-report'
+    || merge?.backupPolicy !== 'sqlite-backup-api-of-target-once-per-startup-batch'
+    || merge?.casPolicy !== 'hard-link-or-digest-verified-copy-before-row-commit'
+    || merge?.rowPolicy !== 'single-transaction-all-domains; identical-rows-reused; content-identity-domains-keep-target; any-other-difference-or-unique-conflict-rolls-back-source'
+    || JSON.stringify(identityDomains.ContentObject) !== JSON.stringify(['created_at'])
+    || JSON.stringify(identityDomains.ProjectContext) !== JSON.stringify(['name', 'created_at', 'updated_at'])
+    || JSON.stringify(identityDomains.Attachment) !== JSON.stringify(['created_at'])
+    || merge?.integrity !== 'foreign-key-check-quick-check-and-per-domain-row-count-before-commit'
+    || merge?.recordPolicy !== 'per-source-record-in-target-control-root; committing-before-commit; blocked-keyed-by-source-fingerprint; automatic-once-per-source-per-configuration-root'
+    || merge?.noticePolicy !== 'once-per-cause-per-configuration-root; blocked-once-per-source-fingerprint; details-in-log-and-data-set-management'
+    || merge?.sourceRetention !== 'unchanged'
+    || merge?.selectionPolicy !== 'never-switch'
+    || merge?.historicalExecutionPolicy !== 'no-host-registration-or-task-recovery') {
+    failures.push('旧工作区历史只能在当前库打开前离线合并：目标独占、先备份、单事务全领域核对，未结束工作与冲突整份拒绝，来源不变且不执行旧任务');
+  }
+  const exclusive = migration?.exclusiveMaintenance;
+  if (exclusive?.location !== 'target-control-root/exclusive-maintenance'
+    || exclusive?.request !== 'operation-and-user-message-published-under-configuration-admission-and-target-maintenance'
+    || exclusive?.participation !== 'host-registers-after-runtime-ready; wait-only-if-every-live-host-participates-else-not-coordinatable'
+    || exclusive?.peerBehavior !== 'finish-owned-execution-then-5s-cancellable-non-modal-countdown-then-reload'
+    || exclusive?.reloadedHostBehavior !== 'wait-on-configuration-admission-until-maintenance-ends'
+    || exclusive?.waitBound !== 'requester-timeout-or-cancel-then-report-and-retry-next-startup'
+    || exclusive?.exclusivityProof !== 'host-liveness-records-only; request-advisory') {
+    failures.push('多窗口独占维护只能在准入与维护锁内发布请求、有界等待参与窗口空闲重载，独占仍以 Host liveness 证明');
   }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
