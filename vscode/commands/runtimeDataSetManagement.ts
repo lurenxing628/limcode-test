@@ -64,22 +64,25 @@ export async function openWithRuntimeDataSetSelection<T>(context: vscode.Extensi
   catch (error) {
     if (!(error instanceof VscodeRuntimeDataSetSelectionRequiredError)) throw error;
     const candidate = await chooseDataSet(error.candidates, '选择当前历史库；其它历史库会在打开后自动合并进来', error.problems,
-      new Map(), { summarizeSelected: true });
+      new Map(), { summarizeSelected: true, startup: true });
     if (!candidate) throw new Error('尚未选择历史库。可从“历史与存储管理”选择后重载窗口。');
     await selectVscodeRuntimeDataSet(pathsFor(context), candidate.id);
     return open();
   }
 }
 
+/** At startup no library is current yet: only the chosen one becomes current, so none is "other". */
 function dataSetLabel(
   candidate: VscodeRuntimeDataSetCandidate,
   merge?: RuntimeDataSetMergeState,
-  summary?: RuntimeDataSetSummary
+  summary?: RuntimeDataSetSummary,
+  startup = false
 ): string {
   const name = summary?.projectNames.length
     ? summary.projectNames.join('、')
     : candidate.source === 'workspace' ? '旧工作区历史' : '默认历史库';
-  return `${candidate.selected ? '当前历史库' : '其他历史库'} · ${name}${mergeStateSuffix(merge)}`;
+  const role = candidate.selected ? '当前历史库 · ' : startup ? '' : '其他历史库 · ';
+  return `${role}${name}${mergeStateSuffix(merge)}`;
 }
 
 function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
@@ -129,7 +132,7 @@ async function chooseDataSet(
   placeHolder: string,
   problems: readonly VscodeRuntimeDataSetProblem[] = [],
   mergeStates: ReadonlyMap<string, RuntimeDataSetMergeState> = new Map(),
-  options: { summarizeSelected?: boolean } = {}
+  options: { summarizeSelected?: boolean; startup?: boolean } = {}
 ) {
   // Read in a worker from private copies, one data set at a time, kept per file state.
   const summaries = new Map<string, RuntimeDataSetSummary | 'unreadable'>();
@@ -150,7 +153,7 @@ async function chooseDataSet(
       const message = rejected ? `\n打开前检查未通过：${rejected.message}`
         : merge?.state === 'blocked' || merge?.state === 'failed' ? `\n${merge.message}` : '';
       return {
-        label: dataSetLabel(candidate, merge, summary),
+        label: dataSetLabel(candidate, merge, summary, options.startup),
         description: [
           rejected ? '暂时无法自动打开' : '',
           read === 'unreadable' ? '对话数和最后活动读取失败（只是没读到，库没有被改动）' : '',
@@ -282,7 +285,7 @@ async function mergeNow(
     modal: true, detail: `来源：${candidate.runtimeDataRootPath}\n\n在后台合并，不需要重载窗口：先备份当前库，再把对话写入当前库。`
       + '原库保留（已发布的旧格式会先备份并就地升级）；原库里中断的任务按“中止”收尾，不会在当前库被继续执行。'
       + '无法自动收尾的工作或数据冲突时整体不合并，并说明原因。'
-      + '特别大的库需要其它窗口暂时重载一次（会先等它们的任务结束，未发送的输入会保留）。' + changed
+      + '特别大的库需要其它窗口暂时重载一次（未发送的输入会保留）；这时若有其它窗口正在执行任务或正在使用，这次先不合并，之后会再试。' + changed
   }, '合并');
   if (confirmed !== '合并' || !candidate.dataSetId || !candidate.rootInstanceId) return;
   await requestRuntimeDataSetMerge(pathsFor(context), {

@@ -580,6 +580,8 @@ test('explicit merge runs online in this window without a reload; without a Runt
   assert.match(confirm[2].detail, /不需要重载窗口/);
   assert.match(confirm[2].detail, /已发布的旧格式会先备份并就地升级/);
   assert.match(confirm[2].detail, /按“中止”收尾，不会在当前库被继续执行/);
+  assert.match(confirm[2].detail, /若有其它窗口正在执行任务或正在使用，这次先不合并，之后会再试/);
+  assert.doesNotMatch(confirm[2].detail, /会先等它们的任务结束/, '合并时不等待忙窗口');
   assert.deepEqual(plain(f.calls.filter(call => ['merge-request', 'merge-online', 'command'].includes(call[0]))), [
     ['merge-request', 'workspace:old', 'old', 'old-instance'],
     ['merge-online', 'this-window', true, ['workspace:old']]
@@ -681,7 +683,7 @@ test('startup picker names every library and shows a preflight rejection on the 
   let opens = 0;
   await f.openWithRuntimeDataSetSelection(f.context, async () => { if (++opens === 1) throw new f.SelectionRequired(); return 'ready'; });
   assert.equal(shown.length, 2, '被预检拒绝的库不再重复列成单独的问题项');
-  assert.deepEqual(plain(shown.map(item => item.label)), ['当前历史库 · limcode', '其他历史库 · notes']);
+  assert.deepEqual(plain(shown.map(item => item.label)), ['当前历史库 · limcode', 'notes'], '启动选择时没有“其他历史库”');
   assert.match(shown[1].description, /^暂时无法自动打开 · 2 个对话/);
   assert.match(shown[1].detail, /打开前检查未通过：这个历史库的结构或完整性核验未通过/);
   assert.deepEqual(f.calls.filter(call => call[0] === 'select'), [['select', 'default']]);
