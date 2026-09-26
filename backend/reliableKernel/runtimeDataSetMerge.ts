@@ -68,10 +68,14 @@ export const RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Target backups kept per control root; older ones are removed after a successful batch. */
 export const RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION = 3;
 /**
- * Online transaction bound: the merge transaction blocks other Hosts' writes (busy_timeout 5 s).
- * Measured on this machine (see the merge report): ~6,000 rows commit in about one second.
+ * Online transaction bound: the merge transaction blocks other Hosts' writes, and those have no
+ * retry beyond busy_timeout (5 s). Measured (source rows, one transaction, another process writing
+ * every 2 ms): 1,249 rows commit in ~0.2 s on an idle machine and in ~1.5 s with the merge, the
+ * other writer and six CPU-bound processes all pinned to one core (the other writer's longest wait
+ * ~1.4 s). 1,200 rows keep that worst case well below busy_timeout; larger sources use the
+ * exclusive fallback.
  */
-export const RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object.freeze({ maxRows: 6_000, maxBytes: 16 * 1024 * 1024 });
+export const RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object.freeze({ maxRows: 1_200, maxBytes: 4 * 1024 * 1024 });
 
 const MAX_REPORTED_CONFLICTS = 20;
 

@@ -2,7 +2,8 @@
 //   kill <root> <point> [candidateId]   merge online and SIGKILL itself at a durable boundary
 //   writer <root> <stopFile> <resultFile> <mergedConversationId>
 //                                       write conversations until stopFile exists (resultFile.ready
-//                                       after the first commit), then report what it saw
+//                                       after the first commit), then report what it saw and its
+//                                       longest single write
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -31,8 +32,10 @@ if (mode === 'kill') {
 if (mode === 'writer') {
   const [stopFile, resultFile, mergedConversationId] = rest;
   let written = 0;
+  let maxMs = 0;
   const errors = [];
   for (;;) {
+    const startedAt = performance.now();
     try {
       await database.transaction([kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: `peer_conversation_${written}`, title: 'peer', status: 'active', created_at: NOW, updated_at: NOW
@@ -40,14 +43,15 @@ if (mode === 'writer') {
       written += 1;
       if (written === 1) await fs.writeFile(`${resultFile}.ready`, '');
     } catch (error) {
-      errors.push(String(error?.message ?? error));
+      errors.push(String(error?.code ?? error?.message ?? error));
     }
+    maxMs = Math.max(maxMs, performance.now() - startedAt);
     if (await fs.stat(stopFile).then(() => true, () => false)) break;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   const seen = (await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('Conversation').get(mergedConversationId)])).snapshot[0];
   await database.close();
-  await fs.writeFile(resultFile, JSON.stringify({ written, errors, sawMerged: seen !== null }));
+  await fs.writeFile(resultFile, JSON.stringify({ written, errors, maxMs: Math.round(maxMs), sawMerged: seen !== null }));
   process.exit(0);
 }
 process.exit(2);

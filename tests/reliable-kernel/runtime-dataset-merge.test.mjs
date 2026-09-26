@@ -21,7 +21,7 @@ const { stablePhaseDId } = kernelFile('effectControlPlane.js');
 const { createConversationRuntimeWorkProbe } = kernelFile('conversationRuntimePendingWork.js');
 const {
   MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS,
-  mergeHistoricalDataSetsOnline,
+  RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
@@ -122,6 +122,37 @@ test('在线合并时另一个窗口（进程）持续写同一当前库：双�
   const target = readDatabase(fixture.current);
   try { assert.equal(target.count('conversation', "id LIKE 'peer\\_conversation\\_%' ESCAPE '\\'"), peerResult.written); }
   finally { target.close(); }
+});
+
+test('复审 merge2 #4：接近在线上限的来源合并时，另一个窗口（进程）的每次写入最长等待远低于 busy_timeout', async (t) => {
+  assert.ok(RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS.maxRows <= 1_500, '上限按实测收紧');
+  const fixture = await createFixture(t, { withBeta: false });
+  const messages = 10;
+  // Each conversation is 2 + 5 × messages rows (conversation, project link, message rows, body).
+  const conversations = Math.floor((RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS.maxRows - 20) / (2 + 5 * messages));
+  await seedBulk(fixture.current, 'current', 200, messages);
+  await seedBulk(fixture.alpha, 'alpha', conversations, messages);
+  const database = await openTarget(t, fixture.current);
+  const control = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-merge-wait-'));
+  t.after(() => fs.rm(control, { recursive: true, force: true }));
+  const stopFile = path.join(control, 'stop');
+  const resultFile = path.join(control, 'result.json');
+  const peer = runChild(['writer', fixture.root, stopFile, resultFile, 'bulk_alpha_0']);
+  await waitForFile(`${resultFile}.ready`);
+  const marks = {};
+  const report = await merge(fixture, database, { onFaultPoint(point) { marks[point] = performance.now(); } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await fs.writeFile(stopFile, '');
+  const exit = await peer;
+  assert.equal(exit.code, 0, exit.stderr);
+  assert.deepEqual([report.deferred, report.blocked, report.failures], [[], [], []], '上限以内在线合并');
+  assert.ok(report.merged[0].insertedRows > RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS.maxRows * 0.8);
+  const result = JSON.parse(await fs.readFile(resultFile, 'utf8'));
+  const transactionMs = Math.round(marks['after-row-commit'] - marks['before-row-commit']);
+  t.diagnostic(`rows=${report.merged[0].insertedRows} transactionMs=${transactionMs} peerMaxMs=${result.maxMs} peerWrites=${result.written}`);
+  assert.deepEqual(result.errors, [], '对方没有 SQLITE_BUSY（不依赖任何重试）');
+  assert.equal(result.sawMerged, true);
+  assert.ok(result.maxMs < 2_000, `对方最长写入等待 ${result.maxMs} ms（合并事务 ${transactionMs} ms）`);
 });
 
 test('未完成工作按中止收尾后合并：先备份来源，合并进来的对话在任何窗口都不会被启动恢复自动执行', async (t) => {
@@ -998,6 +1029,30 @@ async function seed(dataSet, conversations) {
  * ToolCall without Operation), bare (active Turn only), interrupt-requested (lease + pending
  * interrupt request), queued-intent (a user message waiting for the next Turn).
  */
+/** Many small conversations, one project, every message its own body (2 + 5 × messages rows each). */
+async function seedBulk(dataSet, prefix, conversations, messages) {
+  await withRuntime(dataSet, async (runtime, store) => {
+    for (let c = 0; c < conversations; c += 1) {
+      const id = `bulk_${prefix}_${c}`;
+      const steps = [
+        repo('Conversation').insert({ id, title: id, status: 'active', created_at: NOW, updated_at: NOW }),
+        ...projectFolderAssignmentSteps({ conversationId: id, folder: { uri: `file:///workspace/${prefix}`, name: prefix }, now: NOW })
+      ];
+      for (let m = 0; m < messages; m += 1) {
+        const body = await store.ingest(runtime, JSON.stringify({ role: 'user', parts: [{ text: `${id} ${m} ${'x'.repeat(200)}` }] }), MESSAGE_TYPE);
+        const messageId = `${id}_m${m}`;
+        steps.push(
+          repo('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
+          repo('MessageRevision').insert({ id: `${messageId}_r`, message_id: messageId, revision_seq: 1n, role: 'user', content_object_id: body.id, created_at: NOW }),
+          repo('MessageCurrentRevisionLink').insert({ id: `${messageId}_c`, message_id: messageId, revision_id: `${messageId}_r`, updated_at: NOW }),
+          repo('MessagePartOfConversation').insert({ id: `${messageId}_p`, conversation_id: id, message_id: messageId, message_seq: BigInt(m + 1), created_at: NOW })
+        );
+      }
+      await runtime.transaction(steps);
+    }
+  });
+}
+
 async function seedUnfinishedWork(dataSet, specs) {
   await withRuntime(dataSet, async (runtime, store) => {
     for (const { conversationId, kind } of specs) {
