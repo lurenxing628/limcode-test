@@ -973,13 +973,14 @@ export class ReliableConversationRunner {
           return 'finalized';
         }
         if (facts.judgment !== 'resume' || !await this.findPendingTermination(turnId)) return 'none';
-        // A tool that was already executing can only be settled by the Host serving the project
-        // (effect recovery there). Claiming the lease here would only block that Host.
-        const executing = await listAllDomainRows(this.application.database, 'ToolCall', {
-          turn_id: turnId,
-          status: 'executing'
-        });
-        if (executing.length > 0) return 'none';
+        // Work dispatched without a Receipt stays with the Host that ran it: a live one handles the
+        // stop, and only a user's explicit stop closes what a dead one left (settleDeadHostExecution).
+        // Effects never dispatched, such as an approved file change not applied yet, are cancelled.
+        const effects = await this.application.phaseDRecovery.deadHostEffectsForTurn(
+          turnId,
+          this.application.database.hostBootId
+        );
+        if (effects.state !== 'none') return 'none';
         const claimed = await this.application.turns.claimRecoveryExecution({
           turnId,
           ...this.lease(conversationId)
@@ -992,8 +993,10 @@ export class ReliableConversationRunner {
           hostBootId: this.application.database.hostBootId
         });
         if (!fence) return 'retry';
-        return await this.settleUnderClaimedLease(fence, () =>
-          this.application.agentLoop.terminateRequested(turnId)) ? 'interrupted' : 'retry';
+        return await this.settleUnderClaimedLease(fence, async () => {
+          await this.application.phaseDRecovery.reconcileArrivedReceipts(effects.receiptEffectIntentIds);
+          return this.application.agentLoop.terminateRequested(turnId);
+        }) ? 'interrupted' : 'retry';
       });
     } catch (error) {
       if (isConversationRuntimeOwnerBusyError(error)) return 'busy';
@@ -1049,6 +1052,8 @@ export class ReliableConversationRunner {
               effectIntentIds: current.effectIntentIds,
               reason: DEAD_HOST_STOP_REASON
             });
+          } else {
+            await phaseD.reconcileArrivedReceipts(current.receiptEffectIntentIds);
           }
           return this.application.agentLoop.terminateRequested(turnId, 'user-stop-after-window-exit');
         }) ? 'interrupted' : unsettled;

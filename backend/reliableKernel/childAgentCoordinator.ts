@@ -125,6 +125,7 @@ export interface ReliableChildAgentCoordinatorDependencies {
   deadHostEffects?: {
     deadHostEffectsForTurn(turnId: string, selfHostBootId: string): Promise<DeadHostTurnEffects>;
     abandonDeadHostEffects(input: { sourceKey: string; effectIntentIds: readonly string[]; reason: string }): Promise<number>;
+    reconcileArrivedReceipts(effectIntentIds: readonly string[]): Promise<void>;
   };
   quiesceTurnExecution?: (input: { turnId: string; reason: ExecutionHandoffError }) => Promise<void>;
   manualCompression?: {
@@ -717,7 +718,7 @@ export class ReliableChildAgentCoordinator {
     const hostBootId = this.dependencies.database.hostBootId;
     const inspect = (): Promise<DeadHostTurnEffects> => this.dependencies.deadHostEffects
       ? this.dependencies.deadHostEffects.deadHostEffectsForTurn(turnId, hostBootId)
-      : Promise.resolve({ state: 'none' });
+      : Promise.resolve({ state: 'none', receiptEffectIntentIds: [] });
     const owners = this.dependencies.database.conversationOwners;
     try {
       const preview = await inspect();

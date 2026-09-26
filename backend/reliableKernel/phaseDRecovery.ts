@@ -37,14 +37,17 @@ interface PhaseDScanContext {
 
 /**
  * What keeps a Turn's executing tool calls open, and whether the Hosts running them are gone:
- * - `none`: no executing tool call with dispatched work (the ordinary stop path closes the rest);
- * - `live`: a Host that dispatched the work, or holds the Turn's lease, is alive or unverifiable;
- * - `unsupported`: a child spawn is in flight; the child scheduler owns it;
+ * - `none`: nothing was dispatched without a Receipt; the ordinary stop path closes the calls
+ *   (undispatched effects are cancelled). `receiptEffectIntentIds` are effects whose Receipt
+ *   arrived but whose Operation is still open; reconciling them only replays a recorded fact;
+ * - `live`: a Host that dispatched work still lacking a Receipt, or holds the Turn's lease, is
+ *   alive or unverifiable;
+ * - `unsupported`: a child spawn or cancel is in flight; the child scheduler owns it;
  * - `dead`: every such Host is proven dead (process gone or PID reused); `effectIntentIds` are the
  *   dispatched or receipted effects that still need a terminal Operation.
  */
 export type DeadHostTurnEffects =
-  | { state: 'none' }
+  | { state: 'none'; receiptEffectIntentIds: string[] }
   | { state: 'live'; hostBootIds: string[] }
   | { state: 'unsupported' }
   | { state: 'dead'; hostBootIds: string[]; effectIntentIds: string[] };
@@ -532,20 +535,16 @@ export class PhaseDRecoveryScanner {
   }
 
   /**
-   * Read-only inspection for a user's explicit stop. Liveness uses the same process-identity proof
-   * as lease takeover: only a Host proven dead counts, and `selfHostBootId` is never treated as
-   * dead (work dispatched by this process is still running here).
+   * Read-only inspection before a stop settles a Turn control-only. Liveness uses the same
+   * process-identity proof as lease takeover: only a Host proven dead counts, and `selfHostBootId`
+   * is never treated as dead (work dispatched by this process is still running here).
    */
   public async deadHostEffectsForTurn(turnIdInput: string, selfHostBootId: string): Promise<DeadHostTurnEffects> {
     const turnId = requireText(turnIdInput, 'turnId');
     const executing = await listAllDomainRows(this.database, 'ToolCall', { turn_id: turnId, status: 'executing' });
-    if (executing.length === 0) return { state: 'none' };
     const hosts = new Set<string>();
-    const effectIntentIds: string[] = [];
-    const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
-    if (leases.length > 1) throw new Error(`Turn ${turnId} has multiple ExecutionLeases.`);
-    const leaseHost = leases[0] ? requireText(leases[0].host_boot_id, 'ExecutionLease.host_boot_id') : undefined;
-    if (leaseHost !== undefined && leaseHost !== selfHostBootId) hosts.add(leaseHost);
+    const dispatched: string[] = [];
+    const receipted: string[] = [];
     for (const call of executing) {
       const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: String(call.id) });
       for (const operation of operations) {
@@ -554,27 +553,35 @@ export class PhaseDRecoveryScanner {
         for (const attempt of attempts) {
           const intents = await this.list('EffectIntent', { attempt_id: attempt.id }, 2);
           for (const intent of intents) {
-            if (!['dispatched', 'receipt_written'].includes(String(intent.dispatch_state))) continue;
-            if (intent.effect_kind === 'subagent_spawn' || intent.effect_kind === 'subagent_cancel') return { state: 'unsupported' };
+            const child = intent.effect_kind === 'subagent_spawn' || intent.effect_kind === 'subagent_cancel';
+            if (intent.dispatch_state === 'receipt_written') {
+              // A child wait is closed by the ordinary stop path; its spawn already happened.
+              if (!child) receipted.push(String(intent.id));
+              continue;
+            }
+            if (intent.dispatch_state !== 'dispatched') continue;
+            if (child) return { state: 'unsupported' };
             const fence = await this.effects.readEffectDispatchFence(String(intent.id));
             // Without a recorded dispatch Host nothing can prove that the work stopped.
             if (!fence) return { state: 'live', hostBootIds: [] };
             if (fence.hostBootId === selfHostBootId) return { state: 'live', hostBootIds: [fence.hostBootId] };
             hosts.add(fence.hostBootId);
-            effectIntentIds.push(String(intent.id));
+            dispatched.push(String(intent.id));
           }
         }
       }
     }
-    // Executing calls without a dispatched effect close through the ordinary stop path (they are
-    // cancelled); only dispatched work needs the proof below.
-    if (effectIntentIds.length === 0) return { state: 'none' };
+    if (dispatched.length === 0) return { state: 'none', receiptEffectIntentIds: receipted };
+    const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
+    if (leases.length > 1) throw new Error(`Turn ${turnId} has multiple ExecutionLeases.`);
+    const leaseHost = leases[0] ? requireText(leases[0].host_boot_id, 'ExecutionLease.host_boot_id') : undefined;
+    if (leaseHost !== undefined && leaseHost !== selfHostBootId) hosts.add(leaseHost);
     const live: string[] = [];
     for (const hostBootId of hosts) {
       if (await this.database.isHostAlive(hostBootId)) live.push(hostBootId);
     }
     if (live.length > 0) return { state: 'live', hostBootIds: live.sort() };
-    return { state: 'dead', hostBootIds: [...hosts].sort(), effectIntentIds };
+    return { state: 'dead', hostBootIds: [...hosts].sort(), effectIntentIds: [...dispatched, ...receipted] };
   }
 
   /**
@@ -591,19 +598,36 @@ export class PhaseDRecoveryScanner {
     const reason = requireText(input.reason, 'reason');
     let closed = 0;
     for (const effectIntentId of input.effectIntentIds) {
-      const intent = (await this.list('EffectIntent', { id: effectIntentId }, 1))[0];
-      if (!intent) throw new Error(`EffectIntent ${effectIntentId} does not exist.`);
-      const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
-      if (receipts.length > 1) throw new Error(`EffectIntent ${effectIntentId} has multiple EffectReceipts.`);
-      if (receipts.length === 1) {
-        if (await this.resumePersistedReceipt(intent, receipts[0]) !== undefined) closed += 1;
+      const arrived = await this.reconcileArrivedReceipt(effectIntentId);
+      if (arrived.receipt) {
+        if (arrived.closed) closed += 1;
         continue;
       }
-      if (intent.dispatch_state !== 'dispatched') continue;
-      await this.recordUnknownReceipt(intent, `${requireText(input.sourceKey, 'sourceKey')}:${effectIntentId}`, reason);
+      if (arrived.intent.dispatch_state !== 'dispatched') continue;
+      await this.recordUnknownReceipt(arrived.intent, `${requireText(input.sourceKey, 'sourceKey')}:${effectIntentId}`, reason);
       closed += 1;
     }
     return closed;
+  }
+
+  /**
+   * Reconciles effects whose Receipt already arrived but whose Operation is still open, before a
+   * stop closes their tool calls. This only applies recorded facts; nothing is dispatched. The
+   * caller holds the Turn's execution lease fence.
+   */
+  public async reconcileArrivedReceipts(effectIntentIds: readonly string[]): Promise<void> {
+    for (const effectIntentId of effectIntentIds) await this.reconcileArrivedReceipt(effectIntentId);
+  }
+
+  private async reconcileArrivedReceipt(
+    effectIntentId: string
+  ): Promise<{ intent: DomainRow; receipt: boolean; closed: boolean }> {
+    const intent = (await this.list('EffectIntent', { id: effectIntentId }, 1))[0];
+    if (!intent) throw new Error(`EffectIntent ${effectIntentId} does not exist.`);
+    const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
+    if (receipts.length > 1) throw new Error(`EffectIntent ${effectIntentId} has multiple EffectReceipts.`);
+    if (receipts.length === 0) return { intent, receipt: false, closed: false };
+    return { intent, receipt: true, closed: await this.resumePersistedReceipt(intent, receipts[0]) !== undefined };
   }
 
   private async recordUnknownReceipt(intent: DomainRow, sourceKey: string, reason: string): Promise<void> {
