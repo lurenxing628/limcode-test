@@ -10,7 +10,7 @@ import {
   DATA_ROOT_BACKUPS_DIR, DATA_ROOT_RESET_PENDING_FILE, INDEX_FILE, RECORDS_DIR,
   REGISTERED_STORAGE_ROOT_DIRS, REGISTERED_STORAGE_ROOT_FILES
 } from '../capabilities/vscodeStorage/constants';
-import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import { ROOT_BINDING_POINTER_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import type { HistoricalRootBinding } from './rootAuthority';
 import { classifyRecordedProcess, ownProcessStartIdentity } from './runtimeClaimPrimitives';
 import { initializeEmptyRuntimeRoot, RuntimeDatabase } from './runtimeDatabase';
@@ -134,8 +134,12 @@ export type DataRootRelocationTarget =
   | { kind: 'occupied'; entries: string[]; suggestedPath: string }
   /** LimCode data created at this very path: the selected data set there receives the merge. */
   | { kind: 'limcode'; receivingId: string; dataSetIds: string[] }
-  /** LimCode data copied here from elsewhere (its RootBindings name another path). */
-  | { kind: 'copied'; message: string }
+  /**
+   * LimCode data copied here from elsewhere (its RootBindings name another path): renamed aside
+   * as a whole (`<name>.limcode-copied-<time>`, never deleted or merged), then a fresh root.
+   * `sameDataSet`: an older copy of the current data set itself.
+   */
+  | { kind: 'copied'; sameDataSet: boolean; message: string }
   /** Not usable as a data directory at all. */
   | { kind: 'invalid'; message: string };
 
@@ -194,6 +198,8 @@ export interface StagedDataRootRelocation {
 
 export interface DataRootRelocationResult {
   targetRootPath: string;
+  /** Where LimCode data copied into the target from elsewhere was kept (renamed aside). */
+  copiedDataMovedTo?: string;
   merged: RuntimeDataSetMergeResult;
   configuration: { copiedFiles: number; replacedFiles: number; backupPath?: string };
   others: {
@@ -218,7 +224,10 @@ interface RelocationOwner {
   processStartIdentity?: string;
 }
 
-type TargetState = { kind: 'empty' } | { kind: 'limcode'; receivingId: string; dataSetIds: string[] };
+type TargetState =
+  | { kind: 'empty' }
+  | { kind: 'copied'; sameDataSet: boolean }
+  | { kind: 'limcode'; receivingId: string; dataSetIds: string[] };
 
 interface MigratedDataSet {
   id: string;
@@ -241,6 +250,8 @@ interface RelocationMarker {
   state: 'staging' | 'complete';
   relocationId: string;
   sourceRootPath: string;
+  /** The directory this record describes; a record copied along with a directory describes another one and is ignored. */
+  targetRootPath: string;
   startedAt: string;
   owner: RelocationOwner;
   /** Top-level entries of the target before the relocation touched it (never removed by an undo). */
@@ -251,6 +262,8 @@ interface RelocationMarker {
   receivingId: string;
   /** Completion record of an earlier relocation into this directory, put back by an undo. */
   previous?: RelocationMarker;
+  /** Copied LimCode data that was in the target, renamed aside here (renamed back by an undo). */
+  movedAside?: string;
   completedAt?: string;
   migrated?: MigratedDataSet[];
   configuration?: CopiedConfiguration[];
@@ -445,9 +458,10 @@ export async function planDataRootRelocation(input: {
   // A target that is the old directory itself (or inside or above it) is not inspected at all.
   const classified = placement.length > 0
     ? { target: { kind: 'invalid' as const, message: placement[0] }, undoes: false }
-    : await classifyTarget(targetRootPath, sourceRootPath);
+    : await classifyTarget(targetRootPath, sourceRootPath, currentCandidate.dataSetId);
   const target: DataRootRelocationTarget = classified.target;
-  if ((target.kind === 'invalid' || target.kind === 'copied') && placement.length === 0) problems.push(target.message);
+  if (target.kind === 'invalid' && placement.length === 0) problems.push(target.message);
+  if (target.kind === 'copied') warnings.push(target.message);
   if (target.kind === 'occupied') {
     problems.push(`所选文件夹里已有其它文件（${target.entries.length} 项），LimCode 只能放在其中新建的子文件夹里：${target.suggestedPath}`);
   }
@@ -623,7 +637,8 @@ async function databaseBytesOf(runtimeDataRootPath: string): Promise<number> {
 
 async function classifyTarget(
   targetRootPath: string,
-  sourceRootPath: string
+  sourceRootPath: string,
+  currentDataSetId: string | undefined
 ): Promise<{ target: DataRootRelocationTarget; undoes: boolean }> {
   let info;
   try {
@@ -641,7 +656,13 @@ async function classifyTarget(
   }
   if (leftover === 'undo' && marker) {
     // Classified as it was before that attempt; staging undoes the attempt first.
-    return { target: marker.targetState.kind === 'limcode' ? { ...marker.targetState } : { kind: 'empty' }, undoes: true };
+    const state = marker.targetState;
+    return {
+      target: state.kind === 'limcode' ? { ...state }
+        : state.kind === 'copied' ? { kind: 'copied', sameDataSet: state.sameDataSet, message: copiedMessage(targetRootPath, state.sameDataSet) }
+          : { kind: 'empty' },
+      undoes: true
+    };
   }
   const names = (await fs.readdir(targetRootPath)).filter((name) => !IGNORABLE_ENTRY_NAMES.has(name) && !isClaimName(name));
   if (names.length === 0) return { target: { kind: 'empty' }, undoes: false };
@@ -650,13 +671,8 @@ async function classifyTarget(
   }
   const inspection = await inspectVscodeRuntimeDataSets({ globalStoragePath: targetRootPath });
   if (inspection.problems.some((problem) => problem.message.includes('RootBinding 不一致'))) {
-    return {
-      target: {
-        kind: 'copied',
-        message: '新数据目录里的 LimCode 历史库是从别的位置拷贝过来的（记录的路径不是这里），目前还不能直接导入。请换一个空目录，或者先把那份数据放回原来的位置。'
-      },
-      undoes: false
-    };
+    const sameDataSet = currentDataSetId !== undefined && (await copiedDataSetIds(targetRootPath)).includes(currentDataSetId);
+    return { target: { kind: 'copied', sameDataSet, message: copiedMessage(targetRootPath, sameDataSet) }, undoes: false };
   }
   if (inspection.problems.length > 0) {
     return { target: { kind: 'invalid', message: `新数据目录里的 LimCode 历史库无法读取：${inspection.problems[0].message}` }, undoes: false };
@@ -694,6 +710,38 @@ async function unfinishedRelocation(
   } catch {
     return 'none';
   }
+}
+
+function copiedMessage(targetRootPath: string, sameDataSet: boolean): string {
+  const aside = `${path.basename(targetRootPath)}.limcode-copied-<时间>`;
+  return sameDataSet
+    ? `新数据目录里是当前历史的一份旧拷贝（从别处复制过来的）。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；当前历史照常迁入。`
+    : `新数据目录里是从别处拷贝过来的另一份 LimCode 数据。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；当前版本还不能直接导入它，需要时可以把它放回原来的位置后在那里打开。`;
+}
+
+/** Data-set ids named by the RootBindings of a copied data directory (read as plain JSON). */
+async function copiedDataSetIds(root: string): Promise<string[]> {
+  const pointers = [path.join(root, VSCODE_RUNTIME_CONTROL_DIRECTORY, ROOT_BINDING_POINTER_FILE)];
+  const scopes = path.join(root, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, 'scopes');
+  for (const key of await fs.readdir(scopes).catch(() => [] as string[])) {
+    pointers.push(path.join(scopes, key, VSCODE_RUNTIME_CONTROL_DIRECTORY, ROOT_BINDING_POINTER_FILE));
+  }
+  const ids: string[] = [];
+  for (const pointer of pointers) {
+    try {
+      const value = JSON.parse(await fs.readFile(pointer, 'utf8')) as { dataSetId?: unknown };
+      if (typeof value.dataSetId === 'string') ids.push(value.dataSetId);
+    } catch { /* not a readable binding */ }
+  }
+  return ids;
+}
+
+/** Renames the whole copied directory to a sibling; it is never deleted (an undo renames it back). */
+async function moveCopiedDataAside(target: string): Promise<string> {
+  const aside = `${target}.limcode-copied-${timestampSlug()}`;
+  await fs.rename(target, aside);
+  await syncDirectoryDurably(path.dirname(target));
+  return aside;
 }
 
 async function suggestSubfolder(targetRootPath: string): Promise<string> {
@@ -747,21 +795,23 @@ export async function stageDataRootRelocation(
       options.onProgress?.('正在撤销上次没有完成的迁移');
       await undoRelocation(target, earlier);
     }
-    const previous = await readMarker(target);
+    const previous = plan.target.kind === 'copied' ? undefined : await readMarker(target);
     if (previous?.state === 'staging') {
       throw new DataRootRelocationError('data-root-relocation-concurrent', '另一个 LimCode 窗口正在向这个目录迁移数据，请稍后再试。');
     }
+    const movedAside = plan.target.kind === 'copied' ? await moveCopiedDataAside(target) : undefined;
     const createdDirectory = !await pathExists(target);
     await fs.mkdir(target, { recursive: true });
     const preexisting = (await fs.readdir(target)).sort();
     const targetState: TargetState = plan.target.kind === 'limcode'
       ? { kind: 'limcode', receivingId: plan.target.receivingId, dataSetIds: [...plan.target.dataSetIds] }
-      : { kind: 'empty' };
+      : plan.target.kind === 'copied' ? { kind: 'copied', sameDataSet: plan.target.sameDataSet } : { kind: 'empty' };
     const marker: RelocationMarker = {
-      kind: MARKER_KIND, state: 'staging', relocationId, sourceRootPath: plan.sourceRootPath, startedAt, owner: currentOwner(),
+      kind: MARKER_KIND, state: 'staging', relocationId, sourceRootPath: plan.sourceRootPath, targetRootPath: target, startedAt, owner: currentOwner(),
       preexisting, createdDirectory, targetState,
       receivingId: plan.target.kind === 'limcode' ? plan.target.receivingId : plan.current.id,
-      ...(previous ? { previous: withoutPrevious(previous) } : {})
+      ...(previous ? { previous: withoutPrevious(previous) } : {}),
+      ...(movedAside ? { movedAside } : {})
     };
     await writeMarker(target, marker);
     const journal = await RelocationJournal.create(target, relocationId);
@@ -794,12 +844,12 @@ async function revalidatePlan(planned: DataRootRelocationPlan): Promise<DataRoot
   const problems = await placementProblems(planned.targetRootPath, planned.sourceRootPath, planned.targetRootPath);
   const inspection = await inspectVscodeRuntimeDataSets({ globalStoragePath: planned.sourceRootPath });
   const current = requireCurrentCandidate(inspection.candidates);
-  const { target } = await classifyTarget(planned.targetRootPath, planned.sourceRootPath);
+  const { target } = await classifyTarget(planned.targetRootPath, planned.sourceRootPath, current.dataSetId);
   if (target.kind === 'limcode') {
     const offline = await targetOfflineProblem(planned.targetRootPath);
     if (offline) problems.push(offline);
   }
-  if (target.kind === 'invalid' || target.kind === 'copied') problems.push(target.message);
+  if (target.kind === 'invalid') problems.push(target.message);
   if (problems.length > 0) throw new DataRootRelocationError('data-root-relocation-precondition', problems.join('\n'));
   if (current.id !== planned.current.id || current.dataSetId !== planned.current.dataSetId
     || current.rootInstanceId !== planned.current.rootInstanceId || !isDeepStrictEqual(target, planned.target)) {
@@ -906,6 +956,7 @@ export async function completeDataRootRelocation(
       await publish({ dataRootId });
       return {
         targetRootPath: target,
+        ...(staging.movedAside ? { copiedDataMovedTo: staging.movedAside } : {}),
         merged,
         configuration: {
           copiedFiles: configuration.copiedFiles, replacedFiles: configuration.replacedFiles,
@@ -1453,6 +1504,11 @@ async function undoRelocation(target: string, marker: RelocationMarker): Promise
   else await fs.rm(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), { force: true });
   await syncDirectoryDurably(target).catch(() => undefined);
   if (marker.createdDirectory) await fs.rmdir(target).catch(() => undefined);
+  // The copied data that was renamed aside goes back to its place (only into an empty spot).
+  if (marker.movedAside && await pathExists(marker.movedAside) && !await pathExists(target)) {
+    await fs.rename(marker.movedAside, target);
+    await syncDirectoryDurably(path.dirname(target)).catch(() => undefined);
+  }
 }
 
 /** A created file together with this process family's temporaries beside it (`<name>.<pid>.<uuid>.tmp`). */
@@ -1480,7 +1536,7 @@ async function readMarker(root: string): Promise<RelocationMarker | undefined> {
   let value: unknown;
   try { value = JSON.parse(await fs.readFile(path.join(root, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8')); }
   catch { return undefined; }
-  return isMarker(value) ? value : undefined;
+  return isMarker(value) && isSamePath(path.resolve(value.targetRootPath), path.resolve(root)) ? value : undefined;
 }
 
 function isMarker(value: unknown): value is RelocationMarker {
@@ -1489,11 +1545,14 @@ function isMarker(value: unknown): value is RelocationMarker {
   const targetState = marker?.targetState as Partial<TargetState & { receivingId: unknown; dataSetIds: unknown }> | undefined;
   return !!marker && marker.kind === MARKER_KIND && (marker.state === 'staging' || marker.state === 'complete')
     && typeof marker.relocationId === 'string' && /^[0-9a-f-]{36}$/.test(marker.relocationId)
-    && typeof marker.sourceRootPath === 'string' && typeof marker.startedAt === 'string' && typeof marker.receivingId === 'string'
+    && typeof marker.sourceRootPath === 'string' && typeof marker.targetRootPath === 'string'
+    && typeof marker.startedAt === 'string' && typeof marker.receivingId === 'string'
     && typeof marker.createdDirectory === 'boolean' && strings(marker.preexisting)
     && !!marker.owner && typeof marker.owner.processId === 'number'
     && !!targetState && (targetState.kind === 'empty'
+      || (targetState.kind === 'copied' && typeof (targetState as { sameDataSet?: unknown }).sameDataSet === 'boolean')
       || (targetState.kind === 'limcode' && typeof targetState.receivingId === 'string' && strings(targetState.dataSetIds)))
+    && (marker.movedAside === undefined || typeof marker.movedAside === 'string')
     && (marker.previous === undefined || isMarker(marker.previous))
     && (marker.migrated === undefined || (Array.isArray(marker.migrated) && marker.migrated.every((item) =>
       !!item && typeof item.id === 'string' && typeof item.dataSetId === 'string' && typeof item.rootInstanceId === 'string'

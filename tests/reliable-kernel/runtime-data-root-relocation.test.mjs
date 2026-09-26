@@ -207,13 +207,14 @@ test('新目录里的 LimCode 数据冲突时整体取消：两边内容都不�
   await assert.rejects(fs.stat(path.join(target, DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY)), { code: 'ENOENT' });
 });
 
-test('预检：别处拷来的数据、当前目录内部、上级目录与普通文件都会被拒绝并说明原因；云同步目录给出警告', async (t) => {
+test('预检：别处拷来的数据会被改名挪开并写明；当前目录内部、上级目录与普通文件都会被拒绝并说明原因；云同步目录给出警告', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const copied = path.join(fixture.base, 'copied');
   await fs.cp(fixture.root, copied, { recursive: true });
   const copiedPlan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied });
   assert.equal(copiedPlan.target.kind, 'copied');
-  assert.match(copiedPlan.problems.join('\n'), /拷贝过来/);
+  assert.deepEqual(copiedPlan.problems, []);
+  assert.ok(copiedPlan.warnings.some((warning) => /旧拷贝.*改名.*保留在旁边/.test(warning)));
 
   const inside = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: path.join(fixture.root, 'nested') });
   assert.match(inside.problems.join('\n'), /不能放在当前数据目录里面/);

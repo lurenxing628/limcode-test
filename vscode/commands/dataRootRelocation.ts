@@ -550,6 +550,7 @@ function describeResult(result: DataRootRelocationResult): string {
   if (result.others.covered.length) parts.push(`${result.others.covered.length} 个已合并进当前库的历史库不再单独复制`);
   if (result.others.leftBehind.length) parts.push(`${result.others.leftBehind.length} 个历史库留在旧目录（见设置页）`);
   if (result.configuration.replacedFiles) parts.push(`被替换的旧设置版本在 ${result.configuration.backupPath}`);
+  if (result.copiedDataMovedTo) parts.push(`新目录里原来那份拷贝过来的数据已改名保留在 ${result.copiedDataMovedTo}`);
   return `${parts.join('；')}。`;
 }
 

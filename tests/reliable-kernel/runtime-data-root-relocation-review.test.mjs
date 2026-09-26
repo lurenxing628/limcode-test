@@ -8,7 +8,8 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   compiled, conversationIds, createFixture, createLimCodeTarget, Database, deleteAsConfirmed, indexIds, initialize, kernelFile, openRuntime,
-  planWithRuntime, PROJECT, relocate, relocation, renameConversation, RootAuthority, rootAuthority, seed, selectedDataSet, writeRecordStore
+  planWithRuntime, PROJECT, relocate, relocation, renameConversation, RootAuthority, rootAuthority, seed, selectedDataSet, treeSnapshot,
+  writeRecordStore
 } from './runtime-data-root-relocation-fixture.mjs';
 
 const {
@@ -278,4 +279,30 @@ test('崩溃残留：已结束进程的快照目录、预复制暂存和计数�
   assert.deepEqual(removed.filter((file) => file.includes(tag) || file.startsWith(controlRoot)).sort(), [deadStaging, deadCount, deadSnapshot, oldUnowned].sort());
   await fs.stat(liveSnapshot);
   await fs.stat(freshLegacy);
+});
+
+test('目标是别处拷来的 LimCode 数据：整体改名挪到旁边永不删除；同一个库时说明是旧拷贝；迁移失败时改回原名', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const copied = path.join(fixture.base, 'copied');
+  await fs.cp(fixture.root, copied, { recursive: true });
+  const before = await treeSnapshot(copied);
+  const plan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied });
+  assert.deepEqual([plan.target.kind, plan.target.sameDataSet], ['copied', true]);
+  await assert.rejects(relocate(fixture, plan, { publish: async () => { throw new Error('指针写入失败'); } }), /指针写入失败/);
+  assert.deepEqual(await treeSnapshot(copied), before, '失败时拷贝原样放回');
+  assert.deepEqual((await fs.readdir(fixture.base)).filter((name) => name.includes('.limcode-copied-')), []);
+
+  const { result } = await relocate(fixture, await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied }));
+  assert.ok(result.copiedDataMovedTo?.startsWith(`${copied}.limcode-copied-`));
+  assert.deepEqual(await treeSnapshot(result.copiedDataMovedTo), before, '拷贝整体保留在旁边');
+  assert.deepEqual(conversationIds((await selectedDataSet(copied)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
+
+  // A copy of another library is kept aside the same way (importing it for a manual merge is not available yet).
+  const other = path.join(fixture.base, 'other-library');
+  await createLimCodeTarget(other);
+  const otherCopy = path.join(fixture.base, 'other-copy');
+  await fs.cp(other, otherCopy, { recursive: true });
+  const otherPlan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: otherCopy });
+  assert.deepEqual([otherPlan.target.kind, otherPlan.target.sameDataSet], ['copied', false]);
+  assert.ok(otherPlan.warnings.some((warning) => /另一份 LimCode 数据.*不合并、不删除/.test(warning)));
 });
