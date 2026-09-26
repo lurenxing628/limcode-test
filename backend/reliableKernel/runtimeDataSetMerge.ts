@@ -159,12 +159,15 @@ export interface RuntimeDataSetMergeBatchOptions extends RuntimeDataSetMergeOpti
   onSourceStart?(candidate: VscodeRuntimeDataSetCandidate, index: number, total: number): void;
   /**
    * Called under the batch's configuration admission and target maintenance claim when other Hosts
-   * use the target. Typically {@link requestExclusiveRuntimeMaintenance}: wait, bounded, for the
-   * participating windows to reload, then run `merge`. Without it such a batch is only reported.
+   * use the target. Typically {@link requestExclusiveRuntimeMaintenance} with `operationKey`, which
+   * identifies the pending sources so backoff never delays a different set: every other window
+   * first answers, and only when all can yield do they reload and `merge` runs. Without it such a
+   * batch is only reported.
    */
   coordinateTargetHosts?(
     targetPaths: RuntimeRootPaths,
-    merge: () => Promise<void>
+    merge: () => Promise<void>,
+    operationKey: string
   ): Promise<RuntimeExclusiveMaintenanceOutcome<void>>;
 }
 
@@ -344,7 +347,10 @@ export async function mergeRuntimeDataSetsIntoSelected(
           report.targetHostsActive = hosts;
           return report;
         }
-        const outcome = await options.coordinateTargetHosts(target.binding.paths, () => mergeSources());
+        const operationKey = sources
+          .map((source) => `${source.id}@${source.dataSetId ?? ''}/${source.rootInstanceId ?? ''}`)
+          .sort().join('|');
+        const outcome = await options.coordinateTargetHosts(target.binding.paths, () => mergeSources(), operationKey);
         if (outcome.state !== 'completed') report.targetHostsActive = outcome.hosts;
         return report;
       }

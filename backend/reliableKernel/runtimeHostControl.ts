@@ -13,6 +13,7 @@ import {
   releaseClaimRecord,
   requireNonEmptyText,
   tryPublishClaimRecord,
+  type RecordedProcessClassifier,
   type RecordedProcessInspection
 } from './runtimeClaimPrimitives';
 
@@ -72,6 +73,7 @@ export interface RuntimeHostActiveDescriptor {
   hostBootId: string;
   processId: number | null;
   processStartIdentity?: string;
+  startedAt?: string;
   heartbeatAt?: string;
   state: 'live' | 'unknown' | 'malformed';
 }
@@ -242,12 +244,28 @@ export async function assertRuntimeHostsOffline(
   paths: RuntimeRootPaths,
   exceptHostBootId?: string
 ): Promise<void> {
+  const active = await listActiveRuntimeHosts(paths, { exceptHostBootId });
+  if (active.length > 0) throw new RuntimeHostsActiveError(active);
+}
+
+/**
+ * Every Host liveness record not proven dead: live, unknown or malformed. The same classification
+ * as {@link assertRuntimeHostsOffline}; bounded polling loops pass a cached classifier so the
+ * platform identity probe does not run on every poll. A final exclusivity decision must still use
+ * {@link assertRuntimeHostsOffline} itself.
+ */
+export async function listActiveRuntimeHosts(
+  paths: RuntimeRootPaths,
+  options: { exceptHostBootId?: string; classify?: RecordedProcessClassifier } = {}
+): Promise<RuntimeHostActiveDescriptor[]> {
+  const { exceptHostBootId } = options;
+  const classify = options.classify ?? classifyRecordedProcess;
   const directory = runtimeHostLivenessDirectory(paths);
   let names: string[];
   try {
     names = await fs.readdir(directory);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
     throw error;
   }
   const active: RuntimeHostActiveDescriptor[] = [];
@@ -273,17 +291,23 @@ export async function assertRuntimeHostsOffline(
       continue;
     }
     if (exceptHostBootId !== undefined && record.hostBootId === exceptHostBootId) continue;
-    const state = classifyRecordedProcess(record.processId, record.processStartIdentity);
+    const state = classify(record.processId, record.processStartIdentity);
     if (state === 'dead') continue;
     active.push({
       hostBootId: record.hostBootId,
       processId: record.processId,
       ...(record.processStartIdentity !== undefined ? { processStartIdentity: record.processStartIdentity } : {}),
+      startedAt: record.startedAt,
       heartbeatAt: record.heartbeatAt,
       state: state === 'alive' ? 'live' : 'unknown'
     });
   }
-  if (active.length > 0) throw new RuntimeHostsActiveError(active);
+  return active;
+}
+
+/** True only inside a live {@link withRuntimeMaintenance} scope for exactly this root. */
+export function isRuntimeMaintenanceHeld(paths: RuntimeRootPaths): boolean {
+  return RUNTIME_MAINTENANCE_SCOPE.getStore()?.get(runtimeMaintenanceClaimPath(paths))?.active === true;
 }
 
 /** True only inside a live {@link withRuntimeDataRootAdmission} scope for this configuration root. */

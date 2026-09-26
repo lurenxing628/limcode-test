@@ -96,7 +96,7 @@ function fixture({
         if (mergeError) throw mergeError;
         if (mergeReport.targetHostsActive.length && options.coordinateTargetHosts) {
           let merged = false;
-          const outcome = await options.coordinateTargetHosts({ dataRootPath: '/fixture/current' }, async () => { merged = true; });
+          const outcome = await options.coordinateTargetHosts({ dataRootPath: '/fixture/current' }, async () => { merged = true; }, 'workspace:old@old-set/old-root');
           calls.push(['coordinated', outcome.state, merged]);
           return outcome.state === 'completed' ? coordinatedReport : mergeReport;
         }
@@ -124,9 +124,10 @@ function fixture({
     '../runtimeDataSetUpgradeLifetime': lifetime,
     '../runtimeExclusiveMaintenance': {
       async runWithExclusiveMaintenance(paths, input, operation) {
-        calls.push(['exclusive', paths.dataRootPath, input.operation, input.message, input.timeoutMs, input.isCurrent()]);
-        if (coordinatedReport === undefined) return { state: 'timed-out', hosts: [] };
-        return { state: 'completed', result: await operation(), waited: true };
+        calls.push(['exclusive', paths.dataRootPath, input.operation, input.operationKey, input.message,
+          input.configurationRootPath, input.isCurrent()]);
+        if (coordinatedReport === undefined) return { state: 'busy', hosts: [], reason: '其它窗口正在忙' };
+        return { state: 'completed', result: await operation(), coordinated: true };
       }
     }
   };
@@ -488,8 +489,8 @@ test('startup merge reports new blocks once, stays silent for known blocks and n
   const busy = fixture({ mergeReport: emptyMergeReport({ targetHostsActive: [{ hostBootId: 'peer', state: 'live' }], pendingSources: 2 }) });
   await busy.mergeHistoricalDataSetsBeforeOpen(busy.context);
   assert.deepEqual(busy.calls.filter(call => ['exclusive', 'coordinated'].includes(call[0])), [
-    ['exclusive', '/fixture/current', 'historical-merge', '为合并旧聊天记录', 60_000, true],
-    ['coordinated', 'timed-out', false]
+    ['exclusive', '/fixture/current', 'historical-merge', 'workspace:old@old-set/old-root', '为合并旧聊天记录', '/fixture', true],
+    ['coordinated', 'busy', false]
   ]);
   assert.match(busy.calls.find(call => call[0] === 'info')[1], /有 2 份旧聊天记录等待合并.*关闭其它窗口后重载本窗口/);
   const obsolete = fixture();

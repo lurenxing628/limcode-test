@@ -54,11 +54,17 @@
   },
   "exclusiveMaintenance": {
     "location": "target-control-root/exclusive-maintenance",
-    "request": "operation-and-user-message-published-under-configuration-admission-and-target-maintenance",
-    "participation": "host-registers-after-runtime-ready; wait-only-if-every-live-host-participates-else-not-coordinatable",
-    "peerBehavior": "finish-owned-execution-then-5s-cancellable-non-modal-countdown-then-reload",
-    "reloadedHostBehavior": "wait-on-configuration-admission-until-maintenance-ends",
-    "waitBound": "requester-timeout-or-cancel-then-report-and-retry-next-startup",
+    "uses": "user-requested-data-root-migration; oversized-historical-merge-fallback; offline-gc; never-epoch-upgrade",
+    "request": "operation-key-and-user-message-published-by-requester-holding-target-maintenance-and-configuration-admission-when-given",
+    "protocol": "prepare-each-host-answers-ready-busy-or-declined; confirm-only-when-all-ready; go-only-when-all-confirmed; no-host-yields-before-go",
+    "participation": "host-registers-after-runtime-ready; unregistered-live-host-after-15s-grace-or-unknown-host-abandons-at-once",
+    "busyPolicy": "abandon-at-once-by-default; bounded-wait-with-advance-notice-only-when-requested; host-busy-again-restarts-round",
+    "peerBehavior": "busy-while-lease-pinned-or-pending-conversation-work-or-focused; 5s-cancellable-countdown-or-notice-when-user-confirmed; reload-with-unsent-composer-in-webview-state",
+    "requesterSelf": "skipped-by-requester-host-boot-id-else-requester-process; requester-closes-own-runtime-inside-operation",
+    "reloadedHostBehavior": "wait-on-configuration-admission-until-maintenance-ends-then-reread-data-root",
+    "backoff": "per-operation-key-exponential-5m-to-6h-after-abandon; per-operation-10m-cooldown-after-go; explicit-user-request-ignores",
+    "waitBound": "prepare-8s-busy-wait-10m-confirm-20s-release-30s-monotonic; cancellable; outcome-completed-busy-declined-legacy-host-timed-out-cancelled-or-backoff-with-reason",
+    "processProbe": "platform-identity-once-per-pid-and-start-identity-then-kill-0; final-decision-uncached",
     "exclusivityProof": "host-liveness-records-only; request-advisory"
   },
   "candidateRoot": {

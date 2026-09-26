@@ -262,13 +262,15 @@ export async function mergeHistoricalDataSetsBeforeOpen(
           reporter => { progress = reporter; return done; });
       },
       onSourceStart: (_candidate, index, total) => progress?.report({ message: `${index + 1}/${total}` }),
-      // Other windows still use the selected data set: participating windows reload once idle and
-      // then wait on this admission. Older windows cannot take part, so there is no wait for them.
-      coordinateTargetHosts: (targetPaths, merge) => runWithExclusiveMaintenance(targetPaths, {
+      // Other windows still use the selected data set: they first answer; only when all are idle do
+      // they reload and wait on this admission. Any busy or older window withdraws the request and
+      // the same sources back off, so a startup never keeps other windows reloading.
+      coordinateTargetHosts: (targetPaths, merge, operationKey) => runWithExclusiveMaintenance(targetPaths, {
         operation: 'historical-merge',
+        operationKey,
         message: '为合并旧聊天记录',
         waitingTitle: '正在等待其它窗口空闲后合并旧聊天记录',
-        timeoutMs: 60_000,
+        configurationRootPath: paths.globalStoragePath,
         isCurrent: stillCurrent
       }, merge)
     }));

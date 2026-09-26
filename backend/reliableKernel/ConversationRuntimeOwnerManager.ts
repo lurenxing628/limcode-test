@@ -197,6 +197,11 @@ export class ConversationRuntimeOwnerManager {
     return this.owned.has(conversationId);
   }
 
+  /** Conversations this Host owns right now; pinned ones have a command or run in progress. */
+  public ownedActivity(): Array<{ conversationId: string; pinned: boolean }> {
+    return [...this.owned.values()].map((state) => ({ conversationId: state.conversationId, pinned: state.pins > 0 }));
+  }
+
   public async claim(conversationId: string): Promise<void> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
     await this.enqueue(id, async () => {

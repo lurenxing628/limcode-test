@@ -18,7 +18,7 @@ const {
   mergeRuntimeDataSetIntoTarget, mergeRuntimeDataSetsIntoSelected, precopyRuntimeDataSetCas,
   readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
-const { registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
+const { requestExclusiveRuntimeMaintenance, startExclusiveMaintenanceParticipant } = kernelFile('runtimeExclusiveMaintenance.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot,
   selectVscodeRuntimeDataSet
@@ -265,19 +265,27 @@ test('当前库被参与协作的窗口使用时，在准入内等它让出后�
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_coordinated', project: SHARED_PROJECT }]);
   const targetHost = await publishHost(fixture.current.binding);
-  const participant = await registerExclusiveMaintenanceParticipant(fixture.current.binding.paths, 'fixture-host');
   const events = [];
+  // The other window answers ready, confirms, then reloads: its Runtime closes and its liveness disappears.
+  const participant = startExclusiveMaintenanceParticipant(fixture.current.binding.paths, 'fixture-host', {
+    busyReason: async () => undefined,
+    confirm: async () => { events.push('confirm'); return true; },
+    release: async () => { events.push('release'); await participant.dispose(); await fs.rm(targetHost); }
+  }, { pollMs: 10, processId: 2_000_000 });
+  t.after(() => participant.dispose());
+  const keys = [];
   const report = await mergeRuntimeDataSetsIntoSelected(fixture.paths, {
-    coordinateTargetHosts: (targetPaths, merge) => requestExclusiveRuntimeMaintenance(targetPaths, {
-      operation: 'historical-merge', message: '为合并旧聊天记录', timeoutMs: 5_000, pollMs: 10,
-      onWaitStart: () => {
-        events.push('wait');
-        // The other window reloads once idle; its Runtime closes and its liveness disappears.
-        setTimeout(() => { void participant.unregister().then(() => fs.rm(targetHost)); }, 20);
-      }
-    }, async () => { events.push('merge'); await merge(); })
+    coordinateTargetHosts: (targetPaths, merge, operationKey) => {
+      keys.push(operationKey);
+      return requestExclusiveRuntimeMaintenance(targetPaths, {
+        operation: 'historical-merge', operationKey, message: '为合并旧聊天记录', pollMs: 10,
+        onWaitStart: () => events.push('wait')
+      }, async () => { events.push('merge'); await merge(); });
+    }
   });
-  assert.deepEqual(events, ['wait', 'merge']);
+  assert.deepEqual(events, ['wait', 'confirm', 'release', 'merge']);
+  assert.equal(keys.length, 1);
+  assert.ok(keys[0].startsWith(`${fixture.alpha.id}@`), `the pending sources identify the work: ${keys[0]}`);
   assert.deepEqual(report.targetHostsActive, []);
   assert.deepEqual(report.merged.map((item) => item.candidateId), [fixture.alpha.id]);
 
@@ -287,8 +295,8 @@ test('当前库被参与协作的窗口使用时，在准入内等它让出后�
   await publishHost(fixture.current.binding);
   const before = targetDigest(fixture.current);
   const waiting = await mergeRuntimeDataSetsIntoSelected(fixture.paths, {
-    coordinateTargetHosts: (targetPaths, merge) => requestExclusiveRuntimeMaintenance(targetPaths, {
-      operation: 'historical-merge', message: '为合并旧聊天记录', timeoutMs: 50, pollMs: 10
+    coordinateTargetHosts: (targetPaths, merge, operationKey) => requestExclusiveRuntimeMaintenance(targetPaths, {
+      operation: 'historical-merge', operationKey, message: '为合并旧聊天记录', prepareTimeoutMs: 50, pollMs: 10
     }, merge)
   });
   assert.equal(waiting.targetHostsActive.length, 1);

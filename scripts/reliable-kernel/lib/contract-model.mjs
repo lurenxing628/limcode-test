@@ -526,14 +526,24 @@ function validateMigration(root, migration, failures) {
     failures.push('旧工作区历史只能在当前库打开前离线合并：目标独占、先备份、单事务全领域核对，未结束工作与冲突整份拒绝，来源不变且不执行旧任务');
   }
   const exclusive = migration?.exclusiveMaintenance;
-  if (exclusive?.location !== 'target-control-root/exclusive-maintenance'
-    || exclusive?.request !== 'operation-and-user-message-published-under-configuration-admission-and-target-maintenance'
-    || exclusive?.participation !== 'host-registers-after-runtime-ready; wait-only-if-every-live-host-participates-else-not-coordinatable'
-    || exclusive?.peerBehavior !== 'finish-owned-execution-then-5s-cancellable-non-modal-countdown-then-reload'
-    || exclusive?.reloadedHostBehavior !== 'wait-on-configuration-admission-until-maintenance-ends'
-    || exclusive?.waitBound !== 'requester-timeout-or-cancel-then-report-and-retry-next-startup'
-    || exclusive?.exclusivityProof !== 'host-liveness-records-only; request-advisory') {
-    failures.push('多窗口独占维护只能在准入与维护锁内发布请求、有界等待参与窗口空闲重载，独占仍以 Host liveness 证明');
+  const expectedExclusive = {
+    location: 'target-control-root/exclusive-maintenance',
+    uses: 'user-requested-data-root-migration; oversized-historical-merge-fallback; offline-gc; never-epoch-upgrade',
+    request: 'operation-key-and-user-message-published-by-requester-holding-target-maintenance-and-configuration-admission-when-given',
+    protocol: 'prepare-each-host-answers-ready-busy-or-declined; confirm-only-when-all-ready; go-only-when-all-confirmed; no-host-yields-before-go',
+    participation: 'host-registers-after-runtime-ready; unregistered-live-host-after-15s-grace-or-unknown-host-abandons-at-once',
+    busyPolicy: 'abandon-at-once-by-default; bounded-wait-with-advance-notice-only-when-requested; host-busy-again-restarts-round',
+    peerBehavior: 'busy-while-lease-pinned-or-pending-conversation-work-or-focused; 5s-cancellable-countdown-or-notice-when-user-confirmed; reload-with-unsent-composer-in-webview-state',
+    requesterSelf: 'skipped-by-requester-host-boot-id-else-requester-process; requester-closes-own-runtime-inside-operation',
+    reloadedHostBehavior: 'wait-on-configuration-admission-until-maintenance-ends-then-reread-data-root',
+    backoff: 'per-operation-key-exponential-5m-to-6h-after-abandon; per-operation-10m-cooldown-after-go; explicit-user-request-ignores',
+    waitBound: 'prepare-8s-busy-wait-10m-confirm-20s-release-30s-monotonic; cancellable; outcome-completed-busy-declined-legacy-host-timed-out-cancelled-or-backoff-with-reason',
+    processProbe: 'platform-identity-once-per-pid-and-start-identity-then-kill-0; final-decision-uncached',
+    exclusivityProof: 'host-liveness-records-only; request-advisory'
+  };
+  if (!plainObject(exclusive) || JSON.stringify(Object.keys(exclusive).sort()) !== JSON.stringify(Object.keys(expectedExclusive).sort())
+    || Object.entries(expectedExclusive).some(([key, value]) => exclusive[key] !== value)) {
+    failures.push('多窗口独占维护必须两阶段协调：全部窗口就绪才确认、全部确认才让出，忙/拒绝/旧窗口/超时立即放弃并按操作键退避、按操作冷却，独占仍以 Host liveness 证明');
   }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');

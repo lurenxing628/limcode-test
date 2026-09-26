@@ -22,6 +22,42 @@ export function classifyRecordedProcess(
   return inspectRecordedProcess(processId, processStartIdentity).state;
 }
 
+export type RecordedProcessClassifier = (
+  processId: number,
+  processStartIdentity: string | undefined
+) => RecordedProcessState;
+
+/**
+ * For bounded polling loops over the same peers: the platform start-identity probe (a synchronous
+ * PowerShell or ps spawn on Windows/macOS) runs at most once per (pid, identity). Afterwards a
+ * proven-alive process stays alive only while `kill(pid, 0)` still finds it; ESRCH proves it gone.
+ * An EPERM from a proven-alive pid may be a reused pid, so it is fully re-verified once.
+ */
+export function createCachedProcessClassifier(
+  classify: RecordedProcessClassifier = classifyRecordedProcess
+): RecordedProcessClassifier {
+  const cache = new Map<string, RecordedProcessState>();
+  return (processId, processStartIdentity) => {
+    const key = `${processId}\0${processStartIdentity ?? ''}`;
+    const cached = cache.get(key);
+    if (cached === 'dead' || cached === 'unknown') return cached;
+    if (cached === 'alive') {
+      try {
+        process.kill(processId, 0);
+        return 'alive';
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === 'ESRCH') {
+          cache.set(key, 'dead');
+          return 'dead';
+        }
+      }
+    }
+    const state = classify(processId, processStartIdentity);
+    cache.set(key, state);
+    return state;
+  };
+}
+
 export interface RecordedProcessInspection {
   state: RecordedProcessState;
   /** Why the owner could not be proven alive or dead; present only for 'unknown'. */

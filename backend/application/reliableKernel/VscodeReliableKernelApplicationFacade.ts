@@ -574,11 +574,20 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     };
   }
 
-  /** True while this Host still holds an ExecutionLease: a reload now would interrupt that work. */
+  /**
+   * True while a reload of this window would interrupt work: an ExecutionLease of this Host, a
+   * command or run in progress (an activity pin), or any durable pending work of a conversation it
+   * owns — queued input, undelivered deliveries and wakes, a pending answer delivery, background
+   * processes. The owner manager keeps a conversation exactly while that probe reports work.
+   */
   public async hasOwnedExecution(): Promise<boolean> {
     this.requireOpen();
     const database = this.product.application.database;
-    return (await listAllDomainRows(database, 'ExecutionLease', { host_boot_id: database.hostBootId })).length > 0;
+    if ((await listAllDomainRows(database, 'ExecutionLease', { host_boot_id: database.hostBootId })).length > 0) return true;
+    for (const { conversationId, pinned } of database.conversationOwners.ownedActivity()) {
+      if (pinned || await database.hasConversationRuntimeWork(conversationId)) return true;
+    }
+    return false;
   }
 
   public async dispose(): Promise<void> {
