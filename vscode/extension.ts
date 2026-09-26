@@ -43,8 +43,14 @@ async function startApplication(
       '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade'
     );
     const moduleLoadedAt = Date.now();
-    const { openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup } = await import('./commands/runtimeDataSetManagement');
-    const application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context));
+    const {
+      mergeHistoricalDataSetsBeforeOpen, openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup
+    } = await import('./commands/runtimeDataSetManagement');
+    // Historical workspace scopes merge offline into the selected data set before this Host
+    // registers on it; later windows wait on the same admission until the merge finishes.
+    const application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context, {
+      beforeRuntimeOpen: () => mergeHistoricalDataSetsBeforeOpen(context, () => activeStartup === startup)
+    }));
     const applicationOpenedAt = Date.now();
 
     // Deactivation may race a slow filesystem/SQLite open. Publish the result so deactivate() can

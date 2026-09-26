@@ -93,22 +93,45 @@ test('唯一旧workspace根原地选择，包括epoch 3有界升级入口', asyn
   assert.equal(candidate.selected, true);
 }));
 
-test('多旧库必须显式选库，首窗口及当前folder不能抢占', async () => fixture(async (root, paths) => {
+test('多旧库且无显式选择时固定根成为当前库，当前folder不能抢占，已有显式选择保持', async () => fixture(async (root, paths) => {
   await createRoot(root);
   const otherScope = scope('other');
   const otherRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, otherScope);
   await createRoot(otherRoot);
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, otherScope), (error) => {
-    assert.ok(error instanceof VscodeRuntimeDataSetSelectionRequiredError);
-    assert.equal(error.code, 'runtime-dataset-selection-required');
-    assert.deepEqual(error.candidates.map((item) => item.id), ['default', `workspace:${otherScope.key}`]);
-    assert.ok(error.candidates.every((item) => !item.selected));
-    return true;
-  });
-  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+  const first = await resolveVscodeWorkspaceRuntimePlacement(paths, otherScope);
+  assert.equal(first.runtimeScopeRootPath, root);
+  const selection = JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8'));
+  assert.equal(selection.id, 'default');
+  assert.equal(selection.initialized, true);
   await selectVscodeRuntimeDataSet(paths, `workspace:${otherScope.key}`);
   const placement = await resolveVscodeWorkspaceRuntimePlacement(paths, scope('third'));
   assert.equal(placement.runtimeScopeRootPath, otherRoot);
+}));
+
+test('没有固定根的多个旧工作区库按最近使用自动选当前库，不弹选择', async () => fixture(async (root, paths) => {
+  const olderScope = scope('older');
+  const newerScope = scope('newer');
+  const older = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, olderScope), 4);
+  const newer = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, newerScope), 3);
+  await fs.utimes(older.paths.databasePath, new Date('2026-09-01T00:00:00Z'), new Date('2026-09-01T00:00:00Z'));
+  await fs.utimes(newer.paths.databasePath, new Date('2026-09-02T00:00:00Z'), new Date('2026-09-02T00:00:00Z'));
+  const placement = await resolveVscodeWorkspaceRuntimePlacement(paths, olderScope);
+  assert.equal(placement.runtimeDataRootPath, newer.paths.dataRootPath);
+  assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8')).id, `workspace:${newerScope.key}`);
+  await assert.rejects(fs.stat(path.join(root, '.limcode-runtime')), { code: 'ENOENT' });
+}));
+
+test('旧工作区容器不可读时不自动选库，仍要求明确选择', async () => fixture(async (root, paths) => {
+  await createRoot(root);
+  const container = path.join(root, '.limcode-workspace-runtimes', 'scopes');
+  await fs.mkdir(path.dirname(container), { recursive: true });
+  await fs.writeFile(container, 'not-a-directory');
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), (error) => {
+    assert.ok(error instanceof VscodeRuntimeDataSetSelectionRequiredError);
+    assert.deepEqual(error.problems.map((problem) => problem.id), ['workspace-scopes']);
+    return true;
+  });
+  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
 }));
 
 test('固定选择不受workspace保存、增删重排文件夹影响，正常启动不扫描旧scope', async () => fixture(async (root, paths) => {
@@ -130,7 +153,7 @@ test('固定选择不受workspace保存、增删重排文件夹影响，正常�
   await assert.rejects(listVscodeRuntimeDataSets(paths), { code: 'runtime-dataset-invalid' });
 }));
 
-for (const previousEpoch of [3, 4]) test(`epoch ${previousEpoch} 健康旧库与真实维护失败留下的空scope分别报告，首次必须明确选库`, async () => fixture(async (root, paths) => {
+for (const previousEpoch of [3, 4]) test(`epoch ${previousEpoch} 健康旧库与真实维护失败留下的空scope分别报告，首次自动选健康库`, async () => fixture(async (root, paths) => {
   const healthyScope = scope('healthy');
   const healthyRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, healthyScope);
   const binding = await createRoot(healthyRoot, previousEpoch);
@@ -151,20 +174,16 @@ for (const previousEpoch of [3, 4]) test(`epoch ${previousEpoch} 健康旧库与
     [[`workspace:${failedScope.key}`, failedRoot]]);
   assert.match(inspection.problems[0].message, /缺少完整 RootBinding/);
   await assert.rejects(listVscodeRuntimeDataSets(paths), { code: 'runtime-dataset-invalid' });
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, healthyScope), error => {
-    assert.ok(error instanceof VscodeRuntimeDataSetSelectionRequiredError);
-    assert.deepEqual(error.candidates, inspection.candidates);
-    assert.deepEqual(error.problems, inspection.problems);
-    return true;
-  });
-  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
-  await selectVscodeRuntimeDataSet(paths, `workspace:${healthyScope.key}`);
+  // A residue scope is reported by discovery but no longer forces a question: the single healthy
+  // library becomes current in place, and the residue stays untouched.
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, healthyScope)).runtimeScopeRootPath, healthyRoot);
+  assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8')).id, `workspace:${healthyScope.key}`);
   assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('new-window'))).runtimeScopeRootPath, healthyRoot);
   assert.equal(await fs.readFile(binding.paths.rootPointerPath, 'utf8'), pointerBefore);
   assert.deepEqual(await fs.readdir(failedRoot), []);
 }));
 
-test('reset归档后未重建的scope保留诊断与完整备份，不阻止明确选择健康旧库', async () => fixture(async (root, paths) => {
+test('reset归档后未重建的scope保留诊断与完整备份，不阻止自动选择健康旧库', async () => fixture(async (root, paths) => {
   const healthy = await createRoot(root, 4);
   const resetScope = scope('reset-interrupted');
   const resetRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, resetScope);
@@ -178,8 +197,7 @@ test('reset归档后未重建的scope保留诊断与完整备份，不阻止明�
   const inspection = await inspectVscodeRuntimeDataSets(paths);
   assert.deepEqual(inspection.candidates.map(candidate => candidate.id), ['default']);
   assert.equal(inspection.problems[0].id, `workspace:${resetScope.key}`);
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-selection-required' });
-  await selectVscodeRuntimeDataSet(paths, 'default');
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'))).runtimeDataRootPath, healthy.paths.dataRootPath);
   assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('selected'))).runtimeDataRootPath, healthy.paths.dataRootPath);
   assert.equal(await fs.readFile(archivedPointer, 'utf8'), before);
   assert.equal(await fs.readFile(path.join(archive.backupPath, 'active', 'cas', 'retained.bin'), 'utf8'), 'retained');
@@ -199,8 +217,7 @@ test('scope普通文件保留为问题条目，离线检查不拼接文件内的
   assert.deepEqual(inspection.problems.map(problem => problem.id).sort(),
     ['workspace:.DS_Store', `workspace:${fileScope.key}`].sort());
   await assert.rejects(listVscodeRuntimeDataSets(paths), { code: 'runtime-dataset-invalid' });
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-selection-required' });
-  await selectVscodeRuntimeDataSet(paths, 'default');
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'))).runtimeScopeRootPath, root);
   assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('selected'))).runtimeScopeRootPath, root);
   assert.equal(await fs.readFile(filePath, 'utf8'), 'keep-file');
   assert.equal(await fs.readFile(unrelated, 'utf8'), 'keep-unrelated-file');

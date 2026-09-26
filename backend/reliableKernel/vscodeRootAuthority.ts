@@ -196,10 +196,12 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
           `已有运行数据集均无法使用，原数据保持不变：\n${problems.map(problem => problem.message).join('\n')}`
         );
       }
-      if (candidates.length > 1 || problems.length) {
+      // An unreadable fixed root or scope container could hide data; that still needs a person.
+      if (problems.some(problem => problem.id === 'default' || problem.id === 'workspace-scopes')) {
         throw new VscodeRuntimeDataSetSelectionRequiredError(candidates, problems);
       }
-      candidate = candidates[0] ?? await inspectCandidate(configurationRootPath, 'default', undefined, true);
+      candidate = await chooseInitialRuntimeDataSet(candidates)
+        ?? await inspectCandidate(configurationRootPath, 'default', undefined, true);
       await assertConfigurationRootRuntimesOffline(configurationRootPath);
       await publishSelection(configurationRootPath, candidate.id, Boolean(candidate.dataSetId));
     }
@@ -211,6 +213,31 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
       usesLegacyRuntime: candidate.runtimeScopeRootPath === configurationRootPath
     });
   });
+}
+
+/**
+ * First selection when no explicit choice exists (an upgrade from per-workspace versions). The
+ * fixed default root wins when it holds data; otherwise the historical workspace scope whose
+ * SQLite changed last, whose own interrupted work is then recovered as the current data set.
+ * Every other historical workspace scope is merged into it before the Runtime opens, so the
+ * choice only decides which in-place root receives the others. Unusable scopes stay reported.
+ */
+async function chooseInitialRuntimeDataSet(
+  candidates: readonly VscodeRuntimeDataSetCandidate[]
+): Promise<VscodeRuntimeDataSetCandidate | undefined> {
+  const fixed = candidates.find(candidate => candidate.id === 'default');
+  if (fixed || candidates.length <= 1) return fixed ?? candidates[0];
+  let latest: { candidate: VscodeRuntimeDataSetCandidate; changedAt: number } | undefined;
+  for (const candidate of [...candidates].sort((left, right) => left.id.localeCompare(right.id))) {
+    const database = createRuntimeRootPaths(candidate.runtimeDataRootPath).databasePath;
+    let changedAt = 0;
+    for (const file of [database, `${database}-wal`]) {
+      try { changedAt = Math.max(changedAt, (await fs.stat(file)).mtimeMs); }
+      catch (error) { if (!isMissingPathError(error)) throw error; }
+    }
+    if (!latest || changedAt > latest.changedAt) latest = { candidate, changedAt };
+  }
+  return latest?.candidate;
 }
 
 /** Explicit read-only enumeration for selection/history/storage tools; startup does not use it once selected. */

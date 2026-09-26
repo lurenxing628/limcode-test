@@ -162,7 +162,15 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   public static async open(
-    context: vscode.ExtensionContext
+    context: vscode.ExtensionContext,
+    options: {
+      /**
+       * Runs after the selected root is prepared and before this Host registers on it, while the
+       * configuration admission and selected-root maintenance are still held. Used for offline
+       * historical merges; the hook reports its own failures and must not block Runtime open.
+       */
+      beforeRuntimeOpen?(): Promise<void>;
+    } = {}
   ): Promise<VscodeReliableKernelApplicationFacade> {
     await loadCommittedGlobalStatus(context);
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
@@ -193,6 +201,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           );
         }
         await completeVscodeRuntimeDataSetSelection(getPaths());
+        await options.beforeRuntimeOpen?.();
         return VscodeReliableKernelProductRuntime.open(context, {
           authority, runtimePlacement,
           onConfigurationChanged: async () => {

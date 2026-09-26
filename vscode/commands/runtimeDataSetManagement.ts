@@ -8,12 +8,41 @@ import {
 } from '../../backend/reliableKernel/vscodeRootAuthority';
 import { openRuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeDataSetHistory';
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
+import { mergeRuntimeDataSetsIntoSelected, type RuntimeDataSetMergeBatchResult } from '../../backend/reliableKernel/runtimeDataSetMerge';
 import { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } from '../../backend/reliableKernel/runtimeStorageInspection';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 
 const pathsFor = (context: vscode.ExtensionContext) => createVscodeStoragePaths(resolveDataRootUri(context));
+const STARTUP_NOTICE_LEDGER_KEY = 'limcode.runtimeDataSetStartupNotices';
+
+/**
+ * Startup notices about old data sets appear once per distinct cause and configuration root, so a
+ * source that keeps failing does not interrupt every window start. Details stay in the log and in
+ * 历史与存储管理; a cause that goes away and later comes back is announced again.
+ */
+async function freshStartupNotices(
+  context: vscode.ExtensionContext,
+  configurationRootPath: string,
+  topic: 'upgrade' | 'merge',
+  causes: readonly string[]
+): Promise<boolean> {
+  const state = (context as Partial<vscode.ExtensionContext>).globalState;
+  if (!state) return causes.length > 0;
+  type Ledger = Record<string, Partial<Record<'upgrade' | 'merge', string[]>>>;
+  const ledger = state.get<Ledger>(STARTUP_NOTICE_LEDGER_KEY) ?? {};
+  const seen = new Set(ledger[configurationRootPath]?.[topic] ?? []);
+  const fresh = causes.some(cause => !seen.has(cause));
+  const next: Ledger = { ...ledger, [configurationRootPath]: { ...ledger[configurationRootPath], [topic]: [...new Set(causes)] } };
+  await Promise.resolve(state.update(STARTUP_NOTICE_LEDGER_KEY, next))
+    .catch(error => console.warn('[LimCode] 无法记录已显示的旧聊天记录提示。', error));
+  return fresh;
+}
+
+function noticeCause(issue: { candidateId?: string; code?: string; message: string }): string {
+  return `${issue.candidateId ?? ''}\u0000${issue.code ?? issue.message}`;
+}
 
 /** Startup has released admission before awaiting this native picker. It also works without a Webview. */
 export async function openWithRuntimeDataSetSelection<T>(context: vscode.ExtensionContext, open: () => Promise<T>): Promise<T> {
@@ -174,6 +203,90 @@ async function upgradeHistoryBeforeRead(
   return upgraded;
 }
 
+/**
+ * Runs inside Runtime open, after the selected root is prepared and before this Host registers,
+ * so the selected data set can be changed offline. Historical workspace scopes (and explicitly
+ * requested data sets) are merged into it without confirmation. It never throws and never waits
+ * for user input: notifications are fire-and-forget because admission is still held.
+ */
+export async function mergeHistoricalDataSetsBeforeOpen(
+  context: vscode.ExtensionContext,
+  shouldContinue: () => boolean = () => true
+): Promise<void> {
+  if (!shouldContinue() || !canStartRuntimeDataSetUpgrade(context)) return;
+  const paths = pathsFor(context);
+  const stillCurrent = () => canStartRuntimeDataSetUpgrade(context)
+    && shouldContinue() && pathsFor(context).globalStoragePath === paths.globalStoragePath;
+  let finishProgress: (() => void) | undefined;
+  let progress: vscode.Progress<{ message?: string }> | undefined;
+  let report: RuntimeDataSetMergeBatchResult;
+  try {
+    report = await runRuntimeDataSetUpgrade(context, () => mergeRuntimeDataSetsIntoSelected(paths, {
+      shouldContinue: stillCurrent,
+      onWorkStart: () => {
+        const done = new Promise<void>(resolve => { finishProgress = resolve; });
+        void vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在合并旧聊天记录' },
+          reporter => { progress = reporter; return done; });
+      },
+      onSourceStart: (_candidate, index, total) => progress?.report({ message: `${index + 1}/${total}` })
+    }));
+  } catch (error) {
+    console.error('[LimCode] 旧聊天记录合并检查失败。', error);
+    const announce = await freshStartupNotices(context, paths.globalStoragePath, 'merge', [noticeCause({ message: describeError(error) })]);
+    if (announce && stillCurrent()) void vscode.window.showWarningMessage(`旧聊天记录暂时无法合并：${describeError(error)}。原数据未被修改。`);
+    return;
+  } finally {
+    finishProgress?.();
+  }
+  await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent);
+}
+
+async function reportHistoricalMerge(
+  context: vscode.ExtensionContext,
+  configurationRootPath: string,
+  report: RuntimeDataSetMergeBatchResult,
+  stillCurrent: () => boolean
+): Promise<void> {
+  for (const merged of report.merged) {
+    console.info(`[LimCode] 已合并旧聊天记录 ${merged.candidateId}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath}`);
+  }
+  if (report.deferred.length) console.info('[LimCode] 部分旧聊天记录仍被旧版本窗口使用，稍后再合并。', report.deferred);
+  if (!stillCurrent()) return;
+  if (report.merged.length) {
+    const conversations = report.merged.reduce((sum, merged) => sum + merged.insertedConversations, 0);
+    void vscode.window.showInformationMessage(
+      `已把 ${report.merged.length} 份旧聊天记录合并到当前历史库（新增 ${conversations} 个对话），可直接在侧栏继续。原库和合并前备份都已保留。`
+    );
+  }
+  const waiting = report.targetHostsActive.length > 0 && report.pendingSources > 0;
+  const problems = [
+    ...report.blocked.filter(item => item.newlyBlocked),
+    ...report.failures
+  ];
+  // Blocked sources are deduplicated on disk by source fingerprint; the rest once per cause here.
+  const announce = await freshStartupNotices(context, configurationRootPath, 'merge', [
+    ...(waiting ? ['waiting-for-other-windows'] : []),
+    ...report.failures.map(noticeCause)
+  ]);
+  if (!stillCurrent()) return;
+  if (waiting && announce) {
+    void vscode.window.showInformationMessage(
+      `有 ${report.pendingSources} 份旧聊天记录等待合并。其它窗口仍在使用当前库，`
+      + '下次只有本窗口使用时会自动完成；也可以关闭其它窗口后重载本窗口。'
+    );
+  }
+  if (!problems.length) return;
+  console.warn('[LimCode] 部分旧聊天记录未能合并。', problems);
+  if (!announce && !report.blocked.some(item => item.newlyBlocked)) return;
+  void vscode.window.showWarningMessage('部分旧聊天记录未能合并到当前库，原数据未被修改。', '查看原因')
+    .then(async choice => {
+      if (choice !== '查看原因' || !stillCurrent()) return;
+      await showReadOnly(context, '旧聊天记录合并结果', problems.map(problem =>
+        `${problem.candidateId ?? '历史库列表'}\n[${problem.code}] ${problem.message}`
+      ).join('\n\n'));
+    }).then(undefined, error => console.warn('[LimCode] 无法显示旧聊天记录合并详情。', error));
+}
+
 /** Runs after current Runtime startup. Historical upgrades never register or recover old tasks. */
 export async function upgradeHistoricalDataSetsOnStartup(
   context: vscode.ExtensionContext,
@@ -189,9 +302,10 @@ export async function upgradeHistoricalDataSetsOnStartup(
     for (const result of report.results) {
       if (result.backupPath) console.info(`[LimCode] 旧聊天记录已自动升级；升级前备份：${result.backupPath}`);
     }
+    const announce = await freshStartupNotices(context, paths.globalStoragePath, 'upgrade', report.failures.map(noticeCause));
     if (!report.failures.length) return;
     console.warn('[LimCode] 部分旧聊天记录未能自动升级。', report.failures);
-    if (!stillCurrent()) return;
+    if (!announce || !stillCurrent()) return;
     // The upgrade itself requires no response. Details are offered only for sources that need
     // attention, and dismissing this notification cannot block current Runtime startup.
     void vscode.window.showWarningMessage('部分旧聊天记录暂时无法自动升级，原数据未被重置，已生成的备份会保留。', '查看原因')
@@ -203,7 +317,8 @@ export async function upgradeHistoricalDataSetsOnStartup(
       }).then(undefined, error => console.warn('[LimCode] 无法显示旧聊天记录升级详情。', error));
   } catch (error) {
     console.error('[LimCode] 无法自动检查旧聊天记录。', error);
-    if (stillCurrent()) void vscode.window.showErrorMessage(`无法自动检查旧聊天记录：${describeError(error)}。原数据未被重置。`);
+    const announce = await freshStartupNotices(context, paths.globalStoragePath, 'upgrade', [noticeCause({ message: describeError(error) })]);
+    if (announce && stillCurrent()) void vscode.window.showErrorMessage(`无法自动检查旧聊天记录：${describeError(error)}。原数据未被重置。`);
   }
 }
 
