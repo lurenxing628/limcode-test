@@ -1368,6 +1368,7 @@ function executeSteps(
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(step.name)) throw new Error(`Invalid savepoint name: ${step.name}`);
     const marker = quote(step.name);
     const sequenceCount = allocatedSequences.length;
+    const historicalCount = historicalCopiesOf(allocatedSequences).order.length;
     database.exec(`SAVEPOINT ${marker}`);
     try {
       executeSteps(database, step.steps, allocatedSequences);
@@ -1376,9 +1377,36 @@ function executeSteps(
       database.exec(`ROLLBACK TO SAVEPOINT ${marker}`);
       database.exec(`RELEASE SAVEPOINT ${marker}`);
       allocatedSequences.length = sequenceCount;
+      historicalCopiesOf(allocatedSequences).truncate(historicalCount);
       if (!matchesSavepointContinuation(error, step.onError)) throw error;
     }
   }
+}
+
+/**
+ * ModelRequests inserted as historical copies by the running transaction, keyed by that
+ * transaction's own allocated-sequence list (one per transaction, rolled back with its savepoints).
+ */
+const HISTORICAL_COPIES = new WeakMap<RuntimeAllocatedSequence[], HistoricalCopies>();
+
+class HistoricalCopies {
+  public readonly requests = new Set<string>();
+  public readonly order: string[] = [];
+
+  public add(id: string): void {
+    this.requests.add(id);
+    this.order.push(id);
+  }
+
+  public truncate(length: number): void {
+    while (this.order.length > length) this.requests.delete(this.order.pop()!);
+  }
+}
+
+function historicalCopiesOf(transaction: RuntimeAllocatedSequence[]): HistoricalCopies {
+  let copies = HISTORICAL_COPIES.get(transaction);
+  if (!copies) HISTORICAL_COPIES.set(transaction, copies = new HistoricalCopies());
+  return copies;
 }
 
 function executeAssertion(
@@ -1526,8 +1554,14 @@ function executeMutation(
     if ((schema.key === 'ModelStreamCheckpoint' || schema.key === 'ModelStreamFence') && !historicalCopy) {
       throw new Error(`${schema.key} insert is limited to the fixed writer modelStreamEvent operation.`);
     }
+    if (schema.key === 'ModelStreamCheckpoint' || schema.key === 'ModelStreamFence') {
+      // Stream facts are copied only together with their terminal request, as one historical copy
+      // (a Conversation fork, a historical data-set merge): never appended to an existing request.
+      if (!historicalCopiesOf(allocatedSequences).requests.has(String(mutation.row.model_request_id))) {
+        throw new Error(`Historical ${schema.key} copy requires its ModelRequest to be copied in the same transaction.`);
+      }
+    }
     if (schema.key === 'ModelStreamCheckpoint') {
-      // Historical merge copies the retained stream facts of an already terminal request only.
       const request = database.prepare('SELECT status FROM model_request WHERE id = ?').get(mutation.row.model_request_id) as {
         status?: unknown;
       } | undefined;
@@ -1551,8 +1585,8 @@ function executeMutation(
     }
     if (schema.key === 'Operation' && row.owner_kind === 'model_request') {
       if (historicalCopy) {
-        if (row.status === 'pending') {
-          throw new Error('Fork copy ModelRequest Operation must not be pending.');
+        if (!['completed', 'cancelled', 'failed'].includes(String(row.status))) {
+          throw new Error('Historical ModelRequest Operation copy must be terminal.');
         }
       } else if (row.status !== 'pending') {
         throw new Error('ModelRequest Operation must start pending.');
@@ -1564,7 +1598,9 @@ function executeMutation(
       } | undefined;
       if (operation?.owner_kind === 'model_request') {
         if (historicalCopy) {
-          if (row.status === 'pending') throw new Error('Fork copy ModelRequest Attempt must not be pending.');
+          if (!['transient_failed', 'completed', 'cancelled', 'failed'].includes(String(row.status))) {
+            throw new Error('Historical ModelRequest Attempt copy must be terminal.');
+          }
         } else if (row.status !== 'pending') {
           throw new Error('ModelRequest Attempt must start pending.');
         }
@@ -1589,6 +1625,7 @@ function executeMutation(
     const names = Object.keys(encoded);
     const sql = `INSERT INTO ${quote(schema.table)} (${names.map(quote).join(', ')}) VALUES (${names.map((name) => `@${name}`).join(', ')})`;
     database.prepare(sql).run(encoded);
+    if (schema.key === 'ModelRequest' && historicalCopy) historicalCopiesOf(allocatedSequences).add(id);
   } else if (mutation.kind === 'update') {
     const id = requireRuntimeId(mutation.id);
     assertRuntimeDomainUpdatePatch(schema.key, mutation.patch);
