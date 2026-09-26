@@ -11,7 +11,12 @@ const DEFAULT_DEBOUNCE_MS = 250;
 const EDIT_RESTORE_TIMEOUT_MS = 30_000;
 
 type EditSnapshot =
-  | { kind: 'message'; conversationId: string; messageId: string; deleteCount: number; draft: string; attachments: InlineDataPart[] }
+  | {
+    kind: 'message'; conversationId: string; messageId: string;
+    /** The revision the edit started from; a message changed meanwhile is not edited again. */
+    revisionId?: string;
+    deleteCount: number; draft: string; attachments: InlineDataPart[];
+  }
   | { kind: 'turnIntent'; conversationId: string; intentId: string; rowVersion: number; draft: string; attachments: InlineDataPart[] };
 
 export interface PersistedComposerDraft {
@@ -48,17 +53,22 @@ export interface ComposerDraftPersistenceOptions {
   conversationId(): string | undefined;
   findMessage(messageId: string): MessageRecord | undefined;
   storage: ComposerDraftStorage;
+  /** Texts of Turn inputs still being sent (they are sent again after a reload): not restored as a draft. */
+  pendingInputTexts?(): readonly string[];
   debounceMs?: number;
   attachmentLimitBytes?: number;
   onAttachmentsOmitted?(count: number): void;
+  /** The edited message changed after the edit started (another window): the edit was not restored. */
+  onEditDiscarded?(): void;
 }
 
 /**
  * Keeps the unsent composer (chat draft, its attachments and an open edit) in the Webview's own
  * persisted state, so a window reload (for example when another window needs the data directory
  * for a moment) does not lose what the user typed. The chat draft comes back when the composer is
- * created, unless something is already there; an open edit comes back once its conversation is
- * shown (and its message loaded) and is given up when another conversation is shown first.
+ * created, unless something is already there or it is a Turn input still being sent; an open edit
+ * comes back once its conversation is shown and its message loaded, and is given up when another
+ * conversation is shown first or the message changed meanwhile. Clearing is written at once.
  */
 export function useComposerDraftPersistence(options: ComposerDraftPersistenceOptions): { flush(): void; dispose(): void } {
   const { ui, attachments, storage } = options;
@@ -71,8 +81,14 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
   let waitingForMessage = false;
   const giveUpTimer = pendingEdit ? setTimeout(settlePendingEdit, EDIT_RESTORE_TIMEOUT_MS) : undefined;
 
+  // What the last write contained: clearing it (a send, a closed edit) is written at once.
+  let written = { chat: saved !== undefined && hasChatContent(saved.chat), edit: false };
+  let inFlight = false;
+
   if (saved) {
-    if (ui.composerMode === 'chat' && !ui.chatDraft.trim() && attachments.value.chat.length === 0) {
+    inFlight = saved.chat.draft.trim() !== ''
+      && (options.pendingInputTexts?.() ?? []).some((text) => text.trim() === saved.chat.draft.trim());
+    if (!inFlight && ui.composerMode === 'chat' && !ui.chatDraft.trim() && attachments.value.chat.length === 0) {
       if (saved.chat.draft) ui.replaceChatDraft(saved.chat.draft);
       if (saved.chat.attachments.length) attachments.value = { ...attachments.value, chat: clone(saved.chat.attachments) };
     }
@@ -99,6 +115,11 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
       if (!message || pendingEdit !== edit) return;
       settlePendingEdit();
       if (ui.composerMode === 'edit' || options.conversationId() !== edit.conversationId) return;
+      if (message.revisionId !== edit.revisionId) {
+        // Editing the new revision with the old text would silently overwrite that change.
+        options.onEditDiscarded?.();
+        return;
+      }
       ui.startEditMessage(message, edit.deleteCount);
       // The composer resets edit attachments from the message on its next flush; apply afterwards.
       void nextTick(() => nextTick(() => applyEdit(edit)));
@@ -118,6 +139,8 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
     ui.editingTurnIntent?.rowVersion,
     attachments.value
   ], schedule, { deep: true });
+  // Already sent before the reload (it is sent again): drop it from the saved draft right away.
+  if (inFlight) flush();
 
   function applyEdit(edit: EditSnapshot): void {
     const same = edit.kind === 'message'
@@ -138,6 +161,13 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
   }
 
   function schedule(): void {
+    const chatCleared = written.chat && !ui.chatDraft && attachments.value.chat.length === 0;
+    const editClosed = written.edit && ui.composerMode !== 'edit';
+    // A reload right after a send (or a closed edit) must not bring the old text back.
+    if (chatCleared || editClosed) {
+      flush();
+      return;
+    }
     if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(flush, options.debounceMs ?? DEFAULT_DEBOUNCE_MS);
   }
@@ -145,7 +175,9 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
   function flush(): void {
     if (timer !== undefined) clearTimeout(timer);
     timer = undefined;
-    storage.write(snapshot());
+    const next = snapshot();
+    storage.write(next);
+    written = { chat: next !== undefined && hasChatContent(next.chat), edit: ui.composerMode === 'edit' && next?.edit !== undefined };
   }
 
   function snapshot(): PersistedComposerDraft | undefined {
@@ -164,9 +196,10 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
     const conversationId = options.conversationId();
     let edit: EditSnapshot | undefined;
     if (ui.composerMode === 'edit' && conversationId && ui.editingMessage) {
+      const { id: messageId, revisionId } = ui.editingMessage.message;
       edit = {
-        kind: 'message', conversationId, messageId: ui.editingMessage.message.id, deleteCount: ui.editingMessage.deleteCount,
-        draft: ui.composerDraft, attachments: keep(attachments.value.edit)
+        kind: 'message', conversationId, messageId, ...(revisionId !== undefined ? { revisionId } : {}),
+        deleteCount: ui.editingMessage.deleteCount, draft: ui.composerDraft, attachments: keep(attachments.value.edit)
       };
     } else if (ui.composerMode === 'edit' && conversationId && ui.editingTurnIntent) {
       edit = {
@@ -205,11 +238,16 @@ function parsePersisted(value: unknown): PersistedComposerDraft | undefined {
   const validEdit = edit === undefined || (
     typeof edit === 'object' && typeof edit.conversationId === 'string' && typeof edit.draft === 'string'
     && Array.isArray(edit.attachments) && edit.attachments.every(isInlineDataPart)
-    && ((edit.kind === 'message' && typeof edit.messageId === 'string' && Number.isSafeInteger(edit.deleteCount))
+    && ((edit.kind === 'message' && typeof edit.messageId === 'string' && Number.isSafeInteger(edit.deleteCount)
+      && (edit.revisionId === undefined || typeof edit.revisionId === 'string'))
       || (edit.kind === 'turnIntent' && typeof edit.intentId === 'string' && Number.isSafeInteger(edit.rowVersion)))
   );
   if (!validEdit) return undefined;
   return record as PersistedComposerDraft;
+}
+
+function hasChatContent(chat: PersistedComposerDraft['chat']): boolean {
+  return chat.draft !== '' || chat.attachments.length > 0;
 }
 
 function isInlineDataPart(part: unknown): part is InlineDataPart {

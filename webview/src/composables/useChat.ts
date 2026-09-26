@@ -1182,6 +1182,10 @@ export function useChat() {
   const reliableRecords = computed(() =>
     reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
   );
+  /** Texts of every Turn input not yet withdrawn: a reload sends them again, so no draft repeats them. */
+  const inFlightTurnInputTexts = computed(() => Object.values(pendingTurnInputSubmissions.value)
+    .filter((submission) => !submission.withdrawnAt)
+    .map((submission) => submission.text));
   const currentPendingTurnInputs = computed(() => Object.values(pendingTurnInputSubmissions.value)
     .filter((submission) =>
       submission.conversationId === reliableConversation.conversationId.value
@@ -2036,6 +2040,7 @@ export function useChat() {
     openForkReadyNotice,
     dismissForkReadyNotice,
     currentPendingTurnInputs,
+    inFlightTurnInputTexts,
     currentTurnInputAcknowledgements,
     currentTurnInputFailure,
     dismissTurnInputAcknowledgement,

@@ -87,7 +87,8 @@ const {
   steerCurrentTurn,
   currentSteeringSubmitting,
   steeringSubmissionResultsById,
-  dismissSteeringSubmissionResult
+  dismissSteeringSubmissionResult,
+  inFlightTurnInputTexts
 } = useChat();
 const highlighted = ref(false);
 const editorExpanded = ref(false);
@@ -345,8 +346,12 @@ const draftPersistence = useComposerDraftPersistence({
     read: () => bridge.readPersistedState(PERSISTED_COMPOSER_DRAFT_KEY),
     write: (value) => bridge.writePersistedState(PERSISTED_COMPOSER_DRAFT_KEY, value)
   },
+  pendingInputTexts: () => inFlightTurnInputTexts.value,
   onAttachmentsOmitted: (count) => {
     globalSettings.status = `重载前有 ${count} 个未发送的附件太大，没能保留，请重新添加。`;
+  },
+  onEditDiscarded: () => {
+    globalSettings.status = '重载前正在编辑的消息已在别处修改，这次编辑没有恢复，请重新编辑。';
   }
 });
 const attachmentRefreshKey = computed(() => selectedAttachments.value.map((part, index) => index + ':' + (part.inlineData.name ?? '') + ':' + (part.inlineData.sizeBytes ?? 0)).join('|'));
