@@ -2802,10 +2802,16 @@ function commitMeasuredWrite(database: Database.Database): void {
   }
 }
 
+/** Metrics are observational: malformed request input must never make them throw. */
 function measuredWriteLock(request: DatabaseWorkerRequest, nowMs: number): DatabaseWorkerWriteLockTiming | undefined {
   const lock = requestWriteLock;
   if (!lock) return undefined;
-  const domain = request.kind === 'transaction' ? firstMutatedDomain(request.steps) : undefined;
+  let domain: string | undefined;
+  try {
+    domain = request.kind === 'transaction' ? firstMutatedDomain(request.steps, 0) : undefined;
+  } catch {
+    domain = undefined;
+  }
   return {
     waitMs: Math.max(0, (lock.acquiredAtMs ?? nowMs) - lock.startedAtMs),
     holdMs: lock.acquiredAtMs === undefined ? 0 : Math.max(0, (lock.releasedAtMs ?? nowMs) - lock.acquiredAtMs),
@@ -2814,15 +2820,19 @@ function measuredWriteLock(request: DatabaseWorkerRequest, nowMs: number): Datab
   };
 }
 
-function firstMutatedDomain(steps: readonly RepositoryTransactionStep[]): string | undefined {
-  for (const step of Array.isArray(steps) ? steps : []) {
-    if (step.kind === 'savepoint') {
-      const nested = firstMutatedDomain(step.steps);
+function firstMutatedDomain(steps: unknown, depth: number): string | undefined {
+  if (!Array.isArray(steps) || depth > 8) return undefined;
+  for (const step of steps as unknown[]) {
+    if (!step || typeof step !== 'object') continue;
+    const { kind, domain } = step as { kind?: unknown; domain?: unknown };
+    if (typeof kind !== 'string') continue;
+    if (kind === 'savepoint') {
+      const nested = firstMutatedDomain((step as { steps?: unknown }).steps, depth + 1);
       if (nested) return nested;
       continue;
     }
-    if (step.kind.startsWith('assert')) continue;
-    if (typeof step.domain === 'string' && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(step.domain)) return step.domain;
+    if (kind.startsWith('assert')) continue;
+    if (typeof domain === 'string' && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(domain)) return domain;
   }
   return undefined;
 }

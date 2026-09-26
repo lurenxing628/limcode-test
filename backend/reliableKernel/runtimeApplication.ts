@@ -164,7 +164,11 @@ export class ReliableKernelApplication {
     if (supportsDiagnosticRollup(dependencies.diagnosticObserver)) {
       // Persist windowed database/Feed/CAS timings into the bounded journal; attach before any
       // service below issues its first request. WAL sampling starts once composition succeeded.
-      this.runtimeDiagnostics = new RuntimeDiagnosticMetrics(dependencies.diagnosticObserver, database.binding);
+      this.runtimeDiagnostics = new RuntimeDiagnosticMetrics(
+        dependencies.diagnosticObserver,
+        database.binding,
+        database.hostBootId
+      );
       database.attachPerformanceMetrics(this.runtimeDiagnostics);
     }
 

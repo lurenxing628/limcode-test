@@ -115,12 +115,6 @@ export type RuntimePerformanceMetricEvent =
       durationMs: number;
     }
   | {
-      kind: 'terminal_prefix.scan';
-      callCount: number;
-      contextTransactionCount: number;
-      durationMs: number;
-    }
-  | {
       kind: 'client_feed.sync_listener';
       listenerKind: 'database_commit' | 'feed_projection' | 'sidebar_projection';
       listenerCount: number;

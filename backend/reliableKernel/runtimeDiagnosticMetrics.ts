@@ -1,5 +1,4 @@
 import * as fs from 'node:fs/promises';
-import { endianness } from 'node:os';
 import type { RootBinding } from './contracts';
 import type { ReliableDiagnosticRollupObserver } from './diagnosticJournal';
 import type {
@@ -12,25 +11,31 @@ export const SLOW_WRITE_LOCK_MS = 250;
 /** Individually persisted anomalies of one kind per window; the rollup still counts every sample. */
 const ANOMALY_EVENTS_PER_WINDOW = 20;
 const ANOMALY_WINDOW_MS = 5 * 60 * 1_000;
+/** An anomaly persists the open rollup window at most this often, so a storm cannot flood the journal. */
+const ANOMALY_ROLLUP_FLUSH_INTERVAL_MS = 60 * 1_000;
 const WAL_SAMPLE_INTERVAL_MS = 60 * 1_000;
 const WAL_REPORT_INTERVAL_MS = 5 * 60 * 1_000;
-/** Twice SQLite's default wal_autocheckpoint: frames still waiting mean checkpoints are starved. */
-const WAL_PENDING_ALERT_FRAMES = 2_000;
-/** WAL-index header: two 48-byte WalIndexHdr copies followed by WalCkptInfo.nBackfill. */
-const WAL_INDEX_HEADER_BYTES = 100;
+/**
+ * The WAL file is never truncated here (no journal_size_limit), so its size is a high-water mark:
+ * it only grows past about 4 MiB (the default 1000-page auto-checkpoint) when checkpoints cannot
+ * restart the log, typically because a long-lived reader pins it.
+ */
+export const WAL_GROWTH_ALERT_BYTES = 16 * 1_048_576;
 
 export interface RuntimeWalSample {
   walBytes: number;
-  walFrames?: number;
-  checkpointedFrames?: number;
-  pendingFrames?: number;
 }
 
 /**
  * Production sink for RuntimePerformanceMetricEvent. It converts hot-path timings into bounded
  * diagnostic rollups (windowed histograms and totals) and a few rate-limited anomaly events:
- * SQLITE_BUSY / locked failures and slow writer-lock waits or holds. It also samples the WAL
- * size and checkpoint backlog from the file system, outside every SQLite lock.
+ * SQLITE_BUSY / locked failures and slow writer-lock waits or holds. Every rollup and anomaly carries
+ * the Host boot id, because several Hosts append to one data root's journal.
+ *
+ * WAL sampling only stat()s the -wal file. It must never open, read or close limcode.sqlite, its
+ * -wal or its -shm in this process: SQLite's unix VFS holds POSIX fcntl locks on them (writer lock,
+ * reader marks, DMS), and closing ANY descriptor of such a file drops every lock the process holds
+ * on it, letting another Host overwrite a transaction in flight.
  *
  * Recording runs synchronously on the caller's thread and only updates in-memory counters; the
  * journal persists asynchronously. It never changes Runtime behavior.
@@ -40,11 +45,14 @@ export class RuntimeDiagnosticMetrics implements RuntimePerformanceMetricsSink {
   private walTimer: NodeJS.Timeout | undefined;
   private walSample: Promise<void> | undefined;
   private lastWalReportAtMs: number | undefined;
+  private lastWalBytes: number | undefined;
+  private lastAnomalyRollupFlushAtMs: number | undefined;
   private closed = false;
 
   public constructor(
     private readonly diagnostics: ReliableDiagnosticRollupObserver,
-    private readonly binding: RootBinding,
+    private readonly binding: Pick<RootBinding, 'paths'>,
+    private readonly hostBootId: string,
     private readonly now: () => number = () => Date.now()
   ) {}
 
@@ -104,9 +112,6 @@ export class RuntimeDiagnosticMetrics implements RuntimePerformanceMetricsSink {
       case 'context.materialize':
         this.aggregate('context.materialize', { mode: event.mode }, event.durationMs, { segmentCount: event.segmentCount });
         return;
-      case 'terminal_prefix.scan':
-        this.aggregate('terminal_prefix.scan', {}, event.durationMs);
-        return;
       case 'process.phase':
         this.aggregate('process.phase', { stage: event.phase }, event.durationMs,
           event.byteCount !== undefined ? { bytes: event.byteCount } : {});
@@ -117,32 +122,25 @@ export class RuntimeDiagnosticMetrics implements RuntimePerformanceMetricsSink {
     }
   }
 
-  /** Reads the WAL size and the WAL-index checkpoint counters without taking any SQLite lock. */
+  /** stat() only: reports the WAL high-water size and alerts while it keeps growing past the bound. */
   public async sampleWal(): Promise<RuntimeWalSample | undefined> {
     if (this.closed) return undefined;
-    const databasePath = this.binding.paths.databasePath;
-    const walBytes = await fileSize(`${databasePath}-wal`);
-    const index = await readWalIndex(`${databasePath}-shm`);
-    const sample: RuntimeWalSample = {
-      walBytes,
-      ...(index ? {
-        walFrames: index.maxFrame,
-        checkpointedFrames: index.backfilledFrames,
-        pendingFrames: Math.max(0, index.maxFrame - index.backfilledFrames)
-      } : {})
-    };
+    const walBytes = await fileSize(`${this.binding.paths.databasePath}-wal`);
+    const previousBytes = this.lastWalBytes;
+    this.lastWalBytes = walBytes;
     const nowMs = this.now();
     const due = this.lastWalReportAtMs === undefined || nowMs - this.lastWalReportAtMs >= WAL_REPORT_INTERVAL_MS;
-    const starved = (sample.pendingFrames ?? 0) >= WAL_PENDING_ALERT_FRAMES;
-    if (due || starved) {
+    const growing = walBytes >= WAL_GROWTH_ALERT_BYTES && previousBytes !== undefined && walBytes > previousBytes;
+    if (due || growing) {
       this.lastWalReportAtMs = nowMs;
       this.diagnostics.observe({
-        eventKind: starved ? 'database.wal.checkpoint_lagging' : 'database.wal',
+        eventKind: growing ? 'database.wal.growing' : 'database.wal',
         scopeKind: 'runtime',
-        metadata: { ...sample }
+        metadata: { hostBootId: this.hostBootId, walBytes }
       });
+      if (growing) this.flushRollupsForAnomaly();
     }
-    return sample;
+    return { walBytes };
   }
 
   private recordDatabaseRequest(event: Extract<RuntimePerformanceMetricEvent, { kind: 'database.request'; phase: 'finished' }>): void {
@@ -175,6 +173,7 @@ export class RuntimeDiagnosticMetrics implements RuntimePerformanceMetricsSink {
           eventKind: 'database.busy',
           scopeKind: 'runtime',
           metadata: {
+            hostBootId: this.hostBootId,
             ...location,
             reasonCode,
             ...(waitMs !== undefined ? { lockWaitMs: roundMs(waitMs) } : {}),
@@ -182,23 +181,25 @@ export class RuntimeDiagnosticMetrics implements RuntimePerformanceMetricsSink {
           }
         });
       }
+      this.flushRollupsForAnomaly();
       return;
     }
-    if (
-      ((waitMs ?? 0) >= SLOW_WRITE_LOCK_MS || (holdMs ?? 0) >= SLOW_WRITE_LOCK_MS)
-      && this.takeAnomalyBudget('database.write_lock.slow')
-    ) {
-      this.diagnostics.observe({
-        eventKind: 'database.write_lock.slow',
-        scopeKind: 'runtime',
-        metadata: {
-          ...location,
-          status: event.outcome,
-          ...(waitMs !== undefined ? { lockWaitMs: roundMs(waitMs) } : {}),
-          ...(holdMs !== undefined ? { holdMs: roundMs(holdMs) } : {}),
-          ...(event.workerQueueWaitMs !== undefined ? { queueWaitMs: roundMs(event.workerQueueWaitMs) } : {})
-        }
-      });
+    if ((waitMs ?? 0) >= SLOW_WRITE_LOCK_MS || (holdMs ?? 0) >= SLOW_WRITE_LOCK_MS) {
+      if (this.takeAnomalyBudget('database.write_lock.slow')) {
+        this.diagnostics.observe({
+          eventKind: 'database.write_lock.slow',
+          scopeKind: 'runtime',
+          metadata: {
+            hostBootId: this.hostBootId,
+            ...location,
+            status: event.outcome,
+            ...(waitMs !== undefined ? { lockWaitMs: roundMs(waitMs) } : {}),
+            ...(holdMs !== undefined ? { holdMs: roundMs(holdMs) } : {}),
+            ...(event.workerQueueWaitMs !== undefined ? { queueWaitMs: roundMs(event.workerQueueWaitMs) } : {})
+          }
+        });
+      }
+      this.flushRollupsForAnomaly();
     }
   }
 
@@ -211,10 +212,24 @@ export class RuntimeDiagnosticMetrics implements RuntimePerformanceMetricsSink {
     this.diagnostics.aggregate({
       eventKind,
       scopeKind: 'runtime',
-      dimensions,
+      dimensions: { hostBootId: this.hostBootId, ...dimensions },
       ...(durationMs !== undefined && Number.isFinite(durationMs) ? { durationMs: Math.max(0, durationMs) } : {}),
       counters
     });
+  }
+
+  /**
+   * A rollup window lives in memory for up to five minutes. When an anomaly happens, persist the
+   * surrounding window right away (at most once a minute) so a crash soon after cannot lose it.
+   */
+  private flushRollupsForAnomaly(): void {
+    const nowMs = this.now();
+    if (
+      this.lastAnomalyRollupFlushAtMs !== undefined
+      && nowMs - this.lastAnomalyRollupFlushAtMs < ANOMALY_ROLLUP_FLUSH_INTERVAL_MS
+    ) return;
+    this.lastAnomalyRollupFlushAtMs = nowMs;
+    this.diagnostics.emitAggregates();
   }
 
   private takeAnomalyBudget(kind: string): boolean {
@@ -230,33 +245,7 @@ export class RuntimeDiagnosticMetrics implements RuntimePerformanceMetricsSink {
   }
 }
 
-/**
- * Parses the documented WAL-index header (https://sqlite.org/walformat.html): mxFrame is the last
- * valid WAL frame and nBackfill the frames already copied into the database. The two header copies
- * must agree, otherwise a concurrent writer was updating it and this sample is skipped.
- */
-async function readWalIndex(shmPath: string): Promise<{ maxFrame: number; backfilledFrames: number } | undefined> {
-  let handle: fs.FileHandle | undefined;
-  try {
-    handle = await fs.open(shmPath, 'r');
-    const buffer = Buffer.alloc(WAL_INDEX_HEADER_BYTES);
-    const { bytesRead } = await handle.read(buffer, 0, WAL_INDEX_HEADER_BYTES, 0);
-    if (bytesRead < WAL_INDEX_HEADER_BYTES) return undefined;
-    if (!buffer.subarray(0, 48).equals(buffer.subarray(48, 96)) || buffer[12] !== 1) return undefined;
-    const readUInt32 = endianness() === 'LE'
-      ? (offset: number) => buffer.readUInt32LE(offset)
-      : (offset: number) => buffer.readUInt32BE(offset);
-    const maxFrame = readUInt32(16);
-    const backfilledFrames = readUInt32(96);
-    if (backfilledFrames > maxFrame) return { maxFrame, backfilledFrames: maxFrame };
-    return { maxFrame, backfilledFrames };
-  } catch {
-    return undefined;
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
-}
-
+/** stat() never opens a descriptor, so it cannot drop SQLite's POSIX locks on the file. */
 async function fileSize(file: string): Promise<number> {
   try {
     return (await fs.stat(file)).size;

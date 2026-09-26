@@ -101,6 +101,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/compression-reduction-gate.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/runtime-diagnostic-metrics.test.mjs',
+  'tests/reliable-kernel/runtime-diagnostic-sqlite-locks.test.mjs',
   'tests/reliable-kernel/debug-capture-controller.test.mjs',
   'tests/reliable-kernel/debug-capture-provenance.test.mjs',
   'tests/reliable-kernel/debug-capture-files.test.mjs',

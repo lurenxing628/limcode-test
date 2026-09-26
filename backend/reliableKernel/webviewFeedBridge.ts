@@ -836,7 +836,7 @@ export class ReliableKernelWebviewFeedBridge {
         eventKind: 'feed.transient.flushed',
         scopeKind: 'feed_session',
         scopeId: connection.sessionId,
-        dimensions: { conversationId },
+        dimensions: { hostBootId: connection.hostBootId, conversationId },
         counters: {
           rawEventCount,
           emittedEventCount: payloads.length,
@@ -1023,6 +1023,7 @@ export class ReliableKernelWebviewFeedBridge {
       scopeKind: 'feed_session',
       scopeId: ack.sessionId,
       dimensions: {
+        hostBootId: ack.hostBootId,
         ...(client.meta.conversationId ? { conversationId: client.meta.conversationId } : {}),
         deliveryKind: delivery.kind
       },

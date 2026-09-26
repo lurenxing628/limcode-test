@@ -51,15 +51,17 @@ export interface ReliableDiagnosticSampleInput {
 export interface ReliableDiagnosticObserver {
   observe(event: ReliableDiagnosticEventInput): void;
   aggregate?(sample: ReliableDiagnosticSampleInput): void;
+  /** Persists the open rollup window now instead of at its scheduled end. */
+  emitAggregates?(): void;
 }
 
 export type ReliableDiagnosticRollupObserver = ReliableDiagnosticObserver
-  & Required<Pick<ReliableDiagnosticObserver, 'aggregate'>>;
+  & Required<Pick<ReliableDiagnosticObserver, 'aggregate' | 'emitAggregates'>>;
 
 export function supportsDiagnosticRollup(
   observer: ReliableDiagnosticObserver | undefined
 ): observer is ReliableDiagnosticRollupObserver {
-  return typeof observer?.aggregate === 'function';
+  return typeof observer?.aggregate === 'function' && typeof observer.emitAggregates === 'function';
 }
 
 export interface ReliableDiagnosticSpanRecord {
@@ -194,10 +196,7 @@ const ALLOWED_METADATA_KEYS = new Set([
   'transactionCount',
   'checkpointed',
   'segmentCount',
-  'walBytes',
-  'walFrames',
-  'checkpointedFrames',
-  'pendingFrames'
+  'walBytes'
 ]);
 
 interface DiagnosticRollup {
@@ -220,7 +219,8 @@ interface DiagnosticRollup {
  * stale rotations are removed after seven days, and pending memory is bounded. Prompt/output/tool
  * arguments, credentials, headers, paths and arbitrary nested objects are rejected by construction.
  * High-frequency samples are folded into at most 256 in-memory rollups and persisted as one summary
- * per rollup every five minutes (and on inspect/close), so rare events keep hours of history.
+ * per rollup every five minutes (and on inspect/close, or early when a Runtime anomaly is observed),
+ * so rare events keep hours of history. A process killed mid-window loses that window's rollups.
  */
 export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserver {
   private readonly pending: ReliableDiagnosticEventRecord[] = [];
@@ -275,7 +275,7 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
     if (!rollup) {
       // Bounded memory: a burst of distinct identities closes the current window early rather than
       // evicting (and silently losing) any rollup that already holds samples.
-      if (this.rollups.size >= MAX_ROLLUP_KEYS) this.emitRollups();
+      if (this.rollups.size >= MAX_ROLLUP_KEYS) this.emitAggregates();
       rollup = {
         eventKind: sample.eventKind,
         ...(sample.scopeKind ? { scopeKind: sample.scopeKind } : {}),
@@ -315,7 +315,7 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
   }
 
   public async inspect(input: { scopeId?: string; limit?: number } = {}): Promise<ReliableDiagnosticJournalInspection> {
-    this.emitRollups();
+    this.emitAggregates();
     while (this.flushPromise || this.pending.length > 0) await this.flush();
     const limit = normalizeLimit(input.limit);
     const scopeId = input.scopeId?.trim();
@@ -368,7 +368,7 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
 
   public async close(): Promise<void> {
     if (this.closed) return;
-    this.emitRollups();
+    this.emitAggregates();
     this.closed = true;
     this.clearFlushTimer();
     while (this.flushPromise || this.pending.length > 0) await this.flush();
@@ -412,7 +412,8 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
   }
 
   /** Persists one summary per non-empty rollup and starts a new window. */
-  private emitRollups(): void {
+  public emitAggregates(): void {
+    if (this.closed) return;
     if (this.rollupTimer) clearTimeout(this.rollupTimer);
     this.rollupTimer = undefined;
     const startedAtMs = this.rollupWindowStartedAtMs;
@@ -443,7 +444,7 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
     if (this.rollupTimer || this.closed) return;
     this.rollupTimer = setTimeout(() => {
       this.rollupTimer = undefined;
-      this.emitRollups();
+      this.emitAggregates();
     }, this.rollupWindowMs);
     this.rollupTimer.unref?.();
   }

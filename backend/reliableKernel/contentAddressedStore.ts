@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import type { RootBinding } from './contracts';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
@@ -121,7 +122,10 @@ export class ContentAddressedStore {
     return await this.publishIdentified(identifyContent(this.binding, content, contentType));
   }
 
-  private async publishIdentified(content: IdentifiedContent): Promise<PublishedContent> {
+  private async publishIdentified(
+    content: IdentifiedContent,
+    directoryFsyncs?: { count: number }
+  ): Promise<PublishedContent> {
     await this.authority.validate(this.binding);
     this.recordMetric('publish');
     const { bytes, published } = content;
@@ -130,7 +134,10 @@ export class ContentAddressedStore {
     const temporaryRoot = path.join(casRoot, 'tmp');
     const digestRoot = path.join(casRoot, 'sha256');
     const digestPrefix = path.dirname(absolutePath);
-    const recordDirectoryFsync = () => this.recordMetric('directory-fsync');
+    const recordDirectoryFsync = () => {
+      this.recordMetric('directory-fsync');
+      if (directoryFsyncs) directoryFsyncs.count += 1;
+    };
     await ensureDurableChildDirectory(casRoot, temporaryRoot, recordDirectoryFsync);
     await ensureDurableChildDirectory(casRoot, digestRoot, recordDirectoryFsync);
     await ensureDurableChildDirectory(digestRoot, digestPrefix, recordDirectoryFsync);
@@ -173,7 +180,7 @@ export class ContentAddressedStore {
     content: Uint8Array | string,
     contentType: string
   ): Promise<PreparedContentObject> {
-    const prepared = await this.prepareBatch(database, [{ content, contentType }]);
+    const prepared = await this.prepareContent(database, [{ content, contentType }], 'prepare');
     if (!prepared[0]) throw new Error('CAS single prepare lost its input.');
     return prepared[0];
   }
@@ -182,7 +189,16 @@ export class ContentAddressedStore {
     database: RuntimeDatabase,
     inputs: ReadonlyArray<{ content: Uint8Array | string; contentType: string }>
   ): Promise<PreparedContentObject[]> {
+    return this.prepareContent(database, inputs, 'prepare_batch');
+  }
+
+  private async prepareContent(
+    database: RuntimeDatabase,
+    inputs: ReadonlyArray<{ content: Uint8Array | string; contentType: string }>,
+    operation: 'prepare' | 'prepare_batch'
+  ): Promise<PreparedContentObject[]> {
     if (inputs.length === 0) return [];
+    const startedAtMs = database.performanceMetrics ? performance.now() : undefined;
     if (!sameBindingIdentity(database.binding, this.binding)) {
       throw new Error('CAS and RuntimeDatabase must use the same RootBinding.');
     }
@@ -217,10 +233,25 @@ export class ContentAddressedStore {
     this.recordMetric('lookup-hit', lookupHits);
     this.recordMetric('lookup-miss', missing.length);
 
-    const publishedMisses = await Promise.all(missing.map((entry) => this.publishIdentified(entry)));
+    const directoryFsyncs = { count: 0 };
+    const publishedMisses = await Promise.all(missing.map((entry) => this.publishIdentified(entry, directoryFsyncs)));
     for (const published of publishedMisses) {
       const metadata = contentObjectMetadata(published);
       preparedById.set(metadata.id, { metadata, insert: repository.insert(metadata) });
+    }
+    if (startedAtMs !== undefined) {
+      // Lookup plus durable publish of every miss, i.e. what a command waits for before its commit.
+      database.recordPerformanceMetric({
+        kind: 'cas.prepare',
+        operation,
+        lookupHits,
+        lookupMisses: missing.length,
+        publishes: missing.length,
+        tempWrites: missing.length,
+        fileFsyncs: missing.length,
+        directoryFsyncs: directoryFsyncs.count,
+        durationMs: performance.now() - startedAtMs
+      });
     }
 
     return identified.map((entry) => {
