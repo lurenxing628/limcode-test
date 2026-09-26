@@ -3,6 +3,7 @@ import type { ToolDefinition } from '../../registry';
 import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, allowOutsideProjectPathsFromConfig, filePathPolicyDescription } from '../filePathPolicy';
+import { normalizeDisplayPath } from '../../../../../../shared/displayPath';
 
 interface WriteArgs {
   path?: string;
@@ -73,8 +74,4 @@ function summarizeWriteToolCall(rawArgs: unknown): string | undefined {
   const args = (rawArgs ?? {}) as WriteArgs;
   const path = normalizeDisplayPath(args.path);
   return path ? `write ${path}` : undefined;
-}
-
-function normalizeDisplayPath(path: string | undefined): string {
-  return typeof path === 'string' ? path.trim().replace(/\\+/g, '/') : '';
 }

@@ -1,4 +1,3 @@
-import * as path from 'path';
 import { fileURLToPath } from 'url';
 import type {
   CheckpointPolicyRecord,
@@ -7,6 +6,7 @@ import type {
   ToolDefinitionRecord
 } from '../../../../shared/protocol';
 import { STORAGE_VERSION } from '../../../capabilities/vscodeStorage/constants';
+import { isPathInside } from '../../../capabilities/filesystem/pathContainment';
 
 export const DEFAULT_CHECKPOINT_MAX_BYTES = 50 * 1024 * 1024;
 
@@ -51,12 +51,9 @@ export function normalizeCheckpointPolicy(input: Partial<CheckpointPolicyRecord>
 export function workspaceContainsProject(workspaceFolderUris: readonly string[], projectUri: string): boolean {
   const projectPath = fsPathFromUri(projectUri);
   if (!projectPath) return false;
-  const normalizedProject = normalizeFsPath(projectPath);
   return workspaceFolderUris.some((uri) => {
     const workspacePath = fsPathFromUri(uri);
-    if (!workspacePath) return false;
-    const normalizedWorkspace = normalizeFsPath(workspacePath);
-    return normalizedProject === normalizedWorkspace || normalizedProject.startsWith(normalizedWorkspace + path.sep);
+    return !!workspacePath && isPathInside(workspacePath, projectPath);
   });
 }
 
@@ -155,11 +152,6 @@ function fsPathFromUri(uri: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-function normalizeFsPath(value: string): string {
-  const resolved = path.resolve(value);
-  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
 function normalizeRelativePath(value: string): string {

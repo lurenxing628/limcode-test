@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { isPathBelow } from './lib/path-containment.mjs';
 
 const root = process.cwd();
 const extensionRoot = path.join(root, 'dist/extension');
@@ -59,7 +60,7 @@ function commonJsClosure(initial) {
   while (stack.length > 0) {
     const file = stack.pop();
     if (seen.has(file)) continue;
-    if (!file.startsWith(`${extensionRoot}${path.sep}`)) throw new Error(`Package closure escaped dist/extension: ${file}`);
+    if (!isPathBelow(extensionRoot, file)) throw new Error(`Package closure escaped dist/extension: ${file}`);
     if (!fs.existsSync(file)) throw new Error(`Package closure dependency is missing: ${portable(path.relative(root, file))}`);
     seen.add(file);
     const source = fs.readFileSync(file, 'utf8');
@@ -67,7 +68,7 @@ function commonJsClosure(initial) {
       const specifier = match[1];
       if (!specifier.startsWith('.')) continue;
       const unresolved = path.resolve(path.dirname(file), specifier);
-      if (!unresolved.startsWith(`${extensionRoot}${path.sep}`)) {
+      if (!isPathBelow(extensionRoot, unresolved)) {
         throw new Error(`Relative require escaped dist/extension: ${specifier} from ${file}`);
       }
       const target = resolveRelativeModule(unresolved);

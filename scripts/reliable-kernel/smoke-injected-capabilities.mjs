@@ -2,6 +2,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { randomUUID } from 'node:crypto';
+import { isPathBelow } from './lib/path-containment.mjs';
 
 const root = process.cwd();
 const dataRoot = path.resolve(option('data-root') ?? path.join(process.env.HOME, '.local/share/code-server/User/globalStorage/your-publisher.limcode-test'));
@@ -121,7 +122,7 @@ async function readStore(storeRoot) {
   for (const indexed of index.records) {
     if (typeof indexed.file !== 'string') throw new Error('配置index file无效。');
     const filePath = path.resolve(storeRoot, ...indexed.file.split('/'));
-    if (!filePath.startsWith(`${path.resolve(storeRoot)}${path.sep}`)) throw new Error('配置index路径逃逸。');
+    if (!isPathBelow(path.resolve(storeRoot), filePath)) throw new Error('配置index路径逃逸。');
     const file = JSON.parse(await fsp.readFile(filePath, 'utf8'));
     const key = Object.keys(file).find((candidate) => candidate !== 'schemaVersion' && candidate !== 'savedAt');
     const record = key ? file[key] : undefined;

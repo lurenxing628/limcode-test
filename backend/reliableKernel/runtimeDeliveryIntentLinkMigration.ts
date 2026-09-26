@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import Database from 'better-sqlite3';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { storageKeyForDigest } from './contentAddressedStore';
 import {
   runtimeContinuationTurnIntentEnvelope
@@ -457,7 +458,7 @@ function assertExactJson(bytes: Buffer, value: unknown, label: string): void {
 function safeCasPath(casRootPath: string, storageKey: string): string {
   const root = path.resolve(casRootPath);
   const candidate = path.resolve(root, ...storageKey.split('/'));
-  if (!candidate.startsWith(`${root}${path.sep}`)) throw new Error('CAS storage key escapes the Runtime root.');
+  if (!isPathBelow(root, candidate)) throw new Error('CAS storage key escapes the Runtime root.');
   return candidate;
 }
 

@@ -7,6 +7,7 @@ import { defineToolDefinitionModule } from '../types';
 import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, allowOutsideProjectPathsFromConfig, filePathPolicyDescription } from '../filePathPolicy';
 import { compactReadPagesArgument, resolveReadPageRange } from './pageRange';
 import { readTextPages } from './textPages';
+import { normalizeDisplayPath } from '../../../../../../shared/displayPath';
 
 export type ReadFileMode = 'text' | 'attachment';
 
@@ -503,10 +504,6 @@ function boundBatchReadOutput<T extends { content: string; startLine: number; en
 
 function normalizeAttachmentId(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
-}
-
-function normalizeDisplayPath(path: unknown): string {
-  return typeof path === 'string' ? path.trim().replace(/\\+/g, '/') : '';
 }
 
 function lineRangeSuffix(startLine: number | undefined, endLine: number | undefined): string {

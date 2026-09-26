@@ -6,6 +6,7 @@ import type { WorkEnvironmentRecord } from '../../shared/protocol';
 import { isRemoteServerWorkEnvironment, workEnvironmentDisplayName } from '../../shared/workEnvironmentCatalog';
 import type { CommandRunArgs, CommandRunObserver, CommandRunResult, FsDeletePathTargetType, FsReadFileResult } from './types';
 import { sliceTextFile } from './textFileSlice';
+import { isPathInside, isSamePath } from './filesystem/pathContainment';
 
 const DEFAULT_REMOTE_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_CHARS = 120_000;
@@ -16,6 +17,8 @@ export interface RemotePathPolicyOptions {
   allowOutsideProjectPaths?: boolean;
   rejectProjectRoot?: boolean;
   signal?: AbortSignal;
+  /** The SSH login user's home, required when workdir/rootPath/cwd/path starts with `~` (see remoteHomeFor). */
+  home?: string;
 }
 
 export interface RemoteServerStreamHandle {
@@ -59,7 +62,7 @@ export async function runRemoteServerCommand(
   assertRemoteServerCommandSupported(environment);
   const command = (args.command ?? '').trim();
   if (!command) return failedRemoteResult('', 'Missing required argument: command');
-  const cwd = resolveRemoteCwd(args.cwd, environment);
+  const cwd = resolveRemoteCwd(args.cwd, environment, await remoteHomeFor(environment, [args.cwd], args.signal));
   const script = cwd ? `cd ${shQuote(cwd)} && ${command}` : command;
   return executeRemoteServerScript(environment, script, {
     timeout: resolveRemoteTimeout(args.foregroundWaitMs),
@@ -87,7 +90,8 @@ export async function readRemoteServerRawTextFile(
   options: RemotePathPolicyOptions = {}
 ): Promise<string> {
   assertRemoteServerCommandSupported(environment);
-  const remotePath = resolveRemotePath(filePath, environment, undefined, options);
+  const home = await remoteHomeFor(environment, [filePath], options.signal);
+  const remotePath = resolveRemotePath(filePath, environment, undefined, { ...options, home });
   const script = `set -euo pipefail
 FILE=${shQuote(remotePath)}
 if [ ! -e "$FILE" ]; then echo "file not found: $FILE" >&2; exit 44; fi
@@ -148,7 +152,8 @@ export async function writeRemoteServerTextFile(
   options: RemotePathPolicyOptions = {}
 ): Promise<void> {
   assertRemoteServerCommandSupported(environment);
-  const remotePath = resolveRemotePath(filePath, environment, undefined, options);
+  const home = await remoteHomeFor(environment, [filePath], options.signal);
+  const remotePath = resolveRemotePath(filePath, environment, undefined, { ...options, home });
   const remoteDir = path.posix.dirname(remotePath);
   const tempPath = path.posix.join(remoteDir, `.${path.posix.basename(remotePath) || 'file'}.limcode-write-${Date.now()}-${randomBytes(4).toString('hex')}`);
   const mkdirResult = await executeRemoteServerScript(environment, `mkdir -p -- ${shQuote(remoteDir)}`, { timeout: DEFAULT_REMOTE_TIMEOUT_MS, displayCommand: `mkdir -p ${remoteDir}` });
@@ -176,8 +181,9 @@ export async function deleteRemoteServerPath(
   options: RemotePathPolicyOptions = {}
 ): Promise<{ path: string; targetType: FsDeletePathTargetType }> {
   assertRemoteServerCommandSupported(environment);
-  const remotePath = resolveRemotePath(filePath, environment, undefined, { ...options, rejectProjectRoot: true });
-  assertSafeRemoteDeleteTarget(remotePath, environment);
+  const home = await remoteHomeFor(environment, [filePath], options.signal);
+  const remotePath = resolveRemotePath(filePath, environment, undefined, { ...options, rejectProjectRoot: true, home });
+  assertSafeRemoteDeleteTarget(remotePath, environment, home);
   const script = `set -euo pipefail
 TARGET=${shQuote(remotePath)}
 if [ ! -e "$TARGET" ]; then echo "path not found: $TARGET" >&2; exit 44; fi
@@ -312,8 +318,8 @@ export function spawnRemoteServerScript(
 }
 
 export function resolveRemotePath(input: string, environment: WorkEnvironmentRecord, cwd?: string, options: RemotePathPolicyOptions = {}): string {
-  const text = normalizeRemoteInput(input);
-  const base = resolveRemoteCwd(cwd, environment);
+  const text = normalizeRemoteInput(input, options.home);
+  const base = resolveRemoteCwd(cwd, environment, options.home);
   const resolved = path.posix.isAbsolute(text)
     ? path.posix.normalize(text)
     : base
@@ -322,21 +328,21 @@ export function resolveRemotePath(input: string, environment: WorkEnvironmentRec
   return applyRemotePathPolicy(path.posix.normalize(resolved), environment, options);
 }
 
-export function resolveRemoteCwd(inputCwd: string | undefined, environment: WorkEnvironmentRecord): string | undefined {
-  const base = normalizeOptionalRemotePath(environment.workdir) ?? normalizeOptionalRemotePath(environment.rootPath);
-  const cwd = normalizeOptionalRemotePath(inputCwd);
+export function resolveRemoteCwd(inputCwd: string | undefined, environment: WorkEnvironmentRecord, home?: string): string | undefined {
+  const base = normalizeOptionalRemotePath(environment.workdir, home) ?? normalizeOptionalRemotePath(environment.rootPath, home);
+  const cwd = normalizeOptionalRemotePath(inputCwd, home);
   if (!cwd) return base;
   if (path.posix.isAbsolute(cwd)) return path.posix.normalize(cwd);
   return base ? path.posix.join(base, cwd) : path.posix.normalize(cwd);
 }
 
-export function remoteProjectRootPath(environment: WorkEnvironmentRecord): string | undefined {
-  return resolveRemoteCwd(undefined, environment);
+export function remoteProjectRootPath(environment: WorkEnvironmentRecord, home?: string): string | undefined {
+  return resolveRemoteCwd(undefined, environment, home);
 }
 
 function applyRemotePathPolicy(remotePath: string, environment: WorkEnvironmentRecord, options: RemotePathPolicyOptions): string {
   if (options.allowOutsideProjectPaths === false) {
-    const root = remoteProjectRootPath(environment);
+    const root = remoteProjectRootPath(environment, options.home);
     if (!root || !path.posix.isAbsolute(root)) {
       throw new Error(`当前远程工作环境缺少绝对 workdir/rootPath，无法限制项目外路径：${workEnvironmentDisplayName(environment)}`);
     }
@@ -344,29 +350,25 @@ function applyRemotePathPolicy(remotePath: string, environment: WorkEnvironmentR
       throw new Error(`路径超出当前远程工作环境根目录：${remotePath}（root=${root}）`);
     }
   }
-  if (options.rejectProjectRoot === true) assertSafeRemoteDeleteTarget(remotePath, environment);
+  if (options.rejectProjectRoot === true) assertSafeRemoteDeleteTarget(remotePath, environment, options.home);
   return remotePath;
 }
 
-function assertSafeRemoteDeleteTarget(remotePath: string, environment: WorkEnvironmentRecord): void {
+function assertSafeRemoteDeleteTarget(remotePath: string, environment: WorkEnvironmentRecord, home?: string): void {
   const normalized = path.posix.normalize(remotePath);
   if (!normalized || normalized === '/') throw new Error('拒绝删除远程文件系统根目录。');
   if (!path.posix.isAbsolute(normalized)) throw new Error(`远程相对删除路径需要配置 workdir/rootPath：${normalized}`);
-  const root = remoteProjectRootPath(environment);
-  if (root && path.posix.isAbsolute(root) && sameRemotePath(normalized, root)) {
-    throw new Error(`拒绝删除远程工作环境根目录：${normalized}`);
+  const root = remoteProjectRootPath(environment, home);
+  if (root && path.posix.isAbsolute(root) && isPathInside(normalized, root, path.posix)) {
+    throw new Error(isSamePath(normalized, root, path.posix)
+      ? `拒绝删除远程工作环境根目录：${normalized}`
+      : `拒绝删除包含远程工作环境根目录的上级目录：${normalized}`);
   }
-}
-
-function sameRemotePath(left: string, right: string): boolean {
-  return path.posix.normalize(left) === path.posix.normalize(right);
+  if (home && isSamePath(normalized, home, path.posix)) throw new Error(`拒绝删除远程登录用户的家目录：${normalized}`);
 }
 
 function isRemotePathInside(candidate: string, root: string): boolean {
-  const normalizedCandidate = path.posix.normalize(candidate);
-  const normalizedRoot = path.posix.normalize(root);
-  const relative = path.posix.relative(normalizedRoot, normalizedCandidate);
-  return relative === '' || (!!relative && !relative.startsWith('..') && !path.posix.isAbsolute(relative));
+  return isPathInside(path.posix.normalize(root), path.posix.normalize(candidate), path.posix);
 }
 
 
@@ -395,15 +397,91 @@ function remoteHost(environment: WorkEnvironmentRecord): string | undefined {
   return environment.host?.trim() || environment.name?.trim();
 }
 
-function normalizeRemoteInput(input: string): string {
+function normalizeRemoteInput(input: string, home?: string): string {
   const text = input.trim().replace(/\\/g, '/');
   if (!text || text.includes('\0')) throw new Error(`非法远程路径：${input}`);
-  return path.posix.normalize(text);
+  if (!isHomeRelativeRemotePath(text)) return normalizeRemotePath(text);
+  // 引号里的 ~ 不会被远端 shell 展开，必须先换成登录用户的家目录再做 .. 归一和根目录判断。
+  if (!home) throw new Error(`远程路径以 ~ 开头，但尚未解析登录用户的家目录：${input}`);
+  return normalizeRemotePath(text === '~' ? home : path.posix.join(home, text.slice(2)));
 }
 
-function normalizeOptionalRemotePath(input: string | undefined): string | undefined {
+/** posix 归一并去掉尾随 /（根目录 / 除外），使 `~/proj/`、`/srv/proj/` 与 `~/proj`、`/srv/proj` 比较时是同一路径。 */
+function normalizeRemotePath(text: string): string {
+  const normalized = path.posix.normalize(text);
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') || '/' : normalized;
+}
+
+function normalizeOptionalRemotePath(input: string | undefined, home?: string): string | undefined {
   if (typeof input !== 'string' || !input.trim()) return undefined;
-  return normalizeRemoteInput(input);
+  return normalizeRemoteInput(input, home);
+}
+
+function isHomeRelativeRemotePath(text: string): boolean {
+  return text === '~' || text.startsWith('~/');
+}
+
+const remoteHomeDirectories = new Map<string, Promise<string>>();
+
+/**
+ * The SSH login user's home when the environment's workdir/rootPath or one of `inputs` is written as
+ * `~` or `~/…`; undefined (no round trip) otherwise. Resolved once per connection and cached; a failed
+ * lookup is not cached.
+ */
+export async function remoteHomeFor(
+  environment: WorkEnvironmentRecord,
+  inputs: ReadonlyArray<string | undefined> = [],
+  signal?: AbortSignal
+): Promise<string | undefined> {
+  const needsHome = [environment.workdir, environment.rootPath, ...inputs].some((value) =>
+    typeof value === 'string' && isHomeRelativeRemotePath(value.trim().replace(/\\/g, '/'))
+  );
+  if (!needsHome) return undefined;
+  const key = JSON.stringify([environment.id, environment.user ?? '', remoteHost(environment) ?? '', environment.port ?? 0]);
+  let pending = remoteHomeDirectories.get(key);
+  if (!pending) {
+    // 共享查询本身不随某个调用方取消；各调用方只放弃自己的等待。
+    const lookup = queryRemoteHome(environment);
+    remoteHomeDirectories.set(key, lookup);
+    lookup.catch(() => {
+      if (remoteHomeDirectories.get(key) === lookup) remoteHomeDirectories.delete(key);
+    });
+    pending = lookup;
+  }
+  return untilAborted(pending, signal);
+}
+
+function untilAborted<T>(pending: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return pending;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+const REMOTE_HOME_MARKER = '__limcode_remote_home=';
+
+async function queryRemoteHome(environment: WorkEnvironmentRecord): Promise<string> {
+  // 登录 shell 的 profile 可能往 stdout 打印横幅，只认带标记的最后一行。
+  const result = await executeRemoteServerScript(environment, `printf '\\n${REMOTE_HOME_MARKER}%s\\n' "$HOME"`, {
+    timeout: DEFAULT_REMOTE_TIMEOUT_MS,
+    displayCommand: 'resolve remote $HOME'
+  });
+  const line = result.stdout.split('\n').reverse().find((candidate) => candidate.startsWith(REMOTE_HOME_MARKER));
+  const home = line?.slice(REMOTE_HOME_MARKER.length).replace(/\r$/, '');
+  const failure = result.killed
+    ? `查询超时或被中止（${DEFAULT_REMOTE_TIMEOUT_MS / 1000} 秒）`
+    : result.exitCode !== 0
+      ? `退出码 ${result.exitCode}${result.stderr.trim() ? `：${result.stderr.trim()}` : ''}`
+      : line === undefined
+        ? '远端输出里没有 $HOME 结果'
+        : !home || !path.posix.isAbsolute(home)
+          ? `远端 $HOME 不是绝对路径：${JSON.stringify(home ?? '')}`
+          : undefined;
+  if (failure || !home) throw new Error(`无法解析远程服务器 ${workEnvironmentDisplayName(environment)} 登录用户的家目录（~）：${failure}`);
+  return normalizeRemotePath(home);
 }
 
 function resolveRemoteTimeout(value: number | undefined): number {

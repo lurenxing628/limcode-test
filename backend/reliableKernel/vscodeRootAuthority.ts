@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { createVscodeStoragePaths } from '../capabilities/vscodeStorage/paths';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import { isPathInside } from '../capabilities/filesystem/pathContainment';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths } from './contracts';
 import { RootAuthority, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
 import { assertRuntimeHostsOffline, runtimeHostLivenessDirectory, withRuntimeDataRootAdmission } from './runtimeHostControl';
@@ -576,7 +577,7 @@ async function hasRuntimeArtifacts(controlPath: string): Promise<boolean> {
 /** Reject links below the configured root so candidate ids cannot escape their root via aliases. */
 async function assertSafeRootPath(configurationRootPath: string, target: string): Promise<void> {
   const relative = path.relative(configurationRootPath, target);
-  if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+  if (!isPathInside(configurationRootPath, target)) {
     throw new VscodeRuntimeDataSetError(`运行数据集路径越过配置根：${target}`);
   }
   let current = configurationRootPath;

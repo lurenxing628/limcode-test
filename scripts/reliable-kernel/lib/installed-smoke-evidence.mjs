@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { isPathBelow } from './path-containment.mjs';
 
 export const INSTALLED_SMOKE_RECEIPT_KIND = 'limcode-installed-smoke-receipt';
 export const INSTALLED_SMOKE_RECEIPT_REVISION = '2026-08-02';
@@ -377,7 +378,7 @@ function safeRelativePath(input, label) {
 function inside(root, relativeInput, label) {
   const relative = safeRelativePath(relativeInput, label);
   const target = path.resolve(root, relative);
-  if (!target.startsWith(`${root}${path.sep}`)) throw new Error(`${label}逃逸workspace`);
+  if (!isPathBelow(root, target)) throw new Error(`${label}逃逸workspace`);
   if (!fs.existsSync(target) || !fs.statSync(target).isFile()) throw new Error(`${label}不存在或不是文件`);
   return target;
 }

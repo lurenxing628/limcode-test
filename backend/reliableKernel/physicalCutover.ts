@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import { isPathInside } from '../capabilities/filesystem/pathContainment';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
@@ -830,7 +831,8 @@ function requireSafeRecordFile(value: unknown, label: string): string {
     throw new TypeError(`${label}不是安全records JSON路径。`);
   }
   const normalized = path.posix.normalize(value);
-  if (normalized !== value || value.split('/').some((part) => !part || part === '.' || part === '..')) {
+  // 反斜杠和冒号在 Windows 上是分隔符/盘符，会让 path.resolve 跳出 records 目录；生成的文件名从不含这两个字符。
+  if (normalized !== value || /[\\:]/.test(value) || value.split('/').some((part) => !part || part === '.' || part === '..')) {
     throw new TypeError(`${label}包含不安全路径片段。`);
   }
   return value;
@@ -839,7 +841,7 @@ function requireSafeRecordFile(value: unknown, label: string): string {
 function safeJoinedPath(rootPath: string, relativePath: string): string {
   const absolute = path.resolve(rootPath, ...relativePath.split('/'));
   const normalizedRoot = path.resolve(rootPath);
-  if (absolute !== normalizedRoot && !absolute.startsWith(`${normalizedRoot}${path.sep}`)) throw new Error('路径逃逸cutover root。');
+  if (!isPathInside(normalizedRoot, absolute)) throw new Error('路径逃逸cutover root。');
   return absolute;
 }
 

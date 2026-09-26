@@ -4,6 +4,7 @@ import type { ToolDefinition } from '../../registry';
 import { staticToolScheduling } from '../../schedulingContract';
 import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, allowOutsideProjectPathsFromConfig } from '../filePathPolicy';
 import { defineToolDefinitionModule } from '../types';
+import { normalizeDisplayPath } from '../../../../../../shared/displayPath';
 
 interface DeleteArgs {
   paths?: unknown;
@@ -121,8 +122,4 @@ function summarizeDeleteToolCall(rawArgs: unknown): string | undefined {
   if (!first) return undefined;
   const suffix = parsed.paths.length > 1 ? ` +${parsed.paths.length - 1}` : '';
   return `delete ${first}${suffix}`;
-}
-
-function normalizeDisplayPath(path: string | undefined): string {
-  return typeof path === 'string' ? path.trim().replace(/\\+/g, '/') : '';
 }

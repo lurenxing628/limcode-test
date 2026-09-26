@@ -7,6 +7,8 @@ import type { SkillCatalogCapability } from './types';
 import { resolveDataRootUri } from './vscodeStorage/globalStatus';
 import { compareSkillsByPriority, lookupSkill, SKILL_SOURCE_PRIORITY } from '../world/modules/skill/skillLookup';
 import { parseSkillFrontmatter, yamlBoolean, yamlMapping, yamlText } from './skillFrontmatter';
+import { isPathInside, isSamePath } from './filesystem/pathContainment';
+import { realPath } from './filesystem/realPath';
 
 const SKILL_ENTRY_FILE = 'SKILL.md';
 /** 项目级技能目录（相对工作区文件夹），各 Agent 工具的约定位置。 */
@@ -247,7 +249,7 @@ async function installedClaudePluginRoots(claudeHome: string, workspaceFolders: 
       if (typeof install?.installPath !== 'string' || !path.isAbsolute(install.installPath)) continue;
       const scope = typeof install.scope === 'string' ? install.scope : 'user';
       const projectPath = typeof install.projectPath === 'string' ? install.projectPath : undefined;
-      if (scope !== 'user' && !(projectPath && workspaceFolders.some((folder) => path.resolve(folder) === path.resolve(projectPath)))) continue;
+      if (scope !== 'user' && !(projectPath && workspaceFolders.some((folder) => isSamePath(folder, projectPath)))) continue;
       if (!result.includes(install.installPath)) result.push(install.installPath);
     }
   }
@@ -267,8 +269,7 @@ function asPlainRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 function isInsideDirectory(candidate: string, directory: string): boolean {
-  const relative = path.relative(path.resolve(directory), path.resolve(candidate));
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  return isPathInside(directory, candidate);
 }
 
 async function scanSkillsRoot(root: SkillRoot): Promise<SkillDefinitionRecord[]> {
@@ -362,10 +363,10 @@ async function nearestPluginNamespace(
 ): Promise<{ namespace: string; root: string } | undefined> {
   const rootPath = path.resolve(root.fsPath);
   let current = path.dirname(path.resolve(dir.fsPath));
-  while (current === rootPath || current.startsWith(rootPath + path.sep)) {
+  while (isPathInside(rootPath, current)) {
     const namespace = await pluginNamespaceOf(vscode.Uri.file(current));
     if (namespace) return { namespace, root: current };
-    if (current === rootPath) break;
+    if (isSamePath(current, rootPath)) break;
     current = path.dirname(current);
   }
   return undefined;
@@ -399,7 +400,7 @@ async function allowsImplicitInvocation(dir: vscode.Uri): Promise<boolean> {
 async function realPathKey(fsPath: string, uri?: vscode.Uri): Promise<string> {
   if (uri && uri.scheme !== 'file') return uri.toString();
   try {
-    return await fsp.realpath(fsPath);
+    return await realPath(fsPath);
   } catch {
     return path.resolve(fsPath);
   }

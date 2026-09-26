@@ -320,6 +320,10 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     }
     const root = path.resolve(active.rootPath);
     const cwd = path.resolve(root, requested);
+    if (!isInsideRoot(root, cwd)) {
+      const rebased = await rebaseOntoRealRoot([{ root }], cwd);
+      if (rebased) return rebased.target;
+    }
     assertInsideRoot(root, cwd, 'command cwd');
     return cwd;
   }
@@ -358,13 +362,14 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     );
     if (local.length === 0) throw new Error('冻结 WorkEnvironmentPolicy 没有可用本地文件根。');
     if (path.isAbsolute(inputPath)) {
-      const matches = local
-        .map((environment) => ({ environment, root: path.resolve(environment.rootPath!) }))
-        .filter(({ root }) => isInsideRoot(root, path.resolve(inputPath)))
-        .sort((left, right) => right.root.length - left.root.length);
-      const selected = matches[0];
+      const target = path.resolve(inputPath);
+      const candidates = local.map((environment) => ({ environment, root: path.resolve(environment.rootPath!) }));
+      const lexical = candidates
+        .filter(({ root }) => isInsideRoot(root, target))
+        .sort((left, right) => right.root.length - left.root.length)[0];
+      const selected = lexical ? { ...lexical, target } : await rebaseOntoRealRoot(candidates, target);
       if (!selected) throw new Error(`绝对路径不属于冻结策略允许的本地工作环境：${inputPath}`);
-      return resolvePathInsideBoundary(selected.environment.id, selected.root, inputPath);
+      return resolvePathInsideBoundary(selected.environment.id, selected.root, selected.target);
     }
     const active = environments.active;
     if (!active?.rootPath || active.kind !== 'localFolder') {
@@ -453,6 +458,25 @@ function authorityMultimodalEnabled(document: PlainJsonValue): boolean {
 
 function assertInsideRoot(root: string, target: string, label: string): void {
   if (!isInsideRoot(root, target)) throw new Error(`${label} escapes active work environment.`);
+}
+
+/**
+ * An absolute path can name a file inside a work environment through the real path of its root: the
+ * root is a symlink, junction or subst drive and the model saw the resolved form (git rev-parse, stack
+ * traces, /private/var on macOS). Only the root prefix is swapped; nothing below the root is resolved,
+ * so a link inside the target keeps meeting the planner's symbolic-link checks under either spelling.
+ */
+async function rebaseOntoRealRoot<T extends { root: string }>(
+  candidates: readonly T[],
+  target: string
+): Promise<(T & { target: string }) | undefined> {
+  let best: (T & { target: string; realRoot: string }) | undefined;
+  for (const candidate of candidates) {
+    const realRoot = await realPathOfNearestExisting(candidate.root);
+    if (!isInsideRoot(realRoot, target) || (best && best.realRoot.length >= realRoot.length)) continue;
+    best = { ...candidate, realRoot, target: path.join(candidate.root, path.relative(realRoot, target)) };
+  }
+  return best;
 }
 
 function isInsideRoot(root: string, target: string): boolean {

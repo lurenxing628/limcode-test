@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -473,7 +474,7 @@ function requireMatchingContentObject(row: DomainRow, expected: PublishedContent
 function absoluteCasPath(binding: RootBinding, storageKey: string): string {
   const root = path.resolve(binding.paths.casRootPath);
   const candidate = path.resolve(root, ...storageKey.split('/'));
-  if (!candidate.startsWith(`${root}${path.sep}`)) throw new Error('CAS storage key escapes its active root.');
+  if (!isPathBelow(root, candidate)) throw new Error('CAS storage key escapes its active root.');
   return candidate;
 }
 

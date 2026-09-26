@@ -18,6 +18,8 @@ import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { handoffReason, isExecutionHandoffError } from './executionLeaseFence';
+import { isCanonicalPathInside } from '../capabilities/filesystem/pathContainment';
+import { realPath } from '../capabilities/filesystem/realPath';
 
 export type FileChangeOperation =
   | 'create_file'
@@ -1367,7 +1369,7 @@ async function resolveBoundedTarget(
     throw new FilePathConflictError(`WorkEnvironment is not registered: ${workEnvironmentId}`);
   }
   const configuredRoot = path.resolve(requireText(boundary.rootPath, 'WorkEnvironment.rootPath'));
-  const realRoot = await fs.realpath(configuredRoot);
+  const realRoot = await realPath(configuredRoot);
   const target = path.isAbsolute(targetPath)
     ? path.resolve(targetPath)
     : path.resolve(realRoot, targetPath);
@@ -1375,7 +1377,7 @@ async function resolveBoundedTarget(
   const parent = path.dirname(target);
   let realParent: string;
   try {
-    realParent = await fs.realpath(parent);
+    realParent = await realPath(parent);
   } catch (error) {
     if (isNotFound(error)) throw new FilePathConflictError('File target parent does not exist.');
     throw error;
@@ -1390,8 +1392,9 @@ async function resolveBoundedTarget(
   return target;
 }
 
+/** Both sides derive from realpath of the same root, so compare exactly (see isCanonicalPathInside). */
 function assertWithin(root: string, candidate: string): void {
-  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+  if (!isCanonicalPathInside(root, candidate)) {
     throw new FilePathConflictError('File target escapes the registered WorkEnvironment boundary.');
   }
 }

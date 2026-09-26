@@ -3,6 +3,8 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { validateEditToolArguments, type ValidatedEditToolArguments } from '../../shared/editToolArguments';
 import { applyDeleteEdit, applyHunkEdit, applyInsertEdit } from '../capabilities/editStrategies';
+import { isSamePath } from '../capabilities/filesystem/pathContainment';
+import { realPath } from '../capabilities/filesystem/realPath';
 import type { ToolDefinition } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDispatchInput
@@ -190,7 +192,7 @@ async function planMissingParentDirectories(
 ): Promise<FileChangeProposalMemberInput[]> {
   signal?.throwIfAborted();
   const relativeTarget = normalizedRelativeTarget(resolved);
-  const realRoot = await fs.realpath(path.resolve(resolved.rootPath));
+  const realRoot = await realPath(path.resolve(resolved.rootPath));
   const realTarget = path.resolve(realRoot, relativeTarget.split('/').join(path.sep));
   const parent = path.dirname(realTarget);
   const relativeParent = path.relative(realRoot, parent);
@@ -210,9 +212,9 @@ async function planMissingParentDirectories(
         const stat = await fs.lstat(current);
         if (stat.isSymbolicLink()) throw new Error(`Symbolic-link write parents are not allowed: ${current}`);
         if (!stat.isDirectory()) throw new Error(`Write parent component is not a directory: ${current}`);
-        const canonical = await fs.realpath(current);
+        const canonical = await realPath(current);
         signal?.throwIfAborted();
-        if (path.resolve(canonical) !== path.resolve(current)) {
+        if (!isSamePath(canonical, current)) {
           throw new Error(`Write parent does not resolve to its declared boundary path: ${current}`);
         }
         continue;

@@ -32,9 +32,12 @@ import {
   writeRemoteServerTextFile
 } from './workEnvironmentProvider';
 import { sliceTextFile } from './textFileSlice';
+import { isPathInside } from './filesystem/pathContainment';
+import { realPath } from './filesystem/realPath';
 import { buildFileDiffRecord, buildFileReplacementHunks } from './fileDiff';
 import { applyHunkEdit, applyInsertEdit, applyDeleteEdit } from './editStrategies';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS, LIVE_DIFF_SCHEME } from '../../shared/extensionIdentity';
+import { normalizeDisplayPath } from '../../shared/displayPath';
 
 /** Reading a file only to return a slice of it is cheap, so the ceiling guards memory, not usefulness. */
 const MAX_SOURCE_BYTES = 20 * 1024 * 1024;
@@ -106,7 +109,7 @@ export async function readWorkspaceBinaryFile(relPath: string, mimeType: string,
   const normalizedPath = normalizeDisplayPath(relPath);
   if (!normalizedPath) throw new Error('Missing required argument: path');
   const normalizedMimeType = typeof mimeType === 'string' && mimeType.trim() ? mimeType.trim() : 'application/octet-stream';
-  const uri = resolveWorkspacePath(normalizedPath, options, 'read');
+  const uri = await resolveWorkspacePath(normalizedPath, options, 'read');
   const stat = await workspaceFileStat(uri, options.signal);
   if (!stat) throw new Error(`File not found: ${normalizedPath}`);
   if (stat.type !== vscode.FileType.File) throw new Error(`Not a file: ${normalizedPath}`);
@@ -521,7 +524,7 @@ export async function deleteWorkspacePath(relPath: string, options: WorkEnvironm
     return deleteResult(targetPath, deleted.path, deleted.targetType);
   }
 
-  const uri = resolveWorkspacePath(targetPath, options, 'write', { rejectProjectRoot: true });
+  const uri = await resolveWorkspacePath(targetPath, options, 'write', { rejectProjectRoot: true });
   const stat = await workspaceFileStat(uri);
   if (!stat) throw new Error(`Path not found: ${targetPath}`);
   const targetType = fileTypeFromStat(stat, targetPath);
@@ -553,7 +556,7 @@ async function readWorkspaceRawTextFile(relPath: string, maxBytes: number, optio
     }
   }
 
-  const uri = resolveWorkspacePath(relPath, options, 'read');
+  const uri = await resolveWorkspacePath(relPath, options, 'read');
   const stat = await workspaceFileStat(uri, options.signal);
   if (!stat) return { path: relPath, existed: false, content: '' };
   if (stat.type !== vscode.FileType.File) throw new Error(`Not a file: ${relPath}`);
@@ -623,7 +626,7 @@ async function writeWorkspaceRawTextFile(relPath: string, content: string, optio
     return;
   }
 
-  const uri = resolveWorkspacePath(relPath, options, 'write');
+  const uri = await resolveWorkspacePath(relPath, options, 'write');
   await vscode.workspace.fs.createDirectory(dirnameUri(uri));
   await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
 }
@@ -634,12 +637,12 @@ interface WorkspacePathResolveOptions {
   rejectProjectRoot?: boolean;
 }
 
-function resolveWorkspacePath(
+async function resolveWorkspacePath(
   relPath: string,
   options: WorkEnvironmentCapabilityOptions,
   mode: 'read' | 'write',
   resolveOptions: WorkspacePathResolveOptions = {}
-): vscode.Uri {
+): Promise<vscode.Uri> {
   const workEnvironment = options.workEnvironment;
   if (workEnvironment?.available === false) {
     throw new Error(`当前工作环境不可用：${workEnvironmentDisplayName(workEnvironment)}`);
@@ -658,7 +661,7 @@ function resolveWorkspacePath(
   if (!isAbsolute && !root && resolveOptions.rejectProjectRoot === true) {
     throw new Error(`当前工作区缺少项目根目录，无法解析相对删除路径：${targetPath}`);
   }
-  const uri = isAbsolute
+  let uri = isAbsolute
     ? vscode.Uri.file(targetPath)
     : root
       ? vscode.Uri.file(path.resolve(root.fsPath, relativeLocalPath(targetPath)))
@@ -667,6 +670,7 @@ function resolveWorkspacePath(
   if (options.allowOutsideProjectPaths === false) {
     const roots = allowedLocalRootUris(options);
     if (roots.length === 0) throw new Error('当前工作区缺少项目根目录，无法限制项目外路径。');
+    uri = await rebaseOntoRealLocalRoot(uri, roots);
     assertLocalPathInsideAnyRoot(uri, roots);
   }
   if (resolveOptions.rejectProjectRoot === true) assertSafeLocalDeleteTarget(uri, allowedLocalRootUris(options));
@@ -787,7 +791,7 @@ export async function realPathOfNearestExisting(input: string): Promise<string> 
   const rest: string[] = [];
   for (;;) {
     try {
-      return path.join(await fs.realpath(current), ...rest);
+      return path.join(await realPath(current), ...rest);
     } catch {
       const parent = path.dirname(current);
       if (parent === current) return path.resolve(input);
@@ -795,6 +799,21 @@ export async function realPathOfNearestExisting(input: string): Promise<string> 
       current = parent;
     }
   }
+}
+
+/**
+ * 根目录是符号链接/junction/subst 盘时，模型可能给出它的真实路径。只把真实根前缀换回声明的根，
+ * 不解析目标自身，目标里的链接仍按声明路径参与后续检查。
+ */
+async function rebaseOntoRealLocalRoot(uri: vscode.Uri, roots: readonly vscode.Uri[]): Promise<vscode.Uri> {
+  if (roots.some((root) => localPathInsideRoot(uri, root))) return uri;
+  for (const root of roots) {
+    const realRoot = await realPathOfNearestExisting(root.fsPath);
+    if (localPathInsideRoot(uri, vscode.Uri.file(realRoot))) {
+      return vscode.Uri.file(path.join(root.fsPath, path.relative(realRoot, uri.fsPath)));
+    }
+  }
+  return uri;
 }
 
 function assertLocalPathInsideAnyRoot(uri: vscode.Uri, roots: readonly vscode.Uri[]): void {
@@ -805,10 +824,7 @@ function assertLocalPathInsideAnyRoot(uri: vscode.Uri, roots: readonly vscode.Ur
 }
 
 function localPathInsideRoot(uri: vscode.Uri, root: vscode.Uri): boolean {
-  const candidate = canonicalLocalPath(uri.fsPath);
-  const rootPath = canonicalLocalPath(root.fsPath);
-  const relative = path.relative(rootPath, candidate);
-  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+  return isPathInside(canonicalLocalPath(root.fsPath), canonicalLocalPath(uri.fsPath));
 }
 
 function canonicalLocalPath(input: string): string {
@@ -845,10 +861,6 @@ function dirnameUri(uri: vscode.Uri): vscode.Uri {
 
 function normalizePathArg(path: string | undefined): string {
   return typeof path === 'string' ? path.trim() : '';
-}
-
-function normalizeDisplayPath(path: string | undefined): string {
-  return typeof path === 'string' ? path.trim().replace(/\\+/g, '/') : '';
 }
 
 function writeSummary(path: string, action: FsWriteFileResult['action']): string {

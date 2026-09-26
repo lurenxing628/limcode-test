@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { decodeCanonicalBase64 } from '../capabilities/canonicalBase64';
 import { resolveWindowsPowerShell } from '../capabilities/windowsPowerShell';
+import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -154,7 +155,7 @@ export function processSpoolPath(binding: RootBinding, spoolLocatorInput: string
   const locator = requireLocator(spoolLocatorInput);
   const root = path.resolve(processSpoolRoot(binding));
   const candidate = path.resolve(root, locator);
-  if (!candidate.startsWith(`${root}${path.sep}`)) throw new Error('Process spool locator escapes the active RootBinding.');
+  if (!isPathBelow(root, candidate)) throw new Error('Process spool locator escapes the active RootBinding.');
   return candidate;
 }
 

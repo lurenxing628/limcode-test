@@ -1,5 +1,6 @@
 import { IconFileDescription } from '@tabler/icons-vue';
 import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from './types';
+import { normalizeDisplayPath } from '@shared/displayPath';
 
 type ReadFileMode = 'text' | 'attachment';
 
@@ -51,7 +52,7 @@ export const readFileToolDisplay: ToolDisplayResolver = (context) => {
 };
 
 function readFileInputSections(args: ReadFileArgs, context: ToolDisplayContext): ToolDisplaySection[] | undefined {
-  const path = normalizePath(args.path);
+  const path = normalizeDisplayPath(args.path);
   const attachmentId = normalizedText(args.attachmentId);
   const attachmentRef = normalizedText(args.attachmentRef);
   if (!path && !attachmentId && !attachmentRef) return undefined;
@@ -77,7 +78,7 @@ function readFileOutputSections(args: ReadFileArgs, context: ToolDisplayContext)
 
   const output = toolOutput(context.result);
   const record = outputRecord(output);
-  const path = normalizePath(record?.path) || normalizePath(args.path);
+  const path = normalizeDisplayPath(record?.path) || normalizeDisplayPath(args.path);
   const attachmentId = normalizedText(record?.attachmentId) || normalizedText(args.attachmentId);
   const displaySource = path || normalizedText(record?.name) || attachmentId;
   const mode: ReadFileMode = attachmentOutput(record) ? 'attachment' : args.mode ?? 'text';
@@ -191,10 +192,6 @@ function lineRangeSuffix(startLine: number | undefined, endLine: number | undefi
   if (start !== undefined) return `[L${start}-]`;
   if (end !== undefined) return `[L1-${end}]`;
   return '';
-}
-
-function normalizePath(path: string | undefined): string {
-  return path?.trim().replace(/\\+/g, '/') ?? '';
 }
 
 function normalizeLineNumber(value: number | undefined): number | undefined {

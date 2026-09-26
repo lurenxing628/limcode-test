@@ -97,6 +97,9 @@ jobs:
       - name: Run Windows storage and Wrapper regressions
         run: node --test --test-concurrency=1 tests/settingsRevisionConflict.test.cjs tests/storageLockRace.test.cjs tests/reliable-kernel/storage-lock-multiprocess.test.cjs tests/reliable-kernel/platform-runtime-compatibility.test.mjs tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs
 
+      - name: Run Windows path-shape regressions
+        run: node --test --test-concurrency=1 tests/reliable-kernel/path-shape-boundaries.test.mjs
+
   macos-runtime-tests:
     name: macOS runtime compatibility tests
     runs-on: macos-latest

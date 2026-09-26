@@ -16,6 +16,7 @@ import {
   createInstalledSmokeEvidence,
   validateInstalledSmokeCheck
 } from '../lib/installed-smoke-evidence.mjs';
+import { isPathBelow } from '../lib/path-containment.mjs';
 
 // package 出口校验器：stable check.id -> handler。
 // 只登记已有真实实现；其余 installed/migration/smoke checks 保持 PENDING。
@@ -224,7 +225,7 @@ function checkInstalledMainEntryDigest() {
   const vsixMain = readVsixMainEntry(requireArtifact());
   if (installedMain !== vsixMain) return `安装目录main ${installedMain}与VSIX ${vsixMain}不一致`;
   const installedMainPath = path.resolve(absoluteInstalledRoot, installedMain);
-  if (!installedMainPath.startsWith(`${absoluteInstalledRoot}${path.sep}`) || !fs.existsSync(installedMainPath)) {
+  if (!isPathBelow(absoluteInstalledRoot, installedMainPath) || !fs.existsSync(installedMainPath)) {
     return '安装目录main路径逃逸或缺失';
   }
   const installedDigest = crypto.createHash('sha256').update(fs.readFileSync(installedMainPath)).digest('hex');

@@ -590,7 +590,11 @@ function formatTime(value: number | undefined): string {
 function displayProjectUri(uri: string): string {
   try {
     const parsed = new URL(uri);
-    if (parsed.protocol === 'file:') return normalizeFilePath(decodeURIComponent(parsed.pathname));
+    if (parsed.protocol === 'file:') {
+      const filePath = normalizeFilePath(decodeURIComponent(parsed.pathname));
+      // UNC 项目（file://server/share/...）的主机名在 URL.host 里，不能只显示 pathname。
+      return parsed.host && parsed.host !== 'localhost' ? `//${decodeURIComponent(parsed.host)}${filePath}` : filePath;
+    }
   } catch {
     // keep raw uri
   }

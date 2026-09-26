@@ -23,11 +23,14 @@ import {
   executeRemoteServerScript,
   openRemoteServerReadStream,
   openRemoteServerWriteStream,
+  remoteHomeFor,
   remoteProjectRootPath,
   resolveRemotePath,
   shQuote,
   spawnRemoteServerScript
 } from './workEnvironmentProvider';
+import { isPathInside } from './filesystem/pathContainment';
+import { realPath } from './filesystem/realPath';
 
 const STREAM_HIGH_WATER_MARK = 1024 * 1024;
 const PROGRESS_THROTTLE_MS = 1000;
@@ -53,7 +56,7 @@ interface StreamHandle {
 
 interface Endpoint {
   environment: WorkEnvironmentRecord;
-  resolvePath(input: string): string;
+  resolvePath(input: string): Promise<string>;
   normalize(p: string): string;
   dirname(p: string): string;
   basename(p: string): string;
@@ -180,8 +183,8 @@ async function runTransfer(
   const from = createEndpoint(resolveEnvironment(item.fromEnvironment, context), context.signal, pathPolicy);
   const to = createEndpoint(resolveEnvironment(item.toEnvironment, context), context.signal, pathPolicy);
 
-  const sourcePath = from.resolvePath(item.fromPath);
-  let targetPath = to.resolvePath(item.toPath);
+  const sourcePath = await from.resolvePath(item.fromPath);
+  let targetPath = await to.resolvePath(item.toPath);
   const sourceStat = await from.stat(sourcePath);
   const kind: ResolvedKind = item.type === 'auto'
     ? (hasTrailingSlash(item.fromPath) ? 'directory' : sourceStat.type)
@@ -476,10 +479,7 @@ function canonicalLocalPath(input: string): string {
 }
 
 function isLocalPathInsideRoot(candidate: string, root: string): boolean {
-  const normalizedCandidate = canonicalLocalPath(candidate);
-  const normalizedRoot = canonicalLocalPath(root);
-  const relative = path.relative(normalizedRoot, normalizedCandidate);
-  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+  return isPathInside(canonicalLocalPath(root), canonicalLocalPath(candidate));
 }
 
 function assertLocalPathInsideRoot(candidate: string, root: string): void {
@@ -496,7 +496,7 @@ async function realpathNearestExistingLocal(candidate: string): Promise<string> 
   let current = candidate;
   for (;;) {
     try {
-      let resolved = await fsp.realpath(current);
+      let resolved = await realPath(current);
       for (let index = tail.length - 1; index >= 0; index -= 1) resolved = path.join(resolved, tail[index]);
       return resolved;
     } catch (error) {
@@ -518,7 +518,7 @@ class LocalEndpoint implements Endpoint {
     private readonly signal: AbortSignal | undefined,
     private readonly policy: TransferPathPolicy
   ) {}
-  resolvePath(input: string): string {
+  async resolvePath(input: string): Promise<string> {
     const text = normalizeString(input);
     if (!text) throw new Error('本地路径不能为空。');
     const root = localProjectRootPath(this.environment);
@@ -531,6 +531,12 @@ class LocalEndpoint implements Endpoint {
     const normalized = this.normalize(resolved);
     if (!this.policy.allowOutsideProjectPaths) {
       if (!root) throw new Error(`本地工作环境缺少 rootPath，无法限制项目外路径：${workEnvironmentDisplayName(this.environment)}`);
+      if (!isLocalPathInsideRoot(normalized, root)) {
+        // 根目录是符号链接/junction 时，模型可能给出它的真实路径：只换根前缀，不解析目标自身，guardPath 照常复核。
+        this.realRootPromise ??= realPath(root);
+        const realRoot = await this.realRootPromise;
+        if (isLocalPathInsideRoot(normalized, realRoot)) return path.join(root, path.relative(realRoot, normalized));
+      }
       assertLocalPathInsideRoot(normalized, root);
     }
     return normalized;
@@ -545,7 +551,7 @@ class LocalEndpoint implements Endpoint {
     const root = localProjectRootPath(this.environment);
     if (!root) throw new Error(`本地工作环境缺少 rootPath，无法限制项目外路径：${workEnvironmentDisplayName(this.environment)}`);
     assertLocalPathInsideRoot(p, root);
-    if (!this.realRootPromise) this.realRootPromise = fsp.realpath(root);
+    if (!this.realRootPromise) this.realRootPromise = realPath(root);
     const realRoot = await this.realRootPromise;
     const resolved = await realpathNearestExistingLocal(p);
     if (!isLocalPathInsideRoot(resolved, realRoot)) {
@@ -611,19 +617,24 @@ class LocalEndpoint implements Endpoint {
 }
 
 class RemoteCommandEndpoint implements Endpoint {
+  /** Login user's home once `~` appears in workdir/rootPath or a path; every path below is absolute after it. */
+  private home?: string;
   public constructor(
     public environment: WorkEnvironmentRecord,
     private readonly signal: AbortSignal | undefined,
     private readonly policy: TransferPathPolicy
   ) {}
-  resolvePath(input: string): string {
+  async resolvePath(input: string): Promise<string> {
     const text = normalizeString(input);
     if (!text) throw new Error('远端路径不能为空。');
-    const isAbsolute = text.replace(/\\/g, '/').startsWith('/');
-    const root = remoteProjectRootPath(this.environment);
+    this.home ??= await remoteHomeFor(this.environment, [text], this.signal);
+    const slashed = text.replace(/\\/g, '/');
+    const isAbsolute = slashed.startsWith('/') || slashed === '~' || slashed.startsWith('~/');
+    const root = remoteProjectRootPath(this.environment, this.home);
     if (!isAbsolute && !root) throw new Error(`远程工作环境缺少 workdir/rootPath，无法解析相对路径: ${text}`);
     return this.normalize(resolveRemotePath(text, this.environment, undefined, {
-      allowOutsideProjectPaths: this.policy.allowOutsideProjectPaths
+      allowOutsideProjectPaths: this.policy.allowOutsideProjectPaths,
+      home: this.home
     }));
   }
   // allowOutsideProjectPaths=false 时 resolveRemotePath 的词法限制可被符号链接绕过（root/link -> 外部目录），
@@ -638,7 +649,7 @@ class RemoteCommandEndpoint implements Endpoint {
   // 校验与操作在同一脚本内相邻执行，属 time-of-check；root 为 / 时不存在根外路径，词法策略已完备，直接放行。
   private withGuard(body: string, checks: Array<{ path: string; intent: TransferPathIntent }>): string {
     if (this.policy.allowOutsideProjectPaths || checks.length === 0) return body;
-    const root = remoteProjectRootPath(this.environment);
+    const root = remoteProjectRootPath(this.environment, this.home);
     if (!root || !path.posix.isAbsolute(root)) {
       throw new Error(`当前远程工作环境缺少绝对 workdir/rootPath，无法限制项目外路径：${workEnvironmentDisplayName(this.environment)}`);
     }

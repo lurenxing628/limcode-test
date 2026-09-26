@@ -112,7 +112,7 @@ function normalizePositiveInteger(value: string): number | undefined {
     </label>
     <label class="global-settings-field">
       <span>工作目录（可选）</span>
-      <input :value="environment.workdir ?? ''" :readonly="readonly" type="text" placeholder="例如：/root" @change="updateRemoteField('workdir', inputValue($event))" />
+      <input :value="environment.workdir ?? ''" :readonly="readonly" type="text" placeholder="例如：/root 或 ~/project" @change="updateRemoteField('workdir', inputValue($event))" />
     </label>
     <label class="global-settings-field">
       <span>操作系统（可选）</span>

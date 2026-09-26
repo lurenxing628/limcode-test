@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import type { Dir } from 'node:fs';
 import * as path from 'node:path';
 import { syncDirectoryDurably } from '../../capabilities/filesystem/durableDirectorySync';
+import { isPathInside } from '../../capabilities/filesystem/pathContainment';
 import type { RootBinding } from '../contracts';
 import type { RootAuthority } from '../rootAuthority';
 import { DEBUG_CAPTURE_LIMITS, type DebugCaptureEvent, type DebugCaptureManifest, type DebugCaptureSourceRef, type DebugCaptureStopReason } from '../../../shared/debugCapture';
@@ -258,7 +259,7 @@ export class DebugCaptureFiles {
 
   public async export(runId: string, target: string): Promise<void> {
     await this.withRead(runId, async root => {
-      if (path.resolve(target).startsWith(path.resolve(this.directory) + path.sep)) throw new Error('导出位置不能位于取证目录内。');
+      if (isPathInside(this.directory, target)) throw new Error('导出位置不能位于取证目录内。');
       await this.validate();
       await fs.mkdir(target, { recursive: false });
       for (const entry of await fs.readdir(root)) {

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { isPathInside } from '../capabilities/filesystem/pathContainment';
 import { PHYSICAL_CUTOVER_MANIFEST, type PhysicalCutoverManifestEntry } from './generatedPhysicalCutoverManifest';
 import {
   CUTOVER_CONTROL_DIRECTORY,
@@ -359,7 +360,7 @@ function safeJoinedPath(rootPath: string, relativePath: string): string {
   if (path.posix.isAbsolute(relativePath) || relativePath.includes('\\')) throw new Error('配置路径不是安全相对路径。');
   const root = path.resolve(rootPath);
   const absolute = path.resolve(root, ...relativePath.split('/'));
-  if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new Error('配置路径逃逸root。');
+  if (!isPathInside(root, absolute)) throw new Error('配置路径逃逸root。');
   return absolute;
 }
 

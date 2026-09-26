@@ -1,5 +1,6 @@
 import { IconBook } from '@tabler/icons-vue';
 import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from './types';
+import { normalizeDisplayPath } from '@shared/displayPath';
 
 interface SkillsArgs {
   name?: string;
@@ -50,7 +51,7 @@ function skillsOutputSections(context: ToolDisplayContext): ToolDisplaySection[]
   const record = outputRecord(output);
   if (!record) return undefined;
 
-  const path = normalizePath(record.entryPath);
+  const path = normalizeDisplayPath(record.entryPath);
   const loaded = [record.name?.trim(), record.source?.trim() ? `(${record.source.trim()})` : ''].filter(Boolean).join(' ');
   const title = ['技能内容', loaded, path].filter(Boolean).join(' · ');
 
@@ -73,10 +74,6 @@ function toolOutput(result: unknown): unknown {
 function outputRecord(value: unknown): SkillsOutputRecord | undefined {
   const record = asRecord(value);
   return record ? record as SkillsOutputRecord : undefined;
-}
-
-function normalizePath(path: string | undefined): string {
-  return path?.trim().replace(/\\+/g, '/') ?? '';
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

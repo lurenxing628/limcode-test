@@ -7,6 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { toSqliteFilePath } from './sqliteFilePath';
+import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { parseNativeResponseMetrics } from './nativeResponseMetrics';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
@@ -2764,7 +2765,7 @@ function assertPublishedContentObject(row: EncodedRow, casRootPath: string): voi
   if (storageKey !== expectedKey) throw new Error('ContentObject.storage_key does not match its digest.');
   if (typeof byteLength !== 'bigint' || byteLength < 0n) throw new Error('ContentObject.byte_length must be non-negative.');
   const absolutePath = path.resolve(casRootPath, ...expectedKey.split('/'));
-  if (!absolutePath.startsWith(`${path.resolve(casRootPath)}${path.sep}`)) throw new Error('ContentObject CAS path escapes the active root.');
+  if (!isPathBelow(path.resolve(casRootPath), absolutePath)) throw new Error('ContentObject CAS path escapes the active root.');
   const stat = fs.statSync(absolutePath);
   if (!stat.isFile() || BigInt(stat.size) !== byteLength) throw new Error('ContentObject CAS file is missing or has the wrong length.');
 }

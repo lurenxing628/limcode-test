@@ -10,6 +10,7 @@ import {
   assertRuntimeHostsOffline, runtimeMaintenanceClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance
 } from './runtimeHostControl';
 import { toSqliteFilePath } from './sqliteFilePath';
+import { isPathBelow, isSamePath } from '../capabilities/filesystem/pathContainment';
 import {
   listVscodeRuntimeDataSets,
   resolveVscodeRuntimeDataSet,
@@ -126,7 +127,7 @@ export async function deleteUnselectedRuntimeDataSet(
     // Claim release may leave its non-authoritative generation directory after a cleanup error.
     // Finish deleting this already-confirmed scope only after release, while configuration
     // admission still excludes new Hosts. Never recursively remove the shared configuration root.
-    if (path.resolve(candidate.runtimeScopeRootPath) !== configurationRootPath) {
+    if (!isSamePath(candidate.runtimeScopeRootPath, configurationRootPath)) {
       await fs.rm(candidate.runtimeScopeRootPath, { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
     }
     return result;
@@ -230,7 +231,7 @@ async function runtimeDataSetTrees(candidate: VscodeRuntimeDataSetCandidate): Pr
   const scope = path.resolve(candidate.runtimeScopeRootPath);
   // A default/legacy scope shares the configuration root. Never delete or count that whole root.
   const tree = scope === configuration ? path.join(scope, VSCODE_RUNTIME_CONTROL_DIRECTORY) : scope;
-  if (!tree.startsWith(`${configuration}${path.sep}`)) {
+  if (!isPathBelow(configuration, tree)) {
     throw new Error('Runtime data-set tree escapes its configuration root.');
   }
   const backups = path.join(scope, RUNTIME_SCOPE_BACKUPS_DIRECTORY);

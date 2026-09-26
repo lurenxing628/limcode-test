@@ -11,6 +11,7 @@ import { bridge, BridgeMessageType } from '@webview/transport';
 import { useCheckpointPolicyStore } from '@webview/stores/useCheckpointPolicyStore';
 import type { CheckpointRecord, CheckpointTimelineAnchorRecord } from '@shared/protocol';
 import type { ToolDisplayContext, ToolDisplayDiff, ToolDisplayResolver, ToolDisplaySection, ToolHeaderAction, ToolHeaderPreview } from './types';
+import { normalizeDisplayPath } from '@shared/displayPath';
 
 interface WriteArgs {
   path?: string;
@@ -112,7 +113,7 @@ export const deleteToolDisplay: ToolDisplayResolver = (context) => {
 
 
 function writeInputSections(args: WriteArgs, context: ToolDisplayContext): ToolDisplaySection[] {
-  const path = normalizePath(args.path);
+  const path = normalizeDisplayPath(args.path);
   if (!path) return [{ kind: 'input', title: '输入', text: context.stringifyValue(context.args) }];
   return [{
     kind: 'input',
@@ -126,7 +127,7 @@ function writeInputSections(args: WriteArgs, context: ToolDisplayContext): ToolD
 }
 
 function editInputSections(args: EditArgs, context: ToolDisplayContext): ToolDisplaySection[] {
-  const path = normalizePath(args.path);
+  const path = normalizeDisplayPath(args.path);
   if (!path) return [{ kind: 'input', title: '输入', text: context.stringifyValue(context.args) }];
   const mode = selectEditToolMode(args);
   return [{
@@ -160,7 +161,7 @@ function deleteInputSections(args: DeleteArgs, context: ToolDisplayContext): Too
   return [{
     kind: 'input',
     title: '请求删除路径',
-    rows: args.paths.map((path, index) => ({ label: String(index + 1), value: normalizePath(path) })),
+    rows: args.paths.map((path, index) => ({ label: String(index + 1), value: normalizeDisplayPath(path) })),
     rowStyle: 'lineNumber'
   }];
 }
@@ -202,7 +203,7 @@ function fileChangeOutputSections(title: string, output: FileChangeOutput | stri
     { label: '摘要', value: stringValue(output.summary) },
     { label: '状态', value: output.pending === true ? '等待应用' : undefined },
     { label: '错误', value: stringValue(output.error) },
-    { label: '路径', value: normalizePath(output.path) || undefined },
+    { label: '路径', value: normalizeDisplayPath(output.path) || undefined },
     { label: '修改方式', value: stringValue(output.mode) },
     { label: '操作', value: actionLabel(stringValue(output.action)) },
     { label: '修改数', value: editCountText(output) },
@@ -235,14 +236,14 @@ function diffFromOutput(output: FileChangeOutput | string | undefined): ToolDisp
 }
 
 function fileHeaderPreview(inputPath: string | undefined, output: FileChangeOutput | string | undefined): ToolHeaderPreview | undefined {
-  const path = normalizePath(inputPath);
+  const path = normalizeDisplayPath(inputPath);
   if (!path) return undefined;
   const fileName = extractFileName(path);
   if (!fileName) return undefined;
 
   const items = fileChangeItems(typeof output === 'object' ? output?.files : undefined);
   if (items.length > 0) {
-    const matched = items.find((item) => normalizePath(item.path) === path) ?? items[0];
+    const matched = items.find((item) => normalizeDisplayPath(item.path) === path) ?? items[0];
     return {
       fileName,
       filePath: path,
@@ -254,15 +255,15 @@ function fileHeaderPreview(inputPath: string | undefined, output: FileChangeOutp
 }
 
 function deleteHeaderPreview(paths: string[], output: FileChangeOutput | string | undefined): ToolHeaderPreview | undefined {
-  const firstPath = paths.length > 0 ? normalizePath(paths[0]) : undefined;
-  const path = firstPath ?? normalizePath(typeof output === 'object' ? output?.path : undefined);
+  const firstPath = paths.length > 0 ? normalizeDisplayPath(paths[0]) : undefined;
+  const path = firstPath ?? normalizeDisplayPath(typeof output === 'object' ? output?.path : undefined);
   if (!path) return undefined;
   const fileName = extractFileName(path);
   if (!fileName) return undefined;
 
   const items = fileChangeItems(typeof output === 'object' ? output?.files : undefined);
   if (items.length > 0) {
-    const matched = items.find((item) => normalizePath(item.path) === path) ?? items[0];
+    const matched = items.find((item) => normalizeDisplayPath(item.path) === path) ?? items[0];
     return {
       fileName,
       filePath: path,
@@ -384,7 +385,7 @@ function fileChangeItems(value: unknown): FileChangeItem[] {
   for (const item of value) {
     const record = asRecord(item);
     if (!record) continue;
-    const path = normalizePath(record.path);
+    const path = normalizeDisplayPath(record.path);
     if (!path) continue;
     const diff = asRecord(record.diff);
     result.push({
@@ -450,15 +451,15 @@ function deletePathRows(output: FileChangeOutput): Array<{ label: string; value:
   if (compact.length > 0) return compact;
 
   const explicitPaths = stringArray(output.paths);
-  if (explicitPaths.length > 0) return explicitPaths.map((path, index) => ({ label: String(index + 1), value: `${normalizePath(path)} · 成功` }));
+  if (explicitPaths.length > 0) return explicitPaths.map((path, index) => ({ label: String(index + 1), value: `${normalizeDisplayPath(path)} · 成功` }));
 
   const resultPaths = deleteResultPaths(output.results);
-  if (resultPaths.length > 0) return resultPaths.map((path, index) => ({ label: String(index + 1), value: `${normalizePath(path)} · 成功` }));
+  if (resultPaths.length > 0) return resultPaths.map((path, index) => ({ label: String(index + 1), value: `${normalizeDisplayPath(path)} · 成功` }));
 
   const changedFiles = stringArray(output.changedFiles);
-  if (changedFiles.length > 0) return changedFiles.map((path, index) => ({ label: String(index + 1), value: `${normalizePath(path)} · 成功` }));
+  if (changedFiles.length > 0) return changedFiles.map((path, index) => ({ label: String(index + 1), value: `${normalizeDisplayPath(path)} · 成功` }));
 
-  return fileChangeItems(output.files).map((item, index) => ({ label: String(index + 1), value: `${normalizePath(item.path)} · 成功` }));
+  return fileChangeItems(output.files).map((item, index) => ({ label: String(index + 1), value: `${normalizeDisplayPath(item.path)} · 成功` }));
 }
 
 function compactDeletePathRows(value: unknown): Array<{ label: string; value: string }> {
@@ -469,7 +470,7 @@ function compactDeletePathRows(value: unknown): Array<{ label: string; value: st
     const path = stringValue(record?.path);
     const success = booleanValue(record?.success);
     if (!path || success === undefined) continue;
-    rows.push({ label: String(rows.length + 1), value: `${normalizePath(path)} · ${success ? '成功' : '失败'}` });
+    rows.push({ label: String(rows.length + 1), value: `${normalizeDisplayPath(path)} · ${success ? '成功' : '失败'}` });
   }
   return rows;
 }
@@ -479,10 +480,6 @@ function deleteResultPaths(value: unknown): string[] {
   return value
     .map((item) => stringValue(asRecord(item)?.path))
     .filter((path): path is string => !!path?.trim());
-}
-
-function normalizePath(path: unknown): string {
-  return typeof path === 'string' ? path.trim().replace(/\\+/g, '/') : '';
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

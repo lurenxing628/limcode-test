@@ -104,6 +104,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',
   'tests/reliable-kernel/llm-provider-configs-native.test.mjs',
   'tests/reliable-kernel/tool-boundary-regressions.test.mjs',
+  'tests/reliable-kernel/path-shape-boundaries.test.mjs',
   'tests/reliable-kernel/model-system-prompt-prefix.test.mjs',
   'tests/reliable-kernel/native-astra-integration.test.mjs',
   'tests/reliable-kernel/native-compression-guard.test.mjs',

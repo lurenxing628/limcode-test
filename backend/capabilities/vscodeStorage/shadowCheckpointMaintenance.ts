@@ -3,6 +3,7 @@ import type { Dirent } from 'fs';
 import * as path from 'path';
 import type { ShadowRepositoryDiskStatRecord } from '../../../shared/protocol';
 import type { StoragePaths } from './paths';
+import { isPathBelow } from '../filesystem/pathContainment';
 
 const SCAN_TEMP_PREFIX = '.checkpoint-scan-';
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -98,6 +99,5 @@ function sanitizeStorageKey(raw: string): string | undefined {
 }
 
 function isInsideRoot(root: string, target: string): boolean {
-  const relative = path.relative(root, target);
-  return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+  return isPathBelow(root, target);
 }
