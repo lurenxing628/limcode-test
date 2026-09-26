@@ -57,7 +57,7 @@ vscode/extension.ts
 | 宿主归属 | `backend/reliableKernel/ConversationRuntimeOwnerManager.ts`、`runtimeHostControl.ts` | 对话独占、视图/后台生命周期、维护与宿主注册互斥；不替代 ExecutionLease |
 | Runtime 装配 | `backend/reliableKernel/runtimeApplication.ts` | 共享同一 RootBinding、RuntimeDatabase 与 CAS，组合控制面 |
 | Turn 队列控制 | `backend/reliableKernel/turnControlPlane.ts`、`turnGuidanceQueue.ts`、`turnCommandWire.ts` | Turn 主控制面、guidance 修订/暂停/取消/重排、共享命令身份与事务约束 |
-| 运行写入 | `backend/reliableKernel/runtimeDatabase.ts`、`databaseWorker.ts` | SQLite 事务、独立领域 mutation、提交后的 typed changes |
+| 运行写入 | `backend/reliableKernel/runtimeDatabase.ts`、`databaseWorker.ts`、`runtimeStatementCache.ts` | SQLite 事务、独立领域 mutation、提交后的 typed changes；worker 两个连接各自有界复用预编译语句（LRU 256，按 SQL 与结果模式做键，随连接关闭或 schema 变化作废） |
 | 客户端查询 | `backend/reliableKernel/clientProjection.ts`、`runtimeSqlRows.ts` | 只读记录投影、原子快照与历史页；通过受限接口读取 worker 已核验的 CAS 内容 |
 | 前端运行投影 | `backend/reliableKernel/clientFeed.ts`、`webviewFeedBridge.ts` | 有界 snapshot / changes、序列与会话隔离、历史按需读取 |
 | 配置权威 | `backend/reliableKernel/vscodeConfigurationAuthority.ts` | 读取独立配置 roots，冻结执行配置，不把配置迁入 Runtime SQLite |

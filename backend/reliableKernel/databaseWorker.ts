@@ -91,6 +91,13 @@ import {
   requireRuntimeId,
   sqlText
 } from './runtimeSqlRows';
+import {
+  type RuntimeStatementCache,
+  attachRuntimeStatementCache,
+  detachRuntimeStatementCache,
+  prepareCached,
+  prepareUncached
+} from './runtimeStatementCache';
 
 const CONTEXT_CAS_CACHE_MAX_ENTRIES = 4_096;
 const CONTEXT_CAS_CACHE_MAX_BYTES = 32 * 1024 * 1024;
@@ -210,6 +217,9 @@ async function start(): Promise<void> {
   configureTransactionChangeCapture(writer);
   const reader = new Database(toSqliteFilePath(data.binding.paths.databasePath), { readonly: true, fileMustExist: true });
   configureReaderConnection(reader);
+  // Prepared statements live exactly as long as these two connections of this worker.
+  const writerStatements = attachRuntimeStatementCache(writer);
+  const readerStatements = attachRuntimeStatementCache(reader);
   let commitSeq = 0n;
   let closed = false;
   const contextCasCache = new VerifiedContextCasCache();
@@ -227,6 +237,7 @@ async function start(): Promise<void> {
       transferList: readonly ArrayBuffer[] = []
     ) => postMeasuredResponse(response, request, receivedAtMs, transferList);
     try {
+      revalidateStatementCaches(writerStatements, readerStatements);
       if (request.kind === 'transaction') {
         assertDatabaseBinding(writer, data.binding);
         const result = executeTransaction(writer, request.steps, commitSeq + 1n);
@@ -406,13 +417,19 @@ async function start(): Promise<void> {
           readerForeignKeys: BigInt(reader.pragma('foreign_keys', { simple: true }) as number | bigint),
           readerBusyTimeoutMs: BigInt(reader.pragma('busy_timeout', { simple: true }) as number | bigint),
           currentCommitSeq: commitSeq.toString(),
-          contextCasCache: contextCasCache.inspect()
+          contextCasCache: contextCasCache.inspect(),
+          statementCache: {
+            writer: writerStatements.inspect(),
+            reader: readerStatements.inspect()
+          }
         };
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       assertDatabaseBinding(writer, data.binding);
       closed = true;
+      detachRuntimeStatementCache(reader);
+      detachRuntimeStatementCache(writer);
       reader.close();
       writer.close();
       respond({ type: 'response', id: request.id, ok: true, result: null });
@@ -421,6 +438,14 @@ async function start(): Promise<void> {
       respond({ type: 'response', id: request.id, ok: false, error: serializeError(error) });
     }
   });
+}
+
+/**
+ * Another connection that changes the main schema (never this worker: its only DDL is the TEMP
+ * change capture above) drops every cached Statement before the next request uses one.
+ */
+function revalidateStatementCaches(...caches: RuntimeStatementCache[]): void {
+  for (const cache of caches) cache.revalidateSchema();
 }
 
 function configureTransactionChangeCapture(database: Database.Database): void {
@@ -560,7 +585,7 @@ function configureTransactionChangeCapture(database: Database.Database): void {
 }
 
 function readTransactionChanges(database: Database.Database): RuntimeChange[] {
-  const rows = database.prepare(`
+  const rows = prepareCached(database, `
     SELECT current.sequence, current.domain, current.id, current.kind
       FROM runtime_transaction_change AS current
       JOIN (
@@ -592,7 +617,7 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
         return { ...row, record: projectConversationCommandReceiptRecord(database, row.id) };
       }
       const repository = DOMAIN_REPOSITORIES.domain(row.domain);
-      const raw = database.prepare(`SELECT * FROM ${quote(repository.schema.table)} WHERE id = ?`).get(row.id);
+      const raw = prepareCached(database, `SELECT * FROM ${quote(repository.schema.table)} WHERE id = ?`).get(row.id);
       if (!raw) throw new Error(`Committed upsert projection ${row.domain}/${row.id} is missing.`);
       let record = repository.codec.decode(raw as Record<string, unknown>);
       if (row.domain === 'TurnIntent') {
@@ -624,7 +649,7 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
         record = projectCollaborationMessageRecord(database, row.id, clientProjectionContent);
       }
       if (row.domain === 'RuntimeDelivery') {
-        const links = database.prepare(`
+        const links = prepareCached(database, `
           SELECT handled_at
             FROM runtime_delivery_input_link
            WHERE delivery_id = ?
@@ -689,10 +714,10 @@ function executeModelStreamEvent(
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
     assertExecutionLeaseFence(database, input.executionFence);
-    const requestRaw = database.prepare('SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
+    const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
     if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
     const request = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(requestRaw as Record<string, unknown>);
-    const existing = database.prepare(
+    const existing = prepareCached(database,
       'SELECT model_request_id, attempt_seq, socket_generation, stream_seq, checkpoint_kind, content_object_id '
         + 'FROM model_stream_checkpoint WHERE id = ? LIMIT 1'
     ).get(checkpointId) as {
@@ -726,10 +751,10 @@ function executeModelStreamEvent(
         ignoredReason: 'duplicate'
       };
     }
-    const fence = database.prepare(
+    const fence = prepareCached(database,
       'SELECT id FROM model_stream_fence WHERE model_request_id = ? LIMIT 1'
     ).get(modelRequestId);
-    const turn = database.prepare('SELECT status FROM turn WHERE id = ?').get(request.turn_id) as { status?: unknown } | undefined;
+    const turn = prepareCached(database, 'SELECT status FROM turn WHERE id = ?').get(request.turn_id) as { status?: unknown } | undefined;
     if (fence || request.status === 'terminal' || turn?.status !== 'active') {
       database.exec('ROLLBACK');
       return { accepted: false, checkpointed: false, terminal: true, ignoredReason: 'terminal' };
@@ -745,7 +770,7 @@ function executeModelStreamEvent(
       return { accepted: false, checkpointed: false, terminal: false, ignoredReason: 'old-socket-generation' };
     }
     if (input.checkpointKind === 'output_delta' || input.checkpointKind === 'output_item_done') {
-      const checkpointCountRow = database.prepare(`
+      const checkpointCountRow = prepareCached(database, `
         SELECT COUNT(*) AS count,
                COALESCE(SUM(CASE WHEN checkpoint_kind = 'output_delta' THEN 1 ELSE 0 END), 0) AS output_delta_count
           FROM model_stream_checkpoint
@@ -796,11 +821,11 @@ function executeModelStreamEvent(
       if (terminalIdentity.attemptSeq !== attemptSeq || terminalIdentity.socketGeneration !== socketGeneration) {
         throw new Error('Completed ModelStream terminalStats do not match the active stream identity.');
       }
-      const operation = database.prepare(
+      const operation = prepareCached(database,
         "SELECT id FROM operation WHERE owner_kind = 'model_request' AND owner_id = ? LIMIT 1"
       ).get(modelRequestId) as { id?: unknown } | undefined;
       if (typeof operation?.id !== 'string') throw new Error(`ModelRequest ${modelRequestId} has no Operation.`);
-      const attempt = database.prepare(
+      const attempt = prepareCached(database,
         'SELECT id FROM attempt WHERE operation_id = ? AND attempt_seq = ? LIMIT 1'
       ).get(operation.id, attemptSeq) as { id?: unknown } | undefined;
       if (typeof attempt?.id !== 'string') throw new Error(`ModelRequest ${modelRequestId} has no attempt ${attemptSeq}.`);
@@ -880,13 +905,13 @@ function executeModelStreamActivity(
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
     assertExecutionLeaseFence(database, input.executionFence);
-    const requestRaw = database.prepare('SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
+    const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
     if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
     const request = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(requestRaw as Record<string, unknown>);
-    const fence = database.prepare(
+    const fence = prepareCached(database,
       'SELECT id FROM model_stream_fence WHERE model_request_id = ? LIMIT 1'
     ).get(modelRequestId);
-    const turn = database.prepare('SELECT status FROM turn WHERE id = ?').get(request.turn_id) as { status?: unknown } | undefined;
+    const turn = prepareCached(database, 'SELECT status FROM turn WHERE id = ?').get(request.turn_id) as { status?: unknown } | undefined;
     if (fence || request.status === 'terminal' || turn?.status !== 'active') {
       database.exec('ROLLBACK');
       return { accepted: false, terminal: true };
@@ -949,7 +974,7 @@ function executeCancelCurrentModelRequest(
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
     assertExecutionLeaseFence(database, input.executionFence);
-    const requestRaw = database.prepare('SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
+    const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
     if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
     const request = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(requestRaw as Record<string, unknown>);
     const identity = decodeModelStreamIdentity(request.stream_stats_json);
@@ -962,15 +987,15 @@ function executeCancelCurrentModelRequest(
         socketGeneration: identity.socketGeneration.toString()
       };
     }
-    const fence = database.prepare(
+    const fence = prepareCached(database,
       'SELECT id FROM model_stream_fence WHERE model_request_id = ? LIMIT 1'
     ).get(modelRequestId);
     if (fence) throw new Error(`Active ModelRequest ${modelRequestId} unexpectedly has a terminal fence.`);
-    const operation = database.prepare(
+    const operation = prepareCached(database,
       "SELECT id FROM operation WHERE owner_kind = 'model_request' AND owner_id = ? LIMIT 1"
     ).get(modelRequestId) as { id?: unknown } | undefined;
     if (typeof operation?.id !== 'string') throw new Error(`ModelRequest ${modelRequestId} has no Operation.`);
-    const attempt = database.prepare(
+    const attempt = prepareCached(database,
       'SELECT id FROM attempt WHERE operation_id = ? AND attempt_seq = ? LIMIT 1'
     ).get(operation.id, identity.attemptSeq) as { id?: unknown } | undefined;
     if (typeof attempt?.id !== 'string') {
@@ -1019,7 +1044,7 @@ function assertExecutionLeaseFence(
   const ownerId = requireRuntimeId(fence.ownerId);
   const hostBootId = requireRuntimeId(fence.hostBootId);
   const generation = requirePositiveInteger(fence.generation, 'ExecutionLeaseFence.generation');
-  const row = database.prepare(
+  const row = prepareCached(database,
     'SELECT 1 AS present FROM execution_lease '
       + 'WHERE id = ? AND conversation_id = ? AND turn_id = ? AND owner_id = ? '
       + 'AND host_boot_id = ? AND generation = ? LIMIT 1'
@@ -1427,7 +1452,7 @@ function executeAssertion(
       parameters[name] = value;
     }
   }
-  const matched = database.prepare(
+  const matched = prepareCached(database,
     `SELECT 1 AS matched FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
   ).get(parameters);
   if (!matched) {
@@ -1469,7 +1494,7 @@ function executeAssertAll(
   const sql = `SELECT id FROM ${quote(repository.schema.table)}`
     + `${predicates.length ? ` WHERE ${predicates.join(' AND ')} AND (${violations.join(' OR ')})` : ` WHERE ${violations.join(' OR ')}`}`
     + ' LIMIT 1';
-  const violating = database.prepare(sql).get(parameters) as { id?: unknown } | undefined;
+  const violating = prepareCached(database, sql).get(parameters) as { id?: unknown } | undefined;
   if (violating) {
     const error = new Error(`${repository.name} transaction assertAll failed for ${String(violating.id)}.`) as Error & { code: string };
     error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
@@ -1501,7 +1526,7 @@ function executeAssertExactIds(
     if (repository.schema.key !== 'RuntimeDelivery') throw new TypeError('Collaboration backlog scope is only valid for RuntimeDelivery.');
     predicates.push(COLLABORATION_BACKLOG_PREDICATE);
   }
-  const actualIds = (database.prepare(
+  const actualIds = (prepareCached(database,
     `SELECT id FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} ORDER BY id ASC`
   ).all(parameters) as Array<{ id: unknown }>).map((row) => requireRuntimeId(row.id));
   const expected = [...expectedIds].map(requireRuntimeId).sort();
@@ -1520,7 +1545,7 @@ function executeAssertNone(database: Database.Database, domain: string, where: D
   const encoded = repository.codec.encodeWhere(where);
   const { predicates, parameters } = whereClause(encoded);
   if (predicates.length === 0) throw new Error(`${repository.name} assertNone requires predicates.`);
-  const matched = database.prepare(
+  const matched = prepareCached(database,
     `SELECT id FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
   ).get(parameters) as { id?: unknown } | undefined;
   if (matched) {
@@ -1562,7 +1587,7 @@ function executeMutation(
       }
     }
     if (schema.key === 'ModelStreamCheckpoint') {
-      const request = database.prepare('SELECT status FROM model_request WHERE id = ?').get(mutation.row.model_request_id) as {
+      const request = prepareCached(database, 'SELECT status FROM model_request WHERE id = ?').get(mutation.row.model_request_id) as {
         status?: unknown;
       } | undefined;
       if (request?.status !== 'terminal') {
@@ -1593,7 +1618,7 @@ function executeMutation(
       }
     }
     if (schema.key === 'Attempt') {
-      const operation = database.prepare('SELECT owner_kind FROM operation WHERE id = ?').get(row.operation_id) as {
+      const operation = prepareCached(database, 'SELECT owner_kind FROM operation WHERE id = ?').get(row.operation_id) as {
         owner_kind?: unknown;
       } | undefined;
       if (operation?.owner_kind === 'model_request') {
@@ -1624,7 +1649,7 @@ function executeMutation(
     if (schema.key === 'ContentObject') assertPublishedContentObject(encoded, data.binding.paths.casRootPath);
     const names = Object.keys(encoded);
     const sql = `INSERT INTO ${quote(schema.table)} (${names.map(quote).join(', ')}) VALUES (${names.map((name) => `@${name}`).join(', ')})`;
-    database.prepare(sql).run(encoded);
+    prepareCached(database, sql).run(encoded);
     if (schema.key === 'ModelRequest' && historicalCopy) historicalCopiesOf(allocatedSequences).add(id);
   } else if (mutation.kind === 'update') {
     const id = requireRuntimeId(mutation.id);
@@ -1632,7 +1657,7 @@ function executeMutation(
     assertRuntimeStateTransition(database, schema.key, id, mutation.patch);
     const encoded = repository.codec.encodePatch(mutation.patch);
     const assignments = Object.keys(encoded).map((name) => `${quote(name)} = @${name}`);
-    const result = database.prepare(`UPDATE ${quote(schema.table)} SET ${assignments.join(', ')} WHERE id = @__id`)
+    const result = prepareCached(database, `UPDATE ${quote(schema.table)} SET ${assignments.join(', ')} WHERE id = @__id`)
       .run({ ...encoded, __id: id });
     if (result.changes !== 1) throw new Error(`${schema.repository} update expected one row: ${id}`);
   } else if (mutation.kind === 'deleteWhere') {
@@ -1642,7 +1667,7 @@ function executeMutation(
     const encoded = repository.codec.encodeWhere(mutation.where);
     const { predicates, parameters } = whereClause(encoded);
     if (predicates.length === 0) throw new Error(`${schema.repository}.deleteWhere requires predicates.`);
-    const result = database.prepare(`DELETE FROM ${quote(schema.table)} WHERE ${predicates.join(' AND ')}`).run(parameters);
+    const result = prepareCached(database, `DELETE FROM ${quote(schema.table)} WHERE ${predicates.join(' AND ')}`).run(parameters);
     if (result.changes > mutation.maxChanges) {
       throw new Error(`${schema.repository}.deleteWhere exceeded ${mutation.maxChanges} row.`);
 
@@ -1652,7 +1677,7 @@ function executeMutation(
     if (schema.key === 'ModelStreamCheckpoint') {
       throw new Error('ModelStreamCheckpoint rows can only be pruned by the fixed writer stream-finalization operation.');
     }
-    const result = database.prepare(`DELETE FROM ${quote(schema.table)} WHERE id = ?`).run(id);
+    const result = prepareCached(database, `DELETE FROM ${quote(schema.table)} WHERE id = ?`).run(id);
     if (result.changes !== 1) throw new Error(`${schema.repository} delete expected one row: ${id}`);
   }
 }
@@ -1682,7 +1707,7 @@ function insertStreamFact(
   const repository = DOMAIN_REPOSITORIES.domain(domain);
   const encoded = repository.codec.encodeInsert(row);
   const names = Object.keys(encoded);
-  database.prepare(
+  prepareCached(database,
     `INSERT INTO ${quote(repository.schema.table)} (${names.map(quote).join(', ')}) `
       + `VALUES (${names.map((name) => `@${name}`).join(', ')})`
   ).run(encoded);
@@ -1694,7 +1719,7 @@ function executeCheckpointPrune(
 ): void {
   const modelRequestId = requireRuntimeId(mutation.modelRequestId);
   const terminalCheckpointId = requireRuntimeId(mutation.terminalCheckpointId);
-  const fence = database.prepare(`
+  const fence = prepareCached(database, `
     SELECT attempt_seq, socket_generation
       FROM model_stream_fence
      WHERE model_request_id = ?
@@ -1704,7 +1729,7 @@ function executeCheckpointPrune(
     fence?.attempt_seq !== mutation.attemptSeq
     || fence.socket_generation !== mutation.socketGeneration
   ) throw new Error('ModelStream checkpoint prune requires the matching terminal fence identity.');
-  const terminal = database.prepare(`
+  const terminal = prepareCached(database, `
     SELECT model_request_id, attempt_seq, socket_generation, checkpoint_kind
       FROM model_stream_checkpoint
      WHERE id = ?
@@ -1721,7 +1746,7 @@ function executeCheckpointPrune(
     || terminal.socket_generation !== mutation.socketGeneration
     || terminal.checkpoint_kind !== 'terminal_summary'
   ) throw new Error('ModelStream checkpoint prune requires the matching terminal summary.');
-  const retained = database.prepare(`
+  const retained = prepareCached(database, `
     SELECT id
       FROM model_stream_checkpoint
      WHERE model_request_id = ?
@@ -1737,10 +1762,10 @@ function executeCheckpointPrune(
     BigInt(MODEL_STREAM_TERMINAL_TAIL)
   ) as Array<{ id: string }>;
   const keep = new Set([terminalCheckpointId, ...retained.map((row) => requireRuntimeId(row.id))]);
-  const obsolete = database.prepare(
+  const obsolete = prepareCached(database,
     'SELECT id FROM model_stream_checkpoint WHERE model_request_id = ?'
   ).all(modelRequestId) as Array<{ id: string }>;
-  const deleteStatement = database.prepare('DELETE FROM model_stream_checkpoint WHERE id = ?');
+  const deleteStatement = prepareCached(database, 'DELETE FROM model_stream_checkpoint WHERE id = ?');
   for (const row of obsolete) {
     const id = requireRuntimeId(row.id);
     if (!keep.has(id)) deleteStatement.run(id);
@@ -1798,7 +1823,7 @@ function assertTouchedRuntimeAggregates(
     } else if (step.domain === 'Operation') {
       const id = step.kind === 'insert' ? step.row.id : 'id' in step ? step.id : null;
       if (typeof id === 'string') {
-        const owner = database.prepare('SELECT owner_kind, owner_id FROM operation WHERE id = ?').get(id) as {
+        const owner = prepareCached(database, 'SELECT owner_kind, owner_id FROM operation WHERE id = ?').get(id) as {
           owner_kind?: unknown;
           owner_id?: unknown;
         } | undefined;
@@ -1809,7 +1834,7 @@ function assertTouchedRuntimeAggregates(
     } else if (step.domain === 'Attempt') {
       const id = step.kind === 'insert' ? step.row.id : 'id' in step ? step.id : null;
       if (typeof id === 'string') {
-        const owner = database.prepare(`
+        const owner = prepareCached(database, `
           SELECT operation.owner_kind, operation.owner_id
             FROM attempt
             JOIN operation ON operation.id = attempt.operation_id
@@ -1828,25 +1853,25 @@ function assertTouchedRuntimeAggregates(
   };
   steps.forEach(visit);
   for (const turnId of turnIds) {
-    const turn = database.prepare('SELECT status FROM turn WHERE id = ?').get(turnId) as { status?: unknown } | undefined;
+    const turn = prepareCached(database, 'SELECT status FROM turn WHERE id = ?').get(turnId) as { status?: unknown } | undefined;
     if (turn?.status === 'active') continue;
-    const requests = database.prepare('SELECT id FROM model_request WHERE turn_id = ?').all(turnId) as Array<{ id: string }>;
+    const requests = prepareCached(database, 'SELECT id FROM model_request WHERE turn_id = ?').all(turnId) as Array<{ id: string }>;
     for (const request of requests) modelRequestIds.add(requireRuntimeId(request.id));
   }
   for (const modelRequestId of modelRequestIds) assertModelRequestAggregate(database, modelRequestId);
 }
 
 function assertModelRequestAggregate(database: Database.Database, modelRequestId: string): void {
-  const requestRaw = database.prepare('SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
+  const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
   if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
   const request = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(requestRaw as Record<string, unknown>);
   const identity = decodeModelStreamIdentity(request.stream_stats_json);
-  const operations = database.prepare(
+  const operations = prepareCached(database,
     "SELECT id, status FROM operation WHERE owner_kind = 'model_request' AND owner_id = ?"
   ).all(modelRequestId) as Array<{ id: string; status: string }>;
   if (operations.length !== 1) throw new Error(`ModelRequest ${modelRequestId} must own exactly one Operation.`);
   const operation = operations[0];
-  const attempts = database.prepare(
+  const attempts = prepareCached(database,
     'SELECT id, attempt_seq, status, completed_at FROM attempt WHERE operation_id = ? ORDER BY attempt_seq'
   ).all(operation.id) as Array<{ id: string; attempt_seq: bigint; status: string; completed_at: string | null }>;
   if (attempts.length < 1 || attempts.length > 11) {
@@ -1866,7 +1891,7 @@ function assertModelRequestAggregate(database: Database.Database, modelRequestId
   if (priorAttempts.some((attempt) => attempt.status !== 'transient_failed' || attempt.completed_at === null)) {
     throw new Error(`ModelRequest ${modelRequestId} prior Attempts must be durably transient_failed.`);
   }
-  const fence = database.prepare('SELECT * FROM model_stream_fence WHERE model_request_id = ?').get(modelRequestId) as {
+  const fence = prepareCached(database, 'SELECT * FROM model_stream_fence WHERE model_request_id = ?').get(modelRequestId) as {
     attempt_seq?: unknown;
     socket_generation?: unknown;
     outcome?: unknown;
@@ -1942,7 +1967,7 @@ function assertRuntimeStateTransition(
   patch: DomainRow
 ): void {
   if (domain === 'RuntimeDelivery') {
-    const current = database.prepare('SELECT state FROM runtime_delivery WHERE id = ?').get(id) as {
+    const current = prepareCached(database, 'SELECT state FROM runtime_delivery WHERE id = ?').get(id) as {
       state?: unknown;
     } | undefined;
     if (!current || typeof current.state !== 'string') {
@@ -1960,7 +1985,7 @@ function assertRuntimeStateTransition(
     return;
   }
   if (domain === 'RuntimeDeliveryInputLink') {
-    const current = database.prepare('SELECT handled_at FROM runtime_delivery_input_link WHERE id = ?').get(id) as {
+    const current = prepareCached(database, 'SELECT handled_at FROM runtime_delivery_input_link WHERE id = ?').get(id) as {
       handled_at?: unknown;
     } | undefined;
     if (!current) throw new Error(`RuntimeDeliveryInputLinkRepository update expected one row: ${id}`);
@@ -1979,7 +2004,7 @@ function assertRuntimeStateTransition(
     return;
   }
   if (domain === 'ModelRequest') {
-    const raw = database.prepare('SELECT * FROM model_request WHERE id = ?').get(id);
+    const raw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(id);
     if (!raw) throw new Error(`ModelRequestRepository update expected one row: ${id}`);
     const current = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(raw as Record<string, unknown>);
     const currentStatus = String(current.status);
@@ -2029,7 +2054,7 @@ function assertRuntimeStateTransition(
   const ownerJoin = domain === 'Attempt'
     ? 'SELECT current.status, owner.owner_kind FROM attempt AS current JOIN operation AS owner ON owner.id = current.operation_id WHERE current.id = ?'
     : 'SELECT current.status, current.owner_kind FROM operation AS current WHERE current.id = ?';
-  const current = database.prepare(ownerJoin).get(id) as { status?: unknown; owner_kind?: unknown } | undefined;
+  const current = prepareCached(database, ownerJoin).get(id) as { status?: unknown; owner_kind?: unknown } | undefined;
   if (!current || current.owner_kind !== 'model_request') return;
   const currentStatus = String(current.status);
   const nextStatus = 'status' in patch ? String(patch.status) : currentStatus;
@@ -2058,7 +2083,7 @@ function assertClaimedOutboxTransition(
   terminalTimestampColumn: 'completed_at' | 'acknowledged_at',
   successState: 'completed' | 'acknowledged'
 ): void {
-  const raw = database.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id);
+  const raw = prepareCached(database, `SELECT * FROM ${table} WHERE id = ?`).get(id);
   if (!raw) throw new Error(`${domain}Repository update expected one row: ${id}`);
   const current = DOMAIN_REPOSITORIES.codec(domain).decode(raw as Record<string, unknown>);
   const currentState = String(current.state);
@@ -2139,7 +2164,7 @@ function allocateNextSequence(
     }
   }
   const sql = `SELECT COALESCE(MAX(${quote(allocation.column)}), 0) + 1 AS next_value FROM ${quote(repository.schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''}`;
-  const result = database.prepare(sql).get(parameters) as { next_value: bigint };
+  const result = prepareCached(database, sql).get(parameters) as { next_value: bigint };
   if (typeof result.next_value !== 'bigint' || result.next_value <= 0n) throw new Error('SQLite sequence allocation failed.');
   return { ...mutation.row, [allocation.column]: result.next_value };
 }
@@ -2191,7 +2216,7 @@ function executeContextMaterialization(
   database.exec('BEGIN');
   try {
     const rootRepository = DOMAIN_REPOSITORIES.domain('ContextSequenceRoot');
-    const rawRoot = database.prepare('SELECT * FROM context_sequence_root WHERE id = ?').get(normalizedRootId);
+    const rawRoot = prepareCached(database, 'SELECT * FROM context_sequence_root WHERE id = ?').get(normalizedRootId);
     if (!rawRoot) throw new Error(`ContextSequenceRoot ${normalizedRootId} does not exist.`);
     const root = rootRepository.codec.decode(rawRoot as Record<string, unknown>);
     const rootNodeId = nullableRuntimeId(root.root_node_id, 'ContextSequenceRoot.root_node_id');
@@ -2331,7 +2356,7 @@ function readContextChain(
   count: number
 ): ContextMaterializationRecord[] {
   if (count <= 0) throw new Error('Context chain with a start node requires a positive segment count.');
-  const rows = database.prepare(`
+  const rows = prepareCached(database, `
     WITH RECURSIVE chain(id, parent_node_id, segment_id, created_at, depth) AS (
       SELECT id, parent_node_id, segment_id, created_at, 1
         FROM context_sequence_node
@@ -2367,7 +2392,7 @@ function readContextChain(
 }
 
 function readContextRecord(database: Database.Database, nodeId: string): ContextMaterializationRecord {
-  const row = database.prepare(`
+  const row = prepareCached(database, `
     SELECT node.id AS node_id,
            node.parent_node_id AS node_parent_node_id,
            node.segment_id AS node_segment_id,
@@ -2409,7 +2434,8 @@ function decodeContextRecords(
   for (let offset = 0; offset < messageSegmentIds.length; offset += 500) {
     const chunk = messageSegmentIds.slice(offset, offset + 500);
     const placeholders = chunk.map(() => '?').join(',');
-    const sourceRows = database.prepare(`
+    // One placeholder per segment: every chunk length is another SQL text, so it is never cached.
+    const sourceRows = prepareUncached(database, `
       SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role,
              model_request.provider_id AS source_provider_id,
              model_request.model_id AS source_model_id,
@@ -2662,7 +2688,7 @@ function executeToolFactsSnapshot(
 function executeProcessOutputRegistrationMismatches(
   database: Database.Database
 ): ProcessOutputRegistrationMismatch[] {
-  const rows = database.prepare(`
+  const rows = prepareCached(database, `
     SELECT process.id AS process_id,
            CAST(process.retained_chunks AS TEXT) AS expected_chunks,
            CAST(COUNT(chunk.id) AS TEXT) AS registered_chunks,
@@ -2696,7 +2722,7 @@ function executeProcessOutputRegistrationMismatches(
 function executeEffectReceiptReconciliationCandidates(
   database: Database.Database
 ): EffectReceiptReconciliationCandidate[] {
-  const rows = database.prepare(`
+  const rows = prepareCached(database, `
     SELECT intent.id AS effect_intent_id, receipt.id AS effect_receipt_id
       FROM tool_call AS tool_call_row INDEXED BY ix_tool_call_02
       CROSS JOIN operation AS operation_row
@@ -2738,7 +2764,7 @@ function executeEffectReceiptReconciliationCandidates(
 function executeChildConversationOriginCandidates(
   database: Database.Database
 ): ChildConversationOriginCandidate[] {
-  const rows = database.prepare(`
+  const rows = prepareCached(database, `
     SELECT child.id AS child_execution_id
       FROM child_execution AS child
       LEFT JOIN conversation_origin_link AS origin
@@ -2752,7 +2778,7 @@ function executeChildConversationOriginCandidates(
 function executeChildProcessCleanupMaterializationCandidates(
   database: Database.Database
 ): ChildProcessCleanupMaterializationCandidate[] {
-  const rows = database.prepare(`
+  const rows = prepareCached(database, `
     SELECT turn_link.id AS turn_link_id,
            turn_link.interruption_request_id AS interruption_request_id,
            turn_link.turn_id AS turn_id,
@@ -2786,7 +2812,7 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
   const repository = DOMAIN_REPOSITORIES.domain(read.domain);
   const schema = repository.schema;
   if (read.kind === 'get') {
-    const row = database.prepare(`SELECT * FROM ${quote(schema.table)} WHERE id = ?`).get(requireRuntimeId(read.id));
+    const row = prepareCached(database, `SELECT * FROM ${quote(schema.table)} WHERE id = ?`).get(requireRuntimeId(read.id));
     return row ? repository.codec.decode(row as Record<string, unknown>) : null;
   }
   if (!Number.isSafeInteger(read.limit) || read.limit <= 0 || read.limit > 1000) {
@@ -2832,7 +2858,7 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
   }
   parameters.__limit = BigInt(read.limit);
   const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction}${orderColumn === 'id' ? '' : `, id ${direction}`} LIMIT @__limit`;
-  return (database.prepare(sql).all(parameters) as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));
+  return (prepareCached(database, sql).all(parameters) as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));
 }
 
 function requireBackupDestination(value: unknown, dataRootPath: string): string {

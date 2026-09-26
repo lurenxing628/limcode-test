@@ -129,4 +129,4 @@ Extension Development Host 中运行：
 Limcode test: Inspect Reliability State (Development)
 ```
 
-输出中的 `diagnostics.events` 是原始脱敏事件，`diagnostics.spans` 是上述三类链路的有界聚合；`database.contextCasCache` 同时展示长上下文 CAS LRU 的 entries/bytes/hits/misses/evictions。
+输出中的 `diagnostics.events` 是原始脱敏事件，`diagnostics.spans` 是上述三类链路的有界聚合；`database.contextCasCache` 同时展示长上下文 CAS LRU 的 entries/bytes/hits/misses/evictions；`database.statementCache.writer/reader` 展示 SQLite worker 两个连接预编译语句 LRU 的 entries/prepares/hits/misses/evictions/busyBypasses/uncached/invalidations（只有计数，不含 SQL 文本）。

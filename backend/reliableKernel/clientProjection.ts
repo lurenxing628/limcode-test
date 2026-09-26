@@ -55,6 +55,7 @@ import type {
 import { answerSubmissionClientOutcome } from './answerSubmissionOutcome';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { quote, requireNonNegativeIntegerString, requireRuntimeId } from './runtimeSqlRows';
+import { prepareCached, prepareUncached } from './runtimeStatementCache';
 
 /**
  * Verified CAS content reading owned by the database worker. Client projection receives only this
@@ -196,12 +197,12 @@ export function projectTurnClientRecord(
   turnId: string,
   content: ClientProjectionContentAccess
 ): DomainRow {
-  const raw = database.prepare('SELECT * FROM turn WHERE id = ?').get(turnId);
+  const raw = prepareCached(database, 'SELECT * FROM turn WHERE id = ?').get(turnId);
   if (!raw) throw new Error(`Turn ${turnId} does not exist.`);
   const record = DOMAIN_REPOSITORIES.codec('Turn').decode(raw as Record<string, unknown>);
   if (record.status !== 'active') return record;
 
-  const sources = database.prepare(`
+  const sources = prepareCached(database, `
     SELECT content.*
       FROM turn_intent AS intent
       JOIN turn_intent_revision AS revision ON revision.intent_id = intent.id
@@ -238,7 +239,7 @@ export function projectTurnClientRecord(
     : typeof intent.editedMessageRevisionId === 'string'
       ? intent.editedMessageRevisionId.trim()
       : '';
-  const membership = database.prepare(`
+  const membership = prepareCached(database, `
     SELECT membership.conversation_id
       FROM message_part_of_conversation AS membership
      WHERE membership.message_id = ?
@@ -423,7 +424,7 @@ function childToolArgumentPreview(
 ): string | undefined {
   try {
     const contentObjectId = String(tool.arguments_object_id);
-    const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
+    const raw = prepareCached(database, 'SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
     if (!raw) return undefined;
     const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
     if (
@@ -475,10 +476,10 @@ export function projectProcessRecord(
   processId: string,
   content: ClientProjectionContentAccess
 ): DomainRow {
-  const raw = database.prepare('SELECT * FROM process WHERE id = ?').get(processId);
+  const raw = prepareCached(database, 'SELECT * FROM process WHERE id = ?').get(processId);
   if (!raw) throw new Error(`Process ${processId} does not exist.`);
   const record = DOMAIN_REPOSITORIES.codec('Process').decode(raw as Record<string, unknown>);
-  const source = database.prepare(`
+  const source = prepareCached(database, `
     SELECT arguments.*
       FROM process_origin_link AS origin
       JOIN tool_call AS call ON call.id = origin.tool_call_id
@@ -507,7 +508,7 @@ export function projectProcessRecord(
       argumentsProjectionState = 'error';
     }
   }
-  const detached = database.prepare(`
+  const detached = prepareCached(database, `
     SELECT 1
       FROM operation
       JOIN attempt ON attempt.operation_id = operation.id
@@ -533,10 +534,10 @@ export function projectCollaborationMessageRecord(
   messageId: string,
   content: ClientProjectionContentAccess
 ): DomainRow {
-  const raw = database.prepare('SELECT * FROM collaboration_message WHERE id = ?').get(messageId);
+  const raw = prepareCached(database, 'SELECT * FROM collaboration_message WHERE id = ?').get(messageId);
   if (!raw) throw new Error(`CollaborationMessage ${messageId} does not exist.`);
   const record = DOMAIN_REPOSITORIES.codec('CollaborationMessage').decode(raw as Record<string, unknown>);
-  const payloads = database.prepare(`
+  const payloads = prepareCached(database, `
     SELECT payload.*
       FROM collaboration_message_payload_link AS link
       JOIN content_object AS payload ON payload.id = link.content_object_id
@@ -606,7 +607,7 @@ function queryFirstUserRevisionsForCollaborationPeers(
   // The peer title is optional presentation, not a reason to replay a very long conversation.
   // The epoch-5 membership index orders by (conversation_id,message_seq); MATERIALIZED prevents
   // the user-role filter from widening the read past the first 256 immutable memberships.
-  const statement = database.prepare(`
+  const statement = prepareCached(database, `
     WITH earliest AS MATERIALIZED (
       SELECT message_id, message_seq
         FROM message_part_of_conversation INDEXED BY ux_message_part_of_conversation_01
@@ -635,8 +636,8 @@ function readFirstUserTitleContent(
   content: ClientProjectionContentAccess
 ): MessageContent | undefined {
   try {
-    const revision = database.prepare('SELECT content_object_id FROM message_revision WHERE id = ?').get(revisionId) as { content_object_id?: unknown } | undefined;
-    const raw = revision ? database.prepare('SELECT * FROM content_object WHERE id = ?').get(String(revision.content_object_id)) : undefined;
+    const revision = prepareCached(database, 'SELECT content_object_id FROM message_revision WHERE id = ?').get(revisionId) as { content_object_id?: unknown } | undefined;
+    const raw = revision ? prepareCached(database, 'SELECT * FROM content_object WHERE id = ?').get(String(revision.content_object_id)) : undefined;
     if (!raw) return undefined;
     const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
     if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length > PEER_TITLE_CONTENT_MAX_BYTES) return undefined;
@@ -805,7 +806,7 @@ export function executeClientProjectionSnapshot(
        ORDER BY membership.message_seq DESC, m.id DESC
        LIMIT @messageLimit
     `, { conversationId, messageLimit: BigInt(CLIENT_MESSAGE_WINDOW_LIMIT) }).reverse();
-    const messageSummary = database.prepare(`
+    const messageSummary = prepareCached(database, `
       SELECT COUNT(CASE WHEN m.deleted_at IS NULL AND revision.role IN ('user', 'model') THEN 1 END) AS visible_message_count,
              COALESCE(MAX(membership.message_seq), 0) AS last_message_seq
         FROM message_part_of_conversation AS membership
@@ -1415,7 +1416,7 @@ function taskListProjectionFromOutcome(
   if (!outcome || outcome.content_object_id === null) return { items: null, detail_on_demand: false };
   if (outcome.status !== 'succeeded') return { items: null, detail_on_demand: false };
   const contentObjectId = requireRuntimeId(outcome.content_object_id);
-  const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
+  const raw = prepareCached(database, 'SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
   if (!raw) throw new Error(`Task-list ToolOutcome ${toolCallId} references missing ContentObject ${contentObjectId}.`);
   const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
   if (
@@ -1593,7 +1594,7 @@ function readTaskProjectionJson(
   content: ClientProjectionContentAccess
 ): unknown {
   const contentObjectId = requireRuntimeId(contentObjectIdValue);
-  const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
+  const raw = prepareCached(database, 'SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
   if (!raw) throw new Error(`${label} references missing ContentObject ${contentObjectId}.`);
   const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
   const bytes = content.readVerifiedBytes(metadata);
@@ -1640,7 +1641,7 @@ export function executeConversationHistoryProjection(
   database.exec('BEGIN');
   try {
     const totalQuery = conversationHistoryTotalQuery(input);
-    const totalRow = database.prepare(totalQuery.sql).get(totalQuery.params) as { total: bigint };
+    const totalRow = prepareCached(database, totalQuery.sql).get(totalQuery.params) as { total: bigint };
     const page = conversationHistoryPageSeed(database, scope, input, Number(totalRow.total));
     const { seedRows, hasMore } = page;
     const seedIds = seedRows.map((row) => String(row.id));
@@ -1656,7 +1657,7 @@ export function executeConversationHistoryProjection(
     }
     const seedParameters = Object.fromEntries(seedIds.map((id, index) => [`seed${index}`, id]));
     const seedValues = seedIds.map((_id, index) => `(@seed${index})`).join(',');
-    const conversations = queryPlainRows(database, `
+    const conversations = queryIdListRows(database, `
       WITH seed(id) AS (
         VALUES ${seedValues}
       ), page_conversation(id) AS (
@@ -2213,7 +2214,7 @@ export function executeClientCollaborationHistoryPage(
         messageParameters[`message${index}`] = id;
         return `@message${index}`;
       });
-      const deliveries = queryPlainRows(database, `
+      const deliveries = queryIdListRows(database, `
         SELECT delivery.* FROM collaboration_message_target_link AS target
         JOIN runtime_delivery AS delivery ON delivery.id = (
           SELECT newest.id FROM runtime_delivery AS newest
@@ -2401,12 +2402,25 @@ function buildClientVisibleMessageHistoryRecords(
   return records;
 }
 
+/** Fixed SQL text: reuses the connection's prepared Statement. */
 function queryPlainRows(
   database: Pick<Database.Database, 'prepare'>,
   sql: string,
   parameters: Record<string, string | bigint | null> = {}
 ): Array<Record<string, unknown>> {
-  return database.prepare(sql).all(parameters) as Array<Record<string, unknown>>;
+  return prepareCached(database, sql).all(parameters) as Array<Record<string, unknown>>;
+}
+
+/**
+ * SQL text that embeds one placeholder per id: each list length is a different text, so it is
+ * prepared for this call only and never enters the bounded statement cache.
+ */
+function queryIdListRows(
+  database: Pick<Database.Database, 'prepare'>,
+  sql: string,
+  parameters: Record<string, string | bigint | null> = {}
+): Array<Record<string, unknown>> {
+  return prepareUncached(database, sql).all(parameters) as Array<Record<string, unknown>>;
 }
 
 function mergeRowsById(rows: readonly Record<string, unknown>[]): Array<Record<string, unknown>> {
@@ -2517,7 +2531,7 @@ export function queryCollaborationMessagesForTurns(
     return `@turn${index}`;
   }).join(',');
   const inLoadedTurns = (column: string) => turnList ? `${column} IN (${turnList})` : '0';
-  return queryPlainRows(database, `
+  return queryIdListRows(database, `
     SELECT message.*
       FROM collaboration_message AS message
      WHERE message.id IN (
@@ -2583,7 +2597,7 @@ function queryVisibleMessageRowsByIds(
       parameters[`message${index}`] = id;
       return `@message${index}`;
     });
-    rows.push(...queryPlainRows(database, `
+    rows.push(...queryIdListRows(database, `
       WITH visible_messages AS (
         SELECT message.id,
                membership.conversation_id,
@@ -2634,7 +2648,7 @@ function queryLatestToolCallEvents(
       parameters[`tool${index}`] = id;
       return `@tool${index}`;
     });
-    rows.push(...queryPlainRows(database, `
+    rows.push(...queryIdListRows(database, `
       SELECT *
         FROM (
           SELECT event.*,
@@ -2666,7 +2680,7 @@ function queryLatestChildExecutionTurnLinks(
       parameters[`child${index}`] = id;
       return `@child${index}`;
     });
-    rows.push(...queryPlainRows(database, `
+    rows.push(...queryIdListRows(database, `
       SELECT id, child_execution_id, turn_seq, turn_id, created_at
         FROM (
           SELECT link.*,
@@ -2705,7 +2719,7 @@ function queryByIds(
   const parentPriority = unique
     .map((_id, index) => `WHEN @id${index} THEN ${index}`)
     .join(' ');
-  return queryPlainRows(database, `
+  return queryIdListRows(database, `
     SELECT ${quote(table)}.*
       FROM ${quote(table)}
      WHERE ${quote(column)} IN (${placeholders.join(',')})
@@ -2740,7 +2754,7 @@ function queryAllByIds(
       parameters[`id${index}`] = id;
       return `@id${index}`;
     });
-    rows.push(...queryPlainRows(database, `
+    rows.push(...queryIdListRows(database, `
       SELECT * FROM ${quote(table)}
        WHERE ${quote(column)} IN (${placeholders.join(',')})
        ORDER BY id ASC
@@ -2830,7 +2844,7 @@ function queryConversationIdChunks(
       parameters[`conversation${index}`] = id;
       return `@conversation${index}`;
     }).join(',');
-    rows.push(...queryPlainRows(database, sql(placeholders), parameters));
+    rows.push(...queryIdListRows(database, sql(placeholders), parameters));
   }
   return rows;
 }
@@ -2855,7 +2869,7 @@ function queryConversationModelRequests(
             AND visible_link.message_id IN (${visiblePlaceholders.join(',')})
        )`
     : '';
-  return queryPlainRows(database, `
+  return queryIdListRows(database, `
     WITH independent_request_tail AS (
       SELECT request.id
         FROM model_request AS request

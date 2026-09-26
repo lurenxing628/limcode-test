@@ -7,6 +7,7 @@ import type {
   RepositoryTransactionStep
 } from './repositories';
 import type { DatabaseFoundationInspection } from './databaseSchema';
+import type { RuntimeStatementCacheCounters } from './runtimeStatementCache';
 import type {
   ActiveTurnWorkEnvironmentProjection,
   ChildConversationBoundaryProjection
@@ -323,6 +324,11 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
     hits: number;
     misses: number;
     evictions: number;
+  };
+  /** Bounded prepared-statement LRU of each worker connection; counters only, never SQL text. */
+  statementCache: {
+    writer: RuntimeStatementCacheCounters;
+    reader: RuntimeStatementCacheCounters;
   };
 }
 
