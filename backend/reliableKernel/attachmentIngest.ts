@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { decodeCanonicalBase64 as decodeCanonicalBase64Value } from '../capabilities/canonicalBase64';
+import { sqliteDatabaseFileRefusal, sqliteDatabaseFileRefusalMessage } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -698,6 +699,9 @@ async function readLocalAttachmentBytes(
   maxBytes: bigint | undefined,
   label: string
 ): Promise<Buffer> {
+  // The bytes are read in the extension host process, which also holds SQLite connections.
+  const refusal = await sqliteDatabaseFileRefusal(sourcePath);
+  if (refusal) throw new AttachmentContentError(`${label}: ${sqliteDatabaseFileRefusalMessage(refusal)}`);
   let metadata;
   try {
     metadata = await fs.stat(sourcePath, { bigint: true });

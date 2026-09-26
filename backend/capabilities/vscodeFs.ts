@@ -34,6 +34,7 @@ import {
 import { sliceTextFile } from './textFileSlice';
 import { isPathInside } from './filesystem/pathContainment';
 import { realPath } from './filesystem/realPath';
+import { assertNotSqliteDatabaseFile } from './filesystem/sqliteDatabaseFileGuard';
 import { buildFileDiffRecord, buildFileReplacementHunks } from './fileDiff';
 import { applyHunkEdit, applyInsertEdit, applyDeleteEdit } from './editStrategies';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS, LIVE_DIFF_SCHEME } from '../../shared/extensionIdentity';
@@ -674,6 +675,8 @@ async function resolveWorkspacePath(
     assertLocalPathInsideAnyRoot(uri, roots);
   }
   if (resolveOptions.rejectProjectRoot === true) assertSafeLocalDeleteTarget(uri, allowedLocalRootUris(options));
+  // Every local read, write, edit and delete below opens the file in the extension host process.
+  await assertNotSqliteDatabaseFile(uri.fsPath, { recursive: resolveOptions.rejectProjectRoot === true });
   return uri;
 }
 

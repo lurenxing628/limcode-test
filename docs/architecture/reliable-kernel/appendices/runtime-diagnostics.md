@@ -76,6 +76,8 @@ WAL：每 60 秒对 `-wal` 做一次 `stat()` 取大小，每 5 分钟写一条 
 
 **持有 SQLite 连接的进程不得 open/read/close `limcode.sqlite`、`-wal` 或 `-shm`**（`stat` 不打开描述符，可以使用）。SQLite 的 unix VFS 在主库和 `-shm` 上持有 POSIX fcntl 锁（写锁、读标记、DMS）；按 POSIX 语义，进程关闭该文件的任意一个描述符，就会释放本进程在该文件上的全部锁，另一个 Host 随即可以在本 Host 写事务中途提交并被覆盖。因此不再采集 WAL-index 中的 mxFrame/nBackfill（未 checkpoint 帧数）；需要精确积压时只能在不持有该库连接的独立进程里读取。其它 Host 的读事务年龄同样无法从本进程观察；本 Host 读事务都在单个 worker 请求内完成，其最长耗时即 `database.request.summary` 中读请求的 `maxMs`。
 
+**文件工具已统一拦截。** 扩展宿主进程内所有按路径访问本地文件的入口，都先经过 `backend/capabilities/filesystem/sqliteDatabaseFileGuard.ts`：`read`（文本、图片/PDF、批量）、`write`/`edit`/`delete` 的提案规划和执行对账、`transfer` 的源和目标、本地路径附件（用户拖入、Provider 引用、附件重新加载）以及计划导出。守卫只用 `stat`/`realpath`，按给定路径和真实路径（解析符号链接）各判定一次，文件名不区分大小写。拒绝以下文件：LimCode 自己的库文件，包括任意位置的 `limcode.sqlite`、`limcode.epoch-N.sqlite`、`limcode.sqlite.<pid>.tmp` 及其 `-wal`/`-shm`/`-journal`，覆盖当前数据集、旧工作区 scope、合并备份、迁移备份；任何旁边存在同名主库的 `X-wal`/`X-shm`/`X-journal`；任何旁边存在这些伴随文件的主库 `X`。RuntimeDatabase 的 worker 运行期间，还会登记本进程正在使用的库：凡是与它的主库或伴随文件 device+inode 相同的路径都拒绝，硬链接、别名路径和大小写变体都逃不过；递归删除它的任一上级目录也拒绝。拒绝时工具返回明确错误，并提示改在终端子进程里用 `sqlite3 -readonly <库> ".tables"` 或 `".backup '<副本>'"` 访问。子进程有自己的锁，不受影响。VS Code 打开编辑器、终端命令这类在其它进程里执行的访问不在拦截范围内。
+
 诊断写入失败不会重试外部动作，也不会阻断 Agent loop；失败批次被丢弃，只暴露脱敏错误 code。
 
 ## 覆盖链路

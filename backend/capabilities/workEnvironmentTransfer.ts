@@ -31,6 +31,7 @@ import {
 } from './workEnvironmentProvider';
 import { isPathInside } from './filesystem/pathContainment';
 import { realPath } from './filesystem/realPath';
+import { assertNotSqliteDatabaseFile } from './filesystem/sqliteDatabaseFileGuard';
 
 const STREAM_HIGH_WATER_MARK = 1024 * 1024;
 const PROGRESS_THROTTLE_MS = 1000;
@@ -69,6 +70,8 @@ interface Endpoint {
   rename(src: string, dst: string, overwrite: boolean): Promise<void>;
   openRead(p: string): Promise<StreamHandle & { stream: Readable }>;
   openWrite(p: string, overwrite: boolean): Promise<StreamHandle & { stream: Writable }>;
+  /** Refuses a file this process must not touch, before any temp file is written beside it. */
+  assertTransferableFile?(p: string): Promise<void>;
 }
 
 interface TransferPathPolicy {
@@ -306,6 +309,8 @@ async function copyFile(input: {
 }): Promise<{ bytes: number; verifyOk: boolean }> {
   const { from, to, sourcePath, targetPath, overwrite, createDirs, verify, tracker, knownSize, mkdirCache, signal } = input;
   signal?.throwIfAborted();
+  await from.assertTransferableFile?.(sourcePath);
+  await to.assertTransferableFile?.(targetPath);
   const sourceSize = knownSize !== undefined ? knownSize : (await from.stat(sourcePath)).size;
   if (!overwrite && await to.exists(targetPath)) throw new Error(`目标已存在: ${targetPath}`);
   if (createDirs) {
@@ -401,20 +406,23 @@ function reportTransferProgress(tracker: TransferProgressTracker, final: boolean
     : tracker.totalKnown && tracker.totalBytes > 0
       ? Math.min(99, Math.round((tracker.transferredBytes / tracker.totalBytes) * 100))
       : -1;
+  const payload = {
+    kind: 'transfer',
+    sourcePath: tracker.currentSourcePath,
+    targetPath: tracker.currentTargetPath,
+    bytesTransferred: tracker.transferredBytes,
+    totalBytes: tracker.totalKnown ? tracker.totalBytes : undefined,
+    percent,
+    speedBytesPerSec,
+    elapsedMs,
+    filesTransferred: tracker.completedFiles,
+    totalFiles: tracker.totalKnown ? tracker.totalFiles : undefined
+  };
   tracker.observer?.onEvent?.({
     kind: 'progress',
-    payload: {
-      kind: 'transfer',
-      sourcePath: tracker.currentSourcePath,
-      targetPath: tracker.currentTargetPath,
-      bytesTransferred: tracker.transferredBytes,
-      totalBytes: tracker.totalKnown ? tracker.totalBytes : undefined,
-      percent,
-      speedBytesPerSec,
-      elapsedMs,
-      filesTransferred: tracker.completedFiles,
-      totalFiles: tracker.totalKnown ? tracker.totalFiles : undefined
-    }
+    // Runtime Tool events are strict JSON: a value not known yet (no current file before the first
+    // copy starts) is left out, never sent as undefined, or the event fails and replaces the error.
+    payload: Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined))
   });
 }
 
@@ -599,19 +607,30 @@ class LocalEndpoint implements Endpoint {
     }
     return out;
   }
-  async unlink(p: string): Promise<void> { await this.guardPath(p, 'write'); await fsp.rm(p, { force: true }); }
+  // Streams, removal and rename act inside the extension host process, which also holds SQLite
+  // connections, so a database file is refused on either side (sqliteDatabaseFileGuard).
+  async assertTransferableFile(p: string): Promise<void> { await assertNotSqliteDatabaseFile(p); }
+  async unlink(p: string): Promise<void> {
+    await this.guardPath(p, 'write');
+    await assertNotSqliteDatabaseFile(p);
+    await fsp.rm(p, { force: true });
+  }
   async rename(src: string, dst: string, overwrite: boolean): Promise<void> {
     this.signal?.throwIfAborted();
     await this.guardPath(dst, 'write');
+    await assertNotSqliteDatabaseFile(src);
+    await assertNotSqliteDatabaseFile(dst);
     if (overwrite) await fsp.rm(dst, { force: true });
     await fsp.rename(src, dst);
   }
   async openRead(p: string): Promise<StreamHandle & { stream: Readable }> {
     await this.guardPath(p, 'read');
+    await assertNotSqliteDatabaseFile(p);
     return { stream: fs.createReadStream(p, { highWaterMark: STREAM_HIGH_WATER_MARK, signal: this.signal }) };
   }
   async openWrite(p: string, overwrite: boolean): Promise<StreamHandle & { stream: Writable }> {
     await this.guardPath(p, 'write');
+    await assertNotSqliteDatabaseFile(p);
     return { stream: fs.createWriteStream(p, { flags: overwrite ? 'w' : 'wx', highWaterMark: STREAM_HIGH_WATER_MARK, signal: this.signal }) };
   }
 }

@@ -20,6 +20,7 @@ import { RuntimeDatabase } from './runtimeDatabase';
 import { handoffReason, isExecutionHandoffError } from './executionLeaseFence';
 import { isCanonicalPathInside } from '../capabilities/filesystem/pathContainment';
 import { realPath } from '../capabilities/filesystem/realPath';
+import { sqliteDatabaseFileRefusal, sqliteDatabaseFileRefusalMessage } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 
 export type FileChangeOperation =
   | 'create_file'
@@ -1248,6 +1249,7 @@ export class FileMutationDispatcher {
     let resolved: string;
     try {
       resolved = await resolveBoundedTarget(this.resolveBoundary, member.workEnvironmentId, member.targetPath);
+      await refuseSqliteDatabaseTarget(resolved, member.operation);
     } catch (error) {
       return error instanceof FilePathConflictError
         ? memberObservation(member, 'conflict', null, error.message)
@@ -1331,6 +1333,7 @@ export class FileMutationDispatcher {
   private async inspectActual(member: FileEffectRequest['members'][number]): Promise<PathInspection> {
     try {
       const resolved = await resolveBoundedTarget(this.resolveBoundary, member.workEnvironmentId, member.targetPath);
+      await refuseSqliteDatabaseTarget(resolved, member.operation);
       return inspectPath(resolved);
     } catch (error) {
       return error instanceof FilePathConflictError
@@ -1390,6 +1393,18 @@ async function resolveBoundedTarget(
     if (!isNotFound(error)) throw error;
   }
   return target;
+}
+
+/**
+ * Dispatch and reconciliation read, write and delete the target inside the extension host process,
+ * which also holds SQLite connections; a database file there is never touched (sqliteDatabaseFileGuard).
+ */
+async function refuseSqliteDatabaseTarget(
+  target: string,
+  operation: FileEffectRequest['members'][number]['operation']
+): Promise<void> {
+  const refusal = await sqliteDatabaseFileRefusal(target, { recursive: operation === 'delete_directory_tree' });
+  if (refusal) throw new FilePathConflictError(sqliteDatabaseFileRefusalMessage(refusal));
 }
 
 /** Both sides derive from realpath of the same root, so compare exactly (see isCanonicalPathInside). */

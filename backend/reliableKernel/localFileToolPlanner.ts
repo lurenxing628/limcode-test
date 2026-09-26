@@ -5,6 +5,7 @@ import { validateEditToolArguments, type ValidatedEditToolArguments } from '../.
 import { applyDeleteEdit, applyHunkEdit, applyInsertEdit } from '../capabilities/editStrategies';
 import { isSamePath } from '../capabilities/filesystem/pathContainment';
 import { realPath } from '../capabilities/filesystem/realPath';
+import { assertNotSqliteDatabaseFile } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import type { ToolDefinition } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDispatchInput
@@ -120,7 +121,7 @@ export class LocalFileToolPlanner {
       const inputPath = requireText(args.paths[index], `delete.paths[${index}]`);
       const resolved = await this.resolvePath(inputPath, authority);
       signal?.throwIfAborted();
-      const current = await inspectLocalTarget(resolved.absolutePath);
+      const current = await inspectLocalTarget(resolved.absolutePath, { recursive: true });
       signal?.throwIfAborted();
       members.push({
         operation: current.kind === 'directory' ? 'delete_directory_tree' : 'delete_file',
@@ -166,7 +167,12 @@ type LocalTarget =
   | { kind: 'file'; bytes: Buffer; digest: string }
   | { kind: 'directory' };
 
-async function inspectLocalTarget(absolutePath: string): Promise<LocalTarget> {
+async function inspectLocalTarget(
+  absolutePath: string,
+  options: { recursive?: boolean } = {}
+): Promise<LocalTarget> {
+  // Planning reads the current bytes in the extension host process, which also holds SQLite connections.
+  await assertNotSqliteDatabaseFile(absolutePath, options);
   let stat;
   try {
     stat = await fs.lstat(absolutePath);

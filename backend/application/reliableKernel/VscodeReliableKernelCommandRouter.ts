@@ -49,6 +49,7 @@ import {
 import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
 import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
 import { isSettingsRevisionConflictError } from '../../capabilities/settingsRevisionConflict';
+import { assertNotSqliteDatabaseFile } from '../../capabilities/filesystem/sqliteDatabaseFileGuard';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
@@ -1091,6 +1092,8 @@ export class VscodeReliableKernelCommandRouter {
       saveLabel: '导出计划'
     });
     if (!target) return;
+    // workspace.fs serves file: URIs inside this extension host process, which also holds SQLite connections.
+    if (target.scheme === 'file') await assertNotSqliteDatabaseFile(target.fsPath);
     await vscode.workspace.fs.writeFile(target, Buffer.from(markdown, 'utf8'));
   }
 
@@ -1170,6 +1173,8 @@ export class VscodeReliableKernelCommandRouter {
       if (payload.attachmentId?.trim()) {
         part = await this.product.application.attachments.resolveInlineData(payload.attachmentId.trim());
       } else if (payload.sourcePath?.trim()) {
+        // workspace.fs serves file: URIs inside this extension host process, which also holds SQLite connections.
+        await assertNotSqliteDatabaseFile(payload.sourcePath.trim());
         const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(payload.sourcePath.trim()));
         part = {
           inlineData: {

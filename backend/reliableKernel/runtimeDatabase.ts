@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { Worker } from 'node:worker_threads';
+import { registerInProcessSqliteDatabase } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import {
   ROOT_BINDING_POINTER_FILE,
   type RootBinding,
@@ -810,8 +811,20 @@ async function initializeBindingStorage(binding: RootBinding): Promise<void> {
   });
 }
 
+/**
+ * The worker's SQLite locks belong to this whole process, so while it runs the in-process file
+ * entry points refuse its database files under any name (sqliteDatabaseFileGuard).
+ */
 function createWorker(data: DatabaseWorkerData): Worker {
-  return new Worker(path.join(__dirname, 'databaseWorker.js'), { workerData: data });
+  const release = registerInProcessSqliteDatabase(data.binding.paths.databasePath);
+  try {
+    const worker = new Worker(path.join(__dirname, 'databaseWorker.js'), { workerData: data });
+    worker.once('exit', release);
+    return worker;
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 function waitForReady(
