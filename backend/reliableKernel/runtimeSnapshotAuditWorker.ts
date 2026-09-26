@@ -34,7 +34,7 @@ function audit(input: RuntimeSnapshotAuditWorkerData): RuntimeSnapshotAudit {
     database.pragma('query_only = ON');
     assertCurrentSchema(database, input.binding);
     assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS);
-    auditDatabaseIntegrity(database);
+    if (!input.skipIntegrity) auditDatabaseIntegrity(database);
     const result: RuntimeSnapshotAudit = {};
     if (input.contentDigest) result.contentDigest = runtimeDataSetContentDigest(database);
     if (input.unfinishedWork === 'finalize') result.unfinishedWork = inspectUnfinishedWork(database);

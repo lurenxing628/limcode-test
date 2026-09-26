@@ -69,8 +69,14 @@ function saveOtherSettings(): void {
         当前数据目录：<code>{{ settings.common.activeDataRootPath || '正在获取当前数据目录…' }}</code>
       </p>
       <p v-if="settings.common.previousDataRootPath" class="global-settings-path">
-        迁移前的旧目录（原样保留）：<code>{{ settings.common.previousDataRootPath }}</code>
+        迁移前的旧目录：<code>{{ settings.common.previousDataRootPath }}</code>
       </p>
+      <div v-if="settings.common.relocationLeftBehind?.length" class="global-settings-path">
+        <span>以下历史库上次迁移时没有带过来，仍在旧目录（需要时可以回到旧目录处理后再迁移一次，会合并）：</span>
+        <ul>
+          <li v-for="line in settings.common.relocationLeftBehind" :key="line"><code>{{ line }}</code></li>
+        </ul>
+      </div>
       <div class="global-settings-actions">
         <button type="button" class="secondary" @click="settings.requestDataRootAction('relocate')">迁移数据目录…</button>
         <template v-if="settings.common.previousDataRootPath">
@@ -78,7 +84,7 @@ function saveOtherSettings(): void {
           <button type="button" class="secondary" @click="settings.requestDataRootAction('deletePrevious')">删除旧目录…</button>
         </template>
       </div>
-      <span class="global-settings-field-hint">迁移时先检查新目录（空间、权限、是否云同步目录），确认后把当前历史库、其它历史库和设置复制到新目录并逐项核对，旧目录原样保留；所有 LimCode 窗口会重载一次，有任务的窗口会等任务结束，未发送的输入会保留。删除旧目录前会列出占用并再次确认。</span>
+      <span class="global-settings-field-hint">迁移时先检查新目录（空间、权限、是否云同步目录、数据量），确认后把当前历史库、其它历史库、设置、全局规则和技能复制到新目录并逐项核对，迁移本身不修改旧目录的数据；所有 LimCode 窗口会重载一次，有任务的窗口会等任务结束，未发送的输入会保留。删除旧目录只删除确认迁移过去、且迁移之后没有改动的内容，删除前完整列出并再次确认，备份和归档默认保留。</span>
     </div>
 
     <label class="global-settings-field">

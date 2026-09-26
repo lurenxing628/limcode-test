@@ -109,6 +109,7 @@ import {
 } from '../world/modules/agent/blueprints';
 import { composeSystemInstruction, type SystemPromptTextPart } from '../world/modules/chat/systemPromptText';
 import { VscodeConfigurationMutations } from './vscodeConfigurationMutations';
+import { readDataRootRelocationRecord } from './runtimeDataRootRelocation';
 import { builtinDefaultToolNames } from './builtinToolCatalog';
 import type { AttachmentSettingsAuthority } from './attachmentIngest';
 import type {
@@ -736,7 +737,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     if (section === 'common') {
       const context = this.requireContext();
       const status = await loadCommittedGlobalStatus(context);
-      const settings = createGlobalSettingsRecord(context, status);
+      const settings = await withRelocationRecord(createGlobalSettingsRecord(context, status));
       return {
         section,
         settings,
@@ -799,7 +800,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         expectedRevision,
         input.proxyShellAndMcp ?? current.proxyShellAndMcp
       );
-      const committed = createGlobalSettingsRecord(context, committedStatus.current);
+      const committed = await withRelocationRecord(createGlobalSettingsRecord(context, committedStatus.current));
       return {
         section,
         settings: committed,
@@ -1568,4 +1569,11 @@ function clonePlain<T>(value: T): T {
 function requireId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
   return value.trim();
+}
+
+/** Data sets the relocation into the current directory left in the old one (shown until the next move). */
+async function withRelocationRecord(record: GlobalSettingsRecord): Promise<GlobalSettingsRecord> {
+  const relocation = await readDataRootRelocationRecord(record.activeDataRootPath).catch(() => undefined);
+  if (!relocation?.leftBehind.length || relocation.invalidated) return record;
+  return { ...record, relocationLeftBehind: relocation.leftBehind.map((item) => `${item.id}：${item.reason}`) };
 }

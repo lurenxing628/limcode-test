@@ -2,7 +2,7 @@ import { createRuntimeDeliveryWakeHandler } from './runtimeDeliveryWakeHandler';
 import * as vscode from 'vscode';
 import { EXTENSION_USER_AGENT } from '../../../shared/extensionIdentity';
 import type { GlobalSettingsRecord, NetworkSettingsRecord } from '../../../shared/protocol';
-import { resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
+import { resolveDataRootUri, sameFsPath } from '../../capabilities/vscodeStorage/globalStatus';
 import {
   createVscodeStoragePaths,
   type StoragePaths
@@ -175,7 +175,7 @@ export class VscodeReliableKernelProductRuntime {
     context: vscode.ExtensionContext,
     options: VscodeReliableKernelProductRuntimeOptions = {}
   ): Promise<VscodeReliableKernelProductRuntime> {
-    const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
+    const getPaths = pinnedDataRootPaths(context, options.runtimePlacement?.configurationRootPath ?? resolveDataRootUri(context).fsPath);
     const workspaceFolders = currentWorkspaceFolders();
     const configuration = new VscodeConfigurationAuthority(
       getPaths,
@@ -743,4 +743,21 @@ function currentWorkspaceFolders(): Array<{ uri: string; name: string; rootPath:
   return (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
     uri: folder.uri.toString(), name: folder.name, rootPath: folder.uri.fsPath, index
   }));
+}
+
+/**
+ * Configuration paths pinned to the data directory this window's Runtime opened. When another
+ * window switched the data-root pointer meanwhile, configuration is refused instead of being read
+ * from or written into a directory this window's Runtime does not use; the window has to reload.
+ */
+export function pinnedDataRootPaths(context: vscode.ExtensionContext, configurationRootPath: string): () => StoragePaths {
+  const uri = resolveDataRootUri(context);
+  const pinned = createVscodeStoragePaths(sameFsPath(uri.fsPath, configurationRootPath) ? uri : vscode.Uri.file(configurationRootPath));
+  return () => {
+    const current = resolveDataRootUri(context).fsPath;
+    if (!sameFsPath(current, configurationRootPath)) {
+      throw new Error(`数据目录已在其它窗口切换到 ${current}，本窗口仍在使用 ${configurationRootPath}；请重载窗口后再操作。`);
+    }
+    return pinned;
+  };
 }

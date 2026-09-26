@@ -185,6 +185,8 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-dataset-merge-state.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-e2e.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation.test.mjs',
+  'tests/reliable-kernel/runtime-data-root-relocation-review.test.mjs',
+  'tests/reliable-kernel/runtime-data-root-relocation-crash.test.mjs',
   'tests/reliable-kernel/data-root-relocation-commands.test.cjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance.test.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance-windows.test.mjs',

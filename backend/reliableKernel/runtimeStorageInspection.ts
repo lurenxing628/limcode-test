@@ -191,7 +191,8 @@ export async function copyRuntimeDataSetDatabase(
   candidate: VscodeRuntimeDataSetCandidate,
   binding: HistoricalRootBinding
 ): Promise<{ databasePath: string; remove(): Promise<void> }> {
-  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-runtime-history-'));
+  // Named with this process id: a crashed process's copies are found and removed (sweepDataRootRelocationLeftovers).
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-runtime-history-${process.pid}-`));
   const remove = () => fs.rm(temporaryRoot, { recursive: true, force: true });
   try {
     const databasePath = path.join(temporaryRoot, 'limcode.sqlite');

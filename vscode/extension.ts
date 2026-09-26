@@ -47,7 +47,17 @@ async function startApplication(
     const {
       mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup
     } = await import('./commands/runtimeDataSetManagement');
-    const application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context));
+    const dataRootCommands = await import('./commands/dataRootRelocation');
+    // A window that reloaded for a data-directory move waits on the old directory until the move
+    // ends; it says so. A move whose process is gone is undone first.
+    const waiting = await dataRootCommands.beforeDataRootOpen(context).catch((error) => {
+      console.warn(`${EXTENSION_BRAND} data root relocation check failed.`, error);
+      return undefined;
+    });
+    const opening = openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context));
+    const application = waiting
+      ? await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: waiting }, () => opening)
+      : await opening;
     const applicationOpenedAt = Date.now();
 
     // Deactivation may race a slow filesystem/SQLite open. Publish the result so deactivate() can
@@ -60,6 +70,8 @@ async function startApplication(
 
     backendApp = application;
     startup.resolve(application);
+    void dataRootCommands.afterDataRootOpened(context, application.dataRootPath())
+      .catch((error) => console.warn(`${EXTENSION_BRAND} data root follow-up failed.`, error));
 
     console.log(
       `${EXTENSION_BRAND} reliable SQLite/CAS Runtime is active `

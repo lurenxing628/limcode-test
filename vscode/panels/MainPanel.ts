@@ -3,6 +3,7 @@ import {
   BridgeMessageType,
   createMessageId,
   type BridgeClientId,
+  type DataRootActionPayload,
   type OpenConversationPanelRecord,
   type PlanProposalOpenPayload,
   type WebviewClientMeta,
@@ -21,6 +22,7 @@ import {
 import { isReliableKernelControlMessage } from '../../shared/reliableKernelClientFeed';
 import type { ApplicationFacade, ConversationRecoveryResult } from '../ApplicationFacade';
 import type { ApplicationStartup } from '../ApplicationStartup';
+import { answerDataRootPrompt, cancelDataRootPrompts } from '../dataRootPrompts';
 import { isConversationRuntimeOwnerBusyError } from '../../backend/reliableKernel/ConversationRuntimeOwnerManager';
 
 export interface MainPanelOptions {
@@ -409,7 +411,7 @@ export class MainPanel {
           return;
         }
         if (message.type === BridgeMessageType.DataRootAction && message.payload?.action) {
-          this.runDataRootActionFromPanel(message.payload.action);
+          this.runDataRootActionFromPanel(message.payload);
           return;
         }
         this.backendApp.handleWebviewMessage(this.clientId, message);
@@ -421,6 +423,7 @@ export class MainPanel {
   }
 
   public dispose(): void {
+    cancelDataRootPrompts(this.clientId);
     MainPanel.panels.delete(this.panelId);
     MainPanel.notifyConversationPanelStateChanged();
     this.backendApp.detachWebview(this.clientId);
@@ -430,13 +433,21 @@ export class MainPanel {
     }
   }
 
-  /** Settings-page data-directory buttons: native commands own the picker, confirmation and reload. */
-  private runDataRootActionFromPanel(action: unknown): void {
+  /**
+   * Settings-page data-directory buttons run the commands for this page (their confirmations come
+   * back here as ConfirmPanels); an answer resolves the command's open prompt.
+   */
+  private runDataRootActionFromPanel(payload: DataRootActionPayload): void {
+    const action = payload.action;
+    if (action === 'answer') {
+      answerDataRootPrompt(this.clientId, payload);
+      return;
+    }
     const command = action === 'relocate' ? EXTENSION_COMMAND_IDS.relocateDataRoot
       : action === 'returnToPrevious' ? EXTENSION_COMMAND_IDS.returnToPreviousDataRoot
         : action === 'deletePrevious' ? EXTENSION_COMMAND_IDS.deletePreviousDataRoot : undefined;
     if (!command) return;
-    void vscode.commands.executeCommand(command).then(undefined, (error) => {
+    void vscode.commands.executeCommand(command, { clientId: this.clientId }).then(undefined, (error) => {
       const message = error instanceof Error ? error.message : String(error);
       void vscode.window.showErrorMessage(`数据目录操作失败：${message}`);
     });

@@ -170,6 +170,10 @@ export async function loadRecordStoreSnapshot<TRecord extends { id: string }, TK
   indexUri: vscode.Uri,
   recordKey: TKey
 ): Promise<RecordStoreSnapshot<TRecord> | undefined> {
+  // A store that does not exist reads as missing without taking its lock: the lock would create the
+  // store's directory, and a read must never create directories (e.g. under the mount point of an
+  // unmounted data drive, where it would later pass for LimCode data).
+  if (isNodeFsStorageUri(indexUri) && !await directoryExists(path.dirname(nodeFsStoragePath(indexUri)))) return undefined;
   return withRecordStoreMutationLock(
     indexUri,
     () => loadRecordStoreSnapshotUnlocked<TRecord, TKey>(root, indexUri, recordKey)
@@ -830,4 +834,13 @@ function isFileNotFound(error: unknown): boolean {
   const text = [candidate.name, candidate.code, candidate.message, candidate.stack, String(error)]
     .filter((part): part is string => typeof part === 'string').join('\n');
   return /FileNotFound|EntryNotFound|ENOENT|ENOTDIR|not found|no such file|不存在|无法解析不存在的文件/i.test(text);
+}
+
+async function directoryExists(directory: string): Promise<boolean> {
+  try {
+    return (await fs.stat(directory)).isDirectory();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return false;
+    throw error;
+  }
 }

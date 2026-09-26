@@ -17,6 +17,16 @@ export interface StorageRootMigrationStatus {
   migratedAt: string;
 }
 
+/** A data-directory relocation between its stage and its end; cleared when it ends (see dataRootRelocation). */
+export interface PendingDataRootRelocation {
+  relocationId: string;
+  sourceRootPath: string;
+  targetRootPath: string;
+  startedAt: string;
+  processId: number;
+  processStartIdentity?: string;
+}
+
 export interface LimCodeGlobalStatus {
   schemaVersion: typeof STORAGE_VERSION;
   dataRootPath: string;
@@ -25,6 +35,18 @@ export interface LimCodeGlobalStatus {
   proxyShellAndMcp?: boolean;
   updatedAt: string;
   lastMigration?: StorageRootMigrationStatus;
+  /** 自定义数据目录的身份（目录里的 .limcode-data-root-identity.json）；启动时不一致即判为不可用。 */
+  dataRootId?: string;
+  /** 正在进行的数据目录迁移；进程崩溃后由下次启动清理。 */
+  pendingRelocation?: PendingDataRootRelocation;
+}
+
+/** 切换数据目录时的改动；省略的字段保持原值，null 表示清除。路径改变而没有给出新身份时身份被清除。 */
+export interface GlobalStatusDataRootChange {
+  dataRootPath?: string;
+  dataRootId?: string | null;
+  lastMigration?: StorageRootMigrationStatus | null;
+  pendingRelocation?: PendingDataRootRelocation | null;
 }
 
 const committedStatusByContext = new WeakMap<vscode.ExtensionContext, LimCodeGlobalStatus>();
@@ -65,7 +87,26 @@ export async function saveGlobalStatus(
   const uri = globalStatusFileUri(context);
   return withRecordStoreTransaction(uri, async () => {
     const previous = await loadStatusInsideLock(context, uri);
-    return commitStatus(context, uri, previous, dataRootPath, proxy, lastMigration, proxyShellAndMcp);
+    return commitStatus(context, uri, previous, { dataRootPath, proxy, lastMigration, proxyShellAndMcp });
+  });
+}
+
+/** 数据目录迁移、回到旧目录、选择其它目录：在同一把跨进程锁内改指针及其附属记录。 */
+export async function updateGlobalStatusDataRoot(
+  context: vscode.ExtensionContext,
+  change: GlobalStatusDataRootChange
+): Promise<LimCodeGlobalStatus> {
+  const uri = globalStatusFileUri(context);
+  return withRecordStoreTransaction(uri, async () => {
+    const previous = await loadStatusInsideLock(context, uri);
+    return commitStatus(context, uri, previous, {
+      dataRootPath: change.dataRootPath ?? previous.dataRootPath,
+      proxy: previous.proxy,
+      proxyShellAndMcp: previous.proxyShellAndMcp === true,
+      lastMigration: change.lastMigration,
+      dataRootId: change.dataRootId,
+      pendingRelocation: change.pendingRelocation
+    });
   });
 }
 
@@ -84,7 +125,7 @@ export async function saveGlobalStatusExpected(
     if (actualRevision !== expectedRevision) {
       throw new SettingsRevisionConflictError('common', expectedRevision, actualRevision);
     }
-    const current = await commitStatus(context, uri, previous, dataRootPath, proxy, undefined, proxyShellAndMcp);
+    const current = await commitStatus(context, uri, previous, { dataRootPath, proxy, proxyShellAndMcp });
     return { current, previous };
   });
 }
@@ -170,19 +211,30 @@ async function commitStatus(
   context: vscode.ExtensionContext,
   uri: vscode.Uri,
   previous: LimCodeGlobalStatus,
-  dataRootPath: string,
-  proxy: string,
-  lastMigration?: StorageRootMigrationStatus | null,
-  proxyShellAndMcp?: boolean
+  next: {
+    dataRootPath: string;
+    proxy: string;
+    proxyShellAndMcp?: boolean;
+    lastMigration?: StorageRootMigrationStatus | null;
+    dataRootId?: string | null;
+    pendingRelocation?: PendingDataRootRelocation | null;
+  }
 ): Promise<LimCodeGlobalStatus> {
+  const dataRootPath = normalizeStatusDataRootPath(context, next.dataRootPath);
+  // The identity belongs to the directory: kept only while the path stays the same.
+  const dataRootId = next.dataRootId === null ? undefined
+    : next.dataRootId ?? (sameFsPath(dataRootPath, previous.dataRootPath) ? previous.dataRootId : undefined);
+  const pendingRelocation = next.pendingRelocation === null ? undefined : next.pendingRelocation ?? previous.pendingRelocation;
   const status: LimCodeGlobalStatus = {
     schemaVersion: STORAGE_VERSION,
-    dataRootPath: normalizeStatusDataRootPath(context, dataRootPath),
-    proxy: typeof proxy === 'string' ? proxy.trim() : '',
-    proxyShellAndMcp: proxyShellAndMcp ?? (previous.proxyShellAndMcp === true),
+    dataRootPath,
+    proxy: typeof next.proxy === 'string' ? next.proxy.trim() : '',
+    proxyShellAndMcp: next.proxyShellAndMcp ?? (previous.proxyShellAndMcp === true),
     updatedAt: new Date().toISOString(),
-    ...(lastMigration ? { lastMigration: requireMigration(lastMigration) }
-      : lastMigration === undefined && previous.lastMigration ? { lastMigration: { ...previous.lastMigration } } : {})
+    ...(next.lastMigration ? { lastMigration: requireMigration(next.lastMigration) }
+      : next.lastMigration === undefined && previous.lastMigration ? { lastMigration: { ...previous.lastMigration } } : {}),
+    ...(dataRootPath && dataRootId ? { dataRootId: requireDataRootId(dataRootId) } : {}),
+    ...(pendingRelocation ? { pendingRelocation: requirePendingRelocation(pendingRelocation) } : {})
   };
   await writeJson(uri, status);
   remember(context, status);
@@ -198,15 +250,20 @@ function statusFromGlobalState(context: vscode.ExtensionContext): LimCodeGlobalS
   const stored = context.globalState.get<Partial<LimCodeGlobalStatus>>(LIMCODE_GLOBAL_STATUS_KEY);
   const dataRootPath = normalizeDataRootPath(stored?.dataRootPath, { fallbackToDefault: true });
   const lastMigration = normalizeLastMigration(stored?.lastMigration);
+  const customRoot = sameFsPath(dataRootPath, context.globalStorageUri.fsPath) ? '' : dataRootPath;
+  const dataRootId = normalizeDataRootId(stored?.dataRootId);
+  const pendingRelocation = normalizePendingRelocation(stored?.pendingRelocation);
   return {
     schemaVersion: STORAGE_VERSION,
-    dataRootPath: sameFsPath(dataRootPath, context.globalStorageUri.fsPath) ? '' : dataRootPath,
+    dataRootPath: customRoot,
     proxy: typeof stored?.proxy === 'string' ? stored.proxy.trim() : '',
     proxyShellAndMcp: stored?.proxyShellAndMcp === true,
     updatedAt: typeof stored?.updatedAt === 'string' && stored.updatedAt.trim()
       ? stored.updatedAt
       : new Date(0).toISOString(),
-    ...(lastMigration ? { lastMigration } : {})
+    ...(lastMigration ? { lastMigration } : {}),
+    ...(customRoot && dataRootId ? { dataRootId } : {}),
+    ...(pendingRelocation ? { pendingRelocation } : {})
   };
 }
 
@@ -226,13 +283,19 @@ function parseGlobalStatus(uri: vscode.Uri, value: unknown): LimCodeGlobalStatus
   if (record.proxyShellAndMcp !== undefined && typeof record.proxyShellAndMcp !== 'boolean') {
     throw new Error(`全局状态代理开关损坏：${uri.fsPath}`);
   }
+  const dataRootId = record.dataRootId === undefined ? undefined : normalizeDataRootId(record.dataRootId);
+  if (record.dataRootId !== undefined && !dataRootId) throw new Error(`全局状态数据目录身份损坏：${uri.fsPath}`);
+  const pendingRelocation = record.pendingRelocation === undefined ? undefined : normalizePendingRelocation(record.pendingRelocation);
+  if (record.pendingRelocation !== undefined && !pendingRelocation) throw new Error(`全局状态迁移进行记录损坏：${uri.fsPath}`);
   return {
     schemaVersion: STORAGE_VERSION,
     dataRootPath: normalizeDataRootPath(record.dataRootPath),
     proxy: record.proxy.trim(),
     proxyShellAndMcp: record.proxyShellAndMcp === true,
     updatedAt: record.updatedAt,
-    ...(lastMigration ? { lastMigration } : {})
+    ...(lastMigration ? { lastMigration } : {}),
+    ...(dataRootId ? { dataRootId } : {}),
+    ...(pendingRelocation ? { pendingRelocation } : {})
   };
 }
 
@@ -243,7 +306,40 @@ function remember(context: vscode.ExtensionContext, status: LimCodeGlobalStatus)
 }
 
 function cloneStatus(status: LimCodeGlobalStatus): LimCodeGlobalStatus {
-  return { ...status, ...(status.lastMigration ? { lastMigration: { ...status.lastMigration } } : {}) };
+  return {
+    ...status,
+    ...(status.lastMigration ? { lastMigration: { ...status.lastMigration } } : {}),
+    ...(status.pendingRelocation ? { pendingRelocation: { ...status.pendingRelocation } } : {})
+  };
+}
+
+function requireDataRootId(value: string): string {
+  const normalized = normalizeDataRootId(value);
+  if (!normalized) throw new TypeError('Data root identity is invalid.');
+  return normalized;
+}
+
+function normalizeDataRootId(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value) ? value : undefined;
+}
+
+function requirePendingRelocation(value: PendingDataRootRelocation): PendingDataRootRelocation {
+  const normalized = normalizePendingRelocation(value);
+  if (!normalized) throw new TypeError('Pending data root relocation is invalid.');
+  return normalized;
+}
+
+function normalizePendingRelocation(input: unknown): PendingDataRootRelocation | undefined {
+  const candidate = input as Partial<PendingDataRootRelocation> | undefined;
+  if (typeof candidate?.relocationId !== 'string' || typeof candidate.sourceRootPath !== 'string'
+    || typeof candidate.targetRootPath !== 'string' || typeof candidate.startedAt !== 'string'
+    || typeof candidate.processId !== 'number' || !Number.isInteger(candidate.processId)
+    || (candidate.processStartIdentity !== undefined && typeof candidate.processStartIdentity !== 'string')) return undefined;
+  return {
+    relocationId: candidate.relocationId, sourceRootPath: candidate.sourceRootPath, targetRootPath: candidate.targetRootPath,
+    startedAt: candidate.startedAt, processId: candidate.processId,
+    ...(candidate.processStartIdentity !== undefined ? { processStartIdentity: candidate.processStartIdentity } : {})
+  };
 }
 
 function requireMigration(value: StorageRootMigrationStatus): StorageRootMigrationStatus {

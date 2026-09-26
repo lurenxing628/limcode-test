@@ -92,22 +92,23 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
   });
 
   const dataRootCommands = [
-    [EXTENSION_COMMAND_IDS.relocateDataRoot, '迁移数据目录失败', async () => {
+    // `request` carries the settings page that asked ({ clientId }); its confirmations appear there.
+    [EXTENSION_COMMAND_IDS.relocateDataRoot, '迁移数据目录失败', async (request?: unknown) => {
       const { relocateDataRoot } = await import('./dataRootRelocation');
-      await relocateDataRoot(context, startup);
+      await relocateDataRoot(context, startup, request);
     }],
-    [EXTENSION_COMMAND_IDS.returnToPreviousDataRoot, '回到旧数据目录失败', async () => {
+    [EXTENSION_COMMAND_IDS.returnToPreviousDataRoot, '回到旧数据目录失败', async (request?: unknown) => {
       const { returnToPreviousDataRoot } = await import('./dataRootRelocation');
-      await returnToPreviousDataRoot(context, startup);
+      await returnToPreviousDataRoot(context, startup, request);
     }],
-    [EXTENSION_COMMAND_IDS.deletePreviousDataRoot, '删除旧数据目录失败', async () => {
+    [EXTENSION_COMMAND_IDS.deletePreviousDataRoot, '删除旧数据目录失败', async (request?: unknown) => {
       const { deletePreviousDataRoot } = await import('./dataRootRelocation');
-      await deletePreviousDataRoot(context);
+      await deletePreviousDataRoot(context, startup, request);
     }]
   ] as const;
-  const dataRootCommandDisposables = dataRootCommands.map(([commandId, failure, run]) => vscode.commands.registerCommand(commandId, async () => {
+  const dataRootCommandDisposables = dataRootCommands.map(([commandId, failure, run]) => vscode.commands.registerCommand(commandId, async (request?: unknown) => {
     try {
-      await run();
+      await run(request);
     } catch (error) {
       await vscode.window.showErrorMessage(`${failure}：${error instanceof Error ? error.message : String(error)}`);
     }

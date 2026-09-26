@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import SettingsScopeLayout from './SettingsScopeLayout.vue';
+import DataRootPromptPanel from './global/DataRootPromptPanel.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import {
   DEFAULT_GLOBAL_SETTINGS_TAB,
@@ -23,6 +24,7 @@ const settings = useGlobalSettingsStore();
       :default-tab="DEFAULT_GLOBAL_SETTINGS_TAB"
       settings-label="全局设置"
     />
+    <DataRootPromptPanel />
   </div>
 </template>
 

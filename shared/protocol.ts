@@ -106,6 +106,7 @@ export enum BridgeMessageType {
   CheckpointDiffOpen = 'checkpoint.diff.open',
   LocalFileOpen = 'localFile.open',
   DataRootAction = 'dataRoot.action',
+  DataRootPrompt = 'dataRoot.prompt',
   AttachmentOpen = 'attachment.open',
   AttachmentOpenResult = 'attachment.open.result',
   AttachmentReload = 'attachment.reload',
@@ -3051,6 +3052,8 @@ export interface GlobalSettingsRecord {
   defaultDataRootPath: string;
   /** The directory the data was moved away from (kept until deleted); empty when there is none. */
   previousDataRootPath: string;
+  /** Data sets the last relocation into this directory left in the old one, one line each (id and reason). */
+  relocationLeftBehind?: string[];
 }
 export interface NetworkSettingsRecord {
   /** LLM 请求的默认 User-Agent；空字符串使用扩展默认值，渠道或模型请求头可覆盖。 */
@@ -3210,9 +3213,42 @@ export interface LocalFileOpenPayload {
   source: string;
 }
 
-/** Settings page buttons for the data directory; the panel runs the native command. */
+/**
+ * Settings page buttons for the data directory (the panel runs the command, which answers with
+ * dataRoot.prompt confirmations), and the answer to such a prompt.
+ */
 export interface DataRootActionPayload {
-  action: 'relocate' | 'returnToPrevious' | 'deletePrevious';
+  action: 'relocate' | 'returnToPrevious' | 'deletePrevious' | 'answer';
+  /** answer: the prompt answered. */
+  flowId?: string;
+  /** answer: the chosen action key; 'cancel' when dismissed. */
+  choice?: string;
+  /** answer: keys of the ticked options. */
+  include?: string[];
+}
+
+export interface DataRootPromptAction {
+  key: string;
+  label: string;
+  variant?: 'default' | 'secondary' | 'danger';
+}
+
+export interface DataRootPromptSection {
+  title?: string;
+  lines: string[];
+}
+
+/** A confirmation or notice of a data-directory command, shown in the settings page's ConfirmPanel. */
+export interface DataRootPromptPayload {
+  flowId: string;
+  title: string;
+  description?: string;
+  /** Listed in full (never truncated). */
+  sections: DataRootPromptSection[];
+  /** Check boxes, unticked by default (e.g. backups that are kept unless ticked). */
+  options?: Array<{ key: string; label: string; detail?: string }>;
+  actions: DataRootPromptAction[];
+  danger?: boolean;
 }
 
 export interface AttachmentOpenPayload {
@@ -3337,6 +3373,7 @@ export interface BridgeErrorPayload {
 }
 
 export type ExtensionToWebviewMessage =
+  | BridgeEnvelope<BridgeMessageType.DataRootPrompt, DataRootPromptPayload>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureResult, DebugCaptureResult>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureObservationAck, DebugCaptureUiAck>
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>

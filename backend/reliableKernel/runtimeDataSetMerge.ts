@@ -493,14 +493,15 @@ export async function precopyRuntimeDataSetCas(
     throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '来源历史库的身份已变化，本次不预复制。');
   }
   const binding = await requireCompleteRuntimeDataSet(candidate);
-  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-merge-precopy-'));
+  // Named with this process id: a crashed process's copies are found and removed (sweepDataRootRelocationLeftovers).
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-merge-precopy-${process.pid}-`));
   try {
     const snapshotPath = path.join(temporaryRoot, 'limcode.sqlite');
     if (options.sourceDatabase) {
       if (!sameRuntimeDataSetIdentity(options.sourceDatabase.binding, candidate)) {
         throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '传入的数据库与来源历史库不一致。');
       }
-      const staged = path.join(path.dirname(binding.paths.dataRootPath), `merge-precopy-${randomUUID()}.sqlite`);
+      const staged = path.join(path.dirname(binding.paths.dataRootPath), `merge-precopy-${process.pid}-${randomUUID()}.sqlite`);
       try {
         await options.sourceDatabase.backupTo(staged);
         await fs.copyFile(staged, snapshotPath);

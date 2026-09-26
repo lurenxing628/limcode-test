@@ -3,12 +3,11 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { StorageDataResetResult } from '../../capabilities/types';
 import { mapSettledWithBoundedConcurrency } from '../../capabilities/boundedConcurrency';
-import { loadCommittedGlobalStatus, normalizeStatusDataRootPath, resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
+import { loadCommittedGlobalStatus, normalizeStatusDataRootPath, resolveDataRootUri, sameFsPath } from '../../capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/vscodeStorage/paths';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths, type RuntimeRootPaths } from '../../reliableKernel/contracts';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import { assertDataRootAvailable } from '../../reliableKernel/runtimeDataRootRelocation';
-import type { RuntimeExclusiveMaintenanceOutcome } from '../../reliableKernel/runtimeExclusiveMaintenance';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
@@ -64,7 +63,7 @@ import {
   VscodeReliableKernelCutoverCoordinator,
   archiveCurrentRuntimeRootForReset
 } from './VscodeReliableKernelCutoverCoordinator';
-import { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
+import { pinnedDataRootPaths, VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
 import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
@@ -112,6 +111,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private unsubscribeSteering: (() => void) | undefined;
   private disposed = false;
   private productClosed = false;
+  private dataRootMovedWarned = false;
 
   private constructor(
     private readonly context: vscode.ExtensionContext,
@@ -177,7 +177,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       const root = getPaths().globalStoragePath;
       // A configured directory (VS Code's own storage excepted) must exist and hold LimCode data:
       // placement would otherwise create an empty history on an unmounted drive or lost share.
-      if (normalizeStatusDataRootPath(context, status.dataRootPath)) await assertDataRootAvailable(root);
+      if (normalizeStatusDataRootPath(context, status.dataRootPath)) await assertDataRootAvailable(root, status.dataRootId);
       return root;
     }, async () => {
       const runtimePlacement = await resolveVscodeWorkspaceRuntimePlacement(
@@ -210,7 +210,9 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           }
         });
       });
-      facade = new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
+      facade = new VscodeReliableKernelApplicationFacade(
+        context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
+      );
       return facade;
     });
   }
@@ -466,9 +468,28 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return resolveDataRootUri(this.context);
   }
 
-  public refreshGlobalSettings(section: GlobalSettingsSection): Promise<void> {
+  public async refreshGlobalSettings(section: GlobalSettingsSection): Promise<void> {
     this.requireOpen();
-    return this.commandRouter.refreshGlobalSettings(section);
+    await this.commandRouter.refreshGlobalSettings(section);
+    if (section === 'common') this.warnIfDataRootMoved();
+  }
+
+  /**
+   * Another window switched the data-root pointer while this one still runs on the old directory
+   * (e.g. back to the old directory while this one was unreachable): configuration paths are pinned
+   * and refuse (pinnedDataRootPaths), and the user is asked once to reload.
+   */
+  private warnIfDataRootMoved(): void {
+    if (this.dataRootMovedWarned || this.disposed) return;
+    const current = resolveDataRootUri(this.context).fsPath;
+    if (sameFsPath(current, this.runtimePlacement.configurationRootPath)) return;
+    this.dataRootMovedWarned = true;
+    void vscode.window.showWarningMessage(
+      `${EXTENSION_BRAND} 数据目录已在其它窗口切换到 ${current}。本窗口仍在使用原来的目录，设置暂时不能修改，请重载窗口。`,
+      '重载窗口'
+    ).then((choice) => {
+      if (choice) void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    });
   }
 
   public async resetDevelopmentData(): Promise<StorageDataResetResult> {
@@ -592,34 +613,32 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return false;
   }
 
+  /** The configuration root this window's Runtime was opened under (data-directory commands). */
+  public dataRootPath(): string {
+    return this.runtimePlacement.configurationRootPath;
+  }
+
   /**
-   * Runs `operation` with every Host of this window's data directory offline: `coordinate` asks
-   * the other windows to reload (two-phase exclusive maintenance, inside the configuration
-   * admission and the selected root's maintenance claim, like reset), and this window closes its
-   * own Runtime first. Used to move or switch the data directory. When `runtimeClosed` is true the
-   * window must reload, whatever the outcome.
+   * The locks of an offline data-directory change, in the order open and reset take them: the
+   * configuration admission, then the selected root's maintenance claim. Cooperative exclusive
+   * maintenance calls this only for its short locked round (withLocks).
    */
-  public async runWithDataRootOffline<T>(
-    coordinate: (
-      paths: RuntimeRootPaths, requesterHostBootId: string, operation: () => Promise<T>
-    ) => Promise<RuntimeExclusiveMaintenanceOutcome<T>>,
-    operation: () => Promise<T>
-  ): Promise<{ outcome: RuntimeExclusiveMaintenanceOutcome<T> | { state: 'failed'; error: unknown }; runtimeClosed: boolean }> {
+  public withDataRootLocks<R>(body: () => Promise<R>): Promise<R> {
     this.requireOpen();
-    const paths = createVscodeRootAuthority(this.runtimePlacement).expectedPaths();
-    const hostBootId = this.product.application.database.hostBootId;
-    let runtimeClosed = false;
-    try {
-      const outcome = await withRuntimeDataRootAdmission(this.runtimePlacement.configurationRootPath, () =>
-        withRuntimeMaintenance(paths, () => coordinate(paths, hostBootId, async () => {
-          runtimeClosed = true;
-          await this.dispose();
-          return operation();
-        })));
-      return { outcome, runtimeClosed };
-    } catch (error) {
-      return { outcome: { state: 'failed', error }, runtimeClosed };
-    }
+    const { paths } = this.exclusiveMaintenanceTarget();
+    return withRuntimeDataRootAdmission(this.runtimePlacement.configurationRootPath, () => withRuntimeMaintenance(paths, body));
+  }
+
+  /** Closes this window's Runtime before an offline data-directory change; the window reloads afterwards. */
+  public async closeRuntime(): Promise<void> {
+    await this.dispose();
+  }
+
+  /** One Webview client only (e.g. the confirmation of a data-directory command); false when it is gone. */
+  public postToWebview(clientId: BridgeClientId, message: ExtensionToWebviewMessage): boolean {
+    if (this.disposed || !this.webviews.has(clientId)) return false;
+    this.broadcast(message, clientId);
+    return true;
   }
 
   public async dispose(): Promise<void> {
@@ -992,10 +1011,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return requireRows(snapshot.snapshot[0], `${domain} list`);
   }
 
-  /** Every broadcast is a bridge message of the shared protocol, including its channel. */
-  private broadcast(message: ExtensionToWebviewMessage): void {
+  /** Every broadcast is a bridge message of the shared protocol, including its channel; `onlyClientId` narrows it to one client. */
+  private broadcast(message: ExtensionToWebviewMessage, onlyClientId?: BridgeClientId): void {
     const plain = toStructuredClonePlainData(message, 'reliable configuration broadcast');
-    for (const webview of this.webviews.values()) {
+    for (const [clientId, webview] of this.webviews) {
+      if (onlyClientId !== undefined && clientId !== onlyClientId) continue;
       void webview.postMessage(plain).then(undefined, (error) => {
         console.warn('[LimCode] Reliable configuration broadcast failed.', error);
       });

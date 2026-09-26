@@ -24,6 +24,8 @@ export interface RuntimeSnapshotAuditRequest {
   measure?: boolean;
   /** runtimeDataSetContentDigest of the copy (the content part of a merge fingerprint). */
   contentDigest?: boolean;
+  /** false: only the schema checks and the requested measures (quick_check and foreign_key_check skipped). */
+  integrity?: boolean;
 }
 
 export interface RuntimeSnapshotAudit {
@@ -40,6 +42,7 @@ export interface RuntimeSnapshotAuditWorkerData {
   unfinishedWork?: 'finalize' | 'carry';
   measureTables?: string[];
   contentDigest?: boolean;
+  skipIntegrity?: true;
 }
 
 /** @internal */
@@ -61,7 +64,8 @@ export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnaps
     binding: JSON.parse(JSON.stringify(request.binding)) as RootBinding,
     ...(request.unfinishedWork ? { unfinishedWork: request.unfinishedWork } : {}),
     ...(request.measure ? { measureTables: RUNTIME_DOMAIN_SCHEMAS.map((schema) => schema.table) } : {}),
-    ...(request.contentDigest ? { contentDigest: true } : {})
+    ...(request.contentDigest ? { contentDigest: true } : {}),
+    ...(request.integrity === false ? { skipIntegrity: true as const } : {})
   };
   return new Promise((resolve, reject) => {
     let settled = false;

@@ -683,3 +683,15 @@ test('sync stale-generation race immediately re-enters acquisition after another
     await fsp.rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+test('reading a record store that does not exist creates nothing (no lock directory, e.g. under an unmounted drive)', async () => {
+  const rootPath = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-missing-'));
+  try {
+    const store = path.join(rootPath, 'settings', 'mcp-servers');
+    const snapshot = await recordStore.loadRecordStoreSnapshot(MockUri.file(store), MockUri.file(path.join(store, 'index.json')), 'server');
+    assert.equal(snapshot, undefined);
+    assert.deepEqual(await fsp.readdir(rootPath), [], 'the mount point stays empty');
+  } finally {
+    await fsp.rm(rootPath, { recursive: true, force: true });
+  }
+});
