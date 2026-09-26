@@ -637,7 +637,7 @@ test('迁移复用：CAS 在线预复制（按 RootAuthority 校验来源身份�
 
   const database = await openTarget(t, fresh);
   const target = { configurationRootPath: otherRoot, database };
-  const result = await mergeRuntimeDataSetIntoDatabase(fixture.paths, input, target, { linkFile: crossDevice, allowUnfinishedWork: true });
+  const result = await mergeRuntimeDataSetIntoDatabase(fixture.paths, input, target, { linkFile: crossDevice, migration: true });
   assert.equal(result.insertedConversations, 2);
   assert.equal(result.copiedCasObjects, 0, '预复制之后不再复制正文');
   assert.equal(result.reusedCasObjects, precopy.copiedCasObjects);
@@ -648,6 +648,43 @@ test('迁移复用：CAS 在线预复制（按 RootAuthority 校验来源身份�
     assert.deepEqual(moved.database.pragma('foreign_key_check'), []);
   } finally { moved.close(); }
   assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), sourceBefore);
+});
+
+test('迁移遇到正在接收回复的模型请求时明确失败：目标不写入任何行，来源和合并记录原样不动', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false, selected: 'alpha' });
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_kept', project: SHARED_PROJECT },
+    { id: 'conversation_alpha_streaming', project: SHARED_PROJECT }
+  ]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_streaming', kind: 'leased-model-request' }]);
+  const streaming = new Database(fixture.alpha.binding.paths.databasePath);
+  try {
+    streaming.prepare("UPDATE model_request SET status = 'streaming' WHERE id = ?")
+      .run('conversation_alpha_streaming_unfinished_turn_request');
+  } finally { streaming.close(); }
+  const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-dataset-merge-streaming-'));
+  t.after(() => fs.rm(otherRoot, { recursive: true, force: true }));
+  const fresh = await initialize(otherRoot, 'default');
+  const database = await openTarget(t, fresh);
+  const sourceBefore = await treeSnapshot(fixture.alpha.scopeRoot);
+  const ledgerBefore = await treeSnapshot(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths)).catch(() => undefined);
+
+  // The selected data set is the migration source; a historical merge would defer it instead.
+  await assert.rejects(mergeRuntimeDataSetIntoDatabase(fixture.paths, {
+    candidateId: fixture.alpha.id,
+    expectedDataSetId: fixture.alpha.binding.dataSetId,
+    expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
+  }, { configurationRootPath: otherRoot, database }, { migration: true }), (error) => {
+    assert.equal(error.code, 'runtime-data-set-merge-streaming-model-request');
+    assert.match(error.message, /1 个正在接收回复的模型请求/);
+    return true;
+  });
+  const moved = readDatabase(fresh);
+  try { assert.equal(moved.count('conversation'), 0, '目标库没有写入任何对话'); }
+  finally { moved.close(); }
+  assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), sourceBefore);
+  assert.deepEqual(await treeSnapshot(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths)).catch(() => undefined), ledgerBefore,
+    '迁移不写合并记录');
 });
 
 async function createFixture(t, options = {}) {

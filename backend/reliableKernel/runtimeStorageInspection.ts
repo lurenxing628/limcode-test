@@ -147,7 +147,14 @@ export interface RuntimeDataSetDatabaseSnapshot {
  */
 export async function createRuntimeDataSetDatabaseSnapshot(
   candidate: VscodeRuntimeDataSetCandidate,
-  binding: HistoricalRootBinding
+  binding: HistoricalRootBinding,
+  options: {
+    /**
+     * Runs on the finished private copy before this thread opens it (e.g. a worker audit). The
+     * copy is then closed by every other connection of this process; see runtimeSnapshotAudit.
+     */
+    beforeOpen?(snapshotPath: string): Promise<void>;
+  } = {}
 ): Promise<RuntimeDataSetDatabaseSnapshot> {
   const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-runtime-history-'));
   let database: Database.Database | undefined;
@@ -165,6 +172,7 @@ export async function createRuntimeDataSetDatabaseSnapshot(
       }
       if (suffix === '-wal') await fs.copyFile(source, `${snapshotPath}${suffix}`, constants.COPYFILE_FICLONE);
     }
+    await options.beforeOpen?.(snapshotPath);
     database = new Database(toSqliteFilePath(snapshotPath), { readonly: true, fileMustExist: true });
     configureReaderConnection(database);
     database.pragma('query_only = ON');

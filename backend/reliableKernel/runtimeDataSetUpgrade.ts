@@ -1,7 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { RUNTIME_KERNEL_EPOCH, freezeRootBinding, type RootBinding } from './contracts';
-import { assertCurrentSchema, auditDatabaseIntegrity } from './databaseSchema';
 import { physicalCutoverRecoveryRequired, readPhysicalCutoverRequest } from './physicalCutover';
 import { RootAuthorityError } from './rootAuthority';
 import {
@@ -10,11 +9,10 @@ import {
 import {
   assertRuntimeHostsOffline, runtimeHostLivenessDirectory, withRuntimeDataRootAdmission, withRuntimeMaintenance
 } from './runtimeHostControl';
-import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import {
   assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet
 } from './runtimeStorageInspection';
-import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
+import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
 import {
   createVscodeRootAuthority, inspectVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet,
   type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
@@ -175,13 +173,12 @@ export async function upgradeRuntimeDataSet(
       }
       const binding = freezeRootBinding(historical as RootBinding);
       // Validate idempotent current-epoch calls as strictly as a newly upgraded target, opening
-      // only an offline copy so a validation-only command cannot create source WAL/SHM files.
-      const snapshot = await createRuntimeDataSetDatabaseSnapshot(upgraded, historical);
-      try {
-        assertCurrentSchema(snapshot.database, binding);
-        assertRuntimePhysicalSchemaFingerprint(snapshot.database, RUNTIME_DOMAIN_SCHEMAS);
-        auditDatabaseIntegrity(snapshot.database);
-      } finally { await snapshot.close(); }
+      // only an offline copy so a validation-only command cannot create source WAL/SHM files. The
+      // full-file checks run in a worker on that copy (runtimeSnapshotAudit).
+      const snapshot = await createRuntimeDataSetDatabaseSnapshot(upgraded, historical, {
+        beforeOpen: async (snapshotPath) => { await auditRuntimeSnapshot(snapshotPath, { binding }); }
+      });
+      await snapshot.close();
       return {
         candidateId: request.candidateId,
         binding,

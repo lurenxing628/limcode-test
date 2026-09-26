@@ -397,7 +397,8 @@ function checkBridgePayloadPlain() {
   const webviewBoundaryPaths = new Set(boundarySpecs.map((entry) => entry.path));
   const internalStructuredClonePaths = new Set([
     'dist/extension/backend/reliableKernel/databaseWorker.js',
-    'dist/extension/backend/reliableKernel/runtimeDatabase.js'
+    'dist/extension/backend/reliableKernel/runtimeDatabase.js',
+    'dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js'
   ]);
   const problems = [];
 
