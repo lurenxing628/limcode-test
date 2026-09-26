@@ -992,9 +992,8 @@ export class ReliableConversationRunner {
           hostBootId: this.application.database.hostBootId
         });
         if (!fence) return 'retry';
-        const terminated = await runWithExecutionLeaseFence(fence, () =>
-          this.application.agentLoop.terminateRequested(turnId));
-        return terminated ? 'interrupted' : 'retry';
+        return await this.settleUnderClaimedLease(fence, () =>
+          this.application.agentLoop.terminateRequested(turnId)) ? 'interrupted' : 'retry';
       });
     } catch (error) {
       if (isConversationRuntimeOwnerBusyError(error)) return 'busy';
@@ -1036,11 +1035,14 @@ export class ReliableConversationRunner {
           hostBootId
         });
         if (!fence) return 'retry';
-        return runWithExecutionLeaseFence(fence, async () => {
+        let unsettled: 'live' | 'none' | 'retry' = 'retry';
+        return await this.settleUnderClaimedLease(fence, async () => {
           // Re-read under the lease: another stop may have closed some of the work meanwhile.
           const current = await phaseD.deadHostEffectsForTurn(turnId, hostBootId);
-          if (current.state === 'live') return 'live';
-          if (current.state === 'unsupported') return 'none';
+          if (current.state === 'live' || current.state === 'unsupported') {
+            unsettled = current.state === 'live' ? 'live' : 'none';
+            return false;
+          }
           if (current.state === 'dead') {
             await phaseD.abandonDeadHostEffects({
               sourceKey: `user-stop-dead-host:${turnId}`,
@@ -1048,15 +1050,32 @@ export class ReliableConversationRunner {
               reason: DEAD_HOST_STOP_REASON
             });
           }
-          return await this.application.agentLoop.terminateRequested(turnId, 'user-stop-after-window-exit')
-            ? 'interrupted'
-            : 'retry';
-        });
+          return this.application.agentLoop.terminateRequested(turnId, 'user-stop-after-window-exit');
+        }) ? 'interrupted' : unsettled;
       });
     } catch (error) {
       if (isConversationRuntimeOwnerBusyError(error)) return 'live';
       this.onError(error, { operation: 'drive', conversationId, turnId });
       return 'retry';
+    }
+  }
+
+  /**
+   * Control-only settlement under a lease this Host just claimed. Anything short of a terminal Turn,
+   * a failure included, hands the lease back within the same owner hold, so a Host serving the
+   * Conversation can take the Turn over while this one stays alive.
+   */
+  private async settleUnderClaimedLease(fence: ExecutionLeaseFence, settle: () => Promise<boolean>): Promise<boolean> {
+    let settled = false;
+    try {
+      settled = await runWithExecutionLeaseFence(fence, settle);
+      return settled;
+    } finally {
+      if (!settled) {
+        await this.application.turns.releaseExecutionLease(fence).catch((error: unknown) => {
+          this.onError(error, { operation: 'watch-recovery', conversationId: fence.conversationId, turnId: fence.turnId });
+        });
+      }
     }
   }
 

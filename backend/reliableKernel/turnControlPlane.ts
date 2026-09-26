@@ -85,6 +85,12 @@ import {
 } from './childExecutionBoundary';
 
 export const DEFAULT_AGENT_CONVERSATION_ROLE = 'default';
+/**
+ * Owner and Host identity of an ExecutionLease a live Host handed back. No Host ever registers
+ * this identity, so the existing takeover rule (the lease's Host is not alive) lets any Host claim
+ * the Turn, while the generation bump fences every write of the previous holder.
+ */
+export const RELEASED_EXECUTION_LEASE_HOLDER = 'released-execution-lease';
 
 const TURN_STATUS_ACTIVE = 'active';
 const TURN_STATUS_TERMINATED = 'terminated';
@@ -1066,6 +1072,42 @@ export class TurnControlPlane {
       }
       throw error;
     }
+  }
+
+  /**
+   * Hands a Turn's execution back while this Host stays alive, e.g. after control-only settlement
+   * failed or when this Host stopped serving the Conversation. Only the exact fenced generation is
+   * replaced: the next generation is already expired and held by RELEASED_EXECUTION_LEASE_HOLDER,
+   * so the holder's delayed writes fail and a Host serving the Conversation can claim the Turn
+   * without waiting for this one to exit. False means the fence had already been replaced.
+   */
+  public async releaseExecutionLease(fence: ExecutionLeaseFence): Promise<boolean> {
+    return this.runOwnedConversationMutation(fence.conversationId, async () => {
+      const now = this.timestamp();
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('Turn').assert(fence.turnId, { status: TURN_STATUS_ACTIVE }),
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(fence.id, {
+            conversation_id: fence.conversationId,
+            turn_id: fence.turnId,
+            owner_id: fence.ownerId,
+            host_boot_id: fence.hostBootId,
+            generation: fence.generation
+          }),
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').update(fence.id, {
+            owner_id: RELEASED_EXECUTION_LEASE_HOLDER,
+            host_boot_id: RELEASED_EXECUTION_LEASE_HOLDER,
+            generation: fence.generation + 1n,
+            acquired_at: now,
+            expires_at: now
+          })
+        ]);
+        return true;
+      } catch (error) {
+        if (isTransactionAssertionError(error)) return false;
+        throw error;
+      }
+    });
   }
 
   /**
