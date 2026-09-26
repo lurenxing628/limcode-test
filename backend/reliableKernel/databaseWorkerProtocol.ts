@@ -172,15 +172,26 @@ export interface ClientCollaborationHistoryPageResult extends ClientVisibleMessa
   scannedRows: number;
 }
 
+/** One (updated_at, id) key of the history order; `from` is inclusive, `after`/`before` exclusive. */
+export interface ConversationHistoryPageBoundary {
+  kind: 'from' | 'after' | 'before';
+  updatedAt: string;
+  id: string;
+}
+
 export interface ConversationHistoryProjectionInput {
   scopeKind: 'all' | 'unbound' | 'project';
   projectFolderUri?: string;
   limit: number;
-  afterUpdatedAt?: string;
-  afterId?: string;
+  /** Requested zero-based page; the worker clamps it to the current last page. */
+  pageIndex: number;
+  /** Positions pages beyond the exact page-number window; ignored inside that window. */
+  boundary?: ConversationHistoryPageBoundary;
 }
 
 export interface ConversationHistoryProjectionResult {
+  /** The page actually read after clamping to the current data. */
+  pageIndex: number;
   seedRows: DomainRow[];
   conversations: DomainRow[];
   origins: DomainRow[];

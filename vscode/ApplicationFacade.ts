@@ -38,9 +38,20 @@ export type ConversationRecoveryResult =
   | { status: 'waiting_for_project'; projectName: string }
   | { status: 'waiting_for_work_environment'; workEnvironmentId: string };
 
+/**
+ * A Conversation this window just created, forked or sent input to. The sidebar returns to the first
+ * history page when the Conversation belongs to the scope it is showing.
+ */
+export interface ConversationHistoryRevealTarget {
+  conversationId: string;
+  /** Primary project folder URI; absent for an unbound Conversation. */
+  projectFolderUri?: string;
+}
+
 /** VS Code shell 只依赖此门面，不拥有或推断 Runtime 领域关系。 */
 export interface ApplicationFacade {
   readonly onDidChangeConversationHistory: vscode.Event<void>;
+  readonly onDidRevealConversationHistoryTop: vscode.Event<ConversationHistoryRevealTarget>;
 
   createConversation(options?: { projectFolderUri?: string }): Promise<string>;
   forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult>;

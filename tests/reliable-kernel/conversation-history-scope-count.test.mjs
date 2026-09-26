@@ -104,7 +104,8 @@ test('按项目索引计数与原全表计数在 all/project/unbound 及删除�
     const projection = await database.conversationHistoryProjection({
       scopeKind: item.scopeKind,
       ...(item.projectFolderUri ? { projectFolderUri: item.projectFolderUri } : {}),
-      limit: 7
+      limit: 7,
+      pageIndex: 0
     });
     const label = `${item.scopeKind}:${item.projectFolderUri ?? ''}`;
     assert.equal(projection.total, item.expected, label);
@@ -136,4 +137,32 @@ test('项目历史计数从唯一 URI 索引定位并只走项目关联索引', 
       scopeKind
     );
   }
+});
+
+test('非 primary 关联、URI 大小写与尾斜杠都按原全表计数的精确匹配语义处理', async (t) => {
+  const { root, database } = await historyFixture(t);
+  const at = new Date(Date.UTC(2026, 8, 3)).toISOString();
+  // A non-primary link neither counts for its project nor removes the Conversation from unbound.
+  await database.transaction([
+    row('Conversation', { id: 'secondary-only', title: 's', status: 'active', created_at: at, updated_at: at }),
+    row('ConversationProjectLink', {
+      id: 'link-secondary-only', conversation_id: 'secondary-only', project_context_id: 'project-p0',
+      role: 'secondary', created_at: at, updated_at: at
+    })
+  ]);
+  const native = new NativeDatabase(root.binding.paths.databasePath, { readonly: true });
+  t.after(() => native.close());
+  const variants = [
+    PROJECTS.p0, `${PROJECTS.p0}/`, PROJECTS.p0.toUpperCase(), ` ${PROJECTS.p0} `,
+    PROJECTS.p1, `${PROJECTS.p1}/`, 'FILE:///workspace/p1'
+  ];
+  for (const uri of variants) {
+    const projection = await database.conversationHistoryProjection({ scopeKind: 'project', projectFolderUri: uri, limit: 3, pageIndex: 0 });
+    assert.equal(projection.total, legacyTotal(native, 'project', uri), uri);
+  }
+  assert.equal((await database.conversationHistoryProjection({ scopeKind: 'project', projectFolderUri: PROJECTS.p0, limit: 3, pageIndex: 0 })).total, 37);
+  assert.equal((await database.conversationHistoryProjection({ scopeKind: 'project', projectFolderUri: `${PROJECTS.p0}/`, limit: 3, pageIndex: 0 })).total, 0);
+  const unbound = await database.conversationHistoryProjection({ scopeKind: 'unbound', limit: 3, pageIndex: 0 });
+  assert.equal(unbound.total, legacyTotal(native, 'unbound', ''));
+  assert.equal(unbound.total, 9, '只有非 primary 关联的会话仍属于未绑定历史');
 });

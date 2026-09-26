@@ -65,6 +65,8 @@ export interface VscodeReliableKernelCommandRouterOptions {
     conversationId: string;
     deduplicated: boolean;
   }>;
+  /** A newly accepted user input for this Conversation (not a deduplicated replay). */
+  onConversationInputAccepted?(conversationId: string): void;
   openPlanProposal?(payload: { conversationId?: string; toolCallId?: string; planProposalId?: string; title?: string }): void;
   /**
    * The Conversation bound at attach time for one client. A feed may reconnect/resync only to
@@ -1228,7 +1230,7 @@ export class VscodeReliableKernelCommandRouter {
       ...(result.intentId ? { intentId: result.intentId } : {}),
       ...(result.turnId ? { turnId: result.turnId } : {}),
       ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
-    });
+    });    if (!result.deduplicated) this.options.onConversationInputAccepted?.(payload.conversationId);
   }
 
   private async handleTurnSteer(

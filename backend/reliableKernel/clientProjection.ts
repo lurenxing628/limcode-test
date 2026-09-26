@@ -1605,9 +1605,16 @@ function readTaskProjectionJson(
 }
 
 /**
- * A history page is the scope's Conversations strictly after one (updated_at, id) anchor. The
- * anchor is a key, not a frozen snapshot position, so any later commit simply re-reads the same
- * page against current facts: deleted rows vanish and updated rows rise to the first page.
+ * Pages with at most this many rows before them are addressed by page number: every read partitions
+ * the current order exactly, so a refresh never hides a boundary row or repeats a neighbour's rows.
+ * Deeper pages are addressed by their (updated_at, id) boundary instead, keeping each read bounded.
+ */
+export const CONVERSATION_HISTORY_EXACT_OFFSET_ROWS = 10_000;
+
+/**
+ * Reads one sidebar history page against current facts. The requested page number is clamped to
+ * the current last page inside the same read transaction, so a page emptied by deletions resolves
+ * to the nearest existing page in one bounded read instead of a client-driven retry loop.
  */
 export function executeConversationHistoryProjection(
   database: Database.Database,
@@ -1616,41 +1623,31 @@ export function executeConversationHistoryProjection(
   if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) {
     throw new RangeError(`Conversation history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
   }
-  if ((input.afterUpdatedAt === undefined) !== (input.afterId === undefined)) {
-    throw new TypeError('Conversation history cursor requires both afterUpdatedAt and afterId.');
+  if (!Number.isSafeInteger(input.pageIndex) || input.pageIndex < 0) {
+    throw new RangeError('Conversation history pageIndex must be a non-negative integer.');
+  }
+  if (input.boundary && (
+    !['from', 'after', 'before'].includes(input.boundary.kind)
+    || typeof input.boundary.updatedAt !== 'string' || !input.boundary.updatedAt
+    || typeof input.boundary.id !== 'string' || !input.boundary.id
+  )) {
+    throw new TypeError('Conversation history page boundary is malformed.');
   }
   if (input.scopeKind === 'project' && !input.projectFolderUri?.trim()) {
     throw new TypeError('Project conversation history requires projectFolderUri.');
   }
-  const useCursor = input.afterUpdatedAt !== undefined;
   const scope = conversationHistoryScopeSql(input, 'conversation');
-  const cursorSql = useCursor
-    ? `AND (conversation.updated_at < @afterUpdatedAt
-         OR (conversation.updated_at = @afterUpdatedAt AND conversation.id < @afterId))`
-    : '';
   database.exec('BEGIN');
   try {
-    const seedCandidates = queryPlainRows(database, `
-      SELECT conversation.id, conversation.title, conversation.status,
-             conversation.created_at, conversation.updated_at
-        FROM conversation
-       WHERE ${scope.sql}
-             ${cursorSql}
-       ORDER BY conversation.updated_at DESC, conversation.id DESC
-       LIMIT @seedLimit
-    `, {
-      ...scope.params,
-      ...(useCursor ? { afterUpdatedAt: input.afterUpdatedAt!, afterId: input.afterId! } : {}),
-      seedLimit: BigInt(input.limit + 1)
-    });
-    const hasMore = seedCandidates.length > input.limit;
-    const seedRows = seedCandidates.slice(0, input.limit);
     const totalQuery = conversationHistoryTotalQuery(input);
     const totalRow = database.prepare(totalQuery.sql).get(totalQuery.params) as { total: bigint };
+    const page = conversationHistoryPageSeed(database, scope, input, Number(totalRow.total));
+    const { seedRows, hasMore } = page;
     const seedIds = seedRows.map((row) => String(row.id));
     if (seedIds.length === 0) {
       database.exec('COMMIT');
       return {
+        pageIndex: page.pageIndex,
         seedRows: [], conversations: [], origins: [], turns: [], leases: [], agentLinks: [],
         messageSummaries: [], previewTargets: [], titleTargets: [], childExecutions: [], activeChildTurnLinks: [],
         answerBridges: [], inboxItems: [], deliveries: [], deliveryWakes: [], deliveryInputLinks: [],
@@ -1724,6 +1721,7 @@ export function executeConversationHistoryProjection(
     const deliveryInputLinks = queryAllByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
     database.exec('COMMIT');
     return {
+      pageIndex: page.pageIndex,
       seedRows,
       conversations,
       origins,
@@ -1749,6 +1747,61 @@ export function executeConversationHistoryProjection(
     database.exec('ROLLBACK');
     throw error;
   }
+}
+
+const HISTORY_SEED_COLUMNS = `conversation.id, conversation.title, conversation.status,
+             conversation.created_at, conversation.updated_at`;
+const HISTORY_ORDER_DESC = 'ORDER BY conversation.updated_at DESC, conversation.id DESC';
+const HISTORY_ORDER_ASC = 'ORDER BY conversation.updated_at ASC, conversation.id ASC';
+
+function conversationHistoryPageSeed(
+  database: Database.Database,
+  scope: { sql: string; params: Record<string, string> },
+  input: ConversationHistoryProjectionInput,
+  total: number
+): { pageIndex: number; seedRows: DomainRow[]; hasMore: boolean } {
+  const limit = input.limit;
+  const lastPageIndex = total === 0 ? 0 : Math.floor((total - 1) / limit);
+  const read = (sql: string, params: Record<string, string | bigint>): DomainRow[] =>
+    queryPlainRows(database, `SELECT ${HISTORY_SEED_COLUMNS} FROM conversation WHERE ${scope.sql} ${sql}`, {
+      ...scope.params,
+      ...params
+    });
+  const numbered = (pageIndex: number) => ({
+    pageIndex,
+    seedRows: read(`${HISTORY_ORDER_DESC} LIMIT @limit OFFSET @offset`, {
+      limit: BigInt(limit),
+      offset: BigInt(pageIndex * limit)
+    }),
+    hasMore: pageIndex < lastPageIndex
+  });
+  // The oldest page is read upward from the end of the order, so it stays exact at any depth.
+  const last = () => ({
+    pageIndex: lastPageIndex,
+    seedRows: read(`${HISTORY_ORDER_ASC} LIMIT @limit`, {
+      limit: BigInt(total - lastPageIndex * limit)
+    }).reverse(),
+    hasMore: false
+  });
+  const requested = Math.min(input.pageIndex, lastPageIndex);
+  if (requested * limit <= CONVERSATION_HISTORY_EXACT_OFFSET_ROWS) return numbered(requested);
+  if (requested === lastPageIndex) return last();
+  const exactWindowPageIndex = Math.floor(CONVERSATION_HISTORY_EXACT_OFFSET_ROWS / limit);
+  const boundary = input.boundary;
+  if (!boundary) return numbered(exactWindowPageIndex);
+  const key = { boundaryUpdatedAt: boundary.updatedAt, boundaryId: boundary.id, limit: BigInt(limit) };
+  if (boundary.kind === 'before') {
+    const rows = read(`AND (conversation.updated_at > @boundaryUpdatedAt
+           OR (conversation.updated_at = @boundaryUpdatedAt AND conversation.id > @boundaryId))
+         ${HISTORY_ORDER_ASC} LIMIT @limit`, key).reverse();
+    // Fewer than a page above the boundary means the order shrank to the first page.
+    return rows.length === limit ? { pageIndex: requested, seedRows: rows, hasMore: true } : numbered(0);
+  }
+  const comparison = boundary.kind === 'from' ? '<=' : '<';
+  const rows = read(`AND (conversation.updated_at < @boundaryUpdatedAt
+         OR (conversation.updated_at = @boundaryUpdatedAt AND conversation.id ${comparison} @boundaryId))
+       ${HISTORY_ORDER_DESC} LIMIT @limit`, key);
+  return rows.length === limit ? { pageIndex: requested, seedRows: rows, hasMore: requested < lastPageIndex } : last();
 }
 
 function conversationHistoryScopeSql(

@@ -19,7 +19,7 @@ import {
   type VscodeWorkspaceRuntimePlacement
 } from '../../reliableKernel/vscodeRootAuthority';
 import type { RootBinding, RuntimeCommitResult } from '../../reliableKernel/contracts';
-import type { ConversationHistoryProjectionResult } from '../../reliableKernel/databaseWorkerProtocol';
+import type { ConversationHistoryPageBoundary as HistoryPageBoundary } from '../../reliableKernel/databaseWorkerProtocol';
 import {
   assertRuntimeHostsOffline,
   withRuntimeDataRootAdmission,
@@ -51,6 +51,7 @@ import type {
   ConversationAbortResult,
   ConversationAbortTarget,
   ConversationForkResult,
+  ConversationHistoryRevealTarget,
   ConversationRecoveryResult
 } from '../../../vscode/ApplicationFacade';
 import { VscodeReliableKernelCommandRouter } from './VscodeReliableKernelCommandRouter';
@@ -83,6 +84,8 @@ const INTERACTION_ATTENTION_REFRESH_DELAY_MS = 25;
 export class VscodeReliableKernelApplicationFacade implements ApplicationFacade {
   private readonly historyEmitter = new vscode.EventEmitter<void>();
   public readonly onDidChangeConversationHistory = this.historyEmitter.event;
+  private readonly historyRevealEmitter = new vscode.EventEmitter<ConversationHistoryRevealTarget>();
+  public readonly onDidRevealConversationHistoryTop = this.historyRevealEmitter.event;
 
   private readonly webviews = new Map<BridgeClientId, vscode.Webview>();
   /** Attach-meta Conversation binding per client; a feed may never retarget beyond it. */
@@ -130,6 +133,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         this.product.application.webviewFeed.postToConversation(conversationId, { ...message }),
       createConversation: (options) => this.createConversation(options),
       forkConversation: (request) => this.forkConversation(request),
+      onConversationInputAccepted: (conversationId) => this.revealConversationHistoryTop(conversationId),
       conversationIdForClient: (clientId) => this.webviewConversationIds.get(clientId)
     });
     this.externalHistoryWatcher = new ExternalDataVersionWatcher(
@@ -266,6 +270,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       ]);
       await this.refreshConversationHistory();
     });
+    this.historyRevealEmitter.fire({
+      conversationId,
+      ...(projectFolder ? { projectFolderUri: projectFolder.uri.toString() } : {})
+    });
     return conversationId;
   }
 
@@ -278,7 +286,23 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       commandId: requireText(request.command?.commandId, 'Conversation fork commandId')
     });
     await this.refreshConversationHistory();
+    await this.revealConversationHistoryTop(result.conversationId);
     return result;
+  }
+
+  /** Tells the sidebar this window just acted on a Conversation, with its primary project for scoping. */
+  private async revealConversationHistoryTop(conversationId: string): Promise<void> {
+    try {
+      const [link] = await this.list('ConversationProjectLink', { conversation_id: conversationId, role: 'primary' }, 1);
+      const project = link ? await this.maybeRow('ProjectContext', requireText(link.project_context_id, 'ConversationProjectLink.project_context_id')) : null;
+      if (this.disposed) return;
+      this.historyRevealEmitter.fire({
+        conversationId,
+        ...(project ? { projectFolderUri: requireText(project.uri, 'ProjectContext.uri') } : {})
+      });
+    } catch (error) {
+      console.warn('[LimCode] Failed to reveal the acted-on Conversation in history.', error);
+    }
   }
 
   /** The stateless lifecycle service shared with model tools; it never posts to a webview. */
@@ -547,6 +571,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     void this.historyRefresh?.catch(() => undefined);
     for (const clientId of [...this.webviews.keys()]) this.detachWebview(clientId);
     this.historyEmitter.dispose();
+    this.historyRevealEmitter.dispose();
     if (!this.productClosed) {
       this.productClosed = true;
       await this.product.close();
@@ -637,14 +662,16 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   ): Promise<ConversationHistoryPageRecord> {
     const scopeKey = conversationHistoryScopeKey(scope);
     const dataSetKey = historyCursorDataSetKey(this.product.application.database.binding);
-    let state = decodeHistoryKeysetCursor(cursor, scopeKey, limit, dataSetKey);
-    let projection = await this.readConversationHistoryProjection(scope, state, limit);
-    // Refreshes re-read the same anchored page against current facts. Only a page emptied by
-    // deletions moves back toward the first page, one bounded trail step at a time.
-    while (projection.seedRows.length === 0 && state.anchor !== null) {
-      state = { anchor: state.trail.at(-1) ?? null, trail: state.trail.slice(0, -1) };
-      projection = await this.readConversationHistoryProjection(scope, state, limit);
-    }
+    const position = decodeHistoryPageCursor(cursor, scopeKey, limit, dataSetKey);
+    // One bounded read: the worker positions the page by number against current facts and clamps
+    // a page emptied by deletions to the current last page.
+    const projection = await this.product.application.database.conversationHistoryProjection({
+      scopeKind: scope.kind,
+      ...(scope.kind === 'project' ? { projectFolderUri: scope.folderUri } : {}),
+      limit,
+      pageIndex: position.pageIndex,
+      ...(position.boundary ? { boundary: position.boundary } : {})
+    });
     const messageCounts = new Map(projection.messageSummaries.map((row) => [
       String(row.conversation_id),
       Number(row.message_count)
@@ -727,20 +754,20 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       };
     });
     const originLinks = projection.origins.map(conversationOriginLink);
+    const pageIndex = projection.pageIndex;
+    const firstSeed = projection.seedRows[0];
     const lastSeed = projection.seedRows.at(-1);
-    const currentCursor = encodeHistoryKeysetCursor(scopeKey, limit, dataSetKey, state);
-    const nextCursor = projection.hasMore && lastSeed
-      ? encodeHistoryKeysetCursor(scopeKey, limit, dataSetKey, {
-          anchor: { updatedAt: requireText(lastSeed.updated_at, 'Conversation.updated_at'), id: requireText(lastSeed.id, 'Conversation.id') },
-          trail: [...state.trail, state.anchor]
-        })
+    const boundary = (kind: HistoryPageBoundary['kind'], row: DomainRow | undefined): HistoryPageBoundary | undefined =>
+      row ? { kind, updatedAt: requireText(row.updated_at, 'Conversation.updated_at'), id: requireText(row.id, 'Conversation.id') } : undefined;
+    const currentCursor = encodeHistoryPageCursor(scopeKey, limit, dataSetKey, {
+      pageIndex,
+      boundary: boundary('from', firstSeed)
+    });
+    const nextCursor = projection.hasMore
+      ? encodeHistoryPageCursor(scopeKey, limit, dataSetKey, { pageIndex: pageIndex + 1, boundary: boundary('after', lastSeed) })
       : undefined;
-    const previousAnchor = state.trail.at(-1) ?? null;
-    const previousCursor = state.trail.length > 0
-      ? encodeHistoryKeysetCursor(scopeKey, limit, dataSetKey, {
-          anchor: previousAnchor,
-          trail: state.trail.slice(0, -1)
-        })
+    const previousCursor = pageIndex > 0
+      ? encodeHistoryPageCursor(scopeKey, limit, dataSetKey, { pageIndex: pageIndex - 1, boundary: boundary('before', firstSeed) })
       : undefined;
     return {
       scope,
@@ -750,26 +777,13 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         cursor: currentCursor,
         ...(nextCursor ? { nextCursor } : {}),
         ...(previousCursor ? { previousCursor } : {}),
-        pageIndex: state.trail.length,
+        pageIndex,
         pageSize: limit,
         total: projection.total,
         hasNext: Boolean(nextCursor),
         hasPrevious: Boolean(previousCursor)
       }
     };
-  }
-
-  private readConversationHistoryProjection(
-    scope: ConversationHistoryScope,
-    state: HistoryCursorState,
-    limit: number
-  ): Promise<ConversationHistoryProjectionResult> {
-    return this.product.application.database.conversationHistoryProjection({
-      scopeKind: scope.kind,
-      ...(scope.kind === 'project' ? { projectFolderUri: scope.folderUri } : {}),
-      limit,
-      ...(state.anchor ? { afterUpdatedAt: state.anchor.updatedAt, afterId: state.anchor.id } : {})
-    });
   }
 
   private async readConversationHistoryProjectionPreviews(
@@ -963,48 +977,46 @@ function conversationHistoryScopeKey(scope: ConversationHistoryScope): string {
   return scope.kind === 'project' ? `project:${scope.folderUri}` : scope.kind;
 }
 
-interface HistoryCursorAnchor { updatedAt: string; id: string }
-interface HistoryCursorState {
-  anchor: HistoryCursorAnchor | null;
-  trail: Array<HistoryCursorAnchor | null>;
+interface HistoryPagePosition {
+  pageIndex: number;
+  boundary?: HistoryPageBoundary;
 }
 
-function emptyHistoryCursorState(): HistoryCursorState {
-  return { anchor: null, trail: [] };
-}
+const FIRST_HISTORY_PAGE: HistoryPagePosition = { pageIndex: 0 };
+const HISTORY_PAGE_BOUNDARY_KINDS: ReadonlySet<string> = new Set(['from', 'after', 'before']);
 
 /**
- * History cursors hold (updated_at, id) keys, which stay meaningful across commits in the same
- * data set. They are bound only to the RootBinding identity: a cursor minted before a data-set
- * switch or root generation change starts again at the first page of the current data set.
+ * History cursors name a page number plus the neighbouring (updated_at, id) key used only beyond
+ * the exact page-number window. They are bound to the RootBinding identity: a cursor minted before a
+ * data-set switch or root generation change starts again at the first page of the current data set.
  */
 function historyCursorDataSetKey(binding: RootBinding): string {
   return `${binding.dataSetId}:${binding.rootInstanceId}:${binding.rootGeneration}`;
 }
 
-function encodeHistoryKeysetCursor(
+function encodeHistoryPageCursor(
   scopeKey: string,
   pageSize: number,
   dataSetKey: string,
-  state: HistoryCursorState
+  position: HistoryPagePosition
 ): string {
   return Buffer.from(JSON.stringify({
-    kind: 'conversation-history-keyset-page',
+    kind: 'conversation-history-page',
     scopeKey,
     pageSize,
     dataSet: dataSetKey,
-    anchor: state.anchor,
-    trail: state.trail
+    pageIndex: position.pageIndex,
+    ...(position.boundary ? { boundary: position.boundary } : {})
   }), 'utf8').toString('base64url');
 }
 
-function decodeHistoryKeysetCursor(
+function decodeHistoryPageCursor(
   cursor: string | undefined,
   scopeKey: string,
   pageSize: number,
   dataSetKey: string
-): HistoryCursorState {
-  if (!cursor) return emptyHistoryCursorState();
+): HistoryPagePosition {
+  if (!cursor) return FIRST_HISTORY_PAGE;
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
@@ -1016,31 +1028,35 @@ function decodeHistoryKeysetCursor(
   }
   const value = parsed as Record<string, unknown>;
   if (
-    value.kind !== 'conversation-history-keyset-page'
+    value.kind !== 'conversation-history-page'
     || value.scopeKey !== scopeKey
     || value.pageSize !== pageSize
     || typeof value.dataSet !== 'string'
-    || !Array.isArray(value.trail)
+    || !Number.isSafeInteger(value.pageIndex)
+    || (value.pageIndex as number) < 0
   ) {
     throw new TypeError('Conversation history cursor does not match the requested tree page.');
   }
-  if (value.dataSet !== dataSetKey) return emptyHistoryCursorState();
+  if (value.dataSet !== dataSetKey) return FIRST_HISTORY_PAGE;
   return {
-    anchor: decodeHistoryCursorAnchor(value.anchor),
-    trail: value.trail.map(decodeHistoryCursorAnchor)
+    pageIndex: value.pageIndex as number,
+    ...(value.boundary === undefined ? {} : { boundary: decodeHistoryPageBoundary(value.boundary) })
   };
 }
 
-function decodeHistoryCursorAnchor(value: unknown): HistoryCursorAnchor | null {
-  if (value === null || value === undefined) return null;
+function decodeHistoryPageBoundary(value: unknown): HistoryPageBoundary {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError('Conversation history cursor anchor is malformed.');
+    throw new TypeError('Conversation history cursor boundary is malformed.');
   }
   const record = value as Record<string, unknown>;
-  if (typeof record.updatedAt !== 'string' || !record.updatedAt || typeof record.id !== 'string' || !record.id) {
-    throw new TypeError('Conversation history cursor anchor is malformed.');
+  if (
+    typeof record.kind !== 'string' || !HISTORY_PAGE_BOUNDARY_KINDS.has(record.kind)
+    || typeof record.updatedAt !== 'string' || !record.updatedAt
+    || typeof record.id !== 'string' || !record.id
+  ) {
+    throw new TypeError('Conversation history cursor boundary is malformed.');
   }
-  return { updatedAt: record.updatedAt, id: record.id };
+  return { kind: record.kind as HistoryPageBoundary['kind'], updatedAt: record.updatedAt, id: record.id };
 }
 
 function conversationOriginLink(row: DomainRow): ConversationOriginLinkRecord {

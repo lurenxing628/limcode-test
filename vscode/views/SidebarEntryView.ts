@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { MainPanel, type MainPanelOptions } from '../panels/MainPanel';
 import { getUnavailableWebviewHtml, getWebviewHtml } from '../webview/getWebviewHtml';
-import type { ApplicationFacade } from '../ApplicationFacade';
+import type { ApplicationFacade, ConversationHistoryRevealTarget } from '../ApplicationFacade';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { EXTENSION_BRAND, SIDEBAR_ENTRY_VIEW_ID } from '../../shared/extensionIdentity';
 import { toStructuredClonePlainData } from '../../shared/plainData';
@@ -91,6 +91,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
   private lastStateMessage: SidebarStateMessage | undefined;
   private backendApp: ApplicationFacade | undefined;
   private historySubscription: vscode.Disposable | undefined;
+  private historyRevealSubscription: vscode.Disposable | undefined;
   private unavailableMessage: string | undefined;
   private disposed = false;
 
@@ -104,6 +105,10 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.backendApp = backendApp;
     this.historySubscription?.dispose();
     this.historySubscription = backendApp.onDidChangeConversationHistory(() => this.refreshConversationHistory());
+    this.historyRevealSubscription?.dispose();
+    this.historyRevealSubscription = backendApp.onDidRevealConversationHistoryTop(
+      (target) => this.revealConversationHistoryTop(target)
+    );
   }
 
   private async application(): Promise<ApplicationFacade> {
@@ -131,6 +136,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.historyRefreshTimer = undefined;
     this.historySubscription?.dispose();
     this.historySubscription = undefined;
+    this.historyRevealSubscription?.dispose();
+    this.historyRevealSubscription = undefined;
     this.activeWebview = undefined;
   }
 
@@ -238,6 +245,20 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     const message = this.withLivePanelState(this.lastStateMessage);
     this.lastStateMessage = message;
     void postSidebarWebviewMessage(target, message);
+  }
+
+  /**
+   * This window just created, forked or sent input to a Conversation. When it belongs to the shown
+   * scope, the next refresh reads the first page, where that Conversation now sits. Other projects'
+   * activity leaves a project page untouched.
+   */
+  private revealConversationHistoryTop(target: ConversationHistoryRevealTarget): void {
+    const scope = this.lastStateMessage?.history.scope;
+    if (scope && !conversationHistoryScopeContains(scope, target.projectFolderUri)) return;
+    this.lastCursor = undefined;
+    // Discard an in-flight page read so it cannot restore the previous page's cursor.
+    this.historyRequestSeq += 1;
+    this.scheduleConversationHistoryRefresh();
   }
 
   public refreshWorkspaceContext(): void {
@@ -424,6 +445,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     if (requestSeq !== this.historyRequestSeq) {
       return;
     }
+    // Later refreshes re-send the page the backend actually resolved (clamped or re-positioned).
+    this.lastCursor = history.pageInfo.cursor;
     const activeProjectFolderUri = projectFolderUri
       ?? (history.scope.kind === 'project' ? history.scope.folderUri : undefined);
     const message: SidebarStateMessage = this.withLivePanelState({
@@ -448,6 +471,12 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
       openConversations: MainPanel.getOpenConversationPanelStates()
     };
   }
+}
+
+function conversationHistoryScopeContains(scope: ConversationHistoryScope, projectFolderUri: string | undefined): boolean {
+  if (scope.kind === 'all') return true;
+  if (scope.kind === 'unbound') return projectFolderUri === undefined;
+  return scope.folderUri === projectFolderUri;
 }
 
 function postSidebarWebviewMessage(webview: vscode.Webview, message: unknown): Thenable<boolean> {
