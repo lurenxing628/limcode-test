@@ -28,6 +28,18 @@ export class ExecutionHandoffError extends Error {
   }
 }
 
+/**
+ * The Host stopped serving the Conversation (its project folder or work environment left this
+ * window) and the Agent loop stopped at a round boundary. The executor hands the lease back so a
+ * Host serving the Conversation continues the Turn; nothing is marked terminal.
+ */
+export class ExecutionEligibilityLostError extends ExecutionHandoffError {
+  public constructor(conversationId: string) {
+    super(`Conversation ${conversationId} is no longer served by this Host; its Turn stopped between rounds.`);
+    this.name = 'ExecutionEligibilityLostError';
+  }
+}
+
 export function runWithExecutionLeaseFence<T>(
   fence: ExecutionLeaseFence,
   operation: () => T

@@ -24,6 +24,7 @@ import type {
 import {
   ExecutionHandoffError,
   isExecutionHandoffError,
+  ExecutionEligibilityLostError,
   runWithExecutionLeaseFence,
   type ExecutionLeaseFence
 } from '../../reliableKernel/executionLeaseFence';
@@ -1200,8 +1201,9 @@ export class ReliableConversationRunner {
       // ownership pin makes this a cheap invariant assertion rather than an acquisition.
       await this.conversationOwners.assertOwned(slot.conversationId);
       const generation = slot.requestedGeneration;
+      let fence: ExecutionLeaseFence | null = null;
       try {
-        let fence = await this.application.turns.executionLeaseFence({
+        fence = await this.application.turns.executionLeaseFence({
           turnId: slot.turnId,
           leaseOwnerId: this.leaseOwnerId,
           hostBootId: this.application.database.hostBootId
@@ -1283,6 +1285,17 @@ export class ReliableConversationRunner {
         return;
       } catch (error) {
         slot.completedGeneration = generation;
+        if (error instanceof ExecutionEligibilityLostError && fence) {
+          // The folder or work environment left this window mid-Turn: the loop stopped between
+          // rounds; hand the lease back so the Host serving the Conversation continues the Turn.
+          await this.application.turns.releaseExecutionLease(fence).catch((releaseError: unknown) => {
+            this.onError(releaseError, { operation: 'drive', conversationId: slot.conversationId, turnId: slot.turnId });
+          });
+          slot.error = error;
+          slot.terminal = true;
+          if (!this.disposed) this.deferRecoveryCandidate(slot.conversationId, slot.turnId, 'ineligible');
+          return;
+        }
         if (isExecutionHandoffError(error)) {
           // A local handoff is not a durable terminal fact. Unless this Host itself is shutting
           // down, preserve a level-triggered recovery candidate so an expired/replaced generation

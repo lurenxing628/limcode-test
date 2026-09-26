@@ -1622,7 +1622,8 @@ test('Agent loop 开放任务的无工具输出只续行一轮再结束', async 
       owns: (conversationId) => conversationId === 'conversation-bounded',
       async assertOwned(conversationId) {
         assert.equal(conversationId, 'conversation-bounded');
-      }
+      },
+      async executionEligibility() { return 'eligible'; }
     }
   };
   loop.observeLifecycle = () => {};

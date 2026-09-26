@@ -45,6 +45,7 @@ import type {
   SkillPolicyRecord
 } from '../../shared/protocol';
 import {
+  ExecutionEligibilityLostError,
   ExecutionHandoffError,
   isExecutionHandoffError,
   runWithoutExecutionLeaseFence,
@@ -2159,6 +2160,12 @@ export class ReliableChildAgentCoordinator {
         return this.dependencies.agentLoop.drive(turnId);
       });
     } catch (error) {
+      if (error instanceof ExecutionEligibilityLostError) {
+        // Stopped between rounds because this Host no longer serves the child Conversation.
+        await renewal.stop();
+        await this.dependencies.turns.releaseExecutionLease(fence);
+        throw error;
+      }
       if (isExecutionHandoffError(error)) throw error;
       result = await this.failChildDrive(fence, childExecutionId, turnId, error);
     } finally {

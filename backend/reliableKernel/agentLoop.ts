@@ -89,7 +89,7 @@ import {
 } from './turnControlPlane';
 import { frozenCompressionPolicy, readFrozenTurnAuthority } from './frozenAuthority';
 import { assistantMessageIdFor, TurnOutputControlPlane } from './turnOutput';
-import { ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
+import { ExecutionEligibilityLostError, ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
 import { childTaskTextForPreview } from './childSkillPreload';
 import type {
   CoordinateCompressionCommand,
@@ -537,6 +537,11 @@ export class ReliableAgentLoop {
           throw new ExecutionHandoffError(`Conversation ${conversationId} is not owned by this Runtime Host.`);
         }
         await this.database.conversationOwners.assertOwned(conversationId);
+        // A round boundary is a safe point: no tool of this Turn is running. A Host that stopped
+        // serving the Conversation (its folder left this window) stops here and hands the Turn over.
+        if (await this.database.conversationOwners.executionEligibility(conversationId) === 'ineligible') {
+          throw new ExecutionEligibilityLostError(conversationId);
+        }
         await this.cancelSupersededCompressionRequests(
           turnId,
           requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id')
