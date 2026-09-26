@@ -501,19 +501,20 @@ function validateMigration(root, migration, failures) {
     sources: ['pre-switch-history-data-sets-automatic-once', 'user-kept-or-already-merged-explicit-request-only'],
     target: 'selected-current-epoch-data-set-open-in-requesting-host',
     initialSelection: 'no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-exact-schema-and-physical-fingerprint-published-3-4-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched',
-    trigger: 'background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; first-host-to-claim-source-maintenance-merges-others-skip',
+    trigger: 'background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; hosts-prepare-without-claims-and-commit-one-at-a-time-under-admission-and-source-maintenance; later-host-rechecks-source-files-then-rereads-ledger-and-skips-source-already-merged-unreported',
     requiresUserConfirmation: false,
     explicitRequestConfirmation: 'modal-then-online-merge-in-requesting-window-no-reload',
     writePath: 'one-ordinary-runtime-database-write-transaction-per-source; repository-insert-steps-codec-validated-under-worker-insert-invariants; other-hosts-keep-running-and-see-an-external-commit',
     historicalCopyDomains: ['ModelRequest', 'Operation', 'Attempt', 'ModelStreamFence', 'ModelStreamCheckpoint'],
-    sizeLimit: 'online-transaction-at-most-6000-rows-and-16MiB-measured-about-1s; larger-source-via-exclusive-maintenance-inside-target-maintenance-keyed-by-source-file-state-else-deferred',
-    exclusivity: 'configuration-admission-and-source-maintenance; source-offline-by-host-liveness-and-legacy-runtime-owner-claim',
+    historicalCopyPolicy: 'model-request-copy-terminal-with-terminal-state; its-operation-copy-completed-cancelled-or-failed; its-attempt-copy-transient-failed-completed-cancelled-or-failed; stream-fence-and-checkpoint-only-with-parent-model-request-copied-historically-in-the-same-transaction; not-started-request-and-its-pending-operation-and-attempt-inserted-as-the-runtime-creates-them',
+    sizeLimit: 'online-transaction-at-most-1200-source-rows-and-4MiB-measured-worst-about-1.5s-below-busy-timeout; one-transaction-hard-limit-25000-source-rows-above-it-recorded-too-large-before-any-plan-coordination-backup-or-finalization; in-between-exclusive-maintenance-coordinated-outside-locks-after-checks-cas-and-target-backup-locks-wrap-only-source-recheck-and-transaction-keyed-by-source-content-fingerprint-else-deferred',
+    exclusivity: 'snapshot-audit-plan-cas-and-target-backup-without-claims; snapshot-counts-only-if-source-file-state-unchanged-across-copy-else-retaken-at-most-3-times; finalization-and-commit-under-configuration-admission-and-source-maintenance-rechecking-hosts-offline-identity-pointer-and-exact-file-state; exclusive-fallback-takes-admission-and-target-maintenance-around-that-commit; source-offline-by-host-liveness-and-legacy-runtime-owner-claim',
     sourcePolicy: 'exact-published-3-4-backup-and-in-place-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot',
     busySourcePolicy: 'defer-source',
-    unfinishedWorkPolicy: 'source-backup-then-existing-terminal-transitions-cancelled-or-interrupted-with-reason; states-without-transition-refuse-source-with-reason-and-way-out',
-    backupPolicy: 'sqlite-backup-api-of-open-target-once-per-batch-before-first-change; newest-3-kept-per-control-root; failed-backup-leaves-no-files',
-    casPolicy: 'published-before-row-commit; source-digest-verified-before-link-or-copy; existing-target-object-verified-damaged-blocks',
-    rowPolicy: 'every-source-row-decoded-by-codec; identical-rows-reused; content-identity-domains-keep-target; renumbered-columns-shifted-past-target-maximum; any-other-difference-or-unique-conflict-rolls-back-source-before-any-target-change',
+    unfinishedWorkPolicy: 'refusal-probes-conflicts-size-and-cas-checked-on-unfinalized-snapshot-first; kernel-pending-work-probe-judges-every-conversation-as-after-finalization-before-any-finalization; then-source-backup-and-existing-terminal-transitions-cancelled-or-interrupted-with-reason; states-without-transition-refuse-source-with-reason-and-way-out',
+    backupPolicy: 'sqlite-backup-api-of-open-target-once-per-batch-before-first-change-only-when-rows-to-insert; named-utc-millisecond-time-then-process-sequence; unused-by-any-transaction-removed-at-batch-end; used-then-newest-3-by-creation-kept-per-control-root-plus-this-batch-and-newest-before-it; failed-backup-leaves-no-files',
+    casPolicy: 'published-before-row-commit; verified-read-only-before-finalization; source-digest-verified-before-link-or-copy; missing-irregular-or-mismatched-source-object-fails-source; existing-target-object-damaged-or-irregular-blocks',
+    rowPolicy: 'every-source-row-decoded-by-codec; identical-rows-reused; content-identity-domains-keep-target-and-insert-only-if-still-absent-inside-the-transaction-else-compare; renumbered-columns-shifted-past-target-maximum; any-other-difference-refuses-source-before-any-target-change; any-failure-inside-the-transaction-rolls-back-the-whole-source',
     identityDomains: {
       ContentObject: ['created_at'],
       ProjectContext: ['name', 'created_at', 'updated_at'],
@@ -524,20 +525,32 @@ function validateMigration(root, migration, failures) {
       CollaborationMessage: ['message_seq']
     },
     integrity: 'source-foreign-key-quick-check-before; every-source-id-asserted-present-inside-the-transaction',
-    recordPolicy: 'configuration-root-ledger-survives-target-deletion; committing-with-exact-inserted-id-set-counts-as-unmerged; outcomes-keyed-by-source-content-digest-cached-by-exact-file-state; later-failed-attempt-keeps-last-merge; user-kept-marker-in-source-control-root-unreadable-counts-as-kept-unwritable-refuses-switch',
+    recordPolicy: 'configuration-root-ledger-survives-target-deletion; committing-with-exact-inserted-id-set-counts-as-unmerged; commit-evidence-only-rows-outside-content-identity-domains-all-merged-none-record-dropped-partial-blocked; proven-rollback-restores-previous-record-at-once; ledger-reread-under-claims-before-commit; nothing-to-insert-recorded-merged-without-backup; outcomes-keyed-by-source-content-digest-cached-by-exact-file-state; failed-only-for-source-own-deterministic-problems-other-errors-deferred-unrecorded; too-large-records-rows-and-judging-limit-not-failure-not-retried-automatically-while-limit-and-source-unchanged; explicit-request-only-the-requesting-call; recorded-request-keeps-source-pending-7-days-removed-after-merged-blocked-or-failed; later-failed-attempt-keeps-last-merge; user-kept-marker-in-source-control-root-unreadable-counts-as-kept-unwritable-refuses-switch',
     noticePolicy: 'causes-accumulate-per-configuration-root; only-reevaluated-sources-drop-causes; explicit-request-outcome-always-shown; details-in-log-and-data-set-management',
     sourceRetention: 'conversation-content-unchanged; published-3-4-backed-up-and-upgraded-in-place; backup-before-finalization',
     selectionPolicy: 'never-switch',
     historicalExecutionPolicy: 'no-merged-conversation-resumes-in-any-host; source-host-registered-only-to-finalize'
   };
   if (!plainObject(merge) || JSON.stringify(merge) !== JSON.stringify(expectedMerge)) {
-    failures.push('旧历史库只能在当前库打开后在线合并：来源离线、先备份再按现有终态收尾、每来源一个经 Repository 与 codec 的正常写事务，超限才走独占兜底，冲突整份拒绝，合并进来的对话不会被自动继续');
+    failures.push('旧历史库只能在当前库打开后在线合并：来源离线，重活不持锁，全部检查通过才先备份再按现有终态收尾，每来源一个经 Repository 与 codec 的正常写事务，超过在线上限才在锁外协调独占兜底、超过单事务硬上限记为太大，冲突整份拒绝，合并进来的对话不会被自动继续');
   }
   const repositoriesSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/repositories.ts'), 'utf8');
   const historicalCopyDomains = /HISTORICAL_COPY_DOMAINS: readonly string\[\] = \[([^\]]*)\]/.exec(repositoriesSource)?.[1]
     ?.split(',').map((item) => item.trim().replace(/^'|'$/g, '')).filter(Boolean) ?? [];
   if (JSON.stringify(historicalCopyDomains) !== JSON.stringify(expectedMerge.historicalCopyDomains)) {
     failures.push('历史复制插入领域必须与 migration.json#historicalMerge.historicalCopyDomains 完全一致');
+  }
+  const mergeSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeDataSetMerge.ts'), 'utf8');
+  const mergeConstant = (pattern) => pattern.exec(mergeSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
+  const [onlineRows, onlineMiB] = mergeConstant(/RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object\.freeze\(\{ maxRows: ([\d_]+), maxBytes: ([\d_]+) \* 1024 \* 1024 \}\)/);
+  const [transactionRows] = mergeConstant(/RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS = ([\d_]+);/);
+  const [requestDays] = mergeConstant(/RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS = ([\d_]+) \* 24 \* 60 \* 60 \* 1000;/);
+  const [backupRetention] = mergeConstant(/RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION = ([\d_]+);/);
+  if (!expectedMerge.sizeLimit.startsWith(`online-transaction-at-most-${onlineRows}-source-rows-and-${onlineMiB}MiB-`)
+    || !expectedMerge.sizeLimit.includes(`; one-transaction-hard-limit-${transactionRows}-source-rows-`)
+    || !expectedMerge.recordPolicy.includes(`; recorded-request-keeps-source-pending-${requestDays}-days-`)
+    || !expectedMerge.backupPolicy.includes(`; used-then-newest-${backupRetention}-by-creation-`)) {
+    failures.push('migration.json#historicalMerge 的在线上限、单事务硬上限、合并请求期限与备份保留份数必须与 runtimeDataSetMerge.ts 的常量一致');
   }
   const exclusive = migration?.exclusiveMaintenance;
   const expectedExclusive = {
