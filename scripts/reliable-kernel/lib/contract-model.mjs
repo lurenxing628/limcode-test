@@ -577,19 +577,19 @@ function validateMigration(root, migration, failures) {
   }
   const relocation = migration?.dataRootRelocation;
   const expectedRelocation = {
-    entry: 'settings-page-button-or-command; native-folder-picker; read-only-plan; one-modal-confirmation',
-    preflight: 'absolute-path; writable-target-and-parent; free-space-estimate-with-hard-link-saving-on-same-device; not-inside-or-above-current-root; cloud-sync-folder-warning',
-    targetStates: 'missing-empty-or-only-unrelated-files-fresh-root; limcode-data-created-at-this-path-merge-into-its-selected-data-set; copied-from-elsewhere-refused-for-now; anything-else-refused',
-    phases: 'online-fresh-target-root-and-cas-precopy-via-backup-api; exclusive-maintenance-notice-and-wait-for-busy-windows; requester-closes-own-runtime; merge-engine-migration-mode-inside-old-root-admission; configuration; selection; completion-marker; pointer-switch-last; every-window-reloads',
+    entry: 'settings-page-button; command-palette-opens-settings-page; native-folder-picker-only; confirm-panel-prompts-with-complete-lists; read-only-plan',
+    preflight: 'absolute-path; writable-target-and-parent; per-disk-space-new-2x-database-plus-cas-blocks-temp-1x-old-1x; not-inside-or-above-current-root; cloud-sync-folder-warning; current-rows-limit-refused-before-any-coordination',
+    targetStates: 'missing-or-empty-fresh-root; user-files-only-a-new-limcode-subfolder; limcode-structure-created-at-this-path-merge-into-its-selected-data-set-when-offline; copied-from-elsewhere-refused-for-now; anything-else-refused',
+    phases: 'pending-record-in-pointer; online-staging-record-journal-fresh-root-and-cas-precopy-via-backup-api; exclusive-maintenance-final-countdown-waiting-outside-locks-requester-work-counted; requester-rechecks-work-then-closes-runtime; source-fingerprints; configuration; receiving-database-undo-copy; merge-engine-migration-mode; other-data-sets; completion-record; pointer-switch-last-with-identity; every-window-reloads',
     mergeMode: 'selected-source-allowed; no-merge-ledger; unfinished-work-carried-unchanged; streaming-model-request-or-running-process-refused; snapshot-integrity-and-probes-in-worker',
-    otherDataSets: 'same-id-independent-data-sets-marked-user-kept; failed-or-taken-ids-stay-in-old-directory',
-    configuration: 'registered-root-directories-only; record-stores-merged-by-id-current-wins; replaced-target-versions-to-relocation-backups; every-copied-file-sha256-verified',
-    failure: 'pointer-unchanged; relocation-created-target-entries-removed; replaced-configuration-restored; old-directory-never-modified',
-    oldDirectory: 'kept; delete-only-limcode-entries-when-current-root-completion-record-names-it-and-its-hosts-are-offline; return-switches-pointer-only',
-    unavailableRoot: 'configured-directory-missing-or-without-limcode-entries-refuses-startup-with-retry-or-return; never-creates-an-empty-root'
+    otherDataSets: 'same-id-independent-data-sets-marked-user-kept; merged-and-unchanged-carried-by-current; too-large-failed-or-taken-stay-in-old-directory-recorded-and-shown',
+    configuration: 'registered-directories-files-global-rules-and-skills; record-stores-at-any-depth-merged-by-id-current-wins; replaced-versions-copied-to-relocation-backups-then-atomic-replace; journal-before-every-change; sha256-verified-and-fsynced',
+    failure: 'pointer-unchanged; journal-undo-restores-receiving-database-and-replaced-configuration-removes-created-entries; crash-undone-at-next-startup-from-pending-record; unswitched-completion-redone-while-receiving-unchanged; abandoned-private-copies-swept; old-directory-data-never-modified',
+    oldDirectory: 'kept; delete-only-what-the-completion-record-proves-migrated-and-unchanged-by-fingerprint-and-digest; backups-and-archives-only-when-ticked-with-sizes; all-hosts-offline; confirmed-list-must-still-match; return-switches-pointer-and-invalidates-the-record',
+    unavailableRoot: 'identity-file-matched-against-pointer-else-limcode-structure; missing-mismatched-or-empty-refuses-startup-with-retry-return-choose-other-or-default-after-second-confirmation; never-creates-an-empty-root; reads-never-create-directories'
   };
   if (!plainObject(relocation) || JSON.stringify(relocation) !== JSON.stringify(expectedRelocation)) {
-    failures.push('数据目录迁移只能复制核对后最后切换指针：在线预复制、独占阶段经合并引擎迁移模式写入全新根、其它库成为独立保留库、失败不切换并清理、旧目录保留，不可用的数据目录绝不新建空库');
+    failures.push('数据目录迁移只能复制核对后最后切换指针：在线预复制、锁外等待后独占阶段经合并引擎迁移模式写入、每步先记日志、失败或崩溃按日志撤销、删除旧目录只删按指纹证明已迁移且未改动的内容，不可用（身份不符）的数据目录绝不新建空库');
   }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
