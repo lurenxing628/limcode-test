@@ -12,12 +12,26 @@ import { pathToFileURL } from 'node:url';
  * (item-only, whole-chain-so-far cumulative, final aggregate) and by content type.
  */
 
+const USAGE = 'Usage: node scripts/reliable-kernel/benchmark-native-output-growth.mjs'
+  + ' [--items=5,20,50,100] [--item-bytes=2048] [--output=<report.json>] [--compiled-root=dist/extension]';
+const OPTIONS = new Set(['compiled-root', 'items', 'item-bytes', 'output']);
+if (process.argv.slice(2).some((argument) => argument === '--help' || argument === '-h')) {
+  process.stdout.write(`${USAGE}\n`);
+  process.exit(0);
+}
+for (const argument of process.argv.slice(2)) {
+  const match = /^--([a-z-]+)=(.*)$/.exec(argument);
+  if (!match || !OPTIONS.has(match[1])) {
+    throw new TypeError(`Unrecognized argument ${JSON.stringify(argument)}; every option is written as --name=value.\n${USAGE}`);
+  }
+}
+
 const root = process.cwd();
+const itemCounts = positiveIntegerList(option('items') ?? '5,20,50,100', 'items', '5,20,50,100');
+const itemBytes = positiveInteger(option('item-bytes') ?? '2048', 'item-bytes', '2048');
+const outputPath = option('output');
 const compiledRoot = path.resolve(root, option('compiled-root') ?? 'dist/extension');
 const kernel = await import(pathToFileURL(path.join(compiledRoot, 'backend/reliableKernel/index.js')).href);
-const itemCounts = (option('items') ?? '5,20,50,100').split(',').map((value) => positiveInteger(value, 'items'));
-const itemBytes = positiveInteger(option('item-bytes') ?? '2048', 'item-bytes');
-const outputPath = option('output');
 
 const PROVIDER_ID = 'provider-native-growth';
 const MODEL_ID = 'gpt-6-astra';
@@ -38,7 +52,8 @@ const report = {
     'one synthetic logical request streams N completed text items in one provider response; tool calls, reasoning signatures and multi-response chains share the same per-item cumulative write path but are not exercised',
     'item text is deterministic pseudo-random ASCII so identical-content deduplication cannot hide growth',
     'itemOnlyAndAggregateBytes is the storage an O(N) design would keep for the same chain; it excludes any per-item composite descriptor such a design would add',
-    'readAllRevisionsMs/readItemRevisionsMs time reading the Message revisions the way NativeRequestSession.reconcile does today versus items only; timings are single-run and machine-dependent',
+    'reconcileRead.itemRevisionsBytes/itemRevisionsMs read only the item revisions, as NativeRequestSession.reconcile does now that it skips cumulative and final aggregate revisions; reconcileRead.allRevisionsBytes/allRevisionsMs read every revision of the Message, as it did before',
+    'each reconcileRead measurement runs on a freshly reopened application, so the in-process verified-read cache is cold for both; the OS page cache stays warm and timings are single-run and machine-dependent',
     'all payloads are synthetic and the report contains counts, bytes and timings only'
   ],
   rows
@@ -139,8 +154,13 @@ async function measureChain(items) {
     const physicalBytes = newFiles.reduce((total, [, stat]) => total + stat.size, 0);
     const allocatedBytes = newFiles.reduce((total, [, stat]) => total + stat.blocks * 512, 0);
 
-    const readAll = await timedRead(app, revisions, allContentById);
+    // Reopen before each read so neither measurement is served by the other's verified-read cache.
+    await app.close();
+    app = await kernel.ReliableKernelApplication.open(authority, dependencies(adapter));
     const readItems = await timedRead(app, revisions.filter((revision) => itemIds.has(revision.id)), allContentById);
+    await app.close();
+    app = await kernel.ReliableKernelApplication.open(authority, dependencies(adapter));
+    const readAll = await timedRead(app, revisions, allContentById);
     const messageTypeBytes = byContentType[MESSAGE_CONTENT_TYPE]?.logicalBytes ?? 0;
 
     return {
@@ -330,8 +350,18 @@ function option(name) {
   return process.argv.find((argument) => argument.startsWith(prefix))?.slice(prefix.length);
 }
 
-function positiveInteger(value, label) {
+function positiveInteger(value, label, example) {
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new RangeError(`${label} must be a positive integer.`);
+  if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new RangeError(`--${label} must be a positive integer (for example --${label}=${example}); got ${JSON.stringify(value)}.\n${USAGE}`);
+  }
   return parsed;
+}
+
+function positiveIntegerList(value, label, example) {
+  const values = value.split(',');
+  if (values.some((entry) => !/^[0-9]+$/.test(entry) || Number(entry) <= 0 || !Number.isSafeInteger(Number(entry)))) {
+    throw new RangeError(`--${label} must be a comma-separated list of positive integers without spaces (for example --${label}=${example}); got ${JSON.stringify(value)}.\n${USAGE}`);
+  }
+  return values.map(Number);
 }
