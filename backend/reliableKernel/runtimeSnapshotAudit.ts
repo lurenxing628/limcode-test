@@ -22,12 +22,15 @@ export interface RuntimeSnapshotAuditRequest {
   unfinishedWork?: 'finalize' | 'carry';
   /** Row count over every Runtime domain and file size in bytes. */
   measure?: boolean;
+  /** runtimeDataSetContentDigest of the copy (the content part of a merge fingerprint). */
+  contentDigest?: boolean;
 }
 
 export interface RuntimeSnapshotAudit {
   unfinishedWork?: UnfinishedWorkInspection;
   carriedWork?: CarriedWorkRefusals;
   size?: { rows: number; bytes: number };
+  contentDigest?: string;
 }
 
 /** @internal Worker protocol; plain data only. */
@@ -36,6 +39,7 @@ export interface RuntimeSnapshotAuditWorkerData {
   binding: RootBinding;
   unfinishedWork?: 'finalize' | 'carry';
   measureTables?: string[];
+  contentDigest?: boolean;
 }
 
 /** @internal */
@@ -56,7 +60,8 @@ export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnaps
     databasePath: path.resolve(databasePath),
     binding: JSON.parse(JSON.stringify(request.binding)) as RootBinding,
     ...(request.unfinishedWork ? { unfinishedWork: request.unfinishedWork } : {}),
-    ...(request.measure ? { measureTables: RUNTIME_DOMAIN_SCHEMAS.map((schema) => schema.table) } : {})
+    ...(request.measure ? { measureTables: RUNTIME_DOMAIN_SCHEMAS.map((schema) => schema.table) } : {}),
+    ...(request.contentDigest ? { contentDigest: true } : {})
   };
   return new Promise((resolve, reject) => {
     let settled = false;

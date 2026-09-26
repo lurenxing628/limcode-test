@@ -73,6 +73,11 @@ export type RuntimeDataSetMergeLedgerRecord = {
   | { state: 'blocked'; target: RuntimeDataSetIdentity; code: string; message: string }
   /** The source itself cannot be merged (unsupported format, integrity, drift); any target. */
   | { state: 'failed'; code: string; message: string }
+  /**
+   * Too many rows for one merge transaction at the limit `maxRows` of the version that judged it;
+   * not a failure of the source, judged again only when that limit (or the source) changes.
+   */
+  | { state: 'too-large'; code: string; message: string; rows: number; maxRows: number }
 );
 
 export interface RuntimeDataSetMergeLedgerRequest {
@@ -118,6 +123,19 @@ export async function runtimeDataSetFingerprint(candidate: VscodeRuntimeDataSetC
       .catch(() => undefined);
   }
   return fingerprint;
+}
+
+/**
+ * Caches a fingerprint whose content digest the caller computed on a private copy of exactly these
+ * files (`files` from runtimeDataSetFileState before the copy, unchanged after it).
+ */
+export async function rememberRuntimeDataSetFingerprint(
+  candidate: VscodeRuntimeDataSetCandidate,
+  files: string,
+  fingerprint: RuntimeDataSetFingerprint
+): Promise<void> {
+  await writeLedgerJson({ globalStoragePath: candidate.configurationRootPath }, FINGERPRINTS, candidate.id,
+    { kind: FINGERPRINT_KIND, candidateId: candidate.id, files, fingerprint });
 }
 
 export function sameRuntimeDataSetFingerprint(left: RuntimeDataSetFingerprint, right: RuntimeDataSetFingerprint | undefined): boolean {
@@ -178,7 +196,7 @@ function isLedgerRecord(value: unknown, name: string): value is RuntimeDataSetMe
   const record = value as Partial<RuntimeDataSetMergeLedgerRecord> | null;
   return record?.kind === RECORD_KIND && typeof record.candidateId === 'string' && fileName(record.candidateId) === name
     && !!record.source && typeof record.source.dataSetId === 'string'
-    && ['committing', 'merged', 'blocked', 'failed'].includes(String(record.state));
+    && ['committing', 'merged', 'blocked', 'failed', 'too-large'].includes(String(record.state));
 }
 
 /**

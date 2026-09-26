@@ -94,6 +94,7 @@ function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
   }
   if (merge.state === 'blocked' || merge.state === 'failed') return merge.lastMerged ? ' · 之前合并过，再次合并未成功' : ' · 未能合并';
   if (merge.state === 'requested') return ' · 等待合并';
+  if (merge.state === 'too-large') return ` · 约 ${merge.rows} 条记录，当前版本不能安全合并`;
   return ' · 你保留的库（不自动合并）';
 }
 
@@ -151,7 +152,7 @@ async function chooseDataSet(
       const summary = read === 'unreadable' ? undefined : read;
       const rejected = candidateProblems.get(candidate.id);
       const message = rejected ? `\n打开前检查未通过：${rejected.message}`
-        : merge?.state === 'blocked' || merge?.state === 'failed' ? `\n${merge.message}` : '';
+        : merge?.state === 'blocked' || merge?.state === 'failed' || merge?.state === 'too-large' ? `\n${merge.message}` : '';
       return {
         label: dataSetLabel(candidate, merge, summary, options.startup),
         description: [
