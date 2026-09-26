@@ -18,7 +18,8 @@ import {
   resolveVscodeWorkspaceRuntimeScope,
   type VscodeWorkspaceRuntimePlacement
 } from '../../reliableKernel/vscodeRootAuthority';
-import type { RuntimeCommitResult } from '../../reliableKernel/contracts';
+import type { RootBinding, RuntimeCommitResult } from '../../reliableKernel/contracts';
+import type { ConversationHistoryProjectionResult } from '../../reliableKernel/databaseWorkerProtocol';
 import {
   assertRuntimeHostsOffline,
   withRuntimeDataRootAdmission,
@@ -663,15 +664,15 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     limit: number
   ): Promise<ConversationHistoryPageRecord> {
     const scopeKey = conversationHistoryScopeKey(scope);
-    const decoded = decodeHistoryKeysetCursor(cursor, scopeKey, limit);
-    const projection = await this.product.application.database.conversationHistoryProjection({
-      scopeKind: scope.kind,
-      ...(scope.kind === 'project' ? { projectFolderUri: scope.folderUri } : {}),
-      limit,
-      ...(decoded.anchor ? { afterUpdatedAt: decoded.anchor.updatedAt, afterId: decoded.anchor.id } : {}),
-      ...(decoded.commitSeq ? { expectedCommitSeq: decoded.commitSeq } : {})
-    });
-    const state = projection.cursorReset ? emptyHistoryCursorState() : decoded;
+    const dataSetKey = historyCursorDataSetKey(this.product.application.database.binding);
+    let state = decodeHistoryKeysetCursor(cursor, scopeKey, limit, dataSetKey);
+    let projection = await this.readConversationHistoryProjection(scope, state, limit);
+    // Refreshes re-read the same anchored page against current facts. Only a page emptied by
+    // deletions moves back toward the first page, one bounded trail step at a time.
+    while (projection.seedRows.length === 0 && state.anchor !== null) {
+      state = { anchor: state.trail.at(-1) ?? null, trail: state.trail.slice(0, -1) };
+      projection = await this.readConversationHistoryProjection(scope, state, limit);
+    }
     const messageCounts = new Map(projection.messageSummaries.map((row) => [
       String(row.conversation_id),
       Number(row.message_count)
@@ -755,21 +756,16 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     });
     const originLinks = projection.origins.map(conversationOriginLink);
     const lastSeed = projection.seedRows.at(-1);
-    const currentCursor = encodeHistoryKeysetCursor(scopeKey, limit, {
-      ...state,
-      commitSeq: projection.snapshotCommitSeq
-    });
+    const currentCursor = encodeHistoryKeysetCursor(scopeKey, limit, dataSetKey, state);
     const nextCursor = projection.hasMore && lastSeed
-      ? encodeHistoryKeysetCursor(scopeKey, limit, {
-          commitSeq: projection.snapshotCommitSeq,
+      ? encodeHistoryKeysetCursor(scopeKey, limit, dataSetKey, {
           anchor: { updatedAt: requireText(lastSeed.updated_at, 'Conversation.updated_at'), id: requireText(lastSeed.id, 'Conversation.id') },
           trail: [...state.trail, state.anchor]
         })
       : undefined;
     const previousAnchor = state.trail.at(-1) ?? null;
     const previousCursor = state.trail.length > 0
-      ? encodeHistoryKeysetCursor(scopeKey, limit, {
-          commitSeq: projection.snapshotCommitSeq,
+      ? encodeHistoryKeysetCursor(scopeKey, limit, dataSetKey, {
           anchor: previousAnchor,
           trail: state.trail.slice(0, -1)
         })
@@ -789,6 +785,19 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         hasPrevious: Boolean(previousCursor)
       }
     };
+  }
+
+  private readConversationHistoryProjection(
+    scope: ConversationHistoryScope,
+    state: HistoryCursorState,
+    limit: number
+  ): Promise<ConversationHistoryProjectionResult> {
+    return this.product.application.database.conversationHistoryProjection({
+      scopeKind: scope.kind,
+      ...(scope.kind === 'project' ? { projectFolderUri: scope.folderUri } : {}),
+      limit,
+      ...(state.anchor ? { afterUpdatedAt: state.anchor.updatedAt, afterId: state.anchor.id } : {})
+    });
   }
 
   private async readConversationHistoryProjectionPreviews(
@@ -988,7 +997,6 @@ function conversationHistoryScopeKey(scope: ConversationHistoryScope): string {
 
 interface HistoryCursorAnchor { updatedAt: string; id: string }
 interface HistoryCursorState {
-  commitSeq?: string;
   anchor: HistoryCursorAnchor | null;
   trail: Array<HistoryCursorAnchor | null>;
 }
@@ -997,12 +1005,26 @@ function emptyHistoryCursorState(): HistoryCursorState {
   return { anchor: null, trail: [] };
 }
 
-function encodeHistoryKeysetCursor(scopeKey: string, pageSize: number, state: HistoryCursorState): string {
+/**
+ * History cursors hold (updated_at, id) keys, which stay meaningful across commits in the same
+ * data set. They are bound only to the RootBinding identity: a cursor minted before a data-set
+ * switch or root generation change starts again at the first page of the current data set.
+ */
+function historyCursorDataSetKey(binding: RootBinding): string {
+  return `${binding.dataSetId}:${binding.rootInstanceId}:${binding.rootGeneration}`;
+}
+
+function encodeHistoryKeysetCursor(
+  scopeKey: string,
+  pageSize: number,
+  dataSetKey: string,
+  state: HistoryCursorState
+): string {
   return Buffer.from(JSON.stringify({
     kind: 'conversation-history-keyset-page',
     scopeKey,
     pageSize,
-    commitSeq: state.commitSeq,
+    dataSet: dataSetKey,
     anchor: state.anchor,
     trail: state.trail
   }), 'utf8').toString('base64url');
@@ -1011,7 +1033,8 @@ function encodeHistoryKeysetCursor(scopeKey: string, pageSize: number, state: Hi
 function decodeHistoryKeysetCursor(
   cursor: string | undefined,
   scopeKey: string,
-  pageSize: number
+  pageSize: number,
+  dataSetKey: string
 ): HistoryCursorState {
   if (!cursor) return emptyHistoryCursorState();
   let parsed: unknown;
@@ -1028,13 +1051,13 @@ function decodeHistoryKeysetCursor(
     value.kind !== 'conversation-history-keyset-page'
     || value.scopeKey !== scopeKey
     || value.pageSize !== pageSize
-    || (value.commitSeq !== undefined && typeof value.commitSeq !== 'string')
+    || typeof value.dataSet !== 'string'
     || !Array.isArray(value.trail)
   ) {
     throw new TypeError('Conversation history cursor does not match the requested tree page.');
   }
+  if (value.dataSet !== dataSetKey) return emptyHistoryCursorState();
   return {
-    ...(typeof value.commitSeq === 'string' ? { commitSeq: value.commitSeq } : {}),
     anchor: decodeHistoryCursorAnchor(value.anchor),
     trail: value.trail.map(decodeHistoryCursorAnchor)
   };

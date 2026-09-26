@@ -348,7 +348,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'conversationHistoryProjection') {
         assertDatabaseBinding(reader, data.binding);
-        const result = executeConversationHistoryProjection(reader, request.input, commitSeq);
+        const result = executeConversationHistoryProjection(reader, request.input);
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }

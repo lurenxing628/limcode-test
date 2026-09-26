@@ -109,6 +109,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/client-feed-window-rollover.test.mjs',
   'tests/reliable-kernel/conversation-deletion-recovery.test.mjs',
   'tests/reliable-kernel/conversation-history-scope-count.test.mjs',
+  'tests/reliable-kernel/conversation-history-paging-stability.test.mjs',
   'tests/reliable-kernel/command-router-interaction.test.mjs',
   'tests/reliable-kernel/compression-progress-ui.test.mjs',
   'tests/reliable-kernel/conversation-runtime-ownership.test.mjs',

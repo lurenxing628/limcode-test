@@ -1604,10 +1604,14 @@ function readTaskProjectionJson(
   }
 }
 
+/**
+ * A history page is the scope's Conversations strictly after one (updated_at, id) anchor. The
+ * anchor is a key, not a frozen snapshot position, so any later commit simply re-reads the same
+ * page against current facts: deleted rows vanish and updated rows rise to the first page.
+ */
 export function executeConversationHistoryProjection(
   database: Database.Database,
-  input: ConversationHistoryProjectionInput,
-  commitSeq: bigint
+  input: ConversationHistoryProjectionInput
 ): ConversationHistoryProjectionResult {
   if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) {
     throw new RangeError(`Conversation history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
@@ -1618,10 +1622,7 @@ export function executeConversationHistoryProjection(
   if (input.scopeKind === 'project' && !input.projectFolderUri?.trim()) {
     throw new TypeError('Project conversation history requires projectFolderUri.');
   }
-  const dataVersion = BigInt(database.pragma('data_version', { simple: true }) as number | bigint);
-  const snapshotCommitSeq = `${commitSeq.toString()}:${dataVersion.toString()}`;
-  const cursorReset = input.expectedCommitSeq !== undefined && input.expectedCommitSeq !== snapshotCommitSeq;
-  const useCursor = !cursorReset && input.afterUpdatedAt !== undefined;
+  const useCursor = input.afterUpdatedAt !== undefined;
   const scope = conversationHistoryScopeSql(input, 'conversation');
   const cursorSql = useCursor
     ? `AND (conversation.updated_at < @afterUpdatedAt
@@ -1650,8 +1651,6 @@ export function executeConversationHistoryProjection(
     if (seedIds.length === 0) {
       database.exec('COMMIT');
       return {
-        snapshotCommitSeq,
-        cursorReset,
         seedRows: [], conversations: [], origins: [], turns: [], leases: [], agentLinks: [],
         messageSummaries: [], previewTargets: [], titleTargets: [], childExecutions: [], activeChildTurnLinks: [],
         answerBridges: [], inboxItems: [], deliveries: [], deliveryWakes: [], deliveryInputLinks: [],
@@ -1725,8 +1724,6 @@ export function executeConversationHistoryProjection(
     const deliveryInputLinks = queryAllByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
     database.exec('COMMIT');
     return {
-      snapshotCommitSeq,
-      cursorReset,
       seedRows,
       conversations,
       origins,

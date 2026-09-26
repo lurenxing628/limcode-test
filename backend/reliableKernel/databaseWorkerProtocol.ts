@@ -178,12 +178,9 @@ export interface ConversationHistoryProjectionInput {
   limit: number;
   afterUpdatedAt?: string;
   afterId?: string;
-  expectedCommitSeq?: string;
 }
 
 export interface ConversationHistoryProjectionResult {
-  snapshotCommitSeq: string;
-  cursorReset: boolean;
   seedRows: DomainRow[];
   conversations: DomainRow[];
   origins: DomainRow[];
