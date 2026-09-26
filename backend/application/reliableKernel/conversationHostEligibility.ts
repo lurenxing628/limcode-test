@@ -9,7 +9,14 @@ import type { RuntimeDatabase } from '../../reliableKernel/runtimeDatabase';
 export type ConversationHostEligibilityDecision =
   | { eligible: true }
   | { eligible: false; reason: 'project_not_open'; projectUri: string; projectName: string }
-  | { eligible: false; reason: 'work_environment_unavailable'; turnId: string; workEnvironmentId: string };
+  | {
+      eligible: false;
+      reason: 'work_environment_unavailable';
+      turnId: string;
+      workEnvironmentId: string;
+      /** Name and path from this window's catalog, for messages; never the internal id. */
+      workEnvironmentLabel?: string;
+    };
 
 /** What a window shows: the decision, or why it could not be made (the probe failed). */
 export type ConversationHostEligibilityView =
@@ -26,7 +33,11 @@ export interface ConversationHostEligibilityDependencies {
   workspaceFolderUris(): readonly string[];
   /** This Host's work-environment catalog; workspace-folder `available` is Host-local presence. */
   workEnvironments(): Promise<readonly WorkEnvironmentRecord[]>;
+  /** Frozen default work environment by Turn id (immutable once frozen), shared across probes. */
+  frozenWorkEnvironmentCache?: Map<string, string | null>;
 }
+
+const FROZEN_WORK_ENVIRONMENT_CACHE_ENTRIES = 1_000;
 
 /**
  * Decides whether this Host may take over a Conversation's background work from committed facts:
@@ -50,23 +61,53 @@ export async function evaluateConversationHostEligibility(
   let environments: readonly WorkEnvironmentRecord[] | undefined;
   for (const turn of activeTurns) {
     const turnId = requireId(turn.id, 'Turn.id');
-    const snapshots = await listAllDomainRows(dependencies.database, 'AuthoritySnapshot', { turn_id: turnId });
-    if (snapshots.length === 0) continue;
-    if (snapshots.length > 1) throw new Error(`Turn ${turnId} must have at most one AuthoritySnapshot.`);
-    const frozen = await readFrozenTurnAuthority(
-      dependencies.database,
-      dependencies.contentStore,
-      requireId(snapshots[0].id, 'AuthoritySnapshot.id'),
-      turnId
-    );
-    const workEnvironmentId = frozenWorkEnvironmentPolicy(frozen.document)?.defaultWorkEnvironmentId;
+    const workEnvironmentId = await frozenDefaultWorkEnvironment(dependencies, turnId);
     if (!workEnvironmentId) continue;
     environments ??= await dependencies.workEnvironments();
-    if (!environments.some((environment) => environment.id === workEnvironmentId && environment.available)) {
-      return { eligible: false, reason: 'work_environment_unavailable', turnId, workEnvironmentId };
+    const environment = environments.find((candidate) => candidate.id === workEnvironmentId);
+    if (!environment?.available) {
+      const label = environment ? workEnvironmentLabel(environment) : undefined;
+      return {
+        eligible: false,
+        reason: 'work_environment_unavailable',
+        turnId,
+        workEnvironmentId,
+        ...(label ? { workEnvironmentLabel: label } : {})
+      };
     }
   }
   return { eligible: true };
+}
+
+async function frozenDefaultWorkEnvironment(
+  dependencies: ConversationHostEligibilityDependencies,
+  turnId: string
+): Promise<string | undefined> {
+  const cache = dependencies.frozenWorkEnvironmentCache;
+  const cached = cache?.get(turnId);
+  if (cached !== undefined) return cached ?? undefined;
+  const snapshots = await listAllDomainRows(dependencies.database, 'AuthoritySnapshot', { turn_id: turnId });
+  if (snapshots.length > 1) throw new Error(`Turn ${turnId} must have at most one AuthoritySnapshot.`);
+  // A Turn without its snapshot yet is still freezing; only a frozen answer is cached.
+  if (snapshots.length === 0) return undefined;
+  const workEnvironmentId = frozenWorkEnvironmentPolicy((await readFrozenTurnAuthority(
+    dependencies.database,
+    dependencies.contentStore,
+    requireId(snapshots[0].id, 'AuthoritySnapshot.id'),
+    turnId
+  )).document)?.defaultWorkEnvironmentId ?? null;
+  if (cache) {
+    if (cache.size >= FROZEN_WORK_ENVIRONMENT_CACHE_ENTRIES) cache.clear();
+    cache.set(turnId, workEnvironmentId);
+  }
+  return workEnvironmentId ?? undefined;
+}
+
+function workEnvironmentLabel(environment: WorkEnvironmentRecord): string | undefined {
+  const name = environment.name?.trim();
+  const where = environment.displayPath ?? environment.rootPath ?? environment.uri;
+  if (!name) return where || undefined;
+  return where && where !== name ? `${name}（${where}）` : name;
 }
 
 /**
@@ -135,7 +176,9 @@ export function conversationHostIneligibleMessage(
 ): string {
   if (view.reason === 'project_not_open') return `这个对话属于项目“${view.projectName}”，请在打开该项目的窗口中继续。`;
   if (view.reason === 'work_environment_unavailable') {
-    return `这个对话运行在工作环境“${view.workEnvironmentId}”中，当前窗口没有这个工作环境，请在有它的窗口中继续。`;
+    return view.workEnvironmentLabel
+      ? `这个对话正在工作环境“${view.workEnvironmentLabel}”中运行，当前窗口不能使用它，请在有它的窗口中继续。`
+      : '这个对话正在一个当前窗口没有的工作环境中运行，请在有它的窗口中继续。';
   }
   return `无法确认当前窗口能否继续这个对话（${view.message}），因此不会在这里执行。`;
 }
@@ -150,7 +193,9 @@ export function conversationAnswerRecordedMessage(
 ): string {
   if (view.reason === 'project_not_open') return `回答已记录，将在打开项目“${view.projectName}”的窗口中继续执行。`;
   if (view.reason === 'work_environment_unavailable') {
-    return `回答已记录，将在有工作环境“${view.workEnvironmentId}”的窗口中继续执行。`;
+    return view.workEnvironmentLabel
+      ? `回答已记录，将在有工作环境“${view.workEnvironmentLabel}”的窗口中继续执行。`
+      : '回答已记录，将在有该对话工作环境的窗口中继续执行。';
   }
   return `回答已记录；无法确认当前窗口能否继续这个对话（${view.message}），因此不会在这里继续执行。`;
 }

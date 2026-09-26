@@ -53,6 +53,9 @@ const TERMINATION_RECOVERY_MAX_DELAY_MS = 10_000;
 const INELIGIBLE_RECHECK_MS = 30_000;
 const UNKNOWN_ELIGIBILITY_BASE_DELAY_MS = 1_000;
 const UNKNOWN_ELIGIBILITY_MAX_DELAY_MS = 30_000;
+/** Another window's commits trigger at most one scan for Turns no live Host holds per interval. */
+const UNHELD_TURN_SCAN_INTERVAL_MS = 2_000;
+const UNHELD_TURN_RECOVERY_INTERVAL_MS = 5_000;
 const LOCAL_TURN_WAKE_DOMAINS = new Set([
   'EffectIntent',
   'EffectReceipt',
@@ -180,6 +183,10 @@ export class ReliableConversationRunner {
   private readonly admissions = new Map<string, AdmissionSlot>();
   private readonly waitingOwned = new Map<string, WaitingOwnedTurn>();
   private readonly deferredRecovery = new Map<string, DeferredRecoveryTurn>();
+  private unheldScanAt = 0;
+  private unheldScanTimer: NodeJS.Timeout | undefined;
+  private unheldScanTask: Promise<void> | undefined;
+  private readonly unheldRecoveredAt = new Map<string, number>();
   private readonly terminationRecoveryFailures = new Map<string, number>();
   private readonly interruptCancellationSignaled = new Set<string>();
   private externalWakeTimer: NodeJS.Timeout | undefined;
@@ -1097,11 +1104,58 @@ export class ReliableConversationRunner {
     }
   }
 
+  /**
+   * Called when another window committed. An active Turn this window serves that no live Host holds
+   * (its window exited, or handed it back) is recovered here, each Conversation at most once per
+   * UNHELD_TURN_RECOVERY_INTERVAL_MS. This is how an answer recorded in a window that does not serve
+   * the Conversation reaches a serving window that was already open.
+   */
+  public recoverUnheldTurns(): void {
+    if (this.disposed || this.unheldScanTimer || this.unheldScanTask) return;
+    const delay = Math.max(0, this.unheldScanAt + UNHELD_TURN_SCAN_INTERVAL_MS - Date.now());
+    this.unheldScanTimer = setTimeout(() => {
+      this.unheldScanTimer = undefined;
+      this.unheldScanAt = Date.now();
+      const task = this.scanUnheldTurns().catch((error: unknown) => {
+        this.onError(error, { operation: 'watch-recovery', conversationId: 'unknown' });
+      }).finally(() => {
+        if (this.unheldScanTask === task) this.unheldScanTask = undefined;
+      });
+      this.unheldScanTask = task;
+    }, delay);
+    this.unheldScanTimer.unref();
+  }
+
+  private async scanUnheldTurns(): Promise<void> {
+    const childTurnIds = new Set((await listAllDomainRows(this.application.database, 'ChildExecutionActiveTurnLink'))
+      .map((link) => requireId(link.turn_id, 'ChildExecutionActiveTurnLink.turn_id')));
+    const now = Date.now();
+    for (const [conversationId, at] of this.unheldRecoveredAt) {
+      if (now - at >= UNHELD_TURN_RECOVERY_INTERVAL_MS) this.unheldRecoveredAt.delete(conversationId);
+    }
+    for (const turn of await listAllDomainRows(this.application.database, 'Turn', { status: 'active' })) {
+      if (this.disposed) return;
+      const turnId = requireId(turn.id, 'Turn.id');
+      const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+      if (childTurnIds.has(turnId) || this.active.has(turnId) || this.waitingOwned.has(turnId)) continue;
+      if (this.deferredRecovery.has(turnId) || this.unheldRecoveredAt.has(conversationId)) continue;
+      const leases = await listAllDomainRows(this.application.database, 'ExecutionLease', { turn_id: turnId });
+      if (leases.length === 1 && await this.application.database.isHostAlive(
+        requireId(leases[0].host_boot_id, 'ExecutionLease.host_boot_id')
+      )) continue;
+      if (await this.conversationOwners.executionEligibility(conversationId) !== 'eligible') continue;
+      this.unheldRecoveredAt.set(conversationId, Date.now());
+      await this.recoverStartup(undefined, conversationId);
+    }
+  }
+
   public dispose(): void {
     this.disposed = true;
     this.unsubscribeCommit();
     if (this.externalWakeTimer) clearTimeout(this.externalWakeTimer);
     this.externalWakeTimer = undefined;
+    if (this.unheldScanTimer) clearTimeout(this.unheldScanTimer);
+    this.unheldScanTimer = undefined;
     this.waitingOwned.clear();
     this.deferredRecovery.clear();
     this.terminationRecoveryFailures.clear();
@@ -1619,6 +1673,13 @@ export class ReliableConversationRunner {
         const version = await this.application.database.externalDataVersion();
         for (const waiting of [...this.waitingOwned.values()]) {
           if (!localWake && waiting.externalDataVersion === version) continue;
+          // SQLite data_version is database-global: check first that this Turn's own facts changed,
+          // so another window's unrelated commits never probe this window's eligibility.
+          const observation = await this.observeWaitingWake(waiting.turnId);
+          if (observation.fingerprint === waiting.wakeFingerprint) {
+            waiting.externalDataVersion = observation.externalDataVersion;
+            continue;
+          }
           const claim = await this.tryOwnConversation(waiting.conversationId, ownership);
           if (claim === 'busy') {
             // A live peer Host owns this Conversation now; that Host observes and drives the
@@ -1631,13 +1692,6 @@ export class ReliableConversationRunner {
             // stop is still settled here and the Turn resumes once eligibility returns.
             this.deferRecoveryCandidate(waiting.conversationId, waiting.turnId, claim);
             await this.conversationOwners.releaseIfIdle(waiting.conversationId);
-            continue;
-          }
-          const observation = await this.observeWaitingWake(waiting.turnId);
-          if (observation.fingerprint === waiting.wakeFingerprint) {
-            // SQLite data_version is database-global. A different Conversation/Turn committed;
-            // acknowledge that edge without replaying this durable human/process wait.
-            waiting.externalDataVersion = observation.externalDataVersion;
             continue;
           }
           this.waitingOwned.delete(waiting.turnId);

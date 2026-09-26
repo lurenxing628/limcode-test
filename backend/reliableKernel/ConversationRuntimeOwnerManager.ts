@@ -156,6 +156,11 @@ interface OwnedConversation {
   readonly claimPath: string;
   readonly ownerToken: string;
   pins: number;
+  /**
+   * Claimed by a command (run()) rather than for execution. Kept on the claim itself, so whichever
+   * overlapping command finishes last hands it back; an execution claim clears it.
+   */
+  commandClaim: boolean;
 }
 
 /**
@@ -240,8 +245,15 @@ export class ConversationRuntimeOwnerManager {
     if (before !== 'eligible') return before;
     const wasOwned = this.owned.has(id);
     if (!await this.tryClaim(id)) return 'busy';
-    const after = await this.executionEligibility(id);
-    if (after === 'eligible') return 'owned';
+    // Nothing changed hands when this Host already owned it; the check above stands.
+    const after = wasOwned ? before : await this.executionEligibility(id);
+    if (after === 'eligible') {
+      await this.enqueue(id, async () => {
+        const state = this.owned.get(id);
+        if (state) state.commandClaim = false;
+      });
+      return 'owned';
+    }
     if (!wasOwned) await this.enqueue(id, () => this.releaseIfIdleLocked(id, true)).catch(() => undefined);
     return after;
   }
@@ -273,10 +285,10 @@ export class ConversationRuntimeOwnerManager {
    */
   public async run<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
     const id = requireNonEmptyText(conversationId, 'conversationId');
-    let claimedByThisRun = false;
     await this.enqueue(id, async () => {
-      claimedByThisRun = !this.owned.has(id);
+      const claimedByThisRun = !this.owned.has(id);
       const state = await this.claimLocked(id, 'throw');
+      if (claimedByThisRun) state.commandClaim = true;
       state.pins += 1;
     });
     try {
@@ -285,7 +297,7 @@ export class ConversationRuntimeOwnerManager {
       await this.enqueue(id, async () => {
         const state = this.owned.get(id);
         if (state && state.pins > 0) state.pins -= 1;
-        await this.releaseIfIdleLocked(id, claimedByThisRun);
+        await this.releaseIfIdleLocked(id, state?.commandClaim === true);
       }).catch((error: unknown) => {
         if (!this.closed) throw error;
       });
@@ -416,7 +428,7 @@ export class ConversationRuntimeOwnerManager {
         CONVERSATION_RUNTIME_OWNER_RECORD_FILE,
         `${JSON.stringify(metadata)}\n`
       )) {
-        return { conversationId, claimPath, ownerToken: metadata.ownerToken, pins: 0 };
+        return { conversationId, claimPath, ownerToken: metadata.ownerToken, pins: 0, commandClaim: false };
       }
       const record = await this.readRecord(claimPath);
       if (!record) continue;

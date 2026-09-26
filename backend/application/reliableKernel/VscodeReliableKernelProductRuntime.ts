@@ -159,7 +159,10 @@ export class VscodeReliableKernelProductRuntime {
     });
     this.externalRuntimeWatcher = new ExternalDataVersionWatcher(
       () => this.application.database.externalDataVersion(),
-      () => this.application.refreshExternalRuntimeWork(),
+      async () => {
+        await this.application.refreshExternalRuntimeWork();
+        this.conversations.recoverUnheldTurns();
+      },
       { onError: (error) => console.error('[LimCode] 跨宿主 Runtime 同步失败。', error) }
     );
   }
@@ -381,12 +384,14 @@ export class VscodeReliableKernelProductRuntime {
       });
       const runtimeDatabase = application.database;
       const runtimeContent = application.contentStore;
+      const frozenWorkEnvironmentCache = new Map<string, string | null>();
       const conversationEligibility = createDiagnosedConversationHostEligibility(
         (conversationId) => evaluateConversationHostEligibility({
           database: runtimeDatabase,
           contentStore: runtimeContent,
           workspaceFolderUris: () => currentWorkspaceFolders().map((folder) => folder.uri),
-          workEnvironments: () => configuration.workEnvironments()
+          workEnvironments: () => configuration.workEnvironments(),
+          frozenWorkEnvironmentCache
         }, conversationId),
         diagnostics
       );
