@@ -388,6 +388,8 @@ export async function mergeHistoricalDataSetsOnline(
     return picked;
   });
   report.pendingSources = sources.length;
+  // The newest backup from before this batch is never pruned by it (other windows may add theirs).
+  const earlierBackup = sources.length > 0 ? await newestTargetBackup(target).catch(() => undefined) : undefined;
   let started = false;
   for (const [index, source] of sources.entries()) {
     if (!keepGoing()) break;
@@ -412,7 +414,7 @@ export async function mergeHistoricalDataSetsOnline(
       await removeRuntimeDataSetMergeRequest(storagePaths, source.candidate.id).catch(() => undefined);
     }
   }
-  await settleTargetBackup(target).catch(() => undefined);
+  await settleTargetBackup(target, { keep: earlierBackup }).catch(() => undefined);
   if (sources.length > 0) {
     await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, () => pruneRuntimeDataSetMergeCommits(storagePaths))
       .catch(() => undefined);
@@ -1334,7 +1336,12 @@ async function transferCas(
     seen.add(row.storage_key);
     const sourceFile = casPath(sourceCas, row.storage_key);
     const targetFile = casPath(targetCas, row.storage_key);
-    const existing = await regularFileSize(targetFile);
+    const existing = await regularFileSize(targetFile).catch((error: unknown) => {
+      if (error instanceof NotRegularFile) {
+        throw new Outcome({ kind: 'blocked', code: 'runtime-data-set-merge-target-cas-damaged', message: `当前历史库里的正文位置不是普通文件：${row.storage_key}。为免覆盖，暂不合并。` });
+      }
+      throw error;
+    });
     if (existing !== undefined) {
       // CAS files are never rewritten: an existing object must already be exactly these bytes.
       if (existing !== row.byte_length || !await hasDigest(targetFile, row.sha256, verified)) {
@@ -1343,7 +1350,12 @@ async function transferCas(
       result.reusedCasObjects += 1;
       continue;
     }
-    if (await regularFileSize(sourceFile) !== row.byte_length || !await hasDigest(sourceFile, row.sha256, verified)) {
+    // A missing, irregular, short or different source object is the source's own lasting problem.
+    const sourceSize = await regularFileSize(sourceFile).catch((error: unknown) => {
+      if (error instanceof NotRegularFile) return undefined;
+      throw error;
+    });
+    if (sourceSize !== row.byte_length || !await hasDigest(sourceFile, row.sha256, verified)) {
       throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源缺少正文文件或内容与摘要不符：${row.storage_key}。` });
     }
     if (options.verifyOnly) continue;
@@ -1402,7 +1414,7 @@ async function copyIntoCas(targetCas: string, sourceFile: string, targetFile: st
 async function ensureTargetBackup(target: TargetContext): Promise<string> {
   if (target.backup.path) return target.backup.path;
   const backups = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
-  const root = path.join(backups, `${timestampSlug()}-${randomUUID().slice(0, 8)}`);
+  const root = path.join(backups, backupDirectoryName());
   const destination = path.join(root, 'limcode.sqlite');
   const temporary = `${destination}.${process.pid}.tmp`;
   try {
@@ -1436,7 +1448,10 @@ async function ensureTargetBackup(target: TargetContext): Promise<string> {
  * or its transaction proven rolled back) is removed again, so retries do not pile up copies of an
  * unchanged target; otherwise older backups are pruned.
  */
-async function settleTargetBackup(target: TargetContext, options: { keepUsed?: boolean } = {}): Promise<void> {
+async function settleTargetBackup(
+  target: TargetContext,
+  options: { keepUsed?: boolean; keep?: string } = {}
+): Promise<void> {
   const backup = target.backup.path;
   if (!backup) return;
   if (!target.backup.used) {
@@ -1445,23 +1460,44 @@ async function settleTargetBackup(target: TargetContext, options: { keepUsed?: b
     await syncDirectoryDurably(path.dirname(backup)).catch(() => undefined);
     return;
   }
-  if (!options.keepUsed) await pruneTargetBackups(target);
+  if (!options.keepUsed) await pruneTargetBackups(target, [path.basename(backup), ...(options.keep ? [options.keep] : [])]);
 }
 
-/** Keeps the newest target backups; the ones removed only ever held pre-merge copies. */
-async function pruneTargetBackups(target: TargetContext): Promise<void> {
+/**
+ * Keeps the newest target backups by creation time, plus `keep` (this batch's own and the newest
+ * from before it); the ones removed only ever held pre-merge copies.
+ */
+async function pruneTargetBackups(target: TargetContext, keep: readonly string[]): Promise<void> {
   const backups = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
-  const names = (await fs.readdir(backups)).filter((name) => /^\d{8}T\d{6}Z-[0-9a-f]{8}$/.test(name)).sort();
+  const names = await targetBackupsByAge(backups);
   for (const name of names.slice(0, Math.max(0, names.length - RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION))) {
-    await fs.rm(path.join(backups, name), { recursive: true, force: true });
+    if (!keep.includes(name)) await fs.rm(path.join(backups, name), { recursive: true, force: true });
   }
   await syncDirectoryDurably(backups);
+}
+
+async function newestTargetBackup(target: TargetContext): Promise<string | undefined> {
+  return (await targetBackupsByAge(path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY)).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  })).at(-1);
+}
+
+/** Backup directories of this engine, oldest first (millisecond time, then creation order). */
+async function targetBackupsByAge(backups: string): Promise<string[]> {
+  const parsed = (await fs.readdir(backups)).flatMap((name) => {
+    const match = BACKUP_NAME.exec(name);
+    return match ? [{ name, time: match[1], sequence: Number(match[2]) }] : [];
+  });
+  parsed.sort((left, right) => left.time.localeCompare(right.time) || left.sequence - right.sequence
+    || left.name.localeCompare(right.name));
+  return parsed.map((entry) => entry.name);
 }
 
 /** Source backup before finalization, with the offline SQLite Backup API, beside the source. */
 async function backupSource(binding: HistoricalRootBinding): Promise<string> {
   const backups = path.join(path.dirname(binding.paths.dataRootPath), RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY);
-  const root = path.join(backups, `${timestampSlug()}-${randomUUID().slice(0, 8)}`);
+  const root = path.join(backups, backupDirectoryName());
   const destination = path.join(root, 'limcode.sqlite');
   const temporary = `${destination}.${process.pid}.tmp`;
   try {
@@ -1498,10 +1534,12 @@ function casPath(casRoot: string, storageKey: string): string {
   return file;
 }
 
+class NotRegularFile extends Error {}
+
 async function regularFileSize(file: string): Promise<bigint | undefined> {
   try {
     const info = await fs.lstat(file, { bigint: true });
-    if (!info.isFile()) throw new Error(`CAS entry is not a regular file: ${file}`);
+    if (!info.isFile()) throw new NotRegularFile(`CAS entry is not a regular file: ${file}`);
     return info.size;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
@@ -1557,8 +1595,13 @@ async function writeDurableJson(file: string, value: unknown): Promise<void> {
   finally { await fs.rm(temporary, { force: true }); }
 }
 
-function timestampSlug(): string {
-  return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+const BACKUP_NAME = /^(\d{8}T\d{9}Z)-(\d{6,})-[0-9a-f]{8}$/;
+let backupSequence = 0;
+
+/** UTC time to the millisecond, then a per-process sequence: sorts by creation even within one ms. */
+function backupDirectoryName(): string {
+  backupSequence += 1;
+  return `${new Date().toISOString().replace(/[-:.]/g, '')}-${String(backupSequence).padStart(6, '0')}-${randomUUID().slice(0, 8)}`;
 }
 
 /**

@@ -672,14 +672,57 @@ test('审查 #8：当前库备份失败时不留临时文件与空目录并推�
   await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' });
 
   const backups = path.join(controlRoot(fixture.current), 'merge-backups');
-  const old = ['20260101T000000Z-00000001', '20260102T000000Z-00000002', '20260103T000000Z-00000003'];
+  // Millisecond time, then creation order (复审 merge2 #6: same-second backups sort by real time).
+  const old = ['20260101T000000000Z-000009-ffffffff', '20260101T000000001Z-000001-00000000', '20260103T000000000Z-000001-aaaaaaaa'];
   for (const name of old) await fs.mkdir(path.join(backups, name), { recursive: true });
   const merged = await merge(fixture, database);
   assert.equal(merged.merged.length, 1);
+  assert.match(path.basename(merged.merged[0].backupPath), /^\d{8}T\d{9}Z-\d{6}-[0-9a-f]{8}$/);
   const kept = (await fs.readdir(backups)).sort();
   assert.equal(kept.length, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION);
   assert.deepEqual(kept.slice(0, 2), old.slice(1));
   assert.equal(path.join(backups, kept[2]), merged.merged[0].backupPath);
+});
+
+test('复审 merge2 #6：备份之后才推迟的合并不留下本轮备份；来源正文位置不是普通文件属于来源自身的问题，记为失败', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_current_retry', project: SHARED_PROJECT }]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_retry', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  const backups = path.join(controlRoot(fixture.current), 'merge-backups');
+  const failingLink = async () => { throw Object.assign(new Error('input/output error'), { code: 'EIO' }); };
+  for (let startup = 0; startup < 3; startup += 1) {
+    const report = await merge(fixture, database, { linkFile: failingLink });
+    assert.deepEqual([report.merged.length, report.deferred[0]?.code], [0, 'EIO']);
+    assert.deepEqual(await fs.readdir(backups).catch(() => []), [], `第 ${startup + 1} 次推迟后没有累积备份`);
+  }
+
+  const own = casFile(fixture.alpha.binding, messageText('conversation_alpha_retry', 0));
+  await fs.chmod(path.dirname(own), 0o700);
+  await fs.rm(own, { force: true });
+  await fs.mkdir(own);
+  const irregular = await merge(fixture, database);
+  assert.deepEqual([irregular.deferred, irregular.failures.map((item) => item.code)], [[], ['runtime-data-set-merge-source-cas-invalid']]);
+  assert.equal((await merge(fixture, database)).failures[0]?.newly, false, '同一来源状态不再重试');
+  assert.deepEqual(await fs.readdir(backups).catch(() => []), []);
+});
+
+test('复审 merge2 #8：修剪时保留本批开始前最新的那份和本批自己的备份，即使其它窗口同时又做了更新的备份', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_prune', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  const backups = path.join(controlRoot(fixture.current), 'merge-backups');
+  const before = ['20260101T000000000Z-000001-00000001', '20260102T000000000Z-000001-00000002'];
+  const others = ['20990101T000000000Z-000001-0000000a', '20990101T000000000Z-000002-0000000b', '20990101T000000000Z-000003-0000000c'];
+  for (const name of before) await fs.mkdir(path.join(backups, name), { recursive: true });
+  const report = await merge(fixture, database, {
+    async onFaultPoint(point) {
+      if (point !== 'after-row-commit') return;
+      for (const name of others) await fs.mkdir(path.join(backups, name), { recursive: true });
+    }
+  });
+  const own = path.basename(report.merged[0].backupPath);
+  assert.deepEqual((await fs.readdir(backups)).sort(), [before[1], own, ...others].sort());
 });
 
 test('超过在线事务上限的来源：无协调则推迟；协调成功走独占；协调未成功推迟；拒绝、占用或失败的来源从不触发协调', async (t) => {
