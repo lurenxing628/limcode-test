@@ -50,6 +50,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/webview-agent-status-panel.browser.mjs',
   'scripts/reliable-kernel/benchmark-concurrency-tuning.mjs',
   'scripts/reliable-kernel/benchmark-model-independent-hotpaths.mjs',
+  'scripts/reliable-kernel/benchmark-native-output-growth.mjs',
   'scripts/reliable-kernel/benchmark-phase0-milestones.mjs',
   'scripts/reliable-kernel/benchmark-tool-scheduler.mjs',
   'tests/bottomStickyScrollerScheduler.test.cjs',
