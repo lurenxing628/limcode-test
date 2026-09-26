@@ -164,8 +164,10 @@ const REFUSAL_PROBES: readonly Probe[] = Object.freeze([
 
 /**
  * Read-only classification on a source snapshot. The kernel's own per-Conversation pending-work
- * probe is applied to every Conversation as the final authority: anything it still sees after the
- * named probes counts as refused, so the merge never admits work the receiving Runtime would pick up.
+ * probe is applied to every Conversation as the final authority, including the Conversations whose
+ * work would be finalized (judged as they will be once finalized, see busyAfterFinalization):
+ * anything it still sees after the named probes counts as refused, before anything is finalized,
+ * so the merge never admits work the receiving Runtime would pick up.
  */
 export function inspectUnfinishedWork(source: Database.Database): UnfinishedWorkInspection {
   const refused: UnfinishedWorkRefusal[] = [];
@@ -206,16 +208,81 @@ export function inspectUnfinishedWork(source: Database.Database): UnfinishedWork
       conversationId: row.conversation_id,
       expectedRevisionSeq: String(row.revision_seq ?? 0)
     }));
-  const finalizedConversations = new Set([...turns, ...intents].map((item) => item.conversationId));
   if (refused.length === 0) {
-    const busy = createConversationRuntimeWorkProbe(source);
-    let remaining = 0;
-    for (const id of source.prepare('SELECT id FROM conversation ORDER BY id').pluck().iterate() as IterableIterator<string>) {
-      if (!finalizedConversations.has(id) && busy(id)) remaining += 1;
-    }
+    const remaining = busyAfterFinalization(source, turns, intents);
     if (remaining > 0) refused.push({ label: '其它未结束的对话工作', count: remaining });
   }
   return { refused, turns, intents };
+}
+
+/**
+ * Conversations the kernel probe still sees as busy once the finalizable work is closed. Temporary
+ * views shadow exactly the rows the finalization changes (see runtimeDataSetMergeWork): the Turn
+ * terminates, its lease is released, its pending interrupt/termination input is consumed and its
+ * pending tool calls get their results; a queued intent is cancelled. The probe itself is the
+ * kernel's, unchanged. Only temporary objects of this connection are created (the snapshot copy is
+ * opened read-only) and they are dropped before returning.
+ */
+function busyAfterFinalization(
+  source: Database.Database,
+  turns: readonly FinalizableTurn[],
+  intents: readonly FinalizableIntent[]
+): number {
+  const restore = turns.length > 0 || intents.length > 0 ? shadowFinalization(source, turns, intents) : undefined;
+  try {
+    const busy = createConversationRuntimeWorkProbe(source);
+    let remaining = 0;
+    for (const id of source.prepare('SELECT id FROM main.conversation ORDER BY id').pluck().iterate() as IterableIterator<string>) {
+      if (busy(id)) remaining += 1;
+    }
+    return remaining;
+  } finally {
+    restore?.();
+  }
+}
+
+const FINALIZED_TURNS = 'temp.merge_finalized_turn';
+const FINALIZED_INTENTS = 'temp.merge_finalized_intent';
+
+function shadowFinalization(
+  source: Database.Database,
+  turns: readonly FinalizableTurn[],
+  intents: readonly FinalizableIntent[]
+): () => void {
+  const queryOnly = Number(source.pragma('query_only', { simple: true }) as bigint | number) !== 0;
+  source.pragma('query_only = OFF');
+  const drops: string[] = [];
+  const restore = (): void => {
+    for (const drop of drops.reverse()) source.exec(drop);
+    if (queryOnly) source.pragma('query_only = ON');
+  };
+  try {
+    for (const [table, ids] of [[FINALIZED_TURNS, turns.map((turn) => turn.turnId)], [FINALIZED_INTENTS, intents.map((intent) => intent.intentId)]] as const) {
+      source.exec(`CREATE TEMP TABLE ${table.slice('temp.'.length)} (id TEXT PRIMARY KEY) WITHOUT ROWID`);
+      drops.push(`DROP TABLE ${table}`);
+      const insert = source.prepare(`INSERT INTO ${table} (id) VALUES (?)`);
+      for (const id of ids) insert.run(id);
+    }
+    const columns = (table: string): string[] => (source.prepare(`PRAGMA main.table_info(${table})`).all() as Array<{ name: string }>)
+      .map((column) => column.name);
+    const view = (name: string, select: string): void => {
+      source.exec(`CREATE TEMP VIEW ${name} AS ${select}`);
+      drops.push(`DROP VIEW temp.${name}`);
+    };
+    view('turn', `SELECT ${columns('turn').map((column) => column === 'status'
+      ? `CASE WHEN id IN (SELECT id FROM ${FINALIZED_TURNS}) THEN 'terminated' ELSE status END AS status`
+      : `"${column}"`).join(', ')} FROM main.turn`);
+    view('execution_lease', `SELECT * FROM main.execution_lease WHERE turn_id NOT IN (SELECT id FROM ${FINALIZED_TURNS})`);
+    view('pending_turn_input', `SELECT * FROM main.pending_turn_input
+      WHERE NOT (state = 'pending' AND turn_id IN (SELECT id FROM ${FINALIZED_TURNS}))`);
+    view('tool_call', `SELECT * FROM main.tool_call
+      WHERE NOT (status = 'pending' AND turn_id IN (SELECT id FROM ${FINALIZED_TURNS}))`);
+    view('turn_intent', `SELECT * FROM main.turn_intent WHERE id NOT IN (SELECT id FROM ${FINALIZED_INTENTS})`);
+  } catch (error) {
+    restore();
+    throw error;
+  }
+  return restore;
 }
 
 export function describeUnfinishedWork(refused: readonly UnfinishedWorkRefusal[]): string {
