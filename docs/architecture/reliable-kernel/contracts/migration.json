@@ -69,8 +69,8 @@
     "peerBehavior": "busy-while-lease-pinned-or-pending-conversation-work-or-focused; 5s-cancellable-countdown-or-notice-when-user-confirmed; reload-with-unsent-composer-in-webview-state",
     "requesterSelf": "skipped-by-requester-host-boot-id-else-requester-process; requester-closes-own-runtime-inside-operation",
     "reloadedHostBehavior": "wait-on-configuration-admission-until-maintenance-ends-then-reread-data-root",
-    "backoff": "per-operation-key-exponential-5m-to-6h-after-abandon; per-operation-10m-cooldown-after-go; explicit-user-request-ignores",
-    "waitBound": "prepare-8s-busy-wait-10m-confirm-20s-release-30s-monotonic; cancellable; outcome-completed-busy-declined-legacy-host-timed-out-cancelled-or-backoff-with-reason",
+    "backoff": "per-operation-key-exponential-5m-to-6h-after-abandon-or-failure-after-go; deterministic-failure-blocks-key; per-operation-10m-cooldown-after-go; ignore-backoff-explicit-per-call-skips-key-backoff-only; success-resets-key",
+    "waitBound": "prepare-8s-busy-wait-10m-confirm-20s-release-30s-monotonic; cancellable; outcome-completed-busy-declined-legacy-host-timed-out-cancelled-backoff-or-blocked-with-reason; failure-after-go-rethrown",
     "processProbe": "platform-identity-once-per-pid-and-start-identity-then-kill-0; final-decision-uncached",
     "exclusivityProof": "host-liveness-records-only; request-advisory"
   },

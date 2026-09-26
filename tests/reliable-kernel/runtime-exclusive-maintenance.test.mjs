@@ -39,7 +39,7 @@ const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
 const NOW = '2026-09-26T00:00:00.000Z';
 // Long-running windows; a window that started moments ago gets a short grace to register.
 const STARTED = '2026-01-01T00:00:00.000Z';
-const BASE = { operation: 'historical-merge', operationKey: 'sources-a', message: '为合并旧聊天记录' };
+const BASE = { operation: 'historical-merge', operationKey: 'sources-a', message: '为合并旧聊天记录', ignoreBackoff: false };
 // Several simulated windows share this process: each gets its own identity for the self check.
 let nextFakeProcessId = 3_000_000;
 
@@ -202,6 +202,45 @@ test('wait 模式下确认后又开始工作的窗口不会被打断：回到准
   assert.deepEqual(steady.log.filter((entry) => entry[0] === 'release').map((entry) => entry[2]), [2]);
 });
 
+test('go 之后操作失败按操作键退避（冷却不可跳过）；确定性失败直接转 blocked；成功后退避清零', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const failure = () => Object.assign(new Error('复制正文文件时出错'), { code: 'EIO' });
+  const cooldownAfterCoordinatedMs = 1_000;
+  const input = { ...BASE, cooldownAfterCoordinatedMs, backoffBaseMs: 60_000 };
+  const { ignoreBackoff: _omitted, ...implicit } = BASE;
+  await assert.rejects(request(paths, implicit, async () => 1), /ignoreBackoff must be passed explicitly/);
+  await openWindow(t, binding, 'peer-1');
+  await assert.rejects(request(paths, input, async () => { throw failure(); }), /复制正文文件时出错/);
+  await openWindow(t, binding, 'peer-2');
+  const again = await request(paths, input, async () => assert.fail('must not run'));
+  assert.equal(again.state, 'backoff', 'the failed work backs off like an abandoned attempt');
+  const explicit = await request(paths, { ...input, ignoreBackoff: true }, async () => assert.fail('must not run'));
+  assert.equal(explicit.state, 'backoff', 'an explicit request skips the key backoff, never the cooldown');
+  assert.match(explicit.reason, /刚刚已经让其它窗口重载过/);
+  await delay(cooldownAfterCoordinatedMs + 50);
+  const ledger = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'ledger');
+  const keyEntry = async () => {
+    for (const name of await fs.readdir(ledger)) {
+      const entry = JSON.parse(await fs.readFile(path.join(ledger, name), 'utf8'));
+      if (entry.scope === 'key') return entry;
+    }
+    return undefined;
+  };
+  assert.equal((await keyEntry()).attempts, 1);
+  assert.deepEqual(await request(paths, { ...input, ignoreBackoff: true }, async () => 'merged'),
+    { state: 'completed', result: 'merged', coordinated: true });
+  assert.equal(await keyEntry(), undefined, 'success resets the backoff');
+
+  // A deterministic failure blocks the key for good, whoever asks and even with no other window.
+  const deterministic = { ...BASE, operationKey: 'drifted-source', isDeterministicFailure: (error) => error.code === 'SCHEMA_DRIFT' };
+  await assert.rejects(request(paths, deterministic, async () => {
+    throw Object.assign(new Error('来源结构漂移'), { code: 'SCHEMA_DRIFT' });
+  }), /来源结构漂移/);
+  const blocked = await request(paths, { ...deterministic, ignoreBackoff: true }, async () => assert.fail('must not run'));
+  assert.equal(blocked.state, 'blocked');
+  assert.match(blocked.reason, /来源结构漂移/);
+});
+
 test('发起方自己的窗口按 requesterHostBootId（或同一进程）跳过请求，不会被要求重载', async (t) => {
   const { binding, paths } = await createRoot(t);
   const self = await openWindow(t, binding, 'self-window');
@@ -249,17 +288,15 @@ test('一次协调让其它窗口重载后同一操作进入冷却：刚让出�
   const first = await request(paths, BASE, async () => 'merged-by-b');
   assert.deepEqual(first, { state: 'completed', result: 'merged-by-b', coordinated: true });
   assert.equal(a.releases(), 1);
-  // B opened; A restarts and would ask B for the same operation (even another key): cooldown.
+  // B opened; A restarts and would ask B for the same operation (even another key, even explicitly): cooldown.
   const b = await openWindow(t, binding, 'window-b');
-  const reverse = await request(paths, { ...BASE, operationKey: 'sources-b' }, async () => assert.fail('must not run'));
-  assert.equal(reverse.state, 'backoff');
-  assert.match(reverse.reason, /刚刚已经让其它窗口重载过一次/);
+  for (const ignoreBackoff of [false, true]) {
+    const reverse = await request(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff }, async () => assert.fail('must not run'));
+    assert.equal(reverse.state, 'backoff');
+    assert.match(reverse.reason, /刚刚已经让其它窗口重载过一次/);
+  }
   await settle([b]);
   assert.equal(b.confirms(), 0);
-  // The user explicitly asking is the exception.
-  const explicit = await request(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff: true }, async () => 'explicit');
-  assert.equal(explicit.state, 'completed');
-  assert.equal(b.releases(), 1);
 });
 
 test('清理失败不会覆盖已完成的结果；EPERM 等临时错误会重试', async (t) => {
@@ -277,7 +314,8 @@ test('清理失败不会覆盖已完成的结果；EPERM 等临时错误会重�
   };
   t.after(() => { fsPromises.rm = originalRm; });
   await openWindow(t, binding, 'window-a');
-  assert.deepEqual(await request(paths, BASE, async () => 'first'), { state: 'completed', result: 'first', coordinated: true });
+  assert.deepEqual(await request(paths, { ...BASE, cooldownAfterCoordinatedMs: 1 }, async () => 'first'),
+    { state: 'completed', result: 'first', coordinated: true });
   assert.equal(transient, 2);
   assert.equal(fsSync.existsSync(path.join(directory, 'request.json')), false, 'removed after retrying');
   fsPromises.rm = originalRm;
@@ -476,6 +514,10 @@ async function openWindow(t, binding, hostBootId, options = {}) {
 async function settle(windows) {
   await new Promise((resolve) => setTimeout(resolve, 60));
   for (const window of windows) await window.check();
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function exitedProcessId() {

@@ -484,7 +484,7 @@ test('超过在线事务上限的来源：无协调则推迟；协调成功走�
       calls.push(input);
       return requestExclusiveRuntimeMaintenance(input.targetPaths, {
         operation: 'historical-merge', operationKey: input.operationKey, message: '为合并较大的旧聊天记录',
-        configurationRootPath: fixture.root, requesterHostBootId: input.requesterHostBootId
+        configurationRootPath: fixture.root, requesterHostBootId: input.requesterHostBootId, ignoreBackoff: false
       }, run);
     }
   });

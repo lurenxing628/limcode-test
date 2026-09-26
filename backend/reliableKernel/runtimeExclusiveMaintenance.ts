@@ -114,8 +114,14 @@ export interface RuntimeExclusiveMaintenanceInput {
   configurationRootPath?: string;
   participantConfirmation?: ExclusiveMaintenanceConfirmation;
   whenBusy?: ExclusiveMaintenanceBusyPolicy;
-  /** Explicit user requests ignore earlier backoff and cooldown. */
-  ignoreBackoff?: boolean;
+  /**
+   * Required on every call, never inferred from stored state: true only for the one call made for
+   * an explicit user action. It skips the per-key backoff, never the per-operation cooldown or a
+   * blocked key.
+   */
+  ignoreBackoff: boolean;
+  /** A failure of the operation that will fail the same way again: the key is blocked for good. */
+  isDeterministicFailure?(error: unknown): boolean;
   pollMs?: number;
   prepareTimeoutMs?: number;
   busyWaitTimeoutMs?: number;
@@ -135,7 +141,7 @@ export interface RuntimeExclusiveMaintenanceInput {
 }
 
 export type RuntimeExclusiveMaintenanceAbandonState =
-  'busy' | 'declined' | 'legacy-host' | 'timed-out' | 'cancelled' | 'backoff';
+  'busy' | 'declined' | 'legacy-host' | 'timed-out' | 'cancelled' | 'backoff' | 'blocked';
 
 export type RuntimeExclusiveMaintenanceOutcome<T> =
   | { state: 'completed'; result: T; coordinated: boolean }
@@ -170,6 +176,9 @@ export async function requestExclusiveRuntimeMaintenance<T>(
   if (input.configurationRootPath !== undefined && !isRuntimeDataRootAdmissionHeld(input.configurationRootPath)) {
     throw new Error('独占维护必须在配置根的 admission 内发起。');
   }
+  if (typeof input.ignoreBackoff !== 'boolean') {
+    throw new TypeError('ignoreBackoff must be passed explicitly on every call.');
+  }
   const operationName = requireText(input.operation, 'operation');
   const operationKey = requireText(input.operationKey ?? input.operation, 'operationKey');
   const message = requireText(input.message, 'message');
@@ -180,17 +189,30 @@ export async function requestExclusiveRuntimeMaintenance<T>(
   const classify = createCachedProcessClassifier();
   const hostsNow = () => listActiveRuntimeHosts(paths, { exceptHostBootId: except, classify });
   // The final decision never trusts the poll cache.
-  const runExclusive = async (): Promise<T> => {
+  const runExclusive = async (coordinated: boolean): Promise<T> => {
     await assertRuntimeHostsOffline(paths, except);
-    return operation();
+    try {
+      const result = await operation();
+      await clearKeyBackoff(paths, operationName, operationKey);
+      return result;
+    } catch (error) {
+      const reason = `上次${coordinated ? '其它窗口让出后' : ''}操作失败：${describeError(error)}`;
+      if (input.isDeterministicFailure?.(error)) {
+        await recordKeyBlocked(paths, operationName, operationKey, reason);
+      } else if (coordinated) {
+        // Other windows reloaded for nothing: the same work backs off like an abandoned attempt.
+        await recordKeyBackoff(paths, operationName, operationKey, reason, input);
+      }
+      throw error;
+    }
   };
 
+  const blocked = await readKeyBlock(paths, operationName, operationKey);
+  if (blocked) return { state: 'blocked', hosts: [], reason: blocked };
   let hosts = await hostsNow();
-  if (hosts.length === 0) return { state: 'completed', result: await runExclusive(), coordinated: false };
-  if (!input.ignoreBackoff) {
-    const backoff = await readActiveBackoff(paths, operationName, operationKey, input);
-    if (backoff) return { state: 'backoff', hosts, reason: backoff.reason, retryAfter: backoff.until };
-  }
+  if (hosts.length === 0) return { state: 'completed', result: await runExclusive(false), coordinated: false };
+  const backoff = await readActiveBackoff(paths, operationName, operationKey, input);
+  if (backoff) return { state: 'backoff', hosts, reason: backoff.reason, retryAfter: backoff.until };
   const outsiders = await hostsOutsideProtocol(paths, hosts);
   if (outsiders.length > 0) {
     const reason = outsideProtocolReason(outsiders);
@@ -341,8 +363,7 @@ export async function requestExclusiveRuntimeMaintenance<T>(
       break;
     }
     endWait();
-    const result = await runExclusive();
-    await clearKeyBackoff(paths, operationName, operationKey);
+    const result = await runExclusive(true);
     return { state: 'completed', result, coordinated: true };
   } finally {
     endWait();
@@ -628,8 +649,15 @@ interface LedgerEntry {
   operationKey?: string;
   attempts: number;
   until: string;
+  /** A deterministic failure: this key is never run again (its identity must change first). */
+  blocked?: true;
   reason: string;
   recordedAt: string;
+}
+
+async function readKeyBlock(paths: RuntimeRootPaths, operation: string, operationKey: string): Promise<string | undefined> {
+  const entry = await readLedger(paths, keyLedgerName(operation, operationKey));
+  return entry?.blocked === true ? `这项维护此前确定无法完成，不再自动重试：${entry.reason}` : undefined;
 }
 
 async function readActiveBackoff(
@@ -642,12 +670,12 @@ async function readActiveBackoff(
     input.backoffMaxMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.backoffMaxMs,
     input.cooldownAfterCoordinatedMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.cooldownAfterCoordinatedMs
   );
+  // An explicit user request skips the key's backoff, never the operation's cooldown.
+  const entries = [await readLedger(paths, operationLedgerName(operation))];
+  if (!input.ignoreBackoff) entries.push(await readLedger(paths, keyLedgerName(operation, operationKey)));
   let latest: { until: string; reason: string; at: number } | undefined;
-  for (const entry of [
-    await readLedger(paths, operationLedgerName(operation)),
-    await readLedger(paths, keyLedgerName(operation, operationKey))
-  ]) {
-    if (!entry) continue;
+  for (const entry of entries) {
+    if (!entry || entry.blocked) continue;
     const until = Date.parse(entry.until);
     // A clock set back must not freeze retries far beyond the longest backoff.
     if (!Number.isFinite(until) || until <= Date.now() || until > Date.now() + maxMs + 60_000) continue;
@@ -665,6 +693,7 @@ async function recordKeyBackoff(
 ): Promise<void> {
   const name = keyLedgerName(operation, operationKey);
   const previous = await readLedger(paths, name);
+  if (previous?.blocked) return;
   const baseMs = input.backoffBaseMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.backoffBaseMs;
   const maxMs = input.backoffMaxMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.backoffMaxMs;
   const attempts = Math.min(30, (previous?.attempts ?? 0) + 1);
@@ -673,6 +702,13 @@ async function recordKeyBackoff(
     kind: LEDGER_KIND, scope: 'key', operation, operationKey, attempts,
     until: new Date(Date.now() + durationMs).toISOString(), reason, recordedAt: new Date().toISOString()
   }).catch((error) => console.warn('[LimCode] 无法记录独占维护的退避。', error));
+}
+
+async function recordKeyBlocked(paths: RuntimeRootPaths, operation: string, operationKey: string, reason: string): Promise<void> {
+  const recordedAt = new Date().toISOString();
+  await writeLedger(paths, keyLedgerName(operation, operationKey), {
+    kind: LEDGER_KIND, scope: 'key', operation, operationKey, attempts: 1, until: recordedAt, blocked: true, reason, recordedAt
+  }).catch((error) => console.warn('[LimCode] 无法记录独占维护的确定性失败。', error));
 }
 
 async function recordOperationCooldown(
@@ -688,6 +724,7 @@ async function recordOperationCooldown(
   }).catch((error) => console.warn('[LimCode] 无法记录独占维护的冷却期。', error));
 }
 
+/** Success resets the key: a later failure starts again from the shortest backoff. */
 async function clearKeyBackoff(paths: RuntimeRootPaths, operation: string, operationKey: string): Promise<void> {
   await removeWithRetry(path.join(ledgerDirectory(paths), keyLedgerName(operation, operationKey)))
     .catch((error) => console.warn('[LimCode] 无法清除独占维护的退避记录。', error));
@@ -697,7 +734,7 @@ async function readLedger(paths: RuntimeRootPaths, name: string): Promise<Ledger
   try {
     const value = JSON.parse(await fs.readFile(path.join(ledgerDirectory(paths), name), 'utf8')) as Partial<LedgerEntry>;
     if (value.kind !== LEDGER_KIND || typeof value.until !== 'string' || typeof value.reason !== 'string'
-      || !Number.isSafeInteger(value.attempts)) return undefined;
+      || !Number.isSafeInteger(value.attempts) || (value.blocked !== undefined && value.blocked !== true)) return undefined;
     return value as LedgerEntry;
   } catch {
     return undefined;
@@ -783,6 +820,11 @@ function ledgerDirectory(paths: RuntimeRootPaths): string {
 function safeName(value: string): string {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(value)) throw new TypeError('Host boot id is not a safe file name.');
   return value;
+}
+
+function describeError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.length > 200 ? `${text.slice(0, 200)}…` : text;
 }
 
 function requireText(value: string, label: string): string {

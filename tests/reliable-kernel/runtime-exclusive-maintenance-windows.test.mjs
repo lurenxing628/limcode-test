@@ -28,7 +28,7 @@ const THIS_FILE = fileURLToPath(import.meta.url);
 const WINDOW_PROCESS_ENV = 'LIMCODE_EXCLUSIVE_MAINTENANCE_WINDOW';
 const NOW = '2026-09-26T00:00:00.000Z';
 const STARTED = '2026-01-01T00:00:00.000Z';
-const MERGE = { operation: 'historical-merge', operationKey: 'workspace:alpha', message: '为合并旧聊天记录' };
+const MERGE = { operation: 'historical-merge', operationKey: 'workspace:alpha', message: '为合并旧聊天记录', ignoreBackoff: false };
 let nextFakeProcessId = 4_000_000;
 
 if (process.env[WINDOW_PROCESS_ENV]) await runWindowProcess(JSON.parse(process.env[WINDOW_PROCESS_ENV]));

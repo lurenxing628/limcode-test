@@ -522,8 +522,8 @@ test('only an oversized source the engine prepared asks other windows to yield, 
     assert.deepEqual(call[2], {
       operation: 'historical-merge', operationKey: 'workspace:old@0123456789abcdef', message: '为合并较大的旧聊天记录',
       waitingTitle: '正在等待其它窗口空闲后合并较大的旧聊天记录', configurationRootPath: '/fixture',
-      requesterHostBootId: 'this-window',
-      ...(requested ? { whenBusy: 'wait', ignoreBackoff: true, participantConfirmation: 'notice' } : {})
+      requesterHostBootId: 'this-window', ignoreBackoff: requested,
+      ...(requested ? { whenBusy: 'wait', participantConfirmation: 'notice' } : {})
     });
     assert.equal(call[3], true);
     assert.equal(merged, outcome === 'completed');
