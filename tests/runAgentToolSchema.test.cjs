@@ -462,6 +462,13 @@ function createRetainedConversationOwners() {
       owned.add(conversationId);
       return true;
     },
+    async executionEligibility() {
+      return 'eligible';
+    },
+    async tryClaimEligible(conversationId) {
+      owned.add(conversationId);
+      return 'owned';
+    },
     async assertOwned(conversationId) {
       if (!owned.has(conversationId)) {
         throw new Error(`Conversation ${conversationId} is not owned by this Runtime Host.`);
