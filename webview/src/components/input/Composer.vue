@@ -31,6 +31,8 @@ import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import SummaryRebuildConfirm from '@webview/components/input/SummaryRebuildConfirm.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import { useChatDraftPrefill } from '@webview/components/input/chatDraftPrefill';
+import { PERSISTED_COMPOSER_DRAFT_KEY, useComposerDraftPersistence } from '@webview/components/input/composerDraftPersistence';
+import { bridge } from '@webview/transport';
 import { summaryRebuildTooltipRows } from '@webview/components/input/summaryRebuildPreview';
 import { useSummaryRebuildPreview } from '@webview/composables/useSummaryRebuildPreview';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
@@ -333,6 +335,20 @@ const chatAttachments = computed<InlineDataPart[]>({
 });
 // "Send as a new message" never silently replaces a draft or an open edit (see chatDraftPrefill).
 const chatDraftPrefill = useChatDraftPrefill(ui, chatAttachments);
+// Unsent text, attachments and an open edit survive a window reload (Webview state).
+const draftPersistence = useComposerDraftPersistence({
+  ui,
+  attachments: attachmentSnapshots,
+  conversationId: () => reliableConversation.conversationId.value || undefined,
+  findMessage: (messageId) => reliableConversation.projection.value.messages.find((message) => message.id === messageId),
+  storage: {
+    read: () => bridge.readPersistedState(PERSISTED_COMPOSER_DRAFT_KEY),
+    write: (value) => bridge.writePersistedState(PERSISTED_COMPOSER_DRAFT_KEY, value)
+  },
+  onAttachmentsOmitted: (count) => {
+    globalSettings.status = `重载前有 ${count} 个未发送的附件太大，没能保留，请重新添加。`;
+  }
+});
 const attachmentRefreshKey = computed(() => selectedAttachments.value.map((part, index) => index + ':' + (part.inlineData.name ?? '') + ':' + (part.inlineData.sizeBytes ?? 0)).join('|'));
 const hasDraftContent = computed(() => draft.value.trim().length > 0 || selectedAttachments.value.length > 0);
 const attachmentLimitBytes = computed(() => Math.max(1, globalSettings.attachments.maxStoredInlineFileMb || 20) * 1024 * 1024);
@@ -441,6 +457,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  draftPersistence.dispose();
   window.removeEventListener('keydown', onWindowKeydown);
   window.removeEventListener('resize', onWindowResize);
   if (highlightTimer !== undefined) window.clearTimeout(highlightTimer);

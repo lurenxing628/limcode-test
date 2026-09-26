@@ -239,6 +239,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'webview/tests/summaryRebuildPreview.test.ts',
   'webview/tests/compressionTokenChange.test.ts',
   'webview/tests/chatDraftPrefill.test.ts',
+  'webview/tests/composerDraftPersistence.test.ts',
   'webview/tests/steeringReceipts.test.ts'
 ]);
 
