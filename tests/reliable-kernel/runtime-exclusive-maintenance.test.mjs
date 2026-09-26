@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,11 +25,12 @@ const { resolveVscodeRuntimeDataRoot } = kernelFile('vscodeRootAuthority.js');
 const { createCachedProcessClassifier, ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
 const processProtocol = kernelFile('processProtocol.js');
 const {
-  isRuntimeDataRootAdmissionHeld, openUnderCurrentDataRootAdmission, withRuntimeDataRootAdmission, withRuntimeMaintenance
+  isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, openUnderCurrentDataRootAdmission,
+  withRuntimeDataRootAdmission, withRuntimeMaintenance
 } = kernelFile('runtimeHostControl.js');
 const {
-  readExclusiveMaintenanceRequest, registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance,
-  runtimeExclusiveMaintenanceDirectory, startExclusiveMaintenanceParticipant
+  readExclusiveMaintenanceRequests, registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance,
+  runExclusiveRuntimeMaintenance, runtimeExclusiveMaintenanceDirectory, startExclusiveMaintenanceParticipant
 } = kernelFile('runtimeExclusiveMaintenance.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiled, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
@@ -40,61 +40,82 @@ const NOW = '2026-09-26T00:00:00.000Z';
 // Long-running windows; a window that started moments ago gets a short grace to register.
 const STARTED = '2026-01-01T00:00:00.000Z';
 const BASE = { operation: 'historical-merge', operationKey: 'sources-a', message: '为合并旧聊天记录', ignoreBackoff: false };
+const WORK = { kind: 'work', reason: '有任务正在进行' };
 // Several simulated windows share this process: each gets its own identity for the self check.
 let nextFakeProcessId = 3_000_000;
 
-test('只能在 maintenance（及给定的 admission）内发起；没有其它窗口时直接执行，不发布请求', async (t) => {
+test('锁内轮次只能在 maintenance（及给定的 admission）内调用且不等待；等待只能在锁外；ignoreBackoff 必须显式传入', async (t) => {
   const { root, paths } = await createRoot(t);
   await assert.rejects(requestExclusiveRuntimeMaintenance(paths, BASE, async () => 1), /maintenance 锁内/);
   await assert.rejects(withRuntimeMaintenance(paths, () => requestExclusiveRuntimeMaintenance(
     paths, { ...BASE, configurationRootPath: root }, async () => 1
   )), /admission 内/);
+  await assert.rejects(withRuntimeMaintenance(paths, () => requestExclusiveRuntimeMaintenance(
+    paths, { ...BASE, whenBusy: 'wait' }, async () => 1
+  )), /只能在锁外/);
+  await assert.rejects(withRuntimeMaintenance(paths, () => runExclusiveRuntimeMaintenance(
+    paths, { ...BASE, withLocks: (body) => body() }, async () => 1
+  )), /之外进行/);
+  const { ignoreBackoff: _omitted, ...implicit } = BASE;
+  await assert.rejects(request(paths, implicit, async () => 1), /ignoreBackoff must be passed explicitly/);
   let waits = 0;
   const outcome = await request(paths, { ...BASE, onWaitStart: () => { waits += 1; } }, async () => 'done');
   assert.deepEqual(outcome, { state: 'completed', result: 'done', coordinated: false });
   assert.equal(waits, 0);
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
+  assert.deepEqual(await readExclusiveMaintenanceRequests(paths), []);
   const nested = await withRuntimeDataRootAdmission(root, () => request(
     paths, { ...BASE, configurationRootPath: root }, async () => 'nested'
   ));
   assert.deepEqual(nested, { state: 'completed', result: 'nested', coordinated: false });
+  const outside = await run(paths, { ...BASE, configurationRootPath: root, withLocks: (body) =>
+    withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body)) }, async () =>
+    isRuntimeMaintenanceHeld(paths) && isRuntimeDataRootAdmissionHeld(root));
+  assert.deepEqual(outside, { state: 'completed', result: true, coordinated: false }, 'the operation runs under the locks');
 });
 
 test('有未参与协作（旧版本）或状态无法确认的窗口时立即放弃，不发布请求，同一操作键随后退避', async (t) => {
   const { binding, paths } = await createRoot(t);
   await publishHost(binding, 'old-window');
   let ran = false;
-  const run = async () => { ran = true; };
-  const first = await request(paths, BASE, run);
+  const operation = async () => { ran = true; };
+  const first = await request(paths, BASE, operation);
   assert.equal(first.state, 'legacy-host');
   assert.deepEqual(first.hosts.map((host) => host.hostBootId), ['old-window']);
   assert.match(first.reason, /未参与协作的窗口（可能是旧版本）/);
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
+  assert.deepEqual(await readExclusiveMaintenanceRequests(paths), []);
 
-  const second = await request(paths, BASE, run);
+  const second = await request(paths, BASE, operation);
   assert.equal(second.state, 'backoff');
   assert.ok(Date.parse(second.retryAfter) > Date.now());
-  assert.equal((await request(paths, { ...BASE, operationKey: 'sources-b' }, run)).state, 'legacy-host',
+  assert.equal((await request(paths, { ...BASE, operationKey: 'sources-b' }, operation)).state, 'legacy-host',
     'a different work is not delayed by this key');
-  assert.equal((await request(paths, { ...BASE, ignoreBackoff: true }, run)).state, 'legacy-host',
-    'an explicit user request ignores the backoff');
+  assert.equal((await request(paths, { ...BASE, ignoreBackoff: true }, operation)).state, 'legacy-host',
+    'an explicit user request skips the key backoff');
 
   await fs.writeFile(path.join(paths.dataRootPath, 'host-liveness', 'broken.json'), '{');
-  const unknown = await request(paths, { ...BASE, operationKey: 'sources-c' }, run);
+  const unknown = await request(paths, { ...BASE, operationKey: 'sources-c' }, operation);
   assert.equal(unknown.state, 'legacy-host');
   assert.match(unknown.reason, /运行状态无法确认/);
   assert.equal(ran, false);
 });
 
-test('刚启动、尚未登记的窗口有短暂宽限：登记后正常回应，不被当成旧版本', async (t) => {
+test('刚启动、尚未登记的窗口的宽限与准备阶段超时一致：及时登记就正常回应，否则在超时内放弃', async (t) => {
   const { binding, paths } = await createRoot(t);
   const opening = openWindow(t, binding, 'just-opened', { startedAt: new Date().toISOString(), registerAfterMs: 150 });
   // The request is issued while the window's Runtime is open but its participant not started yet.
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await delay(50);
   const outcome = await request(paths, BASE, async () => 'done');
   const window = await opening;
   assert.deepEqual(outcome, { state: 'completed', result: 'done', coordinated: true });
   assert.equal(window.releases(), 1);
+
+  const { binding: other, paths: otherPaths } = await createRoot(t);
+  await publishHost(other, 'never-registers', new Date().toISOString());
+  const started = performance.now();
+  const late = await request(otherPaths, { ...BASE, prepareTimeoutMs: 300 }, async () => assert.fail('must not run'));
+  // Before: a 15 s grace the 8 s prepare timeout cut short, reported as a timeout.
+  assert.equal(late.state, 'legacy-host');
+  assert.ok(performance.now() - started < 2_000, 'no longer than the prepare timeout plus a poll');
 });
 
 test('全部空闲时分三阶段：所有窗口确认之后才统一让出，全部下线后才执行并清理请求', async (t) => {
@@ -109,7 +130,7 @@ test('全部空闲时分三阶段：所有窗口确认之后才统一让出，�
   }, async () => {
     log.push(['operation']);
     // Still published while it runs: a reloaded window's next startup waits on the admission.
-    assert.equal((await readExclusiveMaintenanceRequest(paths))?.phase, 'go');
+    assert.deepEqual((await readExclusiveMaintenanceRequests(paths)).map((request) => request.phase), ['go']);
     return 42;
   });
   assert.deepEqual(outcome, { state: 'completed', result: 42, coordinated: true });
@@ -118,27 +139,24 @@ test('全部空闲时分三阶段：所有窗口确认之后才统一让出，�
   const firstRelease = log.findIndex((entry) => entry[0] === 'release');
   assert.ok(lastConfirm >= 0 && firstRelease > lastConfirm, `every window confirms before any yields: ${JSON.stringify(log)}`);
   assert.deepEqual(log.slice(-2), [['wait-end'], ['operation']]);
-  assert.equal(a.releases(), 1);
-  assert.equal(b.releases(), 1);
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
+  assert.deepEqual([a.releases(), b.releases()], [1, 1]);
   const directory = runtimeExclusiveMaintenanceDirectory(paths);
-  assert.equal(fsSync.existsSync(path.join(directory, 'request.json')), false);
+  assert.deepEqual(await fs.readdir(path.join(directory, 'requests')), []);
   assert.deepEqual(await fs.readdir(path.join(directory, 'responses')), []);
 });
 
 test('有窗口在忙时立即放弃：没有任何窗口倒计时或重载，同一操作键随后退避', async (t) => {
   const { binding, paths } = await createRoot(t);
   const idle = await openWindow(t, binding, 'idle-window');
-  const busy = await openWindow(t, binding, 'busy-window', { busy: '有任务正在进行' });
+  const busy = await openWindow(t, binding, 'busy-window', { busy: WORK });
   let ran = false;
   const outcome = await request(paths, BASE, async () => { ran = true; });
   assert.equal(outcome.state, 'busy');
   assert.deepEqual(outcome.hosts.map((host) => host.hostBootId), ['busy-window']);
-  assert.match(outcome.reason, /其它窗口正在忙（有任务正在进行）/);
+  assert.match(outcome.reason, /1 个其它窗口有任务正在进行/);
   await settle([idle, busy]);
   assert.deepEqual([idle.confirms(), idle.releases(), busy.confirms(), busy.releases()], [0, 0, 0, 0]);
   assert.equal(ran, false);
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
   assert.equal((await request(paths, BASE, async () => { ran = true; })).state, 'backoff');
   assert.equal(ran, false);
 });
@@ -155,51 +173,141 @@ test('确认阶段有窗口的用户选择保留：放弃，且没有任何窗�
   assert.deepEqual([keep.releases(), other.releases()], [0, 0]);
 });
 
-test('wait 模式：等忙窗口空闲后再协调，只提示它一次；等待有上限', async (t) => {
+test('wait 模式只在锁外等待：等忙窗口空闲后再协调，按原因提示它一次；等待有上限', async (t) => {
   const { binding, paths } = await createRoot(t);
   const idle = await openWindow(t, binding, 'idle-window');
-  const busy = await openWindow(t, binding, 'busy-window', { busy: '有任务正在进行' });
+  const busy = await openWindow(t, binding, 'busy-window', { busy: WORK });
+  const focused = await openWindow(t, binding, 'focused-window', { busy: { kind: 'focus', reason: '窗口正在使用' } });
   setTimeout(() => busy.setBusy(undefined), 200);
-  const stages = [];
-  const outcome = await request(paths, {
-    ...BASE, operation: 'data-root-migration', operationKey: 'target-1', message: '为迁移数据目录',
-    whenBusy: 'wait', participantConfirmation: 'notice', busyWaitTimeoutMs: 5_000,
-    onProgress: (progress) => stages.push(progress.stage)
+  setTimeout(() => focused.setBusy(undefined), 300);
+  const progress = [];
+  const outcome = await run(paths, {
+    ...BASE, operation: 'data-root-migration', operationKey: 'target-1', message: '为迁移数据目录', ignoreBackoff: true,
+    whenBusy: 'wait', participantConfirmation: 'final-countdown', busyWaitTimeoutMs: 5_000,
+    onProgress: (item) => progress.push(item)
   }, async () => 'migrated');
   assert.deepEqual(outcome, { state: 'completed', result: 'migrated', coordinated: true });
-  assert.ok(stages.includes('waiting-busy'));
-  assert.deepEqual(busy.log.filter((entry) => entry[0] === 'waiting'), [['waiting', 'busy-window', '有任务正在进行']]);
-  assert.deepEqual([idle.releases(), busy.releases()], [1, 1]);
+  const waiting = progress.filter((item) => item.stage === 'waiting-busy');
+  assert.ok(waiting.some((item) => item.busy.some((entry) => entry.kind === 'work'))
+    && waiting.some((item) => item.busy.some((entry) => entry.kind === 'focus')), 'both kinds are reported apart');
+  assert.deepEqual(busy.log.filter((entry) => entry[0] === 'waiting'), [['waiting', 'busy-window', 'work']]);
+  assert.deepEqual(focused.log.filter((entry) => entry[0] === 'waiting'), [['waiting', 'focused-window', 'focus']]);
+  assert.deepEqual([idle.releases(), busy.releases(), focused.releases()], [1, 1, 1]);
 
   const { binding: other, paths: otherPaths } = await createRoot(t);
-  const stuck = await openWindow(t, other, 'stuck-window', { busy: '有任务正在进行' });
+  const stuck = await openWindow(t, other, 'stuck-window', { busy: WORK });
   const started = performance.now();
-  const bounded = await request(otherPaths, {
-    ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 200
-  }, async () => assert.fail('must not run'));
+  const bounded = await run(otherPaths, { ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 200 }, async () => assert.fail('must not run'));
   assert.equal(bounded.state, 'busy');
   assert.ok(performance.now() - started < 3_000);
   await settle([stuck]);
   assert.equal(stuck.releases(), 0);
 });
 
-test('wait 模式下确认后又开始工作的窗口不会被打断：回到准备阶段重新一轮', async (t) => {
+test('锁外等待期间其它窗口可以正常打开（拿到 admission 与 maintenance），新窗口随后也参与协调', async (t) => {
+  const { root, binding, paths } = await createRoot(t);
+  const busy = await openWindow(t, binding, 'busy-window', { busy: WORK });
+  const withLocks = (body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body));
+  const waiting = run(paths, {
+    ...BASE, configurationRootPath: root, whenBusy: 'wait', busyWaitTimeoutMs: 10_000, withLocks
+  }, async () => 'done');
+  await delay(150);
+  // A window starting now: its Runtime open takes the admission and the maintenance claim.
+  const started = performance.now();
+  await withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, async () => undefined));
+  const openedWithin = performance.now() - started;
+  assert.ok(openedWithin < 1_000, `opened after ${openedWithin} ms`);
+  const late = await openWindow(t, binding, 'late-window', { startedAt: new Date().toISOString() });
+  await delay(100);
+  busy.setBusy(undefined);
+  assert.deepEqual(await waiting, { state: 'completed', result: 'done', coordinated: true });
+  assert.deepEqual([busy.releases(), late.releases()], [1, 1]);
+});
+
+test('锁内轮次的持锁时间有上限：有窗口一直不确认时在确认超时后放弃并释放锁', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  await openWindow(t, binding, 'silent-confirm', { confirm: () => new Promise(() => {}) });
+  let lockedFor;
+  const outcome = await run(paths, {
+    ...BASE, prepareTimeoutMs: 300, confirmTimeoutMs: 300, releaseTimeoutMs: 300,
+    withLocks: async (body) => {
+      const started = performance.now();
+      try { return await withRuntimeMaintenance(paths, body); }
+      finally { lockedFor = performance.now() - started; }
+    }
+  }, async () => assert.fail('must not run'));
+  assert.equal(outcome.state, 'timed-out');
+  assert.ok(lockedFor < 300 + 300 + 300 + 500, `held ${lockedFor} ms`);
+  assert.equal(isRuntimeMaintenanceHeld(paths), false);
+});
+
+test('wait 模式下确认后又开始工作的窗口不会被打断：放开锁回到锁外等待，之后新一轮完成', async (t) => {
   const { binding, paths } = await createRoot(t);
   const steady = await openWindow(t, binding, 'steady-window');
+  let startedWorkIn;
   const flaky = await openWindow(t, binding, 'flaky-window', {
     confirm: (request) => {
-      if (request.round === 1) {
+      if (startedWorkIn === undefined) {
         // The user started a Turn while the countdown ran.
-        flaky.setBusy('有任务正在进行');
+        startedWorkIn = request.round;
+        flaky.setBusy(WORK);
         setTimeout(() => flaky.setBusy(undefined), 150);
       }
       return true;
     }
   });
-  const outcome = await request(paths, { ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 5_000 }, async () => 'done');
+  let lockedRounds = 0;
+  const outcome = await run(paths, {
+    ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 5_000,
+    withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
+  }, async () => 'done');
   assert.deepEqual(outcome, { state: 'completed', result: 'done', coordinated: true });
-  assert.deepEqual(flaky.log.filter((entry) => entry[0] === 'release').map((entry) => entry[2]), [2]);
-  assert.deepEqual(steady.log.filter((entry) => entry[0] === 'release').map((entry) => entry[2]), [2]);
+  assert.equal(lockedRounds, 2, 'the locks were released in between');
+  const releases = [...flaky.log, ...steady.log].filter((entry) => entry[0] === 'release').map((entry) => entry[2]);
+  assert.equal(releases.length, 2);
+  assert.ok(releases.every((round) => round > startedWorkIn), JSON.stringify({ releases, startedWorkIn }));
+});
+
+test('锁内反复遇到新开始的工作时有次数上限，之后放弃', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  // Idle whenever asked outside the locks, busy again in every locked round.
+  const window = await openWindow(t, binding, 'restless-window', {
+    busy: (request) => request.round % 2 === 0 ? WORK : undefined
+  });
+  let lockedRounds = 0;
+  const outcome = await run(paths, {
+    ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 5_000, maxLockedAttempts: 2,
+    withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
+  }, async () => assert.fail('must not run'));
+  assert.equal(outcome.state, 'busy');
+  assert.match(outcome.reason, /反复/);
+  assert.equal(lockedRounds, 2);
+  assert.equal(window.releases(), 0);
+});
+
+test('go 阶段回答忙的窗口本轮不再重载（即使随后变空闲）；已让出的窗口白白重载，操作不执行', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const fast = await openWindow(t, binding, 'fast-window');
+  let answeredGoBusy = false;
+  const slow = await openWindow(t, binding, 'slow-window', {
+    // The user clicks into this window after it confirmed, right before it saw go, then leaves.
+    busy: async (request) => {
+      if (request.phase !== 'go' || answeredGoBusy) return undefined;
+      answeredGoBusy = true;
+      return { kind: 'focus', reason: '窗口正在使用' };
+    }
+  });
+  let ran = false;
+  // The requester reads the busy answer only on its next poll; meanwhile the window is idle again
+  // and still sees go: it must not reload in this round.
+  const outcome = await request(paths, { ...BASE, pollMs: 300 }, async () => { ran = true; });
+  assert.equal(outcome.state, 'busy');
+  assert.equal(ran, false);
+  await settle([slow, fast]);
+  await delay(100);
+  await slow.check();
+  assert.equal(slow.releases(), 0, 'a window that answered busy at go never yields in that round');
+  assert.equal(fast.releases(), 1, 'the documented cost of a go-stage abandon');
 });
 
 test('go 之后操作失败按操作键退避（冷却不可跳过）；确定性失败直接转 blocked；成功后退避清零', async (t) => {
@@ -207,8 +315,6 @@ test('go 之后操作失败按操作键退避（冷却不可跳过）；确定�
   const failure = () => Object.assign(new Error('复制正文文件时出错'), { code: 'EIO' });
   const cooldownAfterCoordinatedMs = 1_000;
   const input = { ...BASE, cooldownAfterCoordinatedMs, backoffBaseMs: 60_000 };
-  const { ignoreBackoff: _omitted, ...implicit } = BASE;
-  await assert.rejects(request(paths, implicit, async () => 1), /ignoreBackoff must be passed explicitly/);
   await openWindow(t, binding, 'peer-1');
   await assert.rejects(request(paths, input, async () => { throw failure(); }), /复制正文文件时出错/);
   await openWindow(t, binding, 'peer-2');
@@ -241,6 +347,29 @@ test('go 之后操作失败按操作键退避（冷却不可跳过）；确定�
   assert.match(blocked.reason, /来源结构漂移/);
 });
 
+test('发起方自己窗口的忙也要等：锁外等待它空闲；abandon 模式直接放弃', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const peer = await openWindow(t, binding, 'peer-window');
+  let ownBusy = true;
+  setTimeout(() => { ownBusy = false; }, 200);
+  const progress = [];
+  const outcome = await run(paths, {
+    ...BASE, operation: 'data-root-migration', operationKey: 'target-1', ignoreBackoff: true, whenBusy: 'wait',
+    requesterHostBootId: 'self-window', requesterBusy: async () => ownBusy ? { kind: 'work', reason: '本窗口有任务正在进行' } : undefined,
+    onProgress: (item) => progress.push(item)
+  }, async () => 'migrated');
+  assert.deepEqual(outcome, { state: 'completed', result: 'migrated', coordinated: true });
+  assert.ok(progress.some((item) => item.stage === 'waiting-busy' && item.requesterBusy?.kind === 'work'));
+  assert.equal(peer.releases(), 1);
+
+  const { paths: alonePaths } = await createRoot(t);
+  const alone = await request(alonePaths, {
+    ...BASE, requesterBusy: async () => ({ kind: 'work', reason: '本窗口有任务正在进行' })
+  }, async () => assert.fail('must not run'));
+  assert.equal(alone.state, 'busy');
+  assert.match(alone.reason, /本窗口还有任务正在进行/);
+});
+
 test('发起方自己的窗口按 requesterHostBootId（或同一进程）跳过请求，不会被要求重载', async (t) => {
   const { binding, paths } = await createRoot(t);
   const self = await openWindow(t, binding, 'self-window');
@@ -271,7 +400,7 @@ test('参与方没有及时回应时按上限超时放弃；发起方取消时�
   assert.equal(outcome.state, 'timed-out');
   assert.deepEqual(outcome.hosts.map((host) => host.hostBootId), ['silent-window']);
   assert.ok(performance.now() - started < 2_000);
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
+  assert.deepEqual(await readExclusiveMaintenanceRequests(paths), []);
 
   let cancel = false;
   setTimeout(() => { cancel = true; }, 50);
@@ -299,14 +428,14 @@ test('一次协调让其它窗口重载后同一操作进入冷却：刚让出�
   assert.equal(b.confirms(), 0);
 });
 
-test('清理失败不会覆盖已完成的结果；EPERM 等临时错误会重试', async (t) => {
+test('清理失败不会覆盖已完成的结果；EPERM 等临时错误会重试；撤回失败的请求不会让参与方再倒计时', async (t) => {
   const { binding, paths } = await createRoot(t);
-  const directory = runtimeExclusiveMaintenanceDirectory(paths);
+  const requests = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests');
   const fsPromises = require('node:fs/promises');
   const originalRm = fsPromises.rm;
   let transient = 0;
   fsPromises.rm = async (target, options) => {
-    if (String(target) === path.join(directory, 'request.json') && transient < 2) {
+    if (path.dirname(String(target)) === requests && String(target).endsWith('.json') && transient < 2) {
       transient += 1;
       throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
     }
@@ -317,26 +446,36 @@ test('清理失败不会覆盖已完成的结果；EPERM 等临时错误会重�
   assert.deepEqual(await request(paths, { ...BASE, cooldownAfterCoordinatedMs: 1 }, async () => 'first'),
     { state: 'completed', result: 'first', coordinated: true });
   assert.equal(transient, 2);
-  assert.equal(fsSync.existsSync(path.join(directory, 'request.json')), false, 'removed after retrying');
+  assert.deepEqual(await fs.readdir(requests), [], 'removed after retrying');
   fsPromises.rm = originalRm;
 
   if (process.platform === 'win32' || process.getuid?.() === 0) return;
-  await openWindow(t, binding, 'window-b');
+  // The request cannot be removed; it was marked withdrawn first, so no window counts down again.
+  let blockRemoval = false;
+  const keep = await openWindow(t, binding, 'window-keep', { confirm: () => { blockRemoval = true; return false; } });
+  const bystander = await openWindow(t, binding, 'window-bystander');
   const warnings = [];
   const originalWarn = console.warn;
   console.warn = (...args) => warnings.push(String(args[0]));
   t.after(() => { console.warn = originalWarn; });
-  const outcome = await request(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff: true }, async () => {
-    await fs.chmod(directory, 0o500);
-    return 'second';
-  });
-  await fs.chmod(directory, 0o700);
+  fsPromises.rm = async (target, options) => {
+    if (blockRemoval && path.dirname(String(target)) === requests) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    return originalRm(target, options);
+  };
+  const outcome = await request(paths, { ...BASE, operationKey: 'sources-b' }, async () => assert.fail('must not run'));
+  fsPromises.rm = originalRm;
   console.warn = originalWarn;
-  assert.deepEqual(outcome, { state: 'completed', result: 'second', coordinated: true });
+  assert.equal(outcome.state, 'declined');
   assert.ok(warnings.some((warning) => /无法撤回独占维护请求/.test(warning)), JSON.stringify(warnings));
+  assert.equal((await fs.readdir(requests)).length, 1, 'the request file is still there');
+  assert.deepEqual(await readExclusiveMaintenanceRequests(paths), [], 'but it is withdrawn');
+  const confirms = bystander.confirms();
+  await settle([bystander, keep]);
+  assert.equal(bystander.confirms(), confirms);
+  assert.equal(bystander.releases(), 0);
 });
 
-test('轮询期间每个进程只做一次平台身份探测，之后只用 kill(pid, 0) 复查', async (t) => {
+test('轮询期间每个进程只做一次平台身份探测；登记参与方时不做平台身份探测', async (t) => {
   const { binding, paths } = await createRoot(t);
   for (const name of ['peer-1', 'peer-2']) {
     await publishHost(binding, name);
@@ -348,10 +487,15 @@ test('轮询期间每个进程只做一次平台身份探测，之后只用 kill
   processProtocol.readProcessStartFingerprint = (pid) => { probes += 1; return original(pid); };
   t.after(() => { processProtocol.readProcessStartFingerprint = original; });
   const outcome = await request(paths, { ...BASE, pollMs: 250, prepareTimeoutMs: 1_000 }, async () => undefined);
-  processProtocol.readProcessStartFingerprint = original;
   assert.equal(outcome.state, 'timed-out');
   // Before: every poll re-probed every Host (about 5 polls x 2 Hosts within this second).
   assert.ok(probes <= 1, `probes=${probes}`);
+
+  probes = 0;
+  const registration = await registerExclusiveMaintenanceParticipant(paths, 'peer-3');
+  await registration.unregister();
+  processProtocol.readProcessStartFingerprint = original;
+  assert.equal(probes, 0, 'existing registrations are checked with kill(pid, 0) only');
 
   let calls = 0;
   const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
@@ -367,36 +511,51 @@ test('轮询期间每个进程只做一次平台身份探测，之后只用 kill
   assert.equal(calls, 1);
 });
 
-test('过期请求或请求方进程已不存在的请求不会被理会；死进程的参与登记会被清理', async (t) => {
-  const { paths } = await createRoot(t);
+test('过期、撤回、心跳过期或请求方已不存在的请求不会被理会；崩溃发起方的残留由下一次请求清理', async (t) => {
+  const { binding, paths } = await createRoot(t);
   const directory = runtimeExclusiveMaintenanceDirectory(paths);
-  await fs.mkdir(path.join(directory, 'hosts'), { recursive: true });
+  await fs.mkdir(path.join(directory, 'requests'), { recursive: true });
   const valid = {
-    kind: 'limcode-runtime-exclusive-maintenance-request', requestId: 'request-1', round: 1, phase: 'prepare',
+    kind: 'limcode-runtime-exclusive-maintenance-request', requestId: 'request-1', round: 1, phase: 'confirm',
     operation: 'historical-merge', operationKey: 'sources-a', message: '为合并旧聊天记录', confirmation: 'countdown',
     whenBusy: 'abandon', requesterProcessId: process.pid, requesterProcessStartIdentity: ownProcessStartIdentity(),
-    createdAt: NOW, expiresAt: new Date(Date.now() + 60_000).toISOString()
+    createdAt: NOW, heartbeatAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString()
   };
-  const write = (value) => fs.writeFile(path.join(directory, 'request.json'), JSON.stringify(value));
+  const write = (value) => fs.writeFile(path.join(directory, 'requests', 'request-1.json'), JSON.stringify(value));
+  const ids = async () => (await readExclusiveMaintenanceRequests(paths)).map((request) => request.requestId);
   await write(valid);
-  assert.equal((await readExclusiveMaintenanceRequest(paths))?.requestId, 'request-1');
+  assert.deepEqual(await ids(), ['request-1']);
   await write({ ...valid, expiresAt: NOW });
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
-  const { round: _round, ...withoutRound } = valid;
-  await write(withoutRound);
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined, 'an older request format is not trusted');
+  assert.deepEqual(await ids(), []);
+  await write({ ...valid, phase: 'withdrawn' });
+  assert.deepEqual(await ids(), [], 'withdrawn but not removable');
+  await write({ ...valid, heartbeatAt: new Date(Date.now() - 60_000).toISOString() });
+  assert.deepEqual(await ids(), [], 'a requester that stopped refreshing it');
+  const { heartbeatAt: _heartbeat, ...older } = valid;
+  await write(older);
+  assert.deepEqual(await ids(), [], 'an older request format is not trusted');
   const deadProcessId = await exitedProcessId();
   await write({ ...valid, requesterProcessId: deadProcessId, requesterProcessStartIdentity: undefined });
-  assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
+  assert.deepEqual(await ids(), []);
+  // A participant never counts down for any of these.
+  const window = await openWindow(t, binding, 'window-a');
+  await settle([window]);
+  assert.equal(window.confirms(), 0);
+
+  // The crashed requester's leftovers are swept when the next request starts.
+  await fs.mkdir(path.join(directory, 'responses', 'request-1'), { recursive: true });
+  await fs.writeFile(path.join(directory, 'responses', 'request-1', 'window-a.json'), '{}');
+  await request(paths, BASE, async () => 'done');
+  assert.deepEqual(await fs.readdir(path.join(directory, 'requests')), []);
+  assert.deepEqual(await fs.readdir(path.join(directory, 'responses')), []);
+
   if (ownProcessStartIdentity() !== undefined) {
-    await write({ ...valid, requesterProcessStartIdentity: 'another-process-start' });
-    assert.equal(await readExclusiveMaintenanceRequest(paths), undefined);
     await fs.writeFile(path.join(directory, 'hosts', 'stale-window.json'), JSON.stringify({
       kind: 'limcode-runtime-exclusive-maintenance-participant', hostBootId: 'stale-window',
-      processId: process.pid, processStartIdentity: 'another-process-start', registeredAt: NOW
+      processId: deadProcessId, registeredAt: NOW
     }));
     const participant = await registerExclusiveMaintenanceParticipant(paths, 'fresh-window');
-    assert.deepEqual(await fs.readdir(path.join(directory, 'hosts')), ['fresh-window.json']);
+    assert.equal((await fs.readdir(path.join(directory, 'hosts'))).includes('stale-window.json'), false);
     await participant.unregister();
   }
   await assert.rejects(registerExclusiveMaintenanceParticipant(paths, '../escape'), /safe file name/);
@@ -424,7 +583,7 @@ test('打开运行时时若数据目录在等待 admission 期间已迁移，放
     opens += 1;
     return { root: current, oldHeld: isRuntimeDataRootAdmissionHeld(oldRoot), newHeld: isRuntimeDataRootAdmissionHeld(newRoot) };
   });
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await delay(100);
   assert.equal(opens, 0, 'waits on the admission');
   finish();
   await migration;
@@ -464,8 +623,16 @@ test('窗口是否空闲复用对话的待办工作判定：执行中的命令�
   assert.equal(await busy(), true, 'durable pending work of an owned conversation is busy');
 });
 
+/** The locked round alone, inside the target maintenance claim. */
 async function request(paths, input, operation) {
   return withRuntimeMaintenance(paths, () => requestExclusiveRuntimeMaintenance(paths, { pollMs: 10, ...input }, operation));
+}
+
+/** Outside the locks: waits without locks, then the short locked round. */
+async function run(paths, input, operation) {
+  return runExclusiveRuntimeMaintenance(paths, {
+    pollMs: 10, withLocks: (body) => withRuntimeMaintenance(paths, body), ...input
+  }, operation);
 }
 
 /**
@@ -477,7 +644,7 @@ async function openWindow(t, binding, hostBootId, options = {}) {
   const push = (entry) => { own.push(entry); options.log?.push(entry); };
   let busy = options.busy;
   const liveness = await publishHost(binding, hostBootId, options.startedAt);
-  if (options.registerAfterMs) await new Promise((resolve) => setTimeout(resolve, options.registerAfterMs));
+  if (options.registerAfterMs) await delay(options.registerAfterMs);
   let participant;
   const window = {
     log: own,
@@ -487,11 +654,11 @@ async function openWindow(t, binding, hostBootId, options = {}) {
     check: () => participant?.checkNow()
   };
   participant = startExclusiveMaintenanceParticipant(binding.paths, hostBootId, {
-    busyReason: async () => busy,
+    busyReason: async (request) => typeof busy === 'function' ? busy(request) : busy,
     confirm: async (request) => {
       push(['confirm', hostBootId, request.round]);
       const answer = typeof options.confirm === 'function' ? options.confirm(request) : options.confirm;
-      return answer ?? true;
+      return (await answer) ?? true;
     },
     release: async (request) => {
       push(['release', hostBootId, request.round]);
@@ -500,7 +667,7 @@ async function openWindow(t, binding, hostBootId, options = {}) {
       await closing.dispose();
       await fs.rm(liveness, { force: true });
     },
-    notifyWaiting: (_request, reason) => push(['waiting', hostBootId, reason])
+    notifyWaiting: (_request, reason) => push(['waiting', hostBootId, reason.kind])
   }, { pollMs: 10, processId: options.processId ?? (nextFakeProcessId += 1) });
   await participant.checkNow();
   t.after(async () => {
@@ -512,7 +679,7 @@ async function openWindow(t, binding, hostBootId, options = {}) {
 
 /** Lets participants run a few more polls, so a late (wrong) reaction would show up. */
 async function settle(windows) {
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await delay(60);
   for (const window of windows) await window.check();
 }
 

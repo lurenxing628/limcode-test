@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
 import type { RuntimeRootPaths } from '../backend/reliableKernel/contracts';
 import {
-  requestExclusiveRuntimeMaintenance, startExclusiveMaintenanceParticipant as startProtocolParticipant,
-  type ExclusiveMaintenanceParticipant, type ExclusiveMaintenanceProgress, type RuntimeExclusiveMaintenanceInput,
-  type RuntimeExclusiveMaintenanceOutcome
+  requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance,
+  startExclusiveMaintenanceParticipant as startProtocolParticipant,
+  type ExclusiveMaintenanceBusy, type ExclusiveMaintenanceParticipant, type ExclusiveMaintenanceProgress,
+  type RuntimeExclusiveMaintenanceInput, type RuntimeExclusiveMaintenanceOutcome,
+  type RuntimeExclusiveMaintenanceRunInput, type RuntimeExclusiveMaintenanceRequest
 } from '../backend/reliableKernel/runtimeExclusiveMaintenance';
 
 export interface ExclusiveMaintenanceParticipantHost {
@@ -22,29 +24,33 @@ export interface ExclusiveMaintenanceParticipantOptions {
 
 /**
  * This window's side of cooperative exclusive maintenance on its selected root. It never yields
- * while it runs work or while the user is in it (a focused window answers busy); only when every
- * window is ready does it show the countdown (or, for an operation the user already confirmed
- * elsewhere, a notice) and then reload. Unsent composer input survives the reload (Webview state).
+ * while it runs work (busy: work) or while the user is in it (busy: focus); only when every window
+ * is ready does it show the countdown (a notice, or a countdown without cancel, when the user
+ * already confirmed the operation elsewhere) and then reload. Unsent composer input survives the
+ * reload (Webview state).
  */
 export function startExclusiveMaintenanceParticipant(
   host: ExclusiveMaintenanceParticipantHost,
   options: ExclusiveMaintenanceParticipantOptions = {}
 ): ExclusiveMaintenanceParticipant {
   const { paths, hostBootId } = host.exclusiveMaintenanceTarget();
+  const seconds = options.countdownSeconds ?? 5;
   return startProtocolParticipant(paths, hostBootId, {
     busyReason: async () => {
-      if (await host.hasOwnedExecution()) return '有任务正在进行';
-      if (vscode.window.state?.focused) return '窗口正在使用';
+      if (await host.hasOwnedExecution()) return { kind: 'work', reason: '有任务正在进行' };
+      if (vscode.window.state?.focused) return { kind: 'focus', reason: '窗口正在使用' };
       return undefined;
     },
     confirm: (request) => request.confirmation === 'notice'
       ? announce(request.message)
-      : countdown(request.message, options.countdownSeconds ?? 5),
+      : countdown(request, seconds),
     release: async () => {
       await vscode.commands.executeCommand('workbench.action.reloadWindow');
     },
-    notifyWaiting: (request) => {
-      void vscode.window.showInformationMessage(`${request.message}：本窗口的任务结束后会自动重载，未发送的输入会保留。`);
+    notifyWaiting: (request, busy) => {
+      void vscode.window.showInformationMessage(busy.kind === 'focus'
+        ? `${request.message}：你正在使用本窗口，切换到其它窗口后本窗口会自动重载，未发送的输入会保留。`
+        : `${request.message}：本窗口的任务结束后会自动重载，未发送的输入会保留。`);
     }
   }, {
     ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
@@ -54,28 +60,42 @@ export function startExclusiveMaintenanceParticipant(
   });
 }
 
+/**
+ * The requester's own window as `requesterBusy`: only its work counts (the user is naturally in the
+ * window where the operation was started, so focus does not).
+ */
+export function requesterWorkBusy(host: Pick<ExclusiveMaintenanceParticipantHost, 'hasOwnedExecution'>): () => Promise<ExclusiveMaintenanceBusy | undefined> {
+  return async () => (await host.hasOwnedExecution()) ? { kind: 'work', reason: '本窗口有任务正在进行' } : undefined;
+}
+
 export type ExclusiveMaintenanceRequestOptions = Omit<
   RuntimeExclusiveMaintenanceInput, 'isCancelled' | 'onWaitStart' | 'onProgress' | 'onWaitEnd'
 > & {
   /** Title of the cancellable progress shown while other windows are involved. */
   waitingTitle: string;
   isCurrent(): boolean;
+  /**
+   * Given: called outside the locks; waiting for busy windows happens without locks and withLocks
+   * takes admission and maintenance only for the short locked round. Omitted: the caller already
+   * holds the locks, and a busy window abandons at once.
+   */
+  withLocks?: RuntimeExclusiveMaintenanceRunInput['withLocks'];
 };
 
 /**
- * Requester side, called while holding the root maintenance claim (and configuration admission).
- * Shows a cancellable progress notification only while other windows are actually involved.
+ * Requester side. Shows a cancellable progress notification only while other windows (or this
+ * window's own work) are actually involved.
  */
 export async function runWithExclusiveMaintenance<T>(
   paths: RuntimeRootPaths,
   options: ExclusiveMaintenanceRequestOptions,
   operation: () => Promise<T>
 ): Promise<RuntimeExclusiveMaintenanceOutcome<T>> {
-  const { waitingTitle, isCurrent, ...input } = options;
+  const { waitingTitle, isCurrent, withLocks, ...input } = options;
   let cancelled = false;
   let finishWait: (() => void) | undefined;
   let reporter: vscode.Progress<{ message?: string }> | undefined;
-  return requestExclusiveRuntimeMaintenance(paths, {
+  const coordinated: RuntimeExclusiveMaintenanceInput = {
     ...input,
     isCancelled: () => cancelled || !isCurrent(),
     onWaitStart: () => {
@@ -90,11 +110,22 @@ export async function runWithExclusiveMaintenance<T>(
     },
     onProgress: (progress) => reporter?.report({ message: describeProgress(progress) }),
     onWaitEnd: () => finishWait?.()
-  }, operation);
+  };
+  return withLocks
+    ? runExclusiveRuntimeMaintenance(paths, { ...coordinated, withLocks }, operation)
+    : requestExclusiveRuntimeMaintenance(paths, coordinated, operation);
 }
 
-function describeProgress(progress: ExclusiveMaintenanceProgress): string {
-  if (progress.stage === 'waiting-busy') return `等待 ${progress.busy.length} 个窗口的任务结束`;
+export function describeProgress(progress: ExclusiveMaintenanceProgress): string {
+  if (progress.stage === 'waiting-busy') {
+    const parts: string[] = [];
+    if (progress.requesterBusy) parts.push('本窗口的任务结束');
+    const working = progress.busy.filter((item) => item.kind === 'work').length;
+    const focused = progress.busy.filter((item) => item.kind === 'focus').length;
+    if (working > 0) parts.push(`${working} 个其它窗口的任务结束`);
+    if (focused > 0) parts.push(`${focused} 个正在使用的窗口被切走`);
+    return `等待${parts.join('、')}`;
+  }
   if (progress.stage === 'confirm') return `其它 ${progress.hosts.length} 个窗口即将重载`;
   if (progress.stage === 'release') return `等待其它 ${progress.hosts.length} 个窗口重载`;
   return `询问其它 ${progress.hosts.length} 个窗口`;
@@ -105,15 +136,23 @@ async function announce(message: string): Promise<boolean> {
   return true;
 }
 
-async function countdown(message: string, seconds: number): Promise<boolean> {
+async function countdown(request: RuntimeExclusiveMaintenanceRequest, seconds: number): Promise<boolean> {
+  // final-countdown: the user already confirmed the operation elsewhere; this window cannot veto it.
+  const cancellable = request.confirmation === 'countdown';
   return vscode.window.withProgress({
-    location: vscode.ProgressLocation.Notification, title: `${message}，本窗口即将重载`, cancellable: true
+    location: vscode.ProgressLocation.Notification, title: `${request.message}，本窗口即将重载`, cancellable
   }, async (progress, token) => {
+    const cancelledNow = () => cancellable && token?.isCancellationRequested === true;
     for (let left = seconds; left > 0; left -= 1) {
-      if (token?.isCancellationRequested) return false;
-      progress?.report({ message: `${left} 秒后重载，未发送的输入会保留；点“取消”保留本窗口`, increment: 100 / seconds });
+      if (cancelledNow()) return false;
+      progress?.report({
+        message: cancellable
+          ? `${left} 秒后重载，未发送的输入会保留；点“取消”保留本窗口`
+          : `${left} 秒后重载（已在其它窗口确认），未发送的输入会保留`,
+        increment: 100 / seconds
+      });
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    return token?.isCancellationRequested !== true;
+    return !cancelledNow();
   });
 }

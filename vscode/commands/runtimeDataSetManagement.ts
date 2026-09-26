@@ -387,10 +387,10 @@ export async function mergeHistoricalDataSetsInBackground(
 /**
  * The only place that asks other windows to yield, for one source above the online merge limit
  * that the engine already prepared and checked. The two-phase primitive decides how windows are
- * asked (backoff per source state; a busy or older window withdraws the request). A merge the user
- * explicitly asked for waits, bounded, for busy windows and skips the per-source backoff (never the
- * cooldown); other windows
- * then only see a notice, because the user already confirmed here.
+ * asked (backoff per source state; a busy or older window withdraws the request). It runs inside the
+ * engine's locks, so it never waits for busy windows. A merge the user explicitly asked for skips
+ * the per-source backoff (never the cooldown); other windows then only see a notice, because the
+ * user already confirmed here.
  */
 async function requestOtherWindowsToYield(
   paths: { globalStoragePath: string },
@@ -405,8 +405,9 @@ async function requestOtherWindowsToYield(
     waitingTitle: '正在等待其它窗口空闲后合并较大的旧聊天记录',
     configurationRootPath: paths.globalStoragePath,
     requesterHostBootId: input.requesterHostBootId,
+    // Called inside the engine's locks: a busy window abandons at once (waiting happens only outside locks).
     ignoreBackoff: input.requested,
-    ...(input.requested ? { whenBusy: 'wait' as const, participantConfirmation: 'notice' as const } : {}),
+    ...(input.requested ? { participantConfirmation: 'notice' as const } : {}),
     isCurrent
   }, merge);
   return outcome.state === 'completed' ? { state: 'completed' } : { state: outcome.state, reason: outcome.reason };
