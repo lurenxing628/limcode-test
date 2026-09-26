@@ -3,16 +3,19 @@ import { registerCommands } from './commands/registerCommands';
 import { MainPanel } from './panels/MainPanel';
 import { registerSidebarEntryView } from './views/SidebarEntryView';
 import { ApplicationStartup } from './ApplicationStartup';
+import { stopRuntimeDataSetUpgrades } from './runtimeDataSetUpgradeLifetime';
 import type { VscodeReliableKernelApplicationFacade } from '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade';
 import { EXTENSION_BRAND } from '../shared/extensionIdentity';
 
 let backendApp: VscodeReliableKernelApplicationFacade | undefined;
 let activeStartup: ApplicationStartup | undefined;
+let activeContext: vscode.ExtensionContext | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   const activationStartedAt = Date.now();
   const startup = new ApplicationStartup();
   activeStartup = startup;
+  activeContext = context;
 
   // Register every VS Code-owned surface before loading the reliable Runtime graph. In particular,
   // onView activation can now resolve the sidebar and paint its lightweight shell immediately.
@@ -40,7 +43,7 @@ async function startApplication(
       '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade'
     );
     const moduleLoadedAt = Date.now();
-    const { openWithRuntimeDataSetSelection } = await import('./commands/runtimeDataSetManagement');
+    const { openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup } = await import('./commands/runtimeDataSetManagement');
     const application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context));
     const applicationOpenedAt = Date.now();
 
@@ -84,6 +87,9 @@ async function startApplication(
     // reads ahead of background scans on the single SQLite worker.
     setImmediate(() => {
       if (activeStartup !== startup || backendApp !== application) return;
+      void upgradeHistoricalDataSetsOnStartup(context,
+        () => activeStartup === startup && backendApp === application)
+        .catch(error => console.error(`${EXTENSION_BRAND} historical data upgrade failed.`, error));
       const recoveryStartedAt = Date.now();
       void application.startRuntimeRecovery().then(
         () => console.log(`${EXTENSION_BRAND} reliable Runtime recovery converged in ${Date.now() - recoveryStartedAt}ms.`),
@@ -109,16 +115,13 @@ export async function deactivate(): Promise<void> {
   activeStartup = undefined;
   const app = backendApp;
   backendApp = undefined;
-  if (app) {
-    await app.dispose();
-    return;
-  }
-  if (!startup) return;
-  const pending = startup.pending();
-  if (!pending) return;
-  try {
-    await (await pending).dispose();
-  } catch {
-    // Failed startup has no live application to close.
-  }
+  const context = activeContext;
+  activeContext = undefined;
+  // Stop the current application's work immediately while any in-flight historical upgrade
+  // finishes its durable boundary, including history commands used without a running Runtime.
+  const upgrades = context ? stopRuntimeDataSetUpgrades(context) : Promise.resolve();
+  const pending = startup?.pending();
+  const disposal = app ? app.dispose() : pending?.then(application => application.dispose(), () => undefined);
+  const [disposed] = await Promise.allSettled([disposal, upgrades]);
+  if (disposed.status === 'rejected') throw disposed.reason;
 }

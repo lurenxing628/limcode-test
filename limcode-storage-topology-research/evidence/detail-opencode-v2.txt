@@ -1,0 +1,5 @@
+packages/cli/src/services/service-config.ts:12:// registration file (by channel), which version, and how to spawn opencode.
+packages/cli/src/services/service-config.ts:66:  const registration = yield* decodeRegistration(text.value).pipe(Effect.option)
+packages/cli/src/services/service-config.ts:67:  if (Option.isNone(registration)) return
+packages/cli/src/services/service-config.ts:68:  if (!versionBelongsToChannel(registration.value.version, channel, installedVersion)) return
+packages/core/src/database/database.ts:28:// releasing a shared semaphore resumes the waiting object's fiber inside the

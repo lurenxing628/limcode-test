@@ -18,7 +18,13 @@
     "legacyChildContinuationPolicy": "epoch-3-and-exact-epoch-4-missing-link-only",
     "epoch4MissingLinkPredecessor": "exact-single-missing-runtime-delivery-intent-link",
     "unknownDriftPolicy": "fail-before-data-change",
-    "compatibilityFallback": false
+    "compatibilityFallback": false,
+    "automaticTriggers": ["selected-root-startup", "other-roots-after-startup", "history-open"],
+    "requiresUserConfirmation": false,
+    "targetHostPolicy": "target-offline-current-other-data-set-may-run",
+    "sourceFailurePolicy": "report-per-source-and-continue-other-sources",
+    "selectionPolicy": "preserve-selection-no-implicit-merge",
+    "historicalExecutionPolicy": "no-host-registration-or-task-recovery"
   },
   "candidateRoot": {
     "isolated": true,

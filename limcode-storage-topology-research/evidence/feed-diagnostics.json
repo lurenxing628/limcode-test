@@ -1,0 +1,45 @@
+{
+  "window": [
+    "2026-09-25T19:36:51.427Z",
+    "2026-09-25T19:44:30.710Z"
+  ],
+  "groups": {
+    "changes": {
+      "bytes": {
+        "n": 284,
+        "p50": 1463.0,
+        "p95": 6463,
+        "p99": 7996,
+        "min": 692,
+        "max": 8068
+      },
+      "ackMs": {
+        "n": 284,
+        "p50": 190.0,
+        "p95": 251,
+        "p99": 315,
+        "min": 168,
+        "max": 366
+      }
+    },
+    "snapshot": {
+      "bytes": {
+        "n": 2,
+        "p50": 289623.0,
+        "p95": 290142,
+        "p99": 290142,
+        "min": 289104,
+        "max": 290142
+      },
+      "ackMs": {
+        "n": 2,
+        "p50": 377.5,
+        "p95": 405,
+        "p99": 405,
+        "min": 350,
+        "max": 405
+      }
+    }
+  },
+  "note": "rotating logs; matched posted/acked events; not a controlled multi-window benchmark"
+}

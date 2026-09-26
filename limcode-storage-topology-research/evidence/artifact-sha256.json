@@ -1,0 +1,15 @@
+{
+  "snapshot-baseline.json": "c9ab4ae85830854ae529b297ec67f8fba0973292b057b3a2a71617daa00f3508",
+  "snapshot-audit.json": "5b08cb542e30ade48a716d5015fa63e3df5130441df20e9ccd1d55f9a94bae89",
+  "cas-integrity.json": "0464cd37234c93627bc3596db56e8e0dba41f7e36cb6656adf169e50b9ee3907",
+  "concurrency.json": "d658521cc996e4ec7d9335e10061cd67577faa1d665dbdd010bb8142e8e967c1",
+  "history-query.json": "762bf568149e668485ee7fd47ad246a9d2b3239825bb2bb9192785a4649ffa6e",
+  "feed-isolation.json": "38f7c7a74129f3416340c2b6a2471ff559ebd6d012f777fa5418d8e62afbb8da",
+  "feed-diagnostics.json": "ebdec2a36bf3005ed4aa9cc4a3361403c4de5d50b656186d3751465995dac498",
+  "targeted-tests.log": "d05da57a6171b8354473fa54025d684906cd488853763b1cbd0eaa4402930d63",
+  "upstream-baseline.json": "1efe5f27afbd9db08fed583d7112805842ca4fc72d7ef012cea15d2e3db19657",
+  "upstream-issues.json": "47bd2a6ef900e5127dbbc12f3dd456237be45ed194a883139d30b513d5460242",
+  "release-0.0.24-verified.json": "d68cc1906c89e1648d88cb296ab7f27e7a7928c36d5f2b667c747fea3bef8cab",
+  "source-evidence.md": "493288456f4ef8525cb0371a7d79cbbecbe1a587b80a5c81d51e53497bf32079",
+  "report.md": "06ab9a1082eac08f4769388afc8465694edf6a2b9de5123d237bc8c588b10d19"
+}

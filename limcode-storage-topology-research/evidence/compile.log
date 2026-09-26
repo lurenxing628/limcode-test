@@ -1,0 +1,21 @@
+
+> limcode-test@0.0.28 precompile
+> node scripts/reliable-kernel/patch-better-sqlite3-report.mjs && node scripts/reliable-kernel/sqlite-reportless-smoke.mjs
+
+better-sqlite3 report guard already present.
+better-sqlite3 opens without a process report.
+
+> limcode-test@0.0.28 compile
+> node scripts/reliable-kernel/build-provider-debug-fork.mjs --check && npm run check:cutover-manifest && npm run clean:extension && tsc -p tsconfig.json && node scripts/reliable-kernel/write-compile-provenance.mjs
+
+固定模型接入库来源与摘要匹配，依赖声明与已安装包都是这个安装包。
+
+> limcode-test@0.0.28 check:cutover-manifest
+> node scripts/reliable-kernel/generate-physical-cutover-manifest.mjs --check
+
+physical cutover manifest生成物与migration.json一致。
+
+> limcode-test@0.0.28 clean:extension
+> node -e "require('fs').rmSync('dist/extension',{recursive:true,force:true})"
+
+已写入可靠内核编译来源：dist/extension/reliable-kernel-compile-provenance.json（commit=11ce63e195c667c78154e8560e598a1024f69b01，worktreeClean=true，sourceFilesTracked=true，source=fa91fcc490ae19a82271a3189528b9a1a2dcd4989200a902b0f2f52814d09013，compiled=93f4774350620b81e441fc0b214f2cd32fba29e2a809eae2f0765af798033d60）。

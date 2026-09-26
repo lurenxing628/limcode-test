@@ -1,0 +1,37 @@
+{
+  "externalCommits": 3,
+  "watchedConversations": [
+    "A",
+    "C"
+  ],
+  "changedConversation": "B",
+  "differentProjects": true,
+  "initialMessages": 2,
+  "additionalMessages": 6,
+  "additionalSnapshots": 6,
+  "totalAdditionalBytes": 16416,
+  "perConversation": [
+    {
+      "id": "A",
+      "initialActiveHashes": [
+        "ec7c723f9f64e920f67c5db7e430063f4f82026719e753e32d4c6f0126f15528"
+      ],
+      "laterActiveHashes": [
+        "ec7c723f9f64e920f67c5db7e430063f4f82026719e753e32d4c6f0126f15528"
+      ],
+      "count": 3
+    },
+    {
+      "id": "C",
+      "initialActiveHashes": [
+        "50a8b2f1a6acdc2c900906db4471fdc2b4cf73eb2801965baf9e86646a07c52a"
+      ],
+      "laterActiveHashes": [
+        "50a8b2f1a6acdc2c900906db4471fdc2b4cf73eb2801965baf9e86646a07c52a"
+      ],
+      "count": 3
+    }
+  ],
+  "errors": [],
+  "note": "real RuntimeDatabase and BoundedClientFeed; synthetic empty transcripts; counts prove invalidation breadth, not browser CPU or real-world bandwidth"
+}

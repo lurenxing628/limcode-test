@@ -1,0 +1,89 @@
+binary/test/binary.test.ts:317:      workspaceDirectory: "test-workspace-directory",
+core/config/types.ts:242:    workspaceDirectory: string;
+core/config/types.ts:250:    workspaceDirectory: string;
+core/context/providers/HttpContextProvider.ts:24:        ? (await ide.getWorkspaceDirs()).find((workspaceDirectory) => {
+core/context/providers/HttpContextProvider.ts:25:            return currentFile?.path.startsWith(workspaceDirectory);
+core/index.d.ts:282:  workspaceDirectory: string;
+core/index.d.ts:296:  workspaceDirectory: string;
+core/protocol/core.ts:60:  workspaceDirectory?: string;
+core/util/history.test.ts:12:  workspaceDirectory: "workspaceDir",
+core/util/history.test.ts:36:      workspaceDirectory: "",
+core/util/history.test.ts:83:      workspaceDirectory: "/home/user/project-a",
+core/util/history.test.ts:89:      workspaceDirectory: "/home/user/project-b",
+core/util/history.test.ts:95:      workspaceDirectory: "/home/user/project-a",
+core/util/history.test.ts:101:      workspaceDirectory: "",
+core/util/history.test.ts:112:      workspaceDirectory: "/home/user/project-a",
+core/util/history.test.ts:116:      sessions.every((s) => s.workspaceDirectory === "/home/user/project-a"),
+core/util/history.test.ts:127:      workspaceDirectory: "/HOME/USER/PROJECT-A",
+core/util/history.test.ts:134:      workspaceDirectory: "/home/user/nonexistent",
+core/util/history.test.ts:141:      workspaceDirectory: "/home/user/project-a",
+core/util/history.test.ts:149:      workspaceDirectory: "/home/user/project-a",
+core/util/history.test.ts:164:        workspaceDirectory: "workspaceDir",
+core/util/history.ts:37:        // Reverse to show newest first; sessions.json is chronological by creation
+core/util/history.ts:42:    if (options.workspaceDirectory) {
+core/util/history.ts:43:      const target = options.workspaceDirectory.toLowerCase();
+core/util/history.ts:46:          typeof session.workspaceDirectory === "string" &&
+core/util/history.ts:47:          session.workspaceDirectory.toLowerCase() === target,
+core/util/history.ts:74:        "Error parsing sessions.json",
+core/util/history.ts:105:        workspaceDirectory: "",
+core/util/history.ts:118:      workspaceDirectory: session.workspaceDirectory,
+core/util/history.ts:160:          sessionMetadata.workspaceDirectory = session.workspaceDirectory;
+core/util/history.ts:172:          workspaceDirectory: session.workspaceDirectory,
+core/util/history.ts:185:          `It looks like there is a JSON formatting error in your sessions.json file (${sessionsListFilePath}). Please fix this before creating a new session.`,
+core/util/history.ts:189:        `It looks like there is a validation error in your sessions.json file (${sessionsListFilePath}). Please fix this before creating a new session. Error: ${error}`,
+core/util/historyUtils.ts:90:    const workspaceDirectory = workspaceDirs?.[0] || "";
+core/util/historyUtils.ts:91:    outputDir = outputDir.replace(/^./, fileURLToPath(workspaceDirectory));
+core/util/paths.ts:107:  const filepath = path.join(getSessionsFolderPath(), "sessions.json");
+extensions/cli/src/commands/ls.test.ts:60:        workspaceDirectory: "/workspace",
+extensions/cli/src/commands/ls.test.ts:68:        workspaceDirectory: "/workspace",
+extensions/cli/src/commands/ls.test.ts:88:              workspaceDirectory: "/workspace",
+extensions/cli/src/commands/ls.test.ts:97:              workspaceDirectory: "/workspace",
+extensions/cli/src/commands/ls.ts:41:            workspaceDirectory: session.workspaceDirectory,
+extensions/cli/src/e2e/resume-flag.test.ts:58:      (f) => f.endsWith(".json") && f !== "sessions.json",
+extensions/cli/src/e2e/resume-flag.test.ts:164:      (f) => f.endsWith(".json") && f !== "sessions.json",
+extensions/cli/src/e2e/resume-flag.test.ts:198:      (f) => f.endsWith(".json") && f !== "sessions.json",
+extensions/cli/src/services/ChatHistoryService.test.ts:14:    workspaceDirectory: "/test",
+extensions/cli/src/services/ChatHistoryService.test.ts:57:        workspaceDirectory: "/custom",
+extensions/cli/src/services/ChatHistoryService.test.ts:87:        workspaceDirectory: "/compacted",
+extensions/cli/src/services/GitAiIntegrationService.test.ts:61:      workspaceDirectory: "/test/workspace",
+extensions/cli/src/services/GitAiIntegrationService.ts:67:    workspaceDirectory: string,
+extensions/cli/src/services/GitAiIntegrationService.ts:73:      workspaceDirectory,
+extensions/cli/src/services/GitAiIntegrationService.ts:80:        { cwd: workspaceDirectory },
+extensions/cli/src/services/GitAiIntegrationService.ts:167:        cwd: session.workspaceDirectory,
+extensions/cli/src/services/GitAiIntegrationService.ts:179:      await this.callGitAiCheckpoint(hookInput, session.workspaceDirectory);
+extensions/cli/src/services/GitAiIntegrationService.ts:209:        cwd: session.workspaceDirectory,
+extensions/cli/src/services/GitAiIntegrationService.ts:221:      await this.callGitAiCheckpoint(hookInput, session.workspaceDirectory);
+extensions/cli/src/session.test.ts:51:    workspaceDirectory: "/test/workspace",
+extensions/cli/src/session.test.ts:94:        workspaceDirectory: process.cwd(),
+extensions/cli/src/session.test.ts:123:        workspaceDirectory: process.cwd(),
+extensions/cli/src/session.test.ts:287:        workspaceDirectory: "/test/workspace",
+extensions/cli/src/session.test.ts:339:        workspaceDirectory: "/test/workspace",
+extensions/cli/src/session.test.ts:345:        "sessions.json" as any, // Should be filtered out
+extensions/cli/src/session.ts:103:        workspaceDirectory: process.cwd(),
+extensions/cli/src/session.ts:311:      .filter((f) => f.endsWith(".json") && f !== "sessions.json")
+extensions/cli/src/session.ts:344:    workspaceDirectory: process.cwd(),
+extensions/cli/src/session.ts:432:      workspaceDirectory: sessionData.workspaceDirectory || "",
+extensions/cli/src/session.ts:567:    workspaceDirectory: process.cwd(),
+extensions/cli/src/stream/streamChatResponse.autoCompaction.test.ts:18:    workspaceDirectory: "/test",
+extensions/cli/src/ui/SessionSelector.test.tsx:31:        workspaceDirectory: "/test",
+extensions/cli/src/ui/SessionSelector.test.tsx:35:        workspaceDirectory: "/test",
+extensions/cli/src/ui/SessionSelector.test.tsx:41:        workspaceDirectory: "/test",
+extensions/cli/src/ui/SessionSelector.test.tsx:47:        workspaceDirectory: "/test",
+extensions/cli/src/ui/SessionSelector.test.tsx:53:        workspaceDirectory: "/test",
+extensions/cli/src/ui/SessionSelector.test.tsx:99:        workspaceDirectory: "/test",
+extensions/cli/src/ui/__tests__/mockRemoteServer.ts:38:          workspaceDirectory: "/mock/workspace",
+extensions/intellij/src/main/kotlin/com/github/continuedev/continueintellijextension/constants/ServerConstants.kt:125:  val path = Paths.get(getSessionsDir(), "sessions.json")
+gui/src/components/History/HistoryTableRow.tsx:134:            {getUriPathBasename(sessionMetadata.workspaceDirectory || "")}
+gui/src/pages/history/history.test.tsx:12:    workspaceDirectory: "/tmp",
+gui/src/pages/history/history.test.tsx:18:    workspaceDirectory: "",
+gui/src/redux/thunks/session.ts:253:      workspaceDirectory: window.workspacePaths?.[0] || "",
+gui/src/redux/thunks/streamResponse.test.ts:1092:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse.test.ts:1139:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_errorHandling.test.ts:389:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_errorHandling.test.ts:436:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_toolCalls.test.ts:829:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_toolCalls.test.ts:876:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_toolCalls.test.ts:1383:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_toolCalls.test.ts:1430:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_toolCalls.test.ts:1644:            workspaceDirectory: "",
+gui/src/redux/thunks/streamResponse_toolCalls.test.ts:1691:            workspaceDirectory: "",

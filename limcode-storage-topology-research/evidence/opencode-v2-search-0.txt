@@ -1,0 +1,169 @@
+.opencode/skills/opencode-dev/SKILL.md:16:- **Discovery**: CLI processes find the shared server through a JSON registration file at `~/.local/state/opencode/service.json` (or `service-local.json` for the local/dev channel) containing `{id, version, url, pid}`. A separate password file under `~/.config/opencode/service.json` provides HTTP Basic auth. Before reusing a registration, the client calls `GET /health` to confirm the server is alive, authenticated, and version-compatible.
+.opencode/skills/opencode-dev/SKILL.md:19:- **Standalone mode** (`--standalone`) opts a single invocation out of the shared daemon: it spawns a private one-off `serve --stdio --port 0` child tied to that invocation's lifetime, with its own random password. Use this to isolate a debugging session from your other running opencode sessions.
+.opencode/skills/opencode-dev/SKILL.md:104:Installed next-channel sessions normally use `~/.local/share/opencode/opencode-next.db` and `~/.local/share/opencode/log/opencode.log`; `OPENCODE_DB` can override the database. Before calling `opencode2 api`, inspect `~/.local/state/opencode/service.json` because the command may start a daemon when none is healthy.
+V2_HTTP_API_AUDIT.md:162:| [x] 061 | `POST` | `/api/experimental/session/{sessionID}/skill` | `experimental.session.skill` | Experimental-only | Skill ID is now the `id` field; standalone activation remains experimental. |
+packages/ai/src/protocols/utils/responses-compaction.ts:89:    // The standalone compaction endpoint rejects histories containing configuration updates.
+packages/ai/test/provider-options/compaction.types.ts:43:// @ts-expect-error Anthropic has no standalone compact endpoint.
+packages/app/e2e/regression/patch-sticky-header.spec.ts:30:    name: "standalone patch",
+packages/app/e2e/regression/session-shell-completion.spec.ts:18:    test(`stops ${grouped ? "grouped" : "standalone"} background shell shimmer when ${status}`, async ({
+packages/app/e2e/regression/session-timeline-working.spec.ts:155:  test(`uses ${grouped ? "grouped" : "standalone"} background shell presentation for Working`, async ({ page }) => {
+packages/app/manifest.json:23:  "display": "standalone"
+packages/app/src/entry.tsx:77:    const standalone = isStandalone()
+packages/app/src/entry.tsx:78:    root.dataset.standalone = String(standalone)
+packages/app/src/entry.tsx:79:    if (standalone) restorePwaRoute()
+packages/app/src/entry.tsx:100:              {standalone && <PwaRoutePersistence />}
+packages/app/src/index.css:28:@media (display-mode: standalone) {
+packages/app/src/index.css:35:/* iOS can report navigator.standalone without matching display-mode. */
+packages/app/src/index.css:36:#root[data-standalone="true"] {
+packages/app/src/runtime/platform/pwa.ts:8:    window.matchMedia("(display-mode: standalone)").matches ||
+packages/app/src/runtime/platform/pwa.ts:9:    ("standalone" in navigator && navigator.standalone === true)
+packages/app/test-browser/pwa-route.test.ts:18:test("normal browser windows are not standalone", () => {
+packages/app/test-browser/pwa-route.test.ts:22:test("detects iOS home-screen apps when the standalone media query does not match", () => {
+packages/app/test-browser/pwa-route.test.ts:23:  const descriptor = Object.getOwnPropertyDescriptor(navigator, "standalone")
+packages/app/test-browser/pwa-route.test.ts:24:  Object.defineProperty(navigator, "standalone", { configurable: true, value: true })
+packages/app/test-browser/pwa-route.test.ts:26:    expect(window.matchMedia("(display-mode: standalone)").matches).toBe(false)
+packages/app/test-browser/pwa-route.test.ts:29:    if (descriptor) Object.defineProperty(navigator, "standalone", descriptor)
+packages/app/test-browser/pwa-route.test.ts:30:    if (!descriptor) delete (navigator as Navigator & { standalone?: boolean }).standalone
+packages/cli/dev/README.md:9:This uses the normal CLI and its real TUI through Vite + `solid-refresh`. For an explicit server or private backend, use `dev:vite` with `--server URL` or `--standalone` respectively. Plain `dev:vite` uses normal CLI service discovery; `dev:vite:live` explicitly connects to the installed server without replacing it.
+packages/cli/script/service-smoke.ts:120:      (file) => file === "service.json" || (file.startsWith("service-") && file.endsWith(".json")),
+packages/cli/src/commands/commands.ts:8:    Flag.withDescription("Print logs to stderr (server logs require --standalone)"),
+packages/cli/src/commands/commands.ts:16:  standalone: Flag.boolean("standalone").pipe(
+packages/cli/src/commands/handlers/acp.ts:8:import { Standalone } from "../../services/standalone"
+packages/cli/src/commands/handlers/api.ts:23:      standalone: input.standalone,
+packages/cli/src/commands/handlers/auth/list.ts:20:  const client = yield* createClient({ server: Option.getOrUndefined(input.server), standalone: input.standalone })
+packages/cli/src/commands/handlers/auth/login.ts:38:      standalone: input.standalone,
+packages/cli/src/commands/handlers/auth/login.ts:48:  standalone: boolean
+packages/cli/src/commands/handlers/auth/login.ts:53:  const client = yield* createClient({ server: input.server, standalone: input.standalone })
+packages/cli/src/commands/handlers/auth/logout.ts:16:      standalone: input.standalone,
+packages/cli/src/commands/handlers/auth/logout.ts:25:  standalone: boolean
+packages/cli/src/commands/handlers/auth/logout.ts:32:  const client = yield* createClient({ server: input.server, standalone: input.standalone })
+packages/cli/src/commands/handlers/auth/switch.ts:16:      standalone: input.standalone,
+packages/cli/src/commands/handlers/auth/switch.ts:25:  standalone: boolean
+packages/cli/src/commands/handlers/auth/switch.ts:32:  const client = yield* createClient({ server: input.server, standalone: input.standalone })
+packages/cli/src/commands/handlers/default.ts:33:      standalone: input.standalone,
+packages/cli/src/commands/handlers/mini.ts:16:      standalone: input.standalone,
+packages/cli/src/commands/handlers/models.ts:14:      standalone: input.standalone,
+packages/cli/src/commands/handlers/reload.ts:14:      standalone: input.standalone,
+packages/cli/src/commands/handlers/run.ts:12:      standalone: input.standalone,
+packages/cli/src/commands/handlers/session/delete.ts:15:    standalone: input.standalone,
+packages/cli/src/commands/handlers/session/export.ts:21:        standalone: input.standalone,
+packages/cli/src/commands/handlers/session/import.ts:30:      standalone: input.standalone,
+packages/cli/src/commands/handlers/session/list.ts:15:    standalone: input.standalone,
+packages/cli/src/commands/handlers/stats.ts:21:    standalone: input.standalone,
+packages/cli/src/env.ts:8:// --server, and adopted by a manually run or standalone server. The legacy
+packages/cli/src/run/v1.ts:4:import { Standalone } from "../services/standalone"
+packages/cli/src/run/v1.ts:25:  standaloneCommand?: ReadonlyArray<string>
+packages/cli/src/run/v1.ts:44:          : yield* Standalone.start({ command: input.standaloneCommand })
+packages/cli/src/services/server-connection.ts:7:import { Standalone } from "./standalone"
+packages/cli/src/services/server-connection.ts:11:  readonly standalone?: boolean
+packages/cli/src/services/server-connection.ts:22:  if (args.server !== undefined && args.standalone)
+packages/cli/src/services/server-connection.ts:23:    return yield* Effect.fail(new Error("--server and --standalone cannot be combined"))
+packages/cli/src/services/server-connection.ts:41:  if (args.standalone) {
+packages/cli/src/services/service-config.ts:30:  if (channel === "latest" || channel === "dev" || channel === "beta" || channel === "next") return "service.json"
+packages/cli/src/services/service-config.ts:97:      ...(name !== "service.json" && OPENCODE_CHANNEL !== "local" ? [path.join(global.state, "service.json")] : []),
+packages/cli/src/services/standalone.ts:20:  if (!executable) throw new Error("Failed to resolve standalone server command")
+packages/cli/src/services/standalone.ts:36:const makeEndpoint = Effect.fn("cli.standalone.endpoint")(
+packages/cli/src/services/standalone.ts:65:export * as Standalone from "./standalone"
+packages/cli/test/fixture/standalone-owner.ts:4:import { Standalone } from "../../src/services/standalone"
+packages/cli/test/mini-config.test.ts:43:        standalone: false,
+packages/cli/test/service.test.ts:36:    expect(await Bun.file(path.join(root, "config", "service.json")).exists()).toBe(false)
+packages/cli/test/service.test.ts:81:  expect(ServiceConfig.filename("latest")).toBe("service.json")
+packages/cli/test/service.test.ts:82:  expect(ServiceConfig.filename("dev")).toBe("service.json")
+packages/cli/test/service.test.ts:83:  expect(ServiceConfig.filename("beta")).toBe("service.json")
+packages/cli/test/service.test.ts:84:  expect(ServiceConfig.filename("next")).toBe("service.json")
+packages/cli/test/service.test.ts:113:  const legacy = path.join(root, "service.json")
+packages/cli/test/standalone.test.ts:7:test("standalone server exits when its owner is killed", async () => {
+packages/cli/test/standalone.test.ts:8:  const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-cli-standalone-"))
+packages/cli/test/standalone.test.ts:9:  const owner = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixture/standalone-owner.ts")], {
+packages/client/src/effect/service.ts:158:  return join(state, "opencode", "service.json")
+packages/client/src/promise/service.ts:128:  return join(process.env["XDG_STATE_HOME"] ?? join(homedir(), ".local", "state"), "opencode", "service.json")
+packages/client/test/fixture/service-fixture.ts:8:  const registration = join(directory, "service.json")
+packages/core/src/persistent-pty/daemon.ts:200:      try: () => readFile(path.join(directory, "service.json"), "utf8"),
+packages/core/src/plugin/module.ts:92:  // Legacy auto-discovery still admits standalone server sources. Configured
+packages/core/src/plugin/skill/opencode.md:249:- Compare with `opencode --standalone`, which runs the TUI with a private
+packages/core/src/plugin/system-prompt/meta.txt:47:- For simple one-off Python computations, such as local file parsing, template rendering, or statistics computations, call `shell` with `python3 -c`. Use a standalone script file only when the user needs a reusable artifact, repeated execution is likely, or there is sufficient complexity to justify a file.
+packages/core/src/shell/scan.ts:937:  let standalone = false
+packages/core/src/shell/scan.ts:1013:        if (standalone) finishWord(index + 1)
+packages/core/src/shell/scan.ts:1023:        if (standalone) finishWord(index + 1)
+packages/core/src/shell/scan.ts:1043:      standalone = !started
+packages/core/src/shell/scan.ts:1256:  let standalone = false
+packages/core/src/shell/scan.ts:1270:        started = !standalone
+packages/core/src/shell/scan.ts:1271:        if (standalone) token = ""
+packages/core/src/shell/scan.ts:1286:        started = !standalone
+packages/core/src/shell/scan.ts:1287:        if (standalone) token = ""
+packages/core/src/shell/scan.ts:1348:      standalone = !started
+packages/core/test/config/agent.test.ts:78:    { name: "standalone variant", frontmatter: "variant: high", model: undefined },
+packages/core/test/modal/models.test.ts:46:            id: "standalone",
+packages/core/test/modal/models.test.ts:85:    const fresh = models.get(Model.ID.make("standalone"))
+packages/core/test/modal/models.test.ts:86:    expect(fresh?.name).toBe("standalone")
+packages/core/test/permission.test.ts:496:      name: "standalone PowerShell scriptblock caller",
+packages/core/test/persistent-pty-daemon.test.ts:152:        path.join(directory, "service.json"),
+packages/core/test/persistent-pty-daemon.test.ts:258:    path.join(directory, "service.json"),
+packages/core/test/session-skill.test.ts:140:  it.effect("publishes raw standalone content under the caller-supplied ID without inbox admission", () =>
+packages/core/test/shell-scan/bash-syntax.test.ts:76:      // These are Bash spellings; Zsh's fd allocation is a standalone statement.
+packages/core/test/shell-scan/powershell-safety.test.ts:129:  test("keeps generic-token quotes distinct from standalone strings", () => {
+packages/core/test/shell-scan/powershell-syntax.test.ts:63:    "distinguishes standalone continuations from escapes inside tokens: %j",
+packages/core/test/shell-scan/redirect.test.ts:119:    "saved prefixes cover their standalone continuation command: %j",
+packages/core/test/v1-migration.test.ts:752:        part("prt_2", assistantMessage.id, { type: "snapshot", snapshot: "standalone" }),
+packages/core/test/v1-migration.test.ts:759:    expect(result.messages[1].data).toMatchObject({ content: [], snapshot: { start: "standalone" } })
+packages/desktop/scripts/bench-startup.ts:91:  registration: join(home, ".local", "state", "opencode", "service.json"),
+packages/desktop/scripts/bench-startup.ts:117:writeFileSync(join(paths.config, "service.json"), JSON.stringify({ port: servicePort }))
+packages/desktop/src/main/ssh/bootstrap.test.ts:30:    printf '%s' '{"url":"http://127.0.0.1:12345","password":"fixture","version":"${version}","pid":1234}' > "$XDG_STATE_HOME/opencode/service.json"
+packages/desktop/src/main/ssh/bootstrap.test.ts:33:    if [ -f "$XDG_STATE_HOME/opencode/service.json" ]; then printf 'http://127.0.0.1:12345\\n'; else printf 'stopped\\n'; fi
+packages/desktop/src/main/ssh/bootstrap.test.ts:76:    yield* fs.writeFileString(path.join(dir, "state/opencode/service.json"), JSON.stringify(expected, null, 2))
+packages/httpapi-codegen/test/generate.test.ts:810:  test("emits Effect Json schemas as standalone Promise types", () => {
+packages/merman/src/state/diagram.test.ts:623:  test.each(["LR", "RL"] as const)("trims leading rows from standalone %s choices", (direction) => {
+packages/merman/src/test/markdown.test.ts:413:test("sizes a standalone state choice after trimming leading rows", async () => {
+packages/merman/src/timeline/diagram.test.ts:85:  test("supports standalone periods followed by continuation events", () => {
+packages/schema/AGENTS.md:35:- Keep standalone ID modules only when they prevent real cycles or heavy dependency edges. Inline one-off IDs into their owning contract module when no cycle exists.
+packages/server/test/persistent-pty.test.ts:208:      expect(existsSync(path.join(fixture.directory, directories[0], "service.json"))).toBeTrue()
+packages/server/test/persistent-pty.test.ts:361:        yield* Effect.promise(() => Bun.file(path.join(handoff.directory, "service.json")).json()),
+packages/server/test/persistent-pty.test.ts:383:      expect(existsSync(path.join(handoff.directory, "service.json"))).toBeFalse()
+packages/session-ui/component-tests/read-image.spec.ts:17:    `lazily previews ${grouped ? "grouped" : "standalone"} image reads and releases them on collapse`,
+packages/session-ui/component-tests/session-lifecycle.spec.ts:114:    `keeps ${open ? "expanded" : "collapsed"} reasoning intent from Thinking through standalone shell into Used`,
+packages/session-ui/src/storybook/current-session-fixtures.ts:316:export const standaloneShellRunningDocument = document(
+packages/session-ui/src/storybook/current-session-fixtures.ts:336:export const standaloneShellCompletedDocument = document([
+packages/session-ui/src/storybook/index.ts:30:  standaloneShellCompletedDocument,
+packages/session-ui/src/storybook/index.ts:31:  standaloneShellRunningDocument,
+packages/session-ui/src/timeline/projection.test.ts:141:      name: "preserves the file group identity when its first member becomes standalone",
+packages/session-ui/src/timeline/projection.test.ts:148:      name: "preserves the file group identity before a later standalone member",
+packages/session-ui/src/timeline/rows-current.test.ts:44:  test("renders a current shell message as a standalone turn", () => {
+packages/session-ui/src/timeline/rows-current.test.ts:896:  test("keeps active and background work standalone when no group precedes them", () => {
+packages/session-ui/src/timeline/terminal-work.stories.tsx:11:  standaloneShellCompletedDocument,
+packages/session-ui/src/timeline/terminal-work.stories.tsx:12:  standaloneShellRunningDocument,
+packages/session-ui/src/timeline/terminal-work.stories.tsx:52:      document={standaloneShellRunningDocument}
+packages/session-ui/src/timeline/terminal-work.stories.tsx:64:      document={standaloneShellCompletedDocument}
+packages/tui/src/routes/session/grouping/tree.ts:15: * owned by the session projection. A path of [] creates a standalone leaf.
+packages/tui/test/cli/tui/data.test.tsx:335:      return json({ location, data: [{ id: "standalone", name: "Standalone" }] })
+packages/tui/test/cli/tui/data.test.tsx:380:    expect(data.location.websearch.list(location)).toEqual([{ id: "standalone", name: "Standalone" }])
+packages/tui/test/cli/tui/dialog-open.test.tsx:166:          location: { directory: "/tmp/standalone-notes" },
+packages/tui/test/cli/tui/dialog-open.test.tsx:186:    expect(frame).toContain("standalone-notes")
+packages/tui/test/cli/tui/dialog-open.test.tsx:190:    expect(frame).not.toContain("/tmp/standalone-notes")
+packages/tui/test/cli/tui/dialog-open.test.tsx:192:    await fixture.app.mockInput.typeText("standalone-notes")
+packages/tui/test/cli/tui/dialog-open.test.tsx:193:    await fixture.app.waitForFrame((value) => value.includes("standalone-notes"))
+packages/tui/test/cli/tui/dialog-open.test.tsx:309:  const standalone = path.resolve("/tmp/standalone-notes")
+packages/tui/test/cli/tui/dialog-open.test.tsx:327:            location: { directory: standalone },
+packages/tui/test/cli/tui/dialog-open.test.tsx:339:      (value) => value.includes("Plain project") && value.includes("standalone-notes"),
+packages/ui/src/assets/favicon/site.webmanifest:23:  "display": "standalone"
+packages/ui/src/forms/inline-input/inline-input.stories.tsx:12:- Provide a label or aria-label when used standalone.
+packages/web/src/content/docs/bs/server.mdx:57:Mozete pokrenuti `opencode serve` da startate standalone server. Ako je opencode TUI vec pokrenut, `opencode serve` ce pokrenuti novi server.
+packages/web/src/content/docs/it/server.mdx:57:Puoi eseguire `opencode serve` per avviare un server standalone. Se la TUI di opencode e gia in esecuzione, `opencode serve` avviera un nuovo server.
+packages/web/src/content/docs/server.mdx:59:You can run `opencode serve` to start a standalone server. If you have the
+perf/test-suite.md:126:| `test/server/httpapi-cors.test.ts`        | 2.621, 1.682, 1.518    |  1.682 | Not a standalone top target; initial 14s was mixed-scope noise/order effect. |
+services/files/README.md:87:CLI and Node CLI archives contain the standalone executable at their root, with
+services/www/src/docs/content/build/client/index.mdx:168:  file: "/var/run/opencode/service.json",
+services/www/src/docs/content/cli/commands.mdx:6:Every command accepts `--help` for its full flag list, for example `opencode run --help`. Commands that talk to a server also accept `--standalone` to run a private server and `--server <url>` to target a specific one.
+services/www/src/docs/content/cli/commands.mdx:18:In CI, pass a provider API key as a secret and use standalone mode so the private server receives it. For example, this GitHub Actions job reviews the checked-out repository:
+services/www/src/docs/content/cli/commands.mdx:30:      - run: opencode run --standalone --model anthropic/claude-sonnet-4-5 "Review this repository for correctness and summarize any issues."
+services/www/src/docs/content/cli/index.mdx:51:Use `--standalone` to run with a private server, or `--server` to connect to a specific server URL:
+services/www/src/docs/content/cli/index.mdx:54:opencode --standalone
+services/www/src/docs/content/cli/providers.mdx:71:server, pass it when starting standalone mode.
+services/www/src/docs/content/cli/providers.mdx:74:ANTHROPIC_API_KEY=sk-ant-... opencode --standalone
+services/www/src/docs/content/index.mdx:31:Download a standalone CLI binary for your platform.
+services/www/src/docs/content/network.mdx:65:opencode --standalone
+services/www/src/docs/content/network.mdx:77:`--standalone` and `serve` use the environment of their own process. `opencode service set env` does not configure these
+services/www/src/docs/content/network.mdx:84:opencode --standalone
+services/www/src/docs/content/providers.mdx:386:GOOGLE_CLOUD_PROJECT=my-project GOOGLE_VERTEX_LOCATION=europe-west4 opencode --standalone
+services/www/src/docs/content/providers.mdx:395:opencode --standalone
+services/www/src/docs/content/troubleshooting.mdx:154:~/.local/state/opencode/service.json
+services/www/src/docs/content/troubleshooting.mdx:160:~/.config/opencode/service.json

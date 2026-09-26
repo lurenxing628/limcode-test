@@ -1,0 +1,165 @@
+.agents/skills/cline-sdk/references/clinecore/REFERENCE.md:120:  sessions.db       # SQLite database
+.agents/skills/cline-sdk/references/clinecore/gotchas.md:66:- `sessions.db` - SQLite database with session metadata
+apps/cli/src/commands/schedule/import-export.ts:154:					parsed.workspaceRoot ?? parsed.workspace_root ?? "",
+apps/cli/src/commands/schedule/import-export.ts:158:						"schedule import requires workspaceRoot/workspace_root in the source file",
+apps/cli/src/runtime/interactive/session-runtime.test.ts:113:		workspace_root: "/tmp/project",
+apps/cli/src/utils/types.ts:50:	workspace_root: string;
+apps/cline-hub/src/server/schedules.ts:122:		const routineWorkspaceRoot = asTrimmedString(args?.workspace_root);
+apps/cline-hub/src/server/schedules.ts:125:				"createSchedule requires name, timing, prompt, and workspace_root",
+apps/cline-hub/src/server/schedules.ts:156:		const routineWorkspaceRoot = asTrimmedString(args?.workspace_root);
+apps/cline-hub/src/server/schedules.ts:159:				"updateSchedule requires schedule_id, name, timing, prompt, and workspace_root",
+apps/cline-hub/src/webview/src/components/views/settings/routine-view.tsx:823:				workspace_root: workspaceRoot,
+apps/examples/desktop-app/scripts/verify-ssh-poc.ts:143:			workspaceRoot: started.manifest.workspace_root,
+apps/examples/desktop-app/sidecar/chat-session.test.ts:135:			manifest: { cwd: "/remote/project", workspace_root: "/remote/project" },
+apps/examples/desktop-app/sidecar/chat-session.test.ts:367:						workspace_root: "/home/host/.cline/data/workspaces/chat",
+apps/examples/desktop-app/sidecar/chat-session.test.ts:2493:					manifest: { cwd: "/tmp/ws", workspace_root: "/tmp/ws" },
+apps/examples/desktop-app/sidecar/chat-session.ts:99:	workspace_root?: unknown;
+apps/examples/desktop-app/sidecar/chat-session.ts:113:		typeof source?.workspace_root === "string"
+apps/examples/desktop-app/sidecar/chat-session.ts:114:			? source.workspace_root.trim()
+apps/examples/desktop-app/sidecar/chat-session.ts:593:	const rawWorkspaceRoot = config.workspaceRoot ?? config.workspace_root;
+apps/examples/desktop-app/sidecar/chat-session.ts:769:		config.cwd ?? config.workspaceRoot ?? config.workspace_root ?? "",
+apps/examples/desktop-app/sidecar/chat-session.ts:1034:	const workspaceRoot = startResult.manifest.workspace_root;
+apps/examples/desktop-app/sidecar/chat-session.ts:1705:			request.config?.workspace_root ||
+apps/examples/desktop-app/sidecar/chat-session.ts:1712:			request.config?.workspace_root ||
+apps/examples/desktop-app/sidecar/commands.ts:1293:		const workspaceRoot = asTrimmedString(args?.workspace_root);
+apps/examples/desktop-app/sidecar/commands.ts:1296:				"createSchedule requires name, timing, prompt, and workspace_root",
+apps/examples/desktop-app/sidecar/commands.ts:1326:		const workspaceRoot = asTrimmedString(args?.workspace_root);
+apps/examples/desktop-app/sidecar/commands.ts:1329:				"updateSchedule requires schedule_id, name, timing, prompt, and workspace_root",
+apps/examples/desktop-app/sidecar/remote-session-credentials.test.ts:62:				workspace_root: "/remote/workspace",
+apps/examples/desktop-app/sidecar/session-data/discovery.ts:141:					manifest.workspace_root ??
+apps/examples/desktop-app/sidecar/session-data/discovery.ts:194:				normalized.workspace_root ??
+apps/examples/desktop-app/src-tauri/src/main.rs:91:    workspace_root: String,
+apps/examples/desktop-app/src-tauri/src/main.rs:407:fn resolve_workspace_root(launch_cwd: &str) -> String {
+apps/examples/desktop-app/src-tauri/src/main.rs:433:        PathBuf::from(&context.workspace_root)
+apps/examples/desktop-app/src-tauri/src/main.rs:485:            PathBuf::from(&context.workspace_root)
+apps/examples/desktop-app/src-tauri/src/main.rs:514:        command.current_dir(&context.workspace_root);
+apps/examples/desktop-app/src-tauri/src/main.rs:521:            .current_dir(&context.workspace_root);
+apps/examples/desktop-app/src-tauri/src/main.rs:525:            "desktop backend sidecar not found. checked binary/script under workspace_root={} and launch_cwd={}",
+apps/examples/desktop-app/src-tauri/src/main.rs:526:            context.workspace_root, context.launch_cwd
+apps/examples/desktop-app/src-tauri/src/main.rs:1448:    let workspace_root = resolve_workspace_root(&launch_cwd);
+apps/examples/desktop-app/src-tauri/src/main.rs:1451:        workspace_root,
+apps/examples/desktop-app/webview/components/views/settings/routine-view.tsx:1100:				workspace_root: workspaceRoot,
+apps/examples/menubar/src-tauri/src/main.rs:22:    last_workspace_root: Option<String>,
+apps/examples/menubar/src-tauri/src/main.rs:45:    workspace_root: String,
+apps/examples/menubar/src-tauri/src/main.rs:91:    last_workspace_root: Option<String>,
+apps/examples/menubar/src-tauri/src/main.rs:169:fn resolve_sidecar_script(workspace_root: &str, launch_cwd: &str) -> Option<PathBuf> {
+apps/examples/menubar/src-tauri/src/main.rs:171:        PathBuf::from(workspace_root)
+apps/examples/menubar/src-tauri/src/main.rs:178:        PathBuf::from(workspace_root)
+apps/examples/menubar/src-tauri/src/main.rs:199:fn resolve_sidecar_binary(workspace_root: &str) -> Option<PathBuf> {
+apps/examples/menubar/src-tauri/src/main.rs:207:            PathBuf::from(workspace_root)
+apps/examples/menubar/src-tauri/src/main.rs:217:            PathBuf::from(workspace_root)
+apps/examples/menubar/src-tauri/src/main.rs:239:    workspace_root: &str,
+apps/examples/menubar/src-tauri/src/main.rs:252:    let mut cmd = if let Some(bin) = resolve_sidecar_binary(workspace_root) {
+apps/examples/menubar/src-tauri/src/main.rs:254:        c.current_dir(workspace_root);
+apps/examples/menubar/src-tauri/src/main.rs:256:    } else if let Some(script) = resolve_sidecar_script(workspace_root, launch_cwd) {
+apps/examples/menubar/src-tauri/src/main.rs:261:            .current_dir(workspace_root);
+apps/examples/menubar/src-tauri/src/main.rs:265:            "menubar sidecar not found under workspace_root={workspace_root}"
+apps/examples/menubar/src-tauri/src/main.rs:362:                hub.last_workspace_root = msg
+apps/examples/menubar/src-tauri/src/main.rs:363:                    .last_workspace_root
+apps/examples/menubar/src-tauri/src/main.rs:443:fn prompt_for_new_chat(workspace_root: &str) -> Option<String> {
+apps/examples/menubar/src-tauri/src/main.rs:444:    let escaped_workspace = escape_applescript(workspace_root);
+apps/examples/menubar/src-tauri/src/main.rs:571:        hub_state.last_workspace_root.is_some(),
+apps/examples/menubar/src-tauri/src/main.rs:616:        "lastWorkspaceRoot": hub.last_workspace_root,
+apps/examples/menubar/src-tauri/src/main.rs:663:    let workspace_root = std::process::Command::new("git")
+apps/examples/menubar/src-tauri/src/main.rs:675:    let workspace_root_for_setup = workspace_root.clone();
+apps/examples/menubar/src-tauri/src/main.rs:679:    let workspace_root_for_watchdog = workspace_root.clone();
+apps/examples/menubar/src-tauri/src/main.rs:690:                &workspace_root_for_setup,
+apps/examples/menubar/src-tauri/src/main.rs:707:                    &workspace_root_for_watchdog,
+apps/examples/menubar/src-tauri/src/main.rs:762:                            let workspace_root = {
+apps/examples/menubar/src-tauri/src/main.rs:764:                                hub.last_workspace_root.clone()
+apps/examples/menubar/src-tauri/src/main.rs:766:                            let Some(workspace_root) = workspace_root else {
+apps/examples/menubar/src-tauri/src/main.rs:773:                            let Some(prompt) = prompt_for_new_chat(&workspace_root) else {
+apps/vscode/README.marketplace.md:125:For example, when working with a local web server, you can use 'Restore Workspace Only' to quickly test different versions of your app, then use 'Restore Task and Workspace' when you find the version you want to continue building from. This lets you safely explore different approaches without losing progress.
+apps/vscode/proto/cline/hooks.proto:15:  repeated string workspace_roots = 5;
+Binary file apps/vscode/proto/descriptor_set.pb matches
+apps/vscode/src/sdk/git-telemetry.test.ts:361:		expect(events[0].properties).toMatchObject({ workspace_root_count: count ?? 0, git: { state: "non_git" } })
+apps/vscode/src/sdk/git-telemetry.test.ts:368:		expect(events[0].properties?.workspace_root_count).toBe(1)
+apps/vscode/src/sdk/git-telemetry.test.ts:372:		expect(events[1].properties?.workspace_root_count).toBe(2)
+apps/vscode/src/sdk/git-telemetry.test.ts:403:			workspace_root_count: 1,
+apps/vscode/src/sdk/git-telemetry.ts:220:				workspace_root_count: snapshot.workspaceRootCount,
+apps/vscode/src/services/lg-cns-integration/webhook-hooks.ts:105:            workspace_roots = $workspaceRoots
+apps/vscode/src/services/lg-cns-integration/webhook-hooks.ts:293:    workspace_roots: input.workspaceRoots ?? [],
+apps/vscode/src/test/e2e/history.test.ts:34:			workspace_root: "/tmp/e2e-history",
+apps/vscode/webview-ui/src/components/history/HistoryView.tsx:34:	workspaceOnly: "Workspace Only",
+docs/sdk/architecture/hub-spoke.mdx:107:  sessions.db                    # SQLite index
+docs/usage/ide.mdx:272:| **Restore Workspace Only** | Resets files to that point but keeps the full conversation | You want to try a different approach but keep the conversation history |
+docs/usage/ide.mdx:274:**Recommended for beginners:** Use **"Restore Workspace Only"** when you want to undo a change but keep chatting with Cline about what to do differently.
+sdk/packages/core/README.md:61:`result.manifest.workspace_root`.
+sdk/packages/core/fixtures/session/session.json:14:	"workspace_root": "/Users/example/dev/cline",
+sdk/packages/core/src/cron/store/cron-schema.ts:24:		workspace_root TEXT,
+sdk/packages/core/src/cron/store/cron-schema.ts:79:		workspace_root TEXT,
+sdk/packages/core/src/cron/store/sqlite-cron-store.ts:211:		workspaceRoot: asOptionalString(row.workspace_root),
+sdk/packages/core/src/cron/store/sqlite-cron-store.ts:276:		workspaceRoot: asOptionalString(row.workspace_root),
+sdk/packages/core/src/cron/store/sqlite-cron-store.ts:723:			where.push("workspace_root = ?");
+sdk/packages/core/src/cron/store/sqlite-cron-store.ts:1006:						enabled, removed, title, prompt, workspace_root,
+sdk/packages/core/src/cron/store/sqlite-cron-store.ts:1071:						workspace_root = ?, schedule_expr = ?, timezone = ?,
+sdk/packages/core/src/cron/store/sqlite-cron-store.ts:1336:						occurred_at, received_at, workspace_root, dedupe_key,
+sdk/packages/core/src/hub/runtime-host/hub-runtime-host.test.ts:270:		expect(started.manifest.workspace_root).toBe(resolvedWorkspace);
+sdk/packages/core/src/hub/runtime-host/hub-runtime-host.ts:725:		workspace_root: workspaceRoot,
+sdk/packages/core/src/hub/runtime-host/hub-runtime-host.ts:750:		workspace_root: snapshot.workspace.root,
+sdk/packages/core/src/hub/server/agenda-task-hub.test.ts:98:						workspace_root: workspaceRoot,
+sdk/packages/core/src/hub/server/boundary.test.ts:387:						workspace_root: resolvedWorkspace,
+sdk/packages/core/src/hub/server/boundary.test.ts:1005:						workspace_root: "/tmp/project",
+sdk/packages/core/src/hub/server/boundary.test.ts:1137:					workspace_root: "/tmp/project",
+sdk/packages/core/src/hub/server/hub-upgrades.test.ts:58:					workspace_root: input.config.workspaceRoot ?? root,
+sdk/packages/core/src/hub/server/replay-wire.test.ts:72:						workspace_root: root,
+sdk/packages/core/src/runtime/host/history.test.ts:89:		workspace_root: "/tmp/workspace",
+sdk/packages/core/src/runtime/host/history.test.ts:541:			workspace_root: "/tmp/workspace",
+sdk/packages/core/src/runtime/host/history.test.ts:556:			workspace_root: "/tmp/workspace",
+sdk/packages/core/src/runtime/host/history.ts:122:		workspaceRoot: manifest.workspace_root,
+sdk/packages/core/src/runtime/host/local-runtime-host.e2e.test.ts:99:			workspace_root: input.workspaceRoot,
+sdk/packages/core/src/runtime/host/local-runtime-host.test.ts:81:		workspace_root: "/tmp/project",
+sdk/packages/core/src/runtime/host/local-runtime-host.test.ts:288:			expect(result.manifest.workspace_root).toBe(chatWorkspace);
+sdk/packages/core/src/runtime/host/local-runtime-host.test.ts:1664:			workspace_root: workspaceRoot,
+sdk/packages/core/src/runtime/host/local-runtime-host.test.ts:4668:					workspaceRoot: manifest.workspace_root,
+sdk/packages/core/src/runtime/host/local-runtime-host.ts:429:					workspaceRoot: existingResumeManifest.workspace_root,
+sdk/packages/core/src/runtime/host/local-runtime-host.ts:490:			workspace_root: workspacePath,
+sdk/packages/core/src/services/session-data.ts:404:		workspace_root: row.workspaceRoot,
+sdk/packages/core/src/services/storage/sqlite-session-store.ts:45:		return join(this.ensureSessionsDir(), "sessions.db");
+sdk/packages/core/src/services/storage/sqlite-session-store.ts:88:				provider, model, cwd, workspace_root, team_name, enable_tools, enable_spawn, enable_teams,
+sdk/packages/core/src/services/storage/sqlite-session-store.ts:194:				provider, model, cwd, workspace_root, team_name,
+sdk/packages/core/src/services/storage/sqlite-session-store.ts:216:			workspaceRoot: asString(row.workspace_root),
+sdk/packages/core/src/services/telemetry/core-events.test.ts:45:	workspace_root_count: 2,
+sdk/packages/core/src/services/telemetry/core-events.ts:150:	workspace_root_count: number;
+sdk/packages/core/src/session/models/session-manifest.ts:19:	workspace_root: z.string().min(1),
+sdk/packages/core/src/session/models/session-row.ts:116:	workspace_root AS workspaceRoot,
+sdk/packages/core/src/session/search/session-history-search.ts:149:		workspace_root,
+sdk/packages/core/src/session/search/session-history-search.ts:288:						workspace_root, indexed_sessions.title,
+sdk/packages/core/src/session/search/session-history-search.ts:296:						AND (? IS NULL OR workspace_root = ?)
+sdk/packages/core/src/session/search/session-history-search.ts:306:					workspace_root, title, snippet, score
+sdk/packages/core/src/session/search/session-history-search.ts:335:				workspaceRoot: String(row.workspace_root),
+sdk/packages/core/src/session/search/session-history-search.ts:415:				workspace_root, title, content
+sdk/packages/core/src/session/services/persistence-service.test.ts:142:						cwd, workspace_root, enable_tools, enable_spawn, enable_teams,
+sdk/packages/core/src/session/services/persistence-service.ts:140:			workspace_root: input.workspaceRoot,
+sdk/packages/core/src/session/services/session-service.ts:37:				provider, model, cwd, workspace_root, team_name, enable_tools, enable_spawn, enable_teams,
+sdk/packages/core/src/session/services/session-service.ts:289:				provider, model, cwd, workspace_root, team_name, enable_tools, enable_spawn, enable_teams,
+sdk/packages/core/src/session/stores/session-manifest-store.ts:71:		workspaceRoot: manifest.workspace_root,
+sdk/packages/core/src/tasks/agenda-task-tool.test.ts:127:			{ operation: "list", workspace_root: "/another-repo" },
+sdk/packages/core/src/tasks/agenda-task-tool.ts:56:	workspace_root: z.string().min(1).nullable().optional(),
+sdk/packages/core/src/tasks/agenda-task-tool.ts:173:	if (input.workspace_root !== undefined) {
+sdk/packages/core/src/tasks/agenda-task-tool.ts:176:			input.workspace_root === null ||
+sdk/packages/core/src/tasks/agenda-task-tool.ts:177:			!sameWorkspace(input.workspace_root, defaults.workspaceRoot)
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:110:		workspaceRoot: asOptionalString(row.workspace_root),
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:271:					workspace_root, cwd, resource_paths_json, priority, assignee,
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:337:				`SELECT DISTINCT workspace_root FROM agenda_tasks
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:338:				WHERE scope = 'workspace' AND workspace_root IS NOT NULL
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:339:				ORDER BY workspace_root ASC`,
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:344:			const root = asOptionalString(row.workspace_root);
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:374:				where.push("workspace_root = ?");
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:381:				"(scope = 'global' OR (scope = 'workspace' AND workspace_root = ?))",
+sdk/packages/core/src/tasks/store/sqlite-task-store.ts:458:					scope = ?, workspace_root = ?, cwd = ?, resource_paths_json = ?,
+sdk/packages/core/src/tasks/store/task-schema.ts:12:		workspace_root TEXT,
+sdk/packages/core/src/tasks/store/task-schema.ts:41:			(scope = 'workspace' AND workspace_root IS NOT NULL) OR
+sdk/packages/core/src/tasks/store/task-schema.ts:42:			(scope = 'global' AND workspace_root IS NULL)
+sdk/packages/core/src/tasks/store/task-schema.ts:78:		ON agenda_tasks(scope, workspace_root, status, available_at);`,
+sdk/packages/shared/src/db/sqlite-db.test.ts:87:				const db = loadSqliteDb(join(dir, "sessions.db"));
+sdk/packages/shared/src/db/sqlite-db.test.ts:101:				workspace_root TEXT NOT NULL,
+sdk/packages/shared/src/db/sqlite-db.test.ts:119:				provider, model, cwd, workspace_root, team_name, enable_tools, enable_spawn, enable_teams,
+sdk/packages/shared/src/db/sqlite-db.ts:201:		workspace_root TEXT NOT NULL,
+sdk/packages/shared/src/db/sqlite-db.ts:235:		workspace_root TEXT,
+sdk/packages/shared/src/db/sqlite-db.ts:282:		column: "workspace_root",
+sdk/packages/shared/src/db/sqlite-db.ts:283:		sql: "ALTER TABLE sessions ADD COLUMN workspace_root TEXT;",
+sdk/packages/shared/src/db/sqlite-db.ts:376:			if (migration.column === "workspace_root") {
+sdk/packages/shared/src/db/sqlite-db.ts:378:					"UPDATE sessions SET workspace_root = cwd WHERE workspace_root IS NULL OR workspace_root = '';",
+sdk/packages/shared/src/storage/paths.ts:250: * Lives alongside `sessions.db` but is a separate file so connector
+sdk/packages/shared/src/storage/paths.ts:263: * Lives alongside `sessions.db` but is a separate file so cron lifecycle,

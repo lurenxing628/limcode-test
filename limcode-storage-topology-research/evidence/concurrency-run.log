@@ -1,0 +1,7 @@
+two-writers {"success":300,"fail":0,"p99":1.4102980000000116,"max":5.015327999999954,"wallMs":3050.3889590000003}
+four-writers {"success":600,"fail":0,"p99":2.166729000000032,"max":18.594282,"wallMs":3062.24927}
+four-writers-saturated {"success":400,"fail":0,"p99":108.93039500000009,"max":1135.070259,"wallMs":2902.324012}
+long-no-retry {"success":156,"fail":4,"p99":1430.4787509999996,"max":1430.6996630000003,"wallMs":6851.982188}
+long-retry {"success":160,"fail":0,"p99":6462.580078,"max":6562.5727910000005,"wallMs":6980.448531}
+long-project-split {"success":159,"fail":1,"p99":2.148494999999997,"max":1230.5531449999999,"wallMs":6650.115615999999}
+WAL 30599272 0

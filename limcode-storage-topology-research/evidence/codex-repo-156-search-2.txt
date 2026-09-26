@@ -1,0 +1,183 @@
+codex-rs/app-server-protocol/src/lib.rs:28:pub use protocol::thread_history_projection::*;
+codex-rs/app-server-protocol/src/protocol/mod.rs:10:pub mod thread_history_projection;
+codex-rs/app-server-protocol/src/protocol/thread_history_projection.rs:98:#[path = "thread_history_projection_tests.rs"]
+codex-rs/cli/src/migrate_rollouts.rs:77:    let thread_history_db_path = config.sqlite.thread_history_db_path();
+codex-rs/cli/src/migrate_rollouts.rs:81:            thread_history_db_path.as_path(),
+codex-rs/cli/src/migrate_rollouts.rs:115:            thread_history_db_path.as_path(),
+codex-rs/cli/src/migrate_rollouts.rs:401:async fn thread_storage_bytes(codex_home: &Path, thread_history_db_path: &Path) -> io::Result<u64> {
+codex-rs/cli/src/migrate_rollouts.rs:424:        let mut path = thread_history_db_path.as_os_str().to_owned();
+codex-rs/cli/src/state_db_recovery.rs:151:            original_path: PathBuf::from("/tmp/state_5.sqlite"),
+codex-rs/cli/src/state_db_recovery.rs:152:            backup_path: PathBuf::from("/tmp/db-backups/sqlite-1-0/state_5.sqlite"),
+codex-rs/core/src/agent/control_tests.rs:2029:async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
+codex-rs/rollout/src/list.rs:1149:                    crate::recorder::reject_unknown_thread_history_mode(&value)?;
+codex-rs/rollout/src/list.rs:1342:                crate::recorder::reject_unknown_thread_history_mode(&value).map_err(|error| {
+codex-rs/rollout/src/recorder.rs:1099:                reject_unknown_thread_history_mode(&value)?;
+codex-rs/rollout/src/recorder.rs:1201:pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Result<()> {
+codex-rs/state/BUILD.bazel:11:        "thread_history_migrations/**",
+codex-rs/state/src/lib.rs:87:pub use runtime::open_thread_history_db;
+codex-rs/state/src/migrations.rs:11:pub(crate) static THREAD_HISTORY_MIGRATOR: Migrator = sqlx::migrate!("./thread_history_migrations");
+codex-rs/state/src/migrations.rs:52:pub(crate) fn runtime_thread_history_migrator() -> Migrator {
+codex-rs/state/src/migrations_tests.rs:422:        .open_thread_history_db(
+codex-rs/state/src/migrations_tests.rs:465:async fn realtime_items_preserve_older_thread_history_writers() {
+codex-rs/state/src/migrations_tests.rs:490:        .open_thread_history_db(&older_migrator, /*telemetry_override*/ None)
+codex-rs/state/src/migrations_tests.rs:519:        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES ('thread-1', 0, 0)",
+codex-rs/state/src/migrations_tests.rs:526:        .open_thread_history_db(&older_migrator, /*telemetry_override*/ None)
+codex-rs/state/src/migrations_tests.rs:549:    sqlx::query("DELETE FROM thread_history_projection_state WHERE thread_id = ?")
+codex-rs/state/src/runtime.rs:15:use crate::migrations::runtime_thread_history_migrator;
+codex-rs/state/src/runtime.rs:356:pub async fn open_thread_history_db(sqlite: &SqliteConfig) -> anyhow::Result<SqlitePool> {
+codex-rs/state/src/runtime.rs:357:    let migrator = runtime_thread_history_migrator();
+codex-rs/state/src/runtime.rs:359:        .open_thread_history_db(&migrator, /*telemetry_override*/ None)
+codex-rs/state/src/runtime/recovery_tests.rs:105:    let path = PathBuf::from("/tmp/sqlite_corrupt/state_5.sqlite");
+codex-rs/state/src/sqlite.rs:33:const STATE_DB_FILENAME: &str = "state_5.sqlite";
+codex-rs/state/src/sqlite.rs:34:const THREAD_HISTORY_DB_FILENAME: &str = "thread_history_1.sqlite";
+codex-rs/state/src/sqlite.rs:53:    filename: STATE_DB_FILENAME,
+codex-rs/state/src/sqlite.rs:179:    pub fn thread_history_db_path(&self) -> PathBuf {
+codex-rs/state/src/sqlite.rs:242:    pub(super) async fn open_thread_history_db(
+codex-rs/state/thread_history_migrations/0001_thread_history.sql:34:CREATE TABLE thread_history_projection_state (
+codex-rs/state/thread_history_migrations/0005_thread_realtime_items.sql:19:    AFTER DELETE ON thread_history_projection_state
+codex-rs/thread-store/src/local/delete_thread.rs:676:        let pool = codex_state::open_thread_history_db(&config.sqlite)
+codex-rs/thread-store/src/local/delete_thread.rs:702:            "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, 3, 3)",
+codex-rs/thread-store/src/local/delete_thread.rs:727:    (SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = ?)
+codex-rs/thread-store/src/local/delete_thread.rs:760:        let pool = codex_state::open_thread_history_db(
+codex-rs/thread-store/src/local/delete_thread.rs:788:            "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, 3, 3)",
+codex-rs/thread-store/src/local/delete_thread.rs:827:    (SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = ?)
+codex-rs/thread-store/src/local/helpers.rs:242:    thread_history_modes: &HashMap<ThreadId, ThreadHistoryMode>,
+codex-rs/thread-store/src/local/helpers.rs:244:    let mut names = HashMap::<ThreadId, String>::with_capacity(thread_history_modes.len());
+codex-rs/thread-store/src/local/helpers.rs:245:    let legacy_thread_ids = thread_history_modes
+codex-rs/thread-store/src/local/helpers.rs:252:        for (&thread_id, &history_mode) in thread_history_modes {
+codex-rs/thread-store/src/local/list_threads.rs:86:    let thread_history_modes = items
+codex-rs/thread-store/src/local/list_threads.rs:90:    let names = resolve_thread_names(store, &thread_history_modes).await;
+codex-rs/thread-store/src/local/live_writer.rs:171:        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
+codex-rs/thread-store/src/local/live_writer.rs:346:        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
+codex-rs/thread-store/src/local/mod.rs:21:mod thread_history_materialization;
+codex-rs/thread-store/src/local/mod.rs:144:    thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
+codex-rs/thread-store/src/local/mod.rs:262:            thread_history_db: Arc::new(OnceCell::new()),
+codex-rs/thread-store/src/local/mod.rs:283:    async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {
+codex-rs/thread-store/src/local/mod.rs:289:        self.thread_history_db
+codex-rs/thread-store/src/local/mod.rs:291:                codex_state::open_thread_history_db(&self.config.sqlite).await
+codex-rs/thread-store/src/local/paginated_fork.rs:59:            super::thread_history_materialization::materialize_to_sqlite(
+codex-rs/thread-store/src/local/paginated_fork.rs:68:    super::thread_history_materialization::materialize_to_sqlite(
+codex-rs/thread-store/src/local/paginated_fork.rs:110:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/revert_thread.rs:88:        super::thread_history_materialization::materialize_to_sqlite(
+codex-rs/thread-store/src/local/search_threads.rs:247:    let thread_history_modes = items
+codex-rs/thread-store/src/local/search_threads.rs:251:    let names = resolve_thread_names(store, &thread_history_modes).await;
+codex-rs/thread-store/src/local/thread_history.rs:61:    let db_path = store.config.sqlite.thread_history_db_path();
+codex-rs/thread-store/src/local/thread_history.rs:64:        .map_err(thread_history_error)?
+codex-rs/thread-store/src/local/thread_history.rs:69:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/thread_history.rs:73:FROM thread_history_projection_state
+codex-rs/thread-store/src/local/thread_history.rs:80:    .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:111:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/thread_history.rs:118:        .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:123:FROM thread_history_projection_state
+codex-rs/thread-store/src/local/thread_history.rs:130:    .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:162:                    let item_json = serde_json::to_string(&item).map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:188:                    .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:225:INSERT INTO thread_history_projection_state (
+codex-rs/thread-store/src/local/thread_history.rs:240:    .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:241:    transaction.commit().await.map_err(thread_history_error)
+codex-rs/thread-store/src/local/thread_history.rs:248:    let db_path = store.config.sqlite.thread_history_db_path();
+codex-rs/thread-store/src/local/thread_history.rs:251:        .map_err(thread_history_delete_error)?
+codex-rs/thread-store/src/local/thread_history.rs:256:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/thread_history.rs:260:        .map_err(thread_history_delete_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:266:        .map_err(thread_history_delete_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:271:        .map_err(thread_history_delete_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:276:        .map_err(thread_history_delete_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:277:    sqlx::query("DELETE FROM thread_history_projection_state WHERE thread_id = ?")
+codex-rs/thread-store/src/local/thread_history.rs:281:        .map_err(thread_history_delete_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:285:        .map_err(thread_history_delete_error)
+codex-rs/thread-store/src/local/thread_history.rs:304:            .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:354:        .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:427:        .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:440:        let item_json = serde_json::to_string(&item.item).map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:472:        .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:493:                .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:514:                .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history.rs:557:fn thread_history_error(err: impl std::fmt::Display) -> ThreadStoreError {
+codex-rs/thread-store/src/local/thread_history.rs:565:        thread_history_error(err)
+codex-rs/thread-store/src/local/thread_history.rs:569:fn thread_history_delete_error(err: impl std::fmt::Display) -> ThreadStoreError {
+codex-rs/thread-store/src/local/thread_history/read.rs:108:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/thread_history/read.rs:166:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/thread_history/read.rs:245:    .map_err(super::thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history/read.rs:279:    .map_err(super::thread_history_error)
+codex-rs/thread-store/src/local/thread_history/read.rs:299:        .map_err(super::thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:1408:        .thread_history_db()
+codex-rs/thread-store/src/local/thread_history/realtime.rs:12:use super::thread_history_error;
+codex-rs/thread-store/src/local/thread_history/realtime.rs:56:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/thread_history/realtime.rs:149:        .bind(i64::try_from(remaining).map_err(thread_history_error)?)
+codex-rs/thread-store/src/local/thread_history/realtime.rs:152:        .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history/realtime.rs:155:            let position = u64::try_from(position).map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history/realtime.rs:158:                    .map_err(thread_history_error)?,
+codex-rs/thread-store/src/local/thread_history/realtime.rs:161:                    turn_id: turn_id.ok_or_else(|| thread_history_error("missing turn ID"))?,
+codex-rs/thread-store/src/local/thread_history/realtime.rs:164:                            .map_err(thread_history_error)?,
+codex-rs/thread-store/src/local/thread_history/realtime.rs:170:                        .map_err(thread_history_error)?
+codex-rs/thread-store/src/local/thread_history/realtime.rs:173:                _ => return Err(thread_history_error("invalid timeline entry kind")),
+codex-rs/thread-store/src/local/thread_history/realtime.rs:190:                .map_err(thread_history_error)
+codex-rs/thread-store/src/local/thread_history/realtime.rs:231:        .map_err(thread_history_error)?;
+codex-rs/thread-store/src/local/thread_history/search.rs:21:use super::thread_history_error;
+codex-rs/thread-store/src/local/thread_history/search.rs:89:    let pool = store.thread_history_db().await?;
+codex-rs/thread-store/src/local/thread_history/search.rs:169:        while let Some(row) = rows.try_next().await.map_err(thread_history_error)? {
+codex-rs/thread-store/src/local/thread_history/search.rs:295:    serde_json::to_string(&cursor).map_err(thread_history_error)
+codex-rs/thread-store/src/local/thread_history/segment_paging.rs:19:use super::thread_history_error;
+codex-rs/thread-store/src/local/thread_history/segment_paging.rs:156:                .map_err(thread_history_error)?
+codex-rs/thread-store/src/local/thread_history/segment_paging.rs:270:                .map_err(thread_history_error)?
+codex-rs/thread-store/src/local/thread_history/segment_paging.rs:335:        .map_err(thread_history_error)?
+codex-rs/thread-store/src/local/thread_history_materialization.rs:365:#[path = "thread_history_materialization_tests.rs"]
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:278:    let thread_history_db_path = sqlite.thread_history_db_path();
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:279:    for sqlite_path in [&state_db_path, &thread_history_db_path] {
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:346:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:425:FROM thread_history_projection_state
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:539:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:565:    sqlx::query("DELETE FROM thread_history_projection_state WHERE thread_id = ?")
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:740:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:754:        "SELECT next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?",
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:887:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1350:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1410:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1497:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1608:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1716:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1851:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1873:UPDATE thread_history_projection_state
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1938:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1978:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2064:        let pool = codex_state::open_thread_history_db(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2115:            .thread_history_db_path()
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2149:    fs::create_dir(store.config.sqlite.thread_history_db_path())
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2189:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2274:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2367:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2415:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2458:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2512:    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2522:    (SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = ?)
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2712:FROM thread_history_projection_state
+codex-rs/tui/src/app/event_dispatch.rs:1103:                self.enqueue_thread_history_entry_response(thread_id, event)
+codex-rs/tui/src/app/session_lifecycle.rs:1269:            app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
+codex-rs/tui/src/app/startup.rs:480:                    app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
+codex-rs/tui/src/app/tests.rs:1092:    app.enqueue_thread_history_entry_response(thread_id, event.clone())
+codex-rs/tui/src/app/tests/session_lifecycle_requests.rs:2777:    app_server.remember_thread_history_mode(paginated_thread_id, ThreadHistoryMode::Legacy);
+codex-rs/tui/src/app/thread_routing.rs:1470:    pub(super) async fn enqueue_thread_history_entry_response(
+codex-rs/tui/src/app/thread_routing.rs:1615:                    self.enqueue_thread_history_entry_response(thread_id, event)
+codex-rs/tui/src/app_server_session/rollout_history.rs:120:    pub(crate) fn remember_thread_history_mode(
+codex-rs/tui/src/app_server_session/rollout_history_tests.rs:267:    app_server.remember_thread_history_mode(thread_id, history_mode);
+codex-rs/tui/src/app_server_session/rollout_history_tests.rs:321:        app_server.remember_thread_history_mode(legacy_thread_id, ThreadHistoryMode::Legacy);
+codex-rs/tui/src/app_server_session/rollout_history_tests.rs:364:    app_server.remember_thread_history_mode(thread_id, ThreadHistoryMode::Legacy);
+codex-rs/tui/src/app_server_session/rollout_history_tests.rs:409:    app_server.remember_thread_history_mode(thread_id, ThreadHistoryMode::Legacy);
+codex-rs/tui/src/app_server_session/rollout_history_tests.rs:431:    app_server.remember_thread_history_mode(missing_thread_id, ThreadHistoryMode::Legacy);
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:882:async fn forked_thread_history_line_includes_name_and_id_snapshot() {
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:908:    assert_chatwidget_snapshot!("forked_thread_history_line", combined);
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:912:async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:937:    assert_chatwidget_snapshot!("forked_thread_history_line_without_name", combined);
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:998:async fn prompt_edit_thread_history_line_snapshot() {
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:1016:    assert_chatwidget_snapshot!("prompt_edit_thread_history_line", combined);
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:1020:async fn app_server_forked_thread_history_line_uses_app_server_title_snapshot() {
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:1056:    assert_chatwidget_snapshot!("app_server_forked_thread_history_line", combined);
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:1060:async fn app_server_forked_thread_history_line_without_app_server_name_ignores_local_snapshot() {
+codex-rs/tui/src/chatwidget/tests/history_replay.rs:1096:        "app_server_forked_thread_history_line_without_app_server_name",
+codex-rs/tui/src/chatwidget/tests/side.rs:7:async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
+codex-rs/tui/src/chatwidget/tests/side.rs:27:    assert_chatwidget_snapshot!("forked_thread_history_line_without_name", combined);
+codex-rs/tui/src/resume_picker.rs:835:    thread_history_modes: HashMap<ThreadId, ThreadHistoryMode>,
+codex-rs/tui/src/resume_picker.rs:1032:            thread_history_modes: HashMap::new(),
+codex-rs/tui/src/resume_picker.rs:1296:                            history_mode: self.thread_history_modes.get(&thread_id).copied(),
+codex-rs/tui/src/resume_picker.rs:1432:        self.thread_history_modes.clear();
+codex-rs/tui/src/resume_picker.rs:1573:        self.thread_history_modes.extend(history_modes);

@@ -1,0 +1,38 @@
+packages/ai/CHANGELOG.md:2190:- Fixed `SqliteAuthCredentialStore.open()` crashing with `SQLITE_BUSY_RECOVERY` (errno 261) when several `omp --session` panes restore concurrently after an unclean shutdown: `PRAGMA busy_timeout = 5000` now runs as a standalone statement BEFORE `PRAGMA journal_mode=WAL` (the first lock-taking statement during WAL recovery), and `open()` retries the BUSY family — `SQLITE_BUSY`, `SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_TIMEOUT` — with bounded exponential backoff. The exhausted-retry error message includes the DB path. Exported `isSqliteBusyError(err)` for callers that need the same classifier ([#2421](https://github.com/can1357/oh-my-pi/issues/2421)).
+packages/ai/src/auth/blocks.ts:180:			// Advisory read: transient failures (e.g. SQLITE_BUSY) fall back to
+packages/ai/src/auth/sqlite-credential-store.ts:566:		// `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY`. Re-setting when opened via
+packages/ai/test/auth-storage-close-releases-handles.test.ts:5: * An unfinalized statement makes `sqlite3_close()` return SQLITE_BUSY, which
+packages/ai/test/auth-storage-close-releases-handles.test.ts:40:		// the closed store makes this throw SQLITE_BUSY.
+packages/ai/test/auth-storage-sqlite-busy.test.ts:5: * sees `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY` before its multi-statement run
+packages/ai/test/auth-storage-sqlite-busy.test.ts:33:		expect(isSqliteBusyError(makeBusyError("SQLITE_BUSY", 5))).toBe(true);
+packages/ai/test/auth-storage-sqlite-busy.test.ts:34:		expect(isSqliteBusyError(makeBusyError("SQLITE_BUSY_RECOVERY", 261))).toBe(true);
+packages/ai/test/auth-storage-sqlite-busy.test.ts:35:		expect(isSqliteBusyError(makeBusyError("SQLITE_BUSY_SNAPSHOT", 517))).toBe(true);
+packages/ai/test/auth-storage-sqlite-busy.test.ts:36:		expect(isSqliteBusyError(makeBusyError("SQLITE_BUSY_TIMEOUT", 773))).toBe(true);
+packages/ai/test/auth-storage-sqlite-busy.test.ts:45:		expect(isSqliteBusyError("SQLITE_BUSY")).toBe(false);
+packages/ai/test/auth-storage-sqlite-busy.test.ts:49:describe("SqliteAuthCredentialStore.open SQLITE_BUSY handling", () => {
+packages/ai/test/auth-storage-sqlite-busy.test.ts:141:	test("retries through a transient SQLITE_BUSY_RECOVERY and eventually succeeds", async () => {
+packages/ai/test/auth-storage-sqlite-busy.test.ts:146:		// throw `SQLITE_BUSY_RECOVERY`, then the third attempt sees the spy
+packages/ai/test/auth-storage-sqlite-busy.test.ts:155:				throw makeBusyError("SQLITE_BUSY_RECOVERY", 261);
+packages/ai/test/auth-storage-sqlite-busy.test.ts:199:			throw makeBusyError("SQLITE_BUSY_RECOVERY", 261);
+packages/catalog/CHANGELOG.md:519:- Fixed a physically corrupt `models.db` (`SQLITE_CORRUPT*` / `SQLITE_NOTADB`, "database disk image is malformed") permanently disabling the model cache. The shared read/write paths swallowed unrecoverable SQLite corruption as a best-effort miss and cached the broken handle, so a successful live catalog could never overwrite the corrupt cache and every later process repeated the miss — a runtime provider extension with no bundled catalog was left with only its bootstrap model. Corruption now self-heals: the cache closes the handle, quarantines `models.db`(+`-wal`/`-shm`) aside, recreates a fresh database, and retries the operation once; `SQLITE_BUSY`, permission, and unrelated errors keep their existing best-effort paths ([#8867](https://github.com/can1357/oh-my-pi/issues/8867)).
+packages/catalog/CHANGELOG.md:1517:- Fixed the model cache opening with `PRAGMA journal_mode=WAL` before `PRAGMA busy_timeout`, so concurrent omp startups could crash inside `getDb()` on `SQLITE_BUSY` during WAL recovery instead of waiting through the transient lock. The busy handler is now installed before the first lock-taking statement ([#2421](https://github.com/can1357/oh-my-pi/issues/2421)).
+packages/coding-agent/src/mnemopi/state.ts:757:		const busyTimeoutMs = Math.max(1, Math.floor(timeoutMs));
+packages/coding-agent/src/mnemopi/state.ts:758:		for (const memory of this.scoped.owned) memory.beam.db.exec(`PRAGMA busy_timeout=${busyTimeoutMs}`);
+packages/coding-agent/src/session/agent-storage.ts:363:	 * Retries on the `SQLITE_BUSY` family (including `SQLITE_BUSY_RECOVERY`) with
+packages/coding-agent/src/session/session-storage.ts:15:/** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
+packages/coding-agent/src/session/session-storage.ts:221:			SESSION_WRITE_FLAGS | (flags === "w" ? fs.constants.O_TRUNC : fs.constants.O_APPEND),
+packages/coding-agent/src/session/session-storage.ts:242:		const nextFd = openCloexecSync(this.#fpath, SESSION_WRITE_FLAGS | fs.constants.O_APPEND);
+packages/coding-agent/src/session/snapcompact-savings-journal.ts:11: * Newline-delimited JSON, opened with O_APPEND so concurrent appenders (parallel
+packages/coding-agent/test/memory-tools.test.ts:1018:			// Signal first: the exec below may throw SQLITE_BUSY while the lock is
+packages/metaharness/src/store.ts:153:		return typeof code === "string" && code.startsWith("SQLITE_BUSY");
+packages/metaharness/src/store.ts:163: * SQLite returns `SQLITE_BUSY`/`SQLITE_BUSY_RECOVERY`. The busy handler that
+packages/mnemopi/test/local-llm.test.ts:30:// and throw SQLITE_BUSY at initBeam once busy_timeout is exceeded (#9886).
+packages/stats/CHANGELOG.md:259:- Fixed the stats dashboard's SQLite init never setting `PRAGMA busy_timeout`, so a concurrent `omp` startup hitting WAL recovery could crash `initDb()` with `SQLITE_BUSY` instead of waiting through it. The busy handler is now installed before `PRAGMA journal_mode=WAL` ([#2421](https://github.com/can1357/oh-my-pi/issues/2421)).
+packages/utils/src/env.ts:446: * (SQLITE_BUSY during WAL recovery/checkpoint — see oh-my-pi#2421): the
+packages/utils/src/fs-open.ts:27: * const fd = openCloexecSync(logPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND);
+packages/utils/src/logger/rotating-file.ts:77:		this.#fd = openCloexecSync(filePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND);
+packages/utils/src/sqlite.ts:253: * SQLite's busy result-code family — base `SQLITE_BUSY` plus the extended
+packages/utils/src/sqlite.ts:254: * variants `SQLITE_BUSY_RECOVERY` (concurrent WAL recovery), `SQLITE_BUSY_SNAPSHOT`,
+packages/utils/src/sqlite.ts:255: * and `SQLITE_BUSY_TIMEOUT`. All warrant the same backoff-and-retry treatment.
+packages/utils/src/sqlite.ts:260:	return typeof code === "string" && code.startsWith("SQLITE_BUSY");
+packages/utils/test/fs-open.test.ts:29:	const fd = openCloexecSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND, 0o600);

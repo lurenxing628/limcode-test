@@ -1,0 +1,5 @@
+packages/core/src/database/migration.ts:74:            INSERT OR IGNORE INTO ${sql.identifier("migration")} (id, time_completed)
+packages/core/src/database/migration.ts:96:              INSERT OR IGNORE INTO ${sql.identifier("migration")} (id, time_completed)
+packages/core/src/database/v1-migration.bun.ts:544:          INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated, time_active, sandboxes)
+packages/core/src/database/v1-migration.bun.ts:611:                  INSERT OR IGNORE INTO session_v2 (
+packages/core/src/database/v1-migration.bun.ts:772:                  INSERT OR IGNORE INTO project (

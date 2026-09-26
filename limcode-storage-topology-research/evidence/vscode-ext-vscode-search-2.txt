@@ -1,0 +1,2 @@
+extensions/copilot/src/platform/chronicle/node/sessionStore.ts:125:				db.exec('PRAGMA journal_mode = DELETE');
+extensions/copilot/src/platform/chronicle/node/sessionStore.ts:126:				db.exec('PRAGMA busy_timeout = 10000');

@@ -1,0 +1,56 @@
+{
+  "v0.0.9": {
+    "commit": "f8d214ee97b87b7fb7f77ba0158dfbbbb63bcecc",
+    "date": "2026-07-26T14:13:40+08:00",
+    "epochDeclaration": []
+  },
+  "v0.0.10": {
+    "commit": "efc150f554b2ab9d5aefd0f55dc64b96b320f3b6",
+    "date": "2026-08-11T22:52:20+08:00",
+    "epochDeclaration": [
+      "export const RUNTIME_KERNEL_EPOCH = 3;"
+    ]
+  },
+  "v0.0.14": {
+    "commit": "94c2e57e267a743cc0a691a970823c9fe89450e1",
+    "date": "2026-08-19T13:10:31+08:00",
+    "epochDeclaration": [
+      "export const RUNTIME_KERNEL_EPOCH = 3;"
+    ]
+  },
+  "v0.0.15": {
+    "commit": "5a3ddf7dcbf4523c0494ee1f5670ffc01262f080",
+    "date": "2026-08-23T01:58:22+08:00",
+    "epochDeclaration": [
+      "export const RUNTIME_KERNEL_EPOCH = 4;"
+    ]
+  },
+  "v0.0.21": {
+    "commit": "8a7ba677a6fe5b4fc79dec474ccdb4206d09b823",
+    "date": "2026-09-13T02:35:37+08:00",
+    "epochDeclaration": [
+      "export const RUNTIME_KERNEL_EPOCH = 4;"
+    ]
+  },
+  "v0.0.24": {
+    "commit": "bdc477a48ab7b4688c0b23791c2bb3ad10500681",
+    "date": "2026-09-24T20:59:39+08:00",
+    "epochDeclaration": [
+      "export const RUNTIME_KERNEL_EPOCH = 5;"
+    ]
+  },
+  "v0.0.25": {
+    "commit": "0666e026cd9998d0e57ed9d6842fc3e5bd3cb4a1",
+    "date": "2026-09-24T14:40:23Z",
+    "epochDeclaration": [
+      "export const RUNTIME_KERNEL_EPOCH = 5;"
+    ]
+  },
+  "v0.0.28": {
+    "commit": "e760950f890f03ab310f4141d4e0a448bfd9b9e9",
+    "date": "2026-09-25T14:59:48Z",
+    "epochDeclaration": [
+      "export const RUNTIME_KERNEL_EPOCH = 5;"
+    ]
+  }
+}

@@ -1,0 +1,109 @@
+codex-rs/thread-store/src/error.rs:10:    if matches!(history_mode, ThreadHistoryMode::Paginated) {
+codex-rs/thread-store/src/in_memory.rs:347:                .history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/in_memory.rs:355:            meta_line.meta.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/in_memory.rs:366:        assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
+codex-rs/thread-store/src/in_memory.rs:377:        assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
+codex-rs/thread-store/src/in_memory.rs:423:                    ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/live_thread.rs:190:        let metadata = if history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/archive_thread.rs:186:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/archive_thread.rs:224:                ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:380:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:390:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:430:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:440:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:458:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:523:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:533:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:572:                ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:673:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/delete_thread.rs:757:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/helpers.rs:258:                ThreadHistoryMode::Paginated => sqlite_thread_name(&metadata),
+codex-rs/thread-store/src/local/helpers.rs:268:        // Legacy titles remain authoritative when present; the index only fills
+codex-rs/thread-store/src/local/helpers.rs:287:    if thread.history_mode == ThreadHistoryMode::Paginated || thread.preview.trim() != name.trim() {
+codex-rs/thread-store/src/local/list_threads.rs:512:        builder.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/mod.rs:952:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/mod.rs:965:        builder.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/mod.rs:978:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/mod.rs:1031:        params.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/mod.rs:1428:        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+codex-rs/thread-store/src/local/mod.rs:1458:        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+codex-rs/thread-store/src/local/mod.rs:1581:        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+codex-rs/thread-store/src/local/mod.rs:1689:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/mod.rs:1942:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/mod.rs:1954:        assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
+codex-rs/thread-store/src/local/mod.rs:1965:        assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
+codex-rs/thread-store/src/local/mod.rs:2015:        create_params.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/model_context.rs:69:    let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated) {
+codex-rs/thread-store/src/local/model_context_tests.rs:656:        write_session_file_with_history_mode(home, timestamp, uuid, ThreadHistoryMode::Paginated)
+codex-rs/thread-store/src/local/model_context_tests.rs:669:        write_session_file_with_history_mode(home, timestamp, uuid, ThreadHistoryMode::Paginated)
+codex-rs/thread-store/src/local/read_thread.rs:148:        if thread.history_mode == ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/read_thread.rs:375:        ThreadHistoryMode::Paginated => sqlite_thread_name(&metadata),
+codex-rs/thread-store/src/local/read_thread.rs:438:        ThreadHistoryMode::Paginated => sqlite_thread_name(metadata),
+codex-rs/thread-store/src/local/read_thread.rs:861:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/read_thread.rs:892:        builder.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/revert_thread.rs:66:    if source_meta.history_mode != ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/revert_thread.rs:177:    .with_history_mode(ThreadHistoryMode::Paginated)
+codex-rs/thread-store/src/local/revert_thread_tests.rs:246:            history_mode: ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/rollout_lineage.rs:138:            if meta.meta.history_mode != ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/rollout_lineage_tests.rs:284:                history_mode: ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/rollout_migration.rs:476:            == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration.rs:481:        if metadata.meta.history_mode == ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/rollout_migration.rs:1058:        if metadata.meta.history_mode == ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/rollout_migration.rs:1098:            if metadata.history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration/canonicalizer.rs:93:        metadata.meta.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/rollout_migration/canonicalizer.rs:281:                    if codex_rollout::is_persisted_rollout_item(&item, ThreadHistoryMode::Paginated)
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:34:    let paginated = history_mode == ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:128:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:134:        write_rollout(home.path(), newer_thread_id, ThreadHistoryMode::Paginated),
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:172:        write_rollout(home.path(), ThreadId::new(), ThreadHistoryMode::Paginated),
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:197:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:243:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:291:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:330:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:414:        write_rollout(home.path(), newest_thread_id, ThreadHistoryMode::Paginated),
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:473:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:487:    write_rollout(home.path(), ThreadId::new(), ThreadHistoryMode::Paginated);
+codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs:546:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:360:            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:637:                && metadata.meta.history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:1741:                && metadata.meta.history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:1950:            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:2099:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:2154:            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:2198:            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/rollout_migration_tests.rs:2591:        ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/test_support.rs:114:    if matches!(history_mode, ThreadHistoryMode::Paginated) {
+codex-rs/thread-store/src/local/thread_history/read.rs:202:        ThreadHistoryMode::Paginated => Ok(()),
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:35:    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:132:    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:237:    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:394:    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:499:    let (home, store, child_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:616:    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:752:    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:769:    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:855:    let (home, store, child_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:1066:        store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:1082:    let (home, store, child_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:1138:    let (home, store, child_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:1290:    if history_mode == ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/thread_history/read_tests.rs:1341:                history_mode: ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:130:        .with_history_mode(ThreadHistoryMode::Paginated)
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:192:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:1568:    builder.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/local/thread_history_materialization_tests.rs:2586:            history_mode: ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/thread_rollout_resolver.rs:92:                // authoritative: after `thread/revert`, a scan could find an older immutable
+codex-rs/thread-store/src/local/thread_rollout_resolver.rs:107:                if metadata.history_mode == ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/thread_rollout_resolver.rs:205:            if history_mode == ThreadHistoryMode::Paginated {
+codex-rs/thread-store/src/local/update_thread_metadata.rs:96:    let paginated = matches!(history_mode, Some(ThreadHistoryMode::Paginated));
+codex-rs/thread-store/src/local/update_thread_metadata.rs:419:                // explicit paginated patch makes SQLite metadata authoritative.
+codex-rs/thread-store/src/local/update_thread_metadata.rs:551:                    ThreadHistoryMode::Paginated => {
+codex-rs/thread-store/src/local/update_thread_metadata.rs:1128:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/update_thread_metadata.rs:1313:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/update_thread_metadata.rs:1376:            ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/local/update_thread_metadata.rs:2137:            ThreadHistoryMode::Paginated,
+codex-rs/thread-store/src/local/update_thread_metadata.rs:2161:        assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
+codex-rs/thread-store/src/local/update_thread_metadata.rs:2169:            ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/thread_metadata_sync.rs:209:            ThreadHistoryMode::Paginated
+codex-rs/thread-store/src/thread_metadata_sync.rs:746:        meta.meta.history_mode = ThreadHistoryMode::Paginated;
+codex-rs/thread-store/src/types.rs:1052:                session_meta(ThreadHistoryMode::Paginated),

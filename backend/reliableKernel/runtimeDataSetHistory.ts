@@ -55,7 +55,7 @@ export async function openRuntimeDataSetHistory(
     if (candidate.selected) throw new Error('Use the active conversation view for the selected Runtime data set.');
     const historical = await requireCompleteRuntimeDataSet(candidate);
     if (historical.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
-      throw Object.assign(new Error('此历史库仍使用旧 Runtime 格式。请在“历史与存储管理”中选择该库并重载窗口，完成备份和离线升级后再读取；原数据保持不变。'), {
+      throw Object.assign(new Error('此旧历史库尚未完成自动备份升级，暂时不能读取。请查看自动升级失败原因；原数据未被重置。'), {
         code: 'runtime-history-offline-upgrade-required'
       });
     }

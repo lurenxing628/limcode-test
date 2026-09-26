@@ -487,6 +487,15 @@ function validateMigration(root, migration, failures) {
   failures.push(...exactSetProblems('epoch升级保留对象',
     ['runtime-rows', 'cas', 'sqlite-backup', 'runtime-archive', 'configuration', 'workspace'],
     migration?.schemaUpgradePolicy?.preserve ?? []));
+  failures.push(...exactSetProblems('旧历史自动升级触发点',
+    ['selected-root-startup', 'other-roots-after-startup', 'history-open'], upgrade?.automaticTriggers ?? []));
+  if (upgrade?.requiresUserConfirmation !== false
+    || upgrade?.targetHostPolicy !== 'target-offline-current-other-data-set-may-run'
+    || upgrade?.sourceFailurePolicy !== 'report-per-source-and-continue-other-sources'
+    || upgrade?.selectionPolicy !== 'preserve-selection-no-implicit-merge'
+    || upgrade?.historicalExecutionPolicy !== 'no-host-registration-or-task-recovery') {
+    failures.push('旧历史必须自动备份升级，仅要求目标离线；逐库报告失败，不切换当前库或执行旧任务');
+  }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
   }
@@ -626,6 +635,10 @@ function validateAuthority(authority, migration, failures) {
   }
   if (authority?.rootPolicy?.mode !== 'offline-restart-only' || authority?.rootPolicy?.onlineMigration !== false) {
     failures.push('换根只能离线并在重启后完成');
+  }
+  if (authority?.rootPolicy?.historicalEpochUpgrade !== 'automatic-backup-then-exact-target-offline-upgrade'
+    || authority?.rootPolicy?.historyDiscovery !== 'per-candidate-errors-no-implicit-fallback') {
+    failures.push('历史发现必须隔离逐库错误，旧格式自动备份精确升级且禁止隐式换库');
   }
   failures.push(...exactSetProblems('RootBinding字段', ROOT_BINDING_FIELDS, authority?.rootPolicy?.rootBindingFields ?? []));
   if (authority?.rootPolicy?.hostRegistration !== 'serialized-with-runtime-maintenance'

@@ -1,0 +1,207 @@
+{
+  "sqliteVersion": "3.53.4",
+  "distribution": "90% project0, remaining four skewed projects; exact current three-table DDL/indexes; warm cache; 15 repeats",
+  "queries": {
+    "page": "SELECT id,title,status,created_at,updated_at FROM conversation WHERE EXISTS(SELECT 1 FROM conversation_project_link l JOIN project_context p ON p.id=l.project_context_id WHERE l.conversation_id=conversation.id AND l.role='primary' AND p.uri=?) ORDER BY updated_at DESC,id DESC LIMIT 51",
+    "countOriginal": "SELECT COUNT(*) n FROM conversation WHERE EXISTS(SELECT 1 FROM conversation_project_link l JOIN project_context p ON p.id=l.project_context_id WHERE l.conversation_id=conversation.id AND l.role='primary' AND p.uri=?)",
+    "countViaLink": "SELECT COUNT(*) n FROM conversation_project_link l JOIN project_context p ON p.id=l.project_context_id WHERE p.uri=? AND l.role='primary'"
+  },
+  "results": [
+    {
+      "n": 20000,
+      "project": 0,
+      "records": {
+        "page": {
+          "ms": {
+            "n": 15,
+            "p50": 0.09201100000001361,
+            "p95": 0.1574640000000045,
+            "max": 0.1574640000000045
+          },
+          "count": 51,
+          "plan": [
+            "SCAN conversation USING INDEX ix_conversation_01",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countOriginal": {
+          "ms": {
+            "n": 15,
+            "p50": 14.436141999999961,
+            "p95": 16.044780000000003,
+            "max": 16.044780000000003
+          },
+          "count": 18000,
+          "plan": [
+            "SCAN conversation USING COVERING INDEX sqlite_autoindex_conversation_1",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countViaLink": {
+          "ms": {
+            "n": 15,
+            "p50": 1.51448199999993,
+            "p95": 1.6276139999999941,
+            "max": 1.6276139999999941
+          },
+          "count": 18000,
+          "plan": [
+            "SEARCH p USING INDEX ux_project_context_01 (uri=?)",
+            "SEARCH l USING INDEX ix_conversation_project_link_02 (project_context_id=?)"
+          ]
+        }
+      }
+    },
+    {
+      "n": 20000,
+      "project": 1,
+      "records": {
+        "page": {
+          "ms": {
+            "n": 15,
+            "p50": 1.8279369999999062,
+            "p95": 1.9455460000000357,
+            "max": 1.9455460000000357
+          },
+          "count": 51,
+          "plan": [
+            "SCAN conversation USING INDEX ix_conversation_01",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countOriginal": {
+          "ms": {
+            "n": 15,
+            "p50": 15.321140000000014,
+            "p95": 16.334790999999996,
+            "max": 16.334790999999996
+          },
+          "count": 400,
+          "plan": [
+            "SCAN conversation USING COVERING INDEX sqlite_autoindex_conversation_1",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countViaLink": {
+          "ms": {
+            "n": 15,
+            "p50": 0.1031430000000455,
+            "p95": 0.12586499999997613,
+            "max": 0.12586499999997613
+          },
+          "count": 400,
+          "plan": [
+            "SEARCH p USING INDEX ux_project_context_01 (uri=?)",
+            "SEARCH l USING INDEX ix_conversation_project_link_02 (project_context_id=?)"
+          ]
+        }
+      }
+    },
+    {
+      "n": 100000,
+      "project": 0,
+      "records": {
+        "page": {
+          "ms": {
+            "n": 15,
+            "p50": 0.08954600000015489,
+            "p95": 0.135522999999921,
+            "max": 0.135522999999921
+          },
+          "count": 51,
+          "plan": [
+            "SCAN conversation USING INDEX ix_conversation_01",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countOriginal": {
+          "ms": {
+            "n": 15,
+            "p50": 83.0134109999999,
+            "p95": 85.66321100000005,
+            "max": 85.66321100000005
+          },
+          "count": 90000,
+          "plan": [
+            "SCAN conversation USING COVERING INDEX sqlite_autoindex_conversation_1",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countViaLink": {
+          "ms": {
+            "n": 15,
+            "p50": 15.061938999999711,
+            "p95": 16.254351000000042,
+            "max": 16.254351000000042
+          },
+          "count": 90000,
+          "plan": [
+            "SEARCH p USING INDEX ux_project_context_01 (uri=?)",
+            "SEARCH l USING INDEX ix_conversation_project_link_02 (project_context_id=?)"
+          ]
+        }
+      }
+    },
+    {
+      "n": 100000,
+      "project": 1,
+      "records": {
+        "page": {
+          "ms": {
+            "n": 15,
+            "p50": 1.8916860000003908,
+            "p95": 2.3386900000000423,
+            "max": 2.3386900000000423
+          },
+          "count": 51,
+          "plan": [
+            "SCAN conversation USING INDEX ix_conversation_01",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countOriginal": {
+          "ms": {
+            "n": 15,
+            "p50": 82.21446100000048,
+            "p95": 83.99445000000014,
+            "max": 83.99445000000014
+          },
+          "count": 2000,
+          "plan": [
+            "SCAN conversation USING COVERING INDEX sqlite_autoindex_conversation_1",
+            "CORRELATED SCALAR SUBQUERY 1",
+            "SEARCH l USING INDEX ux_conversation_project_link_01 (conversation_id=?)",
+            "SEARCH p USING INDEX sqlite_autoindex_project_context_1 (id=?)"
+          ]
+        },
+        "countViaLink": {
+          "ms": {
+            "n": 15,
+            "p50": 0.616689999999835,
+            "p95": 1.0434559999994235,
+            "max": 1.0434559999994235
+          },
+          "count": 2000,
+          "plan": [
+            "SEARCH p USING INDEX ux_project_context_01 (uri=?)",
+            "SEARCH l USING INDEX ix_conversation_project_link_02 (project_context_id=?)"
+          ]
+        }
+      }
+    }
+  ]
+}

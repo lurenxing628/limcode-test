@@ -1,0 +1,18 @@
+{
+  "file": "limcode-test-0.0.24-linux-x64.vsix",
+  "sha256": "092162fbbfb053e6dd3ab352fab595031c0f5ede15540c617ef67392cb700f52",
+  "packageVersion": "0.0.24",
+  "buildProvenance": {
+    "commitSha": "bdc477a48ab7b4688c0b23791c2bb3ad10500681",
+    "mainEntrySha256": "f5b7bde1872aae1a8126c3175ffebb845b6e7623d16d5ef2e8c851a95c919db3",
+    "worktreeClean": true
+  },
+  "epochLines": [
+    "exports.RUNTIME_EPOCH_FILE = exports.ROOT_BINDING_PENDING_FILE = exports.ROOT_BINDING_POINTER_FILE = exports.RUNTIME_CAS_DIRECTORY = exports.RUNTIME_DATABASE_FILE = exports.RUNTIME_KERNEL_EPOCH = void 0;",
+    "exports.RUNTIME_KERNEL_EPOCH = 5;"
+  ],
+  "selectionLines": [
+    "exports.VSCODE_RUNTIME_SELECTION_FILE = '.limcode-runtime-selection.json';",
+    "* A configuration root has one fixed Runtime selection. The workspace is retained as execution"
+  ]
+}

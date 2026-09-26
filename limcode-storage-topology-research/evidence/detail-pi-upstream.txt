@@ -1,0 +1,16 @@
+packages/coding-agent/src/core/session-manager.ts:589:function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgentDir()): string {
+packages/coding-agent/src/core/session-manager.ts:596:export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {
+packages/coding-agent/src/core/session-manager.ts:597:	const sessionDir = getDefaultSessionDirPath(cwd, agentDir);
+packages/coding-agent/src/core/session-manager.ts:1149:		return this.sessionDir === getDefaultSessionDirPath(this.cwd);
+packages/coding-agent/src/core/session-manager.ts:1751:		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+packages/coding-agent/src/core/session-manager.ts:1789:		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+packages/coding-agent/src/core/session-manager.ts:1790:		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+packages/coding-agent/src/core/session-manager.ts:1828:		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
+packages/coding-agent/src/core/session-manager.ts:1870:		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+packages/coding-agent/src/core/session-manager.ts:1871:		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+packages/coding-agent/src/core/session-manager.ts:1901:		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+packages/coding-agent/src/core/session-manager.ts:1902:		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+packages/coding-agent/src/core/session-manager.ts:1944:		const sessionsDir = getSessionsDir();
+packages/coding-agent/src/core/session-manager.ts:1947:			if (!existsSync(sessionsDir)) return [];
+packages/coding-agent/src/core/session-manager.ts:1948:			const entries = await readdir(sessionsDir, { withFileTypes: true });
+packages/coding-agent/src/core/session-manager.ts:1951:				.map((entry) => join(sessionsDir, entry.name));

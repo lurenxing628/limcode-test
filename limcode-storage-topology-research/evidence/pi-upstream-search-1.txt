@@ -1,0 +1,28 @@
+packages/agent/README.md:13:The SQLite session backend and the `node:sqlite` adapter live in a separate package, `@earendil-works/pi-session-backend-sqlite-node`, so the core package does not pull in runtime builtins or native SQLite dependencies by default. The backend accepts a runtime-specific SQLite factory, allowing other session backends to ship as their own packages in the future.
+packages/agent/docs/harness.md:371:Backend: `packages/session-backends/sqlite-node`. **One database file per session is the default; a shared container is supported.** Without `databasePath`, safe alphanumeric/underscore/hyphen ids retain `{id}.sqlite`; every other explicit id uses a `~`-prefixed base64url encoding of its UTF-16 code units, so separators, dots, percent signs, and Unicode cannot escape `directory`. With `databasePath`, any number of Sessions share one container. Metadata reports the canonical physical container path. Every authoritative and projection row is scoped by `session_id`; shared containers are a supported deployment mode, not an implementation detail to remove. SQLite supplies atomic transactions and coherent WAL snapshots, not Session ownership.
+packages/agent/docs/mobile-handoff/01-harness/02-scopes/implementation-handoff.md:38:11. `packages/session-backends/sqlite-node/src/{index,sqlite/index}.ts`, `sqlite/{storage,repo}.ts`, `migrations/001_initial.sql`, and `session/{values,session-sequences}.ts`.
+packages/agent/docs/mobile-handoff/01-harness/02-scopes/implementation-handoff.md:475:MODIFY packages/session-backends/sqlite-node/src/sqlite/session/{values,session-sequences}.ts
+packages/agent/docs/work-packages/01-bound-values-lists.md:67:- `packages/session-backends/sqlite-node/src/sqlite/session/values.ts`
+packages/agent/docs/work-packages/01-bound-values-lists.md:71:- delete `packages/session-backends/sqlite-node/src/sqlite/session/registers.ts` after moving its scalar behavior to `values.ts`;
+packages/agent/docs/work-packages/01-bound-values-lists.md:124:- `packages/session-backends/sqlite-node/src/sqlite/session.ts`
+packages/agent/docs/work-packages/06-session-branch-lane-separation.md:26:7. `packages/session-backends/sqlite-node/src/sqlite/session.ts`, `storage.ts`, and repo implementation.
+packages/agent/docs/work-packages/06-session-branch-lane-separation.md:522:- `packages/session-backends/sqlite-node/src/sqlite/session.ts` and repo creation.
+packages/agent/docs/work-packages/07-sqlite-host-ownership-live-forks.md:101:- delete `src/sqlite/session/writer-lease.ts`;
+packages/agent/docs/work-packages/07-sqlite-host-ownership-live-forks.md:188:- delete `src/sqlite/session/writer-lease.ts`;
+packages/agent/docs/work-packages/07-sqlite-host-ownership-live-forks.md:190:- `src/sqlite/session/session-row.ts`;
+packages/agent/docs/work-packages/07-sqlite-host-ownership-live-forks.md:192:- `src/sqlite/session.ts`;
+packages/agent/docs/work-packages/08-named-branch-streaming-forks.md:19:7. `packages/session-backends/sqlite-node/src/sqlite/repo.ts`, `storage.ts`, `session/values.ts`, `session/entries.ts`, `session/branch-entries.ts`, `types.ts`.
+packages/agent/docs/work-packages/08-named-branch-streaming-forks.md:123:6. Documentation: `harness.md` §2.7 (and the §1.7 fork-related sentences), `values.md` "Forks and rewrites" and backend snapshot mentions, `post-wp05-roadmap.md` (retire the SQLite fork-cost item, add/point to this package), `packages/session-backends/sqlite-node/README.md` fork paragraphs, `packages/agent/benchmark/session/README.md` if dataset wording changes. Historical WP docs and released changelogs untouched. Format/storage versions unchanged; no migration.
+packages/agent/docs/work-packages/08-named-branch-streaming-forks.md:146:Files: `sqlite/repo.ts`, `sqlite/storage.ts`, `sqlite/session/values.ts`, `sqlite/session/entries.ts`, `sqlite/session/branch-entries.ts`, `sqlite/types.ts`, `test/repo.test.ts`, `test/repo-conformance.test.ts`.
+packages/durable/README.md:25:const sqlite = await openNodeSqliteStorage("./session.sqlite");
+packages/session-backends/sqlite-node/CHANGELOG.md:37:- Renamed the package from `@earendil-works/pi-storage-sqlite-node` to `@earendil-works/pi-session-backend-sqlite-node`.
+packages/session-backends/sqlite-node/benchmark/session/session-repo-targets.ts:18:			const directory = await mkdtemp(join(tmpdir(), "pi-sqlite-session-repo-benchmark-"));
+packages/session-backends/sqlite-node/package.json:4:	"description": "Node sqlite session backend for @earendil-works/pi-agent-core sessions",
+packages/session-backends/sqlite-node/src/sqlite/repo.ts:34:	/** Optional single container path. Defaults to one encoded `${id}.sqlite` file per session under directory. */
+packages/session-backends/sqlite-node/test/repo-conformance.test.ts:29:	currentDirectory = await mkdtemp(join(tmpdir(), "pi-sqlite-session-repo-conformance-"));
+packages/session-backends/sqlite-node/test/repo-conformance.test.ts:38:	currentSharedDirectory = await mkdtemp(join(tmpdir(), "pi-sqlite-session-repo-shared-conformance-"));
+packages/session-backends/sqlite-node/test/repo.test.ts:23:	const directory = await mkdtemp(join(tmpdir(), "pi-sqlite-session-"));
+packages/session-backends/sqlite-node/test/storage.test.ts:13:import { advanceNextSeq, readNextSeq } from "../src/sqlite/session/session-sequences.ts";
+packages/session-backends/sqlite-node/test/storage.test.ts:14:import { listValueReadQuery } from "../src/sqlite/session/values.ts";
+scripts/local-release.mjs:18:	{ directory: "packages/session-backends/sqlite-node", name: "@earendil-works/pi-session-backend-sqlite-node" },
+tsconfig.json:35:			"@earendil-works/pi-session-backend-sqlite-node": ["./packages/session-backends/sqlite-node/src/index.ts"],

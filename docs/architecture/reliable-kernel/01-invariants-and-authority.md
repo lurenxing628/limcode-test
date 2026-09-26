@@ -302,7 +302,11 @@ SQLite long-lived connection 只能缓存由 RootAuthority 建立的 immutable f
 
 最终 VSIX 的 cutover-only coordinator 是 archive actor。它按 physical manifest journaled archive Runtime、filter settings/scope links、验证配置与外部 untouched 项，再创建 SQLite/CAS/epoch 并原子切 pointer。激活前失败按 journal 恢复；激活后不自动回退旧 writer。
 
-已落盘 SQLite epoch 3 到当前 epoch 4 只允许在 Extension Host 重启后的数据库打开前做一次精确、有界升级：只接受从 0.0.10–0.0.11 与 0.0.12–0.0.14 已发布 VSIX 提取出的两个完整 manifest 指纹；它们仅在 `ModelContextProjection` 的 `detail`/`summary` client mapping 与对应 digest 上不同，物理 DDL 和其余 86 个领域必须完全一致，不能泛化为任意同 epoch 漂移。升级先校验完整 table/index/trigger DDL、manifest 与 RootBinding predecessor 指纹并生成一致性备份，再写 pending writer fence，以单个 SQLite 事务新增包括 `RuntimeDeliveryIntentLink` 在内的四张关系表、刷新 schema manifest 与 RootBinding，并通过 durable journal 向前收敛。Windows 的持久化合同仍使用 canonical path，仅 SQLite 原生 I/O 使用 namespaced path，以保证深层备份路径可打开。既有对话、消息、附件和 CAS identity 全部保持不变；仅对稳定 id、CommandReceipt、RuntimeDelivery 与旧 CAS envelope 全部吻合的 Child Runtime continuation 发布当前 CAS，并重指向其 intent/preset revision、补独立 Link，不保留运行时 fallback。未知 schema、缺失备份或绑定冲突都 fail closed。
+已发布 SQLite epoch 3/4 只允许按精确来源离线升级到当前 epoch 5。epoch 3 的完整 manifest 分为 v0.0.10–v0.0.12 的 `ModelContextProjection.client=detail` 与 v0.0.13–v0.0.14 的 `summary`；二者物理 DDL 和其余 86 个领域完全相同。v0.0.15–v0.0.21 的正常新建 epoch 4 为完整 91 领域；额外接受的缺 RuntimeDeliveryIntentLink 前驱仍须通过单一精确指纹与 continuation 语义校验，不能由任意缺表推导。升级先核验 table/index/trigger、manifest 与 RootBinding，设置 pending fence/持久 journal，建立并验证 SQLite Backup API 备份，再以单事务补齐当前领域并更新绑定；中断按 journal 向前收敛，旧版 3→4 的已知边界先单独认证恢复。Windows 仅在 SQLite 原生 I/O 使用 namespaced path，持久 RootBinding 保留 canonical path。
+
+备份升级自动触发：当前选中根在 Runtime 打开前完成；当前 Runtime 就绪后串行处理其余旧根；查看旧历史时补做。仅目标根必须无存活或身份未知的 Host，其他已运行数据集继续使用。各库操作分别持有 configuration admission → target maintenance，并在库间释放；结束 activation 后不再开始下一份迁移。旧库发现的局部错误须与可用候选分别返回；已有固定选择损坏时仍拒绝，健康与异常并存时也不自动改选或创建空库。
+
+历史升级入口只复用精确 epoch migrator，不调用含归档重置/空库初始化的通用 cutover coordinator，不改当前 selection，不注册历史 Host 或启动旧任务。既有对话、消息、附件及原 CAS 内容保留；需要转换的旧 Child Runtime continuation 仅在稳定 ID、回执、投递和旧 CAS 全部吻合时发布新内容并补 Link。备份路径和逐库失败原因可追踪。未知 schema、缺失备份或绑定冲突均拒绝；目录移动与跨平台备份恢复需要独立的来源认证与重新绑定流程，不能放宽原位升级检查。
 
 ## 18. 失败原则
 

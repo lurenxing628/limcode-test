@@ -72,12 +72,12 @@ export const EPOCH_3_MODEL_CONTEXT_SUMMARY_SCHEMA_DIGEST =
 
 export const PREVIOUS_RUNTIME_MANIFEST_VARIANT_CONTRACTS = Object.freeze([
   Object.freeze({
-    id: 'epoch-3-v0.0.10-v0.0.11',
+    id: 'epoch-3-v0.0.10-v0.0.12',
     modelContextProjectionClientMapping: 'detail' as const,
     modelContextProjectionSchemaDigest: EPOCH_3_MODEL_CONTEXT_DETAIL_SCHEMA_DIGEST
   }),
   Object.freeze({
-    id: 'epoch-3-v0.0.12-v0.0.14',
+    id: 'epoch-3-v0.0.13-v0.0.14',
     modelContextProjectionClientMapping: 'summary' as const,
     modelContextProjectionSchemaDigest: EPOCH_3_MODEL_CONTEXT_SUMMARY_SCHEMA_DIGEST
   })
