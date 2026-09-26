@@ -40,6 +40,7 @@ const forbidden = [
   },
   { id: '内部架构文档', match: (file) => /(^|\/)docs\/architecture\//.test(file) },
   { id: '内部工具报告', match: (file) => /(^|\/)\.ide-tool-test\//.test(file) },
+  { id: '存储研究资料', match: (file) => /^limcode-storage-topology-research\//.test(file) },
   { id: 'TypeScript或Vue源码', match: (file) => /^(backend|shared|vscode|webview)\/.*\.(?:ts|tsx|vue)$/.test(file) },
   { id: '嵌套VSIX', match: (file) => file.endsWith('.vsix') },
   { id: '运行数据库', match: (file) => /\.(?:sqlite|sqlite3|db)(?:-(?:wal|shm))?$/.test(file) || /-(?:wal|shm)$/.test(file) },

@@ -5,7 +5,7 @@ import type { createVscodeStoragePaths } from '../capabilities/vscodeStorage/pat
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths } from './contracts';
 import { RootAuthority, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
-import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
+import { assertRuntimeHostsOffline, runtimeHostLivenessDirectory, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { CUTOVER_JOURNAL_FILE, physicalCutoverRecoveryRequired } from './physicalCutover';
 
 type VscodeStoragePaths = ReturnType<typeof createVscodeStoragePaths>;
@@ -55,11 +55,23 @@ export interface VscodeRuntimeDataSetCandidate {
   runtimeScopeRootPath: string;
   runtimeDataRootPath: string;
   dataSetId?: string;
+  rootInstanceId?: string;
   runtimeKernelEpoch?: number;
   selected: boolean;
   source: 'fixed' | 'legacy' | 'workspace';
   /** A recognized interrupted physical cutover must finish before opening this root. */
   requiresRecovery?: true;
+}
+
+export interface VscodeRuntimeDataSetProblem {
+  id: string;
+  runtimeScopeRootPath: string;
+  message: string;
+}
+
+export interface VscodeRuntimeDataSetInspection {
+  candidates: VscodeRuntimeDataSetCandidate[];
+  problems: VscodeRuntimeDataSetProblem[];
 }
 
 interface RuntimeDataSetSelection {
@@ -73,8 +85,13 @@ interface RuntimeDataSetSelection {
 export class VscodeRuntimeDataSetSelectionRequiredError extends Error {
   public readonly code = 'runtime-dataset-selection-required';
 
-  public constructor(public readonly candidates: readonly VscodeRuntimeDataSetCandidate[]) {
-    super('发现多个已有运行数据集，请先选择当前数据集；工作区文件夹不会自动决定使用哪个数据库。');
+  public constructor(
+    public readonly candidates: readonly VscodeRuntimeDataSetCandidate[],
+    public readonly problems: readonly VscodeRuntimeDataSetProblem[] = []
+  ) {
+    super(problems.length
+      ? '发现无法使用的历史库，请查看原因并明确选择可用数据集；不会自动跳过异常库或创建空库。'
+      : '发现多个已有运行数据集，请先选择当前数据集；工作区文件夹不会自动决定使用哪个数据库。');
     this.name = 'VscodeRuntimeDataSetSelectionRequiredError';
   }
 }
@@ -172,8 +189,15 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
     if (selection) {
       candidate = await inspectCandidate(configurationRootPath, selection.id, selection, !selection.initialized);
     } else {
-      const candidates = await enumerateCandidates(configurationRootPath);
-      if (candidates.length > 1) throw new VscodeRuntimeDataSetSelectionRequiredError(candidates);
+      const { candidates, problems } = await inspectCandidates(configurationRootPath);
+      if (problems.length && candidates.length === 0) {
+        throw new VscodeRuntimeDataSetError(
+          `已有运行数据集均无法使用，原数据保持不变：\n${problems.map(problem => problem.message).join('\n')}`
+        );
+      }
+      if (candidates.length > 1 || problems.length) {
+        throw new VscodeRuntimeDataSetSelectionRequiredError(candidates, problems);
+      }
       candidate = candidates[0] ?? await inspectCandidate(configurationRootPath, 'default', undefined, true);
       await assertConfigurationRootRuntimesOffline(configurationRootPath);
       await publishSelection(configurationRootPath, candidate.id, Boolean(candidate.dataSetId));
@@ -194,6 +218,14 @@ export async function listVscodeRuntimeDataSets(
 ): Promise<VscodeRuntimeDataSetCandidate[]> {
   const root = path.resolve(paths.globalStoragePath);
   return enumerateCandidates(root, await readRuntimeDataSetSelection(root));
+}
+
+/** Read-only inventory for recovery UI; unavailable roots remain explicit, unselectable problems. */
+export async function inspectVscodeRuntimeDataSets(
+  paths: Pick<VscodeStoragePaths, 'globalStoragePath'>
+): Promise<VscodeRuntimeDataSetInspection> {
+  const root = path.resolve(paths.globalStoragePath);
+  return inspectCandidates(root, await readRuntimeDataSetSelection(root));
 }
 
 /** Resolves an opaque candidate id without accepting arbitrary filesystem paths. */
@@ -258,8 +290,10 @@ export async function assertConfigurationRootRuntimesOffline(
   exceptHostBootId?: string
 ): Promise<void> {
   const configurationRoot = path.resolve(configurationRootPath);
+  const defaultPaths = createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({ globalStoragePath: configurationRoot }));
+  await assertSafeRootPath(configurationRoot, runtimeHostLivenessDirectory(defaultPaths));
   await assertRuntimeHostsOffline(
-    createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({ globalStoragePath: configurationRoot })),
+    defaultPaths,
     exceptHostBootId
   );
   const scopesRoot = path.join(
@@ -267,9 +301,20 @@ export async function assertConfigurationRootRuntimesOffline(
     VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
     VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY
   );
+  await assertSafeRootPath(configurationRoot, scopesRoot);
   for (const scopeKey of await directoryEntryNames(scopesRoot)) {
+    const scopeRoot = path.join(scopesRoot, scopeKey);
+    const info = await fs.lstat(scopeRoot);
+    // A regular file cannot contain a Runtime Host. Keep it in the diagnostic inventory, but
+    // never append a host-liveness path to it. Links and unknown filesystem kinds prove nothing.
+    if (info.isFile()) continue;
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new VscodeRuntimeDataSetError(`运行数据集路径包含链接或无效目录：${scopeRoot}`);
+    }
+    const runtimePaths = createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot }));
+    await assertSafeRootPath(configurationRoot, runtimeHostLivenessDirectory(runtimePaths));
     await assertRuntimeHostsOffline(
-      createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({ globalStoragePath: path.join(scopesRoot, scopeKey) })),
+      runtimePaths,
       exceptHostBootId
     );
   }
@@ -279,21 +324,53 @@ async function enumerateCandidates(
   configurationRootPath: string,
   selection?: RuntimeDataSetSelection
 ): Promise<VscodeRuntimeDataSetCandidate[]> {
-  const ids: string[] = [];
+  return (await inspectCandidates(configurationRootPath, selection, true)).candidates;
+}
+
+async function inspectCandidates(
+  configurationRootPath: string,
+  selection?: RuntimeDataSetSelection,
+  strict = false
+): Promise<VscodeRuntimeDataSetInspection> {
+  const result: VscodeRuntimeDataSetInspection = { candidates: [], problems: [] };
+  const entries: Array<{ id: string; runtimeScopeRootPath: string }> = [];
+  const recordProblem = (id: string, runtimeScopeRootPath: string, error: unknown): void => {
+    if (strict) throw error;
+    result.problems.push({ id, runtimeScopeRootPath, message: error instanceof Error ? error.message : String(error) });
+  };
   const defaultControl = path.join(configurationRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY);
-  await assertSafeRootPath(configurationRootPath, defaultControl);
-  if (await hasRuntimeArtifacts(defaultControl) || selection?.id === 'default') ids.push('default');
-  const scopesRoot = path.join(configurationRootPath, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
-  await assertSafeRootPath(configurationRootPath, scopesRoot);
-  for (const key of (await directoryEntryNames(scopesRoot)).sort()) ids.push(`workspace:${key}`);
-  if (selection && !ids.includes(selection.id)) ids.push(selection.id);
-  const candidates: VscodeRuntimeDataSetCandidate[] = [];
-  for (const id of ids) {
-    candidates.push(await inspectCandidate(
-      configurationRootPath, id, selection, selection?.id === id && !selection.initialized
-    ));
+  try {
+    await assertSafeRootPath(configurationRootPath, defaultControl);
+    if (await hasRuntimeArtifacts(defaultControl) || selection?.id === 'default') {
+      entries.push({ id: 'default', runtimeScopeRootPath: configurationRootPath });
+    }
+  } catch (error) {
+    recordProblem('default', configurationRootPath, error);
   }
-  return candidates;
+  const scopesRoot = path.join(configurationRootPath, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
+  try {
+    await assertSafeRootPath(configurationRootPath, scopesRoot);
+    for (const key of (await directoryEntryNames(scopesRoot)).sort()) {
+      entries.push({ id: `workspace:${key}`, runtimeScopeRootPath: path.join(scopesRoot, key) });
+    }
+  } catch (error) {
+    // This identifies the unreadable container for display only; it is never a candidate id.
+    recordProblem('workspace-scopes', scopesRoot, error);
+  }
+  if (selection && !entries.some(entry => entry.id === selection.id)
+    && !result.problems.some(problem => problem.id === selection.id)) {
+    entries.push({ id: selection.id, runtimeScopeRootPath: runtimeScopeRootForId(configurationRootPath, selection.id) });
+  }
+  for (const { id, runtimeScopeRootPath } of entries) {
+    try {
+      result.candidates.push(await inspectCandidate(
+        configurationRootPath, id, selection, selection?.id === id && !selection.initialized
+      ));
+    } catch (error) {
+      recordProblem(id, runtimeScopeRootPath, error);
+    }
+  }
+  return result;
 }
 
 async function inspectCandidate(
@@ -349,7 +426,11 @@ async function inspectCandidate(
     configurationRootPath,
     runtimeScopeRootPath,
     runtimeDataRootPath,
-    ...(binding ? { dataSetId: binding.dataSetId, runtimeKernelEpoch: binding.runtimeKernelEpoch } : {}),
+    ...(binding ? {
+      dataSetId: binding.dataSetId,
+      rootInstanceId: binding.rootInstanceId,
+      runtimeKernelEpoch: binding.runtimeKernelEpoch
+    } : {}),
     ...(requiresRecovery ? { requiresRecovery: true as const } : {}),
     selected: selection?.id === id,
     source: id === 'default' ? binding ? 'legacy' : 'fixed' : 'workspace'

@@ -9,6 +9,7 @@ import { test } from 'node:test';
 const require = createRequire(import.meta.url);
 const {
   completeVscodeRuntimeDataSetSelection,
+  inspectVscodeRuntimeDataSets,
   listVscodeRuntimeDataSets,
   resolveVscodeRuntimeDataRoot,
   resolveVscodeRuntimeDataSet,
@@ -22,6 +23,8 @@ const {
 const { RootAuthority } = require('../../dist/extension/backend/reliableKernel/rootAuthority.js');
 const { ownProcessStartIdentity } = require('../../dist/extension/backend/reliableKernel/runtimeClaimPrimitives.js');
 const { recoverInterruptedPhysicalCutover, persistPhysicalCutoverRequest } = require('../../dist/extension/backend/reliableKernel/physicalCutover.js');
+const { withRuntimeMaintenance } = require('../../dist/extension/backend/reliableKernel/runtimeHostControl.js');
+const { archiveCurrentRuntimeRootForReset } = require('../../dist/extension/backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js');
 
 const scope = (name) => resolveVscodeWorkspaceRuntimeScope({ workspaceFolderUris: [`file:///workspace/${name}`] });
 const fixture = async (run) => {
@@ -125,6 +128,136 @@ test('固定选择不受workspace保存、增删重排文件夹影响，正常�
     assert.equal(placement.runtimeDataRootPath, first.runtimeDataRootPath);
   }
   await assert.rejects(listVscodeRuntimeDataSets(paths), { code: 'runtime-dataset-invalid' });
+}));
+
+for (const previousEpoch of [3, 4]) test(`epoch ${previousEpoch} 健康旧库与真实维护失败留下的空scope分别报告，首次必须明确选库`, async () => fixture(async (root, paths) => {
+  const healthyScope = scope('healthy');
+  const healthyRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, healthyScope);
+  const binding = await createRoot(healthyRoot, previousEpoch);
+  const pointerBefore = await fs.readFile(binding.paths.rootPointerPath, 'utf8');
+  const failedScope = scope('failed-initialization');
+  const failedRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, failedScope);
+  const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: failedRoot }));
+  await assert.rejects(withRuntimeMaintenance(authority.expectedPaths(), async () => {
+    throw new Error('fixture preflight failed before initialization');
+  }), /fixture preflight/);
+  assert.deepEqual(await fs.readdir(failedRoot), []);
+
+  const inspection = await inspectVscodeRuntimeDataSets(paths);
+  assert.deepEqual(inspection.candidates.map(candidate => candidate.id), [`workspace:${healthyScope.key}`]);
+  assert.equal(inspection.candidates[0].rootInstanceId, binding.rootInstanceId);
+  assert.equal(inspection.candidates[0].runtimeKernelEpoch, previousEpoch);
+  assert.deepEqual(inspection.problems.map(problem => [problem.id, problem.runtimeScopeRootPath]),
+    [[`workspace:${failedScope.key}`, failedRoot]]);
+  assert.match(inspection.problems[0].message, /缺少完整 RootBinding/);
+  await assert.rejects(listVscodeRuntimeDataSets(paths), { code: 'runtime-dataset-invalid' });
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, healthyScope), error => {
+    assert.ok(error instanceof VscodeRuntimeDataSetSelectionRequiredError);
+    assert.deepEqual(error.candidates, inspection.candidates);
+    assert.deepEqual(error.problems, inspection.problems);
+    return true;
+  });
+  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+  await selectVscodeRuntimeDataSet(paths, `workspace:${healthyScope.key}`);
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('new-window'))).runtimeScopeRootPath, healthyRoot);
+  assert.equal(await fs.readFile(binding.paths.rootPointerPath, 'utf8'), pointerBefore);
+  assert.deepEqual(await fs.readdir(failedRoot), []);
+}));
+
+test('reset归档后未重建的scope保留诊断与完整备份，不阻止明确选择健康旧库', async () => fixture(async (root, paths) => {
+  const healthy = await createRoot(root, 4);
+  const resetScope = scope('reset-interrupted');
+  const resetRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, resetScope);
+  const archivedBinding = await createRoot(resetRoot, 3);
+  await fs.writeFile(path.join(archivedBinding.paths.casRootPath, 'retained.bin'), 'retained');
+  const authority = new RootAuthority(() => archivedBinding.paths.dataRootPath);
+  const archive = await archiveCurrentRuntimeRootForReset(authority, resetRoot);
+  assert.equal(archive.archived, true);
+  const archivedPointer = path.join(archive.backupPath, 'root-binding.json');
+  const before = await fs.readFile(archivedPointer, 'utf8');
+  const inspection = await inspectVscodeRuntimeDataSets(paths);
+  assert.deepEqual(inspection.candidates.map(candidate => candidate.id), ['default']);
+  assert.equal(inspection.problems[0].id, `workspace:${resetScope.key}`);
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-selection-required' });
+  await selectVscodeRuntimeDataSet(paths, 'default');
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('selected'))).runtimeDataRootPath, healthy.paths.dataRootPath);
+  assert.equal(await fs.readFile(archivedPointer, 'utf8'), before);
+  assert.equal(await fs.readFile(path.join(archive.backupPath, 'active', 'cas', 'retained.bin'), 'utf8'), 'retained');
+  await assert.rejects(fs.stat(archivedBinding.paths.rootPointerPath), { code: 'ENOENT' });
+}));
+
+test('scope普通文件保留为问题条目，离线检查不拼接文件内的Host路径', async () => fixture(async (root, paths) => {
+  await createRoot(root, 3);
+  const fileScope = scope('file-instead-of-scope');
+  const filePath = resolveVscodeWorkspaceRuntimeScopeRoot(paths, fileScope);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, 'keep-file');
+  const unrelated = path.join(path.dirname(filePath), '.DS_Store');
+  await fs.writeFile(unrelated, 'keep-unrelated-file');
+  const inspection = await inspectVscodeRuntimeDataSets(paths);
+  assert.deepEqual(inspection.candidates.map(candidate => candidate.id), ['default']);
+  assert.deepEqual(inspection.problems.map(problem => problem.id).sort(),
+    ['workspace:.DS_Store', `workspace:${fileScope.key}`].sort());
+  await assert.rejects(listVscodeRuntimeDataSets(paths), { code: 'runtime-dataset-invalid' });
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-selection-required' });
+  await selectVscodeRuntimeDataSet(paths, 'default');
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('selected'))).runtimeScopeRootPath, root);
+  assert.equal(await fs.readFile(filePath, 'utf8'), 'keep-file');
+  assert.equal(await fs.readFile(unrelated, 'utf8'), 'keep-unrelated-file');
+}));
+
+test('只有异常scope时保留错误，不发布选择、不创建默认空库', async () => fixture(async (root, paths) => {
+  const failedRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, scope('only-invalid'));
+  await fs.mkdir(failedRoot, { recursive: true });
+  const inspection = await inspectVscodeRuntimeDataSets(paths);
+  assert.equal(inspection.candidates.length, 0);
+  assert.equal(inspection.problems.length, 1);
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-invalid' });
+  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(root, '.limcode-runtime')), { code: 'ENOENT' });
+  assert.deepEqual(await fs.readdir(failedRoot), []);
+}));
+
+test('健康库旁的符号链接或身份不明Host不能因问题隔离而绕过离线边界', async () => fixture(async (root, paths) => {
+  await createRoot(root, 4);
+  const siblingRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, scope('unsafe-sibling'));
+  await fs.mkdir(path.dirname(siblingRoot), { recursive: true });
+  const external = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-dataset-link-target-'));
+  try {
+    await fs.symlink(external, siblingRoot, 'junction');
+    assert.equal((await inspectVscodeRuntimeDataSets(paths)).problems.length, 1);
+    await assert.rejects(selectVscodeRuntimeDataSet(paths, 'default'), { code: 'runtime-dataset-invalid' });
+    await fs.unlink(siblingRoot);
+    const hostDirectory = path.join(resolveVscodeRuntimeDataRoot({ globalStoragePath: siblingRoot }), 'host-liveness');
+    await fs.mkdir(hostDirectory, { recursive: true });
+    await fs.writeFile(path.join(hostDirectory, 'unknown.json'), '{}');
+    assert.equal((await inspectVscodeRuntimeDataSets(paths)).problems.length, 1);
+    await assert.rejects(selectVscodeRuntimeDataSet(paths, 'default'), { code: 'runtime-hosts-active' });
+    await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+  } finally {
+    await fs.rm(external, { recursive: true, force: true });
+  }
+}));
+
+for (const [fromEpoch, toEpoch] of [[3, 4], [3, 5], [4, 5]]) test(`合法epoch ${fromEpoch}→${toEpoch} pending仍作为候选交给既有升级恢复`, async () => fixture(async (root, paths) => {
+  await createRoot(root, 5);
+  const oldScope = scope('pending-old-root');
+  const oldRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, oldScope);
+  const previous = await createRoot(oldRoot, fromEpoch);
+  const next = { ...previous, runtimeKernelEpoch: toEpoch, rootGeneration: previous.rootGeneration + 1, pointerRevision: previous.pointerRevision + 1 };
+  await fs.writeFile(previous.paths.rootPendingPath, JSON.stringify(next));
+  const manifest = JSON.parse(await fs.readFile(previous.paths.runtimeEpochPath, 'utf8'));
+  await fs.writeFile(previous.paths.runtimeEpochPath, JSON.stringify({ ...manifest, runtimeKernelEpoch: toEpoch, rootGeneration: next.rootGeneration }));
+  const inspection = await inspectVscodeRuntimeDataSets(paths);
+  assert.deepEqual(inspection.problems, []);
+  assert.equal(inspection.candidates.length, 2);
+  const candidate = inspection.candidates.find(candidate => candidate.id === `workspace:${oldScope.key}`);
+  assert.equal(candidate.rootInstanceId, previous.rootInstanceId);
+  assert.equal(candidate.runtimeKernelEpoch, fromEpoch);
+  await selectVscodeRuntimeDataSet(paths, candidate.id);
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('after-selection'))).runtimeScopeRootPath, oldRoot);
+  assert.equal(JSON.parse(await fs.readFile(previous.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch, fromEpoch);
+  assert.deepEqual(JSON.parse(await fs.readFile(previous.paths.rootPendingPath, 'utf8')), next);
 }));
 
 test('活跃或身份不明Host拒绝切换，原选择完整保留', async () => fixture(async (root, paths) => {

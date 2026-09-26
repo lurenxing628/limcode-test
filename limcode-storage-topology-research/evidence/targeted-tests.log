@@ -1,0 +1,684 @@
+TAP version 13
+# Subtest: 多宿主在同一数据集并行推进不同 Conversation，外部提交经有界 Client Feed 对端可见（跨进程运行时证明）
+ok 1 - 多宿主在同一数据集并行推进不同 Conversation，外部提交经有界 Client Feed 对端可见（跨进程运行时证明）
+  ---
+  duration_ms: 2502.020509
+  type: 'test'
+  ...
+# Subtest: 被动宿主可持久请求中断活宿主的 Turn，不能执行其它越权写入，收尾后自动让出
+ok 2 - 被动宿主可持久请求中断活宿主的 Turn，不能执行其它越权写入，收尾后自动让出
+  ---
+  duration_ms: 1141.617565
+  type: 'test'
+  ...
+# Subtest: 同一 Conversation 的跨进程并发 claim 只有一个胜者，同宿主并发 claim 单飞（所有权管理器作用域）
+ok 3 - 同一 Conversation 的跨进程并发 claim 只有一个胜者，同宿主并发 claim 单飞（所有权管理器作用域）
+  ---
+  duration_ms: 692.129613
+  type: 'test'
+  ...
+# Subtest: 活动 pin、并发调用与空闲释放串行化（所有权管理器作用域）
+ok 4 - 活动 pin、并发调用与空闲释放串行化（所有权管理器作用域）
+  ---
+  duration_ms: 126.385974
+  type: 'test'
+  ...
+# Subtest: pending-work 探针在活动 pin 清零后保留所有权，探针失败与默认探针均保守保留（所有权管理器作用域）
+ok 5 - pending-work 探针在活动 pin 清零后保留所有权，探针失败与默认探针均保守保留（所有权管理器作用域）
+  ---
+  duration_ms: 123.249767
+  type: 'test'
+  ...
+# Subtest: pending-work 判定边界：超过 25 条来源记录不得遮蔽更旧的运行中进程，前台完成进程不得保留（数据库探针证明）
+ok 6 - pending-work 判定边界：超过 25 条来源记录不得遮蔽更旧的运行中进程，前台完成进程不得保留（数据库探针证明）
+  ---
+  duration_ms: 240.784321
+  type: 'test'
+  ...
+# Subtest: 真实终止的宿主进程所有权可被接管并留下死亡代际墓碑（跨进程 SIGKILL 证明）
+ok 7 - 真实终止的宿主进程所有权可被接管并留下死亡代际墓碑（跨进程 SIGKILL 证明）
+  ---
+  duration_ms: 1137.057864
+  type: 'test'
+  ...
+# Subtest: 存活宿主携带陈旧 ExecutionLease 也不可被偷，畸形所有权记录 fail closed（跨进程 + 管理器作用域）
+ok 8 - 存活宿主携带陈旧 ExecutionLease 也不可被偷，畸形所有权记录 fail closed（跨进程 + 管理器作用域）
+  ---
+  duration_ms: 2369.907609
+  type: 'test'
+  ...
+# Subtest: 陈旧代际模型回调与栅栏写入被拒绝且不产生持久化副作用（运行时证明）
+ok 9 - 陈旧代际模型回调与栅栏写入被拒绝且不产生持久化副作用（运行时证明）
+  ---
+  duration_ms: 396.284679
+  type: 'test'
+  ...
+# Subtest: 运行时维护等待存活持有者、接管死亡持有者，宿主离线守卫区分存活/畸形/死亡（跨进程）
+ok 10 - 运行时维护等待存活持有者、接管死亡持有者，宿主离线守卫区分存活/畸形/死亡（跨进程）
+  ---
+  duration_ms: 2095.097048
+  type: 'test'
+  ...
+# Subtest: 共享配置根准入期间新作用域注册不得绕过，死亡准入持有者可被接管（跨进程准入证明）
+ok 11 - 共享配置根准入期间新作用域注册不得绕过，死亡准入持有者可被接管（跨进程准入证明）
+  ---
+  duration_ms: 1612.846373
+  type: 'test'
+  ...
+# Subtest: with the switch off the tools are not offered and every entry point rejects them
+ok 12 - with the switch off the tools are not offered and every entry point rejects them
+  ---
+  duration_ms: 932.535431
+  type: 'test'
+  ...
+# Subtest: without run_agent in the effective list only list and read are offered or admitted, even with the switch on
+ok 13 - without run_agent in the effective list only list and read are offered or admitted, even with the switch on
+  ---
+  duration_ms: 634.073298
+  type: 'test'
+  ...
+# Subtest: the switch alone grants the tools at whichever scope turns it on, over any saved lists
+ok 14 - the switch alone grants the tools at whichever scope turns it on, over any saved lists
+  ---
+  duration_ms: 1069.356297
+  type: 'test'
+  ...
+# Subtest: a malformed switch value fails closed instead of breaking every Turn
+ok 15 - a malformed switch value fails closed instead of breaking every Turn
+  ---
+  duration_ms: 745.512469
+  type: 'test'
+  ...
+# Subtest: list excludes this conversation, its team and child tasks; read returns the peer transcript as untrusted data
+ok 16 - list excludes this conversation, its team and child tasks; read returns the peer transcript as untrusted data
+  ---
+  duration_ms: 1554.496839
+  type: 'test'
+  ...
+# Subtest: cross-conversation tools reach only the caller's project, even through a reference obtained earlier
+ok 17 - cross-conversation tools reach only the caller's project, even through a reference obtained earlier
+  ---
+  duration_ms: 1416.132286
+  type: 'test'
+  ...
+# Subtest: long collaboration messages and replies arrive as previews whose marker names the paged read that returns them whole
+ok 18 - long collaboration messages and replies arrive as previews whose marker names the paged read that returns them whole
+  ---
+  duration_ms: 2301.666337
+  type: 'test'
+  ...
+# Subtest: read_conversation spends its budget on the newest messages, pages older ones and long messages, and fits the result cap
+ok 19 - read_conversation spends its budget on the newest messages, pages older ones and long messages, and fits the result cap
+  ---
+  duration_ms: 2465.0284
+  type: 'test'
+  ...
+# Subtest: a followup to a running conversation waits for its Turn to end, then starts exactly one Turn
+ok 20 - a followup to a running conversation waits for its Turn to end, then starts exactly one Turn
+  ---
+  duration_ms: 1029.845162
+  type: 'test'
+  ...
+# Subtest: a message to a running conversation is never injected into its Turn and joins the next Turn without starting one
+ok 21 - a message to a running conversation is never injected into its Turn and joins the next Turn without starting one
+  ---
+  duration_ms: 1013.659919
+  type: 'test'
+  ...
+# Subtest: a user Turn that wins the race after the anchor ends leaves the queued peer task to its own Turn
+ok 22 - a user Turn that wins the race after the anchor ends leaves the queued peer task to its own Turn
+  ---
+  duration_ms: 1124.543605
+  type: 'test'
+  ...
+# Subtest: deleting the target while a followup is queued tells the waiting sender, and the failure reply starts a Turn of the idle sender
+ok 23 - deleting the target while a followup is queued tells the waiting sender, and the failure reply starts a Turn of the idle sender
+  ---
+  duration_ms: 1067.146818
+  type: 'test'
+  ...
+# Subtest: create_conversation starts a first Turn from a peer task and replaying the call creates nothing new
+ok 24 - create_conversation starts a first Turn from a peer task and replaying the call creates nothing new
+  ---
+  duration_ms: 888.902772
+  type: 'test'
+  ...
+# Subtest: wait_agent_messages returns the reply of a created conversation within the same Turn, as the description says
+ok 25 - wait_agent_messages returns the reply of a created conversation within the same Turn, as the description says
+  ---
+  duration_ms: 1020.177179
+  type: 'test'
+  ...
+# Subtest: one Turn may create or fork at most 8 conversations; the next call is refused without writing
+ok 26 - one Turn may create or fork at most 8 conversations; the next call is refused without writing
+  ---
+  duration_ms: 1722.611583
+  type: 'test'
+  ...
+# Subtest: create_conversation that cannot run leaves no conversation behind, not even on retry
+ok 27 - create_conversation that cannot run leaves no conversation behind, not even on retry
+  ---
+  duration_ms: 736.372068
+  type: 'test'
+  ...
+# Subtest: create_conversation refused at admission clears settings a crashed earlier attempt left, and only then
+ok 28 - create_conversation refused at admission clears settings a crashed earlier attempt left, and only then
+  ---
+  duration_ms: 598.278612
+  type: 'test'
+  ...
+# Subtest: create_conversation with an unavailable work environment writes nothing
+ok 29 - create_conversation with an unavailable work environment writes nothing
+  ---
+  duration_ms: 570.115329
+  type: 'test'
+  ...
+# Subtest: create_conversation interrupted between its steps resumes on replay without duplicating anything
+ok 30 - create_conversation interrupted between its steps resumes on replay without duplicating anything
+  ---
+  duration_ms: 764.127441
+  type: 'test'
+  ...
+# [reliable-kernel] failed to clear settings of the uncreated conversation conversation_9fbfc39ee5ffa9783e5e1edf3635d7919017e34e1fe9ed6c51f2e864ae79182b: settings store unavailable
+# Subtest: create_conversation refused by the atomic send after admission leaves no settings behind
+ok 31 - create_conversation refused by the atomic send after admission leaves no settings behind
+  ---
+  duration_ms: 758.960898
+  type: 'test'
+  ...
+# Subtest: create_conversation whose committed send still reports a failure keeps the settings of the conversation it created
+ok 32 - create_conversation whose committed send still reports a failure keeps the settings of the conversation it created
+  ---
+  duration_ms: 702.518391
+  type: 'test'
+  ...
+# Subtest: create_conversation with confirmation required waits for approval and creates only after it
+ok 33 - create_conversation with confirmation required waits for approval and creates only after it
+  ---
+  duration_ms: 1121.290781
+  type: 'test'
+  ...
+# Subtest: turning the switch off mid-Turn leaves that Turn's frozen switch in force until it ends
+ok 34 - turning the switch off mid-Turn leaves that Turn's frozen switch in force until it ends
+  ---
+  duration_ms: 664.647582
+  type: 'test'
+  ...
+# Subtest: fork_conversation copies completed history of the running caller and of another conversation, and replays deduplicate
+ok 35 - fork_conversation copies completed history of the running caller and of another conversation, and replays deduplicate
+  ---
+  duration_ms: 1196.183374
+  type: 'test'
+  ...
+# Subtest: claude: a followup to an idle peer and its reply into the running requester reach the wire as attributed user-role data
+ok 36 - claude: a followup to an idle peer and its reply into the running requester reach the wire as attributed user-role data
+  ---
+  duration_ms: 1215.064791
+  type: 'test'
+  ...
+# Subtest: claude: a message to an idle peer joins the peer user's next Turn as attributed user-role data
+ok 37 - claude: a message to an idle peer joins the peer user's next Turn as attributed user-role data
+  ---
+  duration_ms: 942.754511
+  type: 'test'
+  ...
+# Subtest: claude: the first request of a created conversation is one attributed user-role task
+ok 38 - claude: the first request of a created conversation is one attributed user-role task
+  ---
+  duration_ms: 719.165253
+  type: 'test'
+  ...
+# Subtest: gemini: a followup to an idle peer and its reply into the running requester reach the wire as attributed user-role data
+ok 39 - gemini: a followup to an idle peer and its reply into the running requester reach the wire as attributed user-role data
+  ---
+  duration_ms: 1182.831793
+  type: 'test'
+  ...
+# Subtest: gemini: a message to an idle peer joins the peer user's next Turn as attributed user-role data
+ok 40 - gemini: a message to an idle peer joins the peer user's next Turn as attributed user-role data
+  ---
+  duration_ms: 1018.083696
+  type: 'test'
+  ...
+# Subtest: gemini: the first request of a created conversation is one attributed user-role task
+ok 41 - gemini: the first request of a created conversation is one attributed user-role task
+  ---
+  duration_ms: 714.303949
+  type: 'test'
+  ...
+# Subtest: openai-responses: a followup to an idle peer and its reply into the running requester reach the wire as attributed user-role data
+ok 42 - openai-responses: a followup to an idle peer and its reply into the running requester reach the wire as attributed user-role data
+  ---
+  duration_ms: 1211.055317
+  type: 'test'
+  ...
+# Subtest: openai-responses: a message to an idle peer joins the peer user's next Turn as attributed user-role data
+ok 43 - openai-responses: a message to an idle peer joins the peer user's next Turn as attributed user-role data
+  ---
+  duration_ms: 941.083676
+  type: 'test'
+  ...
+# Subtest: openai-responses: the first request of a created conversation is one attributed user-role task
+ok 44 - openai-responses: the first request of a created conversation is one attributed user-role task
+  ---
+  duration_ms: 746.610896
+  type: 'test'
+  ...
+# Subtest: automatic compression runs on a history without collaboration facts (control) and every Turn completes
+ok 45 - automatic compression runs on a history without collaboration facts (control) and every Turn completes
+  ---
+  duration_ms: 849.988279
+  type: 'test'
+  ...
+# Subtest: manual compression runs on a history without collaboration facts (control) and the next Turn completes
+ok 46 - manual compression runs on a history without collaboration facts (control) and the next Turn completes
+  ---
+  duration_ms: 868.301258
+  type: 'test'
+  ...
+# Subtest: automatic compression runs on a history with collaboration results and received messages and every Turn completes
+ok 47 - automatic compression runs on a history with collaboration results and received messages and every Turn completes
+  ---
+  duration_ms: 2129.289869
+  type: 'test'
+  ...
+# Subtest: manual compression runs on a history with collaboration results and received messages and the next Turn completes
+ok 48 - manual compression runs on a history with collaboration results and received messages and the next Turn completes
+  ---
+  duration_ms: 2057.938267
+  type: 'test'
+  ...
+# Subtest: a manual compression while a message waits for the next Turn ends and leaves the message to the next real Turn
+ok 49 - a manual compression while a message waits for the next Turn ends and leaves the message to the next real Turn
+  ---
+  duration_ms: 1041.465194
+  type: 'test'
+  ...
+# Subtest: a manual compression while a completion reply waits for the next Turn ends and leaves the reply to the next real Turn
+ok 50 - a manual compression while a completion reply waits for the next Turn ends and leaves the reply to the next real Turn
+  ---
+  duration_ms: 1236.482237
+  type: 'test'
+  ...
+# Subtest: a completion reply that arrives during a compression, followed by a restart, waits for the next real Turn
+ok 51 - a completion reply that arrives during a compression, followed by a restart, waits for the next real Turn
+  ---
+  duration_ms: 1509.017809
+  type: 'test'
+  ...
+# Subtest: a completion reply that arrives during a compression starts exactly one Turn once the compression finishes
+ok 52 - a completion reply that arrives during a compression starts exactly one Turn once the compression finishes
+  ---
+  duration_ms: 1232.769216
+  type: 'test'
+  ...
+# Subtest: a completion reply that arrives during a compression starts exactly one Turn once the window restarts
+ok 53 - a completion reply that arrives during a compression starts exactly one Turn once the window restarts
+  ---
+  duration_ms: 1310.597822
+  type: 'test'
+  ...
+# Subtest: a reply routed into a stopping Turn before its terminal commit reads its deliveries joins the queued next Turn, even when the wake scan runs mid-admission
+ok 54 - a reply routed into a stopping Turn before its terminal commit reads its deliveries joins the queued next Turn, even when the wake scan runs mid-admission
+  ---
+  duration_ms: 1150.136695
+  type: 'test'
+  ...
+# Subtest: a reply routed into a stopping Turn between that read and the commit joins the queued next Turn, even when the wake scan runs mid-admission
+ok 55 - a reply routed into a stopping Turn between that read and the commit joins the queued next Turn, even when the wake scan runs mid-admission
+  ---
+  duration_ms: 1225.930417
+  type: 'test'
+  ...
+# Subtest: a reply to a cross-conversation task starts exactly one Turn of the idle requester, which reads it
+ok 56 - a reply to a cross-conversation task starts exactly one Turn of the idle requester, which reads it
+  ---
+  duration_ms: 1055.281398
+  type: 'test'
+  ...
+# Subtest: a reply to a running requester joins its Turn and starts no other Turn
+ok 57 - a reply to a running requester joins its Turn and starts no other Turn
+  ---
+  duration_ms: 1045.18624
+  type: 'test'
+  ...
+# Subtest: a reply whose task budget is spent starts no Turn and joins the next user Turn
+ok 58 - a reply whose task budget is spent starts no Turn and joins the next user Turn
+  ---
+  duration_ms: 1142.239654
+  type: 'test'
+  ...
+# Subtest: a reply that reaches a requester Turn the user stops before taking it in starts a new Turn (while its wake is dispatched)
+ok 59 - a reply that reaches a requester Turn the user stops before taking it in starts a new Turn (while its wake is dispatched)
+  ---
+  duration_ms: 1263.359902
+  type: 'test'
+  ...
+# Subtest: a reply that reaches a requester Turn the user stops before taking it in starts a new Turn (after its wake backed off)
+ok 60 - a reply that reaches a requester Turn the user stops before taking it in starts a new Turn (after its wake backed off)
+  ---
+  duration_ms: 1186.978945
+  type: 'test'
+  ...
+# Subtest: a reply wake dispatched again, or twice at once, still starts only one Turn
+ok 61 - a reply wake dispatched again, or twice at once, still starts only one Turn
+  ---
+  duration_ms: 1132.392436
+  type: 'test'
+  ...
+# Subtest: two conversations trading followups and replies stop once the chain budget is spent
+ok 62 - two conversations trading followups and replies stop once the chain budget is spent
+  ---
+  duration_ms: 1636.482834
+  type: 'test'
+  ...
+# Subtest: fork_conversation that fails after copying settings removes them and reports a clear error
+ok 63 - fork_conversation that fails after copying settings removes them and reports a clear error
+  ---
+  duration_ms: 744.09152
+  type: 'test'
+  ...
+# Subtest: a fork is told which copied collaboration refs are inherited and which ref is itself, and inherited refs fail with a way forward
+ok 64 - a fork is told which copied collaboration refs are inherited and which ref is itself, and inherited refs fail with a way forward
+  ---
+  duration_ms: 1249.145343
+  type: 'test'
+  ...
+# Subtest: fork_conversation refuses a peer-owned writer while reading still works
+ok 65 - fork_conversation refuses a peer-owned writer while reading still works
+  ---
+  duration_ms: 821.686679
+  type: 'test'
+  ...
+# Subtest: 历史读取保留会话和当前消息关系、分页及真实CAS codec，源文件零改写
+ok 66 - 历史读取保留会话和当前消息关系、分页及真实CAS codec，源文件零改写
+  ---
+  duration_ms: 218.282464
+  type: 'test'
+  ...
+# Subtest: 长消息内容有显式继续页且不截断Unicode字符
+ok 67 - 长消息内容有显式继续页且不截断Unicode字符
+  ---
+  duration_ms: 114.50162
+  type: 'test'
+  ...
+# Subtest: 历史快照包含离线WAL已提交事实而不新建或改写源WAL/SHM
+ok 68 - 历史快照包含离线WAL已提交事实而不新建或改写源WAL/SHM
+  ---
+  duration_ms: 120.940062
+  type: 'test'
+  ...
+# Subtest: 历史内容摘要错误、缺失关系及未知schema均明确失败，不返回空历史
+ok 69 - 历史内容摘要错误、缺失关系及未知schema均明确失败，不返回空历史
+  ---
+  duration_ms: 140.859835
+  type: 'test'
+  ...
+# Subtest: 历史消息关系缺失和旧epoch拒绝直接读取，且未执行迁移
+ok 70 - 历史消息关系缺失和旧epoch拒绝直接读取，且未执行迁移
+  ---
+  duration_ms: 124.966328
+  type: 'test'
+  ...
+# Subtest: 空间统计按物理文件计CAS一次，独立分类临时残留、spool、诊断和历史备份
+ok 71 - 空间统计按物理文件计CAS一次，独立分类临时残留、spool、诊断和历史备份
+  ---
+  duration_ms: 116.817116
+  type: 'test'
+  ...
+# Subtest: 删除拒绝当前、确认身份漂移、活Host和未知Host，允许当前另库继续运行
+ok 72 - 删除拒绝当前、确认身份漂移、活Host和未知Host，允许当前另库继续运行
+  ---
+  duration_ms: 134.715922
+  type: 'test'
+  ...
+# Subtest: 删除非当前legacy只删除完整Runtime控制树，保留配置及其它库；拒绝符号链接
+ok 73 - 删除非当前legacy只删除完整Runtime控制树，保留配置及其它库；拒绝符号链接
+  ---
+  duration_ms: 128.907354
+  type: 'test'
+  ...
+# Subtest: 删除旧workspace库会清理已释放维护锁的残留，后续历史库枚举仍可用
+ok 74 - 删除旧workspace库会清理已释放维护锁的残留，后续历史库枚举仍可用
+  ---
+  duration_ms: 106.577408
+  type: 'test'
+  ...
+# Subtest: 相邻指针不能掩盖SQLite内身份漂移；pending恢复和未知文件系统入口均拒绝删除
+ok 75 - 相邻指针不能掩盖SQLite内身份漂移；pending恢复和未知文件系统入口均拒绝删除
+  ---
+  duration_ms: 131.573074
+  type: 'test'
+  ...
+# Subtest: 尚未确定当前数据集时允许只读历史但拒绝把未知当前库当作旧库删除
+ok 76 - 尚未确定当前数据集时允许只读历史但拒绝把未知当前库当作旧库删除
+  ---
+  duration_ms: 125.77753
+  type: 'test'
+  ...
+# Subtest: default真实reset归档计入历史备份，整库删除包含同scope多代备份且保留共享配置
+ok 77 - default真实reset归档计入历史备份，整库删除包含同scope多代备份且保留共享配置
+  ---
+  duration_ms: 165.211292
+  type: 'test'
+  ...
+# Subtest: workspace真实reset归档计入历史备份，整库删除包含同scope多代备份且保留共享配置
+ok 78 - workspace真实reset归档计入历史备份，整库删除包含同scope多代备份且保留共享配置
+  ---
+  duration_ms: 154.785545
+  type: 'test'
+  ...
+# Subtest: 归档备份根为符号链接时统计和删除均拒绝，尚未删除完整候选或外部内容
+ok 79 - 归档备份根为符号链接时统计和删除均拒绝，尚未删除完整候选或外部内容
+  ---
+  duration_ms: 102.687908
+  type: 'test'
+  ...
+# Subtest: 无旧库时只预留固定默认根，初始化完成后根丢失不能隐式重建
+ok 80 - 无旧库时只预留固定默认根，初始化完成后根丢失不能隐式重建
+  ---
+  duration_ms: 69.5645
+  type: 'test'
+  ...
+# Subtest: 唯一完整旧根原地复用，RootBinding、数据集身份和CAS不改写
+ok 81 - 唯一完整旧根原地复用，RootBinding、数据集身份和CAS不改写
+  ---
+  duration_ms: 16.38786
+  type: 'test'
+  ...
+# Subtest: 唯一旧workspace根原地选择，包括epoch 3有界升级入口
+ok 82 - 唯一旧workspace根原地选择，包括epoch 3有界升级入口
+  ---
+  duration_ms: 19.600039
+  type: 'test'
+  ...
+# Subtest: 多旧库必须显式选库，首窗口及当前folder不能抢占
+ok 83 - 多旧库必须显式选库，首窗口及当前folder不能抢占
+  ---
+  duration_ms: 32.071948
+  type: 'test'
+  ...
+# Subtest: 固定选择不受workspace保存、增删重排文件夹影响，正常启动不扫描旧scope
+ok 84 - 固定选择不受workspace保存、增删重排文件夹影响，正常启动不扫描旧scope
+  ---
+  duration_ms: 30.329059
+  type: 'test'
+  ...
+# Subtest: 活跃或身份不明Host拒绝切换，原选择完整保留
+ok 85 - 活跃或身份不明Host拒绝切换，原选择完整保留
+  ---
+  duration_ms: 38.754196
+  type: 'test'
+  ...
+# Subtest: 已完成pending根保留原位置交给既有恢复入口
+ok 86 - 已完成pending根保留原位置交给既有恢复入口
+  ---
+  duration_ms: 12.881674
+  type: 'test'
+  ...
+# Subtest: epoch 3升级已刷出epoch 4但未发布pointer的精确恢复窗口仍可选中
+ok 87 - epoch 3升级已刷出epoch 4但未发布pointer的精确恢复窗口仍可选中
+  ---
+  duration_ms: 17.312303
+  type: 'test'
+  ...
+# Subtest: epoch 3升级已刷出epoch 5但未发布pointer的精确恢复窗口仍可选中
+ok 88 - epoch 3升级已刷出epoch 5但未发布pointer的精确恢复窗口仍可选中
+  ---
+  duration_ms: 15.05269
+  type: 'test'
+  ...
+# Subtest: epoch 4升级已刷出epoch 5但未发布pointer的精确恢复窗口仍可选中
+ok 89 - epoch 4升级已刷出epoch 5但未发布pointer的精确恢复窗口仍可选中
+  ---
+  duration_ms: 14.389044
+  type: 'test'
+  ...
+# Subtest: 真实进程在cutover归档active后退出，选库仍放行原journal恢复且不改写身份
+ok 90 - 真实进程在cutover归档active后退出，选库仍放行原journal恢复且不改写身份
+  ---
+  duration_ms: 240.130252
+  type: 'test'
+  ...
+# Subtest: 仅cutover request不能掩盖丢失数据库，首次未完成pending仍保持拒绝
+ok 91 - 仅cutover request不能掩盖丢失数据库，首次未完成pending仍保持拒绝
+  ---
+  duration_ms: 31.393604
+  type: 'test'
+  ...
+# Subtest: 损坏指针、无binding数据、丢失CAS和epoch身份漂移均拒绝且不发布新选择
+ok 92 - 损坏指针、无binding数据、丢失CAS和epoch身份漂移均拒绝且不发布新选择
+  ---
+  duration_ms: 43.060963
+  type: 'test'
+  ...
+# Subtest: 已选指针损坏不能回退，candidate id和RootBinding路径不能越界
+ok 93 - 已选指针损坏不能回退，candidate id和RootBinding路径不能越界
+  ---
+  duration_ms: 17.04742
+  type: 'test'
+  ...
+# Subtest: 并发空窗口通过同一admission发布单个完整固定选择
+ok 94 - 并发空窗口通过同一admission发布单个完整固定选择
+  ---
+  duration_ms: 108.248012
+  type: 'test'
+  ...
+# Subtest: published epoch 3 upgrades to 5 with the conversation, message and CAS intact
+ok 95 - published epoch 3 upgrades to 5 with the conversation, message and CAS intact
+  ---
+  duration_ms: 558.811006
+  type: 'test'
+  ...
+# Subtest: published epoch 4 upgrades to 5 with the conversation, message and CAS intact
+ok 96 - published epoch 4 upgrades to 5 with the conversation, message and CAS intact
+  ---
+  duration_ms: 425.108311
+  type: 'test'
+  ...
+# Subtest: the earliest published epoch 3 manifest variant keeps history after upgrading
+ok 97 - the earliest published epoch 3 manifest variant keeps history after upgrading
+  ---
+  duration_ms: 327.019448
+  type: 'test'
+  ...
+# Subtest: the exact epoch 4 missing-link predecessor upgrades and reconnects old child continuations
+ok 98 - the exact epoch 4 missing-link predecessor upgrades and reconnects old child continuations
+  ---
+  duration_ms: 426.525633
+  type: 'test'
+  ...
+# Subtest: a committed epoch 4 WAL-only conversation survives the SQLite backup and upgrade
+ok 99 - a committed epoch 4 WAL-only conversation survives the SQLite backup and upgrade
+  ---
+  duration_ms: 390.345969
+  type: 'test'
+  ...
+# Subtest: a deep Runtime path upgrades with a durable backup and opens the preserved conversation
+ok 100 - a deep Runtime path upgrades with a durable backup and opens the preserved conversation
+  ---
+  duration_ms: 389.583658
+  type: 'test'
+  ...
+# Subtest: an interrupted published 3→4 pending-only state recovers and continues to epoch 5
+ok 101 - an interrupted published 3→4 pending-only state recovers and continues to epoch 5
+  ---
+  duration_ms: 327.259115
+  type: 'test'
+  ...
+# Subtest: an interrupted published 3→4 backed-up state recovers and continues to epoch 5
+ok 102 - an interrupted published 3→4 backed-up state recovers and continues to epoch 5
+  ---
+  duration_ms: 344.092935
+  type: 'test'
+  ...
+# Subtest: an exact epoch 4 upgrade recovers at every durable interruption without losing history
+    # Subtest: after-writer-fence
+    ok 1 - after-writer-fence
+      ---
+      duration_ms: 312.63903
+      type: 'test'
+      ...
+    # Subtest: before-backup
+    ok 2 - before-backup
+      ---
+      duration_ms: 303.626992
+      type: 'test'
+      ...
+    # Subtest: after-backup
+    ok 3 - after-backup
+      ---
+      duration_ms: 299.832007
+      type: 'test'
+      ...
+    # Subtest: after-database-commit
+    ok 4 - after-database-commit
+      ---
+      duration_ms: 301.841432
+      type: 'test'
+      ...
+    # Subtest: after-pointer-publication
+    ok 5 - after-pointer-publication
+      ---
+      duration_ms: 294.946279
+      type: 'test'
+      ...
+    1..5
+ok 103 - an exact epoch 4 upgrade recovers at every durable interruption without losing history
+  ---
+  duration_ms: 1514.323929
+  type: 'test'
+  ...
+# Subtest: epoch 4 schema drift leaves the old pointer and conversation untouched
+ok 104 - epoch 4 schema drift leaves the old pointer and conversation untouched
+  ---
+  duration_ms: 226.871346
+  type: 'test'
+  ...
+# Subtest: a damaged migration backup blocks recovery without replacing the old Runtime
+ok 105 - a damaged migration backup blocks recovery without replacing the old Runtime
+  ---
+  duration_ms: 284.413273
+  type: 'test'
+  ...
+# Subtest: Workspace身份保持稳定但不再参与当前Runtime选库
+ok 106 - Workspace身份保持稳定但不再参与当前Runtime选库
+  ---
+  duration_ms: 50.810388
+  type: 'test'
+  ...
+# Subtest: 两个配置Authority不会把对方Workspace持久化为不可用
+ok 107 - 两个配置Authority不会把对方Workspace持久化为不可用
+  ---
+  duration_ms: 33.776264
+  type: 'test'
+  ...
+1..107
+# tests 112
+# suites 0
+# pass 112
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 82392.197365

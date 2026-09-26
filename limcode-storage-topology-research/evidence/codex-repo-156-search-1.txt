@@ -1,0 +1,18 @@
+codex-rs/app-server/tests/suite/v2/thread_delete.rs:391:            /*busy_timeout*/ None,
+codex-rs/app-server/tests/suite/v2/thread_delete.rs:491:        .open_read_only_pool(&database, /*busy_timeout*/ None)
+codex-rs/state/src/audit.rs:24:        .open_read_only_pool(&sqlite.state_db_path(), /*busy_timeout*/ None)
+codex-rs/state/src/migrations.rs:22:        ignore_missing: true,
+codex-rs/state/src/migrations_tests.rs:27:        ignore_missing: STATE_MIGRATOR.ignore_missing,
+codex-rs/state/src/migrations_tests.rs:182:    released_pin_migrator.ignore_missing = true;
+codex-rs/state/src/migrations_tests.rs:271:    released_migrator.ignore_missing = true;
+codex-rs/state/src/migrations_tests.rs:415:        ignore_missing: THREAD_HISTORY_MIGRATOR.ignore_missing,
+codex-rs/state/src/migrations_tests.rs:483:        ignore_missing: true,
+codex-rs/state/src/migrations_tests.rs:872:        .open_read_only_pool(&state_path, /*busy_timeout*/ None)
+codex-rs/state/src/runtime.rs:413:        QueryBuilder::<Sqlite>::new("PRAGMA busy_timeout = ")
+codex-rs/state/src/runtime/logs.rs:615:            ignore_missing: false,
+codex-rs/state/src/runtime/queued_items_tests.rs:54:        ignore_missing: false,
+codex-rs/state/src/runtime/remote_control.rs:346:            ignore_missing: false,
+codex-rs/state/src/sqlite.rs:305:            .busy_timeout(Duration::from_secs(5))
+codex-rs/state/src/sqlite.rs:317:        busy_timeout: Option<Duration>,
+codex-rs/state/src/sqlite.rs:324:        if let Some(busy_timeout) = busy_timeout {
+codex-rs/state/src/sqlite.rs:325:            options = options.busy_timeout(busy_timeout);

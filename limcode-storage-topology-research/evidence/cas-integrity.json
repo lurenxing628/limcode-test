@@ -1,0 +1,29 @@
+{
+  "uniqueCataloguedFiles": 77254,
+  "catalogueObjects": 80931,
+  "logicalBytes": 528540349,
+  "allocatedBytes": 749768704,
+  "missing": 0,
+  "digestMismatch": 0,
+  "lengthMismatch": 0,
+  "semanticIdFieldOccurrences": {
+    "turnId": 3810,
+    "conversationId": 3846,
+    "contentObjectId": 1237,
+    "messageId": 1915,
+    "messageRevisionId": 9468,
+    "toolCallId": 5397,
+    "modelRequestId": 768,
+    "targetConversationId": 3892,
+    "sourceTurnId": 1997,
+    "childExecutionId": 3327,
+    "sourceConversationId": 468,
+    "attachmentId": 240,
+    "sourceRootId": 3
+  },
+  "bodyOnlyContentRefs": 0,
+  "candidateUnreferencedPhysicalFiles": 8153,
+  "candidateUnreferencedPhysicalBytes": 20208158,
+  "seconds": 20.33224191699992,
+  "warning": "candidate only, not deletion approval; body scan is heuristic and active operations/backups/frozen records require retention roots; all reads against source CAS are non-mutating"
+}

@@ -65,6 +65,8 @@
     "runtimeSelectionPointer": ".limcode-runtime-selection.json",
     "workspaceFoldersSelectRuntime": false,
     "unselectedHistory": "offline-snapshot-read-only-on-demand",
+    "historicalEpochUpgrade": "automatic-backup-then-exact-target-offline-upgrade",
+    "historyDiscovery": "per-candidate-errors-no-implicit-fallback",
     "sharedConfigurationMaintenance": "all-runtime-scopes-offline",
     "rootBindingFields": [
       "paths",

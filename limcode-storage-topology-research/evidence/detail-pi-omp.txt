@@ -1,0 +1,6 @@
+packages/coding-agent/src/session/session-storage.ts:5:import { withFileLockSync } from "@oh-my-pi/pi-utils/file-lock";
+packages/coding-agent/src/session/session-storage.ts:15:/** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
+packages/coding-agent/src/session/session-storage.ts:221:			SESSION_WRITE_FLAGS | (flags === "w" ? fs.constants.O_TRUNC : fs.constants.O_APPEND),
+packages/coding-agent/src/session/session-storage.ts:242:		const nextFd = openCloexecSync(this.#fpath, SESSION_WRITE_FLAGS | fs.constants.O_APPEND);
+packages/coding-agent/src/session/session-storage.ts:366:const SESSION_PUBLISH_LOCK_WAIT_MS = 500;
+packages/coding-agent/src/session/session-storage.ts:862:		return withFileLockSync(sessionPath, operation);

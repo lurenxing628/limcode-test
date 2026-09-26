@@ -198,6 +198,8 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 
 当前 Runtime 使用 **epoch 5**。已发布 epoch 3、4 在完整 RootBinding、物理结构、manifest 和其他 Host 离线核验后先持久备份 SQLite，再以单事务升级原库并通过日志恢复；旧版中断的 3→4 升级先精确收敛；原会话、消息、附件、CAS、配置和 Workspace 保留。不支持的旧 epoch 或未知漂移保留原根并拒绝自动启动空库。当前 epoch 5 的 table/index/trigger/manifest/RootBinding 必须完整匹配，任何缺表、client mapping 或 digest 漂移均拒绝打开，不做原地修补。Windows 只在 SQLite 原生 I/O 边界使用 namespaced path，持久 RootBinding 仍保存 canonical path。
 
+旧数据备份升级无需单独确认：选中根在启动前处理，其他旧根在当前 Runtime 就绪后自动逐库处理，查看旧历史时补做。目标库必须离线；其他正常数据集可继续运行。某个旧目录不完整会单独显示原因，不再阻断正常历史库的发现；仍禁止异常根隐式换成空库或自动切换当前选择。自动升级不会合并历史库，也不会启动非当前库的旧任务。详细来源审计与当前交付记录见 [epoch 3/4 恢复审计](../../../limcode-storage-topology-research/epoch3-4-recovery-audit.md)。
+
 真实 cutover actor 是最终 VSIX 的 `cutover-only coordinator`：旧宿主先关闭 admission、drain 并持久化 request，然后退出；最终 VSIX 安装并重启后先完成 journaled archive、配置过滤和校验，再创建 SQLite/CAS/epoch 并原子激活 RootBinding。归档失败时 active pointer 不变且可按 journal 恢复。
 
 ## 8. 实施阶段与验证出口

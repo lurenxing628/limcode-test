@@ -1,0 +1,36 @@
+packages/core/src/task-history/__tests__/task-history.spec.ts:42:	it("merges missing sessions from tasks/<id>/history_item.json", async () => {
+packages/core/src/task-history/__tests__/task-history.spec.ts:54:			path.join(tasksDir, "c", "history_item.json"),
+packages/core/src/task-history/__tests__/task-history.spec.ts:95:			path.join(tasksDir, "good", "history_item.json"),
+packages/core/src/task-history/__tests__/task-history.spec.ts:98:		await fs.writeFile(path.join(tasksDir, "bad-json", "history_item.json"), "{oops")
+packages/core/src/task-history/__tests__/task-history.spec.ts:100:			path.join(tasksDir, "bad-shape", "history_item.json"),
+packages/core/src/task-history/index.ts:6:const HISTORY_ITEM_FILENAME = "history_item.json"
+pnpm-lock.yaml:631:      proper-lockfile:
+pnpm-lock.yaml:767:      '@types/proper-lockfile':
+pnpm-lock.yaml:5204:  '@types/proper-lockfile@4.1.4':
+pnpm-lock.yaml:10845:  proper-lockfile@4.1.2:
+pnpm-lock.yaml:19035:  '@types/proper-lockfile@4.1.4':
+pnpm-lock.yaml:25802:  proper-lockfile@4.1.2:
+src/core/task-persistence/TaskHistoryStore.ts:24: * existing task directory (`globalStorage/tasks/<taskId>/history_item.json`).
+src/core/task-persistence/TaskHistoryStore.ts:28: * Cross-process safety comes from `safeWriteJson`'s `proper-lockfile`
+src/core/task-persistence/TaskHistoryStore.ts:263:			// Tasks on disk but not in cache: read their history_item.json
+src/core/task-persistence/TaskHistoryStore.ts:322:	 * For each entry in the globalState array, writes a `history_item.json`
+src/core/task-persistence/TaskHistoryStore.ts:346:			// Write history_item.json if it doesn't exist yet
+src/core/task-persistence/TaskHistoryStore.ts:438:	 * Write a HistoryItem to its per-task `history_item.json` file.
+src/core/task-persistence/TaskHistoryStore.ts:446:	 * Read a HistoryItem from its per-task `history_item.json` file.
+src/core/task-persistence/TaskHistoryStore.ts:558:	 * Get the path to a task's `history_item.json` file.
+src/core/task-persistence/__tests__/TaskHistoryStore.crossInstance.spec.ts:16:// Mock safeWriteJson to use plain fs writes in tests (avoids proper-lockfile issues)
+src/core/task-persistence/__tests__/TaskHistoryStore.spec.ts:16:// Mock safeWriteJson to use plain fs writes in tests (avoids proper-lockfile issues)
+src/core/task-persistence/__tests__/TaskHistoryStore.spec.ts:238:			// Manually create a task directory with history_item.json
+src/core/task-persistence/__tests__/TaskHistoryStore.spec.ts:308:		it("writes history_item.json for tasks with existing directories", async () => {
+src/core/task-persistence/__tests__/TaskHistoryStore.spec.ts:338:			// Write an existing history_item.json with specific data
+src/package.json:480:		"proper-lockfile": "^4.1.2",
+src/package.json:527:		"@types/proper-lockfile": "^4.1.4",
+src/shared/globalFileNames.ts:7:	historyItem: "history_item.json",
+src/utils/__tests__/safeWriteJson.test.ts:22:	// (like proper-lockfile's internals) will use their actual implementations.
+src/utils/__tests__/safeWriteJson.test.ts:72:		// This allows proper-lockfile to acquire a lock on an existing file.
+src/utils/__tests__/safeWriteJson.test.ts:386:		vi.doMock("proper-lockfile", () => ({
+src/utils/__tests__/safeWriteJson.test.ts:387:			...vi.importActual("proper-lockfile"),
+src/utils/__tests__/safeWriteJson.test.ts:391:		// Re-import safeWriteJson to use the mocked proper-lockfile
+src/utils/__tests__/safeWriteJson.test.ts:398:		vi.unmock("proper-lockfile") // Ensure the mock is removed after this test
+src/utils/safeWriteJson.ts:4:import * as lockfile from "proper-lockfile"
+src/utils/safeWriteJson.ts:23: * - Uses 'proper-lockfile' for inter-process advisory locking to prevent concurrent writes to the same path.

@@ -1,0 +1,8 @@
+packages/core/src/database/database.ts:27:    yield* db.run("PRAGMA journal_mode = WAL")
+packages/core/src/database/database.ts:29:    yield* db.run("PRAGMA busy_timeout = 5000")
+packages/core/src/database/sqlite.bun.ts:164:      if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
+packages/core/src/database/sqlite.node.ts:159:      if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
+packages/desktop/src/main/draft-store.ts:19:    "PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS document (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS blob (id TEXT PRIMARY KEY, data BLOB NOT NULL);",
+packages/effect-drizzle-sqlite/test/sqlite.test.ts:109:    holder.run("pragma busy_timeout = 0")
+packages/effect-drizzle-sqlite/test/sqlite.test.ts:115:        yield* db.run(sql`pragma busy_timeout = 0`)
+packages/effect-sqlite-node/src/index.ts:69:        db.exec("PRAGMA journal_mode = WAL;")

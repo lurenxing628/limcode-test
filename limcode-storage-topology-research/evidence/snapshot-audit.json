@@ -1,0 +1,837 @@
+{
+  "snapshotAt": "2026-09-25T19:37:26.629060+00:00",
+  "sqliteVersion": "3.34.1",
+  "manifestDomains": 107,
+  "nonemptyDomains": 96,
+  "conversationCounts": {
+    "P1": 1,
+    "P2": 36
+  },
+  "messages": 5528,
+  "revisions": 21090,
+  "childExecutions": 26,
+  "physicalFKEdges": 164,
+  "resolvedGraphEdges": 310504,
+  "crossProjectNonContentTables": [],
+  "unassignedNonContentRows": 542,
+  "ambiguousSoftReferenceColumns": {},
+  "unresolvedFields": {
+    "agent_conversation_link.agent_id": 37,
+    "child_interruption_request.source_key": 3,
+    "command_receipt.source_key": 23500,
+    "conversation_reuse_link.agent_id": 1,
+    "execution_lease.owner_id": 1,
+    "execution_lease.host_boot_id": 1,
+    "file_change_set_member.work_environment_id": 470,
+    "model_request.provider_id": 1321,
+    "model_request.model_id": 1321,
+    "operation.owner_id": 4,
+    "tool_call_source_link.batch_id": 4143,
+    "tool_call_source_link.provider_call_id": 4143,
+    "turn_executor_link.agent_id": 180,
+    "turn_intent_executor_link.agent_id": 127
+  },
+  "coverage": {
+    "agent_conversation_link": {
+      "P1": 1,
+      "P2": 36
+    },
+    "answer_bridge": {
+      "P2": 26
+    },
+    "answer_payload": {
+      "P2": 77
+    },
+    "answer_submission": {
+      "P2": 77
+    },
+    "attachment": {
+      "P2": 2
+    },
+    "attachment_link": {
+      "P2": 2
+    },
+    "attachment_observation_link": {},
+    "attempt": {
+      "P2": 3808
+    },
+    "authority_snapshot": {
+      "P2": 180
+    },
+    "child_execution": {
+      "P2": 26
+    },
+    "child_execution_active_turn_link": {},
+    "child_execution_intent_link": {
+      "P2": 35
+    },
+    "child_execution_parent_link": {
+      "P2": 26
+    },
+    "child_execution_turn_link": {
+      "P2": 57
+    },
+    "child_interruption_intent_link": {
+      "P2": 4
+    },
+    "child_interruption_lineage_link": {
+      "P2": 3
+    },
+    "child_interruption_process_cleanup": {
+      "P2": 13
+    },
+    "child_interruption_request": {
+      "P2": 3
+    },
+    "child_interruption_turn_link": {
+      "P2": 3
+    },
+    "collaboration_board_channel": {},
+    "collaboration_board_channel_scope_link": {},
+    "collaboration_board_command_receipt": {},
+    "collaboration_board_post": {},
+    "collaboration_board_post_channel_link": {},
+    "collaboration_board_post_source_link": {},
+    "collaboration_board_reply_link": {},
+    "collaboration_board_subscription_link": {},
+    "collaboration_budget": {
+      "P2": 2
+    },
+    "collaboration_message": {
+      "P2": 206
+    },
+    "collaboration_message_payload_link": {
+      "P2": 206
+    },
+    "collaboration_message_reply_link": {
+      "P2": 11
+    },
+    "collaboration_message_source_link": {
+      "P2": 206
+    },
+    "collaboration_message_target_link": {
+      "P2": 206
+    },
+    "collaboration_request": {
+      "P2": 8
+    },
+    "collaboration_request_turn_link": {
+      "P2": 8
+    },
+    "command_receipt": {
+      "P2": 22958,
+      "unassigned": 542
+    },
+    "compression_block": {
+      "P2": 2
+    },
+    "compression_block_observation_link": {},
+    "compression_block_source": {
+      "P2": 1440
+    },
+    "context_segment": {
+      "P2": 12548
+    },
+    "context_segment_source": {
+      "P2": 12556
+    },
+    "context_sequence_node": {
+      "P2": 12548
+    },
+    "context_sequence_root": {
+      "P2": 12559
+    },
+    "conversation": {
+      "P1": 1,
+      "P2": 36
+    },
+    "conversation_attachment_handle_link": {
+      "P2": 2
+    },
+    "conversation_branch_link": {
+      "P2": 1
+    },
+    "conversation_context_head_link": {
+      "P2": 36
+    },
+    "conversation_origin_link": {
+      "P2": 27
+    },
+    "conversation_project_link": {
+      "P1": 1,
+      "P2": 36
+    },
+    "conversation_reuse_link": {
+      "P2": 1
+    },
+    "effect_intent": {
+      "P2": 2487
+    },
+    "effect_receipt": {
+      "P2": 2486
+    },
+    "execution_lease": {
+      "P2": 1
+    },
+    "file_change_decision": {
+      "P2": 468
+    },
+    "file_change_set": {
+      "P2": 468
+    },
+    "file_change_set_member": {
+      "P2": 470
+    },
+    "file_mutation_receipt": {
+      "P2": 468
+    },
+    "file_mutation_receipt_member": {
+      "P2": 470
+    },
+    "interaction_owner_link": {
+      "P2": 517
+    },
+    "interaction_request": {
+      "P2": 517
+    },
+    "interaction_response": {
+      "P2": 517
+    },
+    "interaction_tool_call_link": {
+      "P2": 517
+    },
+    "message": {
+      "P2": 5528
+    },
+    "message_current_revision_link": {
+      "P2": 5528
+    },
+    "message_part_of_conversation": {
+      "P2": 5528
+    },
+    "message_revision": {
+      "P2": 21090
+    },
+    "message_turn_link": {
+      "P2": 5528
+    },
+    "model_context_projection": {
+      "P2": 1323
+    },
+    "model_request": {
+      "P2": 1321
+    },
+    "model_request_message_link": {
+      "P2": 1283
+    },
+    "model_stream_checkpoint": {
+      "P2": 17142
+    },
+    "model_stream_fence": {
+      "P2": 1256
+    },
+    "operation": {
+      "P2": 5732
+    },
+    "operation_resolution": {
+      "P2": 49
+    },
+    "outcome_pause": {
+      "P2": 49
+    },
+    "pending_turn_input": {
+      "P2": 592
+    },
+    "process": {
+      "P2": 1720
+    },
+    "process_completion_dispatch": {
+      "P2": 270
+    },
+    "process_completion_source_link": {
+      "P2": 1720
+    },
+    "process_origin_link": {
+      "P2": 1720
+    },
+    "process_output_chunk": {
+      "P2": 1804
+    },
+    "process_receipt": {
+      "P2": 1720
+    },
+    "project_context": {
+      "P1": 1,
+      "P2": 1
+    },
+    "runtime_delivery": {
+      "P2": 553
+    },
+    "runtime_delivery_input_link": {
+      "P2": 541
+    },
+    "runtime_delivery_intent_link": {
+      "P2": 82
+    },
+    "runtime_delivery_wake": {
+      "P2": 544
+    },
+    "runtime_inbox_item": {
+      "P2": 553
+    },
+    "runtime_inbox_payload_link": {
+      "P2": 553
+    },
+    "tool_call": {
+      "P2": 4143
+    },
+    "tool_call_event": {
+      "P2": 8982
+    },
+    "tool_call_policy_snapshot": {
+      "P2": 4143
+    },
+    "tool_call_source_link": {
+      "P2": 4143
+    },
+    "tool_execution": {
+      "P2": 4143
+    },
+    "tool_model_result": {
+      "P2": 4142
+    },
+    "tool_outcome": {
+      "P2": 4142
+    },
+    "tool_result_artifact": {
+      "P2": 3672
+    },
+    "turn": {
+      "P2": 180
+    },
+    "turn_execution_preset_revision": {
+      "P2": 156
+    },
+    "turn_executor_link": {
+      "P2": 180
+    },
+    "turn_final_output_fence": {
+      "P2": 73
+    },
+    "turn_intent": {
+      "P2": 156
+    },
+    "turn_intent_authority_revision": {
+      "P2": 127
+    },
+    "turn_intent_executor_link": {
+      "P2": 127
+    },
+    "turn_intent_revision": {
+      "P2": 156
+    },
+    "turn_termination": {
+      "P2": 179
+    }
+  },
+  "contentTypes": {
+    "application/vnd.limcode.message+json": {
+      "objects": 15413,
+      "logicalBytes": 221017788,
+      "allocatedBytes": 257552384,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.model-request-recipe+json": {
+      "objects": 1319,
+      "logicalBytes": 98465884,
+      "allocatedBytes": 101216256,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.model-stream-checkpoint+json": {
+      "objects": 23084,
+      "logicalBytes": 86455133,
+      "allocatedBytes": 156082176,
+      "sqlUnreferencedObjects": 5942,
+      "sqlUnreferencedBytes": 18522608,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.context-tool-pair+json": {
+      "objects": 8276,
+      "logicalBytes": 33104845,
+      "allocatedBytes": 53641216,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "text/plain; charset=utf-8": {
+      "objects": 598,
+      "logicalBytes": 26675531,
+      "allocatedBytes": 28024832,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.tool-model-result+json": {
+      "objects": 4140,
+      "logicalBytes": 20713595,
+      "allocatedBytes": 32452608,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.tool-result-artifact+json": {
+      "objects": 3670,
+      "logicalBytes": 20380278,
+      "allocatedBytes": 30527488,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/octet-stream": {
+      "objects": 1722,
+      "logicalBytes": 12573206,
+      "allocatedBytes": 16789504,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.native-child-handle-projection+json": {
+      "objects": 740,
+      "logicalBytes": 6485235,
+      "allocatedBytes": 8105984,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.turn-authority-snapshot+json": {
+      "objects": 178,
+      "logicalBytes": 4789874,
+      "allocatedBytes": 5103616,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-dispatch-request+json": {
+      "objects": 2191,
+      "logicalBytes": 2786465,
+      "allocatedBytes": 8986624,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.tool-arguments+json": {
+      "objects": 4005,
+      "logicalBytes": 2755865,
+      "allocatedBytes": 16863232,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.native-tool-admission+json": {
+      "objects": 4141,
+      "logicalBytes": 2500290,
+      "allocatedBytes": 16961536,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-process_start-receipt+json": {
+      "objects": 1720,
+      "logicalBytes": 2312583,
+      "allocatedBytes": 7045120,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.native-tool-delivery+json": {
+      "objects": 4095,
+      "logicalBytes": 2160222,
+      "allocatedBytes": 16773120,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.runtime-delivery-model+json": {
+      "objects": 541,
+      "logicalBytes": 1492351,
+      "allocatedBytes": 2682880,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-process_start+json": {
+      "objects": 1721,
+      "logicalBytes": 1331077,
+      "allocatedBytes": 7049216,
+      "sqlUnreferencedObjects": 1721,
+      "sqlUnreferencedBytes": 1331077,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.process-completion+json": {
+      "objects": 270,
+      "logicalBytes": 771092,
+      "allocatedBytes": 1441792,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.file-change-proposal+json": {
+      "objects": 468,
+      "logicalBytes": 366617,
+      "allocatedBytes": 1916928,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-file_mutation+json": {
+      "objects": 468,
+      "logicalBytes": 338069,
+      "allocatedBytes": 1916928,
+      "sqlUnreferencedObjects": 468,
+      "sqlUnreferencedBytes": 338069,
+      "sharedProjectObjects": 0
+    },
+    "text/plain": {
+      "objects": 114,
+      "logicalBytes": 216496,
+      "allocatedBytes": 532480,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-process_exit-receipt+json": {
+      "objects": 270,
+      "logicalBytes": 204987,
+      "allocatedBytes": 1105920,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-file_mutation-receipt+json": {
+      "objects": 468,
+      "logicalBytes": 166398,
+      "allocatedBytes": 1916928,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.compression-contents+json": {
+      "objects": 2,
+      "logicalBytes": 160146,
+      "allocatedBytes": 163840,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.file-change-decision+json": {
+      "objects": 468,
+      "logicalBytes": 131040,
+      "allocatedBytes": 1916928,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-process_exit+json": {
+      "objects": 270,
+      "logicalBytes": 114849,
+      "allocatedBytes": 1105920,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "text/vnd.limcode.collaboration-message": {
+      "objects": 206,
+      "logicalBytes": 107462,
+      "allocatedBytes": 843776,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.plan-review-prompt+json": {
+      "objects": 46,
+      "logicalBytes": 92022,
+      "allocatedBytes": 208896,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "image/png": {
+      "objects": 2,
+      "logicalBytes": 89813,
+      "allocatedBytes": 94208,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.subagent-spawn+json": {
+      "objects": 26,
+      "logicalBytes": 77733,
+      "allocatedBytes": 110592,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.turn-execution-preset+json": {
+      "objects": 130,
+      "logicalBytes": 45992,
+      "allocatedBytes": 532480,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.plan-review-response+json": {
+      "objects": 46,
+      "logicalBytes": 32154,
+      "allocatedBytes": 188416,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.native-steer+json": {
+      "objects": 28,
+      "logicalBytes": 23766,
+      "allocatedBytes": 114688,
+      "sqlUnreferencedObjects": 19,
+      "sqlUnreferencedBytes": 15420,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.turn-intent+json": {
+      "objects": 67,
+      "logicalBytes": 11912,
+      "allocatedBytes": 274432,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.model-request-settings+json": {
+      "objects": 2,
+      "logicalBytes": 5546,
+      "allocatedBytes": 8192,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.ask-user-prompt+json": {
+      "objects": 3,
+      "logicalBytes": 2011,
+      "allocatedBytes": 12288,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-process_stop_request-receipt+json": {
+      "objects": 2,
+      "logicalBytes": 1491,
+      "allocatedBytes": 8192,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.ask-user-response+json": {
+      "objects": 3,
+      "logicalBytes": 1146,
+      "allocatedBytes": 12288,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.turn-interrupt-request+json": {
+      "objects": 6,
+      "logicalBytes": 1122,
+      "allocatedBytes": 24576,
+      "sqlUnreferencedObjects": 1,
+      "sqlUnreferencedBytes": 216,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-process_stop_request+json": {
+      "objects": 2,
+      "logicalBytes": 768,
+      "allocatedBytes": 8192,
+      "sqlUnreferencedObjects": 2,
+      "sqlUnreferencedBytes": 768,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.child-runtime-delivery-continuation+json": {
+      "objects": 5,
+      "logicalBytes": 650,
+      "allocatedBytes": 20480,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "text/markdown": {
+      "objects": 4,
+      "logicalBytes": 604,
+      "allocatedBytes": 16384,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    },
+    "application/vnd.limcode.effect-subagent_spawn-receipt+json": {
+      "objects": 1,
+      "logicalBytes": 39,
+      "allocatedBytes": 4096,
+      "sqlUnreferencedObjects": 0,
+      "sqlUnreferencedBytes": 0,
+      "sharedProjectObjects": 0
+    }
+  },
+  "missingCataloguedFiles": 0,
+  "casFilesystem": {
+    "files": 80134,
+    "logicalBytes": 533200902,
+    "allocatedBytes": 763678720,
+    "notInSnapshotCatalog": 2880,
+    "note": "live CAS sampled after DB backup; not-in-catalog files include subsequent writes; not a GC candidate list"
+  },
+  "contentProjectCounts": {
+    "P2": 72778,
+    "unassigned": 8153
+  },
+  "crossProjectSharedContentLogicalBytes": 0,
+  "messageRevisionBytes": {
+    "distinctAll": 241815731,
+    "distinctCurrent": 36093692,
+    "notCurrentButStillRetained": 205722039
+  },
+  "compressionSamples": [
+    {
+      "type": "application/vnd.limcode.message+json",
+      "sampleObjects": 150,
+      "sampleBytes": 1704242,
+      "zlib6Bytes": 956623,
+      "ratio": 0.5613
+    },
+    {
+      "type": "application/vnd.limcode.model-request-recipe+json",
+      "sampleObjects": 150,
+      "sampleBytes": 11095834,
+      "zlib6Bytes": 3143860,
+      "ratio": 0.2833
+    },
+    {
+      "type": "application/vnd.limcode.model-stream-checkpoint+json",
+      "sampleObjects": 150,
+      "sampleBytes": 463056,
+      "zlib6Bytes": 208212,
+      "ratio": 0.4496
+    },
+    {
+      "type": "application/vnd.limcode.context-tool-pair+json",
+      "sampleObjects": 150,
+      "sampleBytes": 567523,
+      "zlib6Bytes": 222217,
+      "ratio": 0.3916
+    },
+    {
+      "type": "text/plain; charset=utf-8",
+      "sampleObjects": 150,
+      "sampleBytes": 7467476,
+      "zlib6Bytes": 1724628,
+      "ratio": 0.231
+    },
+    {
+      "type": "application/vnd.limcode.tool-model-result+json",
+      "sampleObjects": 150,
+      "sampleBytes": 707083,
+      "zlib6Bytes": 239517,
+      "ratio": 0.3387
+    }
+  ],
+  "databaseTopPageBytes": [
+    {
+      "name": "content_object",
+      "bytes": 25567232
+    },
+    {
+      "name": "ux_content_object_01",
+      "bytes": 11542528
+    },
+    {
+      "name": "command_receipt",
+      "bytes": 9089024
+    },
+    {
+      "name": "sqlite_autoindex_content_object_1",
+      "bytes": 7413760
+    },
+    {
+      "name": "model_stream_checkpoint",
+      "bytes": 6287360
+    },
+    {
+      "name": "message_revision",
+      "bytes": 4841472
+    },
+    {
+      "name": "context_segment_source",
+      "bytes": 3690496
+    },
+    {
+      "name": "context_sequence_root",
+      "bytes": 3612672
+    },
+    {
+      "name": "ux_command_receipt_01",
+      "bytes": 3469312
+    },
+    {
+      "name": "context_sequence_node",
+      "bytes": 3440640
+    },
+    {
+      "name": "model_request",
+      "bytes": 3125248
+    },
+    {
+      "name": "ix_command_receipt_02",
+      "bytes": 2588672
+    },
+    {
+      "name": "context_segment",
+      "bytes": 2584576
+    },
+    {
+      "name": "ux_context_sequence_node_02",
+      "bytes": 2428928
+    },
+    {
+      "name": "sqlite_autoindex_command_receipt_1",
+      "bytes": 2416640
+    },
+    {
+      "name": "tool_call_event",
+      "bytes": 2347008
+    },
+    {
+      "name": "ux_model_stream_checkpoint_01",
+      "bytes": 1875968
+    },
+    {
+      "name": "sqlite_autoindex_model_stream_checkpoint_1",
+      "bytes": 1875968
+    },
+    {
+      "name": "tool_call_source_link",
+      "bytes": 1703936
+    },
+    {
+      "name": "operation",
+      "bytes": 1650688
+    }
+  ],
+  "timeRange": {
+    "min(created_at)": "2026-09-24T14:27:36.051Z",
+    "max(created_at)": "2026-09-25T19:27:18.216Z"
+  },
+  "limitations": [
+    "soft references only include exact existing IDs in declared ID/key fields; unresolved fields listed for semantic review",
+    "empty tables do not establish future project closure",
+    "shared content is not treated as a domain ownership edge",
+    "CAS body-level references require codec review; SQL-unreferenced does not imply safely reclaimable"
+  ]
+}

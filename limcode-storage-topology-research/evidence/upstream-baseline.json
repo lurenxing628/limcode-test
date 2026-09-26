@@ -1,0 +1,74 @@
+{
+  "opencode/v2": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/opencode/v2",
+    "commit": "6585bb710567fd424dcecbf32389c2391f0165fc",
+    "date": "2026-09-25T22:51:46+05:30",
+    "remote": "https://github.com/anomalyco/opencode.git"
+  },
+  "opencode/repo": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/opencode/repo",
+    "commit": "adee738d1e4597a2d0d317ca61a1625eff289efa",
+    "date": "2026-09-25T16:14:58Z",
+    "remote": "https://github.com/anomalyco/opencode.git"
+  },
+  "vscode-ext/kilocode": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/vscode-ext/kilocode",
+    "commit": "1de876dd2c5b1397e6640a736812561843d23459",
+    "date": "2026-09-25T14:26:48-04:00",
+    "remote": "https://github.com/Kilo-Org/kilocode"
+  },
+  "vscode-ext/continue": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/vscode-ext/continue",
+    "commit": "5522c6f44ca0ac3528b37244818fbfa39b5af470",
+    "date": "2026-07-20T21:00:09-07:00",
+    "remote": "https://github.com/continuedev/continue"
+  },
+  "vscode-ext/vscode": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/vscode-ext/vscode",
+    "commit": "c1c5b32e3fd5a2f3922ea20d7d65055b8b4c47e2",
+    "date": "2026-09-25T11:50:02-07:00",
+    "remote": "https://github.com/microsoft/vscode"
+  },
+  "vscode-ext/vscode-copilot-chat": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/vscode-ext/vscode-copilot-chat",
+    "commit": "5863f5a7088958050792b5dccbe8b46c6e13eccc",
+    "date": "2026-05-20T12:23:37+02:00",
+    "remote": "https://github.com/microsoft/vscode-copilot-chat"
+  },
+  "vscode-ext/cline": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/vscode-ext/cline",
+    "commit": "e369614d1a62f4e3d2f9de7de1d6699f9385423b",
+    "date": "2026-09-25T10:50:06-07:00",
+    "remote": "https://github.com/cline/cline"
+  },
+  "vscode-ext/Roo-Code": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/vscode-ext/Roo-Code",
+    "commit": "b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
+    "date": "2026-05-15T14:04:45-04:00",
+    "remote": "https://github.com/RooCodeInc/Roo-Code"
+  },
+  "codex/repo-156": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/codex/repo-156",
+    "commit": "b412ff32c417f855c2b2d1581b77058eed87c84b",
+    "date": "2026-09-22T17:45:44-07:00",
+    "remote": "https://github.com/openai/codex"
+  },
+  "codex/repo-main": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/codex/repo-main",
+    "commit": "a0b85c7a664505a95ad0cfbaa2291ee34aa5133d",
+    "date": "2026-09-25T18:28:46Z",
+    "remote": "https://github.com/openai/codex"
+  },
+  "pi/omp": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/pi/omp",
+    "commit": "04f58a91d141bb0e7c5f7679c2235945ae813057",
+    "date": "2026-09-25T19:55:32+02:00",
+    "remote": "https://github.com/can1357/oh-my-pi.git"
+  },
+  "pi/upstream": {
+    "path": "/tmp/claude-1000/-home-dev/1e8b2c62-c3a2-4944-9465-5b5a2dc8a034/scratchpad/pi/upstream",
+    "commit": "d6af72e1857cfb10b41d8ff8e69f0d72b4cf6d31",
+    "date": "2026-09-25T18:05:22+02:00",
+    "remote": "https://github.com/earendil-works/pi.git"
+  }
+}

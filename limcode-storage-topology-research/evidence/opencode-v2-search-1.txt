@@ -1,0 +1,9 @@
+packages/core/src/database/database.ts:38:        yield* db.run("PRAGMA journal_mode = WAL")
+packages/core/src/database/database.ts:40:        yield* db.run("PRAGMA busy_timeout = 5000")
+packages/core/src/database/sqlite.bun.ts:93:      if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
+packages/core/src/database/sqlite.node.ts:90:      if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
+packages/core/src/database/sqlite.workerd.ts:14:// Durable Object SQLite only allowlists introspection pragmas; journal_mode,
+packages/core/src/database/sqlite.workerd.ts:15:// synchronous, busy_timeout, cache_size, and wal_checkpoint all throw, and
+packages/core/test/database-drizzle.test.ts:149:    holder.run("pragma busy_timeout = 0")
+packages/core/test/database-drizzle.test.ts:155:        yield* db.run(sql`pragma busy_timeout = 0`)
+packages/desktop/src/main/storage/database.ts:19:  native.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY")

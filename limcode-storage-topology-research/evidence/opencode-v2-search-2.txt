@@ -1,0 +1,212 @@
+packages/app/e2e/performance/timeline/session-tab-switch.fixture.ts:123:FROM session_message
+packages/app/e2e/regression/session-message-revert.spec.ts:8:const projectID = "proj_session_message_revert"
+packages/app/e2e/regression/session-message-revert.spec.ts:9:const sessionID = "ses_session_message_revert"
+packages/core/schema.json:64:      "name": "session_message",
+packages/core/schema.json:72:      "name": "session_v2",
+packages/core/schema.json:941:      "table": "session_message"
+packages/core/schema.json:951:      "table": "session_message"
+packages/core/schema.json:961:      "table": "session_message"
+packages/core/schema.json:971:      "table": "session_message"
+packages/core/schema.json:981:      "table": "session_message"
+packages/core/schema.json:991:      "table": "session_message"
+packages/core/schema.json:1001:      "table": "session_message"
+packages/core/schema.json:1081:      "table": "session_v2"
+packages/core/schema.json:1091:      "table": "session_v2"
+packages/core/schema.json:1101:      "table": "session_v2"
+packages/core/schema.json:1111:      "table": "session_v2"
+packages/core/schema.json:1121:      "table": "session_v2"
+packages/core/schema.json:1131:      "table": "session_v2"
+packages/core/schema.json:1141:      "table": "session_v2"
+packages/core/schema.json:1151:      "table": "session_v2"
+packages/core/schema.json:1161:      "table": "session_v2"
+packages/core/schema.json:1171:      "table": "session_v2"
+packages/core/schema.json:1181:      "table": "session_v2"
+packages/core/schema.json:1191:      "table": "session_v2"
+packages/core/schema.json:1201:      "table": "session_v2"
+packages/core/schema.json:1211:      "table": "session_v2"
+packages/core/schema.json:1221:      "table": "session_v2"
+packages/core/schema.json:1231:      "table": "session_v2"
+packages/core/schema.json:1241:      "table": "session_v2"
+packages/core/schema.json:1251:      "table": "session_v2"
+packages/core/schema.json:1261:      "table": "session_v2"
+packages/core/schema.json:1271:      "table": "session_v2"
+packages/core/schema.json:1281:      "table": "session_v2"
+packages/core/schema.json:1291:      "table": "session_v2"
+packages/core/schema.json:1301:      "table": "session_v2"
+packages/core/schema.json:1311:      "table": "session_v2"
+packages/core/schema.json:1321:      "table": "session_v2"
+packages/core/schema.json:1331:      "table": "session_v2"
+packages/core/schema.json:1341:      "table": "session_v2"
+packages/core/schema.json:1351:      "table": "session_v2"
+packages/core/schema.json:1361:      "table": "session_v2"
+packages/core/schema.json:1371:      "table": "session_v2"
+packages/core/schema.json:1381:      "table": "session_v2"
+packages/core/schema.json:1391:      "table": "session_v2"
+packages/core/schema.json:1401:      "table": "session_v2"
+packages/core/schema.json:1411:      "table": "session_v2"
+packages/core/schema.json:1421:      "table": "session_v2"
+packages/core/schema.json:1431:      "table": "session_v2"
+packages/core/schema.json:1569:      "tableTo": "session_v2",
+packages/core/schema.json:1574:      "name": "fk_instruction_entry_session_id_session_v2_id_fk",
+packages/core/schema.json:1580:      "tableTo": "session_v2",
+packages/core/schema.json:1585:      "name": "fk_instruction_state_session_id_session_v2_id_fk",
+packages/core/schema.json:1591:      "tableTo": "session_v2",
+packages/core/schema.json:1596:      "name": "fk_session_inbox_session_id_session_v2_id_fk",
+packages/core/schema.json:1602:      "tableTo": "session_v2",
+packages/core/schema.json:1607:      "name": "fk_session_message_session_id_session_v2_id_fk",
+packages/core/schema.json:1609:      "table": "session_message"
+packages/core/schema.json:1613:      "tableTo": "session_v2",
+packages/core/schema.json:1618:      "name": "fk_session_pending_session_id_session_v2_id_fk",
+packages/core/schema.json:1629:      "name": "fk_session_v2_project_id_project_id_fk",
+packages/core/schema.json:1631:      "table": "session_v2"
+packages/core/schema.json:1752:      "name": "session_message_pk",
+packages/core/schema.json:1753:      "table": "session_message",
+packages/core/schema.json:1766:      "name": "session_v2_pk",
+packages/core/schema.json:1767:      "table": "session_v2",
+packages/core/schema.json:1893:      "name": "session_message_session_seq_idx",
+packages/core/schema.json:1895:      "table": "session_message"
+packages/core/schema.json:1915:      "name": "session_message_session_type_seq_idx",
+packages/core/schema.json:1917:      "table": "session_message"
+packages/core/schema.json:1937:      "name": "session_message_session_time_created_id_idx",
+packages/core/schema.json:1939:      "table": "session_message"
+packages/core/schema.json:1951:      "name": "session_message_time_created_idx",
+packages/core/schema.json:1953:      "table": "session_message"
+packages/core/schema.json:2019:      "name": "session_v2_project_idx",
+packages/core/schema.json:2021:      "table": "session_v2"
+packages/core/schema.json:2033:      "name": "session_v2_workspace_idx",
+packages/core/schema.json:2035:      "table": "session_v2"
+packages/core/schema.json:2047:      "name": "session_v2_parent_idx",
+packages/core/schema.json:2049:      "table": "session_v2"
+packages/core/schema.json:2059:      "where": "\"session_v2\".\"time_suspended\" is not null",
+packages/core/schema.json:2061:      "name": "session_v2_time_suspended_idx",
+packages/core/schema.json:2063:      "table": "session_v2"
+packages/core/src/database/migration.gen.ts:10:import m08 from "./migration/20260312043431_session_message_cursor.js"
+packages/core/src/database/migration.gen.ts:27:import m25 from "./migration/20260603001617_session_message_projection_indexes.js"
+packages/core/src/database/migration.gen.ts:28:import m26 from "./migration/20260603040000_session_message_projection_order.js"
+packages/core/src/database/migration.ts:29:    if (tables.some((table) => table.name === "session" || table.name === "session_v2"))
+packages/core/src/database/migration/20260312043431_session_message_cursor.ts:5:  id: "20260312043431_session_message_cursor",
+packages/core/src/database/migration/20260427172553_slow_nightmare.ts:9:        CREATE TABLE \`session_message\` (
+packages/core/src/database/migration/20260427172553_slow_nightmare.ts:16:          CONSTRAINT \`fk_session_message_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/migration/20260427172553_slow_nightmare.ts:22:      yield* tx.run(`CREATE INDEX \`session_message_session_idx\` ON \`session_message\` (\`session_id\`);`)
+packages/core/src/database/migration/20260427172553_slow_nightmare.ts:24:        `CREATE INDEX \`session_message_session_type_idx\` ON \`session_message\` (\`session_id\`,\`type\`);`,
+packages/core/src/database/migration/20260427172553_slow_nightmare.ts:26:      yield* tx.run(`CREATE INDEX \`session_message_time_created_idx\` ON \`session_message\` (\`time_created\`);`)
+packages/core/src/database/migration/20260603001617_session_message_projection_indexes.ts:5:  id: "20260603001617_session_message_projection_indexes",
+packages/core/src/database/migration/20260603001617_session_message_projection_indexes.ts:8:      yield* tx.run(`DROP INDEX IF EXISTS \`session_message_session_idx\`;`)
+packages/core/src/database/migration/20260603001617_session_message_projection_indexes.ts:9:      yield* tx.run(`DROP INDEX IF EXISTS \`session_message_session_type_idx\`;`)
+packages/core/src/database/migration/20260603001617_session_message_projection_indexes.ts:12:        `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
+packages/core/src/database/migration/20260603001617_session_message_projection_indexes.ts:15:        `CREATE INDEX \`session_message_session_type_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`type\`,\`time_created\`,\`id\`);`,
+packages/core/src/database/migration/20260603040000_session_message_projection_order.ts:5:  id: "20260603040000_session_message_projection_order",
+packages/core/src/database/migration/20260603040000_session_message_projection_order.ts:10:      yield* tx.run(`DELETE FROM \`session_message\`;`)
+packages/core/src/database/migration/20260603040000_session_message_projection_order.ts:11:      yield* tx.run(`ALTER TABLE \`session_message\` ADD COLUMN \`seq\` integer NOT NULL;`)
+packages/core/src/database/migration/20260603040000_session_message_projection_order.ts:12:      yield* tx.run(`DROP INDEX IF EXISTS \`session_message_session_type_time_created_id_idx\`;`)
+packages/core/src/database/migration/20260603040000_session_message_projection_order.ts:13:      yield* tx.run(`CREATE INDEX \`session_message_session_seq_idx\` ON \`session_message\` (\`session_id\`,\`seq\`);`)
+packages/core/src/database/migration/20260603040000_session_message_projection_order.ts:15:        `CREATE INDEX \`session_message_session_type_seq_idx\` ON \`session_message\` (\`session_id\`,\`type\`,\`seq\`);`,
+packages/core/src/database/migration/20260603160727_jittery_ezekiel_stane.ts:16:        `CREATE INDEX IF NOT EXISTS \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
+packages/core/src/database/migration/20260604172448_event_sourced_session_input.ts:9:      yield* tx.run(`DELETE FROM \`session_message\`;`)
+packages/core/src/database/migration/20260604172448_event_sourced_session_input.ts:16:      yield* tx.run(`DROP INDEX IF EXISTS \`session_message_session_seq_idx\`;`)
+packages/core/src/database/migration/20260604172448_event_sourced_session_input.ts:18:        `CREATE UNIQUE INDEX \`session_message_session_seq_idx\` ON \`session_message\` (\`session_id\`,\`seq\`);`,
+packages/core/src/database/migration/20260622170816_reset_v2_session_state.ts:10:      yield* tx.run(`DELETE FROM \`session_message\`;`)
+packages/core/src/database/migration/20260622202450_simplify_session_input.ts:10:      yield* tx.run(`DELETE FROM \`session_message\`;`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:18:            SELECT 1 FROM session_message WHERE session_message.session_id = message.session_id
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:28:        yield* tx.run(`ALTER TABLE \`session\` RENAME TO \`session_v2\`;`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:29:        yield* tx.run(`CREATE INDEX \`session_v2_project_idx\` ON \`session_v2\` (\`project_id\`);`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:30:        yield* tx.run(`CREATE INDEX \`session_v2_workspace_idx\` ON \`session_v2\` (\`workspace_id\`);`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:31:        yield* tx.run(`CREATE INDEX \`session_v2_parent_idx\` ON \`session_v2\` (\`parent_id\`);`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:33:          `CREATE INDEX \`session_v2_time_suspended_idx\` ON \`session_v2\` (\`time_suspended\`) WHERE "session_v2"."time_suspended" is not null;`,
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:64:          CONSTRAINT \`fk_instruction_entry_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:74:          CONSTRAINT \`fk_instruction_state_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:86:          CONSTRAINT \`fk_session_pending_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:90:        CREATE TABLE IF NOT EXISTS \`session_v2\` (
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:123:          CONSTRAINT \`fk_session_v2_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:128:        CREATE TABLE IF NOT EXISTS \`__new_session_message\` (
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:136:          CONSTRAINT \`fk_session_message_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:139:      yield* tx.run(`DROP TABLE \`session_message\`;`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:140:      yield* tx.run(`ALTER TABLE \`__new_session_message\` RENAME TO \`session_message\`;`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:142:        `CREATE UNIQUE INDEX \`session_message_session_seq_idx\` ON \`session_message\` (\`session_id\`,\`seq\`);`,
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:145:        `CREATE INDEX \`session_message_session_type_seq_idx\` ON \`session_message\` (\`session_id\`,\`type\`,\`seq\`);`,
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:148:        `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:150:      yield* tx.run(`CREATE INDEX \`session_message_time_created_idx\` ON \`session_message\` (\`time_created\`);`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:160:      yield* tx.run(`CREATE INDEX \`session_v2_project_idx\` ON \`session_v2\` (\`project_id\`);`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:161:      yield* tx.run(`CREATE INDEX \`session_v2_workspace_idx\` ON \`session_v2\` (\`workspace_id\`);`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:162:      yield* tx.run(`CREATE INDEX \`session_v2_parent_idx\` ON \`session_v2\` (\`parent_id\`);`)
+packages/core/src/database/migration/20260804233008_loose_psylocke.ts:164:        `CREATE INDEX \`session_v2_time_suspended_idx\` ON \`session_v2\` (\`time_suspended\`) WHERE "session_v2"."time_suspended" is not null;`,
+packages/core/src/database/migration/20260811161259_execution_claim_attempts.ts:8:      yield* tx.run(`ALTER TABLE \`session_v2\` ADD \`resume_attempts\` integer DEFAULT 0 NOT NULL;`)
+packages/core/src/database/migration/20260812181746_session_inbox.ts:17:          CONSTRAINT \`fk_session_inbox_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/migration/20260819222447_session_viewed_state.ts:8:      yield* tx.run(`ALTER TABLE \`session_v2\` ADD \`time_idle\` integer;`)
+packages/core/src/database/migration/20260819222447_session_viewed_state.ts:9:      yield* tx.run(`ALTER TABLE \`session_v2\` ADD \`time_viewed\` integer;`)
+packages/core/src/database/migration/20260819222447_session_viewed_state.ts:10:      yield* tx.run(`ALTER TABLE \`session_v2\` ADD \`idle_outcome\` text;`)
+packages/core/src/database/migration/20260910120000_clear_v1_session_permission.ts:8:      yield* tx.run(`UPDATE \`session_v2\` SET \`permission\` = NULL;`)
+packages/core/src/database/schema.gen.ts:133:          CONSTRAINT \`fk_instruction_entry_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/schema.gen.ts:143:          CONSTRAINT \`fk_instruction_state_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/schema.gen.ts:155:          CONSTRAINT \`fk_session_inbox_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/schema.gen.ts:159:        CREATE TABLE \`session_message\` (
+packages/core/src/database/schema.gen.ts:167:          CONSTRAINT \`fk_session_message_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/schema.gen.ts:179:          CONSTRAINT \`fk_session_pending_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/schema.gen.ts:183:        CREATE TABLE \`session_v2\` (
+packages/core/src/database/schema.gen.ts:220:          CONSTRAINT \`fk_session_v2_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
+packages/core/src/database/schema.gen.ts:254:        `CREATE UNIQUE INDEX \`session_message_session_seq_idx\` ON \`session_message\` (\`session_id\`,\`seq\`);`,
+packages/core/src/database/schema.gen.ts:257:        `CREATE INDEX \`session_message_session_type_seq_idx\` ON \`session_message\` (\`session_id\`,\`type\`,\`seq\`);`,
+packages/core/src/database/schema.gen.ts:260:        `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
+packages/core/src/database/schema.gen.ts:262:      yield* tx.run(`CREATE INDEX \`session_message_time_created_idx\` ON \`session_message\` (\`time_created\`);`)
+packages/core/src/database/schema.gen.ts:272:      yield* tx.run(`CREATE INDEX \`session_v2_project_idx\` ON \`session_v2\` (\`project_id\`);`)
+packages/core/src/database/schema.gen.ts:273:      yield* tx.run(`CREATE INDEX \`session_v2_workspace_idx\` ON \`session_v2\` (\`workspace_id\`);`)
+packages/core/src/database/schema.gen.ts:274:      yield* tx.run(`CREATE INDEX \`session_v2_parent_idx\` ON \`session_v2\` (\`parent_id\`);`)
+packages/core/src/database/schema.gen.ts:276:        `CREATE INDEX \`session_v2_time_suspended_idx\` ON \`session_v2\` (\`time_suspended\`) WHERE "session_v2"."time_suspended" is not null;`,
+packages/core/src/database/v1-migration.bun.ts:611:                  INSERT OR IGNORE INTO session_v2 (
+packages/core/src/database/v1-migration.bun.ts:765:          >("SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE session_id = ? ORDER BY seq")
+packages/core/src/database/v1-migration.bun.ts:788:                INSERT INTO session_v2 (
+packages/core/src/database/v1-migration.bun.ts:846:  return tables.has("project") && tables.has("session") && tables.has("session_message")
+packages/core/src/session/sql.ts:23:  "session_v2",
+packages/core/src/session/sql.ts:70:    index("session_v2_project_idx").on(table.project_id),
+packages/core/src/session/sql.ts:71:    index("session_v2_workspace_idx").on(table.workspace_id),
+packages/core/src/session/sql.ts:72:    index("session_v2_parent_idx").on(table.parent_id),
+packages/core/src/session/sql.ts:73:    index("session_v2_time_suspended_idx")
+packages/core/src/session/sql.ts:80:  "session_message",
+packages/core/src/session/sql.ts:93:    uniqueIndex("session_message_session_seq_idx").on(table.session_id, table.seq),
+packages/core/src/session/sql.ts:94:    index("session_message_session_type_seq_idx").on(table.session_id, table.type, table.seq),
+packages/core/src/session/sql.ts:95:    index("session_message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+packages/core/src/session/sql.ts:96:    index("session_message_time_created_idx").on(table.time_created),
+packages/core/test/database-migration.test.ts:182:        expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_v2'`)).toEqual(
+packages/core/test/database-migration.test.ts:184:            name: "session_v2",
+packages/core/test/database-migration.test.ts:199:        yield* db.run(sql`CREATE TABLE session_v2 (id text PRIMARY KEY, title text)`)
+packages/core/test/database-migration.test.ts:200:        yield* db.run(sql`INSERT INTO session_v2 (id, title) VALUES ('ses_existing', 'Existing')`)
+packages/core/test/database-migration.test.ts:205:        expect(yield* db.get(sql`SELECT id, title, time_idle, time_viewed, idle_outcome FROM session_v2`)).toEqual({
+packages/core/test/database-migration.test.ts:235:        expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_v2'`)).toEqual(
+packages/core/test/database-migration.test.ts:236:          { name: "session_v2" },
+packages/core/test/database-migration.test.ts:318:          CREATE TABLE session_message (
+packages/core/test/database-migration.test.ts:346:        yield* db.run(sql`INSERT INTO session_message VALUES ('message', 'session', '{"text":"preserved"}')`)
+packages/core/test/database-migration.test.ts:359:        expect(yield* db.get(sql`SELECT id, resume_attempts FROM session_v2`)).toEqual({
+packages/core/test/database-migration.test.ts:363:        expect(yield* db.get(sql`SELECT id, data FROM session_message`)).toEqual({
+packages/core/test/database-migration.test.ts:374:        expect(yield* db.all<{ table: string }>(sql`PRAGMA foreign_key_list(session_message)`)).toContainEqual(
+packages/core/test/database-migration.test.ts:375:          expect.objectContaining({ table: "session_v2" }),
+packages/core/test/database-migration.test.ts:378:          expect.objectContaining({ table: "session_v2" }),
+packages/core/test/database-migration.test.ts:394:        yield* db.run(sql`CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL)`)
+packages/core/test/session-projector.test.ts:115:      yield* db.run(sql`update session_v2 set revert = ${legacy} where id = ${sessionID}`)
+packages/core/test/session-projector.test.ts:280:      yield* db.run(sql`update session_message set data = '{"time":{"created":0}}' where id = ${messageID}`)
+packages/core/test/sqlite-workerd.test.ts:95:    expect(names).toContain("session_v2")
+packages/core/test/v1-migration.test.ts:950:      CREATE TABLE session_message (
+packages/core/test/v1-migration.test.ts:964:      INSERT INTO session_message VALUES
+packages/core/test/v1-migration.test.ts:979:          INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+packages/core/test/v1-migration.test.ts:983:          INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+packages/core/test/v1-migration.test.ts:994:        expect(yield* db.get(sql`SELECT title, agent, model FROM session_v2 WHERE id = 'ses_next'`)).toEqual({
+packages/core/test/v1-migration.test.ts:1006:        expect(yield* db.all(sql`SELECT id, seq, data FROM session_message WHERE session_id = 'ses_next'`)).toEqual([
+packages/core/test/v1-migration.test.ts:1017:        expect(yield* db.get(sql`SELECT title FROM session_v2 WHERE id = 'ses_existing'`)).toEqual({
+packages/core/test/v1-migration.test.ts:1020:        expect(yield* db.all(sql`SELECT id FROM session_message WHERE session_id = 'ses_existing'`)).toEqual([
+packages/core/test/v1-migration.test.ts:1023:        expect(yield* db.get(sql`SELECT project_id FROM session_v2 WHERE id = 'ses_orphan'`)).toEqual({
+packages/core/test/v1-migration.test.ts:1068:      CREATE TABLE session_message (
+packages/core/test/v1-migration.test.ts:1086:          yield* database.db.get(sql`SELECT fork_boundary, time_suspended FROM session_v2 WHERE id = 'ses_next'`),
+packages/core/test/v1-migration.test.ts:1132:        expect(yield* db.get(sql`SELECT project_id FROM session_v2 WHERE id = 'ses_orphan'`)).toEqual({
+packages/core/test/v1-migration.test.ts:1170:          sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('msg_stale', 'ses_test', 'user', 0, 1, 1, '{"text":"stale","time":{"created":1}}')`,
+packages/core/test/v1-migration.test.ts:1177:        expect(yield* db.all(sql`SELECT id, type, seq, time_created, time_updated, data FROM session_message`)).toEqual(
+packages/core/test/v1-migration.test.ts:1195:            sql`SELECT agent, model, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, time_created, time_updated, time_compacting, time_archived FROM session_v2 WHERE id = 'ses_test'`,
+packages/core/test/v1-migration.test.ts:1238:          sql`CREATE TRIGGER fail_b BEFORE UPDATE ON session_v2 WHEN NEW.id = 'ses_b' BEGIN SELECT RAISE(ABORT, 'stop'); END`,
+packages/core/test/v1-migration.test.ts:1241:          sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('msg_stale_b', 'ses_b', 'user', 0, 7, 8, '{"text":"stale","time":{"created":7}}')`,
+packages/core/test/v1-migration.test.ts:1257:        expect(yield* db.get(sql`SELECT cost FROM session_v2 WHERE id = 'ses_c'`)).toEqual({ cost: 0 })
+packages/core/test/v1-migration.test.ts:1258:        expect(yield* db.get(sql`SELECT cost FROM session_v2 WHERE id = 'ses_b'`)).toBeUndefined()
+packages/core/test/v1-migration.test.ts:1262:            sql`SELECT id, seq, time_created, time_updated, data FROM session_message WHERE session_id = 'ses_b'`,
+packages/core/test/v1-migration.test.ts:1290:        expect(yield* db.get(sql`SELECT cost FROM session_v2 WHERE id = 'ses_b'`)).toEqual({ cost: 0 })
+packages/core/test/v1-migration.test.ts:1291:        expect(yield* db.all(sql`SELECT id FROM session_message WHERE session_id = 'ses_b'`)).toEqual([])
+packages/core/test/v1-migration.test.ts:1351:        expect(yield* db.all(sql`SELECT id FROM session_message`)).toEqual([])
+packages/core/test/v1-migration.test.ts:1386:          sql`CREATE TRIGGER audit_session AFTER UPDATE ON session_v2 BEGIN UPDATE audit SET count = count + 1; END`,
+packages/desktop/src/renderer/startup/initialization.test.ts:18:    const error = new Error("Cannot migrate session_message projections")
+packages/desktop/src/renderer/startup/initialization.test.ts:25:      expect((failure as Error).message).toBe("Cannot migrate session_message projections")

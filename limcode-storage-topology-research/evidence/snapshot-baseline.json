@@ -1,0 +1,40 @@
+{
+  "at": "2026-09-25T19:37:26.629060+00:00",
+  "pythonSQLite": "3.34.1",
+  "datasets": {
+    "vscode": {
+      "source": "/home/dev/.vscode-server/data/User/globalStorage/your-publisher.limcode-test/.limcode-runtime/active/limcode.sqlite",
+      "snapshotBytes": 167075840,
+      "quickCheck": [
+        [
+          "ok"
+        ]
+      ],
+      "foreignKeyViolations": 0,
+      "tables": 109,
+      "sourceFileBytes": {
+        "": 167010304,
+        "-wal": 4321912,
+        "-shm": 32768
+      },
+      "sha256": "01046ae1dc858edbfc7cbef0cfff1d5f9c4926a2fd3d82eab34cbd3ecea8394b"
+    },
+    "code-server": {
+      "source": "/home/dev/.local/share/code-server/User/globalStorage/your-publisher.limcode-test/.limcode-runtime/active/limcode.sqlite",
+      "snapshotBytes": 1908736,
+      "quickCheck": [
+        [
+          "ok"
+        ]
+      ],
+      "foreignKeyViolations": 0,
+      "tables": 109,
+      "sourceFileBytes": {
+        "": 1908736,
+        "-wal": 0,
+        "-shm": 32768
+      },
+      "sha256": "13eccf5571cbc8cbadc1b0d15fdd1602981366bb63eca12bae4a518d86e46918"
+    }
+  }
+}

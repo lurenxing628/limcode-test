@@ -1,0 +1,107 @@
+codex-rs/Cargo.toml:17:    "app-server-daemon",
+codex-rs/Cargo.toml:182:codex-app-server-daemon = { path = "app-server-daemon" }
+codex-rs/app-server-daemon/BUILD.bazel:4:    name = "app-server-daemon",
+codex-rs/app-server-daemon/Cargo.toml:2:name = "codex-app-server-daemon"
+codex-rs/app-server-daemon/README.md:1:# codex-app-server-daemon
+codex-rs/app-server-daemon/README.md:3:> `codex-app-server-daemon` is experimental and its lifecycle contract may
+codex-rs/app-server-daemon/README.md:6:`codex-app-server-daemon` backs the machine-readable `codex app-server`
+codex-rs/app-server-daemon/README.md:49:default. Edit `CODEX_HOME/app-server-daemon/settings.json` to change this:
+codex-rs/app-server-daemon/README.md:94:it copies the invoking package into `CODEX_HOME/packages/app-server-daemon` and
+codex-rs/app-server-daemon/README.md:99:It records the daemon settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
+codex-rs/app-server-daemon/README.md:106:New daemons use `CODEX_HOME/packages/app-server-daemon/current/bin/codex`
+codex-rs/app-server-daemon/README.md:187:The daemon stores its local state under `CODEX_HOME/app-server-daemon/`:
+codex-rs/app-server-daemon/src/backend/pid_tests.rs:163:        let state_dir = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/lib.rs:54:const STATE_DIR_NAME: &str = "app-server-daemon";
+codex-rs/app-server-daemon/src/lib.rs:1249:        let state = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/lib.rs:1268:        std::fs::create_dir_all(home.path().join("packages/app-server-daemon/current"))
+codex-rs/app-server-daemon/src/lib.rs:1306:        let state = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/lib.rs:1363:        let state = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/managed_install.rs:21:    let dedicated = codex_home.join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/managed_install.rs:27:    let state = codex_home.join("app-server-daemon");
+codex-rs/app-server-daemon/src/managed_install.rs:30:            "app-server-daemon",
+codex-rs/app-server-daemon/src/managed_install.rs:65:        || !legacy.is_file() && (cfg!(windows) || root.ends_with("app-server-daemon"))
+codex-rs/app-server-daemon/src/managed_install_path_tests.rs:11:            .join("packages/app-server-daemon/current/bin")
+codex-rs/app-server-daemon/src/managed_install_path_tests.rs:16:    let state = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/managed_install_path_tests.rs:24:        home.path().join("packages/app-server-daemon")
+codex-rs/app-server-daemon/src/managed_install_path_tests.rs:48:        home.path().join("packages/app-server-daemon")
+codex-rs/app-server-daemon/src/managed_install_path_tests.rs:54:        home.path().join("packages/app-server-daemon")
+codex-rs/app-server-daemon/src/managed_install_path_tests.rs:59:        let dedicated = home.path().join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/managed_install_path_tests.rs:69:    let state = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/migration.rs:35:    let root = home.join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install.rs:99:    let root = home.join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install.rs:113:                .iter().any(|name| !matches!(home.join("app-server-daemon").join(name).symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:13:    let state = home.join("app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:82:    let standalone = home.join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:113:    assert!(!home.join("packages/app-server-daemon/current").exists());
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:137:    let selected = std::fs::canonicalize(home.join("packages/app-server-daemon/current"))
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:146:            .join("packages/app-server-daemon/auto-update-version")
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:158:    let state = home.join("app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:179:    assert!(!home.join("packages/app-server-daemon").exists());
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:208:        let root = home.join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:238:                home.join("packages/app-server-daemon"),
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:247:            let state = home.join("app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:282:        let root = home.join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/prepare_install_tests.rs:363:    let current = home.join("packages/app-server-daemon/current");
+codex-rs/app-server-daemon/src/prepare_install_windows_tests.rs:8:    let root = home.path().join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/settings_tests.rs:136:    let dir = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/update_loop.rs:356:    if package_root.ends_with("app-server-daemon") {
+codex-rs/app-server-daemon/src/update_loop.rs:569:            if package_root.ends_with("app-server-daemon") {
+codex-rs/app-server-daemon/src/update_loop_tests.rs:115:        let dedicated = home.path().join("packages/app-server-daemon");
+codex-rs/app-server-daemon/src/update_loop_tests.rs:132:root="$CODEX_HOME/packages/app-server-daemon"
+codex-rs/app-server-daemon/src/update_loop_tests.rs:299:    let state = home.path().join("app-server-daemon");
+codex-rs/app-server-daemon/src/update_loop_tests.rs:691:    check_manual_update_restart("app-server-daemon").await;
+codex-rs/app-server-daemon/src/update_loop_tests.rs:699:    let local_package = package_directory == "app-server-daemon";
+codex-rs/app-server-daemon/src/update_loop_tests.rs:884:        std::path::Path::new("packages/app-server-daemon"),
+codex-rs/app-server-daemon/src/update_loop_tests.rs:898:            std::path::Path::new("packages/app-server-daemon")
+codex-rs/app-server-daemon/src/update_loop_tests.rs:913:                self.0.join("packages/app-server-daemon"),
+codex-rs/app-server-daemon/src/update_loop_tests.rs:942:    let root = home.path().join("packages/app-server-daemon");
+codex-rs/app-server-transport/src/transport/mod.rs:60:        .join("app-server-daemon")
+codex-rs/cli/Cargo.toml:31:codex-app-server-daemon = { workspace = true }
+codex-rs/cli/src/daemon_install_tests.rs:8:        destination: "/home/packages/app-server-daemon".into(),
+codex-rs/cli/src/daemon_install_tests.rs:14:    The daemon package will be installed in /home/packages/app-server-daemon.
+codex-rs/cli/src/doctor/background.rs:20:const STATE_DIR_NAME: &str = "app-server-daemon";
+codex-rs/cli/src/doctor/snapshots/codex__doctor__background__tests__configured_updater.snap:5:update-loop pid file: CODEX_HOME/app-server-daemon/app-server-updater.pid (missing)
+codex-rs/cli/src/doctor/snapshots/codex__doctor__background__tests__configured_updater.snap:6:dedicated pid file: CODEX_HOME/app-server-daemon/daemon.pid (missing)
+codex-rs/cli/src/doctor/snapshots/codex__doctor__background__tests__configured_updater.snap:7:dedicated update-loop pid file: CODEX_HOME/app-server-daemon/daemon-updater.pid (missing)
+codex-rs/cli/tests/app_server_daemon.rs:64:        let state = home.path().join("app-server-daemon");
+codex-rs/cli/tests/app_server_daemon.rs:94:        let record = std::fs::read(self.home.path().join("app-server-daemon").join(name))
+codex-rs/cli/tests/app_server_daemon.rs:147:    let pid_file = daemon.home.path().join("app-server-daemon/app-server.pid");
+codex-rs/cli/tests/app_server_daemon.rs:197:                .join("app-server-daemon/app-server-updater.sock");
+codex-rs/cli/tests/app_server_daemon.rs:251:    let state = daemon.home.path().join("app-server-daemon");
+codex-rs/cli/tests/app_server_daemon.rs:272:    let server_record_path = daemon.home.path().join("app-server-daemon/app-server.pid");
+codex-rs/cli/tests/app_server_daemon.rs:303:            .join("app-server-daemon/app-server.pid")
+codex-rs/cli/tests/app_server_daemon.rs:311:            .join("packages/app-server-daemon")
+codex-rs/cli/tests/app_server_daemon.rs:320:    let state_dir = daemon.home.path().join("app-server-daemon");
+codex-rs/cli/tests/app_server_daemon.rs:339:        let path = daemon.home.path().join("app-server-daemon").join(name);
+codex-rs/cli/tests/app_server_daemon.rs:392:            .join("app-server-daemon/app-server-updater.pid")
+codex-rs/cli/tests/app_server_daemon.rs:403:    let settings = daemon.home.path().join("app-server-daemon/settings.json");
+codex-rs/cli/tests/app_server_daemon.rs:462:            .join("app-server-daemon/app-server-updater.pid")
+codex-rs/cli/tests/app_server_daemon.rs:534:    let state = daemon.home.path().join("app-server-daemon");
+codex-rs/cli/tests/app_server_daemon.rs:573:        .join("packages/app-server-daemon");
+codex-rs/cli/tests/daemon_startup.rs:136:            .join("packages/app-server-daemon/current/bin/codex");
+codex-rs/cli/tests/daemon_startup.rs:137:        fs::create_dir_all(home.path().join("packages/app-server-daemon/current/bin"))?;
+codex-rs/cli/tests/daemon_startup.rs:143:        fs::create_dir(home.path().join("app-server-daemon"))?;
+codex-rs/cli/tests/daemon_startup.rs:145:            home.path().join("app-server-daemon/settings.json"),
+codex-rs/cli/tests/daemon_startup.rs:153:    let pid_file = home.path().join("app-server-daemon/daemon.pid");
+codex-rs/cli/tests/daemon_startup.rs:255:                        let settings: serde_json::Value = serde_json::from_slice(&fs::read(home.path().join("app-server-daemon/settings.json"))?)?;
+codex-rs/cli/tests/daemon_startup.rs:276:                        ensure!(home.path().join("app-server-daemon/daemon.pid").exists());
+codex-rs/cli/tests/features.rs:384:        assert!(!home.path().join("app-server-daemon").exists());
+codex-rs/cli/tests/worktree.rs:277:        let bin = home.join("packages/app-server-daemon/current/bin");
+codex-rs/cli/tests/worktree.rs:285:        fs::create_dir(home.join("app-server-daemon"))?;
+codex-rs/cli/tests/worktree.rs:287:            home.join("app-server-daemon/settings.json"),
+codex-rs/rollout/src/writer_lock.rs:17:const WRITER_LOCK_DIR: &str = "thread-writer-locks";
+codex-rs/thread-store/src/local/delete_thread.rs:811:            .join("thread-writer-locks")
+codex-rs/thread-store/src/local/mod.rs:1502:                .join("thread-writer-locks")
+codex-rs/tui/Cargo.toml:33:codex-app-server-daemon = { workspace = true }
+codex-rs/tui/tests/suite/focus_palette.rs:583:                .join("app-server-daemon")
+codex-rs/tui/tests/suite/focus_palette.rs:612:    std::fs::create_dir_all(home.path().join("packages/app-server-daemon/current"))?;
+codex-rs/tui/tests/suite/snapshots/all__suite__focus_palette__daemon_auto_start_failure.snap:6:Error: daemon executable not found at [CODEX_HOME]/packages/app-server-daemon/current/bin/codex; repair the existing installation, or run `codex app-server daemon start` to install a missing daemon
+scripts/install/install.ps1:928:$standaloneRoot = Join-Path $codexHome $(if ($daemonOnly) { "packages\app-server-daemon" } else { "packages\standalone" })
+scripts/install/install.ps1:978:        $updaterRecord = Join-Path $codexHome "app-server-daemon\app-server-updater.pid"
+scripts/install/install.ps1:979:        if ($daemonOnly) { $updaterRecord = Join-Path $codexHome "app-server-daemon\daemon-updater.pid" }
+scripts/install/install.sh:22:  STANDALONE_ROOT="$CODEX_HOME_DIR/packages/app-server-daemon"
+scripts/install/install.sh:1175:updater_record="$CODEX_HOME_DIR/app-server-daemon/app-server-updater.pid"
+scripts/install/install.sh:1177:  updater_record="$CODEX_HOME_DIR/app-server-daemon/daemon-updater.pid"
+scripts/install/test_install_sh.py:180:            daemon = root / "codex-home/packages/app-server-daemon"
+scripts/install/test_install_sh.py:271:                root / "codex-home/app-server-daemon/app-server-updater.pid"
+scripts/install/test_install_sh.py:327:                root / "codex-home/app-server-daemon/app-server-updater.pid"

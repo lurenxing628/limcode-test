@@ -1,0 +1,3 @@
+codex-rs/rollout/src/writer_lock.rs:17:const WRITER_LOCK_DIR: &str = "thread-writer-locks";
+codex-rs/thread-store/src/local/delete_thread.rs:811:            .join("thread-writer-locks")
+codex-rs/thread-store/src/local/mod.rs:1489:                .join("thread-writer-locks")

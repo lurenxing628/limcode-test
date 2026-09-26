@@ -1,0 +1,654 @@
+AGENTS.md:136:  projectID: text("project_id").notNull(),
+packages/app/V1_API_MIGRATION.md:107:- [x] Migrate project updates from `PATCH /project/:projectID` to `PATCH /api/project/:projectID`.
+packages/app/V1_API_MIGRATION.md:114:  - Listing now uses `GET /api/project/:projectID/directories`; create, removal, and reset remain.
+packages/app/e2e/performance/timeline-stability/fixture.ts:23:export const projectID = "proj_timeline_stability"
+packages/app/e2e/performance/timeline-stability/fixture.ts:522:    id: projectID,
+packages/app/e2e/performance/timeline-stability/fixture.ts:535:    projectID,
+packages/app/e2e/performance/timeline/session-timeline-benchmark.fixture.ts:8:const projectID = "proj_timeline_state_regression"
+packages/app/e2e/performance/timeline/session-timeline-benchmark.fixture.ts:471:    id: projectID,
+packages/app/e2e/performance/timeline/session-timeline-benchmark.fixture.ts:484:    projectID,
+packages/app/e2e/performance/timeline/session-timeline-stress.fixture.ts:28:const projectID = "proj_smoke_timeline"
+packages/app/e2e/performance/timeline/session-timeline-stress.fixture.ts:285:    id: projectID,
+packages/app/e2e/performance/timeline/session-timeline-stress.fixture.ts:307:      projectID,
+packages/app/e2e/performance/timeline/session-timeline-stress.fixture.ts:316:      projectID,
+packages/app/e2e/performance/timeline/session-timeline-stress.fixture.ts:326:      projectID,
+packages/app/e2e/regression/cross-server-tab-close.spec.ts:72:    projectID: `project-${id}`,
+packages/app/e2e/regression/cross-server-tab-close.spec.ts:108:        id: current.projectID,
+packages/app/e2e/regression/file-browser-sidebar-tab-switch.spec.ts:7:const projectID = "proj_file_browser_sidebar"
+packages/app/e2e/regression/file-browser-sidebar-tab-switch.spec.ts:117:      id: projectID,
+packages/app/e2e/regression/file-browser-sidebar-tab-switch.spec.ts:139:        projectID,
+packages/app/e2e/regression/open-file-expand-folder.spec.ts:7:const projectID = "proj_open_file_expand"
+packages/app/e2e/regression/open-file-expand-folder.spec.ts:18:      id: projectID,
+packages/app/e2e/regression/open-file-expand-folder.spec.ts:40:        projectID,
+packages/app/e2e/regression/prompt-input-v2-command-draft.spec.ts:7:const projectID = "proj_prompt_input_v2_editing"
+packages/app/e2e/regression/prompt-input-v2-command-draft.spec.ts:14:      id: projectID,
+packages/app/e2e/regression/prompt-input-v2-command-draft.spec.ts:26:        projectID,
+packages/app/e2e/regression/prompt-thinking-level.spec.ts:7:const projectID = "proj_prompt_thinking_level_regression"
+packages/app/e2e/regression/prompt-thinking-level.spec.ts:14:      id: projectID,
+packages/app/e2e/regression/prompt-thinking-level.spec.ts:43:        projectID,
+packages/app/e2e/regression/remote-session-settings.spec.ts:198:          id: remote ? sessionB.projectID : "project-server-a",
+packages/app/e2e/regression/remote-session-settings.spec.ts:207:      return json(route, { id: remote ? sessionB.projectID : "project-server-a", directory })
+packages/app/e2e/regression/remote-session-settings.spec.ts:230:        id: remote ? sessionB.projectID : "project-server-a",
+packages/app/e2e/regression/remote-session-settings.spec.ts:260:    projectID: `project-${id}`,
+packages/app/e2e/regression/remote-tab-busy.spec.ts:46:    projectID: `project-${id}`,
+packages/app/e2e/regression/remote-tab-busy.spec.ts:82:        id: current.projectID,
+packages/app/e2e/regression/review-image-flash.spec.ts:47:        projectID: "proj_review_image_flash_regression",
+packages/app/e2e/regression/review-line-comment.spec.ts:106:        projectID: "proj_review_line_comment_regression",
+packages/app/e2e/regression/review-open-file.spec.ts:7:const projectID = "proj_review_open_file"
+packages/app/e2e/regression/review-open-file.spec.ts:19:      id: projectID,
+packages/app/e2e/regression/review-open-file.spec.ts:41:        projectID,
+packages/app/e2e/regression/review-state-persistence.spec.ts:7:const projectID = "proj_review_state_persistence"
+packages/app/e2e/regression/review-state-persistence.spec.ts:71:      id: projectID,
+packages/app/e2e/regression/review-state-persistence.spec.ts:133:    projectID,
+packages/app/e2e/regression/review-tab-switch.spec.ts:7:const projectID = "proj_review_tab_switch"
+packages/app/e2e/regression/review-tab-switch.spec.ts:81:      id: projectID,
+packages/app/e2e/regression/review-tab-switch.spec.ts:127:    projectID,
+packages/app/e2e/regression/review-terminal-stacked.spec.ts:6:const projectID = "proj_review_terminal_stacked"
+packages/app/e2e/regression/review-terminal-stacked.spec.ts:31:      id: projectID,
+packages/app/e2e/regression/review-terminal-stacked.spec.ts:53:        projectID,
+packages/app/e2e/regression/review-terminal-stacked.spec.ts:99:        location: { directory, project: { id: projectID, directory } },
+packages/app/e2e/regression/review-terminal-stacked.spec.ts:117:        location: { directory, project: { id: projectID, directory } },
+packages/app/e2e/regression/review-terminal-stacked.spec.ts:135:        location: { directory, project: { id: projectID, directory } },
+packages/app/e2e/regression/session-request-docks.spec.ts:8:const projectID = "proj_request_docks"
+packages/app/e2e/regression/session-request-docks.spec.ts:179:      id: projectID,
+packages/app/e2e/regression/session-request-docks.spec.ts:207:        projectID,
+packages/app/e2e/regression/session-timeline-collapse-state.spec.ts:6:const projectID = "proj_timeline_state_regression"
+packages/app/e2e/regression/session-timeline-collapse-state.spec.ts:402:    id: projectID,
+packages/app/e2e/regression/session-timeline-collapse-state.spec.ts:415:    projectID,
+packages/app/e2e/regression/session-timeline-context-resize.spec.ts:13:const projectID = "proj_context_resize_regression"
+packages/app/e2e/regression/session-timeline-context-resize.spec.ts:337:    id: projectID,
+packages/app/e2e/regression/session-timeline-context-resize.spec.ts:350:    projectID,
+packages/app/e2e/regression/session-todo-dock-navigation.spec.ts:7:const projectID = "proj_todo_dock_navigation"
+packages/app/e2e/regression/session-todo-dock-navigation.spec.ts:35:      id: projectID,
+packages/app/e2e/regression/session-todo-dock-navigation.spec.ts:117:    projectID,
+packages/app/e2e/regression/subagent-child-navigation.spec.ts:7:const projectID = "proj_subagent_navigation"
+packages/app/e2e/regression/subagent-child-navigation.spec.ts:50:      id: projectID,
+packages/app/e2e/regression/subagent-child-navigation.spec.ts:108:    projectID,
+packages/app/e2e/regression/tab-navigate-mousedown.spec.ts:77:    projectID: "project-tabs",
+packages/app/e2e/regression/tab-navigate-mousedown.spec.ts:114:        id: sessionA.projectID,
+packages/app/e2e/regression/terminal-composer-focus.spec.ts:7:const projectID = "proj_terminal_composer_focus"
+packages/app/e2e/regression/terminal-composer-focus.spec.ts:19:      id: projectID,
+packages/app/e2e/regression/terminal-composer-focus.spec.ts:41:        projectID,
+packages/app/e2e/regression/terminal-composer-focus.spec.ts:222:  return { directory, project: { id: projectID, directory } }
+packages/app/e2e/regression/terminal-hidden.spec.ts:6:const projectID = "proj_hidden_terminal_regression"
+packages/app/e2e/regression/terminal-hidden.spec.ts:16:      id: projectID,
+packages/app/e2e/regression/terminal-hidden.spec.ts:38:        projectID,
+packages/app/e2e/regression/terminal-hidden.spec.ts:52:        location: { directory, project: { id: projectID, directory } },
+packages/app/e2e/regression/terminal-hidden.spec.ts:70:        location: { directory, project: { id: projectID, directory } },
+packages/app/e2e/regression/terminal-hidden.spec.ts:88:        location: { directory, project: { id: projectID, directory } },
+packages/app/e2e/regression/terminal-tab-switch.spec.ts:7:const projectID = "proj_terminal_tab_switch"
+packages/app/e2e/regression/terminal-tab-switch.spec.ts:72:      id: projectID,
+packages/app/e2e/regression/terminal-tab-switch.spec.ts:147:    projectID,
+packages/app/e2e/regression/terminal-tab-switch.spec.ts:160:  return { directory, project: { id: projectID, directory } }
+packages/app/e2e/smoke/session-timeline.fixture.ts:28:const projectID = "proj_smoke_timeline"
+packages/app/e2e/smoke/session-timeline.fixture.ts:246:    id: projectID,
+packages/app/e2e/smoke/session-timeline.fixture.ts:268:      projectID,
+packages/app/e2e/smoke/session-timeline.fixture.ts:277:      projectID,
+packages/app/e2e/utils/mock-server.ts:345:    projectID: session.projectID ?? "project",
+packages/app/src/components/edit-project.ts:77:            projectID: props.project.id,
+packages/app/src/components/edit-project.ts:86:        //   projectID: props.project.id,
+packages/app/src/components/prompt-input/submit.test.ts:85:            projectID: "project",
+packages/app/src/context/global-sync/bootstrap.ts:185:function projectID(directory: string, projects: Project[]) {
+packages/app/src/context/global-sync/bootstrap.ts:362:  const seededProject = projectID(input.directory, input.global.project)
+packages/app/src/context/global-sync/bootstrap.ts:423:              const next = projectID(data.directory ?? input.directory, input.global.project)
+packages/app/src/context/global-sync/event-reducer.ts:232:        projectID?: string
+packages/app/src/context/global-sync/event-reducer.ts:240:          projectID: properties.projectID ?? session.projectID,
+packages/app/src/context/global-sync/home-session-index.test.ts:25:  projectID: "project",
+packages/app/src/context/global-sync/home-session-index.test.ts:95:        projectID: "project",
+packages/app/src/context/global-sync/home-session-index.ts:173:    projectID: session.projectID,
+packages/app/src/context/global.tsx:115:    const projectID = childStore.project
+packages/app/src/context/global.tsx:116:    const metadata = projectID
+packages/app/src/context/global.tsx:117:      ? sync.data.project.find((x) => x.id === projectID)
+packages/app/src/context/layout.tsx:447:      const projectID = childStore.project
+packages/app/src/context/layout.tsx:448:      const metadata = projectID
+packages/app/src/context/layout.tsx:449:        ? serverSync().data.project.find((x) => x.id === projectID)
+packages/app/src/context/layout.tsx:573:        const projectID = project.id
+packages/app/src/context/layout.tsx:578:            .update({ projectID, directory: worktree, icon: { color } })
+packages/app/src/context/server-session.test.ts:13:  projectID: "project",
+packages/app/src/context/server-session.ts:951:        projectID: event.data.projectID ?? info.projectID,
+packages/app/src/context/server-sync.test.ts:166:    projectID: "project-1",
+packages/app/src/pages/layout.tsx:1181:        .then((projectID) => serverSDK().api.project.directories({ projectID, location: { directory: root } }))
+packages/app/src/pages/layout.tsx:1293:        .update({ projectID: project.id, directory: project.worktree, name })
+packages/app/src/pages/layout.tsx:1296:      // const result = await serverSDK().api.project.update({ projectID: project.id, name })
+packages/app/src/pages/layout/helpers.ts:101:  const direct = byID.get(session.projectID)
+packages/app/src/utils/server-compat.test.ts:18:          projectID: "project",
+packages/app/src/utils/server-compat.ts:65:    projectID: session.projectID,
+packages/app/src/utils/server-compat.ts:312:      //   const project = (await legacy().project.list()).data?.find((item) => item.id === value.projectID)
+packages/app/src/utils/server-compat.ts:317:      //   if (!result.data) throw new Error(`Project not found: ${value.projectID}`)
+packages/app/src/utils/session.test.ts:9:      projectID: "project-1",
+packages/app/src/utils/session.test.ts:24:      projectID: "project-1",
+packages/app/src/utils/session.test.ts:93:    projectID: "project-1",
+packages/app/src/utils/session.test.ts:108:    projectID: "project-1",
+packages/app/src/utils/session.ts:10:    projectID: input.projectID,
+packages/app/test-browser/command-palette.test.ts:20:  projectID: stored.id,
+packages/client/src/generated-effect/client.ts:391:type Endpoint9_1Input = { readonly projectID?: Endpoint9_1Request["query"]["projectID"] }
+packages/client/src/generated-effect/client.ts:393:  raw["permission.saved.list"]({ query: { projectID: input?.["projectID"] } }).pipe(
+packages/client/src/generated-effect/client.ts:640:  readonly projectID: Endpoint17_0Request["params"]["projectID"]
+packages/client/src/generated-effect/client.ts:648:    params: { projectID: input["projectID"] },
+packages/client/src/generated-effect/client.ts:655:  readonly projectID: Endpoint17_1Request["params"]["projectID"]
+packages/client/src/generated-effect/client.ts:662:    params: { projectID: input["projectID"] },
+packages/client/src/generated-effect/client.ts:669:  readonly projectID: Endpoint17_2Request["params"]["projectID"]
+packages/client/src/generated-effect/client.ts:674:    params: { projectID: input["projectID"] },
+packages/client/src/generated/client.ts:684:            query: { projectID: input?.["projectID"] },
+packages/client/src/generated/client.ts:955:            path: `/experimental/project/${encodeURIComponent(input.projectID)}/copy`,
+packages/client/src/generated/client.ts:968:            path: `/experimental/project/${encodeURIComponent(input.projectID)}/copy`,
+packages/client/src/generated/client.ts:981:            path: `/experimental/project/${encodeURIComponent(input.projectID)}/copy/refresh`,
+packages/client/src/generated/types.ts:238:    readonly projectID: string
+packages/client/src/generated/types.ts:300:    readonly projectID: string
+packages/client/src/generated/types.ts:338:    readonly projectID: string
+packages/client/src/generated/types.ts:2315:  readonly projectID?: { readonly projectID?: string | undefined }["projectID"]
+packages/client/src/generated/types.ts:2321:    readonly projectID: string
+packages/client/src/generated/types.ts:2778:  readonly projectID: { readonly projectID: string }["projectID"]
+packages/client/src/generated/types.ts:2790:  readonly projectID: { readonly projectID: string }["projectID"]
+packages/client/src/generated/types.ts:2801:  readonly projectID: { readonly projectID: string }["projectID"]
+packages/client/test/effect.test.ts:201:    projectID: "project",
+packages/client/test/promise.test.ts:210:    projectID: "project",
+packages/codemode/test/fixtures/opencode-v2-openapi.json:4743:    "/api/project/{projectID}/directories": {
+packages/codemode/test/fixtures/opencode-v2-openapi.json:4749:            "name": "projectID",
+packages/codemode/test/fixtures/opencode-v2-openapi.json:5611:            "name": "projectID",
+packages/codemode/test/fixtures/opencode-v2-openapi.json:8785:    "/experimental/project/{projectID}/copy": {
+packages/codemode/test/fixtures/opencode-v2-openapi.json:8791:            "name": "projectID",
+packages/codemode/test/fixtures/opencode-v2-openapi.json:8908:            "name": "projectID",
+packages/codemode/test/fixtures/opencode-v2-openapi.json:9011:    "/experimental/project/{projectID}/copy/refresh": {
+packages/codemode/test/fixtures/opencode-v2-openapi.json:9017:            "name": "projectID",
+packages/codemode/test/fixtures/opencode-v2-openapi.json:9630:          "projectID": {
+packages/codemode/test/fixtures/opencode-v2-openapi.json:9700:        "required": ["id", "projectID", "cost", "tokens", "time", "title", "location"],
+packages/codemode/test/fixtures/opencode-v2-openapi.json:15673:          "projectID": {
+packages/codemode/test/fixtures/opencode-v2-openapi.json:15683:        "required": ["id", "projectID", "action", "resource"],
+packages/codemode/test/fixtures/opencode-v2-openapi.json:16139:          "projectID": {
+packages/codemode/test/fixtures/opencode-v2-openapi.json:16323:        "required": ["id", "slug", "projectID", "directory", "title", "version", "time"],
+packages/codemode/test/fixtures/opencode-v2-openapi.json:19496:              "projectID": {
+packages/codemode/test/fixtures/opencode-v2-openapi.json:19500:            "required": ["projectID"],
+packages/core/drizzle.config.ts:8:    url: "/home/thdxr/.local/share/opencode/opencode.db",
+packages/core/src/control-plane/move-session.ts:85:      if (current.projectID !== destination.id) {
+packages/core/src/control-plane/move-session.ts:86:        return yield* new DestinationProjectMismatchError({ expected: current.projectID, actual: destination.id })
+packages/core/src/database/database.ts:53:    return join(Global.Path.data, "opencode.db")
+packages/core/src/permission.ts:132:      return (yield* saved.list({ projectID: location.project.id })).map(
+packages/core/src/permission.ts:252:              projectID: location.project.id,
+packages/core/src/permission/saved.ts:18:  projectID: ProjectV2.ID.pipe(Schema.optional),
+packages/core/src/permission/saved.ts:23:  projectID: ProjectV2.ID,
+packages/core/src/permission/saved.ts:46:        .where(input?.projectID ? eq(PermissionTable.project_id, input.projectID) : undefined)
+packages/core/src/permission/saved.ts:50:        (row): Info => ({ id: row.id, projectID: row.project_id, action: row.action, resource: row.resource }),
+packages/core/src/permission/saved.ts:61:            project_id: input.projectID,
+packages/core/src/project.ts:62:      return yield* projectDirectories.list(input.projectID)
+packages/core/src/project/copy.ts:29:  projectID: Project.ID,
+packages/core/src/project/copy.ts:114:    yield* Effect.logInfo("project copy refresh started", { projectID: location.project.id })
+packages/core/src/project/copy.ts:115:    const result = yield* copies.refresh({ projectID: location.project.id })
+packages/core/src/project/copy.ts:117:      projectID: location.project.id,
+packages/core/src/project/copy.ts:137:    const changed = Effect.fnUntraced(function* (projectID: Project.ID, update: boolean) {
+packages/core/src/project/copy.ts:138:      if (update) yield* events.publish(Event.Updated, { projectID })
+packages/core/src/project/copy.ts:159:    const source = Effect.fnUntraced(function* (input: AbsolutePath, projectID: Project.ID) {
+packages/core/src/project/copy.ts:161:      if (!(yield* directories.contains({ projectID, directory: sourceDirectory })))
+packages/core/src/project/copy.ts:174:      const sourceDirectory = yield* source(input.sourceDirectory, input.projectID)
+packages/core/src/project/copy.ts:190:        input.projectID,
+packages/core/src/project/copy.ts:192:          projectID: input.projectID,
+packages/core/src/project/copy.ts:203:      const stored = yield* directories.get({ projectID: input.projectID, directory: copyDirectory })
+packages/core/src/project/copy.ts:210:        input.projectID,
+packages/core/src/project/copy.ts:211:        yield* directories.remove({ projectID: input.projectID, directory: copyDirectory }),
+packages/core/src/project/copy.ts:216:      const stored = yield* directories.list(input.projectID)
+packages/core/src/project/copy.ts:250:                  projectID: input.projectID,
+packages/core/src/project/copy.ts:259:              directories.remove({ projectID: input.projectID, directory }, tx),
+packages/core/src/project/copy.ts:268:      yield* changed(input.projectID, changes.updated.length > 0 || changes.removed.length > 0)
+packages/core/src/project/directories.ts:18:  projectID: ProjectSchema.ID,
+packages/core/src/project/directories.ts:26:  projectID: ProjectSchema.ID,
+packages/core/src/project/directories.ts:35:  projectID: ProjectSchema.ID,
+packages/core/src/project/directories.ts:48:  readonly list: (projectID: ProjectSchema.ID) => Effect.Effect<ReadonlyArray<Directory>>
+packages/core/src/project/directories.ts:50:    projectID: ProjectSchema.ID
+packages/core/src/project/directories.ts:53:  readonly contains: (input: { projectID: ProjectSchema.ID; directory: AbsolutePath }) => Effect.Effect<boolean>
+packages/core/src/project/directories.ts:68:        .values({ project_id: input.projectID, directory: input.directory, strategy: input.strategy })
+packages/core/src/project/directories.ts:90:              eq(ProjectDirectoryTable.project_id, input.projectID),
+packages/core/src/project/directories.ts:100:    const list = Effect.fn("ProjectDirectories.list")(function* (projectID: ProjectSchema.ID) {
+packages/core/src/project/directories.ts:104:        .where(eq(ProjectDirectoryTable.project_id, projectID))
+packages/core/src/project/directories.ts:112:      projectID: ProjectSchema.ID
+packages/core/src/project/directories.ts:121:              eq(ProjectDirectoryTable.project_id, input.projectID),
+packages/core/src/project/directories.ts:131:      projectID: ProjectSchema.ID
+packages/core/src/project/directories.ts:139:            eq(ProjectDirectoryTable.project_id, input.projectID),
+packages/core/src/session.ts:224:          projectID: project.id,
+packages/core/src/session/info.ts:17:    projectID: ProjectV2.ID.make(row.project_id),
+packages/core/src/session/projector.ts:46:    project_id: info.projectID,
+packages/core/test/database-migration.test.ts:342:              projectID: ProjectV2.ID.global,
+packages/core/test/database-migration.test.ts:526:        const projectID = ProjectV2.ID.make("codec_project")
+packages/core/test/database-migration.test.ts:550:            id: projectID,
+packages/core/test/database-migration.test.ts:561:            project_id: projectID,
+packages/core/test/database-migration.test.ts:574:            sql`SELECT worktree, sandboxes FROM project WHERE id = ${projectID}`,
+packages/core/test/database-migration.test.ts:604:          .where(eq(ProjectTable.id, projectID))
+packages/core/test/database-migration.test.ts:611:            sql`SELECT worktree, sandboxes FROM project WHERE id = ${projectID}`,
+packages/core/test/database-migration.test.ts:620:        ).toBe(projectID)
+packages/core/test/database-migration.test.ts:622:        yield* db.run(sql`UPDATE project SET worktree = ${"not-absolute"} WHERE id = ${projectID}`)
+packages/core/test/database-migration.test.ts:624:          Effect.runSync(db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get()),
+packages/core/test/location-layer.test.ts:169:                projectID: ProjectV2.ID.global,
+packages/core/test/move-session.test.ts:71:      const projectID = (yield* Project.Service.use((service) => service.resolve(source))).id
+packages/core/test/move-session.test.ts:76:        .values({ id: projectID, worktree: source, sandboxes: [], time_created: 1, time_updated: 1 })
+packages/core/test/move-session.test.ts:83:          project_id: projectID,
+packages/core/test/move-session.test.ts:125:      const projectID = (yield* Project.Service.use((service) => service.resolve(source))).id
+packages/core/test/move-session.test.ts:130:        .values({ id: projectID, worktree: source, sandboxes: [], time_created: 1, time_updated: 1 })
+packages/core/test/move-session.test.ts:137:          project_id: projectID,
+packages/core/test/move-session.test.ts:191:      const projectID = (yield* Project.Service.use((service) => service.resolve(source))).id
+packages/core/test/move-session.test.ts:196:        .values({ id: projectID, worktree: source, sandboxes: [], time_created: 1, time_updated: 1 })
+packages/core/test/move-session.test.ts:203:          project_id: projectID,
+packages/core/test/permission.test.ts:236:      yield* saved.add({ projectID: Project.ID.global, action: "bash", resources: ["pwd"] })
+packages/core/test/permission.test.ts:309:      expect(yield* saved.list()).toEqual([{ id, projectID: Project.ID.global, action: "read", resource: "src/*" }])
+packages/core/test/project-copy.test.ts:47:    const projectID = Project.ID.make("copy-project")
+packages/core/test/project-copy.test.ts:51:      .values({ id: projectID, worktree: sourceDirectory, sandboxes: [], time_created: 1, time_updated: 1 })
+packages/core/test/project-copy.test.ts:56:      .values({ project_id: projectID, directory: sourceDirectory })
+packages/core/test/project-copy.test.ts:59:    return { root, sourceDirectory, projectID, db }
+packages/core/test/project-copy.test.ts:63:function stored(projectID: Project.ID) {
+packages/core/test/project-copy.test.ts:68:      .where(eq(ProjectDirectoryTable.project_id, projectID))
+packages/core/test/project-copy.test.ts:103:          projectID: input.projectID,
+packages/core/test/project-copy.test.ts:132:        projectID: input.projectID,
+packages/core/test/project-copy.test.ts:139:      expect(yield* stored(input.projectID)).toEqual(
+packages/core/test/project-copy.test.ts:145:      expect(Array.from(yield* Fiber.join(fiber))[0]?.data).toEqual({ projectID: input.projectID })
+packages/core/test/project-copy.test.ts:147:      yield* copy.remove({ projectID: input.projectID, directory: created.directory, force: false })
+packages/core/test/project-copy.test.ts:149:      expect(yield* stored(input.projectID)).toEqual([{ directory: input.sourceDirectory, strategy: null }])
+packages/core/test/project-copy.test.ts:164:        projectID: input.projectID,
+packages/core/test/project-copy.test.ts:173:        .remove({ projectID: input.projectID, directory: created.directory, force: false })
+packages/core/test/project-copy.test.ts:181:      expect(yield* stored(input.projectID)).toContainEqual({ directory: created.directory, strategy: "git_worktree" })
+packages/core/test/project-copy.test.ts:184:      yield* copy.remove({ projectID: input.projectID, directory: created.directory, force: true })
+packages/core/test/project-copy.test.ts:198:        .values({ project_id: input.projectID, directory: unavailable, strategy: "acme/missing" })
+packages/core/test/project-copy.test.ts:203:        .remove({ projectID: input.projectID, directory: unavailable, force: false })
+packages/core/test/project-copy.test.ts:207:      expect(yield* stored(input.projectID)).toContainEqual({ directory: unavailable, strategy: "acme/missing" })
+packages/core/test/project-copy.test.ts:225:        projectID: input.projectID,
+packages/core/test/project-copy.test.ts:240:      yield* copy.remove({ projectID: input.projectID, directory: created.directory, force: false })
+packages/core/test/project-copy.test.ts:263:          projectID: input.projectID,
+packages/core/test/project-copy.test.ts:289:            yield* copy.refresh({ projectID: input.projectID })
+packages/core/test/project-copy.test.ts:311:        .values({ project_id: input.projectID, directory: target })
+packages/core/test/project-copy.test.ts:320:      expect(yield* copy.refresh({ projectID: input.projectID })).toEqual({ updated: [discovered], removed: [] })
+packages/core/test/project-copy.test.ts:322:      expect(yield* stored(input.projectID)).toEqual(
+packages/core/test/project-copy.test.ts:328:      expect(Array.from(yield* Fiber.join(fiber))[0]?.data).toEqual({ projectID: input.projectID })
+packages/core/test/project-copy.test.ts:331:      expect(yield* copy.refresh({ projectID: input.projectID })).toEqual({ updated: [], removed: [discovered] })
+packages/core/test/project-copy.test.ts:332:      expect(yield* stored(input.projectID)).toEqual([{ directory: input.sourceDirectory, strategy: null }])
+packages/core/test/project-copy.test.ts:349:      yield* copy.refresh({ projectID: input.projectID })
+packages/core/test/project-copy.test.ts:352:      expect(yield* stored(input.projectID)).toEqual(
+packages/core/test/project-copy.test.ts:367:      yield* copy.refresh({ projectID: input.projectID })
+packages/core/test/project-copy.test.ts:369:      expect(yield* stored(input.projectID)).toEqual([{ directory: input.sourceDirectory, strategy: null }])
+packages/core/test/project-copy.test.ts:377:      expect(yield* copy.refresh({ projectID: Project.ID.make("missing-project") })).toEqual({
+packages/core/test/project-copy.test.ts:390:        .values({ project_id: input.projectID, directory: missing })
+packages/core/test/project-copy.test.ts:395:      expect(yield* copy.refresh({ projectID: input.projectID })).toEqual({ updated: [], removed: [missing] })
+packages/core/test/project-copy.test.ts:397:      expect(yield* stored(input.projectID)).not.toContainEqual({ directory: missing, strategy: null })
+packages/core/test/project-directories.test.ts:14:const projectID = Project.ID.make("project-directories")
+packages/core/test/project-directories.test.ts:21:      .values({ id: projectID, worktree: directory, sandboxes: [], time_created: 1, time_updated: 1 })
+packages/core/test/project-directories.test.ts:31:      expect(Schema.decodeUnknownSync(ProjectDirectories.ListInput)({ projectID })).toEqual({ projectID })
+packages/core/test/project-directories.test.ts:41:      expect(yield* service.create({ projectID, directory })).toBe(true)
+packages/core/test/project-directories.test.ts:42:      expect(yield* service.create({ projectID, directory, strategy: "git_worktree" })).toBe(false)
+packages/core/test/project-directories.test.ts:43:      expect(yield* service.list(projectID)).toEqual([{ directory, strategy: undefined }])
+packages/core/test/project-directories.test.ts:51:      yield* service.create({ projectID, directory, strategy: "old/strategy" })
+packages/core/test/project-directories.test.ts:53:      expect(yield* service.create({ projectID, directory, strategy: "new/strategy", behavior: "replace" })).toBe(true)
+packages/core/test/project-directories.test.ts:54:      expect(yield* service.create({ projectID, directory, strategy: "new/strategy", behavior: "replace" })).toBe(false)
+packages/core/test/project-directories.test.ts:55:      expect(yield* service.create({ projectID, directory, behavior: "replace" })).toBe(true)
+packages/core/test/project-directories.test.ts:56:      expect(yield* service.create({ projectID, directory, behavior: "replace" })).toBe(false)
+packages/core/test/project-directories.test.ts:57:      expect(yield* service.create({ projectID, directory, strategy: "new/strategy", behavior: "replace" })).toBe(true)
+packages/core/test/project-directories.test.ts:58:      expect(yield* service.list(projectID)).toEqual([{ directory, strategy: "new/strategy" }])
+packages/core/test/session-create.test.ts:155:          projectID: created.projectID,
+packages/core/test/session-runner-model.test.ts:119:        projectID: ProjectV2.ID.global,
+packages/core/test/session-runner-model.test.ts:159:        projectID: ProjectV2.ID.global,
+packages/core/test/session-runner-model.test.ts:183:        projectID: ProjectV2.ID.global,
+packages/core/test/session-runner-model.test.ts:219:        projectID: ProjectV2.ID.global,
+packages/core/test/snapshot.test.ts:114:          const projectID = yield* Effect.gen(function* () {
+packages/core/test/snapshot.test.ts:122:            yield* Effect.promise(() => fs.stat(path.join(tmp.path, "snapshot", projectID, Hash.fast(project)))),
+packages/core/test/snapshot.test.ts:125:            yield* Effect.promise(() => fs.stat(path.join(tmp.path, "snapshot", projectID, Hash.fast(linked)))),
+packages/opencode/src/cli/cmd/import.ts:181:    projectID: ctx.project.id,
+packages/opencode/src/cli/cmd/session.ts:143:    projectId: session.projectID,
+packages/opencode/src/cli/cmd/stats.ts:118:      filteredSessions = filteredSessions.filter((session) => session.projectID === currentProject.id)
+packages/opencode/src/cli/cmd/stats.ts:120:      filteredSessions = filteredSessions.filter((session) => session.projectID === projectFilter)
+packages/opencode/src/control-plane/adapters/index.ts:11:export function getAdapter(projectID: ProjectV2.ID, type: string): WorkspaceAdapter {
+packages/opencode/src/control-plane/adapters/index.ts:12:  const custom = state.get(projectID)?.get(type)
+packages/opencode/src/control-plane/adapters/index.ts:21:export function listAdapters(projectID: ProjectV2.ID): WorkspaceAdapterEntry[] {
+packages/opencode/src/control-plane/adapters/index.ts:22:  return registeredAdapters(projectID).map(([type, adapter]) => ({
+packages/opencode/src/control-plane/adapters/index.ts:29:export function registeredAdapters(projectID: ProjectV2.ID): [string, WorkspaceAdapter][] {
+packages/opencode/src/control-plane/adapters/index.ts:31:  for (const [type, adapter] of state.get(projectID)?.entries() ?? []) adapters.set(type, adapter)
+packages/opencode/src/control-plane/adapters/index.ts:37:export function registerAdapter(projectID: ProjectV2.ID, type: string, adapter: WorkspaceAdapter) {
+packages/opencode/src/control-plane/adapters/index.ts:38:  const adapters = state.get(projectID) ?? new Map<string, WorkspaceAdapter>()
+packages/opencode/src/control-plane/adapters/index.ts:40:  state.set(projectID, adapters)
+packages/opencode/src/control-plane/adapters/worktree.ts:76:      projectID: ctx.project.id,
+packages/opencode/src/control-plane/types.ts:14:  projectID: ProjectV2.ID,
+packages/opencode/src/control-plane/workspace-adapter-runtime.ts:16:    const adapter = getAdapter(info.projectID, info.type)
+packages/opencode/src/control-plane/workspace-adapter-runtime.ts:46:    const adapter = getAdapter(info.projectID, info.type)
+packages/opencode/src/control-plane/workspace.ts:57:    projectID: row.project_id,
+packages/opencode/src/control-plane/workspace.ts:66:  projectID: ProjectV2.ID,
+packages/opencode/src/control-plane/workspace.ts:146:  readonly startWorkspaceSyncing: (projectID: ProjectV2.ID) => Effect.Effect<void>
+packages/opencode/src/control-plane/workspace.ts:494:      const adapter = getAdapter(input.projectID, input.type)
+packages/opencode/src/control-plane/workspace.ts:510:        projectID: input.projectID,
+packages/opencode/src/control-plane/workspace.ts:523:          project_id: info.projectID,
+packages/opencode/src/control-plane/workspace.ts:589:            yield* events.claim(input.sessionID, input.workspaceID ?? previous.projectID)
+packages/opencode/src/control-plane/workspace.ts:755:              projectID: item.projectID,
+packages/opencode/src/control-plane/workspace.ts:768:                project_id: info.projectID,
+packages/opencode/src/control-plane/workspace.ts:854:    const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (projectID: ProjectV2.ID) {
+packages/opencode/src/control-plane/workspace.ts:859:        .where(eq(WorkspaceTable.project_id, projectID))
+packages/opencode/src/project/project.ts:61:  projectID: ProjectV2.ID,
+packages/opencode/src/project/project.ts:76:  projectID: ProjectV2.ID,
+packages/opencode/src/project/project.ts:196:      projectID: ProjectV2.ID
+packages/opencode/src/project/project.ts:199:      if (input.projectID === ProjectV2.ID.global) return
+packages/opencode/src/project/project.ts:204:          projectID: input.projectID,
+packages/opencode/src/project/project.ts:208:            Effect.logWarning("project directory persistence failed", { projectID: input.projectID, cause }),
+packages/opencode/src/project/project.ts:220:      const projectID = ProjectV2.ID.make(data.id)
+packages/opencode/src/project/project.ts:221:      yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
+packages/opencode/src/project/project.ts:222:      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
+packages/opencode/src/project/project.ts:226:            id: projectID,
+packages/opencode/src/project/project.ts:237:        worktree: projectID === ProjectV2.ID.global ? worktree : existing.worktree,
+packages/opencode/src/project/project.ts:242:        projectID !== ProjectV2.ID.global &&
+packages/opencode/src/project/project.ts:291:      if (projectID !== ProjectV2.ID.global) {
+packages/opencode/src/project/project.ts:294:          .set({ project_id: projectID })
+packages/opencode/src/project/project.ts:301:        projectID,
+packages/opencode/src/project/project.ts:306:      if (projectID !== ProjectV2.ID.global && data.vcs?.type === "git") {
+packages/opencode/src/project/project.ts:331:      yield* update({ projectID: input.id, icon: { url } }).pipe(
+packages/opencode/src/project/project.ts:356:        .where(eq(ProjectTable.id, input.projectID))
+packages/opencode/src/project/project.ts:360:      if (!result) return yield* new NotFoundError({ projectID: input.projectID })
+packages/opencode/src/server/routes/instance/httpapi/errors.ts:172:    projectID: Schema.String,
+packages/opencode/src/server/routes/instance/httpapi/groups/project-copy.ts:15:      HttpApiEndpoint.post("generateName", "/experimental/project/:projectID/copy/generate-name", {
+packages/opencode/src/server/routes/instance/httpapi/groups/project-copy.ts:16:        params: { projectID: ProjectV2.ID },
+packages/opencode/src/server/routes/instance/httpapi/groups/project.ts:52:        HttpApiEndpoint.patch("update", `${root}/:projectID`, {
+packages/opencode/src/server/routes/instance/httpapi/groups/project.ts:53:          params: { projectID: ProjectV2.ID },
+packages/opencode/src/server/routes/instance/httpapi/groups/project.ts:65:        HttpApiEndpoint.get("directories", `${root}/:projectID/directories`, {
+packages/opencode/src/server/routes/instance/httpapi/groups/project.ts:66:          params: { projectID: ProjectV2.ID },
+packages/opencode/src/server/routes/instance/httpapi/groups/workspace.ts:13:export const CreatePayload = Schema.Struct(Struct.omit(Workspace.CreateInput.fields, ["projectID"]))
+packages/opencode/src/server/routes/instance/httpapi/handlers/project-copy.ts:66:            projectID: ctx.params.projectID,
+packages/opencode/src/server/routes/instance/httpapi/handlers/project.ts:37:      params: { projectID: ProjectV2.ID }
+packages/opencode/src/server/routes/instance/httpapi/handlers/project.ts:40:      return yield* svc.update({ ...ctx.payload, projectID: ctx.params.projectID }).pipe(
+packages/opencode/src/server/routes/instance/httpapi/handlers/project.ts:44:              projectID: error.projectID,
+packages/opencode/src/server/routes/instance/httpapi/handlers/project.ts:45:              message: `Project not found: ${error.projectID}`,
+packages/opencode/src/server/routes/instance/httpapi/handlers/project.ts:52:    const directories = Effect.fn("ProjectHttpApi.directories")((ctx: { params: { projectID: ProjectV2.ID } }) =>
+packages/opencode/src/server/routes/instance/httpapi/handlers/project.ts:53:      project.directories({ projectID: ctx.params.projectID }),
+packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts:31:          projectID: instance.project.id,
+packages/opencode/src/session/session.ts:81:    projectID: row.project_id,
+packages/opencode/src/session/session.ts:123:    project_id: info.projectID,
+packages/opencode/src/session/session.ts:227:  projectID: ProjectV2.ID,
+packages/opencode/src/session/session.ts:516:        projectID: ctx.project.id,
+packages/opencode/src/session/session.ts:549:        projectID: ctx.project.id,
+packages/opencode/src/session/session.ts:958:    projectID: ProjectV2.ID
+packages/opencode/src/session/session.ts:962:  const conditions = [eq(SessionTable.project_id, input.projectID)]
+packages/opencode/src/storage/storage.ts:44:  projectID: Schema.String,
+packages/opencode/src/storage/storage.ts:93:      let projectID = projectDir
+packages/opencode/src/storage/storage.ts:96:      if (projectID !== "global") {
+packages/opencode/src/storage/storage.ts:119:        projectID = id
+packages/opencode/src/storage/storage.ts:122:          path.join(dir, "project", projectID + ".json"),
+packages/opencode/src/storage/storage.ts:138:        yield* Effect.logInfo(`migrating sessions for project ${projectID}`)
+packages/opencode/src/storage/storage.ts:143:          const dest = path.join(dir, "session", projectID, path.basename(sessionFile))
+packages/opencode/src/storage/storage.ts:196:        path.join(dir, "session", session.value.projectID, session.value.id + ".json"),
+packages/opencode/src/worktree/index.ts:234:      const projectID = ctx.project.id
+packages/opencode/src/worktree/index.ts:278:      yield* runStartScripts(info.directory, { projectID, extra })
+packages/opencode/src/worktree/index.ts:483:      input: { projectID: ProjectV2.ID; extra?: string },
+packages/opencode/src/worktree/index.ts:488:        .where(eq(ProjectTable.id, input.projectID))
+packages/opencode/src/worktree/index.ts:605:      yield* runStartScripts(worktreePath, { projectID: ctx.project.id }).pipe(
+packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap:385:exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db --help 1`] = `
+packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap:386:"opencode db
+packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap:391:  opencode db [query]     open an interactive sqlite3 shell or run a query                 [default]
+packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap:392:  opencode db path        print the database path
+packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap:612:exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db path --help 1`] = `
+packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap:613:"opencode db path
+packages/opencode/test/cli/run/stream.transport.test.ts:355:    projectID: "project-1",
+packages/opencode/test/control-plane/adapters.test.ts:6:function info(projectID: WorkspaceInfo["projectID"], type: string): WorkspaceInfo {
+packages/opencode/test/control-plane/adapters.test.ts:14:    projectID,
+packages/opencode/test/control-plane/workspace.test.ts:132:const startWorkspaceSyncingWithFlag = (projectID: ProjectV2.ID, experimentalWorkspaces: boolean) =>
+packages/opencode/test/control-plane/workspace.test.ts:134:    Workspace.use.startWorkspaceSyncing(projectID).pipe(Effect.provide(workspaceLayer(experimentalWorkspaces))),
+packages/opencode/test/control-plane/workspace.test.ts:271:function workspaceInfo(projectID: ProjectV2.ID, type: string, input?: Partial<Workspace.Info>): Workspace.Info {
+packages/opencode/test/control-plane/workspace.test.ts:279:    projectID,
+packages/opencode/test/control-plane/workspace.test.ts:295:        project_id: info.projectID,
+packages/opencode/test/control-plane/workspace.test.ts:372:      projectID: ProjectV2.ID.make("project-schema"),
+packages/opencode/test/control-plane/workspace.test.ts:473:          projectID: instance.project.id,
+packages/opencode/test/control-plane/workspace.test.ts:484:          projectID: instance.project.id,
+packages/opencode/test/control-plane/workspace.test.ts:499:          projectID: instance.project.id,
+packages/opencode/test/control-plane/workspace.test.ts:538:          yield* Effect.exit(workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })),
+packages/opencode/test/control-plane/workspace.test.ts:565:            workspace.create({ type, branch: "branch", projectID: instance.project.id, extra: { x: 1 } }),
+packages/opencode/test/control-plane/workspace.test.ts:590:        const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
+packages/opencode/test/control-plane/workspace.test.ts:619:          projectID: instance.project.id,
+packages/opencode/test/control-plane/workspace.test.ts:630:                projectID: instance.project.id,
+packages/opencode/test/control-plane/workspace.test.ts:673:                projectID: instance.project.id,
+packages/opencode/test/control-plane/workspace.test.ts:690:                projectID: instance.project.id,
+packages/opencode/test/control-plane/workspace.test.ts:754:            const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
+packages/opencode/test/control-plane/workspace.test.ts:793:        const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
+packages/opencode/test/control-plane/workspace.test.ts:956:        const projectID = instance.project.id
+packages/opencode/test/control-plane/workspace.test.ts:960:        const previous = workspaceInfo(projectID, previousType)
+packages/opencode/test/control-plane/workspace.test.ts:968:              registerAdapter(projectID, previousType, localAdapter(workspaceDir, { createDir: false }).adapter)
+packages/opencode/test/control-plane/workspace.test.ts:970:              expect(workspaceCtx.project.id).not.toBe(projectID)
+packages/opencode/test/control-plane/workspace.test.ts:986:        expect(yield* sessionSequenceOwner(session.id)).toBe(projectID)
+packages/opencode/test/control-plane/workspace.test.ts:1118:        const projectID = instance.project.id
+packages/opencode/test/control-plane/workspace.test.ts:1121:        const first = workspaceInfo(projectID, firstType)
+packages/opencode/test/control-plane/workspace.test.ts:1122:        const second = workspaceInfo(projectID, secondType)
+packages/opencode/test/control-plane/workspace.test.ts:1127:        registerAdapter(projectID, firstType, localAdapter(path.join(dir, "first")).adapter)
+packages/opencode/test/control-plane/workspace.test.ts:1128:        registerAdapter(projectID, secondType, localAdapter(path.join(dir, "second")).adapter)
+packages/opencode/test/control-plane/workspace.test.ts:1133:        yield* workspace.startWorkspaceSyncing(projectID)
+packages/opencode/test/plugin/workspace-adapter.test.ts:94:        projectID: ctx.project.id,
+packages/opencode/test/project/project-directory.test.ts:19:function directories(projectID: ProjectV2.ID) {
+packages/opencode/test/project/project-directory.test.ts:24:      .where(eq(ProjectDirectoryTable.project_id, projectID))
+packages/opencode/test/project/project.test.ts:460:        projectID: result.project.id,
+packages/opencode/test/project/project.test.ts:488:        projectID: result.project.id,
+packages/opencode/test/project/project.test.ts:506:        projectID: result.project.id,
+packages/opencode/test/project/project.test.ts:524:        projectID: result.project.id,
+packages/opencode/test/project/project.test.ts:542:        projectID: result.project.id,
+packages/opencode/test/project/project.test.ts:560:        projectID: result.project.id,
+packages/opencode/test/project/project.test.ts:575:        .update({ projectID: ProjectV2.ID.make("nonexistent-project-id"), name: "Should Fail" })
+packages/opencode/test/project/project.test.ts:580:        expect(error).toMatchObject({ _tag: "Project.NotFoundError", projectID: "nonexistent-project-id" })
+packages/opencode/test/project/project.test.ts:598:      yield* project.update({ projectID: result.project.id, name: "Updated Name" })
+packages/opencode/test/project/project.test.ts:613:        projectID: result.project.id,
+packages/opencode/test/server/global-session-list.test.ts:37:        const firstProject = yield* Project.use.get(firstSession.projectID)
+packages/opencode/test/server/global-session-list.test.ts:38:        const secondProject = yield* Project.use.get(secondSession.projectID)
+packages/opencode/test/server/httpapi-exercise/index.ts:175:    .patch("/project/{projectID}", "project.update")
+packages/opencode/test/server/httpapi-exercise/index.ts:179:      path: route("/project/{projectID}", { projectID: ctx.state.id }),
+packages/opencode/test/server/httpapi-exercise/index.ts:196:    .patch("/project/{projectID}", "project.update.missing")
+packages/opencode/test/server/httpapi-exercise/index.ts:199:      path: route("/project/{projectID}", { projectID: "project_httpapi_missing" }),
+packages/opencode/test/server/httpapi-exercise/index.ts:218:    .get("/project/{projectID}/directories", "project.directories")
+packages/opencode/test/server/httpapi-exercise/index.ts:221:      path: route("/project/{projectID}/directories", { projectID: ctx.state.id }),
+packages/opencode/test/server/httpapi-exercise/index.ts:226:    .post("/experimental/project/{projectID}/copy/generate-name", "experimental.projectCopy.generateName")
+packages/opencode/test/server/httpapi-exercise/index.ts:229:      path: route("/experimental/project/{projectID}/copy/generate-name", { projectID: ctx.state.id }),
+packages/opencode/test/server/httpapi-exercise/index.ts:238:    .post("/experimental/project/{projectID}/copy", "experimental.projectCopy.create")
+packages/opencode/test/server/httpapi-exercise/index.ts:241:      path: route("/experimental/project/{projectID}/copy", { projectID: ctx.state.id }),
+packages/opencode/test/server/httpapi-exercise/index.ts:247:    .delete("/experimental/project/{projectID}/copy", "experimental.projectCopy.remove")
+packages/opencode/test/server/httpapi-exercise/index.ts:250:      path: route("/experimental/project/{projectID}/copy", { projectID: ctx.state.id }),
+packages/opencode/test/server/httpapi-exercise/index.ts:256:    .post("/experimental/project/{projectID}/copy/refresh", "experimental.projectCopy.refresh")
+packages/opencode/test/server/httpapi-exercise/index.ts:260:      path: route("/experimental/project/{projectID}/copy/refresh", { projectID: ctx.state.id }),
+packages/opencode/test/server/httpapi-experimental.test.ts:254:        expect(body[0].project?.id).toBe(second.projectID)
+packages/opencode/test/server/httpapi-instance-context.test.ts:65:const createLocalWorkspace = (input: { projectID: Project.Info["id"]; type: string; directory: string }) =>
+packages/opencode/test/server/httpapi-instance-context.test.ts:68:      registerAdapter(input.projectID, input.type, localAdapter(input.directory))
+packages/opencode/test/server/httpapi-instance-context.test.ts:74:        projectID: input.projectID,
+packages/opencode/test/server/httpapi-instance-context.test.ts:86:    projectID: instance?.project.id,
+packages/opencode/test/server/httpapi-instance-context.test.ts:94:  projectID: Schema.optional(Schema.String),
+packages/opencode/test/server/httpapi-instance-context.test.ts:158:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-instance-context.test.ts:198:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-instance-context.test.ts:223:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-instance-context.test.ts:251:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-instance-context.test.ts:307:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-instance-context.test.ts:336:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-instance.test.ts:212:      const projectID = ProjectV2.ID.make("project_missing")
+packages/opencode/test/server/httpapi-instance.test.ts:215:          new Request(`http://localhost/project/${projectID}`, {
+packages/opencode/test/server/httpapi-instance.test.ts:227:        projectID,
+packages/opencode/test/server/httpapi-instance.test.ts:228:        message: `Project not found: ${projectID}`,
+packages/opencode/test/server/httpapi-promptasync-context.test.ts:74:    const projectID = yield* Project.Service.use((svc) => svc.fromDirectory(dir).pipe(Effect.map((p) => p.project.id)))
+packages/opencode/test/server/httpapi-promptasync-context.test.ts:75:    registerAdapter(projectID, kind, localAdapter(dir))
+packages/opencode/test/server/httpapi-promptasync-context.test.ts:77:      svc.create({ type: kind, branch: null, extra: null, projectID }),
+packages/opencode/test/server/httpapi-public-openapi.test.ts:346:    expect(componentName(responseRef(spec.paths["/project/{projectID}"]?.patch?.responses?.["404"]) ?? "")).toBe(
+packages/opencode/test/server/httpapi-session.test.ts:105:const createLocalWorkspace = (input: { projectID: Project.Info["id"]; type: string; directory: string }) =>
+packages/opencode/test/server/httpapi-session.test.ts:108:      registerAdapter(input.projectID, input.type, localAdapter(input.directory))
+packages/opencode/test/server/httpapi-session.test.ts:114:          projectID: input.projectID,
+packages/opencode/test/server/httpapi-session.test.ts:803:          projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:123:const createWorkspace = (input: { projectID: Project.Info["id"]; type: string; adapter: WorkspaceAdapter }) =>
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:126:      registerAdapter(input.projectID, input.type, input.adapter)
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:132:        projectID: input.projectID,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:140:  projectID: Project.Info["id"]
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:149:    projectID: input.projectID,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:154:const createLocalWorkspace = (input: { projectID: Project.Info["id"]; type: string; directory: string }) =>
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:156:    projectID: input.projectID,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:163:  projectID: Project.Info["id"]
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:169:    registerAdapter(input.projectID, input.type, remoteAdapter(path.join(input.dir, `.${input.type}`), input.url))
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:173:      .values({ id, type: input.type, project_id: input.projectID })
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:288:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:363:                  projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:398:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:419:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:466:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:488:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace-routing.test.ts:534:        projectID: project.project.id,
+packages/opencode/test/server/httpapi-workspace.test.ts:89:          projectID: context?.instance?.project.id ?? missingAdapterContext(),
+packages/opencode/test/server/project-copy.test.ts:51:        const projectID = (yield* json<{ id: string }>(current)).id
+packages/opencode/test/server/project-copy.test.ts:52:        const base = `/project/${projectID}`
+packages/opencode/test/server/project-copy.test.ts:53:        const copies = `/experimental/project/${projectID}/copy?location%5Bdirectory%5D=${encodeURIComponent(test.directory)}`
+packages/opencode/test/server/project-copy.test.ts:64:        const generated = yield* request(test.directory, `/experimental/project/${projectID}/copy/generate-name`, {
+packages/opencode/test/server/project-copy.test.ts:113:          `/experimental/project/${projectID}/copy/refresh?location%5Bdirectory%5D=${encodeURIComponent(test.directory)}`,
+packages/opencode/test/session/schema-decoding.test.ts:25:const projectID = ProjectV2.ID.make("proj-alpha")
+packages/opencode/test/session/schema-decoding.test.ts:40:      projectID,
+packages/opencode/test/session/schema-decoding.test.ts:53:      projectID,
+packages/opencode/test/session/schema-decoding.test.ts:84:      projectID,
+packages/opencode/test/session/schema-decoding.test.ts:114:    const noName = { id: projectID, worktree: "/tmp/wt" }
+packages/opencode/test/session/schema-decoding.test.ts:128:      projectID,
+packages/opencode/test/session/schema-decoding.test.ts:142:      projectID,
+packages/opencode/test/session/schema-decoding.test.ts:147:      project: { id: projectID, worktree: "/tmp/wt", name: "alpha" },
+packages/opencode/test/session/session-schema.test.ts:10:  projectID: ProjectV2.ID.global,
+packages/opencode/test/session/session.test.ts:68:      expect(receivedInfo.projectID).toBe(info.projectID)
+packages/opencode/test/storage/storage.test.ts:208:          projectID: "proj_test",
+packages/opencode/test/storage/storage.test.ts:221:            projectID: string
+packages/opencode/test/storage/storage.test.ts:227:          projectID: "proj_test",
+packages/plugin/src/index.ts:33:  projectID: string
+packages/protocol/src/groups/permission.ts:38:        query: Schema.Struct({ projectID: Project.ID.pipe(Schema.optional) }),
+packages/protocol/src/groups/project-copy.ts:7:const root = "/experimental/project/:projectID/copy"
+packages/protocol/src/groups/project-copy.ts:20:const CreatePayload = Schema.Struct(Struct.omit(ProjectCopy.CreateInput.fields, ["projectID", "sourceDirectory"]))
+packages/protocol/src/groups/project-copy.ts:21:const RemovePayload = Schema.Struct(Struct.omit(ProjectCopy.RemoveInput.fields, ["projectID"]))
+packages/protocol/src/groups/project-copy.ts:26:      params: { projectID: Project.ID },
+packages/protocol/src/groups/project-copy.ts:37:      params: { projectID: Project.ID },
+packages/protocol/src/groups/project-copy.ts:48:      params: { projectID: Project.ID },
+packages/schema/src/permission-saved.ts:16:  projectID: ProjectID,
+packages/schema/src/project-copy.ts:12:  projectID: ProjectID,
+packages/schema/src/project-copy.ts:21:  projectID: ProjectID,
+packages/schema/src/project-directories.ts:8:  schema: { projectID: Project.ID },
+packages/schema/src/session.ts:22:  projectID: Project.ID,
+packages/schema/src/v1/permission.ts:46:export const Approval = Schema.Struct({ projectID: Project.ID, patterns: Schema.Array(Schema.String) }).annotate({
+packages/schema/src/v1/session.ts:546:  projectID: Project.ID,
+packages/sdk/js/src/gen/types.gen.ts:535:  projectID: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:933:      projectID: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:945:            { in: "path", key: "projectID" },
+packages/sdk/js/src/v2/gen/sdk.gen.ts:958:      url: "/experimental/project/{projectID}/copy/generate-name",
+packages/sdk/js/src/v2/gen/sdk.gen.ts:2628:      projectID: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:2642:            { in: "path", key: "projectID" },
+packages/sdk/js/src/v2/gen/sdk.gen.ts:2653:      url: "/project/{projectID}",
+packages/sdk/js/src/v2/gen/sdk.gen.ts:2671:      projectID: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:2682:            { in: "path", key: "projectID" },
+packages/sdk/js/src/v2/gen/sdk.gen.ts:2690:      url: "/project/{projectID}/directories",
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6355:      projectID?: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6359:    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "projectID" }] }])
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6877:      projectID: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6892:            { in: "path", key: "projectID" },
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6905:      url: "/experimental/project/{projectID}/copy",
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6918:      projectID: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6934:            { in: "path", key: "projectID" },
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6945:        url: "/experimental/project/{projectID}/copy",
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6959:      projectID: string
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6972:            { in: "path", key: "projectID" },
+packages/sdk/js/src/v2/gen/sdk.gen.ts:6983:      url: "/experimental/project/{projectID}/copy/refresh",
+packages/sdk/js/src/v2/gen/types.gen.ts:173:  projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:1291:          projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:2201:  projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:2440:  projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:2665:  projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:3911:  projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:5000:  projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:5513:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:6766:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:8799:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:8805:  url: "/project/{projectID}"
+packages/sdk/js/src/v2/gen/types.gen.ts:8833:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:8839:  url: "/project/{projectID}/directories"
+packages/sdk/js/src/v2/gen/types.gen.ts:8865:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:8871:  url: "/experimental/project/{projectID}/copy/generate-name"
+packages/sdk/js/src/v2/gen/types.gen.ts:12559:    projectID?: string
+packages/sdk/js/src/v2/gen/types.gen.ts:13494:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:13502:  url: "/experimental/project/{projectID}/copy"
+packages/sdk/js/src/v2/gen/types.gen.ts:13530:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:13538:  url: "/experimental/project/{projectID}/copy"
+packages/sdk/js/src/v2/gen/types.gen.ts:13562:    projectID: string
+packages/sdk/js/src/v2/gen/types.gen.ts:13570:  url: "/experimental/project/{projectID}/copy/refresh"
+packages/sdk/openapi.json:3769:    "/project/{projectID}": {
+packages/sdk/openapi.json:3775:            "name": "projectID",
+packages/sdk/openapi.json:3869:    "/project/{projectID}/directories": {
+packages/sdk/openapi.json:3875:            "name": "projectID",
+packages/sdk/openapi.json:3931:    "/experimental/project/{projectID}/copy/generate-name": {
+packages/sdk/openapi.json:3937:            "name": "projectID",
+packages/sdk/openapi.json:12817:            "name": "projectID",
+packages/sdk/openapi.json:14937:    "/experimental/project/{projectID}/copy": {
+packages/sdk/openapi.json:14943:            "name": "projectID",
+packages/sdk/openapi.json:15033:            "name": "projectID",
+packages/sdk/openapi.json:15109:    "/experimental/project/{projectID}/copy/refresh": {
+packages/sdk/openapi.json:15115:            "name": "projectID",
+packages/sdk/openapi.json:15756:          "projectID": {
+packages/sdk/openapi.json:15912:        "required": ["id", "slug", "projectID", "directory", "title", "version", "time"],
+packages/sdk/openapi.json:19363:                      "projectID": {
+packages/sdk/openapi.json:19367:                    "required": ["projectID"],
+packages/sdk/openapi.json:22042:          "projectID": {
+packages/sdk/openapi.json:22208:        "required": ["id", "slug", "projectID", "directory", "title", "version", "time", "project"],
+packages/sdk/openapi.json:22767:          "projectID": {
+packages/sdk/openapi.json:22774:        "required": ["_tag", "projectID", "message"],
+packages/sdk/openapi.json:23420:          "projectID": {
+packages/sdk/openapi.json:23447:        "required": ["id", "type", "name", "projectID", "timeUsed"],
+packages/sdk/openapi.json:27258:          "projectID": {
+packages/sdk/openapi.json:27328:        "required": ["id", "projectID", "cost", "tokens", "time", "title", "location"],
+packages/sdk/openapi.json:30635:          "projectID": {
+packages/sdk/openapi.json:30645:        "required": ["id", "projectID", "action", "resource"],
+packages/sdk/openapi.json:32070:              "projectID": {
+packages/sdk/openapi.json:32074:            "required": ["projectID"],
+packages/sdk/openapi.json:35775:              "projectID": {
+packages/sdk/openapi.json:35779:            "required": ["projectID"],
+packages/server/src/handlers/permission.ts:85:              projectID: ctx.query.projectID ?? location.project.id,
+packages/server/src/handlers/project-copy.ts:19:              projectID: ctx.params.projectID,
+packages/server/src/handlers/project-copy.ts:27:          badRequest(copies.remove({ ...ctx.payload, projectID: ctx.params.projectID })).pipe(
+packages/server/src/handlers/project-copy.ts:34:          badRequest(copies.refresh({ projectID: ctx.params.projectID })).pipe(
+packages/tui/src/component/dialog-move-session.tsx:26:  projectID: string
+packages/tui/src/component/dialog-move-session.tsx:61:    () => (projectContext.project() === props.projectID ? undefined : props.projectID),
+packages/tui/src/component/dialog-move-session.tsx:62:    (projectID) =>
+packages/tui/src/component/dialog-move-session.tsx:65:        .then((result) => (result.data?.id === projectID ? result.data.worktree : undefined))
+packages/tui/src/component/dialog-move-session.tsx:69:    if (projectContext.project() === props.projectID) return projectContext.instance.path().worktree
+packages/tui/src/component/dialog-move-session.tsx:74:    () => (props.initialRemoving ? undefined : props.projectID),
+packages/tui/src/component/dialog-move-session.tsx:75:    async (projectID, info): Promise<ProjectDirectory[] | undefined> => {
+packages/tui/src/component/dialog-move-session.tsx:78:          { projectID, location: { directory: sdk.directory } },
+packages/tui/src/component/dialog-move-session.tsx:81:        const directories = await sdk.client.project.directories({ projectID }, { throwOnError: true })
+packages/tui/src/component/dialog-move-session.tsx:129:      .filter((session) => session.projectID === props.projectID && session.path && ![".", "/"].includes(session.path))
+packages/tui/src/component/dialog-move-session.tsx:226:        projectID: props.projectID,
+packages/tui/src/component/dialog-move-session.tsx:248:            projectID: props.projectID,
+packages/tui/src/component/prompt/index.tsx:211:  const move = usePromptMove({ projectID: project.project, sessionID: () => props.sessionID })
+packages/tui/src/component/prompt/move.tsx:18:export function usePromptMove(input: { projectID: () => string | undefined; sessionID: () => string | undefined }) {
+packages/tui/src/component/prompt/move.tsx:31:    const projectID = input.projectID()
+packages/tui/src/component/prompt/move.tsx:32:    if (!projectID) return
+packages/tui/src/component/prompt/move.tsx:37:        { projectID, context },
+packages/tui/src/component/prompt/move.tsx:42:          projectID,
+packages/tui/src/component/prompt/move.tsx:45:          directory: path.join(paths.worktree, projectID.slice(0, 6)),
+packages/tui/src/component/prompt/move.tsx:69:    const projectID = input.projectID()
+packages/tui/src/component/prompt/move.tsx:70:    if (!projectID) return
+packages/tui/src/component/prompt/move.tsx:75:        projectID={projectID}
+packages/tui/src/context/data.tsx:455:          list(projectID: string) {
+packages/tui/src/context/data.tsx:456:            return store.project.permission[projectID]
+packages/tui/src/context/data.tsx:458:          async refresh(projectID: string) {
+packages/tui/src/context/data.tsx:459:            const result = await sdk.client.v2.permission.saved.list({ projectID }, { throwOnError: true })
+packages/tui/src/context/data.tsx:460:            setStore("project", "permission", projectID, result.data.data)
+packages/tui/src/context/project.tsx:45:        ? await sdk.client.project.directories({ projectID: project.data.id, workspace })
+packages/tui/test/app-lifecycle.test.tsx:75:          projectID: "project",
+packages/tui/test/cli/cmd/tui/notifications.test.ts:14:    projectID: "project",
+packages/tui/test/cli/tui/data.test.tsx:39:          projectID: "proj_test",
+packages/tui/test/cli/tui/diff-viewer.test.tsx:201:  projectID: "project-1",
+packages/tui/test/cli/tui/use-event.test.tsx:12:const projectID = "proj_test"
+packages/tui/test/cli/tui/use-event.test.tsx:108:      emit(event(vcs("main"), { directory: "/tmp/other", project: projectID, workspace: "ws_a" }))
+packages/tui/test/cli/tui/use-event.test.tsx:124:      emit(event(vcs("ws"), { directory: "/tmp/other", project: projectID, workspace: "ws_b" }))
+packages/web/src/components/Share.tsx:67:      projectID: props.info.projectID,
+packages/web/src/content/docs/cli.mdx:584:opencode db [query]
+packages/web/src/content/docs/cli.mdx:600:opencode db path
+specs/project.md:13:GET /project/:projectID/session -> Session[]
+specs/project.md:15:GET /project/:projectID/session/:sessionID -> Session
+specs/project.md:17:POST /project/:projectID/session -> Session
+specs/project.md:24:DELETE /project/:projectID/session/:sessionID
+specs/project.md:26:POST /project/:projectID/session/:sessionID/init
+specs/project.md:28:POST /project/:projectID/session/:sessionID/abort
+specs/project.md:30:POST /project/:projectID/session/:sessionID/share
+specs/project.md:32:DELETE /project/:projectID/session/:sessionID/share
+specs/project.md:34:POST /project/:projectID/session/:sessionID/compact
+specs/project.md:36:GET /project/:projectID/session/:sessionID/message -> { info: Message, parts: Part[] }[]
+specs/project.md:38:GET /project/:projectID/session/:sessionID/message/:messageID -> { info: Message, parts: Part[] }
+specs/project.md:40:POST /project/:projectID/session/:sessionID/message -> { info: Message, parts: Part[] }
+specs/project.md:42:POST /project/:projectID/session/:sessionID/revert -> Session
+specs/project.md:44:POST /project/:projectID/session/:sessionID/unrevert -> Session
+specs/project.md:46:POST /project/:projectID/session/:sessionID/permission/:permissionID -> Session
+specs/project.md:48:GET /project/:projectID/session/:sessionID/find/file -> string[]
+specs/project.md:50:GET /project/:projectID/session/:sessionID/file -> { type: "raw" | "patch", content: string }
+specs/project.md:52:GET /project/:projectID/session/:sessionID/file/status -> File[]
+specs/project.md:61:GET /project/:projectID/agent?directory=<resolve path> -> Agent
+specs/project.md:62:GET /project/:projectID/find/file?directory=<resolve path> -> File
+specs/v2/api.html:763:                <td class="body"><code>{ projectID: ProjectID }</code></td>
+specs/v2/api.html:765:                <td class="route"><code>GET /api/project/:projectID</code></td>
+specs/v2/api.html:779:                    >{ projectID: ProjectID name?: string icon?: string commands?: Array&lt;{ name: string command:
+specs/v2/api.html:784:                <td class="route"><code>PATCH /api/project/:projectID</code></td>
+specs/v2/api.html:991:                    >{ projectID?: ProjectID name?: string directory?: string type: string metadata?: Record&lt;string,
+specs/v2/api.html:1015:                <td class="body"><code>{ projectID?: ProjectID }</code></td>

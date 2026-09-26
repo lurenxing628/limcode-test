@@ -49,6 +49,7 @@ src copy/**
 scripts/**
 vendor/**
 docs/**
+limcode-storage-topology-research/**
 milestone/**
 remote-exec/**
 tsconfig*.json
