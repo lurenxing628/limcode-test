@@ -497,33 +497,47 @@ function validateMigration(root, migration, failures) {
     failures.push('旧历史必须自动备份升级，仅要求目标离线；逐库报告失败，不切换当前库或执行旧任务');
   }
   const merge = migration?.historicalMerge;
-  failures.push(...exactSetProblems('历史合并来源',
-    ['legacy-workspace-scope-automatic', 'other-data-set-explicit-request'], merge?.sources ?? []));
-  const identityDomains = merge?.identityDomains ?? {};
-  failures.push(...exactSetProblems('历史合并内容派生身份领域',
-    ['ContentObject', 'ProjectContext', 'Attachment'], Object.keys(identityDomains)));
-  if (merge?.target !== 'selected-current-epoch-data-set'
-    || merge?.initialSelection !== 'no-selection-file-fixed-root-with-data-else-latest-modified-historical-scope; unreadable-fixed-root-or-scope-container-requires-explicit-choice; existing-selection-never-switched'
-    || merge?.trigger !== 'startup-before-selected-host-registration'
-    || merge?.requiresUserConfirmation !== false
-    || merge?.explicitRequestConfirmation !== 'modal-then-reload'
-    || merge?.exclusivity !== 'configuration-admission-and-target-maintenance; other-target-hosts-via-exclusive-maintenance-else-defer-batch'
-    || merge?.sourcePolicy !== 'exact-published-3-4-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot'
-    || merge?.busySourcePolicy !== 'defer-source'
-    || merge?.unfinishedWorkPolicy !== 'refuse-source-and-report'
-    || merge?.backupPolicy !== 'sqlite-backup-api-of-target-once-per-startup-batch'
-    || merge?.casPolicy !== 'hard-link-or-digest-verified-copy-before-row-commit'
-    || merge?.rowPolicy !== 'single-transaction-all-domains; identical-rows-reused; content-identity-domains-keep-target; any-other-difference-or-unique-conflict-rolls-back-source'
-    || JSON.stringify(identityDomains.ContentObject) !== JSON.stringify(['created_at'])
-    || JSON.stringify(identityDomains.ProjectContext) !== JSON.stringify(['name', 'created_at', 'updated_at'])
-    || JSON.stringify(identityDomains.Attachment) !== JSON.stringify(['created_at'])
-    || merge?.integrity !== 'foreign-key-check-quick-check-and-per-domain-row-count-before-commit'
-    || merge?.recordPolicy !== 'per-source-record-in-target-control-root; committing-before-commit; blocked-keyed-by-source-fingerprint; automatic-once-per-source-per-configuration-root'
-    || merge?.noticePolicy !== 'once-per-cause-per-configuration-root; blocked-once-per-source-fingerprint; details-in-log-and-data-set-management'
-    || merge?.sourceRetention !== 'unchanged'
-    || merge?.selectionPolicy !== 'never-switch'
-    || merge?.historicalExecutionPolicy !== 'no-host-registration-or-task-recovery') {
-    failures.push('旧工作区历史只能在当前库打开前离线合并：目标独占、先备份、单事务全领域核对，未结束工作与冲突整份拒绝，来源不变且不执行旧任务');
+  const expectedMerge = {
+    sources: ['pre-switch-history-data-sets-automatic-once', 'user-kept-or-already-merged-explicit-request-only'],
+    target: 'selected-current-epoch-data-set-open-in-requesting-host',
+    initialSelection: 'no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-exact-fingerprint-integrity-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-data-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched',
+    trigger: 'background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; first-host-to-claim-source-maintenance-merges-others-skip',
+    requiresUserConfirmation: false,
+    explicitRequestConfirmation: 'modal-then-online-merge-in-requesting-window-no-reload',
+    writePath: 'one-ordinary-runtime-database-write-transaction-per-source; repository-insert-steps-codec-validated-under-worker-insert-invariants; other-hosts-keep-running-and-see-an-external-commit',
+    historicalCopyDomains: ['ModelRequest', 'Operation', 'Attempt', 'ModelStreamFence', 'ModelStreamCheckpoint'],
+    sizeLimit: 'online-transaction-at-most-6000-rows-and-16MiB-measured-about-1s; larger-source-via-exclusive-maintenance-inside-target-maintenance-keyed-by-source-file-state-else-deferred',
+    exclusivity: 'configuration-admission-and-source-maintenance; source-offline-by-host-liveness-and-legacy-runtime-owner-claim',
+    sourcePolicy: 'exact-published-3-4-backup-and-in-place-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot',
+    busySourcePolicy: 'defer-source',
+    unfinishedWorkPolicy: 'source-backup-then-existing-terminal-transitions-cancelled-or-interrupted-with-reason; states-without-transition-refuse-source-with-reason-and-way-out',
+    backupPolicy: 'sqlite-backup-api-of-open-target-once-per-batch-before-first-change; newest-3-kept-per-control-root; failed-backup-leaves-no-files',
+    casPolicy: 'published-before-row-commit; source-digest-verified-before-link-or-copy; existing-target-object-verified-damaged-blocks',
+    rowPolicy: 'every-source-row-decoded-by-codec; identical-rows-reused; content-identity-domains-keep-target; renumbered-columns-shifted-past-target-maximum; any-other-difference-or-unique-conflict-rolls-back-source-before-any-target-change',
+    identityDomains: {
+      ContentObject: ['created_at'],
+      ProjectContext: ['name', 'created_at', 'updated_at'],
+      Attachment: ['created_at'],
+      AttachmentObservationLink: ['content_object_id', 'created_at']
+    },
+    renumberedColumns: {
+      CollaborationMessage: ['message_seq']
+    },
+    integrity: 'source-foreign-key-quick-check-before; every-source-id-asserted-present-inside-the-transaction',
+    recordPolicy: 'configuration-root-ledger-survives-target-deletion; committing-with-exact-inserted-id-set-counts-as-unmerged; outcomes-keyed-by-exact-source-file-state; user-kept-marker-in-source-control-root',
+    noticePolicy: 'causes-accumulate-per-configuration-root; only-reevaluated-sources-drop-causes; explicit-request-outcome-always-shown; details-in-log-and-data-set-management',
+    sourceRetention: 'conversation-content-unchanged; published-3-4-backed-up-and-upgraded-in-place; backup-before-finalization',
+    selectionPolicy: 'never-switch',
+    historicalExecutionPolicy: 'no-merged-conversation-resumes-in-any-host; source-host-registered-only-to-finalize'
+  };
+  if (!plainObject(merge) || JSON.stringify(merge) !== JSON.stringify(expectedMerge)) {
+    failures.push('旧历史库只能在当前库打开后在线合并：来源离线、先备份再按现有终态收尾、每来源一个经 Repository 与 codec 的正常写事务，超限才走独占兜底，冲突整份拒绝，合并进来的对话不会被自动继续');
+  }
+  const repositoriesSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/repositories.ts'), 'utf8');
+  const historicalCopyDomains = /HISTORICAL_COPY_DOMAINS: readonly string\[\] = \[([^\]]*)\]/.exec(repositoriesSource)?.[1]
+    ?.split(',').map((item) => item.trim().replace(/^'|'$/g, '')).filter(Boolean) ?? [];
+  if (JSON.stringify(historicalCopyDomains) !== JSON.stringify(expectedMerge.historicalCopyDomains)) {
+    failures.push('历史复制插入领域必须与 migration.json#historicalMerge.historicalCopyDomains 完全一致');
   }
   const exclusive = migration?.exclusiveMaintenance;
   const expectedExclusive = {
