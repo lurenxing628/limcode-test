@@ -16,7 +16,7 @@ export const CONTRACT_FILES = [
 ];
 
 const CONTRACT_REVISION = '2026-07-31-r4';
-const CLIENT_FEED_CONTRACT_REVISION = '2026-09-25-r3';
+const CLIENT_FEED_CONTRACT_REVISION = '2026-09-26-r1';
 const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r7';
 // Contracts revised after the base revision; every other contract file stays at CONTRACT_REVISION.
 const FILE_CONTRACT_REVISIONS = new Map([
@@ -327,7 +327,7 @@ export function validateContractDocuments(root, documents) {
   validateFile(documents['file.json'], failures);
   validateContext(documents['context.json'], failures);
   validateSubagent(documents['subagent.json'], failures);
-  validateClient(documents['client-feed.json'], failures);
+  validateClient(root, documents['client-feed.json'], failures);
   validateTargets(documents['targets.json'], documents['gate-registry.json'], failures);
   validateTransitionLedger(root, documents['transition-ledger.json'], failures);
   validateCrossContract(documents, failures);
@@ -1207,7 +1207,7 @@ function validateSubagent(subagent, failures) {
   if (subagent?.recoveryOwnership?.stage !== 'F') failures.push('子代理recovery owner必须是F');
 }
 
-function validateClient(client, failures) {
+function validateClient(root, client, failures) {
   const history = client?.collaborationHistory;
   if (history?.authority !== 'CollaborationMessage+CollaborationMessageSourceLink+CollaborationMessageTargetLink; independent-of-Message'
     || history?.order !== 'CollaborationMessage.message_seq+id-desc; never-created_at'
@@ -1301,11 +1301,44 @@ function validateClient(client, failures) {
   const pagination = client?.pagination;
   if (pagination?.mode !== 'keyset' || pagination?.offsetAllowed !== false || pagination?.frozenRowsAllowed !== false) failures.push('历史读取必须使用键集分页，不能使用offset或冻结整页行');
   if (!positiveInteger(pagination?.maxPageRows) || !positiveInteger(pagination?.maxPageBytes)) failures.push('分页必须有行数和字节上限');
+  if (pagination?.appliesTo !== 'sortIdRegistry-keyset-pages') failures.push('键集分页规则必须只约束sortIdRegistry登记的Feed分页');
+  failures.push(...exactSetProblems('键集分页排除的独立分页', ['conversationHistoryPagination'], pagination?.notApplicableTo ?? []));
+  validateConversationHistoryPagination(root, client?.conversationHistoryPagination, failures);
   if (client?.rendering?.largeLists !== 'virtual-or-segmented' || client?.rendering?.messageHistory !== 'virtual-or-segmented') failures.push('前端大列表和消息历史必须虚拟滚动或分段渲染');
   if (client?.rendering?.customScrollbar !== 'AdvancedScrollbar') failures.push('前端滚动区域必须复用AdvancedScrollbar');
   if (client?.bridgePayload?.structuredClonePlainDataOnly !== true) failures.push('Bridge载荷必须是可结构化克隆的纯数据');
   for (const surface of ['runtime-sqlite', 'cas', 'ordinary-client-state', 'log', 'error', 'vsix']) {
     if (!(client?.secrets?.forbidden ?? []).includes(surface)) failures.push(`密钥禁止面缺少${surface}`);
+  }
+}
+
+/**
+ * The sidebar conversation list is a separate page-number pagination: bounded OFFSET inside the
+ * window, keyset boundaries beyond it. The window must equal the constant the projection enforces.
+ */
+function validateConversationHistoryPagination(root, history, failures) {
+  if (history?.surface !== 'sidebar-conversation-history-list; ConversationHistoryPageRecord'
+    || history?.mode !== 'page-number'
+    || history?.order !== 'Conversation.updated_at+id-desc; mutable-sort-key'
+    || history?.partition !== 'every-read-returns-the-exact-slice-of-the-current-order; adjacent-pages-never-repeat-or-skip-rows'
+    || history?.offsetAllowed !== true
+    || history?.maxOffsetRows !== 10000
+    || history?.offsetRule !== 'bounded-OFFSET-only-when-rows-before-the-page<=maxOffsetRows'
+    || history?.beyondOffsetWindow !== 'keyset-boundary-from|after|before-on-updated_at+id; last-page-read-upward-from-the-end; approximate-under-concurrent-change'
+    || history?.clamp !== 'requested-page-clamped-to-the-current-last-page-inside-one-read-transaction; one-projection-read-per-request'
+    || history?.cursor !== 'pageIndex+optional-boundary+scopeKey+pageSize+dataSetId:rootInstanceId:rootGeneration; no-commitSeq; no-trail'
+    || history?.dataSetMismatch !== 'restart-at-first-page'
+    || history?.refresh !== 'host-resends-the-backend-returned-pageInfo.cursor; foreign-commits-keep-the-page-number'
+    || history?.localActionReveal !== 'this-window-create-fork-or-accepted-input-in-the-shown-scope-returns-to-the-first-page; other-project-actions-never-move-a-project-page'
+    || history?.total !== 'exact-scope-count; project-count-via-ProjectContext.uri-and-ConversationProjectLink.project_context_id-indexes'
+    || history?.frozenRowsAllowed !== false
+    || history?.maxPageRows !== 200) {
+    failures.push('侧栏会话历史必须按页码定位：有界OFFSET窗口外用键集边界，各页为当前排序精确划分，游标只绑定页码与数据集身份');
+  }
+  const projection = fs.readFileSync(path.join(root, 'backend/reliableKernel/clientProjection.ts'), 'utf8');
+  const windowRows = /export const CONVERSATION_HISTORY_EXACT_OFFSET_ROWS = ([\d_]+);/.exec(projection)?.[1];
+  if (windowRows === undefined || Number(windowRows.replaceAll('_', '')) !== history?.maxOffsetRows) {
+    failures.push('侧栏会话历史的OFFSET窗口必须与clientProjection.ts的CONVERSATION_HISTORY_EXACT_OFFSET_ROWS一致');
   }
 }
 

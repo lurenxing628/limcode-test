@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-09-25-r3",
+  "contractRevision": "2026-09-26-r1",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -92,6 +92,10 @@
     "snapshotRequiredRule": "snapshot-required 本身只是一位控制状态，不形成队列；当前 inflight 完成后读取新有界快照。"
   },
   "pagination": {
+    "appliesTo": "sortIdRegistry-keyset-pages",
+    "notApplicableTo": [
+      "conversationHistoryPagination"
+    ],
     "mode": "keyset",
     "offsetAllowed": false,
     "frozenRowsAllowed": false,
@@ -118,6 +122,24 @@
     "maxPageRows": 200,
     "maxPageBytes": 524288,
     "rule": "使用上一页最后一行的稳定排序键继续查询；新插入的行不会让后续页重复或漏读已有行。"
+  },
+  "conversationHistoryPagination": {
+    "surface": "sidebar-conversation-history-list; ConversationHistoryPageRecord",
+    "mode": "page-number",
+    "order": "Conversation.updated_at+id-desc; mutable-sort-key",
+    "partition": "every-read-returns-the-exact-slice-of-the-current-order; adjacent-pages-never-repeat-or-skip-rows",
+    "offsetAllowed": true,
+    "maxOffsetRows": 10000,
+    "offsetRule": "bounded-OFFSET-only-when-rows-before-the-page<=maxOffsetRows",
+    "beyondOffsetWindow": "keyset-boundary-from|after|before-on-updated_at+id; last-page-read-upward-from-the-end; approximate-under-concurrent-change",
+    "clamp": "requested-page-clamped-to-the-current-last-page-inside-one-read-transaction; one-projection-read-per-request",
+    "cursor": "pageIndex+optional-boundary+scopeKey+pageSize+dataSetId:rootInstanceId:rootGeneration; no-commitSeq; no-trail",
+    "dataSetMismatch": "restart-at-first-page",
+    "refresh": "host-resends-the-backend-returned-pageInfo.cursor; foreign-commits-keep-the-page-number",
+    "localActionReveal": "this-window-create-fork-or-accepted-input-in-the-shown-scope-returns-to-the-first-page; other-project-actions-never-move-a-project-page",
+    "total": "exact-scope-count; project-count-via-ProjectContext.uri-and-ConversationProjectLink.project_context_id-indexes",
+    "frozenRowsAllowed": false,
+    "maxPageRows": 200
   },
   "collaborationHistory": {
     "authority": "CollaborationMessage+CollaborationMessageSourceLink+CollaborationMessageTargetLink; independent-of-Message",
@@ -226,7 +248,8 @@
     "r6: RuntimeDeliveryIntentLink 进入有界投影；turn-intent-preview v3 以 guidance/runtime_continuation 判别，并展示后台进程或子 Agent 的真实来源",
     "2026-09-25-r1: 协作卡片按所属回合定位；未加载或早于已加载消息的回合放在第一条消息之上，未进入回合的卡片只在消息下方保留最新几条，最新消息不会被挤出最新分段",
     "2026-09-25-r2: 子 Agent 回答记录带宿主推导的 outcome（submitted/interrupted/failed），续跑预览以 outcome 取代 interrupted；快照为每条已投递回答带上其提交、桥与子执行",
-    "2026-09-25-r3: ModelRequest 在实时增量、快照和历史页统一投影有界结构化计量，防止通用 2 KiB 文本裁剪让瞬态退场后的 Token 和时间指标消失；缺失计量保持未知"
+    "2026-09-25-r3: ModelRequest 在实时增量、快照和历史页统一投影有界结构化计量，防止通用 2 KiB 文本裁剪让瞬态退场后的 Token 和时间指标消失；缺失计量保持未知",
+    "2026-09-26-r1: pagination 的键集与禁止 offset 规则只约束 sortIdRegistry 登记的 Feed 键集分页；侧栏会话历史列表按 conversationHistoryPagination 以页码定位，页前不超过 10,000 行时允许有界 OFFSET，超出后用键集边界；每次刷新各页为当前排序的精确划分，本窗口操作后回到第 1 页，游标只绑定页码与数据集身份"
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",

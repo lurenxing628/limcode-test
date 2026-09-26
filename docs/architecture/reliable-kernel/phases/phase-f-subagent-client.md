@@ -20,7 +20,7 @@
 - snapshot 与 changes 都带 hostBootId；commitSeq 只在同一 host boot 内单调；
 - snapshot 带 snapshotCommitSeq，snapshot read 与 feed registration 形成 atomic barrier；
 - 一个 commit 一个 atomic changes batch；batch/queue 超限转单一 snapshot-required；
-- history/detail 使用 keyset/chunked on-demand read；大列表 virtual/segmented 并复用 AdvancedScrollbar。
+- history/detail 使用 keyset/chunked on-demand read；大列表 virtual/segmented 并复用 AdvancedScrollbar。侧栏会话历史列表是独立的页码分页（见 `client-feed.json` 的 `conversationHistoryPagination`），不属于上述 keyset 规则。
 
 ## 接口依赖
 
