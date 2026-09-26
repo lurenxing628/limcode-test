@@ -56,6 +56,30 @@ test('历史读取保留会话和当前消息关系、分页及真实CAS codec�
   await assert.rejects(reader.listConversations(), /closed/);
 });
 
+test('历史读取显示工具结果消息，不因含工具调用而整页失败', async (t) => {
+  const fixture = await createFixture(t);
+  await seedHistory(fixture.old.binding);
+  const database = new Database(fixture.old.binding.paths.databasePath);
+  configureWriterConnection(database);
+  try {
+    await content(database, fixture.old.binding, 'content-tool', JSON.stringify({
+      detail: { content: '1 # workspace A\n', path: 'README.md' }, status: 'succeeded', toolCallId: 'tool-call-read'
+    }), 'application/vnd.limcode.tool-model-result+json');
+    database.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('message-tool', now, now, null);
+    database.prepare('INSERT INTO message_revision VALUES (?, ?, ?, ?, ?, ?)').run('revision-tool', 'message-tool', 1, 'tool', 'content-tool', now);
+    database.prepare('INSERT INTO message_current_revision_link VALUES (?, ?, ?, ?)').run('current-tool', 'message-tool', 'revision-tool', now);
+    database.prepare('INSERT INTO message_part_of_conversation VALUES (?, ?, ?, ?, ?)').run('membership-tool', 'conversation-a', 'message-tool', 3, now);
+  } finally { database.close(); }
+  const before = await treeSnapshot(fixture.root);
+  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  try {
+    const page = await reader.readMessages('conversation-a');
+    assert.deepEqual(page.items.map((item) => item.role), ['user', 'model', 'tool']);
+    assert.equal(page.items[2].text, '\n[工具结果 succeeded]\n{"content":"1 # workspace A\\n","path":"README.md"}\n');
+  } finally { await reader.close(); }
+  assert.deepEqual(await treeSnapshot(fixture.root), before);
+});
+
 test('长消息内容有显式继续页且不截断Unicode字符', async (t) => {
   const fixture = await createFixture(t);
   const long = 'a'.repeat(32767) + '😀' + 'tail';

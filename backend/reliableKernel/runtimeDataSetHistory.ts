@@ -230,6 +230,14 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
 /** Current canonical MessageContent parts, displayed as text only; never render stored HTML. */
 function decodeHistoryText(source: string, contentType: string): string {
   if (contentType.split(';', 1)[0].trim().toLowerCase() === 'text/plain') return source;
+  if (contentType === 'application/vnd.limcode.tool-model-result+json') {
+    const parsed: unknown = JSON.parse(source);
+    if (!isRecord(parsed) || !('detail' in parsed)) {
+      throw new Error('Historical ToolModelResult does not match the current canonical codec.');
+    }
+    text(parsed.toolCallId, 'Historical ToolModelResult.toolCallId');
+    return `\n[工具结果 ${text(parsed.status, 'Historical ToolModelResult.status')}]\n${JSON.stringify(parsed.detail)}\n`;
+  }
   if (contentType !== 'application/vnd.limcode.message+json') {
     throw new Error(`Unsupported historical message content type: ${contentType}`);
   }
