@@ -7,12 +7,17 @@ import type { ColumnDefinition, RuntimeDomainSchema } from './schema/types';
 
 export type DomainRow = Record<string, unknown>;
 
-/** Domains eligible for trusted Conversation-fork transcript copy inserts. */
+/**
+ * Domains eligible for trusted historical copy inserts: Conversation-fork transcript copies, and
+ * the historical data-set merge, which also carries the retained stream checkpoints of terminal
+ * ModelRequests (the terminal summary is the completed request's durable output).
+ */
 export const HISTORICAL_COPY_DOMAINS: readonly string[] = [
   'ModelRequest',
   'Operation',
   'Attempt',
-  'ModelStreamFence'
+  'ModelStreamFence',
+  'ModelStreamCheckpoint'
 ];
 export type EncodedRow = Record<string, string | bigint | Buffer | null>;
 

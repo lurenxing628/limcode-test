@@ -515,6 +515,15 @@ export class RuntimeDatabase {
   }
 
   /**
+   * Online, consistent copy of this database through the SQLite Backup API on a dedicated worker
+   * connection, so other Hosts keep writing meanwhile. The destination must be a new file inside
+   * this root's control directory; the caller verifies and publishes it.
+   */
+  public async backupTo(destinationPath: string): Promise<void> {
+    await this.request<null>({ kind: 'backupDatabase', destinationPath });
+  }
+
+  /**
    * Close ordering: sweep timers stop and any in-flight idle sweep (whose probe still reads the
    * database) completes while the worker is open; the writer is fenced next, and only then are
    * durable conversation owner records released — never before, and never after another Host

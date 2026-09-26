@@ -366,6 +366,25 @@ async function start(): Promise<void> {
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
+      if (request.kind === 'backupDatabase') {
+        assertDatabaseBinding(reader, data.binding);
+        const destination = requireBackupDestination(request.destinationPath, data.binding.paths.dataRootPath);
+        // A separate connection: the Backup API steps between event-loop turns while this worker
+        // keeps serving requests. One large step after the first copies the rest atomically, so a
+        // concurrent commit from another Host cannot restart a partially copied backup forever.
+        const source = new Database(toSqliteFilePath(data.binding.paths.databasePath), { readonly: true, fileMustExist: true });
+        void source.backup(toSqliteFilePath(destination), { progress: () => 0x7fffffff }).then(
+          () => {
+            source.close();
+            respond({ type: 'response', id: request.id, ok: true, result: null });
+          },
+          (error: unknown) => {
+            source.close();
+            respond({ type: 'response', id: request.id, ok: false, error: serializeError(error) });
+          }
+        );
+        return;
+      }
       if (request.kind === 'externalDataVersion') {
         assertDatabaseBinding(writer, data.binding);
         // SQLite changes this connection-local value only when another connection commits.
@@ -1504,8 +1523,17 @@ function executeMutation(
     if (historicalCopy && !HISTORICAL_COPY_DOMAINS.includes(schema.key)) {
       throw new Error(`${schema.key} does not permit historical copy inserts.`);
     }
-    if (schema.key === 'ModelStreamCheckpoint' || (schema.key === 'ModelStreamFence' && !historicalCopy)) {
+    if ((schema.key === 'ModelStreamCheckpoint' || schema.key === 'ModelStreamFence') && !historicalCopy) {
       throw new Error(`${schema.key} insert is limited to the fixed writer modelStreamEvent operation.`);
+    }
+    if (schema.key === 'ModelStreamCheckpoint') {
+      // Historical merge copies the retained stream facts of an already terminal request only.
+      const request = database.prepare('SELECT status FROM model_request WHERE id = ?').get(mutation.row.model_request_id) as {
+        status?: unknown;
+      } | undefined;
+      if (request?.status !== 'terminal') {
+        throw new Error('Historical ModelStreamCheckpoint copy requires its ModelRequest to be terminal.');
+      }
     }
     const allocatedRow = mutation.allocateSequence
       ? allocateNextSequence(database, repository, mutation)
@@ -2768,6 +2796,18 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
   parameters.__limit = BigInt(read.limit);
   const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction}${orderColumn === 'id' ? '' : `, id ${direction}`} LIMIT @__limit`;
   return (database.prepare(sql).all(parameters) as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));
+}
+
+function requireBackupDestination(value: unknown, dataRootPath: string): string {
+  if (typeof value !== 'string' || !path.isAbsolute(value)) throw new TypeError('Backup destination must be an absolute path.');
+  const destination = path.resolve(value);
+  const controlRoot = path.dirname(path.resolve(dataRootPath));
+  if (!isPathBelow(controlRoot, destination) || isPathBelow(path.resolve(dataRootPath), destination)
+    || destination === path.resolve(dataRootPath)) {
+    throw new Error('Backup destination must stay inside the control root, outside the active data root.');
+  }
+  if (fs.existsSync(destination)) throw new Error('Backup destination already exists.');
+  return destination;
 }
 
 function assertPublishedContentObject(row: EncodedRow, casRootPath: string): void {

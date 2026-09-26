@@ -29,6 +29,7 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'clientKeysetPage'
   | 'conversationHistoryProjection'
   | 'externalDataVersion'
+  | 'backupDatabase'
   | 'inspect'
   | 'close';
 
