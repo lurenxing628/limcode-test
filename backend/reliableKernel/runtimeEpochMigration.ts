@@ -440,6 +440,24 @@ async function publishRetiredEpoch4Manifest(
   });
 }
 
+/**
+ * Read-only exact-predecessor check on an offline snapshot connection: the same integrity,
+ * physical DDL, manifest and binding checks the upgrade performs before it mutates anything.
+ */
+export async function assertPublishedPreviousRuntimeEpochSnapshot(
+  database: Database.Database,
+  binding: HistoricalRootBinding
+): Promise<void> {
+  if (!isSupportedPreviousEpoch(binding.runtimeKernelEpoch)) {
+    throw new RootAuthorityError(
+      'runtime-epoch-migration-unsupported',
+      'The historical Runtime pointer is not an exact published epoch-3/4 predecessor.'
+    );
+  }
+  await assertPreviousEpochManifest(binding);
+  assertPreviousEpochDatabase(database, binding);
+}
+
 async function assertPreviousEpochRoot(binding: HistoricalRootBinding): Promise<void> {
   await assertPreviousEpochManifest(binding);
   const casStat = await fs.stat(binding.paths.casRootPath).catch((error: unknown) => {

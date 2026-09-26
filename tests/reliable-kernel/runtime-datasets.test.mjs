@@ -21,6 +21,11 @@ const {
   VscodeRuntimeDataSetSelectionRequiredError
 } = require('../../dist/extension/backend/reliableKernel/vscodeRootAuthority.js');
 const { RootAuthority } = require('../../dist/extension/backend/reliableKernel/rootAuthority.js');
+const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
+const Database = require('better-sqlite3');
+const { summarizeRuntimeDataSet } = require('../../dist/extension/backend/reliableKernel/runtimeDataSetPreflight.js');
+const { runtimeDataSetFingerprint, writeRuntimeDataSetMergeLedgerRecord } = require('../../dist/extension/backend/reliableKernel/runtimeDataSetMergeLedger.js');
+const { projectFolderAssignmentSteps } = require('../../dist/extension/backend/reliableKernel/conversationProject.js');
 const { ownProcessStartIdentity } = require('../../dist/extension/backend/reliableKernel/runtimeClaimPrimitives.js');
 const { recoverInterruptedPhysicalCutover, persistPhysicalCutoverRequest } = require('../../dist/extension/backend/reliableKernel/physicalCutover.js');
 const { withRuntimeMaintenance } = require('../../dist/extension/backend/reliableKernel/runtimeHostControl.js');
@@ -34,20 +39,42 @@ const fixture = async (run) => {
 };
 
 async function createRoot(scopeRoot, epoch = 5) {
+  // A real Runtime root: the first automatic choice runs a read-only upgradability preflight on it.
   const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot }));
-  let binding = await authority.initializeEmptyRoot(async (next) => {
-    await fs.mkdir(next.paths.casRootPath, { recursive: true });
-    // Selection deliberately checks physical identity, not database schema/integrity. Runtime's
-    // existing startup gate owns that validation, so this fixture never opens a real database.
-    await fs.writeFile(next.paths.databasePath, 'selection-fixture');
-  });
-  if (epoch !== 5) {
-    binding = { ...binding, runtimeKernelEpoch: epoch };
-    await fs.writeFile(binding.paths.rootPointerPath, JSON.stringify(binding));
-    const manifest = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
-    await fs.writeFile(binding.paths.runtimeEpochPath, JSON.stringify({ ...manifest, runtimeKernelEpoch: epoch }));
-  }
-  return binding;
+  const binding = await kernel.initializeEmptyRuntimeRoot(authority);
+  if (epoch === 5) return binding;
+  // The exact published predecessor layout, as in the epoch upgrade tests.
+  const oldKeys = new Set((epoch === 3 ? kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS)
+    .map((schema) => schema.key));
+  const added = kernel.RUNTIME_DOMAIN_SCHEMAS.filter((schema) => !oldKeys.has(schema.key));
+  const database = new Database(kernel.toSqliteFilePath(binding.paths.databasePath));
+  try {
+    database.pragma('foreign_keys = OFF');
+    database.exec('BEGIN IMMEDIATE');
+    for (const schema of [...added].reverse()) database.exec(`DROP TABLE ${schema.table}`);
+    const dropManifest = database.prepare('DELETE FROM schema_manifest WHERE domain_key = ?');
+    for (const schema of added) dropManifest.run(schema.key);
+    database.prepare('UPDATE schema_manifest SET runtime_kernel_epoch = ?').run(epoch);
+    database.prepare('UPDATE root_binding SET runtime_kernel_epoch = ? WHERE singleton = 1').run(epoch);
+    database.exec('COMMIT');
+    database.pragma('wal_checkpoint(TRUNCATE)');
+  } finally { database.close(); }
+  const previous = { ...binding, runtimeKernelEpoch: epoch };
+  await fs.writeFile(binding.paths.rootPointerPath, JSON.stringify(previous));
+  const manifest = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
+  await fs.writeFile(binding.paths.runtimeEpochPath, JSON.stringify({ ...manifest, runtimeKernelEpoch: epoch }));
+  return previous;
+}
+
+/** Unknown drift of a published layout: one index is missing. */
+async function dropOneIndex(binding) {
+  const database = new Database(kernel.toSqliteFilePath(binding.paths.databasePath));
+  try {
+    const name = database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name LIMIT 1").pluck().get();
+    database.exec(`DROP INDEX "${name}"`);
+    database.pragma('wal_checkpoint(TRUNCATE)');
+  } finally { database.close(); }
 }
 
 test('无旧库时只预留固定默认根，初始化完成后根丢失不能隐式重建', async () => fixture(async (root, paths) => {
@@ -119,6 +146,74 @@ test('没有固定根的多个旧工作区库按最近使用自动选当前库�
   assert.equal(placement.runtimeDataRootPath, newer.paths.dataRootPath);
   assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8')).id, `workspace:${newerScope.key}`);
   await assert.rejects(fs.stat(path.join(root, '.limcode-runtime')), { code: 'ENOENT' });
+}));
+
+test('首次自动选库只在通过可升级性预检的候选中选：漂移的最近库和有失败记录的库都不选', async () => fixture(async (root, paths) => {
+  const fixed = await createRoot(root, 4);
+  await dropOneIndex(fixed);
+  const healthyScope = scope('healthy');
+  const driftedScope = scope('drifted');
+  const failedScope = scope('recorded-failure');
+  const healthy = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, healthyScope), 4);
+  const drifted = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, driftedScope), 4);
+  await dropOneIndex(drifted);
+  const failed = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, failedScope));
+  const at = (day) => new Date(`2026-09-0${day}T00:00:00Z`);
+  await fs.utimes(healthy.paths.databasePath, at(1), at(1));
+  await fs.utimes(drifted.paths.databasePath, at(2), at(2));
+  await fs.utimes(failed.paths.databasePath, at(3), at(3));
+  // A merge failure recorded for exactly these files (e.g. a missing message body) also excludes it.
+  const failedCandidate = await resolveVscodeRuntimeDataSet(paths, `workspace:${failedScope.key}`);
+  await writeRuntimeDataSetMergeLedgerRecord(paths, {
+    candidateId: failedCandidate.id, state: 'failed', source: await runtimeDataSetFingerprint(failedCandidate),
+    code: 'runtime-data-set-merge-source-cas-invalid', message: '来源缺少正文文件'
+  });
+  const placement = await resolveVscodeWorkspaceRuntimePlacement(paths, driftedScope);
+  assert.equal(placement.runtimeDataRootPath, healthy.paths.dataRootPath, '固定根和最近的库都过不了预检，选能升级的那个');
+  assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8')).id, `workspace:${healthyScope.key}`);
+}));
+
+test('所有候选都过不了预检时不发布选择，退回显式选择并写明每个库的原因', async () => fixture(async (root, paths) => {
+  const driftedScope = scope('drifted-only');
+  const drifted = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, driftedScope), 4);
+  await dropOneIndex(drifted);
+  const currentScope = scope('drifted-current');
+  await dropOneIndex(await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, currentScope)));
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, driftedScope), (error) => {
+    assert.ok(error instanceof VscodeRuntimeDataSetSelectionRequiredError);
+    assert.deepEqual(error.problems.map((problem) => problem.id).sort(),
+      [`workspace:${driftedScope.key}`, `workspace:${currentScope.key}`].sort());
+    assert.ok(error.problems.every((problem) => /结构或完整性核验未通过/.test(problem.message)));
+    return true;
+  });
+  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+}));
+
+test('选择界面用的历史库摘要：项目文件夹名、对话数与最后活动时间，旧格式同样可读', async () => fixture(async (root, paths) => {
+  const alphaScope = scope('summary');
+  const binding = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, alphaScope));
+  const authority = new RootAuthority(() => binding.paths.dataRootPath);
+  const runtime = await kernel.RuntimeDatabase.open(authority);
+  try {
+    const conversations = [['conversation_a', 'file:///workspace/limcode', '2026-09-20T00:00:00.000Z'],
+      ['conversation_b', 'file:///workspace/limcode', '2026-09-24T08:00:00.000Z'],
+      ['conversation_c', 'file:///workspace/notes', '2026-09-22T00:00:00.000Z']];
+    for (const [id, uri, at] of conversations) {
+      await runtime.transaction([
+        kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id, title: id, status: 'active', created_at: at, updated_at: at }),
+        ...projectFolderAssignmentSteps({ conversationId: id, folder: { uri, name: uri.split('/').pop() }, now: at })
+      ]);
+    }
+  } finally { await runtime.close(); }
+  const candidate = await resolveVscodeRuntimeDataSet(paths, `workspace:${alphaScope.key}`);
+  const before = await fs.readdir(binding.paths.dataRootPath);
+  assert.deepEqual(await summarizeRuntimeDataSet(candidate), {
+    projectNames: ['limcode', 'notes'], conversationCount: 3, lastActivityAt: '2026-09-24T08:00:00.000Z'
+  });
+  assert.deepEqual(await fs.readdir(binding.paths.dataRootPath), before, '摘要读私有快照，不在库旁留下文件');
+  await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, scope('summary-epoch-3')), 3);
+  const oldCandidate = await resolveVscodeRuntimeDataSet(paths, `workspace:${scope('summary-epoch-3').key}`);
+  assert.deepEqual(await summarizeRuntimeDataSet(oldCandidate), { projectNames: [], conversationCount: 0 });
 }));
 
 test('旧工作区容器不可读时不自动选库，仍要求明确选择', async () => fixture(async (root, paths) => {
@@ -335,6 +430,7 @@ for (const [fromEpoch, toEpoch] of [[3, 4], [3, 5], [4, 5]]) test(
 
 test('真实进程在cutover归档active后退出，选库仍放行原journal恢复且不改写身份', async () => fixture(async (root, paths) => {
   const binding = await createRoot(root);
+  const databaseBefore = await fs.readFile(binding.paths.databasePath);
   await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'));
   const source = `
     const { RootAuthority } = require(${JSON.stringify(require.resolve('../../dist/extension/backend/reliableKernel/rootAuthority.js'))});
@@ -360,7 +456,7 @@ test('真实进程在cutover归档active后退出，选库仍放行原journal恢
   const authority = new RootAuthority(() => binding.paths.dataRootPath);
   assert.equal(await recoverInterruptedPhysicalCutover(root, authority), 'rolled-back');
   assert.deepEqual(await authority.current(), binding);
-  assert.equal(await fs.readFile(binding.paths.databasePath, 'utf8'), 'selection-fixture');
+  assert.deepEqual(await fs.readFile(binding.paths.databasePath), databaseBefore);
   assert.equal((await resolveVscodeRuntimeDataSet(paths, 'default')).requiresRecovery, undefined);
 }));
 
@@ -387,6 +483,7 @@ test('损坏指针、无binding数据、丢失CAS和epoch身份漂移均拒绝�
   for (const mode of ['malformed', 'unbound', 'missing-cas', 'epoch-mismatch']) {
     await fixture(async (root, paths) => {
       const binding = await createRoot(root);
+      const databaseBefore = await fs.readFile(binding.paths.databasePath);
       if (mode === 'malformed') await fs.writeFile(binding.paths.rootPointerPath, '{}');
       if (mode === 'unbound') await fs.rm(binding.paths.rootPointerPath);
       if (mode === 'missing-cas') await fs.rm(binding.paths.casRootPath, { recursive: true });
@@ -396,7 +493,7 @@ test('损坏指针、无binding数据、丢失CAS和epoch身份漂移均拒绝�
       }
       await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-invalid' });
       await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
-      assert.equal(await fs.readFile(binding.paths.databasePath, 'utf8'), 'selection-fixture');
+      assert.deepEqual(await fs.readFile(binding.paths.databasePath), databaseBefore);
     });
   }
 });

@@ -6,6 +6,7 @@ import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirector
 import { isPathInside } from '../capabilities/filesystem/pathContainment';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths } from './contracts';
 import { RootAuthority, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
+import { classifyRecordedProcess } from './runtimeClaimPrimitives';
 import { assertRuntimeHostsOffline, runtimeHostLivenessDirectory, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { CUTOVER_JOURNAL_FILE, physicalCutoverRecoveryRequired } from './physicalCutover';
 
@@ -16,9 +17,19 @@ export const VSCODE_RUNTIME_ACTIVE_DIRECTORY = 'active';
 export const VSCODE_WORKSPACE_RUNTIMES_DIRECTORY = '.limcode-workspace-runtimes';
 export const VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY = 'scopes';
 export const VSCODE_RUNTIME_SELECTION_FILE = '.limcode-runtime-selection.json';
+/**
+ * Historical merge ledger of one configuration root. It lives beside the data sets rather than in
+ * any of them, so deleting a merge target never makes its merged sources look unmerged.
+ */
+export const VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY = '.limcode-runtime-merges';
+/** Written into a data set's own control root when the user switches the current data set away from it. */
+export const VSCODE_RUNTIME_DATA_SET_KEPT_FILE = 'kept-by-user.json';
+/** v0.0.10–v0.0.20 per-scope window claim (`<scope>/runtime-owner/owner.json`); later versions publish host-liveness. */
+export const VSCODE_LEGACY_WORKSPACE_RUNTIME_OWNER_DIRECTORY = 'runtime-owner';
 
 const WORKSPACE_RUNTIME_ID_DOMAIN = 'limcode-vscode-workspace-runtime\0';
 const RUNTIME_SELECTION_KIND = 'limcode-runtime-selection';
+const RUNTIME_DATA_SET_KEPT_KIND = 'limcode-runtime-data-set-kept';
 
 export type VscodeWorkspaceRuntimeScopeKind =
   | 'workspace-file'
@@ -200,8 +211,13 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
       if (problems.some(problem => problem.id === 'default' || problem.id === 'workspace-scopes')) {
         throw new VscodeRuntimeDataSetSelectionRequiredError(candidates, problems);
       }
-      candidate = await chooseInitialRuntimeDataSet(candidates)
-        ?? await inspectCandidate(configurationRootPath, 'default', undefined, true);
+      const choice = await chooseInitialRuntimeDataSet(configurationRootPath, candidates);
+      if (choice.rejected.length > 0 && !choice.candidate) {
+        // Nothing passed the read-only upgrade preflight: publishing a choice would only make every
+        // later startup fail on it. A person chooses, with each rejection explained.
+        throw new VscodeRuntimeDataSetSelectionRequiredError(candidates, [...problems, ...choice.rejected]);
+      }
+      candidate = choice.candidate ?? await inspectCandidate(configurationRootPath, 'default', undefined, true);
       await assertConfigurationRootRuntimesOffline(configurationRootPath);
       await publishSelection(configurationRootPath, candidate.id, Boolean(candidate.dataSetId));
     }
@@ -216,19 +232,36 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
 }
 
 /**
- * First selection when no explicit choice exists (an upgrade from per-workspace versions). The
- * fixed default root wins when it holds data; otherwise the historical workspace scope whose
- * SQLite changed last, whose own interrupted work is then recovered as the current data set.
- * Every other historical workspace scope is merged into it before the Runtime opens, so the
- * choice only decides which in-place root receives the others. Unusable scopes stay reported.
+ * First selection when no explicit choice exists (an upgrade from per-workspace versions). Only
+ * data sets that pass the read-only upgrade preflight (recognized epoch 3/4/5, exact fingerprint,
+ * integrity, no pending recovery, no recorded merge failure for the same files) are eligible. The
+ * fixed default root with a complete RootBinding wins; otherwise the historical workspace scope
+ * whose SQLite changed last. Every other data set from before this version is merged into it
+ * after the Runtime opens, so the choice only decides which in-place root receives the others.
  */
 async function chooseInitialRuntimeDataSet(
+  configurationRootPath: string,
   candidates: readonly VscodeRuntimeDataSetCandidate[]
-): Promise<VscodeRuntimeDataSetCandidate | undefined> {
-  const fixed = candidates.find(candidate => candidate.id === 'default');
-  if (fixed || candidates.length <= 1) return fixed ?? candidates[0];
-  let latest: { candidate: VscodeRuntimeDataSetCandidate; changedAt: number } | undefined;
+): Promise<{ candidate?: VscodeRuntimeDataSetCandidate; rejected: VscodeRuntimeDataSetProblem[] }> {
+  const { preflightRuntimeDataSet } = await import('./runtimeDataSetPreflight');
+  const { readRecordedRuntimeDataSetFailure } = await import('./runtimeDataSetMergeLedger');
+  const rejected: VscodeRuntimeDataSetProblem[] = [];
+  const eligible: VscodeRuntimeDataSetCandidate[] = [];
+  let reserved: VscodeRuntimeDataSetCandidate | undefined;
   for (const candidate of [...candidates].sort((left, right) => left.id.localeCompare(right.id))) {
+    // A reserved root without data has nothing to check; it is used only when nothing else exists.
+    if (!candidate.dataSetId) { reserved ??= candidate; continue; }
+    const problem = await preflightRuntimeDataSet(candidate)
+      ?? await readRecordedRuntimeDataSetFailure({ globalStoragePath: configurationRootPath }, candidate);
+    if (problem) rejected.push({ id: candidate.id, runtimeScopeRootPath: candidate.runtimeScopeRootPath, message: problem.message });
+    else eligible.push(candidate);
+  }
+  // Never an empty root in place of history that failed its preflight: a person chooses then.
+  if (eligible.length === 0) return { candidate: rejected.length ? undefined : reserved, rejected };
+  const fixed = eligible.find(candidate => candidate.id === 'default');
+  if (fixed || eligible.length === 1) return { candidate: fixed ?? eligible[0], rejected };
+  let latest: { candidate: VscodeRuntimeDataSetCandidate; changedAt: number } | undefined;
+  for (const candidate of eligible) {
     const database = createRuntimeRootPaths(candidate.runtimeDataRootPath).databasePath;
     let changedAt = 0;
     for (const file of [database, `${database}-wal`]) {
@@ -237,7 +270,7 @@ async function chooseInitialRuntimeDataSet(
     }
     if (!latest || changedAt > latest.changedAt) latest = { candidate, changedAt };
   }
-  return latest?.candidate;
+  return { candidate: latest?.candidate, rejected };
 }
 
 /** Explicit read-only enumeration for selection/history/storage tools; startup does not use it once selected. */
@@ -277,9 +310,85 @@ export async function selectVscodeRuntimeDataSet(
     const candidate = await inspectCandidate(root, id, previous, previous?.id === id && !previous.initialized);
     if (previous?.id === id) return candidate;
     await assertConfigurationRootRuntimesOffline(root);
+    // Switching away is an explicit decision to keep that data set apart: it is never merged
+    // automatically afterwards. Data sets from before this version carry no such record.
+    if (previous) {
+      const kept = await inspectCandidate(root, previous.id, previous, !previous.initialized).catch(() => undefined);
+      if (kept?.dataSetId && kept.rootInstanceId) await markRuntimeDataSetKept(kept);
+    }
     await publishSelection(root, id, true, previous);
     return Object.freeze({ ...candidate, selected: true });
   });
+}
+
+/** Configuration-root merge ledger; see {@link VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY}. */
+export function resolveVscodeRuntimeMergeLedgerRoot(paths: Pick<VscodeStoragePaths, 'globalStoragePath'>): string {
+  return path.join(path.resolve(paths.globalStoragePath), VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY);
+}
+
+/** True when the user switched away from exactly this data set incarnation in this version. */
+export async function isVscodeRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<boolean> {
+  if (!candidate.dataSetId || !candidate.rootInstanceId) return false;
+  const file = keptMarkerPath(candidate);
+  await assertSafeRootPath(candidate.configurationRootPath, file);
+  let value: unknown;
+  try { value = await readOptionalJson(file); }
+  catch { return false; }
+  const record = value as Record<string, unknown> | undefined;
+  return record?.kind === RUNTIME_DATA_SET_KEPT_KIND
+    && record.dataSetId === candidate.dataSetId && record.rootInstanceId === candidate.rootInstanceId;
+}
+
+/**
+ * v0.0.10–v0.0.20 windows claimed their scope through `<scope>/runtime-owner/owner.json` and
+ * published no Host liveness. Judged with the same process-start identity rule as other claims:
+ * only a proven dead or reused owner is absent; a malformed record proves nothing.
+ */
+export async function legacyWorkspaceRuntimeOwnerState(
+  candidate: Pick<VscodeRuntimeDataSetCandidate, 'configurationRootPath' | 'runtimeScopeRootPath'>
+): Promise<'absent' | 'alive' | 'unknown'> {
+  const file = path.join(candidate.runtimeScopeRootPath, VSCODE_LEGACY_WORKSPACE_RUNTIME_OWNER_DIRECTORY, 'owner.json');
+  await assertSafeRootPath(candidate.configurationRootPath, file);
+  let value: unknown;
+  try {
+    value = await readOptionalJson(file);
+  } catch {
+    return 'unknown';
+  }
+  if (value === undefined) return 'absent';
+  const record = value as Record<string, unknown> | null;
+  if (!record || typeof record !== 'object' || !Number.isSafeInteger(record.pid) || (record.pid as number) <= 0
+    || (record.processStartIdentity !== undefined && typeof record.processStartIdentity !== 'string')) return 'unknown';
+  const state = classifyRecordedProcess(record.pid as number, record.processStartIdentity as string | undefined);
+  return state === 'dead' ? 'absent' : state === 'alive' ? 'alive' : 'unknown';
+}
+
+async function markRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
+  const file = keptMarkerPath(candidate);
+  await assertSafeRootPath(candidate.configurationRootPath, file);
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const handle = await fs.open(temporary, 'wx', 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify({
+        kind: RUNTIME_DATA_SET_KEPT_KIND,
+        dataSetId: candidate.dataSetId,
+        rootInstanceId: candidate.rootInstanceId,
+        keptAt: new Date().toISOString()
+      }, null, 2)}\n`, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(temporary, file);
+    await syncDirectoryDurably(path.dirname(file));
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+function keptMarkerPath(candidate: Pick<VscodeRuntimeDataSetCandidate, 'runtimeDataRootPath'>): string {
+  return path.join(path.dirname(path.resolve(candidate.runtimeDataRootPath)), VSCODE_RUNTIME_DATA_SET_KEPT_FILE);
 }
 
 /** Seal the fresh-root reservation after ensureCurrentRoot succeeds, before the Host opens. */
