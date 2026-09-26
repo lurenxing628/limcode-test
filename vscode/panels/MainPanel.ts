@@ -9,7 +9,7 @@ import {
   type WebviewToExtensionMessage
 } from '../../shared/protocol';
 import { displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
-import { EXTENSION_AGENT_NAME, EXTENSION_BRAND, MAIN_PANEL_VIEW_TYPE, WEBVIEW_DEV_PORT } from '../../shared/extensionIdentity';
+import { EXTENSION_AGENT_NAME, EXTENSION_BRAND, EXTENSION_COMMAND_IDS, MAIN_PANEL_VIEW_TYPE, WEBVIEW_DEV_PORT } from '../../shared/extensionIdentity';
 import {
   getInitializingWebviewHtml,
   getUnavailableWebviewHtml,
@@ -408,6 +408,10 @@ export class MainPanel {
           this.openLocalFileFromPanel(message.payload.source);
           return;
         }
+        if (message.type === BridgeMessageType.DataRootAction && message.payload?.action) {
+          this.runDataRootActionFromPanel(message.payload.action);
+          return;
+        }
         this.backendApp.handleWebviewMessage(this.clientId, message);
         this.refreshTitleFromOutgoingMessage(message);
       },
@@ -424,6 +428,18 @@ export class MainPanel {
       const disposable = this.disposables.pop();
       disposable?.dispose();
     }
+  }
+
+  /** Settings-page data-directory buttons: native commands own the picker, confirmation and reload. */
+  private runDataRootActionFromPanel(action: unknown): void {
+    const command = action === 'relocate' ? EXTENSION_COMMAND_IDS.relocateDataRoot
+      : action === 'returnToPrevious' ? EXTENSION_COMMAND_IDS.returnToPreviousDataRoot
+        : action === 'deletePrevious' ? EXTENSION_COMMAND_IDS.deletePreviousDataRoot : undefined;
+    if (!command) return;
+    void vscode.commands.executeCommand(command).then(undefined, (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`数据目录操作失败：${message}`);
+    });
   }
 
   private openLocalFileFromPanel(source: string): void {

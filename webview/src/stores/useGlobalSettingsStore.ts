@@ -19,6 +19,7 @@ import {
   defaultLlmPromptCacheModeForProvider,
   defaultLlmPromptCacheTtlForProvider,
   type CheckpointMaintenanceSettingsRecord,
+  type DataRootActionPayload,
   type GlobalSettingsRecord,
   type NetworkSettingsRecord,
   type GlobalSettingsSection,
@@ -154,7 +155,7 @@ function settingsErrorStatus(requestType: string | undefined, message: string): 
 }
 
 function emptyCommon(): GlobalSettingsRecord {
-  return { dataFilePath: '', proxy: '', proxyShellAndMcp: false, activeDataRootPath: '', defaultDataRootPath: '' };
+  return { dataFilePath: '', proxy: '', proxyShellAndMcp: false, activeDataRootPath: '', defaultDataRootPath: '', previousDataRootPath: '' };
 }
 
 function emptyNetwork(): NetworkSettingsRecord {
@@ -940,7 +941,8 @@ function plainSettingsFromState(state: GlobalSettingsState, section: GlobalSetti
         proxy: state.common.proxy,
         proxyShellAndMcp: state.common.proxyShellAndMcp,
         activeDataRootPath: state.common.activeDataRootPath,
-        defaultDataRootPath: state.common.defaultDataRootPath
+        defaultDataRootPath: state.common.defaultDataRootPath,
+        previousDataRootPath: state.common.previousDataRootPath
       };
     case 'network': return { userAgent: state.network.userAgent.trim() };
     case 'llm': return { activeProviderConfigId: state.llm.activeProviderConfigId };
@@ -1428,7 +1430,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       }
     },
     saveCommon(): void {
-      this.status = '正在保存设置，并按需迁移、删除旧数据目录中的插件数据...';
+      this.status = '正在保存设置...';
       this.enqueueSettingsUpdate({
         section: 'common',
         settings: {
@@ -1436,9 +1438,14 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
           proxy: this.common.proxy,
           proxyShellAndMcp: this.common.proxyShellAndMcp,
           activeDataRootPath: this.common.activeDataRootPath,
-          defaultDataRootPath: this.common.defaultDataRootPath
+          defaultDataRootPath: this.common.defaultDataRootPath,
+          previousDataRootPath: this.common.previousDataRootPath
         }
       });
+    },
+    /** Data-directory moves run as native commands (folder picker, confirmation, progress, reload). */
+    requestDataRootAction(action: DataRootActionPayload['action']): void {
+      bridge.request(BridgeMessageType.DataRootAction, { action });
     },
     saveNetwork(): void {
       this.enqueueSettingsUpdate({

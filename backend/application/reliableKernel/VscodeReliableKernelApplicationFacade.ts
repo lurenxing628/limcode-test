@@ -3,10 +3,12 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { StorageDataResetResult } from '../../capabilities/types';
 import { mapSettledWithBoundedConcurrency } from '../../capabilities/boundedConcurrency';
-import { loadCommittedGlobalStatus, resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
+import { loadCommittedGlobalStatus, normalizeStatusDataRootPath, resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/vscodeStorage/paths';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths, type RuntimeRootPaths } from '../../reliableKernel/contracts';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
+import { assertDataRootAvailable } from '../../reliableKernel/runtimeDataRootRelocation';
+import type { RuntimeExclusiveMaintenanceOutcome } from '../../reliableKernel/runtimeExclusiveMaintenance';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
@@ -170,8 +172,12 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     // this configuration root. It is acquired before placement resolution and the scope
     // maintenance claim nests inside it; both lock orders (open and reset) agree.
     return openUnderCurrentDataRootAdmission(async () => {
-      await loadCommittedGlobalStatus(context);
-      return getPaths().globalStoragePath;
+      const status = await loadCommittedGlobalStatus(context);
+      const root = getPaths().globalStoragePath;
+      // A configured directory (VS Code's own storage excepted) must exist and hold LimCode data:
+      // placement would otherwise create an empty history on an unmounted drive or lost share.
+      if (normalizeStatusDataRootPath(context, status.dataRootPath)) await assertDataRootAvailable(root);
+      return root;
     }, async () => {
       const runtimePlacement = await resolveVscodeWorkspaceRuntimePlacement(
         getPaths(),
@@ -577,6 +583,36 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (pinned || await database.hasConversationRuntimeWork(conversationId)) return true;
     }
     return false;
+  }
+
+  /**
+   * Runs `operation` with every Host of this window's data directory offline: `coordinate` asks
+   * the other windows to reload (two-phase exclusive maintenance, inside the configuration
+   * admission and the selected root's maintenance claim, like reset), and this window closes its
+   * own Runtime first. Used to move or switch the data directory. When `runtimeClosed` is true the
+   * window must reload, whatever the outcome.
+   */
+  public async runWithDataRootOffline<T>(
+    coordinate: (
+      paths: RuntimeRootPaths, requesterHostBootId: string, operation: () => Promise<T>
+    ) => Promise<RuntimeExclusiveMaintenanceOutcome<T>>,
+    operation: () => Promise<T>
+  ): Promise<{ outcome: RuntimeExclusiveMaintenanceOutcome<T> | { state: 'failed'; error: unknown }; runtimeClosed: boolean }> {
+    this.requireOpen();
+    const paths = createVscodeRootAuthority(this.runtimePlacement).expectedPaths();
+    const hostBootId = this.product.application.database.hostBootId;
+    let runtimeClosed = false;
+    try {
+      const outcome = await withRuntimeDataRootAdmission(this.runtimePlacement.configurationRootPath, () =>
+        withRuntimeMaintenance(paths, () => coordinate(paths, hostBootId, async () => {
+          runtimeClosed = true;
+          await this.dispose();
+          return operation();
+        })));
+      return { outcome, runtimeClosed };
+    } catch (error) {
+      return { outcome: { state: 'failed', error }, runtimeClosed };
+    }
   }
 
   public async dispose(): Promise<void> {

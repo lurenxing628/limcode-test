@@ -74,6 +74,18 @@
     "processProbe": "platform-identity-once-per-pid-and-start-identity-then-kill-0; final-decision-uncached",
     "exclusivityProof": "host-liveness-records-only; request-advisory"
   },
+  "dataRootRelocation": {
+    "entry": "settings-page-button-or-command; native-folder-picker; read-only-plan; one-modal-confirmation",
+    "preflight": "absolute-path; writable-target-and-parent; free-space-estimate-with-hard-link-saving-on-same-device; not-inside-or-above-current-root; cloud-sync-folder-warning",
+    "targetStates": "missing-empty-or-only-unrelated-files-fresh-root; limcode-data-created-at-this-path-merge-into-its-selected-data-set; copied-from-elsewhere-refused-for-now; anything-else-refused",
+    "phases": "online-fresh-target-root-and-cas-precopy-via-backup-api; exclusive-maintenance-notice-and-wait-for-busy-windows; requester-closes-own-runtime; merge-engine-migration-mode-inside-old-root-admission; configuration; selection; completion-marker; pointer-switch-last; every-window-reloads",
+    "mergeMode": "selected-source-allowed; no-merge-ledger; unfinished-work-carried-unchanged; streaming-model-request-or-running-process-refused; snapshot-integrity-and-probes-in-worker",
+    "otherDataSets": "same-id-independent-data-sets-marked-user-kept; failed-or-taken-ids-stay-in-old-directory",
+    "configuration": "registered-root-directories-only; record-stores-merged-by-id-current-wins; replaced-target-versions-to-relocation-backups; every-copied-file-sha256-verified",
+    "failure": "pointer-unchanged; relocation-created-target-entries-removed; replaced-configuration-restored; old-directory-never-modified",
+    "oldDirectory": "kept; delete-only-limcode-entries-when-current-root-completion-record-names-it-and-its-hosts-are-offline; return-switches-pointer-only",
+    "unavailableRoot": "configured-directory-missing-or-without-limcode-entries-refuses-startup-with-retry-or-return; never-creates-an-empty-root"
+  },
   "candidateRoot": {
     "isolated": true,
     "mayReadLegacyRuntime": false,
@@ -1779,7 +1791,8 @@
         ],
         "derivedFields": [
           "activeDataRootPath",
-          "defaultDataRootPath"
+          "defaultDataRootPath",
+          "previousDataRootPath"
         ],
         "indexPolicy": "not-applicable-single-record",
         "recordsPolicy": "root-control-fields-stay-in-globalState-business-settings-move-to-settings-root",

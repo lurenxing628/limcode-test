@@ -105,6 +105,7 @@ export enum BridgeMessageType {
   PlanProposalExport = 'planProposal.export',
   CheckpointDiffOpen = 'checkpoint.diff.open',
   LocalFileOpen = 'localFile.open',
+  DataRootAction = 'dataRoot.action',
   AttachmentOpen = 'attachment.open',
   AttachmentOpenResult = 'attachment.open.result',
   AttachmentReload = 'attachment.reload',
@@ -3048,6 +3049,8 @@ export interface GlobalSettingsRecord {
   proxyShellAndMcp: boolean;
   activeDataRootPath: string;
   defaultDataRootPath: string;
+  /** The directory the data was moved away from (kept until deleted); empty when there is none. */
+  previousDataRootPath: string;
 }
 export interface NetworkSettingsRecord {
   /** LLM 请求的默认 User-Agent；空字符串使用扩展默认值，渠道或模型请求头可覆盖。 */
@@ -3207,6 +3210,11 @@ export interface LocalFileOpenPayload {
   source: string;
 }
 
+/** Settings page buttons for the data directory; the panel runs the native command. */
+export interface DataRootActionPayload {
+  action: 'relocate' | 'returnToPrevious' | 'deletePrevious';
+}
+
 export interface AttachmentOpenPayload {
   attachmentId?: string;
   sourcePath?: string;
@@ -3284,6 +3292,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.PlanProposalExport, PlanProposalExportPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpen, CheckpointDiffOpenPayload>
   | BridgeEnvelope<BridgeMessageType.LocalFileOpen, LocalFileOpenPayload>
+  | BridgeEnvelope<BridgeMessageType.DataRootAction, DataRootActionPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentOpen, AttachmentOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReload, AttachmentReloadPayload>
   | BridgeEnvelope<BridgeMessageType.ClientResync, ClientResyncPayload>

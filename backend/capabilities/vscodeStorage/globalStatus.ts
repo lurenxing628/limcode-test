@@ -51,12 +51,15 @@ export async function loadCommittedGlobalStatus(context: vscode.ExtensionContext
   });
 }
 
-/** 内部迁移路径使用的无条件提交；普通设置保存必须使用 saveGlobalStatusExpected。 */
+/**
+ * 内部迁移路径使用的无条件提交；普通设置保存必须使用 saveGlobalStatusExpected。
+ * lastMigration 省略时保留原记录，传 null 时清除（旧目录已删除）。
+ */
 export async function saveGlobalStatus(
   context: vscode.ExtensionContext,
   dataRootPath: string,
   proxy: string,
-  lastMigration?: StorageRootMigrationStatus,
+  lastMigration?: StorageRootMigrationStatus | null,
   proxyShellAndMcp?: boolean
 ): Promise<LimCodeGlobalStatus> {
   const uri = globalStatusFileUri(context);
@@ -104,12 +107,16 @@ export function createGlobalSettingsRecord(
   context: vscode.ExtensionContext,
   status: LimCodeGlobalStatus = loadGlobalStatus(context)
 ): GlobalSettingsRecord {
+  const activeDataRootPath = resolveDataRootUri(context, status.dataRootPath).fsPath;
+  const previous = status.lastMigration;
   return {
     dataFilePath: status.dataRootPath,
     proxy: status.proxy,
     proxyShellAndMcp: status.proxyShellAndMcp === true,
-    activeDataRootPath: resolveDataRootUri(context, status.dataRootPath).fsPath,
-    defaultDataRootPath: context.globalStorageUri.fsPath
+    activeDataRootPath,
+    defaultDataRootPath: context.globalStorageUri.fsPath,
+    previousDataRootPath: previous && sameFsPath(previous.toPath, activeDataRootPath) && !sameFsPath(previous.fromPath, activeDataRootPath)
+      ? previous.fromPath : ''
   };
 }
 
@@ -165,7 +172,7 @@ async function commitStatus(
   previous: LimCodeGlobalStatus,
   dataRootPath: string,
   proxy: string,
-  lastMigration?: StorageRootMigrationStatus,
+  lastMigration?: StorageRootMigrationStatus | null,
   proxyShellAndMcp?: boolean
 ): Promise<LimCodeGlobalStatus> {
   const status: LimCodeGlobalStatus = {
@@ -175,7 +182,7 @@ async function commitStatus(
     proxyShellAndMcp: proxyShellAndMcp ?? (previous.proxyShellAndMcp === true),
     updatedAt: new Date().toISOString(),
     ...(lastMigration ? { lastMigration: requireMigration(lastMigration) }
-      : previous.lastMigration ? { lastMigration: { ...previous.lastMigration } } : {})
+      : lastMigration === undefined && previous.lastMigration ? { lastMigration: { ...previous.lastMigration } } : {})
   };
   await writeJson(uri, status);
   remember(context, status);

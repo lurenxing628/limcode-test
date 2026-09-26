@@ -559,6 +559,22 @@ function validateMigration(root, migration, failures) {
     || Object.entries(expectedExclusive).some(([key, value]) => exclusive[key] !== value)) {
     failures.push('多窗口独占维护必须两阶段协调：全部窗口就绪才确认、全部确认才让出，忙/拒绝/旧窗口/超时立即放弃并按操作键退避、按操作冷却，独占仍以 Host liveness 证明');
   }
+  const relocation = migration?.dataRootRelocation;
+  const expectedRelocation = {
+    entry: 'settings-page-button-or-command; native-folder-picker; read-only-plan; one-modal-confirmation',
+    preflight: 'absolute-path; writable-target-and-parent; free-space-estimate-with-hard-link-saving-on-same-device; not-inside-or-above-current-root; cloud-sync-folder-warning',
+    targetStates: 'missing-empty-or-only-unrelated-files-fresh-root; limcode-data-created-at-this-path-merge-into-its-selected-data-set; copied-from-elsewhere-refused-for-now; anything-else-refused',
+    phases: 'online-fresh-target-root-and-cas-precopy-via-backup-api; exclusive-maintenance-notice-and-wait-for-busy-windows; requester-closes-own-runtime; merge-engine-migration-mode-inside-old-root-admission; configuration; selection; completion-marker; pointer-switch-last; every-window-reloads',
+    mergeMode: 'selected-source-allowed; no-merge-ledger; unfinished-work-carried-unchanged; streaming-model-request-or-running-process-refused; snapshot-integrity-and-probes-in-worker',
+    otherDataSets: 'same-id-independent-data-sets-marked-user-kept; failed-or-taken-ids-stay-in-old-directory',
+    configuration: 'registered-root-directories-only; record-stores-merged-by-id-current-wins; replaced-target-versions-to-relocation-backups; every-copied-file-sha256-verified',
+    failure: 'pointer-unchanged; relocation-created-target-entries-removed; replaced-configuration-restored; old-directory-never-modified',
+    oldDirectory: 'kept; delete-only-limcode-entries-when-current-root-completion-record-names-it-and-its-hosts-are-offline; return-switches-pointer-only',
+    unavailableRoot: 'configured-directory-missing-or-without-limcode-entries-refuses-startup-with-retry-or-return; never-creates-an-empty-root'
+  };
+  if (!plainObject(relocation) || JSON.stringify(relocation) !== JSON.stringify(expectedRelocation)) {
+    failures.push('数据目录迁移只能复制核对后最后切换指针：在线预复制、独占阶段经合并引擎迁移模式写入全新根、其它库成为独立保留库、失败不切换并清理、旧目录保留，不可用的数据目录绝不新建空库');
+  }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
   }

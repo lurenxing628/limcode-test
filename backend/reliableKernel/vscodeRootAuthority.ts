@@ -363,6 +363,15 @@ export async function legacyWorkspaceRuntimeOwnerState(
   return state === 'dead' ? 'absent' : state === 'alive' ? 'alive' : 'unknown';
 }
 
+/**
+ * Records that this data set is kept apart by the user, so it is never merged automatically (a
+ * data set carried to another data directory as its own data set, for example).
+ */
+export async function markVscodeRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
+  if (!candidate.dataSetId || !candidate.rootInstanceId) throw new VscodeRuntimeDataSetError('只有已初始化的数据集才能记为保留。');
+  await markRuntimeDataSetKept(candidate);
+}
+
 async function markRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
   const file = keptMarkerPath(candidate);
   await assertSafeRootPath(candidate.configurationRootPath, file);
@@ -632,6 +641,11 @@ async function validateCandidateEpoch(binding: HistoricalRootBinding, pending?: 
     && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
   ) return;
   throw new VscodeRuntimeDataSetError(`运行数据集epoch身份与RootBinding不一致：${binding.paths.runtimeEpochPath}`);
+}
+
+/** Scope root of a data-set id inside a configuration root (the same id under another data directory). */
+export function resolveVscodeRuntimeDataSetScopeRoot(configurationRootPath: string, id: string): string {
+  return runtimeScopeRootForId(path.resolve(configurationRootPath), id);
 }
 
 function runtimeScopeRootForId(configurationRootPath: string, id: string): string {

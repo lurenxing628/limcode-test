@@ -744,7 +744,9 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       const input = settings as Partial<GlobalSettingsRecord>;
       const requestedDataRootPath = input.dataFilePath?.trim() ?? current.dataFilePath;
       if (requestedDataRootPath !== current.dataFilePath) {
-        throw new Error('可靠 Runtime 运行期间不能切换 data root；如需清空开发数据，请通过受控重置命令归档重置并重载窗口。');
+        // A data root is never switched by rewriting the pointer: the move copies, verifies and
+        // merges the data first (runtimeDataRootRelocation) and keeps the old directory.
+        throw new Error('数据目录不能在这里直接改写：请使用设置页的“迁移数据目录…”按钮（或命令“Limcode Test: 迁移数据目录”），它会先把数据复制到新目录并核对，再切换，旧目录保留。');
       }
       const committedStatus = await saveGlobalStatusExpected(
         context,

@@ -91,7 +91,32 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     await vscode.window.showTextDocument(document, { preview: true });
   });
 
-  context.subscriptions.push(openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand, runtimeDataSetsCommand);
+  const dataRootCommands = [
+    [EXTENSION_COMMAND_IDS.relocateDataRoot, '迁移数据目录失败', async () => {
+      const { relocateDataRoot } = await import('./dataRootRelocation');
+      await relocateDataRoot(context, startup);
+    }],
+    [EXTENSION_COMMAND_IDS.returnToPreviousDataRoot, '回到旧数据目录失败', async () => {
+      const { returnToPreviousDataRoot } = await import('./dataRootRelocation');
+      await returnToPreviousDataRoot(context, startup);
+    }],
+    [EXTENSION_COMMAND_IDS.deletePreviousDataRoot, '删除旧数据目录失败', async () => {
+      const { deletePreviousDataRoot } = await import('./dataRootRelocation');
+      await deletePreviousDataRoot(context);
+    }]
+  ] as const;
+  const dataRootCommandDisposables = dataRootCommands.map(([commandId, failure, run]) => vscode.commands.registerCommand(commandId, async () => {
+    try {
+      await run();
+    } catch (error) {
+      await vscode.window.showErrorMessage(`${failure}：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }));
+
+  context.subscriptions.push(
+    openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand, runtimeDataSetsCommand,
+    ...dataRootCommandDisposables
+  );
 }
 
 async function readyApplication(startup: ApplicationStartup): Promise<ApplicationFacade | undefined> {

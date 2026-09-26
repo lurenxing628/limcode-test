@@ -49,6 +49,21 @@
         "command": "limcode-test.resetDevelopmentData",
         "title": "Limcode Test: Archive and Reset Development Data",
         "category": "Limcode Test"
+      },
+      {
+        "command": "limcode-test.relocateDataRoot",
+        "title": "Limcode Test: 迁移数据目录",
+        "category": "Limcode Test"
+      },
+      {
+        "command": "limcode-test.returnToPreviousDataRoot",
+        "title": "Limcode Test: 回到迁移前的旧数据目录",
+        "category": "Limcode Test"
+      },
+      {
+        "command": "limcode-test.deletePreviousDataRoot",
+        "title": "Limcode Test: 删除迁移前的旧数据目录",
+        "category": "Limcode Test"
       }
     ],
     "menus": {

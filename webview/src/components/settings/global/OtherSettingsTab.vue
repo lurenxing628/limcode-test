@@ -63,10 +63,23 @@ function saveOtherSettings(): void {
       <span class="global-settings-field-hint">默认关闭，仅 LLM 提供商连接使用代理；勾选后新启动的 shell 子进程继承代理环境变量，MCP 连接保存后自动重建。</span>
     </div>
 
-    <label class="global-settings-field">
-      <span>数据目录路径（留空使用 VS Code 默认目录；保存后只迁移并删除旧目录中已注册的插件数据目录）</span>
-      <input v-model="settings.common.dataFilePath" type="text" placeholder="例如：D:/limcode/data" />
-    </label>
+    <div class="global-settings-field" aria-label="数据目录">
+      <span>数据目录</span>
+      <p class="global-settings-path">
+        当前数据目录：<code>{{ settings.common.activeDataRootPath || '正在获取当前数据目录…' }}</code>
+      </p>
+      <p v-if="settings.common.previousDataRootPath" class="global-settings-path">
+        迁移前的旧目录（原样保留）：<code>{{ settings.common.previousDataRootPath }}</code>
+      </p>
+      <div class="global-settings-actions">
+        <button type="button" class="secondary" @click="settings.requestDataRootAction('relocate')">迁移数据目录…</button>
+        <template v-if="settings.common.previousDataRootPath">
+          <button type="button" class="secondary" @click="settings.requestDataRootAction('returnToPrevious')">回到旧目录…</button>
+          <button type="button" class="secondary" @click="settings.requestDataRootAction('deletePrevious')">删除旧目录…</button>
+        </template>
+      </div>
+      <span class="global-settings-field-hint">迁移时先检查新目录（空间、权限、是否云同步目录），确认后把当前历史库、其它历史库和设置复制到新目录并逐项核对，旧目录原样保留；所有 LimCode 窗口会重载一次，有任务的窗口会等任务结束，未发送的输入会保留。删除旧目录前会列出占用并再次确认。</span>
+    </div>
 
     <label class="global-settings-field">
       <span>单条消息附件总大小上限（MB，默认 20；不限制附件数量）</span>
@@ -80,9 +93,6 @@ function saveOtherSettings(): void {
     </div>
 
     <div class="global-settings-path-list" aria-label="全局设置路径信息">
-      <p class="global-settings-path">
-        当前数据目录：<code>{{ settings.common.activeDataRootPath || '正在获取当前数据目录…' }}</code>
-      </p>
       <p class="global-settings-path">
         默认数据目录：<code>{{ settings.common.defaultDataRootPath || '正在获取默认数据目录…' }}</code>
       </p>

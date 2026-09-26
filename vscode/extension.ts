@@ -122,6 +122,13 @@ async function startApplication(
     if (activeStartup !== startup) return;
     const message = error instanceof Error ? error.message : String(error);
     console.error(`${EXTENSION_BRAND} reliable Runtime failed to open.`, error);
+    if ((error as { code?: unknown } | null)?.code === 'data-root-unavailable') {
+      // Never an empty history in place of an unmounted drive: offer retry or the old directory.
+      void import('./commands/dataRootRelocation')
+        .then(({ offerDataRootRecovery }) => offerDataRootRecovery(context, startup, `${EXTENSION_BRAND} ${message}`))
+        .catch((offerError) => console.error(`${EXTENSION_BRAND} data root recovery prompt failed.`, offerError));
+      return;
+    }
     void vscode.window.showErrorMessage(`${EXTENSION_BRAND} 运行时无法启动：${message}`);
   }
 }

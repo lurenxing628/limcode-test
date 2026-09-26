@@ -178,11 +178,16 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     { label: '合并到当前库', description: '把其他历史库的对话并入当前库；在后台进行，原库保留', action: 'merge' },
     { label: '切换当前历史库', description: '保留完整原库，切换后重载窗口', action: 'select' },
     { label: '删除其他历史库', description: '仅删除明确选定的非当前完整历史库', action: 'delete' },
+    { label: '迁移数据目录', description: '把全部历史和设置复制到新目录并核对后切换；旧目录保留', action: 'relocate' },
     { label: '归档并重置当前历史库', description: '保留备份并创建空库；归档本身不释放磁盘', action: 'reset' }
   ], { placeHolder: '历史与存储管理' });
   if (!action || !canStartRuntimeDataSetUpgrade(context)) return;
   if (action.action === 'reset') {
     await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.resetDevelopmentData);
+    return;
+  }
+  if (action.action === 'relocate') {
+    await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.relocateDataRoot);
     return;
   }
   const { candidates, problems } = await inspectVscodeRuntimeDataSets(pathsFor(context));

@@ -10,6 +10,9 @@ export const EXTENSION_COMMAND_IDS = {
   inspectReliability: 'limcode-test.inspectReliability',
   manageRuntimeDataSets: 'limcode-test.manageRuntimeDataSets',
   resetDevelopmentData: 'limcode-test.resetDevelopmentData',
+  relocateDataRoot: 'limcode-test.relocateDataRoot',
+  returnToPreviousDataRoot: 'limcode-test.returnToPreviousDataRoot',
+  deletePreviousDataRoot: 'limcode-test.deletePreviousDataRoot',
   applyLiveDiffPreview: 'limcode-test.applyLiveDiffPreview'
 } as const;
 
