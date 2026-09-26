@@ -174,6 +174,67 @@ test('用户折叠后激活后代会话仍保持折叠', async (context) => {
   assert.equal(result.changed, false);
 });
 
+test('同一页内后来才出现的祖先会被重新展开，用户显式折叠的祖先仍保持折叠', async (context) => {
+  const server = await createWebviewTestServer();
+  context.after(async () => server.close());
+
+  const { buildConversationHistoryForest, flattenConversationHistoryForest } =
+    await server.ssrLoadModule('@shared/conversationHistoryTree');
+  const collapseIntent = await server.ssrLoadModule('/src/sidebar/collapseIntent.ts');
+  const nodesOf = (entries, links) => flattenConversationHistoryForest(buildConversationHistoryForest(entries, links));
+  const parentLink = originLink('link-parent', 'conv-child', 'conv-parent', 950);
+  const grandLink = originLink('link-grand', 'conv-parent', 'conv-grand', 900);
+
+  // First refresh: only the parent chain P→C is on the page.
+  const first = collapseIntent.expandActiveConversationAncestors({
+    nodes: nodesOf([entry('conv-parent', 1000), entry('conv-child', 1001)], [parentLink]),
+    activeConversationId: 'conv-child',
+    expandedIds: new Set(),
+    userCollapsedIds: new Set()
+  });
+  assert.deepEqual([...first.expandedIds], ['conv-parent']);
+  assert.ok(first.autoExpandedKey);
+
+  // Same chain again: nothing to redo.
+  const repeat = collapseIntent.expandActiveConversationAncestors({
+    nodes: nodesOf([entry('conv-parent', 1000), entry('conv-child', 1001)], [parentLink]),
+    activeConversationId: 'conv-child',
+    expandedIds: first.expandedIds,
+    userCollapsedIds: new Set(),
+    alreadyAutoExpandedKey: first.autoExpandedKey
+  });
+  assert.equal(repeat.changed, false);
+
+  // The grandparent G joins the same page later; C must not stay hidden under a collapsed G.
+  const grownNodes = nodesOf(
+    [entry('conv-grand', 1002), entry('conv-parent', 1000), entry('conv-child', 1001)],
+    [parentLink, grandLink]
+  );
+  const grown = collapseIntent.expandActiveConversationAncestors({
+    nodes: grownNodes,
+    activeConversationId: 'conv-child',
+    expandedIds: first.expandedIds,
+    userCollapsedIds: new Set(),
+    alreadyAutoExpandedKey: first.autoExpandedKey
+  });
+  assert.equal(grown.changed, true);
+  assert.deepEqual(new Set(grown.expandedIds), new Set(['conv-parent', 'conv-grand']));
+  const visible = collapseIntent.flattenVisibleHistoryNodes({ forest: buildConversationHistoryForest(
+    [entry('conv-grand', 1002), entry('conv-parent', 1000), entry('conv-child', 1001)],
+    [parentLink, grandLink]
+  ), expandedIds: grown.expandedIds, maxVisualDepth: 8 });
+  assert.ok(visible.some((node) => node.entry.id === 'conv-child'), '激活会话必须可见');
+
+  const collapsed = collapseIntent.expandActiveConversationAncestors({
+    nodes: grownNodes,
+    activeConversationId: 'conv-child',
+    expandedIds: first.expandedIds,
+    userCollapsedIds: new Set(['conv-grand']),
+    alreadyAutoExpandedKey: first.autoExpandedKey
+  });
+  assert.equal(collapsed.expandedIds.has('conv-grand'), false, '用户显式折叠的祖先不被重新展开');
+});
+
 test('折叠标记与收藏状态互相保留，并容忍缺失新字段', async (context) => {
   const server = await createWebviewTestServer();
   context.after(async () => server.close());

@@ -220,7 +220,7 @@ const abortConfirmActions: ConfirmPanelAction[] = [
 
 let disposeMessages: (() => void) | undefined;
 let currentHistoryPageIdentity = '';
-let autoExpandedActiveConversationId: string | undefined;
+let autoExpandedActiveConversationKey: string | undefined;
 let activeAgentConversationIds = new Set<string>();
 let operationNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -256,7 +256,7 @@ onMounted(() => {
     const nextPageIdentity = historyPageIdentity(message.history);
     if (nextPageIdentity !== currentHistoryPageIdentity) {
       currentHistoryPageIdentity = nextPageIdentity;
-      autoExpandedActiveConversationId = undefined;
+      autoExpandedActiveConversationKey = undefined;
     }
     entries.value = Array.isArray(message.history?.entries) ? message.history.entries : [];
     for (const entry of entries.value) {
@@ -632,7 +632,7 @@ function ensureActiveScopeVisible(): void {
 function ensureActiveConversationAncestorsExpanded(): void {
   const activeConversationId = openConversations.value.find((item) => item.active)?.conversationId;
   if (!activeConversationId) {
-    autoExpandedActiveConversationId = undefined;
+    autoExpandedActiveConversationKey = undefined;
     return;
   }
 
@@ -641,11 +641,11 @@ function ensureActiveConversationAncestorsExpanded(): void {
     activeConversationId,
     expandedIds: expandedConversationIds.value,
     userCollapsedIds: userCollapsedConversationIds.value,
-    alreadyAutoExpandedId: autoExpandedActiveConversationId
+    alreadyAutoExpandedKey: autoExpandedActiveConversationKey
   });
 
   if (result.changed) {
-    autoExpandedActiveConversationId = result.autoExpandedId;
+    autoExpandedActiveConversationKey = result.autoExpandedKey;
     expandedConversationIds.value = result.expandedIds;
     persistExpandedConversationIds();
   }

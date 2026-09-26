@@ -84,39 +84,45 @@ export function expandNewlyActiveAgentAncestors(options: {
 
 /**
  * 为当前激活会话展开祖先，遇到用户显式折叠的祖先即停止向上。
+ *
+ * 以"激活会话 + 当前祖先链"作为已展开标记：同一条链只自动展开一次，链上出现新祖先（例如祖先
+ * 后来才进入本页）时重新展开，用户显式折叠过的祖先仍保持折叠。
  */
 export function expandActiveConversationAncestors(options: {
   nodes: readonly ConversationHistoryTreeNode[];
   activeConversationId: string | undefined;
   expandedIds: ReadonlySet<string>;
   userCollapsedIds: ReadonlySet<string>;
-  alreadyAutoExpandedId: string | undefined;
-}): ExpandResult & { autoExpandedId: string | undefined } {
-  const { nodes, activeConversationId, expandedIds, userCollapsedIds, alreadyAutoExpandedId } = options;
-  if (!activeConversationId || activeConversationId === alreadyAutoExpandedId) {
-    return { expandedIds: new Set(expandedIds), changed: false, autoExpandedId: alreadyAutoExpandedId };
-  }
+  alreadyAutoExpandedKey?: string;
+}): ExpandResult & { autoExpandedKey: string | undefined } {
+  const { nodes, activeConversationId, expandedIds, userCollapsedIds, alreadyAutoExpandedKey } = options;
+  const unchanged = { expandedIds: new Set(expandedIds), changed: false, autoExpandedKey: alreadyAutoExpandedKey };
+  if (!activeConversationId) return unchanged;
 
   const nodeById = new Map(nodes.map((node) => [node.entry.id, node]));
-  let node = nodeById.get(activeConversationId);
-  if (!node) {
-    return { expandedIds: new Set(expandedIds), changed: false, autoExpandedId: alreadyAutoExpandedId };
-  }
-
-  const nextExpanded = new Set(expandedIds);
-  let changed = false;
-  while (node.parentConversationId) {
-    // 用户显式折叠过的祖先保持折叠
-    if (userCollapsedIds.has(node.parentConversationId)) break;
-    if (!nextExpanded.has(node.parentConversationId)) {
-      nextExpanded.add(node.parentConversationId);
-      changed = true;
-    }
+  const active = nodeById.get(activeConversationId);
+  if (!active) return unchanged;
+  const ancestorIds: string[] = [];
+  for (let node = active; node.parentConversationId; ) {
+    ancestorIds.push(node.parentConversationId);
     const parent = nodeById.get(node.parentConversationId);
     if (!parent) break;
     node = parent;
   }
-  return { expandedIds: nextExpanded, changed, autoExpandedId: activeConversationId };
+  const autoExpandedKey = [activeConversationId, ...ancestorIds].join('\u0000');
+  if (autoExpandedKey === alreadyAutoExpandedKey) return unchanged;
+
+  const nextExpanded = new Set(expandedIds);
+  let changed = false;
+  for (const ancestorId of ancestorIds) {
+    // 用户显式折叠过的祖先保持折叠
+    if (userCollapsedIds.has(ancestorId)) break;
+    if (!nextExpanded.has(ancestorId)) {
+      nextExpanded.add(ancestorId);
+      changed = true;
+    }
+  }
+  return { expandedIds: nextExpanded, changed, autoExpandedKey };
 }
 
 /**
