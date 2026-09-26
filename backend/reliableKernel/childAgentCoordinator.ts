@@ -717,34 +717,59 @@ export class ReliableChildAgentCoordinator {
   /**
    * A user's stop of a child Turn that no Host here runs. A Host serving the child Conversation,
    * with no work left by an exited window, takes the Turn over through the recovery pass, which
-   * drives the stop. Otherwise the stop is settled control-only, in any window: an orphan Turn is
-   * closed; work a window left running when it exited unexpectedly is closed as outcome_unknown,
-   * but only once every Host that ran it is proven dead; the recorded stop becomes the terminal
-   * state; and the lineage converges. Nothing is dispatched or retried. Returns true when a Host
-   * that is alive (or cannot be verified) still runs the Turn, which then handles the stop itself.
+   * drives the stop. Otherwise the stop is settled control-only (settleChildWithoutExecution), and
+   * because the user asked, work a window left running when it exited unexpectedly is closed as
+   * outcome_unknown once every Host that ran it is proven dead. Returns true when a Host that is
+   * alive (or cannot be verified) still runs the Turn, which then handles the stop itself.
    */
   private async settleStoppedChildTurn(childExecutionId: string, turnId: string): Promise<boolean> {
     if (this.disposing || this.handoff || this.activeTurns.has(turnId)) return false;
     const child = await this.get('ChildExecution', childExecutionId);
     if (!child) return false;
     const conversationId = requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
-    const hostBootId = this.dependencies.database.hostBootId;
-    const inspect = (): Promise<DeadHostTurnEffects> => this.dependencies.deadHostEffects
-      ? this.dependencies.deadHostEffects.deadHostEffectsForTurn(turnId, hostBootId)
-      : Promise.resolve({ state: 'none', receiptEffectIntentIds: [] });
-    const owners = this.dependencies.database.conversationOwners;
     try {
-      const preview = await inspect();
+      const preview = await this.inspectChildTurnEffects(turnId);
       if (preview.state === 'live') return true;
       if (preview.state === 'unsupported' || (
-        preview.state === 'none' && await owners.executionEligibility(conversationId) === 'eligible'
+        preview.state === 'none'
+        && await this.dependencies.database.conversationOwners.executionEligibility(conversationId) === 'eligible'
       )) {
         this.triggerRecoveryPass();
         return false;
       }
-      return await owners.run(conversationId, async () => {
+      return await this.settleChildWithoutExecution(childExecutionId, turnId, conversationId, true) === 'live';
+    } catch (error) {
+      this.reportError(error, 'user-stop-child', turnId);
+      return false;
+    }
+  }
+
+  /**
+   * Control-only settlement of a child Turn for a Host that must not execute its Conversation, the
+   * counterpart of the Conversation runner's settleWithoutExecution. An orphan Turn is finalized; a
+   * recorded stop becomes the terminal state through the Agent loop's termination path (durable
+   * waits cancelled, undispatched effects cancelled, no Provider call, no tool); then the lineage
+   * converges as after a drive. Work dispatched without a Receipt is left to the Host that ran it,
+   * except that a user's stop (`userStop`) closes it as outcome_unknown once every such Host is
+   * proven dead. The claimed lease is handed back unless the Turn became terminal.
+   */
+  private async settleChildWithoutExecution(
+    childExecutionId: string,
+    turnId: string,
+    conversationId: string,
+    userStop: boolean
+  ): Promise<'settled' | 'live' | 'none'> {
+    const hostBootId = this.dependencies.database.hostBootId;
+    // Read-only preview first, so a Turn with nothing to settle never touches the owner record.
+    const preview = await this.dependencies.turns.recoveryFacts(turnId);
+    if (preview.turnStatus !== 'active') return 'none';
+    if (preview.judgment !== 'finalize' && (preview.judgment !== 'resume' || !await this.hasPendingTermination(turnId))) {
+      return 'none';
+    }
+    try {
+      return await this.dependencies.database.conversationOwners.run(conversationId, async () => {
         const facts = await this.dependencies.turns.recoveryFacts(turnId);
-        if (facts.turnStatus !== 'active') return false;
+        if (facts.turnStatus !== 'active') return 'none';
         if (facts.judgment === 'finalize') {
           await this.dependencies.turns.finalizeRecovery({
             source: { kind: 'recovery', key: `child-driver-finalize:${turnId}` },
@@ -753,51 +778,85 @@ export class ReliableChildAgentCoordinator {
             reason: 'Child scheduler recovered an active Turn without execution authority.'
           });
           await this.finishStoppedChildTurn(childExecutionId, turnId);
-          return false;
+          return 'settled';
         }
-        if (facts.judgment !== 'resume' || !await this.hasPendingTermination(turnId)) return false;
-        // A tool still executing without proof that its window is gone stays with the Host serving it.
-        if (preview.state !== 'dead' && (await this.list('ToolCall', { turn_id: turnId, status: 'executing' }, 1)).length > 0) {
-          return false;
-        }
+        if (facts.judgment !== 'resume' || !await this.hasPendingTermination(turnId)) return 'none';
+        const effects = await this.inspectChildTurnEffects(turnId);
+        if (effects.state === 'live') return 'live';
+        if (effects.state === 'unsupported' || (effects.state === 'dead' && !userStop)) return 'none';
         const claimed = await this.dependencies.turns.claimRecoveryExecution({
           turnId,
           leaseOwnerId: this.childLeaseOwnerId,
           hostBootId,
           leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
         });
-        if (!claimed) return true;
+        if (!claimed) return 'live';
         const fence = await this.dependencies.turns.executionLeaseFence({
           turnId,
           leaseOwnerId: this.childLeaseOwnerId,
           hostBootId
         });
-        if (!fence) return false;
-        const outcome = await runWithoutExecutionLeaseFence(() => runWithExecutionLeaseFence(fence, async () => {
-          // Re-read under the lease: another stop may have closed some of the work meanwhile.
-          const current = await inspect();
-          if (current.state === 'live') return 'live' as const;
-          if (current.state === 'unsupported') return 'open' as const;
-          if (current.state === 'dead') {
-            await this.dependencies.deadHostEffects!.abandonDeadHostEffects({
-              sourceKey: `user-stop-dead-host:${turnId}`,
-              effectIntentIds: current.effectIntentIds,
-              reason: DEAD_HOST_STOP_REASON
-            });
+        if (!fence) return 'none';
+        let unsettled: 'live' | 'none' = 'none';
+        let terminated = false;
+        try {
+          terminated = await runWithoutExecutionLeaseFence(() => runWithExecutionLeaseFence(fence, async () => {
+            // Re-read under the lease: another stop may have closed some of the work meanwhile.
+            const current = await this.inspectChildTurnEffects(turnId);
+            if (current.state === 'live') unsettled = 'live';
+            if (current.state === 'live' || current.state === 'unsupported') return false;
+            if (current.state === 'dead') {
+              if (!userStop) return false;
+              await this.dependencies.deadHostEffects!.abandonDeadHostEffects({
+                sourceKey: `user-stop-dead-host:${turnId}`,
+                effectIntentIds: current.effectIntentIds,
+                reason: DEAD_HOST_STOP_REASON
+              });
+            } else {
+              await this.dependencies.deadHostEffects?.reconcileArrivedReceipts(current.receiptEffectIntentIds);
+            }
+            return this.dependencies.agentLoop.terminateRequested(turnId, userStop
+              ? 'user-stop-after-window-exit'
+              : 'child-control-settlement');
+          }));
+        } finally {
+          // Anything short of a terminal Turn, a failure included, hands the lease back in this hold.
+          if (!terminated) {
+            await this.dependencies.turns.releaseExecutionLease(fence)
+              .catch((error: unknown) => this.reportError(error, 'child-control-lease-release', turnId));
           }
-          return await this.dependencies.agentLoop.terminateRequested(turnId, 'user-stop-after-window-exit')
-            ? 'terminated' as const
-            : 'open' as const;
-        }));
-        if (outcome === 'terminated') await this.finishStoppedChildTurn(childExecutionId, turnId);
-        return outcome === 'live';
+        }
+        if (!terminated) return unsettled;
+        await this.finishStoppedChildTurn(childExecutionId, turnId);
+        return 'settled';
       });
     } catch (error) {
       // A live owner of the child Conversation observes the durable stop and executes it.
-      if (isConversationRuntimeOwnerBusyError(error)) return true;
-      this.reportError(error, 'user-stop-child', turnId);
+      if (isConversationRuntimeOwnerBusyError(error)) return 'live';
+      throw error;
+    }
+  }
+
+  private async settleChildInIneligibleHost(
+    childExecutionId: string,
+    turnId: string,
+    conversationId: string
+  ): Promise<boolean> {
+    try {
+      if (await this.dependencies.database.conversationOwners.executionEligibility(conversationId) === 'eligible') {
+        return false;
+      }
+      return await this.settleChildWithoutExecution(childExecutionId, turnId, conversationId, false) === 'settled';
+    } catch (error) {
+      this.reportRecoveryFailureOnce(error, 'recovery-child-control-settlement', turnId);
       return false;
     }
+  }
+
+  private inspectChildTurnEffects(turnId: string): Promise<DeadHostTurnEffects> {
+    return this.dependencies.deadHostEffects
+      ? this.dependencies.deadHostEffects.deadHostEffectsForTurn(turnId, this.dependencies.database.hostBootId)
+      : Promise.resolve({ state: 'none', receiptEffectIntentIds: [] });
   }
 
   /** The same lineage convergence a child drive performs after its Turn becomes terminal. */
@@ -1156,6 +1215,16 @@ export class ReliableChildAgentCoordinator {
         : await gate.run(activeChildConversationId, () =>
             this.recoverActiveChildTurn(childExecutionId, turnId, child));
       if (!recovered.ran) {
+        // A Host that does not serve the child Conversation still settles control-only facts (an
+        // orphan Turn, a recorded stop), so a child stays stoppable without any serving window.
+        if (activeChildConversationId !== undefined && await this.settleChildInIneligibleHost(
+          childExecutionId,
+          turnId,
+          activeChildConversationId
+        )) {
+          report.terminalTurnsReconciled.push(turnId);
+          continue;
+        }
         // Another live owner drives this child; keep the level-triggered takeover edge alive.
         report.deferredTurnIds.push(turnId);
         continue;
@@ -2156,7 +2225,6 @@ export class ReliableChildAgentCoordinator {
     // drive and releases-if-idle afterwards, so ownership follows real work across Hosts.
     return owners.run(conversationId, () => this.driveChildOwned(childExecutionId, turnId));
   }
-
 
   private async driveChildOwned(childExecutionId: string, turnId: string): Promise<ReliableChildDriveResult> {
     const fence = await this.readChildExecutionFence(turnId);
