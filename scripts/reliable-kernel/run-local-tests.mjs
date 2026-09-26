@@ -174,6 +174,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
   'tests/reliable-kernel/runtime-datasets.test.mjs',
   'tests/reliable-kernel/runtime-dataset-history-storage.test.mjs',
+  'tests/reliable-kernel/runtime-dataset-merge.test.mjs',
   'tests/reliable-kernel/work-environment-selection.test.cjs',
   'tests/reliable-kernel/active-turn-work-environment-projection.test.mjs',
   'tests/reliable-kernel/runtime-dataset-commands.test.cjs',
