@@ -2087,13 +2087,20 @@ export class ReliableConversationRunner {
     // serving the Conversation.
     const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
     if (claim !== 'owned') {
+      // Standing down answers every wake so far: the queued Intent stays durable, and a later wake
+      // (terminal commit, rescan, recovery) re-checks. Rescheduling here would loop without ever
+      // yielding when the claim is answered from memory (an ineligible or failing probe).
+      slot.completedGeneration = slot.requestedGeneration;
       if (claim !== 'busy') await this.conversationOwners.releaseIfIdle(slot.conversationId);
       return;
     }
     try {
       await this.conversationOwners.run(slot.conversationId, () => this.runAdmissionSlot(slot));
     } catch (error) {
-      if (isConversationRuntimeOwnerBusyError(error)) return;
+      if (isConversationRuntimeOwnerBusyError(error)) {
+        slot.completedGeneration = slot.requestedGeneration;
+        return;
+      }
       throw error;
     }
   }
