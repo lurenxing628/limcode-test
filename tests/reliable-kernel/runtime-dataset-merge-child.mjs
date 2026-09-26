@@ -1,5 +1,8 @@
 // Child process for runtime-dataset-merge.test.mjs: a second window on the same selected data set.
 //   kill <root> <point> [candidateId]   merge online and SIGKILL itself at a durable boundary
+//   merge <root>                        merge without the online size limit and print the report
+//                                       (run with a small --stack-size to prove no row-sized
+//                                       argument list is built)
 //   writer <root> <stopFile> <resultFile> <mergedConversationId>
 //                                       write conversations until stopFile exists (resultFile.ready
 //                                       after the first commit), then report what it saw and its
@@ -28,6 +31,17 @@ if (mode === 'kill') {
   });
   process.stderr.write(`not killed: ${JSON.stringify(report)}\n`);
   process.exit(3);
+}
+if (mode === 'merge') {
+  const report = await mergeHistoricalDataSetsOnline({ globalStoragePath: root }, { configurationRootPath: root, database }, {
+    limits: { maxRows: Infinity, maxBytes: Infinity }
+  });
+  await database.close();
+  process.stdout.write(JSON.stringify({
+    merged: report.merged.map((item) => item.insertedRows),
+    issues: [...report.deferred, ...report.blocked, ...report.failures].map((item) => `${item.code}: ${item.message}`)
+  }));
+  process.exit(0);
 }
 if (mode === 'writer') {
   const [stopFile, resultFile, mergedConversationId] = rest;

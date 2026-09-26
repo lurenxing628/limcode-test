@@ -21,7 +21,7 @@ const { stablePhaseDId } = kernelFile('effectControlPlane.js');
 const { createConversationRuntimeWorkProbe } = kernelFile('conversationRuntimePendingWork.js');
 const {
   MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS,
-  RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
+  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
@@ -155,6 +155,58 @@ test('复审 merge2 #4：接近在线上限的来源合并时，另一个窗口�
   assert.ok(result.maxMs < 2_000, `对方最长写入等待 ${result.maxMs} ms（合并事务 ${transactionMs} ms）`);
 });
 
+test('复审 reloc-perf #13：规划不再按来源行数构造实参列表（小栈子进程合并上万行来源），内部异常不记为来源失败', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_many', project: SHARED_PROJECT }]);
+  // With --stack-size=100 an argument list of ~12,000 values overflows (Node 24); the source has
+  // more rows, still below the single-transaction limit.
+  const rows = Math.min(15_000, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS - 100);
+  rawInsertConversations(fixture.alpha, 'many', rows);
+  const child = await runChild(['merge', fixture.root], ['--stack-size=100']);
+  assert.equal(child.code, 0, child.stderr);
+  const report = JSON.parse(child.stdout);
+  assert.deepEqual(report.issues, []);
+  assert.ok(report.merged[0] > rows);
+});
+
+test('复审 reloc-perf #14：超过单事务硬上限的来源不协调、不备份、不收尾，记为“太大”而非失败，上限不变就不再重试', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_huge', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_huge', kind: 'bare' }]);
+  rawInsertConversations(fixture.alpha, 'huge', RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
+  const database = await openTarget(t, fixture.current);
+  const sourceBefore = await treeSnapshot(fixture.alpha.scopeRoot);
+  const targetBefore = databaseDigest(fixture.current);
+  const calls = [];
+  const coordinateOversized = async (input, run) => { calls.push(input); await input.withLocks(run); return { state: 'completed' }; };
+  const first = await merge(fixture, database, { coordinateOversized });
+  assert.deepEqual([first.merged, first.deferred, first.failures], [[], [], []], '不是失败，也不是稍后重试');
+  assert.equal(first.blocked[0]?.code, 'runtime-data-set-merge-too-large-for-one-transaction');
+  assert.match(first.blocked[0].message, new RegExp(`约有 \\d+ 条记录，超过当前版本一次合并能安全处理的上限（${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 条）`));
+  assert.match(first.blocked[0].message, /切换到这个库查看/);
+  assert.deepEqual(calls, [], '不请求其它窗口让出');
+  assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), sourceBefore, '没有收尾、没有来源备份');
+  assert.equal(databaseDigest(fixture.current), targetBefore);
+  await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' });
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.deepEqual([record.state, record.maxRows], ['too-large', RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS]);
+  assert.ok(record.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
+  const state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
+  assert.deepEqual([state?.state, state?.rows], ['too-large', record.rows]);
+
+  const again = await merge(fixture, database, { coordinateOversized });
+  assert.deepEqual([again.pendingSources, again.blocked[0]?.newly], [0, false], '上限不变就不再自动重试');
+  const explicit = await merge(fixture, database, { coordinateOversized, candidateIds: [fixture.alpha.id], requested: true });
+  assert.deepEqual([explicit.blocked[0]?.code, explicit.blocked[0]?.requested], ['runtime-data-set-merge-too-large-for-one-transaction', true]);
+  // A version with another limit judges it again.
+  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  await fs.writeFile(file, JSON.stringify({ ...record, maxRows: record.maxRows - 1 }));
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id), undefined);
+  const judgedAgain = await merge(fixture, database, { coordinateOversized });
+  assert.deepEqual([judgedAgain.pendingSources, judgedAgain.blocked[0]?.newly], [1, true]);
+  assert.deepEqual(calls, []);
+});
+
 test('未完成工作按中止收尾后合并：先备份来源，合并进来的对话在任何窗口都不会被启动恢复自动执行', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [
@@ -243,6 +295,92 @@ test('无现成终态转换的未完成工作拒绝合并：写明原因与出�
   const retried = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
   const alpha = retried.blocked.find((item) => item.candidateId === fixture.alpha.id);
   assert.deepEqual([alpha?.newly, alpha?.requested], [true, true], '用户点击的那一次调用：结果总是提示');
+});
+
+test('复审 merge2 #5：待收尾的对话若还有内核判忙而命名探针没覆盖的状态，收尾之前就被拒绝，来源原样不动、提示如实', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_mixed', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_mixed', kind: 'bare' }]);
+  // Same Conversation: an exited process without a ProcessReceipt. The kernel probe keeps the
+  // Conversation busy for it; no named refusal probe counts it (constructed state).
+  rawSource(fixture.alpha, (source) => insertUnreceiptedProcess(source, 'conversation_alpha_mixed'));
+  const before = await treeSnapshot(fixture.alpha.scopeRoot);
+  const report = await merge(fixture, await openTarget(t, fixture.current));
+  assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-unfinished-work');
+  assert.match(report.blocked[0].message, /其它未结束的对话工作×1/);
+  assert.match(report.blocked[0].message, /这个库的对话内容没有改动/);
+  assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), before, '没有先收尾再拒绝');
+});
+
+test('内核探针终审：没有可收尾工作、只有内核判忙的对话也整份拒绝（去掉终审则会被合并）', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_process', project: SHARED_PROJECT }]);
+  rawSource(fixture.alpha, (source) => insertUnreceiptedProcess(source, 'conversation_alpha_process'));
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database);
+  assert.deepEqual(report.merged, []);
+  assert.match(report.blocked[0]?.message ?? '', /其它未结束的对话工作×1/);
+});
+
+for (const [name, spec, label] of [
+  ['(b) 子 Agent 任务 Turn 已完成、有最终输出栅栏、答案未提交', { childStatus: 'idle', bridgeStatus: 'open', terminal: 'completed', fence: true }, '已完成但答案尚未提交的子 Agent 任务×1'],
+  ['(c) 子 Agent 被中断、取消 Turn 仍欠父任务部分答案', { childStatus: 'interrupted', bridgeStatus: 'interrupted', terminal: 'interrupted', terminationRequest: true }, '被中断、仍需生成部分答案的子 Agent×1']
+]) {
+  test(`拒绝探针 ${name}：整份拒绝，来源不动（去掉该探针则会被合并）`, async (t) => {
+    const fixture = await createFixture(t, { withBeta: false });
+    await seed(fixture.alpha, [
+      { id: 'conversation_alpha_parent', project: SHARED_PROJECT },
+      { id: 'conversation_alpha_child', project: SHARED_PROJECT }
+    ]);
+    rawSource(fixture.alpha, (source, contentId) => insertChildExecution(source, contentId, spec));
+    const before = await treeSnapshot(fixture.alpha.scopeRoot);
+    const report = await merge(fixture, await openTarget(t, fixture.current));
+    assert.deepEqual(report.merged, []);
+    assert.ok((report.blocked[0]?.message ?? '').includes(label), report.blocked[0]?.message);
+    assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), before);
+  });
+}
+
+test('复审 merge2 #7：模型流检查点和栅栏只能随父 ModelRequest 在同一事务里以历史复制写入；ModelRequest 的 Operation、Attempt 历史复制只收终态', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_history_copy', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  const store = new kernel.ContentAddressedStore(fixture.current.authority, fixture.current.binding);
+  const recipe = await store.ingest(database, '{}', 'application/json');
+  const body = await store.ingest(database, JSON.stringify({ role: 'model', parts: [{ text: '检查点' }] }), MESSAGE_TYPE);
+  const turnId = 'conversation_history_copy_turn';
+  const copy = (id, seq, { operation = 'cancelled', attempt = 'cancelled' } = {}) => [
+    repo('ModelRequest').insertHistoricalCopy({
+      id, turn_id: turnId, request_seq: seq, status: 'terminal', terminal_state: 'turn-interrupt-requested',
+      provider_id: 'openai-responses', model_id: 'gpt-test', context_window_tokens: 130_000n, compression_threshold_tokens: 100_000n,
+      estimated_context_tokens: 1_000n, authority_snapshot_id: 'authority-merge', settings_snapshot_object_id: null, recipe_object_id: recipe.id,
+      usage_json: null, stream_stats_json: { attemptSeq: '1', socketGeneration: '0', retryReason: null }, created_at: NOW, updated_at: NOW
+    }),
+    repo('Operation').insertHistoricalCopy({
+      id: `${id}_operation`, owner_kind: 'model_request', owner_id: id, operation_seq: 1n, tool_call_id: null, status: operation, created_at: NOW, updated_at: NOW
+    }),
+    repo('Attempt').insertHistoricalCopy({
+      id: `${id}_attempt`, operation_id: `${id}_operation`, attempt_seq: 1n, status: attempt, created_at: NOW, updated_at: NOW, completed_at: NOW
+    })
+  ];
+  const checkpoint = (requestId, streamSeq) => repo('ModelStreamCheckpoint').insertHistoricalCopy({
+    id: `${requestId}_checkpoint_${streamSeq}`, model_request_id: requestId, attempt_seq: 1n, socket_generation: 0n,
+    stream_seq: streamSeq, checkpoint_kind: 'output_delta', content_object_id: body.id, created_at: NOW
+  });
+  await database.transaction([...copy('copied_request', 1n), checkpoint('copied_request', 1n)]);
+  await assert.rejects(database.transaction([checkpoint('copied_request', 2n)]), /copied in the same transaction/,
+    '不能给已有的结束请求追加检查点');
+  await assert.rejects(database.transaction([repo('ModelStreamFence').insertHistoricalCopy({
+    id: 'appended_fence', model_request_id: 'copied_request', attempt_seq: 1n, socket_generation: 0n, terminal_stream_seq: 1n,
+    outcome: 'completed', created_at: NOW
+  })]), /copied in the same transaction/);
+  await assert.rejects(database.transaction(copy('running_operation', 2n, { operation: 'running' })), /Operation copy must be terminal/);
+  await assert.rejects(database.transaction(copy('running_attempt', 3n, { attempt: 'running' })), /Attempt copy must be terminal/);
+  const target = readDatabase(fixture.current);
+  try {
+    assert.equal(target.count('model_stream_checkpoint'), 1);
+    assert.equal(target.count('model_request'), 1);
+  } finally { target.close(); }
 });
 
 test('协作消息 message_seq 平移到当前库最大值之后并保持相对顺序；附件观察按内容身份复用', async (t) => {
@@ -602,6 +740,26 @@ test('复审 merge2 #8：两个窗口同时启动，后处理的窗口在锁内�
   assert.deepEqual([again.pendingSources, again.merged, again.deferred], [1, [], []]);
   assert.deepEqual(await fs.readdir(path.join(controlRoot(touched.current), 'merge-backups')), backups);
   assert.equal((await readRuntimeDataSetMergeStates(touched.paths)).get(touched.alpha.id)?.changedSinceMerge, false);
+});
+
+test('复审 merge2 #8：规划之后另一个窗口合并了同一来源：提交前在锁内重读账本，直接跳过，不报告，本轮备份删除', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_raced', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  let inner;
+  const outer = await merge(fixture, database, {
+    // This window has planned, backed up and copied the bodies; meanwhile another window merges it.
+    async onFaultPoint(point) {
+      if (point === 'after-cas-transfer' && !inner) inner = await merge(fixture, database);
+    }
+  });
+  assert.equal(inner.merged.length, 1);
+  assert.deepEqual([outer.merged, outer.deferred, outer.blocked, outer.failures], [[], [], [], []]);
+  const backups = await fs.readdir(path.join(controlRoot(fixture.current), 'merge-backups'));
+  assert.deepEqual(backups, [path.basename(inner.merged[0].backupPath)], '后到窗口的本轮备份没有留下');
+  const target = readDatabase(fixture.current);
+  try { assert.equal(target.count('conversation', 'id = ?', 'conversation_alpha_raced'), 1); }
+  finally { target.close(); }
 });
 
 test('复审 startup2 #2：合并中当前库被关闭（重载/切库）记为推迟而非失败；停止请求在来源开始前和规划前生效，什么都不记', async (t) => {
@@ -1072,6 +1230,64 @@ async function seed(dataSet, conversations) {
  * ToolCall without Operation), bare (active Turn only), interrupt-requested (lease + pending
  * interrupt request), queued-intent (a user message waiting for the next Turn).
  */
+/** Writes constructed rows straight into an offline data set (states no public API produces). */
+function rawSource(dataSet, write) {
+  const source = new Database(dataSet.binding.paths.databasePath);
+  try {
+    source.pragma('foreign_keys = ON');
+    const contentId = source.prepare('SELECT id FROM content_object WHERE sha256 = ?').pluck().get(sha256(SHARED_TEXT));
+    source.exec('BEGIN IMMEDIATE');
+    write(source, contentId);
+    source.exec('COMMIT');
+    assert.deepEqual(source.pragma('foreign_key_check'), []);
+    source.pragma('wal_checkpoint(TRUNCATE)');
+  } finally { source.close(); }
+}
+
+/** An exited process linked to the Conversation, without its ProcessReceipt. */
+function insertUnreceiptedProcess(source, conversationId) {
+  source.prepare(`INSERT INTO process VALUES (?, 'exited', 'nonce', 1, NULL, NULL, 'fp', 'digest', 'spool', 0, 0, 0, 0, ?, ?, ?)`)
+    .run(`${conversationId}_process`, NOW, NOW, NOW);
+  source.prepare('INSERT INTO process_completion_source_link VALUES (?, ?, ?, ?, ?, ?)')
+    .run(`${conversationId}_process_link`, `${conversationId}_process`, conversationId, `${conversationId}_turn`, 'tool_call_x', NOW);
+}
+
+/** A child execution of conversation_alpha_parent in conversation_alpha_child, as a crash can leave it. */
+function insertChildExecution(source, contentId, spec) {
+  const childTurn = 'conversation_alpha_child_task_turn';
+  source.prepare('INSERT INTO child_execution VALUES (?, ?, ?, ?, ?)').run('child_exec_1', 'conversation_alpha_child', spec.childStatus, NOW, NOW);
+  source.prepare('INSERT INTO child_execution_parent_link VALUES (?, ?, ?, ?, ?, ?)')
+    .run('child_parent_link_1', 'child_exec_1', 'tool_call_spawn_1', null, 'conversation_alpha_parent_turn', NOW);
+  source.prepare('INSERT INTO turn VALUES (?, ?, ?, ?, ?, ?)').run(childTurn, 'conversation_alpha_child', 'terminated', NOW, NOW, NOW);
+  source.prepare('INSERT INTO turn_termination VALUES (?, ?, ?, ?, ?)').run(`${childTurn}_termination`, childTurn, spec.terminal, 'fixture', NOW);
+  source.prepare('INSERT INTO child_execution_turn_link VALUES (?, ?, ?, ?, ?)').run('child_turn_link_1', 'child_exec_1', 1, childTurn, NOW);
+  if (spec.fence) {
+    source.prepare(`INSERT INTO model_request (id, turn_id, request_seq, status, terminal_state, provider_id, model_id,
+      context_window_tokens, compression_threshold_tokens, estimated_context_tokens, authority_snapshot_id,
+      settings_snapshot_object_id, recipe_object_id, usage_json, stream_stats_json, created_at, updated_at)
+      VALUES (?, ?, 1, 'terminal', 'completed', 'p', 'm', 1000, 900, 10, 'authority', NULL, ?, NULL, NULL, ?, ?)`)
+      .run(`${childTurn}_request`, childTurn, contentId, NOW, NOW);
+    source.prepare('INSERT INTO turn_final_output_fence VALUES (?, ?, ?, ?)').run(`${childTurn}_fence`, childTurn, `${childTurn}_request`, NOW);
+  }
+  if (spec.terminationRequest) {
+    source.prepare('INSERT INTO pending_turn_input VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(`${childTurn}_termination_request`, childTurn, 1, 'termination_request', contentId, 'consumed', NOW, NOW);
+  }
+  source.prepare('INSERT INTO answer_bridge VALUES (?, ?, ?, ?, ?, ?)').run('bridge_1', 'child_exec_1', null, spec.bridgeStatus, NOW, NOW);
+}
+
+/** `count` bare conversation rows written straight into an offline data set (no CAS, one transaction). */
+function rawInsertConversations(dataSet, prefix, count) {
+  const source = new Database(dataSet.binding.paths.databasePath);
+  try {
+    const insert = source.prepare("INSERT INTO conversation (id, title, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)");
+    source.transaction(() => {
+      for (let index = 0; index < count; index += 1) insert.run(`raw_${prefix}_${index}`, `raw ${index}`, NOW, NOW);
+    })();
+    source.pragma('wal_checkpoint(TRUNCATE)');
+  } finally { source.close(); }
+}
+
 /** Many small conversations, one project, every message its own body (2 + 5 × messages rows each). */
 async function seedBulk(dataSet, prefix, conversations, messages) {
   await withRuntime(dataSet, async (runtime, store) => {
@@ -1336,10 +1552,11 @@ function controlRoot(dataSet) {
   return path.dirname(dataSet.binding.paths.dataRootPath);
 }
 
-function runChild(args) {
+function runChild(args, nodeOptions = []) {
   const script = path.join(HERE, 'runtime-dataset-merge-child.mjs');
   return new Promise((resolve) => {
-    execFile(process.execPath, [script, ...args], { env: { ...process.env, LIMCODE_TEST_EXTENSION_ROOT: compiled } },
+    execFile(process.execPath, [...nodeOptions, script, ...args],
+      { env: { ...process.env, LIMCODE_TEST_EXTENSION_ROOT: compiled }, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout, stderr) => resolve({ signal: error?.signal ?? null, code: error ? error.code ?? null : 0, stdout, stderr }));
   });
 }
