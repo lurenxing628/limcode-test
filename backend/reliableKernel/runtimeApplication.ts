@@ -19,7 +19,7 @@ import { ConversationDeletionControlPlane } from './conversationDeletion';
 import { ReliableContextCompressionCoordinator } from './contextCompressionCoordinator';
 import { ContextSequenceControlPlane } from './contextSequence';
 import type { RuntimeBuildInfoRecord } from '../../shared/protocol';
-import type { ReliableDiagnosticObserver } from './diagnosticJournal';
+import { supportsDiagnosticRollup, type ReliableDiagnosticObserver } from './diagnosticJournal';
 import {
   FileChangeControlPlane,
   FileMutationDispatcher,
@@ -43,6 +43,7 @@ import {
 } from './processCompletionDelivery';
 import { RootAuthority } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { RuntimeDiagnosticMetrics } from './runtimeDiagnosticMetrics';
 import { listAllDomainRows } from './repositoryPagination';
 import { ToolInteractionControlPlane } from './toolInteractions';
 import {
@@ -148,6 +149,7 @@ export class ReliableKernelApplication {
   private unsubscribeConvergence: (() => void) | undefined;
   private readonly providers: ReliableAgentProviderRegistry;
   private readonly diagnosticObserver: ReliableDiagnosticObserver | undefined;
+  private readonly runtimeDiagnostics: RuntimeDiagnosticMetrics | undefined;
 
   private constructor(
     private readonly authority: RootAuthority,
@@ -159,6 +161,12 @@ export class ReliableKernelApplication {
     this.diagnosticObserver = dependencies.diagnosticObserver;
     this.database = database;
     this.contentStore = contentStore;
+    if (supportsDiagnosticRollup(dependencies.diagnosticObserver)) {
+      // Persist windowed database/Feed/CAS timings into the bounded journal; attach before any
+      // service below issues its first request. WAL sampling starts once composition succeeded.
+      this.runtimeDiagnostics = new RuntimeDiagnosticMetrics(dependencies.diagnosticObserver, database.binding);
+      database.attachPerformanceMetrics(this.runtimeDiagnostics);
+    }
 
     const options = dependencies.now ? { now: dependencies.now } : {};
     this.attachments = new AttachmentIngestService(
@@ -351,7 +359,9 @@ export class ReliableKernelApplication {
     const database = await RuntimeDatabase.open(authority);
     try {
       const contentStore = new ContentAddressedStore(authority, database.binding);
-      return new ReliableKernelApplication(authority, database, contentStore, dependencies);
+      const application = new ReliableKernelApplication(authority, database, contentStore, dependencies);
+      application.runtimeDiagnostics?.start();
+      return application;
     } catch (error) {
       await database.close();
       throw error;
@@ -447,6 +457,7 @@ export class ReliableKernelApplication {
       await this.processDeliveries.dispose();
       await this.toolDispatcher.dispose?.();
       await this.providers.dispose?.();
+      await this.runtimeDiagnostics?.close();
       await this.database.close();
     })();
     return this.closePromise;

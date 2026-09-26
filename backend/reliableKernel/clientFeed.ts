@@ -61,6 +61,7 @@ import { answerSubmissionClientOutcome } from './answerSubmissionOutcome';
 import { requirePhaseFId, requirePhaseFText } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
+import type { ClientFeedSnapshotReason } from './runtimePerformanceMetrics';
 import {
   RUNTIME_DOMAIN_SCHEMA_BY_KEY,
   RUNTIME_DOMAIN_SCHEMA_BY_TABLE
@@ -112,6 +113,9 @@ interface ClientFeedSession {
   lastAckedCommitSeq: string | null;
   snapshotRequired: boolean;
   snapshotRequestGeneration: number;
+  /** First unmet reason of the pending snapshot, and of one requested while a refresh reads. */
+  snapshotReason: ClientFeedSnapshotReason | null;
+  nextSnapshotReason: ClientFeedSnapshotReason | null;
   queue: PendingChangesBatch[];
   queuedBytes: number;
   send(message: ReliableKernelDataMessage): void;
@@ -183,6 +187,8 @@ export class BoundedClientFeed {
       lastAckedCommitSeq: null,
       snapshotRequired: false,
       snapshotRequestGeneration: 0,
+      snapshotReason: null,
+      nextSnapshotReason: null,
       queue: [],
       queuedBytes: 0,
       send: input.send,
@@ -213,13 +219,15 @@ export class BoundedClientFeed {
       // Establish the external-writer baseline before the initial snapshot. A commit racing after
       // this read is consequently discovered by the poller and cannot fall through the handoff.
       await this.ensureExternalCommitPolling();
+      const readStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
       const subscription = await this.database.clientProjectionSnapshotAndSubscribe(
         activeConversationId,
         (commit) => this.onCommit(session, commit)
       );
       session.unsubscribe = subscription.unsubscribe;
       const snapshot = this.createSnapshotMessage(session, subscription.barrier.snapshotCommitSeq, subscription.barrier.snapshot);
-      this.sendNow(session, snapshot, subscription.barrier.snapshotCommitSeq);
+      const bytes = this.sendNow(session, snapshot, subscription.barrier.snapshotCommitSeq);
+      this.recordSnapshotMetric('initial', bytes, readStartedAt);
       session.initializing = false;
       const buffered = session.handoffCommits;
       session.handoffCommits = [];
@@ -258,7 +266,7 @@ export class BoundedClientFeed {
     session.activeConversationId = activeConversationId === undefined || activeConversationId === null
       ? null
       : requirePhaseFId(activeConversationId, 'activeConversationId');
-    this.enterSnapshotRequired(session);
+    this.enterSnapshotRequired(session, 'client_request');
   }
 
   public disconnect(sessionIdInput: string): void {
@@ -327,7 +335,7 @@ export class BoundedClientFeed {
     // writer emit ToolOutcome. Probe calls outside the live window by their committed identity.
     const taskCandidates = committedTaskToolCandidates(commit.changes);
     if (scoped.requiresSnapshot || this.refreshForCommittedTaskCandidates(session, taskCandidates)) {
-      this.enterSnapshotRequired(session);
+      this.enterSnapshotRequired(session, scoped.requiresSnapshot ? 'commit_scope' : 'task_candidate');
       return;
     }
     // Database commitSeq is intentionally allowed to jump on the wire. Commits with no visible
@@ -338,7 +346,7 @@ export class BoundedClientFeed {
       pending.changes.length > CLIENT_CHANGE_BATCH_MAX_RECORDS
       || pending.bytes > CLIENT_CHANGE_BATCH_MAX_BYTES
     ) {
-      this.enterSnapshotRequired(session);
+      this.enterSnapshotRequired(session, 'change_batch_limit');
       return;
     }
     if (!session.inflight && session.queue.length === 0 && !session.refreshing) {
@@ -350,7 +358,7 @@ export class BoundedClientFeed {
       session.queue.length + 1 > CLIENT_MAX_QUEUED_BATCHES
       || session.queuedBytes + pending.bytes > CLIENT_MAX_QUEUED_BYTES
     ) {
-      this.enterSnapshotRequired(session);
+      this.enterSnapshotRequired(session, 'queue_limit');
       return;
     }
     session.queue.push(pending);
@@ -379,7 +387,7 @@ export class BoundedClientFeed {
       void this.probeCommittedTaskCandidates(conversationId, outsideWindow)
         .then((found) => {
           if (found && !session.closed && session.activeConversationId === conversationId) {
-            this.enterSnapshotRequired(session);
+            this.enterSnapshotRequired(session, 'task_candidate');
           }
         })
         .catch((error) => this.closeFailedSession(session, error));
@@ -422,8 +430,10 @@ export class BoundedClientFeed {
       .some((rows) => Array.isArray(rows) && rows.some((row) => row.status === 'succeeded')));
   }
 
-  private enterSnapshotRequired(session: ClientFeedSession): void {
+  private enterSnapshotRequired(session: ClientFeedSession, reason: ClientFeedSnapshotReason): void {
     if (session.closed) return;
+    if (session.refreshing) session.nextSnapshotReason ??= reason;
+    else session.snapshotReason ??= reason;
     session.queue = [];
     session.queuedBytes = 0;
     session.snapshotRequired = true;
@@ -439,6 +449,9 @@ export class BoundedClientFeed {
     session.collectingRefresh = true;
     session.handoffCommits = [];
     const refreshRequestGeneration = session.snapshotRequestGeneration;
+    const reason = session.snapshotReason ?? 'client_request';
+    session.snapshotReason = null;
+    const readStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
     try {
       const barrier = await this.sharedProjectionSnapshot(session.activeConversationId);
       const visible = BigInt(barrier.snapshotCommitSeq);
@@ -448,10 +461,13 @@ export class BoundedClientFeed {
       // An external commit may arrive while the read transaction is materializing this snapshot.
       // Preserve that later request so the ACK of this snapshot schedules one more refresh.
       session.snapshotRequired = session.snapshotRequestGeneration !== refreshRequestGeneration;
+      if (session.snapshotRequired) session.snapshotReason = session.nextSnapshotReason ?? reason;
       const snapshot = this.createSnapshotMessage(session, barrier.snapshotCommitSeq, barrier.snapshot);
-      this.sendNow(session, snapshot, barrier.snapshotCommitSeq);
+      const bytes = this.sendNow(session, snapshot, barrier.snapshotCommitSeq);
+      this.recordSnapshotMetric(reason, bytes, readStartedAt);
       for (const commit of buffered) this.enqueueCommit(session, commit);
     } finally {
+      session.nextSnapshotReason = null;
       session.collectingRefresh = false;
       session.refreshing = false;
     }
@@ -484,13 +500,24 @@ export class BoundedClientFeed {
     session: ClientFeedSession,
     message: ReliableKernelDataMessage,
     commitSeq: string
-  ): void {
+  ): number {
     const queued: QueuedDataMessage = {
       message,
       bytes: wireBytes(message),
       commitSeq
     };
     this.sendQueuedNow(session, queued);
+    return queued.bytes;
+  }
+
+  private recordSnapshotMetric(reason: ClientFeedSnapshotReason, bytes: number, readStartedAt: number | undefined): void {
+    if (readStartedAt === undefined) return;
+    this.database.recordPerformanceMetric({
+      kind: 'client_feed.snapshot',
+      reason,
+      bytes,
+      durationMs: performance.now() - readStartedAt
+    });
   }
 
   private createSnapshotMessage(
@@ -1011,7 +1038,10 @@ export class BoundedClientFeed {
       }
       if (nextVersion === this.externalDataVersion) return;
       this.externalDataVersion = nextVersion;
-      for (const session of this.sessions.values()) this.enterSnapshotRequired(session);
+      if (this.database.performanceMetrics) {
+        this.database.recordPerformanceMetric({ kind: 'client_feed.external_change', sessionCount: this.sessions.size });
+      }
+      for (const session of this.sessions.values()) this.enterSnapshotRequired(session, 'external_commit');
     } catch (error) {
       for (const session of [...this.sessions.values()]) this.closeFailedSession(session, error);
     } finally {

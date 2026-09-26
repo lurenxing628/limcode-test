@@ -271,6 +271,19 @@ export type DatabaseWorkerRequestPayload =
 export interface DatabaseWorkerTiming {
   queueWaitMs: number;
   executeDurationMs: number;
+  /** Present only when the request opened a BEGIN IMMEDIATE writer transaction. */
+  writeLock?: DatabaseWorkerWriteLockTiming;
+}
+
+export interface DatabaseWorkerWriteLockTiming {
+  /** BEGIN IMMEDIATE duration, including SQLite busy_timeout waiting for another connection. */
+  waitMs: number;
+  /** Lock acquired until COMMIT returned, or until the response when the transaction rolled back. */
+  holdMs: number;
+  /** Last stage reached; a failure reports where it happened. */
+  stage: 'begin' | 'body' | 'commit' | 'committed';
+  /** First mutated Repository domain of a `transaction` request; a schema key, never row content. */
+  domain?: string;
 }
 
 export type DatabaseWorkerRequest = DatabaseWorkerRequestPayload & {

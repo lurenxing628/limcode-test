@@ -116,8 +116,8 @@ test('ReliableDiagnosticJournal 只持久化脱敏 metadata 并保持文件/内�
     }
     const inspection = await journal.inspect({ scopeId: 'conversation-1', limit: 25 });
     assert.equal(inspection.events.length, 25);
-    assert.equal(inspection.bounds.maxTotalBytes, 4 * 1_048_576);
-    assert.equal(inspection.bounds.maxPendingEvents, 256);
+    assert.equal(inspection.bounds.maxTotalBytes, 8 * 1_048_576);
+    assert.equal(inspection.bounds.maxPendingEvents, 512);
     assert.equal(inspection.bounds.maxReturnedEvents, 200);
     assert.equal(inspection.bounds.maxReturnedSpans, 100);
     assert.ok(inspection.spans.length <= 100);

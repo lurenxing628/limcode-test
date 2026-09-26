@@ -831,17 +831,16 @@ export class ReliableKernelWebviewFeedBridge {
           streamSeq: String(event.event.streamSeq)
         }
       }));
-      this.diagnostics?.observe({
+      // One flush per streamed batch dominates the journal; keep per-session window totals instead.
+      this.diagnostics?.aggregate?.({
         eventKind: 'feed.transient.flushed',
         scopeKind: 'feed_session',
         scopeId: connection.sessionId,
-        metadata: {
-          conversationId,
+        dimensions: { conversationId },
+        counters: {
           rawEventCount,
           emittedEventCount: payloads.length,
-          toolDeltaEventCount: pending.filter(({ event }) => isToolCallDeltaTransient(event)).length,
-          firstStreamSeq: payloads[0]?.fromStreamSeq ?? '0',
-          lastStreamSeq: payloads[payloads.length - 1]?.event.streamSeq ?? '0'
+          toolDeltaEventCount: pending.filter(({ event }) => isToolCallDeltaTransient(event)).length
         }
       });
       this.postTransientBatch(client, connection, conversationId, payloads);
@@ -1019,17 +1018,16 @@ export class ReliableKernelWebviewFeedBridge {
     ) return;
     clearTimeout(delivery.ackTimer);
     client.transientDeliveries.delete(ack.deliveryId);
-    this.diagnostics?.observe({
+    this.diagnostics?.aggregate?.({
       eventKind: 'feed.transient.acked',
       scopeKind: 'feed_session',
       scopeId: ack.sessionId,
-      correlationId: ack.deliveryId,
-      metadata: {
+      dimensions: {
         ...(client.meta.conversationId ? { conversationId: client.meta.conversationId } : {}),
-        deliveryKind: delivery.kind,
-        headCount: ack.heads.length,
-        elapsedMs: Math.max(0, Date.now() - delivery.postedAt)
-      }
+        deliveryKind: delivery.kind
+      },
+      durationMs: Math.max(0, Date.now() - delivery.postedAt),
+      counters: { headCount: ack.heads.length }
     });
   }
 

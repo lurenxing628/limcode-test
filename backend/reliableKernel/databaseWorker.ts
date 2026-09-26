@@ -56,6 +56,7 @@ import {
   type DatabaseWorkerDiagnostics,
   type DatabaseWorkerRequest,
   type DatabaseWorkerResponse,
+  type DatabaseWorkerWriteLockTiming,
   type ExecutionLeaseFencePayload,
   type EffectReceiptReconciliationCandidate,
   type ModelStreamActivityInput,
@@ -159,6 +160,18 @@ class VerifiedContextCasCache {
   }
 }
 
+/**
+ * Writer-lock timing of the request currently executing on this single-threaded worker. Only
+ * performance.now() stamps are taken inside the transaction; nothing is written or sent until
+ * the response has been produced.
+ */
+let requestWriteLock: {
+  startedAtMs: number;
+  acquiredAtMs?: number;
+  releasedAtMs?: number;
+  stage: DatabaseWorkerWriteLockTiming['stage'];
+} | undefined;
+
 const port = requireParentPort();
 const data = workerData as DatabaseWorkerData;
 
@@ -208,10 +221,11 @@ async function start(): Promise<void> {
     const receivedAtMs = Number.isFinite(request.metricEnqueuedAtMs)
       ? performance.now()
       : undefined;
+    requestWriteLock = undefined;
     const respond = (
       response: Extract<DatabaseWorkerResponse, { type: 'response' }>,
       transferList: readonly ArrayBuffer[] = []
-    ) => postMeasuredResponse(response, request.metricEnqueuedAtMs, receivedAtMs, transferList);
+    ) => postMeasuredResponse(response, request, receivedAtMs, transferList);
     try {
       if (request.kind === 'transaction') {
         assertDatabaseBinding(writer, data.binding);
@@ -622,14 +636,14 @@ function executeTransaction(
   if (!Array.isArray(steps) || steps.length === 0) throw new Error('Runtime transaction requires at least one Repository step.');
   const allocatedSequences: RuntimeAllocatedSequence[] = [];
   let changes: RuntimeChange[] = [];
-  database.exec('BEGIN IMMEDIATE');
+  beginMeasuredWrite(database);
 
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
     executeSteps(database, steps, allocatedSequences);
     assertTouchedRuntimeAggregates(database, steps);
     changes = readTransactionChanges(database);
-    database.exec('COMMIT');
+    commitMeasuredWrite(database);
   } catch (error) {
     database.exec('ROLLBACK');
     throw error;
@@ -652,7 +666,7 @@ function executeModelStreamEvent(
     throw new TypeError(`Unsupported ModelStream checkpoint kind: ${String(input.checkpointKind)}`);
   }
   if (typeof input.now !== 'string' || input.now.length === 0) throw new TypeError('ModelStreamEvent.now must be non-empty.');
-  database.exec('BEGIN IMMEDIATE');
+  beginMeasuredWrite(database);
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
     assertExecutionLeaseFence(database, input.executionFence);
@@ -810,7 +824,7 @@ function executeModelStreamEvent(
       }
     }
     const changes = readTransactionChanges(database);
-    database.exec('COMMIT');
+    commitMeasuredWrite(database);
     const commit: RuntimeCommitResult = {
       commitSeq: nextCommitSeq.toString(),
       changes,
@@ -843,7 +857,7 @@ function executeModelStreamActivity(
   if (typeof input.now !== 'string' || input.now.length === 0) {
     throw new TypeError('ModelStreamActivity.now must be non-empty.');
   }
-  database.exec('BEGIN IMMEDIATE');
+  beginMeasuredWrite(database);
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
     assertExecutionLeaseFence(database, input.executionFence);
@@ -888,7 +902,7 @@ function executeModelStreamActivity(
       })
     ], []);
     const changes = readTransactionChanges(database);
-    database.exec('COMMIT');
+    commitMeasuredWrite(database);
     return {
       accepted: true,
       terminal: false,
@@ -912,7 +926,7 @@ function executeCancelCurrentModelRequest(
   if (typeof input.now !== 'string' || input.now.length === 0) {
     throw new TypeError('ModelRequest cancellation time must be non-empty.');
   }
-  database.exec('BEGIN IMMEDIATE');
+  beginMeasuredWrite(database);
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
     assertExecutionLeaseFence(database, input.executionFence);
@@ -956,7 +970,7 @@ function executeCancelCurrentModelRequest(
     ], []);
     assertModelRequestAggregate(database, modelRequestId);
     const changes = readTransactionChanges(database);
-    database.exec('COMMIT');
+    commitMeasuredWrite(database);
     const commit: RuntimeCommitResult = {
       commitSeq: nextCommitSeq.toString(),
       changes,
@@ -2770,21 +2784,68 @@ function assertPublishedContentObject(row: EncodedRow, casRootPath: string): voi
   if (!stat.isFile() || BigInt(stat.size) !== byteLength) throw new Error('ContentObject CAS file is missing or has the wrong length.');
 }
 
+function beginMeasuredWrite(database: Database.Database): void {
+  const lock: NonNullable<typeof requestWriteLock> = { startedAtMs: performance.now(), stage: 'begin' };
+  requestWriteLock = lock;
+  database.exec('BEGIN IMMEDIATE');
+  lock.acquiredAtMs = performance.now();
+  lock.stage = 'body';
+}
+
+function commitMeasuredWrite(database: Database.Database): void {
+  const lock = requestWriteLock;
+  if (lock) lock.stage = 'commit';
+  database.exec('COMMIT');
+  if (lock) {
+    lock.stage = 'committed';
+    lock.releasedAtMs = performance.now();
+  }
+}
+
+function measuredWriteLock(request: DatabaseWorkerRequest, nowMs: number): DatabaseWorkerWriteLockTiming | undefined {
+  const lock = requestWriteLock;
+  if (!lock) return undefined;
+  const domain = request.kind === 'transaction' ? firstMutatedDomain(request.steps) : undefined;
+  return {
+    waitMs: Math.max(0, (lock.acquiredAtMs ?? nowMs) - lock.startedAtMs),
+    holdMs: lock.acquiredAtMs === undefined ? 0 : Math.max(0, (lock.releasedAtMs ?? nowMs) - lock.acquiredAtMs),
+    stage: lock.stage,
+    ...(domain ? { domain } : {})
+  };
+}
+
+function firstMutatedDomain(steps: readonly RepositoryTransactionStep[]): string | undefined {
+  for (const step of Array.isArray(steps) ? steps : []) {
+    if (step.kind === 'savepoint') {
+      const nested = firstMutatedDomain(step.steps);
+      if (nested) return nested;
+      continue;
+    }
+    if (step.kind.startsWith('assert')) continue;
+    if (typeof step.domain === 'string' && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(step.domain)) return step.domain;
+  }
+  return undefined;
+}
+
 function postMeasuredResponse(
   response: Extract<DatabaseWorkerResponse, { type: 'response' }>,
-  enqueuedAtMs: number | undefined,
+  request: DatabaseWorkerRequest,
   receivedAtMs: number | undefined,
   transferList: readonly ArrayBuffer[] = []
 ): void {
+  const enqueuedAtMs = request.metricEnqueuedAtMs;
   if (receivedAtMs === undefined || enqueuedAtMs === undefined || !Number.isFinite(enqueuedAtMs)) {
     post(response, transferList);
     return;
   }
+  const nowMs = performance.now();
+  const writeLock = measuredWriteLock(request, nowMs);
   post({
     ...response,
     timing: {
       queueWaitMs: Math.max(0, receivedAtMs - enqueuedAtMs),
-      executeDurationMs: Math.max(0, performance.now() - receivedAtMs)
+      executeDurationMs: Math.max(0, nowMs - receivedAtMs),
+      ...(writeLock ? { writeLock } : {})
     }
   }, transferList);
 }

@@ -1,9 +1,10 @@
 /**
- * Development-only, metadata-only timing hooks for the reliable Runtime hot path.
+ * Metadata-only timing hooks for the reliable Runtime hot path.
  *
  * Callers must not add ids, command arguments, user/provider content, paths, credentials, or
- * serialized domain rows to these events. Production code remains uninstrumented unless a sink is
- * explicitly attached.
+ * serialized domain rows to these events. Benchmarks attach in-memory collectors; the product
+ * attaches the bounded diagnostic rollup (runtimeDiagnosticMetrics.ts), which only keeps windowed
+ * aggregates and rate-limited anomalies.
  */
 export interface RuntimePerformanceMetricsSink {
   record(event: RuntimePerformanceMetricEvent): void;
@@ -31,6 +32,16 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'inspect'
   | 'close';
 
+/** Why a bounded Client Feed session received a full snapshot instead of incremental changes. */
+export type ClientFeedSnapshotReason =
+  | 'initial'
+  | 'client_request'
+  | 'commit_scope'
+  | 'task_candidate'
+  | 'change_batch_limit'
+  | 'queue_limit'
+  | 'external_commit';
+
 export type RuntimePerformanceMetricEvent =
   | {
       kind: 'database.root_validate';
@@ -51,6 +62,16 @@ export type RuntimePerformanceMetricEvent =
       roundTripDurationMs: number;
       workerQueueWaitMs?: number;
       workerExecuteDurationMs?: number;
+      /** BEGIN IMMEDIATE wait / lock hold of writer requests. */
+      writeLockWaitMs?: number;
+      writeLockHoldMs?: number;
+      writeLockStage?: 'begin' | 'body' | 'commit' | 'committed';
+      /** First mutated Repository domain (schema key) of a failed or measured transaction. */
+      writeDomain?: string;
+      /** SQLite result code of a failed request, e.g. SQLITE_BUSY. */
+      sqliteErrorCode?: string;
+      /** The failure reported SQLite's "database is locked" condition. */
+      databaseLocked?: boolean;
     }
   | {
       kind: 'database.commit_listeners';
@@ -104,6 +125,16 @@ export type RuntimePerformanceMetricEvent =
       listenerKind: 'database_commit' | 'feed_projection' | 'sidebar_projection';
       listenerCount: number;
       durationMs: number;
+    }
+  | {
+      kind: 'client_feed.snapshot';
+      reason: ClientFeedSnapshotReason;
+      bytes: number;
+      durationMs: number;
+    }
+  | {
+      kind: 'client_feed.external_change';
+      sessionCount: number;
     }
   | {
       kind: 'process.phase';

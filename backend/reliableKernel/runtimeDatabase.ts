@@ -733,7 +733,14 @@ export class RuntimeDatabase {
         ...(message.timing ? {
           workerQueueWaitMs: message.timing.queueWaitMs,
           workerExecuteDurationMs: message.timing.executeDurationMs
-        } : {})
+        } : {}),
+        ...(message.timing?.writeLock ? {
+          writeLockWaitMs: message.timing.writeLock.waitMs,
+          writeLockHoldMs: message.timing.writeLock.holdMs,
+          writeLockStage: message.timing.writeLock.stage,
+          ...(message.timing.writeLock.domain ? { writeDomain: message.timing.writeLock.domain } : {})
+        } : {}),
+        ...(message.ok ? {} : sqliteFailureMetric(message.error))
       });
     }
     if (message.ok) pending.resolve(message.result);
@@ -756,6 +763,15 @@ export class RuntimeDatabase {
     }
     this.pending.clear();
   }
+}
+
+function sqliteFailureMetric(error: SerializedWorkerError): { sqliteErrorCode?: string; databaseLocked?: boolean } {
+  const code = typeof error.code === 'string' && /^SQLITE_[A-Z_]{1,48}$/.test(error.code) ? error.code : undefined;
+  const databaseLocked = /database (?:table )?is locked/i.test(error.message);
+  return {
+    ...(code ? { sqliteErrorCode: code } : {}),
+    ...(databaseLocked ? { databaseLocked } : {})
+  };
 }
 
 export async function initializeEmptyRuntimeRoot(authority: RootAuthority): Promise<RootBinding> {

@@ -32,8 +32,34 @@ export interface ReliableDiagnosticEventRecord {
   metadata: Record<string, string | number | boolean | null>;
 }
 
+/**
+ * One high-frequency sample folded into a bounded per-window summary instead of being persisted
+ * individually. The rollup identity is eventKind + scope + dimensions; the persisted summary is
+ * `${eventKind}.summary`. Dimension and counter keys must be allowlisted metadata keys.
+ */
+export interface ReliableDiagnosticSampleInput {
+  eventKind: string;
+  scopeKind?: ReliableDiagnosticScopeKind;
+  scopeId?: string;
+  dimensions?: Record<string, string | number | boolean>;
+  /** Folded into fixed histogram buckets; the summary reports p50/p95 bucket bounds, max and total. */
+  durationMs?: number;
+  /** Summed across the window. */
+  counters?: Record<string, number>;
+}
+
 export interface ReliableDiagnosticObserver {
   observe(event: ReliableDiagnosticEventInput): void;
+  aggregate?(sample: ReliableDiagnosticSampleInput): void;
+}
+
+export type ReliableDiagnosticRollupObserver = ReliableDiagnosticObserver
+  & Required<Pick<ReliableDiagnosticObserver, 'aggregate'>>;
+
+export function supportsDiagnosticRollup(
+  observer: ReliableDiagnosticObserver | undefined
+): observer is ReliableDiagnosticRollupObserver {
+  return typeof observer?.aggregate === 'function';
 }
 
 export interface ReliableDiagnosticSpanRecord {
@@ -54,12 +80,16 @@ export interface ReliableDiagnosticJournalInspection {
     retentionMs: number;
     maxReturnedEvents: number;
     maxReturnedSpans: number;
+    maxRollupKeys: number;
+    rollupWindowMs: number;
   };
   state: {
     pendingEvents: number;
     droppedEvents: number;
     persistedEvents: number;
     rotations: number;
+    rollupKeys: number;
+    rolledUpSamples: number;
     lastFailureCode?: string;
   };
   events: ReliableDiagnosticEventRecord[];
@@ -69,8 +99,8 @@ export interface ReliableDiagnosticJournalInspection {
 const DIAGNOSTIC_DIRECTORY = 'diagnostics';
 const CURRENT_FILE = 'events.jsonl';
 const MAX_FILES = 4;
-const MAX_FILE_BYTES = 1_048_576;
-const MAX_PENDING_EVENTS = 256;
+const MAX_FILE_BYTES = 2 * 1_048_576;
+const MAX_PENDING_EVENTS = 512;
 const MAX_FLUSH_EVENTS = 128;
 const MAX_RETURNED_EVENTS = 200;
 const MAX_RETURNED_SPANS = 100;
@@ -79,6 +109,12 @@ const FLUSH_DELAY_MS = 750;
 const MAX_METADATA_FIELDS = 16;
 const MAX_METADATA_STRING_LENGTH = 192;
 const MAX_ID_LENGTH = 256;
+const ROLLUP_WINDOW_MS = 5 * 60 * 1_000;
+const MAX_ROLLUP_KEYS = 256;
+/** Summary fields added to every rollup: sampleCount, windowMs, p50Ms, p95Ms, maxMs, totalMs, histogramMs. */
+const ROLLUP_SUMMARY_FIELDS = 7;
+/** Upper bounds (ms) of the duration histogram; samples above the last bound fall into `inf`. */
+const DURATION_BUCKET_BOUNDS_MS = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000];
 
 const ALLOWED_METADATA_KEYS = new Set([
   'conversationId',
@@ -129,18 +165,64 @@ const ALLOWED_METADATA_KEYS = new Set([
   'taskCardSha256',
   'activeChildCount',
   'runningProcessCount',
-  'droppedEvents'
+  'droppedEvents',
+  'sampleCount',
+  'windowMs',
+  'p50Ms',
+  'p95Ms',
+  'maxMs',
+  'totalMs',
+  'histogramMs',
+  'requestKind',
+  'executeMs',
+  'queueWaitMs',
+  'lockWaitMs',
+  'holdMs',
+  'domain',
+  'rawEventCount',
+  'emittedEventCount',
+  'toolDeltaEventCount',
+  'deliveryKind',
+  'headCount',
+  'sessionCount',
+  'publishes',
+  'tempWrites',
+  'fileFsyncs',
+  'directoryFsyncs',
+  'lookupHits',
+  'lookupMisses',
+  'transactionCount',
+  'checkpointed',
+  'segmentCount',
+  'walBytes',
+  'walFrames',
+  'checkpointedFrames',
+  'pendingFrames'
 ]);
+
+interface DiagnosticRollup {
+  eventKind: string;
+  scopeKind?: ReliableDiagnosticScopeKind;
+  scopeId?: string;
+  dimensions: Record<string, string | number | boolean>;
+  sampleCount: number;
+  durationBuckets: number[];
+  totalMs: number;
+  maxMs: number;
+  counters: Map<string, number>;
+}
 
 /**
  * Metadata-only rolling journal stored under the current fenced Runtime root.
  *
  * It is deliberately not a Runtime authority table: diagnostics must never advance domain state or
- * feed commitSeq. Every write revalidates the complete RootBinding, files are capped to 4 MiB total,
+ * feed commitSeq. Every write revalidates the complete RootBinding, files are capped to 8 MiB total,
  * stale rotations are removed after seven days, and pending memory is bounded. Prompt/output/tool
  * arguments, credentials, headers, paths and arbitrary nested objects are rejected by construction.
+ * High-frequency samples are folded into at most 256 in-memory rollups and persisted as one summary
+ * per rollup every five minutes (and on inspect/close), so rare events keep hours of history.
  */
-export class ReliableDiagnosticJournal implements ReliableDiagnosticObserver {
+export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserver {
   private readonly pending: ReliableDiagnosticEventRecord[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
   private flushPromise: Promise<void> | undefined;
@@ -149,12 +231,24 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticObserver {
   private persistedEvents = 0;
   private rotations = 0;
   private lastFailureCode: string | undefined;
+  private readonly rollups = new Map<string, DiagnosticRollup>();
+  private rollupWindowStartedAtMs: number | undefined;
+  private rollupTimer: ReturnType<typeof setTimeout> | undefined;
+  private rolledUpSamples = 0;
+  private readonly rollupWindowMs: number;
 
   public constructor(
     private readonly authority: RootAuthority,
     private readonly binding: RootBinding,
-    private readonly now: () => Date = () => new Date()
-  ) {}
+    private readonly now: () => Date = () => new Date(),
+    options: { rollupWindowMs?: number } = {}
+  ) {
+    const windowMs = options.rollupWindowMs ?? ROLLUP_WINDOW_MS;
+    if (!Number.isSafeInteger(windowMs) || windowMs <= 0) {
+      throw new TypeError('Diagnostic rollupWindowMs must be a positive safe integer.');
+    }
+    this.rollupWindowMs = windowMs;
+  }
 
   public observe(input: ReliableDiagnosticEventInput): void {
     if (this.closed) return;
@@ -165,13 +259,48 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticObserver {
       this.droppedEvents += 1;
       return;
     }
-    if (this.pending.length >= MAX_PENDING_EVENTS) {
-      this.pending.shift();
+    this.enqueue(event);
+  }
+
+  public aggregate(input: ReliableDiagnosticSampleInput): void {
+    if (this.closed) return;
+    let sample: ReturnType<typeof normalizeSample>;
+    try {
+      sample = normalizeSample(input);
+    } catch {
       this.droppedEvents += 1;
+      return;
     }
-    this.pending.push(event);
-    if (this.pending.length >= MAX_FLUSH_EVENTS) void this.flush();
-    else this.scheduleFlush();
+    let rollup = this.rollups.get(sample.key);
+    if (!rollup) {
+      // Bounded memory: a burst of distinct identities closes the current window early rather than
+      // evicting (and silently losing) any rollup that already holds samples.
+      if (this.rollups.size >= MAX_ROLLUP_KEYS) this.emitRollups();
+      rollup = {
+        eventKind: sample.eventKind,
+        ...(sample.scopeKind ? { scopeKind: sample.scopeKind } : {}),
+        ...(sample.scopeId ? { scopeId: sample.scopeId } : {}),
+        dimensions: sample.dimensions,
+        sampleCount: 0,
+        durationBuckets: new Array(DURATION_BUCKET_BOUNDS_MS.length + 1).fill(0),
+        totalMs: 0,
+        maxMs: 0,
+        counters: new Map()
+      };
+      this.rollups.set(sample.key, rollup);
+    }
+    if (this.rollupWindowStartedAtMs === undefined) this.rollupWindowStartedAtMs = this.now().getTime();
+    rollup.sampleCount += 1;
+    this.rolledUpSamples += 1;
+    if (sample.durationMs !== undefined) {
+      rollup.durationBuckets[durationBucket(sample.durationMs)] += 1;
+      rollup.totalMs += sample.durationMs;
+      rollup.maxMs = Math.max(rollup.maxMs, sample.durationMs);
+    }
+    for (const [key, value] of Object.entries(sample.counters)) {
+      rollup.counters.set(key, (rollup.counters.get(key) ?? 0) + value);
+    }
+    this.scheduleRollupEmit();
   }
 
   public async flush(): Promise<void> {
@@ -186,6 +315,7 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticObserver {
   }
 
   public async inspect(input: { scopeId?: string; limit?: number } = {}): Promise<ReliableDiagnosticJournalInspection> {
+    this.emitRollups();
     while (this.flushPromise || this.pending.length > 0) await this.flush();
     const limit = normalizeLimit(input.limit);
     const scopeId = input.scopeId?.trim();
@@ -218,13 +348,17 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticObserver {
         maxPendingEvents: MAX_PENDING_EVENTS,
         retentionMs: RETENTION_MS,
         maxReturnedEvents: MAX_RETURNED_EVENTS,
-        maxReturnedSpans: MAX_RETURNED_SPANS
+        maxReturnedSpans: MAX_RETURNED_SPANS,
+        maxRollupKeys: MAX_ROLLUP_KEYS,
+        rollupWindowMs: this.rollupWindowMs
       },
       state: {
         pendingEvents: this.pending.length,
         droppedEvents: this.droppedEvents,
         persistedEvents: this.persistedEvents,
         rotations: this.rotations,
+        rollupKeys: this.rollups.size,
+        rolledUpSamples: this.rolledUpSamples,
         ...(this.lastFailureCode ? { lastFailureCode: this.lastFailureCode } : {})
       },
       events: events.slice(-limit),
@@ -234,6 +368,7 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticObserver {
 
   public async close(): Promise<void> {
     if (this.closed) return;
+    this.emitRollups();
     this.closed = true;
     this.clearFlushTimer();
     while (this.flushPromise || this.pending.length > 0) await this.flush();
@@ -264,6 +399,53 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticObserver {
       this.droppedEvents += batch.length;
       this.lastFailureCode = errorCode(error);
     }
+  }
+
+  private enqueue(event: ReliableDiagnosticEventRecord): void {
+    if (this.pending.length >= MAX_PENDING_EVENTS) {
+      this.pending.shift();
+      this.droppedEvents += 1;
+    }
+    this.pending.push(event);
+    if (this.pending.length >= MAX_FLUSH_EVENTS) void this.flush();
+    else this.scheduleFlush();
+  }
+
+  /** Persists one summary per non-empty rollup and starts a new window. */
+  private emitRollups(): void {
+    if (this.rollupTimer) clearTimeout(this.rollupTimer);
+    this.rollupTimer = undefined;
+    const startedAtMs = this.rollupWindowStartedAtMs;
+    this.rollupWindowStartedAtMs = undefined;
+    if (this.rollups.size === 0 || startedAtMs === undefined) return;
+    const now = this.now();
+    const windowMs = Math.max(0, now.getTime() - startedAtMs);
+    const rollups = [...this.rollups.values()];
+    this.rollups.clear();
+    for (const rollup of rollups) {
+      let event: ReliableDiagnosticEventRecord;
+      try {
+        event = normalizeEvent({
+          eventKind: `${rollup.eventKind}.summary`,
+          ...(rollup.scopeKind ? { scopeKind: rollup.scopeKind } : {}),
+          ...(rollup.scopeId ? { scopeId: rollup.scopeId } : {}),
+          metadata: rollupSummaryMetadata(rollup, windowMs)
+        }, now);
+      } catch {
+        this.droppedEvents += 1;
+        continue;
+      }
+      this.enqueue(event);
+    }
+  }
+
+  private scheduleRollupEmit(): void {
+    if (this.rollupTimer || this.closed) return;
+    this.rollupTimer = setTimeout(() => {
+      this.rollupTimer = undefined;
+      this.emitRollups();
+    }, this.rollupWindowMs);
+    this.rollupTimer.unref?.();
   }
 
   private scheduleFlush(): void {
@@ -311,6 +493,99 @@ function normalizeEvent(input: ReliableDiagnosticEventInput, now: Date): Reliabl
     observedAt,
     metadata
   };
+}
+
+function normalizeSample(input: ReliableDiagnosticSampleInput): {
+  key: string;
+  eventKind: string;
+  scopeKind?: ReliableDiagnosticScopeKind;
+  scopeId?: string;
+  dimensions: Record<string, string | number | boolean>;
+  durationMs?: number;
+  counters: Record<string, number>;
+} {
+  const eventKind = normalizeToken(input.eventKind, 'eventKind', 88, /^[a-z][a-z0-9_.-]*$/);
+  const scopeKind = input.scopeKind;
+  if (scopeKind && !['runtime', 'conversation', 'turn', 'model_request', 'tool_call', 'feed_session'].includes(scopeKind)) {
+    throw new TypeError('Diagnostic scopeKind is invalid.');
+  }
+  const scopeId = optionalId(input.scopeId, 'scopeId');
+  const dimensionEntries = Object.entries(input.dimensions ?? {});
+  const counterEntries = Object.entries(input.counters ?? {});
+  if (dimensionEntries.length + counterEntries.length > MAX_METADATA_FIELDS - ROLLUP_SUMMARY_FIELDS) {
+    throw new TypeError('Diagnostic sample has too many fields.');
+  }
+  const dimensions: Record<string, string | number | boolean> = {};
+  for (const [key, value] of dimensionEntries.sort(([left], [right]) => left.localeCompare(right))) {
+    if (!ALLOWED_METADATA_KEYS.has(key)) throw new TypeError('Diagnostic sample dimension is not allowlisted.');
+    const normalized = normalizeMetadataValue(value);
+    if (normalized === undefined || normalized === null) throw new TypeError('Diagnostic sample dimension is invalid.');
+    dimensions[key] = normalized;
+  }
+  const counters: Record<string, number> = {};
+  for (const [key, value] of counterEntries) {
+    if (!ALLOWED_METADATA_KEYS.has(key) || key in dimensions) throw new TypeError('Diagnostic sample counter is not allowlisted.');
+    if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError('Diagnostic sample counter must be finite.');
+    counters[key] = value;
+  }
+  const durationMs = input.durationMs;
+  if (durationMs !== undefined && (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 0)) {
+    throw new TypeError('Diagnostic sample durationMs must be a non-negative finite number.');
+  }
+  return {
+    key: JSON.stringify([eventKind, scopeKind ?? null, scopeId ?? null, dimensions]),
+    eventKind,
+    ...(scopeKind ? { scopeKind } : {}),
+    ...(scopeId ? { scopeId } : {}),
+    dimensions,
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    counters
+  };
+}
+
+function durationBucket(durationMs: number): number {
+  const index = DURATION_BUCKET_BOUNDS_MS.findIndex((bound) => durationMs <= bound);
+  return index < 0 ? DURATION_BUCKET_BOUNDS_MS.length : index;
+}
+
+function rollupSummaryMetadata(rollup: DiagnosticRollup, windowMs: number): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {
+    ...rollup.dimensions,
+    sampleCount: rollup.sampleCount,
+    windowMs
+  };
+  const durationCount = rollup.durationBuckets.reduce((sum, count) => sum + count, 0);
+  if (durationCount > 0) {
+    metadata.p50Ms = durationQuantile(rollup, durationCount, 0.5);
+    metadata.p95Ms = durationQuantile(rollup, durationCount, 0.95);
+    metadata.maxMs = roundMs(rollup.maxMs);
+    metadata.totalMs = roundMs(rollup.totalMs);
+    const histogram = rollup.durationBuckets
+      .map((count, index) => count > 0 ? `${DURATION_BUCKET_BOUNDS_MS[index] ?? 'inf'}:${count}` : '')
+      .filter(Boolean)
+      .join(',');
+    if (histogram.length <= MAX_METADATA_STRING_LENGTH) metadata.histogramMs = histogram;
+  }
+  for (const [key, value] of rollup.counters) metadata[key] = roundMs(value);
+  return metadata;
+}
+
+/** Upper bound of the bucket holding the quantile, capped by the exact maximum. */
+function durationQuantile(rollup: DiagnosticRollup, durationCount: number, quantile: number): number {
+  const target = Math.max(1, Math.ceil(durationCount * quantile));
+  let cumulative = 0;
+  for (let index = 0; index < rollup.durationBuckets.length; index += 1) {
+    cumulative += rollup.durationBuckets[index];
+    if (cumulative >= target) {
+      const bound = DURATION_BUCKET_BOUNDS_MS[index];
+      return roundMs(bound === undefined ? rollup.maxMs : Math.min(bound, rollup.maxMs));
+    }
+  }
+  return roundMs(rollup.maxMs);
+}
+
+function roundMs(value: number): number {
+  return Math.round(value * 1_000) / 1_000;
 }
 
 function buildDiagnosticSpans(events: ReliableDiagnosticEventRecord[]): ReliableDiagnosticSpanRecord[] {
