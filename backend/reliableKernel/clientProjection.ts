@@ -1644,9 +1644,8 @@ export function executeConversationHistoryProjection(
     });
     const hasMore = seedCandidates.length > input.limit;
     const seedRows = seedCandidates.slice(0, input.limit);
-    const totalRow = database.prepare(`
-      SELECT COUNT(*) AS total FROM conversation WHERE ${scope.sql}
-    `).get(scope.params) as { total: bigint };
+    const totalQuery = conversationHistoryTotalQuery(input);
+    const totalRow = database.prepare(totalQuery.sql).get(totalQuery.params) as { total: bigint };
     const seedIds = seedRows.map((row) => String(row.id));
     if (seedIds.length === 0) {
       database.exec('COMMIT');
@@ -1756,7 +1755,7 @@ export function executeConversationHistoryProjection(
 }
 
 function conversationHistoryScopeSql(
-  input: ConversationHistoryProjectionInput,
+  input: Pick<ConversationHistoryProjectionInput, 'scopeKind' | 'projectFolderUri'>,
   alias: string
 ): { sql: string; params: Record<string, string> } {
   if (input.scopeKind === 'all') return { sql: '1 = 1', params: {} };
@@ -1778,6 +1777,29 @@ function conversationHistoryScopeSql(
          AND scope_link.role = 'primary'
          AND scope_project.uri = @projectFolderUri
     )`,
+    params: { projectFolderUri: input.projectFolderUri!.trim() }
+  };
+}
+
+/**
+ * Project totals start from the unique ProjectContext URI and count its primary links through the
+ * project link index. ConversationProjectLink is unique per Conversation and cascades with it, so
+ * this equals the scoped Conversation count without probing every Conversation in the data set.
+ */
+export function conversationHistoryTotalQuery(
+  input: Pick<ConversationHistoryProjectionInput, 'scopeKind' | 'projectFolderUri'>
+): { sql: string; params: Record<string, string> } {
+  if (input.scopeKind !== 'project') {
+    const scope = conversationHistoryScopeSql(input, 'conversation');
+    return { sql: `SELECT COUNT(*) AS total FROM conversation WHERE ${scope.sql}`, params: scope.params };
+  }
+  return {
+    sql: `SELECT COUNT(*) AS total
+            FROM project_context AS scope_project
+            JOIN conversation_project_link AS scope_link
+              ON scope_link.project_context_id = scope_project.id
+           WHERE scope_project.uri = @projectFolderUri
+             AND scope_link.role = 'primary'`,
     params: { projectFolderUri: input.projectFolderUri!.trim() }
   };
 }
