@@ -19,7 +19,7 @@ import {
 import {
   pruneRuntimeDataSetMergeCommits, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeLedger,
   readRuntimeDataSetMergeRequests, removeRuntimeDataSetMergeCommit, removeRuntimeDataSetMergeRequest, runtimeDataSetFingerprint,
-  sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit,
+  runtimeDataSetLastMerge, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit,
   writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeLedgerRecord
 } from './runtimeDataSetMergeLedger';
@@ -224,11 +224,20 @@ export interface RuntimeDataSetMergeBatchResult {
   stopped: boolean;
 }
 
+/** The last merge of a data set, judged against the data sets and source files as they are now. */
+export interface RuntimeDataSetMergedFacts {
+  mergedAt: string;
+  intoCurrent: boolean;
+  /** No data set of this configuration root has the target's identity any more (deleted, reset, unreadable). */
+  targetMissing: boolean;
+  changedSinceMerge: boolean;
+}
+
 export type RuntimeDataSetMergeState =
-  | { state: 'merged'; mergedAt: string; intoCurrent: boolean; changedSinceMerge: boolean }
-  | { state: 'blocked' | 'failed'; code: string; message: string }
-  | { state: 'requested'; requestedAt: string }
-  | { state: 'kept' };
+  | ({ state: 'merged' } & RuntimeDataSetMergedFacts)
+  | { state: 'blocked' | 'failed'; code: string; message: string; lastMerged?: RuntimeDataSetMergedFacts }
+  | { state: 'requested'; requestedAt: string; lastMerged?: RuntimeDataSetMergedFacts }
+  | { state: 'kept'; lastMerged?: RuntimeDataSetMergedFacts };
 
 export class RuntimeDataSetMergeError extends Error {
   public constructor(public readonly code: string, message: string, cause?: unknown) {
@@ -302,8 +311,10 @@ export async function mergeHistoricalDataSetsOnline(
         continue;
       }
       if (!requested) {
-        // Kept by the user, or merged once already (into any data set): explicit request only.
-        if (record?.state === 'merged' || await isVscodeRuntimeDataSetKept(candidate)) continue;
+        // Kept by the user, or merged once already (into any data set, also when a later explicit
+        // attempt ended otherwise): explicit request only. An interrupted commit still converges.
+        if ((record && record.state !== 'committing' && runtimeDataSetLastMerge(record))
+          || await isVscodeRuntimeDataSetKept(candidate)) continue;
         const known = unchanged && (record?.state === 'failed'
           || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, target.identity)));
         if (known && (record.state === 'failed' || record.state === 'blocked')) {
@@ -472,25 +483,28 @@ export async function readRuntimeDataSetMergeStates(
   const requests = await readRuntimeDataSetMergeRequests(storagePaths);
   for (const candidate of inspection.candidates) {
     if (candidate.selected || !candidate.dataSetId) continue;
+    const recorded = ledger.get(candidate.id);
+    const record = recorded && sameRuntimeDataSetIdentity(recorded.source, candidate) ? recorded : undefined;
+    const fingerprint = record ? await runtimeDataSetFingerprint(candidate).catch(() => undefined) : undefined;
+    const unchanged = record !== undefined && sameRuntimeDataSetFingerprint(record.source, fingerprint);
+    const merge = record ? runtimeDataSetLastMerge(record) : undefined;
+    const lastMerged: RuntimeDataSetMergedFacts | undefined = merge && {
+      mergedAt: merge.mergedAt,
+      intoCurrent: sameRuntimeDataSetIdentity(merge.target, current),
+      targetMissing: !inspection.candidates.some((dataSet) => sameRuntimeDataSetIdentity(merge.target, dataSet)),
+      changedSinceMerge: !sameRuntimeDataSetFingerprint(merge.source, fingerprint)
+    };
+    const carried = lastMerged ? { lastMerged } : {};
     const request = requests.get(candidate.id);
     if (request && current && sameRuntimeDataSetIdentity(request.target, current)
       && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId) {
-      result.set(candidate.id, { state: 'requested', requestedAt: request.requestedAt });
-      continue;
-    }
-    const record = ledger.get(candidate.id);
-    const applies = record !== undefined && sameRuntimeDataSetIdentity(record.source, candidate);
-    const fingerprint = applies ? await runtimeDataSetFingerprint(candidate).catch(() => undefined) : undefined;
-    const unchanged = applies && sameRuntimeDataSetFingerprint(record.source, fingerprint);
-    if (applies && record.state === 'merged') {
-      result.set(candidate.id, {
-        state: 'merged', mergedAt: record.mergedAt,
-        intoCurrent: sameRuntimeDataSetIdentity(record.target, current), changedSinceMerge: !unchanged
-      });
-    } else if (applies && unchanged && (record.state === 'failed'
-      || (record.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
-      result.set(candidate.id, { state: record.state, code: record.code, message: record.message });
-    } else if (await isVscodeRuntimeDataSetKept(candidate).catch(() => false)) {
+      result.set(candidate.id, { state: 'requested', requestedAt: request.requestedAt, ...carried });
+    } else if (unchanged && (record?.state === 'failed'
+      || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
+      result.set(candidate.id, { state: record.state, code: record.code, message: record.message, ...carried });
+    } else if (lastMerged) {
+      result.set(candidate.id, { state: 'merged', ...lastMerged });
+    } else if (await isVscodeRuntimeDataSetKept(candidate).catch(() => true)) {
       result.set(candidate.id, { state: 'kept' });
     }
   }

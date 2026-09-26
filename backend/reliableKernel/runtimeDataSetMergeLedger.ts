@@ -36,11 +36,23 @@ export interface RuntimeDataSetIdentity {
   rootInstanceId: string;
 }
 
+/** The last successful merge of this source incarnation, and the source state it merged. */
+export interface RuntimeDataSetLastMerge {
+  target: RuntimeDataSetIdentity;
+  mergedAt: string;
+  source: RuntimeDataSetFingerprint;
+}
+
 export type RuntimeDataSetMergeLedgerRecord = {
   kind: typeof RECORD_KIND;
   candidateId: string;
   source: RuntimeDataSetFingerprint;
   updatedAt: string;
+  /**
+   * Kept on a non-merged record that replaced a merged one of the same source incarnation (a later
+   * explicit attempt that was blocked, failed or interrupted): the earlier merge still happened.
+   */
+  lastMerged?: RuntimeDataSetLastMerge;
 } & (
   /** Written before the row transaction; `commitId` names the exact inserted id set. */
   | { state: 'committing'; target: RuntimeDataSetIdentity; commitId: string }
@@ -107,20 +119,57 @@ export function sameRuntimeDataSetIdentity(
 export async function readRuntimeDataSetMergeLedger(paths: StoragePaths): Promise<Map<string, RuntimeDataSetMergeLedgerRecord>> {
   const result = new Map<string, RuntimeDataSetMergeLedgerRecord>();
   for (const [name, value] of await readDirectoryJson(paths, RECORDS)) {
-    const record = value as Partial<RuntimeDataSetMergeLedgerRecord>;
-    if (record?.kind !== RECORD_KIND || typeof record.candidateId !== 'string' || fileName(record.candidateId) !== name
-      || !record.source || typeof record.source.dataSetId !== 'string'
-      || !['committing', 'merged', 'blocked', 'failed'].includes(String(record.state))) continue;
-    result.set(record.candidateId, record as RuntimeDataSetMergeLedgerRecord);
+    if (isLedgerRecord(value, name)) result.set(value.candidateId, value);
   }
   return result;
 }
 
+function isLedgerRecord(value: unknown, name: string): value is RuntimeDataSetMergeLedgerRecord {
+  const record = value as Partial<RuntimeDataSetMergeLedgerRecord> | null;
+  return record?.kind === RECORD_KIND && typeof record.candidateId === 'string' && fileName(record.candidateId) === name
+    && !!record.source && typeof record.source.dataSetId === 'string'
+    && ['committing', 'merged', 'blocked', 'failed'].includes(String(record.state));
+}
+
+/**
+ * Writes the record of one source. A record other than 'merged' carries the last merge of the same
+ * source incarnation forward, so a later failed attempt never hides that the content was merged.
+ */
 export async function writeRuntimeDataSetMergeLedgerRecord(
   paths: StoragePaths,
-  record: DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt'>
+  record: DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt' | 'lastMerged'>
 ): Promise<void> {
-  await writeLedgerJson(paths, RECORDS, record.candidateId, { kind: RECORD_KIND, ...record, updatedAt: new Date().toISOString() });
+  let lastMerged: RuntimeDataSetLastMerge | undefined;
+  if (record.state !== 'merged') {
+    const previous = await readRuntimeDataSetMergeLedgerRecord(paths, record.candidateId);
+    if (previous && sameRuntimeDataSetIdentity(previous.source, record.source)) lastMerged = runtimeDataSetLastMerge(previous);
+  }
+  await writeLedgerJson(paths, RECORDS, record.candidateId, {
+    kind: RECORD_KIND, ...record, ...(lastMerged ? { lastMerged } : {}), updatedAt: new Date().toISOString()
+  });
+}
+
+/** The merge a record proves happened: its own, or the one it carried forward. */
+export function runtimeDataSetLastMerge(record: RuntimeDataSetMergeLedgerRecord): RuntimeDataSetLastMerge | undefined {
+  return record.state === 'merged'
+    ? { target: record.target, mergedAt: record.mergedAt, source: record.source }
+    : record.lastMerged;
+}
+
+async function readRuntimeDataSetMergeLedgerRecord(
+  paths: StoragePaths,
+  candidateId: string
+): Promise<RuntimeDataSetMergeLedgerRecord | undefined> {
+  const file = await ledgerFile(paths, RECORDS, candidateId);
+  let value: unknown;
+  try { value = JSON.parse(await fs.readFile(file, 'utf8')) as unknown; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    // An unreadable previous record carries nothing forward; a torn file is not a record.
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+  return isLedgerRecord(value, path.basename(file)) ? value : undefined;
 }
 
 /** A recorded, still applicable failure of this exact source state (for startup data-set choice). */

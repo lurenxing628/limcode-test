@@ -10,8 +10,8 @@ import { openRuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeD
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
 import {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
-  type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergeIssue,
-  type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
+  type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergedFacts,
+  type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
 } from '../../backend/reliableKernel/runtimeDataSetMerge';
 import { summarizeRuntimeDataSet, type RuntimeDataSetSummary } from '../../backend/reliableKernel/runtimeDataSetPreflight';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
@@ -85,12 +85,18 @@ function dataSetLabel(
 function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
   if (!merge) return '';
   if (merge.state === 'merged') {
+    if (merge.targetMissing) return ' · 曾合并到的库已不存在或无法读取';
     if (merge.changedSinceMerge) return ' · 已合并，但合并后有新变化';
     return merge.intoCurrent ? ' · 已合并到当前库' : ' · 已合并到其它历史库';
   }
-  if (merge.state === 'blocked' || merge.state === 'failed') return ' · 未能合并';
+  if (merge.state === 'blocked' || merge.state === 'failed') return merge.lastMerged ? ' · 之前合并过，再次合并未成功' : ' · 未能合并';
   if (merge.state === 'requested') return ' · 等待合并';
   return ' · 你保留的库（不自动合并）';
+}
+
+/** The last merge of this data set, whatever happened to later attempts. */
+function lastMergeOf(merge?: RuntimeDataSetMergeState): RuntimeDataSetMergedFacts | undefined {
+  return merge?.state === 'merged' ? merge : merge?.lastMerged;
 }
 
 function dataSetFacts(candidate: VscodeRuntimeDataSetCandidate, summary?: RuntimeDataSetSummary): string {
@@ -228,15 +234,31 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     await vscode.window.showInformationMessage('所选历史库已删除。');
     return;
   }
-  await switchHistory(context, startup, candidate);
+  await switchHistory(context, startup, candidate, mergeStates.get(candidate.id));
 }
 
 function deletionNote(merge?: RuntimeDataSetMergeState): string {
-  if (merge?.state !== 'merged') return '';
-  if (merge.changedSinceMerge) {
-    return '\n\n注意：这个库在合并之后又有新的变化，这些变化不在当前库里，删除会永久丢失它们；需要保留时请先选择“合并到当前库”。';
+  if (!merge) return '';
+  const merged = lastMergeOf(merge);
+  if (!merged) return '\n\n注意：这个库的对话还没有合并到任何库，删除后会永久丢失。';
+  if (merged.targetMissing) {
+    return '\n\n注意：这个库曾合并到的库已被删除、重置或暂时无法读取，这里的对话可能已不在任何现存的库里，删除会永久丢失；'
+      + '需要保留时请先选择“合并到当前库”。';
   }
-  return merge.intoCurrent ? '已合并到当前库的对话和正文不受影响。' : '';
+  if (merged.changedSinceMerge) {
+    return '\n\n注意：这个库在上次合并之后又有改动（例如在这里继续过对话），这些改动没有合并进任何库，删除会永久丢失。'
+      + '只是新建过对话时，可以先选择“合并到当前库”；在已合并的对话里继续过时，再次合并会整体不合并，请保留这个库。';
+  }
+  return merged.intoCurrent ? '已合并到当前库的对话和正文不受影响。' : '这个库的对话已合并到另一个现存的历史库，删除后只能在那个库里看到。';
+}
+
+/** What an explicit merge of a data set merged before is expected to do. */
+function remergeNote(merged?: RuntimeDataSetMergedFacts): string {
+  if (!merged) return '';
+  if (merged.targetMissing) return '\n\n这个库曾合并到的库已不存在或无法读取；这次会把它的对话写入当前库。';
+  if (!merged.intoCurrent || !merged.changedSinceMerge) return '';
+  return '\n\n这个库在上次合并到当前库之后又有改动：只新建过对话时，新对话会合并进来；'
+    + '在已合并的对话里继续过时，那些对话与当前库里的那份不同，会整体不合并并说明原因，这时请保留这个库。';
 }
 
 /**
@@ -249,8 +271,7 @@ async function mergeNow(
   candidate: VscodeRuntimeDataSetCandidate,
   merge?: RuntimeDataSetMergeState
 ): Promise<void> {
-  const changed = merge?.state === 'merged' && merge.changedSinceMerge
-    ? '\n\n这个库在上次合并后又有变化；若同一对话在两边都改过，会整体不合并并说明原因。' : '';
+  const changed = remergeNote(lastMergeOf(merge));
   const confirmed = await vscode.window.showWarningMessage('把这个历史库合并到当前库？', {
     modal: true, detail: `来源：${candidate.runtimeDataRootPath}\n\n在后台合并，不需要重载窗口：先备份当前库，再把对话写入当前库。`
       + '原库保留（已发布的旧格式会先备份并就地升级）；原库里中断的任务按“中止”收尾，不会在当前库被继续执行。'
@@ -269,10 +290,23 @@ async function mergeNow(
   await mergeHistoricalDataSetsInBackground(context, host as HistoricalMergeHost, () => true, [candidate.id]);
 }
 
-async function switchHistory(context: vscode.ExtensionContext, startup: ApplicationStartup, candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
+async function switchHistory(
+  context: vscode.ExtensionContext,
+  startup: ApplicationStartup,
+  candidate: VscodeRuntimeDataSetCandidate,
+  merge?: RuntimeDataSetMergeState
+): Promise<void> {
   if (candidate.selected) { await vscode.window.showInformationMessage('已经在使用这个历史库。'); return; }
+  const merged = lastMergeOf(merge);
+  const mergedHere = merged?.intoCurrent && !merged.changedSinceMerge
+    ? '\n\n这个库的对话已合并到当前库。切换过去后如果在已合并的对话里继续聊天，这个库以后就不能再合并回当前库（会整体不合并）；'
+      + '只新建对话、不动已合并的对话时，新对话以后仍可合并回来。'
+    : '';
   const confirmed = await vscode.window.showWarningMessage('切换当前历史库并重载窗口？', {
-    modal: true, detail: `目标：${candidate.runtimeDataRootPath}\n\n当前窗口的运行会停止。请先关闭其它使用同一数据目录的 VS Code 窗口。所有原历史保留，不合并、不搬移。`
+    modal: true, detail: `目标：${candidate.runtimeDataRootPath}\n\n当前窗口的运行会停止。请先关闭其它使用同一数据目录的 VS Code 窗口。`
+      + '切换本身不合并、不搬移任何数据，所有原历史保留。'
+      + '\n\n切换后，现在的当前库会记为“你保留的库”，以后只在你选择“合并到当前库”时才合并；'
+      + '其它还没合并过、也不是你保留的旧库，会在下次打开时自动合并进新的当前库。' + mergedHere
   }, '切换并重载');
   if (confirmed !== '切换并重载') return;
   const application = startup.current();

@@ -611,7 +611,52 @@ test('library pickers show folder names, conversation counts, last activity and 
 
   const warned = fixture({ mergeStates: changed, picks: [action('delete'), 0], confirmation: '永久删除' });
   await warned.manageRuntimeDataSets(warned.context, warned.startup);
-  assert.match(warned.calls.find(call => call[0] === 'warning')[2].detail, /合并之后又有新的变化.*删除会永久丢失它们/);
+  assert.match(warned.calls.find(call => call[0] === 'warning')[2].detail, /上次合并之后又有改动.*没有合并进任何库，删除会永久丢失/);
+});
+
+test('merge state shows a missing merge target and keeps deletion warnings after a later attempt fails', async () => {
+  const facts = { mergedAt: '2026-09-20', intoCurrent: false, targetMissing: true, changedSinceMerge: false };
+  let shown;
+  const missing = fixture({ mergeStates: { 'workspace:old': { state: 'merged', ...facts } }, picks: [action('merge'), items => { shown = items; return undefined; }] });
+  await missing.manageRuntimeDataSets(missing.context, missing.startup);
+  assert.equal(shown.length, 1, '合并目标已不存在的库重新出现在“合并到当前库”列表里');
+  assert.equal(shown[0].label, '其他历史库 · 旧工作区历史 · 曾合并到的库已不存在或无法读取');
+  const deleting = fixture({ mergeStates: { 'workspace:old': { state: 'merged', ...facts } }, picks: [action('delete'), 0], confirmation: '永久删除' });
+  await deleting.manageRuntimeDataSets(deleting.context, deleting.startup);
+  assert.match(deleting.calls.find(call => call[0] === 'warning')[2].detail, /曾合并到的库已被删除、重置或暂时无法读取.*删除会永久丢失/);
+
+  const elsewhere = fixture({ mergeStates: { 'workspace:old': { state: 'merged', ...facts, targetMissing: false } }, picks: [action('delete'), 0], confirmation: '永久删除' });
+  await elsewhere.manageRuntimeDataSets(elsewhere.context, elsewhere.startup);
+  assert.match(elsewhere.calls.find(call => call[0] === 'warning')[2].detail, /已合并到另一个现存的历史库/);
+
+  const lastMerged = { mergedAt: '2026-09-20', intoCurrent: true, targetMissing: false, changedSinceMerge: true };
+  const blocked = { state: 'blocked', code: 'runtime-data-set-merge-conflict', message: '冲突', lastMerged };
+  const failedAgain = fixture({ mergeStates: { 'workspace:old': blocked }, picks: [action('delete'), items => { shown = items; return items[0]; }], confirmation: '永久删除' });
+  await failedAgain.manageRuntimeDataSets(failedAgain.context, failedAgain.startup);
+  assert.equal(shown[0].label, '其他历史库 · 旧工作区历史 · 之前合并过，再次合并未成功');
+  assert.match(failedAgain.calls.find(call => call[0] === 'warning')[2].detail, /上次合并之后又有改动.*删除会永久丢失/,
+    '再次合并受阻后，删除确认仍警告合并后的改动会丢失');
+
+  const never = fixture({ mergeStates: { 'workspace:old': { state: 'kept' } }, picks: [action('delete'), 0], confirmation: '永久删除' });
+  await never.manageRuntimeDataSets(never.context, never.startup);
+  assert.match(never.calls.find(call => call[0] === 'warning')[2].detail, /还没有合并到任何库，删除后会永久丢失/);
+
+  const remerge = fixture({ application: mergeHost(), mergeStates: { 'workspace:old': blocked }, picks: [action('merge'), 0] });
+  await remerge.manageRuntimeDataSets(remerge.context, remerge.startup);
+  const detail = remerge.calls.find(call => call[0] === 'warning' && call[1] === '把这个历史库合并到当前库？')[2].detail;
+  assert.match(detail, /只新建过对话时，新对话会合并进来.*在已合并的对话里继续过时.*整体不合并/);
+  assert.doesNotMatch(detail, /两边都改过/);
+});
+
+test('switching away explains the kept rule and warns before continuing merged conversations in the target', async () => {
+  const facts = { mergedAt: '2026-09-20', intoCurrent: true, targetMissing: false, changedSinceMerge: false };
+  const f = fixture({ mergeStates: { 'workspace:old': { state: 'merged', ...facts } }, picks: [action('select'), 1] });
+  await f.manageRuntimeDataSets(f.context, f.startup);
+  const detail = f.calls.find(call => call[0] === 'warning' && call[1] === '切换当前历史库并重载窗口？')[2].detail;
+  assert.match(detail, /现在的当前库会记为“你保留的库”，以后只在你选择“合并到当前库”时才合并/);
+  assert.match(detail, /还没合并过、也不是你保留的旧库，会在下次打开时自动合并进新的当前库/);
+  assert.match(detail, /在已合并的对话里继续聊天，这个库以后就不能再合并回当前库.*只新建对话.*新对话以后仍可合并回来/);
+  assert.equal(f.calls.some(call => ['select', 'command'].includes(call[0])), false, '未确认不切换');
 });
 
 test('startup picker names every library and shows a preflight rejection on the library itself', async () => {
