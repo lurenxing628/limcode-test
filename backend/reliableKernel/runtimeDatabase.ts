@@ -552,6 +552,9 @@ export class RuntimeDatabase {
       }
       this.commitListeners.clear();
       await this.worker.terminate();
+      // The worker ignores every request that reached it after 'close', and a graceful exit fails
+      // none of them. Reject them here, or an owner operation awaiting one would hold close forever.
+      this.failPending(new Error('RuntimeDatabase is closed.'));
       await this.conversationOwners.close().catch(() => undefined);
       await this.unregisterHostLiveness().catch(() => undefined);
       this.performanceMetricSinks.clear();

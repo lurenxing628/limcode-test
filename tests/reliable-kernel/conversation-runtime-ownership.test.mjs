@@ -969,6 +969,54 @@ test('运行时维护等待存活持有者、接管死亡持有者，宿主离�
   }
 });
 
+test('关闭数据库时，晚于关闭请求的请求被拒绝，等待它的归属操作随之结束', { timeout: 60_000 }, async () => {
+  const { outer, binding } = await createIsolatedRoot('close-race');
+  const database = await openObserverDatabase(binding, 'close-race-host');
+  try {
+    const worker = database['worker'];
+    const post = worker.postMessage.bind(worker);
+    // The worker closes its port after answering 'close' and exits on its own with code 0; a
+    // forced terminate would exit with code 1 and hide the gap behind the crash path.
+    const exitCode = new Promise((resolve) => worker.once('exit', resolve));
+    worker.terminate = () => exitCode;
+    let started;
+    const running = new Promise((resolve) => { started = resolve; });
+    let sendLate;
+    const lateRequest = new Promise((resolve) => { sendLate = resolve; });
+    // An owner operation already in flight whose next request reaches the worker right after 'close'.
+    const late = database.conversationOwners.run('conversation-close-race', () => {
+      started();
+      return lateRequest;
+    }).then(() => 'answered', (error) => error);
+    await running;
+    let lateSent = false;
+    worker.postMessage = (message) => {
+      post(message);
+      if (message.kind === 'close' && !lateSent) {
+        lateSent = true;
+        sendLate(database['sendRequest']({ kind: 'conversationRuntimeWork', conversationId: 'conversation-close-race' }));
+      }
+    };
+    const closed = await Promise.race([
+      database.close().then(() => 'closed'),
+      new Promise((resolve) => setTimeout(() => resolve('hung'), 10_000))
+    ]);
+    assert.equal(closed, 'closed', '关闭必须完成');
+    assert.equal(await exitCode, 0, 'worker 在关闭后自行正常退出');
+    assert.ok(lateSent, '关闭请求之后确实发出了一个请求');
+    const settled = await Promise.race([late, new Promise((resolve) => setTimeout(() => resolve('hung'), 5_000))]);
+    assert.notEqual(settled, 'hung', '等待迟到请求的归属操作必须结束，而不是永远占着这个对话');
+    assert.match(String(settled?.message), /closed/);
+  } finally {
+    // A hung close must fail this test, not the whole file.
+    await Promise.race([
+      database.close().catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 1_000))
+    ]);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 test('共享配置根准入期间新作用域注册不得绕过，死亡准入持有者可被接管（跨进程准入证明）', {
   timeout: 240_000
 }, async () => {
