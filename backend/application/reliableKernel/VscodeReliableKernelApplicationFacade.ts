@@ -5,7 +5,8 @@ import type { StorageDataResetResult } from '../../capabilities/types';
 import { mapSettledWithBoundedConcurrency } from '../../capabilities/boundedConcurrency';
 import { loadCommittedGlobalStatus, resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/vscodeStorage/paths';
-import { RUNTIME_KERNEL_EPOCH } from '../../reliableKernel/contracts';
+import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths, type RuntimeRootPaths } from '../../reliableKernel/contracts';
+import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
@@ -559,6 +560,22 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public handleReliableKernelControl(clientId: BridgeClientId, message: unknown): Promise<boolean> {
     return this.product.application.webviewFeed.handleControl(clientId, message);
+  }
+
+  /** Root and Host identity used by cooperative exclusive maintenance on the selected data set. */
+  public exclusiveMaintenanceTarget(): { paths: RuntimeRootPaths; hostBootId: string } {
+    this.requireOpen();
+    return {
+      paths: createRuntimeRootPaths(this.runtimePlacement.runtimeDataRootPath),
+      hostBootId: this.product.application.database.hostBootId
+    };
+  }
+
+  /** True while this Host still holds an ExecutionLease: a reload now would interrupt that work. */
+  public async hasOwnedExecution(): Promise<boolean> {
+    this.requireOpen();
+    const database = this.product.application.database;
+    return (await listAllDomainRows(database, 'ExecutionLease', { host_boot_id: database.hostBootId })).length > 0;
   }
 
   public async dispose(): Promise<void> {

@@ -8,6 +8,7 @@ import type { VscodeReliableKernelApplicationFacade } from '../backend/applicati
 import { EXTENSION_BRAND } from '../shared/extensionIdentity';
 
 let backendApp: VscodeReliableKernelApplicationFacade | undefined;
+let exclusiveMaintenanceParticipant: { dispose(): Promise<void> } | undefined;
 let activeStartup: ApplicationStartup | undefined;
 let activeContext: vscode.ExtensionContext | undefined;
 
@@ -80,6 +81,16 @@ async function startApplication(
       },
       (error) => console.error(`${EXTENSION_BRAND} settings watcher failed to load.`, error)
     );
+    // Other windows may later ask for a short exclusive window (historical merge); take part.
+    void import('./runtimeExclusiveMaintenance').then(
+      ({ startExclusiveMaintenanceParticipant }) => {
+        if (activeStartup !== startup || backendApp !== application) return;
+        exclusiveMaintenanceParticipant = startExclusiveMaintenanceParticipant(application, {
+          isCurrent: () => activeStartup === startup && backendApp === application
+        });
+      },
+      (error) => console.warn(`${EXTENSION_BRAND} exclusive maintenance participation failed to start.`, error)
+    );
     void import('../backend/application/runtimeBuildInfo').then(
       ({ RUNTIME_BUILD_INFO }) => console.log(
         `${EXTENSION_BRAND} Runtime build information.`,
@@ -123,11 +134,14 @@ export async function deactivate(): Promise<void> {
   backendApp = undefined;
   const context = activeContext;
   activeContext = undefined;
+  const participant = exclusiveMaintenanceParticipant;
+  exclusiveMaintenanceParticipant = undefined;
+  const participation = participant ? participant.dispose().catch(() => undefined) : Promise.resolve();
   // Stop the current application's work immediately while any in-flight historical upgrade
   // finishes its durable boundary, including history commands used without a running Runtime.
   const upgrades = context ? stopRuntimeDataSetUpgrades(context) : Promise.resolve();
   const pending = startup?.pending();
   const disposal = app ? app.dispose() : pending?.then(application => application.dispose(), () => undefined);
-  const [disposed] = await Promise.allSettled([disposal, upgrades]);
+  const [disposed] = await Promise.allSettled([disposal, upgrades, participation]);
   if (disposed.status === 'rejected') throw disposed.reason;
 }

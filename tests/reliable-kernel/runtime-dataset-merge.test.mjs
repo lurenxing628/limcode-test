@@ -18,6 +18,7 @@ const {
   mergeRuntimeDataSetIntoTarget, mergeRuntimeDataSetsIntoSelected, precopyRuntimeDataSetCas,
   readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
+const { registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot,
   selectVscodeRuntimeDataSet
@@ -258,6 +259,41 @@ test('当前库仍有其它窗口时不合并；来源被旧窗口占用时单�
   const partial = await mergeRuntimeDataSetsIntoSelected(fixture.paths);
   assert.deepEqual(partial.deferred.map((item) => item.candidateId), [fixture.alpha.id]);
   assert.deepEqual(partial.merged.map((item) => item.candidateId), [fixture.beta.id]);
+});
+
+test('当前库被参与协作的窗口使用时，在准入内等它让出后完成合并', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_coordinated', project: SHARED_PROJECT }]);
+  const targetHost = await publishHost(fixture.current.binding);
+  const participant = await registerExclusiveMaintenanceParticipant(fixture.current.binding.paths, 'fixture-host');
+  const events = [];
+  const report = await mergeRuntimeDataSetsIntoSelected(fixture.paths, {
+    coordinateTargetHosts: (targetPaths, merge) => requestExclusiveRuntimeMaintenance(targetPaths, {
+      operation: 'historical-merge', message: '为合并旧聊天记录', timeoutMs: 5_000, pollMs: 10,
+      onWaitStart: () => {
+        events.push('wait');
+        // The other window reloads once idle; its Runtime closes and its liveness disappears.
+        setTimeout(() => { void participant.unregister().then(() => fs.rm(targetHost)); }, 20);
+      }
+    }, async () => { events.push('merge'); await merge(); })
+  });
+  assert.deepEqual(events, ['wait', 'merge']);
+  assert.deepEqual(report.targetHostsActive, []);
+  assert.deepEqual(report.merged.map((item) => item.candidateId), [fixture.alpha.id]);
+
+  // A failed coordination (an older window cannot take part, or the wait timed out) changes nothing.
+  const gamma = await initializeScope(fixture.paths, 'gamma');
+  await seed(gamma, [{ id: 'conversation_gamma_waiting', project: SHARED_PROJECT }]);
+  await publishHost(fixture.current.binding);
+  const before = targetDigest(fixture.current);
+  const waiting = await mergeRuntimeDataSetsIntoSelected(fixture.paths, {
+    coordinateTargetHosts: (targetPaths, merge) => requestExclusiveRuntimeMaintenance(targetPaths, {
+      operation: 'historical-merge', message: '为合并旧聊天记录', timeoutMs: 50, pollMs: 10
+    }, merge)
+  });
+  assert.equal(waiting.targetHostsActive.length, 1);
+  assert.deepEqual(waiting.merged, []);
+  assert.equal(targetDigest(fixture.current), before);
 });
 
 test('迁移复用：CAS 在线预复制到另一文件系统上的全新空根，独占时只补增量并携带未完成工作', async (t) => {

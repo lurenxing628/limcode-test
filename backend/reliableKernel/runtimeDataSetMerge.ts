@@ -7,7 +7,7 @@ import Database from 'better-sqlite3';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { storageKeyForDigest } from './contentAddressedStore';
-import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import { RUNTIME_KERNEL_EPOCH, type RootBinding, type RuntimeRootPaths } from './contracts';
 import { assertCurrentSchema, auditDatabaseIntegrity, configureWriterConnection } from './databaseSchema';
 import { type HistoricalRootBinding } from './rootAuthority';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
@@ -15,6 +15,7 @@ import {
   assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance,
   type RuntimeHostActiveDescriptor
 } from './runtimeHostControl';
+import type { RuntimeExclusiveMaintenanceOutcome } from './runtimeExclusiveMaintenance';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import {
   assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet
@@ -156,6 +157,15 @@ export interface RuntimeDataSetMergeBatchOptions extends RuntimeDataSetMergeOpti
   /** Called once, only when at least one source actually needs work. */
   onWorkStart?(total: number): void;
   onSourceStart?(candidate: VscodeRuntimeDataSetCandidate, index: number, total: number): void;
+  /**
+   * Called under the batch's configuration admission and target maintenance claim when other Hosts
+   * use the target. Typically {@link requestExclusiveRuntimeMaintenance}: wait, bounded, for the
+   * participating windows to reload, then run `merge`. Without it such a batch is only reported.
+   */
+  coordinateTargetHosts?(
+    targetPaths: RuntimeRootPaths,
+    merge: () => Promise<void>
+  ): Promise<RuntimeExclusiveMaintenanceOutcome<void>>;
 }
 
 export interface RuntimeDataSetMergeBatchResult {
@@ -329,7 +339,13 @@ export async function mergeRuntimeDataSetsIntoSelected(
         await assertRuntimeHostsOffline(target.binding.paths);
       } catch (error) {
         if (!isRuntimeHostsActiveError(error)) throw error;
-        report.targetHostsActive = [...(error as { hosts: RuntimeHostActiveDescriptor[] }).hosts];
+        const hosts = [...(error as { hosts: RuntimeHostActiveDescriptor[] }).hosts];
+        if (!options.coordinateTargetHosts) {
+          report.targetHostsActive = hosts;
+          return report;
+        }
+        const outcome = await options.coordinateTargetHosts(target.binding.paths, () => mergeSources());
+        if (outcome.state !== 'completed') report.targetHostsActive = outcome.hosts;
         return report;
       }
       await mergeSources();

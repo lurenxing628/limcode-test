@@ -11,6 +11,7 @@ import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../b
 import { mergeRuntimeDataSetsIntoSelected, type RuntimeDataSetMergeBatchResult } from '../../backend/reliableKernel/runtimeDataSetMerge';
 import { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } from '../../backend/reliableKernel/runtimeStorageInspection';
 import type { ApplicationStartup } from '../ApplicationStartup';
+import { runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 
@@ -207,7 +208,8 @@ async function upgradeHistoryBeforeRead(
  * Runs inside Runtime open, after the selected root is prepared and before this Host registers,
  * so the selected data set can be changed offline. Historical workspace scopes (and explicitly
  * requested data sets) are merged into it without confirmation. It never throws and never waits
- * for user input: notifications are fire-and-forget because admission is still held.
+ * for user input: notifications are fire-and-forget because admission is still held; the only wait
+ * is the bounded, cancellable one for other windows of this data set to finish work and reload.
  */
 export async function mergeHistoricalDataSetsBeforeOpen(
   context: vscode.ExtensionContext,
@@ -228,7 +230,16 @@ export async function mergeHistoricalDataSetsBeforeOpen(
         void vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在合并旧聊天记录' },
           reporter => { progress = reporter; return done; });
       },
-      onSourceStart: (_candidate, index, total) => progress?.report({ message: `${index + 1}/${total}` })
+      onSourceStart: (_candidate, index, total) => progress?.report({ message: `${index + 1}/${total}` }),
+      // Other windows still use the selected data set: participating windows reload once idle and
+      // then wait on this admission. Older windows cannot take part, so there is no wait for them.
+      coordinateTargetHosts: (targetPaths, merge) => runWithExclusiveMaintenance(targetPaths, {
+        operation: 'historical-merge',
+        message: '为合并旧聊天记录',
+        waitingTitle: '正在等待其它窗口空闲后合并旧聊天记录',
+        timeoutMs: 60_000,
+        isCurrent: stillCurrent
+      }, merge)
     }));
   } catch (error) {
     console.error('[LimCode] 旧聊天记录合并检查失败。', error);
@@ -271,7 +282,7 @@ async function reportHistoricalMerge(
   if (!stillCurrent()) return;
   if (waiting && announce) {
     void vscode.window.showInformationMessage(
-      `有 ${report.pendingSources} 份旧聊天记录等待合并。其它窗口仍在使用当前库，`
+      `有 ${report.pendingSources} 份旧聊天记录等待合并。其它窗口仍在使用当前库（可能正在执行任务或是旧版本），`
       + '下次只有本窗口使用时会自动完成；也可以关闭其它窗口后重载本窗口。'
     );
   }

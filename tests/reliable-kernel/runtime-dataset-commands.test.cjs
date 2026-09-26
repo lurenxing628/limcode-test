@@ -31,7 +31,7 @@ function fixture({
   picks = [], confirmation, application, currentEpoch = 5, oldEpoch = 5,
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
-  mergeReport = emptyMergeReport(), mergeError, mergeHook, globalState,
+  mergeReport = emptyMergeReport(), mergeError, mergeHook, coordinatedReport, globalState,
   lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {})
 } = {}) {
   const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current' };
@@ -94,6 +94,12 @@ function fixture({
         calls.push(['merge-batch', options.shouldContinue()]);
         if (mergeHook) await mergeHook(options);
         if (mergeError) throw mergeError;
+        if (mergeReport.targetHostsActive.length && options.coordinateTargetHosts) {
+          let merged = false;
+          const outcome = await options.coordinateTargetHosts({ dataRootPath: '/fixture/current' }, async () => { merged = true; });
+          calls.push(['coordinated', outcome.state, merged]);
+          return outcome.state === 'completed' ? coordinatedReport : mergeReport;
+        }
         return mergeReport;
       }
     },
@@ -111,7 +117,14 @@ function fixture({
       deleteUnselectedRuntimeDataSet: async (_paths, id, expected) => calls.push(['delete', id, expected])
     },
     '../../shared/extensionIdentity': { EXTENSION_COMMAND_IDS: { resetDevelopmentData: 'reset' } },
-    '../runtimeDataSetUpgradeLifetime': lifetime
+    '../runtimeDataSetUpgradeLifetime': lifetime,
+    '../runtimeExclusiveMaintenance': {
+      async runWithExclusiveMaintenance(paths, input, operation) {
+        calls.push(['exclusive', paths.dataRootPath, input.operation, input.message, input.timeoutMs, input.isCurrent()]);
+        if (coordinatedReport === undefined) return { state: 'timed-out', hosts: [] };
+        return { state: 'completed', result: await operation(), waited: true };
+      }
+    }
   };
   const filename = path.resolve(__dirname, '../../vscode/commands/runtimeDataSetManagement.ts');
   const module = { exports: {} };
@@ -323,6 +336,12 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
     },
     './commands/runtimeDataSetManagement': management,
     './watchers/GlobalSettingsWatcher': { registerGlobalSettingsWatcher() {} },
+    './runtimeExclusiveMaintenance': {
+      startExclusiveMaintenanceParticipant(host, options) {
+        events.push(['participant-start', host === application, options.isCurrent()]);
+        return { async dispose() { events.push('participant-dispose'); } };
+      }
+    },
     '../backend/application/runtimeBuildInfo': { RUNTIME_BUILD_INFO: {} }
   }, {
     setImmediate,
@@ -464,10 +483,27 @@ test('startup merge reports new blocks once, stays silent for known blocks and n
   assert.match(failing.calls.find(call => call[0] === 'warning')[1], /暂时无法合并.*磁盘已满/);
   const busy = fixture({ mergeReport: emptyMergeReport({ targetHostsActive: [{ hostBootId: 'peer', state: 'live' }], pendingSources: 2 }) });
   await busy.mergeHistoricalDataSetsBeforeOpen(busy.context);
+  assert.deepEqual(busy.calls.filter(call => ['exclusive', 'coordinated'].includes(call[0])), [
+    ['exclusive', '/fixture/current', 'historical-merge', '为合并旧聊天记录', 60_000, true],
+    ['coordinated', 'timed-out', false]
+  ]);
   assert.match(busy.calls.find(call => call[0] === 'info')[1], /有 2 份旧聊天记录等待合并.*关闭其它窗口后重载本窗口/);
   const obsolete = fixture();
   await obsolete.mergeHistoricalDataSetsBeforeOpen(obsolete.context, () => false);
   assert.equal(obsolete.calls.some(call => call[0] === 'merge-batch'), false);
+});
+
+test('startup merge asks other windows for exclusivity and reports the merge done after they reloaded', async () => {
+  const f = fixture({
+    mergeReport: emptyMergeReport({ targetHostsActive: [{ hostBootId: 'peer', state: 'live' }], pendingSources: 1 }),
+    coordinatedReport: emptyMergeReport({
+      merged: [{ candidateId: 'workspace:old', insertedRows: 4, insertedConversations: 1, backupPath: '/fixture/merge-backup' }]
+    })
+  });
+  await f.mergeHistoricalDataSetsBeforeOpen(f.context);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'coordinated'), [['coordinated', 'completed', true]]);
+  assert.match(f.calls.find(call => call[0] === 'info')[1], /已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话）/);
+  assert.equal(f.calls.some(call => ['warning', 'pick', 'select', 'command'].includes(call[0])), false);
 });
 
 test('startup notices about old libraries appear once per cause and again when the cause changes', async () => {
@@ -521,4 +557,27 @@ test('extension runs the historical merge inside Runtime open, before the Host i
   release();
   await merging;
   assert.equal(f.calls.some(call => ['pick', 'warning', 'select', 'command'].includes(call[0])), false);
+});
+
+test('extension joins exclusive maintenance only after Runtime ready and leaves it on deactivation', async t => {
+  const f = extensionEntryFixture();
+  t.after(async () => {
+    f.opened.resolve(f.application);
+    f.finishUpgrade.resolve();
+    await f.deactivate();
+  });
+  f.activate(f.context);
+  const ready = f.startup.wait();
+  await f.opening.promise;
+  await new Promise(setImmediate);
+  assert.equal(f.events.some(event => Array.isArray(event) && event[0] === 'participant-start'), false);
+  f.opened.resolve(f.application);
+  await ready;
+  for (let i = 0; i < 5 && !f.events.some(event => Array.isArray(event) && event[0] === 'participant-start'); i += 1) {
+    await new Promise(setImmediate);
+  }
+  assert.deepEqual(f.events.find(event => Array.isArray(event) && event[0] === 'participant-start'), ['participant-start', true, true]);
+  f.finishUpgrade.resolve();
+  await f.deactivate();
+  assert.equal(f.events.filter(event => event === 'participant-dispose').length, 1);
 });
