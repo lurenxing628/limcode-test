@@ -23,6 +23,7 @@ import type { RootBinding, RuntimeCommitResult } from '../../reliableKernel/cont
 import type { ConversationHistoryPageBoundary as HistoryPageBoundary } from '../../reliableKernel/databaseWorkerProtocol';
 import {
   assertRuntimeHostsOffline,
+  openUnderCurrentDataRootAdmission,
   withRuntimeDataRootAdmission,
   withRuntimeMaintenance
 } from '../../reliableKernel/runtimeHostControl';
@@ -173,13 +174,15 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       beforeRuntimeOpen?(): Promise<void>;
     } = {}
   ): Promise<VscodeReliableKernelApplicationFacade> {
-    await loadCommittedGlobalStatus(context);
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
     let facade: VscodeReliableKernelApplicationFacade | undefined;
     // The data-root admission serializes placement/cutover across every workspace scope sharing
     // this configuration root. It is acquired before placement resolution and the scope
     // maintenance claim nests inside it; both lock orders (open and reset) agree.
-    return withRuntimeDataRootAdmission(path.resolve(getPaths().globalStoragePath), async () => {
+    return openUnderCurrentDataRootAdmission(async () => {
+      await loadCommittedGlobalStatus(context);
+      return getPaths().globalStoragePath;
+    }, async () => {
       const runtimePlacement = await resolveVscodeWorkspaceRuntimePlacement(
         getPaths(),
         resolveVscodeWorkspaceRuntimeScope({

@@ -14,6 +14,9 @@ const { RootAuthority } = kernelFile('rootAuthority.js');
 const { resolveVscodeRuntimeDataRoot } = kernelFile('vscodeRootAuthority.js');
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
 const {
+  isRuntimeDataRootAdmissionHeld, openUnderCurrentDataRootAdmission, withRuntimeDataRootAdmission
+} = kernelFile('runtimeHostControl.js');
+const {
   readExclusiveMaintenanceRequest, registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance,
   runtimeExclusiveMaintenanceDirectory
 } = kernelFile('runtimeExclusiveMaintenance.js');
@@ -127,6 +130,43 @@ test('过期请求或请求方进程已不存在的请求不会让窗口重载�
     await participant.unregister();
   }
   await assert.rejects(registerExclusiveMaintenanceParticipant(paths, '../escape'), /safe file name/);
+});
+
+test('打开运行时时若数据目录在等待 admission 期间已迁移，放开旧根并在新根的 admission 内打开', async (t) => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-admission-follow-'));
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  const oldRoot = path.join(parent, 'old');
+  const newRoot = path.join(parent, 'new');
+  let current = oldRoot;
+  let held;
+  const migrationHeld = new Promise((resolve) => { held = resolve; });
+  let finish;
+  const migrationGate = new Promise((resolve) => { finish = resolve; });
+  // The migration holds the old root's admission, publishes the new root, then releases.
+  const migration = withRuntimeDataRootAdmission(oldRoot, async () => {
+    held();
+    await migrationGate;
+    current = newRoot;
+  });
+  await migrationHeld;
+  let opens = 0;
+  const opening = openUnderCurrentDataRootAdmission(async () => current, async () => {
+    opens += 1;
+    return { root: current, oldHeld: isRuntimeDataRootAdmissionHeld(oldRoot), newHeld: isRuntimeDataRootAdmissionHeld(newRoot) };
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(opens, 0, 'waits on the admission');
+  finish();
+  await migration;
+  assert.deepEqual(await opening, { root: newRoot, oldHeld: false, newHeld: true });
+  assert.equal(opens, 1);
+
+  let flips = 0;
+  await assert.rejects(openUnderCurrentDataRootAdmission(
+    async () => ((flips += 1) % 2 ? oldRoot : newRoot),
+    async () => assert.fail('must not open'),
+    3
+  ), /数据目录在打开期间反复变化/);
 });
 
 async function createRoot(t) {

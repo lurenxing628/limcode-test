@@ -172,6 +172,36 @@ export async function withRuntimeDataRootAdmission<T>(
   );
 }
 
+/**
+ * Runs `open` under the configuration-root admission of the root that is current once that
+ * admission is held. A data-root migration can publish a new root while this Host waits on the old
+ * root's admission (its window was reloaded for that migration): the root is read again under the
+ * admission, and when it moved the old admission is released and the new root's taken instead, so a
+ * Host never registers on a root that was just migrated away.
+ */
+export async function openUnderCurrentDataRootAdmission<T>(
+  readConfigurationRoot: () => Promise<string>,
+  open: () => Promise<T>,
+  maxAttempts = 5
+): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    const admissionRoot = path.resolve(await readConfigurationRoot());
+    const opened = await withRuntimeDataRootAdmission(admissionRoot, async () => {
+      if (comparablePath(await readConfigurationRoot()) !== comparablePath(admissionRoot)) return { moved: true } as const;
+      return { moved: false, value: await open() } as const;
+    });
+    if (!opened.moved) return opened.value;
+    if (attempt >= maxAttempts) {
+      throw new Error('数据目录在打开期间反复变化，本窗口没有打开运行时；请重载窗口后再试。');
+    }
+  }
+}
+
+function comparablePath(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 async function withRuntimeClaim<T>(
   claimPath: string,
   targetPath: string,
@@ -254,6 +284,14 @@ export async function assertRuntimeHostsOffline(
     });
   }
   if (active.length > 0) throw new RuntimeHostsActiveError(active);
+}
+
+/** True only inside a live {@link withRuntimeDataRootAdmission} scope for this configuration root. */
+export function isRuntimeDataRootAdmissionHeld(configurationRootPath: string): boolean {
+  const claimPath = runtimeDataRootAdmissionClaimPath(path.resolve(
+    requireNonEmptyText(configurationRootPath, 'configurationRootPath')
+  ));
+  return RUNTIME_MAINTENANCE_SCOPE.getStore()?.get(claimPath)?.active === true;
 }
 
 interface RuntimeHostLivenessRecord {
