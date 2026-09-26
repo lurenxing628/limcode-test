@@ -10,7 +10,9 @@ import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { storageKeyForDigest } from './contentAddressedStore';
 import { RUNTIME_KERNEL_EPOCH, type RootBinding, type RuntimeRootPaths } from './contracts';
 import { assertCurrentSchema } from './databaseSchema';
-import { DOMAIN_REPOSITORIES, HISTORICAL_COPY_DOMAINS, type DomainRow, type RepositoryTransactionStep } from './repositories';
+import {
+  DOMAIN_REPOSITORIES, HISTORICAL_COPY_DOMAINS, savepoint, type DomainRow, type RepositoryTransactionStep
+} from './repositories';
 import type { HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import {
@@ -18,8 +20,9 @@ import {
 } from './runtimeDataSetMergeWork';
 import {
   pruneRuntimeDataSetMergeCommits, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeLedger,
-  readRuntimeDataSetMergeRequests, removeRuntimeDataSetMergeCommit, removeRuntimeDataSetMergeRequest, runtimeDataSetFingerprint,
-  runtimeDataSetLastMerge, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit,
+  readRuntimeDataSetMergeRequests, removeRuntimeDataSetMergeCommit, removeRuntimeDataSetMergeLedgerRecord,
+  removeRuntimeDataSetMergeRequest, runtimeDataSetFingerprint, runtimeDataSetLastMerge,
+  sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit,
   writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeLedgerRecord
 } from './runtimeDataSetMergeLedger';
@@ -804,6 +807,7 @@ async function mergePreparedSource(
       throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `复制正文文件时出错，稍后重试：${errorMessage(error)}` });
     });
   await fault(options, 'after-cas-transfer');
+  const previous = record ? (await readRuntimeDataSetMergeLedger(paths)).get(candidate.id) : undefined;
   const commitId = record ? await writeRuntimeDataSetMergeCommit(paths, plan.inserted) : undefined;
   if (commitId !== undefined) {
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
@@ -815,8 +819,17 @@ async function mergePreparedSource(
     try {
       await target.database.transaction(plan.steps);
     } catch (error) {
-      // Nothing was committed (one transaction); the committing record converges next time.
-      throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `写入当前库时出错，稍后重试：${errorMessage(error)}` });
+      // One transaction: measured, it either committed completely (only its reply was lost) or
+      // not at all. A proven rollback drops the committing record at once; an unknown outcome
+      // (the target is gone) keeps it for the next startup to converge.
+      const presence = await insertedRowsPresence(plan.inserted, target.database).catch(() => undefined);
+      if (presence === 'none' && commitId !== undefined) {
+        await restoreLedgerRecord(paths, candidate.id, previous);
+        await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
+      }
+      if (presence !== 'all') {
+        throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `写入当前库时出错，稍后重试：${errorMessage(error)}` });
+      }
     }
   }
   await fault(options, 'after-row-commit');
@@ -892,7 +905,18 @@ async function planRows(source: Database.Database, target: RuntimeDatabase): Pro
           continue;
         }
         const inserted = renumbered ? { ...row, [renumbered]: (row[renumbered] as bigint) + offset } : row;
-        plan.steps.push(historical && !notStarted(row) ? repository.insertHistoricalCopy(inserted) : repository.insert(inserted));
+        if (allowed) {
+          // Another window may create the same content-derived identity before this commit: inside
+          // the transaction it is inserted only when still absent, else compared like above.
+          plan.steps.push(savepoint(`merge_identity_${plan.steps.length}`, [repository.insert(inserted)], {
+            kind: 'rollback-and-continue-on-unique',
+            constraints: uniqueIdentities(schema).map((columns) => ({ domain: schema.key, columns }))
+          }), repository.assert(id, Object.fromEntries(schema.columns
+            .filter((column) => column.name !== 'id' && !allowed.has(column.name))
+            .map((column) => [column.name, inserted[column.name]]))));
+        } else {
+          plan.steps.push(historical && !notStarted(row) ? repository.insertHistoricalCopy(inserted) : repository.insert(inserted));
+        }
         plan.inserted.push([schema.key, id]);
         if (schema.key === 'Conversation') plan.insertedConversations += 1;
       }
@@ -910,6 +934,18 @@ async function planRows(source: Database.Database, target: RuntimeDatabase): Pro
   return plan;
 }
 
+/** The id and every declared UNIQUE column set of a domain (any of them can reject a duplicate). */
+function uniqueIdentities(schema: (typeof RUNTIME_DOMAIN_SCHEMAS)[number]): string[][] {
+  const sets = new Map<string, string[]>([['id', ['id']]]);
+  for (const index of schema.indexes) {
+    const match = /^(.+?) UNIQUE(?: WHERE .*)?$/.exec(index);
+    if (!match) continue;
+    const columns = match[1].split(',').map((column) => column.trim());
+    sets.set([...columns].sort().join(','), columns);
+  }
+  return [...sets.values()];
+}
+
 async function maximumValue(database: RuntimeDatabase, domain: string, column: string): Promise<bigint> {
   const rows = (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({
     orderBy: { column, direction: 'desc' }, limit: 1
@@ -925,14 +961,38 @@ async function commitPresence(
   database: RuntimeDatabase
 ): Promise<'all' | 'none' | 'partial'> {
   const commit = await readRuntimeDataSetMergeCommit(paths, commitId);
-  if (!commit || commit.rows.length === 0) return 'none';
+  return commit ? insertedRowsPresence(commit.rows, database) : 'none';
+}
+
+/**
+ * Presence of a merge's inserted rows in the target, counting only rows that exist nowhere else:
+ * a content-derived identity (content, project, attachment, observation) may appear in the target
+ * independently at any time (another window opens the same folder or stores the same bytes), so it
+ * is no evidence of this commit.
+ */
+async function insertedRowsPresence(
+  inserted: ReadonlyArray<readonly [domain: string, id: string]>,
+  database: RuntimeDatabase
+): Promise<'all' | 'none' | 'partial'> {
+  const evidence = inserted.filter(([domain]) => !IDENTITY_MERGE_DIFFERENCES.has(domain));
+  if (evidence.length === 0) return 'none';
   let present = 0;
-  for (let start = 0; start < commit.rows.length; start += READ_CHUNK) {
-    const rows = commit.rows.slice(start, start + READ_CHUNK);
+  for (let start = 0; start < evidence.length; start += READ_CHUNK) {
+    const rows = evidence.slice(start, start + READ_CHUNK);
     const found = (await database.snapshot(rows.map(([domain, id]) => DOMAIN_REPOSITORIES.domain(domain).get(id)))).snapshot;
     present += found.filter((row) => row !== null).length;
   }
-  return present === 0 ? 'none' : present === commit.rows.length ? 'all' : 'partial';
+  return present === 0 ? 'none' : present === evidence.length ? 'all' : 'partial';
+}
+
+/** Puts back the record a committing record replaced (none: the source had no record). */
+async function restoreLedgerRecord(
+  paths: { globalStoragePath: string },
+  candidateId: string,
+  previous: RuntimeDataSetMergeLedgerRecord | undefined
+): Promise<void> {
+  if (previous) await writeRuntimeDataSetMergeLedgerRecord(paths, previous);
+  else await removeRuntimeDataSetMergeLedgerRecord(paths, candidateId);
 }
 
 async function transferCas(

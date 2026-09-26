@@ -35,6 +35,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-09-26T00:00:00.000Z';
 const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
 const SHARED_PROJECT = { uri: 'file:///workspace/shared', name: 'shared' };
+const ALPHA_PROJECT = { uri: 'file:///workspace/alpha', name: 'alpha' };
 const SHARED_TEXT = JSON.stringify({ role: 'user', parts: [{ text: '各工作区都用过的同一段正文' }] });
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 
@@ -393,6 +394,8 @@ test('审查 #6：提交前当前库少了一行复用行时事务整体回滚�
   assert.deepEqual(report.merged, []);
   assert.equal(report.deferred.length, 1);
   assert.match(report.deferred[0].message, /写入当前库时出错/);
+  assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '复审 merge2 #1：确定回滚后立即撤掉 committing 记录');
+  assert.deepEqual(await fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'commits')), []);
   const target = readDatabase(fixture.current);
   try {
     assert.equal(target.count('conversation', 'id = ?', 'conversation_alpha_reuse'), 0, '事务整体回滚');
@@ -407,6 +410,55 @@ test('审查 #6：提交前当前库少了一行复用行时事务整体回滚�
     assert.equal(after.count('conversation', 'id = ?', 'conversation_alpha_reuse'), 1);
     assert.equal(after.count('content_object', 'sha256 = ?', sha256(orphan)), 1, '缺的那一行按来源补回');
   } finally { after.close(); }
+});
+
+test('复审 merge2 #1：提交前被杀后当前库独立出现同一项目（内容派生身份）不算“已有增删”，下次启动照常合并', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_current_folder', project: SHARED_PROJECT }]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_folder', project: ALPHA_PROJECT }]);
+  const killed = await runChild(['kill', fixture.root, 'before-row-commit', fixture.alpha.id]);
+  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'committing');
+  // Before the next startup the user opens folder alpha in a current window: its ProjectContext
+  // (id = hash(uri)) now exists in the target although nothing of the source was committed.
+  const database = await openTarget(t, fixture.current);
+  await database.transaction([
+    repo('Conversation').insert({ id: 'conversation_new_in_alpha_folder', title: 'new', status: 'active', created_at: NOW, updated_at: NOW }),
+    ...projectFolderAssignmentSteps({ conversationId: 'conversation_new_in_alpha_folder', folder: ALPHA_PROJECT, now: NOW })
+  ]);
+  const report = await merge(fixture, database);
+  assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
+  assert.deepEqual(report.merged.map((item) => [item.candidateId, item.recoveredCommit]), [[fixture.alpha.id, false]]);
+  const target = readDatabase(fixture.current);
+  try {
+    assert.deepEqual(target.conversationsFor(ALPHA_PROJECT.uri), ['conversation_alpha_folder', 'conversation_new_in_alpha_folder']);
+    assert.equal(target.count('project_context', 'id = ?', projectContextIdForUri(ALPHA_PROJECT.uri)), 1);
+  } finally { target.close(); }
+});
+
+test('复审 merge2 #1：规划之后另一个窗口提交了同一项目：事务内已有即比对、没有才插入，本次直接合并成功', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_current_race', project: SHARED_PROJECT }]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_race', project: ALPHA_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database, {
+    async onFaultPoint(point) {
+      if (point !== 'before-row-commit') return;
+      await database.transaction([
+        repo('Conversation').insert({ id: 'conversation_peer_alpha_folder', title: 'peer', status: 'active', created_at: NOW, updated_at: NOW }),
+        ...projectFolderAssignmentSteps({ conversationId: 'conversation_peer_alpha_folder', folder: { ...ALPHA_PROJECT, name: 'renamed' }, now: NOW })
+      ]);
+    }
+  });
+  assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
+  assert.equal(report.merged.length, 1);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'merged');
+  const target = readDatabase(fixture.current);
+  try {
+    assert.deepEqual(target.conversationsFor(ALPHA_PROJECT.uri), ['conversation_alpha_race', 'conversation_peer_alpha_folder']);
+    assert.equal(target.database.prepare('SELECT name FROM project_context WHERE id = ?').pluck()
+      .get(projectContextIdForUri(ALPHA_PROJECT.uri)), 'renamed', '当前库已有的项目行保留（名称是展示信息）');
+  } finally { target.close(); }
 });
 
 test('审查 #8：当前库备份失败时不留临时文件与空目录并推迟；成功后只保留最新几份备份', async (t) => {

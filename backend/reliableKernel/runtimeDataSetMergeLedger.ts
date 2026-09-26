@@ -222,6 +222,11 @@ async function readRuntimeDataSetMergeLedgerRecord(
   return isLedgerRecord(value, path.basename(file)) ? value : undefined;
 }
 
+/** Drops a record, e.g. a committing record whose transaction is proven rolled back. */
+export async function removeRuntimeDataSetMergeLedgerRecord(paths: StoragePaths, candidateId: string): Promise<void> {
+  await removeLedgerJson(paths, RECORDS, candidateId);
+}
+
 /** A recorded, still applicable failure of this exact source state (for startup data-set choice). */
 export async function readRecordedRuntimeDataSetFailure(
   paths: StoragePaths,
