@@ -30,6 +30,7 @@ const {
   resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
 } = kernelFile('vscodeRootAuthority.js');
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
+const { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld } = kernelFile('runtimeHostControl.js');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-09-26T00:00:00.000Z';
@@ -459,6 +460,142 @@ test('复审 merge2 #1：规划之后另一个窗口提交了同一项目：事�
     assert.equal(target.database.prepare('SELECT name FROM project_context WHERE id = ?').pluck()
       .get(projectContextIdForUri(ALPHA_PROJECT.uri)), 'renamed', '当前库已有的项目行保留（名称是展示信息）');
   } finally { target.close(); }
+});
+
+test('复审 merge2 #2：有待收尾任务的来源因冲突受阻或因过大推迟时，收尾之前就被拒绝，来源原样不动、提示如实', async (t) => {
+  const conflict = await createFixture(t, { withBeta: false });
+  await seed(conflict.current, [{ id: 'conversation_duplicate', project: SHARED_PROJECT, title: '当前库标题' }]);
+  await seed(conflict.alpha, [
+    { id: 'conversation_duplicate', project: SHARED_PROJECT, title: '旧库标题' },
+    { id: 'conversation_alpha_running', project: SHARED_PROJECT }
+  ]);
+  await seedUnfinishedWork(conflict.alpha, [{ conversationId: 'conversation_alpha_running', kind: 'bare' }]);
+  const before = await treeSnapshot(conflict.alpha.scopeRoot);
+  const report = await merge(conflict, await openTarget(t, conflict.current));
+  assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-conflict');
+  assert.match(report.blocked[0].message, /两边内容都没有改动/);
+  assert.doesNotMatch(report.blocked[0].message, /收尾/);
+  assert.deepEqual(await treeSnapshot(conflict.alpha.scopeRoot), before, '被拒绝的来源没有被收尾、没有来源备份');
+  await assert.rejects(fs.stat(path.join(controlRoot(conflict.alpha), 'merge-source-backups')), { code: 'ENOENT' });
+
+  const large = await createFixture(t, { withBeta: false });
+  await seed(large.alpha, [{ id: 'conversation_alpha_big', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(large.alpha, [{ conversationId: 'conversation_alpha_big', kind: 'bare' }]);
+  const largeBefore = await treeSnapshot(large.alpha.scopeRoot);
+  const database = await openTarget(t, large.current);
+  const deferred = await merge(large, database, { limits: { maxRows: 5, maxBytes: 1 << 30 } });
+  assert.equal(deferred.deferred[0]?.code, 'runtime-data-set-merge-too-large');
+  assert.deepEqual(await treeSnapshot(large.alpha.scopeRoot), largeBefore);
+  const retried = await merge(large, database);
+  assert.equal(retried.merged[0]?.finalized?.turns, 1, '之后能合并时照常收尾后合并');
+});
+
+test('复审 merge2 #3/#9：超限来源在冲突之前从不请求协调；协调时正文与备份已就绪，只包住最后的事务；重活不持有配置根锁', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_duplicate', project: SHARED_PROJECT, title: '当前库标题' }]);
+  await seed(fixture.alpha, [{ id: 'conversation_duplicate', project: SHARED_PROJECT, title: '旧库标题' }]);
+  const database = await openTarget(t, fixture.current);
+  const calls = [];
+  const limits = { maxRows: 5, maxBytes: 1 << 30 };
+  const coordinateOversized = async (input, run) => {
+    calls.push({
+      input,
+      admission: isRuntimeDataRootAdmissionHeld(fixture.root),
+      targetClaim: isRuntimeMaintenanceHeld(input.targetPaths),
+      sourceClaim: isRuntimeMaintenanceHeld(fixture.alpha.binding.paths)
+    });
+    await run();
+    return { state: 'completed' };
+  };
+  const blocked = await merge(fixture, database, { limits, coordinateOversized });
+  assert.equal(blocked.blocked[0]?.code, 'runtime-data-set-merge-conflict');
+  assert.deepEqual(calls, [], '会被拒绝的来源不打扰其它窗口');
+
+  const clean = await createFixture(t, { withBeta: false });
+  await seed(clean.alpha, [{ id: 'conversation_alpha_large', project: SHARED_PROJECT }]);
+  const target = await openTarget(t, clean.current);
+  const heldAt = {};
+  const report = await merge(clean, target, {
+    limits,
+    onFaultPoint(point) {
+      heldAt[point] = [isRuntimeDataRootAdmissionHeld(clean.root), isRuntimeMaintenanceHeld(clean.alpha.binding.paths)];
+    },
+    async coordinateOversized(input, run) {
+      const text = messageText('conversation_alpha_large', 0);
+      calls.push({ cas: await fs.readFile(casFile(clean.current.binding, text), 'utf8') === text,
+        backups: (await fs.readdir(path.join(controlRoot(clean.current), 'merge-backups'))).length,
+        admission: isRuntimeDataRootAdmissionHeld(clean.root), sourceClaim: isRuntimeMaintenanceHeld(clean.alpha.binding.paths) });
+      await run();
+      return { state: 'completed' };
+    }
+  });
+  assert.deepEqual(report.merged.map((item) => item.exclusive), [true]);
+  assert.deepEqual(calls, [{ cas: true, backups: 1, admission: true, sourceClaim: false }], '协调前正文已复制、备份已完成；来源锁只在事务那一步');
+  assert.deepEqual(heldAt, {
+    'after-target-backup': [false, false], 'after-cas-transfer': [false, false],
+    'before-row-commit': [true, true], 'after-row-commit': [true, true]
+  }, '快照、核验、备份、正文复制都不持有配置根锁；复核与事务在锁内');
+});
+
+test('复审 merge2 #8：两个窗口同时启动，后处理的窗口在锁内重读账本，已被合并的来源直接跳过，不备份不提示', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_twice', project: SHARED_PROJECT }]);
+  // One Runtime per process: the two batches stand for two windows (the ledger is shared state).
+  const database = await openTarget(t, fixture.current);
+  let inner;
+  const outer = await merge(fixture, database, {
+    // The second window picked the source, then the first window merged it completely.
+    async onSourceStart() { inner ??= await merge(fixture, database); }
+  });
+  assert.equal(inner.merged.length, 1);
+  assert.equal(outer.pendingSources, 1, '第二个窗口选源时来源还未合并');
+  assert.deepEqual([outer.merged, outer.deferred, outer.blocked, outer.failures], [[], [], [], []], '不重复合并、不重复提示');
+  assert.equal((await fs.readdir(path.join(controlRoot(fixture.current), 'merge-backups'))).length, 1, '第二个窗口不再备份');
+  const target = readDatabase(fixture.current);
+  try { assert.equal(target.count('conversation', 'id = ?', 'conversation_alpha_twice'), 1); }
+  finally { target.close(); }
+
+  // Nothing new to insert (the source files changed, its rows did not): recorded, not backed up, not reported.
+  const touched = await createFixture(t, { withBeta: false });
+  await seed(touched.alpha, [{ id: 'conversation_alpha_same_rows', project: SHARED_PROJECT }]);
+  const touchedTarget = await openTarget(t, touched.current);
+  assert.equal((await merge(touched, touchedTarget)).merged.length, 1);
+  const backups = await fs.readdir(path.join(controlRoot(touched.current), 'merge-backups'));
+  await fs.rm(path.join(resolveVscodeRuntimeMergeLedgerRoot(touched.paths), 'records', `${touched.alpha.id.replace(/:/g, '-')}.json`));
+  const again = await merge(touched, touchedTarget);
+  assert.deepEqual([again.pendingSources, again.merged, again.deferred], [1, [], []]);
+  assert.deepEqual(await fs.readdir(path.join(controlRoot(touched.current), 'merge-backups')), backups);
+  assert.equal((await readRuntimeDataSetMergeStates(touched.paths)).get(touched.alpha.id)?.changedSinceMerge, false);
+});
+
+test('复审 startup2 #2：合并中当前库被关闭（重载/切库）记为推迟而非失败；停止请求在来源开始前和规划前生效，什么都不记', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_closed', project: SHARED_PROJECT }]);
+  const closing = await openTarget(t, fixture.current);
+  const report = await merge(fixture, closing, { async onSourceStart() { await closing.close(); } });
+  assert.deepEqual([report.merged, report.failures, report.blocked], [[], [], []]);
+  assert.equal(report.deferred.length, 1);
+  assert.match(report.deferred[0].message, /RuntimeDatabase is closed/);
+  assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '不记为失败');
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1, '下次启动照常合并');
+
+  const stop = await createFixture(t, { withBeta: false });
+  await seed(stop.alpha, [{ id: 'conversation_alpha_stop', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(stop.alpha, [{ conversationId: 'conversation_alpha_stop', kind: 'bare' }]);
+  const stopTarget = await openTarget(t, stop.current);
+  const sourceBefore = await treeSnapshot(stop.alpha.scopeRoot);
+  const targetBefore = databaseDigest(stop.current);
+  for (const stopAtCall of [3, 4]) {
+    let calls = 0;
+    const stopped = await merge(stop, stopTarget, { shouldContinue: () => ++calls < stopAtCall });
+    assert.equal(stopped.stopped, true, `第 ${stopAtCall} 次检查时停止`);
+    assert.deepEqual([stopped.merged, stopped.deferred, stopped.blocked, stopped.failures], [[], [], [], []]);
+  }
+  assert.equal(await readLedgerRecord(stop, stop.alpha.id), undefined);
+  assert.deepEqual(await treeSnapshot(stop.alpha.scopeRoot), sourceBefore, '停止时来源没有被收尾');
+  assert.equal(databaseDigest(stop.current), targetBefore);
+  await assert.rejects(fs.stat(path.join(controlRoot(stop.current), 'merge-backups')), { code: 'ENOENT' });
 });
 
 test('审查 #8：当前库备份失败时不留临时文件与空目录并推迟；成功后只保留最新几份备份', async (t) => {
