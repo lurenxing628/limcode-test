@@ -339,6 +339,45 @@ test('运行时关闭后迁移失败：迁移自身已撤销时不再重复；�
   assert.ok(closeFailed.kinds().includes('abandon'), '准备阶段留下的内容由命令撤销，不会谎称已清理');
 });
 
+test('reloc3 问题 2 与撤销搁置：失败后拷来的数据仍在旁边就不算撤销完，保留进行中记录并写明拷贝位置；撤销被搁置时清除记录并说明备份在哪；启动时搁置的续撤同样处理；打开搁置的目录提示一次，可以不再提醒', async () => {
+  const aside = `${TARGET}.limcode-copied-2026-09-27T00-00-00-000Z-12345678`;
+  const copied = fixture({ answers: [{ choice: 'relocate', include: [] }], completeError: new Error('同一条记录内容不同'), cleanup: 'cleaned', copyAside: aside });
+  await copied.commands.relocateDataRoot(copied.context, copied.startup, copied.request);
+  const relocationId = copied.calls.find((call) => call[0] === 'status')[1].pendingRelocation.relocationId;
+  assert.deepEqual(copied.calls.find((call) => call[0] === 'find-copy').slice(1), [TARGET, relocationId]);
+  assert.equal(copied.calls.filter((call) => call[0] === 'status').length, 1, '拷贝还在旁边：进行中记录保留，下次启动再改回');
+  const detail = copied.calls.find((call) => call[0] === 'error')[2].detail;
+  assert.match(detail, /没能全部撤销/);
+  assert.ok(detail.includes(aside), detail);
+
+  const heldMessage = '新数据目录里的当前历史库在这次迁移之后有了新的内容。为了不覆盖这些内容，那次迁移在新目录里做的改动没有撤销；迁移前的数据库副本保存在 /data/new-home/.limcode-relocation-backups/x。';
+  const heldError = Object.assign(new Error(heldMessage), { code: 'data-root-relocation-undo-held' });
+  const held = fixture({ answers: [{ choice: 'relocate', include: [] }], completeError: new Error('磁盘错误'), cleanup: 'not-cleaned', abandonError: heldError });
+  await held.commands.relocateDataRoot(held.context, held.startup, held.request);
+  assert.equal(held.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null, '搁置：不会再自动撤销，没有要留给下次启动的');
+  const heldDetail = held.calls.find((call) => call[0] === 'error')[2].detail;
+  assert.ok(heldDetail.includes(heldMessage), heldDetail);
+  assert.doesNotMatch(heldDetail, /下次启动 LimCode 时会再撤销一次/);
+
+  const pending = { relocationId: 'r-1', sourceRootPath: SOURCE, targetRootPath: TARGET, startedAt: 'x', processId: 1 };
+  const hold = { relocationId: 'r-1', message: heldMessage };
+  const startup = fixture({ pendingRelocation: pending, ownerState: 'dead', recoverOutcome: 'held', hold });
+  assert.equal(await startup.commands.beforeDataRootOpen(startup.context), undefined);
+  assert.equal(startup.calls.find((call) => call[0] === 'status')[1].pendingRelocation, null);
+  assert.ok(startup.calls.some((call) => call[0] === 'warning' && call[1].includes('上次中断的数据目录迁移没有撤销') && call[1].includes(heldMessage)));
+
+  const opened = fixture({ hold, nativeAnswers: ['不再提醒'] });
+  await opened.commands.afterDataRootOpened(opened.context, TARGET);
+  await new Promise(setImmediate);
+  const warning = opened.calls.find((call) => call[0] === 'warning');
+  assert.ok(warning[1].includes('这个数据目录里有一次没有撤销的迁移') && warning[1].includes(heldMessage), warning[1]);
+  assert.equal(warning[2], '不再提醒', '不是模态：不阻塞使用');
+  assert.deepEqual(plain(opened.globalState.get('limcode.dataRootHeldRelocationDismissed')), ['r-1']);
+  await opened.commands.afterDataRootOpened(opened.context, TARGET);
+  await new Promise(setImmediate);
+  assert.equal(opened.calls.filter((call) => call[0] === 'warning').length, 1, '不再提醒');
+});
+
 test('命令面板入口打开设置页；本窗口有任务、预检不通过、另一个迁移进行中或取消确认时不开始迁移', async () => {
   const palette = fixture();
   await palette.commands.relocateDataRoot(palette.context, palette.startup);
