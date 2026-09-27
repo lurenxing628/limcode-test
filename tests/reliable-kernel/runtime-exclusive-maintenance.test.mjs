@@ -978,6 +978,27 @@ test('盲审 #4：同一项工作（同一操作与操作键）的较新请求�
   assert.deepEqual(ledger.filter((name) => name.startsWith('key-')), [], 'no backoff for the work that was done');
 });
 
+test('盲审 #4：窗口因自己的维护请求答忙时，回应里写明那项工作（操作、操作键与说明），较早的同一项工作据此等它让出', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  // This window checks for requests only when the test says so.
+  const b = await openWindow(t, binding, 'window-b', { pollMs: 60 * 60_000 });
+  let proceed;
+  const gate = new Promise((resolve) => { proceed = resolve; });
+  // B's own request runs (it waits for B's own work, on demand).
+  const own = run(paths, {
+    ...BASE, operation: 'data-root-migration', operationKey: 'to:/other', message: '为迁移数据目录', ignoreBackoff: true,
+    whenBusy: 'wait', requesterHostBootId: 'window-b', requesterBusy: () => gate
+  }, async () => 'migrated');
+  // A later request of another window: B does not give way to it, so B answers busy for its own request.
+  await writeRequest(paths, { requestId: 'later-request', createdAt: new Date(Date.now() + 60_000).toISOString() });
+  await b.check();
+  const answer = await readAnswer(paths, 'later-request', 'window-b');
+  assert.deepEqual([answer.stage, answer.answer, answer.reason], ['prepare', 'busy', '本窗口正在等待执行迁移数据目录']);
+  assert.deepEqual(answer.maintenance, { operation: 'data-root-migration', operationKey: 'to:/other', activity: '迁移数据目录' });
+  proceed(undefined);
+  assert.equal((await own).state, 'completed');
+});
+
 test('盲审 #4：较早的请求遇到因同一项工作的请求而答忙的窗口时不放弃，按即将让出等它回答', async (t) => {
   const { binding, paths } = await createRoot(t);
   const liveness = await publishHost(binding, 'window-b');
