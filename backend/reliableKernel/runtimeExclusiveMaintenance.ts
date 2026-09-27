@@ -253,6 +253,7 @@ export type RuntimeExclusiveMaintenanceAbandonState =
   'busy' | 'declined' | 'legacy-host' | 'timed-out' | 'cancelled' | 'backoff' | 'blocked';
 
 export type RuntimeExclusiveMaintenanceOutcome<T> =
+  /** coordinated: go was published, so other windows reloaded for this operation (a request alone is not). */
   | { state: 'completed'; result: T; coordinated: boolean }
   | {
     state: RuntimeExclusiveMaintenanceAbandonState;
@@ -500,7 +501,7 @@ class ExclusiveMaintenanceRequester<T> {
         }
         this.endWait();
         activity.report(undefined);
-        return this.completed(await this.execute(goPublished, activity), this.request !== undefined);
+        return this.completed(await this.execute(goPublished, activity), goPublished);
       } finally {
         await this.thaw();
       }

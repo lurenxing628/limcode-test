@@ -1061,7 +1061,8 @@ test('没有发布 go 就不算已协调：其它窗口在 go 前全部关闭、
       return withRuntimeMaintenance(paths, body);
     }
   }, async () => 'done');
-  assert.deepEqual(outcome, { state: 'completed', result: 'done', coordinated: true });
+  // No go was ever published (the other window closed on its own): nothing reloaded for this call.
+  assert.deepEqual(outcome, { state: 'completed', result: 'done', coordinated: false });
   assert.equal(lockedRounds, 2, 'went back outside instead of ending as if windows had reloaded');
 });
 
