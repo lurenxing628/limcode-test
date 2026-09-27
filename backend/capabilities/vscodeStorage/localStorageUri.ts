@@ -19,12 +19,25 @@ export function nodeFsStoragePath(uri: vscode.Uri): string {
 
 /**
  * Whether a storage directory exists (never creates it). Reads use it to leave a missing settings
- * directory missing: a new data directory, or the mount point of an unmounted data drive.
+ * directory missing: a new data directory, or the mount point of an unmounted data drive. Only
+ * "not there" (ENOENT/ENOTDIR, FileNotFound) counts as missing: any other failure (no permission,
+ * an I/O error of a failing drive) is raised, never taken for an empty directory.
  */
 export async function storageDirectoryExists(uri: vscode.Uri): Promise<boolean> {
-  if (isNodeFsStorageUri(uri)) return (await fs.stat(nodeFsStoragePath(uri)).catch(() => undefined))?.isDirectory() === true;
-  const stat = await Promise.resolve(vscode.workspace.fs.stat(uri)).catch(() => undefined);
-  return stat !== undefined && (stat.type & vscode.FileType.Directory) !== 0;
+  try {
+    if (isNodeFsStorageUri(uri)) return (await fs.stat(nodeFsStoragePath(uri))).isDirectory();
+    return ((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory) !== 0;
+  } catch (error) {
+    if (isNotThere(error)) return false;
+    throw error;
+  }
+}
+
+/** ENOENT/ENOTDIR from node, FileNotFound (provider code EntryNotFound) from the VS Code file system. */
+function isNotThere(error: unknown): boolean {
+  const { code, name } = (error ?? {}) as { code?: unknown; name?: unknown };
+  return code === 'ENOENT' || code === 'ENOTDIR' || code === 'FileNotFound' || code === 'EntryNotFound' || code === 'FileNotADirectory'
+    || (typeof name === 'string' && /^(FileNotFound|EntryNotFound|FileNotADirectory|EntryNotADirectory)\b/.test(name));
 }
 
 function normalizedFsPath(value: string): string {
