@@ -1383,6 +1383,83 @@ test('复审 merge3 #8：收尾之后收到停止按推迟处理并记下收尾�
   assert.match(blocked.blocked[0].message, /之前一次合并时已把这个库里的1 个中断的任务按“中止”收尾.*收尾前的备份在 /);
 });
 
+test('盲审 merge #2：两个窗口同时启动且来源需要收尾：先到窗口收尾并合并后，后到窗口在锁内重读账本静默跳过，不报推迟、不再收尾；明确请求时提示已合并', async (t) => {
+  const run = async (explicit) => {
+    const fixture = await createFixture(t, { withBeta: false });
+    await seed(fixture.alpha, [{ id: 'conversation_alpha_twice', project: SHARED_PROJECT }]);
+    await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_twice', kind: 'bare' }]);
+    const database = await openTarget(t, fixture.current);
+    let inner;
+    const outer = await merge(fixture, database, {
+      ...(explicit ? { candidateIds: [fixture.alpha.id], requested: true } : {}),
+      // This window checked the unfinalized copy and is about to close its work; the other window does all of it first.
+      async onFaultPoint(point) {
+        if (point === 'before-source-finalization' && !inner) inner = await merge(fixture, database);
+      }
+    });
+    return { fixture, inner, outer };
+  };
+  const { fixture, inner, outer } = await run(false);
+  assert.deepEqual(inner.merged.map((item) => item.finalized?.turns), [1]);
+  assert.deepEqual([outer.merged, outer.deferred, outer.blocked, outer.failures], [[], [], [], []], '后到窗口不提示');
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'merged');
+  assert.equal((await fs.readdir(path.join(controlRoot(fixture.alpha), 'merge-source-backups'))).length, 1, '来源只备份、收尾一次');
+  const source = readDatabase(fixture.alpha);
+  try { assert.equal(source.count('turn_termination', 'reason = ?', MERGE_FINALIZATION_REASON), 1); }
+  finally { source.close(); }
+
+  const explicit = await run(true);
+  assert.deepEqual(explicit.outer.merged.map((item) => [item.candidateId, item.alreadyMerged, item.insertedConversations]),
+    [[explicit.fixture.alpha.id, true, 0]], '用户明确请求的这一次得到“已合并，没有新内容”');
+  assert.deepEqual(explicit.outer.deferred, []);
+});
+
+test('盲审 merge #2：另一个窗口读到了收尾记录时，收尾只随真正合并的那个窗口报告一次，另一个窗口静默', async (t) => {
+  // The window that closed the work waits after its target backup; the other window read its record of the closed work.
+  const race = async (otherMergesFirst) => {
+    const fixture = await createFixture(t, { withBeta: false });
+    await seed(fixture.alpha, [{ id: 'conversation_alpha_once', project: SHARED_PROJECT }]);
+    await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_once', kind: 'bare' }]);
+    const database = await openTarget(t, fixture.current);
+    let other;
+    let finished;
+    const closerDone = new Promise((resolve) => { finished = resolve; });
+    const closer = await merge(fixture, database, {
+      async onFaultPoint(point) {
+        if (point !== 'after-target-backup' || other) return;
+        if (otherMergesFirst) {
+          other = await merge(fixture, database);
+          return;
+        }
+        let reached;
+        const paused = new Promise((resolve) => { reached = resolve; });
+        other = merge(fixture, database, {
+          async onFaultPoint(inner) {
+            if (inner !== 'after-cas-transfer') return;
+            reached();
+            await closerDone;
+          }
+        });
+        await paused;
+      }
+    });
+    finished();
+    return { fixture, closer, other: await other };
+  };
+  const summary = (report) => [report.merged.map((item) => [item.alreadyMerged ?? false, item.finalized?.turns]),
+    report.deferred, report.blocked, report.failures];
+  const closerMerges = await race(false);
+  assert.deepEqual(summary(closerMerges.closer), [[[false, 1]], [], [], []]);
+  assert.deepEqual(summary(closerMerges.other), [[], [], [], []], '另一个窗口读到过收尾记录，也不重复报告');
+  const otherMerges = await race(true);
+  assert.deepEqual(summary(otherMerges.other), [[[false, 1]], [], [], []], '先合并的窗口报告收尾');
+  assert.deepEqual(summary(otherMerges.closer), [[], [], [], []], '收尾的窗口随后发现已合并，静默');
+  for (const { fixture } of [closerMerges, otherMerges]) {
+    await assert.rejects(fs.stat(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'finalizations',
+      `${fixture.alpha.id.replace(/:/g, '-')}.json`)), { code: 'ENOENT' });
+  }
+});
+
 test('盲审 merge #4：明确请求合并已合并且没有变化的来源，结果里有一条“已合并，没有新内容”', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_r3', project: SHARED_PROJECT }]);

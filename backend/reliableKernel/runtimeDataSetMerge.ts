@@ -337,7 +337,10 @@ type Refusal = {
 
 type SourceOutcome =
   | { kind: 'merged'; result: RuntimeDataSetMergeResult }
-  /** Every row is already in the target: nothing new, reported only for an explicit request (result.alreadyMerged). */
+  /**
+   * Every row is already in the target (or another window merged it meanwhile): nothing new, only
+   * reported for an explicit request or closed work (result.alreadyMerged).
+   */
   | { kind: 'current'; result: RuntimeDataSetMergeResult }
   /** shouldContinue turned false before this source changed anything; nothing is recorded. */
   | { kind: 'stopped' }
@@ -363,6 +366,13 @@ class StopRequested extends Error {}
 
 /** The source files changed while they were being copied; the copy is taken again. */
 class SnapshotRaced extends Error {}
+
+/** Another window merged the source into this target after this batch picked it: nothing to report. */
+class MergedMeanwhile extends Error {
+  public constructor(public readonly result: RuntimeDataSetMergeResult) {
+    super('merged meanwhile');
+  }
+}
 
 /**
  * Merges pending historical data sets of this configuration root into the open selected Runtime.
@@ -391,6 +401,8 @@ export async function mergeHistoricalDataSetsOnline(
   };
   if (!keepGoing()) return report;
   const target = targetContext(targetInput);
+  // Before anything is judged: a source merged into this target after this is another window's.
+  const pickedAt = new Date().toISOString();
   const picked = await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
     const inspection = await inspectVscodeRuntimeDataSets(storagePaths);
     const selected = inspection.candidates.filter((candidate) => candidate.selected);
@@ -452,11 +464,11 @@ export async function mergeHistoricalDataSetsOnline(
     }
     await options.onSourceStart?.(source.candidate, index, sources.length);
     const outcome = await mergeOneSource(storagePaths, target, source.candidate.id, options,
-      { finalizeWork: true, requested: source.requested }, keepGoing);
+      { finalizeWork: true, requested: source.requested, pickedAt }, keepGoing);
     if (outcome.kind === 'stopped') break;
     if (outcome.kind === 'merged' || outcome.kind === 'current') {
       const { result } = outcome;
-      if (outcome.kind === 'merged' || source.requested) report.merged.push(result);
+      if (outcome.kind === 'merged' || source.requested || result.finalized) report.merged.push(result);
       await removeRuntimeDataSetMergeRequest(storagePaths, source.candidate.id).catch(() => undefined);
       continue;
     }
@@ -777,12 +789,16 @@ async function mergeOneSource(
       : await mergeSource(paths, target, candidateId, options, mode, state, keepGoing);
   } catch (error) {
     outcome = sourceOutcome(error, state);
+    // A deferral because the source changed is no outcome when another window merged the source
+    // into this target since this batch picked it.
+    if (error instanceof MergedMeanwhile) outcome = { kind: 'current', result: error.result };
     if ((outcome.kind === 'failed' || outcome.kind === 'blocked') && !state.recorded && !mode.migration) {
       await recordRefusal(paths, target, candidateId, outcome, state).catch(() => undefined);
     }
   }
-  // Closed work stays on record until an outcome that says so (see RuntimeDataSetMergeFinalization).
-  if (state.finalized && outcome.kind !== 'deferred' && outcome.kind !== 'stopped' && !mode.migration) {
+  // Closed work stays on record until an outcome that says so (see RuntimeDataSetMergeFinalization):
+  // a refusal says it in its message; a merge or "already merged" takes it where decided (takeFinalized).
+  if (state.finalized && (outcome.kind === 'blocked' || outcome.kind === 'failed') && !mode.migration) {
     await removeRuntimeDataSetMergeFinalization(paths, candidateId).catch(() => undefined);
   }
   return outcome;
@@ -794,6 +810,8 @@ interface SourceMode {
   requested: boolean;
   /** Data-root migration: the selected source is allowed and the ledger is not written. */
   migration?: boolean;
+  /** When the batch started picking its sources: a merge recorded since is another window's. */
+  pickedAt?: string;
 }
 
 interface SourceProgress {
@@ -933,7 +951,7 @@ async function mergeSource(
       await transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, true);
       stopIfAsked();
       await fault(options, 'before-source-finalization');
-      await finalizeSource(paths, candidate, binding, work, state, options, stopIfAsked);
+      await finalizeSource(paths, target, candidate, binding, work, state, options, mode, stopIfAsked);
       await taken.snapshot.close();
       taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options);
       const remaining = taken.audit.unfinishedWork!;
@@ -979,7 +997,7 @@ async function settledSource(
     const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
     const fingerprint = await runtimeDataSetFingerprint(candidate).catch(() => undefined);
     return sameRuntimeDataSetIdentity(recorded.source, candidate) && sameRuntimeDataSetFingerprint(recorded.source, fingerprint)
-      ? { kind: 'current', result: currentResult(candidate, target) } : undefined;
+      ? { kind: 'current', result: await currentResult(paths, candidate, target, state) } : undefined;
   }
   if (recorded?.state !== 'committing' || !sameRuntimeDataSetIdentity(recorded.target, target.identity)) return undefined;
   return withRuntimeDataRootAdmission(paths.globalStoragePath, async (): Promise<SourceOutcome | undefined> => {
@@ -1009,7 +1027,9 @@ async function settledSource(
       mergedAt: new Date().toISOString(), insertedRows: 0, reusedRows: 0, insertedConversations: 0
     });
     await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
-    return { kind: 'merged', result: { ...unchangedResult(candidate, target), recoveredCommit: true, ...finalizedResult(state) } };
+    return { kind: 'merged', result: {
+      ...unchangedResult(candidate, target), recoveredCommit: true, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state))
+    } };
   });
 }
 
@@ -1095,18 +1115,20 @@ function checkPlan(
 /** Backs up the source and closes its finalizable work, under its maintenance claim. */
 async function finalizeSource(
   paths: { globalStoragePath: string },
+  target: TargetContext,
   candidate: VscodeRuntimeDataSetCandidate,
   binding: HistoricalRootBinding,
   work: UnfinishedWorkInspection,
   state: SourceProgress,
   options: RuntimeDataSetMergeOptions,
+  mode: SourceMode,
   stopIfAsked: () => void
 ): Promise<void> {
   // Windows opening meanwhile wait on the admission and say why (the source backup can take a while).
   await withRuntimeDataRootAdmission(paths.globalStoragePath, () => withRuntimeMaintenance(binding.paths, () => withRuntimeMaintenanceActivity({
     operation: 'historical-merge-finalize', description: '备份并收尾要合并的旧聊天记录'
   }, async () => {
-    await assertSourceUnchanged(paths, candidate, binding, state, false);
+    await assertSourceUnchanged(paths, target, candidate, binding, state, mode);
     stopIfAsked();
     // Work in a data set the user switched away from in this version was not interrupted by an upgrade.
     const reason = await isVscodeRuntimeDataSetKept(candidate) ? KEPT_MERGE_FINALIZATION_REASON : MERGE_FINALIZATION_REASON;
@@ -1154,22 +1176,48 @@ function countFinalized(source: Database.Database, finalized: NonNullable<Source
   finalized.complete = finalized.turns === finalized.turnIds.length && finalized.intents === finalized.intentIds.length;
 }
 
-/** Under the source's claim: no Host, same identity and pointer, and exactly the files that were checked. */
+/**
+ * Under the source's claim: no Host, same identity and pointer, and exactly the files that were
+ * checked. Files changed because another window merged the source into this target since this batch
+ * picked it (closing its work first) are that merge, not a reason to retry.
+ */
 async function assertSourceUnchanged(
   paths: { globalStoragePath: string },
+  target: TargetContext,
   candidate: VscodeRuntimeDataSetCandidate,
   binding: HistoricalRootBinding,
   state: SourceProgress,
-  migration: boolean
+  mode: SourceMode
 ): Promise<void> {
   await assertSourceIdle(candidate);
   const current = await resolveVscodeRuntimeDataSet(paths, candidate.id);
   const pointer = await requireCompleteRuntimeDataSet(current).catch(() => undefined);
-  if (!sameRuntimeDataSetIdentity(current as RuntimeDataSetIdentity, candidate) || (current.selected && !migration)
+  if (!sameRuntimeDataSetIdentity(current as RuntimeDataSetIdentity, candidate) || (current.selected && !mode.migration)
     || pointer?.rootGeneration !== binding.rootGeneration || pointer.pointerRevision !== binding.pointerRevision
     || await runtimeDataSetFileState(binding.paths.databasePath) !== state.files) {
+    const meanwhile = await mergedMeanwhile(paths, target, candidate.id, mode, state);
+    if (meanwhile) throw new MergedMeanwhile(meanwhile);
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '来源历史库在核验之后又有变化，稍后重试。' });
   }
+}
+
+/**
+ * The merge of this source into this target that another window recorded after this batch picked
+ * the source (merged, same source incarnation), as this attempt's result; undefined when there is
+ * none (or no batch picked it: a single explicit merge).
+ */
+async function mergedMeanwhile(
+  paths: { globalStoragePath: string },
+  target: TargetContext,
+  candidateId: string,
+  mode: SourceMode,
+  state: SourceProgress
+): Promise<RuntimeDataSetMergeResult | undefined> {
+  if (mode.pickedAt === undefined || mode.migration) return undefined;
+  const record = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
+  if (record?.state !== 'merged' || !sameRuntimeDataSetIdentity(record.target, target.identity) || record.mergedAt < mode.pickedAt) return undefined;
+  const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
+  return sameRuntimeDataSetIdentity(record.source, candidate) ? currentResult(paths, candidate, target, state) : undefined;
 }
 
 /**
@@ -1190,7 +1238,7 @@ async function commitSource(
   stopIfAsked: () => void
 ): Promise<SourceOutcome> {
   return withRuntimeDataRootAdmission(paths.globalStoragePath, () => withRuntimeMaintenance(binding.paths, async (): Promise<SourceOutcome> => {
-    await assertSourceUnchanged(paths, candidate, binding, state, mode.migration === true);
+    await assertSourceUnchanged(paths, target, candidate, binding, state, mode);
     const previous = mode.migration ? undefined : (await readRuntimeDataSetMergeLedger(paths)).get(candidate.id);
     if ((previous?.state === 'committing' || previous?.state === 'merged') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
       if (previous.state === 'committing') {
@@ -1198,7 +1246,7 @@ async function commitSource(
       }
       if (previous.state === 'merged' && sameRuntimeDataSetIdentity(previous.source, candidate)
         && sameRuntimeDataSetFingerprint(previous.source, state.fingerprint)) {
-        return { kind: 'current', result: currentResult(candidate, target) };
+        return { kind: 'current', result: await currentResult(paths, candidate, target, state) };
       }
     }
     stopIfAsked();
@@ -1209,8 +1257,7 @@ async function commitSource(
       insertedConversations: plan.insertedConversations,
       ...(cas ?? {}),
       ...(plan.steps.length > 0 && target.backup.path ? { backupPath: target.backup.path } : {}),
-      ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}),
-      ...finalizedResult(state)
+      ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {})
     };
     const merged = (): DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt'> => ({
       candidateId: candidate.id, state: 'merged', source: state.fingerprint!, target: target.identity,
@@ -1220,7 +1267,8 @@ async function commitSource(
     if (plan.steps.length === 0) {
       if (mode.migration) return { kind: 'merged', result };
       await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
-      return { kind: 'current', result: { ...result, alreadyMerged: true } };
+      const finalized = await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state));
+      return { kind: 'current', result: { ...result, alreadyMerged: true, ...finalized } };
     }
     const commitId = mode.migration ? undefined : await writeRuntimeDataSetMergeCommit(paths, plan.inserted);
     if (commitId !== undefined) {
@@ -1252,11 +1300,10 @@ async function commitSource(
       }
     }
     await fault(options, 'after-row-commit');
-    if (commitId !== undefined) {
-      await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
-      await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
-    }
-    return { kind: 'merged', result };
+    if (commitId === undefined) return { kind: 'merged', result };
+    await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
+    await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
+    return { kind: 'merged', result: { ...result, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state)) } };
   }));
 }
 
@@ -1307,9 +1354,37 @@ function unchangedResult(candidate: VscodeRuntimeDataSetCandidate, target: Targe
   };
 }
 
-/** Nothing new for this target: all its rows are here already, or a merge recorded before this attempt holds the source. */
-function currentResult(candidate: VscodeRuntimeDataSetCandidate, target: TargetContext): RuntimeDataSetMergeResult {
-  return { ...unchangedResult(candidate, target), alreadyMerged: true };
+/**
+ * Nothing new for this target: a merge recorded before or during this attempt (another window's)
+ * holds the source, or all its rows are here already. Closed work still on record goes with it.
+ */
+async function currentResult(
+  paths: { globalStoragePath: string },
+  candidate: VscodeRuntimeDataSetCandidate,
+  target: TargetContext,
+  state: SourceProgress
+): Promise<RuntimeDataSetMergeResult> {
+  return { ...unchangedResult(candidate, target), alreadyMerged: true, ...await takeFinalized(paths, candidate, state) };
+}
+
+/**
+ * Closed work on record for the source goes into exactly one reported merge outcome: the one that
+ * removes the record, under the configuration admission. None is left when another window's outcome
+ * reported it first (also work this attempt closed itself: that merge holds it); one this attempt
+ * did not know of (closed by another window after this attempt began) is reported as recorded.
+ */
+async function takeFinalized(
+  paths: { globalStoragePath: string },
+  candidate: VscodeRuntimeDataSetCandidate,
+  state: SourceProgress
+): Promise<Pick<RuntimeDataSetMergeResult, 'finalized'>> {
+  return withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
+    const recorded = await readRuntimeDataSetMergeFinalization(paths, candidate);
+    if (!recorded) return {};
+    await removeRuntimeDataSetMergeFinalization(paths, candidate.id);
+    const finalized = state.finalized ?? recorded;
+    return { finalized: { turns: finalized.turns, intents: finalized.intents, sourceBackupPath: finalized.sourceBackupPath } };
+  });
 }
 
 function unfinishedWorkOutcome(found: string, state: SourceProgress, afterFinalization = false): Refusal {
