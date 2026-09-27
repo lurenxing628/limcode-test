@@ -7,6 +7,7 @@ import {
   missingRecordStoreRevision,
   type RecordStoreSnapshot
 } from './recordStore';
+import { storageDirectoryExists } from './localStorageUri';
 import type { createVscodeStoragePaths } from './paths';
 
 type StoragePaths = ReturnType<typeof createVscodeStoragePaths>;
@@ -25,6 +26,9 @@ export interface McpServersSettingsResult {
 export async function loadMcpServersSettings(paths: StoragePaths): Promise<McpServersSettingsResult> {
   const root = mcpServersRootUri(paths);
   const indexUri = mcpServersIndexUri(paths);
+  // No settings directory yet (a new data directory, or the mount point of an unmounted drive): no
+  // servers, as a missing store; the first save writes it.
+  if (!await storageDirectoryExists(paths.settingsRootUri)) return mcpSettingsFromSnapshot(indexUri, { records: [], revision: missingRecordStoreRevision(indexUri) });
   const snapshot = await loadRecordStoreSnapshot<McpServerConfigRecord, 'server'>(root, indexUri, 'server');
   if (snapshot) return mcpSettingsFromSnapshot(indexUri, snapshot);
 
@@ -60,7 +64,7 @@ export async function saveMcpServersSettings(
     settings.servers,
     'server',
     (server) => server.name,
-    { expectedRevision, section: REVISION_SECTION, pruneMissing: true }
+    { expectedRevision, section: REVISION_SECTION, pruneMissing: true, isDefaultRecords: (records) => records.length === 0 }
   );
   return {
     ...mcpSettingsFromSnapshot(indexUri, committed),

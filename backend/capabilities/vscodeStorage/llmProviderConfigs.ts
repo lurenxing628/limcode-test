@@ -43,6 +43,8 @@ import {
   missingRecordStoreRevision,
   type RecordStoreSnapshot
 } from './recordStore';
+import { storageDirectoryExists } from './localStorageUri';
+import { createStorageRevision } from './storageRevision';
 
 const RECORD_KEY = 'config';
 const CONFIGS_DIR = 'llm-provider-configs';
@@ -59,6 +61,13 @@ export interface LlmProviderConfigsSettingsResult {
 export async function loadLlmProviderConfigsSettings(paths: StoragePaths): Promise<LlmProviderConfigsSettingsResult> {
   const root = configsRootUri(paths);
   const indexUri = configsIndexUri(paths);
+  // No settings directory yet (a new data directory, or the mount point of an unmounted drive): the
+  // default channel in memory only, as a missing store; the first save writes it.
+  if (!await storageDirectoryExists(paths.settingsRootUri)) {
+    return providerSettingsFromSnapshot(indexUri, {
+      records: [createDefaultLlmProviderConfig({ name: DEFAULT_CONFIG_NAME })], revision: missingRecordStoreRevision(indexUri)
+    });
+  }
   const snapshot = await loadRecordStoreSnapshot<LlmProviderConfigRecord, typeof RECORD_KEY>(root, indexUri, RECORD_KEY);
   if (snapshot && snapshot.records.length > 0) return providerSettingsFromSnapshot(indexUri, snapshot);
 
@@ -95,7 +104,7 @@ export async function saveLlmProviderConfigsSettings(
     configs,
     RECORD_KEY,
     (record) => record.name,
-    { expectedRevision, section: REVISION_SECTION, pruneMissing: true }
+    { expectedRevision, section: REVISION_SECTION, pruneMissing: true, isDefaultRecords: isDefaultProviderRecords }
   );
   // 改过或删掉的渠道：之前按这个渠道学到的请求适配（去掉的参数、退回的提醒方式）全部作废，按新配置重新试探。
   const saved = new Map(committed.records.map((record) => [record.id, JSON.stringify(record)]));
@@ -190,6 +199,15 @@ function normalizeConfigList(input: LlmProviderConfigRecord[] | undefined): LlmP
     byId.set(config.id, config);
   }
   return sortConfigs([...byId.values()]);
+}
+
+/** The store a read initializes: the one default channel (its id and timestamps differ every time). */
+function isDefaultProviderRecords(records: readonly unknown[]): boolean {
+  const comparable = (record: LlmProviderConfigRecord): string => createStorageRevision({
+    ...normalizeLlmProviderConfig(record), id: '', createdAt: 0, updatedAt: 0
+  });
+  return records.length === 1
+    && comparable(records[0] as LlmProviderConfigRecord) === comparable(createDefaultLlmProviderConfig({ name: DEFAULT_CONFIG_NAME }));
 }
 
 function providerSettingsFromSnapshot(

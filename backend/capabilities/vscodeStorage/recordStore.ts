@@ -51,6 +51,11 @@ export interface RecordStoreCommitResult<TRecord> extends RecordStoreSnapshot<TR
 export interface CommitRecordStoreSnapshotOptions extends SaveRecordStoreOptions {
   expectedRevision: string;
   section: string;
+  /**
+   * The records a read writes as defaults once the settings directory exists: a missing store and
+   * one holding exactly them are the same state, so a save expecting the missing store is accepted.
+   */
+  isDefaultRecords?: (records: readonly unknown[]) => boolean;
 }
 
 export interface UpsertRecordOptions {
@@ -198,7 +203,9 @@ export async function commitRecordStoreSnapshot<TRecord extends { id: string }, 
   return withRecordStoreMutationLock(indexUri, async () => {
     const current = await loadRecordStoreSnapshotUnlocked<TRecord, TKey>(root, indexUri, recordKey);
     const actualRevision = current?.revision ?? missingRecordStoreRevision(indexUri);
-    if (actualRevision !== options.expectedRevision) {
+    const defaultsForMissing = options.expectedRevision === missingRecordStoreRevision(indexUri)
+      && !!current && options.isDefaultRecords?.(current.records) === true;
+    if (actualRevision !== options.expectedRevision && !defaultsForMissing) {
       throw new SettingsRevisionConflictError(options.section, options.expectedRevision, actualRevision);
     }
 

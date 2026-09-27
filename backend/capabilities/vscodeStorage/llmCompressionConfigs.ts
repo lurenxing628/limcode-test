@@ -24,6 +24,8 @@ import {
   missingRecordStoreRevision,
   type RecordStoreSnapshot
 } from './recordStore';
+import { storageDirectoryExists } from './localStorageUri';
+import { createStorageRevision } from './storageRevision';
 
 const RECORD_KEY = 'config';
 const CONFIGS_DIR = 'llm-compression-configs';
@@ -40,6 +42,13 @@ export interface LlmCompressionConfigsSettingsResult {
 export async function loadLlmCompressionConfigsSettings(paths: StoragePaths): Promise<LlmCompressionConfigsSettingsResult> {
   const root = configsRootUri(paths);
   const indexUri = configsIndexUri(paths);
+  // No settings directory yet (a new data directory, or the mount point of an unmounted drive): the
+  // default method in memory only, as a missing store; the first save writes it.
+  if (!await storageDirectoryExists(paths.settingsRootUri)) {
+    return compressionSettingsFromSnapshot(indexUri, {
+      records: [normalizeLlmCompressionConfig(createDefaultLlmCompressionConfig(DEFAULT_CONFIG_NAME))], revision: missingRecordStoreRevision(indexUri)
+    });
+  }
   const snapshot = await loadRecordStoreSnapshot<LlmCompressionConfigRecord, typeof RECORD_KEY>(root, indexUri, RECORD_KEY);
   if (snapshot && snapshot.records.length > 0) return compressionSettingsFromSnapshot(indexUri, snapshot);
 
@@ -74,7 +83,7 @@ export async function saveLlmCompressionConfigsSettings(
     configs,
     RECORD_KEY,
     (record) => record.name,
-    { expectedRevision, section: REVISION_SECTION, pruneMissing: true }
+    { expectedRevision, section: REVISION_SECTION, pruneMissing: true, isDefaultRecords: isDefaultCompressionRecords }
   );
   return {
     ...compressionSettingsFromSnapshot(indexUri, committed),
@@ -153,6 +162,15 @@ function normalizeConfigList(input: LlmCompressionConfigRecord[] | undefined): L
   const byId = new Map<string, LlmCompressionConfigRecord>();
   for (const item of input ?? []) byId.set(item.id, normalizeLlmCompressionConfig(item));
   return sortConfigs([...byId.values()]);
+}
+
+/** The store a read initializes: the one default method (its id and timestamps differ every time). */
+function isDefaultCompressionRecords(records: readonly unknown[]): boolean {
+  const comparable = (record: LlmCompressionConfigRecord): string => createStorageRevision({
+    ...normalizeLlmCompressionConfig(record), id: '', createdAt: 0, updatedAt: 0
+  });
+  return records.length === 1
+    && comparable(records[0] as LlmCompressionConfigRecord) === comparable(createDefaultLlmCompressionConfig(DEFAULT_CONFIG_NAME));
 }
 
 function compressionSettingsFromSnapshot(

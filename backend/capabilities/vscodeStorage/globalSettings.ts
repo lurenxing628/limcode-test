@@ -1,4 +1,3 @@
-import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '../../../shared/debugCapture';
 import type {
@@ -18,7 +17,7 @@ import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { readJson, writeJson } from './json';
 import { createDefaultLlmSettings, normalizeLlmSettings } from './llmSettings';
 import { normalizeLlmCompressionSettings } from './llmCompressionConfigs';
-import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
+import { storageDirectoryExists } from './localStorageUri';
 import { withRecordStoreTransaction } from './recordStore';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
 
@@ -183,7 +182,7 @@ export async function writeGlobalSettingsFile(
       ? undefined
       : materializeGlobalSettingsFile(root, section, current);
     const actualRevision = previous?.revision ?? missingGlobalSettingsRevision(uri, section);
-    if (actualRevision !== expectedRevision) {
+    if (!sameGlobalSettingsRevision(uri, section, actualRevision, expectedRevision)) {
       throw new SettingsRevisionConflictError(section, expectedRevision, actualRevision);
     }
     const normalized = getFileBackedSpec(section).normalize(settings as Partial<GlobalSettingsSectionValue> | undefined);
@@ -210,7 +209,7 @@ async function initializeMissingGlobalSettingsFile(
   // Defaults never create the settings directory: on an unmounted drive's mount point that would
   // write LimCode files where the data directory is missing. They are returned unsaved (the revision
   // of a missing file); the first explicit save writes the file.
-  if (!await directoryExists(root)) {
+  if (!await storageDirectoryExists(root)) {
     return { section, settings: getFileBackedSpec(section).createDefault(), filePath: uri.fsPath, revision: missingGlobalSettingsRevision(uri, section) };
   }
   return withRecordStoreTransaction(uri, async () => {
@@ -260,6 +259,19 @@ async function writeGlobalSettingsFileUnlocked(
 
 function missingGlobalSettingsRevision(uri: vscode.Uri, section: GlobalSettingsSection): string {
   return createMissingStorageRevision(`global-settings:${section}:${uri.toString()}`);
+}
+
+/**
+ * A missing file and one holding exactly the defaults are the same state: defaults are written only
+ * once the settings directory exists (see initializeMissingGlobalSettingsFile), so a page that read
+ * them earlier must not see its first save rejected because another read wrote them meanwhile.
+ */
+function sameGlobalSettingsRevision(uri: vscode.Uri, section: GlobalSettingsSection, actual: string, expected: string): boolean {
+  const missing = missingGlobalSettingsRevision(uri, section);
+  const spec = getFileBackedSpec(section);
+  const defaults = createStorageRevision(spec.normalize(spec.createDefault() as Partial<GlobalSettingsSectionValue>));
+  const canonical = (revision: string): string => revision === missing ? defaults : revision;
+  return canonical(actual) === canonical(expected);
 }
 
 function parseGlobalSettingsFile(
@@ -332,10 +344,4 @@ function getFileBackedSpec(section: GlobalSettingsSection): (typeof GLOBAL_SETTI
     throw new Error(`Global settings section "${section}" is not stored by the generic file-backed settings handler.`);
   }
   return GLOBAL_SETTINGS_SECTION_SPECS[section];
-}
-
-async function directoryExists(uri: vscode.Uri): Promise<boolean> {
-  if (isNodeFsStorageUri(uri)) return (await fs.stat(nodeFsStoragePath(uri)).catch(() => undefined))?.isDirectory() === true;
-  const stat = await Promise.resolve(vscode.workspace.fs.stat(uri)).catch(() => undefined);
-  return stat !== undefined && (stat.type & vscode.FileType.Directory) !== 0;
 }

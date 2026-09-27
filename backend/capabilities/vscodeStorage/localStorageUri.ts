@@ -1,3 +1,4 @@
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 
@@ -14,6 +15,16 @@ export function nodeFsStoragePath(uri: vscode.Uri): string {
     throw new Error(`Storage URI is not backed by local node fs: ${uri.toString()}`);
   }
   return resolved;
+}
+
+/**
+ * Whether a storage directory exists (never creates it). Reads use it to leave a missing settings
+ * directory missing: a new data directory, or the mount point of an unmounted data drive.
+ */
+export async function storageDirectoryExists(uri: vscode.Uri): Promise<boolean> {
+  if (isNodeFsStorageUri(uri)) return (await fs.stat(nodeFsStoragePath(uri)).catch(() => undefined))?.isDirectory() === true;
+  const stat = await Promise.resolve(vscode.workspace.fs.stat(uri)).catch(() => undefined);
+  return stat !== undefined && (stat.type & vscode.FileType.Directory) !== 0;
 }
 
 function normalizedFsPath(value: string): string {
