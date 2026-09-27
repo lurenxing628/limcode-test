@@ -987,6 +987,7 @@ export class ReliableConversationRunner {
     // workspace where it can; only what remains unresolved is then closed as outcome_unknown.
     if (!this.active.has(input.turnId)) {
       await this.recoverDeadHostEffectsByInspection(input.conversationId, input.turnId);
+      await this.recordSpawnedChildren(input.turnId);
       const closed = await this.settleDeadHostExecution(input.conversationId, input.turnId);
       if (closed === 'interrupted') return result;
       if (closed === 'live') return { ...await this.interruptThroughOwner(input, result), executingWindowAlive: true };
@@ -1006,6 +1007,49 @@ export class ReliableConversationRunner {
     } catch (error) {
       this.onError(error, { operation: 'watch-recovery', conversationId, turnId });
     }
+  }
+
+  /**
+   * A user's stop of a Turn whose run_agent spawn was dispatched but never receipted (its window
+   * exited in between). The spawn transaction already created the child, so the spawn is recorded as
+   * succeeded through the child scheduler's own recovery transition, under the child Conversation's
+   * short control claim; the stop then closes the parent's wait and the cascade stops the child.
+   * Nothing is driven here.
+   */
+  private async recordSpawnedChildren(turnId: string): Promise<void> {
+    try {
+      const effects = await this.application.phaseDRecovery.deadHostEffectsForTurn(
+        turnId,
+        this.application.database.hostBootId
+      );
+      if (effects.state !== 'unsupported' || !effects.spawnEffectIntentIds) return;
+      for (const effectIntentId of effects.spawnEffectIntentIds) {
+        const childConversationId = await this.spawnedChildConversation(effectIntentId);
+        await this.conversationOwners.run(
+          childConversationId,
+          () => this.application.runtime.children.recoverSpawnIntent(effectIntentId)
+        );
+      }
+    } catch (error) {
+      if (!isConversationRuntimeOwnerBusyError(error)) {
+        this.onError(error, { operation: 'watch-recovery', conversationId: 'unknown', turnId });
+      }
+    }
+  }
+
+  private async spawnedChildConversation(effectIntentId: string): Promise<string> {
+    const [intent] = await listAllDomainRows(this.application.database, 'EffectIntent', { id: effectIntentId });
+    const [attempt] = await listAllDomainRows(this.application.database, 'Attempt', {
+      id: requireId(intent?.attempt_id, 'EffectIntent.attempt_id')
+    });
+    const [operation] = await listAllDomainRows(this.application.database, 'Operation', {
+      id: requireId(attempt?.operation_id, 'Attempt.operation_id')
+    });
+    if (operation?.owner_kind !== 'child_execution') throw new Error(`Spawn ${effectIntentId} has no ChildExecution Operation.`);
+    const [child] = await listAllDomainRows(this.application.database, 'ChildExecution', {
+      id: requireId(operation.owner_id, 'Operation.owner_id')
+    });
+    return requireId(child?.child_conversation_id, 'ChildExecution.child_conversation_id');
   }
 
   private async interruptThroughOwner(

@@ -42,14 +42,16 @@ interface PhaseDScanContext {
  *   arrived but whose Operation is still open; reconciling them only replays a recorded fact;
  * - `live`: a Host that dispatched work still lacking a Receipt, or holds the Turn's lease, is
  *   alive or unverifiable;
- * - `unsupported`: a child spawn or cancel is in flight; the child scheduler owns it;
+ * - `unsupported`: a child spawn or cancel is in flight; the child scheduler owns it. When only spawns
+ *   are in flight, `spawnEffectIntentIds` lists them: the spawn transaction already created each
+ *   child, so a user's stop may record them as spawned (ChildExecutionControlPlane.recoverSpawnIntent);
  * - `dead`: every such Host is proven dead (process gone or PID reused); `effectIntentIds` are the
  *   dispatched or receipted effects that still need a terminal Operation.
  */
 export type DeadHostTurnEffects =
   | { state: 'none'; receiptEffectIntentIds: string[] }
   | { state: 'live'; hostBootIds: string[] }
-  | { state: 'unsupported' }
+  | { state: 'unsupported'; spawnEffectIntentIds?: string[] }
   | { state: 'dead'; hostBootIds: string[]; effectIntentIds: string[] };
 
 interface HangingEffectRecovery {
@@ -545,6 +547,8 @@ export class PhaseDRecoveryScanner {
     const hosts = new Set<string>();
     const dispatched: string[] = [];
     const receipted: string[] = [];
+    const spawns: string[] = [];
+    let cancelInFlight = false;
     for (const call of executing) {
       const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: String(call.id) });
       for (const operation of operations) {
@@ -560,7 +564,11 @@ export class PhaseDRecoveryScanner {
               continue;
             }
             if (intent.dispatch_state !== 'dispatched') continue;
-            if (child) return { state: 'unsupported' };
+            if (child) {
+              if (intent.effect_kind === 'subagent_spawn') spawns.push(String(intent.id));
+              else cancelInFlight = true;
+              continue;
+            }
             const fence = await this.effects.readEffectDispatchFence(String(intent.id));
             // Without a recorded dispatch Host nothing can prove that the work stopped.
             if (!fence) return { state: 'live', hostBootIds: [] };
@@ -571,6 +579,8 @@ export class PhaseDRecoveryScanner {
         }
       }
     }
+    if (cancelInFlight) return { state: 'unsupported' };
+    if (spawns.length > 0) return { state: 'unsupported', spawnEffectIntentIds: spawns };
     if (dispatched.length === 0) return { state: 'none', receiptEffectIntentIds: receipted };
     const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leases.length > 1) throw new Error(`Turn ${turnId} has multiple ExecutionLeases.`);

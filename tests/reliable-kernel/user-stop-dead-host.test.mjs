@@ -339,15 +339,18 @@ test('死宿主判定：派发或持租约的宿主存活即为 live；本窗口
     const inspect = phaseD.deadHostEffectsForTurn.bind(phaseD);
     let inspections = 0;
     phaseD.deadHostEffectsForTurn = async (...args) => {
+      // Only the re-read made while this window holds the Turn's lease sees the changed world.
+      const [held] = await rows(p1.app, 'ExecutionLease', { turn_id: turnId });
+      if (held?.host_boot_id !== self) return inspect(...args);
       inspections += 1;
-      return inspections === 1 ? inspect(...args) : { state: 'live', hostBootIds: ['host-came-back'] };
+      return { state: 'live', hostBootIds: ['host-came-back'] };
     };
     let lease = (await rows(p1.app, 'ExecutionLease', { turn_id: turnId }))[0];
     const recheck = await p1.runner.interrupt({ commandId: 'stop-recheck', conversationId, turnId,
       expectedLeaseGeneration: String(lease.generation), reason: '用户停止' });
     phaseD.deadHostEffectsForTurn = inspect;
     assert.equal(recheck.executingWindowAlive, true);
-    assert.ok(inspections >= 2, '认领租约后在栅栏内复核');
+    assert.ok(inspections >= 1, '认领租约后在栅栏内复核');
     assert.equal((await rows(p1.app, 'Turn', { id: turnId }))[0]?.status, 'active', '复核不是已死：不收尾');
     assert.deepEqual(await rows(p1.app, 'EffectReceipt', { attempt_id: intent.attempt_id }), [], '复核不是已死：不标记');
     lease = (await rows(p1.app, 'ExecutionLease', { turn_id: turnId }))[0];
@@ -501,6 +504,50 @@ test('子 Agent 运行中本窗口移除其项目文件夹：子驱动停在轮�
   }
 });
 
+test('用户停止：子 Agent 派生已派发、执行窗口在写回执前退出——派生事务已建好子执行，按已派生记录，父 Turn 收尾，级联停止子 Agent（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('spawn-dispatched');
+  let p1;
+  let child;
+  try {
+    const conversationId = 'conversation-spawn-dispatched';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId }, 'origin-spawn-dispatched');
+    const spawned = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    const provider = scriptedProvider([]);
+    p1 = await openHost(dataRoot, provider, { folders: [PROJECT_ONE], label: 'p1', children: true });
+    await p1.app.recover();
+    await p1.runner.recoverStartup();
+    await p1.coordinator.recoverStartup();
+    assert.equal((await rows(p1.app, 'EffectIntent', { id: spawned.spawnIntentId }))[0]?.dispatch_state, 'dispatched');
+    assert.equal((await rows(p1.app, 'Turn', { id: spawned.parentTurnId }))[0]?.status, 'active', '自动路径不收尾');
+    // The panel's stop with cascade (VscodeReliableKernelCommandRouter.handleInterruptRequest).
+    const lease = (await rows(p1.app, 'ExecutionLease', { turn_id: spawned.parentTurnId }))[0];
+    const stopped = await p1.runner.interrupt({ commandId: 'stop-parent', conversationId, turnId: spawned.parentTurnId,
+      expectedLeaseGeneration: String(lease.generation), reason: '用户请求中断当前 Turn 及其子执行。' });
+    assert.equal(stopped.executingWindowAlive, undefined);
+    await p1.coordinator.interruptSubtree({ sourceKey: 'stop-parent:child', childExecutionId: spawned.childExecutionId,
+      reason: 'parent_turn_interrupted' }, { userStop: true });
+    const [intent] = await rows(p1.app, 'EffectIntent', { id: spawned.spawnIntentId });
+    assert.equal(intent.dispatch_state, 'receipt_written', '派生按已派生记录');
+    assert.equal((await rows(p1.app, 'EffectReceipt', { attempt_id: intent.attempt_id }))[0]?.outcome, 'succeeded');
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: spawned.parentTurnId }))[0]?.status === 'terminated', 30_000, '父 Turn 未收尾');
+    for (const turn of await rows(p1.app, 'Turn', { conversation_id: spawned.childConversationId })) {
+      await eventually(async () => (await rows(p1.app, 'Turn', { id: turn.id }))[0]?.status === 'terminated', 30_000, '子 Turn 未收尾');
+    }
+    const [execution] = await rows(p1.app, 'ChildExecution', { id: spawned.childExecutionId });
+    assert.equal(['starting', 'active', 'interrupting'].includes(String(execution.status)), false, `子执行仍为 ${execution.status}`);
+    assert.equal(provider.calls, 0, '不调用模型');
+    assert.equal(p1.owns(conversationId), false);
+    assert.equal(p1.owns(spawned.childConversationId), false);
+  } finally {
+    await p1?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 }
 
 /** The executing window: starts a Turn whose MCP call never answers, then waits to be killed. */
@@ -511,6 +558,10 @@ async function runWorker(mode) {
   }
   if (mode === 'origin-parent-waits') {
     await runChildOrigin({ foreground: true });
+    return;
+  }
+  if (mode === 'origin-spawn-dispatched') {
+    await runSpawnDispatchedOrigin();
     return;
   }
   if (mode !== 'origin') throw new Error(`Unknown worker ${mode}.`);
@@ -581,6 +632,35 @@ async function runChildOrigin(options = {}) {
       childExecutionId: execution.id,
       childConversationId: execution.child_conversation_id,
       childTurnId: link.turn_id
+    });
+    await waitForFile(requiredEnv('LIMCODE_DEAD_HOST_FINISH'), 300_000);
+  } finally {
+    await host.close();
+  }
+}
+
+/** The executing window dies after dispatching a run_agent spawn and before writing its receipt. */
+async function runSpawnDispatchedOrigin() {
+  const dataRoot = requiredEnv('LIMCODE_DEAD_HOST_DATA_ROOT');
+  const conversationId = requiredEnv('LIMCODE_DEAD_HOST_CONVERSATION');
+  const provider = scriptedProvider([{ role: 'model', parts: [{ id: 'provider-spawn', functionCall: {
+    name: 'run_agent', args: { operation: 'spawn', taskName: 'spawned', prompt: '子任务', foregroundWaitMs: 0 } } }] }]);
+  const host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO.uri], label: 'origin', children: true });
+  const effects = host.app.runtime.effects;
+  const record = effects.recordEffectReceipt.bind(effects);
+  effects.recordEffectReceipt = (input) => input.effectKind === 'subagent_spawn' ? new Promise(() => {}) : record(input);
+  try {
+    await createConversation(host.app, conversationId, PROJECT_TWO);
+    const started = await host.runner.input({ commandId: `input-${conversationId}`, conversationId, text: '派一个子 Agent' });
+    await eventually(async () => (await rows(host.app, 'EffectIntent', { effect_kind: 'subagent_spawn', dispatch_state: 'dispatched' })).length === 1,
+      60_000, '派生未派发');
+    const [intent] = await rows(host.app, 'EffectIntent', { effect_kind: 'subagent_spawn' });
+    const [execution] = await rows(host.app, 'ChildExecution', {});
+    await writeJson(requiredEnv('LIMCODE_DEAD_HOST_READY'), {
+      parentTurnId: started.turnId,
+      spawnIntentId: intent.id,
+      childExecutionId: execution.id,
+      childConversationId: execution.child_conversation_id
     });
     await waitForFile(requiredEnv('LIMCODE_DEAD_HOST_FINISH'), 300_000);
   } finally {
