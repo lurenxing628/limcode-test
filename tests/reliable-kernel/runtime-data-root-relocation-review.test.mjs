@@ -143,6 +143,23 @@ test('R5 全局规则（AGENTS.md / CLAUDE.md）和全局技能（skills/）随�
   assert.equal(items.get('configuration:CLAUDE.md').deletable, false);
 });
 
+test('#17 用户自己以 .lock、.tmp 结尾的文件（如检查点工作树里的）照常复制并核对；只跳过 LimCode 自己的锁和临时文件的确切名字', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const worktree = path.join(fixture.root, 'checkpoints', 'shadow', 'worktree');
+  await fs.mkdir(worktree, { recursive: true });
+  await fs.writeFile(path.join(worktree, 'yarn.lock'), 'user lock file\n');
+  await fs.writeFile(path.join(worktree, 'draft.tmp'), 'user temporary file\n');
+  await fs.writeFile(path.join(fixture.root, 'agents', `index.json.${process.pid}.${randomUUID()}.tmp`), 'LimCode temporary');
+  const target = path.join(fixture.base, 'moved');
+  const plan = await planWithRuntime(fixture, target);
+  assert.deepEqual(plan.problems, []);
+  await relocate(fixture, plan);
+  const moved = path.join(target, 'checkpoints', 'shadow', 'worktree');
+  assert.equal(await fs.readFile(path.join(moved, 'yarn.lock'), 'utf8'), 'user lock file\n');
+  assert.equal(await fs.readFile(path.join(moved, 'draft.tmp'), 'utf8'), 'user temporary file\n');
+  assert.deepEqual((await fs.readdir(path.join(target, 'agents'))).filter((name) => name.endsWith('.tmp')), [], 'LimCode 自己的临时文件不复制');
+});
+
 test('R6 settings/ 下嵌套的记录存储按记录 id 合并：目标独有的渠道和 MCP 仍在索引里，来源的记录加进来', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   await writeRecordStore(path.join(fixture.root, 'settings'), 'llm-provider-configs', 'config', [{ id: 'provider-source', name: 'source', apiKey: 'sk-source' }]);

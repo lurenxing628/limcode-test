@@ -154,3 +154,19 @@ test('回到旧目录单独走一遍（迁移由后端直接完成）：真实�
   assert.equal(window.window.closed, true, '本窗口的运行时在锁内关闭');
   assert.equal(reloads(), 1);
 });
+
+test('#12 另一个窗口切换了数据目录（例如当前目录不可达时回到旧目录）：仍开着的窗口配置路径固定在它打开时的目录，发现指针变了就拒绝读写配置并提示重载', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const stillOpen = context(storage);
+  await globalStatus.saveGlobalStatus(stillOpen, fixture.root, '');
+  const { pinnedDataRootPaths } = load('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js');
+  const getPaths = pinnedDataRootPaths(stillOpen, fixture.root);
+  assert.equal(getPaths().globalStorageUri.fsPath, fixture.root);
+
+  const elsewhere = path.join(fixture.base, 'elsewhere');
+  await globalStatus.saveGlobalStatus(context(storage), elsewhere, '');
+  await globalStatus.loadCommittedGlobalStatus(stillOpen); // the settings watcher of the open window
+  assert.throws(() => getPaths(), /数据目录已在其它窗口切换到 .*elsewhere.*请重载窗口后再操作/);
+});
