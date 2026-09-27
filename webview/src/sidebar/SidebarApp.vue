@@ -27,6 +27,7 @@ import {
   writeSidebarHostState,
   getPersistedSidebarHostState
 } from './sidebarHost';
+import { deleteConfirmDescriptionHtml, operationNoticeKind, withDeletedDescendants } from './deletePresentation';
 import {
   SIDEBAR_MESSAGE,
   type ConversationHistoryScope,
@@ -82,7 +83,7 @@ const abortRequests = ref<Record<string, {
   turnId: string;
   leaseGeneration: string;
 }>>({});
-const operationNotice = ref<{ text: string; kind: 'info' | 'error' }>();
+const operationNotice = ref<{ text: string; kind: 'info' | 'warning' | 'error' }>();
 const initialHostState = readSidebarHostState();
 const expandedConversationIds = ref<Set<string>>(new Set(initialHostState.expandedConversationIds));
 const userCollapsedConversationIds = ref<Set<string>>(userCollapsedIdsFromState(initialHostState));
@@ -99,8 +100,13 @@ const renameTarget = ref<SidebarConversationHistoryEntry>();
 const deleteTarget = ref<SidebarConversationHistoryEntry>();
 const abortTarget = ref<SidebarConversationHistoryEntry>();
 const historyList = ref<HTMLElement | null>(null);
+// 删除中或已删除的条目连同它下面的子 Agent 对话一起隐藏，子条目不会冒成顶层条目
+const hiddenByDeletion = computed(() => withDeletedDescendants(
+  new Set([...deletingConversationIds.value, ...removedConversationIds.value]),
+  originLinks.value
+));
 const visibleEntries = computed(() => entries.value.filter((entry) =>
-  !deletingConversationIds.value.has(entry.id) && !removedConversationIds.value.has(entry.id)
+  !hiddenByDeletion.value.has(entry.id)
   // 功能3:空会话不显示;但正在运行的会话即使暂无消息也保留,避免误藏进行中会话
   && (entry.messageCount > 0 || entry.isRunning)
 ));
@@ -127,9 +133,7 @@ const historyCountText = computed(() => {
     return `${displayEntries.value.length} 个收藏 · 当前页`;
   }
   // 待删除隐藏数只统计真正因删除/移除被隐藏的条目,不把空会话过滤算进去,避免低估总数
-  const hiddenPendingDeletes = entries.value.filter((entry) =>
-    deletingConversationIds.value.has(entry.id) || removedConversationIds.value.has(entry.id)
-  ).length;
+  const hiddenPendingDeletes = entries.value.filter((entry) => hiddenByDeletion.value.has(entry.id)).length;
   const total = Math.max(0, (pageInfo.value?.total ?? entries.value.length) - hiddenPendingDeletes);
   const page = pageInfo.value ? `第 ${pageInfo.value.pageIndex + 1} 页` : "当前页";
   return `${total} 个对话 · ${page}`;
@@ -199,8 +203,7 @@ const deleteDialogDescriptionHtml = computed(() => {
   const childAgent = deleteTarget.value
     ? originLinkByConversationId.value.get(deleteTarget.value.id)?.originKind === 'agent'
     : false;
-  const parentNotice = childAgent ? '父对话会收到“子任务已删除”的结果。' : '';
-  return `会先停止${target}和它的子任务里正在运行的任务（包括后台进程），然后删除${target}、其启动的所有子 Agent 对话，以及关联消息、工具记录和运行记录，<strong>不能撤销</strong>。${parentNotice}`;
+  return deleteConfirmDescriptionHtml(target, childAgent);
 });
 const abortDialogDescriptionHtml = computed(() => {
   const title = displayConversationTitle(abortTarget.value);
@@ -251,7 +254,7 @@ onMounted(() => {
           : message.status === 'already_satisfied'
             ? '目标任务已经结束，无需再次终止。'
             : '后台任务已终止。');
-      showOperationNotice(text, message.ok ? 'info' : 'error');
+      showOperationNotice(text, operationNoticeKind(message.ok, message.severity));
       return;
     }
     if (message.type !== SIDEBAR_MESSAGE.state) return;
@@ -537,13 +540,13 @@ function clearAbortRequest(conversationId: string): void {
   abortRequests.value = next;
 }
 
-function showOperationNotice(text: string, kind: 'info' | 'error'): void {
+function showOperationNotice(text: string, kind: 'info' | 'warning' | 'error'): void {
   operationNotice.value = { text, kind };
   if (operationNoticeTimer !== undefined) clearTimeout(operationNoticeTimer);
   operationNoticeTimer = setTimeout(() => {
     operationNotice.value = undefined;
     operationNoticeTimer = undefined;
-  }, kind === 'error' ? 5000 : 2600);
+  }, kind === 'info' ? 2600 : 5000);
 }
 
 function historyMeta(entry: SidebarConversationHistoryEntry): string {

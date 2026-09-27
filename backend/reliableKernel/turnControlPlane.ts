@@ -766,6 +766,16 @@ export class TurnControlPlane {
       this.guidanceQueue.cancelQueuedGuidance(command));
   }
 
+  /**
+   * Deleting a Conversation cancels its queued messages from any window, before any of its Turns is
+   * stopped (conversationDeleteCommand), so no ending Turn admits them. Like requestExternalInterrupt
+   * it takes no ownership: the TurnIntent revision fence rejects a stale cancellation, and admission
+   * only takes an intent that is still queued.
+   */
+  public cancelGuidanceForDeletion(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
+    return this.guidanceQueue.cancelQueuedGuidance(command);
+  }
+
   public setGuidanceHold(command: TurnGuidanceHoldCommand): Promise<TurnCommandResult> {
     return this.runOwnedConversationMutation(command.conversationId, () =>
       this.guidanceQueue.reviseGuidanceHold(command));

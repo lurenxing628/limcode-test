@@ -348,6 +348,11 @@ button {
   color: var(--vscode-errorForeground);
 }
 
+.operation-notice.is-warning {
+  border-left-color: var(--vscode-editorWarning-foreground, var(--vscode-notificationsWarningIcon-foreground));
+  color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
 .history-list-shell {
   position: relative;
   flex: 1 1 0;

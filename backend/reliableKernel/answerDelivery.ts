@@ -3,6 +3,7 @@ import {
   type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
+import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import {
   AutomaticRuntimeDeliveryRouter,
   type AutomaticRuntimeDeliveryDecision
@@ -1856,7 +1857,12 @@ export class RuntimeDeliveryControlPlane {
     const payloadLinks = await this.listRows('RuntimeInboxPayloadLink', {
       inbox_item_id: inboxItemId
     }, 2);
-    if (payloadLinks.length !== 1 || payloadLinks[0].content_object_id !== contentObjectId) {
+    // The deletion of a child Conversation hands its waiting parent Turn a notice in place of the
+    // answer (ConversationDeletionControlPlane): the only input whose content is not the payload.
+    const deletedChildNotice = inbox.source_kind === 'answer_submission'
+      && contentType === CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE
+      && payloadLinks.length === 1;
+    if (payloadLinks.length !== 1 || (payloadLinks[0].content_object_id !== contentObjectId && !deletedChildNotice)) {
       throw new Error('Runtime Delivery model projection requires its exact Inbox payload.');
     }
     const metadata = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
@@ -1936,6 +1942,28 @@ export class RuntimeDeliveryControlPlane {
       inbox.source_id,
       'Answer RuntimeInboxItem.source_id'
     );
+    if (deletedChildNotice) {
+      const notice = JSON.parse(contentBytes.toString('utf8')) as Record<string, unknown>;
+      if (notice?.kind !== 'child_answer_source_deleted' || notice.submissionId !== submissionId) {
+        throw new Error('Deleted child notice conflicts with its Inbox source.');
+      }
+      return projectRuntimeDeliveryForModel({
+        kind: 'child_failure',
+        status: 'failed',
+        phase,
+        deliveryId,
+        inboxItemId,
+        targetTurnId,
+        deliveredAt,
+        childExecutionId: requirePhaseFId(notice.childExecutionId, 'Deleted child notice.childExecutionId'),
+        answerBridgeId: requirePhaseFId(notice.answerBridgeId, 'Deleted child notice.answerBridgeId'),
+        submissionId,
+        sourceTurnId: requirePhaseFId(notice.sourceTurnId, 'Deleted child notice.sourceTurnId'),
+        title: notice.title === null ? null : requirePhaseFText(notice.title, 'Deleted child notice.title'),
+        contentType: 'text/plain',
+        content: requirePhaseFText(notice.reason, 'Deleted child notice.reason')
+      });
+    }
     const submission = await this.requireExisting('AnswerSubmission', submissionId);
     const answerBridgeId = requirePhaseFId(
       submission.answer_bridge_id,
@@ -2450,6 +2478,20 @@ function deliveryIdFor(command: ReturnType<typeof normalizeDeliveryCommand>, att
     command.phase,
     attemptSeq.toString()
   );
+}
+
+/**
+ * The steps that hand a pending current_turn delivery to its running target Turn as runtime input,
+ * for a caller that builds its own transaction (the deletion transaction hands a waiting parent Turn
+ * the deletion notice of its child this way).
+ */
+export function runtimeDeliveryInjectionSteps(
+  delivery: DomainRow,
+  targetTurnId: string,
+  contentObjectId: string,
+  now: string
+): RepositoryTransactionStep[] {
+  return injectionSteps(delivery, targetTurnId, contentObjectId, now, false, []);
 }
 
 function injectionSteps(

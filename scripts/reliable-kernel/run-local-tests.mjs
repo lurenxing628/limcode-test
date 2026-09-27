@@ -35,6 +35,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/conversation-host-eligibility.test.mjs',
   'tests/reliable-kernel/user-stop-dead-host.test.mjs',
   'tests/reliable-kernel/conversation-delete-stop.test.mjs',
+  'tests/reliable-kernel/conversation-delete-stop-review.test.mjs',
   'tests/reliable-kernel/conversation-host-eligibility-review.test.mjs',
   'tests/reliable-kernel/plan-and-entry-eligibility.test.mjs',
   'tests/reliable-kernel/eligibility-placement-handback.test.mjs',

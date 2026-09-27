@@ -21,6 +21,7 @@ import type {
   TurnRuntimeContinuationCommand,
   ExecutionLeaseRenewalResult
 } from '../../reliableKernel/turnControlPlane';
+import type { TurnRecoveryFacts, TurnRecoveryJudgment } from '../../reliableKernel/turnRecovery';
 import {
   ExecutionHandoffError,
   isExecutionHandoffError,
@@ -1989,8 +1990,8 @@ export class ReliableConversationRunner {
       }
       for (const deferred of [...this.deferredRecovery.values()]) {
         if (deferred.nextAttemptAt !== undefined && Date.now() < deferred.nextAttemptAt) continue;
-        const facts = await this.application.turns.recoveryFacts(deferred.turnId);
-        if (facts.turnStatus !== 'active' || facts.judgment === 'needs_human') {
+        const facts = await this.recoveryFactsUnlessDeleted(deferred.turnId);
+        if (!facts || facts.turnStatus !== 'active' || facts.judgment === 'needs_human') {
           this.forgetRecoveryCandidate(deferred.turnId);
           continue;
         }
@@ -2044,6 +2045,21 @@ export class ReliableConversationRunner {
     } finally {
       this.externalWakePollInFlight = false;
       this.ensureExternalWakePolling();
+    }
+  }
+
+  /**
+   * A candidate's Turn is gone once its Conversation was deleted (from this window or another one,
+   * after the Turn stopped): nothing is left to recover or settle, so the candidate is dropped.
+   */
+  private async recoveryFactsUnlessDeleted(
+    turnId: string
+  ): Promise<(TurnRecoveryFacts & { judgment: TurnRecoveryJudgment }) | undefined> {
+    try {
+      return await this.application.turns.recoveryFacts(turnId);
+    } catch (error) {
+      if ((await listAllDomainRows(this.application.database, 'Turn', { id: turnId })).length > 0) throw error;
+      return undefined;
     }
   }
 

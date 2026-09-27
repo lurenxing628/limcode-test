@@ -252,7 +252,7 @@
     ],
     "deadLetterQueue": false,
     "targetGone": "目标Conversation/Turn不存在时，RuntimeInboxItem保留为事实，RuntimeDelivery置failed(reason=target-gone)。",
-    "conversationDeletion": "删除对话先停止范围内工作（对话加整棵子Agent树，conversationDeleteCommand）再在删除事务里收尾：投给范围内对话的pending RuntimeDelivery置failed(reason=target-gone)；只删子对话时父对话对它的等待以“子任务对话已被用户删除”取消，它投给范围外父对话、尚未接收的答复置failed(reason=source-gone)，从未路由的答复Inbox置settled；相关Wake与进程完成派发置dead_letter；不新增schema、状态或持久关系。",
+    "conversationDeletion": "删除对话先停止范围内工作（对话加整棵子Agent树，conversationDeleteCommand）再在删除事务里收尾。停止不需要对话归属：排队消息按修订号CAS取消且全部落地后才停Turn，父Turn停止请求先于子树中断持久化，后台进程直接写停止请求文件；原因写“用户删除对话”（被删子对话的父等待写“用户删除子任务对话”）；命令期间本窗口不在范围内开续跑Turn（内存标记）。收尾：投给范围内对话的pending RuntimeDelivery置failed(reason=target-gone)；只删子对话时父对话对它的等待以“用户删除子任务对话”取消；它投给范围外父对话的答复：父Turn有未结束的模型请求时删除等它接收，父Turn在跑但不在请求中时换成删除通知运行时输入（consumed，内容application/vnd.limcode.child-answer-source-deleted+json，不含答复），父对话空闲时置failed(reason=source-gone)；从未路由的答复Inbox置settled；相关Wake与进程完成派发置dead_letter；不新增schema、状态或持久关系。",
     "identity": {
       "attemptSeq": "每个inbox+destination从1开始，phase/target不参与attempt身份",
       "logicalUnique": "(inbox_item_id,target_conversation_id,attempt_seq) UNIQUE；并发路由判定只能产生一个初始attempt=1",

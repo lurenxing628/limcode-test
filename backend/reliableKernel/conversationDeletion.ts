@@ -3,11 +3,16 @@ import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { collaborationConversationDeletionSteps } from './collaborationDeletion';
 import {
+  CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE,
+  CHILD_CONVERSATION_DELETED_NOTICE,
   deadLetterDeliveryWakeSteps,
   deadLetterProcessCompletionDispatchSteps,
   failPendingDeliverySteps,
   settleAvailableInboxItemSteps
 } from './deliverySettlementSteps';
+import { runtimeDeliveryInjectionSteps } from './answerDelivery';
+import type { ContentAddressedStore } from './contentAddressedStore';
+import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { CHILD_TURN_ANSWER_WAIT_OWNER_KIND, LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND } from './childExecution';
 
 export interface ConversationDeleteResult {
@@ -41,8 +46,10 @@ export type ConversationDeletionWorkKind =
   /** A background process that still runs. */
   | 'process'
   /**
-   * A child answer of the scope that a running Turn outside it (its parent) is taking in right now:
-   * the deletion waits for that Turn instead of pulling the answer from under it.
+   * A child answer of the scope addressed to a running parent Turn outside it that is in a model
+   * request right now: the Turn takes it in at the request boundary, the deletion waits for that.
+   * A parent Turn that waits for anything else (an answer, a review, another child, a command)
+   * instead receives the notice that the child was deleted (settlement in the transaction).
    */
   | 'parent_intake';
 
@@ -109,8 +116,10 @@ interface ConversationDeletionSnapshot {
   answerInboxItems: DomainRow[];
   /** RuntimeDelivery rows of the scope's child answers, every target and state. */
   answerDeliveries: DomainRow[];
-  /** Pending answers of the scope addressed to a running Turn outside it (see 'parent_intake'). */
+  /** Pending answers of the scope addressed to a parent Turn outside it that is in a model request. */
   parentIntakes: DomainRow[];
+  /** Pending answers addressed to a running parent Turn outside it that waits for something else. */
+  parentNotices: Array<{ delivery: DomainRow; submission: DomainRow; bridge: DomainRow; title: string | null }>;
   outsideTitles: Record<string, string>;
   wakesByDelivery: Map<string, DomainRow[]>;
   processSources: DomainRow[];
@@ -129,7 +138,46 @@ interface ConversationDeletionSnapshot {
  * transaction.
  */
 export class ConversationDeletionControlPlane {
-  public constructor(private readonly database: RuntimeDatabase) {}
+  /**
+   * `contentStore` lets the transaction hand a waiting parent Turn the deletion notice; without it
+   * such an answer is settled as `source-gone` like one whose parent is idle.
+   */
+  public constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly contentStore?: ContentAddressedStore
+  ) {}
+
+  /** Conversations a deletion command of this window is stopping, reference counted (in memory). */
+  private readonly stopping = new Map<string, number>();
+
+  /**
+   * Marks Conversations as being stopped for deletion by this window until the returned release
+   * runs. Meanwhile this window's runtime-delivery scheduler opens no continuation Turn in them
+   * (createRuntimeDeliveryWakeHandler): a background process or child the deletion stopped would
+   * otherwise report its end to a new Turn that calls the model. The wake stays pending; the
+   * deletion transaction dead-letters it, and a deletion that does not complete releases the mark,
+   * so the wake is delivered as usual. Only the window that owns a Conversation runs its wakes, so
+   * the mark takes effect where this window owns it.
+   */
+  public markStopping(conversationIds: Iterable<string>): () => void {
+    const marked = [...new Set(conversationIds)];
+    for (const id of marked) this.stopping.set(id, (this.stopping.get(id) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      for (const id of marked) {
+        const count = (this.stopping.get(id) ?? 0) - 1;
+        if (count > 0) this.stopping.set(id, count);
+        else this.stopping.delete(id);
+      }
+    };
+  }
+
+  /** Whether a deletion command of this window is stopping this Conversation (see markStopping). */
+  public isStopping(conversationId: string): boolean {
+    return this.stopping.has(conversationId);
+  }
 
   public async delete(conversationIdInput: string): Promise<ConversationDeleteResult | null> {
     const conversationId = requireId(conversationIdInput, 'conversationId');
@@ -141,9 +189,11 @@ export class ConversationDeletionControlPlane {
     const conversationById = new Map(snapshot.conversations.map((row) => [String(row.id), row]));
     const expectedOriginIdsBySource = groupIds(snapshot.sourceOrigins, 'source_conversation_id');
     const expectedChildExecutionIdsByConversation = groupIds(snapshot.childExecutions, 'child_conversation_id');
+    const now = new Date().toISOString();
     const steps: RepositoryTransactionStep[] = [
       ...collaboration.steps,
-      ...settlementSteps(snapshot, collaboration.pendingDeliveryIds, new Date().toISOString())
+      ...await this.parentNoticeSteps(snapshot, now),
+      ...settlementSteps(snapshot, collaboration.pendingDeliveryIds, now)
     ];
 
     for (const targetId of deletionOrder) {
@@ -332,31 +382,79 @@ export class ConversationDeletionControlPlane {
     };
   }
 
-  private async readSnapshot(rootConversationId: string): Promise<ConversationDeletionSnapshot | null> {
-    const [conversations, childExecutions, origins, turns, leases, activeChildTurnLinks] =
-      await Promise.all([
-        listAllDomainRows(this.database, 'Conversation'),
-        listAllDomainRows(this.database, 'ChildExecution'),
-        listAllDomainRows(this.database, 'ConversationOriginLink'),
-        listAllDomainRows(this.database, 'Turn'),
-        listAllDomainRows(this.database, 'ExecutionLease'),
-        listAllDomainRows(this.database, 'ChildExecutionActiveTurnLink')
-      ]);
-    if (!conversations.some((row) => row.id === rootConversationId)) return null;
+  /**
+   * A waiting parent Turn outside the scope takes the child's pending answer in as runtime input
+   * whose content is the deletion notice (never the deleted child's answer); see
+   * AnswerControlPlane.projectInputForModel. Without a content store the answer is settled as
+   * `source-gone` instead.
+   */
+  private async parentNoticeSteps(snapshot: ConversationDeletionSnapshot, now: string): Promise<RepositoryTransactionStep[]> {
+    if (!this.contentStore) {
+      snapshot.parentNotices.splice(0);
+      return [];
+    }
+    const steps: RepositoryTransactionStep[] = [];
+    for (const { delivery, submission, bridge, title } of snapshot.parentNotices) {
+      const notice = await this.contentStore.prepare(this.database, JSON.stringify({
+        kind: 'child_answer_source_deleted',
+        submissionId: String(submission.id),
+        answerBridgeId: String(bridge.id),
+        childExecutionId: String(bridge.child_execution_id),
+        sourceTurnId: String(submission.turn_id),
+        title,
+        reason: CHILD_CONVERSATION_DELETED_NOTICE
+      }), CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE);
+      steps.push(
+        ...preparedContentObjectSteps([notice], 'child_answer_source_deleted'),
+        ...runtimeDeliveryInjectionSteps(delivery, String(delivery.target_turn_id), notice.metadata.id, now)
+      );
+    }
+    return steps;
+  }
 
-    const agentChildConversationIds = new Set(childExecutions.map((row) => String(row.child_conversation_id)));
-    const agentOrigins = origins.filter((row) =>
-      agentChildConversationIds.has(String(row.conversation_id))
-      && typeof row.source_conversation_id === 'string'
-      && row.source_conversation_id.length > 0
-    );
-    const targetConversationIds = collectConversationDescendants(rootConversationId, agentOrigins);
-    const targetChildExecutions = childExecutions.filter((row) =>
-      targetConversationIds.has(String(row.child_conversation_id))
-    );
+  /** Reads only the deletion scope: the root and its Subagent-origin descendants, level by level. */
+  private async readSnapshot(rootConversationId: string): Promise<ConversationDeletionSnapshot | null> {
+    const root = await this.maybeGet('Conversation', rootConversationId);
+    if (!root) return null;
+    const conversations: DomainRow[] = [];
+    const targetChildExecutions: DomainRow[] = [];
+    const agentOrigins: DomainRow[] = [];
+    const sourceOrigins: DomainRow[] = [];
+    const targetConversationIds = new Set<string>();
+    let frontier: Array<{ id: string; row?: DomainRow }> = [{ id: rootConversationId, row: root }];
+    while (frontier.length > 0) {
+      const next: Array<{ id: string }> = [];
+      for (const entry of frontier) {
+        if (targetConversationIds.has(entry.id)) continue;
+        const conversation = entry.row ?? await this.maybeGet('Conversation', entry.id);
+        // A descendant deleted meanwhile is simply not in the scope; the exact-id asserts of the
+        // transaction catch any change of the graph.
+        if (!conversation) continue;
+        targetConversationIds.add(entry.id);
+        conversations.push(conversation);
+        targetChildExecutions.push(...await listAllDomainRows(this.database, 'ChildExecution', { child_conversation_id: entry.id }));
+        const origins = await listAllDomainRows(this.database, 'ConversationOriginLink', { source_conversation_id: entry.id });
+        sourceOrigins.push(...origins);
+        for (const origin of origins) {
+          const childConversationId = String(origin.conversation_id);
+          if (childConversationId === entry.id) continue;
+          // Only a Subagent origin joins the scope: its Conversation belongs to a ChildExecution.
+          if ((await listAllDomainRows(this.database, 'ChildExecution', { child_conversation_id: childConversationId })).length === 0) continue;
+          agentOrigins.push(origin);
+          next.push({ id: childConversationId });
+        }
+      }
+      frontier = next;
+    }
     const targetChildExecutionIds = new Set(targetChildExecutions.map((row) => String(row.id)));
-    const targetTurns = turns.filter((row) => targetConversationIds.has(String(row.conversation_id)));
-    const targetLeases = leases.filter((row) => targetConversationIds.has(String(row.conversation_id)));
+    const perScope = <T extends string>(ids: Iterable<T>, domain: string, key: string, extra: Record<string, unknown> = {}) =>
+      Promise.all([...ids].map((id) => listAllDomainRows(this.database, domain, { [key]: id, ...extra })))
+        .then((rows) => rows.flat());
+    const [targetTurns, targetLeases, activeChildTurnLinks] = await Promise.all([
+      perScope(targetConversationIds, 'Turn', 'conversation_id', { status: 'active' }),
+      perScope(targetConversationIds, 'ExecutionLease', 'conversation_id'),
+      perScope(targetChildExecutionIds, 'ChildExecutionActiveTurnLink', 'child_execution_id')
+    ]);
     const perChild = (domain: string, extra: Record<string, unknown> = {}) => Promise.all([...targetChildExecutionIds]
       .map((childExecutionId) => listAllDomainRows(this.database, domain, { child_execution_id: childExecutionId, ...extra })))
       .then((rows) => rows.flat());
@@ -398,14 +496,31 @@ export class ConversationDeletionControlPlane {
     })))).flat();
     const answerDeliveries = (await Promise.all(answerInboxItems.map((inbox) =>
       listAllDomainRows(this.database, 'RuntimeDelivery', { inbox_item_id: String(inbox.id) })))).flat();
-    const activeTurnIdSet = new Set(turns.filter((row) => row.status === 'active').map((row) => String(row.id)));
-    const parentIntakes = answerDeliveries.filter((row) => row.state === 'pending'
-      && typeof row.target_turn_id === 'string'
-      && !targetConversationIds.has(String(row.target_conversation_id))
-      && activeTurnIdSet.has(row.target_turn_id));
-    const outsideTitles = Object.fromEntries(conversations
-      .filter((row) => parentIntakes.some((delivery) => delivery.target_conversation_id === row.id))
-      .map((row) => [String(row.id), typeof row.title === 'string' ? row.title : '']));
+    // A pending answer of the scope addressed to a running parent Turn outside it.
+    const parentIntakes: DomainRow[] = [];
+    const parentNotices: ConversationDeletionSnapshot['parentNotices'] = [];
+    const outsideTitles: Record<string, string> = {};
+    for (const delivery of answerDeliveries) {
+      if (delivery.state !== 'pending' || delivery.phase !== 'current_turn' || typeof delivery.target_turn_id !== 'string') continue;
+      if (targetConversationIds.has(String(delivery.target_conversation_id))) continue;
+      const targetTurn = await this.maybeGet('Turn', delivery.target_turn_id);
+      if (targetTurn?.status !== 'active') continue;
+      const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: delivery.target_turn_id });
+      if (requests.some((request) => request.status !== 'terminal')) {
+        parentIntakes.push(delivery);
+        const parent = await this.maybeGet('Conversation', String(delivery.target_conversation_id));
+        outsideTitles[String(delivery.target_conversation_id)] = typeof parent?.title === 'string' ? parent.title : '';
+        continue;
+      }
+      const inbox = answerInboxItems.find((row) => row.id === delivery.inbox_item_id);
+      const submission = answerSubmissions.find((row) => row.id === inbox?.source_id);
+      const bridge = answerBridges.find((row) => row.id === submission?.answer_bridge_id);
+      if (!submission || !bridge) continue;
+      // The notice names the child task by its Conversation's title, never by the answer's own title.
+      const execution = targetChildExecutions.find((row) => row.id === bridge.child_execution_id);
+      const child = conversations.find((row) => row.id === execution?.child_conversation_id);
+      parentNotices.push({ delivery, submission, bridge, title: typeof child?.title === 'string' && child.title.trim() ? child.title : null });
+    }
     const pendingDeliveryIds = [...new Set([...targetDeliveries, ...answerDeliveries]
       .filter((row) => row.state === 'pending').map((row) => String(row.id)))];
     const wakesByDelivery = new Map(await Promise.all(pendingDeliveryIds.map(async (deliveryId) =>
@@ -425,15 +540,13 @@ export class ConversationDeletionControlPlane {
     ))).flat();
 
     return {
-      conversations: conversations.filter((row) => targetConversationIds.has(String(row.id))),
+      conversations,
       childExecutions: targetChildExecutions,
       childOrigins: agentOrigins.filter((row) =>
         targetConversationIds.has(String(row.conversation_id))
         && targetConversationIds.has(String(row.source_conversation_id))
       ),
-      sourceOrigins: origins.filter((row) =>
-        targetConversationIds.has(String(row.source_conversation_id))
-      ),
+      sourceOrigins,
       turns: targetTurns,
       leases: targetLeases,
       activeChildTurnLinks: activeChildTurnLinks.filter((row) =>
@@ -451,6 +564,7 @@ export class ConversationDeletionControlPlane {
       answerInboxItems,
       answerDeliveries,
       parentIntakes,
+      parentNotices,
       outsideTitles,
       wakesByDelivery,
       processSources: targetProcessSources,
@@ -531,7 +645,10 @@ function settlementSteps(
   const steps: RepositoryTransactionStep[] = [];
   const settled = new Set(settledCollaborationDeliveries);
   const scope = new Set(snapshot.conversations.map((row) => String(row.id)));
-  const intakes = new Set(snapshot.parentIntakes.map((row) => String(row.id)));
+  const intakes = new Set([
+    ...snapshot.parentIntakes.map((row) => String(row.id)),
+    ...snapshot.parentNotices.map((notice) => String(notice.delivery.id))
+  ]);
   const failDelivery = (delivery: DomainRow, reason: string): void => {
     const deliveryId = requireId(delivery.id, 'RuntimeDelivery.id');
     if (delivery.state !== 'pending' || settled.has(deliveryId) || intakes.has(deliveryId)) return;
@@ -574,28 +691,6 @@ function settlementSteps(
     steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertNone({ inbox_item_id: inboxId, state: 'pending' }));
   }
   return steps;
-}
-
-function collectConversationDescendants(rootId: string, origins: readonly DomainRow[]): Set<string> {
-  const childrenByParent = new Map<string, string[]>();
-  for (const origin of origins) {
-    const parentId = String(origin.source_conversation_id);
-    const childId = String(origin.conversation_id);
-    const children = childrenByParent.get(parentId) ?? [];
-    children.push(childId);
-    childrenByParent.set(parentId, children);
-  }
-  const descendants = new Set<string>([rootId]);
-  const pending = [rootId];
-  while (pending.length > 0) {
-    const parentId = pending.pop()!;
-    for (const childId of childrenByParent.get(parentId) ?? []) {
-      if (descendants.has(childId)) continue;
-      descendants.add(childId);
-      pending.push(childId);
-    }
-  }
-  return descendants;
 }
 
 function descendantFirstConversationIds(rootId: string, origins: readonly DomainRow[]): string[] {

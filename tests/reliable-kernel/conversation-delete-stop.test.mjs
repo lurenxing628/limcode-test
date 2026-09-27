@@ -26,8 +26,8 @@ const { runAgentTool } = await load('backend/world/modules/tools/definitions/run
 const {
   stopAndDeleteConversation,
   isConversationDeleteIncompleteError,
-  CHILD_CONVERSATION_DELETED_REASON,
-  CONVERSATION_DELETED_STOP_REASON
+  CHILD_CONVERSATION_DELETE_REASON,
+  CONVERSATION_DELETE_STOP_REASON
 } = await load('backend/application/reliableKernel/conversationDeleteCommand.js');
 
 const PROVIDER_ID = 'delete-stop-provider';
@@ -93,9 +93,9 @@ test('删除有活动 Turn 和多层活动子 Agent 的树：先停再删，调�
     assert.equal((await rows(p1.app, 'Turn', { status: 'active' })).length, 3, '父、子、孙三个 Turn 都在进行');
     assert.equal((await rows(p1.app, 'ChildExecution', {})).length, 2);
     const callsBefore = provider.calls.length;
-    let announced = 0;
-    const deleted = await deleteCommand(p1, 'parent', { onStopping: () => { announced += 1; } });
-    assert.equal(announced, 1, '需要停止时只提示一次');
+    const progress = [];
+    const deleted = await deleteCommand(p1, 'parent', { onProgress: (entry) => progress.push(entry.kind) });
+    assert.deepEqual(progress, ['stopping'], '需要停止时只提示一次');
     assert.deepEqual([...deleted.deletedConversationIds].sort(), [...roles.keys()].sort(), '整棵树一起删除');
     await quiet(p1, 1_500);
     assert.equal(provider.calls.length, callsBefore, '先停再删：Provider 调用次数不再增加');
@@ -195,7 +195,7 @@ test('删除有排队消息的对话：排队消息先取消，不被准入；�
   await fs.rm(outer, { recursive: true, force: true });
 });
 
-test('只删子对话：父 Turn 拿到“子任务对话已被用户删除”的结果并继续；父对话里子 Agent 没接收的答复被收尾', { timeout: 180_000 }, async () => {
+test('只删子对话：父 Turn 拿到“用户删除子任务对话”的结果并继续；父对话里子 Agent 没接收的答复被收尾', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('child-only');
   const parentRequests = [];
   let background = false;
@@ -225,7 +225,7 @@ test('只删子对话：父 Turn 拿到“子任务对话已被用户删除”�
     const continued = parentRequests.filter((request) => request.conversationId === 'parent');
     // 子 Agent 停下时的部分答复若赶上仍在跑的父 Turn，会被它一并接收，因此可能多一次调用；第一次继续一定带着删除原因。
     assert.ok(continued.length >= 2, '父 Turn 拿到结果后继续调用模型');
-    assert.ok(JSON.stringify(continued[1].context).includes(CHILD_CONVERSATION_DELETED_REASON), '父的等待结果写明子任务对话已被用户删除');
+    assert.ok(JSON.stringify(continued[1].context).includes(CHILD_CONVERSATION_DELETE_REASON), '父的等待结果写明是用户删除了子任务对话');
     assert.equal((await rows(p1.app, 'Conversation', { id: 'parent' })).length, 1, '父对话保留');
     await assertNoPendingResults(p1.app);
 
@@ -417,7 +417,7 @@ function deleteCommand(host, conversationId, options = {}) {
   }, {
     conversationId,
     requestId: `delete-${conversationId}-${Date.now()}`,
-    ...(options.onStopping ? { onStopping: options.onStopping } : {})
+    ...(options.onProgress ? { onProgress: options.onProgress } : {})
   });
 }
 
@@ -789,4 +789,4 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-void CONVERSATION_DELETED_STOP_REASON;
+void CONVERSATION_DELETE_STOP_REASON;

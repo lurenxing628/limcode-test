@@ -61,6 +61,8 @@ export type ExtensionToSidebarMessage =
       status?: 'committed' | 'already_applied' | 'already_satisfied' | 'stale';
       runId?: string;
       deletedConversationIds?: string[];
+      /** 'warning': a deletion that did not complete in time (its stop requests stay). */
+      severity?: 'warning';
       message?: string;
     };
 

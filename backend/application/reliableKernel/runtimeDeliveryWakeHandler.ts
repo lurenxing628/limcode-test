@@ -49,6 +49,12 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
       return { acknowledged: false };
     }
     await dependencies.ready?.();
+    if (request.action !== 'resume_current_turn' && application.conversationDeletion.isStopping(request.conversationId)) {
+      // This window is stopping the Conversation to delete it: the end of what it stopped opens no
+      // Turn. The wake stays pending; the deletion settles it, or it is delivered if the deletion
+      // does not complete.
+      return { acknowledged: false };
+    }
     if (request.action === 'resume_current_turn') {
       if (!request.targetTurnId) return { acknowledged: false };
       // This is a scheduling hint. The loop absorbs committed input at a safe protocol boundary.

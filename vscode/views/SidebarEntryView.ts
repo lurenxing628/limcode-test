@@ -366,9 +366,11 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
         const message = error instanceof Error ? error.message : '删除对话失败。';
         console.warn('[LimCode] Failed to delete sidebar conversation.', error);
         await this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
-        await this.postConversationOperationResult(webview, 'delete', conversationId, false, message);
         // Work that did not stop in time is not a refusal: the stop requests stay, deleting again completes.
-        if (isConversationDeleteIncompleteError(error)) void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${message}`);
+        const incomplete = isConversationDeleteIncompleteError(error);
+        await this.postConversationOperationResult(webview, 'delete', conversationId, false, message,
+          incomplete ? { severity: 'warning' } : {});
+        if (incomplete) void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${message}`);
         else void vscode.window.showErrorMessage(`${EXTENSION_BRAND}: ${message}`);
       }
     })();
@@ -423,6 +425,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
       status?: 'committed' | 'already_applied' | 'already_satisfied' | 'stale';
       runId?: string;
       deletedConversationIds?: string[];
+      severity?: 'warning';
     } = {}
   ): Promise<void> {
     try {

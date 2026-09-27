@@ -191,7 +191,7 @@ export class ReliableKernelApplication {
       authorityCompiler: dependencies.authorityCompiler,
       attachments: this.attachments
     });
-    this.conversationDeletion = new ConversationDeletionControlPlane(database);
+    this.conversationDeletion = new ConversationDeletionControlPlane(database, contentStore);
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
     this.compression = new ContextCompressionControlPlane(database, contentStore, options);
     this.modelProvider = new ModelProviderControlPlane(database, contentStore, {

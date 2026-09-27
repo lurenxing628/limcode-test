@@ -39,7 +39,7 @@ import {
 import { BridgeMessageType } from '../../../shared/protocol';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
 import { STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE } from './conversationHostEligibility';
-import { CONVERSATION_DELETE_PROGRESS_TITLE, stopAndDeleteConversation } from './conversationDeleteCommand';
+import { stopAndDeleteConversation } from './conversationDeleteCommand';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
 import type {
   BridgeClientId,
@@ -464,6 +464,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.requireOpen();
     let finishProgress: (() => void) | undefined;
     const progressDone = new Promise<void>((resolve) => { finishProgress = resolve; });
+    let report: ((message: string) => void) | undefined;
+    let latestMessage = '';
     try {
       const deleted = await stopAndDeleteConversation({
         application: this.product.application,
@@ -472,11 +474,22 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       }, {
         conversationId,
         requestId: randomUUID(),
-        onStopping: () => {
+        // One notification while the command waits; its text follows what it waits for.
+        onProgress: (progress) => {
+          latestMessage = progress.message;
+          if (report) {
+            report(progress.message);
+            return;
+          }
+          report = () => undefined;
           void vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
-            title: `${EXTENSION_BRAND}：${CONVERSATION_DELETE_PROGRESS_TITLE}`
-          }, () => progressDone);
+            title: EXTENSION_BRAND
+          }, (notification) => {
+            report = (message) => notification.report({ message });
+            notification.report({ message: latestMessage });
+            return progressDone;
+          });
         }
       });
       if (!deleted) return null;

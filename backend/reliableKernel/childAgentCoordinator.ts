@@ -2769,7 +2769,10 @@ export class ReliableChildAgentCoordinator {
       if (!bridge || bridge.current_submission_id === null) continue;
       const submissionId = requireId(bridge.current_submission_id, 'AnswerBridge.current_submission_id');
       const submission = await this.get('AnswerSubmission', submissionId);
-      if (!submission) throw new Error(`AnswerBridge references missing AnswerSubmission ${submissionId}.`);
+      if (!submission) {
+        if (!await this.get('ChildExecution', childExecutionId)) continue;
+        throw new Error(`AnswerBridge references missing AnswerSubmission ${submissionId}.`);
+      }
       currentSubmissionById.set(submissionId, submission);
       childBySubmissionId.set(submissionId, childExecutionId);
     }
@@ -2782,11 +2785,13 @@ export class ReliableChildAgentCoordinator {
       const submissionId = requireId(submission.id, 'AnswerSubmission.id');
       // Wait settlements and delivery routing mutate the parent Conversation; only its owner may
       // cross that edge. A foreign parent's durable answer waits for its own coordinator pass.
-      const parentConversationId = await this.parentConversationForChild(
-        childBySubmissionId.get(submissionId)!,
+      const childExecutionId = childBySubmissionId.get(submissionId)!;
+      // A child deleted with its Conversation during this pass leaves nothing to reconcile; the
+      // pass goes on with the other children instead of failing whoever shares it.
+      const ran = await this.reconcileCommittedAnswer(childExecutionId, () => this.parentConversationForChild(
+        childExecutionId,
         parentConversationCache
-      );
-      const ran = await gate.run(parentConversationId, async () => {
+      ).then((parentConversationId) => gate.run(parentConversationId, async () => {
         const sourceTurnId = requireId(submission.turn_id, 'AnswerSubmission.turn_id');
         let disposition = await this.dependencies.answers.classifyDeliveryRecovery(submissionId);
         if (disposition.kind === 'existing') {
@@ -2830,8 +2835,17 @@ export class ReliableChildAgentCoordinator {
         })) {
           await this.deliverBackgroundAnswer(waits.answerBridgeId, waits.inboxItemId);
         }
-      });
-      if (!ran.ran) continue;
+      })));
+      if (!ran?.ran) continue;
+    }
+  }
+
+  private async reconcileCommittedAnswer<T>(childExecutionId: string, reconcile: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await reconcile();
+    } catch (error) {
+      if (!await this.get('ChildExecution', childExecutionId)) return undefined;
+      throw error;
     }
   }
 

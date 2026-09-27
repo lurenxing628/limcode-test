@@ -136,6 +136,7 @@ const KNOWN_CONTENT_TYPE_ENTRIES: ReadonlyArray<readonly [string, RuntimeContent
   ['application/vnd.limcode.native-child-handle-projection+json', 'childDelivery', '子 Agent 句柄'],
   ['application/vnd.limcode.runtime-delivery-model+json', 'childDelivery', '投递给模型的内容'],
   ['application/vnd.limcode.process-completion+json', 'childDelivery', '进程完成投递'],
+  ['application/vnd.limcode.child-answer-source-deleted+json', 'childDelivery', '子任务删除通知'],
   ['text/vnd.limcode.collaboration-message', 'childDelivery', '协作消息'],
   ['application/vnd.limcode.ask-user-prompt+json', 'interaction', '向用户提问'],
   ['application/vnd.limcode.ask-user-response+json', 'interaction', '用户回答'],

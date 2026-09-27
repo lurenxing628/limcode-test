@@ -1,5 +1,14 @@
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 
+/** What a waiting parent Turn is told when the user deleted the child Conversation whose answer it was owed. */
+export const CHILD_CONVERSATION_DELETED_NOTICE = '子任务对话已被用户删除，它的答复不会再送达。';
+
+/**
+ * Content type of the runtime input that replaces such an answer: the child's identity as it was
+ * when it was deleted, and the notice. Never the deleted child's answer text.
+ */
+export const CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE = 'application/vnd.limcode.child-answer-source-deleted+json';
+
 /**
  * Transaction steps that give up a result nobody will receive, shared by every "abandon" transition
  * (the deletion transaction with `target-gone` / `source-gone`, a data-root relocation with its own
