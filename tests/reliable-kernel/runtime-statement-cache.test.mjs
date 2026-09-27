@@ -106,6 +106,40 @@ test('同一 SQL 按不同模式先后取用，每次结果形状都与新 prepa
   }
 });
 
+test('挂接后改连接默认 safeIntegers 会报错，缓存语句与新 prepare 始终一致；解除挂接后恢复', () => {
+  const statementCache = cacheModule();
+  const sql = 'SELECT n FROM t WHERE id = ?';
+  const database = memoryDatabase();
+  try {
+    statementCache.attachRuntimeStatementCache(database);
+    assert.deepEqual(statementCache.prepareCached(database, sql).get('row-1'), { n: 1n });
+    assert.throws(() => database.defaultSafeIntegers(false), /must not change while a Runtime statement cache is attached/);
+    assert.equal(database.defaultSafeIntegers(true), database, 'setting the same default again is allowed');
+    assert.equal(database.defaultSafeIntegers(), database, 'the argument defaults to true, as in better-sqlite3');
+    assert.deepEqual(statementCache.prepareCached(database, sql).get('row-1'), { n: 1n });
+    assert.deepEqual(database.prepare(sql).get('row-1'), { n: 1n }, 'a fresh prepare still agrees with the cached one');
+
+    statementCache.detachRuntimeStatementCache(database);
+    assert.equal(Object.hasOwn(database, 'defaultSafeIntegers'), false);
+    database.defaultSafeIntegers(false);
+    assert.deepEqual(database.prepare(sql).get('row-1'), { n: 1 }, 'a detached connection changes its default freely');
+  } finally {
+    database.close();
+  }
+
+  const numbers = memoryDatabase({ safeIntegers: false });
+  try {
+    statementCache.attachRuntimeStatementCache(numbers);
+    assert.throws(() => numbers.defaultSafeIntegers(), /must not change/);
+    assert.throws(() => numbers.defaultSafeIntegers(true), /must not change/);
+    numbers.defaultSafeIntegers(false);
+    assert.deepEqual(statementCache.prepareCached(numbers, sql).get('row-2'), { n: 2 });
+  } finally {
+    statementCache.detachRuntimeStatementCache(numbers);
+    numbers.close();
+  }
+});
+
 test('迭代中重入同一 SQL 使用私有语句，不报 statement busy，也不进缓存', () => {
   const statementCache = cacheModule();
   const database = memoryDatabase();

@@ -9,7 +9,10 @@ export type RuntimeStatementRows = 'object' | 'pluck' | 'raw' | 'expand';
 export interface RuntimeStatementMode {
   /** Row shape of a statement that returns data; defaults to plain objects. */
   rows?: RuntimeStatementRows;
-  /** BigInt integers; defaults to the connection's own default, as for a fresh prepare. */
+  /**
+   * BigInt integers; defaults to the connection's default when the cache was attached, as for a
+   * fresh prepare. That default must not change while the cache is attached (the change throws).
+   */
   safeIntegers?: boolean;
 }
 
@@ -52,11 +55,14 @@ interface NormalizedMode {
  * every hit, so a Statement always behaves like the fresh prepare it replaces. A Statement that is
  * still iterating is never handed out twice. The cache belongs to exactly one connection object and
  * is dropped with it; another connection, a reopened worker or a changed main schema starts empty.
+ * The connection's default safeIntegers must not change after attaching: cached Statements keep the
+ * default read at attach time, so attachRuntimeStatementCache makes such a change throw.
  */
 export class RuntimeStatementCache {
   private readonly entries = new Map<string, Database.Statement>();
   private readonly schemaVersionStatement: Database.Statement;
-  private readonly connectionSafeIntegers: boolean;
+  /** The connection default read when the cache was created; every cached Statement uses it. */
+  public readonly connectionSafeIntegers: boolean;
   private schemaVersion: bigint;
   private closed = false;
   private prepares = 0;
@@ -193,7 +199,12 @@ function applyMode(statement: Database.Statement, mode: NormalizedMode): Databas
 
 const caches = new WeakMap<object, RuntimeStatementCache>();
 
-/** Attaches a new cache to one connection; a connection never shares or inherits a cache. */
+/**
+ * Attaches a new cache to one connection; a connection never shares or inherits a cache.
+ * Set the connection's default safeIntegers before attaching and never change it afterwards:
+ * a cached Statement keeps the default of the attach time while a fresh prepare would follow the
+ * new one. Until the cache is detached, `defaultSafeIntegers` with another value throws.
+ */
 export function attachRuntimeStatementCache(
   database: Database.Database,
   maxEntries: number = RUNTIME_STATEMENT_CACHE_MAX_ENTRIES
@@ -201,13 +212,28 @@ export function attachRuntimeStatementCache(
   if (caches.has(database)) throw new Error('Runtime statement cache is already attached to this connection.');
   const cache = new RuntimeStatementCache(database, maxEntries);
   caches.set(database, cache);
+  const attachedDefault = cache.connectionSafeIntegers;
+  const setDefault = database.defaultSafeIntegers;
+  Object.defineProperty(database, 'defaultSafeIntegers', {
+    configurable: true,
+    writable: true,
+    value: (toggle?: boolean) => {
+      if ((toggle ?? true) !== attachedDefault) {
+        throw new Error('The connection default safeIntegers must not change while a Runtime statement cache is attached.');
+      }
+      return setDefault.call(database, attachedDefault);
+    }
+  });
   return cache;
 }
 
 /** Detaches and closes the connection's cache; call before closing the connection. */
 export function detachRuntimeStatementCache(database: Database.Database): void {
-  caches.get(database)?.close();
+  const cache = caches.get(database);
+  if (!cache) return;
+  cache.close();
   caches.delete(database);
+  Reflect.deleteProperty(database, 'defaultSafeIntegers');
 }
 
 /**
