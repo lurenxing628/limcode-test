@@ -313,7 +313,8 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
   const application = {
     ...mergeHost(),
     async dispose() { events.push('dispose'); },
-    async startRuntimeRecovery() { events.push('recover'); }
+    async startRuntimeRecovery() { events.push('recover'); },
+    dataRootPath() { return '/fixture/data-root'; }
   };
   const lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {});
   const management = fixture({ lifetime, upgradeError, mergeHook,
@@ -350,6 +351,8 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
       } }
     },
     './commands/runtimeDataSetManagement': management,
+    // No data-directory move in progress: nothing to wait for or finish.
+    './commands/dataRootRelocation': { async beforeDataRootOpen() { return undefined; }, async afterDataRootOpened() {} },
     './watchers/GlobalSettingsWatcher': { registerGlobalSettingsWatcher() {} },
     './runtimeExclusiveMaintenance': {
       startExclusiveMaintenanceParticipant(host, options) {
