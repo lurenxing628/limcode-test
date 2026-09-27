@@ -161,6 +161,7 @@ function context(storage) {
   };
 }
 
+const NOW_ISO = new Date('2026-09-27T00:00:00.000Z').toISOString();
 const failures = () => ui.calls.filter(([kind, title]) => kind === 'error' || (kind === 'prompt' && /没有|失败|不能/.test(title)));
 const reloads = () => ui.calls.filter(([kind, command]) => kind === 'command' && command === 'workbench.action.reloadWindow').length;
 
@@ -365,4 +366,193 @@ test('reloc2 #5：旧版本设置的自定义目录（指针没有身份）第�
   const loaded = await globalSettings.loadGlobalSettingsFile(MockUri.file(unmounted), 'appearance');
   assert.ok(loaded.settings && loaded.revision);
   await assert.rejects(fs.stat(path.join(fixture.base, 'mnt')), { code: 'ENOENT' });
+});
+
+/** An existing LimCode directory copied here from elsewhere (its RootBindings name another path). */
+async function copiedHome(fixture) {
+  const target = path.join(fixture.base, 'copied-home');
+  const elsewhere = path.join(fixture.base, 'elsewhere');
+  await createLimCodeTarget(elsewhere);
+  await fs.cp(elsewhere, target, { recursive: true });
+  await fs.rm(elsewhere, { recursive: true, force: true });
+  return { target, before: await treeSnapshot(target) };
+}
+
+const asidesIn = async (directory) => (await fs.readdir(directory)).filter((name) => name.includes('.limcode-copied-'));
+
+test('reloc3 问题 2（R3-A）拷来的目标：完成阶段失败、撤销最后把拷贝改回原名时 EPERM：不算撤销完，保留进行中记录并写明拷贝在哪；下次启动改回', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const { target, before } = await copiedHome(fixture);
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const first = await openWindow(t, fixture.root);
+  ui.calls.length = 0;
+  ui.picked = target;
+  const fsp = require('node:fs/promises');
+  const rename = fsp.rename;
+  let selectionFailures = 0;
+  fsp.rename = async function (from, to, ...rest) {
+    // Completion fails writing the new root's selection file; putting the copy back is refused (a Windows sharing violation).
+    if (path.basename(String(to)) === '.limcode-runtime-selection.json' && path.dirname(String(to)) === target && selectionFailures === 0) {
+      selectionFailures += 1;
+      throw Object.assign(new Error('EIO: injected failure writing the selection'), { code: 'EIO' });
+    }
+    if (String(from).includes('.limcode-copied-') && path.resolve(String(to)) === target) {
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+    }
+    return rename.call(this, from, to, ...rest);
+  };
+  try {
+    await commands.relocateDataRoot(vscodeContext, first.startup, { clientId: 'client-1' });
+  } finally { fsp.rename = rename; }
+  const trace = () => JSON.stringify(ui.calls, null, 1);
+  const [aside] = await asidesIn(fixture.base);
+  assert.ok(aside, '前提：拷贝留在旁边');
+  const status = await globalStatus.loadCommittedGlobalStatus(vscodeContext);
+  assert.equal(status.pendingRelocation?.targetRootPath, target, `拷贝没改回原名：进行中记录保留给下次启动：${trace()}`);
+  const error = ui.calls.find(([kind]) => kind === 'error');
+  assert.match(error?.[2] ?? '', /没能全部撤销/);
+  assert.ok((error?.[2] ?? '').includes(path.join(fixture.base, aside)), '提示写明拷贝在哪');
+
+  // The next startup (a new process) puts the copy back.
+  const statusFile = path.join(storage, globalStatus.LIMCODE_GLOBAL_STATUS_FILE);
+  const saved = JSON.parse(await fs.readFile(statusFile, 'utf8'));
+  saved.pendingRelocation.processId = spawnSync(process.execPath, ['-e', '']).pid;
+  delete saved.pendingRelocation.processStartIdentity;
+  await fs.writeFile(statusFile, `${JSON.stringify(saved, null, 2)}\n`);
+  const restarted = context(storage);
+  assert.equal(await commands.beforeDataRootOpen(restarted), undefined);
+  assert.ok(!(await globalStatus.loadCommittedGlobalStatus(restarted)).pendingRelocation);
+  assert.deepEqual(await asidesIn(fixture.base), []);
+  const after = await treeSnapshot(target);
+  for (const [file, digest] of Object.entries(before)) assert.equal(after[file], digest, `改回原样：${file}`);
+});
+
+test('reloc3 问题 2（R3-A2）拷来的目标：改名挪开之后目录 fsync 失败：准备阶段把拷贝改回原名，如实提示已撤销、清除进行中记录', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const { target, before } = await copiedHome(fixture);
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const first = await openWindow(t, fixture.root);
+  ui.calls.length = 0;
+  ui.picked = target;
+  const durable = require(path.join(compiled, 'backend/capabilities/filesystem/durableDirectorySync.js'));
+  const sync = durable.syncDirectoryDurably;
+  let injected = 0;
+  durable.syncDirectoryDurably = async function (directory, ...rest) {
+    if (injected === 0 && (await asidesIn(fixture.base)).length > 0 && path.resolve(directory) === fixture.base) {
+      injected += 1;
+      throw Object.assign(new Error('EIO: injected directory fsync failure'), { code: 'EIO' });
+    }
+    return sync.call(this, directory, ...rest);
+  };
+  try {
+    await commands.relocateDataRoot(vscodeContext, first.startup, { clientId: 'client-1' });
+  } finally { durable.syncDirectoryDurably = sync; }
+  assert.equal(injected, 1, '前提：注入生效');
+  assert.deepEqual(await asidesIn(fixture.base), [], '拷贝已改回原名');
+  assert.ok(!(await globalStatus.loadCommittedGlobalStatus(vscodeContext)).pendingRelocation);
+  assert.match(ui.calls.filter(([kind]) => kind === 'prompt').at(-1)?.[2] ?? '', /本次做的改动已撤销/);
+  const after = await treeSnapshot(target);
+  for (const [file, digest] of Object.entries(before)) assert.equal(after[file], digest, `原样：${file}`);
+  assert.equal(first.window.closed, false, '准备阶段失败：本窗口的运行时照常打开');
+});
+
+test('reloc3 #6 准备阶段撤销没做完、进行中记录属于本窗口：同一窗口再点迁移时不说“另一个窗口在迁移”，而是先把本窗口上次的撤销做完再迁移', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const { target } = await copiedHome(fixture);
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const window = await openWindow(t, fixture.root);
+  ui.calls.length = 0;
+  ui.picked = target;
+  const merge = require(path.join(compiled, 'backend/reliableKernel/runtimeDataSetMerge.js'));
+  const precopy = merge.precopyRuntimeDataSetCas;
+  const fsp = require('node:fs/promises');
+  const rename = fsp.rename;
+  let failing = true;
+  merge.precopyRuntimeDataSetCas = async function (...args) {
+    if (failing) throw Object.assign(new Error('注入：预复制时磁盘已满'), { code: 'ENOSPC' });
+    return precopy.apply(this, args);
+  };
+  fsp.rename = async function (from, to, ...rest) {
+    if (failing && String(from).includes('.limcode-copied-') && path.resolve(String(to)) === target) {
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+    }
+    return rename.call(this, from, to, ...rest);
+  };
+  t.after(() => { merge.precopyRuntimeDataSetCas = precopy; fsp.rename = rename; });
+  await commands.relocateDataRoot(vscodeContext, window.startup, { clientId: 'client-1' });
+  const trace = () => JSON.stringify(ui.calls, null, 1);
+  assert.equal(window.window.closed, false);
+  assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).pendingRelocation?.processId, process.pid, `前提：本窗口的记录留着：${trace()}`);
+  assert.equal((await asidesIn(fixture.base)).length, 1);
+  failing = false;
+  ui.calls.length = 0;
+  await commands.relocateDataRoot(vscodeContext, window.startup, { clientId: 'client-1' });
+  assert.ok(!JSON.stringify(ui.calls).includes('另一个 LimCode 窗口正在迁移'), trace());
+  assert.deepEqual(failures(), [], `这次迁移成功：${trace()}`);
+  assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootPath, target);
+  assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
+});
+
+test('reloc3 F1/问题 1 真实的 Facade.open：新目录里有发起进程还在的迁移时拒绝打开（reason relocating）；撤销之后打开时为旧版本设置的自定义目录记下身份', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'existing');
+  await createLimCodeTarget(target);
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, target, '');
+  const plan = await planWithRuntime(fixture, target);
+  const source = await kernel.RuntimeDatabase.open(fixture.current.authority, { hostBootId: `window-${randomUUID()}` });
+  let staged;
+  try { staged = await relocation.stageDataRootRelocation(plan, source); } finally { await source.close(); }
+  const open = () => Facade.open(vscodeContext).then(async (facade) => { await facade.dispose(); return undefined; }, (error) => error);
+  const refused = await open();
+  assert.equal(refused?.reason, 'relocating', `拒绝打开：${refused?.message}`);
+  assert.ok(!(await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootId, '拒绝时什么都不记');
+  await relocation.abandonStagedDataRootRelocation(staged);
+  // The rest of opening needs a real VS Code; the identity is recorded before that, inside the admission.
+  const opened = await open();
+  assert.notEqual(opened?.reason, 'relocating');
+  const recorded = (await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootId;
+  assert.ok(recorded, `打开时记下了身份：${opened?.message}`);
+  assert.equal(recorded, await relocation.readDataRootIdentity(target));
+});
+
+test('reloc3 G1 globalStatus 的进行中记录按比较后写入：已有别的进行中迁移时拒绝写入；清除只清自己的', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const pending = (id) => ({ relocationId: id, sourceRootPath: fixture.root, targetRootPath: path.join(fixture.base, 'x'), startedAt: NOW_ISO, processId: process.pid });
+  const first = randomUUID();
+  const second = randomUUID();
+  await globalStatus.updateGlobalStatusDataRoot(vscodeContext, { pendingRelocation: pending(first), expectedPendingRelocationId: null });
+  await assert.rejects(globalStatus.updateGlobalStatusDataRoot(vscodeContext, { pendingRelocation: pending(second), expectedPendingRelocationId: null }),
+    { code: 'global-status-pending-relocation-conflict' });
+  await globalStatus.updateGlobalStatusDataRoot(vscodeContext, { pendingRelocation: null, expectedPendingRelocationId: second });
+  assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).pendingRelocation?.relocationId, first, '别人的记录不被清掉');
+  await globalStatus.updateGlobalStatusDataRoot(vscodeContext, { pendingRelocation: null, expectedPendingRelocationId: first });
+  assert.ok(!(await globalStatus.loadCommittedGlobalStatus(vscodeContext)).pendingRelocation);
+});
+
+test('reloc3 F4 冻结的窗口只认领自己已持有的对话，解冻后照常按资格认领', async () => {
+  const productModule = load('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js');
+  const product = Object.assign(Object.create(productModule.VscodeReliableKernelProductRuntime.prototype), { executionGate: { frozen: 0 } });
+  const probe = productModule.freezableClaimProbe(product.executionGate, { owns: (id) => id === 'owned' }, async (id) => id !== 'ineligible');
+  assert.deepEqual([await probe('new'), await probe('owned'), await probe('ineligible')], [true, true, false]);
+  const thaw = product.freezeNewExecution();
+  assert.deepEqual([await probe('new'), await probe('owned'), await probe('ineligible')], [false, true, false]);
+  thaw();
+  thaw();
+  assert.deepEqual([await probe('new'), await probe('owned')], [true, true], '解冻可以重复调用');
 });

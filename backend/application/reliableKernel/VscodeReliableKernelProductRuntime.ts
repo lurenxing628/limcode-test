@@ -420,10 +420,9 @@ export class VscodeReliableKernelProductRuntime {
       // the Conversation back right after; a probe failure never counts as eligible.
       // A frozen window (an exclusive maintenance is about to close its Runtime) takes up no new
       // Conversation; the ones it owns keep running (see freezeNewExecution).
-      runtimeDatabase.conversationOwners.setClaimEligibilityProbe(
-        async (conversationId) => (executionGate.frozen === 0 || runtimeDatabase.conversationOwners.owns(conversationId))
-          && (await conversationEligibility(conversationId)).eligible
-      );
+      runtimeDatabase.conversationOwners.setClaimEligibilityProbe(freezableClaimProbe(
+        executionGate, runtimeDatabase.conversationOwners, async (conversationId) => (await conversationEligibility(conversationId)).eligible
+      ));
       // New input starts a Turn: an idle Conversation may start wherever the work environment its
       // next Turn would freeze is available, even after its project folder moved.
       const conversationEntryEligibility = (
@@ -801,4 +800,16 @@ export function pinnedDataRootPaths(context: vscode.ExtensionContext, configurat
     }
     return pinned;
   };
+}
+
+/**
+ * The claim probe of a window: while frozen (see VscodeReliableKernelProductRuntime.freezeNewExecution)
+ * it claims only the Conversations it owns already; otherwise its host eligibility decides.
+ */
+export function freezableClaimProbe(
+  executionGate: { frozen: number },
+  owners: { owns(conversationId: string): boolean },
+  eligible: (conversationId: string) => Promise<boolean>
+): (conversationId: string) => Promise<boolean> {
+  return async (conversationId) => (executionGate.frozen === 0 || owners.owns(conversationId)) && await eligible(conversationId);
 }
