@@ -44,6 +44,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/conversation-history-scope-count.test.mjs',
   'tests/reliable-kernel/conversation-history-paging-stability.test.mjs',
   'tests/reliable-kernel/sidebar-history-cursor.test.mjs',
+  'tests/reliable-kernel/sidebar-history-local-actions.test.mjs',
   'tests/reliable-kernel/skill-catalog.test.mjs',
   'tests/reliable-kernel/conversation-settings-isolation.test.mjs',
   'tests/reliable-kernel/child-agent-status-controls.test.cjs',

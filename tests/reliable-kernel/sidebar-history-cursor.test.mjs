@@ -148,19 +148,42 @@ test('本窗口在当前范围内的动作让侧栏回到第一页，其他项�
   assert.equal(host.requests[5].cursor, undefined);
 });
 
-test('命令路由只在新接受的用户输入后通知回到第一页，重放的输入不通知', async () => {
-  const accepted = [];
-  const results = [{ deduplicated: false, admitted: true, turnId: 'turn-1' }, { deduplicated: true, admitted: false }];
+test('命令路由只在本窗口命令期间的提交刷新了该对话行时通知回到第一页', async () => {
+  const acted = [];
+  const listeners = new Set();
+  const commit = (...changes) => {
+    for (const listener of [...listeners]) listener({ commitSeq: '1', changes, allocatedSequences: [] });
+  };
+  const upsert = (domain, id) => ({ domain, kind: 'upsert', id });
+  const inputs = [
+    // Accepted input: its commit refreshes the Conversation row.
+    () => { commit(upsert('TurnIntent', 'intent-1'), upsert('Conversation', 'conversation-a')); return { deduplicated: false, admitted: true, turnId: 'turn-1' }; },
+    // Replay of the same command: nothing is committed.
+    () => ({ deduplicated: true, admitted: false }),
+    // A command whose commit changes other rows and another Conversation only.
+    () => { commit(upsert('TurnIntent', 'intent-2'), upsert('Conversation', 'conversation-c')); return { deduplicated: false, admitted: false }; }
+  ];
   const router = new VscodeReliableKernelCommandRouter({
     debugCapture: { setListener() {} },
     toolHost: { setStateChangeListener() {} },
     ensureCapabilitiesReady: async () => undefined,
-    conversations: { input: async () => results.shift() }
-  }, { onConversationInputAccepted: (conversationId) => accepted.push(conversationId) });
+    application: { database: {
+      onCommit(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+      conversationOwners: { run: (_conversationId, operation) => operation() }
+    } },
+    conversations: { input: async () => inputs.shift()() }
+  }, { onConversationActedOn: (conversationId) => acted.push(conversationId) });
   router.childExecutionIdForConversation = async () => undefined;
   router.postTurnInputResult = () => undefined;
-  const payload = { conversationId: 'conversation-a', text: 'hi', command: { commandId: 'command-1' } };
-  await router.handleTurnInputUnderOwnership({}, 'correlation-1', 'turn.start', payload);
-  await router.handleTurnInputUnderOwnership({}, 'correlation-2', 'turn.start', payload);
-  assert.deepEqual(accepted, ['conversation-a']);
+  const input = (conversationId, commandId) => router.handleTurnInput({}, `correlation-${commandId}`, 'turn.start', {
+    conversationId, text: 'hi', command: { commandId }
+  });
+  await input('conversation-a', 'command-1');
+  await input('conversation-a', 'command-1');
+  await input('conversation-b', 'command-2');
+  assert.deepEqual(acted, ['conversation-a']);
+  // Runtime work committed after the command returned is not this window's action.
+  commit(upsert('Conversation', 'conversation-a'));
+  assert.deepEqual(acted, ['conversation-a']);
+  assert.equal(listeners.size, 0, '命令结束后不再监听提交');
 });

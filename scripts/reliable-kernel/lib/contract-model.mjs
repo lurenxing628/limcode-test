@@ -16,7 +16,7 @@ export const CONTRACT_FILES = [
 ];
 
 const CONTRACT_REVISION = '2026-07-31-r4';
-const CLIENT_FEED_CONTRACT_REVISION = '2026-09-26-r1';
+const CLIENT_FEED_CONTRACT_REVISION = '2026-09-27-r1';
 const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r7';
 // Contracts revised after the base revision; every other contract file stays at CONTRACT_REVISION.
 const FILE_CONTRACT_REVISIONS = new Map([
@@ -1387,7 +1387,7 @@ function validateConversationHistoryPagination(root, history, failures) {
     || history?.cursor !== 'pageIndex+optional-boundary+scopeKey+pageSize+dataSetId:rootInstanceId:rootGeneration; no-commitSeq; no-trail'
     || history?.dataSetMismatch !== 'restart-at-first-page'
     || history?.refresh !== 'host-resends-the-backend-returned-pageInfo.cursor; foreign-commits-keep-the-page-number'
-    || history?.localActionReveal !== 'this-window-create-fork-or-accepted-input-in-the-shown-scope-returns-to-the-first-page; other-project-actions-never-move-a-project-page'
+    || history?.localActionReveal !== 'this-window-create-fork-or-command-whose-commit-refreshes-the-Conversation-row(input,steer,queued-guidance,stop,retry,edit,edit-and-run,delete-message,manual-compression-at-admission,answer,rename)-in-the-shown-scope-returns-to-the-first-page; replays-and-commands-leaving-the-row-keep-the-page; other-project-actions-never-move-a-project-page'
     || history?.total !== 'exact-scope-count; project-count-via-ProjectContext.uri-and-ConversationProjectLink.project_context_id-indexes'
     || history?.frozenRowsAllowed !== false
     || history?.maxPageRows !== 200) {

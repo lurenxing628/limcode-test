@@ -42,8 +42,10 @@ export type ConversationRecoveryResult =
   | { status: 'eligibility_unknown'; message: string };
 
 /**
- * A Conversation this window just created, forked or sent input to. The sidebar returns to the first
- * history page when the Conversation belongs to the scope it is showing.
+ * A Conversation this window just created, forked or changed in a way that refreshed its `updated_at`
+ * (input, steering, queued guidance, stop, retry, edit, message deletion, manual compression, an
+ * answer, a rename), so it now heads the history order. The sidebar returns to the first history page
+ * when the Conversation belongs to the scope it is showing.
  */
 export interface ConversationHistoryRevealTarget {
   conversationId: string;

@@ -1,6 +1,6 @@
 # 机器合同说明
 
-> 基础合同修订：`2026-07-31-r4`；Client Feed 合同 `client-feed.json`：`2026-09-26-r1`；子 Agent 合同 `subagent.json`：`2026-09-25-r7`。校验器逐文件固定核验，不进行运行时版本协商。
+> 基础合同修订：`2026-07-31-r4`；Client Feed 合同 `client-feed.json`：`2026-09-27-r1`；子 Agent 合同 `subagent.json`：`2026-09-25-r7`。校验器逐文件固定核验，不进行运行时版本协商。
 
 本目录保存可由脚本直接检查的计划底线。Markdown 解释“为什么”，JSON 限制“不能悄悄变成什么”；Runtime 不使用这些 revision 做版本协商、旧格式 fallback 或 migration chain。
 
@@ -12,7 +12,7 @@
 - `file.json`：FileChangeSet、approval、actual mutation 与 receipt；
 - `context.json`：source-occurrence Context DAG、HeadLink、compression replacement、Provider `disabled-full-request`；
 - `subagent.json`：ChildExecution lineage、required interrupt_subtree、Answer/Delivery/InputLink；
-- `client-feed.json`：bounded snapshot/changes/queue、commitSeq barrier、pagination（键集、禁止 offset，只约束 sortIdRegistry 登记的 Feed 分页）；侧栏会话历史列表另由 `conversationHistoryPagination` 约束：按页码定位，页前不超过 10,000 行（与 `CONVERSATION_HISTORY_EXACT_OFFSET_ROWS` 一致）时用有界 OFFSET，超出后用键集边界，每次刷新各页为当前排序的精确划分，本窗口操作后回到第 1 页，游标只绑定页码与数据集身份；普通记录维持 2 KiB 摘要，ModelRequest 计量单独投影为最多 32 KiB 的结构化事实（原生最多 8 个最近 response），不得按文本截断 usage/timing；
+- `client-feed.json`：bounded snapshot/changes/queue、commitSeq barrier、pagination（键集、禁止 offset，只约束 sortIdRegistry 登记的 Feed 分页）；侧栏会话历史列表另由 `conversationHistoryPagination` 约束：按页码定位，页前不超过 10,000 行（与 `CONVERSATION_HISTORY_EXACT_OFFSET_ROWS` 一致）时用有界 OFFSET，超出后用键集边界，每次刷新各页为当前排序的精确划分；本窗口的操作只要其提交刷新了某个对话的行（`updated_at` 即排序键：新建、派生、发送、引导、修改排队消息、停止、重试、编辑与编辑后运行、删除消息、手动压缩在维护回合准入时、回答交互、重命名），且该对话在所显示范围内，侧栏就回到第 1 页并定位到它，重放与未改动对话行的操作不翻页；游标只绑定页码与数据集身份；普通记录维持 2 KiB 摘要，ModelRequest 计量单独投影为最多 32 KiB 的结构化事实（原生最多 8 个最近 response），不得按文本截断 usage/timing；
 - `migration.json`：71 个 registered roots、files/settings/external inputs 的 physical manifest 与 cutover actor；
 - `gate-registry.json`：三个出口、四组 validator、stable atomic check IDs；
 - `targets.json`：本机 package/provenance 与 9 个 installed smoke；

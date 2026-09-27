@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-09-26-r1",
+  "contractRevision": "2026-09-27-r1",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -136,7 +136,7 @@
     "cursor": "pageIndex+optional-boundary+scopeKey+pageSize+dataSetId:rootInstanceId:rootGeneration; no-commitSeq; no-trail",
     "dataSetMismatch": "restart-at-first-page",
     "refresh": "host-resends-the-backend-returned-pageInfo.cursor; foreign-commits-keep-the-page-number",
-    "localActionReveal": "this-window-create-fork-or-accepted-input-in-the-shown-scope-returns-to-the-first-page; other-project-actions-never-move-a-project-page",
+    "localActionReveal": "this-window-create-fork-or-command-whose-commit-refreshes-the-Conversation-row(input,steer,queued-guidance,stop,retry,edit,edit-and-run,delete-message,manual-compression-at-admission,answer,rename)-in-the-shown-scope-returns-to-the-first-page; replays-and-commands-leaving-the-row-keep-the-page; other-project-actions-never-move-a-project-page",
     "total": "exact-scope-count; project-count-via-ProjectContext.uri-and-ConversationProjectLink.project_context_id-indexes",
     "frozenRowsAllowed": false,
     "maxPageRows": 200
@@ -249,7 +249,8 @@
     "2026-09-25-r1: 协作卡片按所属回合定位；未加载或早于已加载消息的回合放在第一条消息之上，未进入回合的卡片只在消息下方保留最新几条，最新消息不会被挤出最新分段",
     "2026-09-25-r2: 子 Agent 回答记录带宿主推导的 outcome（submitted/interrupted/failed），续跑预览以 outcome 取代 interrupted；快照为每条已投递回答带上其提交、桥与子执行",
     "2026-09-25-r3: ModelRequest 在实时增量、快照和历史页统一投影有界结构化计量，防止通用 2 KiB 文本裁剪让瞬态退场后的 Token 和时间指标消失；缺失计量保持未知",
-    "2026-09-26-r1: pagination 的键集与禁止 offset 规则只约束 sortIdRegistry 登记的 Feed 键集分页；侧栏会话历史列表按 conversationHistoryPagination 以页码定位，页前不超过 10,000 行时允许有界 OFFSET，超出后用键集边界；每次刷新各页为当前排序的精确划分，本窗口操作后回到第 1 页，游标只绑定页码与数据集身份"
+    "2026-09-26-r1: pagination 的键集与禁止 offset 规则只约束 sortIdRegistry 登记的 Feed 键集分页；侧栏会话历史列表按 conversationHistoryPagination 以页码定位，页前不超过 10,000 行时允许有界 OFFSET，超出后用键集边界；每次刷新各页为当前排序的精确划分，本窗口操作后回到第 1 页，游标只绑定页码与数据集身份",
+    "2026-09-27-r1: 侧栏历史的“本窗口操作后回到第 1 页”覆盖所有让对话行刷新（updated_at 即排序键）的本窗口操作：新建、派生、发送、引导、修改排队消息、停止、重试、编辑与编辑后运行、删除消息、手动压缩（维护回合准入时）、回答交互、重命名；以操作期间本 Host 的提交是否改动该对话行判定，重放与未改动对话行的操作保持当前页"
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",

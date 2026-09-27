@@ -61,7 +61,7 @@ import type {
   ConversationHistoryRevealTarget,
   ConversationRecoveryResult
 } from '../../../vscode/ApplicationFacade';
-import { VscodeReliableKernelCommandRouter } from './VscodeReliableKernelCommandRouter';
+import { VscodeReliableKernelCommandRouter, watchConversationRefresh } from './VscodeReliableKernelCommandRouter';
 import {
   VscodeReliableKernelCutoverCoordinator,
   archiveCurrentRuntimeRootForReset
@@ -141,7 +141,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         this.product.application.webviewFeed.postToConversation(conversationId, { ...message }),
       createConversation: (options) => this.createConversation(options),
       forkConversation: (request) => this.forkConversation(request),
-      onConversationInputAccepted: (conversationId) => this.revealConversationHistoryTop(conversationId),
+      onConversationActedOn: (conversationId) => void this.revealConversationHistoryTop(conversationId),
       conversationIdForClient: (clientId) => this.webviewConversationIds.get(clientId)
     });
     this.externalHistoryWatcher = new ExternalDataVersionWatcher(
@@ -323,7 +323,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return result;
   }
 
-  /** Tells the sidebar this window just acted on a Conversation, with its primary project for scoping. */
+  /**
+   * Tells the sidebar this window just created, forked or refreshed a Conversation (which now heads
+   * the history order), with its primary project for scoping.
+   */
   private async revealConversationHistoryTop(conversationId: string): Promise<void> {
     try {
       const [link] = await this.list('ConversationProjectLink', { conversation_id: conversationId, role: 'primary' }, 1);
@@ -335,6 +338,24 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       });
     } catch (error) {
       console.warn('[LimCode] Failed to reveal the acted-on Conversation in history.', error);
+    }
+  }
+
+  /**
+   * A sidebar command on one Conversation (rename, stop). When one of its commits refreshed the
+   * Conversation's row, the sidebar is told to show the first history page before the command
+   * resolves: the sidebar re-reads its page right after, and must not re-read the page it left.
+   */
+  private async revealingConversationRefresh<T>(conversationId: string, command: () => Promise<T>): Promise<T> {
+    let revealed: Promise<void> | undefined;
+    const stop = watchConversationRefresh(this.product.application.database, conversationId, () => {
+      revealed = this.revealConversationHistoryTop(conversationId);
+    });
+    try {
+      return await command();
+    } finally {
+      stop();
+      await revealed;
     }
   }
 
@@ -366,7 +387,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public async renameConversationTitle(conversationId: string, title: string): Promise<boolean> {
     this.requireOpen();
-    return this.product.application.database.conversationOwners.run(conversationId, async () => {
+    return this.revealingConversationRefresh(conversationId, () => this.product.application.database.conversationOwners.run(conversationId, async () => {
       const existing = await this.maybeRow('Conversation', conversationId);
       if (!existing) return false;
       const normalized = title.trim();
@@ -379,7 +400,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       ]);
       await this.refreshConversationHistory();
       return true;
-    });
+    }));
   }
 
   public async deleteConversation(conversationId: string): Promise<string[] | null> {
@@ -394,12 +415,21 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return deleted.deletedConversationIds;
   }
 
-  public async abortConversation(
+  public abortConversation(
     conversationId: string,
     requestId: string,
     target: ConversationAbortTarget
   ): Promise<ConversationAbortResult> {
     this.requireOpen();
+    // A new stop request, or settling a Turn whose window exited, refreshes the Conversation.
+    return this.revealingConversationRefresh(conversationId, () => this.abortConversationTurn(conversationId, requestId, target));
+  }
+
+  private async abortConversationTurn(
+    conversationId: string,
+    requestId: string,
+    target: ConversationAbortTarget
+  ): Promise<ConversationAbortResult> {
     // A stop is a fenced durable request, not a second writer for the peer-owned Turn.
     const turnId = requireText(target.turnId, 'abort target Turn.id');
     const expectedLeaseGeneration = requireDecimal(target.leaseGeneration, 'abort target lease generation');

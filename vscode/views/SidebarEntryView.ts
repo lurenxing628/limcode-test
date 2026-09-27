@@ -248,9 +248,9 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
   }
 
   /**
-   * This window just created, forked or sent input to a Conversation. When it belongs to the shown
-   * scope, the next refresh reads the first page, where that Conversation now sits. Other projects'
-   * activity leaves a project page untouched.
+   * This window just created, forked or refreshed a Conversation (see ConversationHistoryRevealTarget).
+   * When it belongs to the shown scope, the next refresh reads the first page, where that
+   * Conversation now sits. Other projects' activity leaves a project page untouched.
    */
   private revealConversationHistoryTop(target: ConversationHistoryRevealTarget): void {
     const scope = this.lastStateMessage?.history.scope;

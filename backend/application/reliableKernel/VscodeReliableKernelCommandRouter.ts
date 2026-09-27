@@ -52,6 +52,7 @@ import { isSettingsRevisionConflictError } from '../../capabilities/settingsRevi
 import { assertNotSqliteDatabaseFile } from '../../capabilities/filesystem/sqliteDatabaseFileGuard';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
+import type { RuntimeCommitResult } from '../../reliableKernel/contracts';
 import type { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
 import { readVscodeSshWorkEnvironments } from './VscodeSshConfigurationReader';
 import { applyProxyEnvironment, currentProxyEnvironment, proxyForShellAndMcp } from './proxyEnvironment';
@@ -74,8 +75,13 @@ export interface VscodeReliableKernelCommandRouterOptions {
     conversationId: string;
     deduplicated: boolean;
   }>;
-  /** A newly accepted user input for this Conversation (not a deduplicated replay). */
-  onConversationInputAccepted?(conversationId: string): void;
+  /**
+   * A command of this window refreshed the Conversation's row, and with it `updated_at`, the key of
+   * the sidebar history order: new input, steering, a queued-guidance change, a stop, a retry, an
+   * edit, a message deletion, a manual compression, an answer, a rename. Replays and commands that
+   * leave the row alone are not reported (see watchConversationRefresh).
+   */
+  onConversationActedOn?(conversationId: string): void;
   openPlanProposal?(payload: { conversationId?: string; toolCallId?: string; planProposalId?: string; title?: string }): void;
   /**
    * The Conversation bound at attach time for one client. A feed may reconnect/resync only to
@@ -211,7 +217,24 @@ export class VscodeReliableKernelCommandRouter {
    * execute, without taking over its running capabilities.
    */
   private runConversationCommand<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
-    return this.product.application.database.conversationOwners.run(conversationId, operation);
+    return this.followConversationRefresh(conversationId, () =>
+      this.product.application.database.conversationOwners.run(conversationId, operation));
+  }
+
+  /**
+   * Reports the Conversation to the sidebar as soon as a commit made while this window's command
+   * runs refreshes its row (onConversationActedOn). A long command reports at that commit, not at
+   * its end: manual compression admits its maintenance Turn first and returns after the summary.
+   */
+  private async followConversationRefresh<T>(conversationId: string, command: () => Promise<T>): Promise<T> {
+    const actedOn = this.options.onConversationActedOn;
+    if (!actedOn) return command();
+    const stop = watchConversationRefresh(this.product.application.database, conversationId, () => actedOn(conversationId));
+    try {
+      return await command();
+    } finally {
+      stop();
+    }
   }
 
   /** Whether this window executes the Conversation; undefined when the runtime cannot say (tests). */
@@ -1272,7 +1295,7 @@ export class VscodeReliableKernelCommandRouter {
       ...(result.intentId ? { intentId: result.intentId } : {}),
       ...(result.turnId ? { turnId: result.turnId } : {}),
       ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
-    });    if (!result.deduplicated) this.options.onConversationInputAccepted?.(payload.conversationId);
+    });
   }
 
   private async handleTurnSteer(
@@ -1301,13 +1324,13 @@ export class VscodeReliableKernelCommandRouter {
       throw new TypeError('Turn steer 缺少有效的 ExecutionLease generation。');
     }
     await this.product.ensureCapabilitiesReady();
-    const receipt = await provider.steer({
+    const receipt = await this.followConversationRefresh(conversationId, () => provider.steer({
       commandId: requireText(payload.command.commandId, 'commandId'),
       conversationId,
       turnId: requireText(payload.turnId, 'turnId'),
       leaseEpoch: BigInt(leaseEpoch),
       content: requirePayload(payload.content, 'Turn steer content')
-    });
+    }));
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.TurnSteerResult,
@@ -1491,12 +1514,14 @@ export class VscodeReliableKernelCommandRouter {
         ? '用户请求中断当前 Turn 及其子执行。'
         : '用户请求中断当前 Turn。'
     };
-    const result = childExecutionId
+    // Not an owned command (see runConversationCommand), but a stop that commits a new request, or
+    // settles a Turn whose window exited, refreshes the Conversation like any other command here.
+    const result = await this.followConversationRefresh(payload.conversationId, async () => childExecutionId
       ? await this.product.childAgents.interruptFromConversation({
           ...interruptInput,
           childExecutionId
         })
-      : await this.product.conversations.interrupt(interruptInput);
+      : await this.product.conversations.interrupt(interruptInput));
     if ('executingWindowAlive' in result && result.executingWindowAlive) {
       void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);
     }
@@ -2294,6 +2319,37 @@ export class VscodeReliableKernelCommandRouter {
       }
     );
   }
+}
+
+/**
+ * Calls `onRefreshed` once, at the first commit of this Host that changes the Conversation's row
+ * before the returned stop runs. Every change of that row sets `updated_at`, the sidebar history
+ * order key, so the Conversation then heads the first history page: a command of this window that
+ * commits such a change (or runs while this Host commits one) has moved it there. A replay, a
+ * coalesced stop or a command that touches only other rows commits no such change.
+ */
+export function watchConversationRefresh(
+  database: { onCommit(listener: (commit: RuntimeCommitResult) => void): () => void },
+  conversationId: string,
+  onRefreshed: () => void
+): () => void {
+  let unsubscribe: (() => void) | undefined;
+  unsubscribe = database.onCommit((commit) => {
+    if (!unsubscribe || !commit.changes.some((change) =>
+      change.domain === 'Conversation' && change.kind === 'upsert' && change.id === conversationId)) return;
+    unsubscribe();
+    unsubscribe = undefined;
+    try {
+      onRefreshed();
+    } catch (error) {
+      // A commit listener must never throw into the database's commit dispatch.
+      console.warn('[LimCode] Failed to report a refreshed Conversation to the history view.', error);
+    }
+  });
+  return () => {
+    unsubscribe?.();
+    unsubscribe = undefined;
+  };
 }
 
 function requirePayload<T>(payload: T | undefined, label: string): T {
