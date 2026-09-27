@@ -691,6 +691,21 @@ test('switching away explains the kept rule and warns before continuing merged c
   assert.equal(f.calls.some(call => ['select', 'command'].includes(call[0])), false, '未确认不切换');
 });
 
+test('跨模块盲审 #7：磁盘空间不足的推迟只在新原因出现时提示，所需空间的数字变了也不重复提示', async () => {
+  const values = new Map();
+  const globalState = { get: key => values.get(key), update: async (key, value) => { values.set(key, value); } };
+  const full = megabytes => ({ candidateId: 'workspace:old', code: 'runtime-data-set-merge-disk-full', newly: true,
+    message: `磁盘空间不足，需要约 ${megabytes} MB：合并前要先在 /fixture/current 备份当前历史库` });
+  const notices = async issue => {
+    const f = fixture({ globalState, mergeReport: emptyMergeReport({ deferred: [issue] }) });
+    await f.mergeHistoricalDataSetsInBackground(f.context, mergeHost());
+    return f.calls.filter(call => ['warning', 'info'].includes(call[0])).map(call => call[1]);
+  };
+  assert.deepEqual(await notices(full(120)),
+    ['有 1 份旧聊天记录暂时无法合并（磁盘空间不足，需要约 120 MB：合并前要先在 /fixture/current 备份当前历史库），以后启动时会自动重试。']);
+  assert.deepEqual(await notices(full(121)), [], '之后每次启动同一原因都不再提示');
+});
+
 test('a library whose summary cannot be read says so instead of looking empty', async () => {
   let shown;
   const f = fixture({ summaries: { 'workspace:old': new Error('EACCES') }, picks: [action('history'), items => { shown = items; return undefined; }] });

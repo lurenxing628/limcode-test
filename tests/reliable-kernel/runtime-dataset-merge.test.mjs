@@ -1446,6 +1446,31 @@ test('盲审 merge #8：收尾原因区分来源：本版本切走（用户保�
   assert.equal(KEPT_MERGE_FINALIZATION_REASON, '合并前收尾。');
 });
 
+test('跨模块盲审 #7：合并前备份之前核对剩余空间：不够就推迟并写明约需多少 MB，不写备份、不收尾', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_space', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database, { freeSpace: async () => 1024 });
+  assert.equal(report.deferred[0]?.code, 'runtime-data-set-merge-disk-full');
+  assert.match(report.deferred[0].message, /^磁盘空间不足，需要约 \d+ MB：合并前要先在 .+ 备份当前历史库$/);
+  await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' }, '一个字节都没写');
+  assert.deepEqual((await merge(fixture, database, { freeSpace: async () => Number.MAX_SAFE_INTEGER })).merged.length, 1);
+
+  // A source whose work would be closed first: its own backup is checked the same way, before anything is closed.
+  const busy = await createFixture(t, { withBeta: false });
+  await seed(busy.alpha, [{ id: 'conversation_alpha_space_busy', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(busy.alpha, [{ conversationId: 'conversation_alpha_space_busy', kind: 'bare' }]);
+  const busyTarget = await openTarget(t, busy.current);
+  const deferred = await merge(busy, busyTarget, { freeSpace: async () => 1024 });
+  assert.equal(deferred.deferred[0]?.code, 'runtime-data-set-merge-disk-full');
+  assert.match(deferred.deferred[0].message, /备份这份旧聊天记录/);
+  const source = readDatabase(busy.alpha);
+  try { assert.equal(source.count('turn', "status = 'active'"), 1, '没有收尾'); }
+  finally { source.close(); }
+  await assert.rejects(fs.stat(path.join(controlRoot(busy.alpha), 'merge-source-backups')), { code: 'ENOENT' });
+});
+
+/** Conversations the ledger records as inserted per target: [targetDataSetId, sorted ids][]. */
 async function seqFixture(t) {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.current, [{ id: 'conversation_current_seq', project: SHARED_PROJECT }]);

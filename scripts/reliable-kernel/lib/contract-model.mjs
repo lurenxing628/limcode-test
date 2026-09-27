@@ -512,7 +512,7 @@ function validateMigration(root, migration, failures) {
     sourcePolicy: 'exact-published-3-4-backup-and-in-place-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot',
     busySourcePolicy: 'defer-source',
     unfinishedWorkPolicy: 'refusal-probes-conflicts-size-and-cas-checked-on-unfinalized-snapshot-first; kernel-pending-work-probe-judges-every-conversation-as-after-finalization-before-any-finalization; then-source-backup-and-existing-terminal-transitions-cancelled-or-interrupted-with-reason-by-source-legacy-interrupted-by-upgrade-user-kept-closed-before-merge; closed-counts-read-back-from-source-after-closing-never-planned-counts; states-without-transition-refuse-source-with-reason-and-way-out',
-    backupPolicy: 'sqlite-backup-api-of-open-target-once-per-batch-before-first-change-only-when-rows-to-insert; named-utc-millisecond-time-then-process-sequence; unused-by-any-transaction-removed-at-batch-end; used-then-newest-3-by-creation-kept-per-control-root-plus-this-batch-and-newest-before-it; failed-backup-leaves-no-files',
+    backupPolicy: 'sqlite-backup-api-of-open-target-once-per-batch-before-first-change-only-when-rows-to-insert; named-utc-millisecond-time-then-process-sequence; unused-by-any-transaction-removed-at-batch-end; used-then-newest-3-by-creation-kept-per-control-root-plus-this-batch-and-newest-before-it; failed-backup-leaves-no-files; target-and-source-backups-first-check-free-space-for-database-plus-wal-plus-64MiB-on-their-disk-else-deferred-disk-full-with-needed-MB-before-writing-notified-once-per-cause',
     casPolicy: 'published-before-row-commit; verified-read-only-before-finalization; source-digest-verified-before-link-or-copy; missing-irregular-or-mismatched-source-object-fails-source; existing-target-object-damaged-or-irregular-blocks',
     rowPolicy: 'every-source-row-decoded-by-codec; identical-rows-reused; content-identity-domains-keep-target-and-insert-only-if-still-absent-inside-the-transaction-else-compare; renumbered-columns-allocated-inside-the-transaction-after-its-maximum-in-source-order; any-other-difference-refuses-source-before-any-target-change; any-failure-inside-the-transaction-rolls-back-the-whole-source',
     identityDomains: {
@@ -546,11 +546,13 @@ function validateMigration(root, migration, failures) {
   const [transactionRows] = mergeConstant(/RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS = ([\d_]+);/);
   const [requestDays] = mergeConstant(/RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS = ([\d_]+) \* 24 \* 60 \* 60 \* 1000;/);
   const [backupRetention] = mergeConstant(/RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION = ([\d_]+);/);
+  const [backupMarginMiB] = mergeConstant(/BACKUP_FREE_SPACE_MARGIN_BYTES = ([\d_]+) \* 1024 \* 1024;/);
   if (!expectedMerge.sizeLimit.startsWith(`online-transaction-at-most-${onlineRows}-source-rows-and-${onlineMiB}MiB-`)
     || !expectedMerge.sizeLimit.includes(`; one-transaction-hard-limit-${transactionRows}-source-rows-`)
     || !expectedMerge.recordPolicy.includes(`; recorded-request-keeps-source-pending-${requestDays}-days-`)
-    || !expectedMerge.backupPolicy.includes(`; used-then-newest-${backupRetention}-by-creation-`)) {
-    failures.push('migration.json#historicalMerge 的在线上限、单事务硬上限、合并请求期限与备份保留份数必须与 runtimeDataSetMerge.ts 的常量一致');
+    || !expectedMerge.backupPolicy.includes(`; used-then-newest-${backupRetention}-by-creation-`)
+    || !expectedMerge.backupPolicy.includes(`-database-plus-wal-plus-${backupMarginMiB}MiB-`)) {
+    failures.push('migration.json#historicalMerge 的在线上限、单事务硬上限、合并请求期限、备份保留份数与备份前剩余空间余量必须与 runtimeDataSetMerge.ts 的常量一致');
   }
   const exclusive = migration?.exclusiveMaintenance;
   const expectedExclusive = {

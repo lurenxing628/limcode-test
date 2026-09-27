@@ -155,6 +155,8 @@ export type RuntimeDataSetMergeFaultPoint =
 export interface RuntimeDataSetMergeOptions {
   /** Test-only crash or change injection at durable boundaries and between checks. */
   onFaultPoint?(point: RuntimeDataSetMergeFaultPoint): void | Promise<void>;
+  /** Test-only: free bytes on the disk of `directory` (defaults to fs.statfs; undefined when unknown). */
+  freeSpace?(directory: string): Promise<number | undefined>;
   /** Defaults to fs.link; a cross-device or unsupported link falls back to a verified copy. */
   linkFile?(source: string, target: string): Promise<void>;
   /** Defaults to {@link RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS}. */
@@ -920,7 +922,7 @@ async function mergeSource(
       // recorded as merged, without a target backup and without a report.
       return await commitSource(paths, target, candidate, binding, plan, undefined, state, options, mode, stopIfAsked);
     }
-    await ensureTargetBackup(target);
+    await ensureTargetBackup(target, options);
     await fault(options, 'after-target-backup');
     const cas = await transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, false);
     await fault(options, 'after-cas-transfer');
@@ -1081,7 +1083,7 @@ async function finalizeSource(
     stopIfAsked();
     // Work in a data set the user switched away from in this version was not interrupted by an upgrade.
     const reason = await isVscodeRuntimeDataSetKept(candidate) ? KEPT_MERGE_FINALIZATION_REASON : MERGE_FINALIZATION_REASON;
-    const sourceBackupPath = await backupSource(binding);
+    const sourceBackupPath = await backupSource(binding, options);
     await fault(options, 'after-source-backup');
     const earlier = state.finalized;
     const finalized: NonNullable<SourceProgress['finalized']> = state.finalized = {
@@ -1717,8 +1719,9 @@ async function rememberLinked(sourceFile: string, targetFile: string, verified: 
 }
 
 /** Online Backup API copy of the target, once per batch; failures leave no partial files behind. */
-async function ensureTargetBackup(target: TargetContext): Promise<string> {
+async function ensureTargetBackup(target: TargetContext, options: RuntimeDataSetMergeOptions): Promise<string> {
   if (target.backup.path) return target.backup.path;
+  await assertRoomForBackup(target.binding.paths.databasePath, target.controlRoot, '当前历史库', options);
   const backups = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
   const root = path.join(backups, backupDirectoryName());
   const destination = path.join(root, 'limcode.sqlite');
@@ -1801,7 +1804,8 @@ async function targetBackupsByAge(backups: string): Promise<string[]> {
 }
 
 /** Source backup before finalization, with the offline SQLite Backup API, beside the source. */
-async function backupSource(binding: HistoricalRootBinding): Promise<string> {
+async function backupSource(binding: HistoricalRootBinding, options: RuntimeDataSetMergeOptions): Promise<string> {
+  await assertRoomForBackup(binding.paths.databasePath, path.dirname(binding.paths.dataRootPath), '这份旧聊天记录', options);
   const backups = path.join(path.dirname(binding.paths.dataRootPath), RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY);
   const root = path.join(backups, backupDirectoryName());
   const destination = path.join(root, 'limcode.sqlite');
@@ -1824,6 +1828,36 @@ async function backupSource(binding: HistoricalRootBinding): Promise<string> {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-backup-failed', message: `收尾前备份来源失败，稍后重试：${errorMessage(error)}` });
   }
   return root;
+}
+
+/** Free space kept beyond a backup on its disk, so a merge never fills it for the windows writing there. */
+const BACKUP_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024;
+
+/**
+ * A full backup of `databasePath` (database and WAL, at most their size) in `directory` needs that
+ * much room plus a margin on its disk: without it the merge is deferred before anything is written,
+ * so a full disk is never filled again at every startup. Free space the platform cannot tell is
+ * not checked (the copy itself then fails cleanly).
+ */
+async function assertRoomForBackup(
+  databasePath: string,
+  directory: string,
+  what: string,
+  options: RuntimeDataSetMergeOptions
+): Promise<void> {
+  let bytes = BACKUP_FREE_SPACE_MARGIN_BYTES;
+  for (const file of [databasePath, `${databasePath}-wal`]) bytes += await fs.stat(file).then((info) => info.size, () => 0);
+  const free = await (options.freeSpace ?? freeSpace)(directory).catch(() => undefined);
+  if (free === undefined || free >= bytes) return;
+  throw new Outcome({
+    kind: 'deferred', code: 'runtime-data-set-merge-disk-full',
+    message: `磁盘空间不足，需要约 ${Math.ceil(bytes / (1024 * 1024))} MB：合并前要先在 ${directory} 备份${what}`
+  });
+}
+
+async function freeSpace(directory: string): Promise<number | undefined> {
+  const stats = await fs.statfs(directory);
+  return Number(stats.bavail) * Number(stats.bsize);
 }
 
 function fingerprintDigest(fingerprint: RuntimeDataSetFingerprint): string {
