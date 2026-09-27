@@ -285,7 +285,10 @@ export type DatabaseWorkerRequestPayload =
 export interface DatabaseWorkerTiming {
   queueWaitMs: number;
   executeDurationMs: number;
-  /** Present only when the request opened a BEGIN IMMEDIATE writer transaction. */
+  /**
+   * Present only when this very request opened a BEGIN IMMEDIATE writer transaction. A response
+   * posted after other requests ran (an online backup) never reports their writer lock.
+   */
   writeLock?: DatabaseWorkerWriteLockTiming;
 }
 

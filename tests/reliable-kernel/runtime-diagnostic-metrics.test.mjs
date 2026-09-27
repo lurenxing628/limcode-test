@@ -568,6 +568,51 @@ test('计量开启时畸形事务步骤只让该请求失败，不会让数据�
   }
 });
 
+test('在线备份与写事务交错时，备份的应答不带写锁计时，写事务各报自己的', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-backup-lock-metric-'));
+  const root = await kernel.resetCandidateRuntimeRoot(directory);
+  const events = [];
+  const database = await kernel.RuntimeDatabase.open(root.authority, {
+    hostBootId: 'backup-lock-metric',
+    performanceMetrics: { record: (event) => events.push(event) }
+  });
+  const now = new Date().toISOString();
+  const receipts = (prefix, count) => Array.from({ length: count }, (_value, index) => repo('CommandReceipt').insert({
+    id: `${prefix}-receipt-${index}`, source_kind: 'metric', source_key: `${prefix}:${index}`, conversation_id: null, turn_id: null, created_at: now
+  }));
+  try {
+    await database.transaction(receipts('seed', 2_000));
+    const busy = receipts('busy', 20_000);
+    const later = receipts('later', 200);
+    const destination = path.join(path.dirname(root.binding.paths.dataRootPath), 'backup-lock-metric.sqlite');
+    events.length = 0;
+    // Each public call first validates the root binding asynchronously; posting the requests
+    // directly fixes their order: a large transaction keeps the worker busy while the backup and
+    // a second transaction queue behind it, so the backup is answered after that transaction ran.
+    const send = (request) => database['sendRequest'](request);
+    await Promise.all([
+      send({ kind: 'transaction', steps: busy }),
+      send({ kind: 'backupDatabase', destinationPath: destination }),
+      send({ kind: 'transaction', steps: later })
+    ]);
+    const finished = events.filter((event) => event.kind === 'database.request' && event.phase === 'finished');
+    assert.deepEqual(finished.map((event) => event.requestKind), ['transaction', 'transaction', 'backupDatabase']);
+    for (const event of finished.slice(0, 2)) {
+      assert.equal(event.writeLockStage, 'committed');
+      assert.equal(event.writeDomain, 'CommandReceipt');
+      assert.ok(event.writeLockHoldMs > 0);
+    }
+    const backup = finished[2];
+    assert.equal(backup.outcome, 'ok');
+    for (const field of ['writeLockWaitMs', 'writeLockHoldMs', 'writeLockStage', 'writeDomain']) {
+      assert.equal(backup[field], undefined, `backup ${field}`);
+    }
+  } finally {
+    await database.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('汇总脚本跳过坏行与缺 metadata 的行，默认只统计 7 天保留期', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-diagnostic-summary-script-'));
   const line = (observedAt, eventKind, metadata) => JSON.stringify({

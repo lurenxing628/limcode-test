@@ -168,16 +168,27 @@ class VerifiedContextCasCache {
 }
 
 /**
- * Writer-lock timing of the request currently executing on this single-threaded worker. Only
- * performance.now() stamps are taken inside the transaction; nothing is written or sent until
- * the response has been produced.
+ * Writer-lock timing of one request. Only performance.now() stamps are taken inside the
+ * transaction; nothing is written or sent until the response has been produced.
  */
-let requestWriteLock: {
+interface RequestWriteLock {
   startedAtMs: number;
   acquiredAtMs?: number;
   releasedAtMs?: number;
   stage: DatabaseWorkerWriteLockTiming['stage'];
-} | undefined;
+}
+
+/** What one request measured; its response reports this and nothing another request measured. */
+interface RequestMeasurement {
+  writeLock?: RequestWriteLock;
+}
+
+/**
+ * The request whose synchronous handling is running on this single-threaded worker, while it runs.
+ * A response posted later (an online backup finishes after other requests ran) still reads the
+ * measurement of its own request, never whatever another request left here.
+ */
+let measuringRequest: RequestMeasurement | undefined;
 
 const port = requireParentPort();
 const data = workerData as DatabaseWorkerData;
@@ -231,11 +242,12 @@ async function start(): Promise<void> {
     const receivedAtMs = Number.isFinite(request.metricEnqueuedAtMs)
       ? performance.now()
       : undefined;
-    requestWriteLock = undefined;
+    const measurement: RequestMeasurement = {};
+    measuringRequest = measurement;
     const respond = (
       response: Extract<DatabaseWorkerResponse, { type: 'response' }>,
       transferList: readonly ArrayBuffer[] = []
-    ) => postMeasuredResponse(response, request, receivedAtMs, transferList);
+    ) => postMeasuredResponse(response, request, receivedAtMs, measurement.writeLock, transferList);
     try {
       revalidateStatementCaches(writerStatements, readerStatements);
       if (request.kind === 'transaction') {
@@ -384,6 +396,8 @@ async function start(): Promise<void> {
         // keeps serving requests. One large step after the first copies the rest atomically, so a
         // concurrent commit from another Host cannot restart a partially copied backup forever.
         const source = new Database(toSqliteFilePath(data.binding.paths.databasePath), { readonly: true, fileMustExist: true });
+        // Answered after later requests ran; `respond` reports only this request's own measurement,
+        // and a backup never takes this worker's writer lock, so its response has no writeLock.
         void source.backup(toSqliteFilePath(destination), { progress: () => 0x7fffffff }).then(
           () => {
             source.close();
@@ -436,6 +450,8 @@ async function start(): Promise<void> {
       port.close();
     } catch (error) {
       respond({ type: 'response', id: request.id, ok: false, error: serializeError(error) });
+    } finally {
+      measuringRequest = undefined;
     }
   });
 }
@@ -2888,15 +2904,15 @@ function assertPublishedContentObject(row: EncodedRow, casRootPath: string): voi
 }
 
 function beginMeasuredWrite(database: Database.Database): void {
-  const lock: NonNullable<typeof requestWriteLock> = { startedAtMs: performance.now(), stage: 'begin' };
-  requestWriteLock = lock;
+  const lock: RequestWriteLock = { startedAtMs: performance.now(), stage: 'begin' };
+  if (measuringRequest) measuringRequest.writeLock = lock;
   database.exec('BEGIN IMMEDIATE');
   lock.acquiredAtMs = performance.now();
   lock.stage = 'body';
 }
 
 function commitMeasuredWrite(database: Database.Database): void {
-  const lock = requestWriteLock;
+  const lock = measuringRequest?.writeLock;
   if (lock) lock.stage = 'commit';
   database.exec('COMMIT');
   if (lock) {
@@ -2906,8 +2922,11 @@ function commitMeasuredWrite(database: Database.Database): void {
 }
 
 /** Metrics are observational: malformed request input must never make them throw. */
-function measuredWriteLock(request: DatabaseWorkerRequest, nowMs: number): DatabaseWorkerWriteLockTiming | undefined {
-  const lock = requestWriteLock;
+function measuredWriteLock(
+  request: DatabaseWorkerRequest,
+  lock: RequestWriteLock | undefined,
+  nowMs: number
+): DatabaseWorkerWriteLockTiming | undefined {
   if (!lock) return undefined;
   let domain: string | undefined;
   try {
@@ -2944,6 +2963,7 @@ function postMeasuredResponse(
   response: Extract<DatabaseWorkerResponse, { type: 'response' }>,
   request: DatabaseWorkerRequest,
   receivedAtMs: number | undefined,
+  writeLockTiming: RequestWriteLock | undefined,
   transferList: readonly ArrayBuffer[] = []
 ): void {
   const enqueuedAtMs = request.metricEnqueuedAtMs;
@@ -2952,7 +2972,7 @@ function postMeasuredResponse(
     return;
   }
   const nowMs = performance.now();
-  const writeLock = measuredWriteLock(request, nowMs);
+  const writeLock = measuredWriteLock(request, writeLockTiming, nowMs);
   post({
     ...response,
     timing: {
