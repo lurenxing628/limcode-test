@@ -52,6 +52,15 @@ export interface RuntimeDataSetLastMerge {
   source: RuntimeDataSetFingerprint;
 }
 
+/**
+ * Conversations that merges of this source incarnation actually inserted into one data set (not
+ * the ones that were there already), accumulated over every merge into it.
+ */
+export interface RuntimeDataSetMergedConversations {
+  target: RuntimeDataSetIdentity;
+  conversationIds: string[];
+}
+
 export type RuntimeDataSetMergeLedgerRecord = {
   kind: typeof RECORD_KIND;
   candidateId: string;
@@ -62,6 +71,11 @@ export type RuntimeDataSetMergeLedgerRecord = {
    * explicit attempt that was blocked, failed or interrupted): the earlier merge still happened.
    */
   lastMerged?: RuntimeDataSetLastMerge;
+  /**
+   * Per receiving data set, kept on every later record of the same source incarnation: a later merge
+   * into that data set leaves out the ones the user deleted there since (see mergeSource).
+   */
+  mergedInto?: RuntimeDataSetMergedConversations[];
 } & (
   /**
    * Written before the row transaction; `commitId` names the exact inserted id set. `replaced` is the
@@ -245,20 +259,44 @@ function isLedgerRecord(value: unknown, name: string): value is RuntimeDataSetMe
 
 /**
  * Writes the record of one source. A record other than 'merged' carries the last merge of the same
- * source incarnation forward, so a later failed attempt never hides that the content was merged.
+ * source incarnation forward, so a later failed attempt never hides that the content was merged;
+ * every record carries its conversations merged per target forward, adding
+ * `insertedConversationIds` (proven inserted into `record.target`) to them.
  */
 export async function writeRuntimeDataSetMergeLedgerRecord(
   paths: StoragePaths,
-  record: DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt' | 'lastMerged'>
+  input: DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt' | 'lastMerged' | 'mergedInto'>
+    & { insertedConversationIds?: readonly string[] }
 ): Promise<void> {
-  let lastMerged: RuntimeDataSetLastMerge | undefined;
-  if (record.state !== 'merged') {
-    const previous = await readRuntimeDataSetMergeLedgerRecord(paths, record.candidateId);
-    if (previous && sameRuntimeDataSetIdentity(previous.source, record.source)) lastMerged = runtimeDataSetLastMerge(previous);
+  const { insertedConversationIds, ...record } = input;
+  const previous = await readRuntimeDataSetMergeLedgerRecord(paths, record.candidateId);
+  const same = previous !== undefined && sameRuntimeDataSetIdentity(previous.source, record.source);
+  const lastMerged = same && record.state !== 'merged' ? runtimeDataSetLastMerge(previous) : undefined;
+  const mergedInto = (same ? previous.mergedInto ?? [] : []).map((entry) => ({ ...entry, conversationIds: [...entry.conversationIds] }));
+  if (insertedConversationIds?.length && 'target' in record) {
+    let entry = mergedInto.find((item) => sameRuntimeDataSetIdentity(item.target, record.target));
+    if (!entry) mergedInto.push(entry = { target: record.target, conversationIds: [] });
+    entry.conversationIds = [...new Set([...entry.conversationIds, ...insertedConversationIds])];
   }
   await writeLedgerJson(paths, RECORDS, record.candidateId, {
-    kind: RECORD_KIND, ...record, ...(lastMerged ? { lastMerged } : {}), updatedAt: new Date().toISOString()
+    kind: RECORD_KIND, ...record, ...(lastMerged ? { lastMerged } : {}), ...(mergedInto.length > 0 ? { mergedInto } : {}),
+    updatedAt: new Date().toISOString()
   });
+}
+
+/**
+ * Conversations merges of this record's source incarnation inserted into `target` so far (none
+ * when nothing was recorded for it). A malformed entry names none.
+ */
+export function runtimeDataSetMergedConversations(
+  record: RuntimeDataSetMergeLedgerRecord | undefined,
+  target: RuntimeDataSetIdentity
+): string[] {
+  const entries: unknown = record?.mergedInto;
+  if (!Array.isArray(entries)) return [];
+  const entry = entries.find((item: Partial<RuntimeDataSetMergedConversations> | null) =>
+    sameRuntimeDataSetIdentity(item?.target, target)) as Partial<RuntimeDataSetMergedConversations> | undefined;
+  return Array.isArray(entry?.conversationIds) ? entry.conversationIds.filter((id): id is string => typeof id === 'string') : [];
 }
 
 /** The merge a record proves happened: its own, or the one it carried forward. */

@@ -26,6 +26,7 @@ const {
 } = kernelFile('runtimeDataSetMerge.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { runExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
+const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
@@ -1383,6 +1384,164 @@ test('复审 merge3 #8：收尾之后收到停止按推迟处理并记下收尾�
   assert.match(blocked.blocked[0].message, /之前一次合并时已把这个库里的1 个中断的任务按“中止”收尾.*收尾前的备份在 /);
 });
 
+test('盲审 merge #1：再次合并不把用户在当前库删掉的对话插回：新对话照常合并，结果报出跳过的数量，账本按目标记下插入过的对话', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_keep', project: SHARED_PROJECT },
+    { id: 'conversation_alpha_deleted_later', project: SHARED_PROJECT }
+  ]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  assert.deepEqual(await mergedInto(fixture), [[fixture.current.binding.dataSetId, ['conversation_alpha_deleted_later', 'conversation_alpha_keep']]]);
+  // The user deletes a merged conversation here (a hard delete), and later only creates one in the source.
+  const deleted = await new ConversationDeletionControlPlane(database).delete('conversation_alpha_deleted_later');
+  assert.deepEqual(deleted?.deletedConversationIds, ['conversation_alpha_deleted_later']);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_new', project: SHARED_PROJECT }]);
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.changedSinceMerge, true);
+  await requestMerge(fixture, fixture.alpha);
+  const again = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.deepEqual([again.deferred, again.blocked, again.failures], [[], [], []]);
+  assert.deepEqual(again.merged.map((item) => [item.insertedConversations, item.skippedConversations, item.alreadyMerged]), [[1, 1, undefined]]);
+  const target = readDatabase(fixture.current);
+  try {
+    assert.deepEqual(target.database.prepare('SELECT id FROM conversation ORDER BY id').pluck().all(),
+      ['conversation_alpha_keep', 'conversation_alpha_new'], '删掉的对话没有回到当前库');
+    assert.equal(target.count('turn', 'conversation_id = ?', 'conversation_alpha_deleted_later'), 0);
+    assert.equal(target.count('message_part_of_conversation', 'conversation_id = ?', 'conversation_alpha_deleted_later'), 0);
+    assert.deepEqual(target.database.pragma('foreign_key_check'), []);
+  } finally { target.close(); }
+  assert.deepEqual(await mergedInto(fixture),
+    [[fixture.current.binding.dataSetId, ['conversation_alpha_deleted_later', 'conversation_alpha_keep', 'conversation_alpha_new']]]);
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.changedSinceMerge, false);
+});
+
+test('盲审 merge #1：跳过的对话按闭包整体不插：之后在来源里继续产生的 Turn、模型请求与 Operation、消息、交互请求、上下文序列和子 Agent 对话都不插；保留对话里关联到这些 Turn 的消息照常合并，只是不带那条关联', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_keep', project: SHARED_PROJECT },
+    { id: 'conversation_alpha_gone', project: SHARED_PROJECT }
+  ]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  await new ConversationDeletionControlPlane(database).delete('conversation_alpha_gone');
+  // Meanwhile the user went on with that conversation in the source (switched there and back).
+  const later = 'conversation_alpha_gone_later_turn';
+  rawSource(fixture.alpha, (source, contentId) => {
+    source.prepare('INSERT INTO turn VALUES (?, ?, ?, ?, ?, ?)').run(later, 'conversation_alpha_gone', 'terminated', NOW, NOW, NOW);
+    source.prepare('INSERT INTO turn_termination VALUES (?, ?, ?, ?, ?)').run(`${later}_termination`, later, 'completed', 'fixture', NOW);
+    // Its message, and one of the kept conversation that is linked to its Turn as well.
+    for (const [message, conversation] of [['gone_later_message', 'conversation_alpha_gone'], ['kept_linked_message', 'conversation_alpha_keep']]) {
+      source.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run(message, NOW, NOW, null);
+      source.prepare('INSERT INTO message_revision VALUES (?, ?, ?, ?, ?, ?)').run(`${message}_revision`, message, 1, 'user', contentId, NOW);
+      source.prepare('INSERT INTO message_current_revision_link VALUES (?, ?, ?, ?)').run(`${message}_current`, message, `${message}_revision`, NOW);
+      source.prepare('INSERT INTO message_part_of_conversation VALUES (?, ?, ?, ?, ?)').run(`${message}_member`, conversation, message, 10, NOW);
+      source.prepare('INSERT INTO message_turn_link VALUES (?, ?, ?, ?, ?)').run(`${message}_turn_link`, later, message, 'user', NOW);
+    }
+    // Its answered question: the schema trigger deletes a request with its Turn.
+    source.prepare('INSERT INTO interaction_request VALUES (?, ?, ?, ?, ?, ?)').run('gone_later_question', 'ask_user', 'answered', contentId, NOW, NOW);
+    source.prepare('INSERT INTO interaction_owner_link VALUES (?, ?, ?, ?)').run('gone_later_question_owner', 'gone_later_question', later, NOW);
+    // Its context: root → node → segment, none referenced by anything kept.
+    source.prepare('INSERT INTO context_segment VALUES (?, ?, ?, ?)').run('gone_later_segment', contentId, 'message', NOW);
+    source.prepare('INSERT INTO context_sequence_node VALUES (?, ?, ?, ?)').run('gone_later_node', null, 'gone_later_segment', NOW);
+    source.prepare('INSERT INTO context_sequence_root VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('gone_later_root', 'conversation_alpha_gone', 1, 'gone_later_node', 'gone_later_node', 1, 1, 10, NOW);
+    // A Subagent conversation it started (never merged anywhere).
+    source.prepare("INSERT INTO conversation (id, title, status, created_at, updated_at) VALUES (?, 'child', 'active', ?, ?)")
+      .run('conversation_alpha_gone_child', NOW, NOW);
+    source.prepare('INSERT INTO child_execution VALUES (?, ?, ?, ?, ?)').run('gone_child_execution', 'conversation_alpha_gone_child', 'idle', NOW, NOW);
+    source.prepare('INSERT INTO conversation_origin_link VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('gone_child_origin', 'conversation_alpha_gone_child', 'conversation_alpha_gone', later, null, null, NOW);
+  });
+  // And left a model request behind there: closed before the merge (reported), then left out whole.
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_gone', kind: 'leased-model-request' }]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_new', project: SHARED_PROJECT }]);
+  await requestMerge(fixture, fixture.alpha);
+  const again = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.deepEqual([again.deferred, again.blocked, again.failures], [[], [], []]);
+  assert.deepEqual(again.merged.map((item) => [item.insertedConversations, item.skippedConversations, item.finalized?.turns]), [[1, 1, 1]]);
+  const unfinished = 'conversation_alpha_gone_unfinished_turn';
+  const target = readDatabase(fixture.current);
+  try {
+    assert.deepEqual(target.database.prepare('SELECT id FROM conversation ORDER BY id').pluck().all(), ['conversation_alpha_keep', 'conversation_alpha_new']);
+    for (const [table, id] of [
+      ['turn', later], ['turn', unfinished], ['model_request', `${unfinished}_request`], ['operation', `${unfinished}_operation`],
+      ['attempt', `${unfinished}_attempt`], ['tool_call', `${unfinished}_tool`], ['message', 'gone_later_message'],
+      ['message_part_of_conversation', 'gone_later_message_member'], ['message_turn_link', 'kept_linked_message_turn_link'],
+      ['interaction_request', 'gone_later_question'],
+      ['context_sequence_root', 'gone_later_root'], ['context_sequence_node', 'gone_later_node'], ['context_segment', 'gone_later_segment'],
+      ['child_execution', 'gone_child_execution'], ['conversation_origin_link', 'gone_child_origin']
+    ]) assert.equal(target.count(table, 'id = ?', id), 0, `${table} ${id} 不插入`);
+    assert.equal(target.count('message', 'id = ?', 'kept_linked_message'), 1, '保留对话的消息照常合并');
+    assert.equal(target.count('message_part_of_conversation', 'id = ?', 'kept_linked_message_member'), 1);
+    assert.deepEqual(target.database.pragma('foreign_key_check'), []);
+    assert.equal(target.database.pragma('quick_check', { simple: true }), 'ok');
+  } finally { target.close(); }
+});
+
+test('盲审 merge #1：提交后崩溃、之后在当前库删了这批里的对话：实测部分存在而受阻，这批插入的对话照样记入账本，之后明确合并时不再插回', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_crash_keep', project: SHARED_PROJECT },
+    { id: 'conversation_alpha_crash_gone', project: SHARED_PROJECT }
+  ]);
+  const killed = await runChild(['kill', fixture.root, 'after-row-commit']);
+  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  const database = await openTarget(t, fixture.current);
+  await new ConversationDeletionControlPlane(database).delete('conversation_alpha_crash_gone');
+  const converged = await merge(fixture, database);
+  assert.equal(converged.blocked[0]?.code, 'runtime-data-set-merge-conflict', '消息行删不掉：部分存在，证明事务已提交');
+  assert.deepEqual(await mergedInto(fixture), [[fixture.current.binding.dataSetId, ['conversation_alpha_crash_gone', 'conversation_alpha_crash_keep']]]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_crash_new', project: SHARED_PROJECT }]);
+  await requestMerge(fixture, fixture.alpha);
+  const again = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.deepEqual(again.merged.map((item) => [item.insertedConversations, item.skippedConversations]), [[1, 1]]);
+  const target = readDatabase(fixture.current);
+  try {
+    assert.deepEqual(target.database.prepare('SELECT id FROM conversation ORDER BY id').pluck().all(),
+      ['conversation_alpha_crash_keep', 'conversation_alpha_crash_new']);
+  } finally { target.close(); }
+});
+
+test('盲审 merge #1：提交后崩溃、没有删对话：下次启动实测全部在，按提交记录报出新增的对话并记入账本', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_after_commit_a', project: SHARED_PROJECT },
+    { id: 'conversation_alpha_after_commit_b', project: SHARED_PROJECT }
+  ]);
+  const killed = await runChild(['kill', fixture.root, 'after-row-commit']);
+  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  const database = await openTarget(t, fixture.current);
+  const converged = await merge(fixture, database);
+  assert.deepEqual(converged.merged.map((item) => [item.recoveredCommit, item.insertedConversations, item.insertedRows > 0]), [[true, 2, true]]);
+  assert.deepEqual(await mergedInto(fixture),
+    [[fixture.current.binding.dataSetId, ['conversation_alpha_after_commit_a', 'conversation_alpha_after_commit_b']]]);
+});
+
+test('盲审 merge #1：提交前崩溃后按实测收敛的自动合并（记录下来的请求）同样不插回以前合并过、之后删掉的对话', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_keep', project: SHARED_PROJECT },
+    { id: 'conversation_alpha_gone', project: SHARED_PROJECT }
+  ]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  await new ConversationDeletionControlPlane(database).delete('conversation_alpha_gone');
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_new', project: SHARED_PROJECT }]);
+  // The user asked for the merge; the window doing it was killed before its transaction.
+  await requestMerge(fixture, fixture.alpha);
+  const killed = await runChild(['kill', fixture.root, 'before-row-commit']);
+  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'committing');
+  // Next startup: none of that commit is here, so the record it replaced is back and the request merges again.
+  const converged = await merge(fixture, database);
+  assert.deepEqual([converged.deferred, converged.blocked], [[], []]);
+  assert.deepEqual(converged.merged.map((item) => [item.insertedConversations, item.skippedConversations, item.recoveredCommit]), [[1, 1, false]]);
+  const target = readDatabase(fixture.current);
+  try {
+    assert.deepEqual(target.database.prepare('SELECT id FROM conversation ORDER BY id').pluck().all(), ['conversation_alpha_keep', 'conversation_alpha_new']);
+  } finally { target.close(); }
+});
+
 test('盲审 merge #2：两个窗口同时启动且来源需要收尾：先到窗口收尾并合并后，后到窗口在锁内重读账本静默跳过，不报推迟、不再收尾；明确请求时提示已合并', async (t) => {
   const run = async (explicit) => {
     const fixture = await createFixture(t, { withBeta: false });
@@ -1660,6 +1819,11 @@ test('跨模块盲审 #7：合并前备份之前核对剩余空间：不够就�
 });
 
 /** Conversations the ledger records as inserted per target: [targetDataSetId, sorted ids][]. */
+async function mergedInto(fixture) {
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  return (record?.mergedInto ?? []).map((entry) => [entry.target.dataSetId, [...entry.conversationIds].sort()]);
+}
+
 async function seqFixture(t) {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.current, [{ id: 'conversation_current_seq', project: SHARED_PROJECT }]);

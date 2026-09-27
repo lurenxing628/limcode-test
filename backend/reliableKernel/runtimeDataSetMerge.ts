@@ -24,7 +24,7 @@ import {
   readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger,
   readRuntimeDataSetMergeRequests, rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit,
   removeRuntimeDataSetMergeFinalization, removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest,
-  restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetFingerprint, runtimeDataSetLastMerge,
+  restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetFingerprint, runtimeDataSetLastMerge, runtimeDataSetMergedConversations,
   sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization,
   writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeLedgerRecord,
@@ -58,7 +58,9 @@ import {
  * the ledger are checked again and ONE ordinary RuntimeDatabase write transaction of Repository
  * insert steps runs (codec-validated, worker insert invariants apply, other Hosts keep running and
  * see it as an external commit). Sources above the online size limit need the exclusive fallback,
- * which wraps that last step alone. The ledger records every outcome by exact source file state.
+ * which wraps that last step alone. The ledger records every outcome by exact source file state,
+ * and the conversations each merge inserted: one the user deleted in the target since is left out
+ * of every later merge of that source into it, with everything that belongs to it (skippedRows).
  */
 
 /** One verified online Backup API copy of the target per batch that changes it (target control root). */
@@ -269,6 +271,12 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   finalized?: { turns: number; intents: number; sourceBackupPath: string };
   /** Merged through the exclusive fallback because the source exceeded the online limits. */
   exclusive?: boolean;
+  /**
+   * Conversations left out because an earlier merge of this source inserted them into this data set
+   * and the user deleted them there since (with everything that belongs to them); counted per
+   * deleted conversation, its Subagent conversations included in it.
+   */
+  skippedConversations?: number;
   /** Nothing new was written: the source is merged into this data set already (已合并，没有新内容). */
   alreadyMerged?: true;
 }
@@ -339,7 +347,7 @@ type SourceOutcome =
   | { kind: 'merged'; result: RuntimeDataSetMergeResult }
   /**
    * Every row is already in the target (or another window merged it meanwhile): nothing new, only
-   * reported for an explicit request or closed work (result.alreadyMerged).
+   * reported for an explicit request, closed work or conversations left out (result.alreadyMerged).
    */
   | { kind: 'current'; result: RuntimeDataSetMergeResult }
   /** shouldContinue turned false before this source changed anything; nothing is recorded. */
@@ -468,7 +476,7 @@ export async function mergeHistoricalDataSetsOnline(
     if (outcome.kind === 'stopped') break;
     if (outcome.kind === 'merged' || outcome.kind === 'current') {
       const { result } = outcome;
-      if (outcome.kind === 'merged' || source.requested || result.finalized) report.merged.push(result);
+      if (outcome.kind === 'merged' || source.requested || result.finalized || result.skippedConversations) report.merged.push(result);
       await removeRuntimeDataSetMergeRequest(storagePaths, source.candidate.id).catch(() => undefined);
       continue;
     }
@@ -832,6 +840,8 @@ interface SourceProgress {
   finalized?: {
     turnIds: string[]; intentIds: string[]; turns: number; intents: number; sourceBackupPath: string; complete: boolean; earlier?: boolean;
   };
+  /** Conversations the plan leaves out (see skippedRows), counted per deleted conversation. */
+  skippedConversations?: number;
   /** The outcome was already written to the ledger where it was found. */
   recorded?: boolean;
 }
@@ -920,6 +930,8 @@ async function mergeSource(
     if (settled) return settled;
   }
   const { candidate, binding } = await resolveSource(paths, target, candidateId, mode, state);
+  // Conversations earlier merges of this source inserted here: the ones deleted here since are left out.
+  const merged = mode.migration ? [] : await recordedConversations(paths, target, candidate);
   const unfinishedWork = mode.finalizeWork ? 'finalize' as const : 'carry' as const;
   let taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options);
   try {
@@ -943,7 +955,7 @@ async function mergeSource(
     }
     const limits = options.limits ?? RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
     stopIfAsked();
-    let plan = await planRows(taken.snapshot.database, target.database);
+    let plan = await planSource(taken.snapshot.database, target, merged, state);
     let size = checkPlan(plan, taken.audit.size!, limits, options, state);
     const verified: CasVerification = options.casVerification ?? new Map();
     if (work && hasFinalizableWork(work)) {
@@ -961,7 +973,7 @@ async function mergeSource(
         throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(remaining.refused) || '收尾后仍有未结束的任务', state, true));
       }
       stopIfAsked();
-      plan = await planRows(taken.snapshot.database, target.database);
+      plan = await planSource(taken.snapshot.database, target, merged, state);
       size = checkPlan(plan, taken.audit.size!, limits, options, state);
     }
     if (plan.steps.length === 0) {
@@ -1007,7 +1019,8 @@ async function settledSource(
     const record = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
     if (record?.state !== 'committing' || !sameRuntimeDataSetIdentity(record.target, target.identity)
       || !sameRuntimeDataSetIdentity(record.source, candidate)) return undefined;
-    const presence = await commitPresence(paths, record.commitId, target.database);
+    const rows = (await readRuntimeDataSetMergeCommit(paths, record.commitId))?.rows ?? [];
+    const presence = rows.length > 0 ? await insertedRowsPresence(rows, target.database) : 'none';
     if (presence === 'none') {
       // Nothing of it was committed: the record it replaced is back, and the source is merged again.
       await restoreLedgerRecord(paths, candidateId, record.replaced);
@@ -1015,10 +1028,14 @@ async function settledSource(
       return undefined;
     }
     state.fingerprint = record.source;
+    // Some of it is here, so the one transaction committed: every conversation it inserted is on record
+    // as merged here (one the user deleted since is left out of later merges into this data set).
+    const insertedConversationIds = rows.filter(([domain]) => domain === 'Conversation').map(([, id]) => id);
     if (presence === 'partial') {
       const outcome: Refusal = { kind: 'blocked', code: 'runtime-data-set-merge-conflict', message: '上次合并在提交时中断，之后当前库里这批对话已有增删，无法确认合并状态；请在历史与存储管理中手动合并。' };
       await writeRuntimeDataSetMergeLedgerRecord(paths, {
-        candidateId, state: 'blocked', source: record.source, target: target.identity, code: outcome.code, message: outcome.message
+        candidateId, state: 'blocked', source: record.source, target: target.identity, code: outcome.code, message: outcome.message,
+        insertedConversationIds
       });
       state.recorded = true;
       throw new Outcome(outcome);
@@ -1026,11 +1043,13 @@ async function settledSource(
     // Recorded for the source state that was committed; later changes show as changed since merge.
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId, state: 'merged', source: record.source, target: target.identity,
-      mergedAt: new Date().toISOString(), insertedRows: 0, reusedRows: 0, insertedConversations: 0
+      mergedAt: new Date().toISOString(), insertedRows: rows.length, reusedRows: 0,
+      insertedConversations: insertedConversationIds.length, insertedConversationIds
     });
     await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
     return { kind: 'merged', result: {
-      ...unchangedResult(candidate, target), recoveredCommit: true, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state))
+      ...unchangedResult(candidate, target), insertedRows: rows.length, insertedConversations: insertedConversationIds.length,
+      recoveredCommit: true, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state))
     } };
   });
 }
@@ -1278,6 +1297,7 @@ async function commitLocked(
     }
   }
   stopIfAsked();
+  const insertedConversationIds = plan.inserted.filter(([domain]) => domain === 'Conversation').map(([, id]) => id);
   const result: RuntimeDataSetMergeResult = {
     ...unchangedResult(candidate, target),
     insertedRows: plan.inserted.length,
@@ -1285,12 +1305,13 @@ async function commitLocked(
     insertedConversations: plan.insertedConversations,
     ...(cas ?? {}),
     ...(plan.steps.length > 0 && target.backup.path ? { backupPath: target.backup.path } : {}),
-    ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {})
+    ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}),
+    ...(state.skippedConversations ? { skippedConversations: state.skippedConversations } : {})
   };
-  const merged = (): DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt'> => ({
+  const merged = (): Parameters<typeof writeRuntimeDataSetMergeLedgerRecord>[1] => ({
     candidateId: candidate.id, state: 'merged', source: state.fingerprint!, target: target.identity,
     mergedAt: new Date().toISOString(), insertedRows: plan.inserted.length, reusedRows: plan.reused,
-    insertedConversations: plan.insertedConversations
+    insertedConversations: plan.insertedConversations, insertedConversationIds
   });
   if (plan.steps.length === 0) {
     if (mode.migration) return { kind: 'merged', result };
@@ -1543,6 +1564,218 @@ async function transferSourceCas(
   });
 }
 
+/** Conversations earlier merges of this source inserted into this target (its ledger record). */
+async function recordedConversations(
+  paths: { globalStoragePath: string },
+  target: TargetContext,
+  candidate: VscodeRuntimeDataSetCandidate
+): Promise<string[]> {
+  const record = (await readRuntimeDataSetMergeLedger(paths)).get(candidate.id);
+  return record && sameRuntimeDataSetIdentity(record.source, candidate) ? runtimeDataSetMergedConversations(record, target.identity) : [];
+}
+
+/** The row plan of a source copy, leaving out what belongs to conversations deleted here since they were merged. */
+async function planSource(
+  source: Database.Database,
+  target: TargetContext,
+  merged: readonly string[],
+  state: SourceProgress
+): Promise<RowPlan> {
+  const deleted = merged.length > 0 ? await deletedSinceMerge(source, target.database, merged) : undefined;
+  state.skippedConversations = deleted?.count ?? 0;
+  return planRows(source, target.database, deleted && skippedRows(source, deleted.conversations));
+}
+
+/**
+ * Conversations of the source a merge leaves out: inserted into this target by an earlier merge of
+ * the source and absent from it now (the user deleted them), with their Subagent descendants in the
+ * source, as deleting a conversation takes them (ConversationDeletionControlPlane). Counted per
+ * deleted conversation: one whose Subagent parent is left out as well belongs to it.
+ */
+async function deletedSinceMerge(
+  source: Database.Database,
+  target: RuntimeDatabase,
+  merged: readonly string[]
+): Promise<{ conversations: Set<string>; count: number } | undefined> {
+  const inSource = new Set(source.prepare('SELECT id FROM conversation').pluck().all() as string[]);
+  const candidates = [...new Set(merged)].filter((id) => inSource.has(id));
+  const deleted: string[] = [];
+  for (let start = 0; start < candidates.length; start += READ_CHUNK) {
+    const ids = candidates.slice(start, start + READ_CHUNK);
+    const found = (await target.snapshot(ids.map((id) => DOMAIN_REPOSITORIES.domain('Conversation').get(id)))).snapshot;
+    ids.forEach((id, index) => { if (found[index] === null) deleted.push(id); });
+  }
+  if (deleted.length === 0) return undefined;
+  // Subagent origins, as the deletion reads them: a ChildExecution's conversation and its source conversation.
+  const parents = new Map<string, string>();
+  const children = new Map<string, string[]>();
+  for (const [child, parent] of source.prepare(`
+    SELECT origin.conversation_id, origin.source_conversation_id FROM conversation_origin_link AS origin
+     WHERE origin.conversation_id IN (SELECT child_conversation_id FROM child_execution)
+       AND origin.source_conversation_id IS NOT NULL AND origin.source_conversation_id <> ''
+  `).raw().iterate() as IterableIterator<[string, string]>) {
+    parents.set(child, parent);
+    children.set(parent, [...children.get(parent) ?? [], child]);
+  }
+  const conversations = new Set(deleted);
+  for (const pending = [...deleted]; pending.length > 0;) {
+    for (const child of children.get(pending.pop()!) ?? []) {
+      if (conversations.has(child)) continue;
+      conversations.add(child);
+      pending.push(child);
+    }
+  }
+  const count = [...conversations].filter((id) => !conversations.has(parents.get(id) ?? '')).length;
+  return { conversations, count };
+}
+
+/**
+ * Ownership without a foreign key (see skippedRows): a row with one of these columns naming a
+ * left-out row (of `owner`, and only for that `kind`) is left out with it. An Operation with its
+ * ModelRequest (the worker checks that aggregate); deliveries to a left-out conversation (deleting
+ * it settles them); command receipts, context roots and projections, effects, file mutations and
+ * processes of left-out conversations, turns, tool calls and attempts.
+ */
+const SKIPPED_WITH: ReadonlyArray<{ domain: string; column: string; owner: string; kind?: readonly [column: string, value: string] }> = [
+  { domain: 'Operation', column: 'owner_id', owner: 'ModelRequest', kind: ['owner_kind', 'model_request'] },
+  { domain: 'RuntimeDelivery', column: 'target_conversation_id', owner: 'Conversation' },
+  { domain: 'RuntimeDelivery', column: 'target_turn_id', owner: 'Turn' },
+  { domain: 'CommandReceipt', column: 'conversation_id', owner: 'Conversation' },
+  { domain: 'CommandReceipt', column: 'turn_id', owner: 'Turn' },
+  { domain: 'ContextSequenceRoot', column: 'conversation_id', owner: 'Conversation' },
+  { domain: 'ModelContextProjection', column: 'owner_id', owner: 'ModelRequest', kind: ['owner_kind', 'model_request'] },
+  { domain: 'ModelContextProjection', column: 'owner_id', owner: 'CompressionBlock', kind: ['owner_kind', 'compression_block'] },
+  { domain: 'ModelContextProjection', column: 'root_id', owner: 'ContextSequenceRoot' },
+  { domain: 'EffectIntent', column: 'attempt_id', owner: 'Attempt' },
+  { domain: 'EffectReceipt', column: 'attempt_id', owner: 'Attempt' },
+  { domain: 'EffectReceipt', column: 'operation_id', owner: 'Operation' },
+  { domain: 'EffectReceipt', column: 'tool_call_id', owner: 'ToolCall' },
+  { domain: 'EffectReceipt', column: 'conversation_id', owner: 'Conversation' },
+  { domain: 'FileMutationReceipt', column: 'effect_receipt_id', owner: 'EffectReceipt' },
+  { domain: 'FileMutationReceipt', column: 'change_set_id', owner: 'FileChangeSet' },
+  { domain: 'FileMutationReceiptMember', column: 'member_id', owner: 'FileChangeSetMember' },
+  { domain: 'ProcessOriginLink', column: 'tool_call_id', owner: 'ToolCall' },
+  { domain: 'ProcessCompletionSourceLink', column: 'conversation_id', owner: 'Conversation' },
+  { domain: 'ProcessCompletionSourceLink', column: 'source_turn_id', owner: 'Turn' },
+  { domain: 'ProcessCompletionSourceLink', column: 'source_tool_call_id', owner: 'ToolCall' },
+  { domain: 'ProcessReceipt', column: 'process_id', owner: 'Process' }
+];
+
+/**
+ * Rows that reference nothing of their own and exist for their members (rows naming them in these
+ * columns): left out once all members are (`all`: messages, processes, context nodes and segments),
+ * or once any is where deleting a conversation removes them with it (`any`: the interaction request
+ * of a deleted Turn by the schema trigger, board channels and posts by the collaboration deletion).
+ */
+const SKIPPED_WITH_MEMBERS: ReadonlyArray<{ domain: string; mode: 'all' | 'any'; members: ReadonlyArray<readonly [domain: string, column: string]> }> = [
+  { domain: 'Message', mode: 'all', members: [['MessagePartOfConversation', 'message_id'], ['MessageTurnLink', 'message_id']] },
+  { domain: 'Process', mode: 'all', members: [['ProcessOriginLink', 'process_id'], ['ProcessCompletionSourceLink', 'process_id']] },
+  { domain: 'ContextSequenceNode', mode: 'all', members: [
+    ['ContextSequenceRoot', 'root_node_id'], ['ContextSequenceRoot', 'tail_node_id'], ['ContextSequenceNode', 'parent_node_id']
+  ] },
+  { domain: 'ContextSegment', mode: 'all', members: [['ContextSequenceNode', 'segment_id'], ['CompressionBlockSource', 'segment_id']] },
+  { domain: 'InteractionRequest', mode: 'any', members: [['InteractionOwnerLink', 'request_id']] },
+  { domain: 'CollaborationBoardChannel', mode: 'any', members: [['CollaborationBoardChannelScopeLink', 'channel_id']] },
+  { domain: 'CollaborationBoardPost', mode: 'any', members: [
+    ['CollaborationBoardPostSourceLink', 'post_id'], ['CollaborationBoardPostChannelLink', 'post_id'], ['CollaborationBoardReplyLink', 'post_id']
+  ] }
+];
+
+// Checked when this module loads: the rules name existing domains and columns.
+(() => {
+  const schemas = new Map(RUNTIME_DOMAIN_SCHEMAS.map((schema) => [schema.key, schema]));
+  const column = (domain: string, name: string): void => {
+    if (!schemas.get(domain)?.columns.some((item) => item.name === name)) {
+      throw new Error(`Historical merge skip rule names an unknown column ${domain}.${name}.`);
+    }
+  };
+  for (const rule of SKIPPED_WITH) {
+    column(rule.domain, rule.column);
+    if (rule.kind) column(rule.domain, rule.kind[0]);
+    if (!schemas.has(rule.owner)) throw new Error(`Historical merge skip rule names an unknown domain ${rule.owner}.`);
+  }
+  for (const rule of SKIPPED_WITH_MEMBERS) {
+    if (!schemas.has(rule.domain)) throw new Error(`Historical merge skip rule names an unknown domain ${rule.domain}.`);
+    for (const [domain, name] of rule.members) column(domain, name);
+  }
+})();
+
+/**
+ * Every source row that belongs to the left-out conversations, by domain: the conversations, every
+ * row with a foreign key to a left-out row, the ownership of SKIPPED_WITH and the members of
+ * SKIPPED_WITH_MEMBERS, to a fixed point. So no row that is inserted references one that is left
+ * out. Rows of the four content-derived domains are never left out (inserted only if still absent,
+ * as ever). Cross-conversation collaboration history (collaboration messages with their source,
+ * target, payload and reply links, inbox items, budgets, requests) and the branch or origin links
+ * of other conversations stay, as when a conversation is deleted.
+ */
+function skippedRows(source: Database.Database, conversations: ReadonlySet<string>): Map<string, Set<string>> {
+  const key = (domain: string, id: unknown): string => `${domain}\u0000${String(id)}`;
+  const domainOf = new Map(RUNTIME_DOMAIN_SCHEMAS.map((schema) => [schema.table, schema.key]));
+  // A row → the rows left out with it; a member row → what it is a member of (and how many members that has).
+  const dependents = new Map<string, string[]>();
+  const memberOf = new Map<string, Array<{ owner: string; all: boolean }>>();
+  const members = new Map<string, number>();
+  const append = <T>(map: Map<string, T[]>, at: string, value: T): void => {
+    const list = map.get(at);
+    if (list) list.push(value);
+    else map.set(at, [value]);
+  };
+  for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
+    if (IDENTITY_MERGE_DIFFERENCES.has(schema.key)) continue;
+    const references = [
+      ...schema.columns.flatMap((column) => {
+        const owner = column.references ? domainOf.get(column.references.table) : undefined;
+        return owner === undefined || IDENTITY_MERGE_DIFFERENCES.has(owner) ? [] : [{ column: column.name, owner, kind: undefined }];
+      }),
+      ...SKIPPED_WITH.filter((rule) => rule.domain === schema.key)
+    ];
+    const memberships = SKIPPED_WITH_MEMBERS.flatMap((rule) => rule.members
+      .filter(([domain]) => domain === schema.key).map(([, column]) => ({ column, owner: rule.domain, all: rule.mode === 'all' })));
+    if (references.length === 0 && memberships.length === 0) continue;
+    const columns = [...new Set(['id', ...references.flatMap((item) => item.kind ? [item.column, item.kind[0]] : [item.column]),
+      ...memberships.map((item) => item.column)])];
+    const rows = source.prepare(`SELECT ${columns.map((column) => `"${column}"`).join(', ')} FROM "${schema.table}"`);
+    for (const row of rows.iterate() as IterableIterator<Record<string, unknown>>) {
+      const self = key(schema.key, row.id);
+      for (const { column, owner, kind } of references) {
+        if (row[column] !== null && (!kind || row[kind[0]] === kind[1])) append(dependents, key(owner, row[column]), self);
+      }
+      for (const { column, owner, all } of memberships) {
+        if (row[column] === null) continue;
+        const of = key(owner, row[column]);
+        append(memberOf, self, { owner: of, all });
+        if (all) members.set(of, (members.get(of) ?? 0) + 1);
+      }
+    }
+  }
+  const skipped = new Map<string, Set<string>>();
+  const seen = new Set<string>();
+  const pending: string[] = [];
+  const leftOut = new Map<string, number>();
+  const skip = (at: string): void => {
+    if (seen.has(at)) return;
+    seen.add(at);
+    pending.push(at);
+    const split = at.indexOf('\u0000');
+    const domain = at.slice(0, split);
+    let ids = skipped.get(domain);
+    if (!ids) skipped.set(domain, ids = new Set());
+    ids.add(at.slice(split + 1));
+  };
+  for (const id of conversations) skip(key('Conversation', id));
+  while (pending.length > 0) {
+    const at = pending.pop()!;
+    for (const dependent of dependents.get(at) ?? []) skip(dependent);
+    for (const { owner, all } of memberOf.get(at) ?? []) {
+      const count = (leftOut.get(owner) ?? 0) + 1;
+      leftOut.set(owner, count);
+      if (!all || count === members.get(owner)) skip(owner);
+    }
+  }
+  return skipped;
+}
+
 interface RowPlan {
   steps: RepositoryTransactionStep[];
   inserted: Array<[string, string]>;
@@ -1556,8 +1789,13 @@ interface RowPlan {
  * through the domain Repository insert step (historical copies for the terminal model-stream
  * domains). Existing ids are compared on decoded values. The transaction ends by asserting that
  * every source id exists in the receiving data set, so the committed row set is measured, not assumed.
+ * Rows in `skipped` (see skippedRows) are left out entirely: not compared, inserted or asserted.
  */
-async function planRows(source: Database.Database, target: RuntimeDatabase): Promise<RowPlan> {
+async function planRows(
+  source: Database.Database,
+  target: RuntimeDatabase,
+  skipped?: ReadonlyMap<string, ReadonlySet<string>>
+): Promise<RowPlan> {
   const plan: RowPlan = { steps: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
   const presence: RepositoryTransactionStep[] = [];
   for (const schema of MERGE_DOMAIN_ORDER) {
@@ -1615,7 +1853,9 @@ async function planRows(source: Database.Database, target: RuntimeDatabase): Pro
       // Decoding stays on the extension thread; yield so a large source never monopolizes it.
       await new Promise((resolve) => setImmediate(resolve));
     };
+    const leftOut = skipped?.get(schema.key);
     for (const raw of statement.iterate() as IterableIterator<Record<string, unknown>>) {
+      if (leftOut?.has(String(raw.id))) continue;
       chunk.push(sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
       if (chunk.length >= READ_CHUNK) await flush();
     }
@@ -1653,16 +1893,6 @@ function withoutColumn(row: DomainRow, column: string): DomainRow {
   const rest = { ...row };
   delete rest[column];
   return rest;
-}
-
-/** Exact inserted id set of an interrupted commit: all present, none present, or changed since. */
-async function commitPresence(
-  paths: { globalStoragePath: string },
-  commitId: string,
-  database: RuntimeDatabase
-): Promise<'all' | 'none' | 'partial'> {
-  const commit = await readRuntimeDataSetMergeCommit(paths, commitId);
-  return commit ? insertedRowsPresence(commit.rows, database) : 'none';
 }
 
 /**
@@ -2131,8 +2361,6 @@ function sentence(text: string): string {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
 // ---------------------------------------------------------------------------------------------
 // Shared with runtimeDataSetBulkCopy (data-root migration into an empty, not yet visible root).

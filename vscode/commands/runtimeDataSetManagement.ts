@@ -291,7 +291,7 @@ function remergeNote(merged?: RuntimeDataSetMergedFacts): string {
   if (merged.sourceUnreadable) return '\n\n现在无法读取这个库，不能确认它在上次合并之后有没有改动；合并时会重新核验，读不出来会说明原因。';
   if (!merged.changedSinceMerge) return '';
   return '\n\n这个库在上次合并到当前库之后又有改动：只新建过对话时，新对话会合并进来；'
-    + '在已合并的对话里继续过时，那些对话与当前库里的那份不同，会整体不合并并说明原因，这时请保留这个库。';
+    + '在已合并、当前库里也还在的对话里继续过时，那些对话与当前库里的那份不同，会整体不合并并说明原因，这时请保留这个库。';
 }
 
 /** What an explicit merge of a source above the online limit does (the engine's and coordination's own bounds). */
@@ -318,6 +318,7 @@ async function mergeNow(
   const confirmed = await vscode.window.showWarningMessage('把这个历史库合并到当前库？', {
     modal: true, detail: `来源：${candidate.runtimeDataRootPath}\n\n在后台合并，不需要重载窗口：先备份当前库，再把对话写入当前库。`
       + '原库保留（已发布的旧格式会先备份并就地升级）；原库里中断的任务按“中止”收尾、排队未发送的消息会被取消，都不会在当前库被继续执行。'
+      + '以前从这个库合并进当前库、之后你在当前库删除了的对话不会再合并回来（连同它们的子 Agent 对话，在这个库里继续过的也一样）。'
       + '无法自动收尾的工作或数据冲突时整体不合并，并说明原因。' + oversizedMergeNote() + changed
   }, '合并');
   if (confirmed !== '合并' || !candidate.dataSetId || !candidate.rootInstanceId) return;
@@ -340,9 +341,12 @@ async function switchHistory(
 ): Promise<void> {
   if (candidate.selected) { await vscode.window.showInformationMessage('已经在使用这个历史库。'); return; }
   const merged = lastMergeOf(merge);
-  const mergedHere = merged?.intoCurrent && !merged.changedSinceMerge && !merged.sourceUnreadable
-    ? '\n\n这个库的对话已合并到当前库。切换过去后如果在已合并的对话里继续聊天，这个库以后就不能再合并回当前库（会整体不合并）；'
-      + '只新建对话、不动已合并的对话时，新对话以后仍可合并回来。'
+  const mergedHere = merged?.intoCurrent
+    ? (!merged.changedSinceMerge && !merged.sourceUnreadable
+      ? '\n\n这个库的对话已合并到当前库。切换过去后如果在已合并的对话里继续聊天，这个库以后就不能再合并回当前库（会整体不合并）；'
+        + '只新建对话、不动已合并的对话时，新对话以后仍可合并回来。'
+      : '')
+      + '\n\n从这个库合并进当前库、之后在当前库删除了的对话，以后再合并时不会被插回（在这个库里继续过也一样）。'
     : '';
   const confirmed = await vscode.window.showWarningMessage('切换当前历史库并重载窗口？', {
     modal: true, detail: `目标：${candidate.runtimeDataRootPath}\n\n当前窗口的运行会停止。请先关闭其它使用同一数据目录的 VS Code 窗口。`
@@ -549,16 +553,19 @@ function mergedLog(merged: RuntimeDataSetMergeResult): string {
     ? `旧聊天记录 ${merged.candidateId} 已合并到当前历史库，没有新内容`
     : `已合并旧聊天记录 ${merged.candidateId}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`)
     + (merged.finalized ? `；收尾 ${merged.finalized.turns} 个中断任务，另有 ${merged.finalized.intents} 条排队未发送的消息已取消，`
-      + `收尾前来源备份：${merged.finalized.sourceBackupPath}` : '');
+      + `收尾前来源备份：${merged.finalized.sourceBackupPath}` : '')
+    + (merged.skippedConversations ? `；${merged.skippedConversations} 个之前合并进来、之后在当前库删除的对话没有再合并` : '');
 }
 
-/** What merged sources also did: work closed before merging. */
+/** What merged sources also did: work closed before merging, and conversations deliberately left out. */
 function mergedNotes(results: readonly RuntimeDataSetMergeResult[]): string {
   const total = (count: (result: RuntimeDataSetMergeResult) => number): number => results.reduce((sum, result) => sum + count(result), 0);
   const turns = total(result => result.finalized?.turns ?? 0);
   const intents = total(result => result.finalized?.intents ?? 0);
+  const skipped = total(result => result.skippedConversations ?? 0);
   return (turns ? `其中 ${turns} 个中断的任务已按“中止”收尾，不会被继续执行。` : '')
-    + (intents ? `另有 ${intents} 条排队未发送的消息已取消。` : '');
+    + (intents ? `另有 ${intents} 条排队未发送的消息已取消。` : '')
+    + (skipped ? `有 ${skipped} 个对话以前合并进来、之后你在当前库删除了，这次没有再合并回来。` : '');
 }
 
 /** Runs after current Runtime startup. Historical upgrades never register or recover old tasks. */
