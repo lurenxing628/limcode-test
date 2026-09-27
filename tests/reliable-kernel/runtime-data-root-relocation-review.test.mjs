@@ -257,7 +257,7 @@ test('行数上限只管合并进已有 LimCode 数据：迁入新建根时当�
   bulk(fixture.current.binding.paths.databasePath, 'conversation_bulk_current');
   const fresh = await planWithRuntime(fixture, path.join(fixture.base, 'moved'));
   assert.deepEqual(fresh.problems, [], '新建根按批写入，不受单事务上限');
-  assert.ok(fresh.current.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
+  assert.equal(fresh.current.rows, undefined, '迁入新建根不统计行数');
   assert.equal(fresh.others[0].leaveBehind, undefined, '其它库总是进新建根，不再因行数留在旧目录');
   const existing = path.join(fixture.base, 'existing');
   await createLimCodeTarget(existing);
@@ -265,9 +265,10 @@ test('行数上限只管合并进已有 LimCode 数据：迁入新建根时当�
   const refused = await planWithRuntime(fixture, existing);
   assert.equal(refused.target.kind, 'limcode');
   assert.match(refused.problems.join('\n'), /合并一次最多 \d+ 行），当前版本暂不能迁移到这个目录；旧目录不受影响/);
+  assert.ok(refused.current.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, '合并进已有目标时统计当前库的行数');
   assert.deepEqual(await treeSnapshot(existing), before, '预检不改动已有目标');
   const controlRoot = path.dirname(fixture.current.binding.paths.dataRootPath);
-  assert.deepEqual((await fs.readdir(controlRoot)).filter((name) => name.startsWith('relocation-count-')), [], '计数用的副本已删除');
+  assert.deepEqual((await fs.readdir(controlRoot)).filter((name) => name.startsWith('relocation-count-')), [], '计数不在旧目录里做副本');
 });
 
 test('其它历史库在线阶段已整库复制进新根：之后没变的直接保留，之后有写入的在独占阶段丢弃重做，迁移结果与来源一致', async (t) => {

@@ -1,8 +1,9 @@
 // Real SIGKILL at every durable step of a relocation and inside the undo itself (reloc2 review's 72
 // points plus the undo's own steps), then what the next startup does: the undo is always finished
 // (whatever the first kill or the interrupted undo left), the target is exactly as before, copied
-// data renamed aside is back, and the target receives the relocation again. The one exception is a
-// kill between the merge's commit and the journal entry of its fingerprint: that undo is held. The old directory is
+// data renamed aside is back, and the target receives the relocation again (also after a kill between
+// the merge's commit and the journal entry of its fingerprint: the rows journaled before the commit
+// show that only the relocation wrote there). The old directory is
 // never touched. Child: runtime-data-root-relocation-undo-crash-child.mjs; runs against the compiled dist.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -24,7 +25,11 @@ function child(base, scenario, kind, phase) {
   return new Promise((resolve) => run.on('exit', (code, signal) => resolve({ code, signal })));
 }
 
-const noise = (file) => /\.runtime-(maintenance|admission)/.test(file) || file.endsWith('-shm') || /[\\/]cas[\\/]sha256[\\/]/.test(file);
+// Left by a killed process like its claims: the liveness record of the merge's session on the
+// receiving data set (killed inside the merge transaction, e.g. at its 'merging' journal entry);
+// a dead process's record never counts as online.
+const noise = (file) => /\.runtime-(maintenance|admission)/.test(file) || file.endsWith('-shm') || /[\\/]cas[\\/]sha256[\\/]/.test(file)
+  || /[\\/]host-liveness[\\/]/.test(file);
 function diffSnapshots(before, after) {
   const keys = new Set([...Object.keys(before), ...Object.keys(after)].filter((key) => !noise(key)));
   const diff = [];
@@ -54,8 +59,8 @@ push('empty', 'during-merge', 'pending-written', 'journal-create', 'staging-mark
 for (let n = 1; n <= 10; n += 1) push('empty', `journal-before:${n}`, `journal-after:${n}`);
 push('limcode', 'journal-create', 'staging-marker-after', 'dbbackup-before-rename', 'identity-after', 'complete-marker-after', 'publish-after',
   'undo-db-restored', 'undo-work-removed', 'undo-db-restored@journal-before:13',
-  'undo-marked', 'undo-restored', 'undo-record-removed', 'undo-marked@journal-before:12', 'undo-restored@journal-before:5');
-for (let n = 1; n <= 15; n += 1) push('limcode', `journal-before:${n}`, `journal-after:${n}`);
+  'undo-marked', 'undo-restored', 'undo-record-removed', 'undo-restored@journal-before:12', 'undo-restored@journal-before:5');
+for (let n = 1; n <= 16; n += 1) push('limcode', `journal-before:${n}`, `journal-after:${n}`);
 push('copied', 'during-merge', 'aside-after', 'staging-marker-after', 'journal-after:1', 'journal-after:9', 'journal-after:10', 'complete-marker-after', 'publish-after', 'undo-work-removed',
   'undo-marked', 'undo-record-removed', 'undo-leftover-moved@during-merge', 'undo-record-removed@during-merge');
 for (let n = 2; n <= 10; n += 1) push('copied', `journal-before:${n}`);
@@ -99,20 +104,6 @@ for (const [scenario, kind] of scenarios) {
       assert.fail(`下次启动撤销失败：${error?.code ?? ''} ${error?.message}\n${await log()}`);
     }
     t.diagnostic(`recover -> ${outcome}`);
-    if (kind === 'limcode' && scenario === 'journal-before:14') {
-      // Killed after the merge committed, before its fingerprint was journaled: the undo cannot tell
-      // this merge from someone else's writes, so it holds (touches nothing, says where the backups
-      // are) rather than risk overwriting them. Nothing is lost; the old directory is untouched.
-      assert.equal(outcome, 'held');
-      await assertOldHomeIntact(root);
-      const hold = await relocation.readDataRootRelocationHold(target);
-      assert.match(hold?.message ?? '', /没有撤销/);
-      assert.ok(hold.message.includes(path.join(target, '.limcode-relocation-backups')), hold.message);
-      const receiving = await selectedDataSet(target);
-      assert.deepEqual(conversationIds(receiving.runtimeDataRootPath).sort(), ['conversation_current_1', 'conversation_current_2', 'conversation_existing_1']);
-      assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held', '搁置之后不会再自动撤销');
-      return;
-    }
     assert.ok(outcome === 'recovered' || outcome === 'absent', outcome);
     await assertOldHomeIntact(root);
 

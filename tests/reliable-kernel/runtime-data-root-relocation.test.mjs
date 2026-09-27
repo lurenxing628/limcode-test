@@ -28,7 +28,8 @@ test('迁移到空目录：当前库与其它库按原 id 迁入、设置逐文�
   assert.deepEqual(plan.problems, []);
   assert.equal(plan.target.kind, 'empty');
   assert.equal(plan.current.id, 'default');
-  assert.ok(plan.current.rows > 0 && plan.current.casBytes > 0 && plan.current.databaseBytes > 0);
+  assert.equal(plan.current.rows, undefined, '迁入新建根不统计行数（按批写入，不受单事务上限）');
+  assert.ok(plan.current.casBytes > 0 && plan.current.databaseBytes > 0);
   assert.deepEqual(plan.others.map((item) => item.id), [fixture.alpha.id]);
   assert.ok(plan.space.length > 0 && plan.space.every((space) => space.requiredBytes > 0));
 
@@ -60,7 +61,8 @@ test('迁移到空目录：当前库与其它库按原 id 迁入、设置逐文�
   assert.equal(await fs.readFile(path.join(target, 'settings', 'llm.json'), 'utf8'), '{"activeProviderConfigId":"source"}\n');
   await assert.rejects(fs.stat(path.join(target, 'notes.txt')), { code: 'ENOENT' }, '未登记的用户文件不跟随迁移');
   const marker = JSON.parse(await fs.readFile(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'));
-  assert.equal(marker.state, 'complete');
+  assert.equal(marker.state, 'published', '切换指针之后记下已生效');
+  assert.ok(marker.publishedAt);
   assert.equal(marker.sourceRootPath, fixture.root);
   assert.deepEqual(marker.migrated.map((item) => item.id), ['default', fixture.alpha.id]);
   assert.ok(marker.migrated.every((item) => typeof item.fingerprint.contentDigest === 'string'), '每个迁移过的库都记下来源内容指纹');

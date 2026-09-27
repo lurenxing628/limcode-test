@@ -323,7 +323,8 @@ test('迁移在合并时失败、撤销又没做完（放回设置时 EPERM）�
   assert.equal(status.dataRootPath, fixture.root, '指针没有切换');
   assert.equal(status.pendingRelocation?.targetRootPath, target, '进行中记录留给下次启动');
   const markerFile = path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE);
-  assert.equal(JSON.parse(await fs.readFile(markerFile, 'utf8')).state, 'undoing');
+  // A staging record is undone without an 'undoing' mark first (the undo only deletes and renames back).
+  assert.equal(JSON.parse(await fs.readFile(markerFile, 'utf8')).state, 'staging');
   assert.notDeepEqual(await treeSnapshot(path.join(target, 'settings')), settingsBefore, '前提：设置确实没放回');
 
   // The next startup is a new process: the one that ran the relocation has ended.
@@ -555,4 +556,63 @@ test('reloc3 F4 冻结的窗口只认领自己已持有的对话，解冻后照�
   thaw();
   thaw();
   assert.deepEqual([await probe('new'), await probe('owned')], [true, true], '解冻可以重复调用');
+});
+
+test('盲审 1（exp2b）指针已切到新目录之后，释放旧目录的锁失败（EIO）：迁移按已完成处理，不撤销；如实提示“迁移已完成，收尾时出错”，新目录照常打开并收尾', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'new-home');
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const first = await openWindow(t, fixture.root);
+  // The real locks: the operation under them (relocation + pointer switch) succeeds, then releasing
+  // the old directory's claim fails (e.g. the old directory's drive went away just then).
+  const realLocks = Facade.prototype.withDataRootLocks;
+  first.window.withDataRootLocks = async function (body) {
+    await realLocks.call(this, body);
+    throw Object.assign(new Error("EIO: i/o error, rename '.limcode-runtime.runtime-maintenance'"), { code: 'EIO' });
+  };
+  ui.calls.length = 0;
+  ui.picked = target;
+  await commands.relocateDataRoot(vscodeContext, first.startup, { clientId: 'client-1' });
+  const status = await globalStatus.loadCommittedGlobalStatus(vscodeContext);
+  assert.equal(status.dataRootPath, target, '指针切换到新目录');
+  assert.equal(status.pendingRelocation, undefined);
+  await relocation.assertDataRootAvailable(target, status.dataRootId);
+  assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
+  const told = ui.calls.find(([kind, title]) => kind === 'error' && title === '数据目录迁移已完成');
+  assert.match(told?.[2] ?? '', /迁移已完成，收尾时出错：.*EIO/);
+  assert.ok(!ui.calls.some(([kind, , detail]) => kind === 'error' && /数据目录没有切换/.test(detail ?? '')), '不说与事实相反的话');
+  assert.equal(reloads(), 1);
+  // The reloaded window opens the new directory: its own relocation is confirmed and finalized there.
+  await commands.afterDataRootOpened(vscodeContext, target);
+  assert.equal(JSON.parse(await fs.readFile(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8')).state, 'finalized');
+});
+
+test('盲审 7（exp8）进行中记录指向一个再也接不上的位置（记录里有目标锚点）：给出“放弃这次迁移的记录”，确认后照常选择新文件夹迁移', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const lostTarget = path.join(fixture.base, 'lost-drive', 'LimCode');
+  await globalStatus.updateGlobalStatusDataRoot(vscodeContext, {
+    pendingRelocation: {
+      relocationId: randomUUID(), sourceRootPath: fixture.root, targetRootPath: lostTarget, startedAt: NOW_ISO,
+      processId: spawnSync(process.execPath, ['-e', '']).pid, targetAnchor: { parent: '1:1' }
+    },
+    expectedPendingRelocationId: null
+  });
+  const first = await openWindow(t, fixture.root);
+  ui.calls.length = 0;
+  ui.picked = path.join(fixture.base, 'new-home');
+  await commands.relocateDataRoot(vscodeContext, first.startup, { clientId: 'client-1' });
+  const offered = ui.calls.find(([kind, title]) => kind === 'prompt' && title === '上次的迁移还没有撤销完');
+  assert.match(offered?.[2] ?? '', /现在看不到/);
+  assert.match(offered[2], /放弃之后不会再尝试撤销：旧目录没有改动/);
+  assert.ok(ui.calls.some(([kind]) => kind === 'open-dialog'), '放弃记录之后照常选择新文件夹');
+  const status = await globalStatus.loadCommittedGlobalStatus(vscodeContext);
+  assert.equal(status.dataRootPath, ui.picked, '迁移照常完成');
+  assert.equal(status.pendingRelocation, undefined);
 });

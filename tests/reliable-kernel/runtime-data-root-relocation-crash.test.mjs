@@ -100,7 +100,11 @@ test('SIGKILL 在切换指针之后：指针指向完整写好的新目录，打
   assert.equal(run.pointer.pendingRelocation, undefined, '进行中记录随指针一起清除');
   const moved = await selectedDataSet(target);
   assert.deepEqual(conversationIds(moved.runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
+  // Killed before the record was confirmed: only an opener whose pointer names this relocation confirms and finalizes it.
   await finalizeDataRootRelocation(target);
+  assert.ok(await fs.stat(path.join(target, '.limcode-relocation-backups')), '指针没有指明这次迁移的打开者不收尾');
+  await finalizeDataRootRelocation(target, { publishedRelocationId: run.pointer.lastMigration.relocationId });
+  assert.equal(JSON.parse(await fs.readFile(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8')).state, 'finalized');
   await assert.rejects(fs.stat(path.join(target, '.limcode-relocation-backups')), { code: 'ENOENT' }, '空目标没有被替换的设置：备份目录收尾后不留');
   await assertOldHomeIntact(root);
 });

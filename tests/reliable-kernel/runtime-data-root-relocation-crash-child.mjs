@@ -88,7 +88,8 @@ async function main() {
     relocationId,
     publish: async () => {
       if (scenario === 'before-publish') kill('pointer switch (before the write)');
-      await writeFileAtomicDurable(pointer, JSON.stringify({ dataRootPath: target }));
+      // Like the real switch: the pointer names this relocation (only then may its installation confirm it).
+      await writeFileAtomicDurable(pointer, JSON.stringify({ dataRootPath: target, lastMigration: { fromPath: fixture.root, toPath: target, relocationId } }));
       if (scenario === 'after-publish') kill('pointer switch (after the write)');
     }
   });

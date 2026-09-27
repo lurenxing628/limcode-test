@@ -194,7 +194,13 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     }, async () => {
       // A relocation into this directory that never finished is undone first (never over content
       // written since) or, while its process may still run, the open is refused.
-      const settled = await settleDataRootRelocationBeforeOpen(getPaths().globalStoragePath);
+      // The installation that relocated its data here confirms its own relocation (see settleDataRootRelocationBeforeOpen).
+      const opened = await loadCommittedGlobalStatus(context);
+      const root = getPaths().globalStoragePath;
+      const publishedRelocationId = opened.lastMigration && sameFsPath(opened.lastMigration.toPath, root) ? opened.lastMigration.relocationId : undefined;
+      const settled = await settleDataRootRelocationBeforeOpen(root, {
+        installation: context.globalStorageUri.fsPath, ...(publishedRelocationId ? { publishedRelocationId } : {})
+      });
       if (settled.held) console.warn(`[LimCode] ${settled.held}`);
       if (settled.undone) {
         // What the undo left may no longer be LimCode data (e.g. a directory the relocation created).

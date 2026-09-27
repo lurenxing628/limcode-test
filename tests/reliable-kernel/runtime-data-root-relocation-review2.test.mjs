@@ -222,7 +222,13 @@ test('M9 随目录拷来的完成记录不作数：把新目录整个拷到别�
 test('M10 完成但没切换指针的迁移，之后接收库又有了改动：不再整体撤销重做', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const target = path.join(fixture.base, 'moved');
-  await relocate(fixture, await planWithRuntime(fixture, target)); // pointer never switched (no publish)
+  // The switch fails and its process ends before it could tell whether the pointer switched: the record stays 'complete'.
+  const plan = await planWithRuntime(fixture, target);
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await stageDataRootRelocation(plan, source); } finally { await source.close(); }
+  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }).catch(() => undefined);
+  await markStagingOwnerDead(target);
   const again = await planWithRuntime(fixture, target);
   assert.equal(again.undoesEarlierAttempt, true, '前提：没有改动时会撤销重做');
   const receiving = await selectedDataSet(target);

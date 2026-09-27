@@ -37,11 +37,12 @@ export async function relocate(fixture, plan, { publish, linkFile, relocationId 
   } finally {
     await source.close();
   }
-  const result = await relocation.completeDataRootRelocation(staged, publish ?? (async () => undefined), options);
+  // The test's publish never switches a real pointer: a failed one provably left it unchanged.
+  const result = await relocation.completeDataRootRelocation(staged, publish ?? (async () => undefined), { ...options, pointerUnchanged: async () => true });
   return { staged, result };
 }
 
-/** Plan with this "window's" Runtime open (rows are counted through its Backup API). */
+/** Plan with this "window's" Runtime open (rows, when counted, are counted on its own read connection). */
 export async function planWithRuntime(fixture, targetRootPath) {
   const source = await openRuntime(fixture.current);
   try {

@@ -33,9 +33,11 @@ function fixture({
   picked = TARGET, plan = {}, answers = [], busy = [false], exclusive = 'completed', completeError, cleanup,
   closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
-  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold
+  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold,
+  afterLocksError, statusUnreadable = false, undoUnpublishedResult = {}
 } = {}) {
   const calls = [];
+  const abandonOptions = [];
   const progressOptions = [];
   const cancellation = { listeners: [], onCancellationRequested(listener) { this.listeners.push(listener); return { dispose: () => { this.listeners = this.listeners.filter((entry) => entry !== listener); } }; } };
   const prompts = [];
@@ -91,7 +93,11 @@ function fixture({
     vscode,
     '../../backend/capabilities/vscodeStorage/globalStatus': {
       LIMCODE_GLOBAL_STATUS_FILE: '.limcode-global-status.json',
-      loadCommittedGlobalStatus: async () => status,
+      loadCommittedGlobalStatus: async () => {
+        // Readable until the relocation ran into trouble (statusUnreadable: from its failure on).
+        if (statusUnreadable && calls.some((call) => call[0] === 'complete')) throw new Error('EIO: i/o error, read');
+        return status;
+      },
       resolveDataRootUri: (_context, dataRootPath) => ({ fsPath: dataRootPath || '/vscode/global-storage' }),
       sameFsPath: (left, right) => path.resolve(left) === path.resolve(right),
       GlobalStatusPendingRelocationConflictError: class GlobalStatusPendingRelocationConflictError extends Error {},
@@ -105,6 +111,7 @@ function fixture({
         if (change.pendingRelocation === null) delete status.pendingRelocation;
         else if (change.pendingRelocation) status.pendingRelocation = change.pendingRelocation;
         if (change.lastMigration === null) delete status.lastMigration;
+        else if (change.lastMigration) status.lastMigration = change.lastMigration;
         return status;
       }
     },
@@ -145,8 +152,9 @@ function fixture({
         };
       },
       dataRootRelocationCleanupState: (error) => (error && typeof error === 'object' ? cleanupStates.get(error) : undefined),
-      abandonStagedDataRootRelocation: async (input) => {
+      abandonStagedDataRootRelocation: async (input, options) => {
         calls.push(['abandon', input === staged]);
+        abandonOptions.push(plain(options ?? {}));
         if (abandonError) throw abandonError;
       },
       dataRootRelocationOwnerState: () => ownerState,
@@ -165,7 +173,9 @@ function fixture({
       clearDataRootMovedNotice: async (root, installation) => { calls.push(['clear-moved', root, installation]); return false; },
       sweepDataRootRelocationLeftovers: async (root) => { calls.push(['sweep', root]); return { removed: [] }; },
       findDataRootRelocationCopy: async (root, relocationId) => { calls.push(['find-copy', root, relocationId]); return copyAside; },
-      readDataRootRelocationHold: async (root) => { calls.push(['read-hold', root]); return hold; }
+      readDataRootRelocationHold: async (root) => { calls.push(['read-hold', root]); return hold; },
+      isDataRootRelocationTargetInvisible: (error) => error?.code === 'data-root-relocation-target-invisible',
+      undoUnpublishedDataRootRelocation: async (root) => { calls.push(['undo-unpublished', root]); return undoUnpublishedResult; }
     },
     '../../backend/reliableKernel/runtimeExclusiveMaintenance': {
       clearExclusiveMaintenanceKey: async (_paths, operation, operationKey) => { calls.push(['clear-key', operation, operationKey]); }
@@ -202,6 +212,8 @@ function fixture({
             return { value: await operation({ reportStage: (text) => calls.push(['report-stage', text]) }) };
           } finally { await check.thaw?.(); }
         });
+        // E.g. releasing the old directory's claim fails after the operation succeeded.
+        if (afterLocksError) throw afterLocksError;
         if (result.busy) return { state: 'busy', hosts: [], reason: result.busy.reason };
         return { state: 'completed', result: result.value, coordinated: true };
       }
@@ -215,7 +227,7 @@ function fixture({
     workspaceState: { get: () => undefined, update: async () => {} }
   };
   const request = { clientId: 'client-1' };
-  return { calls, prompts, commands, context, startup, status, request, globalState, progressOptions, cancellation, kinds: () => calls.map((call) => call[0]).filter((kind) => kind !== 'progress') };
+  return { calls, abandonOptions, prompts, commands, context, startup, status, request, globalState, progressOptions, cancellation, kinds: () => calls.map((call) => call[0]).filter((kind) => kind !== 'progress') };
 }
 
 const modal = (call) => call[2]?.modal === true || call.slice(2).some((item) => item?.modal === true);
@@ -468,13 +480,34 @@ test('数据目录不可用：可以重试、回到旧目录、选择其它已�
   await noPrevious.commands.offerDataRootRecovery(noPrevious.context, noPrevious.startup, '数据目录不可用');
   assert.deepEqual(noPrevious.calls.find((call) => call[0] === 'error').slice(2), ['重试', '选择其它目录…', '使用默认目录…']);
 
-  // reloc3 #4: an error that retrying will not fix (no permission, a path that became a file) or an
-  // unfinished relocation into the directory: the other ways out are offered too.
-  for (const reason of ['inaccessible', 'relocating']) {
-    const stuck = fixture({ host: false, recoveryChoice: undefined });
-    await stuck.commands.offerDataRootRecovery(stuck.context, stuck.startup, '数据目录不可用', reason);
-    assert.deepEqual(stuck.calls.find((call) => call[0] === 'error').slice(2), ['重试', '选择其它目录…', '使用默认目录…'], reason);
+  // reloc3 #4: an error that retrying will not fix (no permission, a path that became a file): the other ways out are offered too.
+  const stuck = fixture({ host: false, recoveryChoice: undefined });
+  await stuck.commands.offerDataRootRecovery(stuck.context, stuck.startup, '数据目录不可用', 'inaccessible');
+  assert.deepEqual(stuck.calls.find((call) => call[0] === 'error').slice(2), ['重试', '选择其它目录…', '使用默认目录…']);
+  // Blind review C: temporary (a relocation into the directory runs or waits for its windows, a read
+  // that usually passes): only "重试", never a way that points elsewhere meanwhile.
+  for (const reason of ['relocating', 'unreadable']) {
+    const waiting = fixture({ host: false, recoveryChoice: '重试' });
+    await waiting.commands.offerDataRootRecovery(waiting.context, waiting.startup, '数据目录不可用', reason);
+    const offered = waiting.calls.find((call) => call[0] === 'error');
+    assert.deepEqual(offered.slice(2), ['重试'], reason);
+    assert.match(offered[1], reason === 'relocating' ? /迁移完成或撤销之后就能打开/ : /通常是暂时的/);
+    assert.deepEqual(waiting.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+    assert.ok(!waiting.kinds().includes('status'));
   }
+  // Blind review A: another installation's relocation copied its data in and never switched, its process gone: the user decides.
+  const later = fixture({ host: false, recoveryChoice: '暂不打开' });
+  await later.commands.offerDataRootRecovery(later.context, later.startup, '数据目录暂时没有打开', 'unpublished');
+  assert.deepEqual(later.calls.find((call) => call[0] === 'error').slice(2), ['撤销那次未完成的迁移并打开', '暂不打开']);
+  assert.ok(!later.kinds().includes('undo-unpublished') && !later.kinds().includes('command'), '暂不打开：什么都不动');
+  const undo = fixture({ host: false, recoveryChoice: '撤销那次未完成的迁移并打开' });
+  undo.status.dataRootPath = TARGET;
+  await undo.commands.offerDataRootRecovery(undo.context, undo.startup, '数据目录暂时没有打开', 'unpublished');
+  assert.deepEqual(undo.calls.find((call) => call[0] === 'undo-unpublished'), ['undo-unpublished', TARGET]);
+  assert.deepEqual(undo.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+  const kept = fixture({ host: false, recoveryChoice: '撤销那次未完成的迁移并打开', undoUnpublishedResult: { held: '之后有人写过。' } });
+  await kept.commands.offerDataRootRecovery(kept.context, kept.startup, '数据目录暂时没有打开', 'unpublished');
+  assert.match(kept.calls.find((call) => call[0] === 'warning')[2].detail, /之后有人写过。[\s\S]*照常打开/);
 
   // reloc3 #6: the unavailable directory's data was moved (its notice stays after the old data is deleted): "改用迁移后的目录".
   const movedAway = fixture({
@@ -623,4 +656,45 @@ test('另一个安装把这个目录的数据迁走了（reloc2 #7）：打开�
   await own.commands.afterDataRootOpened(own.context, SOURCE, own.startup);
   assert.deepEqual(own.calls.find((call) => call[0] === 'clear-moved').slice(1), [SOURCE, '/vscode/global-storage']);
   assert.ok(!own.kinds().includes('warning'), '本安装回到这里：标记直接清掉，不提示');
+});
+
+test('盲审 1 切换指针之后的失败不撤销已生效的迁移：先重读指针，指明本次迁移就按已完成处理并如实提示；读不出指针时什么都不撤销；指针没变才撤销（带着证明）', async () => {
+  const tookEffect = fixture({ answers: [{ choice: 'relocate', include: [] }], afterLocksError: new Error('EIO: i/o error, rename') });
+  await tookEffect.commands.relocateDataRoot(tookEffect.context, tookEffect.startup, tookEffect.request);
+  assert.ok(!tookEffect.kinds().includes('abandon'), '已生效的迁移不撤销');
+  const done = tookEffect.calls.find((call) => call[0] === 'error');
+  assert.equal(done[1], '数据目录迁移已完成');
+  assert.match(done[2].detail, /迁移已完成，收尾时出错：.*EIO: i\/o error, rename/);
+  assert.equal(tookEffect.status.dataRootPath, TARGET);
+  assert.equal(tookEffect.status.pendingRelocation, undefined);
+  assert.deepEqual(tookEffect.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+
+  const unknown = fixture({ answers: [{ choice: 'relocate', include: [] }], completeError: new Error('写指针失败'), cleanup: 'not-cleaned', statusUnreadable: true });
+  await unknown.commands.relocateDataRoot(unknown.context, unknown.startup, unknown.request);
+  assert.ok(!unknown.kinds().includes('abandon'), '读不出指针：无法证明没切换，不撤销');
+  const told = unknown.calls.find((call) => call[0] === 'error');
+  assert.equal(told[1], '无法确认数据目录迁移的结果');
+  assert.ok(unknown.status.pendingRelocation, '进行中记录保留，下次启动再判断');
+
+  const unchanged = fixture({ answers: [{ choice: 'relocate', include: [] }], completeError: new Error('写指针失败'), cleanup: 'not-cleaned' });
+  await unchanged.commands.relocateDataRoot(unchanged.context, unchanged.startup, unchanged.request);
+  assert.deepEqual(unchanged.abandonOptions, [{ pointerUnchanged: true }], '重读指针确认没切换，才带着证明撤销');
+  assert.match(unchanged.calls.find((call) => call[0] === 'error')[2].detail, /数据目录没有切换/);
+});
+
+test('盲审 7 启动时进行中记录的目标一直看不到：提示并给出“放弃这次迁移的记录”（二次确认），确认后清除记录；不确认就保留', async () => {
+  const pending = {
+    relocationId: 'lost', sourceRootPath: SOURCE, targetRootPath: '/mnt/lost/limcode', startedAt: '2026-09-27T00:00:00.000Z', processId: 1,
+    targetAnchor: { parent: '1:1' }
+  };
+  const forget = fixture({ pendingRelocation: pending, recoverOutcome: 'unreachable', nativeAnswers: ['放弃这次迁移的记录…', '放弃这次迁移的记录'] });
+  await forget.commands.beforeDataRootOpen(forget.context);
+  assert.deepEqual(forget.calls.find((call) => call[0] === 'recover')[1].anchor, { parent: '1:1' }, '续撤带着目标锚点');
+  const warning = forget.calls.find((call) => call[0] === 'warning');
+  assert.match(warning[1], /现在看不到/);
+  assert.equal(warning[2], '放弃这次迁移的记录…', '原生提示里只多一个选项');
+  assert.equal(forget.status.pendingRelocation, undefined, '确认后清除进行中记录');
+  const keep = fixture({ pendingRelocation: pending, recoverOutcome: 'unreachable', nativeAnswers: [undefined] });
+  await keep.commands.beforeDataRootOpen(keep.context);
+  assert.ok(keep.status.pendingRelocation, '不确认就保留，下次再试');
 });

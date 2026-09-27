@@ -4,13 +4,15 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { Worker } from 'node:worker_threads';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathBelow, isPathInside, isSamePath } from '../capabilities/filesystem/pathContainment';
 import {
   DATA_ROOT_BACKUPS_DIR, DATA_ROOT_RESET_PENDING_FILE, INDEX_FILE, RECORDS_DIR,
   REGISTERED_STORAGE_ROOT_DIRS, REGISTERED_STORAGE_ROOT_FILES
 } from '../capabilities/vscodeStorage/constants';
-import { ROOT_BINDING_POINTER_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import { createRuntimeRootPaths, ROOT_BINDING_POINTER_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
 import type { HistoricalRootBinding } from './rootAuthority';
 import { classifyRecordedProcess, ownProcessStartIdentity } from './runtimeClaimPrimitives';
 import { initializeEmptyRuntimeRoot, RuntimeDatabase } from './runtimeDatabase';
@@ -29,7 +31,10 @@ import {
   type RuntimeDataSetFingerprint
 } from './runtimeDataSetMergeLedger';
 import { RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY } from './runtimeEpochMigration';
-import { withRuntimeDataRootAdmission, withRuntimeMaintenance } from './runtimeHostControl';
+import {
+  assertRuntimeHostsOffline, isRuntimeHostsActiveError, listActiveRuntimeHosts, withRuntimeDataRootAdmission, withRuntimeMaintenance
+} from './runtimeHostControl';
+import type { RelocationDigestWorkerResponse } from './runtimeDataRootRelocationWorker';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
 import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import {
@@ -112,6 +117,8 @@ const LIMCODE_TOP_LEVEL_NAMES: ReadonlySet<string> = new Set([
 const CLOUD_SYNC_SEGMENT = /^(onedrive.*|dropbox|icloud ?drive|iclouddrive|mobile documents|cloudstorage|google ?drive|googledrive|my drive|box|box sync|pcloud ?drive|nutstore|坚果云|百度网盘|baidunetdisk|baidusyncdisk|seafile|nextcloud|owncloud|synologydrive|mega|yandex\.disk)$/i;
 /** Free space kept beyond the estimate on every disk involved. */
 const FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024;
+/** Debug captures of a data set, below its Runtime data root (see debugCapture/files). */
+const DEBUG_CAPTURES_PATH: readonly string[] = ['diagnostics', 'debug-captures'];
 /** Allocation units a copy of the CAS objects is measured at (FAT/exFAT use up to 1 MiB clusters). */
 const CLUSTER_SIZES: readonly number[] = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
 /** Linux statfs types of filesystems without hard links (msdos/vfat, exFAT): CAS objects are copied. */
@@ -137,9 +144,11 @@ export class DataRootRelocationError extends Error {
  * 'unreadable': a read failed with an error that usually passes (a network drive that hiccups), so
  * only retrying makes sense; 'inaccessible': any other read error (no permission, a path that became
  * a file), which retrying will not fix; 'relocating': a relocation into it has not finished and its
- * process is alive or cannot be judged.
+ * process is alive or cannot be judged (or its undo cannot run right now); 'unpublished': a
+ * relocation of another installation copied its data in but never switched to it, and its process
+ * is gone (the user decides: undo it, or do not open the directory now).
  */
-export type DataRootUnavailableReason = 'missing' | 'not-directory' | 'empty' | 'mismatch' | 'unreadable' | 'inaccessible' | 'relocating';
+export type DataRootUnavailableReason = 'missing' | 'not-directory' | 'empty' | 'mismatch' | 'unreadable' | 'inaccessible' | 'relocating' | 'unpublished';
 
 /** Read errors that usually pass by themselves (see DataRootUnavailableReason 'unreadable'). */
 const TRANSIENT_READ_ERRORS: ReadonlySet<string> = new Set([
@@ -151,7 +160,8 @@ export class DataRootUnavailableError extends Error {
   public readonly code = 'data-root-unavailable';
 
   public constructor(public readonly dataRootPath: string, public readonly reason: DataRootUnavailableReason, cause?: unknown) {
-    super(dataRootUnavailableMessage(dataRootPath, reason));
+    // A relocation's own explanation (e.g. why an unfinished one could not be undone yet) is part of it.
+    super(dataRootUnavailableMessage(dataRootPath, reason, cause instanceof DataRootRelocationError ? cause.message : undefined));
     this.name = 'DataRootUnavailableError';
     if (cause !== undefined) (this as Error & { cause?: unknown }).cause = cause;
   }
@@ -200,7 +210,8 @@ export interface DataRootRelocationPlan {
   sourceRootPath: string;
   targetRootPath: string;
   target: DataRootRelocationTarget;
-  current: DataRootRelocationDataSet & { rows: number };
+  /** `rows`: counted only when merging into an existing data set (its one-transaction bound). */
+  current: DataRootRelocationDataSet & { rows?: number };
   /** Other data sets of the old directory; `leaveBehind` names why one stays there. */
   others: Array<DataRootRelocationDataSet & { leaveBehind?: string }>;
   /** Data sets of the old directory that cannot even be inspected; they stay there. */
@@ -233,6 +244,20 @@ export interface StagedDataRootRelocation {
   precopied: RuntimeDataSetCasPrecopy;
   /** Other data sets already copied whole into fresh roots of the target while every window kept working. */
   precopiedOthers: Record<string, PrecopiedDataSet>;
+  /** Where the relocation found the target before it first changed it (see DataRootRelocationTargetAnchor). */
+  anchor: DataRootRelocationTargetAnchor;
+}
+
+/**
+ * The directories the relocation found before it first changed the target, as `<device>:<inode>`:
+ * the target's parent and, when the target existed and stays in place, the target itself. The
+ * pointer's in-progress record carries it: a later attempt that finds no record in the target tells
+ * "undone, or never written" (the same directories) from "not visible right now" (e.g. the drive of
+ * a mount point is not connected, a drive letter changed).
+ */
+export interface DataRootRelocationTargetAnchor {
+  parent: string;
+  target?: string;
 }
 
 /** Another data set copied whole into a fresh root of the target during stage. */
@@ -262,6 +287,19 @@ export interface DataRootRelocationOptions extends Pick<RuntimeDataSetMergeOptio
   signal?: AbortSignal;
   /** The installation that moves the data, named in the old directory's moved notice (none: no notice). */
   movedBy?: DataRootMovedNotice['installation'];
+  /**
+   * The installation that starts the relocation (its own storage directory), recorded in the
+   * target's record: only it confirms, finalizes or redoes that relocation there.
+   */
+  installation?: string;
+  /** Unfinished work carried to the new directory, listed in the moved notice (see DataRootMovedNotice.carriedWork). */
+  carriedWork?: DataRootCarriedWork['items'];
+  /**
+   * After `publish` failed: whether the data-root pointer provably did not switch to this
+   * relocation (the caller reads it again). Only then is the relocation undone right there, both
+   * admissions still held; otherwise it stays as it is for the caller (see completeDataRootRelocation).
+   */
+  pointerUnchanged?(): Promise<boolean>;
 }
 
 /** See DATA_ROOT_MOVED_NOTICE_FILE. */
@@ -271,6 +309,19 @@ export interface DataRootMovedNotice {
   movedAt: string;
   /** `id`: the installation's own storage directory (where its data-root pointer lives); `label` for people. */
   installation: { id: string; label: string };
+  /**
+   * Unfinished work the relocation carried to the new directory unchanged. In the old directory it
+   * must not simply resume (it would run twice): whoever keeps using the old directory settles it
+   * first (closed as aborted), with the user's consent; `settlement` says whether that happened.
+   */
+  carriedWork?: DataRootCarriedWork;
+}
+
+/** See DataRootMovedNotice.carriedWork. */
+export interface DataRootCarriedWork {
+  /** Each carried item: its conversation, the Turn when there is one, and a line for people. */
+  items: Array<{ conversationId: string; turnId?: string; label: string }>;
+  settlement: { state: 'pending' } | { state: 'settled'; at: string; by: string };
 }
 
 /** What the pointer switch records: the identity of the new data directory. */
@@ -307,18 +358,24 @@ interface CopiedConfiguration {
 interface RelocationMarker {
   kind: typeof MARKER_KIND;
   /**
-   * 'undoing' is written before an undo touches anything: from then on every later attempt (after a
-   * crash or a failed step) continues the undo, whatever the journal says. 'held': an undo found the
-   * receiving data set changed since the relocation (someone else wrote there) and stopped without
-   * touching anything; it is never undone automatically again (see `held`).
+   * 'staging' → 'complete' (everything copied, pointer not switched yet) → 'published' (the
+   * initiating installation switched its pointer; written by it right after) → 'finalized' (it
+   * opened the new directory and removed the journal and the undo copies). Only a staging or
+   * complete record is ever undone; a complete one only when the pointer provably did not switch.
+   * 'undoing' is written before the undo of a complete record touches anything, so every later
+   * attempt continues it (a staging record needs no mark: it is undone anyway). 'held': an undo
+   * found the receiving data set changed since the relocation (someone else wrote there) and
+   * stopped without touching anything; it is never undone automatically again (see `held`).
    */
-  state: 'staging' | 'complete' | 'undoing' | 'held';
+  state: 'staging' | 'complete' | 'published' | 'finalized' | 'undoing' | 'held';
   relocationId: string;
   sourceRootPath: string;
   /** The directory this record describes; a record copied along with a directory describes another one and is ignored. */
   targetRootPath: string;
   startedAt: string;
   owner: RelocationOwner;
+  /** The initiating installation (see DataRootRelocationOptions.installation). */
+  installation?: string;
   /** Top-level entries of the target before the relocation touched it (never removed by an undo). */
   preexisting: string[];
   createdDirectory: boolean;
@@ -339,6 +396,8 @@ interface RelocationMarker {
   invalidatedAt?: string;
   /** Why the undo was held (state 'held'); the relocation's backups stay in its work directory. */
   held?: { at: string; reason: string };
+  publishedAt?: string;
+  finalizedAt?: string;
 }
 
 type JournalEntry =
@@ -346,14 +405,25 @@ type JournalEntry =
   | { op: 'entry'; path: string }
   /** An existing file or link; its previous version is at `backup` (relative to the work directory). */
   | { op: 'replace'; path: string; backup: string }
-  /** The existing receiving database; its offline copy is at `backup`, taken while its content was `before`. */
-  | { op: 'database'; path: string; backup: string; before: RuntimeDataSetFingerprint }
+  /**
+   * The existing receiving database; its offline copy is at `backup`, taken while its content was
+   * `before`; `stamp`: the copy's files (see fileStamp), to tell a restore interrupted halfway from
+   * one someone wrote into since.
+   */
+  | { op: 'database'; path: string; backup: string; before: RuntimeDataSetFingerprint; stamp: { database: string; wal?: string } }
   /**
    * The receiving data set right after the relocation wrote it (nothing to undo by itself): an undo
    * goes ahead only while the data set is still exactly this, or still `before`, so it never
    * overwrites or removes what anyone wrote there since.
    */
   | { op: 'received'; path: string; fingerprint: RuntimeDataSetFingerprint }
+  /**
+   * Written right before the merge into an existing receiving data set commits: the rows its one
+   * transaction inserts. An undo that finds the data set neither `before` nor `received` (e.g. killed
+   * between the commit and the 'received' entry) still goes ahead when removing exactly these rows
+   * gives back `before`: nobody else wrote there.
+   */
+  | { op: 'merging'; path: string; inserted: Array<[domain: string, id: string]> }
   /** An existing directory: an undo removes every entry of it that is not in `keep`. */
   | { op: 'children'; path: string; keep: string[] };
 
@@ -453,7 +523,12 @@ async function hasLimCodeStructure(root: string): Promise<boolean> {
   // A RootBinding pointer is only written by initializing a Runtime root, never by a stray mkdir -p.
   if (await isFile(path.join(root, VSCODE_RUNTIME_CONTROL_DIRECTORY, ROOT_BINDING_POINTER_FILE))) return true;
   const scopes = path.join(root, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, 'scopes');
-  for (const key of await fs.readdir(scopes).catch(() => [] as string[])) {
+  // Only a missing scopes directory is empty; a read that fails otherwise throws (see readFailureReason).
+  const keys = await fs.readdir(scopes).catch((error: unknown) => {
+    if (isMissing(error)) return [] as string[];
+    throw error;
+  });
+  for (const key of keys) {
     if (await isFile(path.join(scopes, key, VSCODE_RUNTIME_CONTROL_DIRECTORY, ROOT_BINDING_POINTER_FILE))) return true;
   }
   return false;
@@ -463,7 +538,10 @@ async function hasLimCodeStructure(root: string): Promise<boolean> {
 export async function inspectDataRootForReturn(dataRootPath: string): Promise<{ usable: boolean; message?: string }> {
   try {
     await assertDataRootAvailable(dataRootPath);
-    if (await unfinishedRelocationOwner(dataRootPath) === 'running') return { usable: false, message: dataRootUnavailableMessage(path.resolve(dataRootPath), 'relocating') };
+    const unfinished = await unfinishedRelocationOwner(dataRootPath);
+    if (unfinished === 'running' || unfinished === 'unpublished') {
+      return { usable: false, message: dataRootUnavailableMessage(path.resolve(dataRootPath), unfinished === 'running' ? 'relocating' : 'unpublished') };
+    }
     const inspection = await inspectVscodeRuntimeDataSets({ globalStoragePath: dataRootPath });
     if (inspection.problems.some((problem) => problem.message.includes('RootBinding 不一致'))) {
       return { usable: false, message: '这个目录里的 LimCode 数据是从别的位置拷贝过来的，不能直接打开。' };
@@ -488,6 +566,8 @@ export async function planDataRootRelocation(input: {
   sourceRootPath: string;
   targetRootPath: string;
   sourceDatabase?: RuntimeDatabase;
+  /** The installation that plans it (see DataRootRelocationOptions.installation). */
+  installation?: string;
 }): Promise<DataRootRelocationPlan> {
   const sourceRootPath = path.resolve(input.sourceRootPath);
   const targetRootPath = path.resolve(input.targetRootPath);
@@ -504,8 +584,7 @@ export async function planDataRootRelocation(input: {
   const currentCandidate = requireCurrentCandidate(inspection.candidates);
   const currentBinding = await requireCompleteRuntimeDataSet(currentCandidate);
   const currentSize = await measureDataSet(currentBinding);
-  const currentRows = await countRows(currentCandidate, currentBinding, input.sourceDatabase);
-  const current = { ...identityOf(currentCandidate), ...currentSize, rows: currentRows };
+  const current: DataRootRelocationPlan['current'] = { ...identityOf(currentCandidate), ...currentSize };
   const others: DataRootRelocationPlan['others'] = [];
   for (const candidate of inspection.candidates) {
     if (candidate.selected || !candidate.dataSetId || !candidate.rootInstanceId) continue;
@@ -516,9 +595,12 @@ export async function planDataRootRelocation(input: {
       continue;
     }
     const size = await measureDataSet(binding);
-    const rows = await countRows(candidate, binding).catch(() => undefined);
-    const leaveBehind = rows === undefined ? '无法读取这个历史库（可能需要先在旧目录里打开一次完成升级）' : undefined;
-    others.push({ ...identityOf(candidate), ...size, ...(rows !== undefined ? { rows } : {}), ...(leaveBehind ? { leaveBehind } : {}) });
+    // Nothing is copied or opened for the others: an older format stays (it is upgraded where it is),
+    // and one a window has open (another installation, an old version) stays too.
+    const leaveBehind = candidate.requiresRecovery || candidate.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH
+      ? '这个历史库需要先在旧目录里打开一次（完成升级或恢复）'
+      : (await listActiveRuntimeHosts(createRuntimeRootPaths(candidate.runtimeDataRootPath)).catch(() => [])).length > 0 ? DATA_SET_IN_USE_REASON : undefined;
+    others.push({ ...identityOf(candidate), ...size, ...(leaveBehind ? { leaveBehind } : {}) });
   }
   const unreadable = inspection.problems.map((problem) => ({ id: problem.id, reason: `无法读取：${problem.message}` }));
   for (const problem of inspection.problems) {
@@ -528,8 +610,9 @@ export async function planDataRootRelocation(input: {
   let configurationBytes = 0;
   let configurationAllocated = 0;
   for (const name of CONFIGURATION_ENTRIES) {
+    // The same test as the copy (transferConfiguration): a file, a directory or a link (copied as a link).
+    if (!isConfigurationEntry(await lstatOrUndefined(path.join(sourceRootPath, name)))) continue;
     const measured = await measureTree(path.join(sourceRootPath, name));
-    if (measured.files === 0 && !await pathExists(path.join(sourceRootPath, name))) continue;
     configurationEntries.push(name);
     configurationBytes += measured.bytes;
     configurationAllocated += measured.allocated;
@@ -538,7 +621,7 @@ export async function planDataRootRelocation(input: {
   // A target that is the old directory itself (or inside or above it) is not inspected at all.
   const classified = placement.length > 0
     ? { target: { kind: 'invalid' as const, message: placement[0] }, undoes: false }
-    : await classifyTarget(targetRootPath, sourceRootPath, currentCandidate.dataSetId);
+    : await classifyTarget(targetRootPath, sourceRootPath, currentCandidate.dataSetId, input.installation);
   const target: DataRootRelocationTarget = classified.target;
   if (target.kind === 'invalid' && placement.length === 0) problems.push(target.message);
   if (target.kind === 'copied') {
@@ -548,11 +631,6 @@ export async function planDataRootRelocation(input: {
   }
   if (target.kind === 'occupied') {
     problems.push(`所选文件夹里已有其它文件（${target.entries.length} 项），LimCode 只能放在其中新建的子文件夹里：${target.suggestedPath}`);
-  }
-  if (target.kind === 'limcode' && currentRows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS) {
-    // Into an existing data set the move is one merge transaction whose memory grows with the rows
-    // (a fresh root is written in batches instead); refused here, before any window is involved.
-    problems.push(`新数据目录里已有 LimCode 数据，当前历史库要一次合并进去；它的数据较多（约 ${currentRows} 行记录，合并一次最多 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 行），当前版本暂不能迁移到这个目录；旧目录不受影响，可以继续使用。可以改选一个空文件夹。`);
   }
   if (target.kind === 'limcode') {
     warnings.push('新数据目录里已有 LimCode 数据：当前历史会合并进去（同一条记录内容不同时整体取消，两边都不改）；设置按记录合并，同一项以当前在用的为准，被替换的旧版本放进新目录的备份文件夹。');
@@ -575,9 +653,26 @@ export async function planDataRootRelocation(input: {
   const spaceEstimate = await estimateSpace({
     sourceRootPath, targetRootPath, currentBinding, current, others, configurationAllocated, target
   });
+  let spaceShort = false;
   for (const space of spaceEstimate.space) {
     if (space.freeBytes !== undefined && space.freeBytes < space.requiredBytes) {
+      spaceShort = true;
       problems.push(`${space.label}所在磁盘剩余 ${formatBytes(space.freeBytes)}，迁移过程中大约需要 ${formatBytes(space.requiredBytes)}（${space.path}）。`);
+    }
+  }
+  if (target.kind === 'limcode' && !spaceShort) {
+    // Into an existing data set the move is one merge transaction whose memory grows with the rows
+    // (a fresh root is written in batches instead); refused here, before any window is involved.
+    // Counted only here, after the space check, and without copying the database.
+    try {
+      current.rows = await countRows(currentCandidate, currentBinding, input.sourceDatabase);
+    } catch (error) {
+      problems.push(isDiskFull(error)
+        ? `统计当前历史库的记录数时磁盘空间不足（${errorMessage(error)}），请先腾出空间再迁移。`
+        : `无法统计当前历史库的记录数：${errorMessage(error)}`);
+    }
+    if (current.rows !== undefined && current.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS) {
+      problems.push(`新数据目录里已有 LimCode 数据，当前历史库要一次合并进去；它的数据较多（约 ${current.rows} 行记录，合并一次最多 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 行），当前版本暂不能迁移到这个目录；旧目录不受影响，可以继续使用。可以改选一个空文件夹。`);
     }
   }
   return {
@@ -631,21 +726,13 @@ async function measureDataSet(binding: HistoricalRootBinding): Promise<Pick<Data
 }
 
 /**
- * Rows over every Runtime domain, counted in a worker on a private copy: the open database of this
- * window through its Backup API (a staging file in its control root, named with this process id),
- * any other one through a copy of its files.
+ * Rows over every Runtime domain: the open database of this window counts them on its own reader
+ * connection (nothing is copied); a database no window of this process has open is counted in a
+ * worker on a private copy in the system temporary directory.
  */
 async function countRows(candidate: VscodeRuntimeDataSetCandidate, binding: HistoricalRootBinding, sourceDatabase?: RuntimeDatabase): Promise<number> {
+  if (sourceDatabase) return sourceDatabase.countDomainRows();
   const request = { binding: binding as unknown as RootBinding, measure: true, integrity: false } as const;
-  if (sourceDatabase) {
-    const staged = path.join(path.dirname(path.resolve(binding.paths.dataRootPath)), `relocation-count-${process.pid}-${randomUUID()}.sqlite`);
-    try {
-      await sourceDatabase.backupTo(staged);
-      return (await auditRuntimeSnapshot(staged, request)).size!.rows;
-    } finally {
-      await removeSqliteFiles(staged);
-    }
-  }
   const copy = await copyRuntimeDataSetDatabase(candidate, binding);
   try {
     return (await auditRuntimeSnapshot(copy.databasePath, request)).size!.rows;
@@ -736,7 +823,8 @@ async function databaseBytesOf(runtimeDataRootPath: string): Promise<number> {
 async function classifyTarget(
   targetRootPath: string,
   sourceRootPath: string,
-  currentDataSetId: string | undefined
+  currentDataSetId: string | undefined,
+  installation?: string
 ): Promise<{ target: DataRootRelocationTarget; undoes: boolean }> {
   let info;
   try {
@@ -747,8 +835,16 @@ async function classifyTarget(
   }
   if (info.isSymbolicLink()) return { target: { kind: 'invalid', message: '新数据目录不能是符号链接，请直接选择它指向的目录。' }, undoes: false };
   if (!info.isDirectory()) return { target: { kind: 'invalid', message: '新数据目录的位置上已经有一个文件。' }, undoes: false };
-  const marker = await readMarker(targetRootPath);
-  const leftover = marker ? await unfinishedRelocation(targetRootPath, marker, sourceRootPath) : 'none';
+  let marker: RelocationMarker | undefined;
+  try { marker = await readMarker(targetRootPath); }
+  catch (error) { return { target: { kind: 'invalid', message: `无法读取新数据目录里的迁移记录：${errorMessage(error)}` }, undoes: false }; }
+  const leftover = marker ? await unfinishedRelocation(targetRootPath, marker, sourceRootPath, installation) : 'none';
+  if (leftover === 'foreign') {
+    return {
+      target: { kind: 'invalid', message: '新数据目录里有另一个 LimCode 安装没有生效的迁移（数据已复制进来，但那个安装没有切换过去，它的进程也已结束）。请先在那个安装里打开一次 LimCode 让它撤销，或在这里打开这个目录时选择撤销。' },
+      undoes: false
+    };
+  }
   if (leftover === 'running') {
     return { target: { kind: 'invalid', message: '另一个 LimCode 窗口正在向这个目录迁移数据（或无法确认上次迁移的进程已经结束），请稍后再试。' }, undoes: false };
   }
@@ -797,21 +893,28 @@ async function classifyTarget(
 }
 
 /**
- * An earlier relocation in the target that must be undone before this one: a staging record whose
- * owner is gone, or a completion from this same directory whose pointer switch never happened (its
- * journal is still there) and whose receiving data set is unchanged since.
+ * An earlier relocation in the target that must be undone before this one: a staging (or undoing)
+ * record whose owner is gone, or a completion of this installation from this same directory whose
+ * pointer switch never happened (not confirmed 'published', its journal still there) and whose
+ * receiving data set is unchanged since. 'running': its owner lives (or cannot be judged) and it is
+ * not confirmed yet. 'foreign': another installation's completion that was never confirmed, owner
+ * gone: that installation (or the user, when opening the directory) decides about it.
  */
 async function unfinishedRelocation(
   target: string,
   marker: RelocationMarker,
-  sourceRootPath: string
-): Promise<'none' | 'running' | 'undo'> {
+  sourceRootPath: string,
+  installation?: string
+): Promise<'none' | 'running' | 'undo' | 'foreign'> {
   // Someone else wrote into the target since: never undone automatically (see undoRelocation).
-  if (marker.state === 'held') return 'none';
-  if (marker.state === 'staging') return ownerState(marker.owner) === 'dead' ? 'undo' : 'running';
-  // An undo that was interrupted is always finished, whoever interrupted it and whatever changed.
-  if (marker.state === 'undoing') return ownerState(marker.owner) === 'dead' ? 'undo' : 'running';
-  if (marker.invalidatedAt || !isSamePath(path.resolve(marker.sourceRootPath), sourceRootPath)) return 'none';
+  if (marker.state === 'held' || marker.state === 'published' || marker.state === 'finalized') return 'none';
+  // An undo that was interrupted is always finished, whoever interrupted it (still behind the receiving check).
+  if (marker.state === 'staging' || marker.state === 'undoing') return ownerState(marker.owner) === 'dead' ? 'undo' : 'running';
+  // Complete, not confirmed: its owner may still switch the pointer.
+  if (ownerState(marker.owner) !== 'dead') return 'running';
+  if (marker.invalidatedAt) return 'none';
+  if (marker.installation !== installation) return 'foreign';
+  if (!isSamePath(path.resolve(marker.sourceRootPath), sourceRootPath)) return 'none';
   if (!await pathExists(journalPath(target, marker.relocationId)) || !marker.receivingFingerprint) return 'none';
   try {
     const receiving = await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, marker.receivingId);
@@ -882,24 +985,32 @@ export async function stageDataRootRelocation(
   options: DataRootRelocationOptions & {
     /** The id the caller recorded as in progress (the data-root pointer's record), so a crash can be undone. */
     relocationId?: string;
+    /**
+     * Called once right before the first change to the target, with where it was found: the caller
+     * records it with its in-progress record (see DataRootRelocationTargetAnchor). A failure stops
+     * the relocation before anything in the target changed.
+     */
+    beforeTargetChange?(anchor: DataRootRelocationTargetAnchor): Promise<void>;
   } = {}
 ): Promise<StagedDataRootRelocation> {
   const target = planned.targetRootPath;
   const relocationId = options.relocationId ?? randomUUID();
   const startedAt = new Date().toISOString();
-  const { plan, receiving } = await withRuntimeDataRootAdmission(target, async () => {
-    const plan = await revalidatePlan(planned);
+  const { plan, receiving, anchor } = await withRuntimeDataRootAdmission(target, async () => {
+    const plan = await revalidatePlan(planned, options.installation);
     const earlier = await readMarker(target);
-    if (earlier && await unfinishedRelocation(target, earlier, plan.sourceRootPath) === 'undo') {
+    if (earlier && await unfinishedRelocation(target, earlier, plan.sourceRootPath, options.installation) === 'undo') {
       const blocked = await targetOfflineProblem(target);
       if (blocked) throw new DataRootRelocationError('data-root-relocation-target-busy', blocked);
       options.onProgress?.('正在撤销上次没有完成的迁移');
       await undoRelocation(target, earlier);
     }
     const previous = plan.target.kind === 'copied' ? undefined : await readMarker(target);
-    if (previous && previous.state !== 'complete' && previous.state !== 'held') {
+    if (previous && !isCompleted(previous) && previous.state !== 'held') {
       throw new DataRootRelocationError('data-root-relocation-concurrent', '另一个 LimCode 窗口正在向这个目录迁移数据，请稍后再试。');
     }
+    const anchor = await targetAnchor(target, plan.target.kind !== 'copied' && await pathExists(target));
+    await options.beforeTargetChange?.(anchor);
     let movedAside: string | undefined;
     if (plan.target.kind === 'copied') {
       // A window may still be using the copy (e.g. of another installation): never pull it away.
@@ -921,6 +1032,7 @@ export async function stageDataRootRelocation(
         : plan.target.kind === 'copied' ? { kind: 'copied', sameDataSet: plan.target.sameDataSet } : { kind: 'empty' };
       marker = {
         kind: MARKER_KIND, state: 'staging', relocationId, sourceRootPath: plan.sourceRootPath, targetRootPath: target, startedAt, owner: currentOwner(),
+        ...(options.installation ? { installation: options.installation } : {}),
         preexisting, createdDirectory, targetState,
         receivingId: plan.target.kind === 'limcode' ? plan.target.receivingId : plan.current.id,
         ...(previous ? { previous: withoutPrevious(previous) } : {}),
@@ -928,7 +1040,7 @@ export async function stageDataRootRelocation(
       };
       await writeMarker(target, marker);
       const journal = await RelocationJournal.create(target, relocationId);
-      return { plan, receiving: await prepareReceivingRoot(plan, journal) };
+      return { plan, receiving: await prepareReceivingRoot(plan, journal), anchor };
     } catch (error) {
       const staging = marker;
       const undo = staging ? () => undoRelocation(target, staging)
@@ -952,9 +1064,9 @@ export async function stageDataRootRelocation(
       ...(sourceDatabase ? { sourceDatabase } : {}),
       ...(options.signal ? { signal: options.signal } : {})
     });
-    return { plan, relocationId, startedAt, receiving, precopied, precopiedOthers };
+    return { plan, relocationId, startedAt, receiving, precopied, precopiedOthers, anchor };
   } catch (error) {
-    recordCleanup(error, await abandonStagedDataRootRelocation({ plan, relocationId }).then(() => true, (undoError: unknown) => {
+    recordCleanup(error, await abandonStagedDataRootRelocation({ plan, relocationId, anchor }).then(() => true, (undoError: unknown) => {
       console.error('[LimCode] 撤销迁移准备失败。', undoError);
       return false;
     }));
@@ -963,11 +1075,11 @@ export async function stageDataRootRelocation(
 }
 
 /** The plan still holds (same current data set, same kind of target); nothing is measured again. */
-async function revalidatePlan(planned: DataRootRelocationPlan): Promise<DataRootRelocationPlan> {
+async function revalidatePlan(planned: DataRootRelocationPlan, installation?: string): Promise<DataRootRelocationPlan> {
   const problems = await placementProblems(planned.targetRootPath, planned.sourceRootPath, planned.targetRootPath);
   const inspection = await inspectVscodeRuntimeDataSets({ globalStoragePath: planned.sourceRootPath });
   const current = requireCurrentCandidate(inspection.candidates);
-  const { target } = await classifyTarget(planned.targetRootPath, planned.sourceRootPath, current.dataSetId);
+  const { target } = await classifyTarget(planned.targetRootPath, planned.sourceRootPath, current.dataSetId, installation);
   if (target.kind === 'limcode') {
     const offline = await targetOfflineProblem(planned.targetRootPath);
     if (offline) problems.push(offline);
@@ -1002,9 +1114,23 @@ async function createDataSetRoot(target: string, id: string, journal: Relocation
   return runtimeDataRootPath;
 }
 
-/** Undoes what an abandoned stage created (e.g. the windows could not be closed); only while it is still ours. */
-export async function abandonStagedDataRootRelocation(staged: { plan: { targetRootPath: string }; relocationId: string }): Promise<void> {
+/**
+ * Undoes what an abandoned relocation did in the target (e.g. the windows could not be closed);
+ * only while its record is still ours. A staging (or interrupted undoing) record is undone; a
+ * complete one only with `pointerUnchanged`: the caller read the data-root pointer after the
+ * failure and it did not switch to this relocation (otherwise the relocation may have taken effect
+ * and is never undone). A published or finalized one never. `anchor`: where the relocation found
+ * the target (see DataRootRelocationTargetAnchor); a target that is not visible right now is never
+ * taken for undone.
+ */
+export async function abandonStagedDataRootRelocation(
+  staged: { plan: { targetRootPath: string }; relocationId: string; anchor?: DataRootRelocationTargetAnchor },
+  options: { pointerUnchanged?: boolean } = {}
+): Promise<void> {
   const target = path.resolve(staged.plan.targetRootPath);
+  // Read first without a claim: no claim file is ever left beside a target that is not there.
+  const found = await readMarker(target);
+  if (!found || found.relocationId !== staged.relocationId) await assertTargetVisible(target, staged.anchor);
   await withRuntimeDataRootAdmission(target, async () => {
     const marker = await readMarker(target);
     if (!marker || marker.relocationId !== staged.relocationId) {
@@ -1014,7 +1140,14 @@ export async function abandonStagedDataRootRelocation(staged: { plan: { targetRo
       if (aside) await restoreMovedAside(target, aside);
       return;
     }
-    if (marker.targetState.kind === 'limcode' && await hasDatabaseRestore(target, marker)) {
+    if (marker.state === 'published' || marker.state === 'finalized') {
+      throw new DataRootRelocationError('data-root-relocation-published', '这次迁移已经生效（数据目录已切换到新目录），不会撤销。');
+    }
+    if (marker.state === 'complete' && !options.pointerUnchanged) {
+      throw new DataRootRelocationError('data-root-relocation-unconfirmed',
+        '新数据目录里已有这次迁移的完成记录，无法确认数据目录没有切换过去，所以没有撤销；下次启动时会再判断。');
+    }
+    if (await hasDatabaseRestore(target, marker)) {
       const blocked = await targetOfflineProblem(target);
       if (blocked) throw new DataRootRelocationError('data-root-relocation-target-busy', blocked);
     }
@@ -1027,10 +1160,16 @@ export async function abandonStagedDataRootRelocation(staged: { plan: { targetRo
 
 /**
  * Exclusive phase. Call while holding the old directory's configuration admission after every
- * Host of it went offline (this window's own Runtime included). `publish` switches the data-root
- * pointer; it runs last, after the completion record. Any failure before it returns undoes the
- * relocation in the target from its journal; `dataRootRelocationCleanupState(error)` tells whether
- * that undo succeeded.
+ * Host of its current data set went offline (this window's own Runtime included). `publish`
+ * switches the data-root pointer; it runs last, after the completion record. A failure before it
+ * undoes the relocation in the target from its journal right there (both admissions still held,
+ * and only while no Host has the target open); `dataRootRelocationCleanupState(error)` tells
+ * whether that undo succeeded. A failure of `publish` itself is undone only when
+ * `options.pointerUnchanged` proves the pointer did not switch (it may have switched before the
+ * failure); otherwise nothing is undone ('not-cleaned') and the caller reads the pointer again and
+ * either treats the relocation as done or abandons it with that proof (abandonStagedDataRootRelocation). Once
+ * `publish` returned, the record is confirmed 'published' (best effort: the initiating installation
+ * confirms it when it opens the new directory otherwise).
  */
 export async function completeDataRootRelocation(
   staged: StagedDataRootRelocation,
@@ -1041,20 +1180,21 @@ export async function completeDataRootRelocation(
   const source = plan.sourceRootPath;
   const target = plan.targetRootPath;
   const sourcePaths = { globalStoragePath: source };
-  // Set once the staging record is confirmed ours: from then on a failure undoes the target's changes.
-  const owned: { marker?: RelocationMarker } = {};
-  try {
-    return await withRuntimeDataRootAdmission(source, () => withRuntimeDataRootAdmission(target, async () => {
-      const staging = await readMarker(target);
-      if (staging?.state !== 'staging' || staging.relocationId !== staged.relocationId) {
-        throw new DataRootRelocationError('data-root-relocation-lost', '新数据目录里的迁移准备记录不见了（可能已被另一个窗口清理），本次不迁移。');
-      }
-      owned.marker = staging;
-      const journal = RelocationJournal.open(target, staged.relocationId);
-      await assertConfigurationRootRuntimesOffline(source);
+  return withRuntimeDataRootAdmission(source, () => withRuntimeDataRootAdmission(target, async () => {
+    const staging = await readMarker(target);
+    if (staging?.state !== 'staging' || staging.relocationId !== staged.relocationId) {
+      throw new DataRootRelocationError('data-root-relocation-lost', '新数据目录里的迁移准备记录不见了（可能已被另一个窗口清理），本次不迁移。');
+    }
+    const journal = RelocationJournal.open(target, staged.relocationId);
+    let completed: RelocationMarker;
+    let dataRootId: string;
+    let outcome: Omit<DataRootRelocationResult, 'targetRootPath'>;
+    try {
+      const current = await resolveVscodeRuntimeDataSet(sourcePaths, plan.current.id);
+      // Only the data sets that move must be offline; another one still in use stays behind.
+      await assertRuntimeHostsOffline(createRuntimeRootPaths(current.runtimeDataRootPath));
       const busyTarget = await targetOfflineProblem(target);
       if (busyTarget) throw new DataRootRelocationError('data-root-relocation-target-busy', busyTarget);
-      const current = await resolveVscodeRuntimeDataSet(sourcePaths, plan.current.id);
       if (!current.selected || current.dataSetId !== plan.current.dataSetId || current.rootInstanceId !== plan.current.rootInstanceId) {
         throw new DataRootRelocationError('data-root-relocation-changed', '迁移期间当前历史库发生了变化，本次不迁移。');
       }
@@ -1069,11 +1209,12 @@ export async function completeDataRootRelocation(
         await journalMergeBackups(target, staged.receiving.runtimeDataRootPath, journal);
       }
       const merged = await mergeInto(sourcePaths, target, plan.current, staged.receiving.runtimeDataRootPath,
-        { ...options, signal: undefined, progressLabel: '正在迁移当前历史库' }, plan.target.kind !== 'limcode', staged.precopied.verification);
+        { ...options, signal: undefined, progressLabel: '正在迁移当前历史库' }, plan.target.kind !== 'limcode', journal, staged.precopied.verification);
       // What the relocation left in the receiving data set: an undo later goes ahead only while it is unchanged.
       options.onProgress?.('正在核对新目录');
       const receivingFingerprint = await dataSetFingerprint(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, staged.receiving.id));
       await journal.append({ op: 'received', path: path.relative(target, staged.receiving.runtimeDataRootPath), fingerprint: receivingFingerprint });
+      await copyDebugCaptures(current.runtimeDataRootPath, staged.receiving.runtimeDataRootPath, target, journal);
       const others = await migrateOthers(staged, current, journal, options);
       const leftBehind = [...others.result.leftBehind, ...plan.unreadable.filter((item) => !others.result.leftBehind.some((left) => left.id === item.id))];
       if (plan.target.kind !== 'limcode') {
@@ -1081,26 +1222,16 @@ export async function completeDataRootRelocation(
         await selectVscodeRuntimeDataSet({ globalStoragePath: target }, staged.receiving.id);
       }
       await journal.recordCreation(DATA_ROOT_IDENTITY_FILE);
-      const dataRootId = await ensureDataRootIdentity(target);
-      await writeMarker(target, {
+      dataRootId = await ensureDataRootIdentity(target);
+      completed = {
         ...staging, state: 'complete', completedAt: new Date().toISOString(),
         migrated: [{ ...identityOf(current), fingerprint: currentFingerprint }, ...others.migrated],
         configuration: configuration.copied,
         leftBehind,
         receivingFingerprint
-      });
-      await publish({ dataRootId });
-      // The pointer switched: from here on nothing is undone. Notices are best effort.
-      await fs.rm(path.join(target, DATA_ROOT_MOVED_NOTICE_FILE), { force: true })
-        .catch((error: unknown) => console.warn('[LimCode] 清除新目录里过时的“数据已迁走”标记失败。', error));
-      if (options.movedBy) {
-        await writeJsonDurably(path.join(source, DATA_ROOT_MOVED_NOTICE_FILE), {
-          kind: MOVED_NOTICE_KIND, targetRootPath: target, relocationId: staged.relocationId, movedAt: new Date().toISOString(),
-          installation: options.movedBy
-        }).catch((error: unknown) => console.warn('[LimCode] 在旧目录写“数据已迁走”标记失败。', error));
-      }
-      return {
-        targetRootPath: target,
+      };
+      await writeMarker(target, completed);
+      outcome = {
         ...(staging.movedAside ? { copiedDataMovedTo: staging.movedAside } : {}),
         merged,
         configuration: {
@@ -1109,23 +1240,93 @@ export async function completeDataRootRelocation(
         },
         others: { ...others.result, leftBehind }
       };
-    }));
-  } catch (error) {
-    // Only a staging record confirmed ours is undone here; otherwise the caller abandons the stage
-    // (which again undoes only a record that is still ours).
-    if (owned.marker) {
-      const staging = owned.marker;
+    } catch (error) {
+      // Still under both admissions since this attempt began, and the staging record kept every
+      // window from opening the target before: nobody else wrote there. A Host that has the target
+      // open anyway (an old version) keeps its database untouched.
       options.onProgress?.('正在撤销本次迁移在新目录里的改动');
-      // Nobody else wrote into the target meanwhile: it was offline under its admission until the
-      // failure, and a window that opens it now waits (or is refused) while this record is ours.
-      const cleaned = await withRuntimeDataRootAdmission(target, () => undoRelocation(target, staging, { verified: true })).then(() => true, (undoError: unknown) => {
+      recordCleanup(error, await undoAfterFailure(target, staging).then(() => true, (undoError: unknown) => {
         console.error('[LimCode] 迁移失败后撤销新数据目录里的改动时出错。', undoError);
         return false;
-      });
-      recordCleanup(error, cleaned);
+      }));
+      throw error;
     }
-    throw error;
+    try {
+      await publish({ dataRootId });
+    } catch (error) {
+      const unchanged = await (options.pointerUnchanged?.() ?? Promise.resolve(false)).catch(() => false);
+      if (unchanged) {
+        options.onProgress?.('正在撤销本次迁移在新目录里的改动');
+        recordCleanup(error, await undoAfterFailure(target, completed).then(() => true, (undoError: unknown) => {
+          console.error('[LimCode] 切换指针失败后撤销新数据目录里的改动时出错。', undoError);
+          return false;
+        }));
+      } else {
+        recordCleanup(error, false);
+      }
+      throw error;
+    }
+    // The pointer switched: from here on nothing is undone. The confirmation and the notices are best effort.
+    await writeMarker(target, { ...completed, state: 'published', publishedAt: new Date().toISOString() })
+      .catch((error: unknown) => console.warn('[LimCode] 在新目录记下迁移已生效失败，下次打开新目录时补记。', error));
+    await fs.rm(path.join(target, DATA_ROOT_MOVED_NOTICE_FILE), { force: true })
+      .catch((error: unknown) => console.warn('[LimCode] 清除新目录里过时的“数据已迁走”标记失败。', error));
+    if (options.movedBy) {
+      await writeJsonDurably(path.join(source, DATA_ROOT_MOVED_NOTICE_FILE), {
+        kind: MOVED_NOTICE_KIND, targetRootPath: target, relocationId: staged.relocationId, movedAt: new Date().toISOString(),
+        installation: options.movedBy,
+        ...(options.carriedWork?.length ? { carriedWork: { items: options.carriedWork, settlement: { state: 'pending' } } } : {})
+      }).catch((error: unknown) => console.warn('[LimCode] 在旧目录写“数据已迁走”标记失败。', error));
+    }
+    return { targetRootPath: target, ...outcome };
+  }));
+}
+
+/**
+ * The undo right after a failed completion: only while the target still shows this relocation's
+ * record (a drive that just went away shows none: nothing is taken for undone), and not while a
+ * Host has the target open and its database would be restored.
+ */
+async function undoAfterFailure(target: string, staging: RelocationMarker): Promise<void> {
+  if ((await readMarker(target))?.relocationId !== staging.relocationId) {
+    throw new DataRootRelocationError('data-root-relocation-target-invisible',
+      `新数据目录里看不到这次迁移的记录（${target}；例如所在的盘刚刚断开），没有撤销；进行中记录保留，接上后会再撤销。`);
   }
+  if (await hasDatabaseRestore(target, staging)) {
+    const blocked = await targetOfflineProblem(target);
+    if (blocked) throw new DataRootRelocationError('data-root-relocation-target-busy', blocked);
+  }
+  await undoRelocation(target, staging, { verified: true });
+}
+
+/**
+ * Debug captures of the data set (<data root>/diagnostics/debug-captures, one directory per run)
+ * move with it: a run the receiving data set does not have is copied (verified) and journaled.
+ */
+async function copyDebugCaptures(fromDataRoot: string, toDataRoot: string, target: string, journal: RelocationJournal): Promise<number> {
+  const from = path.join(fromDataRoot, ...DEBUG_CAPTURES_PATH);
+  const runs = (await fs.readdir(from, { withFileTypes: true }).catch((error: unknown) => {
+    if (isMissing(error)) return [];
+    throw error;
+  })).filter((entry) => entry.isDirectory() && !isTransientName(entry.name)).map((entry) => entry.name).sort();
+  if (runs.length === 0) return 0;
+  const to = path.join(toDataRoot, ...DEBUG_CAPTURES_PATH);
+  const created = !await pathExists(to);
+  if (created) {
+    await journal.recordCreation(path.relative(target, to));
+    await fs.mkdir(to, { recursive: true });
+  }
+  const state: TransferState = { journal, targetRoot: target, copiedFiles: 0, replacedFiles: 0, hashes: new Map() };
+  let copied = 0;
+  for (const run of runs) {
+    const destination = path.join(to, run);
+    if (await pathExists(destination)) continue;
+    if (!created) await journal.append({ op: 'entry', path: path.relative(target, destination) });
+    await copyTree(path.join(from, run), destination, state);
+    copied += 1;
+  }
+  await syncDirectoryDurably(to);
+  return copied;
 }
 
 /**
@@ -1141,6 +1342,7 @@ async function mergeInto(
   runtimeDataRootPath: string,
   options: DataRootRelocationOptions & { progressLabel?: string },
   freshRoot: boolean,
+  journal: RelocationJournal,
   casVerification?: RuntimeDataSetCasVerification
 ): Promise<RuntimeDataSetMergeResult> {
   const input = { candidateId: dataSet.id, expectedDataSetId: dataSet.dataSetId, expectedRootInstanceId: dataSet.rootInstanceId };
@@ -1152,8 +1354,12 @@ async function mergeInto(
   return withRuntimeMaintenance(authority.expectedPaths(), async () => {
     const database = await RuntimeDatabase.open(authority, { hostBootId: `data-root-relocation-${randomUUID()}` });
     try {
-      return await mergeRuntimeDataSetIntoDatabase(sourcePaths, input, { configurationRootPath: target, database },
-        { migration: true, ...(options.linkFile ? { linkFile: options.linkFile } : {}) });
+      // The rows the one transaction inserts are journaled before it commits (see JournalEntry 'merging').
+      const relative = path.relative(target, runtimeDataRootPath);
+      return await mergeRuntimeDataSetIntoDatabase(sourcePaths, input, { configurationRootPath: target, database }, {
+        migration: true, ...(options.linkFile ? { linkFile: options.linkFile } : {}),
+        beforeCommit: (inserted) => journal.append({ op: 'merging', path: relative, inserted: inserted.map(([domain, id]) => [domain, id]) })
+      });
     } finally {
       await database.close();
     }
@@ -1218,6 +1424,8 @@ async function precopyOthers(
     if (lastMerge && sameRuntimeDataSetIdentity(lastMerge.target, plan.current)) continue;
     const label = `正在预先复制其它历史库（${index + 1}/${plan.others.length}）`;
     options.onProgress?.(label);
+    // In use by a window (another installation, an old version): copied later if it is free by then.
+    if (await dataSetInUse(sourcePaths, other.id)) continue;
     const runtimeDataRootPath = resolveVscodeRuntimeDataRoot({ globalStoragePath: resolveVscodeRuntimeDataSetScopeRoot(target, other.id) });
     let created: string | undefined;
     try {
@@ -1234,7 +1442,7 @@ async function precopyOthers(
     } catch (error) {
       if (created) await removeCreatedDataSetRoot(target, runtimeDataRootPath, created);
       if (options.signal?.aborted) throw error;
-      console.warn(`[LimCode] 预先复制历史库 ${other.id} 未完成，独占阶段再迁移：${errorMessage(error)}`);
+      console.warn(`[LimCode] 预先复制历史库 ${other.id} 未完成，独占阶段再迁移：${relocationReason(error)}`);
     }
   }
   return receipts;
@@ -1309,7 +1517,10 @@ async function backupReceivingDatabase(target: string, receiving: StagedDataRoot
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
-  await journal.append({ op: 'database', path: path.relative(target, databasePath), backup: name, before });
+  const database = await fileStamp(path.join(destination, 'limcode.sqlite'));
+  const wal = await fileStamp(path.join(destination, 'limcode.sqlite-wal'));
+  if (!database) throw new DataRootRelocationError('data-root-relocation-backup', `新数据目录里当前历史库的迁移前副本没有写成：${destination}`);
+  await journal.append({ op: 'database', path: path.relative(target, databasePath), backup: name, before, stamp: { database, ...(wal ? { wal } : {}) } });
 }
 
 /**
@@ -1348,6 +1559,7 @@ async function migrateOthers(
       if (candidate.dataSetId !== other.dataSetId || candidate.rootInstanceId !== other.rootInstanceId) {
         throw new Error('确认之后这个历史库发生了变化');
       }
+      if (await dataSetInUse(sourcePaths, other.id)) throw new Error(DATA_SET_IN_USE_REASON);
       const fingerprint = await dataSetFingerprint(candidate);
       const record = ledger.get(other.id);
       const lastMerge = record ? runtimeDataSetLastMerge(record) : undefined;
@@ -1371,13 +1583,14 @@ async function migrateOthers(
         await createDataSetRoot(target, other.id, journal);
         await initializeFreshRoot(target, runtimeDataRootPath);
         await mergeInto(sourcePaths, target, other, runtimeDataRootPath,
-          { ...options, signal: undefined, progressLabel: `正在迁移其它历史库（${index + 1}/${plan.others.length}）` }, true);
+          { ...options, signal: undefined, progressLabel: `正在迁移其它历史库（${index + 1}/${plan.others.length}）` }, true, journal);
       }
+      await copyDebugCaptures(candidate.runtimeDataRootPath, runtimeDataRootPath, target, journal);
       await markVscodeRuntimeDataSetKept(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, other.id));
       migrated.push({ ...identityOf(candidate), fingerprint });
       result.migrated.push(other.id);
     } catch (error) {
-      result.leftBehind.push({ id: other.id, reason: errorMessage(error) });
+      result.leftBehind.push({ id: other.id, reason: relocationReason(error) });
       if (created) {
         await removeCreatedDataSetRoot(target, runtimeDataRootPath, created).catch((removeError: unknown) => {
           console.error(`[LimCode] 删除新目录里未迁成的历史库 ${other.id} 失败。`, removeError);
@@ -1387,6 +1600,21 @@ async function migrateOthers(
     }
   }
   return { result, migrated };
+}
+
+const DATA_SET_IN_USE_REASON = '这个历史库正被其它 LimCode 窗口使用（可能是另一个安装或旧版本），这次不迁移，留在旧目录（删除旧目录时也会保留）';
+
+/** A data set of the old directory with an online Host (any installation, any version with a liveness record). */
+async function dataSetInUse(sourcePaths: { globalStoragePath: string }, id: string): Promise<boolean> {
+  const candidate = await resolveVscodeRuntimeDataSet(sourcePaths, id);
+  return (await listActiveRuntimeHosts(createRuntimeRootPaths(candidate.runtimeDataRootPath))).length > 0;
+}
+
+/** Why another data set stays behind, in the relocation's words (the merge engine's speak of later merges). */
+function relocationReason(error: unknown): string {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  if (isRuntimeHostsActiveError(error) || code === 'runtime-hosts-active' || code === 'runtime-legacy-owner-active') return DATA_SET_IN_USE_REASON;
+  return errorMessage(error);
 }
 
 async function firstMissingAncestor(root: string, target: string): Promise<string | undefined> {
@@ -1432,12 +1660,16 @@ async function transferConfiguration(sourceRoot: string, targetRoot: string, jou
   const copied: CopiedConfiguration[] = [];
   for (const name of CONFIGURATION_ENTRIES) {
     const source = path.join(sourceRoot, name);
-    const info = await lstatOrUndefined(source);
-    if (!info || !(info.isDirectory() || info.isFile())) continue;
+    if (!isConfigurationEntry(await lstatOrUndefined(source))) continue;
     await transferEntry(source, path.join(targetRoot, name), name, state);
     copied.push({ entry: name, digest: await treeDigest(source, state.hashes) });
   }
   return { copied, copiedFiles: state.copiedFiles, replacedFiles: state.replacedFiles };
+}
+
+/** A configuration entry the relocation copies: a file, a directory, or a link (copied as the link itself). */
+function isConfigurationEntry(info: Stats | undefined): boolean {
+  return !!info && (info.isFile() || info.isDirectory() || info.isSymbolicLink());
 }
 
 interface TransferState {
@@ -1744,8 +1976,13 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
     const valid = !!entry && typeof entry.path === 'string' && (entry.op === 'entry'
       || (entry.op === 'children' && Array.isArray(keep) && keep.every((name) => typeof name === 'string'))
       || (entry.op === 'replace' && typeof entry.backup === 'string')
-      || (entry.op === 'database' && typeof entry.backup === 'string' && fingerprint(entry.before))
-      || (entry.op === 'received' && fingerprint(entry.fingerprint)));
+      || (entry.op === 'database' && typeof entry.backup === 'string' && fingerprint(entry.before)
+        && typeof (entry as { stamp?: { database?: unknown } }).stamp?.database === 'string'
+        && ['undefined', 'string'].includes(typeof (entry as { stamp: { wal?: unknown } }).stamp.wal))
+      || (entry.op === 'received' && fingerprint(entry.fingerprint))
+      || (entry.op === 'merging' && Array.isArray((entry as { inserted?: unknown }).inserted)
+        && ((entry as { inserted: unknown[] }).inserted).every((row) => Array.isArray(row) && row.length === 2
+          && typeof row[0] === 'string' && typeof row[1] === 'string')));
     if (!valid) {
       throw new DataRootRelocationError('data-root-relocation-journal', `迁移日志里有无法识别的记录：${line}`);
     }
@@ -1756,33 +1993,76 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
   return entries;
 }
 
+type ReceivingCheck = { kind: 'unchanged' } | { kind: 'changed'; reason: string } | { kind: 'unreadable'; reason: string };
+
 /**
- * Why the receiving data set may no longer be undone, if so: it is neither what the relocation left
- * there (its 'received' journal entry) nor what it was before (an existing one's 'database' entry;
- * also what a restore that already happened put back). Someone else wrote there since. An existing
- * data set that cannot be read counts as changed; a fresh root of this relocation that cannot be
- * read any more (half removed by an interrupted undo) does not.
+ * Whether the receiving data set may still be undone: it is what the relocation left there (its
+ * 'received' journal entry), or what it was before (an existing one's 'database' entry; also what a
+ * restore that already happened put back), or exactly `before` plus the rows the merge journaled
+ * before its commit ('merging': e.g. killed between the commit and the 'received' entry). Otherwise
+ * someone else wrote there since ('changed'). An existing data set that cannot be read right now is
+ * 'unreadable': nothing is decided, the next attempt reads it again. A fresh root of this relocation
+ * that cannot be read any more (half removed by an interrupted undo) counts as unchanged.
  */
-async function receivingChangedSince(target: string, marker: RelocationMarker): Promise<string | undefined> {
+async function receivingChangedSince(target: string, marker: RelocationMarker): Promise<ReceivingCheck> {
   const entries = await readJournal(target, marker.relocationId);
   const database = entries.find((entry): entry is Extract<JournalEntry, { op: 'database' }> => entry.op === 'database');
   const received = entries.find((entry): entry is Extract<JournalEntry, { op: 'received' }> => entry.op === 'received');
-  if (!database && !received) return undefined;
+  const merging = entries.find((entry): entry is Extract<JournalEntry, { op: 'merging' }> => entry.op === 'merging');
+  if (!database && !received) return { kind: 'unchanged' };
   if (database) {
-    // This undo's own restore is halfway (the database file is back, its WAL not yet): it continues.
+    // This undo's own restore is halfway (the database file is back, its WAL maybe not yet): it
+    // continues while the files there are exactly the ones it put back (a rename keeps the stamp,
+    // any write, also a checkpoint on close, changes it) and no other WAL appeared.
     const backup = path.join(workDirectory(target, marker.relocationId), database.backup);
-    if (await pathExists(backup) && !await pathExists(path.join(backup, 'limcode.sqlite'))) return undefined;
+    if (await pathExists(backup) && !await pathExists(path.join(backup, 'limcode.sqlite'))) {
+      const destination = path.join(target, database.path);
+      const walRestored = database.stamp.wal !== undefined && !await pathExists(path.join(backup, 'limcode.sqlite-wal'));
+      const wal = await lstatOrUndefined(`${destination}-wal`);
+      const walIntact = walRestored ? await fileStamp(`${destination}-wal`) === database.stamp.wal : !wal || wal.size === 0;
+      if (await fileStamp(destination) === database.stamp.database && walIntact) return { kind: 'unchanged' };
+      return { kind: 'changed', reason: '撤销还原到一半时，新数据目录里的当前历史库又被打开写入过。' };
+    }
   }
+  let candidate: VscodeRuntimeDataSetCandidate;
   let current: RuntimeDataSetFingerprint;
   try {
-    current = await dataSetFingerprint(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, marker.receivingId));
+    candidate = await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, marker.receivingId);
+    current = await dataSetFingerprint(candidate);
   } catch (error) {
-    if (!database) return undefined;
-    return `新数据目录里的当前历史库现在无法读取（${errorMessage(error)}），无法确认迁移之后没有别人写入。`;
+    if (!database) return { kind: 'unchanged' };
+    return { kind: 'unreadable', reason: errorMessage(error) };
   }
-  if (database && sameRuntimeDataSetFingerprint(database.before, current)) return undefined;
-  if (received && sameRuntimeDataSetFingerprint(received.fingerprint, current)) return undefined;
-  return '新数据目录里的当前历史库在这次迁移之后有了新的内容（可能是另一个 LimCode 安装或窗口正在使用这个目录）。';
+  if (database && sameRuntimeDataSetFingerprint(database.before, current)) return { kind: 'unchanged' };
+  if (received && sameRuntimeDataSetFingerprint(received.fingerprint, current)) return { kind: 'unchanged' };
+  if (database && merging && current.dataSetId === database.before.dataSetId && current.rootInstanceId === database.before.rootInstanceId) {
+    try {
+      if (await digestWithoutRows(candidate, merging.inserted) === database.before.contentDigest) return { kind: 'unchanged' };
+    } catch (error) {
+      return { kind: 'unreadable', reason: errorMessage(error) };
+    }
+  }
+  return { kind: 'changed', reason: '新数据目录里的当前历史库在这次迁移之后有了新的内容（可能是另一个 LimCode 安装或窗口正在使用这个目录）。' };
+}
+
+/** The content digest of a data set without the given rows, on a private copy in a worker. */
+async function digestWithoutRows(candidate: VscodeRuntimeDataSetCandidate, inserted: Array<[string, string]>): Promise<string> {
+  const copy = await copyRuntimeDataSetDatabase(candidate, await requireCompleteRuntimeDataSet(candidate));
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const worker = new Worker(path.join(__dirname, 'runtimeDataRootRelocationWorker.js'), { workerData: { databasePath: copy.databasePath, inserted } });
+      worker.once('message', (message: RelocationDigestWorkerResponse) => {
+        settled = true;
+        if (message.ok) resolve(message.digest);
+        else reject(new Error(message.message));
+      });
+      worker.once('error', (error) => { if (!settled) { settled = true; reject(error); } });
+      worker.once('exit', (code) => { if (!settled) { settled = true; reject(new Error(`核对线程异常退出（退出码 ${code}）。`)); } });
+    });
+  } finally {
+    await copy.remove();
+  }
 }
 
 function heldError(target: string, marker: RelocationMarker): DataRootRelocationError {
@@ -1798,72 +2078,113 @@ function isHeldError(error: unknown): boolean {
   return (error as { code?: unknown } | undefined)?.code === 'data-root-relocation-undo-held';
 }
 
+function isUnreadableUndo(error: unknown): boolean {
+  return (error as { code?: unknown } | undefined)?.code === 'data-root-relocation-undo-unreadable';
+}
+
 async function hasDatabaseRestore(target: string, marker: RelocationMarker): Promise<boolean> {
   return (await readJournal(target, marker.relocationId)).some((entry) => entry.op === 'database');
 }
 
 /**
  * Undoes a relocation in the target from its journal, newest change first. First the receiving data
- * set must still be exactly what the relocation left there (or what it was before): otherwise
- * someone wrote there since (another installation whose current directory it is), nothing is
- * touched and the record becomes 'held' (see receivingChangedSince). `verified`: the caller knows
- * nobody could have written (an undo right after its own failure, the target never left offline).
- * The record is marked 'undoing' (durably) before anything is touched, so an interrupted undo is
- * always continued (see unfinishedRelocation). Every step can run again: replaced files and an
- * existing receiving database are put back from the relocation's own backups, created entries
- * removed; then the journal directory goes, then the record (the earlier completion record is put
- * back, or it is removed), and last the copied data renamed aside comes back to its place. Stops at
- * the first failure. Callers hold the target's admission; a database restore needs every Host of
- * the target offline.
+ * set must still be exactly what the relocation left there, or what it was before, or that plus only
+ * its own rows (see receivingChangedSince): otherwise someone wrote there since (another installation
+ * whose current directory it is), nothing is touched and the record becomes 'held'. When it cannot
+ * be read right now, nothing is touched either and the record stays as it is, for the next attempt.
+ * `verified`: the caller knows nobody could have written (the undo right after its own failure,
+ * the target never left its admission). A complete record is marked 'undoing' (durably) before
+ * anything is touched, so an interrupted undo is always continued; a staging record needs no mark
+ * (it is undone anyway), and a disk too full for the mark does not stop the undo either: every
+ * step frees space or needs none. Every step can run again: replaced files and an existing
+ * receiving database are put back from the relocation's own backups, created entries removed; then
+ * the journal directory goes, then the record (the earlier completion record is put back, or it is
+ * removed), and last the copied data renamed aside comes back to its place. Stops at the first
+ * failure (a full disk says what can be deleted by hand). Callers hold the target's admission; a
+ * database restore needs every Host of the target offline.
  */
 async function undoRelocation(target: string, found: RelocationMarker, options: { verified?: boolean } = {}): Promise<void> {
   if (found.state === 'held') throw heldError(target, found);
+  if (found.state === 'published' || found.state === 'finalized') {
+    throw new DataRootRelocationError('data-root-relocation-published', '这次迁移已经生效（数据目录已切换到新目录），不会撤销。');
+  }
   if (!options.verified) {
-    const changed = await receivingChangedSince(target, found);
-    if (changed) {
-      const held: RelocationMarker = { ...found, state: 'held', held: { at: new Date().toISOString(), reason: changed } };
+    const check = await receivingChangedSince(target, found);
+    if (check.kind === 'unreadable') {
+      throw new DataRootRelocationError('data-root-relocation-undo-unreadable',
+        `那次没有完成的数据迁移还没有撤销：${target} 里的当前历史库现在读不出来（${check.reason}），无法确认那次迁移之后没有别人写入，`
+        + '这次没有撤销，记录保持不变；下次会再试。');
+    }
+    if (check.kind === 'changed') {
+      const held: RelocationMarker = { ...found, state: 'held', held: { at: new Date().toISOString(), reason: check.reason } };
       await writeMarker(target, held);
       throw heldError(target, held);
     }
   }
-  const marker: RelocationMarker = found.state === 'undoing' ? found : { ...found, state: 'undoing' };
-  if (found.state !== 'undoing') await writeMarker(target, marker);
-  const work = workDirectory(target, marker.relocationId);
-  for (const entry of (await readJournal(target, marker.relocationId)).reverse()) {
-    const destination = path.join(target, entry.path);
-    if (entry.op === 'received') continue;
-    if (entry.op === 'entry') {
-      await removeWithTemporaries(destination);
-      continue;
+  const entries = await readJournal(target, found.relocationId);
+  try {
+    let marker = found;
+    if (found.state === 'complete') {
+      marker = { ...found, state: 'undoing' };
+      await writeMarker(target, marker).catch((error: unknown) => {
+        if (!isDiskFull(error)) throw error;
+        console.warn('[LimCode] 磁盘已满，先撤销（撤销只会腾出空间）再记下撤销进行中。', error);
+      });
     }
-    if (entry.op === 'children') {
-      // Entries created inside an existing directory (e.g. a merge backup of the receiving data set).
-      for (const name of await fs.readdir(destination).catch(() => [] as string[])) {
-        if (!entry.keep.includes(name)) await fs.rm(path.join(destination, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    const work = workDirectory(target, marker.relocationId);
+    for (const entry of [...entries].reverse()) {
+      const destination = path.join(target, entry.path);
+      if (entry.op === 'received' || entry.op === 'merging') continue;
+      if (entry.op === 'entry') {
+        await removeWithTemporaries(destination);
+        continue;
       }
-      continue;
+      if (entry.op === 'children') {
+        // Entries created inside an existing directory (e.g. a merge backup of the receiving data set).
+        for (const name of await fs.readdir(destination).catch(() => [] as string[])) {
+          if (!entry.keep.includes(name)) await fs.rm(path.join(destination, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        }
+        continue;
+      }
+      const backup = path.join(work, entry.backup);
+      if (entry.op === 'replace') {
+        if (!await pathExists(backup)) continue;
+        const previous = await fs.lstat(backup);
+        const current = await lstatOrUndefined(destination);
+        if (current && (current.isDirectory() || !previous.isFile())) await fs.rm(destination, { recursive: true, force: true });
+        await fs.mkdir(path.dirname(destination), { recursive: true });
+        await fs.rename(backup, destination);
+        await syncDirectoryDurably(path.dirname(destination));
+        continue;
+      }
+      await restoreReceivingDatabase(destination, backup);
     }
-    const backup = path.join(work, entry.backup);
-    if (entry.op === 'replace') {
-      if (!await pathExists(backup)) continue;
-      const previous = await fs.lstat(backup);
-      const current = await lstatOrUndefined(destination);
-      if (current && (current.isDirectory() || !previous.isFile())) await fs.rm(destination, { recursive: true, force: true });
-      await fs.mkdir(path.dirname(destination), { recursive: true });
-      await fs.rename(backup, destination);
-      await syncDirectoryDurably(path.dirname(destination));
-      continue;
-    }
-    await restoreReceivingDatabase(destination, backup);
+    await fs.rm(work, { recursive: true, force: true });
+    const backups = path.join(target, DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY);
+    if (!marker.preexisting.includes(DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY)) await fs.rmdir(backups).catch(() => undefined);
+    if (marker.previous) await writeMarker(target, marker.previous);
+    else await fs.rm(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), { force: true });
+    await syncDirectoryDurably(target).catch(() => undefined);
+  } catch (error) {
+    if (!isDiskFull(error)) throw error;
+    throw new DataRootRelocationError('data-root-relocation-disk-full', await diskFullHint(target, found, entries), error);
   }
-  await fs.rm(work, { recursive: true, force: true });
-  const backups = path.join(target, DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY);
-  if (!marker.preexisting.includes(DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY)) await fs.rmdir(backups).catch(() => undefined);
-  if (marker.previous) await writeMarker(target, marker.previous);
-  else await fs.rm(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), { force: true });
-  await syncDirectoryDurably(target).catch(() => undefined);
-  if (marker.movedAside && await pathExists(marker.movedAside)) await restoreMovedAside(target, marker.movedAside);
-  else if (marker.createdDirectory) await fs.rmdir(target).catch(() => undefined);
+  if (found.movedAside && await pathExists(found.movedAside)) await restoreMovedAside(target, found.movedAside);
+  else if (found.createdDirectory) await fs.rmdir(target).catch(() => undefined);
+}
+
+/** What the user can delete by hand when the target's disk is too full even for the undo. */
+async function diskFullHint(target: string, marker: RelocationMarker, entries: readonly JournalEntry[]): Promise<string> {
+  const created = entries.filter((entry): entry is Extract<JournalEntry, { op: 'entry' }> => entry.op === 'entry')
+    .map((entry) => path.join(target, entry.path));
+  const left: string[] = [];
+  for (const entry of marker.createdDirectory ? [target] : [...created, workDirectory(target, marker.relocationId)]) {
+    if (await pathExists(entry).catch(() => true)) left.push(entry);
+  }
+  const lead = '新数据目录所在的磁盘已满，撤销没有做完（旧目录没有改动，下次启动会再试）。';
+  return left.length > 0
+    ? `${lead}可以先手动删除这次迁移在新目录里新建的这些内容来腾出空间：${left.join('；')}。`
+    : `${lead}这次迁移新建的内容已经删掉了，只差写回迁移前的记录：请在这个盘上腾出一点空间。`;
 }
 
 /**
@@ -1949,11 +2270,26 @@ function requireRelative(relative: string): void {
 // ---------------------------------------------------------------------------------------------
 // Records, recovery and leftovers
 
+/**
+ * The relocation record of a directory. Only a missing file means "none": any other read error (a
+ * drive that hiccups, no permission) throws, since it proves nothing either way. A record that does
+ * not describe this directory (copied along from elsewhere) is ignored.
+ */
 async function readMarker(root: string): Promise<RelocationMarker | undefined> {
+  let text: string;
+  try { text = await fs.readFile(path.join(root, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'); }
+  catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
   let value: unknown;
-  try { value = JSON.parse(await fs.readFile(path.join(root, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8')); }
-  catch { return undefined; }
+  try { value = JSON.parse(text); } catch { return undefined; }
   return isMarker(value) && isSamePath(path.resolve(value.targetRootPath), path.resolve(root)) ? value : undefined;
+}
+
+/** Copied, with its pointer switch still to be confirmed or confirmed (see RelocationMarker.state). */
+function isCompleted(marker: RelocationMarker): boolean {
+  return marker.state === 'complete' || marker.state === 'published' || marker.state === 'finalized';
 }
 
 function isMarker(value: unknown): value is RelocationMarker {
@@ -1961,7 +2297,8 @@ function isMarker(value: unknown): value is RelocationMarker {
   const strings = (items: unknown): boolean => Array.isArray(items) && items.every((item) => typeof item === 'string');
   const targetState = marker?.targetState as Partial<TargetState & { receivingId: unknown; dataSetIds: unknown }> | undefined;
   return !!marker && marker.kind === MARKER_KIND
-    && (marker.state === 'staging' || marker.state === 'complete' || marker.state === 'undoing' || marker.state === 'held')
+    && ['staging', 'complete', 'published', 'finalized', 'undoing', 'held'].includes(String(marker.state))
+    && (marker.installation === undefined || typeof marker.installation === 'string')
     && (marker.held === undefined || (typeof marker.held.at === 'string' && typeof marker.held.reason === 'string'))
     && typeof marker.relocationId === 'string' && /^[0-9a-f-]{36}$/.test(marker.relocationId)
     && typeof marker.sourceRootPath === 'string' && typeof marker.targetRootPath === 'string'
@@ -2009,7 +2346,7 @@ export async function readDataRootRelocationRecord(root: string): Promise<{
   leftBehind: Array<{ id: string; reason: string; hint: string }>;
 } | undefined> {
   const marker = await readMarker(path.resolve(root));
-  if (marker?.state !== 'complete') return undefined;
+  if (!marker || !isCompleted(marker)) return undefined;
   return {
     sourceRootPath: marker.sourceRootPath,
     ...(marker.completedAt ? { completedAt: marker.completedAt } : {}),
@@ -2034,22 +2371,40 @@ export async function invalidateDataRootRelocationRecord(currentRootPath: string
   const root = path.resolve(currentRootPath);
   await withRuntimeDataRootAdmission(root, async () => {
     const marker = await readMarker(root);
-    if (marker?.state !== 'complete' || marker.invalidatedAt) return;
+    if (!marker || !isCompleted(marker) || marker.invalidatedAt) return;
     await writeMarker(root, { ...marker, invalidatedAt: new Date().toISOString() });
     await finalizeRelocation(root, marker);
   });
 }
 
 /**
- * The relocation into this directory took effect (it is the current data directory): its journal
- * and the undo copy of a receiving database are no longer needed. Replaced configuration versions
- * stay for the user.
+ * The relocation into this directory took effect and the installation that started it opened the
+ * directory: its journal and the undo copy of a receiving database are no longer needed (replaced
+ * configuration versions stay for the user) and the record becomes 'finalized'. Only that
+ * installation, and only for a confirmed ('published') record; a 'complete' one it confirms first
+ * when its pointer names this relocation (`publishedRelocationId`: the pointer switched, the
+ * confirmation was lost). Any other installation that opens the directory never touches it.
  */
-export async function finalizeDataRootRelocation(currentRootPath: string): Promise<void> {
+export async function finalizeDataRootRelocation(
+  currentRootPath: string,
+  input: { installation?: string; publishedRelocationId?: string } = {}
+): Promise<void> {
   const root = path.resolve(currentRootPath);
-  const marker = await readMarker(root);
-  if (marker?.state !== 'complete' || !await pathExists(journalPath(root, marker.relocationId))) return;
-  await withRuntimeDataRootAdmission(root, () => finalizeRelocation(root, marker));
+  const found = await readMarker(root);
+  if (!found || found.installation !== input.installation) return;
+  const confirmable = found.state === 'complete' && found.relocationId === input.publishedRelocationId;
+  if (found.state !== 'published' && !confirmable) return;
+  await withRuntimeDataRootAdmission(root, async () => {
+    let marker = await readMarker(root);
+    if (!marker || marker.relocationId !== found.relocationId || (marker.state !== 'published' && marker.state !== 'complete')) return;
+    const now = new Date().toISOString();
+    if (marker.state === 'complete') {
+      marker = { ...marker, state: 'published', publishedAt: now };
+      await writeMarker(root, marker);
+    }
+    await finalizeRelocation(root, marker);
+    await writeMarker(root, { ...marker, state: 'finalized', finalizedAt: now });
+  });
 }
 
 async function finalizeRelocation(root: string, marker: RelocationMarker): Promise<void> {
@@ -2062,43 +2417,48 @@ async function finalizeRelocation(root: string, marker: RelocationMarker): Promi
 }
 
 /**
- * A relocation recorded as in progress (see the data-root pointer) whose process is gone: what it
- * did in the target is undone — its staging, or a completion whose pointer switch never happened
- * (the pointer's record is cleared together with the switch) while the receiving data set is
- * unchanged. 'running' while the owner lives (or cannot be judged), 'blocked' while the target is
- * in use and a database restore would be needed.
+ * A relocation recorded as in progress (see the data-root pointer; while it is there the pointer
+ * did not switch to it) whose process is gone: what it did in the target is undone — its staging,
+ * or a completion never confirmed — unless someone wrote there since ('held'). 'running' while the
+ * owner lives (or cannot be judged), 'blocked' while the target is in use and a database restore
+ * would be needed, 'unreadable' while the receiving data set cannot be read (nothing decided,
+ * tried again later), 'unreachable' while the target is not visible (its parent is missing, or the
+ * directories it was found in are not the ones there: `anchor`), 'orphaned' when the relocation's
+ * data is in the target but can no longer be undone (its journal is gone, e.g. finalized by another
+ * installation of an older version, or it was confirmed there). 'absent': nothing of it is there
+ * (never written, or undone).
  */
 export async function recoverInterruptedDataRootRelocation(input: {
   targetRootPath: string;
   relocationId: string;
-}): Promise<'recovered' | 'absent' | 'unreachable' | 'running' | 'blocked' | 'held'> {
+  anchor?: DataRootRelocationTargetAnchor;
+}): Promise<'recovered' | 'absent' | 'unreachable' | 'running' | 'blocked' | 'held' | 'unreadable' | 'orphaned'> {
   const target = path.resolve(input.targetRootPath);
-  // Never takes a claim beside a directory whose parent is not there (an unmounted drive).
-  if (!(await lstatOrUndefined(path.dirname(target)).catch(() => undefined))?.isDirectory()) return 'unreachable';
-  if (!(await lstatOrUndefined(target).catch(() => undefined))?.isDirectory()) {
-    // Killed right after renaming copied data aside: it comes back; otherwise nothing was left there.
+  const nothingThere = async (): Promise<'recovered' | 'absent' | 'unreachable'> => {
+    try { await assertTargetVisible(target, input.anchor); } catch { return 'unreachable'; }
+    // An undo removes the record just before the copied data renamed aside comes back.
     const aside = await findMovedAside(target, input.relocationId);
     if (!aside) return 'absent';
     await withRuntimeDataRootAdmission(target, () => restoreMovedAside(target, aside));
     return 'recovered';
-  }
+  };
+  // Never takes a claim beside a directory whose parent is not there (an unmounted drive).
+  if (!(await lstatOrUndefined(path.dirname(target)).catch(() => undefined))?.isDirectory()) return input.anchor ? 'unreachable' : 'absent';
+  const found = await readMarker(target);
+  if (!found || found.relocationId !== input.relocationId) return nothingThere();
   return withRuntimeDataRootAdmission(target, async () => {
     const marker = await readMarker(target);
-    if (!marker || marker.relocationId !== input.relocationId) {
-      // An undo removes the record just before the copied data renamed aside comes back.
-      const aside = await findMovedAside(target, input.relocationId);
-      if (!aside) return 'absent';
-      await restoreMovedAside(target, aside);
-      return 'recovered';
-    }
+    if (!marker || marker.relocationId !== input.relocationId) return nothingThere();
     if (marker.state === 'held') return 'held';
+    if (marker.state === 'published' || marker.state === 'finalized') return 'orphaned';
     if (ownerState(marker.owner) !== 'dead') return 'running';
-    if (marker.state === 'complete' && await unfinishedRelocation(target, marker, path.resolve(marker.sourceRootPath)) !== 'undo') return 'absent';
+    if (marker.state === 'complete' && !await pathExists(journalPath(target, marker.relocationId))) return 'orphaned';
     if (await hasDatabaseRestore(target, marker) && await targetOfflineProblem(target)) return 'blocked';
     try {
       await undoRelocation(target, marker);
     } catch (error) {
       if (isHeldError(error)) return 'held';
+      if (isUnreadableUndo(error)) return 'unreadable';
       throw error;
     }
     return 'recovered';
@@ -2107,32 +2467,90 @@ export async function recoverInterruptedDataRootRelocation(input: {
 
 /**
  * Before a window opens `root` (call under its configuration admission): a relocation into it that
- * never finished is not built upon. Its process proven gone: the undo is completed first (`undone`;
- * the directory may then no longer hold LimCode data, so the caller checks it again), unless someone
- * wrote into it since, in which case nothing is touched, the record is left 'held' and `held` says
- * why and where the backups are (the directory opens as it is). Its process alive or unknown: the
- * open is refused ('relocating'), as it is while a needed database restore finds the directory in use.
+ * never finished is not built upon. A staging or undoing record whose process is proven gone: the
+ * undo is completed first (`undone`; the directory may then no longer hold LimCode data, so the
+ * caller checks it again), unless someone wrote into it since, in which case nothing is touched,
+ * the record is left 'held' and `held` says why and where the backups are (the directory opens as
+ * it is). A complete record (copied, pointer switch not confirmed): the installation that started
+ * it and whose pointer names it confirms it (`installation`, `publishedRelocationId`) and opens;
+ * for anyone else it is refused while its process lives ('relocating'), and once that is gone the
+ * user decides ('unpublished', see undoUnpublishedDataRootRelocation). A process alive or unknown,
+ * a needed database restore while the directory is in use, or an undo that cannot read the
+ * receiving data set right now: refused ('relocating').
  */
-export async function settleDataRootRelocationBeforeOpen(root: string): Promise<{ undone: boolean; held?: string }> {
+export async function settleDataRootRelocationBeforeOpen(
+  root: string,
+  opener: { installation?: string; publishedRelocationId?: string } = {}
+): Promise<{ undone: boolean; held?: string }> {
   const target = path.resolve(root);
   return withRuntimeDataRootAdmission(target, async () => {
-    const marker = await readMarker(target);
-    if (!marker || (marker.state !== 'staging' && marker.state !== 'undoing')) return { undone: false };
+    let marker: RelocationMarker | undefined;
+    try { marker = await readMarker(target); }
+    catch (error) { throw new DataRootUnavailableError(target, readFailureReason(error), error); }
+    if (!marker) return { undone: false };
+    if (marker.state === 'complete') {
+      if (opener.installation !== undefined && marker.installation === opener.installation && marker.relocationId === opener.publishedRelocationId) {
+        await writeMarker(target, { ...marker, state: 'published', publishedAt: new Date().toISOString() });
+        return { undone: false };
+      }
+      if (marker.invalidatedAt) return { undone: false };
+      throw new DataRootUnavailableError(target, ownerState(marker.owner) === 'dead' ? 'unpublished' : 'relocating');
+    }
+    if (marker.state !== 'staging' && marker.state !== 'undoing') return { undone: false };
     if (ownerState(marker.owner) !== 'dead') throw new DataRootUnavailableError(target, 'relocating');
-    if (await hasDatabaseRestore(target, marker) && await targetOfflineProblem(target)) throw new DataRootUnavailableError(target, 'relocating');
+    if (await hasDatabaseRestore(target, marker) && await targetOfflineProblem(target)) {
+      throw new DataRootUnavailableError(target, 'relocating', new DataRootRelocationError('data-root-relocation-target-busy',
+        '发起它的进程已经结束，但这个目录正被其它 LimCode 窗口使用（可能是另一个 VS Code 或 code-server），要等它们关闭后才能撤销。'));
+    }
     try {
       await undoRelocation(target, marker);
     } catch (error) {
       if (isHeldError(error)) return { undone: false, held: errorMessage(error) };
+      if (isUnreadableUndo(error)) throw new DataRootUnavailableError(target, 'unreadable', error);
       throw error;
     }
     return { undone: true };
   });
 }
 
-/** 'running': an unfinished relocation into `root` whose process is alive or cannot be judged (opening it is refused). */
-async function unfinishedRelocationOwner(root: string): Promise<'none' | 'running' | 'dead'> {
+/**
+ * "撤销那次未完成的迁移并打开": the user's choice for a directory with another installation's
+ * relocation that copied its data in but never switched to it, its process gone (see
+ * settleDataRootRelocationBeforeOpen, 'unpublished'). Undone like any other: never over content
+ * written since ('held' then says why and where the backups are).
+ */
+export async function undoUnpublishedDataRootRelocation(root: string): Promise<{ held?: string }> {
+  const target = path.resolve(root);
+  return withRuntimeDataRootAdmission(target, async () => {
+    const marker = await readMarker(target);
+    if (!marker || marker.state !== 'complete' || marker.invalidatedAt) return {};
+    if (ownerState(marker.owner) !== 'dead') throw new DataRootUnavailableError(target, 'relocating');
+    if (!await pathExists(journalPath(target, marker.relocationId))) {
+      throw new DataRootRelocationError('data-root-relocation-orphaned',
+        `那次迁移的撤销日志已经不在了（${journalPath(target, marker.relocationId)}），无法自动撤销；这个目录里有那次迁移复制进来的数据。`
+        + `确认要按现在的样子使用这个目录，可以删除 ${path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE)} 后再打开。`);
+    }
+    if (await hasDatabaseRestore(target, marker)) {
+      const blocked = await targetOfflineProblem(target);
+      if (blocked) throw new DataRootRelocationError('data-root-relocation-target-busy', blocked);
+    }
+    try {
+      await undoRelocation(target, marker);
+    } catch (error) {
+      if (isHeldError(error)) return { held: errorMessage(error) };
+      throw error;
+    }
+    return {};
+  });
+}
+
+/**
+ * 'running': an unfinished relocation into `root` whose process is alive or cannot be judged, or a
+ * completion that was never confirmed (opening it is refused or asks, see settleDataRootRelocationBeforeOpen).
+ */
+async function unfinishedRelocationOwner(root: string): Promise<'none' | 'running' | 'dead' | 'unpublished'> {
   const marker = await readMarker(path.resolve(root));
+  if (marker?.state === 'complete' && !marker.invalidatedAt) return ownerState(marker.owner) === 'dead' ? 'unpublished' : 'running';
   if (!marker || (marker.state !== 'staging' && marker.state !== 'undoing')) return 'none';
   return ownerState(marker.owner) === 'dead' ? 'dead' : 'running';
 }
@@ -2154,18 +2572,50 @@ export async function findDataRootRelocationCopy(targetRootPath: string, relocat
 
 /** The moved notice of a directory (see DATA_ROOT_MOVED_NOTICE_FILE), if it has a valid one. */
 export async function readDataRootMovedNotice(root: string): Promise<DataRootMovedNotice | undefined> {
+  let text: string;
+  try { text = await fs.readFile(path.join(path.resolve(root), DATA_ROOT_MOVED_NOTICE_FILE), 'utf8'); }
+  catch (error) {
+    // Only a missing notice is none; a read that fails otherwise proves nothing and throws.
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
   let value: unknown;
-  try { value = JSON.parse(await fs.readFile(path.join(path.resolve(root), DATA_ROOT_MOVED_NOTICE_FILE), 'utf8')); }
-  catch { return undefined; }
+  try { value = JSON.parse(text); } catch { return undefined; }
   const notice = value as (Partial<DataRootMovedNotice> & { kind?: unknown }) | null;
   if (notice?.kind !== MOVED_NOTICE_KIND || typeof notice.targetRootPath !== 'string' || typeof notice.relocationId !== 'string'
-    || typeof notice.movedAt !== 'string' || typeof notice.installation?.id !== 'string' || typeof notice.installation.label !== 'string') {
+    || typeof notice.movedAt !== 'string' || typeof notice.installation?.id !== 'string' || typeof notice.installation.label !== 'string'
+    || (notice.carriedWork !== undefined && !isCarriedWork(notice.carriedWork))) {
     return undefined;
   }
   return {
     targetRootPath: notice.targetRootPath, relocationId: notice.relocationId, movedAt: notice.movedAt,
-    installation: { id: notice.installation.id, label: notice.installation.label }
+    installation: { id: notice.installation.id, label: notice.installation.label },
+    ...(notice.carriedWork ? { carriedWork: notice.carriedWork } : {})
   };
+}
+
+function isCarriedWork(value: unknown): value is DataRootCarriedWork {
+  const work = value as Partial<DataRootCarriedWork> | null;
+  const settlement = work?.settlement as { state?: unknown; at?: unknown; by?: unknown } | undefined;
+  return !!work && Array.isArray(work.items) && work.items.every((item) => !!item && typeof item.conversationId === 'string'
+    && (item.turnId === undefined || typeof item.turnId === 'string') && typeof item.label === 'string')
+    && (settlement?.state === 'pending' || (settlement?.state === 'settled' && typeof settlement.at === 'string' && typeof settlement.by === 'string'));
+}
+
+/**
+ * Records that the carried work of a moved notice was settled in the old directory (closed as
+ * aborted, see DataRootMovedNotice.carriedWork); `by` names the installation that did it.
+ */
+export async function settleDataRootMovedWork(root: string, relocationId: string, by: string): Promise<boolean> {
+  const resolved = path.resolve(root);
+  return withRuntimeDataRootAdmission(resolved, async () => {
+    const notice = await readDataRootMovedNotice(resolved);
+    if (!notice?.carriedWork || notice.relocationId !== relocationId || notice.carriedWork.settlement.state === 'settled') return false;
+    await writeJsonDurably(path.join(resolved, DATA_ROOT_MOVED_NOTICE_FILE), {
+      kind: MOVED_NOTICE_KIND, ...notice, carriedWork: { ...notice.carriedWork, settlement: { state: 'settled', at: new Date().toISOString(), by } }
+    });
+    return true;
+  });
 }
 
 /** This installation uses the directory again (e.g. "回到旧目录"): its own moved notice there goes. */
@@ -2222,7 +2672,8 @@ export async function sweepDataRootRelocationLeftovers(dataRootPath: string): Pr
 
 export interface OldDataRootDeletionItem {
   key: string;
-  kind: 'data-set' | 'configuration' | 'backup' | 'metadata';
+  /** 'unmigrated': what a data set holds besides what moved (e.g. its diagnostic journal); only when ticked. */
+  kind: 'data-set' | 'unmigrated' | 'configuration' | 'backup' | 'metadata';
   /** User-facing description. */
   label: string;
   paths: string[];
@@ -2267,14 +2718,14 @@ export async function planOldDataRootDeletion(input: {
   const marker = await readMarker(currentRoot);
   if (!input.relocationId) {
     problems.push('当前目录是切换过来的（回到旧目录、选择其它目录或使用默认目录），没有复制旧目录的数据，不能据此删除旧目录。');
-  } else if (marker?.state !== 'complete' || !isSamePath(path.resolve(marker.sourceRootPath), oldRoot)) {
+  } else if (!marker || !isCompleted(marker) || !isSamePath(path.resolve(marker.sourceRootPath), oldRoot)) {
     problems.push('找不到从这个目录迁移完成的记录，为避免误删，不能在这里删除它。');
   } else if (marker.relocationId !== input.relocationId) {
     problems.push('当前目录里的迁移记录不是切换到这里的那次迁移留下的，为避免误删，不能在这里删除旧目录。');
   } else if (marker.invalidatedAt) {
     problems.push('迁移之后回到过这个旧目录，它可能有新的数据；迁移记录不再作为删除依据。需要时请再迁移一次（会合并），之后才能删除。');
   }
-  if (problems.length > 0 || marker?.state !== 'complete') return { oldRootPath: oldRoot, problems, items: [], kept: [] };
+  if (problems.length > 0 || !marker || !isCompleted(marker)) return { oldRootPath: oldRoot, problems, items: [], kept: [] };
   const items: OldDataRootDeletionItem[] = [];
   const covered = new Set<string>();
   const cover = (absolute: string): void => { covered.add(path.relative(oldRoot, absolute).split(path.sep)[0]); };
@@ -2302,13 +2753,15 @@ export async function planOldDataRootDeletion(input: {
       cover(archives);
     }
     if (!candidate.dataSetId) continue;
-    const paths = (await fs.readdir(controlRoot).catch(() => [] as string[]))
-      .filter((name) => !CONTROL_ROOT_BACKUP_DIRECTORIES.includes(name)).map((name) => path.join(controlRoot, name));
-    let bytes = 0;
-    for (const entry of paths) bytes += (await measureTree(entry)).bytes;
     cover(controlRoot);
     const migrated = marker.migrated?.find((item) => item.id === candidate.id
       && item.dataSetId === candidate.dataSetId && item.rootInstanceId === candidate.rootInstanceId);
+    // Where its debug captures went: the receiving data set for the current one, else its own (or the one it is merged into).
+    const movedId = candidate.selected ? marker.receivingId : migrated?.mergedInto ?? candidate.id;
+    const moved = migrated ? await resolveVscodeRuntimeDataSet({ globalStoragePath: currentRoot }, movedId).catch(() => undefined) : undefined;
+    const { paths, unmigrated } = await splitDataSetEntries(controlRoot, candidate.runtimeDataRootPath, moved?.runtimeDataRootPath);
+    let bytes = 0;
+    for (const entry of paths) bytes += (await measureTree(entry)).bytes;
     let reason: string | undefined;
     if (!migrated) reason = '没有迁移到当前目录';
     else {
@@ -2322,6 +2775,17 @@ export async function planOldDataRootDeletion(input: {
       label: `历史库 ${candidate.id}${candidate.selected ? '（旧目录的当前库）' : ''}${migrated?.mergedInto ? '（已合并进当前库）' : ''}`,
       paths, bytes, optional: false, deletable: !reason, ...(reason ? { reason } : {})
     });
+    if (unmigrated.length > 0) {
+      let unmigratedBytes = 0;
+      for (const entry of unmigrated) unmigratedBytes += (await measureTree(entry)).bytes;
+      const names = unmigrated.map((entry) => path.relative(controlRoot, entry).split(path.sep).join('/'));
+      items.push({
+        key: `unmigrated:${candidate.id}`, kind: 'unmigrated',
+        label: `历史库 ${candidate.id} 里没有迁移的内容（${names.slice(0, 5).join('、')}${names.length > 5 ? ` 等 ${names.length} 项` : ''}）`,
+        paths: unmigrated, bytes: unmigratedBytes, optional: true, deletable: !reason,
+        ...(reason ? { reason: '这个历史库保留，它的其它内容也保留' } : {})
+      });
+    }
   }
   for (const problem of inspection.problems) {
     const relative = path.relative(oldRoot, problem.runtimeScopeRootPath).split(path.sep)[0];
@@ -2412,7 +2876,7 @@ export async function deleteOldDataRoot(input: {
     if (!isDeepStrictEqual(keys, [...input.confirmedKeys].sort())) {
       throw new DataRootRelocationError('data-root-old-delete-changed', '确认之后旧目录发生了变化，没有删除任何内容；请重新查看后再删除。');
     }
-    const order: Array<OldDataRootDeletionItem['kind']> = ['data-set', 'backup', 'configuration', 'metadata'];
+    const order: Array<OldDataRootDeletionItem['kind']> = ['data-set', 'unmigrated', 'backup', 'configuration', 'metadata'];
     for (const kind of order) {
       for (const item of selected.filter((entry) => entry.kind === kind)) {
         for (const entry of item.paths) await fs.rm(entry, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -2425,17 +2889,83 @@ export async function deleteOldDataRoot(input: {
   });
 }
 
+/** What moved with a data set (its database, CAS, debug captures the new directory has) or is only bookkeeping. */
+const MOVED_DATA_ROOT_ENTRIES: ReadonlySet<string> = new Set([
+  'limcode.sqlite', 'limcode.sqlite-wal', 'limcode.sqlite-shm', 'limcode.sqlite-journal', 'cas', 'runtime-kernel-epoch.json',
+  'host-liveness', 'conversation-owners', 'exclusive-maintenance'
+]);
+const BOOKKEEPING_CONTROL_ROOT_ENTRIES: ReadonlySet<string> = new Set([
+  ROOT_BINDING_POINTER_FILE, 'root-binding.pending.json', 'owner.json', 'kept-by-user.json',
+  'cutover-completion.json', 'cutover-journal.json', 'cutover-request.json'
+]);
+
+/**
+ * A data set's entries in its control root (backups aside, they are items of their own): `paths`
+ * moved with it or are bookkeeping (deleted with the data set); `unmigrated` did not move and are
+ * deleted only when ticked — anything unknown, a non-empty process spool, diagnostics other than
+ * debug captures, debug captures the new directory does not have.
+ */
+async function splitDataSetEntries(controlRoot: string, dataRoot: string, movedDataRoot: string | undefined): Promise<{ paths: string[]; unmigrated: string[] }> {
+  const paths: string[] = [];
+  const unmigrated: string[] = [];
+  const names = async (directory: string): Promise<string[]> => (await fs.readdir(directory).catch((error: unknown) => {
+    if (isMissing(error)) return [] as string[];
+    throw error;
+  })).sort();
+  for (const name of await names(controlRoot)) {
+    const entry = path.join(controlRoot, name);
+    if (CONTROL_ROOT_BACKUP_DIRECTORIES.includes(name)) continue;
+    if (!isSamePath(entry, dataRoot)) {
+      (BOOKKEEPING_CONTROL_ROOT_ENTRIES.has(name) || isClaimName(name) || isTransientName(name) ? paths : unmigrated).push(entry);
+      continue;
+    }
+    for (const inner of await names(dataRoot)) {
+      const item = path.join(dataRoot, inner);
+      if (MOVED_DATA_ROOT_ENTRIES.has(inner) || isClaimName(inner) || isTransientName(inner)) paths.push(item);
+      else if (inner === PROCESS_SPOOL_DIRECTORY && (await names(item)).length === 0) paths.push(item);
+      else if (inner === DEBUG_CAPTURES_PATH[0]) {
+        for (const diagnostic of await names(item)) {
+          const detail = path.join(item, diagnostic);
+          if (diagnostic !== DEBUG_CAPTURES_PATH[1]) {
+            unmigrated.push(detail);
+            continue;
+          }
+          for (const run of await names(detail)) {
+            const there = movedDataRoot ? await pathExists(path.join(movedDataRoot, ...DEBUG_CAPTURES_PATH, run)) : false;
+            (there ? paths : unmigrated).push(path.join(detail, run));
+          }
+        }
+      } else unmigrated.push(item);
+    }
+  }
+  return { paths, unmigrated };
+}
+
 /** Control roots, scope roots and the workspace-runtimes container left empty by a deletion. */
 async function removeEmptyDirectories(oldRoot: string): Promise<void> {
   const scopes = path.join(oldRoot, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, 'scopes');
+  // A deleted data set leaves the empty directories of its Runtime data root (unmigrated content, when kept, keeps them).
+  const pruneDeleted = async (scopeRoot: string): Promise<void> => {
+    const dataRoot = resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot });
+    if (!await pathExists(path.join(dataRoot, 'limcode.sqlite'))) await pruneEmptyDirectories(dataRoot);
+  };
+  await pruneDeleted(oldRoot);
   for (const key of await fs.readdir(scopes).catch(() => [] as string[])) {
     const scope = path.join(scopes, key);
+    await pruneDeleted(scope);
     await fs.rmdir(path.join(scope, VSCODE_RUNTIME_CONTROL_DIRECTORY)).catch(() => undefined);
     await fs.rmdir(scope).catch(() => undefined);
   }
   await fs.rmdir(scopes).catch(() => undefined);
   await fs.rmdir(path.join(oldRoot, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY)).catch(() => undefined);
   await fs.rmdir(path.join(oldRoot, VSCODE_RUNTIME_CONTROL_DIRECTORY)).catch(() => undefined);
+}
+
+/** Removes the empty directories of a tree, deepest first (never a file). */
+async function pruneEmptyDirectories(directory: string): Promise<void> {
+  if (!(await lstatOrUndefined(directory).catch(() => undefined))?.isDirectory()) return;
+  for (const name of await fs.readdir(directory).catch(() => [] as string[])) await pruneEmptyDirectories(path.join(directory, name));
+  await fs.rmdir(directory).catch(() => undefined);
 }
 
 function backupLabel(name: string): string {
@@ -2592,19 +3122,23 @@ async function removeSqliteFiles(file: string): Promise<void> {
   for (const suffix of ['', '-wal', '-shm', '-journal']) await fs.rm(`${file}${suffix}`, { force: true });
 }
 
-function dataRootUnavailableMessage(root: string, reason: DataRootUnavailableReason): string {
+function dataRootUnavailableMessage(root: string, reason: DataRootUnavailableReason, detail?: string): string {
   if (reason === 'relocating') {
-    return `数据目录暂时不能打开：${root} 里有一次还没完成的数据迁移（可能来自另一个 LimCode 安装），发起它的进程还在运行或无法确认已经结束。`
+    return `数据目录暂时不能打开：${root} 里有一次还没完成的数据迁移（可能来自另一个 LimCode 安装），${detail ?? '发起它的进程还在运行或无法确认已经结束。'}`
       + '它完成或撤销之后才能打开这个目录；本窗口没有打开运行时。';
   }
-  if (reason === 'unreadable') {
-    return `数据目录暂时无法读取：${root}；本窗口没有打开运行时。`;
+  if (reason === 'unpublished') {
+    return `数据目录暂时没有打开：${root} 里有一次没有生效的数据迁移（多半来自另一个 LimCode 安装）：数据已经复制进来，`
+      + '但发起它的安装没有切换过去，它的进程也已经结束。可以撤销那次迁移后打开（只撤销那次迁移写入的内容；这之后有人写入过就不撤销），也可以暂不打开。';
   }
-  const detail = reason === 'missing' ? '目录不存在'
+  if (reason === 'unreadable') {
+    return `数据目录暂时无法读取：${root}；本窗口没有打开运行时。${detail ?? ''}`;
+  }
+  const what = reason === 'missing' ? '目录不存在'
     : reason === 'not-directory' ? '这个位置不是文件夹'
       : reason === 'empty' ? '目录里没有 LimCode 数据'
         : reason === 'mismatch' ? '目录里不是原来那份 LimCode 数据' : '目录无法访问（例如没有权限）';
-  return `数据目录不可用（${detail}）：${root}。可能是外置盘没有接上或网络盘断开；为避免在这里新建一份空的历史，本窗口没有打开运行时。`;
+  return `数据目录不可用（${what}）：${root}。可能是外置盘没有接上或网络盘断开；为避免在这里新建一份空的历史，本窗口没有打开运行时。`;
 }
 
 /** 'unreadable' for a read error that usually passes, 'inaccessible' for any other. */
@@ -2628,8 +3162,64 @@ function timestampSlug(): string {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
+/** Only these mean "not there"; any other error proves nothing either way. */
 function isMissing(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/** The disk (or the user's quota) is full. */
+function isDiskFull(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOSPC' || code === 'EDQUOT' || /SQLITE_FULL|database or disk is full/i.test(errorMessage(error));
+}
+
+/** `<inode>:<size>:<mtime ns>` of a file, undefined when it is not there: a rename keeps it, any write changes it. */
+async function fileStamp(file: string): Promise<string | undefined> {
+  try {
+    const info = await fs.lstat(file, { bigint: true });
+    return info.isFile() ? `${info.ino}:${info.size}:${info.mtimeNs}` : undefined;
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
+}
+
+/** `<device>:<inode>` of a directory, undefined when it is not one (or cannot be read). */
+async function directoryIdentity(directory: string): Promise<string | undefined> {
+  try {
+    const info = await fs.stat(directory, { bigint: true });
+    return info.isDirectory() ? `${info.dev}:${info.ino}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** See DataRootRelocationTargetAnchor; `keptInPlace`: the target exists and is not renamed aside. */
+async function targetAnchor(target: string, keptInPlace: boolean): Promise<DataRootRelocationTargetAnchor> {
+  const parent = await directoryIdentity(path.dirname(target));
+  if (!parent) throw new DataRootRelocationError('data-root-relocation-target-missing', `新数据目录的上级文件夹不在了：${path.dirname(target)}`);
+  const self = keptInPlace ? await directoryIdentity(target) : undefined;
+  return { parent, ...(self ? { target: self } : {}) };
+}
+
+/**
+ * A relocation that changed the target (it has an anchor) and finds no record of it there: whether
+ * the directories it found are still the ones there. Otherwise the target is not visible right now
+ * (a disconnected drive leaves its mount point empty) and nothing may be taken for undone.
+ */
+async function assertTargetVisible(target: string, anchor: DataRootRelocationTargetAnchor | undefined): Promise<void> {
+  if (!anchor) return;
+  const parent = await directoryIdentity(path.dirname(target));
+  const self = anchor.target === undefined ? undefined : await directoryIdentity(target);
+  if (parent === anchor.parent && self === anchor.target) return;
+  throw new DataRootRelocationError('data-root-relocation-target-invisible',
+    `新数据目录现在看不到，或已不是迁移时的那个位置（${target}；例如所在的盘没有接上、网络盘断开或盘符变了）。`
+    + '那次迁移在那里做的改动还没有撤销，进行中记录保留，接上后会再撤销；旧目录没有改动。');
+}
+
+export function isDataRootRelocationTargetInvisible(error: unknown): boolean {
+  return (error as { code?: unknown } | undefined)?.code === 'data-root-relocation-target-invisible';
 }
 
 function errorMessage(error: unknown): string {

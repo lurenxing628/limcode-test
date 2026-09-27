@@ -56,14 +56,19 @@ async function writeMeanwhile(target) {
 
 const markerOf = async (target) => JSON.parse(await fs.readFile(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'));
 
-for (const scenario of ['identity-after', 'undo-marked@identity-after', 'undo-marked@complete-marker-after']) {
+for (const scenario of ['identity-after', 'undo-db-restored@identity-after', 'undo-marked@complete-marker-after']) {
   test(`问题 1 ${scenario}：迁移中断后另一个安装在撤销之前打开新目录写了对话，之后的续撤不覆盖它：撤销被搁置、什么都不动，并写明迁移前备份在哪`, async (t) => {
     const { target, relocationId } = await crashedInto(t, scenario);
     const settingsBefore = await fs.readFile(path.join(target, 'settings', 'llm.json'), 'utf8');
     const receiving = await writeMeanwhile(target);
     assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held');
     assert.ok(conversationIds(receiving).includes('conversation_written_meanwhile'), '续撤没有抹掉迁移之后写入的对话');
-    assert.ok(conversationIds(receiving).includes('conversation_current_1'), '接收库没有被迁移前的副本覆盖');
+    if (scenario.startsWith('undo-db-restored')) {
+      // The interrupted undo had already put the database back (its WAL not yet): what was written into it since stays.
+      assert.deepEqual(conversationIds(receiving).sort(), ['conversation_existing_1', 'conversation_written_meanwhile'], '还原到一半之后写入的内容保留');
+    } else {
+      assert.ok(conversationIds(receiving).includes('conversation_current_1'), '接收库没有被迁移前的副本覆盖');
+    }
     assert.equal(await fs.readFile(path.join(target, 'settings', 'llm.json'), 'utf8'), settingsBefore, '搁置时什么都不动');
     const marker = await markerOf(target);
     assert.equal(marker.state, 'held');
@@ -126,7 +131,7 @@ test('问题 1 进程内：完成阶段失败后立即撤销（目标一直在�
   try { staged = await stageDataRootRelocation(plan, source); } finally { await source.close(); }
   const stages = [];
   let error;
-  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }, { onProgress: (text) => stages.push(text) })
+  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }, { onProgress: (text) => stages.push(text), pointerUnchanged: async () => true })
     .catch((caught) => { error = caught; });
   assert.match(error?.message ?? '', /指针写入失败/);
   assert.equal(dataRootRelocationCleanupState(error), 'cleaned');
@@ -195,7 +200,7 @@ test('撤销还原接收库做到一半（库文件已放回、WAL 还在副本�
   };
   t.after(() => { fsp.rename = rename; });
   let error;
-  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }).catch((caught) => { error = caught; });
+  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }, { pointerUnchanged: async () => true }).catch((caught) => { error = caught; });
   assert.equal(dataRootRelocationCleanupState(error), 'not-cleaned');
   const work = path.join(target, relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, staged.relocationId);
   const [backup] = (await fs.readdir(work)).filter((name) => name.startsWith('database-'));
@@ -229,7 +234,7 @@ test('X2 撤销到一半（undoing）而发起进程已结束：下一次迁移�
   assert.equal(plan.undoesEarlierAttempt, true);
   await relocate(fixture, plan);
   assert.deepEqual(conversationIds(existing.binding.paths.dataRootPath), ['conversation_current_1', 'conversation_current_2', 'conversation_existing_1']);
-  assert.equal((await markerOf(target)).state, 'complete');
+  assert.equal((await markerOf(target)).state, 'published', '切换指针之后记下已生效');
 });
 
 test('X9 拷来的数据改名挪开之后目录 fsync 失败：准备阶段把拷贝改回原名，如实报告已清理', async (t) => {
@@ -283,7 +288,7 @@ test('问题 2 撤销删掉记录后把拷贝改回原名失败：abandon 仍找
   };
   t.after(() => { fsp.rename = rename; });
   let error;
-  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }).catch((caught) => { error = caught; });
+  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }, { pointerUnchanged: async () => true }).catch((caught) => { error = caught; });
   assert.equal(dataRootRelocationCleanupState(error), 'not-cleaned');
   await assert.rejects(fs.stat(path.join(copied, relocation.DATA_ROOT_RELOCATION_MARKER_FILE)), { code: 'ENOENT' }, '前提：记录已删');
   const [aside] = (await fs.readdir(fixture.base)).filter((name) => name.includes('.limcode-copied-'));
