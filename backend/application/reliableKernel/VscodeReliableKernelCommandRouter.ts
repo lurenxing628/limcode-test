@@ -1751,7 +1751,12 @@ export class VscodeReliableKernelCommandRouter {
     payload: CompressionStartPayload
   ): Promise<void> {
     const conversationId = requireText(payload.conversationId, 'conversationId');
-    await this.requireExecutionHost(conversationId);
+    // The maintenance Turn runs as its source Turn's Agent; judge the entry by that Agent's settings.
+    const executorAgentId = await this.product.conversations.manualCompressionExecutorAgentId?.(
+      conversationId,
+      await this.childExecutionIdForConversation(conversationId)
+    );
+    await this.requireExecutionHost(conversationId, executorAgentId);
     await this.runConversationCommand(conversationId, () =>
       this.handleCompressionStartUnderOwnership(webview, correlationId, payload, conversationId));
   }

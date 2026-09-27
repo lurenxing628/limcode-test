@@ -362,12 +362,274 @@ test('复审 #9：入口预览按单条消息指定的 Agent 求值：该 Agent 
   }
 });
 
+
+test('复审 H2：源 Turn 由单条消息指定的 Agent 执行时，手动压缩入口按该 Agent 判定，与维护 Turn 实际冻结的环境一致', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('h2-agent');
+  let host;
+  try {
+    host = await openHost(dataRoot, scriptedProvider([{ role: 'model', parts: [{ text: '好' }] }, { role: 'model', parts: [{ text: '摘要' }] }]), {
+      folders: [PROJECT_ONE], label: 'h2', frozen: CHOSEN.id, environments: [CHOSEN],
+      // 只有 agent-other 的工作环境策略选中了本窗口可用的目录。
+      selectedFor: (agentId) => agentId === 'agent-other' ? CHOSEN.id : undefined
+    });
+    const conversationId = 'conversation-h2';
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    const first = await host.runner.input({ commandId: 'h2-1', conversationId, text: '指定 Agent', agentId: 'agent-other' });
+    await eventually(async () => (await rows(host.app, 'Turn', { id: first.turnId }))[0]?.status === 'terminated', 30_000, '第一个 Turn 未结束');
+    await host.runner.waitForIdle();
+    assert.equal((await host.entry(conversationId)).eligible, false, '对比：按默认 Agent 判定会拒绝');
+    assert.equal(await host.runner.manualCompressionExecutorAgentId(conversationId), 'agent-other');
+    const [head] = await rows(host.app, 'ConversationContextHeadLink', { conversation_id: conversationId });
+    const outcome = await host.runner.manualCompression({ commandId: 'h2-compress', conversationId, compressSegmentCount: 1,
+      target: { kind: 'current_head', expectedRootId: head.root_id } });
+    const maintenance = (await rows(host.app, 'Turn', { conversation_id: conversationId })).find((r) => r.id !== first.turnId);
+    assert.equal(maintenance?.id, outcome.turnId);
+    assert.equal(maintenance.status, 'terminated');
+    const [snapshot] = await rows(host.app, 'AuthoritySnapshot', { turn_id: maintenance.id });
+    const document = (await readFrozenTurnAuthority(host.app.database, host.app.contentStore, snapshot.id, maintenance.id)).document;
+    assert.equal(frozenWorkEnvironmentPolicy(document).defaultWorkEnvironmentId, CHOSEN.id, '入口批准的正是维护 Turn 冻结的环境');
+  } finally {
+    await host?.close();
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('复审 X16：重试与编辑后运行按单条消息指定的 Agent 判定入口', { timeout: 60_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('retry-agent');
+  let host;
+  try {
+    host = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_TWO], label: 'retry' });
+    const judged = [];
+    host.runner.setEntryEligibility(async (conversationId, options) => { judged.push(options); return 'ineligible'; });
+    const reject = (promise) => assert.rejects(promise, (error) => isConversationHostIneligibleError(error));
+    await reject(host.runner.retry({ commandId: 'r', conversationId: 'c', sourceTurnId: 't', target: { kind: 'turn' }, agentId: ' agent-other ' }));
+    await reject(host.runner.editAndRun({ commandId: 'e', conversationId: 'c', messageId: 'm', expectedRevisionId: 'v', text: 'x', agentId: 'agent-edit' }));
+    await reject(host.runner.retry({ commandId: 'r2', conversationId: 'c', sourceTurnId: 't', target: { kind: 'turn' } }));
+    assert.deepEqual(judged, [{ executorAgentId: 'agent-other' }, { executorAgentId: 'agent-edit' }, {}]);
+  } finally {
+    await host?.close();
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('复审 X7/X8：维护 Turn 准入后驱动因资格未知被挡：手动压缩返回错误并以失败收尾；期间排队的消息随后被准入', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('x7-unknown');
+  let host;
+  try {
+    const conversationId = 'conversation-x7';
+    const provider = scriptedProvider([{ role: 'model', parts: [{ text: '第一轮回答。' }] }, { role: 'model', parts: [{ text: '排队消息的回答' }] }]);
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'x7' });
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    const first = await host.runner.input({ commandId: 'x7-1', conversationId, text: '第一条' });
+    await eventually(async () => (await rows(host.app, 'Turn', { id: first.turnId }))[0]?.status === 'terminated', 30_000, '第一个 Turn 未结束');
+    await host.runner.waitForIdle();
+    host.runner.setEntryEligibility(async () => 'eligible');
+    // Right after the maintenance Turn is admitted: a message is queued behind it (its admission finds the
+    // Turn active), then this window's probe starts failing before the drive claims.
+    const admit = host.app.turns.runtimeContinuation.bind(host.app.turns);
+    let queued = false;
+    host.app.turns.runtimeContinuation = async (command) => {
+      const result = await admit(command);
+      if (command.maintenance && !queued) {
+        queued = true;
+        await host.runner.input({ commandId: 'x7-queued', conversationId, text: '压缩期间排队' });
+        await eventually(async () => host.runner.admissions.size === 0, 10_000, '排队消息的准入尝试未结束');
+        host.failProbe = true;
+      }
+      return result;
+    };
+    const [head] = await rows(host.app, 'ConversationContextHeadLink', { conversation_id: conversationId });
+    await assert.rejects(host.runner.manualCompression({ commandId: 'x7-compress', conversationId, compressSegmentCount: 1,
+      target: { kind: 'current_head', expectedRootId: head.root_id } }),
+    (error) => isConversationHostIneligibleError(error) && error.eligibility === 'unknown');
+    const maintenance = (await rows(host.app, 'Turn', { conversation_id: conversationId }))
+      .find((r) => r.id !== first.turnId && (r.status === 'terminated' || r.status === 'active'));
+    const terminations = await rows(host.app, 'TurnTermination', {});
+    assert.ok(queued, '排队消息已写入');
+    assert.equal(terminations.some((row) => row.terminal_status === 'failed' && row.reason === 'manual_context_compression_not_served_here'), true,
+      '维护 Turn 以失败收尾');
+    assert.ok(maintenance);
+    assert.equal(provider.calls, 1, '没有发起压缩请求');
+    host.failProbe = false;
+    await eventually(async () => provider.calls === 2, 15_000, '维护 Turn 收尾后排队消息没有被准入');
+  } finally {
+    await host?.close();
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('复审 X11/X12：维护 Turn 的环境预览出错时手动压缩报错且不留下活动 Turn；重建摘要估算用的维护权限同样换成本窗口的环境', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('x11-preview');
+  let origin; let host;
+  try {
+    const conversationId = 'conversation-x11';
+    origin = await openHost(dataRoot, scriptedProvider([{ role: 'model', parts: [{ text: '第一轮回答。' }] }]), {
+      folders: [PROJECT_TWO], label: 'origin', frozen: PROJECT_TWO_ENV,
+      environments: [{ id: PROJECT_TWO_ENV, name: '项目二', displayPath: '/workspace/project-two', available: true }]
+    });
+    await createConversation(origin.app, conversationId, PROJECT_TWO_FOLDER);
+    const first = await origin.runner.input({ commandId: 'x11-1', conversationId, text: '第一条' });
+    await eventually(async () => (await rows(origin.app, 'Turn', { id: first.turnId }))[0]?.status === 'terminated', 30_000, '第一个 Turn 未结束');
+    await origin.close(); origin = undefined;
+
+    const provider = scriptedProvider([]);
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_ONE], label: 'x11', frozen: CHOSEN.id, selected: CHOSEN.id, environments: [CHOSEN] });
+    const authority = await host.app.turns.previewMaintenanceAuthority(conversationId, first.turnId);
+    assert.deepEqual(frozenWorkEnvironmentPolicy(authority), { enabled: false, allowedWorkEnvironmentIds: [CHOSEN.id], defaultWorkEnvironmentId: CHOSEN.id },
+      '估算的维护权限换成本窗口所选环境');
+    assert.equal(authority.model.modelId, 'placement-model', '其余权限继承源 Turn');
+    // The chosen work environment disappears after the entry approved the command.
+    host.runner.setEntryEligibility(async () => 'eligible');
+    host.environments.splice(0);
+    const [head] = await rows(host.app, 'ConversationContextHeadLink', { conversation_id: conversationId });
+    await assert.rejects(host.runner.manualCompression({ commandId: 'x11-compress', conversationId, compressSegmentCount: 1,
+      target: { kind: 'current_head', expectedRootId: head.root_id } }), /当前窗口的工作环境不可用/);
+    assert.deepEqual((await rows(host.app, 'Turn', { conversation_id: conversationId })).map((r) => r.status), ['terminated'], '没有维护 Turn');
+    assert.equal(provider.calls, 0);
+  } finally {
+    await origin?.close();
+    await host?.close();
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('复审 X4/X5/X6：准入被 busy 挡下后按退避重试并在成功后清掉退避；判为不合格时清掉条目；dispose 清掉等待中的重试', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('x4-busy');
+  let host;
+  try {
+    const provider = gatedProvider();
+    const gates = new Map();
+    provider.gate = (call) => { let open; gates.set(call, { promise: new Promise((resolve) => { open = resolve; }), open }); };
+    provider.release = ((releaseFirst) => (call) => call ? gates.get(call).open() : releaseFirst())(provider.release);
+    const send = provider.sendFullRequest.bind(provider);
+    provider.sendFullRequest = async (request, controls) => {
+      const gate = gates.get(provider.calls + 1);
+      if (gate) await gate.promise;
+      return send(request, controls);
+    };
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'x4' });
+    const conversationId = 'conversation-x4';
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    const owners = host.app.database.conversationOwners;
+    const tryClaimEligible = owners.tryClaimEligible.bind(owners);
+    let forced;
+    owners.tryClaimEligible = async (id) => forced ?? tryClaimEligible(id);
+    const first = await host.runner.input({ commandId: 'x4-1', conversationId, text: '第一条' });
+    await provider.started;
+    await host.runner.input({ commandId: 'x4-2', conversationId, text: '第二条（排队）' });
+    // Another live window holds the Conversation when the queue drains.
+    forced = 'busy';
+    provider.release();
+    await eventually(async () => (await rows(host.app, 'Turn', { id: first.turnId }))[0]?.status === 'terminated', 30_000, '第一个 Turn 未结束');
+    await eventually(async () => host.runner.admissionRetries.has(conversationId), 10_000, 'busy 后没有安排重试');
+    await sleep(200);
+    assert.equal(provider.calls, 1);
+    forced = undefined;
+    await eventually(async () => provider.calls === 2, 10_000, 'busy 解除后排队消息没有被重试准入');
+    await host.runner.waitForIdle();
+    assert.equal(host.runner.admissionRetries.has(conversationId), false, '准入成功后清掉退避');
+
+    // An unknown answer schedules a retry; an ineligible one waits for a rescan and drops the entry.
+    provider.gate(3);
+    const third = await host.runner.input({ commandId: 'x4-3', conversationId, text: '第三条' });
+    assert.equal(third.admitted, true);
+    await host.runner.input({ commandId: 'x4-4', conversationId, text: '第四条（排队）' });
+    forced = 'unknown';
+    provider.release(3);
+    await eventually(async () => (await rows(host.app, 'Turn', { id: third.turnId }))[0]?.status === 'terminated', 30_000, '第三个 Turn 未结束');
+    await eventually(async () => host.runner.admissionRetries.get(conversationId)?.timer !== undefined, 10_000, 'unknown 后没有安排重试');
+    clearTimeout(host.runner.admissionRetries.get(conversationId).timer);
+    host.runner.admissionRetries.get(conversationId).timer = undefined;
+    forced = 'ineligible';
+    host.runner.scheduleAdmission(conversationId);
+    await eventually(async () => !host.runner.admissionRetries.has(conversationId), 10_000, '判为不合格后仍留着退避条目');
+    forced = 'busy';
+    host.runner.scheduleAdmission(conversationId);
+    await eventually(async () => host.runner.admissionRetries.get(conversationId)?.timer !== undefined, 10_000, 'busy 后没有安排重试');
+    host.runner.dispose();
+    assert.equal(host.runner.admissionRetries.size, 0, 'dispose 清掉等待中的重试');
+    assert.equal(provider.calls, 3, '排队的第四条没有在本窗口被准入');
+  } finally {
+    await host?.close();
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('复审 X3：等待中的 Turn 所在窗口移除项目文件夹后，别的窗口回答触发的外部唤醒路径同样交还执行租约，合格窗口续跑（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('x3-external');
+  let w2; let child;
+  try {
+    const conversationId = 'conversation-x3';
+    const files = workerFiles(outer, 'w1');
+    child = spawnWorker(dataRoot, 'x3-w1', { ...files.env, LIMCODE_PLACEMENT_CONVERSATION: conversationId });
+    const w1 = await waitForWorkerJson(child, files.ready, 90_000);
+    assert.equal(w1.leaseOnW1, true, '移除文件夹但还没有重扫：租约仍在 W1');
+    const provider2 = scriptedProvider([{ role: 'model', parts: [{ text: '按回答继续。' }] }]);
+    w2 = await openHost(dataRoot, provider2, { folders: [PROJECT_TWO], label: 'w2', askUser: true });
+    const [request] = await rows(w2.app, 'InteractionRequest', { status: 'pending' });
+    // W1 hands the Conversation back on its idle sweep (it no longer serves it); then W2 records the answer.
+    await eventually(async () => w2.app.database.conversationOwners.run(conversationId, () => w2.app.interactions.resolveAskUser({
+      source: { kind: 'command', key: 'x3-answer' }, requestId: request.id,
+      response: { answer: { selectedOptionIndexes: [0], customText: '' } }, cancelled: false
+    })).then(() => true, () => false), 30_000, 'W2 无法记录回答');
+    await eventually(async () => (await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId }))[0]?.host_boot_id !== w1.hostBootId,
+      30_000, 'W1 看到外部回答后没有交还执行租约');
+    w2.runner.resume(conversationId, w1.turnId);
+    await eventually(async () => (await rows(w2.app, 'Turn', { id: w1.turnId }))[0]?.status === 'terminated', 30_000, '合格窗口没有续跑');
+    assert.equal(provider2.calls, 1);
+    assert.equal(child.exitCode, null, 'W1 仍存活');
+    await fs.writeFile(files.finish, 'finish\n', 'utf8');
+    await waitForExit(child, 90_000, true);
+  } finally {
+    await w2?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('复审 X9：控制类认领已提交但随后出错时交还租约，不把别的窗口挡在外面', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('x9-claim');
+  let origin; let p1;
+  try {
+    const conversationId = 'conversation-x9';
+    origin = await openHost(dataRoot, scriptedProvider([{ role: 'model', parts: [{ id: 'ask', functionCall: {
+      name: 'ask_user', args: { question: '继续吗？', options: [{ label: '继续' }] } } }] }]), { folders: [PROJECT_TWO], label: 'origin', askUser: true });
+    await createConversation(origin.app, conversationId, PROJECT_TWO_FOLDER);
+    const { turnId } = await origin.runner.input({ commandId: 'x9', conversationId, text: '问我' });
+    await eventually(async () => (await rows(origin.app, 'InteractionRequest', { status: 'pending' })).length === 1, 30_000, '未进入等待');
+    await origin.runner.waitForIdle();
+    await origin.close(); origin = undefined;
+
+    // A window that does not serve the Conversation settles the user's stop without executing it.
+    p1 = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_ONE], label: 'p1', askUser: true });
+    const claim = p1.app.turns.claimRecoveryExecution.bind(p1.app.turns);
+    let injected = 0;
+    p1.app.turns.claimRecoveryExecution = async (input) => {
+      await claim(input);
+      injected += 1;
+      throw new Error('认领已提交后读取失败（注入）');
+    };
+    const [lease] = await rows(p1.app, 'ExecutionLease', { turn_id: turnId });
+    await p1.runner.interrupt({ commandId: 'x9-stop', conversationId, turnId, expectedLeaseGeneration: String(lease.generation), reason: '用户停止' });
+    assert.ok(injected >= 1, '控制类认领被调用');
+    const [after] = await rows(p1.app, 'ExecutionLease', { turn_id: turnId });
+    assert.ok(after, '租约仍在');
+    assert.notEqual(after.host_boot_id, p1.app.database.hostBootId, '出错后本窗口不继续持有租约');
+    assert.equal((await rows(p1.app, 'Turn', { id: turnId }))[0]?.status, 'active');
+    assert.equal(p1.owns(conversationId), false);
+  } finally {
+    await origin?.close();
+    await p1?.close();
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 }
 
 async function runWorker(mode) {
   const dataRoot = requiredEnv('LIMCODE_PLACEMENT_DATA_ROOT');
   const conversationId = requiredEnv('LIMCODE_PLACEMENT_CONVERSATION');
-  if (mode !== 'r5-w1') throw new Error(`Unknown worker ${mode}`);
+  if (mode !== 'r5-w1' && mode !== 'x3-w1') throw new Error(`Unknown worker ${mode}`);
   const host = await openHost(dataRoot, scriptedProvider([{ role: 'model', parts: [{ id: 'ask', functionCall: {
     name: 'ask_user', args: { question: '继续吗？', options: [{ label: '继续' }] } } }] }]), { folders: [PROJECT_TWO], label: 'w1', askUser: true });
   try {
@@ -377,7 +639,10 @@ async function runWorker(mode) {
     await host.runner.waitForIdle();
     // 用户在 W1 移除了项目文件夹（W1 窗口仍开着）。
     host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
-    await host.runner.rescan();
+    // x3: no rescan; the window's idle sweep (any local commit runs one) hands the Conversation back,
+    // and the external wake path (another window's answer) notices the rest.
+    if (mode === 'r5-w1') await host.runner.rescan();
+    else await host.app.database.conversationOwners.sweepIdle();
     const [lease] = await rows(host.app, 'ExecutionLease', { turn_id: turnId });
     await writeJson(requiredEnv('LIMCODE_PLACEMENT_READY'), { turnId, hostBootId: host.app.database.hostBootId,
       ownsAfterRescan: host.owns(conversationId), leaseOnW1: lease?.host_boot_id === host.app.database.hostBootId,

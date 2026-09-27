@@ -572,7 +572,39 @@ test('停止时工具仍在另一个存活窗口执行：面板停止提示去�
   assert.deepEqual(interrupts, ['turn']);
   assert.deepEqual(posted.map((message) => message.payload.status), ['accepted']);
   assert.deepEqual(informationMessages, [
-    `${EXTENSION_BRAND}：停止请求已记录。这个对话的工具仍在另一个窗口中执行，请到该窗口查看停止结果。`
+    `${EXTENSION_BRAND}：停止请求已记录。这个对话的工具或正在启动的子 Agent 仍在另一个窗口中执行，请到该窗口查看停止结果；子 Agent 启动完成后也可以在那里停止它。`
+  ]);
+});
+
+test('面板入口按将执行它的 Agent 判定：单条消息指定的 Agent；手动压缩用源 Turn 的执行 Agent', async () => {
+  const judged = [];
+  const refused = { eligible: false, reason: 'next_work_environment_unavailable', message: '当前窗口的工作环境不可用。' };
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
+    toolHost: { setStateChangeListener() {} },
+    application: { database: { conversationOwners: { async run(_conversationId, operation) { return operation(); } } } },
+    conversations: {
+      async manualCompressionExecutorAgentId(conversationId, childExecutionId) {
+        judged.push(['source-executor', conversationId, childExecutionId]);
+        return 'agent-source';
+      }
+    },
+    async conversationEntryEligibility(conversationId, options) {
+      judged.push(['entry', conversationId, options]);
+      return refused;
+    }
+  });
+  router.list = async () => [];
+  const command = { commandId: 'c', expectedVersion: 0, issuedAt: Date.now() };
+  await assert.rejects(router.handleTurnInput(webview([]), 'start', BridgeMessageType.TurnStart,
+    { conversationId: 'conversation', command, text: '你好', agentId: ' agent-other ' }), (error) => error?.code === 'conversation-host-ineligible');
+  await assert.rejects(router.handleCompressionStart(webview([]), 'compress', {
+    conversationId: 'conversation', command, target: { kind: 'current_head', expectedRootId: 'root' }
+  }), (error) => error?.code === 'conversation-host-ineligible');
+  assert.deepEqual(judged, [
+    ['entry', 'conversation', { executorAgentId: 'agent-other' }],
+    ['source-executor', 'conversation', undefined],
+    ['entry', 'conversation', { executorAgentId: 'agent-source' }]
   ]);
 });
 

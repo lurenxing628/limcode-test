@@ -465,7 +465,7 @@ export class ReliableConversationRunner {
     sourceReplay?: 'immutable_provenance';
   }): Promise<ReliableManualCompressionResult> {
     this.requireOpen();
-    await this.requireExecutionHost(input.conversationId);
+    await this.requireExecutionHost(input.conversationId, await this.manualCompressionEntry(input.conversationId));
     return this.conversationOwners.run(input.conversationId, async () => {
       const replay = await this.inspectManualCompression({
         commandId: input.commandId,
@@ -516,7 +516,10 @@ export class ReliableConversationRunner {
     };
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    await this.requireExecutionHost(input.conversationId);
+    await this.requireExecutionHost(
+      input.conversationId,
+      await this.manualCompressionEntry(input.conversationId, input.childExecution?.childExecutionId)
+    );
     const sourceReplay = parseManualCompressionSourceReplay(input.sourceReplay, input.target);
     return this.conversationOwners.run(input.conversationId, async () => {
       if (sourceReplay) {
@@ -615,6 +618,26 @@ export class ReliableConversationRunner {
     await this.conversationOwners.assertOwned(slot.conversationId);
     const frozen = await this.readManualCompressionDrive(slot);
     return frozen ? this.driveManualCompression(slot, frozen) : null;
+  }
+
+  /**
+   * The Agent that executes a manual compression's maintenance Turn: its source Turn's executor
+   * (the maintenance Turn inherits that authority and freezes the work environment that Agent's
+   * next Turn would use here), or the Conversation's default Agent without a source Turn. The entry
+   * decision uses the same Agent, so it approves exactly the work environment the Turn freezes.
+   */
+  public async manualCompressionExecutorAgentId(
+    conversationId: string,
+    childExecutionId?: string
+  ): Promise<string | undefined> {
+    const sourceTurnId = await this.manualCompressionSourceTurn(conversationId, childExecutionId);
+    if (!sourceTurnId) return undefined;
+    const [executor] = await listAllDomainRows(this.application.database, 'TurnExecutorLink', { turn_id: sourceTurnId });
+    return requireId(executor?.agent_id, 'TurnExecutorLink.agent_id');
+  }
+
+  private async manualCompressionEntry(conversationId: string, childExecutionId?: string): Promise<ConversationEntryOptions> {
+    return executorOption(await this.manualCompressionExecutorAgentId(conversationId, childExecutionId));
   }
 
   /**
@@ -2349,7 +2372,8 @@ export class ReliableConversationRunner {
       task: Promise.resolve()
     };
     const task = this.runOwnedAdmissionSlot(slot)
-      .catch((error) => this.onError(error, { operation: 'admit-next', conversationId }))
+      // After dispose the database closes under an admission still in flight; its error is expected.
+      .catch((error) => { if (!this.disposed) this.onError(error, { operation: 'admit-next', conversationId }); })
       .finally(() => this.finishAdmissionSlot(slot));
     slot.task = task;
     this.admissions.set(conversationId, slot);
@@ -2372,6 +2396,7 @@ export class ReliableConversationRunner {
       slot.completedGeneration = slot.requestedGeneration;
       if (claim !== 'busy') await this.conversationOwners.releaseIfIdle(slot.conversationId);
       if (claim !== 'ineligible') await this.retryAdmissionLater(slot.conversationId);
+      else this.clearAdmissionRetry(slot.conversationId);
       return;
     }
     this.clearAdmissionRetry(slot.conversationId);

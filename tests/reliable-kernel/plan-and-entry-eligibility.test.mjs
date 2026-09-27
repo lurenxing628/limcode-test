@@ -121,7 +121,20 @@ test('复审 #2：项目文件夹移动后，空闲对话在本窗口选择工�
     f.releaseSend();
     const result = await running;
     assert.equal(result.terminalStatus, 'completed');
-    assert.equal((await f.frozen(result.turnId)).document.workEnvironmentPolicy.defaultWorkEnvironmentId, environment.id);
+    const frozenPolicy = (await f.frozen(result.turnId)).document.workEnvironmentPolicy;
+    assert.equal(frozenPolicy.defaultWorkEnvironmentId, environment.id);
+    assert.ok(frozenPolicy.allowedWorkEnvironmentIds.includes(environment.id));
+    // A maintenance Turn (manual compression) freezes the real preview's policy for this window: the
+    // same policy compile() froze for the ordinary Turn, not an approximation.
+    const maintenance = await f.app.turns.previewMaintenanceAuthority('parent', result.turnId);
+    assert.deepEqual(maintenance.workEnvironmentPolicy, frozenPolicy);
+    // Once the chosen folder is gone, the real preview reports it and an idle Conversation is not served here.
+    await fs.rm(moved.fsPath, { recursive: true, force: true });
+    await f.configuration.synchronizeWorkspaceFolders([]);
+    assert.equal((await f.app.turns.previewNextTurnWorkEnvironment('parent')).error !== undefined, true);
+    assert.deepEqual(await evaluateConversationHostEligibility(dependencies, 'parent'), {
+      eligible: false, reason: 'project_not_open', projectUri: oldProject.uri, projectName: 'project-old'
+    });
   }, {
     async send(_request, controls, f) {
       await new Promise((resolve) => { f.releaseSend = resolve; });
