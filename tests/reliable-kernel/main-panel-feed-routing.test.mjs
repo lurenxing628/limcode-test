@@ -86,7 +86,12 @@ test('MainPanel 把协作历史请求和所有 Feed 控制消息交给可靠 Fee
     handleWebviewMessage(_clientId, message) { commands.push(message.type); }
   };
   try {
-    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(process.cwd()) }, { wait: async () => facade });
+    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(process.cwd()) }, {
+      wait: async () => facade,
+      // Like ApplicationStartup: nothing holds the data directory, so the shell shows no waiting reason.
+      waiting: () => undefined,
+      onDidChangeWaiting: () => ({ dispose() {} })
+    });
     await registeredSerializer.deserializeWebviewPanel(panel, { conversationId: 'conversation' });
     assert.equal(typeof receive, 'function', 'the restored chat panel must listen for Webview messages');
 

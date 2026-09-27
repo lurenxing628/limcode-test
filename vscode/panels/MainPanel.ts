@@ -69,7 +69,7 @@ export class MainPanel {
           let disposed = false;
           const startupDispose = webviewPanel.onDidDispose(() => { disposed = true; });
           MainPanel.renderInitializing(webviewPanel, serialized, startup.waiting());
-          // While another window holds the data directory, the shell says why and for how long.
+          // While another window holds the data directory, the shell says why (the stage, no seconds).
           const waiting = startup.onDidChangeWaiting((status) => {
             if (!disposed) MainPanel.renderInitializing(webviewPanel, serialized, status);
           });

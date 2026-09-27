@@ -64,9 +64,7 @@ test('另一宿主主持对话时，恢复面板仍可查看已提交事实，�
         return fixture.owner.run(id, async () => {}).finally(finishRecovery);
       }
     });
-    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(fixture.directory) }, {
-      wait: async () => facade
-    });
+    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(fixture.directory) }, startupOf(async () => facade));
     await registeredSerializer.deserializeWebviewPanel(panel, { conversationId: 'restored-conversation' });
     await recoverySettled;
     assert.deepEqual([...attachedClients], ['restored-client']);
@@ -131,9 +129,7 @@ for (const failureStage of ['attach', 'render']) {
         },
         detachWebview(id) { attachedClients.delete(id); }
       });
-      MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(fixture.directory) }, {
-        wait: async () => facade
-      });
+      MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(fixture.directory) }, startupOf(async () => facade));
       await registeredSerializer.deserializeWebviewPanel(panel, { conversationId: `failed-${failureStage}` });
       assert.equal(attachedClients.size, 0, '失败后必须清理 Feed 连接');
       assert.equal(recoveryAttempted, false, '面板初始化失败不应启动运行恢复');
@@ -156,9 +152,7 @@ test('恢复排队时面板已关闭，不建立 Feed 或恢复会话', { timeou
       recoverConversation() { recovered = true; return Promise.resolve(); },
       attachWebview() { assert.fail('已关闭的面板不得建立 Feed'); }
     });
-    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(fixture.directory) }, {
-      wait: async () => { await gate; return facade; }
-    });
+    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(fixture.directory) }, startupOf(async () => { await gate; return facade; }));
     const restoration = registeredSerializer.deserializeWebviewPanel(panel, { conversationId: 'restored-conversation' });
     panel.dispose();
     resumeStartup();
@@ -171,6 +165,11 @@ test('恢复排队时面板已关闭，不建立 Feed 或恢复会话', { timeou
     await fixture.close();
   }
 });
+
+/** The ApplicationStartup the serializer gets: nothing holds the data directory, so no waiting reason. */
+function startupOf(wait) {
+  return { wait, waiting: () => undefined, onDidChangeWaiting: () => ({ dispose() {} }) };
+}
 
 function createFacade(overrides = {}) {
   return {
