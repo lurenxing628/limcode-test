@@ -418,7 +418,7 @@ async function start(): Promise<void> {
       if (request.kind === 'countDomainRows') {
         assertDatabaseBinding(reader, data.binding);
         const count = reader.transaction(() => RUNTIME_DOMAIN_SCHEMAS.reduce((rows, schema) =>
-          rows + Number(reader.prepare(`SELECT COUNT(*) FROM "${schema.table.replace(/"/g, '""')}"`).pluck().get() as bigint | number), 0));
+          rows + Number(prepareCached(reader, `SELECT COUNT(*) FROM "${schema.table.replace(/"/g, '""')}"`, { rows: 'pluck' }).get() as bigint | number), 0));
         respond({ type: 'response', id: request.id, ok: true, result: String(count()) });
         return;
       }
