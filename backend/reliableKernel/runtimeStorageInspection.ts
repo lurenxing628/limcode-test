@@ -42,7 +42,11 @@ type StoragePaths = { globalStoragePath: string };
 const CATEGORIES: readonly RuntimeStorageCategory[] = [
   'sqlite', 'cas', 'casTemporary', 'processSpool', 'diagnostics', 'other', 'historicalBackups'
 ];
-/** Complete control roots archived by VscodeReliableKernelCutoverCoordinator live beside the active control root. */
+/**
+ * Complete control roots archived by VscodeReliableKernelCutoverCoordinator live beside the active
+ * control root. They are not part of the scope's data set: its storage inspection does not count them
+ * and deleting it keeps them.
+ */
 const RUNTIME_SCOPE_BACKUPS_DIRECTORY = '.limcode-runtime-backups';
 
 /** Explicit command only. Walk actual files once, never sum duplicate ContentObject metadata. */
@@ -55,12 +59,13 @@ export async function inspectRuntimeDataSetStorage(
   const categories = Object.fromEntries(CATEGORIES.map((key) => [key, { fileCount: 0, bytes: '0' }])) as
     Record<RuntimeStorageCategory, RuntimeStorageSize>;
   const total: RuntimeStorageSize = { fileCount: 0, bytes: '0' };
-  for (const tree of await runtimeDataSetTrees(candidate)) {
+  const { trees, excluded } = await runtimeDataSetTrees(candidate);
+  for (const tree of trees) {
     await walkRuntimeDataSetFiles(tree, async (filePath, size) => {
       const category = classifyStoragePath(candidate, filePath);
       addSize(categories[category], size);
       addSize(total, size);
-    });
+    }, excluded);
   }
   // Do not present a scan of a replaced/deleted root as this candidate's current usage.
   const current = await resolveVscodeRuntimeDataSet(paths, candidateId);
@@ -106,19 +111,21 @@ export async function deleteUnselectedRuntimeDataSet(
       // Identity must also be present in the actual SQLite file, not only in adjacent JSON files.
       const snapshot = await createRuntimeDataSetDatabaseSnapshot(current, currentBinding);
       await snapshot.close();
-      const trees = await runtimeDataSetTrees(current);
+      const { trees, excluded } = await runtimeDataSetTrees(current);
       const maintenancePath = runtimeMaintenanceClaimPath(binding.paths);
       const deleted: RuntimeStorageSize = { fileCount: 0, bytes: '0' };
-      // Validate every tree before deleting any. For default roots, delete backups first so a
-      // backup cleanup failure leaves the complete active candidate available for a retry.
-      for (const tree of trees) await walkRuntimeDataSetFiles(tree, async (_filePath, size) => addSize(deleted, size), maintenancePath);
+      // Validate every tree before deleting any. Reset archives of the scope are never part of it:
+      // they stay.
+      for (const tree of trees) {
+        await walkRuntimeDataSetFiles(tree, async (_filePath, size) => addSize(deleted, size), [maintenancePath, ...excluded]);
+      }
       for (const tree of trees) {
         if (path.dirname(maintenancePath) === tree) {
           // The per-scope claim is a sibling of its control root, inside the workspace scope.
           // Keep our claim alive through all deletions; its finally block releases it normally.
           for (const entry of await fs.readdir(tree)) {
             const entryPath = path.join(tree, entry);
-            if (entryPath !== maintenancePath) await fs.rm(entryPath, { recursive: true, force: false });
+            if (entryPath !== maintenancePath && !excluded.includes(entryPath)) await fs.rm(entryPath, { recursive: true, force: false });
           }
         } else await fs.rm(tree, { recursive: true, force: false });
       }
@@ -128,7 +135,16 @@ export async function deleteUnselectedRuntimeDataSet(
     // Finish deleting this already-confirmed scope only after release, while configuration
     // admission still excludes new Hosts. Never recursively remove the shared configuration root.
     if (!isSamePath(candidate.runtimeScopeRootPath, configurationRootPath)) {
-      await fs.rm(candidate.runtimeScopeRootPath, { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
+      const archives = path.join(candidate.runtimeScopeRootPath, RUNTIME_SCOPE_BACKUPS_DIRECTORY);
+      if (!await exists(archives)) {
+        await fs.rm(candidate.runtimeScopeRootPath, { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
+      } else {
+        // The scope keeps only its reset archives; enumeration no longer counts it as a data set.
+        for (const entry of await fs.readdir(candidate.runtimeScopeRootPath)) {
+          if (entry === RUNTIME_SCOPE_BACKUPS_DIRECTORY) continue;
+          await fs.rm(path.join(candidate.runtimeScopeRootPath, entry), { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
+        }
+      }
     }
     return result;
   });
@@ -268,7 +284,7 @@ export async function requireCompleteRuntimeDataSet(
   return binding;
 }
 
-async function runtimeDataSetTrees(candidate: VscodeRuntimeDataSetCandidate): Promise<string[]> {
+async function runtimeDataSetTrees(candidate: VscodeRuntimeDataSetCandidate): Promise<{ trees: string[]; excluded: string[] }> {
   const configuration = path.resolve(candidate.configurationRootPath);
   const scope = path.resolve(candidate.runtimeScopeRootPath);
   // A default/legacy scope shares the configuration root. Never delete or count that whole root.
@@ -282,18 +298,20 @@ async function runtimeDataSetTrees(candidate: VscodeRuntimeDataSetCandidate): Pr
     await assertNoSymbolicPath(configuration, backups);
     if (!(await fs.lstat(backups)).isDirectory()) throw new Error('Runtime scope backups must be a directory.');
   }
-  // Workspace scopes already include their sibling backup directory in the one complete tree.
-  return scope === configuration && hasBackups ? [backups, tree] : [tree];
+  // A workspace scope is one tree that also holds the archives directory; it is walked around.
+  return { trees: [tree], excluded: scope === configuration || !hasBackups ? [] : [backups] };
 }
 
 function classifyStoragePath(candidate: VscodeRuntimeDataSetCandidate, filePath: string): RuntimeStorageCategory {
-  const scopeRelative = path.relative(candidate.runtimeScopeRootPath, filePath).split(path.sep);
-  if (scopeRelative[0] === RUNTIME_SCOPE_BACKUPS_DIRECTORY) return 'historicalBackups';
   const control = path.join(candidate.runtimeScopeRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY);
+  return classifyControlRootPath(control, candidate.runtimeDataRootPath, filePath);
+}
+
+function classifyControlRootPath(control: string, dataRootPath: string, filePath: string): RuntimeStorageCategory {
   const controlRelative = path.relative(control, filePath).split(path.sep);
   if (controlRelative[0] === 'backups' || controlRelative[0] === 'epoch-migration-backups'
     || controlRelative[0] === 'merge-backups' || controlRelative[0] === 'merge-source-backups') return 'historicalBackups';
-  const relative = path.relative(candidate.runtimeDataRootPath, filePath).split(path.sep);
+  const relative = path.relative(dataRootPath, filePath).split(path.sep);
   if (relative.length === 1 && ['limcode.sqlite', 'limcode.sqlite-wal', 'limcode.sqlite-shm', 'limcode.sqlite-journal'].includes(relative[0])) return 'sqlite';
   if (relative[0] === 'cas') return relative[1] === 'tmp' ? 'casTemporary' : 'cas';
   if (relative[0] === 'process-spool') return 'processSpool';
@@ -304,12 +322,12 @@ function classifyStoragePath(candidate: VscodeRuntimeDataSetCandidate, filePath:
 async function walkRuntimeDataSetFiles(
   root: string,
   consume: (filePath: string, bytes: bigint) => Promise<void>,
-  excludedRoot?: string
+  excludedRoots: readonly string[] = []
 ): Promise<void> {
   const queue = [root];
   while (queue.length > 0) {
     const current = queue.pop()!;
-    if (current === excludedRoot) continue;
+    if (excludedRoots.includes(current)) continue;
     const stat = await fs.lstat(current, { bigint: true });
     if (stat.isSymbolicLink()) throw new Error(`Runtime inspection refuses symbolic links: ${current}`);
     if (stat.isFile()) await consume(current, stat.size);

@@ -278,7 +278,7 @@ for (const previousEpoch of [3, 4]) test(`epoch ${previousEpoch} 健康旧库与
   assert.deepEqual(await fs.readdir(failedRoot), []);
 }));
 
-test('reset归档后未重建的scope保留诊断与完整备份，不阻止自动选择健康旧库', async () => fixture(async (root, paths) => {
+test('reset归档后未重建的scope只剩归档：不算历史库也不算问题，完整备份原样保留，不阻止自动选择健康旧库', async () => fixture(async (root, paths) => {
   const healthy = await createRoot(root, 4);
   const resetScope = scope('reset-interrupted');
   const resetRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, resetScope);
@@ -291,7 +291,8 @@ test('reset归档后未重建的scope保留诊断与完整备份，不阻止自�
   const before = await fs.readFile(archivedPointer, 'utf8');
   const inspection = await inspectVscodeRuntimeDataSets(paths);
   assert.deepEqual(inspection.candidates.map(candidate => candidate.id), ['default']);
-  assert.equal(inspection.problems[0].id, `workspace:${resetScope.key}`);
+  assert.deepEqual(inspection.problems, [], '只剩归档的 scope 不是历史库');
+  assert.deepEqual((await listVscodeRuntimeDataSets(paths)).map(candidate => candidate.id), ['default']);
   assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'))).runtimeDataRootPath, healthy.paths.dataRootPath);
   assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('selected'))).runtimeDataRootPath, healthy.paths.dataRootPath);
   assert.equal(await fs.readFile(archivedPointer, 'utf8'), before);

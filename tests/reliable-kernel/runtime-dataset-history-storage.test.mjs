@@ -262,7 +262,7 @@ test('尚未确定当前数据集时允许只读历史但拒绝把未知当前�
 });
 
 for (const scopeKind of ['default', 'workspace']) {
-  test(`${scopeKind}真实reset归档计入历史备份，整库删除包含同scope多代备份且保留共享配置`, async (t) => {
+  test(`${scopeKind}真实reset归档不算本地库的一部分：统计不计入、整库删除保留归档，只剩归档的scope不再算库，共享配置保留`, async (t) => {
     const fixture = await createFixture(t);
     const target = scopeKind === 'default' ? fixture.current : fixture.old;
     const survivor = scopeKind === 'default' ? fixture.old : fixture.current;
@@ -274,8 +274,7 @@ for (const scopeKind of ['default', 'workspace']) {
     assert.equal(path.dirname(archived.backupPath), path.join(target.scopeRoot, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY));
     target.binding = await initialize(target.scopeRoot);
     assert.notEqual(target.binding.dataSetId, oldDataSetId);
-    const backupFiles = Object.values(await treeSnapshot(archived.backupPath));
-    const backupBytes = backupFiles.reduce((sum, file) => sum + BigInt(file.size), 0n);
+    const archiveBefore = await treeSnapshot(archived.backupPath);
     await selectVscodeRuntimeDataSet(fixture.paths, survivor.id);
     const keep = path.join(fixture.root, 'settings/keep.json');
     const unrelated = path.join(fixture.root, 'independent-backups/keep.bin');
@@ -283,12 +282,17 @@ for (const scopeKind of ['default', 'workspace']) {
       await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, 'keep');
     }
     const usage = await inspectRuntimeDataSetStorage(fixture.paths, target.id);
-    assert.deepEqual(usage.categories.historicalBackups, { fileCount: backupFiles.length, bytes: backupBytes.toString() });
+    assert.deepEqual(usage.categories.historicalBackups, { fileCount: 0, bytes: '0' }, '归档单独作为外来历史库统计');
     assert.equal(usage.archiveReclaimsBytes, false);
     const result = await deleteUnselectedRuntimeDataSet(fixture.paths, target.id, target.binding.dataSetId);
     assert.deepEqual(result.deleted, usage.total);
-    await assert.rejects(fs.stat(path.join(target.scopeRoot, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY)), { code: 'ENOENT' });
+    assert.deepEqual(await treeSnapshot(archived.backupPath), archiveBefore, '归档原样保留');
     await assert.rejects(fs.stat(target.binding.paths.databasePath), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(path.dirname(target.binding.paths.rootPointerPath)), { code: 'ENOENT' });
+    if (scopeKind === 'workspace') {
+      assert.deepEqual(await fs.readdir(target.scopeRoot), [VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY]);
+    }
+    assert.deepEqual((await listVscodeRuntimeDataSets(fixture.paths)).map((candidate) => candidate.id), [survivor.id]);
     assert.ok((await fs.stat(survivor.binding.paths.databasePath)).isFile());
     assert.equal(await fs.readFile(keep, 'utf8'), 'keep');
     assert.equal(await fs.readFile(unrelated, 'utf8'), 'keep');

@@ -191,6 +191,8 @@ test('deletion only offers other histories and cancellation performs no mutation
   assert.deepEqual(confirmed.calls.filter(call => call[0] === 'delete'), [['delete', 'workspace:old', 'old']]);
   assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /还没有合并到当前库.*删除后其中的对话会永久丢失/,
     '复审 merge3 #7：没有账本记录、从未合并的待合并来源也要警告');
+  assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /它的归档（归档并重置留下的 \.limcode-runtime-backups）会保留/,
+    '删除历史库不再连带删除归档，确认框写明');
 });
 
 test('read-only history is available without runtime startup and closes its snapshot on exit', async () => {

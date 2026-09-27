@@ -7,7 +7,9 @@ import { isPathInside } from '../capabilities/filesystem/pathContainment';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths } from './contracts';
 import { RootAuthority, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
 import { classifyRecordedProcess } from './runtimeClaimPrimitives';
-import { assertRuntimeHostsOffline, runtimeHostLivenessDirectory, withRuntimeDataRootAdmission } from './runtimeHostControl';
+import {
+  assertRuntimeHostsOffline, runtimeHostLivenessDirectory, runtimeMaintenanceClaimPath, withRuntimeDataRootAdmission
+} from './runtimeHostControl';
 import { CUTOVER_JOURNAL_FILE, physicalCutoverRecoveryRequired } from './physicalCutover';
 
 type VscodeStoragePaths = ReturnType<typeof createVscodeStoragePaths>;
@@ -22,6 +24,12 @@ export const VSCODE_RUNTIME_SELECTION_FILE = '.limcode-runtime-selection.json';
  * any of them, so deleting a merge target never makes its merged sources look unmerged.
  */
 export const VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY = '.limcode-runtime-merges';
+/**
+ * Reset archives of a scope (`<scope>/.limcode-runtime-backups/<time>-<id8>`, each a complete former
+ * control root). Never a data set of this configuration root: a scope that keeps only these is not
+ * enumerated.
+ */
+export const VSCODE_RUNTIME_ARCHIVES_DIRECTORY = '.limcode-runtime-backups';
 /** Written into a data set's own control root when the user switches the current data set away from it. */
 export const VSCODE_RUNTIME_DATA_SET_KEPT_FILE = 'kept-by-user.json';
 /**
@@ -527,6 +535,8 @@ async function inspectCandidates(
   try {
     await assertSafeRootPath(configurationRootPath, scopesRoot);
     for (const key of (await directoryEntryNames(scopesRoot)).sort()) {
+      // Its data set was deleted and only its archives remain (a selected id is still inspected below).
+      if (await keepsOnlyArchives(path.join(scopesRoot, key))) continue;
       entries.push({ id: `workspace:${key}`, runtimeScopeRootPath: path.join(scopesRoot, key) });
     }
   } catch (error) {
@@ -741,6 +751,21 @@ async function publishSelection(
     await fs.rm(temporary, { force: true });
   }
   return selection;
+}
+
+/**
+ * A workspace scope holding nothing but reset archives (and a leftover maintenance claim directory
+ * of its deleted data set). Anything else, or an unreadable scope, is judged as a candidate.
+ */
+async function keepsOnlyArchives(runtimeScopeRootPath: string): Promise<boolean> {
+  let names: string[];
+  try { names = await fs.readdir(runtimeScopeRootPath); }
+  catch { return false; }
+  const claim = path.basename(runtimeMaintenanceClaimPath(createRuntimeRootPaths(
+    resolveVscodeRuntimeDataRoot({ globalStoragePath: runtimeScopeRootPath })
+  )));
+  return names.includes(VSCODE_RUNTIME_ARCHIVES_DIRECTORY)
+    && names.every((name) => name === VSCODE_RUNTIME_ARCHIVES_DIRECTORY || name === claim);
 }
 
 /** Empty control/active directories are harmless; any actual entry requires an existing binding. */
