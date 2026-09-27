@@ -32,6 +32,8 @@ export interface DataRootRelocationHost {
   exclusiveMaintenanceTarget(): { paths: RuntimeRootPaths; hostBootId: string };
   dataRootPath(): string;
   withDataRootLocks<R>(body: () => Promise<R>): Promise<R>;
+  /** Stops this window from taking up new work; returns the undo. */
+  freezeNewWork(): () => void;
   closeRuntime(): Promise<void>;
   postToWebview(clientId: BridgeClientId, message: ExtensionToWebviewMessage): boolean;
 }
@@ -146,16 +148,20 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
     try {
       const outcome = await exclusively(host, {
         operation: 'data-root-relocation',
-        operationKey: `data-root-relocation:${plan.targetRootPath}`,
+        operationKey: `data-root-relocation:${plan.targetRootPath}#${relocationId}`,
         message: '为迁移数据目录',
         waitingTitle: '迁移数据目录：正在等待 LimCode 窗口空闲',
         configurationRootPath: plan.sourceRootPath
-      }, async () => {
+      }, async (stage) => {
         runtimeClosed = true;
+        stage('正在关闭本窗口的运行时');
         await host.closeRuntime();
-        return completeDataRootRelocation(staged, (publication) => publishRelocation(context, plan, relocationId, publication), {
-          onProgress, movedBy: installationOf(context)
-        });
+        // Windows waiting to open the old directory show the same stages (copy with batches, others, checks).
+        const report = (message: string): void => { onProgress(message); stage(message); };
+        return completeDataRootRelocation(staged, (publication) => {
+          report('正在切换到新数据目录');
+          return publishRelocation(context, plan, relocationId, publication);
+        }, { onProgress: report, movedBy: installationOf(context) });
       });
       if (outcome.state === 'completed') {
         result = outcome.result;
@@ -196,16 +202,18 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
 
 /**
  * The one coordinated call of the data-directory commands: waits (outside the locks, up to the
- * primitive's limit) for other windows and for this window's own work, asks the other windows to
- * reload with a countdown they cannot veto (the user confirmed here), then runs `operation` under
- * the configuration admission and the selected root's maintenance claim. This window's own work
- * is checked once more right before `operation` closes its Runtime; a new task started after the
- * confirmation is announced once (the move waits for it).
+ * primitive's limit) for other windows and for this window's own work, freezes this window before
+ * any other window is told to go (beforeGo: no new work is taken up; still busy sends the call back
+ * outside the locks), asks the other windows to reload with a countdown they cannot veto (the user
+ * confirmed here), then runs `operation` under the configuration admission and the selected root's
+ * maintenance claim. `operation` reports its stages to windows waiting to open. The key carries the
+ * attempt's own id: every call is an explicit user action, and a new attempt after fixing a cause
+ * is never held back by an earlier failure.
  */
 async function exclusively<T>(
   host: DataRootRelocationHost,
   input: { operation: string; operationKey: string; message: string; waitingTitle: string; configurationRootPath: string },
-  operation: () => Promise<T>
+  operation: (stage: (text: string) => void) => Promise<T>
 ): Promise<RuntimeExclusiveMaintenanceOutcome<T>> {
   const { paths, hostBootId } = host.exclusiveMaintenanceTarget();
   const ownWork = requesterWorkBusy(host);
@@ -222,16 +230,21 @@ async function exclusively<T>(
     ...input,
     requesterHostBootId: hostBootId,
     requesterBusy,
+    beforeGo: async () => {
+      const thaw = host.freezeNewWork();
+      const busy = await ownWork();
+      return busy ? { busy: { ...busy, reason: '本窗口在确认之后开始了新的任务' }, thaw } : { thaw };
+    },
     participantConfirmation: 'final-countdown',
     whenBusy: 'wait',
     ignoreBackoff: true,
     isCurrent: () => true,
     withLocks: (body) => host.withDataRootLocks(body)
-  }, async () => {
+  }, async ({ reportStage }) => {
     if (await host.hasOwnedExecution()) {
       throw new DataRootRelocationError('data-root-requester-busy', '本窗口在最后一刻开始了新的任务，本次没有进行；任务结束后可以再试。');
     }
-    return operation();
+    return operation((text) => reportStage(text));
   });
 }
 
@@ -295,12 +308,14 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     let failure: unknown;
     try {
       const outcome = await exclusively(host, {
-        operation: 'data-root-return', operationKey: `data-root-return:${previous}`, message: '为切换回旧数据目录',
+        operation: 'data-root-return', operationKey: `data-root-return:${previous}#${randomUUID()}`, message: '为切换回旧数据目录',
         waitingTitle: '回到旧目录：正在等待 LimCode 窗口空闲', configurationRootPath: host.dataRootPath()
-      }, async () => {
+      }, async (stage) => {
         runtimeClosed = true;
+        stage('正在关闭本窗口的运行时');
         await host.closeRuntime();
         await assertConfigurationRootRuntimesOffline(host.dataRootPath());
+        stage('正在切换回旧数据目录');
         await switchPointer();
       });
       if (outcome.state === 'completed') {
@@ -620,12 +635,14 @@ async function switchToMovedDataRoot(context: vscode.ExtensionContext, startup: 
   try {
     if (host) {
       const outcome = await exclusively(host, {
-        operation: 'data-root-follow', operationKey: `data-root-follow:${next}`, message: '为改用迁移后的数据目录',
+        operation: 'data-root-follow', operationKey: `data-root-follow:${next}#${randomUUID()}`, message: '为改用迁移后的数据目录',
         waitingTitle: '改用新目录：正在等待 LimCode 窗口空闲', configurationRootPath: host.dataRootPath()
-      }, async () => {
+      }, async (stage) => {
         runtimeClosed = true;
+        stage('正在关闭本窗口的运行时');
         await host.closeRuntime();
         await assertConfigurationRootRuntimesOffline(host.dataRootPath());
+        stage('正在切换数据目录');
         await pointTo(context, next, current);
       });
       if (outcome.state !== 'completed') throw new Error(outcome.reason);
@@ -726,6 +743,7 @@ async function pendingHost(startup: ApplicationStartup): Promise<DataRootRelocat
 
 function isHost(host: Partial<DataRootRelocationHost> | undefined): host is DataRootRelocationHost {
   return typeof host?.withDataRootLocks === 'function' && typeof host.closeRuntime === 'function' && typeof host.postToWebview === 'function'
+    && typeof host.freezeNewWork === 'function'
     && typeof host.hasOwnedExecution === 'function' && typeof host.exclusiveMaintenanceTarget === 'function' && !!host.product;
 }
 

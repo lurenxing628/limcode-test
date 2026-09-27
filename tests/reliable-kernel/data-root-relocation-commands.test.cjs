@@ -74,6 +74,7 @@ function fixture({
     dataRootPath() { return SOURCE; },
     async withDataRootLocks(body) { calls.push(['locks']); return body(); },
     async closeRuntime() { calls.push(['close-runtime']); if (closeError) throw closeError; },
+    freezeNewWork() { calls.push(['freeze']); return () => calls.push(['thaw']); },
     postToWebview() { return true; }
   } : undefined;
   const startup = {
@@ -183,8 +184,16 @@ function fixture({
       runWithExclusiveMaintenance: async (paths, options, operation) => {
         calls.push(['exclusive', options]);
         if (exclusive !== 'completed') return { state: exclusive, hosts: [], reason: '另一个窗口有任务正在进行' };
-        const result = await options.withLocks(operation);
-        return { state: 'completed', result, coordinated: true };
+        // Like the primitive: beforeGo once everything is ready, the operation under the locks, then the thaw.
+        const result = await options.withLocks(async () => {
+          const check = await options.beforeGo();
+          try {
+            if (check.busy) return { busy: check.busy };
+            return { value: await operation({ reportStage: (text) => calls.push(['report-stage', text]) }) };
+          } finally { await check.thaw?.(); }
+        });
+        if (result.busy) return { state: 'busy', hosts: [], reason: result.busy.reason };
+        return { state: 'completed', result: result.value, coordinated: true };
       }
     }
   };
@@ -204,13 +213,17 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
   const f = fixture({ answers: [{ choice: 'relocate', include: [] }] });
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
   assert.deepEqual(f.kinds(), [
-    'open-dialog', 'plan', 'busy?', 'prompt', 'status', 'stage', 'exclusive', 'locks', 'busy?', 'close-runtime', 'complete', 'status',
-    'global-state', 'command'
+    'open-dialog', 'plan', 'busy?', 'prompt', 'status', 'stage', 'exclusive', 'locks', 'freeze', 'busy?', 'busy?', 'report-stage', 'close-runtime',
+    'complete', 'report-stage', 'status', 'thaw', 'global-state', 'command'
   ]);
+  assert.deepEqual(f.calls.filter((call) => call[0] === 'report-stage').map((call) => call[1]), ['正在关闭本窗口的运行时', '正在切换到新数据目录'],
+    '等着打开的窗口看得到阶段（复制与核对的阶段经 onProgress 同样报告）');
   assert.equal(f.calls.find((call) => call[0] === 'plan')[2], true, '行数经本窗口打开的数据库统计');
   const pending = f.calls.find((call) => call[0] === 'status')[1].pendingRelocation;
   assert.deepEqual([pending.sourceRootPath, pending.targetRootPath, pending.processId, pending.processStartIdentity], [SOURCE, TARGET, process.pid, 'start-identity']);
   assert.equal(f.calls.find((call) => call[0] === 'stage')[3], pending.relocationId, '目标里的准备记录与迁移进行记录同一个 id');
+  assert.equal(f.calls.find((call) => call[0] === 'exclusive')[1].operationKey, `data-root-relocation:${TARGET}#${pending.relocationId}`,
+    '协调的 key 带本次迁移 id：修好原因后再试是新的 key');
   const exclusive = f.calls.find((call) => call[0] === 'exclusive')[1];
   assert.equal(exclusive.participantConfirmation, 'final-countdown');
   assert.equal(exclusive.whenBusy, 'wait');
@@ -246,7 +259,7 @@ test('复审 bulk #6：迁移进度可以取消；在线预复制期间取消时
   assert.ok(!f.calls.some((call) => call[0] === 'command'));
 });
 
-test('发起窗口在等待期间开始新任务：只提示一次迁移会推迟；关闭运行时前最后一刻又有任务就放弃，撤销准备，不重载', async () => {
+test('发起窗口在等待期间开始新任务：只提示一次迁移会推迟；确认之后（beforeGo 冻结本窗口时）仍有任务就退回，撤销准备，不重载', async () => {
   const f = fixture({ answers: [{ choice: 'relocate', include: [] }], busy: [false, true, true, true] });
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
   const exclusive = f.calls.find((call) => call[0] === 'exclusive')[1];
@@ -256,7 +269,8 @@ test('发起窗口在等待期间开始新任务：只提示一次迁移会推�
   assert.ok(!f.kinds().includes('close-runtime') && !f.kinds().includes('complete'), '忙着的窗口没有被切断');
   assert.deepEqual(f.calls.find((call) => call[0] === 'abandon'), ['abandon', true]);
   assert.equal(f.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null);
-  assert.match(JSON.stringify(f.prompts.at(-1)), /最后一刻开始了新的任务/);
+  assert.match(JSON.stringify(f.prompts.at(-1)), /本窗口在确认之后开始了新的任务/);
+  assert.deepEqual(f.kinds().filter((kind) => kind === 'freeze' || kind === 'thaw'), ['freeze', 'thaw'], '冻结后发现忙：马上解冻');
   assert.ok(!f.calls.some((call) => call[0] === 'command'));
 });
 
@@ -447,6 +461,8 @@ test('回到旧目录：运行时正常时经独占协调（倒计时不可否�
   const status = f.calls.find((call) => call[0] === 'status')[1];
   assert.deepEqual([status.dataRootPath, status.dataRootId, status.lastMigration.fromPath], ['/data/older', '00000000-0000-4000-8000-000000000002', SOURCE]);
   assert.ok(!f.kinds().includes('stage') && !f.kinds().includes('complete'));
+  assert.deepEqual(f.calls.filter((call) => call[0] === 'report-stage').map((call) => call[1]), ['正在关闭本窗口的运行时', '正在切换回旧数据目录']);
+  assert.ok(order.indexOf('freeze') < order.indexOf('close-runtime'), '关闭运行时之前先冻结本窗口');
 
   const unreachable = fixture({ host: false, lastMigration: { ...lastMigration, toPath: '/mnt/usb/limcode' }, currentAvailable: false, nativeAnswers: ['回到旧目录'] });
   unreachable.status.dataRootPath = '/mnt/usb/limcode';

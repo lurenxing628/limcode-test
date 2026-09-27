@@ -642,6 +642,15 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return withRuntimeDataRootAdmission(this.runtimePlacement.configurationRootPath, () => withRuntimeMaintenance(paths, body));
   }
 
+  /**
+   * Freezes this window before an exclusive data-directory change closes its Runtime: no new work
+   * is taken up (see VscodeReliableKernelProductRuntime.freezeNewExecution). Returns the undo.
+   */
+  public freezeNewWork(): () => void {
+    this.requireOpen();
+    return this.product.freezeNewExecution();
+  }
+
   /** Closes this window's Runtime before an offline data-directory change; the window reloads afterwards. */
   public async closeRuntime(): Promise<void> {
     await this.dispose();

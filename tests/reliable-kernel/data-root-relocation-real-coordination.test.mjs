@@ -71,11 +71,18 @@ async function openWindow(t, configurationRootPath) {
   const database = await kernel.RuntimeDatabase.open(new RootAuthority(() => selected.runtimeDataRootPath), { hostBootId: `window-${randomUUID()}` });
   const window = Object.assign(Object.create(Facade.prototype), {
     runtimePlacement: { configurationRootPath, runtimeScopeRootPath: configurationRootPath, runtimeDataRootPath: selected.runtimeDataRootPath },
-    product: { application: { database } },
+    // The ProductRuntime's freeze (its claim probe) is its own concern; here it is only recorded.
+    product: {
+      application: { database },
+      freezeNewExecution() { window.frozen += 1; ui.calls.push(['freeze']); return () => { window.frozen -= 1; ui.calls.push(['thaw']); }; }
+    },
+    frozen: 0,
+    frozenWhenClosed: undefined,
     closed: false,
     requireOpen() { if (this.closed) throw new Error('Runtime closed'); },
     async dispose() {
       if (this.closed) return;
+      this.frozenWhenClosed = this.frozen;
       this.closed = true;
       await database.close();
     },
@@ -118,6 +125,8 @@ test('单窗口迁移数据目录再回到旧目录：真实协调原语在锁�
   assert.deepEqual(failures(), [], `迁移没有失败：${trace()}`);
   assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootPath, target, `指针切到新目录：${trace()}`);
   assert.equal(first.window.closed, true, '本窗口的运行时在锁内关闭');
+  assert.equal(first.window.frozenWhenClosed, 1, '关闭运行时时本窗口已冻结（beforeGo），不再开始新任务');
+  assert.equal(first.window.frozen, 0, '锁内轮次结束后解冻');
   assert.equal(reloads(), 1);
   assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
 

@@ -110,6 +110,8 @@ export class VscodeReliableKernelProductRuntime {
   private readonly initializeConfiguration: () => Promise<void>;
   private readonly workspaceFoldersSubscription: vscode.Disposable;
   private workspaceFoldersChangeTask: Promise<void> = Promise.resolve();
+  /** While frozen (see freezeNewExecution) this window claims no Conversation it does not own yet. */
+  private readonly executionGate: { frozen: number };
 
   private constructor(input: {
     application: ReliableKernelApplication;
@@ -129,8 +131,10 @@ export class VscodeReliableKernelProductRuntime {
     ) => Promise<ConversationHostEligibilityDecision>;
     initializeConfiguration: () => Promise<void>;
     onConfigurationChanged?: () => Promise<void> | void;
+    executionGate: { frozen: number };
   }) {
     this.application = input.application;
+    this.executionGate = input.executionGate;
     this.configuration = input.configuration;
     this.toolHost = input.toolHost;
     this.childAgents = input.childAgents;
@@ -394,6 +398,7 @@ export class VscodeReliableKernelProductRuntime {
         runtimeBuildInfo: getRuntimeBuildInfo
       });
       const runtimeDatabase = application.database;
+      const executionGate = { frozen: 0 };
       const runtimeContent = application.contentStore;
       const runtimeTurns = application.turns;
       const frozenWorkEnvironmentCache = new Map<string, string | null>();
@@ -413,8 +418,11 @@ export class VscodeReliableKernelProductRuntime {
       // Only a window whose project folder and frozen work environment match executes a
       // Conversation (model, tools, Turn progress). Control commands work in every window and hand
       // the Conversation back right after; a probe failure never counts as eligible.
+      // A frozen window (an exclusive maintenance is about to close its Runtime) takes up no new
+      // Conversation; the ones it owns keep running (see freezeNewExecution).
       runtimeDatabase.conversationOwners.setClaimEligibilityProbe(
-        async (conversationId) => (await conversationEligibility(conversationId)).eligible
+        async (conversationId) => (executionGate.frozen === 0 || runtimeDatabase.conversationOwners.owns(conversationId))
+          && (await conversationEligibility(conversationId)).eligible
       );
       // New input starts a Turn: an idle Conversation may start wherever the work environment its
       // next Turn would freeze is available, even after its project folder moved.
@@ -535,7 +543,8 @@ export class VscodeReliableKernelProductRuntime {
         conversationEligibility,
         conversationEntryEligibility,
         initializeConfiguration,
-        onConfigurationChanged: options.onConfigurationChanged
+        onConfigurationChanged: options.onConfigurationChanged,
+        executionGate
       });
     } catch (error) {
       await debugCapture.close().catch(() => undefined);
@@ -561,6 +570,22 @@ export class VscodeReliableKernelProductRuntime {
    * level-triggered and protected by the same SQLite CAS/lease fences as live work, so it must not
    * hold extension activation (and the entire sidebar) hostage while it scans a large data set.
    */
+  /**
+   * Stops this window from taking up new work, for an exclusive maintenance that is about to close
+   * its Runtime: a Conversation it does not own yet is not claimed for execution here (new input
+   * stays pending and runs after the reload); Conversations it owns are not interrupted. Returns the
+   * undo (idempotent).
+   */
+  public freezeNewExecution(): () => void {
+    this.executionGate.frozen += 1;
+    let thawed = false;
+    return () => {
+      if (thawed) return;
+      thawed = true;
+      this.executionGate.frozen -= 1;
+    };
+  }
+
   public startRecovery(): Promise<ReliableKernelRecoveryReport> {
     if (this.recoveryTask) return this.recoveryTask;
     if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
