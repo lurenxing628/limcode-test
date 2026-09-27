@@ -86,7 +86,8 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     const snapshot = await backendApp.inspectReliability(conversationId || undefined);
     const document = await vscode.workspace.openTextDocument({
       language: 'json',
-      content: `${JSON.stringify(snapshot, null, 2)}\n`
+      // The worker's SQLite pragma diagnostics are BigInt, which JSON cannot hold: decimal text.
+      content: `${JSON.stringify(snapshot, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value, 2)}\n`
     });
     await vscode.window.showTextDocument(document, { preview: true });
   });

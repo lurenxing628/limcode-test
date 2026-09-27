@@ -31,7 +31,9 @@ const vscode = {
   workspace: {
     registerTextDocumentContentProvider(_scheme, provider) { ui.provider = provider; return { dispose() {} }; },
     onDidCloseTextDocument() { return { dispose() {} }; },
-    async openTextDocument(uri) { return { text: ui.provider.provideTextDocumentContent(uri) }; }
+    async openTextDocument(input) {
+      return { text: typeof input?.content === 'string' ? input.content : ui.provider.provideTextDocumentContent(input) };
+    }
   },
   commands: {
     registerCommand(id, callback) { ui.registered.set(id, callback); return { dispose() {} }; },
@@ -365,13 +367,15 @@ test('统计在 worker 的 reader 连接上执行：写连接不参与，另一�
   }
 });
 
-test('inspectReliability 的 JSON 带上同一份按类型统计', async (t) => {
+test('开发诊断命令打开的 JSON 带上同一份按类型统计，数据库诊断里的大整数写成十进制文本', async (t) => {
   const { database, store } = await openRuntime(t, 'inspect');
   await store.ingest(database, 'inspect reliability', MESSAGE);
   await store.ingest(database, 'png bytes', 'image/png');
   const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
     compiledRoot, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
   ));
+  const { registerCommands } = require(path.join(compiledRoot, 'vscode/commands/registerCommands.js'));
+  const { EXTENSION_COMMAND_IDS } = require(path.join(compiledRoot, 'shared/extensionIdentity.js'));
   const facade = Object.assign(Object.create(Facade.prototype), {
     disposed: false,
     productClosed: false,
@@ -381,11 +385,17 @@ test('inspectReliability 的 JSON 带上同一份按类型统计', async (t) => 
       diagnostics: { inspect: async () => ({ events: [], spans: [] }) }
     }
   });
-  const snapshot = JSON.parse(JSON.stringify(await facade.inspectReliability(), (_key, value) =>
-    typeof value === 'bigint' ? value.toString() : value));
+  registerCommands({ subscriptions: [], extensionMode: vscode.ExtensionMode.Development }, { wait: async () => facade, current: () => facade });
+  ui.documents.length = 0;
+  // The Data root scope (no conversation), exactly as the inspector's quick pick passes it.
+  await ui.registered.get(EXTENSION_COMMAND_IDS.inspectReliability)({ conversationId: '' });
+  assert.equal(ui.documents.length, 1);
+  const snapshot = JSON.parse(ui.documents[0]);
   assert.deepEqual(snapshot.contentUsage, usage.summarizeRuntimeContentUsage(await database.contentUsage()));
   assert.deepEqual(snapshot.contentUsage.categories.map((category) => [category.key, category.count, category.bytes]),
     [['message', '1', '19'], ['attachment', '1', '9']]);
+  assert.equal(snapshot.database.foreignKeys, '1');
+  assert.equal(snapshot.database.readerBusyTimeoutMs, '5000');
 });
 
 test('查看存储占用：当前库在目录统计之后按分类列出正文，并附两条说明', async (t) => {
