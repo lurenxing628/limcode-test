@@ -88,6 +88,9 @@ export class RuntimeDatabaseWorkerError extends Error {
 const OPEN_ROOT_POINTERS = new Map<string, string>();
 const HOST_HEARTBEAT_INTERVAL_MS = 5_000;
 const CONVERSATION_OWNER_SWEEP_DELAY_MS = 50;
+/** How long a matching process-identity comparison is reused by isHostAliveCached. */
+const HOST_IDENTITY_RECHECK_MS = 60_000;
+const HOST_IDENTITY_CACHE_ENTRIES = 1_000;
 
 interface RuntimeHostLivenessRecord {
   kind: 'limcode-runtime-host-liveness';
@@ -134,6 +137,8 @@ export class RuntimeDatabase {
   private conversationOwnerSweepTimer: NodeJS.Timeout | undefined;
   private conversationOwnerSweepTask: Promise<void> = Promise.resolve();
   private conversationOwnerSweepsStopped = false;
+  /** Process-identity comparisons by (hostBootId, pid) for isHostAliveCached. */
+  private readonly hostIdentityComparisons = new Map<string, { result: 'alive' | 'dead'; at: number }>();
 
   private constructor(
     private readonly authority: RootAuthority,
@@ -398,6 +403,42 @@ export class RuntimeDatabase {
     const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
     if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
     return inspectRecordedProcess(record) !== 'dead';
+  }
+
+  /**
+   * isHostAlive for frequent scans (the takeover scan runs after other windows' commits). Whether
+   * the process still exists is checked every time (a cheap signal-0 probe); the comparison of its
+   * start identity, which some platforms answer by starting a process, is cached per (hostBootId,
+   * pid): a mismatch or a vanished process stays dead, a match is compared again after
+   * HOST_IDENTITY_RECHECK_MS. Unknown answers are never cached and count as alive.
+   */
+  public async isHostAliveCached(hostBootIdInput: string): Promise<boolean> {
+    const hostBootId = requireNonEmptyText(hostBootIdInput, 'hostBootId');
+    if (hostBootId === this.hostBootId) return this.isHostAlive(hostBootId);
+    await this.validateBinding('host_liveness');
+    const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
+    if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
+    const key = `${hostBootId}\0${record.processId}`;
+    const cached = this.hostIdentityComparisons.get(key);
+    const now = Date.now();
+    if (cached?.result === 'dead') return false;
+    if (cached && now - cached.at < HOST_IDENTITY_RECHECK_MS) {
+      try {
+        process.kill(record.processId, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === 'ESRCH') {
+          this.hostIdentityComparisons.set(key, { result: 'dead', at: now });
+          return false;
+        }
+      }
+      return true;
+    }
+    const inspected = inspectRecordedProcess(record);
+    if (inspected !== 'unknown') {
+      if (this.hostIdentityComparisons.size >= HOST_IDENTITY_CACHE_ENTRIES) this.hostIdentityComparisons.clear();
+      this.hostIdentityComparisons.set(key, { result: inspected, at: now });
+    }
+    return inspected !== 'dead';
   }
 
   /** The listener receives the object a committed transaction() also resolves with; read-only. */

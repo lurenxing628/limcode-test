@@ -483,6 +483,45 @@ test('资格判定写入诊断：按原因汇总，探针失败逐条记录并�
   assert.equal(conversationRecoveryWaitingMessage({ status: 'checked' }), undefined);
 });
 
+test('盲审 8：冻结的工作环境在当前窗口不可用时，面板恢复提示带上它的名称和路径（来自本窗口目录），不显示内部 id', async () => {
+  const { conversationRecoveryWaitingMessage } = require(compiled('vscode/panels/MainPanel.js'));
+  const { VscodeReliableKernelProductRuntime } = require(compiled('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js'));
+  const view = {
+    eligible: false,
+    reason: 'work_environment_unavailable',
+    turnId: 'turn-remote',
+    workEnvironmentId: 'work-env-remote',
+    workEnvironmentLabel: '远程机（/srv/app）'
+  };
+  // VscodeReliableKernelProductRuntime.recoverConversation in a window that does not serve the Conversation.
+  const runtime = Object.create(VscodeReliableKernelProductRuntime.prototype);
+  Object.assign(runtime, {
+    closing: false,
+    conversationEligibility: async () => view,
+    conversations: { async recoverStartup() { return {}; } },
+    recoveryController: new AbortController(),
+    application: { database: { async hasConversationRuntimeWork() { return true; } } }
+  });
+  const result = await runtime.recoverConversation('conversation-remote');
+  assert.deepEqual(result, {
+    status: 'waiting_for_work_environment',
+    workEnvironmentId: 'work-env-remote',
+    workEnvironmentLabel: '远程机（/srv/app）'
+  });
+  assert.equal(
+    conversationRecoveryWaitingMessage(result),
+    `${EXTENSION_BRAND}：该对话冻结的工作环境“远程机（/srv/app）”在当前窗口不可用，未完成的任务会在有该工作环境的窗口中继续执行。`
+  );
+  // Not in this window's catalog: no name to show, and never the internal id.
+  const { workEnvironmentLabel: _label, ...unlabelled } = view;
+  runtime.conversationEligibility = async () => unlabelled;
+  const withoutLabel = await runtime.recoverConversation('conversation-remote');
+  assert.deepEqual(withoutLabel, { status: 'waiting_for_work_environment', workEnvironmentId: 'work-env-remote' });
+  const message = conversationRecoveryWaitingMessage(withoutLabel);
+  assert.equal(message, `${EXTENSION_BRAND}：该对话冻结的工作环境在当前窗口不可用，未完成的任务会在打开该工作环境的窗口中继续执行。`);
+  assert.equal(message.includes('work-env-remote'), false);
+});
+
 test('文件修改审批：不合格窗口只记录决定，不派发修改、不续跑并提示；合格窗口照常派发并续跑', async () => {
   for (const eligible of [false, true]) {
     informationMessages.length = 0;

@@ -77,11 +77,12 @@ interface PlacedWork {
  * project folder open here. An idle Conversation waiting for runtime deliveries (a finished
  * background process, a child Agent's answer, a peer's message) is served where one of the
  * continuations they start can run: a continuation that inherits its source Turn's authority is
- * placed by the work environment that Turn froze, and one that compiles current settings by where
- * its next Turn could start. Any other idle Conversation is served where its project folder is
- * open, or, when that folder is not open here, where its next Turn could start (the preview finds
- * a work environment available here). A Conversation without a project link and without frozen
- * work environments has no durable placement fact, so every Host remains eligible for it.
+ * placed by the work environment that Turn froze, and one that compiles current settings (a peer
+ * message) by the same decision as new input (nextTurnEntryEligibility). Any other idle
+ * Conversation is served where its project folder is open, or, when that folder is not open here,
+ * where its next Turn could start (the preview finds a work environment available here). A
+ * Conversation without a project link and without frozen work environments has no durable
+ * placement fact, so every Host remains eligible for it.
  */
 export async function evaluateConversationHostEligibility(
   dependencies: ConversationHostEligibilityDependencies,
@@ -95,8 +96,9 @@ export async function evaluateConversationHostEligibility(
   let first: ConversationHostEligibilityDecision | undefined;
   let nextTurn: Promise<ConversationHostEligibilityDecision> | undefined;
   for (const sourceTurnId of continuations) {
+    // A peer message's continuation compiles current settings: the same decision as new input.
     const decision = sourceTurnId === null
-      ? await (nextTurn ??= idleEligibility(dependencies, conversationId, project))
+      ? await (nextTurn ??= nextTurnEntryEligibility(dependencies, conversationId, project))
       : await placementEligibility(dependencies, project, [
           { turnId: sourceTurnId, workEnvironmentId: await frozenDefaultWorkEnvironment(dependencies, sourceTurnId) }
         ]);
@@ -213,8 +215,22 @@ export async function evaluateConversationEntryEligibility(
     ]);
   }
   if (work.length > 0) return placementEligibility(dependencies, project, work);
-  const next = await dependencies.nextTurnWorkEnvironment(conversationId, {
-    ...(options.executorAgentId ? { executorAgentId: options.executorAgentId } : {})
+  return nextTurnEntryEligibility(dependencies, conversationId, project, options.executorAgentId);
+}
+
+/**
+ * Whether a Turn that compiles current settings could start here: judged by the work environment
+ * the preview resolves for it (the explicit choice, the executor's policy, the project), or by the
+ * project folder when no preview is available. New input and a peer message's continuation share it.
+ */
+async function nextTurnEntryEligibility(
+  dependencies: ConversationHostEligibilityDependencies,
+  conversationId: string,
+  project: { uri: string; name: string } | undefined,
+  executorAgentId?: string
+): Promise<ConversationHostEligibilityDecision> {
+  const next = await dependencies.nextTurnWorkEnvironment?.(conversationId, {
+    ...(executorAgentId ? { executorAgentId } : {})
   });
   if (!next) return projectOpenEligibility(dependencies, project);
   if (next.error) return { eligible: false, reason: 'next_work_environment_unavailable', message: next.error };

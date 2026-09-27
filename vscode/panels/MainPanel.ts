@@ -765,7 +765,10 @@ export function conversationRecoveryWaitingMessage(result: ConversationRecoveryR
     return `${EXTENSION_BRAND}：该对话属于项目“${result.projectName}”，未完成的任务会在打开该项目的窗口中继续执行。`;
   }
   if (result?.status === 'waiting_for_work_environment') {
-    return `${EXTENSION_BRAND}：该对话冻结的工作环境在当前窗口不可用，未完成的任务会在打开该工作环境的窗口中继续执行。`;
+    // The work environment's name and path from this window's catalog; never its internal id.
+    return result.workEnvironmentLabel
+      ? `${EXTENSION_BRAND}：该对话冻结的工作环境“${result.workEnvironmentLabel}”在当前窗口不可用，未完成的任务会在有该工作环境的窗口中继续执行。`
+      : `${EXTENSION_BRAND}：该对话冻结的工作环境在当前窗口不可用，未完成的任务会在打开该工作环境的窗口中继续执行。`;
   }
   if (result?.status === 'eligibility_unknown') return `${EXTENSION_BRAND}：${result.message}`;
   return undefined;

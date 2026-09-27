@@ -430,6 +430,8 @@ export class ReliableAgentLoop {
     string,
     Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>
   >();
+  /** The Turn of each in-flight native call execution (same keys as nativeCallExecutions). */
+  private readonly nativeCallTurnIds = new Map<string, string>();
   private readonly automaticDeliveries: AutomaticRuntimeDeliveryRouter;
   private readonly now: () => string;
   private readonly reconcileCommittedToolCall:
@@ -537,8 +539,10 @@ export class ReliableAgentLoop {
           throw new ExecutionHandoffError(`Conversation ${conversationId} is not owned by this Runtime Host.`);
         }
         await this.database.conversationOwners.assertOwned(conversationId);
-        // A round boundary is a safe point: no tool of this Turn is running. A Host that stopped
-        // serving the Conversation (its folder left this window) stops here and hands the Turn over.
+        // A Host that stopped serving the Conversation (its folder left this window) stops here and
+        // hands the Turn over. No synchronous tool of this Turn is running at a round boundary, but
+        // an admitted async native call may still run in this Host: the hand-back waits for it
+        // (quiesceNativeCalls) before the lease goes back.
         if (await this.database.conversationOwners.executionEligibility(conversationId) === 'ineligible') {
           throw new ExecutionEligibilityLostError(conversationId);
         }
@@ -2682,12 +2686,38 @@ export class ReliableAgentLoop {
     if (running) return running;
     const execution = this.dispatchNativeCallOnce(input);
     this.nativeCallExecutions.set(input.toolCallId, execution);
+    this.nativeCallTurnIds.set(input.toolCallId, input.turnId);
     void execution.then(() => undefined, () => undefined).then(() => {
       if (this.nativeCallExecutions.get(input.toolCallId) === execution) {
         this.nativeCallExecutions.delete(input.toolCallId);
+        this.nativeCallTurnIds.delete(input.toolCallId);
       }
     });
     return execution;
+  }
+
+  /** Whether this Host still runs a native call it started for the Turn. */
+  public hasNativeCalls(turnId: string): boolean {
+    for (const callTurnId of this.nativeCallTurnIds.values()) if (callTurnId === turnId) return true;
+    return false;
+  }
+
+  /**
+   * Waits until every native call this Host started for the Turn has settled (its result recorded,
+   * or its execution ended). A Host that hands the Turn's lease back waits here first, so none of
+   * its effects is still in flight under a lease another Host may then hold. Nothing is cancelled.
+   */
+  public async quiesceNativeCalls(turnId: string): Promise<void> {
+    const awaited = new Set<Promise<unknown>>();
+    for (;;) {
+      const running = [...this.nativeCallTurnIds]
+        .filter(([, callTurnId]) => callTurnId === turnId)
+        .map(([toolCallId]) => this.nativeCallExecutions.get(toolCallId))
+        .filter((execution): execution is NonNullable<typeof execution> => execution !== undefined && !awaited.has(execution));
+      if (running.length === 0) return;
+      for (const execution of running) awaited.add(execution);
+      await Promise.allSettled(running);
+    }
   }
 
   private async dispatchNativeCallOnce(

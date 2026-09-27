@@ -38,7 +38,7 @@ export interface ConversationForkResult {
 export type ConversationRecoveryResult =
   | { status: 'checked' }
   | { status: 'waiting_for_project'; projectName: string }
-  | { status: 'waiting_for_work_environment'; workEnvironmentId: string }
+  | { status: 'waiting_for_work_environment'; workEnvironmentId: string; workEnvironmentLabel?: string }
   | { status: 'eligibility_unknown'; message: string };
 
 /**

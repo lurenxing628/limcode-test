@@ -419,6 +419,47 @@ test('复审 #7：服务该对话的窗口里用户停止，死宿主留下的�
   }
 });
 
+test('盲审 5：服务子对话的窗口里用户停止子 Agent，死宿主留下的效果先对子对话跑启动恢复（Phase D）核对，核对不了的才由停止标为结果未知（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('serving-child-stop');
+  let p2;
+  let child;
+  try {
+    const conversationId = 'conversation-serving-child-stop';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId }, 'origin-child');
+    const spawned = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    // A window serving the project, so the child Conversation too, that has not recovered the child Turn yet.
+    p2 = await openHost(dataRoot, scriptedProvider([{ role: 'model', parts: [{ text: '父对话收到子 Agent 的结果。' }] }]),
+      { folders: [PROJECT_TWO.uri], label: 'p2', children: true });
+    assert.equal(await p2.app.database.conversationOwners.executionEligibility(spawned.childConversationId), 'eligible');
+    const [call] = await rows(p2.app, 'ToolCall', { turn_id: spawned.childTurnId, status: 'executing' });
+    const [intent] = await effectIntentsForToolCall(p2.app, call.id);
+    const stopped = await p2.coordinator.interruptSubtree({
+      sourceKey: 'user-stop-child-serving',
+      childExecutionId: spawned.childExecutionId,
+      reason: '用户停止子 Agent'
+    }, { userStop: true });
+    assert.equal(stopped.executingWindowAlive, undefined);
+    await eventually(async () => (await rows(p2.app, 'Turn', { id: spawned.childTurnId }))[0]?.status === 'terminated',
+      30_000, '子 Turn 未收尾');
+    assert.equal((await rows(p2.app, 'TurnTermination', { turn_id: spawned.childTurnId }))[0]?.terminal_status, 'interrupted');
+    const [receipt] = await rows(p2.app, 'EffectReceipt', { attempt_id: intent.attempt_id });
+    assert.equal(receipt?.outcome, 'outcome_unknown');
+    const detail = await readContentJson(p2.app, receipt.response_object_id);
+    assert.notEqual(detail.reason, DEAD_HOST_STOP_REASON, '先走恢复路径，不直接按用户停止标记');
+    assert.match(detail.reason, /MCP service cannot prove/);
+    const receipts = await rows(p2.app, 'CommandReceipt', {});
+    assert.equal(receipts.some((row) => String(row.source_key).startsWith('user-stop-dead-host:')), false);
+    assert.equal(p2.mcpCalls(), 0, '恢复不重放外部调用');
+  } finally {
+    await p2?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 test('子驱动只在服务子对话的窗口执行：不合格窗口即使持有子 Turn 的租约也不驱动，立即交还（跨进程）', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('drive-child-gate');
   let p1;

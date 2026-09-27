@@ -57,6 +57,8 @@ const UNKNOWN_ELIGIBILITY_MAX_DELAY_MS = 30_000;
 /** Another window's commits trigger at most one scan for Turns no live Host holds per interval. */
 const UNHELD_TURN_SCAN_INTERVAL_MS = 2_000;
 const UNHELD_TURN_RECOVERY_INTERVAL_MS = 5_000;
+/** How long after a skipped lease's expiry the takeover scan looks again. */
+const UNHELD_TURN_EXPIRY_MARGIN_MS = 250;
 /** Queued admission stood down as busy or unknown retries on its own, with backoff. */
 const ADMISSION_RETRY_BASE_DELAY_MS = 1_000;
 const ADMISSION_RETRY_MAX_DELAY_MS = 30_000;
@@ -206,6 +208,15 @@ export class ReliableConversationRunner {
   private unheldScanTimer: NodeJS.Timeout | undefined;
   private unheldScanTask: Promise<void> | undefined;
   private readonly unheldRecoveredAt = new Map<string, number>();
+  private unheldExpiryTimer: NodeJS.Timeout | undefined;
+  private unheldExpiryAt: number | undefined;
+  /** Lease hand-backs in progress (waiting for this Host's native calls of the Turn to settle). */
+  private readonly leaseHandBacks = new Map<string, Promise<LeaseHandBackResult>>();
+  /** Turn → Conversation: lease hand-backs a Conversation held by another window deferred; retried each poll. */
+  private readonly pendingLeaseHandBacks = new Map<string, string>();
+  private conversationTakeover: (conversationId: string) => Promise<void> = async (conversationId) => {
+    await this.recoverStartup(undefined, conversationId);
+  };
   private readonly terminationRecoveryFailures = new Map<string, number>();
   private readonly interruptCancellationSignaled = new Set<string>();
   private externalWakeTimer: NodeJS.Timeout | undefined;
@@ -869,6 +880,8 @@ export class ReliableConversationRunner {
         } else {
           (claim === 'ineligible' ? report.ineligibleTurnIds : report.eligibilityUnknownTurnIds).push(turnId);
           this.deferRecoveryCandidate(turnConversationId, turnId, claim);
+          // A lease this Host still holds for a Turn it does not serve goes back.
+          if (claim === 'ineligible') await this.releaseWaitingTurn(turnConversationId, turnId);
         }
         continue;
       }
@@ -961,25 +974,58 @@ export class ReliableConversationRunner {
   }
 
   /**
-   * A waiting Turn whose Conversation this window no longer serves (its folder left the window):
-   * the execution lease goes back with the owner record, so a window serving the Conversation
-   * continues the Turn (an answer, a stop) while this one stays open.
+   * A Turn whose lease this window holds but which it no longer serves (its folder left the window)
+   * and does not drive: the lease goes back so a window serving the Conversation continues the Turn
+   * (an answer, a stop) while this one stays open. This window's native calls of the Turn that still
+   * run finish first and record their results here; then the lease row this window holds goes back
+   * whether or not it expired (a Turn that waited longer than the lease is still held by this live
+   * Host, which no other Host may displace). A caller never waits for such a call: the hand-back
+   * then completes in the background ('quiescing'). 'busy' means another window holds the
+   * Conversation right now: the hand-back stays pending and each wake poll retries it while this
+   * Host still holds the lease and does not serve the Conversation.
    */
-  private async releaseWaitingTurn(conversationId: string, turnId: string): Promise<void> {
-    try {
-      await this.conversationOwners.run(conversationId, async () => {
-        const fence = await this.application.turns.executionLeaseFence({
-          turnId,
-          leaseOwnerId: this.leaseOwnerId,
-          hostBootId: this.application.database.hostBootId
+  private releaseWaitingTurn(conversationId: string, turnId: string): Promise<LeaseHandBackResult> {
+    if (this.leaseHandBacks.has(turnId)) return Promise.resolve('quiescing');
+    // A drive in progress hands its lease back itself, between rounds.
+    if (this.active.has(turnId)) return Promise.resolve('not_held');
+    const detached = this.application.agentLoop.hasNativeCalls(turnId);
+    const lease = {
+      turnId,
+      leaseOwnerId: this.leaseOwnerId,
+      hostBootId: this.application.database.hostBootId
+    };
+    const handBack = (async (): Promise<LeaseHandBackResult> => {
+      await this.application.agentLoop.quiesceNativeCalls(turnId);
+      if (this.disposed) return 'not_held';
+      try {
+        // Nothing to hand back: the Conversation is not claimed for it.
+        if (!await this.application.turns.heldExecutionLeaseFence(lease)) return 'not_held';
+        return await this.conversationOwners.run(conversationId, async () => {
+          // Re-checked under the claim: the folder may have come back meanwhile, and a drive owns its lease.
+          if (this.active.has(turnId)
+            || await this.conversationOwners.executionEligibility(conversationId) !== 'ineligible') return 'not_held';
+          const fence = await this.application.turns.heldExecutionLeaseFence(lease);
+          if (!fence) return 'not_held';
+          return await this.application.turns.releaseExecutionLease(fence) ? 'released' : 'not_held';
         });
-        if (fence) await this.application.turns.releaseExecutionLease(fence);
-      });
-    } catch (error) {
-      if (!isConversationRuntimeOwnerBusyError(error)) {
+      } catch (error) {
+        if (isConversationRuntimeOwnerBusyError(error)) return 'busy';
         this.onError(error, { operation: 'watch-external', conversationId, turnId });
+        return 'not_held';
       }
-    }
+    })().then((result) => {
+      if (result === 'busy' && !this.disposed) {
+        this.pendingLeaseHandBacks.set(turnId, conversationId);
+        this.ensureExternalWakePolling();
+      } else {
+        this.pendingLeaseHandBacks.delete(turnId);
+      }
+      return result;
+    }).finally(() => {
+      if (this.leaseHandBacks.get(turnId) === handBack) this.leaseHandBacks.delete(turnId);
+    });
+    this.leaseHandBacks.set(turnId, handBack);
+    return detached ? Promise.resolve('quiescing') : handBack;
   }
 
   /**
@@ -1311,6 +1357,7 @@ export class ReliableConversationRunner {
     for (const [conversationId, at] of this.unheldRecoveredAt) {
       if (now - at >= UNHELD_TURN_RECOVERY_INTERVAL_MS) this.unheldRecoveredAt.delete(conversationId);
     }
+    let nextExpiry: number | undefined;
     for (const turn of await listAllDomainRows(this.application.database, 'Turn', { status: 'active' })) {
       if (this.disposed) return;
       const turnId = requireId(turn.id, 'Turn.id');
@@ -1318,13 +1365,57 @@ export class ReliableConversationRunner {
       if (childTurnIds.has(turnId) || this.active.has(turnId) || this.waitingOwned.has(turnId)) continue;
       if (this.deferredRecovery.has(turnId) || this.unheldRecoveredAt.has(conversationId)) continue;
       const leases = await listAllDomainRows(this.application.database, 'ExecutionLease', { turn_id: turnId });
-      if (leases.length === 1 && await this.application.database.isHostAlive(
-        requireId(leases[0].host_boot_id, 'ExecutionLease.host_boot_id')
-      )) continue;
+      if (leases.length === 1) {
+        // An unexpired lease is not taken over here, so only an expired one needs the (cached)
+        // process-identity check of its holder. The scan looks again once it expires: a Host that
+        // exited commits nothing more that would start another scan.
+        const expiresAt = Date.parse(String(leases[0].expires_at));
+        if (!Number.isFinite(expiresAt)) continue;
+        if (expiresAt > Date.now()) {
+          nextExpiry = Math.min(nextExpiry ?? expiresAt, expiresAt);
+          continue;
+        }
+        if (await this.application.database.isHostAliveCached(
+          requireId(leases[0].host_boot_id, 'ExecutionLease.host_boot_id')
+        )) continue;
+      }
       if (await this.conversationOwners.executionEligibility(conversationId) !== 'eligible') continue;
       this.unheldRecoveredAt.set(conversationId, Date.now());
-      await this.recoverStartup(undefined, conversationId);
+      try {
+        // The same per-Conversation recovery as a view takeover: work the exited window left
+        // dispatched is checked first (Phase D), then the child scheduler, then this runner.
+        await this.conversationTakeover(conversationId);
+      } catch (error) {
+        if (!isConversationRuntimeOwnerBusyError(error)) {
+          this.onError(error, { operation: 'watch-recovery', conversationId, turnId });
+        }
+      }
     }
+    if (nextExpiry !== undefined) this.scheduleUnheldRescanAt(nextExpiry);
+  }
+
+  /** Runs the takeover scan again once the earliest lease it skipped as unexpired has expired. */
+  private scheduleUnheldRescanAt(expiresAt: number): void {
+    if (this.disposed || (this.unheldExpiryTimer && this.unheldExpiryAt !== undefined && this.unheldExpiryAt <= expiresAt)) {
+      return;
+    }
+    if (this.unheldExpiryTimer) clearTimeout(this.unheldExpiryTimer);
+    this.unheldExpiryAt = expiresAt;
+    this.unheldExpiryTimer = setTimeout(() => {
+      this.unheldExpiryTimer = undefined;
+      this.unheldExpiryAt = undefined;
+      this.recoverUnheldTurns();
+    }, Math.max(0, expiresAt - Date.now()) + UNHELD_TURN_EXPIRY_MARGIN_MS);
+    this.unheldExpiryTimer.unref();
+  }
+
+  /**
+   * Installs how an eligible window takes over a Conversation whose active Turn no live Host holds
+   * (VscodeReliableKernelProductRuntime: the same recovery as a view takeover). By default only
+   * this runner's recovery runs.
+   */
+  public setConversationTakeover(takeover: (conversationId: string) => Promise<void>): void {
+    this.conversationTakeover = takeover;
   }
 
   public dispose(): void {
@@ -1334,9 +1425,12 @@ export class ReliableConversationRunner {
     this.externalWakeTimer = undefined;
     if (this.unheldScanTimer) clearTimeout(this.unheldScanTimer);
     this.unheldScanTimer = undefined;
+    if (this.unheldExpiryTimer) clearTimeout(this.unheldExpiryTimer);
+    this.unheldExpiryTimer = undefined;
     for (const conversationId of [...this.admissionRetries.keys()]) this.clearAdmissionRetry(conversationId);
     this.waitingOwned.clear();
     this.deferredRecovery.clear();
+    this.pendingLeaseHandBacks.clear();
     this.terminationRecoveryFailures.clear();
     this.interruptCancellationSignaled.clear();
     this.rebuildPreviews.clear();
@@ -1521,7 +1615,9 @@ export class ReliableConversationRunner {
         slot.completedGeneration = generation;
         if (error instanceof ExecutionEligibilityLostError && fence) {
           // The folder or work environment left this window mid-Turn: the loop stopped between
-          // rounds; hand the lease back so the Host serving the Conversation continues the Turn.
+          // rounds; hand the lease back so the Host serving the Conversation continues the Turn,
+          // once the async native calls this Host still runs for it have recorded their results.
+          await this.application.agentLoop.quiesceNativeCalls(slot.turnId);
           await this.application.turns.releaseExecutionLease(fence).catch((releaseError: unknown) => {
             this.onError(releaseError, { operation: 'drive', conversationId: slot.conversationId, turnId: slot.turnId });
           });
@@ -1823,7 +1919,8 @@ export class ReliableConversationRunner {
   private ensureExternalWakePolling(): void {
     if (
       this.disposed
-      || (this.active.size === 0 && this.waitingOwned.size === 0 && this.deferredRecovery.size === 0)
+      || (this.active.size === 0 && this.waitingOwned.size === 0 && this.deferredRecovery.size === 0
+        && this.pendingLeaseHandBacks.size === 0)
       || this.externalWakeTimer
     ) return;
     this.externalWakeTimer = setTimeout(() => {
@@ -1841,12 +1938,22 @@ export class ReliableConversationRunner {
     if (
       this.disposed
       || this.externalWakePollInFlight
-      || (this.active.size === 0 && this.waitingOwned.size === 0 && this.deferredRecovery.size === 0)
+      || (this.active.size === 0 && this.waitingOwned.size === 0 && this.deferredRecovery.size === 0
+        && this.pendingLeaseHandBacks.size === 0)
     ) return;
     this.externalWakePollInFlight = true;
     try {
       const ownership = new Map<string, ConversationRuntimeEligibleClaimResult>();
       await this.cancelDurablyInterruptedLocalTurns();
+      for (const [turnId, conversationId] of [...this.pendingLeaseHandBacks]) {
+        // A hand-back another window's hold deferred: retried while this Host still holds the lease
+        // (checked before any claim) and does not serve the Conversation.
+        if (await this.conversationOwners.executionEligibility(conversationId) !== 'ineligible') {
+          this.pendingLeaseHandBacks.delete(turnId);
+          continue;
+        }
+        await this.releaseWaitingTurn(conversationId, turnId);
+      }
       if (this.waitingOwned.size > 0) {
         const localWake = this.localWakeRequested;
         this.localWakeRequested = false;
@@ -1912,6 +2019,8 @@ export class ReliableConversationRunner {
             : claim;
           if (eligibility === 'eligible') continue;
           this.deferRecoveryCandidate(deferred.conversationId, deferred.turnId, eligibility);
+          // A lease this Host still holds for a Turn it does not serve goes back.
+          if (eligibility === 'ineligible') await this.releaseWaitingTurn(deferred.conversationId, deferred.turnId);
           continue;
         }
         const claimed = await this.application.turns.claimRecoveryExecution({
@@ -2513,6 +2622,8 @@ export class ReliableConversationRunner {
     if (this.disposed) throw new Error('ReliableConversationRunner 已关闭。');
   }
 }
+
+type LeaseHandBackResult = 'released' | 'not_held' | 'busy' | 'quiescing';
 
 function requireId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0) throw new TypeError(`${label} must be a non-empty id.`);

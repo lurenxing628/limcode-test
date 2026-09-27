@@ -38,6 +38,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/plan-and-entry-eligibility.test.mjs',
   'tests/reliable-kernel/eligibility-placement-handback.test.mjs',
   'tests/reliable-kernel/eligibility-delivery-ownership.test.mjs',
+  'tests/reliable-kernel/eligibility-blind-review.test.mjs',
   'tests/reliable-kernel/dead-host-effects-spawn.test.mjs',
   'tests/reliable-kernel/panel-owner-lifecycle.test.mjs',
   'tests/reliable-kernel/sidebar-cross-host-abort.test.mjs',

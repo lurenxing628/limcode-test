@@ -42,6 +42,7 @@ import { VscodeReliableFileDiffEditor } from './VscodeReliableFileDiffEditor';
 import { getRuntimeBuildInfo } from '../runtimeBuildInfo';
 import { ReliableConversationRunner } from './ReliableConversationRunner';
 import { ReliableConversationLifecycle } from './conversationLifecycle';
+import { recoverServedConversation } from './conversationTakeover';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
   conversationHostIneligibleMessage,
@@ -140,6 +141,8 @@ export class VscodeReliableKernelProductRuntime {
     this.childAgents = input.childAgents;
     this.fileDiffs = input.fileDiffs;
     this.conversations = input.conversations;
+    // A Turn no live Host holds any more is taken over with the same recovery as a view takeover.
+    this.conversations.setConversationTakeover((conversationId) => this.recoverOwnedConversation(conversationId));
     this.conversationLifecycle = input.conversationLifecycle;
     this.providerRegistry = input.providerRegistry;
     this.diagnostics = input.diagnostics;
@@ -651,7 +654,11 @@ export class VscodeReliableKernelProductRuntime {
     if (!await this.application.database.hasConversationRuntimeWork(conversationId)) return { status: 'checked' };
     if (view.reason === 'project_not_open') return { status: 'waiting_for_project', projectName: view.projectName };
     if (view.reason === 'work_environment_unavailable') {
-      return { status: 'waiting_for_work_environment', workEnvironmentId: view.workEnvironmentId };
+      return {
+        status: 'waiting_for_work_environment',
+        workEnvironmentId: view.workEnvironmentId,
+        ...(view.workEnvironmentLabel ? { workEnvironmentLabel: view.workEnvironmentLabel } : {})
+      };
     }
     return { status: 'eligibility_unknown', message: conversationHostIneligibleMessage(view) };
   }
@@ -661,14 +668,13 @@ export class VscodeReliableKernelProductRuntime {
     const existing = this.conversationRecoveryTasks.get(conversationId);
     if (existing) return existing;
     const signal = this.recoveryController.signal;
-    const task = this.application.database.conversationOwners.run(conversationId, async () => {
-      signal.throwIfAborted();
-      await this.ensureCapabilitiesReady();
-      await this.application.recoverConversation(conversationId, signal);
-      signal.throwIfAborted();
-      await this.childAgents.recoverStartup(signal, conversationId);
-      signal.throwIfAborted();
-      await this.conversations.recoverStartup(signal, conversationId);
+    const task = recoverServedConversation({
+      application: this.application,
+      childAgents: this.childAgents,
+      conversations: this.conversations,
+      conversationId,
+      signal,
+      ready: () => this.ensureCapabilitiesReady()
     }).finally(() => {
       if (this.conversationRecoveryTasks.get(conversationId) === task) {
         this.conversationRecoveryTasks.delete(conversationId);

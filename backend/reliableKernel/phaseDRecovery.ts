@@ -322,10 +322,12 @@ export class PhaseDRecoveryScanner {
     }
     // Several code-server browser clients may have independent Extension Hosts over the same
     // Runtime root. A newly opened Host must not mistake another live Host's in-flight external
-    // effect for crash residue merely because the receipt has not arrived yet. Only the Turn's
-    // durable lease plus the lease Host's process identity is accepted as liveness proof; dead or
-    // missing owners still fall through to the conservative effect-specific recovery below.
-    if (await this.isOwnedByLiveTurnHost(intent)) return { reconciled: false, unknown: false };
+    // effect for crash residue merely because the receipt has not arrived yet. The Host recorded in
+    // the effect's dispatch fence is the one running it: while that Host is alive (or cannot be
+    // proven dead) nothing is recovered here, whoever holds the Turn's lease now (it may have handed
+    // the lease back, or waited past its expiry); that Host records the real outcome. Dead or
+    // missing dispatchers still fall through to the conservative effect-specific recovery below.
+    if (await this.isDispatchedByLiveHost(intent)) return { reconciled: false, unknown: false };
     const source = {
       kind: 'recovery' as const,
       key: `recovery:effect-intent-hanging:${intent.id as string}`
@@ -379,31 +381,9 @@ export class PhaseDRecoveryScanner {
     };
   }
 
-  private async isOwnedByLiveTurnHost(intent: DomainRow): Promise<boolean> {
+  private async isDispatchedByLiveHost(intent: DomainRow): Promise<boolean> {
     const dispatchFence = await this.effects.readEffectDispatchFence(String(intent.id));
     if (!dispatchFence) return false;
-    const attempts = await this.list('Attempt', { id: intent.attempt_id }, 2);
-    if (attempts.length !== 1) return false;
-    const operations = await this.list('Operation', { id: attempts[0].operation_id }, 2);
-    if (operations.length !== 1 || operations[0].tool_call_id === null) return false;
-    if (isTerminalOperationOutcome(operations[0].status)) return false;
-    const calls = await this.list('ToolCall', { id: operations[0].tool_call_id }, 2);
-    if (calls.length !== 1) return false;
-    const turns = await this.list('Turn', { id: calls[0].turn_id, status: 'active' }, 2);
-    if (turns.length !== 1) return false;
-    const leases = await this.list('ExecutionLease', { turn_id: turns[0].id }, 2);
-    if (leases.length !== 1) return false;
-    const lease = leases[0];
-    if (
-      lease.id !== dispatchFence.executionLeaseId
-      || lease.conversation_id !== dispatchFence.conversationId
-      || lease.turn_id !== dispatchFence.turnId
-      || lease.owner_id !== dispatchFence.ownerId
-      || lease.host_boot_id !== dispatchFence.hostBootId
-      || requirePositiveBigInt(lease.generation, 'ExecutionLease.generation').toString() !== dispatchFence.generation
-      || typeof lease.expires_at !== 'string'
-      || Date.parse(lease.expires_at) <= Date.now()
-    ) return false;
     return this.database.isHostAlive(dispatchFence.hostBootId);
   }
 

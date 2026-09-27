@@ -52,7 +52,7 @@ import {
   runWithExecutionLeaseFence,
   type ExecutionLeaseFence
 } from './executionLeaseFence';
-import { isConversationRuntimeOwnerBusyError } from './ConversationRuntimeOwnerManager';
+import { ConversationHostIneligibleError, isConversationRuntimeOwnerBusyError } from './ConversationRuntimeOwnerManager';
 import { DEAD_HOST_STOP_REASON, type DeadHostTurnEffects } from './phaseDRecovery';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import {
@@ -127,7 +127,11 @@ export interface ReliableChildAgentCoordinatorDependencies {
     deadHostEffectsForTurn(turnId: string, selfHostBootId: string): Promise<DeadHostTurnEffects>;
     abandonDeadHostEffects(input: { sourceKey: string; effectIntentIds: readonly string[]; reason: string }): Promise<number>;
     reconcileArrivedReceipts(effectIntentIds: readonly string[]): Promise<void>;
+    /** The startup recovery of dispatched work (Phase D), scoped to one Conversation. */
+    runAll?(signal?: AbortSignal, conversationId?: string): Promise<unknown>;
   };
+  /** Child Turn ExecutionLease duration; 30 seconds by default. */
+  leaseDurationMs?: number;
   quiesceTurnExecution?: (input: { turnId: string; reason: ExecutionHandoffError }) => Promise<void>;
   manualCompression?: {
     admit(input: {
@@ -204,6 +208,8 @@ export class ReliableChildAgentCoordinator {
   private recoveryRerunRequested = false;
   private recoveryRerunUnscoped = false;
   private recoveryPollingNeeded = false;
+  /** Child lease hand-backs waiting for this Host's native calls of the Turn to settle. */
+  private readonly leaseHandBacks = new Map<string, Promise<void>>();
   private recoveryObservedDataVersion: string | undefined;
   private recoveryChangeScanAt = 0;
   private recoverySafetyScanAt = 0;
@@ -313,7 +319,7 @@ export class ReliableChildAgentCoordinator {
       // settings instead of the planning Turn's (see ChildSpawnAuthorityBound).
       authorityBound: 'executor_agent',
       leaseOwnerId: this.childLeaseOwnerId,
-      leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+      leaseExpiresAt: this.leaseExpiresAt()
     });
     const inheritedThinkingOverride = await this.dependencies.children.frozenChildThinkingOverrideForTurn(parentTurnId);
     await this.dependencies.modelProfiles.initializeConversation({
@@ -491,7 +497,7 @@ export class ReliableChildAgentCoordinator {
       conversationId: requireId(input.conversationId, 'conversationId'),
       leaseOwnerId: this.childLeaseOwnerId,
       hostBootId: this.dependencies.database.hostBootId,
-      leaseExpiresAt: leaseExpiry(this.timestamp(), 0),
+      leaseExpiresAt: this.leaseExpiresAt(),
       content: input.content,
       ...(input.contentType ? { contentType: input.contentType } : {}),
       ...(input.executorAgentId ? { executorAgentId: input.executorAgentId } : {}),
@@ -522,7 +528,7 @@ export class ReliableChildAgentCoordinator {
       conversationId: requireId(input.conversationId, 'conversationId'),
       leaseOwnerId: this.childLeaseOwnerId,
       hostBootId: this.dependencies.database.hostBootId,
-      leaseExpiresAt: leaseExpiry(this.timestamp(), 0),
+      leaseExpiresAt: this.leaseExpiresAt(),
       sourceTurnId: requireId(input.sourceTurnId, 'sourceTurnId'),
       target: input.target,
       ...(input.expectedMessageRevisionId
@@ -558,7 +564,7 @@ export class ReliableChildAgentCoordinator {
       conversationId: requireId(input.conversationId, 'conversationId'),
       leaseOwnerId: this.childLeaseOwnerId,
       hostBootId: this.dependencies.database.hostBootId,
-      leaseExpiresAt: leaseExpiry(this.timestamp(), 0),
+      leaseExpiresAt: this.leaseExpiresAt(),
       messageId: requireId(input.messageId, 'messageId'),
       ...(input.expectedRevisionId ? { expectedRevisionId: input.expectedRevisionId } : {}),
       content: input.content,
@@ -622,7 +628,16 @@ export class ReliableChildAgentCoordinator {
     this.launch(childExecutionId, turnId);
     const task = this.activeTurns.get(turnId);
     if (!task) throw new Error('Child 手动压缩维护 Turn 未进入子调度器。');
-    const driven = await task;
+    let driven: ReliableChildDriveResult;
+    try {
+      driven = await task;
+    } catch (error) {
+      if (!(error instanceof ChildConversationNotServedError)) throw error;
+      // Admitted, but this window stopped serving the child Conversation before driving it:
+      // record the maintenance Turn as failed rather than leave it active for no Host.
+      await this.failUnstartedChildCompression(childExecutionId, turnId);
+      throw new ConversationHostIneligibleError(input.conversationId, 'ineligible');
+    }
     if (driven.compression) {
       return {
         turnId,
@@ -638,6 +653,42 @@ export class ReliableChildAgentCoordinator {
     });
     if (!terminal) throw new Error('Child 手动压缩完成后缺少可回放的终态。');
     return { ...terminal, deduplicated: started.deduplicated };
+  }
+
+  /**
+   * A child maintenance Turn admitted here that this window may not drive (its eligibility changed
+   * in between; driveChild handed the lease back): the lease is taken again and the Turn recorded as
+   * failed, the counterpart of the runner's failUnstartedManualCompression. No model request was
+   * made. A live Host that took the lease meanwhile keeps it.
+   */
+  private async failUnstartedChildCompression(childExecutionId: string, turnId: string): Promise<void> {
+    const hostBootId = this.dependencies.database.hostBootId;
+    let fence = await this.dependencies.turns.heldExecutionLeaseFence({ turnId, leaseOwnerId: this.childLeaseOwnerId, hostBootId });
+    if (!fence) {
+      const claimed = await this.dependencies.turns.claimRecoveryExecution({
+        turnId,
+        leaseOwnerId: this.childLeaseOwnerId,
+        hostBootId,
+        leaseExpiresAt: this.leaseExpiresAt()
+      });
+      if (!claimed) return;
+      fence = {
+        id: claimed.executionLeaseId,
+        conversationId: claimed.conversationId,
+        turnId: claimed.turnId,
+        ownerId: this.childLeaseOwnerId,
+        hostBootId,
+        generation: BigInt(claimed.leaseGeneration)
+      };
+    }
+    const held = fence;
+    await runWithoutExecutionLeaseFence(() => runWithExecutionLeaseFence(held, () => this.dependencies.turns.terminal({
+      source: { kind: 'internal', key: `manual-compression-maintenance:${turnId}:not-served` },
+      turnId,
+      terminalStatus: 'failed',
+      reason: 'manual_context_compression_not_served_here'
+    })));
+    await this.finishStoppedChildTurn(childExecutionId, turnId);
   }
 
   /** Commits and immediately wakes an interrupt through the scheduler that owns this child Turn. */
@@ -728,8 +779,17 @@ export class ReliableChildAgentCoordinator {
     if (!child) return false;
     const conversationId = requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
     try {
-      const preview = await this.inspectChildTurnEffects(turnId);
+      let preview = await this.inspectChildTurnEffects(turnId);
       if (preview.state === 'live') return true;
+      // A window serving the child Conversation first recovers what an exited window left
+      // dispatched the way startup does (Phase D checks the workspace where it can); only what
+      // stays unresolved is closed by the stop below.
+      if (preview.state === 'dead' && this.dependencies.deadHostEffects?.runAll
+        && await this.dependencies.database.conversationOwners.executionEligibility(conversationId) === 'eligible') {
+        await this.dependencies.deadHostEffects.runAll(undefined, conversationId);
+        preview = await this.inspectChildTurnEffects(turnId);
+        if (preview.state === 'live') return true;
+      }
       if (preview.state === 'unsupported' || (
         preview.state === 'none'
         && await this.dependencies.database.conversationOwners.executionEligibility(conversationId) === 'eligible'
@@ -790,7 +850,7 @@ export class ReliableChildAgentCoordinator {
             turnId,
             leaseOwnerId: this.childLeaseOwnerId,
             hostBootId,
-            leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+            leaseExpiresAt: this.leaseExpiresAt()
           });
         } catch (error) {
           // The claim may have committed before a later read failed: hand back what this Host holds.
@@ -869,6 +929,76 @@ export class ReliableChildAgentCoordinator {
       this.reportRecoveryFailureOnce(error, 'recovery-child-control-settlement', turnId);
       return false;
     }
+  }
+
+  private leaseDurationMs(): number {
+    return this.dependencies.leaseDurationMs ?? CHILD_LEASE_DURATION_MS;
+  }
+
+  private leaseExpiresAt(): string {
+    return new Date(Date.parse(this.timestamp()) + this.leaseDurationMs()).toISOString();
+  }
+
+  /**
+   * Hands a child Turn's lease back from a Host that does not serve (or no longer serves) the child
+   * Conversation and does not drive the Turn, the counterpart of the Conversation runner's waiting
+   * Turn hand-back: this Host's native calls of the Turn finish first, then the lease row it holds
+   * goes back whether or not it expired (a child Turn waiting longer than its lease is still held
+   * by this live Host). The caller holds the child Conversation's ownership.
+   */
+  private async handBackChildLease(turnId: string): Promise<boolean> {
+    await this.dependencies.agentLoop.quiesceNativeCalls(turnId);
+    const fence = await this.dependencies.turns.heldExecutionLeaseFence({
+      turnId,
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId
+    });
+    return fence ? this.dependencies.turns.releaseExecutionLease(fence) : false;
+  }
+
+  /**
+   * A child Turn this Host holds the lease of while it does not serve the child Conversation (its
+   * folder left the window) and does not drive it: the lease goes back under the child
+   * Conversation's short control claim. When another window holds that Conversation right now the
+   * recovery polling retries. While this Host still runs native calls of the Turn the hand-back
+   * completes in the background, so a recovery pass never waits for them.
+   */
+  private async handBackIneligibleChildLease(turnId: string, conversationId: string): Promise<void> {
+    if (this.activeTurns.has(turnId) || this.leaseHandBacks.has(turnId)) return;
+    if (!await this.dependencies.turns.heldExecutionLeaseFence({
+      turnId,
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId
+    })) return;
+    const owners = this.dependencies.database.conversationOwners;
+    if (await owners.executionEligibility(conversationId) !== 'ineligible') return;
+    this.waitingOwned.delete(turnId);
+    const detached = this.dependencies.agentLoop.hasNativeCalls(turnId);
+    const handBack = (async () => {
+      await this.dependencies.agentLoop.quiesceNativeCalls(turnId);
+      if (this.disposing || this.handoff) return;
+      try {
+        await owners.run(conversationId, async () => {
+          // Re-checked under the claim: the folder may have come back meanwhile, and a drive owns its lease.
+          if (this.activeTurns.has(turnId) || await owners.executionEligibility(conversationId) !== 'ineligible') return;
+          await this.handBackChildLease(turnId);
+        });
+      } catch (error) {
+        if (!isConversationRuntimeOwnerBusyError(error)) throw error;
+        this.recoveryPollingNeeded = true;
+        this.ensureRecoveryPolling();
+      }
+    })().finally(() => {
+      if (this.leaseHandBacks.get(turnId) === handBack) this.leaseHandBacks.delete(turnId);
+    });
+    this.leaseHandBacks.set(turnId, handBack);
+    if (!detached) {
+      await handBack;
+      return;
+    }
+    void handBack.catch((error: unknown) => {
+      if (!this.disposing && !this.handoff) this.reportRecoveryFailureOnce(error, 'recovery-child-lease-hand-back', turnId);
+    });
   }
 
   private inspectChildTurnEffects(turnId: string): Promise<DeadHostTurnEffects> {
@@ -1243,6 +1373,13 @@ export class ReliableChildAgentCoordinator {
           report.terminalTurnsReconciled.push(turnId);
           continue;
         }
+        // A child Turn this window still holds (it waited for an answer here before the folder
+        // left) goes back for the window serving the child Conversation.
+        if (activeChildConversationId !== undefined) {
+          await this.handBackIneligibleChildLease(turnId, activeChildConversationId).catch((error: unknown) => {
+            this.reportRecoveryFailureOnce(error, 'recovery-child-lease-hand-back', turnId);
+          });
+        }
         // Another live owner drives this child; keep the level-triggered takeover edge alive.
         report.deferredTurnIds.push(turnId);
         continue;
@@ -1284,7 +1421,7 @@ export class ReliableChildAgentCoordinator {
             childExecutionId: entry.childExecutionId,
             turnIntentId: entry.turnIntentId,
             leaseOwnerId: this.childLeaseOwnerId,
-            leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+            leaseExpiresAt: this.leaseExpiresAt()
           });
           // Another Turn already took its delivery in: the intent was cancelled, nothing starts.
           if ('superseded' in admitted) return { kind: 'superseded' as const };
@@ -1392,7 +1529,7 @@ export class ReliableChildAgentCoordinator {
       turnId,
       leaseOwnerId: this.childLeaseOwnerId,
       hostBootId: this.dependencies.database.hostBootId,
-      leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+      leaseExpiresAt: this.leaseExpiresAt()
     });
     if (!claimed) return 'deferred';
     this.launch(childExecutionId, turnId);
@@ -1839,7 +1976,7 @@ export class ReliableChildAgentCoordinator {
       ...(deadline ? { waitDeadlineAt: deadline } : {}),
       title: requireText(args.taskName, 'run_agent.taskName').replace(/\s+/g, ' ').slice(0, 120),
       leaseOwnerId: this.childLeaseOwnerId,
-      leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
+      leaseExpiresAt: this.leaseExpiresAt()
     });
     await this.dependencies.modelProfiles.initializeConversation({
       conversationId: spawned.childConversationId,
@@ -2025,7 +2162,7 @@ export class ReliableChildAgentCoordinator {
           childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
           turnIntentId: sent.turnIntentId,
           leaseOwnerId: this.childLeaseOwnerId,
-          leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
+          leaseExpiresAt: this.leaseExpiresAt()
         });
         // A run_agent send has no delivery of its own, so it is never superseded.
         if ('superseded' in admitted) throw new Error(`run_agent send ${sent.turnIntentId} was cancelled as a runtime continuation.`);
@@ -2234,13 +2371,8 @@ export class ReliableChildAgentCoordinator {
       ? await owners.executionEligibility(conversationId) === 'eligible'
       : await owners.tryClaimEligible(conversationId) === 'owned';
     if (!serves) {
-      const fence = await this.dependencies.turns.executionLeaseFence({
-        turnId,
-        leaseOwnerId: this.childLeaseOwnerId,
-        hostBootId: this.dependencies.database.hostBootId
-      });
-      if (fence) await this.dependencies.turns.releaseExecutionLease(fence);
-      throw new ExecutionHandoffError(`Child Conversation ${conversationId} is not served by this Host.`);
+      await this.handBackChildLease(turnId);
+      throw new ChildConversationNotServedError(conversationId);
     }
     // The child Conversation's owner drives it. The activity pin holds ownership for the whole
     // drive and releases-if-idle afterwards, so ownership follows real work across Hosts.
@@ -2279,6 +2411,7 @@ export class ReliableChildAgentCoordinator {
         // Stopped between rounds because this Host no longer serves the child Conversation. A failed
         // hand-back is reported; the eligibility error stays the one the drive reports.
         await renewal.stop();
+        await this.dependencies.agentLoop.quiesceNativeCalls(turnId);
         await this.dependencies.turns.releaseExecutionLease(fence)
           .catch((releaseError: unknown) => this.reportError(releaseError, 'child-eligibility-lease-release', turnId));
         throw error;
@@ -2366,7 +2499,7 @@ export class ReliableChildAgentCoordinator {
         try {
           const renewed = await this.dependencies.turns.renewExecutionLease({
             fence,
-            leaseExpiresAt: new Date(Date.now() + 30_000).toISOString()
+            leaseExpiresAt: new Date(Date.now() + this.leaseDurationMs()).toISOString()
           });
           if (!renewed) throw new ExecutionHandoffError(
             `Child Turn ${fence.turnId} lost its ExecutionLease generation.`
@@ -2390,7 +2523,7 @@ export class ReliableChildAgentCoordinator {
           }
         }
       });
-    }, 10_000);
+    }, Math.max(1_000, Math.min(10_000, Math.floor(this.leaseDurationMs() / 3))));
     timer.unref();
     return {
       stop: async () => {
@@ -2836,10 +2969,7 @@ function assertExpectedPlanDelegation(
   }
 }
 
-function leaseExpiry(now: string, foregroundWaitMs: number): string {
-  void foregroundWaitMs;
-  return new Date(Date.parse(now) + 30_000).toISOString();
-}
+const CHILD_LEASE_DURATION_MS = 30_000;
 
 function requireWaitMs(value: PlainJsonValue | undefined): number {
   if (value === undefined) return 0;
@@ -3019,4 +3149,12 @@ function compareCounter(left: unknown, right: unknown): number {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(1, ms)));
+}
+
+/** driveChild in a window that does not serve the child Conversation (its lease went back). */
+class ChildConversationNotServedError extends ExecutionHandoffError {
+  public constructor(conversationId: string) {
+    super(`Child Conversation ${conversationId} is not served by this Host.`);
+    this.name = 'ChildConversationNotServedError';
+  }
 }

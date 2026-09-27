@@ -1017,6 +1017,39 @@ export class TurnControlPlane {
     };
   }
 
+  /**
+   * The fence of the lease row this owner holds on an active Turn, whether or not it has expired.
+   * A Turn that waits for an answer stops renewing its lease, yet the lease stays this live Host's:
+   * no other Host may take it over (claimRecoveryExecution never displaces a live Host), so handing
+   * it back must not depend on expiry. releaseExecutionLease asserts this exact row before writing.
+   */
+  public async heldExecutionLeaseFence(input: {
+    turnId: string;
+    leaseOwnerId: string;
+    hostBootId: string;
+  }): Promise<ExecutionLeaseFence | null> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const leaseOwnerId = requireId(input.leaseOwnerId, 'leaseOwnerId');
+    const hostBootId = requireId(input.hostBootId, 'hostBootId');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { turn_id: turnId }, limit: 2 })
+    ]);
+    const turn = snapshot.snapshot[0];
+    const leases = rows(snapshot.snapshot[1]);
+    if (!turn || Array.isArray(turn) || turn.status !== TURN_STATUS_ACTIVE || leases.length !== 1) return null;
+    const lease = leases[0];
+    if (lease.owner_id !== leaseOwnerId || lease.host_boot_id !== hostBootId) return null;
+    return {
+      id: requireId(lease.id, 'ExecutionLease.id'),
+      conversationId: requireId(lease.conversation_id, 'ExecutionLease.conversation_id'),
+      turnId,
+      ownerId: leaseOwnerId,
+      hostBootId,
+      generation: requirePositiveInteger(lease.generation, 'ExecutionLease.generation')
+    };
+  }
+
   /** Renews only the exact captured generation; a recovered owner makes this a harmless loser. */
   public async renewExecutionLease(input: {
     fence: ExecutionLeaseFence;
