@@ -70,6 +70,20 @@ async function main() {
     return mkdir.call(this, directory, ...rest);
   };
 
+  // An empty target is written in batches (no merge backup): killed once the first batch of the
+  // current data set is committed in the receiving root.
+  const { RuntimeDatabase } = require(path.join(compiled, 'backend/reliableKernel/runtimeDatabase.js'));
+  const { resolveVscodeRuntimeDataRoot } = require(path.join(compiled, 'backend/reliableKernel/vscodeRootAuthority.js'));
+  const receivingRoot = path.resolve(resolveVscodeRuntimeDataRoot({ globalStoragePath: target }));
+  const transaction = RuntimeDatabase.prototype.transaction;
+  RuntimeDatabase.prototype.transaction = async function hookedTransaction(...rest) {
+    const result = await transaction.apply(this, rest);
+    if (scenario === 'during-merge' && kind === 'empty' && path.resolve(this.binding.paths.dataRootPath) === receivingRoot) {
+      kill('batched copy (first batch committed)');
+    }
+    return result;
+  };
+
   await relocate(fixture, plan, {
     relocationId,
     publish: async () => {

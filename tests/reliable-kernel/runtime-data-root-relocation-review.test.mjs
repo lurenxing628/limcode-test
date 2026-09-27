@@ -238,7 +238,7 @@ test('#15 新目录正被其它 LimCode 窗口使用时不迁入', async (t) => 
   } finally { await window.close(); }
 });
 
-test('临时上限（合并引擎的单事务硬上限）：当前库超过上限时预检直接拒绝（目标不被创建）；其它库超限时留在旧目录', async (t) => {
+test('行数上限只管合并进已有 LimCode 数据：迁入新建根时当前库和其它库都不受限；已有目标时当前库超限在任何协调之前拒绝，目标不改动', async (t) => {
   const fixture = await createFixture(t);
   const bulk = (databasePath, prefix) => {
     const database = new Database(databasePath);
@@ -250,17 +250,41 @@ test('临时上限（合并引擎的单事务硬上限）：当前库超过上�
     } finally { database.close(); }
   };
   bulk(fixture.alpha.binding.paths.databasePath, 'conversation_bulk_alpha');
-  const target = path.join(fixture.base, 'moved');
-  const withLargeOther = await planWithRuntime(fixture, target);
-  assert.deepEqual(withLargeOther.problems, []);
-  assert.match(withLargeOther.others[0].leaveBehind, /数据较多/);
   bulk(fixture.current.binding.paths.databasePath, 'conversation_bulk_current');
-  const refused = await planWithRuntime(fixture, target);
-  assert.match(refused.problems.join('\n'), /当前版本暂不能迁移；旧目录不受影响/);
-  assert.ok(refused.current.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
-  await assert.rejects(fs.stat(target), { code: 'ENOENT' });
+  const fresh = await planWithRuntime(fixture, path.join(fixture.base, 'moved'));
+  assert.deepEqual(fresh.problems, [], '新建根按批写入，不受单事务上限');
+  assert.ok(fresh.current.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
+  assert.equal(fresh.others[0].leaveBehind, undefined, '其它库总是进新建根，不再因行数留在旧目录');
+  const existing = path.join(fixture.base, 'existing');
+  await createLimCodeTarget(existing);
+  const before = await treeSnapshot(existing);
+  const refused = await planWithRuntime(fixture, existing);
+  assert.equal(refused.target.kind, 'limcode');
+  assert.match(refused.problems.join('\n'), /合并一次最多 \d+ 行），当前版本暂不能迁移到这个目录；旧目录不受影响/);
+  assert.deepEqual(await treeSnapshot(existing), before, '预检不改动已有目标');
   const controlRoot = path.dirname(fixture.current.binding.paths.dataRootPath);
   assert.deepEqual((await fs.readdir(controlRoot)).filter((name) => name.startsWith('relocation-count-')), [], '计数用的副本已删除');
+});
+
+test('其它历史库在线阶段已整库复制进新根：之后没变的直接保留，之后有写入的在独占阶段丢弃重做，迁移结果与来源一致', async (t) => {
+  for (const changed of [false, true]) {
+    const fixture = await createFixture(t);
+    const target = path.join(fixture.base, `moved-${changed}`);
+    const plan = await planWithRuntime(fixture, target);
+    const source = await openRuntime(fixture.current);
+    let staged;
+    try { staged = await relocation.stageDataRootRelocation(plan, source, {}); }
+    finally { await source.close(); }
+    const receipt = staged.precopiedOthers[fixture.alpha.id];
+    assert.ok(receipt && receipt.rows > 0, '在线阶段已复制其它库');
+    assert.ok(staged.precopied.verification.size > 0, '当前库预复制带回已校验正文的元数据');
+    if (changed) await seed(fixture.alpha, [{ id: 'conversation_alpha_after_stage', project: PROJECT }]);
+    const result = await relocation.completeDataRootRelocation(staged, async () => undefined, {});
+    assert.deepEqual(result.others.migrated, [fixture.alpha.id]);
+    const moved = await rootAuthority.resolveVscodeRuntimeDataSet({ globalStoragePath: target }, fixture.alpha.id);
+    assert.deepEqual(conversationIds(moved.runtimeDataRootPath), conversationIds(fixture.alpha.binding.paths.dataRootPath));
+    assert.equal(conversationIds(moved.runtimeDataRootPath).includes('conversation_alpha_after_stage'), changed);
+  }
 });
 
 test('空间预估按盘核对：新目录约 2×数据库、临时目录 1×数据库、旧目录 1×数据库，同一块盘合计；只遍历一次', async (t) => {

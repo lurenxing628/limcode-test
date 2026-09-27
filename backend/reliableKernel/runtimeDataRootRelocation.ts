@@ -14,9 +14,11 @@ import { ROOT_BINDING_POINTER_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } fro
 import type { HistoricalRootBinding } from './rootAuthority';
 import { classifyRecordedProcess, ownProcessStartIdentity } from './runtimeClaimPrimitives';
 import { initializeEmptyRuntimeRoot, RuntimeDatabase } from './runtimeDatabase';
+import { copyRuntimeDataSetIntoEmptyRoot, ensureRuntimeDataSetCopyCurrent, type RuntimeDataSetCopyReceipt } from './runtimeDataSetBulkCopy';
 import {
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY,
-  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY, type RuntimeDataSetMergeOptions,
+  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY, type RuntimeDataSetCasPrecopy,
+  type RuntimeDataSetCasVerification, type RuntimeDataSetMergeOptions,
   type RuntimeDataSetMergeResult
 } from './runtimeDataSetMerge';
 import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
@@ -189,7 +191,10 @@ export interface StagedDataRootRelocation {
   relocationId: string;
   startedAt: string;
   receiving: { id: string; runtimeDataRootPath: string; binding: HistoricalRootBinding };
-  precopied: { copiedCasObjects: number; linkedCasObjects: number; reusedCasObjects: number };
+  /** The current data set's CAS pre-copy, with the verified objects' file identities (skipped when unchanged). */
+  precopied: RuntimeDataSetCasPrecopy;
+  /** Other data sets already copied whole into fresh roots of the target while every window kept working. */
+  precopiedOthers: Record<string, RuntimeDataSetCopyReceipt>;
 }
 
 export interface DataRootRelocationResult {
@@ -419,12 +424,6 @@ export async function planDataRootRelocation(input: {
   const currentSize = await measureDataSet(currentBinding);
   const currentRows = await countRows(currentCandidate, currentBinding, input.sourceDatabase);
   const current = { ...identityOf(currentCandidate), ...currentSize, rows: currentRows };
-  // Temporary: the move is one merge-engine transaction whose memory grows with the rows, so the
-  // engine's one-transaction bound applies until the move is written in batches; refused here,
-  // before any window is involved.
-  if (currentRows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS) {
-    problems.push(`当前历史库数据较多（约 ${currentRows} 行记录，当前版本最多迁移 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 行），当前版本暂不能迁移；旧目录不受影响，可以继续使用。`);
-  }
   const others: DataRootRelocationPlan['others'] = [];
   for (const candidate of inspection.candidates) {
     if (candidate.selected || !candidate.dataSetId || !candidate.rootInstanceId) continue;
@@ -436,8 +435,7 @@ export async function planDataRootRelocation(input: {
     }
     const size = await measureDataSet(binding);
     const rows = await countRows(candidate, binding).catch(() => undefined);
-    const leaveBehind = rows === undefined ? '无法读取这个历史库（可能需要先在旧目录里打开一次完成升级）'
-      : rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS ? `数据较多（约 ${rows} 行记录），当前版本暂不能迁移` : undefined;
+    const leaveBehind = rows === undefined ? '无法读取这个历史库（可能需要先在旧目录里打开一次完成升级）' : undefined;
     others.push({ ...identityOf(candidate), ...size, ...(rows !== undefined ? { rows } : {}), ...(leaveBehind ? { leaveBehind } : {}) });
   }
   for (const problem of inspection.problems) {
@@ -463,6 +461,11 @@ export async function planDataRootRelocation(input: {
   if (target.kind === 'copied') warnings.push(target.message);
   if (target.kind === 'occupied') {
     problems.push(`所选文件夹里已有其它文件（${target.entries.length} 项），LimCode 只能放在其中新建的子文件夹里：${target.suggestedPath}`);
+  }
+  if (target.kind === 'limcode' && currentRows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS) {
+    // Into an existing data set the move is one merge transaction whose memory grows with the rows
+    // (a fresh root is written in batches instead); refused here, before any window is involved.
+    problems.push(`新数据目录里已有 LimCode 数据，当前历史库要一次合并进去；它的数据较多（约 ${currentRows} 行记录，合并一次最多 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 行），当前版本暂不能迁移到这个目录；旧目录不受影响，可以继续使用。可以改选一个空文件夹。`);
   }
   if (target.kind === 'limcode') {
     warnings.push('新数据目录里已有 LimCode 数据：当前历史会合并进去（同一条记录内容不同时整体取消，两边都不改）；设置按记录合并，同一项以当前在用的为准，被替换的旧版本放进新目录的备份文件夹。');
@@ -822,6 +825,9 @@ export async function stageDataRootRelocation(
     }
   });
   try {
+    // Other data sets first: their hard links would otherwise change the ctime of objects shared
+    // with the current data set after its pre-copy recorded them.
+    const precopiedOthers = await precopyOthers(plan, relocationId, receiving.id, options);
     options.onProgress?.('正在预先复制正文文件');
     const precopied = await precopyRuntimeDataSetCas({ globalStoragePath: plan.sourceRootPath }, {
       candidateId: plan.current.id, expectedDataSetId: plan.current.dataSetId, expectedRootInstanceId: plan.current.rootInstanceId
@@ -829,7 +835,7 @@ export async function stageDataRootRelocation(
       ...(options.linkFile ? { linkFile: options.linkFile } : {}),
       ...(sourceDatabase ? { sourceDatabase } : {})
     });
-    return { plan, relocationId, startedAt, receiving, precopied };
+    return { plan, relocationId, startedAt, receiving, precopied, precopiedOthers };
   } catch (error) {
     await abandonStagedDataRootRelocation({ plan, relocationId }).catch((undoError: unknown) => {
       console.error('[LimCode] 撤销迁移准备失败。', undoError);
@@ -934,7 +940,8 @@ export async function completeDataRootRelocation(
       const configuration = await transferConfiguration(source, target, journal);
       options.onProgress?.('正在迁移当前历史库');
       if (plan.target.kind === 'limcode') await backupReceivingDatabase(target, staged.receiving, journal);
-      const merged = await mergeInto(sourcePaths, target, plan.current, staged.receiving.runtimeDataRootPath, options, plan.target.kind !== 'limcode');
+      const merged = await mergeInto(sourcePaths, target, plan.current, staged.receiving.runtimeDataRootPath, options, plan.target.kind !== 'limcode',
+        staged.precopied.verification);
       if (plan.target.kind === 'limcode' && merged.backupPath) await journal.append({ op: 'entry', path: path.relative(target, merged.backupPath) });
       const others = await migrateOthers(staged, current, journal, options);
       if (plan.target.kind !== 'limcode') {
@@ -980,8 +987,10 @@ export async function completeDataRootRelocation(
 }
 
 /**
- * `freshRoot`: the receiving root was created by this relocation, so the merge's own pre-merge
- * backup only holds an empty database and is removed again.
+ * `freshRoot`: the receiving root was created by this relocation and is still empty, so the data
+ * set is copied into it in batches (copyRuntimeDataSetIntoEmptyRoot; the caller holds the target's
+ * admission and undoes the whole root on failure). An existing receiving data set gets one merge
+ * transaction (bounded by the plan's row check).
  */
 async function mergeInto(
   sourcePaths: { globalStoragePath: string },
@@ -989,26 +998,84 @@ async function mergeInto(
   dataSet: { id: string; dataSetId: string; rootInstanceId: string },
   runtimeDataRootPath: string,
   options: DataRootRelocationOptions,
-  freshRoot: boolean
+  freshRoot: boolean,
+  casVerification?: RuntimeDataSetCasVerification
 ): Promise<RuntimeDataSetMergeResult> {
+  const input = { candidateId: dataSet.id, expectedDataSetId: dataSet.dataSetId, expectedRootInstanceId: dataSet.rootInstanceId };
+  if (freshRoot) {
+    return copyResult(await copyRuntimeDataSetIntoEmptyRoot(sourcePaths, input, { configurationRootPath: target, runtimeDataRootPath }, {
+      ...(options.linkFile ? { linkFile: options.linkFile } : {}), ...(casVerification ? { casVerification } : {})
+    }));
+  }
   const authority = createVscodeRootAuthority({ runtimeDataRootPath, configurationRootPath: target });
-  const merged = await withRuntimeMaintenance(authority.expectedPaths(), async () => {
+  return withRuntimeMaintenance(authority.expectedPaths(), async () => {
     const database = await RuntimeDatabase.open(authority, { hostBootId: `data-root-relocation-${randomUUID()}` });
     try {
-      return await mergeRuntimeDataSetIntoDatabase(sourcePaths, {
-        candidateId: dataSet.id, expectedDataSetId: dataSet.dataSetId, expectedRootInstanceId: dataSet.rootInstanceId
-      }, { configurationRootPath: target, database }, { migration: true, ...(options.linkFile ? { linkFile: options.linkFile } : {}) });
+      return await mergeRuntimeDataSetIntoDatabase(sourcePaths, input, { configurationRootPath: target, database },
+        { migration: true, ...(options.linkFile ? { linkFile: options.linkFile } : {}) });
     } finally {
       await database.close();
     }
   });
-  if (freshRoot && merged.backupPath) {
-    await fs.rm(merged.backupPath, { recursive: true, force: true });
-    await fs.rmdir(path.dirname(merged.backupPath)).catch(() => undefined);
-    const { backupPath: _discarded, ...result } = merged;
-    return result;
+}
+
+function copyResult(receipt: RuntimeDataSetCopyReceipt): RuntimeDataSetMergeResult {
+  return {
+    candidateId: receipt.candidateId, sourceDataSetId: receipt.source.dataSetId, targetDataSetId: receipt.target.dataSetId,
+    insertedRows: receipt.rows, reusedRows: 0, insertedConversations: receipt.insertedConversations, ...receipt.cas, recoveredCommit: false,
+    ...(receipt.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: receipt.upgradedFromEpoch } : {})
+  };
+}
+
+/**
+ * Online part of moving the other data sets: each one that will move gets a fresh root in the
+ * target (journaled) and is copied whole while every window keeps working; the exclusive phase keeps
+ * the copy when the source's files are unchanged and redoes it otherwise. One that cannot be copied
+ * now (in use by an old window, an unreadable state) is simply tried again in the exclusive phase.
+ */
+async function precopyOthers(
+  plan: DataRootRelocationPlan,
+  relocationId: string,
+  receivingId: string,
+  options: DataRootRelocationOptions
+): Promise<Record<string, RuntimeDataSetCopyReceipt>> {
+  const target = plan.targetRootPath;
+  const sourcePaths = { globalStoragePath: plan.sourceRootPath };
+  const taken = new Set(plan.target.kind === 'limcode' ? plan.target.dataSetIds : []);
+  taken.add(receivingId);
+  const ledger = await readRuntimeDataSetMergeLedger(sourcePaths).catch(() => new Map());
+  const journal = RelocationJournal.open(target, relocationId);
+  const receipts: Record<string, RuntimeDataSetCopyReceipt> = {};
+  for (const [index, other] of plan.others.entries()) {
+    if (other.leaveBehind || taken.has(other.id)) continue;
+    const record = ledger.get(other.id);
+    const lastMerge = record ? runtimeDataSetLastMerge(record) : undefined;
+    // Probably carried by the current data set (confirmed by fingerprint in the exclusive phase).
+    if (lastMerge && sameRuntimeDataSetIdentity(lastMerge.target, plan.current)) continue;
+    options.onProgress?.(`正在预先复制其它历史库（${index + 1}/${plan.others.length}）`);
+    let created: string | undefined;
+    try {
+      receipts[other.id] = await withRuntimeDataRootAdmission(target, async () => {
+        const runtimeDataRootPath = resolveVscodeRuntimeDataRoot({ globalStoragePath: resolveVscodeRuntimeDataSetScopeRoot(target, other.id) });
+        if (await pathExists(path.dirname(runtimeDataRootPath))) throw new Error('新数据目录里已有这个历史库的目录');
+        created = await firstMissingAncestor(target, path.dirname(runtimeDataRootPath));
+        await createDataSetRoot(target, other.id, journal);
+        await initializeFreshRoot(target, runtimeDataRootPath);
+        return copyRuntimeDataSetIntoEmptyRoot(sourcePaths, {
+          candidateId: other.id, expectedDataSetId: other.dataSetId, expectedRootInstanceId: other.rootInstanceId
+        }, { configurationRootPath: target, runtimeDataRootPath }, options.linkFile ? { linkFile: options.linkFile } : {});
+      });
+    } catch (error) {
+      console.warn(`[LimCode] 预先复制历史库 ${other.id} 未完成，独占阶段再迁移：${errorMessage(error)}`);
+      if (created) await fs.rm(created, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
-  return merged;
+  return receipts;
+}
+
+async function initializeFreshRoot(target: string, runtimeDataRootPath: string): Promise<void> {
+  const authority = createVscodeRootAuthority({ runtimeDataRootPath, configurationRootPath: target });
+  await withRuntimeMaintenance(authority.expectedPaths(), () => initializeEmptyRuntimeRoot(authority));
 }
 
 /**
@@ -1076,18 +1143,29 @@ async function migrateOthers(
       const record = ledger.get(other.id);
       const lastMerge = record ? runtimeDataSetLastMerge(record) : undefined;
       if (lastMerge && sameRuntimeDataSetIdentity(lastMerge.target, current) && sameRuntimeDataSetFingerprint(lastMerge.source, fingerprint)) {
+        const copied = staged.precopiedOthers[other.id];
+        if (copied) await fs.rm(path.dirname(copied.target.runtimeDataRootPath), { recursive: true, force: true });
         migrated.push({ ...identityOf(candidate), fingerprint, mergedInto: current.id });
         result.covered.push(other.id);
         continue;
       }
       const scopeRoot = resolveVscodeRuntimeDataSetScopeRoot(target, other.id);
       const runtimeDataRootPath = resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot });
-      if (await pathExists(path.dirname(runtimeDataRootPath))) throw new Error('新数据目录里已有这个历史库的目录');
-      created = await firstMissingAncestor(target, path.dirname(runtimeDataRootPath));
-      await createDataSetRoot(target, other.id, journal);
-      const authority = createVscodeRootAuthority({ runtimeDataRootPath, configurationRootPath: target });
-      await withRuntimeMaintenance(authority.expectedPaths(), () => initializeEmptyRuntimeRoot(authority));
-      await mergeInto(sourcePaths, target, other, runtimeDataRootPath, options, true);
+      const precopied = staged.precopiedOthers[other.id];
+      if (precopied) {
+        // Copied while the windows kept working: kept when the source files are unchanged, else
+        // the fresh root is emptied and the data set copied again now.
+        await ensureRuntimeDataSetCopyCurrent(sourcePaths, precopied, async () => {
+          await fs.rm(path.dirname(runtimeDataRootPath), { recursive: true, force: true });
+          await initializeFreshRoot(target, runtimeDataRootPath);
+        }, options.linkFile ? { linkFile: options.linkFile } : {});
+      } else {
+        if (await pathExists(path.dirname(runtimeDataRootPath))) throw new Error('新数据目录里已有这个历史库的目录');
+        created = await firstMissingAncestor(target, path.dirname(runtimeDataRootPath));
+        await createDataSetRoot(target, other.id, journal);
+        await initializeFreshRoot(target, runtimeDataRootPath);
+        await mergeInto(sourcePaths, target, other, runtimeDataRootPath, options, true);
+      }
       await markVscodeRuntimeDataSetKept(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, other.id));
       migrated.push({ ...identityOf(candidate), fingerprint });
       result.migrated.push(other.id);
