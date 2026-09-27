@@ -103,6 +103,101 @@ test('发起方自身忙碌只看任务不看焦点（requesterWorkBusy）', asy
     { kind: 'work', reason: '本窗口有任务正在进行' });
 });
 
+test('打开运行时等待时说明原因：持有方在做什么、已进行多久、阶段；只是另一个窗口在打开时照实说；等太久或没有进展时只给“继续等待 / 关闭窗口”', async () => {
+  const events = { progress: [], warnings: [], commands: [] };
+  const answers = [];
+  const vscode = {
+    ProgressLocation: { Notification: 15 },
+    window: {
+      withProgress: async (options, task) => {
+        events.progress.push(['open', options.title]);
+        await task({ report: (value) => events.progress.push(['report', value.message]) });
+        events.progress.push(['closed']);
+      },
+      showWarningMessage: async (message, ...actions) => {
+        events.warnings.push({ message, actions });
+        return answers.shift();
+      }
+    },
+    commands: { executeCommand: async (id) => { events.commands.push(id); } }
+  };
+  const opening = loadLayerModule('vscode/runtimeOpeningWait.ts', { vscode });
+  const describe = (wait) => ({ ...opening.describeRuntimeOpeningWait(wait) });
+  assert.deepEqual({ ...describe({ waitedMs: 1_500 }).status }, {
+    title: '正在等待其它窗口', description: '正在等待其它窗口完成打开（已等待 2 秒），完成后自动打开；未发送的输入已保留。'
+  });
+  const migrating = { operation: 'data-root-migration', description: '迁移数据目录', runningMs: 12_400, heartbeatAgeMs: 800, stale: false };
+  assert.equal(describe({ waitedMs: 3_000, activity: migrating }).status.description,
+    '另一个窗口正在迁移数据目录（已进行 12 秒），完成后自动打开；未发送的输入已保留。');
+  assert.equal(describe({ waitedMs: 3_000, activity: { ...migrating, stage: '正在复制正文（3/10）', runningMs: 300_000 } }).status.description,
+    '另一个窗口正在迁移数据目录（已进行 5 分钟，正在复制正文（3/10）），完成后自动打开；未发送的输入已保留。');
+  assert.equal(describe({ waitedMs: 3_000, activity: migrating }).warning, undefined);
+  assert.match(describe({ waitedMs: 11 * 60_000, activity: migrating }).warning, /本窗口已等待 11 分钟。本窗口会继续等它结束，不会跳过它直接打开；也可以关闭本窗口。/);
+  assert.match(describe({ waitedMs: 61_000 }).warning, /另一个窗口一直没有完成打开/);
+  const stale = describe({ waitedMs: 20_000, activity: { ...migrating, heartbeatAgeMs: 31_000, stale: true } });
+  assert.match(stale.status.description, /^另一个窗口正在迁移数据目录，已经 31 秒没有进展（可能卡在网络盘或外置盘上）/);
+  assert.match(stale.warning, /不会跳过它直接打开/);
+
+  const statuses = [];
+  const presenter = opening.createRuntimeOpeningWaitPresenter((status) => statuses.push(status && { ...status }));
+  presenter.onWait({ waitedMs: 1_000 });
+  presenter.onWait({ waitedMs: 1_200 });
+  presenter.onWait({ waitedMs: 2_000, activity: migrating });
+  assert.deepEqual(statuses.map((status) => status.description), [
+    '正在等待其它窗口完成打开（已等待 1 秒），完成后自动打开；未发送的输入已保留。',
+    '另一个窗口正在迁移数据目录（已进行 12 秒），完成后自动打开；未发送的输入已保留。'
+  ], 'the shell is updated only when the text changes');
+  assert.equal(events.progress.filter((entry) => entry[0] === 'open').length, 1, 'one notification for the whole wait');
+  // The holder stopped making progress: warned once; the user keeps waiting, then no new warning at once.
+  answers.push('继续等待');
+  presenter.onWait({ waitedMs: 30_000, activity: { ...migrating, heartbeatAgeMs: 20_000, stale: true } });
+  await delay(10);
+  presenter.onWait({ waitedMs: 31_000, activity: { ...migrating, heartbeatAgeMs: 21_000, stale: true } });
+  await delay(10);
+  assert.equal(events.warnings.length, 1);
+  assert.deepEqual([...events.warnings[0].actions], ['继续等待', '关闭窗口']);
+  assert.deepEqual(events.commands, [], 'keeps waiting: never opens past the lock');
+  presenter.end();
+  await delay(10);
+  assert.equal(statuses.at(-1), undefined);
+  assert.deepEqual(events.progress.at(-1), ['closed']);
+
+  // Known at once (a data-directory move recorded as running): shown before any wait was measured.
+  const announced = [];
+  const early = opening.createRuntimeOpeningWaitPresenter((status) => announced.push(status?.description));
+  early.announce('正在迁移数据目录，完成后自动打开；未发送的输入已保留。');
+  early.onWait({ waitedMs: 1_000, activity: migrating });
+  early.end();
+  assert.deepEqual(announced, ['正在迁移数据目录，完成后自动打开；未发送的输入已保留。',
+    '另一个窗口正在迁移数据目录（已进行 12 秒），完成后自动打开；未发送的输入已保留。', undefined]);
+  assert.equal(events.progress.filter((entry) => entry[0] === 'open').length, 2, 'one notification per opening');
+
+  // “关闭窗口” closes this window; nothing else happens.
+  const closing = opening.createRuntimeOpeningWaitPresenter(() => {});
+  answers.push('关闭窗口');
+  closing.onWait({ waitedMs: 30_000, activity: { ...migrating, heartbeatAgeMs: 20_000, stale: true } });
+  await delay(10);
+  assert.deepEqual(events.commands, ['workbench.action.closeWindow']);
+  closing.end();
+});
+
+test('打开外壳读取启动等待原因：变化时通知，运行时就绪后不再接受', async () => {
+  const { ApplicationStartup } = require(path.join(compiled, 'vscode/ApplicationStartup.js'));
+  const startup = new ApplicationStartup();
+  const seen = [];
+  const subscription = startup.onDidChangeWaiting((status) => seen.push(status));
+  const status = { title: '正在等待另一个窗口', description: '另一个窗口正在迁移数据目录（已进行 3 秒），完成后自动打开；未发送的输入已保留。' };
+  startup.reportWaiting(status);
+  assert.deepEqual(startup.waiting(), status);
+  startup.reportWaiting(undefined);
+  startup.resolve({});
+  startup.reportWaiting(status);
+  subscription.dispose();
+  startup.reportWaiting(undefined);
+  assert.deepEqual(seen, [status, undefined]);
+  assert.equal(startup.waiting(), undefined);
+});
+
 // ---------------------------------------------------------------------------------------------
 // Part 2: every window is its own process, opened like a real startup.
 // ---------------------------------------------------------------------------------------------
@@ -329,6 +424,23 @@ function vscodeMock(window, onReload, cancel = false) {
       }
     }
   };
+}
+
+/** Loads a real VS Code layer module (TypeScript source) with the given dependencies. */
+function loadLayerModule(file, dependencies) {
+  const ts = require('typescript');
+  const filename = path.resolve(file);
+  const module = { exports: {} };
+  vm.runInNewContext(ts.transpileModule(fsSync.readFileSync(filename, 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
+  }).outputText, {
+    module, exports: module.exports, console, setInterval, clearInterval, setTimeout, clearTimeout, Promise,
+    require(name) {
+      if (!Object.prototype.hasOwnProperty.call(dependencies, name)) throw new Error(`Unexpected dependency ${name}`);
+      return dependencies[name];
+    }
+  }, { filename });
+  return module.exports;
 }
 
 /** Loads the real VS Code layer with a per-window vscode mock. */

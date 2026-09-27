@@ -68,9 +68,13 @@ export class MainPanel {
           const serialized = optionsFromSerializedState(state, webviewPanel.title);
           let disposed = false;
           const startupDispose = webviewPanel.onDidDispose(() => { disposed = true; });
-          MainPanel.renderInitializing(webviewPanel, serialized);
+          MainPanel.renderInitializing(webviewPanel, serialized, startup.waiting());
+          // While another window holds the data directory, the shell says why and for how long.
+          const waiting = startup.onDidChangeWaiting((status) => {
+            if (!disposed) MainPanel.renderInitializing(webviewPanel, serialized, status);
+          });
           try {
-            const backendApp = await startup.wait();
+            const backendApp = await startup.wait().finally(() => waiting.dispose());
             const options = await resolveRestoredPanelOptions(backendApp, serialized);
             if (disposed) {
               startupDispose.dispose();
@@ -333,8 +337,16 @@ export class MainPanel {
     panel.webview.html = getUnavailableWebviewHtml(message);
   }
 
-  private static renderInitializing(panel: vscode.WebviewPanel, options: MainPanelOptions): void {
+  private static renderInitializing(
+    panel: vscode.WebviewPanel,
+    options: MainPanelOptions,
+    waiting?: { title: string; description: string }
+  ): void {
     panel.webview.options = { enableScripts: false };
+    if (waiting) {
+      panel.webview.html = getInitializingWebviewHtml(waiting.title, waiting.description);
+      return;
+    }
     const kind = panelKind(options);
     const target = kind === 'globalSettings'
       ? '设置'

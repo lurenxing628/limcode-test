@@ -48,16 +48,25 @@ async function startApplication(
       mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup
     } = await import('./commands/runtimeDataSetManagement');
     const dataRootCommands = await import('./commands/dataRootRelocation');
+    // Another window may hold the data directory (a migration, a large merge, or it is opening):
+    // after a second the shell and a notification say why and for how long; never opens past it.
+    const { createRuntimeOpeningWaitPresenter } = await import('./runtimeOpeningWait');
+    const openingWait = createRuntimeOpeningWaitPresenter((status) => startup.reportWaiting(status));
     // A window that reloaded for a data-directory move waits on the old directory until the move
-    // ends; it says so. A move whose process is gone is undone first.
+    // ends; it says so at once. A move whose process is gone is undone first.
     const waiting = await dataRootCommands.beforeDataRootOpen(context).catch((error) => {
       console.warn(`${EXTENSION_BRAND} data root relocation check failed.`, error);
       return undefined;
     });
-    const opening = openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context));
-    const application = waiting
-      ? await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: waiting }, () => opening)
-      : await opening;
+    if (waiting) openingWait.announce(`${waiting}；未发送的输入已保留。`);
+    let application: Awaited<ReturnType<typeof VscodeReliableKernelApplicationFacade.open>>;
+    try {
+      application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context, {
+        onRuntimeWait: (wait) => { if (activeStartup === startup) openingWait.onWait(wait); }
+      }));
+    } finally {
+      openingWait.end();
+    }
     const applicationOpenedAt = Date.now();
 
     // Deactivation may race a slow filesystem/SQLite open. Publish the result so deactivate() can

@@ -26,7 +26,7 @@ const { createCachedProcessClassifier, ownProcessStartIdentity } = kernelFile('r
 const processProtocol = kernelFile('processProtocol.js');
 const {
   isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, openUnderCurrentDataRootAdmission,
-  withRuntimeDataRootAdmission, withRuntimeMaintenance
+  runtimeDataRootAdmissionClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance, withRuntimeMaintenanceActivity
 } = kernelFile('runtimeHostControl.js');
 const {
   readExclusiveMaintenanceRequests, registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance,
@@ -621,6 +621,42 @@ test('窗口是否空闲复用对话的待办工作判定：执行中的命令�
   ]);
   await database.conversationOwners.claim('conversation_running');
   assert.equal(await busy(), true, 'durable pending work of an owned conversation is busy');
+});
+
+test('持有方没有发布标记时只说在等其它窗口；标记属于别的持有方时不采用；心跳停止时报告没有进展，但从不越过锁', async (t) => {
+  const { root } = await createRoot(t);
+  await assert.rejects(withRuntimeMaintenanceActivity({ operation: 'x', description: '整理' }, async () => 1), /只能在持有/);
+  let holding;
+  const held = new Promise((resolve) => { holding = resolve; });
+  let letGo;
+  const gate = new Promise((resolve) => { letGo = resolve; });
+  const holder = withRuntimeDataRootAdmission(root, async () => { holding(); await gate; });
+  await held;
+  const waits = [];
+  const opening = new Promise((resolve) => setImmediate(resolve)).then(() =>
+    openUnderCurrentDataRootAdmission(async () => root, async () => 'opened', 5, { onWait: (wait) => waits.push(wait) }));
+  const claim = runtimeDataRootAdmissionClaimPath(root);
+  const { claimToken } = JSON.parse(await fs.readFile(path.join(claim, 'owner.json'), 'utf8'));
+  const marker = (token, heartbeatAt) => fs.writeFile(path.join(claim, 'activity.json'), JSON.stringify({
+    kind: 'limcode-runtime-maintenance-activity', claimToken: token, operation: 'data-root-migration', description: '迁移数据目录',
+    processId: process.pid, startedAt: new Date(Date.now() - 60_000).toISOString(), heartbeatAt
+  }));
+  await marker('another-holder', new Date().toISOString());
+  await delay(1_300);
+  assert.ok(waits.length > 0 && waits.every((wait) => wait.activity === undefined), 'another opening window, or a leftover');
+  await marker(claimToken, new Date(Date.now() - 30_000).toISOString());
+  const seen = waits.length;
+  await delay(400);
+  const stale = waits.slice(seen).find((wait) => wait.activity);
+  assert.equal(stale?.activity.stale, true);
+  assert.ok(stale.activity.heartbeatAgeMs >= 30_000);
+  let opened = false;
+  void opening.then(() => { opened = true; });
+  await delay(200);
+  assert.equal(opened, false, 'a stale holder is never taken over');
+  letGo();
+  await holder;
+  assert.equal(await opening, 'opened');
 });
 
 /** The locked round alone, inside the target maintenance claim. */

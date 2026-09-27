@@ -26,7 +26,8 @@ import {
   assertRuntimeHostsOffline,
   openUnderCurrentDataRootAdmission,
   withRuntimeDataRootAdmission,
-  withRuntimeMaintenance
+  withRuntimeMaintenance,
+  type RuntimeClaimWait
 } from '../../reliableKernel/runtimeHostControl';
 import {
   DEFAULT_CONVERSATION_TITLE,
@@ -166,7 +167,16 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     });
   }
 
-  public static async open(context: vscode.ExtensionContext): Promise<VscodeReliableKernelApplicationFacade> {
+  /**
+   * `onRuntimeWait` reports a long wait on the data-root admission or the scope maintenance claim
+   * (another window migrating the data directory, merging, or opening), with the holder's published
+   * activity, so the window can say why; the wait itself never ends early.
+   */
+  public static async open(
+    context: vscode.ExtensionContext,
+    options: { onRuntimeWait?(wait: RuntimeClaimWait): void } = {}
+  ): Promise<VscodeReliableKernelApplicationFacade> {
+    const wait = options.onRuntimeWait ? { onWait: options.onRuntimeWait } : undefined;
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
     let facade: VscodeReliableKernelApplicationFacade | undefined;
     // The data-root admission serializes placement/cutover across every workspace scope sharing
@@ -209,12 +219,12 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
             await facade?.refreshConversationHistory();
           }
         });
-      });
+      }, wait);
       facade = new VscodeReliableKernelApplicationFacade(
         context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
       );
       return facade;
-    });
+    }, undefined, wait);
   }
 
   /** Starts the history/watcher hydration after VS Code surfaces have been registered. */

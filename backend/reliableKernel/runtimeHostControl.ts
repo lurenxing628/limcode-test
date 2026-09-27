@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import type { RuntimeRootPaths } from './contracts';
 import {
   classifyRecordedProcess,
@@ -22,7 +23,60 @@ export const RUNTIME_MAINTENANCE_RECORD_FILE = 'owner.json';
 
 const RUNTIME_MAINTENANCE_SUFFIX = '.runtime-maintenance';
 const RUNTIME_ADMISSION_SUFFIX = '.runtime-admission';
-const MAINTENANCE_RETRY_DELAY_MS = 50;
+const RUNTIME_MAINTENANCE_ACTIVITY_FILE = 'activity.json';
+const RUNTIME_MAINTENANCE_ACTIVITY_KIND = 'limcode-runtime-maintenance-activity';
+
+/** Waiting for a claim polls quickly at first, then backs off (a maintenance can take minutes). */
+export const RUNTIME_CLAIM_WAIT = Object.freeze({
+  firstPollMs: 50,
+  /** After firstPhaseMs of waiting. */
+  laterPollMs: 250,
+  firstPhaseMs: 2_000,
+  /** After laterPhaseMs of waiting. */
+  slowPollMs: 1_000,
+  laterPhaseMs: 10_000,
+  /** onWait is called only once a wait lasted this long. */
+  reportAfterMs: 1_000,
+  /** A holder refreshes its activity this often while it works. */
+  activityHeartbeatMs: 2_000,
+  /** An activity not refreshed this long is reported as stale: the holder is alive but makes no progress. */
+  activityStaleMs: 15_000
+});
+
+/** What a maintenance holder is doing, as published by {@link withRuntimeMaintenanceActivity}. */
+export interface RuntimeMaintenanceActivity {
+  /** Stable operation name, e.g. data-root-migration. */
+  operation: string;
+  /** User-facing, completes “另一个窗口正在…”, e.g. 迁移数据目录. */
+  description: string;
+  /** User-facing stage or progress, e.g. 正在复制正文（3/10）. */
+  stage?: string;
+}
+
+export interface RuntimeMaintenanceActivityHandle {
+  /** Replaces the stage shown to waiting windows (written at once, and with every heartbeat). */
+  report(stage: string | undefined): void;
+}
+
+/** The holder's published activity as seen by a waiter. */
+export interface RuntimeClaimWaitActivity extends RuntimeMaintenanceActivity {
+  runningMs: number;
+  heartbeatAgeMs: number;
+  /** Not refreshed for activityStaleMs: the holder process is alive but makes no progress (never taken over). */
+  stale: boolean;
+}
+
+export interface RuntimeClaimWait {
+  /** How long this caller has been waiting for the claim (monotonic). */
+  waitedMs: number;
+  /** Absent when the holder published nothing, e.g. another window that is opening. */
+  activity?: RuntimeClaimWaitActivity;
+}
+
+export interface RuntimeClaimWaitOptions {
+  /** Called on every poll once a wait lasted reportAfterMs; the wait itself never ends early. */
+  onWait?(wait: RuntimeClaimWait): void;
+}
 
 export interface RuntimeMaintenanceMetadata {
   claimToken: string;
@@ -147,9 +201,10 @@ const RUNTIME_MAINTENANCE_SCOPE = new AsyncLocalStorage<ReadonlyMap<string, Acqu
  */
 export async function withRuntimeMaintenance<T>(
   paths: RuntimeRootPaths,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  wait?: RuntimeClaimWaitOptions
 ): Promise<T> {
-  return withRuntimeClaim(runtimeMaintenanceClaimPath(paths), paths.rootPointerPath, operation);
+  return withRuntimeClaim(runtimeMaintenanceClaimPath(paths), paths.rootPointerPath, operation, wait);
 }
 
 /**
@@ -162,7 +217,8 @@ export async function withRuntimeMaintenance<T>(
  */
 export async function withRuntimeDataRootAdmission<T>(
   configurationRootPath: string,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  wait?: RuntimeClaimWaitOptions
 ): Promise<T> {
   const configurationRoot = path.resolve(
     requireNonEmptyText(configurationRootPath, 'configurationRootPath')
@@ -170,7 +226,8 @@ export async function withRuntimeDataRootAdmission<T>(
   return withRuntimeClaim(
     runtimeDataRootAdmissionClaimPath(configurationRoot),
     configurationRoot,
-    operation
+    operation,
+    wait
   );
 }
 
@@ -179,19 +236,21 @@ export async function withRuntimeDataRootAdmission<T>(
  * admission is held. A data-root migration can publish a new root while this Host waits on the old
  * root's admission (its window was reloaded for that migration): the root is read again under the
  * admission, and when it moved the old admission is released and the new root's taken instead, so a
- * Host never registers on a root that was just migrated away.
+ * Host never registers on a root that was just migrated away. `wait.onWait` reports a long wait
+ * (and what the holder is doing) so the window can explain it; the wait never ends early.
  */
 export async function openUnderCurrentDataRootAdmission<T>(
   readConfigurationRoot: () => Promise<string>,
   open: () => Promise<T>,
-  maxAttempts = 5
+  maxAttempts = 5,
+  wait?: RuntimeClaimWaitOptions
 ): Promise<T> {
   for (let attempt = 1; ; attempt += 1) {
     const admissionRoot = path.resolve(await readConfigurationRoot());
     const opened = await withRuntimeDataRootAdmission(admissionRoot, async () => {
       if (comparablePath(await readConfigurationRoot()) !== comparablePath(admissionRoot)) return { moved: true } as const;
       return { moved: false, value: await open() } as const;
-    });
+    }, wait);
     if (!opened.moved) return opened.value;
     if (attempt >= maxAttempts) {
       throw new Error('数据目录在打开期间反复变化，本窗口没有打开运行时；请重载窗口后再试。');
@@ -207,7 +266,8 @@ function comparablePath(value: string): string {
 async function withRuntimeClaim<T>(
   claimPath: string,
   targetPath: string,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  wait?: RuntimeClaimWaitOptions
 ): Promise<T> {
   const scope = RUNTIME_MAINTENANCE_SCOPE.getStore();
   const inherited = scope?.get(claimPath);
@@ -215,7 +275,7 @@ async function withRuntimeClaim<T>(
   // inherits the context map but finds the claim inactive, so it reacquires the mutex instead
   // of running unprotected after the outer scope already released it.
   if (inherited?.active) return operation();
-  const acquired = await acquireMaintenanceClaim(claimPath, targetPath);
+  const acquired = await acquireMaintenanceClaim(claimPath, targetPath, wait);
   const nextScope = new Map(scope);
   nextScope.set(claimPath, acquired);
   let operationFailed = false;
@@ -318,6 +378,123 @@ export function isRuntimeDataRootAdmissionHeld(configurationRootPath: string): b
   return RUNTIME_MAINTENANCE_SCOPE.getStore()?.get(claimPath)?.active === true;
 }
 
+/**
+ * Publishes what this holder does inside every claim it holds in this async scope (the configuration
+ * admission and/or maintenance claims), refreshed every activityHeartbeatMs while `body` runs and
+ * gone with the claim. Windows waiting on one of these claims show it (RuntimeClaimWaitOptions).
+ * Advisory only: it is bound to the holder's claim token and lives inside the claim directory, so a
+ * crashed holder's leftover never describes a later holder, and a stale heartbeat never lets a waiter
+ * take the claim over.
+ */
+export async function withRuntimeMaintenanceActivity<T>(
+  activity: RuntimeMaintenanceActivity,
+  body: (handle: RuntimeMaintenanceActivityHandle) => Promise<T>
+): Promise<T> {
+  const claims = [...(RUNTIME_MAINTENANCE_SCOPE.getStore()?.values() ?? [])].filter((claim) => claim.active);
+  if (claims.length === 0) throw new Error('维护进行中标记只能在持有 admission 或 maintenance 时发布。');
+  requireNonEmptyText(activity.operation, 'activity.operation');
+  requireNonEmptyText(activity.description, 'activity.description');
+  const startedAt = new Date().toISOString();
+  let stage = activity.stage;
+  let writing: Promise<void> | undefined;
+  let again = false;
+  let stopped = false;
+  const writeAll = async (): Promise<void> => {
+    for (const claim of claims) {
+      if (!claim.active || stopped) return;
+      await writeMaintenanceActivity(claim, {
+        kind: RUNTIME_MAINTENANCE_ACTIVITY_KIND,
+        claimToken: claim.metadata.claimToken,
+        operation: activity.operation,
+        description: activity.description,
+        ...(stage ? { stage } : {}),
+        processId: process.pid,
+        startedAt,
+        heartbeatAt: new Date().toISOString()
+      }).catch(() => undefined);
+    }
+  };
+  const flush = (): Promise<void> => {
+    if (writing) {
+      again = true;
+      return writing;
+    }
+    writing = (async () => {
+      do {
+        again = false;
+        await writeAll();
+      } while (again && !stopped);
+    })().finally(() => { writing = undefined; });
+    return writing;
+  };
+  await flush();
+  const timer = setInterval(() => { void flush(); }, RUNTIME_CLAIM_WAIT.activityHeartbeatMs);
+  timer.unref?.();
+  try {
+    return await body({
+      report(next) {
+        if (next === stage) return;
+        stage = next;
+        void flush();
+      }
+    });
+  } finally {
+    stopped = true;
+    clearInterval(timer);
+    await writing;
+    for (const claim of claims) {
+      if (claim.active) await fs.rm(path.join(claim.claimPath, RUNTIME_MAINTENANCE_ACTIVITY_FILE), { force: true }).catch(() => undefined);
+    }
+  }
+}
+
+interface RuntimeMaintenanceActivityRecord extends RuntimeMaintenanceActivity {
+  kind: typeof RUNTIME_MAINTENANCE_ACTIVITY_KIND;
+  claimToken: string;
+  processId: number;
+  startedAt: string;
+  heartbeatAt: string;
+}
+
+async function writeMaintenanceActivity(claim: AcquiredRuntimeMaintenance, record: RuntimeMaintenanceActivityRecord): Promise<void> {
+  const file = path.join(claim.claimPath, RUNTIME_MAINTENANCE_ACTIVITY_FILE);
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    await fs.rename(temporary, file);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+/** The activity published inside a claim, only when it belongs to the holder with this token. */
+async function readMaintenanceActivity(claimPath: string, holderToken: string): Promise<RuntimeClaimWaitActivity | undefined> {
+  let record: Partial<RuntimeMaintenanceActivityRecord>;
+  try { record = JSON.parse(await fs.readFile(path.join(claimPath, RUNTIME_MAINTENANCE_ACTIVITY_FILE), 'utf8')) as Partial<RuntimeMaintenanceActivityRecord>; }
+  catch { return undefined; }
+  if (record.kind !== RUNTIME_MAINTENANCE_ACTIVITY_KIND || record.claimToken !== holderToken
+    || typeof record.operation !== 'string' || typeof record.description !== 'string'
+    || (record.stage !== undefined && typeof record.stage !== 'string')) return undefined;
+  const started = Date.parse(String(record.startedAt));
+  const heartbeat = Date.parse(String(record.heartbeatAt));
+  if (!Number.isFinite(started) || !Number.isFinite(heartbeat)) return undefined;
+  const now = Date.now();
+  const heartbeatAgeMs = Math.max(0, now - heartbeat);
+  return {
+    operation: record.operation,
+    description: record.description,
+    ...(record.stage ? { stage: record.stage } : {}),
+    runningMs: Math.max(0, now - started),
+    heartbeatAgeMs,
+    stale: heartbeatAgeMs > RUNTIME_CLAIM_WAIT.activityStaleMs
+  };
+}
+
+function claimRetryDelayMs(waitedMs: number): number {
+  if (waitedMs < RUNTIME_CLAIM_WAIT.firstPhaseMs) return RUNTIME_CLAIM_WAIT.firstPollMs;
+  return waitedMs < RUNTIME_CLAIM_WAIT.laterPhaseMs ? RUNTIME_CLAIM_WAIT.laterPollMs : RUNTIME_CLAIM_WAIT.slowPollMs;
+}
+
 interface RuntimeHostLivenessRecord {
   dataSetId: string;
   rootInstanceId: string;
@@ -332,7 +509,8 @@ interface RuntimeHostLivenessRecord {
 
 async function acquireMaintenanceClaim(
   claimPath: string,
-  rootPointerPath: string
+  rootPointerPath: string,
+  wait?: RuntimeClaimWaitOptions
 ): Promise<AcquiredRuntimeMaintenance> {
   const ownIdentity = ownProcessStartIdentity();
   const metadata: RuntimeMaintenanceMetadata = {
@@ -345,6 +523,17 @@ async function acquireMaintenanceClaim(
   await fs.mkdir(path.dirname(claimPath), { recursive: true, mode: 0o700 });
   let observedToken: string | undefined;
   let observed: RecordedProcessInspection | undefined;
+  const waitStarted = performance.now();
+  // A live holder: tell the observer (after a while) what it does, then poll again, backing off.
+  const pause = async (holderToken: string): Promise<void> => {
+    const waitedMs = performance.now() - waitStarted;
+    if (wait?.onWait && waitedMs >= RUNTIME_CLAIM_WAIT.reportAfterMs) {
+      const activity = await readMaintenanceActivity(claimPath, holderToken);
+      try { wait.onWait({ waitedMs, ...(activity ? { activity } : {}) }); }
+      catch (error) { console.warn('[LimCode] Runtime claim wait observer failed.', error); }
+    }
+    await delay(claimRetryDelayMs(waitedMs));
+  };
   for (;;) {
     if (await tryPublishClaimRecord(claimPath, RUNTIME_MAINTENANCE_RECORD_FILE, `${JSON.stringify(metadata)}\n`)) {
       return { claimPath, metadata, active: true, released: false };
@@ -353,7 +542,7 @@ async function acquireMaintenanceClaim(
     if (!record) continue;
     if (record.processId === process.pid && record.processStartIdentity === ownIdentity) {
       // Another async scope in this same process holds the claim; wait for its release.
-      await delay(MAINTENANCE_RETRY_DELAY_MS);
+      await pause(record.claimToken);
       continue;
     }
     if (record.claimToken !== observedToken) {
@@ -387,7 +576,7 @@ async function acquireMaintenanceClaim(
         );
       }
     }
-    await delay(MAINTENANCE_RETRY_DELAY_MS);
+    await pause(record.claimToken);
   }
 }
 
