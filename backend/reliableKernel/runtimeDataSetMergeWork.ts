@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ContentAddressedStore } from './contentAddressedStore';
+import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { createReliableKernelRuntimeServices } from './runtimeServices';
 import { TurnControlPlane, type TurnAuthorityCompiler } from './turnControlPlane';
@@ -37,12 +38,17 @@ export const KEPT_MERGE_FINALIZATION_REASON = '合并前收尾。';
  * Closes the finalizable work of an offline source with the existing control-plane transitions,
  * Turns with `reason`. Call inside the source's maintenance claim, after a verified source backup;
  * the source registers a short-lived Host for the duration. No Turn is started and no provider is
- * contacted.
+ * contacted. Afterwards, also when a transition failed, `onCounted` gets how many of the Turns and
+ * intents in `count` the source has closed (not how many were planned).
  */
 export async function finalizeUnfinishedWork(
   authority: RootAuthority,
   inspection: UnfinishedWorkInspection,
-  options: { reason: string }
+  options: {
+    reason: string;
+    count: { turnIds: readonly string[]; intentIds: readonly string[] };
+    onCounted(closed: { turns: number; intents: number }): void;
+  }
 ): Promise<void> {
   const database = await RuntimeDatabase.open(authority, { hostBootId: `merge-finalize-${randomUUID()}` });
   try {
@@ -93,6 +99,26 @@ export async function finalizeUnfinishedWork(
       else await turns.terminal(command);
     }
   } finally {
+    await countClosed(database, options.count).then(options.onCounted, () => undefined);
     await database.close();
   }
+}
+
+/** How many of these Turns are no longer active and of these intents no longer queued. */
+async function countClosed(
+  database: RuntimeDatabase,
+  count: { turnIds: readonly string[]; intentIds: readonly string[] }
+): Promise<{ turns: number; intents: number }> {
+  const closed = async (domain: string, ids: readonly string[], open: (row: DomainRow) => boolean): Promise<number> => {
+    let total = 0;
+    for (let start = 0; start < ids.length; start += 250) {
+      const rows = (await database.snapshot(ids.slice(start, start + 250).map((id) => DOMAIN_REPOSITORIES.domain(domain).get(id)))).snapshot;
+      total += (rows as Array<DomainRow | null>).filter((row) => row !== null && !open(row)).length;
+    }
+    return total;
+  };
+  return {
+    turns: await closed('Turn', count.turnIds, (row) => row.status === 'active'),
+    intents: await closed('TurnIntent', count.intentIds, (row) => row.state === 'queued')
+  };
 }

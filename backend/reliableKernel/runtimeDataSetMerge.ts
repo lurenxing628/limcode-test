@@ -260,7 +260,10 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   recoveredCommit: boolean;
   /** The source was upgraded from a published predecessor immediately before merging. */
   upgradedFromEpoch?: 3 | 4;
-  /** Unfinished work closed before the merge (source backup kept beside the source). */
+  /**
+   * Unfinished work closed before the merge (source backup kept beside the source): Turns ended as
+   * cancelled or interrupted and queued, unsent user messages cancelled, as counted in the source.
+   */
   finalized?: { turns: number; intents: number; sourceBackupPath: string };
   /** Merged through the exclusive fallback because the source exceeded the online limits. */
   exclusive?: boolean;
@@ -775,8 +778,11 @@ interface SourceProgress {
   /**
    * Unfinished work was (being) closed in the source; `complete` once every transition succeeded.
    * `earlier`: closed by an earlier attempt whose outcome did not say so (none in this attempt).
+   * The ids are everything set out to close; the counts, how many of them the source has closed.
    */
-  finalized?: { turns: number; intents: number; sourceBackupPath: string; complete: boolean; earlier?: boolean };
+  finalized?: {
+    turnIds: string[]; intentIds: string[]; turns: number; intents: number; sourceBackupPath: string; complete: boolean; earlier?: boolean;
+  };
   /** The outcome was already written to the ledger where it was found. */
   recorded?: boolean;
 }
@@ -857,7 +863,8 @@ async function mergeSource(
     const earlier = await readRuntimeDataSetMergeFinalization(paths, await resolveVscodeRuntimeDataSet(paths, candidateId));
     if (earlier) {
       state.finalized = {
-        turns: earlier.turns, intents: earlier.intents, sourceBackupPath: earlier.sourceBackupPath, complete: earlier.complete, earlier: true
+        turnIds: earlier.turnIds, intentIds: earlier.intentIds, turns: earlier.turns, intents: earlier.intents,
+        sourceBackupPath: earlier.sourceBackupPath, complete: earlier.complete, earlier: true
       };
     }
     const settled = await settledSource(paths, target, candidateId, state);
@@ -867,6 +874,8 @@ async function mergeSource(
   const unfinishedWork = mode.finalizeWork ? 'finalize' as const : 'carry' as const;
   let taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options);
   try {
+    // An earlier attempt may have ended before it counted what it closed: counted in this copy.
+    if (state.finalized?.earlier) countFinalized(taken.snapshot.database, state.finalized);
     const rows = taken.audit.size!.rows;
     if (!mode.migration && rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS) {
       // Before any plan, coordination, backup or finalization: this version cannot merge it safely.
@@ -1076,8 +1085,10 @@ async function finalizeSource(
     await fault(options, 'after-source-backup');
     const earlier = state.finalized;
     const finalized: NonNullable<SourceProgress['finalized']> = state.finalized = {
-      turns: (earlier?.turns ?? 0) + work.turns.length,
-      intents: (earlier?.intents ?? 0) + work.intents.length,
+      turnIds: [...new Set([...earlier?.turnIds ?? [], ...work.turns.map((turn) => turn.turnId)])],
+      intentIds: [...new Set([...earlier?.intentIds ?? [], ...work.intents.map((intent) => intent.intentId)])],
+      turns: earlier?.turns ?? 0,
+      intents: earlier?.intents ?? 0,
       // The oldest backup holds the source from before any of its work was closed.
       sourceBackupPath: earlier?.sourceBackupPath ?? sourceBackupPath,
       complete: false
@@ -1085,13 +1096,33 @@ async function finalizeSource(
     // On record before anything is closed: an attempt that ends without saying so leaves it for the next.
     const remember = (): Promise<void> => writeRuntimeDataSetMergeFinalization(paths, {
       candidateId: candidate.id, source: { dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! },
-      turns: finalized.turns, intents: finalized.intents, sourceBackupPath: finalized.sourceBackupPath, complete: finalized.complete
+      turnIds: finalized.turnIds, intentIds: finalized.intentIds, turns: finalized.turns, intents: finalized.intents,
+      sourceBackupPath: finalized.sourceBackupPath, complete: finalized.complete
     });
     await remember();
-    await finalizeUnfinishedWork(createVscodeRootAuthority(candidate), work, { reason });
+    // Counted in the source afterwards, also when a transition failed: never the planned numbers.
+    const counted = (closed: { turns: number; intents: number }): void => { finalized.turns = closed.turns; finalized.intents = closed.intents; };
+    try {
+      await finalizeUnfinishedWork(createVscodeRootAuthority(candidate), work, { reason, count: finalized, onCounted: counted });
+    } catch (error) {
+      await remember().catch(() => undefined);
+      throw error;
+    }
     finalized.complete = true;
     await remember();
   })));
+}
+
+/**
+ * How many of the Turns and queued messages set out to close are closed in this copy of the source
+ * (an attempt that ended abruptly never counted its own).
+ */
+function countFinalized(source: Database.Database, finalized: NonNullable<SourceProgress['finalized']>): void {
+  const turn = source.prepare('SELECT status FROM turn WHERE id = ?').pluck();
+  const intent = source.prepare('SELECT state FROM turn_intent WHERE id = ?').pluck();
+  finalized.turns = finalized.turnIds.filter((id) => ![undefined, 'active'].includes(turn.get(id) as string | undefined)).length;
+  finalized.intents = finalized.intentIds.filter((id) => ![undefined, 'queued'].includes(intent.get(id) as string | undefined)).length;
+  finalized.complete = finalized.turns === finalized.turnIds.length && finalized.intents === finalized.intentIds.length;
 }
 
 /** Under the source's claim: no Host, same identity and pointer, and exactly the files that were checked. */

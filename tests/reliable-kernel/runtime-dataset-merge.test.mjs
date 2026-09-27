@@ -1382,6 +1382,49 @@ test('复审 merge3 #8：收尾之后收到停止按推迟处理并记下收尾�
   assert.match(blocked.blocked[0].message, /之前一次合并时已把这个库里的1 个中断的任务按“中止”收尾.*收尾前的备份在 /);
 });
 
+test('盲审 merge #3/#5：收尾数按收尾后来源里的实际状态统计：上次收尾中途崩溃后再收尾不重复计数，排队消息的取消照样计入', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_queued', project: SHARED_PROJECT },
+    { id: 'conversation_alpha_active', project: SHARED_PROJECT }
+  ]);
+  await seedUnfinishedWork(fixture.alpha, [
+    { conversationId: 'conversation_alpha_queued', kind: 'queued-intent' },
+    { conversationId: 'conversation_alpha_active', kind: 'bare' }
+  ]);
+  // An earlier attempt set out to close both, cancelled the queued message and crashed before the Turn:
+  // its record still has the numbers it planned and says it did not complete.
+  rawSource(fixture.alpha, (source) => {
+    source.prepare("UPDATE turn_intent SET state = 'cancelled' WHERE id = ?").run('conversation_alpha_queued_intent');
+  });
+  const marker = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'finalizations', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  await fs.mkdir(path.dirname(marker), { recursive: true });
+  await fs.writeFile(marker, JSON.stringify({
+    kind: 'limcode-runtime-data-set-merge-finalization', candidateId: fixture.alpha.id,
+    source: { dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId },
+    turnIds: ['conversation_alpha_active_unfinished_turn'], intentIds: ['conversation_alpha_queued_intent'],
+    turns: 1, intents: 1, sourceBackupPath: '/earlier/source-backup', complete: false, finalizedAt: NOW
+  }));
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database);
+  assert.deepEqual(report.merged.map((item) => item.finalized), [{ turns: 1, intents: 1, sourceBackupPath: '/earlier/source-backup' }],
+    '中断的任务收尾一次就算一次，取消的排队消息也算上');
+  const source = readDatabase(fixture.alpha);
+  try {
+    assert.equal(source.count('turn', "status = 'active'"), 0);
+    assert.equal(source.database.prepare('SELECT state FROM turn_intent').pluck().get(), 'cancelled');
+  } finally { source.close(); }
+  await assert.rejects(fs.stat(marker), { code: 'ENOENT' });
+
+  // The source had only a queued message: nothing is counted as an interrupted task.
+  const queued = await createFixture(t, { withBeta: false });
+  await seed(queued.alpha, [{ id: 'conversation_alpha_r4', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(queued.alpha, [{ conversationId: 'conversation_alpha_r4', kind: 'queued-intent' }]);
+  const queuedTarget = await openTarget(t, queued.current);
+  const queuedReport = await merge(queued, queuedTarget);
+  assert.deepEqual(queuedReport.merged.map((item) => [item.finalized?.turns, item.finalized?.intents]), [[0, 1]]);
+});
+
 test('盲审 merge #8：收尾原因区分来源：本版本切走（用户保留）的库写“合并前收尾。”，旧版本留下的库写“旧版本升级时中断，合并前收尾。”', async (t) => {
   const fixture = await createFixture(t, { selected: 'alpha' });
   await selectVscodeRuntimeDataSet(fixture.paths, 'default');

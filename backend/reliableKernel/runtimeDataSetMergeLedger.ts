@@ -103,6 +103,10 @@ export interface RuntimeDataSetMergeFinalization {
   kind: typeof FINALIZATION_KIND;
   candidateId: string;
   source: RuntimeDataSetIdentity;
+  /** Every Turn and queued TurnIntent the merge set out to close, over all its attempts. */
+  turnIds: string[];
+  intentIds: string[];
+  /** How many of them were closed when last counted in the source (not how many were planned). */
   turns: number;
   intents: number;
   sourceBackupPath: string;
@@ -331,7 +335,9 @@ export async function readRuntimeDataSetMergeFinalization(
     throw error;
   }
   const entry = value as Partial<RuntimeDataSetMergeFinalization> | null;
+  const ids = (list: unknown): list is string[] => Array.isArray(list) && list.every((id) => typeof id === 'string');
   if (entry?.kind !== FINALIZATION_KIND || entry.candidateId !== candidate.id || !sameRuntimeDataSetIdentity(entry.source, candidate)
+    || !ids(entry.turnIds) || !ids(entry.intentIds)
     || typeof entry.turns !== 'number' || typeof entry.intents !== 'number' || typeof entry.sourceBackupPath !== 'string'
     || typeof entry.complete !== 'boolean' || typeof entry.finalizedAt !== 'string') return undefined;
   return entry as RuntimeDataSetMergeFinalization;
