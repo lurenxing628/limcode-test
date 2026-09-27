@@ -846,6 +846,34 @@ test('两个请求方不互等：本窗口有进行中的请求时对其它请�
   assert.deepEqual([working.releases(), d.releases()], [1, 1], 'the later requester yielded after its own request ended');
 });
 
+test('跨模块盲审 #8：让先给本窗口自己更早的请求（例如仍在等待的超大合并）时如实写“本窗口正在等待执行…”，不说成另一个窗口', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  await openWindow(t, binding, 'busy-window', { busy: WORK });
+  const earlier = new Date(Date.now() - 1_000).toISOString();
+  await writeRequest(paths, {
+    requestId: 'own-merge', requesterHostBootId: 'self-window', whenBusy: 'wait', operation: 'historical-merge', operationKey: 'workspace:alpha',
+    message: '为合并较大的旧聊天记录', activity: '合并较大的旧聊天记录', createdAt: earlier
+  });
+  const own = await run(paths, {
+    ...BASE, operation: 'data-root-relocation', operationKey: 'target', message: '为迁移数据目录', ignoreBackoff: true,
+    whenBusy: 'wait', requesterHostBootId: 'self-window'
+  }, async () => assert.fail('must not run'));
+  assert.equal(own.state, 'busy');
+  assert.equal(own.reason, '本窗口正在等待执行合并较大的旧聊天记录，这次没有进行，完成后再试。');
+  assert.equal(own.gaveWayTo, 'own-merge');
+
+  await fs.rm(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests', 'own-merge.json'), { force: true });
+  await writeRequest(paths, {
+    requestId: 'other-merge', requesterHostBootId: 'other-window', whenBusy: 'wait', operation: 'historical-merge', operationKey: 'workspace:beta',
+    message: '为合并较大的旧聊天记录', activity: '合并较大的旧聊天记录', createdAt: earlier
+  });
+  const other = await run(paths, {
+    ...BASE, operation: 'data-root-relocation', operationKey: 'target-2', message: '为迁移数据目录', ignoreBackoff: true,
+    whenBusy: 'wait', requesterHostBootId: 'self-window'
+  }, async () => assert.fail('must not run'));
+  assert.equal(other.reason, '另一个窗口先发起了合并较大的旧聊天记录，这次让它先完成，没有进行；之后可以再试。');
+});
+
 test('本窗口的请求让先于更早的请求：在对方确认前、倒计时之后与让出阶段都先不回答，本窗口请求结束后照常确认与让出', async (t) => {
   const { binding, paths } = await createRoot(t);
   let duringCountdown;

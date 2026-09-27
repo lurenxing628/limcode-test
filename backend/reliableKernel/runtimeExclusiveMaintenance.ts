@@ -524,10 +524,13 @@ class ExclusiveMaintenanceRequester<T> {
     for (;;) {
       if (this.input.isCancelled?.()) return this.abandon('cancelled', this.hosts, '已取消。');
       await this.heartbeat();
-      // Two requesters never wait for each other: the later one gives way, with the reason.
+      // Two requesters never wait for each other: the later one gives way, with the reason (this
+      // window's own earlier request, e.g. a large merge still waiting, is named as such).
       const earlier = await this.earlierRequest();
       if (earlier) {
-        const outcome = await this.abandon('busy', this.hosts, `另一个窗口先发起了${earlier.activity}，这次让它先完成，没有进行；之后可以再试。`);
+        const outcome = await this.abandon('busy', this.hosts, this.isOwnWindow(earlier)
+          ? `本窗口正在等待执行${earlier.activity}，这次没有进行，完成后再试。`
+          : `另一个窗口先发起了${earlier.activity}，这次让它先完成，没有进行；之后可以再试。`);
         return { ...outcome, gaveWayTo: earlier.requestId };
       }
       await this.refreshHosts();
@@ -710,7 +713,14 @@ class ExclusiveMaintenanceRequester<T> {
     return this.input.requesterBusy ? await this.input.requesterBusy() : undefined;
   }
 
-  /** A live request of another requester that this one gives way to. */
+  /** A request made by the requester's own window (its registered Host, else its process). */
+  private isOwnWindow(request: RuntimeExclusiveMaintenanceRequest): boolean {
+    return this.input.requesterHostBootId !== undefined
+      ? request.requesterHostBootId === this.input.requesterHostBootId
+      : request.requesterHostBootId === undefined && request.requesterProcessId === process.pid;
+  }
+
+  /** A live request of another requester (possibly of this same window) that this one gives way to. */
   private async earlierRequest(): Promise<RuntimeExclusiveMaintenanceRequest | undefined> {
     if (!this.request) return undefined;
     const others = (await readExclusiveMaintenanceRequests(this.paths, { classify: this.classify }))
@@ -1366,7 +1376,7 @@ async function recordOperationCooldown(
 
 /** A recorded reason that ends with “try again later” says when instead. */
 function withRetryTime(reason: string, untilMs: number): string {
-  return `${reason.replace(/[，；]?(?:之后可以再试|稍后再试)。$/, '。')}${retryText(untilMs)}`;
+  return `${reason.replace(/[，；]?(?:之后可以再试|稍后再试|完成后再试)。$/, '。')}${retryText(untilMs)}`;
 }
 
 /** When a refused call may be made again, in the user's words: about how long, and the local time. */
