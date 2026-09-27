@@ -408,5 +408,5 @@ test('目标是别处拷来的 LimCode 数据：整体改名挪到旁边永不�
   await fs.cp(other, otherCopy, { recursive: true });
   const otherPlan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: otherCopy });
   assert.deepEqual([otherPlan.target.kind, otherPlan.target.sameDataSet], ['copied', false]);
-  assert.ok(otherPlan.warnings.some((warning) => /另一份 LimCode 数据.*不合并、不删除/.test(warning)));
+  assert.ok(otherPlan.warnings.some((warning) => /另一份 LimCode 数据.*不合并、不删除；之后它列在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看/.test(warning)));
 });

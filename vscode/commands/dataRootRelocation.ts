@@ -549,7 +549,8 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
   ];
   if (required.length === 0 && optional.length === 0) {
     await tell(ask, '旧目录里没有可以删除的 LimCode 数据', keptLines.length ? keptLines : ['旧目录里已经没有 LimCode 的数据。']);
-    if (!keptItems.some((item) => item.kind === 'data-set')) await forgetPreviousDataRoot(context);
+    // A kept data set or archive is still listed from here (foreign history reads the old directory's archives).
+    if (!keptItems.some((item) => item.kind === 'data-set' || item.kind === 'backup')) await forgetPreviousDataRoot(context);
     return;
   }
   const sections: DataRootPromptSection[] = [
@@ -575,7 +576,7 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
   });
   if (answer.choice !== 'delete') return;
   const include = optional.filter((item) => answer.include.includes(item.key)).map((item) => item.key);
-  let removed: { removed: string[]; remainingDataSets: number };
+  let removed: { removed: string[]; remainingDataSets: number; remainingArchives?: number };
   try {
     removed = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在删除旧数据目录中的 LimCode 数据…' },
       () => deleteOldDataRoot({ ...input, include, confirmedKeys: [...required.map((item) => item.key), ...include] }));
@@ -583,10 +584,13 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
     await tell(ask, '旧数据目录没有删除', [describeError(error)]);
     return;
   }
-  if (removed.remainingDataSets === 0) await forgetPreviousDataRoot(context);
+  // Archives kept in the old directory stay visible (外来历史库) only while it is remembered.
+  if (removed.remainingDataSets === 0 && !removed.remainingArchives) await forgetPreviousDataRoot(context);
   await tell(ask, '已删除', [
     `已删除 ${removed.removed.length} 项。`,
-    ...(removed.remainingDataSets > 0 ? [`旧目录里还保留 ${removed.remainingDataSets} 个历史库，设置页仍会显示这个旧目录。`] : [])
+    ...(removed.remainingDataSets > 0 ? [`旧目录里还保留 ${removed.remainingDataSets} 个历史库，设置页仍会显示这个旧目录。`] : []),
+    ...(removed.remainingArchives
+      ? [`旧目录里还保留 ${removed.remainingArchives} 份“归档并重置”留下的归档，列在“历史与存储管理 → 外来历史库”里${removed.remainingDataSets > 0 ? '' : '，设置页仍会显示这个旧目录'}。`] : [])
   ]);
 }
 

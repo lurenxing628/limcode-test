@@ -568,6 +568,36 @@ test('删除旧目录：完整列出将删除与保留的内容，备份默认�
   assert.equal(emptied.calls.find((call) => call[0] === 'status')[1].lastMigration, null, '旧目录没有历史库了：不再显示');
 });
 
+test('删除旧目录后旧目录里还留着“归档并重置”的归档：继续记住旧目录（归档经它列在外来历史库里），并说明还保留几份', async () => {
+  const lastMigration = { fromPath: '/vscode/global-storage', toPath: SOURCE, migratedAt: '2026-09-26T00:00:00.000Z' };
+  const items = [
+    { key: 'data-set:default', kind: 'data-set', label: '历史库 default', paths: [], bytes: 4096, optional: false, deletable: true },
+    { key: 'backup:workspace:x:.limcode-runtime-backups', kind: 'backup', label: '历史库 workspace:x 的“归档并重置”归档', paths: [], bytes: 999, optional: true, deletable: true }
+  ];
+  const archived = fixture({
+    lastMigration, deletion: { items }, answers: [{ choice: 'delete', include: [] }, { choice: 'ok', include: [] }],
+    deleteResult: { removed: ['data-set:default'], remainingDataSets: 0, remainingArchives: 2 }
+  });
+  await archived.commands.deletePreviousDataRoot(archived.context, archived.startup, archived.request);
+  assert.ok(!archived.calls.some((call) => call[0] === 'status'), '旧目录里还有归档：不清空 lastMigration');
+  assert.match(JSON.stringify(archived.prompts.at(-1)), /还保留 2 份“归档并重置”留下的归档，列在“历史与存储管理 → 外来历史库”里，设置页仍会显示这个旧目录/);
+
+  const unreadable = fixture({
+    lastMigration,
+    deletion: { items: [{ key: 'backup:workspace:y:.limcode-runtime-backups', kind: 'backup', label: '归档', paths: [], bytes: 0, optional: true, deletable: false, reason: '无法读取，保留' }] }
+  });
+  await unreadable.commands.deletePreviousDataRoot(unreadable.context, unreadable.startup, unreadable.request);
+  assert.ok(!unreadable.kinds().includes('delete'));
+  assert.ok(!unreadable.calls.some((call) => call[0] === 'status'), '只剩保留的归档目录（无法读取）：同样不忘记旧目录');
+
+  const cleared = fixture({
+    lastMigration, deletion: { items }, answers: [{ choice: 'delete', include: ['backup:workspace:x:.limcode-runtime-backups'] }],
+    deleteResult: { removed: ['backup:workspace:x:.limcode-runtime-backups', 'data-set:default'], remainingDataSets: 0, remainingArchives: 0 }
+  });
+  await cleared.commands.deletePreviousDataRoot(cleared.context, cleared.startup, cleared.request);
+  assert.equal(cleared.calls.find((call) => call[0] === 'status')[1].lastMigration, null, '归档也删了：不再显示旧目录');
+});
+
 test('数据目录不可用：可以重试、回到旧目录、选择其它已有目录或改用默认目录（二次确认）', async () => {
   const lastMigration = { fromPath: SOURCE, toPath: '/mnt/usb/limcode', migratedAt: '2026-09-26T00:00:00.000Z' };
   const retry = fixture({ host: false, lastMigration, recoveryChoice: '重试' });

@@ -39,9 +39,9 @@ import type { RelocationDigestWorkerResponse } from './runtimeDataRootRelocation
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
 import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import {
-  assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, markVscodeRuntimeDataSetKept,
-  resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot, selectVscodeRuntimeDataSet,
-  VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY, VSCODE_RUNTIME_SELECTION_FILE,
+  assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories,
+  markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
+  selectVscodeRuntimeDataSet, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY, VSCODE_RUNTIME_SELECTION_FILE,
   VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
@@ -628,6 +628,11 @@ export async function planDataRootRelocation(input: {
   for (const problem of inspection.problems) {
     warnings.push(`旧目录里有一个无法读取的历史库不会被迁移，仍留在旧目录：${problem.message}`);
   }
+  // Listed by directory, not by data set: a scope whose data set was deleted keeps its archives too.
+  const archives = await countResetArchives(sourceRootPath);
+  if (archives > 0) {
+    warnings.push(`旧目录里有 ${archives} 份“归档并重置”留下的归档（含当时的对话）。归档不会迁移，留在旧目录；迁移之后它们列在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看；删除旧目录时默认保留。`);
+  }
   const configurationEntries: string[] = [];
   let configurationBytes = 0;
   let configurationAllocated = 0;
@@ -950,7 +955,7 @@ function copiedMessage(targetRootPath: string, sameDataSet: boolean): string {
   const aside = `${path.basename(targetRootPath)}.limcode-copied-<时间>`;
   return sameDataSet
     ? `新数据目录里是当前历史的一份旧拷贝（从别处复制过来的）。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；当前历史照常迁入。`
-    : `新数据目录里是从别处拷贝过来的另一份 LimCode 数据。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；之后可以在“历史与存储管理 → 外来历史库”里只读查看（以后的版本支持合并），也可以把它放回原来的位置后在那里打开。`;
+    : `新数据目录里是从别处拷贝过来的另一份 LimCode 数据。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；之后它列在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看（以后的版本支持合并），也可以把它放回原来的位置后在那里打开。`;
 }
 
 /** Data-set ids named by the RootBindings of a copied data directory (read as plain JSON). */
@@ -2868,6 +2873,19 @@ export async function planOldDataRootDeletion(input: {
       optional: false, deletable: false, reason: `无法读取，保留：${problem.message}`
     });
   }
+  // Archives listed by directory: also those of a scope whose data set was deleted (no candidate names them).
+  const listed = new Set(items.flatMap((item) => item.paths));
+  const known = new Set([...inspection.candidates.map((candidate) => candidate.id), ...inspection.problems.map((problem) => problem.id)]);
+  for (const directory of await listVscodeRuntimeArchiveDirectories(oldRoot).catch(() => [])) {
+    if (listed.has(directory.path)) continue;
+    cover(directory.path);
+    items.push({
+      key: `backup:${directory.scope}:${RESET_ARCHIVES_DIRECTORY}`, kind: 'backup',
+      label: `历史库 ${directory.scope} 的“归档并重置”归档（含当时的对话${known.has(directory.scope) ? '' : '；这个历史库本身已经删除'}）`,
+      paths: [directory.path], bytes: directory.unreadable ? 0 : (await measureTree(directory.path).catch(() => ({ bytes: 0 }))).bytes,
+      optional: true, deletable: !directory.unreadable, ...(directory.unreadable ? { reason: `无法读取，保留：${directory.unreadable}` } : {})
+    });
+  }
 
   for (const copied of marker.configuration ?? []) {
     const entry = path.join(oldRoot, copied.entry);
@@ -2937,7 +2955,7 @@ export async function deleteOldDataRoot(input: {
   include?: readonly string[];
   /** Keys of the items the confirmation listed for deletion. */
   confirmedKeys: readonly string[];
-}): Promise<{ removed: string[]; remainingDataSets: number }> {
+}): Promise<{ removed: string[]; remainingDataSets: number; remainingArchives: number }> {
   const oldRoot = path.resolve(input.oldRootPath);
   return withRuntimeDataRootAdmission(oldRoot, async () => {
     await assertConfigurationRootRuntimesOffline(oldRoot);
@@ -2958,8 +2976,15 @@ export async function deleteOldDataRoot(input: {
     await removeEmptyDirectories(oldRoot);
     const after = await inspectVscodeRuntimeDataSets({ globalStoragePath: oldRoot }).catch(() => undefined);
     const remainingDataSets = after ? after.candidates.filter((candidate) => candidate.dataSetId).length + after.problems.length : 0;
-    return { removed: keys, remainingDataSets };
+    // Archives kept in the old directory stay foreign history of the current one only while it is remembered.
+    return { removed: keys, remainingDataSets, remainingArchives: await countResetArchives(oldRoot) };
   });
+}
+
+/** Reset archives in every scope of a data directory, found by listing directories (an unreadable archives directory counts once). */
+async function countResetArchives(root: string): Promise<number> {
+  const directories = await listVscodeRuntimeArchiveDirectories(root).catch(() => []);
+  return directories.reduce((sum, directory) => sum + (directory.unreadable ? 1 : directory.names.length), 0);
 }
 
 /** What moved with a data set (its database, CAS, debug captures the new directory has) or is only bookkeeping. */
