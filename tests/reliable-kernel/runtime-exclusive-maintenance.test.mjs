@@ -25,12 +25,13 @@ const { resolveVscodeRuntimeDataRoot } = kernelFile('vscodeRootAuthority.js');
 const { createCachedProcessClassifier, ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
 const processProtocol = kernelFile('processProtocol.js');
 const {
-  isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, openUnderCurrentDataRootAdmission,
+  isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, openUnderCurrentDataRootAdmission, RUNTIME_CLAIM_WAIT,
   runtimeDataRootAdmissionClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance, withRuntimeMaintenanceActivity
 } = kernelFile('runtimeHostControl.js');
 const {
-  readExclusiveMaintenanceRequests, registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance,
-  runExclusiveRuntimeMaintenance, runtimeExclusiveMaintenanceDirectory, startExclusiveMaintenanceParticipant
+  clearExclusiveMaintenanceKey, readExclusiveMaintenanceRequests, registerExclusiveMaintenanceParticipant,
+  requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance, runtimeExclusiveMaintenanceDirectory,
+  startExclusiveMaintenanceParticipant
 } = kernelFile('runtimeExclusiveMaintenance.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiled, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
@@ -280,50 +281,77 @@ test('锁内反复遇到新开始的工作时有次数上限，之后放弃', as
     withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
   }, async () => assert.fail('must not run'));
   assert.equal(outcome.state, 'busy');
-  assert.match(outcome.reason, /反复/);
+  assert.equal(outcome.reason, '准备期间反复有窗口变忙（最后一次：1 个其它窗口有任务正在进行），这次没有进行，稍后再试。');
   assert.equal(lockedRounds, 2);
   assert.equal(window.releases(), 0);
 });
 
-test('go 阶段回答忙的窗口本轮不再重载（即使随后变空闲）；已让出的窗口白白重载，操作不执行', async (t) => {
+test('go 阶段回答忙的窗口本轮不再重载（即使随后变空闲）；已让出的窗口白白重载一次，这次调用结束，操作不执行', async (t) => {
   const { binding, paths } = await createRoot(t);
   const fast = await openWindow(t, binding, 'fast-window');
   let answeredGoBusy = false;
   const slow = await openWindow(t, binding, 'slow-window', {
-    // The user clicks into this window after it confirmed, right before it saw go, then leaves.
+    // The user clicks into this window after it confirmed and after the fast one reloaded (the order
+    // is fixed: the busy answer waits for that reload), right before it saw go; then leaves.
     busy: async (request) => {
       if (request.phase !== 'go' || answeredGoBusy) return undefined;
       answeredGoBusy = true;
+      await fast.released;
+      // Idle again at once: every later poll of this round must still not reload it.
+      setImmediate(() => { void slow.check(); });
       return { kind: 'focus', reason: '窗口正在使用' };
     }
   });
   let ran = false;
-  // The requester reads the busy answer only on its next poll; meanwhile the window is idle again
-  // and still sees go: it must not reload in this round.
-  const outcome = await request(paths, { ...BASE, pollMs: 300 }, async () => { ran = true; });
-  assert.equal(outcome.state, 'busy');
+  let lockedRounds = 0;
+  // The requester reads the busy answer only on its next poll; meanwhile the window is idle again.
+  const outcome = await run(paths, {
+    ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 5_000, pollMs: 300,
+    withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
+  }, async () => { ran = true; });
+  assert.equal(outcome.state, 'busy', 'a busy window at go ends the call, even in wait mode');
+  assert.match(outcome.reason, /其它窗口开始让出后1 个其它窗口正在使用，这次没有进行/);
   assert.equal(ran, false);
+  assert.equal(lockedRounds, 1, 'no second round in the same call');
   await settle([slow, fast]);
-  await delay(100);
   await slow.check();
   assert.equal(slow.releases(), 0, 'a window that answered busy at go never yields in that round');
-  assert.equal(fast.releases(), 1, 'the documented cost of a go-stage abandon');
+  assert.equal(fast.releases(), 1, 'the documented cost of a go-stage abandon: one reload in vain, never two');
+  // The cooldown holds off an automatic retry of the operation.
+  const again = await run(paths, { ...BASE, operationKey: 'sources-b' }, async () => assert.fail('must not run'));
+  assert.equal(again.state, 'backoff');
 });
 
-test('go 之后操作失败按操作键退避（冷却不可跳过）；确定性失败直接转 blocked；成功后退避清零', async (t) => {
+test('go 阶段遇忙的调用在慢窗口看到 go 之前就结束时，慢窗口不重载', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  // This window checks for requests only when the test says so (a window busy with other things).
+  const late = await openWindow(t, binding, 'late-window', { pollMs: 60 * 60_000 });
+  const busyAtGo = await openWindow(t, binding, 'busy-at-go', { busy: async (request) => request.phase === 'go' ? WORK : undefined });
+  const confirmedBoth = run(paths, { ...BASE, confirmTimeoutMs: 5_000 }, async () => assert.fail('must not run'));
+  // late answers prepare and confirm when asked, and is not asked again once it confirmed.
+  while (late.confirms() === 0) {
+    await late.check();
+    await delay(10);
+  }
+  const outcome = await confirmedBoth;
+  assert.equal(outcome.state, 'busy');
+  await late.check();
+  assert.deepEqual([late.releases(), busyAtGo.releases()], [0, 0], 'the call ended before late saw go');
+});
+
+test('go 之后操作失败按操作键退避；冷却只让原发起进程的明确重试越过；成功后退避清零', async (t) => {
   const { binding, paths } = await createRoot(t);
   const failure = () => Object.assign(new Error('复制正文文件时出错'), { code: 'EIO' });
-  const cooldownAfterCoordinatedMs = 1_000;
-  const input = { ...BASE, cooldownAfterCoordinatedMs, backoffBaseMs: 60_000 };
+  const input = { ...BASE, backoffBaseMs: 60_000 };
   await openWindow(t, binding, 'peer-1');
   await assert.rejects(request(paths, input, async () => { throw failure(); }), /复制正文文件时出错/);
   await openWindow(t, binding, 'peer-2');
   const again = await request(paths, input, async () => assert.fail('must not run'));
   assert.equal(again.state, 'backoff', 'the failed work backs off like an abandoned attempt');
-  const explicit = await request(paths, { ...input, ignoreBackoff: true }, async () => assert.fail('must not run'));
-  assert.equal(explicit.state, 'backoff', 'an explicit request skips the key backoff, never the cooldown');
-  assert.match(explicit.reason, /刚刚已经让其它窗口重载过/);
-  await delay(cooldownAfterCoordinatedMs + 50);
+  // A window that opened after the go (a window that just yielded) cannot skip the cooldown, even explicitly.
+  const reopened = await request(paths, { ...input, ignoreBackoff: true, requesterStartedAtMs: Date.now() }, async () => assert.fail('must not run'));
+  assert.equal(reopened.state, 'backoff');
+  assert.match(reopened.reason, /本窗口是在那之后打开的，暂不反过来要求其它窗口重载/);
   const ledger = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'ledger');
   const keyEntry = async () => {
     for (const name of await fs.readdir(ledger)) {
@@ -333,18 +361,32 @@ test('go 之后操作失败按操作键退避（冷却不可跳过）；确定�
     return undefined;
   };
   assert.equal((await keyEntry()).attempts, 1);
+  // The user explicitly tries again in the window that started it (this process predates the cooldown).
   assert.deepEqual(await request(paths, { ...input, ignoreBackoff: true }, async () => 'merged'),
     { state: 'completed', result: 'merged', coordinated: true });
   assert.equal(await keyEntry(), undefined, 'success resets the backoff');
+});
 
-  // A deterministic failure blocks the key for good, whoever asks and even with no other window.
-  const deterministic = { ...BASE, operationKey: 'drifted-source', isDeterministicFailure: (error) => error.code === 'SCHEMA_DRIFT' };
+test('确定性失败只拦自动调用：用户明确重试照常执行，成功后清除；也可以显式清除', async (t) => {
+  const { paths } = await createRoot(t);
+  const deterministic = { ...BASE, operationKey: 'to:/target', isDeterministicFailure: (error) => error.code === 'EACCES' };
+  // Alone: the operation runs at once and fails (the target directory is not writable).
   await assert.rejects(request(paths, deterministic, async () => {
-    throw Object.assign(new Error('来源结构漂移'), { code: 'SCHEMA_DRIFT' });
-  }), /来源结构漂移/);
-  const blocked = await request(paths, { ...deterministic, ignoreBackoff: true }, async () => assert.fail('must not run'));
-  assert.equal(blocked.state, 'blocked');
-  assert.match(blocked.reason, /来源结构漂移/);
+    throw Object.assign(new Error('目标目录不可写'), { code: 'EACCES' });
+  }), /目标目录不可写/);
+  const automatic = await request(paths, deterministic, async () => assert.fail('must not run'));
+  assert.equal(automatic.state, 'blocked');
+  assert.match(automatic.reason, /目标目录不可写；排除原因后可以手动再试/);
+  // The user fixed the permission and explicitly tries again.
+  assert.deepEqual(await request(paths, { ...deterministic, ignoreBackoff: true }, async () => 'migrated'),
+    { state: 'completed', result: 'migrated', coordinated: false });
+  assert.deepEqual(await request(paths, deterministic, async () => 'again'), { state: 'completed', result: 'again', coordinated: false },
+    'success cleared the blocked key');
+
+  await assert.rejects(request(paths, deterministic, async () => { throw Object.assign(new Error('还是不可写'), { code: 'EACCES' }); }));
+  assert.equal((await request(paths, deterministic, async () => assert.fail('must not run'))).state, 'blocked');
+  await clearExclusiveMaintenanceKey(paths, deterministic.operation, deterministic.operationKey);
+  assert.equal((await request(paths, deterministic, async () => 'cleared')).state, 'completed');
 });
 
 test('发起方自己窗口的忙也要等：锁外等待它空闲；abandon 模式直接放弃', async (t) => {
@@ -419,11 +461,14 @@ test('一次协调让其它窗口重载后同一操作进入冷却：刚让出�
   assert.equal(a.releases(), 1);
   // B opened; A restarts and would ask B for the same operation (even another key, even explicitly): cooldown.
   const b = await openWindow(t, binding, 'window-b');
-  for (const ignoreBackoff of [false, true]) {
-    const reverse = await request(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff }, async () => assert.fail('must not run'));
-    assert.equal(reverse.state, 'backoff');
-    assert.match(reverse.reason, /刚刚已经让其它窗口重载过一次/);
-  }
+  const automatic = await request(paths, { ...BASE, operationKey: 'sources-b' }, async () => assert.fail('must not run'));
+  assert.equal(automatic.state, 'backoff');
+  assert.match(automatic.reason, /刚刚已经让其它窗口重载过一次/);
+  // Explicitly, from the window that just yielded (its process started after the go): still not.
+  const explicit = await request(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff: true, requesterStartedAtMs: Date.now() },
+    async () => assert.fail('must not run'));
+  assert.equal(explicit.state, 'backoff');
+  assert.match(explicit.reason, /本窗口是在那之后打开的/);
   await settle([b]);
   assert.equal(b.confirms(), 0);
 });
@@ -517,7 +562,7 @@ test('过期、撤回、心跳过期或请求方已不存在的请求不会被�
   await fs.mkdir(path.join(directory, 'requests'), { recursive: true });
   const valid = {
     kind: 'limcode-runtime-exclusive-maintenance-request', requestId: 'request-1', round: 1, phase: 'confirm',
-    operation: 'historical-merge', operationKey: 'sources-a', message: '为合并旧聊天记录', confirmation: 'countdown',
+    operation: 'historical-merge', operationKey: 'sources-a', message: '为合并旧聊天记录', activity: '合并旧聊天记录', confirmation: 'countdown',
     whenBusy: 'abandon', requesterProcessId: process.pid, requesterProcessStartIdentity: ownProcessStartIdentity(),
     createdAt: NOW, heartbeatAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString()
   };
@@ -534,6 +579,9 @@ test('过期、撤回、心跳过期或请求方已不存在的请求不会被�
   const { heartbeatAt: _heartbeat, ...older } = valid;
   await write(older);
   assert.deepEqual(await ids(), [], 'an older request format is not trusted');
+  const { activity: _activity, ...withoutActivity } = valid;
+  await write(withoutActivity);
+  assert.deepEqual(await ids(), [], 'nor one without the activity');
   const deadProcessId = await exitedProcessId();
   await write({ ...valid, requesterProcessId: deadProcessId, requesterProcessStartIdentity: undefined });
   assert.deepEqual(await ids(), []);
@@ -545,9 +593,13 @@ test('过期、撤回、心跳过期或请求方已不存在的请求不会被�
   // The crashed requester's leftovers are swept when the next request starts.
   await fs.mkdir(path.join(directory, 'responses', 'request-1'), { recursive: true });
   await fs.writeFile(path.join(directory, 'responses', 'request-1', 'window-a.json'), '{}');
+  const longAgo = new Date(Date.now() - 60_000);
+  await fs.utimes(path.join(directory, 'responses', 'request-1'), longAgo, longAgo);
+  // Answers written just now may belong to a request published while the cleanup ran: kept for now.
+  await fs.mkdir(path.join(directory, 'responses', 'just-answered'), { recursive: true });
   await request(paths, BASE, async () => 'done');
   assert.deepEqual(await fs.readdir(path.join(directory, 'requests')), []);
-  assert.deepEqual(await fs.readdir(path.join(directory, 'responses')), []);
+  assert.deepEqual(await fs.readdir(path.join(directory, 'responses')), ['just-answered']);
 
   if (ownProcessStartIdentity() !== undefined) {
     await fs.writeFile(path.join(directory, 'hosts', 'stale-window.json'), JSON.stringify({
@@ -623,6 +675,221 @@ test('窗口是否空闲复用对话的待办工作判定：执行中的命令�
   assert.equal(await busy(), true, 'durable pending work of an owned conversation is busy');
 });
 
+test('两个请求方不互等：本窗口有进行中的请求时对其它请求答忙、从不让出；较新的请求让先并写明原因，较早的完成', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const working = await openWindow(t, binding, 'working-window', { busy: WORK });
+  const b = await openWindow(t, binding, 'window-b');
+  // B: the user confirmed a migration there; it waits outside the locks for the working window.
+  const migration = run(paths, {
+    ...BASE, operation: 'data-root-migration', operationKey: 'to:/new-root', message: '为迁移数据目录', ignoreBackoff: true,
+    whenBusy: 'wait', busyWaitTimeoutMs: 10_000, participantConfirmation: 'final-countdown', requesterHostBootId: 'window-b'
+  }, async () => 'migrated');
+  while ((await readExclusiveMaintenanceRequests(paths)).length === 0) await delay(10);
+  // Any other request meanwhile: B's own window answers busy (a reload would drop its request).
+  await writeRequest(paths, { requestId: 'later-request', createdAt: new Date(Date.now() + 1_000).toISOString(), whenBusy: 'abandon' });
+  await b.check();
+  const answer = await readAnswer(paths, 'later-request', 'window-b');
+  assert.deepEqual([answer.answer, answer.busyKind, answer.reason], ['busy', 'work', '本窗口正在等待执行迁移数据目录']);
+  await writeRequest(paths, { requestId: 'later-request', createdAt: new Date(Date.now() + 1_000).toISOString(), whenBusy: 'abandon', phase: 'confirm' });
+  await b.check();
+  assert.equal((await readAnswer(paths, 'later-request', 'window-b')).answer, 'busy', 'never confirms another request meanwhile');
+  await fs.rm(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests', 'later-request.json'));
+
+  // D: the user clicks another operation in a second window: the later request gives way at once.
+  const d = await openWindow(t, binding, 'window-d');
+  const clicked = await run(paths, {
+    ...BASE, operation: 'historical-merge', operationKey: 'source@x', message: '为合并较大的旧聊天记录', ignoreBackoff: true,
+    whenBusy: 'wait', participantConfirmation: 'notice', requesterHostBootId: 'window-d'
+  }, async () => assert.fail('must not run'));
+  assert.equal(clicked.state, 'busy');
+  assert.match(clicked.reason, /^另一个窗口先发起了迁移数据目录，这次让它先完成，没有进行；之后可以再试。$/);
+  working.setBusy(undefined);
+  assert.deepEqual(await migration, { state: 'completed', result: 'migrated', coordinated: true });
+  assert.equal(b.releases(), 0, 'the window of the running request never yielded to another request');
+  assert.deepEqual([working.releases(), d.releases()], [1, 1], 'the later requester yielded after its own request ended');
+});
+
+test('本窗口的请求让先于更早的请求：在对方确认与让出阶段先不回答，本窗口请求结束后照常确认与让出', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  // This window checks for requests only when the test says so.
+  const b = await openWindow(t, binding, 'window-b', { pollMs: 60 * 60_000 });
+  const earlier = { requestId: 'earlier-request', createdAt: '2020-01-01T00:00:00.000Z', whenBusy: 'wait', confirmation: 'notice' };
+  await writeRequest(paths, earlier);
+  await b.check();
+  assert.equal((await readAnswer(paths, 'earlier-request', 'window-b')).answer, 'ready');
+  await writeRequest(paths, { ...earlier, phase: 'confirm' });
+  // B's own request starts right then (not published yet: B is alone and checks its own work first).
+  let proceed;
+  const ownCheck = new Promise((resolve) => { proceed = resolve; });
+  const own = run(paths, {
+    ...BASE, operation: 'data-root-migration', operationKey: 'to:/other', message: '为迁移数据目录', ignoreBackoff: true,
+    whenBusy: 'wait', requesterHostBootId: 'window-b', requesterBusy: () => ownCheck
+  }, async () => 'migrated');
+  await b.check();
+  const held = await readAnswer(paths, 'earlier-request', 'window-b');
+  assert.deepEqual([held.stage, held.answer], ['prepare', 'ready'], 'no confirm (and no busy) while its own request runs');
+  assert.equal(b.confirms(), 0);
+  proceed(undefined);
+  assert.equal((await own).state, 'completed');
+  await b.check();
+  assert.equal((await readAnswer(paths, 'earlier-request', 'window-b')).answer, 'confirmed');
+  await writeRequest(paths, { ...earlier, phase: 'go' });
+  await b.check();
+  assert.equal(b.releases(), 1);
+});
+
+test('用户已确认的操作（不可取消倒计时或只提示）在确认阶段与倒计时之后只看任务不看焦点；普通倒计时仍看焦点', async (t) => {
+  for (const confirmation of ['final-countdown', 'notice', 'countdown']) {
+    const { binding, paths } = await createRoot(t);
+    // The user clicks into the window whose countdown or notice just appeared, and stays there.
+    let focused = false;
+    const window = await openWindow(t, binding, `${confirmation}-window`, {
+      busy: async () => focused ? { kind: 'focus', reason: '窗口正在使用' } : undefined,
+      confirm: () => { focused = true; return true; }
+    });
+    let lockedRounds = 0;
+    const outcome = await run(paths, {
+      ...BASE, participantConfirmation: confirmation, whenBusy: 'wait', busyWaitTimeoutMs: 1_000,
+      withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
+    }, async () => 'done');
+    if (confirmation === 'countdown') {
+      assert.equal(outcome.state, 'busy', 'an ordinary countdown still defers to the user in that window');
+      assert.match(outcome.reason, /1 个其它窗口正在使用/);
+      assert.equal(window.releases(), 0);
+    } else {
+      assert.deepEqual(outcome, { state: 'completed', result: 'done', coordinated: true }, confirmation);
+      assert.equal(lockedRounds, 1, `${confirmation}: one round, not vetoed by focus`);
+      assert.equal(window.releases(), 1);
+    }
+  }
+});
+
+test('锁内轮次用完时放弃原因按最后一次的实际原因：发起窗口自身任务、其它窗口任务分开写', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  await openWindow(t, binding, 'idle-peer');
+  let lockedRounds = 0;
+  const outcome = await run(paths, {
+    ...BASE, whenBusy: 'wait', requesterHostBootId: 'self',
+    // The requester's own window is busy exactly while the locks are held (e.g. its Turn resumes).
+    requesterBusy: async () => isRuntimeMaintenanceHeld(paths) ? { kind: 'work', reason: '本窗口有任务正在进行' } : undefined,
+    withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
+  }, async () => assert.fail('must not run'));
+  assert.equal(outcome.state, 'busy');
+  assert.equal(lockedRounds, 3);
+  assert.equal(outcome.reason, '准备期间反复有窗口变忙（最后一次：本窗口还有任务正在进行），这次没有进行，稍后再试。');
+  assert.doesNotMatch(outcome.reason, /其它窗口/);
+});
+
+test('beforeGo 在全部确认之后、发布 go 之前调用：本窗口不空闲就在任何窗口重载前退回锁外或放弃；冻结在轮次结束时解除', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const log = [];
+  const peer = await openWindow(t, binding, 'peer', { log });
+  let checks = 0;
+  const outcome = await run(paths, {
+    ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 5_000, requesterHostBootId: 'self',
+    beforeGo: async () => {
+      checks += 1;
+      const check = checks;
+      log.push(['before-go', check]);
+      const thaw = () => { log.push(['thaw', check]); };
+      return check === 1 ? { busy: { kind: 'work', reason: '本窗口有任务正在进行' }, thaw } : { thaw };
+    }
+  }, async () => { log.push(['operation']); return 'done'; });
+  assert.deepEqual(outcome, { state: 'completed', result: 'done', coordinated: true });
+  const at = (entry) => log.findIndex((item) => JSON.stringify(item) === JSON.stringify(entry));
+  const firstRelease = log.findIndex((item) => item[0] === 'release');
+  const lastConfirm = log.findLastIndex((item) => item[0] === 'confirm');
+  assert.ok(at(['before-go', 1]) > log.findIndex((item) => item[0] === 'confirm'), 'called after every window confirmed');
+  assert.ok(at(['thaw', 1]) < at(['before-go', 2]) && at(['before-go', 2]) > lastConfirm, JSON.stringify(log));
+  assert.ok(firstRelease > at(['before-go', 2]), 'nobody yielded before the requester froze and was idle');
+  assert.ok(at(['operation']) < at(['thaw', 2]), 'thawed when the round ended');
+  assert.equal(peer.releases(), 1);
+
+  // Abandon mode: busy at beforeGo abandons before anybody yields.
+  const { binding: other, paths: otherPaths } = await createRoot(t);
+  const idle = await openWindow(t, other, 'idle');
+  const abandoned = await run(otherPaths, {
+    ...BASE, requesterHostBootId: 'self', beforeGo: async () => ({ busy: { kind: 'work', reason: '本窗口有任务正在进行' } })
+  }, async () => assert.fail('must not run'));
+  assert.equal(abandoned.state, 'busy');
+  assert.match(abandoned.reason, /本窗口还有任务正在进行/);
+  await settle([idle]);
+  assert.equal(idle.releases(), 0);
+});
+
+test('让出阶段与执行前再查发起窗口自身：让出期间开始的任务让本次调用结束，操作不执行', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  // The peer takes a while to reload, like a real window.
+  await openWindow(t, binding, 'slow-peer', { releaseDelayMs: 2_000 });
+  let ownWork = false;
+  let checksWhileYielding = 0;
+  let goAt;
+  const outcome = await run(paths, {
+    ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 5_000, requesterHostBootId: 'self',
+    requesterBusy: async () => {
+      if (ownWork) checksWhileYielding += 1;
+      return ownWork ? { kind: 'work', reason: '本窗口有任务正在进行' } : undefined;
+    },
+    onProgress: (progress) => {
+      if (progress.stage !== 'release' || ownWork) return;
+      ownWork = true;
+      goAt = performance.now();
+    }
+  }, async () => assert.fail('must not run'));
+  assert.equal(outcome.state, 'busy');
+  assert.match(outcome.reason, /^其它窗口开始让出后本窗口还有任务正在进行，这次没有进行/);
+  assert.ok(checksWhileYielding >= 1);
+  // Ended while the peer was still reloading, not only once everybody had gone.
+  assert.ok(performance.now() - goAt < 1_000, `ended ${performance.now() - goAt} ms after the own work started`);
+
+  // Alone (nobody to ask): the last check right before the operation.
+  const { paths: alonePaths } = await createRoot(t);
+  let calls = 0;
+  const alone = await request(alonePaths, {
+    ...BASE, requesterBusy: async () => ((calls += 1) >= 2 ? { kind: 'work', reason: '本窗口有任务正在进行' } : undefined)
+  }, async () => assert.fail('must not run'));
+  assert.equal(alone.state, 'busy');
+  assert.equal(calls, 2, 'checked once before and once right before the operation');
+});
+
+test('锁内执行操作期间持续刷新请求与“维护进行中”标记：等待打开的窗口看到在做什么、已进行多久和阶段，轮询在最初几秒后退避', async (t) => {
+  const { root, binding, paths } = await createRoot(t);
+  await openWindow(t, binding, 'peer');
+  const waits = [];
+  let startOpening;
+  const openingStarted = new Promise((resolve) => { startOpening = resolve; });
+  // A reloaded window opening again: outside the requester's async scope, it waits on the admission.
+  const opening = openingStarted.then(() => openUnderCurrentDataRootAdmission(async () => root, async () => 'opened', 5, {
+    onWait: (wait) => waits.push(wait)
+  }));
+  let visible;
+  const outcome = await run(paths, {
+    ...BASE, operation: 'data-root-migration', operationKey: 'to:/new-root', message: '为迁移数据目录', ignoreBackoff: true,
+    configurationRootPath: root, withLocks: (body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body))
+  }, async ({ reportStage }) => {
+    startOpening();
+    await delay(1_500);
+    reportStage('正在复制正文（1/2）');
+    await delay(3_500);
+    // Before: the request was not refreshed while the operation ran (invisible after 15 s).
+    visible = (await readExclusiveMaintenanceRequests(paths, { staleRequestMs: 3_000 })).map((item) => `${item.phase}:${item.activity}`);
+    return 'migrated';
+  });
+  assert.equal(outcome.state, 'completed');
+  assert.equal(await opening, 'opened', 'opens once the maintenance ended');
+  assert.deepEqual(visible, ['go:迁移数据目录']);
+  assert.ok(waits.length > 0 && waits[0].waitedMs >= RUNTIME_CLAIM_WAIT.reportAfterMs);
+  assert.ok(waits.every((wait) => wait.activity?.description === '迁移数据目录' && wait.activity.operation === 'data-root-migration'));
+  const last = waits.at(-1);
+  assert.equal(last.activity.stage, '正在复制正文（1/2）');
+  assert.equal(last.activity.stale, false);
+  assert.ok(last.activity.heartbeatAgeMs < RUNTIME_CLAIM_WAIT.activityHeartbeatMs + 1_000, `heartbeat ${last.activity.heartbeatAgeMs} ms old`);
+  assert.ok(last.activity.runningMs >= 4_500);
+  const later = waits.filter((wait) => wait.waitedMs >= 3_000 && wait.waitedMs < 4_500).length;
+  assert.ok(later >= 3 && later <= 8, `polls between 3 s and 4.5 s of waiting: ${later}`);
+  await assert.rejects(fs.access(path.join(runtimeDataRootAdmissionClaimPath(root), 'activity.json')), 'gone with the claim');
+});
+
 test('持有方没有发布标记时只说在等其它窗口；标记属于别的持有方时不采用；心跳停止时报告没有进展，但从不越过锁', async (t) => {
   const { root } = await createRoot(t);
   await assert.rejects(withRuntimeMaintenanceActivity({ operation: 'x', description: '整理' }, async () => 1), /只能在持有/);
@@ -659,6 +926,45 @@ test('持有方没有发布标记时只说在等其它窗口；标记属于别�
   assert.equal(await opening, 'opened');
 });
 
+test('残留清理与新请求交错：列完回应后再列一次请求，只删两次都没有请求且足够旧的回应，另一个请求方照常完成', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const peer = await openWindow(t, binding, 'peer');
+  // R1's key backs off (an earlier abandoned attempt): below, R1 only sweeps and returns.
+  peer.setBusy(WORK);
+  assert.equal((await request(paths, { ...BASE, operationKey: 'k1', backoffBaseMs: 60_000 }, async () => 'x')).state, 'busy');
+  peer.setBusy(undefined);
+  await settle([peer]);
+  const fsPromises = require('node:fs/promises');
+  const original = fsPromises.readdir;
+  const requestsDirectory = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests');
+  const responsesDirectory = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'responses');
+  let pauseNext = true;
+  // R1's cleanup is paused between listing requests/ and listing responses/ (a slow platform probe,
+  // heavy I/O), until another requester published and the peer answered it.
+  fsPromises.readdir = async function patched(target, ...rest) {
+    const result = await original.call(this, target, ...rest);
+    if (pauseNext && path.resolve(String(target)) === requestsDirectory && /sweepAbandonedRequests/.test(new Error().stack)) {
+      pauseNext = false;
+      for (let i = 0; i < 300; i += 1) {
+        if ((await original(responsesDirectory).catch(() => [])).length > 0) break;
+        await delay(10);
+      }
+    }
+    return result;
+  };
+  t.after(() => { fsPromises.readdir = original; });
+  await fs.mkdir(requestsDirectory, { recursive: true });
+  const r1 = run(paths, { ...BASE, operationKey: 'k1', backoffBaseMs: 60_000 }, async () => 'r1');
+  await delay(30);
+  const r2 = run(paths, { ...BASE, operationKey: 'k2', pollMs: 400, prepareTimeoutMs: 1_500 }, async () => 'r2');
+  const [o1, o2] = await Promise.all([r1, r2]);
+  fsPromises.readdir = original;
+  // Before: R1 removed R2's fresh answers, the peer never answered again and R2 timed out.
+  assert.equal(o2.state, 'completed', JSON.stringify(o2));
+  assert.equal(o1.state, 'backoff');
+  assert.equal(peer.releases(), 1, 'R2 made the peer yield');
+});
+
 /** The locked round alone, inside the target maintenance claim. */
 async function request(paths, input, operation) {
   return withRuntimeMaintenance(paths, () => requestExclusiveRuntimeMaintenance(paths, { pollMs: 10, ...input }, operation));
@@ -682,8 +988,10 @@ async function openWindow(t, binding, hostBootId, options = {}) {
   const liveness = await publishHost(binding, hostBootId, options.startedAt);
   if (options.registerAfterMs) await delay(options.registerAfterMs);
   let participant;
+  let markReleased;
   const window = {
     log: own,
+    released: new Promise((resolve) => { markReleased = resolve; }),
     setBusy(value) { busy = value; },
     confirms: () => own.filter((entry) => entry[0] === 'confirm').length,
     releases: () => own.filter((entry) => entry[0] === 'release').length,
@@ -700,17 +1008,35 @@ async function openWindow(t, binding, hostBootId, options = {}) {
       push(['release', hostBootId, request.round]);
       const closing = participant;
       participant = undefined;
+      if (options.releaseDelayMs) await delay(options.releaseDelayMs);
       await closing.dispose();
       await fs.rm(liveness, { force: true });
+      markReleased();
     },
     notifyWaiting: (_request, reason) => push(['waiting', hostBootId, reason.kind])
-  }, { pollMs: 10, processId: options.processId ?? (nextFakeProcessId += 1) });
+  }, { pollMs: options.pollMs ?? 10, processId: options.processId ?? (nextFakeProcessId += 1) });
   await participant.checkNow();
   t.after(async () => {
     await participant?.dispose();
     await fs.rm(liveness, { force: true });
   });
   return window;
+}
+
+/** A request file of another requester (this process stands in for it). */
+async function writeRequest(paths, overrides) {
+  const file = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests', `${overrides.requestId}.json`);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({
+    kind: 'limcode-runtime-exclusive-maintenance-request', round: 1, phase: 'prepare', operation: 'offline-gc', operationKey: 'gc',
+    message: '为整理数据', activity: '整理数据', confirmation: 'countdown', whenBusy: 'abandon', requesterProcessId: process.pid,
+    requesterProcessStartIdentity: ownProcessStartIdentity(), heartbeatAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), ...overrides
+  }));
+}
+
+async function readAnswer(paths, requestId, hostBootId) {
+  return JSON.parse(await fs.readFile(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'responses', requestId, `${hostBootId}.json`), 'utf8'));
 }
 
 /** Lets participants run a few more polls, so a late (wrong) reaction would show up. */

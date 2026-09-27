@@ -3,7 +3,7 @@ import type { RuntimeRootPaths } from '../backend/reliableKernel/contracts';
 import {
   requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance,
   startExclusiveMaintenanceParticipant as startProtocolParticipant,
-  type ExclusiveMaintenanceBusy, type ExclusiveMaintenanceParticipant, type ExclusiveMaintenanceProgress,
+  type ExclusiveMaintenanceBusy, type ExclusiveMaintenanceOperation, type ExclusiveMaintenanceParticipant, type ExclusiveMaintenanceProgress,
   type RuntimeExclusiveMaintenanceInput, type RuntimeExclusiveMaintenanceOutcome,
   type RuntimeExclusiveMaintenanceRunInput, type RuntimeExclusiveMaintenanceRequest
 } from '../backend/reliableKernel/runtimeExclusiveMaintenance';
@@ -20,14 +20,26 @@ export interface ExclusiveMaintenanceParticipantOptions {
   isCurrent?(): boolean;
   /** Tests that run several windows in one process give each its own identity. */
   processId?: number;
+  /**
+   * Keeps a text across the reload that yielding causes (e.g. in workspaceState); the window shows
+   * it once it opened again. Used for this window's own request that ended shortly before.
+   */
+  rememberAcrossReload?(text: string): PromiseLike<void> | void;
 }
+
+/** How long before a reload this window's own unfinished request is carried across it. */
+const REMEMBER_BEFORE_RELOAD_MS = 5 * 60_000;
+/** The last request of this window that did not complete, and when it ended. */
+let unfinishedRequest: { text: string; at: number } | undefined;
 
 /**
  * This window's side of cooperative exclusive maintenance on its selected root. It never yields
  * while it runs work (busy: work) or while the user is in it (busy: focus); only when every window
  * is ready does it show the countdown (a notice, or a countdown without cancel, when the user
  * already confirmed the operation elsewhere) and then reload. Unsent composer input survives the
- * reload (Webview state).
+ * reload (Webview state). While this window's own request runs it never yields (the primitive
+ * answers busy for it), and when it yields shortly after its own request ended without completing,
+ * the outcome is kept across the reload (rememberAcrossReload).
  */
 export function startExclusiveMaintenanceParticipant(
   host: ExclusiveMaintenanceParticipantHost,
@@ -45,6 +57,11 @@ export function startExclusiveMaintenanceParticipant(
       ? announce(request.message)
       : countdown(request, seconds),
     release: async () => {
+      const unfinished = unfinishedRequest;
+      if (unfinished && Date.now() - unfinished.at < REMEMBER_BEFORE_RELOAD_MS && options.rememberAcrossReload) {
+        try { await options.rememberAcrossReload(unfinished.text); }
+        catch (error) { console.warn('[LimCode] 无法保留重载前的维护结果。', error); }
+      }
       await vscode.commands.executeCommand('workbench.action.reloadWindow');
     },
     notifyWaiting: (request, busy) => {
@@ -84,12 +101,13 @@ export type ExclusiveMaintenanceRequestOptions = Omit<
 
 /**
  * Requester side. Shows a cancellable progress notification only while other windows (or this
- * window's own work) are actually involved.
+ * window's own work) are actually involved. An outcome that did not complete is remembered, so a
+ * reload of this window soon after (another window's maintenance) keeps it (rememberAcrossReload).
  */
 export async function runWithExclusiveMaintenance<T>(
   paths: RuntimeRootPaths,
   options: ExclusiveMaintenanceRequestOptions,
-  operation: () => Promise<T>
+  operation: ExclusiveMaintenanceOperation<T>
 ): Promise<RuntimeExclusiveMaintenanceOutcome<T>> {
   const { waitingTitle, isCurrent, withLocks, ...input } = options;
   let cancelled = false;
@@ -111,9 +129,18 @@ export async function runWithExclusiveMaintenance<T>(
     onProgress: (progress) => reporter?.report({ message: describeProgress(progress) }),
     onWaitEnd: () => finishWait?.()
   };
-  return withLocks
-    ? runExclusiveRuntimeMaintenance(paths, { ...coordinated, withLocks }, operation)
-    : requestExclusiveRuntimeMaintenance(paths, coordinated, operation);
+  const activity = input.activity ?? input.message.replace(/^为/, '');
+  try {
+    const outcome = await (withLocks
+      ? runExclusiveRuntimeMaintenance(paths, { ...coordinated, withLocks }, operation)
+      : requestExclusiveRuntimeMaintenance(paths, coordinated, operation));
+    unfinishedRequest = outcome.state === 'completed' || outcome.state === 'cancelled'
+      ? undefined : { text: `${activity}没有进行：${outcome.reason}`, at: Date.now() };
+    return outcome;
+  } catch (error) {
+    unfinishedRequest = { text: `${activity}没有完成：${error instanceof Error ? error.message : String(error)}`, at: Date.now() };
+    throw error;
+  }
 }
 
 export function describeProgress(progress: ExclusiveMaintenanceProgress): string {

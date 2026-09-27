@@ -372,6 +372,135 @@ test('复现改写：用户请求过的大来源遇到忙窗口时不在锁内�
   assert.deepEqual(windows.reloads(), { B: 0, A: 0, C: 0 });
 });
 
+test('多进程（复审 MP5）：两个请求方同时在锁外等待时不互等——较新的请求让先并写明原因，较早的迁移完成；较新的窗口随后让出，重载后看到自己没有进行的原因', async (t) => {
+  const fixture = await createRoot(t);
+  const windows = createWindows(t, fixture.root, { noMerge: true });
+  await (await windows.start('C', { busy: true, busyForMs: 5_000 })).waitFor('ready');
+  // B: the user confirmed “迁移数据目录” here, then went to window D.
+  const b = await windows.start('B', { request: true });
+  await b.waitFor('progress', 30_000);
+  // D: the user clicks another operation in window D that needs the other windows offline.
+  const d = await windows.start('D', {
+    request: true, keptNoticeFile: path.join(path.dirname(fixture.root), 'kept-D.json'),
+    requestOptions: { operation: 'historical-merge', operationKey: 'source@x', message: '为合并较大的旧聊天记录', participantConfirmation: 'notice', requesterBusy: undefined }
+  });
+  const dOutcome = await d.waitFor('coordination', 60_000);
+  const bOutcome = await b.waitFor('coordination', 60_000);
+  const kept = await windows.waitForEvent('D', 'kept-notice', 30_000);
+  await windows.stop();
+  assert.equal(dOutcome.state, 'busy');
+  assert.match(dOutcome.reason, /^另一个窗口先发起了迁移数据目录，这次让它先完成/);
+  assert.equal(bOutcome.state, 'completed', 'the earlier migration is never dropped');
+  assert.deepEqual(windows.reloads(), { C: 1, B: 0, D: 1 });
+  const dReload = windows.events().find((event) => event.name === 'D' && event.event === 'reload');
+  assert.ok(dReload.at >= dOutcome.at, 'D yielded only after its own request ended');
+  assert.match(kept.text, /^合并较大的旧聊天记录没有进行：另一个窗口先发起了迁移数据目录/);
+});
+
+test('多进程（复审 MP4）：用户已确认的操作不可否决——参与方用户点进倒计时的窗口不会让这一轮作废', async (t) => {
+  const fixture = await createRoot(t);
+  const windows = createWindows(t, fixture.root, { noMerge: true });
+  await (await windows.start('W', { countdownSeconds: 1, focusOnCountdownMs: 1_500, participantPollMs: 50 })).waitFor('ready');
+  const requester = await windows.start('R', { request: true });
+  const coordination = await requester.waitFor('coordination', 60_000);
+  await delay(300);
+  await windows.stop();
+  assert.equal(coordination.state, 'completed');
+  const countdowns = windows.events().filter((event) => event.name === 'W' && event.event === 'progress' && event.countdown);
+  assert.equal(countdowns.length, 1);
+  assert.equal(windows.events().filter((event) => event.name === 'R' && event.event === 'locks-taken').length, 1);
+  assert.equal(windows.reloads().W, 1);
+});
+
+test('多进程（复审 MP6）：go 阶段有窗口又变忙时这次调用结束——每个窗口最多重载一次，锁内只有一轮', async (t) => {
+  const fixture = await createRoot(t);
+  const windows = createWindows(t, fixture.root, { noMerge: true });
+  await (await windows.start('F', { participantPollMs: 50 })).waitFor('ready');
+  await (await windows.start('S', { participantPollMs: 400, workAfterConfirm: { delayMs: 60, forMs: 1_500, once: true } })).waitFor('ready');
+  const requester = await windows.start('R', { request: true });
+  const coordination = await requester.waitFor('coordination', 60_000);
+  await delay(1_000);
+  await windows.stop();
+  assert.equal(coordination.state, 'busy');
+  assert.match(coordination.reason, /^其它窗口开始让出后1 个其它窗口有任务正在进行，这次没有进行/);
+  assert.equal(windows.events().filter((event) => event.name === 'R' && event.event === 'locks-taken').length, 1);
+  const reloads = windows.reloads();
+  assert.ok(reloads.F <= 1 && reloads.S === 0 && reloads.R === 0, JSON.stringify(reloads));
+  assert.equal(windows.events().filter((event) => event.event === 'operation').length, 0);
+});
+
+test('多进程（复审 MP2）：用户点击的合并在其它窗口让出后提交失败——其它窗口只重载一次，刚重载后的再次点击被冷却挡住', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
+  await requestRuntimeDataSetMerge(fixture.paths, {
+    candidateId: fixture.alpha.id,
+    expectedDataSetId: fixture.alpha.binding.dataSetId,
+    expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
+  });
+  const windows = createWindows(t, fixture.root, { limits: LIMITS, failCommit: true });
+  await (await windows.start('B', { noMerge: true })).waitFor('ready');
+  const a = await windows.start('A', { explicit: fixture.alpha.id });
+  await a.waitFor('report', 60_000);
+  // A window opened after that go (like one that just yielded) clicks again.
+  const again = await windows.start('A2', { explicit: fixture.alpha.id });
+  await again.waitFor('report', 60_000);
+  await delay(1_000);
+  await windows.stop();
+  const reloads = windows.reloads();
+  assert.deepEqual([reloads.A, reloads.A2], [0, 0]);
+  assert.ok(reloads.B <= 1, JSON.stringify(reloads));
+  const clicks = windows.events().filter((event) => event.event === 'coordination' && event.requested);
+  assert.equal(clicks.at(-1).name, 'A2');
+  assert.equal(clicks.at(-1).state, 'backoff');
+  assert.match(clicks.at(-1).reason, /本窗口是在那之后打开的/);
+  for (const report of windows.reports()) assert.deepEqual(report.merged, []);
+});
+
+test('多进程（复审 MP3）：用户点击的大来源遇到忙窗口时在锁外等待，新窗口随即打开，之后合并完成', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
+  const windows = createWindows(t, fixture.root, { limits: LIMITS });
+  await (await windows.start('B', { busy: true, busyForMs: 6_000, noMerge: true })).waitFor('ready');
+  const a = await windows.start('A', { explicit: fixture.alpha.id });
+  await a.waitFor('progress', 30_000);
+  const c = await windows.start('C', { noMerge: true });
+  const opened = await c.waitFor('opened', 15_000);
+  const report = await a.waitFor('report', 60_000);
+  await windows.stop();
+  assert.ok(opened.openMs < 3_000, `C opened after ${opened.openMs} ms`);
+  assert.deepEqual(report.merged, [fixture.alpha.id]);
+  assert.deepEqual(windows.reloads(), { B: 1, A: 0, C: 1 });
+});
+
+test('多进程：只有发起窗口自己忙时也等它（其它窗口空闲），操作在它的任务结束之后才执行', async (t) => {
+  const fixture = await createRoot(t);
+  const windows = createWindows(t, fixture.root, { noMerge: true });
+  await (await windows.start('idle')).waitFor('ready');
+  const requester = await windows.start('requester', { request: true, busy: true, busyForMs: 2_000 });
+  const coordination = await requester.waitFor('coordination', 30_000);
+  await windows.stop();
+  assert.equal(coordination.state, 'completed');
+  const operation = windows.events().find((event) => event.event === 'operation');
+  const busyEnd = windows.events().find((event) => event.name === 'requester' && event.event === 'opened').startedAt + 2_000;
+  assert.ok(operation.at >= busyEnd, 'the requester window finished its own work first');
+});
+
+test('多进程：迁移执行期间重载的窗口在打开外壳里看到“另一个窗口正在迁移数据目录（已进行 N 秒）”，结束后自动打开', async (t) => {
+  const fixture = await createRoot(t);
+  const windows = createWindows(t, fixture.root, { noMerge: true });
+  await (await windows.start('W')).waitFor('ready');
+  const requester = await windows.start('R', { request: true, operationMs: 4_000 });
+  const coordination = await requester.waitFor('coordination', 30_000);
+  const reopened = await windows.waitForEvent('W', 'opened', 30_000, 2);
+  await windows.stop();
+  assert.equal(coordination.state, 'completed');
+  const statuses = windows.events().filter((event) => event.name === 'W' && event.boot === 2 && event.event === 'opening-status')
+    .map((event) => event.description);
+  assert.ok(statuses.some((text) => /^另一个窗口正在迁移数据目录（已进行 \d+ 秒），完成后自动打开；未发送的输入已保留。$/.test(text)), JSON.stringify(statuses));
+  const released = windows.events().find((event) => event.name === 'R' && event.event === 'locks-released').at;
+  assert.ok(reopened.at >= released, 'opened only after the maintenance let go of the locks');
+});
+
 // ---------------------------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------------------------
@@ -496,7 +625,11 @@ function createWindows(t, root, defaults) {
     child.once('exit', (code, signal) => {
       if (state.children.get(name) === child) state.children.delete(name);
       state.events.push({ name, boot, event: 'exit', code, signal, at: Date.now() });
-      if (!state.stopped && own.some((event) => event.event === 'reload')) void start(name, behavior);
+      if (!state.stopped && own.some((event) => event.event === 'reload')) {
+        // A reloaded window boots again, no longer as the requester or with the user's click.
+        const { request: _request, explicit: _explicit, requestAfterMs: _after, ...rest } = behavior;
+        void start(name, rest);
+      }
     });
     return {
       waitFor: (eventName, timeoutMs = 20_000) => new Promise((resolve, reject) => {
@@ -536,6 +669,17 @@ function createWindows(t, root, defaults) {
       if (child) await exitOf(child);
     },
     events: () => state.events,
+    /** An event of any boot of this window (at least `boot`), also one still to come. */
+    waitForEvent: (name, eventName, timeoutMs = 20_000, boot = 1) => new Promise((resolve, reject) => {
+      const started = Date.now();
+      const poll = () => {
+        const found = state.events.find((event) => event.name === name && event.event === eventName && event.boot >= boot);
+        if (found) return resolve(found);
+        if (Date.now() - started > timeoutMs) return reject(new Error(`${name} did not report ${eventName}`));
+        setTimeout(poll, 20);
+      };
+      poll();
+    }),
     reports: () => state.events.filter((event) => event.event === 'report'),
     reloads: () => Object.fromEntries(Object.keys(state.boots).map((name) => [
       name, state.events.filter((event) => event.name === name && event.event === 'reload').length

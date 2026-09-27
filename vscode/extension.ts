@@ -11,6 +11,9 @@ let backendApp: VscodeReliableKernelApplicationFacade | undefined;
 let exclusiveMaintenanceParticipant: { dispose(): Promise<void> } | undefined;
 let activeStartup: ApplicationStartup | undefined;
 let activeContext: vscode.ExtensionContext | undefined;
+/** This window's own maintenance request that ended without completing right before it was reloaded. */
+const RELOAD_NOTICE_KEY = 'limcode.exclusiveMaintenance.noticeAfterReload';
+const RELOAD_NOTICE_TTL_MS = 10 * 60_000;
 
 export function activate(context: vscode.ExtensionContext): void {
   const activationStartedAt = Date.now();
@@ -103,11 +106,13 @@ async function startApplication(
       ({ startExclusiveMaintenanceParticipant }) => {
         if (activeStartup !== startup || backendApp !== application) return;
         exclusiveMaintenanceParticipant = startExclusiveMaintenanceParticipant(application, {
-          isCurrent: () => activeStartup === startup && backendApp === application
+          isCurrent: () => activeStartup === startup && backendApp === application,
+          rememberAcrossReload: (text) => context.workspaceState.update(RELOAD_NOTICE_KEY, { text, at: Date.now() })
         });
       },
       (error) => console.warn(`${EXTENSION_BRAND} exclusive maintenance participation failed to start.`, error)
     );
+    showNoticeKeptAcrossReload(context);
     void import('../backend/application/runtimeBuildInfo').then(
       ({ RUNTIME_BUILD_INFO }) => console.log(
         `${EXTENSION_BRAND} Runtime build information.`,
@@ -152,6 +157,15 @@ async function startApplication(
     }
     void vscode.window.showErrorMessage(`${EXTENSION_BRAND} 运行时无法启动：${message}`);
   }
+}
+
+/** This window's own maintenance request ended without completing just before another one reloaded it. */
+function showNoticeKeptAcrossReload(context: vscode.ExtensionContext): void {
+  const kept = context.workspaceState.get<{ text?: unknown; at?: unknown }>(RELOAD_NOTICE_KEY);
+  if (!kept) return;
+  void context.workspaceState.update(RELOAD_NOTICE_KEY, undefined);
+  if (typeof kept.text !== 'string' || typeof kept.at !== 'number' || Date.now() - kept.at > RELOAD_NOTICE_TTL_MS) return;
+  void vscode.window.showWarningMessage(`${EXTENSION_BRAND} 重载前：${kept.text}`);
 }
 
 export async function deactivate(): Promise<void> {

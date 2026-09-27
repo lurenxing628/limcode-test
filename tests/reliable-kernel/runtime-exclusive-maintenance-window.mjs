@@ -3,7 +3,15 @@
 // then starts the real participant layer (vscode/runtimeExclusiveMaintenance.ts with a vscode mock)
 // and, unless told otherwise, runs the real background merge with the parameters of
 // requestOtherWindowsToYield (vscode/commands/runtimeDataSetManagement.ts). A reload closes the
-// Runtime and exits; the parent starts the next boot of the same window.
+// Runtime and exits; the parent starts the next boot of the same window. Behaviors:
+//   busy / busyForMs      — this window's own work (hasOwnedExecution) from its start
+//   focused               — the user is in this window; focusOnCountdownMs: the user clicks into it
+//                           when its countdown appears and stays that long
+//   countdownSeconds      — participant countdown length (0 by default)
+//   workAfterConfirm      — { delayMs, forMs, once }: a Turn starts shortly after this window confirmed
+//   request / requestOptions / operationMs — this window requests exclusive maintenance (a migration by default)
+//   explicit              — the background merge is the call made for the user's click (candidateIds + requested)
+//   keptNoticeFile        — this window's workspaceState: text kept across a reload (rememberAcrossReload)
 import fsSync from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -37,33 +45,42 @@ const emit = (event, extra = {}) => new Promise((resolve) => {
 });
 setInterval(() => {}, 60_000);
 
-const hostBootId = `${name}-boot-${boot}`;
-const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
-const database = await openUnderCurrentDataRootAdmission(async () => root,
-  () => kernel.RuntimeDatabase.open(authority, { hostBootId }));
-const paths = authority.expectedPaths();
-await emit('opened', { hostBootId, startedAt });
+// A text the previous boot kept across its reload (extension.ts shows it once).
+if (behavior.keptNoticeFile && fsSync.existsSync(behavior.keptNoticeFile)) {
+  const kept = JSON.parse(fsSync.readFileSync(behavior.keptNoticeFile, 'utf8'));
+  fsSync.rmSync(behavior.keptNoticeFile, { force: true });
+  await emit('kept-notice', { text: kept.text });
+}
 
-const busyNow = () => behavior.busy === true && (!behavior.busyForMs || Date.now() - startedAt < behavior.busyForMs);
-const facadeLike = { requireOpen() {}, product: { application: { database } } };
-const host = {
-  exclusiveMaintenanceTarget: () => ({ paths, hostBootId }),
-  hasOwnedExecution: async () => busyNow() || Facade.prototype.hasOwnedExecution.call(facadeLike)
-};
-let participant;
-const layer = loadVscodeLayer({
+let focused = behavior.focused === true;
+let workUntil = behavior.busy === true ? (behavior.busyForMs ? startedAt + behavior.busyForMs : Infinity) : 0;
+let workScheduled = false;
+const vscodeMock = {
   ProgressLocation: { Notification: 15 },
   window: {
-    state: { get focused() { return behavior.focused === true; } },
+    state: { get focused() { return focused; } },
     withProgress: async (options, task) => {
-      await emit('progress', { title: options.title, cancellable: options.cancellable === true });
+      const countdown = /即将重载/.test(options.title);
+      await emit('progress', { title: options.title, cancellable: options.cancellable === true, countdown });
+      if (countdown && behavior.focusOnCountdownMs) {
+        // The user clicks into the window whose countdown just appeared, then goes back.
+        focused = true;
+        setTimeout(() => { focused = false; }, behavior.focusOnCountdownMs);
+      }
       // The user presses "取消" on a cancellable countdown (behavior.cancelCountdown).
-      return task({ report() {} }, {
+      const result = await task({ report() {} }, {
         get isCancellationRequested() { return behavior.cancelCountdown === true && options.cancellable === true; },
         onCancellationRequested() {}
       });
+      if (countdown && behavior.workAfterConfirm && !(behavior.workAfterConfirm.once && workScheduled)) {
+        workScheduled = true;
+        const { delayMs, forMs } = behavior.workAfterConfirm;
+        setTimeout(() => { workUntil = Date.now() + forMs; void emit('work-start'); }, delayMs);
+      }
+      return result;
     },
-    showInformationMessage: async (message) => { await emit('notice', { message }); }
+    showInformationMessage: async (message) => { await emit('notice', { message }); },
+    showWarningMessage: async (message) => { await emit('warning', { message }); return undefined; }
   },
   commands: {
     executeCommand: async (id) => {
@@ -71,17 +88,55 @@ const layer = loadVscodeLayer({
       await emit('reload');
       // deactivate(): participant and Runtime close, then the Extension Host process is replaced.
       await participant?.dispose().catch(() => undefined);
-      await database.close().catch(() => undefined);
+      await database?.close().catch(() => undefined);
       process.exit(0);
     }
   }
+};
+let participant;
+let database;
+
+// Opening like extension.ts: a long wait on the admission is explained (runtimeOpeningWait.ts).
+const openingWait = loadLayer('vscode/runtimeOpeningWait.ts', {}).createRuntimeOpeningWaitPresenter((status) => {
+  if (status) void emit('opening-status', { description: status.description });
 });
+const hostBootId = `${name}-boot-${boot}`;
+const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
+const openStarted = Date.now();
+database = await openUnderCurrentDataRootAdmission(async () => root,
+  () => kernel.RuntimeDatabase.open(authority, { hostBootId }), 5, { onWait: (wait) => openingWait.onWait(wait) });
+openingWait.end();
+const paths = authority.expectedPaths();
+await emit('opened', { hostBootId, startedAt, openMs: Date.now() - openStarted });
+
+const busyNow = () => Date.now() < workUntil;
+const facadeLike = { requireOpen() {}, product: { application: { database } } };
+const host = {
+  exclusiveMaintenanceTarget: () => ({ paths, hostBootId }),
+  hasOwnedExecution: async () => busyNow() || Facade.prototype.hasOwnedExecution.call(facadeLike)
+};
+const layer = loadLayer('vscode/runtimeExclusiveMaintenance.ts', { '../backend/reliableKernel/runtimeExclusiveMaintenance': exclusive });
 // An older version never takes part (behavior.participant === false).
 if (behavior.participant !== false) {
-  participant = layer.startExclusiveMaintenanceParticipant(host, { countdownSeconds: 0, pollMs: behavior.participantPollMs ?? 50 });
+  participant = layer.startExclusiveMaintenanceParticipant(host, {
+    countdownSeconds: behavior.countdownSeconds ?? 0, pollMs: behavior.participantPollMs ?? 50,
+    ...(behavior.keptNoticeFile ? {
+      rememberAcrossReload: (text) => fsSync.writeFileSync(behavior.keptNoticeFile, JSON.stringify({ text }))
+    } : {})
+  });
   await participant.checkNow();
 }
 await emit('ready');
+if (behavior.requestAfterMs) await new Promise((resolve) => setTimeout(resolve, behavior.requestAfterMs));
+
+const withTrackedLocks = (take) => async (body) => {
+  await emit('locks-wanted');
+  return take(async () => {
+    const lockedAt = Date.now();
+    await emit('locks-taken');
+    try { return await body(); } finally { await emit('locks-released', { heldMs: Date.now() - lockedAt }); }
+  });
+};
 
 if (behavior.request) {
   // This window asks the others to yield, outside the locks (a data-root migration the user confirmed).
@@ -90,12 +145,18 @@ if (behavior.request) {
     waitingTitle: '正在等待其它窗口空闲后迁移数据目录', configurationRootPath: root, requesterHostBootId: hostBootId,
     requesterBusy: layer.requesterWorkBusy(host), ignoreBackoff: true, whenBusy: 'wait',
     participantConfirmation: 'final-countdown', pollMs: 20, isCurrent: () => true,
-    withLocks: (body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body))
-  }, async () => { await emit('operation'); return 'migrated'; }).catch((error) => ({ state: 'threw', reason: String(error?.message ?? error) }));
+    ...(behavior.requestOptions ?? {}),
+    withLocks: withTrackedLocks((body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body)))
+  }, async () => {
+    await emit('operation');
+    if (behavior.operationMs) await new Promise((resolve) => setTimeout(resolve, behavior.operationMs));
+    return 'migrated';
+  }).catch((error) => ({ state: 'threw', reason: String(error?.message ?? error) }));
   await emit('coordination', { state: outcome.state, reason: outcome.reason });
 } else if (!behavior.noMerge) {
   const report = await mergeHistoricalDataSetsOnline({ globalStoragePath: root }, { configurationRootPath: root, database }, {
     limits: behavior.limits,
+    ...(behavior.explicit ? { candidateIds: [behavior.explicit], requested: true } : {}),
     ...(behavior.failLink ? {
       // Stands in for a persistent I/O failure while linking/copying CAS (EIO, EACCES, ENOSPC …).
       linkFile: async () => { throw Object.assign(new Error('input/output error'), { code: 'EIO' }); }
@@ -112,6 +173,7 @@ if (behavior.request) {
   await emit('report', {
     merged: report.merged.map((item) => item.candidateId),
     deferred: report.deferred.map((item) => item.code),
+    deferredMessages: report.deferred.map((item) => item.message),
     blocked: report.blocked.map((item) => item.code),
     failures: report.failures.map((item) => item.code),
     pending: report.pendingSources
@@ -130,7 +192,7 @@ async function requestOtherWindowsToYield(storagePaths, input, merge) {
     ignoreBackoff: input.requested,
     ...(input.requested ? { whenBusy: 'wait', participantConfirmation: 'notice' } : {}),
     isDeterministicFailure: input.isDeterministicFailure,
-    withLocks: input.withLocks,
+    withLocks: withTrackedLocks(input.withLocks),
     isCurrent: () => true
   }, merge).catch(async (error) => {
     await emit('coordination', { state: 'threw', requested: input.requested, reason: String(error?.message ?? error) });
@@ -140,15 +202,16 @@ async function requestOtherWindowsToYield(storagePaths, input, merge) {
   return outcome.state === 'completed' ? { state: 'completed' } : { state: outcome.state, reason: outcome.reason };
 }
 
-function loadVscodeLayer(vscodeModule) {
+/** Loads a real VS Code layer module with this window's vscode mock. */
+function loadLayer(file, extra) {
   const ts = require('typescript');
-  const filename = path.resolve('vscode/runtimeExclusiveMaintenance.ts');
+  const filename = path.resolve(file);
   const module = { exports: {} };
-  const dependencies = { vscode: vscodeModule, '../backend/reliableKernel/runtimeExclusiveMaintenance': exclusive };
+  const dependencies = { vscode: vscodeMock, ...extra };
   vm.runInNewContext(ts.transpileModule(fsSync.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText, {
-    module, exports: module.exports, console, setInterval, clearInterval, setTimeout, clearTimeout,
+    module, exports: module.exports, console, setInterval, clearInterval, setTimeout, clearTimeout, Promise,
     require(dependency) {
       if (!Object.prototype.hasOwnProperty.call(dependencies, dependency)) throw new Error(`Unexpected dependency ${dependency}`);
       return dependencies[dependency];

@@ -556,24 +556,26 @@ function validateMigration(root, migration, failures) {
   const expectedExclusive = {
     location: 'target-control-root/exclusive-maintenance',
     uses: 'user-requested-data-root-migration; oversized-historical-merge-fallback; offline-gc; never-epoch-upgrade',
-    request: 'one-file-per-requester-with-operation-key-and-user-message; heartbeat-2s-ignored-after-15s; marked-withdrawn-before-removal',
+    request: 'one-file-per-requester-with-operation-key-user-message-and-activity; heartbeat-2s-refreshed-while-operation-runs-ignored-after-15s; marked-withdrawn-before-removal',
     protocol: 'prepare-each-host-answers-ready-busy-or-declined; confirm-only-when-all-ready; go-only-when-all-confirmed; no-host-yields-before-go; new-round-per-locked-attempt',
     participation: 'host-registers-after-runtime-ready; registration-grace-equals-prepare-timeout; unregistered-live-host-after-grace-or-unknown-host-abandons',
-    busyPolicy: 'abandon-at-once-by-default; wait-bounded-only-outside-locks-with-advance-notice-per-reason; busy-again-under-locks-releases-them-and-waits-outside-at-most-3-locked-attempts',
+    busyPolicy: 'abandon-at-once-by-default; wait-bounded-only-outside-locks-with-advance-notice-per-reason; busy-again-before-go-releases-locks-and-waits-outside-at-most-3-locked-attempts; busy-at-go-ends-the-call; abandon-reason-from-last-actual-busy-requester-other-work-or-focus',
+    concurrentRequesters: 'window-with-running-request-answers-busy-and-never-yields; later-request-gives-way-to-earlier-one-that-waits-or-is-past-prepare-by-created-at-then-request-id; window-giving-way-holds-its-confirm-and-go-answers-until-own-request-ended; unfinished-outcome-kept-across-a-reload-that-follows-within-5m',
     lockHold: 'admission-and-maintenance-only-for-locked-round-prepare-8s-confirm-20s-release-30s-then-operation; never-while-waiting-for-busy-windows',
-    peerBehavior: 'busy-work-while-lease-pinned-or-pending-conversation-work; busy-focus-while-focused; 5s-cancellable-countdown-or-final-countdown-without-cancel-or-notice; go-stage-busy-never-reloads-that-round; reload-with-unsent-composer-in-webview-state',
-    goAbandonCost: 'windows-already-reloaded-wait-on-admission-then-reopen-with-unsent-input-kept',
-    requesterSelf: 'skipped-by-requester-host-boot-id-else-requester-process; requester-busy-callback-counts-like-another-window; requester-closes-own-runtime-inside-operation',
-    reloadedHostBehavior: 'wait-on-configuration-admission-until-maintenance-ends-then-reread-data-root',
-    backoff: 'per-operation-key-exponential-5m-to-6h-after-abandon-or-failure-after-go; deterministic-failure-blocks-key; per-operation-10m-cooldown-after-go; ignore-backoff-explicit-per-call-skips-key-backoff-only; success-resets-key',
+    peerBehavior: 'busy-work-while-lease-pinned-or-pending-conversation-work-or-own-request-running; busy-focus-while-focused-except-past-prepare-of-final-countdown-or-notice; 5s-cancellable-countdown-or-final-countdown-without-cancel-or-notice; go-stage-busy-never-reloads-that-round; reload-with-unsent-composer-in-webview-state',
+    goAbandonCost: 'each-window-reloads-at-most-once-per-call; busy-at-go-abandons-the-call; windows-already-reloaded-wait-on-admission-then-reopen-with-unsent-input-kept; automatic-retry-held-off-by-10m-cooldown; explicit-retry-skips-cooldown-only-from-a-process-started-before-it',
+    requesterSelf: 'skipped-by-requester-host-boot-id-else-requester-process; requester-busy-callback-counts-like-another-window-while-preparing-confirming-yielding-and-right-before-operation; before-go-hook-after-all-confirmed-freezes-requester-window-busy-returns-outside-or-abandons-before-any-reload-thawed-when-round-ends; requester-closes-own-runtime-inside-operation',
+    activityMarker: 'holder-publishes-operation-description-stage-and-start-inside-each-held-claim-bound-to-claim-token; refreshed-every-2s-during-locked-round-and-operation; stale-after-15s-reported-never-taken-over; gone-with-the-claim',
+    reloadedHostBehavior: 'wait-on-configuration-admission-until-maintenance-ends-then-reread-data-root; after-1s-shell-and-notification-show-holder-activity-and-elapsed-or-another-window-opening; poll-50ms-then-250ms-after-2s-then-1s-after-10s; warning-offers-keep-waiting-or-close-window-after-long-wait-or-stale-heartbeat; never-opens-past-the-lock',
+    backoff: 'per-operation-key-exponential-5m-to-6h-after-abandon-or-failure-after-go; deterministic-failure-blocks-key-for-automatic-calls-only; explicit-call-runs-blocked-key-and-success-clears-it; clear-key-api; key-carries-identity-that-changes-once-fixed; per-operation-10m-cooldown-after-go; ignore-backoff-explicit-per-call-skips-key-backoff; success-resets-key',
     waitBound: 'prepare-8s-busy-wait-10m-confirm-20s-release-30s-monotonic; cancellable; outcome-completed-busy-declined-legacy-host-timed-out-cancelled-backoff-or-blocked-with-reason; failure-after-go-rethrown',
     processProbe: 'platform-identity-once-per-pid-and-start-identity-then-kill-0; registration-kill-0-only; final-decision-uncached',
-    cleanup: 'crashed-requester-requests-and-responses-swept-by-next-request; cleanup-failure-logged-never-replaces-outcome; eperm-retried',
+    cleanup: 'crashed-requester-requests-and-responses-swept-by-next-request; answers-removed-only-without-request-in-listings-before-and-after-and-unwritten-15s; cleanup-failure-logged-never-replaces-outcome; eperm-retried',
     exclusivityProof: 'host-liveness-records-only; request-advisory'
   };
   if (!plainObject(exclusive) || JSON.stringify(Object.keys(exclusive).sort()) !== JSON.stringify(Object.keys(expectedExclusive).sort())
     || Object.entries(expectedExclusive).some(([key, value]) => exclusive[key] !== value)) {
-    failures.push('多窗口独占维护必须分阶段协调：全部窗口就绪才确认、全部确认才让出；等待忙窗口只在锁外，锁内轮次有时限；放弃与让出后失败按操作键退避、确定性失败转 blocked、按操作冷却，独占仍以 Host liveness 证明');
+    failures.push('多窗口独占维护必须分阶段协调：全部窗口就绪才确认、全部确认才让出，go 之后遇忙本次结束；两个请求方不互等；等待忙窗口只在锁外，锁内轮次有时限；放弃与让出后失败按操作键退避、确定性失败只拦自动调用、按操作冷却；持锁方发布带心跳的维护进行中标记，等待打开的窗口说明原因且绝不越过锁；独占仍以 Host liveness 证明');
   }
   const relocation = migration?.dataRootRelocation;
   const expectedRelocation = {
