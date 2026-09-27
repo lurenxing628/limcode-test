@@ -20,9 +20,13 @@ function facadeForAbort(overrides = {}) {
   const calls = [];
   const facade = Object.create(Facade.prototype);
   facade.product = {
-    application: { database: { conversationOwners: {
-      run() { assert.fail('侧栏停止不应要求当前宿主认领远端 Conversation'); }
-    } } },
+    application: { database: {
+      conversationOwners: {
+        run() { assert.fail('侧栏停止不应要求当前宿主认领远端 Conversation'); }
+      },
+      // The stop watches its own commits to return the history list to page one.
+      onCommit() { return () => {}; }
+    } },
     conversations: { async interrupt(request) { calls.push({ kind: 'interrupt', request }); } },
     childAgents: { async interruptSubtree(request) { calls.push({ kind: 'subtree', request }); } }
   };
