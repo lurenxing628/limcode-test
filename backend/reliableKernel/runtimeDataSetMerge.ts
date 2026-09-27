@@ -20,13 +20,13 @@ import {
   type CarriedWorkRefusals, type UnfinishedWorkInspection
 } from './runtimeDataSetMergeWork';
 import {
-  cachedRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits, readRuntimeDataSetMergeCommit,
-  readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger, readRuntimeDataSetMergeRequests,
-  rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit, removeRuntimeDataSetMergeFinalization,
-  removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest, restoreRuntimeDataSetMergeLedgerRecord,
-  runtimeDataSetFingerprint, runtimeDataSetLastMerge, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity,
-  writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization, writeRuntimeDataSetMergeLedgerRecord,
-  writeRuntimeDataSetMergeRequest,
+  cachedRuntimeDataSetFingerprint, isReadableRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits,
+  readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger,
+  readRuntimeDataSetMergeRequests, rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit,
+  removeRuntimeDataSetMergeFinalization, removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest,
+  restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetFingerprint, runtimeDataSetLastMerge,
+  sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization,
+  writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeLedgerRecord,
   type RuntimeDataSetMergeLedgerRequest
 } from './runtimeDataSetMergeLedger';
@@ -269,6 +269,8 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   finalized?: { turns: number; intents: number; sourceBackupPath: string };
   /** Merged through the exclusive fallback because the source exceeded the online limits. */
   exclusive?: boolean;
+  /** Nothing new was written: the source is merged into this data set already (已合并，没有新内容). */
+  alreadyMerged?: true;
 }
 
 export interface RuntimeDataSetMergeIssue {
@@ -303,7 +305,10 @@ export interface RuntimeDataSetMergedFacts {
   intoCurrent: boolean;
   /** No data set of this configuration root has the target's identity any more (deleted, reset, unreadable). */
   targetMissing: boolean;
+  /** Its content differs from the merged state (false while it cannot be read, see sourceUnreadable). */
   changedSinceMerge: boolean;
+  /** Its content cannot be read now (e.g. no room for the private copy): whether it changed is unknown. */
+  sourceUnreadable?: true;
 }
 
 export type RuntimeDataSetMergeState =
@@ -332,8 +337,8 @@ type Refusal = {
 
 type SourceOutcome =
   | { kind: 'merged'; result: RuntimeDataSetMergeResult }
-  /** Every row is already in the target: recorded as merged, nothing new to report. */
-  | { kind: 'current' }
+  /** Every row is already in the target: nothing new, reported only for an explicit request (result.alreadyMerged). */
+  | { kind: 'current'; result: RuntimeDataSetMergeResult }
   /** shouldContinue turned false before this source changed anything; nothing is recorded. */
   | { kind: 'stopped' }
   | Refusal;
@@ -450,8 +455,8 @@ export async function mergeHistoricalDataSetsOnline(
       { finalizeWork: true, requested: source.requested }, keepGoing);
     if (outcome.kind === 'stopped') break;
     if (outcome.kind === 'merged' || outcome.kind === 'current') {
-      if (outcome.kind === 'merged') report.merged.push(outcome.result);
-      else if (source.requested) report.merged.push(unchangedResult(source.candidate, target));
+      const { result } = outcome;
+      if (outcome.kind === 'merged' || source.requested) report.merged.push(result);
       await removeRuntimeDataSetMergeRequest(storagePaths, source.candidate.id).catch(() => undefined);
       continue;
     }
@@ -502,6 +507,8 @@ async function selectSource(
   const unchanged = record !== undefined && fingerprint !== 'uncached' && sameRuntimeDataSetFingerprint(record.source, fingerprint);
   if (record?.state === 'merged' && sameRuntimeDataSetIdentity(record.target, target.identity) && unchanged) {
     if (request || source.expired) await removeRuntimeDataSetMergeRequest(paths, candidate.id);
+    // An explicit request always hears back, also when there is nothing new.
+    if (source.requested) report.merged.push({ ...unchangedResult(candidate, target), alreadyMerged: true });
     return 'skip';
   }
   if (source.requested) return later ? 'later' : 'work';
@@ -567,9 +574,7 @@ export async function mergeRuntimeDataSetIntoDatabase(
   const outcome = await mergeOneSource(storagePaths, target, candidate.id,
     { limits: { maxRows: Infinity, maxBytes: Infinity }, ...options },
     { finalizeWork: !options.migration, requested: true, migration: options.migration === true });
-  if (outcome.kind === 'merged' || outcome.kind === 'current') {
-    return outcome.kind === 'merged' ? outcome.result : unchangedResult(candidate, target);
-  }
+  if (outcome.kind === 'merged' || outcome.kind === 'current') return outcome.result;
   await settleTargetBackup(target, { keepUsed: true }).catch(() => undefined);
   if (outcome.kind === 'stopped') throw new RuntimeDataSetMergeError('runtime-data-set-merge-stopped', '合并已停止。');
   throw new RuntimeDataSetMergeError(outcome.code, outcome.message);
@@ -705,13 +710,15 @@ export async function readRuntimeDataSetMergeStates(
     const fingerprint = record ? await cachedRuntimeDataSetFingerprint(candidate).catch(() => undefined)
       ?? await withRuntimeDataSetReadClaims(storagePaths, candidate, () => runtimeDataSetFingerprint(candidate)).catch(() => undefined)
       : undefined;
+    const readable = fingerprint !== undefined && isReadableRuntimeDataSetFingerprint(fingerprint);
     const unchanged = record !== undefined && sameRuntimeDataSetFingerprint(record.source, fingerprint);
     const merge = record ? runtimeDataSetLastMerge(record) : undefined;
     const lastMerged: RuntimeDataSetMergedFacts | undefined = merge && {
       mergedAt: merge.mergedAt,
       intoCurrent: sameRuntimeDataSetIdentity(merge.target, current),
       targetMissing: !inspection.candidates.some((dataSet) => sameRuntimeDataSetIdentity(merge.target, dataSet)),
-      changedSinceMerge: !sameRuntimeDataSetFingerprint(merge.source, fingerprint)
+      changedSinceMerge: readable && !sameRuntimeDataSetFingerprint(merge.source, fingerprint),
+      ...(readable ? {} : { sourceUnreadable: true as const })
     };
     const carried = lastMerged ? { lastMerged } : {};
     const request = requests.get(candidate.id);
@@ -939,7 +946,7 @@ async function mergeSource(
     }
     if (plan.steps.length === 0) {
       // Nothing new (e.g. a source whose files changed but whose rows all exist here already):
-      // recorded as merged, without a target backup and without a report.
+      // recorded as merged, without a target backup; reported only when there is something to say.
       return await commitSource(paths, target, candidate, binding, plan, undefined, state, options, mode, stopIfAsked);
     }
     await ensureTargetBackup(target, options);
@@ -972,7 +979,7 @@ async function settledSource(
     const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
     const fingerprint = await runtimeDataSetFingerprint(candidate).catch(() => undefined);
     return sameRuntimeDataSetIdentity(recorded.source, candidate) && sameRuntimeDataSetFingerprint(recorded.source, fingerprint)
-      ? { kind: 'current' } : undefined;
+      ? { kind: 'current', result: currentResult(candidate, target) } : undefined;
   }
   if (recorded?.state !== 'committing' || !sameRuntimeDataSetIdentity(recorded.target, target.identity)) return undefined;
   return withRuntimeDataRootAdmission(paths.globalStoragePath, async (): Promise<SourceOutcome | undefined> => {
@@ -1191,7 +1198,7 @@ async function commitSource(
       }
       if (previous.state === 'merged' && sameRuntimeDataSetIdentity(previous.source, candidate)
         && sameRuntimeDataSetFingerprint(previous.source, state.fingerprint)) {
-        return { kind: 'current' };
+        return { kind: 'current', result: currentResult(candidate, target) };
       }
     }
     stopIfAsked();
@@ -1213,7 +1220,7 @@ async function commitSource(
     if (plan.steps.length === 0) {
       if (mode.migration) return { kind: 'merged', result };
       await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
-      return { kind: 'current' };
+      return { kind: 'current', result: { ...result, alreadyMerged: true } };
     }
     const commitId = mode.migration ? undefined : await writeRuntimeDataSetMergeCommit(paths, plan.inserted);
     if (commitId !== undefined) {
@@ -1298,6 +1305,11 @@ function unchangedResult(candidate: VscodeRuntimeDataSetCandidate, target: Targe
     insertedRows: 0, reusedRows: 0, insertedConversations: 0,
     linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0, recoveredCommit: false
   };
+}
+
+/** Nothing new for this target: all its rows are here already, or a merge recorded before this attempt holds the source. */
+function currentResult(candidate: VscodeRuntimeDataSetCandidate, target: TargetContext): RuntimeDataSetMergeResult {
+  return { ...unchangedResult(candidate, target), alreadyMerged: true };
 }
 
 function unfinishedWorkOutcome(found: string, state: SourceProgress, afterFinalization = false): Refusal {

@@ -1383,6 +1383,20 @@ test('复审 merge3 #8：收尾之后收到停止按推迟处理并记下收尾�
   assert.match(blocked.blocked[0].message, /之前一次合并时已把这个库里的1 个中断的任务按“中止”收尾.*收尾前的备份在 /);
 });
 
+test('盲审 merge #4：明确请求合并已合并且没有变化的来源，结果里有一条“已合并，没有新内容”', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_r3', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  await requestMerge(fixture, fixture.alpha);
+  const explicit = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.deepEqual([explicit.deferred, explicit.blocked, explicit.failures], [[], [], []]);
+  assert.deepEqual(explicit.merged.map((item) => [item.candidateId, item.alreadyMerged, item.insertedRows, item.backupPath]),
+    [[fixture.alpha.id, true, 0, undefined]]);
+  // A startup with nothing requested stays silent.
+  assert.deepEqual((await merge(fixture, database)).merged, []);
+});
+
 test('盲审 merge #3/#5：收尾数按收尾后来源里的实际状态统计：上次收尾中途崩溃后再收尾不重复计数，排队消息的取消照样计入', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [
@@ -1479,6 +1493,24 @@ test('盲审 merge #6：“历史与存储管理”读合并状态时，没缓�
   try {
     assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.changedSinceMerge, false);
   } finally { await release(); }
+});
+
+test('盲审 merge #4：合并状态读不出来（私有副本放不下）时显示无法读取，而不是合并后有新变化', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_unreadable', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  // Opened without writing (its fingerprint is no longer cached), and no room for the private copy.
+  await fs.utimes(fixture.alpha.binding.paths.databasePath, new Date(), new Date());
+  const temporary = process.env.TMPDIR;
+  process.env.TMPDIR = path.join(fixture.root, 'no-such-directory');
+  let unreadable;
+  try { unreadable = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id); }
+  finally {
+    if (temporary === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = temporary;
+  }
+  assert.deepEqual([unreadable?.state, unreadable?.changedSinceMerge, unreadable?.sourceUnreadable], ['merged', false, true]);
 });
 
 test('跨模块盲审 #7：合并前备份之前核对剩余空间：不够就推迟并写明约需多少 MB，不写备份、不收尾', async (t) => {

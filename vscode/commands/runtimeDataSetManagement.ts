@@ -92,6 +92,7 @@ function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
   if (!merge) return '';
   if (merge.state === 'merged') {
     if (merge.targetMissing) return ' · 曾合并到的库已不存在或无法读取';
+    if (merge.sourceUnreadable) return ' · 已合并，现在无法读取（不能判断合并后有没有变化）';
     if (merge.changedSinceMerge) return ' · 已合并，但合并后有新变化';
     return merge.intoCurrent ? ' · 已合并到当前库' : ' · 已合并到其它历史库';
   }
@@ -186,7 +187,7 @@ async function chooseDataSet(
 }
 
 function alreadyMergedHere(merge?: RuntimeDataSetMergeState): boolean {
-  return merge?.state === 'merged' && merge.intoCurrent && !merge.changedSinceMerge;
+  return merge?.state === 'merged' && merge.intoCurrent && !merge.changedSinceMerge && !merge.sourceUnreadable;
 }
 
 /** User-invoked history/storage commands intentionally do not require a running database. */
@@ -272,6 +273,9 @@ function deletionNote(candidate: VscodeRuntimeDataSetCandidate, merge?: RuntimeD
     return '\n\n注意：这个库曾合并到的库已被删除、重置或暂时无法读取，这里的对话可能已不在任何现存的库里，删除会永久丢失；'
       + '需要保留时请先选择“合并到当前库”。';
   }
+  if (merged.sourceUnreadable) {
+    return '\n\n注意：现在无法读取这个库，不能确认它在上次合并之后有没有改动；如果有，删除后这些改动会永久丢失。';
+  }
   if (merged.changedSinceMerge) {
     return '\n\n注意：这个库在上次合并之后又有改动（例如在这里继续过对话），这些改动没有合并进任何库，删除会永久丢失。'
       + '只是新建过对话时，可以先选择“合并到当前库”；在已合并的对话里继续过时，再次合并会整体不合并，请保留这个库。';
@@ -283,7 +287,9 @@ function deletionNote(candidate: VscodeRuntimeDataSetCandidate, merge?: RuntimeD
 function remergeNote(merged?: RuntimeDataSetMergedFacts): string {
   if (!merged) return '';
   if (merged.targetMissing) return '\n\n这个库曾合并到的库已不存在或无法读取；这次会把它的对话写入当前库。';
-  if (!merged.intoCurrent || !merged.changedSinceMerge) return '';
+  if (!merged.intoCurrent) return '';
+  if (merged.sourceUnreadable) return '\n\n现在无法读取这个库，不能确认它在上次合并之后有没有改动；合并时会重新核验，读不出来会说明原因。';
+  if (!merged.changedSinceMerge) return '';
   return '\n\n这个库在上次合并到当前库之后又有改动：只新建过对话时，新对话会合并进来；'
     + '在已合并的对话里继续过时，那些对话与当前库里的那份不同，会整体不合并并说明原因，这时请保留这个库。';
 }
@@ -334,7 +340,7 @@ async function switchHistory(
 ): Promise<void> {
   if (candidate.selected) { await vscode.window.showInformationMessage('已经在使用这个历史库。'); return; }
   const merged = lastMergeOf(merge);
-  const mergedHere = merged?.intoCurrent && !merged.changedSinceMerge
+  const mergedHere = merged?.intoCurrent && !merged.changedSinceMerge && !merged.sourceUnreadable
     ? '\n\n这个库的对话已合并到当前库。切换过去后如果在已合并的对话里继续聊天，这个库以后就不能再合并回当前库（会整体不合并）；'
       + '只新建对话、不动已合并的对话时，新对话以后仍可合并回来。'
     : '';
@@ -452,7 +458,7 @@ export async function mergeHistoricalDataSetsInBackground(
   } finally {
     finishProgress?.();
   }
-  await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent);
+  await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent, candidateIds !== undefined);
 }
 
 /**
@@ -490,7 +496,8 @@ async function reportHistoricalMerge(
   context: vscode.ExtensionContext,
   configurationRootPath: string,
   report: RuntimeDataSetMergeBatchResult,
-  stillCurrent: () => boolean
+  stillCurrent: () => boolean,
+  requested: boolean
 ): Promise<void> {
   for (const merged of report.merged) console.info(`[LimCode] ${mergedLog(merged)}`);
   const issues = [...report.deferred, ...report.blocked, ...report.failures];
@@ -499,12 +506,23 @@ async function reportHistoricalMerge(
   const fresh = await freshStartupNotices(context, configurationRootPath, 'merge',
     issues.filter(issue => issue.newly !== false), evaluated);
   if (!stillCurrent()) return;
-  if (report.merged.length) {
-    const conversations = report.merged.reduce((sum, merged) => sum + merged.insertedConversations, 0);
+  const merged = report.merged.filter(item => !item.alreadyMerged);
+  if (merged.length) {
+    const conversations = merged.reduce((sum, item) => sum + item.insertedConversations, 0);
     void vscode.window.showInformationMessage(
-      `已把 ${report.merged.length} 份旧聊天记录合并到当前历史库（新增 ${conversations} 个对话），可直接在侧栏继续。`
-      + mergedNotes(report.merged) + '原库和合并前备份都已保留。'
+      `已把 ${merged.length} 份旧聊天记录合并到当前历史库（新增 ${conversations} 个对话），可直接在侧栏继续。`
+      + mergedNotes(merged) + '原库和合并前备份都已保留。'
     );
+  }
+  const current = report.merged.filter(item => item.alreadyMerged);
+  if (current.length) {
+    void vscode.window.showInformationMessage(
+      `${requested ? '所选历史库' : `${current.length} 份旧聊天记录`}已合并到当前历史库，没有新内容。${mergedNotes(current)}`
+    );
+  }
+  // The user's click always hears back, also when the engine found nothing to do for it.
+  if (requested && !report.stopped && !report.merged.length && !issues.length) {
+    void vscode.window.showInformationMessage('这次没有合并：所选历史库已不在，或者当前历史库已经切换。可以重新打开“历史与存储管理”查看。');
   }
   const announce = (issue: RuntimeDataSetMergeIssue) => issue.requested || fresh.has(noticeCause(issue));
   const deferred = report.deferred.filter(announce);
@@ -527,7 +545,9 @@ async function reportHistoricalMerge(
 
 /** One log line per merged source, with everything its notice summarizes. */
 function mergedLog(merged: RuntimeDataSetMergeResult): string {
-  return `已合并旧聊天记录 ${merged.candidateId}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`
+  return (merged.alreadyMerged
+    ? `旧聊天记录 ${merged.candidateId} 已合并到当前历史库，没有新内容`
+    : `已合并旧聊天记录 ${merged.candidateId}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`)
     + (merged.finalized ? `；收尾 ${merged.finalized.turns} 个中断任务，另有 ${merged.finalized.intents} 条排队未发送的消息已取消，`
       + `收尾前来源备份：${merged.finalized.sourceBackupPath}` : '');
 }

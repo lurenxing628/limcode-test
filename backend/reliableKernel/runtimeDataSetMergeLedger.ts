@@ -22,6 +22,8 @@ const COMMITS = 'commits';
 /** Cache only: the content digest last computed for an exact file state. Never a merge fact. */
 const FINGERPRINTS = 'fingerprints';
 const FINALIZATIONS = 'finalizations';
+/** Content digest prefix of a data set whose content could not be read (see runtimeDataSetFingerprint). */
+const UNREADABLE_DIGEST = 'unreadable:';
 
 type StoragePaths = { globalStoragePath: string };
 
@@ -139,7 +141,7 @@ export async function runtimeDataSetFingerprint(candidate: VscodeRuntimeDataSetC
   catch {
     // Content that cannot be read (a damaged file, an unknown format, no room for the copy) is
     // judged by its exact file state, never cached: the merge's own checks report the cause.
-    return { ...identity, contentDigest: `unreadable:${files}` };
+    return { ...identity, contentDigest: `${UNREADABLE_DIGEST}${files}` };
   }
   const fingerprint: RuntimeDataSetFingerprint = { ...fingerprintIdentity(facts.binding), contentDigest: facts.contentDigest! };
   // Cached only when nothing moved while the copy was taken.
@@ -149,6 +151,11 @@ export async function runtimeDataSetFingerprint(candidate: VscodeRuntimeDataSetC
       .catch(() => undefined);
   }
   return fingerprint;
+}
+
+/** False for a fingerprint that names only the file state, because the content could not be read. */
+export function isReadableRuntimeDataSetFingerprint(fingerprint: RuntimeDataSetFingerprint): boolean {
+  return !fingerprint.contentDigest.startsWith(UNREADABLE_DIGEST);
 }
 
 /**

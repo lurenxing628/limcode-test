@@ -724,6 +724,49 @@ test('盲审 merge #3：合并通知与日志写明取消的排队消息；只�
   ]);
 });
 
+test('盲审 merge #4：明确合并时已合并、没有新内容也有回应，引擎什么都没做时同样回应；自动合并没有可说的就静默', async () => {
+  const already = {
+    candidateId: 'workspace:old', sourceDataSetId: 'old', targetDataSetId: 'current', insertedRows: 0, reusedRows: 0,
+    insertedConversations: 0, linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0, recoveredCommit: false, alreadyMerged: true
+  };
+  const explicit = async mergeReport => {
+    const f = fixture({ picks: [action('merge'), 0], confirmation: '合并', application: mergeHost(), mergeReport });
+    await f.manageRuntimeDataSets(f.context, f.startup);
+    return f.calls.filter(call => ['info', 'warning', 'error'].includes(call[0]) && call[1] !== '把这个历史库合并到当前库？').map(call => call[1]);
+  };
+  assert.deepEqual(await explicit(emptyMergeReport({ merged: [already] })), ['所选历史库已合并到当前历史库，没有新内容。']);
+  assert.deepEqual(await explicit(emptyMergeReport()), ['这次没有合并：所选历史库已不在，或者当前历史库已经切换。可以重新打开“历史与存储管理”查看。']);
+  assert.deepEqual(await explicit(emptyMergeReport({ stopped: true })), [], '停止（窗口关闭或切库）时不回应');
+
+  const quiet = fixture({ mergeReport: emptyMergeReport() });
+  await quiet.mergeHistoricalDataSetsInBackground(quiet.context, mergeHost());
+  assert.equal(quiet.calls.some(call => ['info', 'warning'].includes(call[0])), false);
+  const closed = fixture({ mergeReport: emptyMergeReport({ merged: [{ ...already, finalized: { turns: 1, intents: 0, sourceBackupPath: '/fixture/source-backup' } }] }) });
+  await closed.mergeHistoricalDataSetsInBackground(closed.context, mergeHost());
+  assert.deepEqual(closed.calls.filter(call => call[0] === 'info').map(call => call[1]),
+    ['1 份旧聊天记录已合并到当前历史库，没有新内容。其中 1 个中断的任务已按“中止”收尾，不会被继续执行。'], '收尾过的工作照样说明');
+});
+
+test('盲审 merge #4：读不出内容的已合并库显示“无法读取”，不当成合并后有新变化；仍可再次合并，合并与删除的确认如实说明', async () => {
+  const unreadable = { 'workspace:old': {
+    state: 'merged', mergedAt: '2026-09-20', intoCurrent: true, targetMissing: false, changedSinceMerge: false, sourceUnreadable: true
+  } };
+  let shown;
+  const listed = fixture({ mergeStates: unreadable, picks: [action('merge'), items => { shown = items; return undefined; }] });
+  await listed.manageRuntimeDataSets(listed.context, listed.startup);
+  assert.equal(shown.length, 1, '读不出来时不能断定已合并且没变化，仍列在“合并到当前库”里');
+  assert.equal(shown[0].label, '其他历史库 · 旧工作区历史 · 已合并，现在无法读取（不能判断合并后有没有变化）');
+  const merging = fixture({ application: mergeHost(), mergeStates: unreadable, picks: [action('merge'), 0] });
+  await merging.manageRuntimeDataSets(merging.context, merging.startup);
+  const detail = merging.calls.find(call => call[0] === 'warning' && call[1] === '把这个历史库合并到当前库？')[2].detail;
+  assert.match(detail, /现在无法读取这个库，不能确认它在上次合并之后有没有改动；合并时会重新核验，读不出来会说明原因。/);
+  assert.doesNotMatch(detail, /又有改动：/);
+  const deleting = fixture({ mergeStates: unreadable, picks: [action('delete'), 0], confirmation: '永久删除' });
+  await deleting.manageRuntimeDataSets(deleting.context, deleting.startup);
+  assert.match(deleting.calls.find(call => call[0] === 'warning')[2].detail,
+    /现在无法读取这个库，不能确认它在上次合并之后有没有改动；如果有，删除后这些改动会永久丢失/);
+});
+
 test('盲审 merge #6：列表摘要在该库的 admission 与 maintenance 里读取；没有数据的库不读也不显示读取失败', async () => {
   let shown;
   const f = fixture({ picks: [action('history'), items => { shown = items; return undefined; }] });
