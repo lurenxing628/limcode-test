@@ -226,6 +226,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-data-root-relocation-crash-child.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-fixture.mjs',
   'tests/reliable-kernel/data-root-relocation-commands.test.cjs',
+  'tests/reliable-kernel/data-root-relocation-real-coordination.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-child.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-e2e.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-full-runtime.mjs',
