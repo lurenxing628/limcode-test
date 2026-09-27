@@ -128,6 +128,33 @@ test('F2b 拷来的目录在预检之后被某个窗口打开（例如另一个�
   assert.ok(await fs.stat(path.join(copied, '.limcode-runtime-selection.json')));
 });
 
+test('#4 拷来的数据改名挪开后中断，原位置又有了别的内容：不覆盖、不报已恢复，错误写明拷贝在哪；清掉之后再恢复就改回原名', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const elsewhere = path.join(fixture.base, 'elsewhere');
+  await createLimCodeTarget(elsewhere);
+  const copied = path.join(fixture.base, 'copied');
+  await fs.cp(elsewhere, copied, { recursive: true });
+  const before = await treeSnapshot(copied);
+  const plan = await planWithRuntime(fixture, copied);
+  assert.equal(plan.target.kind, 'copied');
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await stageDataRootRelocation(plan, source); } finally { await source.close(); }
+  // The process is gone before completing; meanwhile something else was written where the copy was.
+  await markStagingOwnerDead(copied);
+  await fs.writeFile(path.join(copied, 'notes.txt'), 'written later');
+  const [aside] = (await fs.readdir(fixture.base)).filter((name) => name.startsWith('copied.limcode-copied-'));
+  assert.ok(aside?.endsWith(staged.relocationId.slice(0, 8)), '挪开的名字带迁移 id');
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(recoverInterruptedDataRootRelocation({ targetRootPath: copied, relocationId: staged.relocationId }),
+      (error) => error.code === 'data-root-relocation-copy-aside' && error.message.includes(path.join(fixture.base, aside)));
+  }
+  assert.equal(await fs.readFile(path.join(copied, 'notes.txt'), 'utf8'), 'written later');
+  await fs.rm(path.join(copied, 'notes.txt'));
+  assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: copied, relocationId: staged.relocationId }), 'recovered');
+  assert.deepEqual(await treeSnapshot(copied), before);
+});
+
 test('F3 旧版本设置的自定义目录（没有记录身份）：只有设置记录存储时不算可用的数据目录', async (t) => {
   const base = await crashBase(t, 'f3');
   const dataRoot = path.join(base, 'mnt', 'usb', 'LimCode');
