@@ -228,6 +228,12 @@ export interface RuntimeDataSetIntoDatabaseOptions extends RuntimeDataSetMergeOp
   migration?: boolean;
   /** Objects an earlier online pre-copy verified ({@link precopyRuntimeDataSetCas}); unchanged ones are not hashed again. */
   casVerification?: RuntimeDataSetCasVerification;
+  /**
+   * Migration only: called with exactly the rows the one row transaction inserts, right before it
+   * commits (the migration journals them, so an interrupted undo can tell its own rows apart). A
+   * failure stops the merge before the commit.
+   */
+  beforeCommit?(inserted: ReadonlyArray<readonly [domain: string, id: string]>): Promise<void>;
 }
 
 export interface RuntimeDataSetCasTransfer {
@@ -1117,7 +1123,7 @@ async function commitSource(
   plan: RowPlan,
   cas: RuntimeDataSetCasTransfer | undefined,
   state: SourceProgress,
-  options: RuntimeDataSetMergeOptions,
+  options: RuntimeDataSetMergeOptions & Pick<RuntimeDataSetIntoDatabaseOptions, 'beforeCommit'>,
   mode: SourceMode,
   stopIfAsked: () => void
 ): Promise<SourceOutcome> {
@@ -1161,6 +1167,7 @@ async function commitSource(
         ...(previous ? { replaced: previous } : {})
       });
     }
+    if (mode.migration) await options.beforeCommit?.(plan.inserted);
     const backupUsed = target.backup.used === true;
     target.backup.used = true;
     await fault(options, 'before-row-commit');
