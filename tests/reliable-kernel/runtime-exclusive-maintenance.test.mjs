@@ -29,7 +29,7 @@ const {
   runtimeDataRootAdmissionClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance, withRuntimeMaintenanceActivity
 } = kernelFile('runtimeHostControl.js');
 const {
-  clearExclusiveMaintenanceKey, readExclusiveMaintenanceRequests, registerExclusiveMaintenanceParticipant,
+  clearExclusiveMaintenanceKey, createProtocolProcessClassifier, readExclusiveMaintenanceRequests, registerExclusiveMaintenanceParticipant,
   requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance, runtimeExclusiveMaintenanceDirectory,
   startExclusiveMaintenanceParticipant
 } = kernelFile('runtimeExclusiveMaintenance.js');
@@ -707,6 +707,57 @@ test('轮询期间每个进程只做一次平台身份探测；登记参与方�
   await exited;
   assert.equal(classify(child.pid, 'identity'), 'dead');
   assert.equal(calls, 1);
+});
+
+test('盲审 #8：进程探测一时失败（unknown）只短暂记住：几秒后重新探测；存活的只用 kill(0) 复查，确定结束的一直记住', () => {
+  let now = 0;
+  const probes = [];
+  const answers = ['unknown', 'alive'];
+  const classify = createProtocolProcessClassifier((pid) => { probes.push(pid); return answers.shift() ?? 'alive'; }, 5_000, () => now);
+  assert.equal(classify(process.pid, 'identity'), 'unknown');
+  now = 4_000;
+  assert.equal(classify(process.pid, 'identity'), 'unknown', 'still within the recheck time');
+  assert.equal(probes.length, 1);
+  now = 5_000;
+  assert.equal(classify(process.pid, 'identity'), 'alive', 'probed again');
+  assert.equal(classify(process.pid, 'identity'), 'alive', 'then kill(0) only');
+  assert.equal(probes.length, 2);
+  const dead = createProtocolProcessClassifier(() => { probes.push('dead'); return 'dead'; }, 5_000, () => now);
+  assert.equal(dead(4_100_999, 'gone'), 'dead');
+  now = 60_000;
+  assert.equal(dead(4_100_999, 'gone'), 'dead');
+  assert.equal(probes.filter((entry) => entry === 'dead').length, 1);
+});
+
+test('盲审 #8：参与方对某个请求方的进程探测一时失败，不会一直不理它：重新探测后照常回应', { timeout: 30_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const identity = ownProcessStartIdentity();
+  const original = processProtocol.readProcessStartFingerprint;
+  let failing = true;
+  processProtocol.readProcessStartFingerprint = (pid) => {
+    if (failing) throw new Error('进程启动时间暂时读不到');
+    return original(pid);
+  };
+  t.after(() => { processProtocol.readProcessStartFingerprint = original; });
+  const window = await openWindow(t, binding, 'window');
+  await writeRequest(paths, { requestId: 'probe-request', createdAt: NOW, requesterProcessStartIdentity: identity });
+  await window.check();
+  await assert.rejects(readAnswer(paths, 'probe-request', 'window'), 'the requester could not be judged: no answer yet');
+  failing = false;
+  await writeRequest(paths, { requestId: 'probe-request', createdAt: NOW, requesterProcessStartIdentity: identity });
+  const started = performance.now();
+  for (;;) {
+    await window.check();
+    const answer = await readAnswer(paths, 'probe-request', 'window').catch(() => undefined);
+    if (answer) {
+      assert.equal(answer.answer, 'ready');
+      break;
+    }
+    assert.ok(performance.now() - started < 12_000, 'answered after the recheck time');
+    await delay(200);
+    // Keep the request fresh (its heartbeat) while waiting.
+    await writeRequest(paths, { requestId: 'probe-request', createdAt: NOW, requesterProcessStartIdentity: identity });
+  }
 });
 
 test('过期、撤回、心跳过期或请求方已不存在的请求不会被理会；崩溃发起方的残留由下一次请求清理', async (t) => {

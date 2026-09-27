@@ -5,7 +5,7 @@ import { performance } from 'node:perf_hooks';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import type { RuntimeRootPaths } from './contracts';
 import {
-  createCachedProcessClassifier, delay, ownProcessStartIdentity, type RecordedProcessClassifier
+  classifyRecordedProcess, createCachedProcessClassifier, delay, ownProcessStartIdentity, type RecordedProcessClassifier
 } from './runtimeClaimPrimitives';
 import {
   assertRuntimeHostsOffline, isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, listActiveRuntimeHosts,
@@ -280,6 +280,34 @@ export type RuntimeExclusiveMaintenanceOutcome<T> =
 
 export type ExclusiveMaintenanceOperation<T> = (context: ExclusiveMaintenanceOperationContext) => Promise<T>;
 
+/** A failed platform probe ('unknown') is trusted this long before that process is probed again. */
+export const UNKNOWN_PROCESS_RECHECK_MS = 5_000;
+
+/**
+ * The process classifier of the protocol's long-lived loops (a participant runs as long as its
+ * window): cached like createCachedProcessClassifier, except that 'unknown' (e.g. a start-identity
+ * probe that failed once) is kept only briefly and then probed again, so one failed probe never
+ * leaves a window deaf to a requester, or a requester blind to a window, until it reloads.
+ */
+export function createProtocolProcessClassifier(
+  probe: RecordedProcessClassifier = classifyRecordedProcess,
+  unknownRecheckMs = UNKNOWN_PROCESS_RECHECK_MS,
+  now: () => number = () => performance.now()
+): RecordedProcessClassifier {
+  const perProcess = new Map<string, { classify: RecordedProcessClassifier; unknownSince?: number }>();
+  return (processId, processStartIdentity) => {
+    const key = `${processId}\0${processStartIdentity ?? ''}`;
+    let entry = perProcess.get(key);
+    if (!entry || (entry.unknownSince !== undefined && now() - entry.unknownSince >= unknownRecheckMs)) {
+      entry = { classify: createCachedProcessClassifier(probe) };
+      perProcess.set(key, entry);
+    }
+    const state = entry.classify(processId, processStartIdentity);
+    if (state === 'unknown') entry.unknownSince ??= now();
+    return state;
+  };
+}
+
 export function runtimeExclusiveMaintenanceDirectory(paths: RuntimeRootPaths): string {
   return path.join(path.dirname(path.resolve(paths.dataRootPath)), RUNTIME_EXCLUSIVE_MAINTENANCE_DIRECTORY);
 }
@@ -396,7 +424,7 @@ class ExclusiveMaintenanceRequester<T> {
   private readonly pollMs: number;
   private readonly prepareTimeoutMs: number;
   private readonly whenBusy: ExclusiveMaintenanceBusyPolicy;
-  private readonly classify = createCachedProcessClassifier();
+  private readonly classify = createProtocolProcessClassifier();
   private readonly busyDeadline: number;
   private readonly local: LocalRequest;
   private readonly leavingGraceMs: number;
@@ -941,7 +969,7 @@ export function startExclusiveMaintenanceParticipant(
   options: ExclusiveMaintenanceParticipantOptions = {}
 ): ExclusiveMaintenanceParticipant {
   const ownProcessId = options.processId ?? process.pid;
-  const classify = createCachedProcessClassifier();
+  const classify = createProtocolProcessClassifier();
   const answered = new Map<string, string>();
   const declinedRequests = new Set<string>();
   const notified = new Set<string>();
