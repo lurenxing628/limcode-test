@@ -46,7 +46,8 @@ async function startApplication(
     );
     const moduleLoadedAt = Date.now();
     const {
-      mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection, upgradeHistoricalDataSetsOnStartup
+      announceForeignRuntimeHistoryOnStartup, mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection,
+      upgradeHistoricalDataSetsOnStartup
     } = await import('./commands/runtimeDataSetManagement');
     const dataRootCommands = await import('./commands/dataRootRelocation');
     // Another window may hold the data directory (a migration, a large merge, or it is opening):
@@ -136,7 +137,10 @@ async function startApplication(
       void upgradeHistoricalDataSetsOnStartup(context, isCurrent)
         .catch(error => console.error(`${EXTENSION_BRAND} historical data upgrade failed.`, error))
         .then(() => mergeHistoricalDataSetsInBackground(context, application, isCurrent))
-        .catch(error => console.error(`${EXTENSION_BRAND} historical data merge failed.`, error));
+        .catch(error => console.error(`${EXTENSION_BRAND} historical data merge failed.`, error))
+        // Archives and copied data directories: listed once, announced once, read only on request.
+        .then(() => announceForeignRuntimeHistoryOnStartup(context, isCurrent))
+        .catch(error => console.error(`${EXTENSION_BRAND} foreign history discovery failed.`, error));
       const recoveryStartedAt = Date.now();
       void application.startRuntimeRecovery().then(
         () => console.log(`${EXTENSION_BRAND} reliable Runtime recovery converged in ${Date.now() - recoveryStartedAt}ms.`),

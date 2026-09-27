@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { createRuntimeRootPaths, type RootBinding } from './contracts';
 import { assertDatabaseBinding, configureReaderConnection } from './databaseSchema';
 import { RootAuthority, type HistoricalRootBinding } from './rootAuthority';
+import type { LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import {
   assertRuntimeHostsOffline, runtimeMaintenanceClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance
 } from './runtimeHostControl';
@@ -45,7 +46,7 @@ const CATEGORIES: readonly RuntimeStorageCategory[] = [
 /**
  * Complete control roots archived by VscodeReliableKernelCutoverCoordinator live beside the active
  * control root. They are not part of the scope's data set: its storage inspection does not count them
- * and deleting it keeps them.
+ * and deleting it keeps them; each is listed as foreign history of its own (runtimeForeignHistory).
  */
 const RUNTIME_SCOPE_BACKUPS_DIRECTORY = '.limcode-runtime-backups';
 
@@ -115,7 +116,7 @@ export async function deleteUnselectedRuntimeDataSet(
       const maintenancePath = runtimeMaintenanceClaimPath(binding.paths);
       const deleted: RuntimeStorageSize = { fileCount: 0, bytes: '0' };
       // Validate every tree before deleting any. Reset archives of the scope are never part of it:
-      // they stay.
+      // they stay, and are listed as foreign history afterwards.
       for (const tree of trees) {
         await walkRuntimeDataSetFiles(tree, async (_filePath, size) => addSize(deleted, size), [maintenancePath, ...excluded]);
       }
@@ -172,7 +173,26 @@ export async function createRuntimeDataSetDatabaseSnapshot(
     beforeOpen?(snapshotPath: string): Promise<void>;
   } = {}
 ): Promise<RuntimeDataSetDatabaseSnapshot> {
-  const copy = await copyRuntimeDataSetDatabase(candidate, binding);
+  return openRuntimeDatabaseSnapshotCopy(await copyRuntimeDataSetDatabase(candidate, binding), binding, options);
+}
+
+/**
+ * The same private snapshot of a located root: copied from its located database only (checked
+ * link-free below its container), fenced by the recorded binding. Callers hold the root's fence
+ * (maintenance for a local data set, the foreign claim for a foreign root) with its Hosts offline.
+ */
+export async function createLocatedRuntimeDatabaseSnapshot(
+  root: LocatedRuntimeRoot,
+  options: { beforeOpen?(snapshotPath: string): Promise<void> } = {}
+): Promise<RuntimeDataSetDatabaseSnapshot> {
+  return openRuntimeDatabaseSnapshotCopy(await copyRuntimeSqliteFiles(root.containerRoot, root.located.databasePath), root.recorded, options);
+}
+
+async function openRuntimeDatabaseSnapshotCopy(
+  copy: { databasePath: string; remove(): Promise<void> },
+  binding: HistoricalRootBinding,
+  options: { beforeOpen?(snapshotPath: string): Promise<void> }
+): Promise<RuntimeDataSetDatabaseSnapshot> {
   let database: Database.Database | undefined;
   try {
     const snapshotPath = copy.databasePath;
@@ -335,6 +355,26 @@ async function walkRuntimeDataSetFiles(
       for (const name of await fs.readdir(current)) queue.push(path.join(current, name));
     } else throw new Error(`Runtime inspection refuses unsupported filesystem entries: ${current}`);
   }
+}
+
+/**
+ * Storage of a located root: its located control tree (the archive directory, or a copied scope's
+ * `.limcode-runtime`) walked once without following links. Never reads a recorded path.
+ */
+export async function inspectLocatedRuntimeStorage(root: LocatedRuntimeRoot): Promise<RuntimeDataSetStorageInspection> {
+  const control = path.dirname(root.located.rootPointerPath);
+  await assertNoSymbolicPath(root.containerRoot, control);
+  const categories = Object.fromEntries(CATEGORIES.map((key) => [key, { fileCount: 0, bytes: '0' }])) as
+    Record<RuntimeStorageCategory, RuntimeStorageSize>;
+  const total: RuntimeStorageSize = { fileCount: 0, bytes: '0' };
+  await walkRuntimeDataSetFiles(control, async (filePath, size) => {
+    addSize(categories[classifyControlRootPath(control, root.located.dataRootPath, filePath)], size);
+    addSize(total, size);
+  });
+  return {
+    candidateId: root.id, dataSetId: root.recorded.dataSetId, observedAt: new Date().toISOString(),
+    selected: false, categories, total, archiveReclaimsBytes: false
+  };
 }
 
 export async function assertNoSymbolicPath(root: string, target: string): Promise<void> {

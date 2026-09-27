@@ -322,6 +322,7 @@ export function validateContractDocuments(root, documents) {
   validateValidatorProtocol(root, documents['gate-registry.json'], failures);
   validateMigration(root, documents['migration.json'], failures);
   validateAuthority(documents['authority.json'], documents['migration.json'], failures);
+  validateForeignHistory(root, documents['authority.json'], failures);
   validateIdentity(documents['identity.json'], failures);
   validateTool(documents['tool.json'], failures);
   validateFile(documents['file.json'], failures);
@@ -584,7 +585,7 @@ function validateMigration(root, migration, failures) {
   const expectedRelocation = {
     entry: 'settings-page-button; command-palette-opens-settings-page; native-folder-picker-only; confirm-panel-prompts-with-complete-lists; read-only-plan',
     preflight: 'absolute-path; writable-target-and-parent; per-disk-space-by-file-sizes-first-new-2x-database-plus-cas-by-target-cluster-when-copied-or-fat-exfat-temp-1x-old-1x-short-space-refused-before-counting; not-inside-or-above-current-root; cloud-sync-folder-warning; existing-limcode-target-current-rows-counted-on-the-windows-read-connection-without-a-copy-above-merge-one-transaction-hard-limit-refused-before-any-coordination; fresh-root-batched-copy-unbounded-rows-not-counted; other-data-sets-with-an-online-host-left-behind-with-the-reason',
-    targetStates: 'missing-or-empty-fresh-root-the-extensions-own-pointer-file-ignored; user-files-including-settings-record-stores-alone-only-a-new-limcode-subfolder; limcode-runtime-with-a-selected-current-data-set-created-at-this-path-merge-into-it-when-offline; copied-from-elsewhere-alone-and-offline-renamed-aside-whole-under-the-relocation-id-never-merged-or-deleted-then-fresh-root; copied-mixed-with-user-files-only-a-new-limcode-subfolder; anything-else-refused',
+    targetStates: 'missing-or-empty-fresh-root-the-extensions-own-pointer-file-ignored; user-files-including-settings-record-stores-alone-only-a-new-limcode-subfolder; limcode-runtime-with-a-selected-current-data-set-created-at-this-path-merge-into-it-when-offline; copied-from-elsewhere-alone-and-offline-renamed-aside-whole-under-the-relocation-id-never-deleted-or-merged-automatically-registered-in-place-as-read-only-foreign-history-then-fresh-root; copied-mixed-with-user-files-only-a-new-limcode-subfolder; anything-else-refused',
     phases: 'pending-record-in-pointer-compare-and-set; online-staging-record-journal-fresh-root-and-cas-precopy-via-backup-api; target-anchor-recorded-in-the-pending-record-before-the-first-target-change; preparation-cancellable-coordination-and-exclusive-phase-not; exclusive-maintenance-final-countdown-waiting-outside-locks-requester-work-counted; before-go-confirms-idle-then-freezes-the-window-refusing-write-commands-at-entry-until-the-operation-ends-only-work-from-before-counts; stages-reported-to-waiting-windows-undo-included; attempt-coordination-key-cleared-afterwards; requester-closes-runtime; source-fingerprints; configuration; receiving-database-undo-copy-with-its-fingerprint; merge-engine-migration-mode; merge-inserted-rows-journaled-before-commit; received-fingerprint-journaled; debug-captures-copied-with-their-data-set; other-data-sets; completion-record-naming-the-initiating-installation; pointer-switch-last-with-identity-and-relocation-id; record-confirmed-published-by-the-initiating-installation; moved-notice-in-old-directory-with-the-unfinished-work-of-each-data-set-that-moved-listed-from-its-private-snapshot; every-window-reloads',
     mergeMode: 'selected-source-allowed; no-merge-ledger; unfinished-work-carried-unchanged; streaming-model-request-or-running-process-refused; snapshot-integrity-and-probes-in-worker',
     otherDataSets: 'same-id-independent-data-sets-marked-user-kept; merged-and-unchanged-carried-by-current; in-use-by-an-online-host-too-large-failed-taken-or-unreadable-stay-in-old-directory-recorded-and-shown-with-what-to-do; exclusive-offline-assertion-only-for-the-current-and-migrating-data-sets',
@@ -745,6 +746,20 @@ function validateMigration(root, migration, failures) {
   for (const marker of ['journal', '恢复', '激活前失败']) {
     const text = JSON.stringify(migration?.archiveContract ?? {});
     if (!text.includes(marker)) failures.push(`archiveContract缺少失败语义：${marker}`);
+  }
+}
+
+/**
+ * Foreign history (archives and copied data directories) is registered in place and read only:
+ * located paths for every read, the recorded binding only as an identity fence, never a
+ * RootAuthority or RuntimeDatabase, and its cache and claims only under the current configuration root.
+ */
+function validateForeignHistory(root, authority, failures) {
+  const foreignSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeForeignHistory.ts'), 'utf8');
+  if (authority?.rootPolicy?.foreignHistory !== 'verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written'
+    || !foreignSource.includes("const CACHE_DIRECTORY = 'foreign';") || !foreignSource.includes("const CLAIMS_DIRECTORY = 'foreign-claims';")
+    || /\bRuntimeDatabase\b|new RootAuthority|withRuntimeMaintenance\(root\.recorded|recorded\.paths\.(databasePath|casRootPath|rootPointerPath|runtimeEpochPath)/.test(foreignSource)) {
+    failures.push('外来历史库只能原位只读登记：读取只经 located 路径，recorded 只作身份栅栏与显示，从不建立 RootAuthority 或打开 RuntimeDatabase，结果缓存与声明只在当前配置根 .limcode-runtime-merges/foreign 与 foreign-claims，外来目录从不写入');
   }
 }
 

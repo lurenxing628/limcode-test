@@ -13,7 +13,8 @@ const kernel = (file) => require(path.join(compiled, 'backend/reliableKernel', f
 const Database = require('better-sqlite3');
 const { RootAuthority } = kernel('rootAuthority.js');
 const { configureWriterConnection, initializeCurrentSchema } = kernel('databaseSchema.js');
-const { openRuntimeDataSetHistory } = kernel('runtimeDataSetHistory.js');
+const { openRuntimeDataSetHistory, locateLocalRuntimeDataSet } = kernel('runtimeDataSetHistory.js');
+const openHistory = async (paths, id) => openRuntimeDataSetHistory(paths, await locateLocalRuntimeDataSet(paths, id));
 const { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } = kernel('runtimeStorageInspection.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope,
@@ -31,7 +32,7 @@ test('历史读取保留会话和当前消息关系、分页及真实CAS codec�
   await seedHistory(fixture.old.binding);
   await publishHost(fixture.current.binding); // Another selected root may keep running.
   const before = await treeSnapshot(fixture.root);
-  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  const reader = await openHistory(fixture.paths, fixture.old.id);
   try {
     const first = await reader.listConversations({ limit: 1 });
     assert.deepEqual(first.items.map((item) => item.id), ['conversation-b']);
@@ -71,7 +72,7 @@ test('历史读取显示工具结果消息，不因含工具调用而整页失�
     database.prepare('INSERT INTO message_part_of_conversation VALUES (?, ?, ?, ?, ?)').run('membership-tool', 'conversation-a', 'message-tool', 3, now);
   } finally { database.close(); }
   const before = await treeSnapshot(fixture.root);
-  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  const reader = await openHistory(fixture.paths, fixture.old.id);
   try {
     const page = await reader.readMessages('conversation-a');
     assert.deepEqual(page.items.map((item) => item.role), ['user', 'model', 'tool']);
@@ -84,7 +85,7 @@ test('长消息内容有显式继续页且不截断Unicode字符', async (t) => 
   const fixture = await createFixture(t);
   const long = 'a'.repeat(32767) + '😀' + 'tail';
   await seedHistory(fixture.old.binding, long);
-  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  const reader = await openHistory(fixture.paths, fixture.old.id);
   try {
     const page = await reader.readMessages('conversation-a');
     const message = page.items[0];
@@ -105,7 +106,7 @@ test('历史快照包含离线WAL已提交事实而不新建或改写源WAL/SHM'
   writer.pragma('wal_autocheckpoint = 0');
   writer.prepare('INSERT INTO conversation VALUES (?, ?, ?, ?, ?)').run('wal-only', 'WAL记录', 'active', now, now);
   const before = await treeSnapshot(fixture.root);
-  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  const reader = await openHistory(fixture.paths, fixture.old.id);
   try { assert.deepEqual((await reader.listConversations()).items.map((item) => item.id), ['wal-only']); }
   finally { await reader.close(); }
   assert.deepEqual(await treeSnapshot(fixture.root), before);
@@ -115,14 +116,14 @@ test('历史内容摘要错误、缺失关系及未知schema均明确失败，�
   const fixture = await createFixture(t);
   const seeded = await seedHistory(fixture.old.binding);
   await fs.writeFile(seeded.userFile, Buffer.alloc(Buffer.byteLength('用户原文'), 1));
-  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  const reader = await openHistory(fixture.paths, fixture.old.id);
   try { await assert.rejects(reader.readMessages('conversation-a'), /digest/); }
   finally { await reader.close(); }
   const database = new Database(fixture.old.binding.paths.databasePath);
   database.exec('ALTER TABLE conversation ADD COLUMN invented TEXT');
   database.close();
   const before = await treeSnapshot(fixture.root);
-  await assert.rejects(openRuntimeDataSetHistory(fixture.paths, fixture.old.id), /DDL drift/);
+  await assert.rejects(openHistory(fixture.paths, fixture.old.id), /DDL drift/);
   assert.deepEqual(await treeSnapshot(fixture.root), before);
 });
 
@@ -132,7 +133,7 @@ test('历史消息关系缺失和旧epoch拒绝直接读取，且未执行迁移
   const database = new Database(fixture.old.binding.paths.databasePath);
   database.exec("DELETE FROM message_current_revision_link WHERE message_id = 'message-user'");
   database.close();
-  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  const reader = await openHistory(fixture.paths, fixture.old.id);
   try { await assert.rejects(reader.readMessages('conversation-a'), /no current revision/); }
   finally { await reader.close(); }
   const pointer = { ...fixture.old.binding, runtimeKernelEpoch: 3 };
@@ -141,7 +142,7 @@ test('历史消息关系缺失和旧epoch拒绝直接读取，且未执行迁移
   await fs.writeFile(pointer.paths.rootPointerPath, JSON.stringify(pointer));
   await fs.writeFile(pointer.paths.runtimeEpochPath, JSON.stringify(epoch));
   const before = await treeSnapshot(fixture.root);
-  await assert.rejects(openRuntimeDataSetHistory(fixture.paths, fixture.old.id), { code: 'runtime-history-offline-upgrade-required' });
+  await assert.rejects(openHistory(fixture.paths, fixture.old.id), { code: 'runtime-history-offline-upgrade-required' });
   assert.deepEqual(await treeSnapshot(fixture.root), before);
 });
 
@@ -176,7 +177,7 @@ test('删除拒绝当前、确认身份漂移、活Host和未知Host，允许当
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, 'stale-confirmation'), /identity changed/);
   const host = await publishHost(fixture.old.binding);
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId), { code: 'runtime-hosts-active' });
-  await assert.rejects(openRuntimeDataSetHistory(fixture.paths, fixture.old.id), { code: 'runtime-hosts-active' });
+  await assert.rejects(openHistory(fixture.paths, fixture.old.id), { code: 'runtime-hosts-active' });
   await fs.writeFile(host, '{}');
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId), { code: 'runtime-hosts-active' });
   await fs.rm(host);
@@ -197,7 +198,7 @@ test('删除非当前legacy只删除完整Runtime控制树，保留配置及其�
   await fs.symlink(path.dirname(settings), link, 'dir');
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, 'default', fixture.current.binding.dataSetId), /symbolic/);
   await fs.rm(link);
-  const reader = await openRuntimeDataSetHistory(fixture.paths, 'default');
+  const reader = await openHistory(fixture.paths, 'default');
   await deleteUnselectedRuntimeDataSet(fixture.paths, 'default', fixture.current.binding.dataSetId);
   try { await assert.rejects(reader.listConversations(), /缺少|缺失|missing/); }
   finally { await reader.close(); }
@@ -243,7 +244,7 @@ test('相邻指针不能掩盖SQLite内身份漂移；pending恢复和未知文�
   database.close();
   const before = await treeSnapshot(fixture.root);
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId), /RootBinding fence mismatch/);
-  await assert.rejects(openRuntimeDataSetHistory(fixture.paths, fixture.old.id), /RootBinding fence mismatch/);
+  await assert.rejects(openHistory(fixture.paths, fixture.old.id), /RootBinding fence mismatch/);
   assert.deepEqual(await treeSnapshot(fixture.root), before);
   await fs.writeFile(fixture.old.binding.paths.rootPendingPath, JSON.stringify(fixture.old.binding));
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId), /pending/);
@@ -255,7 +256,7 @@ test('尚未确定当前数据集时允许只读历史但拒绝把未知当前�
   await fs.rm(resolveVscodeRuntimeSelectionPath(fixture.paths));
   const before = await treeSnapshot(fixture.root);
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId), /Select a fixed current/);
-  const reader = await openRuntimeDataSetHistory(fixture.paths, fixture.old.id);
+  const reader = await openHistory(fixture.paths, fixture.old.id);
   try { assert.deepEqual((await reader.listConversations()).items, []); }
   finally { await reader.close(); }
   assert.deepEqual(await treeSnapshot(fixture.root), before);

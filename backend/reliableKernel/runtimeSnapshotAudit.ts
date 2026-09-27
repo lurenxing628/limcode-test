@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { RootBinding } from './contracts';
+import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 import type { CarriedWorkRefusals, UnfinishedWorkInspection } from './runtimeDataSetMergeProbes';
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 
@@ -26,6 +27,8 @@ export interface RuntimeSnapshotAuditRequest {
   contentDigest?: boolean;
   /** false: only the schema checks and the requested measures (quick_check and foreign_key_check skipped). */
   integrity?: boolean;
+  /** Project names, conversation count and last activity (readRuntimeDataSetSummary). */
+  summary?: boolean;
 }
 
 export interface RuntimeSnapshotAudit {
@@ -33,6 +36,7 @@ export interface RuntimeSnapshotAudit {
   carriedWork?: CarriedWorkRefusals;
   size?: { rows: number; bytes: number };
   contentDigest?: string;
+  summary?: RuntimeDataSetSummary;
 }
 
 /** @internal Worker protocol; plain data only. */
@@ -43,6 +47,7 @@ export interface RuntimeSnapshotAuditWorkerData {
   measureTables?: string[];
   contentDigest?: boolean;
   skipIntegrity?: true;
+  summary?: true;
 }
 
 /** @internal */
@@ -65,7 +70,8 @@ export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnaps
     ...(request.unfinishedWork ? { unfinishedWork: request.unfinishedWork } : {}),
     ...(request.measure ? { measureTables: RUNTIME_DOMAIN_SCHEMAS.map((schema) => schema.table) } : {}),
     ...(request.contentDigest ? { contentDigest: true } : {}),
-    ...(request.integrity === false ? { skipIntegrity: true as const } : {})
+    ...(request.integrity === false ? { skipIntegrity: true as const } : {}),
+    ...(request.summary ? { summary: true as const } : {})
   };
   return new Promise((resolve, reject) => {
     let settled = false;

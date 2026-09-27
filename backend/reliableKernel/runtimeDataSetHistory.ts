@@ -7,14 +7,16 @@ import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import { storageKeyForDigest } from './contentAddressedStore';
 import { assertCurrentSchema } from './databaseSchema';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
-import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission, withRuntimeMaintenance } from './runtimeHostControl';
+import { relocateRuntimeRoot, withLocatedRuntimeRootFence } from './runtimeForeignHistory';
+import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
+import { sameLocatedRuntimeRoot, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import {
-  assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet,
-  type RuntimeDataSetDatabaseSnapshot
+  assertNoSymbolicPath, createLocatedRuntimeDatabaseSnapshot, type RuntimeDataSetDatabaseSnapshot
 } from './runtimeStorageInspection';
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
-import { resolveVscodeRuntimeDataSet, type VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
+
+export { locateLocalRuntimeDataSet, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 
 export interface RuntimeHistoryConversation {
   id: string; title: string; status: string; createdAt: string; updatedAt: string;
@@ -26,7 +28,7 @@ export interface RuntimeHistoryMessage {
 }
 export interface RuntimeHistoryTextPage { text: string; hasMore: boolean; nextOffset?: number }
 export interface RuntimeDataSetHistory {
-  readonly candidate: VscodeRuntimeDataSetCandidate;
+  readonly root: LocatedRuntimeRoot;
   listConversations(input?: { limit?: number; after?: RuntimeHistoryConversationCursor }): Promise<{
     items: RuntimeHistoryConversation[]; next?: RuntimeHistoryConversationCursor;
   }>;
@@ -42,33 +44,39 @@ const TEXT_PAGE_CHARACTERS = 32768;
 const MAX_MESSAGE_CONTENT_BYTES = 64n * 1024n * 1024n;
 
 /**
- * Opens a command-scoped, read-only history snapshot, without RuntimeDatabase or a Host.
- * SQLite's readonly WAL connection can create source -wal/-shm files. Copy SQLite and its WAL
- * under admission/offline fencing, then open only that temporary copy. CAS stays on-demand.
+ * Opens a command-scoped, read-only history snapshot, without RuntimeDatabase or a Host, of a
+ * located root: an unselected local data set (locateLocalRuntimeDataSet) or a verified foreign
+ * history root (runtimeForeignHistory). SQLite's readonly WAL connection can create source
+ * -wal/-shm files. Copy SQLite and its WAL from the located paths under the root's fence (local:
+ * admission + maintenance; foreign: its claim under this configuration root) with its Hosts
+ * offline, then open only that temporary copy, fenced by the recorded binding. CAS stays on-demand,
+ * read from the located root. A recorded path is never read.
  */
 export async function openRuntimeDataSetHistory(
   paths: { globalStoragePath: string },
-  candidateId: string
+  root: LocatedRuntimeRoot
 ): Promise<RuntimeDataSetHistory> {
-  return withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
-    const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
-    if (candidate.selected) throw new Error('Use the active conversation view for the selected Runtime data set.');
-    const historical = await requireCompleteRuntimeDataSet(candidate);
+  const open = async (): Promise<RuntimeDataSetHistory> => {
+    const current = await relocateRuntimeRoot(paths, root);
+    if (!sameLocatedRuntimeRoot(current, root)) {
+      throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
+    }
+    const historical = current.recorded;
     if (historical.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
       throw Object.assign(new Error('此旧历史库尚未完成自动备份升级，暂时不能读取。请查看自动升级失败原因；原数据未被重置。'), {
         code: 'runtime-history-offline-upgrade-required'
       });
     }
     const binding = historical as RootBinding;
-    return withRuntimeMaintenance(binding.paths, async () => {
-      await assertRuntimeHostsOffline(binding.paths);
+    return withLocatedRuntimeRootFence(paths, current, async () => {
+      await assertRuntimeHostsOffline(current.located);
       let snapshot: RuntimeDataSetDatabaseSnapshot | undefined;
       try {
-        snapshot = await createRuntimeDataSetDatabaseSnapshot(candidate, binding);
+        snapshot = await createLocatedRuntimeDatabaseSnapshot(current);
         const { database } = snapshot;
         assertCurrentSchema(database, binding);
         assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS, { label: 'Historical Runtime' });
-        return new ReadonlyRuntimeDataSetHistory(paths, candidate, binding, database, snapshot);
+        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot);
       } catch (error) {
         await snapshot?.close();
         if (error instanceof Error) {
@@ -77,7 +85,9 @@ export async function openRuntimeDataSetHistory(
         throw error;
       }
     });
-  });
+  };
+  // A foreign root is no data set of this configuration root: nothing registers Hosts on it here.
+  return root.origin.kind === 'local' ? withRuntimeDataRootAdmission(paths.globalStoragePath, open) : open();
 }
 
 class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
@@ -86,7 +96,7 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
 
   public constructor(
     private readonly paths: { globalStoragePath: string },
-    public readonly candidate: VscodeRuntimeDataSetCandidate,
+    public readonly root: LocatedRuntimeRoot,
     private readonly binding: RootBinding,
     private readonly database: Database.Database,
     private readonly snapshot: RuntimeDataSetDatabaseSnapshot
@@ -161,10 +171,8 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
 
   private async validateSource(): Promise<void> {
     if (this.closed) throw new Error('Runtime history reader is closed.');
-    const candidate = await resolveVscodeRuntimeDataSet(this.paths, this.candidate.id);
-    if (candidate.selected) throw new Error('Historical Runtime was selected for active use; reopen its active conversation view.');
-    const current = await requireCompleteRuntimeDataSet(candidate);
-    if (JSON.stringify(current) !== JSON.stringify(this.binding)) {
+    const current = await relocateRuntimeRoot(this.paths, this.root);
+    if (!sameLocatedRuntimeRoot(current, this.root)) {
       throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
     }
   }
@@ -207,8 +215,8 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length < 0n || metadata.byte_length > MAX_MESSAGE_CONTENT_BYTES) {
       throw new Error(`Historical ContentObject ${id} exceeds the 64 MiB message read limit or has an invalid length.`);
     }
-    const filePath = path.join(this.binding.paths.casRootPath, ...key.split('/'));
-    await assertNoSymbolicPath(this.candidate.configurationRootPath, filePath);
+    const filePath = path.join(this.root.located.casRootPath, ...key.split('/'));
+    await assertNoSymbolicPath(this.root.containerRoot, filePath);
     const stat = await fs.lstat(filePath, { bigint: true });
     if (!stat.isFile() || stat.size !== metadata.byte_length) throw new Error(`Historical ContentObject ${id} byte length mismatch.`);
     const bytes = await fs.readFile(filePath);

@@ -711,3 +711,18 @@ function formatHostProcesses(hosts: RuntimeHostActiveDescriptor[]): string {
     .filter((processId): processId is number => processId !== null);
   return processIds.length > 0 ? `（进程 ${processIds.join('、')}）` : '';
 }
+
+/**
+ * The same identity mutex as {@link withRuntimeMaintenance}, on a claim path the caller chooses
+ * inside its own configuration root. For a Runtime root that must never receive a claim of its own:
+ * a foreign history root read in place (runtimeForeignHistory) is never written, so its claim lives
+ * under the reading configuration root. `targetPath` is only recorded as text in the claim record.
+ */
+export async function withRuntimeClaimAtPath<T>(
+  claimPath: string,
+  targetPath: string,
+  operation: () => Promise<T>,
+  wait?: RuntimeClaimWaitOptions
+): Promise<T> {
+  return withRuntimeClaim(path.resolve(requireNonEmptyText(claimPath, 'claimPath')), targetPath, operation, wait);
+}

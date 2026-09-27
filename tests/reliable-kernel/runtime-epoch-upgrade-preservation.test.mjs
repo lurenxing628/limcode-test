@@ -13,9 +13,10 @@ const kernel = require(path.resolve('dist/extension/backend/reliableKernel/index
 const { VscodeReliableKernelCutoverCoordinator } = require(path.resolve(
   'dist/extension/backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
 ));
-const { openRuntimeDataSetHistory } = require(path.resolve(
+const { openRuntimeDataSetHistory, locateLocalRuntimeDataSet } = require(path.resolve(
   'dist/extension/backend/reliableKernel/runtimeDataSetHistory.js'
 ));
+const openHistory = async (paths, id) => openRuntimeDataSetHistory(paths, await locateLocalRuntimeDataSet(paths, id));
 const { persistPhysicalCutoverRequest, CUTOVER_JOURNAL_FILE } = require(path.resolve(
   'dist/extension/backend/reliableKernel/physicalCutover.js'
 ));
@@ -349,7 +350,7 @@ for (const previousEpoch of [3, 4]) {
       assert.equal((await fs.readdir(path.join(fixture.paths.dataRootPath, 'host-liveness')))
         .filter(name => name.endsWith('.json')).length, 0);
 
-      const reader = await openRuntimeDataSetHistory(storagePaths, input.candidateId);
+      const reader = await openHistory(storagePaths, input.candidateId);
       try {
         assert.equal((await reader.listConversations()).items[0].title, fixture.title);
         const messages = await reader.readMessages(fixture.conversationId);
@@ -555,7 +556,7 @@ test('explicit upgrade resumes each exact pending migration boundary without req
       assert.equal(result.binding.runtimeKernelEpoch, 5);
       assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
       await fs.access(path.join(result.backupPath, 'limcode.epoch-4.sqlite'));
-      const reader = await openRuntimeDataSetHistory(storagePaths, input.candidateId);
+      const reader = await openHistory(storagePaths, input.candidateId);
       try { assert.equal((await reader.readMessages(fixture.conversationId)).items[0].text, fixture.message); }
       finally { await reader.close(); }
       await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
@@ -624,7 +625,7 @@ test('automatic discovery upgrades independent histories after one failure and f
     assert.equal((await kernel.resolveVscodeRuntimeDataSet(storagePaths, upgradeInput(failed).candidateId)).runtimeKernelEpoch, 3);
     await assert.rejects(fs.access(path.join(path.dirname(interrupted.paths.dataRootPath),
       kernel.RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE)), { code: 'ENOENT' });
-    const reader = await openRuntimeDataSetHistory(storagePaths, upgradeInput(intact).candidateId);
+    const reader = await openHistory(storagePaths, upgradeInput(intact).candidateId);
     try { assert.equal((await reader.readMessages(intact.conversationId)).items[0].text, intact.message); }
     finally { await reader.close(); }
     await current.transaction([kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({

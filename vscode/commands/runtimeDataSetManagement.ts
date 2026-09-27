@@ -6,7 +6,9 @@ import {
   inspectVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet, selectVscodeRuntimeDataSet, VscodeRuntimeDataSetSelectionRequiredError,
   type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetProblem
 } from '../../backend/reliableKernel/vscodeRootAuthority';
-import { openRuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeDataSetHistory';
+import {
+  locateLocalRuntimeDataSet, openRuntimeDataSetHistory, type RuntimeDataSetHistory
+} from '../../backend/reliableKernel/runtimeDataSetHistory';
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
 import {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
@@ -23,6 +25,9 @@ import type { ApplicationStartup } from '../ApplicationStartup';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
 import { runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
+import { manageForeignRuntimeHistory } from './foreignRuntimeHistory';
+
+export { announceForeignRuntimeHistoryOnStartup } from './foreignRuntimeHistory';
 
 const pathsFor = (context: vscode.ExtensionContext) => createVscodeStoragePaths(resolveDataRootUri(context));
 const STARTUP_NOTICE_LEDGER_KEY = 'limcode.runtimeDataSetStartupNotices';
@@ -197,6 +202,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   if (!canStartRuntimeDataSetUpgrade(context)) return;
   const action = await vscode.window.showQuickPick([
     { label: '其他历史库', description: '查看旧聊天；旧格式会先自动备份升级', action: 'history' },
+    { label: '外来历史库', description: '归档与从别处拷来的目录里的旧聊天；只读查看，以后的版本支持合并', action: 'foreign' },
     { label: '查看存储占用', description: '按需统计正文、数据库、临时文件与备份', action: 'storage' },
     { label: '合并到当前库', description: '把其他历史库的对话并入当前库；在后台进行，原库保留', action: 'merge' },
     { label: '切换当前历史库', description: '保留完整原库，切换后重载窗口', action: 'select' },
@@ -212,6 +218,10 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   }
   if (action.action === 'relocate') {
     await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.relocateDataRoot);
+    return;
+  }
+  if (action.action === 'foreign') {
+    await manageForeignRuntimeHistory(context);
     return;
   }
   if (action.action === 'cleanupBackups') {
@@ -249,7 +259,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     // Native VS Code command: no settings Webview exists here, so use the shell's modal confirmation.
     const confirmed = await vscode.window.showWarningMessage('永久删除这个历史库及其备份？', {
       modal: true, detail: `${dataSetLabel(candidate, mergeStates.get(candidate.id))}\n${candidate.runtimeDataRootPath}\n\n此操作不能撤销，不会删除当前历史库或共享设置。`
-        + '它的归档（归档并重置留下的 .limcode-runtime-backups）会保留。'
+        + '它的归档（归档并重置留下的 .limcode-runtime-backups）会保留，之后作为外来历史库出现在“历史与存储管理 → 外来历史库”里，可以只读查看。'
         + deletionNote(candidate, mergeStates.get(candidate.id))
     }, '永久删除');
     if (confirmed !== '永久删除') return;
@@ -658,8 +668,19 @@ export async function showRuntimeStorage(
 }
 
 async function browseHistory(context: vscode.ExtensionContext, candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
-  const history = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在打开只读历史…' },
-    () => openRuntimeDataSetHistory(pathsFor(context), candidate.id));
+  const paths = pathsFor(context);
+  await browseRuntimeHistory(context, dataSetLabel(candidate),
+    async () => openRuntimeDataSetHistory(paths, await locateLocalRuntimeDataSet(paths, candidate.id)));
+}
+
+/** Read-only paging of one history source: an unselected local data set or a verified foreign history root. */
+export async function browseRuntimeHistory(
+  context: vscode.ExtensionContext,
+  label: string,
+  open: () => Promise<RuntimeDataSetHistory>,
+  source = '其它历史库'
+): Promise<void> {
+  const history = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在打开只读历史…' }, open);
   try {
     let after: { updatedAt: string; id: string } | undefined;
     for (;;) {
@@ -669,19 +690,19 @@ async function browseHistory(context: vscode.ExtensionContext, candidate: Vscode
       }));
       if (page.next) choices.push({ label: '下一页会话', next: true });
       if (!choices.length) { await vscode.window.showInformationMessage('这个历史库没有会话。'); return; }
-      const choice = await vscode.window.showQuickPick(choices, { placeHolder: `${dataSetLabel(candidate)} · 只读历史`, matchOnDetail: true });
+      const choice = await vscode.window.showQuickPick(choices, { placeHolder: `${label} · 只读历史`, matchOnDetail: true });
       if (!choice) return;
       if (choice.next) { after = page.next; continue; }
-      if (choice.id) await browseMessages(context, history, choice.id, choice.label);
+      if (choice.id) await browseMessages(context, history, choice.id, choice.label, source);
     }
   } finally { await history.close(); }
 }
 
-async function browseMessages(context: vscode.ExtensionContext, history: Awaited<ReturnType<typeof openRuntimeDataSetHistory>>, conversationId: string, title: string) {
+async function browseMessages(context: vscode.ExtensionContext, history: RuntimeDataSetHistory, conversationId: string, title: string, source: string) {
   let after: string | undefined;
   for (;;) {
     const page = await history.readMessages(conversationId, { limit: 50, after });
-    await showReadOnly(context, title, [title, '其它历史库 · 只读，不会恢复执行', '', ...page.items.map(item =>
+    await showReadOnly(context, title, [title, `${source} · 只读，不会恢复执行`, '', ...page.items.map(item =>
       `[${item.role}] ${item.createdAt}\n${item.text}${item.hasMoreText ? '\n（此消息还有后续正文，可在菜单继续阅读）' : ''}\n`)].join('\n'));
     const choices = [
       ...(page.next ? [{ label: '后 50 条消息', action: 'next' }] : []),
@@ -704,7 +725,7 @@ async function browseMessages(context: vscode.ExtensionContext, history: Awaited
 }
 
 const readers = new WeakMap<vscode.ExtensionContext, { show(title: string, text: string): Promise<void> }>();
-async function showReadOnly(context: vscode.ExtensionContext, title: string, text: string): Promise<void> {
+export async function showReadOnly(context: vscode.ExtensionContext, title: string, text: string): Promise<void> {
   let reader = readers.get(context);
   if (!reader) {
     const contents = new Map<string, string>();
@@ -722,7 +743,7 @@ async function showReadOnly(context: vscode.ExtensionContext, title: string, tex
   await reader.show(title, text);
 }
 
-function formatBytes(value: string): string {
+export function formatBytes(value: string): string {
   const bytes = BigInt(value);
   if (bytes < 1024n) return `${bytes} B`;
   const units = ['KiB', 'MiB', 'GiB', 'TiB'];

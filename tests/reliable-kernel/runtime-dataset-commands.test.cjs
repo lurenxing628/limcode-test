@@ -120,8 +120,10 @@ function fixture({
       }
     },
     '../../backend/reliableKernel/runtimeDataSetHistory': {
-      openRuntimeDataSetHistory: async (_paths, id) => {
-        calls.push(['history', id]);
+      // The history reader receives the located root; a local one keeps its candidate id.
+      locateLocalRuntimeDataSet: async (_paths, id) => ({ id, origin: { kind: 'local', candidateId: id } }),
+      openRuntimeDataSetHistory: async (_paths, root) => {
+        calls.push(['history', root.id]);
         return {
           listConversations: async () => ({ items: [{ id: 'conversation', title: 'Original history', updatedAt: '2026-01-01' }] }),
           readMessages: async () => ({ items: [{ id: 'message', role: 'user', text: 'preserved text', createdAt: '2026-01-01' }] }),
@@ -141,6 +143,10 @@ function fixture({
       deleteUnselectedRuntimeDataSet: async (_paths, id, expected) => calls.push(['delete', id, expected])
     },
     '../../backend/reliableKernel/runtimeContentUsage': { describeCurrentRuntimeContentUsage: async () => [] },
+    './foreignRuntimeHistory': {
+      manageForeignRuntimeHistory: async () => { calls.push(['foreign']); },
+      announceForeignRuntimeHistoryOnStartup: async () => { calls.push(['foreign-announce']); }
+    },
     '../../shared/extensionIdentity': { EXTENSION_COMMAND_IDS: { resetDevelopmentData: 'reset' } },
     '../runtimeDataSetUpgradeLifetime': lifetime,
     '../runtimeExclusiveMaintenance': {
@@ -191,8 +197,17 @@ test('deletion only offers other histories and cancellation performs no mutation
   assert.deepEqual(confirmed.calls.filter(call => call[0] === 'delete'), [['delete', 'workspace:old', 'old']]);
   assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /还没有合并到当前库.*删除后其中的对话会永久丢失/,
     '复审 merge3 #7：没有账本记录、从未合并的待合并来源也要警告');
-  assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /它的归档（归档并重置留下的 \.limcode-runtime-backups）会保留/,
+  assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /归档.*会保留，之后作为外来历史库出现在“历史与存储管理 → 外来历史库”里/,
     '删除历史库不再连带删除归档，确认框写明');
+});
+
+test('历史与存储管理的“外来历史库”入口只打开外来历史库列表，不枚举也不改动本地库', async () => {
+  const f = fixture({ picks: [action('foreign')] });
+  await f.manageRuntimeDataSets(f.context, f.startup);
+  const menu = f.calls.find(call => call[0] === 'pick');
+  assert.ok(menu, '菜单已显示');
+  assert.deepEqual(f.calls.filter(call => call[0] === 'foreign'), [['foreign']]);
+  assert.equal(f.calls.some(call => ['history', 'delete', 'select', 'summarize'].includes(call[0])), false);
 });
 
 test('read-only history is available without runtime startup and closes its snapshot on exit', async () => {

@@ -1,7 +1,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { assertCurrentSchema, auditDatabaseIntegrity, configureReaderConnection } from './databaseSchema';
-import { runtimeDataSetContentDigest } from './runtimeDataSetContent';
+import { readRuntimeDataSetSummary, runtimeDataSetContentDigest } from './runtimeDataSetContent';
 import { inspectCarriedWork, inspectUnfinishedWork } from './runtimeDataSetMergeProbes';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import type {
@@ -37,6 +37,7 @@ function audit(input: RuntimeSnapshotAuditWorkerData): RuntimeSnapshotAudit {
     if (!input.skipIntegrity) auditDatabaseIntegrity(database);
     const result: RuntimeSnapshotAudit = {};
     if (input.contentDigest) result.contentDigest = runtimeDataSetContentDigest(database);
+    if (input.summary) result.summary = readRuntimeDataSetSummary(database);
     if (input.unfinishedWork === 'finalize') result.unfinishedWork = inspectUnfinishedWork(database);
     if (input.unfinishedWork === 'carry') result.carriedWork = inspectCarriedWork(database);
     if (input.measureTables) {

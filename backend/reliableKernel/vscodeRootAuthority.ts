@@ -27,7 +27,7 @@ export const VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY = '.limcode-runtime-merges';
 /**
  * Reset archives of a scope (`<scope>/.limcode-runtime-backups/<time>-<id8>`, each a complete former
  * control root). Never a data set of this configuration root: a scope that keeps only these is not
- * enumerated.
+ * enumerated, and each archive is listed as foreign history (runtimeForeignHistory).
  */
 export const VSCODE_RUNTIME_ARCHIVES_DIRECTORY = '.limcode-runtime-backups';
 /** Written into a data set's own control root when the user switches the current data set away from it. */
