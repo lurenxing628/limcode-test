@@ -63,7 +63,7 @@ dimensions 与计数字段必须在 metadata allowlist 内，合计不超过 9 �
 
 上表所有汇总的 dimensions 都另含 `hostBootId`。
 
-快照原因 `reasonCode`：`initial`（连接）、`client_request`（Webview 请求）、`commit_scope`（本 Host 提交超出增量范围）、`task_candidate`（任务卡片需要重算）、`change_batch_limit`/`queue_limit`（增量超过批量或队列上限）、`external_commit`（其它 Host 或连接的提交，当前只能整体失效）。一次快照读取期间又到来的请求，其原因留给紧接着的下一次快照。
+快照原因 `reasonCode`：`initial`（连接）、`client_request`（Webview 请求）、`commit_scope`（本 Host 提交超出增量范围）、`task_candidate`（任务卡片需要重算）、`change_batch_limit`/`queue_limit`（增量超过批量或队列上限）、`external_commit`（其它 Host 或连接的提交，当前只能整体失效）。一次快照读取期间又到来的请求，其原因留给紧接着的下一次快照；读取期间到来的本 Host 提交在快照发出后回放，其中超出增量范围的同样把 `commit_scope` 留给下一次快照。
 
 "外部提交成本"的统计口径：`feed.snapshot.summary` 中 `external_commit` 只覆盖对话面板的 Client Feed。侧栏历史列表的外部刷新走 Facade 的 `ExternalDataVersionWatcher`，运行工作的外部刷新走 ProductRuntime 的同名 watcher，二者都不产生 Feed 快照；它们的成本体现在 `database.request.summary` 的 `conversationHistoryProjection`、`externalDataVersion` 等 requestKind 中，汇总脚本会按 requestKind 列出。
 

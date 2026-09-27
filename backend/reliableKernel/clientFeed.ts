@@ -467,6 +467,9 @@ export class BoundedClientFeed {
       this.recordSnapshotMetric(reason, bytes, readStartedAt);
       for (const commit of buffered) this.enqueueCommit(session, commit);
     } finally {
+      // A commit replayed above may have required the next snapshot while this refresh still ran;
+      // keep that reason for it instead of reporting the next snapshot as a client request.
+      if (session.snapshotRequired) session.snapshotReason ??= session.nextSnapshotReason;
       session.nextSnapshotReason = null;
       session.collectingRefresh = false;
       session.refreshing = false;

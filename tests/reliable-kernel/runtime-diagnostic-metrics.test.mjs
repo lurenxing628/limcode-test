@@ -436,6 +436,60 @@ test('Feed 全量快照记录七种原因，读取期间到来的请求原因留
   }
 });
 
+test('快照读取期间到来、需要全量快照的本 Host 提交，下一次快照记为提交超出增量范围', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-feed-buffered-reason-'));
+  const root = await kernel.resetCandidateRuntimeRoot(directory);
+  const real = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: 'feed-buffered' });
+  await real.transaction([conversation('diag-active')]);
+  const { snapshot } = await real.clientProjectionSnapshot('diag-active');
+  await real.close();
+  await fs.rm(directory, { recursive: true, force: true });
+
+  const recorded = [];
+  let commit;
+  let pendingRead;
+  let readStarted = false;
+  const database = {
+    hostBootId: 'feed-buffered',
+    performanceMetrics: { record() {} },
+    recordPerformanceMetric: (event) => recorded.push(event),
+    async externalDataVersion() { return '1'; },
+    async clientProjectionSnapshotAndSubscribe(_conversationId, listener) {
+      commit = listener;
+      return { barrier: { snapshotCommitSeq: '1', snapshot }, unsubscribe() {} };
+    },
+    async clientProjectionSnapshot() {
+      readStarted = true;
+      if (pendingRead) await pendingRead.promise;
+      return { snapshotCommitSeq: '1', snapshot };
+    },
+    async snapshot(reads) { return { snapshotCommitSeq: '1', snapshot: reads.map(() => null) }; }
+  };
+  const feed = new kernel.BoundedClientFeed(database);
+  const received = [];
+  const reasons = () => recorded.filter((event) => event.kind === 'client_feed.snapshot').map((event) => event.reason);
+  try {
+    const connection = await feed.connect({ activeConversationId: 'diag-active', send: (message) => received.push(message) });
+    const ack = () => feed.acknowledge({ sessionId: connection.sessionId, hostBootId: connection.hostBootId, messageSeq: received.at(-1).messageSeq });
+    ack();
+    let release;
+    pendingRead = { promise: new Promise((resolve) => { release = resolve; }) };
+    feed.requestSnapshot(connection.sessionId, 'diag-active');
+    await waitFor(() => readStarted, 'snapshot read in progress');
+    // Deleting a message cannot be sent as changes; it lands while the requested snapshot is read.
+    commit({ commitSeq: '2', changes: [{ domain: 'Message', kind: 'remove', id: 'message-removed' }], allocatedSequences: [] });
+    pendingRead = undefined;
+    release();
+    await waitFor(() => reasons().length === 2, 'requested snapshot');
+    ack();
+    await waitFor(() => reasons().length === 3, 'snapshot for the commit replayed after the read');
+    ack();
+    assert.deepEqual(reasons(), ['initial', 'client_request', 'commit_scope']);
+  } finally {
+    feed.close();
+  }
+});
+
 test('本 Host 自己的提交只走增量，不会被记成外部提交', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-feed-local-commits-'));
   const root = await kernel.resetCandidateRuntimeRoot(directory);
