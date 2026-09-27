@@ -613,6 +613,43 @@ for (const variant of [
   });
 }
 
+test('派发宿主已死、停止窗口服务该项目：普通停止把派生记为已派生后交还子对话，不占着不驱动；子调度随后接管并驱动子 Agent（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('spawn-dead-serving');
+  let p1; let child;
+  try {
+    const conversationId = 'conversation-spawn-dead-serving';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId }, 'origin-spawn-dispatched');
+    const spawned = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    let childCalls = 0;
+    const provider = {
+      providerId: PROVIDER_ID,
+      async sendFullRequest(request, controls) {
+        if (request.conversationId !== conversationId) childCalls += 1;
+        await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ text: '完成' }] } });
+      }
+    };
+    // No startup recovery: only the user's stop touches the dispatched spawn.
+    p1 = await openHost(dataRoot, provider, { folders: [PROJECT_TWO.uri], label: 'p1', children: true });
+    const [lease] = await rows(p1.app, 'ExecutionLease', { turn_id: spawned.parentTurnId });
+    const stopped = await p1.runner.interrupt({ commandId: 'stop-parent', conversationId, turnId: spawned.parentTurnId,
+      expectedLeaseGeneration: String(lease.generation), reason: '用户请求中断当前 Turn。' });
+    assert.equal(stopped.executingWindowAlive, undefined);
+    const [intent] = await rows(p1.app, 'EffectIntent', { id: spawned.spawnIntentId });
+    assert.equal(intent.dispatch_state, 'receipt_written', '派发宿主已死：按已派生记录');
+    assert.equal(p1.owns(spawned.childConversationId), false, '记完派生后交还子对话，不占着不驱动');
+    await p1.coordinator.recoverStartup();
+    await eventually(async () => childCalls >= 1, 30_000, '子调度没有接管并驱动子 Agent');
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: spawned.parentTurnId }))[0]?.status === 'terminated', 30_000, '父 Turn 未收尾');
+  } finally {
+    await p1?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 test('复审 X10：子调度的控制类认领已提交但随后出错时交还子 Turn 的租约（跨进程）', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('x10-child-claim');
   let p1; let child;
