@@ -31,7 +31,7 @@ class MockUri {
   toString() { return `file://${this.path}`; }
 }
 
-const ui = { calls: [], picked: undefined };
+const ui = { calls: [], picked: undefined, failReport: undefined };
 const CONFIRMATIONS = new Set(['迁移并重载', '回到旧目录']);
 const vscodeMock = {
   Uri: MockUri,
@@ -47,7 +47,13 @@ const vscodeMock = {
     async showInformationMessage(message) { ui.calls.push(['info', message]); },
     async showErrorMessage(message, options) { ui.calls.push(['error', message, options?.detail]); },
     async withProgress(_options, task) {
-      return task({ report() {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
+      const report = (value) => {
+        // A step of the relocation that fails once (e.g. the disk is full while copying).
+        if (ui.failReport === undefined || value?.message !== ui.failReport) return;
+        ui.failReport = undefined;
+        throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+      };
+      return task({ report }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
     }
   },
   commands: { async executeCommand(command) { ui.calls.push(['command', command]); } }
@@ -59,6 +65,8 @@ Module._load = function load(name, parent, isMain) {
 
 const load = (file) => require(path.join(compiled, file));
 const commands = load('vscode/commands/dataRootRelocation.js');
+const { startExclusiveMaintenanceParticipant } = load('backend/reliableKernel/runtimeExclusiveMaintenance.js');
+const { ownProcessStartIdentity } = load('backend/reliableKernel/runtimeClaimPrimitives.js');
 const globalStatus = load('backend/capabilities/vscodeStorage/globalStatus.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 const prompts = await fs.stat(path.join(compiled, 'vscode/dataRootPrompts.js')).then(() => load('vscode/dataRootPrompts.js'), () => undefined);
@@ -100,11 +108,56 @@ async function openWindow(t, configurationRootPath) {
   return { window, startup: { wait: async () => window, pending: () => Promise.resolve(window) } };
 }
 
+/**
+ * Another window of the same directory, as the coordination sees it (one process holds one
+ * RuntimeDatabase per root, so its Host is its liveness record): its participant confirms at once
+ * and, told to go, reloads (its Host goes offline).
+ */
+async function openPeer(t, configurationRootPath) {
+  const selected = await selectedDataSet(configurationRootPath);
+  const binding = await new RootAuthority(() => selected.runtimeDataRootPath).current();
+  const hostBootId = `peer-${randomUUID()}`;
+  const liveness = path.join(binding.paths.dataRootPath, 'host-liveness', `${hostBootId}.json`);
+  await fs.mkdir(path.dirname(liveness), { recursive: true });
+  const now = new Date().toISOString();
+  await fs.writeFile(liveness, JSON.stringify({
+    kind: 'limcode-runtime-host-liveness', dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId,
+    rootGeneration: binding.rootGeneration, hostBootId, livenessId: `${hostBootId}-liveness`, processId: process.pid,
+    processStartIdentity: ownProcessStartIdentity(), startedAt: now, heartbeatAt: now
+  }));
+  const peer = {
+    reloads: 0,
+    async close() { await participant.dispose(); await fs.rm(liveness, { force: true }); }
+  };
+  const participant = startExclusiveMaintenanceParticipant(binding.paths, hostBootId, {
+    busyReason: async () => undefined,
+    confirm: async () => true,
+    release: async () => {
+      peer.reloads += 1;
+      await participant.dispose();
+      await fs.rm(liveness, { force: true });
+    }
+  }, { pollMs: 20 });
+  await participant.checkNow();
+  t.after(async () => {
+    await participant.dispose();
+    await fs.rm(liveness, { force: true });
+  });
+  return peer;
+}
+
 function context(storage) {
   const state = new Map();
+  // This window's workspaceState: it survives the window's reloads (reuse the same context for that).
+  const workspace = new Map();
   return {
     globalStorageUri: MockUri.file(storage),
-    globalState: { get: (key) => state.get(key), update: async (key, value) => { state.set(key, value); }, keys: () => [...state.keys()] }
+    globalState: { get: (key) => state.get(key), update: async (key, value) => { state.set(key, value); }, keys: () => [...state.keys()] },
+    workspaceState: {
+      get: (key) => workspace.get(key),
+      update: async (key, value) => { if (value === undefined) workspace.delete(key); else workspace.set(key, value); },
+      keys: () => [...workspace.keys()]
+    }
   };
 }
 
@@ -142,6 +195,57 @@ test('单窗口迁移数据目录再回到旧目录：真实协调原语在锁�
   assert.equal(second.window.closed, true);
   assert.equal(reloads(), 1);
   assert.deepEqual(conversationIds((await selectedDataSet(fixture.root)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
+});
+
+test('迁移在其它窗口让出之后失败（复制时磁盘满），本窗口按流程重载：用户马上再点迁移可以立即进行；刚让出的另一个窗口去点迁移仍被冷却挡住，并写明何时可以再试', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'new-home');
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const trace = () => JSON.stringify(ui.calls, null, 1);
+
+  const first = await openWindow(t, fixture.root);
+  const peer = await openPeer(t, fixture.root);
+  ui.calls.length = 0;
+  ui.picked = target;
+  ui.failReport = '正在复制设置、全局规则和技能';
+  try {
+    await commands.relocateDataRoot(vscodeContext, first.startup, { clientId: 'client-1' });
+  } finally { ui.failReport = undefined; }
+  assert.match(ui.calls.find(([kind]) => kind === 'error')?.[2] ?? '', /ENOSPC[\s\S]*窗口将重载以重新打开原目录/, trace());
+  assert.equal(peer.reloads, 1, '另一个窗口已经让出');
+  assert.equal(first.window.closed, true);
+  assert.equal(reloads(), 1, '本窗口按迁移流程重载');
+  const status = await globalStatus.loadCommittedGlobalStatus(vscodeContext);
+  assert.equal(status.dataRootPath, fixture.root);
+  assert.equal(status.pendingRelocation, undefined, trace());
+
+  // Both windows open again. The one that yielded (its own workspaceState) clicks “迁移数据目录” too;
+  // it would make this window reload: held off, with when. (This window stands in as a peer here.)
+  const yielded = await openWindow(t, fixture.root);
+  const standIn = await openPeer(t, fixture.root);
+  ui.calls.length = 0;
+  await commands.relocateDataRoot(context(storage), yielded.startup, { clientId: 'client-2' });
+  const refused = ui.calls.find(([kind, title]) => kind === 'prompt' && /没有进行/.test(title));
+  assert.match(refused?.[2] ?? '', /暂不再次要求其它窗口重载。约 10 分钟后（\d\d:\d\d 以后）可以再试。/, trace());
+  assert.equal(yielded.window.closed, false);
+  assert.equal(standIn.reloads, 0);
+  assert.equal(reloads(), 0);
+  await standIn.close();
+  await yielded.window.dispose();
+
+  // This window reloaded (the same workspaceState): the user retries right away and it runs.
+  const reopened = await openWindow(t, fixture.root);
+  const peerAgain = await openPeer(t, fixture.root);
+  ui.calls.length = 0;
+  await commands.relocateDataRoot(vscodeContext, reopened.startup, { clientId: 'client-1' });
+  assert.deepEqual(failures(), [], `重试没有失败：${trace()}`);
+  assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootPath, target, trace());
+  assert.equal(peerAgain.reloads, 1, '其它窗口为这一次操作再重载一次');
+  assert.equal(reloads(), 1);
+  assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
 });
 
 test('回到旧目录单独走一遍（迁移由后端直接完成）：真实协调原语在锁外等待，本窗口在锁内关闭运行时后切回指针', async (t) => {

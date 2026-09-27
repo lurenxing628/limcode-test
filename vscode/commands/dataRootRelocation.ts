@@ -23,7 +23,7 @@ import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../shared/extensionId
 import type { BridgeClientId, DataRootPromptSection, ExtensionToWebviewMessage } from '../../shared/protocol';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { askInSettingsPage, type DataRootPrompt, type DataRootPromptAnswer } from '../dataRootPrompts';
-import { requesterWorkBusy, runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
+import { requesterWorkBusy, runWithExclusiveMaintenance, type ExclusiveMaintenanceWindowState } from '../runtimeExclusiveMaintenance';
 
 /** What the data-directory commands need of the open Runtime (the reliable-kernel Facade). */
 export interface DataRootRelocationHost {
@@ -151,7 +151,8 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
         operationKey: `data-root-relocation:${plan.targetRootPath}#${relocationId}`,
         message: '为迁移数据目录',
         waitingTitle: '迁移数据目录：正在等待 LimCode 窗口空闲',
-        configurationRootPath: plan.sourceRootPath
+        configurationRootPath: plan.sourceRootPath,
+        windowState: context.workspaceState
       }, async (stage) => {
         runtimeClosed = true;
         stage('正在关闭本窗口的运行时');
@@ -208,11 +209,16 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
  * confirmed here), then runs `operation` under the configuration admission and the selected root's
  * maintenance claim. `operation` reports its stages to windows waiting to open. The key carries the
  * attempt's own id: every call is an explicit user action, and a new attempt after fixing a cause
- * is never held back by an earlier failure.
+ * is never held back by an earlier failure. The cooldown after other windows yielded is by operation,
+ * whatever the key: only this window's retry passes it, with the operation's token that the layer
+ * keeps in this window's workspaceState across the reload after a failure.
  */
 async function exclusively<T>(
   host: DataRootRelocationHost,
-  input: { operation: string; operationKey: string; message: string; waitingTitle: string; configurationRootPath: string },
+  input: {
+    operation: string; operationKey: string; message: string; waitingTitle: string; configurationRootPath: string;
+    windowState: ExclusiveMaintenanceWindowState | undefined;
+  },
   operation: (stage: (text: string) => void) => Promise<T>
 ): Promise<RuntimeExclusiveMaintenanceOutcome<T>> {
   const { paths, hostBootId } = host.exclusiveMaintenanceTarget();
@@ -317,7 +323,8 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     try {
       const outcome = await exclusively(host, {
         operation: 'data-root-return', operationKey: `data-root-return:${previous}#${randomUUID()}`, message: '为切换回旧数据目录',
-        waitingTitle: '回到旧目录：正在等待 LimCode 窗口空闲', configurationRootPath: host.dataRootPath()
+        waitingTitle: '回到旧目录：正在等待 LimCode 窗口空闲', configurationRootPath: host.dataRootPath(),
+        windowState: context.workspaceState
       }, async (stage) => {
         runtimeClosed = true;
         stage('正在关闭本窗口的运行时');
@@ -644,7 +651,8 @@ async function switchToMovedDataRoot(context: vscode.ExtensionContext, startup: 
     if (host) {
       const outcome = await exclusively(host, {
         operation: 'data-root-follow', operationKey: `data-root-follow:${next}#${randomUUID()}`, message: '为改用迁移后的数据目录',
-        waitingTitle: '改用新目录：正在等待 LimCode 窗口空闲', configurationRootPath: host.dataRootPath()
+        waitingTitle: '改用新目录：正在等待 LimCode 窗口空闲', configurationRootPath: host.dataRootPath(),
+        windowState: context.workspaceState
       }, async (stage) => {
         runtimeClosed = true;
         stage('正在关闭本窗口的运行时');

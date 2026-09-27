@@ -172,11 +172,19 @@ export interface RuntimeExclusiveMaintenanceInput {
   activity?: string;
   /**
    * Required on every call, never inferred from stored state: true only for the one call made for
-   * an explicit user action. It skips the per-key backoff and a blocked key; it skips the
-   * per-operation cooldown only when the requesting process started before that cooldown (a window
-   * that just yielded never makes the others yield right back).
+   * an explicit user action. It skips the per-key backoff and a blocked key. The cooldown after a go
+   * holds off every call of the operation, whatever its key (a key may carry the attempt's own id);
+   * only an explicit call carrying the requesterToken of the call that published that go passes
+   * (the user retrying in the window that asked, also after it reloaded, on any target). Windows
+   * that yielded never make the others yield right back.
    */
   ignoreBackoff: boolean;
+  /**
+   * Identifies the requesting window's user operation (this operation name) across its reloads; the
+   * VS Code layer keeps it in workspaceState until the operation completes. Recorded with the
+   * cooldown when go is published.
+   */
+  requesterToken?: string;
   /** The requester's own registered Host when it stays open while requesting (e.g. a migration). */
   requesterHostBootId?: string;
   /**
@@ -187,9 +195,10 @@ export interface RuntimeExclusiveMaintenanceInput {
   requesterBusy?(): Promise<ExclusiveMaintenanceBusy | undefined>;
   /**
    * Called once everything is ready (every other window confirmed, or none is left), before go is
-   * published and before the operation: freeze the requester's own window (no new work starts) and
-   * report whether it is idle. Busy sends the requester back outside the locks (wait) or abandons,
-   * before any window reloads.
+   * published and before the operation: check that the requester's own window is idle first, then
+   * freeze it (no new work starts) doing only what cannot fail afterwards, and return the thaw.
+   * Busy sends the requester back outside the locks (wait) or abandons, before any window reloads;
+   * a hook that throws counts as busy (whatever it froze before throwing it must undo itself).
    */
   beforeGo?(): Promise<ExclusiveMaintenanceGoCheck>;
   /** When given, the configuration admission of this root is part of the locks. */
@@ -207,8 +216,6 @@ export interface RuntimeExclusiveMaintenanceInput {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   cooldownAfterCoordinatedMs?: number;
-  /** Wall-clock start of the requesting process (ms); defaults to this process. */
-  requesterStartedAtMs?: number;
   isCancelled?(): boolean;
   /** Called once when a request is first published (other windows are involved). */
   onWaitStart?(hosts: readonly RuntimeHostActiveDescriptor[]): void;
@@ -237,8 +244,10 @@ export type RuntimeExclusiveMaintenanceOutcome<T> =
     hosts: RuntimeHostActiveDescriptor[];
     /** User-facing reason in Chinese. */
     reason: string;
-    /** For backoff: when an automatic retry is allowed again. */
+    /** For backoff: when a retry is allowed again (also written in the reason). */
     retryAfter?: string;
+    /** This request gave way to that earlier request (its requestId). */
+    gaveWayTo?: string;
   };
 
 export type ExclusiveMaintenanceOperation<T> = (context: ExclusiveMaintenanceOperationContext) => Promise<T>;
@@ -451,22 +460,23 @@ class ExclusiveMaintenanceRequester<T> {
       const frozen = await this.freeze();
       if (frozen !== 'ready') return frozen;
       try {
-        let coordinated = this.request !== undefined;
+        // Only a published go makes windows reload: until then a busy requester goes back outside.
+        let goPublished = false;
         if (this.hosts.length > 0) {
           const released = await this.release();
           if (released !== 'ready') return released;
-          coordinated = true;
+          goPublished = true;
         }
         // Last check: the requester's own window started nothing since beforeGo.
         const own = await this.requesterBusy();
         if (own) {
-          return coordinated
+          return goPublished
             ? await this.abandon('busy', [], goBusyReason([], own))
             : (await this.whenBusyStep([], own, true)) as AbandonOutcome | typeof RETRY;
         }
         this.endWait();
         activity.report(undefined);
-        return this.completed(await this.execute(coordinated, activity), coordinated);
+        return this.completed(await this.execute(goPublished, activity), this.request !== undefined);
       } finally {
         await this.thaw();
       }
@@ -493,7 +503,10 @@ class ExclusiveMaintenanceRequester<T> {
       await this.heartbeat();
       // Two requesters never wait for each other: the later one gives way, with the reason.
       const earlier = await this.earlierRequest();
-      if (earlier) return this.abandon('busy', this.hosts, `另一个窗口先发起了${earlier.activity}，这次让它先完成，没有进行；之后可以再试。`);
+      if (earlier) {
+        const outcome = await this.abandon('busy', this.hosts, `另一个窗口先发起了${earlier.activity}，这次让它先完成，没有进行；之后可以再试。`);
+        return { ...outcome, gaveWayTo: earlier.requestId };
+      }
       this.hosts = await this.hostsNow();
       const own = await this.requesterBusy();
       if (this.hosts.length === 0 && !own) return 'ready';
@@ -551,8 +564,15 @@ class ExclusiveMaintenanceRequester<T> {
   /** beforeGo: the requester freezes its own window and says whether it is idle; nobody yielded yet. */
   private async freeze(): Promise<Step> {
     if (!this.input.beforeGo) return 'ready';
-    const check = await this.input.beforeGo();
-    this.thawFreeze = check?.thaw ? () => check.thaw!() : undefined;
+    let check: ExclusiveMaintenanceGoCheck | undefined;
+    try {
+      check = await this.input.beforeGo();
+    } catch (error) {
+      // The requester could not tell whether its window is idle: nobody yields this round.
+      console.warn('[LimCode] 独占维护发布 go 前检查本窗口失败，按忙处理。', error);
+      return (await this.whenBusyStep([], { kind: 'work', reason: `无法确认本窗口是否空闲：${describeError(error)}` }, true))!;
+    }
+    this.thawFreeze = check?.thaw ? () => check!.thaw!() : undefined;
     if (!check?.busy) return 'ready';
     await this.thaw();
     return (await this.whenBusyStep([], check.busy, true))!;
@@ -575,7 +595,7 @@ class ExclusiveMaintenanceRequester<T> {
   private async release(): Promise<Step> {
     await this.publish({ phase: 'go' });
     // From here windows reload: a later request of this operation must not make them reload again soon.
-    await recordOperationCooldown(this.paths, this.operationName, this.input);
+    await recordOperationCooldown(this.paths, this.operationName, this.operationKey, this.input);
     const deadline = this.now() + (this.input.releaseTimeoutMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.releaseTimeoutMs);
     for (;;) {
       if (this.input.isCancelled?.()) return this.abandon('cancelled', this.hosts, '已取消。');
@@ -618,6 +638,7 @@ class ExclusiveMaintenanceRequester<T> {
     return { state, hosts, reason };
   }
 
+  /** `coordinated`: go was published, so other windows reloaded for this operation. */
   private async execute(coordinated: boolean, activity: RuntimeMaintenanceActivityHandle): Promise<T> {
     // The final decision never trusts the poll cache.
     await assertRuntimeHostsOffline(this.paths, this.input.requesterHostBootId);
@@ -825,6 +846,9 @@ export function startExclusiveMaintenanceParticipant(
   const current = (): boolean => !disposed && options.isCurrent?.() !== false;
   const isOwn = (request: RuntimeExclusiveMaintenanceRequest): boolean => request.requesterHostBootId === hostBootId
     || (request.requesterHostBootId === undefined && request.requesterProcessId === ownProcessId);
+  // This window's own running request: requests are made in the window's own process (also before
+  // the request file is published).
+  const ownRequest = (): LocalRequest | undefined => LOCAL_REQUESTS.get(hostBootId)?.[0];
   const respond = async (
     request: RuntimeExclusiveMaintenanceRequest,
     stage: ExclusiveMaintenancePhase,
@@ -911,10 +935,6 @@ export function startExclusiveMaintenanceParticipant(
     for (const key of [...answered.keys()]) if (!live.has(key.slice(0, key.indexOf('#')))) answered.delete(key);
     for (const key of [...settledRounds]) if (!live.has(key.slice(0, key.indexOf('#')))) settledRounds.delete(key);
     for (const set of [declinedRequests, notified]) for (const id of [...set]) if (!live.has(id)) set.delete(id);
-    const ownFiles = requests.filter(isOwn);
-    // This process's own request (also before it is published), else one of this window on disk.
-    const ownRequest = (): LocalRequest | undefined => LOCAL_REQUESTS.get(hostBootId)?.[0]
-      ?? (ownFiles[0] ? { activity: ownFiles[0].activity, request: ownFiles[0] } : undefined);
     for (const request of requests) {
       if (!current()) return;
       if (isOwn(request)) continue;
@@ -1140,8 +1160,10 @@ interface LedgerEntry {
   operationKey?: string;
   attempts: number;
   until: string;
-  /** A deterministic failure: this key is never run again (its identity must change first). */
+  /** A deterministic failure: automatic calls of this key never run again (an explicit call may). */
   blocked?: true;
+  /** Cooldown: the call that published go (see RuntimeExclusiveMaintenanceInput.requesterToken). */
+  requesterToken?: string;
   reason: string;
   recordedAt: string;
 }
@@ -1164,13 +1186,12 @@ async function readActiveBackoff(
   const entries: LedgerEntry[] = [];
   const cooldown = await readLedger(paths, operationLedgerName(operation));
   if (cooldown) {
-    // An explicit user request skips the operation's cooldown only from a process that started
-    // before it: a window that just yielded (its reload is a new process) never makes the others
-    // yield right back.
-    const recordedAt = Date.parse(cooldown.recordedAt);
-    const startedAt = input.requesterStartedAtMs ?? performance.timeOrigin;
-    const skip = input.ignoreBackoff && Number.isFinite(recordedAt) && startedAt < recordedAt;
-    if (!skip) entries.push(input.ignoreBackoff ? { ...cooldown, reason: JUST_YIELDED_REASON } : cooldown);
+    // Every call of the operation waits for the cooldown whatever its key (a new key per attempt
+    // must not get around it), except an explicit call with the token of the call that published
+    // the go: the user retrying in the window that asked, also after the failure reloaded it.
+    // Windows that yielded have no such token and never make the others yield right back.
+    const sameRequester = input.requesterToken !== undefined && cooldown.requesterToken === input.requesterToken;
+    if (!input.ignoreBackoff || !sameRequester) entries.push(cooldown);
   }
   // An explicit user request skips the key's backoff.
   if (!input.ignoreBackoff) {
@@ -1185,10 +1206,8 @@ async function readActiveBackoff(
     if (!Number.isFinite(until) || until <= Date.now() || until > Date.now() + maxMs + 60_000) continue;
     if (!latest || until > latest.at) latest = { until: entry.until, reason: entry.reason, at: until };
   }
-  return latest ? { until: latest.until, reason: latest.reason } : undefined;
+  return latest ? { until: latest.until, reason: `${latest.reason}${retryText(latest.at)}` } : undefined;
 }
-
-const JUST_YIELDED_REASON = '刚刚已经为这项维护让其它窗口重载过一次，本窗口是在那之后打开的，暂不反过来要求其它窗口重载；请稍后再试。';
 
 async function recordKeyBackoff(
   paths: RuntimeRootPaths,
@@ -1220,14 +1239,24 @@ async function recordKeyBlocked(paths: RuntimeRootPaths, operation: string, oper
 async function recordOperationCooldown(
   paths: RuntimeRootPaths,
   operation: string,
+  operationKey: string,
   input: RuntimeExclusiveMaintenanceInput
 ): Promise<void> {
   const durationMs = input.cooldownAfterCoordinatedMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.cooldownAfterCoordinatedMs;
   await writeLedger(paths, operationLedgerName(operation), {
-    kind: LEDGER_KIND, scope: 'operation', operation, attempts: 1,
+    kind: LEDGER_KIND, scope: 'operation', operation, operationKey, attempts: 1,
     until: new Date(Date.now() + durationMs).toISOString(),
-    reason: '刚刚已经让其它窗口重载过一次，稍后再自动尝试。', recordedAt: new Date().toISOString()
+    ...(input.requesterToken !== undefined ? { requesterToken: input.requesterToken } : {}),
+    reason: '刚刚已经为这项维护让其它窗口重载过一次，暂不再次要求其它窗口重载。', recordedAt: new Date().toISOString()
   }).catch((error) => console.warn('[LimCode] 无法记录独占维护的冷却期。', error));
+}
+
+/** When a refused call may be made again, in the user's words: about how long, and the local time. */
+function retryText(untilMs: number): string {
+  const minutes = Math.max(1, Math.ceil((untilMs - Date.now()) / 60_000));
+  const at = new Date(untilMs);
+  const clock = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+  return `约 ${minutes} 分钟后（${clock} 以后）可以再试。`;
 }
 
 /** Success resets the key: a later failure starts again from the shortest backoff. */

@@ -206,7 +206,8 @@ function fixture({
   const globalState = new Map();
   const context = {
     globalStorageUri: { fsPath: '/vscode/global-storage' },
-    globalState: { get: (key) => globalState.get(key), update: async (key, value) => { calls.push(['global-state', key, value]); globalState.set(key, value); } }
+    globalState: { get: (key) => globalState.get(key), update: async (key, value) => { calls.push(['global-state', key, value]); globalState.set(key, value); } },
+    workspaceState: { get: () => undefined, update: async () => {} }
   };
   const request = { clientId: 'client-1' };
   return { calls, prompts, commands, context, startup, status, request, globalState, progressOptions, cancellation, kinds: () => calls.map((call) => call[0]).filter((kind) => kind !== 'progress') };
@@ -237,6 +238,7 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
   assert.equal(exclusive.requesterHostBootId, 'host-1');
   assert.equal(typeof exclusive.withLocks, 'function', '等待在锁外进行，锁只在短轮次里拿');
   assert.equal(typeof exclusive.requesterBusy, 'function', '发起窗口自己的任务也在等待范围内');
+  assert.equal(exclusive.windowState, f.context.workspaceState, '本次操作的标识记在本窗口的 workspaceState：失败重载后再点迁移可以越过冷却');
   const published = f.calls.filter((call) => call[0] === 'status')[1][1];
   assert.deepEqual([published.dataRootPath, published.dataRootId, published.pendingRelocation, published.lastMigration.fromPath],
     [TARGET, '00000000-0000-4000-8000-000000000001', null, SOURCE]);
@@ -472,6 +474,7 @@ test('回到旧目录：运行时正常时经独占协调（倒计时不可否�
   await f.commands.returnToPreviousDataRoot(f.context, f.startup, f.request);
   assert.match(JSON.stringify(f.prompts[0]), /不复制也不合并/);
   assert.equal(f.calls.find((call) => call[0] === 'exclusive')[1].participantConfirmation, 'final-countdown');
+  assert.equal(f.calls.find((call) => call[0] === 'exclusive')[1].windowState, f.context.workspaceState);
   const order = f.kinds();
   assert.ok(order.indexOf('close-runtime') < order.indexOf('invalidate') && order.indexOf('invalidate') < order.indexOf('status'));
   assert.deepEqual(f.calls.find((call) => call[0] === 'invalidate'), ['invalidate', SOURCE]);
@@ -537,6 +540,7 @@ test('另一个安装把这个目录的数据迁走了（reloc2 #7）：打开�
   await follow.commands.afterDataRootOpened(follow.context, SOURCE, follow.startup);
   for (let turn = 0; turn < 20 && !follow.kinds().includes('command'); turn += 1) await new Promise(setImmediate);
   assert.equal(follow.calls.find((call) => call[0] === 'exclusive')[1].participantConfirmation, 'final-countdown');
+  assert.equal(follow.calls.find((call) => call[0] === 'exclusive')[1].windowState, follow.context.workspaceState);
   const switched = follow.calls.find((call) => call[0] === 'status')[1];
   assert.deepEqual([switched.dataRootPath, switched.lastMigration.fromPath, switched.lastMigration.relocationId], ['/data/moved-by-other', SOURCE, undefined]);
   assert.deepEqual(follow.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);

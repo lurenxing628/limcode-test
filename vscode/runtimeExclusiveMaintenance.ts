@@ -21,16 +21,27 @@ export interface ExclusiveMaintenanceParticipantOptions {
   /** Tests that run several windows in one process give each its own identity. */
   processId?: number;
   /**
-   * Keeps a text across the reload that yielding causes (e.g. in workspaceState); the window shows
-   * it once it opened again. Used for this window's own request that ended shortly before.
+   * This window's state that survives its reload (VS Code workspaceState). It carries the token of
+   * the user's operation (so the user can retry it right after a failure reloaded the window) and
+   * the reason why the user's operation gave way to the request this window then yielded to.
    */
-  rememberAcrossReload?(text: string): PromiseLike<void> | void;
+  windowState?: ExclusiveMaintenanceWindowState;
 }
 
-/** How long before a reload this window's own unfinished request is carried across it. */
-const REMEMBER_BEFORE_RELOAD_MS = 5 * 60_000;
-/** The last request of this window that did not complete, and when it ended. */
-let unfinishedRequest: { text: string; at: number } | undefined;
+/** The part of VS Code's Memento this layer uses. */
+export interface ExclusiveMaintenanceWindowState {
+  get<T>(key: string): T | undefined;
+  update(key: string, value: unknown): PromiseLike<void>;
+}
+
+const NOTICE_KEY = 'limcode.exclusiveMaintenance.noticeAfterReload';
+const REQUESTER_KEY = 'limcode.exclusiveMaintenance.requester';
+/** A kept notice older than this is dropped unread. */
+const NOTICE_TTL_MS = 10 * 60_000;
+/** Set when this window's participant starts. */
+let windowState: ExclusiveMaintenanceWindowState | undefined;
+/** The user's last operation in this window that gave way to an earlier request (its requestId). */
+let gaveWay: { text: string; requestId: string } | undefined;
 
 /**
  * This window's side of cooperative exclusive maintenance on its selected root. It never yields
@@ -38,8 +49,8 @@ let unfinishedRequest: { text: string; at: number } | undefined;
  * is ready does it show the countdown (a notice, or a countdown without cancel, when the user
  * already confirmed the operation elsewhere) and then reload. Unsent composer input survives the
  * reload (Webview state). While this window's own request runs it never yields (the primitive
- * answers busy for it), and when it yields shortly after its own request ended without completing,
- * the outcome is kept across the reload (rememberAcrossReload).
+ * answers busy for it); when the user's operation gave way to an earlier request and this window
+ * then yields to exactly that request, the reason is kept across the reload (windowState).
  */
 export function startExclusiveMaintenanceParticipant(
   host: ExclusiveMaintenanceParticipantHost,
@@ -47,6 +58,7 @@ export function startExclusiveMaintenanceParticipant(
 ): ExclusiveMaintenanceParticipant {
   const { paths, hostBootId } = host.exclusiveMaintenanceTarget();
   const seconds = options.countdownSeconds ?? 5;
+  if (options.windowState) windowState = options.windowState;
   return startProtocolParticipant(paths, hostBootId, {
     busyReason: async () => {
       if (await host.hasOwnedExecution()) return { kind: 'work', reason: '有任务正在进行' };
@@ -56,10 +68,10 @@ export function startExclusiveMaintenanceParticipant(
     confirm: (request) => request.confirmation === 'notice'
       ? announce(request.message)
       : countdown(request, seconds),
-    release: async () => {
-      const unfinished = unfinishedRequest;
-      if (unfinished && Date.now() - unfinished.at < REMEMBER_BEFORE_RELOAD_MS && options.rememberAcrossReload) {
-        try { await options.rememberAcrossReload(unfinished.text); }
+    release: async (request) => {
+      const kept = gaveWay;
+      if (kept && kept.requestId === request.requestId && windowState) {
+        try { await windowState.update(NOTICE_KEY, { text: kept.text, at: Date.now() }); }
         catch (error) { console.warn('[LimCode] 无法保留重载前的维护结果。', error); }
       }
       await vscode.commands.executeCommand('workbench.action.reloadWindow');
@@ -92,6 +104,11 @@ export type ExclusiveMaintenanceRequestOptions = Omit<
   waitingTitle: string;
   isCurrent(): boolean;
   /**
+   * This window's workspaceState, where an explicit call keeps its operation's requester token
+   * across a reload; defaults to the one the participant of this window was started with.
+   */
+  windowState?: ExclusiveMaintenanceWindowState;
+  /**
    * Given: called outside the locks; waiting for busy windows happens without locks and withLocks
    * takes admission and maintenance only for the short locked round. Omitted: the caller already
    * holds the locks, and a busy window abandons at once.
@@ -100,16 +117,31 @@ export type ExclusiveMaintenanceRequestOptions = Omit<
 };
 
 /**
+ * Once after the window opened again: why the user's operation did not run before another window's
+ * maintenance reloaded this one. Read and cleared.
+ */
+export function takeNoticeKeptAcrossReload(state: ExclusiveMaintenanceWindowState): string | undefined {
+  const kept = state.get<{ text?: unknown; at?: unknown }>(NOTICE_KEY);
+  if (!kept) return undefined;
+  void Promise.resolve(state.update(NOTICE_KEY, undefined)).catch(() => undefined);
+  return typeof kept.text === 'string' && typeof kept.at === 'number' && Date.now() - kept.at <= NOTICE_TTL_MS ? kept.text : undefined;
+}
+
+/**
  * Requester side. Shows a cancellable progress notification only while other windows (or this
- * window's own work) are actually involved. An outcome that did not complete is remembered, so a
- * reload of this window soon after (another window's maintenance) keeps it (rememberAcrossReload).
+ * window's own work) are actually involved. For the user's explicit call it passes the requester
+ * token of the operation (by its name, whatever the key), kept in windowState until the operation
+ * completed: the user can retry right after a failure reloaded this window, past the cooldown that
+ * failure started, while other windows and automatic calls cannot. When the user's operation gives
+ * way to an earlier request, the reason is kept for a reload for that request.
  */
 export async function runWithExclusiveMaintenance<T>(
   paths: RuntimeRootPaths,
   options: ExclusiveMaintenanceRequestOptions,
   operation: ExclusiveMaintenanceOperation<T>
 ): Promise<RuntimeExclusiveMaintenanceOutcome<T>> {
-  const { waitingTitle, isCurrent, withLocks, ...input } = options;
+  const { waitingTitle, isCurrent, withLocks, windowState: givenState, ...input } = options;
+  const state = givenState ?? windowState;
   let cancelled = false;
   let finishWait: (() => void) | undefined;
   let reporter: vscode.Progress<{ message?: string }> | undefined;
@@ -130,17 +162,41 @@ export async function runWithExclusiveMaintenance<T>(
     onWaitEnd: () => finishWait?.()
   };
   const activity = input.activity ?? input.message.replace(/^为/, '');
-  try {
-    const outcome = await (withLocks
-      ? runExclusiveRuntimeMaintenance(paths, { ...coordinated, withLocks }, operation)
-      : requestExclusiveRuntimeMaintenance(paths, coordinated, operation));
-    unfinishedRequest = outcome.state === 'completed' || outcome.state === 'cancelled'
-      ? undefined : { text: `${activity}没有进行：${outcome.reason}`, at: Date.now() };
-    return outcome;
-  } catch (error) {
-    unfinishedRequest = { text: `${activity}没有完成：${error instanceof Error ? error.message : String(error)}`, at: Date.now() };
-    throw error;
+  const requesterToken = input.ignoreBackoff && state ? await userOperationToken(state, input.operation) : undefined;
+  const request = { ...coordinated, ...(requesterToken !== undefined ? { requesterToken } : {}) };
+  const outcome = await (withLocks
+    ? runExclusiveRuntimeMaintenance(paths, { ...request, withLocks }, operation)
+    : requestExclusiveRuntimeMaintenance(paths, request, operation));
+  if (outcome.state === 'completed' && requesterToken !== undefined && state) {
+    const { [input.operation]: _done, ...others } = requesterTokens(state);
+    await Promise.resolve(state.update(REQUESTER_KEY, Object.keys(others).length > 0 ? others : undefined)).catch(() => undefined);
   }
+  if (input.ignoreBackoff && outcome.state !== 'completed' && outcome.gaveWayTo !== undefined) {
+    gaveWay = { text: `${activity}没有进行：${outcome.reason}`, requestId: outcome.gaveWayTo };
+  }
+  return outcome;
+}
+
+/**
+ * The token of the user's operation in this window, by operation name: the one kept (across
+ * reloads) until that operation completed, else a new one, kept before anything is published.
+ */
+async function userOperationToken(state: ExclusiveMaintenanceWindowState, operation: string): Promise<string | undefined> {
+  const kept = requesterTokens(state);
+  if (kept[operation]) return kept[operation];
+  const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+  try { await state.update(REQUESTER_KEY, { ...kept, [operation]: token }); }
+  catch (error) {
+    console.warn('[LimCode] 无法记录本次维护操作的标识。', error);
+    return undefined;
+  }
+  return token;
+}
+
+function requesterTokens(state: ExclusiveMaintenanceWindowState): Record<string, string> {
+  const kept = state.get<Record<string, unknown>>(REQUESTER_KEY);
+  if (!kept || typeof kept !== 'object' || Array.isArray(kept)) return {};
+  return Object.fromEntries(Object.entries(kept).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
 }
 
 export function describeProgress(progress: ExclusiveMaintenanceProgress): string {

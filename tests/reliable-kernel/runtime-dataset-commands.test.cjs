@@ -366,7 +366,8 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
       startExclusiveMaintenanceParticipant(host, options) {
         events.push(['participant-start', host === application, options.isCurrent()]);
         return { async dispose() { events.push('participant-dispose'); } };
-      }
+      },
+      takeNoticeKeptAcrossReload() { return undefined; }
     },
     '../backend/application/runtimeBuildInfo': { RUNTIME_BUILD_INFO: {} }
   }, {
