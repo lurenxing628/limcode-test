@@ -1198,8 +1198,9 @@ function canonicalFolderUri(value: string): string {
  * A custom data directory set by an earlier version has no recorded identity yet. Its first normal
  * open records one (under the configuration admission, right after the directory passed the
  * structure check), so from then on only this very directory is accepted (assertDataRootAvailable).
+ * The pointer is only updated while it still names that directory.
  */
-async function recordDataRootIdentity(context: vscode.ExtensionContext): Promise<void> {
+export async function recordDataRootIdentity(context: vscode.ExtensionContext): Promise<void> {
   const status = await loadCommittedGlobalStatus(context);
   if (!normalizeStatusDataRootPath(context, status.dataRootPath) || status.dataRootId) return;
   const dataRootId = await ensureDataRootIdentity(resolveDataRootUri(context, status.dataRootPath).fsPath);

@@ -238,3 +238,27 @@ test('迁移在合并时失败、撤销又没做完（放回设置时 EPERM）�
   await assert.rejects(fs.stat(markerFile), { code: 'ENOENT' });
   await assert.rejects(fs.stat(path.join(target, relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY)), { code: 'ENOENT' });
 });
+
+test('reloc2 #5：旧版本设置的自定义目录（指针没有身份）第一次正常打开时记下身份，之后同一位置换成另一份数据不再放行；外置盘没挂上时读设置只给默认值、不建目录', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  assert.ok(!(await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootId, '前提：指针没有记录身份');
+  const { recordDataRootIdentity } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
+  await recordDataRootIdentity(vscodeContext);
+  const recorded = (await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootId;
+  assert.equal(recorded, await relocation.readDataRootIdentity(fixture.root));
+  await recordDataRootIdentity(vscodeContext);
+  assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootId, recorded, '只记一次');
+  const other = path.join(fixture.base, 'other-drive');
+  await createLimCodeTarget(other);
+  await assert.rejects(relocation.assertDataRootAvailable(other, recorded), { reason: 'mismatch' });
+
+  const globalSettings = load('backend/capabilities/vscodeStorage/globalSettings.js');
+  const unmounted = path.join(fixture.base, 'mnt', 'usb', 'LimCode', 'settings');
+  const loaded = await globalSettings.loadGlobalSettingsFile(MockUri.file(unmounted), 'appearance');
+  assert.ok(loaded.settings && loaded.revision);
+  await assert.rejects(fs.stat(path.join(fixture.base, 'mnt')), { code: 'ENOENT' });
+});
