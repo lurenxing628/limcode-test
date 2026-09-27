@@ -80,6 +80,8 @@ interface DriveSlot {
   waitingExternalDataVersion?: string;
   waitingWakeFingerprint?: string;
   maintenanceResult?: CoordinateCompressionResult;
+  /** Why this Host did not drive the slot: another live Host owns it, or this Host does not serve it. */
+  stoodDown?: Exclude<ConversationRuntimeEligibleClaimResult, 'owned'>;
   error?: unknown;
   task: Promise<void>;
 }
@@ -480,6 +482,11 @@ export class ReliableConversationRunner {
       const slot = this.scheduleDrive(input.conversationId, turnId);
       if (!slot) throw new Error('手动压缩维护 Turn 未能进入可靠调度。');
       await slot.task;
+      if (slot.stoodDown === 'ineligible' || slot.stoodDown === 'unknown') {
+        // Nothing ran: close the maintenance Turn here rather than leave it active for no Host.
+        await this.failUnstartedManualCompression(input.conversationId, turnId);
+        throw new ConversationHostIneligibleError(input.conversationId, slot.stoodDown);
+      }
       if (slot.error) throw slot.error;
       return {
         turnId,
@@ -566,6 +573,27 @@ export class ReliableConversationRunner {
             }
       });
     });
+  }
+
+  /**
+   * A maintenance Turn this window admitted but may not drive (its eligibility changed in between)
+   * is recorded as failed under the lease it still holds; no model request was made.
+   */
+  private async failUnstartedManualCompression(conversationId: string, turnId: string): Promise<void> {
+    this.forgetRecoveryCandidate(turnId);
+    const fence = await this.application.turns.executionLeaseFence({
+      turnId,
+      leaseOwnerId: this.leaseOwnerId,
+      hostBootId: this.application.database.hostBootId
+    });
+    if (!fence) return;
+    await runWithExecutionLeaseFence(fence, () => this.application.turns.terminal({
+      source: { kind: 'internal', key: `manual-compression-maintenance:${turnId}:not-served` },
+      turnId,
+      terminalStatus: 'failed',
+      reason: 'manual_context_compression_not_served_here'
+    }));
+    this.scheduleAdmission(conversationId);
   }
 
   /** Runs a maintenance descriptor under the caller's already-established execution fence. */
@@ -1240,6 +1268,7 @@ export class ReliableConversationRunner {
     const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
     if (claim !== 'owned') {
       slot.terminal = true;
+      slot.stoodDown = claim;
       slot.completedGeneration = slot.requestedGeneration;
       if (claim === 'busy') {
         this.deferExecutionRecovery(slot);

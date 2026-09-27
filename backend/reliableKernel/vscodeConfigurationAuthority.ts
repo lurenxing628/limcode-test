@@ -254,21 +254,31 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
         link.conversationId === request.conversationId && link.role === 'active'
       ));
+      const policy = resolveScopedRecord(
+        records.workEnvironmentPolicyScopeLinks,
+        records.workEnvironmentPolicies,
+        scopesHighToLow,
+        (link) => link.workEnvironmentPolicyId
+      );
       const selection = resolveWorkEnvironmentSelection({
         environments: records.workEnvironments,
-        policy: resolveScopedRecord(
-          records.workEnvironmentPolicyScopeLinks,
-          records.workEnvironmentPolicies,
-          scopesHighToLow,
-          (link) => link.workEnvironmentPolicyId
-        ),
+        policy,
         inheritedPolicy: request.inheritedWorkEnvironmentPolicy,
         explicitWorkEnvironmentId: selectedEnvironment?.workEnvironmentId,
         project: request.workspace
       });
+      if (selection.error) {
+        return { ...(selection.active ? { workEnvironmentId: selection.active.id } : {}), error: selection.error };
+      }
       return {
         ...(selection.active ? { workEnvironmentId: selection.active.id } : {}),
-        ...(selection.error ? { error: selection.error } : {})
+        // The same frozen policy compileWithCurrentWorkspace writes into the authority snapshot.
+        policy: {
+          id: policy?.id ?? null,
+          enabled: policy?.enabled ?? false,
+          allowedWorkEnvironmentIds: selection.allowed.map((environment) => environment.id).sort(),
+          defaultWorkEnvironmentId: selection.active?.id ?? null
+        }
       };
     });
   }

@@ -237,6 +237,15 @@ export interface TurnWorkEnvironmentPreview {
   workEnvironmentId?: string;
   /** Why no Turn could start here, in the user's words (the same text compile() would fail with). */
   error?: string;
+  /** Without an error: exactly the `workEnvironmentPolicy` compile() would freeze for such a Turn. */
+  policy?: TurnFrozenWorkEnvironmentPolicy;
+}
+
+export interface TurnFrozenWorkEnvironmentPolicy {
+  id: string | null;
+  enabled: boolean;
+  allowedWorkEnvironmentIds: string[];
+  defaultWorkEnvironmentId: string | null;
 }
 
 export interface TurnExecutionCommand {
@@ -717,7 +726,10 @@ export class TurnControlPlane {
     const previewTurnId = 'turn_maintenance_authority_preview';
     const compiled = sourceTurnId === null
       ? await this.compileCurrentAuthority(conversationId, previewTurnId, 'retry')
-      : await this.inheritTurnAuthority(requireId(sourceTurnId, 'sourceTurnId'), previewTurnId, conversationId, 'retry');
+      : await this.withNextTurnWorkEnvironment(
+          await this.inheritTurnAuthority(requireId(sourceTurnId, 'sourceTurnId'), previewTurnId, conversationId, 'retry'),
+          conversationId
+        );
     const content = compiled.authoritySnapshot.content;
     const text = typeof content === 'string' ? content : Buffer.from(content).toString('utf8');
     return normalizePlainJson(JSON.parse(text) as unknown, 'Maintenance authority preview');
@@ -1844,6 +1856,9 @@ export class TurnControlPlane {
           command.modelOverride,
           command.membership
         );
+    if (plan.runtimeMaintenance && plan.inheritSourceAuthority) {
+      compiled = await this.withNextTurnWorkEnvironment(compiled, conversation.id as string);
+    }
     if (retryRewind) compiled = withRetryLineage(compiled, retryRewind.lineage);
     const now = this.timestamp();
 
@@ -2286,6 +2301,43 @@ export class TurnControlPlane {
       ...(workspace ? { workspace } : {}),
       ...(inheritedWorkEnvironmentPolicy ? { inheritedWorkEnvironmentPolicy } : {})
     });
+  }
+
+  /**
+   * A manual compression keeps its source Turn's frozen model, prompt and compression settings but
+   * runs in the window that accepted the command: its work environment is the one the next Turn
+   * would freeze here (exactly what the entry decision approved), not the source Turn's, which may
+   * be a project folder that has since moved. Without a preview the inherited authority stands.
+   */
+  private async withNextTurnWorkEnvironment(
+    compiled: ReturnType<typeof normalizeCompiledTurnAuthority>,
+    conversationId: string
+  ): Promise<ReturnType<typeof normalizeCompiledTurnAuthority>> {
+    const preview = await this.previewNextTurnWorkEnvironment(conversationId, compiled.executorAgentId);
+    if (!preview) return compiled;
+    if (preview.error) throw new Error(preview.error);
+    if (!preview.policy) return compiled;
+    const content = compiled.authoritySnapshot.content;
+    const text = typeof content === 'string' ? content : Buffer.from(content).toString('utf8');
+    const document = normalizePlainJson(JSON.parse(text) as unknown, 'Maintenance authority');
+    if (!document || typeof document !== 'object' || Array.isArray(document)) {
+      throw new Error('Maintenance authority must be a JSON object.');
+    }
+    return {
+      ...compiled,
+      authoritySnapshot: {
+        ...compiled.authoritySnapshot,
+        content: canonicalPlainJson({
+          ...document,
+          workEnvironmentPolicy: {
+            id: preview.policy.id,
+            enabled: preview.policy.enabled,
+            allowedWorkEnvironmentIds: [...preview.policy.allowedWorkEnvironmentIds],
+            defaultWorkEnvironmentId: preview.policy.defaultWorkEnvironmentId
+          }
+        }, 'Maintenance authority')
+      }
+    };
   }
 
   private async inheritTurnAuthority(
