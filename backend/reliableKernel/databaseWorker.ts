@@ -254,7 +254,9 @@ async function start(): Promise<void> {
       revalidateStatementCaches(writerStatements, readerStatements);
       if (request.kind === 'transaction') {
         assertDatabaseBinding(writer, data.binding);
-        const result = executeTransaction(writer, request.steps, commitSeq + 1n);
+        const result = request.durable
+          ? committedDurably(writer, () => executeTransaction(writer, request.steps, commitSeq + 1n))
+          : executeTransaction(writer, request.steps, commitSeq + 1n);
         commitSeq += 1n;
         post({ type: 'commit', result });
         // Only a reference: the host answers with the commit message's result (cloned once).
@@ -449,6 +451,7 @@ async function start(): Promise<void> {
           readerForeignKeys: BigInt(reader.pragma('foreign_keys', { simple: true }) as number | bigint),
           readerBusyTimeoutMs: BigInt(reader.pragma('busy_timeout', { simple: true }) as number | bigint),
           currentCommitSeq: commitSeq.toString(),
+          durableCommitCount,
           contextCasCache: contextCasCache.inspect(),
           statementCache: {
             writer: writerStatements.inspect(),
@@ -704,6 +707,28 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0;
     })
     .map(({ sequence: _sequence, ...change }) => change);
+}
+
+/** Transactions this worker committed through committedDurably (diagnostics). */
+let durableCommitCount = 0;
+
+/**
+ * One transaction whose commit is on disk when it returns: with synchronous = FULL (checked to be in
+ * effect) SQLite syncs the WAL at that commit. The connection is back to NORMAL afterwards, also when
+ * the transaction failed. Only this connection's pragma changes; no database file is opened here.
+ */
+function committedDurably<T>(database: Database.Database, commit: () => T): T {
+  prepareCached(database, 'PRAGMA synchronous = FULL').run();
+  try {
+    if (BigInt(prepareCached(database, 'PRAGMA synchronous', { rows: 'pluck' }).get() as number | bigint) !== 2n) {
+      throw new Error('SQLite synchronous = FULL is not in effect for a durable transaction.');
+    }
+    const result = commit();
+    durableCommitCount += 1;
+    return result;
+  } finally {
+    prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
+  }
 }
 
 function executeTransaction(

@@ -257,7 +257,8 @@ export interface DatabaseWorkerData {
 }
 
 export type DatabaseWorkerRequestPayload =
-  | { kind: 'transaction'; steps: RepositoryTransactionStep[] }
+  /** `durable`: this commit is synced before the response (see RuntimeDatabase.transaction). */
+  | { kind: 'transaction'; steps: RepositoryTransactionStep[]; durable?: true }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'snapshotAll'; read: RepositoryListRead }
   | { kind: 'toolFactsSnapshot'; toolCallId: string }
@@ -323,6 +324,8 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
   readerForeignKeys: bigint;
   readerBusyTimeoutMs: bigint;
   currentCommitSeq: string;
+  /** Transactions this worker committed with synchronous = FULL on request (`durable`). */
+  durableCommitCount: number;
   /** Bounded verified Context CAS cache counters; metadata only, never content bytes. */
   contextCasCache: {
     entries: number;

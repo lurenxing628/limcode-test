@@ -1244,9 +1244,10 @@ async function mergedMeanwhile(
 /**
  * The final step, under configuration admission and the source's maintenance claim: the source is
  * checked again (no Host, the exact files that were verified), the ledger is read again (another
- * window may have merged it meanwhile), then the committing record and ONE row transaction. Once
- * the transaction committed, that is the outcome: writing the merged record or releasing a claim
- * afterwards can fail only into the log (the next startup converges a committing record).
+ * window may have merged it meanwhile), then the committing record and ONE row transaction, synced
+ * to disk before anything records it as merged. Once the transaction committed, that is the
+ * outcome: writing the merged record or releasing a claim afterwards can fail only into the log
+ * (the next startup converges a committing record).
  */
 async function commitSource(
   paths: { globalStoragePath: string },
@@ -1331,7 +1332,9 @@ async function commitLocked(
   target.backup.used = true;
   await fault(options, 'before-row-commit');
   try {
-    await target.database.transaction(plan.steps);
+    // Synced at its commit (synchronous = FULL for this transaction alone): the merged record written
+    // next, and the commit evidence removed with it, never outlive a merge a power loss takes back.
+    await target.database.transaction(plan.steps, { durable: true });
   } catch (error) {
     // One transaction: measured, it either committed completely (only its reply was lost) or
     // not at all. A proven rollback drops the committing record at once; an unknown outcome

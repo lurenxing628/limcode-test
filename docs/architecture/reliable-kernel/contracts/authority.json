@@ -32,6 +32,7 @@
       "busy_timeout_ms": 5000,
       "foreign_keys": "on-per-connection"
     },
+    "durableCommits": "merge-engine-row-transaction-only-historical-merge-exclusive-fallback-and-relocation-merge-mode-synchronous-full-for-that-commit-then-normal",
     "connectionModel": {
       "writer": "single-dedicated-worker-per-host",
       "reader": "wal-snapshot",

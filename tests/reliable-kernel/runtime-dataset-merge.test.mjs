@@ -1819,6 +1819,45 @@ test('跨模块盲审 #7：合并前备份之前核对剩余空间：不够就�
 });
 
 /** Conversations the ledger records as inserted per target: [targetDataSetId, sorted ids][]. */
+test('盲审 merge #9：合并事务以 synchronous=FULL 提交，落盘之后才写“已合并”，之后回到 NORMAL；事务失败时同样回到 NORMAL，其它事务不受影响', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_current_durable', project: SHARED_PROJECT }]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_durable', project: SHARED_PROJECT }]);
+  const orphan = 'orphan body of the durable merge commit';
+  await ingest(fixture.current, orphan);
+  await ingest(fixture.alpha, orphan);
+  const database = await openTarget(t, fixture.current);
+  const state = async () => {
+    const inspected = await database.inspect();
+    return [inspected.synchronous, inspected.durableCommitCount];
+  };
+  assert.deepEqual(await state(), [1n, 0], '打开当前库时的事务照常是 NORMAL');
+  // The merge transaction fails (a row it reuses is gone): rolled back, deferred, NORMAL again.
+  const failed = await merge(fixture, database, {
+    async onFaultPoint(point) {
+      if (point !== 'before-row-commit') return;
+      // Another process: this one holds the database open (closing a descriptor here would drop its locks).
+      await new Promise((resolve, reject) => execFile(process.execPath, ['-e',
+        "const D = require('better-sqlite3'); const d = new D(process.argv[1]); d.pragma('busy_timeout = 5000');"
+        + " d.prepare('DELETE FROM content_object WHERE sha256 = ?').run(process.argv[2]); d.close();",
+        fixture.current.binding.paths.databasePath, sha256(orphan)], (error) => error ? reject(error) : resolve()));
+    }
+  });
+  assert.match(failed.deferred[0]?.message ?? '', /写入当前库时出错/);
+  assert.deepEqual(await state(), [1n, 0]);
+  // Committed: on disk before the ledger says merged (still committing right after it), then NORMAL.
+  let atCommit;
+  const merged = await merge(fixture, database, {
+    async onFaultPoint(point) {
+      if (point === 'after-row-commit') atCommit = [...await state(), (await readLedgerRecord(fixture, fixture.alpha.id))?.state];
+    }
+  });
+  assert.equal(merged.merged.length, 1);
+  assert.deepEqual(atCommit, [1n, 1, 'committing']);
+  assert.deepEqual(await state(), [1n, 1]);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'merged');
+});
+
 async function mergedInto(fixture) {
   const record = await readLedgerRecord(fixture, fixture.alpha.id);
   return (record?.mergedInto ?? []).map((entry) => [entry.target.dataSetId, [...entry.conversationIds].sort()]);

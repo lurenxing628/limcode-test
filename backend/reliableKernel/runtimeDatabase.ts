@@ -220,8 +220,11 @@ export class RuntimeDatabase {
   /**
    * Resolves with the same RuntimeCommitResult object that the commit listeners received (one
    * structured clone from the worker); the caller and the listeners must treat it as read-only.
+   * `durable`: this commit is synced to disk before the call returns (the writer's synchronous is
+   * FULL for this transaction only, NORMAL again afterwards), for a commit that is recorded as done
+   * outside this database (the historical merge ledger).
    */
-  public async transaction(steps: RepositoryTransactionStep[]): Promise<RuntimeCommitResult> {
+  public async transaction(steps: RepositoryTransactionStep[], options: { durable?: true } = {}): Promise<RuntimeCommitResult> {
     const fence = currentExecutionLeaseFence();
     const fencedSteps = fence
       ? [
@@ -234,7 +237,7 @@ export class RuntimeDatabase {
       : steps;
     return this.requestWithExecutionFence(
       fence,
-      { kind: 'transaction', steps: fencedSteps }
+      { kind: 'transaction', steps: fencedSteps, ...(options.durable ? { durable: true as const } : {}) }
     );
   }
 
