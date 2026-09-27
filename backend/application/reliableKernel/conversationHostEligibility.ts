@@ -1,9 +1,10 @@
 import type { WorkEnvironmentRecord } from '../../../shared/protocol';
 import { workEnvironmentIdFromUri } from '../../../shared/workEnvironmentCatalog';
-import type { ContentAddressedStore } from '../../reliableKernel/contentAddressedStore';
+import type { ContentAddressedStore, ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnosticJournal';
 import { projectFolderForConversation } from '../../reliableKernel/conversationProject';
 import { frozenWorkEnvironmentPolicy, readFrozenTurnAuthority } from '../../reliableKernel/frozenAuthority';
+import { normalizePlainJson } from '../../reliableKernel/plainJson';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { RuntimeDatabase } from '../../reliableKernel/runtimeDatabase';
 import type { TurnWorkEnvironmentPreview } from '../../reliableKernel/turnControlPlane';
@@ -14,7 +15,9 @@ export type ConversationHostEligibilityDecision =
   | {
       eligible: false;
       reason: 'work_environment_unavailable';
-      turnId: string;
+      /** The active Turn (or, for queued input, the queued TurnIntent) that froze it. */
+      turnId?: string;
+      intentId?: string;
       workEnvironmentId: string;
       /** Name and path from this window's catalog, for messages; never the internal id. */
       workEnvironmentLabel?: string;
@@ -29,6 +32,14 @@ export type ConversationHostEligibilityView =
 const PROBE_FAILURE_REPORT_INTERVAL_MS = 60_000;
 const PROBE_FAILURE_REPORT_ENTRIES = 1_000;
 
+/** What the next Turn would be: its executor (a per-message Agent) or the Turn whose authority it inherits. */
+export interface ConversationNextTurnOptions {
+  /** The Agent the new input names; the Conversation's default Agent otherwise. */
+  executorAgentId?: string;
+  /** A runtime continuation inherits this Turn's frozen authority, work environment included. */
+  inheritsFromTurnId?: string;
+}
+
 export interface ConversationHostEligibilityDependencies {
   database: RuntimeDatabase;
   contentStore: ContentAddressedStore;
@@ -36,45 +47,124 @@ export interface ConversationHostEligibilityDependencies {
   workspaceFolderUris(): readonly string[];
   /** This Host's work-environment catalog; workspace-folder `available` is Host-local presence. */
   workEnvironments(): Promise<readonly WorkEnvironmentRecord[]>;
-  /** Frozen default work environment by Turn id (immutable once frozen), shared across probes. */
+  /** Frozen default work environment by Turn or queued TurnIntent id (immutable once frozen), shared across probes. */
   frozenWorkEnvironmentCache?: Map<string, string | null>;
+  /**
+   * The work environment the next Turn would freeze here, resolved like compile() (explicit choice,
+   * inherited boundary, project, scoped policy default); undefined when it cannot be previewed.
+   */
+  nextTurnWorkEnvironment?(
+    conversationId: string,
+    options?: Pick<ConversationNextTurnOptions, 'executorAgentId'>
+  ): Promise<TurnWorkEnvironmentPreview | undefined>;
 }
 
 const FROZEN_WORK_ENVIRONMENT_CACHE_ENTRIES = 1_000;
 
+/** One piece of execution work and the default work environment its authority froze. */
+interface PlacedWork {
+  turnId?: string;
+  intentId?: string;
+  workEnvironmentId: string | undefined;
+}
+
 /**
  * Decides whether this Host may take over a Conversation's background work from committed facts.
- * Every active Turn's frozen default work environment must be available here (the same condition
- * tool dispatch enforces), and the primary ProjectContext folder must be open here, unless every
- * active Turn froze a work environment other than the project's own: that Turn was started in a
- * work environment the user chose (for example after the project folder moved), which is then its
- * placement. A Conversation without a project link and without a frozen default environment has
- * no durable placement fact, so every Host remains eligible for it.
+ * The work is every active Turn and every queued TurnIntent; each froze its authority, work
+ * environment included, when it was created. Each must be placeable here: a frozen work environment
+ * other than the project's own (one the user chose, for example after the project folder moved)
+ * only needs to be available here; the project's own work environment, or none, also needs the
+ * project folder open here. An idle Conversation is served where its project folder is open, or,
+ * when that folder is not open here, where its next Turn could start (the work environment chosen
+ * for it is available here). A Conversation without a project link and without frozen work
+ * environments has no durable placement fact, so every Host remains eligible for it.
  */
 export async function evaluateConversationHostEligibility(
   dependencies: ConversationHostEligibilityDependencies,
   conversationId: string
 ): Promise<ConversationHostEligibilityDecision> {
   const project = await projectFolderForConversation(dependencies.database, conversationId);
-  const activeTurns = await listAllDomainRows(dependencies.database, 'Turn', {
-    conversation_id: conversationId,
-    status: 'active'
+  const work = await frozenConversationWork(dependencies, conversationId);
+  if (work.length > 0) return placementEligibility(dependencies, project, work);
+  if (!project || dependencies.workspaceFolderUris().includes(project.uri)) return { eligible: true };
+  const next = await dependencies.nextTurnWorkEnvironment?.(conversationId);
+  if (next?.workEnvironmentId !== undefined && !next.error) return { eligible: true };
+  return { eligible: false, reason: 'project_not_open', projectUri: project.uri, projectName: project.name };
+}
+
+export interface ConversationEntryEligibilityDependencies extends ConversationHostEligibilityDependencies {
+  /** The work environment the next Turn would freeze here; undefined when it cannot be previewed. */
+  nextTurnWorkEnvironment(
+    conversationId: string,
+    options?: Pick<ConversationNextTurnOptions, 'executorAgentId'>
+  ): Promise<TurnWorkEnvironmentPreview | undefined>;
+}
+
+/**
+ * Whether new input, retry, edit-and-run, compression or a runtime continuation may start a Turn in
+ * this window, judged by the work environment that Turn will freeze. While the Conversation has an
+ * active Turn or queued input, that work must also be placeable here (evaluateConversationHostEligibility).
+ * A runtime continuation inherits its source Turn's frozen work environment; any other new Turn
+ * freezes what compile() resolves now, including a work environment the user chose in this window,
+ * even when the project folder moved.
+ */
+export async function evaluateConversationEntryEligibility(
+  dependencies: ConversationEntryEligibilityDependencies,
+  conversationId: string,
+  options: ConversationNextTurnOptions = {}
+): Promise<ConversationHostEligibilityDecision> {
+  const project = await projectFolderForConversation(dependencies.database, conversationId);
+  const work = await frozenConversationWork(dependencies, conversationId);
+  if (options.inheritsFromTurnId) {
+    const turnId = options.inheritsFromTurnId;
+    return placementEligibility(dependencies, project, [
+      ...work,
+      { turnId, workEnvironmentId: await frozenDefaultWorkEnvironment(dependencies, turnId) }
+    ]);
+  }
+  if (work.length > 0) return placementEligibility(dependencies, project, work);
+  const next = await dependencies.nextTurnWorkEnvironment(conversationId, {
+    ...(options.executorAgentId ? { executorAgentId: options.executorAgentId } : {})
   });
-  const frozen: Array<{ turnId: string; workEnvironmentId: string | undefined }> = [];
+  if (!next) return evaluateConversationHostEligibility(dependencies, conversationId);
+  if (next.error) return { eligible: false, reason: 'next_work_environment_unavailable', message: next.error };
+  return { eligible: true };
+}
+
+/** Active Turns and queued TurnIntents with the default work environment each froze. */
+async function frozenConversationWork(
+  dependencies: ConversationHostEligibilityDependencies,
+  conversationId: string
+): Promise<PlacedWork[]> {
+  const [activeTurns, queuedIntents] = await Promise.all([
+    listAllDomainRows(dependencies.database, 'Turn', { conversation_id: conversationId, status: 'active' }),
+    listAllDomainRows(dependencies.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued', turn_id: null })
+  ]);
+  const work: PlacedWork[] = [];
   for (const turn of activeTurns) {
     const turnId = requireId(turn.id, 'Turn.id');
-    frozen.push({ turnId, workEnvironmentId: await frozenDefaultWorkEnvironment(dependencies, turnId) });
+    work.push({ turnId, workEnvironmentId: await frozenDefaultWorkEnvironment(dependencies, turnId) });
   }
+  for (const intent of queuedIntents) {
+    const intentId = requireId(intent.id, 'TurnIntent.id');
+    work.push({ intentId, workEnvironmentId: await queuedIntentWorkEnvironment(dependencies, intentId) });
+  }
+  return work;
+}
+
+async function placementEligibility(
+  dependencies: ConversationHostEligibilityDependencies,
+  project: { uri: string; name: string } | undefined,
+  work: readonly PlacedWork[]
+): Promise<ConversationHostEligibilityDecision> {
   if (project && !dependencies.workspaceFolderUris().includes(project.uri)) {
     const projectEnvironmentId = workEnvironmentIdFromUri(project.uri);
-    const placedElsewhere = frozen.length > 0 && frozen.every((turn) =>
-      turn.workEnvironmentId !== undefined && turn.workEnvironmentId !== projectEnvironmentId);
-    if (!placedElsewhere) {
+    if (work.some((item) => item.workEnvironmentId === undefined || item.workEnvironmentId === projectEnvironmentId)) {
       return { eligible: false, reason: 'project_not_open', projectUri: project.uri, projectName: project.name };
     }
   }
   let environments: readonly WorkEnvironmentRecord[] | undefined;
-  for (const { turnId, workEnvironmentId } of frozen) {
+  for (const { turnId, intentId, workEnvironmentId } of work) {
     if (!workEnvironmentId) continue;
     environments ??= await dependencies.workEnvironments();
     const environment = environments.find((candidate) => candidate.id === workEnvironmentId);
@@ -83,40 +173,13 @@ export async function evaluateConversationHostEligibility(
       return {
         eligible: false,
         reason: 'work_environment_unavailable',
-        turnId,
+        ...(turnId ? { turnId } : {}),
+        ...(intentId ? { intentId } : {}),
         workEnvironmentId,
         ...(label ? { workEnvironmentLabel: label } : {})
       };
     }
   }
-  return { eligible: true };
-}
-
-export interface ConversationEntryEligibilityDependencies extends ConversationHostEligibilityDependencies {
-  /** The work environment the next Turn would freeze here; undefined when it cannot be previewed. */
-  nextTurnWorkEnvironment(conversationId: string): Promise<TurnWorkEnvironmentPreview | undefined>;
-}
-
-/**
- * Whether new input, retry, edit-and-run or compression may start a Turn in this window. While the
- * Conversation has an active Turn or queued input, that work decides (evaluateConversationHostEligibility).
- * An idle Conversation may start wherever the work environment its next Turn would freeze is
- * available, including one the user chose in this window, even when the project folder moved.
- */
-export async function evaluateConversationEntryEligibility(
-  dependencies: ConversationEntryEligibilityDependencies,
-  conversationId: string
-): Promise<ConversationHostEligibilityDecision> {
-  const [activeTurns, queuedIntents] = await Promise.all([
-    listAllDomainRows(dependencies.database, 'Turn', { conversation_id: conversationId, status: 'active' }),
-    listAllDomainRows(dependencies.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued' })
-  ]);
-  if (activeTurns.length > 0 || queuedIntents.length > 0) {
-    return evaluateConversationHostEligibility(dependencies, conversationId);
-  }
-  const next = await dependencies.nextTurnWorkEnvironment(conversationId);
-  if (!next) return evaluateConversationHostEligibility(dependencies, conversationId);
-  if (next.error) return { eligible: false, reason: 'next_work_environment_unavailable', message: next.error };
   return { eligible: true };
 }
 
@@ -137,11 +200,42 @@ async function frozenDefaultWorkEnvironment(
     requireId(snapshots[0].id, 'AuthoritySnapshot.id'),
     turnId
   )).document)?.defaultWorkEnvironmentId ?? null;
-  if (cache) {
-    if (cache.size >= FROZEN_WORK_ENVIRONMENT_CACHE_ENTRIES) cache.clear();
-    cache.set(turnId, workEnvironmentId);
-  }
+  rememberFrozen(cache, turnId, workEnvironmentId);
   return workEnvironmentId ?? undefined;
+}
+
+/** A queued TurnIntent froze its authority when it was queued (TurnIntentAuthorityRevision). */
+async function queuedIntentWorkEnvironment(
+  dependencies: ConversationHostEligibilityDependencies,
+  intentId: string
+): Promise<string | undefined> {
+  const cacheKey = `intent:${intentId}`;
+  const cache = dependencies.frozenWorkEnvironmentCache;
+  const cached = cache?.get(cacheKey);
+  if (cached !== undefined) return cached ?? undefined;
+  const revisions = await listAllDomainRows(dependencies.database, 'TurnIntentAuthorityRevision', { intent_id: intentId });
+  if (revisions.length > 1) throw new Error(`TurnIntent ${intentId} must have at most one frozen authority.`);
+  if (revisions.length === 0) return undefined;
+  const objects = await listAllDomainRows(dependencies.database, 'ContentObject', {
+    id: requireId(revisions[0].authority_object_id, 'TurnIntentAuthorityRevision.authority_object_id')
+  });
+  if (objects.length !== 1) throw new Error(`TurnIntent ${intentId} frozen authority content is missing.`);
+  let document: unknown;
+  try {
+    document = JSON.parse((await dependencies.contentStore.read(objects[0] as ContentObjectMetadata)).toString('utf8'));
+  } catch (error) {
+    throw new Error(`TurnIntent ${intentId} frozen authority is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const workEnvironmentId = frozenWorkEnvironmentPolicy(normalizePlainJson(document, `TurnIntent ${intentId} authority`))
+    ?.defaultWorkEnvironmentId ?? null;
+  rememberFrozen(cache, cacheKey, workEnvironmentId);
+  return workEnvironmentId ?? undefined;
+}
+
+function rememberFrozen(cache: Map<string, string | null> | undefined, key: string, value: string | null): void {
+  if (!cache) return;
+  if (cache.size >= FROZEN_WORK_ENVIRONMENT_CACHE_ENTRIES) cache.clear();
+  cache.set(key, value);
 }
 
 function workEnvironmentLabel(environment: WorkEnvironmentRecord): string | undefined {

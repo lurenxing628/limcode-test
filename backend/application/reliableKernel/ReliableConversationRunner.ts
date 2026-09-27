@@ -166,6 +166,17 @@ export interface ReliableManualCompressionDriveResult {
   compression?: CoordinateCompressionResult;
 }
 
+/** What a new Turn would be: see ConversationNextTurnOptions in conversationHostEligibility. */
+export interface ConversationEntryOptions {
+  executorAgentId?: string;
+  inheritsFromTurnId?: string;
+}
+
+export type ConversationEntryEligibilityProbe = (
+  conversationId: string,
+  options?: ConversationEntryOptions
+) => Promise<ConversationRuntimeExecutionEligibility>;
+
 export type ReliableConversationRunnerErrorHandler = (
   error: unknown,
   context: {
@@ -184,7 +195,8 @@ export class ReliableConversationRunner {
   private readonly admissions = new Map<string, AdmissionSlot>();
   private readonly waitingOwned = new Map<string, WaitingOwnedTurn>();
   private readonly deferredRecovery = new Map<string, DeferredRecoveryTurn>();
-  private entryEligibility: ((conversationId: string) => Promise<ConversationRuntimeExecutionEligibility>) | undefined;
+  private entryEligibility: ConversationEntryEligibilityProbe | undefined;
+  private readonly admissionRetries = new Map<string, { failures: number; timer?: NodeJS.Timeout }>();
   private unheldScanAt = 0;
   private unheldScanTimer: NodeJS.Timeout | undefined;
   private unheldScanTask: Promise<void> | undefined;
@@ -222,7 +234,7 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    await this.requireExecutionHost(input.conversationId);
+    await this.requireExecutionHost(input.conversationId, executorOption(input.agentId));
     return this.conversationOwners.run(input.conversationId, async () => {
       const content = serializeUserContent(input.text, input.content);
       const command: TurnInputCommand = {
@@ -331,7 +343,7 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    await this.requireExecutionHost(input.conversationId);
+    await this.requireExecutionHost(input.conversationId, executorOption(input.agentId));
     return this.conversationOwners.run(input.conversationId, async () => {
       const command: TurnRetryCommand = {
         source: { kind: 'command', key: input.commandId },
@@ -362,7 +374,7 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    await this.requireExecutionHost(input.conversationId);
+    await this.requireExecutionHost(input.conversationId, executorOption(input.agentId));
     return this.conversationOwners.run(input.conversationId, async () => {
       const content = serializeUserContent(input.text, input.content);
       const command: TurnEditAndRunCommand = {
@@ -417,7 +429,11 @@ export class ReliableConversationRunner {
     sourceTurnId: string | null;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    await this.requireExecutionHost(input.conversationId);
+    // A continuation with a source Turn inherits that Turn's frozen work environment.
+    await this.requireExecutionHost(
+      input.conversationId,
+      input.sourceTurnId === null ? {} : { inheritsFromTurnId: input.sourceTurnId }
+    );
     return this.conversationOwners.run(input.conversationId, async () => {
       const command: TurnRuntimeContinuationCommand = {
         source: { kind: 'internal', key: input.commandId },
@@ -2013,15 +2029,34 @@ export class ReliableConversationRunner {
    * Installs how new input decides whether it may start a Turn here (see
    * evaluateConversationEntryEligibility); by default it is the Conversation's execution eligibility.
    */
-  public setEntryEligibility(probe: (conversationId: string) => Promise<ConversationRuntimeExecutionEligibility>): void {
+  public setEntryEligibility(probe: ConversationEntryEligibilityProbe): void {
     this.entryEligibility = probe;
   }
 
+  /**
+   * Whether a runtime delivery's continuation may start here: the same entry decision its admission
+   * makes (runtimeContinuation), judged by the work environment that Turn will freeze — the source
+   * Turn's when it inherits one (null: a collaboration continuation compiles current settings).
+   */
+  public continuationEligibility(
+    conversationId: string,
+    sourceTurnId: string | null
+  ): Promise<ConversationRuntimeExecutionEligibility> {
+    return this.entryDecision(conversationId, sourceTurnId === null ? {} : { inheritsFromTurnId: sourceTurnId });
+  }
+
+  private async entryDecision(
+    conversationId: string,
+    options: ConversationEntryOptions
+  ): Promise<ConversationRuntimeExecutionEligibility> {
+    return this.entryEligibility
+      ? this.entryEligibility(conversationId, options)
+      : this.conversationOwners.executionEligibility(conversationId);
+  }
+
   /** Execution commands (new input, retry, edit, continuation, compression) need a serving Host. */
-  private async requireExecutionHost(conversationId: string): Promise<void> {
-    const eligibility = this.entryEligibility
-      ? await this.entryEligibility(conversationId)
-      : await this.conversationOwners.executionEligibility(conversationId);
+  private async requireExecutionHost(conversationId: string, options: ConversationEntryOptions = {}): Promise<void> {
+    const eligibility = await this.entryDecision(conversationId, options);
     if (eligibility !== 'eligible') throw new ConversationHostIneligibleError(conversationId, eligibility);
   }
 
@@ -2451,4 +2486,8 @@ function defaultErrorHandler(
       (error as { terminalError?: unknown }).terminalError
     );
   }
+}
+
+function executorOption(agentId: string | undefined): ConversationEntryOptions {
+  return agentId?.trim() ? { executorAgentId: agentId.trim() } : {};
 }

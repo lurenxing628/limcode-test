@@ -226,9 +226,13 @@ export class VscodeReliableKernelCommandRouter {
    * Conversation starts wherever its next Turn's work environment is available (see
    * evaluateConversationEntryEligibility), so a moved project continues after choosing one here.
    */
-  private async requireExecutionHost(conversationId: string): Promise<void> {
+  private async requireExecutionHost(conversationId: string, agentId?: string): Promise<void> {
+    // A message that names its own Agent is judged by that Agent's work-environment settings.
     const view = this.product.conversationEntryEligibility
-      ? await this.product.conversationEntryEligibility(conversationId)
+      ? await this.product.conversationEntryEligibility(
+          conversationId,
+          agentId?.trim() ? { executorAgentId: agentId.trim() } : undefined
+        )
       : await this.conversationHostEligibility(conversationId);
     if (!view || view.eligible) return;
     throw new ConversationHostIneligibleError(
@@ -1224,7 +1228,7 @@ export class VscodeReliableKernelCommandRouter {
     requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue,
     payload: TurnStartPayload
   ): Promise<void> {
-    await this.requireExecutionHost(payload.conversationId);
+    await this.requireExecutionHost(payload.conversationId, payload.agentId);
     await this.runConversationCommand(payload.conversationId, () =>
       this.handleTurnInputUnderOwnership(webview, correlationId, requestType, payload));
   }
@@ -1536,7 +1540,7 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: MessageEditPayload
   ): Promise<void> {
-    if (payload.runAfterEdit) await this.requireExecutionHost(payload.conversationId);
+    if (payload.runAfterEdit) await this.requireExecutionHost(payload.conversationId, payload.agentId);
     await this.runConversationCommand(payload.conversationId, () =>
       this.handleMessageEditUnderOwnership(webview, correlationId, payload));
   }
@@ -1655,7 +1659,7 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: MessageRetryFromPayload
   ): Promise<void> {
-    await this.requireExecutionHost(payload.conversationId);
+    await this.requireExecutionHost(payload.conversationId, payload.agentId);
     await this.runConversationCommand(payload.conversationId, () =>
       this.handleMessageRetryUnderOwnership(webview, correlationId, payload));
   }

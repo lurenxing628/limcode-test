@@ -2258,7 +2258,10 @@ export class TurnControlPlane {
    * from the same inputs compile() receives (default Agent, project, a child's inherited boundary).
    * Undefined when the compiler cannot preview or the Conversation has no default Agent.
    */
-  public async previewNextTurnWorkEnvironment(conversationIdInput: string): Promise<TurnWorkEnvironmentPreview | undefined> {
+  public async previewNextTurnWorkEnvironment(
+    conversationIdInput: string,
+    executorAgentIdInput?: string
+  ): Promise<TurnWorkEnvironmentPreview | undefined> {
     const conversationId = requireId(conversationIdInput, 'conversationId');
     if (!this.authorityCompiler.previewWorkEnvironment) return undefined;
     const [agents, workspace, children] = await Promise.all([
@@ -2266,7 +2269,7 @@ export class TurnControlPlane {
       projectFolderForConversation(this.database, conversationId),
       this.listRows('ChildExecution', { child_conversation_id: conversationId }, 2)
     ]);
-    if (agents.length !== 1 || children.length > 1) return undefined;
+    if ((!executorAgentIdInput && agents.length !== 1) || children.length > 1) return undefined;
     const inheritedWorkEnvironmentPolicy = children[0]
       ? await readChildExecutionWorkEnvironmentBoundary(
           this.database,
@@ -2276,7 +2279,10 @@ export class TurnControlPlane {
       : undefined;
     return this.authorityCompiler.previewWorkEnvironment({
       conversationId,
-      executorAgentId: requireId(agents[0].agent_id, 'AgentConversationLink.agent_id'),
+      // A per-message Agent (or an inherited executor) resolves its own scoped work-environment policy.
+      executorAgentId: executorAgentIdInput
+        ? requireId(executorAgentIdInput, 'executorAgentId')
+        : requireId(agents[0].agent_id, 'AgentConversationLink.agent_id'),
       ...(workspace ? { workspace } : {}),
       ...(inheritedWorkEnvironmentPolicy ? { inheritedWorkEnvironmentPolicy } : {})
     });

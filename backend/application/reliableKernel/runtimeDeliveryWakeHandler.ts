@@ -32,10 +32,16 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
       return { acknowledged: true };
     }
     // Everything below executes the Conversation. A Host that does not serve it leaves the durable
-    // delivery pending for the Host that does.
-    if (await application.database.conversationOwners.executionEligibility(request.conversationId) !== 'eligible') {
-      return { acknowledged: false };
-    }
+    // delivery pending for the Host that does. A continuation is judged like its admission: by the
+    // work environment the new Turn will freeze (its source Turn's when it inherits one), so an idle
+    // Conversation whose project moved continues where that work environment is available.
+    const eligibility = request.action === 'resume_current_turn'
+      ? await application.database.conversationOwners.executionEligibility(request.conversationId)
+      : await runner.continuationEligibility(
+          request.conversationId,
+          request.sourceKind === 'collaboration_message' ? null : request.sourceTurnId
+        );
+    if (eligibility !== 'eligible') return { acknowledged: false };
     await dependencies.ready?.();
     if (request.action === 'resume_current_turn') {
       if (!request.targetTurnId) return { acknowledged: false };
