@@ -255,6 +255,34 @@ export interface DatabaseWorkerData {
   mode: 'initialize' | 'runtime';
   binding: RootBinding;
   hostBootId: string;
+  /**
+   * A private instance opened offline for maintenance (RuntimeDatabase.open `maintenance`): only it
+   * accepts the maintenance transaction requests.
+   */
+  maintenance?: true;
+}
+
+/**
+ * Answer of `maintenanceCommit`. The transaction's changes are not read back or projected (a
+ * maintenance instance has no commit listeners): anything that shows this database must take a new
+ * snapshot. Allocated writer sequences are only counted.
+ */
+export interface RuntimeMaintenanceCommitResult {
+  commitSeq: string;
+  snapshotRequired: true;
+  allocatedSequences: number;
+}
+
+/** Answer of `maintenanceRollback`: false when no maintenance transaction was open (already rolled back). */
+export interface RuntimeMaintenanceRollbackResult {
+  rolledBack: boolean;
+}
+
+/** Answer of `maintenanceCheckpoint`: SQLite's wal_checkpoint(TRUNCATE) row. */
+export interface RuntimeWalCheckpointResult {
+  busy: number;
+  log: number;
+  checkpointed: number;
 }
 
 export type DatabaseWorkerRequestPayload =
@@ -287,6 +315,18 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'countDomainRows' }
   /** Consistent SQLite Backup API copy of the live database into its own control root. */
   | { kind: 'backupDatabase'; destinationPath: string }
+  /**
+   * One write transaction over several requests, only on a maintenance instance (see
+   * DatabaseWorkerData.maintenance): begun with synchronous = FULL, steps appended in chunks under
+   * the ordinary insert invariants, the touched ModelRequest aggregates asserted once at the commit,
+   * no changes read back. While it is open every other write request is refused; a failed append
+   * rolls the whole transaction back. `maintenanceCheckpoint` runs wal_checkpoint(TRUNCATE) outside it.
+   */
+  | { kind: 'maintenanceBegin' }
+  | { kind: 'maintenanceAppend'; steps: RepositoryTransactionStep[] }
+  | { kind: 'maintenanceCommit' }
+  | { kind: 'maintenanceRollback' }
+  | { kind: 'maintenanceCheckpoint' }
   | { kind: 'inspect' }
   | { kind: 'close' };
 
@@ -347,7 +387,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

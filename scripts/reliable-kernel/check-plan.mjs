@@ -259,6 +259,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-dataset-bulk-copy.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-full-runtime.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-crash-child.mjs',
+  'tests/reliable-kernel/fixtures/runtime-merge-fixture.mjs',
+  'tests/reliable-kernel/runtime-maintenance-transaction.test.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance.test.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance-windows.test.mjs',
   'tests/reliable-kernel/runtime-write-freeze.test.mjs',

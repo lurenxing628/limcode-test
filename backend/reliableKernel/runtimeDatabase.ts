@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { Worker } from 'node:worker_threads';
+import { Worker, type ResourceLimits } from 'node:worker_threads';
 import type { RelocatedWorkInventory } from './relocatedWorkInventory';
 import { registerInProcessSqliteDatabase } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import {
@@ -38,6 +38,9 @@ import type {
   ProcessOutputRegistrationMismatch,
   DatabaseWorkerRequestPayload,
   DatabaseWorkerResponse,
+  RuntimeMaintenanceCommitResult,
+  RuntimeMaintenanceRollbackResult,
+  RuntimeWalCheckpointResult,
   SerializedWorkerError,
   ToolFactsSnapshot
 } from './databaseWorkerProtocol';
@@ -56,6 +59,8 @@ import {
   ConversationRuntimeOwnerReleasedError
 } from './ConversationRuntimeOwnerManager';
 import {
+  assertRuntimeHostsOffline,
+  isRuntimeMaintenanceHeld,
   runtimeHostLivenessDirectory,
   withRuntimeMaintenance
 } from './runtimeHostControl';
@@ -149,7 +154,9 @@ export class RuntimeDatabase {
     private readonly worker: Worker,
     public readonly workerThreadId: number,
     private readonly registryKey: string,
-    initialPerformanceMetrics?: RuntimePerformanceMetricsSink
+    initialPerformanceMetrics?: RuntimePerformanceMetricsSink,
+    /** Opened offline for maintenance: a private instance without commit listeners (see open). */
+    public readonly maintenance = false
   ) {
     if (initialPerformanceMetrics) this.performanceMetricSinks.add(initialPerformanceMetrics);
     this.conversationOwners = new ConversationRuntimeOwnerManager(binding, hostBootId);
@@ -185,18 +192,36 @@ export class RuntimeDatabase {
    */
   public static async open(
     authority: RootAuthority,
-    options: { hostBootId?: string; performanceMetrics?: RuntimePerformanceMetricsSink } = {}
+    options: {
+      hostBootId?: string;
+      performanceMetrics?: RuntimePerformanceMetricsSink;
+      /**
+       * A private offline instance for maintenance transactions (see maintenanceBegin): the caller
+       * holds this root's maintenance claim for as long as it is open, and no other Host may be on it.
+       * It never has commit listeners.
+       */
+      maintenance?: true;
+      /** Worker heap limits (e.g. a test bounding a maintenance worker). */
+      resourceLimits?: ResourceLimits;
+    } = {}
   ): Promise<RuntimeDatabase> {
     const hostBootId = options.hostBootId ?? randomUUID();
+    if (options.maintenance && !isRuntimeMaintenanceHeld(authority.expectedPaths())) {
+      throw new Error('A maintenance Runtime database is opened only while its caller holds the root maintenance claim.');
+    }
     // Selection, pointer recovery and registration all join admission before scope maintenance.
     return authority.withRuntimeHostAdmission(() => withRuntimeMaintenance(authority.expectedPaths(), async () => {
       const binding = await authority.current();
+      if (options.maintenance) await assertRuntimeHostsOffline(binding.paths);
       const registryKey = binding.paths.rootPointerPath;
       if (OPEN_ROOT_POINTERS.has(registryKey)) {
         throw new Error(`A Runtime database worker is already open for ${registryKey}.`);
       }
       OPEN_ROOT_POINTERS.set(registryKey, hostBootId);
-      const worker = createWorker({ mode: 'runtime', binding, hostBootId });
+      const worker = createWorker(
+        { mode: 'runtime', binding, hostBootId, ...(options.maintenance ? { maintenance: true as const } : {}) },
+        options.resourceLimits
+      );
       try {
         const ready = await waitForReady(worker, 'runtime');
         const database = new RuntimeDatabase(
@@ -206,7 +231,8 @@ export class RuntimeDatabase {
           worker,
           ready.workerThreadId,
           registryKey,
-          options.performanceMetrics
+          options.performanceMetrics,
+          options.maintenance === true
         );
         await database.registerHostLiveness();
         return database;
@@ -240,6 +266,46 @@ export class RuntimeDatabase {
       fence,
       { kind: 'transaction', steps: fencedSteps, ...(options.durable ? { durable: true as const } : {}) }
     );
+  }
+
+  /**
+   * Maintenance transaction of a private offline instance (open `maintenance`, no commit listeners):
+   * one write transaction over several requests, begun with synchronous = FULL. Steps are appended in
+   * chunks under the ordinary insert invariants; the ModelRequest aggregates they touch are asserted
+   * once, at the commit. While it is open this database refuses every other write, and a failed append
+   * rolls all of it back. The commit reads no changes back (the result says a snapshot is required).
+   */
+  public async maintenanceBegin(): Promise<void> {
+    this.assertMaintenanceInstance();
+    await this.request<null>({ kind: 'maintenanceBegin' });
+  }
+
+  public async maintenanceAppend(steps: RepositoryTransactionStep[]): Promise<void> {
+    this.assertMaintenanceInstance();
+    await this.request<null>({ kind: 'maintenanceAppend', steps });
+  }
+
+  /** Synced to disk when it returns (synchronous = FULL for this transaction, NORMAL again afterwards). */
+  public async maintenanceCommit(): Promise<RuntimeMaintenanceCommitResult> {
+    this.assertMaintenanceInstance();
+    return this.request<RuntimeMaintenanceCommitResult>({ kind: 'maintenanceCommit' });
+  }
+
+  /** Rolls the open maintenance transaction back; `rolledBack` is false when none was open. */
+  public async maintenanceRollback(): Promise<RuntimeMaintenanceRollbackResult> {
+    this.assertMaintenanceInstance();
+    return this.request<RuntimeMaintenanceRollbackResult>({ kind: 'maintenanceRollback' });
+  }
+
+  /** wal_checkpoint(TRUNCATE) outside a maintenance transaction: the WAL is written back and emptied. */
+  public async maintenanceCheckpoint(): Promise<RuntimeWalCheckpointResult> {
+    this.assertMaintenanceInstance();
+    return this.request<RuntimeWalCheckpointResult>({ kind: 'maintenanceCheckpoint' });
+  }
+
+  private assertMaintenanceInstance(): void {
+    if (!this.maintenance) throw new Error('Maintenance transactions run only on a Runtime database opened for maintenance.');
+    if (this.commitListeners.size > 0) throw new Error('Maintenance transactions run only on a Runtime database without commit listeners.');
   }
 
   public async snapshot(
@@ -480,8 +546,13 @@ export class RuntimeDatabase {
 
   /** The listener receives the object a committed transaction() also resolves with; read-only. */
   public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
+    this.refuseCommitListenerOnMaintenance();
     this.commitListeners.add(listener);
     return () => this.commitListeners.delete(listener);
+  }
+
+  private refuseCommitListenerOnMaintenance(): void {
+    if (this.maintenance) throw new Error('A maintenance Runtime database has no commit listeners.');
   }
 
   /** Present only while an explicitly attached development observer exists. */
@@ -504,6 +575,7 @@ export class RuntimeDatabase {
     readBarrier: () => Promise<SnapshotBarrier<T>>,
     onCommit: (result: RuntimeCommitResult) => void
   ): Promise<SnapshotSubscription<T>> {
+    this.refuseCommitListenerOnMaintenance();
     const buffered: RuntimeCommitResult[] = [];
     let live = false;
     const listener = (result: RuntimeCommitResult) => {
@@ -949,10 +1021,10 @@ async function initializeBindingStorage(binding: RootBinding): Promise<void> {
  * The worker's SQLite locks belong to this whole process, so while it runs the in-process file
  * entry points refuse its database files under any name (sqliteDatabaseFileGuard).
  */
-function createWorker(data: DatabaseWorkerData): Worker {
+function createWorker(data: DatabaseWorkerData, resourceLimits?: ResourceLimits): Worker {
   const release = registerInProcessSqliteDatabase(data.binding.paths.databasePath);
   try {
-    const worker = new Worker(path.join(__dirname, 'databaseWorker.js'), { workerData: data });
+    const worker = new Worker(path.join(__dirname, 'databaseWorker.js'), { workerData: data, ...(resourceLimits ? { resourceLimits } : {}) });
     worker.once('exit', release);
     return worker;
   } catch (error) {
@@ -1008,7 +1080,9 @@ function databaseMetricRequestKind(
   // The conversation pending-work probe, the domain row count and the carried-work inventory are one
   // fixed worker read snapshot each.
   if (kind === 'conversationRuntimeWork' || kind === 'countDomainRows' || kind === 'relocatedWorkInventory') return 'snapshot';
-  return kind;
+  // A maintenance transaction's requests are parts of one write transaction.
+  if (kind.startsWith('maintenance')) return 'transaction';
+  return kind as RuntimeDatabaseMetricRequestKind;
 }
 
 async function readHostLiveness(filePath: string): Promise<RuntimeHostLivenessRecord | undefined> {

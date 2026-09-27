@@ -68,6 +68,8 @@ import {
   type ModelRequestCancelInput,
   type ModelRequestCancelResult,
   type ProcessOutputRegistrationMismatch,
+  type RuntimeMaintenanceCommitResult,
+  type RuntimeWalCheckpointResult,
   type SerializedWorkerError,
   type ToolFactsSnapshot
 } from './databaseWorkerProtocol';
@@ -231,11 +233,14 @@ async function start(): Promise<void> {
   configureTransactionChangeCapture(writer);
   const reader = new Database(toSqliteFilePath(data.binding.paths.databasePath), { readonly: true, fileMustExist: true });
   configureReaderConnection(reader);
+  if (data.maintenance === true) configureMaintenanceConnections(writer, reader);
   // Prepared statements live exactly as long as these two connections of this worker.
   const writerStatements = attachRuntimeStatementCache(writer);
   const readerStatements = attachRuntimeStatementCache(reader);
   let commitSeq = 0n;
   let closed = false;
+  /** The open maintenance transaction of a maintenance instance (see DatabaseWorkerData.maintenance). */
+  let maintenance: MaintenanceTransaction | undefined;
   const contextCasCache = new VerifiedContextCasCache();
   const conversationRuntimeWork = createConversationRuntimeWorkProbe(reader);
 
@@ -253,6 +258,51 @@ async function start(): Promise<void> {
     ) => postMeasuredResponse(response, request, receivedAtMs, measurement.writeLock, transferList);
     try {
       revalidateStatementCaches(writerStatements, readerStatements);
+      if (maintenance && MAINTENANCE_EXCLUSIVE_WRITES.has(request.kind)) {
+        throw new Error(`A maintenance transaction is open on this Runtime database; ${request.kind} is refused until it ends.`);
+      }
+      if (request.kind.startsWith('maintenance') && data.maintenance !== true) {
+        throw new Error('Maintenance transactions run only on a Runtime database opened for maintenance.');
+      }
+      if (request.kind === 'maintenanceBegin') {
+        assertDatabaseBinding(writer, data.binding);
+        maintenance = beginMaintenanceTransaction(writer);
+        respond({ type: 'response', id: request.id, ok: true, result: null });
+        return;
+      }
+      if (request.kind === 'maintenanceAppend') {
+        const open = requireMaintenanceTransaction(maintenance);
+        try {
+          appendMaintenanceSteps(writer, open, request.steps);
+        } catch (error) {
+          // One source, one transaction: a failed chunk ends all of it.
+          maintenance = undefined;
+          rollbackMaintenanceTransaction(writer);
+          throw error;
+        }
+        respond({ type: 'response', id: request.id, ok: true, result: null });
+        return;
+      }
+      if (request.kind === 'maintenanceCommit') {
+        const open = requireMaintenanceTransaction(maintenance);
+        maintenance = undefined;
+        const result = commitMaintenanceTransaction(writer, open, commitSeq + 1n);
+        commitSeq += 1n;
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'maintenanceRollback') {
+        const rolledBack = maintenance !== undefined;
+        maintenance = undefined;
+        if (rolledBack) rollbackMaintenanceTransaction(writer);
+        respond({ type: 'response', id: request.id, ok: true, result: { rolledBack } });
+        return;
+      }
+      if (request.kind === 'maintenanceCheckpoint') {
+        if (maintenance) throw new Error('A WAL checkpoint cannot run while the maintenance transaction is open.');
+        respond({ type: 'response', id: request.id, ok: true, result: truncateWal(writer) });
+        return;
+      }
       if (request.kind === 'transaction') {
         assertDatabaseBinding(writer, data.binding);
         const result = request.durable
@@ -468,6 +518,10 @@ async function start(): Promise<void> {
         return;
       }
       assertDatabaseBinding(writer, data.binding);
+      if (maintenance) {
+        maintenance = undefined;
+        rollbackMaintenanceTransaction(writer);
+      }
       closed = true;
       detachRuntimeStatementCache(reader);
       detachRuntimeStatementCache(writer);
@@ -758,6 +812,137 @@ function executeTransaction(
     throw error;
   }
   return { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences };
+}
+
+/** Requests refused while a maintenance transaction is open: every other writer entry point. */
+const MAINTENANCE_EXCLUSIVE_WRITES: ReadonlySet<string> = new Set([
+  'transaction', 'modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest', 'maintenanceBegin'
+]);
+
+/** Ids per page of a maintenance commit's aggregate check. */
+const MAINTENANCE_AGGREGATE_PAGE = 256;
+
+/**
+ * A maintenance instance writes one transaction of any size (a whole historical source): small page
+ * caches, and a TEMP table of the writer for what that transaction keeps across its appends (see
+ * MaintenanceTransaction). Memory stays one chunk large however many rows the transaction writes.
+ * (Runs from start(), before this module's later constants are initialized.)
+ */
+function configureMaintenanceConnections(writer: Database.Database, reader: Database.Database): void {
+  // KiB per database file (SQLite's default here is 16 MiB). A growing transaction spills its pages
+  // to the WAL, so the cache bounds the memory, not the size of the transaction.
+  const pageCacheKib = 4096;
+  for (const [database, schema] of [[writer, 'main'], [writer, 'temp'], [reader, 'main']] as const) {
+    database.pragma(`${schema}.cache_size = -${pageCacheKib}`);
+  }
+  writer.exec(`
+    CREATE TEMP TABLE runtime_maintenance_scratch (
+      kind TEXT NOT NULL CHECK (kind IN ('model_request', 'turn', 'historical_copy')),
+      id TEXT NOT NULL,
+      PRIMARY KEY (kind, id)
+    ) WITHOUT ROWID
+  `);
+}
+
+/**
+ * One write transaction of a maintenance instance, open across requests. The ModelRequest aggregates
+ * and Turns it touched (asserted once, at its commit) and the ModelRequests it inserted as historical
+ * copies (a copied stream fact needs its request copied by the same transaction) are rows of
+ * temp.runtime_maintenance_scratch, so they end with the transaction and follow its savepoints.
+ * Allocated sequences are listed per append (a Message revision reference resolves within its
+ * append) and counted across appends.
+ */
+interface MaintenanceTransaction {
+  allocatedSequences: number;
+  historicalCopies: HistoricalCopies;
+  touched: TouchedRuntimeAggregates;
+}
+
+function requireMaintenanceTransaction(open: MaintenanceTransaction | undefined): MaintenanceTransaction {
+  if (!open) throw new Error('No maintenance transaction is open on this Runtime database.');
+  return open;
+}
+
+/**
+ * BEGIN IMMEDIATE with synchronous = FULL (checked in effect; SQLite cannot change it inside a
+ * transaction), so the commit is synced to disk when it returns. NORMAL again once it ends.
+ */
+function beginMaintenanceTransaction(database: Database.Database): MaintenanceTransaction {
+  prepareCached(database, 'PRAGMA synchronous = FULL').run();
+  try {
+    if (BigInt(prepareCached(database, 'PRAGMA synchronous', { rows: 'pluck' }).get() as number | bigint) !== 2n) {
+      throw new Error('SQLite synchronous = FULL is not in effect for a maintenance transaction.');
+    }
+    beginMeasuredWrite(database);
+  } catch (error) {
+    if (database.inTransaction) database.exec('ROLLBACK');
+    prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
+    throw error;
+  }
+  try {
+    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_maintenance_scratch');
+  } catch (error) {
+    rollbackMaintenanceTransaction(database);
+    throw error;
+  }
+  return {
+    allocatedSequences: 0,
+    historicalCopies: new MaintenanceHistoricalCopies(database),
+    touched: maintenanceTouchedAggregates(database)
+  };
+}
+
+/**
+ * One chunk of steps under the ordinary insert invariants. Nothing reads a maintenance transaction's
+ * change capture, so it is emptied after every chunk (temporary storage stays one chunk large).
+ */
+function appendMaintenanceSteps(
+  database: Database.Database,
+  open: MaintenanceTransaction,
+  steps: RepositoryTransactionStep[]
+): void {
+  if (!Array.isArray(steps) || steps.length === 0) throw new Error('A maintenance append requires at least one Repository step.');
+  const allocated: RuntimeAllocatedSequence[] = [];
+  HISTORICAL_COPIES.set(allocated, open.historicalCopies);
+  executeSteps(database, steps, allocated);
+  assertTouchedRuntimeAggregates(database, steps, open.touched);
+  database.exec('DELETE FROM temp.runtime_transaction_change');
+  open.allocatedSequences += allocated.length;
+}
+
+/** Asserts every aggregate the transaction touched, then commits it durably (see beginMaintenanceTransaction). */
+function commitMaintenanceTransaction(
+  database: Database.Database,
+  open: MaintenanceTransaction,
+  nextCommitSeq: bigint
+): RuntimeMaintenanceCommitResult {
+  try {
+    assertMaintenanceAggregates(database);
+    database.exec('DELETE FROM temp.runtime_maintenance_scratch');
+    database.exec('DELETE FROM temp.runtime_transaction_change');
+    commitMeasuredWrite(database);
+  } catch (error) {
+    rollbackMaintenanceTransaction(database);
+    throw error;
+  }
+  prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
+  durableCommitCount += 1;
+  return { commitSeq: nextCommitSeq.toString(), snapshotRequired: true, allocatedSequences: open.allocatedSequences };
+}
+
+function rollbackMaintenanceTransaction(database: Database.Database): void {
+  try {
+    if (database.inTransaction) database.exec('ROLLBACK');
+  } finally {
+    prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
+  }
+}
+
+/** wal_checkpoint(TRUNCATE) on the writer: the WAL is written back and truncated when no reader holds it. */
+function truncateWal(database: Database.Database): RuntimeWalCheckpointResult {
+  const row = prepareCached(database, 'PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number | bigint; log: number | bigint; checkpointed: number | bigint };
+  return { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) };
 }
 
 
@@ -1458,7 +1643,7 @@ function executeSteps(
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(step.name)) throw new Error(`Invalid savepoint name: ${step.name}`);
     const marker = quote(step.name);
     const sequenceCount = allocatedSequences.length;
-    const historicalCount = historicalCopiesOf(allocatedSequences).order.length;
+    const historicalCount = historicalCopiesOf(allocatedSequences).mark();
     database.exec(`SAVEPOINT ${marker}`);
     try {
       executeSteps(database, step.steps, allocatedSequences);
@@ -1475,17 +1660,34 @@ function executeSteps(
 
 /**
  * ModelRequests inserted as historical copies by the running transaction, keyed by that
- * transaction's own allocated-sequence list (one per transaction, rolled back with its savepoints).
+ * transaction's own allocated-sequence list (one per transaction, rolled back with its savepoints;
+ * a maintenance transaction registers its one set for the list of every append).
  */
 const HISTORICAL_COPIES = new WeakMap<RuntimeAllocatedSequence[], HistoricalCopies>();
 
-class HistoricalCopies {
-  public readonly requests = new Set<string>();
-  public readonly order: string[] = [];
+interface HistoricalCopies {
+  has(id: string): boolean;
+  add(id: string): void;
+  /** Where a savepoint starts; truncate(mark) after its ROLLBACK TO forgets what it added. */
+  mark(): number;
+  truncate(mark: number): void;
+}
+
+class TransactionHistoricalCopies implements HistoricalCopies {
+  private readonly requests = new Set<string>();
+  private readonly order: string[] = [];
+
+  public has(id: string): boolean {
+    return this.requests.has(id);
+  }
 
   public add(id: string): void {
     this.requests.add(id);
     this.order.push(id);
+  }
+
+  public mark(): number {
+    return this.order.length;
   }
 
   public truncate(length: number): void {
@@ -1493,9 +1695,32 @@ class HistoricalCopies {
   }
 }
 
+/** A maintenance transaction's copies, rows of its TEMP scratch table: a savepoint's ROLLBACK TO removes its own. */
+class MaintenanceHistoricalCopies implements HistoricalCopies {
+  public constructor(private readonly database: Database.Database) {}
+
+  public has(id: string): boolean {
+    return prepareCached(this.database,
+      "SELECT 1 FROM temp.runtime_maintenance_scratch WHERE kind = 'historical_copy' AND id = ?"
+    ).get(id) !== undefined;
+  }
+
+  public add(id: string): void {
+    prepareCached(this.database, "INSERT INTO temp.runtime_maintenance_scratch (kind, id) VALUES ('historical_copy', ?)").run(id);
+  }
+
+  public mark(): number {
+    return 0;
+  }
+
+  public truncate(): void {
+    // SQLite rolled the savepoint's rows back already.
+  }
+}
+
 function historicalCopiesOf(transaction: RuntimeAllocatedSequence[]): HistoricalCopies {
   let copies = HISTORICAL_COPIES.get(transaction);
-  if (!copies) HISTORICAL_COPIES.set(transaction, copies = new HistoricalCopies());
+  if (!copies) HISTORICAL_COPIES.set(transaction, copies = new TransactionHistoricalCopies());
   return copies;
 }
 
@@ -1648,7 +1873,7 @@ function executeMutation(
       // Stream facts are copied only together with their terminal request, as one historical copy
       // (a Conversation fork, a historical data-set merge, a data-root relocation bulk copy): never
       // appended to an existing request.
-      if (!historicalCopiesOf(allocatedSequences).requests.has(String(mutation.row.model_request_id))) {
+      if (!historicalCopiesOf(allocatedSequences).has(String(mutation.row.model_request_id))) {
         throw new Error(`Historical ${schema.key} copy requires its ModelRequest to be copied in the same transaction.`);
       }
     }
@@ -1866,12 +2091,27 @@ function resolveMessageRevisionSequenceReference(
   return { ...row, source_revision: allocated.value };
 }
 
+/**
+ * ModelRequest aggregates and Turns a transaction touched, resolved when its steps ran (an Operation
+ * or Attempt to its ModelRequest). A maintenance transaction accumulates them over its appends in its
+ * TEMP scratch table and asserts them once, at its commit (assertMaintenanceAggregates).
+ */
+interface TouchedRuntimeAggregates {
+  modelRequestIds: { add(id: string): unknown };
+  turnIds: { add(id: string): unknown };
+}
+
+/**
+ * Checks every ModelRequest aggregate the executed `steps` touched. With `accumulated` (a maintenance
+ * transaction) the touched ids are only added to it; assertMaintenanceAggregates runs at the commit.
+ */
 function assertTouchedRuntimeAggregates(
   database: Database.Database,
-  steps: readonly RepositoryTransactionStep[]
+  steps: readonly RepositoryTransactionStep[],
+  accumulated?: TouchedRuntimeAggregates
 ): void {
-  const modelRequestIds = new Set<string>();
-  const turnIds = new Set<string>();
+  const collected = accumulated ? undefined : { modelRequestIds: new Set<string>(), turnIds: new Set<string>() };
+  const { modelRequestIds, turnIds } = accumulated ?? collected!;
   const visit = (step: RepositoryTransactionStep): void => {
     if (step.kind === 'savepoint') {
       step.steps.forEach(visit);
@@ -1918,13 +2158,57 @@ function assertTouchedRuntimeAggregates(
     }
   };
   steps.forEach(visit);
-  for (const turnId of turnIds) {
+  if (collected) assertCollectedRuntimeAggregates(database, collected);
+}
+
+/** The aggregate checks of assertTouchedRuntimeAggregates, on the transaction's state as it is now. */
+function assertCollectedRuntimeAggregates(
+  database: Database.Database,
+  touched: { modelRequestIds: ReadonlySet<string>; turnIds: ReadonlySet<string> }
+): void {
+  const modelRequestIds = new Set(touched.modelRequestIds);
+  for (const turnId of touched.turnIds) {
     const turn = prepareCached(database, 'SELECT status FROM turn WHERE id = ?').get(turnId) as { status?: unknown } | undefined;
     if (turn?.status === 'active') continue;
     const requests = prepareCached(database, 'SELECT id FROM model_request WHERE turn_id = ?').all(turnId) as Array<{ id: string }>;
     for (const request of requests) modelRequestIds.add(requireRuntimeId(request.id));
   }
   for (const modelRequestId of modelRequestIds) assertModelRequestAggregate(database, modelRequestId);
+}
+
+/** A maintenance transaction's touched ids, rows of its TEMP scratch table. */
+function maintenanceTouchedAggregates(database: Database.Database): TouchedRuntimeAggregates {
+  const sink = (kind: 'model_request' | 'turn') => ({
+    add: (id: string) => prepareCached(database,
+      `INSERT OR IGNORE INTO temp.runtime_maintenance_scratch (kind, id) VALUES ('${kind}', ?)`).run(id)
+  });
+  return { modelRequestIds: sink('model_request'), turnIds: sink('turn') };
+}
+
+/**
+ * assertCollectedRuntimeAggregates over a maintenance transaction's scratch table, on its state at the
+ * commit: a touched Turn that is not active adds its ModelRequests, then every touched ModelRequest
+ * aggregate is asserted, a page of ids at a time.
+ */
+function assertMaintenanceAggregates(database: Database.Database): void {
+  prepareCached(database, `
+    INSERT OR IGNORE INTO temp.runtime_maintenance_scratch (kind, id)
+    SELECT 'model_request', model_request.id
+      FROM temp.runtime_maintenance_scratch AS touched
+      JOIN model_request ON model_request.turn_id = touched.id
+      LEFT JOIN turn ON turn.id = touched.id
+     WHERE touched.kind = 'turn' AND turn.status IS NOT 'active'
+  `).run();
+  const page = prepareCached(database, `
+    SELECT id FROM temp.runtime_maintenance_scratch
+     WHERE kind = 'model_request' AND id > ? ORDER BY id LIMIT ${MAINTENANCE_AGGREGATE_PAGE}
+  `, { rows: 'pluck' });
+  for (let after = ''; ;) {
+    const ids = page.all(after) as string[];
+    for (const id of ids) assertModelRequestAggregate(database, requireRuntimeId(id));
+    if (ids.length < MAINTENANCE_AGGREGATE_PAGE) return;
+    after = ids[ids.length - 1]!;
+  }
 }
 
 function assertModelRequestAggregate(database: Database.Database, modelRequestId: string): void {

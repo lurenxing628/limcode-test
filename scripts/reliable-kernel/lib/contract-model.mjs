@@ -790,6 +790,9 @@ function validateAuthority(authority, migration, failures) {
   if (database?.genericJsonTables !== false) failures.push('禁止通用JSON领域表');
   if (database?.arbitrarySqlBatch !== false) failures.push('禁止业务层任意SQL批处理');
   if (database?.businessWritesThroughRepositories !== true) failures.push('业务写入必须经过领域仓储');
+  if (database?.maintenanceTransactions !== 'offline-private-instance-only-opened-under-root-maintenance-with-hosts-offline-no-commit-listeners; one-write-transaction-across-requests-other-writes-refused-while-open; appended-steps-under-ordinary-insert-invariants-failed-append-rolls-back-all; touched-model-request-aggregates-and-historical-copies-kept-in-a-temp-table-aggregates-asserted-at-commit; commit-reads-no-changes-back-snapshot-required-allocated-sequences-counted-only; wal-checkpoint-truncate-a-separate-request-outside-the-transaction') {
+    failures.push('维护事务只用于持有维护声明、没有在线宿主的离线私有实例，不回传 changes，打开期间拒绝其它写，插入不变量照常');
+  }
   if (database?.connectionModel?.writer !== 'single-dedicated-worker-per-host'
     || database?.connectionModel?.crossHostWrites !== 'sqlite-serialized-transactions'
     || authority?.sequenceAllocation?.concurrency !== 'sqlite-serialized-writer-transactions') {

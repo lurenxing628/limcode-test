@@ -32,7 +32,8 @@
       "busy_timeout_ms": 5000,
       "foreign_keys": "on-per-connection"
     },
-    "durableCommits": "merge-engine-row-transaction-only-historical-merge-exclusive-fallback-and-relocation-merge-mode-synchronous-full-for-that-commit-then-normal",
+    "durableCommits": "merge-engine-row-transaction-only-historical-merge-exclusive-fallback-and-relocation-merge-mode-synchronous-full-for-that-commit-then-normal; large-merge-maintenance-transaction-begun-with-synchronous-full-normal-again-after-commit-or-rollback",
+    "maintenanceTransactions": "offline-private-instance-only-opened-under-root-maintenance-with-hosts-offline-no-commit-listeners; one-write-transaction-across-requests-other-writes-refused-while-open; appended-steps-under-ordinary-insert-invariants-failed-append-rolls-back-all; touched-model-request-aggregates-and-historical-copies-kept-in-a-temp-table-aggregates-asserted-at-commit; commit-reads-no-changes-back-snapshot-required-allocated-sequences-counted-only; wal-checkpoint-truncate-a-separate-request-outside-the-transaction",
     "connectionModel": {
       "writer": "single-dedicated-worker-per-host",
       "reader": "wal-snapshot",
