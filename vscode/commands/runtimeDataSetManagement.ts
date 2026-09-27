@@ -12,7 +12,7 @@ import {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
   RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS,
   type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergedFacts,
-  type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
+  type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeResult, type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
 } from '../../backend/reliableKernel/runtimeDataSetMerge';
 import { summarizeRuntimeDataSet, type RuntimeDataSetSummary } from '../../backend/reliableKernel/runtimeDataSetPreflight';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
@@ -308,7 +308,7 @@ async function mergeNow(
   const changed = remergeNote(lastMergeOf(merge));
   const confirmed = await vscode.window.showWarningMessage('把这个历史库合并到当前库？', {
     modal: true, detail: `来源：${candidate.runtimeDataRootPath}\n\n在后台合并，不需要重载窗口：先备份当前库，再把对话写入当前库。`
-      + '原库保留（已发布的旧格式会先备份并就地升级）；原库里中断的任务按“中止”收尾，不会在当前库被继续执行。'
+      + '原库保留（已发布的旧格式会先备份并就地升级）；原库里中断的任务按“中止”收尾、排队未发送的消息会被取消，都不会在当前库被继续执行。'
       + '无法自动收尾的工作或数据冲突时整体不合并，并说明原因。' + oversizedMergeNote() + changed
   }, '合并');
   if (confirmed !== '合并' || !candidate.dataSetId || !candidate.rootInstanceId) return;
@@ -489,10 +489,7 @@ async function reportHistoricalMerge(
   report: RuntimeDataSetMergeBatchResult,
   stillCurrent: () => boolean
 ): Promise<void> {
-  for (const merged of report.merged) {
-    console.info(`[LimCode] 已合并旧聊天记录 ${merged.candidateId}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`
-      + (merged.finalized ? `；收尾 ${merged.finalized.turns} 个中断任务，收尾前来源备份：${merged.finalized.sourceBackupPath}` : ''));
-  }
+  for (const merged of report.merged) console.info(`[LimCode] ${mergedLog(merged)}`);
   const issues = [...report.deferred, ...report.blocked, ...report.failures];
   if (issues.length) console.warn('[LimCode] 部分旧聊天记录暂未合并。', issues);
   const evaluated = new Set([...report.merged.map(item => item.candidateId), ...issues.map(item => item.candidateId ?? '')]);
@@ -501,11 +498,9 @@ async function reportHistoricalMerge(
   if (!stillCurrent()) return;
   if (report.merged.length) {
     const conversations = report.merged.reduce((sum, merged) => sum + merged.insertedConversations, 0);
-    const finalized = report.merged.reduce((sum, merged) => sum + (merged.finalized?.turns ?? 0), 0);
     void vscode.window.showInformationMessage(
       `已把 ${report.merged.length} 份旧聊天记录合并到当前历史库（新增 ${conversations} 个对话），可直接在侧栏继续。`
-      + (finalized ? `其中 ${finalized} 个旧版本中断的任务已按“中止”收尾，不会被继续执行。` : '')
-      + '原库和合并前备份都已保留。'
+      + mergedNotes(report.merged) + '原库和合并前备份都已保留。'
     );
   }
   const announce = (issue: RuntimeDataSetMergeIssue) => issue.requested || fresh.has(noticeCause(issue));
@@ -525,6 +520,22 @@ async function reportHistoricalMerge(
       `${problem.candidateId ?? '历史库列表'}\n[${problem.code}] ${problem.message}`
     ).join('\n\n'));
   }).then(undefined, error => console.warn('[LimCode] 无法显示旧聊天记录合并详情。', error));
+}
+
+/** One log line per merged source, with everything its notice summarizes. */
+function mergedLog(merged: RuntimeDataSetMergeResult): string {
+  return `已合并旧聊天记录 ${merged.candidateId}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`
+    + (merged.finalized ? `；收尾 ${merged.finalized.turns} 个中断任务，另有 ${merged.finalized.intents} 条排队未发送的消息已取消，`
+      + `收尾前来源备份：${merged.finalized.sourceBackupPath}` : '');
+}
+
+/** What merged sources also did: work closed before merging. */
+function mergedNotes(results: readonly RuntimeDataSetMergeResult[]): string {
+  const total = (count: (result: RuntimeDataSetMergeResult) => number): number => results.reduce((sum, result) => sum + count(result), 0);
+  const turns = total(result => result.finalized?.turns ?? 0);
+  const intents = total(result => result.finalized?.intents ?? 0);
+  return (turns ? `其中 ${turns} 个中断的任务已按“中止”收尾，不会被继续执行。` : '')
+    + (intents ? `另有 ${intents} 条排队未发送的消息已取消。` : '');
 }
 
 /** Runs after current Runtime startup. Historical upgrades never register or recover old tasks. */

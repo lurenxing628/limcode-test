@@ -147,10 +147,16 @@ function fixture({
   };
   const filename = path.resolve(__dirname, '../../vscode/commands/runtimeDataSetManagement.ts');
   const module = { exports: {} };
+  // The module's log lines (the new context has no console of this process).
+  const logs = [];
+  const log = level => (...args) => logs.push([level, args.map(arg => arg instanceof Error ? arg.message : typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ')]);
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
-  }).outputText, { module, exports: module.exports, require: name => dependencies[name] ?? require(name) });
-  return { ...module.exports, context: { subscriptions: [], ...(globalState ? { globalState } : {}) }, startup: { current: () => application }, calls, SelectionRequired, lifetime };
+  }).outputText, {
+    module, exports: module.exports, require: name => dependencies[name] ?? require(name),
+    console: { info: log('info'), warn: log('warn'), error: log('error'), log: log('log') }
+  });
+  return { ...module.exports, context: { subscriptions: [], ...(globalState ? { globalState } : {}) }, startup: { current: () => application }, calls, logs, SelectionRequired, lifetime };
 }
 
 test('startup asks once after selection-required, selects exact candidate and retries open', async () => {
@@ -499,7 +505,7 @@ test('after Runtime ready old libraries merge online in the background without a
   assert.deepEqual(f.calls.filter(call => call[0] === 'merge-online'), [['merge-online', 'this-window', true, null]]);
   const info = f.calls.find(call => call[0] === 'info')[1];
   assert.match(info, /已把 1 份旧聊天记录合并到当前历史库（新增 3 个对话）/);
-  assert.match(info, /2 个旧版本中断的任务已按“中止”收尾，不会被继续执行/);
+  assert.match(info, /其中 2 个中断的任务已按“中止”收尾，不会被继续执行。另有 1 条排队未发送的消息已取消。/);
   assert.equal(f.calls.some(call => ['pick', 'warning', 'select', 'command', 'history', 'upgrade', 'exclusive'].includes(call[0])), false);
 });
 
@@ -603,7 +609,7 @@ test('explicit merge runs online in this window without a reload; without a Runt
   const confirm = f.calls.find(call => call[0] === 'warning' && call[1] === '把这个历史库合并到当前库？');
   assert.match(confirm[2].detail, /不需要重载窗口/);
   assert.match(confirm[2].detail, /已发布的旧格式会先备份并就地升级/);
-  assert.match(confirm[2].detail, /按“中止”收尾，不会在当前库被继续执行/);
+  assert.match(confirm[2].detail, /原库里中断的任务按“中止”收尾、排队未发送的消息会被取消，都不会在当前库被继续执行/);
   // 复审 merge3 #2：明确合并对超限来源会等其它窗口（与协调参数 whenBusy: 'wait' 一致），条件写具体数字。
   assert.match(confirm[2].detail, /超过 1234 条记录或 5 MiB 的库需要其它窗口暂时让出：会在后台等其它窗口的任务结束、正在使用的窗口被切走（最多约 7 分钟，可取消），然后其它窗口会重载一次/);
   assert.match(confirm[2].detail, /超过 56789 条记录的库当前版本不能安全合并/);
@@ -689,6 +695,26 @@ test('switching away explains the kept rule and warns before continuing merged c
   assert.match(detail, /还没合并过、也不是你保留的旧库，会在下次打开时自动合并进新的当前库/);
   assert.match(detail, /在已合并的对话里继续聊天，这个库以后就不能再合并回当前库.*只新建对话.*新对话以后仍可合并回来/);
   assert.equal(f.calls.some(call => ['select', 'command'].includes(call[0])), false, '未确认不切换');
+});
+
+const mergedOld = overrides => ({
+  candidateId: 'workspace:old', sourceDataSetId: 'old', targetDataSetId: 'current', insertedRows: 12, reusedRows: 0,
+  insertedConversations: 1, linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0, recoveredCommit: false,
+  backupPath: '/fixture/backup', ...overrides
+});
+
+test('盲审 merge #3：合并通知与日志写明取消的排队消息；只取消了排队消息时不提中断的任务', async () => {
+  const f = fixture({ mergeReport: emptyMergeReport({ merged: [
+    mergedOld({ finalized: { turns: 0, intents: 2, sourceBackupPath: '/fixture/source-backup' } })
+  ] }) });
+  await f.mergeHistoricalDataSetsInBackground(f.context, mergeHost(), () => true);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'info').map(call => call[1]), [
+    '已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话），可直接在侧栏继续。另有 2 条排队未发送的消息已取消。原库和合并前备份都已保留。'
+  ]);
+  assert.deepEqual(f.logs.filter(([level]) => level === 'info').map(([, line]) => line), [
+    '[LimCode] 已合并旧聊天记录 workspace:old：新增 12 行；合并前备份：/fixture/backup；收尾 0 个中断任务，另有 2 条排队未发送的消息已取消，'
+    + '收尾前来源备份：/fixture/source-backup'
+  ]);
 });
 
 test('跨模块盲审 #7：磁盘空间不足的推迟只在新原因出现时提示，所需空间的数字变了也不重复提示', async () => {
