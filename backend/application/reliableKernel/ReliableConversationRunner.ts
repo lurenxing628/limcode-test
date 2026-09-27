@@ -57,6 +57,9 @@ const UNKNOWN_ELIGIBILITY_MAX_DELAY_MS = 30_000;
 /** Another window's commits trigger at most one scan for Turns no live Host holds per interval. */
 const UNHELD_TURN_SCAN_INTERVAL_MS = 2_000;
 const UNHELD_TURN_RECOVERY_INTERVAL_MS = 5_000;
+/** Queued admission stood down as busy or unknown retries on its own, with backoff. */
+const ADMISSION_RETRY_BASE_DELAY_MS = 1_000;
+const ADMISSION_RETRY_MAX_DELAY_MS = 30_000;
 const LOCAL_TURN_WAKE_DOMAINS = new Set([
   'EffectIntent',
   'EffectReceipt',
@@ -928,9 +931,32 @@ export class ReliableConversationRunner {
       const eligibility = await this.conversationOwners.executionEligibility(waiting.conversationId);
       if (eligibility === 'eligible') continue;
       this.deferRecoveryCandidate(waiting.conversationId, waiting.turnId, eligibility);
+      if (eligibility === 'ineligible') await this.releaseWaitingTurn(waiting.conversationId, waiting.turnId);
       await this.conversationOwners.releaseIfIdle(waiting.conversationId);
     }
     return this.recoverStartup(signal);
+  }
+
+  /**
+   * A waiting Turn whose Conversation this window no longer serves (its folder left the window):
+   * the execution lease goes back with the owner record, so a window serving the Conversation
+   * continues the Turn (an answer, a stop) while this one stays open.
+   */
+  private async releaseWaitingTurn(conversationId: string, turnId: string): Promise<void> {
+    try {
+      await this.conversationOwners.run(conversationId, async () => {
+        const fence = await this.application.turns.executionLeaseFence({
+          turnId,
+          leaseOwnerId: this.leaseOwnerId,
+          hostBootId: this.application.database.hostBootId
+        });
+        if (fence) await this.application.turns.releaseExecutionLease(fence);
+      });
+    } catch (error) {
+      if (!isConversationRuntimeOwnerBusyError(error)) {
+        this.onError(error, { operation: 'watch-external', conversationId, turnId });
+      }
+    }
   }
 
   /**
@@ -1035,18 +1061,9 @@ export class ReliableConversationRunner {
           this.application.database.hostBootId
         );
         if (effects.state !== 'none') return 'none';
-        const claimed = await this.application.turns.claimRecoveryExecution({
-          turnId,
-          ...this.lease(conversationId)
-        });
+        const fence = await this.claimControlLease(conversationId, turnId);
         // A live lease holder observes the durable request and stops the Turn itself.
-        if (!claimed) return 'busy';
-        const fence = await this.application.turns.executionLeaseFence({
-          turnId,
-          leaseOwnerId: this.leaseOwnerId,
-          hostBootId: this.application.database.hostBootId
-        });
-        if (!fence) return 'retry';
+        if (!fence) return 'busy';
         return await this.settleUnderClaimedLease(fence, async () => {
           await this.application.phaseDRecovery.reconcileArrivedReceipts(effects.receiptEffectIntentIds);
           return this.application.agentLoop.terminateRequested(turnId);
@@ -1081,17 +1098,8 @@ export class ReliableConversationRunner {
         const facts = await this.application.turns.recoveryFacts(turnId);
         if (facts.turnStatus !== 'active' || facts.judgment !== 'resume') return 'none';
         if (!await this.findPendingTermination(turnId)) return 'none';
-        const claimed = await this.application.turns.claimRecoveryExecution({
-          turnId,
-          ...this.lease(conversationId)
-        });
-        if (!claimed) return 'live';
-        const fence = await this.application.turns.executionLeaseFence({
-          turnId,
-          leaseOwnerId: this.leaseOwnerId,
-          hostBootId
-        });
-        if (!fence) return 'retry';
+        const fence = await this.claimControlLease(conversationId, turnId);
+        if (!fence) return 'live';
         let unsettled: 'live' | 'none' | 'retry' = 'retry';
         return await this.settleUnderClaimedLease(fence, async () => {
           // Re-read under the lease: another stop may have closed some of the work meanwhile.
@@ -1116,6 +1124,43 @@ export class ReliableConversationRunner {
       if (isConversationRuntimeOwnerBusyError(error)) return 'live';
       this.onError(error, { operation: 'drive', conversationId, turnId });
       return 'retry';
+    }
+  }
+
+  /**
+   * Claims a Turn's lease for control-only settlement. The fence is the exact generation the claim
+   * committed, so no read-back can fail between the claim and the hand-back below; if the claim
+   * itself fails after committing, whatever this Host now holds is handed back before rethrowing.
+   */
+  private async claimControlLease(conversationId: string, turnId: string): Promise<ExecutionLeaseFence | null> {
+    let claimed: Awaited<ReturnType<ReliableKernelApplication['turns']['claimRecoveryExecution']>>;
+    try {
+      claimed = await this.application.turns.claimRecoveryExecution({ turnId, ...this.lease(conversationId) });
+    } catch (error) {
+      await this.releaseHeldLease(conversationId, turnId);
+      throw error;
+    }
+    if (!claimed) return null;
+    return {
+      id: claimed.executionLeaseId,
+      conversationId: claimed.conversationId,
+      turnId: claimed.turnId,
+      ownerId: this.leaseOwnerId,
+      hostBootId: this.application.database.hostBootId,
+      generation: BigInt(claimed.leaseGeneration)
+    };
+  }
+
+  private async releaseHeldLease(conversationId: string, turnId: string): Promise<void> {
+    try {
+      const fence = await this.application.turns.executionLeaseFence({
+        turnId,
+        leaseOwnerId: this.leaseOwnerId,
+        hostBootId: this.application.database.hostBootId
+      });
+      if (fence) await this.application.turns.releaseExecutionLease(fence);
+    } catch (error) {
+      this.onError(error, { operation: 'watch-recovery', conversationId, turnId });
     }
   }
 
@@ -1202,6 +1247,7 @@ export class ReliableConversationRunner {
     this.externalWakeTimer = undefined;
     if (this.unheldScanTimer) clearTimeout(this.unheldScanTimer);
     this.unheldScanTimer = undefined;
+    for (const conversationId of [...this.admissionRetries.keys()]) this.clearAdmissionRetry(conversationId);
     this.waitingOwned.clear();
     this.deferredRecovery.clear();
     this.terminationRecoveryFailures.clear();
@@ -1738,6 +1784,7 @@ export class ReliableConversationRunner {
             // This Host no longer serves the Conversation (or cannot tell): keep a candidate so a
             // stop is still settled here and the Turn resumes once eligibility returns.
             this.deferRecoveryCandidate(waiting.conversationId, waiting.turnId, claim);
+            if (claim === 'ineligible') await this.releaseWaitingTurn(waiting.conversationId, waiting.turnId);
             await this.conversationOwners.releaseIfIdle(waiting.conversationId);
             continue;
           }
@@ -2254,13 +2301,16 @@ export class ReliableConversationRunner {
     // serving the Conversation.
     const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
     if (claim !== 'owned') {
-      // Standing down answers every wake so far: the queued Intent stays durable, and a later wake
-      // (terminal commit, rescan, recovery) re-checks. Rescheduling here would loop without ever
-      // yielding when the claim is answered from memory (an ineligible or failing probe).
+      // Standing down answers every wake so far: the queued Intent stays durable. Rescheduling at
+      // once would loop without ever yielding when the claim is answered from memory. A live peer
+      // owner (busy) or a failing probe (unknown) is retried after a backoff delay; a window that
+      // does not serve the Conversation waits for a rescan (its folders changed).
       slot.completedGeneration = slot.requestedGeneration;
       if (claim !== 'busy') await this.conversationOwners.releaseIfIdle(slot.conversationId);
+      if (claim !== 'ineligible') await this.retryAdmissionLater(slot.conversationId);
       return;
     }
+    this.clearAdmissionRetry(slot.conversationId);
     try {
       await this.conversationOwners.run(slot.conversationId, () => this.runAdmissionSlot(slot));
     } catch (error) {
@@ -2270,6 +2320,38 @@ export class ReliableConversationRunner {
       }
       throw error;
     }
+  }
+
+  private async retryAdmissionLater(conversationId: string): Promise<void> {
+    if (this.disposed) return;
+    const queued = await listAllDomainRows(this.application.database, 'TurnIntent', {
+      conversation_id: conversationId,
+      state: 'queued',
+      turn_id: null
+    });
+    if (queued.length === 0 || this.disposed) {
+      this.clearAdmissionRetry(conversationId);
+      return;
+    }
+    const entry = this.admissionRetries.get(conversationId) ?? { failures: 0 };
+    if (entry.timer) return;
+    entry.failures += 1;
+    const delayMs = Math.min(
+      ADMISSION_RETRY_MAX_DELAY_MS,
+      ADMISSION_RETRY_BASE_DELAY_MS * (2 ** Math.min(10, entry.failures - 1))
+    );
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      if (!this.disposed) this.scheduleAdmission(conversationId);
+    }, delayMs);
+    entry.timer.unref();
+    this.admissionRetries.set(conversationId, entry);
+  }
+
+  private clearAdmissionRetry(conversationId: string): void {
+    const entry = this.admissionRetries.get(conversationId);
+    if (entry?.timer) clearTimeout(entry.timer);
+    this.admissionRetries.delete(conversationId);
   }
 
   private async runAdmissionSlot(slot: AdmissionSlot): Promise<void> {

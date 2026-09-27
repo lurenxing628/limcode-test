@@ -784,19 +784,37 @@ export class ReliableChildAgentCoordinator {
         const effects = await this.inspectChildTurnEffects(turnId);
         if (effects.state === 'live') return 'live';
         if (effects.state === 'unsupported' || (effects.state === 'dead' && !userStop)) return 'none';
-        const claimed = await this.dependencies.turns.claimRecoveryExecution({
-          turnId,
-          leaseOwnerId: this.childLeaseOwnerId,
-          hostBootId,
-          leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
-        });
+        let claimed: Awaited<ReturnType<TurnControlPlane['claimRecoveryExecution']>>;
+        try {
+          claimed = await this.dependencies.turns.claimRecoveryExecution({
+            turnId,
+            leaseOwnerId: this.childLeaseOwnerId,
+            hostBootId,
+            leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+          });
+        } catch (error) {
+          // The claim may have committed before a later read failed: hand back what this Host holds.
+          const held = await this.dependencies.turns.executionLeaseFence({
+            turnId,
+            leaseOwnerId: this.childLeaseOwnerId,
+            hostBootId
+          }).catch(() => null);
+          if (held) {
+            await this.dependencies.turns.releaseExecutionLease(held)
+              .catch((releaseError: unknown) => this.reportError(releaseError, 'child-control-lease-release', turnId));
+          }
+          throw error;
+        }
         if (!claimed) return 'live';
-        const fence = await this.dependencies.turns.executionLeaseFence({
-          turnId,
-          leaseOwnerId: this.childLeaseOwnerId,
-          hostBootId
-        });
-        if (!fence) return 'none';
+        // The exact generation the claim committed: no read-back can fail before the hand-back below.
+        const fence: ExecutionLeaseFence = {
+          id: claimed.executionLeaseId,
+          conversationId: claimed.conversationId,
+          turnId: claimed.turnId,
+          ownerId: this.childLeaseOwnerId,
+          hostBootId,
+          generation: BigInt(claimed.leaseGeneration)
+        };
         let unsettled: 'live' | 'none' = 'none';
         let terminated = false;
         try {
@@ -2255,9 +2273,11 @@ export class ReliableChildAgentCoordinator {
       });
     } catch (error) {
       if (error instanceof ExecutionEligibilityLostError) {
-        // Stopped between rounds because this Host no longer serves the child Conversation.
+        // Stopped between rounds because this Host no longer serves the child Conversation. A failed
+        // hand-back is reported; the eligibility error stays the one the drive reports.
         await renewal.stop();
-        await this.dependencies.turns.releaseExecutionLease(fence);
+        await this.dependencies.turns.releaseExecutionLease(fence)
+          .catch((releaseError: unknown) => this.reportError(releaseError, 'child-eligibility-lease-release', turnId));
         throw error;
       }
       if (isExecutionHandoffError(error)) throw error;
