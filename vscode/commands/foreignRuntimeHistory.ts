@@ -37,7 +37,7 @@ export async function announceForeignRuntimeHistoryOnStartup(
   const fresh = await rememberAnnounced(context, input.configurationRootPath, found.map((entry) => entry.id));
   if (fresh === 0) return;
   void Promise.resolve(vscode.window.showInformationMessage(
-    `发现 ${fresh} 个外来历史库（归档并重置留下的归档，或从别处拷来的数据目录）。可以在“历史与存储管理 → 外来历史库”里只读查看；以后的版本支持合并。原数据保持原样。`,
+    `发现 ${fresh} 个外来历史库（归档并重置留下的归档，或从别处拷来的数据目录）。可以在“历史与存储管理 → 外来历史库”里核验，核验通过的可以只读查看；以后的版本支持合并。原数据保持原样。`,
     '查看'
   )).then((pick) => {
     if (pick === '查看') return manageForeignRuntimeHistory(context);
@@ -127,7 +127,7 @@ async function reveal(entry: ForeignRuntimeHistoryEntry): Promise<void> {
 }
 
 function entryLabel(entry: ForeignRuntimeHistoryEntry): string {
-  const source = entry.location.kind === 'archive' ? '归档'
+  const source = entry.location.kind === 'archive' ? entry.location.side === 'previous' ? '归档（上一个数据目录里）' : '归档'
     : entry.archiveName ? '拷来目录里的归档' : entry.location.side === 'previous' ? '从别处拷来（上一个数据目录旁）' : '从别处拷来';
   const scope = entry.scope && entry.scope !== 'default' ? ' · 工作区库' : '';
   const state = entry.status === 'failed' ? '未通过核验 · ' : entry.status === 'unavailable' ? '暂时无法核验 · ' : '';

@@ -57,7 +57,7 @@ const PLAN = {
     }),
     item({
       key: 'reset-archive:arch', kind: 'reset-archive', name: '20260901-010203-004-abcdef12', path: `${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`,
-      inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '“归档并重置”时整份保留的历史库，含当时的对话；以后的版本会支持查看和合并，本版本只列出，不删除'
+      inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '“归档并重置”时整份保留的历史库，含当时的对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除'
     })
   ]
 };

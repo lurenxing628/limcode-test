@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { TextDecoder } from 'node:util';
 import Database from 'better-sqlite3';
@@ -7,7 +6,10 @@ import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import { storageKeyForDigest } from './contentAddressedStore';
 import { assertCurrentSchema } from './databaseSchema';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
-import { relocateRuntimeRoot, withLocatedRuntimeRootFence } from './runtimeForeignHistory';
+import {
+  copyLocatedRuntimeDatabase, heldDatabaseFiles, readLocatedRuntimeFile, relocateRuntimeRoot, withLocatedRuntimeRootFence,
+  type HeldDatabaseFiles
+} from './runtimeForeignHistory';
 import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { sameLocatedRuntimeRoot, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
@@ -48,16 +50,19 @@ const MAX_MESSAGE_CONTENT_BYTES = 64n * 1024n * 1024n;
  * located root: an unselected local data set (locateLocalRuntimeDataSet) or a verified foreign
  * history root (runtimeForeignHistory). SQLite's readonly WAL connection can create source
  * -wal/-shm files. Copy SQLite and its WAL from the located paths under the root's fence (local:
- * admission + maintenance; foreign: its claim under this configuration root) with its Hosts
- * offline, then open only that temporary copy, fenced by the recorded binding. CAS stays on-demand,
- * read from the located root. A recorded path is never read.
+ * admission + maintenance; foreign: its claim under this configuration root, verified again inside
+ * it) with its Hosts offline, then open only that temporary copy, fenced by the recorded binding.
+ * The copy counts only when the files kept their state while it was taken, and no file copied or
+ * read is a file of a database this process may hold (copyLocatedRuntimeDatabase). CAS stays
+ * on-demand, read from the located root as regular files only. A recorded path is never read.
  */
 export async function openRuntimeDataSetHistory(
   paths: { globalStoragePath: string },
   root: LocatedRuntimeRoot
 ): Promise<RuntimeDataSetHistory> {
   const open = async (): Promise<RuntimeDataSetHistory> => {
-    const current = await relocateRuntimeRoot(paths, root);
+    const held = await heldByThisProcess(paths, root);
+    const current = await relocateRuntimeRoot(paths, root, held);
     if (!sameLocatedRuntimeRoot(current, root)) {
       throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
     }
@@ -69,14 +74,19 @@ export async function openRuntimeDataSetHistory(
     }
     const binding = historical as RootBinding;
     return withLocatedRuntimeRootFence(paths, current, async () => {
-      await assertRuntimeHostsOffline(current.located);
+      // A foreign root's Host records are read only as regular files (runtimeForeignHistory), never
+      // through the local liveness reader: verified again here, under its claim.
+      if (current.origin.kind === 'local') await assertRuntimeHostsOffline(current.located);
+      else if (!sameLocatedRuntimeRoot(await relocateRuntimeRoot(paths, current, held), current)) {
+        throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
+      }
       let snapshot: RuntimeDataSetDatabaseSnapshot | undefined;
       try {
-        snapshot = await createLocatedRuntimeDatabaseSnapshot(current);
+        snapshot = await createLocatedRuntimeDatabaseSnapshot(current, { copy: (located) => copyLocatedRuntimeDatabase(located, held) });
         const { database } = snapshot;
         assertCurrentSchema(database, binding);
         assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS, { label: 'Historical Runtime' });
-        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot);
+        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot, held);
       } catch (error) {
         await snapshot?.close();
         if (error instanceof Error) {
@@ -90,6 +100,14 @@ export async function openRuntimeDataSetHistory(
   return root.origin.kind === 'local' ? withRuntimeDataRootAdmission(paths.globalStoragePath, open) : open();
 }
 
+/**
+ * Files of the databases this process may hold SQLite locks on, which the reader never opens. A local
+ * data set is copied under its own maintenance claim, so only its own database is left out.
+ */
+function heldByThisProcess(paths: { globalStoragePath: string }, root: LocatedRuntimeRoot): Promise<HeldDatabaseFiles> {
+  return heldDatabaseFiles(paths.globalStoragePath, root.origin.kind === 'local' ? { except: root.located.databasePath } : {});
+}
+
 class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
   private closed = false;
   private readonly textCache = new Map<string, string>();
@@ -99,7 +117,8 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     public readonly root: LocatedRuntimeRoot,
     private readonly binding: RootBinding,
     private readonly database: Database.Database,
-    private readonly snapshot: RuntimeDataSetDatabaseSnapshot
+    private readonly snapshot: RuntimeDataSetDatabaseSnapshot,
+    private held: HeldDatabaseFiles
   ) {}
 
   public async listConversations(input: { limit?: number; after?: RuntimeHistoryConversationCursor } = {}) {
@@ -171,7 +190,8 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
 
   private async validateSource(): Promise<void> {
     if (this.closed) throw new Error('Runtime history reader is closed.');
-    const current = await relocateRuntimeRoot(this.paths, this.root);
+    this.held = await heldByThisProcess(this.paths, this.root);
+    const current = await relocateRuntimeRoot(this.paths, this.root, this.held);
     if (!sameLocatedRuntimeRoot(current, this.root)) {
       throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
     }
@@ -217,9 +237,8 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     }
     const filePath = path.join(this.root.located.casRootPath, ...key.split('/'));
     await assertNoSymbolicPath(this.root.containerRoot, filePath);
-    const stat = await fs.lstat(filePath, { bigint: true });
-    if (!stat.isFile() || stat.size !== metadata.byte_length) throw new Error(`Historical ContentObject ${id} byte length mismatch.`);
-    const bytes = await fs.readFile(filePath);
+    // A regular file no larger than recorded, never a link, a FIFO or a file of a database this process holds.
+    const bytes = await readLocatedRuntimeFile(filePath, this.held, Number(metadata.byte_length));
     if (BigInt(bytes.length) !== metadata.byte_length || createHash('sha256').update(bytes).digest('hex') !== digest) {
       throw new Error(`Historical ContentObject ${id} digest or byte length mismatch.`);
     }

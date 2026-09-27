@@ -1062,7 +1062,7 @@ async function listKeptBackups(configurationRootPath: string, root: ControlRoot)
   if (info?.isDirectory() && await noSymbolicPath(configurationRootPath, archives)) {
     for (const name of (await readDirectoryNames(archives)).sort()) {
       items.push(await keptItem(configurationRootPath, configurationRootPath, 'reset-archive', path.join(archives, name), root.candidateId,
-        '“归档并重置”时整份保留的历史库，含当时的对话；以后的版本会支持查看和合并，本版本只列出，不删除'));
+        '“归档并重置”时整份保留的历史库，含当时的对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除'));
     }
   } else if (info) {
     items.push(await keptItem(configurationRootPath, configurationRootPath, 'reset-archive', archives, root.candidateId,
@@ -1083,7 +1083,7 @@ async function listConfigurationLevelBackups(configurationRootPath: string): Pro
   for (const name of (await readDirectoryNames(parent)).filter((entry) => entry.startsWith(prefix)).sort()) {
     // Only the entry itself is checked for a link: the data directory's parent is not LimCode's.
     items.push(await keptItem(configurationRootPath, path.join(parent, name), 'copied-data-root', path.join(parent, name), undefined,
-      '迁移数据目录时从别处拷来、挪到旁边保留的 LimCode 数据，含对话；以后的版本会支持查看和合并，本版本只列出，不删除'));
+      '迁移数据目录时从别处拷来、挪到旁边保留的 LimCode 数据，含对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除'));
   }
   return items;
 }

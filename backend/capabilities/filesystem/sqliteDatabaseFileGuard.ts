@@ -194,3 +194,8 @@ async function realPathOfNearestExisting(input: string): Promise<string> {
     }
   }
 }
+
+/** The databases registered by {@link registerInProcessSqliteDatabase} right now (their main files). */
+export function inProcessSqliteDatabasePaths(): string[] {
+  return [...new Set(inProcessDatabases.values())];
+}

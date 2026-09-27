@@ -30,6 +30,23 @@ export const VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY = '.limcode-runtime-merges';
  * enumerated, and each archive is listed as foreign history (runtimeForeignHistory).
  */
 export const VSCODE_RUNTIME_ARCHIVES_DIRECTORY = '.limcode-runtime-backups';
+/**
+ * Names of reset archives: `<yyyyMMdd-HHmmss-SSS>-<id8>` (archiveCurrentRuntimeRootForReset), and
+ * `<yyyyMMdd-HHmmss-SSS>-epoch-<N>-to-<M>-<id8>` of the automatic epoch resets of released 0.0.15–0.0.21.
+ */
+export const VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN = String.raw`\d{8}-\d{6}-\d{3}-(?:epoch-\d+-to-\d+-)?[0-9a-f]{8}`;
+const RUNTIME_ARCHIVE_NAME = new RegExp(`^${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}$`);
+const WORKSPACE_SCOPE_KEY = /^(workspace-file|folder|folder-set|empty)-[a-f0-9]{64}$/;
+
+export interface VscodeRuntimeArchiveDirectory {
+  /** 'default' or `workspace:<key>`. */
+  scope: string;
+  path: string;
+  /** Entries named like archives, sorted. */
+  names: string[];
+  /** A link, a non-directory or an unreadable directory: listed, never followed. */
+  unreadable?: string;
+}
 /** Written into a data set's own control root when the user switches the current data set away from it. */
 export const VSCODE_RUNTIME_DATA_SET_KEPT_FILE = 'kept-by-user.json';
 /**
@@ -766,6 +783,40 @@ async function keepsOnlyArchives(runtimeScopeRootPath: string): Promise<boolean>
   )));
   return names.includes(VSCODE_RUNTIME_ARCHIVES_DIRECTORY)
     && names.every((name) => name === VSCODE_RUNTIME_ARCHIVES_DIRECTORY || name === claim);
+}
+
+/**
+ * Every scope's archives directory of a configuration root, found by listing directories rather than
+ * by data-set enumeration: a scope whose data set was deleted keeps its archives, and a data directory
+ * left behind by a relocation keeps all of them. Links are never followed.
+ */
+export async function listVscodeRuntimeArchiveDirectories(configurationRootPath: string): Promise<VscodeRuntimeArchiveDirectory[]> {
+  const root = path.resolve(configurationRootPath);
+  const scopes: Array<{ scope: string; root: string }> = [{ scope: 'default', root }];
+  const scopesRoot = path.join(root, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
+  try {
+    await assertSafeRootPath(root, scopesRoot);
+    for (const key of (await directoryEntryNames(scopesRoot)).filter((name) => WORKSPACE_SCOPE_KEY.test(name)).sort()) {
+      scopes.push({ scope: `workspace:${key}`, root: path.join(scopesRoot, key) });
+    }
+  } catch { /* Scopes that cannot be listed hide nothing that could be shown here. */ }
+  const result: VscodeRuntimeArchiveDirectory[] = [];
+  for (const scope of scopes) {
+    const archives = path.join(scope.root, VSCODE_RUNTIME_ARCHIVES_DIRECTORY);
+    try {
+      await assertSafeRootPath(root, archives);
+      const info = await fs.lstat(archives);
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        result.push({ scope: scope.scope, path: archives, names: [], unreadable: '归档目录是符号链接或不是目录' });
+        continue;
+      }
+      result.push({ scope: scope.scope, path: archives, names: (await fs.readdir(archives)).filter((name) => RUNTIME_ARCHIVE_NAME.test(name)).sort() });
+    } catch (error) {
+      if (isMissingPathError(error)) continue;
+      result.push({ scope: scope.scope, path: archives, names: [], unreadable: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return result;
 }
 
 /** Empty control/active directories are harmless; any actual entry requires an existing binding. */

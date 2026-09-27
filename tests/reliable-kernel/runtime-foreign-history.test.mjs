@@ -207,7 +207,10 @@ for (const scopeKind of ['default', 'workspace']) {
       read = await readAll(fixture.paths, root, conversationId);
       await foreign.inspectForeignRuntimeStorage(fixture.paths, root);
     } finally { probe.stop(); }
-    assert.deepEqual(probe.seen.filter((call) => inside(liveControl, call.path)), [], '现存根从不被访问');
+    // The live root that occupies the archive's recorded location: only its database files are stat-ed (the files
+    // this process may hold SQLite locks on, which nothing here may open); nothing of it is listed, opened or read.
+    assert.deepEqual(probe.seen.filter((call) => inside(liveControl, call.path)
+      && !(call.name === 'stat' && /\/limcode\.sqlite(-wal|-shm|-journal)?$/.test(call.path))), [], '现存根除了数据库文件的 stat 之外从不被访问');
     assert.deepEqual(probe.seen.filter((call) => writes(call) && inside(archives, call.path)), [], '查看时不在归档目录里建声明或任何文件');
     assert.deepEqual(read.conversations, scopeKind === 'default' ? ['conversation_current_2', 'conversation_current_1'] : [conversationId]);
     assert.deepEqual(read.messages, [`${conversationId} 的正文`]);
@@ -251,9 +254,11 @@ test('启动发现只列目录、读小 JSON：找到上一个数据目录旁的
     ['previous', `.limcode-workspace-runtimes/scopes/folder-${'a'.repeat(64)}/.limcode-runtime-backups/${found[2].archiveName}/active`]
   ]);
   assert.equal(found[0].id, foreign.foreignRuntimeHistoryId(found[0].location, source.binding));
-  assert.deepEqual(probe.seen.filter((call) => /limcode\.sqlite/.test(call.path)), []);
-  assert.deepEqual(probe.seen.filter((call) => !['lstat', 'readdir', 'readFile'].includes(call.name)).map((call) => call.name), []);
-  assert.ok(probe.seen.filter((call) => call.name === 'readFile').every((call) => call.path.endsWith('.json')));
+  // SQLite files are only stat-ed (which files this process may hold locks on), never opened; JSON is opened read-only.
+  assert.deepEqual(probe.seen.filter((call) => /limcode\.sqlite/.test(call.path) && call.name !== 'stat'), []);
+  assert.deepEqual(probe.seen.filter((call) => !['lstat', 'stat', 'readdir', 'open'].includes(call.name)).map((call) => call.name), []);
+  assert.ok(probe.seen.filter((call) => call.name === 'stat').every((call) => /limcode\.sqlite(-wal|-shm|-journal)?$/.test(call.path)));
+  assert.ok(probe.seen.filter((call) => call.name === 'open').every((call) => call.path.endsWith('.json') && !writes(call)));
 });
 
 /** A complete copy of a LimCode directory beside `home`, named as a relocation names copied data. */
@@ -312,9 +317,28 @@ test('每种拒绝原因各一例：未通过的列出位置、大小与原因�
       const liveness = path.join(control(await copiedBeside(home, elsewhere, 1)), 'active', 'host-liveness');
       await fs.mkdir(liveness, { recursive: true });
       await fs.writeFile(path.join(liveness, 'fixture.json'), JSON.stringify({
-        dataSetId: source.binding.dataSetId, rootInstanceId: source.binding.rootInstanceId, rootGeneration: 1, hostBootId: 'h',
+        kind: 'limcode-runtime-host-liveness', dataSetId: source.binding.dataSetId, rootInstanceId: source.binding.rootInstanceId, rootGeneration: 1, hostBootId: 'h',
         livenessId: 'l', processId: process.pid, processStartIdentity: ownProcessStartIdentity(), startedAt: NOW, heartbeatAt: NOW
       }));
+    }],
+    ['foreign-history-host-record', 'failed', async (home) => {
+      // A record without its kind proves nothing about its writer, and never gets better by itself.
+      const liveness = path.join(control(await copiedBeside(home, elsewhere, 1)), 'active', 'host-liveness');
+      await fs.mkdir(liveness, { recursive: true });
+      await fs.writeFile(path.join(liveness, 'fixture.json'), JSON.stringify({ hostBootId: 'h', processId: process.pid }));
+    }],
+    ['foreign-history-file-too-large', 'failed', async (home) => {
+      // A liveness record is a few hundred bytes: a larger file is refused before it is read.
+      const liveness = path.join(control(await copiedBeside(home, elsewhere, 1)), 'active', 'host-liveness');
+      await fs.mkdir(liveness, { recursive: true });
+      await fs.writeFile(path.join(liveness, 'fixture.json'), JSON.stringify({
+        kind: 'limcode-runtime-host-liveness', dataSetId: source.binding.dataSetId, rootInstanceId: source.binding.rootInstanceId, rootGeneration: 1, hostBootId: 'h',
+        livenessId: 'l', processId: process.pid, processStartIdentity: ownProcessStartIdentity(), startedAt: NOW, heartbeatAt: NOW, padding: 'x'.repeat(70 * 1024)
+      }));
+    }],
+    ['foreign-history-epoch-newer', 'failed', async (home) => {
+      const copied = await copiedBeside(home, elsewhere, 1);
+      await fs.writeFile(pointer(copied), JSON.stringify({ ...JSON.parse(await fs.readFile(pointer(copied), 'utf8')), runtimeKernelEpoch: 6 }));
     }],
     ['foreign-history-audit-failed', 'failed', async (home) => {
       const sqlite = new Database(database(await copiedBeside(home, elsewhere, 1)));

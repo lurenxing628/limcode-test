@@ -183,9 +183,14 @@ export async function createRuntimeDataSetDatabaseSnapshot(
  */
 export async function createLocatedRuntimeDatabaseSnapshot(
   root: LocatedRuntimeRoot,
-  options: { beforeOpen?(snapshotPath: string): Promise<void> } = {}
+  options: {
+    beforeOpen?(snapshotPath: string): Promise<void>;
+    /** Takes the private copy instead, e.g. one that counts only when the files kept their state while copied. */
+    copy?(root: LocatedRuntimeRoot): Promise<{ databasePath: string; remove(): Promise<void> }>;
+  } = {}
 ): Promise<RuntimeDataSetDatabaseSnapshot> {
-  return openRuntimeDatabaseSnapshotCopy(await copyRuntimeSqliteFiles(root.containerRoot, root.located.databasePath), root.recorded, options);
+  const copy = options.copy ? await options.copy(root) : await copyRuntimeSqliteFiles(root.containerRoot, root.located.databasePath);
+  return openRuntimeDatabaseSnapshotCopy(copy, root.recorded, options);
 }
 
 async function openRuntimeDatabaseSnapshotCopy(

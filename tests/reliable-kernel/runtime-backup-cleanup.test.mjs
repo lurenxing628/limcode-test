@@ -419,8 +419,8 @@ test('只列出的备份：归档、拷来的目录、旧格式 backups/ 与 .li
     ['data-backups', false, '44', '.limcode-data-backups']
   ]);
   assert.deepEqual(listed.map((item) => item.inCurrentDataSet), [false, false, false, false], '只列出的都不是当前库的一部分（归档就在当前库的目录下也一样）');
-  assert.match(listed[0].reason, /含当时的对话；以后的版本会支持查看和合并，本版本只列出，不删除/);
-  assert.match(listed[1].reason, /含对话；以后的版本会支持查看和合并，本版本只列出，不删除/);
+  assert.match(listed[0].reason, /含当时的对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除/);
+  assert.match(listed[1].reason, /含对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除/);
   assert.equal(listed[0].createdAt, '2026-09-01T01:02:03.004Z');
   assert.equal(listed[1].createdAt, '2026-09-02T01:02:03.004Z');
   const result = await deleteRuntimeBackups(plan, database, listed.map((item) => item.key));

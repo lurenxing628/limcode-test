@@ -44,7 +44,7 @@ const COPIED = entry({
     kind: 'copied', side: 'current', baseDataRootPath: ROOT, containerPath: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
     containerName: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', dataRootRelativePath: '.limcode-runtime/active'
   },
-  status: 'failed', code: 'foreign-history-epoch-not-current', reason: '它是已发布的旧格式（第 4 代），只能在原位置由 LimCode 备份后升级；当前版本不在别处升级它，原样保留。',
+  status: 'failed', code: 'foreign-history-epoch-not-current', reason: '它是已发布的旧格式（第 4 代）。当前版本只在数据目录自己的历史库上先备份再升级旧格式，不升级从别处拷来的目录，所以不能在这里打开它。它原样保留，不会被删除。',
   locatedPath: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678/.limcode-runtime/active', size: { bytes: '8192', fileCount: 5 },
   summary: undefined
 });
@@ -160,6 +160,20 @@ test('选中核验通过的外来库：只读查看经 located 根打开历史�
   assert.match(text, /合计：3 个文件，4096 B/);
 });
 
+test('上一个数据目录里的归档注明来源', async () => {
+  const previous = entry({
+    location: {
+      kind: 'archive', side: 'previous', baseDataRootPath: '/old/limcode',
+      containerPath: '/old/limcode/.limcode-runtime-backups/20260901-010203-004-abcdef12',
+      containerName: 'limcode/.limcode-runtime-backups/20260901-010203-004-abcdef12', dataRootRelativePath: 'active'
+    }
+  });
+  const f = fixture({ entries: [previous], picks: [undefined] });
+  await f.command.manageForeignRuntimeHistory(f.context);
+  const [, items] = f.calls.find((call) => call[0] === 'pick');
+  assert.equal(items[0].label, '归档（上一个数据目录里） · 20260901-010203-004-abcdef12');
+});
+
 test('启动发现：新条目只提示一次，之后再出现的新条目另行提示；“查看”打开外来历史库列表', async () => {
   const one = { id: 'foreign:archive:aaaaaaaaaaaaaaaa' };
   const two = { id: 'foreign:copied:bbbbbbbbbbbbbbbb' };
@@ -171,7 +185,7 @@ test('启动发现：新条目只提示一次，之后再出现的新条目另�
   const infos = f.calls.filter((call) => call[0] === 'info');
   assert.equal(infos.length, 2);
   assert.match(infos[0][1], /^发现 2 个外来历史库/);
-  assert.match(infos[0][1], /只读查看；以后的版本支持合并/);
+  assert.match(infos[0][1], /可以在“历史与存储管理 → 外来历史库”里核验，核验通过的可以只读查看；以后的版本支持合并/, '按发现计数，只承诺核验通过的可以查看');
   assert.match(infos[1][1], /^发现 1 个外来历史库/);
   assert.deepEqual(f.calls.find((call) => call[0] === 'discover'), ['discover', {
     paths: { globalStoragePath: ROOT }, configurationRootPath: ROOT, previousDataRootPath: '/old/limcode'

@@ -752,3 +752,34 @@ export async function withRuntimeClaimAtPath<T>(
 ): Promise<T> {
   return withRuntimeClaim(path.resolve(requireNonEmptyText(claimPath, 'claimPath')), targetPath, operation, wait);
 }
+
+/**
+ * The judgement of {@link listActiveRuntimeHosts} over liveness records the caller read itself, for a
+ * root this process must not follow links into (a foreign history root reads every record as a small
+ * regular file, never through a link, a FIFO or a file of a database this process holds). `records`
+ * are the `*.json` entries with their text; malformed ones come back with state 'malformed'.
+ */
+export function judgeRuntimeHostLivenessRecords(
+  records: ReadonlyArray<{ name: string; text: string }>,
+  classify: RecordedProcessClassifier = classifyRecordedProcess
+): RuntimeHostActiveDescriptor[] {
+  const active: RuntimeHostActiveDescriptor[] = [];
+  for (const { name, text } of records) {
+    let value: unknown;
+    try { value = JSON.parse(text) as unknown; }
+    catch { active.push(malformedDescriptor(name, undefined)); continue; }
+    const record = parseHostLivenessRecord(value);
+    if (!record) { active.push(malformedDescriptor(name, value)); continue; }
+    const state = classify(record.processId, record.processStartIdentity);
+    if (state === 'dead') continue;
+    active.push({
+      hostBootId: record.hostBootId,
+      processId: record.processId,
+      ...(record.processStartIdentity !== undefined ? { processStartIdentity: record.processStartIdentity } : {}),
+      startedAt: record.startedAt,
+      heartbeatAt: record.heartbeatAt,
+      state: state === 'alive' ? 'live' : 'unknown'
+    });
+  }
+  return active;
+}

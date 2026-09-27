@@ -216,7 +216,7 @@ test('deletion only offers other histories and cancellation performs no mutation
   assert.deepEqual(confirmed.calls.filter(call => call[0] === 'delete'), [['delete', 'workspace:old', 'old']]);
   assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /还没有合并到当前库.*删除后其中的对话会永久丢失/,
     '复审 merge3 #7：没有账本记录、从未合并的待合并来源也要警告');
-  assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /归档.*会保留，之后作为外来历史库出现在“历史与存储管理 → 外来历史库”里/,
+  assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /归档.*会保留，之后作为外来历史库出现在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看/,
     '删除历史库不再连带删除归档，确认框写明');
 });
 
