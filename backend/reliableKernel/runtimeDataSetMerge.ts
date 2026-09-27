@@ -668,7 +668,25 @@ export async function requestRuntimeDataSetMerge(
   });
 }
 
-/** Merge state of every non-selected data set, relative to the currently selected one. */
+/**
+ * Reads a data set other than the one this window has open (a private copy of its files) under the
+ * configuration admission and that data set's maintenance claim: every opener of it in this
+ * process (merge finalization, upgrade, read-only history) holds them, and copying files this
+ * process has open in SQLite would release its POSIX locks on them.
+ */
+export async function withRuntimeDataSetReadClaims<T>(
+  paths: { globalStoragePath: string },
+  candidate: VscodeRuntimeDataSetCandidate,
+  read: () => Promise<T>
+): Promise<T> {
+  return withRuntimeDataRootAdmission(path.resolve(paths.globalStoragePath),
+    async () => withRuntimeMaintenance((await requireCompleteRuntimeDataSet(candidate)).paths, read));
+}
+
+/**
+ * Merge state of every non-selected data set, relative to the currently selected one. A content
+ * fingerprint not cached for the exact files is read under that data set's claims.
+ */
 export async function readRuntimeDataSetMergeStates(
   paths: { globalStoragePath: string }
 ): Promise<Map<string, RuntimeDataSetMergeState>> {
@@ -684,7 +702,9 @@ export async function readRuntimeDataSetMergeStates(
     if (candidate.selected || !candidate.dataSetId) continue;
     const recorded = ledger.get(candidate.id);
     const record = recorded && sameRuntimeDataSetIdentity(recorded.source, candidate) ? recorded : undefined;
-    const fingerprint = record ? await runtimeDataSetFingerprint(candidate).catch(() => undefined) : undefined;
+    const fingerprint = record ? await cachedRuntimeDataSetFingerprint(candidate).catch(() => undefined)
+      ?? await withRuntimeDataSetReadClaims(storagePaths, candidate, () => runtimeDataSetFingerprint(candidate)).catch(() => undefined)
+      : undefined;
     const unchanged = record !== undefined && sameRuntimeDataSetFingerprint(record.source, fingerprint);
     const merge = record ? runtimeDataSetLastMerge(record) : undefined;
     const lastMerged: RuntimeDataSetMergedFacts | undefined = merge && {

@@ -32,7 +32,8 @@ const {
 } = kernelFile('vscodeRootAuthority.js');
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
 const {
-  isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, runtimeDataRootAdmissionClaimPath, runtimeMaintenanceClaimPath
+  isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, runtimeDataRootAdmissionClaimPath, runtimeMaintenanceClaimPath,
+  withRuntimeMaintenance
 } = kernelFile('runtimeHostControl.js');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1444,6 +1445,40 @@ test('盲审 merge #8：收尾原因区分来源：本版本切走（用户保�
     assert.equal(reason('conversation_beta_legacy_unfinished_turn'), MERGE_FINALIZATION_REASON);
   } finally { target.close(); }
   assert.equal(KEPT_MERGE_FINALIZATION_REASON, '合并前收尾。');
+});
+
+test('盲审 merge #6：“历史与存储管理”读合并状态时，没缓存的内容指纹在该库的 admission 与 maintenance 里读取，缓存命中不取锁', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_state', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  // Opening the library without writing changes its file state only: its fingerprint is no longer cached.
+  const touch = () => fs.utimes(fixture.alpha.binding.paths.databasePath, new Date(), new Date());
+  const holdMaintenance = async () => {
+    let release;
+    let held;
+    const acquired = new Promise((resolve) => { held = resolve; });
+    const done = withRuntimeMaintenance(fixture.alpha.binding.paths, async () => {
+      held();
+      await new Promise((resolve) => { release = resolve; });
+    });
+    await acquired;
+    return async () => { release(); await done; };
+  };
+  await touch();
+  let release = await holdMaintenance();
+  let settled = false;
+  const reading = readRuntimeDataSetMergeStates(fixture.paths).then((states) => { settled = true; return states; });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(settled, false, '要复制这个库时等它的 maintenance');
+  await release();
+  const states = await reading;
+  assert.deepEqual([states.get(fixture.alpha.id)?.state, states.get(fixture.alpha.id)?.changedSinceMerge], ['merged', false]);
+  // Now cached for exactly these files: read without taking anything.
+  release = await holdMaintenance();
+  try {
+    assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.changedSinceMerge, false);
+  } finally { await release(); }
 });
 
 test('跨模块盲审 #7：合并前备份之前核对剩余空间：不够就推迟并写明约需多少 MB，不写备份、不收尾', async (t) => {

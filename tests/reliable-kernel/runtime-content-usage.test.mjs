@@ -66,7 +66,11 @@ const managementStubs = {
   },
   '../../backend/reliableKernel/runtimeDataSetHistory': {},
   '../../backend/reliableKernel/runtimeDataSetUpgrade': {},
-  '../../backend/reliableKernel/runtimeDataSetMerge': { readRuntimeDataSetMergeStates: async () => new Map() },
+  '../../backend/reliableKernel/runtimeDataSetMerge': {
+    readRuntimeDataSetMergeStates: async () => new Map(),
+    // Summaries of other libraries are read under that library's claims.
+    withRuntimeDataSetReadClaims: async (_paths, _candidate, read) => read()
+  },
   '../../backend/reliableKernel/runtimeDataSetPreflight': { summarizeRuntimeDataSet: async () => undefined },
   '../../backend/reliableKernel/runtimeExclusiveMaintenance': { EXCLUSIVE_MAINTENANCE_DEFAULTS: { busyWaitTimeoutMs: 60_000 } },
   '../../backend/reliableKernel/runtimeStorageInspection': {

@@ -37,10 +37,10 @@ function fixture({
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
   mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, exclusiveOutcome = 'completed', summaries = {}, globalState,
-  lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {})
+  emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {})
 } = {}) {
   const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current', source: 'legacy' };
-  const old = { id: 'workspace:old', dataSetId: 'old', rootInstanceId: 'old-instance', runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old', source: 'workspace' };
+  const old = { id: 'workspace:old', ...(emptyOld ? {} : { dataSetId: 'old', rootInstanceId: 'old-instance' }), runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old', source: 'workspace' };
   const calls = [];
   class SelectionRequired extends Error { constructor() { super('select'); this.candidates = [current, old]; this.problems = problems; } }
   const vscode = {
@@ -110,6 +110,13 @@ function fixture({
       RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS: 56789,
       requestRuntimeDataSetMerge: async (_paths, input) => {
         calls.push(['merge-request', input.candidateId, input.expectedDataSetId, input.expectedRootInstanceId]);
+      },
+      // The library's admission and maintenance claim around a read of it.
+      withRuntimeDataSetReadClaims: async (_paths, candidate, read) => {
+        // As the engine: a library without data has no complete data set to claim.
+        if (!candidate.dataSetId) throw new Error('这个历史库还没有数据。');
+        calls.push(['claims', candidate.id]);
+        try { return await read(); } finally { calls.push(['claims-released', candidate.id]); }
       }
     },
     '../../backend/reliableKernel/runtimeDataSetHistory': {
@@ -715,6 +722,18 @@ test('盲审 merge #3：合并通知与日志写明取消的排队消息；只�
     '[LimCode] 已合并旧聊天记录 workspace:old：新增 12 行；合并前备份：/fixture/backup；收尾 0 个中断任务，另有 2 条排队未发送的消息已取消，'
     + '收尾前来源备份：/fixture/source-backup'
   ]);
+});
+
+test('盲审 merge #6：列表摘要在该库的 admission 与 maintenance 里读取；没有数据的库不读也不显示读取失败', async () => {
+  let shown;
+  const f = fixture({ picks: [action('history'), items => { shown = items; return undefined; }] });
+  await f.manageRuntimeDataSets(f.context, f.startup);
+  assert.deepEqual(plain(f.calls.filter(call => ['claims', 'summarize', 'claims-released'].includes(call[0]))),
+    [['claims', 'workspace:old'], ['summarize', 'workspace:old'], ['claims-released', 'workspace:old']]);
+  const empty = fixture({ emptyOld: true, picks: [action('history'), items => { shown = items; return undefined; }] });
+  await empty.manageRuntimeDataSets(empty.context, empty.startup);
+  assert.equal(empty.calls.some(call => ['claims', 'summarize'].includes(call[0])), false);
+  assert.doesNotMatch(shown[0].description, /读取失败/);
 });
 
 test('跨模块盲审 #7：磁盘空间不足的推迟只在新原因出现时提示，所需空间的数字变了也不重复提示', async () => {

@@ -10,7 +10,7 @@ import { openRuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeD
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
 import {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
-  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS,
+  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, withRuntimeDataSetReadClaims,
   type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergedFacts,
   type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeResult, type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
 } from '../../backend/reliableKernel/runtimeDataSetMerge';
@@ -127,9 +127,10 @@ function isPublishedOldDataSet(candidate: VscodeRuntimeDataSetCandidate): boolea
 }
 
 /**
- * Names, counts and last activity come from a private snapshot of each data set. The selected
- * data set is skipped while this window has it open: copying its files would release this
- * process's SQLite locks on them.
+ * Names, counts and last activity come from a private snapshot of each data set, taken under that
+ * data set's claims (as every opener of it in this process holds them). The selected data set is
+ * skipped while this window has it open: copying its files would release this process's SQLite
+ * locks on them.
  */
 async function chooseDataSet(
   candidates: readonly VscodeRuntimeDataSetCandidate[],
@@ -141,8 +142,10 @@ async function chooseDataSet(
   // Read in a worker from private copies, one data set at a time, kept per file state.
   const summaries = new Map<string, RuntimeDataSetSummary | 'unreadable'>();
   for (const candidate of candidates) {
-    if (candidate.selected && !options.summarizeSelected) continue;
-    const summary = await summarizeRuntimeDataSet(candidate).catch(() => 'unreadable' as const);
+    // A library without data has nothing to read (and no maintenance claim of its own).
+    if ((candidate.selected && !options.summarizeSelected) || !candidate.dataSetId) continue;
+    const summary = await withRuntimeDataSetReadClaims({ globalStoragePath: candidate.configurationRootPath }, candidate,
+      () => summarizeRuntimeDataSet(candidate)).catch(() => 'unreadable' as const);
     if (summary) summaries.set(candidate.id, summary);
   }
   // A startup preflight rejection names a candidate: shown on that candidate, still choosable.
