@@ -20,7 +20,7 @@ export interface RuntimeDataSetFactsRequest {
   openable?: boolean;
   contentDigest?: boolean;
   summary?: boolean;
-  /** Every Conversation and MessageRevision id (the readable history), each sorted. */
+  /** Every Conversation and MessageRevision id (the readable history), read from the tables, in no particular order. */
   historyIds?: boolean;
   /** The unfinished work a relocation carries away (see relocatedWorkInventory), from the same snapshot. */
   relocatedWork?: boolean;

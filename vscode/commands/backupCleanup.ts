@@ -29,6 +29,7 @@ type Ask = (prompt: DataRootPrompt) => Promise<DataRootPromptAnswer>;
 const CANCEL = { key: 'cancel', label: '取消', variant: 'secondary' as const };
 const OK = { key: 'cancel', label: '知道了', variant: 'secondary' as const };
 const SETTINGS_LOCATION = '其他 → 数据目录';
+const DELETABLE_KINDS: ReadonlySet<RuntimeBackupKind> = new Set(['epoch-migration', 'merge-target', 'merge-source']);
 
 /** Group order of the first panel: the three kinds that can be proven first, then the listed ones. */
 const KINDS: ReadonlyArray<{ kind: RuntimeBackupKind; title: string; purpose: string }> = [
@@ -74,17 +75,23 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   let plan: RuntimeBackupCleanupPlan;
   try {
     plan = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在检查备份…' },
-      (progress) => runRuntimeDataSetUpgrade(context, () => planRuntimeBackupCleanup(configurationRootPath, current, {
-        onProgress: (message) => progress.report({ message })
-      })));
+      (progress) => runRuntimeDataSetUpgrade(context, () => {
+        const check = () => planRuntimeBackupCleanup(configurationRootPath, current, {
+          onProgress: (message) => progress.report({ message })
+        });
+        // The check writes too (it settles leftovers of an interrupted cleanup, copies other data
+        // sets under their maintenance and writes the id cache): a write command for the freeze.
+        return host.writeGate ? host.writeGate.run(check) : check();
+      }));
   } catch (error) {
     await tell(ask, '备份检查没有完成', [describeError(error), '没有删除任何内容。']);
     return;
   }
+  logDetails(plan.details, plan.items);
   const deletable = plan.items.filter((item) => item.deletable);
   const first = await ask({
     title: deletable.length > 0 ? '清理备份：勾选要删除的备份' : '清理备份：没有可以删除的备份',
-    description: '只删除能证明完整存在于本地库的副本：副本里的每个对话、每条消息都还在同一位置的历史库里。含有别处没有的对话的备份一律保留。',
+    description: '只删除能证明完整存在于本地库的副本：副本里的每个对话、每个消息版本（包括编辑前的版本）都还在同一位置的历史库里。含有别处没有的对话的备份一律保留。',
     sections: firstPanelSections(plan),
     actions: deletable.length > 0 ? [CANCEL, { key: 'next', label: '下一步', variant: 'default' }] : [OK]
   });
@@ -127,7 +134,16 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
     await tell(ask, '备份没有删除', [describeError(error)]);
     return;
   }
+  logDetails([], [...result.kept, ...result.unfinished]);
   await tell(ask, result.deleted.length > 0 ? '备份已删除' : '没有删除任何备份', resultLines(result));
+}
+
+/** The technical causes behind the reasons shown, for the log only. */
+function logDetails(details: readonly string[], items: ReadonlyArray<{ name: string; reason: string; detail?: string }>): void {
+  for (const detail of details) console.warn('[LimCode] 清理备份：', detail);
+  for (const item of items) {
+    if (item.detail) console.warn(`[LimCode] 清理备份：${item.name}（${item.reason}）`, item.detail);
+  }
 }
 
 function firstPanelSections(plan: RuntimeBackupCleanupPlan): DataRootPromptSection[] {
@@ -139,6 +155,8 @@ function firstPanelSections(plan: RuntimeBackupCleanupPlan): DataRootPromptSecti
         ? `可以删除 ${deletable.length} 项，合计 ${formatBytes(sum(deletable.map((item) => item.bytes)))}（预计释放 ${formatBytes(sum(deletable.map((item) => item.reclaimableBytes)))}）；默认都不勾选。`
         : '没有能证明已完整存在于本地库的备份，全部保留。',
       ...(plan.finishedDeletions.length > 0 ? [`已删完上次没有删完的 ${plan.finishedDeletions.length} 项。`] : []),
+      ...(plan.restoredDeletions.length > 0
+        ? [`上次清理在最后一次核对之前中断：${plan.restoredDeletions.length} 项已改回原名，按这次的核对结果列出。`] : []),
       ...plan.problems
     ]
   }];
@@ -178,10 +196,11 @@ function createdText(item: RuntimeBackupCleanupItem): string {
   return item.createdAt ? `创建于 ${formatTime(item.createdAt)}` : '创建时间未知';
 }
 
+/** Whose copy it is only for the kinds that belong to a data set; the listed-only ones just say where they are. */
 function locationText(item: RuntimeBackupCleanupItem): string {
-  const owner = item.kind === 'copied-data-root' ? '数据目录旁边'
-    : item.inCurrentDataSet ? '当前库' : item.dataSetCandidateId ? `历史库 ${item.dataSetCandidateId}` : '数据目录';
-  return `位置：${owner}，${item.path}`;
+  if (!DELETABLE_KINDS.has(item.kind)) return `位置：${item.path}`;
+  const owner = item.inCurrentDataSet ? '当前库' : item.dataSetCandidateId ? `历史库 ${item.dataSetCandidateId}` : '未知的历史库';
+  return `所属：${owner}　位置：${item.path}`;
 }
 
 async function tell(ask: Ask, title: string, lines: string[]): Promise<void> {

@@ -9,13 +9,13 @@ const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/e
 const { RuntimeWriteGate } = require(path.join(compiled, 'backend/application/reliableKernel/runtimeWriteGate.js'));
 
 /** Loads vscode/commands/backupCleanup.ts with every dependency replaced by a recording fake. */
-function loadCommand(dependencies) {
+function loadCommand(dependencies, sandboxConsole = console) {
   const filename = path.resolve(__dirname, '../../vscode/commands/backupCleanup.ts');
   const module = { exports: {} };
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText, {
-    module, exports: module.exports, console, process,
+    module, exports: module.exports, console: sandboxConsole, process,
     require(name) {
       if (!Object.prototype.hasOwnProperty.call(dependencies, name)) throw new Error(`Unexpected source dependency: ${name}`);
       return dependencies[name];
@@ -32,7 +32,7 @@ function item(overrides) {
   return {
     key: 'merge-target:.limcode-runtime/merge-backups/a', kind: 'merge-target', name: 'a', path: `${CONTROL}/merge-backups/a`,
     dataSetCandidateId: 'default', inCurrentDataSet: true, bytes: '2048', reclaimableBytes: '1024', fileCount: 2,
-    createdAt: '2026-09-20T01:02:00.000Z', deletable: true, reason: '可以删除：其中 2 个对话、4 条消息都完整存在于当前库', ...overrides
+    createdAt: '2026-09-20T01:02:00.000Z', deletable: true, reason: '可以删除：其中 2 个对话、4 个消息版本都完整存在于当前库', ...overrides
   };
 }
 
@@ -40,10 +40,12 @@ const PLAN = {
   configurationRootPath: ROOT,
   checkedAt: '2026-09-27T08:00:00.000Z',
   finishedDeletions: [`${CONTROL}/merge-backups/old.deleting-0123456789abcdef`],
+  restoredDeletions: [],
   problems: [],
+  details: [],
   items: [
     item({ key: 'merge-target:old', name: 'merge-old', path: `${CONTROL}/merge-backups/merge-old` }),
-    item({ key: 'merge-target:newest', name: 'merge-newest', path: `${CONTROL}/merge-backups/merge-newest`, deletable: false, reason: '这是这个库最新的一份合并前备份，保留' }),
+    item({ key: 'merge-target:newest', name: 'merge-newest', path: `${CONTROL}/merge-backups/merge-newest`, deletable: false, reason: '这是这个库最新的一份满 1 小时的完整合并前备份，保留' }),
     item({
       key: 'epoch-migration:up', kind: 'epoch-migration', name: 'upgrade', path: `${CONTROL}/epoch-migration-backups/upgrade`, bytes: '4096', reclaimableBytes: '4096',
       deletable: false, reason: '含 3 个当前库没有的对话（可能是你删掉的），按历史保留', missingConversations: 3
@@ -51,16 +53,16 @@ const PLAN = {
     item({
       key: 'merge-source:src', kind: 'merge-source', name: 'source', path: '/data/limcode/.limcode-workspace-runtimes/scopes/x/.limcode-runtime/merge-source-backups/source',
       dataSetCandidateId: 'workspace:folder-x', inCurrentDataSet: false, bytes: '1048576', reclaimableBytes: '1048576',
-      reason: '可以删除：其中 1 个对话、2 条消息都完整存在于这个历史库（workspace:folder-x）'
+      reason: '可以删除：其中 1 个对话、2 个消息版本都完整存在于这个历史库（workspace:folder-x）'
     }),
     item({
       key: 'reset-archive:arch', kind: 'reset-archive', name: '20260901-010203-004-abcdef12', path: `${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`,
-      bytes: '100', reclaimableBytes: '100', deletable: false, reason: '“归档并重置”时整份保留的历史库，含当时的对话；以后的版本会支持查看和合并，本版本只列出，不删除'
+      inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '“归档并重置”时整份保留的历史库，含当时的对话；以后的版本会支持查看和合并，本版本只列出，不删除'
     })
   ]
 };
 
-function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = true, writeGate } = {}) {
+function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = true, writeGate, onPlan, warnings } = {}) {
   const calls = [];
   const prompts = [];
   const database = { binding: { dataSetId: 'current' }, snapshot: async () => ({ snapshot: [] }) };
@@ -86,6 +88,7 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
       async planRuntimeBackupCleanup(root, current, options) {
         calls.push(['plan', root, current === database]);
         options.onProgress('正在核对 merge-old…');
+        onPlan?.();
         if (planError) throw planError;
         return plan;
       },
@@ -113,7 +116,7 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
       runRuntimeDataSetUpgrade: (_context, operation) => { calls.push(['lifetime']); return operation(); }
     }
   };
-  const command = loadCommand(dependencies);
+  const command = loadCommand(dependencies, warnings ? { ...console, warn: (...args) => warnings.push(args.map(String).join(' ')) } : console);
   return { calls, prompts, run: (request = { clientId: 'client-1' }) => command.cleanupBackups({}, startup, request) };
 }
 
@@ -137,13 +140,14 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   assert.match(merge.lines[0], /^用途：/);
   assert.deepEqual(merge.options.map((option) => option.key), ['merge-target:old']);
   assert.match(merge.options[0].label, /^merge-old（2 KiB，预计释放 1 KiB）$/);
-  assert.match(merge.options[0].detail, /创建于 2026-09-\d\d \d\d:\d\d.*位置：当前库，\/data\/limcode\/\.limcode-runtime\/merge-backups\/merge-old.*可以删除：其中 2 个对话/);
-  assert.ok(merge.lines.some((line) => line.startsWith('merge-newest（2 KiB）') && line.endsWith('不删除：这是这个库最新的一份合并前备份，保留')));
+  assert.match(merge.options[0].detail, /创建于 2026-09-\d\d \d\d:\d\d.*所属：当前库　位置：\/data\/limcode\/\.limcode-runtime\/merge-backups\/merge-old.*可以删除：其中 2 个对话/);
+  assert.ok(merge.lines.some((line) => line.startsWith('merge-newest（2 KiB）') && line.endsWith('不删除：这是这个库最新的一份满 1 小时的完整合并前备份，保留')));
   const upgrade = first.sections.find((section) => section.title === '升级前备份（1 项）');
   assert.deepEqual(upgrade.options, [], '不可删的项没有勾选框');
   assert.ok(upgrade.lines.some((line) => line.includes('不删除：含 3 个当前库没有的对话（可能是你删掉的），按历史保留')));
   const archive = first.sections.find((section) => section.title?.startsWith('“归档并重置”'));
-  assert.ok(archive.lines.some((line) => line.includes('位置：当前库，/data/limcode/.limcode-runtime-backups/') && line.includes('（100 B）')));
+  assert.ok(archive.lines.some((line) => line.includes('位置：/data/limcode/.limcode-runtime-backups/') && line.includes('（100 B）')));
+  assert.ok(archive.lines.every((line) => !line.includes('当前库') && !line.includes('所属：')), '只列出的归档不是当前库的一部分，位置只写路径');
   assert.ok(first.sections[0].lines.includes('已删完上次没有删完的 1 项。'));
   assert.ok(first.sections[0].lines.some((line) => line.startsWith('可以删除 2 项，合计 1 MiB') && line.includes('默认都不勾选')));
 
@@ -265,4 +269,46 @@ test('冻结期间（本窗口正在迁移数据目录等）清理备份按写�
   const open = fixture({ writeGate: gate, answers: [{ choice: 'next', include: ['merge-target:old'] }, { choice: 'delete', include: [] }] });
   await open.run();
   assert.deepEqual(open.calls.find((call) => call[0] === 'delete')?.[3], ['merge-target:old'], '解冻后照常删除');
+});
+
+test('检查进行中开始冻结（迁移数据目录的 beforeGo）：检查按写命令计入冻结基线', async () => {
+  const gate = new RuntimeWriteGate();
+  let baseline;
+  let thaw;
+  const f = fixture({
+    writeGate: gate,
+    onPlan() {
+      // The check may be settling leftovers of an interrupted cleanup or copying another data set right now.
+      thaw = gate.freeze('迁移数据目录', []);
+      baseline = gate.frozenBaseline();
+    }
+  });
+  await f.run();
+  thaw?.();
+  assert.ok(baseline, '检查期间发生了冻结');
+  assert.equal(baseline.writesRunning, true, '冻结时这次检查算作仍在进行的写命令');
+});
+
+test('检查结果：上次中断、改回原名的项写在面板上；技术原因只写进日志，不显示在面板上', async () => {
+  const warnings = [];
+  const f = fixture({
+    warnings,
+    plan: {
+      ...PLAN,
+      restoredDeletions: [`${CONTROL}/merge-backups/merge-old`],
+      problems: ['/data/limcode/.limcode-runtime 里的备份没有全部列出。'],
+      details: ['/data/limcode/.limcode-runtime 里的备份没有全部列出。 EACCES: permission denied, scandir'],
+      items: [...PLAN.items, item({
+        key: 'merge-target:bad', name: 'merge-bad', deletable: false, reason: '这份备份的数据库已损坏，无法核对，按历史保留',
+        detail: 'SQLITE_CORRUPT: database disk image is malformed'
+      })]
+    }
+  });
+  await f.run();
+  const first = f.prompts[0];
+  assert.ok(first.sections[0].lines.includes('上次清理在最后一次核对之前中断：1 项已改回原名，按这次的核对结果列出。'));
+  assert.ok(first.sections[0].lines.includes('/data/limcode/.limcode-runtime 里的备份没有全部列出。'));
+  assert.doesNotMatch(JSON.stringify(first), /SQLITE_CORRUPT|EACCES/);
+  assert.ok(warnings.some((line) => line.includes('merge-bad') && line.includes('SQLITE_CORRUPT')), warnings.join('\n'));
+  assert.ok(warnings.some((line) => line.includes('EACCES')), warnings.join('\n'));
 });

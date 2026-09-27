@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -20,6 +20,8 @@ const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
 const { writeRuntimeDataSetMergeFinalization } = kernelFile('runtimeDataSetMergeLedger.js');
 const { migratePreviousRuntimeEpochIfRequired } = kernelFile('runtimeEpochMigration.js');
 const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBackupCleanup.js');
+const { runtimeDataRootAdmissionClaimPath, runtimeMaintenanceClaimPath, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
+const durableDirectorySync = require(path.join(compiled, 'backend/capabilities/filesystem/durableDirectorySync.js'));
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
@@ -46,7 +48,7 @@ test('合并前备份：内容全在当前库的旧备份可删、最新一份�
   assert.equal(olderItem.kind, 'merge-target');
   assert.equal(olderItem.deletable, true, olderItem.reason);
   assert.deepEqual([olderItem.conversations, olderItem.revisions, olderItem.missingConversations, olderItem.missingRevisions], [2, 4, 0, 0]);
-  assert.match(olderItem.reason, /^可以删除：其中 2 个对话、4 条消息都完整存在于当前库$/);
+  assert.match(olderItem.reason, /^可以删除：其中 2 个对话、4 个消息版本都完整存在于当前库$/);
   assert.equal(olderItem.inCurrentDataSet, true);
   assert.equal(olderItem.dataSetCandidateId, 'default');
   assert.ok(BigInt(olderItem.bytes) > 0n);
@@ -54,7 +56,7 @@ test('合并前备份：内容全在当前库的旧备份可删、最新一份�
   assert.ok(olderItem.createdAt, '创建时间取自目录名');
   const newestItem = itemAt(plan, newest);
   assert.equal(newestItem.deletable, false);
-  assert.match(newestItem.reason, /最新的一份合并前备份/);
+  assert.equal(newestItem.reason, '这是这个库最新的一份满 1 小时的完整合并前备份，保留');
   assert.ok(reader.calls > 0, '当前库经它自己的读取线程查询');
   assert.ok(reader.maxBatch <= 250, '每次最多查 250 个 id');
 
@@ -64,32 +66,74 @@ test('合并前备份：内容全在当前库的旧备份可删、最新一份�
   });
   assert.deepEqual(result.deleted.map((item) => item.path), [older]);
   assert.deepEqual(result.kept.map((item) => [item.path, item.reason]), [[newest, '不在可以删除的清单里']]);
-  assert.deepEqual(renames, ['before-rename', 'after-rename']);
+  assert.deepEqual(renames, ['before-rename', 'after-rename', 'after-verify']);
   await assert.rejects(fs.lstat(older), { code: 'ENOENT' });
   assert.deepEqual(await fs.readdir(path.dirname(older)), [path.basename(newest)], '没有留下 .deleting- 目录');
   const again = await planRuntimeBackupCleanup(fixture.root, reader);
   assert.equal(again.items.some((item) => item.path === older), false);
 });
 
-test('合并前备份的保护：不满 1 小时的、目录里有 .tmp 的都保留（与最新一份分别判断）', async (t) => {
+test('合并前备份的保护：最新一份只认满 1 小时的完整备份，它和比它新的都保留；不满 1 小时（名字时间与目录修改时间取较晚的）、有 .tmp 的保留', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one']);
   const database = await openCurrent(t, fixture);
-  const old = await targetBackup(fixture.current, database, 240);
-  const writing = await targetBackup(fixture.current, database, 180);
+  const oldest = await targetBackup(fixture.current, database, 300);
+  const anchor = await targetBackup(fixture.current, database, 240);
+  const writing = await targetBackup(fixture.current, database, 200);
   await fs.writeFile(path.join(writing, `limcode.sqlite.${process.pid}.tmp`), 'partial');
-  await backdate(writing, 180);
+  await backdate(writing, 200);
+  // Newer than the anchor and an hour old, but without a database: never the anchor, kept as newer.
+  const incomplete = path.join(controlRoot(fixture.current), 'merge-backups', backupName(150));
+  await fs.mkdir(incomplete);
+  await fs.writeFile(path.join(incomplete, 'root-binding.json'), JSON.stringify(database.binding));
+  await backdate(incomplete, 150);
+  // Named 2 hours ago, but its directory changed 20 minutes ago: counted from the later time.
+  const touched = await targetBackup(fixture.current, database, 120);
+  await backdate(touched, 20);
   const young = await targetBackup(fixture.current, database, 30);
   const newest = await targetBackup(fixture.current, database, 10);
 
   const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.equal(itemAt(plan, old).deletable, true, itemAt(plan, old).reason);
-  assert.deepEqual([itemAt(plan, writing).deletable, itemAt(plan, writing).reason], [false, '备份还没有写完（目录里有临时文件），保留']);
-  assert.deepEqual([itemAt(plan, young).deletable, itemAt(plan, young).reason], [false, '创建不满 1 小时，可能正被合并使用，保留']);
-  assert.match(itemAt(plan, newest).reason, /最新的一份合并前备份/);
-  // An hour later the young one is an ordinary older backup.
+  const reasons = (checked) => Object.fromEntries([oldest, anchor, writing, incomplete, touched, young, newest]
+    .map((directory, index) => [['oldest', 'anchor', 'writing', 'incomplete', 'touched', 'young', 'newest'][index], itemAt(checked, directory).reason]));
+  assert.equal(itemAt(plan, oldest).deletable, true, itemAt(plan, oldest).reason);
+  assert.deepEqual(reasons(plan), {
+    oldest: itemAt(plan, oldest).reason,
+    anchor: '这是这个库最新的一份满 1 小时的完整合并前备份，保留',
+    writing: '备份还没有写完（目录里有临时文件），保留',
+    incomplete: '比这个库最新的一份满 1 小时的完整合并前备份还新，保留',
+    touched: '创建不满 1 小时，可能正被合并使用，保留',
+    young: '创建不满 1 小时，可能正被合并使用，保留',
+    newest: '创建不满 1 小时，可能正被合并使用，保留'
+  });
+  // An hour later the newest complete one anchors the protection, and the ones before it are older backups.
   const later = await planRuntimeBackupCleanup(fixture.root, database, { now: () => Date.now() + 61 * MINUTE });
-  assert.equal(itemAt(later, young).deletable, true, itemAt(later, young).reason);
+  for (const directory of [oldest, anchor, touched, young]) assert.equal(itemAt(later, directory).deletable, true, itemAt(later, directory).reason);
+  assert.equal(itemAt(later, newest).reason, '这是这个库最新的一份满 1 小时的完整合并前备份，保留');
+  assert.equal(itemAt(later, incomplete).reason, '备份里没有数据库文件，不处理');
+
+  // Without any complete backup an hour old, every one stays.
+  await fs.rm(oldest, { recursive: true });
+  await fs.rm(anchor, { recursive: true });
+  const none = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.equal(itemAt(none, incomplete).reason, '这个库还没有满 1 小时的完整合并前备份，全部保留');
+});
+
+test('锁内复核按同一口径找最新一份：列出之后原来的最新一份不见了、只多了不满 1 小时的，那一项不删', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  const database = await openCurrent(t, fixture);
+  const older = await targetBackup(fixture.current, database, 240);
+  const anchor = await targetBackup(fixture.current, database, 180);
+  const plan = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.equal(itemAt(plan, older).deletable, true, itemAt(plan, older).reason);
+  // Meanwhile another window's merge batch pruned the anchor and wrote a backup it may still discard.
+  await fs.rm(anchor, { recursive: true });
+  await targetBackup(fixture.current, database, 5);
+  const result = await deleteRuntimeBackups(plan, database, [itemAt(plan, older).key]);
+  assert.deepEqual(result.deleted, []);
+  assert.deepEqual(result.kept.map((item) => item.reason), ['这是这个库最新的一份满 1 小时的完整合并前备份，保留；这一项没有删除']);
+  assert.ok((await fs.lstat(older)).isDirectory());
 });
 
 test('覆盖核对：当前库删掉一个对话后，对应副本变为不可删；列出之后才删掉的对话也在锁内挡住删除', async (t) => {
@@ -156,14 +200,14 @@ test('升级前备份：升级完成满 7 天才可删；控制根里有进行�
   const eightDays = { now: () => Date.now() + 8 * DAY };
   const later = await planRuntimeBackupCleanup(fixture.root, database, eightDays);
   assert.equal(itemAt(later, backup).deletable, true, itemAt(later, backup).reason);
-  assert.match(itemAt(later, backup).reason, /2 个对话、4 条消息都完整存在于当前库/);
+  assert.match(itemAt(later, backup).reason, /2 个对话、4 个消息版本都完整存在于当前库/);
 
   const journal = path.join(controlRoot(fixture.current), 'epoch-to-5-migration.json');
   await fs.writeFile(journal, '{}');
   const journaled = await planRuntimeBackupCleanup(fixture.root, database, eightDays);
-  assert.equal(itemAt(journaled, backup).reason, '有进行中的操作（epoch-to-5-migration.json），完成之后再清理');
+  assert.equal(itemAt(journaled, backup).reason, '有进行中的操作（未完成的升级），完成之后再清理');
   const result = await deleteRuntimeBackups(later, database, [itemAt(later, backup).key], eightDays);
-  assert.deepEqual(result.kept.map((item) => item.reason), ['有进行中的操作（epoch-to-5-migration.json），完成之后再清理；这一项没有删除'],
+  assert.deepEqual(result.kept.map((item) => item.reason), ['有进行中的操作（未完成的升级），完成之后再清理；这一项没有删除'],
     '锁内复核：列出之后出现的日志也挡住删除');
   await fs.rm(journal);
 
@@ -202,7 +246,7 @@ test('合并来源的收尾前备份：真实收尾留下的可删；被未报�
   assert.equal(item.kind, 'merge-source');
   assert.equal(item.deletable, true, item.reason);
   assert.equal(item.inCurrentDataSet, false);
-  assert.equal(item.reason, `可以删除：其中 2 个对话、4 条消息都完整存在于这个历史库（${fixture.alpha.id}）`);
+  assert.equal(item.reason, `可以删除：其中 2 个对话、4 个消息版本都完整存在于这个历史库（${fixture.alpha.id}）`);
 
   await writeRuntimeDataSetMergeFinalization(fixture.paths, {
     candidateId: fixture.alpha.id,
@@ -222,7 +266,7 @@ test('合并来源的收尾前备份：真实收尾留下的可删；被未报�
   });
   const revision = itemAt(await planRuntimeBackupCleanup(fixture.root, database), sourceBackup);
   assert.deepEqual([revision.deletable, revision.missingConversations, revision.missingRevisions, revision.reason],
-    [false, 0, 1, `含 1 条这个历史库（${fixture.alpha.id}）没有的消息，按历史保留`]);
+    [false, 0, 1, `含 1 个这个历史库（${fixture.alpha.id}）没有的消息版本，按历史保留`]);
 
   rawEdit(fixture.alpha, (source) => source.prepare('DELETE FROM conversation WHERE id = ?').run('conversation_alpha_one'));
   const conversation = itemAt(await planRuntimeBackupCleanup(fixture.root, database), sourceBackup);
@@ -241,7 +285,7 @@ test('来源库在列出之后有改动：锁内按文件状态复核，那一�
   assert.equal(itemAt(plan, backup).deletable, true, itemAt(plan, backup).reason);
   await seed(fixture.alpha, ['conversation_alpha_later']);
   const result = await deleteRuntimeBackups(plan, database, [itemAt(plan, backup).key]);
-  assert.deepEqual(result.kept.map((item) => item.reason), ['暂时无法核对（所在历史库在检查之后有改动）；这一项没有删除']);
+  assert.deepEqual(result.kept.map((item) => item.reason), ['所在历史库在检查之后有改动，请重新检查；这一项没有删除']);
   assert.ok((await fs.lstat(backup)).isDirectory());
 });
 
@@ -260,33 +304,60 @@ test('不是所在历史库的备份（身份不一致）与比所在历史库�
   const binding = JSON.parse(await fs.readFile(path.join(ahead, 'root-binding.json'), 'utf8'));
   await fs.writeFile(path.join(ahead, 'root-binding.json'), JSON.stringify({ ...binding, rootGeneration: binding.rootGeneration + 1 }));
   await backdate(ahead, 240);
+  // Same data set and root instance ids, but recorded at another place (paths are compared too).
+  const elsewhere = await targetBackup(fixture.current, database, 200);
+  const recorded = JSON.parse(await fs.readFile(path.join(elsewhere, 'root-binding.json'), 'utf8'));
+  await fs.writeFile(path.join(elsewhere, 'root-binding.json'), JSON.stringify({
+    ...recorded, paths: { ...recorded.paths, casRootPath: path.join(path.dirname(recorded.paths.casRootPath), 'elsewhere-cas') }
+  }));
+  await backdate(elsewhere, 200);
   await targetBackup(fixture.current, database, 120);
 
   const plan = await planRuntimeBackupCleanup(fixture.root, database);
   assert.deepEqual([itemAt(plan, foreign).deletable, itemAt(plan, foreign).reason], [false, '不是所在历史库的备份（身份不一致），按历史保留']);
   assert.deepEqual([itemAt(plan, ahead).deletable, itemAt(plan, ahead).reason], [false, '所在历史库比这份备份更旧（代数更低），按历史保留']);
+  assert.deepEqual([itemAt(plan, elsewhere).deletable, itemAt(plan, elsewhere).reason], [false, '不是所在历史库的备份（身份不一致），按历史保留']);
 });
 
-test('改名之后崩溃（子进程 SIGKILL）：留下的 .deleting- 目录由下次清理删完', async (t) => {
+test('删除中崩溃（子进程 SIGKILL）：改名后、再次核对前崩溃的改回原名重新核对；核对并标记之后崩溃的由下次清理删完', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one']);
   const database = await openCurrent(t, fixture);
   const doomed = await targetBackup(fixture.current, database, 180);
   const kept = await targetBackup(fixture.current, database, 120);
+  const parent = path.dirname(doomed);
   const key = itemAt(await planRuntimeBackupCleanup(fixture.root, database), doomed).key;
 
-  const child = await runChild(['delete-then-crash', fixture.root, key]);
-  assert.equal(child.signal, 'SIGKILL', child.stderr);
-  const names = await fs.readdir(path.dirname(doomed));
-  const leftover = names.find((name) => name.startsWith(`${path.basename(doomed)}.deleting-`));
-  assert.ok(leftover, names.join(','));
-  assert.match(leftover, /\.deleting-[0-9a-f]{16}$/);
+  const early = await runChild(['delete-then-crash', fixture.root, key, 'after-rename']);
+  assert.equal(early.signal, 'SIGKILL', early.stderr);
+  let names = await fs.readdir(parent);
+  const unverified = names.find((name) => name.startsWith(`${path.basename(doomed)}.deleting-`));
+  assert.ok(unverified, names.join(','));
+  assert.match(unverified, /\.deleting-[0-9a-f]{16}$/);
   assert.equal(names.includes(path.basename(doomed)), false, '改名已经持久');
+  assert.deepEqual(await fs.readdir(path.join(parent, unverified)).then((entries) => entries.includes('.limcode-backup-cleanup-verified')), false);
+  // A mark left from an earlier attempt names another directory: it never counts, and goes with the restore.
+  await fs.writeFile(path.join(parent, unverified, '.limcode-backup-cleanup-verified'), JSON.stringify({
+    kind: 'limcode-backup-cleanup-verified', name: `${path.basename(doomed)}.deleting-0123456789abcdef`
+  }));
 
+  const restored = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.deepEqual([restored.finishedDeletions, restored.restoredDeletions], [[], [doomed]], '没有核对完的不删，改回原名');
+  assert.deepEqual((await fs.readdir(parent)).sort(), [path.basename(doomed), path.basename(kept)].sort());
+  assert.equal((await fs.readdir(doomed)).includes('.limcode-backup-cleanup-verified'), false, '改回原名时去掉不属于它的标记');
+  assert.equal(restored.items.some((item) => item.path.includes('.deleting-')), false);
+  // Taking the stale mark out touched the directory (young for an hour); as an older backup it is listed as checked.
+  await backdate(doomed, 180);
+  assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), doomed).deletable, true, '改回原名后按这次的核对结果列出');
+
+  const late = await runChild(['delete-then-crash', fixture.root, key, 'after-verify']);
+  assert.equal(late.signal, 'SIGKILL', late.stderr);
+  names = await fs.readdir(parent);
+  const verified = names.find((name) => name.startsWith(`${path.basename(doomed)}.deleting-`));
+  assert.ok(verified, names.join(','));
   const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.deepEqual(plan.finishedDeletions, [path.join(path.dirname(doomed), leftover)]);
-  assert.deepEqual(await fs.readdir(path.dirname(doomed)), [path.basename(kept)]);
-  assert.equal(plan.items.some((item) => item.path.includes('.deleting-')), false);
+  assert.deepEqual([plan.finishedDeletions, plan.restoredDeletions], [[path.join(parent, verified)], []]);
+  assert.deepEqual(await fs.readdir(parent), [path.basename(kept)]);
   assert.equal(itemAt(plan, kept).deletable, false, '剩下的是最新一份');
 });
 
@@ -347,6 +418,7 @@ test('只列出的备份：归档、拷来的目录、旧格式 backups/ 与 .li
     ['legacy-cutover', false, '33', 'backups'],
     ['data-backups', false, '44', '.limcode-data-backups']
   ]);
+  assert.deepEqual(listed.map((item) => item.inCurrentDataSet), [false, false, false, false], '只列出的都不是当前库的一部分（归档就在当前库的目录下也一样）');
   assert.match(listed[0].reason, /含当时的对话；以后的版本会支持查看和合并，本版本只列出，不删除/);
   assert.match(listed[1].reason, /含对话；以后的版本会支持查看和合并，本版本只列出，不删除/);
   assert.equal(listed[0].createdAt, '2026-09-01T01:02:03.004Z');
@@ -425,6 +497,379 @@ test('所在历史库在列出之后换了代数：锁内复核身份与代数�
   assert.ok((await fs.lstat(backup)).isDirectory());
   const next = await planRuntimeBackupCleanup(fixture.root, database);
   assert.equal(itemAt(next, backup).deletable, true, '代数更高的同一历史库仍然覆盖这份备份');
+});
+
+test('备份库是打开中的当前库或另一个本地历史库的硬链接：检查不复制它，本进程对当前库的 POSIX 锁不丢，写明原因并保留', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  await seed(fixture.alpha, ['conversation_alpha']);
+  const database = await openCurrent(t, fixture);
+  const databasePath = database.binding.paths.databasePath;
+  await database.snapshot([{ kind: 'get', domain: 'Conversation', id: 'conversation_one' }]);
+  const heldBefore = probeSharedLock(databasePath);
+  if (heldBefore !== undefined) assert.equal(heldBefore, 'held', '打开的当前库持有数据库文件的 SHARED 锁');
+
+  // Restored with `ln`/`cp -al`, or linked by a dedup tool: the same inode as a live database.
+  const linkedCurrent = await linkedBackup(fixture, database.binding, databasePath, 300);
+  const linkedAlpha = await linkedBackup(fixture, database.binding, fixture.alpha.binding.paths.databasePath, 280);
+  await targetBackup(fixture.current, database, 120);
+
+  const plan = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.deepEqual([itemAt(plan, linkedCurrent).deletable, itemAt(plan, linkedCurrent).reason],
+    [false, '它和当前库是同一个文件（硬链接）；为了不破坏当前库的锁，不读取它，按历史保留']);
+  assert.deepEqual([itemAt(plan, linkedAlpha).deletable, itemAt(plan, linkedAlpha).reason],
+    [false, `它和历史库（${fixture.alpha.id}）是同一个文件（硬链接）；为了不破坏历史库（${fixture.alpha.id}）的锁，不读取它，按历史保留`]);
+  if (heldBefore !== undefined) assert.equal(probeSharedLock(databasePath), 'held', '检查备份不能释放本进程对当前库的 POSIX 锁');
+  const result = await deleteRuntimeBackups(plan, database, [itemAt(plan, linkedCurrent).key, itemAt(plan, linkedAlpha).key]);
+  assert.deepEqual(result.kept.map((item) => item.reason), ['不在可以删除的清单里', '不在可以删除的清单里']);
+  assert.equal((await fs.stat(databasePath)).nlink, 2);
+  assert.equal((await database.snapshot([{ kind: 'get', domain: 'Conversation', id: 'conversation_one' }])).snapshot[0]?.id, 'conversation_one');
+});
+
+test('另一个本地历史库的库文件是当前库的硬链接：不复制那个库，它那里的备份写明原因并保留，当前库的锁不丢', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  await seed(fixture.alpha, ['conversation_alpha']);
+  const backup = await sourceBackup(fixture.alpha);
+  const database = await openCurrent(t, fixture);
+  const databasePath = database.binding.paths.databasePath;
+  const alphaPath = fixture.alpha.binding.paths.databasePath;
+  for (const suffix of ['', '-wal', '-shm']) await fs.rm(`${alphaPath}${suffix}`, { force: true });
+  await fs.link(databasePath, alphaPath);
+  await database.snapshot([{ kind: 'get', domain: 'Conversation', id: 'conversation_one' }]);
+  const heldBefore = probeSharedLock(databasePath);
+  if (heldBefore !== undefined) assert.equal(heldBefore, 'held');
+
+  const plan = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.deepEqual([itemAt(plan, backup).deletable, itemAt(plan, backup).reason],
+    [false, '所在历史库和当前库是同一个文件（硬链接）；为了不破坏当前库的锁，不读取它，按历史保留']);
+  if (heldBefore !== undefined) assert.equal(probeSharedLock(databasePath), 'held', '不复制与当前库同一个文件的历史库');
+});
+
+test('与真实合并并发：另一个窗口的合并刚写好、之后因推迟又删掉的备份不算最新一份，原来最新的一份保留', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_current']);
+  await seed(fixture.alpha, ['conversation_alpha']);
+  const database = await openCurrent(t, fixture);
+  const previousNewest = await targetBackup(fixture.current, database, 180);
+  const backups = path.dirname(previousNewest);
+
+  // The cleanup runs in another async context (as in another window), free of the merge's claims.
+  let startCleanup;
+  const cleanupStarted = new Promise((resolve) => { startCleanup = resolve; });
+  const cleanupDone = cleanupStarted.then(async () => {
+    const plan = await planRuntimeBackupCleanup(fixture.root, database);
+    const result = await deleteRuntimeBackups(plan, database, plan.items.filter((item) => item.deletable).map((item) => item.key));
+    return { plan, result };
+  });
+  const report = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database }, {
+    async onFaultPoint(point) {
+      if (point !== 'after-target-backup') return;
+      startCleanup();
+      await cleanupDone;
+      // As when the source is deferred after its target backup exists (changed before the commit,
+      // oversized coordination abandoned, …): the batch removes its unused backup again.
+      throw new Error('模拟：来源在提交前推迟');
+    }
+  });
+  const { plan, result } = await cleanupDone;
+  assert.equal(report.deferred.length, 1, '这次合并推迟、没有用上它的备份');
+  const young = plan.items.filter((item) => item.kind === 'merge-target' && item.path !== previousNewest);
+  assert.deepEqual(young.map((item) => item.reason), ['创建不满 1 小时，可能正被合并使用，保留']);
+  assert.equal(itemAt(plan, previousNewest).reason, '这是这个库最新的一份满 1 小时的完整合并前备份，保留');
+  assert.deepEqual(result.deleted, []);
+  assert.deepEqual(await fs.readdir(backups), [path.basename(previousNewest)], '两边结束后仍有一份完整的合并前备份');
+});
+
+test('改名之后的失败：再次核对或写标记失败时改回原名并报保留；同步父目录失败不改变结论；标记之后删除失败报“没有删完”，下次清理删完', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_kept', 'conversation_later_deleted']);
+  const database = await openCurrent(t, fixture);
+  const first = await targetBackup(fixture.current, database, 300);
+  const second = await targetBackup(fixture.current, database, 240);
+  const third = await targetBackup(fixture.current, database, 200);
+  await targetBackup(fixture.current, database, 120);
+  const parent = path.dirname(first);
+  const original = durableDirectorySync.syncDirectoryDurably;
+  t.after(() => { durableDirectorySync.syncDirectoryDurably = original; });
+  const failing = (matches) => async (directory, ...rest) => {
+    if (matches(directory)) throw Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+    return original(directory, ...rest);
+  };
+
+  // The verified mark cannot be made durable (the renamed directory's fsync fails): name back, kept.
+  let plan = await planRuntimeBackupCleanup(fixture.root, database);
+  durableDirectorySync.syncDirectoryDurably = failing((directory) => path.basename(directory).startsWith(`${path.basename(first)}.deleting-`));
+  let result = await deleteRuntimeBackups(plan, database, [itemAt(plan, first).key]);
+  durableDirectorySync.syncDirectoryDurably = original;
+  assert.deepEqual([result.deleted, result.unfinished], [[], []]);
+  assert.deepEqual(result.kept.map((item) => [item.path, item.reason, item.detail]),
+    [[first, '改名之后没能再次核对，已改回原名，保留', 'EIO: i/o error, fsync']]);
+  assert.equal((await fs.readdir(parent)).some((name) => name.includes('.deleting-')), false);
+  assert.equal((await fs.readdir(first)).includes('.limcode-backup-cleanup-verified'), false, '改回原名的备份里没有已核对标记');
+
+  // The parent's fsync right after the rename fails: the check and the durable mark still decide.
+  plan = await planRuntimeBackupCleanup(fixture.root, database);
+  let failures = 0;
+  durableDirectorySync.syncDirectoryDurably = failing((directory) => directory === parent && ++failures === 1);
+  result = await deleteRuntimeBackups(plan, database, [itemAt(plan, third).key]);
+  durableDirectorySync.syncDirectoryDurably = original;
+  assert.ok(failures >= 1);
+  assert.deepEqual([result.deleted.map((item) => item.path), result.kept, result.unfinished], [[third], [], []]);
+
+  // The removal fails after the mark: not removed completely (never "kept"); the next cleanup finishes it.
+  if (process.getuid?.() !== 0) {
+    const locked = path.join(second, 'locked');
+    // Wherever the copy is by then, its locked directory is writable again before the fixture goes.
+    const unlock = async () => {
+      for (const name of await fs.readdir(parent)) {
+        if (name.startsWith(path.basename(second))) await fs.chmod(path.join(parent, name, 'locked'), 0o700).catch(() => undefined);
+      }
+    };
+    try {
+      await fs.mkdir(locked);
+      await fs.writeFile(path.join(locked, 'file.bin'), 'x');
+      await fs.chmod(locked, 0o500);
+      await backdate(second, 240);
+      plan = await planRuntimeBackupCleanup(fixture.root, database);
+      assert.equal(itemAt(plan, second).deletable, true, itemAt(plan, second).reason);
+      result = await deleteRuntimeBackups(plan, database, [itemAt(plan, second).key]);
+      assert.deepEqual([result.deleted, result.kept], [[], []]);
+      assert.equal(result.unfinished.length, 1);
+      assert.match(result.unfinished[0].reason, /^已核对并改名为 .+\.deleting-[0-9a-f]{16}，但没有删完；下次清理备份时会删完$/);
+      assert.match(result.unfinished[0].detail, /EACCES|EPERM/);
+      const leftover = (await fs.readdir(parent)).find((name) => name.startsWith(`${path.basename(second)}.deleting-`));
+      assert.ok(leftover);
+      assert.ok((await fs.readdir(path.join(parent, leftover))).includes('.limcode-backup-cleanup-verified'), '标记最后才删');
+      await unlock();
+      const next = await planRuntimeBackupCleanup(fixture.root, database);
+      assert.deepEqual(next.finishedDeletions, [path.join(parent, leftover)]);
+    } finally {
+      await unlock();
+    }
+  }
+
+  // The copy reported kept stays kept: a conversation deleted afterwards makes it history, never deleted silently.
+  await database.transaction([repo('Conversation').delete('conversation_later_deleted')]);
+  await backdate(first, 300); // Its mark came and went: the directory itself changed a moment ago.
+  const later = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.deepEqual(later.finishedDeletions, []);
+  assert.deepEqual([itemAt(later, first).deletable, itemAt(later, first).reason], [false, '含 1 个当前库没有的对话（可能是你删掉的），按历史保留']);
+});
+
+test('改名之后再核一次覆盖：改名与删除之间当前库删掉了备份里的对话（删除对话不取锁）、其它历史库有了改动，改回原名并保留', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_kept', 'conversation_deleted']);
+  await seed(fixture.alpha, ['conversation_alpha']);
+  const database = await openCurrent(t, fixture);
+  const backup = await targetBackup(fixture.current, database, 180);
+  await targetBackup(fixture.current, database, 120);
+  const source = await sourceBackup(fixture.alpha);
+  const plan = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.equal(itemAt(plan, backup).deletable, true, itemAt(plan, backup).reason);
+  assert.equal(itemAt(plan, source).deletable, true, itemAt(plan, source).reason);
+
+  const result = await deleteRuntimeBackups(plan, database, [itemAt(plan, backup).key, itemAt(plan, source).key], {
+    async onFaultPoint(point, key) {
+      if (point !== 'after-rename') return;
+      if (key === itemAt(plan, backup).key) await database.transaction([repo('Conversation').delete('conversation_deleted')]);
+      else rawEdit(fixture.alpha, (alpha) => alpha.prepare('UPDATE conversation SET title = ? WHERE id = ?').run('改过的标题', 'conversation_alpha'));
+    }
+  });
+  assert.deepEqual(result.deleted, []);
+  assert.deepEqual(result.kept.map((item) => [item.path, item.reason]).sort(), [
+    [backup, '当前库刚刚少了 1 个这份备份里有的对话，已改回原名，保留'],
+    [source, '所在历史库在检查之后有改动，已改回原名，保留']
+  ].sort());
+  for (const directory of [backup, source]) {
+    assert.ok((await fs.lstat(directory)).isDirectory());
+    assert.equal((await fs.readdir(path.dirname(directory))).some((name) => name.includes('.deleting-')), false);
+  }
+  const next = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.equal(itemAt(next, backup).reason, '含 1 个当前库没有的对话（可能是你删掉的），按历史保留');
+});
+
+test('0.0.15–0.0.21 的 3→4 升级备份（完成记录 toEpoch 4、nextBinding 为 epoch 4）满 7 天、内容全在当前库也一律保留；完成记录与身份不符的也保留', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  const database = await openCurrent(t, fixture);
+  const binding = database.binding;
+  const previousBinding = { ...binding, runtimeKernelEpoch: 3 };
+  const directory = path.join(controlRoot(fixture.current), 'epoch-migration-backups', '20260101T000000Z-abcdef12');
+  await fs.mkdir(directory, { recursive: true });
+  const file = path.join(directory, 'limcode.epoch-3.sqlite');
+  await database.backupTo(file);
+  for (const suffix of ['-wal', '-shm']) await fs.rm(`${file}${suffix}`, { force: true });
+  rawEditFile(file, (old) => old.prepare('UPDATE root_binding SET runtime_kernel_epoch = 3 WHERE singleton = 1').run());
+  await fs.writeFile(path.join(directory, 'root-binding.epoch-3.json'), JSON.stringify(previousBinding, null, 2));
+  const record = {
+    kind: 'limcode-runtime-epoch-migration-completion', attemptId: randomUUID(), fromEpoch: 3, toEpoch: 4,
+    previousBinding, nextBinding: { ...binding, runtimeKernelEpoch: 4 }, databaseBackupSha256: '0'.repeat(64),
+    completedAt: new Date(Date.now() - 30 * DAY).toISOString()
+  };
+  const writeRecord = (value) => fs.writeFile(path.join(directory, 'epoch-migration-completion.json'), JSON.stringify(value, null, 2));
+  const later = { now: () => Date.now() + 30 * DAY };
+  await writeRecord(record);
+  const plan = await planRuntimeBackupCleanup(fixture.root, database, later);
+  assert.deepEqual([itemAt(plan, directory).deletable, itemAt(plan, directory).reason], [false, '旧版本 3→4 升级留下的备份，一律保留']);
+  const result = await deleteRuntimeBackups(plan, database, [itemAt(plan, directory).key], later);
+  assert.deepEqual(result.kept.map((item) => item.reason), ['不在可以删除的清单里']);
+  assert.ok((await fs.lstat(file)).isFile());
+
+  // A record claiming 3→5 whose next binding is still epoch 4, and a record of an unknown upgrade.
+  await writeRecord({ ...record, toEpoch: 5 });
+  assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database, later), directory).reason, '升级完成记录与备份里的身份记录不一致，按历史保留');
+  await writeRecord({ ...record, toEpoch: 6 });
+  assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database, later), directory).reason, '升级完成记录无法识别，按历史保留');
+});
+
+test('升级前备份的 7 天按最晚的时间算：完成记录里的时间、目录名的时间、完成记录文件的修改时间取最晚的；晚于现在按时间不可信保留', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  await downgradeToEpoch4(fixture.current.binding);
+  const upgraded = await migratePreviousRuntimeEpochIfRequired(fixture.current.authority);
+  fixture.current.binding = upgraded.binding;
+  const database = await openCurrent(t, fixture);
+  const parent = path.dirname(upgraded.backupPath);
+  const suffix = path.basename(upgraded.backupPath).split('-').at(-1);
+  const recordName = 'epoch-migration-completion.json';
+  const record = JSON.parse(await fs.readFile(path.join(upgraded.backupPath, recordName), 'utf8'));
+  const slug = (time) => new Date(time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  let directory = upgraded.backupPath;
+  // Renames the backup after `nameTime` and rewrites its completion record (the file's times become now).
+  const arrange = async (nameTime, completedAt) => {
+    const next = path.join(parent, `${slug(nameTime)}-${suffix}`);
+    if (next !== directory) await fs.rename(directory, next);
+    directory = next;
+    await fs.writeFile(path.join(directory, recordName), JSON.stringify({ ...record, completedAt: new Date(completedAt).toISOString() }, null, 2));
+  };
+  const now = Date.now();
+  // The clock of a check, `ahead` of the real one.
+  const reason = async (ahead) => itemAt(await planRuntimeBackupCleanup(fixture.root, database, { now: () => Date.now() + ahead }), directory).reason;
+  const waiting = /^升级完成不满 7 天，.+ 之后才可以删除$/;
+
+  // Only the record file is recent (the clock was behind during the upgrade).
+  await arrange(now - 30 * DAY, now - 30 * DAY);
+  assert.match(await reason(0), waiting);
+  assert.match(await reason(8 * DAY), /^可以删除：/);
+  // Only the directory name is recent.
+  await arrange(now + 5 * DAY, now - 30 * DAY);
+  assert.match(await reason(8 * DAY), waiting);
+  // Only the completion time is recent.
+  await arrange(now - 30 * DAY, now + 5 * DAY);
+  assert.match(await reason(8 * DAY), waiting);
+  assert.match(await reason(13 * DAY), /^可以删除：/);
+  // Later than now: the clock (then or now) cannot be trusted.
+  await arrange(now - 30 * DAY, now + DAY);
+  assert.equal(await reason(0), '升级完成的时间晚于现在，时间不可信，按历史保留');
+});
+
+test('控制根里有其它进行中的操作（挂起的切换指针、旧版本的 3→4 升级日志、旧格式切换的请求或日志）时保留', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  const database = await openCurrent(t, fixture);
+  const backup = await targetBackup(fixture.current, database, 180);
+  await targetBackup(fixture.current, database, 120);
+  const control = controlRoot(fixture.current);
+  for (const [file, operation] of [
+    ['root-binding.pending.json', '未完成的历史库切换'],
+    ['epoch-3-to-4-migration.json', '旧版本未完成的 3→4 升级'],
+    ['cutover-request.json', '未完成的旧格式数据切换'],
+    ['cutover-journal.json', '未完成的旧格式数据切换']
+  ]) {
+    await fs.writeFile(path.join(control, file), '{}');
+    const plan = await planRuntimeBackupCleanup(fixture.root, database);
+    assert.deepEqual([itemAt(plan, backup).deletable, itemAt(plan, backup).reason], [false, `有进行中的操作（${operation}），完成之后再清理`], file);
+    await fs.rm(path.join(control, file));
+  }
+  assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), backup).deletable, true);
+});
+
+test('删除期间在所持的 admission 与控制根 maintenance 里发布“清理备份”的维护进行中标记，等下一个控制根的锁时 admission 里仍有，结束后随锁消失', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  await seed(fixture.alpha, ['conversation_alpha']);
+  const database = await openCurrent(t, fixture);
+  const backup = await targetBackup(fixture.current, database, 180);
+  await targetBackup(fixture.current, database, 120);
+  const source = await sourceBackup(fixture.alpha);
+  const plan = await planRuntimeBackupCleanup(fixture.root, database);
+  const admission = runtimeDataRootAdmissionClaimPath(fixture.root);
+  const maintenance = runtimeMaintenanceClaimPath(fixture.current.binding.paths);
+  const readActivity = async (claim) => {
+    const owner = JSON.parse(await fs.readFile(path.join(claim, 'owner.json'), 'utf8'));
+    const activity = JSON.parse(await fs.readFile(path.join(claim, 'activity.json'), 'utf8'));
+    return { operation: activity.operation, description: activity.description, stage: activity.stage, sameClaim: activity.claimToken === owner.claimToken };
+  };
+  const seen = [];
+  // Another window holds the alpha control root's maintenance: the deletion waits for it holding the admission.
+  let release;
+  let held;
+  const holding = new Promise((resolve) => { held = resolve; });
+  const holder = withRuntimeMaintenance(fixture.alpha.binding.paths, () => new Promise((resolve) => { release = resolve; held(); }));
+  await holding;
+  const deletion = deleteRuntimeBackups(plan, database, [itemAt(plan, backup).key, itemAt(plan, source).key], {
+    async onFaultPoint(point, key) {
+      if (point === 'before-rename' && key === itemAt(plan, backup).key) seen.push(await readActivity(admission), await readActivity(maintenance));
+    }
+  });
+  let waiting;
+  for (let attempt = 0; attempt < 100 && waiting?.stage !== '已处理 1/2 份备份'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    waiting = await readActivity(admission).catch(() => undefined);
+  }
+  release();
+  await holder;
+  const result = await deletion;
+  assert.deepEqual(result.deleted.map((item) => item.path), [backup, source]);
+  assert.deepEqual(seen, [admission, maintenance].map(() => ({ operation: 'backup-cleanup', description: '清理备份', stage: '正在删除第 1/2 份备份', sameClaim: true })));
+  assert.deepEqual(waiting, { operation: 'backup-cleanup', description: '清理备份', stage: '已处理 1/2 份备份', sameClaim: true });
+  for (const claim of [admission, maintenance]) await assert.rejects(fs.access(path.join(claim, 'activity.json')));
+});
+
+test('两个其它历史库的库文件是同一个文件（硬链接）：两个都不复制，那里的备份写明原因并保留', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  await seed(fixture.alpha, ['conversation_alpha']);
+  const beta = await addWorkspaceDataSet(fixture, 'file:///workspace/beta');
+  const backup = await sourceBackup(fixture.alpha);
+  const database = await openCurrent(t, fixture);
+  const betaPath = beta.binding.paths.databasePath;
+  for (const suffix of ['', '-wal', '-shm']) await fs.rm(`${betaPath}${suffix}`, { force: true });
+  await fs.link(fixture.alpha.binding.paths.databasePath, betaPath);
+  const plan = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.deepEqual([itemAt(plan, backup).deletable, itemAt(plan, backup).reason],
+    [false, `所在历史库和另一个历史库（${beta.id}）是同一个文件（硬链接），不读取它，按历史保留`]);
+});
+
+test('副本的 id 直接从表里读、不经主键索引：索引里少了一个对话的副本照样看出它有当前库没有的对话', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  const database = await openCurrent(t, fixture);
+  const backup = await targetBackup(fixture.current, database, 180);
+  await targetBackup(fixture.current, database, 120);
+  hideFromPrimaryKeyIndex(path.join(backup, 'limcode.sqlite'), 'conversation', 'conversation_one', 'conversation_hidden');
+  await backdate(backup, 180);
+  const item = itemAt(await planRuntimeBackupCleanup(fixture.root, database), backup);
+  assert.deepEqual([item.deletable, item.missingConversations, item.reason], [false, 1, '含 1 个当前库没有的对话（可能是你删掉的），按历史保留']);
+});
+
+test('读不了的副本：原因用中文写明是损坏还是与身份记录不符，按历史保留，不写“暂时”；技术原因只放在 detail', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_one']);
+  const database = await openCurrent(t, fixture);
+  const damaged = await targetBackup(fixture.current, database, 300);
+  const mismatched = await targetBackup(fixture.current, database, 240);
+  await targetBackup(fixture.current, database, 120);
+  await fs.writeFile(path.join(damaged, 'limcode.sqlite'), Buffer.alloc(8192, 7));
+  await backdate(damaged, 300);
+  rawEditFile(path.join(mismatched, 'limcode.sqlite'), (copy) => copy.prepare('UPDATE root_binding SET root_instance_id = ?').run(randomUUID()));
+  await backdate(mismatched, 240);
+  const plan = await planRuntimeBackupCleanup(fixture.root, database);
+  assert.deepEqual([itemAt(plan, damaged).deletable, itemAt(plan, damaged).reason], [false, '这份备份的数据库已损坏，无法核对，按历史保留']);
+  assert.match(itemAt(plan, damaged).detail, /not a database|malformed/i);
+  assert.deepEqual([itemAt(plan, mismatched).deletable, itemAt(plan, mismatched).reason], [false, '这份备份里的数据库与它的身份记录不一致，按历史保留']);
+  assert.match(itemAt(plan, mismatched).detail, /RootBinding/);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -579,6 +1024,92 @@ async function downgradeToEpoch4(binding) {
   await fs.writeFile(binding.paths.rootPointerPath, `${JSON.stringify({ ...binding, runtimeKernelEpoch: 4 }, null, 2)}\n`);
 }
 
+/** Another workspace data set (initialized, not selected) beside alpha. */
+async function addWorkspaceDataSet(fixture, folder) {
+  const scope = resolveVscodeWorkspaceRuntimeScope({ workspaceFolderUris: [folder] });
+  const scopeRoot = resolveVscodeWorkspaceRuntimeScopeRoot(fixture.paths, scope);
+  await fs.mkdir(scopeRoot, { recursive: true });
+  return initialize(scopeRoot, `workspace:${scope.key}`);
+}
+
+/**
+ * A copy whose primary key index misses one row of `table` (only integrity_check would tell): the
+ * row is inserted while the table is declared without its primary key, then the declaration and the
+ * old index come back.
+ */
+function hideFromPrimaryKeyIndex(file, table, templateId, hiddenId) {
+  const edit = (write) => {
+    const database = new Database(file);
+    try {
+      database.unsafeMode(true);
+      write(database);
+      database.pragma('wal_checkpoint(TRUNCATE)');
+    } finally { database.close(); }
+  };
+  let saved;
+  edit((database) => {
+    saved = {
+      table: database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").pluck().get(table),
+      index: database.prepare("SELECT * FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND name LIKE 'sqlite_autoindex_%'").get(table)
+    };
+    assert.ok(saved.table.includes('"id" TEXT PRIMARY KEY') && saved.index, saved.table);
+    database.pragma('writable_schema = ON');
+    database.prepare("UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?").run(saved.table.replace('"id" TEXT PRIMARY KEY', '"id" TEXT'), table);
+    database.prepare('DELETE FROM sqlite_master WHERE name = ?').run(saved.index.name);
+  });
+  edit((database) => {
+    // The other tables' references to it are not valid while it has no primary key.
+    database.pragma('foreign_keys = OFF');
+    const columns = database.prepare(`PRAGMA table_info("${table}")`).all().map((column) => `"${column.name}"`);
+    database.prepare(`INSERT INTO "${table}" (${columns.join(', ')}) SELECT ${columns.map((column) => column === '"id"' ? '?' : column).join(', ')} FROM "${table}" WHERE id = ?`)
+      .run(hiddenId, templateId);
+  });
+  edit((database) => {
+    database.pragma('writable_schema = ON');
+    database.prepare("UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?").run(saved.table, table);
+    database.prepare('INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES (?, ?, ?, ?, ?)')
+      .run(saved.index.type, saved.index.name, saved.index.tbl_name, saved.index.rootpage, saved.index.sql);
+  });
+  const check = new Database(file, { readonly: true });
+  try {
+    assert.notEqual(check.pragma('quick_check', { simple: true }), 'ok', '索引确实缺了这一行');
+    assert.deepEqual(check.prepare(`SELECT id FROM "${table}" WHERE id = ?`).pluck().all(hiddenId), [], '经索引查不到');
+  } finally { check.close(); }
+}
+
+/** A pre-merge backup of the current data set whose database file is a hard link of `databasePath`. */
+async function linkedBackup(fixture, binding, databasePath, minutesAgo) {
+  const directory = path.join(controlRoot(fixture.current), 'merge-backups', backupName(minutesAgo));
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, 'root-binding.json'), `${JSON.stringify(binding, null, 2)}\n`);
+  await fs.link(databasePath, path.join(directory, 'limcode.sqlite'));
+  await backdate(directory, minutesAgo);
+  return directory;
+}
+
+/**
+ * Another process asks for a write lock on SQLite's SHARED range of a database file: 'held' while
+ * this process holds its read lock there; undefined without python3 (the probe is then skipped).
+ */
+function probeSharedLock(databasePath) {
+  try {
+    return execFileSync('python3', ['-c', `
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 510, 0x40000002, 0)
+    print('free')
+    fcntl.lockf(fd, fcntl.LOCK_UN, 510, 0x40000002, 0)
+except OSError:
+    print('held')
+finally:
+    os.close(fd)
+`, databasePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
 function controlRoot(dataSet) {
   return path.dirname(dataSet.binding.paths.dataRootPath);
 }
@@ -592,7 +1123,8 @@ function itemAt(plan, directory) {
 function runChild(args) {
   const script = path.join(HERE, 'runtime-backup-cleanup-child.mjs');
   return new Promise((resolve) => {
-    execFile(process.execPath, [script, ...args], { env: { ...process.env, LIMCODE_TEST_EXTENSION_ROOT: compiled } },
+    // A child that hangs is ended with SIGTERM, never mistaken for the SIGKILL of its crash point.
+    execFile(process.execPath, [script, ...args], { env: { ...process.env, LIMCODE_TEST_EXTENSION_ROOT: compiled }, timeout: 60_000, killSignal: 'SIGTERM' },
       (error, stdout, stderr) => resolve({ signal: error?.signal ?? null, code: error ? error.code ?? null : 0, stdout, stderr }));
   });
 }

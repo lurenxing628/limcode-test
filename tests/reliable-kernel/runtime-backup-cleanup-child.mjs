@@ -11,13 +11,17 @@ const { RootAuthority } = kernelFile('rootAuthority.js');
 const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBackupCleanup.js');
 const { resolveVscodeRuntimeDataRoot } = kernelFile('vscodeRootAuthority.js');
 
-const [mode, root, key] = process.argv.slice(2);
+const [mode, root, key, crashPoint = 'after-rename'] = process.argv.slice(2);
 if (mode !== 'delete-then-crash') throw new Error(`unknown mode ${mode}`);
+if (!['after-rename', 'after-verify'].includes(crashPoint)) throw new Error(`unknown crash point ${crashPoint}`);
 const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
 const database = await kernel.RuntimeDatabase.open(authority, { hostBootId: `crash-${randomUUID()}` });
 const plan = await planRuntimeBackupCleanup(root, database);
 await deleteRuntimeBackups(plan, database, [key], {
-  // Killed after the durable rename, before the recursive removal (and with both claims held).
-  onFaultPoint(point) { if (point === 'after-rename') process.kill(process.pid, 'SIGKILL'); }
+  // Killed with both claims held: after-rename before the coverage was checked again (no verified
+  // mark yet), after-verify once the mark is durable and before the recursive removal.
+  onFaultPoint(point) { if (point === crashPoint) process.kill(process.pid, 'SIGKILL'); }
 });
-process.exitCode = 3;
+// Not killed: the crash point was never reached.
+await database.close().catch(() => undefined);
+process.exit(3);
