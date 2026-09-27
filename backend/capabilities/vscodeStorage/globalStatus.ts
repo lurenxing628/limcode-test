@@ -31,6 +31,12 @@ export interface PendingDataRootRelocation {
   startedAt: string;
   processId: number;
   processStartIdentity?: string;
+  /**
+   * Set right before the relocation first changes the target: the identities (`<device>:<inode>`)
+   * of the directories it found there (see DataRootRelocationTargetAnchor). Absent: the target was
+   * never changed, so nothing of the relocation can be there.
+   */
+  targetAnchor?: { parent: string; target?: string };
 }
 
 export interface LimCodeGlobalStatus {
@@ -367,11 +373,16 @@ function normalizePendingRelocation(input: unknown): PendingDataRootRelocation |
   if (typeof candidate?.relocationId !== 'string' || typeof candidate.sourceRootPath !== 'string'
     || typeof candidate.targetRootPath !== 'string' || typeof candidate.startedAt !== 'string'
     || typeof candidate.processId !== 'number' || !Number.isInteger(candidate.processId)
-    || (candidate.processStartIdentity !== undefined && typeof candidate.processStartIdentity !== 'string')) return undefined;
+    || (candidate.processStartIdentity !== undefined && typeof candidate.processStartIdentity !== 'string')
+    || (candidate.targetAnchor !== undefined && (typeof candidate.targetAnchor?.parent !== 'string'
+      || (candidate.targetAnchor.target !== undefined && typeof candidate.targetAnchor.target !== 'string')))) return undefined;
   return {
     relocationId: candidate.relocationId, sourceRootPath: candidate.sourceRootPath, targetRootPath: candidate.targetRootPath,
     startedAt: candidate.startedAt, processId: candidate.processId,
-    ...(candidate.processStartIdentity !== undefined ? { processStartIdentity: candidate.processStartIdentity } : {})
+    ...(candidate.processStartIdentity !== undefined ? { processStartIdentity: candidate.processStartIdentity } : {}),
+    ...(candidate.targetAnchor !== undefined ? {
+      targetAnchor: { parent: candidate.targetAnchor.parent, ...(candidate.targetAnchor.target !== undefined ? { target: candidate.targetAnchor.target } : {}) }
+    } : {})
   };
 }
 
