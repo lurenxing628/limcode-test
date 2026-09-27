@@ -227,6 +227,46 @@ test('an edit of a message changed meanwhile (another revision) is not restored,
   after.reload();
 });
 
+test('an edit given up because the message changed is dropped from the saved state at once: the next reload does not tell again', async () => {
+  const state = webviewState();
+  const before = composer(state, { conversationId: 'conversation-1', messages: [editedMessage] });
+  before.ui.startEditMessage(editedMessage, 2);
+  await settle();
+  before.ui.setComposerDraft('基于修订 1 改写的问题');
+  await saved();
+  before.reload();
+
+  // Reload 1: the conversation is shown at once, its messages arrive after the first save ran.
+  const changed = { ...editedMessage, revisionId: 'revision-2', content: { parts: [{ text: '另一个窗口改过的问题' }] } } as unknown as MessageRecord;
+  const first = composer(state, { conversationId: 'conversation-1' });
+  await saved();
+  first.messages.value = [changed];
+  await settle();
+  assert.equal(first.discarded(), 1);
+  assert.equal(first.ui.composerMode, 'chat');
+  assert.equal((state.read() as PersistedComposerDraft | undefined)?.edit, undefined, 'written without waiting for the debounce');
+  // Reloaded again right away (nothing typed meanwhile).
+  first.reload();
+  const second = composer(state, { conversationId: 'conversation-1', messages: [changed] });
+  await settle();
+  assert.equal(second.discarded(), 0, 'the user is not told again');
+  assert.equal(second.ui.composerMode, 'chat');
+  second.reload();
+});
+
+test('an edit given up because another conversation is shown first is dropped from the saved state at once', async () => {
+  const state = webviewState();
+  state.write({
+    chat: { draft: '', attachments: [] },
+    edit: { kind: 'message', conversationId: 'conversation-1', messageId: 'message-2', revisionId: 'revision-1', deleteCount: 2, draft: '改过的问题', attachments: [] },
+    savedAt: 1
+  });
+  const other = composer(state, { conversationId: 'conversation-2' });
+  await settle();
+  assert.equal(state.read(), undefined, 'another conversation shown first: nothing left to restore');
+  other.reload();
+});
+
 test('closing an edit is written at once: a reload right after does not reopen it', async () => {
   const state = webviewState();
   const before = composer(state, { conversationId: 'conversation-1', messages: [editedMessage] });

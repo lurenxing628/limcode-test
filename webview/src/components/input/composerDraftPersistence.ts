@@ -68,7 +68,8 @@ export interface ComposerDraftPersistenceOptions {
  * for a moment) does not lose what the user typed. The chat draft comes back when the composer is
  * created, unless something is already there or it is a Turn input still being sent; an open edit
  * comes back once its conversation is shown and its message loaded, and is given up when another
- * conversation is shown first or the message changed meanwhile. Clearing is written at once.
+ * conversation is shown first or the message changed meanwhile. Clearing and giving up an edit are
+ * written at once.
  */
 export function useComposerDraftPersistence(options: ComposerDraftPersistenceOptions): { flush(): void; dispose(): void } {
   const { ui, attachments, storage } = options;
@@ -79,7 +80,7 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
   let timer: ReturnType<typeof setTimeout> | undefined;
   let messageWait: WatchStopHandle | undefined;
   let waitingForMessage = false;
-  const giveUpTimer = pendingEdit ? setTimeout(settlePendingEdit, EDIT_RESTORE_TIMEOUT_MS) : undefined;
+  const giveUpTimer = pendingEdit ? setTimeout(dropPendingEdit, EDIT_RESTORE_TIMEOUT_MS) : undefined;
 
   // What the last write contained: clearing it (a send, a closed edit) is written at once.
   let written = { chat: saved !== undefined && hasChatContent(saved.chat), edit: false };
@@ -99,7 +100,7 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
     const edit = pendingEdit;
     if (!edit || !conversationId) return;
     if (conversationId !== edit.conversationId || ui.composerMode === 'edit') {
-      settlePendingEdit();
+      dropPendingEdit();
       return;
     }
     if (waitingForMessage) return;
@@ -113,13 +114,17 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
     waitingForMessage = true;
     messageWait = watch(() => options.findMessage(edit.messageId), (message) => {
       if (!message || pendingEdit !== edit) return;
-      settlePendingEdit();
-      if (ui.composerMode === 'edit' || options.conversationId() !== edit.conversationId) return;
+      if (ui.composerMode === 'edit' || options.conversationId() !== edit.conversationId) {
+        dropPendingEdit();
+        return;
+      }
       if (message.revisionId !== edit.revisionId) {
         // Editing the new revision with the old text would silently overwrite that change.
+        dropPendingEdit();
         options.onEditDiscarded?.();
         return;
       }
+      settlePendingEdit();
       ui.startEditMessage(message, edit.deleteCount);
       // The composer resets edit attachments from the message on its next flush; apply afterwards.
       void nextTick(() => nextTick(() => applyEdit(edit)));
@@ -149,6 +154,16 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
     if (ui.composerMode !== 'edit' || !same) return;
     ui.setComposerDraft(edit.draft);
     attachments.value = { ...attachments.value, edit: clone(edit.attachments) };
+  }
+
+  /**
+   * The saved edit cannot be restored any more: written at once, so a reload before the next save
+   * neither brings it back nor tells the user about it again.
+   */
+  function dropPendingEdit(): void {
+    if (!pendingEdit) return;
+    settlePendingEdit();
+    flush();
   }
 
   /** The saved edit was restored, or cannot be any more: stop carrying it along. */
