@@ -26,7 +26,16 @@ export interface ExclusiveMaintenanceParticipantOptions {
    * the reason why the user's operation gave way to the request this window then yielded to.
    */
   windowState?: ExclusiveMaintenanceWindowState;
+  /**
+   * Asks this window's Webviews to write unsent input into their state at once (their own saves
+   * are debounced); returns how many were asked. Called when a countdown or notice starts and right
+   * before this window reloads, which then waits DRAFT_SAVE_SETTLE_MS for those writes.
+   */
+  saveDrafts?(): number;
 }
+
+/** After asking the Webviews to save, the reload waits this long for their writes to land. */
+const DRAFT_SAVE_SETTLE_MS = 250;
 
 /** The part of VS Code's Memento this layer uses. */
 export interface ExclusiveMaintenanceWindowState {
@@ -62,21 +71,33 @@ export function startExclusiveMaintenanceParticipant(
   const { paths, hostBootId } = host.exclusiveMaintenanceTarget();
   const seconds = options.countdownSeconds ?? 5;
   if (options.windowState) windowState = options.windowState;
+  const saveDrafts = (): number => {
+    try { return options.saveDrafts?.() ?? 0; }
+    catch (error) {
+      console.warn('[LimCode] 无法通知面板保存未发送的输入。', error);
+      return 0;
+    }
+  };
   return startProtocolParticipant(paths, hostBootId, {
     busyReason: async () => {
       if (await host.hasOwnedExecution()) return { kind: 'work', reason: '有任务正在进行' };
       if (vscode.window.state?.focused) return { kind: 'focus', reason: '窗口正在使用' };
       return undefined;
     },
-    confirm: (request, context) => request.confirmation === 'notice'
-      ? announce(request.message)
-      : countdown(request, seconds, context),
+    confirm: (request, context) => {
+      saveDrafts();
+      return request.confirmation === 'notice'
+        ? announce(request.message)
+        : countdown(request, seconds, context);
+    },
     release: async (request) => {
       const kept = gaveWay;
       if (kept && kept.requestId === request.requestId && windowState) {
         try { await windowState.update(NOTICE_KEY, { text: kept.text, at: Date.now() }); }
         catch (error) { console.warn('[LimCode] 无法保留重载前的维护结果。', error); }
       }
+      // What was typed within the composer's save delay is written before the Webviews go.
+      if (saveDrafts() > 0) await new Promise((resolve) => setTimeout(resolve, DRAFT_SAVE_SETTLE_MS));
       await vscode.commands.executeCommand('workbench.action.reloadWindow');
     },
     notifyWaiting: (request, busy) => {

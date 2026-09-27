@@ -325,6 +325,7 @@ function deferred() {
 function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, keptNotice } = {}) {
   const events = [];
   const openOptions = [];
+  const participantOptions = [];
   const opening = deferred();
   const opened = deferred();
   const upgradeStarted = deferred();
@@ -334,7 +335,8 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, kept
     ...mergeHost(),
     async dispose() { events.push('dispose'); },
     async startRuntimeRecovery() { events.push('recover'); },
-    dataRootPath() { return '/fixture/data-root'; }
+    dataRootPath() { return '/fixture/data-root'; },
+    postToWebview(clientId, message) { events.push(['post-to-webview', clientId, message.type]); return true; }
   };
   const lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {});
   const management = fixture({ lifetime, upgradeError, mergeHook,
@@ -360,7 +362,13 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, kept
       async showWarningMessage(message) { events.push(['warning-message', message]); }
     } },
     './commands/registerCommands': { registerCommands(_context, barrier) { startup = barrier; } },
-    './panels/MainPanel': { MainPanel: { registerSerializer() {} } },
+    './panels/MainPanel': { MainPanel: {
+      registerSerializer() {},
+      saveComposerDrafts(post) {
+        events.push('save-drafts');
+        return post('panel-client', { type: 'composer.draft.save' }) ? 1 : 0;
+      }
+    } },
     './views/SidebarEntryView': { registerSidebarEntryView() {} },
     './ApplicationStartup': loadSource('vscode/ApplicationStartup.ts', {}),
     './runtimeDataSetUpgradeLifetime': lifetime,
@@ -391,6 +399,7 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, kept
     './runtimeExclusiveMaintenance': {
       startExclusiveMaintenanceParticipant(host, options) {
         events.push(['participant-start', host === application, options.isCurrent()]);
+        participantOptions.push(options);
         return {
           async dispose() { events.push('participant-dispose'); },
           async unregister() { events.push('participant-unregister'); }
@@ -409,7 +418,7 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, kept
   // Nothing kept across a reload in these activations.
   management.context.workspaceState = { get() { return undefined; }, async update() {} };
   return {
-    ...extension, application, context: management.context, calls: management.calls, events, management, lifetime, openOptions,
+    ...extension, application, context: management.context, calls: management.calls, events, management, lifetime, openOptions, participantOptions,
     opening, opened, upgradeStarted, finishUpgrade,
     get startup() { return startup; }
   };
@@ -953,6 +962,24 @@ test('a wait on the Runtime is settled once its lock was taken: the notification
     [['opening-notification', 'LimCode 正在等待另一个窗口'], ['opening-notification-closed']], 'closed before the Runtime opened');
   f.opened.resolve(f.application);
   await ready;
+});
+
+test('before another window reloads this one, every panel is asked through the Facade to save its unsent input at once (blind review #10)', async t => {
+  const f = extensionEntryFixture();
+  t.after(async () => {
+    f.opened.resolve(f.application);
+    f.finishUpgrade.resolve();
+    await f.deactivate();
+  });
+  f.activate(f.context);
+  const ready = f.startup.wait();
+  await f.opening.promise;
+  f.opened.resolve(f.application);
+  await ready;
+  for (let i = 0; i < 20 && f.participantOptions.length === 0; i += 1) await new Promise(setImmediate);
+  assert.equal(f.participantOptions[0].saveDrafts(), 1);
+  assert.deepEqual(f.events.filter(event => event === 'save-drafts' || (Array.isArray(event) && event[0] === 'post-to-webview')),
+    ['save-drafts', ['post-to-webview', 'panel-client', 'composer.draft.save']]);
 });
 
 test('deactivation marks this window leaving at once and removes its registration only after its Runtime closed (blind review #1)', async t => {

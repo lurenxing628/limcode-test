@@ -54,6 +54,8 @@ function composer(state: ReturnType<typeof webviewState>, options: {
   /** Already in the composer when the persistence starts (e.g. a restored failed send). */
   typed?: string;
   pendingInputTexts?: string[];
+  onSaveRequest?(listener: () => void): () => void;
+  pageEvents?: EventTarget;
 } = {}) {
   setActivePinia(createPinia());
   const ui = useConversationUiStore();
@@ -64,8 +66,9 @@ function composer(state: ReturnType<typeof webviewState>, options: {
   const omitted: number[] = [];
   let discarded = 0;
   const scope = effectScope();
+  let persistence: ReturnType<typeof useComposerDraftPersistence> | undefined;
   scope.run(() => {
-    useComposerDraftPersistence({
+    persistence = useComposerDraftPersistence({
       ui,
       attachments,
       conversationId: () => conversationId.value,
@@ -75,7 +78,9 @@ function composer(state: ReturnType<typeof webviewState>, options: {
       debounceMs: DEBOUNCE_MS,
       attachmentLimitBytes: options.attachmentLimitBytes,
       onAttachmentsOmitted: (count) => omitted.push(count),
-      onEditDiscarded: () => { discarded += 1; }
+      onEditDiscarded: () => { discarded += 1; },
+      ...(options.onSaveRequest ? { onSaveRequest: options.onSaveRequest } : {}),
+      ...(options.pageEvents ? { pageEvents: options.pageEvents } : {})
     });
     // Composer.vue: starting an edit resets the edit attachments from the message.
     watch(() => ui.composerHighlightKey, () => {
@@ -90,6 +95,8 @@ function composer(state: ReturnType<typeof webviewState>, options: {
   return {
     ui, attachments, conversationId, messages, omitted,
     discarded: () => discarded,
+    /** The composer unmounts (Composer.vue onBeforeUnmount). */
+    dispose: () => persistence?.dispose(),
     /** The window reloads: no dispose, no flush. */
     reload: () => { state.reloadWindow(); scope.stop(); }
   };
@@ -117,6 +124,56 @@ test('unsent chat text and attachments survive a window reload, also in a new ch
   assert.equal(after.ui.chatDraft, '还没发出去的问题');
   assert.deepEqual(after.attachments.value.chat, [part('notes.txt')]);
   after.reload();
+});
+
+test('blind review #10: what was just typed is written at once when the host asks (before a reload) or the page goes away, not after the debounce', async () => {
+  const state = webviewState();
+  const requests = new Set<() => void>();
+  const page = new EventTarget();
+  const before = composer(state, {
+    onSaveRequest: (listener) => {
+      requests.add(listener);
+      return () => { requests.delete(listener); };
+    },
+    pageEvents: page
+  });
+  before.ui.setComposerDraft('刚打完的字');
+  await settle(1);
+  assert.equal(state.read(), undefined, 'still within the debounce');
+  for (const listener of requests) listener();
+  assert.equal((state.read() as PersistedComposerDraft).chat.draft, '刚打完的字');
+  before.ui.setComposerDraft('刚打完的字，又加了几个');
+  await settle(1);
+  page.dispatchEvent(new Event('pagehide'));
+  assert.equal((state.read() as PersistedComposerDraft).chat.draft, '刚打完的字，又加了几个');
+  before.reload();
+
+  const after = composer(state, { conversationId: 'conversation-1' });
+  await settle();
+  assert.equal(after.ui.chatDraft, '刚打完的字，又加了几个');
+  after.reload();
+});
+
+test('an unmounted composer no longer listens for save requests or pagehide', async () => {
+  const state = webviewState();
+  const requests = new Set<() => void>();
+  const page = new EventTarget();
+  const mounted = composer(state, {
+    onSaveRequest: (listener) => {
+      requests.add(listener);
+      return () => { requests.delete(listener); };
+    },
+    pageEvents: page
+  });
+  mounted.ui.setComposerDraft('卸载前的字');
+  await settle(1);
+  mounted.dispose();
+  assert.equal(requests.size, 0);
+  assert.equal((state.read() as PersistedComposerDraft).chat.draft, '卸载前的字', 'unmounting writes at once');
+  state.write(undefined);
+  page.dispatchEvent(new Event('pagehide'));
+  assert.equal(state.read(), undefined);
+  mounted.reload();
 });
 
 test('a sent (cleared) draft is written at once: a reload right after does not bring it back', async () => {

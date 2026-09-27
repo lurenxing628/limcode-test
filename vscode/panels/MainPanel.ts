@@ -4,6 +4,7 @@ import {
   createMessageId,
   type BridgeClientId,
   type DataRootActionPayload,
+  type ExtensionToWebviewMessage,
   type OpenConversationPanelRecord,
   type PlanProposalOpenPayload,
   type WebviewClientMeta,
@@ -552,6 +553,20 @@ export class MainPanel {
     if (!this.conversationId || !payload || payload.conversationId !== this.conversationId) return;
     if (!isDefaultConversationTitle(this.panel.title)) return;
     this.panel.title = panelTabTitle(displayConversationTitleFromText(payload.text ?? payload.content?.parts.map((part) => 'text' in part ? part.text : '').join('\n') ?? ''));
+  }
+
+  /**
+   * Asks the Webview of every panel to write its unsent composer input into its state at once (the
+   * composer otherwise saves a moment after the last change), e.g. right before another window's
+   * maintenance reloads this one. `post` is the Facade's plain-data boundary (postToWebview);
+   * returns how many panels were asked.
+   */
+  public static saveComposerDrafts(post: (clientId: BridgeClientId, message: ExtensionToWebviewMessage) => boolean): number {
+    let asked = 0;
+    for (const panel of MainPanel.panels.values()) {
+      if (post(panel.clientId, { id: createMessageId(), type: BridgeMessageType.ComposerDraftSave, channel: 'control' })) asked += 1;
+    }
+    return asked;
   }
 
   public static refreshConversationTitle(conversationId: string): void {

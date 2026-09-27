@@ -342,6 +342,28 @@ test('盲审 #5：带过重载的原因按窗口重新打开的时间判断有�
   assert.equal(state.get('limcode.exclusiveMaintenance.noticeAfterReload'), undefined, 'read and cleared either way');
 });
 
+test('盲审 #10：确认重载前让面板立即保存未发送的输入：确认开始时一次，重载前再一次并留出写入的时间', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const log = [];
+  const layer = loadVscodeLayer(vscodeMock({ titles: [], notices: [] }, () => { log.push(['reload', Date.now()]); }));
+  const liveness = await publishHost(binding, 'window-drafts');
+  const participant = layer.startExclusiveMaintenanceParticipant({
+    exclusiveMaintenanceTarget: () => ({ paths, hostBootId: 'window-drafts' }), hasOwnedExecution: async () => false
+  }, {
+    countdownSeconds: 0, pollMs: 60 * 60_000, processId: (nextFakeProcessId += 1),
+    saveDrafts: () => { log.push(['save', Date.now()]); return 1; }
+  });
+  t.after(async () => { await participant.dispose(); await fs.rm(liveness, { force: true }); });
+  const request = { requestId: 'draft-request', createdAt: new Date().toISOString(), whenBusy: 'wait', confirmation: 'notice' };
+  for (const phase of ['prepare', 'confirm', 'go']) {
+    await writeRequest(paths, { ...request, phase });
+    await participant.checkNow();
+  }
+  for (let polls = 0; polls < 100 && !log.some(([kind]) => kind === 'reload'); polls += 1) await delay(10);
+  assert.deepEqual(log.map(([kind]) => kind), ['save', 'save', 'reload']);
+  assert.ok(log[2][1] - log[1][1] >= 200, `the writes get time before the reload (${log[2][1] - log[1][1]} ms)`);
+});
+
 test('打开外壳读取启动等待原因：变化时通知，运行时就绪后不再接受', async () => {
   const { ApplicationStartup } = require(path.join(compiled, 'vscode/ApplicationStartup.js'));
   const startup = new ApplicationStartup();

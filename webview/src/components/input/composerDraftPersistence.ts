@@ -60,6 +60,13 @@ export interface ComposerDraftPersistenceOptions {
   onAttachmentsOmitted?(count: number): void;
   /** The edited message changed after the edit started (another window): the edit was not restored. */
   onEditDiscarded?(): void;
+  /**
+   * Subscribes to the host's request to save at once (the window is about to reload); returns the
+   * unsubscribe. Such a request, and the page going away (pagehide), write immediately.
+   */
+  onSaveRequest?(listener: () => void): () => void;
+  /** Where pagehide is listened for; the Webview's window by default. */
+  pageEvents?: Pick<EventTarget, 'addEventListener' | 'removeEventListener'>;
 }
 
 /**
@@ -69,7 +76,7 @@ export interface ComposerDraftPersistenceOptions {
  * created, unless something is already there or it is a Turn input still being sent; an open edit
  * comes back once its conversation is shown and its message loaded, and is given up when another
  * conversation is shown first or the message changed meanwhile. Clearing and giving up an edit are
- * written at once.
+ * written at once, and so is everything when the host asks (before a reload) or the page goes away.
  */
 export function useComposerDraftPersistence(options: ComposerDraftPersistenceOptions): { flush(): void; dispose(): void } {
   const { ui, attachments, storage } = options;
@@ -146,6 +153,11 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
   ], schedule, { deep: true });
   // Already sent before the reload (it is sent again): drop it from the saved draft right away.
   if (inFlight) flush();
+  // The debounce must not cost the last keystrokes when the window reloads or the page goes away.
+  const saveNow = (): void => flush();
+  const stopSaveRequests = options.onSaveRequest?.(saveNow);
+  const pageEvents = options.pageEvents ?? (typeof window === 'undefined' ? undefined : window);
+  pageEvents?.addEventListener('pagehide', saveNow);
 
   function applyEdit(edit: EditSnapshot): void {
     const same = edit.kind === 'message'
@@ -239,6 +251,8 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
       flush();
       stopRestore();
       stopSave();
+      stopSaveRequests?.();
+      pageEvents?.removeEventListener('pagehide', saveNow);
       settlePendingEdit();
     }
   };

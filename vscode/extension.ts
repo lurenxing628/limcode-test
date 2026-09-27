@@ -107,7 +107,9 @@ async function startApplication(
         if (activeStartup !== startup || backendApp !== application) return;
         exclusiveMaintenanceParticipant = startExclusiveMaintenanceParticipant(application, {
           isCurrent: () => activeStartup === startup && backendApp === application,
-          windowState: context.workspaceState
+          windowState: context.workspaceState,
+          // Unsent input typed within the composer's save delay is written before a reload.
+          saveDrafts: () => MainPanel.saveComposerDrafts((clientId, message) => application.postToWebview(clientId, message))
         });
         // The user's operation gave way to another window's maintenance, which then reloaded this one.
         // Valid by when this window reopened, not by how long it then waited for that maintenance.

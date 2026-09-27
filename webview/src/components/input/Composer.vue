@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import {
+  BridgeMessageType,
   type AgentRecord,
   type InlineDataPart,
   type LlmProviderConfigRecord,
@@ -347,6 +348,8 @@ const draftPersistence = useComposerDraftPersistence({
     write: (value) => bridge.writePersistedState(PERSISTED_COMPOSER_DRAFT_KEY, value)
   },
   pendingInputTexts: () => inFlightTurnInputTexts.value,
+  // Before another window's maintenance reloads this one: what was just typed is written at once.
+  onSaveRequest: (listener) => bridge.on(BridgeMessageType.ComposerDraftSave, () => listener()),
   onAttachmentsOmitted: (count) => {
     globalSettings.status = `重载前有 ${count} 个未发送的附件太大，没能保留，请重新添加。`;
   },

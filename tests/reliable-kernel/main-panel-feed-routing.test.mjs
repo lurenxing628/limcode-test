@@ -123,3 +123,42 @@ test('MainPanel 把协作历史请求和所有 Feed 控制消息交给可靠 Fee
     panel.dispose();
   }
 });
+
+test('盲审 #10：重载前请每个面板立即保存未发送的输入，经 Facade 的 postToWebview（纯数据边界）发出', { timeout: 15000 }, async () => {
+  const disposed = new EventEmitter();
+  const panel = {
+    title: 'Limcode Test', visible: true, viewColumn: 1,
+    onDidDispose: disposed.event,
+    onDidChangeViewState: new EventEmitter().event,
+    reveal() {},
+    dispose() { disposed.fire(); disposed.dispose(); },
+    webview: {
+      options: {}, cspSource: 'vscode-webview:', html: '',
+      asWebviewUri: (uri) => uri,
+      onDidReceiveMessage: () => ({ dispose() {} })
+    }
+  };
+  const facade = {
+    waitUntilHydrated: async () => {},
+    conversationExists: async () => true,
+    getConversationDisplayTitle: () => '对话',
+    recoverConversation: async () => {},
+    attachWebview: () => 'draft-client',
+    setWebviewVisible() {},
+    detachWebview() {},
+    handleWebviewMessage() {}
+  };
+  const posted = [];
+  const post = (clientId, message) => { posted.push([clientId, message.type, message.channel]); return true; };
+  try {
+    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(process.cwd()) }, {
+      wait: async () => facade, waiting: () => undefined, onDidChangeWaiting: () => ({ dispose() {} })
+    });
+    await registeredSerializer.deserializeWebviewPanel(panel, { conversationId: 'conversation' });
+    assert.equal(MainPanel.saveComposerDrafts(post), 1);
+    assert.deepEqual(posted, [['draft-client', 'composer.draft.save', 'control']]);
+  } finally {
+    panel.dispose();
+  }
+  assert.equal(MainPanel.saveComposerDrafts(post), 0, 'a closed panel is not asked');
+});

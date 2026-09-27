@@ -121,6 +121,8 @@ export enum BridgeMessageType {
   GlobalSettingsSnapshot = 'settings.global.snapshot',
   GlobalSettingsFlush = 'settings.global.flush',
   GlobalSettingsFlushResult = 'settings.global.flush.result',
+  /** Extension → Webview: write the unsent composer input into the Webview state now (the window is about to reload). */
+  ComposerDraftSave = 'composer.draft.save',
   DebugCaptureCommand = 'diagnostics.capture.command',
   DebugCaptureResult = 'diagnostics.capture.result',
   DebugCaptureObservation = 'diagnostics.capture.observation',
@@ -3410,6 +3412,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.AttachmentReloadResult, AttachmentReloadResultPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsSnapshot, GlobalSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsFlush, undefined>
+  | BridgeEnvelope<BridgeMessageType.ComposerDraftSave, undefined>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsSnapshot, ConversationSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ProjectFoldersSnapshot, ProjectFoldersSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.FsStatResult, FsStatResultPayload>;
