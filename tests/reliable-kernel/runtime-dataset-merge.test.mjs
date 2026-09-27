@@ -20,7 +20,7 @@ const { attachmentObservationLinkId } = kernelFile('attachmentObservations.js');
 const { stablePhaseDId } = kernelFile('effectControlPlane.js');
 const { createConversationRuntimeWorkProbe } = kernelFile('conversationRuntimePendingWork.js');
 const {
-  MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS,
+  KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS,
   RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
@@ -1380,6 +1380,27 @@ test('复审 merge3 #8：收尾之后收到停止按推迟处理并记下收尾�
   assert.match(blocked.blocked[0].message, /当前库没有改动/);
   assert.doesNotMatch(blocked.blocked[0].message, /两边内容都没有改动/);
   assert.match(blocked.blocked[0].message, /之前一次合并时已把这个库里的1 个中断的任务按“中止”收尾.*收尾前的备份在 /);
+});
+
+test('盲审 merge #8：收尾原因区分来源：本版本切走（用户保留）的库写“合并前收尾。”，旧版本留下的库写“旧版本升级时中断，合并前收尾。”', async (t) => {
+  const fixture = await createFixture(t, { selected: 'alpha' });
+  await selectVscodeRuntimeDataSet(fixture.paths, 'default');
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_kept', project: SHARED_PROJECT }]);
+  await seed(fixture.beta, [{ id: 'conversation_beta_legacy', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_kept', kind: 'bare' }]);
+  await seedUnfinishedWork(fixture.beta, [{ conversationId: 'conversation_beta_legacy', kind: 'bare' }]);
+  const database = await openTarget(t, fixture.current);
+  assert.deepEqual((await merge(fixture, database)).merged.map((item) => item.candidateId), [fixture.beta.id], '保留的库不自动合并');
+  await requestMerge(fixture, fixture.alpha);
+  assert.deepEqual((await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true })).merged.map((item) => item.candidateId),
+    [fixture.alpha.id]);
+  const target = readDatabase(fixture.current);
+  try {
+    const reason = (turnId) => target.database.prepare('SELECT reason FROM turn_termination WHERE turn_id = ?').pluck().get(turnId);
+    assert.equal(reason('conversation_alpha_kept_unfinished_turn'), KEPT_MERGE_FINALIZATION_REASON);
+    assert.equal(reason('conversation_beta_legacy_unfinished_turn'), MERGE_FINALIZATION_REASON);
+  } finally { target.close(); }
+  assert.equal(KEPT_MERGE_FINALIZATION_REASON, '合并前收尾。');
 });
 
 async function seqFixture(t) {

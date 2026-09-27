@@ -16,7 +16,7 @@ import {
 import type { HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import {
-  describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, MERGE_FINALIZATION_REASON,
+  describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON,
   type CarriedWorkRefusals, type UnfinishedWorkInspection
 } from './runtimeDataSetMergeWork';
 import {
@@ -1070,6 +1070,8 @@ async function finalizeSource(
   }, async () => {
     await assertSourceUnchanged(paths, candidate, binding, state, false);
     stopIfAsked();
+    // Work in a data set the user switched away from in this version was not interrupted by an upgrade.
+    const reason = await isVscodeRuntimeDataSetKept(candidate) ? KEPT_MERGE_FINALIZATION_REASON : MERGE_FINALIZATION_REASON;
     const sourceBackupPath = await backupSource(binding);
     await fault(options, 'after-source-backup');
     const earlier = state.finalized;
@@ -1086,7 +1088,7 @@ async function finalizeSource(
       turns: finalized.turns, intents: finalized.intents, sourceBackupPath: finalized.sourceBackupPath, complete: finalized.complete
     });
     await remember();
-    await finalizeUnfinishedWork(createVscodeRootAuthority(candidate), work);
+    await finalizeUnfinishedWork(createVscodeRootAuthority(candidate), work, { reason });
     finalized.complete = true;
     await remember();
   })));
@@ -2050,4 +2052,4 @@ export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFrom
     : new RuntimeDataSetMergeError(outcome.code, outcome.message, error);
 }
 
-export { MERGE_FINALIZATION_REASON };
+export { KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON };

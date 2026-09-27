@@ -28,16 +28,21 @@ export {
  * | queued ordinary TurnIntent (user message waiting)  | TurnControlPlane.cancelGuidance                  |
  * | everything below                                   | refused, with the reason and what the user can do |
  */
+/** Reason of a Turn closed before merging a data set an earlier version left behind. */
 export const MERGE_FINALIZATION_REASON = '旧版本升级时中断，合并前收尾。';
+/** Reason of a Turn closed before merging a data set the user switched away from in this version. */
+export const KEPT_MERGE_FINALIZATION_REASON = '合并前收尾。';
 
 /**
- * Closes the finalizable work of an offline source with the existing control-plane transitions.
- * Call inside the source's maintenance claim, after a verified source backup; the source registers
- * a short-lived Host for the duration. No Turn is started and no provider is contacted.
+ * Closes the finalizable work of an offline source with the existing control-plane transitions,
+ * Turns with `reason`. Call inside the source's maintenance claim, after a verified source backup;
+ * the source registers a short-lived Host for the duration. No Turn is started and no provider is
+ * contacted.
  */
 export async function finalizeUnfinishedWork(
   authority: RootAuthority,
-  inspection: UnfinishedWorkInspection
+  inspection: UnfinishedWorkInspection,
+  options: { reason: string }
 ): Promise<void> {
   const database = await RuntimeDatabase.open(authority, { hostBootId: `merge-finalize-${randomUUID()}` });
   try {
@@ -81,7 +86,7 @@ export async function finalizeUnfinishedWork(
         source: { kind: 'recovery' as const, key: `historical-merge-finalize:turn:${turn.turnId}` },
         turnId: turn.turnId,
         terminalStatus: turn.terminalStatus,
-        reason: MERGE_FINALIZATION_REASON
+        reason: options.reason
       };
       const facts = await turns.recoveryFacts(turn.turnId);
       if (facts.judgment === 'finalize' && turn.terminalStatus === 'cancelled') await turns.finalizeRecovery(command);
