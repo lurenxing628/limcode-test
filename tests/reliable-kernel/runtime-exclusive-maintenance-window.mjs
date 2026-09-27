@@ -17,6 +17,10 @@
 //   closeAfterMs          — the user closes this window that long after it is ready (no next boot)
 //   reloadAfterMs         — the user reloads this window that long after it is ready
 //   closeGapMs            — closing its Runtime (the Host liveness record goes last) takes this long
+//   request: 'large-session' — this window runs the large historical merge session of
+//                           vscode/commands/largeHistoricalMerge.ts (the startup prompt, or with
+//                           largeManual the manual entry) with a fake engine: largeSources
+//                           [{ candidateId, rows, mergeMs }]; it closes its Runtime, merges, reloads
 import { randomUUID } from 'node:crypto';
 import fsSync from 'node:fs';
 import path from 'node:path';
@@ -39,7 +43,11 @@ const { RootAuthority } = kernelFile('rootAuthority.js');
 const { resolveVscodeRuntimeDataRoot } = kernelFile('vscodeRootAuthority.js');
 const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
 const exclusive = kernelFile('runtimeExclusiveMaintenance.js');
-const { openUnderCurrentDataRootAdmission, withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
+const {
+  assertRuntimeHostsOffline, isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, openUnderCurrentDataRootAdmission,
+  withRuntimeDataRootAdmission, withRuntimeMaintenance
+} = kernelFile('runtimeHostControl.js');
+const largeMergeSession = kernelFile('runtimeLargeMergeSession.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiled, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
 ));
@@ -68,12 +76,19 @@ let focused = behavior.focused === true;
 let workUntil = behavior.busy === true ? (behavior.busyForMs ? startedAt + behavior.busyForMs : Infinity) : 0;
 let workScheduled = false;
 const vscodeMock = {
-  ProgressLocation: { Notification: 15 },
+  ProgressLocation: { Notification: 15, Window: 10 },
+  env: { sessionId: behavior.sessionId ?? `session-${name}-${boot}` },
   window: {
     state: { get focused() { return focused; } },
     withProgress: async (options, task) => {
-      const countdown = /即将重载/.test(options.title);
+      const countdown = /即将重载/.test(options.title ?? '');
       await emit('progress', { title: options.title, cancellable: options.cancellable === true, countdown });
+      // The large merge session's own notifications have no title: every message is recorded.
+      if (options.title === undefined) {
+        return task({ report: (value) => { if (value?.message) void emit('progress-report', { message: value.message }); } }, {
+          isCancellationRequested: false, onCancellationRequested() { return { dispose() {} }; }
+        });
+      }
       if (countdown && behavior.focusOnCountdownMs) {
         // The user clicks into the window whose countdown just appeared, then goes back.
         focused = true;
@@ -92,7 +107,12 @@ const vscodeMock = {
       return result;
     },
     showInformationMessage: async (message) => { await emit('notice', { message }); },
-    showWarningMessage: async (message) => { await emit('warning', { message }); return undefined; }
+    showWarningMessage: async (message) => {
+      await emit('warning', { message });
+      // The manual large merge's confirmation.
+      return /^合并较大的旧聊天记录（/.test(message) ? '开始合并' : undefined;
+    },
+    showErrorMessage: async (message) => { await emit('error-message', { message }); }
   },
   commands: {
     executeCommand: async (id) => {
@@ -147,6 +167,14 @@ if (behavior.participant !== false) {
 // Shown once after a reload (extension.ts).
 const kept = windowState ? layer.takeNoticeKeptAcrossReload(windowState, startedAt) : undefined;
 if (kept) await emit('kept-notice', { text: kept });
+// The large merge session's outcome, kept by this window before it reloaded (runtimeDataSetManagement).
+const keptLarge = windowState ? largeMergeSession.takeLargeMergeResult(windowState, startedAt) : undefined;
+if (keptLarge) {
+  await emit('kept-large-result', {
+    merged: keptLarge.report?.merged.map((item) => [item.candidateId, item.insertedConversations]) ?? [],
+    deferred: keptLarge.report?.deferred.map((item) => item.code) ?? [], details: keptLarge.details, error: keptLarge.error
+  });
+}
 await emit('ready');
 if (behavior.closeAfterMs) {
   setTimeout(async () => {
@@ -170,7 +198,9 @@ const withTrackedLocks = (take) => async (body) => {
   });
 };
 
-if (behavior.request) {
+if (behavior.request === 'large-session') {
+  await runLargeSession();
+} else if (behavior.request) {
   // This window asks the others to yield, outside the locks (a data-root migration the user confirmed;
   // like dataRootRelocation.ts, the key carries the attempt's own id).
   const outcome = await layer.runWithExclusiveMaintenance(paths, {
@@ -215,6 +245,97 @@ if (behavior.request) {
   });
 }
 
+/**
+ * The large merge session of this window with the real session layer and coordination, and a fake
+ * engine whose merge checks it runs in the exclusive phase (both claims held, every Host offline).
+ */
+async function runLargeSession() {
+  const sources = (behavior.largeSources ?? []).map((source, index) => ({
+    candidateId: source.candidateId, runtimeDataRootPath: `/fixture/${source.candidateId}`, fingerprint: `fingerprint-${index}`,
+    rows: source.rows, databaseBytes: 1024 * 1024,
+    duration: { expectedMs: source.mergeMs, minMs: Math.round(source.mergeMs * 0.8), maxMs: Math.round(source.mergeMs * 1.6) }
+  }));
+  const engine = {
+    waiting: async () => sources.map(({ candidateId, rows, duration }) => ({ candidateId, rows, duration })),
+    prepare: async ({ candidateIds }) => {
+      await emit('engine-prepare', { candidateIds });
+      return {
+        sources: sources.filter((source) => candidateIds.includes(source.candidateId)),
+        report: { merged: [], deferred: [], blocked: [], failures: [] },
+        space: { targetDirectory: paths.dataRootPath, temporaryDirectory: root, targetDatabaseBytes: 1024, targetBackupPending: false },
+        engineState: 'fake'
+      };
+    },
+    release: async () => undefined,
+    run: async ({ preparation, signal, onProgress }) => {
+      let offline = 'offline';
+      try { await assertRuntimeHostsOffline(paths); } catch (error) { offline = String(error?.message ?? error); }
+      await emit('engine-run', { offline, admission: isRuntimeDataRootAdmissionHeld(root), maintenance: isRuntimeMaintenanceHeld(paths) });
+      const rowsTotal = preparation.sources.reduce((sum, source) => sum + source.rows, 0);
+      let rowsWritten = 0;
+      const outcomes = [];
+      for (const [index, source] of preparation.sources.entries()) {
+        const steps = Math.max(1, Math.round(source.duration.expectedMs / 20));
+        for (let step = 1; step <= steps; step += 1) {
+          if (signal.aborted) break;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          onProgress({ index, total: preparation.sources.length, candidateId: source.candidateId, rowsWritten: rowsWritten + Math.round((source.rows * step) / steps), rowsTotal });
+        }
+        rowsWritten += source.rows;
+        outcomes.push({ candidateId: source.candidateId, state: 'merged', result: {
+          candidateId: source.candidateId, sourceDataSetId: `source-${index}`, targetDataSetId: 'target', insertedRows: source.rows, reusedRows: 0,
+          insertedConversations: 10 + index, linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0, recoveredCommit: false
+        } });
+      }
+      return outcomes;
+    }
+  };
+  const lifetime = loadLayer('vscode/runtimeDataSetUpgradeLifetime.ts', {});
+  const session = loadLayer('vscode/commands/largeHistoricalMerge.ts', {
+    '../../backend/reliableKernel/runtimeExclusiveMaintenance': exclusive,
+    '../../backend/reliableKernel/runtimeLargeMergeEngine': kernelFile('runtimeLargeMergeEngine.js'),
+    '../../backend/reliableKernel/runtimeLargeMergeSession': largeMergeSession,
+    '../../shared/extensionIdentity': require(path.join(compiled, 'shared/extensionIdentity.js')),
+    '../panels/MainPanel': { MainPanel: { saveComposerDrafts: () => 0 } },
+    '../runtimeDataSetUpgradeLifetime': lifetime,
+    '../runtimeExclusiveMaintenance': layer
+  });
+  const writeGate = facadeLike.writeGate;
+  const largeHost = {
+    product: { application: { database } },
+    hasOwnedExecution: host.hasOwnedExecution,
+    exclusiveMaintenanceTarget: host.exclusiveMaintenanceTarget,
+    dataRootPath: () => root,
+    withDataRootLocks: withTrackedLocks((body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body))),
+    freezeNewWork: (activity) => {
+      const thaw = writeGate.freeze(activity, []);
+      void emit('frozen', { activity });
+      return () => { thaw(); void emit('thawed'); };
+    },
+    closeRuntime: async () => {
+      await emit('runtime-closing');
+      await database.close();
+      await emit('runtime-closed');
+    },
+    writeGate
+  };
+  const options = {
+    report: async (batch, requested) => { await emit('large-report', { requested, deferred: batch.deferred.map((item) => item.code) }); },
+    isCurrent: () => true,
+    engine,
+    ...(windowState ? { windowState } : {}),
+    saveDrafts: () => 0,
+    probeDisk: async () => ({ device: 1, freeBytes: 1e12 }),
+    countdownSeconds: behavior.largeCountdownSeconds ?? 1,
+    coordination: { pollMs: 20 }
+  };
+  const context = { workspaceState: windowState };
+  const ids = sources.map((source) => source.candidateId);
+  if (behavior.largeManual) await session.startLargeHistoricalMerge(context, largeHost, { ...options, candidateIds: ids });
+  else await session.offerLargeHistoricalMerge(context, largeHost, ids, options);
+  await emit('large-session-ended');
+}
+
 /** The parameters of requestOtherWindowsToYield in vscode/commands/runtimeDataSetManagement.ts. */
 async function requestOtherWindowsToYield(storagePaths, input, merge) {
   const outcome = await layer.runWithExclusiveMaintenance(input.targetPaths, {
@@ -246,7 +367,7 @@ function loadLayer(file, extra) {
   vm.runInNewContext(ts.transpileModule(fsSync.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText, {
-    module, exports: module.exports, console, setInterval, clearInterval, setTimeout, clearTimeout, Promise,
+    module, exports: module.exports, console, setInterval, clearInterval, setTimeout, clearTimeout, Promise, AbortController,
     require(dependency) {
       if (!Object.prototype.hasOwnProperty.call(dependencies, dependency)) throw new Error(`Unexpected dependency ${dependency}`);
       return dependencies[dependency];

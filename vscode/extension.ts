@@ -47,6 +47,7 @@ async function startApplication(
     const moduleLoadedAt = Date.now();
     const {
       announceForeignRuntimeHistoryOnStartup, mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection,
+      reportLargeHistoricalMergeKeptAcrossReload,
       upgradeHistoricalDataSetsOnStartup
     } = await import('./commands/runtimeDataSetManagement');
     const dataRootCommands = await import('./commands/dataRootRelocation');
@@ -133,6 +134,9 @@ async function startApplication(
     setImmediate(() => {
       if (activeStartup !== startup || backendApp !== application) return;
       const isCurrent = () => activeStartup === startup && backendApp === application;
+      // This window reloaded after its large historical merge session: each source's outcome, once.
+      void reportLargeHistoricalMergeKeptAcrossReload(context, isCurrent, activationStartedAt)
+        .catch(error => console.warn(`${EXTENSION_BRAND} large historical merge result could not be shown.`, error));
       // Old data sets are upgraded, then merged online into this Runtime, both in the background.
       void upgradeHistoricalDataSetsOnStartup(context, isCurrent)
         .catch(error => console.error(`${EXTENSION_BRAND} historical data upgrade failed.`, error))

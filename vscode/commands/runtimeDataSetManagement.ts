@@ -21,11 +21,19 @@ import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDataba
 import { EXCLUSIVE_MAINTENANCE_DEFAULTS } from '../../backend/reliableKernel/runtimeExclusiveMaintenance';
 import { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } from '../../backend/reliableKernel/runtimeStorageInspection';
 import { describeCurrentRuntimeContentUsage } from '../../backend/reliableKernel/runtimeContentUsage';
+import { LARGE_MERGE_AWAITING_CODE, largeMergeEngine, type LargeMergeWaitingSource } from '../../backend/reliableKernel/runtimeLargeMergeEngine';
+import {
+  LARGE_MERGE_SESSION_DEFERRAL_CODE, LARGE_MERGE_SESSION_DEFERRAL_STATE, largeMergeMinutes, sumLargeMergeDurations, takeLargeMergeResult
+} from '../../backend/reliableKernel/runtimeLargeMergeSession';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
 import { runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 import { manageForeignRuntimeHistory } from './foreignRuntimeHistory';
+import {
+  isLargeHistoricalMergeHost, LARGE_MERGE_SESSION_CAUSE, offerLargeHistoricalMerge, startLargeHistoricalMerge,
+  type LargeHistoricalMergeOptions
+} from './largeHistoricalMerge';
 
 export { announceForeignRuntimeHistoryOnStartup } from './foreignRuntimeHistory';
 
@@ -84,13 +92,16 @@ function dataSetLabel(
   candidate: VscodeRuntimeDataSetCandidate,
   merge?: RuntimeDataSetMergeState,
   summary?: RuntimeDataSetSummary,
-  startup = false
+  startup = false,
+  waiting?: LargeMergeWaitingSource
 ): string {
   const name = summary?.projectNames.length
     ? summary.projectNames.join('、')
     : candidate.source === 'workspace' ? '旧工作区历史' : '默认历史库';
   const role = candidate.selected ? '当前历史库 · ' : startup ? '' : '其他历史库 · ';
-  return `${role}${name}${mergeStateSuffix(merge)}`;
+  // Waiting for the large merge session (大库会话): its cached size, whatever the ledger said before.
+  const state = waiting ? ` · 较大，等待合并（约 ${largeMergeMinutes(waiting.duration.expectedMs)} 分钟）` : mergeStateSuffix(merge);
+  return `${role}${name}${state}`;
 }
 
 function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
@@ -143,7 +154,7 @@ async function chooseDataSet(
   placeHolder: string,
   problems: readonly VscodeRuntimeDataSetProblem[] = [],
   mergeStates: ReadonlyMap<string, RuntimeDataSetMergeState> = new Map(),
-  options: { summarizeSelected?: boolean; startup?: boolean } = {}
+  options: { summarizeSelected?: boolean; startup?: boolean; waiting?: readonly LargeMergeWaitingSource[] } = {}
 ) {
   // Read in a worker from private copies, one data set at a time, kept per file state.
   const summaries = new Map<string, RuntimeDataSetSummary | 'unreadable'>();
@@ -166,7 +177,7 @@ async function chooseDataSet(
       const message = rejected ? `\n打开前检查未通过：${rejected.message}`
         : merge?.state === 'blocked' || merge?.state === 'failed' || merge?.state === 'too-large' ? `\n${merge.message}` : '';
       return {
-        label: dataSetLabel(candidate, merge, summary, options.startup),
+        label: dataSetLabel(candidate, merge, summary, options.startup, options.waiting?.find((item) => item.candidateId === candidate.id)),
         description: [
           rejected ? '暂时无法自动打开' : '',
           read === 'unreadable' ? '对话数和最后活动读取失败（只是没读到，库没有被改动）' : '',
@@ -200,11 +211,18 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   if (!canStartRuntimeDataSetUpgrade(context)) return;
   await loadCommittedGlobalStatus(context);
   if (!canStartRuntimeDataSetUpgrade(context)) return;
+  // Sources waiting for the large merge session, from cached facts (nothing is read here).
+  const waiting = await largeMergeEngine().waiting(pathsFor(context)).catch(() => [] as LargeMergeWaitingSource[]);
+  const waitingMinutes = largeMergeMinutes(sumLargeMergeDurations(waiting.map((item) => item.duration)).expectedMs);
   const action = await vscode.window.showQuickPick([
     { label: '其他历史库', description: '查看旧聊天；旧格式会先自动备份升级', action: 'history' },
     { label: '外来历史库', description: '归档与从别处拷来的目录里的旧聊天；只读查看，以后的版本支持合并', action: 'foreign' },
     { label: '查看存储占用', description: '按需统计正文、数据库、临时文件与备份', action: 'storage' },
     { label: '合并到当前库', description: '把其他历史库的对话并入当前库；在后台进行，原库保留', action: 'merge' },
+    ...(waiting.length > 0 ? [{
+      label: `合并较大的旧聊天记录（${waiting.length} 份，约 ${waitingMinutes} 分钟）`,
+      description: '先在后台准备；合并期间所有 LimCode 窗口暂停并显示进度，完成后自动恢复', action: 'largeMerge'
+    }] : []),
     { label: '切换当前历史库', description: '保留完整原库，切换后重载窗口', action: 'select' },
     { label: '删除其他历史库', description: '仅删除明确选定的非当前完整历史库', action: 'delete' },
     { label: '迁移数据目录', description: '把全部历史和设置复制到新目录并核对后切换；旧目录保留', action: 'relocate' },
@@ -229,6 +247,15 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.cleanupBackups);
     return;
   }
+  if (action.action === 'largeMerge') {
+    const host = startup.current();
+    if (!isLargeHistoricalMergeHost(host)) {
+      await vscode.window.showErrorMessage('运行时没有打开，不能合并较大的旧聊天记录。');
+      return;
+    }
+    await startLargeHistoricalMerge(context, host, largeMergeOptions(context, host.dataRootPath(), () => canStartRuntimeDataSetUpgrade(context)));
+    return;
+  }
   const { candidates, problems } = await inspectVscodeRuntimeDataSets(pathsFor(context));
   if (!canStartRuntimeDataSetUpgrade(context)) return;
   const mergeStates = await readRuntimeDataSetMergeStates(pathsFor(context)).catch(() => new Map<string, RuntimeDataSetMergeState>());
@@ -246,7 +273,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     }
     return;
   }
-  const candidate = await chooseDataSet(eligible, action.label, problems, mergeStates);
+  const candidate = await chooseDataSet(eligible, action.label, problems, mergeStates, { waiting });
   if (!candidate || !canStartRuntimeDataSetUpgrade(context)) return;
   if (action.action === 'merge') { await mergeNow(context, startup, candidate, mergeStates.get(candidate.id)); return; }
   if (action.action === 'storage') { await showRuntimeStorage(context, candidate, startup); return; }
@@ -432,17 +459,24 @@ export interface HistoricalMergeHost {
  * pending data sets are merged online, one source per short write transaction, while this and
  * other windows keep working. It never throws and never asks anything: every outcome is a
  * notification, each cause at most once unless the user explicitly asked for that merge.
+ * Sources left to the large merge session (大库会话) go on there: offered in one window after a
+ * startup, confirmed right away after the user's click.
  */
 export async function mergeHistoricalDataSetsInBackground(
   context: vscode.ExtensionContext,
   host: HistoricalMergeHost,
   shouldContinue: () => boolean = () => true,
   candidateIds?: readonly string[]
-): Promise<void> {
-  if (!shouldContinue() || !canStartRuntimeDataSetUpgrade(context)) return;
+): Promise<RuntimeDataSetMergeBatchResult | undefined> {
+  if (!shouldContinue() || !canStartRuntimeDataSetUpgrade(context)) return undefined;
   const paths = pathsFor(context);
   const stillCurrent = () => canStartRuntimeDataSetUpgrade(context)
     && shouldContinue() && pathsFor(context).globalStoragePath === paths.globalStoragePath;
+  // A pending large merge session takes every other source above the online limit along (one
+  // coordination, one reload); asked once, from cached facts, when the first such source comes.
+  let largeSession: Promise<boolean> | undefined;
+  const largeSessionPending = (): Promise<boolean> => largeSession ??= largeMergeEngine().waiting(paths)
+    .then((waiting) => waiting.length > 0, () => false);
   let finishProgress: (() => void) | undefined;
   let progress: vscode.Progress<{ message?: string }> | undefined;
   let report: RuntimeDataSetMergeBatchResult;
@@ -460,7 +494,7 @@ export async function mergeHistoricalDataSetsInBackground(
           reporter => { progress = reporter; return done; });
       },
       onSourceStart: (_candidate, index, total) => progress?.report({ message: `${index + 1}/${total}` }),
-      coordinateOversized: (input, merge) => requestOtherWindowsToYield(paths, input, merge, stillCurrent)
+      coordinateOversized: (input, merge) => requestOtherWindowsToYield(paths, input, merge, stillCurrent, largeSessionPending)
     }));
   } catch (error) {
     console.error('[LimCode] 旧聊天记录合并检查失败。', error);
@@ -469,11 +503,65 @@ export async function mergeHistoricalDataSetsInBackground(
     if ((fresh.size > 0 || candidateIds) && stillCurrent()) {
       void vscode.window.showWarningMessage(`旧聊天记录暂时无法合并：${describeError(error)}。已有数据未被修改，稍后会自动重试。`);
     }
-    return;
+    return undefined;
   } finally {
     finishProgress?.();
   }
   await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent, candidateIds !== undefined);
+  const session = largeMergeSessionSources(report);
+  if (session.length > 0 && isLargeHistoricalMergeHost(host) && stillCurrent()) {
+    const options = largeMergeOptions(context, paths.globalStoragePath, stillCurrent);
+    if (candidateIds) await startLargeHistoricalMerge(context, host, { ...options, candidateIds: session });
+    // Not awaited: the prompt counts down and the session may wait for other windows; the startup goes on.
+    else void offerLargeHistoricalMerge(context, host, session, options)
+      .catch(error => console.error('[LimCode] 合并较大的旧聊天记录失败。', error));
+  }
+  return report;
+}
+
+/** Sources the batch left to the large merge session: above the in-memory bound, and those taken along. */
+function largeMergeSessionSources(report: RuntimeDataSetMergeBatchResult): string[] {
+  return report.deferred.filter((issue) => issue.candidateId !== undefined && isLargeMergeSessionIssue(issue))
+    .map((issue) => issue.candidateId!);
+}
+
+function isLargeMergeSessionIssue(issue: RuntimeDataSetMergeIssue): boolean {
+  return issue.code === LARGE_MERGE_AWAITING_CODE || issue.code === LARGE_MERGE_SESSION_DEFERRAL_CODE;
+}
+
+/** How the large merge session tells its outcomes: like this module's, with the same startup-notice dedup. */
+function largeMergeOptions(
+  context: vscode.ExtensionContext,
+  configurationRootPath: string,
+  stillCurrent: () => boolean
+): LargeHistoricalMergeOptions {
+  const state = (context as Partial<vscode.ExtensionContext>).workspaceState;
+  return {
+    report: (batch, requested, details) => reportHistoricalMerge(context, configurationRootPath, batch, stillCurrent, requested, details),
+    freshCause: async (code, message) => (await freshStartupNotices(context, configurationRootPath, 'merge',
+      [{ candidateId: LARGE_MERGE_SESSION_CAUSE, code, message }], new Set([LARGE_MERGE_SESSION_CAUSE]))).size > 0,
+    isCurrent: stillCurrent,
+    ...(state ? { windowState: state } : {})
+  };
+}
+
+/**
+ * Once after this window opened again following its large merge session (the result it kept
+ * before reloading, see largeHistoricalMerge.ts): each source's outcome, told like the online
+ * batch's. `openedAt` is when the extension started activating.
+ */
+export async function reportLargeHistoricalMergeKeptAcrossReload(
+  context: vscode.ExtensionContext,
+  shouldContinue: () => boolean = () => true,
+  openedAt: number = Date.now()
+): Promise<void> {
+  const state = (context as Partial<vscode.ExtensionContext>).workspaceState;
+  if (!state) return;
+  const kept = takeLargeMergeResult(state, openedAt);
+  if (!kept) return;
+  const stillCurrent = () => canStartRuntimeDataSetUpgrade(context) && shouldContinue();
+  if (kept.error && stillCurrent()) void vscode.window.showWarningMessage(`合并较大的旧聊天记录时出错：${kept.error}。`);
+  if (kept.report) await reportHistoricalMerge(context, kept.configurationRootPath, kept.report, stillCurrent, kept.requested, kept.details);
 }
 
 /**
@@ -489,8 +577,14 @@ async function requestOtherWindowsToYield(
   paths: { globalStoragePath: string },
   input: RuntimeDataSetOversizedMerge,
   merge: () => Promise<void>,
-  isCurrent: () => boolean
+  isCurrent: () => boolean,
+  largeSessionPending?: () => Promise<boolean>
 ): Promise<RuntimeDataSetExclusiveOutcome> {
+  // A large merge session is pending: this source goes along with it (one coordination and one
+  // reload for all of them) instead of making the windows yield on its own; the user's click does not.
+  if (!input.requested && await largeSessionPending?.()) {
+    return { state: LARGE_MERGE_SESSION_DEFERRAL_STATE, reason: '和其它较大的旧聊天记录一起合并' };
+  }
   const outcome = await runWithExclusiveMaintenance(input.targetPaths, {
     operation: 'historical-merge',
     operationKey: input.operationKey,
@@ -512,7 +606,8 @@ async function reportHistoricalMerge(
   configurationRootPath: string,
   report: RuntimeDataSetMergeBatchResult,
   stillCurrent: () => boolean,
-  requested: boolean
+  requested: boolean,
+  details?: readonly string[]
 ): Promise<void> {
   for (const merged of report.merged) console.info(`[LimCode] ${mergedLog(merged)}`);
   const issues = [...report.deferred, ...report.blocked, ...report.failures];
@@ -524,10 +619,16 @@ async function reportHistoricalMerge(
   const merged = report.merged.filter(item => !item.alreadyMerged);
   if (merged.length) {
     const conversations = merged.reduce((sum, item) => sum + item.insertedConversations, 0);
-    void vscode.window.showInformationMessage(
-      `已把 ${merged.length} 份旧聊天记录合并到当前历史库（新增 ${conversations} 个对话），可直接在侧栏继续。`
-      + mergedNotes(merged) + '原库和合并前备份都已保留。'
-    );
+    const text = `已把 ${merged.length} 份${details ? '较大的' : ''}旧聊天记录合并到当前历史库（新增 ${conversations} 个对话），可直接在侧栏继续。`
+      + mergedNotes(merged) + '原库和合并前备份都已保留。';
+    if (!details?.length) void vscode.window.showInformationMessage(text);
+    else {
+      // The large merge session: how many conversations each source added (or why not), on request.
+      void Promise.resolve(vscode.window.showInformationMessage(text, '查看详情')).then(async choice => {
+        if (choice !== '查看详情' || !stillCurrent()) return;
+        await showReadOnly(context, '较大的旧聊天记录合并结果', details.join('\n\n'));
+      }).then(undefined, error => console.warn('[LimCode] 无法显示较大的旧聊天记录合并详情。', error));
+    }
   }
   const current = report.merged.filter(item => item.alreadyMerged);
   if (current.length) {
@@ -540,8 +641,9 @@ async function reportHistoricalMerge(
     void vscode.window.showInformationMessage('这次没有合并：所选历史库已不在，或者当前历史库已经切换。可以重新打开“历史与存储管理”查看。');
   }
   // Another window's request merges the same source right now (superseded): nothing to tell here.
-  const announce = (issue: RuntimeDataSetMergeIssue) => issue.requested
-    || (issue.code !== 'runtime-data-set-merge-exclusive-superseded' && fresh.has(noticeCause(issue)));
+  // A source left to the large merge session is told by that session (its prompt, confirmation or result).
+  const announce = (issue: RuntimeDataSetMergeIssue) => !isLargeMergeSessionIssue(issue) && (issue.requested
+    || (issue.code !== 'runtime-data-set-merge-exclusive-superseded' && fresh.has(noticeCause(issue))));
   const deferred = report.deferred.filter(announce);
   if (deferred.length) {
     void vscode.window.showInformationMessage(

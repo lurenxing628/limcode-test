@@ -25,6 +25,10 @@ function loadSource(relative, dependencies, globals = {}) {
   return module.exports;
 }
 
+const compiled = process.env.LIMCODE_TEST_EXTENSION_ROOT
+  ? path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT) : path.resolve(__dirname, '../../dist/extension');
+const largeMergeSession = require(path.join(compiled, 'backend/reliableKernel/runtimeLargeMergeSession.js'));
+
 function emptyMergeReport(overrides = {}) {
   return { merged: [], deferred: [], blocked: [], failures: [], pendingSources: 0, stopped: false, ...overrides };
 }
@@ -37,7 +41,7 @@ function fixture({
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
   mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, exclusiveOutcome = 'completed', summaries = {}, globalState,
-  emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {})
+  emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {}), largeWaiting = [], workspaceState
 } = {}) {
   const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current', source: 'legacy' };
   const old = { id: 'workspace:old', ...(emptyOld ? {} : { dataSetId: 'old', rootInstanceId: 'old-instance' }), runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old', source: 'workspace' };
@@ -156,6 +160,18 @@ function fixture({
         if (exclusiveOutcome !== 'completed') return { state: exclusiveOutcome, hosts: [], reason: '有 1 个窗口正在忙（有任务正在进行）' };
         return { state: 'completed', result: await operation(), coordinated: true };
       }
+    },
+    // The large merge session (大库会话): the adapter's cached waiting sources, its helpers, and its entry points.
+    '../../backend/reliableKernel/runtimeLargeMergeEngine': {
+      LARGE_MERGE_AWAITING_CODE: 'runtime-data-set-merge-awaiting-exclusive',
+      largeMergeEngine: () => ({ waiting: async () => { calls.push(['large-waiting']); return largeWaiting; } })
+    },
+    '../../backend/reliableKernel/runtimeLargeMergeSession': largeMergeSession,
+    './largeHistoricalMerge': {
+      LARGE_MERGE_SESSION_CAUSE: 'large-merge-session',
+      isLargeHistoricalMergeHost: host => host?.large === true,
+      async offerLargeHistoricalMerge(_context, _host, candidateIds, options) { calls.push(['large-offer', [...candidateIds], options]); },
+      async startLargeHistoricalMerge(_context, _host, options) { calls.push(['large-start', options.candidateIds ? [...options.candidateIds] : null, options]); }
     }
   };
   const filename = path.resolve(__dirname, '../../vscode/commands/runtimeDataSetManagement.ts');
@@ -169,7 +185,10 @@ function fixture({
     module, exports: module.exports, require: name => dependencies[name] ?? require(name),
     console: { info: log('info'), warn: log('warn'), error: log('error'), log: log('log') }
   });
-  return { ...module.exports, context: { subscriptions: [], ...(globalState ? { globalState } : {}) }, startup: { current: () => application }, calls, logs, SelectionRequired, lifetime };
+  return {
+    ...module.exports, context: { subscriptions: [], ...(globalState ? { globalState } : {}), ...(workspaceState ? { workspaceState } : {}) },
+    startup: { current: () => application }, calls, logs, SelectionRequired, lifetime
+  };
 }
 
 test('startup asks once after selection-required, selects exact candidate and retries open', async () => {
@@ -339,6 +358,113 @@ function deferred() {
 }
 
 /** Run the actual activation and management modules with a controllable Runtime/upgrade boundary. */
+
+/** A window whose open Runtime can run the large merge session (the Facade has the data-directory methods). */
+const largeHost = () => ({ ...mergeHost(), large: true, dataRootPath: () => '/fixture' });
+const AWAITING = 'runtime-data-set-merge-awaiting-exclusive';
+const TAKEN_ALONG = 'runtime-data-set-merge-exclusive-large-session';
+
+test('大库会话：批结果里等大库会话的来源不当成“暂时无法合并”提示；启动后连同被带上的中等来源交给会话提示，用户点击的合并直接进入会话的确认', async () => {
+  const report = emptyMergeReport({
+    deferred: [
+      { candidateId: 'workspace:huge', code: AWAITING, message: '较大，等待合并', newly: true },
+      { candidateId: 'workspace:medium', code: TAKEN_ALONG, message: '这份旧聊天记录较大（约 5000 条记录），需要其它窗口暂时让出才能合并：和其它较大的旧聊天记录一起合并。以后会自动重试。', newly: true },
+      { candidateId: 'workspace:busy', code: 'runtime-hosts-active', message: '正被旧窗口使用', newly: true }
+    ]
+  });
+  const f = fixture({ mergeReport: report });
+  const returned = await f.mergeHistoricalDataSetsInBackground(f.context, largeHost());
+  assert.equal(returned, report);
+  const notices = f.calls.filter(call => ['warning', 'info'].includes(call[0])).map(call => call[1]);
+  assert.deepEqual(notices, ['有 1 份旧聊天记录暂时无法合并（正被旧窗口使用），以后启动时会自动重试。']);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'large-offer').map(call => call[1]), [['workspace:huge', 'workspace:medium']]);
+  assert.equal(f.calls.some(call => call[0] === 'large-start'), false);
+  // The session tells its outcomes through the same notices and dedup.
+  const options = f.calls.find(call => call[0] === 'large-offer')[2];
+  assert.equal(typeof options.report, 'function');
+  assert.equal(typeof options.freshCause, 'function');
+  // A window without the data-directory methods (e.g. a test double) offers nothing.
+  const plainHost = fixture({ mergeReport: report });
+  await plainHost.mergeHistoricalDataSetsInBackground(plainHost.context, mergeHost());
+  assert.equal(plainHost.calls.some(call => call[0] === 'large-offer'), false);
+  // The user's click: straight to the session's confirmation, for the sources it asked for.
+  const requested = fixture({ mergeReport: emptyMergeReport({ deferred: [{ candidateId: 'workspace:huge', code: AWAITING, message: '较大，等待合并', newly: true, requested: true }] }) });
+  await requested.mergeHistoricalDataSetsInBackground(requested.context, largeHost(), () => true, ['workspace:huge']);
+  assert.deepEqual(requested.calls.filter(call => call[0] === 'large-start').map(call => call[1]), [['workspace:huge']]);
+  assert.equal(requested.calls.some(call => ['warning', 'info'].includes(call[0])), false, 'not told as deferred or as “nothing was done”');
+});
+
+test('大库会话：有来源等待时，超过在线上限的中等来源不单独协调、跟会话一起合并；用户点击的中等来源照常协调；没有来源等待时照旧', async () => {
+  const withLocks = body => body();
+  const oversized = requested => ({
+    targetPaths: { dataRootPath: '/fixture/current' }, requesterHostBootId: 'this-window',
+    candidateId: 'workspace:medium', operationKey: 'workspace:medium@0123', requested, withLocks, isDeterministicFailure: () => false
+  });
+  const waiting = [{ candidateId: 'workspace:huge', rows: 700_000, duration: { expectedMs: 4 * 60_000, minMs: 3.2 * 60_000, maxMs: 6.4 * 60_000 } }];
+  for (const [largeWaiting, requested, coordinated] of [[waiting, false, false], [waiting, true, true], [[], false, true]]) {
+    const results = [];
+    const f = fixture({ largeWaiting, mergeHook: async options => {
+      results.push(await options.coordinateOversized(oversized(requested), async () => {}));
+      results.push(await options.coordinateOversized({ ...oversized(requested), candidateId: 'workspace:medium-2' }, async () => {}));
+    } });
+    await f.mergeHistoricalDataSetsInBackground(f.context, largeHost(), () => true, requested ? ['workspace:medium'] : undefined);
+    assert.equal(f.calls.filter(call => call[0] === 'exclusive').length, coordinated ? 2 : 0);
+    if (!coordinated) assert.deepEqual(plain(results), [0, 1].map(() => ({ state: 'large-session', reason: '和其它较大的旧聊天记录一起合并' })));
+    assert.ok(f.calls.filter(call => call[0] === 'large-waiting').length <= 1, 'asked once per batch, from cached facts');
+  }
+});
+
+test('大库会话：“历史与存储管理”只在有来源等待时列出“合并较大的旧聊天记录（N 份，约 X 分钟）”，合并列表里把它们标为“较大，等待合并（约 N 分钟）”；入口开始手动合并，运行时没打开时说明', async () => {
+  const waiting = [
+    { candidateId: 'workspace:old', rows: 700_000, duration: { expectedMs: 4 * 60_000, minMs: 3.2 * 60_000, maxMs: 6.4 * 60_000 } },
+    { candidateId: 'workspace:other', rows: 50_000, duration: { expectedMs: 60_000, minMs: 48_000, maxMs: 96_000 } }
+  ];
+  const none = fixture({ picks: [undefined] });
+  await none.manageRuntimeDataSets(none.context, none.startup);
+  assert.equal(none.calls[0][0], 'large-waiting');
+  assert.equal(none.calls.find(call => call[0] === 'pick')[1].some(item => item.action === 'largeMerge'), false);
+  const listed = fixture({ largeWaiting: waiting, picks: [action('merge'), undefined] });
+  await listed.manageRuntimeDataSets(listed.context, listed.startup);
+  const [menu, sources] = listed.calls.filter(call => call[0] === 'pick').map(call => call[1]);
+  const entry = menu.find(item => item.action === 'largeMerge');
+  assert.equal(entry.label, '合并较大的旧聊天记录（2 份，约 5 分钟）');
+  assert.equal(menu.indexOf(entry), menu.findIndex(item => item.action === 'merge') + 1);
+  assert.equal(sources[0].label, '其他历史库 · 旧工作区历史 · 较大，等待合并（约 4 分钟）');
+  const offline = fixture({ largeWaiting: waiting, picks: [action('largeMerge')] });
+  await offline.manageRuntimeDataSets(offline.context, offline.startup);
+  assert.deepEqual(offline.calls.filter(call => call[0] === 'error').map(call => call[1]), ['运行时没有打开，不能合并较大的旧聊天记录。']);
+  const running = fixture({ largeWaiting: waiting, picks: [action('largeMerge')], application: largeHost() });
+  await running.manageRuntimeDataSets(running.context, running.startup);
+  const [start] = running.calls.filter(call => call[0] === 'large-start');
+  assert.equal(start[1], null, 'the session takes the waiting sources itself');
+  assert.equal(typeof start[2].report, 'function');
+});
+
+test('大库会话：重载后按在线合并的同一套通知与去重说明结果（合并的对话数可查看每一份的详情；点了取消的那一份总会说明）；合并中途出错也说明；只提示一次', async () => {
+  const values = new Map();
+  const workspaceState = { get: key => values.get(key), update: async (key, value) => { if (value === undefined) values.delete(key); else values.set(key, value); } };
+  const merged = { candidateId: 'workspace:huge', insertedRows: 700_000, insertedConversations: 321, backupPath: '/fixture/backup', exclusive: true };
+  await largeMergeSession.keepLargeMergeResult(workspaceState, {
+    configurationRootPath: '/fixture', requested: false, details: ['workspace:huge（/fixture/huge，约 70 万条记录）：新增 321 个对话。'],
+    report: emptyMergeReport({ merged: [merged], deferred: [{ candidateId: 'workspace:other', code: 'runtime-data-set-merge-large-session-cancelled', message: '合并时取消了，这一份已撤回。', newly: true, requested: true }] })
+  });
+  const f = fixture({ workspaceState, informationChoice: '查看详情' });
+  await f.reportLargeHistoricalMergeKeptAcrossReload(f.context, () => true, Date.now());
+  await new Promise(resolve => setImmediate(resolve));
+  const infos = f.calls.filter(call => call[0] === 'info').map(call => call[1]);
+  assert.deepEqual(infos, [
+    '已把 1 份较大的旧聊天记录合并到当前历史库（新增 321 个对话），可直接在侧栏继续。原库和合并前备份都已保留。',
+    '有 1 份旧聊天记录暂时无法合并（合并时取消了，这一份已撤回），以后启动时会自动重试。'
+  ]);
+  assert.match(f.calls.find(call => call[0] === 'document')[1], /workspace:huge（\/fixture\/huge，约 70 万条记录）：新增 321 个对话。/);
+  await f.reportLargeHistoricalMergeKeptAcrossReload(f.context, () => true, Date.now());
+  assert.equal(f.calls.filter(call => call[0] === 'info').length, 2, 'told once');
+  await largeMergeSession.keepLargeMergeResult(workspaceState, { configurationRootPath: '/fixture', requested: true, details: [], error: '写入失败。已经合并完的会保留，其余的以后启动时会再合并' });
+  const failed = fixture({ workspaceState });
+  await failed.reportLargeHistoricalMergeKeptAcrossReload(failed.context, () => true, Date.now());
+  assert.deepEqual(failed.calls.filter(call => call[0] === 'warning').map(call => call[1]), ['合并较大的旧聊天记录时出错：写入失败。已经合并完的会保留，其余的以后启动时会再合并。']);
+});
+
 function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, keptNotice } = {}) {
   const events = [];
   const openOptions = [];

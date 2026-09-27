@@ -120,10 +120,10 @@ const CLOUD_SYNC_SEGMENT = /^(onedrive.*|dropbox|icloud ?drive|iclouddrive|mobil
 const FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024;
 /** Debug captures of a data set, below its Runtime data root (see debugCapture/files). */
 const DEBUG_CAPTURES_PATH: readonly string[] = ['diagnostics', 'debug-captures'];
-/** Allocation units a copy of the CAS objects is measured at (FAT/exFAT use up to 1 MiB clusters). */
-const CLUSTER_SIZES: readonly number[] = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+/** Allocation units a copy of the CAS objects is measured at (FAT/exFAT use up to 1 MiB clusters). Also the large merge session's. */
+export const CLUSTER_SIZES: readonly number[] = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
 /** Linux statfs types of filesystems without hard links (msdos/vfat, exFAT): CAS objects are copied. */
-const NO_HARD_LINK_FILESYSTEMS: ReadonlySet<number> = new Set([0x4d44, 0x2011bab0]);
+export const NO_HARD_LINK_FILESYSTEMS: ReadonlySet<number> = new Set([0x4d44, 0x2011bab0]);
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 /** Temporary copies named with their owner's process id (see sweepDataRootRelocationLeftovers). */
 const OWNED_TEMPORARY_DIRECTORY = /^limcode-(?:runtime-history|merge-precopy|relocation-count)-(\d+)-/;
