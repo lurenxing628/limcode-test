@@ -15,10 +15,12 @@ const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'di
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiledRoot, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
 ));
+const { RuntimeWriteGate } = require(path.join(compiledRoot, 'backend/application/reliableKernel/runtimeWriteGate.js'));
 
 function facadeForAbort(overrides = {}) {
   const calls = [];
   const facade = Object.create(Facade.prototype);
+  facade.writeGate = new RuntimeWriteGate();
   facade.product = {
     application: { database: {
       conversationOwners: {

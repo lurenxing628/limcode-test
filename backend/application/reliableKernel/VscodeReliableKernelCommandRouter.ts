@@ -65,6 +65,49 @@ import {
 } from './conversationHostEligibility';
 import { ConversationHostIneligibleError } from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { EXTENSION_BRAND } from '../../../shared/extensionIdentity';
+import type { RuntimeWriteGate } from './runtimeWriteGate';
+
+/**
+ * Webview commands that only read or show something: allowed while this window is frozen for an
+ * exclusive data-directory operation (see RuntimeWriteGate). Every other command writes the Runtime
+ * or its configuration and is refused at this entry while frozen.
+ */
+const READ_ONLY_COMMANDS: ReadonlySet<string> = new Set<string>([
+  BridgeMessageType.Ready,
+  BridgeMessageType.GlobalSettingsFlushResult,
+  BridgeMessageType.DebugCaptureObservation,
+  BridgeMessageType.ConversationOpen,
+  BridgeMessageType.ClientResync,
+  BridgeMessageType.Ping,
+  BridgeMessageType.GetWorkspaceInfo,
+  BridgeMessageType.ProjectFoldersGet,
+  BridgeMessageType.GlobalSettingsGet,
+  BridgeMessageType.ConversationSettingsGet,
+  BridgeMessageType.LlmProviderModelsGet,
+  BridgeMessageType.FsStatGet,
+  BridgeMessageType.ModelProfileScopeRead,
+  BridgeMessageType.SkillCatalogRefresh,
+  BridgeMessageType.RulesCatalogRefresh,
+  BridgeMessageType.PlanProposalExport,
+  BridgeMessageType.PlanProposalOpen,
+  BridgeMessageType.AttachmentOpen,
+  BridgeMessageType.AttachmentReload,
+  BridgeMessageType.CheckpointGitStatusGet,
+  BridgeMessageType.CheckpointShadowStatsGet,
+  BridgeMessageType.CheckpointDiffOpen,
+  BridgeMessageType.CompressionRebuildPreviewGet,
+  BridgeMessageType.ToolDiffOpen,
+  BridgeMessageType.ShowInfo
+]);
+/** Debug capture actions that only read (a capture itself is started, stopped or deleted otherwise). */
+const READ_ONLY_DEBUG_CAPTURE_ACTIONS: ReadonlySet<string> = new Set(['status', 'analyze', 'open', 'export']);
+
+function isWriteCommand(message: WebviewToExtensionMessage): boolean {
+  if (message.type === BridgeMessageType.DebugCaptureCommand) {
+    return !READ_ONLY_DEBUG_CAPTURE_ACTIONS.has(String((message.payload as { action?: unknown } | undefined)?.action));
+  }
+  return !READ_ONLY_COMMANDS.has(message.type);
+}
 
 export interface VscodeReliableKernelCommandRouterOptions {
   broadcast?(message: ExtensionToWebviewMessage): void;
@@ -88,6 +131,11 @@ export interface VscodeReliableKernelCommandRouterOptions {
    * this binding; in-panel navigation must go through the Host panel opening path.
    */
   conversationIdForClient?(clientId: string): string | undefined;
+  /**
+   * The window's write freeze (the Facade's): every command that writes goes through it and is
+   * refused at this entry, with the reason, while an exclusive data-directory operation runs.
+   */
+  writeGate?: RuntimeWriteGate;
 }
 
 /** Normal Webview command route for reliable Runtime mutations. Bounded Feed remains the only data route. */
@@ -122,7 +170,11 @@ export class VscodeReliableKernelCommandRouter {
       this.handleModelProfileScope(clientId, webview, message);
       return;
     }
-    void this.dispatch(clientId, webview, message).catch((error) => {
+    const gate = this.options.writeGate;
+    const dispatch = (): Promise<void> => this.dispatch(clientId, webview, message);
+    // A write refused while frozen fails like any other command: the sender gets its rejection
+    // (a Turn input stays in the composer) and the reason is shown.
+    void (gate && isWriteCommand(message) ? gate.run(dispatch) : dispatch()).catch((error) => {
       const text = error instanceof Error ? error.message : String(error);
       console.error('[LimCode] Reliable Webview command failed.', message.type, error);
       if (
@@ -769,7 +821,10 @@ export class VscodeReliableKernelCommandRouter {
           return scope.scopeKind === 'conversation' && scope.scopeId ? this.runConversationCommand(scope.scopeId, write) : write();
         };
         // Registering above is synchronous. The existing configuration queue now includes preflight.
-        const queued = this.configurationMutationQueue.then(work, work);
+        // A save while this window is frozen is refused before anything is written.
+        const gate = this.options.writeGate;
+        const admitted = gate ? () => gate.run(work) : work;
+        const queued = this.configurationMutationQueue.then(admitted, admitted);
         this.configurationMutationQueue = queued.then(() => undefined, () => undefined);
         return queued;
       });

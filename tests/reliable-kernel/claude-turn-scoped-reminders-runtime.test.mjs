@@ -27,6 +27,7 @@ const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/e
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
+const { RuntimeWriteGate } = load('backend/application/reliableKernel/runtimeWriteGate.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -151,6 +152,7 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, retryOnError
     });
     facade = Object.create(Facade.prototype);
     facade.product = { application: app, configuration };
+    facade.writeGate = new RuntimeWriteGate();
     facade.historyEntries = [];
     facade.refreshConversationHistory = async () => {};
   };

@@ -18,6 +18,7 @@ const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/e
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
+const { RuntimeWriteGate } = load('backend/application/reliableKernel/runtimeWriteGate.js');
 const { ForkContextCandidateProbe } = load('backend/reliableKernel/conversationForkContext.js');
 const { prepareChildContextFork } = load('backend/reliableKernel/childContextFork.js');
 const { ReliableConversationRunner } = load('backend/application/reliableKernel/ReliableConversationRunner.js');
@@ -132,6 +133,7 @@ async function withForkRuntime(run, {
     // ownership pins, configuration stores, context writer and agent loop remain real.
     facade = Object.create(Facade.prototype);
     facade.product = { application: app, configuration };
+    facade.writeGate = new RuntimeWriteGate();
     facade.historyEntries = [];
     facade.refreshConversationHistory = async () => {};
   };

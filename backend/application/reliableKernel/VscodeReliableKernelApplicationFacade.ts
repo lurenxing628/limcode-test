@@ -63,6 +63,7 @@ import type {
   ConversationRecoveryResult
 } from '../../../vscode/ApplicationFacade';
 import { VscodeReliableKernelCommandRouter, watchConversationRefresh } from './VscodeReliableKernelCommandRouter';
+import { isRuntimeWritesFrozenError, RuntimeWriteGate } from './runtimeWriteGate';
 import {
   VscodeReliableKernelCutoverCoordinator,
   archiveCurrentRuntimeRootForReset
@@ -100,6 +101,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   /** Attach-meta Conversation binding per client; a feed may never retarget beyond it. */
   private readonly webviewConversationIds = new Map<BridgeClientId, string>();
   private readonly commandRouter: VscodeReliableKernelCommandRouter;
+  /** Refuses write commands while an exclusive data-directory operation is about to close this Runtime. */
+  private readonly writeGate = new RuntimeWriteGate();
   private readonly externalHistoryWatcher: ExternalDataVersionWatcher;
   private readonly interactionAttentionNotifier: InteractionAttentionNotifier;
   private readonly interactionLeaseEdges: InteractionLeaseEdgeTracker;
@@ -141,10 +144,12 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       broadcast: (message) => this.broadcast(message),
       postToConversation: (conversationId, message) =>
         this.product.application.webviewFeed.postToConversation(conversationId, { ...message }),
-      createConversation: (options) => this.createConversation(options),
-      forkConversation: (request) => this.forkConversation(request),
+      // The router admits its commands through the write gate itself.
+      createConversation: (options) => this.createConversationNow(options),
+      forkConversation: (request) => this.forkConversationNow(request),
       onConversationActedOn: (conversationId) => void this.revealConversationHistoryTop(conversationId),
-      conversationIdForClient: (clientId) => this.webviewConversationIds.get(clientId)
+      conversationIdForClient: (clientId) => this.webviewConversationIds.get(clientId),
+      writeGate: this.writeGate
     });
     this.externalHistoryWatcher = new ExternalDataVersionWatcher(
       () => product.application.database.externalDataVersion(),
@@ -272,7 +277,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (this.disposed) return;
       await this.refreshInteractionAttention();
       if (this.disposed) return;
-      if (this.historyEntries.length === 0) await this.createConversation();
+      // A window frozen for a data-directory operation creates nothing; it reloads afterwards.
+      if (this.historyEntries.length === 0 && !this.writeGate.frozen) await this.createConversation();
     })();
     // Lazy callers may only need a scoped page and intentionally do not await the global cache
     // hydration. Keep a failure observed while preserving the rejecting Promise for commands that
@@ -288,7 +294,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return this.product.startRecovery();
   }
 
-  public async createConversation(options: { projectFolderUri?: string } = {}): Promise<string> {
+  public createConversation(options: { projectFolderUri?: string } = {}): Promise<string> {
+    return this.write(() => this.createConversationNow(options));
+  }
+
+  private async createConversationNow(options: { projectFolderUri?: string }): Promise<string> {
     this.requireOpen();
     const conversationId = runtimeId('conversation');
     const agent = await this.product.configuration.resolveAgent({ agentType: 'main' });
@@ -330,7 +340,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return conversationId;
   }
 
-  public async forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult> {
+  public forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult> {
+    return this.write(() => this.forkConversationNow(request));
+  }
+
+  private async forkConversationNow(request: ConversationForkPayload): Promise<ConversationForkResult> {
     this.requireOpen();
     const result = await this.conversationLifecycle().fork({
       sourceConversationId: request.sourceConversationId,
@@ -405,7 +419,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return displayConversationTitle({ id: conversationId, title: entry?.title });
   }
 
-  public async renameConversationTitle(conversationId: string, title: string): Promise<boolean> {
+  public renameConversationTitle(conversationId: string, title: string): Promise<boolean> {
+    return this.write(() => this.renameConversationTitleNow(conversationId, title));
+  }
+
+  private async renameConversationTitleNow(conversationId: string, title: string): Promise<boolean> {
     this.requireOpen();
     return this.revealingConversationRefresh(conversationId, () => this.product.application.database.conversationOwners.run(conversationId, async () => {
       const existing = await this.maybeRow('Conversation', conversationId);
@@ -423,7 +441,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     }));
   }
 
-  public async deleteConversation(conversationId: string): Promise<string[] | null> {
+  public deleteConversation(conversationId: string): Promise<string[] | null> {
+    return this.write(() => this.deleteConversationNow(conversationId));
+  }
+
+  private async deleteConversationNow(conversationId: string): Promise<string[] | null> {
     this.requireOpen();
     // The deletion control plane additionally pins every cascaded descendant before its
     // transaction; this requested-id run is the facade boundary guard.
@@ -436,6 +458,14 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   public abortConversation(
+    conversationId: string,
+    requestId: string,
+    target: ConversationAbortTarget
+  ): Promise<ConversationAbortResult> {
+    return this.write(() => this.abortConversationNow(conversationId, requestId, target));
+  }
+
+  private async abortConversationNow(
     conversationId: string,
     requestId: string,
     target: ConversationAbortTarget
@@ -564,7 +594,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     });
   }
 
-  public async resetDevelopmentData(): Promise<StorageDataResetResult> {
+  public resetDevelopmentData(): Promise<StorageDataResetResult> {
+    return this.write(() => this.resetDevelopmentDataNow());
+  }
+
+  private async resetDevelopmentDataNow(): Promise<StorageDataResetResult> {
     this.requireOpen();
     const storageRoot = this.runtimePlacement.runtimeScopeRootPath;
 
@@ -623,7 +657,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   /** Native command confirmation precedes this offline switch; callers reload the window after it. */
-  public async selectRuntimeDataSet(id: string): Promise<void> {
+  public selectRuntimeDataSet(id: string): Promise<void> {
+    return this.write(() => this.selectRuntimeDataSetNow(id));
+  }
+
+  private async selectRuntimeDataSetNow(id: string): Promise<void> {
     this.requireOpen();
     const paths = this.getPaths();
     await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
@@ -676,12 +714,18 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
    * command or run in progress (an activity pin), or any durable pending work of a conversation it
    * owns — queued input, undelivered deliveries and wakes, a pending answer delivery, background
    * processes. The owner manager keeps a conversation exactly while that probe reports work.
+   * Frozen (freezeNewWork): only work that existed before the freeze counts — a write command
+   * still running from before, and the conversations owned then (what a view does meanwhile is not
+   * work). Leases always count: while frozen none can start, so one is work from before.
    */
   public async hasOwnedExecution(): Promise<boolean> {
     this.requireOpen();
     const database = this.product.application.database;
+    const frozen = this.writeGate.frozenBaseline();
+    if (frozen?.writesRunning) return true;
     if ((await listAllDomainRows(database, 'ExecutionLease', { host_boot_id: database.hostBootId })).length > 0) return true;
     for (const { conversationId, pinned } of database.conversationOwners.ownedActivity()) {
+      if (frozen && !frozen.conversationIds.has(conversationId)) continue;
       if (pinned || await database.hasConversationRuntimeWork(conversationId)) return true;
     }
     return false;
@@ -704,12 +748,34 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   /**
-   * Freezes this window before an exclusive data-directory change closes its Runtime: no new work
-   * is taken up (see VscodeReliableKernelProductRuntime.freezeNewExecution). Returns the undo.
+   * Freezes this window before an exclusive data-directory change closes its Runtime, until the
+   * returned undo (idempotent): every command that writes the Runtime or its configuration is
+   * refused at its entry with “正在<activity>，完成后再操作。” (new messages, retries, edit-and-run,
+   * compression, plan approval, rename, delete, settings…); views and reads go on and unsent input
+   * stays in the composer. No Conversation is claimed for execution anew
+   * (VscodeReliableKernelProductRuntime.freezeNewExecution), and only work that existed before the
+   * freeze counts as this window's work (hasOwnedExecution). Synchronous, so nothing slips in between.
    */
-  public freezeNewWork(): () => void {
+  public freezeNewWork(activity: string): () => void {
     this.requireOpen();
-    return this.product.freezeNewExecution();
+    const owned = this.product.application.database.conversationOwners.ownedActivity().map(({ conversationId }) => conversationId);
+    const thawWrites = this.writeGate.freeze(activity, owned);
+    const thawExecution = this.product.freezeNewExecution();
+    return () => {
+      thawExecution();
+      thawWrites();
+    };
+  }
+
+  /**
+   * A write command entering here (the sidebar, a panel, a command): refused while frozen, with
+   * the reason shown, since those callers only log a failure.
+   */
+  private write<T>(operation: () => Promise<T>): Promise<T> {
+    return this.writeGate.run(operation).catch((error: unknown) => {
+      if (isRuntimeWritesFrozenError(error)) void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${error.message}`);
+      throw error;
+    });
   }
 
   /** Closes this window's Runtime before an offline data-directory change; the window reloads afterwards. */

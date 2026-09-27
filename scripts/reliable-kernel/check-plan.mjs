@@ -254,6 +254,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-dataset-merge-crash-child.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance.test.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance-windows.test.mjs',
+  'tests/reliable-kernel/runtime-write-freeze.test.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance-window.mjs',
   'tests/reliable-kernel/work-environment-selection.test.cjs',
   'tests/reliable-kernel/active-turn-work-environment-projection.test.mjs',

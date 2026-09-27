@@ -36,6 +36,7 @@ const {
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiled, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
 ));
+const { RuntimeWriteGate } = require(path.join(compiled, 'backend/application/reliableKernel/runtimeWriteGate.js'));
 
 const NOW = '2026-09-26T00:00:00.000Z';
 // Long-running windows; a window that started moments ago gets a short grace to register.
@@ -795,7 +796,7 @@ test('窗口是否空闲复用对话的待办工作判定：执行中的命令�
     await database.close();
     await fs.rm(directory, { recursive: true, force: true });
   });
-  const facade = { requireOpen() {}, product: { application: { database } } };
+  const facade = { requireOpen() {}, product: { application: { database } }, writeGate: new RuntimeWriteGate() };
   const busy = () => Facade.prototype.hasOwnedExecution.call(facade);
   assert.equal(await busy(), false);
   await database.conversationOwners.claim('conversation_idle');

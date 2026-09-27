@@ -69,6 +69,7 @@ const { startExclusiveMaintenanceParticipant } = load('backend/reliableKernel/ru
 const { ownProcessStartIdentity } = load('backend/reliableKernel/runtimeClaimPrimitives.js');
 const globalStatus = load('backend/capabilities/vscodeStorage/globalStatus.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
+const { RuntimeWriteGate } = load('backend/application/reliableKernel/runtimeWriteGate.js');
 const prompts = await fs.stat(path.join(compiled, 'vscode/dataRootPrompts.js')).then(() => load('vscode/dataRootPrompts.js'), () => undefined);
 
 /**
@@ -81,7 +82,9 @@ async function openWindow(t, configurationRootPath) {
   const database = await kernel.RuntimeDatabase.open(new RootAuthority(() => selected.runtimeDataRootPath), { hostBootId: `window-${randomUUID()}` });
   const window = Object.assign(Object.create(Facade.prototype), {
     runtimePlacement: { configurationRootPath, runtimeScopeRootPath: configurationRootPath, runtimeDataRootPath: selected.runtimeDataRootPath },
-    // The ProductRuntime's freeze (its claim probe) is its own concern; here it is only recorded.
+    // The Facade's write gate (its entry refusal is real); the ProductRuntime's freeze of its claim
+    // probe is its own concern and only recorded here.
+    writeGate: new RuntimeWriteGate(),
     product: {
       application: { database },
       freezeNewExecution() { window.frozen += 1; ui.calls.push(['freeze']); return () => { window.frozen -= 1; ui.calls.push(['thaw']); }; }
@@ -93,6 +96,11 @@ async function openWindow(t, configurationRootPath) {
     async dispose() {
       if (this.closed) return;
       this.frozenWhenClosed = this.frozen;
+      // What the user gets for a write in this window while the operation closes its Runtime.
+      if (this.writeGate.frozen) {
+        this.writeRefusalWhenClosed = await this.renameConversationTitle('conversation_current_1', '改个名字')
+          .then(() => undefined, (error) => error.message);
+      }
       this.closed = true;
       await database.close();
     },
@@ -184,7 +192,10 @@ test('单窗口迁移数据目录再回到旧目录：真实协调原语在锁�
   assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootPath, target, `指针切到新目录：${trace()}`);
   assert.equal(first.window.closed, true, '本窗口的运行时在锁内关闭');
   assert.equal(first.window.frozenWhenClosed, 1, '关闭运行时时本窗口已冻结（beforeGo），不再开始新任务');
+  assert.equal(first.window.writeRefusalWhenClosed, '正在迁移数据目录，完成后再操作。', '冻结期间本窗口的写命令在入口被拒绝并说明原因');
+  assert.ok(ui.calls.some(([kind, message]) => kind === 'warning' && message.endsWith('正在迁移数据目录，完成后再操作。')));
   assert.equal(first.window.frozen, 0, '锁内轮次结束后解冻');
+  assert.equal(first.window.writeGate.frozen, false, '写命令也随之解冻');
   assert.equal(reloads(), 1);
   assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
 
@@ -196,6 +207,7 @@ test('单窗口迁移数据目录再回到旧目录：真实协调原语在锁�
   assert.deepEqual(failures(), [], `回到旧目录没有失败：${trace()}`);
   assert.equal((await globalStatus.loadCommittedGlobalStatus(vscodeContext)).dataRootPath, fixture.root, `指针切回旧目录：${trace()}`);
   assert.equal(second.window.closed, true);
+  assert.equal(second.window.writeRefusalWhenClosed, '正在切换回旧数据目录，完成后再操作。', '提示按操作说明替换');
   assert.equal(reloads(), 1);
   assert.deepEqual(conversationIds((await selectedDataSet(fixture.root)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
 });

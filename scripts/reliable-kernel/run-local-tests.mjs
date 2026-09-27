@@ -209,6 +209,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/data-root-relocation-real-coordination.test.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance.test.mjs',
   'tests/reliable-kernel/runtime-exclusive-maintenance-windows.test.mjs',
+  'tests/reliable-kernel/runtime-write-freeze.test.mjs',
   'tests/reliable-kernel/work-environment-selection.test.cjs',
   'tests/reliable-kernel/active-turn-work-environment-projection.test.mjs',
   'tests/reliable-kernel/runtime-dataset-commands.test.cjs',

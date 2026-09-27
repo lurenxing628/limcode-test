@@ -38,8 +38,11 @@ export interface DataRootRelocationHost {
   exclusiveMaintenanceTarget(): { paths: RuntimeRootPaths; hostBootId: string };
   dataRootPath(): string;
   withDataRootLocks<R>(body: () => Promise<R>): Promise<R>;
-  /** Stops this window from taking up new work; returns the undo. */
-  freezeNewWork(): () => void;
+  /**
+   * Stops this window from taking up new work and refuses its write commands (“正在<activity>，完成后再
+   * 操作。”) until the returned undo; only work from before counts as busy meanwhile.
+   */
+  freezeNewWork(activity: string): () => void;
   closeRuntime(): Promise<void>;
   postToWebview(clientId: BridgeClientId, message: ExtensionToWebviewMessage): boolean;
 }
@@ -300,8 +303,9 @@ async function pointerSwitchedTo(context: vscode.ExtensionContext, targetRootPat
 /**
  * The one coordinated call of the data-directory commands: waits (outside the locks, up to the
  * primitive's limit) for other windows and for this window's own work, freezes this window before
- * any other window is told to go (beforeGo: no new work is taken up; still busy sends the call back
- * outside the locks), asks the other windows to reload with a countdown they cannot veto (the user
+ * any other window is told to go (beforeGo: until the operation ended no new work is taken up and
+ * every write command is refused at its entry; still busy sends the call back outside the locks,
+ * where it keeps waiting within the same limit), asks the other windows to reload with a countdown they cannot veto (the user
  * confirmed here), then runs `operation` under the configuration admission and the selected root's
  * maintenance claim. `operation` reports its stages to windows waiting to open. The key carries the
  * attempt's own id: every call is an explicit user action, and a new attempt after fixing a cause
@@ -353,7 +357,8 @@ async function coordinateExclusively<T>(
       // reaches the primitive (a lost one would leave this window frozen).
       const busy = await ownWork();
       if (busy) return { busy: { ...busy, reason: '本窗口在确认之后开始了新的任务' } };
-      const thaw = host.freezeNewWork();
+      // From here until the operation ended this window refuses every write command at its entry.
+      const thaw = host.freezeNewWork(input.message.replace(/^为/, ''));
       // Work taken up between the check and the freeze; a check that fails counts as busy.
       const late = await ownWork().then(
         (found) => found && { ...found, reason: '本窗口在确认之后开始了新的任务' },
@@ -1009,7 +1014,8 @@ function describePlan(plan: DataRootRelocationPlan): DataRootPromptSection[] {
     {
       title: '过程：',
       lines: [
-        '先在后台预先复制正文；然后等所有 LimCode 窗口（包括本窗口）的任务结束，其它窗口倒计时后自动重载（已在这里确认，不能取消；未发送的输入会保留）。这期间开始新的任务会让迁移继续等待（最多 10 分钟）。',
+        '先在后台预先复制正文；然后等所有 LimCode 窗口（包括本窗口）的任务结束（最多 10 分钟，这期间开始新的任务会让迁移继续等），其它窗口倒计时后自动重载（已在这里确认，不能取消；未发送的输入会保留）。',
+        '从其它窗口开始重载到迁移结束，本窗口不接受新消息、重试、压缩、改名、删除等修改（会提示“正在迁移数据目录，完成后再操作。”）；查看不受影响，输入框里的内容会保留。',
         '本窗口停止运行时，把历史库、设置、全局规则和技能写入新目录并逐项核对；全部成功后才切换到新目录，所有窗口重载一次。',
         '任何一步失败都不会切换，新目录里本次做的改动会被撤销。',
         '旧目录的数据不会被修改；之后可以在设置页“删除旧目录”（只删除确认迁移过去、且之后没有改动的内容，备份默认保留），或“回到旧目录”。'

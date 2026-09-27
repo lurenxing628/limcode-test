@@ -43,6 +43,7 @@ const { openUnderCurrentDataRootAdmission, withRuntimeDataRootAdmission, withRun
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiled, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
 ));
+const { RuntimeWriteGate } = require(path.join(compiled, 'backend/application/reliableKernel/runtimeWriteGate.js'));
 
 const { root, name, boot, behavior } = JSON.parse(process.env.LIMCODE_EXCLUSIVE_MAINTENANCE_WINDOW);
 const startedAt = Date.now();
@@ -128,7 +129,7 @@ const paths = authority.expectedPaths();
 await emit('opened', { hostBootId, startedAt, openMs: Date.now() - openStarted });
 
 const busyNow = () => Date.now() < workUntil;
-const facadeLike = { requireOpen() {}, product: { application: { database } } };
+const facadeLike = { requireOpen() {}, product: { application: { database } }, writeGate: new RuntimeWriteGate() };
 const host = {
   exclusiveMaintenanceTarget: () => ({ paths, hostBootId }),
   hasOwnedExecution: async () => busyNow() || Facade.prototype.hasOwnedExecution.call(facadeLike)
