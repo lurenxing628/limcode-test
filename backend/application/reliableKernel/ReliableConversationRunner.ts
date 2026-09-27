@@ -982,13 +982,30 @@ export class ReliableConversationRunner {
       reason: input.reason
     });
     if (result.ignoredBecauseTerminal) return result;
-    // Only this explicit stop may close work a window left running when it exited unexpectedly.
+    // Only this explicit stop may close work a window left running when it exited unexpectedly. A
+    // window serving the Conversation first recovers that work the way startup does, checking the
+    // workspace where it can; only what remains unresolved is then closed as outcome_unknown.
     if (!this.active.has(input.turnId)) {
+      await this.recoverDeadHostEffectsByInspection(input.conversationId, input.turnId);
       const closed = await this.settleDeadHostExecution(input.conversationId, input.turnId);
       if (closed === 'interrupted') return result;
       if (closed === 'live') return { ...await this.interruptThroughOwner(input, result), executingWindowAlive: true };
     }
     return this.interruptThroughOwner(input, result);
+  }
+
+  private async recoverDeadHostEffectsByInspection(conversationId: string, turnId: string): Promise<void> {
+    try {
+      if (await this.conversationOwners.executionEligibility(conversationId) !== 'eligible') return;
+      const preview = await this.application.phaseDRecovery.deadHostEffectsForTurn(
+        turnId,
+        this.application.database.hostBootId
+      );
+      if (preview.state !== 'dead') return;
+      await this.application.phaseDRecovery.runAll(undefined, conversationId);
+    } catch (error) {
+      this.onError(error, { operation: 'watch-recovery', conversationId, turnId });
+    }
   }
 
   private async interruptThroughOwner(
