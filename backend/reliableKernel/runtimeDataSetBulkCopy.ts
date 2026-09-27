@@ -616,7 +616,7 @@ function sameStoredValue(left: unknown, right: unknown): boolean {
   return left === right || (Buffer.isBuffer(left) && Buffer.isBuffer(right) && left.equals(right));
 }
 
-function comparable(file: string): string {
+export function comparable(file: string): string {
   const resolved = path.resolve(file);
   return process.platform === 'win32' || process.platform === 'darwin' ? resolved.toLowerCase() : resolved;
 }

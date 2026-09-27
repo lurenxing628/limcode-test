@@ -24,7 +24,8 @@ const pending = new Map<string, { clientId: BridgeClientId; options: ReadonlySet
 export function askInSettingsPage(host: DataRootPromptHost, clientId: BridgeClientId, prompt: DataRootPrompt): Promise<DataRootPromptAnswer> {
   const flowId = randomUUID();
   return new Promise((resolve) => {
-    pending.set(flowId, { clientId, options: new Set((prompt.options ?? []).map((option) => option.key)), resolve });
+    const options = [...(prompt.options ?? []), ...prompt.sections.flatMap((section) => section.options ?? [])];
+    pending.set(flowId, { clientId, options: new Set(options.map((option) => option.key)), resolve });
     const posted = host.postToWebview(clientId, {
       id: randomUUID(),
       type: BridgeMessageType.DataRootPrompt,

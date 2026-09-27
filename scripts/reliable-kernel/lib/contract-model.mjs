@@ -593,6 +593,44 @@ function validateMigration(root, migration, failures) {
   if (!plainObject(relocation) || JSON.stringify(relocation) !== JSON.stringify(expectedRelocation)) {
     failures.push('数据目录迁移只能复制核对后最后切换指针：在线预复制、锁外等待后独占阶段经合并引擎迁移模式写入、每步先记日志、失败或崩溃按日志撤销、删除旧目录只删按指纹证明已迁移且未改动的内容，不可用（身份不符）的数据目录绝不新建空库');
   }
+  const cleanup = migration?.backupCleanup;
+  const expectedCleanup = {
+    entry: 'settings-page-other-data-root-button; data-set-management-and-command-palette-only-open-the-settings-page; progress-notification-while-checking',
+    deletableKinds: ['epoch-migration-backups', 'merge-backups', 'merge-source-backups'],
+    listedOnly: 'reset-archives-limcode-runtime-backups; relocation-copied-aside-limcode-copied; control-root-legacy-backups; limcode-data-backups; name-location-size-and-reason-never-deleted',
+    coverage: 'every-conversation-and-message-revision-id-of-the-copy-in-the-local-data-set-of-the-same-control-root; copy-read-in-facts-worker-from-private-copy-ids-cached-by-exact-file-state-in-merge-ledger-coverage; current-data-set-only-through-its-own-worker-reader-250-ids-per-read; other-local-data-sets-through-facts-worker-private-copy-under-their-maintenance; uncovered-kept-as-history-naming-the-missing-conversations',
+    conditions: 'upgrade-backup-completion-record-next-binding-same-data-set-local-generation-not-lower-and-7-days-after-completion; merge-and-source-backup-root-binding-same-data-set-local-generation-not-lower',
+    protections: 'in-progress-control-root-journal-or-committing-merge; newest-complete-merge-backup-per-control-root; merge-backup-younger-than-1h; directory-with-tmp-file; source-backup-referenced-by-unreported-finalization',
+    confirmation: 'first-confirm-panel-grouped-by-kind-name-size-created-purpose-and-conclusion-only-deletable-items-have-unticked-boxes; second-danger-confirm-panel-items-total-size-check-time-cannot-be-undone',
+    deletion: 'reverified-under-configuration-admission-and-control-root-maintenance-file-state-local-identity-and-generation-journals-newest-and-coverage; rename-to-deleting-id-fsync-parent-then-recursive-remove; crash-leftover-finished-by-next-cleanup',
+    filesystem: 'never-follows-symbolic-links; platform-path-comparison; sqlite-only-in-workers',
+    reclaim: 'files-with-other-hard-links-not-counted'
+  };
+  if (!plainObject(cleanup) || JSON.stringify(cleanup) !== JSON.stringify(expectedCleanup)) {
+    failures.push('备份清理只删能证明完整存在于本地库的副本：只处理升级前、合并前与合并来源的收尾前备份，副本的全部对话与消息修订 id 都在同一控制根的本地库才可删（当前库只经它自己的读取线程查询），保护最新一份、不满 1 小时、有临时文件、进行中的日志与未报告的收尾引用，升级备份满 7 天；归档、拷来的目录与旧格式备份只列出；两步确认，锁内复核后先改名再删，不跟随符号链接');
+  }
+  const cleanupSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeBackupCleanup.ts'), 'utf8');
+  const graceDays = Number(/RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS = ([\d_]+) \* 24 \* 60 \* 60 \* 1000;/.exec(cleanupSource)?.[1]?.replaceAll('_', ''));
+  const minAge = /RUNTIME_BACKUP_CLEANUP_MERGE_BACKUP_MIN_AGE_MS = (?:([\d_]+) \* )?60 \* 60 \* 1000;/.exec(cleanupSource);
+  const minAgeHours = minAge ? Number(minAge[1]?.replaceAll('_', '') ?? 1) : Number.NaN;
+  const readBatch = Number(/RUNTIME_BACKUP_CLEANUP_READ_BATCH = ([\d_]+);/.exec(cleanupSource)?.[1]?.replaceAll('_', ''));
+  if (!expectedCleanup.conditions.includes(`-and-${graceDays}-days-after-completion`)
+    || !expectedCleanup.protections.includes(`; merge-backup-younger-than-${minAgeHours}h;`)
+    || !expectedCleanup.coverage.includes(`-reader-${readBatch}-ids-per-read;`)) {
+    failures.push('migration.json#backupCleanup 的升级宽限天数、合并前备份最短保留时间与每次读取 id 数必须与 runtimeBackupCleanup.ts 的常量一致');
+  }
+  const directoryConstant = (file, name) => new RegExp(`export const ${name} = '([^']+)';`).exec(fs.readFileSync(path.join(root, 'backend/reliableKernel', file), 'utf8'))?.[1];
+  const deletableDirectories = [
+    directoryConstant('runtimeEpochMigration.ts', 'RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY'),
+    directoryConstant('runtimeDataSetMerge.ts', 'RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY'),
+    directoryConstant('runtimeDataSetMerge.ts', 'RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY')
+  ];
+  const deletableKinds = /RUNTIME_BACKUP_DELETABLE_KINDS: readonly RuntimeBackupKind\[\] = Object\.freeze\(\[([^\]]*)\]\)/.exec(cleanupSource)?.[1]
+    ?.split(',').map((item) => item.trim().replace(/^'|'$/g, '')).filter(Boolean) ?? [];
+  if (JSON.stringify(deletableDirectories) !== JSON.stringify(expectedCleanup.deletableKinds)
+    || JSON.stringify(deletableKinds) !== JSON.stringify(['epoch-migration', 'merge-target', 'merge-source'])) {
+    failures.push('备份清理可删的只有 migration.json#backupCleanup.deletableKinds 列出的三种目录（升级前备份、合并前备份、合并来源的收尾前备份）');
+  }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
   }

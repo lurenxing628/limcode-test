@@ -457,7 +457,8 @@ export class MainPanel {
     }
     const command = action === 'relocate' ? EXTENSION_COMMAND_IDS.relocateDataRoot
       : action === 'returnToPrevious' ? EXTENSION_COMMAND_IDS.returnToPreviousDataRoot
-        : action === 'deletePrevious' ? EXTENSION_COMMAND_IDS.deletePreviousDataRoot : undefined;
+        : action === 'deletePrevious' ? EXTENSION_COMMAND_IDS.deletePreviousDataRoot
+          : action === 'cleanupBackups' ? EXTENSION_COMMAND_IDS.cleanupBackups : undefined;
     if (!command) return;
     void vscode.commands.executeCommand(command, { clientId: this.clientId }).then(undefined, (error) => {
       const message = error instanceof Error ? error.message : String(error);

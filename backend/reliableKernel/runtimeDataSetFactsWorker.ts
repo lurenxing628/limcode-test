@@ -4,7 +4,7 @@ import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import { assertCurrentSchema, assertDatabaseBinding, configureReaderConnection } from './databaseSchema';
 import { readRuntimeDataSetSummary, runtimeDataSetContentDigest } from './runtimeDataSetContent';
 import type {
-  RuntimeDataSetFacts, RuntimeDataSetFactsWorkerData, RuntimeDataSetFactsWorkerResponse
+  RuntimeDataSetFacts, RuntimeDataSetFactsWorkerData, RuntimeDataSetFactsWorkerResponse, RuntimeDataSetHistoryIds
 } from './runtimeDataSetFacts';
 import { assertPublishedPreviousRuntimeEpochSnapshot } from './runtimeEpochMigration';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
@@ -42,9 +42,22 @@ async function read(input: RuntimeDataSetFactsWorkerData): Promise<Omit<RuntimeD
     }
     return {
       ...(input.contentDigest ? { contentDigest: runtimeDataSetContentDigest(database) } : {}),
-      ...(input.summary ? { summary: readRuntimeDataSetSummary(database) } : {})
+      ...(input.summary ? { summary: readRuntimeDataSetSummary(database) } : {}),
+      ...(input.historyIds ? { historyIds: readHistoryIds(database) } : {})
     };
   } finally {
     database.close();
   }
+}
+
+/** Epoch-agnostic: both tables exist unchanged in the published epochs 3 and 4 and in epoch 5. */
+function readHistoryIds(database: Database.Database): RuntimeDataSetHistoryIds {
+  const ids = (table: 'conversation' | 'message_revision'): string[] => {
+    const values = database.prepare(`SELECT id FROM ${table} ORDER BY id`).pluck().all();
+    if (!values.every((value): value is string => typeof value === 'string' && value.length > 0)) {
+      throw new Error(`Historical ${table}.id is not non-empty text.`);
+    }
+    return values;
+  };
+  return { conversations: ids('conversation'), messageRevisions: ids('message_revision') };
 }

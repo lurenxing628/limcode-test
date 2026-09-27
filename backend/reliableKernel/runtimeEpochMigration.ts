@@ -38,10 +38,12 @@ export const PREVIOUS_RUNTIME_KERNEL_EPOCH = 3;
 export const LATEST_PUBLISHED_RUNTIME_KERNEL_EPOCH = 4;
 export const RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE = 'epoch-to-5-migration.json';
 export const RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY = 'epoch-migration-backups';
-const RETIRED_EPOCH_3_TO_4_JOURNAL_FILE = 'epoch-3-to-4-migration.json';
+export const RETIRED_EPOCH_3_TO_4_JOURNAL_FILE = 'epoch-3-to-4-migration.json';
+/** Written into the backup directory once an upgrade completed (its `nextBinding` and `completedAt`). */
+export const RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE = 'epoch-migration-completion.json';
 
 const MIGRATION_KIND = 'limcode-runtime-epoch-migration';
-const MIGRATION_COMPLETION_KIND = 'limcode-runtime-epoch-migration-completion';
+export const MIGRATION_COMPLETION_KIND = 'limcode-runtime-epoch-migration-completion';
 const EPOCH_3_ADDED_DOMAIN_KEYS = new Set([
   'ConversationAttachmentHandleLink',
   'AttachmentObservationLink',
@@ -817,7 +819,7 @@ async function finalizeJournal(
     path.join(backupRoot, 'epoch-migration-journal.completed.json'),
     journal
   );
-  await writeDurableJson(path.join(backupRoot, 'epoch-migration-completion.json'), {
+  await writeDurableJson(path.join(backupRoot, RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), {
     kind: MIGRATION_COMPLETION_KIND,
     attemptId: journal.attemptId,
     fromEpoch: journal.fromEpoch,

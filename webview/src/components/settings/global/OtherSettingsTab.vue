@@ -83,8 +83,9 @@ function saveOtherSettings(): void {
           <button type="button" class="secondary" @click="settings.requestDataRootAction('returnToPrevious')">回到旧目录…</button>
           <button type="button" class="secondary" @click="settings.requestDataRootAction('deletePrevious')">删除旧目录…</button>
         </template>
+        <button type="button" class="secondary" @click="settings.requestDataRootAction('cleanupBackups')">清理备份…</button>
       </div>
-      <span class="global-settings-field-hint">迁移时先检查新目录（空间、权限、是否云同步目录、数据量），确认后把当前历史库、其它历史库、设置、全局规则和技能复制到新目录并逐项核对，迁移本身不修改旧目录的数据；所有 LimCode 窗口会重载一次，有任务的窗口会等任务结束，未发送的输入会保留。删除旧目录只删除确认迁移过去、且迁移之后没有改动的内容，删除前完整列出并再次确认，备份和归档默认保留。</span>
+      <span class="global-settings-field-hint">迁移时先检查新目录（空间、权限、是否云同步目录、数据量），确认后把当前历史库、其它历史库、设置、全局规则和技能复制到新目录并逐项核对，迁移本身不修改旧目录的数据；所有 LimCode 窗口会重载一次，有任务的窗口会等任务结束，未发送的输入会保留。删除旧目录只删除确认迁移过去、且迁移之后没有改动的内容，删除前完整列出并再次确认，备份和归档默认保留。清理备份只删除能证明完整存在于本地库的升级前、合并前与合并来源备份（副本里的每个对话、每条消息都还在同一位置的历史库里），含有别处没有的对话的一律保留；归档和从别处拷来的目录只列出。</span>
     </div>
 
     <label class="global-settings-field">

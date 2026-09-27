@@ -13,6 +13,7 @@ export const EXTENSION_COMMAND_IDS = {
   relocateDataRoot: 'limcode-test.relocateDataRoot',
   returnToPreviousDataRoot: 'limcode-test.returnToPreviousDataRoot',
   deletePreviousDataRoot: 'limcode-test.deletePreviousDataRoot',
+  cleanupBackups: 'limcode-test.cleanupBackups',
   applyLiveDiffPreview: 'limcode-test.applyLiveDiffPreview'
 } as const;
 

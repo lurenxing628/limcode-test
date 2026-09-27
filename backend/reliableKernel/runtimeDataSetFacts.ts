@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
-import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
+import { copyRuntimeDataSetDatabase, copyRuntimeSqliteFiles, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import type { VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
 
 /**
@@ -19,12 +19,21 @@ export interface RuntimeDataSetFactsRequest {
   openable?: boolean;
   contentDigest?: boolean;
   summary?: boolean;
+  /** Every Conversation and MessageRevision id (the readable history), each sorted. */
+  historyIds?: boolean;
+}
+
+/** Ids of the readable history of one database; revisions reference their content, which is never deleted. */
+export interface RuntimeDataSetHistoryIds {
+  conversations: string[];
+  messageRevisions: string[];
 }
 
 export interface RuntimeDataSetFacts {
   binding: HistoricalRootBinding;
   contentDigest?: string;
   summary?: RuntimeDataSetSummary;
+  historyIds?: RuntimeDataSetHistoryIds;
 }
 
 /** @internal Worker protocol; plain data only. */
@@ -57,9 +66,39 @@ export async function readRuntimeDataSetFacts(
       binding: JSON.parse(JSON.stringify(binding)) as HistoricalRootBinding,
       ...(request.openable ? { openable: true } : {}),
       ...(request.contentDigest ? { contentDigest: true } : {}),
-      ...(request.summary ? { summary: true } : {})
+      ...(request.summary ? { summary: true } : {}),
+      ...(request.historyIds ? { historyIds: true } : {})
     });
     return { binding, ...facts };
+  } finally {
+    await copy.remove();
+  }
+}
+
+/**
+ * The same read-only facts of one SQLite backup file (not a data set) of a configuration root, whose
+ * root_binding row must equal `binding` (the binding saved beside it). The copy counts only when the
+ * file state (runtimeDataSetFileState) is the same before and after it; `files` is that state.
+ */
+export async function readRuntimeBackupFacts(
+  input: { configurationRootPath: string; databasePath: string; binding: HistoricalRootBinding },
+  request: RuntimeDataSetFactsRequest
+): Promise<{ files: string; facts: Omit<RuntimeDataSetFacts, 'binding'> }> {
+  const files = await runtimeDataSetFileState(input.databasePath);
+  const copy = await copyRuntimeSqliteFiles(input.configurationRootPath, input.databasePath);
+  try {
+    const facts = await runWorker({
+      databasePath: copy.databasePath,
+      binding: JSON.parse(JSON.stringify(input.binding)) as HistoricalRootBinding,
+      ...(request.openable ? { openable: true } : {}),
+      ...(request.contentDigest ? { contentDigest: true } : {}),
+      ...(request.summary ? { summary: true } : {}),
+      ...(request.historyIds ? { historyIds: true } : {})
+    });
+    if (await runtimeDataSetFileState(input.databasePath) !== files) {
+      throw new RuntimeDataSetFactsError('备份文件在读取期间发生了变化。', 'runtime-backup-changed-while-reading');
+    }
+    return { files, facts };
   } finally {
     await copy.remove();
   }

@@ -64,6 +64,11 @@
         "command": "limcode-test.deletePreviousDataRoot",
         "title": "Limcode Test: 删除迁移前的旧数据目录",
         "category": "Limcode Test"
+      },
+      {
+        "command": "limcode-test.cleanupBackups",
+        "title": "Limcode Test: 清理备份",
+        "category": "Limcode Test"
       }
     ],
     "menus": {

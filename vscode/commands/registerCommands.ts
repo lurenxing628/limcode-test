@@ -105,6 +105,10 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     [EXTENSION_COMMAND_IDS.deletePreviousDataRoot, '删除旧数据目录失败', async (request?: unknown) => {
       const { deletePreviousDataRoot } = await import('./dataRootRelocation');
       await deletePreviousDataRoot(context, startup, request);
+    }],
+    [EXTENSION_COMMAND_IDS.cleanupBackups, '清理备份失败', async (request?: unknown) => {
+      const { cleanupBackups } = await import('./backupCleanup');
+      await cleanupBackups(context, startup, request);
     }]
   ] as const;
   const dataRootCommandDisposables = dataRootCommands.map(([commandId, failure, run]) => vscode.commands.registerCommand(commandId, async (request?: unknown) => {

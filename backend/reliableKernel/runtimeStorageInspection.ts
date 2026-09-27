@@ -191,16 +191,30 @@ export async function copyRuntimeDataSetDatabase(
   candidate: VscodeRuntimeDataSetCandidate,
   binding: HistoricalRootBinding
 ): Promise<{ databasePath: string; remove(): Promise<void> }> {
+  return copyRuntimeSqliteFiles(candidate.configurationRootPath, binding.paths.databasePath);
+}
+
+/**
+ * Private copy of one SQLite file of a configuration root (a data set's database or a backup) and
+ * its WAL, never its -shm, in a fresh temporary directory; the source is only copied, never opened
+ * by SQLite. Same caller contract: never a database this process has open.
+ */
+export async function copyRuntimeSqliteFiles(
+  configurationRootPath: string,
+  sourceDatabasePath: string
+): Promise<{ databasePath: string; remove(): Promise<void> }> {
+  await assertNoSymbolicPath(configurationRootPath, sourceDatabasePath);
+  if (!(await fs.lstat(sourceDatabasePath)).isFile()) throw new Error('Historical SQLite database is not a regular file.');
   // Named with this process id: a crashed process's copies are found and removed (sweepDataRootRelocationLeftovers).
   const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-runtime-history-${process.pid}-`));
   const remove = () => fs.rm(temporaryRoot, { recursive: true, force: true });
   try {
     const databasePath = path.join(temporaryRoot, 'limcode.sqlite');
-    await fs.copyFile(binding.paths.databasePath, databasePath, constants.COPYFILE_FICLONE);
+    await fs.copyFile(sourceDatabasePath, databasePath, constants.COPYFILE_FICLONE);
     for (const suffix of ['-wal', '-journal']) {
-      const source = `${binding.paths.databasePath}${suffix}`;
+      const source = `${sourceDatabasePath}${suffix}`;
       if (!await exists(source)) continue;
-      await assertNoSymbolicPath(candidate.configurationRootPath, source);
+      await assertNoSymbolicPath(configurationRootPath, source);
       const stat = await fs.lstat(source);
       if (!stat.isFile()) throw new Error(`Historical SQLite sidecar is not a regular file: ${suffix}`);
       if (suffix === '-journal' && stat.size > 0) {

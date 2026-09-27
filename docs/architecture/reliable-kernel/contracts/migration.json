@@ -92,6 +92,22 @@
     "oldDirectory": "kept; pointer-relocation-id-must-match-the-completion-record-switches-without-copying-never-justify-deletion; delete-only-what-the-completion-record-proves-migrated-and-unchanged-by-fingerprint-and-digest; a-data-sets-content-that-did-not-move-listed-as-unmigrated-deleted-only-when-ticked; backups-and-archives-only-when-ticked-with-sizes; all-hosts-offline; confirmed-list-must-still-match; moved-notice-kept-when-deleting; return-switches-pointer-invalidates-the-record-and-clears-its-own-moved-notice; other-installations-warned-without-blocking-and-offered-the-new-directory-also-when-it-is-unavailable",
     "unavailableRoot": "identity-file-matched-against-pointer-else-limcode-structure-selection-identity-or-root-binding; identity-recorded-on-first-normal-open-inside-admission; unfinished-relocation-settled-inside-admission-before-open-undone-when-its-process-is-gone-refused-otherwise; unconfirmed-completion-confirmed-and-finalized-only-by-the-initiating-installation-whose-pointer-names-it-others-refused-while-its-process-lives-and-asked-once-it-is-gone; relocating-and-transient-read-errors-offer-retry-only-other-read-errors-also-other-directories; only-enoent-and-enotdir-count-as-missing; missing-mismatched-or-empty-refuses-startup-with-retry-return-choose-other-or-default-after-second-confirmation; never-creates-an-empty-root; reads-of-file-and-record-store-settings-never-create-directories-missing-equals-defaults-on-first-save"
   },
+  "backupCleanup": {
+    "entry": "settings-page-other-data-root-button; data-set-management-and-command-palette-only-open-the-settings-page; progress-notification-while-checking",
+    "deletableKinds": [
+      "epoch-migration-backups",
+      "merge-backups",
+      "merge-source-backups"
+    ],
+    "listedOnly": "reset-archives-limcode-runtime-backups; relocation-copied-aside-limcode-copied; control-root-legacy-backups; limcode-data-backups; name-location-size-and-reason-never-deleted",
+    "coverage": "every-conversation-and-message-revision-id-of-the-copy-in-the-local-data-set-of-the-same-control-root; copy-read-in-facts-worker-from-private-copy-ids-cached-by-exact-file-state-in-merge-ledger-coverage; current-data-set-only-through-its-own-worker-reader-250-ids-per-read; other-local-data-sets-through-facts-worker-private-copy-under-their-maintenance; uncovered-kept-as-history-naming-the-missing-conversations",
+    "conditions": "upgrade-backup-completion-record-next-binding-same-data-set-local-generation-not-lower-and-7-days-after-completion; merge-and-source-backup-root-binding-same-data-set-local-generation-not-lower",
+    "protections": "in-progress-control-root-journal-or-committing-merge; newest-complete-merge-backup-per-control-root; merge-backup-younger-than-1h; directory-with-tmp-file; source-backup-referenced-by-unreported-finalization",
+    "confirmation": "first-confirm-panel-grouped-by-kind-name-size-created-purpose-and-conclusion-only-deletable-items-have-unticked-boxes; second-danger-confirm-panel-items-total-size-check-time-cannot-be-undone",
+    "deletion": "reverified-under-configuration-admission-and-control-root-maintenance-file-state-local-identity-and-generation-journals-newest-and-coverage; rename-to-deleting-id-fsync-parent-then-recursive-remove; crash-leftover-finished-by-next-cleanup",
+    "filesystem": "never-follows-symbolic-links; platform-path-comparison; sqlite-only-in-workers",
+    "reclaim": "files-with-other-hard-links-not-counted"
+  },
   "candidateRoot": {
     "isolated": true,
     "mayReadLegacyRuntime": false,

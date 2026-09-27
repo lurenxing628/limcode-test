@@ -33,21 +33,33 @@ function onAction(action: ConfirmPanelAction): void {
       <div ref="scroller" class="data-root-prompt-scroll">
         <section v-for="(section, index) in prompt.sections" :key="index" class="data-root-prompt-section">
           <h3 v-if="section.title">{{ section.title }}</h3>
-          <ul>
+          <ul v-if="section.lines.length">
             <li v-for="(line, lineIndex) in section.lines" :key="lineIndex">{{ line }}</li>
           </ul>
+          <div v-for="option in section.options ?? []" :key="option.key" class="data-root-prompt-choice">
+            <LcCheckbox
+              :model-value="store.include.includes(option.key)"
+              size="sm"
+              :aria-label="option.label"
+              @update:model-value="store.toggle(option.key, $event)"
+            >
+              <span class="data-root-prompt-option">{{ option.label }}</span>
+            </LcCheckbox>
+            <span v-if="option.detail" class="data-root-prompt-option-detail">{{ option.detail }}</span>
+          </div>
         </section>
         <section v-if="prompt.options?.length" class="data-root-prompt-section" aria-label="可选删除项">
-          <LcCheckbox
-            v-for="option in prompt.options"
-            :key="option.key"
-            :model-value="store.include.includes(option.key)"
-            size="sm"
-            :aria-label="option.label"
-            @update:model-value="store.toggle(option.key, $event)"
-          >
-            <span class="data-root-prompt-option">{{ option.label }}</span>
-          </LcCheckbox>
+          <div v-for="option in prompt.options" :key="option.key" class="data-root-prompt-choice">
+            <LcCheckbox
+              :model-value="store.include.includes(option.key)"
+              size="sm"
+              :aria-label="option.label"
+              @update:model-value="store.toggle(option.key, $event)"
+            >
+              <span class="data-root-prompt-option">{{ option.label }}</span>
+            </LcCheckbox>
+            <span v-if="option.detail" class="data-root-prompt-option-detail">{{ option.detail }}</span>
+          </div>
         </section>
       </div>
       <AdvancedScrollbar :scroller="scroller" :refresh-key="refreshKey" variant="minimal" />
@@ -99,5 +111,18 @@ function onAction(action: ConfirmPanelAction): void {
 
 .data-root-prompt-option {
   overflow-wrap: anywhere;
+}
+
+.data-root-prompt-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.data-root-prompt-option-detail {
+  padding-left: 24px;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+  color: var(--vscode-descriptionForeground);
 }
 </style>

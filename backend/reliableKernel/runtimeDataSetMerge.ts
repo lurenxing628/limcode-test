@@ -1876,7 +1876,7 @@ async function writeDurableJson(file: string, value: unknown): Promise<void> {
   finally { await fs.rm(temporary, { force: true }); }
 }
 
-const BACKUP_NAME = /^(\d{8}T\d{9}Z)-(\d{6,})-[0-9a-f]{8}$/;
+export const BACKUP_NAME = /^(\d{8}T\d{9}Z)-(\d{6,})-[0-9a-f]{8}$/;
 let backupSequence = 0;
 
 /** UTC time to the millisecond, then a per-process sequence: sorts by creation even within one ms. */

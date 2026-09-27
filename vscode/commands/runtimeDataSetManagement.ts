@@ -198,6 +198,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     { label: '切换当前历史库', description: '保留完整原库，切换后重载窗口', action: 'select' },
     { label: '删除其他历史库', description: '仅删除明确选定的非当前完整历史库', action: 'delete' },
     { label: '迁移数据目录', description: '把全部历史和设置复制到新目录并核对后切换；旧目录保留', action: 'relocate' },
+    { label: '清理备份', description: '在设置页核对并删除已完整存在于本地库的备份', action: 'cleanupBackups' },
     { label: '归档并重置当前历史库', description: '保留备份并创建空库；归档本身不释放磁盘', action: 'reset' }
   ], { placeHolder: '历史与存储管理' });
   if (!action || !canStartRuntimeDataSetUpgrade(context)) return;
@@ -207,6 +208,11 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   }
   if (action.action === 'relocate') {
     await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.relocateDataRoot);
+    return;
+  }
+  if (action.action === 'cleanupBackups') {
+    // Only opens the settings page at 其他 → 数据目录; the cleanup runs from its button.
+    await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.cleanupBackups);
     return;
   }
   const { candidates, problems } = await inspectVscodeRuntimeDataSets(pathsFor(context));

@@ -3218,7 +3218,7 @@ export interface LocalFileOpenPayload {
  * dataRoot.prompt confirmations), and the answer to such a prompt.
  */
 export interface DataRootActionPayload {
-  action: 'relocate' | 'returnToPrevious' | 'deletePrevious' | 'answer';
+  action: 'relocate' | 'returnToPrevious' | 'deletePrevious' | 'cleanupBackups' | 'answer';
   /** answer: the prompt answered. */
   flowId?: string;
   /** answer: the chosen action key; 'cancel' when dismissed. */
@@ -3233,9 +3233,19 @@ export interface DataRootPromptAction {
   variant?: 'default' | 'secondary' | 'danger';
 }
 
+/** A check box of a prompt, unticked by default. */
+export interface DataRootPromptOption {
+  key: string;
+  label: string;
+  /** Shown under the label. */
+  detail?: string;
+}
+
 export interface DataRootPromptSection {
   title?: string;
   lines: string[];
+  /** Check boxes that belong to this section, shown after its lines. */
+  options?: DataRootPromptOption[];
 }
 
 /** A confirmation or notice of a data-directory command, shown in the settings page's ConfirmPanel. */
@@ -3246,7 +3256,7 @@ export interface DataRootPromptPayload {
   /** Listed in full (never truncated). */
   sections: DataRootPromptSection[];
   /** Check boxes, unticked by default (e.g. backups that are kept unless ticked). */
-  options?: Array<{ key: string; label: string; detail?: string }>;
+  options?: DataRootPromptOption[];
   actions: DataRootPromptAction[];
   danger?: boolean;
 }
