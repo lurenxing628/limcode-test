@@ -58,17 +58,20 @@ function sidebarHost() {
   const listeners = { history: [], reveal: [] };
   const requests = [];
   let scope = { kind: 'project', folderUri: P };
+  let held;
   const backendApp = {
     onDidChangeConversationHistory: (listener) => { listeners.history.push(listener); return disposable(); },
     onDidRevealConversationHistoryTop: (listener) => { listeners.reveal.push(listener); return disposable(); },
     async getConversationHistoryPage(input) {
       requests.push({ ...input });
+      if (held) await held.promise;
       return {
         scope,
         entries: [],
         originLinks: [],
         // The backend may re-position or clamp; the host must remember what it actually resolved.
-        pageInfo: { cursor: `resolved:${input.cursor ?? 'first'}`, pageIndex: 0, pageSize: 50, total: 0, hasNext: false, hasPrevious: false }
+        // Any cursor stands for a later page here; no cursor is the first page.
+        pageInfo: { cursor: `resolved:${input.cursor ?? 'first'}`, pageIndex: input.cursor ? 2 : 0, pageSize: 50, total: 0, hasNext: false, hasPrevious: false }
       };
     },
     getCurrentProjectHistoryScope: () => scope,
@@ -93,6 +96,12 @@ function sidebarHost() {
     requests,
     posted,
     setScope(next) { scope = next; },
+    /** Page reads started from now on wait until the returned release runs. */
+    holdReads() {
+      let release;
+      held = { promise: new Promise((resolve) => { release = resolve; }) };
+      return () => { held = undefined; release(); };
+    },
     request(message) { receive({ type: 'sidebar.historyPage.get', limit: 50, ...message }); },
     historyChanged() { for (const listener of listeners.history) listener(); },
     reveal(target) { for (const listener of listeners.reveal) listener(target); },
@@ -146,6 +155,28 @@ test('本窗口在当前范围内的动作让侧栏回到第一页，其他项�
   host.reveal({ conversationId: 'q-conversation', projectFolderUri: Q });
   await waitFor(() => host.requests.length === 6, '全部历史回到第一页');
   assert.equal(host.requests[5].cursor, undefined);
+});
+
+test('本窗口动作要求回到第一页时，进行中的旧页读取作废，最终停在第一页', async (t) => {
+  const host = sidebarHost();
+  t.after(() => host.dispose());
+  host.request({ scopeKind: 'project', projectFolderUri: P, cursor: 'page-3' });
+  await waitFor(() => host.posted.length === 1, '第 3 页状态');
+  // Another commit refreshes the shown page; that read is still in flight when this window acts.
+  const release = host.holdReads();
+  host.historyChanged();
+  await waitFor(() => host.requests.length === 2, '刷新读取开始');
+  assert.equal(host.requests[1].cursor, 'resolved:page-3');
+  host.reveal({ conversationId: 'p-conversation', projectFolderUri: P });
+  release();
+  await waitFor(() => host.requests.length === 3, '回到第一页的读取');
+  await settle();
+  assert.deepEqual(host.requests.map((request) => request.cursor ?? null), ['page-3', 'resolved:page-3', null]);
+  // The stale read neither showed the old page again nor handed its cursor to the next refresh.
+  assert.deepEqual(host.posted.map((message) => message.history.pageInfo.pageIndex), [2, 0]);
+  host.historyChanged();
+  await waitFor(() => host.requests.length === 4, '之后的刷新');
+  assert.equal(host.requests[3].cursor, 'resolved:first');
 });
 
 test('命令路由只在本窗口命令期间的提交刷新了该对话行时通知回到第一页', async () => {
