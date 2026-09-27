@@ -16,7 +16,8 @@ import { classifyRecordedProcess, ownProcessStartIdentity } from './runtimeClaim
 import { initializeEmptyRuntimeRoot, RuntimeDatabase } from './runtimeDatabase';
 import {
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY,
-  RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY, type RuntimeDataSetMergeOptions, type RuntimeDataSetMergeResult
+  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY, type RuntimeDataSetMergeOptions,
+  type RuntimeDataSetMergeResult
 } from './runtimeDataSetMerge';
 import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
 import {
@@ -63,11 +64,6 @@ export const DATA_ROOT_RELOCATION_MARKER_FILE = '.limcode-data-root-relocation.j
 export const DATA_ROOT_IDENTITY_FILE = '.limcode-data-root-identity.json';
 /** Replaced configuration versions, the journal and database backups of each relocation. */
 export const DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY = '.limcode-relocation-backups';
-/**
- * The move is one SQLite transaction whose memory grows with the rows of the data set; until it
- * is written in batches, larger data sets are refused before any window is involved.
- */
-export const DATA_ROOT_RELOCATION_MAX_ROWS = 25_000;
 /** A folder that already holds other files receives LimCode data only in its own sub-folder. */
 export const DATA_ROOT_RELOCATION_SUBFOLDER = 'LimCode';
 /** Global rules and skills live directly in the data directory (rulesCatalog, skillCatalog). */
@@ -423,8 +419,11 @@ export async function planDataRootRelocation(input: {
   const currentSize = await measureDataSet(currentBinding);
   const currentRows = await countRows(currentCandidate, currentBinding, input.sourceDatabase);
   const current = { ...identityOf(currentCandidate), ...currentSize, rows: currentRows };
-  if (currentRows > DATA_ROOT_RELOCATION_MAX_ROWS) {
-    problems.push(`当前历史库数据较多（约 ${currentRows} 行记录，当前版本最多迁移 ${DATA_ROOT_RELOCATION_MAX_ROWS} 行），当前版本暂不能迁移；旧目录不受影响，可以继续使用。`);
+  // Temporary: the move is one merge-engine transaction whose memory grows with the rows, so the
+  // engine's one-transaction bound applies until the move is written in batches; refused here,
+  // before any window is involved.
+  if (currentRows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS) {
+    problems.push(`当前历史库数据较多（约 ${currentRows} 行记录，当前版本最多迁移 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 行），当前版本暂不能迁移；旧目录不受影响，可以继续使用。`);
   }
   const others: DataRootRelocationPlan['others'] = [];
   for (const candidate of inspection.candidates) {
@@ -438,7 +437,7 @@ export async function planDataRootRelocation(input: {
     const size = await measureDataSet(binding);
     const rows = await countRows(candidate, binding).catch(() => undefined);
     const leaveBehind = rows === undefined ? '无法读取这个历史库（可能需要先在旧目录里打开一次完成升级）'
-      : rows > DATA_ROOT_RELOCATION_MAX_ROWS ? `数据较多（约 ${rows} 行记录），当前版本暂不能迁移` : undefined;
+      : rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS ? `数据较多（约 ${rows} 行记录），当前版本暂不能迁移` : undefined;
     others.push({ ...identityOf(candidate), ...size, ...(rows !== undefined ? { rows } : {}), ...(leaveBehind ? { leaveBehind } : {}) });
   }
   for (const problem of inspection.problems) {

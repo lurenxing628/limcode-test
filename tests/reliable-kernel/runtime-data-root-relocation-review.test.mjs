@@ -13,11 +13,12 @@ import {
 } from './runtime-data-root-relocation-fixture.mjs';
 
 const {
-  DATA_ROOT_RELOCATION_MAX_ROWS, assertDataRootAvailable, invalidateDataRootRelocationRecord, planDataRootRelocation, planOldDataRootDeletion,
+  assertDataRootAvailable, invalidateDataRootRelocationRecord, planDataRootRelocation, planOldDataRootDeletion,
   deleteOldDataRoot, readDataRootRelocationRecord, sweepDataRootRelocationLeftovers
 } = relocation;
 const { inspectVscodeRuntimeDataSets, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot } = rootAuthority;
 const { runtimeDataSetFingerprint, writeRuntimeDataSetMergeLedgerRecord } = kernelFile('runtimeDataSetMergeLedger.js');
+const { RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS } = kernelFile('runtimeDataSetMerge.js');
 
 const itemsByKey = (plan) => new Map(plan.items.map((item) => [item.key, item]));
 
@@ -220,14 +221,14 @@ test('#15 新目录正被其它 LimCode 窗口使用时不迁入', async (t) => 
   } finally { await window.close(); }
 });
 
-test('临时上限：当前库超过 25000 行时预检直接拒绝（目标不被创建）；其它库超限时留在旧目录', async (t) => {
+test('临时上限（合并引擎的单事务硬上限）：当前库超过上限时预检直接拒绝（目标不被创建）；其它库超限时留在旧目录', async (t) => {
   const fixture = await createFixture(t);
   const bulk = (databasePath, prefix) => {
     const database = new Database(databasePath);
     try {
       const insert = database.prepare("INSERT INTO conversation (id, title, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)");
       database.transaction(() => {
-        for (let index = 0; index <= DATA_ROOT_RELOCATION_MAX_ROWS; index += 1) insert.run(`${prefix}_${index}`, 't', '2026-09-26T00:00:00.000Z', '2026-09-26T00:00:00.000Z');
+        for (let index = 0; index <= RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS; index += 1) insert.run(`${prefix}_${index}`, 't', '2026-09-26T00:00:00.000Z', '2026-09-26T00:00:00.000Z');
       })();
     } finally { database.close(); }
   };
@@ -239,7 +240,7 @@ test('临时上限：当前库超过 25000 行时预检直接拒绝（目标不�
   bulk(fixture.current.binding.paths.databasePath, 'conversation_bulk_current');
   const refused = await planWithRuntime(fixture, target);
   assert.match(refused.problems.join('\n'), /当前版本暂不能迁移；旧目录不受影响/);
-  assert.ok(refused.current.rows > DATA_ROOT_RELOCATION_MAX_ROWS);
+  assert.ok(refused.current.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
   await assert.rejects(fs.stat(target), { code: 'ENOENT' });
   const controlRoot = path.dirname(fixture.current.binding.paths.dataRootPath);
   assert.deepEqual((await fs.readdir(controlRoot)).filter((name) => name.startsWith('relocation-count-')), [], '计数用的副本已删除');
