@@ -369,6 +369,8 @@ async function coordinateExclusively<T>(
     participantConfirmation: 'final-countdown',
     whenBusy: 'wait',
     ignoreBackoff: true,
+    // Confirmed in the settings page and coordinating now: nothing to cancel (reloads may have begun).
+    cancellable: false,
     isCurrent: () => true,
     withLocks: (body) => host.withDataRootLocks(body)
   }, async ({ reportStage }) => {

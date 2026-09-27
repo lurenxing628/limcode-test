@@ -100,8 +100,14 @@ export function requesterWorkBusy(host: Pick<ExclusiveMaintenanceParticipantHost
 export type ExclusiveMaintenanceRequestOptions = Omit<
   RuntimeExclusiveMaintenanceInput, 'isCancelled' | 'onWaitStart' | 'onProgress' | 'onWaitEnd'
 > & {
-  /** Title of the cancellable progress shown while other windows are involved. */
+  /** Title of the progress shown while other windows are involved. */
   waitingTitle: string;
+  /**
+   * Whether the user can cancel while other windows are involved (default true). An operation the
+   * user already confirmed that cannot be taken back once it coordinates (the data-directory
+   * commands) passes false: its progress has no cancel button. After go nothing cancels any more.
+   */
+  cancellable?: boolean;
   isCurrent(): boolean;
   /**
    * This window's workspaceState, where an explicit call keeps its operation's requester token
@@ -128,8 +134,8 @@ export function takeNoticeKeptAcrossReload(state: ExclusiveMaintenanceWindowStat
 }
 
 /**
- * Requester side. Shows a cancellable progress notification only while other windows (or this
- * window's own work) are actually involved. For the user's explicit call it passes the requester
+ * Requester side. Shows a progress notification (cancellable unless `cancellable: false`) only
+ * while other windows (or this window's own work) are actually involved. For the user's explicit call it passes the requester
  * token of the operation (by its name, whatever the key), kept in windowState until the operation
  * completed: the user can retry right after a failure reloaded this window, past the cooldown that
  * failure started, while other windows and automatic calls cannot. When the user's operation gives
@@ -140,7 +146,7 @@ export async function runWithExclusiveMaintenance<T>(
   options: ExclusiveMaintenanceRequestOptions,
   operation: ExclusiveMaintenanceOperation<T>
 ): Promise<RuntimeExclusiveMaintenanceOutcome<T>> {
-  const { waitingTitle, isCurrent, withLocks, windowState: givenState, ...input } = options;
+  const { waitingTitle, isCurrent, withLocks, windowState: givenState, cancellable = true, ...input } = options;
   const state = givenState ?? windowState;
   let cancelled = false;
   let finishWait: (() => void) | undefined;
@@ -151,10 +157,10 @@ export async function runWithExclusiveMaintenance<T>(
     onWaitStart: () => {
       const done = new Promise<void>((resolve) => { finishWait = resolve; });
       void vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification, title: waitingTitle, cancellable: true
+        location: vscode.ProgressLocation.Notification, title: waitingTitle, cancellable
       }, (progress, token) => {
         reporter = progress;
-        token?.onCancellationRequested?.(() => { cancelled = true; });
+        if (cancellable) token?.onCancellationRequested?.(() => { cancelled = true; });
         return done;
       });
     },

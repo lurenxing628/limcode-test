@@ -339,6 +339,21 @@ test('盲审 #1：锁内确认阶段有窗口开始关闭时不再等它确认�
     'no go was published, so no cooldown either');
 });
 
+test('盲审 #3：go 发布之后不再理会取消——其它窗口已经开始重载，操作照常完成；go 之前的取消照常放弃', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const window = await openWindow(t, binding, 'yielding-window', { releaseDelayMs: 200 });
+  // The user presses cancel as soon as the other window began to reload.
+  const outcome = await run(paths, { ...BASE, isCancelled: () => window.releases() > 0 }, async () => 'done');
+  assert.equal(outcome.state, 'completed', `${outcome.state}: ${outcome.reason}`);
+  assert.equal(window.releases(), 1);
+
+  const { binding: other, paths: otherPaths } = await createRoot(t);
+  const idle = await openWindow(t, other, 'idle-window');
+  const cancelled = await run(otherPaths, { ...BASE, isCancelled: () => true }, async () => assert.fail('must not run'));
+  assert.equal(cancelled.state, 'cancelled');
+  assert.equal(idle.releases(), 0);
+});
+
 test('锁内轮次的持锁时间有上限：有窗口一直不确认时在确认超时后放弃并释放锁', async (t) => {
   const { binding, paths } = await createRoot(t);
   await openWindow(t, binding, 'silent-confirm', { confirm: () => new Promise(() => {}) });

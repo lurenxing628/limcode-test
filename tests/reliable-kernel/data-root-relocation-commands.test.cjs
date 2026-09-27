@@ -7,14 +7,22 @@ const vm = require('node:vm');
 const test = require('node:test');
 const ts = require('typescript');
 
-/** Loads vscode/commands/dataRootRelocation.ts with every dependency replaced by a recording fake. */
-function loadCommands(dependencies) {
-  const filename = path.resolve(__dirname, '../../vscode/commands/dataRootRelocation.ts');
+// The coordination is real: vscode/runtimeExclusiveMaintenance.ts over the compiled primitive, with
+// real locks in a temporary directory. The migration backend and the UI are recording fakes.
+const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
+const primitive = require(path.join(compiled, 'backend/reliableKernel/runtimeExclusiveMaintenance.js'));
+const hostControl = require(path.join(compiled, 'backend/reliableKernel/runtimeHostControl.js'));
+const { createRuntimeRootPaths } = require(path.join(compiled, 'backend/reliableKernel/contracts.js'));
+const { ownProcessStartIdentity } = require(path.join(compiled, 'backend/reliableKernel/runtimeClaimPrimitives.js'));
+
+/** Transpiles a source file and runs it with exactly the given dependencies. */
+function loadSource(relative, dependencies) {
+  const filename = path.resolve(__dirname, '../..', relative);
   const module = { exports: {} };
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText, {
-    module, exports: module.exports, console, process, AbortController,
+    module, exports: module.exports, console, process, AbortController, setTimeout, clearTimeout,
     require(name) {
       if (name === 'node:crypto') return crypto;
       if (name === 'node:os') return os;
@@ -25,12 +33,20 @@ function loadCommands(dependencies) {
   return module.exports;
 }
 
-const SOURCE = '/data/old-home';
-const TARGET = '/data/new-home';
+/** Loads vscode/commands/dataRootRelocation.ts with the given dependencies (fakes except the coordination). */
+function loadCommands(dependencies) {
+  return loadSource('vscode/commands/dataRootRelocation.ts', dependencies);
+}
+
+const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'limcode-relocation-commands-'));
+process.on('exit', () => fs.rmSync(WORK, { recursive: true, force: true }));
+const SOURCE = path.join(WORK, 'old-home');
+const TARGET = path.join(WORK, 'new-home');
+fs.mkdirSync(SOURCE, { recursive: true });
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
 function fixture({
-  picked = TARGET, plan = {}, answers = [], busy = [false], exclusive = 'completed', completeError, cleanup,
+  picked = TARGET, plan = {}, answers = [], busy = [false], completeError, cleanup,
   closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
   nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold,
@@ -69,19 +85,32 @@ function fixture({
   };
   const staged = { plan: planFor(TARGET), relocationId: 'staged' };
   const database = { hostBootId: 'host-1' };
+  // This window's selected root: its own directory, so coordination records never leak between fixtures.
+  const paths = createRuntimeRootPaths(path.join(fs.mkdtempSync(path.join(SOURCE, 'window-')), 'runtime'));
+  let frozen = 0;
   const application = host ? {
     product: { application: { database } },
+    /** `busy`: a list consumed per check (the last value stays), or a function of this window's state. */
     async hasOwnedExecution() {
-      const value = busy.length > 1 ? busy.shift() : busy[0];
+      const value = typeof busy === 'function'
+        ? busy({ frozen: frozen > 0, locked: hostControl.isRuntimeMaintenanceHeld(paths) })
+        : busy.length > 1 ? busy.shift() : busy[0];
       calls.push(['busy?', value instanceof Error ? 'error' : value]);
       if (value instanceof Error) throw value;
       return value;
     },
-    exclusiveMaintenanceTarget() { return { paths: { dataRootPath: `${SOURCE}/.limcode-runtime/active` }, hostBootId: 'host-1' }; },
+    exclusiveMaintenanceTarget() { return { paths, hostBootId: 'host-1' }; },
     dataRootPath() { return SOURCE; },
-    async withDataRootLocks(body) { calls.push(['locks']); return body(); },
+    async withDataRootLocks(body) {
+      calls.push(['locks']);
+      return hostControl.withRuntimeDataRootAdmission(SOURCE, () => hostControl.withRuntimeMaintenance(paths, body));
+    },
     async closeRuntime() { calls.push(['close-runtime']); if (closeError) throw closeError; },
-    freezeNewWork() { calls.push(['freeze']); return () => calls.push(['thaw']); },
+    freezeNewWork(activity) {
+      frozen += 1;
+      calls.push(['freeze', activity]);
+      return () => { frozen -= 1; calls.push(['thaw']); };
+    },
     postToWebview() { return true; }
   } : undefined;
   const startup = {
@@ -183,7 +212,11 @@ function fixture({
       undoUnpublishedDataRootRelocation: async (root) => { calls.push(['undo-unpublished', root]); return undoUnpublishedResult; }
     },
     '../../backend/reliableKernel/runtimeExclusiveMaintenance': {
-      clearExclusiveMaintenanceKey: async (_paths, operation, operationKey) => { calls.push(['clear-key', operation, operationKey]); }
+      ...primitive,
+      clearExclusiveMaintenanceKey: async (keyPaths, operation, operationKey) => {
+        calls.push(['clear-key', operation, operationKey]);
+        return primitive.clearExclusiveMaintenanceKey(keyPaths, operation, operationKey);
+      }
     },
     '../../backend/reliableKernel/runtimeHostControl': {
       withRuntimeDataRootAdmission: async (root, run) => { calls.push(['admission', root]); return run(); }
@@ -204,24 +237,19 @@ function fixture({
         return answers.shift() ?? { choice: 'cancel', include: [] };
       }
     },
-    '../runtimeExclusiveMaintenance': {
-      requesterWorkBusy: (target) => async () => ((await target.hasOwnedExecution()) ? { kind: 'work', reason: '本窗口有任务正在进行' } : undefined),
-      runWithExclusiveMaintenance: async (paths, options, operation) => {
-        calls.push(['exclusive', options]);
-        if (exclusive !== 'completed') return { state: exclusive, hosts: [], reason: '另一个窗口有任务正在进行' };
-        // Like the primitive: beforeGo once everything is ready, the operation under the locks, then the thaw.
-        const result = await options.withLocks(async () => {
-          const check = await options.beforeGo();
-          try {
-            if (check.busy) return { busy: check.busy };
-            return { value: await operation({ reportStage: (text) => calls.push(['report-stage', text]) }) };
-          } finally { await check.thaw?.(); }
-        });
-        // E.g. releasing the old directory's claim fails after the operation succeeded.
-        if (afterLocksError) throw afterLocksError;
-        if (result.busy) return { state: 'busy', hosts: [], reason: result.busy.reason };
-        return { state: 'completed', result: result.value, coordinated: true };
-      }
+  };
+  // The real coordination layer; only what reaches it and the operation's stages are recorded.
+  const layer = loadSource('vscode/runtimeExclusiveMaintenance.ts', { vscode, '../backend/reliableKernel/runtimeExclusiveMaintenance': primitive });
+  dependencies['../runtimeExclusiveMaintenance'] = {
+    ...layer,
+    runWithExclusiveMaintenance: async (maintenancePaths, options, operation) => {
+      calls.push(['exclusive', options]);
+      const outcome = await layer.runWithExclusiveMaintenance(maintenancePaths, options, (context) => operation({
+        reportStage: (text) => { calls.push(['report-stage', text]); context.reportStage(text); }
+      }));
+      // E.g. releasing the old directory's claim fails after the operation succeeded.
+      if (afterLocksError && outcome.state === 'completed') throw afterLocksError;
+      return outcome;
     }
   };
   const commands = loadCommands(dependencies);
@@ -232,7 +260,40 @@ function fixture({
     workspaceState: { get: () => undefined, update: async () => {} }
   };
   const request = { clientId: 'client-1' };
-  return { calls, abandonOptions, prompts, commands, context, startup, status, request, globalState, progressOptions, cancellation, kinds: () => calls.map((call) => call[0]).filter((kind) => kind !== 'progress') };
+  return {
+    calls, abandonOptions, prompts, commands, context, startup, status, request, globalState, progressOptions, cancellation, paths,
+    frozen: () => frozen, kinds: () => calls.map((call) => call[0]).filter((kind) => kind !== 'progress')
+  };
+}
+
+/**
+ * Another window of the old directory, as the coordination sees it: its Host liveness record and
+ * the real participant (it confirms at once; `busyAtGo`: a task starts right when it is told to go).
+ * Told to go, it reloads like extension.ts (leaving, the Runtime closes, the registration goes).
+ */
+async function openPeer(f, { busyAtGo = false } = {}) {
+  const hostBootId = `peer-${crypto.randomUUID()}`;
+  const liveness = path.join(hostControl.runtimeHostLivenessDirectory(f.paths), `${hostBootId}.json`);
+  fs.mkdirSync(path.dirname(liveness), { recursive: true });
+  fs.writeFileSync(liveness, JSON.stringify({
+    kind: 'limcode-runtime-host-liveness', dataSetId: 'data-set', rootInstanceId: 'root-instance', rootGeneration: 1, hostBootId,
+    livenessId: `${hostBootId}-liveness`, processId: process.pid, processStartIdentity: ownProcessStartIdentity(),
+    startedAt: '2026-01-01T00:00:00.000Z', heartbeatAt: new Date().toISOString()
+  }));
+  const peer = { reloads: 0 };
+  const close = async () => {
+    await participant.dispose();
+    fs.rmSync(liveness, { force: true });
+    await participant.unregister();
+  };
+  const participant = primitive.startExclusiveMaintenanceParticipant(f.paths, hostBootId, {
+    busyReason: async (request) => (busyAtGo && request.phase === 'go' ? { kind: 'work', reason: '有任务正在进行' } : undefined),
+    confirm: async () => true,
+    release: async () => { peer.reloads += 1; await close(); }
+  }, { pollMs: 20 });
+  await participant.checkNow();
+  peer.close = close;
+  return peer;
 }
 
 const modal = (call) => call[2]?.modal === true || call.slice(2).some((item) => item?.modal === true);
@@ -240,13 +301,16 @@ const modal = (call) => call[2]?.modal === true || call.slice(2).some((item) => 
 test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行中并在线准备，锁外等待后倒计时不可否决地重载其它窗口，再查一次本窗口的任务，关闭运行时，最后切换指针', async () => {
   const f = fixture({ answers: [{ choice: 'relocate', include: [] }] });
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
+  // The real primitive: its own-window checks outside and inside the locks, beforeGo (check, freeze,
+  // check), the last check, and the operation's own check before it closes the Runtime.
   assert.deepEqual(f.kinds(), [
-    'open-dialog', 'plan', 'busy?', 'prompt', 'status', 'stage', 'exclusive', 'locks', 'busy?', 'freeze', 'busy?', 'busy?', 'report-stage', 'close-runtime',
-    'complete', 'report-stage', 'status', 'thaw', 'clear-key', 'global-state', 'command'
+    'open-dialog', 'plan', 'busy?', 'prompt', 'status', 'stage', 'exclusive', 'busy?', 'locks', 'busy?', 'busy?', 'freeze', 'busy?', 'busy?', 'busy?',
+    'report-stage', 'close-runtime', 'complete', 'report-stage', 'status', 'thaw', 'clear-key', 'global-state', 'command'
   ]);
-  // reloc3 #6: only the preparation can be cancelled; the coordinated part has no cancel button.
-  assert.deepEqual(plain(f.progressOptions).filter(({ title }) => title.startsWith('正在迁移数据目录')).map(({ title, cancellable }) => [title, cancellable]),
-    [['正在迁移数据目录：准备中（可以取消）', true], ['正在迁移数据目录（已不能取消）', false]]);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'freeze'), ['freeze', '迁移数据目录'], '冻结时说明本窗口在做什么（拒绝写命令的提示用它）');
+  // reloc3 #6 / blind #3: only the preparation can be cancelled; nothing after it has a cancel button.
+  assert.deepEqual(plain(f.progressOptions).map(({ title, cancellable }) => [title, cancellable]),
+    [['正在检查新数据目录…', undefined], ['正在迁移数据目录：准备中（可以取消）', true], ['正在迁移数据目录（已不能取消）', false]]);
   const pendingId = f.calls.find((call) => call[0] === 'status')[1].pendingRelocation.relocationId;
   assert.deepEqual(f.calls.find((call) => call[0] === 'clear-key'), ['clear-key', 'data-root-relocation', `data-root-relocation:${TARGET}#${pendingId}`],
     'reloc3 #6：本次尝试的协调键用完即清，不在账本里累积');
@@ -294,40 +358,67 @@ test('复审 bulk #6：迁移进度可以取消；在线预复制期间取消时
   assert.ok(!f.calls.some((call) => call[0] === 'command'));
 });
 
-test('发起窗口在等待期间开始新任务：只提示一次迁移会推迟；确认之后（beforeGo）仍有任务就退回，撤销准备，不重载；忙时不冻结', async () => {
-  const f = fixture({ answers: [{ choice: 'relocate', include: [] }], busy: [false, true, true, true] });
+test('发起窗口在等待期间有任务：只提示一次迁移会推迟，在锁外等它结束（这期间不冻结），之后照常迁移（盲审 #7：与真实原语一致）', async () => {
+  let checks = 0;
+  // Idle when the user confirms, then busy for three checks.
+  const f = fixture({ answers: [{ choice: 'relocate', include: [] }], busy: () => { checks += 1; return checks >= 2 && checks <= 4; } });
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
-  const exclusive = f.calls.find((call) => call[0] === 'exclusive')[1];
-  assert.deepEqual(plain(await exclusive.requesterBusy()), { kind: 'work', reason: '本窗口有任务正在进行' });
-  await exclusive.requesterBusy();
   assert.equal(f.calls.filter((call) => call[0] === 'info' && /会等它结束后再进行/.test(call[1])).length, 1);
-  assert.ok(!f.kinds().includes('close-runtime') && !f.kinds().includes('complete'), '忙着的窗口没有被切断');
-  assert.deepEqual(f.calls.find((call) => call[0] === 'abandon'), ['abandon', true]);
-  assert.equal(f.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null);
-  assert.match(JSON.stringify(f.prompts.at(-1)), /本窗口在确认之后开始了新的任务/);
-  assert.deepEqual(f.kinds().filter((kind) => kind === 'freeze' || kind === 'thaw'), [], '冻结之前就发现忙：不冻结');
-  assert.ok(!f.calls.some((call) => call[0] === 'command'));
+  const kinds = f.kinds();
+  assert.ok(kinds.lastIndexOf('busy?') > kinds.indexOf('exclusive') + 3, 'waited while busy');
+  assert.equal(kinds.filter((kind) => kind === 'freeze').length, 1, '只在空闲之后冻结一次');
+  assert.ok(kinds.includes('complete') && !kinds.includes('abandon'));
+  assert.deepEqual(plain(f.progressOptions).map(({ title, cancellable }) => [title, cancellable]), [
+    ['正在检查新数据目录…', undefined], ['正在迁移数据目录：准备中（可以取消）', true], ['正在迁移数据目录（已不能取消）', false],
+    ['迁移数据目录：正在等待 LimCode 窗口空闲', false]
+  ], '等待本窗口时的通知也不能取消');
+  assert.deepEqual(f.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
 });
 
-test('beforeGo 冻结之后的复查：发现检查与冻结之间开始的任务，或复查本身出错（按忙处理），都把解冻交给原语，窗口不会一直冻结', async () => {
-  for (const [late, reason] of [[true, /本窗口在确认之后开始了新的任务/], [new Error('探测失败'), /无法确认本窗口是否空闲/]]) {
-    const f = fixture({ answers: [{ choice: 'relocate', include: [] }], busy: [false, false, late] });
+test('beforeGo 冻结之后的复查：检查与冻结之间开始的任务或复查本身出错都按忙处理——解冻、放开锁回锁外继续等，之后照常迁移，窗口不会一直冻结（盲审 #7）', async () => {
+  for (const late of [true, new Error('探测失败')]) {
+    let frozenChecks = 0;
+    const f = fixture({ answers: [{ choice: 'relocate', include: [] }], busy: ({ frozen }) => (frozen && (frozenChecks += 1) === 1 ? late : false) });
     await f.commands.relocateDataRoot(f.context, f.startup, f.request);
-    assert.deepEqual(f.kinds().filter((kind) => ['busy?', 'freeze', 'thaw'].includes(kind)), ['busy?', 'busy?', 'freeze', 'busy?', 'thaw']);
-    assert.ok(!f.kinds().includes('close-runtime'));
-    assert.deepEqual(f.calls.find((call) => call[0] === 'abandon'), ['abandon', true]);
-    assert.match(JSON.stringify(f.prompts.at(-1)), reason);
-    assert.ok(!f.calls.some((call) => call[0] === 'command'));
+    assert.deepEqual(f.kinds().filter((kind) => ['freeze', 'thaw', 'close-runtime', 'locks'].includes(kind)),
+      ['locks', 'freeze', 'thaw', 'locks', 'freeze', 'close-runtime', 'thaw']);
+    assert.equal(f.frozen(), 0);
+    assert.ok(f.kinds().includes('complete') && !f.kinds().includes('abandon'));
+    assert.deepEqual(f.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
   }
 });
 
-test('其它窗口没有让出：撤销准备、清除进行中记录，本窗口继续使用原目录且不重载，原因显示在设置页', async () => {
-  const f = fixture({ answers: [{ choice: 'relocate', include: [] }], exclusive: 'busy' });
-  await f.commands.relocateDataRoot(f.context, f.startup, f.request);
+test('盲审 #3：进入协调后没有可以取消的通知——等其它窗口时的通知也不能取消；其它窗口按 go 重载后迁移照常完成', async () => {
+  const f = fixture({ answers: [{ choice: 'relocate', include: [] }] });
+  const peer = await openPeer(f);
+  try {
+    await f.commands.relocateDataRoot(f.context, f.startup, f.request);
+  } finally {
+    await peer.close();
+  }
+  assert.equal(peer.reloads, 1);
+  assert.ok(f.kinds().includes('complete'));
+  assert.deepEqual(plain(f.progressOptions).map(({ title, cancellable }) => [title, cancellable]), [
+    ['正在检查新数据目录…', undefined], ['正在迁移数据目录：准备中（可以取消）', true], ['正在迁移数据目录（已不能取消）', false],
+    ['迁移数据目录：正在等待 LimCode 窗口空闲', false]
+  ]);
+  assert.equal(f.cancellation.listeners.length, 0, '协调阶段没有任何取消监听');
+  assert.deepEqual(f.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+});
+
+test('其它窗口没有让出（go 之后又开始了任务）：撤销准备、清除进行中记录，本窗口继续使用原目录且不重载，原因显示在设置页', async () => {
+  const f = fixture({ answers: [{ choice: 'relocate', include: [] }] });
+  const peer = await openPeer(f, { busyAtGo: true });
+  try {
+    await f.commands.relocateDataRoot(f.context, f.startup, f.request);
+  } finally {
+    await peer.close();
+  }
   assert.deepEqual(f.calls.find((call) => call[0] === 'abandon'), ['abandon', true]);
   assert.ok(!f.kinds().includes('close-runtime'));
+  assert.equal(peer.reloads, 0);
   assert.equal(f.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null);
-  assert.match(JSON.stringify(f.prompts.at(-1)), /另一个窗口有任务正在进行/);
+  assert.match(JSON.stringify(f.prompts.at(-1)), /其它窗口开始让出后1 个其它窗口有任务正在进行/);
   assert.ok(!f.calls.some((call) => call[0] === 'command'));
 });
 
@@ -650,7 +741,8 @@ test('另一个安装把这个目录的数据迁走了（reloc2 #7）：打开�
 
   const follow = fixture({ movedNotice: notice, nativeAnswers: ['改用新目录', '改用并重载'] });
   await follow.commands.afterDataRootOpened(follow.context, SOURCE, follow.startup);
-  for (let turn = 0; turn < 20 && !follow.kinds().includes('command'); turn += 1) await new Promise(setImmediate);
+  // The switch coordinates for real (files and locks): give it real time.
+  for (let turn = 0; turn < 500 && !follow.kinds().includes('command'); turn += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(follow.calls.find((call) => call[0] === 'exclusive')[1].participantConfirmation, 'final-countdown');
   assert.equal(follow.calls.find((call) => call[0] === 'exclusive')[1].windowState, follow.context.workspaceState);
   const switched = follow.calls.find((call) => call[0] === 'status')[1];

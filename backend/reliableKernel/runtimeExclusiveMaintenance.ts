@@ -227,6 +227,10 @@ export interface RuntimeExclusiveMaintenanceInput {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   cooldownAfterCoordinatedMs?: number;
+  /**
+   * Checked until go is published. From then on other windows reload whatever happens here, so a
+   * cancel is ignored and the operation goes on.
+   */
   isCancelled?(): boolean;
   /** Called once when a request is first published (other windows are involved). */
   onWaitStart?(hosts: readonly RuntimeHostActiveDescriptor[]): void;
@@ -632,7 +636,8 @@ class ExclusiveMaintenanceRequester<T> {
     }
     const deadline = this.now() + (this.input.releaseTimeoutMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.releaseTimeoutMs);
     for (;;) {
-      if (this.input.isCancelled?.()) return this.abandon('cancelled', this.hosts, '已取消。');
+      // Once go is published windows reload anyway: a cancel would only make that in vain.
+      if (!goPublished && this.input.isCancelled?.()) return this.abandon('cancelled', this.leaving, '已取消。');
       await this.heartbeat();
       await this.refreshHosts();
       const busy = this.hosts.length > 0 ? busyHosts(this.hosts, await this.answers()) : [];
